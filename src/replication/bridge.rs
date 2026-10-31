@@ -10116,20 +10116,40 @@ impl FederationDirectoryReplicationBridge {
                 }
             }
         }
-        let grants = match self.directory.list_live_consent_grants_by(owner).await {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::debug!(
-                    owner,
-                    error = %e,
-                    "route consent: the owner's grants could not be read; relayed routes \
-                     about its nodes are withheld (fail-closed)"
-                );
-                return None;
+        // The owner's pen is any live roster key of theirs: a device joined by
+        // approval (CC 3.3.6.3) signs the person's grants with its roster key
+        // (`<fedID>-<fp>`), not the fedID key.
+        let roster =
+            match ciris_persist::federation::self_roster::roster_now(&*self.directory, owner).await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(
+                        owner,
+                        error = %e,
+                        "route consent: the owner's roster could not be read; relayed routes \
+                         about its nodes are withheld (fail-closed)"
+                    );
+                    return None;
+                }
+            };
+        let mut subjects = HashSet::new();
+        for pen in std::iter::once(owner.to_owned()).chain(roster) {
+            match self.directory.list_live_consent_grants_by(&pen).await {
+                Ok(grants) => subjects.extend(grants.into_iter().flat_map(|g| g.subject_key_ids)),
+                Err(e) => {
+                    tracing::debug!(
+                        owner,
+                        pen,
+                        error = %e,
+                        "route consent: the owner's grants could not be read; relayed routes \
+                         about its nodes are withheld (fail-closed)"
+                    );
+                    return None;
+                }
             }
-        };
-        let set: Arc<HashSet<String>> =
-            Arc::new(grants.into_iter().flat_map(|g| g.subject_key_ids).collect());
+        }
+        let set: Arc<HashSet<String>> = Arc::new(subjects);
         if let Ok(mut memo) = self.route_consent_memo.lock() {
             if memo.len() >= SEND_SET_MEMBERSHIP_CAP {
                 memo.clear();
@@ -21487,12 +21507,17 @@ pub(crate) mod tests {
     async fn a_relayed_route_reaches_a_stranger_only_after_the_owners_consent() {
         use crate::observability::WithholdReason;
         use sha2::{Digest as _, Sha256};
-        for consented in [false, true] {
+        // Who signed the consent: nobody, the owner's fedID key, or the
+        // roster key of a device the owner joined by approval (CC 3.3.6.3),
+        // which is the owner's pen on that device.
+        for pen in [None, Some("person-bob"), Some("person-bob-dev2")] {
+            let consented = pen.is_some();
             let backend = Arc::new(MemoryBackend::new());
             register_fixture_keys(
                 &backend,
                 &[
                     ("person-bob", identity_type::USER),
+                    ("person-bob-dev2", identity_type::USER),
                     ("node-bob", identity_type::NODE),
                     ("node-bob-2", identity_type::NODE),
                     ("node-relay", identity_type::NODE),
@@ -21500,6 +21525,7 @@ pub(crate) mod tests {
                 ],
             )
             .await;
+            seed_device_occurrence(&backend, "person-bob", "person-bob-dev2", "phone").await;
             let id = uuid::Uuid::new_v4().to_string();
             seed_scoped_attestation(
                 &backend,
@@ -21512,8 +21538,8 @@ pub(crate) mod tests {
             )
             .await;
             seed_owner_binding(&backend, "person-bob", "node-bob-2").await;
-            if consented {
-                seed_consent_membership(&backend, "person-bob", "node-stranger").await;
+            if let Some(pen) = pen {
+                seed_consent_membership(&backend, pen, "node-stranger").await;
             }
             let metrics = crate::observability::EdgeMetrics::new();
             let publish = vec!["node-bob".to_string()];
@@ -21548,8 +21574,8 @@ pub(crate) mod tests {
             assert_eq!(
                 (to_stranger, fetched),
                 (consented, consented),
-                "consented={consented}: the stranger gets the relayed route iff the owner \
-                 consented to it"
+                "pen={pen:?}: the stranger gets the relayed route iff the owner, or a live \
+                 roster key of theirs, consented to it"
             );
             assert!(
                 advertised(
