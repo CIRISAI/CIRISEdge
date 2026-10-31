@@ -39,14 +39,17 @@
 //! # Scope of a proposal
 //!
 //! Proposing reveals this node's public address to the peer, so edge proposes
-//! only to a peer it shares a room with, and only on the identity link to it:
+//! only to a peer it shares a room with or that the host named a consented
+//! contact (Eric 2026-10-30: "anyone who has consented to a contact request",
+//! so a new contact's consent exchange collapses to direct at once), and only
+//! on the identity link to it:
 //!
 //! - when it dials an A/V leg to a member of the call's group
 //!   ([`crate::transport::reticulum::ReticulumTransport::open_av_link`]),
 //!   waiting up to [`DIRECT_PATH_BUDGET`] for the outcome;
-//! - after a send to a room peer ships over a link that crosses a transport
-//!   node (CIRISEdge#915), without waiting: the room's later traffic rides
-//!   the direct link once it is up.
+//! - after a send to a room peer or consented contact ships over a link that
+//!   crosses a transport node (CIRISEdge#915), without waiting: later traffic
+//!   rides the direct link once it is up.
 //!
 //! Nothing else proposes.
 
@@ -101,7 +104,8 @@ pub const DIRECT_LEG_NO_PROGRESS: Duration = Duration::from_secs(2);
 /// the address is someone this node is already in a call or a room with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DirectAccept {
-    /// Accept only from a peer that shares a room with this node
+    /// Accept only from a peer that shares a room with this node, or that the
+    /// host named a consented contact
     /// ([`crate::transport::reticulum::ReticulumTransport::should_accept_direct`]).
     /// leviculum asks edge per request (`AskHost`, leviculum#82): it holds
     /// the request, probes nothing and reveals nothing until edge answers.
@@ -570,7 +574,13 @@ pub(crate) struct DirectPaths {
     waiters: std::sync::Mutex<HashMap<LinkId, Vec<tokio::sync::oneshot::Sender<DirectOutcome>>>>,
     events: tokio::sync::broadcast::Sender<DirectPathEvent>,
     anchors: std::sync::Arc<std::sync::Mutex<HashMap<LinkId, usize>>>,
+    /// Peers (node key ids) the host named as consented contacts
+    /// ([`Self::allow_contact`]): direct with them like a room peer.
+    contacts: std::sync::Mutex<std::collections::HashSet<String>>,
 }
+
+/// Most consented contacts remembered for direct links.
+pub const DIRECT_CONTACTS_MAX: usize = 4096;
 
 impl DirectPaths {
     pub(crate) fn new(config: DirectLinksConfig) -> Self {
@@ -580,7 +590,41 @@ impl DirectPaths {
             waiters: std::sync::Mutex::new(HashMap::new()),
             events: tokio::sync::broadcast::channel(64).0,
             anchors: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            contacts: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Eric 2026-10-30: a node goes direct with "anyone who has consented to a
+    /// contact request", not only a room peer, so a new contact's consent
+    /// exchange runs over a direct link at once. The host names each such
+    /// peer by its NODE key id (on sending a request, and on accepting one).
+    /// `false` when the set is full ([`DIRECT_CONTACTS_MAX`]).
+    pub(crate) fn allow_contact(&self, node_key_id: &str) -> bool {
+        let mut contacts = self
+            .contacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if contacts.len() >= DIRECT_CONTACTS_MAX && !contacts.contains(node_key_id) {
+            return false;
+        }
+        contacts.insert(node_key_id.to_owned());
+        true
+    }
+
+    /// Forget a contact (the request was declined or withdrawn).
+    pub(crate) fn forget_contact(&self, node_key_id: &str) {
+        self.contacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(node_key_id);
+    }
+
+    /// Whether `peer` is a consented contact.
+    pub(crate) fn is_contact(&self, peer: &str) -> bool {
+        self.contacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(peer)
     }
 
     /// The tracker, locked. Never held across an `.await`.

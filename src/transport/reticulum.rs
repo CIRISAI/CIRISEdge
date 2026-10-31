@@ -6148,11 +6148,7 @@ impl ReticulumTransport {
         if !self.direct_paths.config.proposes() {
             return;
         }
-        let shares_room = self
-            .scope_addresses
-            .get()
-            .is_some_and(|table| table.shares_group_with(destination_key_id));
-        if !shares_room {
+        if !self.direct_standing(destination_key_id) {
             return;
         }
         // A one-hop neighbour (a shared interface) is already direct.
@@ -6278,11 +6274,37 @@ impl ReticulumTransport {
     /// rule ([`crate::transport::direct_path::accepts_direct`]).
     #[must_use]
     pub fn should_accept_direct(&self, peer_key_id: &str) -> bool {
-        let shares_room = self
-            .scope_addresses
-            .get()
-            .is_some_and(|table| table.shares_group_with(peer_key_id));
-        crate::transport::direct_path::accepts_direct(self.direct_paths.config.accept, shares_room)
+        crate::transport::direct_path::accepts_direct(
+            self.direct_paths.config.accept,
+            self.direct_standing(peer_key_id),
+        )
+    }
+
+    /// Whether `peer_key_id` may share a direct path with this node: it
+    /// shares a room with it, or the host named it a consented contact
+    /// ([`Self::allow_direct_contact`]). The one rule the accept decision and
+    /// the send-path proposal both read.
+    #[must_use]
+    pub fn direct_standing(&self, peer_key_id: &str) -> bool {
+        direct_standing(
+            self.scope_addresses.get().map(AsRef::as_ref),
+            &self.direct_paths,
+            peer_key_id,
+        )
+    }
+
+    /// Eric 2026-10-30 — name `node_key_id` a consented contact: this node
+    /// accepts a direct link from it and proposes one to it, like a room
+    /// peer. Call on sending a contact request and on accepting one, with the
+    /// contact's NODE key id. `false` when the bounded set is full.
+    pub fn allow_direct_contact(&self, node_key_id: &str) -> bool {
+        self.direct_paths.allow_contact(node_key_id)
+    }
+
+    /// Withdraw [`Self::allow_direct_contact`] (a declined or withdrawn
+    /// request).
+    pub fn forget_direct_contact(&self, node_key_id: &str) {
+        self.direct_paths.forget_contact(node_key_id);
     }
 
     /// CIRISEdge#805 item 8 — every direct-path event this node sees (either
@@ -11245,6 +11267,16 @@ struct AnnounceCtx {
 }
 
 /// Shared handles the event loop hands to [`handle_event`].
+/// Whether `peer` may share a direct path with this node: a room peer, or a
+/// consented contact. Shared by the accept decision and the proposal hook.
+fn direct_standing(
+    table: Option<&ScopeAddressTable>,
+    direct_paths: &crate::transport::direct_path::DirectPaths,
+    peer: &str,
+) -> bool {
+    table.is_some_and(|t| t.shares_group_with(peer)) || direct_paths.is_contact(peer)
+}
+
 struct EventCtx<'a> {
     node: &'a ReticulumNode,
     /// CIRISEdge#621 — this node's own key id, so inbound attribution can
@@ -14772,9 +14804,11 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
         }
     }
     let shares_room = peer.as_deref().is_some_and(|p| {
-        ctx.scope_addresses
-            .get()
-            .is_some_and(|table| table.shares_group_with(p))
+        direct_standing(
+            ctx.scope_addresses.get().map(AsRef::as_ref),
+            ctx.direct_paths,
+            p,
+        )
     });
     let accepted = peer.is_some()
         && crate::transport::direct_path::accepts_direct(

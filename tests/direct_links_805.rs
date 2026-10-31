@@ -1973,3 +1973,38 @@ async fn a_peer_that_refused_before_joining_the_room_comes_up_direct_once_it_joi
         "B proposed, to A: {up:?}"
     );
 }
+
+/// **Eric 2026-10-30** — two nodes that share NO room, but whose hosts named
+/// each other consented contacts (a contact request sent and accepted), go
+/// direct on the first send: the consent exchange rides the direct link at
+/// once. A node that named no contact still proposes nothing
+/// (`a_send_outside_every_room_proposes_nothing_915`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consented_contacts_go_direct_without_a_room() {
+    let mut p = trio("c1030", proposer(), DirectLinksConfig::default()).await;
+    assert!(!p.b.transport.should_accept_direct(&p.a.key.key_id));
+    assert!(p.a.transport.allow_direct_contact(&p.b.key.key_id));
+    assert!(p.b.transport.allow_direct_contact(&p.a.key.key_id));
+    assert!(p.b.transport.should_accept_direct(&p.a.key.key_id));
+
+    p.a.transport
+        .send(&p.b.key.key_id, b"contact-request")
+        .await
+        .expect("A's send to B ships through T");
+    let up = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the contacts' link comes up direct");
+    assert!(
+        matches!(&up, DirectPathEvent::Established { proposed: true, peer, .. }
+            if peer.as_deref() == Some(p.b.key.key_id.as_str())),
+        "{up:?}"
+    );
+
+    p.b.transport.forget_direct_contact(&p.a.key.key_id);
+    assert!(
+        !p.b.transport.should_accept_direct(&p.a.key.key_id),
+        "a withdrawn contact is no longer accepted"
+    );
+}
