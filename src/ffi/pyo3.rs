@@ -956,6 +956,38 @@ impl PyEdge {
         }
     }
 
+    /// Eric 2026-10-30 — name `node_key_id` (a contact's NODE key id) a
+    /// consented contact: this node accepts a direct link from it and
+    /// proposes one to it, like a room peer. Call on sending a contact
+    /// request and on accepting one. Returns `False` when the bounded set is
+    /// full or there is no Reticulum transport.
+    #[pyo3(signature = (node_key_id))]
+    fn allow_direct_contact(&self, node_key_id: &str) -> bool {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            self.inner
+                .reticulum_transport()
+                .is_some_and(|t| t.allow_direct_contact(node_key_id))
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            let _ = node_key_id;
+            false
+        }
+    }
+
+    /// Withdraw [`Self::allow_direct_contact`] (a declined or withdrawn
+    /// request).
+    #[pyo3(signature = (node_key_id))]
+    fn forget_direct_contact(&self, node_key_id: &str) {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.inner.reticulum_transport() {
+            t.forget_direct_contact(node_key_id);
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        let _ = node_key_id;
+    }
+
     /// CIRISEdge#292 — the `key_id`s currently in the live rooted-peer
     /// map (announce-rooted or `prime_peer`'d). Operator readback for
     /// triaging a zero-delivery bring-up (CIRISServer#205): an admitted

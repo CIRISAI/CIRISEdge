@@ -2944,3 +2944,80 @@ async fn forged_supersede_by(
         additional_scrubs: Vec::new(),
     }
 }
+
+/// **A message carries a file in the room**: the attachment survives the
+/// share, a revision of the caption keeps it, and a file from another room is
+/// refused.
+#[tokio::test]
+async fn a_message_carries_a_file_in_the_room_and_a_revision_keeps_it() {
+    let w = world().await;
+    let store = content_store(&w).await;
+    // A row already in the room stands in for the file row: what the producer
+    // checks is that the file's cohort target is this room.
+    let file = placed(&w, "the file row").await;
+
+    let (msg, _) = chat::chat_message_attachment_in(
+        &w.alice,
+        &w.room,
+        &file,
+        Some("the minutes"),
+        later(1),
+        &store,
+    )
+    .await
+    .expect("attach");
+    assert_eq!(
+        msg.attestation_envelope[chat::FIELD_ATTACHMENT],
+        file.attestation_id.as_str()
+    );
+    put(&w, &msg).await;
+    share_encrypted_privately(
+        &*w.dir,
+        &msg,
+        EncryptedCohort::Community {
+            community_key_id: w.room.clone(),
+        },
+        CrossingBasis::ProducerAuthority,
+        w.signers(),
+    )
+    .await
+    .expect("share the attachment into the room");
+    let seen = room_messages(&w).await;
+    let carried = seen
+        .iter()
+        .find(|m| m.attachment.as_deref() == Some(file.attestation_id.as_str()))
+        .expect("the widening carries the attachment");
+    assert_eq!(carried.body, Body::Text("the minutes".to_owned()));
+
+    let head = w.stored(&alice_fed(), &carried.attestation_id).await;
+    let (revised, _) = chat::chat_message_supersede_in(
+        &w.alice,
+        &w.room,
+        &head,
+        "the final minutes",
+        later(2),
+        &store,
+    )
+    .await
+    .expect("revise the caption");
+    put(&w, &revised).await;
+    let seen = room_messages(&w).await;
+    let now = seen
+        .iter()
+        .find(|m| m.attestation_id == revised.attestation_id)
+        .expect("the revision is the head");
+    assert_eq!(
+        now.attachment.as_deref(),
+        Some(file.attestation_id.as_str()),
+        "a revision changes the words, not the file"
+    );
+
+    let mut elsewhere = file.clone();
+    elsewhere.attestation_envelope[chat::FIELD_COMMUNITY_ID] = serde_json::json!("another-room");
+    assert!(
+        chat::chat_message_attachment_in(&w.alice, &w.room, &elsewhere, None, later(3), &store)
+            .await
+            .is_err(),
+        "a file from another room is refused"
+    );
+}

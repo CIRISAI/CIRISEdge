@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "43.3.0"
+version = "43.4.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -441,7 +441,7 @@ publish = false
 #     registers a SINGLE-role `identity_type` — no fixture encoded the
 #     repealed loophole.
 #   * 2566bc54 still pins CIRISVerify v13.6.1 — one `ciris-verify-core`.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v59.1.1", version = "59", features = ["sqlite", "encrypted-kv"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v59.1.2", version = "59", features = ["sqlite", "encrypted-kv"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -922,8 +922,8 @@ tempfile       = { version = "3", optional = true }
 # `DirectLinkPolicy::AskHost` + `DirectLinkRequested` + `accept_direct_link` /
 # `reject_direct_link` (a host-decided direct-link accept), and
 # `retire_direct_link` (a host-forced fallback). Additive: no edge call site moved.
-leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", tag = "v0.31.1+ciris.1", version = "0.31", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.31.1+ciris.1", version = "0.31", optional = true }
+leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", rev = "c6d0a224cf318c92238038df038056099c14a1c6", version = "0.31", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "c6d0a224cf318c92238038df038056099c14a1c6", version = "0.31", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -933,7 +933,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.31.1+
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.31.1+ciris.1", version = "0.31", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", rev = "c6d0a224cf318c92238038df038056099c14a1c6", version = "0.31", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
@@ -1592,7 +1592,7 @@ async-trait        = "0.1"
 # two `ciris-verify-core` cdylibs — the empty-stdout SIGSEGV class).
 # v38.6.0 (CIRISPersist#774) — held in lockstep with the runtime pin above
 # through the RC-adopt and back onto `tag`. These two move together, always.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v59.1.1", version = "59", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv", "test-anchor"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v59.1.2", version = "59", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv", "test-anchor"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3

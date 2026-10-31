@@ -39,14 +39,17 @@
 //! # Scope of a proposal
 //!
 //! Proposing reveals this node's public address to the peer, so edge proposes
-//! only to a peer it shares a room with, and only on the identity link to it:
+//! only to a peer it shares a room with or that the host named a consented
+//! contact (Eric 2026-10-30: "anyone who has consented to a contact request",
+//! so a new contact's consent exchange collapses to direct at once), and only
+//! on the identity link to it:
 //!
 //! - when it dials an A/V leg to a member of the call's group
 //!   ([`crate::transport::reticulum::ReticulumTransport::open_av_link`]),
 //!   waiting up to [`DIRECT_PATH_BUDGET`] for the outcome;
-//! - after a send to a room peer ships over a link that crosses a transport
-//!   node (CIRISEdge#915), without waiting: the room's later traffic rides
-//!   the direct link once it is up.
+//! - after a send to a room peer or consented contact ships over a link that
+//!   crosses a transport node (CIRISEdge#915), without waiting: later traffic
+//!   rides the direct link once it is up.
 //!
 //! Nothing else proposes.
 
@@ -101,7 +104,8 @@ pub const DIRECT_LEG_NO_PROGRESS: Duration = Duration::from_secs(2);
 /// the address is someone this node is already in a call or a room with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DirectAccept {
-    /// Accept only from a peer that shares a room with this node
+    /// Accept only from a peer that shares a room with this node, or that the
+    /// host named a consented contact
     /// ([`crate::transport::reticulum::ReticulumTransport::should_accept_direct`]).
     /// leviculum asks edge per request (`AskHost`, leviculum#82): it holds
     /// the request, probes nothing and reveals nothing until edge answers.
@@ -177,9 +181,6 @@ impl DirectLinksConfig {
 /// direct path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectRetry {
-    /// Not on this link: the peer refused it by policy. A new link (a network
-    /// change, a restart) may ask again.
-    NotOnThisLink,
     /// After this long.
     After(Duration),
 }
@@ -189,9 +190,14 @@ pub enum DirectRetry {
 #[must_use]
 pub fn retry_after(failure: Failure, attempts: u32) -> DirectRetry {
     match failure {
-        Failure::Rejected(_) => DirectRetry::NotOnThisLink,
         Failure::PunchFailed => DirectRetry::After(DIRECT_PUNCH_FAILED_BACKOFF),
-        Failure::Timeout | Failure::ProbeFailed => {
+        // A refusal is retried like a timeout (CIRISEdge#920). Under the
+        // default `RoomPeers` a peer refuses until it shares a room with this
+        // node, and room setup is exactly when the first sends to it go out:
+        // pinning the refusal to the link left a pair room relayed for good.
+        // The backoff doubles, so a peer that refuses by policy (`Off`) is
+        // asked rarely, not never.
+        Failure::Rejected(_) | Failure::Timeout | Failure::ProbeFailed => {
             let factor = 1u32.checked_shl(attempts.min(16)).unwrap_or(u32::MAX);
             DirectRetry::After(
                 DIRECT_RETRY_BASE
@@ -258,8 +264,6 @@ pub enum ProposeSkip {
     AlreadyDirect,
     /// The last proposal failed and its backoff has not run out.
     BackingOff,
-    /// The peer refused a proposal on this very link.
-    RejectedOnThisLink,
 }
 
 impl ProposeSkip {
@@ -270,7 +274,6 @@ impl ProposeSkip {
             Self::InFlight => "in_flight",
             Self::AlreadyDirect => "already_direct",
             Self::BackingOff => "backing_off",
-            Self::RejectedOnThisLink => "rejected_on_this_link",
         }
     }
 }
@@ -287,8 +290,7 @@ enum Entry {
         interface: usize,
     },
     BackingOff {
-        until: Option<Instant>,
-        rejected_link: Option<LinkId>,
+        until: Instant,
     },
 }
 
@@ -314,7 +316,9 @@ impl DirectPathTracker {
     ///
     /// # Errors
     /// The [`ProposeSkip`] that applies.
-    pub fn admit(&self, peer: &str, link: LinkId, now: Instant) -> Result<(), ProposeSkip> {
+    /// `_link` is the link a proposal would ride; whether to propose is a
+    /// property of the peer, not of one link to it.
+    pub fn admit(&self, peer: &str, _link: LinkId, now: Instant) -> Result<(), ProposeSkip> {
         let Some(p) = self.peers.get(peer) else {
             return Ok(());
         };
@@ -325,13 +329,7 @@ impl DirectPathTracker {
                 Err(ProposeSkip::InFlight)
             }
             Entry::Direct { .. } => Err(ProposeSkip::AlreadyDirect),
-            Entry::BackingOff {
-                rejected_link: Some(rejected),
-                ..
-            } if rejected == link => Err(ProposeSkip::RejectedOnThisLink),
-            Entry::BackingOff {
-                until: Some(until), ..
-            } if until > now => Err(ProposeSkip::BackingOff),
+            Entry::BackingOff { until } if until > now => Err(ProposeSkip::BackingOff),
             // A proposal gone stale, or a backoff that ran out.
             Entry::Proposing { .. } | Entry::BackingOff { .. } => Ok(()),
         }
@@ -370,8 +368,7 @@ impl DirectPathTracker {
             peer.to_owned(),
             PeerDirect {
                 entry: Entry::BackingOff {
-                    until: Some(now + DIRECT_RETRY_BASE),
-                    rejected_link: None,
+                    until: now + DIRECT_RETRY_BASE,
                 },
                 attempts,
             },
@@ -415,16 +412,8 @@ impl DirectPathTracker {
     pub fn failed(&mut self, link: LinkId, failure: Failure, now: Instant) -> Option<String> {
         let peer = self.link_peer.remove(&link)?;
         let attempts = self.peers.get(&peer).map_or(0, |p| p.attempts);
-        let entry = match retry_after(failure, attempts) {
-            DirectRetry::NotOnThisLink => Entry::BackingOff {
-                until: None,
-                rejected_link: Some(link),
-            },
-            DirectRetry::After(wait) => Entry::BackingOff {
-                until: Some(now + wait),
-                rejected_link: None,
-            },
-        };
+        let DirectRetry::After(wait) = retry_after(failure, attempts);
+        let entry = Entry::BackingOff { until: now + wait };
         self.peers.insert(
             peer.clone(),
             PeerDirect {
@@ -443,8 +432,7 @@ impl DirectPathTracker {
             peer.clone(),
             PeerDirect {
                 entry: Entry::BackingOff {
-                    until: Some(now + DIRECT_RETRY_BASE),
-                    rejected_link: None,
+                    until: now + DIRECT_RETRY_BASE,
                 },
                 attempts: 0,
             },
@@ -586,7 +574,13 @@ pub(crate) struct DirectPaths {
     waiters: std::sync::Mutex<HashMap<LinkId, Vec<tokio::sync::oneshot::Sender<DirectOutcome>>>>,
     events: tokio::sync::broadcast::Sender<DirectPathEvent>,
     anchors: std::sync::Arc<std::sync::Mutex<HashMap<LinkId, usize>>>,
+    /// Peers (node key ids) the host named as consented contacts
+    /// ([`Self::allow_contact`]): direct with them like a room peer.
+    contacts: std::sync::Mutex<std::collections::HashSet<String>>,
 }
+
+/// Most consented contacts remembered for direct links.
+pub const DIRECT_CONTACTS_MAX: usize = 4096;
 
 impl DirectPaths {
     pub(crate) fn new(config: DirectLinksConfig) -> Self {
@@ -596,7 +590,41 @@ impl DirectPaths {
             waiters: std::sync::Mutex::new(HashMap::new()),
             events: tokio::sync::broadcast::channel(64).0,
             anchors: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            contacts: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Eric 2026-10-30: a node goes direct with "anyone who has consented to a
+    /// contact request", not only a room peer, so a new contact's consent
+    /// exchange runs over a direct link at once. The host names each such
+    /// peer by its NODE key id (on sending a request, and on accepting one).
+    /// `false` when the set is full ([`DIRECT_CONTACTS_MAX`]).
+    pub(crate) fn allow_contact(&self, node_key_id: &str) -> bool {
+        let mut contacts = self
+            .contacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if contacts.len() >= DIRECT_CONTACTS_MAX && !contacts.contains(node_key_id) {
+            return false;
+        }
+        contacts.insert(node_key_id.to_owned());
+        true
+    }
+
+    /// Forget a contact (the request was declined or withdrawn).
+    pub(crate) fn forget_contact(&self, node_key_id: &str) {
+        self.contacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(node_key_id);
+    }
+
+    /// Whether `peer` is a consented contact.
+    pub(crate) fn is_contact(&self, peer: &str) -> bool {
+        self.contacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(peer)
     }
 
     /// The tracker, locked. Never held across an `.await`.
@@ -743,7 +771,7 @@ mod tests {
     fn the_retry_policy_by_failure() {
         assert_eq!(
             retry_after(Failure::Rejected(1), 0),
-            DirectRetry::NotOnThisLink
+            DirectRetry::After(DIRECT_RETRY_BASE)
         );
         assert_eq!(
             retry_after(Failure::PunchFailed, 0),
@@ -800,17 +828,21 @@ mod tests {
     }
 
     #[test]
-    fn a_rejection_blocks_that_link_only() {
+    fn a_rejection_backs_the_peer_off_and_is_asked_again_920() {
+        // CIRISEdge#920: B refused while it did not yet share the room; once it
+        // joins, the next send after the backoff must propose again, on any
+        // link, including the one B refused.
         let now = Instant::now();
         let mut t = DirectPathTracker::default();
         t.proposed("b", link(1), None, now);
         t.failed(link(1), Failure::Rejected(1), now);
-        let much_later = now + Duration::from_secs(24 * 3600);
+        assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::BackingOff));
         assert_eq!(
-            t.admit("b", link(1), much_later),
-            Err(ProposeSkip::RejectedOnThisLink)
+            t.admit("b", link(2), now),
+            Err(ProposeSkip::BackingOff),
+            "one refusal backs the PEER off, not one link of it"
         );
-        assert_eq!(t.admit("b", link(2), now), Ok(()));
+        assert_eq!(t.admit("b", link(1), now + DIRECT_RETRY_BASE), Ok(()));
     }
 
     #[test]
