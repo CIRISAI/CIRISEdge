@@ -46,7 +46,9 @@ use ciris_edge::transport::{InboundFrame, Transport};
 use ciris_edge::verify::RootingDirectory;
 use ciris_edge::EdgeMetrics;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
-use ciris_persist::federation::{Attestation, FederationDirectory, SignedAttestation};
+use ciris_persist::federation::{
+    Attestation, FederationDirectory, SignedAttestation, SignedKeyRecord,
+};
 use ciris_persist::store::sqlite::SqliteBackend;
 use common::{build_reticulum_with_retry, directory_with};
 use sha2::Digest as _;
@@ -724,7 +726,7 @@ impl Node {
     /// `peer` into this node's send set, naming the machine the grant is FOR
     /// (persist v44.6.0 `for_key_id`). Consent is the human's act, so persist's
     /// `consent_peers_by_principals(node)` counts it as the node's send set.
-    async fn consent_as_owner(&self, peer: &Ident) {
+    async fn consent_as_owner(&self, peer: &Ident) -> Attestation {
         let asserted_at = chrono::Utc::now();
         let attestation_id = format!("consent-replication-{}-{}", self.owner.key_id, peer.key_id);
         let subjects = vec![peer.key_id.clone()];
@@ -790,7 +792,7 @@ impl Node {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
-        put(&self.dir, row).await;
+        put(&self.dir, row.clone()).await;
         // The grant must count: persist's one definition of this node's send
         // set names the peer, so the peer is Attributed AND consent-included —
         // not a first-contact stranger.
@@ -806,6 +808,7 @@ impl Node {
             peer.key_id,
             self.key.key_id
         );
+        row
     }
 }
 
@@ -1038,6 +1041,11 @@ async fn two_devices_of_one_owner_root_each_other_through_the_owners_acceptance_
 /// exchanges allegiance facts and roots. A canonical is one source of route
 /// rows, never a required party.
 ///
+/// Since Eric's 2026-10-30 ruling (CONSENT-GATED ROUTES) K relays an owned
+/// node's route only to a peer its owner consented to; the persons here have
+/// consented each other, and K holds both grants. Without them K withholds the
+/// route (`a_relayed_route_reaches_a_stranger_only_after_the_owners_consent`).
+///
 /// Fail-before: with the relay narrowed back to a node's own routes, A never
 /// holds B's signed row and the first wait expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1089,8 +1097,32 @@ async fn two_persons_nodes_root_through_a_mutual_peer_that_relays_their_signed_r
     k.accept(&root).await;
     // Peered: each person consents the other's node, exactly as the field.
     // Nobody consents K, and K consents nobody.
-    a.consent_as_owner(&b.key).await;
-    b.consent_as_owner(&a.key).await;
+    let a_consents_b = a.consent_as_owner(&b.key).await;
+    let b_consents_a = b.consent_as_owner(&a.key).await;
+    // Eric 2026-10-30 (CONSENT-GATED ROUTES): K relays an owned node's route
+    // only to a peer its owner consented to, so K holds both grants, as a relay
+    // does once the contact's consent has crossed it.
+    // A relay holds the persons' records and their announced owner-bindings
+    // (how it knows whose consent a route needs).
+    for n in [&a, &b] {
+        k.dir
+            .put_public_key(SignedKeyRecord {
+                record: n.owner.record("user").await,
+            })
+            .await
+            .expect("K holds the owner's record");
+        let binding = owner_binding_attestation(
+            &n.owner.key_id,
+            &n.key.key_id,
+            chrono::Utc::now(),
+            &n.owner.signer(),
+        )
+        .await
+        .expect("owner binding");
+        put(&k.dir, binding).await;
+    }
+    put(&k.dir, a_consents_b).await;
+    put(&k.dir, b_consents_a).await;
 
     let (ta, port_a) = transport_for(&a, tmp.path(), "a", None).await;
     let (tb, _) = transport_for(&b, tmp.path(), "b", Some(port_a)).await;
