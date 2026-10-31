@@ -5198,13 +5198,16 @@ impl FederationDirectoryReplicationBridge {
                 .park_booked_at(kind, hash, signer, source_peer, Instant::now());
         self.book_park(kind);
         self.note_park_evictions(evictions);
-        // The park waits on the Key; ask for it NOW, ahead of background
-        // repair (the #904 priority set), not whenever the repair queue gets
-        // to it. A new contact's rows parked behind a starved queue were dead
-        // on arrival for the whole window (the cross-NAT harness, 2026-10-30:
-        // `backoff_secs=1800 parked=3479`); the Key's arrival releases the
-        // park and re-asks the rows at once.
-        self.request_signer(EnvelopeKind::Key, signer);
+        // The park waits on the Key: route the ask to the peer that OFFERED
+        // the row, which is the one most likely to hold the Key (node-c
+        // offering its own occurrence holds its owner's Key), so that peer's
+        // next round asks it. NOT the #904 person-priority set: that is for
+        // keys a person is waiting on, capped and drained in name order, and
+        // filling it with every park (778 on the cross-NAT harness, mostly
+        // gate-peer keys no peer serves) starved the one key the contact
+        // needed and even spent the offering peer's own rounds on junk
+        // (2026-10-31, run 41204695676: the owner key was never asked).
+        self.note_missing_signer(EnvelopeKind::Key, signer, source_peer);
         tracing::debug!(
             kind = ?kind,
             envelope_hash = %hex::encode(&hash[..8]),
@@ -16640,32 +16643,52 @@ pub(crate) mod tests {
     /// queued names in the field). Now the next round toward any peer asks for
     /// it first, repair resumes after, and a name both requested and queued is
     /// asked once.
-    /// A row parked on an ABSENT signer Key asks for that Key on the next
-    /// round, ahead of background repair, instead of waiting for the repair
-    /// queue to reach it (the cross-NAT harness, 2026-10-30: a new contact's
-    /// rows parked `backoff_secs=1800 parked=3479` behind a starved queue).
+    /// A row parked on an ABSENT signer Key is asked of the peer that OFFERED
+    /// it, on that peer's next round, and a flood of other parks displaces
+    /// neither that ask nor a key a person is waiting on (cross-NAT harness,
+    /// 2026-10-31: 778 parks, mostly gate-peer keys, filled the person-priority
+    /// set and node-c's owner key was never asked).
     #[tokio::test]
-    async fn a_parked_rows_absent_key_is_asked_before_background_repair() {
+    async fn a_parked_rows_absent_key_is_asked_of_the_peer_that_offered_it() {
         let (_backend, bridge) = test_fixtures::make_bridge(&[]);
-        for i in 0..270 {
-            bridge.note_missing_signer(
-                EnvelopeKind::Key,
-                &format!("repair-signer-{i:03}"),
-                Some("canonical"),
-            );
+        // The flood: rows from the canonical parked on keys nobody serves.
+        for i in 0..300u32 {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&i.to_be_bytes());
+            bridge
+                .park_on_absent_key(
+                    EnvelopeKind::TransportDestination,
+                    hash,
+                    &format!("ciris-gate-peer-{i:03}"),
+                    Some("canonical"),
+                )
+                .await;
         }
+        // The one that matters: node-c offers a row signed by its owner.
         bridge
             .park_on_absent_key(
                 EnvelopeKind::IdentityOccurrence,
-                [7u8; 32],
-                "new-contact-node",
-                Some("canonical"),
+                [0xee; 32],
+                "qa-node-owner-of-c",
+                Some("node-c"),
             )
             .await;
+        // A key a person pasted still goes first, ahead of every park.
+        bridge.request_signer(EnvelopeKind::Key, "pasted-contact-key");
         assert_eq!(
+            bridge.take_missing_signer_for("node-c").as_deref(),
+            Some("pasted-contact-key"),
+            "the person-requested key is not displaced by parks"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("node-c").as_deref(),
+            Some("qa-node-owner-of-c"),
+            "node-c's round asks node-c for the key of the row it offered"
+        );
+        assert_ne!(
             bridge.take_missing_signer_for("canonical").as_deref(),
-            Some("new-contact-node"),
-            "the parked row's Key is asked first"
+            Some("qa-node-owner-of-c"),
+            "and it is asked once"
         );
     }
 
