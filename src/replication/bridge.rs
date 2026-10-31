@@ -2201,7 +2201,7 @@ pub struct FederationDirectoryReplicationBridge {
     /// its live `consent:replication` grants), memoized for
     /// [`CONSENT_SEND_SET_MEMO_TTL`]: a canonical gates every relayed route
     /// row on it, every round.
-    route_consent_memo: Mutex<HashMap<String, (Arc<HashSet<String>>, Instant)>>,
+    route_consent_memo: Mutex<HashMap<String, ConsentedSubjects>>,
     /// CIRISEdge#552 (B) — signers a transient refusal named that this node may
     /// not hold. Bounded: a peer that offers unadmittable rows must not be able
     /// to grow this without limit, so past the cap new names are DROPPED rather
@@ -2350,6 +2350,9 @@ pub type RevocationObserver = Arc<dyn Fn(&str) + Send + Sync>;
 /// bounded by the scheduler's 10 s round budget) while staying well under the
 /// default 30 s cadence, so the item-1 bound still re-resolves every round.
 const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(10);
+
+/// One owner's consented subjects and when they were read.
+type ConsentedSubjects = (Arc<HashSet<String>>, Instant);
 
 /// Peers whose send-set membership is remembered for change logging.
 const SEND_SET_MEMBERSHIP_CAP: usize = 4096;
@@ -7791,10 +7794,13 @@ impl FederationDirectoryReplicationBridge {
         if subjects.contains(&peer) {
             return true;
         }
-        match self.owner_of_cached(peer).await {
-            OwnerLookup::Owner(owner) => subjects.contains(&owner.as_str()),
-            _ => false,
-        }
+        // Read directly, not through the owner memo: this runs only on
+        // consent-grant rows, and an answer cached here before the peer's
+        // owner-binding lands would outlive it in every other owner read.
+        matches!(
+            ciris_persist::federation::admission::owner_of(&*self.directory, peer).await,
+            Ok(Some(owner)) if subjects.contains(&owner.as_str())
+        )
     }
 
     async fn attestation_is_relayed_announce(
