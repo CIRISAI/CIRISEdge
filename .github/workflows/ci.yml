@@ -365,7 +365,7 @@ jobs:
   darwin-aarch64-test:
     name: darwin-aarch64 (no pyo3)
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: off PR (cut runners)
-    runs-on: macos-14
+    runs-on: macos-15
     # CIRISEdge#229 — restore only; canonical macos-aarch64 save lives
     # on `pyo3-wheel` `darwin-aarch64` (release-profile target/).
     # `packages: write` not needed here.
@@ -1060,7 +1060,7 @@ jobs:
   # adding iOS-sim-x86_64 for Intel Macs) drops in cleanly.
   ios-pyo3:
     name: ios PyO3 abi3 (${{ matrix.target }})
-    runs-on: macos-14
+    runs-on: macos-15
     # CIRISEdge#229 — densest iOS canonical save (PyO3 +
     # extension-module on top of build-ios's plain dylib). PLAT
     # tokens `ios-aarch64` / `ios-aarch64-sim` match persist's
@@ -1623,7 +1623,7 @@ jobs:
           # wheel matrix. All entries keep `extension-module transport-http`.
           - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64, features: "pyo3 extension-module transport-http" }
           - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64, features: "pyo3 extension-module transport-http" }
-          - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64, features: "pyo3 extension-module transport-http" }
+          - { os: macos-15,         label: darwin-aarch64, tag: macosx_11_0_arm64, features: "pyo3 extension-module transport-http" }
           # v2.1.1 (CIRISEdge#87 / #90 / leviculum#10) — windows-x86_64
           # wheel. Leviculum's 4c15dfd Windows port of reticulum-std
           # unblocked the FIRST layer (LocalInterface + AutoInterface
@@ -2581,8 +2581,8 @@ jobs:
           - { platform: linux-x86_64,   runs-on: ubuntu-latest,    backend: postgres }
           - { platform: linux-aarch64,  runs-on: ubuntu-24.04-arm, backend: sqlite   }
           - { platform: linux-aarch64,  runs-on: ubuntu-24.04-arm, backend: postgres }
-          - { platform: darwin-aarch64, runs-on: macos-14,         backend: sqlite   }
-          - { platform: darwin-aarch64, runs-on: macos-14,         backend: postgres }
+          - { platform: darwin-aarch64, runs-on: macos-15,         backend: sqlite   }
+          - { platform: darwin-aarch64, runs-on: macos-15,         backend: postgres }
     uses: CIRISAI/CIRISConformance/.github/workflows/run-against-wheels.yml@main
     with:
       runs-on: ${{ matrix.runs-on }}
