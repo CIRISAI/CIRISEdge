@@ -1267,7 +1267,13 @@ impl Session {
                     };
                     if !retry.is_terminal() && key_missing {
                         if let Some(signer) = &signer {
-                            provider.note_missing_signer(self.kind, signer, source_peer);
+                            if !crate::replication::missing_signer::is_relayed_route(
+                                self.kind,
+                                signer,
+                                source_peer,
+                            ) {
+                                provider.note_missing_signer(self.kind, signer, source_peer);
+                            }
                         }
                     }
                     // CIRISEdge#858 — ONE WARN per (plane, signer) per window,

@@ -5207,7 +5207,9 @@ impl FederationDirectoryReplicationBridge {
         // gate-peer keys no peer serves) starved the one key the contact
         // needed and even spent the offering peer's own rounds on junk
         // (2026-10-31, run 41204695676: the owner key was never asked).
-        self.note_missing_signer(EnvelopeKind::Key, signer, source_peer);
+        if !crate::replication::missing_signer::is_relayed_route(kind, signer, source_peer) {
+            self.note_missing_signer(EnvelopeKind::Key, signer, source_peer);
+        }
         tracing::debug!(
             kind = ?kind,
             envelope_hash = %hex::encode(&hash[..8]),
@@ -16644,10 +16646,11 @@ pub(crate) mod tests {
     /// it first, repair resumes after, and a name both requested and queued is
     /// asked once.
     /// A row parked on an ABSENT signer Key is asked of the peer that OFFERED
-    /// it, on that peer's next round, and a flood of other parks displaces
+    /// it, on that peer's next round; a route merely RELAYED by a peer is held
+    /// but never asked about, so a flood of them spends no rounds and displaces
     /// neither that ask nor a key a person is waiting on (cross-NAT harness,
-    /// 2026-10-31: 778 parks, mostly gate-peer keys, filled the person-priority
-    /// set and node-c's owner key was never asked).
+    /// 2026-10-31: 778 parks, mostly relayed gate-peer routes, filled the
+    /// person-priority set and node-c's owner key was never asked).
     #[tokio::test]
     async fn a_parked_rows_absent_key_is_asked_of_the_peer_that_offered_it() {
         let (_backend, bridge) = test_fixtures::make_bridge(&[]);
@@ -16685,10 +16688,24 @@ pub(crate) mod tests {
             Some("qa-node-owner-of-c"),
             "node-c's round asks node-c for the key of the row it offered"
         );
-        assert_ne!(
-            bridge.take_missing_signer_for("canonical").as_deref(),
-            Some("qa-node-owner-of-c"),
-            "and it is asked once"
+        assert_eq!(
+            bridge.take_missing_signer_for("canonical"),
+            None,
+            "the canonical's rounds are not spent asking for the keys of 300 routes it \
+             merely relayed, and the owner key is asked once"
+        );
+        // A route offered by its OWN node still asks that node.
+        bridge
+            .park_on_absent_key(
+                EnvelopeKind::TransportDestination,
+                [0xdd; 32],
+                "node-d",
+                Some("node-d"),
+            )
+            .await;
+        assert_eq!(
+            bridge.take_missing_signer_for("node-d").as_deref(),
+            Some("node-d")
         );
     }
 
