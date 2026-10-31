@@ -699,6 +699,10 @@ impl AvRelay {
         inbound_link_id: Vec<u8>,
     ) -> (tokio::task::JoinHandle<()>, RelayAdmissions) {
         let (control_tx, mut control_rx) = mpsc::channel::<RelayControl>(16);
+        let congested = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<u64>::new(),
+        ));
+        let congested_record = std::sync::Arc::clone(&congested);
         let stream_id = self.stream_id;
         let tag = stream_tag(stream_id);
         let mut dispatcher = self.dispatcher;
@@ -792,6 +796,15 @@ impl AvRelay {
                     Err(AvDispatcherError::Congested) => {
                         // Routine realtime backpressure (CIRISEdge#460): the
                         // chunk is dropped for the congested hop, never queued.
+                        {
+                            let mut record = congested_record
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if record.len() >= RELAY_CONGESTED_RECORD {
+                                record.pop_front();
+                            }
+                            record.push_back(chunk_seq);
+                        }
                         tracing::debug!(
                             stream = %tag,
                             chunk_seq,
@@ -811,7 +824,13 @@ impl AvRelay {
                 }
             }
         });
-        (pump, RelayAdmissions { tx: control_tx })
+        (
+            pump,
+            RelayAdmissions {
+                tx: control_tx,
+                congested,
+            },
+        )
     }
 }
 
@@ -849,7 +868,14 @@ enum RelayControl {
 #[derive(Clone)]
 pub struct RelayAdmissions {
     tx: mpsc::Sender<RelayControl>,
+    /// The chunk_seqs the pump dropped because a downstream hop refused them
+    /// as `Congested` (CIRISEdge#591: dropped, never queued), most recent
+    /// [`RELAY_CONGESTED_RECORD`] kept.
+    congested: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u64>>>,
 }
+
+/// How many congested drops [`RelayAdmissions::congested_drops`] remembers.
+pub const RELAY_CONGESTED_RECORD: usize = 4096;
 
 impl std::fmt::Debug for RelayAdmissions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -858,6 +884,19 @@ impl std::fmt::Debug for RelayAdmissions {
 }
 
 impl RelayAdmissions {
+    /// The chunk_seqs this relay dropped for a congested downstream hop,
+    /// oldest first: a frame missing downstream is accounted for here or it
+    /// was lost.
+    #[must_use]
+    pub fn congested_drops(&self) -> Vec<u64> {
+        self.congested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect()
+    }
+
     /// Admit `link`'s subscriber from the next forwarded chunk. The caller
     /// has checked it is ENTITLED (`av_leg_choice::relay_admits`).
     ///
