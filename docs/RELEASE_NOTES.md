@@ -13,8 +13,8 @@
 - **A route a peer merely relayed is held on its absent Key but never asked about.** A relay offers
   every announced node's route (CC 5.3.4 I5), so a node parks hundreds of routes for nodes it will
   never reach, and each ask would replace that peer's whole replication round. A route offered by its
-  own node still asks. A route this node needs belongs to a node whose own rows also arrive; those
-  rows ask that node, and its Key releases the route too.
+  own node still asks, and so does a relayed route whose node this node sends to (a contact's node,
+  once the contact grant names it).
 
 # v43.4.0 — direct links that recover, traces that ship, files in chats
 
