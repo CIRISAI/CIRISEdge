@@ -5172,6 +5172,13 @@ impl FederationDirectoryReplicationBridge {
                 .park_booked_at(kind, hash, signer, source_peer, Instant::now());
         self.book_park(kind);
         self.note_park_evictions(evictions);
+        // The park waits on the Key; ask for it NOW, ahead of background
+        // repair (the #904 priority set), not whenever the repair queue gets
+        // to it. A new contact's rows parked behind a starved queue were dead
+        // on arrival for the whole window (the cross-NAT harness, 2026-10-30:
+        // `backoff_secs=1800 parked=3479`); the Key's arrival releases the
+        // park and re-asks the rows at once.
+        self.request_signer(EnvelopeKind::Key, signer);
         tracing::debug!(
             kind = ?kind,
             envelope_hash = %hex::encode(&hash[..8]),
@@ -16583,6 +16590,35 @@ pub(crate) mod tests {
     /// queued names in the field). Now the next round toward any peer asks for
     /// it first, repair resumes after, and a name both requested and queued is
     /// asked once.
+    /// A row parked on an ABSENT signer Key asks for that Key on the next
+    /// round, ahead of background repair, instead of waiting for the repair
+    /// queue to reach it (the cross-NAT harness, 2026-10-30: a new contact's
+    /// rows parked `backoff_secs=1800 parked=3479` behind a starved queue).
+    #[tokio::test]
+    async fn a_parked_rows_absent_key_is_asked_before_background_repair() {
+        let (_backend, bridge) = test_fixtures::make_bridge(&[]);
+        for i in 0..270 {
+            bridge.note_missing_signer(
+                EnvelopeKind::Key,
+                &format!("repair-signer-{i:03}"),
+                Some("canonical"),
+            );
+        }
+        bridge
+            .park_on_absent_key(
+                EnvelopeKind::IdentityOccurrence,
+                [7u8; 32],
+                "new-contact-node",
+                Some("canonical"),
+            )
+            .await;
+        assert_eq!(
+            bridge.take_missing_signer_for("canonical").as_deref(),
+            Some("new-contact-node"),
+            "the parked row's Key is asked first"
+        );
+    }
+
     #[tokio::test]
     async fn a_requested_key_is_asked_before_background_repair_904() {
         let (_backend, bridge) = test_fixtures::make_bridge(&[]);
