@@ -1,5 +1,21 @@
 # CIRISEdge Release Notes
 
+# v43.4.1 — a contact's key is asked of the contact, and relayed routes stop costing rounds
+
+**2026-10-31.** **PATCH** from v43.4.0. Pins CIRISPersist **v59.1.2** (verify v20.2.0 unchanged).
+
+- **A parked row's Key is asked of the peer that offered it.** v43.4.0 put every row parked on an
+  absent signer Key into the set reserved for keys a person is waiting on. That set is capped at 64
+  and drained in name order, one per round. On the cross-NAT harness, 778 parks, mostly gate-peer
+  keys nobody serves, filled it, so the contact's owner key was never asked. That key also signs the
+  contact grant, so the receiver couldn't verify the request. A park now routes its Key to the peer
+  that offered the row, and the priority set is kept for people.
+- **A route a peer merely relayed is held on its absent Key but never asked about.** A relay offers
+  every announced node's route (CC 5.3.4 I5), so a node parks hundreds of routes for nodes it will
+  never reach, and each ask would replace that peer's whole replication round. A route offered by its
+  own node still asks. A route this node needs belongs to a node whose own rows also arrive; those
+  rows ask that node, and its Key releases the route too.
+
 # v43.4.0 — direct links that recover, traces that ship, files in chats
 
 **2026-10-30.** **MINOR** from v43.3.0. Pins CIRISPersist **v59.1.2** (verify v20.2.0 unchanged).
