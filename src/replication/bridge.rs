@@ -2202,6 +2202,9 @@ pub struct FederationDirectoryReplicationBridge {
     /// [`CONSENT_SEND_SET_MEMO_TTL`]: a canonical gates every relayed route
     /// row on it, every round.
     route_consent_memo: Mutex<HashMap<String, ConsentedSubjects>>,
+    /// Whether relayed routes are consent-gated ([`Self::with_consent_gated_routes`]).
+    /// Off by default until CIRISPersist#1165 lets a relay hold contact grants.
+    consent_gated_routes: bool,
     /// CIRISEdge#552 (B) — signers a transient refusal named that this node may
     /// not hold. Bounded: a peer that offers unadmittable rows must not be able
     /// to grow this without limit, so past the cap new names are DROPPED rather
@@ -2442,6 +2445,7 @@ impl FederationDirectoryReplicationBridge {
             consent_subject_key_ids: Vec::new(),
             send_set_membership: std::sync::Mutex::new(HashMap::new()),
             route_consent_memo: Mutex::new(HashMap::new()),
+            consent_gated_routes: false,
             config,
             operational: None,
             consent_memo: Mutex::new(None),
@@ -2544,6 +2548,7 @@ impl FederationDirectoryReplicationBridge {
             consent_subject_key_ids: Vec::new(),
             send_set_membership: std::sync::Mutex::new(HashMap::new()),
             route_consent_memo: Mutex::new(HashMap::new()),
+            consent_gated_routes: false,
             config,
             operational: Some(operational),
             consent_memo: Mutex::new(None),
@@ -2742,6 +2747,24 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_serve_tier_subject(mut self, subject: Option<String>) -> Self {
         self.serve_tier_subject = subject;
+        self
+    }
+
+    /// Turn on CONSENT-GATED ROUTES ([`Self::route_row_unconsented`]): a
+    /// relayed route about an owned node is served only to a peer its owner
+    /// consented to (Eric 2026-10-30).
+    ///
+    /// TODO(CIRISPersist#1165): make this the default once persist's
+    /// `may_receive` admits an owner's contact grant at an infrastructure
+    /// relay. Until then no relay holds contact grants, so turning it on stops
+    /// two persons' NAT'd nodes from ever getting each other's route (a dial
+    /// under the E1 seal needs it) and first contact breaks. Then also serve
+    /// this node's owner's contact grants to infra:serve relays (the edge half
+    /// of #1165) and witness the whole flow: grant reaches the relay, relay
+    /// serves the route, requester dials direct.
+    #[must_use]
+    pub fn with_consent_gated_routes(mut self, on: bool) -> Self {
+        self.consent_gated_routes = on;
         self
     }
 
@@ -10060,6 +10083,7 @@ impl FederationDirectoryReplicationBridge {
             return Some(reason);
         }
         if kind == EnvelopeKind::TransportDestination
+            && self.consent_gated_routes
             && self.route_row_unconsented(subject, peer).await
         {
             return Some(crate::observability::WithholdReason::RouteNotConsented);
@@ -21552,7 +21576,8 @@ pub(crate) mod tests {
             let bridge = bridge_over(&backend, &[])
                 .with_self_provider(Some(Arc::new(move || publish.clone())))
                 .with_local_key_id(Some("node-relay".to_string()))
-                .with_metrics(Some(metrics.clone()));
+                .with_metrics(Some(metrics.clone()))
+                .with_consent_gated_routes(true);
             let signed = sign_transport_destination_fixture(
                 "node-bob",
                 "aa00",
@@ -21600,6 +21625,58 @@ pub(crate) mod tests {
                 .unwrap_or(0);
             assert_eq!(booked > 0, !consented, "booked by name: {booked}");
         }
+    }
+
+    /// The switch is OFF by default until CIRISPersist#1165: a relay with no
+    /// contact grants serves an announced node's route to a stranger exactly
+    /// as before, so first contact is no worse while the relay cannot hold
+    /// grants.
+    #[tokio::test]
+    async fn with_the_switch_off_a_relayed_route_reaches_a_stranger_as_before() {
+        use sha2::{Digest as _, Sha256};
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-bob", identity_type::USER),
+                ("node-bob", identity_type::NODE),
+                ("node-relay", identity_type::NODE),
+                ("node-stranger", identity_type::NODE),
+            ],
+        )
+        .await;
+        let id = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &id,
+            "person-bob",
+            "node-bob",
+            "delegates_to",
+            "federation",
+            owner_binding_envelope(&id, "person-bob", "node-bob"),
+        )
+        .await;
+        let publish = vec!["node-bob".to_string()];
+        let bridge = bridge_over(&backend, &[])
+            .with_self_provider(Some(Arc::new(move || publish.clone())))
+            .with_local_key_id(Some("node-relay".to_string()));
+        let signed =
+            sign_transport_destination_fixture("node-bob", "aa00", 1, Utc::now().trunc_subsecs(6));
+        let wire = serde_json::to_vec(&signed).expect("wire");
+        assert!(bridge
+            .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire, None)
+            .await
+            .is_admitted());
+        let hash: [u8; 32] = Sha256::digest(&wire).into();
+        assert!(advertised(
+            &bridge
+                .list_envelope_refs_for_peer(
+                    EnvelopeKind::TransportDestination,
+                    Some("node-stranger")
+                )
+                .await,
+            &hash
+        ));
     }
 
     /// **RELAY THE CONSENT REQUEST (Eric 2026-10-30).** A relay (standing in

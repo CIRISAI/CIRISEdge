@@ -1041,10 +1041,11 @@ async fn two_devices_of_one_owner_root_each_other_through_the_owners_acceptance_
 /// exchanges allegiance facts and roots. A canonical is one source of route
 /// rows, never a required party.
 ///
-/// Since Eric's 2026-10-30 ruling (CONSENT-GATED ROUTES) K relays an owned
-/// node's route only to a peer its owner consented to; the persons here have
-/// consented each other, and K holds both grants. Without them K withholds the
-/// route (`a_relayed_route_reaches_a_stranger_only_after_the_owners_consent`).
+/// Since Eric's 2026-10-30 ruling (CONSENT-GATED ROUTES) a relay that has the
+/// rule on relays an owned node's route only to a peer its owner consented to;
+/// the persons here have consented each other and K holds both grants, so this
+/// witness holds with the rule on or off. The rule is off by default until
+/// CIRISPersist#1165 (`with_the_switch_off_a_relayed_route_reaches_a_stranger_as_before`).
 ///
 /// Fail-before: with the relay narrowed back to a node's own routes, A never
 /// holds B's signed row and the first wait expires.
