@@ -2197,6 +2197,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// INFO ([`Self::note_send_set_membership`]). Bounded: cleared past
     /// [`SEND_SET_MEMBERSHIP_CAP`] peers.
     send_set_membership: std::sync::Mutex<HashMap<String, &'static str>>,
+    /// CONSENT-GATED ROUTES — each owner's consented subjects (the subjects of
+    /// its live `consent:replication` grants), memoized for
+    /// [`CONSENT_SEND_SET_MEMO_TTL`]: a canonical gates every relayed route
+    /// row on it, every round.
+    route_consent_memo: Mutex<HashMap<String, (Arc<HashSet<String>>, Instant)>>,
     /// CIRISEdge#552 (B) — signers a transient refusal named that this node may
     /// not hold. Bounded: a peer that offers unadmittable rows must not be able
     /// to grow this without limit, so past the cap new names are DROPPED rather
@@ -2433,6 +2438,7 @@ impl FederationDirectoryReplicationBridge {
             local_key_id: None,
             consent_subject_key_ids: Vec::new(),
             send_set_membership: std::sync::Mutex::new(HashMap::new()),
+            route_consent_memo: Mutex::new(HashMap::new()),
             config,
             operational: None,
             consent_memo: Mutex::new(None),
@@ -2534,6 +2540,7 @@ impl FederationDirectoryReplicationBridge {
             local_key_id: None,
             consent_subject_key_ids: Vec::new(),
             send_set_membership: std::sync::Mutex::new(HashMap::new()),
+            route_consent_memo: Mutex::new(HashMap::new()),
             config,
             operational: Some(operational),
             consent_memo: Mutex::new(None),
@@ -5520,7 +5527,11 @@ impl FederationDirectoryReplicationBridge {
                         continue;
                     };
                     if self
-                        .identity_row_pull_withholds(&occurrence, peer_key_id)
+                        .identity_row_pull_withholds(
+                            EnvelopeKind::IdentityOccurrence,
+                            &occurrence,
+                            peer_key_id,
+                        )
                         .await
                     {
                         continue;
@@ -5541,7 +5552,11 @@ impl FederationDirectoryReplicationBridge {
                     let td = &row.transport_destination;
                     // CIRISEdge#682 — the subject-Pull twin (see above).
                     if self
-                        .identity_row_pull_withholds(&td.occurrence_key_id, peer_key_id)
+                        .identity_row_pull_withholds(
+                            EnvelopeKind::TransportDestination,
+                            &td.occurrence_key_id,
+                            peer_key_id,
+                        )
                         .await
                     {
                         continue;
@@ -6462,7 +6477,9 @@ impl FederationDirectoryReplicationBridge {
         window: SweepWindow<'_>,
     ) -> Vec<EnvelopeRef> {
         let mut subjects = self.self_own_subjects(kind);
-        let withheld = self.identity_rows_withheld_from(&subjects, peer).await;
+        let withheld = self
+            .identity_rows_withheld_from(kind, &subjects, peer)
+            .await;
         for (subject, reason) in &withheld {
             subjects.remove(subject);
             self.withhold(
@@ -7748,6 +7765,31 @@ impl FederationDirectoryReplicationBridge {
     ///
     /// No selector installed ⇒ `false` for every row: the first-contact reach is
     /// then exactly #671's, byte for byte.
+    /// **RELAY THE CONSENT REQUEST** (Eric 2026-10-30: "The canonical relays
+    /// the contact consent request"). A `consent:replication` grant whose
+    /// subjects name `peer`, or `peer`'s owner, is the contact request (or its
+    /// acceptance) addressed to that peer: it crosses first contact to it,
+    /// whatever this relay's own send set says. Persist's `may_receive` still
+    /// decides the row after this.
+    async fn consent_grant_names(&self, row: &serde_json::Value, peer: &str) -> bool {
+        use ciris_persist::federation::consent_grammar::GRANT_DIMENSION;
+        if Self::row_dimension(row) != GRANT_DIMENSION {
+            return false;
+        }
+        let subjects: Vec<&str> = row
+            .get("subject_key_ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        if subjects.contains(&peer) {
+            return true;
+        }
+        match self.owner_of_cached(peer).await {
+            OwnerLookup::Owner(owner) => subjects.contains(&owner.as_str()),
+            _ => false,
+        }
+    }
+
     async fn attestation_is_relayed_announce(
         &self,
         row: &serde_json::Value,
@@ -7899,14 +7941,16 @@ impl FederationDirectoryReplicationBridge {
         if reach == Reach::FirstContact
             && !self.attestation_is_allegiance_fact(row, memo).await
             && !self.attestation_is_relayed_announce(row, memo).await
+            && !self.consent_grant_names(row, peer).await
         {
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
                 &format!(
                     "{site}: attestation: not consent-included — first-contact reach carries \
-                     only this node's allegiance facts and the announced owner-bindings of \
-                     nodes it publishes (CIRISEdge#671, #752)"
+                     only this node's allegiance facts, the announced owner-bindings of \
+                     nodes it publishes, and consent grants naming the peer (CIRISEdge#671, \
+                     #752)"
                 ),
             );
             tracing::debug!(
@@ -9985,6 +10029,109 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    /// CIRISEdge#682 + CONSENT-GATED ROUTES — whether a row of `kind` about
+    /// `subject` is withheld from `peer`: the announce reach, and on the
+    /// `TransportDestination` plane the route-consent rule as well
+    /// ([`Self::route_row_unconsented`]). `None` serves.
+    async fn identity_row_withholds(
+        &self,
+        kind: EnvelopeKind,
+        subject: &str,
+        peer: Option<&str>,
+    ) -> Option<crate::observability::WithholdReason> {
+        if let Some(reason) = self
+            .identity_row_reach(subject)
+            .await
+            .withholds(subject, peer)
+        {
+            return Some(reason);
+        }
+        if kind == EnvelopeKind::TransportDestination
+            && self.route_row_unconsented(subject, peer).await
+        {
+            return Some(crate::observability::WithholdReason::RouteNotConsented);
+        }
+        None
+    }
+
+    /// **CONSENT-GATED ROUTES** (Eric 2026-10-30: "The canonical relays the
+    /// contact consent request, only after consent can we go direct"). A
+    /// RELAYED route row about an owned node `subject` goes to `peer` only when
+    /// the node's owner has consented to it: a live `consent:replication`
+    /// grant the owner authored names `peer` or `peer`'s owner. That grant is
+    /// the proof of contact consent; the recipient writes it on accept.
+    ///
+    /// Unchanged, and so never withheld here:
+    /// - this node's OWN route (it is not relayed);
+    /// - a route to the node itself, or to another node of the same owner;
+    /// - an UNOWNED node's route (the canonical, a bare server): there is no
+    ///   owner to consent, and announcing is how it is reached.
+    ///
+    /// Fail-closed: an owner that cannot be resolved, or a grant read that
+    /// fails, withholds.
+    async fn route_row_unconsented(&self, subject: &str, peer: Option<&str>) -> bool {
+        if self.local_key_id.as_deref() == Some(subject)
+            || self.serve_tier_subject.as_deref() == Some(subject)
+        {
+            return false;
+        }
+        let Some(peer) = peer else {
+            return true;
+        };
+        if peer == subject {
+            return false;
+        }
+        let owner = match self.owner_of_cached(subject).await {
+            OwnerLookup::Owner(o) => o,
+            OwnerLookup::Unowned => return false,
+            OwnerLookup::Unresolved => return true,
+        };
+        let peer_owner = match self.owner_of_cached(peer).await {
+            OwnerLookup::Owner(o) => Some(o),
+            _ => None,
+        };
+        if peer_owner.as_deref() == Some(owner.as_str()) {
+            return false;
+        }
+        let Some(consented) = self.owner_consented_subjects(&owner).await else {
+            return true;
+        };
+        !(consented.contains(peer) || peer_owner.is_some_and(|o| consented.contains(&o)))
+    }
+
+    /// The subjects of `owner`'s live `consent:replication` grants, memoized
+    /// for [`CONSENT_SEND_SET_MEMO_TTL`]. `None` on a read failure.
+    async fn owner_consented_subjects(&self, owner: &str) -> Option<Arc<HashSet<String>>> {
+        if let Ok(memo) = self.route_consent_memo.lock() {
+            if let Some((set, at)) = memo.get(owner) {
+                if at.elapsed() < CONSENT_SEND_SET_MEMO_TTL {
+                    return Some(Arc::clone(set));
+                }
+            }
+        }
+        let grants = match self.directory.list_live_consent_grants_by(owner).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::debug!(
+                    owner,
+                    error = %e,
+                    "route consent: the owner's grants could not be read; relayed routes \
+                     about its nodes are withheld (fail-closed)"
+                );
+                return None;
+            }
+        };
+        let set: Arc<HashSet<String>> =
+            Arc::new(grants.into_iter().flat_map(|g| g.subject_key_ids).collect());
+        if let Ok(mut memo) = self.route_consent_memo.lock() {
+            if memo.len() >= SEND_SET_MEMBERSHIP_CAP {
+                memo.clear();
+            }
+            memo.insert(owner.to_owned(), (Arc::clone(&set), Instant::now()));
+        }
+        Some(set)
+    }
+
     /// CIRISEdge#682 — the fetch-twin decision, booked at the deciding branch.
     /// Undecodable bytes fail closed (the reach cannot be decided for a row
     /// whose subject is unreadable, and the receiver could not admit it anyway).
@@ -9997,10 +10144,7 @@ impl FederationDirectoryReplicationBridge {
     ) -> bool {
         let peer_label = peer.unwrap_or("<unattributed>");
         let reason = match Self::identity_row_subject(kind, bytes) {
-            Some(subject) => self
-                .identity_row_reach(&subject)
-                .await
-                .withholds(&subject, peer),
+            Some(subject) => self.identity_row_withholds(kind, &subject, peer).await,
             None => Some(crate::observability::WithholdReason::IdentityRowAnnounceUnresolved),
         };
         let Some(reason) = reason else {
@@ -10019,12 +10163,13 @@ impl FederationDirectoryReplicationBridge {
 
     /// CIRISEdge#682 — the subject-Pull decision for one identity row about
     /// `occurrence`, booked at the deciding branch.
-    async fn identity_row_pull_withholds(&self, occurrence: &str, peer: Option<&str>) -> bool {
-        let Some(reason) = self
-            .identity_row_reach(occurrence)
-            .await
-            .withholds(occurrence, peer)
-        else {
+    async fn identity_row_pull_withholds(
+        &self,
+        kind: EnvelopeKind,
+        occurrence: &str,
+        peer: Option<&str>,
+    ) -> bool {
+        let Some(reason) = self.identity_row_withholds(kind, occurrence, peer).await else {
             return false;
         };
         self.withhold(
@@ -10041,16 +10186,13 @@ impl FederationDirectoryReplicationBridge {
     /// (sweep, subject) — the filter closure the sweep takes is synchronous.
     async fn identity_rows_withheld_from(
         &self,
+        kind: EnvelopeKind,
         subjects: &HashSet<String>,
         peer: Option<&str>,
     ) -> HashMap<String, crate::observability::WithholdReason> {
         let mut out = HashMap::new();
         for subject in subjects {
-            if let Some(reason) = self
-                .identity_row_reach(subject)
-                .await
-                .withholds(subject, peer)
-            {
+            if let Some(reason) = self.identity_row_withholds(kind, subject, peer).await {
                 out.insert(subject.clone(), reason);
             }
         }
@@ -21296,6 +21438,150 @@ pub(crate) mod tests {
         assert!(
             metrics.snapshot().withholds_by_reason.is_empty(),
             "nothing withheld for an announced node"
+        );
+    }
+
+    /// **CONSENT-GATED ROUTES (Eric 2026-10-30).** A RELAY (here `node-relay`,
+    /// standing in for the canonical) holding an announced node's route serves
+    /// it to a stranger only once that node's owner has consented to the
+    /// stranger: before, withheld and booked `route_not_consented` on the
+    /// advertise and the fetch twin; after the owner's grant names it, served.
+    /// The owner's other node is served throughout.
+    #[tokio::test]
+    async fn a_relayed_route_reaches_a_stranger_only_after_the_owners_consent() {
+        use crate::observability::WithholdReason;
+        use sha2::{Digest as _, Sha256};
+        for consented in [false, true] {
+            let backend = Arc::new(MemoryBackend::new());
+            register_fixture_keys(
+                &backend,
+                &[
+                    ("person-bob", identity_type::USER),
+                    ("node-bob", identity_type::NODE),
+                    ("node-bob-2", identity_type::NODE),
+                    ("node-relay", identity_type::NODE),
+                    ("node-stranger", identity_type::NODE),
+                ],
+            )
+            .await;
+            let id = uuid::Uuid::new_v4().to_string();
+            seed_scoped_attestation(
+                &backend,
+                &id,
+                "person-bob",
+                "node-bob",
+                "delegates_to",
+                "federation",
+                owner_binding_envelope(&id, "person-bob", "node-bob"),
+            )
+            .await;
+            seed_owner_binding(&backend, "person-bob", "node-bob-2").await;
+            if consented {
+                seed_consent_membership(&backend, "person-bob", "node-stranger").await;
+            }
+            let metrics = crate::observability::EdgeMetrics::new();
+            let publish = vec!["node-bob".to_string()];
+            let bridge = bridge_over(&backend, &[])
+                .with_self_provider(Some(Arc::new(move || publish.clone())))
+                .with_local_key_id(Some("node-relay".to_string()))
+                .with_metrics(Some(metrics.clone()));
+            let signed = sign_transport_destination_fixture(
+                "node-bob",
+                "aa00",
+                1,
+                Utc::now().trunc_subsecs(6),
+            );
+            let wire = serde_json::to_vec(&signed).expect("wire");
+            assert!(bridge
+                .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire, None)
+                .await
+                .is_admitted());
+            let hash: [u8; 32] = Sha256::digest(&wire).into();
+            let kind = EnvelopeKind::TransportDestination;
+
+            let to_stranger = advertised(
+                &bridge
+                    .list_envelope_refs_for_peer(kind, Some("node-stranger"))
+                    .await,
+                &hash,
+            );
+            let fetched = bridge
+                .fetch_envelope_bytes_for_peer(kind, &hash, Some("node-stranger"))
+                .await
+                .is_some();
+            assert_eq!(
+                (to_stranger, fetched),
+                (consented, consented),
+                "consented={consented}: the stranger gets the relayed route iff the owner \
+                 consented to it"
+            );
+            assert!(
+                advertised(
+                    &bridge
+                        .list_envelope_refs_for_peer(kind, Some("node-bob-2"))
+                        .await,
+                    &hash
+                ),
+                "the owner's other node is served regardless"
+            );
+            let booked = metrics
+                .snapshot()
+                .withholds_by_reason
+                .get(&WithholdReason::RouteNotConsented)
+                .copied()
+                .unwrap_or(0);
+            assert_eq!(booked > 0, !consented, "booked by name: {booked}");
+        }
+    }
+
+    /// **RELAY THE CONSENT REQUEST (Eric 2026-10-30).** A relay (standing in
+    /// for the canonical) that holds a contact's `consent:replication` grant
+    /// naming `node-target` hands it to `node-target`, though the relay's own
+    /// send set names nobody (so the target is a first-contact recipient), and
+    /// to no one else.
+    #[tokio::test]
+    async fn a_relay_hands_a_consent_grant_to_the_node_it_names() {
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-req", identity_type::USER),
+                ("node-relay", identity_type::NODE),
+                ("node-target", identity_type::NODE),
+                ("node-other", identity_type::NODE),
+            ],
+        )
+        .await;
+        seed_consent_membership(&backend, "person-req", "node-target").await;
+        // In the field the canonical and the nodes attached to it hold a trust
+        // root in common; the Rooted floor runs after this gate either way.
+        seed_common_root(&backend, &["node-relay", "node-target", "node-other"]).await;
+        let metrics = crate::observability::EdgeMetrics::new();
+        let bridge = bridge_over(&backend, &[])
+            .with_local_key_id(Some("node-relay".to_string()))
+            .with_metrics(Some(metrics.clone()));
+
+        let mut grant = None;
+        for r in bridge.list_attestation_holdings().await {
+            let bytes = bridge
+                .fetch_envelope_bytes(EnvelopeKind::Attestation, &r.envelope_hash)
+                .await
+                .expect("holdings resolve to bytes");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("wire json");
+            if FederationDirectoryReplicationBridge::row_dimension(&v) == "consent:replication:v1" {
+                grant = Some(r.envelope_hash);
+            }
+        }
+        let grant = grant.expect("the relay holds the grant");
+        let offered = |refs: Vec<EnvelopeRef>| refs.iter().any(|r| r.envelope_hash == grant);
+        assert!(
+            offered(bridge.list_attestations_for_peer(Some("node-target")).await),
+            "the grant crosses first contact to the node it names: {:?}",
+            metrics.snapshot().recent_withholds
+        );
+        assert!(
+            !offered(bridge.list_attestations_for_peer(Some("node-other")).await),
+            "and to no one else"
         );
     }
 
