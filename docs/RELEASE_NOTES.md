@@ -2,7 +2,14 @@
 
 # v43.4.0 — direct links that recover, traces that ship, files in chats
 
-**2026-10-30.** **MINOR** from v43.3.0. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
+**2026-10-30.** **MINOR** from v43.3.0. Pins CIRISPersist **v59.1.2** (verify v20.2.0 unchanged).
+
+- **persist v59.1.2: a phone resolves its owner (CIRISPersist#1162).** On a node that reaches persist
+  through the directory ops proxy (the pyo3 `init_edge_runtime` path: phones and agent-embedded nodes),
+  every `AttestationQuery` read failed with "method execute_attestation_query has no DirectoryOp". The
+  phone never resolved or pushed its own owner-binding, and a desktop it contacted read its owner as
+  `CONTACT UNRESOLVED`. The proxy now carries the query (and three occurrence/composer reads). Both
+  sides must be on 59.1.2. Edge carries the fix by pin.
 
 - **A room peer that refused before it joined the room is asked again (#920).** On the live mesh, the
   room's creator proposed a direct link while the joiner was not yet in the room, and the joiner
