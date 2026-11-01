@@ -184,6 +184,12 @@ pub mod peer_bundle_frame;
 #[cfg(feature = "_reticulum-module")]
 pub mod identity_model;
 
+/// Mobile-background lifecycle: suspend and resume a transport in-process
+/// (no socket, link, listener or edge task while suspended). See the module
+/// docs for the platform rules it answers and the interim design.
+pub mod lifecycle;
+pub use lifecycle::SuspendReport;
+
 /// Reticulum-native transport (OQ-07 first impl). Backed by Leviculum
 /// (`reticulum-core` + `reticulum-std`). Canonical wire per
 /// `MISSION.md` §2; HTTP is the documented fallback.
@@ -412,6 +418,12 @@ pub enum TransportError {
         /// What happened.
         detail: String,
     },
+    /// The transport is suspended (the host is in the background — see
+    /// [`lifecycle`]). Nothing was sent and nothing about the peer was
+    /// learned: callers skip quietly and retry after resume, with no backoff
+    /// and no failure recorded against the peer.
+    #[error("transport suspended (host in background); retry after resume")]
+    Suspended,
 }
 
 /// CIRISEdge#393 (E3) — a transport-attributed source `key_id` that is

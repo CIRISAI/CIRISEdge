@@ -99,6 +99,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::transport::lifecycle::SuspendReport;
 use leviculum_core::link::LinkId;
 use leviculum_core::resource::ResourceStrategy;
 use leviculum_core::{Destination, DestinationHash, DestinationType, Direction, Identity};
@@ -2595,6 +2596,20 @@ pub struct ReticulumTransport {
     /// `.try_recv()` surface — call sites unchanged, field type
     /// updated.
     events: Mutex<Option<EventReceiver>>,
+    /// Mobile-background lifecycle (see [`crate::transport::lifecycle`]): the
+    /// send gate, the listeners' park signal, and the counters suspend reads.
+    lifecycle: Arc<crate::transport::lifecycle::Lifecycle>,
+    /// TCP clients edge attaches at runtime (not through the builder), so
+    /// suspend can detach them: dropping a [`TcpClientHandle`] ends the
+    /// client's reconnect loop at whatever await it is parked on and closes
+    /// its socket. A config-loaded client has no such handle — removing it
+    /// leaves its reconnect loop running (see the lifecycle module docs).
+    /// Clients with IFAC or a no-transit posture still go through the builder
+    /// (the runtime attach carries neither) and are reported as open.
+    runtime_tcp_clients: Vec<SocketAddr>,
+    /// The live handles of [`Self::runtime_tcp_clients`]; empty while
+    /// suspended.
+    tcp_client_handles: std::sync::Mutex<Vec<leviculum_std::interfaces::TcpClientHandle>>,
     /// `key_id → rooted peer`, populated by the authenticated
     /// cold-start path from received announces. Every entry has been
     /// rooted against the persist directory + had its attestation
@@ -3472,6 +3487,9 @@ impl ReticulumTransport {
         // what was wired so `transport_stats` + `interface_specs` can
         // surface the configured set.
         let mut interface_specs: Vec<RegisteredInterface> = Vec::new();
+        // Lifecycle — TCP clients attached after `start` (detachable), not
+        // through the builder. See `ReticulumTransport::runtime_tcp_clients`.
+        let mut runtime_tcp_clients: Vec<SocketAddr> = Vec::new();
         // CIRISEdge#168 (v5.0) — Transport-node mode. Called
         // explicitly so the config's `false` default is honoured;
         // leviculum's builder otherwise defaults the knob to `true`.
@@ -3578,8 +3596,16 @@ impl ReticulumTransport {
                 ),
             });
             for peer in &config.bootstrap_peers {
-                builder =
-                    apply_tcp_client_transit(builder, *peer, config.transit, config.ifac.as_ref());
+                if runtime_attachable(config.transit, config.ifac.as_ref()) {
+                    runtime_tcp_clients.push(*peer);
+                } else {
+                    builder = apply_tcp_client_transit(
+                        builder,
+                        *peer,
+                        config.transit,
+                        config.ifac.as_ref(),
+                    );
+                }
                 interface_specs.push(RegisteredInterface {
                     handle: InterfaceHandle(interface_specs.len()),
                     kind: "TCPClientInterface".to_string(),
@@ -3598,6 +3624,24 @@ impl ReticulumTransport {
             // `TransportError::Config` if the variant is gated but
             // unimplemented, e.g. I²P).
             for iface in &config.interfaces {
+                #[cfg(feature = "transport-reticulum-tcp-client")]
+                if let ReticulumInterfaceConfig::TcpClient(cfg) = iface {
+                    if runtime_attachable(cfg.transit, cfg.ifac.as_ref()) {
+                        runtime_tcp_clients.push(cfg.target_addr);
+                        interface_specs.push(RegisteredInterface {
+                            handle: InterfaceHandle(interface_specs.len()),
+                            kind: "TCPClientInterface".to_string(),
+                            stats: TransportStats::minimal(
+                                format!("tcp-client-{}", cfg.target_addr),
+                                "TCPClientInterface",
+                                "online",
+                                0,
+                                0,
+                            ),
+                        });
+                        continue;
+                    }
+                }
                 let (next_builder, kind, name) = apply_interface_config(
                     builder,
                     iface,
@@ -3792,6 +3836,7 @@ impl ReticulumTransport {
         node.start()
             .await
             .map_err(|e| TransportError::Io(format!("reticulum node start: {e}")))?;
+        let tcp_client_handles = attach_tcp_clients(&node, &runtime_tcp_clients)?;
 
         tracing::info!(
             addr = %config.listen_addr,
@@ -3902,6 +3947,9 @@ impl ReticulumTransport {
             deferred_handshake_part: Arc::new(std::sync::Mutex::new(HashMap::new())),
             test_binding_key_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             events: Mutex::new(Some(events)),
+            lifecycle: Arc::new(crate::transport::lifecycle::Lifecycle::default()),
+            runtime_tcp_clients,
+            tcp_client_handles: std::sync::Mutex::new(tcp_client_handles),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
@@ -5296,7 +5344,9 @@ impl ReticulumTransport {
         let leased = Arc::clone(&self.scoped_link_leased);
         let last_used = Arc::clone(&self.pool_last_used);
         let dkid = destination_key_id.to_owned();
-        let dial = tokio::spawn(async move {
+        // Lifecycle — a dial is refused while suspended and cancelled by one.
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let dial = tokio::spawn(lifecycle.guard_task(async move {
             let _dial_permit = gate
                 .acquire()
                 .await
@@ -5330,7 +5380,7 @@ impl ReticulumTransport {
                 .or_default()
                 .push(link_id);
             Ok(lease)
-        });
+        }));
         dial.await
             .map_err(|e| TransportError::Io(format!("scoped dial task failed: {e}")))?
     }
@@ -6772,6 +6822,12 @@ impl ReticulumTransport {
         self.resolve_peer(destination_key_id)
             .await
             .map(|p| p.dest_hash.into_bytes())
+    }
+
+    /// Lifecycle test seam — sends running through the lifecycle gate now.
+    #[doc(hidden)]
+    pub fn sends_in_flight_for_test(&self) -> usize {
+        self.lifecycle.sends_in_flight()
     }
 
     /// v7.0.0 (CIRISEdge#191 / #195) test seam — install a synthetic
@@ -8352,7 +8408,9 @@ impl ReticulumTransport {
             let ctx = self.dial_ctx();
             let peer_owned = peer;
             let dkid = destination_key_id.to_owned();
-            let dial = tokio::spawn(async move {
+            // Lifecycle — a dial is refused while suspended and cancelled by one.
+            let lifecycle = Arc::clone(&self.lifecycle);
+            let dial = tokio::spawn(lifecycle.guard_task(async move {
                 let _dial_permit = gate
                     .acquire()
                     .await
@@ -8371,7 +8429,7 @@ impl ReticulumTransport {
                 }
                 ctx.dial_and_identify(&dkid, &peer_owned, has_path, establish_timeout)
                     .await
-            });
+            }));
             dial.await
                 .map_err(|e| TransportError::Io(format!("dial task failed: {e}")))??
         };
@@ -8987,6 +9045,432 @@ impl Transport for ReticulumTransport {
         destination_key_id: &str,
         envelope_bytes: &[u8],
     ) -> Result<TransportSendOutcome, TransportError> {
+        // Lifecycle — refused while suspended, cancelled if a suspend lands.
+        self.lifecycle
+            .guard(self.send_live(destination_key_id, envelope_bytes))
+            .await
+    }
+
+    async fn send_on_reply_path(
+        &self,
+        destination_key_id: &str,
+        path: &crate::transport::ReplyPath,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        self.lifecycle
+            .guard(self.send_on_reply_path_live(destination_key_id, path, envelope_bytes))
+            .await
+    }
+
+    async fn send_on_reply_path_only(
+        &self,
+        destination_key_id: &str,
+        path: &crate::transport::ReplyPath,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        self.lifecycle
+            .guard(self.send_on_reply_path_only_live(destination_key_id, path, envelope_bytes))
+            .await
+    }
+
+    async fn listen(&self, sink: mpsc::Sender<InboundFrame>) -> Result<(), TransportError> {
+        // Claim the node's single event receiver. A second `listen`
+        // call finds it gone — that is a wiring bug, not a runtime
+        // condition, so surface it as a config error.
+        let mut events = self
+            .events
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| TransportError::Config("listen called twice".into()))?;
+
+        tracing::info!(
+            addr = %self.config.listen_addr,
+            dest = %self.local_dest_hash,
+            named_dest = %self.local_named_dest_hash,
+            "Reticulum transport listening",
+        );
+
+        // CIRISEdge#34 — emit `transport_up` interface event. Consumers
+        // subscribed via `PyEdge.subscribe_interface_events()` observe
+        // the moment the transport reaches listening state.
+        if let Some(bus) = self.event_bus.as_ref() {
+            bus.emit_interface(crate::events::NetworkEvent::interface(
+                crate::events::EventKind::TransportUp,
+                "reticulum-rs",
+                format!(
+                    "Reticulum transport listening on {} (dest {}, named-dest {})",
+                    self.config.listen_addr, self.local_dest_hash, self.local_named_dest_hash,
+                ),
+            ));
+        }
+
+        // Lifecycle — the listener runs active (timers, reaper, announce
+        // worker) until a suspend asks it to park, parks with no timer until
+        // resume, and runs active again: one `listen` for the transport's
+        // whole life, holding the node's single event receiver throughout.
+        let _listener = self.lifecycle.listener();
+        let mut woken = false;
+        loop {
+            if self.lifecycle.park_requested() {
+                self.lifecycle.park_until_woken().await;
+            }
+            match self.listen_active(&mut events, &sink, woken).await {
+                ListenExit::Park => woken = true,
+                ListenExit::EventsClosed => break,
+            }
+        }
+
+        // CIRISEdge#34 — emit `transport_down` interface event on
+        // listener exit. Symmetric with the `transport_up` emission
+        // above; consumers observe shutdown via the same channel.
+        if let Some(bus) = self.event_bus.as_ref() {
+            bus.emit_interface(crate::events::NetworkEvent::interface(
+                crate::events::EventKind::TransportDown,
+                "reticulum-rs",
+                "Reticulum transport listen loop exited",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Lifecycle — how long a resumed listener waits for an interface to come
+/// online before its first announce.
+const RESUME_ANNOUNCE_WAIT: Duration = Duration::from_secs(10);
+
+/// Why [`ReticulumTransport::listen_active`] returned.
+enum ListenExit {
+    /// A suspend asked the listener to park.
+    Park,
+    /// The node's event channel closed: the listener ends.
+    EventsClosed,
+}
+
+impl ReticulumTransport {
+    /// One active run of the listener: the announce timer, the link reapers,
+    /// the attribution tick, the announce cold-start worker and the event
+    /// loop. Returns when a suspend asks it to park (after draining the
+    /// events already queued and ending the worker) or when the event channel
+    /// closes. `woken` — a run after a resume: its first announce waits
+    /// (bounded) for an interface to come online, since the resumed TCP
+    /// clients are still connecting.
+    // The body is the pre-lifecycle `listen` loop, unchanged but for the park
+    // arm and the worker's end; splitting it would scatter its borrows.
+    #[allow(clippy::too_many_lines)]
+    async fn listen_active(
+        &self,
+        events: &mut EventReceiver,
+        sink: &mpsc::Sender<InboundFrame>,
+        woken: bool,
+    ) -> ListenExit {
+        let _active = self.lifecycle.task();
+        if woken {
+            let deadline = tokio::time::Instant::now() + RESUME_ANNOUNCE_WAIT;
+            let online = tokio::select! {
+                // Suspended again before an interface came up.
+                () = self.lifecycle.park_signal() => return ListenExit::Park,
+                online = crate::transport::lifecycle::settle(deadline, || {
+                    let up = self.node.interface_stats().iter().any(|i| i.online);
+                    async move { up }
+                }) => online,
+            };
+            if !online {
+                tracing::info!(
+                    "resume: no interface online within {RESUME_ANNOUNCE_WAIT:?}; announcing \
+                     anyway (the interfaces re-announce when they connect)"
+                );
+            }
+        }
+
+        // v7.4.0 (CIRISEdge#231) — announce edge's NAMED destination
+        // (the standard RNS `sha256(name_hash || identity_hash)`),
+        // NOT the explicit-hash. The explicit-hash is unannounceable
+        // by Leviculum guard — every v7.0.0–v7.3.x cut WARN-spammed
+        // on every tick because the announce loop was pointed at it.
+        // Now any RNS fabric learning our announce gets a routable
+        // path to `local_named_dest_hash`. The explicit-hash stays
+        // registered for direct-dial / prime_peer back-compat.
+        //
+        // The app-data is edge's signed announce attestation
+        // (CIRISEdge#15 send side) — a federation-key signature
+        // binding this transport identity to `local_key_id`. When no
+        // signer was supplied the announce carries empty app-data and
+        // rooting peers drop it (fail-honest).
+        //
+        // CC 5.3.3.5 E1 — the announce is the one thing this transport sends
+        // OFF a link, and it stays unsealed: it is public by design (a signed
+        // routing hint every node may read and relay; there is no peer to key
+        // it to). Everything edge sends on a link rides the link seal.
+        let app_data: &[u8] = self.local_attestation.as_deref().unwrap_or(&[]);
+        let unannounced = || {
+            self.test_unannounced
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        if unannounced() {
+            tracing::debug!("unannounced (test seam): no initial announce");
+        } else if let Err(e) = self
+            .node
+            .announce_destination(&self.local_named_dest_hash, Some(app_data))
+            .await
+        {
+            tracing::warn!(error = %e, "initial announce (named destination) failed");
+        }
+        let mut announce_tick = tokio::time::interval(self.config.announce_interval);
+        announce_tick.tick().await; // consume the immediate first tick
+                                    // CIRISEdge#819 — the link-pool reaper's cadence: a quarter of the
+                                    // idle bound, kept within [250 ms, 30 s], so a lane is closed within
+                                    // a quarter-bound of going stale.
+                                    // CIRISEdge#853 — the same tick runs the responder-side inbound reap,
+                                    // so it follows the shorter of the two bounds.
+        let (pool_bound, _) = self.link_pool_policy();
+        let inbound_bound = self.inbound_link_idle_bound();
+        let reap_bound = if inbound_bound.is_zero() {
+            pool_bound
+        } else {
+            pool_bound.min(inbound_bound)
+        };
+        let mut pool_tick = tokio::time::interval(
+            (reap_bound / 4).clamp(Duration::from_millis(250), Duration::from_secs(30)),
+        );
+        pool_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        pool_tick.tick().await;
+
+        // CIRISEdge#336 (fast heal) — rate-limit gate for event-driven announces.
+        // `None` until the first link-up, so the first connecting peer triggers an
+        // announce immediately.
+        let mut last_event_announce: Option<std::time::Instant> = None;
+
+        // CIRISEdge#482 item 3 — offload announce cold-start onto a dedicated
+        // worker so a slow / contended rooting directory can no longer
+        // head-of-line every other node event behind an announce's DB
+        // round-trips. The EventReceiver select arm below `try_send`s each
+        // inbound announce here; this single worker drains them FIFO (the same
+        // serial processing order as the old inline path, just decoupled from
+        // the hot event task — so it introduces no new concurrency). The worker
+        // exits when `announce_tx` drops on listener shutdown.
+        let announce_ctx = AnnounceCtx {
+            peers: Arc::clone(&self.peers),
+            rooting: self.rooting.clone(),
+            event_bus: self.event_bus.clone(),
+            reachability: self.reachability.clone(),
+            peer_bundles: Arc::clone(&self.peer_bundles),
+            hybrid_policy: self.hybrid_policy,
+            transport_binding_enforcement: self.transport_binding_enforcement,
+            bundle_save_gate: self.bundle_save_gate,
+            local_key_id: Arc::from(self.occurrence_key_id()),
+            // CIRISEdge#530 — cheap clone (every `EdgeMetrics` field is an `Arc`).
+            metrics: self.metrics.get().cloned(),
+        };
+        let (announce_tx, mut announce_rx) = mpsc::channel::<AnnounceView>(ANNOUNCE_QUEUE_DEPTH);
+        // CIRISEdge#627 — the PRIORITY lane: announces whose Stage 1 installed a
+        // never-seen key. Drained first (`biased`), sized for a burst of fresh
+        // peers, so a re-announce flood can fill the ordinary lane without a
+        // first-contact peer ever being the one shed.
+        let (announce_priority_tx, mut announce_priority_rx) =
+            mpsc::channel::<AnnounceView>(ANNOUNCE_PRIORITY_QUEUE_DEPTH);
+        let worker_lifecycle = Arc::clone(&self.lifecycle);
+        let announce_worker = tokio::spawn(async move {
+            let _task = worker_lifecycle.task();
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    v = announce_priority_rx.recv() => v,
+                    v = announce_rx.recv() => v,
+                };
+                let Some(announce) = next else { break };
+                resolve_announce_cold_start(announce, &announce_ctx).await;
+            }
+            tracing::debug!("announce cold-start worker exiting (channel closed)");
+        });
+
+        // CC 5.3.3.5 E1 — frames waiting for their link's attribution
+        // (`release_held`) are re-checked on this tick, which runs only while
+        // some wait: a binding healed in the cold-start worker raises no event
+        // here, and a link still unattributed at the budget must be refused.
+        let mut attribution_tick = tokio::time::interval(Duration::from_millis(100));
+        attribution_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let ctx = EventCtx {
+            node: &self.node,
+            local_key_id: self.occurrence_key_id(),
+            route_answer_override: &self.route_answer_override,
+            peers: &self.peers,
+            established_links: &self.established_links,
+            sent_resource_progress: &self.sent_resource_progress,
+            sink,
+            rooting: self.rooting.as_deref(),
+            hybrid_policy: self.hybrid_policy,
+            binding_cache: &self.binding_cache,
+            announce_tx: &announce_tx,
+            announce_priority_tx: &announce_priority_tx,
+            transport_binding_enforcement: self.transport_binding_enforcement,
+            metrics: self.metrics.get(),
+            bundle_save_gate: self.bundle_save_gate,
+            peer_bundles: &self.peer_bundles,
+            own_bundle: self.own_bundle.as_ref(),
+            own_announce_frame: self.own_announce_frame.as_deref(),
+            event_bus: self.event_bus.as_deref(),
+            link_established_at: &self.link_established_at,
+            reusable_dialed_link: &self.reusable_dialed_link,
+            link_in_flight: &self.link_in_flight,
+            inbound_resource_active: &self.inbound_resource_active,
+            pool_last_used: &self.pool_last_used,
+            link_to_peer_key_id: &self.link_to_peer_key_id,
+            link_last_inbound_at: &self.link_last_inbound_at,
+            inbound_reasm: &self.inbound_reasm,
+            dialed_link_dest: &self.dialed_link_dest,
+            link_plane: &self.link_plane,
+            scope_addresses: &self.scope_addresses,
+            #[cfg(feature = "lxmf")]
+            lxmf_serve: &self.lxmf_serve,
+            congestion: &self.congestion,
+            peer_reachable: &self.peer_reachable,
+            link_direction: &self.link_direction,
+            metrics_source: self.metrics_source,
+            #[cfg(feature = "lxmf")]
+            lxmf_serve_links: &self.lxmf_serve_links,
+            swallow_link_closed: &self.swallow_link_closed,
+            reusable_scoped_link: &self.reusable_scoped_link,
+            concluded_resources: &self.concluded_resources,
+            swallow_link_established: &self.swallow_link_established,
+            link_last_outbound_at: &self.link_last_outbound_at,
+            av_sink: &self.av_sink,
+            av_node: &self.node,
+            av_dialed_peer: &self.av_dialed_peer,
+            direct_paths: &self.direct_paths,
+            seals: &self.seals,
+            shapers: &self.shapers,
+        };
+        let exit = loop {
+            tokio::select! {
+                // Lifecycle — a suspend: handle what the link closes already
+                // queued (so the pool and attribution maps forget the closed
+                // links), then stop. The timers above end with this run.
+                () = self.lifecycle.park_signal() => {
+                    while let Ok(event) = events.try_recv() {
+                        handle_event(event, &ctx).await;
+                    }
+                    break ListenExit::Park;
+                }
+                _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution() => {
+                    for link in ctx.seals.awaiting_attribution() {
+                        release_held(&ctx, LinkId::new(link)).await;
+                    }
+                }
+                _ = pool_tick.tick() => {
+                    let closed = self.reap_idle_pooled_links().await;
+                    if closed > 0 {
+                        tracing::debug!(
+                            closed,
+                            "link-pool reaper closed idle pooled links (CIRISEdge#819)"
+                        );
+                    }
+                    // CIRISEdge#853 — link-ups that never reached an
+                    // application frame within the establish window.
+                    if let Some(m) = self.metrics.get() {
+                        m.responder_link_up_expire();
+                    }
+                    let closed = self.reap_idle_inbound_links().await;
+                    if closed > 0 {
+                        tracing::debug!(
+                            closed,
+                            "inbound reaper closed idle inbound links (CIRISEdge#853)"
+                        );
+                    }
+                }
+                _ = announce_tick.tick() => {
+                    if unannounced() {
+                        tracing::trace!("unannounced (test seam): no periodic announce");
+                    } else if let Err(e) = self
+                        .node
+                        .announce_destination(&self.local_named_dest_hash, Some(app_data))
+                        .await
+                    {
+                        tracing::warn!(error = %e, "periodic announce (named destination) failed");
+                    }
+                    // CIRISEdge#809 — mirror leviculum's eviction count on the
+                    // announce cadence, so the gauge moves without a reader
+                    // asking the transport first (a brief node lock).
+                    let _ = self.known_destination_evictions();
+                    // CIRISEdge#406 — re-arm the signed transport-destination
+                    // producer on the announce cadence. Memoized once current
+                    // (no directory read after success); until then this heals
+                    // the boot-order faults (directory unavailable at
+                    // construction, own federation key registered after the
+                    // transport came up) without a restart.
+                    if let Some(rooting) = self.rooting.as_deref() {
+                        let _outcome = self
+                            .self_route
+                            .ensure(
+                                &self.local_signer,
+                                rooting,
+                                self.local_named_dest_hash(),
+                                self.local_transport_pubkey,
+                                self.seals.secret().pair(),
+                                self.config.local_epoch,
+                            )
+                            .await;
+                    }
+                }
+                event = events.recv() => {
+                    let Some(event) = event else {
+                        tracing::info!("Reticulum event channel closed; listener exiting");
+                        break ListenExit::EventsClosed;
+                    };
+                    // CIRISEdge#336 (fast heal) — RNS-aligned event-driven announce.
+                    // A `LinkEstablished` means a peer just connected; re-announce so
+                    // it learns our routable NAMED dest in seconds (→ the #336 belt
+                    // heals its route now, not after the next ~5 min periodic tick).
+                    // Rate-limited so rapid link churn can't storm announces.
+                    let link_just_established =
+                        matches!(event, NodeEvent::LinkEstablished { .. });
+                    handle_event(event, &ctx).await;
+
+                    // `map_or(true, …)` not `is_none_or` — MSRV 1.75 (is_none_or is 1.82).
+                    if link_just_established
+                        && !unannounced()
+                        && last_event_announce
+                            .map_or(true, |t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
+                    {
+                        last_event_announce = Some(std::time::Instant::now());
+                        match self
+                            .node
+                            .announce_destination(&self.local_named_dest_hash, Some(app_data))
+                            .await
+                        {
+                            Ok(()) => tracing::debug!(
+                                "event-driven announce on link-up — RNS-aligned fast \
+                                 convergence (CIRISEdge#336)"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "event-driven announce (link up) failed"
+                            ),
+                        }
+                    }
+                }
+            }
+        };
+        // End this run's announce worker: its queues close with `ctx` and the
+        // senders; the abort ends a cold-start resolution still in progress.
+        drop(ctx);
+        drop(announce_tx);
+        drop(announce_priority_tx);
+        announce_worker.abort();
+        let _ = announce_worker.await;
+        exit
+    }
+}
+
+/// The [`Transport`] send bodies, run by the trait methods behind the
+/// lifecycle gate ([`crate::transport::lifecycle`]).
+impl ReticulumTransport {
+    async fn send_live(
+        &self,
+        destination_key_id: &str,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
         // AV-13: reject oversized payloads before touching the network.
         if envelope_bytes.len() > MAX_BODY_BYTES {
             return Err(TransportError::BodyTooLarge {
@@ -9121,7 +9605,7 @@ impl Transport for ReticulumTransport {
     /// by another transport, or a link that has since closed, falls back to the
     /// by-key [`Self::send`] (which still tries the peer's attributed links and
     /// then a dial).
-    async fn send_on_reply_path(
+    async fn send_on_reply_path_live(
         &self,
         destination_key_id: &str,
         path: &crate::transport::ReplyPath,
@@ -9158,7 +9642,7 @@ impl Transport for ReticulumTransport {
         self.send(destination_key_id, envelope_bytes).await
     }
 
-    async fn send_on_reply_path_only(
+    async fn send_on_reply_path_only_live(
         &self,
         destination_key_id: &str,
         path: &crate::transport::ReplyPath,
@@ -9205,310 +9689,6 @@ impl Transport for ReticulumTransport {
              on is gone or would not carry the reply (CIRISEdge#739)",
             hex::encode(path.token())
         )))
-    }
-
-    async fn listen(&self, sink: mpsc::Sender<InboundFrame>) -> Result<(), TransportError> {
-        // Claim the node's single event receiver. A second `listen`
-        // call finds it gone — that is a wiring bug, not a runtime
-        // condition, so surface it as a config error.
-        let mut events = self
-            .events
-            .lock()
-            .await
-            .take()
-            .ok_or_else(|| TransportError::Config("listen called twice".into()))?;
-
-        tracing::info!(
-            addr = %self.config.listen_addr,
-            dest = %self.local_dest_hash,
-            named_dest = %self.local_named_dest_hash,
-            "Reticulum transport listening",
-        );
-
-        // CIRISEdge#34 — emit `transport_up` interface event. Consumers
-        // subscribed via `PyEdge.subscribe_interface_events()` observe
-        // the moment the transport reaches listening state.
-        if let Some(bus) = self.event_bus.as_ref() {
-            bus.emit_interface(crate::events::NetworkEvent::interface(
-                crate::events::EventKind::TransportUp,
-                "reticulum-rs",
-                format!(
-                    "Reticulum transport listening on {} (dest {}, named-dest {})",
-                    self.config.listen_addr, self.local_dest_hash, self.local_named_dest_hash,
-                ),
-            ));
-        }
-
-        // v7.4.0 (CIRISEdge#231) — announce edge's NAMED destination
-        // (the standard RNS `sha256(name_hash || identity_hash)`),
-        // NOT the explicit-hash. The explicit-hash is unannounceable
-        // by Leviculum guard — every v7.0.0–v7.3.x cut WARN-spammed
-        // on every tick because the announce loop was pointed at it.
-        // Now any RNS fabric learning our announce gets a routable
-        // path to `local_named_dest_hash`. The explicit-hash stays
-        // registered for direct-dial / prime_peer back-compat.
-        //
-        // The app-data is edge's signed announce attestation
-        // (CIRISEdge#15 send side) — a federation-key signature
-        // binding this transport identity to `local_key_id`. When no
-        // signer was supplied the announce carries empty app-data and
-        // rooting peers drop it (fail-honest).
-        //
-        // CC 5.3.3.5 E1 — the announce is the one thing this transport sends
-        // OFF a link, and it stays unsealed: it is public by design (a signed
-        // routing hint every node may read and relay; there is no peer to key
-        // it to). Everything edge sends on a link rides the link seal.
-        let app_data: &[u8] = self.local_attestation.as_deref().unwrap_or(&[]);
-        let unannounced = || {
-            self.test_unannounced
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
-        if unannounced() {
-            tracing::debug!("unannounced (test seam): no initial announce");
-        } else if let Err(e) = self
-            .node
-            .announce_destination(&self.local_named_dest_hash, Some(app_data))
-            .await
-        {
-            tracing::warn!(error = %e, "initial announce (named destination) failed");
-        }
-        let mut announce_tick = tokio::time::interval(self.config.announce_interval);
-        announce_tick.tick().await; // consume the immediate first tick
-                                    // CIRISEdge#819 — the link-pool reaper's cadence: a quarter of the
-                                    // idle bound, kept within [250 ms, 30 s], so a lane is closed within
-                                    // a quarter-bound of going stale.
-                                    // CIRISEdge#853 — the same tick runs the responder-side inbound reap,
-                                    // so it follows the shorter of the two bounds.
-        let (pool_bound, _) = self.link_pool_policy();
-        let inbound_bound = self.inbound_link_idle_bound();
-        let reap_bound = if inbound_bound.is_zero() {
-            pool_bound
-        } else {
-            pool_bound.min(inbound_bound)
-        };
-        let mut pool_tick = tokio::time::interval(
-            (reap_bound / 4).clamp(Duration::from_millis(250), Duration::from_secs(30)),
-        );
-        pool_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        pool_tick.tick().await;
-
-        // CIRISEdge#336 (fast heal) — rate-limit gate for event-driven announces.
-        // `None` until the first link-up, so the first connecting peer triggers an
-        // announce immediately.
-        let mut last_event_announce: Option<std::time::Instant> = None;
-
-        // CIRISEdge#482 item 3 — offload announce cold-start onto a dedicated
-        // worker so a slow / contended rooting directory can no longer
-        // head-of-line every other node event behind an announce's DB
-        // round-trips. The EventReceiver select arm below `try_send`s each
-        // inbound announce here; this single worker drains them FIFO (the same
-        // serial processing order as the old inline path, just decoupled from
-        // the hot event task — so it introduces no new concurrency). The worker
-        // exits when `announce_tx` drops on listener shutdown.
-        let announce_ctx = AnnounceCtx {
-            peers: Arc::clone(&self.peers),
-            rooting: self.rooting.clone(),
-            event_bus: self.event_bus.clone(),
-            reachability: self.reachability.clone(),
-            peer_bundles: Arc::clone(&self.peer_bundles),
-            hybrid_policy: self.hybrid_policy,
-            transport_binding_enforcement: self.transport_binding_enforcement,
-            bundle_save_gate: self.bundle_save_gate,
-            local_key_id: Arc::from(self.occurrence_key_id()),
-            // CIRISEdge#530 — cheap clone (every `EdgeMetrics` field is an `Arc`).
-            metrics: self.metrics.get().cloned(),
-        };
-        let (announce_tx, mut announce_rx) = mpsc::channel::<AnnounceView>(ANNOUNCE_QUEUE_DEPTH);
-        // CIRISEdge#627 — the PRIORITY lane: announces whose Stage 1 installed a
-        // never-seen key. Drained first (`biased`), sized for a burst of fresh
-        // peers, so a re-announce flood can fill the ordinary lane without a
-        // first-contact peer ever being the one shed.
-        let (announce_priority_tx, mut announce_priority_rx) =
-            mpsc::channel::<AnnounceView>(ANNOUNCE_PRIORITY_QUEUE_DEPTH);
-        tokio::spawn(async move {
-            loop {
-                let next = tokio::select! {
-                    biased;
-                    v = announce_priority_rx.recv() => v,
-                    v = announce_rx.recv() => v,
-                };
-                let Some(announce) = next else { break };
-                resolve_announce_cold_start(announce, &announce_ctx).await;
-            }
-            tracing::debug!("announce cold-start worker exiting (channel closed)");
-        });
-
-        // CC 5.3.3.5 E1 — frames waiting for their link's attribution
-        // (`release_held`) are re-checked on this tick, which runs only while
-        // some wait: a binding healed in the cold-start worker raises no event
-        // here, and a link still unattributed at the budget must be refused.
-        let mut attribution_tick = tokio::time::interval(Duration::from_millis(100));
-        attribution_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let ctx = EventCtx {
-            node: &self.node,
-            local_key_id: self.occurrence_key_id(),
-            route_answer_override: &self.route_answer_override,
-            peers: &self.peers,
-            established_links: &self.established_links,
-            sent_resource_progress: &self.sent_resource_progress,
-            sink: &sink,
-            rooting: self.rooting.as_deref(),
-            hybrid_policy: self.hybrid_policy,
-            binding_cache: &self.binding_cache,
-            announce_tx: &announce_tx,
-            announce_priority_tx: &announce_priority_tx,
-            transport_binding_enforcement: self.transport_binding_enforcement,
-            metrics: self.metrics.get(),
-            bundle_save_gate: self.bundle_save_gate,
-            peer_bundles: &self.peer_bundles,
-            own_bundle: self.own_bundle.as_ref(),
-            own_announce_frame: self.own_announce_frame.as_deref(),
-            event_bus: self.event_bus.as_deref(),
-            link_established_at: &self.link_established_at,
-            reusable_dialed_link: &self.reusable_dialed_link,
-            link_in_flight: &self.link_in_flight,
-            inbound_resource_active: &self.inbound_resource_active,
-            pool_last_used: &self.pool_last_used,
-            link_to_peer_key_id: &self.link_to_peer_key_id,
-            link_last_inbound_at: &self.link_last_inbound_at,
-            inbound_reasm: &self.inbound_reasm,
-            dialed_link_dest: &self.dialed_link_dest,
-            link_plane: &self.link_plane,
-            scope_addresses: &self.scope_addresses,
-            #[cfg(feature = "lxmf")]
-            lxmf_serve: &self.lxmf_serve,
-            congestion: &self.congestion,
-            peer_reachable: &self.peer_reachable,
-            link_direction: &self.link_direction,
-            metrics_source: self.metrics_source,
-            #[cfg(feature = "lxmf")]
-            lxmf_serve_links: &self.lxmf_serve_links,
-            swallow_link_closed: &self.swallow_link_closed,
-            reusable_scoped_link: &self.reusable_scoped_link,
-            concluded_resources: &self.concluded_resources,
-            swallow_link_established: &self.swallow_link_established,
-            link_last_outbound_at: &self.link_last_outbound_at,
-            av_sink: &self.av_sink,
-            av_node: &self.node,
-            av_dialed_peer: &self.av_dialed_peer,
-            direct_paths: &self.direct_paths,
-            seals: &self.seals,
-            shapers: &self.shapers,
-        };
-        loop {
-            tokio::select! {
-                _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution() => {
-                    for link in ctx.seals.awaiting_attribution() {
-                        release_held(&ctx, LinkId::new(link)).await;
-                    }
-                }
-                _ = pool_tick.tick() => {
-                    let closed = self.reap_idle_pooled_links().await;
-                    if closed > 0 {
-                        tracing::debug!(
-                            closed,
-                            "link-pool reaper closed idle pooled links (CIRISEdge#819)"
-                        );
-                    }
-                    // CIRISEdge#853 — link-ups that never reached an
-                    // application frame within the establish window.
-                    if let Some(m) = self.metrics.get() {
-                        m.responder_link_up_expire();
-                    }
-                    let closed = self.reap_idle_inbound_links().await;
-                    if closed > 0 {
-                        tracing::debug!(
-                            closed,
-                            "inbound reaper closed idle inbound links (CIRISEdge#853)"
-                        );
-                    }
-                }
-                _ = announce_tick.tick() => {
-                    if unannounced() {
-                        tracing::trace!("unannounced (test seam): no periodic announce");
-                    } else if let Err(e) = self
-                        .node
-                        .announce_destination(&self.local_named_dest_hash, Some(app_data))
-                        .await
-                    {
-                        tracing::warn!(error = %e, "periodic announce (named destination) failed");
-                    }
-                    // CIRISEdge#809 — mirror leviculum's eviction count on the
-                    // announce cadence, so the gauge moves without a reader
-                    // asking the transport first (a brief node lock).
-                    let _ = self.known_destination_evictions();
-                    // CIRISEdge#406 — re-arm the signed transport-destination
-                    // producer on the announce cadence. Memoized once current
-                    // (no directory read after success); until then this heals
-                    // the boot-order faults (directory unavailable at
-                    // construction, own federation key registered after the
-                    // transport came up) without a restart.
-                    if let Some(rooting) = self.rooting.as_deref() {
-                        let _outcome = self
-                            .self_route
-                            .ensure(
-                                &self.local_signer,
-                                rooting,
-                                self.local_named_dest_hash(),
-                                self.local_transport_pubkey,
-                                self.seals.secret().pair(),
-                                self.config.local_epoch,
-                            )
-                            .await;
-                    }
-                }
-                event = events.recv() => {
-                    let Some(event) = event else {
-                        tracing::info!("Reticulum event channel closed; listener exiting");
-                        break;
-                    };
-                    // CIRISEdge#336 (fast heal) — RNS-aligned event-driven announce.
-                    // A `LinkEstablished` means a peer just connected; re-announce so
-                    // it learns our routable NAMED dest in seconds (→ the #336 belt
-                    // heals its route now, not after the next ~5 min periodic tick).
-                    // Rate-limited so rapid link churn can't storm announces.
-                    let link_just_established =
-                        matches!(event, NodeEvent::LinkEstablished { .. });
-                    handle_event(event, &ctx).await;
-
-                    // `map_or(true, …)` not `is_none_or` — MSRV 1.75 (is_none_or is 1.82).
-                    if link_just_established
-                        && !unannounced()
-                        && last_event_announce
-                            .map_or(true, |t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
-                    {
-                        last_event_announce = Some(std::time::Instant::now());
-                        match self
-                            .node
-                            .announce_destination(&self.local_named_dest_hash, Some(app_data))
-                            .await
-                        {
-                            Ok(()) => tracing::debug!(
-                                "event-driven announce on link-up — RNS-aligned fast \
-                                 convergence (CIRISEdge#336)"
-                            ),
-                            Err(e) => tracing::warn!(
-                                error = %e,
-                                "event-driven announce (link up) failed"
-                            ),
-                        }
-                    }
-                }
-            }
-        }
-
-        // CIRISEdge#34 — emit `transport_down` interface event on
-        // listener exit. Symmetric with the `transport_up` emission
-        // above; consumers observe shutdown via the same channel.
-        if let Some(bus) = self.event_bus.as_ref() {
-            bus.emit_interface(crate::events::NetworkEvent::interface(
-                crate::events::EventKind::TransportDown,
-                "reticulum-rs",
-                "Reticulum transport listen loop exited",
-            ));
-        }
-
-        Ok(())
     }
 }
 
@@ -17757,6 +17937,221 @@ fn set_owner_only(_path: &std::path::Path) -> Result<(), TransportError> {
 /// predicate. IFAC-only → `add_tcp_server_ifac`; no-transit-only →
 /// `add_tcp_server_no_transit`; the IFAC+no-transit combo (a member-only LEAF
 /// port — no convenience method covers it) → the general `add_interface_config`.
+/// Lifecycle — how long [`ReticulumTransport::resume`] waits for its TCP
+/// clients to connect before reopening the send gate, so the first sends after
+/// a resume do not dial into an interface that is still connecting.
+const RESUME_CONNECT_WAIT: Duration = Duration::from_secs(5);
+
+/// Lifecycle — the most a suspend waits after closing its links for their
+/// LINKCLOSE packets to be written before the interfaces go.
+const SUSPEND_FLUSH_GRACE: Duration = Duration::from_millis(100);
+
+/// Leviculum's own tasks while the node runs: its event loop and its
+/// traffic-counter thread. They outlive a suspend until leviculum#90.
+const NODE_TASKS_WHILE_RUNNING: usize = 2;
+
+/// **Mobile-background lifecycle** — see [`crate::transport::lifecycle`] for
+/// the platform rules and the interim design.
+impl ReticulumTransport {
+    /// Whether the transport is suspended (sends refused with
+    /// [`TransportError::Suspended`]).
+    #[must_use]
+    pub fn is_suspended(&self) -> bool {
+        self.lifecycle.is_suspended()
+    }
+
+    /// Suspend: refuse sends, close every link, park the listener, detach the
+    /// interfaces, and return once nothing is left open — or at `deadline`,
+    /// reporting what still is. Idempotent: a second call redoes every step
+    /// (each is idempotent) and reports `already_suspended`, so it also
+    /// finishes what a suspend cut short by its deadline left behind. Never
+    /// fails; [`SuspendReport::quiescent`] says whether it got there.
+    pub async fn suspend(&self, deadline: Duration) -> SuspendReport {
+        use crate::transport::lifecycle::settle;
+        let started = std::time::Instant::now();
+        let until = tokio::time::Instant::now() + deadline;
+        let Ok(_op) = tokio::time::timeout_at(until, self.lifecycle.lock_op()).await else {
+            // A resume still running holds the lock past our whole budget.
+            return self.suspend_report(started, self.lifecycle.is_suspended());
+        };
+        let already = self.lifecycle.close_gate();
+        if !already {
+            tracing::info!(
+                links = self.node.link_list().len(),
+                ?deadline,
+                "transport SUSPENDING (host entering background): sends refused, \
+                 closing links, parking the listener, detaching interfaces"
+            );
+        }
+        // Close every link — pooled, inbound, A/V, scoped, direct — at the
+        // node, while the interfaces are still up to carry the LINKCLOSEs.
+        for info in self.node.link_list() {
+            if self.node.direct_link_interface(&info.link_id).is_some() {
+                let _ = self.node.retire_direct_link(&info.link_id).await;
+            }
+            let _ = self.node.close_link(&info.link_id).await;
+        }
+        settle(until, || {
+            let open = self.node.link_list().len();
+            async move { open == 0 }
+        })
+        .await;
+        // Park the listener: it drains the closes' events and stops its
+        // timers and its announce worker.
+        self.lifecycle.request_park(true);
+        let flush = tokio::time::Instant::now() + SUSPEND_FLUSH_GRACE;
+        settle(until.min(flush), || {
+            let unparked = self.lifecycle.listeners_unparked();
+            async move { unparked == 0 }
+        })
+        .await;
+        self.quiesce_node();
+        settle(until, || {
+            let quiet = self.quiescent_now();
+            async move { quiet }
+        })
+        .await;
+        let report = self.suspend_report(started, already);
+        tracing::info!(?report, "transport suspended");
+        report
+    }
+
+    /// Resume: reattach the interfaces, reopen the send gate and wake the
+    /// listener, whose first run announces. Idempotent, and a no-op when not
+    /// suspended. On an error the transport stays suspended.
+    pub async fn resume(&self) -> Result<(), TransportError> {
+        let _op = self.lifecycle.lock_op().await;
+        if !self.lifecycle.is_suspended() {
+            return Ok(());
+        }
+        self.wake_node()?;
+        if !self.runtime_tcp_clients.is_empty() {
+            let until = tokio::time::Instant::now() + RESUME_CONNECT_WAIT;
+            let connected = crate::transport::lifecycle::settle(until, || {
+                let up = self.node.interface_stats().iter().any(|i| i.online);
+                async move { up }
+            })
+            .await;
+            if !connected {
+                tracing::info!(
+                    "resume: no TCP client connected within {RESUME_CONNECT_WAIT:?}; \
+                     reopening sends anyway (the clients keep reconnecting)"
+                );
+            }
+        }
+        self.lifecycle.open_gate();
+        self.lifecycle.request_park(false);
+        // The interfaces were detached, so the node forgot the paths learned
+        // through them; ask again for every peer we hold, instead of waiting
+        // for each peer's next announce.
+        let dests: Vec<DestinationHash> = self
+            .peers
+            .lock()
+            .await
+            .values()
+            .map(|p| p.peer.dest_hash)
+            .collect();
+        for dest in &dests {
+            let _ = self.node.request_path(dest).await;
+        }
+        tracing::info!(
+            paths_requested = dests.len(),
+            "transport RESUMED (host in foreground): interfaces reattached, sends open"
+        );
+        Ok(())
+    }
+
+    /// Take the node's interfaces down. Interim (leviculum#90 makes this
+    /// `node.stop()`): detach the runtime TCP clients and remove the
+    /// connections a TCP server accepted. The listening socket itself, and
+    /// any interface edge could not attach at runtime, stay — the report
+    /// says so.
+    fn quiesce_node(&self) {
+        let detached = std::mem::take(
+            &mut *self
+                .tcp_client_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        drop(detached);
+        for iface in self.node.interface_stats() {
+            if iface.name.starts_with("tcp_server/") {
+                let _ = self.node.remove_interface(iface.interface_id);
+            }
+        }
+    }
+
+    /// Bring the node's interfaces back (leviculum#90: `node.start()`).
+    fn wake_node(&self) -> Result<(), TransportError> {
+        let mut handles = self
+            .tcp_client_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if handles.is_empty() {
+            *handles = attach_tcp_clients(&self.node, &self.runtime_tcp_clients)?;
+        }
+        Ok(())
+    }
+
+    fn quiescent_now(&self) -> bool {
+        self.node.link_list().is_empty()
+            && self.node.interface_stats().is_empty()
+            && self.node.tcp_listen_addrs().is_empty()
+            && self.lifecycle.edge_tasks() == 0
+            && self.lifecycle.sends_in_flight() == 0
+            && self.lifecycle.listeners_unparked() == 0
+    }
+
+    fn suspend_report(&self, started: std::time::Instant, already: bool) -> SuspendReport {
+        let edge_tasks = self.lifecycle.edge_tasks();
+        let node_tasks = if self.node.is_running() {
+            NODE_TASKS_WHILE_RUNNING
+        } else {
+            0
+        };
+        SuspendReport {
+            already_suspended: already,
+            quiescent: self.lifecycle.is_suspended() && self.quiescent_now(),
+            elapsed: started.elapsed(),
+            links_open: self.node.link_list().len(),
+            interfaces_open: self.node.interface_stats().len(),
+            listener_open: !self.node.tcp_listen_addrs().is_empty(),
+            tasks_running: edge_tasks + node_tasks,
+            sends_in_flight: self.lifecycle.sends_in_flight(),
+            edge_tasks,
+            node_tasks,
+        }
+    }
+}
+
+/// Lifecycle — whether a TCP client can be attached at runtime (and so
+/// detached on suspend): leviculum's runtime attach carries neither IFAC nor
+/// a no-transit posture, so those clients stay on the builder.
+fn runtime_attachable(transit: Option<bool>, ifac: Option<&IfacConfig>) -> bool {
+    ifac.is_none() && transit != Some(false)
+}
+
+/// Lifecycle — attach each runtime TCP client to a started node. The handle
+/// keeps it attached; dropping it detaches it (reconnect loop ended, socket
+/// closed).
+fn attach_tcp_clients(
+    node: &ReticulumNode,
+    targets: &[SocketAddr],
+) -> Result<Vec<leviculum_std::interfaces::TcpClientHandle>, TransportError> {
+    targets
+        .iter()
+        .map(|addr| {
+            node.spawn_tcp_client(
+                &format!("tcp-client-{addr}"),
+                &addr.ip().to_string(),
+                addr.port(),
+                None,
+            )
+            .map_err(|e| TransportError::Io(format!("attach TCP client {addr}: {e}")))
+        })
+        .collect()
+}
+
 fn apply_tcp_server_transit(
     builder: ReticulumNodeBuilder,
     addr: SocketAddr,

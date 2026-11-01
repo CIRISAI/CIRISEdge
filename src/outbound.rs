@@ -640,8 +640,20 @@ async fn dispatch_one(
                 );
             }
         }
+        Err(TransportError::Suspended) => {
+            // Lifecycle — the transport is suspended (host in background):
+            // nothing was attempted, so no attempt is charged and no backoff
+            // drawn. The row stays claimed; its claim lapses and the row is
+            // claimed again after resume. (`Edge::suspend` stops this
+            // dispatcher first; this arm covers a transport suspended alone.)
+            tracing::debug!(
+                queue_id = ?row.queue_id,
+                "dispatcher: transport suspended; row left for after resume"
+            );
+        }
         Err(e) => {
             let class = match &e {
+                TransportError::Suspended => "suspended",
                 TransportError::Unreachable(_) => "unreachable",
                 TransportError::Timeout(_) => "timeout",
                 TransportError::Config(_) => "config",

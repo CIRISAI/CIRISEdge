@@ -1044,6 +1044,13 @@ async fn round_and_report(
     let recovery = match run_one_recovery_round(coord, round_timeout).await {
         Ok(step) => step,
         Err(e) => {
+            // Lifecycle — the transport is suspended: skip quietly. The
+            // ordinary round would be refused the same way; nothing is
+            // reported and no backoff moves.
+            if matches!(round_class_of(&e), RoundClass::Suspended) {
+                tracing::debug!("signer-recovery round skipped: transport suspended");
+                return RoundClass::Suspended;
+            }
             // CIRISEdge#794 — no route: the ordinary round would fail the
             // same way, so it does not run; the backoff takes over.
             if let RoundClass::NoRoute(error) = round_class_of(&e) {
@@ -1083,6 +1090,12 @@ async fn round_and_report(
         Ok(_) => RoundClass::Other,
         Err(e) => round_class_of(e),
     };
+    // Lifecycle — a round refused because the transport is suspended is not
+    // an error of the round: skip quietly, no event, no backoff.
+    if matches!(class, RoundClass::Suspended) {
+        tracing::debug!("round skipped: transport suspended");
+        return class;
+    }
     let event = match outcome {
         // CIRISEdge#380 — run_one_round converts SendThenComplete to
         // Complete after sending; the merged arm is defensive if it

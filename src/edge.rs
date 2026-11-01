@@ -1416,6 +1416,15 @@ pub struct Edge {
     /// `EdgeBindingsError::Unsupported`.
     #[cfg(feature = "_reticulum-module")]
     reticulum_transport: Option<Arc<crate::transport::reticulum::ReticulumTransport>>,
+    /// Mobile-background lifecycle — edge's own background loops (durable
+    /// outbound dispatcher, sweeps, blackhole pruner), stopped by
+    /// [`Self::suspend`] and respawned by [`Self::resume`].
+    background: crate::transport::lifecycle::PausableTasks,
+    /// Mobile-background lifecycle — `true` between [`Self::suspend`] and
+    /// [`Self::resume`].
+    suspended: std::sync::atomic::AtomicBool,
+    /// Serializes [`Self::suspend`] and [`Self::resume`].
+    lifecycle_op: tokio::sync::Mutex<()>,
     /// CIRISEdge#499 — the scope-address lifecycle, present only when the
     /// operator opted in via [`EdgeBuilder::scope_native_addressing`] AND a
     /// Reticulum transport is wired. `None` is the default and is
@@ -2640,6 +2649,12 @@ impl Edge {
                     self.metrics.inc_send_failure(transport.id(), class);
                 }
                 o
+            }
+            // Lifecycle — suspended: nothing was attempted, so nothing is
+            // recorded against the peer.
+            Err(e @ crate::TransportError::Suspended) => {
+                self.retire_ephemeral_waiter(waiter.as_ref());
+                return Err(EdgeError::Transport(e));
             }
             Err(e) => {
                 let error_class = transport_error_class(&e).to_string();
@@ -4667,6 +4682,78 @@ impl Edge {
         tasks
     }
 
+    /// **Mobile background: suspend.** The host calls this from its
+    /// `enter_background(deadline)` (Android Doze / App Standby, iOS background
+    /// suspension — see [`crate::transport::lifecycle`] for the platform rules
+    /// and the design). Stops edge's background loops (durable outbound
+    /// dispatcher, sweeps, blackhole pruner), then suspends the Reticulum
+    /// transport: sends refused with
+    /// [`TransportError::Suspended`](crate::TransportError::Suspended), every
+    /// link closed, the listener parked, the interfaces detached. Returns once
+    /// nothing is left open, or at `deadline` with what still is.
+    ///
+    /// Idempotent; never fails. Does not rebuild anything: [`Self::resume`]
+    /// brings the same `Edge` (and the replication runtime riding it) back.
+    pub async fn suspend(&self, deadline: std::time::Duration) -> crate::transport::SuspendReport {
+        let started = std::time::Instant::now();
+        let until = tokio::time::Instant::now() + deadline;
+        let Ok(_op) = tokio::time::timeout_at(until, self.lifecycle_op.lock()).await else {
+            return crate::transport::SuspendReport {
+                already_suspended: self.is_suspended(),
+                elapsed: started.elapsed(),
+                edge_tasks: self.background.running(),
+                tasks_running: self.background.running(),
+                ..Default::default()
+            };
+        };
+        let already = self
+            .suspended
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        let background_left = self.background.pause(until).await;
+        let own = crate::transport::SuspendReport {
+            already_suspended: already,
+            quiescent: background_left == 0,
+            elapsed: started.elapsed(),
+            tasks_running: background_left,
+            edge_tasks: background_left,
+            ..Default::default()
+        };
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            let mut report = t.suspend(left).await.merge(&own);
+            report.elapsed = started.elapsed();
+            return report;
+        }
+        own
+    }
+
+    /// **Mobile background: resume.** The host calls this from its
+    /// `enter_foreground()`. Reattaches the Reticulum transport's interfaces,
+    /// reopens sends, wakes the listener (which announces), and respawns
+    /// edge's background loops. Idempotent; a no-op when not suspended. On an
+    /// error the edge stays suspended and the call may be retried.
+    pub async fn resume(&self) -> Result<(), EdgeError> {
+        let _op = self.lifecycle_op.lock().await;
+        if !self.is_suspended() {
+            return Ok(());
+        }
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            t.resume().await?;
+        }
+        self.background.resume();
+        self.suspended
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether [`Self::suspend`] is in force.
+    #[must_use]
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// CIRISEdge#243 — spawn the outbound dispatcher + periodic sweeps on
     /// the supplied edge-side runtime `Handle`. This is the exact spawn
     /// block [`Self::run`] wires inline; extracting it into one method
@@ -4696,6 +4783,8 @@ impl Edge {
         runtime: &tokio::runtime::Handle,
         shutdown_rx: &watch::Receiver<bool>,
     ) -> Vec<tokio::task::JoinHandle<()>> {
+        // Lifecycle — registered with the closures that spawn them, so
+        // `suspend` can stop them and `resume` spawn them again.
         let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         {
             let q = self.queue.clone();
@@ -4703,15 +4792,29 @@ impl Edge {
             let cfg = self.config.dispatcher.clone();
             let sd = shutdown_rx.clone();
             let reach = Some(self.reachability.clone());
-            tasks.push(runtime.spawn(async move {
-                run_dispatcher(q, ts, cfg, sd, reach).await;
+            let rt = runtime.clone();
+            tasks.push(self.background.register(move || {
+                let (q, ts, cfg, sd, reach) = (
+                    q.clone(),
+                    ts.clone(),
+                    cfg.clone(),
+                    sd.clone(),
+                    reach.clone(),
+                );
+                rt.spawn(async move {
+                    run_dispatcher(q, ts, cfg, sd, reach).await;
+                })
             }));
         }
         {
             let q = self.queue.clone();
             let sd = shutdown_rx.clone();
-            tasks.push(runtime.spawn(async move {
-                run_sweeps(q, sd).await;
+            let rt = runtime.clone();
+            tasks.push(self.background.register(move || {
+                let (q, sd) = (q.clone(), sd.clone());
+                rt.spawn(async move {
+                    run_sweeps(q, sd).await;
+                })
             }));
         }
         tasks
@@ -5097,8 +5200,12 @@ impl Edge {
                     .and_then(|t| t.blackhole_rules_handle())
                 {
                     let sd = shutdown_rx.clone();
-                    tasks.push(tokio::spawn(async move {
-                        run_blackhole_pruner(rules, interval, sd).await;
+                    let rt = tokio::runtime::Handle::current();
+                    tasks.push(self.background.register(move || {
+                        let (rules, sd) = (rules.clone(), sd.clone());
+                        rt.spawn(async move {
+                            run_blackhole_pruner(rules, interval, sd).await;
+                        })
                     }));
                 }
             }
@@ -8834,6 +8941,9 @@ impl EdgeBuilder {
             reachability,
             #[cfg(feature = "_reticulum-module")]
             reticulum_transport: self.reticulum_transport,
+            background: crate::transport::lifecycle::PausableTasks::default(),
+            suspended: std::sync::atomic::AtomicBool::new(false),
+            lifecycle_op: tokio::sync::Mutex::new(()),
             #[cfg(feature = "_reticulum-module")]
             scope_lifecycle: match scope_lifecycle {
                 Some(lifecycle) => std::sync::OnceLock::from(lifecycle),
@@ -9008,6 +9118,8 @@ fn transport_error_class(e: &TransportError) -> &'static str {
         TransportError::LinkSealRefused { .. } => "link_seal_refused",
         // The peer's proof did not verify against the key held for it.
         TransportError::LinkProofRefused { .. } => "link_proof_refused",
+        // Lifecycle — the host is in the background; not a peer fault.
+        TransportError::Suspended => "suspended",
     }
 }
 

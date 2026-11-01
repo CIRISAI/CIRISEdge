@@ -357,9 +357,34 @@ pub struct PyEdge {
     /// immediately and hot-spins the claim loop. Declared AFTER
     /// `_transport_runtime` so field drop-order tears the runtime down
     /// first (aborting the dispatcher task) before this sender drops —
-    /// no busy-loop window at teardown, no explicit signal needed.
+    /// no busy-loop window at teardown. `close()` also sends `true` on
+    /// it, so the dispatcher and sweeps end cleanly before the runtime goes.
     /// `None` when there's no transport runtime (`for_test` / HTTPS-only).
     _transport_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl PyEdge {
+    /// Signal the outbound dispatcher and sweeps to stop (`close()`), so
+    /// they end cleanly instead of being torn down mid-claim with the runtime.
+    fn stop_transport_dispatch(&self) {
+        if let Some(tx) = self._transport_shutdown_tx.as_ref() {
+            tx.send_replace(true);
+        }
+    }
+
+    /// Run a lifecycle future on the edge-side transport runtime (its tokio
+    /// time driver is the one edge's timers need — CIRISEdge#217/#220), or on
+    /// a throwaway current-thread runtime when this edge has none.
+    fn block_on_transport<F: std::future::Future>(&self, fut: F) -> PyResult<F::Output> {
+        if let Some(rt) = self._transport_runtime.as_ref() {
+            return Ok(rt.block_on(fut));
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("lifecycle runtime: {e}")))?;
+        Ok(rt.block_on(fut))
+    }
 }
 
 /// v2.4.0 (CIRISEdge#103) — best-effort cleanup if the Python caller
@@ -598,6 +623,7 @@ impl PyEdge {
     #[cfg(feature = "transport-reticulum-local")]
     #[allow(clippy::unnecessary_wraps)] // Keep PyResult for future-proofing the pymethod shape
     fn close(&self, py: Python<'_>) -> PyResult<()> {
+        self.stop_transport_dispatch();
         let Ok(mut guard) = self.shared_instance_cleanup.lock() else {
             // PoisonError: a prior caller panicked inside the lock.
             // Treat as already-closed and return Ok — re-panicking from
@@ -653,8 +679,56 @@ impl PyEdge {
     /// Python API surface is feature-invariant (callers don't need to
     /// `hasattr(edge, "close")` based on the wheel's feature set).
     #[cfg(not(feature = "transport-reticulum-local"))]
+    #[allow(clippy::unnecessary_wraps)] // the pymethod shape is PyResult on every build
     fn close(&self, _py: Python<'_>) -> PyResult<()> {
+        self.stop_transport_dispatch();
         Ok(())
+    }
+
+    /// **Mobile background: suspend** (secondary path — a Rust host calls
+    /// `Edge::suspend` directly). Stops edge's background loops, refuses
+    /// sends, closes every link, parks the listener and detaches the
+    /// interfaces; returns once nothing is left open or after
+    /// `deadline_secs`. Returns the report as a dict: `already_suspended`,
+    /// `quiescent`, `elapsed_secs`, `links_open`, `interfaces_open`,
+    /// `listener_open`, `tasks_running`, `sends_in_flight`, `edge_tasks`,
+    /// `node_tasks`. Idempotent; never raises for the suspend itself.
+    fn suspend<'py>(
+        &self,
+        py: Python<'py>,
+        deadline_secs: f64,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let deadline = std::time::Duration::try_from_secs_f64(deadline_secs.max(0.0))
+            .map_err(|e| PyValueError::new_err(format!("deadline_secs: {e}")))?;
+        let edge = Arc::clone(&self.inner);
+        let report =
+            py.detach(|| self.block_on_transport(async move { edge.suspend(deadline).await }))?;
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("already_suspended", report.already_suspended)?;
+        dict.set_item("quiescent", report.quiescent)?;
+        dict.set_item("elapsed_secs", report.elapsed.as_secs_f64())?;
+        dict.set_item("links_open", report.links_open)?;
+        dict.set_item("interfaces_open", report.interfaces_open)?;
+        dict.set_item("listener_open", report.listener_open)?;
+        dict.set_item("tasks_running", report.tasks_running)?;
+        dict.set_item("sends_in_flight", report.sends_in_flight)?;
+        dict.set_item("edge_tasks", report.edge_tasks)?;
+        dict.set_item("node_tasks", report.node_tasks)?;
+        Ok(dict)
+    }
+
+    /// **Mobile background: resume** — reattach the interfaces, reopen sends,
+    /// wake the listener (it announces) and respawn edge's background loops.
+    /// Idempotent; a no-op when not suspended.
+    fn resume(&self, py: Python<'_>) -> PyResult<()> {
+        let edge = Arc::clone(&self.inner);
+        py.detach(|| self.block_on_transport(async move { edge.resume().await }))?
+            .map_err(|e| PyRuntimeError::new_err(format!("resume: {e}")))
+    }
+
+    /// Whether `suspend` is in force.
+    fn is_suspended(&self) -> bool {
+        self.inner.is_suspended()
     }
 
     /// v2.4.0 (CIRISEdge#103) — context-manager support so callers
