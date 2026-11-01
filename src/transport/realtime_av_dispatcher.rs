@@ -291,6 +291,13 @@ pub trait AvLinkSender: Send + Sync + 'static {
     /// one: absorbing the condition here makes it unobservable to every
     /// layer above, which is exactly the defect leviculum#66 documents.
     async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError>;
+
+    /// The most one message on this link carries, when the transport knows
+    /// it. Control frames that span several messages (a call's stream key
+    /// binding) are sized to it. `None` by default.
+    fn message_limit(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The async byte-stream recv half the caller plugs in. `recv` resolves
@@ -735,6 +742,57 @@ impl AvDispatcher {
         except: &[PeerKeyId],
     ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
         self.fan_out_report(inner, except).await
+    }
+
+    /// CIRISEdge#805 — send control frames (not chunks) to every downstream
+    /// leg except `except`: `frames_for(limit)` gives the frames for a leg
+    /// whose messages carry at most `limit` bytes, sent in order. A control
+    /// frame takes no outer A/V seal and no `link_seq` (the link seal still
+    /// covers it), and no layer policy applies. A congested leg is retried
+    /// briefly; a leg that stays congested gives up the rest of its frames.
+    /// A leg whose link is gone is pruned.
+    pub async fn send_control_report(
+        &mut self,
+        except: &[PeerKeyId],
+        frames_for: &(dyn Fn(Option<usize>) -> Vec<Vec<u8>> + Send + Sync),
+    ) -> Vec<(PeerKeyId, LegSend)> {
+        const CONGESTED_RETRIES: u32 = 20;
+        const CONGESTED_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+        let mut report = Vec::with_capacity(self.subscribers.len());
+        let mut gone = Vec::new();
+        for (subscriber, state) in &mut self.subscribers {
+            if except.contains(subscriber) {
+                continue;
+            }
+            let frames = frames_for(state.sender.message_limit());
+            let mut leg = LegSend::Sent;
+            'frames: for frame in &frames {
+                let mut tries = 0;
+                loop {
+                    match state.sender.send(frame).await {
+                        Ok(()) => break,
+                        Err(AvDispatcherError::Congested) if tries < CONGESTED_RETRIES => {
+                            tries += 1;
+                            tokio::time::sleep(CONGESTED_PAUSE).await;
+                        }
+                        Err(AvDispatcherError::LinkGone(_)) => {
+                            gone.push(subscriber.clone());
+                            leg = LegSend::Gone;
+                            break 'frames;
+                        }
+                        Err(e) => {
+                            leg = LegSend::Failed(e);
+                            break 'frames;
+                        }
+                    }
+                }
+            }
+            report.push((subscriber.clone(), leg));
+        }
+        for subscriber in &gone {
+            self.subscribers.remove(subscriber);
+        }
+        report
     }
 
     /// CIRISEdge#805 item 5 — cap `subscriber`'s leg at `policy`: chunks

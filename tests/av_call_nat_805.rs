@@ -47,6 +47,7 @@ use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
 use ciris_edge::transport::av_call::{
     Call, CallDeps, CallError, CallOptions, Frame, ReceivedFrame, RoomRoster,
 };
+use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{StreamDekRegistrar, UnwiredRegistrar};
 use ciris_edge::transport::direct_path::{DirectLinksConfig, DirectPathEvent};
 use ciris_edge::transport::reticulum::{
@@ -224,6 +225,7 @@ async fn transport_node(tcp_port: u16, facilitator_port: u16) -> ReticulumNode {
 /// One edge node: a TCP client of `T` only.
 struct Side {
     key: Ident,
+    dir: Arc<SqliteBackend>,
     transport: Arc<ReticulumTransport>,
     metrics: EdgeMetrics,
     lifecycle: Arc<ScopeLifecycle>,
@@ -302,6 +304,7 @@ async fn side(
     ];
     Side {
         key,
+        dir: Arc::clone(dir),
         transport,
         metrics,
         lifecycle,
@@ -420,6 +423,8 @@ async fn join(side: &Side, group: &CohortGroup, room: &str) -> Result<Call, Call
             events: None,
             metrics: Some(side.metrics.clone()),
             record: None,
+            signer: side.key.signer(),
+            verifier: Arc::clone(&side.dir) as Arc<dyn StreamKeyVerifier>,
         },
         CallOptions::default(),
     )

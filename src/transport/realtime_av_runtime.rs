@@ -616,6 +616,14 @@ impl AvPublisher {
 /// wire bytes from one upstream [`AvInboundLink`], open the inbound outer
 /// AEAD, and re-seal per downstream subscriber via
 /// [`AvDispatcher::relay_chunk`]. The inner ciphertext is never touched.
+///
+/// A room call's chunks (`av_call`) carry their publisher's 64-byte source
+/// signature at the end of the inner unit
+/// (`transport::av_chunk_auth`); this relay forwards it byte for byte
+/// with the rest. It needs no DEK to check one: the signature covers the inner
+/// ciphertext, so a call relay built on this role can drop a forgery before
+/// forwarding with `ChunkAuth::check`. Dormant: nothing here wires that check
+/// today, because no production path runs this role.
 pub struct AvRelay {
     stream_id: StreamId,
     dispatcher: AvDispatcher,
@@ -1519,6 +1527,10 @@ mod leviculum_link {
         /// limit FIRST. leviculum refuses an oversized Channel message as
         /// `TooLarge` and `send_on_link` folds that into `LinkFailed`, so
         /// without this check an oversized chunk read as a link failure.
+        fn message_limit(&self) -> Option<usize> {
+            LeviculumAvSender::channel_limit(self)
+        }
+
         async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
             use leviculum_core::SendError;
             use leviculum_std::error::Error as LevError;

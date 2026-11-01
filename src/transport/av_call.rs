@@ -32,6 +32,20 @@
 //! relayed copy, so relays never loop), under each member's layer policy
 //! ([`Call::set_layer_policy`]): a member then hears a stream on two legs.
 //!
+//! # Source authentication
+//!
+//! Every member can derive every stream's DEK, so the inner seal alone cannot
+//! say WHO sealed a chunk. Each chunk therefore carries its publisher's
+//! signature under a per-epoch chunk key, and the key is bound to the stream
+//! by the publisher's hybrid federation signature
+//! ([`crate::transport::av_chunk_auth`]). A receiver, and a relay before it
+//! forwards, drops any chunk that does not verify under its stream's bound
+//! key; a relay forwards only chunks whose verified publisher is the peer it
+//! heard them from. The publisher sends its binding on every leg after the
+//! stream hello, at every roll and every
+//! [`crate::transport::av_chunk_auth::BINDING_REANNOUNCE`]; a relay forwards
+//! the bindings it verifies.
+//!
 //! # Frames (§4)
 //!
 //! [`Call::frames`] dedupes the two legs on `(stream, epoch, chunk_seq)` and
@@ -68,6 +82,10 @@ use crate::cohort_scope::CohortScope;
 use crate::mls::CohortGroup;
 use crate::scope_lifecycle::{ScopeGroupSnapshot, ScopeLifecycle};
 use crate::transport::av_call_key::{stream_epoch_dek, CallId};
+use crate::transport::av_chunk_auth::{
+    collides_with_binding_part, BindingAssembler, BindingOutcome, ChunkAuth, ChunkAuthError,
+    ChunkSigner, Part, StreamKeyBinding, StreamKeyVerifier, BINDING_REANNOUNCE, CHUNK_SIG_LEN,
+};
 use crate::transport::av_keep::{
     AvKeep, AvKeepTarget, KeepOutcome, KeptAvPublisher, StreamDekRegistrar,
 };
@@ -627,6 +645,11 @@ pub struct CallDeps {
     /// The call-row door (item 6). `None`: this node writes no call row and
     /// knows only the attendees it hears.
     pub record: Option<Arc<dyn CallRecord>>,
+    /// This node's federation signer: it binds the stream's chunk keys. Its
+    /// key id must be the node's (the stream's publisher).
+    pub signer: Arc<crate::identity::LocalSigner>,
+    /// Verifies the other publishers' bindings (persist's directory).
+    pub verifier: Arc<dyn StreamKeyVerifier>,
 }
 
 // ─── identifiers ────────────────────────────────────────────────────
@@ -1015,7 +1038,6 @@ struct Shared {
     dialling: StdMutex<HashMap<String, Instant>>,
     backoff: StdMutex<HashMap<String, Duration>>,
     in_links: StdMutex<HashMap<[u8; 16], String>>,
-    stream_publishers: StdMutex<HashMap<StreamId, String>>,
     policies: StdMutex<HashMap<String, ReceiverLayerPolicy>>,
     members: StdMutex<Vec<String>>,
     heard_tx: mpsc::Sender<Heard>,
@@ -1039,6 +1061,42 @@ struct Shared {
     /// The one `RecordRefused` has fired.
     record_refused: AtomicBool,
     id: CallId,
+    /// The nonce this join's stream id was derived from (its binding names it).
+    join_nonce: [u8; 32],
+    /// The federation signer that binds this stream's chunk keys.
+    signer: Arc<crate::identity::LocalSigner>,
+    /// Verifies other publishers' bindings.
+    verifier: Arc<dyn StreamKeyVerifier>,
+    /// This stream's chunk key for the publisher's current epoch, and its
+    /// binding. Replaced only under the publisher lock, at the roll.
+    own_key: StdMutex<OwnChunkKey>,
+    /// The other streams' bound chunk keys.
+    auth: ChunkAuth,
+}
+
+/// This stream's chunk key at one epoch and its binding's encoding.
+struct OwnChunkKey {
+    signer: ChunkSigner,
+    wire: Arc<Vec<u8>>,
+}
+
+/// Mint this stream's chunk key for `epoch` and bind it.
+async fn mint_own_key(
+    signer: &crate::identity::LocalSigner,
+    room: &str,
+    join_nonce: [u8; 32],
+    stream: StreamId,
+    epoch: Epoch,
+) -> Result<OwnChunkKey, CallError> {
+    let key =
+        ChunkSigner::generate(stream, epoch).map_err(|e| CallError::Plumbing(e.to_string()))?;
+    let binding = StreamKeyBinding::sign(signer, room, join_nonce, stream, epoch, key.public())
+        .await
+        .map_err(|e| CallError::Plumbing(e.to_string()))?;
+    Ok(OwnChunkKey {
+        signer: key,
+        wire: Arc::new(binding.to_bytes()),
+    })
 }
 
 impl Shared {
@@ -1114,7 +1172,15 @@ impl Call {
             events,
             metrics,
             record,
+            signer,
+            verifier,
         } = deps;
+        if signer.key_id != own_key_id {
+            return Err(CallError::Plumbing(format!(
+                "the signer that binds this stream's chunk keys is {}, not the publisher {own_key_id}",
+                signer.key_id
+            )));
+        }
         let attendee = record
             .as_ref()
             .map_or_else(|| own_key_id.to_owned(), |r| r.attendee().to_owned());
@@ -1124,8 +1190,9 @@ impl Call {
         let scope = CohortScope::Cohort {
             cohort_id: room.to_owned(),
         };
-        let (stream, epoch, publisher, keep) =
+        let (stream, join_nonce, epoch, publisher, keep) =
             start_stream(room, own_key_id, &room_group, opts.keep, registrar, events).await?;
+        let own_key = mint_own_key(&signer, room, join_nonce, stream, epoch).await?;
 
         // Addresses: the call's group, from the room's destination secret at
         // the room's epoch, for the room's members.
@@ -1161,7 +1228,6 @@ impl Call {
             dialling: StdMutex::new(HashMap::new()),
             backoff: StdMutex::new(HashMap::new()),
             in_links: StdMutex::new(HashMap::new()),
-            stream_publishers: StdMutex::new(HashMap::new()),
             policies: StdMutex::new(HashMap::new()),
             members: StdMutex::new(members),
             heard_tx,
@@ -1178,6 +1244,11 @@ impl Call {
             attendees_known: StdMutex::new(std::collections::BTreeSet::new()),
             record_refused: AtomicBool::new(false),
             id,
+            join_nonce,
+            signer,
+            verifier,
+            own_key: StdMutex::new(own_key),
+            auth: ChunkAuth::new(room),
         });
         if let KeepOutcome::Refused(refused) = keep {
             shared.emit(CallEvent::KeepRefused {
@@ -1238,13 +1309,24 @@ impl Call {
     }
 
     /// The largest frame plaintext every member leg carries (#720), or
-    /// `None` before any leg is up.
+    /// `None` before any leg is up: each leg's Channel limit less the chunk's
+    /// wire overhead and its source signature.
     #[must_use]
     pub fn chunk_plaintext_budget(&self) -> Option<usize> {
         Shared::lock(&self.shared.out_legs)
             .values()
-            .map(|l| l.channel_limit.saturating_sub(AV_CHUNK_WIRE_OVERHEAD))
+            .map(|l| {
+                l.channel_limit
+                    .saturating_sub(AV_CHUNK_WIRE_OVERHEAD + CHUNK_SIG_LEN)
+            })
             .min()
+    }
+
+    /// What the chunk source authentication counted on this node: chunks
+    /// verified, forged and unbound, bindings installed and refused.
+    #[must_use]
+    pub fn chunk_auth_counts(&self) -> crate::transport::av_chunk_auth::ChunkAuthCounts {
+        self.shared.auth.counts()
     }
 
     /// The members this node has a leg to.
@@ -1286,6 +1368,12 @@ impl Call {
             .seal_next(&frame.bytes, frame.codec_id, frame.layer)
             .map_err(|e| CallError::Plumbing(e.to_string()))?;
         let epoch = publisher.epoch();
+        // The source signature, under this epoch's chunk key (swapped only
+        // under this same lock, at the roll).
+        let inner = Shared::lock(&self.shared.own_key)
+            .signer
+            .sign(&inner)
+            .map_err(|e| CallError::Plumbing(e.to_string()))?;
         let withhold: Vec<String> = Shared::lock(&self.shared.test_withhold)
             .as_ref()
             .filter(|(_, n)| *n > 0 && chunk_seq.0 % n == 0)
@@ -1507,11 +1595,18 @@ async fn start_stream(
     keep: AvKeep,
     registrar: Arc<dyn StreamDekRegistrar>,
     events: Option<Arc<crate::events::EventBus>>,
-) -> Result<(StreamId, Epoch, Publisher, KeepOutcome), CallError> {
+) -> Result<(StreamId, [u8; 32], Epoch, Publisher, KeepOutcome), CallError> {
     let mut join_nonce = [0u8; 32];
-    ciris_crypto::random::fill(&mut join_nonce)
-        .map_err(|e| CallError::Plumbing(format!("join nonce: {e}")))?;
-    let stream = call_stream_id(room, own_key_id, &join_nonce);
+    // A stream id whose first bytes read as a binding part would be taken
+    // for one by every receiver: draw again (odds 2^-40 a draw).
+    let stream = loop {
+        ciris_crypto::random::fill(&mut join_nonce)
+            .map_err(|e| CallError::Plumbing(format!("join nonce: {e}")))?;
+        let stream = call_stream_id(room, own_key_id, &join_nonce);
+        if !collides_with_binding_part(stream) {
+            break stream;
+        }
+    };
     let epoch = Epoch(room_group.epoch().await);
     let dek = stream_epoch_dek(room_group, stream, epoch)
         .await
@@ -1534,7 +1629,7 @@ async fn start_stream(
     )
     .await
     .map_err(|e| CallError::Plumbing(e.to_string()))?;
-    Ok((stream, epoch, publisher, outcome))
+    Ok((stream, join_nonce, epoch, publisher, outcome))
 }
 
 fn leg_outcome(leg: LegSend) -> LegOutcome {
@@ -1592,10 +1687,22 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
             room: shared.room.clone(),
             detail: e.to_string(),
         })?;
+    // The new epoch's chunk key, bound BEFORE the roll: a failure leaves the
+    // stream where it was, to roll on the next try.
+    let own_key = mint_own_key(
+        &shared.signer,
+        &shared.room,
+        shared.join_nonce,
+        shared.stream,
+        to,
+    )
+    .await?;
     let keep = publisher
         .roll_room_epoch(to, dek)
         .await
         .map_err(|e| CallError::Plumbing(e.to_string()))?;
+    let wire = Arc::clone(&own_key.wire);
+    *Shared::lock(&shared.own_key) = own_key;
     // Departed members: no more of this stream for them.
     let before: Vec<String> = Shared::lock(&shared.members).clone();
     let left: Vec<String> = before
@@ -1611,6 +1718,11 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     for m in &left {
         publisher.remove_subscriber(m);
     }
+    // Every remaining leg learns the new key before the epoch's first chunk.
+    publisher
+        .dispatcher_mut()
+        .send_control_report(&[], &|limit| StreamKeyBinding::parts(&wire, limit))
+        .await;
     drop(publisher);
     Shared::lock(&shared.members).clone_from(&members);
     Shared::lock(&shared.epochs).push(room_epoch);
@@ -1755,18 +1867,10 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     // The stream hello: the link's first message after the transit KEX.
     let hello = encode_hello(shared.stream);
     let deadline = tokio::time::Instant::now() + HELLO_BUDGET;
-    loop {
-        match link.sender.send(&hello).await {
-            Ok(()) => break,
-            Err(AvDispatcherError::Congested) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(e) => {
-                tracing::debug!(peer = %member, error = %e, "call leg: hello not sent");
-                let _ = shared.transport.link_teardown(&link.link_id).await;
-                return false;
-            }
-        }
+    if let Err(e) = send_patiently(&link.sender, &hello, deadline).await {
+        tracing::debug!(peer = %member, error = %e, "call leg: hello not sent");
+        let _ = shared.transport.link_teardown(&link.link_id).await;
+        return false;
     }
     let policy = Shared::lock(&shared.policies)
         .get(member)
@@ -1775,7 +1879,33 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     let seal_key = link.transit.seal_key();
     let link_id = link.link_id;
     {
+        // Under the publisher lock, so no roll lands between the binding and
+        // the leg joining the roster: the stream's current binding (and, for a
+        // relay, every binding it holds but the member's own), then the leg.
         let mut publisher = shared.publisher.lock().await;
+        let mut wires = vec![Arc::clone(&Shared::lock(&shared.own_key).wire)];
+        if shared.opts.relay {
+            wires.extend(shared.auth.bindings_except(member));
+        }
+        for wire in &wires {
+            let parts = StreamKeyBinding::parts(wire, Some(channel_limit));
+            if parts.is_empty() {
+                tracing::warn!(
+                    peer = %member,
+                    channel_limit,
+                    "call leg: the link is too small to carry a stream key binding"
+                );
+                let _ = shared.transport.link_teardown(&link_id).await;
+                return false;
+            }
+            for part in &parts {
+                if let Err(e) = send_patiently(&link.sender, part, deadline).await {
+                    tracing::debug!(peer = %member, error = %e, "call leg: binding not sent");
+                    let _ = shared.transport.link_teardown(&link_id).await;
+                    return false;
+                }
+            }
+        }
         if let Err(e) = publisher.add_subscriber(AvSubscriberLink {
             subscriber: member.to_owned(),
             transit_key: seal_key,
@@ -1803,6 +1933,24 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         "call leg UP: this node's stream rides a keyed link to the member (CIRISEdge#805)"
     );
     true
+}
+
+/// Send one control frame on a fresh leg, waiting out backpressure until
+/// `deadline`.
+async fn send_patiently(
+    sender: &crate::transport::realtime_av_runtime::LeviculumAvSender,
+    bytes: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result<(), AvDispatcherError> {
+    loop {
+        match sender.send(bytes).await {
+            Ok(()) => return Ok(()),
+            Err(AvDispatcherError::Congested) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Accept every link a member dials to this node's call addresses.
@@ -1839,7 +1987,6 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
         let _ = shared.transport.link_teardown(&link_id).await;
         return;
     };
-    Shared::lock(&shared.stream_publishers).insert(own_stream, peer.clone());
     Shared::lock(&shared.in_links).insert(link_id, peer.clone());
     let open_key = accepted.transit.open_key();
     pump(&shared, &peer, own_stream, link_id, &open_key, inbound).await;
@@ -1857,12 +2004,27 @@ async fn pump(
     let mut next_seq: u64 = 0;
     let mut gap = HopGap::default();
     let mut guard = LinkIdGuard::default();
+    let mut bindings = BindingAssembler::default();
     while let Ok(frame) = inbound.recv_frame().await {
         if shared.ended.load(Ordering::Relaxed) {
             break;
         }
         let at = Instant::now();
+        // A part carries no hop counter: the drops it reports stay pending for
+        // the next chunk.
         let dropped = gap.report(frame.dropped_before);
+        match bindings.push(&frame.bytes) {
+            Part::NotAPart => {}
+            Part::Incomplete => continue,
+            Part::Malformed => {
+                shared.count(crate::observability::AV_CALL_BINDING_REFUSED);
+                continue;
+            }
+            Part::Complete(wire) => {
+                take_binding(shared, peer, &wire).await;
+                continue;
+            }
+        }
         let Ok(sealed) = SealedAvChunk::from_bytes(&frame.bytes) else {
             shared.count(crate::observability::AV_CALL_FRAME_UNOPENED);
             continue;
@@ -1881,15 +2043,38 @@ async fn pump(
         guard.opened();
         gap.resolved();
         next_seq = opened_at.wrapping_add(1);
-        let stream = inner.stream_id();
-        // First-hand copies only are relayed: never a relayed copy, never
-        // back to its publisher.
-        if shared.opts.relay && stream == own_stream {
+        let signed = inner;
+        let stream = signed.stream_id();
+        // The source check, before anything else is done with the chunk: it
+        // must verify under the key bound to its (stream, epoch), so only the
+        // stream's publisher can have made it.
+        let (publisher, inner) = match shared.auth.check(&signed) {
+            Ok(checked) => checked,
+            Err(ChunkAuthError::Unbound) => {
+                shared.count(crate::observability::AV_CALL_FRAME_UNBOUND);
+                continue;
+            }
+            Err(ChunkAuthError::Forged) => {
+                shared.count(crate::observability::AV_CALL_FRAME_FORGED);
+                tracing::debug!(
+                    peer = %peer,
+                    stream = %crate::transport::realtime_av::stream_label(stream),
+                    epoch = signed.epoch().0,
+                    chunk_seq = signed.chunk_seq().0,
+                    "call: a chunk not signed by its stream's publisher — dropped, not relayed"
+                );
+                continue;
+            }
+        };
+        // First-hand copies only are relayed: from the stream's own publisher
+        // on its own link, never a relayed copy, never back to its publisher.
+        // The signature travels with the chunk.
+        if shared.opts.relay && stream == own_stream && *publisher == *peer {
             let delay = shared.test_relay_delay_ms.load(Ordering::Relaxed);
             if delay == 0 {
-                relay(shared, &inner, peer).await;
+                relay(shared, &signed, peer).await;
             } else {
-                let (s, i, p) = (Arc::clone(shared), inner.clone(), peer.to_owned());
+                let (s, i, p) = (Arc::clone(shared), signed.clone(), peer.to_owned());
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     relay(&s, &i, &p).await;
@@ -1904,13 +2089,9 @@ async fn pump(
             shared.count(crate::observability::AV_CALL_FRAME_UNOPENED);
             continue;
         };
-        let publisher = Shared::lock(&shared.stream_publishers)
-            .get(&stream)
-            .cloned()
-            .unwrap_or_else(|| peer.to_owned());
         let heard = Heard {
             frame: ReceivedFrame {
-                publisher,
+                publisher: publisher.to_string(),
                 stream,
                 epoch: inner.epoch(),
                 chunk_seq: inner.chunk_seq(),
@@ -1924,6 +2105,59 @@ async fn pump(
             break;
         }
     }
+}
+
+/// A stream key binding completed on `peer`'s link: verify and install it
+/// (the hybrid check runs once per binding, never per chunk). A relay forwards
+/// a binding it heard first-hand from its publisher to every other leg.
+async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
+    let members = shared.room_group.member_key_ids().await;
+    let binding = match shared
+        .auth
+        .accept_binding(wire, &members, shared.verifier.as_ref())
+        .await
+    {
+        BindingOutcome::Installed(b) => {
+            shared.count(crate::observability::AV_CALL_BINDING_INSTALLED);
+            tracing::info!(
+                peer = %peer,
+                publisher = %b.publisher,
+                stream = %crate::transport::realtime_av::stream_label(b.stream),
+                epoch = b.epoch.0,
+                "call: a stream's chunk key is bound by its publisher's hybrid signature"
+            );
+            b
+        }
+        BindingOutcome::Known(b) => b,
+        BindingOutcome::Refused(e) => {
+            shared.count(crate::observability::AV_CALL_BINDING_REFUSED);
+            tracing::warn!(peer = %peer, error = %e, "call: a stream key binding was refused");
+            return;
+        }
+    };
+    if shared.opts.relay && binding.publisher == peer {
+        let wire = wire.to_vec();
+        shared
+            .publisher
+            .lock()
+            .await
+            .dispatcher_mut()
+            .send_control_report(&[peer.to_owned()], &|limit| {
+                StreamKeyBinding::parts(&wire, limit)
+            })
+            .await;
+    }
+}
+
+/// Re-send this stream's current binding on every leg (a receiver whose
+/// inbound queue dropped a part gets it again).
+async fn reannounce(shared: &Arc<Shared>) {
+    let mut publisher = shared.publisher.lock().await;
+    let wire = Arc::clone(&Shared::lock(&shared.own_key).wire);
+    publisher
+        .dispatcher_mut()
+        .send_control_report(&[], &|limit| StreamKeyBinding::parts(&wire, limit))
+        .await;
 }
 
 /// Forward a first-hand chunk to every member but its publisher, under each
@@ -1985,6 +2219,13 @@ async fn reorder_loop(
 /// How often (in watch ticks) a call reads its rows for new attendees.
 const ATTENDANCE_EVERY_TICKS: u64 = 4;
 
+/// [`BINDING_REANNOUNCE`] in watch ticks.
+fn reannounce_ticks() -> u64 {
+    u64::try_from(BINDING_REANNOUNCE.as_millis() / WATCH_TICK.as_millis())
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// Write this attendee's call row. A refusal fires `RecordRefused` once and
 /// the call carries on; nothing is faked.
 async fn write_call_row(shared: &Arc<Shared>) {
@@ -2037,6 +2278,9 @@ async fn watch_loop(shared: Arc<Shared>) {
         n = n.wrapping_add(1);
         if n % ATTENDANCE_EVERY_TICKS == 0 {
             announce_attendees(&shared).await;
+        }
+        if n % reannounce_ticks() == 0 {
+            reannounce(&shared).await;
         }
         if let Err(CallError::CallEnded(_)) = roll_if_moved(&shared).await {
             return;
