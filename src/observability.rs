@@ -1150,6 +1150,36 @@ pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
 
+// ─── CIRISEdge#930 — `EdgeMetrics::key_plane_sweep` labels ──────────────
+//
+// The four per-subject key-plane listings (Key, IdentityOccurrence,
+// Revocation, IdentityOccurrenceRevocation) answer from a per-subject memo
+// invalidated by the store's admission cursor. Each listing books what it
+// cost, so a sweep that starts reading every subject again names itself.
+
+/// Key-plane listings answered (one per plane per peer round).
+pub const KEY_PLANE_LISTINGS: &str = "key_plane_listings";
+/// Listings that read the store for at least one subject.
+pub const KEY_PLANE_SWEEPS: &str = "key_plane_sweeps";
+/// Subjects read from the store (each is one to several persist reads).
+pub const KEY_PLANE_SUBJECT_READS: &str = "key_plane_subject_reads";
+/// Subjects answered from the memo, no store read.
+pub const KEY_PLANE_MEMO_HITS: &str = "key_plane_memo_hits";
+/// Subject reads the store did not serve (warned, not memoized, retried).
+pub const KEY_PLANE_READ_FAILURES: &str = "key_plane_read_failures";
+/// Wall-clock milliseconds spent in listings that read the store.
+pub const KEY_PLANE_SWEEP_MS: &str = "key_plane_sweep_ms";
+/// Change-probe pages read (`list_attestations_since` from the memo cursor).
+pub const KEY_PLANE_PROBE_READS: &str = "key_plane_probe_reads";
+/// Rows the change probe read.
+pub const KEY_PLANE_PROBE_ROWS: &str = "key_plane_probe_rows";
+/// Change probes the store did not serve (the memo was forgotten).
+pub const KEY_PLANE_PROBE_FAILURES: &str = "key_plane_probe_failures";
+/// Memoized answers dropped because a new row could change them.
+pub const KEY_PLANE_INVALIDATED: &str = "key_plane_invalidated";
+/// Memo rebuilds (first use, the TTL, or after a failed probe).
+pub const KEY_PLANE_REBUILDS: &str = "key_plane_rebuilds";
+
 // ─── v43 InvalidProof triage — `EdgeMetrics::peer_binding` labels ──────
 //
 // A peer's binding is the key a dial hands leviculum to check the link
@@ -1515,6 +1545,11 @@ pub struct EdgeMetrics {
     /// (`PEER_BINDING_*` constants in this module): wrong keys healed,
     /// corrected at dial, refused at prime, and proofs that failed.
     pub peer_binding: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#930 — the key-plane listings' cost ledger, by label
+    /// (`KEY_PLANE_*` constants in this module): listings, store sweeps,
+    /// subject reads, memo hits, change-probe reads and rows, invalidations,
+    /// rebuilds and the wall time spent reading.
+    pub key_plane_sweep: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — peers with a direct path now, per reporting
     /// transport (keyed by its metrics source id, like `link_pool_sizes`).
     /// Read as [`Self::direct_links_active`] (the sum).
@@ -2233,6 +2268,23 @@ impl EdgeMetrics {
     #[must_use]
     pub fn peer_binding(&self) -> HashMap<String, u64> {
         self.peer_binding
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#930 — add `n` to a `KEY_PLANE_*` label.
+    pub fn add_key_plane_sweep(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.key_plane_sweep.write().entry(label).or_insert(0) += n;
+        }
+    }
+
+    /// The key-plane listing ledger by label (tests + the operator readback).
+    #[must_use]
+    pub fn key_plane_sweep(&self) -> HashMap<String, u64> {
+        self.key_plane_sweep
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -2962,6 +3014,7 @@ impl EdgeMetrics {
             link_shaping: self.link_shaping(),
             direct_link: self.direct_link(),
             peer_binding: self.peer_binding(),
+            key_plane_sweep: self.key_plane_sweep(),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
@@ -3244,6 +3297,8 @@ pub struct EdgeMetricsBundle {
     /// The peer bindings dials check link proofs against, by
     /// `PEER_BINDING_*` label.
     pub peer_binding: HashMap<String, u64>,
+    /// CIRISEdge#930 — the key-plane listings' cost by `KEY_PLANE_*` label.
+    pub key_plane_sweep: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
     pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
@@ -3560,6 +3615,8 @@ impl EdgeMetricsBundle {
         f.family("direct_link", &self.direct_link);
         // The peer-binding ledger, `peer_binding.<label>`.
         f.family("peer_binding", &self.peer_binding);
+        // CIRISEdge#930 — the key-plane listings, `key_plane_sweep.<label>`.
+        f.family("key_plane_sweep", &self.key_plane_sweep);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
             "direct_links_active".to_string(),
@@ -3774,6 +3831,7 @@ edge_metrics_bundle_fields!(
     link_shaping,
     direct_link,
     peer_binding,
+    key_plane_sweep,
     direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,

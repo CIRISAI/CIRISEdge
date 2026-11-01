@@ -2964,6 +2964,12 @@ fn metrics_bundle_to_pydict<'py>(
         peer_binding.set_item(label.as_str(), *n)?;
     }
     root.set_item("peer_binding", peer_binding)?;
+    // CIRISEdge#930 — the key-plane listings' cost ledger.
+    let key_plane_sweep = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.key_plane_sweep {
+        key_plane_sweep.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("key_plane_sweep", key_plane_sweep)?;
     root.set_item("direct_links_active", bundle.direct_links_active)?;
     // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
     // a missing install and a membership refusal are two numbers.

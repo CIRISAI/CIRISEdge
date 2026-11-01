@@ -121,6 +121,8 @@ pub mod attestation_bind;
 pub mod bridge;
 pub mod convergence;
 pub mod coordinator;
+#[cfg(test)]
+mod counting_directory_930;
 pub mod directory;
 /// CIRISEdge#761 — the `(scope, group, named)` a membership-plane row is about,
 /// for persist's `may_receive_group_plane` serve gate.
@@ -129,6 +131,11 @@ pub mod group_plane;
 /// hold. NEVER holdings; see the module docs for why that distinction is the
 /// whole safety of the design.
 pub mod key_grant_emitter;
+/// CIRISEdge#930 — the key-plane listings, memoized per subject on the
+/// store's admission cursor.
+pub(crate) mod key_plane_memo;
+#[cfg(test)]
+mod key_plane_memo_930_tests;
 pub(crate) mod key_plane_rows;
 #[cfg(test)]
 mod key_plane_v59_tests;

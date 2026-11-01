@@ -61,7 +61,7 @@ fn bridge(
 
 /// `key`'s self-revocation, hybrid-signed by `key` over persist's bound
 /// envelope (the path a self-revocation takes; no `slash` conferral needed).
-async fn self_revocation(dir: &SqliteBackend, key: &Ident) -> Revocation {
+pub(super) async fn self_revocation(dir: &SqliteBackend, key: &Ident) -> Revocation {
     use sha2::Digest as _;
     let now = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(
         chrono::Utc::now().timestamp_micros(),
@@ -152,15 +152,15 @@ async fn route(
 /// Node A: a person P, its node N (P's occurrence of N, attested by P), a key
 /// K that revoked itself, and N's route — each written through the LOCAL
 /// authoring door, which mints the key-plane rows.
-struct NodeA {
-    p: Ident,
-    n: Ident,
-    k: Ident,
-    dir: Arc<SqliteBackend>,
+pub(super) struct NodeA {
+    pub(super) p: Ident,
+    pub(super) n: Ident,
+    pub(super) k: Ident,
+    pub(super) dir: Arc<SqliteBackend>,
 }
 
 impl NodeA {
-    async fn build(tag: &str, seed: u8) -> Self {
+    pub(super) async fn build(tag: &str, seed: u8) -> Self {
         let p = Ident::mint(&format!("person-p-{tag}"), "user", seed).await;
         let n = Ident::mint(&format!("node-n-{tag}"), "node", seed + 1).await;
         let k = Ident::mint(&format!("node-k-{tag}"), "node", seed + 2).await;
@@ -199,7 +199,7 @@ impl NodeA {
     /// P withdraws its occurrence of N: the `withdraws` of N's
     /// `identity:occurrence:v1` row (persist v59.0.0's occurrence revocation),
     /// authored at A. Returns the row.
-    async fn withdraw_occurrence(&self) -> Attestation {
+    pub(super) async fn withdraw_occurrence(&self) -> Attestation {
         let target =
             crate::replication::key_plane_rows::occurrence_rows_about(&*self.dir, self.p.key_id())
                 .await
@@ -232,7 +232,7 @@ impl NodeA {
     /// N, a node (single-signer: CC 3.1.5 rule A), revokes its occurrence
     /// `occurrence` as a framed object; A holds its
     /// `identity:occurrence_revocation:v1` carrier. Returns the row.
-    async fn carrier_revoking_node_occurrence(&self, occurrence: &str) -> Attestation {
+    pub(super) async fn carrier_revoking_node_occurrence(&self, occurrence: &str) -> Attestation {
         use ciris_persist::federation::occurrence_revocation_carrier::{
             carrier_row, FramedOccurrenceRevocation,
         };
@@ -282,7 +282,7 @@ fn messages(outcome: ReplicationOutcome) -> Vec<ReplicationMessage> {
 
 /// One `kind` round: B initiates against A, and the two sessions exchange
 /// until neither has anything to say.
-async fn round(
+pub(super) async fn round(
     kind: EnvelopeKind,
     a: &Arc<FederationDirectoryReplicationBridge>,
     a_id: &str,

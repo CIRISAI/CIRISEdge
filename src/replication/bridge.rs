@@ -114,6 +114,7 @@ use ciris_verify_core::threshold::ThresholdMember;
 
 use super::directory::ReplicationDirectory;
 use super::group_plane::{is_membership_plane, GroupPlane};
+use super::key_plane_memo::KeyPlaneRead;
 use super::key_plane_rows;
 use super::protocol::{EnvelopeKind, EnvelopeRef};
 use super::summary::ApplyOutcome;
@@ -2138,6 +2139,10 @@ pub struct FederationDirectoryReplicationBridge {
     /// the #312 responder factory, hot-adds) — so one gate here IS the
     /// node-wide bound, with no separate registry to keep in sync.
     sweep_gate: SweepGate,
+    /// CIRISEdge#930 — the four per-subject key-plane listings, memoized per
+    /// subject and invalidated by the store's admission cursor (see
+    /// [`super::key_plane_memo`]).
+    key_plane_memos: super::key_plane_memo::KeyPlaneMemos,
     /// CIRISEdge#531 DEPTH — the per-`(peer, plane)` advertise watermarks. See
     /// [`SweepCursors`] / [`PlaneWatermark`]. On the bridge for the same reason
     /// [`Self::sweep_gate`] is: the ONE production bridge is shared by every
@@ -2473,6 +2478,7 @@ impl FederationDirectoryReplicationBridge {
             collective_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             first_contact_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
+            key_plane_memos: super::key_plane_memo::KeyPlaneMemos::default(),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
             lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
                 crate::rate_limit::Policy::quota(
@@ -2576,6 +2582,7 @@ impl FederationDirectoryReplicationBridge {
             collective_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             first_contact_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
+            key_plane_memos: super::key_plane_memo::KeyPlaneMemos::default(),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
             lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
                 crate::rate_limit::Policy::quota(
@@ -6457,15 +6464,8 @@ impl FederationDirectoryReplicationBridge {
     /// the row's signed `asserted_at`.
     async fn list_key_record_rows(&self, subjects: Option<HashSet<String>>) -> Vec<EnvelopeRef> {
         let subjects = subjects.unwrap_or_else(|| self.self_own_subjects(EnvelopeKind::Key));
-        let mut rows: Vec<Attestation> = Vec::new();
-        for subject in subjects {
-            let _permit = self.sweep_gate.enter().await;
-            match key_plane_rows::key_record_rows(&*self.directory, &subject).await {
-                Ok(found) => rows.extend(found),
-                Err(e) => Self::key_plane_read_failed(EnvelopeKind::Key, &subject, &e),
-            }
-        }
-        self.key_plane_refs(rows, "list_key_record_rows")
+        self.key_plane_listing(KeyPlaneRead::KeyRecord, subjects)
+            .await
     }
 
     /// persist v59.0.0 — a key-plane row read that persist did not serve: the
@@ -6510,6 +6510,184 @@ impl FederationDirectoryReplicationBridge {
         }
         refs
     }
+
+    /// CIRISEdge#930 — one key-plane listing over `subjects`, answered from
+    /// the plane's per-subject memo ([`super::key_plane_memo`]).
+    ///
+    /// First the memo is brought current with the store
+    /// ([`Self::refresh_key_plane_memo`]); then each subject the memo has no
+    /// answer for is read exactly as the pre-#930 loop read it (one width
+    /// permit per subject read, a failure warned and NOT memoized, so it is
+    /// retried on the next listing), and memoized. The result is the deduped
+    /// union of the subjects' refs: the same set the per-subject loop built.
+    ///
+    /// The plane's lock is held for the whole listing, so N peers' rounds
+    /// arriving together cost one fill, not N. Each listing books its store
+    /// reads and wall time ([`crate::observability::KEY_PLANE_SUBJECT_READS`]
+    /// and siblings), and a listing that read the store says so in the log
+    /// with its plane, read count and elapsed time — the next storm names
+    /// itself.
+    async fn key_plane_listing<I>(&self, read: KeyPlaneRead, subjects: I) -> Vec<EnvelopeRef>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        use crate::observability as obs;
+        let started = Instant::now();
+        let mut memo = self.key_plane_memos.plane(read).lock().await;
+        self.refresh_key_plane_memo(read, &mut memo).await;
+        let mut refs: Vec<EnvelopeRef> = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let mut asked: HashSet<String> = HashSet::new();
+        let (mut hits, mut reads, mut failed) = (0u64, 0u64, 0u64);
+        for subject in subjects {
+            if !asked.insert(subject.clone()) {
+                continue;
+            }
+            if let Some(cached) = memo.get(&subject) {
+                hits += 1;
+                refs.extend(
+                    cached
+                        .iter()
+                        .filter(|r| seen.insert(r.envelope_hash))
+                        .cloned(),
+                );
+                continue;
+            }
+            reads += 1;
+            let found = {
+                // CIRISEdge#531 — the width permit, per member read.
+                let _permit = self.sweep_gate.enter().await;
+                read.read(&*self.directory, &subject).await
+            };
+            match found {
+                Ok(rows) => {
+                    let subject_refs = self.key_plane_refs(rows, read.site());
+                    refs.extend(
+                        subject_refs
+                            .iter()
+                            .filter(|r| seen.insert(r.envelope_hash))
+                            .cloned(),
+                    );
+                    memo.insert(subject, subject_refs);
+                }
+                Err(e) => {
+                    failed += 1;
+                    Self::key_plane_read_failed(read.kind(), &subject, &e);
+                }
+            }
+        }
+        drop(memo);
+        let elapsed = started.elapsed();
+        if let Some(m) = &self.metrics {
+            m.add_key_plane_sweep(obs::KEY_PLANE_LISTINGS, 1);
+            m.add_key_plane_sweep(obs::KEY_PLANE_MEMO_HITS, hits);
+            if reads > 0 {
+                m.add_key_plane_sweep(obs::KEY_PLANE_SWEEPS, 1);
+                m.add_key_plane_sweep(obs::KEY_PLANE_SUBJECT_READS, reads);
+                m.add_key_plane_sweep(obs::KEY_PLANE_READ_FAILURES, failed);
+                m.add_key_plane_sweep(
+                    obs::KEY_PLANE_SWEEP_MS,
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                );
+            }
+        }
+        if reads > 0 {
+            tracing::debug!(
+                plane = ?read.kind(),
+                subjects = asked.len(),
+                subject_reads = reads,
+                memo_hits = hits,
+                failed,
+                refs = refs.len(),
+                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                "key-plane sweep read the store (CIRISEdge#930)"
+            );
+        }
+        refs
+    }
+
+    /// CIRISEdge#930 — bring `read`'s memo current with the store: rebuild it
+    /// when it is due ([`super::key_plane_memo::MEMO_TTL`]), else drain the
+    /// admission cursor from where it stopped and drop every answer a new
+    /// row can change ([`super::key_plane_memo::dirt_of`]). The cursor is
+    /// persist's, so a LOCAL write (an authoring door, the claim path) moves
+    /// it exactly as a replicated apply does. A probe the store did not serve
+    /// forgets the memo: no answer is vouched for by a read that failed.
+    async fn refresh_key_plane_memo(
+        &self,
+        read: KeyPlaneRead,
+        memo: &mut super::key_plane_memo::PlaneMemo,
+    ) {
+        use super::key_plane_memo::{dirt_of, Dirt, PROBE_PAGE};
+        use crate::observability as obs;
+        let book = |label: &'static str, n: u64| {
+            if let Some(m) = &self.metrics {
+                m.add_key_plane_sweep(label, n);
+            }
+        };
+        let now = Instant::now();
+        if memo.needs_rebuild(now) {
+            // Every answer goes, and the cursor restarts a lag before now; the
+            // drain below then carries it to the end of the log BEFORE any
+            // subject is read (its dirt lands on an empty memo), so a row
+            // committed after this point is past the cursor and the next probe
+            // sees it.
+            memo.rebuild(now, chrono::Utc::now());
+            book(obs::KEY_PLANE_REBUILDS, 1);
+        }
+        let (mut rows_seen, mut dropped) = (0u64, 0u64);
+        loop {
+            book(obs::KEY_PLANE_PROBE_READS, 1);
+            let read_page = {
+                // CIRISEdge#531 — a bulk page read: one width permit per page.
+                let _permit = self.sweep_gate.enter().await;
+                self.directory
+                    .list_attestations_since(memo.cursor(), PROBE_PAGE)
+                    .await
+            };
+            let page = match read_page {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::warn!(
+                        plane = ?read.kind(),
+                        error = %e,
+                        "key-plane change probe FAILED: the memo is forgotten and this \
+                         listing reads every subject from the store (correct, at the \
+                         pre-history: CIRISEdge#930 cost)"
+                    );
+                    memo.forget();
+                    book(obs::KEY_PLANE_PROBE_FAILURES, 1);
+                    return;
+                }
+            };
+            let served = page.len();
+            for served_row in &page {
+                rows_seen += 1;
+                let dirt = match dirt_of(read, &*self.directory, &served_row.attestation).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::debug!(
+                            plane = ?read.kind(),
+                            error = %e,
+                            "key-plane change probe could not resolve a withdraws target: \
+                             dropping the plane's memo (CIRISEdge#930)"
+                        );
+                        Dirt::Plane
+                    }
+                };
+                dropped += u64::try_from(memo.apply(&dirt)).unwrap_or(u64::MAX);
+            }
+            if let Some(last) = page.last() {
+                memo.advance(last.resume_pair());
+            }
+            if served < usize::try_from(PROBE_PAGE).unwrap_or(usize::MAX) {
+                break;
+            }
+        }
+        book(obs::KEY_PLANE_PROBE_ROWS, rows_seen);
+        book(obs::KEY_PLANE_INVALIDATED, dropped);
+    }
+
     /// CIRISEdge#682 — the announce-gated advertise of the two identity planes.
     /// The `SelfOwn` publish set is narrowed per peer by
     /// [`Self::identity_rows_withheld_from`] (one reach walk per subject, not
@@ -6553,17 +6731,8 @@ impl FederationDirectoryReplicationBridge {
     async fn list_occurrence_rows(&self, subjects: Option<HashSet<String>>) -> Vec<EnvelopeRef> {
         let subjects =
             subjects.unwrap_or_else(|| self.self_own_subjects(EnvelopeKind::IdentityOccurrence));
-        let mut rows: Vec<Attestation> = Vec::new();
-        for subject in subjects {
-            let _permit = self.sweep_gate.enter().await;
-            match key_plane_rows::occurrence_rows_binding(&*self.directory, &subject).await {
-                Ok(found) => rows.extend(found),
-                Err(e) => {
-                    Self::key_plane_read_failed(EnvelopeKind::IdentityOccurrence, &subject, &e);
-                }
-            }
-        }
-        self.key_plane_refs(rows, "list_occurrence_rows")
+        self.key_plane_listing(KeyPlaneRead::OccurrenceBinding, subjects)
+            .await
     }
 
     /// TransportDestination plane — `SelfOwn` (publish-own): the node's OWN
@@ -9510,16 +9679,13 @@ impl FederationDirectoryReplicationBridge {
     /// `wire_refs_for_subject` reads it (`revocations_for`, then the row
     /// persist minted); a revocation held without its row is not offered.
     async fn list_revocation_rows(&self) -> Vec<EnvelopeRef> {
-        let mut rows: Vec<Attestation> = Vec::new();
-        for subject in self.subjects_for_projection(Projection::Global) {
-            // CIRISEdge#531 — the width permit, per member read.
-            let _permit = self.sweep_gate.enter().await;
-            match key_plane_rows::revocation_rows_of(&*self.directory, &subject).await {
-                Ok(found) => rows.extend(found),
-                Err(e) => Self::key_plane_read_failed(EnvelopeKind::Revocation, &subject, &e),
-            }
-        }
-        self.key_plane_refs(rows, "list_revocation_rows")
+        // CIRISEdge#930 — Global is every key on a canonical: answered from
+        // the per-subject memo, the store read only for subjects it lacks.
+        self.key_plane_listing(
+            KeyPlaneRead::Revocation,
+            self.subjects_for_projection(Projection::Global),
+        )
+        .await
     }
 
     /// persist v59.0.0 — the IdentityOccurrenceRevocation plane: every held
@@ -9529,19 +9695,14 @@ impl FederationDirectoryReplicationBridge {
     /// revocation whether or not it consents to the revoker's rows — the
     /// consent-gated Attestation plane would not reach it).
     async fn list_occurrence_withdrawal_rows(&self) -> Vec<EnvelopeRef> {
-        let mut rows: Vec<Attestation> = Vec::new();
-        for subject in self.subjects_for_projection(Projection::Global) {
-            let _permit = self.sweep_gate.enter().await;
-            match key_plane_rows::occurrence_withdrawals_binding(&*self.directory, &subject).await {
-                Ok(found) => rows.extend(found),
-                Err(e) => Self::key_plane_read_failed(
-                    EnvelopeKind::IdentityOccurrenceRevocation,
-                    &subject,
-                    &e,
-                ),
-            }
-        }
-        self.key_plane_refs(rows, "list_occurrence_withdrawal_rows")
+        // CIRISEdge#930 — as `list_revocation_rows`: the 10,484 empty
+        // `list_composers_referencing_any` calls in three minutes were this
+        // loop, once per Global subject per peer round.
+        self.key_plane_listing(
+            KeyPlaneRead::OccurrenceWithdrawal,
+            self.subjects_for_projection(Projection::Global),
+        )
+        .await
     }
 
     // ── CIRISEdge#504 — the 5 E4 keyless-declaration planes advertise via
