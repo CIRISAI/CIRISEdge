@@ -33,6 +33,25 @@
 //! below the depth where they can forward. A static reserve
 //! (`forwarder_reserve_fraction`) also exists but is off by default: it idles
 //! capacity once every relay is placed.
+//!
+//! ## Stage 2 (`FSD/CIRIS_MESH.md` §4, §6.4, §7)
+//!
+//! - **Class policy** ([`ClassPolicy`]): a canonical refuses video outright
+//!   ([`RefuseReason::ClassRefused`], V1) and commits audio only up to 5 %
+//!   of its measured (or advertised) capacity with no trial slot (V2).
+//! - **Forwarder kind** ([`ForwarderKind`]): a non-member TRANSPORT forwarder
+//!   (the canonical, a contact) is not a room member and never a tree node;
+//!   it carries member-to-member links 1:1. With `max_children = 1` a second
+//!   downstream leg of one stream is refused `relay_nonmember_fanout` (M2).
+//! - **Admit-close** ([`Admission::set_admit_closed`]): the service tier
+//!   refuses new relay work ([`RefuseReason::AdmitClosed`]).
+//! - **One uplink, many streams** ([`Admission::set_external_committed`]):
+//!   a node's other admissions' commitments count against this one's limit.
+//! - **Measured role costs** ([`Admission::set_role_costs`]): production
+//!   prices a commitment at the stream's measured rate, not a nominal one.
+//! - **Make-before-break shed** ([`Admission::shed_all_draining`]): a load
+//!   shed keeps forwarding to the shed subscriber until it unsubscribes or
+//!   `down_silence_ms` passes, so the move loses no frames (LS4).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,6 +76,77 @@ pub struct Commitment {
 }
 
 const MAX_PROBE_STREAMS: u64 = 16;
+
+/// What kind of forwarder an admission speaks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForwarderKind {
+    /// A room member: the publisher or a member relay (an ALM tree node).
+    #[default]
+    Member,
+    /// A non-member transport forwarder (the canonical, a contact): carries
+    /// one member's link to another 1:1, never a tree node. It needs no
+    /// upstream of its own (the link IS the path to the far end) and is not
+    /// on the roster; its requesters must be.
+    Transport,
+}
+
+/// A forwarder's per-class policy (`FSD/CIRIS_MESH.md` §6.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClassPolicy {
+    /// Whether the full stream (video) may be committed. `false` refuses
+    /// every primary with [`RefuseReason::ClassRefused`].
+    pub video: bool,
+    /// Commit fraction for this forwarder in place of `commit_fraction`
+    /// (the canonical's audio ceiling, 5 %).
+    pub fraction: Option<f64>,
+    /// Whether an unmeasured forwarder gets the cold-start trial slot.
+    pub trial_slot: bool,
+    /// Most subscribers at once (`Some(1)`: a non-member forwards one link
+    /// of a stream, never a fan-out, M2).
+    pub max_children: Option<usize>,
+}
+
+impl Default for ClassPolicy {
+    fn default() -> Self {
+        Self {
+            video: true,
+            fraction: None,
+            trial_slot: true,
+            max_children: None,
+        }
+    }
+}
+
+impl ClassPolicy {
+    /// The canonical (§6.4 V1/V2): never video, audio within 5 % of
+    /// measured, no trial slot.
+    #[must_use]
+    pub fn canonical() -> Self {
+        Self {
+            video: false,
+            fraction: Some(0.05),
+            trial_slot: false,
+            max_children: None,
+        }
+    }
+
+    /// A non-member contact forwarding a room's call (§4.4 M2): one
+    /// downstream leg per stream.
+    #[must_use]
+    pub fn nonmember_forwarder() -> Self {
+        Self {
+            max_children: Some(1),
+            ..Self::default()
+        }
+    }
+}
+
+/// A shed subscriber still being forwarded to until it moves (LS4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Drain {
+    role: Role,
+    until_ms: u64,
+}
 
 /// C2 admission for one forwarder and one stream.
 // Independent state flags (root, upstream health, probe demand, over-claim
@@ -83,6 +173,11 @@ pub struct Admission<P: PeerRef> {
     upstream_healthy: bool,
     upstream_latency_ms: u32,
     members: BTreeSet<P>,
+    kind: ForwarderKind,
+    class: ClassPolicy,
+    admit_closed: bool,
+    external_committed: u64,
+    draining: BTreeMap<P, Drain>,
 }
 
 impl<P: PeerRef> Admission<P> {
@@ -136,7 +231,153 @@ impl<P: PeerRef> Admission<P> {
             upstream_healthy: false,
             upstream_latency_ms: 0,
             members: BTreeSet::new(),
+            kind: ForwarderKind::Member,
+            class: ClassPolicy::default(),
+            admit_closed: false,
+            external_committed: 0,
+            draining: BTreeMap::new(),
         }
+    }
+
+    /// Admission for a non-member TRANSPORT forwarder (the canonical, or a
+    /// contact) under `class`. It is always "forwarding" (the far end of each
+    /// link is its upstream) and sits at depth 0 of the path it carries.
+    #[must_use]
+    pub fn transport(
+        me: P,
+        cfg: ControllerConfig,
+        advertised_bps: Option<u64>,
+        class: ClassPolicy,
+    ) -> Self {
+        let mut a = Self::relay(me, cfg, advertised_bps);
+        a.kind = ForwarderKind::Transport;
+        a.class = class;
+        a.depth = Some(0);
+        a.upstream_healthy = true;
+        a
+    }
+
+    /// Set this forwarder's class policy.
+    pub fn set_class_policy(&mut self, class: ClassPolicy) {
+        self.class = class;
+    }
+
+    /// The class policy.
+    #[must_use]
+    pub fn class_policy(&self) -> ClassPolicy {
+        self.class
+    }
+
+    /// The forwarder kind.
+    #[must_use]
+    pub fn kind(&self) -> ForwarderKind {
+        self.kind
+    }
+
+    /// Admit-close (`FSD/CIRIS_MESH.md` §7.2): while closed, every request
+    /// that would grow a commitment is refused [`RefuseReason::AdmitClosed`].
+    /// Existing commitments are untouched (shedding is a separate lever).
+    pub fn set_admit_closed(&mut self, closed: bool) {
+        self.admit_closed = closed;
+    }
+
+    /// Whether admission is closed.
+    #[must_use]
+    pub fn admit_closed(&self) -> bool {
+        self.admit_closed
+    }
+
+    /// Bits/s the node's OTHER admissions (its other streams) have committed
+    /// on the same uplink: subtracted from this one's limit.
+    pub fn set_external_committed(&mut self, bps: u64) {
+        self.external_committed = bps;
+    }
+
+    /// Price commitments at measured rates: a primary costs `stream_bps`, a
+    /// standby `standby_bps`. Re-prices the ledger (production measures the
+    /// stream it forwards; the sim keeps the nominal config).
+    pub fn set_role_costs(&mut self, stream_bps: u64, standby_bps: u64) {
+        self.cfg.stream_bps = stream_bps.max(1);
+        self.cfg.standby_bps = standby_bps.max(1).min(self.cfg.stream_bps);
+        for c in self.ledger.values_mut() {
+            c.bps = self.cfg.role_bps(c.role);
+        }
+    }
+
+    /// Grow the unmeasured probe allowance to `streams` full streams (a
+    /// publisher starts a small room as a full mesh; measurement then rules).
+    #[allow(clippy::cast_precision_loss)]
+    pub fn set_probe_streams(&mut self, streams: u64) {
+        if self.ceiling_bps.is_none() {
+            self.probe_bps = self
+                .probe_bps
+                .max((streams.min(MAX_PROBE_STREAMS) * self.cfg.stream_bps) as f64);
+        }
+    }
+
+    /// Everyone this forwarder sends to: the ledger, plus subscribers shed
+    /// make-before-break whose drain has not ended.
+    #[must_use]
+    pub fn forwarding_to(&self) -> Vec<(P, Role)> {
+        let mut v: Vec<(P, Role)> = self
+            .ledger
+            .iter()
+            .map(|(p, c)| (p.clone(), c.role))
+            .collect();
+        for (p, d) in &self.draining {
+            if !self.ledger.contains_key(p) {
+                v.push((p.clone(), d.role));
+            }
+        }
+        v
+    }
+
+    /// Whether `p` is being drained.
+    #[must_use]
+    pub fn is_draining(&self, p: &P) -> bool {
+        self.draining.contains_key(p)
+    }
+
+    /// End drains whose budget passed.
+    pub fn expire_drains(&mut self, now_ms: u64) {
+        self.draining.retain(|_, d| d.until_ms > now_ms);
+    }
+
+    /// **A-shed** (`FSD/CIRIS_MESH.md` §7.2): shed every commitment, most
+    /// recent first (LIFO), each make-before-break: the commitment leaves
+    /// the ledger now (capacity is accounted free) but this forwarder keeps
+    /// sending to the subscriber until it unsubscribes or `down_silence_ms`
+    /// passes. Returns the shed subscribers in shed order.
+    pub fn shed_all_draining(
+        &mut self,
+        now_ms: u64,
+        reason: super::ShedReason,
+        log: &mut DecisionLog,
+    ) -> Vec<P> {
+        let mut order: Vec<(P, Commitment)> =
+            self.ledger.iter().map(|(p, c)| (p.clone(), *c)).collect();
+        order.sort_by_key(|(_, c)| std::cmp::Reverse(c.order));
+        let mut shed = Vec::with_capacity(order.len());
+        for (p, c) in order {
+            self.ledger.remove(&p);
+            self.draining.insert(
+                p.clone(),
+                Drain {
+                    role: c.role,
+                    until_ms: now_ms + self.cfg.down_silence_ms,
+                },
+            );
+            log.record(
+                now_ms,
+                &self.me,
+                DecisionKind::Shed,
+                Some(&p),
+                i64::from(reason.code()),
+                reason.token(),
+            );
+            shed.push(p);
+        }
+        shed
     }
 
     /// Update this relay's view of its own upstream (from its selector).
@@ -170,7 +411,14 @@ impl<P: PeerRef> Admission<P> {
     pub fn hard_limit_bps(&self) -> f64 {
         let adv = self.advertised_bps.map_or(f64::INFINITY, |a| a as f64);
         let measured = self.ceiling_bps.unwrap_or(f64::INFINITY);
-        (self.cfg.commit_fraction * adv.min(measured) - self.cfg.reserve_bps as f64).max(0.0)
+        (self.fraction() * adv.min(measured)
+            - self.cfg.reserve_bps as f64
+            - self.external_committed as f64)
+            .max(0.0)
+    }
+
+    fn fraction(&self) -> f64 {
+        self.class.fraction.unwrap_or(self.cfg.commit_fraction)
     }
 
     /// The admission limit (bits/s) before the forwarder reserve: the hard
@@ -180,13 +428,17 @@ impl<P: PeerRef> Admission<P> {
     pub fn limit_bps(&self) -> f64 {
         let adv = self.advertised_bps.map_or(f64::INFINITY, |a| a as f64);
         let measured = self.ceiling_bps.unwrap_or(f64::INFINITY);
-        let hard = self.cfg.commit_fraction * adv.min(measured);
-        let probe = if self.ceiling_bps.is_none() {
-            self.floor_bps + self.probe_bps
-        } else {
-            f64::INFINITY
+        let hard = self.fraction() * adv.min(measured);
+        let probe = match (self.ceiling_bps, self.class.trial_slot) {
+            (Some(_), _) => f64::INFINITY,
+            (None, true) => self.floor_bps + self.probe_bps,
+            // No trial slot: an unmeasured forwarder commits only against
+            // what it advertises (the canonical's configured capacity), or
+            // what it has demonstrated.
+            (None, false) if self.advertised_bps.is_some() => f64::INFINITY,
+            (None, false) => self.floor_bps,
         };
-        (hard.min(probe) - self.cfg.reserve_bps as f64).max(0.0)
+        (hard.min(probe) - self.cfg.reserve_bps as f64 - self.external_committed as f64).max(0.0)
     }
 
     /// Bits/s committed.
@@ -210,7 +462,12 @@ impl<P: PeerRef> Admission<P> {
     /// Whether this forwarder currently has the stream to forward.
     #[must_use]
     pub fn forwarding(&self) -> bool {
-        self.members.contains(&self.me) && (self.is_root || self.upstream_healthy)
+        match self.kind {
+            ForwarderKind::Member => {
+                self.members.contains(&self.me) && (self.is_root || self.upstream_healthy)
+            }
+            ForwarderKind::Transport => true,
+        }
     }
 
     /// The offer to advertise to candidates.
@@ -308,13 +565,30 @@ impl<P: PeerRef> Admission<P> {
         log: &mut DecisionLog,
     ) -> AdmitDecision {
         // Membership is eligibility, not admission: checked even with
-        // admission off, and before anything else.
-        if !self.members.contains(&self.me) || !self.members.contains(&req.subscriber) {
+        // admission off, and before anything else. A transport forwarder is
+        // not a member; the links it carries are members'.
+        let me_ok = self.kind == ForwarderKind::Transport || self.members.contains(&self.me);
+        if !me_ok || !self.members.contains(&req.subscriber) {
             return self.refuse(now_ms, req, RefuseReason::NotMember, rng, log);
+        }
+        // M2: a non-member forwards one link of a stream, never a fan-out.
+        if let Some(max) = self.class.max_children {
+            if !self.ledger.contains_key(&req.subscriber) && self.ledger.len() >= max {
+                return self.refuse(now_ms, req, RefuseReason::NotMember, rng, log);
+            }
+        }
+        // V1: a class this forwarder never carries is refused whatever the
+        // capacity (a canonical never relays video).
+        if req.role == Role::Primary && !self.class.video {
+            return self.refuse(now_ms, req, RefuseReason::ClassRefused, rng, log);
         }
         if !self.cfg.admission_enabled {
             self.commit(now_ms, req, log);
             return AdmitDecision::Admit { role: req.role };
+        }
+        let existing_bps = self.ledger.get(&req.subscriber).map_or(0, |c| c.bps);
+        if self.admit_closed && self.cfg.role_bps(req.role) > existing_bps {
+            return self.refuse(now_ms, req, RefuseReason::AdmitClosed, rng, log);
         }
         if req.subscriber == self.me || self.ancestry.contains(&req.subscriber) {
             return self.refuse(now_ms, req, RefuseReason::Loop, rng, log);
@@ -419,7 +693,8 @@ impl<P: PeerRef> Admission<P> {
 
     /// A subscriber left (or its link is gone).
     pub fn release(&mut self, sub: &P) -> bool {
-        self.ledger.remove(sub).is_some()
+        let drained = self.draining.remove(sub).is_some();
+        self.ledger.remove(sub).is_some() || drained
     }
 
     /// Fold one closed egress window. Returns the subscribers shed (most
@@ -431,6 +706,7 @@ impl<P: PeerRef> Admission<P> {
         w: &EgressWindow,
         log: &mut DecisionLog,
     ) -> Vec<P> {
+        self.expire_drains(now_ms);
         if w.congested && w.sent_bps > 0.0 {
             self.clean_streak = 0;
             self.congested_streak += 1;
@@ -741,5 +1017,199 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ─── stage 2 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn canonical_refuses_video_and_caps_audio_at_five_percent() {
+        let cfg = ControllerConfig::interactive();
+        // 10 streams of advertised capacity: 5 % is 0.5 Mbit/s of AUDIO,
+        // 7 standbys at 64 kbit/s.
+        let adv = 10 * cfg.stream_bps;
+        let mut a = Admission::transport(9u32, cfg.clone(), Some(adv), ClassPolicy::canonical());
+        roster(&mut a);
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        for s in 1..6u32 {
+            assert!(
+                matches!(
+                    a.request(0, &req(s, Role::Primary), &mut rng, &mut log),
+                    AdmitDecision::Refuse {
+                        reason: RefuseReason::ClassRefused,
+                        ..
+                    }
+                ),
+                "a canonical never commits video"
+            );
+        }
+        let mut admitted = 0u64;
+        for s in 1..32u32 {
+            if matches!(
+                a.request(0, &req(s, Role::Standby), &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ) {
+                admitted += 1;
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let cap = 0.05 * adv as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let committed = a.committed_bps() as f64;
+        assert!(committed <= cap + 1.0, "{committed} > 5 % of {adv}");
+        assert_eq!(admitted, 7);
+        assert_eq!(
+            RefuseReason::ClassRefused.token(),
+            "relay_class_refused:video"
+        );
+    }
+
+    #[test]
+    fn a_nonmember_forwarder_never_fans_out_a_stream() {
+        // W5(a): a second downstream leg of one stream through the same
+        // non-member is refused `relay_nonmember_fanout`. Mutation: with
+        // `max_children: None` the second leg is admitted, so the assertion
+        // below fails (checked by `nonmember_fanout_mutant_admits`).
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::transport(
+            9u32,
+            cfg.clone(),
+            Some(10 * cfg.stream_bps),
+            ClassPolicy::nonmember_forwarder(),
+        );
+        roster(&mut a);
+        let mut rng = SplitMix64(4);
+        let mut log = DecisionLog::default();
+        assert!(matches!(
+            a.request(0, &req(1, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+        let second = a.request(0, &req(2, Role::Primary), &mut rng, &mut log);
+        assert!(
+            matches!(
+                second,
+                AdmitDecision::Refuse {
+                    reason: RefuseReason::NotMember,
+                    ..
+                }
+            ),
+            "{second:?}"
+        );
+        assert_eq!(RefuseReason::NotMember.token(), "relay_nonmember_fanout");
+    }
+
+    #[test]
+    fn nonmember_fanout_mutant_admits() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::transport(
+            9u32,
+            cfg.clone(),
+            Some(10 * cfg.stream_bps),
+            ClassPolicy::default(),
+        );
+        roster(&mut a);
+        a.set_probe_streams(4);
+        let mut rng = SplitMix64(4);
+        let mut log = DecisionLog::default();
+        let _ = a.request(0, &req(1, Role::Primary), &mut rng, &mut log);
+        assert!(
+            matches!(
+                a.request(0, &req(2, Role::Primary), &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ),
+            "without M2's one-leg rule the second leg is admitted: the W5(a) check is live"
+        );
+    }
+
+    #[test]
+    fn admit_closed_refuses_growth_but_keeps_commitments() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::publisher(0u32, cfg.clone(), Some(10 * cfg.stream_bps));
+        roster(&mut a);
+        a.set_probe_streams(8);
+        let mut rng = SplitMix64(5);
+        let mut log = DecisionLog::default();
+        assert!(matches!(
+            a.request(0, &req(1, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+        a.set_admit_closed(true);
+        assert!(matches!(
+            a.request(0, &req(2, Role::Standby), &mut rng, &mut log),
+            AdmitDecision::Refuse {
+                reason: RefuseReason::AdmitClosed,
+                ..
+            }
+        ));
+        // A downgrade never grows a commitment: still admitted.
+        assert!(matches!(
+            a.request(0, &req(1, Role::Standby), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+        assert_eq!(a.ledger().len(), 1);
+    }
+
+    #[test]
+    fn a_load_shed_is_lifo_and_keeps_forwarding_until_the_drain_ends() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::publisher(0u32, cfg.clone(), Some(20 * cfg.stream_bps));
+        roster(&mut a);
+        a.set_probe_streams(8);
+        let mut rng = SplitMix64(6);
+        let mut log = DecisionLog::default();
+        for s in 1..=4u32 {
+            let _ = a.request(u64::from(s), &req(s, Role::Standby), &mut rng, &mut log);
+        }
+        let shed = a.shed_all_draining(100, super::super::ShedReason::LoadShed, &mut log);
+        assert_eq!(shed, vec![4, 3, 2, 1], "newest admission first");
+        assert_eq!(a.committed_bps(), 0);
+        assert_eq!(
+            a.forwarding_to().len(),
+            4,
+            "still forwarded while they move"
+        );
+        assert!(a.release(&2));
+        assert_eq!(a.forwarding_to().len(), 3);
+        a.expire_drains(100 + cfg.down_silence_ms);
+        assert!(a.forwarding_to().is_empty());
+    }
+
+    #[test]
+    fn other_streams_commitments_share_the_uplink() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::publisher(0u32, cfg.clone(), Some(4 * cfg.stream_bps));
+        roster(&mut a);
+        a.set_probe_streams(8);
+        // 65 % of 4 streams = 2.6 streams; another stream holds 2.
+        a.set_external_committed(2 * cfg.stream_bps);
+        let mut rng = SplitMix64(7);
+        let mut log = DecisionLog::default();
+        let mut n = 0;
+        for s in 1..8u32 {
+            if matches!(
+                a.request(0, &req(s, Role::Primary), &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ) {
+                n += 1;
+            }
+        }
+        assert_eq!(n, 0, "0.6 of a stream left: no primary fits");
+    }
+
+    #[test]
+    fn refusal_and_shed_tokens_are_stable_and_round_trip() {
+        let mut seen = std::collections::BTreeSet::new();
+        for r in RefuseReason::ALL {
+            assert!(seen.insert(r.token()), "duplicate token {}", r.token());
+            assert_eq!(RefuseReason::from_code(r.code()), Some(r));
+        }
+        for r in [
+            super::super::ShedReason::OverCommitted,
+            super::super::ShedReason::UpstreamLost,
+            super::super::ShedReason::Preempted,
+            super::super::ShedReason::LoadShed,
+        ] {
+            assert_eq!(super::super::ShedReason::from_code(r.code()), Some(r));
+        }
     }
 }

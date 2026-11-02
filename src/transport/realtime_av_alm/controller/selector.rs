@@ -34,13 +34,22 @@
 //! marked down. Suspicion of a deeper parent waits longer
 //! (`suspect · (1 + depth/2)`) so a relay's own failover finishes before its
 //! children give up on it.
+//!
+//! **Tiers** (`FSD/CIRIS_MESH.md` R2/R3, §6.4–6.5): every candidate has a
+//! [`Tier`]. The lowest tier with a viable candidate wins outright; scores
+//! are compared only WITHIN a tier, so the canonical (usually the
+//! best-provisioned, lowest-RTT candidate) can never out-score a roster
+//! member. The canonical never carries video: it is never a primary, only an
+//! audio (standby-role) path, taken when no member can serve the primary.
+//! A node on it keeps probing the member tier with its jittered backoff and
+//! moves back make-before-break ([`ParentSelector::video_unavailable`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::decision_log::{DecisionKind, DecisionLog};
 use super::path_meter::PathMeter;
 use super::peer_state::{PeerHealth, PeerState};
-use super::{AdmitDecision, ControllerConfig, JitterSource, Offer, PeerRef, Role};
+use super::{AdmitDecision, ControllerConfig, JitterSource, Offer, PeerRef, Role, Tier};
 
 /// What the caller must do on the wire (stage 2: a C3 frame each).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +119,8 @@ struct Cand<P> {
     better_windows: u32,
     no_room_offers: u32,
     eligible: bool,
+    tier: Tier,
+    offer_at_ms: u64,
 }
 
 /// How long an unanswered subscribe waits before it counts as refused.
@@ -153,6 +164,8 @@ pub struct ParentSelector<P: PeerRef> {
     last_standby_rotation_ms: Option<u64>,
     members: BTreeSet<P>,
     parent_changes: u64,
+    tiers: BTreeMap<P, Tier>,
+    next_r3_probe_ms: u64,
 }
 
 impl<P: PeerRef> ParentSelector<P> {
@@ -176,7 +189,46 @@ impl<P: PeerRef> ParentSelector<P> {
             last_standby_rotation_ms: None,
             members: BTreeSet::new(),
             parent_changes: 0,
+            tiers: BTreeMap::new(),
+            next_r3_probe_ms: 0,
         }
+    }
+
+    /// Put candidate `p` in `tier` (default [`Tier::Member`]). A canonical
+    /// candidate is exempt from the roster gate (it is a non-member
+    /// transport forwarder, never a tree node) and is eligible for the audio
+    /// role only.
+    pub fn set_tier(&mut self, p: &P, tier: Tier) {
+        self.tiers.insert(p.clone(), tier);
+        if let Some(c) = self.cands.get_mut(p) {
+            c.tier = tier;
+        }
+    }
+
+    /// The tier of `p`.
+    #[must_use]
+    pub fn tier_of(&self, p: &P) -> Tier {
+        self.tiers.get(p).copied().unwrap_or_default()
+    }
+
+    /// `FSD/CIRIS_MESH.md` §6.5: this node hears the stream on the canonical
+    /// tier, audio only, with no member serving it the full stream.
+    #[must_use]
+    pub fn video_unavailable(&self) -> bool {
+        self.primary.is_none()
+            && self
+                .standby
+                .as_ref()
+                .is_some_and(|s| self.tier_of(s) == Tier::Canonical)
+    }
+
+    /// Every candidate with its health, tier and whether it offered.
+    #[must_use]
+    pub fn candidates(&self) -> Vec<(P, PeerState, Tier)> {
+        self.cands
+            .iter()
+            .map(|(p, c)| (p.clone(), c.health.state(), c.tier))
+            .collect()
     }
 
     /// Whether this node can forward (sent with every subscribe).
@@ -274,6 +326,7 @@ impl<P: PeerRef> ParentSelector<P> {
 
     fn cand(&mut self, p: &P, now_ms: u64) -> &mut Cand<P> {
         let cfg = &self.cfg;
+        let tier = self.tiers.get(p).copied().unwrap_or_default();
         self.cands.entry(p.clone()).or_insert_with(|| Cand {
             offer: None,
             rtt_ms: 0.0,
@@ -286,6 +339,8 @@ impl<P: PeerRef> ParentSelector<P> {
             better_windows: 0,
             no_room_offers: 0,
             eligible: true,
+            tier,
+            offer_at_ms: now_ms,
         })
     }
 
@@ -302,6 +357,7 @@ impl<P: PeerRef> ParentSelector<P> {
         let c = self.cand(&from, now_ms);
         let looped = offer.ancestry.contains(&me);
         c.rtt_ms = rtt_ms;
+        c.offer_at_ms = now_ms;
         c.meter.on_rtt(rtt_ms);
         let upgrade = stream_bps.saturating_sub(standby_bps);
         c.no_room_offers = if offer.headroom_bps < upgrade {
@@ -467,6 +523,26 @@ impl<P: PeerRef> ParentSelector<P> {
             }
             AdmitDecision::Admit { .. } => match role {
                 Role::Standby => {
+                    // A new standby replaces the old one: release it, or its
+                    // reservation would be held for nothing.
+                    if let Some(old) = self.standby.clone().filter(|o| o != from) {
+                        if self
+                            .cands
+                            .get(&old)
+                            .is_some_and(|c| c.link == Link::Standby)
+                        {
+                            self.cands.get_mut(&old).expect("present").link = Link::None;
+                            log.record(
+                                now_ms,
+                                &me,
+                                DecisionKind::Unsubscribe,
+                                Some(&old),
+                                0,
+                                "standby replaced",
+                            );
+                            out.push(SelectorAction::Unsubscribe { parent: old });
+                        }
+                    }
                     let c = self.cands.get_mut(from).expect("present");
                     c.link = Link::Standby;
                     c.failures = 0;
@@ -574,14 +650,22 @@ impl<P: PeerRef> ParentSelector<P> {
         let Some(o) = c.offer.as_ref() else {
             return false;
         };
+        let canonical = c.tier == Tier::Canonical;
+        if canonical && role == Role::Primary {
+            // V1: the canonical never carries video.
+            return false;
+        }
         if !c.eligible
-            || !self.members.contains(p)
+            || (!canonical && !self.members.contains(p))
             || !o.forwarding
             || o.ancestry.contains(&self.me)
             || o.depth.saturating_add(1) > self.cfg.max_depth
             || now_ms < c.backoff_until
             || matches!(c.health.state(), PeerState::Suspected | PeerState::Down)
+            || now_ms.saturating_sub(c.offer_at_ms) > self.cfg.down_silence_ms
         {
+            // A candidate that stopped offering (gone, or no longer
+            // forwarding) is not a candidate: its last offer is stale.
             return false;
         }
         if self.cfg.admission_enabled && self.headroom_for(o, role) < self.cfg.role_bps(role) {
@@ -660,6 +744,10 @@ impl<P: PeerRef> ParentSelector<P> {
                 (p.clone(), s)
             })
             .collect();
+        // R2: the lowest tier with a viable candidate wins outright; scores
+        // are compared only within it.
+        let low = scored.iter().map(|(p, _)| self.cands[p].tier).min()?;
+        scored.retain(|(p, _)| self.cands[p].tier == low);
         let best = scored.iter().map(|(_, s)| *s).fold(f64::MIN, f64::max);
         if scored.is_empty() {
             return None;
@@ -676,6 +764,31 @@ impl<P: PeerRef> ParentSelector<P> {
     /// The voluntary-switch dwell: `min_dwell · 2^k`, k = voluntary switches
     /// in the last [`FLAP_WINDOW_MS`] (capped at 8×), so a noisy pair cannot
     /// flap at the base dwell.
+    /// R3's probe target: the best-scoring member-tier candidate that is
+    /// viable in every way but advertised room.
+    fn best_member_ignoring_room(&self, now_ms: u64) -> Option<P> {
+        self.cands
+            .iter()
+            .filter(|(p, c)| {
+                c.tier == Tier::Member
+                    && c.link == Link::None
+                    && c.eligible
+                    && self.members.contains(p)
+                    && self.primary.as_ref() != Some(p)
+                    && now_ms >= c.backoff_until
+                    && now_ms.saturating_sub(c.offer_at_ms) <= self.cfg.down_silence_ms
+                    && c.offer.as_ref().is_some_and(|o| {
+                        o.forwarding
+                            && !o.ancestry.contains(&self.me)
+                            && o.depth.saturating_add(1) <= self.cfg.max_depth
+                    })
+                    && !matches!(c.health.state(), PeerState::Suspected | PeerState::Down)
+            })
+            .map(|(p, c)| (p.clone(), self.score(c)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(p, _)| p)
+    }
+
     fn dwell_ms(&self, now_ms: u64) -> u64 {
         let k = self
             .recent_switches
@@ -913,7 +1026,8 @@ impl<P: PeerRef> ParentSelector<P> {
         if self.primary.is_none() && !pending_primary {
             let standby_ok = self.standby.clone().filter(|s| {
                 let c = &self.cands[s];
-                c.link == Link::Standby
+                c.tier != Tier::Canonical
+                    && c.link == Link::Standby
                     && c.eligible
                     && self.members.contains(s)
                     && now_ms >= c.backoff_until
@@ -923,10 +1037,43 @@ impl<P: PeerRef> ParentSelector<P> {
                         PeerState::Available | PeerState::Degraded | PeerState::Recovering
                     )
             });
+            let standby_pending = self.cands.values().any(|c| {
+                matches!(
+                    c.link,
+                    Link::Requested {
+                        role: Role::Standby,
+                        ..
+                    }
+                )
+            });
             if let Some(s) = standby_ok {
                 out.push(self.request(now_ms, &s, Role::Primary, "promote standby", log));
             } else if let Some(p) = self.pick(Role::Primary, now_ms, false, rng) {
                 out.push(self.request(now_ms, &p, Role::Primary, "join", log));
+            } else if self.video_unavailable() && now_ms >= self.next_r3_probe_ms {
+                // R3: on the canonical tier, keep ASKING the member tier on a
+                // jittered backoff, even when no member advertises room: a
+                // forwarder grows its probe only on demand, and a request it
+                // refuses is that demand.
+                let base = self.cfg.backoff_base_ms * 4;
+                self.next_r3_probe_ms = now_ms + self.cfg.backoff_ms(base, 2, rng);
+                if let Some(p) = self.best_member_ignoring_room(now_ms) {
+                    out.push(self.request(now_ms, &p, Role::Primary, "R3 probe", log));
+                }
+            } else if self.standby.is_none()
+                && !standby_pending
+                && self.cands.values().any(|c| c.tier == Tier::Canonical)
+            {
+                // §6.5: no member can serve the full stream. Take audio on the
+                // canonical tier, and keep probing the member tier for the
+                // primary (R3). Without a canonical candidate this is a no-op:
+                // a member-only world waits for room, as stage 1 did.
+                if let Some(s) = self
+                    .pick(Role::Standby, now_ms, false, rng)
+                    .filter(|s| self.cands[s].tier == Tier::Canonical)
+                {
+                    out.push(self.request(now_ms, &s, Role::Standby, "audio fallback", log));
+                }
             }
         }
 
@@ -967,9 +1114,33 @@ impl<P: PeerRef> ParentSelector<P> {
         if let Some(s) = self.standby.clone() {
             let c = &self.cands[&s];
             let calm = c.link == Link::Standby && self.promoting().is_none();
-            if c.health.state() == PeerState::Down || !self.members.contains(&s) || !c.eligible {
+            let canonical = c.tier == Tier::Canonical;
+            if c.health.state() == PeerState::Down
+                || (!canonical && !self.members.contains(&s))
+                || !c.eligible
+            {
                 self.standby = None;
                 out.push(self.drop_parent(now_ms, &s, rng, log, "standby down or ineligible"));
+            } else if calm && canonical && self.primary.is_some() {
+                // R3: off the canonical as soon as a member can take the
+                // standby (the primary already carries the audio).
+                if let Some(n) = self
+                    .pick(Role::Standby, now_ms, false, rng)
+                    .filter(|n| self.cands[n].tier == Tier::Member)
+                {
+                    self.standby = None;
+                    out.push(self.drop_parent(now_ms, &s, rng, log, "leave the canonical tier"));
+                    out.push(self.request(now_ms, &n, Role::Standby, "member standby", log));
+                } else if now_ms >= self.next_r3_probe_ms {
+                    // No member advertises standby room: ask one anyway (R3);
+                    // the canonical standby stays until a member admits, and
+                    // is released then (`on_decision`).
+                    let base = self.cfg.backoff_base_ms * 4;
+                    self.next_r3_probe_ms = now_ms + self.cfg.backoff_ms(base, 2, rng);
+                    if let Some(n) = self.best_member_ignoring_room(now_ms) {
+                        out.push(self.request(now_ms, &n, Role::Standby, "R3 probe", log));
+                    }
+                }
             } else if calm
                 && self.cfg.admission_enabled
                 && c.no_room_offers >= STANDBY_NO_ROOM_OFFERS
@@ -1006,5 +1177,143 @@ impl<P: PeerRef> ParentSelector<P> {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{AdmitDecision, SplitMix64};
+    use super::*;
+
+    fn offer(from: u32, headroom_streams: u64, cfg: &ControllerConfig) -> Offer<u32> {
+        Offer {
+            from,
+            depth: 0,
+            ancestry: Vec::new(),
+            headroom_bps: headroom_streams * cfg.stream_bps,
+            forwarder_headroom_bps: headroom_streams * cfg.stream_bps,
+            upstream_latency_ms: 0,
+            forwarding: true,
+        }
+    }
+
+    /// Run `s` for `ms`, answering every subscribe with Admit and feeding
+    /// fresh offers; returns the requests it made.
+    fn drive(
+        s: &mut ParentSelector<u32>,
+        cfg: &ControllerConfig,
+        from_ms: u64,
+        to_ms: u64,
+        offers: &[(u32, u64, f64)],
+    ) -> Vec<SelectorAction<u32>> {
+        let mut rng = SplitMix64(11);
+        let mut log = DecisionLog::default();
+        let mut all = Vec::new();
+        let mut t = from_ms;
+        let mut seq = from_ms / 50;
+        while t < to_ms {
+            // Every subscribed parent delivers (the primary the full chunk,
+            // a standby its audio), at half its offer RTT.
+            for (p, role) in s.subscriptions() {
+                let rtt = offers.iter().find(|o| o.0 == p).map_or(50.0, |o| o.2);
+                for k in 0..5 {
+                    s.on_chunk(t, &p, seq + k, role == Role::Primary, 6_000, rtt / 2.0);
+                }
+            }
+            seq += 5;
+            if t % 1_000 == 0 {
+                for &(p, room, rtt) in offers {
+                    s.on_offer(t, offer(p, room, cfg), rtt, &mut log);
+                }
+            }
+            let acts = s.tick(t, &mut rng, &mut log);
+            for a in &acts {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    let d = AdmitDecision::Admit { role: *role };
+                    let more = s.on_decision(t, parent, &d, &mut rng, &mut log);
+                    all.extend(more);
+                }
+            }
+            all.extend(acts);
+            t += 250;
+        }
+        all
+    }
+
+    /// W1 (`FSD/CIRIS_MESH.md` §9): with any eligible member Available, the
+    /// canonical is never chosen, however much better it scores.
+    #[test]
+    fn w1_members_before_the_canonical() {
+        let cfg = ControllerConfig::interactive();
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2, 3]);
+        s.set_tier(&9, Tier::Canonical);
+        // The canonical: lowest RTT, most headroom. The members: slow, tight.
+        let acts = drive(
+            &mut s,
+            &cfg,
+            0,
+            20_000,
+            &[(9, 50, 2.0), (2, 2, 300.0), (3, 2, 320.0)],
+        );
+        assert!(matches!(s.primary(), Some(&2 | &3)));
+        assert!(matches!(s.standby(), Some(&2 | &3)));
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, SelectorAction::Subscribe { parent: 9, .. })),
+            "the canonical was asked while a member was viable: {acts:?}"
+        );
+        assert!(!s.video_unavailable());
+    }
+
+    /// W1's mutation: scoring the canonical WITH the members (the same node
+    /// put in the member tier) picks it. If this ever stops picking 9, W1
+    /// no longer proves anything.
+    #[test]
+    fn w1_mutant_scoring_the_canonical_with_members_picks_it() {
+        let cfg = ControllerConfig::interactive();
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2, 3, 9]);
+        let _ = drive(
+            &mut s,
+            &cfg,
+            0,
+            20_000,
+            &[(9, 50, 2.0), (2, 2, 300.0), (3, 2, 320.0)],
+        );
+        assert_eq!(s.primary(), Some(&9));
+    }
+
+    /// §6.5 / V1: with no member, the canonical carries audio only (never a
+    /// primary) and the node keeps probing; a member that appears takes the
+    /// primary and the canonical standby is released (R3).
+    #[test]
+    fn canonical_is_audio_only_and_the_member_tier_is_reprobed() {
+        let cfg = ControllerConfig::interactive();
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2, 3]);
+        s.set_tier(&9, Tier::Canonical);
+        let acts = drive(&mut s, &cfg, 0, 10_000, &[(9, 50, 2.0)]);
+        assert!(s.primary().is_none());
+        assert_eq!(s.standby(), Some(&9));
+        assert!(s.video_unavailable());
+        assert!(!acts.iter().any(|a| matches!(
+            a,
+            SelectorAction::Subscribe {
+                parent: 9,
+                role: Role::Primary
+            }
+        )));
+        let acts = drive(
+            &mut s,
+            &cfg,
+            10_000,
+            30_000,
+            &[(9, 50, 2.0), (2, 4, 40.0), (3, 4, 60.0)],
+        );
+        assert!(matches!(s.primary(), Some(&2 | &3)));
+        assert_ne!(s.standby(), Some(&9), "{acts:?}");
+        assert!(!s.video_unavailable());
     }
 }

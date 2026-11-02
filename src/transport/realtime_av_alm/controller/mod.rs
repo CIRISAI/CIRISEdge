@@ -28,9 +28,16 @@
 //! | C6 | [`peer_state`] | available → degraded → suspected → down → recovering; suspicion is never a trust verdict |
 //! | C7 | [`decision_log`] | deterministic, SHA-256-chained decision log + counters |
 //!
-//! C3 (the subscribe/admit frame on the wire) and C5 (stale-frame dropping)
-//! are stage 2. The message types C3 will carry are defined here
-//! ([`ControlMsg`], [`Offer`], [`SubscribeRequest`], [`AdmitDecision`]).
+//! C3 (stage 2) puts [`ControlMsg`] on the wire ([`wire`]): one `CALM`
+//! frame per message on the existing A/V link, capability-gated per peer.
+//! C5 (stale frames) lives in the call layer (`av_call.rs`) and leviculum's
+//! timed Channel frames.
+//!
+//! ## Tiers
+//!
+//! Candidates carry a [`Tier`] (`FSD/CIRIS_MESH.md` R2): roster members
+//! first (the publisher and member relays), the canonical last and never
+//! scored against them; the canonical is audio-only (§6.4).
 //!
 //! ## Multi-hop
 //!
@@ -72,8 +79,9 @@ pub mod decision_log;
 pub mod path_meter;
 pub mod peer_state;
 pub mod selector;
+pub mod wire;
 
-pub use admission::{Admission, Commitment};
+pub use admission::{Admission, ClassPolicy, Commitment, ForwarderKind};
 pub use decision_log::{DecisionKind, DecisionLog};
 pub use path_meter::{EgressMeter, EgressWindow, PathMeter, PathSnapshot};
 pub use peer_state::{PeerHealth, PeerState};
@@ -283,6 +291,23 @@ impl ControllerConfig {
         self
     }
 
+    /// The transport-relay class (`FSD/CIRIS_MESH.md` §4.2): the same
+    /// controller choosing a RELAYED TRANSPORT PATH (a relay reservation)
+    /// instead of an A/V parent. Depth is 1 by rule (one relay, never two),
+    /// the primary is the reservation's measured rate and the standby is a
+    /// keepalive-only link (measured by real keepalive delivery).
+    #[must_use]
+    pub fn transport_relay() -> Self {
+        Self {
+            // The `server` shaping class' per-link rate (7000 B/s): the
+            // default allowance an unreserved relayed link gets.
+            stream_bps: 56_000,
+            standby_bps: 1_000,
+            max_depth: 1,
+            ..Self::interactive()
+        }
+    }
+
     /// Cost of a subscription in `role`.
     #[must_use]
     pub fn role_bps(&self, role: Role) -> u64 {
@@ -370,6 +395,76 @@ pub enum RefuseReason {
     /// E1 item 1, 6.1.6); a non-member may only be a transport-layer
     /// forwarder of ONE member-to-member link, never a tree node.
     NotMember,
+    /// The flow's class is refused by this forwarder's class policy: a
+    /// canonical never relays video (`FSD/CIRIS_MESH.md` §6.4 V1).
+    ClassRefused,
+    /// This node's service tier closed admission to new relay work
+    /// (`FSD/CIRIS_MESH.md` §7.2 Admit-close).
+    AdmitClosed,
+}
+
+impl RefuseReason {
+    /// Every reason (for token tests).
+    pub const ALL: [Self; 7] = [
+        Self::Capacity,
+        Self::Loop,
+        Self::DepthLimit,
+        Self::UpstreamUnhealthy,
+        Self::NotMember,
+        Self::ClassRefused,
+        Self::AdmitClosed,
+    ];
+
+    /// The stable refusal token (counted by label, surfaced to the host).
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Capacity => "relay_capacity",
+            Self::Loop => "relay_loop",
+            Self::DepthLimit => "relay_depth_limit",
+            Self::UpstreamUnhealthy => "relay_upstream_unhealthy",
+            Self::NotMember => "relay_nonmember_fanout",
+            Self::ClassRefused => "relay_class_refused:video",
+            Self::AdmitClosed => "load_refuse:admit_closed",
+        }
+    }
+
+    /// The wire code (C3 `REFUSE`).
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// From the wire code.
+    #[must_use]
+    pub const fn from_code(c: u8) -> Option<Self> {
+        match c {
+            0 => Some(Self::Capacity),
+            1 => Some(Self::Loop),
+            2 => Some(Self::DepthLimit),
+            3 => Some(Self::UpstreamUnhealthy),
+            4 => Some(Self::NotMember),
+            5 => Some(Self::ClassRefused),
+            6 => Some(Self::AdmitClosed),
+            _ => None,
+        }
+    }
+}
+
+/// Which selection tier a candidate parent belongs to (`FSD/CIRIS_MESH.md`
+/// §1, R2). Tiers are never compared by score: a lower tier with any viable
+/// candidate wins outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum Tier {
+    /// A room member (the publisher itself, or a member relay): an ALM media
+    /// parent. Roster members come before any canonical.
+    #[default]
+    Member,
+    /// The canonical: a non-member TRANSPORT forwarder of one
+    /// member-to-member link, the last resort. It never carries video
+    /// (§6.4 V1): it is eligible only for the audio (standby) role, and a
+    /// node on it keeps probing the member tier (R3).
+    Canonical,
 }
 
 /// Admission's answer.
@@ -398,6 +493,39 @@ pub enum ShedReason {
     UpstreamLost,
     /// Displaced by a forward-capable subscriber (forwarder preemption).
     Preempted,
+    /// Shed by this node's service tier (`FSD/CIRIS_MESH.md` §7.2 A-shed).
+    LoadShed,
+}
+
+impl ShedReason {
+    /// The stable token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::OverCommitted => "relay_shed:over_committed",
+            Self::UpstreamLost => "relay_shed:upstream_lost",
+            Self::Preempted => "relay_shed:preempted",
+            Self::LoadShed => "load_shed:audio",
+        }
+    }
+
+    /// The wire code (C3 `SHED`).
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// From the wire code.
+    #[must_use]
+    pub const fn from_code(c: u8) -> Option<Self> {
+        match c {
+            0 => Some(Self::OverCommitted),
+            1 => Some(Self::UpstreamLost),
+            2 => Some(Self::Preempted),
+            3 => Some(Self::LoadShed),
+            _ => None,
+        }
+    }
 }
 
 /// The control vocabulary C3 will frame. One frame = one stream + one

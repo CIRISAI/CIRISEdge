@@ -102,6 +102,7 @@ pub mod handler;
 pub mod holonomic;
 pub mod identity;
 pub mod key_boundary;
+pub mod load_ladder;
 pub mod log_throttle;
 pub mod manifest;
 /// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — nobody joins a
@@ -394,6 +395,7 @@ pub use key_boundary::{
     KeyBoundaryParseError, KeyBoundaryScope, KEY_BOUNDARY_PREFIX, KEY_BOUNDARY_SUFFIX,
     LEGACY_NO_SEED_IN_HEAP,
 };
+pub use load_ladder::{LoadPressure, ServiceTier};
 pub use messages::{
     is_federation_attestation_emitting_type, AccordCarrier, AccordSignature, AnnouncementKind,
     AnnouncementPriority, AttestationGossip, AttestationRef, AuthorityClass,
