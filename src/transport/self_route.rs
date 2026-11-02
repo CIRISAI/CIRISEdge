@@ -441,13 +441,44 @@ fn transit_kex_member(pair: &TransitKexPair) -> serde_json::Value {
     })
 }
 
-/// The row's `asserted_at`: now, µs-truncated, and strictly after `not_after`
-/// (the stored signed row's), so a re-sign never lands on the stored clock.
+/// The row's `asserted_at`: now, truncated to the substrate's millisecond, and
+/// strictly after `not_after` (the stored signed row's), so a re-sign never
+/// lands on the stored clock.
+///
+/// persist v61 (CC 2.6.2 strict): the bump is ONE MILLISECOND. A signed instant
+/// is `.sssZ` and nothing finer verifies, so the v43 one-microsecond bump
+/// produced an instant the canonical form cannot carry (persist refuses a
+/// sub-millisecond `asserted_at` on a signed route).
 fn next_asserted_at(not_after: Option<DateTime<Utc>>) -> DateTime<Utc> {
     let now = ciris_persist::federation::admission::truncate_to_substrate_resolution(Utc::now());
     match not_after {
-        Some(floor) if now <= floor => floor + chrono::Duration::microseconds(1),
+        Some(floor) if now <= floor => {
+            ciris_persist::federation::admission::truncate_to_substrate_resolution(floor)
+                + chrono::Duration::milliseconds(1)
+        }
         _ => now,
+    }
+}
+
+/// persist v61 (CC 2.6.2 strict) — the signed route envelope writes its
+/// instants in the one canonical form, `YYYY-MM-DDTHH:MM:SS.sssZ`, whatever
+/// the typed row's serde writes (chrono's default omits the fraction on a
+/// whole second, and persist refuses any other form at admission). The typed
+/// column holds the same millisecond, so the envelope and the column agree.
+fn render_route_instants(envelope: &mut serde_json::Value, row: &TransportDestination) {
+    use ciris_persist::federation::admission::render_signed_instant;
+    let Some(obj) = envelope.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "asserted_at".into(),
+        serde_json::Value::String(render_signed_instant(row.asserted_at)),
+    );
+    if let Some(retired_at) = row.retired_at {
+        obj.insert(
+            "retired_at".into(),
+            serde_json::Value::String(render_signed_instant(retired_at)),
+        );
     }
 }
 
@@ -509,6 +540,7 @@ async fn build_and_sign_self_route(
         tracing::warn!(error = %e, "history: CIRISEdge#406: route envelope serialize failed");
         SelfRouteOutcome::Deferred(format!("envelope serialize: {e}"))
     })?;
+    render_route_instants(&mut envelope, &row);
     if let Some(pair) = transit {
         let Some(obj) = envelope.as_object_mut() else {
             return Err(SelfRouteOutcome::Deferred(
@@ -1223,9 +1255,18 @@ mod tests {
     fn next_asserted_at_strictly_exceeds_the_stored_clock() {
         let ahead = Utc::now() + chrono::Duration::seconds(60);
         let ahead = ciris_persist::federation::admission::truncate_to_substrate_resolution(ahead);
+        // persist v61 (CC 2.6.2 strict): the bump is one millisecond, so the
+        // re-signed instant is still `.sssZ`.
         assert_eq!(
             next_asserted_at(Some(ahead)),
-            ahead + chrono::Duration::microseconds(1)
+            ahead + chrono::Duration::milliseconds(1)
+        );
+        assert_eq!(
+            ciris_persist::federation::admission::truncate_to_substrate_resolution(
+                next_asserted_at(Some(ahead))
+            ),
+            next_asserted_at(Some(ahead)),
+            "the bumped instant carries no sub-millisecond part"
         );
         let behind = Utc::now() - chrono::Duration::seconds(60);
         assert!(next_asserted_at(Some(behind)) > behind);

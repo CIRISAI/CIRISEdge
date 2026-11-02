@@ -261,7 +261,9 @@ pub async fn ensure_content_occurrence(
         directory
             .put_identity_occurrence_local(IdentityOccurrence {
                 device_class: device_class.to_owned(),
-                asserted_at: chrono::Utc::now(),
+                asserted_at: ciris_persist::federation::admission::truncate_to_substrate_resolution(
+                    chrono::Utc::now(),
+                ),
                 persist_row_hash: String::new(),
                 ..found.clone()
             })
@@ -279,7 +281,10 @@ pub async fn ensure_content_occurrence(
             occurrence_key_id: occurrence_key_id.to_owned(),
             device_class: device_class.to_owned(),
             hardware_attestation: None,
-            asserted_at: chrono::Utc::now(),
+            // persist v61 (CC 2.6.2 strict): an occurrence instant is `.sssZ`.
+            asserted_at: ciris_persist::federation::admission::truncate_to_substrate_resolution(
+                chrono::Utc::now(),
+            ),
             valid_until: None,
             encryption_pubkeys: Some(enc),
             transport_binding: None,
