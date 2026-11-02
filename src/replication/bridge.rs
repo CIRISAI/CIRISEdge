@@ -713,8 +713,9 @@ fn group_of_row(row: &Attestation) -> Option<String> {
     })
 }
 
-/// persist v61 S2 (#1148) — what a row refused `not_in_audience` waits on: the
-/// group it is placed at, and its attester's owner axis.
+/// persist v61 S2 (#1148) — what a row refused `not_in_audience` waits on, most
+/// specific first: the group it is placed at, then its attester's owner axis.
+/// The park takes the first.
 fn audience_gate_keys(bytes: &[u8]) -> Vec<String> {
     let Some(row) = row_of_wire(bytes) else {
         return Vec::new();
@@ -5021,8 +5022,8 @@ impl FederationDirectoryReplicationBridge {
 
     /// persist v61 S2 (CIRISPersist#1148) — park a row refused
     /// `not_in_audience` on what gates it: the group it is placed at
-    /// (`audience:group:<id>`) and its attester's owner axis
-    /// (`audience:owner:<attester>`). persist's guidance is "re-offer only
+    /// (`audience:group:<id>`), or for a row placed at no group its attester's
+    /// owner axis (`audience:owner:<attester>`). persist's guidance is "re-offer only
     /// after the receiver's audience changes": the admission of a membership
     /// row of that group, or of an owner binding / replication consent of that
     /// key, releases it ([`audience_release_keys`]) and asks the offering peer
@@ -5036,18 +5037,17 @@ impl FederationDirectoryReplicationBridge {
         envelope_bytes: &[u8],
         source_peer: Option<&str>,
     ) {
+        // A parked row waits on ONE dependency (the backoff entry's
+        // `waiting_on`): the group it is placed at when it has one, else its
+        // attester's owner axis.
         let keys = audience_gate_keys(envelope_bytes);
-        let Some((first, rest)) = keys.split_first() else {
+        let Some(first) = keys.first() else {
             return;
         };
         let evictions = self.refusal_backoff.park_evictions();
         let window =
             self.refusal_backoff
                 .park_booked_at(kind, hash, first, source_peer, Instant::now());
-        for key in rest {
-            self.refusal_backoff
-                .index_waiting_on(kind, hash, key, source_peer);
-        }
         self.book_park(kind);
         self.note_park_evictions(evictions);
         tracing::debug!(
