@@ -20,14 +20,15 @@
 //!
 //! Test-only: the files are ~325 KB and nothing in production reads them.
 
-/// The CIRISConstitution commit both files are vendored from: `b4da527`, the
-/// `v1.0-rc14` tag commit (`cc_version 1.0-rc14`, containing rc12 and rc13) —
-/// what persist v61 vendors (CIRISPersist `4eca870b`), so the replay persist
-/// runs and the one edge runs read the same bytes. (Was rc8.1 `157039d`
-/// through the persist v59/v60 adopts; rc7 `536b8cb` through persist v57; rc6
-/// `651140a` until the persist v55 adopt, rc5 `a4d29a6` until the v33.0.0
-/// adopt.)
-pub const VENDORED_CC_COMMIT: &str = "b4da5272413c6b056baa597e537d4aabdcee6902";
+/// The CIRISConstitution commit both files are vendored from: `ace6b74`, the
+/// `v1.0-rc15` tag commit (tag object `6869eb10`, `cc_version 1.0-rc15`) —
+/// what persist v61 vendors (CIRISPersist `362e20b3`), byte-identical, so
+/// the replay persist runs and the one edge runs read the same bytes. rc15
+/// keeps rc14's grammar (`registry_sha256` `df79a1dd…`, 1244 vectors). (Was
+/// rc14 `b4da527` at the first v61 prestage; rc8.1 `157039d` through the
+/// persist v59/v60 adopts; rc7 `536b8cb` through persist v57; rc6 `651140a`
+/// until the persist v55 adopt, rc5 `a4d29a6` until the v33.0.0 adopt.)
+pub const VENDORED_CC_COMMIT: &str = "ace6b74217b4496a67e47aef2258461517e4493c";
 
 /// `_meta.registry_sha256` — the hash of the GRAMMAR (families + `_meta`
 /// minus the prose hash), CSD/3's pin. A wording edit to Part 3 moves only
@@ -35,7 +36,7 @@ pub const VENDORED_CC_COMMIT: &str = "b4da5272413c6b056baa597e537d4aabdcee6902";
 pub const VENDORED_REGISTRY_SHA256: &str =
     "df79a1dde30a380380da83f0d776737e580705b6305741f037a5a78c2bef9898";
 
-/// The number of vectors the pinned file carries (rc14 at `b4da527`; rc8.1
+/// The number of vectors the pinned file carries (rc15 at `ace6b74` and rc14 at `b4da527`; rc8.1
 /// carried 1147, rc7 at `536b8cb` 1103, rc6 at `651140a` 968).
 pub const VENDORED_N_VECTORS: usize = 1244;
 
@@ -208,7 +209,7 @@ mod tests {
             vroot["_meta"]["registry_sha256"], VENDORED_REGISTRY_SHA256,
             "the vectors were generated from a different grammar than the vendored registry"
         );
-        assert_eq!(meta["cc_version"], "1.0-rc14");
+        assert_eq!(meta["cc_version"], "1.0-rc15");
         // The commit is a full 40-hex SHA — a re-vendor records exactly where the bytes came from.
         assert!(
             VENDORED_CC_COMMIT.len() == 40
