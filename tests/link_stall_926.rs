@@ -186,9 +186,25 @@ async fn pair(tag: &str) -> Pair {
         .await
         .expect("A receives B within 60s")
         .expect("A channel open");
+    let reverse = settled_reverse_link(&a, &b_key).await;
+    Pair {
+        b_key,
+        a,
+        metrics_a,
+        rx_b,
+        reverse,
+        _b: b,
+        _tasks: tasks,
+        _tmp: tmp,
+    }
+}
+
+/// The one link B opened to A and identified (A's reverse path to B), once
+/// A's Channel on it has nothing outstanding.
+async fn settled_reverse_link(a: &Arc<ReticulumTransport>, b_key: &str) -> [u8; 16] {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let reverse = loop {
-        let links = a.reverse_links_for_test(&b_key).await;
+        let links = a.reverse_links_for_test(b_key).await;
         if links.len() == 1 {
             break links;
         }
@@ -201,22 +217,13 @@ async fn pair(tag: &str) -> Pair {
     let reverse = reverse[0];
     assert!(
         wait_for(Duration::from_secs(30), || {
-            let a = Arc::clone(&a);
+            let a = Arc::clone(a);
             async move { a.link_channel_settled_for_test(reverse) }
         })
         .await,
         "A's Channel on B's link settles"
     );
-    Pair {
-        b_key,
-        a,
-        metrics_a,
-        rx_b,
-        reverse,
-        _b: b,
-        _tasks: tasks,
-        _tmp: tmp,
-    }
+    reverse
 }
 
 fn payload(len: usize, salt: u8) -> Vec<u8> {
