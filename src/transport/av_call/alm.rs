@@ -623,6 +623,7 @@ impl AlmState {
         let now = self.now_ms();
         let stream = f.stream;
         self.counts.c3_received += 1;
+        self.label(crate::observability::ALM_C3_RECEIVED);
         let mut out = Vec::new();
         match f.msg {
             ControlMsg::Subscribe(req) => {
