@@ -469,7 +469,7 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
         supporting: false,
     },
     TestEvidence {
-        cc: "5.3",
+        cc: "5.4.6",
         clm: "CLM-serve-seat-announced",
         property: "an unannounced owned node's identity rows reach only its owner's nodes (#682)",
         impl_anchor: "src/replication/bridge.rs#IdentityRowReach::withholds",
