@@ -2599,11 +2599,6 @@ pub struct ReticulumTransport {
     /// Mobile-background lifecycle (see [`crate::transport::lifecycle`]): the
     /// send gate, the listeners' park signal, and the counters suspend reads.
     lifecycle: Arc<crate::transport::lifecycle::Lifecycle>,
-    /// Mobile-background lifecycle — every TCP client edge configured, in
-    /// builder order, with the exact `InterfaceConfig` the builder got: suspend
-    /// removes each removable one (`remove_interface`), resume re-adds it from
-    /// that config (`spawn_interface`). See [`TcpClientSlot`].
-    tcp_clients: std::sync::Mutex<Vec<TcpClientSlot>>,
     /// `key_id → rooted peer`, populated by the authenticated
     /// cold-start path from received announces. Every entry has been
     /// rooted against the persist directory + had its attestation
@@ -3481,9 +3476,6 @@ impl ReticulumTransport {
         // what was wired so `transport_stats` + `interface_specs` can
         // surface the configured set.
         let mut interface_specs: Vec<RegisteredInterface> = Vec::new();
-        // Lifecycle — the TCP client configs the builder gets, in order, kept
-        // so suspend/resume can remove and re-add them.
-        let mut client_configs: Vec<leviculum_std::config::InterfaceConfig> = Vec::new();
         // CIRISEdge#168 (v5.0) — Transport-node mode. Called
         // explicitly so the config's `false` default is honoured;
         // leviculum's builder otherwise defaults the knob to `true`.
@@ -3590,13 +3582,8 @@ impl ReticulumTransport {
                 ),
             });
             for peer in &config.bootstrap_peers {
-                builder = apply_tcp_client_transit(
-                    builder,
-                    *peer,
-                    config.transit,
-                    config.ifac.as_ref(),
-                    &mut client_configs,
-                );
+                builder =
+                    apply_tcp_client_transit(builder, *peer, config.transit, config.ifac.as_ref());
                 interface_specs.push(RegisteredInterface {
                     handle: InterfaceHandle(interface_specs.len()),
                     kind: "TCPClientInterface".to_string(),
@@ -3620,7 +3607,6 @@ impl ReticulumTransport {
                     iface,
                     &mut share_instance_local,
                     &mut connect_instance_local,
-                    &mut client_configs,
                 )?;
                 builder = next_builder;
                 interface_specs.push(RegisteredInterface {
@@ -3801,6 +3787,13 @@ impl ReticulumTransport {
             );
         }
         node.set_announce_control(Some(Box::new(announce_policy.clone())));
+        // leviculum v0.33 retries this node's failed direct-link proposals in
+        // the background by default. While edge does not propose (no
+        // facilitator — the production default, Eric's hold), no retry may
+        // propose for it either.
+        if !config.direct_links.proposes() {
+            node.set_direct_link_retry(false);
+        }
 
         // Take the single event receiver before starting, then start
         // the event loop. `listen` claims the stashed receiver.
@@ -3810,7 +3803,6 @@ impl ReticulumTransport {
         node.start()
             .await
             .map_err(|e| TransportError::Io(format!("reticulum node start: {e}")))?;
-        let tcp_clients = TcpClientSlot::after_start(&node, client_configs);
 
         tracing::info!(
             addr = %config.listen_addr,
@@ -3922,7 +3914,6 @@ impl ReticulumTransport {
             test_binding_key_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             events: Mutex::new(Some(events)),
             lifecycle: Arc::new(crate::transport::lifecycle::Lifecycle::default()),
-            tcp_clients: std::sync::Mutex::new(tcp_clients),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
@@ -14867,6 +14858,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             reason,
             interface_in,
             hops,
+            ..
         } => {
             note_packet_dropped(
                 ctx.metrics,
@@ -14894,6 +14886,34 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             link_id,
             interface_index,
         } => direct_link_lost(ctx, link_id, interface_index).await,
+        // leviculum v0.33 — logged only; ALM stage 2 and relay selection will
+        // consume them.
+        NodeEvent::RelayRouteLearned {
+            destination_hash,
+            relay,
+            interface_index,
+            hops,
+        } => {
+            tracing::debug!(
+                dest = %hex::encode(destination_hash.as_bytes()),
+                relay = %hex::encode(relay),
+                interface_index,
+                hops,
+                "relay route learned (leviculum v0.33; not consumed yet)"
+            );
+        }
+        NodeEvent::ChannelMessageExpired {
+            link_id,
+            sequence,
+            expiry,
+        } => {
+            tracing::debug!(
+                link = %hex::encode(link_id.as_bytes()),
+                sequence,
+                ?expiry,
+                "channel message expired (leviculum v0.33; not consumed yet)"
+            );
+        }
         other => {
             tracing::trace!(event = ?other, "unhandled Reticulum event");
         }
@@ -17936,7 +17956,7 @@ const RESUME_CONNECT_WAIT: Duration = Duration::from_secs(5);
 const SUSPEND_FLUSH_GRACE: Duration = Duration::from_millis(100);
 
 /// Leviculum's own tasks while the node runs: its event loop and its
-/// traffic-counter thread. They outlive a suspend until leviculum#90.
+/// traffic-counter thread. Suspend stops both (`stop_shared`).
 const NODE_TASKS_WHILE_RUNNING: usize = 2;
 
 /// **Mobile-background lifecycle** — see [`crate::transport::lifecycle`] for
@@ -17994,7 +18014,7 @@ impl ReticulumTransport {
             async move { unparked == 0 }
         })
         .await;
-        self.quiesce_node();
+        self.quiesce_node().await;
         settle(until, || {
             let quiet = self.quiescent_now();
             async move { quiet }
@@ -18013,13 +18033,9 @@ impl ReticulumTransport {
         if !self.lifecycle.is_suspended() {
             return Ok(());
         }
-        self.wake_node()?;
-        let any_client = self
-            .tcp_clients
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .any(|s| s.removable);
+        self.wake_node().await?;
+        let any_client =
+            !self.config.bootstrap_peers.is_empty() || !self.config.interfaces.is_empty();
         if any_client {
             let until = tokio::time::Instant::now() + RESUME_CONNECT_WAIT;
             let connected = crate::transport::lifecycle::settle(until, || {
@@ -18056,54 +18072,52 @@ impl ReticulumTransport {
         Ok(())
     }
 
-    /// Take the node's interfaces down. Interim (leviculum#90 makes this
-    /// `node.stop()`): remove every removable TCP client and the connections
-    /// a TCP server accepted. The listening socket itself, and
-    /// any interface edge could not attach at runtime, stay — the report
-    /// says so.
-    fn quiesce_node(&self) {
-        for slot in self
-            .tcp_clients
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter_mut()
-            .filter(|s| s.removable)
-        {
-            // Removing the interface drops its channels; its reconnect loop
-            // ends at its next `is_closed` check and its socket closes
-            // (leviculum#95 — pinned by `tests/transport_suspend.rs`).
-            if let Some(id) = slot.id.take() {
-                let _ = self.node.remove_interface(id);
-            }
-        }
-        for iface in self.node.interface_stats() {
-            if iface.name.starts_with("tcp_server/") {
-                let _ = self.node.remove_interface(iface.interface_id);
-            }
+    /// Take the node down (leviculum#90, `stop_shared`): its event loop
+    /// exits, every interface socket and listener closes, its traffic-counter
+    /// thread ends, and calls that need a run fail as not running until
+    /// [`Self::wake_node`]. The node keeps its identity, destinations, announce
+    /// policy and event channel — the receiver the parked listener holds.
+    async fn quiesce_node(&self) {
+        if let Err(e) = self.node.stop_shared().await {
+            tracing::warn!(error = %e, "suspend: leviculum node stop failed");
         }
     }
 
-    /// Bring the node's interfaces back (leviculum#90: `node.start()`): re-add
-    /// each removed TCP client from the config the builder got.
-    fn wake_node(&self) -> Result<(), TransportError> {
-        let mut slots = self
-            .tcp_clients
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for slot in slots.iter_mut().filter(|s| s.removable && s.id.is_none()) {
-            let ids = self
-                .node
-                .spawn_interface(slot.config.clone())
-                .map_err(|e| TransportError::Io(format!("re-add TCP client: {e}")))?;
-            slot.id = ids.first().copied();
+    /// Bring the node back (`start_shared`): it rebuilds its configured
+    /// interfaces under their original indexes — so a TCP client's
+    /// tunnel-synthesize re-runs with the same tunnel id and the node it dials
+    /// restores its paths back here — and re-announces. Starting a running node
+    /// is a no-op here.
+    async fn wake_node(&self) -> Result<(), TransportError> {
+        if self.node.is_running() {
+            return Ok(());
         }
-        Ok(())
+        self.node
+            .start_shared()
+            .await
+            .map_err(|e| TransportError::Io(format!("resume: leviculum node start: {e}")))
+    }
+
+    /// `(interfaces, listener)` still open. A stopped node holds none —
+    /// `stop_shared` returns only once every interface socket and listener is
+    /// closed — whatever its (frozen) interface tables still list.
+    fn open_sockets(&self) -> (usize, bool) {
+        if self.node.is_running() {
+            (
+                self.node.interface_stats().len(),
+                !self.node.tcp_listen_addrs().is_empty(),
+            )
+        } else {
+            (0, false)
+        }
     }
 
     fn quiescent_now(&self) -> bool {
-        self.node.link_list().is_empty()
-            && self.node.interface_stats().is_empty()
-            && self.node.tcp_listen_addrs().is_empty()
+        let (interfaces, listener) = self.open_sockets();
+        !self.node.is_running()
+            && self.node.link_list().is_empty()
+            && interfaces == 0
+            && !listener
             && self.lifecycle.edge_tasks() == 0
             && self.lifecycle.sends_in_flight() == 0
             && self.lifecycle.listeners_unparked() == 0
@@ -18116,73 +18130,19 @@ impl ReticulumTransport {
         } else {
             0
         };
+        let (interfaces_open, listener_open) = self.open_sockets();
         SuspendReport {
             already_suspended: already,
             quiescent: self.lifecycle.is_suspended() && self.quiescent_now(),
             elapsed: started.elapsed(),
             links_open: self.node.link_list().len(),
-            interfaces_open: self.node.interface_stats().len(),
-            listener_open: !self.node.tcp_listen_addrs().is_empty(),
+            interfaces_open,
+            listener_open,
             tasks_running: edge_tasks + node_tasks,
             sends_in_flight: self.lifecycle.sends_in_flight(),
             edge_tasks,
             node_tasks,
         }
-    }
-}
-
-/// Mobile-background lifecycle — one TCP client edge configured: the exact
-/// config the builder got, and its interface id while attached.
-struct TcpClientSlot {
-    config: leviculum_std::config::InterfaceConfig,
-    /// `None` while suspended (removed), or when the boot mapping failed.
-    id: Option<leviculum_core::transport::InterfaceId>,
-    /// Re-adding through `spawn_interface` carries the target and IFAC but
-    /// not a no-transit posture (a runtime-added TCP client is always
-    /// transit), so a no-transit client is never removed: suspend reports it
-    /// open.
-    removable: bool,
-}
-
-impl TcpClientSlot {
-    /// Pair each configured client with the interface the node started for
-    /// it. Config-loaded clients are named `tcp_client_<index>` and are the
-    /// only `TCPClientInterface`s at start, in builder order. If the counts
-    /// disagree, nothing is removable (suspend then reports them open rather
-    /// than guess).
-    fn after_start(
-        node: &ReticulumNode,
-        configs: Vec<leviculum_std::config::InterfaceConfig>,
-    ) -> Vec<Self> {
-        let mut started: Vec<(usize, leviculum_core::transport::InterfaceId)> = node
-            .interface_stats()
-            .into_iter()
-            .filter_map(|i| {
-                i.name
-                    .strip_prefix("tcp_client_")
-                    .and_then(|n| n.parse::<usize>().ok())
-                    .map(|n| (n, i.interface_id))
-            })
-            .collect();
-        started.sort_by_key(|(n, _)| *n);
-        let mapped = started.len() == configs.len();
-        if !mapped {
-            tracing::warn!(
-                configured = configs.len(),
-                started = started.len(),
-                "lifecycle: TCP clients at start do not match the configured set; suspend \
-                 will leave them attached and report them open"
-            );
-        }
-        configs
-            .into_iter()
-            .enumerate()
-            .map(|(i, config)| Self {
-                removable: mapped && config.transit != Some(false),
-                id: if mapped { Some(started[i].1) } else { None },
-                config,
-            })
-            .collect()
     }
 }
 
@@ -18225,27 +18185,9 @@ fn apply_tcp_client_transit(
     addr: SocketAddr,
     transit: Option<bool>,
     ifac: Option<&IfacConfig>,
-    client_configs: &mut Vec<leviculum_std::config::InterfaceConfig>,
 ) -> ReticulumNodeBuilder {
-    // Lifecycle — the config is built here (field for field what
-    // `add_tcp_client` / `add_tcp_client_ifac` push) and handed to the builder
-    // through `add_interface_config`, so the boot path is unchanged and the
-    // same config can re-add the client after a suspend.
-    let config = tcp_client_interface_config(addr, transit, ifac);
-    client_configs.push(config.clone());
-    builder.add_interface_config(config)
-}
-
-/// The `InterfaceConfig` for one TCP client — exactly what leviculum's
-/// `add_tcp_client` (open), `add_tcp_client_ifac` (IFAC) or edge's own no-transit
-/// section (CIRISEdge#492) put on the builder.
-fn tcp_client_interface_config(
-    addr: SocketAddr,
-    transit: Option<bool>,
-    ifac: Option<&IfacConfig>,
-) -> leviculum_std::config::InterfaceConfig {
     match (ifac, transit == Some(false)) {
-        (ifac_opt, true) => leviculum_std::config::InterfaceConfig {
+        (ifac_opt, true) => builder.add_interface_config(leviculum_std::config::InterfaceConfig {
             interface_type: "TCPClientInterface".to_string(),
             name: "TCP Client".to_string(),
             target_host: Some(addr.ip().to_string()),
@@ -18255,23 +18197,14 @@ fn tcp_client_interface_config(
             passphrase: ifac_opt.as_ref().map(|i| i.passphrase.clone()),
             ifac_size: ifac_opt.as_ref().map(|i| i.ifac_size),
             ..Default::default()
-        },
-        (Some(ifac), false) => leviculum_std::config::InterfaceConfig {
-            name: "TCP Client".to_string(),
-            interface_type: "TCPClientInterface".to_string(),
-            target_host: Some(addr.ip().to_string()),
-            target_port: Some(addr.port()),
-            networkname: ifac.networkname.clone(),
-            passphrase: Some(ifac.passphrase.clone()),
-            ifac_size: Some(ifac.ifac_size),
-            ..Default::default()
-        },
-        (None, false) => leviculum_std::config::InterfaceConfig {
-            interface_type: "TCPClientInterface".to_string(),
-            target_host: Some(addr.ip().to_string()),
-            target_port: Some(addr.port()),
-            ..Default::default()
-        },
+        }),
+        (Some(ifac), false) => builder.add_tcp_client_ifac(
+            addr,
+            ifac.networkname.as_deref(),
+            &ifac.passphrase,
+            ifac.ifac_size,
+        ),
+        (None, false) => builder.add_tcp_client(addr),
     }
 }
 
@@ -18288,7 +18221,6 @@ fn apply_interface_config(
     iface: &ReticulumInterfaceConfig,
     share_instance: &mut Option<String>,
     connect_instance: &mut Option<String>,
-    client_configs: &mut Vec<leviculum_std::config::InterfaceConfig>,
 ) -> Result<(ReticulumNodeBuilder, &'static str, String), TransportError> {
     match iface {
         #[cfg(feature = "transport-reticulum-auto")]
@@ -18327,13 +18259,8 @@ fn apply_interface_config(
         ReticulumInterfaceConfig::TcpClient(cfg) => {
             let name = format!("tcp-client-{}", cfg.target_addr);
             // CIRISEdge#492 — scoped-transit posture via the shared mapper.
-            builder = apply_tcp_client_transit(
-                builder,
-                cfg.target_addr,
-                cfg.transit,
-                cfg.ifac.as_ref(),
-                client_configs,
-            );
+            builder =
+                apply_tcp_client_transit(builder, cfg.target_addr, cfg.transit, cfg.ifac.as_ref());
             Ok((builder, "TCPClientInterface", name))
         }
         #[cfg(feature = "transport-reticulum-udp")]

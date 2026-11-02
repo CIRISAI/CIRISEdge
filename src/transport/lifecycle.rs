@@ -21,13 +21,7 @@
 //! socket, link or listener and runs no edge task; resume brings the node back
 //! to replicating.
 //!
-//! # Design (interim, edge-only — until leviculum#90)
-//!
-//! Leviculum's `stop()`/`start()` take `&mut self` and edge holds its node as a
-//! shared `Arc`, so the node itself cannot be stopped from edge today.
-//! leviculum#90 makes them callable through `&self` (and stops the 1 Hz traffic
-//! counter thread with the event loop). Until it lands, suspend is built from
-//! what leviculum lets a shared handle do:
+//! # Design (leviculum v0.33 — leviculum#90)
 //!
 //! 1. **Refuse sends.** Every send through the [`Transport`](super::Transport)
 //!    surface, and every dial task, fails with
@@ -35,56 +29,29 @@
 //!    already in flight is cancelled with the same error (its future is
 //!    dropped — sends are cancel-safe, CIRISEdge#853). The replication
 //!    scheduler treats `Suspended` as "skip quietly, no backoff".
-//! 2. **Close every link** (pooled, inbound, direct) at the node.
+//! 2. **Close every link** (pooled, inbound, direct) at the node, while the
+//!    interfaces can still carry the LINKCLOSEs.
 //! 3. **Park the listener.** The listen loop drains the events the closes
 //!    raised, stops its announce timer, link reaper and attribution tick, ends
 //!    its announce cold-start worker, and parks on the resume signal — a parked
-//!    future with no timer, holding the node's event receiver so resume needs
-//!    no second `listen`.
-//! 4. **Remove the interfaces.** Every TCP client edge configured goes
-//!    through the builder exactly as on any node (the boot path does not
-//!    change); edge keeps the `InterfaceConfig` it handed the builder. Suspend
-//!    removes each client with `remove_interface`: its channels drop, its
-//!    reconnect loop ends at its next `incoming_tx.is_closed()` check and its
-//!    socket closes (leviculum#95 claimed otherwise; it was edge's misreading,
-//!    and `tests/transport_suspend.rs` pins the true behaviour). Resume re-adds
-//!    each from its saved config with `spawn_interface`, which carries the
-//!    target and IFAC but not a no-transit posture — so a no-transit client is
-//!    never removed, and a node with one reports it in `interfaces_open`,
-//!    never `quiescent`. Connections a TCP *server* accepted are removed; the
-//!    listening socket itself cannot be closed without stopping the node, so a
-//!    node with a server reports `listener_open: true` and is never reported
-//!    quiescent.
+//!    future with no timer, holding the node's event receiver.
+//! 4. **Stop the node** (`ReticulumNode::stop_shared`, through the shared
+//!    `Arc`): its event loop exits, every interface socket and listener —
+//!    TCP clients, a TCP server, accepted connections — closes, and its
+//!    traffic-counter thread ends. `quiescent` therefore covers leviculum's
+//!    own tasks too, and a node with a listener suspends fully.
 //!
-//! # The tunnel handshake and the path back after resume
+//! Resume is `start_shared`: the node keeps its identity, destinations,
+//! announce policy and event channel, rebuilds its configured interfaces under
+//! their original indexes and re-announces. A TCP client's
+//! tunnel-synthesize therefore re-runs with the same tunnel id, and the node
+//! it dials restores its paths back to us without waiting for an announce
+//! (leviculum-core `tunnel.rs`, Codeberg #64). Then the send gate reopens and
+//! the woken listener announces.
 //!
-//! Checked against leviculum c6d0a224, in source and by experiment. The fork
-//! keeps a tunnel table (`leviculum-core/src/tunnel.rs`, `Transport::tunnels`,
-//! Codeberg #64; edge's older note in `routing_tunnels` that it keeps none is
-//! stale). A config-loaded TCP client registers tunnel-capable at start
-//! (`register_interface_config`) and sends a signed tunnel-synthesize on every
-//! connect; the node it dials keeps the paths learned over that connection for
-//! eight hours and restores them when the same tunnel reappears. The tunnel id
-//! is derived from `tcp_client_<index>`.
-//!
-//! A client re-added through `spawn_interface` is *not* registered
-//! tunnel-capable (only start-up and a `bootstrap_only` re-attach call
-//! `register_interface_config`), so it sends no synthesize — and its fresh
-//! index would give a new tunnel id anyway. Observed: after resume, no
-//! `TUNNEL_SYNTHESIZE_SENT`, no `TUNNEL_REAPPEARED` at the canonical, and the
-//! resumed node's `tunnel_ids()` empty. The canonical still had a path back
-//! at the first look after `resume` returned (it waits, bounded, for a client
-//! to connect): leviculum announces the local destinations on a newly
-//! registered interface (`handle_interface_up`) and the woken listener
-//! announces too, so the route is relearned by announce, not restored by
-//! tunnel. Same-tunnel restore across a suspend needs the client back under its
-//! original index — leviculum#90's `stop_shared`/`start_shared` (v0.33) does
-//! that.
-//!
-//! What stays until leviculum#90: the node's own event loop (idle, no
-//! interfaces) and its traffic-counter thread. [`SuspendReport::node_tasks`]
-//! counts them, honestly. The swap to `node.stop()`/`node.start()` is one
-//! internal function on the transport (`quiesce_node` / `wake_node`).
+//! Not rebuilt by `start_shared`: an interface attached at runtime
+//! (`spawn_interface`, `spawn_rnode_channel_interface` — a host-attached
+//! radio); the host re-attaches it after resume.
 //!
 //! Edge's own background loops (the durable outbound dispatcher, its sweeps,
 //! the blackhole pruner) are stopped by [`Edge::suspend`](crate::Edge::suspend)
@@ -110,9 +77,9 @@ use super::TransportError;
 pub struct SuspendReport {
     /// The node was already suspended; nothing was done but the measurement.
     pub already_suspended: bool,
-    /// No socket (link, interface, listener), no edge task and no send in
-    /// flight. `false` means the deadline was hit or something cannot be
-    /// closed in-process (a TCP server listener, a non-TCP interface).
+    /// The node is stopped (no leviculum task), and no socket (link,
+    /// interface, listener), edge task or send in flight remains. `false`
+    /// means the deadline was hit (or the node failed to stop).
     pub quiescent: bool,
     /// Wall time the call took.
     pub elapsed: Duration,
@@ -131,8 +98,7 @@ pub struct SuspendReport {
     /// it is a future waiting on the resume signal, with no timer.
     pub edge_tasks: usize,
     /// Leviculum's own tasks still alive: its event loop and its traffic
-    /// counter thread (2 while the node runs). Idle with no interface; they
-    /// go away with leviculum#90.
+    /// counter thread — 2 while the node runs, 0 once suspend stopped it.
     pub node_tasks: usize,
 }
 
