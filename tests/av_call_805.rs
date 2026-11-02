@@ -473,6 +473,20 @@ async fn wait_legs(call: &Call, n: usize) {
     );
 }
 
+/// Wait until `call` has verified `n` other publishers' stream key bindings:
+/// the setup step after the legs (a hybrid verification each, once), before
+/// which a receiver holds its first chunks in the link's queue.
+async fn wait_bound(call: &Call, n: u64) {
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            call.chunk_auth_counts().bindings_installed >= n
+        })
+        .await,
+        "the call verifies its peers' bindings: {:?}",
+        call.chunk_auth_counts()
+    );
+}
+
 /// **A8** — a three-member room call over keyed loopback links.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -501,6 +515,9 @@ async fn a_three_member_room_call_over_keyed_links() {
     .expect("C joins as a relay");
     for call in [&call_a, &call_b, &call_c] {
         wait_legs(call, 2).await;
+    }
+    for call in [&call_a, &call_b, &call_c] {
+        wait_bound(call, 2).await;
     }
     for nd in [a, b, c] {
         // CC 5.3.3.5 E1 — every link is keyed by the link layer (identity
@@ -651,6 +668,9 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
         .await
         .expect("C");
     wait_legs(&call_a, 2).await;
+    for call in [&call_a, &call_b, &call_c] {
+        wait_bound(call, 2).await;
+    }
     let mut events_a = call_a.events().expect("A's events");
     let mut frames_b = call_b.frames().expect("B");
     let mut frames_c = call_c.frames().expect("C");
@@ -769,6 +789,9 @@ async fn a_member_cannot_forge_another_members_stream_through_a_relay() {
     .expect("C joins as a relay");
     for call in [&call_a, &call_b, &call_c] {
         wait_legs(call, 2).await;
+    }
+    for call in [&call_a, &call_b, &call_c] {
+        wait_bound(call, 2).await;
     }
     let mut frames_a = call_a.frames().expect("A's frames");
     let mut frames_b = call_b.frames().expect("B's frames");

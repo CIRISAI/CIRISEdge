@@ -83,7 +83,7 @@ use crate::mls::CohortGroup;
 use crate::scope_lifecycle::{ScopeGroupSnapshot, ScopeLifecycle};
 use crate::transport::av_call_key::{stream_epoch_dek, CallId};
 use crate::transport::av_chunk_auth::{
-    collides_with_binding_part, BindingAssembler, BindingOutcome, ChunkAuth, ChunkAuthError,
+    collides_with_binding_part, AvAuthRefusal, BindingAssembler, BindingOutcome, ChunkAuth,
     ChunkSigner, Part, StreamKeyBinding, StreamKeyVerifier, BINDING_REANNOUNCE, CHUNK_SIG_LEN,
 };
 use crate::transport::av_keep::{
@@ -1918,6 +1918,9 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         publisher
             .dispatcher_mut()
             .set_layer_policy(&member.to_owned(), policy);
+        // The binding parts just filled the link's Channel window: the leg
+        // settles, so the first chunks retry rather than drop.
+        publisher.dispatcher_mut().settle(&member.to_owned());
     }
     Shared::lock(&shared.out_legs).insert(
         member.to_owned(),
@@ -1993,6 +1996,7 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
     Shared::lock(&shared.in_links).remove(&link_id);
 }
 
+#[allow(clippy::too_many_lines)] // one linear per-frame sequence: part, open, source check, relay, deliver
 async fn pump(
     shared: &Arc<Shared>,
     peer: &str,
@@ -2017,7 +2021,10 @@ async fn pump(
             Part::NotAPart => {}
             Part::Incomplete => continue,
             Part::Malformed => {
+                let refusal = AvAuthRefusal::BindingPartMalformed;
                 shared.count(crate::observability::AV_CALL_BINDING_REFUSED);
+                shared.count(refusal.as_str());
+                tracing::debug!(peer = %peer, reason = %refusal, "call: a binding part was refused");
                 continue;
             }
             Part::Complete(wire) => {
@@ -2050,18 +2057,21 @@ async fn pump(
         // stream's publisher can have made it.
         let (publisher, inner) = match shared.auth.check(&signed) {
             Ok(checked) => checked,
-            Err(ChunkAuthError::Unbound) => {
-                shared.count(crate::observability::AV_CALL_FRAME_UNBOUND);
-                continue;
-            }
-            Err(ChunkAuthError::Forged) => {
-                shared.count(crate::observability::AV_CALL_FRAME_FORGED);
+            Err(e) => {
+                let refusal = e.refusal();
+                shared.count(if e.is_forged() {
+                    crate::observability::AV_CALL_FRAME_FORGED
+                } else {
+                    crate::observability::AV_CALL_FRAME_UNBOUND
+                });
+                shared.count(refusal.as_str());
                 tracing::debug!(
                     peer = %peer,
+                    reason = %refusal,
                     stream = %crate::transport::realtime_av::stream_label(stream),
                     epoch = signed.epoch().0,
                     chunk_seq = signed.chunk_seq().0,
-                    "call: a chunk not signed by its stream's publisher — dropped, not relayed"
+                    "call: a chunk not proven its stream's publisher's — dropped, not relayed"
                 );
                 continue;
             }
@@ -2130,8 +2140,15 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
         }
         BindingOutcome::Known(b) => b,
         BindingOutcome::Refused(e) => {
+            let refusal = e.refusal();
             shared.count(crate::observability::AV_CALL_BINDING_REFUSED);
-            tracing::warn!(peer = %peer, error = %e, "call: a stream key binding was refused");
+            shared.count(refusal.as_str());
+            tracing::warn!(
+                peer = %peer,
+                reason = %refusal,
+                error = %e,
+                "call: a stream key binding was refused"
+            );
             return;
         }
     };

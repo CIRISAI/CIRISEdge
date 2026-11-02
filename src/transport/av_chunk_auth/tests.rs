@@ -186,13 +186,22 @@ async fn a_member_holding_the_dek_cannot_forge_the_publishers_chunks() {
     let mut junk = forged.inner_ciphertext().to_vec();
     junk.extend_from_slice(&[0u8; CHUNK_SIG_LEN]);
     let junk = with_ciphertext(&forged, junk);
-    assert_eq!(auth.check(&junk).unwrap_err(), ChunkAuthError::Forged);
+    assert_eq!(
+        auth.check(&junk).unwrap_err(),
+        ChunkAuthError::TrailerInvalid
+    );
     let key_b = ChunkSigner::generate(stream, Epoch(3)).unwrap();
     let by_b = key_b.sign(&forged).unwrap();
-    assert_eq!(auth.check(&by_b).unwrap_err(), ChunkAuthError::Forged);
+    assert_eq!(
+        auth.check(&by_b).unwrap_err(),
+        ChunkAuthError::TrailerInvalid
+    );
     // Too short to carry a signature at all.
     let bare = with_ciphertext(&forged, vec![0u8; 10]);
-    assert_eq!(auth.check(&bare).unwrap_err(), ChunkAuthError::Forged);
+    assert_eq!(
+        auth.check(&bare).unwrap_err(),
+        ChunkAuthError::TrailerMissing
+    );
     assert_eq!(auth.counts().forged, 3, "every forgery is counted");
     assert_eq!(auth.counts().verified, 0);
 
@@ -245,7 +254,10 @@ async fn a_member_holding_the_dek_cannot_forge_the_publishers_chunks() {
     ));
     // Still only A's key for epoch 3, and B's chunk is still refused.
     assert_eq!(auth.bound(stream, Epoch(4)).map(|b| b.key), None);
-    assert_eq!(auth.check(&by_b).unwrap_err(), ChunkAuthError::Forged);
+    assert_eq!(
+        auth.check(&by_b).unwrap_err(),
+        ChunkAuthError::TrailerInvalid
+    );
 }
 
 /// **A chunk replayed under another stream id, epoch or sequence number is
@@ -276,7 +288,7 @@ async fn a_chunk_replayed_under_another_stream_or_epoch_is_refused() {
         assert_eq!(
             auth.check(&relabel(&chunk, stream, epoch, seq))
                 .unwrap_err(),
-            ChunkAuthError::Forged,
+            ChunkAuthError::TrailerInvalid,
             "replayed under {what}"
         );
     }
@@ -324,7 +336,7 @@ async fn an_epoch_roll_rebinds_and_the_old_key_is_refused() {
     let by_old = old_at_new.sign(&seal(stream, 4, 0, b"old key")).unwrap();
     assert_eq!(
         auth.check(&by_old).unwrap_err(),
-        ChunkAuthError::Forged,
+        ChunkAuthError::TrailerInvalid,
         "the old key signs no chunk of the new epoch"
     );
     assert!(auth
@@ -414,4 +426,148 @@ async fn bindings_ride_as_parts_and_reassemble() {
     assert!(collides_with_binding_part(StreamId(
         *b"CSKB\x01xxxxxxxxxxxxxxxxxxxxxxxxxxx"
     )));
+}
+
+// ─── KAT vectors (for CIRISVerify) ──────────────────────────────────
+
+/// Expected values of [`kat_vectors_are_deterministic`]; regenerate by
+/// running it with `--nocapture` after an intended format change.
+mod kat {
+    pub const STREAM_ID: &str = "c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d8";
+    pub const CHUNK_KEY_PUB: &str =
+        "0b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d";
+    pub const BINDING_SIGNED_BYTES: &str =
+        "63697269732d656467653a61762d73747265616d2d6b65793a7631010008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d";
+    pub const BINDING_SIG_ED25519: &str =
+        "cfee152e5695500e16a6138276132a1e4f3684951dfbfb838e3eade0240eee6b0cc7d1976935d8e4ea2bf11f3ea802cf8dfcb5cf93671856b5e1c66290130008";
+    pub const BINDING_SIG_ML_DSA_65_SHA256: &str =
+        "f4c5aec87ce37cd46f8ab10370e9c321cac1daba2ff6d89594b9e3dc0baf21d3";
+    pub const BINDING_WIRE_SHA256: &str =
+        "558daab6b4434ced81ddd497f38ade2c2f8d109be3e22a663174bb2d156fc4f8";
+    pub const BINDING_ID: &str = "558daab6b4434ced";
+    pub const INNER_AEAD: &str = "b3b432abd9ea536a45a933956e21b34dc01e4571e5196d0aa08396";
+    pub const CHUNK_SIG_MESSAGE: &str =
+        "63697269732d656467653a61762d6368756e6b2d7369673a7631c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050000000000000000ff000000b3b432abd9ea536a45a933956e21b34dc01e4571e5196d0aa08396";
+    pub const TRAILER: &str =
+        "3e88ffce0fa074ab1b2b88fb04095d427fcb46d8f1f49dac851f92761e861a1661865b999ccd22fc4608da5a20e51ec900f13f8ef1b5ba7ce9d8dc1b3261f807";
+    pub const FORGED_TRAILER: &str =
+        "14627f17213c016c8efaaa43ef4fe52d30f0ff97d3ac6943359132d68e4a46a63950bc46b98d2f9c4044b204997bfa6f41db9ae624d3ebde874d0845c0f00c0c";
+}
+
+/// **KAT vectors from fixed seeds**, printed as hex and asserted, so
+/// CIRISVerify can copy them: a binding (signing bytes and both signature
+/// halves), a chunk (its inner AEAD, the bytes its trailer signs, the
+/// trailer) with its verdict, and a forged chunk refused by token.
+///
+/// Inputs: publisher `node-kat-a` with Ed25519 seed `01`×32 and ML-DSA-65
+/// seed `54`×32; room `room-kat`; join nonce `07`×32; epoch 5; chunk key seed
+/// `0c`×32; DEK `42`×32; chunk_seq 0, codec `ff`, layer (0,0,0), plaintext
+/// `kat-chunk-0`; forger chunk key seed `0f`×32.
+#[tokio::test]
+async fn kat_vectors_are_deterministic() {
+    const PUBLISHER: &str = "node-kat-a";
+    const KAT_ROOM: &str = "room-kat";
+    let publisher = signer(PUBLISHER, 1);
+    let keys = Keys::of(&[&publisher]).await;
+    let nonce = [0x07; 32];
+    let epoch = Epoch(5);
+    let stream = call_stream_id(KAT_ROOM, PUBLISHER, &nonce);
+    let key = ChunkSigner::from_seed(stream, epoch, [0x0c; 32]);
+
+    let binding = StreamKeyBinding::sign(&publisher, KAT_ROOM, nonce, stream, epoch, key.public())
+        .await
+        .unwrap();
+    let again = StreamKeyBinding::sign(&publisher, KAT_ROOM, nonce, stream, epoch, key.public())
+        .await
+        .unwrap();
+    assert_eq!(binding, again, "both signature halves are deterministic");
+    let wire = binding.to_bytes();
+    let auth = ChunkAuth::new(KAT_ROOM);
+    assert!(matches!(
+        auth.accept_binding(&wire, &[PUBLISHER.to_owned()], &keys)
+            .await,
+        BindingOutcome::Installed(_)
+    ));
+
+    let inner = seal_av_inner(
+        b"kat-chunk-0",
+        &dek(),
+        stream,
+        epoch,
+        ChunkSeq(0),
+        CODEC_OPAQUE,
+        ChunkLayer::BASE,
+    )
+    .unwrap();
+    let signed = key.sign(&inner).unwrap();
+    let trailer = &signed.inner_ciphertext()[inner.inner_ciphertext().len()..];
+    let (who, opened) = auth.check(&signed).expect("verdict: verified");
+    assert_eq!(&*who, PUBLISHER);
+    assert_eq!(open_av_inner(&opened, &dek()).unwrap(), b"kat-chunk-0");
+
+    let forger_key = ChunkSigner::from_seed(stream, epoch, [0x0f; 32]);
+    let forged = forger_key.sign(&inner).unwrap();
+    let forged_trailer = &forged.inner_ciphertext()[inner.inner_ciphertext().len()..];
+    let refused = auth.check(&forged).unwrap_err();
+    assert_eq!(refused.refusal().as_str(), "av_chunk_trailer_invalid");
+    let short = with_ciphertext(&inner, inner.inner_ciphertext()[..20].to_vec());
+    assert_eq!(
+        auth.check(&short).unwrap_err().refusal().as_str(),
+        "av_chunk_trailer_missing"
+    );
+
+    let got = [
+        ("STREAM_ID", hex::encode(stream.0)),
+        ("CHUNK_KEY_PUB", hex::encode(key.public())),
+        ("BINDING_SIGNED_BYTES", hex::encode(binding.signed_bytes())),
+        ("BINDING_SIG_ED25519", hex::encode(&binding.sig_ed25519)),
+        (
+            "BINDING_SIG_ML_DSA_65_SHA256",
+            hex::encode(Sha256::digest(&binding.sig_ml_dsa_65)),
+        ),
+        ("BINDING_WIRE_SHA256", hex::encode(Sha256::digest(&wire))),
+        ("BINDING_ID", hex::encode(StreamKeyBinding::id_of(&wire))),
+        ("INNER_AEAD", hex::encode(inner.inner_ciphertext())),
+        (
+            "CHUNK_SIG_MESSAGE",
+            hex::encode(chunk_sig_message(&inner, inner.inner_ciphertext())),
+        ),
+        ("TRAILER", hex::encode(trailer)),
+        ("FORGED_TRAILER", hex::encode(forged_trailer)),
+    ];
+    for (name, value) in &got {
+        println!("KAT {name} = {value}");
+    }
+    println!("KAT VERDICT chunk = verified (publisher {PUBLISHER})");
+    println!("KAT VERDICT forged = {}", refused.refusal());
+    let want = [
+        kat::STREAM_ID,
+        kat::CHUNK_KEY_PUB,
+        kat::BINDING_SIGNED_BYTES,
+        kat::BINDING_SIG_ED25519,
+        kat::BINDING_SIG_ML_DSA_65_SHA256,
+        kat::BINDING_WIRE_SHA256,
+        kat::BINDING_ID,
+        kat::INNER_AEAD,
+        kat::CHUNK_SIG_MESSAGE,
+        kat::TRAILER,
+        kat::FORGED_TRAILER,
+    ];
+    for ((name, value), want) in got.iter().zip(want) {
+        assert_eq!(value, want, "KAT {name}");
+    }
+}
+
+/// Every refusal token is distinct, snake_case and `av_`-prefixed.
+#[test]
+fn refusal_tokens_are_stable_and_distinct() {
+    let tokens: Vec<&str> = AvAuthRefusal::ALL.iter().map(|r| r.as_str()).collect();
+    let mut sorted = tokens.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), tokens.len());
+    for t in tokens {
+        assert!(t.starts_with("av_"));
+        assert!(t.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+    }
 }

@@ -9,7 +9,7 @@
 //! AEAD alone cannot tell the stream's publisher from any other member. This
 //! is the known shared-key caveat of SFrame-style group media. This module
 //! closes it. Members can still decrypt, but only a stream's publisher can
-//! produce chunks a receiver or a relay accepts as that stream's.
+//! produce chunks a receiver or a member relay accepts as that stream's.
 //!
 //! # Construction
 //!
@@ -40,9 +40,9 @@
 //! the stream hello, again on every leg at each epoch roll (before the first
 //! chunk of the new epoch, under the same lock that seals chunks), and again
 //! every [`BINDING_REANNOUNCE`] so a binding lost to an inbound queue overflow
-//! is replaced. A relay forwards every binding it verifies to its own legs, and
-//! sends the bindings it holds on every leg it dials, so a member who hears a
-//! stream only through a relay can still verify it.
+//! is replaced. A member relay (`CallOptions::relay`, a room member) forwards the
+//! bindings it verifies, and sends the ones it holds on legs it dials. Bindings ride
+//! only member-to-member A/V legs, never a non-member transport forwarder's (E1-opaque).
 //!
 //! A binding is about 3.6 KB (the ML-DSA-65 signature is 3309 bytes), more than
 //! one Channel message, so it rides as [`BINDING_PART_MAGIC`] parts sized to
@@ -60,8 +60,8 @@
 //! ```
 //!
 //! The signature sits inside the outer (hop) seal and outside the inner (E2E)
-//! seal. So a relay, which opens only the outer seal, can check it without the
-//! DEK. The chunk header is unchanged, and the dispatcher and the relay forward
+//! seal. So a member relay, which opens only the outer seal, can check it without
+//! the DEK. The chunk header is unchanged; the dispatcher and the relay forward
 //! the inner unit byte for byte as before.
 //!
 //! **Checking a chunk** ([`ChunkAuth::check`]) is a map lookup of the bound key
@@ -90,13 +90,11 @@
 //! identity to the ephemeral key is the binding, and that is hybrid-signed
 //! (Ed25519 + ML-DSA-65), so it holds against a quantum adversary too.
 //!
-//! # Compatibility
+//! # The chunk format
 //!
-//! Enforced at once, as with the CC 5.3.3.5 E1 per-link seal. A peer without
-//! this change sends unsigned chunks and no bindings. Its chunks are dropped
-//! here as unbound, and its receivers fail to open this node's chunks (the
-//! appended signature breaks their inner AEAD). Both sides of a call must run
-//! this version.
+//! The binding and the trailer are part of the A/V chunk format, not an
+//! option: a chunk without a verified binding or trailer is refused. The
+//! layout is written out, with KAT vectors, in `docs/av_chunk_auth_wire.md`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -183,6 +181,75 @@ fn with_ciphertext(inner: &InnerSealed, ciphertext: Vec<u8>) -> InnerSealed {
         inner.layer(),
         ciphertext,
     )
+}
+
+// ─── refusal tokens ─────────────────────────────────────────────────
+
+/// **The stable refusal tokens** of chunk source authentication: the one
+/// spelling a relay and a receiver use in logs (`reason = …`) and as
+/// `av_plane` counter labels. Each names one refusal; never renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AvAuthRefusal {
+    /// A binding part with a bad header, an inconsistent part count, a
+    /// reassembly over the bound, or a reassembly that does not hash to its id.
+    BindingPartMalformed,
+    /// A reassembled binding that does not parse.
+    BindingMalformed,
+    /// A binding for another room than the call's.
+    BindingOtherRoom,
+    /// A binding whose publisher is not in the room's MLS group.
+    BindingPublisherNotMember,
+    /// A binding whose stream id is not derived from its publisher and nonce.
+    BindingStreamNotDerived,
+    /// A binding whose hybrid signature did not verify.
+    BindingSignatureUnverified,
+    /// A binding for an epoch older than the two the receiver holds.
+    BindingStaleEpoch,
+    /// A chunk too short to carry its 64-byte trailer.
+    ChunkTrailerMissing,
+    /// A chunk whose trailer does not verify under the bound key.
+    ChunkTrailerInvalid,
+    /// A chunk for a `(stream, epoch)` with no verified binding.
+    ChunkUnbound,
+}
+
+impl AvAuthRefusal {
+    /// Every token, in declaration order.
+    pub const ALL: [Self; 10] = [
+        Self::BindingPartMalformed,
+        Self::BindingMalformed,
+        Self::BindingOtherRoom,
+        Self::BindingPublisherNotMember,
+        Self::BindingStreamNotDerived,
+        Self::BindingSignatureUnverified,
+        Self::BindingStaleEpoch,
+        Self::ChunkTrailerMissing,
+        Self::ChunkTrailerInvalid,
+        Self::ChunkUnbound,
+    ];
+
+    /// The token's stable spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BindingPartMalformed => "av_binding_part_malformed",
+            Self::BindingMalformed => "av_binding_malformed",
+            Self::BindingOtherRoom => "av_binding_other_room",
+            Self::BindingPublisherNotMember => "av_binding_publisher_not_member",
+            Self::BindingStreamNotDerived => "av_binding_stream_not_derived",
+            Self::BindingSignatureUnverified => "av_binding_signature_unverified",
+            Self::BindingStaleEpoch => "av_binding_stale_epoch",
+            Self::ChunkTrailerMissing => "av_chunk_trailer_missing",
+            Self::ChunkTrailerInvalid => "av_chunk_trailer_invalid",
+            Self::ChunkUnbound => "av_chunk_unbound",
+        }
+    }
+}
+
+impl std::fmt::Display for AvAuthRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 // ─── the publisher's key ────────────────────────────────────────────
@@ -334,6 +401,21 @@ pub enum BindingError {
     /// Older than the epochs this receiver holds for the stream.
     #[error("binding for epoch {0} is older than the stream's held epochs")]
     Stale(u64),
+}
+
+impl BindingError {
+    /// The refusal's stable token.
+    #[must_use]
+    pub const fn refusal(&self) -> AvAuthRefusal {
+        match self {
+            Self::Malformed(_) => AvAuthRefusal::BindingMalformed,
+            Self::OtherRoom(_) => AvAuthRefusal::BindingOtherRoom,
+            Self::NotAMember(_) => AvAuthRefusal::BindingPublisherNotMember,
+            Self::NotThePublishersStream(_) => AvAuthRefusal::BindingStreamNotDerived,
+            Self::Signature(_) => AvAuthRefusal::BindingSignatureUnverified,
+            Self::Stale(_) => AvAuthRefusal::BindingStaleEpoch,
+        }
+    }
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -754,9 +836,30 @@ pub enum ChunkAuthError {
     /// No verified binding for the chunk's `(stream, epoch)`.
     #[error("no bound chunk key for the chunk's stream and epoch")]
     Unbound,
-    /// The signature is missing or does not verify under the bound key.
+    /// The inner unit is too short to carry the 64-byte trailer.
+    #[error("chunk carries no source signature")]
+    TrailerMissing,
+    /// The trailer does not verify under the stream's bound key.
     #[error("chunk signature does not verify under the stream's bound key")]
-    Forged,
+    TrailerInvalid,
+}
+
+impl ChunkAuthError {
+    /// The refusal's stable token.
+    #[must_use]
+    pub const fn refusal(self) -> AvAuthRefusal {
+        match self {
+            Self::Unbound => AvAuthRefusal::ChunkUnbound,
+            Self::TrailerMissing => AvAuthRefusal::ChunkTrailerMissing,
+            Self::TrailerInvalid => AvAuthRefusal::ChunkTrailerInvalid,
+        }
+    }
+
+    /// Missing or invalid trailer: not the publisher's chunk.
+    #[must_use]
+    pub const fn is_forged(self) -> bool {
+        matches!(self, Self::TrailerMissing | Self::TrailerInvalid)
+    }
 }
 
 /// What [`ChunkAuth`] counted.
@@ -764,7 +867,7 @@ pub enum ChunkAuthError {
 pub struct ChunkAuthCounts {
     /// Chunks whose signature verified.
     pub verified: u64,
-    /// Chunks dropped: bad or missing signature.
+    /// Chunks dropped: missing or invalid trailer.
     pub forged: u64,
     /// Chunks dropped: no bound key.
     pub unbound: u64,
@@ -972,7 +1075,8 @@ impl ChunkAuth {
     /// else.
     ///
     /// # Errors
-    /// [`ChunkAuthError::Unbound`] / [`ChunkAuthError::Forged`], each counted.
+    /// [`ChunkAuthError::Unbound`], [`ChunkAuthError::TrailerMissing`] or
+    /// [`ChunkAuthError::TrailerInvalid`], each counted.
     pub fn check(&self, inner: &InnerSealed) -> Result<(Arc<str>, InnerSealed), ChunkAuthError> {
         let Some(bound) = self.bound(inner.stream_id(), inner.epoch()) else {
             self.unbound.fetch_add(1, Ordering::Relaxed);
@@ -981,7 +1085,7 @@ impl ChunkAuth {
         let ct = inner.inner_ciphertext();
         let Some(split) = ct.len().checked_sub(CHUNK_SIG_LEN) else {
             self.forged.fetch_add(1, Ordering::Relaxed);
-            return Err(ChunkAuthError::Forged);
+            return Err(ChunkAuthError::TrailerMissing);
         };
         let (aead, sig) = ct.split_at(split);
         let ok = Ed25519Verifier::new()
@@ -989,7 +1093,7 @@ impl ChunkAuth {
             .unwrap_or(false);
         if !ok {
             self.forged.fetch_add(1, Ordering::Relaxed);
-            return Err(ChunkAuthError::Forged);
+            return Err(ChunkAuthError::TrailerInvalid);
         }
         self.verified.fetch_add(1, Ordering::Relaxed);
         Ok((bound.publisher, with_ciphertext(inner, aead.to_vec())))
