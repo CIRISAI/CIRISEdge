@@ -2554,6 +2554,10 @@ impl Edge {
     /// recipient-determination rules of CIRISEdge#48-A.
     ///
     /// Refusal returns a typed [`EdgeError::CohortScopeRefusedRecipient`].
+    // The transport-outcome match grew past the 100-line cap with the
+    // lifecycle `Suspended` arm (nothing recorded against the peer); the
+    // match is one decision and reads best whole.
+    #[allow(clippy::too_many_lines)]
     pub async fn send_with_cohort_scope<M: Message>(
         &self,
         destination_key_id: &str,

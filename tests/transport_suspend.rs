@@ -292,7 +292,7 @@ async fn pair(tag: &str) -> Pair {
     let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(64);
     let (tx_b, mut rx_b) = mpsc::channel::<InboundFrame>(64);
     let metrics_b = EdgeMetrics::new();
-    let rt_b = Arc::new(
+    let replication_b = Arc::new(
         ReplicationRuntime::start(
             Arc::clone(&b_dir) as Arc<dyn FederationDirectory>,
             Arc::clone(&b) as Arc<dyn Transport>,
@@ -314,7 +314,7 @@ async fn pair(tag: &str) -> Pair {
         )
         .await,
     );
-    let router = InboundRouter::new(rt_b.registry());
+    let router = InboundRouter::new(replication_b.registry());
     let a_rx: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let a_seen = Arc::clone(&a_rx);
     let (la, lb) = (Arc::clone(&a), Arc::clone(&b));
@@ -362,7 +362,7 @@ async fn pair(tag: &str) -> Pair {
         b_dir,
         _a_dir: a_dir,
         a_rx,
-        rt_b,
+        rt_b: replication_b,
         metrics_b,
         _tmp: tmp,
         _tasks: tasks,

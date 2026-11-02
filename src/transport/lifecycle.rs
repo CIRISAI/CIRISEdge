@@ -62,12 +62,17 @@
 //! and respawned by resume, through [`PausableTasks`].
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(feature = "_reticulum-module")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "_reticulum-module")]
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "_reticulum-module")]
 use tokio::sync::watch;
 
+#[cfg(feature = "_reticulum-module")]
 use super::TransportError;
 
 /// What [`suspend`](crate::Edge::suspend) left behind, measured when it
@@ -121,6 +126,7 @@ impl SuspendReport {
     }
 }
 
+#[cfg(feature = "_reticulum-module")]
 /// One transport's suspend state: the send gate, the park signal its
 /// listeners wait on, and the counters suspend reads to decide quiescence.
 pub(crate) struct Lifecycle {
@@ -139,6 +145,7 @@ pub(crate) struct Lifecycle {
     listeners_parked: AtomicUsize,
 }
 
+#[cfg(feature = "_reticulum-module")]
 impl Default for Lifecycle {
     fn default() -> Self {
         Self {
@@ -154,24 +161,29 @@ impl Default for Lifecycle {
     }
 }
 
+#[cfg(feature = "_reticulum-module")]
 /// Decrements its counter on drop — every exit, cancellation included.
 pub(crate) struct CountGuard<'a>(&'a AtomicUsize);
 
+#[cfg(feature = "_reticulum-module")]
 impl Drop for CountGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
+#[cfg(feature = "_reticulum-module")]
 /// [`CountGuard`] for a task that owns an `Arc<Lifecycle>` (a spawned dial).
 pub(crate) struct OwnedTaskGuard(Arc<Lifecycle>);
 
+#[cfg(feature = "_reticulum-module")]
 impl Drop for OwnedTaskGuard {
     fn drop(&mut self) {
         self.0.edge_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
+#[cfg(feature = "_reticulum-module")]
 impl Lifecycle {
     pub(crate) fn is_suspended(&self) -> bool {
         self.suspended.load(Ordering::Acquire)
@@ -400,7 +412,10 @@ impl PausableTasks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
 
+    #[cfg(feature = "_reticulum-module")]
     #[tokio::test]
     async fn a_guarded_send_is_refused_and_an_in_flight_one_cancelled() {
         let lc = Arc::new(Lifecycle::default());

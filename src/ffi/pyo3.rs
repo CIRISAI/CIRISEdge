@@ -348,26 +348,26 @@ pub struct PyEdge {
     ///
     /// `None` for `for_test` builds and HTTPS-only transport
     /// posture — there's nothing to listen on.
-    _transport_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    transport_runtime: Option<Arc<tokio::runtime::Runtime>>,
     _transport_listener_handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// CIRISEdge#243 — the `watch::Sender` for the outbound dispatcher's
     /// shutdown signal. Held (never dropped early) so `run_dispatcher`'s
     /// idle-poll `select!` on `shutdown.changed()` never sees a closed
     /// channel — a dropped sender makes `changed()` return `Err`
     /// immediately and hot-spins the claim loop. Declared AFTER
-    /// `_transport_runtime` so field drop-order tears the runtime down
+    /// `transport_runtime` so field drop-order tears the runtime down
     /// first (aborting the dispatcher task) before this sender drops —
     /// no busy-loop window at teardown. `close()` also sends `true` on
     /// it, so the dispatcher and sweeps end cleanly before the runtime goes.
     /// `None` when there's no transport runtime (`for_test` / HTTPS-only).
-    _transport_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    transport_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl PyEdge {
     /// Signal the outbound dispatcher and sweeps to stop (`close()`), so
     /// they end cleanly instead of being torn down mid-claim with the runtime.
     fn stop_transport_dispatch(&self) {
-        if let Some(tx) = self._transport_shutdown_tx.as_ref() {
+        if let Some(tx) = self.transport_shutdown_tx.as_ref() {
             tx.send_replace(true);
         }
     }
@@ -376,7 +376,7 @@ impl PyEdge {
     /// time driver is the one edge's timers need — CIRISEdge#217/#220), or on
     /// a throwaway current-thread runtime when this edge has none.
     fn block_on_transport<F: std::future::Future>(&self, fut: F) -> PyResult<F::Output> {
-        if let Some(rt) = self._transport_runtime.as_ref() {
+        if let Some(rt) = self.transport_runtime.as_ref() {
             return Ok(rt.block_on(fut));
         }
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -514,9 +514,9 @@ impl PyEdge {
             // v7.1.0 (CIRISEdge#220) — `for_test` builds don't run
             // background listeners; tests drive `dispatch_inbound_for_test`
             // directly when they need the inbound path.
-            _transport_runtime: None,
+            transport_runtime: None,
             _transport_listener_handles: std::sync::Mutex::new(Vec::new()),
-            _transport_shutdown_tx: None,
+            transport_shutdown_tx: None,
         }
     }
 }
@@ -8311,7 +8311,7 @@ pub fn init_edge_runtime(
     // Python runtime instead of enqueuing forever. Pre-#243 only the listeners
     // ran here (ephemeral `send_opaque_request` transmits inline, so it was
     // unaffected). The `watch::Sender` is stashed on `PyEdge`
-    // (`_transport_shutdown_tx`) for the runtime's lifetime — see that field's
+    // (`transport_shutdown_tx`) for the runtime's lifetime — see that field's
     // busy-loop note.
     let (transport_handles, transport_shutdown_tx): (
         Vec<tokio::task::JoinHandle<()>>,
@@ -8333,9 +8333,9 @@ pub fn init_edge_runtime(
         _dev_cert_tmpdir: https_dev_cert_tmpdir,
         #[cfg(feature = "transport-reticulum-local")]
         shared_instance_cleanup: std::sync::Mutex::new(shared_instance_cleanup),
-        _transport_runtime: transport_runtime,
+        transport_runtime,
         _transport_listener_handles: std::sync::Mutex::new(transport_handles),
-        _transport_shutdown_tx: transport_shutdown_tx,
+        transport_shutdown_tx,
     })
 }
 

@@ -9454,7 +9454,6 @@ impl ReticulumTransport {
         };
         // End this run's announce worker: its queues close with `ctx` and the
         // senders; the abort ends a cold-start resolution still in progress.
-        drop(ctx);
         drop(announce_tx);
         drop(announce_priority_tx);
         announce_worker.abort();
