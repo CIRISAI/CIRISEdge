@@ -450,4 +450,113 @@ mod tests {
         assert!(collides_with_control_frame(StreamId(id)));
         assert!(!collides_with_control_frame(s()));
     }
+
+    /// **CALM KAT vectors** (for the CC, `docs/alm_calm_wire.md` §7): one
+    /// frame of each kind from fixed inputs, asserted byte-for-byte, and each
+    /// decoding back with the LINK peer (`node-kat-b`) in every peer field.
+    ///
+    /// Inputs: stream `00 01 02 … 1f`; CAPS = C3 v1 | timed | relay (7);
+    /// SUBSCRIBE standby, forward-capable; ADMIT primary; REFUSE
+    /// `relay_class_refused:video` (code 5), retry 1500 ms; SHED
+    /// `load_shed:audio` (code 3); OFFER depth 1, forwarding, headroom
+    /// 2 000 000, forwarder headroom 3 000 000, upstream latency 42 ms,
+    /// ancestry `["node-kat-a"]`.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn calm_kat_vectors() {
+        let mut id = [0u8; 32];
+        for (i, b) in id.iter_mut().enumerate() {
+            *b = u8::try_from(i).expect("small");
+        }
+        let st = StreamId(id);
+        let peer = "node-kat-b";
+        let msgs: Vec<(&str, Vec<u8>, Option<ControlMsg<String>>)> = vec![
+            (
+                "CAPS",
+                encode_caps(CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_RELAY),
+                None,
+            ),
+            (
+                "SUBSCRIBE",
+                Vec::new(),
+                Some(ControlMsg::Subscribe(SubscribeRequest {
+                    subscriber: peer.into(),
+                    role: Role::Standby,
+                    forward_capable: true,
+                })),
+            ),
+            (
+                "UNSUBSCRIBE",
+                Vec::new(),
+                Some(ControlMsg::Unsubscribe {
+                    subscriber: peer.into(),
+                }),
+            ),
+            (
+                "ADMIT",
+                Vec::new(),
+                Some(ControlMsg::Decision(AdmitDecision::Admit {
+                    role: Role::Primary,
+                })),
+            ),
+            (
+                "REFUSE",
+                Vec::new(),
+                Some(ControlMsg::Decision(AdmitDecision::Refuse {
+                    reason: RefuseReason::ClassRefused,
+                    retry_after_ms: 1500,
+                })),
+            ),
+            (
+                "SHED",
+                Vec::new(),
+                Some(ControlMsg::Shed {
+                    reason: ShedReason::LoadShed,
+                }),
+            ),
+            (
+                "OFFER",
+                Vec::new(),
+                Some(ControlMsg::Offer(Offer {
+                    from: peer.into(),
+                    depth: 1,
+                    ancestry: vec!["node-kat-a".into()],
+                    headroom_bps: 2_000_000,
+                    forwarder_headroom_bps: 3_000_000,
+                    upstream_latency_ms: 42,
+                    forwarding: true,
+                })),
+            ),
+        ];
+        let want = [
+            ("CAPS", "43414c4d010100000007"),
+            ("SUBSCRIBE", "43414c4d0102000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0101"),
+            ("UNSUBSCRIBE", "43414c4d0103000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"),
+            ("ADMIT", "43414c4d0104000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00"),
+            ("REFUSE", "43414c4d0105000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f05000005dc"),
+            ("SHED", "43414c4d0106000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f03"),
+            ("OFFER", "43414c4d0107000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f010100000000001e848000000000002dc6c00000002a01000a6e6f64652d6b61742d61"),
+        ];
+        for ((name, caps_bytes, msg), (wname, whex)) in msgs.into_iter().zip(want) {
+            assert_eq!(name, wname);
+            let bytes = match &msg {
+                Some(m) => encode(st, m),
+                None => caps_bytes,
+            };
+            println!(
+                "KAT CALM {name} ({} B) = {}",
+                bytes.len(),
+                hex::encode(&bytes)
+            );
+            assert_eq!(hex::encode(&bytes), whex, "KAT CALM {name}");
+            match (decode(&bytes, peer).expect("decodes"), msg) {
+                (WireFrame::Caps(c), None) => assert_eq!(c, 7),
+                (WireFrame::Control(f), Some(m)) => {
+                    assert_eq!(f.stream, st);
+                    assert_eq!(f.msg, m);
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
 }

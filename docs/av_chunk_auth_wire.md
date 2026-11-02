@@ -399,6 +399,9 @@ inputs; the hash pins it.
 
 ## 6. The ALM control frame (C3, stage 2) — FLAG FOR THE CC
 
+**The full specification (layout, rules, validation order, KAT) is
+`docs/alm_calm_wire.md`; this section summarises it.**
+
 A call's A/V links also carry the ALM controller's control frames
 (`realtime_av_alm/controller/wire.rs`). Like a binding part, a C3 frame takes
 no A/V outer seal and no hop counter; the E1 link seal covers it.
