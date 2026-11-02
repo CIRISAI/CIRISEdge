@@ -2388,6 +2388,15 @@ mod mesh_scenarios {
             .into_iter()
             .map(|(k, _)| k)
             .collect();
+        // FSD S1 (5) as ruled (§6.4 V2, Eric): the canonical carries no video,
+        // and audio only for members with no admitting contact, within 5 %.
+        let cap = (0.05 * 100.0 * sim.cfg.stream_bps as f64) as u64;
+        if sim.canonical_peak_bps > cap {
+            return Err(sim.report(
+                Some(w.canonical),
+                &format!("canonical audio {} > 5 % ({cap})", sim.canonical_peak_bps),
+            ));
+        }
         if canon_kids.iter().any(|k| !off.contains(k)) {
             return Err(sim.report(
                 Some(w.canonical),
