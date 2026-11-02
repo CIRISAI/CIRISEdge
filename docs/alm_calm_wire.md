@@ -34,7 +34,7 @@ frame = magic "CALM" (4) ‖ version 0x01 (1) ‖ kind (1) ‖ body
 |---|---|---|
 | `CONTROL_MAGIC` | `43 41 4c 4d` ("CALM") | `wire.rs:46` |
 | `CONTROL_VERSION` | `0x01` | `wire.rs:48` |
-| header length | 6 bytes | `wire.rs:50` (`HEADER_LEN`) |
+| header length | 6 bytes | `wire.rs:49` (`HEADER_LEN`) |
 
 A frame is a CALM frame iff it is at least 6 bytes long and starts
 `"CALM" 0x01` (`is_control_frame`, `wire.rs:82`).
