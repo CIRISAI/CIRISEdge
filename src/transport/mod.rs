@@ -238,6 +238,11 @@ pub mod link_shaping;
 #[cfg(feature = "_reticulum-module")]
 pub mod av_call;
 
+/// CIRISEdge#805 — source authentication for a call's chunks: a per-epoch
+/// Ed25519 chunk key per stream, bound by the publisher's hybrid signature.
+#[cfg(feature = "_reticulum-module")]
+pub mod av_chunk_auth;
+
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
 /// edges (CIRISEdge#169). CEG-native (the Scope-B queue: byte-exact
 /// signed CEG envelopes); pairs with Reticulum Transport-node mode

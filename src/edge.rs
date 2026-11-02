@@ -4445,6 +4445,9 @@ impl Edge {
             actor,
             node: Arc::clone(&self.signer),
         }) as Arc<dyn crate::transport::av_call::CallRecord>;
+        let verifier = Arc::new(crate::transport::av_chunk_auth::DirectoryKeys(Arc::clone(
+            &directory,
+        ))) as Arc<dyn crate::transport::av_chunk_auth::StreamKeyVerifier>;
         Call::join(
             room,
             &own,
@@ -4457,6 +4460,10 @@ impl Edge {
                 events: Some(Arc::clone(&self.events)),
                 metrics: Some(self.metrics()),
                 record: Some(record),
+                // The node signs its stream's chunk-key bindings: the stream's
+                // publisher is the node (`own`), whoever attends.
+                signer: Arc::clone(&self.signer),
+                verifier,
             },
             opts,
         )

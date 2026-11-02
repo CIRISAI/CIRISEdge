@@ -921,6 +921,19 @@ pub const AV_CALL_FRAME_UNOPENED: &str = "av_call_frame_unopened";
 pub const AV_CALL_FRAME_NO_KEY: &str = "av_call_frame_no_key";
 /// CIRISEdge#805 item 5 — a call frame this node relayed to a member.
 pub const AV_CALL_RELAYED: &str = "av_call_relayed";
+/// CIRISEdge#805 — a call chunk whose source signature did not verify under
+/// its stream's bound chunk key (or carried none): not the publisher's,
+/// dropped and never relayed.
+pub const AV_CALL_FRAME_FORGED: &str = "av_call_frame_forged";
+/// CIRISEdge#805 — a call chunk for a `(stream, epoch)` with no verified
+/// chunk-key binding: dropped and never relayed.
+pub const AV_CALL_FRAME_UNBOUND: &str = "av_call_frame_unbound";
+/// CIRISEdge#805 — a stream's chunk-key binding verified (the publisher's
+/// hybrid signature) and installed.
+pub const AV_CALL_BINDING_INSTALLED: &str = "av_call_binding_installed";
+/// CIRISEdge#805 — a chunk-key binding refused (malformed, another room, not
+/// the publisher's stream, not a member, or a bad hybrid signature).
+pub const AV_CALL_BINDING_REFUSED: &str = "av_call_binding_refused";
 /// CIRISEdge#805 item 6 — this attendee's call row was refused; the call
 /// stays live.
 pub const AV_CALL_RECORD_REFUSED: &str = "av_call_record_refused";
