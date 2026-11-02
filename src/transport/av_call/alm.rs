@@ -200,7 +200,8 @@ impl AlmState {
         relay_capable: bool,
         seed: u64,
     ) -> Self {
-        let cfg = ControllerConfig::interactive();
+        let mut cfg = ControllerConfig::interactive();
+        cfg.idle_aware_silence = true;
         let mut own = Admission::publisher(me.to_owned(), cfg.clone(), None);
         own.set_members(members.iter().cloned());
         let fanout = (members.len().saturating_sub(1) as u64).clamp(1, PUBLISHER_INITIAL_FANOUT);
@@ -338,6 +339,27 @@ impl AlmState {
             });
         }
         out
+    }
+
+    /// Every link that carried `peer`'s frames to this node is gone: it is
+    /// down as a parent (C6), now, not after its silence.
+    pub(super) fn on_parent_link_down(&mut self, peer: &str) {
+        let now = self.now_ms();
+        let p = peer.to_owned();
+        for s in self.sels.values_mut() {
+            s.on_link_down(now, &p, &mut self.log);
+        }
+    }
+
+    /// This node's leg to `peer` is gone: it can no longer send it anything,
+    /// so `peer` holds no commitment here.
+    pub(super) fn on_child_link_down(&mut self, peer: &str) {
+        let p = peer.to_owned();
+        self.own.release(&p);
+        for a in self.relays.values_mut() {
+            a.release(&p);
+        }
+        self.provisional.remove(peer);
     }
 
     /// The service tier now.
@@ -726,12 +748,13 @@ impl AlmState {
             let (full, audio) = self.own_rate.costs();
             self.own.set_role_costs(full, audio);
         }
-        for (s, r) in &mut self.rates {
-            if r.roll(now) {
-                if let Some(a) = self.relays.get_mut(s) {
-                    let (full, audio) = r.costs();
-                    a.set_role_costs(full, audio);
-                }
+        // Every relayed stream is priced at its measured rate (the floor
+        // until media flows), on the same footing as this node's own.
+        for (s, a) in &mut self.relays {
+            let r = self.rates.entry(*s).or_default();
+            if r.roll(now) || r.windows == 0 {
+                let (full, audio) = r.costs();
+                a.set_role_costs(full, audio);
             }
         }
 
@@ -790,6 +813,8 @@ impl AlmState {
             // offers relay.
             if self.relay_capable && primary.is_some() && !self.relays.contains_key(&s) {
                 let mut a = Admission::relay(self.me.clone(), self.cfg.clone(), None);
+                let (full, audio) = self.rates.get(&s).cloned().unwrap_or_default().costs();
+                a.set_role_costs(full, audio);
                 a.set_members(self.members.iter().cloned());
                 a.set_admit_closed(!self.tier.admits_new_relay_work());
                 self.relays.insert(s, a);

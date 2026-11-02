@@ -1581,6 +1581,7 @@ impl Call {
                 let outcome = leg_outcome(leg);
                 if outcome == LegOutcome::Gone {
                     Shared::lock(&self.shared.out_legs).remove(&peer);
+                    Shared::lock(&self.shared.alm).on_child_link_down(&peer);
                 }
                 (peer, outcome)
             })
@@ -2141,6 +2142,7 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     tokio::spawn(out_leg_reader(
         Arc::clone(shared),
         member.to_owned(),
+        link_id,
         leg_inbound,
     ));
     tracing::info!(
@@ -2224,6 +2226,10 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
     }
     pump(&shared, &peer, own_stream, link_id, &open_key, inbound).await;
     Shared::lock(&shared.in_links).remove(&link_id);
+    // C6: the member's frames reached this node only on this link.
+    if !Shared::lock(&shared.in_links).values().any(|p| *p == peer) {
+        Shared::lock(&shared.alm).on_parent_link_down(&peer);
+    }
     let mut senders = Shared::lock(&shared.in_senders);
     if senders.get(&peer).is_some_and(|s| Arc::ptr_eq(s, &sender)) {
         senders.remove(&peer);
@@ -2379,6 +2385,7 @@ fn leg_rtt_ms(shared: &Arc<Shared>, peer: &str) -> f64 {
 async fn out_leg_reader(
     shared: Arc<Shared>,
     peer: String,
+    link_id: [u8; 16],
     inbound: crate::transport::realtime_av_runtime::PumpReceiver,
 ) {
     while let Ok(f) = inbound.recv_frame().await {
@@ -2388,6 +2395,15 @@ async fn out_leg_reader(
         if is_control_frame(&f.bytes) {
             handle_c3(&shared, &peer, &f.bytes, true).await;
         }
+    }
+    // The leg's link closed: unless a fresh leg replaced it, the member holds
+    // no commitment here any more.
+    let replaced = Shared::lock(&shared.out_legs)
+        .get(&peer)
+        .is_some_and(|l| l.link_id != link_id);
+    if !replaced {
+        Shared::lock(&shared.out_legs).remove(&peer);
+        Shared::lock(&shared.alm).on_child_link_down(&peer);
     }
 }
 

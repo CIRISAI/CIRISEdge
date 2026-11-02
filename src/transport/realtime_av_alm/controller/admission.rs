@@ -296,7 +296,11 @@ impl<P: PeerRef> Admission<P> {
     /// Price commitments at measured rates: a primary costs `stream_bps`, a
     /// standby `standby_bps`. Re-prices the ledger (production measures the
     /// stream it forwards; the sim keeps the nominal config).
+    #[allow(clippy::cast_precision_loss)]
     pub fn set_role_costs(&mut self, stream_bps: u64, standby_bps: u64) {
+        // The probe allowance is counted in streams: it keeps its count.
+        let old = self.cfg.stream_bps.max(1) as f64;
+        self.probe_bps *= stream_bps.max(1) as f64 / old;
         self.cfg.stream_bps = stream_bps.max(1);
         self.cfg.standby_bps = standby_bps.max(1).min(self.cfg.stream_bps);
         for c in self.ledger.values_mut() {
@@ -438,7 +442,10 @@ impl<P: PeerRef> Admission<P> {
             (None, false) if self.advertised_bps.is_some() => f64::INFINITY,
             (None, false) => self.floor_bps,
         };
-        (hard.min(probe) - self.cfg.reserve_bps as f64 - self.external_committed as f64).max(0.0)
+        // The node's other streams share the MEASURED uplink, so they come
+        // off the hard limit; the probe gate is this admission's own growth.
+        let hard = hard - self.external_committed as f64;
+        (hard.min(probe) - self.cfg.reserve_bps as f64).max(0.0)
     }
 
     /// Bits/s committed.

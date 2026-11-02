@@ -166,6 +166,7 @@ pub struct ParentSelector<P: PeerRef> {
     parent_changes: u64,
     tiers: BTreeMap<P, Tier>,
     next_r3_probe_ms: u64,
+    last_activity_ms: Option<u64>,
 }
 
 impl<P: PeerRef> ParentSelector<P> {
@@ -191,6 +192,7 @@ impl<P: PeerRef> ParentSelector<P> {
             parent_changes: 0,
             tiers: BTreeMap::new(),
             next_r3_probe_ms: 0,
+            last_activity_ms: None,
         }
     }
 
@@ -402,6 +404,8 @@ impl<P: PeerRef> ParentSelector<P> {
         bytes: u64,
         latency_ms: f64,
     ) {
+        // The stream is active (on some path), whoever delivered it.
+        self.last_activity_ms = Some(now_ms);
         let Some(c) = self.cands.get_mut(from) else {
             return;
         };
@@ -874,6 +878,7 @@ impl<P: PeerRef> ParentSelector<P> {
         // 1. Meters + health (C1 → C6).
         let mut rolled_standby = false;
         let standby = self.standby.clone();
+        let (idle_aware, activity) = (self.cfg.idle_aware_silence, self.last_activity_ms);
         for (p, c) in &mut self.cands {
             let rolled = c.meter.roll(now_ms);
             if rolled && standby.as_ref() == Some(p) {
@@ -886,6 +891,11 @@ impl<P: PeerRef> ParentSelector<P> {
                     .unwrap_or(c.subscribed_at)
                     .max(c.subscribed_at);
                 let depth = c.offer.as_ref().map_or(0, |o| u64::from(o.depth.min(4)));
+                if idle_aware && !activity.is_some_and(|a| a > last) {
+                    // Nothing newer arrived on any path: the stream is idle,
+                    // not this parent dead.
+                    return 0;
+                }
                 now_ms.saturating_sub(last) * 2 / (2 + depth)
             });
             let snap = c.meter.snapshot();

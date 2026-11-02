@@ -229,6 +229,11 @@ pub struct ControllerConfig {
     pub latency_budget_ms: u64,
     /// Deepest a subscriber may sit (publisher = 0).
     pub max_depth: u8,
+    /// A subscribed parent's silence counts only while the stream is active
+    /// on another path (a live call's stream is idle until its host
+    /// publishes; an idle stream is not a dead parent). The link closing is
+    /// then the hard down signal. Off in the sim, whose streams never idle.
+    pub idle_aware_silence: bool,
     /// Score weights.
     pub weights: ScoreWeights,
 }
@@ -266,6 +271,7 @@ impl ControllerConfig {
             degraded_loss: 0.05,
             latency_budget_ms: 400,
             max_depth: 3,
+            idle_aware_silence: false,
             weights: ScoreWeights {
                 delivery: 0.45,
                 capacity: 0.15,
