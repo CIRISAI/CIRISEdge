@@ -6872,6 +6872,14 @@ impl ReticulumTransport {
         (out.sent, out.total)
     }
 
+    /// CIRISEdge#926 test seam — the plaintext size one Channel fragment
+    /// carries on `link` (what the fragmenter cuts a frame to).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn channel_fragment_bytes_for_test(&self, link: [u8; 16]) -> usize {
+        send_mdu(&self.node, &self.shapers, &LinkId::new(link))
+    }
+
     /// CIRISEdge#926 test seam — zero-landing sends in `link`'s current stall
     /// run, and whether the guard judged it dead.
     #[doc(hidden)]

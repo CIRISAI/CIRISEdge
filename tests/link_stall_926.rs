@@ -336,11 +336,21 @@ async fn a_slow_link_that_lands_some_fragments_is_not_closed_926() {
     let slow = p.reverse;
     p.a.stop_acks_on_link_for_test(slow, Some(1));
 
-    // ~1.2 KB: several fragments at the link MDU, so each send lands 1 of N.
-    let frame = payload(1_200, 3);
+    // Three fragments at the link's Channel MDU (within the Channel-first
+    // cap), so each send lands 1 of 3 and then waits out the pacing bound.
+    let mdu = p.a.channel_fragment_bytes_for_test(slow);
+    assert!(mdu > 0, "the link has a Channel MDU");
+    let frame = payload(mdu * 5 / 2, 3);
+    let t = std::time::Instant::now();
     p.a.send(&p.b_key, &frame)
         .await
         .expect("the send delivers (over a dial once the busy-retry window ends)");
+    assert!(
+        t.elapsed() >= Duration::from_secs(7),
+        "the send rode the slow link's Channel through the whole busy-retry window \
+         (took {:?})",
+        t.elapsed()
+    );
     expect_frame(
         &mut p.rx_b,
         &frame,
