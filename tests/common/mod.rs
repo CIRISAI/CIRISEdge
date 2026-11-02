@@ -177,12 +177,17 @@ pub async fn prime_v7_peer_pair(
 /// CC 5.4.3 rc16 — `CIRIS_EDGE_TEST_SHAPING=server` runs every transport a
 /// suite builds under the server class's fleet default (shaping ON on every
 /// identity link), so a suite witnesses its traffic with shaping on: rows on
-/// the shaped link, bulk on the unshaped bulk plane. Unset, nothing changes.
+/// the shaped link, bulk on the unshaped bulk plane. Unset, nothing changes;
+/// a transport whose suite set its own policy is never overridden.
 #[cfg(feature = "transport-reticulum")]
 #[allow(dead_code)]
 pub fn apply_env_shaping(cfg: &mut ciris_edge::transport::reticulum::ReticulumTransportConfig) {
     use ciris_edge::transport::link_shaping::{DeviceKind, DeviceState, ShapingPolicy};
-    if std::env::var("CIRIS_EDGE_TEST_SHAPING").as_deref() == Ok("server") {
+    // Only where the suite left shaping at its default: a test that names
+    // its own policy (tests/link_shaping_e1.rs) keeps it.
+    if std::env::var("CIRIS_EDGE_TEST_SHAPING").as_deref() == Ok("server")
+        && cfg.shaping == ShapingPolicy::default()
+    {
         let device = DeviceState::of(DeviceKind::Server);
         cfg.shaping = ShapingPolicy::for_device(&device);
         cfg.device = device;
