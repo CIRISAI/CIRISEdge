@@ -593,13 +593,6 @@ pub enum WithholdReason {
     /// Distinct from [`Self::IdentityRowNodeNotAnnounced`] so an operator is
     /// sent to the directory, not to the announce wizard.
     IdentityRowAnnounceUnresolved,
-    /// Eric 2026-10-30 (CONSENT-GATED ROUTES) — a relayed
-    /// `TransportDestination` row about an owned node, asked for by a peer
-    /// its owner has not consented to: no live `consent:replication` grant
-    /// authored by the node's owner names the peer or the peer's owner. A
-    /// contact request crosses through the canonical; only after consent does
-    /// the requester get the route that lets it dial direct.
-    RouteNotConsented,
     /// CIRISEdge#758 (CC 5.4.6) — a `Family` / `Community` RECORD asked for (on
     /// the advertise or the direct-fetch twin) by a peer whose person
     /// (`owner_of(peer)`, the peer itself when unowned) is neither a live
@@ -608,6 +601,9 @@ pub enum WithholdReason {
     /// hides a group's existence and membership from outsiders; a founder's
     /// node offering the record to every peer disclosed both. Not a fault —
     /// the peer is outside the group. `detail` names the plane and the site.
+    /// persist v61 (CIRISPersist#991): the record and its membership events are
+    /// `group:roster:v1` / `membership:*:v1` rows on the Attestation plane;
+    /// this is their withhold there.
     GroupRecordNotMemberOrInvitee,
 }
 
@@ -667,7 +663,6 @@ impl WithholdReason {
             Self::LxmfRetentionExpired => "lxmf_retention_expired",
             Self::IdentityRowNodeNotAnnounced => "identity_row_node_not_announced",
             Self::IdentityRowAnnounceUnresolved => "identity_row_announce_unresolved",
-            Self::RouteNotConsented => "route_not_consented",
             Self::GroupRecordNotMemberOrInvitee => "group_record_not_member_or_invitee",
         }
     }

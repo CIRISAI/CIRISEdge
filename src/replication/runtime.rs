@@ -187,7 +187,6 @@ fn build_bridge(
         )
         .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
         .with_consent_subjects(config.consent_subject_key_ids.clone())
-        .with_consent_gated_routes(config.consent_gated_routes)
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
         // legs live (leg A ∧ leg B against this node's own trust base), the
         // owner-conferred rung fail-closed pending CIRISPersist#788. Installed
@@ -834,12 +833,6 @@ pub struct ReplicationRuntimeConfig {
     /// Empty (the default) falls back to `local_key_id`: correct wherever the
     /// agent and the node are one key.
     pub consent_subject_key_ids: Vec<String>,
-    /// CONSENT-GATED ROUTES (Eric 2026-10-30): serve a relayed route about an
-    /// owned node only to a peer its owner consented to. `false` by default.
-    ///
-    /// TODO(CIRISPersist#1165): default it on once a relay can hold contact
-    /// grants (see `FederationDirectoryReplicationBridge::with_consent_gated_routes`).
-    pub consent_gated_routes: bool,
     /// CIRISEdge#640 — everything a node needs to OPEN sealed content it did
     /// not seal, wired as ONE value (see [`SealedContentWiring`]): the engine
     /// that projects key-grant wraps into grants for this node's occurrences,
@@ -912,6 +905,37 @@ pub const BOOTSTRAP_ROUND_PLANES: [EnvelopeKind; 5] = [
     EnvelopeKind::Revocation,
     EnvelopeKind::IdentityOccurrenceRevocation,
 ];
+
+/// persist v60.0.0 / v61 (CIRISPersist#991) — drop every `(peer, kind)` on a
+/// [retired plane](EnvelopeKind::is_retired_plane). A host that still names one
+/// (the framed `Community` / `Family` / membership planes, the member listing,
+/// the framed `KeyGrant`, the operational trio) would otherwise get a
+/// coordinator per pair that lists nothing and refuses everything it is
+/// offered — a round of transport spent on a plane persist retired. Their rows
+/// ride the Attestation plane. Each dropped pair is logged once
+/// ([`note_retired_plane_skipped`]).
+fn without_retired_planes(peers: Vec<ReplicationPeer>) -> Vec<ReplicationPeer> {
+    peers
+        .into_iter()
+        .filter(|p| {
+            let retired = p.kind.is_retired_plane();
+            if retired {
+                note_retired_plane_skipped(&p.peer_key_id, p.kind);
+            }
+            !retired
+        })
+        .collect()
+}
+
+/// The one log line a skipped retired-plane peer gets.
+fn note_retired_plane_skipped(peer_key_id: &str, kind: EnvelopeKind) {
+    tracing::info!(
+        peer = peer_key_id,
+        kind = kind.as_wire_str(),
+        "replication peer on a RETIRED plane not scheduled: persist retired its framed \
+         carriage and its rows ride the Attestation plane (history: CIRISPersist#991)"
+    );
+}
 
 /// CIRISEdge#881 — the initiator peers the bundle's seated serve nodes
 /// (`serve_nodes`, the baked canonical ids) add: each on every
@@ -1076,7 +1100,7 @@ impl ReplicationRuntime {
                 config.local_key_id.as_deref(),
             )
         };
-        let peers = merge_peers(peers, &bundle_peers);
+        let peers = without_retired_planes(merge_peers(peers, &bundle_peers));
         if !bundle_peers.is_empty() {
             tracing::info!(
                 serve_nodes = bundle_peers.len() / BOOTSTRAP_ROUND_PLANES.len(),
@@ -1328,6 +1352,11 @@ impl ReplicationRuntime {
         kind: EnvelopeKind,
     ) -> Result<(), ReplicationRuntimeError> {
         let peer_key_id = peer_key_id.into();
+        // persist v61 — a retired plane carries nothing; it is never scheduled.
+        if kind.is_retired_plane() {
+            note_retired_plane_skipped(&peer_key_id, kind);
+            return Ok(());
+        }
         let key = (peer_key_id.clone(), kind);
 
         {

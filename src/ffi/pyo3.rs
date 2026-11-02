@@ -2639,11 +2639,13 @@ impl PyEdge {
     /// directory + transport.
     ///
     /// `peers` is a list of `(peer_key_id, kind_str)` tuples where
-    /// `kind_str` is one of the 10 wire-stable kinds per FSD §3.3:
-    /// "key" / "attestation" / "revocation" / "identity_occurrence"
-    /// / "family" / "community" / "identity_occurrence_revocation"
-    /// / "family_membership_revocation" /
-    /// "community_membership_revocation" / "location_proof".
+    /// `kind_str` is a wire-stable kind (`EnvelopeKind::as_wire_str`).
+    /// persist v61 — a RETIRED plane ("family", "community", the four
+    /// membership planes, "community_membership_listing", "key_grant", the
+    /// three operational kinds) still parses but is never scheduled (logged
+    /// once): its rows ride "attestation". Name "key" / "identity_occurrence" /
+    /// "transport_destination" / "attestation" (and "revocation" /
+    /// "identity_occurrence_revocation" / "location_proof" as needed).
     ///
     /// `cadence_seconds` overrides the scheduler's default 30 s
     /// per-round cadence; `None` keeps the default. The round

@@ -85,22 +85,6 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
              stage → the group's membership-plane audience; public, the cohort's \
              per-node audience: self → the owner's personal-class nodes)",
         ),
-        // CIRISEdge#758 / #762 / #761 (CC 5.4.6 "from outsiders only", CC
-        // 4.4.3.2.1; persist v53 S1 `ServeAudience::MembershipPlane`) — a
-        // group's RECORD and its five membership planes are served per row,
-        // per peer, by persist's `may_receive_group_plane`: a public group's
-        // (`is_public_group`: an authority-gated `infrastructure` community,
-        // the accord family, a conferring family, the deployment's WA family)
-        // to every peer; a private group's to its members' nodes, its live
-        // invitees' nodes (full plane history) and the nodes of the member a
-        // row names (for a revocation, the removed member). On the advertise
-        // and the fetch twin alike; an unbound requester is served only public
-        // groups' rows. Withheld rows are booked
-        // `group_record_not_member_or_invitee`.
-        EnvelopeKind::Family | EnvelopeKind::Community => (
-            "cohort",
-            "membership_plane: persist may_receive_group_plane(peer, scope, group, None)",
-        ),
         EnvelopeKind::LocationProof => ("cohort", "public"),
         // The key revocation plane keeps the hardcoded widest own∪cohort set
         // (`Projection::Global`, the #311 rule) and serves public — its
@@ -113,37 +97,42 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
             "global; rides:attestation withdraws of identity:occurrence:v1 rows",
             "public",
         ),
-        // The membership planes keep the `Global` advertise projection (every
-        // node that holds the group's record must fold the same events, #860)
-        // and are gated per peer: the revocation names the removed member, the
-        // widening the member it seats (#860 / #910), the listing (#912) its
-        // discloser — gated by default, pending CC on what `listed` means.
-        EnvelopeKind::FamilyMembershipRevocation
+        // persist v60.0.0 / v61 (CIRISPersist#991) — the RETIRED planes
+        // (`EnvelopeKind::is_retired_plane`): nothing advertised, point-read,
+        // held or scheduled; an inbound framed object is refused
+        // `federation_envelope_kind_retired`. A group's record and its
+        // widening / removal / resignation travel as `group:roster:v1` /
+        // `membership:*:v1` rows on the Attestation plane, served per row by
+        // persist's `may_receive` (→ `may_receive_group_plane`: a public
+        // group's to every peer; a private group's to its members' nodes, live
+        // invitees' nodes and the named member's node; no Rooted floor). A key
+        // grant is a `key_grant:{axis}:v1` row there. The member listing and
+        // the operational trio have no row.
+        EnvelopeKind::Family
+        | EnvelopeKind::Community
+        | EnvelopeKind::FamilyMembershipRevocation
         | EnvelopeKind::CommunityMembershipRevocation
         | EnvelopeKind::CommunityMembershipWidening
-        | EnvelopeKind::FamilyMembershipWidening
-        | EnvelopeKind::CommunityMembershipListing => (
-            "global",
-            "membership_plane: persist may_receive_group_plane(peer, scope, group, named member)",
+        | EnvelopeKind::FamilyMembershipWidening => (
+            "retired; rides:attestation group:roster:v1 / membership:*:v1 rows",
+            "retired: federation_envelope_kind_retired; rows: persist may_receive \
+             (group plane: members' nodes, live invitees' nodes, named member's node; \
+             public group → every peer)",
         ),
-        EnvelopeKind::Organization | EnvelopeKind::OrgMembership | EnvelopeKind::PartnerRecord => {
-            ("bulk_since", "public")
-        }
+        EnvelopeKind::KeyGrant => (
+            "retired; rides:attestation key_grant:{axis}:v1 rows",
+            "retired: federation_envelope_kind_retired; rows: persist may_receive \
+             (the cohort's audience only)",
+        ),
+        EnvelopeKind::CommunityMembershipListing
+        | EnvelopeKind::Organization
+        | EnvelopeKind::OrgMembership
+        | EnvelopeKind::PartnerRecord => ("retired", "retired: federation_envelope_kind_retired"),
         // CIRISEdge#474 — the accord-quorum-evidence plane rides the dedicated
         // CURSOR path (`CursorPull` → `Deliver`, resume on `evidence_at`), NOT the
         // content-hash Summary/Diff/Fetch flow (`persist_index_kind` → None). The
         // bundle is a public `FederationOnly`-tier record — no capability gate.
         EnvelopeKind::AccordQuorumEvidence => ("cursor:evidence_at", "public"),
-        // CIRISPersist#848 — a key_grant SET is an attestation row: it is
-        // advertised and served through the Attestation plane (per-record,
-        // `SelfOwn` on persist's side), never as a plane of its own. Stated
-        // here so the manifest names where the wraps travel.
-        // persist v53 S1 (I397) — a key set follows its cohort's audience
-        // (`may_receive`), never a device it merely names.
-        EnvelopeKind::KeyGrant => (
-            "rides:attestation",
-            "persist may_receive(peer, set): the cohort's audience only",
-        ),
     };
     // CIRISEdge#462 — `receive`: whether this kind answers a subject-scoped Pull
     // (the RECEIVE axis), and under what rule. The FIVE replicated kinds are
@@ -344,8 +333,18 @@ pub fn serve_advertise_policy_sha256() -> String {
 // `key:revocation:v1`, and for IdentityOccurrenceRevocation the `withdraws`
 // of an `identity:occurrence:v1` row), the framed objects being retired. Reach,
 // serve and receive are unchanged. **CIRISServer must mirror this pin.**
+//
+// persist v61 (CIRISPersist#991) — RE-PINNED, ead63aac… → 5904b100…: the six
+// group-plane kinds, the member listing and the framed KeyGrant are RETIRED
+// planes (nothing advertised, served, held or scheduled; inbound refused
+// `federation_envelope_kind_retired`), their records and events riding the
+// Attestation plane as `group:roster:v1` / `membership:*:v1` /
+// `key_grant:{axis}:v1` rows under persist's `may_receive`; the operational
+// trio's cells say `retired` too. Attestation, the key planes,
+// TransportDestination, LocationProof and AccordQuorumEvidence are unchanged.
+// **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "ead63aac63f6736b12084a07278557b7b273e6a98c9d52b77504f512d9fc5439";
+    "5904b1001eb330fe2c3a5ea5864e628394c1a675023894ccf0e0606f63a90cb3";
 
 #[cfg(test)]
 mod tests {

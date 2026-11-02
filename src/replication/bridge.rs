@@ -101,15 +101,10 @@ use ciris_persist::federation::consent_grammar::{self, ConsentTransferPolicy};
 use ciris_persist::federation::namespace::{self, Projection};
 use ciris_persist::federation::trust_root::capability_roots_to_trusted_root;
 use ciris_persist::federation::types::delegation_scope;
-use ciris_persist::federation::types::{
-    Attestation, SignedAttestation, SignedCommunity, SignedCommunityMembershipListing,
-    SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening, SignedFamily,
-    SignedFamilyMembershipRevocation, SignedFamilyMembershipWidening, SignedLocationProof,
-};
+use ciris_persist::federation::types::{Attestation, SignedAttestation, SignedLocationProof};
 use ciris_persist::federation::FederationDirectory;
 
 use super::directory::ReplicationDirectory;
-use super::group_plane::{is_membership_plane, GroupPlane};
 use super::key_plane_rows;
 use super::protocol::{EnvelopeKind, EnvelopeRef};
 use super::summary::ApplyOutcome;
@@ -661,6 +656,11 @@ fn key_grant_refusal_terminal(reason: &str) -> bool {
     .any(|r| r.as_str() == reason)
 }
 
+/// persist v61 S2 (CIRISPersist#1148) — the `AttestationRefusalReason` token
+/// of a replicated row this node is not in the audience for. See
+/// [`attestation_refusal_retry`].
+pub(crate) const ATTESTATION_NOT_IN_AUDIENCE: &str = "not_in_audience";
+
 /// CIRISEdge#459 — the retry disposition of a typed Attestation-plane refusal,
 /// decided by persist's own [`is_retryable`](ciris_persist::federation::attestation_apply::AttestationRefusalReason::is_retryable)
 /// (persist v59.0.0), never re-decided here:
@@ -674,13 +674,28 @@ fn key_grant_refusal_terminal(reason: &str) -> bool {
 ///   to `Duplicate`), and `key_plane_refused` (a key-plane row its family door
 ///   did not apply; since v59.0.0 it no longer folds in the pending proposal,
 ///   which persist split out so this token can stop).
+///
+/// persist v61 S2 (CIRISPersist#1148) — ONE override: `not_in_audience` (a
+/// replicated row this node is not in the audience for). persist marks it
+/// retryable (the roster may yet admit this node), but nothing about the
+/// offering peer's next round changes it, so edge books it TERMINAL: the
+/// per-(peer, row) refusal backoff then re-asks on its terminal schedule
+/// instead of every round, forever. Matched by persist's token, so the arm
+/// holds on a persist that does not name the variant yet.
 fn attestation_refusal_retry(
     reason: ciris_persist::federation::attestation_apply::AttestationRefusalReason,
 ) -> RetryDisposition {
-    if reason.is_retryable() {
-        RetryDisposition::Transient
-    } else {
+    attestation_refusal_retry_of(reason.as_str(), reason.is_retryable())
+}
+
+/// [`attestation_refusal_retry`] on persist's token and its own
+/// `is_retryable`, so the `not_in_audience` override is witnessed on a persist
+/// that does not name the variant yet.
+fn attestation_refusal_retry_of(token: &str, persist_retryable: bool) -> RetryDisposition {
+    if token == ATTESTATION_NOT_IN_AUDIENCE || !persist_retryable {
         RetryDisposition::Terminal
+    } else {
+        RetryDisposition::Transient
     }
 }
 
@@ -1126,7 +1141,6 @@ pub(crate) struct ReadProbe {
     pub(crate) delay_ms: std::sync::atomic::AtomicU64,
     pub(crate) in_flight: std::sync::atomic::AtomicUsize,
     pub(crate) max_in_flight: std::sync::atomic::AtomicUsize,
-    pub(crate) group_plane_reads: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -1718,27 +1732,6 @@ impl MayReceiveKey {
     }
 }
 
-/// CIRISEdge#758 / #761 — one peer's membership-plane gate for one sweep or
-/// fetch: persist's `may_receive_group_plane` verdict per `(scope, group,
-/// named)`, memoized for the sweep, and where a refusal is booked. `peer`
-/// `None` is an unbound requester: it proves no person, so only a public
-/// group's rows reach it.
-struct GroupPlaneGate<'a> {
-    peer: Option<&'a str>,
-    site: &'static str,
-    memo: HashMap<GroupPlane, bool>,
-}
-
-impl<'a> GroupPlaneGate<'a> {
-    fn new(peer: Option<&'a str>, site: &'static str) -> Self {
-        Self {
-            peer,
-            site,
-            memo: HashMap::new(),
-        }
-    }
-}
-
 /// CIRISEdge#531 DEPTH — the hard stop on a [`SweepWindow::Full`] drain.
 ///
 /// A `Full` drain loops until a page comes back short. Every exit depends on
@@ -2144,14 +2137,6 @@ pub struct FederationDirectoryReplicationBridge {
     /// INFO ([`Self::note_send_set_membership`]). Bounded: cleared past
     /// [`SEND_SET_MEMBERSHIP_CAP`] peers.
     send_set_membership: std::sync::Mutex<HashMap<String, &'static str>>,
-    /// CONSENT-GATED ROUTES — each owner's consented subjects (the subjects of
-    /// its live `consent:replication` grants), memoized for
-    /// [`CONSENT_SEND_SET_MEMO_TTL`]: a canonical gates every relayed route
-    /// row on it, every round.
-    route_consent_memo: Mutex<HashMap<String, ConsentedSubjects>>,
-    /// Whether relayed routes are consent-gated ([`Self::with_consent_gated_routes`]).
-    /// Off by default until CIRISPersist#1165 lets a relay hold contact grants.
-    consent_gated_routes: bool,
     /// CIRISEdge#552 (B) — signers a transient refusal named that this node may
     /// not hold. Bounded: a peer that offers unadmittable rows must not be able
     /// to grow this without limit, so past the cap new names are DROPPED rather
@@ -2301,9 +2286,6 @@ pub type RevocationObserver = Arc<dyn Fn(&str) + Send + Sync>;
 /// default 30 s cadence, so the item-1 bound still re-resolves every round.
 const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(10);
 
-/// One owner's consented subjects and when they were read.
-type ConsentedSubjects = (Arc<HashSet<String>>, Instant);
-
 /// Peers whose send-set membership is remembered for change logging.
 const SEND_SET_MEMBERSHIP_CAP: usize = 4096;
 
@@ -2391,8 +2373,6 @@ impl FederationDirectoryReplicationBridge {
             local_key_id: None,
             consent_subject_key_ids: Vec::new(),
             send_set_membership: std::sync::Mutex::new(HashMap::new()),
-            route_consent_memo: Mutex::new(HashMap::new()),
-            consent_gated_routes: false,
             config,
             consent_memo: Mutex::new(None),
             consent_flight: SingleFlight::default(),
@@ -2590,24 +2570,6 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_serve_tier_subject(mut self, subject: Option<String>) -> Self {
         self.serve_tier_subject = subject;
-        self
-    }
-
-    /// Turn on CONSENT-GATED ROUTES ([`Self::route_row_unconsented`]): a
-    /// relayed route about an owned node is served only to a peer its owner
-    /// consented to (Eric 2026-10-30).
-    ///
-    /// TODO(CIRISPersist#1165): make this the default once persist's
-    /// `may_receive` admits an owner's contact grant at an infrastructure
-    /// relay. Until then no relay holds contact grants, so turning it on stops
-    /// two persons' NAT'd nodes from ever getting each other's route (a dial
-    /// under the E1 seal needs it) and first contact breaks. Then also serve
-    /// this node's owner's contact grants to infra:serve relays (the edge half
-    /// of #1165) and witness the whole flow: grant reaches the relay, relay
-    /// serves the route, requester dials direct.
-    #[must_use]
-    pub fn with_consent_gated_routes(mut self, on: bool) -> Self {
-        self.consent_gated_routes = on;
         self
     }
 
@@ -3261,7 +3223,7 @@ impl FederationDirectoryReplicationBridge {
     // them into a struct would just move the same eight behind a name and cost
     // every call site a builder. The alternative — 13 hand-written page loops —
     // is what this exists to prevent.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn sweep_paged<S, Read, Fut, T, IN, RS, TS, C>(
         &self,
         kind: EnvelopeKind,
@@ -3281,47 +3243,6 @@ impl FederationDirectoryReplicationBridge {
         TS: Fn(&S) -> u64,
         C: Fn(&S) -> &T,
     {
-        self.sweep_paged_gated(
-            kind,
-            window,
-            read,
-            resume,
-            in_scope,
-            seq_of,
-            content_of,
-            None::<(&mut GroupPlaneGate<'_>, fn(&S) -> GroupPlane)>,
-        )
-        .await
-    }
-
-    /// [`Self::sweep_paged`] with the CIRISEdge#761 membership-plane gate:
-    /// when `gate` is bound, each page's in-scope rows are put to
-    /// [`Self::group_plane_admits`] over the group `plane_of` reads, and only
-    /// the admitted ones are offered. The cursor still advances over every
-    /// row read (the watermark tracks what this node LOOKED AT, not what it
-    /// offered; see [`Self::attestation_page`]).
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    async fn sweep_paged_gated<S, Read, Fut, T, IN, RS, TS, C, PO>(
-        &self,
-        kind: EnvelopeKind,
-        window: SweepWindow<'_>,
-        read: Read,
-        resume: RS,
-        in_scope: IN,
-        seq_of: TS,
-        content_of: C,
-        mut gate: Option<(&mut GroupPlaneGate<'_>, PO)>,
-    ) -> Vec<EnvelopeRef>
-    where
-        T: serde::Serialize,
-        Read: Fn(Option<ResumeCursor>, u32) -> Fut,
-        Fut: std::future::Future<Output = Vec<S>>,
-        RS: Fn(&S) -> ResumeCursor,
-        IN: Fn(&S) -> bool,
-        TS: Fn(&S) -> u64,
-        C: Fn(&S) -> &T,
-        PO: Fn(&S) -> GroupPlane,
-    {
         let budget = self.sweep_page_budget().await;
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
@@ -3333,11 +3254,9 @@ impl FederationDirectoryReplicationBridge {
                     let _permit = self.sweep_gate.enter().await;
                     let rows = read(since.clone(), budget).await;
                     self.record_page(rows.len());
-                    let mask = self.page_mask(kind, &rows, &in_scope, &mut gate).await;
                     self.advertise_page_into(
                         &rows,
                         &in_scope,
-                        mask.as_deref(),
                         &seq_of,
                         &content_of,
                         &mut refs,
@@ -3404,16 +3323,7 @@ impl FederationDirectoryReplicationBridge {
                     c.note_skip(&key, mark);
                 }
             }
-            let mask = self.page_mask(kind, &rows, &in_scope, &mut gate).await;
-            self.advertise_page_into(
-                &rows,
-                &in_scope,
-                mask.as_deref(),
-                &seq_of,
-                &content_of,
-                &mut refs,
-                &mut seen,
-            );
+            self.advertise_page_into(&rows, &in_scope, &seq_of, &content_of, &mut refs, &mut seen);
             (rows.len(), rows.last().map(&resume))
         };
         if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
@@ -3426,11 +3336,9 @@ impl FederationDirectoryReplicationBridge {
                         c.note_skip(&key, mark);
                     }
                 }
-                let mask = self.page_mask(kind, &rows, &in_scope, &mut gate).await;
                 self.advertise_page_into(
                     &rows,
                     &in_scope,
-                    mask.as_deref(),
                     &seq_of,
                     &content_of,
                     &mut refs,
@@ -3441,28 +3349,6 @@ impl FederationDirectoryReplicationBridge {
             self.sweep_after_backfill(&key, b_served, plan.budget, b_last);
         }
         refs
-    }
-
-    /// The gate half of one page of [`Self::sweep_paged_gated`]: `None` when
-    /// no gate is bound (the page's `in_scope` alone decides).
-    async fn page_mask<S, IN, PO>(
-        &self,
-        kind: EnvelopeKind,
-        rows: &[S],
-        in_scope: &IN,
-        gate: &mut Option<(&mut GroupPlaneGate<'_>, PO)>,
-    ) -> Option<Vec<bool>>
-    where
-        IN: Fn(&S) -> bool,
-        PO: Fn(&S) -> GroupPlane,
-    {
-        match gate {
-            Some((g, plane_of)) => Some(
-                self.group_plane_mask(kind, rows, in_scope, &*plane_of, g)
-                    .await,
-            ),
-            None => None,
-        }
     }
 
     /// CIRISEdge#440 — is the `trace:*` plane paused by a live
@@ -3937,16 +3823,6 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             // treated as a stranger.
             (EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination, peer) => {
                 self.list_identity_plane_for_peer(kind, peer, window).await
-            }
-            // CIRISEdge#758 / #761 (CC 5.4.6, persist v53 S1) — the group
-            // RECORDS and the five membership planes are per-peer too: a
-            // private group's rows reach its members' nodes, its live
-            // invitees' nodes and the nodes of the member a row names
-            // (persist's `may_receive_group_plane`); a public group's reach
-            // every peer. An unbound peer (`None`) proves no person and is
-            // served only public groups' rows.
-            (k, peer) if is_membership_plane(k) => {
-                self.list_group_plane_for_peer(kind, peer, window).await
             }
             _ => self.list_envelope_refs_unbounded(kind, window).await,
         }
@@ -4460,19 +4336,6 @@ impl FederationDirectoryReplicationBridge {
         ) && self
             .identity_row_fetch_withholds(kind, &bytes, envelope_hash, peer_key_id)
             .await
-        {
-            return None;
-        }
-        // CIRISEdge#758 / #761 (CC 5.4.6) — the direct-fetch twin of the
-        // per-peer membership-plane advertise: a peer that learned a group
-        // record's or a membership row's hash out-of-band is handed it only
-        // when persist's `may_receive_group_plane` admits it, the same
-        // predicate over the same `(scope, group, named)` the advertise read,
-        // so the two agree. A public group's rows reach any requester.
-        if is_membership_plane(kind)
-            && !self
-                .group_plane_fetch_serves(kind, &bytes, peer_key_id)
-                .await
         {
             return None;
         }
@@ -5171,24 +5034,6 @@ impl FederationDirectoryReplicationBridge {
             EnvelopeKind::IdentityOccurrenceRevocation => {
                 self.list_occurrence_withdrawal_rows().await
             }
-            EnvelopeKind::Family => self.list_families(window).await,
-            EnvelopeKind::Community => self.list_communities(window).await,
-            EnvelopeKind::FamilyMembershipRevocation => {
-                self.list_family_membership_revocations(window, None).await
-            }
-            EnvelopeKind::CommunityMembershipRevocation => {
-                self.list_community_membership_revocations(window, None)
-                    .await
-            }
-            EnvelopeKind::CommunityMembershipWidening => {
-                self.list_community_membership_widenings(window, None).await
-            }
-            EnvelopeKind::FamilyMembershipWidening => {
-                self.list_family_membership_widenings(window, None).await
-            }
-            EnvelopeKind::CommunityMembershipListing => {
-                self.list_community_membership_listings(window, None).await
-            }
             EnvelopeKind::LocationProof => self.list_location_proofs(window).await,
             // CIRISEdge#474 — the accord-quorum-evidence plane is NEVER advertised
             // by content-hash: it has no `signed_wire_index` entry
@@ -5207,13 +5052,25 @@ impl FederationDirectoryReplicationBridge {
             // would offer every row twice.
             // persist v60.0.0 (§8) — the operational planes are retired: an
             // organisation is an affiliation, carried on the attestation plane.
-            // Nothing is advertised on them; an inbound object is refused
+            // persist v61 (CIRISPersist#991) — so are the six group-plane kinds
+            // and the member listing: a group's record and its membership
+            // events are `group:roster:v1` / `membership:*:v1` rows, advertised
+            // by the Attestation arm above under persist's `may_receive`; the
+            // listing has no successor. Nothing is advertised on a retired
+            // plane; an inbound object is refused
             // `federation_envelope_kind_retired` (`refuse_retired_framed`).
             EnvelopeKind::AccordQuorumEvidence
             | EnvelopeKind::KeyGrant
             | EnvelopeKind::Organization
             | EnvelopeKind::OrgMembership
-            | EnvelopeKind::PartnerRecord => Vec::new(),
+            | EnvelopeKind::PartnerRecord
+            | EnvelopeKind::Family
+            | EnvelopeKind::Community
+            | EnvelopeKind::FamilyMembershipRevocation
+            | EnvelopeKind::CommunityMembershipRevocation
+            | EnvelopeKind::CommunityMembershipWidening
+            | EnvelopeKind::FamilyMembershipWidening
+            | EnvelopeKind::CommunityMembershipListing => Vec::new(),
         }
     }
 
@@ -5420,11 +5277,7 @@ impl FederationDirectoryReplicationBridge {
                         continue;
                     };
                     if self
-                        .identity_row_pull_withholds(
-                            EnvelopeKind::IdentityOccurrence,
-                            &occurrence,
-                            peer_key_id,
-                        )
+                        .identity_row_pull_withholds(&occurrence, peer_key_id)
                         .await
                     {
                         continue;
@@ -5445,11 +5298,7 @@ impl FederationDirectoryReplicationBridge {
                     let td = &row.transport_destination;
                     // CIRISEdge#682 — the subject-Pull twin (see above).
                     if self
-                        .identity_row_pull_withholds(
-                            EnvelopeKind::TransportDestination,
-                            &td.occurrence_key_id,
-                            peer_key_id,
-                        )
+                        .identity_row_pull_withholds(&td.occurrence_key_id, peer_key_id)
                         .await
                     {
                         continue;
@@ -6067,12 +5916,15 @@ impl FederationDirectoryReplicationBridge {
                 }
                 outcome
             }
-            // #848 — a key_grant set framed under its own tag lands on the same
-            // door; the `key_grant:` prefix router inside decides.
-            EnvelopeKind::Attestation | EnvelopeKind::KeyGrant => {
+            EnvelopeKind::Attestation => {
                 let outcome = self.apply_attestation(envelope_bytes, source_peer).await;
                 if outcome.is_admitted() {
                     self.widen_on_admitted_acceptance(envelope_bytes).await;
+                    // persist v61 (CIRISPersist#991) — a group's record and its
+                    // membership events arrive here as rows now; what the
+                    // framed Family / FamilyMembershipRevocation doors did on
+                    // admission, the row does.
+                    self.on_group_plane_row_admitted(envelope_bytes);
                     // persist v59.0.0 — a `key:revocation:v1` row rides this
                     // plane too.
                     if let Some(revocation) = revocation_of_row_bytes(kind, envelope_bytes) {
@@ -6081,60 +5933,27 @@ impl FederationDirectoryReplicationBridge {
                 }
                 outcome
             }
-            EnvelopeKind::Family => {
-                let outcome = self.apply_family(envelope_bytes).await;
-                // Workstream F — a family record IS the accord roster
-                // (`active_roster_of` reads exactly this row's members), so an
-                // admitted one moves the `signer_seated` leg for every signer
-                // under that root. Re-parsed only when a gate is installed.
-                if outcome.is_admitted() && self.accord_relay_gate.is_some() {
-                    if let Ok(f) = serde_json::from_slice::<SignedFamily>(envelope_bytes) {
-                        self.invalidate_accord_relay(&[&f.family.family_key_id]);
-                    }
-                }
-                outcome
-            }
-            EnvelopeKind::Community => self.apply_community(envelope_bytes).await,
+            // persist v59.0.0 / v60.0.0 / v61 (CIRISPersist#991) — the framed
+            // kinds persist retired with no row of their own on this session
+            // plane: the operational trio (v60), and the six group-plane kinds,
+            // the member listing and the framed KeyGrant (v61). A group's record
+            // and its membership events are `group:roster:v1` /
+            // `membership:{widening,removal,resignation}:v1` ROWS on the
+            // Attestation plane; a key grant is a `key_grant:{axis}:v1` row
+            // there; the listing has no successor. An inbound framed object is
+            // refused TERMINAL under `federation_envelope_kind_retired` and
+            // never reaches an authoring door.
             EnvelopeKind::Organization
             | EnvelopeKind::OrgMembership
-            | EnvelopeKind::PartnerRecord => self.refuse_retired_framed(kind, envelope_bytes),
-            EnvelopeKind::FamilyMembershipRevocation => {
-                let outcome = self
-                    .apply_family_membership_revocation(envelope_bytes)
-                    .await;
-                // Workstream F — a seat removal is the revocation fold
-                // `active_roster_of` applies; a cached `signer_seated: true`
-                // for the removed holder must not outlive it.
-                if outcome.is_admitted() && self.accord_relay_gate.is_some() {
-                    if let Ok(r) =
-                        serde_json::from_slice::<SignedFamilyMembershipRevocation>(envelope_bytes)
-                    {
-                        self.invalidate_accord_relay(&[
-                            &r.family_membership_revocation.family_key_id,
-                            &r.family_membership_revocation.removed_identity_key_id,
-                        ]);
-                    }
-                }
-                outcome
-            }
-            EnvelopeKind::CommunityMembershipRevocation => {
-                self.apply_community_membership_revocation(envelope_bytes)
-                    .await
-            }
-            // #860 — applied exactly like the revocation: the row lands, the
-            // roster is a read-time fold, nothing is rewritten.
-            EnvelopeKind::CommunityMembershipWidening => {
-                self.apply_community_membership_widening(envelope_bytes)
-                    .await
-            }
-            // persist v49.0.0 — #910 the family mirror, #912 the member's own listing.
-            EnvelopeKind::FamilyMembershipWidening => {
-                self.apply_family_membership_widening(envelope_bytes).await
-            }
-            EnvelopeKind::CommunityMembershipListing => {
-                self.apply_community_membership_listing(envelope_bytes)
-                    .await
-            }
+            | EnvelopeKind::PartnerRecord
+            | EnvelopeKind::Family
+            | EnvelopeKind::Community
+            | EnvelopeKind::FamilyMembershipRevocation
+            | EnvelopeKind::CommunityMembershipRevocation
+            | EnvelopeKind::CommunityMembershipWidening
+            | EnvelopeKind::FamilyMembershipWidening
+            | EnvelopeKind::CommunityMembershipListing
+            | EnvelopeKind::KeyGrant => self.refuse_retired_framed(kind, envelope_bytes),
             EnvelopeKind::LocationProof => self.apply_location_proof(envelope_bytes).await,
             EnvelopeKind::TransportDestination => {
                 self.apply_transport_destination(envelope_bytes).await
@@ -6246,7 +6065,6 @@ impl FederationDirectoryReplicationBridge {
         &self,
         rows: &[S],
         in_scope: IN,
-        mask: Option<&[bool]>,
         seq_of: TS,
         content_of: C,
         refs: &mut Vec<EnvelopeRef>,
@@ -6257,11 +6075,7 @@ impl FederationDirectoryReplicationBridge {
         TS: Fn(&S) -> u64,
         C: Fn(&S) -> &T,
     {
-        let admitted = |i: usize, r: &S| match mask {
-            Some(m) => m.get(i).copied().unwrap_or(false),
-            None => in_scope(r),
-        };
-        for (_, row) in rows.iter().enumerate().filter(|(i, r)| admitted(*i, r)) {
+        for row in rows.iter().filter(|r| in_scope(r)) {
             let Some((hash, _bytes)) = content_hash_of(content_of(row)) else {
                 // CIRISEdge#425 — a row that will not serialize is silently absent
                 // from the advertise set (peers never learn it exists, so it never
@@ -6370,9 +6184,7 @@ impl FederationDirectoryReplicationBridge {
         window: SweepWindow<'_>,
     ) -> Vec<EnvelopeRef> {
         let mut subjects = self.self_own_subjects(kind);
-        let withheld = self
-            .identity_rows_withheld_from(kind, &subjects, peer)
-            .await;
+        let withheld = self.identity_rows_withheld_from(&subjects, peer).await;
         for (subject, reason) in &withheld {
             subjects.remove(subject);
             self.withhold(
@@ -6748,6 +6560,21 @@ impl FederationDirectoryReplicationBridge {
                  empty one means the row is bad (CIRISEdge v17.7.0 / history: CIRISPersist#713)"
             );
             return false;
+        }
+        // persist v61 (CIRISPersist#991) — a GROUP-PLANE row keeps its retired
+        // framed plane's reach: advertised by every holder, narrowed per peer by
+        // persist's `may_receive` (→ `may_receive_group_plane`) in the audience
+        // gate. The family-scope attestation cell is `SelfOwn`, which would let
+        // only the signer's own nodes relay a family's record, widening or
+        // REMOVAL — and a removal every holder of the record must fold (#860)
+        // would then reach only the members who sync with its signer.
+        if canonical_json
+            .pointer("/attestation_envelope/dimension")
+            .and_then(serde_json::Value::as_str)
+            .and_then(ciris_persist::federation::group_plane::GroupPlaneFamily::of_dimension)
+            .is_some()
+        {
+            return true;
         }
         // v36 (CIRISPersist#713) — one resolver for the whole family decision:
         // `Plane::Attestation { dimension }` is value-keyed, so `trace:*` resolves
@@ -7900,6 +7727,41 @@ impl FederationDirectoryReplicationBridge {
                 return true;
             }
         };
+        // persist v61 (CIRISPersist#991, CC 5.4.6) — a GROUP-PLANE row (a
+        // group's `group:roster:v1` record, a `membership:{widening,removal,
+        // resignation}:v1` event) is served exactly as its retired framed plane
+        // was: by persist's one resolver alone, which routes it to
+        // `may_receive_group_plane` (a public group's rows to every peer; a
+        // private group's to its members' nodes, its live invitees' nodes —
+        // with the plane's full history — and the node of the member a row
+        // names). No send-set reach and no Rooted floor: an invitee is a
+        // stranger who shares no root with the room, and it must hold the
+        // record before it can be anything else (CIRISEdge#758). Booked
+        // `group_record_not_member_or_invitee`, the framed planes' token.
+        if ciris_persist::federation::group_plane::is_group_plane_row(att) {
+            if self.may_receive_cached(att, peer, memo).await.allowed() {
+                return false;
+            }
+            self.withhold(
+                WithholdReason::GroupRecordNotMemberOrInvitee,
+                peer,
+                &format!(
+                    "{site}: group-plane row: the peer is not in the group's membership-plane \
+                     audience (persist may_receive; CIRISEdge#758/#761, CC 5.4.6)"
+                ),
+            );
+            tracing::debug!(
+                peer,
+                attester,
+                attestation_id = Self::row_attestation_id(row),
+                dimension = Self::row_dimension(row),
+                site,
+                "group-plane row withheld — the recipient is neither a member's node, a live \
+                 invitee's node nor the named member's node of this private group \
+                 (CIRISEdge#758/#761, CC 5.4.6)"
+            );
+            return true;
+        }
         // CIRISEdge#756 (`FSD/FIRST_CONTACT.md` §2.4, I22) — the membership
         // ceremony addressed to the peer's own person crosses first contact:
         // the invitation naming it and the invitee's answer to its proposal.
@@ -9672,6 +9534,37 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    /// persist v61 (CIRISPersist#991) — the apply-side hook the framed Family
+    /// and FamilyMembershipRevocation doors used to run, now on the ROW. A
+    /// family's record is the accord roster (`active_roster_of` reads its
+    /// members) and a seat removal is the fold it applies, so an admitted
+    /// family `group:roster:v1` / `membership:*:v1` row drops the cached
+    /// `signer_seated` verdicts under that family and for the member the row
+    /// names (Workstream F). A community row moves no accord roster. Parsed
+    /// only when a gate is installed; never fails the apply (the row is
+    /// already stored).
+    fn on_group_plane_row_admitted(&self, envelope_bytes: &[u8]) {
+        use ciris_persist::federation::group_plane::{group_signed_of_row, GroupKind};
+        if self.accord_relay_gate.is_none() {
+            return;
+        }
+        let Ok(row) = serde_json::from_slice::<Attestation>(envelope_bytes).or_else(|_| {
+            serde_json::from_slice::<SignedAttestation>(envelope_bytes).map(|s| s.attestation)
+        }) else {
+            return;
+        };
+        let Ok(Some(signed)) = group_signed_of_row(&row) else {
+            return;
+        };
+        if signed.kind() != GroupKind::Family {
+            return;
+        }
+        match signed.member_key_id() {
+            Some(member) => self.invalidate_accord_relay(&[signed.group_key_id(), member]),
+            None => self.invalidate_accord_relay(&[signed.group_key_id()]),
+        }
+    }
+
     /// persist v52.0.0 (CIRISPersist#955) — the widener's half of the apply
     /// path: an admitted acceptance of a proposal this node issued becomes the
     /// roster widening. Parsed only when a widener is installed. Never fails
@@ -9933,128 +9826,22 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// CIRISEdge#682 + CONSENT-GATED ROUTES — whether a row of `kind` about
-    /// `subject` is withheld from `peer`: the announce reach, and on the
-    /// `TransportDestination` plane the route-consent rule as well
-    /// ([`Self::route_row_unconsented`]). `None` serves.
+    /// CIRISEdge#682 — whether a row of `kind` about `subject` is withheld from
+    /// `peer`: the announce reach. `None` serves.
+    ///
+    /// v44 (CC rc15 5.4.6, 5.3.4 amended) — the consent-gated-routes rule
+    /// (v43.4.0, switched off) is retired: a forwarder must not hold the
+    /// contact grant, so it has nothing to gate on. An owned node's route
+    /// reaches a contact inside the sealed first-contact request and
+    /// acceptance (CIRISEdge#922).
     async fn identity_row_withholds(
         &self,
-        kind: EnvelopeKind,
         subject: &str,
         peer: Option<&str>,
     ) -> Option<crate::observability::WithholdReason> {
-        if let Some(reason) = self
-            .identity_row_reach(subject)
+        self.identity_row_reach(subject)
             .await
             .withholds(subject, peer)
-        {
-            return Some(reason);
-        }
-        if kind == EnvelopeKind::TransportDestination
-            && self.consent_gated_routes
-            && self.route_row_unconsented(subject, peer).await
-        {
-            return Some(crate::observability::WithholdReason::RouteNotConsented);
-        }
-        None
-    }
-
-    /// **CONSENT-GATED ROUTES** (Eric 2026-10-30: "The canonical relays the
-    /// contact consent request, only after consent can we go direct"). A
-    /// RELAYED route row about an owned node `subject` goes to `peer` only when
-    /// the node's owner has consented to it: a live `consent:replication`
-    /// grant the owner authored names `peer` or `peer`'s owner. That grant is
-    /// the proof of contact consent; the recipient writes it on accept.
-    ///
-    /// Unchanged, and so never withheld here:
-    /// - this node's OWN route (it is not relayed);
-    /// - a route to the node itself, or to another node of the same owner;
-    /// - an UNOWNED node's route (the canonical, a bare server): there is no
-    ///   owner to consent, and announcing is how it is reached.
-    ///
-    /// Fail-closed: an owner that cannot be resolved, or a grant read that
-    /// fails, withholds.
-    async fn route_row_unconsented(&self, subject: &str, peer: Option<&str>) -> bool {
-        if self.local_key_id.as_deref() == Some(subject)
-            || self.serve_tier_subject.as_deref() == Some(subject)
-        {
-            return false;
-        }
-        let Some(peer) = peer else {
-            return true;
-        };
-        if peer == subject {
-            return false;
-        }
-        let owner = match self.owner_of_cached(subject).await {
-            OwnerLookup::Owner(o) => o,
-            OwnerLookup::Unowned => return false,
-            OwnerLookup::Unresolved => return true,
-        };
-        let peer_owner = match self.owner_of_cached(peer).await {
-            OwnerLookup::Owner(o) => Some(o),
-            _ => None,
-        };
-        if peer_owner.as_deref() == Some(owner.as_str()) {
-            return false;
-        }
-        let Some(consented) = self.owner_consented_subjects(&owner).await else {
-            return true;
-        };
-        !(consented.contains(peer) || peer_owner.is_some_and(|o| consented.contains(&o)))
-    }
-
-    /// The subjects of `owner`'s live `consent:replication` grants, memoized
-    /// for [`CONSENT_SEND_SET_MEMO_TTL`]. `None` on a read failure.
-    async fn owner_consented_subjects(&self, owner: &str) -> Option<Arc<HashSet<String>>> {
-        if let Ok(memo) = self.route_consent_memo.lock() {
-            if let Some((set, at)) = memo.get(owner) {
-                if at.elapsed() < CONSENT_SEND_SET_MEMO_TTL {
-                    return Some(Arc::clone(set));
-                }
-            }
-        }
-        // The owner's pen is any live roster key of theirs: a device joined by
-        // approval (CC 3.3.6.3) signs the person's grants with its roster key
-        // (`<fedID>-<fp>`), not the fedID key.
-        let roster =
-            match ciris_persist::federation::self_roster::roster_now(&*self.directory, owner).await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(
-                        owner,
-                        error = %e,
-                        "route consent: the owner's roster could not be read; relayed routes \
-                         about its nodes are withheld (fail-closed)"
-                    );
-                    return None;
-                }
-            };
-        let mut subjects = HashSet::new();
-        for pen in std::iter::once(owner.to_owned()).chain(roster) {
-            match self.directory.list_live_consent_grants_by(&pen).await {
-                Ok(grants) => subjects.extend(grants.into_iter().flat_map(|g| g.subject_key_ids)),
-                Err(e) => {
-                    tracing::debug!(
-                        owner,
-                        pen,
-                        error = %e,
-                        "route consent: the owner's grants could not be read; relayed routes \
-                         about its nodes are withheld (fail-closed)"
-                    );
-                    return None;
-                }
-            }
-        }
-        let set: Arc<HashSet<String>> = Arc::new(subjects);
-        if let Ok(mut memo) = self.route_consent_memo.lock() {
-            if memo.len() >= SEND_SET_MEMBERSHIP_CAP {
-                memo.clear();
-            }
-            memo.insert(owner.to_owned(), (Arc::clone(&set), Instant::now()));
-        }
-        Some(set)
     }
 
     /// CIRISEdge#682 — the fetch-twin decision, booked at the deciding branch.
@@ -10069,7 +9856,7 @@ impl FederationDirectoryReplicationBridge {
     ) -> bool {
         let peer_label = peer.unwrap_or("<unattributed>");
         let reason = match Self::identity_row_subject(kind, bytes) {
-            Some(subject) => self.identity_row_withholds(kind, &subject, peer).await,
+            Some(subject) => self.identity_row_withholds(&subject, peer).await,
             None => Some(crate::observability::WithholdReason::IdentityRowAnnounceUnresolved),
         };
         let Some(reason) = reason else {
@@ -10088,13 +9875,8 @@ impl FederationDirectoryReplicationBridge {
 
     /// CIRISEdge#682 — the subject-Pull decision for one identity row about
     /// `occurrence`, booked at the deciding branch.
-    async fn identity_row_pull_withholds(
-        &self,
-        kind: EnvelopeKind,
-        occurrence: &str,
-        peer: Option<&str>,
-    ) -> bool {
-        let Some(reason) = self.identity_row_withholds(kind, occurrence, peer).await else {
+    async fn identity_row_pull_withholds(&self, occurrence: &str, peer: Option<&str>) -> bool {
+        let Some(reason) = self.identity_row_withholds(occurrence, peer).await else {
             return false;
         };
         self.withhold(
@@ -10111,13 +9893,12 @@ impl FederationDirectoryReplicationBridge {
     /// (sweep, subject) — the filter closure the sweep takes is synchronous.
     async fn identity_rows_withheld_from(
         &self,
-        kind: EnvelopeKind,
         subjects: &HashSet<String>,
         peer: Option<&str>,
     ) -> HashMap<String, crate::observability::WithholdReason> {
         let mut out = HashMap::new();
         for subject in subjects {
-            if let Some(reason) = self.identity_row_withholds(kind, subject, peer).await {
+            if let Some(reason) = self.identity_row_withholds(subject, peer).await {
                 out.insert(subject.clone(), reason);
             }
         }
@@ -10188,453 +9969,6 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// CIRISEdge#758 / #761 (CC 5.4.6, `FSD/FIRST_CONTACT.md` §2.5, I23;
-    /// persist v53 S1) — the per-peer view of a MEMBERSHIP PLANE (persist's
-    /// `ServeAudience::MembershipPlane`: the two group records and the five
-    /// membership planes): the sweep's rows, narrowed per row to what
-    /// persist's `may_receive_group_plane` lets `peer` receive. Every row the
-    /// sweep considered and the gate kept back is booked
-    /// `group_record_not_member_or_invitee`.
-    async fn list_group_plane_for_peer(
-        &self,
-        kind: EnvelopeKind,
-        peer: Option<&str>,
-        window: SweepWindow<'_>,
-    ) -> Vec<EnvelopeRef> {
-        let mut gate = GroupPlaneGate::new(peer, "advertise");
-        let gate = Some(&mut gate);
-        match kind {
-            EnvelopeKind::Family => self.list_families_gated(window, gate).await,
-            EnvelopeKind::Community => self.list_communities_gated(window, gate).await,
-            EnvelopeKind::FamilyMembershipRevocation => {
-                self.list_family_membership_revocations(window, gate).await
-            }
-            EnvelopeKind::CommunityMembershipRevocation => {
-                self.list_community_membership_revocations(window, gate)
-                    .await
-            }
-            EnvelopeKind::CommunityMembershipWidening => {
-                self.list_community_membership_widenings(window, gate).await
-            }
-            EnvelopeKind::FamilyMembershipWidening => {
-                self.list_family_membership_widenings(window, gate).await
-            }
-            EnvelopeKind::CommunityMembershipListing => {
-                self.list_community_membership_listings(window, gate).await
-            }
-            _ => self.list_envelope_refs_unbounded(kind, window).await,
-        }
-    }
-
-    /// CIRISEdge#761 — **the one membership-plane decision**: may the gate's
-    /// peer receive a row about `plane`? persist's `may_receive_group_plane`
-    /// for a bound peer; for an unbound requester, persist's `is_public_group`
-    /// alone (it proves no person, so no member, invitee or named arm can
-    /// hold). Memoized per gate; a refusal is booked at every row it refuses.
-    /// Fail-closed: a directory error refuses.
-    ///
-    /// CIRISEdge#817 — every caller holds a sweep permit across this: the
-    /// advertise through `sweep_paged_gated`'s per-page permit, the fetch twin
-    /// through its own ([`Self::group_plane_fetch_serves`]). It takes none
-    /// itself, because the advertise caller already holds one.
-    async fn group_plane_admits(
-        &self,
-        gate: &mut GroupPlaneGate<'_>,
-        kind: EnvelopeKind,
-        plane: &GroupPlane,
-    ) -> bool {
-        use ciris_persist::federation::replication_audience::{
-            is_public_group, may_receive_group_plane,
-        };
-        let verdict = if let Some(v) = gate.memo.get(plane) {
-            *v
-        } else {
-            #[cfg(test)]
-            self.read_probe
-                .group_plane_reads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            #[cfg(test)]
-            let _probe = self.read_probe.enter(true).await;
-            let dir = &*self.directory as &dyn ciris_persist::federation::FederationDirectory;
-            let answer = match gate.peer {
-                Some(p) => may_receive_group_plane(
-                    dir,
-                    p,
-                    plane.scope,
-                    &plane.group,
-                    plane.named.as_deref(),
-                )
-                .await
-                .map(ciris_persist::federation::replication_audience::Verdict::allowed),
-                None => is_public_group(dir, &plane.group).await,
-            };
-            let v = answer.unwrap_or_else(|e| {
-                tracing::debug!(
-                    group = %plane.group,
-                    error = %e,
-                    "membership-plane audience unresolved — withheld (fail-closed, \
-                     CIRISEdge#761)"
-                );
-                false
-            });
-            gate.memo.insert(plane.clone(), v);
-            v
-        };
-        if !verdict {
-            let peer = gate.peer.unwrap_or("<unattributed>");
-            self.withhold(
-                crate::observability::WithholdReason::GroupRecordNotMemberOrInvitee,
-                peer,
-                &format!(
-                    "{}: {}: the peer is not in the group's membership-plane audience \
-                     (persist may_receive_group_plane; CIRISEdge#758/#761, CC 5.4.6)",
-                    gate.site,
-                    kind.as_wire_str()
-                ),
-            );
-            tracing::debug!(
-                peer,
-                group = %plane.group,
-                kind = ?kind,
-                site = gate.site,
-                "membership-plane row withheld — the recipient is neither a member's node, a \
-                 live invitee's node nor the named member's node of this private group \
-                 (CIRISEdge#758/#761, CC 5.4.6)"
-            );
-        }
-        verdict
-    }
-
-    /// CIRISEdge#758 / #761 — the direct-fetch twin: the row's group read from
-    /// its wire bytes by the advertise's own reader ([`GroupPlane::of_wire`])
-    /// and judged by [`Self::group_plane_admits`]. Bytes that name no group get
-    /// nothing.
-    async fn group_plane_fetch_serves(
-        &self,
-        kind: EnvelopeKind,
-        bytes: &[u8],
-        peer: Option<&str>,
-    ) -> bool {
-        let mut gate = GroupPlaneGate::new(peer, "fetch");
-        let Some(plane) = GroupPlane::of_wire(kind, bytes) else {
-            self.withhold(
-                crate::observability::WithholdReason::GroupRecordNotMemberOrInvitee,
-                peer.unwrap_or("<unattributed>"),
-                &format!("fetch: {}: the row names no group", kind.as_wire_str()),
-            );
-            return false;
-        };
-        // CIRISEdge#817 — the fetch twin's `may_receive_group_plane` (and its
-        // `live_invitees_of`) copies count against the sweep permits, as the
-        // advertise's do: there the read runs inside `sweep_paged_gated`'s
-        // per-page permit; here, per fetch, nothing held one. Taken only after
-        // the no-group refusal above, so refusing stays instant, and nothing
-        // on the fetch path holds a permit already (the gate is not
-        // re-entrant).
-        let _permit = self.sweep_gate.enter().await;
-        self.group_plane_admits(&mut gate, kind, &plane).await
-    }
-
-    /// CIRISEdge#761 — the per-page mask [`Self::sweep_paged_gated`] applies:
-    /// for each row in scope, [`Self::group_plane_admits`] over the row's
-    /// group. A row out of scope is never put to persist.
-    async fn group_plane_mask<S>(
-        &self,
-        kind: EnvelopeKind,
-        rows: &[S],
-        in_scope: impl Fn(&S) -> bool,
-        plane_of: impl Fn(&S) -> GroupPlane,
-        gate: &mut GroupPlaneGate<'_>,
-    ) -> Vec<bool> {
-        let mut mask = Vec::with_capacity(rows.len());
-        for row in rows {
-            let admit = in_scope(row) && self.group_plane_admits(gate, kind, &plane_of(row)).await;
-            mask.push(admit);
-        }
-        mask
-    }
-
-    async fn list_families(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
-        self.list_families_gated(window, None).await
-    }
-
-    /// The Family plane's sweep, with the CIRISEdge#758 / #761 per-peer gate
-    /// when a peer is bound (`gate`); `None` is the peer-blind view (holdings,
-    /// diagnostics, tests).
-    async fn list_families_gated(
-        &self,
-        window: SweepWindow<'_>,
-        gate: Option<&mut GroupPlaneGate<'_>>,
-    ) -> Vec<EnvelopeRef> {
-        // CIRISEdge#523 — plane 1 of 3. A Family's members are PERSONS; the
-        // cohort is NODE-keyed. See [`Self::cohort_set_with_owners`].
-        let mut cohort = self.cohort_set_with_owners().await;
-        // A family is founded by its opener ALONE (CIRISPersist#955), so a new
-        // family's record names only this node's own person and never crosses
-        // the cohort arm: the sweep also lists the families this node's own
-        // identities are in. That widens only what this node CONSIDERS; who
-        // RECEIVES a record is the per-peer gate (CIRISEdge#758/#761, CC
-        // 5.4.6): persist's `may_receive_group_plane` — the group's members'
-        // nodes and its live invitees' nodes, or every peer for a public
-        // group. The invitee's node needs the record to admit the proposal and
-        // to fold the widening that follows (#736).
-        if let Some(own) = self.self_provider.as_ref() {
-            cohort.extend(own());
-        }
-        self.sweep_paged_gated(
-            EnvelopeKind::Family,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_families_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedFamily::resume_pair,
-            |s| {
-                s.family
-                    .family
-                    .members
-                    .iter()
-                    .any(|m| cohort.contains(&m.key_id))
-            },
-            |s| Self::ms_seq(s.family.family.founded_at),
-            |s| &s.family,
-            gate.map(|g| {
-                (g, |s: &ciris_persist::federation::ServedFamily| {
-                    GroupPlane::of_family(&s.family)
-                })
-            }),
-        )
-        .await
-    }
-
-    async fn list_communities(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
-        self.list_communities_gated(window, None).await
-    }
-
-    /// The Community plane's sweep — the twin of [`Self::list_families_gated`].
-    async fn list_communities_gated(
-        &self,
-        window: SweepWindow<'_>,
-        gate: Option<&mut GroupPlaneGate<'_>>,
-    ) -> Vec<EnvelopeRef> {
-        // CIRISEdge#523 — plane 2 of 3, and the one the ladder MEASURED: the
-        // recipient held 0 `federation_communities` rows for a room its owner
-        // is a member of. See [`Self::cohort_set_with_owners`].
-        let mut cohort = self.cohort_set_with_owners().await;
-        // persist v52.0.0 (CIRISPersist#955) — a room is founded by its opener
-        // ALONE and everyone else joins by accepting a proposal, so a new
-        // room's roster names only this node's own person: the sweep also
-        // lists the rooms this node's own identities are in. Who RECEIVES a
-        // record is the per-peer gate (CIRISEdge#758/#761, CC 5.4.6):
-        // persist's `may_receive_group_plane` — the room's members' nodes and
-        // its live invitees' nodes (the record travels with the invitation),
-        // or every peer for a public group.
-        if let Some(own) = self.self_provider.as_ref() {
-            cohort.extend(own());
-        }
-        self.sweep_paged_gated(
-            EnvelopeKind::Community,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_communities_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedCommunity::resume_pair,
-            |s| {
-                s.community
-                    .community
-                    .members
-                    .iter()
-                    .any(|m| cohort.contains(&m.key_id))
-            },
-            |s| Self::ms_seq(s.community.community.founded_at),
-            |s| &s.community,
-            gate.map(|g| {
-                (g, |s: &ciris_persist::federation::ServedCommunity| {
-                    GroupPlane::of_community(&s.community)
-                })
-            }),
-        )
-        .await
-    }
-
-    async fn list_family_membership_revocations(
-        &self,
-        window: SweepWindow<'_>,
-        gate: Option<&mut GroupPlaneGate<'_>>,
-    ) -> Vec<EnvelopeRef> {
-        // #311 tombstone fix — membership revocation projects `Global`
-        // (advertised whole, no cohort filter); per peer, the CIRISEdge#761
-        // membership-plane gate (`gate`) keeps a private group's revocation to
-        // its members', live invitees' and the removed member's nodes.
-        self.sweep_paged_gated(
-            EnvelopeKind::FamilyMembershipRevocation,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_family_membership_revocations_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedFamilyMembershipRevocation::resume_pair,
-            |_| true,
-            |s| Self::ms_seq(s.revocation.family_membership_revocation.removed_at),
-            |s| &s.revocation,
-            gate.map(|g| {
-                (
-                    g,
-                    |s: &ciris_persist::federation::ServedFamilyMembershipRevocation| {
-                        GroupPlane::of_family_revocation(&s.revocation)
-                    },
-                )
-            }),
-        )
-        .await
-    }
-
-    async fn list_community_membership_revocations(
-        &self,
-        window: SweepWindow<'_>,
-        gate: Option<&mut GroupPlaneGate<'_>>,
-    ) -> Vec<EnvelopeRef> {
-        // #311 tombstone fix — membership revocation projects `Global`
-        // (advertised whole, no cohort filter); per peer, the CIRISEdge#761
-        // membership-plane gate (`gate`) keeps a private group's revocation to
-        // its members', live invitees' and the removed member's nodes.
-        self.sweep_paged_gated(
-            EnvelopeKind::CommunityMembershipRevocation,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_community_membership_revocations_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedCommunityMembershipRevocation::resume_pair,
-            |_| true,
-            |s| Self::ms_seq(s.revocation.community_membership_revocation.removed_at),
-            |s| &s.revocation,
-            gate.map(|g| {
-                (
-                    g,
-                    |s: &ciris_persist::federation::ServedCommunityMembershipRevocation| {
-                        GroupPlane::of_community_revocation(&s.revocation)
-                    },
-                )
-            }),
-        )
-        .await
-    }
-
-    /// persist v48.0.0 (CIRISPersist#860) — the widening plane, swept exactly
-    /// like the revocation it mirrors: `Global` projection, resumed on the
-    /// three-part `(community, member, effective_at)` id, under the same
-    /// per-peer membership-plane gate (CIRISEdge#761).
-    async fn list_community_membership_widenings(
-        &self,
-        window: SweepWindow<'_>,
-        gate: Option<&mut GroupPlaneGate<'_>>,
-    ) -> Vec<EnvelopeRef> {
-        self.sweep_paged_gated(
-            EnvelopeKind::CommunityMembershipWidening,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_community_membership_widenings_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedCommunityMembershipWidening::resume_pair,
-            |_| true,
-            |s| Self::ms_seq(s.widening.community_membership_widening.effective_at),
-            |s| &s.widening,
-            gate.map(|g| {
-                (
-                    g,
-                    |s: &ciris_persist::federation::ServedCommunityMembershipWidening| {
-                        GroupPlane::of_community_widening(&s.widening)
-                    },
-                )
-            }),
-        )
-        .await
-    }
-
-    /// persist v49.0.0 (CIRISPersist#910) — the family widening plane, the
-    /// 18th kind: the community widening's family twin, swept the same way.
-    async fn list_family_membership_widenings(
-        &self,
-        window: SweepWindow<'_>,
-        gate: Option<&mut GroupPlaneGate<'_>>,
-    ) -> Vec<EnvelopeRef> {
-        self.sweep_paged_gated(
-            EnvelopeKind::FamilyMembershipWidening,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_family_membership_widenings_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedFamilyMembershipWidening::resume_pair,
-            |_| true,
-            |s| Self::ms_seq(s.widening.family_membership_widening.effective_at),
-            |s| &s.widening,
-            gate.map(|g| {
-                (
-                    g,
-                    |s: &ciris_persist::federation::ServedFamilyMembershipWidening| {
-                        GroupPlane::of_family_widening(&s.widening)
-                    },
-                )
-            }),
-        )
-        .await
-    }
-
-    /// persist v49.0.0 (CIRISPersist#912) — the `listed` membership listing
-    /// plane, the 19th kind: a member's OWN disclosure (signer binding
-    /// `SelfOwn` on persist's side). It travels exactly as far as the room's
-    /// widening and revocation rows and no further (a listing row — even a
-    /// cleared or pre-join one — reveals that its signer is in the room), so
-    /// it rides the membership planes' projection and per-peer gate
-    /// (CIRISEdge#761: gated by default, pending CC on what `listed` means);
-    /// `listed_members` is the host-gated OUTPUT of the fold, not the rows'
-    /// wire reach.
-    async fn list_community_membership_listings(
-        &self,
-        window: SweepWindow<'_>,
-        gate: Option<&mut GroupPlaneGate<'_>>,
-    ) -> Vec<EnvelopeRef> {
-        self.sweep_paged_gated(
-            EnvelopeKind::CommunityMembershipListing,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_community_membership_listings_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedCommunityMembershipListing::resume_pair,
-            |_| true,
-            |s| Self::ms_seq(s.listing.community_membership_listing.effective_at),
-            |s| &s.listing,
-            gate.map(|g| {
-                (
-                    g,
-                    |s: &ciris_persist::federation::ServedCommunityMembershipListing| {
-                        GroupPlane::of_community_listing(&s.listing)
-                    },
-                )
-            }),
-        )
-        .await
-    }
-
     async fn list_location_proofs(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // CIRISEdge#523 — plane 3 of 3. A LocationProof's `subject_key_id` is
         // whoever the proof is ABOUT, which for a person's presence claim is a
@@ -10657,28 +9991,6 @@ impl FederationDirectoryReplicationBridge {
         )
         .await
     }
-
-    // ── v2 operational-data list_* ─────────────────────────────────
-    //
-    // v2 operational kinds enumerate via persist's
-    // `list_organizations_since` / `list_org_memberships_since` /
-    // `list_signed_partner_records_since` (cursor + limit; CIRISPersist
-    // v5.1.0 shipped the first two and v5.2.0 / #194 shipped the third
-    // explicitly "for CIRISEdge#65 v2 bidirectional partner_record"
-    // — closes the v2.0.0 admit-only carve-out). Each row's wire
-    // `envelope_hash` is `sha256(JCS(Signed*Record))` per FSD §3.2.2 —
-    // JCS-conformant, edge-defined, reproducible by any non-persist
-    // CEG implementer (the §3.2.1 deferred-interop fix).
-    //
-    // The page limit is operator-tunable via [`BridgeConfig::operational_page_limit`];
-    // default `u32::MAX` covers federations whose operational rosters
-    // (orgs × memberships × licenses) fit in a single page.
-    //
-    // Skipping with `continue` on a row whose JCS hash can't be computed
-    // is safe: the row exists in persist but won't be advertised on the
-    // wire this round; the next round retries. Logging that skip is a
-    // v2.0.x follow-up (matches the v1 trust-kinds' silent-skip on
-    // decode_hash failure).
 }
 
 // ─── apply_envelope_bytes — per-kind dispatch ───────────────────────
@@ -10761,13 +10073,21 @@ impl FederationDirectoryReplicationBridge {
                     | ReplicatedAttestationOutcome::Deduplicated => ApplyOutcome::Duplicate,
                     // The row was refused at the attestation plane. Say so with
                     // persist's reason.
+                    // persist v61 — with persist's retry disposition, as the
+                    // general door books it: a terminal reason (or
+                    // `not_in_audience`) is not re-asked every round.
                     ReplicatedAttestationOutcome::Refused { reason } => {
-                        ApplyOutcome::refused(format!(
-                            "key_grant: row refused at the attestation plane ({reason:?}) \
+                        let why = format!(
+                            "key_grant: row refused at the attestation plane ({}) \
                              — attestation_id={attestation_id} type={attestation_type} \
                              sealer={minter}; projected={}",
+                            reason.as_str(),
                             admission.projected
-                        ))
+                        );
+                        match attestation_refusal_retry(reason) {
+                            RetryDisposition::Terminal => ApplyOutcome::refused_terminal(why),
+                            RetryDisposition::Transient => ApplyOutcome::refused(why),
+                        }
                     }
                 }
             }
@@ -11015,179 +10335,9 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    // ── CIRISEdge#394 (E4 lockstep verdict) — edge is PASS-THROUGH on the
-    // five authority-signed declaration planes ──────────────────────────
-    //
-    // Family / Community / FamilyMembershipRevocation /
-    // CommunityMembershipRevocation / LocationProof carry an authority
-    // signature persist v21.0.0+ (CIRISPersist#502 E4) verifies FAIL-CLOSED
-    // at admission (hybrid Ed25519 + bound-form ML-DSA-65,
-    // `HybridPolicy::Strict`, over
-    // `ceg_produce_canonicalize(record.signing_envelope())`, against the
-    // authority's REGISTERED pubkeys — `verify_family_admission` et al.).
-    // Edge PRODUCES none of these records: no constructor of the five
-    // `Signed*` wrappers exists anywhere in edge, and the pyo3
-    // `apply_envelope` surface hands over PRE-SIGNED bytes from the rider.
-    // So edge's lockstep duty is byte-transparency, not signing:
-    //
-    //   * RECEIVE (the `apply_*` below): typed deserialize → persist
-    //     `put_*`. The three wrapper fields (`authority_key_id`,
-    //     `scrub_signature_classical`, `scrub_signature_pqc`) flow through
-    //     the typed struct unmodified; persist's gate is the admission
-    //     oracle.
-    //   * SERVE (`list_*` + `fetch_envelope_bytes`): served bytes come from
-    //     persist's `signed_wire_index` — persist's OWN serialization of the
-    //     stored row, never re-signed or re-shaped by edge.
-    //
-    // Pinned by `e4_*_forward_path_preserves_authority_signature` (the five
-    // positive round trips, re-admission on a second node as the oracle) and
-    // `e4_unsigned_declarations_refuse_at_admission` (the fail-closed half)
-    // in the tests module below.
-    async fn apply_family(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(self, "Family", bytes, SignedFamily, put_family)
-    }
-
-    /// persist v38.2.0 / CIRISPersist#758 (CIRISEdge#522) — the Community door
-    /// stopped being an insert and became a **verdict**, so this plane leaves
-    /// [`apply_signed_plane!`] behind.
-    ///
-    /// Three outcomes now, where the macro could only express two:
-    ///
-    /// - **fresh row → `Admitted`.** Unchanged.
-    /// - **identical re-put → `Duplicate`.** Convergent derivation (a pair
-    ///   chat mints one deterministic community per pair) means two nodes
-    ///   author BYTE-IDENTICAL content and each signs as itself, so a
-    ///   re-offered copy is the COMMON case, not an anomaly. persist answers
-    ///   `Unchanged` and leaves the stored row and its first-accepted authority
-    ///   signature untouched. The macro would have called that `Admitted` —
-    ///   claiming anti-entropy progress on every round that re-offers a
-    ///   community this node already holds, which is the "applied all N" /
-    ///   "nothing moved" collapse #457 exists to prevent.
-    /// - **differing roster under an occupied id → `Refused`, named.**
-    ///   persist returns the TYPED refusal `ConflictingRecord` (v50; the
-    ///   [`Error::Conflict`](ciris_persist::federation::Error::Conflict) before
-    ///   it); edge books it as [`ApplyRefusalClass::CommunityRosterFork`]. It is not
-    ///   retryable (retrying spins) and must not be dropped (dropping hides a
-    ///   fork). Roster CHANGES travel as supersedes, never as a differing
-    ///   re-put, so this can only mean two authorities disagree about one id.
-    ///
-    /// # The replicated door (persist v50.0.0, CIRISPersist#925/#931)
-    ///
-    /// A record received from a peer goes through
-    /// `apply_replicated_community`, never the local `put_community` door:
-    /// v50 made the local door run the full CC 3.2 infrastructure gate
-    /// whoever signed, which would refuse a legacy non-conformant record the
-    /// federation already carries. The replicated door admits it as DATA (the
-    /// fold's gates still apply) and routes an occupied id with a supersede
-    /// proof through the amendment checks. Locally authored communities keep
-    /// `put_community`; the Family plane stays on `put_family`.
-    ///
-    /// Its outcome is TYPED, decided under the write's own serialization
-    /// (persist PR #921 review F3), so the pre-read edge used to label
-    /// `Admitted` vs `Duplicate` is gone — it raced a concurrent apply of the
-    /// same record, and the answer now comes from the one party that knows:
-    ///
-    /// - `Inserted` / `Superseded` → `Admitted`.
-    /// - `Unchanged` → `Duplicate`.
-    /// - `Refused { ConflictingRecord }` → [`ApplyRefusalClass::CommunityRosterFork`]
-    ///   (a differing record with no proof, or a proof over a version this
-    ///   node does not hold — the fork signal, as before).
-    /// - `Refused { DegradesConformance }` → the same class: a supersede that
-    ///   would replace a CONFORMANT infrastructure record with a
-    ///   non-conformant one is two authorities disagreeing about one id, and
-    ///   nothing about it changes by waiting.
-    async fn apply_community(&self, bytes: &[u8]) -> ApplyOutcome {
-        use ciris_persist::federation::{ReplicatedCommunityOutcome, ReplicatedCommunityRefusal};
-
-        let record: SignedCommunity = match serde_json::from_slice(bytes) {
-            Ok(r) => r,
-            Err(e) => return ApplyOutcome::Deserialize(apply_deser_reason("Community", bytes, &e)),
-        };
-        let content_hash =
-            content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
-        let community_key_id = record.community.community_key_id.clone();
-        match self.directory.apply_replicated_community(record).await {
-            Ok(ReplicatedCommunityOutcome::Inserted | ReplicatedCommunityOutcome::Superseded) => {
-                ApplyOutcome::Admitted
-            }
-            Ok(ReplicatedCommunityOutcome::Unchanged) => ApplyOutcome::Duplicate,
-            Ok(ReplicatedCommunityOutcome::Refused { reason }) => {
-                let why = match reason {
-                    ReplicatedCommunityRefusal::ConflictingRecord => "conflicting_record",
-                    ReplicatedCommunityRefusal::DegradesConformance => "degrades_conformance",
-                };
-                let err = ciris_persist::federation::Error::Conflict(format!(
-                    "replicated community {community_key_id} refused: {why}"
-                ));
-                self.refuse_as(
-                    "Community",
-                    &content_hash,
-                    &err,
-                    ApplyRefusalClass::CommunityRosterFork,
-                )
-            }
-            // A hard error from the door (the typed refusals are `Ok`). A
-            // `Conflict` here is still the fork signal on this plane.
-            Err(e @ ciris_persist::federation::Error::Conflict(_)) => self.refuse_as(
-                "Community",
-                &content_hash,
-                &e,
-                ApplyRefusalClass::CommunityRosterFork,
-            ),
-            Err(e) => self.refuse("Community", &content_hash, &e),
-        }
-    }
-
-    async fn apply_family_membership_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(
-            self,
-            "FamilyMembershipRevocation",
-            bytes,
-            SignedFamilyMembershipRevocation,
-            put_family_membership_revocation
-        )
-    }
-
-    async fn apply_community_membership_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(
-            self,
-            "CommunityMembershipRevocation",
-            bytes,
-            SignedCommunityMembershipRevocation,
-            put_community_membership_revocation
-        )
-    }
-
-    async fn apply_community_membership_widening(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(
-            self,
-            "CommunityMembershipWidening",
-            bytes,
-            SignedCommunityMembershipWidening,
-            put_community_membership_widening
-        )
-    }
-
-    async fn apply_family_membership_widening(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(
-            self,
-            "FamilyMembershipWidening",
-            bytes,
-            SignedFamilyMembershipWidening,
-            put_family_membership_widening
-        )
-    }
-
-    async fn apply_community_membership_listing(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(
-            self,
-            "CommunityMembershipListing",
-            bytes,
-            SignedCommunityMembershipListing,
-            put_community_membership_listing
-        )
-    }
-
+    /// CIRISEdge#394 (E4) — pass-through: persist verifies the authority's
+    /// hybrid signature fail-closed at `put_location_proof`; edge hands over the
+    /// typed record unmodified.
     async fn apply_location_proof(&self, bytes: &[u8]) -> ApplyOutcome {
         apply_signed_plane!(
             self,
@@ -11531,6 +10681,10 @@ pub(crate) mod tests {
         algorithm, device_class, identity_type, Attestation, Community, CommunityMember,
         CommunityMembershipRevocation, Family, FamilyMember, FamilyMembershipRevocation, KeyRecord,
         LocationProof, Revocation, SignedAttestation, SignedKeyRecord,
+    };
+    use ciris_persist::federation::types::{
+        SignedCommunity, SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening,
+        SignedFamily, SignedFamilyMembershipRevocation, SignedFamilyMembershipWidening,
     };
     use ciris_persist::store::SqliteBackend;
     use sha2::{Digest as _, Sha256};
@@ -13030,7 +12184,8 @@ pub(crate) mod tests {
                 R::ConflictingAttestation
                 | R::StoreConflict
                 | R::KeyPlaneRefused
-                | R::SelfRosterPending => {
+                | R::SelfRosterPending
+                | R::GroupPlaneRefused => {
                     let ApplyOutcome::Refused {
                         reason: msg, retry, ..
                     } = &outcome
@@ -13055,6 +12210,45 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// persist v61 S2 (CIRISPersist#1148) — `not_in_audience` is retryable by
+    /// persist's predicate, and edge books it TERMINAL so the per-(peer, row)
+    /// refusal backoff re-asks on its terminal schedule, never every round.
+    /// Every other token keeps persist's disposition.
+    #[test]
+    fn not_in_audience_is_terminal_whatever_persist_says() {
+        assert_eq!(
+            attestation_refusal_retry_of(ATTESTATION_NOT_IN_AUDIENCE, true),
+            RetryDisposition::Terminal
+        );
+        assert_eq!(
+            attestation_refusal_retry_of(ATTESTATION_NOT_IN_AUDIENCE, false),
+            RetryDisposition::Terminal
+        );
+        assert_eq!(
+            attestation_refusal_retry_of("store_conflict", true),
+            RetryDisposition::Transient
+        );
+        assert_eq!(
+            attestation_refusal_retry_of("group_plane_refused", false),
+            RetryDisposition::Terminal
+        );
+        // The ledger books a terminal refusal on the slow schedule, not every
+        // round: a terminal Refused is suppressed after its first sighting.
+        let backoff = RefusalBackoff::new();
+        let t0 = std::time::Instant::now();
+        let window = backoff.record_at(
+            EnvelopeKind::Attestation,
+            [7u8; 32],
+            RetryDisposition::Terminal,
+            t0,
+        );
+        assert!(window > RetryDisposition::Transient.window(1));
+        assert!(
+            backoff.suppressed_at(EnvelopeKind::Attestation, &[7u8; 32], t0 + window / 2),
+            "a terminal refusal is not re-asked inside its window"
+        );
     }
 
     /// CIRISEdge#459 — the wire drive: a same-`attestation_id` row carrying
@@ -13880,21 +13074,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Hybrid-sign a [`CommunityMembershipListing`] — signed by the MEMBER it
-    /// names (persist's `SelfOwn` binding: only the member lists themself).
-    fn sign_community_membership_listing_fixture(
-        listing: ciris_persist::federation::CommunityMembershipListing,
-    ) -> SignedCommunityMembershipListing {
-        let member = listing.member_key_id.clone();
-        let (_h, classical, pqc) = sign_attestation_envelope(&member, &listing.signing_envelope());
-        SignedCommunityMembershipListing {
-            community_membership_listing: listing,
-            authority_key_id: member,
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
-        }
-    }
-
     /// Hybrid-sign a [`LocationProof`] — mirrors [`sign_family_fixture`].
     fn sign_location_proof_fixture(
         authority_key_id: &str,
@@ -14065,6 +13244,22 @@ pub(crate) mod tests {
         // persist v52.0.0 (#955) — a widening admits only on the member's
         // acceptance, on each node that judges it.
         seed_consent_for_widening(&*backend_a, kind, &wire).await;
+        if kind.is_retired_plane() {
+            pin_group_row_forward_path(
+                kind,
+                &cohort,
+                registered_keys,
+                communities,
+                families,
+                (&backend_a, &bridge_a),
+                &wire,
+                signed,
+                &wrapper_fields_of,
+                &signing_envelope_of,
+            )
+            .await;
+            return;
+        }
         let outcome = bridge_a.apply_envelope_bytes(kind, &wire, None).await;
         assert!(
             outcome.is_admitted(),
@@ -14128,6 +13323,266 @@ pub(crate) mod tests {
             outcome_b.is_admitted(),
             "node B must re-admit the {kind:?} bytes node A served; got {outcome_b:?}"
         );
+    }
+
+    /// persist v61 (CIRISPersist#991) — the group-plane kinds' E4 forward
+    /// path, as ROWS. The framed object is refused by name on its retired
+    /// plane (`federation_envelope_kind_retired`, terminal); the same object
+    /// put through node A's local door is minted into its `group:roster:v1` /
+    /// `membership:*:v1` row, which A advertises and serves on the Attestation
+    /// plane hash-integral, carrying the object with its authority signature
+    /// byte-identical; node B re-admits the served row through the
+    /// replicated-attestation door (the lockstep property), and a re-offer is
+    /// a `Duplicate`.
+    #[allow(clippy::too_many_arguments)]
+    async fn pin_group_row_forward_path<T>(
+        kind: EnvelopeKind,
+        cohort: &[String],
+        registered_keys: &[(&str, &str)],
+        communities: &[SignedCommunity],
+        families: &[SignedFamily],
+        (backend_a, bridge_a): (&Arc<SqliteBackend>, &FederationDirectoryReplicationBridge),
+        wire: &[u8],
+        signed: &T,
+        wrapper_fields_of: &impl Fn(&T) -> (String, String, Option<String>),
+        signing_envelope_of: &impl Fn(&T) -> serde_json::Value,
+    ) where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        use ciris_persist::federation::group_plane::group_signed_of_row;
+        // 1. The framed object is refused on its retired plane, terminal.
+        match bridge_a.apply_envelope_bytes(kind, wire, None).await {
+            ApplyOutcome::Refused { reason, retry, .. } => {
+                assert!(
+                    reason.contains(
+                        ciris_persist::federation::replication_policy::ENVELOPE_KIND_RETIRED
+                    ),
+                    "{kind:?}: refused under the retired token: {reason}"
+                );
+                assert_eq!(retry, RetryDisposition::Terminal, "{kind:?}");
+            }
+            other => panic!("{kind:?}: a framed object must be refused, got {other:?}"),
+        }
+        assert!(bridge_a.list_envelope_refs(kind).await.is_empty());
+
+        // 2. The local door mints the row; A serves it on the Attestation plane.
+        put_group_object_locally(&**backend_a, kind, wire).await;
+        let family = group_row_family(kind);
+        let served = served_group_rows(bridge_a, family).await;
+        assert_eq!(served.len(), 1, "exactly one {family:?} row for {kind:?}");
+        let (hash, bytes) = &served[0];
+        let served_hash: [u8; 32] = Sha256::digest(bytes).into();
+        assert_eq!(&served_hash, hash, "served bytes hash back to the ref");
+        let row: Attestation = serde_json::from_slice(bytes).expect("a row");
+        let object = group_signed_of_row(&row)
+            .expect("a well-formed group row")
+            .expect("the row carries its object")
+            .object()
+            .expect("object");
+        // The row's object leaves the record's recomputed `persist_row_hash`
+        // out (persist `GroupSigned::object`); put it back empty to decode.
+        let mut object = object;
+        if let Some(inner) = object
+            .as_object_mut()
+            .and_then(|o| o.values_mut().find(|v| v.is_object()))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            inner
+                .entry("persist_row_hash")
+                .or_insert_with(|| serde_json::Value::String(String::new()));
+        }
+        let decoded: T = serde_json::from_value(object).expect("the carried object decodes");
+        assert_eq!(
+            wrapper_fields_of(&decoded),
+            wrapper_fields_of(signed),
+            "authority_key_id + scrub signatures survive byte-identical in the row"
+        );
+        assert_eq!(signing_envelope_of(&decoded), signing_envelope_of(signed));
+
+        // 3. Node B re-admits the served row on the Attestation plane.
+        let (backend_b, bridge_b) = make_bridge(cohort);
+        register_fixture_keys(&backend_b, registered_keys).await;
+        for c in communities {
+            backend_b.put_community(c.clone()).await.expect("seed room");
+        }
+        for f in families {
+            backend_b.put_family(f.clone()).await.expect("seed family");
+        }
+        seed_consent_for_widening(&*backend_b, kind, wire).await;
+        let outcome_b = bridge_b
+            .apply_envelope_bytes(EnvelopeKind::Attestation, bytes, None)
+            .await;
+        assert!(
+            outcome_b.is_admitted(),
+            "node B admits the {family:?} row node A served; got {outcome_b:?}"
+        );
+        assert_eq!(
+            bridge_b
+                .apply_envelope_bytes(EnvelopeKind::Attestation, bytes, None)
+                .await,
+            ApplyOutcome::Duplicate,
+            "a re-offered group row is a Duplicate"
+        );
+    }
+
+    /// The group-plane row family a retired framed kind's object mints.
+    fn group_row_family(
+        kind: EnvelopeKind,
+    ) -> ciris_persist::federation::group_plane::GroupPlaneFamily {
+        use ciris_persist::federation::group_plane::GroupPlaneFamily as F;
+        match kind {
+            EnvelopeKind::Family | EnvelopeKind::Community => F::Roster,
+            EnvelopeKind::FamilyMembershipWidening | EnvelopeKind::CommunityMembershipWidening => {
+                F::Widening
+            }
+            EnvelopeKind::FamilyMembershipRevocation
+            | EnvelopeKind::CommunityMembershipRevocation => F::Removal,
+            other => panic!("{other:?} mints no group-plane row"),
+        }
+    }
+
+    /// Put a framed group object through the LOCAL door of its kind.
+    async fn put_group_object_locally(
+        dir: &dyn FederationDirectory,
+        kind: EnvelopeKind,
+        wire: &[u8],
+    ) {
+        let r = match kind {
+            EnvelopeKind::Family => dir.put_family(serde_json::from_slice(wire).unwrap()).await,
+            EnvelopeKind::Community => {
+                dir.put_community(serde_json::from_slice(wire).unwrap())
+                    .await
+            }
+            EnvelopeKind::FamilyMembershipRevocation => {
+                dir.put_family_membership_revocation(serde_json::from_slice(wire).unwrap())
+                    .await
+            }
+            EnvelopeKind::CommunityMembershipRevocation => {
+                dir.put_community_membership_revocation(serde_json::from_slice(wire).unwrap())
+                    .await
+            }
+            EnvelopeKind::CommunityMembershipWidening => {
+                dir.put_community_membership_widening(serde_json::from_slice(wire).unwrap())
+                    .await
+            }
+            EnvelopeKind::FamilyMembershipWidening => {
+                dir.put_family_membership_widening(serde_json::from_slice(wire).unwrap())
+                    .await
+            }
+            other => panic!("{other:?} has no local group door"),
+        };
+        r.unwrap_or_else(|e| panic!("{kind:?}: the local door admits the object: {e}"));
+    }
+
+    /// Every Attestation-plane row of `family` `bridge` advertises, fetched:
+    /// `(advertised hash, served bytes)`.
+    async fn served_group_rows(
+        bridge: &FederationDirectoryReplicationBridge,
+        family: ciris_persist::federation::group_plane::GroupPlaneFamily,
+    ) -> Vec<([u8; 32], Vec<u8>)> {
+        use ciris_persist::federation::group_plane::GroupPlaneFamily;
+        let mut out = Vec::new();
+        for r in bridge.list_envelope_refs(EnvelopeKind::Attestation).await {
+            let bytes = bridge
+                .fetch_envelope_bytes(EnvelopeKind::Attestation, &r.envelope_hash)
+                .await
+                .expect("an advertised row is fetchable");
+            let Ok(row) = serde_json::from_slice::<Attestation>(&bytes) else {
+                continue;
+            };
+            if GroupPlaneFamily::of_row(&row) == Some(family) {
+                out.push((r.envelope_hash, bytes));
+            }
+        }
+        out
+    }
+
+    /// persist v61 (CIRISPersist#991) — the A/V roster
+    /// (`transport::av_call::RoomRoster`, persist's
+    /// `is_active_community_member`) resolves on a node that received the room
+    /// ONLY as rows: the `group:roster:v1` record and the
+    /// `membership:widening:v1` event carried A → B on the Attestation plane
+    /// and applied through the replicated-attestation door land in the
+    /// projection the roster reads. Before the rows arrive B knows no member.
+    #[tokio::test]
+    async fn the_av_roster_resolves_from_group_rows_on_the_attestation_plane() {
+        use crate::transport::av_call::RoomRoster as _;
+        use ciris_persist::federation::group_plane::GroupPlaneFamily;
+        let keys = [
+            ("e4-authority", identity_type::USER),
+            ("e4-community", identity_type::AGENT),
+            ("e4-member", identity_type::USER),
+            ("e4-newcomer", identity_type::USER),
+        ];
+        let room = sign_community_fixture(
+            "e4-authority",
+            fixture_community_founded("e4-community", "e4-authority", "e4-member"),
+        );
+        let widening = sign_community_membership_widening_fixture(
+            "e4-authority",
+            ciris_persist::federation::CommunityMembershipWidening {
+                community_key_id: "e4-community".to_string(),
+                member_key_id: "e4-newcomer".to_string(),
+                joined_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                effective_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        let widening_wire = serde_json::to_vec(&widening).expect("wire");
+
+        let (backend_a, bridge_a) = make_bridge(&[]);
+        register_fixture_keys(&backend_a, &keys).await;
+        backend_a
+            .put_community(room)
+            .await
+            .expect("A founds the room");
+        seed_consent_for_widening(
+            &*backend_a,
+            EnvelopeKind::CommunityMembershipWidening,
+            &widening_wire,
+        )
+        .await;
+        backend_a
+            .put_community_membership_widening(widening)
+            .await
+            .expect("A widens the newcomer in");
+
+        let (backend_b, bridge_b) = make_bridge(&[]);
+        register_fixture_keys(&backend_b, &keys).await;
+        seed_consent_for_widening(
+            &*backend_b,
+            EnvelopeKind::CommunityMembershipWidening,
+            &widening_wire,
+        )
+        .await;
+        for who in ["e4-member", "e4-newcomer"] {
+            assert!(
+                !backend_b
+                    .is_active_member("e4-community", who)
+                    .await
+                    .unwrap_or(false),
+                "{who}: B holds no roster before the rows arrive"
+            );
+        }
+
+        for family in [GroupPlaneFamily::Roster, GroupPlaneFamily::Widening] {
+            let rows = served_group_rows(&bridge_a, family).await;
+            assert_eq!(rows.len(), 1, "one {family:?} row");
+            let outcome = bridge_b
+                .apply_envelope_bytes(EnvelopeKind::Attestation, &rows[0].1, None)
+                .await;
+            assert!(outcome.is_admitted(), "{family:?}: {outcome:?}");
+        }
+        for who in ["e4-authority", "e4-member", "e4-newcomer"] {
+            assert!(
+                backend_b
+                    .is_active_member("e4-community", who)
+                    .await
+                    .expect("roster read"),
+                "{who}: the A/V roster reads the member from the rows' projection"
+            );
+        }
     }
 
     #[tokio::test]
@@ -14348,178 +13803,6 @@ pub(crate) mod tests {
             "{terminal}"
         );
         assert!(terminal.contains("TERMINAL"), "{terminal}");
-    }
-
-    /// persist v50.0.0 (CIRISPersist#931) — a Community record received from a
-    /// peer goes through the REPLICATED door. A legacy `founder_only`
-    /// infrastructure record (non-conformant under CC 3.2, which wants a
-    /// quorum protocol) is refused by the LOCAL door whoever signed it; the
-    /// federation already carries such records, so the replicated apply must
-    /// admit it as DATA — `Admitted`, then `Duplicate` on the re-offer. Through
-    /// `put_community` (the pre-v50 wiring) this row would be refused on every
-    /// round.
-    #[tokio::test]
-    async fn a_replicated_legacy_infrastructure_community_is_admitted_as_data() {
-        use ciris_persist::federation::FederationDirectory;
-
-        let cohort = vec!["legacy-human".to_string()];
-        let (backend, bridge) = make_bridge(&cohort);
-        register_fixture_keys(&backend, &[("legacy-human", identity_type::USER)]).await;
-        let legacy = sign_community_fixture(
-            "legacy-human",
-            Community {
-                community_key_id: "legacy-infra-room".to_string(),
-                community_name: "trust root".to_string(),
-                members: vec![CommunityMember {
-                    key_id: "legacy-human".to_string(),
-                    joined_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
-                    role: Some(
-                        ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_string(),
-                    ),
-                }],
-                founded_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
-                consensus_protocol: "founder_only".to_string(),
-                policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
-                persist_row_hash: String::new(),
-                prev_head_digest: String::new(),
-                charter_digest: String::new(),
-            },
-        );
-        backend
-            .put_community(legacy.clone())
-            .await
-            .expect_err("precondition: the LOCAL door judges a legacy record and refuses it");
-        let wire = serde_json::to_vec(&legacy).expect("signed community serializes");
-        assert_eq!(
-            bridge
-                .apply_envelope_bytes(EnvelopeKind::Community, &wire, None)
-                .await,
-            ApplyOutcome::Admitted,
-            "the replicated door admits a legacy record as data",
-        );
-        assert_eq!(
-            bridge
-                .apply_envelope_bytes(EnvelopeKind::Community, &wire, None)
-                .await,
-            ApplyOutcome::Duplicate,
-            "an identical re-offer is Unchanged at persist, Duplicate here",
-        );
-        assert!(backend
-            .lookup_community("legacy-infra-room")
-            .await
-            .expect("lookup")
-            .is_some());
-    }
-
-    /// persist#758 (CIRISEdge#522 item 1) — the Community door's THREE
-    /// verdicts, driven through edge's real apply path on all three arms.
-    ///
-    /// The convergent re-put is the one that would have been silently wrong:
-    /// before v38.2.0 the memory backend OVERWROTE the stored row (and its
-    /// first-accepted authority signature) on a re-put, and edge's macro
-    /// reported `Admitted` either way — anti-entropy progress claimed on every
-    /// round that re-offers a community this node already holds.
-    #[tokio::test]
-    async fn the_community_door_verdicts_are_duplicate_and_named_fork() {
-        let cohort = vec!["fork-member".to_string()];
-        let (backend, bridge, metrics) = make_metered_bridge(&cohort);
-        register_fixture_keys(
-            &backend,
-            &[
-                ("fork-authority", identity_type::AGENT),
-                ("fork-community", identity_type::AGENT),
-                // CC 3.2 steward-binding: a non-infra community member must
-                // root in an accountable human — a `user` self-anchors.
-                ("fork-member", identity_type::USER),
-            ],
-        )
-        .await;
-
-        let signed = sign_community_fixture(
-            "fork-authority",
-            fixture_community("fork-community", "fork-member"),
-        );
-        let wire = serde_json::to_vec(&signed).expect("signed community serializes");
-
-        // 1. Fresh row — real progress.
-        assert_eq!(
-            bridge
-                .apply_envelope_bytes(EnvelopeKind::Community, &wire, None)
-                .await,
-            ApplyOutcome::Admitted,
-        );
-
-        // 2. The SAME bytes again — persist#758's idempotent `Ok` no-op. Not
-        //    progress, and not a refusal either: a duplicate.
-        assert_eq!(
-            bridge
-                .apply_envelope_bytes(EnvelopeKind::Community, &wire, None)
-                .await,
-            ApplyOutcome::Duplicate,
-            "a convergent re-put is an idempotent no-op, not fresh state",
-        );
-
-        // 3. DIFFERING content under the occupied id — the fork.
-        let mut forked = fixture_community("fork-community", "fork-member");
-        forked.community_name = "A DIFFERENT CO-OP".to_string();
-        let forked_wire = serde_json::to_vec(&sign_community_fixture("fork-authority", forked))
-            .expect("forked community serializes");
-        let outcome = bridge
-            .apply_envelope_bytes(EnvelopeKind::Community, &forked_wire, None)
-            .await;
-        let ApplyOutcome::Refused { reason: msg, .. } = &outcome else {
-            panic!("a differing roster under an occupied id must be REFUSED, got {outcome:?}");
-        };
-        assert!(
-            msg.contains(ApplyRefusalClass::CommunityRosterFork.as_str()),
-            "the fork must be NAMED, not just refused: {msg}",
-        );
-        assert!(
-            msg.contains("TERMINAL"),
-            "an apply loop must not read a fork as retryable: {msg}",
-        );
-
-        // ...and it is COUNTED. A fork nobody can see from a scrape is the
-        // log-and-drop failure #522 names.
-        let snap = metrics.snapshot();
-        assert_eq!(
-            snap.apply_refusals_by_class
-                .get(ApplyRefusalClass::CommunityRosterFork.as_str())
-                .copied(),
-            Some(1),
-            "the class axis books the fork once: {:?}",
-            snap.apply_refusals_by_class,
-        );
-        assert_eq!(
-            snap.apply_refusals_by_kind
-                .get(&EnvelopeKind::Community)
-                .copied(),
-            Some(1),
-            "and the kind axis still books it at the #425 choke",
-        );
-        // The DUPLICATE is not a refusal on either axis (#457's distinct
-        // states): it books as a duplicate and nothing else.
-        assert_eq!(
-            snap.replication_duplicate_total
-                .get(&EnvelopeKind::Community)
-                .copied(),
-            Some(1),
-        );
-        assert_eq!(
-            snap.replication_applied_total
-                .get(&EnvelopeKind::Community)
-                .copied(),
-            Some(1),
-            "exactly ONE apply changed state across three offers",
-        );
-
-        // The stored row is the FIRST one — the fork did not overwrite it.
-        let stored = backend
-            .lookup_community("fork-community")
-            .await
-            .expect("lookup")
-            .expect("the community is stored");
-        assert_eq!(stored.community_name, "E4 Pin Co-op");
     }
 
     /// persist#757 (CIRISEdge#522 item 2) — AV-45 at the PUT door, including
@@ -14807,45 +14090,6 @@ pub(crate) mod tests {
                 )
             },
             |s| s.family_membership_widening.signing_envelope(),
-        )
-        .await;
-    }
-
-    /// #912 — the listing plane's E4 forward path (the 19th kind): the row is
-    /// signed by the member it names and survives the wire byte-for-byte.
-    #[tokio::test]
-    async fn e4_community_membership_listing_forward_path_preserves_member_signature() {
-        let signed = sign_community_membership_listing_fixture(
-            ciris_persist::federation::CommunityMembershipListing {
-                community_key_id: "e4-community".to_string(),
-                member_key_id: "e4-member".to_string(),
-                effective_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
-                listed: Some("public".to_string()),
-                persist_row_hash: String::new(),
-            },
-        );
-        pin_e4_forward_path(
-            EnvelopeKind::CommunityMembershipListing,
-            &[],
-            &[
-                ("e4-authority", identity_type::AGENT),
-                ("e4-member", identity_type::USER),
-            ],
-            &[sign_community_fixture(
-                "e4-authority",
-                fixture_community("e4-community", "e4-member"),
-            )],
-            &[],
-            &[],
-            &signed,
-            |s: &SignedCommunityMembershipListing| {
-                (
-                    s.authority_key_id.clone(),
-                    s.scrub_signature_classical.clone(),
-                    s.scrub_signature_pqc.clone(),
-                )
-            },
-            |s| s.community_membership_listing.signing_envelope(),
         )
         .await;
     }
@@ -18277,11 +17521,39 @@ pub(crate) mod tests {
     async fn an_operational_kind_is_refused_as_retired_v60() {
         let (_backend, bridge) = make_bridge(&["k1".into()]);
         let bytes = br#"{"organization": {"org_id": "org-acme", "attesting_key_id": "k1"}}"#;
-        for kind in [
-            EnvelopeKind::Organization,
-            EnvelopeKind::OrgMembership,
-            EnvelopeKind::PartnerRecord,
-        ] {
+        // persist v61 (CIRISPersist#991) — every retired plane, the six
+        // group-plane kinds, the member listing and the framed KeyGrant with
+        // the operational trio: refused by persist's token, terminal, and the
+        // kind's own detail is booked on the retired ledger.
+        let retired: Vec<EnvelopeKind> = EnvelopeKind::ALL
+            .into_iter()
+            .filter(|k| k.is_retired_plane())
+            .collect();
+        assert_eq!(
+            retired,
+            vec![
+                EnvelopeKind::Family,
+                EnvelopeKind::Community,
+                EnvelopeKind::FamilyMembershipRevocation,
+                EnvelopeKind::CommunityMembershipRevocation,
+                EnvelopeKind::Organization,
+                EnvelopeKind::OrgMembership,
+                EnvelopeKind::PartnerRecord,
+                EnvelopeKind::KeyGrant,
+                EnvelopeKind::CommunityMembershipWidening,
+                EnvelopeKind::FamilyMembershipWidening,
+                EnvelopeKind::CommunityMembershipListing,
+            ]
+        );
+        for kind in retired {
+            assert!(
+                bridge.list_envelope_refs(kind).await.is_empty(),
+                "{kind:?}: nothing advertised on a retired plane"
+            );
+            assert!(
+                kind.persist_index_kind().is_none(),
+                "{kind:?}: no serve basis"
+            );
             let outcome = bridge.apply_envelope_bytes(kind, bytes, None).await;
             assert!(
                 matches!(&outcome, ApplyOutcome::Refused { reason: r, retry, .. }
@@ -20386,15 +19658,28 @@ pub(crate) mod tests {
             .list_attestations_since(None, 100)
             .await
             .expect("read back seeded rows");
+        // persist v61 (CIRISPersist#991) — the affiliation's record the matrix
+        // seeds is minted into its `group:roster:v1` row; every holder
+        // advertises a group-plane row (the audience gate narrows per peer).
+        let group_rows = held
+            .iter()
+            .filter(|row| {
+                ciris_persist::federation::group_plane::is_group_plane_row(&row.attestation)
+            })
+            .count();
+        assert_eq!(group_rows, 1, "the seeded affiliation's record row");
         assert_eq!(
             held.len(),
-            5,
+            5 + group_rows,
             "all five rows were ADMITTED — the OUT verdict below is the projection, not admission"
         );
         let expected_in = [in_fed, in_affil, in_self_own, in_tombstone];
         let expected: std::collections::BTreeSet<([u8; 32], u64)> = held
             .iter()
-            .filter(|row| expected_in.contains(&row.attestation.attestation_id.as_str()))
+            .filter(|row| {
+                expected_in.contains(&row.attestation.attestation_id.as_str())
+                    || ciris_persist::federation::group_plane::is_group_plane_row(&row.attestation)
+            })
             .map(|row| {
                 let (hash, _bytes) = content_hash_of(&row.attestation).expect("held row hashes");
                 (
@@ -20403,7 +19688,7 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        assert_eq!(expected.len(), 4);
+        assert_eq!(expected.len(), 4 + group_rows);
         let out_hash = held
             .iter()
             .find(|row| row.attestation.attestation_id == out_self_foreign)
@@ -20435,7 +19720,11 @@ pub(crate) mod tests {
             holdings.iter().any(|r| r.envelope_hash == out_hash),
             "the out-of-projection row IS held (receive axis)"
         );
-        assert_eq!(holdings.len(), 5, "holdings carry every admitted row");
+        assert_eq!(
+            holdings.len(),
+            held.len(),
+            "holdings carry every admitted row"
+        );
 
         // #433 boundary: the projection DEFINES eligibility. A row it
         // excludes was never eligible, so the sweep books NOTHING — not
@@ -21226,114 +20515,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// **CONSENT-GATED ROUTES (Eric 2026-10-30).** A RELAY (here `node-relay`,
-    /// standing in for the canonical) holding an announced node's route serves
-    /// it to a stranger only once that node's owner has consented to the
-    /// stranger: before, withheld and booked `route_not_consented` on the
-    /// advertise and the fetch twin; after the owner's grant names it, served.
-    /// The owner's other node is served throughout.
+    /// v44 (CC rc15 5.4.6 "First contact through a forwarder"; CIRISPersist#1165
+    /// superseded) — the consent-gated-routes rule is RETIRED: a forwarder never
+    /// holds the contact grant, so it cannot gate a route on one. A relay
+    /// serves an announced node's route to a stranger as it did before the
+    /// rule (the sealed request/acceptance carrying the route is CIRISEdge#922).
     #[tokio::test]
-    async fn a_relayed_route_reaches_a_stranger_only_after_the_owners_consent() {
-        use crate::observability::WithholdReason;
+    async fn a_relayed_route_reaches_a_stranger_with_no_consent_gate() {
         use sha2::{Digest as _, Sha256};
-        // Who signed the consent: nobody, the owner's fedID key, or the
-        // roster key of a device the owner joined by approval (CC 3.3.6.3),
-        // which is the owner's pen on that device.
-        for pen in [None, Some("person-bob"), Some("person-bob-dev2")] {
-            let consented = pen.is_some();
-            let backend = Arc::new(MemoryBackend::new());
-            register_fixture_keys(
-                &backend,
-                &[
-                    ("person-bob", identity_type::USER),
-                    ("person-bob-dev2", identity_type::USER),
-                    ("node-bob", identity_type::NODE),
-                    ("node-bob-2", identity_type::NODE),
-                    ("node-relay", identity_type::NODE),
-                    ("node-stranger", identity_type::NODE),
-                ],
-            )
-            .await;
-            seed_device_occurrence(&backend, "person-bob", "person-bob-dev2", "phone").await;
-            let id = uuid::Uuid::new_v4().to_string();
-            seed_scoped_attestation(
-                &backend,
-                &id,
-                "person-bob",
-                "node-bob",
-                "delegates_to",
-                "federation",
-                owner_binding_envelope(&id, "person-bob", "node-bob"),
-            )
-            .await;
-            seed_owner_binding(&backend, "person-bob", "node-bob-2").await;
-            if let Some(pen) = pen {
-                seed_consent_membership(&backend, pen, "node-stranger").await;
-            }
-            let metrics = crate::observability::EdgeMetrics::new();
-            let publish = vec!["node-bob".to_string()];
-            let bridge = bridge_over(&backend, &[])
-                .with_self_provider(Some(Arc::new(move || publish.clone())))
-                .with_local_key_id(Some("node-relay".to_string()))
-                .with_metrics(Some(metrics.clone()))
-                .with_consent_gated_routes(true);
-            let signed = sign_transport_destination_fixture(
-                "node-bob",
-                "aa00",
-                1,
-                Utc::now().trunc_subsecs(6),
-            );
-            let wire = serde_json::to_vec(&signed).expect("wire");
-            assert!(bridge
-                .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire, None)
-                .await
-                .is_admitted());
-            let hash: [u8; 32] = Sha256::digest(&wire).into();
-            let kind = EnvelopeKind::TransportDestination;
-
-            let to_stranger = advertised(
-                &bridge
-                    .list_envelope_refs_for_peer(kind, Some("node-stranger"))
-                    .await,
-                &hash,
-            );
-            let fetched = bridge
-                .fetch_envelope_bytes_for_peer(kind, &hash, Some("node-stranger"))
-                .await
-                .is_some();
-            assert_eq!(
-                (to_stranger, fetched),
-                (consented, consented),
-                "pen={pen:?}: the stranger gets the relayed route iff the owner, or a live \
-                 roster key of theirs, consented to it"
-            );
-            assert!(
-                advertised(
-                    &bridge
-                        .list_envelope_refs_for_peer(kind, Some("node-bob-2"))
-                        .await,
-                    &hash
-                ),
-                "the owner's other node is served regardless"
-            );
-            let booked = metrics
-                .snapshot()
-                .withholds_by_reason
-                .get(&WithholdReason::RouteNotConsented)
-                .copied()
-                .unwrap_or(0);
-            assert_eq!(booked > 0, !consented, "booked by name: {booked}");
-        }
-    }
-
-    /// The switch is OFF by default until CIRISPersist#1165: a relay with no
-    /// contact grants serves an announced node's route to a stranger exactly
-    /// as before, so first contact is no worse while the relay cannot hold
-    /// grants.
-    #[tokio::test]
-    async fn with_the_switch_off_a_relayed_route_reaches_a_stranger_as_before() {
-        use sha2::{Digest as _, Sha256};
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[
@@ -21385,7 +20575,7 @@ pub(crate) mod tests {
     /// to no one else.
     #[tokio::test]
     async fn a_relay_hands_a_consent_grant_to_the_node_it_names() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[
@@ -21745,146 +20935,6 @@ pub(crate) mod tests {
             ))
             .await
             .expect("seed community");
-    }
-
-    /// **The CIRISEdge#523 regression pin.** A Community whose member list names
-    /// a PERSON, requested by a NODE that person owns → the row IS advertised.
-    /// Pre-fix this returned 0 refs — the measured field state.
-    #[tokio::test]
-    async fn community_advertises_to_a_node_whose_owner_is_a_member() {
-        let backend = owner_axis_backend(true).await;
-        seed_community_with_member(&backend, "person-bob").await;
-        let bridge = bridge_over(&backend, &["node-bob"]);
-
-        let refs = bridge.list_envelope_refs(EnvelopeKind::Community).await;
-        assert_eq!(
-            refs.len(),
-            1,
-            "a room whose member is the requesting node's OWNER must be advertised \
-             — the person/node axis (CIRISEdge#523); got {refs:?}"
-        );
-    }
-
-    /// The pre-fix shape as the NEGATIVE CONTROL: an unrelated node — no owner
-    /// match, not directly named — is still served nothing. The widening must
-    /// not become "advertise to everyone".
-    #[tokio::test]
-    async fn community_stays_withheld_from_an_unrelated_node() {
-        let backend = owner_axis_backend(true).await;
-        seed_community_with_member(&backend, "person-bob").await;
-        // `node-stranger` has no owner-binding at all, and is not a member.
-        let bridge = bridge_over(&backend, &["node-stranger"]);
-
-        assert!(
-            bridge
-                .list_envelope_refs(EnvelopeKind::Community)
-                .await
-                .is_empty(),
-            "an unrelated node is neither a member nor a member's node — nothing advertised"
-        );
-    }
-
-    /// A node whose owner is a member of a DIFFERENT roster gets nothing: the
-    /// widening joins on the owner-binding, not on "has an owner".
-    #[tokio::test]
-    async fn community_stays_withheld_when_the_owner_is_not_a_member() {
-        let backend = owner_axis_backend(true).await;
-        // The room's member is alice; the cohort node is owned by BOB.
-        seed_community_with_member(&backend, "person-alice").await;
-        let bridge = bridge_over(&backend, &["node-bob"]);
-
-        assert!(
-            bridge
-                .list_envelope_refs(EnvelopeKind::Community)
-                .await
-                .is_empty(),
-            "an owner who is not on the roster confers nothing"
-        );
-    }
-
-    /// The DIRECT path is widened, never replaced: a roster entry naming the
-    /// node itself still advertises. The node carries an owner-binding because
-    /// CC 3.2 requires one — persist refuses an `UnstewardedCommunityMember`, so
-    /// "a node-named roster entry with no owner" is not a field-realizable
-    /// shape. Its owner is deliberately NOT a member, so only the direct test
-    /// can be what admits this row.
-    #[tokio::test]
-    async fn community_still_advertises_to_a_directly_named_node() {
-        let backend = owner_axis_backend(true).await;
-        seed_community_with_member(&backend, "node-bob").await;
-        let bridge = bridge_over(&backend, &["node-bob"]);
-
-        assert_eq!(
-            bridge
-                .list_envelope_refs(EnvelopeKind::Community)
-                .await
-                .len(),
-            1,
-            "a member entry naming the NODE directly keeps working (no regression \
-             on the pre-#523 path)"
-        );
-    }
-
-    /// Plane 2 of 3 — Family carries the identical gate shape.
-    #[tokio::test]
-    async fn family_advertises_to_a_node_whose_owner_is_a_member() {
-        let backend = owner_axis_backend(true).await;
-        backend
-            .put_family(sign_family_fixture(
-                "room-authority",
-                fixture_family("household", "person-bob"),
-            ))
-            .await
-            .expect("seed family");
-
-        assert_eq!(
-            bridge_over(&backend, &["node-bob"])
-                .list_envelope_refs(EnvelopeKind::Family)
-                .await
-                .len(),
-            1,
-            "Family shares the Community gate shape (CIRISEdge#523 plane 2)"
-        );
-        assert!(
-            bridge_over(&backend, &["node-stranger"])
-                .list_envelope_refs(EnvelopeKind::Family)
-                .await
-                .is_empty(),
-            "…and the same negative control holds"
-        );
-    }
-
-    /// CIRISEdge#736 — a family founded by this node's own person ALONE (the
-    /// persist v52 founding: every other member joins by consent) is
-    /// advertised by publish-own, so the invitee's node can follow it; with no
-    /// cohort member on the roster and no own identity, it is not.
-    #[tokio::test]
-    async fn a_family_founded_by_this_nodes_own_person_alone_is_advertised() {
-        let backend = owner_axis_backend(true).await;
-        backend
-            .put_family(sign_family_fixture(
-                "person-alice",
-                fixture_family("household", "person-alice"),
-            ))
-            .await
-            .expect("seed family");
-        let own = vec!["node-alice".to_string(), "person-alice".to_string()];
-        assert_eq!(
-            bridge_over(&backend, &[])
-                .with_self_provider(Some(Arc::new(move || own.clone())))
-                .list_envelope_refs(EnvelopeKind::Family)
-                .await
-                .len(),
-            1,
-            "the opener's own family crosses on the publish-own arm"
-        );
-        assert!(
-            bridge_over(&backend, &["node-stranger"])
-                .list_envelope_refs(EnvelopeKind::Family)
-                .await
-                .is_empty(),
-            "a node whose own person is not on the roster advertises nothing"
-        );
     }
 
     // ─── CC 5.2 — the AUDIENCE gate on ATTESTATION rows (v19.0.0) ───────────
@@ -22524,7 +21574,7 @@ pub(crate) mod tests {
         let record = |kind: EnvelopeKind| {
             let bridge = &bridge;
             async move {
-                let refs = bridge.list_envelope_refs(kind).await;
+                let refs = bridge.test_refs(kind, None).await;
                 assert_eq!(refs.len(), 1, "one {kind:?} record held");
                 refs[0].envelope_hash
             }
@@ -22537,14 +21587,11 @@ pub(crate) mod tests {
             let bridge = &bridge;
             async move {
                 let listed = bridge
-                    .list_envelope_refs_for_peer(kind, peer)
+                    .test_refs(kind, peer)
                     .await
                     .iter()
                     .any(|r| r.envelope_hash == hash);
-                let fetched = bridge
-                    .fetch_envelope_bytes_for_peer(kind, &hash, peer)
-                    .await
-                    .is_some();
+                let fetched = bridge.test_fetch(kind, &hash, peer).await.is_some();
                 assert_eq!(
                     listed, fetched,
                     "{kind:?} to {peer:?}: the advertise and the fetch twin agree"
@@ -22570,7 +21617,11 @@ pub(crate) mod tests {
             !served(EnvelopeKind::Community, Some("node-e"), h_g).await,
             "a declined proposal is not a live invitation"
         );
-        for peer in [Some("node-c"), None] {
+        // persist v61 (CIRISPersist#991): the record is a row on the
+        // Attestation plane, whose unbound (`None`) view is the local
+        // projection-only view (every production provider is peer-bound), so
+        // the unbound-requester arm of the retired framed plane has no twin.
+        for peer in [Some("node-c")] {
             assert!(
                 !served(EnvelopeKind::Community, peer, h_g).await
                     && !served(EnvelopeKind::Family, peer, h_f).await,
@@ -22583,6 +21634,104 @@ pub(crate) mod tests {
         );
     }
 
+    /// persist v61 (CIRISPersist#991) — test-only views that let the
+    /// framed-plane witnesses ask about a group's record and membership
+    /// events where they live now: as `group:roster:v1` / `membership:*:v1`
+    /// rows on the Attestation plane. For a retired group kind, the
+    /// Attestation-plane refs (per peer, or peer-blind) whose row's object is
+    /// of that kind; any other kind passes through unchanged.
+    impl FederationDirectoryReplicationBridge {
+        async fn test_refs(&self, kind: EnvelopeKind, peer: Option<&str>) -> Vec<EnvelopeRef> {
+            if !kind.is_retired_plane() {
+                return self.list_envelope_refs_for_peer(kind, peer).await;
+            }
+            let refs = match peer {
+                Some(p) => {
+                    self.list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(p))
+                        .await
+                }
+                None => self.list_envelope_refs(EnvelopeKind::Attestation).await,
+            };
+            let mut out = Vec::new();
+            for r in refs {
+                if let Some(bytes) = self
+                    .fetch_envelope_bytes(EnvelopeKind::Attestation, &r.envelope_hash)
+                    .await
+                {
+                    if group_row_is_of_kind(&bytes, kind) {
+                        out.push(r);
+                    }
+                }
+            }
+            out
+        }
+
+        async fn test_fetch(
+            &self,
+            kind: EnvelopeKind,
+            hash: &[u8; 32],
+            peer: Option<&str>,
+        ) -> Option<Vec<u8>> {
+            self.fetch_envelope_bytes_for_peer(serve_kind(kind), hash, peer)
+                .await
+        }
+
+        async fn test_fetch_raw(&self, kind: EnvelopeKind, hash: &[u8; 32]) -> Option<Vec<u8>> {
+            self.fetch_envelope_bytes(serve_kind(kind), hash).await
+        }
+    }
+
+    /// The session plane a framed kind's objects are served on since v61.
+    fn serve_kind(kind: EnvelopeKind) -> EnvelopeKind {
+        if kind.is_retired_plane() {
+            EnvelopeKind::Attestation
+        } else {
+            kind
+        }
+    }
+
+    /// Is `bytes` a group-plane row whose object a framed `kind` carried?
+    fn group_row_is_of_kind(bytes: &[u8], kind: EnvelopeKind) -> bool {
+        use ciris_persist::federation::group_plane::{group_signed_of_row, GroupSigned};
+        let Ok(row) = serde_json::from_slice::<Attestation>(bytes) else {
+            return false;
+        };
+        let Ok(Some(signed)) = group_signed_of_row(&row) else {
+            return false;
+        };
+        matches!(
+            (kind, signed),
+            (EnvelopeKind::Family, GroupSigned::Family(_))
+                | (EnvelopeKind::Community, GroupSigned::Community(_))
+                | (
+                    EnvelopeKind::FamilyMembershipRevocation,
+                    GroupSigned::FamilyRevocation(_)
+                )
+                | (
+                    EnvelopeKind::CommunityMembershipRevocation,
+                    GroupSigned::CommunityRevocation(_)
+                )
+                | (
+                    EnvelopeKind::FamilyMembershipWidening,
+                    GroupSigned::FamilyWidening(_)
+                )
+                | (
+                    EnvelopeKind::CommunityMembershipWidening,
+                    GroupSigned::CommunityWidening(_)
+                )
+        )
+    }
+
+    /// The group id a group-plane row's object names.
+    fn group_id_of_row_bytes(bytes: &[u8]) -> String {
+        let row: Attestation = serde_json::from_slice(bytes).expect("a row");
+        ciris_persist::federation::group_plane::group_signed_of_row(&row)
+            .expect("well-formed")
+            .expect("a group row")
+            .group_key_id()
+            .to_owned()
+    }
+
     /// CIRISEdge#761 — is `hash` offered to `peer` on the per-peer advertise,
     /// and does the fetch twin agree? Asserts the agreement (a withheld row is
     /// neither listed nor fetchable; a served one both), returns the verdict.
@@ -22593,14 +21742,11 @@ pub(crate) mod tests {
         hash: [u8; 32],
     ) -> bool {
         let listed = bridge
-            .list_envelope_refs_for_peer(kind, peer)
+            .test_refs(kind, peer)
             .await
             .iter()
             .any(|r| r.envelope_hash == hash);
-        let fetched = bridge
-            .fetch_envelope_bytes_for_peer(kind, &hash, peer)
-            .await
-            .is_some();
+        let fetched = bridge.test_fetch(kind, &hash, peer).await.is_some();
         assert_eq!(
             listed, fetched,
             "{kind:?} to {peer:?}: the advertise and the fetch twin agree (CIRISEdge#761)"
@@ -22694,7 +21840,7 @@ pub(crate) mod tests {
         let metrics = crate::observability::EdgeMetrics::new();
         let bridge = audience_bridge(&backend).with_metrics(Some(metrics.clone()));
         let kind = EnvelopeKind::CommunityMembershipRevocation;
-        let refs = bridge.list_envelope_refs(kind).await;
+        let refs = bridge.test_refs(kind, None).await;
         assert_eq!(refs.len(), 1, "the one revocation is held");
         let hash = refs[0].envelope_hash;
 
@@ -22710,7 +21856,11 @@ pub(crate) mod tests {
             served_761(&bridge, kind, Some("node-carol"), hash).await,
             "a live invitee's node gets the room's full plane history"
         );
-        for peer in [Some("node-dave"), Some("node-stranger"), None] {
+        // persist v61 (CIRISPersist#991): the record is a row on the
+        // Attestation plane, whose unbound (`None`) view is the local
+        // projection-only view (every production provider is peer-bound), so
+        // the unbound-requester arm of the retired framed plane has no twin.
+        for peer in [Some("node-dave"), Some("node-stranger")] {
             assert!(
                 !served_761(&bridge, kind, peer, hash).await,
                 "{peer:?}, an outsider, does not learn the room's roster (CC 5.4.6)"
@@ -22896,7 +22046,7 @@ pub(crate) mod tests {
             .expect("bob leaves");
         let bridge = audience_bridge(&backend);
         let kind = EnvelopeKind::CommunityMembershipRevocation;
-        let refs = bridge.list_envelope_refs(kind).await;
+        let refs = bridge.test_refs(kind, None).await;
         assert_eq!(refs.len(), 1, "the one revocation is held");
         let hash = refs[0].envelope_hash;
         assert!(
@@ -23070,17 +22220,12 @@ pub(crate) mod tests {
             .with_self_provider(Some(Arc::new(move || publish.clone())));
         let kind = EnvelopeKind::Community;
         let mut by_id = std::collections::HashMap::new();
-        for r in bridge.list_envelope_refs(kind).await {
+        for r in bridge.test_refs(kind, None).await {
             let bytes = bridge
-                .fetch_envelope_bytes(kind, &r.envelope_hash)
+                .test_fetch_raw(kind, &r.envelope_hash)
                 .await
                 .expect("held record");
-            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-            let id = v
-                .pointer("/community/community_key_id")
-                .and_then(serde_json::Value::as_str)
-                .expect("community id")
-                .to_owned();
+            let id = group_id_of_row_bytes(&bytes);
             by_id.insert(id, r.envelope_hash);
         }
         let canon = by_id[CANON];
@@ -23198,7 +22343,7 @@ pub(crate) mod tests {
             .with_metrics(Some(metrics.clone()));
         let refs = |kind: EnvelopeKind| {
             let bridge = &bridge;
-            async move { bridge.list_envelope_refs(kind).await }
+            async move { bridge.test_refs(kind, None).await }
         };
         assert_eq!(refs(EnvelopeKind::Community).await.len(), 2);
         assert_eq!(
@@ -23210,36 +22355,31 @@ pub(crate) mod tests {
             let bridge = &bridge;
             async move {
                 let mut out = Vec::new();
-                for r in bridge.list_envelope_refs(kind).await {
+                for r in bridge.test_refs(kind, None).await {
                     let listed = bridge
-                        .list_envelope_refs_for_peer(kind, peer)
+                        .test_refs(kind, peer)
                         .await
                         .iter()
                         .any(|x| x.envelope_hash == r.envelope_hash);
-                    let bytes = bridge
-                        .fetch_envelope_bytes_for_peer(kind, &r.envelope_hash, peer)
-                        .await;
+                    let bytes = bridge.test_fetch(kind, &r.envelope_hash, peer).await;
                     assert_eq!(
                         listed,
                         bytes.is_some(),
                         "{kind:?} to {peer:?}: the advertise and the fetch twin agree"
                     );
                     if let Some(b) = bytes {
-                        let v: serde_json::Value = serde_json::from_slice(&b).expect("json");
-                        let id = v
-                            .pointer("/community/community_key_id")
-                            .or_else(|| v.pointer("/family/family_key_id"))
-                            .and_then(|g| g.as_str())
-                            .expect("group id")
-                            .to_owned();
-                        out.push(id);
+                        out.push(group_id_of_row_bytes(&b));
                     }
                 }
                 out.sort();
                 out
             }
         };
-        for peer in [Some("node-c"), None] {
+        // persist v61 (CIRISPersist#991): the record is a row on the
+        // Attestation plane, whose unbound (`None`) view is the local
+        // projection-only view (every production provider is peer-bound), so
+        // the unbound-requester arm of the retired framed plane has no twin.
+        for peer in [Some("node-c")] {
             assert_eq!(
                 served(EnvelopeKind::Community, peer).await,
                 vec!["infra-762".to_owned()],
@@ -23499,19 +22639,21 @@ pub(crate) mod tests {
         seed_community_with_member(&backend, "person-bob").await;
         let bridge = bridge_over(&backend, &["node-bob", "node-stranger"]);
 
-        let _ = bridge.list_envelope_refs(EnvelopeKind::Community).await;
+        // persist v61 (CIRISPersist#991) — the framed Family / Community planes
+        // are retired; LocationProof is the one Cohort plane left that walks
+        // the owner axis, so the memo is witnessed across two of its sweeps.
+        let _ = bridge.list_envelope_refs(EnvelopeKind::LocationProof).await;
         let after_first = bridge.owner_reads.load(Ordering::Relaxed);
         assert_eq!(
             after_first, 2,
-            "the first plane resolves each of the 2 cohort members exactly once"
+            "the first sweep resolves each of the 2 cohort members exactly once"
         );
 
-        let _ = bridge.list_envelope_refs(EnvelopeKind::Family).await;
         let _ = bridge.list_envelope_refs(EnvelopeKind::LocationProof).await;
         assert_eq!(
             bridge.owner_reads.load(Ordering::Relaxed),
             after_first,
-            "the other two planes in the same round re-read the directory ZERO times \
+            "the next sweep in the same round re-reads the directory ZERO times \
              (CIRISEdge#523 memo; the #400 per-envelope-re-resolution regression)"
         );
     }
@@ -23638,14 +22780,17 @@ pub(crate) mod tests {
         seed_community_with_member(&backend, "person-bob").await;
         let bridge = bridge_over(&backend, &["node-bob"]);
 
-        assert!(
-            bridge
-                .list_envelope_refs(EnvelopeKind::Community)
-                .await
-                .is_empty(),
-            "unowned node → the room is not advertised (and `Unowned` is memoized)"
-        );
+        // persist v61 — probed on the LocationProof plane (the framed
+        // Community plane this used is retired): its cohort walk memoizes the
+        // node's `Unowned`.
+        let _ = bridge.list_envelope_refs(EnvelopeKind::LocationProof).await;
         let reads_before = bridge.owner_reads.load(Ordering::Relaxed);
+        let _ = bridge.list_envelope_refs(EnvelopeKind::LocationProof).await;
+        assert_eq!(
+            bridge.owner_reads.load(Ordering::Relaxed),
+            reads_before,
+            "`Unowned` is memoized: a second sweep walks nothing"
+        );
 
         // The owner-binding arrives ON THE WIRE and is ADMITTED — the real
         // receive path, which is where the invalidation hangs.
@@ -23666,15 +22811,7 @@ pub(crate) mod tests {
             "the owner-binding must be admitted (idempotent re-put); got {outcome:?}"
         );
 
-        assert_eq!(
-            bridge
-                .list_envelope_refs(EnvelopeKind::Community)
-                .await
-                .len(),
-            1,
-            "the admitted owner-binding invalidated the memo — the room is advertised \
-             in the SAME round, not one TTL later"
-        );
+        let _ = bridge.list_envelope_refs(EnvelopeKind::LocationProof).await;
         assert!(
             bridge.owner_reads.load(Ordering::Relaxed) > reads_before,
             "…and it did so by re-walking the directory, not by serving a stale hit"
@@ -24584,7 +23721,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn a_strangers_subject_pull_gets_the_announced_binding_only_907() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let (relay, peer, peer_owner, rootless) =
             ("node-relay", "node-peer", "person-peer", "node-rootless");
         let (o, d, e, u) = ("person-o", "node-d", "node-e", "node-u");

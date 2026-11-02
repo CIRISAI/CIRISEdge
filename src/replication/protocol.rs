@@ -300,6 +300,23 @@ impl EnvelopeKind {
         ciris_persist::federation::replication_policy::RETIRED_FRAMED.contains(&self.persist_kind())
     }
 
+    /// persist v60.0.0 / v61 (CIRISPersist#991) — is this a RETIRED PLANE: a
+    /// framed kind persist retired whose session plane carries no row of its
+    /// own? The operational trio (v60), the six group-plane kinds, the member
+    /// listing and the framed `KeyGrant` (v61). Their objects travel as rows on
+    /// the Attestation plane (or, for the listing, not at all), so nothing is
+    /// advertised, point-read, held or scheduled on them, and an inbound object
+    /// is refused `federation_envelope_kind_retired`. The key-plane kinds are
+    /// retired framed too but still carry their family's row
+    /// ([`Self::key_plane_family`], [`Self::carries_occurrence_withdrawals`]),
+    /// so they are not retired planes.
+    #[must_use]
+    pub fn is_retired_plane(self) -> bool {
+        self.is_framed_retired()
+            && self.key_plane_family().is_none()
+            && !self.carries_occurrence_withdrawals()
+    }
+
     /// persist v59.0.0 — the key-plane row family this SESSION plane carries,
     /// or `None` for a plane that carries no key-plane row.
     ///
@@ -439,8 +456,10 @@ impl EnvelopeKind {
 
     /// CIRISEdge#474 — is this kind served over the dedicated CURSOR path
     /// (`CursorPull` → `Deliver`, resume on `evidence_at`) rather than the
-    /// content-hash Summary/Diff/Fetch flow? EXACTLY the kinds with no
-    /// `signed_wire_index` entry ([`Self::persist_index_kind`] → None). Currently only
+    /// content-hash Summary/Diff/Fetch flow? EXACTLY the kinds that carry
+    /// anything (a [retired plane](Self::is_retired_plane) carries nothing) and
+    /// have no `signed_wire_index` entry ([`Self::persist_index_kind`] → None).
+    /// Currently only
     /// [`Self::AccordQuorumEvidence`]; checked over `ALL` in a test — and the
     /// serve/advertise manifest's `advertise`/`receive` cursor cells are DERIVED
     /// from this predicate in `serve_policy`'s tests, so a future cursor kind
@@ -505,8 +524,16 @@ impl EnvelopeKind {
     /// persist indexes no framed key-plane object any more. The serve twin
     /// re-checks what the row is, so the point-read never serves another
     /// row on these planes.
+    ///
+    /// persist v61 — a [retired plane](Self::is_retired_plane) has no serve
+    /// basis at all: `None`, so a peer that names a framed group record's hash
+    /// on the retired `Community` plane is never handed it past the
+    /// Attestation plane's audience gate.
     #[must_use]
     pub fn persist_index_kind(self) -> Option<&'static str> {
+        if self.is_retired_plane() {
+            return None;
+        }
         Some(match self {
             // #848 — a key_grant set IS an attestation row: it is point-read
             // through persist's Attestation content-hash index, never one of
@@ -986,7 +1013,7 @@ mod tests {
             let bases = [kind.persist_index_kind().is_some(), kind.is_cursor_served()];
             assert_eq!(
                 bases.iter().filter(|b| **b).count(),
-                1,
+                usize::from(!kind.is_retired_plane()),
                 "{kind:?}: must be exactly one of content-hash-indexed / cursor-served \
                  (none when retired and carrying nothing), got {bases:?}"
             );
@@ -1001,24 +1028,45 @@ mod tests {
     /// operational kinds, which carry nothing (an organisation is an
     /// affiliation, on the attestation plane).
     #[test]
-    fn the_retired_framed_kinds_are_persists_seven_v60() {
+    fn the_retired_framed_kinds_are_persists_fifteen_v61() {
         use ciris_persist::federation::replication_policy::{retired_detail, RETIRED_FRAMED};
         let retired: Vec<EnvelopeKind> = EnvelopeKind::ALL
             .into_iter()
             .filter(|k| k.is_framed_retired())
             .collect();
+        // persist v61 (CIRISPersist#991) — the six group-plane kinds, the
+        // framed KeyGrant and the member listing join: fifteen, all but
+        // Attestation, TransportDestination, LocationProof and
+        // AccordQuorumEvidence.
         assert_eq!(
             retired,
             vec![
                 EnvelopeKind::Key,
                 EnvelopeKind::Revocation,
                 EnvelopeKind::IdentityOccurrence,
+                EnvelopeKind::Family,
+                EnvelopeKind::Community,
                 EnvelopeKind::IdentityOccurrenceRevocation,
+                EnvelopeKind::FamilyMembershipRevocation,
+                EnvelopeKind::CommunityMembershipRevocation,
                 EnvelopeKind::Organization,
                 EnvelopeKind::OrgMembership,
                 EnvelopeKind::PartnerRecord,
+                EnvelopeKind::KeyGrant,
+                EnvelopeKind::CommunityMembershipWidening,
+                EnvelopeKind::FamilyMembershipWidening,
+                EnvelopeKind::CommunityMembershipListing,
             ]
         );
+        // A retired PLANE carries nothing; the four key-plane kinds still carry
+        // their rows.
+        for k in &retired {
+            assert_eq!(
+                k.is_retired_plane(),
+                k.key_plane_family().is_none() && !k.carries_occurrence_withdrawals(),
+                "{k:?}"
+            );
+        }
         assert_eq!(retired.len(), RETIRED_FRAMED.len());
         for k in &retired {
             assert_eq!(retired_detail(k.persist_kind()), k.as_wire_str());

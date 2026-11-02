@@ -122,9 +122,6 @@ pub mod bridge;
 pub mod convergence;
 pub mod coordinator;
 pub mod directory;
-/// CIRISEdge#761 — the `(scope, group, named)` a membership-plane row is about,
-/// for persist's `may_receive_group_plane` serve gate.
-pub mod group_plane;
 /// CIRISEdge#552 — hashes known to exist whose bodies this node does not
 /// hold. NEVER holdings; see the module docs for why that distinction is the
 /// whole safety of the design.

@@ -335,16 +335,11 @@ async fn an_outbound_serve_offers_no_framed_key_plane_object_v59() {
         .filter(|k| k.is_framed_retired())
     {
         let refs = bridge.list_envelope_refs_for_peer(kind, Some(PEER)).await;
-        // persist v60.0.0 (§8) — the operational planes are retired outright:
-        // nothing is offered on them.
-        if matches!(
-            kind,
-            EnvelopeKind::Organization | EnvelopeKind::OrgMembership | EnvelopeKind::PartnerRecord
-        ) {
-            assert!(
-                refs.is_empty(),
-                "{kind:?}: a retired operational plane offers nothing"
-            );
+        // persist v60.0.0 (§8) / v61 (#991) — a retired PLANE (the operational
+        // trio, the group-plane kinds, the listing, the framed KeyGrant) is
+        // retired outright: nothing is offered on it.
+        if kind.is_retired_plane() {
+            assert!(refs.is_empty(), "{kind:?}: a retired plane offers nothing");
             continue;
         }
         let Some(family) = kind.key_plane_family() else {
