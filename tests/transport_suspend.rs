@@ -9,7 +9,7 @@
 //!   cancelled with it; the replication scheduler draws no backoff);
 //! - resumed, B's sends reach A again and a row A ships lands in B's
 //!   directory through B's replication runtime — nothing rebuilt;
-//! - suspend → resume cycles repeat with no fd, thread or task growth;
+//! - suspend → resume cycles repeat with no fd or task growth;
 //! - a suspend whose deadline is shorter than a stuck send returns by its
 //!   deadline, and a node with a TCP server reports its listener honestly.
 //!
@@ -188,16 +188,9 @@ fn open_fds() -> usize {
     std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count)
 }
 
-fn threads() -> usize {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("Threads:").map(|v| v.trim().parse().ok()))
-                .flatten()
-        })
-        .unwrap_or(0)
-}
+/// The tests here measure process-wide state (fds, the kernel's TCP table);
+/// they run one at a time.
+static SERIAL: Mutex<()> = Mutex::const_new(());
 
 struct Pair {
     a: Arc<ReticulumTransport>,
@@ -210,8 +203,23 @@ struct Pair {
     _a_dir: Arc<SqliteBackend>,
     a_rx: Arc<Mutex<Vec<Vec<u8>>>>,
     rt_b: Arc<ReplicationRuntime>,
+    metrics_b: EdgeMetrics,
     _tmp: tempfile::TempDir,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+    _a_runtime: OwnRuntime,
+}
+
+/// A's listener runs on its own runtime, as the canonical runs in its own
+/// process: the per-link tasks its event loop spawns (e.g. the 10 s responder
+/// handshake watch) then never count against B's runtime.
+struct OwnRuntime(Option<tokio::runtime::Runtime>);
+
+impl Drop for OwnRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_background();
+        }
+    }
 }
 
 /// A listens (the canonical); B is client-only, holds A's hybrid-signed route
@@ -220,7 +228,9 @@ struct Pair {
 #[allow(clippy::too_many_lines)]
 async fn pair(tag: &str) -> Pair {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("warn,ciris_edge=info")
+        .with_env_filter(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "warn,ciris_edge=info".into()),
+        )
         .with_test_writer()
         .try_init();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -281,6 +291,7 @@ async fn pair(tag: &str) -> Pair {
 
     let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(64);
     let (tx_b, mut rx_b) = mpsc::channel::<InboundFrame>(64);
+    let metrics_b = EdgeMetrics::new();
     let rt_b = Arc::new(
         ReplicationRuntime::start(
             Arc::clone(&b_dir) as Arc<dyn FederationDirectory>,
@@ -296,7 +307,7 @@ async fn pair(tag: &str) -> Pair {
                     ..SchedulerConfig::default()
                 },
                 local_key_id: Some(key_b.key_id.clone()),
-                metrics: Some(EdgeMetrics::new()),
+                metrics: Some(metrics_b.clone()),
                 ..Default::default()
             },
             None,
@@ -307,8 +318,13 @@ async fn pair(tag: &str) -> Pair {
     let a_rx: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let a_seen = Arc::clone(&a_rx);
     let (la, lb) = (Arc::clone(&a), Arc::clone(&b));
+    let a_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("A's runtime");
     let tasks = vec![
-        tokio::spawn(async move {
+        a_runtime.spawn(async move {
             let _ = la.listen(tx_a).await;
         }),
         tokio::spawn(async move {
@@ -347,12 +363,23 @@ async fn pair(tag: &str) -> Pair {
         _a_dir: a_dir,
         a_rx,
         rt_b,
+        metrics_b,
         _tmp: tmp,
         _tasks: tasks,
+        _a_runtime: OwnRuntime(Some(a_runtime)),
     }
 }
 
 impl Pair {
+    /// Attestation rounds B has run to an outcome (any outcome).
+    fn rounds_run(&self) -> u64 {
+        self.metrics_b
+            .snapshot()
+            .replication_round_duration_seconds
+            .get(&EnvelopeKind::Attestation)
+            .map_or(0, |h| h.count)
+    }
+
     /// B → A, and A received it.
     async fn b_reaches_a(&self, body: &[u8]) {
         self.b
@@ -426,6 +453,7 @@ fn assert_quiet(r: &SuspendReport, what: &str) {
 /// a row A ships lands in B's directory through the same replication runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
+    let _serial = SERIAL.lock().await;
     let p = pair("mid").await;
     p.b_reaches_a(b"warm-up").await;
     assert!(p.b.link_count().await >= 1, "B holds a link to A");
@@ -463,6 +491,12 @@ async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
         "quiescent well before the deadline: {:?}",
         started.elapsed()
     );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        p.rt_b.no_route_backoff().is_empty(),
+        "the round the suspend cancelled draws no backoff: {:?}",
+        p.rt_b.no_route_backoff()
+    );
     let closed = wait_until(Duration::from_secs(5), || async {
         established_on(p.port_a) == 0
     })
@@ -478,8 +512,15 @@ async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
         "a send while suspended is refused with Suspended: {refused:?}"
     );
     // A round while suspended is skipped quietly: no no-route backoff.
+    let before = p.rounds_run();
     p.rt_b.round_now(&p.key_a.key_id).await.expect("kick");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let ran = wait_until(Duration::from_secs(20), || async {
+        p.rounds_run() > before
+    })
+    .await;
+    assert!(ran, "a round toward A ran while B was suspended");
+    // The scheduler records the round's class just after its duration.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         p.rt_b.no_route_backoff().is_empty(),
         "a round refused by the suspend draws no backoff: {:?}",
@@ -502,15 +543,18 @@ async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
     );
 }
 
-/// **Cycles.** Suspend → resume three times; each suspend is quiescent, each
-/// resume reaches A, and the process holds no more fds or threads after the
-/// third cycle than after the first.
+/// **Cycles.** Suspend → resume four times; each suspend is quiescent, each
+/// resume reaches A, and from the second cycle on (the first warms lazy
+/// state) the suspended points hold the same number of open fds and of live
+/// tasks on this test's runtime. The tests in this file run one at a time
+/// ([`SERIAL`]), so the process-wide fd count is this test's alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_suspend_resume_cycles_do_not_grow() {
+    let _serial = SERIAL.lock().await;
     let p = pair("cycles").await;
     p.b_reaches_a(b"cycle-0").await;
     let mut marks = Vec::new();
-    for i in 1..=3u8 {
+    for i in 1..=4u8 {
         let r = p.b.suspend(Duration::from_secs(10)).await;
         assert_quiet(&r, &format!("cycle {i}"));
         let closed = wait_until(Duration::from_secs(5), || async {
@@ -518,19 +562,16 @@ async fn repeated_suspend_resume_cycles_do_not_grow() {
         })
         .await;
         assert!(closed, "cycle {i}: no ESTABLISHED connection on A's port");
-        marks.push((open_fds(), threads()));
+        let tasks = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        marks.push((open_fds(), tasks));
         p.b.resume().await.expect("resume");
         p.b_reaches_a(format!("cycle-{i}").as_bytes()).await;
     }
-    let (fds1, th1) = marks[0];
-    let (fds3, th3) = marks[2];
-    assert!(
-        fds3 <= fds1 + 2,
-        "fds do not grow across cycles: {marks:?} (suspended points)"
-    );
-    assert!(
-        th3 <= th1 + 1,
-        "threads do not grow across cycles: {marks:?} (suspended points)"
+    assert_eq!(
+        marks[1], marks[3],
+        "(open fds, live tasks) at the suspended points do not grow across cycles: {marks:?}"
     );
 }
 
@@ -542,6 +583,7 @@ async fn repeated_suspend_resume_cycles_do_not_grow() {
 /// `Suspended`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn suspend_returns_by_its_deadline_and_reports_the_listener() {
+    let _serial = SERIAL.lock().await;
     let p = pair("deadline").await;
     p.b_reaches_a(b"open a link").await;
     p.a.delay_resource_ships_for_test(60_000);
