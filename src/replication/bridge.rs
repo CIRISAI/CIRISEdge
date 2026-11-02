@@ -666,6 +666,101 @@ fn key_grant_refusal_terminal(reason: &str) -> bool {
 /// [`attestation_refusal_retry`].
 pub(crate) const ATTESTATION_NOT_IN_AUDIENCE: &str = "not_in_audience";
 
+/// persist v61 S2 (#1148) — is `outcome` a `not_in_audience` refusal, on the
+/// general attestation door or the key-grant door? Read from the reason both
+/// doors write with persist's token ([`attestation_outcome_to_apply`]; the
+/// key-grant door's `(token)`).
+fn is_not_in_audience_refusal(outcome: &ApplyOutcome) -> bool {
+    match outcome {
+        ApplyOutcome::Refused { reason, .. } => {
+            reason.contains(&format!("({ATTESTATION_NOT_IN_AUDIENCE};"))
+                || reason.contains(&format!("({ATTESTATION_NOT_IN_AUDIENCE})"))
+        }
+        _ => false,
+    }
+}
+
+/// The park key of a group's audience.
+fn audience_group_key(group_key_id: &str) -> String {
+    format!("audience:group:{group_key_id}")
+}
+
+/// The park key of a key's owner axis (a `self` row's audience is its
+/// owner's own nodes; an allow list is the owner's).
+fn audience_owner_key(key_id: &str) -> String {
+    format!("audience:owner:{key_id}")
+}
+
+/// The attestation row in wire bytes (bare, or the legacy `{"attestation": …}`
+/// wrap).
+fn row_of_wire(bytes: &[u8]) -> Option<Attestation> {
+    serde_json::from_slice::<Attestation>(bytes)
+        .or_else(|_| serde_json::from_slice::<SignedAttestation>(bytes).map(|s| s.attestation))
+        .ok()
+}
+
+/// The group a row is placed at: a group-plane row's own group, else the
+/// envelope's group target (`community_key_id` / `family_key_id`).
+fn group_of_row(row: &Attestation) -> Option<String> {
+    if let Ok(Some(signed)) = ciris_persist::federation::group_plane::group_signed_of_row(row) {
+        return Some(signed.group_key_id().to_owned());
+    }
+    ["community_key_id", "family_key_id"].iter().find_map(|m| {
+        row.attestation_envelope
+            .get(*m)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+/// persist v61 S2 (#1148) — what a row refused `not_in_audience` waits on: the
+/// group it is placed at, and its attester's owner axis.
+fn audience_gate_keys(bytes: &[u8]) -> Vec<String> {
+    let Some(row) = row_of_wire(bytes) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::with_capacity(2);
+    if let Some(group) = group_of_row(&row) {
+        keys.push(audience_group_key(&group));
+    }
+    keys.push(audience_owner_key(&row.attesting_key_id));
+    keys
+}
+
+/// persist v61 S2 (#1148) — the audience gates an ADMITTED row can open: a
+/// group's record or membership event (`group:roster:v1`, `membership:*`,
+/// including the ceremony rows) opens its group; an owner binding opens both
+/// of its keys; a `consent:replication` grant (an allow list) opens its
+/// author's owner axis.
+fn audience_release_keys(bytes: &[u8]) -> Vec<String> {
+    let Some(row) = row_of_wire(bytes) else {
+        return Vec::new();
+    };
+    let dimension = row
+        .attestation_envelope
+        .get("dimension")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut keys = Vec::new();
+    if dimension.starts_with("group:roster:") || dimension.starts_with("membership:") {
+        if let Some(group) = group_of_row(&row) {
+            keys.push(audience_group_key(&group));
+        }
+    }
+    if row.attestation_type == ciris_persist::federation::types::attestation_type::DELEGATES_TO
+        && ciris_persist::federation::admission::is_owner_binding_envelope(
+            &row.attestation_envelope,
+        )
+    {
+        keys.push(audience_owner_key(&row.attesting_key_id));
+        keys.push(audience_owner_key(&row.attested_key_id));
+    }
+    if dimension.starts_with("consent:replication") {
+        keys.push(audience_owner_key(&row.attesting_key_id));
+    }
+    keys
+}
+
 /// CIRISEdge#459 — the retry disposition of a typed Attestation-plane refusal,
 /// decided by persist's own [`is_retryable`](ciris_persist::federation::attestation_apply::AttestationRefusalReason::is_retryable)
 /// (persist v59.0.0), never re-decided here:
@@ -4602,6 +4697,13 @@ impl FederationDirectoryReplicationBridge {
                 "signer is now bound to its identity — released the rows refused while it \
                  was not, and asked their peers again now (CIRISEdge#776)"
             ),
+            ReleaseCause::AudienceChanged => tracing::info!(
+                gate = %signer,
+                released,
+                kicked,
+                "this node's audience changed — released the rows refused not_in_audience \
+                 on it and asked their peers again now (history: CIRISPersist#1148)"
+            ),
             ReleaseCause::Host => tracing::info!(
                 signer = %signer,
                 released,
@@ -4648,6 +4750,11 @@ impl FederationDirectoryReplicationBridge {
         }
         if let Some(signed_by) = signed_by.filter(|s| Some(s) != bound.as_ref()) {
             released += self.release_and_kick(&signed_by, ReleaseCause::Host);
+        }
+        // persist v61 S2 (#1148) — and the rows parked `not_in_audience` that a
+        // locally written membership / owner-binding / consent row admits.
+        for key in audience_release_keys(envelope_bytes) {
+            released += self.release_and_kick(&key, ReleaseCause::AudienceChanged);
         }
         released
     }
@@ -4823,6 +4930,13 @@ impl FederationDirectoryReplicationBridge {
                     if let Some(signer) = newly_bound_signer_of(kind, envelope_bytes) {
                         self.release_and_kick(&signer, ReleaseCause::SignerBound);
                     }
+                    // persist v61 S2 (#1148) — an admitted row that can change
+                    // THIS node's audience (a group's record or membership
+                    // event, an owner binding, a replication consent) releases
+                    // the rows parked `not_in_audience` on it.
+                    for key in audience_release_keys(envelope_bytes) {
+                        self.release_and_kick(&key, ReleaseCause::AudienceChanged);
+                    }
                 }
                 // The admitted (or already-held) key record releases the rows
                 // parked on its key.
@@ -4895,9 +5009,74 @@ impl FederationDirectoryReplicationBridge {
                     }
                 }
             }
+            Some(RetryDisposition::Terminal) if is_not_in_audience_refusal(outcome) => {
+                let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+                self.park_on_audience(kind, hash, envelope_bytes, source_peer)
+                    .await;
+            }
             _ => {}
         }
         self.book_refusal_memory();
+    }
+
+    /// persist v61 S2 (CIRISPersist#1148) — park a row refused
+    /// `not_in_audience` on what gates it: the group it is placed at
+    /// (`audience:group:<id>`) and its attester's owner axis
+    /// (`audience:owner:<attester>`). persist's guidance is "re-offer only
+    /// after the receiver's audience changes": the admission of a membership
+    /// row of that group, or of an owner binding / replication consent of that
+    /// key, releases it ([`audience_release_keys`]) and asks the offering peer
+    /// again at once. Until then it waits on the TERMINAL schedule — the
+    /// refusal is already booked terminal ([`attestation_refusal_retry`]) —
+    /// which is the floor for a row nothing ever releases, so it never loops.
+    async fn park_on_audience(
+        &self,
+        kind: EnvelopeKind,
+        hash: [u8; 32],
+        envelope_bytes: &[u8],
+        source_peer: Option<&str>,
+    ) {
+        let keys = audience_gate_keys(envelope_bytes);
+        let Some((first, rest)) = keys.split_first() else {
+            return;
+        };
+        let evictions = self.refusal_backoff.park_evictions();
+        let window =
+            self.refusal_backoff
+                .park_booked_at(kind, hash, first, source_peer, Instant::now());
+        for key in rest {
+            self.refusal_backoff
+                .index_waiting_on(kind, hash, key, source_peer);
+        }
+        self.book_park(kind);
+        self.note_park_evictions(evictions);
+        tracing::debug!(
+            kind = ?kind,
+            envelope_hash = %hex::encode(&hash[..8]),
+            gates = ?keys,
+            from = source_peer.unwrap_or("<unattributed>"),
+            backoff_secs = window.as_secs(),
+            "row refused not_in_audience — parked on what gates it; a membership, \
+             owner-binding or consent row that changes this node's audience releases it \
+             and re-asks the peer at once (history: CIRISPersist#1148)"
+        );
+    }
+
+    /// persist v61 S2 (CIRISPersist#1148) — **the host's release hook for an
+    /// audience change written LOCALLY** (a widening the host put, a room it
+    /// joined, an owner binding it applied): release every row parked
+    /// `not_in_audience` on `group_or_key` and ask the peers that offered them
+    /// again now. The bridge releases on its own when the change arrives
+    /// through the apply choke; [`Self::release_bound_signer`] covers a local
+    /// row given as bytes. Returns how many rows were released.
+    pub fn release_audience(&self, group_or_key: &str) -> usize {
+        self.release_and_kick(
+            &audience_group_key(group_or_key),
+            ReleaseCause::AudienceChanged,
+        ) + self.release_and_kick(
+            &audience_owner_key(group_or_key),
+            ReleaseCause::AudienceChanged,
+        )
     }
 
     /// CIRISEdge#679 — park a refused row on its signer's ABSENT `Key`, on the
@@ -9594,13 +9773,18 @@ impl FederationDirectoryReplicationBridge {
                 member_key_id,
                 role,
                 ..
-            }) => tracing::info!(
-                group = %group_key_id,
-                member = %member_key_id,
-                role = ?role,
-                acceptance = %row.attestation_id,
-                "membership widened on the member's acceptance (CIRISPersist#955)"
-            ),
+            }) => {
+                tracing::info!(
+                    group = %group_key_id,
+                    member = %member_key_id,
+                    role = ?role,
+                    acceptance = %row.attestation_id,
+                    "membership widened on the member's acceptance (CIRISPersist#955)"
+                );
+                // persist v61 S2 (#1148) — the widening is a LOCAL write (it
+                // bypasses the choke): release what it admits here.
+                self.release_audience(&group_key_id);
+            }
             Ok(other) => tracing::debug!(
                 acceptance = %row.attestation_id,
                 outcome = ?other,
@@ -10103,6 +10287,22 @@ impl FederationDirectoryReplicationBridge {
             // persist v55.0.0 (#989) — a `KeyGrantRefused` reason that is the
             // row's own (`key_grant_refusal_terminal`) is terminal; the others
             // wait on state that can land and keep the transient rule.
+            // persist v61 S2 (#1148) — the key-grant door folds the attestation
+            // plane's typed `NotInAudience` into `KeyGrantRefused {
+            // attestation_refused, detail: "…: NotInAudience" }`. Booked as the
+            // general door books it: terminal, under persist's token, so the
+            // choke parks it on its audience (`park_on_audience`) and a
+            // membership row releases it. Matched on the detail because the
+            // door carries no typed reason (CIRISPersist#1184).
+            Err(ciris_persist::federation::Error::KeyGrantRefused { reason, detail })
+                if detail.contains("NotInAudience") =>
+            {
+                ApplyOutcome::refused_terminal(format!(
+                    "key_grant: row refused at the attestation plane \
+                     ({ATTESTATION_NOT_IN_AUDIENCE}) — {reason}: {detail} — \
+                     attestation_id={attestation_id} type={attestation_type} sealer={minter}"
+                ))
+            }
             Err(e) => {
                 let reason = format!(
                     "key_grant: persist refused the row ({e}) — attestation_id={attestation_id} \
@@ -12301,6 +12501,141 @@ pub(crate) mod tests {
             backoff.suppressed_at(EnvelopeKind::Attestation, &[7u8; 32], t0 + window / 2),
             "a terminal refusal is not re-asked inside its window"
         );
+    }
+
+    /// A row placed at `room`, as wire bytes, carrying `dimension`.
+    fn audience_row_1148(id: &str, attester: &str, dimension: &str, room: &str) -> Vec<u8> {
+        let row = build_federation_attestation(
+            id,
+            attester,
+            "person-subject",
+            "scores",
+            serde_json::json!({ "dimension": dimension, "community_key_id": room }),
+        );
+        serde_json::to_vec(&row).expect("wire")
+    }
+
+    /// The refusal persist's replicated door answers for a row this node is
+    /// not in the audience for, as the general door books it.
+    fn not_in_audience_outcome_1148() -> ApplyOutcome {
+        use ciris_persist::federation::attestation_apply::{
+            AttestationRefusalReason as R, ReplicatedAttestationOutcome as O,
+        };
+        attestation_outcome_to_apply(
+            O::Refused {
+                reason: R::NotInAudience,
+            },
+            "h",
+        )
+        .0
+    }
+
+    /// persist v61 S2 (CIRISPersist#1148) — **a row refused `not_in_audience`
+    /// is re-asked the moment this node's audience changes, not after the
+    /// terminal window.** The refusal parks the row on its room
+    /// (`audience:group:<room>`); a membership row of that room admitted here
+    /// releases it and the row's `want` is no longer suppressed, so the next
+    /// round (kicked at once in production) asks the offering peer again.
+    /// Mutation: drop the release in `park_or_release` and the last two
+    /// assertions fail (the row waits out `TERMINAL_BASE`, 30 min).
+    #[tokio::test]
+    async fn a_not_in_audience_row_is_released_by_its_rooms_membership_row_1148() {
+        use sha2::{Digest as _, Sha256};
+        let (_backend, bridge) = make_bridge(&[]);
+        let kind = EnvelopeKind::Attestation;
+        let wire = audience_row_1148("grant-1148", "person-owner", "chat:message:v1", "room-1148");
+        let hash: [u8; 32] = Sha256::digest(&wire).into();
+        let refused = not_in_audience_outcome_1148();
+        assert!(is_not_in_audience_refusal(&refused), "{refused:?}");
+        bridge.remember_outcome(kind, &wire, &refused);
+        bridge
+            .park_or_release(kind, &wire, &refused, Some("peer-p"))
+            .await;
+        let backoff = bridge.refusal_backoff_for_test();
+        assert_eq!(
+            backoff.parked_on("audience:group:room-1148"),
+            1,
+            "parked on its room"
+        );
+        assert!(
+            backoff.suppressed_at(kind, &hash, Instant::now() + Duration::from_secs(60)),
+            "quiet while the room has not admitted this node"
+        );
+
+        // The receiver's membership row for that room lands.
+        let widening = audience_row_1148(
+            "widening-1148",
+            "person-founder",
+            "membership:widening:v1",
+            "room-1148",
+        );
+        let before = bridge.signer_releases();
+        bridge
+            .park_or_release(kind, &widening, &ApplyOutcome::Admitted, Some("peer-p"))
+            .await;
+        assert_eq!(backoff.parked_on("audience:group:room-1148"), 0, "released");
+        assert!(bridge.signer_releases() > before, "the release fired");
+        assert!(
+            !backoff.suppressed_at(kind, &hash, Instant::now()),
+            "the row is asked for again at once, not after the 30 min window"
+        );
+    }
+
+    /// persist v61 S2 (#1148) — **with nothing to release it, a row refused
+    /// `not_in_audience` stays parked on the terminal floor and is not asked
+    /// for in a loop.** A membership row of ANOTHER room releases nothing; the
+    /// row stays suppressed through `TERMINAL_BASE`, and a second refusal of
+    /// the same bytes earns a LONGER window (doubling), never the transient
+    /// ladder.
+    #[tokio::test]
+    async fn a_not_in_audience_row_nothing_releases_stays_on_the_terminal_floor_1148() {
+        use crate::replication::refusal_backoff::TERMINAL_BASE;
+        use sha2::{Digest as _, Sha256};
+        let (_backend, bridge) = make_bridge(&[]);
+        let kind = EnvelopeKind::Attestation;
+        let wire = audience_row_1148("grant-1148b", "person-owner", "chat:message:v1", "room-a");
+        let hash: [u8; 32] = Sha256::digest(&wire).into();
+        let refused = not_in_audience_outcome_1148();
+        let t0 = Instant::now();
+        bridge.remember_outcome(kind, &wire, &refused);
+        bridge
+            .park_or_release(kind, &wire, &refused, Some("peer-p"))
+            .await;
+        let other = audience_row_1148("widening-b", "person-x", "membership:widening:v1", "room-b");
+        bridge
+            .park_or_release(kind, &other, &ApplyOutcome::Admitted, Some("peer-p"))
+            .await;
+        let backoff = bridge.refusal_backoff_for_test();
+        assert_eq!(
+            backoff.parked_on("audience:group:room-a"),
+            1,
+            "still parked"
+        );
+        assert!(
+            backoff.suppressed_at(kind, &hash, t0 + TERMINAL_BASE - Duration::from_secs(1)),
+            "quiet for the whole terminal window — no loop"
+        );
+        let second = backoff.record_at(kind, hash, RetryDisposition::Terminal, t0 + TERMINAL_BASE);
+        assert!(
+            second > TERMINAL_BASE,
+            "a repeat refusal backs off further: {second:?}"
+        );
+    }
+
+    /// persist v61 S2 (#1148) — the key-grant door's `not_in_audience` (persist
+    /// folds it into `KeyGrantRefused { attestation_refused, detail }`) is
+    /// recognised and parked like the general door's.
+    #[test]
+    fn the_key_grant_doors_not_in_audience_is_recognised_1148() {
+        let outcome = ApplyOutcome::refused_terminal(format!(
+            "key_grant: row refused at the attestation plane ({ATTESTATION_NOT_IN_AUDIENCE}) — x"
+        ));
+        assert!(is_not_in_audience_refusal(&outcome));
+        assert!(!is_not_in_audience_refusal(
+            &ApplyOutcome::refused_terminal(
+                "Attestation: admission refused (conflicting_attestation; content_hash=h)"
+            )
+        ));
     }
 
     /// CIRISEdge#459 — the wire drive: a same-`attestation_id` row carrying
@@ -25631,6 +25966,9 @@ enum ReleaseCause {
     SignerBound,
     /// The host's release hook, after a local write.
     Host,
+    /// persist v61 S2 (#1148) — a row that changes this node's audience (a
+    /// group's membership row, an owner binding, a replication consent).
+    AudienceChanged,
 }
 
 /// CIRISEdge#858 — the window of the park log: one line per signer per
