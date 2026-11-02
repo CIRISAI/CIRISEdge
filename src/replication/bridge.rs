@@ -548,19 +548,24 @@ pub(crate) fn typed_terminal_verdict(
         E::TraceDimensionInvalid { .. }
         | E::MalformedRow { .. }
         | E::EnvelopeKindRetired { .. } => Some(err.kind()),
-        // persist v55.0.0 (#753) — the two DimensionRejected reasons that are
-        // functions of the row: a family held shut until its door
-        // (`registered_family_held_shut`; a later persist may open it, and the
-        // terminal schedule still re-asks) and a ledger row breaking its L1
-        // triple binding. Every other DimensionRejected keeps the
-        // unclassified transient rule.
+        // persist v55.0.0 (#753) introduced terminal DimensionRejected reasons
+        // one by one (`registered_family_held_shut`, the ledger binding). persist
+        // v61 publishes the predicate: `dimension_rejected_reason::RETRYABLE`
+        // names the reasons a re-offer can turn into an admission, and it is
+        // EMPTY — every gate on this arm is pure over the signed row (v61 adds
+        // `group_plane_row_shape` and `partnership_shape_retired`). Read from
+        // persist, never restated, so a reason persist marks retryable later
+        // goes back to the transient rule by the same pin.
         E::DimensionRejected { reason, .. }
-            if *reason
-                == ciris_persist::federation::admission::REGISTERED_FAMILY_HELD_SHUT_REASON
-                || *reason == ciris_persist::federation::admission::LEDGER_BINDING_REASON =>
+            if !ciris_persist::federation::admission::dimension_rejected_reason::RETRYABLE
+                .contains(reason) =>
         {
             Some(reason)
         }
+        // persist v61 (CIRISPersist#1143) — a change to a DISSOLVED group:
+        // nothing about it is ever admitted again (the dissolution's signed
+        // instant stands), so a re-offer can only be refused again.
+        E::GroupDissolved { .. } => Some(err.kind()),
         // persist v55.0.0 (#989 / #975) — a row type the row-type gate refuses
         // (a retired carrier: a new `holds_bytes` claim, retired in v55, or a
         // key-grant SET), and
@@ -11815,9 +11820,9 @@ pub(crate) mod tests {
     }
 
     /// persist v55.0.0 — the row-shape verdicts. Terminal: `MalformedRow`,
-    /// `AttestationTypeUnregistered`, `PaymentProcessorIdentifier`, and the two
-    /// named `DimensionRejected` reasons. Every other `DimensionRejected` keeps
-    /// the unclassified transient rule.
+    /// `AttestationTypeUnregistered`, `PaymentProcessorIdentifier`, and (v61)
+    /// every `DimensionRejected` reason persist's `RETRYABLE` does not name —
+    /// all of them today — plus `GroupDissolved`.
     #[test]
     fn v55_row_shape_refusals_follow_persists_dispositions() {
         use ciris_persist::federation::admission;
@@ -11856,7 +11861,21 @@ pub(crate) mod tests {
                 dim(admission::LEDGER_BINDING_REASON),
                 RetryDisposition::Terminal,
             ),
-            (dim("missing_version_segment"), RetryDisposition::Transient),
+            // persist v61: `dimension_rejected_reason::RETRYABLE` is empty, so
+            // every reason is the row's own, including v61's
+            // `group_plane_row_shape`.
+            (dim("missing_version_segment"), RetryDisposition::Terminal),
+            (
+                dim(ciris_persist::federation::group_plane::GROUP_PLANE_ROW_SHAPE_REASON),
+                RetryDisposition::Terminal,
+            ),
+            (
+                E::GroupDissolved {
+                    group_key_id: "room-dissolved".to_owned(),
+                    dissolved_at: chrono::Utc::now(),
+                },
+                RetryDisposition::Terminal,
+            ),
         ]);
     }
 
