@@ -105,11 +105,8 @@ classifiers = [
 # DIRECTORY_ABI_VERSION stays 7); the floor moves with the MAJOR.
 # v61.0.0 moves DIRECTORY_ABI_VERSION to 12 (the six framed group listings,
 # ApplyReplicatedCommunity and the member listing leave the capsule).
-# PRESTAGE: the rev pin's crate (and the wheel built from it) still reports
-# 60.1.0, so the floor reads `>=60.1` until the tag swap, where it becomes
-# `>=61,<62` (the skew hook refuses `>=61` against a 60.1.0 resolve, rightly).
 dependencies = [
-    "ciris-persist>=60.1,<62",
+    "ciris-persist>=61,<62",
 ]
 dynamic = ["version"]
 
