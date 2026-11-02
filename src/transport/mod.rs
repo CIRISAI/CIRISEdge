@@ -233,6 +233,12 @@ pub mod route_fetch;
 #[cfg(feature = "_reticulum-module")]
 pub mod link_shaping;
 
+/// CIRISEdge#926 — the link stall guard: a link whose Channel lands nothing
+/// for a run of sends is never chosen again and is closed (or moved off a
+/// dead punched path).
+#[cfg(feature = "_reticulum-module")]
+pub mod link_stall;
+
 /// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
 /// live streams (`FSD/AV_CALL_API.md`).
 #[cfg(feature = "_reticulum-module")]
