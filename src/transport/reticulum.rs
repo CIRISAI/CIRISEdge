@@ -2000,16 +2000,6 @@ pub struct ReticulumTransportConfig {
     /// CC 5.4.3 — this node's link-shaping policy (`CLM-link-shaping`).
     /// Default `off`: nothing is offered and no link is shaped.
     pub shaping: crate::transport::link_shaping::ShapingPolicy,
-    /// Mobile-background lifecycle — opt in to a fully suspendable node
-    /// ([`crate::transport::lifecycle`]). `true` (a phone): TCP clients without
-    /// IFAC or a no-transit posture are attached at runtime, so
-    /// [`ReticulumTransport::suspend`] can detach them and close their
-    /// sockets; they send no tunnel-synthesize handshake (see the lifecycle
-    /// docs for what that costs). `false` (the default; every other node):
-    /// the boot path is unchanged — every client goes through the builder —
-    /// and `suspend` still refuses sends, closes links and parks the
-    /// listener, but reports those clients as open (`quiescent: false`).
-    pub suspendable: bool,
 }
 
 impl ReticulumTransportConfig {
@@ -2037,7 +2027,6 @@ impl ReticulumTransportConfig {
             ifac: None,
             direct_links: crate::transport::direct_path::DirectLinksConfig::default(),
             shaping: crate::transport::link_shaping::ShapingPolicy::default(),
-            suspendable: false,
         }
     }
 
@@ -2610,19 +2599,11 @@ pub struct ReticulumTransport {
     /// Mobile-background lifecycle (see [`crate::transport::lifecycle`]): the
     /// send gate, the listeners' park signal, and the counters suspend reads.
     lifecycle: Arc<crate::transport::lifecycle::Lifecycle>,
-    /// With [`ReticulumTransportConfig::suspendable`] — TCP clients edge
-    /// attaches at runtime (not through the builder), so
-    /// suspend can detach them: dropping a [`TcpClientHandle`] ends the
-    /// client's reconnect loop at whatever await it is parked on and closes
-    /// its socket, and resume re-attaches it from the address alone (a
-    /// config-loaded client would need its `InterfaceConfig` kept to re-add;
-    /// see the lifecycle module docs).
-    /// Clients with IFAC or a no-transit posture still go through the builder
-    /// (the runtime attach carries neither) and are reported as open.
-    runtime_tcp_clients: Vec<SocketAddr>,
-    /// The live handles of [`Self::runtime_tcp_clients`]; empty while
-    /// suspended.
-    tcp_client_handles: std::sync::Mutex<Vec<leviculum_std::interfaces::TcpClientHandle>>,
+    /// Mobile-background lifecycle — every TCP client edge configured, in
+    /// builder order, with the exact `InterfaceConfig` the builder got: suspend
+    /// removes each removable one (`remove_interface`), resume re-adds it from
+    /// that config (`spawn_interface`). See [`TcpClientSlot`].
+    tcp_clients: std::sync::Mutex<Vec<TcpClientSlot>>,
     /// `key_id → rooted peer`, populated by the authenticated
     /// cold-start path from received announces. Every entry has been
     /// rooted against the persist directory + had its attestation
@@ -3500,9 +3481,9 @@ impl ReticulumTransport {
         // what was wired so `transport_stats` + `interface_specs` can
         // surface the configured set.
         let mut interface_specs: Vec<RegisteredInterface> = Vec::new();
-        // Lifecycle — TCP clients attached after `start` (detachable), not
-        // through the builder. See `ReticulumTransport::runtime_tcp_clients`.
-        let mut runtime_tcp_clients: Vec<SocketAddr> = Vec::new();
+        // Lifecycle — the TCP client configs the builder gets, in order, kept
+        // so suspend/resume can remove and re-add them.
+        let mut client_configs: Vec<leviculum_std::config::InterfaceConfig> = Vec::new();
         // CIRISEdge#168 (v5.0) — Transport-node mode. Called
         // explicitly so the config's `false` default is honoured;
         // leviculum's builder otherwise defaults the knob to `true`.
@@ -3609,16 +3590,13 @@ impl ReticulumTransport {
                 ),
             });
             for peer in &config.bootstrap_peers {
-                if config.suspendable && runtime_attachable(config.transit, config.ifac.as_ref()) {
-                    runtime_tcp_clients.push(*peer);
-                } else {
-                    builder = apply_tcp_client_transit(
-                        builder,
-                        *peer,
-                        config.transit,
-                        config.ifac.as_ref(),
-                    );
-                }
+                builder = apply_tcp_client_transit(
+                    builder,
+                    *peer,
+                    config.transit,
+                    config.ifac.as_ref(),
+                    &mut client_configs,
+                );
                 interface_specs.push(RegisteredInterface {
                     handle: InterfaceHandle(interface_specs.len()),
                     kind: "TCPClientInterface".to_string(),
@@ -3637,29 +3615,12 @@ impl ReticulumTransport {
             // `TransportError::Config` if the variant is gated but
             // unimplemented, e.g. I²P).
             for iface in &config.interfaces {
-                #[cfg(feature = "transport-reticulum-tcp-client")]
-                if let ReticulumInterfaceConfig::TcpClient(cfg) = iface {
-                    if config.suspendable && runtime_attachable(cfg.transit, cfg.ifac.as_ref()) {
-                        runtime_tcp_clients.push(cfg.target_addr);
-                        interface_specs.push(RegisteredInterface {
-                            handle: InterfaceHandle(interface_specs.len()),
-                            kind: "TCPClientInterface".to_string(),
-                            stats: TransportStats::minimal(
-                                format!("tcp-client-{}", cfg.target_addr),
-                                "TCPClientInterface",
-                                "online",
-                                0,
-                                0,
-                            ),
-                        });
-                        continue;
-                    }
-                }
                 let (next_builder, kind, name) = apply_interface_config(
                     builder,
                     iface,
                     &mut share_instance_local,
                     &mut connect_instance_local,
+                    &mut client_configs,
                 )?;
                 builder = next_builder;
                 interface_specs.push(RegisteredInterface {
@@ -3849,7 +3810,7 @@ impl ReticulumTransport {
         node.start()
             .await
             .map_err(|e| TransportError::Io(format!("reticulum node start: {e}")))?;
-        let tcp_client_handles = attach_tcp_clients(&node, &runtime_tcp_clients)?;
+        let tcp_clients = TcpClientSlot::after_start(&node, client_configs);
 
         tracing::info!(
             addr = %config.listen_addr,
@@ -3961,8 +3922,7 @@ impl ReticulumTransport {
             test_binding_key_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             events: Mutex::new(Some(events)),
             lifecycle: Arc::new(crate::transport::lifecycle::Lifecycle::default()),
-            runtime_tcp_clients,
-            tcp_client_handles: std::sync::Mutex::new(tcp_client_handles),
+            tcp_clients: std::sync::Mutex::new(tcp_clients),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
@@ -6835,6 +6795,23 @@ impl ReticulumTransport {
         self.resolve_peer(destination_key_id)
             .await
             .map(|p| p.dest_hash.into_bytes())
+    }
+
+    /// Lifecycle test seam — the tunnel ids this node synthesized on its TCP
+    /// clients (leviculum `ReticulumNode::tunnel_ids`).
+    #[doc(hidden)]
+    pub fn tunnel_ids_for_test(&self) -> Vec<[u8; 32]> {
+        self.node.tunnel_ids()
+    }
+
+    /// Lifecycle test seam — the node's interface names now.
+    #[doc(hidden)]
+    pub fn interface_names_for_test(&self) -> Vec<String> {
+        self.node
+            .interface_stats()
+            .into_iter()
+            .map(|i| i.name)
+            .collect()
     }
 
     /// Lifecycle test seam — sends running through the lifecycle gate now.
@@ -18037,7 +18014,13 @@ impl ReticulumTransport {
             return Ok(());
         }
         self.wake_node()?;
-        if !self.runtime_tcp_clients.is_empty() {
+        let any_client = self
+            .tcp_clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|s| s.removable);
+        if any_client {
             let until = tokio::time::Instant::now() + RESUME_CONNECT_WAIT;
             let connected = crate::transport::lifecycle::settle(until, || {
                 let up = self.node.interface_stats().iter().any(|i| i.online);
@@ -18074,18 +18057,25 @@ impl ReticulumTransport {
     }
 
     /// Take the node's interfaces down. Interim (leviculum#90 makes this
-    /// `node.stop()`): detach the runtime TCP clients and remove the
-    /// connections a TCP server accepted. The listening socket itself, and
+    /// `node.stop()`): remove every removable TCP client and the connections
+    /// a TCP server accepted. The listening socket itself, and
     /// any interface edge could not attach at runtime, stay — the report
     /// says so.
     fn quiesce_node(&self) {
-        let detached = std::mem::take(
-            &mut *self
-                .tcp_client_handles
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        drop(detached);
+        for slot in self
+            .tcp_clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter_mut()
+            .filter(|s| s.removable)
+        {
+            // Removing the interface drops its channels; its reconnect loop
+            // ends at its next `is_closed` check and its socket closes
+            // (leviculum#95 — pinned by `tests/transport_suspend.rs`).
+            if let Some(id) = slot.id.take() {
+                let _ = self.node.remove_interface(id);
+            }
+        }
         for iface in self.node.interface_stats() {
             if iface.name.starts_with("tcp_server/") {
                 let _ = self.node.remove_interface(iface.interface_id);
@@ -18093,14 +18083,19 @@ impl ReticulumTransport {
         }
     }
 
-    /// Bring the node's interfaces back (leviculum#90: `node.start()`).
+    /// Bring the node's interfaces back (leviculum#90: `node.start()`): re-add
+    /// each removed TCP client from the config the builder got.
     fn wake_node(&self) -> Result<(), TransportError> {
-        let mut handles = self
-            .tcp_client_handles
+        let mut slots = self
+            .tcp_clients
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if handles.is_empty() {
-            *handles = attach_tcp_clients(&self.node, &self.runtime_tcp_clients)?;
+        for slot in slots.iter_mut().filter(|s| s.removable && s.id.is_none()) {
+            let ids = self
+                .node
+                .spawn_interface(slot.config.clone())
+                .map_err(|e| TransportError::Io(format!("re-add TCP client: {e}")))?;
+            slot.id = ids.first().copied();
         }
         Ok(())
     }
@@ -18136,32 +18131,59 @@ impl ReticulumTransport {
     }
 }
 
-/// Lifecycle — whether a TCP client can be attached at runtime (and so
-/// detached on suspend): leviculum's runtime attach carries neither IFAC nor
-/// a no-transit posture, so those clients stay on the builder.
-fn runtime_attachable(transit: Option<bool>, ifac: Option<&IfacConfig>) -> bool {
-    ifac.is_none() && transit != Some(false)
+/// Mobile-background lifecycle — one TCP client edge configured: the exact
+/// config the builder got, and its interface id while attached.
+struct TcpClientSlot {
+    config: leviculum_std::config::InterfaceConfig,
+    /// `None` while suspended (removed), or when the boot mapping failed.
+    id: Option<leviculum_core::transport::InterfaceId>,
+    /// Re-adding through `spawn_interface` carries the target and IFAC but
+    /// not a no-transit posture (a runtime-added TCP client is always
+    /// transit), so a no-transit client is never removed: suspend reports it
+    /// open.
+    removable: bool,
 }
 
-/// Lifecycle — attach each runtime TCP client to a started node. The handle
-/// keeps it attached; dropping it detaches it (reconnect loop ended, socket
-/// closed).
-fn attach_tcp_clients(
-    node: &ReticulumNode,
-    targets: &[SocketAddr],
-) -> Result<Vec<leviculum_std::interfaces::TcpClientHandle>, TransportError> {
-    targets
-        .iter()
-        .map(|addr| {
-            node.spawn_tcp_client(
-                &format!("tcp-client-{addr}"),
-                &addr.ip().to_string(),
-                addr.port(),
-                None,
-            )
-            .map_err(|e| TransportError::Io(format!("attach TCP client {addr}: {e}")))
-        })
-        .collect()
+impl TcpClientSlot {
+    /// Pair each configured client with the interface the node started for
+    /// it. Config-loaded clients are named `tcp_client_<index>` and are the
+    /// only `TCPClientInterface`s at start, in builder order. If the counts
+    /// disagree, nothing is removable (suspend then reports them open rather
+    /// than guess).
+    fn after_start(
+        node: &ReticulumNode,
+        configs: Vec<leviculum_std::config::InterfaceConfig>,
+    ) -> Vec<Self> {
+        let mut started: Vec<(usize, leviculum_core::transport::InterfaceId)> = node
+            .interface_stats()
+            .into_iter()
+            .filter_map(|i| {
+                i.name
+                    .strip_prefix("tcp_client_")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .map(|n| (n, i.interface_id))
+            })
+            .collect();
+        started.sort_by_key(|(n, _)| *n);
+        let mapped = started.len() == configs.len();
+        if !mapped {
+            tracing::warn!(
+                configured = configs.len(),
+                started = started.len(),
+                "lifecycle: TCP clients at start do not match the configured set; suspend \
+                 will leave them attached and report them open"
+            );
+        }
+        configs
+            .into_iter()
+            .enumerate()
+            .map(|(i, config)| Self {
+                removable: mapped && config.transit != Some(false),
+                id: if mapped { Some(started[i].1) } else { None },
+                config,
+            })
+            .collect()
+    }
 }
 
 fn apply_tcp_server_transit(
@@ -18203,9 +18225,27 @@ fn apply_tcp_client_transit(
     addr: SocketAddr,
     transit: Option<bool>,
     ifac: Option<&IfacConfig>,
+    client_configs: &mut Vec<leviculum_std::config::InterfaceConfig>,
 ) -> ReticulumNodeBuilder {
+    // Lifecycle — the config is built here (field for field what
+    // `add_tcp_client` / `add_tcp_client_ifac` push) and handed to the builder
+    // through `add_interface_config`, so the boot path is unchanged and the
+    // same config can re-add the client after a suspend.
+    let config = tcp_client_interface_config(addr, transit, ifac);
+    client_configs.push(config.clone());
+    builder.add_interface_config(config)
+}
+
+/// The `InterfaceConfig` for one TCP client — exactly what leviculum's
+/// `add_tcp_client` (open), `add_tcp_client_ifac` (IFAC) or edge's own no-transit
+/// section (CIRISEdge#492) put on the builder.
+fn tcp_client_interface_config(
+    addr: SocketAddr,
+    transit: Option<bool>,
+    ifac: Option<&IfacConfig>,
+) -> leviculum_std::config::InterfaceConfig {
     match (ifac, transit == Some(false)) {
-        (ifac_opt, true) => builder.add_interface_config(leviculum_std::config::InterfaceConfig {
+        (ifac_opt, true) => leviculum_std::config::InterfaceConfig {
             interface_type: "TCPClientInterface".to_string(),
             name: "TCP Client".to_string(),
             target_host: Some(addr.ip().to_string()),
@@ -18215,14 +18255,23 @@ fn apply_tcp_client_transit(
             passphrase: ifac_opt.as_ref().map(|i| i.passphrase.clone()),
             ifac_size: ifac_opt.as_ref().map(|i| i.ifac_size),
             ..Default::default()
-        }),
-        (Some(ifac), false) => builder.add_tcp_client_ifac(
-            addr,
-            ifac.networkname.as_deref(),
-            &ifac.passphrase,
-            ifac.ifac_size,
-        ),
-        (None, false) => builder.add_tcp_client(addr),
+        },
+        (Some(ifac), false) => leviculum_std::config::InterfaceConfig {
+            name: "TCP Client".to_string(),
+            interface_type: "TCPClientInterface".to_string(),
+            target_host: Some(addr.ip().to_string()),
+            target_port: Some(addr.port()),
+            networkname: ifac.networkname.clone(),
+            passphrase: Some(ifac.passphrase.clone()),
+            ifac_size: Some(ifac.ifac_size),
+            ..Default::default()
+        },
+        (None, false) => leviculum_std::config::InterfaceConfig {
+            interface_type: "TCPClientInterface".to_string(),
+            target_host: Some(addr.ip().to_string()),
+            target_port: Some(addr.port()),
+            ..Default::default()
+        },
     }
 }
 
@@ -18239,6 +18288,7 @@ fn apply_interface_config(
     iface: &ReticulumInterfaceConfig,
     share_instance: &mut Option<String>,
     connect_instance: &mut Option<String>,
+    client_configs: &mut Vec<leviculum_std::config::InterfaceConfig>,
 ) -> Result<(ReticulumNodeBuilder, &'static str, String), TransportError> {
     match iface {
         #[cfg(feature = "transport-reticulum-auto")]
@@ -18277,8 +18327,13 @@ fn apply_interface_config(
         ReticulumInterfaceConfig::TcpClient(cfg) => {
             let name = format!("tcp-client-{}", cfg.target_addr);
             // CIRISEdge#492 — scoped-transit posture via the shared mapper.
-            builder =
-                apply_tcp_client_transit(builder, cfg.target_addr, cfg.transit, cfg.ifac.as_ref());
+            builder = apply_tcp_client_transit(
+                builder,
+                cfg.target_addr,
+                cfg.transit,
+                cfg.ifac.as_ref(),
+                client_configs,
+            );
             Ok((builder, "TCPClientInterface", name))
         }
         #[cfg(feature = "transport-reticulum-udp")]

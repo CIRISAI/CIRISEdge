@@ -222,12 +222,11 @@ impl Drop for OwnRuntime {
     }
 }
 
-/// A listens (the canonical); B is client-only — `suspendable` as given (a
-/// phone sets it), holds A's hybrid-signed route
+/// A listens (the canonical); B is client-only, holds A's hybrid-signed route
 /// (so it can seal to A and attribute A's frames), and replicates
 /// Attestations with A.
 #[allow(clippy::too_many_lines)]
-async fn pair(tag: &str, suspendable: bool) -> Pair {
+async fn pair(tag: &str) -> Pair {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "warn,ciris_edge=info".into()),
@@ -275,7 +274,6 @@ async fn pair(tag: &str, suspendable: bool) -> Pair {
                 },
             )];
             c.announce_interval = Duration::from_secs(5);
-            c.suspendable = suspendable;
             (c, auth(signer, &dir))
         }
     })
@@ -456,7 +454,7 @@ fn assert_quiet(r: &SuspendReport, what: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
     let _serial = SERIAL.lock().await;
-    let p = pair("mid", true).await;
+    let p = pair("mid").await;
     p.b_reaches_a(b"warm-up").await;
     assert!(p.b.link_count().await >= 1, "B holds a link to A");
 
@@ -553,7 +551,7 @@ async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_suspend_resume_cycles_do_not_grow() {
     let _serial = SERIAL.lock().await;
-    let p = pair("cycles", true).await;
+    let p = pair("cycles").await;
     p.b_reaches_a(b"cycle-0").await;
     let mut marks = Vec::new();
     for i in 1..=4u8 {
@@ -586,7 +584,7 @@ async fn repeated_suspend_resume_cycles_do_not_grow() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn suspend_returns_by_its_deadline_and_reports_the_listener() {
     let _serial = SERIAL.lock().await;
-    let p = pair("deadline", true).await;
+    let p = pair("deadline").await;
     p.b_reaches_a(b"open a link").await;
     p.a.delay_resource_ships_for_test(60_000);
     p.a.delay_channel_sends_for_test(60_000);
@@ -626,35 +624,92 @@ async fn suspend_returns_by_its_deadline_and_reports_the_listener() {
     p.a.resume().await.expect("resume A");
 }
 
-/// **Opt-in.** A node not built `suspendable` (the default) boots exactly as
-/// before — its TCP client goes through the builder — and a suspend still
-/// refuses sends, closes its links and parks its listener, but reports that
-/// client as open: `interfaces_open > 0`, `quiescent: false`, its connection
-/// to A still ESTABLISHED. Resume brings it back to sending.
+/// **Boot is unchanged; suspend is full.** B is built with no lifecycle
+/// configuration at all: its client is the builder's (`tcp_client_0`) and
+/// sends its tunnel-synthesize at boot, as on main. Suspend removes it —
+/// `interfaces_open: 0`, no ESTABLISHED connection on A's port, `quiescent` —
+/// and resume re-adds it from the saved config and B sends again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_default_node_boots_unchanged_and_reports_its_builder_client_open() {
+async fn a_default_node_boots_unchanged_and_suspends_fully() {
     let _serial = SERIAL.lock().await;
-    let p = pair("default", false).await;
+    let p = pair("default").await;
     p.b_reaches_a(b"default boot").await;
-    let r = p.b.suspend(Duration::from_secs(2)).await;
-    assert!(
-        r.interfaces_open > 0,
-        "the builder-attached client is reported open: {r:?}"
+    assert_eq!(
+        p.b.interface_names_for_test(),
+        vec!["tcp_client_0".to_string()],
+        "B's client is the builder's, as on main"
     );
-    assert!(!r.quiescent, "never quiescent with a client open: {r:?}");
-    assert!(!r.listener_open, "B has no listener: {r:?}");
-    assert_eq!(r.links_open, 0, "the links are closed all the same: {r:?}");
-    assert_eq!(r.edge_tasks, 0, "the listener parked all the same: {r:?}");
-    assert!(
-        established_on(p.port_a) >= 2,
-        "the builder client's connection stays up: {}",
-        established_on(p.port_a)
+    assert_eq!(
+        p.b.tunnel_ids_for_test().len(),
+        1,
+        "the builder client synthesized its tunnel at boot"
     );
-    let refused = p.b.send(&p.key_a.key_id, b"while suspended").await;
-    assert!(
-        matches!(refused, Err(TransportError::Suspended)),
-        "{refused:?}"
-    );
+    let r = p.b.suspend(Duration::from_secs(10)).await;
+    assert_quiet(&r, "default node");
+    let closed = wait_until(Duration::from_secs(5), || async {
+        established_on(p.port_a) == 0
+    })
+    .await;
+    assert!(closed, "no ESTABLISHED connection on A's port");
     p.b.resume().await.expect("resume");
     p.b_reaches_a(b"default resumed").await;
+}
+
+/// **The path back after resume.** Suspending B drops A's path to B (its
+/// interface went down). Within a second of `resume` returning, A has a path
+/// back to B again — relearned by announce on the re-added interface; the
+/// re-added client sends no tunnel-synthesize on leviculum c6d0a224 (see the
+/// lifecycle docs), and B's tunnel ids say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_resume_the_canonical_has_a_path_back_within_a_second() {
+    let _serial = SERIAL.lock().await;
+    let p = pair("pathback").await;
+    p.b_reaches_a(b"pathback boot").await;
+    let named_b = p.b.local_named_dest_hash();
+    let a_has_path = || {
+        p.a.path_table_rows_for_test()
+            .iter()
+            .any(|r| r.0 == named_b)
+    };
+    assert!(a_has_path(), "A routes to B before the suspend");
+    let r = p.b.suspend(Duration::from_secs(10)).await;
+    assert_quiet(&r, "pathback");
+    let dropped = wait_until(Duration::from_secs(5), || async { !a_has_path() }).await;
+    assert!(dropped, "A's path to B goes with B's interface");
+    p.b.resume().await.expect("resume");
+    let back = wait_until(Duration::from_secs(1), || async { a_has_path() }).await;
+    assert!(back, "A has a path back to B within a second of resume");
+    assert!(
+        p.b.tunnel_ids_for_test().is_empty(),
+        "the re-added client sent no tunnel-synthesize (leviculum c6d0a224)"
+    );
+}
+
+/// **leviculum#95 is false — pinned.** A TCP client removed through
+/// `remove_interface` (what suspend does) does not reconnect: for 12 s — past
+/// two of its 5 s reconnect intervals — against a live A, no connection on
+/// A's port is ever ESTABLISHED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_tcp_client_does_not_reconnect_95() {
+    let _serial = SERIAL.lock().await;
+    let p = pair("95").await;
+    p.b_reaches_a(b"95 boot").await;
+    let r = p.b.suspend(Duration::from_secs(10)).await;
+    assert_quiet(&r, "95");
+    let closed = wait_until(Duration::from_secs(5), || async {
+        established_on(p.port_a) == 0
+    })
+    .await;
+    assert!(closed, "the removed client's connection closed");
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(12) {
+        assert_eq!(
+            established_on(p.port_a),
+            0,
+            "the removed client reconnected after {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    p.b.resume().await.expect("resume");
 }

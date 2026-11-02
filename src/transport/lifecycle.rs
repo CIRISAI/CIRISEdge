@@ -41,48 +41,45 @@
 //!    its announce cold-start worker, and parks on the resume signal — a parked
 //!    future with no timer, holding the node's event receiver so resume needs
 //!    no second `listen`.
-//! 4. **Detach the interfaces.** On a node built with
-//!    [`ReticulumTransportConfig::suspendable`](super::reticulum::ReticulumTransportConfig::suspendable)
-//!    (a phone), every TCP client without IFAC or a no-transit posture is a
-//!    runtime-attached leviculum client whose handle, when dropped, ends its
-//!    reconnect loop at whatever await it is parked on and closes its socket.
-//!    A node that is not `suspendable` (the default; its boot path is
-//!    unchanged) keeps its builder clients through a suspend and reports them
-//!    in `interfaces_open`, never `quiescent`. (A config-loaded client *can*
-//!    be removed: `remove_interface` drops its channels and its reconnect loop
-//!    ends at its next `incoming_tx.is_closed()` check — leviculum confirmed
-//!    this on c6d0a224 and v0.33, closing leviculum#95, which an earlier edge
-//!    note had wrongly claimed. Re-adding it on resume needs its
-//!    `InterfaceConfig` through `spawn_interface`, which would also keep the
-//!    tunnel handshake below; that is the follow-up that could retire the
-//!    `suspendable` runtime attach.) Connections a TCP *server*
-//!    accepted are removed; the listening socket itself cannot be closed
-//!    without stopping the node, so a node with a server reports
-//!    `listener_open: true` and is never reported quiescent.
+//! 4. **Remove the interfaces.** Every TCP client edge configured goes
+//!    through the builder exactly as on any node (the boot path does not
+//!    change); edge keeps the `InterfaceConfig` it handed the builder. Suspend
+//!    removes each client with `remove_interface`: its channels drop, its
+//!    reconnect loop ends at its next `incoming_tx.is_closed()` check and its
+//!    socket closes (leviculum#95 claimed otherwise; it was edge's misreading,
+//!    and `tests/transport_suspend.rs` pins the true behaviour). Resume re-adds
+//!    each from its saved config with `spawn_interface`, which carries the
+//!    target and IFAC but not a no-transit posture — so a no-transit client is
+//!    never removed, and a node with one reports it in `interfaces_open`,
+//!    never `quiescent`. Connections a TCP *server* accepted are removed; the
+//!    listening socket itself cannot be closed without stopping the node, so a
+//!    node with a server reports `listener_open: true` and is never reported
+//!    quiescent.
 //!
-//! # What a runtime-attached client gives up: the tunnel handshake
+//! # The tunnel handshake and the path back after resume
 //!
-//! Checked against leviculum c6d0a224. The fork *does* keep a tunnel table
-//! (`leviculum-core/src/tunnel.rs`, `Transport::tunnels`, Python-RNS
-//! `Transport.py` tunnels, Codeberg #64); edge's older note in
-//! `routing_tunnels` that it keeps none is stale. A config-loaded TCP client
-//! is registered tunnel-capable and, on every connect and reconnect, sends a
-//! signed `rnstransport.tunnel.synthesize` to the node it dials. That node —
-//! the canonical, for a phone — derives a `tunnel_id` from our transport key
-//! and interface hash, and holds (for eight hours) the paths it learned over
-//! that connection, i.e. the route back to this node's destinations. When
-//! the client reconnects and synthesizes again, the canonical restores those
-//! paths at once, re-homed onto the new connection, without waiting for an
-//! announce.
+//! Checked against leviculum c6d0a224, in source and by experiment. The fork
+//! keeps a tunnel table (`leviculum-core/src/tunnel.rs`, `Transport::tunnels`,
+//! Codeberg #64; edge's older note in `routing_tunnels` that it keeps none is
+//! stale). A config-loaded TCP client registers tunnel-capable at start
+//! (`register_interface_config`) and sends a signed tunnel-synthesize on every
+//! connect; the node it dials keeps the paths learned over that connection for
+//! eight hours and restores them when the same tunnel reappears. The tunnel id
+//! is derived from `tcp_client_<index>`.
 //!
-//! `spawn_tcp_client` registers no tunnel interface and sends no synthesize.
-//! For a suspendable node that reconnects, the canonical therefore relearns
-//! the route back to it from its announce instead: resume waits (bounded) for
-//! a client to come online, and the woken listener announces then; every new
-//! link also triggers an event-driven announce. The cost is the window between
-//! the reconnect and that announce — seconds — in which the canonical has no
-//! path to this node; traffic for it in that window is retried or held by the
-//! sender. A non-suspendable node keeps the handshake exactly as before.
+//! A client re-added through `spawn_interface` is *not* registered
+//! tunnel-capable (only start-up and a `bootstrap_only` re-attach call
+//! `register_interface_config`), so it sends no synthesize — and its fresh
+//! index would give a new tunnel id anyway. Observed: after resume, no
+//! `TUNNEL_SYNTHESIZE_SENT`, no `TUNNEL_REAPPEARED` at the canonical, and the
+//! resumed node's `tunnel_ids()` empty. The canonical still had a path back
+//! at the first look after `resume` returned (it waits, bounded, for a client
+//! to connect): leviculum announces the local destinations on a newly
+//! registered interface (`handle_interface_up`) and the woken listener
+//! announces too, so the route is relearned by announce, not restored by
+//! tunnel. Same-tunnel restore across a suspend needs the client back under its
+//! original index — leviculum#90's `stop_shared`/`start_shared` (v0.33) does
+//! that.
 //!
 //! What stays until leviculum#90: the node's own event loop (idle, no
 //! interfaces) and its traffic-counter thread. [`SuspendReport::node_tasks`]
