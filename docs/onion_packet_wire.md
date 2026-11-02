@@ -300,3 +300,25 @@ n = 1, 2, 3.
     (FSD/ONION_ROUTING.md §8).
   - Persist has no `onion_hop_pubkeys` reader before 61.0.1 (CIRISPersist#1181).
   - Persist has no `pseudonym` or rendezvous gate (CIRISPersist#1149).
+
+## 10. Source map (at the submission commit)
+
+| What | Where |
+|---|---|
+| Identifier, sizes, labels, flags | `src/onion/packet.rs:59` |
+| Decapsulation (seed and split forms) | `src/onion/packet.rs:274` |
+| X-Wing combiner | `src/onion/packet.rs:314` |
+| Key derivation | `src/onion/packet.rs:509` |
+| LIONESS encrypt / decrypt | `src/onion/packet.rs:570`, `:579` |
+| Slot commitment | `src/onion/packet.rs:589` |
+| Encapsulation | `src/onion/packet.rs:598` |
+| Header build | `src/onion/packet.rs:648` |
+| Body open | `src/onion/packet.rs:741` |
+| Peel (acceptance steps 2–8) | `src/onion/packet.rs:877` |
+| Receiver's fetched-body open | `src/onion/packet.rs:927` |
+| Tag-resistance witness | `src/onion/packet.rs:1003` |
+| KATs | `src/onion/packet.rs:1183`, `:1204` |
+| `CONP` framing | `src/onion/relay.rs:24` |
+| Relay acceptance (steps 1, 9–11) | `src/onion/relay.rs:172` |
+| Refusal tokens | `src/onion/tokens.rs` |
+| Transport intake and forward | `src/transport/reticulum.rs:13962` (`handle_onion_frame`) |

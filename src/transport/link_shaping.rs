@@ -1454,6 +1454,7 @@ mod tests {
     /// The CC 5.4.3 table's values ride with each class, and the cost
     /// columns match the rate.
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn the_fleet_default_is_on_for_server_only_and_opt_in_elsewhere() {
         for (kind, unmetered, class, general) in [
             (DeviceKind::Server, true, BudgetClass::Server, true),
@@ -1601,6 +1602,7 @@ mod tests {
     /// cannot ride the shaped row plane. At the server class a row of up to
     /// about 2 MB fits (ρ·rate·W = 0.5 × 7000 × 600 B).
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn a_shaped_link_carries_rows_and_refuses_bulk_by_name() {
         let ours = ShapingPolicy::for_class(BudgetClass::Server);
         let t = LinkShapers::new(ours);

@@ -12,6 +12,10 @@ use super::tokens;
 use crate::transport::onion_layers::{LayerDeal, LAYERS};
 use crate::transport::onion_liveness::MIN_ANSWERING;
 
+/// Resolves a dealt relay's key id to its identity destination hash and its
+/// hop key ([`crate::onion::hop_key::hop_key_for`]).
+pub type HopResolver<'a> = dyn Fn(&str) -> Option<([u8; 16], HopKey)> + Sync + 'a;
+
 /// One hop of a chosen route, resolved for building.
 #[derive(Debug, Clone)]
 pub struct RouteHop {
@@ -66,7 +70,7 @@ pub fn pick_route(
             return Err(tokens::UNAVAILABLE_LIVENESS);
         }
         let i = uniform(candidates.len(), rng).map_err(|_| tokens::ROUTE_FAILED)?;
-        out[l] = candidates[i].clone();
+        out[l].clone_from(candidates[i]);
     }
     Ok(out)
 }
@@ -167,9 +171,9 @@ mod tests {
             pick_route(&deal, &me, &all, &mut rng).unwrap_err(),
             tokens::UNAVAILABLE_LIVENESS
         );
-        let none = |_: &str| false;
+        let silent = |_: &str| false;
         assert_eq!(
-            pick_route(&deal, "nobody", &none, &mut rng).unwrap_err(),
+            pick_route(&deal, "nobody", &silent, &mut rng).unwrap_err(),
             tokens::UNAVAILABLE_LIVENESS
         );
         let thin = deal_layers(&nine[..2], 3, 2);

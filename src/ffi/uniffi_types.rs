@@ -452,6 +452,7 @@ pub struct EdgeShapingClassInfo {
 
 /// The Anonymous Tier on this node (`onion_status`), counts only.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // each a separate fact the client shows
 pub struct EdgeOnionStatus {
     pub enabled: bool,
     pub active: bool,

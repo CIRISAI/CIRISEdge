@@ -7195,7 +7195,7 @@ impl ReticulumTransport {
     pub async fn onion_publish(
         &self,
         payload: &[u8],
-        resolve: &(dyn Fn(&str) -> Option<([u8; 16], crate::onion::packet::HopKey)> + Sync),
+        resolve: &crate::onion::sender::HopResolver<'_>,
     ) -> Result<(), &'static str> {
         use crate::onion::tokens;
         let onion = &self.onion;
@@ -13962,11 +13962,11 @@ async fn shaped_link_to_dest(ctx: &EventCtx<'_>, dest: [u8; 16]) -> Option<LinkI
 async fn handle_onion_frame(ctx: &EventCtx<'_>, link_id: LinkId, data: &[u8]) {
     use crate::onion::relay::RelayAction;
     use crate::onion::tokens;
-    let shaped = ctx.shapers.is_shaped(link_id.into_bytes());
+    let on_shaped_link = ctx.shapers.is_shaped(link_id.into_bytes());
     let now = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
     let period = crate::transport::onion_layers::period_of(now);
     let body = &data[crate::onion::relay::ONION_FRAME_MAGIC.len()..];
-    match ctx.onion.accept_inbound(body, shaped, period) {
+    match ctx.onion.accept_inbound(body, on_shaped_link, period) {
         Err(token) => drop_inbound(
             Some(link_id),
             token,
