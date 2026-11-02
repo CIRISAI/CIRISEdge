@@ -571,3 +571,34 @@ fn refusal_tokens_are_stable_and_distinct() {
         assert!(t.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
     }
 }
+
+/// CC 5.3.3.2.3 / CC 2.6.3: both signature lengths MUST hold at parse, so an
+/// ML-DSA-65 signature of any length but 3309 is refused before verify.
+#[test]
+fn binding_parse_enforces_both_signature_lengths() {
+    let good = StreamKeyBinding {
+        room: "room".to_owned(),
+        publisher: "pub".to_owned(),
+        join_nonce: [1u8; 32],
+        stream: StreamId([2u8; 32]),
+        epoch: Epoch(1),
+        chunk_key: [3u8; 32],
+        sig_ed25519: vec![0u8; 64],
+        sig_ml_dsa_65: vec![0u8; ML_DSA_65_SIG_LEN],
+    };
+    assert!(StreamKeyBinding::from_bytes(&good.to_bytes()).is_ok());
+    for len in [1, ML_DSA_65_SIG_LEN - 1, ML_DSA_65_SIG_LEN + 1] {
+        let mut bad = good.clone();
+        bad.sig_ml_dsa_65 = vec![0u8; len];
+        assert!(
+            matches!(
+                StreamKeyBinding::from_bytes(&bad.to_bytes()),
+                Err(BindingError::Malformed("signature length"))
+            ),
+            "ML-DSA length {len} must be refused at parse"
+        );
+    }
+    let mut bad = good.clone();
+    bad.sig_ed25519 = vec![0u8; 63];
+    assert!(StreamKeyBinding::from_bytes(&bad.to_bytes()).is_err());
+}

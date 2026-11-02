@@ -112,6 +112,10 @@ use crate::transport::realtime_av::{inner_sealed_from_parts, Epoch, InnerSealed,
 /// The bytes a chunk's source signature adds to its inner unit.
 pub const CHUNK_SIG_LEN: usize = 64;
 
+/// The ML-DSA-65 signature length (FIPS 204) a [`StreamKeyBinding`] must carry;
+/// enforced at parse like Ed25519's 64 (CC 5.3.3.2.3, CC 2.6.3).
+pub const ML_DSA_65_SIG_LEN: usize = 3309;
+
 /// The domain tag of a chunk's source signature.
 const CHUNK_SIG_DOMAIN: &[u8] = b"ciris-edge:av-chunk-sig:v1";
 
@@ -560,7 +564,8 @@ impl StreamKeyBinding {
         if !r.0.is_empty() {
             return Err(BindingError::Malformed("trailing bytes"));
         }
-        if sig_ed25519.len() != 64 || sig_ml_dsa_65.is_empty() {
+        // CC 5.3.3.2.3 / CC 2.6.3: both fixed lengths MUST hold at parse.
+        if sig_ed25519.len() != 64 || sig_ml_dsa_65.len() != ML_DSA_65_SIG_LEN {
             return Err(BindingError::Malformed("signature length"));
         }
         Ok(Self {
