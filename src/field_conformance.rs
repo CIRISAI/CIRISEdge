@@ -559,8 +559,8 @@ pub const DEFERRED_PENDING_PLANE: &[(&str, &str)] = &[
     ),
     (
         "delivery durability",
-        "processed by messages GoalDeclaration::DELIVERY / GoalRetirement::DELIVERY; covered \
-      by the messages module tests.",
+        "processed by messages Withdraws::DELIVERY (Durable: TTL, attempts, persistence); \
+      pinned by tests/ceg_content_discipline.rs.",
     ),
     (
         "holder staleness/TTL + ContentMiss->withdraws",

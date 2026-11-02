@@ -21,7 +21,7 @@ use std::time::Duration as StdDuration;
 const PROBE_DELAY_MS: u64 = 50;
 
 fn bridge_with_permits(
-    backend: &Arc<MemoryBackend>,
+    backend: &Arc<SqliteBackend>,
     cohort: &[&str],
     permits: usize,
 ) -> FederationDirectoryReplicationBridge {
@@ -58,7 +58,7 @@ fn ago(by: StdDuration) -> Instant {
 /// of the eight missed and re-read the send-set (8 reads).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_send_set_is_reread_once_for_every_concurrent_sweep_817() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let bridge = bridge_with_permits(&backend, &[], 2);
     *bridge.consent_memo.lock().unwrap() = Some((
         ResolvedPeerSet::from_consent_peers(Vec::new()),
@@ -106,7 +106,7 @@ async fn an_expired_send_set_is_reread_once_for_every_concurrent_sweep_817() {
 /// walk's answer. Fails on v40.0.3 (8 walks).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_owner_binding_is_walked_once_for_every_concurrent_caller_817() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     register_fixture_keys(
         &backend,
         &[
@@ -151,7 +151,7 @@ async fn an_expired_owner_binding_is_walked_once_for_every_concurrent_caller_817
 /// instead of joining the stale walk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invalidation_mid_flight_starts_a_fresh_walk_817() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let bridge = Arc::new(bridge_with_permits(&backend, &[], 2));
     let before = bridge.owner_reads.load(Ordering::SeqCst);
     let stale = {
@@ -186,7 +186,7 @@ async fn an_invalidation_mid_flight_starts_a_fresh_walk_817() {
 /// read still makes a third).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn group_plane_and_send_set_reads_are_bounded_by_the_sweep_permits_817() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     register_fixture_keys(
         &backend,
         &[
@@ -248,7 +248,7 @@ async fn group_plane_and_send_set_reads_are_bounded_by_the_sweep_permits_817() {
 /// page acquires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_send_set_permit_does_not_re_enter_the_gate_817() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let bridge = bridge_with_permits(&backend, &[], 1);
     bridge.read_probe.delay_ms.store(0, Ordering::SeqCst);
     let peers: Vec<String> = (0..4).map(|i| format!("node-peer-{i}")).collect();
@@ -292,7 +292,7 @@ async fn one_deliver_walks_the_trust_root_once_and_the_next_sees_a_revocation_81
     let local = "local-node";
     let producer = "producer";
     let peer = "rooted-peer";
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     register_fixture_keys(
         &backend,
         &[

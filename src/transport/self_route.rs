@@ -654,7 +654,7 @@ mod tests {
     use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
     use ciris_persist::federation::types::{algorithm, identity_type, KeyRecord, SignedKeyRecord};
     use ciris_persist::federation::FederationDirectory;
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
 
     const DEST: [u8; 16] = [0xab; 16];
     const OTHER_DEST: [u8; 16] = [0xcd; 16];
@@ -705,12 +705,12 @@ mod tests {
 
     /// Register `signer`'s pubkeys as a federation key so its signatures
     /// verify against the PINNED directory entry at admission.
-    async fn register(backend: &Arc<MemoryBackend>, signer: &LocalSigner) {
+    async fn register(backend: &Arc<SqliteBackend>, signer: &LocalSigner) {
         register_as(backend, signer, identity_type::NODE).await;
     }
 
     /// [`register`] under a chosen `identity_type` (CIRISEdge#888).
-    async fn register_as(backend: &Arc<MemoryBackend>, signer: &LocalSigner, kind: &str) {
+    async fn register_as(backend: &Arc<SqliteBackend>, signer: &LocalSigner, kind: &str) {
         let ed_pub = HardwareSigner::public_key(signer.classical.as_ref())
             .await
             .expect("ed25519 pubkey");
@@ -758,8 +758,8 @@ mod tests {
             .clone()
     }
 
-    fn backend() -> Arc<MemoryBackend> {
-        Arc::new(MemoryBackend::new())
+    fn backend() -> Arc<SqliteBackend> {
+        Arc::new(ciris_persist::store::test_backend::test_backend())
     }
 
     /// The headline field-provenance test: the producer emits through
@@ -1135,7 +1135,7 @@ mod tests {
         }
     }
 
-    async fn backend_with(signer: &LocalSigner) -> Arc<MemoryBackend> {
+    async fn backend_with(signer: &LocalSigner) -> Arc<SqliteBackend> {
         let b = backend();
         register(&b, signer).await;
         b

@@ -54,7 +54,7 @@ use crate::transport::TransportId;
 /// can hold an `Arc<dyn VerifyDirectory>` — `FederationDirectory`
 /// itself uses `impl Future` returns (RPIT in trait) which makes it
 /// non-dyn-compatible. Blanket-implemented for any
-/// `FederationDirectory`, so hosts can pass `Arc::new(MemoryBackend)`
+/// `FederationDirectory`, so hosts can pass `Arc::new(SqliteBackend)`
 /// or `Arc::new(PostgresBackend)` without picking edge's generics.
 #[async_trait]
 pub trait VerifyDirectory: Send + Sync + 'static {

@@ -50,15 +50,15 @@ use std::sync::Arc;
 
 use ciris_persist::federation::types::{identity_type, KeyRecord, SignedKeyRecord};
 use ciris_persist::federation::FederationDirectory;
-use ciris_persist::store::MemoryBackend;
+use ciris_persist::store::SqliteBackend;
 
 use ciris_edge::replication::bridge::{CohortProvider, FederationDirectoryReplicationBridge};
 use ciris_edge::replication::{EnvelopeKind, ReplicationDirectory};
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-fn fresh_bridge(cohort: Vec<String>) -> (Arc<MemoryBackend>, FederationDirectoryReplicationBridge) {
-    let backend = Arc::new(MemoryBackend::new());
+fn fresh_bridge(cohort: Vec<String>) -> (Arc<SqliteBackend>, FederationDirectoryReplicationBridge) {
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let dir: Arc<dyn FederationDirectory> = backend.clone();
     let cohort_cb: CohortProvider = Arc::new(move || cohort.clone());
     let bridge = FederationDirectoryReplicationBridge::new(dir, cohort_cb);

@@ -884,7 +884,7 @@ impl AccordRelayGate {
 mod tests {
     use super::*;
     use ciris_persist::federation::trust_root::{AccordRootSource, ACCORD_HEARTBEAT_DIMENSION};
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
 
     /// The three-bool verdict, spelled out at every call so a test's INPUT is
     /// legible next to its expectation.
@@ -1475,7 +1475,8 @@ mod tests {
 
     #[test]
     fn no_local_identity_refuses_every_object() {
-        let dir: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> =
+            Arc::new(ciris_persist::store::test_backend::test_backend());
         let gate = AccordRelayGate::new(dir, None);
         assert_eq!(
             gate.decide(&subject("humanity-accord", "any-holder"), now()),
@@ -1490,7 +1491,8 @@ mod tests {
     /// different fact from any decided refusal.
     #[test]
     fn an_unprimed_gate_refuses_as_unresolved_not_as_a_decision() {
-        let dir: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> =
+            Arc::new(ciris_persist::store::test_backend::test_backend());
         let gate = AccordRelayGate::new(dir, Some("this-node".into()));
         assert_eq!(
             gate.decide(&subject("humanity-accord", "holder-a"), now()),
@@ -1508,7 +1510,8 @@ mod tests {
     /// not.
     #[tokio::test]
     async fn priming_an_unheld_root_caches_a_cannot_judge_verdict() {
-        let dir: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> =
+            Arc::new(ciris_persist::store::test_backend::test_backend());
         let gate = AccordRelayGate::new(dir, Some("this-node".into()));
         let t0 = now();
         let s = gate
@@ -1580,7 +1583,7 @@ mod tests {
     /// Seed a keyless accord family (`put_family_local` — a family holds no key
     /// and cannot sign its own declaration), the way persist's own
     /// `seed_test_family` does.
-    async fn seed_family(backend: &MemoryBackend, root: &str, members: &[&str]) {
+    async fn seed_family(backend: &SqliteBackend, root: &str, members: &[&str]) {
         use ciris_persist::federation::types::{Family, FamilyMember};
         let founded: chrono::DateTime<chrono::Utc> = "2020-01-01T00:00:00Z"
             .parse()
@@ -1626,7 +1629,7 @@ mod tests {
         let stranger: &str = &zid("relay-stranger");
         let us: &str = &zid("relay-this-node");
 
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         for who in [root, seated, stranger, us] {
             backend
                 .put_public_key(key(who))
@@ -1710,7 +1713,7 @@ mod tests {
         let other_holder: &str = &zid("some-other-holder");
         let us: &str = &zid("x-node");
         let signer: &str = &zid("x-holder-on-a");
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         for who in [us, signer, other_holder, accord_a, accord_b] {
             backend.put_public_key(key(who)).await.expect("register");
         }
@@ -1785,7 +1788,7 @@ mod tests {
         let signer: &str = &zid("e-holder");
         let root: &str = &zid("e-accord");
         let other: &str = &zid("e-other-accord");
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         for who in [us, signer, root, other] {
             backend.put_public_key(key(who)).await.expect("register");
         }
@@ -1893,7 +1896,7 @@ mod tests {
         let signer: &str = &zid("t-holder");
         let second: &str = &zid("t-holder-second");
         let root: &str = &zid("t-accord");
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         for who in [us, signer, second, root] {
             backend.put_public_key(key(who)).await.expect("register");
         }
@@ -2042,7 +2045,8 @@ mod tests {
     /// stale one.
     #[tokio::test]
     async fn invalidation_drops_a_cached_verdict_before_the_ttl() {
-        let dir: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> =
+            Arc::new(ciris_persist::store::test_backend::test_backend());
         let gate = AccordRelayGate::new(dir, Some("us".into()));
         let t0 = now();
         let s = subject("accord-root", "holder-a");
@@ -2107,7 +2111,7 @@ mod tests {
         let other_holder: &str = &zid("sk-other-holder");
         let us: &str = &zid("sk-node");
         let signer: &str = &zid("sk-holder-on-a");
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         for who in [us, signer, other_holder, accord_a, accord_b] {
             backend.put_public_key(key(who)).await.expect("register");
         }
