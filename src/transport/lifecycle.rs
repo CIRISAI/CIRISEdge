@@ -46,12 +46,16 @@
 //!    (a phone), every TCP client without IFAC or a no-transit posture is a
 //!    runtime-attached leviculum client whose handle, when dropped, ends its
 //!    reconnect loop at whatever await it is parked on and closes its socket.
-//!    A config-loaded client cannot be detached cleanly: removing it through
-//!    `remove_interface` drops its channels but leaves its reconnect loop
-//!    running, and against a live peer it reconnects in a tight loop. So a
-//!    node that is not `suspendable` (the default; its boot path is unchanged)
-//!    keeps its builder clients through a suspend and reports them in
-//!    `interfaces_open`, never `quiescent`. Connections a TCP *server*
+//!    A node that is not `suspendable` (the default; its boot path is
+//!    unchanged) keeps its builder clients through a suspend and reports them
+//!    in `interfaces_open`, never `quiescent`. (A config-loaded client *can*
+//!    be removed: `remove_interface` drops its channels and its reconnect loop
+//!    ends at its next `incoming_tx.is_closed()` check — leviculum confirmed
+//!    this on c6d0a224 and v0.33, closing leviculum#95, which an earlier edge
+//!    note had wrongly claimed. Re-adding it on resume needs its
+//!    `InterfaceConfig` through `spawn_interface`, which would also keep the
+//!    tunnel handshake below; that is the follow-up that could retire the
+//!    `suspendable` runtime attach.) Connections a TCP *server*
 //!    accepted are removed; the listening socket itself cannot be closed
 //!    without stopping the node, so a node with a server reports
 //!    `listener_open: true` and is never reported quiescent.

@@ -2614,8 +2614,9 @@ pub struct ReticulumTransport {
     /// attaches at runtime (not through the builder), so
     /// suspend can detach them: dropping a [`TcpClientHandle`] ends the
     /// client's reconnect loop at whatever await it is parked on and closes
-    /// its socket. A config-loaded client has no such handle — removing it
-    /// leaves its reconnect loop running (see the lifecycle module docs).
+    /// its socket, and resume re-attaches it from the address alone (a
+    /// config-loaded client would need its `InterfaceConfig` kept to re-add;
+    /// see the lifecycle module docs).
     /// Clients with IFAC or a no-transit posture still go through the builder
     /// (the runtime attach carries neither) and are reported as open.
     runtime_tcp_clients: Vec<SocketAddr>,
