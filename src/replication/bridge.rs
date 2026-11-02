@@ -670,7 +670,7 @@ pub(crate) const ATTESTATION_NOT_IN_AUDIENCE: &str = "not_in_audience";
 /// general attestation door or the key-grant door? Read from the reason both
 /// doors write with persist's token ([`attestation_outcome_to_apply`]; the
 /// key-grant door's `(token)`).
-fn is_not_in_audience_refusal(outcome: &ApplyOutcome) -> bool {
+pub(crate) fn is_not_in_audience_refusal(outcome: &ApplyOutcome) -> bool {
     match outcome {
         ApplyOutcome::Refused { reason, .. } => {
             reason.contains(&format!("({ATTESTATION_NOT_IN_AUDIENCE};"))
@@ -10294,8 +10294,15 @@ impl FederationDirectoryReplicationBridge {
             // choke parks it on its audience (`park_on_audience`) and a
             // membership row releases it. Matched on the detail because the
             // door carries no typed reason (CIRISPersist#1184).
+            // persist v61.0.0 (I1519) — key-grant rows are exempt from the
+            // #1148 put-time gate; their own audience rule is the door's
+            // `recipient_not_in_audience`, a back-off of the same kind ("a peer
+            // backs off on either"), parked and released the same way.
             Err(ciris_persist::federation::Error::KeyGrantRefused { reason, detail })
-                if detail.contains("NotInAudience") =>
+                if detail.contains("NotInAudience")
+                    || reason
+                        == ciris_persist::federation::key_grant::KeyGrantRefusalReason::RecipientNotInAudience
+                            .as_str() =>
             {
                 ApplyOutcome::refused_terminal(format!(
                     "key_grant: row refused at the attestation plane \
@@ -14083,7 +14090,7 @@ pub(crate) mod tests {
         // waiting or by retrying.
         for reason in [
             CohortStandingRefusal::AttestedParty,
-            CohortStandingRefusal::NamedSubject,
+            CohortStandingRefusal::SubjectOutsideAudience,
         ] {
             let err = E::CohortStandingRefused {
                 cohort_scope: "community".to_owned(),
