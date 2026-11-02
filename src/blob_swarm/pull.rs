@@ -320,7 +320,16 @@ impl Default for PullConfig {
             dag_chunks_in_flight: DEFAULT_DAG_CHUNKS_IN_FLIGHT,
             dag_bytes_in_flight: DEFAULT_DAG_BYTES_IN_FLIGHT,
             dag_adopt_batch_chunks: DEFAULT_DAG_ADOPT_BATCH_CHUNKS,
-            durability_interval: Some(DEFAULT_DURABILITY_INTERVAL),
+            // DIAGNOSTIC ONLY (CIRISEdge#930 storm bisect, not for release):
+            // `CIRIS_EDGE_DURABILITY_INTERVAL_SECS=0` turns the pass off.
+            durability_interval: match std::env::var("CIRIS_EDGE_DURABILITY_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                Some(0) => None,
+                Some(secs) => Some(Duration::from_secs(secs)),
+                None => Some(DEFAULT_DURABILITY_INTERVAL),
+            },
         }
     }
 }
