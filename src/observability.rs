@@ -942,6 +942,9 @@ pub const AV_CALL_RECORD_REFUSED: &str = "av_call_record_refused";
 
 /// leviculum#94 — a media frame sent with a deadline (a timed Channel frame).
 pub const AV_SENT_TIMED: &str = "av_sent_timed";
+/// leviculum#94 — a media frame that fills its Channel and so cannot carry
+/// the 10-byte timed wrapper: sent untimed.
+pub const AV_SENT_UNTIMED_FULL: &str = "av_sent_untimed_full";
 /// leviculum#94 — this node's timed media frame passed its deadline
 /// unconfirmed (an expired marker went in its place).
 pub const AV_FRAME_EXPIRED_SENDER: &str = "av_frame_expired_sender";

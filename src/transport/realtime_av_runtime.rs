@@ -1639,6 +1639,17 @@ mod leviculum_link {
                     self.link_id
                 )));
             };
+            // leviculum#94's timed wrapper (msgtype u16 ‖ sent_ms u32 ‖
+            // ttl_ms u32) rides inside the Channel message: a frame that
+            // fills the Channel without it cannot carry it, and goes untimed.
+            const TIMED_HEADER_LEN: usize = 10;
+            let ttl = ttl.filter(|_| {
+                let fits = bytes.len() + TIMED_HEADER_LEN <= channel_limit;
+                if !fits {
+                    self.count(crate::observability::AV_SENT_UNTIMED_FULL);
+                }
+                fits
+            });
             let handle = self.node.link_handle(&self.link_id);
             if ttl.is_some() {
                 self.count(crate::observability::AV_SENT_TIMED);
