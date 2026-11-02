@@ -419,8 +419,11 @@ mod tests {
         let Some(obj) = envelope.as_object_mut() else {
             return;
         };
-        obj.entry("asserted_at")
-            .or_insert_with(|| serde_json::json!(asserted_at.to_rfc3339()));
+        obj.entry("asserted_at").or_insert_with(|| {
+            serde_json::json!(ciris_persist::federation::admission::render_signed_instant(
+                asserted_at
+            ))
+        });
         let mut row = serde_json::json!({
             "attestation_id": attestation_id,
             "attesting_key_id": attesting_key_id,
@@ -443,7 +446,7 @@ mod tests {
         use chrono::SubsecRound as _;
         // #598: the fold orders on the `asserted_at` COLUMN, so bind that instant
         // (µs-truncated) + the #643 `row` mirror into the envelope before signing.
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         let attestation_id = uuid::Uuid::new_v4().to_string();
         bind_attestation_envelope(
             &mut envelope,

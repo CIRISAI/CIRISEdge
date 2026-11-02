@@ -10652,6 +10652,24 @@ pub(crate) mod test_fixtures {
         (backend, bridge)
     }
 
+    /// A bridge whose backend already holds NODE key rows for `key_ids` —
+    /// persist v61 (CIRISPersist#1122): an agent-typed key announces no route,
+    /// so a fixture that seeds routes for its keys registers nodes.
+    pub(crate) async fn make_bridge_with_node_keys(
+        key_ids: &[&str],
+    ) -> (Arc<SqliteBackend>, FederationDirectoryReplicationBridge) {
+        let (backend, bridge) = make_bridge(&[]);
+        for kid in key_ids {
+            backend
+                .put_public_key(ciris_persist::federation::SignedKeyRecord {
+                    record: super::tests::fixture_key_record(kid, identity_type::NODE),
+                })
+                .await
+                .expect("seed key");
+        }
+        (backend, bridge)
+    }
+
     /// A bridge whose backend already holds AGENT key rows for `key_ids`.
     pub(crate) async fn make_bridge_with_keys(
         key_ids: &[&str],
@@ -11155,7 +11173,7 @@ pub(crate) mod tests {
         // AV-62 anti-Goodhart gate forbids a SELF-attested `capacity:*` row (you
         // can't rate your own reputation), which the old `capacity:example:v1`
         // fixture tripped — but self-attesting one's own identity is legitimate.
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         let attestation_id = uuid::Uuid::new_v4().to_string();
         let mut envelope = serde_json::json!({
             "attesting_key_id": other_producer,
@@ -11449,6 +11467,10 @@ pub(crate) mod tests {
         epoch: u64,
         asserted_at: chrono::DateTime<Utc>,
     ) -> ciris_persist::federation::self_at_login::SignedTransportDestination {
+        // persist v61 (CC 2.6.2 strict): the route's instant is `.sssZ`, so the
+        // typed column holds the millisecond the envelope carries.
+        let asserted_at =
+            ciris_persist::federation::admission::truncate_to_substrate_resolution(asserted_at);
         use ciris_persist::federation::self_at_login::{
             BindingProvenance, SignedTransportDestination, TransportDestination,
         };
@@ -11488,7 +11510,7 @@ pub(crate) mod tests {
         for k in [this_node, foreign] {
             backend
                 .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(k, identity_type::AGENT),
+                    record: fixture_key_record(k, identity_type::NODE),
                 })
                 .await
                 .expect("seed key");
@@ -11497,7 +11519,7 @@ pub(crate) mod tests {
         let selector: CohortProvider = Arc::new(move || publish_set.clone());
         let bridge = bridge.with_self_provider(Some(selector));
         // Admit the FOREIGN node's signed route exactly as replication would.
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         let signed = sign_transport_destination_fixture(foreign, "aa00", 3, now);
         let outcome = bridge
             .apply_envelope_bytes(
@@ -11540,11 +11562,11 @@ pub(crate) mod tests {
         let (backend, bridge) = make_bridge(&[]);
         backend
             .put_public_key(SignedKeyRecord {
-                record: fixture_key_record(key, identity_type::AGENT),
+                record: fixture_key_record(key, identity_type::NODE),
             })
             .await
             .expect("seed key");
-        let t5 = Utc::now().trunc_subsecs(6);
+        let t5 = Utc::now().trunc_subsecs(3);
         let current = sign_transport_destination_fixture(key, "aa00", 5, t5);
         let wire = |s: &ciris_persist::federation::self_at_login::SignedTransportDestination| {
             serde_json::to_vec(s).expect("wire")
@@ -12185,7 +12207,8 @@ pub(crate) mod tests {
                 | R::StoreConflict
                 | R::KeyPlaneRefused
                 | R::SelfRosterPending
-                | R::GroupPlaneRefused => {
+                | R::GroupPlaneRefused
+                | R::NotInAudience => {
                     let ApplyOutcome::Refused {
                         reason: msg, retry, ..
                     } = &outcome
@@ -12198,7 +12221,8 @@ pub(crate) mod tests {
                         "{reason}: the message names the SAME branch the ledger books: {msg}"
                     );
                     // persist v59.0.0 — the split: a pending roster proposal is
-                    // retried, a refused key-plane row is not.
+                    // retried, a refused key-plane row is not. persist v61 S2 —
+                    // `not_in_audience` is retryable by persist and TERMINAL here.
                     let expected = match reason {
                         R::StoreConflict | R::SelfRosterPending => RetryDisposition::Transient,
                         _ => RetryDisposition::Terminal,
@@ -12218,6 +12242,15 @@ pub(crate) mod tests {
     /// Every other token keeps persist's disposition.
     #[test]
     fn not_in_audience_is_terminal_whatever_persist_says() {
+        use ciris_persist::federation::attestation_apply::AttestationRefusalReason as R;
+        // The token edge matches is persist's own, and persist calls it
+        // retryable — the override is what makes it terminal.
+        assert_eq!(R::NotInAudience.as_str(), ATTESTATION_NOT_IN_AUDIENCE);
+        assert!(R::NotInAudience.is_retryable());
+        assert_eq!(
+            attestation_refusal_retry(R::NotInAudience),
+            RetryDisposition::Terminal
+        );
         assert_eq!(
             attestation_refusal_retry_of(ATTESTATION_NOT_IN_AUDIENCE, true),
             RetryDisposition::Terminal
@@ -12714,7 +12747,7 @@ pub(crate) mod tests {
             sink.lock().expect("observer sink").push(k.to_string());
         })));
 
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         let mut rev = ciris_persist::federation::types::Revocation {
             revocation_id: "rev-1".to_string(),
             revoked_key_id: Some(target.to_string()),
@@ -13165,7 +13198,7 @@ pub(crate) mod tests {
                 role: None,
             }],
             founded_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
-            consensus_protocol: "founder_only".to_string(),
+            consensus_protocol: "unanimous".to_string(),
             policy_blob: None,
             persist_row_hash: String::new(),
             prev_head_digest: String::new(),
@@ -13435,8 +13468,9 @@ pub(crate) mod tests {
             EnvelopeKind::FamilyMembershipWidening | EnvelopeKind::CommunityMembershipWidening => {
                 F::Widening
             }
-            EnvelopeKind::FamilyMembershipRevocation
-            | EnvelopeKind::CommunityMembershipRevocation => F::Removal,
+            EnvelopeKind::FamilyMembershipRevocation => F::Removal,
+            // The community pin carries a resignation (see its test).
+            EnvelopeKind::CommunityMembershipRevocation => F::Resignation,
             other => panic!("{other:?} mints no group-plane row"),
         }
     }
@@ -13514,10 +13548,13 @@ pub(crate) mod tests {
             ("e4-member", identity_type::USER),
             ("e4-newcomer", identity_type::USER),
         ];
-        let room = sign_community_fixture(
-            "e4-authority",
-            fixture_community_founded("e4-community", "e4-authority", "e4-member"),
-        );
+        // persist v61 (#1123): the founder widens alone only while it holds
+        // the room's one seat.
+        let room = sign_community_fixture("e4-authority", {
+            let mut c = fixture_community_founded("e4-community", "e4-authority", "e4-member");
+            c.members.retain(|m| m.key_id == "e4-authority");
+            c
+        });
         let widening = sign_community_membership_widening_fixture(
             "e4-authority",
             ciris_persist::federation::CommunityMembershipWidening {
@@ -13556,7 +13593,7 @@ pub(crate) mod tests {
             &widening_wire,
         )
         .await;
-        for who in ["e4-member", "e4-newcomer"] {
+        for who in ["e4-authority", "e4-newcomer"] {
             assert!(
                 !backend_b
                     .is_active_member("e4-community", who)
@@ -13574,7 +13611,7 @@ pub(crate) mod tests {
                 .await;
             assert!(outcome.is_admitted(), "{family:?}: {outcome:?}");
         }
-        for who in ["e4-authority", "e4-member", "e4-newcomer"] {
+        for who in ["e4-authority", "e4-newcomer"] {
             assert!(
                 backend_b
                     .is_active_member("e4-community", who)
@@ -13878,7 +13915,7 @@ pub(crate) mod tests {
     /// empty), so AV-84 has nothing to refuse and the AV-45 membership
     /// question is the one under test.
     fn community_scoped_chat_row(member: &str, community: &str) -> Vec<u8> {
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         let mut envelope = serde_json::json!({
             "dimension": "chat:message:v1",
             "community_id": community,
@@ -13969,8 +14006,11 @@ pub(crate) mod tests {
     async fn e4_community_membership_revocation_forward_path_preserves_authority_signature() {
         // effective_at must NOT be future-dated (SecReview F4: community
         // removal is immediate for forward secrecy).
+        // persist v61 (#1123): a removal above the family needs the room's
+        // consensus, never one voice — the pin carries the member's own
+        // RESIGNATION (`membership:resignation:v1`), which is theirs alone.
         let signed = sign_community_membership_revocation_fixture(
-            "e4-authority",
+            "e4-member",
             CommunityMembershipRevocation {
                 community_key_id: "e4-community".to_string(),
                 removed_identity_key_id: "e4-member".to_string(),
@@ -14034,10 +14074,13 @@ pub(crate) mod tests {
                 ("e4-member", identity_type::USER),
                 ("e4-newcomer", identity_type::USER),
             ],
-            &[sign_community_fixture(
-                "e4-authority",
-                fixture_community_founded("e4-community", "e4-authority", "e4-member"),
-            )],
+            // persist v61 (#1123): one voice never decides who is in a room —
+            // the founder widens alone only while it is the room's one seat.
+            &[sign_community_fixture("e4-authority", {
+                let mut c = fixture_community_founded("e4-community", "e4-authority", "e4-member");
+                c.members.retain(|m| m.key_id == "e4-authority");
+                c
+            })],
             &[],
             &[],
             &signed,
@@ -14323,7 +14366,7 @@ pub(crate) mod tests {
         // Build a federation-tier attestation with real hybrid sigs
         // (v6.3.2 / CIRISEdge#166 — passes persist v9.0.0's
         // verify_federation_tier_ingest).
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         let attestation_id = uuid::Uuid::new_v4().to_string();
         let mut envelope = serde_json::json!({
             "attesting_key_id": attesting_id,
@@ -14417,7 +14460,7 @@ pub(crate) mod tests {
 
         // A federation-tier (tier="federation") Attestation via put_attestation
         // (indexes under "Attestation"; cohort_scope="federation" → advertised).
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         let attestation_id = uuid::Uuid::new_v4().to_string();
         let mut envelope = serde_json::json!({
             "attesting_key_id": attester,
@@ -14804,8 +14847,11 @@ pub(crate) mod tests {
         let Some(obj) = envelope.as_object_mut() else {
             return;
         };
-        obj.entry("asserted_at")
-            .or_insert_with(|| serde_json::json!(asserted_at.to_rfc3339()));
+        obj.entry("asserted_at").or_insert_with(|| {
+            serde_json::json!(ciris_persist::federation::admission::render_signed_instant(
+                asserted_at
+            ))
+        });
         let mut row = serde_json::json!({
             "attestation_id": attestation_id,
             "attesting_key_id": attesting_key_id,
@@ -14858,7 +14904,7 @@ pub(crate) mod tests {
         // can't store sub-µs, so a producer that mints ns precision makes an op
         // sequence a strict order on sqlite/memory but a TIE on postgres. The fold
         // refuses ns rows outright.
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         // #598: the fold orders on the `asserted_at` COLUMN, so that instant must be
         // SIGNED — stamp it into the envelope (matching the column) before signing,
         // or the row is REFUSED as an unbound replay. RFC3339, the shape persist's
@@ -14943,7 +14989,7 @@ pub(crate) mod tests {
         mut envelope: serde_json::Value,
         cohort_scope: &str,
     ) -> Attestation {
-        let now = Utc::now().trunc_subsecs(6); // #598 microsecond floor
+        let now = Utc::now().trunc_subsecs(3); // CC 2.6.2: a signed instant is .sssZ
         bind_attestation_envelope(
             &mut envelope,
             now,
@@ -15257,7 +15303,7 @@ pub(crate) mod tests {
     /// A real, hybrid-signed, federation-tier attestation as the WIRE carries
     /// it (CIRISEdge#397 — bare, not the `SignedAttestation` wrap).
     fn fixture_federation_attestation_bytes(attesting_id: &str, attested_id: &str) -> Vec<u8> {
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         let attestation_id = uuid::Uuid::new_v4().to_string();
         let mut envelope = serde_json::json!({
             "attesting_key_id": attesting_id,
@@ -15808,7 +15854,7 @@ pub(crate) mod tests {
         let third_party = "subject-s";
         let stranger = "stranger-x";
         let (backend, bridge) =
-            test_fixtures::make_bridge_with_keys(&[local, third_party, stranger]).await;
+            test_fixtures::make_bridge_with_node_keys(&[local, third_party, stranger]).await;
         // persist v59.0.0 — the public plane these lookups read is the route
         // plane: a fixture key travels only as a row it does not have, so the
         // Key plane would answer empty for the wrong reason.
@@ -15891,7 +15937,8 @@ pub(crate) mod tests {
             crate::replication::serve_tier::ServeTier::Canonical,
         ] {
             let (b, bridge) =
-                test_fixtures::make_bridge_with_keys(&[local, third_party, stranger, root]).await;
+                test_fixtures::make_bridge_with_node_keys(&[local, third_party, stranger, root])
+                    .await;
             seed_routes(&b, &[local, third_party, stranger]).await;
             let bridge = bridge
                 .with_local_key_id(Some(local.to_string()))
@@ -15915,7 +15962,8 @@ pub(crate) mod tests {
             crate::replication::serve_tier::ServeTier::Canonical,
         ] {
             let (backend, bridge) =
-                test_fixtures::make_bridge_with_keys(&[local, third_party, stranger, root]).await;
+                test_fixtures::make_bridge_with_node_keys(&[local, third_party, stranger, root])
+                    .await;
             seed_routes(&backend, &[local, third_party, stranger]).await;
             // Both hang their trust off the same root (CC 4's shape).
             seed_acceptance_edge(&backend, local, root, &scope).await;
@@ -15964,7 +16012,7 @@ pub(crate) mod tests {
     /// persist v59.0.0 — a signed route for each key (the public subject-pull
     /// plane a fixture key can still carry).
     pub(crate) async fn seed_routes(backend: &SqliteBackend, keys: &[&str]) {
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         for key in keys {
             backend
                 .put_signed_transport_destination(&sign_transport_destination_fixture(
@@ -16201,7 +16249,7 @@ pub(crate) mod tests {
     fn v31_revocation_paste_cannot_deadmit_an_unintended_key() {
         // Build a well-formed, signed revocation of `revoked`, tagged `id`.
         let build = |id: &str, revoked: &str| {
-            let now = Utc::now().trunc_subsecs(6);
+            let now = Utc::now().trunc_subsecs(3);
             let mut rev = Revocation {
                 revocation_id: id.to_string(),
                 revoked_key_id: Some(revoked.to_string()),
@@ -16285,7 +16333,7 @@ pub(crate) mod tests {
 
         // Build a signed delegates_to(root → attested, scope infra:serve).
         let build = |id: &str, attested: &str| {
-            let now = Utc::now().trunc_subsecs(6);
+            let now = Utc::now().trunc_subsecs(3);
             let mut envelope = serde_json::json!({
                 "id": id,
                 "attesting_key_id": "root",
@@ -16511,7 +16559,7 @@ pub(crate) mod tests {
     /// be registered keys). persist computes `persist_row_hash` on put — the
     /// value the Revocation plane advertises + the cache-free fetch scan matches.
     async fn seed_revocation(backend: &SqliteBackend, revoking: &str, revoked: &str) {
-        let now = Utc::now().trunc_subsecs(6); // #598 microsecond floor
+        let now = Utc::now().trunc_subsecs(3); // CC 2.6.2: a signed instant is .sssZ
         let id = uuid::Uuid::new_v4().to_string();
         let mut revocation = Revocation {
             revocation_id: id,
@@ -17168,7 +17216,7 @@ pub(crate) mod tests {
 
         // A trace scores-attestation (self-subject, federation tier =
         // promoted) + a NON-trace attestation for the control.
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         for (attestation_type, dimension) in [
             ("scores", Some("trace:complete:v1")),
             ("delegates_to", None),
@@ -19953,7 +20001,7 @@ pub(crate) mod tests {
         for p in producers {
             backend
                 .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(p, identity_type::AGENT),
+                    record: fixture_key_record(p, identity_type::NODE),
                 })
                 .await
                 .expect("seed key");
@@ -20419,7 +20467,7 @@ pub(crate) mod tests {
             .with_local_key_id(Some("node-bob".to_string()))
             .with_metrics(Some(metrics.clone()));
         let signed =
-            sign_transport_destination_fixture("node-bob", "aa00", 1, Utc::now().trunc_subsecs(6));
+            sign_transport_destination_fixture("node-bob", "aa00", 1, Utc::now().trunc_subsecs(3));
         let wire = serde_json::to_vec(&signed).expect("wire");
         let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire, None)
@@ -20550,7 +20598,7 @@ pub(crate) mod tests {
             .with_self_provider(Some(Arc::new(move || publish.clone())))
             .with_local_key_id(Some("node-relay".to_string()));
         let signed =
-            sign_transport_destination_fixture("node-bob", "aa00", 1, Utc::now().trunc_subsecs(6));
+            sign_transport_destination_fixture("node-bob", "aa00", 1, Utc::now().trunc_subsecs(3));
         let wire = serde_json::to_vec(&signed).expect("wire");
         assert!(bridge
             .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire, None)
@@ -20734,7 +20782,7 @@ pub(crate) mod tests {
                 .with_local_key_id(Some("node-bob".to_string())),
         );
         let signed =
-            sign_transport_destination_fixture("node-bob", "aa00", 1, Utc::now().trunc_subsecs(6));
+            sign_transport_destination_fixture("node-bob", "aa00", 1, Utc::now().trunc_subsecs(3));
         let wire = serde_json::to_vec(&signed).expect("wire");
         let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire, None)
@@ -22313,7 +22361,7 @@ pub(crate) mod tests {
         backend
             .put_community(sign_community_fixture(
                 "person-p",
-                community("priv-c-762", "founder_only", None),
+                community("priv-c-762", "unanimous", None),
             ))
             .await
             .expect("the private community");
@@ -24345,7 +24393,7 @@ pub(crate) mod tests {
             for id in ids {
                 backend
                     .put_public_key(SignedKeyRecord {
-                        record: fixture_key_record(id, identity_type::AGENT),
+                        record: fixture_key_record(id, identity_type::NODE),
                     })
                     .await
                     .expect("seed key");
@@ -24983,7 +25031,7 @@ pub(crate) mod tests {
         async fn seed_self_row(backend: &Arc<SqliteBackend>, producer: &str, secs: i64) -> String {
             let at = (chrono::DateTime::from_timestamp(1_760_000_000, 0).expect("instant")
                 + chrono::Duration::seconds(secs))
-            .trunc_subsecs(6);
+            .trunc_subsecs(3);
             let attestation_id = format!("row-{producer}-{secs:04}");
             let mut envelope = serde_json::json!({
                 "attesting_key_id": producer,

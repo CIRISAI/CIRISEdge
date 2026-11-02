@@ -122,10 +122,11 @@ async fn route(
         occurrence_key_id: node.key_id().to_owned(),
         transport_kind: "reticulum".to_owned(),
         destination: "a0".repeat(16),
-        asserted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_micros(
-            chrono::Utc::now().timestamp_micros(),
+        // persist v61 (CC 2.6.2 strict): the route's instant is `.sssZ`.
+        asserted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            chrono::Utc::now().timestamp_millis(),
         )
-        .expect("micros"),
+        .expect("millis"),
         last_seen_at: None,
         transport_ed25519_pubkey_base64: Some(b64.encode([0xbb; 32])),
         transport_x25519_pubkey_base64: Some(b64.encode([0xcc; 32])),
@@ -236,7 +237,7 @@ impl NodeA {
         use ciris_persist::federation::occurrence_revocation_carrier::{
             carrier_row, FramedOccurrenceRevocation,
         };
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let envelope = serde_json::json!({
             "attesting_key_id": self.n.key_id(),
             "identity_key_id": self.n.key_id(),

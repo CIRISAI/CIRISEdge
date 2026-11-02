@@ -177,10 +177,10 @@ impl SelfSignedRouteProducer {
                 key_id = %signer.key_id,
                 dest = %hex::encode(dest_hash),
                 "self route under an AGENT-typed federation key: an agent does not announce \
-                 at a transit key (it is reached through its node's binding). Run the \
-                 transport under the node key (use_node_identity). The route is still \
-                 published on this line; a node key bound to the same destination wins every \
-                 attribution tie (history: CIRISEdge#888)"
+                 at a transit key (it is reached through its node's binding). persist v61 \
+                 REFUSES the route (transport_destination_agent_key), so this node publishes \
+                 NO route and peers cannot attribute its frames. Run the transport under the \
+                 node key (use_node_identity) (history: CIRISEdge#888, CIRISPersist#1122)"
             );
         }
     }
@@ -843,28 +843,28 @@ mod tests {
         );
     }
 
-    /// CIRISEdge#888 — a transport under an agent-typed key is named (once)
-    /// but still publishes on this line: refusing would drop pre-split nodes
-    /// off the mesh. The #888 fix is attribution, where an agent row loses
-    /// every tie to a node key.
+    /// CIRISEdge#888 — a transport under an agent-typed key is named (once).
+    /// persist v61 (CIRISPersist#1122): the route is REFUSED by name
+    /// (`transport_destination_agent_key`) — the dated fleet floor this line
+    /// waited for — and the outcome says so (Deferred, never swallowed).
     #[tokio::test]
-    async fn an_agent_typed_key_is_named_and_still_publishes_888() {
+    async fn an_agent_typed_key_is_named_and_its_route_refused_888() {
         let backend = backend();
         let signer = hybrid_signer("self-route-agent");
         register_as(&backend, &signer, identity_type::AGENT).await;
         let dir: &dyn RootingDirectory = backend.as_ref();
         let producer = SelfSignedRouteProducer::new();
         let out = producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await;
-        assert_eq!(
-            out,
-            SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Inserted)
+        assert!(
+            matches!(&out, SelfRouteOutcome::Deferred(why) if why.contains("transport_destination_agent_key")),
+            "persist refuses an agent-key route by name: {out:?}"
         );
         assert!(
             producer.warned_actor_key.load(Ordering::Relaxed),
             "named once"
         );
         assert!(
-            dir.hybrid_transport_binding_exists(&signer.key_id, DEST)
+            !dir.hybrid_transport_binding_exists(&signer.key_id, DEST)
                 .await
         );
     }

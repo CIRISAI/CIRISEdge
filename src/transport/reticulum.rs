@@ -20399,7 +20399,8 @@ mod tests {
             },
             pubkey_ml_dsa_65_base64: None,
             algorithm: "hybrid".to_string(),
-            identity_type: "agent".to_string(),
+            // persist v61 (#1122): an agent key announces no route.
+            identity_type: "node".to_string(),
             identity_ref: format!("ref-{key_id}"),
             valid_from: chrono::Utc::now(),
             valid_until: None,
@@ -20489,7 +20490,8 @@ mod tests {
             pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
             pubkey_ml_dsa_65_base64: None,
             algorithm: "hybrid".to_string(),
-            identity_type: "agent".to_string(),
+            // persist v61 (#1122): an agent key announces no route.
+            identity_type: "node".to_string(),
             identity_ref: format!("ref-{key_id}"),
             valid_from: chrono::Utc::now(),
             valid_until: None,

@@ -369,7 +369,7 @@ async fn r6_third_party_pull_keys_on_tier() {
     use crate::replication::protocol::EnvelopeKind;
     for tier in ALL_TIERS {
         let (backend, bridge) =
-            crate::replication::bridge::test_fixtures::make_bridge_with_keys(&[
+            crate::replication::bridge::test_fixtures::make_bridge_with_node_keys(&[
                 "local-A",
                 "subject-S",
                 "stranger-X",
