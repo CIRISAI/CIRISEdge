@@ -2964,6 +2964,12 @@ fn metrics_bundle_to_pydict<'py>(
         peer_binding.set_item(label.as_str(), *n)?;
     }
     root.set_item("peer_binding", peer_binding)?;
+    // CIRISEdge#926 — the link stall guard by label.
+    let link_stall = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.link_stall {
+        link_stall.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("link_stall", link_stall)?;
     root.set_item("direct_links_active", bundle.direct_links_active)?;
     // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
     // a missing install and a membership refusal are two numbers.

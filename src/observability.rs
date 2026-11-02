@@ -1163,6 +1163,20 @@ pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
 
+// ─── CIRISEdge#926 — `EdgeMetrics::link_stall` labels ─────────────────
+//
+// The link stall guard (`transport::link_stall`): a Channel send that landed
+// nothing because the peer acknowledged nothing, and what the guard did once
+// a link's run of them made it dead.
+
+/// One Channel send landed zero fragments: the window never opened.
+pub const LINK_STALL_ZERO_LANDED_SEND: &str = "link_stall_zero_landed_send";
+/// A link judged dead was closed; the next send dials a fresh one.
+pub const LINK_STALL_CLOSED: &str = "link_stall_closed";
+/// A link judged dead on a punched interface was moved back onto its relayed
+/// path (leviculum#83 `retire_direct_link`) instead of closed.
+pub const LINK_STALL_RETIRED_DIRECT: &str = "link_stall_retired_direct";
+
 // ─── v43 InvalidProof triage — `EdgeMetrics::peer_binding` labels ──────
 //
 // A peer's binding is the key a dial hands leviculum to check the link
@@ -1528,6 +1542,10 @@ pub struct EdgeMetrics {
     /// (`PEER_BINDING_*` constants in this module): wrong keys healed,
     /// corrected at dial, refused at prime, and proofs that failed.
     pub peer_binding: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#926 — the link stall guard by label (`LINK_STALL_*`
+    /// constants in this module): zero-landing Channel sends, and the dead
+    /// links it closed or moved off a punched path.
+    pub link_stall: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — peers with a direct path now, per reporting
     /// transport (keyed by its metrics source id, like `link_pool_sizes`).
     /// Read as [`Self::direct_links_active`] (the sum).
@@ -2231,6 +2249,21 @@ impl EdgeMetrics {
     #[must_use]
     pub fn direct_link(&self) -> HashMap<String, u64> {
         self.direct_link
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#926 — count one link-stall event by its `LINK_STALL_*` label.
+    pub fn inc_link_stall(&self, label: &'static str) {
+        *self.link_stall.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#926 — the link-stall ledger by label.
+    #[must_use]
+    pub fn link_stall(&self) -> HashMap<String, u64> {
+        self.link_stall
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -2975,6 +3008,7 @@ impl EdgeMetrics {
             link_shaping: self.link_shaping(),
             direct_link: self.direct_link(),
             peer_binding: self.peer_binding(),
+            link_stall: self.link_stall(),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
@@ -3257,6 +3291,8 @@ pub struct EdgeMetricsBundle {
     /// The peer bindings dials check link proofs against, by
     /// `PEER_BINDING_*` label.
     pub peer_binding: HashMap<String, u64>,
+    /// CIRISEdge#926 — the link stall guard by `LINK_STALL_*` label.
+    pub link_stall: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
     pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
@@ -3573,6 +3609,8 @@ impl EdgeMetricsBundle {
         f.family("direct_link", &self.direct_link);
         // The peer-binding ledger, `peer_binding.<label>`.
         f.family("peer_binding", &self.peer_binding);
+        // CIRISEdge#926 — the link stall guard, `link_stall.<label>`.
+        f.family("link_stall", &self.link_stall);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
             "direct_links_active".to_string(),
@@ -3787,6 +3825,7 @@ edge_metrics_bundle_fields!(
     link_shaping,
     direct_link,
     peer_binding,
+    link_stall,
     direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,

@@ -2623,6 +2623,15 @@ pub struct ReticulumTransport {
     /// CIRISEdge#853 test seam — see
     /// [`ReticulumTransport::delay_channel_sends_for_test`]. 0 in production.
     test_channel_delay_ms: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#926 — the link stall guard
+    /// ([`crate::transport::link_stall`]): per-link runs of Channel sends that
+    /// landed nothing. A link it judged dead is never picked for a send.
+    stall_guard: Arc<crate::transport::link_stall::LinkStallGuard>,
+    /// CIRISEdge#926 test seam — links whose peer has "stopped
+    /// acknowledging", each with how many fragments of a frame still land
+    /// before the window stops opening. Empty in production. See
+    /// [`ReticulumTransport::stop_acks_on_link_for_test`].
+    test_unacked_links: std::sync::Mutex<HashMap<LinkId, usize>>,
     /// CIRISEdge#853 test seam — see
     /// [`ReticulumTransport::delay_resource_ships_for_test`]. 0 in production.
     test_ship_delay_ms: std::sync::atomic::AtomicU64,
@@ -3242,6 +3251,7 @@ impl ReticulumTransport {
             test_identify_last: Arc::clone(&self.test_identify_last),
             deferred_handshake_part: Arc::clone(&self.deferred_handshake_part),
             test_binding_key_only: Arc::clone(&self.test_binding_key_only),
+            stall_guard: Arc::clone(&self.stall_guard),
         }
     }
 
@@ -3907,6 +3917,8 @@ impl ReticulumTransport {
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
             test_force_busy: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             test_channel_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            stall_guard: Arc::default(),
+            test_unacked_links: std::sync::Mutex::new(HashMap::new()),
             test_ship_delay_ms: std::sync::atomic::AtomicU64::new(0),
             test_publish_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             resolver,
@@ -5270,6 +5282,7 @@ impl ReticulumTransport {
         }
         if let Some(lease) = lease_pooled_scoped_link(
             &self.node,
+            &self.stall_guard,
             &self.reusable_scoped_link,
             &self.scoped_link_leased,
             &self.link_plane,
@@ -5305,6 +5318,7 @@ impl ReticulumTransport {
             // just published an idle lane.
             if let Some(lease) = lease_pooled_scoped_link(
                 &ctx.node,
+                &ctx.stall_guard,
                 &pool,
                 &leased,
                 &ctx.link_plane,
@@ -6823,6 +6837,84 @@ impl ReticulumTransport {
             .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// CIRISEdge#926 test seam — the peer "stops acknowledging" on `link`:
+    /// every Channel send on it lands its first `land` fragments and then
+    /// waits out the pacing bound with the window shut (the field's
+    /// `0/N landed … fragment_pacing_timeout` when `land == 0`; a slow link
+    /// that still lands some when `land > 0`), and its Resource slot stays
+    /// held (`Busy`). `None` restores the link.
+    #[doc(hidden)]
+    pub fn stop_acks_on_link_for_test(&self, link: [u8; 16], land: Option<usize>) {
+        let mut links = self
+            .test_unacked_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match land {
+            Some(n) => {
+                links.insert(LinkId::new(link), n);
+            }
+            None => {
+                links.remove(&LinkId::new(link));
+            }
+        }
+    }
+
+    /// CIRISEdge#926 test seam — one guarded Channel send of `bytes` on
+    /// `link`, exactly as the reverse path makes one; `(sent, total)`.
+    #[doc(hidden)]
+    pub async fn send_channel_for_test(&self, link: [u8; 16], bytes: &[u8]) -> (usize, usize) {
+        let id = LinkId::new(link);
+        let mdu = send_mdu(&self.node, &self.shapers, &id);
+        let Some(fragments) = crate::transport::frame_fragment::fragment(bytes, mdu) else {
+            return (0, 0);
+        };
+        let out = self.send_channel_marked(id, &fragments).await;
+        (out.sent, out.total)
+    }
+
+    /// CIRISEdge#926 test seam — the plaintext size one Channel fragment
+    /// carries on `link` (what the fragmenter cuts a frame to).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn channel_fragment_bytes_for_test(&self, link: [u8; 16]) -> usize {
+        send_mdu(&self.node, &self.shapers, &LinkId::new(link))
+    }
+
+    /// CIRISEdge#926 test seam — zero-landing sends in `link`'s current stall
+    /// run, and whether the guard judged it dead.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn link_stall_for_test(&self, link: [u8; 16]) -> (u32, bool) {
+        (
+            self.stall_guard.zero_sends(&link),
+            self.stall_guard.is_dead(&link),
+        )
+    }
+
+    /// CIRISEdge#926 test seam — `link`'s Channel has nothing outstanding
+    /// (every frame sent on it so far was acknowledged), so no delivery proof
+    /// is still on its way to restart a stall run under a witness.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn link_channel_settled_for_test(&self, link: [u8; 16]) -> bool {
+        self.node
+            .link_stats(&LinkId::new(link))
+            .is_some_and(|s| s.tx_ring_size() == 0)
+    }
+
+    /// CIRISEdge#926 test seam — the links the peer `peer` identified to this
+    /// node (the reverse-path candidates), live at the node.
+    #[doc(hidden)]
+    pub async fn reverse_links_for_test(&self, peer: &str) -> Vec<[u8; 16]> {
+        self.link_to_peer_key_id
+            .lock()
+            .await
+            .iter()
+            .filter(|(id, p)| p.as_str() == peer && self.node.link_is_established(id))
+            .map(|(id, _)| id.into_bytes())
+            .collect()
+    }
+
     pub fn force_next_sends_busy_for_test(&self, n: u32) {
         self.test_force_busy
             .store(n, std::sync::atomic::Ordering::Relaxed);
@@ -8193,13 +8285,151 @@ impl ReticulumTransport {
         fragments: &[Vec<u8>],
     ) -> FragmentSendOutcome {
         let _busy = OutboundShipGuard::new(&self.outbound_ship_active, link_id);
+        let started = std::time::Instant::now();
         let delay = self
             .test_channel_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        send_fragments_on_channel(&self.node, &self.seals, &self.shapers, &link_id, fragments).await
+        let unacked = self
+            .test_unacked_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&link_id)
+            .copied();
+        let outcome = match unacked {
+            None => {
+                send_fragments_on_channel(
+                    &self.node,
+                    &self.seals,
+                    &self.shapers,
+                    &link_id,
+                    fragments,
+                )
+                .await
+            }
+            // CIRISEdge#926 test seam: the first `land` fragments go out for
+            // real, then the window never opens again (no acks come back), so
+            // the next fragment's pacing wait runs out exactly as in the field.
+            Some(land) => {
+                let landed = fragments.len().min(land);
+                let head = send_fragments_on_channel(
+                    &self.node,
+                    &self.seals,
+                    &self.shapers,
+                    &link_id,
+                    &fragments[..landed],
+                )
+                .await;
+                if landed < fragments.len() && head.complete() {
+                    tokio::time::sleep(CHANNEL_FRAGMENT_SEND_TIMEOUT).await;
+                    FragmentSendOutcome {
+                        sent: head.sent,
+                        total: fragments.len(),
+                        stalled: Some("fragment_pacing_timeout"),
+                    }
+                } else {
+                    FragmentSendOutcome {
+                        total: fragments.len(),
+                        ..head
+                    }
+                }
+            }
+        };
+        self.observe_channel_send(link_id, &outcome, started).await;
+        outcome
+    }
+
+    /// CIRISEdge#926 — feed one Channel send on `link_id` to the stall guard
+    /// ([`crate::transport::link_stall`]) and act on a link it judges dead:
+    /// one that landed nothing for [`STALL_MAX_ZERO_SENDS`] sends in a row, or
+    /// for [`STALL_BOUND`], with no delivery proof from the peer between.
+    ///
+    /// [`STALL_MAX_ZERO_SENDS`]: crate::transport::link_stall::STALL_MAX_ZERO_SENDS
+    /// [`STALL_BOUND`]: crate::transport::link_stall::STALL_BOUND
+    async fn observe_channel_send(
+        &self,
+        link_id: LinkId,
+        outcome: &FragmentSendOutcome,
+        started: std::time::Instant,
+    ) {
+        use crate::transport::link_stall::{ChannelLanding, StallVerdict};
+        let landing = ChannelLanding::classify(outcome.sent, outcome.total, outcome.stalled);
+        if landing == ChannelLanding::Starved {
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_stall(crate::observability::LINK_STALL_ZERO_LANDED_SEND);
+            }
+        }
+        let delivered = self.node.link_stats(&link_id).map(|s| s.bytes_delivered());
+        let verdict =
+            self.stall_guard
+                .observe(link_id.into_bytes(), landing, delivered, started, |id| {
+                    self.node.link_is_established(&LinkId::new(*id))
+                });
+        if let StallVerdict::Dead {
+            zero_sends,
+            stalled_for,
+        } = verdict
+        {
+            self.act_on_stalled_link(link_id, zero_sends, stalled_for)
+                .await;
+        }
+    }
+
+    /// CIRISEdge#926 — the stall guard judged `link_id` dead. A link on a
+    /// punched interface moves back onto its relayed path (leviculum#83
+    /// `retire_direct_link`: the punched path is what stopped carrying the
+    /// peer's acks) and starts a fresh run there. Any other link is closed: it
+    /// already left every pick (`is_dead`), the teardown forgets it everywhere,
+    /// and the next send to the peer re-dials (through the canonical when the
+    /// peer is behind NAT) or rides the peer's next link to us. One line.
+    async fn act_on_stalled_link(&self, link_id: LinkId, zero_sends: u32, stalled_for: Duration) {
+        let peer = self
+            .link_to_peer_key_id
+            .lock()
+            .await
+            .get(&link_id)
+            .cloned()
+            .unwrap_or_else(|| "-".to_owned());
+        let link = hex::encode(link_id.as_bytes());
+        if self.node.direct_link_interface(&link_id).is_some()
+            && self.node.retire_direct_link(&link_id).await.is_ok()
+        {
+            self.stall_guard.forget(&link_id.into_bytes());
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_stall(crate::observability::LINK_STALL_RETIRED_DIRECT);
+            }
+            tracing::warn!(
+                link = %link,
+                peer = %peer,
+                zero_sends,
+                stalled_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX),
+                action = "retired_direct",
+                "link Channel landed nothing for {zero_sends} sends in a row: the punched path \
+                 stopped carrying the peer's acks, moved the link back onto its relayed path \
+                 (CIRISEdge#926, leviculum#89)"
+            );
+            return;
+        }
+        if let Some(m) = self.metrics.get() {
+            m.inc_link_stall(crate::observability::LINK_STALL_CLOSED);
+        }
+        tracing::warn!(
+            link = %link,
+            peer = %peer,
+            zero_sends,
+            stalled_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX),
+            action = "closed",
+            "link Channel landed nothing for {zero_sends} sends in a row: the peer acknowledges \
+             nothing on it, closed it and the next send re-dials (CIRISEdge#926)"
+        );
+        if let Err(e) = self
+            .link_teardown_as(link_id, LinkCloseCause::LocalTeardown)
+            .await
+        {
+            tracing::debug!(error = %e, "stalled link teardown failed (CIRISEdge#926)");
+        }
     }
 
     /// CIRISEdge#853 — wrap a claimed lane in a [`LinkClaim`], so the claim is
@@ -8410,9 +8640,13 @@ impl ReticulumTransport {
         // NOT sufficient (a NAT-dead link stays `Active` for the whole stale
         // window), so the selector additionally prefers the freshest INBOUND —
         // the link the peer is demonstrably sending on right now.
+        // CIRISEdge#926 — and never a link the stall guard judged dead: the
+        // peer acknowledges nothing on it, whatever leviculum still holds.
         let live: Vec<(LinkId, u64, u64)> = candidates
             .into_iter()
-            .filter(|id| self.node.link_is_established(id))
+            .filter(|id| {
+                self.node.link_is_established(id) && !self.stall_guard.is_dead(&id.into_bytes())
+            })
             .map(|id| {
                 (
                     id,
@@ -8480,7 +8714,9 @@ impl ReticulumTransport {
         let mut attempts: u32 = 0;
         loop {
             let live = match pinned {
-                Some(id) => Some(id).filter(|id| self.node.link_is_established(id)),
+                Some(id) => Some(id).filter(|id| {
+                    self.node.link_is_established(id) && !self.stall_guard.is_dead(&id.into_bytes())
+                }),
                 None => {
                     self.live_link_to(destination_key_id, LinkPlane::Identity)
                         .await
@@ -8763,6 +8999,16 @@ impl ReticulumTransport {
                 |n| n.checked_sub(1),
             )
             .is_ok()
+        {
+            return Err(ShipError::Busy);
+        }
+        // CIRISEdge#926 test seam — a link whose peer stopped acknowledging
+        // holds its one Resource slot with a transfer that never proves.
+        if self
+            .test_unacked_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(link_id)
         {
             return Err(ShipError::Busy);
         }
@@ -10131,8 +10377,11 @@ impl Drop for OutboundShipGuard<'_> {
 /// lock so two concurrent leases cannot pick the same lane. Dead entries are
 /// evicted on the way out — the map is a cache over leviculum's link registry,
 /// and leviculum is the authority.
+// CIRISEdge#926 — the stall guard joined the pool's other per-link state.
+#[allow(clippy::too_many_arguments)]
 async fn lease_pooled_scoped_link(
     node: &ReticulumNode,
+    stall_guard: &crate::transport::link_stall::LinkStallGuard,
     pool: &Mutex<HashMap<DestinationHash, Vec<LinkId>>>,
     leased: &Arc<std::sync::Mutex<HashSet<LinkId>>>,
     planes: &Mutex<HashMap<LinkId, LinkPlane>>,
@@ -10143,7 +10392,8 @@ async fn lease_pooled_scoped_link(
     let mut map = pool.lock().await;
     let links = map.get_mut(dest)?;
     let before = links.len();
-    links.retain(|id| node.link_is_established(id));
+    // CIRISEdge#926 — a link the stall guard judged dead is never leased.
+    links.retain(|id| node.link_is_established(id) && !stall_guard.is_dead(&id.into_bytes()));
     note_pool_links_closed(metrics, before - links.len());
     if links.is_empty() {
         map.remove(dest);
@@ -10230,6 +10480,9 @@ struct DialCtx {
     deferred_handshake_part: Arc<std::sync::Mutex<HashMap<LinkId, Vec<u8>>>>,
     /// Test seam — see `ReticulumTransport::test_binding_key_only`.
     test_binding_key_only: Arc<std::sync::atomic::AtomicBool>,
+    /// CIRISEdge#926 — see `ReticulumTransport::stall_guard`: the pool never
+    /// hands out a link it judged dead.
+    stall_guard: Arc<crate::transport::link_stall::LinkStallGuard>,
 }
 
 impl DialCtx {
@@ -11208,7 +11461,11 @@ impl DialCtx {
         // pool slot forever. The map is a cache over the link registry and the
         // registry is the authority.
         let before = pool.len();
-        pool.retain(|id| self.node.link_is_established(id));
+        // CIRISEdge#926 — nor a link the stall guard judged dead (it is being
+        // closed; until the close lands it must not be handed out).
+        pool.retain(|id| {
+            self.node.link_is_established(id) && !self.stall_guard.is_dead(&id.into_bytes())
+        });
         note_pool_links_closed(self.metrics.as_ref(), before - pool.len());
         if pool.is_empty() {
             map.remove(dest);
