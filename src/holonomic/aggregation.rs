@@ -14,7 +14,7 @@
 //! surface ([`effective_source_count`] + [`passes_dominance_gate`]), the
 //! §19.7.1.1 [`member_commitment`] Merkle, and the PQC-mandatory ingest gate
 //! ([`verify_aggregation_meta`]) live in
-//! [`ciris_verify_core::holonomic::aggregation`], the canonical home for every
+//! [`ciris_verify_core::substrate::aggregation`], the canonical home for every
 //! §19/§Q signed shape, on verify's shared `Preimage` builder + bound-hybrid
 //! gate (verify v8.7.0). Edge **re-exports** them here so the producer path
 //! keeps one import path, and adds only the producer-side tier assembly below.
@@ -60,18 +60,18 @@
 //! empty sentinel) — one Merkle scheme across §19.1 + §19.7, no schema fork.
 
 // ── the canonical §19.7 shapes + verify gates (verify-owned) ──────────
-pub use ciris_verify_core::holonomic::aggregation::{
+pub use ciris_verify_core::substrate::aggregation::{
     descend_order, effective_source_count, mass_commitment, mass_to_fixed, member_commitment,
     passes_dominance_gate, passes_multiplicity_gate, verify_aggregation_meta,
     verify_member_commitment, AggregationMetaV1, AggregationMetaVerification,
     MASS_FIXED_POINT_SCALE,
 };
-pub use ciris_verify_core::holonomic::preimage::DOMAIN_AGG_META as AGG_META_DOMAIN;
+pub use ciris_verify_core::substrate::preimage::DOMAIN_AGG_META as AGG_META_DOMAIN;
 
 /// §19.7.1.1 producer alias — the historical edge name for verify's canonical
 /// [`member_commitment`], kept so producer call-sites and the #57 freeze-gate
 /// vector tests read unchanged across the #267 re-export cut.
-pub use ciris_verify_core::holonomic::aggregation::member_commitment as compute_member_commitment;
+pub use ciris_verify_core::substrate::aggregation::member_commitment as compute_member_commitment;
 
 /// CC 6.1.1 / 6.1.2.1.1 (rc9 b3bc620) — the first source id that appears more
 /// than once, or `None` when the list is unique. A `member_commitment` leaf list

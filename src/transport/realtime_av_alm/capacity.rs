@@ -93,7 +93,7 @@
 //!
 //! Signing canonical-bytes domain separator is `CIRISALM-CAPv2\0\0` —
 //! shared byte-for-byte with Verify's
-//! [`ciris_verify_core::holonomic::preimage::DOMAIN_RELAY_CAPACITY`].
+//! [`ciris_verify_core::substrate::preimage::DOMAIN_RELAY_CAPACITY`].
 //! The MDC `sub_stream_commitments` are additive planner state; they
 //! ride the wire unsigned and do NOT change the signed preimage.
 
@@ -362,7 +362,7 @@ impl RelayCapacity {
 
     /// Canonical bytes for hybrid signing — **delegated verbatim to
     /// Verify** so an edge-minted advert verifies under Verify's
-    /// [`ciris_verify_core::holonomic::alm::verify_relay_capacity`]
+    /// [`ciris_verify_core::substrate::alm::verify_relay_capacity`]
     /// (§19.4 N8; CIRISEdge#359 Crypto-DRY).
     ///
     /// Layout is Verify's canonical §19.0 preimage:
@@ -389,7 +389,7 @@ impl RelayCapacity {
     #[must_use]
     pub fn canonical_bytes_for_signing(&self, advertiser_key_id: &str, epoch: Epoch) -> Vec<u8> {
         // Single shared construction — Verify's builder, not an edge fork.
-        ciris_verify_core::holonomic::alm::SignedRelayCapacity {
+        ciris_verify_core::substrate::alm::SignedRelayCapacity {
             peer_id: advertiser_key_id.to_string(),
             uplink_mbps: uplink_mbps_to_u32(self.uplink_mbps),
             epoch: epoch.0,
@@ -1092,7 +1092,7 @@ mod tests {
         let edge_bytes = cap.canonical_bytes_for_signing("relay-1", Epoch(3));
 
         // Verify's canonical builder, constructed independently.
-        let verify_bytes = ciris_verify_core::holonomic::alm::SignedRelayCapacity {
+        let verify_bytes = ciris_verify_core::substrate::alm::SignedRelayCapacity {
             peer_id: "relay-1".to_string(),
             uplink_mbps: 500,
             epoch: 3,

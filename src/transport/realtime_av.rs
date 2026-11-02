@@ -477,7 +477,7 @@ fn epoch_counter(chunk_seq: ChunkSeq) -> Result<u32, RealtimeAvError> {
 ///
 /// §19 re-export debt (CIRISEdge#359 F-4): the SHA-256 construction is
 /// the §10.5.8 A/V nonce shape owned by
-/// [`ciris_verify_core::holonomic::av_chunk::inner_nonce`] (KAT-locked
+/// [`ciris_verify_core::substrate::av_chunk::inner_nonce`] (KAT-locked
 /// there). This edge-newtyped wrapper delegates to it byte-for-byte —
 /// `StreamId`/`Epoch`/`ChunkSeq` are edge-only newtypes so a plain
 /// re-export is not type-compatible.
@@ -489,7 +489,7 @@ fn epoch_counter(chunk_seq: ChunkSeq) -> Result<u32, RealtimeAvError> {
 /// this keeps the v19 construction byte-for-byte until then.
 #[allow(deprecated)]
 pub fn derive_inner_nonce(stream_id: StreamId, epoch: Epoch, chunk_seq: ChunkSeq) -> [u8; 12] {
-    ciris_verify_core::holonomic::av_chunk::inner_nonce(&stream_id.0, epoch.0, chunk_seq.0)
+    ciris_verify_core::substrate::av_chunk::inner_nonce(&stream_id.0, epoch.0, chunk_seq.0)
 }
 
 /// Derive the outer-AEAD nonce per Link from `(link_id, link_seq)`.
@@ -499,9 +499,9 @@ pub fn derive_inner_nonce(stream_id: StreamId, epoch: Epoch, chunk_seq: ChunkSeq
 ///
 /// §19 re-export debt (CIRISEdge#359 F-4): delegates to the shared
 /// §10.5.8 nonce owner
-/// [`ciris_verify_core::holonomic::av_chunk::outer_nonce`] byte-for-byte.
+/// [`ciris_verify_core::substrate::av_chunk::outer_nonce`] byte-for-byte.
 pub fn derive_outer_nonce(link_id: &[u8], link_seq: u64) -> [u8; 12] {
-    ciris_verify_core::holonomic::av_chunk::outer_nonce(link_id, link_seq)
+    ciris_verify_core::substrate::av_chunk::outer_nonce(link_id, link_seq)
 }
 
 /// The inner-sealed half of a chunk — E2E ciphertext shared across the
