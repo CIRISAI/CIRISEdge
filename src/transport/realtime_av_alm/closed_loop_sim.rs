@@ -39,9 +39,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
 use super::controller::{
-    Admission, ControlMsg, ControllerConfig, DecisionKind, DecisionLog, EgressMeter, JitterSource,
-    ParentSelector, Role, SelectorAction, ShedReason, SplitMix64, SubscribeRequest,
+    Admission, ClassPolicy, ControlMsg, ControllerConfig, DecisionKind, DecisionLog, EgressMeter,
+    JitterSource, ParentSelector, Role, SelectorAction, ShedReason, SplitMix64, SubscribeRequest,
+    Tier,
 };
+use crate::load_ladder::ServiceTier;
 
 /// Media chunk interval (and the sim's base step).
 pub const CHUNK_MS: u64 = 50;
@@ -217,6 +219,14 @@ pub struct Sim {
     /// Membership-invariant violations: (t, node, what). A non-member holding
     /// downstream legs, or being anyone's primary/standby.
     pub nonmember_violations: Vec<(u64, u32, &'static str)>,
+    /// Stage 2: the canonical (a non-member transport forwarder, the last
+    /// tier, audio only), if this world has one.
+    pub canonical: Option<u32>,
+    /// Stage 2: samples where the canonical held a PRIMARY (video)
+    /// commitment: (t, subscriber). V1 says never.
+    pub canonical_video: Vec<(u64, u32)>,
+    /// Stage 2: the canonical's peak audio commitment (bps).
+    pub canonical_peak_bps: u64,
 }
 
 impl Sim {
@@ -297,7 +307,91 @@ impl Sim {
             overcap_from: 0,
             roster,
             nonmember_violations: Vec::new(),
+            canonical: None,
+            canonical_video: Vec::new(),
+            canonical_peak_bps: 0,
         }
+    }
+
+    /// Stage 2 (`FSD/CIRIS_MESH.md` §6.4): make node `n` the canonical — a
+    /// non-member TRANSPORT forwarder advertising `advertised_streams`,
+    /// under the canonical class policy (never video, audio within 5 %, no
+    /// trial slot), in the last tier of every selector. It carries each
+    /// requester's link 1:1 (each child is its own relayed link, never a
+    /// fan-out of one stream, §4.4 M2), so it is fed the far end's chunks
+    /// directly rather than through a parent of its own.
+    pub fn make_canonical(&mut self, n: u32, advertised_streams: f64) {
+        let adv = (advertised_streams * self.cfg.stream_bps as f64) as u64;
+        let mut a = Admission::transport(n, self.cfg.clone(), Some(adv), ClassPolicy::canonical());
+        a.set_members(self.roster.iter().copied());
+        let node = &mut self.nodes[n as usize];
+        node.adm = Some(a);
+        node.sel = None;
+        node.spec.forwarder = true;
+        node.spec.member = false;
+        node.spec.uplink_streams = node.spec.uplink_streams.max(advertised_streams);
+        for nd in &mut self.nodes {
+            if let Some(sel) = nd.sel.as_mut() {
+                sel.set_tier(&n, Tier::Canonical);
+            }
+        }
+        self.canonical = Some(n);
+    }
+
+    /// Stage 2: node `n`'s candidates (its contact set; a hard-NAT node's
+    /// does not include the publisher).
+    pub fn set_candidates(&mut self, n: u32, cands: Vec<u32>) {
+        self.nodes[n as usize].cands = cands;
+    }
+
+    /// Stage 2: give the publisher a starting probe allowance (the far end of
+    /// many relayed links is not one cold uplink).
+    pub fn set_probe_streams(&mut self, n: u32, streams: u64) {
+        if let Some(a) = self.nodes[n as usize].adm.as_mut() {
+            a.set_probe_streams(streams);
+        }
+    }
+
+    /// Stage 2 (`FSD/CIRIS_MESH.md` §7.2): node `n`'s service tier. Tier ≥ 1
+    /// closes its admission; tier 2 sheds every commitment LIFO,
+    /// make-before-break (the shed child keeps receiving until it moves).
+    pub fn set_tier(&mut self, n: u32, tier: ServiceTier) -> Vec<u32> {
+        let t = self.now;
+        let mut shed = Vec::new();
+        if let Some(a) = self.nodes[n as usize].adm.as_mut() {
+            a.set_admit_closed(!tier.admits_new_relay_work());
+            if tier.sheds_relayed_audio() {
+                shed = a.shed_all_draining(t, ShedReason::LoadShed, &mut self.log);
+            }
+        }
+        for &v in &shed {
+            self.send_ctrl(
+                t,
+                n,
+                v,
+                ControlMsg::Shed {
+                    reason: ShedReason::LoadShed,
+                },
+            );
+        }
+        shed
+    }
+
+    /// Node `n`'s candidates: (id, state, tier).
+    pub fn candidates_of(&self, n: u32) -> Vec<(u32, super::controller::PeerState, Tier)> {
+        self.nodes[n as usize]
+            .sel
+            .as_ref()
+            .map(ParentSelector::candidates)
+            .unwrap_or_default()
+    }
+
+    /// Whether `n` hears the stream on the canonical tier, audio only.
+    pub fn video_unavailable(&self, n: u32) -> bool {
+        self.nodes[n as usize]
+            .sel
+            .as_ref()
+            .is_some_and(ParentSelector::video_unavailable)
     }
 
     fn fresh_node(
@@ -535,7 +629,7 @@ impl Sim {
         let Some(adm) = &node.adm else {
             return;
         };
-        let mut kids: Vec<(u32, Role)> = adm.ledger().iter().map(|(k, c)| (*k, c.role)).collect();
+        let mut kids: Vec<(u32, Role)> = adm.forwarding_to();
         if kids.is_empty() {
             return;
         }
@@ -744,14 +838,39 @@ impl Sim {
     fn sample(&mut self, t: u64) {
         // Membership invariant (CC 5.4.6 / E1 item 1 / 6.1.6): no non-member
         // holds downstream legs or is anyone's media parent.
+        if let Some(c) = self.canonical {
+            if let Some(a) = self.nodes[c as usize].adm.as_ref() {
+                for (k, cm) in a.ledger() {
+                    if cm.role == Role::Primary {
+                        self.canonical_video.push((t, *k));
+                    }
+                }
+                self.canonical_peak_bps = self.canonical_peak_bps.max(a.committed_bps());
+            }
+        }
         for (i, n) in self.nodes.iter().enumerate() {
             let id = i as u32;
+            // The canonical is a transport forwarder of 1:1 links (§4.4), not
+            // a tree node: its links are not tree edges.
+            if Some(id) == self.canonical {
+                continue;
+            }
             if !n.spec.member && n.adm.as_ref().is_some_and(|a| !a.ledger().is_empty()) {
                 self.nonmember_violations
                     .push((t, id, "non-member holds downstream legs"));
             }
             if let Some(sel) = n.sel.as_ref() {
-                for (p, _) in sel.subscriptions() {
+                for (p, role) in sel.subscriptions() {
+                    if Some(p) == self.canonical {
+                        if role == Role::Primary {
+                            self.nonmember_violations.push((
+                                t,
+                                p,
+                                "the canonical is a video parent",
+                            ));
+                        }
+                        continue;
+                    }
                     if !self.nodes[p as usize].spec.member {
                         self.nonmember_violations
                             .push((t, p, "non-member is a media parent"));
@@ -794,6 +913,21 @@ impl Sim {
             self.nodes[0].got_full.set(seq);
             self.nodes[0].got_any.set(seq);
             self.forward(t, 0, seq, true, t, true);
+            if let Some(c) = self.canonical {
+                if self.nodes[c as usize].alive {
+                    let lat = self.base_latency(0, c);
+                    self.push(
+                        t + lat.ceil() as u64,
+                        0,
+                        c,
+                        Payload::Chunk {
+                            seq,
+                            full: true,
+                            emitted: t,
+                        },
+                    );
+                }
+            }
         }
         if t % OFFER_MS == 0 {
             self.offers(t);
@@ -2054,5 +2188,555 @@ mod scenarios {
             "{}",
             sim.report(None, &format!("conv {:?}", m.converged_ms))
         );
+    }
+}
+
+// ─── Stage 2 scenarios: relay selection (FSD CIRIS_MESH §9) ──────────
+
+#[cfg(test)]
+mod mesh_scenarios {
+    //! `FSD/CIRIS_MESH.md` §9 and §7.6 on the closed loop, driving the
+    //! production controller types. The worlds:
+    //!
+    //! - node 0 is the far end of every requester's link (the publisher);
+    //! - **member relays** reach it directly and are the ALM media parents
+    //!   of the hard-NAT members, who cannot reach node 0 at all (their
+    //!   candidates are their contact set: roster relays + the canonical);
+    //! - the **canonical** is a non-member transport forwarder of 1:1 links,
+    //!   the last tier, audio only (§6.4).
+    use super::*;
+
+    const SECOND: u64 = 1_000;
+
+    fn seeds() -> Vec<u64> {
+        let n = std::env::var("CIRIS_ALM_SOAK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3u64);
+        (1..=n).collect()
+    }
+
+    struct World {
+        sim: Sim,
+        relays: Vec<u32>,
+        leaves: Vec<u32>,
+        canonical: u32,
+    }
+
+    /// `relay_caps` member relays, `leaves` hard-NAT members each with
+    /// `contacts` random relays + the canonical (advertising `canon_streams`).
+    fn world(
+        seed: u64,
+        cfg: ControllerConfig,
+        relay_caps: &[f64],
+        leaves: usize,
+        contacts: usize,
+        canon_streams: f64,
+    ) -> World {
+        let mut others: Vec<NodeSpec> = relay_caps.iter().map(|&c| NodeSpec::relay(c)).collect();
+        others.extend(std::iter::repeat(NodeSpec::leaf()).take(leaves));
+        others.push(NodeSpec::leaf());
+        let far_end = (relay_caps.len() as f64 * 1.7).max(4.0);
+        let mut sim = Sim::new(
+            seed,
+            cfg,
+            NodeSpec::relay(far_end),
+            &others,
+            Candidates::All,
+            None,
+        );
+        let relays: Vec<u32> = (1..=relay_caps.len() as u32).collect();
+        let first_leaf = relay_caps.len() as u32 + 1;
+        let leaf_ids: Vec<u32> = (first_leaf..first_leaf + leaves as u32).collect();
+        let canonical = first_leaf + leaves as u32;
+        sim.make_canonical(canonical, canon_streams);
+        sim.set_probe_streams(0, relays.len() as u64 + 1);
+        for &r in &relays {
+            sim.set_candidates(r, vec![0]);
+        }
+        let mut pick = SplitMix64(seed ^ 0xC0_7AC7);
+        for &l in &leaf_ids {
+            let mut pool = relays.clone();
+            let mut c = Vec::with_capacity(contacts + 1);
+            for _ in 0..contacts.min(pool.len()) {
+                let j = pick.range_u64(0, pool.len() as u64) as usize;
+                c.push(pool.swap_remove(j));
+            }
+            c.push(canonical);
+            sim.set_candidates(l, c);
+        }
+        World {
+            sim,
+            relays,
+            leaves: leaf_ids,
+            canonical,
+        }
+    }
+
+    fn line(name: &str, w: &World, m: &Metrics, extra: &str) {
+        eprintln!(
+            "[ALM-MESH] {name:<10} seed={} conv={:?} chg/sub/120s={:.3} flips={} overcap={} \
+             served={}/{} canon_video={} canon_peak_bps={} {extra} decisions={} hash={}",
+            w.sim.seed,
+            m.converged_ms,
+            m.change_rate_per_120s,
+            m.flips,
+            m.overcap_samples,
+            m.served,
+            m.subscribers,
+            w.sim.canonical_video.len(),
+            w.sim.canonical_peak_bps,
+            w.sim.log.len(),
+            &w.sim.log.hash_hex()[..16],
+        );
+    }
+
+    /// Per-relay committed ÷ real capacity, max/min over relays carrying load.
+    fn load_spread(w: &World) -> f64 {
+        let loads: Vec<f64> = w
+            .relays
+            .iter()
+            .filter(|&&r| w.sim.alive(r))
+            .map(|&r| {
+                w.sim.committed(r) as f64 / (w.sim.uplink_streams(r) * w.sim.cfg.stream_bps as f64)
+            })
+            .collect();
+        let max = loads.iter().copied().fold(0.0, f64::max);
+        let min = loads.iter().copied().fold(f64::MAX, f64::min);
+        if min <= 0.0 {
+            f64::INFINITY
+        } else {
+            max / min
+        }
+    }
+
+    const S1_END: u64 = 300 * SECOND;
+
+    fn s1(seed: u64, cfg: ControllerConfig) -> (World, Metrics) {
+        // FSD S1: 200 hard-NAT members, 40 roster relays of {5,10,20}
+        // reservation units, each member's contacts a random 8 of the 40, the
+        // canonical present, all joining at t = 0.
+        let caps: Vec<f64> = (0..40).map(|i| [5.0, 10.0, 20.0][i % 3]).collect();
+        let mut w = world(seed, cfg, &caps, 200, 8, 100.0);
+        w.sim.run_until(S1_END);
+        let m = w.sim.metrics(30 * SECOND, S1_END, &w.leaves);
+        (w, m)
+    }
+
+    /// The FSD S1 criteria, as this world measures them: (1) every member
+    /// attached by 30 s (a member primary, or audio on the canonical when
+    /// every one of its contacts is genuinely full), ≥ 99 % on a member;
+    /// (2) no relay over 0.65 × capacity; (4) no flips and ≤ 1 change per
+    /// member per 120 s; (5) the canonical carries only members none of
+    /// whose contacts has room (≤ 1 %), and never video. The load spread
+    /// (3) is reported, not asserted (see the module report).
+    fn s1_verdict(w: &World, m: &Metrics) -> Result<String, String> {
+        let sim = &w.sim;
+        if let Some(&(t, n, what)) = sim.nonmember_violations.first() {
+            return Err(sim.report(Some(n), &format!("{what} at t={t}")));
+        }
+        if let Some(&(t, n)) = sim.canonical_video.first() {
+            return Err(sim.report(Some(n), &format!("video on the canonical at t={t}")));
+        }
+        if m.overcap_samples > 0 {
+            let (t, n, load, cap) = sim.overcap[0];
+            return Err(sim.report(Some(n), &format!("{load:.0} > {cap:.0} at t={t}")));
+        }
+        let on_member: Vec<u32> = w
+            .leaves
+            .iter()
+            .copied()
+            .filter(|&l| sim.primary_of(l).is_some_and(|p| w.relays.contains(&p)))
+            .collect();
+        let off: Vec<u32> = w
+            .leaves
+            .iter()
+            .copied()
+            .filter(|l| !on_member.contains(l))
+            .collect();
+        if on_member.len() * 100 < w.leaves.len() * 99 {
+            return Err(sim.report(
+                None,
+                &format!(
+                    "{}/{} on a roster relay; off {off:?}",
+                    on_member.len(),
+                    w.leaves.len()
+                ),
+            ));
+        }
+        for &l in &off {
+            if !sim.video_unavailable(l) {
+                return Err(sim.report(
+                    Some(l),
+                    "unattached (neither a member primary nor canonical audio)",
+                ));
+            }
+        }
+        let late = on_member
+            .iter()
+            .copied()
+            .filter(|&l| sim.last_unserved(l) > 30 * SECOND)
+            .max_by_key(|&l| sim.last_unserved(l));
+        if let Some(l) = late {
+            return Err(sim.report(
+                Some(l),
+                &format!("member-served only at {} ms", sim.last_unserved(l)),
+            ));
+        }
+        let canon_kids: Vec<u32> = sim
+            .children_of(w.canonical)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        if canon_kids.iter().any(|k| !off.contains(k)) {
+            return Err(sim.report(
+                Some(w.canonical),
+                &format!(
+                    "the canonical carries a member that has a member primary: {canon_kids:?}"
+                ),
+            ));
+        }
+        if m.flips > 0 {
+            return Err(sim.report(m.worst_flipper, &format!("{} A→B→A flips", m.flips)));
+        }
+        if m.change_rate_per_120s > 1.0 {
+            return Err(sim.report(None, &format!("change rate {:.3}", m.change_rate_per_120s)));
+        }
+        Ok(format!(
+            "on_member={} canonical_audio_only={} spread={:.2}",
+            on_member.len(),
+            off.len(),
+            load_spread(w)
+        ))
+    }
+
+    /// **S1 — hard-NAT members choose roster relays without herding.** Pass:
+    /// served by 30 s, ≥ 99 % on a roster relay, no relay over 0.65 ×
+    /// capacity, no flips, ≤ 1 change per member per 120 s, the canonical
+    /// carrying nothing.
+    #[test]
+    fn s1_hard_nat_members_choose_roster_relays_without_herding() {
+        for seed in seeds() {
+            let (w, m) = s1(seed, ControllerConfig::interactive());
+            let r = s1_verdict(&w, &m);
+            line("S1", &w, &m, r.as_deref().unwrap_or("FAIL"));
+            if let Err(e) = r {
+                panic!("{e}");
+            }
+        }
+    }
+
+    /// **S1-mut** — the herding controls off MUST fail S1.
+    #[test]
+    fn s1_mut_herding_controls_off_must_fail() {
+        let (w, m) = s1(1, ControllerConfig::interactive().herding_mutant());
+        let r = s1_verdict(&w, &m);
+        line(
+            "S1-mut",
+            &w,
+            &m,
+            if r.is_err() {
+                "FAILS (as it must)"
+            } else {
+                "PASSED"
+            },
+        );
+        assert!(r.is_err(), "S1 does not test herding: the mutant passed");
+    }
+
+    /// **S3 — a roster relay goes offline; failover to another MEMBER before
+    /// the canonical.** The killed relay's members promote their (member)
+    /// standbys: audio never gaps, video gaps at most the suspicion bound,
+    /// and the canonical carries nothing. Variant: every relay goes, and
+    /// the members fall to the canonical — audio only, never video.
+    #[test]
+    fn s3_relay_failover_prefers_members_then_canonical_audio_only() {
+        for seed in seeds() {
+            let mut w = world(
+                seed,
+                ControllerConfig::interactive(),
+                &[10.0; 6],
+                24,
+                6,
+                50.0,
+            );
+            w.sim.run_until(120 * SECOND);
+            let victim = w
+                .relays
+                .iter()
+                .copied()
+                .max_by_key(|&r| w.sim.children_of(r).len())
+                .expect("relays");
+            let orphans: Vec<u32> = w
+                .leaves
+                .iter()
+                .copied()
+                .filter(|&l| w.sim.primary_of(l) == Some(victim))
+                .collect();
+            assert!(
+                !orphans.is_empty(),
+                "{}",
+                w.sim.report(Some(victim), "no orphans")
+            );
+            // The canonical may carry audio during cold start (members still
+            // probing their capacity, R2); what counts is after the failure.
+            w.sim.canonical_peak_bps = 0;
+            w.sim.kill(victim);
+            w.sim.run_until(180 * SECOND);
+            let m = w.sim.metrics(120 * SECOND, 180 * SECOND, &orphans);
+            for &o in &orphans {
+                let p = w.sim.primary_of(o);
+                assert!(
+                    p.is_some_and(|p| w.relays.contains(&p) && p != victim),
+                    "{}",
+                    w.sim
+                        .report(Some(o), &format!("not on another member: {p:?}"))
+                );
+            }
+            assert_eq!(
+                w.sim.canonical_peak_bps,
+                0,
+                "{}",
+                w.sim.report(
+                    Some(w.canonical),
+                    "the canonical carried a member that had a member"
+                )
+            );
+            // Suspicion (1.5 s) + RTT + one admission round, in chunks.
+            let bound = (super::super::PARENT_SILENCE_HEAL_MS + 2_000) / CHUNK_MS;
+            assert!(
+                m.max_audio_gap <= 2 && m.max_video_gap <= bound,
+                "{}",
+                w.sim.report(
+                    None,
+                    &format!("gaps audio={} video={}", m.max_audio_gap, m.max_video_gap)
+                )
+            );
+            line(
+                "S3",
+                &w,
+                &m,
+                &format!(
+                    "orphans={} vgap={} agap={}",
+                    orphans.len(),
+                    m.max_video_gap,
+                    m.max_audio_gap
+                ),
+            );
+
+            // Variant: no member left. Audio-only on the canonical, V1 holds.
+            for &r in &w.relays.clone() {
+                if w.sim.alive(r) {
+                    w.sim.kill(r);
+                }
+            }
+            w.sim.run_until(260 * SECOND);
+            assert!(w.sim.canonical_video.is_empty(), "video on the canonical");
+            let audio_only = w
+                .leaves
+                .iter()
+                .filter(|&&l| w.sim.video_unavailable(l))
+                .count();
+            assert!(
+                audio_only > 0,
+                "{}",
+                w.sim.report(
+                    Some(w.leaves[0]),
+                    &format!(
+                        "nobody fell to the canonical: leaf0 primary={:?} standby={:?} cands={:?} canon_children={:?}",
+                        w.sim.primary_of(w.leaves[0]),
+                        w.sim.standby_of(w.leaves[0]),
+                        w.sim.candidates_of(w.leaves[0]),
+                        w.sim.children_of(w.canonical)
+                    )
+                )
+            );
+            let cap = (0.05 * 50.0 * w.sim.cfg.stream_bps as f64) as u64;
+            assert!(
+                w.sim.canonical_peak_bps <= cap,
+                "audio {} > 5 % ({cap})",
+                w.sim.canonical_peak_bps
+            );
+            eprintln!(
+                "[ALM-MESH] S3-variant seed={seed} audio_only_on_canonical={audio_only}/{}",
+                w.leaves.len()
+            );
+        }
+    }
+
+    /// **S5 + S6 — canonical saturation, then recovery to the member tier.**
+    /// No member relay is up: every member asks the canonical. Zero video
+    /// reservations at the canonical ever; audio ≤ 5 % of its capacity;
+    /// members beyond that get nothing (refused `relay_capacity`), never an
+    /// unadmitted path. Then the relays come up: members leave the canonical
+    /// make-before-break, video resumes, and the canonical's audio falls to
+    /// ≤ 10 % of its peak.
+    #[test]
+    fn s5_s6_canonical_saturation_then_recovery() {
+        for seed in seeds() {
+            let mut w = world(
+                seed,
+                ControllerConfig::interactive(),
+                &[10.0; 24],
+                120,
+                6,
+                60.0,
+            );
+            for &r in &w.relays.clone() {
+                w.sim.kill(r);
+            }
+            w.sim.run_until(100 * SECOND);
+            let cap = (0.05 * 60.0 * w.sim.cfg.stream_bps as f64) as u64;
+            let audio_only = w
+                .leaves
+                .iter()
+                .filter(|&&l| w.sim.video_unavailable(l))
+                .count();
+            let unserved = w
+                .leaves
+                .iter()
+                .filter(|&&l| w.sim.standby_of(l).is_none())
+                .count();
+            assert!(
+                w.sim.canonical_video.is_empty(),
+                "V1: video on the canonical"
+            );
+            assert!(
+                w.sim.canonical_peak_bps <= cap,
+                "V2: {} > {cap}",
+                w.sim.canonical_peak_bps
+            );
+            let refusals = w.sim.log.count(DecisionKind::Refuse);
+            assert!(
+                audio_only > 0 && unserved > 0 && refusals > 0,
+                "audio_only={audio_only} unserved={unserved}"
+            );
+            // Nobody hears video with no member up.
+            for &l in &w.leaves {
+                assert!(
+                    !w.sim.got_full(l, 90 * SECOND / CHUNK_MS),
+                    "video without a member path"
+                );
+            }
+            let peak = w.sim.canonical_peak_bps;
+            for &r in &w.relays.clone() {
+                w.sim.revive(r);
+            }
+            w.sim.run_until(300 * SECOND);
+            let now_canon = w.sim.committed(w.canonical);
+            let m = w.sim.metrics(200 * SECOND, 300 * SECOND, &w.leaves);
+            assert!(
+                now_canon * 10 <= peak,
+                "{}",
+                w.sim.report(
+                    Some(w.canonical),
+                    &format!("canonical still holds {now_canon} of peak {peak}")
+                )
+            );
+            assert!(w.sim.canonical_video.is_empty());
+            line(
+                "S5/S6",
+                &w,
+                &m,
+                &format!(
+                    "audio_only={audio_only} refused_capacity={unserved} canon_after={now_canon}"
+                ),
+            );
+            assert!(
+                m.served * 100 >= m.subscribers * 95,
+                "video did not resume: {}/{}",
+                m.served,
+                m.subscribers
+            );
+        }
+    }
+
+    /// **LS4 — make-before-break shed.** A relay goes to tier 2 and sheds
+    /// every commitment LIFO; each shed member moves to another member relay
+    /// (never the canonical while a member has headroom) with zero frames
+    /// lost to the move: the shedding relay keeps forwarding until it moves.
+    #[test]
+    fn ls4_tier_two_shed_is_make_before_break() {
+        for seed in seeds() {
+            let mut w = world(
+                seed,
+                ControllerConfig::interactive(),
+                &[10.0; 4],
+                12,
+                4,
+                50.0,
+            );
+            w.sim.run_until(120 * SECOND);
+            let r = w
+                .relays
+                .iter()
+                .copied()
+                .max_by_key(|&r| w.sim.children_of(r).len())
+                .expect("relays");
+            let before: Vec<u32> = w.sim.children_of(r).into_iter().map(|(c, _)| c).collect();
+            w.sim.canonical_peak_bps = 0;
+            let shed = w.sim.set_tier(r, ServiceTier::ChatAndContacts);
+            let mut sorted = shed.clone();
+            sorted.sort_unstable();
+            let mut b = before.clone();
+            b.sort_unstable();
+            assert_eq!(sorted, b, "every commitment shed");
+            w.sim.run_until(180 * SECOND);
+            let primaries: Vec<u32> = w
+                .leaves
+                .iter()
+                .copied()
+                .filter(|l| shed.contains(l))
+                .collect();
+            let m = w.sim.metrics(119 * SECOND, 180 * SECOND, &primaries);
+            for &c in &primaries {
+                let p = w.sim.primary_of(c);
+                assert!(
+                    p.is_some_and(|p| p != r && w.relays.contains(&p)),
+                    "{}",
+                    w.sim.report(Some(c), &format!("moved to {p:?}"))
+                );
+            }
+            assert_eq!(
+                m.max_audio_gap,
+                0,
+                "{}",
+                w.sim.report(None, "audio lost to the move")
+            );
+            assert_eq!(
+                m.max_video_gap,
+                0,
+                "{}",
+                w.sim.report(None, "video lost to the move")
+            );
+            assert_eq!(
+                w.sim.canonical_peak_bps, 0,
+                "a member fell to the canonical"
+            );
+            assert!(
+                w.sim.children_of(r).is_empty(),
+                "the shed relay admitted again"
+            );
+            eprintln!(
+                "[ALM-MESH] LS4 seed={seed} shed={} (LIFO) moved_without_loss",
+                shed.len()
+            );
+        }
+    }
+
+    /// Same seed, same decision-log hash (the determinism gate for stage 2).
+    #[test]
+    fn mesh_determinism_same_seed_same_hash() {
+        let a = {
+            let mut w = world(7, ControllerConfig::interactive(), &[8.0; 6], 24, 4, 50.0);
+            w.sim.run_until(60 * SECOND);
+            w.sim.log.hash_hex()
+        };
+        let b = {
+            let mut w = world(7, ControllerConfig::interactive(), &[8.0; 6], 24, 4, 50.0);
+            w.sim.run_until(60 * SECOND);
+            w.sim.log.hash_hex()
+        };
+        assert_eq!(a, b);
     }
 }

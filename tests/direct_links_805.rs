@@ -2013,3 +2013,75 @@ async fn consented_contacts_go_direct_without_a_room() {
         "a withdrawn contact is no longer accepted"
     );
 }
+
+/// **ALM stage 2 / #926 on a punched path** — leviculum v0.33's two-sided
+/// punch brings A↔B direct (both ends `Established`, each having proven the
+/// address both ways), and the #926 stall guard then watches that punched
+/// identity link: when the peer stops acknowledging on it (the 2026-10-31
+/// one-sided-punch symptom), three zero-landing Channel sends judge it dead
+/// and the guard moves it OFF the punched interface back onto its relayed
+/// path (leviculum#83 `retire_direct_link`) instead of retrying it for
+/// minutes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_punched_link_that_stops_acking_is_retired_by_the_stall_guard() {
+    let mut p = trio("w926", proposer(), DirectLinksConfig::default()).await;
+    let (_spine, b_addr) = open_call(&p).await;
+    let _arrivals = p.b.transport.take_av_arrivals().expect("B's arrivals");
+    let _link =
+        p.a.transport
+            .open_av_link(&p.b.key.key_id, &b_addr)
+            .await
+            .expect("A reaches B over the punched interface");
+    let DirectPathEvent::Established {
+        link_id: identity_link,
+        ..
+    } = next_event(&mut p.a.events, Duration::from_secs(5), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("A's Established")
+    else {
+        unreachable!()
+    };
+    // Two-sided: B moved too (v0.33: an address proven both ways).
+    next_event(&mut p.b.events, Duration::from_secs(10), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("B's Established");
+    assert!(p.a.transport.direct_link_interface(identity_link).is_some());
+
+    // The peer stops acknowledging on the punched link.
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            p.a.transport.link_channel_settled_for_test(identity_link)
+        })
+        .await
+    );
+    p.a.transport
+        .stop_acks_on_link_for_test(identity_link, Some(0));
+    let frame = vec![0x5a; 64];
+    for _ in 0..3 {
+        let (sent, total) =
+            p.a.transport
+                .send_channel_for_test(identity_link, &frame)
+                .await;
+        assert_eq!(sent, 0, "nothing lands ({sent}/{total})");
+    }
+    p.a.transport
+        .stop_acks_on_link_for_test(identity_link, None);
+    let retired = wait_until(Duration::from_secs(10), || async {
+        p.a.transport.direct_link_interface(identity_link).is_none()
+    })
+    .await;
+    assert!(
+        retired,
+        "the stall guard moved the dead punched link off its interface: stall={:?}",
+        p.a.transport.link_stall_for_test(identity_link)
+    );
+    let (zero, dead) = p.a.transport.link_stall_for_test(identity_link);
+    assert!(
+        !dead && zero == 0,
+        "a fresh run on the relayed path: ({zero}, {dead})"
+    );
+}
