@@ -222,21 +222,33 @@ node's next roll (one 250 ms watch tick, or the next `publish`), the departed
 member's leg is still on the roster. A re-announce in that window would send
 it the current binding, which it already holds as a member of the epoch.
 
-## 2. The 64-byte trailer
+## 2. The 72-byte trailer (v2: source timestamp + signature)
+
+> **CHANGED in ALM stage 2 (edge v44.0.0) — FLAG FOR THE CC (5.3.3.2.3).**
+> The trailer now carries the publisher's source timestamp, and the
+> signature covers it. The domain tag moved `v1` → `v2`, so a `v1` trailer
+> does not verify (`av_chunk_trailer_invalid`). The timestamp is the ALM C1
+> meter's latency input: a receiver measures each path's latency ABOVE the
+> fastest delivery it has seen for the stream, so the clock offset between
+> the hosts cancels. It is signed so a relay cannot make its path look
+> faster than it is (a member relay re-seals only the outer layer and
+> forwards the trailer byte for byte).
 
 ### 2.1 What it signs
 
-`chunk_sig_message` (`av_chunk_auth.rs:160`):
+`chunk_sig_message` (`av_chunk_auth.rs`):
 
 ```
-msg = "ciris-edge:av-chunk-sig:v1"   26 bytes ASCII (CHUNK_SIG_DOMAIN :116)
+msg = "ciris-edge:av-chunk-sig:v2"   26 bytes ASCII (CHUNK_SIG_DOMAIN)
     ‖ stream_id                      32
     ‖ u64_be(epoch)                  8
     ‖ u64_be(chunk_seq)              8
     ‖ codec_id                       1
     ‖ spatial ‖ temporal ‖ quality   3
+    ‖ u64_be(source_ms)              8   the publisher's wall clock, UNIX ms, at seal
     ‖ inner_aead                     the inner AES-256-GCM ciphertext INCLUDING its 16-byte tag
-trailer = Ed25519.sign(chunk_key[stream, epoch], msg)          64 bytes (CHUNK_SIG_LEN :113)
+trailer = u64_be(source_ms) ‖ Ed25519.sign(chunk_key[stream, epoch], msg)
+                                     8 + 64 = 72 bytes (CHUNK_TRAILER_LEN; CHUNK_SIG_LEN = 64)
 ```
 
 The signer is `ChunkSigner::sign` (`:340`). It refuses a chunk of another
@@ -256,7 +268,7 @@ SealedAvChunk wire (realtime_av.rs:360):
 The trailer is appended to the inner unit, after the inner ciphertext and
 inside the outer (hop) seal. A hop opens the outer seal (`open_av_outer`,
 `realtime_av.rs:852`) and gets `inner_aead ‖ trailer`. The trailer is the
-last 64 bytes. A member relay forwards that unit byte for byte, re-sealing only
+last 72 bytes: the first 8 are `source_ms`, the last 64 the signature. A member relay forwards that unit byte for byte, re-sealing only
 the outer layer.
 
 ### 2.3 Verification order
@@ -267,8 +279,8 @@ the outer layer.
 3. Open the outer seal at the hop counter (`open_hop_outer`, `realtime_av_dispatcher.rs:252`); on failure count `av_call_frame_unopened`.
 4. `ChunkAuth::check` (`av_chunk_auth.rs:1080`, called at `av_call.rs:2058`):
    1. look up the bound key for `(stream_id, epoch)`, else `av_chunk_unbound`;
-   2. take the last 64 bytes as the trailer, else `av_chunk_trailer_missing`;
-   3. Ed25519 `verify_strict(key, msg, trailer)` with `msg` built from the header and the remaining bytes, else `av_chunk_trailer_invalid`.
+   2. take the last 72 bytes as the trailer, else `av_chunk_trailer_missing`;
+   3. split it `source_ms[8] ‖ sig[64]`; Ed25519 `verify_strict(key, msg, sig)` with `msg` built from the header, `source_ms` and the remaining bytes, else `av_chunk_trailer_invalid`.
 5. Forward only if this node relays, the link's hello named this stream, and
    the verified publisher is the link's peer (`:2082`). The forwarded unit
    still carries the trailer.
@@ -291,15 +303,15 @@ channel_limit(link) = min(link_mdu − 6, 65535) − 25        (reticulum.rs:430
                                                             25 = E1 seal header 9 + tag 16, link_seal.rs:114)
 AV_CHUNK_WIRE_OVERHEAD = 48 + 4 + 16 + 16 = 84            (realtime_av.rs:824: header, codec/layer, inner tag, outer tag)
 max plaintext before   = channel_limit − 84
-max plaintext after    = channel_limit − 84 − 64 = channel_limit − 148
+max plaintext after    = channel_limit − 84 − 72 = channel_limit − 156     (v2 trailer)
 ```
 
 `link_mdu` is leviculum's `floor((mtu − 1 − 19 − 48) / 16) × 16 − 1`.
 
 | Link MTU | link MDU | Channel limit | Max plaintext before | after | Binding parts (KAT size) |
 |---|---|---|---|---|---|
-| 500 (base) | 431 | 400 | 316 | 252 | 10 × ≤400 B |
-| 1400 (punched direct, `direct_path.rs:469`) | 1327 | 1296 | 1212 | 1148 | 3 × ≤1296 B |
+| 500 (base) | 431 | 400 | 316 | 244 | 10 × ≤400 B |
+| 1400 (punched direct, `direct_path.rs:469`) | 1327 | 1296 | 1212 | 1140 | 3 × ≤1296 B |
 
 The call refuses a frame over the budget before sealing it. A smaller MTU
 shrinks every number in the row.
@@ -325,7 +337,7 @@ forwarder runs none of this and emits none of them. Each refusal:
 | `av_binding_signature_unverified` | hybrid signature not `HybridVerified` | `av_call_binding_refused` |
 | `av_binding_stale_epoch` | epoch older than the two held for the stream | `av_call_binding_refused` |
 | `av_chunk_unbound` | no verified binding for the chunk's `(stream, epoch)`; this covers an unknown stream, and an epoch whose key was dropped two rolls ago | `av_call_frame_unbound` |
-| `av_chunk_trailer_missing` | inner unit shorter than 64 bytes | `av_call_frame_forged` |
+| `av_chunk_trailer_missing` | inner unit shorter than 72 bytes | `av_call_frame_forged` |
 | `av_chunk_trailer_invalid` | trailer does not verify under the bound key | `av_call_frame_forged` |
 
 A successfully installed binding counts `av_call_binding_installed`.
@@ -342,6 +354,7 @@ It asserts the constants in `mod kat` (`:435`) and prints them with
 - chunk key: Ed25519 seed `0c`×32;
 - DEK `42`×32;
 - chunk_seq 0, codec `ff`, layer (0,0,0), plaintext ASCII `kat-chunk-0`;
+- source timestamp `1790000000000` ms (`000001a0c4506c00`);
 - inner seal: AES-256-GCM, with the nonce from `derive_inner_nonce` (`realtime_av.rs:491`);
 - forger chunk key: Ed25519 seed `0f`×32.
 
@@ -364,16 +377,19 @@ SHA-256(BINDING_SIG_ML_DSA_65) f4c5aec87ce37cd46f8ab10370e9c321cac1daba2ff6d8959
 SHA-256(binding encoding)      558daab6b4434ced81ddd497f38ade2c2f8d109be3e22a663174bb2d156fc4f8
 BINDING_ID (part id)           558daab6b4434ced
 INNER_AEAD           b3b432abd9ea536a45a933956e21b34dc01e4571e5196d0aa08396
-CHUNK_SIG_MESSAGE    63697269732d656467653a61762d6368756e6b2d7369673a7631   "ciris-edge:av-chunk-sig:v1"
+CHUNK_SIG_MESSAGE    63697269732d656467653a61762d6368756e6b2d7369673a7632   "ciris-edge:av-chunk-sig:v2"
                      c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d8   stream_id
                      0000000000000005 0000000000000000                        epoch, chunk_seq
                      ff 000000                                                codec, layer
+                     000001a0c4506c00                                         source_ms
                      b3b432abd9ea536a45a933956e21b34dc01e4571e5196d0aa08396   inner_aead
-TRAILER              3e88ffce0fa074ab1b2b88fb04095d427fcb46d8f1f49dac851f92761e861a16
-                     61865b999ccd22fc4608da5a20e51ec900f13f8ef1b5ba7ce9d8dc1b3261f807
+TRAILER              000001a0c4506c00                                         source_ms
+                     cf846332f5b31fbf08b8b340514a53895515dff7d164b22be777779fe38a3f3f
+                     f5d55e896cba1ae768320aa633ad0b6a09fb2c58ea19154eb1b6b6d00a14ff09
 VERDICT              verified, publisher node-kat-a
-FORGED_TRAILER       14627f17213c016c8efaaa43ef4fe52d30f0ff97d3ac6943359132d68e4a46a6
-                     3950bc46b98d2f9c4044b204997bfa6f41db9ae624d3ebde874d0845c0f00c0c
+FORGED_TRAILER       000001a0c4506c00
+                     8d2ebc021ef41a20e0734ac2ef78e408da634e1c47a3a0c6ab55132a9e3a6b97
+                     7742bdef28be63574723b24c60a061a6da2340a064a70785195d093b80454006
 VERDICT (forged)     av_chunk_trailer_invalid
 VERDICT (inner unit truncated to 20 bytes)   av_chunk_trailer_missing
 ```
@@ -381,7 +397,37 @@ VERDICT (inner unit truncated to 20 bytes)   av_chunk_trailer_missing
 The full 3309-byte ML-DSA-65 signature is not printed. It is fixed by the
 inputs; the hash pins it.
 
-## 6. Status in the format
+## 6. The ALM control frame (C3, stage 2) — FLAG FOR THE CC
+
+A call's A/V links also carry the ALM controller's control frames
+(`realtime_av_alm/controller/wire.rs`). Like a binding part, a C3 frame takes
+no A/V outer seal and no hop counter; the E1 link seal covers it.
+
+```
+frame = "CALM" ‖ 0x01 ‖ kind ‖ body
+CAPS 0x01: caps u32_be (bit 0 C3 v1, bit 1 timed Channel frames, bit 2 offers relay)
+SUBSCRIBE 0x02: stream[32] ‖ role u8 (0 primary, 1 standby) ‖ flags u8 (bit 0 forward-capable)
+UNSUBSCRIBE 0x03: stream[32]
+ADMIT 0x04: stream[32] ‖ role u8
+REFUSE 0x05: stream[32] ‖ reason u8 ‖ retry_after_ms u32_be
+SHED 0x06: stream[32] ‖ reason u8
+OFFER 0x07: stream[32] ‖ depth u8 ‖ forwarding u8 ‖ headroom_bps u64_be
+            ‖ forwarder_headroom_bps u64_be ‖ upstream_latency_ms u32_be
+            ‖ n u8 ‖ n × (len u16_be ‖ utf8 key id)       (ancestry, root first, n ≤ 8)
+```
+
+- The sender of a frame is never in it: the link's attributed peer is.
+- Capability gate: the RESPONDER of each A/V link sends `CAPS` first, on the
+  reverse direction of the link it accepted; a dialler answers with its own
+  only after hearing one. Nothing else is sent to a peer that never said
+  `CAPS` (a pre-C3 peer would read a frame as a chunk that fails to open).
+- A stream id beginning `"CALM" 0x01` is never minted (`collides_with_control_frame`).
+- Refusal tokens: `relay_capacity`, `relay_loop`, `relay_depth_limit`,
+  `relay_upstream_unhealthy`, `relay_nonmember_fanout`,
+  `relay_class_refused:video`, `load_refuse:admit_closed`; shed tokens
+  `relay_shed:{over_committed,upstream_lost,preempted}`, `load_shed:audio`.
+
+## 7. Status in the format
 
 The binding and the trailer are part of the A/V chunk format, not an
 optional layer:

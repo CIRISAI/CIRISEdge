@@ -147,7 +147,7 @@ async fn the_publishers_chunks_verify_and_open() {
         let signed = key.sign(&inner).unwrap();
         assert_eq!(
             signed.inner_ciphertext().len(),
-            inner.inner_ciphertext().len() + CHUNK_SIG_LEN
+            inner.inner_ciphertext().len() + CHUNK_TRAILER_LEN
         );
         let (publisher, opened) = auth.check(&signed).expect("A's own chunk verifies");
         assert_eq!(&*publisher, A);
@@ -184,7 +184,7 @@ async fn a_member_holding_the_dek_cannot_forge_the_publishers_chunks() {
 
     // Unsigned (B's 64 bytes of anything) and signed by B's own key.
     let mut junk = forged.inner_ciphertext().to_vec();
-    junk.extend_from_slice(&[0u8; CHUNK_SIG_LEN]);
+    junk.extend_from_slice(&[0u8; CHUNK_TRAILER_LEN]);
     let junk = with_ciphertext(&forged, junk);
     assert_eq!(
         auth.check(&junk).unwrap_err(),
@@ -447,11 +447,11 @@ mod kat {
     pub const BINDING_ID: &str = "558daab6b4434ced";
     pub const INNER_AEAD: &str = "b3b432abd9ea536a45a933956e21b34dc01e4571e5196d0aa08396";
     pub const CHUNK_SIG_MESSAGE: &str =
-        "63697269732d656467653a61762d6368756e6b2d7369673a7631c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050000000000000000ff000000b3b432abd9ea536a45a933956e21b34dc01e4571e5196d0aa08396";
+        "63697269732d656467653a61762d6368756e6b2d7369673a7632c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050000000000000000ff000000000001a0c4506c00b3b432abd9ea536a45a933956e21b34dc01e4571e5196d0aa08396";
     pub const TRAILER: &str =
-        "3e88ffce0fa074ab1b2b88fb04095d427fcb46d8f1f49dac851f92761e861a1661865b999ccd22fc4608da5a20e51ec900f13f8ef1b5ba7ce9d8dc1b3261f807";
+        "000001a0c4506c00cf846332f5b31fbf08b8b340514a53895515dff7d164b22be777779fe38a3f3ff5d55e896cba1ae768320aa633ad0b6a09fb2c58ea19154eb1b6b6d00a14ff09";
     pub const FORGED_TRAILER: &str =
-        "14627f17213c016c8efaaa43ef4fe52d30f0ff97d3ac6943359132d68e4a46a63950bc46b98d2f9c4044b204997bfa6f41db9ae624d3ebde874d0845c0f00c0c";
+        "000001a0c4506c008d2ebc021ef41a20e0734ac2ef78e408da634e1c47a3a0c6ab55132a9e3a6b977742bdef28be63574723b24c60a061a6da2340a064a70785195d093b80454006";
 }
 
 /// **KAT vectors from fixed seeds**, printed as hex and asserted, so
@@ -462,11 +462,14 @@ mod kat {
 /// Inputs: publisher `node-kat-a` with Ed25519 seed `01`×32 and ML-DSA-65
 /// seed `54`×32; room `room-kat`; join nonce `07`×32; epoch 5; chunk key seed
 /// `0c`×32; DEK `42`×32; chunk_seq 0, codec `ff`, layer (0,0,0), plaintext
-/// `kat-chunk-0`; forger chunk key seed `0f`×32.
+/// `kat-chunk-0`; source timestamp 1790000000000 ms; forger chunk key seed
+/// `0f`×32.
 #[tokio::test]
 async fn kat_vectors_are_deterministic() {
     const PUBLISHER: &str = "node-kat-a";
     const KAT_ROOM: &str = "room-kat";
+    // 2026-09-21T15:06:40Z, the chunk's signed source timestamp.
+    const KAT_SOURCE_MS: u64 = 1_790_000_000_000;
     let publisher = signer(PUBLISHER, 1);
     let keys = Keys::of(&[&publisher]).await;
     let nonce = [0x07; 32];
@@ -499,14 +502,14 @@ async fn kat_vectors_are_deterministic() {
         ChunkLayer::BASE,
     )
     .unwrap();
-    let signed = key.sign(&inner).unwrap();
+    let signed = key.sign_at(&inner, KAT_SOURCE_MS).unwrap();
     let trailer = &signed.inner_ciphertext()[inner.inner_ciphertext().len()..];
     let (who, opened) = auth.check(&signed).expect("verdict: verified");
     assert_eq!(&*who, PUBLISHER);
     assert_eq!(open_av_inner(&opened, &dek()).unwrap(), b"kat-chunk-0");
 
     let forger_key = ChunkSigner::from_seed(stream, epoch, [0x0f; 32]);
-    let forged = forger_key.sign(&inner).unwrap();
+    let forged = forger_key.sign_at(&inner, KAT_SOURCE_MS).unwrap();
     let forged_trailer = &forged.inner_ciphertext()[inner.inner_ciphertext().len()..];
     let refused = auth.check(&forged).unwrap_err();
     assert_eq!(refused.refusal().as_str(), "av_chunk_trailer_invalid");
@@ -530,7 +533,11 @@ async fn kat_vectors_are_deterministic() {
         ("INNER_AEAD", hex::encode(inner.inner_ciphertext())),
         (
             "CHUNK_SIG_MESSAGE",
-            hex::encode(chunk_sig_message(&inner, inner.inner_ciphertext())),
+            hex::encode(chunk_sig_message(
+                &inner,
+                inner.inner_ciphertext(),
+                KAT_SOURCE_MS,
+            )),
         ),
         ("TRAILER", hex::encode(trailer)),
         ("FORGED_TRAILER", hex::encode(forged_trailer)),

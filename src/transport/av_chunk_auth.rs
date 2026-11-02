@@ -109,15 +109,24 @@ use crate::identity::LocalSigner;
 use crate::transport::av_call::call_stream_id;
 use crate::transport::realtime_av::{inner_sealed_from_parts, Epoch, InnerSealed, StreamId};
 
-/// The bytes a chunk's source signature adds to its inner unit.
+/// The chunk's Ed25519 source signature.
 pub const CHUNK_SIG_LEN: usize = 64;
+
+/// The publisher's source timestamp (UNIX ms, `u64_be`) the trailer carries
+/// ahead of the signature (ALM stage 2: the C1 meter's latency input).
+pub const CHUNK_SOURCE_TS_LEN: usize = 8;
+
+/// The bytes a chunk's trailer adds to its inner unit:
+/// `source_ms u64_be ‖ signature[64]`.
+pub const CHUNK_TRAILER_LEN: usize = CHUNK_SOURCE_TS_LEN + CHUNK_SIG_LEN;
 
 /// The ML-DSA-65 signature length (FIPS 204) a [`StreamKeyBinding`] must carry;
 /// enforced at parse like Ed25519's 64 (CC 5.3.3.2.3, CC 2.6.3).
 pub const ML_DSA_65_SIG_LEN: usize = 3309;
 
-/// The domain tag of a chunk's source signature.
-const CHUNK_SIG_DOMAIN: &[u8] = b"ciris-edge:av-chunk-sig:v1";
+/// The domain tag of a chunk's source signature. `v2` (ALM stage 2) adds the
+/// source timestamp to the signed bytes; a `v1` trailer does not verify.
+const CHUNK_SIG_DOMAIN: &[u8] = b"ciris-edge:av-chunk-sig:v2";
 
 /// The domain tag of a binding's hybrid signature.
 const BINDING_DOMAIN: &[u8] = b"ciris-edge:av-stream-key:v1";
@@ -159,11 +168,12 @@ pub fn collides_with_binding_part(stream: StreamId) -> bool {
     stream.0[..4] == BINDING_PART_MAGIC && stream.0[4] == BINDING_PART_VERSION
 }
 
-/// The bytes a chunk's source signature covers.
+/// The bytes a chunk's source signature covers: the header fields, the
+/// publisher's source timestamp, then the inner AEAD.
 #[must_use]
-pub fn chunk_sig_message(inner: &InnerSealed, inner_aead: &[u8]) -> Vec<u8> {
+pub fn chunk_sig_message(inner: &InnerSealed, inner_aead: &[u8], source_ms: u64) -> Vec<u8> {
     let layer = inner.layer();
-    let mut m = Vec::with_capacity(CHUNK_SIG_DOMAIN.len() + 32 + 8 + 8 + 4 + inner_aead.len());
+    let mut m = Vec::with_capacity(CHUNK_SIG_DOMAIN.len() + 32 + 8 + 8 + 4 + 8 + inner_aead.len());
     m.extend_from_slice(CHUNK_SIG_DOMAIN);
     m.extend_from_slice(&inner.stream_id().0);
     m.extend_from_slice(&inner.epoch().0.to_be_bytes());
@@ -172,8 +182,17 @@ pub fn chunk_sig_message(inner: &InnerSealed, inner_aead: &[u8]) -> Vec<u8> {
     m.push(layer.spatial);
     m.push(layer.temporal);
     m.push(layer.quality);
+    m.extend_from_slice(&source_ms.to_be_bytes());
     m.extend_from_slice(inner_aead);
     m
+}
+
+/// Wall-clock UNIX milliseconds (the publisher's source timestamp).
+#[must_use]
+pub fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn with_ciphertext(inner: &InnerSealed, ciphertext: Vec<u8>) -> InnerSealed {
@@ -336,12 +355,26 @@ impl ChunkSigner {
         self.epoch
     }
 
-    /// Append this key's signature to `inner`'s ciphertext.
+    /// Append the trailer (the source timestamp, now, and this key's
+    /// signature) to `inner`'s ciphertext.
+    ///
+    /// # Errors
+    /// As [`Self::sign_at`].
+    pub fn sign(&self, inner: &InnerSealed) -> Result<InnerSealed, ChunkKeyError> {
+        self.sign_at(inner, unix_ms_now())
+    }
+
+    /// Append the trailer `source_ms ‖ signature` to `inner`'s ciphertext;
+    /// the signature covers the timestamp.
     ///
     /// # Errors
     /// [`ChunkKeyError::WrongEpoch`] when `inner` is another stream's or
     /// epoch's; [`ChunkKeyError::Crypto`] when signing fails.
-    pub fn sign(&self, inner: &InnerSealed) -> Result<InnerSealed, ChunkKeyError> {
+    pub fn sign_at(
+        &self,
+        inner: &InnerSealed,
+        source_ms: u64,
+    ) -> Result<InnerSealed, ChunkKeyError> {
         if inner.stream_id() != self.stream || inner.epoch() != self.epoch {
             return Err(ChunkKeyError::WrongEpoch {
                 key: self.epoch.0,
@@ -351,10 +384,11 @@ impl ChunkSigner {
         let ct = inner.inner_ciphertext();
         let sig = self
             .key
-            .sign(&chunk_sig_message(inner, ct))
+            .sign(&chunk_sig_message(inner, ct, source_ms))
             .map_err(|e| ChunkKeyError::Crypto(e.to_string()))?;
-        let mut signed = Vec::with_capacity(ct.len() + CHUNK_SIG_LEN);
+        let mut signed = Vec::with_capacity(ct.len() + CHUNK_TRAILER_LEN);
         signed.extend_from_slice(ct);
+        signed.extend_from_slice(&source_ms.to_be_bytes());
         signed.extend_from_slice(&sig);
         Ok(with_ciphertext(inner, signed))
     }
@@ -1075,33 +1109,53 @@ impl ChunkAuth {
 
     /// **The per-chunk check**: the chunk's signature (its last
     /// [`CHUNK_SIG_LEN`] bytes) under the key bound to its `(stream, epoch)`.
-    /// Returns the publisher and the chunk with the signature removed, ready
+    /// Returns the publisher and the chunk with the trailer removed, ready
     /// for the inner open. A map lookup and one Ed25519 verification; nothing
     /// else.
     ///
     /// # Errors
+    /// As [`Self::check_timed`].
+    pub fn check(&self, inner: &InnerSealed) -> Result<(Arc<str>, InnerSealed), ChunkAuthError> {
+        self.check_timed(inner).map(|(p, i, _)| (p, i))
+    }
+
+    /// [`Self::check`], also returning the publisher's signed source
+    /// timestamp (UNIX ms).
+    ///
+    /// # Errors
     /// [`ChunkAuthError::Unbound`], [`ChunkAuthError::TrailerMissing`] or
     /// [`ChunkAuthError::TrailerInvalid`], each counted.
-    pub fn check(&self, inner: &InnerSealed) -> Result<(Arc<str>, InnerSealed), ChunkAuthError> {
+    pub fn check_timed(
+        &self,
+        inner: &InnerSealed,
+    ) -> Result<(Arc<str>, InnerSealed, u64), ChunkAuthError> {
         let Some(bound) = self.bound(inner.stream_id(), inner.epoch()) else {
             self.unbound.fetch_add(1, Ordering::Relaxed);
             return Err(ChunkAuthError::Unbound);
         };
         let ct = inner.inner_ciphertext();
-        let Some(split) = ct.len().checked_sub(CHUNK_SIG_LEN) else {
+        let Some(split) = ct.len().checked_sub(CHUNK_TRAILER_LEN) else {
             self.forged.fetch_add(1, Ordering::Relaxed);
             return Err(ChunkAuthError::TrailerMissing);
         };
-        let (aead, sig) = ct.split_at(split);
+        let (aead, trailer) = ct.split_at(split);
+        let (ts, sig) = trailer.split_at(CHUNK_SOURCE_TS_LEN);
+        let mut tsb = [0u8; CHUNK_SOURCE_TS_LEN];
+        tsb.copy_from_slice(ts);
+        let source_ms = u64::from_be_bytes(tsb);
         let ok = Ed25519Verifier::new()
-            .verify_strict(&bound.key, &chunk_sig_message(inner, aead), sig)
+            .verify_strict(&bound.key, &chunk_sig_message(inner, aead, source_ms), sig)
             .unwrap_or(false);
         if !ok {
             self.forged.fetch_add(1, Ordering::Relaxed);
             return Err(ChunkAuthError::TrailerInvalid);
         }
         self.verified.fetch_add(1, Ordering::Relaxed);
-        Ok((bound.publisher, with_ciphertext(inner, aead.to_vec())))
+        Ok((
+            bound.publisher,
+            with_ciphertext(inner, aead.to_vec()),
+            source_ms,
+        ))
     }
 }
 
