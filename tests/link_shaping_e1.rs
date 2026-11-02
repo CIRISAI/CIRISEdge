@@ -594,3 +594,130 @@ async fn rho_and_the_window_move_the_real_share_and_the_delay() {
         "a shorter window delays a burst more: W=2 s {t_short:?} vs W=30 s {t_long:?}"
     );
 }
+
+/// An envelope-shaped payload of `len` bytes whose head names `message_type`
+/// (the transport reads only the head to classify bulk; the bytes cross as is).
+fn typed_payload(message_type: &str, marker: &[u8], len: usize) -> Vec<u8> {
+    let head = format!(
+        r#"{{"edge_schema_version":"1","signing_key_id":"s","destination_key_id":"d","message_type":"{message_type}","body":""#
+    );
+    let mut v = head.into_bytes();
+    v.extend(marked(marker, len));
+    v.extend_from_slice(br#""}"#);
+    v
+}
+
+/// **CC 5.4.3 rc16 two planes** — two server-class nodes, shaped both ways. A
+/// row rides the shaped identity link; then a 1 MiB blob chunk, a four-chunk
+/// DAG (B → A) and a 512 KiB content body (A → B, A the responder) all
+/// complete on an UNSHAPED link of their own. The shaped link stays constant:
+/// once shaped, every frame on it is the one agreed size (no frame larger
+/// than the shaped MDU), its real-frame count stays a handful, and nothing
+/// was refused as bulk. Mutation: route the bulk onto the shaped link and the
+/// sends fail (`link_shaping_bulk_refused`) or the shaped wire grows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_constant() {
+    let server = policy(BudgetClass::Server, 20_000, 0.5, 10, false);
+    let t = duo("bulk", server.clone(), server).await;
+    t.a.transport.set_link_wire_tap_for_test(true);
+    t.b.transport.set_link_wire_tap_for_test(true);
+    let row = typed_payload("attestation_gossip", b"BULK-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B -> A row on the shaped link");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "the row crossed"
+    );
+    assert_eq!(
+        t.b.shaping("link_shaping_agreed"),
+        1,
+        "{:?}",
+        t.b.metrics.link_shaping()
+    );
+
+    let blob = typed_payload("blob_chunk_body", b"BLOB-1MIB-", 1 << 20);
+    t.b.transport
+        .send(&t.a.key.key_id, &blob)
+        .await
+        .expect("a 1 MiB blob chunk B -> A completes");
+    let dag: Vec<Vec<u8>> = (0..4)
+        .map(|i| {
+            typed_payload(
+                "blob_chunk_body",
+                format!("DAG-CHUNK-{i}-").as_bytes(),
+                256 * 1024,
+            )
+        })
+        .collect();
+    for c in &dag {
+        t.b.transport
+            .send(&t.a.key.key_id, c)
+            .await
+            .expect("a DAG chunk B -> A completes");
+    }
+    let body = typed_payload("content_body", b"CONTENT-A2B-", 512 * 1024);
+    t.a.transport
+        .send(&t.b.key.key_id, &body)
+        .await
+        .expect("a content body A -> B completes");
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            let mut all = t.a.received(&blob).await && t.b.received(&body).await;
+            for c in &dag {
+                all = all && t.a.received(c).await;
+            }
+            all
+        })
+        .await,
+        "every bulk payload arrived"
+    );
+
+    for n in [&t.a, &t.b] {
+        assert_eq!(
+            n.shaping("link_shaping_bulk_refused"),
+            0,
+            "{:?}",
+            n.metrics.link_shaping()
+        );
+    }
+    assert!(
+        t.b.shaping("link_shaping_frames_real") < 50,
+        "the bulk never entered the shaper: {:?}",
+        t.b.metrics.link_shaping()
+    );
+    let wire = t.b.transport.link_wire_tapped_for_test();
+    let shaped = wire.first().expect("B dialled").0;
+    let frames = frames_on(&wire, shaped);
+    let (size, run) = trailing_run(&frames);
+    assert!(
+        run >= 10,
+        "the shaped link keeps its stream: {run} × {size} B"
+    );
+    let first = frames
+        .iter()
+        .position(|f| f.len() == size)
+        .expect("shaped frames");
+    assert!(
+        frames[first..].iter().all(|f| f.len() == size),
+        "once shaped, every frame on the shaped link is {size} B: {:?}",
+        frames[first..]
+            .iter()
+            .map(Vec::len)
+            .filter(|&l| l != size)
+            .collect::<Vec<_>>()
+    );
+    let bulk_bytes: usize = wire
+        .iter()
+        .filter(|(l, _)| *l != shaped)
+        .map(|(_, f)| f.len())
+        .sum();
+    assert!(
+        bulk_bytes > (1 << 20) + 4 * 256 * 1024,
+        "the bulk crossed on another link: {bulk_bytes} B"
+    );
+}

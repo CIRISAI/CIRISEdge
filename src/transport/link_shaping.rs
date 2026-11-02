@@ -232,6 +232,36 @@ pub fn fleet_default_row(class: BudgetClass) -> Option<&'static FleetDefault> {
     FLEET_DEFAULTS.iter().find(|r| r.class == class)
 }
 
+/// CC 5.4.3 rc16 **two planes** — the message types that are bulk by kind:
+/// content and blob/DAG chunk bodies, and the fetches that ask for them (so
+/// the answer finds an unshaped reverse path to ride back on, even to a peer
+/// it cannot dial). Wire spellings of `crate::messages::MessageType`.
+pub const BULK_MESSAGE_TYPES: [&str; 4] = [
+    "content_fetch",
+    "content_body",
+    "blob_chunk_fetch",
+    "blob_chunk_body",
+];
+
+/// Whether an outbound envelope is bulk by kind ([`BULK_MESSAGE_TYPES`]).
+/// Reads only the envelope's head: `message_type` serializes before the body
+/// (`crate::messages::EdgeEnvelope`), so a megabyte body is never scanned.
+#[must_use]
+pub fn is_bulk_class(envelope: &[u8]) -> bool {
+    const KEY: &[u8] = b"\"message_type\":\"";
+    let head = &envelope[..envelope.len().min(1024)];
+    let Some(at) = head.windows(KEY.len()).position(|w| w == KEY) else {
+        return false;
+    };
+    let rest = &head[at + KEY.len()..];
+    let Some(end) = rest.iter().position(|&b| b == b'"') else {
+        return false;
+    };
+    BULK_MESSAGE_TYPES
+        .iter()
+        .any(|t| t.as_bytes() == &rest[..end])
+}
+
 /// The default share of the node cap held for layer neighbours: half of the
 /// eight links' worth.
 pub const DEFAULT_LAYER_RESERVE_LINKS: u32 = 4;
@@ -966,6 +996,10 @@ pub struct LinkShapers {
     layer_peers: Mutex<std::collections::HashSet<String>>,
     /// The peer each offered or shaped link goes to, when known.
     link_peer: Mutex<HashMap<[u8; 16], String>>,
+    /// CC 5.4.3 rc16 two planes — the BULK links this node dialled: identity
+    /// links on which no shaping is ever offered, carrying bulk and nothing
+    /// else this node chooses.
+    bulk: Mutex<std::collections::HashSet<[u8; 16]>>,
     links: Mutex<HashMap<[u8; 16], Arc<LinkShaper>>>,
     /// Links this node sent an offer on, with that offer.
     offered: Mutex<HashMap<[u8; 16], ShapingOffer>>,
@@ -985,6 +1019,7 @@ impl LinkShapers {
             policy: std::sync::RwLock::new(policy),
             layer_peers: Mutex::new(std::collections::HashSet::new()),
             link_peer: Mutex::new(HashMap::new()),
+            bulk: Mutex::new(std::collections::HashSet::new()),
             links: Mutex::new(HashMap::new()),
             offered: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -1264,6 +1299,44 @@ impl LinkShapers {
         self.offered().remove(link);
         self.pending().remove(link);
         self.link_peer().remove(link);
+        self.bulk
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(link);
+    }
+
+    /// Mark `link` as a bulk-plane link (dialled with no shaping offer).
+    pub fn mark_bulk(&self, link: [u8; 16]) {
+        self.bulk
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(link);
+    }
+
+    /// Whether `link` is a bulk-plane link this node dialled.
+    #[must_use]
+    pub fn is_bulk(&self, link: [u8; 16]) -> bool {
+        self.bulk
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&link)
+    }
+
+    /// CC 5.4.3 rc16 **two planes** — whether `envelope` must leave `link`
+    /// for an unshaped bulk link: `link` is shaped AND the envelope is bulk
+    /// by kind ([`is_bulk_class`]) or beyond one window's real-frame budget
+    /// ([`Agreement::reach_frames`]). An unshaped link carries anything.
+    #[must_use]
+    pub fn needs_bulk_plane(&self, link: [u8; 16], envelope: &[u8]) -> bool {
+        let Some(shaper) = self.get(link) else {
+            return false;
+        };
+        if is_bulk_class(envelope) {
+            return true;
+        }
+        let cap = body_capacity(shaper.agreement().frame_bytes);
+        crate::transport::frame_fragment::fragment(envelope, cap)
+            .map_or(true, |f| f.len() > shaper.agreement().reach_frames())
     }
 
     /// Shaped links now.
@@ -1594,6 +1667,54 @@ mod tests {
         // Turning shaping off closes every shaped link.
         assert_eq!(t.set_policy(ShapingPolicy::default()), vec![[2u8; 16]]);
         assert_eq!(t.shaped_count(), 0);
+    }
+
+    /// CC 5.4.3 rc16 two planes — the bulk classes are read off the
+    /// envelope head; rows are not bulk; and a payload needs the bulk plane
+    /// only when its link is shaped.
+    #[test]
+    fn bulk_is_classified_by_kind_and_only_leaves_a_shaped_link() {
+        let env = |t: &str| {
+            format!(
+                r#"{{"edge_schema_version":"1","signing_key_id":"a","destination_key_id":"b","message_type":"{t}","body":{{"x":1}}}}"#
+            )
+            .into_bytes()
+        };
+        for t in BULK_MESSAGE_TYPES {
+            assert!(is_bulk_class(&env(t)), "{t}");
+        }
+        for t in [
+            "attestation_gossip",
+            "opaque_request",
+            "content_miss",
+            "blob_chunk_miss",
+        ] {
+            assert!(!is_bulk_class(&env(t)), "{t}");
+        }
+        assert!(!is_bulk_class(b"not json at all"));
+        let t = LinkShapers::new(ShapingPolicy::for_class(BudgetClass::Server));
+        let link = [3u8; 16];
+        assert!(
+            !t.needs_bulk_plane(link, &env("blob_chunk_body")),
+            "unshaped: carries anything"
+        );
+        let _ = t.offer_for(link, 1400, None);
+        t.peer_offer(link, &offer(BudgetClass::Server, 1400, 7000, 0.5, 600))
+            .unwrap()
+            .expect("shaped");
+        assert!(t.needs_bulk_plane(link, &env("blob_chunk_body")));
+        assert!(
+            !t.needs_bulk_plane(link, &env("attestation_gossip")),
+            "a row stays"
+        );
+        assert!(
+            t.needs_bulk_plane(link, &vec![b'r'; 3_000_000]),
+            "beyond reach"
+        );
+        t.mark_bulk([4u8; 16]);
+        assert!(t.is_bulk([4u8; 16]));
+        t.forget(&[4u8; 16]);
+        assert!(!t.is_bulk([4u8; 16]));
     }
 
     /// CC 5.4.3 rc16 **two planes**: a shaped link carries rows, never bulk.

@@ -174,6 +174,21 @@ pub async fn prime_v7_peer_pair(
         .await;
 }
 
+/// CC 5.4.3 rc16 — `CIRIS_EDGE_TEST_SHAPING=server` runs every transport a
+/// suite builds under the server class's fleet default (shaping ON on every
+/// identity link), so a suite witnesses its traffic with shaping on: rows on
+/// the shaped link, bulk on the unshaped bulk plane. Unset, nothing changes.
+#[cfg(feature = "transport-reticulum")]
+#[allow(dead_code)]
+pub fn apply_env_shaping(cfg: &mut ciris_edge::transport::reticulum::ReticulumTransportConfig) {
+    use ciris_edge::transport::link_shaping::{DeviceKind, DeviceState, ShapingPolicy};
+    if std::env::var("CIRIS_EDGE_TEST_SHAPING").as_deref() == Ok("server") {
+        let device = DeviceState::of(DeviceKind::Server);
+        cfg.shaping = ShapingPolicy::for_device(&device);
+        cfg.device = device;
+    }
+}
+
 /// Build a [`ReticulumTransport`], retrying on the transient
 /// "address already in use" race.
 ///
@@ -212,7 +227,8 @@ where
     const MAX_ATTEMPTS: usize = 16;
     let mut last_err = None;
     for _ in 0..MAX_ATTEMPTS {
-        let (cfg, auth) = make().await;
+        let (mut cfg, auth) = make().await;
+        apply_env_shaping(&mut cfg);
         let addr = cfg.listen_addr;
         match ReticulumTransport::new(cfg, auth).await {
             Ok(transport) => return (Arc::new(transport), addr),
@@ -255,7 +271,8 @@ where
     const MAX_ATTEMPTS: usize = 16;
     let mut last_err = None;
     for _ in 0..MAX_ATTEMPTS {
-        let (cfg, auth) = make().await;
+        let (mut cfg, auth) = make().await;
+        apply_env_shaping(&mut cfg);
         let addr = cfg.listen_addr;
         match ReticulumTransport::new(cfg, auth).await {
             Ok(transport) => {

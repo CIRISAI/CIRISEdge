@@ -3253,8 +3253,19 @@ impl ReticulumTransport {
 
     /// CIRISEdge#568 — a cloneable handle to the state a cold dial needs, so
     /// the dial can be spawned and survive its round being abandoned.
+    /// CC 5.4.3 rc16 two planes — a dial context for the BULK lane: its pool
+    /// hands out only unshaped links, and its dials offer no shaping (the
+    /// link is marked bulk and carries bulk; [`Transport::send`]).
+    fn bulk_dial_ctx(&self) -> DialCtx {
+        DialCtx {
+            bulk_lane: true,
+            ..self.dial_ctx()
+        }
+    }
+
     fn dial_ctx(&self) -> DialCtx {
         DialCtx {
+            bulk_lane: false,
             node: Arc::clone(&self.node),
             local_identity: self.local_identity.clone(),
             own_bundle: self.own_bundle.clone(),
@@ -6151,7 +6162,7 @@ impl ReticulumTransport {
         // abandons the wait, not the link.
         let lane = with_timeout(
             remaining(),
-            self.identity_lane(destination_key_id, &candidates),
+            self.identity_lane(destination_key_id, &candidates, false),
         )
         .await;
         let link = match lane {
@@ -8440,7 +8451,15 @@ impl ReticulumTransport {
         &self,
         destination_key_id: &str,
         candidates: &[DialCandidate],
+        bulk: bool,
     ) -> Result<LinkClaim, TransportError> {
+        let lane_ctx = || {
+            if bulk {
+                self.bulk_dial_ctx()
+            } else {
+                self.dial_ctx()
+            }
+        };
         // CIRISEdge#336 (v13.8.0) — ROUTE-TABLE-FIRST dial selection. The route
         // table is the source of dial truth; identity math only proposed the
         // candidates (`resolve_dial_candidates`). `select_dial_candidate` picks a PATHED candidate
@@ -8519,7 +8538,7 @@ impl ReticulumTransport {
         // repeating it per send was the waste.
         // CIRISEdge#819 — `reserved`: the lane came from the pool already
         // marked in flight for this send (see `DialCtx::reusable_link_to`).
-        let reused = self.reusable_link_to(&peer.dest_hash).await;
+        let reused = lane_ctx().reusable_link_to(&peer.dest_hash).await;
         let claim = if let Some(existing) = reused {
             tracing::trace!(
                 key_id = %destination_key_id,
@@ -8554,7 +8573,7 @@ impl ReticulumTransport {
             // it is meant to gate is still running — the single-flight property
             // #532 installed would hold only for callers that survive.
             let gate = self.dial_gate_for(peer.dest_hash).await;
-            let ctx = self.dial_ctx();
+            let ctx = lane_ctx();
             let peer_owned = peer;
             let dkid = destination_key_id.to_owned();
             let dial = tokio::spawn(async move {
@@ -8595,6 +8614,50 @@ impl ReticulumTransport {
     /// frame we put there is dropped `UNATTRIBUTED`. A link with no plane
     /// record is never selected (fail-closed; every established link has one).
     async fn live_link_to(&self, destination_key_id: &str, plane: LinkPlane) -> Option<LinkId> {
+        self.live_link_to_where(destination_key_id, plane, |_| true)
+            .await
+    }
+
+    /// CC 5.4.3 rc16 **two planes** — the reverse-path link for `envelope`
+    /// to `destination_key_id`. Bulk never rides a shaped link: when the
+    /// freshest identity link is shaped and the payload needs the bulk plane,
+    /// the freshest UNSHAPED identity link is taken instead (none: the send
+    /// dials the bulk lane). A row prefers a shaped link when the peer holds
+    /// one, so rows stay on the shaped row plane and off a bulk link.
+    async fn reply_link_for(&self, destination_key_id: &str, envelope: &[u8]) -> Option<LinkId> {
+        let pick = self
+            .live_link_to(destination_key_id, LinkPlane::Identity)
+            .await?;
+        if self.shapers.needs_bulk_plane(pick.into_bytes(), envelope) {
+            return self
+                .live_link_to_where(destination_key_id, LinkPlane::Identity, |id| {
+                    !self.shapers.is_shaped(id.into_bytes())
+                })
+                .await;
+        }
+        if self.shapers.is_shaped(pick.into_bytes()) {
+            return Some(pick);
+        }
+        let shaped = self
+            .live_link_to_where(destination_key_id, LinkPlane::Identity, |id| {
+                self.shapers.is_shaped(id.into_bytes())
+            })
+            .await;
+        // A row lands on an unshaped (possibly bulk) link only when the peer
+        // holds no shaped link that can carry it.
+        match shaped {
+            Some(s) if !self.shapers.needs_bulk_plane(s.into_bytes(), envelope) => Some(s),
+            _ => Some(pick),
+        }
+    }
+
+    /// [`Self::live_link_to`], over the links `keep` admits.
+    async fn live_link_to_where(
+        &self,
+        destination_key_id: &str,
+        plane: LinkPlane,
+        keep: impl Fn(&LinkId) -> bool,
+    ) -> Option<LinkId> {
         let candidates: Vec<LinkId> = {
             let planes = self.link_plane.lock().await;
             self.link_to_peer_key_id
@@ -8602,7 +8665,9 @@ impl ReticulumTransport {
                 .await
                 .iter()
                 .filter(|(id, peer)| {
-                    peer.as_str() == destination_key_id && planes.get(*id) == Some(&plane)
+                    peer.as_str() == destination_key_id
+                        && planes.get(*id) == Some(&plane)
+                        && keep(id)
                 })
                 .map(|(id, _)| *id)
                 .collect()
@@ -8685,9 +8750,24 @@ impl ReticulumTransport {
         let mut attempts: u32 = 0;
         loop {
             let live = match pinned {
+                // CC 5.4.3 rc16 two planes — a pinned link that is shaped
+                // cannot carry bulk: answer the link's attributed peer on its
+                // bulk plane instead (an unattributable requester's answer
+                // falls through to the dial, which cannot reach it either).
+                Some(id)
+                    if self
+                        .shapers
+                        .needs_bulk_plane(id.into_bytes(), envelope_bytes) =>
+                {
+                    let peer = self.link_to_peer_key_id.lock().await.get(&id).cloned();
+                    match peer {
+                        Some(p) => self.reply_link_for(&p, envelope_bytes).await,
+                        None => None,
+                    }
+                }
                 Some(id) => Some(id).filter(|id| self.node.link_is_established(id)),
                 None => {
-                    self.live_link_to(destination_key_id, LinkPlane::Identity)
+                    self.reply_link_for(destination_key_id, envelope_bytes)
                         .await
                 }
             };
@@ -9297,7 +9377,29 @@ impl Transport for ReticulumTransport {
             return Ok(TransportSendOutcome::Delivered);
         }
 
-        let claim = self.identity_lane(destination_key_id, &candidates).await?;
+        // CC 5.4.3 rc16 two planes — bulk (a chunk, a content body, a fetch
+        // for one, or anything beyond the shaped link's reach) rides an
+        // UNSHAPED link of its own and never the shaped row link. A bulk-class
+        // send to a peer this node shapes toward goes straight to the bulk
+        // lane; any other send takes the row lane and moves to the bulk lane
+        // only when the row link it got is shaped and the payload is too big.
+        let bulk_class = crate::transport::link_shaping::is_bulk_class(envelope_bytes);
+        let mut claim = self
+            .identity_lane(
+                destination_key_id,
+                &candidates,
+                bulk_class && self.shapers.offers_to(Some(destination_key_id)),
+            )
+            .await?;
+        if self
+            .shapers
+            .needs_bulk_plane(claim.link_id().into_bytes(), envelope_bytes)
+        {
+            claim.release().await;
+            claim = self
+                .identity_lane(destination_key_id, &candidates, true)
+                .await?;
+        }
 
         // CIRISEdge#532 — hold the link for the duration of the transfer, so a
         // concurrent send to this peer takes another pooled link or dials one
@@ -10409,6 +10511,11 @@ async fn lease_pooled_scoped_link(
 /// equal values diverge.
 #[derive(Clone)]
 struct DialCtx {
+    /// CC 5.4.3 rc16 two planes — this context's lane: `false` the row lane
+    /// (dials offer shaping per policy; the pool never hands out a bulk
+    /// link), `true` the bulk lane (dials offer none and are marked bulk; the
+    /// pool never hands out a shaped link).
+    bulk_lane: bool,
     node: Arc<ReticulumNode>,
     local_identity: Identity,
     own_bundle: Option<OwnBuildBundle>,
@@ -11226,7 +11333,19 @@ impl DialCtx {
             .await?;
         // CC 5.4.3 — the shaping offer is the link's first sealed frame; the
         // dial waits for the peer's offer before anything else rides the link.
-        self.offer_shaping(link_id, destination_key_id).await?;
+        // CC 5.4.3 rc16 two planes — a bulk-lane dial offers nothing: the link
+        // runs unshaped (a responder only ever answers an offer) and is marked
+        // bulk, so no row lane takes it.
+        if self.bulk_lane {
+            self.shapers.mark_bulk(link_id.into_bytes());
+            tracing::debug!(
+                peer = %destination_key_id,
+                link = %hex::encode(link_id.into_bytes()),
+                "bulk-plane link up, unshaped (CC 5.4.3 two planes)"
+            );
+        } else {
+            self.offer_shaping(link_id, destination_key_id).await?;
+        }
         Ok(link_id)
     }
 
@@ -11443,9 +11562,19 @@ impl DialCtx {
         // IDLE only. A link mid-transfer is not available: Reticulum runs one
         // resource per link, so handing it out serialises the caller behind the
         // transfer already on it — which is the regression the M=4 sweep caught.
+        // CC 5.4.3 rc16 two planes — a link belongs to one plane: the row lane
+        // never takes a bulk link, the bulk lane never a shaped one.
         let picked = pool
             .iter()
-            .find(|id| !in_flight.contains(*id) && planes.get(*id) == Some(&LinkPlane::Identity))
+            .find(|id| {
+                !in_flight.contains(*id)
+                    && planes.get(*id) == Some(&LinkPlane::Identity)
+                    && if self.bulk_lane {
+                        !self.shapers.is_shaped(id.into_bytes())
+                    } else {
+                        !self.shapers.is_bulk(id.into_bytes())
+                    }
+            })
             .copied();
         // CIRISEdge#819 (Codex on #821) — a hand-out RESERVES the lane: it is
         // marked in flight here, under the pool lock, so the caller owns the
