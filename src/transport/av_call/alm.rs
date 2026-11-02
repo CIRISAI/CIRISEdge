@@ -1,0 +1,1091 @@
+//! ALM stage 2 — the call's controller state: the ALM mesh on a live call.
+//!
+//! One [`AlmState`] per call (per node), behind a std mutex in the call's
+//! shared state. It is synchronous and does no I/O: every method returns the
+//! C3 frames to send ([`Outgoing`]) and the async call layer sends them. The
+//! clock is the call's own monotonic `now_ms`, randomness a seeded
+//! [`SplitMix64`], so a field log replays.
+//!
+//! What it runs:
+//!
+//! - **This node's stream, as parent 0**: an [`Admission`] (C2) answering the
+//!   other members' C3 `SUBSCRIBE`s. A small room starts as the full mesh it
+//!   always was (the publisher's probe allowance is the room, up to
+//!   [`PUBLISHER_INITIAL_FANOUT`]); measured congestion then sheds the most
+//!   recent subscribers to member relays (T7).
+//! - **Every other member's stream, as subscriber**: a [`ParentSelector`]
+//!   (C4/C6) choosing among the publisher itself and the members that
+//!   forward it, from their C3 `OFFER`s. Room membership gates candidacy
+//!   (CC 5.4.6 / 6.1.6: tree nodes are members). When the publisher cannot
+//!   reach this node directly (hard NAT, a failed punch, no direct path),
+//!   it simply never offers here, and the roster members that hear it ARE
+//!   the candidates: roster relays before any canonical, organically.
+//! - **Streams this node forwards** (when it offers relay): an [`Admission`]
+//!   per stream, with its upstream view refreshed after every selector
+//!   decision, so a relay that just lost its parent refuses before a peer in
+//!   the same failover wave lands on it.
+//!
+//! The selector's warm standby is the base/audio layer only; a forwarder
+//! sends a standby child only base-layer and codec-opaque (audio) chunks.
+//! A peer that does not speak C3 (no `CAPS`) is served exactly as before:
+//! the full stream, and the legacy first-hand relay when this node relays.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::{Duration, Instant};
+
+use crate::load_ladder::ServiceTier;
+use crate::transport::realtime_av::StreamId;
+use crate::transport::realtime_av_alm::controller::wire::{
+    self, encode, encode_caps, CAPS_THIS_BUILD, CAP_C3_V1, CAP_RELAY, CAP_TIMED_FRAMES,
+};
+use crate::transport::realtime_av_alm::controller::{
+    Admission, AdmitDecision, ControlFrame, ControlMsg, ControllerConfig, DecisionKind,
+    DecisionLog, EgressMeter, ParentSelector, RefuseReason, Role, SelectorAction, ShedReason,
+    SplitMix64, SubscribeRequest,
+};
+
+/// How often a forwarder offers each stream it can serve.
+pub(super) const OFFER_EVERY_MS: u64 = 1_000;
+/// The publisher's starting probe allowance, in streams: a small room is
+/// served as the full mesh it was; measurement then rules.
+pub(super) const PUBLISHER_INITIAL_FANOUT: u64 = 8;
+/// How long a C3 peer that has not yet chosen a parent for this node's
+/// stream keeps receiving it (the join gap: join jitter + one offer + one
+/// round trip). Past it, a peer that chose nothing gets nothing.
+pub(super) const PROVISIONAL_MS: u64 = 10_000;
+/// Time to live for codec-opaque (audio) media on a timed leg.
+pub(super) const AUDIO_TTL: Duration = Duration::from_millis(300);
+/// Time to live for layered video on a timed leg.
+pub(super) const VIDEO_TTL: Duration = Duration::from_millis(400);
+/// The floor a measured stream rate is never priced below (bits/s).
+const MIN_STREAM_BPS: f64 = 16_000.0;
+/// The floor a measured audio rate is never priced below (bits/s).
+const MIN_AUDIO_BPS: f64 = 8_000.0;
+/// Chunks remembered per stream for the forwarding dedupe.
+const FORWARD_DEDUPE: usize = 512;
+
+/// One C3 frame to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Outgoing {
+    /// The member it goes to.
+    pub to: String,
+    /// The encoded frame.
+    pub frame: Vec<u8>,
+}
+
+/// A stream's measured rate: bits/s over 1 s windows, EWMA.
+#[derive(Debug, Clone, Default)]
+struct Rate {
+    win_full: u64,
+    win_audio: u64,
+    since_ms: u64,
+    full_bps: f64,
+    audio_bps: f64,
+    windows: u32,
+}
+
+impl Rate {
+    fn add(&mut self, bytes: u64, audio: bool) {
+        self.win_full += bytes;
+        if audio {
+            self.win_audio += bytes;
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn roll(&mut self, now_ms: u64) -> bool {
+        let dt = now_ms.saturating_sub(self.since_ms);
+        if dt < 1_000 {
+            return false;
+        }
+        let secs = dt as f64 / 1_000.0;
+        let full = self.win_full as f64 * 8.0 / secs;
+        let audio = self.win_audio as f64 * 8.0 / secs;
+        let a = if self.windows == 0 { 1.0 } else { 0.3 };
+        self.full_bps = a * full + (1.0 - a) * self.full_bps;
+        self.audio_bps = a * audio + (1.0 - a) * self.audio_bps;
+        self.windows += 1;
+        self.win_full = 0;
+        self.win_audio = 0;
+        self.since_ms = now_ms;
+        true
+    }
+
+    /// `(stream_bps, standby_bps)` to price commitments at.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn costs(&self) -> (u64, u64) {
+        let full = self.full_bps.max(MIN_STREAM_BPS);
+        let audio = self.audio_bps.max(MIN_AUDIO_BPS).min(full);
+        (full as u64, audio as u64)
+    }
+}
+
+/// One stream's parents, as this node chose them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlmParents {
+    /// The stream.
+    pub stream: StreamId,
+    /// Its publisher, once known.
+    pub publisher: Option<String>,
+    /// The primary parent (full stream).
+    pub primary: Option<String>,
+    /// The warm standby (base/audio).
+    pub standby: Option<String>,
+    /// Primary changes after the first join.
+    pub parent_changes: u64,
+}
+
+/// What the ALM counted on a call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlmCounts {
+    /// C3 frames sent / received / malformed.
+    pub c3_sent: u64,
+    /// C3 frames received and applied.
+    pub c3_received: u64,
+    /// Frames that read as C3 and did not decode.
+    pub c3_malformed: u64,
+    /// Subscribes this node admitted.
+    pub admitted: u64,
+    /// Subscribes this node refused, by token.
+    pub refused: BTreeMap<&'static str, u64>,
+    /// Subscribers this node shed.
+    pub shed: u64,
+    /// Chunks this node forwarded as an admitted media parent.
+    pub forwarded: u64,
+    /// Media frames dropped by age before they were opened (C5).
+    pub stale_dropped: u64,
+    /// Legs shed to the base layer under congestion (C5).
+    pub legs_shed_to_base: u64,
+}
+
+/// The call's ALM controller state (see the module docs).
+pub(super) struct AlmState {
+    me: String,
+    cfg: ControllerConfig,
+    t0: Instant,
+    rng: SplitMix64,
+    log: DecisionLog,
+    own_stream: StreamId,
+    own: Admission<String>,
+    relay_capable: bool,
+    relays: BTreeMap<StreamId, Admission<String>>,
+    sels: BTreeMap<StreamId, ParentSelector<String>>,
+    publisher_of: BTreeMap<StreamId, String>,
+    caps: BTreeMap<String, u32>,
+    provisional: BTreeMap<String, u64>,
+    told_publisher: BTreeSet<StreamId>,
+    draining_parent: BTreeMap<StreamId, String>,
+    last_primary: BTreeMap<StreamId, Option<String>>,
+    egress: EgressMeter,
+    leg_queue_ms: BTreeMap<String, f64>,
+    members: Vec<String>,
+    tier: ServiceTier,
+    own_rate: Rate,
+    rates: BTreeMap<StreamId, Rate>,
+    forwarded_seen: BTreeMap<StreamId, (BTreeSet<(u64, u64)>, VecDeque<(u64, u64)>)>,
+    min_offset: BTreeMap<StreamId, (i64, u64)>,
+    last_offer_ms: u64,
+    pub(super) counts: AlmCounts,
+    pub(super) labels: Vec<&'static str>,
+    video_unavailable: BTreeSet<StreamId>,
+    pub(super) events: Vec<super::CallEvent>,
+}
+
+impl AlmState {
+    /// A fresh state for `me` publishing `own_stream` in a room of `members`.
+    pub(super) fn new(
+        me: &str,
+        own_stream: StreamId,
+        members: &[String],
+        relay_capable: bool,
+        seed: u64,
+    ) -> Self {
+        let cfg = ControllerConfig::interactive();
+        let mut own = Admission::publisher(me.to_owned(), cfg.clone(), None);
+        own.set_members(members.iter().cloned());
+        let fanout = (members.len().saturating_sub(1) as u64).clamp(1, PUBLISHER_INITIAL_FANOUT);
+        own.set_probe_streams(fanout);
+        Self {
+            me: me.to_owned(),
+            egress: EgressMeter::new(cfg.meter_window_ms, cfg.congestion_queue_ms),
+            cfg,
+            t0: Instant::now(),
+            rng: SplitMix64(seed),
+            log: DecisionLog::new(64),
+            own_stream,
+            own,
+            relay_capable,
+            relays: BTreeMap::new(),
+            sels: BTreeMap::new(),
+            publisher_of: BTreeMap::new(),
+            caps: BTreeMap::new(),
+            provisional: BTreeMap::new(),
+            told_publisher: BTreeSet::new(),
+            draining_parent: BTreeMap::new(),
+            last_primary: BTreeMap::new(),
+            leg_queue_ms: BTreeMap::new(),
+            members: members.to_vec(),
+            tier: ServiceTier::FullOps,
+            own_rate: Rate::default(),
+            rates: BTreeMap::new(),
+            forwarded_seen: BTreeMap::new(),
+            min_offset: BTreeMap::new(),
+            last_offer_ms: 0,
+            counts: AlmCounts::default(),
+            labels: Vec::new(),
+            video_unavailable: BTreeSet::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// The call's monotonic clock (ms).
+    pub(super) fn now_ms(&self) -> u64 {
+        u64::try_from(self.t0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// This node's capability bits.
+    pub(super) fn caps_bits(&self) -> u32 {
+        CAPS_THIS_BUILD | if self.relay_capable { CAP_RELAY } else { 0 }
+    }
+
+    /// This node's `CAPS` frame.
+    pub(super) fn caps_frame(&self) -> Vec<u8> {
+        encode_caps(self.caps_bits())
+    }
+
+    /// Whether `peer` said it speaks C3.
+    pub(super) fn speaks_c3(&self, peer: &str) -> bool {
+        self.caps.get(peer).is_some_and(|c| c & CAP_C3_V1 != 0)
+    }
+
+    /// Whether `peer`'s leviculum takes timed frames.
+    pub(super) fn takes_timed(&self, peer: &str) -> bool {
+        self.caps
+            .get(peer)
+            .is_some_and(|c| c & CAP_TIMED_FRAMES != 0)
+    }
+
+    /// The decision log's chained hash (hex).
+    pub(super) fn log_hash(&self) -> String {
+        self.log.hash_hex()
+    }
+
+    /// Records in the decision log.
+    pub(super) fn log_len(&self) -> u64 {
+        self.log.len()
+    }
+
+    /// Records of one kind.
+    pub(super) fn log_count(&self, kind: DecisionKind) -> u64 {
+        self.log.count(kind)
+    }
+
+    /// The decision log's rendered tail.
+    pub(super) fn log_tail(&self) -> String {
+        self.log.tail()
+    }
+
+    fn label(&mut self, l: &'static str) {
+        self.labels.push(l);
+    }
+
+    /// The room's roster (both sides: selectors and admissions).
+    pub(super) fn set_members(&mut self, members: &[String]) {
+        self.members = members.to_vec();
+        self.own.set_members(members.iter().cloned());
+        for a in self.relays.values_mut() {
+            a.set_members(members.iter().cloned());
+        }
+        for s in self.sels.values_mut() {
+            s.set_members(members.iter().cloned());
+        }
+        self.caps.retain(|p, _| members.contains(p));
+        self.provisional.retain(|p, _| members.contains(p));
+    }
+
+    /// The service tier (§7.2): Admit-close on relays at ≥ 1, A-shed (LIFO,
+    /// make-before-break) at 2.
+    pub(super) fn set_tier(&mut self, tier: ServiceTier) -> Vec<Outgoing> {
+        if tier == self.tier {
+            return Vec::new();
+        }
+        let now = self.now_ms();
+        self.tier = tier;
+        self.events
+            .push(super::CallEvent::LoadTier { tier: tier.as_u8() });
+        let mut out = Vec::new();
+        let mut shed_frames = Vec::new();
+        for (stream, a) in &mut self.relays {
+            a.set_admit_closed(!tier.admits_new_relay_work());
+            if tier.sheds_relayed_audio() {
+                for p in a.shed_all_draining(now, ShedReason::LoadShed, &mut self.log) {
+                    shed_frames.push((*stream, p));
+                }
+            }
+        }
+        for (stream, p) in shed_frames {
+            self.counts.shed += 1;
+            self.label(crate::observability::ALM_SHED);
+            self.label(ShedReason::LoadShed.token());
+            out.push(Outgoing {
+                to: p,
+                frame: encode(
+                    stream,
+                    &ControlMsg::Shed {
+                        reason: ShedReason::LoadShed,
+                    },
+                ),
+            });
+        }
+        out
+    }
+
+    /// The service tier now.
+    pub(super) fn tier(&self) -> ServiceTier {
+        self.tier
+    }
+
+    /// A peer's `CAPS`. Returns whether this is the first one heard.
+    pub(super) fn on_caps(&mut self, peer: &str, caps: u32) -> bool {
+        let first = self.caps.insert(peer.to_owned(), caps).is_none();
+        if first && caps & CAP_C3_V1 != 0 && self.members.iter().any(|m| m == peer) {
+            let now = self.now_ms();
+            if self.own.role_of(&peer.to_owned()).is_none() {
+                self.provisional.insert(peer.to_owned(), now);
+            }
+            self.label(crate::observability::ALM_C3_PEER_CAPABLE);
+        }
+        first
+    }
+
+    /// `publisher` publishes `stream` (its own link's hello names it).
+    pub(super) fn note_publisher(&mut self, stream: StreamId, publisher: &str) {
+        if stream == self.own_stream || publisher == self.me {
+            return;
+        }
+        self.publisher_of.insert(stream, publisher.to_owned());
+        self.selector(stream);
+    }
+
+    fn selector(&mut self, stream: StreamId) -> &mut ParentSelector<String> {
+        let (me, cfg, fc, members) = (
+            self.me.clone(),
+            self.cfg.clone(),
+            self.relay_capable,
+            self.members.clone(),
+        );
+        self.sels.entry(stream).or_insert_with(|| {
+            let mut s = ParentSelector::new(me, cfg, fc);
+            s.set_members(members);
+            s
+        })
+    }
+
+    /// The per-leg queueing delay above the propagation floor, from the
+    /// leg's link stats (refreshed each watch tick).
+    pub(super) fn set_leg_queue_ms(&mut self, peer: &str, ms: f64) {
+        self.leg_queue_ms.insert(peer.to_owned(), ms);
+    }
+
+    /// C1, sender side: `bytes` left on `peer`'s leg.
+    pub(super) fn on_sent(&mut self, peer: &str, bytes: u64) {
+        let now = self.now_ms();
+        let q = self.leg_queue_ms.get(peer).copied().unwrap_or(0.0);
+        self.egress.on_sent(now, bytes, q);
+    }
+
+    /// C1, sender side: `bytes` refused (congested) or expired unconfirmed.
+    pub(super) fn on_dropped(&mut self, bytes: u64) {
+        let now = self.now_ms();
+        self.egress.on_dropped(now, bytes);
+    }
+
+    /// This node published `bytes` of its own stream.
+    pub(super) fn on_own_published(&mut self, bytes: u64, base_or_audio: bool) {
+        self.own_rate.add(bytes, base_or_audio);
+    }
+
+    /// The members this node's own chunk must NOT go to, among `legs`: C3
+    /// peers that hold no commitment (and are past the provisional window),
+    /// and standby children for a chunk above the base layer.
+    pub(super) fn own_exclude(&self, legs: &[String], base_or_audio: bool) -> Vec<String> {
+        let now = self.now_ms();
+        legs.iter()
+            .filter(|p| {
+                if !self.speaks_c3(p) {
+                    return false;
+                }
+                match self.own.role_of(p) {
+                    Some(Role::Primary) => false,
+                    Some(Role::Standby) => !base_or_audio,
+                    None => {
+                        let fresh = self
+                            .provisional
+                            .get(*p)
+                            .is_some_and(|t| now.saturating_sub(*t) < PROVISIONAL_MS);
+                        let draining = self.own.is_draining(p);
+                        !(fresh || draining)
+                    }
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether this node forwards `stream`'s chunk `(epoch, seq)` heard from
+    /// `from` and, if so, the legs it must NOT go to. Only chunks from this
+    /// node's primary (or promoting) parent are forwarded, once each, to the
+    /// admitted children (standby children: base/audio only); never back to
+    /// `from` or the publisher.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_exclude(
+        &mut self,
+        stream: StreamId,
+        epoch: u64,
+        seq: u64,
+        from: &str,
+        publisher: &str,
+        legs: &[String],
+        base_or_audio: bool,
+    ) -> Option<Vec<String>> {
+        let adm = self.relays.get(&stream)?;
+        let sel = self.sels.get(&stream)?;
+        let from_parent =
+            sel.primary().is_some_and(|p| p == from) || sel.promoting().is_some_and(|p| p == from);
+        if !from_parent {
+            return None;
+        }
+        let targets: BTreeSet<String> = adm
+            .forwarding_to()
+            .into_iter()
+            .filter(|(p, role)| {
+                p != from && p != publisher && (*role == Role::Primary || base_or_audio)
+            })
+            .map(|(p, _)| p)
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let (set, order) = self.forwarded_seen.entry(stream).or_default();
+        if !set.insert((epoch, seq)) {
+            return None;
+        }
+        order.push_back((epoch, seq));
+        if order.len() > FORWARD_DEDUPE {
+            if let Some(old) = order.pop_front() {
+                set.remove(&old);
+            }
+        }
+        Some(
+            legs.iter()
+                .filter(|l| !targets.contains(*l))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// C1, receiver side: a verified chunk of `stream` from `from`.
+    /// `source_ms` is the publisher's signed timestamp; latency is measured
+    /// above the fastest delivery seen for the stream, so clock offset
+    /// between the hosts cancels.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
+    pub(super) fn on_chunk(
+        &mut self,
+        stream: StreamId,
+        from: &str,
+        epoch: u64,
+        seq: u64,
+        bytes: u64,
+        source_ms: u64,
+        base_or_audio: bool,
+    ) {
+        if stream == self.own_stream {
+            return;
+        }
+        let now = self.now_ms();
+        let wall = crate::transport::av_chunk_auth::unix_ms_now();
+        let offset = wall as i64 - source_ms as i64;
+        let entry = self.min_offset.entry(stream).or_insert((offset, now));
+        // The floor decays: a better floor wins at once, a stale one is
+        // replaced after 30 s.
+        if offset < entry.0 || now.saturating_sub(entry.1) > 30_000 {
+            *entry = (offset, now);
+        }
+        let latency = (offset - entry.0).max(0) as f64;
+        let Some(sel) = self.sels.get_mut(&stream) else {
+            return;
+        };
+        let role = sel
+            .subscriptions()
+            .into_iter()
+            .find(|(p, _)| p == from)
+            .map(|(_, r)| r);
+        let full = role == Some(Role::Primary);
+        let key = (epoch << 32) | (seq & 0xFFFF_FFFF);
+        sel.on_chunk(now, &from.to_owned(), key, full, bytes, latency);
+        if sel.primary().is_some_and(|p| p == from) {
+            self.rates
+                .entry(stream)
+                .or_default()
+                .add(bytes, base_or_audio);
+        }
+    }
+
+    fn external_for(&self, stream: Option<StreamId>) -> u64 {
+        let own = if stream.is_none() {
+            0
+        } else {
+            self.own.committed_bps()
+        };
+        own + self
+            .relays
+            .iter()
+            .filter(|(s, _)| Some(**s) != stream)
+            .map(|(_, a)| a.committed_bps())
+            .sum::<u64>()
+    }
+
+    fn action_frames(
+        &mut self,
+        stream: StreamId,
+        acts: Vec<SelectorAction<String>>,
+    ) -> Vec<Outgoing> {
+        let fc = self.relay_capable;
+        acts.into_iter()
+            .map(|a| match a {
+                SelectorAction::Subscribe { parent, role } => Outgoing {
+                    frame: encode(
+                        stream,
+                        &ControlMsg::Subscribe(SubscribeRequest {
+                            subscriber: self.me.clone(),
+                            role,
+                            forward_capable: fc,
+                        }),
+                    ),
+                    to: parent,
+                },
+                SelectorAction::Unsubscribe { parent } => Outgoing {
+                    frame: encode(
+                        stream,
+                        &ControlMsg::Unsubscribe {
+                            subscriber: self.me.clone(),
+                        },
+                    ),
+                    to: parent,
+                },
+            })
+            .collect()
+    }
+
+    fn sync_upstream(&mut self, stream: StreamId) {
+        let view = self
+            .sels
+            .get(&stream)
+            .and_then(ParentSelector::upstream_view);
+        if let Some(a) = self.relays.get_mut(&stream) {
+            match view {
+                Some(u) => a.set_upstream(Some(u.depth), u.ancestry, u.healthy, u.latency_ms),
+                None => a.set_upstream(None, Vec::new(), false, 0),
+            }
+        }
+    }
+
+    /// One C3 frame from `peer` (`rtt_ms`: the link's smoothed RTT).
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn on_control(
+        &mut self,
+        peer: &str,
+        f: ControlFrame<String>,
+        rtt_ms: f64,
+    ) -> Vec<Outgoing> {
+        let now = self.now_ms();
+        let stream = f.stream;
+        self.counts.c3_received += 1;
+        let mut out = Vec::new();
+        match f.msg {
+            ControlMsg::Subscribe(req) => {
+                let (decision, preempted) = if stream == self.own_stream {
+                    self.provisional.remove(peer);
+                    let ext = self.external_for(None);
+                    self.own.set_external_committed(ext);
+                    let d = self.own.request(now, &req, &mut self.rng, &mut self.log);
+                    (d, self.own.take_preempted())
+                } else if self.relays.contains_key(&stream) {
+                    let ext = self.external_for(Some(stream));
+                    let a = self.relays.get_mut(&stream).expect("present");
+                    a.set_external_committed(ext);
+                    let d = a.request(now, &req, &mut self.rng, &mut self.log);
+                    (d, a.take_preempted())
+                } else {
+                    // Not forwarding this stream: say so by name.
+                    (
+                        AdmitDecision::Refuse {
+                            reason: RefuseReason::UpstreamUnhealthy,
+                            retry_after_ms: self.cfg.backoff_base_ms * 4,
+                        },
+                        Vec::new(),
+                    )
+                };
+                match &decision {
+                    AdmitDecision::Admit { .. } => {
+                        self.counts.admitted += 1;
+                        self.label(crate::observability::ALM_ADMIT);
+                    }
+                    AdmitDecision::Refuse { reason, .. } => {
+                        *self.counts.refused.entry(reason.token()).or_insert(0) += 1;
+                        self.label(crate::observability::ALM_REFUSE);
+                        self.label(reason.token());
+                    }
+                }
+                out.push(Outgoing {
+                    to: peer.to_owned(),
+                    frame: encode(stream, &ControlMsg::Decision(decision)),
+                });
+                for v in preempted {
+                    self.counts.shed += 1;
+                    self.label(crate::observability::ALM_SHED);
+                    out.push(Outgoing {
+                        to: v,
+                        frame: encode(
+                            stream,
+                            &ControlMsg::Shed {
+                                reason: ShedReason::Preempted,
+                            },
+                        ),
+                    });
+                }
+            }
+            ControlMsg::Unsubscribe { .. } => {
+                let p = peer.to_owned();
+                if stream == self.own_stream {
+                    self.provisional.remove(peer);
+                    self.own.release(&p);
+                } else if let Some(a) = self.relays.get_mut(&stream) {
+                    a.release(&p);
+                }
+            }
+            ControlMsg::Decision(d) => {
+                let acts = match self.sels.get_mut(&stream) {
+                    Some(s) => {
+                        s.on_decision(now, &peer.to_owned(), &d, &mut self.rng, &mut self.log)
+                    }
+                    None => Vec::new(),
+                };
+                out.extend(self.action_frames(stream, acts));
+                self.sync_upstream(stream);
+            }
+            ControlMsg::Shed { reason } => {
+                if let Some(s) = self.sels.get_mut(&stream) {
+                    s.on_shed(now, &peer.to_owned(), &mut self.rng, &mut self.log);
+                    self.draining_parent.insert(stream, peer.to_owned());
+                    self.label(reason.token());
+                }
+                self.sync_upstream(stream);
+            }
+            ControlMsg::Offer(o) => {
+                if stream == self.own_stream || !self.members.iter().any(|m| m == peer) {
+                    return out;
+                }
+                if o.depth == 0 {
+                    self.publisher_of.insert(stream, peer.to_owned());
+                }
+                let mut log = std::mem::take(&mut self.log);
+                self.selector(stream).on_offer(now, o, rtt_ms, &mut log);
+                self.log = log;
+            }
+        }
+        out
+    }
+
+    /// Scale an admission's headroom (measured bits/s of the stream it
+    /// forwards) into the nominal units every selector reasons in.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn nominal(&self, bps: u64, rate: &Rate) -> u64 {
+        let (measured, _) = rate.costs();
+        let scale = self.cfg.stream_bps as f64 / measured.max(1) as f64;
+        (bps as f64 * scale).min(u64::MAX as f64 / 2.0) as u64
+    }
+
+    /// One watch tick: egress windows (C2 measurement and over-commit
+    /// shedding), selector ticks (C4/C6) with the upstream refresh after
+    /// each decision, relay admissions for newly forwarded streams, offers to
+    /// `c3_legs` (the C3 members this node can reach), and the publisher
+    /// and draining-parent unsubscribes.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn tick(&mut self, c3_legs: &[String]) -> Vec<Outgoing> {
+        let now = self.now_ms();
+        let mut out = Vec::new();
+
+        // Measured rates price commitments (production streams are the
+        // host's bitrate, not a nominal one).
+        if self.own_rate.roll(now) {
+            let (full, audio) = self.own_rate.costs();
+            self.own.set_role_costs(full, audio);
+        }
+        for (s, r) in &mut self.rates {
+            if r.roll(now) {
+                if let Some(a) = self.relays.get_mut(s) {
+                    let (full, audio) = r.costs();
+                    a.set_role_costs(full, audio);
+                }
+            }
+        }
+
+        // C2: one egress window feeds every admission on this uplink.
+        if let Some(w) = self.egress.roll(now) {
+            let streams: Vec<StreamId> = self.relays.keys().copied().collect();
+            let mut shed: Vec<(StreamId, String)> = Vec::new();
+            for s in streams {
+                let ext = self.external_for(Some(s));
+                let a = self.relays.get_mut(&s).expect("present");
+                a.set_external_committed(ext);
+                for p in a.on_egress_window(now, &w, &mut self.log) {
+                    shed.push((s, p));
+                }
+            }
+            let ext = self.external_for(None);
+            self.own.set_external_committed(ext);
+            for p in self.own.on_egress_window(now, &w, &mut self.log) {
+                shed.push((self.own_stream, p));
+            }
+            for (s, p) in shed {
+                self.counts.shed += 1;
+                self.label(crate::observability::ALM_SHED);
+                out.push(Outgoing {
+                    to: p,
+                    frame: encode(
+                        s,
+                        &ControlMsg::Shed {
+                            reason: ShedReason::OverCommitted,
+                        },
+                    ),
+                });
+            }
+        }
+
+        // C4/C6 per stream; the relay's upstream view is refreshed after
+        // every decision (the simultaneous-failover loop).
+        let streams: Vec<StreamId> = self.sels.keys().copied().collect();
+        for s in streams {
+            let has_children = self
+                .relays
+                .get(&s)
+                .is_some_and(|a| a.ledger().values().any(|c| c.role == Role::Primary));
+            let mut log = std::mem::take(&mut self.log);
+            let sel = self.sels.get_mut(&s).expect("present");
+            sel.set_has_children(has_children);
+            let acts = sel.tick(now, &mut self.rng, &mut log);
+            self.log = log;
+            out.extend(self.action_frames(s, acts));
+            self.sync_upstream(s);
+
+            let sel = &self.sels[&s];
+            let primary = sel.primary().cloned();
+            let standby = sel.standby().cloned();
+            // A relay admission for every stream this node receives, when it
+            // offers relay.
+            if self.relay_capable && primary.is_some() && !self.relays.contains_key(&s) {
+                let mut a = Admission::relay(self.me.clone(), self.cfg.clone(), None);
+                a.set_members(self.members.iter().cloned());
+                a.set_admit_closed(!self.tier.admits_new_relay_work());
+                self.relays.insert(s, a);
+                self.sync_upstream(s);
+            }
+            if self.last_primary.get(&s) != Some(&primary) {
+                if self.last_primary.get(&s).is_some_and(Option::is_some) {
+                    self.label(crate::observability::ALM_PARENT_CHANGE);
+                }
+                self.last_primary.insert(s, primary.clone());
+            }
+            // The publisher keeps sending a C3 member that has not chosen
+            // (the join gap): tell it once this node chose another parent.
+            if let (Some(p), Some(publisher)) = (&primary, self.publisher_of.get(&s).cloned()) {
+                let uses_publisher = *p == publisher || standby.as_ref() == Some(&publisher);
+                if uses_publisher {
+                    self.told_publisher.remove(&s);
+                } else if self.told_publisher.insert(s) {
+                    out.push(Outgoing {
+                        to: publisher,
+                        frame: encode(
+                            s,
+                            &ControlMsg::Unsubscribe {
+                                subscriber: self.me.clone(),
+                            },
+                        ),
+                    });
+                }
+            }
+            // A parent that shed this node make-before-break keeps sending
+            // until told: tell it once the replacement primary is up.
+            if let Some(d) = self.draining_parent.get(&s).cloned() {
+                if primary.as_ref().is_some_and(|p| *p != d) {
+                    self.draining_parent.remove(&s);
+                    out.push(Outgoing {
+                        to: d,
+                        frame: encode(
+                            s,
+                            &ControlMsg::Unsubscribe {
+                                subscriber: self.me.clone(),
+                            },
+                        ),
+                    });
+                }
+            }
+            // §6.5 — audio only on the canonical tier.
+            let vu = self.sels[&s].video_unavailable();
+            let publisher = self.publisher_of.get(&s).cloned().unwrap_or_default();
+            if vu && self.video_unavailable.insert(s) {
+                self.events.push(super::CallEvent::VideoUnavailable {
+                    publisher,
+                    reason: "relay_canonical_audio_only",
+                });
+            } else if !vu && self.video_unavailable.remove(&s) {
+                self.events
+                    .push(super::CallEvent::VideoRestored { publisher });
+            }
+        }
+
+        // Offers (C3) to every C3 member this node can reach.
+        if now.saturating_sub(self.last_offer_ms) >= OFFER_EVERY_MS || self.last_offer_ms == 0 {
+            self.last_offer_ms = now.max(1);
+            let mut own_offer = self.own.offer();
+            own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);
+            own_offer.forwarder_headroom_bps =
+                self.nominal(own_offer.forwarder_headroom_bps, &self.own_rate);
+            let own_frame = encode(self.own_stream, &ControlMsg::Offer(own_offer));
+            let relay_offers: Vec<(StreamId, Vec<String>, Vec<u8>)> = self
+                .relays
+                .iter()
+                .filter(|(_, a)| a.forwarding())
+                .map(|(s, a)| {
+                    let mut o = a.offer();
+                    let rate = self.rates.get(s).cloned().unwrap_or_default();
+                    o.headroom_bps = self.nominal(o.headroom_bps, &rate);
+                    o.forwarder_headroom_bps = self.nominal(o.forwarder_headroom_bps, &rate);
+                    let mut skip = o.ancestry.clone();
+                    if let Some(p) = self.publisher_of.get(s) {
+                        skip.push(p.clone());
+                    }
+                    (*s, skip, encode(*s, &ControlMsg::Offer(o)))
+                })
+                .collect();
+            for peer in c3_legs {
+                if !self.members.iter().any(|m| m == peer) {
+                    continue;
+                }
+                out.push(Outgoing {
+                    to: peer.clone(),
+                    frame: own_frame.clone(),
+                });
+                for (_, skip, f) in &relay_offers {
+                    if !skip.contains(peer) {
+                        out.push(Outgoing {
+                            to: peer.clone(),
+                            frame: f.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every stream this node receives, with its chosen parents.
+    pub(super) fn parents(&self) -> Vec<AlmParents> {
+        self.sels
+            .iter()
+            .map(|(s, sel)| AlmParents {
+                stream: *s,
+                publisher: self.publisher_of.get(s).cloned(),
+                primary: sel.primary().cloned(),
+                standby: sel.standby().cloned(),
+                parent_changes: sel.parent_changes(),
+            })
+            .collect()
+    }
+
+    /// Who holds a commitment on this node's own stream, by role.
+    pub(super) fn own_children(&self) -> Vec<(String, Role)> {
+        self.own
+            .ledger()
+            .iter()
+            .map(|(p, c)| (p.clone(), c.role))
+            .collect()
+    }
+
+    /// Who this node forwards `stream` to, by role.
+    pub(super) fn relay_children(&self, stream: StreamId) -> Vec<(String, Role)> {
+        self.relays
+            .get(&stream)
+            .map(Admission::forwarding_to)
+            .unwrap_or_default()
+    }
+
+    /// Commitments, own and relayed (bits/s): the `load_ledger`'s A/V rows.
+    pub(super) fn committed(&self) -> (u64, u64) {
+        (
+            self.own.committed_bps(),
+            self.relays.values().map(Admission::committed_bps).sum(),
+        )
+    }
+
+    /// The worst relay commitment ratio against the learned ceiling (the
+    /// ladder's `edge:relay_commit` signal); 0 while unmeasured.
+    #[allow(clippy::cast_precision_loss)]
+    pub(super) fn relay_commit_ratio(&self) -> f64 {
+        self.relays
+            .values()
+            .chain(std::iter::once(&self.own))
+            .filter_map(|a| {
+                a.ceiling_bps()
+                    .filter(|c| *c > 0.0)
+                    .map(|c| a.committed_bps() as f64 / c)
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// Note a decoded frame that did not decode.
+    pub(super) fn note_malformed(&mut self, e: wire::WireError) {
+        self.counts.c3_malformed += 1;
+        self.label(crate::observability::ALM_C3_MALFORMED);
+        self.label(e.token());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::realtime_av_alm::controller::wire::{decode, WireFrame};
+
+    fn s(b: u8) -> StreamId {
+        StreamId([b; 32])
+    }
+
+    fn roster() -> Vec<String> {
+        vec!["a".into(), "b".into(), "c".into()]
+    }
+
+    fn deliver(to: &mut AlmState, from: &str, frames: &[Outgoing]) -> Vec<Outgoing> {
+        let mut out = Vec::new();
+        let me = to.me.clone();
+        for f in frames.iter().filter(|f| f.to == me) {
+            match decode(&f.frame, from).expect("decodes") {
+                WireFrame::Caps(c) => {
+                    to.on_caps(from, c);
+                }
+                WireFrame::Control(cf) => out.extend(to.on_control(from, cf, 20.0)),
+            }
+        }
+        out
+    }
+
+    /// The C3 admit path between two nodes: B learns A's stream from A's
+    /// offer, subscribes, A admits, and A's own chunks then go to B (and to
+    /// nobody that never subscribed, past the provisional window).
+    #[test]
+    fn subscribe_admit_and_send_set() {
+        let (sa, sb) = (s(1), s(2));
+        let mut a = AlmState::new("a", sa, &roster(), false, 1);
+        let mut b = AlmState::new("b", sb, &roster(), false, 2);
+        a.on_caps("b", CAPS_THIS_BUILD);
+        a.on_caps("c", CAPS_THIS_BUILD);
+        b.on_caps("a", CAPS_THIS_BUILD);
+        b.note_publisher(sa, "a");
+        let legs = vec!["b".to_owned(), "c".to_owned()];
+        // Both C3 peers are provisional at first: nobody excluded.
+        assert!(a.own_exclude(&legs, false).is_empty());
+        let offers = a.tick(&legs);
+        let _ = deliver(&mut b, "a", &offers);
+        let mut sub = Vec::new();
+        for _ in 0..12 {
+            std::thread::sleep(Duration::from_millis(100));
+            sub.extend(b.tick(&["a".to_owned()]));
+        }
+        assert!(sub.iter().any(|o| o.to == "a"), "B subscribes to A");
+        let decisions = deliver(&mut a, "b", &sub);
+        assert!(a
+            .own_children()
+            .iter()
+            .any(|(p, r)| p == "b" && *r == Role::Primary));
+        let _ = deliver(&mut b, "a", &decisions);
+        assert_eq!(b.parents()[0].primary.as_deref(), Some("a"));
+        // C never chose: once the provisional window passes it is excluded.
+        a.provisional.insert("c".into(), 0);
+        a.t0 = Instant::now() - Duration::from_millis(PROVISIONAL_MS + 1);
+        assert_eq!(a.own_exclude(&legs, false), vec!["c".to_owned()]);
+    }
+
+    /// A refusal names its token; a subscribe to a stream this node does not
+    /// forward is refused `relay_upstream_unhealthy`.
+    #[test]
+    fn refuse_is_named() {
+        let mut a = AlmState::new("a", s(1), &roster(), true, 1);
+        let f = ControlFrame {
+            stream: s(9),
+            msg: ControlMsg::Subscribe(SubscribeRequest {
+                subscriber: "b".into(),
+                role: Role::Primary,
+                forward_capable: false,
+            }),
+        };
+        let out = a.on_control("b", f, 10.0);
+        let WireFrame::Control(cf) = decode(&out[0].frame, "a").unwrap() else {
+            panic!()
+        };
+        assert!(matches!(
+            cf.msg,
+            ControlMsg::Decision(AdmitDecision::Refuse {
+                reason: RefuseReason::UpstreamUnhealthy,
+                ..
+            })
+        ));
+        assert_eq!(a.counts.refused.get("relay_upstream_unhealthy"), Some(&1));
+    }
+
+    /// A non-C3 (legacy) peer is never excluded: it gets the full stream.
+    #[test]
+    fn legacy_peers_keep_the_full_mesh() {
+        let a = AlmState::new("a", s(1), &roster(), false, 1);
+        assert!(a.own_exclude(&["b".into(), "c".into()], false).is_empty());
+    }
+
+    /// Tier 2 sheds every relayed child LIFO with a named Shed notice.
+    #[test]
+    fn tier_two_sheds_relayed_children() {
+        let mut a = AlmState::new("a", s(1), &roster(), true, 1);
+        let mut adm = Admission::relay("a".to_owned(), ControllerConfig::interactive(), None);
+        adm.set_members(roster());
+        adm.set_upstream(Some(1), vec!["x".into()], true, 10);
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        for p in ["b", "c"] {
+            let _ = adm.request(
+                0,
+                &SubscribeRequest {
+                    subscriber: p.into(),
+                    role: Role::Standby,
+                    forward_capable: false,
+                },
+                &mut rng,
+                &mut log,
+            );
+        }
+        a.relays.insert(s(7), adm);
+        let out = a.set_tier(ServiceTier::ChatAndContacts);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|o| matches!(
+            decode(&o.frame, "a"),
+            Ok(WireFrame::Control(ControlFrame {
+                msg: ControlMsg::Shed {
+                    reason: ShedReason::LoadShed
+                },
+                ..
+            }))
+        )));
+        assert!(a.relays[&s(7)].admit_closed());
+    }
+}

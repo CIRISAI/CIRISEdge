@@ -506,6 +506,31 @@ impl PyEdge {
         VERSION
     }
 
+    /// `FSD/CIRIS_MESH.md` §7.3 L-S1 — **the host's load verdict**:
+    /// `"normal"`, `"warning"` or `"critical"`. Returns the effective service
+    /// tier (0 full ops, 1 audio and files, 2 chat and contacts). Raises
+    /// `ValueError` on another spelling.
+    fn set_load_pressure(&self, pressure: &str) -> PyResult<u8> {
+        let p = crate::LoadPressure::parse(pressure).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "bad_load_pressure: {pressure:?} is not normal, warning or critical"
+            ))
+        })?;
+        Ok(self.inner.set_load_pressure(p).as_u8())
+    }
+
+    /// `FSD/CIRIS_MESH.md` §7.2 — the service tier this node runs at: 0 full
+    /// ops, 1 audio and files, 2 chat and contacts.
+    fn service_tier(&self) -> u8 {
+        self.inner.service_tier().as_u8()
+    }
+
+    /// `FSD/CIRIS_MESH.md` §7.4 — the `load_ledger` as JSON.
+    fn load_ledger_json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.inner.load_ledger())
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
     /// CIRISEdge#437 — hand over a peer's presented build-attestation
     /// bundle (the JSON `SignedCegObject` bytes, `kind =
     /// "build_attestation_bundle"`, CIRISVerify#181) for the durable-save
@@ -4019,6 +4044,19 @@ fn call_event_to_pydict<'py>(
         V::RecordRefused { reason } => {
             d.set_item("kind", "record_refused")?;
             d.set_item("reason", reason)?;
+        }
+        V::VideoUnavailable { publisher, reason } => {
+            d.set_item("kind", "video_unavailable")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("reason", *reason)?;
+        }
+        V::VideoRestored { publisher } => {
+            d.set_item("kind", "video_restored")?;
+            d.set_item("publisher", publisher)?;
+        }
+        V::LoadTier { tier } => {
+            d.set_item("kind", "load_tier")?;
+            d.set_item("tier", *tier)?;
         }
     }
     Ok(d)

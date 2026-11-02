@@ -1205,6 +1205,10 @@ pub struct Edge {
     verify: Arc<VerifyPipeline>,
     queue: Arc<dyn OutboundHandle>,
     signer: Arc<LocalSigner>,
+    /// `FSD/CIRIS_MESH.md` §7 — the service ladder: host pressure
+    /// ([`Edge::set_load_pressure`]) and edge's own signals → the tier every
+    /// live call and the transport's forwarding admission read.
+    load_ladder: Arc<crate::load_ladder::SharedLadder>,
     /// v1.1.1 (CIRISEdge#50 darwin follow-on; mirrors CIRISPersist#137/#138
     /// `select_signer`). When the cohabitation init path supplies a
     /// local seed signer that names the same `key_id` as `signer`, this
@@ -2242,6 +2246,96 @@ impl Edge {
     }
 
     #[must_use]
+    /// **The host's load verdict** (`FSD/CIRIS_MESH.md` §7.3 L-S1): the
+    /// server samples the host (CPU, RSS, read time) and says `Normal`,
+    /// `Warning` or `Critical`. Edge maps it to a [`crate::ServiceTier`]
+    /// (0, 1, 2), may hold a higher tier from its own signals, raises at once
+    /// and steps down one tier per cooldown (60 s from 2, 120 s from 1).
+    /// Every live call and the transport's forwarding admission follow the
+    /// tier. Returns the effective tier.
+    pub fn set_load_pressure(&self, pressure: crate::LoadPressure) -> crate::ServiceTier {
+        let tier = self.load_ladder.set_host_pressure(pressure);
+        self.apply_service_tier(tier);
+        tier
+    }
+
+    /// The service tier this node runs at (`FSD/CIRIS_MESH.md` §7.2):
+    /// `FullOps` (0), `AudioAndFiles` (1), `ChatAndContacts` (2). Folds in
+    /// the transport's forwarded-load signal (`edge:transit_pps`) first.
+    pub fn service_tier(&self) -> crate::ServiceTier {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            let load = t.forward_load();
+            let tier = self
+                .load_ladder
+                .report(crate::load_ladder::EdgeLoadSignals {
+                    transit_pps_ratio: load.pps_ratio,
+                    ..crate::load_ladder::EdgeLoadSignals::default()
+                });
+            self.apply_service_tier(tier);
+            return tier;
+        }
+        self.load_ladder.tier()
+    }
+
+    /// The ladder's recent tier changes and token counters (`load_tier:*`
+    /// with their causes), for the operator readback.
+    #[must_use]
+    pub fn load_ladder(&self) -> Arc<crate::load_ladder::SharedLadder> {
+        Arc::clone(&self.load_ladder)
+    }
+
+    /// **The `load_ledger`** (`FSD/CIRIS_MESH.md` §7.4): the costliest
+    /// forwarded links this node carries (bits/s and packets/s each), over
+    /// the transport's last one-second reading. A/V commitments are per call
+    /// (`Call::alm_counts`, `Call::alm_relay_children`).
+    #[must_use]
+    pub fn load_ledger(&self) -> crate::observability::LoadLedger {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            let load = t.forward_load();
+            return crate::observability::LoadLedger {
+                tier: self.load_ladder.tier().as_u8(),
+                transit_pps: load.pps,
+                transit_bps: load.bps,
+                transit: load
+                    .top
+                    .iter()
+                    .map(|c| crate::observability::LoadLedgerEntry {
+                        subject: hex::encode(c.link_id),
+                        bps: c.bps,
+                        pps: c.pps,
+                    })
+                    .collect(),
+                counters: self
+                    .load_ladder
+                    .counters()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v))
+                    .collect(),
+            };
+        }
+        crate::observability::LoadLedger {
+            tier: self.load_ladder.tier().as_u8(),
+            counters: self
+                .load_ladder
+                .counters()
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
+            ..crate::observability::LoadLedger::default()
+        }
+    }
+
+    #[allow(clippy::unused_self)]
+    fn apply_service_tier(&self, tier: crate::ServiceTier) {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            t.set_service_tier(tier);
+        }
+        let _ = tier;
+    }
+
     pub fn metrics(&self) -> crate::observability::EdgeMetrics {
         self.metrics.clone()
     }
@@ -4464,6 +4558,7 @@ impl Edge {
                 // publisher is the node (`own`), whoever attends.
                 signer: Arc::clone(&self.signer),
                 verifier,
+                load: Some(Arc::clone(&self.load_ladder)),
             },
             opts,
         )
@@ -8804,6 +8899,7 @@ impl EdgeBuilder {
             verify,
             queue,
             signer,
+            load_ladder: Arc::new(crate::load_ladder::SharedLadder::default()),
             local_signer: self.local_signer,
             transports: self.transports,
             handlers: Arc::new(Mutex::new(HashMap::new())),

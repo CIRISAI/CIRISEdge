@@ -12,7 +12,9 @@
 //!   other publisher arrives byte-identical and in chunk order; C relays with
 //!   a capped layer policy for B, A's direct leg to B loses every third chunk
 //!   and C's relay leg is delayed, and B's `frames()` is still strictly
-//!   increasing with nothing skipped; only base-layer chunks are relayed.
+//!   increasing with nothing skipped; only base-layer chunks are relayed. With
+//!   ALM stage 2, C forwards only to the members that subscribed to it over
+//!   C3: B and A each take C as the warm standby for the other's stream.
 //! - **A3** (`a_removed_member_hears_nothing_after_the_roll`): the room
 //!   removes C; A's stream rolls; B hears the post-roll chunks, C hears none.
 //! - **A4 / A7 / A12** (`budget_keep_refused_and_no_key_door`): a Kept stream
@@ -428,6 +430,7 @@ async fn join_recorded(
             record,
             signer: node.key.signer(),
             verifier: Arc::clone(&node.dir) as Arc<dyn StreamKeyVerifier>,
+            load: None,
         },
         opts,
     )
@@ -535,6 +538,24 @@ async fn a_three_member_room_call_over_keyed_links() {
         })
         .await,
         "every leg dialled to a node was answered after the claim check"
+    );
+
+    // ALM stage 2: C relays only to the members that SUBSCRIBED to it (C3).
+    // B and A each take C as the warm standby for the other's stream (the
+    // publisher is the primary); wait for both before publishing.
+    let standby_on_c = |call: &Call, stream| {
+        call.alm_parents()
+            .iter()
+            .any(|p| p.stream == stream && p.standby.as_deref() == Some(c.key.key_id.as_str()))
+    };
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            standby_on_c(&call_b, call_a.stream()) && standby_on_c(&call_a, call_b.stream())
+        })
+        .await,
+        "B and A take C as standby: B {:?} A {:?}",
+        call_b.alm_parents(),
+        call_a.alm_parents()
     );
 
     // C relays to B at the base layer only; A's direct leg to B loses every
@@ -793,6 +814,17 @@ async fn a_member_cannot_forge_another_members_stream_through_a_relay() {
     for call in [&call_a, &call_b, &call_c] {
         wait_bound(call, 2).await;
     }
+    // ALM stage 2: C relays A's stream to B once B took it as standby (C3).
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            call_b.alm_parents().iter().any(|p| {
+                p.stream == call_a.stream() && p.standby.as_deref() == Some(c.key.key_id.as_str())
+            })
+        })
+        .await,
+        "B takes C as standby for A's stream: {:?}",
+        call_b.alm_parents()
+    );
     let mut frames_a = call_a.frames().expect("A's frames");
     let mut frames_b = call_b.frames().expect("B's frames");
     let mut frames_c = call_c.frames().expect("C's frames");
@@ -1045,6 +1077,7 @@ async fn joining_is_membership_by_name() {
         record: None,
         signer: x.key.signer(),
         verifier: Arc::clone(&x.dir) as Arc<dyn StreamKeyVerifier>,
+        load: None,
     };
     // A room X is not in.
     let other = CohortGroup::create(store("a2-other"), "room-a2", "someone-else", 16)

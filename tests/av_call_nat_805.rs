@@ -425,6 +425,7 @@ async fn join(side: &Side, group: &CohortGroup, room: &str) -> Result<Call, Call
             record: None,
             signer: side.key.signer(),
             verifier: Arc::clone(&side.dir) as Arc<dyn StreamKeyVerifier>,
+            load: None,
         },
         CallOptions::default(),
     )
