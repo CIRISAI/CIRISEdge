@@ -77,6 +77,7 @@ use ciris_edge::{CohortScope, Edge, EdgeConfig, HybridPolicy};
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::encrypted_kv::XChaChaKvStore;
 use ciris_persist::federation::blobs::BlobStorage as _;
+use ciris_persist::federation::group_plane::GroupPlaneFamily;
 use ciris_persist::federation::key_grant::SignedKeyGrantRow;
 use ciris_persist::federation::types::{Family, FamilyMember, SignedFamily};
 use ciris_persist::federation::{Attestation, FederationDirectory, SignedAttestation};
@@ -520,7 +521,11 @@ struct Relay {
 
 /// Every `kind` envelope `from` serves (structural planes: roster, keys) to
 /// `to`'s apply door.
-async fn carry_plane(from: &Member, to: &Member, kind: EnvelopeKind) -> Vec<ApplyOutcome> {
+async fn carry_plane(from: &Member, to: &Member, family: GroupPlaneFamily) -> Vec<ApplyOutcome> {
+    // persist v61 (CIRISPersist#991) — a group's record and its membership
+    // events are rows of `family` on the Attestation plane; the framed planes
+    // are retired. Carry exactly that family's rows.
+    let kind = EnvelopeKind::Attestation;
     let mut out = Vec::new();
     for r in from.bridge.list_envelope_refs(kind).await {
         let bytes = from
@@ -528,6 +533,12 @@ async fn carry_plane(from: &Member, to: &Member, kind: EnvelopeKind) -> Vec<Appl
             .fetch_envelope_bytes(kind, &r.envelope_hash)
             .await
             .expect("an advertised envelope is fetchable");
+        let Ok(row) = serde_json::from_slice::<Attestation>(&bytes) else {
+            continue;
+        };
+        if GroupPlaneFamily::of_row(&row) != Some(family) {
+            continue;
+        }
         out.push(
             to.bridge
                 .apply_envelope_bytes(kind, &bytes, Some(&from.node.me))
@@ -673,7 +684,7 @@ async fn form_family_by_consent(p1: &Member, q1: &Member, p: &Ident, q: &Ident, 
     // proposal is its own fix (the v38 record-exposure blocker), and this
     // witness asserts nothing about a non-member's record.
     assert!(
-        carry_plane(p1, q1, EnvelopeKind::Family)
+        carry_plane(p1, q1, GroupPlaneFamily::Roster)
             .await
             .iter()
             .all(ApplyOutcome::is_admitted),
@@ -725,7 +736,7 @@ async fn form_family_by_consent(p1: &Member, q1: &Member, p: &Ident, q: &Ident, 
 
     // Q's widening reaches Q1 through P1's serve (it lands only where Q's
     // own acceptance is held, persist #955).
-    let applied = carry_plane(p1, q1, EnvelopeKind::FamilyMembershipWidening).await;
+    let applied = carry_plane(p1, q1, GroupPlaneFamily::Widening).await;
     assert_eq!(applied.len(), 1, "one widening");
     assert!(applied[0].is_admitted(), "{applied:?}");
     assert_eq!(active_members(&q1.node).await, want, "Q1 reads the roster");
@@ -778,7 +789,7 @@ async fn form_family_by_consent(p1: &Member, q1: &Member, p: &Ident, q: &Ident, 
         deliver(q1, &accept_r, p1).await.is_admitted(),
         "Q1 admits R's acceptance"
     );
-    let applied = carry_plane(p1, q1, EnvelopeKind::FamilyMembershipWidening).await;
+    let applied = carry_plane(p1, q1, GroupPlaneFamily::Widening).await;
     assert_eq!(applied.len(), 2, "both widenings offered");
     assert!(
         applied.iter().any(ApplyOutcome::is_admitted),
