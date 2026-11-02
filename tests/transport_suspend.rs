@@ -624,6 +624,18 @@ async fn a_listening_node_suspends_fully_and_listens_again() {
     p.a.delay_channel_sends_for_test(0);
     p.a.resume().await.expect("resume A");
     assert_eq!(listening_on(p.port_a), 1, "A listens again");
+    // Route heal: B's client reconnects on its own backoff (5 s), then learns
+    // A's path from the announce A sends on the new connection.
+    let named_a = p.a.local_named_dest_hash();
+    let healed = wait_until(Duration::from_secs(30), || async {
+        established_on(p.port_a) >= 2
+            && p.b
+                .path_table_rows_for_test()
+                .iter()
+                .any(|r| r.0 == named_a)
+    })
+    .await;
+    assert!(healed, "B reconnects to the resumed A and routes to it");
     p.b_reaches_a(b"after A resumed").await;
 }
 
