@@ -227,6 +227,8 @@ fn policy(
         window: Duration::from_secs(window_s),
         node_cap_bytes_per_s: bytes_per_s.saturating_mul(8),
         require_shaped_links: strict,
+        scope: ciris_edge::transport::link_shaping::ShapingScope::AllIdentityLinks,
+        layer_reserve_links: ciris_edge::transport::link_shaping::DEFAULT_LAYER_RESERVE_LINKS,
     }
 }
 

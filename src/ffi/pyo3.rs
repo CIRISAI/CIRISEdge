@@ -3955,6 +3955,7 @@ fn call_err_token(e: &crate::transport::av_call::CallError) -> &'static str {
         E::CallEnded(_) => "call_ended",
         E::ActorIsNotTheSubject { .. } => "actor_is_not_the_subject",
         E::Plumbing(_) => "plumbing",
+        E::AnonymousMode => crate::onion::tokens::ANONYMOUS_NO_MEDIA,
     }
 }
 
@@ -3968,7 +3969,8 @@ fn call_err_to_py(e: &crate::transport::av_call::CallError) -> PyErr {
         E::NotARoomMember { .. }
         | E::ConsentMissing { .. }
         | E::FrameTooLarge { .. }
-        | E::ActorIsNotTheSubject { .. } => PyValueError::new_err(msg),
+        | E::ActorIsNotTheSubject { .. }
+        | E::AnonymousMode => PyValueError::new_err(msg),
         _ => PyRuntimeError::new_err(msg),
     }
 }
@@ -6092,10 +6094,12 @@ pub fn init_edge_runtime(
     // When `local_instance_name` is `None`, neither parameter has
     // any effect — v2.2.x behavior is preserved exactly.
     local_instance_name: Option<&str>,
-    // CC 5.4.3 (CLM-link-shaping) — this node's link-shaping policy. `None`
-    // / `off` (the default) offers nothing. `shaping_class` is one of
-    // `server`, `home`, `phone-wifi`, `phone-cellular`, `off`; ρ and W default
-    // to the modelled values (0.5, 600 s); the node cap to eight links' worth.
+    // CC 5.4.3 (CLM-link-shaping) — this node's link-shaping class.
+    // `server` shapes every identity link (the fleet default for servers);
+    // `home`, `phone-wifi`, `phone-cellular` are the person's opt-in for that
+    // class; `off` offers nothing; `None` shapes only onion layer links (none
+    // while the Anonymous Tier is dormant). ρ and W default to the modelled
+    // values (0.5, 600 s; 3600 s cellular); the node cap to eight links' worth.
     shaping_class: Option<String>,
     shaping_rho: Option<f64>,
     shaping_window_seconds: Option<u64>,
@@ -7267,6 +7271,32 @@ pub fn init_edge_runtime(
             policy.node_cap_bytes_per_s = cap;
         }
         policy.require_shaped_links = require_shaped_links;
+        // The class names the device too (CC 5.4.6 item 1 relay policy).
+        {
+            use crate::transport::link_shaping::{DeviceKind, DeviceState};
+            transport_config.device = match class {
+                BudgetClass::Server => DeviceState::of(DeviceKind::Server),
+                BudgetClass::Home => DeviceState::of(DeviceKind::Home),
+                BudgetClass::PhoneWifi => DeviceState::of(DeviceKind::Phone),
+                BudgetClass::PhoneCellular => {
+                    DeviceState::of(DeviceKind::Phone).with_network(false, true)
+                }
+                BudgetClass::Off => DeviceState::of(DeviceKind::platform_default()),
+            };
+        }
+        transport_config = transport_config.with_shaping(policy);
+    } else {
+        // CC 5.4.3 rc16 fleet default (Eric, 2026-11-02, final): shaping is
+        // ON by default for `server` only, which a server host names by
+        // passing `shaping_class="server"`. Naming any other class is the
+        // person's opt-in for that class (cellular included). With no class
+        // the node shapes only its onion layer links (none unless its tier
+        // runs), at the platform's class.
+        use crate::transport::link_shaping::{DeviceKind, DeviceState, ShapingPolicy};
+        let device = DeviceState::of(DeviceKind::platform_default());
+        let mut policy = ShapingPolicy::for_device(&device);
+        policy.require_shaped_links = require_shaped_links;
+        transport_config.device = device;
         transport_config = transport_config.with_shaping(policy);
     }
     // CIRISEdge#168 (v5.0) — Transport-node mode (§24 NAT-traversal).

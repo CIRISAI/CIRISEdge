@@ -1115,6 +1115,8 @@ dependencies = [
  "leviculum-lxmf",
  "leviculum-std",
  "libc",
+ "libcrux-kem",
+ "libcrux-sha3",
  "memchr",
  "openmls",
  "openmls_basic_credential",

@@ -7,6 +7,38 @@ piece of code is the layer deal (`src/transport/onion_layers.rs`), written first
 the determinism the CC requires. Edge vendors CC rc8.1 today (its namespace matcher is persist's); the
 rc10 families arrive with persist's rc10 adoption.
 
+**v44 status (2026-11-01, CC rc16).** The tier is wired in edge v44 and ships **dormant**
+(Eric, 2026-11-02). It is active on a node only when two things hold:
+
+- the person has opted in (`OnionPolicy::enabled`, which is off by default); and
+- the deal reports the tier available, meaning at least three relays per layer are both dealt and
+  answering.
+
+Today the canonical bundle seats one relay, so the floor fails on every node.
+
+**What has changed since rc10:**
+
+- **The packet** follows CC rc16 item 3. The hop KEM is the X-Wing draft-06 construction from
+  libcrux, with the SHA3 combiner. The body is a LIONESS wide block, so it resists tagging. The
+  header carries chained slot commitments. See `docs/onion_packet_wire.md` (with the known-answer
+  tests, KATs), which supersedes §5 below.
+- **The hop key** is read through one accessor (`src/onion/hop_key.rs`). Until persist 61.0.1 the
+  transit pair stands in for it.
+- **Relay, sender, pseudonym and runtime** live in `src/onion/{relay,sender,pseudonym,runtime}.rs`.
+- **Anonymous mode is row-plane only.** While the tier is active, a node starts no call and no
+  stream (`onion_anonymous_no_media`).
+- **Shaping.** It is on by default for the `server` class only and is opt-in for every other class.
+  Whatever the class, a node running the tier always shapes its layer links, and those links get a
+  reserved share of the cap (`docs/LINK_SHAPING_COST.md`).
+
+**Still owed:**
+
+- the fold reader that builds `RelayCandidate`s, which needs `INFRA_RELAY` from persist v60.1 and
+  the 61.0.1 markers;
+- the rendezvous row and the mailbox (CIRISPersist#1149);
+- the pseudonym's persist gate;
+- an over-the-wire RNS loopback.
+
 **Normative sources, in order:** CC 5.4.6 "The Anonymous Tier: onion routing" items 1–8; CC 3.3.6.2
 "The onion hop key", "The opt-out marker", "The hop key's shape"; CC 3.1.4 "Rendezvous route leaf"
 (`rendezvous:route:v1`); CC 1.13.3.1 operator guidance; CC 5.4.3 link shaping; CC 5.3.3.5 E1.

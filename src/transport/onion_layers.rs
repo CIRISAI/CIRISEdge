@@ -401,6 +401,51 @@ mod tests {
         }
     }
 
+    /// CLM-onion-layer-model `Inv_HostileShareBound` / Lean `hostile_share_bound`,
+    /// on the implementation: whatever the mix of seats, conferred standings
+    /// and strangers, in every layer of every deal the unconferred relays are
+    /// at most `c/(1+c)` of the layer (`unconferred·(1+c) ≤ c·size`), and the
+    /// deal is the same for any arrival order.
+    #[test]
+    fn no_layer_is_more_than_c_over_one_plus_c_unconferred() {
+        let mut checked = 0usize;
+        for seats in 0..10 {
+            for standings in 0..5 {
+                for others in [0usize, 1, 2, 7, 30, 120] {
+                    let mut v: Vec<_> = (0..seats)
+                        .map(|i| node(&format!("seat{i}"), true))
+                        .collect();
+                    for i in 0..standings {
+                        let mut st = node(&format!("standing{i}"), false);
+                        st.relay_standing = true;
+                        v.push(st);
+                    }
+                    v.extend((0..others).map(|i| node(&format!("stranger{i}"), false)));
+                    let mut rev = v.clone();
+                    rev.reverse();
+                    for c in 1u32..=3 {
+                        for period in [0u64, 1, 77, 496_000] {
+                            let d = deal_layers(&v, period, c);
+                            assert_eq!(d, deal_layers(&rev, period, c), "arrival order");
+                            for layer in &d.layers {
+                                let unconferred =
+                                    layer.iter().filter(|k| k.starts_with("stranger")).count();
+                                assert!(
+                                    unconferred * (1 + c as usize) <= c as usize * layer.len(),
+                                    "seats {seats} standings {standings} others {others} c {c}: \
+                                     {unconferred} of {} unconferred",
+                                    layer.len()
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 3000);
+    }
+
     /// Membership: each predicate leg excludes on its own; a seat's violations
     /// are named.
     #[test]

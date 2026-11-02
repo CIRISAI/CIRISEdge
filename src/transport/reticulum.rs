@@ -522,6 +522,23 @@ const fn shaping_applies_to(plane: LinkPlane) -> bool {
     matches!(plane, LinkPlane::Identity)
 }
 
+#[cfg(test)]
+mod shaping_plane_tests {
+    use super::{shaping_applies_to, LinkPlane};
+
+    /// CC 5.4.3 rc16 **two planes**: a link belongs to one plane, and only
+    /// the identity (row) plane is ever shaped. An A/V leg (a call or a
+    /// stream) never takes a shaped link, on either end; neither does a
+    /// scoped link. Bulk on an identity link is refused at the shaper
+    /// (`link_shaping::a_shaped_link_carries_rows_and_refuses_bulk_by_name`).
+    #[test]
+    fn only_the_row_plane_is_shaped_and_av_legs_never_are() {
+        assert!(shaping_applies_to(LinkPlane::Identity));
+        assert!(!shaping_applies_to(LinkPlane::Av));
+        assert!(!shaping_applies_to(LinkPlane::Scoped));
+    }
+}
+
 /// CC 5.4.3 — the most plaintext one outbound frame on `link_id` carries:
 /// on a shaped link the shaped frame's body ([`link_shaping::body_capacity`]
 /// of the agreed frame), else the link's Channel MDU.
@@ -693,6 +710,13 @@ async fn send_fragments_on_channel(
                     sent: 0,
                     total,
                     stalled: Some("shaping_queue_full"),
+                }
+            }
+            Err(crate::transport::link_shaping::ShapingError::BulkBeyondReach(..)) => {
+                FragmentSendOutcome {
+                    sent: 0,
+                    total,
+                    stalled: Some(crate::observability::LINK_SHAPING_BULK_REFUSED),
                 }
             }
             Err(_) => FragmentSendOutcome {
@@ -1997,8 +2021,13 @@ pub struct ReticulumTransportConfig {
     /// peer's request refused. See [`crate::transport::direct_path`].
     pub direct_links: crate::transport::direct_path::DirectLinksConfig,
     /// CC 5.4.3 — this node's link-shaping policy (`CLM-link-shaping`).
-    /// Default `off`: nothing is offered and no link is shaped.
+    /// Default `off`: nothing is offered and no link is shaped. A host sets
+    /// its class's fleet default (`ShapingPolicy::for_device`): on for
+    /// `server`, opt-in for the rest.
     pub shaping: crate::transport::link_shaping::ShapingPolicy,
+    /// The device this node runs on (CC 5.4.6 item 1 relay policy; the
+    /// mobile host updates it at runtime, `set_device_state`).
+    pub device: crate::transport::link_shaping::DeviceState,
 }
 
 impl ReticulumTransportConfig {
@@ -2026,6 +2055,9 @@ impl ReticulumTransportConfig {
             ifac: None,
             direct_links: crate::transport::direct_path::DirectLinksConfig::default(),
             shaping: crate::transport::link_shaping::ShapingPolicy::default(),
+            device: crate::transport::link_shaping::DeviceState::of(
+                crate::transport::link_shaping::DeviceKind::platform_default(),
+            ),
         }
     }
 
@@ -2560,6 +2592,9 @@ pub struct ReticulumTransport {
     /// CC 5.4.3 — the shaped links and this node's shaping policy
     /// ([`crate::transport::link_shaping`]).
     shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    /// CC 5.4.6 — the Anonymous Tier on this node (dormant unless its
+    /// operator opts in and the deal is available; [`crate::onion`]).
+    onion: Arc<crate::onion::runtime::OnionRuntime>,
     /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead
     /// of the real one (see [`HandshakeOverride`]). `None` in production.
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
@@ -3331,6 +3366,22 @@ impl ReticulumTransport {
 
         // CC 5.3.3.5 E1 — the per-link seal table, keyed by those transit keys
         // and answering every dialler's handshake as the advertised id.
+        // CC 5.4.6 — the Anonymous Tier, dormant until opted in. Under the
+        // persist < 61.0.1 stand-in the node's hop key IS its transit pair
+        // (`crate::onion::hop_key`), so the relay decapsulates with the
+        // transit custody in the split form.
+        let onion = Arc::new(crate::onion::runtime::OnionRuntime::new(
+            config.local_key_id.clone(),
+            config.device,
+        ));
+        match crate::onion::hop_key::local_hop_secret_from_transit(&transit_kex) {
+            Ok(hop) => onion.set_relay(Some(crate::onion::relay::OnionRelay::new(hop, None))),
+            Err(e) => tracing::warn!(
+                reason = crate::onion::tokens::NO_VALID_HOP_KEY,
+                error = %e,
+                "no onion hop secret: this node cannot relay (CC 3.3.6.2)"
+            ),
+        }
         let seals = Arc::new(crate::transport::link_seal::LinkSeals::new(
             transit_kex,
             config.local_key_id.clone(),
@@ -3347,8 +3398,10 @@ impl ReticulumTransport {
                 window_s = shapers.policy().window.as_secs(),
                 node_cap_bytes_per_s = shapers.policy().node_cap_bytes_per_s,
                 require_shaped_links = shapers.policy().require_shaped_links,
-                "link shaping ON: every identity link is offered shaping (CC 5.4.3, \
-                 CLM-link-shaping)"
+                all_identity_links = shapers.policy().scope
+                    == crate::transport::link_shaping::ShapingScope::AllIdentityLinks,
+                "link shaping ON at this class: every identity link when all_identity_links, \
+                 else the onion layer links only (CC 5.4.3, CLM-link-shaping)"
             );
         }
 
@@ -3894,6 +3947,7 @@ impl ReticulumTransport {
             self_route,
             seals,
             shapers,
+            onion,
             handshake_override: Arc::new(std::sync::Mutex::new(None)),
             route_answer_override: Arc::new(std::sync::Mutex::new(None)),
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5743,6 +5797,15 @@ impl ReticulumTransport {
         address: &MemberAddress,
         initiator_key_id: &str,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
+        // CC 5.4.3 rc16 — a node in anonymous mode is confined to the row
+        // plane: it opens no A/V leg (no call, no stream).
+        if let Err(token) = self.onion.media_allowed() {
+            self.onion.count(token);
+            return Err(TransportError::Config(format!(
+                "{token}: this node is in anonymous mode (its Anonymous Tier is active); \
+                 no call and no stream ride its links (CC 5.4.3)"
+            )));
+        }
         let (dest_hash, transport_keys, pair) =
             self.av_dial_target(destination_key_id, address).await?;
         // CIRISEdge#805 item 8 — a derived address answers only a one-hop
@@ -7052,6 +7115,148 @@ impl ReticulumTransport {
     // ALSO emit `LinkEvent`s on `event_bus.emit_link(...)` so the
     // `subscribe_link_events` AsyncIterator (closes the link half of
     // CIRISEdge#34) actually fires.
+
+    /// CC 5.4.6 — this node's Anonymous Tier (dormant in v44 unless opted in
+    /// and available).
+    #[must_use]
+    pub fn onion(&self) -> &Arc<crate::onion::runtime::OnionRuntime> {
+        &self.onion
+    }
+
+    /// CC 5.4.3 — this node's shaping policy now.
+    #[must_use]
+    pub fn shaping_policy(&self) -> crate::transport::link_shaping::ShapingPolicy {
+        self.shapers.policy()
+    }
+
+    /// Shaped links now.
+    #[must_use]
+    pub fn shaped_link_count(&self) -> usize {
+        self.shapers.shaped_count()
+    }
+
+    /// CC 5.4.3 — replace the shaping policy at runtime. Shaped links the new
+    /// policy cannot carry are closed (never left half-shaped) and redial
+    /// under it. Returns how many closed.
+    pub async fn set_shaping_policy(
+        &self,
+        policy: crate::transport::link_shaping::ShapingPolicy,
+    ) -> usize {
+        let close = self.shapers.set_policy(policy);
+        for link in &close {
+            let id = LinkId::new(*link);
+            self.seals.refuse(*link);
+            let _ = self.node.close_link(&id).await;
+        }
+        if !close.is_empty() {
+            tracing::info!(
+                closed = close.len(),
+                class = self.shapers.policy().class.as_str(),
+                "shaping policy changed at runtime; links it no longer carries were closed \
+                 to renegotiate (CC 5.4.3)"
+            );
+        }
+        close.len()
+    }
+
+    /// The host's device facts changed (Wi-Fi ↔ cellular, charging): the
+    /// shaping class follows the device ([`ShapingPolicy::for_device`],
+    /// the person's opt-in kept) and so does the relay policy. Returns how
+    /// many shaped links closed to renegotiate.
+    ///
+    /// [`ShapingPolicy::for_device`]: crate::transport::link_shaping::ShapingPolicy::for_device
+    pub async fn set_device_state(
+        &self,
+        device: crate::transport::link_shaping::DeviceState,
+    ) -> usize {
+        self.onion.set_device(device);
+        let mut policy = crate::transport::link_shaping::ShapingPolicy::for_device(&device);
+        policy.require_shaped_links = self.shapers.policy().require_shaped_links;
+        let closed = self.set_shaping_policy(policy).await;
+        self.onion_refresh();
+        closed
+    }
+
+    /// CC 5.4.6 — re-read the tier's layer peers into the shaper (call after
+    /// the opt-in, the deal or the device changes). A node whose tier is not
+    /// active names none and reserves nothing.
+    pub fn onion_refresh(&self) {
+        self.shapers.set_layer_peers(self.onion.layer_peers());
+    }
+
+    /// CC 5.4.6 item 2 — publish `payload` through the tier: route over this
+    /// period's deal (one answering relay per layer), resolve each relay's
+    /// destination and hop key with `resolve`, build the packet, and queue
+    /// it on the SHAPED link to the first hop. Every refusal is a token.
+    ///
+    /// # Errors
+    /// The tier's tokens; [`crate::onion::tokens::ROUTE_FAILED`];
+    /// [`crate::onion::tokens::FIRST_HOP_UNSHAPED`].
+    pub async fn onion_publish(
+        &self,
+        payload: &[u8],
+        resolve: &(dyn Fn(&str) -> Option<([u8; 16], crate::onion::packet::HopKey)> + Sync),
+    ) -> Result<(), &'static str> {
+        use crate::onion::tokens;
+        let onion = &self.onion;
+        let out = async {
+            onion.tier()?;
+            let deal = onion.deal().ok_or(tokens::UNAVAILABLE_FLOOR)?;
+            let mut rng = crate::onion::packet::SystemEntropy;
+            let pick = crate::onion::sender::pick_route(
+                &deal,
+                self.occurrence_key_id(),
+                &|k| onion.answering(k),
+                &mut rng,
+            )?;
+            let mut hops = Vec::with_capacity(3);
+            for k in &pick {
+                let (dest, key) = resolve(k).ok_or(tokens::ROUTE_FAILED)?;
+                hops.push(crate::onion::sender::RouteHop {
+                    key_id: k.clone(),
+                    dest,
+                    key,
+                });
+            }
+            let route: [crate::onion::sender::RouteHop; 3] =
+                hops.try_into().map_err(|_| tokens::ROUTE_FAILED)?;
+            let first = route[0].dest;
+            let link = {
+                let dialled = self.dialed_link_dest.lock().await;
+                dialled
+                    .iter()
+                    .find(|(l, d)| {
+                        d.into_bytes() == first && self.shapers.is_shaped(l.into_bytes())
+                    })
+                    .map(|(l, _)| *l)
+            }
+            .ok_or(tokens::FIRST_HOP_UNSHAPED)?;
+            let shaper = self
+                .shapers
+                .get(link.into_bytes())
+                .ok_or(tokens::FIRST_HOP_UNSHAPED)?;
+            let packet = crate::onion::sender::build_publication(
+                &route,
+                payload,
+                deal.period,
+                onion.policy().mix_mean_delay_ms,
+                &mut rng,
+            )
+            .map_err(|e| e.label())?;
+            let frame = crate::onion::relay::onion_frame(&packet);
+            let cap = crate::transport::link_shaping::body_capacity(shaper.agreement().frame_bytes);
+            let frags = crate::transport::frame_fragment::fragment(&frame, cap)
+                .ok_or(tokens::ROUTE_FAILED)?;
+            shaper.enqueue(frags).map_err(|e| e.label())?;
+            Ok(())
+        }
+        .await;
+        onion.count(match out {
+            Ok(()) => tokens::PUBLISHED,
+            Err(t) => t,
+        });
+        out
+    }
 
     /// Snapshot every link the event loop has seen reach `Active`.
     /// State is `Active` by definition (closed/stale links are removed
@@ -8794,6 +8999,21 @@ impl ReticulumTransport {
                     }
                     Err(ShipError::Busy)
                 }
+                // CC 5.4.3 rc16 two planes — bulk never rides the shaped row
+                // plane: refused by name, counted, nothing queued.
+                Err(e @ crate::transport::link_shaping::ShapingError::BulkBeyondReach(..)) => {
+                    if let Some(m) = self.metrics.get() {
+                        m.inc_link_shaping(e.label());
+                    }
+                    tracing::warn!(
+                        link = ?link_id,
+                        bytes = envelope_bytes.len(),
+                        reason = e.label(),
+                        "a message beyond the shaped link's reach was refused: bulk rides an \
+                         unshaped link of its own (CC 5.4.3 two planes)"
+                    );
+                    Err(ShipError::Other(TransportError::Io(e.to_string())))
+                }
                 Err(e) => Err(ShipError::Other(TransportError::Io(e.to_string()))),
             };
         }
@@ -9394,6 +9614,7 @@ impl Transport for ReticulumTransport {
             direct_paths: &self.direct_paths,
             seals: &self.seals,
             shapers: &self.shapers,
+            onion: &self.onion,
         };
         loop {
             tokio::select! {
@@ -11022,7 +11243,10 @@ impl DialCtx {
     /// [`OFFER_ANSWER_BUDGET`]: crate::transport::link_shaping::OFFER_ANSWER_BUDGET
     async fn offer_shaping(&self, link_id: LinkId, peer: &str) -> Result<(), TransportError> {
         use crate::transport::link_shaping::{ShapingError, OFFER_ANSWER_BUDGET};
-        if !self.shapers.policy().enabled() {
+        // CC 5.4.3 / 5.4.6 item 4 — nothing is offered to a peer this node
+        // does not shape toward (shaping off, or a general link under a
+        // layer-links-only scope such as phone-on-cellular).
+        if !self.shapers.offers_to(Some(peer)) {
             return Ok(());
         }
         if !self
@@ -11036,9 +11260,9 @@ impl DialCtx {
         }
         let link = link_id.into_bytes();
         let answer = self.shapers.begin_offer(link);
-        let offer = self
-            .shapers
-            .offer_for(link, link_channel_mdu(&self.node, &link_id));
+        let offer =
+            self.shapers
+                .offer_for(link, link_channel_mdu(&self.node, &link_id), Some(peer));
         let out = send_fragments_on_channel(
             &self.node,
             &self.seals,
@@ -11420,6 +11644,8 @@ struct EventCtx<'a> {
     seals: &'a Arc<crate::transport::link_seal::LinkSeals>,
     /// CC 5.4.3 — see `ReticulumTransport::shapers`.
     shapers: &'a Arc<crate::transport::link_shaping::LinkShapers>,
+    /// CC 5.4.6 — the Anonymous Tier: inbound onion frames are its.
+    onion: &'a Arc<crate::onion::runtime::OnionRuntime>,
 }
 
 impl EventCtx<'_> {
@@ -12150,6 +12376,15 @@ async fn attribute_and_deliver(
         }
         // choke-ok: consumed as a transport control frame; every refusal
         // inside goes through `drop_inbound` by name.
+        return;
+    }
+    // CC 5.4.6 — an onion packet (`CONP`) is a transport frame for the
+    // Anonymous Tier, consumed here: relayed over a shaped link, or refused
+    // by name (an unshaped link, a node not running the tier).
+    if crate::onion::relay::is_onion_frame(&data) {
+        handle_onion_frame(ctx, link_id, &data).await;
+        // choke-ok: consumed as a transport control frame; every refusal is
+        // counted by token in the onion runtime and said by `drop_inbound`.
         return;
     }
     if crate::transport::peer_bundle_frame::is_peer_bundle_frame(&data) {
@@ -13616,8 +13851,12 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
         // on a scoped or A/V link this node answers `off`, whatever its class.
         let (_, plane) = resolve_inbound_link(ctx, &link_id).await;
         let ours = if shaping_applies_to(plane) {
+            // The peer the handshake attributed the link to, when known: a
+            // layer neighbour is offered shaping under any scope and draws on
+            // the reserve (CIRISEdge v44, CC 5.4.6 item 4).
+            let peer = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
             ctx.shapers
-                .offer_for(link, link_channel_mdu(ctx.node, &link_id))
+                .offer_for(link, link_channel_mdu(ctx.node, &link_id), peer.as_deref())
         } else {
             ctx.shapers.offer_off_for(link)
         };
@@ -13676,6 +13915,107 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
             );
         }
         Err(e) => shaping_teardown(ctx, link_id, &e).await,
+    }
+}
+
+/// CC 5.4.6 — the shaped link to the node whose identity destination is
+/// `dest`, if this node holds one (a link it dialled to `dest`, or a link
+/// attributed to the peer announced at `dest`).
+async fn shaped_link_to_dest(ctx: &EventCtx<'_>, dest: [u8; 16]) -> Option<LinkId> {
+    let dialled: Vec<LinkId> = ctx
+        .dialed_link_dest
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, d)| d.into_bytes() == dest)
+        .map(|(l, _)| *l)
+        .collect();
+    if let Some(l) = dialled
+        .into_iter()
+        .find(|l| ctx.shapers.is_shaped(l.into_bytes()))
+    {
+        return Some(l);
+    }
+    let key_ids: Vec<String> = ctx
+        .peers
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, p)| p.peer.dest_hash.into_bytes() == dest)
+        .map(|(k, _)| k.clone())
+        .collect();
+    if key_ids.is_empty() {
+        return None;
+    }
+    ctx.link_to_peer_key_id
+        .lock()
+        .await
+        .iter()
+        .find(|(l, k)| key_ids.contains(k) && ctx.shapers.is_shaped(l.into_bytes()))
+        .map(|(l, _)| *l)
+}
+
+/// CC 5.4.6 — one inbound onion frame: the runtime decides (dormant, an
+/// unshaped link, a replay, ... refused by token before or after the peel);
+/// a forward waits out its delay and leaves on the next hop's SHAPED link
+/// only; a final hop's publication waits for persist's exit door.
+async fn handle_onion_frame(ctx: &EventCtx<'_>, link_id: LinkId, data: &[u8]) {
+    use crate::onion::relay::RelayAction;
+    use crate::onion::tokens;
+    let shaped = ctx.shapers.is_shaped(link_id.into_bytes());
+    let now = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+    let period = crate::transport::onion_layers::period_of(now);
+    let body = &data[crate::onion::relay::ONION_FRAME_MAGIC.len()..];
+    match ctx.onion.accept_inbound(body, shaped, period) {
+        Err(token) => drop_inbound(
+            Some(link_id),
+            token,
+            "an onion frame refused by the Anonymous Tier (CC 5.4.6)",
+        ),
+        Ok(RelayAction::Forward {
+            next_dest,
+            delay,
+            packet,
+            hold,
+        }) => {
+            let Some(next) = shaped_link_to_dest(ctx, next_dest).await else {
+                ctx.onion.count(tokens::NEXT_HOP_UNROUTABLE);
+                drop_inbound(
+                    Some(link_id),
+                    tokens::NEXT_HOP_UNROUTABLE,
+                    "no shaped link to the onion packet's next hop (CC 5.4.6)",
+                );
+                return;
+            };
+            let Some(shaper) = ctx.shapers.get(next.into_bytes()) else {
+                ctx.onion.count(tokens::NEXT_HOP_UNROUTABLE);
+                return;
+            };
+            let onion = Arc::clone(ctx.onion);
+            tokio::spawn(async move {
+                let _hold = hold;
+                tokio::time::sleep(delay).await;
+                let frame = crate::onion::relay::onion_frame(&packet);
+                let cap =
+                    crate::transport::link_shaping::body_capacity(shaper.agreement().frame_bytes);
+                let sent = crate::transport::frame_fragment::fragment(&frame, cap)
+                    .is_some_and(|f| shaper.enqueue(f).is_ok());
+                onion.count(if sent {
+                    tokens::FORWARDED
+                } else {
+                    tokens::NEXT_HOP_UNROUTABLE
+                });
+            });
+        }
+        Ok(RelayAction::Store { payload }) => ctx.onion.push_exit(payload),
+        Ok(RelayAction::Mailbox { .. }) => {
+            ctx.onion.count(tokens::EXIT_PENDING_PERSIST);
+            drop_inbound(
+                Some(link_id),
+                tokens::EXIT_PENDING_PERSIST,
+                "a rendezvous mailbox deposit; persist has no mailbox door yet (CIRISPersist#1149)",
+            );
+        }
     }
 }
 

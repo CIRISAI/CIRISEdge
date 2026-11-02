@@ -474,6 +474,10 @@ pub use ffi::uniffi_types::{
     EdgeTransportHandle, EdgeTransportHealth, EdgeTransportInfo, EdgeTransportSpec,
     EdgeTransportStats, EdgeTunnelInfo,
 };
+#[cfg(feature = "ffi-uniffi")]
+pub use ffi::uniffi_types::{
+    EdgeDeviceState, EdgeOnionStatus, EdgeShapingClassInfo, EdgeShapingStatus,
+};
 
 // UDL function bodies live in `ffi::uniffi_impl` — re-exported here
 // under their UDL names. The scaffolding's marshalling shells look up
@@ -512,6 +516,10 @@ pub use ffi::uniffi_impl_routing::{
     routing_path_drop_via, routing_path_request, routing_path_table, routing_path_to,
     routing_rate_table, routing_reverse_table, routing_transport_id, routing_transport_uptime,
     routing_tunnels,
+};
+#[cfg(feature = "ffi-uniffi")]
+pub use ffi::uniffi_impl_shaping::{
+    onion_set_enabled, onion_status, shaping_class_table, shaping_set_device_state, shaping_status,
 };
 
 // The included scaffolding emits ~30 `#[unsafe(no_mangle)]` FFI shim

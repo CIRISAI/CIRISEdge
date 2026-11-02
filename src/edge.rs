@@ -4397,6 +4397,12 @@ impl Edge {
             .reticulum_transport
             .clone()
             .ok_or_else(|| missing("a Reticulum transport"))?;
+        // CC 5.4.3 rc16 — a peer in anonymous mode (its Anonymous Tier
+        // active) is confined to the row plane: no call, no stream.
+        if let Err(token) = transport.onion().media_allowed() {
+            transport.onion().count(token);
+            return Err(CallError::AnonymousMode);
+        }
         let lifecycle = self
             .scope_lifecycle
             .get()

@@ -145,6 +145,207 @@ pub struct ShapingPolicy {
     /// Close an identity link whose peer offers `off` (or no offer) instead
     /// of running it unshaped.
     pub require_shaped_links: bool,
+    /// Which identity links are offered the class: every one, or only this
+    /// node's onion layer links (CC 5.4.6 item 4: the tier's activation turns
+    /// shaping on for the layer links while the fleet default governs the
+    /// rest). See [`FLEET_DEFAULTS`] for which classes shape every link by
+    /// default.
+    pub scope: ShapingScope,
+    /// How many links' worth of the node cap is held back for onion layer
+    /// neighbours that do not yet have a shaped link (CIRISEdge v44): a
+    /// first-come link to anyone else cannot take the share a layer link
+    /// needs. Reserved only while layer peers are named
+    /// ([`LinkShapers::set_layer_peers`]), so a node that does not run the
+    /// tier reserves nothing.
+    pub layer_reserve_links: u32,
+}
+
+/// Which identity links a node offers shaping on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapingScope {
+    /// Every identity link (the fleet default for `server`, `home`,
+    /// `phone-wifi`).
+    AllIdentityLinks,
+    /// Only the onion layer links (the tier's own requirement, CC 5.4.6
+    /// item 4); every other link is offered `off`.
+    LayerLinksOnly,
+}
+
+/// **THE fleet-default table** (CC 5.4.3 rc16; Eric as steward, 2026-11-02,
+/// final): per budget class, whether shaping is on for EVERY identity link
+/// by default, and what that costs. Shaping is on by default for `server`
+/// only; `home`, `phone-wifi` and `phone-cellular` shape every link only when
+/// the person opts in ([`DeviceState::shaping_opt_in`]). Whatever the row
+/// says, a node running the Anonymous Tier shapes its layer links
+/// ([`ShapingScope::LayerLinksOnly`]). Changing a default is a one-line
+/// change here; the witness
+/// `the_fleet_default_is_on_for_server_only_and_opt_in_elsewhere` reads it.
+///
+/// The cost columns are what a client shows at the moment of choosing: a
+/// shaped link always runs at its class rate (cover fills what real traffic
+/// leaves), each way, so at the eight-link node cap a month (30 days) costs
+/// `rate × 8 × 2,592,000 s` each way (`docs/LINK_SHAPING_COST.md`).
+pub const FLEET_DEFAULTS: [FleetDefault; 4] = [
+    // class                         on by default   GB/month/link  GB/month at cap (each way)
+    FleetDefault {
+        class: BudgetClass::Server,
+        on_by_default: true,
+        gb_month_per_link_each_way: 18.1,
+        gb_month_at_cap_each_way: 145.2,
+    },
+    FleetDefault {
+        class: BudgetClass::Home,
+        on_by_default: false,
+        gb_month_per_link_each_way: 7.3,
+        gb_month_at_cap_each_way: 58.1,
+    },
+    FleetDefault {
+        class: BudgetClass::PhoneWifi,
+        on_by_default: false,
+        gb_month_per_link_each_way: 3.6,
+        gb_month_at_cap_each_way: 29.0,
+    },
+    FleetDefault {
+        class: BudgetClass::PhoneCellular,
+        on_by_default: false,
+        gb_month_per_link_each_way: 0.9,
+        gb_month_at_cap_each_way: 7.3,
+    },
+];
+
+/// One row of [`FLEET_DEFAULTS`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FleetDefault {
+    /// The class.
+    pub class: BudgetClass,
+    /// Shaping on every identity link without the person opting in.
+    pub on_by_default: bool,
+    /// One shaped link for a month, each way, in GB (10⁹ bytes).
+    pub gb_month_per_link_each_way: f64,
+    /// The eight-link cap for a month, each way, in GB.
+    pub gb_month_at_cap_each_way: f64,
+}
+
+/// The [`FLEET_DEFAULTS`] row for `class` (`None` for `off`).
+#[must_use]
+pub fn fleet_default_row(class: BudgetClass) -> Option<&'static FleetDefault> {
+    FLEET_DEFAULTS.iter().find(|r| r.class == class)
+}
+
+/// The default share of the node cap held for layer neighbours: half of the
+/// eight links' worth.
+pub const DEFAULT_LAYER_RESERVE_LINKS: u32 = 4;
+
+/// How many links' worth of the class budget the node cap is (CC 5.4.3).
+pub const NODE_CAP_LINKS: u32 = 8;
+
+/// What kind of device a node runs on, for its shaping class and its relay
+/// policy (CC 5.4.3 classes; CC 5.4.6 item 1 device policy;
+/// FSD/CIRIS_MESH.md §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    /// A server or a serve seat.
+    Server,
+    /// A home node (an always-on machine on a home uplink).
+    Home,
+    /// A phone: its class follows the network it is on.
+    Phone,
+}
+
+impl DeviceKind {
+    /// Parse a host token.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "server" => Some(Self::Server),
+            "home" | "desktop" => Some(Self::Home),
+            "phone" | "mobile" => Some(Self::Phone),
+            _ => None,
+        }
+    }
+
+    /// The stable token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Home => "home",
+            Self::Phone => "phone",
+        }
+    }
+
+    /// The kind a build assumes before its host says otherwise: a phone on
+    /// iOS and Android, else a home node (the cheaper of the two always-on
+    /// classes; a server host names itself).
+    #[must_use]
+    pub const fn platform_default() -> Self {
+        if cfg!(any(target_os = "ios", target_os = "android")) {
+            Self::Phone
+        } else {
+            Self::Home
+        }
+    }
+}
+
+/// The device facts a host reports (the mobile/UniFFI surface,
+/// `shaping_set_device_state`). They change at runtime: Wi-Fi ↔ cellular,
+/// plugged in ↔ on battery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // four independent host facts, each named
+pub struct DeviceState {
+    /// The device kind.
+    pub kind: DeviceKind,
+    /// On an unmetered network (Wi-Fi, Ethernet). A phone that is not is on
+    /// cellular. Ignored for servers and home nodes.
+    pub unmetered: bool,
+    /// On external power.
+    pub charging: bool,
+    /// The person opted into shaping every identity link at their class
+    /// (`home`, `phone-wifi`, `phone-cellular` are opt-in; [`FLEET_DEFAULTS`]).
+    /// A person's choice, not a network fact: it is kept when the device moves
+    /// between Wi-Fi and cellular ([`Self::with_network`]).
+    pub shaping_opt_in: bool,
+    /// The user's relay override, either way (CC 5.4.6 item 1: "the user MAY
+    /// override the policy either way"). `None` follows the device policy.
+    pub relay_override: Option<bool>,
+}
+
+impl DeviceState {
+    /// A device of `kind` in its usual state (unmetered, powered, no
+    /// overrides). A phone's real state comes from its host.
+    #[must_use]
+    pub const fn of(kind: DeviceKind) -> Self {
+        Self {
+            kind,
+            unmetered: true,
+            charging: true,
+            shaping_opt_in: false,
+            relay_override: None,
+        }
+    }
+
+    /// The same device after a network or power change: the person's
+    /// opt-in and relay override are kept, whatever class the move lands on.
+    #[must_use]
+    pub const fn with_network(self, unmetered: bool, charging: bool) -> Self {
+        Self {
+            unmetered,
+            charging,
+            ..self
+        }
+    }
+
+    /// The budget class the device offers (CC 5.4.3): a server's and a home
+    /// node's own; a phone's follows its network.
+    #[must_use]
+    pub const fn budget_class(&self) -> BudgetClass {
+        match self.kind {
+            DeviceKind::Server => BudgetClass::Server,
+            DeviceKind::Home => BudgetClass::Home,
+            DeviceKind::Phone if self.unmetered => BudgetClass::PhoneWifi,
+            DeviceKind::Phone => BudgetClass::PhoneCellular,
+        }
+    }
 }
 
 impl Default for ShapingPolicy {
@@ -174,15 +375,55 @@ impl ShapingPolicy {
             bytes_per_s,
             rho: 0.5,
             window,
-            node_cap_bytes_per_s: bytes_per_s.saturating_mul(8),
+            node_cap_bytes_per_s: bytes_per_s.saturating_mul(NODE_CAP_LINKS),
             require_shaped_links: false,
+            scope: ShapingScope::AllIdentityLinks,
+            layer_reserve_links: DEFAULT_LAYER_RESERVE_LINKS,
         }
     }
 
-    /// Whether this node offers shaping at all.
+    /// **The fleet default for `class`** ([`FLEET_DEFAULTS`]): every identity
+    /// link when the class is on by default, else the layer links only (so a
+    /// node running the tier still shapes them). `off` stays off.
+    #[must_use]
+    pub fn fleet_default(class: BudgetClass) -> Self {
+        let mut p = Self::for_class(class);
+        if !fleet_default_row(class).is_some_and(|r| r.on_by_default) {
+            p.scope = ShapingScope::LayerLinksOnly;
+        }
+        p
+    }
+
+    /// The fleet default for a device in its current state, widened to every
+    /// identity link when the person opted in (any class, cellular included).
+    #[must_use]
+    pub fn for_device(d: &DeviceState) -> Self {
+        let mut p = Self::fleet_default(d.budget_class());
+        if d.shaping_opt_in {
+            p.scope = ShapingScope::AllIdentityLinks;
+        }
+        p
+    }
+
+    /// Whether this node offers shaping at all (on some link).
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.class != BudgetClass::Off && self.bytes_per_s > 0
+    }
+
+    /// Whether a link is offered this node's class: a layer link whenever
+    /// shaping is enabled, any other identity link only under
+    /// [`ShapingScope::AllIdentityLinks`].
+    #[must_use]
+    pub fn offers_on(&self, layer_link: bool) -> bool {
+        self.enabled() && (layer_link || self.scope == ShapingScope::AllIdentityLinks)
+    }
+
+    /// Bytes one shaped link costs each way over a 30-day month at the
+    /// class rate (cover and real together: a shaped link always runs at λ).
+    #[must_use]
+    pub fn monthly_bytes_per_link(&self) -> u64 {
+        u64::from(self.bytes_per_s) * 30 * 86_400
     }
 }
 
@@ -324,6 +565,23 @@ pub struct Agreement {
 }
 
 impl Agreement {
+    /// CC 5.4.3 rc16 **two planes** — the most real frames one message may
+    /// take on this link: the real-frame budget of one window,
+    /// `ceil(ρ·λ·W)` (and never more than the queue holds). A message within
+    /// it is a row (a post, a message, a reaction, a small image) and rides
+    /// the shaped row plane; one beyond it is bulk and is refused at the
+    /// shaper by name ([`ShapingError::BulkBeyondReach`]): bulk and live
+    /// media ride unshaped links of their own and make no shaping claim.
+    /// (The queue's own bound is a separate, retryable refusal.)
+    #[must_use]
+    pub fn reach_frames(&self) -> usize {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let r = (self.rho * self.lambda * self.window.as_secs_f64())
+            .ceil()
+            .max(1.0) as usize;
+        r
+    }
+
     /// Bytes per second this agreement costs each way.
     #[must_use]
     pub fn bytes_per_s(&self) -> u32 {
@@ -378,6 +636,10 @@ pub enum ShapingError {
     /// A body larger than the shaped frame carries.
     #[error("a {0}-byte body does not fit a {1}-byte shaped frame")]
     BodyTooLarge(usize, usize),
+    /// A message of more frames than the link's real-frame budget for one
+    /// window: bulk, which never rides the shaped row plane.
+    #[error("a {0}-frame message is beyond the shaped link's reach of {1} frames (bulk rides an unshaped link)")]
+    BulkBeyondReach(usize, usize),
 }
 
 impl ShapingError {
@@ -392,6 +654,7 @@ impl ShapingError {
             Self::UnshapedPeer => o::LINK_SHAPING_REFUSED_UNSHAPED_PEER,
             Self::WrongKind(_) => o::LINK_SHAPING_DROPPED_WRONG_KIND,
             Self::QueueFull(_) => o::LINK_SHAPING_QUEUE_DEFERRED,
+            Self::BulkBeyondReach(..) => o::LINK_SHAPING_BULK_REFUSED,
         }
     }
 }
@@ -605,6 +868,10 @@ impl LinkShaper {
     /// # Errors
     /// [`ShapingError::QueueFull`] (the caller defers), [`ShapingError::BodyTooLarge`].
     pub fn enqueue(&self, bodies: Vec<Vec<u8>>) -> Result<(), ShapingError> {
+        let reach = self.agreement.reach_frames();
+        if bodies.len() > reach {
+            return Err(ShapingError::BulkBeyondReach(bodies.len(), reach));
+        }
         let cap = body_capacity(self.agreement.frame_bytes);
         if let Some(b) = bodies.iter().find(|b| b.len() > cap) {
             return Err(ShapingError::BodyTooLarge(
@@ -690,7 +957,15 @@ impl LinkShaper {
 /// The node's shaped links and its node-wide cap.
 #[derive(Debug)]
 pub struct LinkShapers {
-    policy: ShapingPolicy,
+    /// The policy in force; replaced at runtime by [`Self::set_policy`] (a
+    /// phone moving between Wi-Fi and cellular, or plugging in).
+    policy: std::sync::RwLock<ShapingPolicy>,
+    /// This node's onion layer neighbours by key id (empty unless the node
+    /// runs the Anonymous Tier): their links are offered shaping under any
+    /// scope and draw on the reserve.
+    layer_peers: Mutex<std::collections::HashSet<String>>,
+    /// The peer each offered or shaped link goes to, when known.
+    link_peer: Mutex<HashMap<[u8; 16], String>>,
     links: Mutex<HashMap<[u8; 16], Arc<LinkShaper>>>,
     /// Links this node sent an offer on, with that offer.
     offered: Mutex<HashMap<[u8; 16], ShapingOffer>>,
@@ -707,7 +982,9 @@ impl LinkShapers {
     #[must_use]
     pub fn new(policy: ShapingPolicy) -> Self {
         Self {
-            policy,
+            policy: std::sync::RwLock::new(policy),
+            layer_peers: Mutex::new(std::collections::HashSet::new()),
+            link_peer: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
             offered: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -715,10 +992,118 @@ impl LinkShapers {
         }
     }
 
-    /// The policy in force.
+    /// The policy in force (a snapshot: it may change at runtime).
     #[must_use]
-    pub fn policy(&self) -> &ShapingPolicy {
-        &self.policy
+    pub fn policy(&self) -> ShapingPolicy {
+        self.policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the policy at runtime. A shaped link the new policy can no
+    /// longer carry (its agreed rate is above the new per-link rate, shaping
+    /// is now off, or the link is no longer offered under the new scope) is
+    /// stopped and forgotten here and returned for the caller to CLOSE: a
+    /// link is never left half-shaped, and a closed link is redialled and
+    /// renegotiated under the new policy. A link that still fits keeps its
+    /// agreement (an upgrade applies to links offered from now on).
+    pub fn set_policy(&self, policy: ShapingPolicy) -> Vec<[u8; 16]> {
+        let layer = self.layer_peer_set();
+        let peers = self.link_peer_map();
+        let mut close = Vec::new();
+        {
+            let mut links = self.links();
+            links.retain(|link, shaper| {
+                let is_layer = peers.get(link).is_some_and(|p| layer.contains(p));
+                let keep = policy.offers_on(is_layer)
+                    && shaper.agreement().bytes_per_s() <= policy.bytes_per_s.saturating_add(1);
+                if !keep {
+                    shaper.stop();
+                    close.push(*link);
+                }
+                keep
+            });
+        }
+        for link in &close {
+            self.offered().remove(link);
+            self.pending().remove(link);
+            self.link_peer().remove(link);
+        }
+        *self
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+        close
+    }
+
+    /// Name this node's onion layer neighbours (empty: the tier is not
+    /// running here, and nothing is reserved).
+    pub fn set_layer_peers(&self, peers: std::collections::HashSet<String>) {
+        *self
+            .layer_peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = peers;
+    }
+
+    fn layer_peer_set(&self) -> std::collections::HashSet<String> {
+        self.layer_peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn link_peer(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], String>> {
+        self.link_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn link_peer_map(&self) -> HashMap<[u8; 16], String> {
+        self.link_peer().clone()
+    }
+
+    /// Whether `peer` is one of this node's layer neighbours.
+    #[must_use]
+    pub fn is_layer_peer(&self, peer: Option<&str>) -> bool {
+        peer.is_some_and(|p| {
+            self.layer_peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(p)
+        })
+    }
+
+    /// Whether this node offers shaping on a link to `peer` at all (the
+    /// dialler sends no offer when it does not).
+    #[must_use]
+    pub fn offers_to(&self, peer: Option<&str>) -> bool {
+        self.policy().offers_on(self.is_layer_peer(peer))
+    }
+
+    /// Bytes/s of the node cap held back for layer neighbours that have no
+    /// shaped link yet: `min(layer_reserve_links, unshaped layer peers) ×
+    /// the class rate`.
+    #[must_use]
+    pub fn layer_reserve(&self) -> u32 {
+        let policy = self.policy();
+        let layer = self.layer_peer_set();
+        if layer.is_empty() {
+            return 0;
+        }
+        let shaped_peers: std::collections::HashSet<String> = {
+            let links = self.links();
+            self.link_peer()
+                .iter()
+                .filter(|(l, _)| links.contains_key(*l))
+                .map(|(_, p)| p.clone())
+                .collect()
+        };
+        let waiting = layer.iter().filter(|p| !shaped_peers.contains(*p)).count();
+        let n = u32::try_from(waiting)
+            .unwrap_or(u32::MAX)
+            .min(policy.layer_reserve_links);
+        n.saturating_mul(policy.bytes_per_s)
     }
 
     fn links(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], Arc<LinkShaper>>> {
@@ -771,13 +1156,36 @@ impl LinkShapers {
             .values()
             .map(|s| s.agreement.bytes_per_s())
             .fold(0u32, u32::saturating_add);
-        self.policy.node_cap_bytes_per_s.saturating_sub(used)
+        self.policy().node_cap_bytes_per_s.saturating_sub(used)
     }
 
-    /// This node's offer for `link` (recorded as sent).
+    /// This node's offer for `link` to `peer` (recorded as sent). A layer
+    /// neighbour's link is offered under any scope and may use the whole
+    /// remaining cap; any other link is offered only under
+    /// [`ShapingScope::AllIdentityLinks`] and only what is left after the
+    /// layer reserve ([`Self::layer_reserve`]).
     #[must_use]
-    pub fn offer_for(&self, link: [u8; 16], frame_bytes: usize) -> ShapingOffer {
-        let offer = ShapingOffer::from_policy(&self.policy, frame_bytes, self.remaining_cap());
+    pub fn offer_for(
+        &self,
+        link: [u8; 16],
+        frame_bytes: usize,
+        peer: Option<&str>,
+    ) -> ShapingOffer {
+        let policy = self.policy();
+        let layer = self.is_layer_peer(peer);
+        let offer = if policy.offers_on(layer) {
+            let room = if layer {
+                self.remaining_cap()
+            } else {
+                self.remaining_cap().saturating_sub(self.layer_reserve())
+            };
+            ShapingOffer::from_policy(&policy, frame_bytes, room)
+        } else {
+            ShapingOffer::off()
+        };
+        if let Some(p) = peer {
+            self.link_peer().insert(link, p.to_owned());
+        }
         self.offered().insert(link, offer);
         offer
     }
@@ -813,7 +1221,7 @@ impl LinkShapers {
                 self.links().insert(link, Arc::clone(&shaper));
                 Ok(Some(shaper))
             }
-            None if self.policy.require_shaped_links && ours.class != BudgetClass::Off => {
+            None if self.policy().require_shaped_links && ours.class != BudgetClass::Off => {
                 Err(ShapingError::UnshapedPeer)
             }
             None => Ok(None),
@@ -855,6 +1263,7 @@ impl LinkShapers {
         }
         self.offered().remove(link);
         self.pending().remove(link);
+        self.link_peer().remove(link);
     }
 
     /// Shaped links now.
@@ -876,6 +1285,8 @@ mod tests {
             window: Duration::from_secs(u64::from(w)),
             node_cap_bytes_per_s: u32::MAX,
             require_shaped_links: false,
+            scope: ShapingScope::AllIdentityLinks,
+            layer_reserve_links: DEFAULT_LAYER_RESERVE_LINKS,
         };
         ShapingOffer::from_policy(&p, usize::from(frame), u32::MAX)
     }
@@ -927,7 +1338,7 @@ mod tests {
     fn a_half_shaped_link_is_unshaped_or_refused_by_policy() {
         let link = [7u8; 16];
         let lenient = LinkShapers::new(ShapingPolicy::for_class(BudgetClass::Home));
-        let _ = lenient.offer_for(link, 400);
+        let _ = lenient.offer_for(link, 400, None);
         assert!(lenient
             .peer_offer(link, &ShapingOffer::off())
             .unwrap()
@@ -936,14 +1347,14 @@ mod tests {
         let mut strict_policy = ShapingPolicy::for_class(BudgetClass::Home);
         strict_policy.require_shaped_links = true;
         let strict = LinkShapers::new(strict_policy);
-        let _ = strict.offer_for(link, 400);
+        let _ = strict.offer_for(link, 400, None);
         assert!(matches!(
             strict.peer_offer(link, &ShapingOffer::off()),
             Err(ShapingError::UnshapedPeer)
         ));
         // A node that offers nothing never refuses: it is the one that is off.
         let off = LinkShapers::new(ShapingPolicy::default());
-        let o = off.offer_for(link, 400);
+        let o = off.offer_for(link, 400, None);
         assert_eq!(o.class, BudgetClass::Off);
         assert!(off
             .peer_offer(link, &offer(BudgetClass::Home, 400, 2800, 0.5, 600))
@@ -957,13 +1368,13 @@ mod tests {
         p.node_cap_bytes_per_s = 4000;
         let t = LinkShapers::new(p);
         let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
-        let o1 = t.offer_for([1u8; 16], 400);
+        let o1 = t.offer_for([1u8; 16], 400, None);
         assert_eq!(o1.rate_milli, 7000, "2800 B/s at 400 B");
         t.peer_offer([1u8; 16], &peer).unwrap().expect("shaped");
-        let o2 = t.offer_for([2u8; 16], 400);
+        let o2 = t.offer_for([2u8; 16], 400, None);
         assert_eq!(o2.rate_milli, 3000, "1200 B/s left under the cap");
         t.peer_offer([2u8; 16], &peer).unwrap().expect("shaped");
-        let o3 = t.offer_for([3u8; 16], 400);
+        let o3 = t.offer_for([3u8; 16], 400, None);
         assert_eq!(
             o3.class,
             BudgetClass::Off,
@@ -1031,5 +1442,241 @@ mod tests {
         ));
         s.stop();
         assert!(matches!(s.next_emission().await, Emission::Stopped));
+    }
+
+    fn peer_offer_at(class: BudgetClass) -> ShapingOffer {
+        offer(class, 400, class.default_bytes_per_s(), 0.5, 600)
+    }
+
+    /// Eric's fleet default (2026-11-02, final): shaping ON by default for
+    /// `server` only; `home`, `phone-wifi` and `phone-cellular` shape every
+    /// link only when the person opts in; every class shapes its layer links.
+    /// The CC 5.4.3 table's values ride with each class, and the cost
+    /// columns match the rate.
+    #[test]
+    fn the_fleet_default_is_on_for_server_only_and_opt_in_elsewhere() {
+        for (kind, unmetered, class, general) in [
+            (DeviceKind::Server, true, BudgetClass::Server, true),
+            (DeviceKind::Home, true, BudgetClass::Home, false),
+            (DeviceKind::Phone, true, BudgetClass::PhoneWifi, false),
+            (DeviceKind::Phone, false, BudgetClass::PhoneCellular, false),
+        ] {
+            let mut d = DeviceState::of(kind);
+            d.unmetered = unmetered;
+            let p = ShapingPolicy::for_device(&d);
+            assert_eq!(p.class, class);
+            assert!(p.enabled());
+            assert_eq!(
+                p.offers_on(false),
+                general,
+                "{class:?} general links by default"
+            );
+            assert!(p.offers_on(true), "{class:?} always shapes its layer links");
+            assert!((p.rho - 0.5).abs() < 1e-9);
+            let w = if class == BudgetClass::PhoneCellular {
+                3600
+            } else {
+                600
+            };
+            assert_eq!(p.window, Duration::from_secs(w));
+            assert_eq!(p.node_cap_bytes_per_s, class.default_bytes_per_s() * 8);
+            let t = LinkShapers::new(p);
+            let o = t.offer_for([1u8; 16], 400, Some("stranger"));
+            assert_eq!(o.class == BudgetClass::Off, !general, "{class:?}");
+            // The person opts in: every class, cellular included, shapes all.
+            d.shaping_opt_in = true;
+            assert!(
+                ShapingPolicy::for_device(&d).offers_on(false),
+                "{class:?} opted in"
+            );
+            // The table's cost columns follow the rate (within rounding).
+            let row = fleet_default_row(class).expect("a row per class");
+            #[allow(clippy::cast_precision_loss)]
+            let per_link = ShapingPolicy::for_class(class).monthly_bytes_per_link() as f64 / 1e9;
+            assert!(
+                (row.gb_month_per_link_each_way - per_link).abs() < 0.06,
+                "{class:?}"
+            );
+            assert!(
+                (row.gb_month_at_cap_each_way - per_link * 8.0).abs() < 0.1,
+                "{class:?}"
+            );
+        }
+        assert_eq!(
+            FLEET_DEFAULTS
+                .iter()
+                .filter(|r| r.on_by_default)
+                .map(|r| r.class)
+                .collect::<Vec<_>>(),
+            vec![BudgetClass::Server]
+        );
+        assert!(!ShapingPolicy::fleet_default(BudgetClass::Off).enabled());
+        // The library default stays off: a host names its class.
+        assert!(!ShapingPolicy::default().enabled());
+        assert_eq!(
+            ShapingPolicy::for_class(BudgetClass::Server).monthly_bytes_per_link(),
+            18_144_000_000
+        );
+        assert_eq!(
+            ShapingPolicy::for_class(BudgetClass::PhoneCellular).monthly_bytes_per_link(),
+            907_200_000
+        );
+    }
+
+    /// The policy changes at runtime. A person who opted in on Wi-Fi moves
+    /// to cellular: the opt-in is kept (cellular is opted in too, Eric
+    /// 2026-11-02), and links whose agreed rate is above the cellular rate
+    /// close (to be redialled under the new class, never half-shaped) while a
+    /// link already at the cellular rate stays. A person who did NOT opt in
+    /// keeps only the layer link. Shaping off closes everything.
+    #[test]
+    fn a_class_change_at_runtime_keeps_the_opt_in_and_closes_what_no_longer_fits() {
+        let mut wifi = DeviceState::of(DeviceKind::Phone);
+        wifi.charging = false;
+        wifi.shaping_opt_in = true;
+        let cell_peer = peer_offer_at(BudgetClass::PhoneCellular);
+        let build = |d: &DeviceState| {
+            let t = LinkShapers::new(ShapingPolicy::for_device(d));
+            t.set_layer_peers(["relay-a".to_owned()].into_iter().collect());
+            let _ = t.offer_for([1u8; 16], 400, Some("friend"));
+            t.peer_offer([1u8; 16], &cell_peer)
+                .unwrap()
+                .expect("shaped");
+            let _ = t.offer_for([2u8; 16], 400, Some("relay-a"));
+            t.peer_offer([2u8; 16], &cell_peer)
+                .unwrap()
+                .expect("shaped");
+            let _ = t.offer_for([3u8; 16], 400, Some("other"));
+            t.peer_offer([3u8; 16], &peer_offer_at(BudgetClass::Server))
+                .unwrap()
+                .expect("shaped");
+            assert_eq!(t.shaped_count(), 3);
+            t
+        };
+        let t = build(&wifi);
+        let cell = wifi.with_network(false, false);
+        assert!(
+            cell.shaping_opt_in,
+            "a network change keeps the person's choice"
+        );
+        let closed = t.set_policy(ShapingPolicy::for_device(&cell));
+        assert_eq!(
+            closed,
+            vec![[3u8; 16]],
+            "only the link above the cellular rate closes"
+        );
+        assert!(t.is_shaped([1u8; 16]) && t.is_shaped([2u8; 16]));
+        assert_eq!(t.policy().class, BudgetClass::PhoneCellular);
+        assert_eq!(
+            t.offer_for([4u8; 16], 400, Some("friend")).class,
+            BudgetClass::PhoneCellular,
+            "opted in on cellular: general links are still offered"
+        );
+        // Back on Wi-Fi: nothing closes, general links offered at the Wi-Fi class.
+        assert!(t.set_policy(ShapingPolicy::for_device(&wifi)).is_empty());
+        assert_eq!(
+            t.offer_for([5u8; 16], 400, Some("friend")).class,
+            BudgetClass::PhoneWifi
+        );
+
+        // Not opted in: the move to cellular leaves only the layer link.
+        let mut quiet = wifi;
+        quiet.shaping_opt_in = false;
+        let t = build(&DeviceState {
+            shaping_opt_in: true,
+            ..quiet
+        });
+        let mut closed = t.set_policy(ShapingPolicy::for_device(&quiet.with_network(false, false)));
+        closed.sort_unstable();
+        assert_eq!(closed, vec![[1u8; 16], [3u8; 16]]);
+        assert!(t.is_shaped([2u8; 16]), "the layer link stays shaped");
+        // Turning shaping off closes every shaped link.
+        assert_eq!(t.set_policy(ShapingPolicy::default()), vec![[2u8; 16]]);
+        assert_eq!(t.shaped_count(), 0);
+    }
+
+    /// CC 5.4.3 rc16 **two planes**: a shaped link carries rows, never bulk.
+    /// A message within one window's real-frame budget is queued; one beyond
+    /// it (a large blob) is refused by name and never queued, so a blob
+    /// cannot ride the shaped row plane. At the server class a row of up to
+    /// about 2 MB fits (ρ·rate·W = 0.5 × 7000 × 600 B).
+    #[test]
+    fn a_shaped_link_carries_rows_and_refuses_bulk_by_name() {
+        let ours = ShapingPolicy::for_class(BudgetClass::Server);
+        let t = LinkShapers::new(ours);
+        let _ = t.offer_for([1u8; 16], 1400, None);
+        let s = t
+            .peer_offer([1u8; 16], &offer(BudgetClass::Server, 1400, 7000, 0.5, 600))
+            .unwrap()
+            .expect("shaped");
+        let reach = s.agreement().reach_frames();
+        assert_eq!(reach, 1500, "0.5 × 5 frames/s × 600 s");
+        let body = body_capacity(1400);
+        assert!(reach * body > 2_000_000 && reach * body < 2_200_000);
+        s.enqueue(vec![vec![1u8; body]; 40])
+            .expect("a row (a small image) rides");
+        let e = s.enqueue(vec![vec![1u8; body]; reach + 1]).unwrap_err();
+        assert!(matches!(e, ShapingError::BulkBeyondReach(n, r) if n == reach + 1 && r == reach));
+        assert_eq!(e.label(), crate::observability::LINK_SHAPING_BULK_REFUSED);
+        assert_eq!(s.queued(), 40, "nothing of the bulk message was queued");
+    }
+
+    /// The cap is no longer first come, first served: with layer peers named,
+    /// their share of the eight links' worth is held back, so general links
+    /// stop at four and the layer neighbours still get shaped links; with no
+    /// layer peers (the tier not running) nothing is reserved.
+    #[test]
+    fn the_cap_reserves_room_for_layer_neighbours() {
+        let p = ShapingPolicy::for_class(BudgetClass::Home);
+        let peer = peer_offer_at(BudgetClass::Server);
+        // Not running the tier: eight general links fill the cap.
+        let t = LinkShapers::new(p.clone());
+        for i in 0..8u8 {
+            let o = t.offer_for([i; 16], 400, Some(&format!("g{i}")));
+            assert_ne!(o.class, BudgetClass::Off, "general link {i}");
+            t.peer_offer([i; 16], &peer).unwrap().expect("shaped");
+        }
+        assert_eq!(
+            t.offer_for([9u8; 16], 400, Some("g9")).class,
+            BudgetClass::Off
+        );
+
+        // Running it with six layer peers: four links' worth is held.
+        let t = LinkShapers::new(p);
+        t.set_layer_peers((0..6).map(|i| format!("L{i}")).collect());
+        assert_eq!(t.layer_reserve(), 4 * 2800);
+        let mut general = 0;
+        for i in 0..8u8 {
+            let o = t.offer_for([i; 16], 400, Some(&format!("g{i}")));
+            if o.class != BudgetClass::Off {
+                t.peer_offer([i; 16], &peer).unwrap().expect("shaped");
+                general += 1;
+            }
+        }
+        assert_eq!(general, 4, "general links stop at the reserve");
+        for i in 0..4u8 {
+            let link = [100 + i; 16];
+            let o = t.offer_for(link, 400, Some(&format!("L{i}")));
+            assert_ne!(
+                o.class,
+                BudgetClass::Off,
+                "layer link {i} gets its reserved share"
+            );
+            t.peer_offer(link, &peer).unwrap().expect("shaped");
+        }
+        assert_eq!(t.remaining_cap(), 0);
+        // Two layer peers still wait: their share stays held against any
+        // general link that frees room, never handed to a stranger.
+        assert_eq!(t.layer_reserve(), 2 * 2800);
+        t.forget(&[0u8; 16]);
+        assert_eq!(
+            t.offer_for([50u8; 16], 400, Some("g-late")).class,
+            BudgetClass::Off,
+            "a freed general slot goes to the waiting layer peers first"
+        );
+        assert_ne!(
+            t.offer_for([104u8; 16], 400, Some("L4")).class,
+            BudgetClass::Off
+        );
     }
 }

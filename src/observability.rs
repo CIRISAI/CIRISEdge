@@ -1089,6 +1089,10 @@ pub const LINK_SHAPING_COVER_RECEIVED: &str = "link_shaping_cover_received";
 pub const LINK_SHAPING_QUEUE_DEFERRED: &str = "link_shaping_queue_deferred";
 /// A shaped frame could not be sent; the link closed.
 pub const LINK_SHAPING_SEND_FAILED: &str = "link_shaping_send_failed";
+/// CC 5.4.3 rc16 two planes — a frame beyond a shaped link's real-frame
+/// budget for one window (bulk: a large blob) was refused from the row
+/// plane; bulk rides an unshaped link of its own and makes no shaping claim.
+pub const LINK_SHAPING_BULK_REFUSED: &str = "link_shaping_bulk_refused";
 /// A row the Attestation advertise's projection filter skipped (a `SelfOwn`
 /// row whose attester is not in this node's self-publish set, ...). Not a
 /// withhold: the row was not this node's to publish when it was read.

@@ -367,6 +367,11 @@ pub enum CallError {
     /// The transport, the addressing plane or the media runtime refused.
     #[error("call plumbing: {0}")]
     Plumbing(String),
+    /// CC 5.4.3 rc16 — this node is in anonymous mode (its Anonymous Tier is
+    /// active): a peer in anonymous mode is confined to the row plane, so it
+    /// starts and joins no call and no stream. Refused before anything starts.
+    #[error("this node is in anonymous mode: no call and no stream (onion_anonymous_no_media)")]
+    AnonymousMode,
 }
 
 /// Item 6 — a call row is its attendee's own: `actor` is its attester and its

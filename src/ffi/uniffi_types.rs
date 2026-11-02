@@ -416,3 +416,51 @@ pub struct EdgeLinkInfo {
     pub transport_kind: String,
     pub direction: EdgeLinkDirection,
 }
+
+// ─── v44 shaping + Anonymous Tier (CC 5.4.3 / 5.4.6) ───────────────
+
+/// The host's device facts (`shaping_set_device_state`).
+#[derive(Debug, Clone)]
+pub struct EdgeDeviceState {
+    pub device_kind: String,
+    pub unmetered: bool,
+    pub charging: bool,
+    pub shaping_opt_in: bool,
+    pub relay_override: Option<bool>,
+}
+
+/// The shaping policy in force (`shaping_status`).
+#[derive(Debug, Clone)]
+pub struct EdgeShapingStatus {
+    pub budget_class: String,
+    pub all_links: bool,
+    pub bytes_per_s: u32,
+    pub node_cap_bytes_per_s: u32,
+    pub shaped_links: u32,
+    pub layer_reserve_links: u32,
+}
+
+/// One row of the fleet-default table (`shaping_class_table`).
+#[derive(Debug, Clone)]
+pub struct EdgeShapingClassInfo {
+    pub budget_class: String,
+    pub on_by_default: bool,
+    pub bytes_per_s: u32,
+    pub gb_month_per_link_each_way: f64,
+    pub gb_month_at_cap_each_way: f64,
+}
+
+/// The Anonymous Tier on this node (`onion_status`), counts only.
+#[derive(Debug, Clone)]
+pub struct EdgeOnionStatus {
+    pub enabled: bool,
+    pub active: bool,
+    pub reason: Option<String>,
+    pub dealt: Vec<u32>,
+    pub answering: Vec<u32>,
+    pub relaying: bool,
+    pub relay_reason: Option<String>,
+    pub small_set: bool,
+    pub hop_key_source: String,
+    pub confines_media: bool,
+}

@@ -585,6 +585,16 @@ openmls                  = { version = "0.8.1", default-features = false }
 # silently resolve crates.io 0.3.1 and keep libcrux-kem 0.0.7.
 openmls_libcrux_crypto   = { git = "https://github.com/CIRISAI/openmls", tag = "openmls_libcrux_crypto-v0.3.1+ciris.1", version = "0.3.1" }
 openmls_basic_credential = { version = "0.5.0", features = ["clonable"] }
+# CC 5.4.6 item 3 (rc16) — the onion hop KEM is X-Wing AS THE DRAFT DEFINES IT
+# (draft-connolly-cfrg-xwing-kem-06, the SHA3-256 combiner), not the stack's
+# HKDF-combined X25519+ML-KEM. libcrux-kem 0.0.10 ships it (`XWingKemDraft06`)
+# and is already in the graph through the openmls fork above (#822), so naming
+# it here adds no crate; libcrux-sha3 is its own SHA3/SHAKE, used for the
+# combiner on the split-key path, the LIONESS body and the slot commitment
+# (src/onion/packet.rs, docs/onion_packet_wire.md). Exact pins: they move with
+# the openmls fork, never alone.
+libcrux-kem = { version = "=0.0.10" }
+libcrux-sha3 = { version = "=0.0.11" }
 openmls_traits           = { version = "0.5.0" }
 tls_codec                = { version = "0.4.2", features = ["derive"] }
 
