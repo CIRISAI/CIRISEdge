@@ -222,11 +222,12 @@ impl Drop for OwnRuntime {
     }
 }
 
-/// A listens (the canonical); B is client-only, holds A's hybrid-signed route
+/// A listens (the canonical); B is client-only — `suspendable` as given (a
+/// phone sets it), holds A's hybrid-signed route
 /// (so it can seal to A and attribute A's frames), and replicates
 /// Attestations with A.
 #[allow(clippy::too_many_lines)]
-async fn pair(tag: &str) -> Pair {
+async fn pair(tag: &str, suspendable: bool) -> Pair {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "warn,ciris_edge=info".into()),
@@ -274,6 +275,7 @@ async fn pair(tag: &str) -> Pair {
                 },
             )];
             c.announce_interval = Duration::from_secs(5);
+            c.suspendable = suspendable;
             (c, auth(signer, &dir))
         }
     })
@@ -454,7 +456,7 @@ fn assert_quiet(r: &SuspendReport, what: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
     let _serial = SERIAL.lock().await;
-    let p = pair("mid").await;
+    let p = pair("mid", true).await;
     p.b_reaches_a(b"warm-up").await;
     assert!(p.b.link_count().await >= 1, "B holds a link to A");
 
@@ -551,7 +553,7 @@ async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_suspend_resume_cycles_do_not_grow() {
     let _serial = SERIAL.lock().await;
-    let p = pair("cycles").await;
+    let p = pair("cycles", true).await;
     p.b_reaches_a(b"cycle-0").await;
     let mut marks = Vec::new();
     for i in 1..=4u8 {
@@ -584,7 +586,7 @@ async fn repeated_suspend_resume_cycles_do_not_grow() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn suspend_returns_by_its_deadline_and_reports_the_listener() {
     let _serial = SERIAL.lock().await;
-    let p = pair("deadline").await;
+    let p = pair("deadline", true).await;
     p.b_reaches_a(b"open a link").await;
     p.a.delay_resource_ships_for_test(60_000);
     p.a.delay_channel_sends_for_test(60_000);
@@ -622,4 +624,37 @@ async fn suspend_returns_by_its_deadline_and_reports_the_listener() {
     p.a.delay_resource_ships_for_test(0);
     p.a.delay_channel_sends_for_test(0);
     p.a.resume().await.expect("resume A");
+}
+
+/// **Opt-in.** A node not built `suspendable` (the default) boots exactly as
+/// before — its TCP client goes through the builder — and a suspend still
+/// refuses sends, closes its links and parks its listener, but reports that
+/// client as open: `interfaces_open > 0`, `quiescent: false`, its connection
+/// to A still ESTABLISHED. Resume brings it back to sending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_default_node_boots_unchanged_and_reports_its_builder_client_open() {
+    let _serial = SERIAL.lock().await;
+    let p = pair("default", false).await;
+    p.b_reaches_a(b"default boot").await;
+    let r = p.b.suspend(Duration::from_secs(2)).await;
+    assert!(
+        r.interfaces_open > 0,
+        "the builder-attached client is reported open: {r:?}"
+    );
+    assert!(!r.quiescent, "never quiescent with a client open: {r:?}");
+    assert!(!r.listener_open, "B has no listener: {r:?}");
+    assert_eq!(r.links_open, 0, "the links are closed all the same: {r:?}");
+    assert_eq!(r.edge_tasks, 0, "the listener parked all the same: {r:?}");
+    assert!(
+        established_on(p.port_a) >= 2,
+        "the builder client's connection stays up: {}",
+        established_on(p.port_a)
+    );
+    let refused = p.b.send(&p.key_a.key_id, b"while suspended").await;
+    assert!(
+        matches!(refused, Err(TransportError::Suspended)),
+        "{refused:?}"
+    );
+    p.b.resume().await.expect("resume");
+    p.b_reaches_a(b"default resumed").await;
 }

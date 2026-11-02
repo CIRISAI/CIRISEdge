@@ -2000,6 +2000,16 @@ pub struct ReticulumTransportConfig {
     /// CC 5.4.3 — this node's link-shaping policy (`CLM-link-shaping`).
     /// Default `off`: nothing is offered and no link is shaped.
     pub shaping: crate::transport::link_shaping::ShapingPolicy,
+    /// Mobile-background lifecycle — opt in to a fully suspendable node
+    /// ([`crate::transport::lifecycle`]). `true` (a phone): TCP clients without
+    /// IFAC or a no-transit posture are attached at runtime, so
+    /// [`ReticulumTransport::suspend`] can detach them and close their
+    /// sockets; they send no tunnel-synthesize handshake (see the lifecycle
+    /// docs for what that costs). `false` (the default; every other node):
+    /// the boot path is unchanged — every client goes through the builder —
+    /// and `suspend` still refuses sends, closes links and parks the
+    /// listener, but reports those clients as open (`quiescent: false`).
+    pub suspendable: bool,
 }
 
 impl ReticulumTransportConfig {
@@ -2027,6 +2037,7 @@ impl ReticulumTransportConfig {
             ifac: None,
             direct_links: crate::transport::direct_path::DirectLinksConfig::default(),
             shaping: crate::transport::link_shaping::ShapingPolicy::default(),
+            suspendable: false,
         }
     }
 
@@ -2599,7 +2610,8 @@ pub struct ReticulumTransport {
     /// Mobile-background lifecycle (see [`crate::transport::lifecycle`]): the
     /// send gate, the listeners' park signal, and the counters suspend reads.
     lifecycle: Arc<crate::transport::lifecycle::Lifecycle>,
-    /// TCP clients edge attaches at runtime (not through the builder), so
+    /// With [`ReticulumTransportConfig::suspendable`] — TCP clients edge
+    /// attaches at runtime (not through the builder), so
     /// suspend can detach them: dropping a [`TcpClientHandle`] ends the
     /// client's reconnect loop at whatever await it is parked on and closes
     /// its socket. A config-loaded client has no such handle — removing it
@@ -3596,7 +3608,7 @@ impl ReticulumTransport {
                 ),
             });
             for peer in &config.bootstrap_peers {
-                if runtime_attachable(config.transit, config.ifac.as_ref()) {
+                if config.suspendable && runtime_attachable(config.transit, config.ifac.as_ref()) {
                     runtime_tcp_clients.push(*peer);
                 } else {
                     builder = apply_tcp_client_transit(
@@ -3626,7 +3638,7 @@ impl ReticulumTransport {
             for iface in &config.interfaces {
                 #[cfg(feature = "transport-reticulum-tcp-client")]
                 if let ReticulumInterfaceConfig::TcpClient(cfg) = iface {
-                    if runtime_attachable(cfg.transit, cfg.ifac.as_ref()) {
+                    if config.suspendable && runtime_attachable(cfg.transit, cfg.ifac.as_ref()) {
                         runtime_tcp_clients.push(cfg.target_addr);
                         interface_specs.push(RegisteredInterface {
                             handle: InterfaceHandle(interface_specs.len()),
