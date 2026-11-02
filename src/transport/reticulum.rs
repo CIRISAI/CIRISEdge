@@ -14955,6 +14955,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             reason,
             interface_in,
             hops,
+            ..
         } => {
             note_packet_dropped(
                 ctx.metrics,
