@@ -292,6 +292,14 @@ pub trait AvLinkSender: Send + Sync + 'static {
     /// layer above, which is exactly the defect leviculum#66 documents.
     async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError>;
 
+    /// ALM C5 — send one MEDIA chunk. A sender that can give it a deadline
+    /// does (leviculum's timed Channel frames, so a stale frame is never
+    /// retransmitted or delivered late); the default is [`Self::send`].
+    /// Control frames (binding parts, C3) always go through [`Self::send`].
+    async fn send_media(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+        self.send(bytes).await
+    }
+
     /// The most one message on this link carries, when the transport knows
     /// it. Control frames that span several messages (a call's stream key
     /// binding) are sized to it. `None` by default.
@@ -322,6 +330,7 @@ pub trait AvLinkReceiver: Send + Sync + 'static {
         Ok(InboundWireFrame {
             dropped_before: 0,
             bytes: self.recv().await?,
+            queued_at: None,
         })
     }
 }
@@ -335,6 +344,10 @@ pub struct InboundWireFrame {
     pub dropped_before: u64,
     /// The frame.
     pub bytes: Vec<u8>,
+    /// When the transport queued it (ALM C5: a consumer drops media older
+    /// than its budget by AGE, oldest first). `None` from a seam that does
+    /// not stamp.
+    pub queued_at: Option<std::time::Instant>,
 }
 
 /// Extra hop-counter values an open loop tries PAST the reported gap.
@@ -808,6 +821,34 @@ impl AvDispatcher {
         report
     }
 
+    /// ALM stage 2 — send one control frame (C3) to ONE subscriber's leg,
+    /// retrying brief backpressure, WITHOUT settling the leg (a C3 frame is
+    /// one small message, not a burst). `None` when `subscriber` has no leg.
+    pub async fn send_control_to(
+        &mut self,
+        subscriber: &PeerKeyId,
+        frame: &[u8],
+    ) -> Option<LegSend> {
+        const TRIES: u32 = 5;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+        let state = self.subscribers.get_mut(subscriber)?;
+        let mut tries = 0;
+        loop {
+            match state.sender.send(frame).await {
+                Ok(()) => return Some(LegSend::Sent),
+                Err(AvDispatcherError::Congested) if tries < TRIES => {
+                    tries += 1;
+                    tokio::time::sleep(PAUSE).await;
+                }
+                Err(AvDispatcherError::LinkGone(_)) => {
+                    self.subscribers.remove(subscriber);
+                    return Some(LegSend::Gone);
+                }
+                Err(e) => return Some(LegSend::Failed(e)),
+            }
+        }
+    }
+
     /// CIRISEdge#805 — mark `subscriber`'s leg SETTLING for
     /// [`CONTROL_SETTLE`]: the caller just sent it a control burst on the
     /// link directly (a call's binding on a fresh leg). Returns whether the
@@ -884,14 +925,14 @@ impl AvDispatcher {
             // its counter is spent — a nonce that might have been emitted is
             // never used twice.
             let wire = sealed.to_bytes();
-            let mut sent = state.sender.send(&wire).await;
+            let mut sent = state.sender.send_media(&wire).await;
             while matches!(sent, Err(AvDispatcherError::Congested))
                 && state
                     .settle_until
                     .is_some_and(|until| std::time::Instant::now() < until)
             {
                 tokio::time::sleep(SETTLE_RETRY).await;
-                sent = state.sender.send(&wire).await;
+                sent = state.sender.send_media(&wire).await;
             }
             if state
                 .settle_until
@@ -1424,6 +1465,7 @@ mod tests {
             tx.send(InboundWireFrame {
                 dropped_before,
                 bytes: wire(chunk_seq, link_seq),
+                queued_at: None,
             })
             .expect("feed");
         }
@@ -1483,6 +1525,7 @@ mod tests {
             tx.send(InboundWireFrame {
                 dropped_before,
                 bytes,
+                queued_at: None,
             })
             .expect("feed");
         }
@@ -1643,6 +1686,7 @@ mod tests {
             bytes: seal_av_outer(&inner(&dek, chunk_seq, 32), &[0x31; 32], link_id, link_seq)
                 .expect("outer")
                 .to_bytes(),
+            queued_at: None,
         }
     }
 

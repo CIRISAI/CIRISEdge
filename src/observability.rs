@@ -937,6 +937,78 @@ pub const AV_CALL_BINDING_REFUSED: &str = "av_call_binding_refused";
 /// CIRISEdge#805 item 6 — this attendee's call row was refused; the call
 /// stays live.
 pub const AV_CALL_RECORD_REFUSED: &str = "av_call_record_refused";
+
+// ─── ALM stage 2 — `EdgeMetrics::av_plane` labels ────────────────────
+
+/// leviculum#94 — a media frame sent with a deadline (a timed Channel frame).
+pub const AV_SENT_TIMED: &str = "av_sent_timed";
+/// leviculum#94 — this node's timed media frame passed its deadline
+/// unconfirmed (an expired marker went in its place).
+pub const AV_FRAME_EXPIRED_SENDER: &str = "av_frame_expired_sender";
+/// leviculum#94 — a peer's timed frame arrived as its expired marker.
+pub const AV_FRAME_EXPIRED_MARKED: &str = "av_frame_expired_marked";
+/// leviculum#94 — a peer's timed frame arrived past its time to live and was
+/// dropped, not delivered late.
+pub const AV_FRAME_EXPIRED_LATE: &str = "av_frame_expired_late";
+/// ALM C5 — a media frame older than its class budget dropped from the
+/// inbound queue by age (oldest first) before it was opened.
+pub const AV_FRAME_STALE_DROPPED: &str = "av_frame_stale_dropped";
+/// ALM C5 — a leg shed to the base layer after sustained congestion.
+pub const AV_LEG_SHED_TO_BASE: &str = "av_leg_shed_to_base";
+/// ALM C5 — a leg restored from the base layer after clean sends.
+pub const AV_LEG_RESTORED: &str = "av_leg_restored";
+/// ALM C3 — a control frame sent / received / refused as malformed.
+pub const ALM_C3_SENT: &str = "alm_c3_sent";
+/// ALM C3 — a control frame received and applied.
+pub const ALM_C3_RECEIVED: &str = "alm_c3_received";
+/// ALM C3 — a frame that read as C3 and did not decode.
+pub const ALM_C3_MALFORMED: &str = "alm_c3_malformed";
+/// ALM C3 — a peer said it speaks C3 (its `CAPS`).
+pub const ALM_C3_PEER_CAPABLE: &str = "alm_c3_peer_capable";
+/// ALM C2 — a subscribe admitted / refused at this node.
+pub const ALM_ADMIT: &str = "alm_admit";
+/// ALM C2 — a subscribe refused at this node (the token is counted too).
+pub const ALM_REFUSE: &str = "alm_refuse";
+/// ALM C2 — a subscriber shed by this node.
+pub const ALM_SHED: &str = "alm_shed";
+/// ALM — a chunk this node forwarded as an admitted media parent.
+pub const ALM_FORWARDED: &str = "alm_forwarded";
+/// ALM C4 — this node's primary parent for a stream changed.
+pub const ALM_PARENT_CHANGE: &str = "alm_parent_change";
+/// FSD CIRIS_MESH R2 — an identity link established through a roster relay.
+pub const ALM_RELAY_TIER_ROSTER: &str = "alm_relay_tier_roster";
+/// FSD CIRIS_MESH R2 — a roster relay's one attempt did not establish.
+pub const ALM_RELAY_TIER_ROSTER_FAILED: &str = "alm_relay_tier_roster_failed";
+/// FSD CIRIS_MESH R2 — no roster relay established: the default path (last
+/// tier) was dialled.
+pub const ALM_RELAY_TIER_DEFAULT: &str = "alm_relay_tier_default";
+/// `FSD/CIRIS_MESH.md` §7.4 — one `load_ledger` cost entry.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct LoadLedgerEntry {
+    /// What it is: a forwarded link id (hex), a stream, or a peer.
+    pub subject: String,
+    /// Bits/s.
+    pub bps: f64,
+    /// Packets/s.
+    pub pps: f64,
+}
+
+/// `FSD/CIRIS_MESH.md` §7.4 — the `load_ledger` metrics family: the top cost
+/// entries this node carries, so shedding never sheds blind.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct LoadLedger {
+    /// The service tier now (0, 1, 2).
+    pub tier: u8,
+    /// Total forwarded packets/s.
+    pub transit_pps: f64,
+    /// Total forwarded bits/s.
+    pub transit_bps: f64,
+    /// The costliest forwarded links, most packets/s first (top 10).
+    pub transit: Vec<LoadLedgerEntry>,
+    /// The ladder's token counters (`load_tier:*` and their causes).
+    pub counters: std::collections::BTreeMap<String, u64>,
+}
+
 // ─── CC 5.3.3.5 E1 — `EdgeMetrics::link_seal` labels ─────────────────
 //
 // Every RNS link carries the CC 3.3.6.2 hybrid transit KEX as its first frame

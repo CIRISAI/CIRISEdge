@@ -233,11 +233,20 @@ pub mod route_fetch;
 #[cfg(feature = "_reticulum-module")]
 pub mod link_shaping;
 
+/// ALM stage 2 — what the A/V controller reads off the Reticulum transport:
+/// per-link delivery telemetry, timed-frame expiries, learned relay routes.
+#[cfg(feature = "_reticulum-module")]
+pub mod alm_link;
 /// CIRISEdge#926 — the link stall guard: a link whose Channel lands nothing
 /// for a run of sends is never chosen again and is closed (or moved off a
 /// dead punched path).
 #[cfg(feature = "_reticulum-module")]
 pub mod link_stall;
+/// ALM stage 2 — the transport relay tier (`FSD/CIRIS_MESH.md` R2): roster
+/// relays before the canonical for a link that cannot be direct, and a
+/// relay's C2 admission of the links it forwards.
+#[cfg(feature = "_reticulum-module")]
+pub mod relay_tier;
 
 /// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
 /// live streams (`FSD/AV_CALL_API.md`).

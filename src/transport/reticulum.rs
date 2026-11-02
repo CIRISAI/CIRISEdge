@@ -1999,6 +1999,20 @@ pub struct ReticulumTransportConfig {
     /// CC 5.4.3 — this node's link-shaping policy (`CLM-link-shaping`).
     /// Default `off`: nothing is offered and no link is shaped.
     pub shaping: crate::transport::link_shaping::ShapingPolicy,
+    /// ALM stage 2 (`FSD/CIRIS_MESH.md` R2) — an identity dial to a peer
+    /// with no one-hop path tries ROSTER relays (relays the destination was
+    /// heard through whose node shares a room with this node or is a
+    /// consented contact) before the default path (in production, the
+    /// canonical). Default on: it only reorders paths that already exist.
+    pub steer_roster_relays: bool,
+    /// The establish budget per roster relay (one attempt each; edge owns
+    /// the failover to the next, then to the default path).
+    pub relay_establish_budget: Duration,
+    /// ALM stage 2 — a transport node's C2 admission of the links it
+    /// forwards for others (leviculum#93). Installed when
+    /// `enable_transport`; the default admits uncapped at tier 0 and closes
+    /// to new forwarded links at service tier ≥ 1 (§7.2 Admit-close).
+    pub forward_admission: crate::transport::relay_tier::ForwardAdmissionConfig,
 }
 
 impl ReticulumTransportConfig {
@@ -2026,6 +2040,9 @@ impl ReticulumTransportConfig {
             ifac: None,
             direct_links: crate::transport::direct_path::DirectLinksConfig::default(),
             shaping: crate::transport::link_shaping::ShapingPolicy::default(),
+            steer_roster_relays: true,
+            relay_establish_budget: Duration::from_secs(5),
+            forward_admission: crate::transport::relay_tier::ForwardAdmissionConfig::default(),
         }
     }
 
@@ -2926,6 +2943,20 @@ pub struct ReticulumTransport {
     /// knob, the per-peer state machine, the dials waiting on a proposal, the
     /// event broadcast and the anchored identity links.
     direct_paths: Arc<crate::transport::direct_path::DirectPaths>,
+    /// ALM stage 2 — per-link timed-frame expiries and learned relay routes
+    /// (written by the event loop, read by the call layer).
+    alm_links: Arc<crate::transport::alm_link::AlmLinkState>,
+    /// ALM stage 2 — this node's C2 admission of the links it forwards
+    /// (installed on the node when `enable_transport`).
+    forward_admission: Arc<crate::transport::relay_tier::ForwardAdmission>,
+    /// ALM stage 2 — the last forwarded-load reading (`load_ledger`, ladder).
+    forward_load: Arc<std::sync::Mutex<crate::transport::relay_tier::ForwardLoad>>,
+    /// ALM stage 2 — roster relays before the default path (R2).
+    steer_roster_relays: bool,
+    /// ALM stage 2 — establish budget per roster relay.
+    relay_establish_budget: Duration,
+    /// Whether this node forwards for others.
+    forwards_for_others: bool,
     /// CIRISEdge#805 test seam — fail the next N derived-link identifies
     /// ([`Self::fail_next_derived_identifies_for_test`]). Zero in production.
     fail_derived_identify: Arc<std::sync::atomic::AtomicU32>,
@@ -3252,6 +3283,13 @@ impl ReticulumTransport {
             deferred_handshake_part: Arc::clone(&self.deferred_handshake_part),
             test_binding_key_only: Arc::clone(&self.test_binding_key_only),
             stall_guard: Arc::clone(&self.stall_guard),
+            relay_steer: self.steer_roster_relays.then(|| RelaySteer {
+                budget: self.relay_establish_budget,
+                established: Arc::clone(&self.established_links),
+                peers: Arc::clone(&self.peers),
+                table: self.scope_addresses.get().cloned(),
+                direct_paths: Arc::clone(&self.direct_paths),
+            }),
         }
     }
 
@@ -3802,6 +3840,23 @@ impl ReticulumTransport {
         node.start()
             .await
             .map_err(|e| TransportError::Io(format!("reticulum node start: {e}")))?;
+        // leviculum v0.32+ re-proposes a failed direct link on its own
+        // (1, 2, 5, 10, 15 min). While this node proposes nothing (the
+        // production default since the 2026-10-31 one-sided punch, until the
+        // host names a facilitator) the retry stays off with it.
+        if !config.direct_links.proposes() {
+            node.set_direct_link_retry(false);
+        }
+        // ALM stage 2 — a transport node's C2 admission of the links it
+        // forwards (leviculum#93). The hook runs under the node lock and reads
+        // only the admission's own ledger.
+        let forward_admission = Arc::new(crate::transport::relay_tier::ForwardAdmission::new(
+            config.forward_admission.clone(),
+        ));
+        if config.enable_transport {
+            let fa = Arc::clone(&forward_admission);
+            node.set_forward_admission(Some(Box::new(move |req| fa.decide(req))));
+        }
 
         tracing::info!(
             addr = %config.listen_addr,
@@ -3871,6 +3926,11 @@ impl ReticulumTransport {
         let direct_paths = Arc::new(crate::transport::direct_path::DirectPaths::new(
             config.direct_links.clone(),
         ));
+        let (steer_roster_relays, relay_establish_budget, forwards_for_others) = (
+            config.steer_roster_relays,
+            config.relay_establish_budget,
+            config.enable_transport,
+        );
         Ok(Self {
             config,
             // CIRISEdge#530 — off by default; attach with `with_metrics`.
@@ -3968,6 +4028,14 @@ impl ReticulumTransport {
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_paths,
+            alm_links: Arc::new(crate::transport::alm_link::AlmLinkState::new()),
+            forward_admission,
+            forward_load: Arc::new(std::sync::Mutex::new(
+                crate::transport::relay_tier::ForwardLoad::default(),
+            )),
+            steer_roster_relays,
+            relay_establish_budget,
+            forwards_for_others,
             fail_derived_identify: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             tear_down_reply_link: std::sync::atomic::AtomicU32::new(0),
             scoped_pool_bypass: std::sync::atomic::AtomicBool::new(false),
@@ -6305,6 +6373,74 @@ impl ReticulumTransport {
             &self.direct_paths,
             peer_key_id,
         )
+    }
+
+    /// ALM stage 2 — one A/V link's delivery telemetry (leviculum#35), or
+    /// `None` when leviculum no longer holds the link.
+    #[must_use]
+    pub fn av_link_stats(
+        &self,
+        link: &[u8; 16],
+    ) -> Option<crate::transport::alm_link::AvLinkStats> {
+        let st = self.node.link_stats(&LinkId::new(*link))?;
+        Some(crate::transport::alm_link::AvLinkStats {
+            bytes_delivered: st.bytes_delivered(),
+            srtt_ms: st.srtt_ms(),
+            min_rtt_ms: st.min_rtt_ms(),
+            busy_rejections: st.busy_rejections(),
+            pacing_rejections: st.pacing_rejections(),
+            window: st.window(),
+            window_max: st.window_max(),
+        })
+    }
+
+    /// ALM stage 2 — timed media frames on `link` that never arrived fresh
+    /// (leviculum#94), by side.
+    #[must_use]
+    pub fn av_link_expired(&self, link: &[u8; 16]) -> crate::transport::alm_link::ExpiredCounts {
+        self.alm_links.expired(link)
+    }
+
+    /// ALM stage 2 — the transport's ALM state (learned relay routes).
+    #[must_use]
+    pub fn alm_links(&self) -> &crate::transport::alm_link::AlmLinkState {
+        &self.alm_links
+    }
+
+    /// ALM stage 2 — this node's C2 admission of forwarded links.
+    #[must_use]
+    pub fn forward_admission(&self) -> &crate::transport::relay_tier::ForwardAdmission {
+        &self.forward_admission
+    }
+
+    /// ALM stage 2 — the last forwarded-load reading (zero on a leaf).
+    #[must_use]
+    pub fn forward_load(&self) -> crate::transport::relay_tier::ForwardLoad {
+        self.forward_load
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// ALM stage 2 (`FSD/CIRIS_MESH.md` §7) — the service tier: forwarded
+    /// links close to new admissions at tier ≥ 1.
+    pub fn set_service_tier(&self, tier: crate::load_ladder::ServiceTier) {
+        self.forward_admission.set_tier(tier);
+    }
+
+    /// ALM stage 2 — the key id of the roster member (a room peer or a
+    /// consented contact) whose transport identity hash is `relay`, if any:
+    /// the roster relay tier's eligibility (R2, §3.3).
+    pub async fn roster_relay_key(&self, relay: &[u8; 16]) -> Option<String> {
+        RelaySteer {
+            budget: self.relay_establish_budget,
+            established: Arc::clone(&self.established_links),
+            peers: Arc::clone(&self.peers),
+            table: self.scope_addresses.get().cloned(),
+            direct_paths: Arc::clone(&self.direct_paths),
+        }
+        .roster_key(relay)
+        .await
     }
 
     /// Eric 2026-10-30 — name `node_key_id` a consented contact: this node
@@ -9464,6 +9600,29 @@ impl Transport for ReticulumTransport {
             .take()
             .ok_or_else(|| TransportError::Config("listen called twice".into()))?;
 
+        // ALM stage 2 — a transport node reads what it forwards once a
+        // second: the admission ledger retires closed links, and the rates
+        // feed the `load_ledger` and the ladder's `edge:transit_pps` signal.
+        if self.forwards_for_others {
+            let node_w = Arc::downgrade(&self.node);
+            let fa = Arc::clone(&self.forward_admission);
+            let out = Arc::clone(&self.forward_load);
+            tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    let Some(node) = node_w.upgrade() else { return };
+                    let links = node.forwarded_links();
+                    drop(node);
+                    let now = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let load = fa.refresh(&links, now);
+                    *out.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = load;
+                }
+            });
+        }
+
         tracing::info!(
             addr = %self.config.listen_addr,
             dest = %self.local_dest_hash,
@@ -9638,6 +9797,7 @@ impl Transport for ReticulumTransport {
             av_node: &self.node,
             av_dialed_peer: &self.av_dialed_peer,
             direct_paths: &self.direct_paths,
+            alm_links: &self.alm_links,
             seals: &self.seals,
             shapers: &self.shapers,
         };
@@ -10483,6 +10643,33 @@ struct DialCtx {
     /// CIRISEdge#926 — see `ReticulumTransport::stall_guard`: the pool never
     /// hands out a link it judged dead.
     stall_guard: Arc<crate::transport::link_stall::LinkStallGuard>,
+    /// ALM stage 2 — roster relays before the default path (R2); `None`
+    /// when the transport's `steer_roster_relays` is off.
+    relay_steer: Option<RelaySteer>,
+}
+
+/// ALM stage 2 (`FSD/CIRIS_MESH.md` R2) — what an identity dial needs to
+/// steer through a roster relay.
+#[derive(Clone)]
+struct RelaySteer {
+    budget: Duration,
+    established: Arc<Mutex<HashSet<LinkId>>>,
+    peers: Arc<Mutex<HashMap<String, RootedPeer>>>,
+    table: Option<Arc<ScopeAddressTable>>,
+    direct_paths: Arc<crate::transport::direct_path::DirectPaths>,
+}
+
+impl RelaySteer {
+    /// The roster member (a room peer or a consented contact) whose
+    /// transport identity hash is `relay`, if any (§3.3 eligibility).
+    async fn roster_key(&self, relay: &[u8; 16]) -> Option<String> {
+        let peers = self.peers.lock().await;
+        peers.iter().find_map(|(key_id, rp)| {
+            (TransportIdentityPub::from_pub64(&rp.transport_pubkey64).hash()[..] == relay[..]
+                && direct_standing(self.table.as_deref(), &self.direct_paths, key_id))
+            .then(|| key_id.clone())
+        })
+    }
 }
 
 impl DialCtx {
@@ -11117,6 +11304,110 @@ impl DialCtx {
     /// and the plane (#728), await establishment, identify (#340), and key the
     /// link with `pair` claiming `claim` (CC 5.3.3.5 E1). Pushes nothing and
     /// publishes nothing; the caller decides what the link may carry.
+    /// Tag an identity-plane dial before it establishes: the initiator side
+    /// of the seal (CC 5.3.3.5 E1), the dialled destination (#424: a reply on
+    /// the reverse path attributes to this peer) and the plane (#728: the
+    /// pool and the reverse-path selector never see an untagged link).
+    async fn tag_identity_dial(&self, link_id: LinkId, dest: DestinationHash) {
+        self.seals.begin_initiator(link_id.into_bytes());
+        self.dialed_link_dest.lock().await.insert(link_id, dest);
+        self.link_plane
+            .lock()
+            .await
+            .insert(link_id, LinkPlane::Identity);
+    }
+
+    /// ALM stage 2 (`FSD/CIRIS_MESH.md` R2) — dial `dest` through a ROSTER
+    /// relay: one the destination was heard through whose node shares a room
+    /// with this node or is a consented contact. R2 order (fewest hops, then
+    /// a seeded draw among equals, `relay_tier::roster_relays_first`), ONE
+    /// establish attempt per relay (`connect_via` with a budget), edge owning
+    /// the failover. `None` when no roster relay establishes: the caller
+    /// falls to the default path, the last tier.
+    async fn dial_via_roster_relay(
+        &self,
+        destination_key_id: &str,
+        dest: &DestinationHash,
+        signing_key: &[u8; 32],
+    ) -> Option<LinkId> {
+        let steer = self.relay_steer.clone()?;
+        let routes = self.node.relay_routes(dest);
+        if routes.is_empty() {
+            return None;
+        }
+        let mut keys: HashMap<[u8; 16], String> = HashMap::new();
+        for r in &routes {
+            if let Some(k) = steer.roster_key(&r.relay).await {
+                if k != destination_key_id {
+                    keys.insert(r.relay, k);
+                }
+            }
+        }
+        if keys.is_empty() {
+            return None;
+        }
+        let mut seed = [0u8; 8];
+        let _ = ciris_crypto::random::fill(&mut seed);
+        let candidates = crate::transport::relay_tier::roster_relays_first(
+            &routes,
+            |r| keys.get(r).cloned(),
+            u64::from_le_bytes(seed),
+        );
+        let budget = steer.budget;
+        for c in candidates {
+            let link = match self
+                .node
+                .connect_via(dest, signing_key, c.relay, Some(budget))
+                .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::debug!(
+                        key_id = %destination_key_id,
+                        relay = %c.key_id,
+                        error = %e,
+                        "roster relay: no route through it (leviculum#91)"
+                    );
+                    continue;
+                }
+            };
+            let link_id = *link.link_id();
+            self.tag_identity_dial(link_id, *dest).await;
+            let deadline = tokio::time::Instant::now() + budget + Duration::from_millis(500);
+            let established = loop {
+                if steer.established.lock().await.contains(&link_id) {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            if established {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.inc_av_plane(crate::observability::ALM_RELAY_TIER_ROSTER);
+                }
+                tracing::info!(
+                    key_id = %destination_key_id,
+                    relay = %c.key_id,
+                    hops = c.hops,
+                    link = %hex::encode(link_id.into_bytes()),
+                    "identity link through a ROSTER relay, before the canonical \
+                     (FSD CIRIS_MESH R2, leviculum#91)"
+                );
+                return Some(link_id);
+            }
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_av_plane(crate::observability::ALM_RELAY_TIER_ROSTER_FAILED);
+            }
+            let _ = self.node.close_link(&link_id).await;
+        }
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_av_plane(crate::observability::ALM_RELAY_TIER_DEFAULT);
+        }
+        None
+    }
+
     async fn connect_and_key(
         &self,
         destination_key_id: &str,
@@ -11128,36 +11419,35 @@ impl DialCtx {
     ) -> Result<LinkId, TransportError> {
         let signing_key =
             self.dial_signing_key(destination_key_id, &peer.dest_hash, &peer.transport_ed25519);
-        let (link, established) = self
-            .node
-            .connect_awaited(&peer.dest_hash, &signing_key)
-            .await
-            .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
-        let link_id = *link.link_id();
-        self.seals.begin_initiator(link_id.into_bytes());
-        // CIRISEdge#424 — record the dest we dialed for THIS link so an inbound
-        // reply arriving over it (the initiator-side reverse path a NAT'd peer's
-        // responder uses) attributes to this peer even though leviculum's
-        // `link_destination` returns `None` for our own dialed links.
-        self.dialed_link_dest
-            .lock()
-            .await
-            .insert(link_id, peer.dest_hash);
-        // CIRISEdge#728 — an identity-plane dial by construction: `peer` came
-        // from `resolve_dial_candidates` (announced / directory-resolved
-        // destinations; a derived address is neither). Tagged before
-        // establishment so the pool and the reverse-path selector never see an
-        // untagged link.
-        self.link_plane
-            .lock()
-            .await
-            .insert(link_id, LinkPlane::Identity);
-
-        // Await `LinkEstablished` on BOTH ends — the peer must have accepted the
-        // LINK_REQUEST or a resource transfer cannot start. `established` resolves
-        // `Ok(())` on establishment, `Err(LinkClosed)` if the peer refused / the link
-        // died first; a timeout means no route or a stalled dial.
-        let outcome = with_timeout(establish_timeout, established).await;
+        // ALM stage 2 (`FSD/CIRIS_MESH.md` R2) — no one-hop path: roster
+        // relays first, each one attempt; the default path (the canonical in
+        // production) is the last tier, below.
+        let steered = if self.relay_steer.is_some()
+            && has_path
+            && self.node.hops_to(&peer.dest_hash).is_some_and(|h| h > 1)
+        {
+            self.dial_via_roster_relay(destination_key_id, &peer.dest_hash, &signing_key)
+                .await
+        } else {
+            None
+        };
+        let (link_id, outcome) = if let Some(link_id) = steered {
+            (link_id, Some(Ok(())))
+        } else {
+            let (link, established) = self
+                .node
+                .connect_awaited(&peer.dest_hash, &signing_key)
+                .await
+                .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
+            let link_id = *link.link_id();
+            self.tag_identity_dial(link_id, peer.dest_hash).await;
+            // Await `LinkEstablished` on BOTH ends — the peer must have accepted
+            // the LINK_REQUEST or a resource transfer cannot start. `established`
+            // resolves `Ok(())` on establishment, `Err(LinkClosed)` if the peer
+            // refused / the link died first; a timeout means no route or a
+            // stalled dial.
+            (link_id, with_timeout(establish_timeout, established).await)
+        };
         if let Some(refused) =
             self.link_proof_refused(destination_key_id, &peer.dest_hash, outcome.as_ref())
         {
@@ -11672,6 +11962,8 @@ struct EventCtx<'a> {
     /// CIRISEdge#805 item 8 — see the field of the same name on
     /// [`ReticulumTransport`].
     direct_paths: &'a crate::transport::direct_path::DirectPaths,
+    /// ALM stage 2 — see the field of the same name on [`ReticulumTransport`].
+    alm_links: &'a crate::transport::alm_link::AlmLinkState,
     /// CC 5.3.3.5 E1 — see `ReticulumTransport::seals`. An `Arc` so a link's
     /// handshake budget can outlive the event that armed it.
     seals: &'a Arc<crate::transport::link_seal::LinkSeals>,
@@ -14740,6 +15032,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 link_id,
             );
             ctx.link_book().forget(link_id, close_cause(reason)).await;
+            ctx.alm_links.forget(&link_id.into_bytes());
             if pooled {
                 note_starved_pool_close(reason, &link_id);
             }
@@ -14964,6 +15257,48 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 interface_in,
                 hops,
             );
+        }
+        // ALM stage 2 (leviculum#94) — a timed media frame never arrived
+        // fresh. On the RECEIVING side it took a hop counter on the sender
+        // that no frame will show: report it to the A/V queue as a drop, so
+        // the next frame's open skips past it exactly as an overflow drop.
+        NodeEvent::ChannelMessageExpired {
+            link_id, expiry, ..
+        } => {
+            use leviculum_core::node::FrameExpiry;
+            let (sender, marked, label) = match expiry {
+                FrameExpiry::Sender => (true, false, crate::observability::AV_FRAME_EXPIRED_SENDER),
+                FrameExpiry::MarkedByPeer => {
+                    (false, true, crate::observability::AV_FRAME_EXPIRED_MARKED)
+                }
+                FrameExpiry::ArrivedLate { .. } => {
+                    (false, false, crate::observability::AV_FRAME_EXPIRED_LATE)
+                }
+            };
+            ctx.alm_links
+                .note_expired(link_id.into_bytes(), sender, marked);
+            if !sender {
+                ctx.av_sink.note_dropped_before_sink(link_id);
+            }
+            if let Some(m) = ctx.metrics {
+                m.inc_av_plane(label);
+            }
+        }
+        // ALM stage 2 (leviculum#91) — a relay a destination is reachable
+        // through: a candidate for the roster relay tier.
+        NodeEvent::RelayRouteLearned {
+            destination_hash,
+            relay,
+            interface_index,
+            hops,
+        } => {
+            ctx.alm_links
+                .note_learned(crate::transport::alm_link::LearnedRelayRoute {
+                    destination: destination_hash.into_bytes(),
+                    relay,
+                    interface_index,
+                    hops,
+                });
         }
         // CIRISEdge#805 item 8 — direct links (leviculum#70).
         NodeEvent::DirectLinkEstablished {
