@@ -330,15 +330,6 @@ impl FederationDirectory for CountingDirectory {
             .list_communities_for_member(member_identity_key_id)
             .await
     }
-    async fn list_community_membership_listings_for(
-        &self,
-        community_key_id: &str,
-    ) -> Result<Vec<CommunityMembershipListing>, Error> {
-        self.hit("list_community_membership_listings_for");
-        self.inner
-            .list_community_membership_listings_for(community_key_id)
-            .await
-    }
     async fn list_community_membership_revocations_for(
         &self,
         community_key_id: &str,
@@ -505,45 +496,6 @@ impl FederationDirectory for CountingDirectory {
             .list_open_self_roster_proposals(identity_key_id)
             .await
     }
-    async fn list_org_memberships_for(&self, org_id: &str) -> Result<Vec<OrgMembership>, Error> {
-        self.hit("list_org_memberships_for");
-        self.inner.list_org_memberships_for(org_id).await
-    }
-    async fn list_org_memberships_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedOrgMembership>, Error> {
-        self.hit("list_org_memberships_since");
-        self.inner.list_org_memberships_since(since, limit).await
-    }
-    async fn list_organizations_for(&self, org_id: &str) -> Result<Vec<Organization>, Error> {
-        self.hit("list_organizations_for");
-        self.inner.list_organizations_for(org_id).await
-    }
-    async fn list_organizations_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedOrganization>, Error> {
-        self.hit("list_organizations_since");
-        self.inner.list_organizations_since(since, limit).await
-    }
-    async fn list_partner_records_for(
-        &self,
-        license_id: &str,
-    ) -> Result<Vec<PartnerRecord>, Error> {
-        self.hit("list_partner_records_for");
-        self.inner.list_partner_records_for(license_id).await
-    }
-    async fn list_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedPartnerRecord>, Error> {
-        self.hit("list_partner_records_since");
-        self.inner.list_partner_records_since(since, limit).await
-    }
     async fn list_settled_self_roster_proposals(
         &self,
         identity_key_id: &str,
@@ -570,16 +522,6 @@ impl FederationDirectory for CountingDirectory {
     ) -> Result<Vec<ServedCommunity>, Error> {
         self.hit("list_signed_communities_since");
         self.inner.list_signed_communities_since(since, limit).await
-    }
-    async fn list_signed_community_membership_listings_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedCommunityMembershipListing>, Error> {
-        self.hit("list_signed_community_membership_listings_since");
-        self.inner
-            .list_signed_community_membership_listings_since(since, limit)
-            .await
     }
     async fn list_signed_community_membership_revocations_since(
         &self,
@@ -637,16 +579,6 @@ impl FederationDirectory for CountingDirectory {
         self.hit("list_signed_location_proofs_since");
         self.inner
             .list_signed_location_proofs_since(since, limit)
-            .await
-    }
-    async fn list_signed_partner_records_since(
-        &self,
-        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
-        limit: u32,
-    ) -> Result<Vec<ServedSignedPartnerRecord>, Error> {
-        self.hit("list_signed_partner_records_since");
-        self.inner
-            .list_signed_partner_records_since(since, limit)
             .await
     }
     async fn list_signed_transport_destinations_since(
@@ -779,13 +711,6 @@ impl FederationDirectory for CountingDirectory {
         self.hit("put_community");
         self.inner.put_community(community).await
     }
-    async fn put_community_membership_listing(
-        &self,
-        listing: SignedCommunityMembershipListing,
-    ) -> Result<(), Error> {
-        self.hit("put_community_membership_listing");
-        self.inner.put_community_membership_listing(listing).await
-    }
     async fn put_community_membership_revocation(
         &self,
         revocation: SignedCommunityMembershipRevocation,
@@ -832,18 +757,6 @@ impl FederationDirectory for CountingDirectory {
     async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
         self.hit("put_location_proof");
         self.inner.put_location_proof(proof).await
-    }
-    async fn put_org_membership(&self, signed: SignedOrgMembership) -> Result<(), Error> {
-        self.hit("put_org_membership");
-        self.inner.put_org_membership(signed).await
-    }
-    async fn put_organization(&self, signed: SignedOrganization) -> Result<(), Error> {
-        self.hit("put_organization");
-        self.inner.put_organization(signed).await
-    }
-    async fn put_partner_record(&self, signed: SignedPartnerRecord) -> Result<(), Error> {
-        self.hit("put_partner_record");
-        self.inner.put_partner_record(signed).await
     }
     async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error> {
         self.hit("put_public_key");
