@@ -997,7 +997,8 @@ async fn accept_upstream(r: &Side, arrival: AvArrival) -> (AvInboundLink, [u8; 3
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
-    let q = quad("w2").await;
+    // leviculum v0.33 grew the node; box the fixture future (clippy::large_futures).
+    let q = Box::pin(quad("w2")).await;
     let (a_id, b_id, r_id, c_id) = (
         q.a.key.key_id.clone(),
         q.b.key.key_id.clone(),
@@ -1286,7 +1287,8 @@ async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_leg_carrying_media_outlives_the_reaper_863() {
-    let q = quad("w2b").await;
+    // leviculum v0.33 grew the node; box the fixture future (clippy::large_futures).
+    let q = Box::pin(quad("w2b")).await;
     let (a_id, b_id, r_id) = (
         q.a.key.key_id.clone(),
         q.b.key.key_id.clone(),
@@ -1460,7 +1462,8 @@ async fn strip_transit_pair(dir: &Arc<SqliteBackend>, owner: &Ident) {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_transit_kex_refuses_a_false_claim_and_a_missing_pair_by_name() {
-    let q = quad("w7").await;
+    // leviculum v0.33 grew the node; box the fixture future (clippy::large_futures).
+    let q = Box::pin(quad("w7")).await;
     let (a_id, b_id, r_id) = (
         q.a.key.key_id.clone(),
         q.b.key.key_id.clone(),
