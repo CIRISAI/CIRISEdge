@@ -223,7 +223,7 @@ fn dimension(row: &Attestation) -> &str {
         .unwrap_or_default()
 }
 
-fn in_room<'a>(room: &'a str) -> impl Fn(&Attestation) -> bool + 'a {
+fn in_room(room: &str) -> impl Fn(&Attestation) -> bool + '_ {
     move |row| {
         row.attestation_envelope
             .get("community_key_id")
@@ -449,7 +449,8 @@ async fn room_of_three_plus_dave() -> ([Party; 4], [Node; 4], String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // the whole flow, in order, on purpose
 async fn a_cosigned_widening_lands_alike_everywhere_and_a_short_set_nowhere() {
-    let ([alice, bob, carol, dave], [na, nb, nc, nd], room) = room_of_three_plus_dave().await;
+    let ([alice, bob, carol, dave], [na, nb, nc, nd], room) =
+        Box::pin(room_of_three_plus_dave()).await;
     let event = RosterEvent::widening(&room, &dave.person.key_id, None, at(3));
 
     // 3. One voice of three: every node's door refuses it, alike.

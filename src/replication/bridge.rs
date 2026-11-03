@@ -14265,7 +14265,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn e4_family_forward_path_preserves_authority_signature() {
         let signed = sign_family_fixture("e4-authority", fixture_family("e4-family", "e4-member"));
-        pin_e4_forward_path(
+        Box::pin(pin_e4_forward_path(
             EnvelopeKind::Family,
             &["e4-member"], // cohort-scoped advertise: a member must be in cohort
             &[
@@ -14284,7 +14284,7 @@ pub(crate) mod tests {
                 )
             },
             |s| s.family.signing_envelope(),
-        )
+        ))
         .await;
     }
 
@@ -14294,7 +14294,7 @@ pub(crate) mod tests {
             "e4-authority",
             fixture_community("e4-community", "e4-member"),
         );
-        pin_e4_forward_path(
+        Box::pin(pin_e4_forward_path(
             EnvelopeKind::Community,
             &["e4-member"],
             // CC 3.2 steward-binding gate: a non-infra community member must
@@ -14318,7 +14318,7 @@ pub(crate) mod tests {
                 )
             },
             |s| s.community.signing_envelope(),
-        )
+        ))
         .await;
     }
 
@@ -14615,7 +14615,7 @@ pub(crate) mod tests {
                 persist_row_hash: String::new(),
             },
         );
-        pin_e4_forward_path(
+        Box::pin(pin_e4_forward_path(
             EnvelopeKind::FamilyMembershipRevocation,
             &[], // tombstone plane advertises Global — no cohort needed
             &[
@@ -14638,7 +14638,7 @@ pub(crate) mod tests {
                 )
             },
             |s| s.family_membership_revocation.signing_envelope(),
-        )
+        ))
         .await;
     }
 
@@ -14661,7 +14661,7 @@ pub(crate) mod tests {
                 persist_row_hash: String::new(),
             },
         );
-        pin_e4_forward_path(
+        Box::pin(pin_e4_forward_path(
             EnvelopeKind::CommunityMembershipRevocation,
             &[],
             &[
@@ -14685,7 +14685,7 @@ pub(crate) mod tests {
                 )
             },
             |s| s.community_membership_revocation.signing_envelope(),
-        )
+        ))
         .await;
     }
 
@@ -14704,7 +14704,7 @@ pub(crate) mod tests {
                 persist_row_hash: String::new(),
             },
         );
-        pin_e4_forward_path(
+        Box::pin(pin_e4_forward_path(
             EnvelopeKind::CommunityMembershipWidening,
             &[],
             &[
@@ -14732,7 +14732,7 @@ pub(crate) mod tests {
                 )
             },
             |s| s.community_membership_widening.signing_envelope(),
-        )
+        ))
         .await;
     }
 
@@ -14750,7 +14750,7 @@ pub(crate) mod tests {
                 persist_row_hash: String::new(),
             },
         );
-        pin_e4_forward_path(
+        Box::pin(pin_e4_forward_path(
             EnvelopeKind::FamilyMembershipWidening,
             &[],
             &[
@@ -14773,7 +14773,7 @@ pub(crate) mod tests {
                 )
             },
             |s| s.family_membership_widening.signing_envelope(),
-        )
+        ))
         .await;
     }
 
@@ -14795,7 +14795,7 @@ pub(crate) mod tests {
                 persist_row_hash: String::new(),
             },
         );
-        pin_e4_forward_path(
+        Box::pin(pin_e4_forward_path(
             EnvelopeKind::LocationProof,
             &["e4-subject"], // cohort-scoped advertise keys on the subject
             &[
@@ -14821,7 +14821,7 @@ pub(crate) mod tests {
                 )
             },
             |s| s.location_proof.signing_envelope(),
-        )
+        ))
         .await;
     }
 

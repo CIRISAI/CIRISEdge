@@ -118,8 +118,8 @@ async fn pair(tag: &str) -> Pair {
     let key_b = TestFedKey::new(&format!("edge-b-926-{tag}"), 0x0b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
     let metrics_a = ciris_edge::EdgeMetrics::new();
