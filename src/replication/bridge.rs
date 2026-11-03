@@ -2843,7 +2843,11 @@ impl FederationDirectoryReplicationBridge {
             .await?;
             let advanced = next != cursor;
             for mut r in rows {
-                if r.proposal_id.is_none() {
+                // Only a LANDED roster row completes a proposal; the scan's
+                // margin may also re-name earlier rows (the host dedups by id).
+                if r.proposal_id.is_none()
+                    && r.kind == crate::decision_rows::DecisionRowKind::RosterLanded
+                {
                     r.proposal_id = proposal_id.map(str::to_owned);
                 }
                 let _ = self.decision_rows.emit(r.clone());

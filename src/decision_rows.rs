@@ -331,7 +331,7 @@ impl DecisionRowSignal {
 mod tests {
     use super::*;
 
-    fn row(dimension: &str, attestation_type: &str, extra: serde_json::Value) -> Attestation {
+    fn row(dimension: &str, attestation_type: &str, extra: &serde_json::Value) -> Attestation {
         let mut envelope = serde_json::json!({ "dimension": dimension });
         if let (Some(o), Some(e)) = (envelope.as_object_mut(), extra.as_object()) {
             for (k, v) in e {
@@ -362,14 +362,14 @@ mod tests {
     fn every_documented_prefix_classifies_and_others_do_not() {
         for (kind, prefixes) in DecisionRowKind::PREFIXES {
             for p in prefixes {
-                let r = row(&format!("{p}v1"), "scores", serde_json::json!({}));
+                let r = row(&format!("{p}v1"), "scores", &serde_json::json!({}));
                 assert_eq!(DecisionRowKind::of_row(&r), Some(kind), "{p}");
             }
         }
         let halt = row(
             "",
             "accord:invoke:constitutional:h1:v1",
-            serde_json::json!({}),
+            &serde_json::json!({}),
         );
         assert_eq!(
             DecisionRowKind::of_row(&halt),
@@ -377,7 +377,7 @@ mod tests {
         );
         for other in ["chat:message:v1", "consent:state:granted:v1", "member:x"] {
             assert_eq!(
-                DecisionRowKind::of_row(&row(other, "scores", serde_json::json!({}))),
+                DecisionRowKind::of_row(&row(other, "scores", &serde_json::json!({}))),
                 None,
                 "{other}"
             );
@@ -390,7 +390,7 @@ mod tests {
         let r = row(
             "membership:acceptance:v1",
             "scores",
-            serde_json::json!({ "references_attestation_id": "p1", "community_key_id": "room" }),
+            &serde_json::json!({ "references_attestation_id": "p1", "community_key_id": "room" }),
         );
         let at = chrono::Utc::now();
         let d = DecisionRowRef::of_row(&r, DecisionCursor::at_or_before(at)).expect("relevant");

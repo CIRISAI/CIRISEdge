@@ -623,7 +623,6 @@ pub async fn widen_cosigned(
     at: chrono::DateTime<chrono::Utc>,
     pens: &[&crate::identity::LocalSigner],
 ) -> Result<bool, MembershipError> {
-    use crate::replication::attestation_bind::truncate_to_substrate_resolution;
     if pens.is_empty() {
         return Err(MembershipError::Other(
             "a widening needs at least one signature".into(),
@@ -675,56 +674,69 @@ pub async fn widen_cosigned(
                 .map_err(|e| MembershipError::from_persist("widen community", &e))
         }
         GroupScope::Family => {
-            let already = directory
-                .active_family_members(group_key_id)
-                .await
-                .map_err(|e| MembershipError::from_persist("read family roster", &e))?
-                .iter()
-                .any(|m| m.key_id == member_key_id && m.role.as_deref() == role);
-            if already {
-                return Ok(false);
-            }
-            let at = truncate_to_substrate_resolution(at);
-            let widening = ciris_persist::federation::types::FamilyMembershipWidening {
-                family_key_id: group_key_id.to_owned(),
-                member_key_id: member_key_id.to_owned(),
-                joined_at: at,
-                effective_at: at,
-                role: role.map(str::to_owned),
-                persist_row_hash: String::new(),
-            };
-            let canonical =
-                ciris_persist::prelude::ceg_produce_canonicalize(&widening.signing_envelope())
-                    .map_err(|e| MembershipError::Other(format!("canonicalize widening: {e}")))?;
-            let mut voices = Vec::with_capacity(pens.len());
-            for pen in pens {
-                let (classical, pqc) =
-                    crate::identity::sign_bound_hybrid(pen, &canonical, "family widening")
-                        .await
-                        .map_err(MembershipError::Other)?;
-                voices.push(ciris_persist::federation::types::RosterCosignature {
-                    authority_key_id: pen.key_id.clone(),
-                    scrub_signature_classical: classical,
-                    scrub_signature_pqc: pqc,
-                });
-            }
-            let mut voices = voices.into_iter();
-            let primary = voices.next().expect("at least one pen");
-            directory
-                .put_family_membership_widening(
-                    ciris_persist::federation::types::SignedFamilyMembershipWidening {
-                        family_membership_widening: widening,
-                        authority_key_id: primary.authority_key_id,
-                        scrub_signature_classical: primary.scrub_signature_classical,
-                        scrub_signature_pqc: primary.scrub_signature_pqc,
-                        cosignatures: voices.collect(),
-                    },
-                )
-                .await
-                .map(|()| true)
-                .map_err(|e| MembershipError::from_persist("widen family", &e))
+            widen_family_cosigned(directory, group_key_id, member_key_id, role, at, pens).await
         }
     }
+}
+
+/// [`widen_cosigned`]'s family arm: a `FamilyMembershipWidening` signed by
+/// every pen, through `put_family_membership_widening`.
+async fn widen_family_cosigned(
+    directory: &dyn FederationDirectory,
+    group_key_id: &str,
+    member_key_id: &str,
+    role: Option<&str>,
+    at: chrono::DateTime<chrono::Utc>,
+    pens: &[&crate::identity::LocalSigner],
+) -> Result<bool, MembershipError> {
+    use crate::replication::attestation_bind::truncate_to_substrate_resolution;
+    let already = directory
+        .active_family_members(group_key_id)
+        .await
+        .map_err(|e| MembershipError::from_persist("read family roster", &e))?
+        .iter()
+        .any(|m| m.key_id == member_key_id && m.role.as_deref() == role);
+    if already {
+        return Ok(false);
+    }
+    let at = truncate_to_substrate_resolution(at);
+    let widening = ciris_persist::federation::types::FamilyMembershipWidening {
+        family_key_id: group_key_id.to_owned(),
+        member_key_id: member_key_id.to_owned(),
+        joined_at: at,
+        effective_at: at,
+        role: role.map(str::to_owned),
+        persist_row_hash: String::new(),
+    };
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&widening.signing_envelope())
+        .map_err(|e| MembershipError::Other(format!("canonicalize widening: {e}")))?;
+    let mut voices = Vec::with_capacity(pens.len());
+    for pen in pens {
+        let (classical, pqc) =
+            crate::identity::sign_bound_hybrid(pen, &canonical, "family widening")
+                .await
+                .map_err(MembershipError::Other)?;
+        voices.push(ciris_persist::federation::types::RosterCosignature {
+            authority_key_id: pen.key_id.clone(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        });
+    }
+    let mut voices = voices.into_iter();
+    let primary = voices.next().expect("at least one pen");
+    directory
+        .put_family_membership_widening(
+            ciris_persist::federation::types::SignedFamilyMembershipWidening {
+                family_membership_widening: widening,
+                authority_key_id: primary.authority_key_id,
+                scrub_signature_classical: primary.scrub_signature_classical,
+                scrub_signature_pqc: primary.scrub_signature_pqc,
+                cosignatures: voices.collect(),
+            },
+        )
+        .await
+        .map(|()| true)
+        .map_err(|e| MembershipError::from_persist("widen family", &e))
 }
 
 /// The row's `dimension`, if any.
