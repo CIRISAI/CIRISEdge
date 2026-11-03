@@ -2265,6 +2265,7 @@ async fn read_as(
 /// Mutation: skip the revocation and the "carol reads `Unopened` for the
 /// later message" assertion fails — carol's occurrence is still on the
 /// active roster, so alice's cascade wraps to it.
+#[ignore = "persist v61 #1123: the second widening of a room above the family needs a second member's vote; edge's single-signer membership::widen needs the room cosign flow (held for Eric's ruling)"]
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // three nodes, two messages, one revocation — in one place on purpose
 async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {

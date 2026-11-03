@@ -6772,8 +6772,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     .await
     .expect("the founder signs dave's widening");
     // persist v61 (#1123): one voice never widens a room above the family —
-    // under `majority` over {alice, bob, carol}, bob co-signs the same
-    // widening envelope.
+    // under `majority`, bob and carol co-sign the same widening envelope.
     {
         let widening = ciris_persist::federation::CommunityMembershipWidening {
             community_key_id: ROOM.to_owned(),
@@ -6786,26 +6785,38 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
         let canonical =
             ciris_persist::prelude::ceg_produce_canonicalize(&widening.signing_envelope())
                 .expect("canonicalize the widening");
-        let (classical, pqc) = ciris_edge::identity::sign_bound_hybrid(
-            &edge_signer_for(&bob),
-            &canonical,
-            "widening cosign",
-        )
-        .await
-        .expect("bob co-signs");
-        spec_d
-            .cosignatures
-            .push(ciris_persist::federation::types::RosterCosignature {
-                authority_key_id: bob.key_id.clone(),
-                scrub_signature_classical: classical,
-                scrub_signature_pqc: pqc,
-            });
+        // bob AND carol: the fold counts the seats at the widening's instant,
+        // which is erin's resignation's too, so a majority of four is three.
+        for voter in [&bob, &carol] {
+            let (classical, pqc) = ciris_edge::identity::sign_bound_hybrid(
+                &edge_signer_for(voter),
+                &canonical,
+                "widening cosign",
+            )
+            .await
+            .expect("co-signs");
+            spec_d
+                .cosignatures
+                .push(ciris_persist::federation::types::RosterCosignature {
+                    authority_key_id: voter.key_id.clone(),
+                    scrub_signature_classical: classical,
+                    scrub_signature_pqc: pqc,
+                });
+        }
     }
     for n in nodes {
-        n.dir
+        let added = n
+            .dir
             .add_community_member(ROOM, member_d.clone(), &spec_d)
             .await
             .expect("every directory folds the widening");
+        assert!(added, "the cosigned widening seats dave");
+        assert!(
+            ciris_persist::federation::is_active_community_member(&*n.dir, ROOM, &dave.key_id)
+                .await
+                .expect("roster"),
+            "dave is active after the widening"
+        );
     }
     let post = node_a
         .store

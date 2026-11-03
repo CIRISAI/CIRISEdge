@@ -678,8 +678,24 @@ async fn form_family_by_consent(p1: &Member, q1: &Member, p: &Ident, q: &Ident, 
     )
     .await
     .expect("P1 proposes Q");
+    // It reaches Q1 at Q1's apply door. Not through P1's serve: before the
+    // widening Q1 is a first-contact stranger to P1 (no consent grant, not a
+    // family member's node), and first-contact reach carries no family-scoped
+    // row — the #955 invitee arm widens the AUDIENCE, not the send set
+    // (persist's `may_receive`, CIRISEdge#761). A host whose persons consented to each
+    // other carries it on the round; `pair_room_consent_955` hands it over
+    // the same way.
+    // persist v61 (#1148): Q1 judges its OWN audience for the family's
+    // record, and an invitee's node is in it only once it holds the live
+    // proposal naming it (`live_invitees_of` reads this node's store). So the
+    // proposal crosses first, then the founding.
+    let proposed = deliver(q1, &proposal, p1).await;
+    assert!(
+        proposed.is_admitted(),
+        "Q1 admits the proposal naming Q: {proposed:?}"
+    );
     // The founding record reaches the INVITEE's node, after the proposal
-    // names it (the record the proposal needs to be admitted). A non-family
+    // names it. A non-family
     // node is handed nothing here: what the record plane may reach before a
     // proposal is its own fix (the v38 record-exposure blocker), and this
     // witness asserts nothing about a non-member's record.
@@ -692,17 +708,6 @@ async fn form_family_by_consent(p1: &Member, q1: &Member, p: &Ident, q: &Ident, 
         active_members(&q1.node).await,
         [p.key_id.as_str()],
         "founded by P alone"
-    );
-    // It reaches Q1 at Q1's apply door. Not through P1's serve: before the
-    // widening Q1 is a first-contact stranger to P1 (no consent grant, not a
-    // family member's node), and first-contact reach carries no family-scoped
-    // row — the #955 invitee arm widens the AUDIENCE, not the send set
-    // (persist's `may_receive`, CIRISEdge#761). A host whose persons consented to each
-    // other carries it on the round; `pair_room_consent_955` hands it over
-    // the same way.
-    assert!(
-        deliver(q1, &proposal, p1).await.is_admitted(),
-        "Q1 admits the proposal naming Q"
     );
     let inbox = membership::pending_proposals_for(&*q1.node.dir, &q.key_id)
         .await
