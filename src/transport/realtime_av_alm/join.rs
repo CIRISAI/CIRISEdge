@@ -1,5 +1,11 @@
 //! ALM-B — parent finding / tree join (CIRISEdge#131 + CIRISEdge#128 MDC).
 //!
+//! **SUPERSEDED** by [`super::controller`] (C2 admission + C4 selector).
+//! This planner is stateless, sorts by RTT and checks `has_room_for(B, 0)`
+//! (current load ignored), so every concurrent joiner picks the same parent
+//! (sim M9: 500 of 500). It has no production caller and stays only until the
+//! controller is wired into `av_call.rs`; do not build on it.
+//!
 //! Given a stream + my own [`ReceiverLayerPolicy`] + a candidate
 //! pool of [`ParentCandidate`]s, [`AlmJoinPlanner::plan`] picks the
 //! best primary parent (lowest RTT with room + adequate

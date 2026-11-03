@@ -1,5 +1,32 @@
 # CIRISEdge Release Notes
 
+# Unreleased: A/V chunk source authentication
+
+- **Source authentication for A/V chunks.** A call's stream keys come from the room's MLS group, so
+  every member can decrypt every stream. The inner seal alone therefore proves a chunk came from the
+  room, not from the stream's publisher. So the A/V chunk format carries the publisher's signature.
+  Receivers, and member relays (`CallOptions::relay`, room members) before they forward, drop any
+  chunk that doesn't verify. Members can decrypt each other's streams, but only a stream's publisher
+  can produce chunks for it.
+  - At stream start and at every epoch roll, the publisher makes an ephemeral Ed25519 chunk key. It
+    binds the key to the stream with its hybrid federation signature (Ed25519 + ML-DSA-65).
+  - Receivers verify a binding once, against persist's directory. Each chunk then costs one map
+    lookup and one Ed25519 verification, with no persist read per chunk.
+  - A member relay forwards only chunks whose verified publisher is the peer it heard them from.
+  - Bindings travel only on member-to-member A/V legs. A non-member transport forwarder never
+    receives one; it forwards the link-sealed frames opaque.
+  - Refusals are named by stable tokens (`av_chunk_unbound`, `av_chunk_trailer_invalid`, …).
+  - A binding is about ten Channel messages. A leg that has just carried one settles for 150 ms:
+    a chunk the link refuses as congested is retried rather than dropped, so the binding doesn't
+    cost the chunks right behind it. Outside that window, congested chunks are dropped as before.
+  - The chunk carries a 64-byte signature. The per-frame plaintext budget is therefore the link's
+    Channel limit less 148 bytes: 252 bytes on a base-MTU link.
+  - The wire layout and KAT vectors are in `docs/av_chunk_auth_wire.md`.
+- **Rust surface:** `av_call::CallDeps` gains two required fields, `signer` (the node's federation
+  signer, which binds its stream's chunk keys) and `verifier` (a `StreamKeyVerifier`;
+  `av_chunk_auth::DirectoryKeys` wraps a persist directory). `Edge::join_call` fills both.
+  `Call::chunk_auth_counts` reports what the check counted.
+
 # v43.4.1 — a contact's key is asked of the contact, and relayed routes stop costing rounds
 
 **2026-10-31.** **PATCH** from v43.4.0. Pins CIRISPersist **v59.1.2** (verify v20.2.0 unchanged).

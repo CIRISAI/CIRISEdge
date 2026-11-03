@@ -291,6 +291,21 @@ pub trait AvLinkSender: Send + Sync + 'static {
     /// one: absorbing the condition here makes it unobservable to every
     /// layer above, which is exactly the defect leviculum#66 documents.
     async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError>;
+
+    /// ALM C5 — send one MEDIA chunk. A sender that can give it a deadline
+    /// does (leviculum's timed Channel frames, so a stale frame is never
+    /// retransmitted or delivered late); the default is [`Self::send`].
+    /// Control frames (binding parts, C3) always go through [`Self::send`].
+    async fn send_media(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+        self.send(bytes).await
+    }
+
+    /// The most one message on this link carries, when the transport knows
+    /// it. Control frames that span several messages (a call's stream key
+    /// binding) are sized to it. `None` by default.
+    fn message_limit(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The async byte-stream recv half the caller plugs in. `recv` resolves
@@ -315,6 +330,7 @@ pub trait AvLinkReceiver: Send + Sync + 'static {
         Ok(InboundWireFrame {
             dropped_before: 0,
             bytes: self.recv().await?,
+            queued_at: None,
         })
     }
 }
@@ -328,6 +344,10 @@ pub struct InboundWireFrame {
     pub dropped_before: u64,
     /// The frame.
     pub bytes: Vec<u8>,
+    /// When the transport queued it (ALM C5: a consumer drops media older
+    /// than its budget by AGE, oldest first). `None` from a seam that does
+    /// not stamp.
+    pub queued_at: Option<std::time::Instant>,
 }
 
 /// Extra hop-counter values an open loop tries PAST the reported gap.
@@ -483,7 +503,18 @@ struct OutboundState {
     /// CIRISEdge#805 item 5 — the subscriber's layer cap: a chunk above it is
     /// not sent on this leg (and consumes no counter).
     policy: ReceiverLayerPolicy,
+    /// CIRISEdge#805 — until when the leg is SETTLING after a control burst
+    /// (a call's stream key binding, several Channel messages): a chunk the
+    /// link refuses as congested is retried briefly instead of dropped, so
+    /// the burst does not cost the chunks right behind it. `None` outside a
+    /// burst: a congested chunk is dropped at once (#591).
+    settle_until: Option<std::time::Instant>,
 }
+
+/// CIRISEdge#805 — how long a leg settles after a control burst.
+pub const CONTROL_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+/// CIRISEdge#805 — the pause between retries of a settling leg's chunk.
+const SETTLE_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// CIRISEdge#805 item 5 — what one fan-out did on one downstream leg.
 #[derive(Debug)]
@@ -585,6 +616,7 @@ impl AvDispatcher {
                     next_link_seq: 0,
                     sender: link.outbound_send,
                     policy: ReceiverLayerPolicy::UNCAPPED,
+                    settle_until: None,
                 },
             );
         }
@@ -737,6 +769,100 @@ impl AvDispatcher {
         self.fan_out_report(inner, except).await
     }
 
+    /// CIRISEdge#805 — send control frames (not chunks) to every downstream
+    /// leg except `except`: `frames_for(limit)` gives the frames for a leg
+    /// whose messages carry at most `limit` bytes, sent in order. A control
+    /// frame takes no outer A/V seal and no `link_seq` (the link seal still
+    /// covers it), and no layer policy applies. A congested leg is retried
+    /// briefly; a leg that stays congested gives up the rest of its frames.
+    /// A leg whose link is gone is pruned.
+    pub async fn send_control_report(
+        &mut self,
+        except: &[PeerKeyId],
+        frames_for: &(dyn Fn(Option<usize>) -> Vec<Vec<u8>> + Send + Sync),
+    ) -> Vec<(PeerKeyId, LegSend)> {
+        const CONGESTED_RETRIES: u32 = 20;
+        const CONGESTED_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+        let mut report = Vec::with_capacity(self.subscribers.len());
+        let mut gone = Vec::new();
+        for (subscriber, state) in &mut self.subscribers {
+            if except.contains(subscriber) {
+                continue;
+            }
+            let frames = frames_for(state.sender.message_limit());
+            state.settle_until = Some(std::time::Instant::now() + CONTROL_SETTLE);
+            let mut leg = LegSend::Sent;
+            'frames: for frame in &frames {
+                let mut tries = 0;
+                loop {
+                    match state.sender.send(frame).await {
+                        Ok(()) => break,
+                        Err(AvDispatcherError::Congested) if tries < CONGESTED_RETRIES => {
+                            tries += 1;
+                            tokio::time::sleep(CONGESTED_PAUSE).await;
+                        }
+                        Err(AvDispatcherError::LinkGone(_)) => {
+                            gone.push(subscriber.clone());
+                            leg = LegSend::Gone;
+                            break 'frames;
+                        }
+                        Err(e) => {
+                            leg = LegSend::Failed(e);
+                            break 'frames;
+                        }
+                    }
+                }
+            }
+            report.push((subscriber.clone(), leg));
+        }
+        for subscriber in &gone {
+            self.subscribers.remove(subscriber);
+        }
+        report
+    }
+
+    /// ALM stage 2 — send one control frame (C3) to ONE subscriber's leg,
+    /// retrying brief backpressure, WITHOUT settling the leg (a C3 frame is
+    /// one small message, not a burst). `None` when `subscriber` has no leg.
+    pub async fn send_control_to(
+        &mut self,
+        subscriber: &PeerKeyId,
+        frame: &[u8],
+    ) -> Option<LegSend> {
+        const TRIES: u32 = 5;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+        let state = self.subscribers.get_mut(subscriber)?;
+        let mut tries = 0;
+        loop {
+            match state.sender.send(frame).await {
+                Ok(()) => return Some(LegSend::Sent),
+                Err(AvDispatcherError::Congested) if tries < TRIES => {
+                    tries += 1;
+                    tokio::time::sleep(PAUSE).await;
+                }
+                Err(AvDispatcherError::LinkGone(_)) => {
+                    self.subscribers.remove(subscriber);
+                    return Some(LegSend::Gone);
+                }
+                Err(e) => return Some(LegSend::Failed(e)),
+            }
+        }
+    }
+
+    /// CIRISEdge#805 — mark `subscriber`'s leg SETTLING for
+    /// [`CONTROL_SETTLE`]: the caller just sent it a control burst on the
+    /// link directly (a call's binding on a fresh leg). Returns whether the
+    /// subscriber is on the roster.
+    pub fn settle(&mut self, subscriber: &PeerKeyId) -> bool {
+        match self.subscribers.get_mut(subscriber) {
+            Some(state) => {
+                state.settle_until = Some(std::time::Instant::now() + CONTROL_SETTLE);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// CIRISEdge#805 item 5 — cap `subscriber`'s leg at `policy`: chunks
     /// whose layer is above it are not sent to it (the relay-side layer
     /// policy). Returns whether the subscriber is on the roster.
@@ -798,7 +924,23 @@ impl AvDispatcher {
             // failed any other way is ambiguous (the bytes may be out), so
             // its counter is spent — a nonce that might have been emitted is
             // never used twice.
-            let leg = match state.sender.send(&sealed.to_bytes()).await {
+            let wire = sealed.to_bytes();
+            let mut sent = state.sender.send_media(&wire).await;
+            while matches!(sent, Err(AvDispatcherError::Congested))
+                && state
+                    .settle_until
+                    .is_some_and(|until| std::time::Instant::now() < until)
+            {
+                tokio::time::sleep(SETTLE_RETRY).await;
+                sent = state.sender.send_media(&wire).await;
+            }
+            if state
+                .settle_until
+                .is_some_and(|until| std::time::Instant::now() >= until)
+            {
+                state.settle_until = None;
+            }
+            let leg = match sent {
                 Ok(()) => {
                     state.next_link_seq = state.next_link_seq.wrapping_add(1);
                     LegSend::Sent
@@ -972,6 +1114,7 @@ impl AvDispatcher {
                 next_link_seq,
                 sender: link.outbound_send,
                 policy: ReceiverLayerPolicy::UNCAPPED,
+                settle_until: None,
             },
         );
         Ok(())
@@ -1322,6 +1465,7 @@ mod tests {
             tx.send(InboundWireFrame {
                 dropped_before,
                 bytes: wire(chunk_seq, link_seq),
+                queued_at: None,
             })
             .expect("feed");
         }
@@ -1381,6 +1525,7 @@ mod tests {
             tx.send(InboundWireFrame {
                 dropped_before,
                 bytes,
+                queued_at: None,
             })
             .expect("feed");
         }
@@ -1541,6 +1686,7 @@ mod tests {
             bytes: seal_av_outer(&inner(&dek, chunk_seq, 32), &[0x31; 32], link_id, link_seq)
                 .expect("outer")
                 .to_bytes(),
+            queued_at: None,
         }
     }
 

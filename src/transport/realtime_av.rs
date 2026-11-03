@@ -100,7 +100,7 @@ use crate::transport::TransportId;
 /// Per-stream identity — 32 bytes, derived by callers as `sha256(stream_meta)`.
 /// The exact derivation lives upstream (lens / agent UX); this module treats
 /// it as an opaque key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId(pub [u8; 32]);
 
 /// THE spelling of a stream's id as a string: `av-` + the lowercase hex of its
