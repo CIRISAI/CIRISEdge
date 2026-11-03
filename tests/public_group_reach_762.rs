@@ -436,7 +436,7 @@ async fn found(node: &Node, scope: GroupScope, group: &str, infrastructure: bool
                     })),
                 )
             } else {
-                ("founder_only", None)
+                ("majority", None)
             };
             let community = Community {
                 community_key_id: group.to_owned(),

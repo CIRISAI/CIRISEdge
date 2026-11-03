@@ -163,8 +163,8 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
     let key_b = TestFedKey::new("edge-key-bbbb", 0x0b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
 
@@ -301,8 +301,8 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
     let key_b = TestFedKey::new("edge-bg-bbbb", 0x2b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
 

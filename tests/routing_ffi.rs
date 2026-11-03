@@ -108,7 +108,7 @@ async fn single_transport(
     let key_a = TestFedKey::new("edge-routing-aaaa", 0x3a);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
     ])
     .await;
 
@@ -150,8 +150,8 @@ async fn paired_transports(
     let key_b = TestFedKey::new("edge-routing-bbbb", 0x3b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
 
@@ -863,7 +863,7 @@ async fn blackhole_durable_round_trip() {
     let key_a = TestFedKey::new("edge-durable-bh-aaaa", 0x41);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
     ])
     .await;
     let blackhole: Arc<dyn ciris_persist::federation::BlackholeRules> = directory.clone();
@@ -1039,7 +1039,7 @@ async fn blackhole_upsert_preserves_hits_on_intent_change() {
     let key_a = TestFedKey::new("edge-upsert-bh-aaaa", 0x51);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
     ])
     .await;
     let blackhole: Arc<dyn ciris_persist::federation::BlackholeRules> = directory.clone();

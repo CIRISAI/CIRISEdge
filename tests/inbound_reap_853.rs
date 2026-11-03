@@ -139,8 +139,8 @@ async fn pair_ticking(tag: &str, inbound_bound: Duration, fast_tick: bool) -> Pa
     let key_b = TestFedKey::new(&format!("edge-b-853-{tag}"), 0x0b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
     let metrics_a = ciris_edge::EdgeMetrics::new();

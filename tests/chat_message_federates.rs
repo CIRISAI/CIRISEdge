@@ -2286,7 +2286,7 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
         &room,
         "the trio",
         &[(alice_fed().as_str(), Some(MEMBER_ROLE_FOUNDER))],
-        consensus_protocol::FOUNDER_ONLY,
+        consensus_protocol::MAJORITY,
         ts(),
     )
     .expect("alice is the founder");
@@ -2507,7 +2507,7 @@ async fn a_chat_message_cites_its_blob_in_evidence_refs_and_keeps_the_pointer() 
         &room,
         "solo",
         &[(alice_fed().as_str(), Some(MEMBER_ROLE_FOUNDER))],
-        consensus_protocol::FOUNDER_ONLY,
+        consensus_protocol::MAJORITY,
         ts(),
     )
     .expect("alice is the founder");

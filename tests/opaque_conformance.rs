@@ -273,8 +273,8 @@ mod loopback {
 
         let dir = directory_with(vec![
             signed_record(&steward, &steward, "steward"),
-            signed_record(&a, &steward, "agent"),
-            signed_record(&b, &steward, "agent"),
+            signed_record(&a, &steward, "node"),
+            signed_record(&b, &steward, "node"),
         ])
         .await;
 
@@ -437,8 +437,8 @@ mod loopback {
         let b = TestFedKey::new("edge-b-opaque-ev", 0x3b);
         let dir = directory_with(vec![
             signed_record(&steward, &steward, "steward"),
-            signed_record(&a, &steward, "agent"),
-            signed_record(&b, &steward, "agent"),
+            signed_record(&a, &steward, "node"),
+            signed_record(&b, &steward, "node"),
         ])
         .await;
 
@@ -582,8 +582,8 @@ mod loopback {
         let b = TestFedKey::new("edge-b-opaque-243", 0x4b);
         let dir = directory_with(vec![
             signed_record(&steward, &steward, "steward"),
-            signed_record(&a, &steward, "agent"),
-            signed_record(&b, &steward, "agent"),
+            signed_record(&a, &steward, "node"),
+            signed_record(&b, &steward, "node"),
         ])
         .await;
 

@@ -545,9 +545,14 @@ pub(crate) fn typed_terminal_verdict(
         // occurrence revocation). persist: "Terminal: the same bytes are never
         // admitted on this door". Its token is `kind()`, persist's
         // `replication_policy::ENVELOPE_KIND_RETIRED` (v59.0.0).
+        //
+        // persist v61 (CIRISPersist#1143) — a change to a DISSOLVED group:
+        // nothing about it is ever admitted again (the dissolution's signed
+        // instant stands), so a re-offer can only be refused again.
         E::TraceDimensionInvalid { .. }
         | E::MalformedRow { .. }
-        | E::EnvelopeKindRetired { .. } => Some(err.kind()),
+        | E::EnvelopeKindRetired { .. }
+        | E::GroupDissolved { .. } => Some(err.kind()),
         // persist v55.0.0 (#753) introduced terminal DimensionRejected reasons
         // one by one (`registered_family_held_shut`, the ledger binding). persist
         // v61 publishes the predicate: `dimension_rejected_reason::RETRYABLE`
@@ -562,10 +567,6 @@ pub(crate) fn typed_terminal_verdict(
         {
             Some(reason)
         }
-        // persist v61 (CIRISPersist#1143) — a change to a DISSOLVED group:
-        // nothing about it is ever admitted again (the dissolution's signed
-        // instant stands), so a re-offer can only be refused again.
-        E::GroupDissolved { .. } => Some(err.kind()),
         // persist v55.0.0 (#989 / #975) — a row type the row-type gate refuses
         // (a retired carrier: a new `holds_bytes` claim, retired in v55, or a
         // key-grant SET), and
@@ -7884,7 +7885,10 @@ impl FederationDirectoryReplicationBridge {
     /// (`RecipientNotInSendSet`) so the narrowing is never silent. Applied on
     /// the advertise AND the direct-fetch twin, which must agree (the v18.2.0
     /// lesson); the subject-Pull is first-party by construction and untouched.
-    #[allow(clippy::too_many_arguments)] // the row twice: the gate view and the typed row persist reads
+    // The row twice (the gate view and the typed row persist reads); and since
+    // persist v61 (#991) the group-plane arm, the framed planes' rule in one
+    // place, adds the lines.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn audience_withholds(
         &self,
         audience: Result<ciris_persist::federation::Audience, String>,
@@ -11679,14 +11683,14 @@ pub(crate) mod tests {
         epoch: u64,
         asserted_at: chrono::DateTime<Utc>,
     ) -> ciris_persist::federation::self_at_login::SignedTransportDestination {
-        // persist v61 (CC 2.6.2 strict): the route's instant is `.sssZ`, so the
-        // typed column holds the millisecond the envelope carries.
-        let asserted_at =
-            ciris_persist::federation::admission::truncate_to_substrate_resolution(asserted_at);
         use ciris_persist::federation::self_at_login::{
             BindingProvenance, SignedTransportDestination, TransportDestination,
         };
         use ciris_verify_core::transport_binding::TransportBindingSignature;
+        // persist v61 (CC 2.6.2 strict): the route's instant is `.sssZ`, so the
+        // typed column holds the millisecond the envelope carries.
+        let asserted_at =
+            ciris_persist::federation::admission::truncate_to_substrate_resolution(asserted_at);
         let row = TransportDestination {
             occurrence_key_id: key_id.to_string(),
             transport_kind: "reticulum".to_string(),
@@ -12619,7 +12623,11 @@ pub(crate) mod tests {
             "still parked"
         );
         assert!(
-            backoff.suppressed_at(kind, &hash, t0 + TERMINAL_BASE - Duration::from_secs(1)),
+            backoff.suppressed_at(
+                kind,
+                &hash,
+                t0 + TERMINAL_BASE.saturating_sub(Duration::from_secs(1))
+            ),
             "quiet for the whole terminal window — no loop"
         );
         let second = backoff.record_at(kind, hash, RetryDisposition::Terminal, t0 + TERMINAL_BASE);
@@ -13590,8 +13598,9 @@ pub(crate) mod tests {
     /// signed it. Every other E4 kind admits a distinct authority by design
     /// (an authority legitimately speaks about parties who are not itself) and
     /// passes `&[]`.
-    // A test fixture: V151 (#860) added the two group-seeding slices.
-    #[allow(clippy::too_many_arguments)]
+    // A test fixture: V151 (#860) added the two group-seeding slices; persist
+    // v61 (#991) the branch to the row path.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn pin_e4_forward_path<T>(
         kind: EnvelopeKind,
         cohort: &[&str],
@@ -22085,6 +22094,8 @@ pub(crate) mod tests {
                 .await
         }
 
+        // Its one caller is the test-anchor-gated 761 trust-root witness.
+        #[cfg(feature = "test-anchor")]
         async fn test_fetch_raw(&self, kind: EnvelopeKind, hash: &[u8; 32]) -> Option<Vec<u8>> {
             self.fetch_envelope_bytes(serve_kind(kind), hash).await
         }

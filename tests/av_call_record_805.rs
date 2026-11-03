@@ -155,53 +155,47 @@ async fn room() -> RoomFixture {
         .expect("admit the owner binding");
     }
     let room = chat::new_room_community_key_id();
+    // persist v61 (#1123, CC 4.5.13): one voice never decides who is in a room
+    // above the family, so alice cannot widen bob and then carol alone under
+    // `majority`. The room is FOUNDED with all three: alice signs the record and
+    // bob and carol co-sign it (persist #955: a founding admits the members who
+    // signed it).
     let roster = chat::community(
         &room,
         "the call room",
-        &[("alice-fed", Some(MEMBER_ROLE_FOUNDER))],
-        consensus_protocol::FOUNDER_ONLY,
+        &[
+            ("alice-fed", Some(MEMBER_ROLE_FOUNDER)),
+            ("bob-fed", None),
+            ("carol-fed", None),
+        ],
+        consensus_protocol::MAJORITY,
         ts(),
     )
-    .expect("alice founds it");
-    dir.put_community(
-        chat::signed_community(roster, &alice.human)
-            .await
-            .expect("sign"),
-    )
-    .await
-    .expect("admit the room");
+    .expect("alice founds it with bob and carol");
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&roster.signing_envelope())
+        .expect("canonicalize the room");
+    let mut signed = chat::signed_community(roster, &alice.human)
+        .await
+        .expect("sign");
+    for m in [&bob, &carol] {
+        let (classical, pqc) =
+            ciris_edge::identity::sign_bound_hybrid(&m.human, &canonical, "room cosign")
+                .await
+                .expect("cosign");
+        signed
+            .cosignatures
+            .push(ciris_persist::federation::types::RosterCosignature {
+                authority_key_id: m.human.key_id.clone(),
+                scrub_signature_classical: classical,
+                scrub_signature_pqc: pqc,
+            });
+    }
+    dir.put_community(signed).await.expect("admit the room");
     dir.put_public_key(SignedKeyRecord {
         record: record(&room, &signer(&room, 9), &signer(&room, 9), "user").await,
     })
     .await
     .expect("register the room id as a key (persist fixture convention)");
-    for (m, who) in [(&bob, "bob-fed"), (&carol, "carol-fed")] {
-        let proposal = ciris_edge::membership::propose(
-            &*dir,
-            ciris_edge::membership::GroupScope::Community,
-            &room,
-            who,
-            None,
-            chrono::Utc::now() + chrono::Duration::days(7),
-            &alice.human,
-        )
-        .await
-        .expect("alice proposes");
-        ciris_edge::membership::reply(&*dir, &proposal.attestation_id, true, &m.human)
-            .await
-            .expect("the member accepts");
-        assert!(ciris_edge::membership::widen(
-            &*dir,
-            ciris_edge::membership::GroupScope::Community,
-            &room,
-            who,
-            None,
-            ts(),
-            &alice.human,
-        )
-        .await
-        .expect("alice widens"));
-    }
     RoomFixture {
         dir,
         room,
@@ -489,11 +483,13 @@ async fn an_attendee_removed_from_the_room_stays_an_attendee() {
         "bob-fed",
         chrono::Utc::now() - chrono::Duration::seconds(1),
         Some("removed for the witness"),
-        &["alice-fed"],
-        &r.alice.human,
+        &["bob-fed"],
+        // persist v61 (#1123): a removal under `majority` takes the room's
+        // votes; bob's own resignation is his alone.
+        &r.bob.human,
     )
     .await
-    .expect("alice removes bob from the room");
+    .expect("bob leaves the room");
     assert!(
         !ciris_persist::federation::is_active_community_member(&*r.dir, &r.room, "bob-fed")
             .await

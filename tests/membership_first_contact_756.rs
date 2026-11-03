@@ -447,7 +447,7 @@ async fn found(node: &Node, scope: GroupScope, group: &str) {
                     role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
                 }],
                 founded_at: at,
-                consensus_protocol: "founder_only".to_owned(),
+                consensus_protocol: "majority".to_owned(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
                 prev_head_digest: String::new(),

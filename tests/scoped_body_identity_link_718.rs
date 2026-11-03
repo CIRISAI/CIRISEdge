@@ -276,7 +276,7 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
             })
             .collect(),
         founded_at: ts(),
-        consensus_protocol: "founder_only".to_owned(),
+        consensus_protocol: "majority".to_owned(),
         policy_blob: None,
         persist_row_hash: String::new(),
         prev_head_digest: String::new(),

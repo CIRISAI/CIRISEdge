@@ -683,12 +683,10 @@ async fn form_family_by_consent(p1: &Member, q1: &Member, p: &Ident, q: &Ident, 
     // node is handed nothing here: what the record plane may reach before a
     // proposal is its own fix (the v38 record-exposure blocker), and this
     // witness asserts nothing about a non-member's record.
+    let founding = carry_plane(p1, q1, GroupPlaneFamily::Roster).await;
     assert!(
-        carry_plane(p1, q1, GroupPlaneFamily::Roster)
-            .await
-            .iter()
-            .all(ApplyOutcome::is_admitted),
-        "the founding reaches the invitee's node"
+        !founding.is_empty() && founding.iter().all(ApplyOutcome::is_admitted),
+        "the founding reaches the invitee's node: {founding:?}"
     );
     assert_eq!(
         active_members(&q1.node).await,
