@@ -235,12 +235,14 @@ pub fn fleet_default_row(class: BudgetClass) -> Option<&'static FleetDefault> {
 /// CC 5.4.3 rc16 **two planes** — the message types that are bulk by kind:
 /// content and blob/DAG chunk bodies, and the fetches that ask for them (so
 /// the answer finds an unshaped reverse path to ride back on, even to a peer
-/// it cannot dial). Wire spellings of `crate::messages::MessageType`.
+/// it cannot dial). The WIRE spellings of `crate::messages::MessageType`
+/// (serde's default: the variant name), pinned to serde's own output by
+/// `bulk_classes_are_the_wire_spelling_of_their_message_types`.
 pub const BULK_MESSAGE_TYPES: [&str; 4] = [
-    "content_fetch",
-    "content_body",
-    "blob_chunk_fetch",
-    "blob_chunk_body",
+    "ContentFetch",
+    "ContentBody",
+    "BlobChunkFetch",
+    "BlobChunkBody",
 ];
 
 /// Whether an outbound envelope is bulk by kind ([`BULK_MESSAGE_TYPES`]).
@@ -1703,22 +1705,39 @@ mod tests {
     /// only when its link is shaped.
     #[test]
     fn bulk_is_classified_by_kind_and_only_leaves_a_shaped_link() {
-        let env = |t: &str| {
-            format!(
-                r#"{{"edge_schema_version":"1","signing_key_id":"a","destination_key_id":"b","message_type":"{t}","body":{{"x":1}}}}"#
-            )
-            .into_bytes()
+        use crate::messages::MessageType as M;
+        // The exact bytes the field produces: the envelope the edge builds
+        // (field order and serde spelling of the real `EdgeEnvelope`).
+        let env = |t: M| {
+            let mut v = serde_json::json!({
+                "edge_schema_version": crate::messages::SchemaVersion::default(),
+                "signing_key_id": "a",
+                "destination_key_id": "b",
+                "message_type": t,
+            })
+            .to_string()
+            .into_bytes();
+            // serde_json::json! sorts keys; the edge's struct order puts
+            // `message_type` before `body` and the signatures: append those.
+            v.pop();
+            v.extend_from_slice(br#","body":{"x":1},"signature":"s"}"#);
+            v
         };
-        for t in BULK_MESSAGE_TYPES {
-            assert!(is_bulk_class(&env(t)), "{t}");
+        for t in [
+            M::ContentFetch,
+            M::ContentBody,
+            M::BlobChunkFetch,
+            M::BlobChunkBody,
+        ] {
+            assert!(is_bulk_class(&env(t.clone())), "{t:?}");
         }
         for t in [
-            "attestation_gossip",
-            "opaque_request",
-            "content_miss",
-            "blob_chunk_miss",
+            M::AttestationGossip,
+            M::OpaqueRequest,
+            M::ContentMiss,
+            M::BlobChunkMiss,
         ] {
-            assert!(!is_bulk_class(&env(t)), "{t}");
+            assert!(!is_bulk_class(&env(t.clone())), "{t:?}");
         }
         assert!(!is_bulk_class(b"not json at all"));
         let t = LinkShapers::new(ShapingPolicy::for_class(BudgetClass::Server));
@@ -1744,6 +1763,30 @@ mod tests {
         assert!(t.is_bulk([4u8; 16]));
         t.forget(&[4u8; 16]);
         assert!(!t.is_bulk([4u8; 16]));
+    }
+
+    /// The classifier's spellings ARE serde's: each bulk class is the JSON
+    /// string `MessageType` serializes to, so a rename on either side fails
+    /// here instead of silently routing bulk onto the shaped link.
+    #[test]
+    fn bulk_classes_are_the_wire_spelling_of_their_message_types() {
+        use crate::messages::MessageType as M;
+        let wire: Vec<String> = [
+            M::ContentFetch,
+            M::ContentBody,
+            M::BlobChunkFetch,
+            M::BlobChunkBody,
+        ]
+        .iter()
+        .map(|t| {
+            serde_json::to_value(t)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+        assert_eq!(wire, BULK_MESSAGE_TYPES.map(str::to_owned).to_vec());
     }
 
     /// CC 5.4.3 rc16 **two planes**: a shaped link carries rows, never bulk.

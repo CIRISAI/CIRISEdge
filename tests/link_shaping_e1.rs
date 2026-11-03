@@ -232,6 +232,15 @@ fn policy(
     }
 }
 
+/// An `off` policy the suite names itself (not the library default), so
+/// `CIRIS_EDGE_TEST_SHAPING=server` (tests/common) never turns it on.
+fn explicit_off() -> ShapingPolicy {
+    ShapingPolicy {
+        layer_reserve_links: 0,
+        ..ShapingPolicy::default()
+    }
+}
+
 /// `A` listens, `B` dials; each holds the other's signed route.
 async fn duo(tag: &str, policy_a: ShapingPolicy, policy_b: ShapingPolicy) -> Duo {
     init_tracing();
@@ -452,7 +461,7 @@ async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
     let lenient = duo(
         "half",
         policy(BudgetClass::Home, 200_000, 0.5, 10, false),
-        ShapingPolicy::default(),
+        explicit_off(),
     )
     .await;
     // A (shaping) dials B (off): A offers, B answers off.
@@ -492,7 +501,7 @@ async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
     let strict = duo(
         "strict",
         policy(BudgetClass::Home, 200_000, 0.5, 10, true),
-        ShapingPolicy::default(),
+        explicit_off(),
     )
     .await;
     match strict
@@ -596,7 +605,8 @@ async fn rho_and_the_window_move_the_real_share_and_the_delay() {
 }
 
 /// An envelope-shaped payload of `len` bytes whose head names `message_type`
-/// (the transport reads only the head to classify bulk; the bytes cross as is).
+/// in its WIRE spelling (`MessageType`'s serde form, e.g. `BlobChunkBody`):
+/// the transport reads only the head to classify bulk; the bytes cross as is.
 fn typed_payload(message_type: &str, marker: &[u8], len: usize) -> Vec<u8> {
     let head = format!(
         r#"{{"edge_schema_version":"1","signing_key_id":"s","destination_key_id":"d","message_type":"{message_type}","body":""#
@@ -621,7 +631,7 @@ async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_consta
     let t = duo("bulk", server.clone(), server).await;
     t.a.transport.set_link_wire_tap_for_test(true);
     t.b.transport.set_link_wire_tap_for_test(true);
-    let row = typed_payload("attestation_gossip", b"BULK-ROW-", 2_000);
+    let row = typed_payload("AttestationGossip", b"BULK-ROW-", 2_000);
     t.b.transport
         .send(&t.a.key.key_id, &row)
         .await
@@ -640,7 +650,7 @@ async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_consta
         t.b.metrics.link_shaping()
     );
 
-    let blob = typed_payload("blob_chunk_body", b"BLOB-1MIB-", 1 << 20);
+    let blob = typed_payload("BlobChunkBody", b"BLOB-1MIB-", 1 << 20);
     t.b.transport
         .send(&t.a.key.key_id, &blob)
         .await
@@ -648,7 +658,7 @@ async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_consta
     let dag: Vec<Vec<u8>> = (0..4)
         .map(|i| {
             typed_payload(
-                "blob_chunk_body",
+                "BlobChunkBody",
                 format!("DAG-CHUNK-{i}-").as_bytes(),
                 256 * 1024,
             )
@@ -660,7 +670,7 @@ async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_consta
             .await
             .expect("a DAG chunk B -> A completes");
     }
-    let body = typed_payload("content_body", b"CONTENT-A2B-", 512 * 1024);
+    let body = typed_payload("ContentBody", b"CONTENT-A2B-", 512 * 1024);
     t.a.transport
         .send(&t.b.key.key_id, &body)
         .await
@@ -728,13 +738,14 @@ async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_consta
 /// 10 s = 500 kB), so it needs the bulk plane, and no unshaped link to B can
 /// exist. It must not fail: it rides the shaped link in shaped-budget
 /// fragments, slowly, counted `link_shaping_bulk_on_shaped_fallback`, and the
-/// shaped link stays one frame size throughout. Mutation: no fallback → the
+/// shaped link stays one frame size throughout (enough frames of it to have
+/// carried the whole megabyte). Mutation: no fallback → the
 /// send fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bulk_to_a_peer_reachable_only_over_its_shaped_link_rides_it_slowly_and_never_fails() {
     let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     let t = duo("fallback", server.clone(), server).await;
-    let row = typed_payload("attestation_gossip", b"FB-ROW-", 2_000);
+    let row = typed_payload("AttestationGossip", b"FB-ROW-", 2_000);
     t.b.transport
         .send(&t.a.key.key_id, &row)
         .await
@@ -754,7 +765,7 @@ async fn bulk_to_a_peer_reachable_only_over_its_shaped_link_rides_it_slowly_and_
     );
     t.a.transport.refuse_outbound_dials_for_test(true);
     t.a.transport.set_link_wire_tap_for_test(true);
-    let deliver = typed_payload("attestation_gossip", b"FB-DELIVER-", 1 << 20);
+    let deliver = typed_payload("AttestationGossip", b"FB-DELIVER-", 1 << 20);
     t.a.transport
         .send(&t.b.key.key_id, &deliver)
         .await
@@ -783,7 +794,7 @@ async fn bulk_to_a_peer_reachable_only_over_its_shaped_link_rides_it_slowly_and_
     let frames = frames_on(&wire, link);
     let (size, run) = trailing_run(&frames);
     assert!(
-        frames.iter().all(|f| f.len() == size) && run >= 2_000,
+        frames.iter().all(|f| f.len() == size) && run * size >= 1 << 20,
         "the shaped link stays one frame size while the bulk crosses: {run} × {size} B, others {:?}",
         frames.iter().map(Vec::len).filter(|&l| l != size).collect::<Vec<_>>()
     );

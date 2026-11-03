@@ -8645,12 +8645,13 @@ impl ReticulumTransport {
         envelope: &[u8],
         dial_error: TransportError,
     ) -> Result<TransportSendOutcome, TransportError> {
-        let shaped = self
+        let shaped_live = self
             .live_link_to_where(destination_key_id, LinkPlane::Identity, |id| {
                 self.shapers.is_shaped(id.into_bytes())
             })
             .await;
-        let Some(link) = shaped.filter(|l| self.shapers.needs_bulk_plane(l.into_bytes(), envelope))
+        let Some(link) =
+            shaped_live.filter(|l| self.shapers.needs_bulk_plane(l.into_bytes(), envelope))
         else {
             return Err(dial_error);
         };
@@ -11438,21 +11439,7 @@ impl DialCtx {
         };
         self.key_link(link_id, destination_key_id, pair, claim)
             .await?;
-        // CC 5.4.3 — the shaping offer is the link's first sealed frame; the
-        // dial waits for the peer's offer before anything else rides the link.
-        // CC 5.4.3 rc16 two planes — a bulk-lane dial offers nothing: the link
-        // runs unshaped (a responder only ever answers an offer) and is marked
-        // bulk, so no row lane takes it.
-        if self.bulk_lane {
-            self.shapers.mark_bulk(link_id.into_bytes());
-            tracing::debug!(
-                peer = %destination_key_id,
-                link = %hex::encode(link_id.into_bytes()),
-                "bulk-plane link up, unshaped (CC 5.4.3 two planes)"
-            );
-        } else {
-            self.offer_shaping(link_id, destination_key_id).await?;
-        }
+        self.settle_plane(link_id, destination_key_id).await?;
         Ok(link_id)
     }
 
@@ -11467,6 +11454,25 @@ impl DialCtx {
     ///
     /// [`LinkShapers::peer_offer`]: crate::transport::link_shaping::LinkShapers::peer_offer
     /// [`OFFER_ANSWER_BUDGET`]: crate::transport::link_shaping::OFFER_ANSWER_BUDGET
+    /// CC 5.4.3 — the dialled link's plane, settled right after the transit
+    /// KEX: a row-lane dial sends its shaping offer as the link's first
+    /// sealed frame and waits for the peer's ([`Self::offer_shaping`]); a
+    /// bulk-lane dial (CC 5.4.3 rc16 two planes) offers nothing, so the link
+    /// runs unshaped (a responder only ever answers an offer), and is marked
+    /// bulk, so no row lane takes it.
+    async fn settle_plane(&self, link_id: LinkId, peer: &str) -> Result<(), TransportError> {
+        if self.bulk_lane {
+            self.shapers.mark_bulk(link_id.into_bytes());
+            tracing::debug!(
+                peer = %peer,
+                link = %hex::encode(link_id.into_bytes()),
+                "bulk-plane link up, unshaped (CC 5.4.3 two planes)"
+            );
+            return Ok(());
+        }
+        self.offer_shaping(link_id, peer).await
+    }
+
     async fn offer_shaping(&self, link_id: LinkId, peer: &str) -> Result<(), TransportError> {
         use crate::transport::link_shaping::{ShapingError, OFFER_ANSWER_BUDGET};
         // CC 5.4.3 / 5.4.6 item 4 — nothing is offered to a peer this node
