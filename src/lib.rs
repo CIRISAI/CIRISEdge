@@ -61,6 +61,9 @@ pub mod contact;
 pub mod content_occurrence;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
+/// v44 (CIRISConstitution#198 §5) — which decision-relevant rows landed, as
+/// an event and a rebuildable cursor; the queue itself is the host's.
+pub mod decision_rows;
 pub mod delivery_mode;
 pub mod detector;
 /// CIRISEdge#683 — first contact on the opaque plane (`FSD/FIRST_CONTACT.md` §2.2).

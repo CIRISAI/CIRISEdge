@@ -423,6 +423,15 @@ pub async fn pending_proposals_for(
 /// Each signer is a PERSON (or other roster) key: the roster's consensus
 /// counts raw seat keys, so a widening must be signed by the founder's own
 /// key, not by a device acting for it.
+///
+/// **One voice, offered; never a tally** (persist v61, CIRISConstitution#198
+/// §5). The widener signs with the proposer's own pen only and hands that one
+/// voice to persist's door. It lands where the group's protocol says one
+/// voice is enough: a room of one (the newcomer's acceptance is the second
+/// voice, CC 3.1.3.2) or a `founder_only` family. Anywhere else persist
+/// refuses by rule (`roster_consensus_insufficient`); the widener logs it and
+/// the change is the server's cosign flow to collect. It never retries that
+/// refusal and never signs for anyone else.
 #[derive(Clone, Default)]
 pub struct MembershipWidener {
     authorities: Vec<Arc<crate::identity::LocalSigner>>,
@@ -470,6 +479,9 @@ pub enum WidenOutcome {
         member_key_id: String,
         /// Their role.
         role: Option<String>,
+        /// The proposal the acceptance answered: this widening completes the
+        /// proposal/acceptance pair (the decision-row event names it).
+        proposal_id: String,
     },
     /// The member was already active (a re-applied acceptance): nothing written.
     AlreadyMember,
@@ -554,21 +566,19 @@ pub async fn widen_on_acceptance(
             group_key_id: group,
             member_key_id: member,
             role,
+            proposal_id: proposal_id.to_owned(),
         }
     } else {
         WidenOutcome::AlreadyMember
     })
 }
 
-/// **The roster widening, signed by `authority`, put through the group's
-/// door.** Community: [`crate::community_roster::community_membership_widening`]
-/// → `add_community_member`. Family: a signed `FamilyMembershipWidening` →
-/// `put_family_membership_widening`. persist admits it only on a matching
-/// live acceptance by `member_key_id`; without one the refusal comes back by
-/// persist's rule, verbatim (a member who only ever DECLINED is refused
-/// `membership_declined`, terminal, by persist itself since v52 — CIRISPersist
-/// #955 follow-up; edge keeps no second copy of that rule). `Ok(false)` = the
-/// member was already active (no row written).
+/// **The roster widening, offered with ONE voice (`authority`).** Exactly
+/// [`widen_cosigned`] with one pen: persist's door admits it only where the
+/// group's `consensus_protocol` says one voice is enough (a room of one, where
+/// the newcomer's acceptance is the second voice; a `founder_only` family),
+/// and refuses it by rule anywhere else. Edge never adds a voice it was not
+/// given and counts nothing (CIRISConstitution#198 §5).
 ///
 /// # Errors
 /// Build/sign failure, or persist's refusal.
@@ -581,42 +591,84 @@ pub async fn widen(
     at: chrono::DateTime<chrono::Utc>,
     authority: &crate::identity::LocalSigner,
 ) -> Result<bool, MembershipError> {
-    widen_at_door(
+    widen_cosigned(
         directory,
         scope,
         group_key_id,
         member_key_id,
         role,
         at,
-        authority,
+        &[authority],
     )
     .await
 }
 
-async fn widen_at_door(
+/// **The roster widening, signed by every pen in `pens`, put through the
+/// group's door.** The first pen is the row's authority and the rest ride as
+/// its cosignatures (`additional_scrubs` on the v61 row), all over the same
+/// widening envelope. Community / affiliation: the room's
+/// `add_community_member`; family: `put_family_membership_widening`. persist
+/// judges the voices under the group's protocol and admits a growth only on a
+/// matching live acceptance by `member_key_id`; its refusal comes back by rule,
+/// verbatim. `Ok(false)` = the member was already active (no row written).
+///
+/// # Errors
+/// No pen; build/sign failure; persist's refusal.
+pub async fn widen_cosigned(
     directory: &dyn FederationDirectory,
     scope: GroupScope,
     group_key_id: &str,
     member_key_id: &str,
     role: Option<&str>,
     at: chrono::DateTime<chrono::Utc>,
-    authority: &crate::identity::LocalSigner,
+    pens: &[&crate::identity::LocalSigner],
 ) -> Result<bool, MembershipError> {
     use crate::replication::attestation_bind::truncate_to_substrate_resolution;
+    if pens.is_empty() {
+        return Err(MembershipError::Other(
+            "a widening needs at least one signature".into(),
+        ));
+    }
     match scope {
         // An affiliation widens through the community roster: the same
         // machinery at its own tier (CC 4.4.3.2.8).
         GroupScope::Community | GroupScope::Affiliations => {
-            let (member, spec) = crate::community_roster::community_membership_widening(
-                directory,
+            let event = crate::community_roster::RosterEvent::widening(
                 group_key_id,
                 member_key_id,
                 role,
                 at,
-                authority,
-            )
-            .await
-            .map_err(MembershipError::Other)?;
+            );
+            let crate::community_roster::RosterEvent::Widening(w) = &event else {
+                unreachable!("RosterEvent::widening builds a widening")
+            };
+            if directory
+                .lookup_community(group_key_id)
+                .await
+                .map_err(|e| MembershipError::from_persist("lookup room", &e))?
+                .is_none()
+            {
+                return Err(MembershipError::Other(format!(
+                    "room {group_key_id} is not on this directory: a widening names a roster \
+                     that must exist to be folded"
+                )));
+            }
+            let member = ciris_persist::federation::types::CommunityMember {
+                key_id: w.member_key_id.clone(),
+                joined_at: w.joined_at,
+                role: w.role.clone(),
+            };
+            let mut voices = crate::community_roster::cosign_all(&event, pens)
+                .await
+                .map_err(MembershipError::Other)?
+                .into_iter();
+            let primary = voices.next().expect("at least one pen");
+            let spec = ciris_persist::federation::cohort::AdmitSpec {
+                authority_key_id: primary.authority_key_id,
+                scrub_signature_classical: primary.scrub_signature_classical,
+                scrub_signature_pqc: primary.scrub_signature_pqc,
+                cosignatures: voices.collect(),
+            };
             directory
                 .add_community_member(group_key_id, member, &spec)
                 .await
@@ -644,18 +696,28 @@ async fn widen_at_door(
             let canonical =
                 ciris_persist::prelude::ceg_produce_canonicalize(&widening.signing_envelope())
                     .map_err(|e| MembershipError::Other(format!("canonicalize widening: {e}")))?;
-            let (scrub_signature_classical, scrub_signature_pqc) =
-                crate::identity::sign_bound_hybrid(authority, &canonical, "family widening")
-                    .await
-                    .map_err(MembershipError::Other)?;
+            let mut voices = Vec::with_capacity(pens.len());
+            for pen in pens {
+                let (classical, pqc) =
+                    crate::identity::sign_bound_hybrid(pen, &canonical, "family widening")
+                        .await
+                        .map_err(MembershipError::Other)?;
+                voices.push(ciris_persist::federation::types::RosterCosignature {
+                    authority_key_id: pen.key_id.clone(),
+                    scrub_signature_classical: classical,
+                    scrub_signature_pqc: pqc,
+                });
+            }
+            let mut voices = voices.into_iter();
+            let primary = voices.next().expect("at least one pen");
             directory
                 .put_family_membership_widening(
                     ciris_persist::federation::types::SignedFamilyMembershipWidening {
                         family_membership_widening: widening,
-                        authority_key_id: authority.key_id.clone(),
-                        scrub_signature_classical,
-                        scrub_signature_pqc,
-                        cosignatures: Vec::new(),
+                        authority_key_id: primary.authority_key_id,
+                        scrub_signature_classical: primary.scrub_signature_classical,
+                        scrub_signature_pqc: primary.scrub_signature_pqc,
+                        cosignatures: voices.collect(),
                     },
                 )
                 .await

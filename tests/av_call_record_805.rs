@@ -490,7 +490,7 @@ async fn an_attendee_removed_from_the_room_stays_an_attendee() {
         chrono::Utc::now() - chrono::Duration::seconds(1),
         Some("removed for the witness"),
         &["alice-fed"],
-        &r.alice.human,
+        &[&*r.alice.human],
     )
     .await
     .expect("alice removes bob from the room");

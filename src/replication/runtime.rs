@@ -1777,6 +1777,45 @@ impl ReplicationRuntime {
         self.bridge.release_bound_signer(kind, envelope_bytes)
     }
 
+    /// v44 (CIRISConstitution#198 §5) — a receiver of every later
+    /// decision-relevant-row event ([`crate::decision_rows`]). Nothing fires
+    /// while the node is suspended; rebuild from the last cursor with
+    /// [`crate::decision_rows::decision_rows_since`] on resume.
+    #[must_use]
+    pub fn subscribe_decision_rows(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::decision_rows::DecisionRowRef> {
+        self.bridge.subscribe_decision_rows()
+    }
+
+    /// v44 — the host wrote `row` locally: emit its decision-row event and
+    /// carry it to every peer now. `written_after` is an instant taken
+    /// before the write. See
+    /// [`FederationDirectoryReplicationBridge::note_local_write`].
+    pub async fn note_local_write(
+        &self,
+        row: &ciris_persist::federation::Attestation,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Option<crate::decision_rows::DecisionRowRef> {
+        self.bridge.note_local_write(row, written_after).await
+    }
+
+    /// v44 — the host wrote rows persist minted (a `put_*` roster door):
+    /// emit an event for every decision-relevant row served since
+    /// `written_after`, and carry them now. See
+    /// [`FederationDirectoryReplicationBridge::note_local_writes_since`].
+    ///
+    /// # Errors
+    /// persist's read failure.
+    pub async fn note_local_writes_since(
+        &self,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::decision_rows::DecisionRowRef>, ciris_persist::federation::Error> {
+        self.bridge
+            .note_local_writes_since(written_after, None)
+            .await
+    }
+
     /// The runtime's bridge. Useful for telemetry or tests that
     /// want to inspect cache state.
     pub fn bridge(&self) -> Arc<FederationDirectoryReplicationBridge> {

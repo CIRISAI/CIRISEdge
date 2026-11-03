@@ -2417,7 +2417,7 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
         chrono::Utc::now(),
         Some("asked to leave"),
         &[],
-        &alice,
+        &[&alice],
     )
     .await
     .expect("persist admits the founder's removal and rotates the epoch");
