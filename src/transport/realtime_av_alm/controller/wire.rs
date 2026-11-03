@@ -361,6 +361,7 @@ mod tests {
         StreamId([7u8; 32])
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn rt(msg: ControlMsg<String>) {
         let bytes = encode(s(), &msg);
         assert!(is_control_frame(&bytes));
@@ -464,13 +465,14 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn calm_kat_vectors() {
+        type Case<'a> = (&'a str, Vec<u8>, Option<ControlMsg<String>>);
         let mut id = [0u8; 32];
         for (i, b) in id.iter_mut().enumerate() {
             *b = u8::try_from(i).expect("small");
         }
         let st = StreamId(id);
         let peer = "node-kat-b";
-        let msgs: Vec<(&str, Vec<u8>, Option<ControlMsg<String>>)> = vec![
+        let msgs: Vec<Case<'_>> = vec![
             (
                 "CAPS",
                 encode_caps(CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_RELAY),

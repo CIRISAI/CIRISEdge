@@ -64,6 +64,9 @@ const MIN_AUDIO_BPS: f64 = 8_000.0;
 /// Chunks remembered per stream for the forwarding dedupe.
 const FORWARD_DEDUPE: usize = 512;
 
+/// The forwarding dedupe of one stream: the `(epoch, seq)` set and its order.
+type SeenRing = (BTreeSet<(u64, u64)>, VecDeque<(u64, u64)>);
+
 /// One C3 frame to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Outgoing {
@@ -182,7 +185,7 @@ pub(super) struct AlmState {
     tier: ServiceTier,
     own_rate: Rate,
     rates: BTreeMap<StreamId, Rate>,
-    forwarded_seen: BTreeMap<StreamId, (BTreeSet<(u64, u64)>, VecDeque<(u64, u64)>)>,
+    forwarded_seen: BTreeMap<StreamId, SeenRing>,
     min_offset: BTreeMap<StreamId, (i64, u64)>,
     last_offer_ms: u64,
     pub(super) counts: AlmCounts,
@@ -510,7 +513,11 @@ impl AlmState {
     /// `source_ms` is the publisher's signed timestamp; latency is measured
     /// above the fastest delivery seen for the stream, so clock offset
     /// between the hosts cancels.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_wrap,
+        clippy::too_many_arguments
+    )]
     pub(super) fn on_chunk(
         &mut self,
         stream: StreamId,
@@ -1041,7 +1048,9 @@ mod tests {
         assert_eq!(b.parents()[0].primary.as_deref(), Some("a"));
         // C never chose: once the provisional window passes it is excluded.
         a.provisional.insert("c".into(), 0);
-        a.t0 = Instant::now() - Duration::from_millis(PROVISIONAL_MS + 1);
+        a.t0 = Instant::now()
+            .checked_sub(Duration::from_millis(PROVISIONAL_MS + 1))
+            .expect("the clock is past the window");
         assert_eq!(a.own_exclude(&legs, false), vec!["c".to_owned()]);
     }
 

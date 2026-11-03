@@ -167,6 +167,7 @@ impl ServiceTier {
     /// What tier `self` does to a flow of `class` ([`Lever`]). Never-shed
     /// classes are `Full` at every tier (L-A3).
     #[must_use]
+    #[allow(clippy::match_same_arms)] // one arm per (class, tier) cell of §7.2's table
     pub const fn lever(self, class: FlowClass) -> Lever {
         if class.never_shed() {
             return Lever::Full;
@@ -174,8 +175,7 @@ impl ServiceTier {
         match (class, self) {
             (_, Self::FullOps) => Lever::Full,
             (FlowClass::RelayedVideo, _) => Lever::BaseLayer,
-            (FlowClass::RelayedAudio, Self::AudioAndFiles)
-            | (FlowClass::Bulk, Self::AudioAndFiles) => Lever::Full,
+            (FlowClass::RelayedAudio | FlowClass::Bulk, Self::AudioAndFiles) => Lever::Full,
             (FlowClass::RelayedAudio, Self::ChatAndContacts) => Lever::Shed,
             (FlowClass::Bulk, Self::ChatAndContacts) => Lever::Pause,
             (FlowClass::OrdinaryRound, t) => Lever::Stretch(t.stretch()),

@@ -563,7 +563,7 @@ impl<P: PeerRef> Admission<P> {
     }
 
     /// Decide a subscribe request (new, upgrade or downgrade).
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     pub fn request(
         &mut self,
         now_ms: u64,

@@ -2665,6 +2665,7 @@ mod mesh_scenarios {
     /// (never the canonical while a member has headroom) with zero frames
     /// lost to the move: the shedding relay keeps forwarding until it moves.
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn ls4_tier_two_shed_is_make_before_break() {
         for seed in seeds() {
             let mut w = world(

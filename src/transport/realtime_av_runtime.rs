@@ -1424,7 +1424,7 @@ mod leviculum_link {
             use std::sync::atomic::Ordering::Relaxed;
             let audio = wire
                 .get(48)
-                .is_none_or(|c| *c == crate::transport::realtime_av::CODEC_OPAQUE);
+                .map_or(true, |c| *c == crate::transport::realtime_av::CODEC_OPAQUE);
             let ms = if audio {
                 self.audio_ms.load(Relaxed)
             } else {
@@ -1608,6 +1608,8 @@ mod leviculum_link {
         ) -> Result<(), AvDispatcherError> {
             use leviculum_core::SendError;
             use leviculum_std::error::Error as LevError;
+            /// leviculum#94's timed wrapper: msgtype u16 ‖ sent_ms u32 ‖ ttl_ms u32.
+            const TIMED_HEADER_LEN: usize = 10;
 
             let Some(channel_limit) = self.channel_limit() else {
                 self.count(crate::observability::AV_SEND_LINK_GONE);
@@ -1639,10 +1641,9 @@ mod leviculum_link {
                     self.link_id
                 )));
             };
-            // leviculum#94's timed wrapper (msgtype u16 ‖ sent_ms u32 ‖
-            // ttl_ms u32) rides inside the Channel message: a frame that
-            // fills the Channel without it cannot carry it, and goes untimed.
-            const TIMED_HEADER_LEN: usize = 10;
+            // leviculum#94's timed wrapper rides inside the Channel message: a
+            // frame that fills the Channel without it cannot carry it, and
+            // goes untimed.
             let ttl = ttl.filter(|_| {
                 let fits = bytes.len() + TIMED_HEADER_LEN <= channel_limit;
                 if !fits {

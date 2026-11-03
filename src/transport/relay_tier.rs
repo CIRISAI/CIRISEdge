@@ -87,9 +87,9 @@ pub fn roster_relays_first(
         })
         .collect();
     v.sort_by_key(|(h, draw, _)| (*h, *draw));
-    let mut seen = HashSet::new();
+    let mut relays_kept = HashSet::new();
     v.into_iter()
-        .filter(|(_, _, c)| seen.insert(c.relay))
+        .filter(|(_, _, c)| relays_kept.insert(c.relay))
         .map(|(_, _, c)| c)
         .collect()
 }

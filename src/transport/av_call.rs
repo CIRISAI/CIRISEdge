@@ -2042,6 +2042,7 @@ fn reconcile_legs(shared: &Arc<Shared>) {
 
 /// Dial `member`'s call address, name this stream on the new link, and put
 /// the link on the publisher's roster with its seal key.
+#[allow(clippy::too_many_lines)] // one linear dial: address, link, hello, bindings, roster, C3 reader
 async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     let Some(address) =
         shared
@@ -2301,19 +2302,18 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
             .dispatcher_mut()
             .send_control_to(&o.to, &o.frame)
             .await;
-        let ok = match sent {
-            Some(LegSend::Sent) => true,
-            _ => {
-                let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
-                match sender {
-                    Some(s) => crate::transport::realtime_av_dispatcher::AvLinkSender::send(
-                        s.as_ref(),
-                        &o.frame,
-                    )
-                    .await
-                    .is_ok(),
-                    None => false,
-                }
+        let ok = if let Some(LegSend::Sent) = sent {
+            true
+        } else {
+            let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
+            match sender {
+                Some(s) => crate::transport::realtime_av_dispatcher::AvLinkSender::send(
+                    s.as_ref(),
+                    &o.frame,
+                )
+                .await
+                .is_ok(),
+                None => false,
             }
         };
         if ok {
@@ -2608,7 +2608,7 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
     };
     if shared.opts.relay && (installed || binding.publisher == peer) {
         let wire = wire.to_vec();
-        let except = vec![peer.to_owned(), binding.publisher.to_string()];
+        let except = vec![peer.to_owned(), binding.publisher.clone()];
         shared
             .publisher
             .lock()
