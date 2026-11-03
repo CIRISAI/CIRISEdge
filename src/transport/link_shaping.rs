@@ -902,6 +902,35 @@ impl LinkShaper {
         if bodies.len() > reach {
             return Err(ShapingError::BulkBeyondReach(bodies.len(), reach));
         }
+        self.enqueue_within_queue(bodies)
+    }
+
+    /// Whether the shaper was stopped (its link closed or was renegotiated).
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// The queue's free room, in bodies.
+    #[must_use]
+    pub fn room(&self) -> usize {
+        self.queue_cap.saturating_sub(self.queued())
+    }
+
+    /// CC 5.4.3 rc16 two planes — the LAST-RESORT bulk path: queue part of a
+    /// bulk message on this shaped link without the reach check, for a peer
+    /// no unshaped link can exist to (a NAT'd peer this node cannot dial).
+    /// The shaper still paces every body at the agreed λ under the ρ budget,
+    /// so the link stays constant-size and constant-rate; the message is only
+    /// slow. The caller feeds it in pieces as [`Self::room`] allows.
+    ///
+    /// # Errors
+    /// As [`Self::enqueue`], less the reach refusal.
+    pub fn enqueue_bulk_fallback(&self, bodies: Vec<Vec<u8>>) -> Result<(), ShapingError> {
+        self.enqueue_within_queue(bodies)
+    }
+
+    fn enqueue_within_queue(&self, bodies: Vec<Vec<u8>>) -> Result<(), ShapingError> {
         let cap = body_capacity(self.agreement.frame_bytes);
         if let Some(b) = bodies.iter().find(|b| b.len() > cap) {
             return Err(ShapingError::BodyTooLarge(

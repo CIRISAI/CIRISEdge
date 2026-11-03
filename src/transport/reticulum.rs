@@ -2606,6 +2606,8 @@ pub struct ReticulumTransport {
     /// binding, so a peer it dials cannot attribute the link. `false` in
     /// production.
     test_unannounced: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — every outbound dial fails as unroutable (a NAT'd peer).
+    test_refuse_dials: Arc<std::sync::atomic::AtomicBool>,
     /// CIRISEdge#805 item 5 — the router of peer-opened A/V links to the
     /// live calls, once one exists. It owns the A/V arrivals; `None` inside
     /// means another consumer took them first.
@@ -3285,6 +3287,7 @@ impl ReticulumTransport {
             own_key_id: self.occurrence_key_id().to_owned(),
             handshake_override: Arc::clone(&self.handshake_override),
             test_unannounced: Arc::clone(&self.test_unannounced),
+            test_refuse_dials: Arc::clone(&self.test_refuse_dials),
             test_identify_last: Arc::clone(&self.test_identify_last),
             deferred_handshake_part: Arc::clone(&self.deferred_handshake_part),
             test_binding_key_only: Arc::clone(&self.test_binding_key_only),
@@ -3962,6 +3965,7 @@ impl ReticulumTransport {
             handshake_override: Arc::new(std::sync::Mutex::new(None)),
             route_answer_override: Arc::new(std::sync::Mutex::new(None)),
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            test_refuse_dials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             av_call_router: std::sync::OnceLock::new(),
             test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_handshake_part: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -6594,6 +6598,15 @@ impl ReticulumTransport {
             .len()
     }
 
+    /// CC 5.4.3 two-planes test seam — every outbound dial from this node
+    /// fails as unroutable, as to a NAT'd peer: only links the peer dials in
+    /// remain.
+    #[doc(hidden)]
+    pub fn refuse_outbound_dials_for_test(&self, on: bool) {
+        self.test_refuse_dials
+            .store(on, std::sync::atomic::Ordering::Release);
+    }
+
     /// CIRISEdge#805 test seam — the next `n` derived-link dials fail at
     /// identify, AFTER the link established (the partial-open arm).
     #[doc(hidden)]
@@ -8618,6 +8631,71 @@ impl ReticulumTransport {
             .await
     }
 
+    /// CC 5.4.3 rc16 two planes — the LAST RESORT for a payload that needs
+    /// the bulk plane when no unshaped link to the peer could be had (the dial
+    /// failed: a NAT'd peer reachable only over the link it dialled in, which
+    /// is shaped). The payload rides that shaped link in shaped-budget
+    /// fragments, paced by the shaper like every other frame: slow, never a
+    /// failure, counted `link_shaping_bulk_on_shaped_fallback`. With no live
+    /// shaped link, or a payload that does not need the bulk plane, the dial's
+    /// own error stands.
+    async fn bulk_on_shaped_or(
+        &self,
+        destination_key_id: &str,
+        envelope: &[u8],
+        dial_error: TransportError,
+    ) -> Result<TransportSendOutcome, TransportError> {
+        let shaped = self
+            .live_link_to_where(destination_key_id, LinkPlane::Identity, |id| {
+                self.shapers.is_shaped(id.into_bytes())
+            })
+            .await;
+        let Some(link) = shaped.filter(|l| self.shapers.needs_bulk_plane(l.into_bytes(), envelope))
+        else {
+            return Err(dial_error);
+        };
+        let Some(shaper) = self.shapers.get(link.into_bytes()) else {
+            return Err(dial_error);
+        };
+        let cap = crate::transport::link_shaping::body_capacity(shaper.agreement().frame_bytes);
+        let Some(mut rest) = crate::transport::frame_fragment::fragment(envelope, cap) else {
+            return Err(dial_error);
+        };
+        if let Some(m) = self.metrics.get() {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_BULK_ON_SHAPED_FALLBACK);
+        }
+        tracing::info!(
+            destination_key_id,
+            link = ?link,
+            bytes = envelope.len(),
+            frames = rest.len(),
+            dial_error = %dial_error,
+            "no unshaped link can reach this peer; bulk rides its shaped link in shaped-budget \
+             fragments (slow, CC 5.4.3 two-planes last resort)"
+        );
+        let deadline = tokio::time::Instant::now() + RESOURCE_TRANSFER_TIMEOUT;
+        while !rest.is_empty() {
+            if !self.node.link_is_established(&link) || shaper.is_stopped() {
+                return Err(TransportError::Io(
+                    "the shaped link closed during a bulk fallback".to_owned(),
+                ));
+            }
+            let room = shaper.room().min(rest.len());
+            if room == 0 {
+                if tokio::time::Instant::now() > deadline {
+                    return Err(TransportError::Timeout(RESOURCE_TRANSFER_TIMEOUT));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let piece: Vec<Vec<u8>> = rest.drain(..room).collect();
+            shaper
+                .enqueue_bulk_fallback(piece)
+                .map_err(|e| TransportError::Io(e.to_string()))?;
+        }
+        Ok(TransportSendOutcome::Delivered)
+    }
+
     /// CC 5.4.3 rc16 **two planes** — the reverse-path link for `envelope`
     /// to `destination_key_id`. Bulk never rides a shaped link: when the
     /// freshest identity link is shaped and the payload needs the bulk plane,
@@ -9384,21 +9462,37 @@ impl Transport for ReticulumTransport {
         // lane; any other send takes the row lane and moves to the bulk lane
         // only when the row link it got is shaped and the payload is too big.
         let bulk_class = crate::transport::link_shaping::is_bulk_class(envelope_bytes);
-        let mut claim = self
+        let lane = self
             .identity_lane(
                 destination_key_id,
                 &candidates,
                 bulk_class && self.shapers.offers_to(Some(destination_key_id)),
             )
-            .await?;
+            .await;
+        let mut claim = match lane {
+            Ok(c) => c,
+            Err(e) => {
+                return self
+                    .bulk_on_shaped_or(destination_key_id, envelope_bytes, e)
+                    .await
+            }
+        };
         if self
             .shapers
             .needs_bulk_plane(claim.link_id().into_bytes(), envelope_bytes)
         {
             claim.release().await;
-            claim = self
+            claim = match self
                 .identity_lane(destination_key_id, &candidates, true)
-                .await?;
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return self
+                        .bulk_on_shaped_or(destination_key_id, envelope_bytes, e)
+                        .await
+                }
+            };
         }
 
         // CIRISEdge#532 — hold the link for the duration of the transfer, so a
@@ -10551,6 +10645,8 @@ struct DialCtx {
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_unannounced`.
     test_unannounced: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — every outbound dial fails as unroutable (a NAT'd peer).
+    test_refuse_dials: Arc<std::sync::atomic::AtomicBool>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_identify_last`.
     test_identify_last: Arc<std::sync::atomic::AtomicBool>,
     /// CC 5.3.3.5 E1 test seam ([`HandshakeOverride::DeferLastPart`]): the
@@ -11019,6 +11115,17 @@ impl DialCtx {
         has_path: bool,
         establish_timeout: Duration,
     ) -> Result<LinkClaim, TransportError> {
+        if self
+            .test_refuse_dials
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(TransportError::NoRouteToPeer {
+                key_id: destination_key_id.to_owned(),
+                target_dest: hex::encode(peer.dest_hash.into_bytes()),
+                has_path,
+                paths: "test seam: outbound dials refused".to_owned(),
+            });
+        }
         // CIRISEdge#484 — leviculum v0.16 `connect_awaited` returns the handle
         // immediately AND a completion future for `LinkEstablished`, registered
         // BEFORE dispatch (edge no longer needs to observe the event loop `listen`

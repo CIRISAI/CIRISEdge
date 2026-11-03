@@ -721,3 +721,70 @@ async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_consta
         "the bulk crossed on another link: {bulk_bytes} B"
     );
 }
+
+/// **CC 5.4.3 rc16 two planes, the last resort** — B is a NAT'd phone: it
+/// dials A (the only link, shaped), and A cannot dial B. An UNPROMPTED 1 MiB
+/// Deliver from A to B is beyond the shaped link's reach (0.5 × 100 kB/s ×
+/// 10 s = 500 kB), so it needs the bulk plane, and no unshaped link to B can
+/// exist. It must not fail: it rides the shaped link in shaped-budget
+/// fragments, slowly, counted `link_shaping_bulk_on_shaped_fallback`, and the
+/// shaped link stays one frame size throughout. Mutation: no fallback → the
+/// send fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_to_a_peer_reachable_only_over_its_shaped_link_rides_it_slowly_and_never_fails() {
+    let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    let t = duo("fallback", server.clone(), server).await;
+    let row = typed_payload("attestation_gossip", b"FB-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B dials A: the shaped link");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "B's row crossed"
+    );
+    assert_eq!(
+        t.a.shaping("link_shaping_agreed"),
+        1,
+        "{:?}",
+        t.a.metrics.link_shaping()
+    );
+    t.a.transport.refuse_outbound_dials_for_test(true);
+    t.a.transport.set_link_wire_tap_for_test(true);
+    let deliver = typed_payload("attestation_gossip", b"FB-DELIVER-", 1 << 20);
+    t.a.transport
+        .send(&t.b.key.key_id, &deliver)
+        .await
+        .expect("an unprompted 1 MiB Deliver to a peer A cannot dial completes");
+    assert!(
+        wait_until(Duration::from_secs(120), || async {
+            t.b.received(&deliver).await
+        })
+        .await,
+        "B received the 1 MiB Deliver over the shaped link: {:?}",
+        t.a.metrics.link_shaping()
+    );
+    assert_eq!(
+        t.a.shaping("link_shaping_bulk_on_shaped_fallback"),
+        1,
+        "{:?}",
+        t.a.metrics.link_shaping()
+    );
+    assert_eq!(t.a.shaping("link_shaping_bulk_refused"), 0);
+    let wire = t.a.transport.link_wire_tapped_for_test();
+    let link = wire.first().expect("A sent on the link").0;
+    assert!(
+        wire.iter().all(|(l, _)| *l == link),
+        "one link: the shaped one"
+    );
+    let frames = frames_on(&wire, link);
+    let (size, run) = trailing_run(&frames);
+    assert!(
+        frames.iter().all(|f| f.len() == size) && run >= 2_000,
+        "the shaped link stays one frame size while the bulk crosses: {run} × {size} B, others {:?}",
+        frames.iter().map(Vec::len).filter(|&l| l != size).collect::<Vec<_>>()
+    );
+}
