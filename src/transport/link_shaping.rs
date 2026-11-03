@@ -1743,16 +1743,16 @@ mod tests {
         let t = LinkShapers::new(ShapingPolicy::for_class(BudgetClass::Server));
         let link = [3u8; 16];
         assert!(
-            !t.needs_bulk_plane(link, &env("blob_chunk_body")),
+            !t.needs_bulk_plane(link, &env(M::BlobChunkBody)),
             "unshaped: carries anything"
         );
         let _ = t.offer_for(link, 1400, None);
         t.peer_offer(link, &offer(BudgetClass::Server, 1400, 7000, 0.5, 600))
             .unwrap()
             .expect("shaped");
-        assert!(t.needs_bulk_plane(link, &env("blob_chunk_body")));
+        assert!(t.needs_bulk_plane(link, &env(M::BlobChunkBody)));
         assert!(
-            !t.needs_bulk_plane(link, &env("attestation_gossip")),
+            !t.needs_bulk_plane(link, &env(M::AttestationGossip)),
             "a row stays"
         );
         assert!(
