@@ -700,27 +700,7 @@ async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_consta
         "the bulk never entered the shaper: {:?}",
         t.b.metrics.link_shaping()
     );
-    let wire = t.b.transport.link_wire_tapped_for_test();
-    let shaped = wire.first().expect("B dialled").0;
-    let frames = frames_on(&wire, shaped);
-    let (size, run) = trailing_run(&frames);
-    assert!(
-        run >= 10,
-        "the shaped link keeps its stream: {run} × {size} B"
-    );
-    let first = frames
-        .iter()
-        .position(|f| f.len() == size)
-        .expect("shaped frames");
-    assert!(
-        frames[first..].iter().all(|f| f.len() == size),
-        "once shaped, every frame on the shaped link is {size} B: {:?}",
-        frames[first..]
-            .iter()
-            .map(Vec::len)
-            .filter(|&l| l != size)
-            .collect::<Vec<_>>()
-    );
+    let (shaped, wire) = assert_shaped_stream_constant(&t.b).await;
     let bulk_bytes: usize = wire
         .iter()
         .filter(|(l, _)| *l != shaped)
@@ -798,4 +778,47 @@ async fn bulk_to_a_peer_reachable_only_over_its_shaped_link_rides_it_slowly_and_
         "the shaped link stays one frame size while the bulk crosses: {run} × {size} B, others {:?}",
         frames.iter().map(Vec::len).filter(|&l| l != size).collect::<Vec<_>>()
     );
+}
+
+/// The first link `n` dialled is its shaped row link: wait until its stream
+/// has run on for ten frames, then assert that once shaped every frame on it
+/// is the one agreed size. Returns that link and the whole tap.
+async fn assert_shaped_stream_constant(n: &Node) -> ([u8; 16], Vec<([u8; 16], Vec<u8>)>) {
+    // The shaped link's stream runs on at λ (about one frame a second at
+    // this budget) whatever the bulk plane did: let it accumulate a run.
+    let shaped = n
+        .transport
+        .link_wire_tapped_for_test()
+        .first()
+        .expect("B dialled")
+        .0;
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            let w = n.transport.link_wire_tapped_for_test();
+            trailing_run(&frames_on(&w, shaped)).1 >= 10
+        })
+        .await,
+        "the shaped link keeps its constant stream"
+    );
+    let wire = n.transport.link_wire_tapped_for_test();
+    let frames = frames_on(&wire, shaped);
+    let (size, run) = trailing_run(&frames);
+    assert!(
+        run >= 10,
+        "the shaped link keeps its stream: {run} × {size} B"
+    );
+    let first = frames
+        .iter()
+        .position(|f| f.len() == size)
+        .expect("shaped frames");
+    assert!(
+        frames[first..].iter().all(|f| f.len() == size),
+        "once shaped, every frame on the shaped link is {size} B: {:?}",
+        frames[first..]
+            .iter()
+            .map(Vec::len)
+            .filter(|&l| l != size)
+            .collect::<Vec<_>>()
+    );
+    (shaped, wire)
 }
