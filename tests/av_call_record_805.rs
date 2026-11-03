@@ -483,13 +483,13 @@ async fn an_attendee_removed_from_the_room_stays_an_attendee() {
         "bob-fed",
         chrono::Utc::now() - chrono::Duration::seconds(1),
         Some("removed for the witness"),
-        &["bob-fed"],
+        &["alice-fed", "carol-fed"],
         // persist v61 (#1123): a removal under `majority` takes the room's
-        // votes; bob's own resignation is his alone.
-        &r.bob.human,
+        // votes — alice and carol, two of three, cosign it.
+        &[&*r.alice.human, &*r.carol.human],
     )
     .await
-    .expect("bob leaves the room");
+    .expect("alice and carol remove bob from the room");
     assert!(
         !ciris_persist::federation::is_active_community_member(&*r.dir, &r.room, "bob-fed")
             .await

@@ -2094,6 +2094,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// the peer that offered it when the signer's binding lands. Installed
     /// once, after the scheduler exists (the bridge is built first).
     release_kick: std::sync::OnceLock<super::scheduler::SchedulerHandle>,
+    /// v44 (CIRISConstitution#198 §5) — the decision-relevant-row event: a
+    /// proposal, reply, objection, landed roster event, moderation act, accord
+    /// halt or contact grant admitted here (through the choke, by the widener,
+    /// or reported by the host as a local write). The host's queue re-reads
+    /// on it; [`crate::decision_rows::decision_rows_since`] rebuilds.
+    decision_rows: crate::decision_rows::DecisionRowSignal,
     /// CIRISEdge#440 — the resolved mesh-config read seam. `Some` lets a root's
     /// TTL'd relief shrink the since-page limit
     /// ([`Self::effective_page_limit`]) and pause the `trace:*` plane
@@ -2493,6 +2499,7 @@ impl FederationDirectoryReplicationBridge {
             membership_widener: None,
             key_grant_wake: None,
             release_kick: std::sync::OnceLock::new(),
+            decision_rows: crate::decision_rows::DecisionRowSignal::new(),
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
@@ -2784,6 +2791,94 @@ impl FederationDirectoryReplicationBridge {
     /// scheduler. Without it a released row waits for the next cadence tick.
     pub fn install_release_kick(&self, scheduler: super::scheduler::SchedulerHandle) {
         let _ = self.release_kick.set(scheduler);
+    }
+
+    /// v44 — the decision-relevant-row event stream (see
+    /// [`crate::decision_rows`]). Clone it, or [`Self::subscribe_decision_rows`].
+    #[must_use]
+    pub fn decision_rows(&self) -> &crate::decision_rows::DecisionRowSignal {
+        &self.decision_rows
+    }
+
+    /// v44 — a receiver of every later decision-relevant-row event.
+    #[must_use]
+    pub fn subscribe_decision_rows(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::decision_rows::DecisionRowRef> {
+        self.decision_rows.subscribe()
+    }
+
+    /// v44 (carriage C1) — **the host wrote `row` locally** (a proposal, a
+    /// reply, an objection, a cosigned roster row): local writes bypass the
+    /// apply choke, so emit its decision-row event here and kick every peer on
+    /// the Attestation plane NOW, so the act's standing set has it within a
+    /// round-trip instead of the next cadence tick. A row that is not
+    /// decision-relevant is still kicked (the host chose to report it).
+    /// Returns the event emitted, if any.
+    pub async fn note_local_write(
+        &self,
+        row: &Attestation,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Option<crate::decision_rows::DecisionRowRef> {
+        let emitted = self.decision_rows.observe(row, written_after, None);
+        self.kick_attestation_plane().await;
+        emitted
+    }
+
+    /// v44 (carriage C1) — **the host wrote rows it does not hold as
+    /// `Attestation`s** (persist mints a `membership:widening:v1` /
+    /// `membership:removal:v1` row from the signed object a `put_*` stores):
+    /// emit an event for every decision-relevant row served since
+    /// `written_after`, and kick the Attestation plane. Returns the events.
+    ///
+    /// # Errors
+    /// persist's read failure.
+    pub async fn note_local_writes_since(
+        &self,
+        written_after: chrono::DateTime<chrono::Utc>,
+        proposal_id: Option<&str>,
+    ) -> Result<Vec<crate::decision_rows::DecisionRowRef>, ciris_persist::federation::Error> {
+        let mut out = Vec::new();
+        let mut cursor = Some(crate::decision_rows::DecisionCursor::at_or_before(
+            written_after,
+        ));
+        loop {
+            let (rows, next) = crate::decision_rows::decision_rows_since(
+                &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
+                cursor.clone(),
+                512,
+            )
+            .await?;
+            let advanced = next != cursor;
+            for mut r in rows {
+                // Only a LANDED roster row completes a proposal; the scan's
+                // margin may also re-name earlier rows (the host dedups by id).
+                if r.proposal_id.is_none()
+                    && r.kind == crate::decision_rows::DecisionRowKind::RosterLanded
+                {
+                    r.proposal_id = proposal_id.map(str::to_owned);
+                }
+                let _ = self.decision_rows.emit(r.clone());
+                out.push(r);
+            }
+            if !advanced {
+                break;
+            }
+            cursor = next;
+        }
+        self.kick_attestation_plane().await;
+        Ok(out)
+    }
+
+    /// Fire a round on the Attestation plane toward every peer now (no-op
+    /// before the runtime installs its scheduler).
+    async fn kick_attestation_plane(&self) {
+        if let Some(scheduler) = self.release_kick.get() {
+            let me = self.local_key_id.clone().unwrap_or_default();
+            let _ = scheduler
+                .propagate(&me, super::protocol::EnvelopeKind::Attestation)
+                .await;
+        }
     }
 
     /// CIRISEdge#858 — size the refusal memory: `max_keys` ordinary rows
@@ -6108,8 +6203,13 @@ impl FederationDirectoryReplicationBridge {
                 outcome
             }
             EnvelopeKind::Attestation => {
+                let before = chrono::Utc::now();
                 let outcome = self.apply_attestation(envelope_bytes, source_peer).await;
                 if outcome.is_admitted() {
+                    // v44 — a decision-relevant row landed through the choke.
+                    if let Some(row) = attestation_of_bytes(envelope_bytes) {
+                        let _ = self.decision_rows.observe(&row, before, None);
+                    }
                     self.widen_on_admitted_acceptance(envelope_bytes).await;
                     // persist v61 (CIRISPersist#991) — a group's record and its
                     // membership events arrive here as rows now; what the
@@ -9931,13 +10031,23 @@ impl FederationDirectoryReplicationBridge {
             return;
         }
         let dir = &*self.directory as &dyn ciris_persist::federation::FederationDirectory;
+        let widen_started = chrono::Utc::now();
         match crate::membership::widen_on_acceptance(dir, &row, widener).await {
             Ok(crate::membership::WidenOutcome::Widened {
                 group_key_id,
                 member_key_id,
                 role,
+                proposal_id,
                 ..
             }) => {
+                // v44 — the widening is a LOCAL write persist minted: name it
+                // (with the proposal it completes) and carry it now.
+                if let Err(e) = self
+                    .note_local_writes_since(widen_started, Some(&proposal_id))
+                    .await
+                {
+                    tracing::warn!(error = %e, "decision-row scan after a widening failed");
+                }
                 tracing::info!(
                     group = %group_key_id,
                     member = %member_key_id,
@@ -26209,6 +26319,15 @@ fn key_of_record_row(kind: EnvelopeKind, envelope_bytes: &[u8]) -> Option<String
     }
     let row = key_plane_rows::row_of_bytes(envelope_bytes)?;
     ciris_persist::federation::key_plane::key_record_of_row(&row).map(|r| r.key_id)
+}
+
+/// The row an Attestation-plane envelope carries (bare or wrapped).
+fn attestation_of_bytes(envelope_bytes: &[u8]) -> Option<Attestation> {
+    serde_json::from_slice::<Attestation>(envelope_bytes)
+        .or_else(|_| {
+            serde_json::from_slice::<SignedAttestation>(envelope_bytes).map(|s| s.attestation)
+        })
+        .ok()
 }
 
 /// persist v59.0.0 (CIRISEdge#430) — the revocation a `key:revocation:v1` row
