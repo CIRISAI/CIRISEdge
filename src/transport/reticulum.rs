@@ -1993,9 +1993,11 @@ pub struct ReticulumTransportConfig {
     /// makes the `listen_addr` server + every bootstrap client a member-only port;
     /// `None` = open. Typed `interfaces` carry their own IFAC.
     pub ifac: Option<IfacConfig>,
-    /// CIRISEdge#805 item 8 — direct links through NAT (leviculum#70). The
-    /// default is inert: no facilitator (never proposes), none served, every
-    /// peer's request refused. See [`crate::transport::direct_path`].
+    /// CIRISEdge#805 item 8 — direct links through NAT (leviculum#70). v44:
+    /// proposing is ON by default, with the facilitator the host's init
+    /// resolves from the genesis bundle; a config that reaches the transport
+    /// with none resolved proposes nothing. Serving is off and accepting is
+    /// from room peers. See [`crate::transport::direct_path`].
     pub direct_links: crate::transport::direct_path::DirectLinksConfig,
     /// CC 5.4.3 — this node's link-shaping policy (`CLM-link-shaping`).
     /// Default `off`: nothing is offered and no link is shaped.
@@ -2947,6 +2949,9 @@ pub struct ReticulumTransport {
     /// knob, the per-peer state machine, the dials waiting on a proposal, the
     /// event broadcast and the anchored identity links.
     direct_paths: Arc<crate::transport::direct_path::DirectPaths>,
+    /// v44 — whether leviculum's background re-proposal of a failed direct
+    /// link is on for this node (its default; forced off when proposing is).
+    direct_link_retry: std::sync::atomic::AtomicBool,
     /// ALM stage 2 — per-link timed-frame expiries and learned relay routes
     /// (written by the event loop, read by the call layer).
     alm_links: Arc<crate::transport::alm_link::AlmLinkState>,
@@ -3533,10 +3538,12 @@ impl ReticulumTransport {
             .enable_transport(config.enable_transport)
             // CIRISEdge#805 item 8 — always explicit, so the node never runs on
             // a leviculum default (or a stray config file's keys) edge did not
-            // choose. The default is inert.
+            // choose.
             .direct_link(config.direct_links.leviculum_settings());
         tracing::info!(
             proposes = config.direct_links.proposes(),
+            proposing = ?config.direct_links.proposing,
+            facilitator = ?config.direct_links.facilitator,
             serves_facilitator = ?config.direct_links.serve_facilitator,
             accept = ?config.direct_links.accept,
             "reticulum direct links (CIRISEdge#805 item 8, leviculum#70)"
@@ -3835,11 +3842,14 @@ impl ReticulumTransport {
             );
         }
         node.set_announce_control(Some(Box::new(announce_policy.clone())));
-        // leviculum v0.33 retries this node's failed direct-link proposals in
-        // the background by default. While edge does not propose (no
-        // facilitator — the production default, Eric's hold), no retry may
-        // propose for it either.
-        if !config.direct_links.proposes() {
+        // leviculum v0.32+ re-proposes a failed direct link on its own
+        // (1, 2, 5, 10, 15 min). That is wanted exactly when this node
+        // proposes (v44: on by default, with a resolved facilitator); while
+        // it does not (proposing off, or no facilitator resolved), no retry
+        // may propose for it either. Proposing was held off from 2026-10-31
+        // (the one-sided punch) until leviculum#89 and CIRISEdge#926 shipped.
+        let direct_link_retry = config.direct_links.proposes();
+        if !direct_link_retry {
             node.set_direct_link_retry(false);
         }
 
@@ -3851,13 +3861,6 @@ impl ReticulumTransport {
         node.start()
             .await
             .map_err(|e| TransportError::Io(format!("reticulum node start: {e}")))?;
-        // leviculum v0.32+ re-proposes a failed direct link on its own
-        // (1, 2, 5, 10, 15 min). While this node proposes nothing (the
-        // production default since the 2026-10-31 one-sided punch, until the
-        // host names a facilitator) the retry stays off with it.
-        if !config.direct_links.proposes() {
-            node.set_direct_link_retry(false);
-        }
         // ALM stage 2 — a transport node's C2 admission of the links it
         // forwards (leviculum#93). The hook runs under the node lock and reads
         // only the admission's own ledger.
@@ -4040,6 +4043,7 @@ impl ReticulumTransport {
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_paths,
+            direct_link_retry: std::sync::atomic::AtomicBool::new(direct_link_retry),
             alm_links: Arc::new(crate::transport::alm_link::AlmLinkState::new()),
             forward_admission,
             forward_load: Arc::new(std::sync::Mutex::new(
@@ -6289,6 +6293,42 @@ impl ReticulumTransport {
             }
         };
         let now = std::time::Instant::now();
+        // v44 — proposal glare (leviculum#96): leviculum refuses a REQUEST
+        // that crosses this node's own proposal on the same link REJECT_BUSY
+        // before the host sees it, so both ends proposing at once both fail.
+        // The tie-break is the link's direction, an asymmetric fact both ends
+        // hold: only the INITIATOR proposes on a link; the responder yields,
+        // and proposes itself only after GLARE_WAIT without the initiator's
+        // proposal. A link of unknown direction is treated as initiated.
+        let initiator = self
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_link
+            .get(&link)
+            .map_or(true, |d| *d == LinkDirection::Outbound);
+        let since = self.direct_paths.yield_since(destination_key_id);
+        match crate::transport::direct_path::glare_verdict(initiator, since, now) {
+            crate::transport::direct_path::GlareVerdict::Yield => {
+                if since.is_none() {
+                    self.direct_paths.note_yield(destination_key_id, now);
+                    self.spawn_yield_fallback(destination_key_id, link);
+                }
+                count(crate::observability::DIRECT_LINK_YIELDED);
+                tracing::info!(
+                    key_id = %destination_key_id,
+                    link = %hex::encode(link.as_bytes()),
+                    "direct path: the peer initiated this link, so it proposes; yielding \
+                     (v44, leviculum#96)"
+                );
+                return Err(DirectPath::Unavailable {
+                    reason: "yield_to_initiator",
+                });
+            }
+            crate::transport::direct_path::GlareVerdict::Propose => {
+                self.direct_paths.clear_yield(destination_key_id);
+            }
+        }
         let admitted = self
             .direct_paths
             .tracker()
@@ -6322,41 +6362,53 @@ impl ReticulumTransport {
                 // interface: the Lost event is on its way. Dial as without.
                 Err(DirectPath::Unavailable { reason: "pending" })
             }
-            Ok(()) => {
-                // Registered BEFORE the dispatch, so the outcome cannot precede
-                // the registration.
-                let rx = self.direct_paths.wait_for(link);
-                let before = link_channel_message_limit(&self.node, &link);
-                self.direct_paths
-                    .tracker()
-                    .proposed(destination_key_id, link, before, now);
-                if let Err(e) = self.node.propose_direct_link(&link).await {
-                    self.direct_paths.forget(link);
-                    self.direct_paths
-                        .tracker()
-                        .propose_refused(destination_key_id, link, now);
-                    count(crate::observability::DIRECT_LINK_PROPOSE_REFUSED);
-                    tracing::info!(
-                        key_id = %destination_key_id,
-                        link = %hex::encode(link.as_bytes()),
-                        error = %e,
-                        "direct path: leviculum refused the proposal (CIRISEdge#805 item 8)"
-                    );
-                    return Err(DirectPath::Unavailable {
-                        reason: "propose_refused",
-                    });
-                }
-                count(crate::observability::DIRECT_LINK_PROPOSED);
-                tracing::info!(
-                    key_id = %destination_key_id,
-                    link = %hex::encode(link.as_bytes()),
-                    channel_limit_before = ?before,
-                    "direct path: PROPOSED on the identity link to a call member or room \
-                     peer (CIRISEdge#805 item 8, #915)"
-                );
-                Ok((link, rx))
-            }
+            Ok(()) => dispatch_proposal(
+                &self.node,
+                &self.direct_paths,
+                self.metrics.get(),
+                destination_key_id,
+                link,
+                now,
+            )
+            .await
+            .map(|rx| (link, rx)),
         }
+    }
+
+    /// v44 (leviculum#96) — the end of a yield: after [`GLARE_WAIT`], jittered,
+    /// propose on `link` if nothing has settled it. A timer, because the send
+    /// that yielded may be this node's last on the link (#920: a peer that only
+    /// replies must still bring it direct). Nothing happens if the initiator's
+    /// proposal came meanwhile, a send took this node's turn, the standing is
+    /// gone, the link is gone, or the transport is suspended.
+    ///
+    /// [`GLARE_WAIT`]: crate::transport::direct_path::GLARE_WAIT
+    fn spawn_yield_fallback(&self, peer: &str, link: LinkId) {
+        use crate::transport::direct_path::{jitter_draw, GLARE_WAIT};
+        let peer = peer.to_owned();
+        let node = Arc::clone(&self.node);
+        let direct_paths = Arc::clone(&self.direct_paths);
+        let table = self.scope_addresses.get().cloned();
+        let metrics = self.metrics.get().cloned();
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let wait = GLARE_WAIT.mul_f64(1.0 + jitter_draw());
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            if direct_paths.yield_since(&peer).is_none() {
+                return;
+            }
+            direct_paths.clear_yield(&peer);
+            let now = std::time::Instant::now();
+            if lifecycle.is_suspended()
+                || !direct_standing(table.as_deref(), &direct_paths, &peer)
+                || !node.link_is_established(&link)
+                || direct_paths.tracker().admit(&peer, link, now).is_err()
+            {
+                return;
+            }
+            let _ =
+                dispatch_proposal(&node, &direct_paths, metrics.as_ref(), &peer, link, now).await;
+        });
     }
 
     /// CIRISEdge#805 item 8 — THE accept decision for a peer's direct-link
@@ -6469,6 +6521,36 @@ impl ReticulumTransport {
     /// request).
     pub fn forget_direct_contact(&self, node_key_id: &str) {
         self.direct_paths.forget_contact(node_key_id);
+    }
+
+    /// v44 test seam — propose to `peer` on `link` now, as a send over it
+    /// would (the standing check, then the glare tie-break and the
+    /// proposal). Returns what happened: `proposed`, `joined`, or the reason
+    /// nothing was proposed (`no_standing`, `yield_to_initiator`,
+    /// `backing_off`, …).
+    #[doc(hidden)]
+    pub async fn propose_direct_on_link_for_test(&self, peer: &str, link: [u8; 16]) -> String {
+        use crate::transport::direct_path::DirectPath;
+        if !self.direct_paths.config.proposes() {
+            return "not_configured".to_owned();
+        }
+        if !self.direct_standing(peer) {
+            return "no_standing".to_owned();
+        }
+        match self.start_or_join_proposal(peer, LinkId::new(link)).await {
+            Ok((l, _)) if l == LinkId::new(link) => "proposed".to_owned(),
+            Ok(_) => "joined".to_owned(),
+            Err(DirectPath::Unavailable { reason }) => reason.to_owned(),
+            Err(other) => format!("{other:?}"),
+        }
+    }
+
+    /// v44 — whether leviculum re-proposes this node's failed direct links in
+    /// the background: on iff this node proposes.
+    #[must_use]
+    pub fn direct_link_retry_enabled(&self) -> bool {
+        self.direct_link_retry
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// CIRISEdge#805 item 8 — every direct-path event this node sees (either
@@ -11976,6 +12058,54 @@ struct AnnounceCtx {
 /// Shared handles the event loop hands to [`handle_event`].
 /// Whether `peer` may share a direct path with this node: a room peer, or a
 /// consented contact. Shared by the accept decision and the proposal hook.
+/// Start a proposal to `peer` on `link`: the tracker's record, the waiter for
+/// its outcome, and leviculum's dispatch. The caller has admitted it.
+async fn dispatch_proposal(
+    node: &ReticulumNode,
+    direct_paths: &crate::transport::direct_path::DirectPaths,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    peer: &str,
+    link: LinkId,
+    now: std::time::Instant,
+) -> Result<
+    tokio::sync::oneshot::Receiver<crate::transport::direct_path::DirectOutcome>,
+    crate::transport::direct_path::DirectPath,
+> {
+    let count = |label: &'static str| {
+        if let Some(m) = metrics {
+            m.inc_direct_link(label);
+        }
+    };
+    // Registered BEFORE the dispatch, so the outcome cannot precede the
+    // registration.
+    let rx = direct_paths.wait_for(link);
+    let before = link_channel_message_limit(node, &link);
+    direct_paths.tracker().proposed(peer, link, before, now);
+    if let Err(e) = node.propose_direct_link(&link).await {
+        direct_paths.forget(link);
+        direct_paths.tracker().propose_refused(peer, link, now);
+        count(crate::observability::DIRECT_LINK_PROPOSE_REFUSED);
+        tracing::info!(
+            key_id = %peer,
+            link = %hex::encode(link.as_bytes()),
+            error = %e,
+            "direct path: leviculum refused the proposal (CIRISEdge#805 item 8)"
+        );
+        return Err(crate::transport::direct_path::DirectPath::Unavailable {
+            reason: "propose_refused",
+        });
+    }
+    count(crate::observability::DIRECT_LINK_PROPOSED);
+    tracing::info!(
+        key_id = %peer,
+        link = %hex::encode(link.as_bytes()),
+        channel_limit_before = ?before,
+        "direct path: PROPOSED on the identity link to a call member or room peer \
+         (CIRISEdge#805 item 8, #915)"
+    );
+    Ok(rx)
+}
+
 fn direct_standing(
     table: Option<&ScopeAddressTable>,
     direct_paths: &crate::transport::direct_path::DirectPaths,
@@ -15568,6 +15698,10 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
             ctx.direct_paths.config.accept,
             shares_room,
         );
+    // The initiator's proposal came: nothing left to yield to.
+    if let Some(p) = peer.as_deref() {
+        ctx.direct_paths.clear_yield(p);
+    }
     if let Some(m) = ctx.metrics {
         m.inc_direct_link(if accepted {
             crate::observability::DIRECT_LINK_REQUEST_ACCEPTED
@@ -15618,7 +15752,12 @@ async fn direct_link_failed(
     let peer = ctx
         .direct_paths
         .tracker()
-        .failed(link_id, failure, std::time::Instant::now())
+        .failed(
+            link_id,
+            failure,
+            std::time::Instant::now(),
+            crate::transport::direct_path::jitter_draw(),
+        )
         .or(hint);
     let reason = crate::transport::direct_path::failure_label(failure);
     if let Some(m) = ctx.metrics {

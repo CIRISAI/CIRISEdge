@@ -14,12 +14,12 @@ every structure below is a fixed concatenation.
 
 A binding states that one Ed25519 public key signs one stream's chunks in one
 epoch. Defined at `transport/av_chunk_auth.rs` (struct `StreamKeyBinding`);
-encoded by `unsigned_body` (`:463`) and `to_bytes` (`:531`), and parsed by
-`from_bytes` (`:542`).
+encoded by `unsigned_body` (`:501`) and `to_bytes` (`:569`), and parsed by
+`from_bytes` (`:580`).
 
 | # | Member | Encoding | Bytes |
 |---|---|---|---|
-| 1 | version | `u8`, must be `0x01` (`BINDING_VERSION`, `:122`) | 1 |
+| 1 | version | `u8`, must be `0x01` (`BINDING_VERSION`, `:135`) | 1 |
 | 2 | room | `u16` BE length, then UTF-8 (the community key id) | 2 + n |
 | 3 | publisher | `u16` BE length, then UTF-8 (the publisher's federation key id) | 2 + n |
 | 4 | join_nonce | raw | 32 |
@@ -30,14 +30,14 @@ encoded by `unsigned_body` (`:463`) and `to_bytes` (`:531`), and parsed by
 | 9 | sig_ml_dsa_65 | `u16` BE length (non-zero), then the signature (3309 for ML-DSA-65) | 2 + 3309 |
 
 Members 1–7 are the **unsigned body**; members 8–9 follow it. The string
-writers are `put_str` (`:421`) and `put_bytes` (`:427`).
+writers are `put_str` (`:459`) and `put_bytes` (`:465`).
 
-Parse rules (`from_bytes`, `:542`):
-- the whole encoding is at most 8192 bytes (`MAX_BINDING_LEN`, `:131`);
-- room and publisher lengths must be 1..=1024 (`MAX_ID_LEN`, `:137`; `Reader::string`, `:452`) and valid UTF-8;
+Parse rules (`from_bytes`, `:580`):
+- the whole encoding is at most 8192 bytes (`MAX_BINDING_LEN`, `:144`);
+- room and publisher lengths must be 1..=1024 (`MAX_ID_LEN`, `:150`; `Reader::string`, `:490`) and valid UTF-8;
 - trailing bytes are refused.
 
-`stream_id` is derived at `transport/av_call.rs:669`:
+`stream_id` is derived at `transport/av_call.rs:730`:
 `SHA-256("ciris-edge:call-stream:v2" ‖ utf8(room) ‖ utf8(publisher) ‖ join_nonce)`,
 with no length prefixes. Re-deriving it is how a receiver knows the stream is
 the publisher's.
@@ -52,8 +52,8 @@ signed_bytes = "ciris-edge:av-stream-key:v1"      (27 bytes ASCII, BINDING_DOMAI
              ‖ unsigned_body                       (members 1–7 exactly as encoded above)
 ```
 
-`signed_bytes` is at `:478`. The signature is made by `StreamKeyBinding::sign`
-(`:490`) through `identity::sign_bound_hybrid` (`identity.rs:464`):
+`signed_bytes` is at `:516`. The signature is made by `StreamKeyBinding::sign`
+(`:528`) through `identity::sign_bound_hybrid` (`identity.rs:464`):
 
 - `sig_ed25519 = Ed25519.sign(fed_ed25519_key, signed_bytes)`
 - `sig_ml_dsa_65 = ML-DSA-65.sign(fed_ml_dsa_key, signed_bytes ‖ sig_ed25519)`
@@ -62,11 +62,11 @@ So ML-DSA covers the Ed25519 signature (the CIRIS bound-hybrid form, AV-33).
 Both halves are carried raw: the base64 that `sign_bound_hybrid` returns is
 decoded before encoding. The signing key is the publisher's federation key
 (`LocalSigner` whose `key_id` is the publisher). `Call::join` refuses a signer
-whose key id is not the node's own (`transport/av_call.rs:1178`).
+whose key id is not the node's own (`transport/av_call.rs:1269`).
 
-Verification (`verify_signature`, `:644`) re-encodes both halves as base64
+Verification (`verify_signature`, `:683`) re-encodes both halves as base64
 and calls persist's `verify_hybrid_via_directory` under `HybridPolicy::Strict`.
-Only `VerifyOutcome::HybridVerified` passes (`:681`).
+Only `VerifyOutcome::HybridVerified` passes (`:740`).
 
 The keyring's ML-DSA-65 signs deterministically (the KAT signs twice and
 compares). A verifier should still check ML-DSA by verification, never by
@@ -74,22 +74,22 @@ byte equality, because FIPS 204 also permits hedged signing.
 
 ### 1.3 Receiver acceptance order
 
-`ChunkAuth::accept_binding` (`:949`) does these steps in order. Cheap checks
+`ChunkAuth::accept_binding` (`:988`) does these steps in order. Cheap checks
 come before the directory lookup.
 
 1. **Parse.** On failure: `av_binding_malformed`.
 2. **Already seen.** If the binding id (§1.4) is in the 128-entry seen ring
-   (`SEEN_IDS`, `:142`), return `Known` with no re-verification and no
+   (`SEEN_IDS`, `:155`), return `Known` with no re-verification and no
    re-install.
-3. **Check the shape** (`check_shape`, `:627`):
+3. **Check the shape** (`check_shape`, `:666`):
    - the room equals the call's room, else `av_binding_other_room`;
    - the stream id re-derives from the publisher and nonce, else `av_binding_stream_not_derived`;
-   - the publisher is in the room's MLS group (`CohortGroup::member_key_ids`, read by the caller at `transport/av_call.rs:2123`), else `av_binding_publisher_not_member`.
+   - the publisher is in the room's MLS group (`CohortGroup::member_key_ids`, read by the caller at `transport/av_call.rs:2661`), else `av_binding_publisher_not_member`.
 4. **Verify the hybrid signature** against the directory. On failure: `av_binding_signature_unverified`.
-5. **Install** (`install`, `:1000`):
+5. **Install** (`install`, `:1039`):
    - an epoch older than the second-newest held for that stream is refused (`av_binding_stale_epoch`);
    - each stream keeps only its two newest epochs;
-   - each publisher keeps its four newest streams (`MAX_STREAMS_PER_PUBLISHER`, `:139`).
+   - each publisher keeps its four newest streams (`MAX_STREAMS_PER_PUBLISHER`, `:152`).
 
 Refusals are not cached. The cause may pass (a member list that lags, a
 directory still learning the key), and the checks before step 4 cost nothing.
@@ -97,7 +97,7 @@ directory still learning the key), and the checks before step 4 cost nothing.
 ### 1.4 Part framing
 
 A binding is larger than one Channel message, so it travels as parts
-(`parts`, `:592`).
+(`parts`, `:631`).
 
 ```
 part = "CSKB"                    4  BINDING_PART_MAGIC (:126)
@@ -108,20 +108,20 @@ part = "CSKB"                    4  BINDING_PART_MAGIC (:126)
      ‖ payload                   ≥1 the encoding cut in order
 ```
 
-The part header is 15 bytes (`PART_HEADER_LEN`, `:128`).
+The part header is 15 bytes (`PART_HEADER_LEN`, `:141`).
 
 **Sizing per link.** Payload = the link's Channel message limit − 15. The
 payload must be at least 64, or nothing is sent. The limit comes from:
-- `AvLinkSender::message_limit`, which the Reticulum sender implements (`transport/realtime_av_runtime.rs:1530`);
-- otherwise 1024 (`FALLBACK_PART_LIMIT`, `:148`);
-- or, on a fresh leg, the dialled link's `channel_limit` (`transport/av_call.rs:1891`).
+- `AvLinkSender::message_limit`, which the Reticulum sender implements (`transport/realtime_av_runtime.rs:1587`);
+- otherwise 1024 (`FALLBACK_PART_LIMIT`, `:161`);
+- or, on a fresh leg, the dialled link's `channel_limit` (`transport/av_call.rs:2122`).
 
 Parts of one binding are cut per link, so their sizes differ between links.
 The id does not.
 
-**Reassembly** (`BindingAssembler::push`, `:768`) is per link:
+**Reassembly** (`BindingAssembler::push`, `:807`) is per link:
 - a frame is a part iff it is at least 15 bytes and starts `"CSKB" 0x01`;
-- at most 4 bindings are in flight per link (`MAX_PENDING`, `:135`), and the oldest is dropped when a fifth starts;
+- at most 4 bindings are in flight per link (`MAX_PENDING`, `:148`), and the oldest is dropped when a fifth starts;
 - each binding reassembles to at most 8192 bytes;
 - the count must be the same in every part of an id;
 - a duplicate index is ignored;
@@ -132,50 +132,50 @@ Parts may arrive in any order and interleaved with other bindings' parts.
 
 **Telling parts from chunks.** A chunk's first 32 bytes are its stream id. A
 publisher never mints a stream id that begins `"CSKB" 0x01`: `start_stream`
-draws the join nonce again (`transport/av_call.rs:1606`;
-`collides_with_binding_part`, `:154`).
+draws the join nonce again (`transport/av_call.rs:1834`;
+`collides_with_binding_part`, `:167`).
 
 A part takes no A/V outer seal and no hop `link_seq`. The E1 link seal still
 covers it, like every frame on the link. A part's drop report stays pending
-for the next chunk (`HopGap`, `transport/av_call.rs:2019`).
+for the next chunk (`HopGap`, `transport/av_call.rs:2519`).
 
 ### 1.5 When a publisher sends its binding
 
 These are all in `transport/av_call.rs`.
 
-- **On every new leg** (`dial_leg`, `:1844`):
+- **On every new leg** (`dial_leg`, `:2076`):
   1. the link's transit KEX;
-  2. the stream hello `"CHLO" ‖ 0x01 ‖ stream_id[32]` (`encode_hello`, `:686`; 37 bytes, unsigned);
-  3. under the publisher lock, the current binding's parts and, if this node relays, every binding it holds whose publisher is not the dialled member (`:1888`);
+  2. the stream hello `"CHLO" ‖ 0x01 ‖ stream_id[32]` (`encode_hello`, `:747`; 37 bytes, unsigned);
+  3. under the publisher lock, the current binding's parts and, if this node relays, every binding it holds whose publisher is not the dialled member (`:2122`);
   4. only then is the leg added to the fan-out roster, so no chunk precedes the binding.
 
-  Sends wait out backpressure until the hello budget expires (`send_patiently`, `:1943`).
-- **At an epoch roll** (`roll_if_moved`, `:1671`). The order is fixed:
-  1. derive the new DEK (`:1684`);
-  2. mint the new chunk key and its binding (`mint_own_key`, `:1692`; a failure leaves the stream un-rolled);
-  3. roll the publisher (`:1701`);
-  4. swap in the new key (`:1705`);
+  Sends wait out backpressure until the hello budget expires (`send_patiently`, `:2190`).
+- **At an epoch roll** (`roll_if_moved`, `:1899`). The order is fixed:
+  1. derive the new DEK (`:1912`);
+  2. mint the new chunk key and its binding (`mint_own_key`, `:1920`; a failure leaves the stream un-rolled);
+  3. roll the publisher (`:1929`);
+  4. swap in the new key (`:1933`);
   5. remove departed members' legs;
-  6. send the new binding on every remaining leg (`send_control_report`, `:1724`).
+  6. send the new binding on every remaining leg (`send_control_report`, `:1952`).
 
   All of this happens under the publisher lock, which `publish` must also
-  take to seal and sign (`:1375`). So the new binding precedes the new
+  take to seal and sign (`:1559`). So the new binding precedes the new
   epoch's first chunk on every leg. Control sends retry backpressure 20 × 10 ms
-  per part (`transport/realtime_av_dispatcher.rs:766`).
+  per part (`transport/realtime_av_dispatcher.rs:804`).
 - **Settling after a burst.** A binding is about ten Channel messages on a
   base-MTU link, and it fills the link's Channel window just ahead of the
   next chunk. Chunks are sent without queueing and dropped when the link
   reports congestion (#591). So a leg that has just carried a binding
-  SETTLES for 150 ms (`CONTROL_SETTLE`, `transport/realtime_av_dispatcher.rs:502`):
+  SETTLES for 150 ms (`CONTROL_SETTLE`, `transport/realtime_av_dispatcher.rs:529`):
   - a congested chunk send on it is retried every 5 ms instead of dropped;
   - after the window, a congested send is dropped at once as before.
 
   `send_control_report` sets this on every leg it sends to. `dial_leg` sets it
-  on a fresh leg (`settle`, `transport/realtime_av_dispatcher.rs:815`, called
-  at `transport/av_call.rs:1923`).
-- **Every 10 s** (`BINDING_REANNOUNCE`, `av_chunk_auth.rs:145`): the current
+  on a fresh leg (`settle`, `transport/realtime_av_dispatcher.rs:881`, called
+  at `transport/av_call.rs:2157`).
+- **Every 10 s** (`BINDING_REANNOUNCE`, `av_chunk_auth.rs:158`): the current
   binding is re-sent on every leg. This runs every 40 ticks of the 250 ms
-  `WATCH_TICK` (`reannounce`, `:2171`; `reannounce_ticks`, `:2240`). It
+  `WATCH_TICK` (`reannounce`, `:2728`; `reannounce_ticks`, `:2839`). It
   replaces a binding lost to an inbound-queue overflow.
 
 ### 1.6 How member relays forward bindings
@@ -187,10 +187,10 @@ is not a relay in this sense. It never receives or verifies a binding, and
 it forwards E1-sealed frames opaque. A binding names the room and the
 publisher, so it is never handed to a non-member (§1.7).
 
-A member relay (`take_binding`, `transport/av_call.rs:2123`):
+A member relay (`take_binding`, `transport/av_call.rs:2660`):
 - forwards a completed binding, whether `Installed` or `Known`, to every
   other leg, but only when the binding's publisher is the peer of the link it
-  arrived on, i.e. heard first-hand (`:2155`). It is never sent back to that
+  arrived on, i.e. heard first-hand (`:2694`). It is never sent back to that
   peer. This passes the publisher's periodic re-send along and cannot loop;
 - sends every binding it holds on each leg it dials (§1.5);
 - verifies each binding (§1.3) before forwarding it.
@@ -201,18 +201,18 @@ The code sends a binding in three places, and each reaches a room member
 only (`transport/av_call.rs`):
 
 - **A leg this node dials** (`dial_leg`). `reconcile_legs` dials only the
-  names in `shared.members` (`:1810`). That list is the room's MLS group:
+  names in `shared.members` (`:2041`). That list is the room's MLS group:
   set at join (`admit`), and replaced at each roll from
-  `room_group.member_key_ids()` (`:1678`, `:1727`). The dial goes to the
-  member's own derived A/V call address (`send_address`, `:1849`), and the
+  `room_group.member_key_ids()` (`:1906`, `:1955`). The dial goes to the
+  member's own derived A/V call address (`send_address`, `:2081`), and the
   link is keyed by the E1 transit KEX to that node. The binding parts go on
-  that link before it joins the fan-out roster (`:1909`).
+  that link before it joins the fan-out roster (`:2143`).
 - **The fan-out roster** (`send_control_report` at the roll, re-announce and
   member-relay forwarding). The roster's legs are added only by `dial_leg`
-  (`:1909`). A departed member's leg is removed at the roll (`:1719`), before
-  the new binding is sent (`:1724`).
+  (`:2143`). A departed member's leg is removed at the roll (`:1947`), before
+  the new binding is sent (`:1952`).
 - **Inbound links** carry no binding outward. A link from a non-member is
-  closed before any frame is read (`:1976`).
+  closed before any frame is read (`:2224`).
 
 Every frame on these legs is under the E1 per-link seal, so a Reticulum
 transport node that forwards the link's packets sees ciphertext only.
@@ -251,7 +251,7 @@ trailer = u64_be(source_ms) ‖ Ed25519.sign(chunk_key[stream, epoch], msg)
                                      8 + 64 = 72 bytes (CHUNK_TRAILER_LEN; CHUNK_SIG_LEN = 64)
 ```
 
-The signer is `ChunkSigner::sign` (`:340`). It refuses a chunk of another
+The signer is `ChunkSigner::sign_at` (`:373`; `sign`, `:363`, stamps now). It refuses a chunk of another
 stream or epoch than the key's. The chunk key is an ephemeral Ed25519 key
 generated per `(stream, epoch)`.
 
@@ -273,16 +273,16 @@ the outer layer.
 
 ### 2.3 Verification order
 
-**Member relay** (no DEK needed for any step; `pump`, `transport/av_call.rs:2000`):
+**Member relay** (no DEK needed for any step; `pump`, `transport/av_call.rs:2496`):
 1. If the frame is a binding part, reassemble it (§1.4) and stop.
 2. Parse `SealedAvChunk`; on failure count `av_call_frame_unopened`.
 3. Open the outer seal at the hop counter (`open_hop_outer`, `realtime_av_dispatcher.rs:252`); on failure count `av_call_frame_unopened`.
-4. `ChunkAuth::check` (`av_chunk_auth.rs:1080`, called at `av_call.rs:2058`):
+4. `ChunkAuth::check_timed` (`av_chunk_auth.rs:1128`; `check`, `:1118`, drops the timestamp; called at `av_call.rs:2580`):
    1. look up the bound key for `(stream_id, epoch)`, else `av_chunk_unbound`;
    2. take the last 72 bytes as the trailer, else `av_chunk_trailer_missing`;
    3. split it `source_ms[8] ‖ sig[64]`; Ed25519 `verify_strict(key, msg, sig)` with `msg` built from the header, `source_ms` and the remaining bytes, else `av_chunk_trailer_invalid`.
 5. Forward only if this node relays, the link's hello named this stream, and
-   the verified publisher is the link's peer (`:2082`). The forwarded unit
+   the verified publisher is the link's peer (`:2769`). The forwarded unit
    still carries the trailer.
 
 **Receiver**: steps 1–4 as above, then:
@@ -296,10 +296,10 @@ No step reads persist, and no step runs a hybrid verification.
 
 ## 3. Per-frame budget
 
-From `Call::chunk_plaintext_budget` (`transport/av_call.rs:1315`):
+From `Call::chunk_plaintext_budget` (`transport/av_call.rs:1427`):
 
 ```
-channel_limit(link) = min(link_mdu − 6, 65535) − 25        (reticulum.rs:430; 6 = Channel envelope,
+channel_limit(link) = min(link_mdu − 6, 65535) − 25        (reticulum.rs:431; 6 = Channel envelope,
                                                             25 = E1 seal header 9 + tag 16, link_seal.rs:114)
 AV_CHUNK_WIRE_OVERHEAD = 48 + 4 + 16 + 16 = 84            (realtime_av.rs:824: header, codec/layer, inner tag, outer tag)
 max plaintext before   = channel_limit − 84
@@ -311,21 +311,21 @@ max plaintext after    = channel_limit − 84 − 72 = channel_limit − 156    
 | Link MTU | link MDU | Channel limit | Max plaintext before | after | Binding parts (KAT size) |
 |---|---|---|---|---|---|
 | 500 (base) | 431 | 400 | 316 | 244 | 10 × ≤400 B |
-| 1400 (punched direct, `direct_path.rs:469`) | 1327 | 1296 | 1212 | 1140 | 3 × ≤1296 B |
+| 1400 (punched direct, `direct_path.rs:666`) | 1327 | 1296 | 1212 | 1140 | 3 × ≤1296 B |
 
 The call refuses a frame over the budget before sealing it. A smaller MTU
 shrinks every number in the row.
 
 ## 4. Refusal tokens
 
-There is one enum, `AvAuthRefusal` (`av_chunk_auth.rs:192`), whose `as_str`
-(`:233`) gives the spellings. `refusal_tokens_are_stable_and_distinct`
-(`av_chunk_auth/tests.rs:563`) checks them. A relay and a receiver run the
+There is one enum, `AvAuthRefusal` (`av_chunk_auth.rs:215`), whose `as_str`
+(`:256`) gives the spellings. `refusal_tokens_are_stable_and_distinct`
+(`av_chunk_auth/tests.rs:570`) checks them. A relay and a receiver run the
 same code, so the tokens are identical on both. A non-member transport
 forwarder runs none of this and emits none of them. Each refusal:
 - is logged with `reason = <token>`;
 - increments the `av_plane` counter of the same name;
-- increments one aggregate counter (`observability.rs:927–936`): `av_call_frame_forged`, `av_call_frame_unbound` or `av_call_binding_refused`.
+- increments one aggregate counter (`observability.rs:922–931`): `av_call_frame_forged`, `av_call_frame_unbound` or `av_call_binding_refused`.
 
 | Token | Meaning | Aggregate counter |
 |---|---|---|
@@ -344,7 +344,7 @@ A successfully installed binding counts `av_call_binding_installed`.
 
 ## 5. KAT vectors
 
-These come from `kat_vectors_are_deterministic` (`av_chunk_auth/tests.rs:467`).
+These come from `kat_vectors_are_deterministic` (`av_chunk_auth/tests.rs:468`).
 It asserts the constants in `mod kat` (`:435`) and prints them with
 `--nocapture`.
 

@@ -6149,11 +6149,14 @@ enum LocalInstanceRole {
     // production dials while a test trust root is active); an explicit
     // bool is the caller's word.
     baked_canonical_dials = None,
-    // CIRISEdge#915 — direct links. Absent: no facilitator, none served,
-    // upgrades accepted from room peers only (today's behaviour).
+    // CIRISEdge#915 — direct links. v44: proposing is on by default; with
+    // no facilitator named it is the genesis bundle's first serve node
+    // (`CIRIS_DIRECT_LINK_FACILITATOR=bootstrap`), under the #661 gate.
+    // None served, upgrades accepted from room peers only.
     direct_link_facilitator = None,
     direct_link_serve_port = None,
     direct_link_accept = "room_peers",
+    direct_link_proposing = "on",
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -6372,14 +6375,16 @@ pub fn init_edge_runtime(
     node_keystore_alias: Option<&str>,
     baked_canonical_dials: Option<bool>,
     // CIRISEdge#915 — `"host:port"` of the facilitator this node probes when
-    // it proposes a direct link (the server it links to). `None`: it never
-    // proposes.
+    // it proposes a direct link. `None` (v44): the genesis bundle's first
+    // serve node, when the baked canonical dials are allowed (#661).
     direct_link_facilitator: Option<String>,
     // CIRISEdge#915 — run a facilitator on this UDP port (a node with a
     // public address).
     direct_link_serve_port: Option<u16>,
     // CIRISEdge#915 — `room_peers` (default), `identified_only` or `off`.
     direct_link_accept: &str,
+    // v44 — `on` (default) or `off`: whether this node proposes direct links.
+    direct_link_proposing: &str,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -7357,6 +7362,13 @@ pub fn init_edge_runtime(
     // CIRISEdge#915 — direct links. leviculum fixes these at node build, so
     // they are set here, before the transport is built, or never.
     transport_config.direct_links = crate::transport::direct_path::DirectLinksConfig {
+        proposing: crate::transport::direct_path::Proposing::parse(direct_link_proposing)
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "init_edge_runtime: direct_link_proposing {direct_link_proposing:?} is not \
+                     on or off"
+                ))
+            })?,
         facilitator: direct_link_facilitator,
         serve_facilitator: direct_link_serve_port,
         accept: crate::transport::direct_path::DirectAccept::parse(direct_link_accept).ok_or_else(
@@ -7367,7 +7379,14 @@ pub fn init_edge_runtime(
                 ))
             },
         )?,
-    };
+    }
+    // v44 — proposing on by default: the bundle's canonical is the
+    // facilitator when the host named none, under the #661 gate (a node under
+    // a test trust root never probes the production canonical).
+    .resolve_bundle_facilitator(crate::edge::baked_canonical_dials_allowed(
+        baked_canonical_dials,
+        crate::edge::test_trust_root_override_active(),
+    ));
     // CC 5.4.3 — link shaping policy.
     if let Some(class) = shaping_class.as_deref() {
         use crate::transport::link_shaping::{BudgetClass, ShapingPolicy};
@@ -12075,6 +12094,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -12206,6 +12226,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -12376,6 +12397,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )?;
             Ok(())
         });
@@ -12499,6 +12521,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -12780,6 +12803,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -12956,6 +12980,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             );
             // Cleanup: drop OUR engine from the singleton so the next real-engine
             // sibling test constructs cleanly (one persist engine per process).
@@ -13094,6 +13119,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )?;
             Ok(edge.signer_key_id())
         });
