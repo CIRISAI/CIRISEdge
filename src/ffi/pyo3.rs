@@ -7281,7 +7281,9 @@ pub fn init_edge_runtime(
                 BudgetClass::PhoneCellular => {
                     DeviceState::of(DeviceKind::Phone).with_network(false, true)
                 }
-                BudgetClass::Off => DeviceState::of(DeviceKind::platform_default()),
+                BudgetClass::Off | BudgetClass::HomeElsewhere => {
+                    DeviceState::of(DeviceKind::platform_default())
+                }
             };
         }
         transport_config = transport_config.with_shaping(policy);

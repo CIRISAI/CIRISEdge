@@ -50,9 +50,10 @@ pub const OFFER_LEN: usize = 4 + 1 + 1 + 2 + 4 + 2 + 4;
 pub const FRAME_HEADER_LEN: usize = 4 + 1 + 1 + 2;
 const KIND_COVER: u8 = 0x00;
 const KIND_REAL: u8 = 0x01;
-/// The floor on a shaped link's frame rate. A link is never turned off for
-/// being slow: below this it is held here.
-pub const MIN_LAMBDA: f64 = 0.1;
+/// The least frame rate an offer encodes (`rate_milli` 1). Not a floor on
+/// the link: under [`ShapedSharePolicy::DivideNoFloor`] a share runs however
+/// small, down to this.
+pub const MIN_LAMBDA: f64 = 0.001;
 /// The longest budget window an offer may name (one day). `agree` takes the
 /// longer of the two windows, so an unbounded one would let a peer switch the
 /// budget off on its own link.
@@ -74,6 +75,10 @@ pub enum BudgetClass {
     Home = 3,
     /// A server: ~7 KB/s per link.
     Server = 4,
+    /// Not a class: the answer to a shaping peer a node at its bound cannot
+    /// shape (`link_shaping_home_elsewhere`). `off` for the agreement; the
+    /// link closes. A 43.x peer reads it as a malformed class and closes too.
+    HomeElsewhere = 5,
 }
 
 impl BudgetClass {
@@ -82,7 +87,7 @@ impl BudgetClass {
     #[must_use]
     pub const fn default_bytes_per_s(self) -> u32 {
         match self {
-            Self::Off => 0,
+            Self::Off | Self::HomeElsewhere => 0,
             Self::PhoneCellular => 350,
             Self::PhoneWifi => 1400,
             Self::Home => 2800,
@@ -95,6 +100,7 @@ impl BudgetClass {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::HomeElsewhere => "home-elsewhere",
             Self::PhoneCellular => "phone-cellular",
             Self::PhoneWifi => "phone-wifi",
             Self::Home => "home",
@@ -122,6 +128,7 @@ impl BudgetClass {
             2 => Self::PhoneWifi,
             3 => Self::Home,
             4 => Self::Server,
+            5 => Self::HomeElsewhere,
             _ => return None,
         })
     }
@@ -151,6 +158,9 @@ pub struct ShapingPolicy {
     /// rest). See [`FLEET_DEFAULTS`] for which classes shape every link by
     /// default.
     pub scope: ShapingScope,
+    /// How the node cap is shared among the shaped links
+    /// ([`ShapedSharePolicy`]). One line changes the default.
+    pub share: ShapedSharePolicy,
     /// How many links' worth of the node cap is held back for onion layer
     /// neighbours that do not yet have a shaped link (CIRISEdge v44): a
     /// first-come link to anyone else cannot take the share a layer link
@@ -158,6 +168,39 @@ pub struct ShapingPolicy {
     /// ([`LinkShapers::set_layer_peers`]), so a node that does not run the
     /// tier reserves nothing.
     pub layer_reserve_links: u32,
+}
+
+/// CC 5.4.3 — **how the node-wide cap is shared among the shaped links**
+/// (Eric, 2026-11-04: "we shape with shaped peers if possible, otherwise
+/// refuse and offer unshaped (bulk transfers) if available"). The default is
+/// [`Self::BoundedWithFloor`]; switching it is the one line in
+/// [`ShapingPolicy::for_class`].
+///
+/// **The accepted leak.** A refused peer still gets an unshaped bulk link
+/// (files and calls keep working), and that link is observable: an observer
+/// learns the node is at its bound, and the peer's bulk crosses in the clear
+/// shape a Resource has. Prior art (Tarzan, Herd) homes the extra peer
+/// elsewhere instead; until homing lands (CIRISEdge#935) the spill is the
+/// trade-off, and it is bounded: at most one unshaped link per refused peer,
+/// never a row link run unshaped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShapedSharePolicy {
+    /// Every shaping peer is shaped, each link at `cap ÷ shaped links`,
+    /// however small, so the sum of rates never passes the cap. A link's rate
+    /// then publishes the node's shaped-link count, and at large counts a row
+    /// waits one frame gap (about 5 min at a thousand links). Not the default.
+    DivideNoFloor,
+    /// At most `max_links` general shaped links, each at `floor_bytes_per_s`
+    /// (the class rate: no dilution); a shaping peer past the bound is
+    /// REFUSED for rows (`link_shaping_home_elsewhere`), never run unshaped,
+    /// and keeps its unshaped bulk link. Layer neighbours have their own
+    /// reserve and do not count.
+    BoundedWithFloor {
+        /// General shaped links at most.
+        max_links: u32,
+        /// Each shaped link's rate.
+        floor_bytes_per_s: u32,
+    },
 }
 
 /// Which identity links a node offers shaping on.
@@ -427,6 +470,12 @@ impl ShapingPolicy {
             node_cap_bytes_per_s: bytes_per_s.saturating_mul(NODE_CAP_LINKS),
             require_shaped_links: false,
             scope: ShapingScope::AllIdentityLinks,
+            // THE share policy default (Eric, 2026-11-04). The other arm is
+            // `ShapedSharePolicy::DivideNoFloor`.
+            share: ShapedSharePolicy::BoundedWithFloor {
+                max_links: NODE_CAP_LINKS,
+                floor_bytes_per_s: bytes_per_s,
+            },
             layer_reserve_links: DEFAULT_LAYER_RESERVE_LINKS,
         }
     }
@@ -494,6 +543,25 @@ pub struct ShapingOffer {
 }
 
 impl ShapingOffer {
+    /// The refusal of a shaping peer at the bound (`off` on the wire, with
+    /// its reason; [`ShapedSharePolicy::BoundedWithFloor`]).
+    #[must_use]
+    pub const fn home_elsewhere() -> Self {
+        Self {
+            class: BudgetClass::HomeElsewhere,
+            frame_bytes: 0,
+            rate_milli: 0,
+            rho_milli: 0,
+            window_s: 0,
+        }
+    }
+
+    /// Whether this offer shapes (neither `off` nor a refusal).
+    #[must_use]
+    pub const fn shapes(&self) -> bool {
+        !matches!(self.class, BudgetClass::Off | BudgetClass::HomeElsewhere)
+    }
+
     /// The `off` offer.
     #[must_use]
     pub const fn off() -> Self {
@@ -514,7 +582,7 @@ impl ShapingOffer {
     /// node holds now ([`LinkShapers::rebalance`]), which changes as peers
     /// come and go; quoting today's share would pin a link low for good, and
     /// quoting nothing left would be `off`, leaving a shaping peer unshaped.
-    /// A rate under the floor is held AT the floor ([`MIN_LAMBDA`]), never
+    /// A slow rate is quoted as it is ([`MIN_LAMBDA`] at the least), never
     /// turned off.
     #[must_use]
     pub fn from_policy(policy: &ShapingPolicy, frame_bytes: usize) -> Self {
@@ -578,7 +646,7 @@ impl ShapingOffer {
             rho_milli: be16(12),
             window_s: be32(14),
         };
-        if class != BudgetClass::Off
+        if offer.shapes()
             && (offer.rate_milli == 0
                 || offer.frame_bytes < MIN_FRAME_BYTES
                 || offer.rho_milli == 0
@@ -655,7 +723,7 @@ impl Agreement {
 /// the longer W — each the more conservative of the two.
 #[must_use]
 pub fn agree(a: &ShapingOffer, b: &ShapingOffer) -> Option<Agreement> {
-    if a.class == BudgetClass::Off || b.class == BudgetClass::Off {
+    if !a.shapes() || !b.shapes() {
         return None;
     }
     let frame_bytes = a.frame_bytes.min(b.frame_bytes);
@@ -686,6 +754,13 @@ pub enum ShapingError {
     /// The peer offered `off` and this node requires shaped links.
     #[error("the peer offers no shaping and this node requires shaped links")]
     UnshapedPeer,
+    /// A shaping peer past this node's bound, or this node past the peer's:
+    /// the row link is refused, never run unshaped; bulk still has its own
+    /// unshaped link ([`ShapedSharePolicy::BoundedWithFloor`]).
+    #[error(
+        "a shaping peer past the shaped-link bound: homed elsewhere (link_shaping_home_elsewhere)"
+    )]
+    HomeElsewhere,
     /// A shaped frame on an unshaped link, or a bare frame on a shaped one.
     #[error("a frame of the wrong kind for this link's shaping state: {0}")]
     WrongKind(&'static str),
@@ -711,6 +786,7 @@ impl ShapingError {
                 o::LINK_SHAPING_REFUSED_MALFORMED
             }
             Self::UnshapedPeer => o::LINK_SHAPING_REFUSED_UNSHAPED_PEER,
+            Self::HomeElsewhere => o::LINK_SHAPING_HOME_ELSEWHERE,
             Self::WrongKind(_) => o::LINK_SHAPING_DROPPED_WRONG_KIND,
             Self::QueueFull(_) => o::LINK_SHAPING_QUEUE_DEFERRED,
             Self::BulkBeyondReach(..) => o::LINK_SHAPING_BULK_REFUSED,
@@ -969,8 +1045,7 @@ impl LinkShaper {
 
     /// Apply this link's share of the node cap: a LOCAL, downward adjustment.
     /// The agreement stays the upper bound for the link's life, and this
-    /// sender runs at `min(agreed λ, share)`, held at [`MIN_LAMBDA`] at the
-    /// bottom. No frame crosses the wire for it, so a peer joining costs the
+    /// sender runs at `min(agreed λ, share)`, down to [`MIN_LAMBDA`]. No frame crosses the wire for it, so a peer joining costs the
     /// other links nothing, and a share rises again when peers leave. The two
     /// directions of a link can then differ, which shows only each sender's
     /// own link count, never its traffic. The real budget follows the rate,
@@ -978,7 +1053,7 @@ impl LinkShaper {
     pub fn set_share(&self, bytes_per_s: f64) {
         let lambda = (bytes_per_s / f64::from(self.agreement.frame_bytes))
             .min(self.agreement.lambda)
-            .max(MIN_LAMBDA.min(self.agreement.lambda));
+            .max(MIN_LAMBDA);
         if lambda.to_bits() == self.lambda_now.swap(lambda.to_bits(), Ordering::AcqRel) {
             return;
         }
@@ -1260,11 +1335,8 @@ impl LinkShapers {
             let mut links = self.links();
             links.retain(|link, shaper| {
                 let is_layer = peers.get(link).is_some_and(|p| layer.contains(p));
-                let floor = MIN_LAMBDA * f64::from(shaper.agreement().frame_bytes);
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let top = f64::from(policy.bytes_per_s).max(floor).ceil() as u32;
                 let keep = policy.offers_on(is_layer)
-                    && shaper.agreement().bytes_per_s() <= top.saturating_add(1);
+                    && shaper.agreement().bytes_per_s() <= policy.bytes_per_s.saturating_add(1);
                 if !keep {
                     shaper.stop();
                     close.push(*link);
@@ -1348,10 +1420,10 @@ impl LinkShapers {
     /// budget". The layer reserve is held out and shared among the layer
     /// neighbours; the rest is shared among the other links; no link goes
     /// above the class rate. Run whenever a link or the policy changes. Each
-    /// share is applied locally ([`LinkShaper::set_share`]). A share under the
-    /// floor is held at [`MIN_LAMBDA`], which CAN carry the total past the cap
-    /// once the links outnumber `cap / floor`: a shaping peer is never left
-    /// unshaped, and the crossing is said once ([`Self::effective_total`]).
+    /// share is applied locally ([`LinkShaper::set_share`]). Under
+    /// [`ShapedSharePolicy::BoundedWithFloor`] a general link's share is the
+    /// floor (the class rate) and the bound keeps the sum under the cap; under
+    /// [`ShapedSharePolicy::DivideNoFloor`] the share divides, however small.
     pub fn rebalance(&self) {
         let policy = self.policy();
         let layer = self.layer_peer_set();
@@ -1371,6 +1443,12 @@ impl LinkShapers {
             (cap - held).max(0.0) / general.max(1) as f64,
         );
         let class = f64::from(policy.bytes_per_s);
+        let general_share = match policy.share {
+            ShapedSharePolicy::DivideNoFloor => general_share,
+            ShapedSharePolicy::BoundedWithFloor {
+                floor_bytes_per_s, ..
+            } => f64::from(floor_bytes_per_s),
+        };
         for (l, shaper) in &links {
             let share = if is_layer(l) {
                 layer_share
@@ -1386,10 +1464,64 @@ impl LinkShapers {
                 links = links.len(),
                 total_bytes_per_s = total,
                 node_cap_bytes_per_s = policy.node_cap_bytes_per_s,
-                "the shaped links' floor rates pass the node cap: every shaping peer stays \
-                 shaped, at the floor (CC 5.4.3)"
+                "the shaped links' rates pass the node cap (CC 5.4.3)"
             );
         }
+    }
+
+    /// General shaped links now (layer neighbours' links excluded).
+    fn general_shaped_count(&self) -> usize {
+        let layer = self.layer_peer_set();
+        let peers = self.link_peer();
+        self.links()
+            .keys()
+            .filter(|l| !peers.get(*l).is_some_and(|p| layer.contains(p)))
+            .count()
+    }
+
+    /// [`ShapedSharePolicy::BoundedWithFloor`] — whether one more general
+    /// shaped link would pass the bound (`max_links` less the links' worth the
+    /// layer reserve holds).
+    #[must_use]
+    pub fn at_bound(&self) -> bool {
+        let policy = self.policy();
+        let ShapedSharePolicy::BoundedWithFloor { max_links, .. } = policy.share else {
+            return false;
+        };
+        let reserved_links = if policy.bytes_per_s == 0 {
+            0
+        } else {
+            self.layer_reserve() / policy.bytes_per_s
+        };
+        let room = usize::try_from(max_links.saturating_sub(reserved_links)).unwrap_or(usize::MAX);
+        self.general_shaped_count() >= room
+    }
+
+    /// The responder's answer to `theirs` on `link` to `peer`: this node's
+    /// offer, or the refusal when `theirs` shapes and this node is at its
+    /// bound for a general link ([`Self::at_bound`]). The dialler learns the
+    /// same at [`Self::peer_offer`], after offering.
+    #[must_use]
+    pub fn offer_for_answer(
+        &self,
+        link: [u8; 16],
+        frame_bytes: usize,
+        peer: Option<&str>,
+        theirs: &ShapingOffer,
+    ) -> ShapingOffer {
+        if theirs.shapes()
+            && self.policy().offers_on(self.is_layer_peer(peer))
+            && !self.is_layer_peer(peer)
+            && self.at_bound()
+        {
+            if let Some(p) = peer {
+                self.link_peer().insert(link, p.to_owned());
+            }
+            let refusal = ShapingOffer::home_elsewhere();
+            self.offered().insert(link, refusal);
+            return refusal;
+        }
+        self.offer_for(link, frame_bytes, peer)
     }
 
     /// Bytes per second this node's shaped links emit now, summed.
@@ -1490,14 +1622,22 @@ impl LinkShapers {
             .offered()
             .insert(link, ShapingOffer::off())
             .unwrap_or_else(ShapingOffer::off);
+        let peer = self.link_peer().get(&link).cloned();
+        let refused = ours.class == BudgetClass::HomeElsewhere
+            || theirs.class == BudgetClass::HomeElsewhere
+            || (ours.shapes()
+                && theirs.shapes()
+                && !self.is_layer_peer(peer.as_deref())
+                && self.at_bound());
         let out = match agree(&ours, theirs) {
+            _ if refused => Err(ShapingError::HomeElsewhere),
             Some(agreement) => {
                 let shaper = Arc::new(LinkShaper::new(link, agreement, self.queue_cap));
                 self.links().insert(link, Arc::clone(&shaper));
                 self.rebalance();
                 Ok(Some(shaper))
             }
-            None if self.policy().require_shaped_links && ours.class != BudgetClass::Off => {
+            None if self.policy().require_shaped_links && ours.shapes() => {
                 Err(ShapingError::UnshapedPeer)
             }
             None => Ok(None),
@@ -1506,6 +1646,7 @@ impl LinkShapers {
             // choke-ok: a dial that stopped waiting closed the link.
             let _ = tx.send(match &out {
                 Ok(s) => Ok(s.is_some()),
+                Err(ShapingError::HomeElsewhere) => Err(ShapingError::HomeElsewhere),
                 Err(_) => Err(ShapingError::UnshapedPeer),
             });
         }
@@ -1527,9 +1668,7 @@ impl LinkShapers {
     /// Whether this node sent an offer on `link` that is still unanswered.
     #[must_use]
     pub fn awaiting_answer(&self, link: [u8; 16]) -> bool {
-        self.offered()
-            .get(&link)
-            .is_some_and(|o| o.class != BudgetClass::Off)
+        self.offered().get(&link).is_some_and(ShapingOffer::shapes)
     }
 
     /// The link closed: stop and forget its shaper.
@@ -1602,6 +1741,7 @@ mod tests {
             node_cap_bytes_per_s: u32::MAX,
             require_shaped_links: false,
             scope: ShapingScope::AllIdentityLinks,
+            share: ShapedSharePolicy::DivideNoFloor,
             layer_reserve_links: DEFAULT_LAYER_RESERVE_LINKS,
         };
         ShapingOffer::from_policy(&p, usize::from(frame))
@@ -1688,14 +1828,81 @@ mod tests {
         }
     }
 
-    /// **"Always shape with shaped peers"** (Eric, 2026-11-04) under CC 5.4.3
-    /// "a node divides a node-wide cap across its shaped links": a server at
+    /// **The default arm** ([`ShapedSharePolicy::BoundedWithFloor`], Eric
+    /// 2026-11-04): eight shaped links each at the full class rate, summing
+    /// to the cap; the ninth shaping peer is REFUSED by name on both sides
+    /// (the responder answers `home-elsewhere`; a dialler at its bound refuses
+    /// at the answer), never run unshaped; a peer whose offer is `off` is not
+    /// a shaping peer and gets its ordinary unshaped link. Mutation: run the
+    /// ninth link instead of refusing → this fails.
+    #[test]
+    fn at_the_bound_a_ninth_shaping_peer_is_refused_and_an_off_peer_is_not() {
+        let p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        let cap = f64::from(p.node_cap_bytes_per_s);
+        let t = LinkShapers::new(p);
+        shaped_links(&t, 8, "g", 10);
+        for i in 0..8u8 {
+            let s = t.get([10 + i; 16]).expect("a link");
+            assert!(
+                (s.bytes_per_s_now() - 7000.0).abs() < 1.0,
+                "full class rate"
+            );
+        }
+        assert!((t.effective_total() - cap).abs() < 8.0);
+        assert!(t.at_bound());
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
+        let ours = t.offer_for_answer([100u8; 16], 400, Some("ninth"), &peer);
+        assert_eq!(ours.class, BudgetClass::HomeElsewhere);
+        assert!(matches!(
+            t.peer_offer([100u8; 16], &peer),
+            Err(ShapingError::HomeElsewhere)
+        ));
+        assert!(
+            !t.is_shaped([100u8; 16]),
+            "never run unshaped either: refused"
+        );
+        assert_eq!(
+            ShapingError::HomeElsewhere.label(),
+            crate::observability::LINK_SHAPING_HOME_ELSEWHERE
+        );
+        let o = t.offer_for([101u8; 16], 400, Some("tenth"));
+        assert!(
+            o.shapes(),
+            "a dialler offers; the bound is decided at the answer"
+        );
+        assert!(matches!(
+            t.peer_offer([101u8; 16], &peer),
+            Err(ShapingError::HomeElsewhere)
+        ));
+        let _ = t.offer_for([102u8; 16], 400, Some("refuser"));
+        assert!(matches!(
+            t.peer_offer([102u8; 16], &ShapingOffer::home_elsewhere()),
+            Err(ShapingError::HomeElsewhere)
+        ));
+        let ours = t.offer_for_answer([103u8; 16], 400, Some("quiet"), &ShapingOffer::off());
+        assert!(ours.shapes());
+        assert!(t
+            .peer_offer([103u8; 16], &ShapingOffer::off())
+            .unwrap()
+            .is_none());
+        assert_eq!(t.shaped_count(), 8);
+        t.forget(&[10u8; 16]);
+        assert!(!t.at_bound());
+        let _ = t.offer_for([104u8; 16], 400, Some("next"));
+        t.peer_offer([104u8; 16], &peer).unwrap().expect("shaped");
+        assert!((t.effective_total() - cap).abs() < 8.0);
+        let back = ShapingOffer::decode(&ShapingOffer::home_elsewhere().encode()).unwrap();
+        assert_eq!(back.class, BudgetClass::HomeElsewhere);
+        assert!(agree(&back, &peer).is_none());
+    }
+
+    /// **The other arm** ([`ShapedSharePolicy::DivideNoFloor`]): a server at
     /// eight links takes a ninth shaping peer, the link IS shaped, and the
     /// links' rates still sum to the cap. A peer leaving gives its share back.
-    /// Mutation: offer `off` past the eighth link → this fails.
     #[test]
-    fn a_ninth_shaping_peer_is_shaped_and_the_links_share_the_cap() {
-        let p = ShapingPolicy::fleet_default(BudgetClass::Server);
+    fn under_divide_no_floor_a_ninth_shaping_peer_is_shaped_and_the_links_share_the_cap() {
+        let mut p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        p.share = ShapedSharePolicy::DivideNoFloor;
         let cap = f64::from(p.node_cap_bytes_per_s);
         let t = LinkShapers::new(p);
         shaped_links(&t, 8, "g", 10);
@@ -1728,41 +1935,34 @@ mod tests {
         );
     }
 
-    /// The floor holds a link rather than turning it off, on a frame where
-    /// the share (and even the class rate) is below it, and the total can
-    /// then pass the cap: at the 16,272-byte loopback frame, past 34 links.
+    /// No floor anywhere a shaping peer could be turned off: a cellular class
+    /// on a 16 KB frame is quoted at its true rate (one frame per 46 s), and
+    /// under `DivideNoFloor` a hundred links each take a hundredth of the cap
+    /// and the sum stays under it.
     #[test]
-    fn the_floor_holds_a_shaping_peers_link_and_can_carry_the_total_past_the_cap() {
+    fn a_slow_rate_is_quoted_not_refused_and_divide_no_floor_keeps_the_sum_under_the_cap() {
         let cell = ShapingPolicy::for_class(BudgetClass::PhoneCellular);
         let o = ShapingOffer::from_policy(&cell, 16_272);
-        assert_ne!(
-            o.class,
-            BudgetClass::Off,
-            "350 B/s on a 16 KB frame is held, not off"
-        );
-        assert_eq!(o.rate_milli, 100);
-        let p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        assert!(o.shapes(), "350 B/s on a 16 KB frame is quoted, not off");
+        assert_eq!(o.rate_milli, 22);
+        let mut p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        p.share = ShapedSharePolicy::DivideNoFloor;
         let cap = f64::from(p.node_cap_bytes_per_s);
         let t = LinkShapers::new(p);
         let peer = offer(BudgetClass::Server, 16_272, 7000, 0.5, 600);
         for i in 0..100u8 {
-            let link = [i; 16];
-            let _ = t.offer_for(link, 16_272, Some(&format!("p{i}")));
-            t.peer_offer(link, &peer).unwrap().expect("shaped");
-            if i < 34 {
-                assert!(t.effective_total() <= cap + 1.0, "{} links", i + 1);
-            }
+            let _ = t.offer_for([i; 16], 16_272, Some(&format!("p{i}")));
+            t.peer_offer([i; 16], &peer).unwrap().expect("shaped");
+            assert!(t.effective_total() <= cap + 1.0, "{} links", i + 1);
         }
         assert_eq!(t.shaped_count(), 100);
         let per_link = t.get([0u8; 16]).expect("a link").bytes_per_s_now();
         assert!(
-            (per_link - 1627.2).abs() < 1.0,
-            "held at the floor: {per_link}"
+            (per_link - 560.0).abs() < 1.0,
+            "a hundredth of the cap: {per_link}"
         );
-        assert!(t.effective_total() > cap, "100 floors pass the cap");
     }
 
-    #[test]
     fn frames_are_one_size_and_cover_is_told_from_real_only_inside() {
         let mut pad = |b: &mut [u8]| b.iter_mut().for_each(|x| *x = 0xAB);
         let real = wrap(400, Some(b"hello"), &mut pad).unwrap();
@@ -1888,6 +2088,14 @@ mod tests {
                 .map(|r| r.class)
                 .collect::<Vec<_>>(),
             vec![BudgetClass::Server]
+        );
+        assert_eq!(
+            ShapingPolicy::for_class(BudgetClass::Server).share,
+            ShapedSharePolicy::BoundedWithFloor {
+                max_links: NODE_CAP_LINKS,
+                floor_bytes_per_s: 7000
+            },
+            "the default share policy (Eric, 2026-11-04)"
         );
         assert!(!ShapingPolicy::fleet_default(BudgetClass::Off).enabled());
         // The library default stays off: a host names its class.
@@ -2117,7 +2325,8 @@ mod tests {
     /// the general links share the other four however many arrive first.
     #[test]
     fn the_cap_reserves_room_for_layer_neighbours() {
-        let p = ShapingPolicy::for_class(BudgetClass::Home);
+        let mut p = ShapingPolicy::for_class(BudgetClass::Home);
+        p.share = ShapedSharePolicy::DivideNoFloor;
         let t = LinkShapers::new(p.clone());
         shaped_links(&t, 8, "g", 10);
         assert_eq!(t.layer_reserve(), 0);

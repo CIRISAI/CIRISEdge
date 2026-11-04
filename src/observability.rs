@@ -1073,6 +1073,11 @@ pub const LINK_SHAPING_UNSHAPED: &str = "link_shaping_unshaped";
 /// Refused: the peer offers no shaping and this node requires shaped links;
 /// the link closed.
 pub const LINK_SHAPING_REFUSED_UNSHAPED_PEER: &str = "link_shaping_refused_unshaped_peer";
+/// CC 5.4.3 — a shaping peer past this node's shaped-link bound (or this
+/// node past the peer's): the row link is refused and closed, never run
+/// unshaped; the peer homes elsewhere (CIRISEdge#935) and keeps its unshaped
+/// bulk link.
+pub const LINK_SHAPING_HOME_ELSEWHERE: &str = "link_shaping_home_elsewhere";
 /// Refused: a malformed offer or shaped frame; the link closed.
 pub const LINK_SHAPING_REFUSED_MALFORMED: &str = "link_shaping_refused_malformed";
 /// Dropped and the link closed: a bare frame on a shaped link, a shaped

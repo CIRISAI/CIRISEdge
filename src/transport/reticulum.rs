@@ -2606,6 +2606,11 @@ pub struct ReticulumTransport {
     /// Peers whose bulk dial failed lately, so bulk to a peer reachable only
     /// over its shaped link goes straight there ([`BULK_DIAL_NEGATIVE_TTL`]).
     bulk_dial_failed: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// Peers that refused this node's row link at their bound, or that this
+    /// node refused at its own, lately: a row send to one fails by name
+    /// without a dial for [`BULK_DIAL_NEGATIVE_TTL`] (the peer homes elsewhere,
+    /// CIRISEdge#935); bulk still dials its unshaped link.
+    row_homed_elsewhere: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead
     /// of the real one (see [`HandshakeOverride`]). `None` in production.
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
@@ -3302,6 +3307,7 @@ impl ReticulumTransport {
             test_unannounced: Arc::clone(&self.test_unannounced),
             test_refuse_dials: Arc::clone(&self.test_refuse_dials),
             test_refused_dials: Arc::clone(&self.test_refused_dials),
+            row_homed_elsewhere: Arc::clone(&self.row_homed_elsewhere),
             test_identify_last: Arc::clone(&self.test_identify_last),
             deferred_handshake_part: Arc::clone(&self.deferred_handshake_part),
             test_binding_key_only: Arc::clone(&self.test_binding_key_only),
@@ -3983,6 +3989,7 @@ impl ReticulumTransport {
             test_refused_dials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bulk_fallbacks: Arc::new(crate::transport::link_shaping::BulkFallbacks::default()),
             bulk_dial_failed: std::sync::Mutex::new(HashMap::new()),
+            row_homed_elsewhere: Arc::new(std::sync::Mutex::new(HashMap::new())),
             av_call_router: std::sync::OnceLock::new(),
             test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_handshake_part: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -8660,6 +8667,17 @@ impl ReticulumTransport {
             .await
     }
 
+    /// Whether `peer`'s row link was refused at a bound within
+    /// [`BULK_DIAL_NEGATIVE_TTL`].
+    fn row_recently_homed_elsewhere(&self, peer: &str) -> bool {
+        let mut m = self
+            .row_homed_elsewhere
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        m.retain(|_, at| at.elapsed() < BULK_DIAL_NEGATIVE_TTL);
+        m.contains_key(peer)
+    }
+
     /// Whether a bulk dial to `peer` failed within [`BULK_DIAL_NEGATIVE_TTL`].
     fn bulk_dial_recently_failed(&self, peer: &str) -> bool {
         let mut failed = self
@@ -9533,6 +9551,15 @@ impl Transport for ReticulumTransport {
         // lane; any other send takes the row lane and moves to the bulk lane
         // only when the row link it got is shaped and the payload is too big.
         let bulk = crate::transport::link_shaping::is_bulk_payload(envelope_bytes);
+        if !bulk && self.row_recently_homed_elsewhere(destination_key_id) {
+            return Err(TransportError::LinkSealRefused {
+                peer: destination_key_id.to_owned(),
+                reason: crate::observability::LINK_SHAPING_HOME_ELSEWHERE,
+                detail: "the row link to this peer was refused at a shaped-link bound lately; \
+                         it is homed elsewhere (CIRISEdge#935), bulk still rides its own link"
+                    .to_owned(),
+            });
+        }
         if bulk && self.bulk_dial_recently_failed(destination_key_id) {
             if let Some(link) = self
                 .shaped_link_for_bulk(destination_key_id, envelope_bytes)
@@ -10730,6 +10757,9 @@ struct DialCtx {
     test_refuse_dials: Arc<std::sync::atomic::AtomicBool>,
     /// Test seam — how many dials [`Self::test_refuse_dials`] refused.
     test_refused_dials: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared with the transport: peers whose row link was refused at a bound
+    /// ([`ReticulumTransport::row_homed_elsewhere`]).
+    row_homed_elsewhere: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_identify_last`.
     test_identify_last: Arc<std::sync::atomic::AtomicBool>,
     /// CC 5.3.3.5 E1 test seam ([`HandshakeOverride::DeferLastPart`]): the
@@ -11619,6 +11649,12 @@ impl DialCtx {
                 Ok(())
             }
             Ok(Ok(Err(e))) => {
+                if matches!(e, ShapingError::HomeElsewhere) {
+                    self.row_homed_elsewhere
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(peer.to_owned(), std::time::Instant::now());
+                }
                 let err = refuse(e);
                 self.close_refused(link_id).await;
                 Err(err)
@@ -14168,7 +14204,7 @@ async fn shaped_inbound(
 ///
 /// [`LinkShapers::peer_offer`]: crate::transport::link_shaping::LinkShapers::peer_offer
 async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8]) {
-    use crate::transport::link_shaping::{BudgetClass, ShapingError, ShapingOffer};
+    use crate::transport::link_shaping::{ShapingError, ShapingOffer};
     let link = link_id.into_bytes();
     let theirs = match ShapingOffer::decode(bytes) {
         Ok(o) => o,
@@ -14186,8 +14222,12 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
             // layer neighbour is offered shaping under any scope and draws on
             // the reserve (CIRISEdge v44, CC 5.4.6 item 4).
             let peer = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
-            ctx.shapers
-                .offer_for(link, link_channel_mdu(ctx.node, &link_id), peer.as_deref())
+            ctx.shapers.offer_for_answer(
+                link,
+                link_channel_mdu(ctx.node, &link_id),
+                peer.as_deref(),
+                &theirs,
+            )
         } else {
             ctx.shapers.offer_off_for(link)
         };
@@ -14203,7 +14243,7 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
             .await;
             return;
         }
-        if ours.class != BudgetClass::Off {
+        if ours.shapes() {
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
             }

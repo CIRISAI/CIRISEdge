@@ -228,6 +228,7 @@ fn policy(
         node_cap_bytes_per_s: bytes_per_s.saturating_mul(8),
         require_shaped_links: strict,
         scope: ciris_edge::transport::link_shaping::ShapingScope::AllIdentityLinks,
+        share: ciris_edge::transport::link_shaping::ShapedSharePolicy::DivideNoFloor,
         layer_reserve_links: ciris_edge::transport::link_shaping::DEFAULT_LAYER_RESERVE_LINKS,
     }
 }
@@ -1008,4 +1009,113 @@ async fn a_link_over_the_node_cap_is_shaped_at_its_share() {
         t.b.metrics.link_shaping()
     );
     assert_eq!(t.a.transport.shaped_link_count(), 1);
+}
+
+/// **The bound, on a real pair** (Eric, 2026-11-04): A is a server at its
+/// shaped-link bound (`max_links` 0 stands for eight full). B, a shaping peer,
+/// dials for a row: A refuses by name, the row link closes and never runs
+/// unshaped, B's send fails with the token and its next row send fails
+/// without a dial. B's 1 MiB bulk transfer still completes, on an unshaped
+/// link of its own. Mutation: run the refused link unshaped for rows → fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_crosses() {
+    use ciris_edge::transport::link_shaping::ShapedSharePolicy;
+    let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    full.share = ShapedSharePolicy::BoundedWithFloor {
+        max_links: 0,
+        floor_bytes_per_s: 100_000,
+    };
+    let t = duo(
+        "bound",
+        full,
+        policy(BudgetClass::Server, 100_000, 0.5, 10, false),
+    )
+    .await;
+    let row = typed_payload("AttestationGossip", b"BOUND-ROW-", 2_000);
+    let err =
+        t.b.transport
+            .send(&t.a.key.key_id, &row)
+            .await
+            .expect_err("A at its bound refuses B's row link");
+    assert!(
+        err.to_string().contains("link_shaping_home_elsewhere"),
+        "{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            t.a.shaping("link_shaping_home_elsewhere") >= 1
+        })
+        .await,
+        "A counts the refusal: {:?}",
+        t.a.metrics.link_shaping()
+    );
+    assert_eq!(
+        t.b.shaping("link_shaping_home_elsewhere"),
+        1,
+        "{:?}",
+        t.b.metrics.link_shaping()
+    );
+    assert_eq!(t.a.transport.shaped_link_count(), 0);
+    assert!(!t.a.received(&row).await, "the row never crossed unshaped");
+    let err =
+        t.b.transport
+            .send(&t.a.key.key_id, &row)
+            .await
+            .expect_err("the next row send fails without a dial");
+    assert!(
+        err.to_string().contains("link_shaping_home_elsewhere"),
+        "{err}"
+    );
+    assert_eq!(
+        t.b.shaping("link_shaping_home_elsewhere"),
+        1,
+        "no second refusal on the wire"
+    );
+    let blob = typed_payload("BlobChunkBody", b"BOUND-BULK-", 1 << 20);
+    t.b.transport
+        .send(&t.a.key.key_id, &blob)
+        .await
+        .expect("bulk rides an unshaped link of its own");
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            t.a.received(&blob).await
+        })
+        .await
+    );
+    assert_eq!(
+        t.a.transport.shaped_link_count(),
+        0,
+        "still nothing shaped at A"
+    );
+}
+
+/// A peer whose class is Off is not a shaping peer: at A's bound its row
+/// link runs unshaped, as CC 5.4.3 "either side off" says, and the row crosses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_the_bound_an_off_peer_still_gets_an_ordinary_unshaped_link() {
+    use ciris_edge::transport::link_shaping::ShapedSharePolicy;
+    let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    full.share = ShapedSharePolicy::BoundedWithFloor {
+        max_links: 0,
+        floor_bytes_per_s: 100_000,
+    };
+    let t = duo("bound-off", full, explicit_off()).await;
+    let row = typed_payload("AttestationGossip", b"OFF-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("an off peer's row rides an unshaped link");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await
+    );
+    assert_eq!(
+        t.a.shaping("link_shaping_home_elsewhere"),
+        0,
+        "{:?}",
+        t.a.metrics.link_shaping()
+    );
+    assert_eq!(t.a.shaping("link_shaping_unshaped"), 1);
 }
