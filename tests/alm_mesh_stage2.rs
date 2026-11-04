@@ -514,7 +514,8 @@ fn primary_for(
 /// **Roster relays before the canonical** (Eric 2026-11-02): `B` and `C`
 /// cannot reach each other directly; each hears the other through `A`, a
 /// roster member that offers relay — never through the canonical `T`.
-#[allow(clippy::too_many_lines)]
+// a, b, c, t: the nodes as the module docs name them.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
     let tag = "alm2-roster";
@@ -776,4 +777,42 @@ async fn stale_media_is_dropped_by_age_and_the_hop_recovers() {
         "no frame failed its open"
     );
     assert_eq!(cb.legs(), vec![a.key.key_id.clone()], "the link stayed up");
+}
+
+/// **A lost ADMIT is resent, not withdrawn.** Every must-arrive C3 frame A
+/// sends is refused on its first attempt, as a congested link refuses it. B
+/// still records A as its parent from the resent ADMIT, and never has to
+/// withdraw (its 3 s request timeout never fires). Mutation: without the
+/// resend, B gets no ADMIT at all, times out and withdraws.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_refused_admit_is_resent_not_withdrawn() {
+    let tag = "alm2-resend";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    ca.fail_next_c3_for_test(u64::MAX);
+    let cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    let recorded = wait_until(Duration::from_secs(60), || async {
+        primary_for(&cb, ca.stream()).as_deref() == Some(a.key.key_id.as_str())
+    })
+    .await;
+    assert!(
+        recorded,
+        "B records A from the resent ADMIT: {:?} log {:?}",
+        cb.alm_parents(),
+        cb.alm_log()
+    );
+    assert_eq!(
+        cb.alm_log_count(
+            ciris_edge::transport::realtime_av_alm::controller::DecisionKind::Unsubscribe
+        ),
+        0,
+        "B never withdrew: {:?}",
+        cb.alm_log()
+    );
+    assert!(
+        av(&a.metrics, "alm_c3_resent") > 0,
+        "A resent: {:?}",
+        a.metrics.av_plane()
+    );
 }

@@ -1159,6 +1159,9 @@ struct Shared {
     /// Test seam: every pump holds its next frame until this instant (a
     /// stalled consumer, so queued media ages).
     test_stall_until: StdMutex<Option<Instant>>,
+    /// Test seam: this many must-arrive C3 frames fail their FIRST send, as
+    /// a congested link refuses them (their resends are untouched).
+    test_fail_c3: AtomicU64,
 }
 
 /// This stream's chunk key at one epoch and its binding's encoding.
@@ -1357,6 +1360,7 @@ impl Call {
             queue_age_ms: AtomicU64::new(0),
             load,
             test_stall_until: StdMutex::new(None),
+            test_fail_c3: AtomicU64::new(0),
         });
         if let KeepOutcome::Refused(refused) = keep {
             shared.emit(CallEvent::KeepRefused {
@@ -1671,6 +1675,13 @@ impl Call {
     #[doc(hidden)]
     pub fn stall_inbound_for_test(&self, d: Duration) {
         *Shared::lock(&self.shared.test_stall_until) = Some(Instant::now() + d);
+    }
+
+    /// Test seam: the next `n` must-arrive C3 frames this node sends fail their
+    /// first attempt, as a congested link refuses them.
+    #[doc(hidden)]
+    pub fn fail_next_c3_for_test(&self, n: u64) {
+        self.shared.test_fail_c3.store(n, Ordering::Relaxed);
     }
 
     /// Test seam: re-send this stream's binding on every leg now, as the
@@ -2315,6 +2326,16 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
         if !Shared::lock(&shared.alm).speaks_c3(&o.to) {
             continue;
         }
+        let refused_by_seam = !is_periodic(&o.frame)
+            && shared
+                .test_fail_c3
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok();
+        if refused_by_seam {
+            let s = Arc::clone(shared);
+            tokio::spawn(async move { resend_c3(&s, o).await });
+            continue;
+        }
         let sent = shared
             .publisher
             .lock()
@@ -2380,6 +2401,7 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
         if ok {
             Shared::lock(&shared.alm).counts.c3_sent += 1;
             shared.count(crate::observability::ALM_C3_SENT);
+            shared.count(crate::observability::ALM_C3_RESENT);
             return;
         }
     }

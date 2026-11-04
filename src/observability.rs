@@ -963,6 +963,9 @@ pub const AV_LEG_RESTORED: &str = "av_leg_restored";
 pub const ALM_C3_SENT: &str = "alm_c3_sent";
 /// ALM C3 — a control frame that could not be sent to its member.
 pub const ALM_C3_SEND_FAILED: &str = "alm_c3_send_failed";
+/// ALM C3 — a must-arrive control frame delivered by a resend after the
+/// link refused it.
+pub const ALM_C3_RESENT: &str = "alm_c3_resent";
 /// ALM C3 — a control frame received and applied.
 pub const ALM_C3_RECEIVED: &str = "alm_c3_received";
 /// ALM C3 — a frame that read as C3 and did not decode.
