@@ -64,15 +64,30 @@ one window's real-frame budget, `ceil(ρ·λ·W)` frames. That budget is:
 | `phone-wifi` | about 420 KB |
 | `phone-cellular` | about 630 KB |
 
-**Bulk is refused at the shaper.** A larger message is bulk. The shaper
-refuses it by name and queues none of it (`link_shaping_bulk_refused`).
+**Bulk moves to an unshaped link.** A message needs the bulk plane when its
+link is shaped and either of these holds:
 
-**Bulk and live media take unshaped links.** Bulk and live media (calls and
-streams) ride unshaped links of their own and make no shaping claim:
+- it is bulk by kind: `ContentFetch`, `ContentBody`, `BlobChunkFetch` or
+  `BlobChunkBody` (`BULK_MESSAGE_TYPES`, the wire spelling of `MessageType`);
+- it is larger than one window's real-frame budget.
 
-- An A/V leg is on the `Av` plane and is never shaped.
-- A scoped link is never shaped either.
+Such a message takes the freshest unshaped link to the peer. If there is none,
+the node dials one with no shaping offer and marks it bulk, so rows do not use
+it. Fetches count as bulk so that the answer has an unshaped way back, even to
+a peer this node cannot dial.
 
-**Open in v44: bulk has no dedicated plane yet.** A blob larger than a row can
-still reach a peer over an unshaped identity link. Over a shaped link it is
-refused, and nothing yet dials an unshaped bulk link to carry it instead.
+**Live media.** An A/V leg is on the `Av` plane and is never shaped. A scoped
+link is never shaped either. Neither makes a shaping claim.
+
+**The last resort.** If no unshaped link can be had because the dial fails (for
+example, a NAT'd phone reachable only over the link it dialled in), the message
+rides the shaped link in shaped-budget fragments and is counted
+`link_shaping_bulk_on_shaped_fallback`. The shaper paces it like every other
+frame, so the link stays constant-size and constant-rate. It is slow, but it
+does not fail. The bound is the window budget: at the `server` class on a 16 KB
+frame, about 0.2 real frames per second, or about 3 KB/s.
+
+**The refusal.** The shaper itself still refuses a message beyond its reach
+outside that fallback (`link_shaping_bulk_refused`), and queues none of it. The
+send paths move bulk before it gets there, so a count here means a path that
+skipped them.
