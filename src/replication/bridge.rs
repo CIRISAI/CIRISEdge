@@ -7014,21 +7014,6 @@ impl FederationDirectoryReplicationBridge {
             );
             return false;
         }
-        // persist v61 (CIRISPersist#991) — a GROUP-PLANE row keeps its retired
-        // framed plane's reach: advertised by every holder, narrowed per peer by
-        // persist's `may_receive` (→ `may_receive_group_plane`) in the audience
-        // gate. The family-scope attestation cell is `SelfOwn`, which would let
-        // only the signer's own nodes relay a family's record, widening or
-        // REMOVAL — and a removal every holder of the record must fold (#860)
-        // would then reach only the members who sync with its signer.
-        if canonical_json
-            .pointer("/attestation_envelope/dimension")
-            .and_then(serde_json::Value::as_str)
-            .and_then(ciris_persist::federation::group_plane::GroupPlaneFamily::of_dimension)
-            .is_some()
-        {
-            return true;
-        }
         // v36 (CIRISPersist#713) — one resolver for the whole family decision:
         // `Plane::Attestation { dimension }` is value-keyed, so `trace:*` resolves
         // Capability and `scores:*` resolves Subject from the TABLE rather than
@@ -10561,22 +10546,27 @@ impl FederationDirectoryReplicationBridge {
             // persist v55.0.0 (#989) — a `KeyGrantRefused` reason that is the
             // row's own (`key_grant_refusal_terminal`) is terminal; the others
             // wait on state that can land and keep the transient rule.
-            // persist v61 S2 (#1148) — the key-grant door folds the attestation
-            // plane's typed `NotInAudience` into `KeyGrantRefused {
-            // attestation_refused, detail: "…: NotInAudience" }`. Booked as the
-            // general door books it: terminal, under persist's token, so the
-            // choke parks it on its audience (`park_on_audience`) and a
-            // membership row releases it. Matched on the detail because the
-            // door carries no typed reason (CIRISPersist#1184).
+            // persist v61 S2 (#1148) — the attestation plane's `NotInAudience`
+            // on a key-grant row is booked as the general door books it:
+            // terminal, under persist's token, so the choke parks it on its
+            // audience (`park_on_audience`) and a membership row releases it.
+            // persist v61.0.1 (#1184) carries the reason typed.
             // persist v61.0.0 (I1519) — key-grant rows are exempt from the
             // #1148 put-time gate; their own audience rule is the door's
             // `recipient_not_in_audience`, a back-off of the same kind ("a peer
             // backs off on either"), parked and released the same way.
-            Err(ciris_persist::federation::Error::KeyGrantRefused { reason, detail })
-                if detail.contains("NotInAudience")
-                    || reason
-                        == ciris_persist::federation::key_grant::KeyGrantRefusalReason::RecipientNotInAudience
-                            .as_str() =>
+            Err(ciris_persist::federation::Error::KeyGrantRefused {
+                reason,
+                detail,
+                attestation_reason,
+            }) if matches!(
+                attestation_reason,
+                Some(
+                    ciris_persist::federation::attestation_apply::AttestationRefusalReason::NotInAudience
+                )
+            ) || reason
+                == ciris_persist::federation::key_grant::KeyGrantRefusalReason::RecipientNotInAudience
+                    .as_str() =>
             {
                 ApplyOutcome::refused_terminal(format!(
                     "key_grant: row refused at the attestation plane \
@@ -12486,6 +12476,7 @@ pub(crate) mod tests {
                     E::KeyGrantRefused {
                         reason: reason.as_str(),
                         detail: "…".to_owned(),
+                        attestation_reason: None,
                     },
                     want,
                 )
@@ -12907,8 +12898,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// persist v61 S2 (#1148) — the key-grant door's `not_in_audience` (persist
-    /// folds it into `KeyGrantRefused { attestation_refused, detail }`) is
+    /// persist v61 S2 (#1148) — the key-grant door's `not_in_audience` (typed
+    /// on `KeyGrantRefused::attestation_reason` since persist v61.0.1, #1184) is
     /// recognised and parked like the general door's.
     #[test]
     fn the_key_grant_doors_not_in_audience_is_recognised_1148() {
