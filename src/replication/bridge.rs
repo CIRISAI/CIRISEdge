@@ -2555,40 +2555,16 @@ impl FederationDirectoryReplicationBridge {
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             key_plane_memos: super::key_plane_memo::KeyPlaneMemos::default(),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
-            lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
-                crate::rate_limit::Policy::quota(
-                    Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
-                    Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
-                    Self::IDENTIFIER_LOOKUP_MAX_PEERS,
-                )
-                .with_long_windows([
-                    Some(crate::rate_limit::Quota::new(
-                        Self::IDENTIFIER_LOOKUPS_PER_HOUR,
-                        3_600,
-                    )),
-                    Some(crate::rate_limit::Quota::new(
-                        Self::IDENTIFIER_LOOKUPS_PER_DAY,
-                        86_400,
-                    )),
-                ]),
-            )),
-            announced_testimony_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
-                crate::rate_limit::Policy::quota(
-                    Self::ANNOUNCED_TESTIMONY_LOOKUPS_PER_WINDOW,
-                    Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
-                    Self::IDENTIFIER_LOOKUP_MAX_PEERS,
-                )
-                .with_long_windows([
-                    Some(crate::rate_limit::Quota::new(
-                        Self::ANNOUNCED_TESTIMONY_LOOKUPS_PER_HOUR,
-                        3_600,
-                    )),
-                    Some(crate::rate_limit::Quota::new(
-                        Self::ANNOUNCED_TESTIMONY_LOOKUPS_PER_DAY,
-                        86_400,
-                    )),
-                ]),
-            )),
+            lookup_limiter: Self::lookup_budget(
+                Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
+                Self::IDENTIFIER_LOOKUPS_PER_HOUR,
+                Self::IDENTIFIER_LOOKUPS_PER_DAY,
+            ),
+            announced_testimony_limiter: Self::lookup_budget(
+                Self::ANNOUNCED_TESTIMONY_LOOKUPS_PER_WINDOW,
+                Self::ANNOUNCED_TESTIMONY_LOOKUPS_PER_HOUR,
+                Self::ANNOUNCED_TESTIMONY_LOOKUPS_PER_DAY,
+            ),
             subject_pull_charges: Mutex::default(),
             pull_offers: Mutex::new(super::subject_pull::WindowLedger::new(
                 super::subject_pull::LEDGER_CAP,
@@ -7392,7 +7368,29 @@ impl FederationDirectoryReplicationBridge {
         verdict
     }
 
+    /// One per-requester lookup budget: a burst quota, and the hourly and daily
+    /// ceilings a slow drain is measured against (FSD_RATE_LIMIT §5.4).
+    fn lookup_budget(
+        per_window: u32,
+        per_hour: u32,
+        per_day: u32,
+    ) -> Mutex<crate::rate_limit::RateLimiter> {
+        use crate::rate_limit::{Policy, Quota, RateLimiter};
+        Mutex::new(RateLimiter::new(
+            Policy::quota(
+                per_window,
+                Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
+                Self::IDENTIFIER_LOOKUP_MAX_PEERS,
+            )
+            .with_long_windows([
+                Some(Quota::new(per_hour, 3_600)),
+                Some(Quota::new(per_day, 86_400)),
+            ]),
+        ))
+    }
+
     /// The clock the lookup limiters and their ledgers read.
+    #[cfg_attr(not(test), allow(clippy::unused_self))] // the skew is test-only
     fn limiter_now(&self) -> crate::rate_limit::Ts {
         #[cfg(test)]
         let skew = self
@@ -24654,6 +24652,7 @@ pub(crate) mod tests {
             "the fetch twin serves what the advertise offers"
         );
         for (id, why) in [
+            (&unpublished, "a node the relay does not publish"),
             (&unannounced, "a binding at `self` (not announced)"),
             (&consent, "a consent row about a published node"),
         ] {

@@ -750,6 +750,7 @@ impl ReplicationScheduler {
     /// telemetry consumers. Drop the receiver to stop receiving
     /// events; the scheduler tolerates a closed sink (the round
     /// loops continue).
+    #[allow(clippy::too_many_lines)] // one select loop: every command arm in one place
     pub async fn run_with_events(
         mut self,
         mut cancel: watch::Receiver<bool>,

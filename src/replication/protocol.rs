@@ -900,6 +900,17 @@ mod tests {
     /// refused frame.
     #[test]
     fn summary_status_is_flat_optional_and_tolerant_937() {
+        // The same struct without the field.
+        #[derive(Deserialize)]
+        struct PreV44Summary {
+            kind: EnvelopeKind,
+            refs: Vec<EnvelopeRef>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum PreV44 {
+            Summary(PreV44Summary),
+        }
         let plain = ReplicationMessage::Summary(SummaryMessage {
             status: None,
             kind: EnvelopeKind::Attestation,
@@ -923,17 +934,7 @@ mod tests {
         assert_eq!(wire["retry_after_secs"], 60);
         assert_eq!(ReplicationMessage::from_bytes(&bytes).unwrap(), throttled);
 
-        // A pre-v44 peer's reader: the same struct without the field.
-        #[derive(Deserialize)]
-        struct PreV44Summary {
-            kind: EnvelopeKind,
-            refs: Vec<EnvelopeRef>,
-        }
-        #[derive(Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum PreV44 {
-            Summary(PreV44Summary),
-        }
+        // A pre-v44 peer's reader.
         let PreV44::Summary(old) = serde_json::from_slice::<PreV44>(&bytes).unwrap();
         assert_eq!(old.kind, EnvelopeKind::Attestation);
         assert!(old.refs.is_empty(), "an old peer reads the empty list");

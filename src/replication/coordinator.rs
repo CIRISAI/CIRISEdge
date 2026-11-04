@@ -1681,12 +1681,10 @@ mod tests {
         assert!(!bob_coord.is_round_complete().await);
     }
 
-    fn pull_rig(
-        known: HashMap<Vec<u8>, [u8; 32]>,
-    ) -> (
-        Arc<ReplicationCoordinator>,
-        Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
-    ) {
+    /// What the Pull witnesses read of the peer's side of the wire.
+    type Wire = Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>;
+
+    fn pull_rig(known: HashMap<Vec<u8>, [u8; 32]>) -> (Arc<ReplicationCoordinator>, Wire) {
         let (alice_t, bob_t) = alice_bob_transports();
         let provider = Arc::new(StaticProvider {
             state: LocalState::new(),
@@ -1704,9 +1702,7 @@ mod tests {
         (coord, bob_t.my_inbox.clone())
     }
 
-    async fn next_frame(
-        rx: &Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
-    ) -> crate::replication::wire_frame::Framed {
+    async fn next_frame(rx: &Wire) -> crate::replication::wire_frame::Framed {
         let bytes = tokio::time::timeout(Duration::from_secs(2), rx.lock().await.recv())
             .await
             .expect("a frame in time")
