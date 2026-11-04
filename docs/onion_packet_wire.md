@@ -298,7 +298,7 @@ n = 1, 2, 3.
 - **Known gaps in v44.**
   - Mailbox and fetch framing beyond the FETCH flag is not specified
     (FSD/ONION_ROUTING.md §8).
-  - Persist has no `onion_hop_pubkeys` reader before 61.0.1 (CIRISPersist#1181).
+  - Persist has no `onion_hop_pubkeys` reader until CIRISPersist#1181.
   - Persist has no `pseudonym` or rendezvous gate (CIRISPersist#1149).
 
 ## 10. Source map (at the submission commit)

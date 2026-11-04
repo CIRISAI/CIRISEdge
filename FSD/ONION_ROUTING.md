@@ -22,7 +22,7 @@ Today the canonical bundle seats one relay, so the floor fails on every node.
   libcrux, with the SHA3 combiner. The body is a LIONESS wide block, so it resists tagging. The
   header carries chained slot commitments. See `docs/onion_packet_wire.md` (with the known-answer
   tests, KATs), which supersedes §5 below.
-- **The hop key** is read through one accessor (`src/onion/hop_key.rs`). Until persist 61.0.1 the
+- **The hop key** is read through one accessor (`src/onion/hop_key.rs`). Until CIRISPersist#1181 the
   transit pair stands in for it.
 - **Relay, sender, pseudonym and runtime** live in `src/onion/{relay,sender,pseudonym,runtime}.rs`.
 - **Anonymous mode is row-plane only.** While the tier is active, a node starts no call and no
@@ -35,7 +35,7 @@ Today the canonical bundle seats one relay, so the floor fails on every node.
 **Still owed:**
 
 - the fold reader that builds `RelayCandidate`s, which needs `INFRA_RELAY` from persist v60.1 and
-  the 61.0.1 markers;
+  the #1181 markers;
 - the rendezvous row and the mailbox (CIRISPersist#1149);
 - the pseudonym's persist gate;
 - an over-the-wire RNS loopback.

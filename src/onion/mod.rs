@@ -9,7 +9,7 @@
 //! - [`packet`] — the `outfox-xwing-v1` codec (draft X-Wing hop KEM, LIONESS
 //!   body), submitted to the CC with `docs/onion_packet_wire.md` and its KATs;
 //! - [`hop_key`] — the ONE place a node's hop key is read off the fold (today
-//!   the transit pair stands in; persist 61.0.1 swaps in `onion_hop_pubkeys`),
+//!   the transit pair stands in; CIRISPersist#1181 swaps in `onion_hop_pubkeys`),
 //!   use-time separation, and custody of the node's own hop secret;
 //! - [`policy`] — the opt-in, the device relay policy and every refusal token;
 //! - [`relay`] — the relay step: shaped links only, replay, period, hold bound;

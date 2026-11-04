@@ -199,7 +199,7 @@ mod tests {
     /// route over the deal, builds the publication, and the packet crosses
     /// three in-process relays, each on a link marked shaped; the exit stores
     /// the payload. The same packet offered on an unshaped link is refused at
-    /// the first hop. (Over-the-wire RNS loopback is owed with persist 61.0.1,
+    /// the first hop. (Over-the-wire RNS loopback is owed with CIRISPersist#1181,
     /// when a node can publish its own hop key.)
     #[test]
     fn a_publication_crosses_three_relays_end_to_end_when_forced_available() {

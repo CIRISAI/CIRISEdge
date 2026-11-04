@@ -281,14 +281,16 @@ mod tests {
 
     #[test]
     fn classify_names_the_window_never_opening() {
-        for r in [
-            "fragment_pacing_timeout",
-            "frame_budget_exhausted",
-            "shaping_queue_full",
-        ] {
+        for r in ["fragment_pacing_timeout", "frame_budget_exhausted"] {
             assert_eq!(ChannelLanding::classify(0, 1, Some(r)), S, "{r}");
         }
-        for r in ["link_unsealed", "link_send_error", "shaping_body_too_large"] {
+        // `shaping_queue_full` is load on a healthy slow link, never a stall.
+        for r in [
+            "link_unsealed",
+            "link_send_error",
+            "shaping_body_too_large",
+            "shaping_queue_full",
+        ] {
             assert_eq!(
                 ChannelLanding::classify(0, 3, Some(r)),
                 ChannelLanding::Refused,

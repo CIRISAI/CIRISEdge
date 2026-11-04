@@ -1224,7 +1224,7 @@ async fn a_burst_of_rows_to_a_peer_shares_one_shaped_link() {
 
 /// The announced owner-binding `delegates_to(owner → node)`, as
 /// `attestation_bind::owner_binding_attestation` mints it.
-async fn announced_owner_binding(owner: &Ident, node: &str) -> Attestation {
+async fn owner_binding_at(owner: &Ident, node: &str, cohort_scope: &str) -> Attestation {
     let asserted_at = ciris_edge::replication::attestation_bind::truncate_to_substrate_resolution(
         chrono::Utc::now(),
     );
@@ -1244,7 +1244,7 @@ async fn announced_owner_binding(owner: &Ident, node: &str) -> Attestation {
             attestation_type: "delegates_to",
             attested_key_id: node,
             subject_key_ids: &subjects,
-            cohort_scope: "federation",
+            cohort_scope,
             weight: None,
         },
     );
@@ -1271,7 +1271,7 @@ async fn announced_owner_binding(owner: &Ident, node: &str) -> Attestation {
         persist_row_hash: String::new(),
         subject_key_ids: subjects,
         withdraws_admission_rule: None,
-        cohort_scope: "federation".to_owned(),
+        cohort_scope: cohort_scope.to_owned(),
         // `tier` is where the row LIVES (persist's federation listings read
         // `tier = 'federation'` only — a `local` row is invisible to
         // `owner_of`); `cohort_scope` is the AUDIENCE. A claim's binding is a
@@ -1294,6 +1294,7 @@ fn roomy(max_links: u32) -> ShapingPolicy {
 }
 
 /// One node of a referral witness.
+#[allow(clippy::too_many_arguments)] // a test fixture, each a node's own fact
 async fn start_node(
     tmp: &std::path::Path,
     key: Ident,
@@ -1569,7 +1570,7 @@ async fn a_refused_peer_homes_on_a_referral_and_its_contact_completes_there() {
         })
         .await
         .expect("the owner's key");
-    let binding = announced_owner_binding(&owner, &t.w.key.key_id).await;
+    let binding = owner_binding_at(&owner, &t.w.key.key_id, "federation").await;
     t.r.dir
         .put_attestation(SignedAttestation {
             attestation: binding,
@@ -1869,4 +1870,46 @@ async fn a_row_behind_a_slow_path_file_overtakes_it() {
         })
         .await
     );
+}
+
+/// E10 — **a node that chose not to be listed is never referred.** W is owned,
+/// offers relay and has free slots, and its owner binding is at `self` scope: it
+/// has not announced, so R names nobody. Mutation: drop the binding test → R
+/// names W.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owned_node_that_has_not_announced_is_never_referred() {
+    let mut t = referral_pair(
+        "self",
+        0x8a,
+        DeviceState::of(DeviceKind::Server),
+        None,
+        false,
+    )
+    .await;
+    let owner = Ident::new("person-keeps-w", 0x8f).await;
+    t.r.dir
+        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: owner.record_as("user").await,
+        })
+        .await
+        .expect("the owner's key");
+    let binding = owner_binding_at(&owner, &t.w.key.key_id, "self").await;
+    t.r.dir
+        .put_attestation(SignedAttestation {
+            attestation: binding,
+        })
+        .await
+        .expect("W is owned, unannounced");
+    assert!(t.r.transport.peer_free_slots(&t.w.key.key_id) > Some(0));
+    let p = refused_peer(&mut t).await;
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            p.shaping("link_shaping_referral_exhausted") == 1
+        })
+        .await,
+        "{:?}",
+        p.metrics.link_shaping()
+    );
+    assert_eq!(t.r.shaping("link_shaping_referral_sent"), 0);
+    assert_eq!(t.r.shaping("link_shaping_referral_withheld"), 1);
 }

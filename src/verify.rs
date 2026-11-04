@@ -399,6 +399,14 @@ pub trait RootingDirectory: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// CC 5.4.6 — whether `node` is announced in the CC's sense: an owned node
+    /// has a live owner binding at federation scope; an unowned node has no one
+    /// to announce it, and its own announce stands. Default `Err` (no directory
+    /// ⇒ unknown, which a caller treats as not announced).
+    async fn node_announced(&self, _node: &str) -> Result<bool, String> {
+        Err("no federation directory wired (RootingDirectory default)".to_string())
+    }
+
     /// CC 5.3.3.5 E1 pre-seal route fetch — this node's own `key:record:v1`
     /// row for `key_id` (persist's projection of the key as a row), carried
     /// in a route answer to a dialler that does not hold the key. Default
@@ -777,6 +785,19 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         key_id: &str,
     ) -> Result<Option<ciris_persist::federation::self_at_login::TransitKexPair>, String> {
         authenticated_self_signed_transit_pair(self, key_id).await
+    }
+
+    async fn node_announced(&self, node: &str) -> Result<bool, String> {
+        let owner = ciris_persist::federation::admission::owner_of(self, node)
+            .await
+            .map_err(|e| format!("owner_of: {e}"))?;
+        let Some(owner) = owner else {
+            return Ok(true);
+        };
+        crate::replication::bridge::live_announcing_rows(self, &owner, node)
+            .await
+            .map(|rows| !rows.is_empty())
+            .map_err(|e| format!("live_announcing_rows: {e}"))
     }
 
     async fn own_key_record_row(

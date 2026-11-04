@@ -1175,8 +1175,9 @@ pub const LINK_SHAPING_REFERRAL_SENT: &str = "link_shaping_referral_sent";
 /// A refusal went out with no node to name: no shaped peer reported room, or
 /// none could be referred. The peer uses its fallback order.
 pub const LINK_SHAPING_REFERRAL_EMPTY: &str = "link_shaping_referral_empty";
-/// A candidate with free slots was not referred: unannounced, or with no live
-/// route carrying a transit pair.
+/// A candidate with free slots was not referred: not announced (for an owned
+/// node, no live federation-scope owner binding), or with no live route
+/// carrying a transit pair.
 pub const LINK_SHAPING_REFERRAL_WITHHELD: &str = "link_shaping_referral_withheld";
 /// One node a refusal named reached this node.
 pub const LINK_SHAPING_REFERRAL_RECEIVED: &str = "link_shaping_referral_received";

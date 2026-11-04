@@ -44,7 +44,7 @@ pub struct OnionStatus {
     /// Below ten answering in some layer: the client says the set is small.
     pub small_set: bool,
     /// Where the hop key is read from (`transit_kex_pubkeys` until persist
-    /// 61.0.1, then `onion_hop_pubkeys`).
+    /// CIRISPersist#1181, then `onion_hop_pubkeys`).
     pub hop_key_source: &'static str,
     /// While active, this node is confined to the row plane: no call, no
     /// stream. Always true: the client shows it at opt-in.

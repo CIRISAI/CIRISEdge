@@ -126,11 +126,14 @@ that the last entries are dropped). The body is JSON:
 rc17, `CLM-refusal-carries-referrals`): an owner who turns relay offering on hands
 the node's route to strangers for first contact and consent.
 A referral names any announced node, owned or not, that reports free shaped slots,
-with a live route carrying a transit pair. A node reports slots only while its
+with a live route carrying a transit pair. Announced means the CC's sense: an owned
+node has a live owner binding at federation scope, so a node that chose not to be
+listed is never referred, whatever its relay offering. A node reports slots only while its
 relay offering is on (`onion::policy::relay_offering`: on for servers and home
 nodes, a phone only on Wi-Fi while charging, the user's override either way, less
 the operator's relay opt-out). When the offering ends the node reports zero at
-once on its running links and peers stop ranking it. Edge nodes come first; one
+once on its running links and peers stop ranking it. A client-only node (every v44
+phone) reports zero whatever its state. Edge nodes come first; one
 serve seat may take the last entry when fewer than three edge nodes qualify.
 
 **Capacity.** The free slots ride the in-band capability body

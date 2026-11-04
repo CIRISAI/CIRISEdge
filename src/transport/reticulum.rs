@@ -9220,14 +9220,9 @@ impl ReticulumTransport {
             // it is meant to gate is still running — the single-flight property
             // #532 installed would hold only for callers that survive.
             let gate = self.dial_gate_for(peer.dest_hash).await;
-            let gate_permits = if !bulk
-                && self.shapers.offers_to(Some(destination_key_id))
-                && !self.peer_row_link_is_unshaped(&peer.dest_hash).await
-            {
-                u32::try_from(MAX_CONCURRENT_DIALS_PER_DEST).unwrap_or(1)
-            } else {
-                1
-            };
+            let gate_permits = self
+                .dial_gate_permits(destination_key_id, &peer.dest_hash, bulk)
+                .await;
             let ctx = lane_ctx();
             let peer_owned = peer;
             let dkid = destination_key_id.to_owned();
@@ -9260,6 +9255,19 @@ impl ReticulumTransport {
                 .map_err(|e| TransportError::Io(format!("dial task failed: {e}")))??
         };
         Ok(claim)
+    }
+
+    /// How much of a peer's dial gate this dial takes: all of it for a row dial
+    /// that would bring up a shaped link.
+    async fn dial_gate_permits(&self, peer: &str, dest: &DestinationHash, bulk: bool) -> u32 {
+        if !bulk
+            && self.shapers.offers_to(Some(peer))
+            && !self.peer_row_link_is_unshaped(dest).await
+        {
+            u32::try_from(MAX_CONCURRENT_DIALS_PER_DEST).unwrap_or(1)
+        } else {
+            1
+        }
     }
 
     /// Whether a row link this node dialled to `dest` runs unshaped: the peer
@@ -10587,6 +10595,8 @@ impl ReticulumTransport {
 /// The [`Transport`] send bodies, run by the trait methods behind the
 /// lifecycle gate ([`crate::transport::lifecycle`]).
 impl ReticulumTransport {
+    // The send's one ordered story: the plane, the bound, the bulk paths.
+    #[allow(clippy::too_many_lines)]
     async fn send_live(
         &self,
         destination_key_id: &str,
@@ -12541,8 +12551,9 @@ impl DialCtx {
     /// against it ([`LinkShapers::peer_offer`], run by the event loop when
     /// the answer lands). No answer within [`OFFER_ANSWER_BUDGET`] leaves the
     /// link unshaped for good (or closes it under `require_shaped_links`).
-    /// With an `off` policy nothing is sent and the link runs unshaped; a
-    /// peer that requires shaping closes it on its side.
+    /// With an `off` policy nothing is sent and the link runs unshaped. A
+    /// responder only reacts to an offer, so a peer that requires shaping
+    /// learns nothing here and the link stays up unshaped on its side too.
     ///
     /// [`LinkShapers::peer_offer`]: crate::transport::link_shaping::LinkShapers::peer_offer
     /// [`OFFER_ANSWER_BUDGET`]: crate::transport::link_shaping::OFFER_ANSWER_BUDGET

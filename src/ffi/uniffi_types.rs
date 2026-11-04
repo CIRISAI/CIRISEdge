@@ -421,6 +421,7 @@ pub struct EdgeLinkInfo {
 
 /// The host's device facts (`shaping_set_device_state`).
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent host facts, each named
 pub struct EdgeDeviceState {
     pub device_kind: String,
     pub unmetered: bool,

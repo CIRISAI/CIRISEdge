@@ -2001,6 +2001,88 @@ const MISSING_SIGNER_CAP: usize = 1024;
 /// any other name.
 const REQUESTED_SIGNER_CAP: usize = 64;
 
+/// The ids of the LIVE rows by which `owner` announces `node`: one liveness for
+/// the serve gate and the referral test.
+pub(crate) async fn live_announcing_rows(
+    directory: &dyn FederationDirectory,
+    owner: &str,
+    node: &str,
+) -> Result<HashSet<String>, ciris_persist::federation::Error> {
+    use ciris_persist::federation::admission::is_owner_binding_envelope;
+    use ciris_persist::federation::types::{attestation_type, cohort_scope};
+    // persist v56 (#1001): the owner-binding plane about `node` and the
+    // composers that can retire it, page by page. `to` is v55's
+    // `list_attestations_for` exactly; scores (the bulk of rows about a
+    // node) are not read. No `authored_by(owner)`: the node's own
+    // retraction must stay in the slice `retired_ids` folds.
+    //
+    // A page NOT SERVED is an `Err` (`Pages::next` is `.served()?`), so
+    // `node_is_announced` is `Err` and `identity_row_reach` answers
+    // `Unresolved`, which it never memoizes. A refused read must never
+    // become `Ok(false)` "not announced": that answer IS cached, and would
+    // withhold the node's identity rows until the next ownership event.
+    let mut rows: Vec<Attestation> = Vec::new();
+    let mut pages = ciris_persist::federation::attestation_query::AttestationQuery::to(
+        node,
+        ciris_persist::federation::attestation_query::FOLD_PAGE,
+    )
+    .types(&[
+        attestation_type::DELEGATES_TO,
+        attestation_type::SUPERSEDES,
+        attestation_type::WITHDRAWS,
+        attestation_type::RECANTS,
+    ])
+    .pages();
+    while let Some(page) = pages.next(directory).await? {
+        rows.extend(page);
+    }
+    let refs: Vec<&Attestation> = rows.iter().collect();
+    let retired = ciris_persist::federation::precedence::retired_ids(&refs);
+    let now = chrono::Utc::now();
+    let mut live = HashSet::new();
+    for r in &rows {
+        if r.attesting_key_id != owner
+            || r.attested_key_id != node
+            || r.cohort_scope != cohort_scope::FEDERATION
+            || retired.contains(r.attestation_id.as_str())
+            || r.expires_at.is_some_and(|exp| exp <= now)
+        {
+            continue;
+        }
+        let announces = if r.attestation_type == attestation_type::DELEGATES_TO {
+            is_owner_binding_envelope(&r.attestation_envelope)
+        } else if r.attestation_type == attestation_type::SUPERSEDES {
+            if is_owner_binding_envelope(&r.attestation_envelope) {
+                true
+            } else {
+                match r
+                    .attestation_envelope
+                    .get("references_attestation_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some(prior_id) => {
+                        let prior = match rows.iter().find(|p| p.attestation_id == prior_id) {
+                            Some(p) => Some(p.clone()),
+                            None => directory.get_attestation(prior_id).await?,
+                        };
+                        prior.is_some_and(|p| {
+                            p.attestation_type == attestation_type::DELEGATES_TO
+                                && is_owner_binding_envelope(&p.attestation_envelope)
+                        })
+                    }
+                    None => false,
+                }
+            }
+        } else {
+            false
+        };
+        if announces {
+            live.insert(r.attestation_id.clone());
+        }
+    }
+    Ok(live)
+}
+
 /// Production-grade [`ReplicationDirectory`] implementation over
 /// persist's `FederationDirectory`.
 pub struct FederationDirectoryReplicationBridge {
@@ -10457,79 +10539,7 @@ impl FederationDirectoryReplicationBridge {
         owner: &str,
         node: &str,
     ) -> Result<HashSet<String>, ciris_persist::federation::Error> {
-        use ciris_persist::federation::admission::is_owner_binding_envelope;
-        use ciris_persist::federation::types::{attestation_type, cohort_scope};
-        // persist v56 (#1001): the owner-binding plane about `node` and the
-        // composers that can retire it, page by page. `to` is v55's
-        // `list_attestations_for` exactly; scores (the bulk of rows about a
-        // node) are not read. No `authored_by(owner)`: the node's own
-        // retraction must stay in the slice `retired_ids` folds.
-        //
-        // A page NOT SERVED is an `Err` (`Pages::next` is `.served()?`), so
-        // `node_is_announced` is `Err` and `identity_row_reach` answers
-        // `Unresolved`, which it never memoizes. A refused read must never
-        // become `Ok(false)` "not announced": that answer IS cached, and would
-        // withhold the node's identity rows until the next ownership event.
-        let mut rows: Vec<Attestation> = Vec::new();
-        let mut pages = ciris_persist::federation::attestation_query::AttestationQuery::to(
-            node,
-            ciris_persist::federation::attestation_query::FOLD_PAGE,
-        )
-        .types(&[
-            attestation_type::DELEGATES_TO,
-            attestation_type::SUPERSEDES,
-            attestation_type::WITHDRAWS,
-            attestation_type::RECANTS,
-        ])
-        .pages();
-        while let Some(page) = pages.next(&*self.directory).await? {
-            rows.extend(page);
-        }
-        let refs: Vec<&Attestation> = rows.iter().collect();
-        let retired = ciris_persist::federation::precedence::retired_ids(&refs);
-        let now = chrono::Utc::now();
-        let mut live = HashSet::new();
-        for r in &rows {
-            if r.attesting_key_id != owner
-                || r.attested_key_id != node
-                || r.cohort_scope != cohort_scope::FEDERATION
-                || retired.contains(r.attestation_id.as_str())
-                || r.expires_at.is_some_and(|exp| exp <= now)
-            {
-                continue;
-            }
-            let announces = if r.attestation_type == attestation_type::DELEGATES_TO {
-                is_owner_binding_envelope(&r.attestation_envelope)
-            } else if r.attestation_type == attestation_type::SUPERSEDES {
-                if is_owner_binding_envelope(&r.attestation_envelope) {
-                    true
-                } else {
-                    match r
-                        .attestation_envelope
-                        .get("references_attestation_id")
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        Some(prior_id) => {
-                            let prior = match rows.iter().find(|p| p.attestation_id == prior_id) {
-                                Some(p) => Some(p.clone()),
-                                None => self.directory.get_attestation(prior_id).await?,
-                            };
-                            prior.is_some_and(|p| {
-                                p.attestation_type == attestation_type::DELEGATES_TO
-                                    && is_owner_binding_envelope(&p.attestation_envelope)
-                            })
-                        }
-                        None => false,
-                    }
-                }
-            } else {
-                false
-            };
-            if announces {
-                live.insert(r.attestation_id.clone());
-            }
-        }
-        Ok(live)
+        live_announcing_rows(&*self.directory, owner, node).await
     }
 
     /// CIRISEdge#682 — the occurrence key an identity-plane wire row is about

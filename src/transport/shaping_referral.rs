@@ -148,15 +148,17 @@ pub fn rank_referrals<R: rand::Rng + ?Sized, S: std::hash::BuildHasher>(
     candidates
 }
 
-/// `key_id`'s live route and key record, ready to refer: the node announced
-/// and carries a transit pair. `None` is every other answer. Whether it offers
-/// relay was settled by its report: a node that does not reports no slots.
+/// `key_id`'s live route and key record, ready to refer: the node announced in
+/// the CC's sense ([`RootingDirectory::node_announced`]), so a node that chose
+/// not to be listed is never handed out, and it carries a transit pair. `None`
+/// is every other answer. Whether it offers relay was settled by its report: a
+/// node that does not reports no slots.
 pub async fn referable_route(
     rooting: &dyn RootingDirectory,
     key_id: &str,
     announced: bool,
 ) -> Option<RouteAnswer> {
-    if !announced {
+    if !announced || !rooting.node_announced(key_id).await.ok()? {
         return None;
     }
     let route = rooting.signed_reticulum_route(key_id).await.ok()??;
