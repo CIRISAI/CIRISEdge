@@ -37,6 +37,36 @@ on 2026-11-02; the ruling is final.
   - Any other class is the person's opt-in for that class.
   - No class shapes the layer links only.
 
+## The node cap divides; it never refuses
+
+CC 5.4.3: "the link runs at the lower of the two offers, and a node divides a
+node-wide cap across its shaped links", at most eight links' worth in total.
+
+- **Every shaping peer is shaped.** An offer quotes the class rate on every link
+  the policy offers on, so the cap never makes an offer `off`.
+- **Each link takes a share.** `LinkShapers::rebalance` holds the layer reserve
+  out, shares the rest among the other links, and bounds each at the class rate.
+- **A share is local and downward.** The agreement stays the link's upper bound,
+  and each sender runs at `min(agreed, share)`. No frame crosses the wire when a
+  peer joins, and shares rise again when peers leave. Renegotiating would cost a
+  sealed exchange on every link per join, and a wire change. The two directions
+  of a link can run at different rates, which shows only each sender's link
+  count, never its traffic.
+- **The floor.** A share below 0.1 frames per second is held there, not turned
+  off. The floor is per frame, so it depends on the link's frame size, and it
+  can carry the total past the cap:
+
+| Shaping peers on a `server`, 16,272-byte frame | Share by the cap | Rate held | Mean wait for a frame | Total, each way | Per month, each way |
+|---|---|---|---|---|---|
+| 8 | 7,000 B/s | 7,000 B/s | 2.3 s | 56 KB/s | 145 GB |
+| 34 | 1,647 B/s | 1,647 B/s | 9.9 s | 56 KB/s | 145 GB |
+| 100 | 560 B/s | 1,627 B/s (floor) | 10 s | 163 KB/s | 422 GB |
+| 1,000 | 56 B/s | 1,627 B/s (floor) | 10 s | 1.63 MB/s | 4,218 GB |
+
+On a 400-byte frame the floor is 40 B/s, so 1,000 peers stay inside the cap at
+56 B/s each, about 7 s per frame. Whether the floor or the cap wins at large peer
+counts on TCP is an open question for the CC.
+
 ## Latency
 
 Well below ρ, the Poisson timer sets latency, not the budget. The mean

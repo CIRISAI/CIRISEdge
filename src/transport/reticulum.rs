@@ -14119,6 +14119,10 @@ async fn shaped_inbound(
         return None;
     }
     match ctx.shapers.get(link) {
+        // The switch to shaped is not atomic across the two ends: a frame the
+        // peer sent bare just before it installed its shaper lands here just
+        // after this end did (`LinkShaper::in_transition`).
+        Some(s) if lane != Lane::Channel && s.in_transition() => Some(plain),
         Some(_) if lane != Lane::Channel => {
             shaping_teardown(
                 ctx,
@@ -14128,7 +14132,8 @@ async fn shaped_inbound(
             .await;
             None
         }
-        Some(_) => match unwrap(&plain) {
+        Some(s) => match unwrap(&plain) {
+            Err(ShapingError::WrongKind(_)) if s.in_transition() => Some(plain),
             Ok(ShapedFrame::Cover) => {
                 if let Some(m) = ctx.metrics {
                     m.inc_link_shaping(crate::observability::LINK_SHAPING_COVER_RECEIVED);
@@ -14378,7 +14383,7 @@ async fn run_bulk_fallback(
                            part-way; the message is not delivered and the send is retried";
     let agreement = *shaper.agreement();
     #[allow(clippy::cast_precision_loss)] // a frame count; a bound, not an amount
-    let budget = frames.len() as f64 / (agreement.rho * agreement.lambda).max(0.001);
+    let budget = frames.len() as f64 / (agreement.rho * shaper.lambda_now()).max(0.001);
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs_f64(budget * 3.0)
         + Duration::from_secs(60);

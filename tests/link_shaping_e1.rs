@@ -970,3 +970,42 @@ async fn a_512_kib_deliver_takes_the_bulk_link_and_a_4_kib_deliver_stays_shaped(
         "no real frame of it entered the shaper"
     );
 }
+
+/// **The cap limits rate, not whether**, between two real nodes: A's node cap
+/// is under one link's agreed rate, so its share is a fraction of it, and the
+/// link is still shaped both ways and still carries a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_over_the_node_cap_is_shaped_at_its_share() {
+    let mut capped = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    capped.node_cap_bytes_per_s = 2_000;
+    let t = duo(
+        "share",
+        capped,
+        policy(BudgetClass::Server, 100_000, 0.5, 10, false),
+    )
+    .await;
+    let row = typed_payload("AttestationGossip", b"SHARE-ROW-", 2_000);
+    t.a.transport
+        .send(&t.b.key.key_id, &row)
+        .await
+        .expect("A -> B");
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            t.b.received(&row).await
+        })
+        .await
+    );
+    assert_eq!(
+        t.a.shaping("link_shaping_agreed"),
+        1,
+        "{:?}",
+        t.a.metrics.link_shaping()
+    );
+    assert_eq!(
+        t.b.shaping("link_shaping_agreed"),
+        1,
+        "{:?}",
+        t.b.metrics.link_shaping()
+    );
+    assert_eq!(t.a.transport.shaped_link_count(), 1);
+}

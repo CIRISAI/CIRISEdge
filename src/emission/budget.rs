@@ -127,6 +127,14 @@ impl BudgetMeter {
         g.insert(scope, ScopeBudget::new(target_real_per_window, window));
     }
 
+    /// Change `scope`'s target without touching its window or its counts: a
+    /// rate change must not hand the scope a fresh window's budget.
+    pub fn set_target(&self, scope: &ScopeKey, target_real_per_window: u32) {
+        if let Some(budget) = self.inner.lock().get_mut(scope) {
+            budget.target_real_per_window = target_real_per_window;
+        }
+    }
+
     /// Query the budget state for `scope` AT [`Instant::now`].
     /// The query also rolls the window if it has expired since the
     /// last record.
