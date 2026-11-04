@@ -5753,7 +5753,11 @@ impl ReticulumTransport {
         } else {
             NO_PATH_ESTABLISH_TIMEOUT
         };
-        let ctx = self.dial_ctx();
+        // CC 3.2 (f) + CC 5.4.3 — no shaping offer: this link carries first
+        // contact only, sent frame by frame below, and neither an offer nor a
+        // shaped frame is first contact. A shaped link would refuse those bare
+        // frames as the wrong kind and close.
+        let ctx = self.bulk_dial_ctx();
         let link_id = ctx
             .connect_and_key(
                 peer_key_id,
