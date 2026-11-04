@@ -778,6 +778,18 @@ pub trait Transport: Send + Sync + 'static {
     /// `Arc`, so the clone shares, never copies.
     fn attach_metrics(&self, _metrics: crate::observability::EdgeMetrics) {}
 
+    /// CC 5.4.3 referrals — each node this transport homes on after a refusal
+    /// at a bound, so the replication runtime can round with it. `None`: this
+    /// transport has no bound to be refused at.
+    fn subscribe_homed(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        None
+    }
+
+    /// CC 5.4.3 referrals — the nodes homed on so far.
+    fn homed_peers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// CIRISEdge#809 — the bag this transport already counts into, if a
     /// caller attached one before handing it to `EdgeBuilder` (e.g.
     /// `ReticulumTransport::with_metrics(Some(..))`). The builder ADOPTS

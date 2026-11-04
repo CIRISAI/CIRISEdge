@@ -2620,6 +2620,8 @@ pub struct ReticulumTransport {
     homing_rx: Mutex<Option<mpsc::Receiver<HomingJob>>>,
     /// The nodes this node homed on, by the node that refused it.
     homed: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Each node as it is homed on ([`Transport::subscribe_homed`]).
+    homed_events: tokio::sync::broadcast::Sender<String>,
     /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead
     /// of the real one (see [`HandshakeOverride`]). `None` in production.
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
@@ -3319,6 +3321,7 @@ impl ReticulumTransport {
             row_homed_elsewhere: Arc::clone(&self.row_homed_elsewhere),
             homing_tx: self.homing_tx.downgrade(),
             homed: Arc::clone(&self.homed),
+            homed_events: self.homed_events.clone(),
             peers: Arc::clone(&self.peers),
             test_identify_last: Arc::clone(&self.test_identify_last),
             deferred_handshake_part: Arc::clone(&self.deferred_handshake_part),
@@ -4023,6 +4026,7 @@ impl ReticulumTransport {
             homing_tx,
             homing_rx: Mutex::new(Some(homing_rx)),
             homed: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            homed_events: tokio::sync::broadcast::channel(16).0,
             av_call_router: std::sync::OnceLock::new(),
             test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_handshake_part: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -9600,6 +9604,14 @@ impl Transport for ReticulumTransport {
         Some(self.peer_reachable.subscribe())
     }
 
+    fn subscribe_homed(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        Some(self.homed_events.subscribe())
+    }
+
+    fn homed_peers(&self) -> Vec<String> {
+        self.homed_on_referrals()
+    }
+
     async fn send(
         &self,
         destination_key_id: &str,
@@ -10918,6 +10930,8 @@ struct DialCtx {
     homing_tx: mpsc::WeakSender<HomingJob>,
     /// See [`ReticulumTransport::homed`].
     homed: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// See [`ReticulumTransport::homed_events`].
+    homed_events: tokio::sync::broadcast::Sender<String>,
     /// The peer table: a referred node is installed here to be dialled.
     peers: Arc<Mutex<HashMap<String, RootedPeer>>>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_identify_last`.
@@ -11909,7 +11923,10 @@ impl DialCtx {
                 self.homed
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(job.refused_by, key_id);
+                    .insert(job.refused_by, key_id.clone());
+                // choke-ok: no subscriber is a transport with no runtime; the
+                // list above still names the node.
+                let _ = self.homed_events.send(key_id);
                 return;
             }
             count(o::LINK_SHAPING_REFERRAL_FAILED);

@@ -15,6 +15,9 @@ use std::time::Duration;
 
 use ciris_edge::identity::{sign_bound_hybrid, LocalSigner};
 use ciris_edge::replication::attestation_bind::{bind_attestation_envelope, AttestationColumns};
+use ciris_edge::replication::{
+    self_publish_set, InboundRouter, ReplicationRuntime, ReplicationRuntimeConfig, SchedulerConfig,
+};
 use ciris_edge::transport::link_shaping::{
     BudgetClass, DeviceKind, DeviceState, ShapedSharePolicy, ShapingPolicy,
 };
@@ -173,6 +176,7 @@ struct Node {
     metrics: EdgeMetrics,
     dir: Arc<SqliteBackend>,
     seen: Arc<Mutex<Vec<InboundFrame>>>,
+    runtime: Option<Arc<ReplicationRuntime>>,
 }
 
 impl Node {
@@ -312,6 +316,7 @@ async fn duo(tag: &str, policy_a: ShapingPolicy, policy_b: ShapingPolicy) -> Duo
             metrics,
             dir,
             seen,
+            runtime: None,
         });
     }
     let b = nodes.pop().expect("b");
@@ -1296,6 +1301,8 @@ async fn start_node(
     device: DeviceState,
     records: Vec<ciris_persist::federation::KeyRecord>,
     bootstrap: Vec<u16>,
+    publish: Option<Vec<String>>,
+    silent: bool,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> (Node, u16) {
     let dir = directory_with(records).await;
@@ -1324,8 +1331,38 @@ async fn start_node(
         metrics.clone(),
     )
     .await;
+    // Silent from birth: no announce of any kind has left this node.
+    transport.set_unannounced_for_test(silent);
+    // The production wiring when the node publishes: a runtime with no peers
+    // of its own, rounds driven by the test.
+    let mut runtime = None;
+    if let Some(publish) = publish {
+        runtime = Some(Arc::new(
+            ReplicationRuntime::start(
+                Arc::clone(&dir) as Arc<dyn FederationDirectory>,
+                Arc::clone(&transport) as Arc<dyn Transport>,
+                Vec::new(),
+                ReplicationRuntimeConfig {
+                    scheduler: SchedulerConfig {
+                        cadence: Duration::from_secs(3600),
+                        round_timeout: Duration::from_secs(15),
+                        ..SchedulerConfig::default()
+                    },
+                    local_key_id: Some(key.key_id.clone()),
+                    metrics: Some(metrics.clone()),
+                    enable_bundle_bootstrap_peers: false,
+                    ..Default::default()
+                },
+                Some(self_publish_set(publish)),
+            )
+            .await,
+        ));
+    }
+    let router = runtime
+        .as_ref()
+        .map(|r: &Arc<ReplicationRuntime>| InboundRouter::new(r.registry()));
     let seen: Arc<Mutex<Vec<InboundFrame>>> = Arc::new(Mutex::new(Vec::new()));
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(256);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(1024);
     let listener = Arc::clone(&transport);
     tasks.push(tokio::spawn(async move {
         let _ = listener.listen(tx).await;
@@ -1333,6 +1370,9 @@ async fn start_node(
     let sink = Arc::clone(&seen);
     tasks.push(tokio::spawn(async move {
         while let Some(f) = rx.recv().await {
+            if let Some(router) = router.as_ref() {
+                let _ = router.try_route(&f).await;
+            }
             sink.lock().await.push(f);
         }
     }));
@@ -1343,6 +1383,7 @@ async fn start_node(
             metrics,
             dir,
             seen,
+            runtime,
         },
         addr.port(),
     )
@@ -1357,11 +1398,21 @@ struct Referral {
     w_port: u16,
     p_key: Option<Ident>,
     p_records: Vec<ciris_persist::federation::KeyRecord>,
+    /// P must not hear of W until a referral names it.
+    w_silent: bool,
+    /// P runs a replication runtime.
+    p_rounds: bool,
     tmp: tempfile::TempDir,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-async fn referral_pair(tag: &str, seed: u8, w_device: DeviceState) -> Referral {
+async fn referral_pair(
+    tag: &str,
+    seed: u8,
+    w_device: DeviceState,
+    w_publishes: Option<&str>,
+    w_silent: bool,
+) -> Referral {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let r_key = Ident::new(&format!("node-r-{tag}"), seed).await;
@@ -1381,9 +1432,12 @@ async fn referral_pair(tag: &str, seed: u8, w_device: DeviceState) -> Referral {
         DeviceState::of(DeviceKind::Server),
         all.clone(),
         Vec::new(),
+        None,
+        false,
         &mut tasks,
     )
     .await;
+    let publish = w_publishes.map(|z| vec![w_key.key_id.clone(), z.to_owned()]);
     let (w, w_port) = start_node(
         tmp.path(),
         w_key,
@@ -1391,11 +1445,24 @@ async fn referral_pair(tag: &str, seed: u8, w_device: DeviceState) -> Referral {
         w_device,
         all,
         vec![r_port],
+        publish,
+        w_silent,
         &mut tasks,
     )
     .await;
     seed_route(&r, &w).await;
     seed_route(&w, &r).await;
+    if w_silent {
+        // R, W's neighbour, holds W's binding out of band: W announces nothing.
+        r.transport
+            .prime_peer(
+                &w.key.key_id,
+                w.transport.local_named_dest_hash(),
+                w.transport.local_transport_pubkey(),
+            )
+            .await
+            .expect("W's own binding");
+    }
     assert!(
         wait_until(Duration::from_secs(60), || async {
             w.transport.knows_peer(&r.key.key_id).await
@@ -1424,6 +1491,8 @@ async fn referral_pair(tag: &str, seed: u8, w_device: DeviceState) -> Referral {
         w_port,
         p_key: Some(p_key),
         p_records: vec![p_record, r_record],
+        w_silent,
+        p_rounds: false,
         tmp,
         tasks,
     }
@@ -1432,6 +1501,7 @@ async fn referral_pair(tag: &str, seed: u8, w_device: DeviceState) -> Referral {
 /// P, up now, knowing R and not W, is refused at R's bound.
 async fn refused_peer(t: &mut Referral) -> Node {
     let key = t.p_key.take().expect("one P");
+    let publish = t.p_rounds.then(|| vec![key.key_id.clone()]);
     let (p, _) = start_node(
         t.tmp.path(),
         key,
@@ -1439,6 +1509,8 @@ async fn refused_peer(t: &mut Referral) -> Node {
         DeviceState::of(DeviceKind::Server),
         t.p_records.clone(),
         vec![t.r_port, t.w_port],
+        publish,
+        false,
         &mut t.tasks,
     )
     .await;
@@ -1450,6 +1522,15 @@ async fn refused_peer(t: &mut Referral) -> Node {
         })
         .await
     );
+    if t.w_silent {
+        // Past W's announce interval, with a live interface to W: its
+        // periodic announces are off too, so only a referral can name it.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        assert!(
+            !p.transport.knows_peer(&t.w.key.key_id).await,
+            "P has not heard of W"
+        );
+    }
     let row = typed_payload("AttestationGossip", b"REFUSED-ROW-", 2_000);
     let err = p
         .transport
@@ -1473,7 +1554,14 @@ async fn refused_peer(t: &mut Referral) -> Node {
 /// never reaches W and this fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_peer_homes_on_a_referral_and_its_contact_completes_there() {
-    let mut t = referral_pair("home", 0x3a, DeviceState::of(DeviceKind::Server)).await;
+    let mut t = referral_pair(
+        "home",
+        0x3a,
+        DeviceState::of(DeviceKind::Server),
+        None,
+        true,
+    )
+    .await;
     let owner = Ident::new("person-owns-w", 0x3f).await;
     t.r.dir
         .put_public_key(ciris_persist::prelude::SignedKeyRecord {
@@ -1488,7 +1576,6 @@ async fn a_refused_peer_homes_on_a_referral_and_its_contact_completes_there() {
         })
         .await
         .expect("W is owned, here");
-    t.w.transport.set_unannounced_for_test(true);
     let w_id = t.w.key.key_id.clone();
     let r_id = t.r.key.key_id.clone();
     let p = refused_peer(&mut t).await;
@@ -1546,7 +1633,7 @@ async fn a_refused_peer_homes_on_a_referral_and_its_contact_completes_there() {
 async fn a_node_with_its_relay_offering_off_is_never_referred() {
     let mut off = DeviceState::of(DeviceKind::Server);
     off.relay_override = Some(false);
-    let mut t = referral_pair("off", 0x4a, off).await;
+    let mut t = referral_pair("off", 0x4a, off, None, false).await;
     assert_eq!(t.r.transport.peer_free_slots(&t.w.key.key_id), Some(0));
     let p = refused_peer(&mut t).await;
     assert!(
@@ -1566,7 +1653,14 @@ async fn a_node_with_its_relay_offering_off_is_never_referred() {
 /// link stays up, so it is the report that takes the phone out, not a close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_phone_that_loses_wifi_stops_being_referred_on_the_next_report() {
-    let mut t = referral_pair("wifi", 0x5a, DeviceState::of(DeviceKind::Phone)).await;
+    let mut t = referral_pair(
+        "wifi",
+        0x5a,
+        DeviceState::of(DeviceKind::Phone),
+        None,
+        false,
+    )
+    .await;
     assert!(t.r.transport.peer_free_slots(&t.w.key.key_id) > Some(0));
     let mut on_cellular = DeviceState::of(DeviceKind::Phone);
     on_cellular.unmetered = false;
@@ -1587,4 +1681,62 @@ async fn a_phone_that_loses_wifi_stops_being_referred_on_the_next_report() {
         .await
     );
     assert_eq!(t.r.shaping("link_shaping_referral_sent"), 0);
+}
+
+/// **A homed node is really used.** Edge registers the node P homed on as a
+/// replication peer on the bootstrap planes by itself: no host adds it, and a
+/// host's later peer set does not drop it. A key record P can have from nowhere
+/// else crosses on P's own round to W. Mutation: drop the forwarder → the
+/// record never arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_homed_node_is_a_replication_peer_on_the_bootstrap_planes() {
+    let z = Ident::new("node-z-rounds", 0x6f).await;
+    let mut t = referral_pair(
+        "rounds",
+        0x6a,
+        DeviceState::of(DeviceKind::Server),
+        Some(&z.key_id),
+        false,
+    )
+    .await;
+    t.w.dir
+        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: z.record().await,
+        })
+        .await
+        .expect("Z's record, at W only");
+    t.p_rounds = true;
+    let w_id = t.w.key.key_id.clone();
+    let p = refused_peer(&mut t).await;
+    let held = || async {
+        FederationDirectory::lookup_public_key(&*p.dir, &z.key_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    };
+    assert!(
+        wait_until(Duration::from_secs(45), || async {
+            p.transport.homed_on_referrals().contains(&w_id)
+        })
+        .await
+    );
+    assert!(!held().await, "P holds nothing of Z yet");
+    let runtime = p.runtime.as_ref().expect("P rounds");
+    // The forwarder registers within moments; a host's peer set then keeps it.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    runtime
+        .set_peers(Vec::new())
+        .await
+        .expect("a host's peer set");
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            let _ = runtime.round_now_all().await;
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            held().await
+        })
+        .await,
+        "Z's record crossed on P's own round to W: {:?}",
+        p.metrics.link_shaping()
+    );
 }

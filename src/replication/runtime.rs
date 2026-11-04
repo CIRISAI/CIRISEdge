@@ -950,6 +950,130 @@ pub fn merge_peers(
     peers
 }
 
+/// CC 5.4.3 referrals — what a homed node's rounds are built from: a peer
+/// refused at a bound homes on a referred node, and its first contact and
+/// consent only flow there if something rounds with it. The transport says who;
+/// this registers it on the bootstrap planes, as a bundle peer is, and every
+/// later [`ReplicationRuntime::set_peers`] keeps it.
+#[derive(Clone)]
+struct HomedPeers {
+    transport: Arc<dyn Transport>,
+    registry: Arc<ReplicationRegistry>,
+    bridge: Arc<FederationDirectoryReplicationBridge>,
+    applier: Arc<dyn StateApplier>,
+    scheduler_handle: SchedulerHandle,
+    current_initiators: Arc<Mutex<HashSet<(String, EnvelopeKind)>>>,
+    proactive_publish: bool,
+    /// Held across peer sets ([`ReplicationRuntime::set_peers`]).
+    peers: Arc<Mutex<Vec<ReplicationPeer>>>,
+}
+
+impl HomedPeers {
+    async fn register(&self, node: &str) {
+        for kind in BOOTSTRAP_ROUND_PLANES {
+            self.peers.lock().await.push(ReplicationPeer {
+                peer_key_id: node.to_owned(),
+                kind,
+            });
+            if !self
+                .current_initiators
+                .lock()
+                .await
+                .insert((node.to_owned(), kind))
+            {
+                continue;
+            }
+            let coord = build_peer_coordinator(
+                &self.transport,
+                &self.bridge,
+                &self.applier,
+                self.proactive_publish,
+                node,
+                kind,
+                SessionRole::Initiator,
+            );
+            self.registry
+                .register(node.to_owned(), kind, Arc::clone(&coord))
+                .await;
+            if let Err(e) = self.scheduler_handle.add_initiator(coord).await {
+                tracing::warn!(error = %e, node, "a homed node's rounds did not start");
+                return;
+            }
+        }
+        tracing::info!(
+            node,
+            planes = ?BOOTSTRAP_ROUND_PLANES,
+            "replication rounds with the node this one homed on after a refusal, on the \
+             bootstrap planes (CC 5.4.3)"
+        );
+    }
+}
+
+/// CC 5.4.3 referrals — register each node the transport homes on. A
+/// transport with no such events spawns nothing.
+fn spawn_homed_forwarder(homed: HomedPeers, cancel_rx: &watch::Receiver<bool>) {
+    use tokio::sync::broadcast::error::RecvError;
+    let Some(mut events) = homed.transport.subscribe_homed() else {
+        return;
+    };
+    let mut cancel = cancel_rx.clone();
+    tokio::spawn(async move {
+        // Subscribed first: one homed before this runtime came up is still used.
+        for node in homed.transport.homed_peers() {
+            homed.register(&node).await;
+        }
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => {
+                    if *cancel.borrow() {
+                        return;
+                    }
+                }
+                event = events.recv() => match event {
+                    Ok(node) => homed.register(&node).await,
+                    Err(RecvError::Lagged(_)) => {
+                        for node in homed.transport.homed_peers() {
+                            homed.register(&node).await;
+                        }
+                    }
+                    Err(RecvError::Closed) => return,
+                },
+            }
+        }
+    });
+}
+
+/// A coordinator in `role` over the runtime's shared parts.
+fn build_peer_coordinator(
+    transport: &Arc<dyn Transport>,
+    bridge: &Arc<FederationDirectoryReplicationBridge>,
+    applier: &Arc<dyn StateApplier>,
+    proactive_publish: bool,
+    peer_key_id: &str,
+    kind: EnvelopeKind,
+    role: SessionRole,
+) -> Arc<ReplicationCoordinator> {
+    let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(bridge) as _;
+    // CIRISEdge#379 — peer-bound provider (observer gate).
+    let provider: Arc<dyn StateProvider> =
+        Arc::new(DirectoryStateAdapter::new(bridge_dir).with_peer(peer_key_id));
+    // CIRISEdge#370 — hot-adds share the runtime's ONE no-mutex applier.
+    let applier = Arc::clone(applier);
+    // CIRISEdge#927 — hot-added Initiators inherit the runtime's proactive-
+    // publish posture. Harmless for Responders (they never `start_round`).
+    Arc::new(
+        ReplicationCoordinator::new(
+            Arc::clone(transport),
+            peer_key_id.to_string(),
+            kind,
+            role,
+            provider,
+            applier,
+        )
+        .with_proactive_publish(proactive_publish),
+    )
+}
+
 pub struct ReplicationRuntime {
     transport: Arc<dyn Transport>,
     registry: Arc<ReplicationRegistry>,
@@ -986,6 +1110,8 @@ pub struct ReplicationRuntime {
     /// CIRISEdge#881 — the bundle-seeded bootstrap peers merged into every
     /// peer set this runtime is given (`start`, `set_peers`).
     bundle_peers: Vec<ReplicationPeer>,
+    /// CC 5.4.3 referrals — the nodes homed on, merged the same way.
+    homed_peers: Arc<Mutex<Vec<ReplicationPeer>>>,
     /// CIRISEdge#927 — whether this node's Initiator rounds proactively deliver
     /// their publish set (set iff `start` got a `self_provider`). Applied to
     /// every Initiator coordinator this runtime builds, including hot-adds.
@@ -1249,6 +1375,21 @@ impl ReplicationRuntime {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let key_grant_emitter = spawn_key_grant_emitter_for(&config, key_grant_wake, &cancel_rx);
         spawn_reachability_forwarder(&transport, &scheduler_handle, &cancel_rx);
+        let current_initiators = Arc::new(Mutex::new(initial_initiator_set));
+        let homed_peers = Arc::new(Mutex::new(Vec::new()));
+        spawn_homed_forwarder(
+            HomedPeers {
+                transport: Arc::clone(&transport),
+                registry: Arc::clone(&registry),
+                bridge: Arc::clone(&bridge),
+                applier: Arc::clone(&shared_applier),
+                scheduler_handle: scheduler_handle.clone(),
+                current_initiators: Arc::clone(&current_initiators),
+                proactive_publish,
+                peers: Arc::clone(&homed_peers),
+            },
+            &cancel_rx,
+        );
         // CIRISEdge#370/#636 — see [`spawn_scheduler_task`] for the event sink.
         let scheduler_task = spawn_scheduler_task(scheduler, &scheduler_handle, cancel_rx, &config);
 
@@ -1267,8 +1408,9 @@ impl ReplicationRuntime {
             key_grant_emitter,
             config,
             scheduler_handle,
-            current_initiators: Arc::new(Mutex::new(initial_initiator_set)),
+            current_initiators,
             bundle_peers,
+            homed_peers,
             proactive_publish,
             mesh_config,
         }
@@ -1648,6 +1790,7 @@ impl ReplicationRuntime {
     ) -> Result<(), ReplicationRuntimeError> {
         // CIRISEdge#881 — the bundle's bootstrap peers ride every peer set.
         let desired = merge_peers(desired, &self.bundle_peers);
+        let desired = merge_peers(desired, &self.homed_peers.lock().await);
         let desired_set: HashSet<(String, EnvelopeKind)> = desired
             .iter()
             .map(|p| (p.peer_key_id.clone(), p.kind))
@@ -1679,24 +1822,14 @@ impl ReplicationRuntime {
         kind: EnvelopeKind,
         role: SessionRole,
     ) -> Arc<ReplicationCoordinator> {
-        let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&self.bridge) as _;
-        // CIRISEdge#379 — peer-bound provider (observer gate).
-        let provider: Arc<dyn StateProvider> =
-            Arc::new(DirectoryStateAdapter::new(bridge_dir).with_peer(peer_key_id));
-        // CIRISEdge#370 — hot-adds share the runtime's ONE no-mutex applier.
-        let applier = Arc::clone(&self.applier);
-        // CIRISEdge#927 — hot-added Initiators inherit the runtime's proactive-
-        // publish posture. Harmless for Responders (they never `start_round`).
-        Arc::new(
-            ReplicationCoordinator::new(
-                Arc::clone(&self.transport),
-                peer_key_id.to_string(),
-                kind,
-                role,
-                provider,
-                applier,
-            )
-            .with_proactive_publish(self.proactive_publish),
+        build_peer_coordinator(
+            &self.transport,
+            &self.bridge,
+            &self.applier,
+            self.proactive_publish,
+            peer_key_id,
+            kind,
+            role,
         )
     }
 
