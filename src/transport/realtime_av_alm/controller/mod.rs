@@ -168,6 +168,9 @@ pub struct ScoreWeights {
 }
 
 /// Every controller constant, so a stream class is a config and not a fork.
+// Independent knobs (admission on/off, jitter, idle-aware silence, direct
+// first), each a mutant or a deployment switch: not a mode enum in disguise.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
     /// Full-quality stream rate a primary subscription costs (bits/s).
