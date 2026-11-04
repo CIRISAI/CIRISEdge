@@ -1662,14 +1662,13 @@ mod tests {
     use super::*;
     use crate::transport::{InboundFrame, TransportError, TransportId, TransportSendOutcome};
     use async_trait::async_trait;
-    use ciris_persist::store::MemoryBackend;
     use std::sync::Mutex;
 
     // ─── Test fixtures ────────────────────────────────────────────
     //
     // v7.0.0 (CIRISEdge#194): the converger now calls
     // `FederationDirectory::evict_fountain_content_*` directly. Tests
-    // use `MemoryBackend` (persist's in-memory FederationDirectory
+    // use `SqliteBackend` (persist's in-memory FederationDirectory
     // impl) — the evict methods return `Ok(0)` for unknown content
     // (no manifest seeded), so a successful dispatch lights the
     // `SwarmEvent::EjectedToTier` / `HardDeleted` sink emission and
@@ -1689,12 +1688,12 @@ mod tests {
     }
 
     /// `Arc<dyn FederationDirectory>` test handle: a fresh
-    /// `MemoryBackend`. Its `evict_fountain_content_*` surfaces no-op
+    /// `SqliteBackend`. Its `evict_fountain_content_*` surfaces no-op
     /// (return `Ok(0)`) on unknown `content_id`, which is exactly the
     /// behaviour the converger tests rely on — they assert on the
     /// `SwarmEvent` sink that fires after a successful dispatch.
     fn test_directory() -> Arc<dyn FederationDirectory> {
-        Arc::new(MemoryBackend::new())
+        Arc::new(ciris_persist::store::test_backend::test_backend())
     }
 
     #[derive(Default)]
@@ -1892,7 +1891,7 @@ mod tests {
 
         // v7.0.0: assert via the SwarmEvent sink (the converger emits
         // EjectedToTier on `Ok(_)` of the directory call;
-        // MemoryBackend returns `Ok(0)` for unknown content_id). Tier
+        // SqliteBackend returns `Ok(0)` for unknown content_id). Tier
         // label is "t2" — persist v10.0.0's `FountainTier::T2`
         // (DiskPressure::Warn-equivalent: keep `n_source`, drop
         // repair — the gentlest tier that actually frees symbol rows).

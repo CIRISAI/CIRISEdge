@@ -78,6 +78,15 @@ existing rule, promoted to the module so no future caller re-derives it wrongly.
 Backoff windows are likewise internal: the limiter knows when it will next
 allow, and does not say.
 
+**The one published hint (CIRISEdge#937).** A throttled subject `Pull` answers
+`subject_pull_throttled` with `retry_after_secs` (FSD/REPLICATION_WIRE_FORMAT_V1.md
+§3.4.1). That value is the lookup window, a **policy constant** and the same for
+every requester, never derived from this key's refill state, so it tells a
+spammer nothing it could not read in this document. It exists because the
+limited party on this path is a host with a person waiting: an empty list reads
+as "nobody holds this", so the host either hammers or gives up wrongly. The
+limiter's own state stays internal, as above.
+
 ### D4 — Classes carry the tier, promotion is explicit
 
 A key's class selects its quota. `InviteGate`'s stranger/contact split is the

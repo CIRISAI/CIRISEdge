@@ -316,6 +316,7 @@ async fn inbound_frame_resets_and_the_release_kick_is_not_swallowed_794() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     t.set("gone", Route::Delivered);
     let frame = super::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+        status: None,
         kind: EnvelopeKind::IdentityOccurrence,
         refs: vec![],
     }));

@@ -316,7 +316,7 @@ async fn takedown_notice_with_tvec_legal_basis_triggers_fast_path() {
     let me = FedKey::new("edge-self", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -340,7 +340,7 @@ async fn takedown_notice_with_gifct_cip_legal_basis_triggers_fast_path() {
     let me = FedKey::new("edge-self", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -363,7 +363,7 @@ async fn takedown_notice_with_ncmec_legal_basis_triggers_fast_path() {
     let me = FedKey::new("edge-self", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -388,7 +388,7 @@ async fn takedown_notice_with_non_fastpath_legal_basis_uses_standard_dispatch() 
     let me = FedKey::new("edge-self", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -419,7 +419,7 @@ async fn key_grant_uses_addressed_delivery_to_recipient_key_id() {
     let me = FedKey::new("edge-self", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -475,7 +475,7 @@ async fn unknown_subject_kind_passes_through_to_existing_contribution_handler() 
     let me = FedKey::new("edge-self", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -503,7 +503,7 @@ async fn legacy_contribution_without_subject_kind_passes_through() {
     let me = FedKey::new("edge-self", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -682,7 +682,7 @@ async fn l1_cdn_edge_enabled_client_mode_ignores_flag() {
     let me = FedKey::new("edge-self", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -716,7 +716,7 @@ async fn l1_cdn_edge_enabled_proxy_mode_ignores_flag() {
     let me = FedKey::new("edge-self", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -749,8 +749,8 @@ async fn takedown_notice_respects_cohort_scope_refusal() {
     let sender = FedKey::new("sender-peer", 0xCC);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
-        signed_record(&sender, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
+        signed_record(&sender, &steward, "node"),
     ])
     .await;
     // Sender's directory-recorded cohort_scope is `Public` (implicit
@@ -799,8 +799,8 @@ async fn key_grant_respects_cohort_scope_refusal() {
     let sender = FedKey::new("sender-peer", 0xCC);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
-        signed_record(&sender, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
+        signed_record(&sender, &steward, "node"),
     ])
     .await;
     directory
@@ -845,8 +845,8 @@ async fn takedown_notice_with_matching_cohort_scope_proceeds_to_fast_path() {
     let sender = FedKey::new("sender-peer", 0xCC);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&me, &steward, "agent"),
-        signed_record(&sender, &steward, "agent"),
+        signed_record(&me, &steward, "node"),
+        signed_record(&sender, &steward, "node"),
     ])
     .await;
     directory

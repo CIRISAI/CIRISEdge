@@ -93,7 +93,7 @@ async fn no_path_send_fails_fast_and_loud_not_a_silent_30s_timeout() {
     let sender = TestFedKey::new("edge-key-sender", 0x0a);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&sender, &steward, "agent"),
+        signed_record(&sender, &steward, "node"),
     ])
     .await;
 
@@ -204,8 +204,8 @@ async fn identified_link_from_an_advisory_key_owning_peer_is_attributed_659() {
     let key_b = TestFedKey::new("edge-key-bbbb", 0x0b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
 
@@ -340,8 +340,8 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
     let key_b = TestFedKey::new("edge-key-bbbb", 0x0b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
 
@@ -488,8 +488,8 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
     let key_b = TestFedKey::new("edge-key-bbbb", 0x0b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
 

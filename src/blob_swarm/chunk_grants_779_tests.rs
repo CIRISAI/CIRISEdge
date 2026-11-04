@@ -505,14 +505,22 @@ pub(crate) async fn cross_keys_except(
             KeyGrantAxis::Stream { epoch, .. } if withhold.epochs.contains(epoch) => continue,
             _ => {}
         }
-        let admission = reader
+        // persist v61 S2 (CIRISPersist#1148): a replicated row this node is
+        // not in the audience for is refused `NotInAudience` — the author's
+        // wraps for its OTHER recipients. The serve gate never sends those in
+        // production; here they are skipped exactly as that gate would.
+        let admission = match reader
             .store
             .engine()
             .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: s.attestation.clone(),
             })
             .await
-            .expect("the reader admits the row");
+        {
+            Ok(a) => a,
+            Err(e) if e.to_string().contains("NotInAudience") => continue,
+            Err(e) => panic!("the reader admits the row: {e:?}"),
+        };
         if let Some(sink) = sink {
             sink.key_grant_admitted(&admission);
         }

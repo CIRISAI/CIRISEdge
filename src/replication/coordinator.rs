@@ -38,18 +38,30 @@
 //!   per-medium port mapping) and hands them to
 //!   [`ReplicationCoordinator::feed_inbound_bytes`].
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use crate::transport::{Transport, TransportError};
 
-use super::protocol::{EnvelopeKind, FetchMessage, ProtocolError, PullMessage, ReplicationMessage};
+use super::protocol::{
+    EnvelopeKind, FetchMessage, ProtocolError, PullMessage, ReplicationMessage, SummaryMessage,
+    SummaryStatus,
+};
 use super::session::{ReplicationOutcome, Session, SessionRole};
 use super::summary::{StalenessSignal, StateApplier, StateProvider};
 use super::wire_frame::{RoundMeta, RoundSide};
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// An inbound replication message together with the round metadata its
 /// frame carried (`None` for a LEGACY v1/v2 frame from a pre-v26 peer).
@@ -137,6 +149,30 @@ pub enum CoordinatorError {
     /// or a late-arriving message from a round that already timed out.
     #[error("no round in progress — late or mis-routed inbound message")]
     NoRoundInProgress,
+    /// Every Pull slot toward this peer on this plane is taken: this Pull was
+    /// not sent. See [`ReplicationCoordinator::MAX_PULL_EXCHANGES`].
+    #[error("too many subject Pulls in flight toward this peer")]
+    TooManyPulls,
+}
+
+/// What [`ReplicationCoordinator::pull_exchange`] did with an ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullDispatched {
+    /// The `Pull` left; its exchange is running.
+    Sent,
+    /// A Pull for this subject is already in flight toward this peer; it
+    /// answers this ask too.
+    InFlight,
+    /// This peer throttled a Pull on this plane and its hint has not run out
+    /// (CIRISEdge#937): nothing was sent, the ask would spend the peer's
+    /// patience and buy nothing.
+    Throttled { retry_after_secs: u64 },
+}
+
+/// One subject Pull in flight: its own round, its own inbox.
+struct PullExchange {
+    subject: String,
+    replies: mpsc::Sender<ReplicationMessage>,
 }
 
 /// Binds one [`Session`] to one transport peer. The application
@@ -203,6 +239,12 @@ pub struct ReplicationCoordinator {
     /// round inbox that lives exactly as long as the driven round, plus an
     /// on-demand inbox for `Pull` replies. See [`RoleInbox`].
     inbox: RoleInbox,
+    /// The subject Pulls in flight, by the round each was stamped with. See
+    /// [`Self::pull_exchange`].
+    pull_exchanges: std::sync::Mutex<HashMap<u64, PullExchange>>,
+    /// CIRISEdge#937 — unix seconds until which this peer asked not to be
+    /// Pulled on this plane; 0 = no hint held.
+    pull_retry_at_secs: AtomicU64,
 }
 
 impl ReplicationCoordinator {
@@ -210,6 +252,16 @@ impl ReplicationCoordinator {
     /// 3 messages queued (Summary + Diff + Deliver); 8 gives slack
     /// for a slightly-late deliver while the scheduler is mid-step.
     pub const INBOUND_CHANNEL_CAPACITY: usize = 8;
+
+    /// Subject Pulls in flight at once per `(peer, kind)`. Each is one session
+    /// and a few persist reads, outside the round gate on purpose (a person is
+    /// waiting on it, and a fan-out of rounds must not queue it), so this is
+    /// their bound. Past it the Pull fails to dispatch and the caller retries.
+    pub const MAX_PULL_EXCHANGES: usize = 8;
+
+    /// The longest a peer's `retry_after_secs` is believed, so a hostile or
+    /// broken hint cannot silence this node's Pulls.
+    pub const MAX_PULL_RETRY_AFTER_SECS: u64 = 3_600;
 
     /// CIRISEdge#662 — the driver records what it is doing. Called by the
     /// responder driver around its three awaits; a coordinator nobody drives
@@ -274,6 +326,8 @@ impl ReplicationCoordinator {
             applier,
             session: Mutex::new(Session::new(role, kind)),
             inbox,
+            pull_exchanges: std::sync::Mutex::new(HashMap::new()),
+            pull_retry_at_secs: AtomicU64::new(0),
             driver_phase: std::sync::atomic::AtomicU8::new(DriverPhase::Idle as u8),
             driver_phase_since_ms: AtomicU64::new(0),
         }
@@ -410,6 +464,19 @@ impl ReplicationCoordinator {
         else {
             return Err(ReplyRefusal::WrongRole);
         };
+        // A Pull exchange's reply goes to that exchange and to nobody else: it
+        // must never reach a driven round's session, or wait for one.
+        let exchange = self
+            .pull_exchanges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&round)
+            .map(|e| e.replies.clone());
+        if let Some(replies) = exchange {
+            return replies
+                .try_send(msg)
+                .map_err(|_| ReplyRefusal::BackPressure);
+        }
         let current = current_round.load(Ordering::Acquire);
         let pull = pull_round.load(Ordering::Acquire);
         if current != 0 && round == current {
@@ -692,18 +759,7 @@ impl ReplicationCoordinator {
                         bound_round.store(incoming, Ordering::Release);
                     }
                 }
-                if let (Some(metrics), ReplicationMessage::Summary(sm)) = (&self.metrics, &m) {
-                    if crate::replication::bridge::is_removal_kind(sm.kind) {
-                        let hashes: Vec<[u8; 32]> =
-                            sm.refs.iter().map(|r| r.envelope_hash).collect();
-                        metrics.removal_ack_from_summary(
-                            &self.peer_key_id,
-                            sm.kind,
-                            &hashes,
-                            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
-                        );
-                    }
-                }
+                self.note_removal_ack(&m);
                 session
                     .on_message(
                         m,
@@ -730,6 +786,22 @@ impl ReplicationCoordinator {
             DriveStep::SendThenWait(_) | DriveStep::Refused => {}
         }
         Ok(step)
+    }
+
+    /// CIRISEdge#441 — a peer's Summary on a removal-class kind is the
+    /// protocol-native delivery ack of what it lists.
+    fn note_removal_ack(&self, msg: &ReplicationMessage) {
+        if let (Some(metrics), ReplicationMessage::Summary(sm)) = (&self.metrics, msg) {
+            if crate::replication::bridge::is_removal_kind(sm.kind) {
+                let hashes: Vec<[u8; 32]> = sm.refs.iter().map(|r| r.envelope_hash).collect();
+                metrics.removal_ack_from_summary(
+                    &self.peer_key_id,
+                    sm.kind,
+                    &hashes,
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                );
+            }
+        }
     }
 
     /// CIRISEdge#441 — install the metrics handle (builder; used at the two
@@ -861,17 +933,6 @@ impl ReplicationCoordinator {
             .map_err(CoordinatorError::from)
     }
 
-    /// CIRISEdge#462 — INITIATE a subject-scoped RECEIVE-axis pull: send this
-    /// coordinator's peer a `Pull{kind, subject_key_id}`. The peer answers with a
-    /// [`super::protocol::SummaryMessage`] of the subject's refs, which arrives on
-    /// this coordinator's inbound channel and is processed by the NORMAL round
-    /// drive loop (`on_summary` → Diff → Deliver → apply) — so this coordinator
-    /// MUST be an [`SessionRole::Initiator`](super::session::SessionRole::Initiator)
-    /// with a live drive loop (the scheduler's periodic round, installed by
-    /// [`super::runtime::ReplicationRuntime::register_initiator_peer`]). Fire-and-
-    /// forget: the testimony converges over the peer's next round, matching the
-    /// anti-entropy model — sending the Pull carries no session state (only the
-    /// reply does), so there is nothing to await here.
     /// Take this peer's queued signer name and send the `Pull` that recovers it
     /// (FSD-SIGNER-RECOVERY D4).
     ///
@@ -917,6 +978,211 @@ impl ReplicationCoordinator {
         Ok(Some(signer))
     }
 
+    /// **A subject Pull, driven to the apply on its own exchange.** Sends
+    /// `Pull{kind, subject}` on a round of its own and drives the answer
+    /// (`Summary` → `Diff` → `Deliver` → apply) on a task of its own, with a
+    /// session of its own, as soon as each frame lands.
+    ///
+    /// # Why a Pull is not a message on the scheduled round
+    ///
+    /// An initiator reads inbound only inside a driven round, and there is one
+    /// session per coordinator, so a Pull sent beside the schedule had three
+    /// fates, all of them measured on CIRISServer's contact harness (ce7: the
+    /// canonical served the binding at 16:55:18.5, alice applied it at
+    /// 16:56:03.5):
+    ///
+    /// - no round live: the reply parked in the on-demand inbox with no reader
+    ///   until the next tick, up to a full cadence; a person re-asking meanwhile
+    ///   filled it (`inbox full while its driver was idle`);
+    /// - a round live: the Pull took that round's id, and a reply landing after
+    ///   the round closed was dropped (`answers no round this node is
+    ///   driving`);
+    /// - and whatever the next round did read, it read as its OWN Summary.
+    ///
+    /// A recovery round (FSD-SIGNER-RECOVERY) avoids that by replacing a tick,
+    /// which is right for background repair and wrong for an ask a person is
+    /// waiting on: it would queue behind the round in flight and the round gate.
+    /// Here each Pull's round id is the correlation, carried by the frames that
+    /// already have one, so no wire change.
+    ///
+    /// # Errors
+    ///
+    /// The `Pull` did not leave (a send error), or [`Self::MAX_PULL_EXCHANGES`]
+    /// are already in flight. An exchange that fails after the send is logged;
+    /// its rows arrive by the next ask.
+    pub async fn pull_exchange(
+        self: &Arc<Self>,
+        subject_key_id: &str,
+        reply_timeout: Duration,
+    ) -> Result<PullDispatched, CoordinatorError> {
+        if let Some(retry_after_secs) = self.pull_retry_after_secs() {
+            tracing::debug!(
+                peer = %self.peer_key_id,
+                kind = ?self.kind,
+                subject = %subject_key_id,
+                retry_after_secs,
+                "subject Pull held back: this peer throttled the last one and its \
+                 hint has not run out (CIRISEdge#937)"
+            );
+            return Ok(PullDispatched::Throttled { retry_after_secs });
+        }
+        let round = Self::mint_round_id();
+        let (replies, inbox) = mpsc::channel(Self::INBOUND_CHANNEL_CAPACITY);
+        {
+            let mut live = self
+                .pull_exchanges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if live.values().any(|e| e.subject == subject_key_id) {
+                return Ok(PullDispatched::InFlight);
+            }
+            if live.len() >= Self::MAX_PULL_EXCHANGES {
+                return Err(CoordinatorError::TooManyPulls);
+            }
+            let subject = subject_key_id.to_owned();
+            live.insert(round, PullExchange { subject, replies });
+        }
+        let pull = ReplicationMessage::Pull(PullMessage {
+            kind: self.kind,
+            subject_key_id: subject_key_id.to_owned(),
+        });
+        let mut session = Session::new(SessionRole::Initiator, self.kind);
+        session.expect_on_demand_reply();
+        if let Err(e) = self.send_on_round(&pull, round).await {
+            self.close_pull_exchange(round);
+            return Err(e);
+        }
+        let span = tracing::info_span!(
+            "subject_pull_exchange",
+            peer = %self.peer_key_id,
+            kind = ?self.kind,
+            subject = %subject_key_id,
+        );
+        tokio::spawn(
+            Arc::clone(self)
+                .drive_pull_exchange(session, round, inbox, reply_timeout)
+                .instrument(span),
+        );
+        Ok(PullDispatched::Sent)
+    }
+
+    /// Seconds left on this peer's throttle hint for this plane (#937), if any.
+    /// A host's "looking…" reads this; so does [`Self::pull_exchange`].
+    #[must_use]
+    pub fn pull_retry_after_secs(&self) -> Option<u64> {
+        let left = self
+            .pull_retry_at_secs
+            .load(Ordering::Acquire)
+            .saturating_sub(unix_secs());
+        (left > 0).then_some(left)
+    }
+
+    fn close_pull_exchange(&self, round: u64) {
+        self.pull_exchanges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&round);
+    }
+
+    async fn send_on_round(
+        &self,
+        msg: &ReplicationMessage,
+        round: u64,
+    ) -> Result<(), CoordinatorError> {
+        let bytes = super::wire_frame::wrap_v3(msg, RoundSide::Initiator, round);
+        self.transport
+            .send(&self.peer_key_id, &bytes)
+            .await
+            .map(|_| ())
+            .map_err(CoordinatorError::from)
+    }
+
+    async fn drive_pull_exchange(
+        self: Arc<Self>,
+        session: Session,
+        round: u64,
+        inbox: mpsc::Receiver<ReplicationMessage>,
+        reply_timeout: Duration,
+    ) {
+        match self
+            .step_pull_exchange(session, round, inbox, reply_timeout)
+            .await
+        {
+            Ok(Some(report)) => tracing::debug!(
+                admitted = report.admitted,
+                refused = report.refused,
+                "subject Pull answered and applied"
+            ),
+            Ok(None) => {}
+            Err(reason) => tracing::debug!(
+                reason,
+                "subject Pull exchange ended short; a later ask re-runs it"
+            ),
+        }
+        self.close_pull_exchange(round);
+    }
+
+    /// `Ok(None)`: answered, nothing to apply (the peer throttled it).
+    async fn step_pull_exchange(
+        &self,
+        mut session: Session,
+        round: u64,
+        mut inbox: mpsc::Receiver<ReplicationMessage>,
+        reply_timeout: Duration,
+    ) -> Result<Option<RoundReport>, &'static str> {
+        loop {
+            let Ok(Some(msg)) = tokio::time::timeout(reply_timeout, inbox.recv()).await else {
+                return Err("no reply in time");
+            };
+            self.note_removal_ack(&msg);
+            let throttled = match &msg {
+                ReplicationMessage::Summary(SummaryMessage {
+                    status: Some(SummaryStatus::SubjectPullThrottled { retry_after_secs }),
+                    ..
+                }) => Some(*retry_after_secs),
+                _ => None,
+            };
+            let outcome = session
+                .on_message(
+                    msg,
+                    self.provider.as_ref(),
+                    self.applier.as_ref(),
+                    Some(self.peer_key_id.as_str()),
+                )
+                .await;
+            // Refused, not empty: there is nothing to ask this peer for.
+            if let Some(secs) = throttled {
+                let hint = secs.min(Self::MAX_PULL_RETRY_AFTER_SECS);
+                self.pull_retry_at_secs
+                    .store(unix_secs() + hint, Ordering::Release);
+                return Ok(None);
+            }
+            match Self::outcome_to_step(outcome) {
+                DriveStep::SendThenWait(msgs) => {
+                    for m in &msgs {
+                        self.send_on_round(m, round)
+                            .await
+                            .map_err(|_| "a reply could not be sent")?;
+                    }
+                }
+                DriveStep::SendThenComplete(msgs, report) => {
+                    for m in &msgs {
+                        self.send_on_round(m, round)
+                            .await
+                            .map_err(|_| "a reply could not be sent")?;
+                    }
+                    return Ok(Some(report));
+                }
+                DriveStep::Complete(report) => return Ok(Some(report)),
+                DriveStep::Refused => return Err("an unexpected message"),
+            }
+        }
+    }
+
+    /// The `Pull` of a recovery round ([`Self::send_recovery_pull`]): one
+    /// message on THIS coordinator's session, stamped with the driven round the
+    /// scheduler opened for it. A subject Pull a caller asks for is
+    /// [`Self::pull_exchange`].
     pub async fn start_pull(&self, subject_key_id: &str) -> Result<(), CoordinatorError> {
         let pull = ReplicationMessage::Pull(PullMessage {
             kind: self.kind,
@@ -1422,6 +1688,224 @@ mod tests {
         assert!(!bob_coord.is_round_complete().await);
     }
 
+    /// What the Pull witnesses read of the peer's side of the wire.
+    type Wire = Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>;
+
+    fn pull_rig(known: HashMap<Vec<u8>, [u8; 32]>) -> (Arc<ReplicationCoordinator>, Wire) {
+        let (alice_t, bob_t) = alice_bob_transports();
+        let provider = Arc::new(StaticProvider {
+            state: LocalState::new(),
+            envelopes: HashMap::new(),
+        });
+        let applier = RecordingApplier::with(known, std::collections::HashSet::new());
+        let coord = Arc::new(ReplicationCoordinator::new(
+            Arc::new(alice_t),
+            "bob",
+            EnvelopeKind::Attestation,
+            SessionRole::Initiator,
+            provider,
+            applier,
+        ));
+        (coord, bob_t.my_inbox.clone())
+    }
+
+    async fn next_frame(rx: &Wire) -> crate::replication::wire_frame::Framed {
+        let bytes = tokio::time::timeout(Duration::from_secs(2), rx.lock().await.recv())
+            .await
+            .expect("a frame in time")
+            .expect("open");
+        crate::replication::wire_frame::try_unwrap_framed(&bytes)
+            .expect("decode")
+            .expect("a replication frame")
+    }
+
+    fn summary_of(refs: Vec<EnvelopeRef>, status: Option<SummaryStatus>) -> ReplicationMessage {
+        ReplicationMessage::Summary(SummaryMessage {
+            status,
+            kind: EnvelopeKind::Attestation,
+            refs,
+        })
+    }
+
+    /// The field's two losses, on one coordinator: a round is LIVE when the Pull
+    /// leaves (ce7, 16:53:48: the reply took the round's id and was dropped when
+    /// it closed), and nothing drives the coordinator but the frames themselves.
+    /// The exchange takes its own round, runs Summary → Diff → Deliver → apply
+    /// while the driven round stands untouched, and closes behind itself.
+    #[tokio::test]
+    async fn a_pull_runs_to_the_apply_on_its_own_round_beside_a_live_one() {
+        let (alice, to_bob) = pull_rig(HashMap::from([(b"binding".to_vec(), h(3))]));
+        let driven = alice.begin_round().await;
+        assert_eq!(
+            alice
+                .pull_exchange("dan", Duration::from_secs(5))
+                .await
+                .unwrap(),
+            PullDispatched::Sent
+        );
+        let pull = next_frame(&to_bob).await;
+        let round = pull.meta.expect("v3").round;
+        assert!(matches!(pull.msg, ReplicationMessage::Pull(_)));
+        assert_ne!(round, driven, "a Pull does not ride the driven round");
+
+        alice
+            .deliver_reply(
+                summary_of(
+                    vec![EnvelopeRef {
+                        envelope_hash: h(3),
+                        seq: 1,
+                    }],
+                    None,
+                ),
+                round,
+            )
+            .expect("the exchange's Summary routes");
+        let diff = next_frame(&to_bob).await;
+        assert_eq!(diff.meta.expect("v3").round, round);
+        let ReplicationMessage::Diff(diff) = diff.msg else {
+            panic!("the Diff follows at once: {:?}", diff.msg);
+        };
+        assert_eq!(diff.want, vec![h(3)]);
+
+        alice
+            .deliver_reply(
+                ReplicationMessage::Deliver(DeliverMessage {
+                    kind: EnvelopeKind::Attestation,
+                    envelopes: vec![b"binding".to_vec()],
+                }),
+                round,
+            )
+            .expect("the exchange's Deliver routes");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while alice.pull_exchanges.lock().unwrap().contains_key(&round) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the exchange closes"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(
+                alice
+                    .applier
+                    .apply_envelope(EnvelopeKind::Attestation, b"binding", None)
+                    .await,
+                ApplyOutcome::Duplicate
+            ),
+            "the row was applied: applying it again is a duplicate"
+        );
+        assert_eq!(alice.current_round(), driven, "the driven round stands");
+        assert_eq!(
+            alice.deliver_reply(summary_of(vec![], None), round),
+            Err(ReplyRefusal::RoundMismatch {
+                expected: driven,
+                got: round
+            }),
+            "a late reply is a visible drop"
+        );
+    }
+
+    /// #937, the requester: a throttled answer ends the exchange with no Diff,
+    /// and no further Pull leaves until the hint runs out, on that plane only.
+    /// A hint is capped: a peer cannot silence this node with a large number.
+    #[tokio::test]
+    async fn a_throttled_answer_holds_further_pulls_for_its_hint_937() {
+        let (alice, to_bob) = pull_rig(HashMap::new());
+        let _ = alice
+            .pull_exchange("dan", Duration::from_secs(5))
+            .await
+            .unwrap();
+        let round = next_frame(&to_bob).await.meta.expect("v3").round;
+        alice
+            .deliver_reply(
+                summary_of(
+                    vec![],
+                    Some(SummaryStatus::SubjectPullThrottled {
+                        retry_after_secs: 60,
+                    }),
+                ),
+                round,
+            )
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while alice.pull_retry_after_secs().is_none() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        assert!(alice.pull_retry_after_secs().unwrap() <= 60);
+        assert!(matches!(
+            alice.pull_exchange("carol", Duration::from_secs(5)).await,
+            Ok(PullDispatched::Throttled { .. })
+        ));
+        assert!(
+            to_bob.lock().await.try_recv().is_err(),
+            "neither a Diff nor a second Pull is on the wire"
+        );
+
+        // The hint ran out; a broken peer now names a century.
+        alice.pull_retry_at_secs.store(0, Ordering::Release);
+        let _ = alice
+            .pull_exchange("dan", Duration::from_secs(5))
+            .await
+            .unwrap();
+        let round = next_frame(&to_bob).await.meta.expect("v3").round;
+        alice
+            .deliver_reply(
+                summary_of(
+                    vec![],
+                    Some(SummaryStatus::SubjectPullThrottled {
+                        retry_after_secs: 3_153_600_000,
+                    }),
+                ),
+                round,
+            )
+            .unwrap();
+        while alice.pull_retry_after_secs().is_none() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            alice.pull_retry_after_secs().unwrap()
+                <= ReplicationCoordinator::MAX_PULL_RETRY_AFTER_SECS
+        );
+    }
+
+    /// A person's add re-asks: one exchange per subject, and a bound on them.
+    #[tokio::test]
+    async fn pulls_are_one_per_subject_and_bounded() {
+        let (alice, _to_bob) = pull_rig(HashMap::new());
+        let t = Duration::from_secs(5);
+        assert_eq!(
+            alice.pull_exchange("dan", t).await.unwrap(),
+            PullDispatched::Sent
+        );
+        assert_eq!(
+            alice.pull_exchange("dan", t).await.unwrap(),
+            PullDispatched::InFlight
+        );
+        for i in 1..ReplicationCoordinator::MAX_PULL_EXCHANGES {
+            assert_eq!(
+                alice.pull_exchange(&format!("s{i}"), t).await.unwrap(),
+                PullDispatched::Sent
+            );
+        }
+        assert!(matches!(
+            alice.pull_exchange("over", t).await,
+            Err(CoordinatorError::TooManyPulls)
+        ));
+    }
+
+    /// A Pull that could not leave is the caller's to retry, and leaves no slot.
+    #[tokio::test]
+    async fn a_silent_peers_exchange_times_out_and_frees_its_slot() {
+        let (alice, _to_bob) = pull_rig(HashMap::new());
+        let _ = alice
+            .pull_exchange("dan", Duration::from_millis(30))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(alice.pull_exchanges.lock().unwrap().is_empty());
+    }
+
     /// CIRISEdge#462 — the INITIATION drives the full RECEIVE cycle end-to-end: a
     /// fresh node's `start_pull` → the responder's subject-scoped Summary → the
     /// requester's Diff → the responder's Deliver → the requester applies the
@@ -1555,6 +2039,7 @@ mod tests {
     #[test]
     fn try_parse_inbound_bytes_round_trips_framed() {
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
@@ -1581,6 +2066,7 @@ mod tests {
     #[test]
     fn parse_inbound_bytes_strict_v1_rejects_bare_json() {
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
@@ -1641,6 +2127,7 @@ mod tests {
             a_applier,
         );
         let m = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
@@ -1706,6 +2193,7 @@ mod tests {
             applier,
         );
         let remote_summary = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![EnvelopeRef {
                 envelope_hash: h(99),
@@ -1809,6 +2297,7 @@ mod tests {
         // and feed it. Session computes Diff (want = [h(3), h(4)],
         // diff_want_count = 2) and stores it.
         let bob_summary = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![
                 EnvelopeRef {
@@ -2126,6 +2615,7 @@ mod tests {
                 applier,
             );
             let open = ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             });
@@ -2155,6 +2645,7 @@ mod tests {
                 applier,
             );
             let open = ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             });
@@ -2233,6 +2724,7 @@ mod tests {
                 })
             };
             let summary = ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             });
@@ -2281,6 +2773,7 @@ mod tests {
             );
             let round = alice.begin_round().await;
             let msg = ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             });
@@ -2320,6 +2813,7 @@ mod tests {
             assert_ne!(first, 0);
             assert_ne!(first, second);
             let msg = ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             });

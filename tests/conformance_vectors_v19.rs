@@ -2,7 +2,7 @@
 //!
 //! Emits byte-exact KAT (Known Answer Test) fixtures for every §19 wire
 //! shape into `conformance_vectors/19/*.json`. CIRISVerify v5.8.0's
-//! `ciris_verify_core::holonomic` MUST reproduce each emitted vector
+//! `ciris_verify_core::substrate` MUST reproduce each emitted vector
 //! byte-for-byte to ratify cross-impl conformance.
 //!
 //! Each test in this module either:

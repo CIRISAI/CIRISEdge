@@ -184,6 +184,12 @@ pub mod peer_bundle_frame;
 #[cfg(feature = "_reticulum-module")]
 pub mod identity_model;
 
+/// Mobile-background lifecycle: suspend and resume a transport in-process
+/// (no socket, link, listener or edge task while suspended). See the module
+/// docs for the platform rules it answers and the interim design.
+pub mod lifecycle;
+pub use lifecycle::SuspendReport;
+
 /// Reticulum-native transport (OQ-07 first impl). Backed by Leviculum
 /// (`reticulum-core` + `reticulum-std`). Canonical wire per
 /// `MISSION.md` §2; HTTP is the documented fallback.
@@ -239,14 +245,33 @@ pub mod link_shaping;
 /// membership for a period and the three layers, a pure function of the fold.
 pub mod onion_layers;
 
+/// ALM stage 2 — what the A/V controller reads off the Reticulum transport:
+/// per-link delivery telemetry, timed-frame expiries, learned relay routes.
+#[cfg(feature = "_reticulum-module")]
+pub mod alm_link;
+/// CIRISEdge#926 — the link stall guard: a link whose Channel lands nothing
+/// for a run of sends is never chosen again and is closed (or moved off a
+/// dead punched path).
+#[cfg(feature = "_reticulum-module")]
+pub mod link_stall;
 /// CC 5.4.6 item 4 (steward 2026-10-22) — the per-node liveness fold beside
 /// the deal: availability = the floor ∧ ≥ 3 answering relays per layer.
 pub mod onion_liveness;
+/// ALM stage 2 — the transport relay tier (`FSD/CIRIS_MESH.md` R2): roster
+/// relays before the canonical for a link that cannot be direct, and a
+/// relay's C2 admission of the links it forwards.
+#[cfg(feature = "_reticulum-module")]
+pub mod relay_tier;
 
 /// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
 /// live streams (`FSD/AV_CALL_API.md`).
 #[cfg(feature = "_reticulum-module")]
 pub mod av_call;
+
+/// CIRISEdge#805 — source authentication for a call's chunks: a per-epoch
+/// Ed25519 chunk key per stream, bound by the publisher's hybrid signature.
+#[cfg(feature = "_reticulum-module")]
+pub mod av_chunk_auth;
 
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
 /// edges (CIRISEdge#169). CEG-native (the Scope-B queue: byte-exact
@@ -422,6 +447,12 @@ pub enum TransportError {
         /// What happened.
         detail: String,
     },
+    /// The transport is suspended (the host is in the background — see
+    /// [`lifecycle`]). Nothing was sent and nothing about the peer was
+    /// learned: callers skip quietly and retry after resume, with no backoff
+    /// and no failure recorded against the peer.
+    #[error("transport suspended (host in background); retry after resume")]
+    Suspended,
 }
 
 /// CIRISEdge#393 (E3) — a transport-attributed source `key_id` that is

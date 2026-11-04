@@ -4,10 +4,10 @@
 //! - item 1: the consent send-set memo and the owner-of memo are
 //!   single-flight, so N concurrent callers of an EXPIRED entry cost ONE
 //!   persist read;
-//! - item 2: the membership-plane audience read (`may_receive_group_plane`,
-//!   on the advertise and its fetch twin) and the send-set read behind
-//!   `resolve_attestation_recipient` run under the advertise sweep permit,
-//!   so at most `advertise_sweep_permits` of them are in flight at once.
+//! - item 2: the send-set read behind `resolve_attestation_recipient` runs
+//!   under the advertise sweep permit, so at most `advertise_sweep_permits`
+//!   of them are in flight at once. (The membership-plane audience read this
+//!   item also bounded retired with the framed group planes in persist v61.)
 //!
 //! The in-memory directory never yields, so concurrent callers would
 //! serialise and every bound would hold vacuously. The bridge's test-only
@@ -21,7 +21,7 @@ use std::time::Duration as StdDuration;
 const PROBE_DELAY_MS: u64 = 50;
 
 fn bridge_with_permits(
-    backend: &Arc<MemoryBackend>,
+    backend: &Arc<SqliteBackend>,
     cohort: &[&str],
     permits: usize,
 ) -> FederationDirectoryReplicationBridge {
@@ -58,7 +58,7 @@ fn ago(by: StdDuration) -> Instant {
 /// of the eight missed and re-read the send-set (8 reads).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_send_set_is_reread_once_for_every_concurrent_sweep_817() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let bridge = bridge_with_permits(&backend, &[], 2);
     *bridge.consent_memo.lock().unwrap() = Some((
         ResolvedPeerSet::from_consent_peers(Vec::new()),
@@ -106,7 +106,7 @@ async fn an_expired_send_set_is_reread_once_for_every_concurrent_sweep_817() {
 /// walk's answer. Fails on v40.0.3 (8 walks).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_owner_binding_is_walked_once_for_every_concurrent_caller_817() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     register_fixture_keys(
         &backend,
         &[
@@ -151,7 +151,7 @@ async fn an_expired_owner_binding_is_walked_once_for_every_concurrent_caller_817
 /// instead of joining the stale walk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invalidation_mid_flight_starts_a_fresh_walk_817() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let bridge = Arc::new(bridge_with_permits(&backend, &[], 2));
     let before = bridge.owner_reads.load(Ordering::SeqCst);
     let stale = {
@@ -174,59 +174,29 @@ async fn an_invalidation_mid_flight_starts_a_fresh_walk_817() {
     assert_eq!(stale.await.unwrap(), OwnerLookup::Unowned);
 }
 
-/// **Item 2 — the membership-plane and send-set reads are bounded by the
-/// sweep permits.** `advertise_sweep_permits = 2`; eight peers at once each
-/// (a) advertise the Family plane (its `may_receive_group_plane` runs inside
-/// the page permit), (b) fetch the family record by hash (the fetch twin's
-/// `may_receive_group_plane`, which ran under no permit), and (c) resolve
-/// their attestation recipient with the send-set memo empty (the
-/// `consent_peers_by_principals` read, which ran under no permit). At most two
-/// of those reads are ever in flight together. Fails on v40.0.3: the eight
-/// fetches' reads all overlap (and with the fetch permit alone, the send-set
-/// read still makes a third).
+/// **Item 2 — the send-set read is bounded by the sweep permits.**
+/// `advertise_sweep_permits = 2`; eight peers at once resolve their
+/// attestation recipient with the send-set memo empty (the
+/// `consent_peers_by_principals` read, which ran under no permit on v40.0.3).
+/// They share one read, and at most two probed reads are ever in flight.
+///
+/// persist v61 (CIRISPersist#991) retired the framed Family / Community
+/// planes, and with them edge's own `may_receive_group_plane` advertise and
+/// fetch twin this test also drove: a group's record is a `group:roster:v1`
+/// row on the Attestation plane, gated by persist's `may_receive` inside the
+/// attestation sweep's page permit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn group_plane_and_send_set_reads_are_bounded_by_the_sweep_permits_817() {
-    let backend = Arc::new(MemoryBackend::new());
-    register_fixture_keys(
-        &backend,
-        &[
-            ("person-p", identity_type::USER),
-            ("person-l", identity_type::USER),
-        ],
-    )
-    .await;
-    backend
-        .put_family(sign_family_fixture(
-            "person-p",
-            fixture_family_founded("f-817", "person-p", "person-l"),
-        ))
-        .await
-        .expect("seed the family");
+async fn send_set_reads_are_bounded_by_the_sweep_permits_817() {
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let bridge = bridge_with_permits(&backend, &["person-p"], 2);
-    let refs = bridge.list_envelope_refs(EnvelopeKind::Family).await;
-    assert_eq!(refs.len(), 1, "the family record is held");
-    let hash = refs[0].envelope_hash;
-    let reads_before = bridge.read_probe.group_plane_reads.load(Ordering::SeqCst);
     let peers: Vec<String> = (0..8).map(|i| format!("node-peer-{i}")).collect();
     let work = peers.iter().map(|p| {
         let bridge = &bridge;
-        async move {
-            let p = p.as_str();
-            tokio::join!(
-                bridge.list_envelope_refs_for_peer(EnvelopeKind::Family, Some(p)),
-                bridge.fetch_envelope_bytes_for_peer(EnvelopeKind::Family, &hash, Some(p)),
-                bridge.resolve_attestation_recipient(p),
-            )
-        }
+        async move { bridge.resolve_attestation_recipient(p.as_str()).await }
     });
     tokio::time::timeout(StdDuration::from_secs(60), futures::future::join_all(work))
         .await
         .expect("no sweep deadlocks on the permit");
-    assert_eq!(
-        bridge.read_probe.group_plane_reads.load(Ordering::SeqCst) - reads_before,
-        16,
-        "every advertise and every fetch put the family to persist"
-    );
     assert_eq!(
         bridge.consent_set_reads.load(Ordering::SeqCst),
         1,
@@ -238,7 +208,6 @@ async fn group_plane_and_send_set_reads_are_bounded_by_the_sweep_permits_817() {
         "with 2 permits and 8 concurrent peers at most 2 membership-plane / send-set \
          reads are in flight at once; saw {max}"
     );
-    assert_eq!(max, 2, "the bound is reached, not a serialisation");
     assert_eq!(bridge.read_probe.in_flight.load(Ordering::SeqCst), 0);
 }
 
@@ -248,7 +217,7 @@ async fn group_plane_and_send_set_reads_are_bounded_by_the_sweep_permits_817() {
 /// page acquires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_send_set_permit_does_not_re_enter_the_gate_817() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let bridge = bridge_with_permits(&backend, &[], 1);
     bridge.read_probe.delay_ms.store(0, Ordering::SeqCst);
     let peers: Vec<String> = (0..4).map(|i| format!("node-peer-{i}")).collect();
@@ -292,7 +261,7 @@ async fn one_deliver_walks_the_trust_root_once_and_the_next_sees_a_revocation_81
     let local = "local-node";
     let producer = "producer";
     let peer = "rooted-peer";
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     register_fixture_keys(
         &backend,
         &[

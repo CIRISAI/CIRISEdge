@@ -74,7 +74,11 @@ fn arb_summary() -> impl Strategy<Value = SummaryMessage> {
         arb_envelope_kind(),
         prop::collection::vec(arb_envelope_ref(), 0..16),
     )
-        .prop_map(|(kind, refs)| SummaryMessage { kind, refs })
+        .prop_map(|(kind, refs)| SummaryMessage {
+            status: None,
+            kind,
+            refs,
+        })
 }
 
 fn arb_diff() -> impl Strategy<Value = DiffMessage> {

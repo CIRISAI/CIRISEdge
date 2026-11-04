@@ -1205,6 +1205,10 @@ pub struct Edge {
     verify: Arc<VerifyPipeline>,
     queue: Arc<dyn OutboundHandle>,
     signer: Arc<LocalSigner>,
+    /// `FSD/CIRIS_MESH.md` §7 — the service ladder: host pressure
+    /// ([`Edge::set_load_pressure`]) and edge's own signals → the tier every
+    /// live call and the transport's forwarding admission read.
+    load_ladder: Arc<crate::load_ladder::SharedLadder>,
     /// v1.1.1 (CIRISEdge#50 darwin follow-on; mirrors CIRISPersist#137/#138
     /// `select_signer`). When the cohabitation init path supplies a
     /// local seed signer that names the same `key_id` as `signer`, this
@@ -1416,6 +1420,15 @@ pub struct Edge {
     /// `EdgeBindingsError::Unsupported`.
     #[cfg(feature = "_reticulum-module")]
     reticulum_transport: Option<Arc<crate::transport::reticulum::ReticulumTransport>>,
+    /// Mobile-background lifecycle — edge's own background loops (durable
+    /// outbound dispatcher, sweeps, blackhole pruner), stopped by
+    /// [`Self::suspend`] and respawned by [`Self::resume`].
+    background: crate::transport::lifecycle::PausableTasks,
+    /// Mobile-background lifecycle — `true` between [`Self::suspend`] and
+    /// [`Self::resume`].
+    suspended: std::sync::atomic::AtomicBool,
+    /// Serializes [`Self::suspend`] and [`Self::resume`].
+    lifecycle_op: tokio::sync::Mutex<()>,
     /// CIRISEdge#499 — the scope-address lifecycle, present only when the
     /// operator opted in via [`EdgeBuilder::scope_native_addressing`] AND a
     /// Reticulum transport is wired. `None` is the default and is
@@ -2242,6 +2255,96 @@ impl Edge {
     }
 
     #[must_use]
+    /// **The host's load verdict** (`FSD/CIRIS_MESH.md` §7.3 L-S1): the
+    /// server samples the host (CPU, RSS, read time) and says `Normal`,
+    /// `Warning` or `Critical`. Edge maps it to a [`crate::ServiceTier`]
+    /// (0, 1, 2), may hold a higher tier from its own signals, raises at once
+    /// and steps down one tier per cooldown (60 s from 2, 120 s from 1).
+    /// Every live call and the transport's forwarding admission follow the
+    /// tier. Returns the effective tier.
+    pub fn set_load_pressure(&self, pressure: crate::LoadPressure) -> crate::ServiceTier {
+        let tier = self.load_ladder.set_host_pressure(pressure);
+        self.apply_service_tier(tier);
+        tier
+    }
+
+    /// The service tier this node runs at (`FSD/CIRIS_MESH.md` §7.2):
+    /// `FullOps` (0), `AudioAndFiles` (1), `ChatAndContacts` (2). Folds in
+    /// the transport's forwarded-load signal (`edge:transit_pps`) first.
+    pub fn service_tier(&self) -> crate::ServiceTier {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            let load = t.forward_load();
+            let tier = self
+                .load_ladder
+                .report(crate::load_ladder::EdgeLoadSignals {
+                    transit_pps_ratio: load.pps_ratio,
+                    ..crate::load_ladder::EdgeLoadSignals::default()
+                });
+            self.apply_service_tier(tier);
+            return tier;
+        }
+        self.load_ladder.tier()
+    }
+
+    /// The ladder's recent tier changes and token counters (`load_tier:*`
+    /// with their causes), for the operator readback.
+    #[must_use]
+    pub fn load_ladder(&self) -> Arc<crate::load_ladder::SharedLadder> {
+        Arc::clone(&self.load_ladder)
+    }
+
+    /// **The `load_ledger`** (`FSD/CIRIS_MESH.md` §7.4): the costliest
+    /// forwarded links this node carries (bits/s and packets/s each), over
+    /// the transport's last one-second reading. A/V commitments are per call
+    /// (`Call::alm_counts`, `Call::alm_relay_children`).
+    #[must_use]
+    pub fn load_ledger(&self) -> crate::observability::LoadLedger {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            let load = t.forward_load();
+            return crate::observability::LoadLedger {
+                tier: self.load_ladder.tier().as_u8(),
+                transit_pps: load.pps,
+                transit_bps: load.bps,
+                transit: load
+                    .top
+                    .iter()
+                    .map(|c| crate::observability::LoadLedgerEntry {
+                        subject: hex::encode(c.link_id),
+                        bps: c.bps,
+                        pps: c.pps,
+                    })
+                    .collect(),
+                counters: self
+                    .load_ladder
+                    .counters()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v))
+                    .collect(),
+            };
+        }
+        crate::observability::LoadLedger {
+            tier: self.load_ladder.tier().as_u8(),
+            counters: self
+                .load_ladder
+                .counters()
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
+            ..crate::observability::LoadLedger::default()
+        }
+    }
+
+    #[allow(clippy::unused_self)]
+    fn apply_service_tier(&self, tier: crate::ServiceTier) {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            t.set_service_tier(tier);
+        }
+        let _ = tier;
+    }
+
     pub fn metrics(&self) -> crate::observability::EdgeMetrics {
         self.metrics.clone()
     }
@@ -2545,6 +2648,10 @@ impl Edge {
     /// recipient-determination rules of CIRISEdge#48-A.
     ///
     /// Refusal returns a typed [`EdgeError::CohortScopeRefusedRecipient`].
+    // The transport-outcome match grew past the 100-line cap with the
+    // lifecycle `Suspended` arm (nothing recorded against the peer); the
+    // match is one decision and reads best whole.
+    #[allow(clippy::too_many_lines)]
     pub async fn send_with_cohort_scope<M: Message>(
         &self,
         destination_key_id: &str,
@@ -2640,6 +2747,12 @@ impl Edge {
                     self.metrics.inc_send_failure(transport.id(), class);
                 }
                 o
+            }
+            // Lifecycle — suspended: nothing was attempted, so nothing is
+            // recorded against the peer.
+            Err(e @ crate::TransportError::Suspended) => {
+                self.retire_ephemeral_waiter(waiter.as_ref());
+                return Err(EdgeError::Transport(e));
             }
             Err(e) => {
                 let error_class = transport_error_class(&e).to_string();
@@ -4451,6 +4564,9 @@ impl Edge {
             actor,
             node: Arc::clone(&self.signer),
         }) as Arc<dyn crate::transport::av_call::CallRecord>;
+        let verifier = Arc::new(crate::transport::av_chunk_auth::DirectoryKeys(Arc::clone(
+            &directory,
+        ))) as Arc<dyn crate::transport::av_chunk_auth::StreamKeyVerifier>;
         Call::join(
             room,
             &own,
@@ -4463,6 +4579,11 @@ impl Edge {
                 events: Some(Arc::clone(&self.events)),
                 metrics: Some(self.metrics()),
                 record: Some(record),
+                // The node signs its stream's chunk-key bindings: the stream's
+                // publisher is the node (`own`), whoever attends.
+                signer: Arc::clone(&self.signer),
+                verifier,
+                load: Some(Arc::clone(&self.load_ladder)),
             },
             opts,
         )
@@ -4673,6 +4794,78 @@ impl Edge {
         tasks
     }
 
+    /// **Mobile background: suspend.** The host calls this from its
+    /// `enter_background(deadline)` (Android Doze / App Standby, iOS background
+    /// suspension — see [`crate::transport::lifecycle`] for the platform rules
+    /// and the design). Stops edge's background loops (durable outbound
+    /// dispatcher, sweeps, blackhole pruner), then suspends the Reticulum
+    /// transport: sends refused with
+    /// [`TransportError::Suspended`](crate::TransportError::Suspended), every
+    /// link closed, the listener parked, the interfaces detached. Returns once
+    /// nothing is left open, or at `deadline` with what still is.
+    ///
+    /// Idempotent; never fails. Does not rebuild anything: [`Self::resume`]
+    /// brings the same `Edge` (and the replication runtime riding it) back.
+    pub async fn suspend(&self, deadline: std::time::Duration) -> crate::transport::SuspendReport {
+        let started = std::time::Instant::now();
+        let until = tokio::time::Instant::now() + deadline;
+        let Ok(_op) = tokio::time::timeout_at(until, self.lifecycle_op.lock()).await else {
+            return crate::transport::SuspendReport {
+                already_suspended: self.is_suspended(),
+                elapsed: started.elapsed(),
+                edge_tasks: self.background.running(),
+                tasks_running: self.background.running(),
+                ..Default::default()
+            };
+        };
+        let already = self
+            .suspended
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        let background_left = self.background.pause(until).await;
+        let own = crate::transport::SuspendReport {
+            already_suspended: already,
+            quiescent: background_left == 0,
+            elapsed: started.elapsed(),
+            tasks_running: background_left,
+            edge_tasks: background_left,
+            ..Default::default()
+        };
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            let mut report = t.suspend(left).await.merge(&own);
+            report.elapsed = started.elapsed();
+            return report;
+        }
+        own
+    }
+
+    /// **Mobile background: resume.** The host calls this from its
+    /// `enter_foreground()`. Reattaches the Reticulum transport's interfaces,
+    /// reopens sends, wakes the listener (which announces), and respawns
+    /// edge's background loops. Idempotent; a no-op when not suspended. On an
+    /// error the edge stays suspended and the call may be retried.
+    pub async fn resume(&self) -> Result<(), EdgeError> {
+        let _op = self.lifecycle_op.lock().await;
+        if !self.is_suspended() {
+            return Ok(());
+        }
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            t.resume().await?;
+        }
+        self.background.resume();
+        self.suspended
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether [`Self::suspend`] is in force.
+    #[must_use]
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// CIRISEdge#243 — spawn the outbound dispatcher + periodic sweeps on
     /// the supplied edge-side runtime `Handle`. This is the exact spawn
     /// block [`Self::run`] wires inline; extracting it into one method
@@ -4702,6 +4895,8 @@ impl Edge {
         runtime: &tokio::runtime::Handle,
         shutdown_rx: &watch::Receiver<bool>,
     ) -> Vec<tokio::task::JoinHandle<()>> {
+        // Lifecycle — registered with the closures that spawn them, so
+        // `suspend` can stop them and `resume` spawn them again.
         let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         {
             let q = self.queue.clone();
@@ -4709,15 +4904,29 @@ impl Edge {
             let cfg = self.config.dispatcher.clone();
             let sd = shutdown_rx.clone();
             let reach = Some(self.reachability.clone());
-            tasks.push(runtime.spawn(async move {
-                run_dispatcher(q, ts, cfg, sd, reach).await;
+            let rt = runtime.clone();
+            tasks.push(self.background.register(move || {
+                let (q, ts, cfg, sd, reach) = (
+                    q.clone(),
+                    ts.clone(),
+                    cfg.clone(),
+                    sd.clone(),
+                    reach.clone(),
+                );
+                rt.spawn(async move {
+                    run_dispatcher(q, ts, cfg, sd, reach).await;
+                })
             }));
         }
         {
             let q = self.queue.clone();
             let sd = shutdown_rx.clone();
-            tasks.push(runtime.spawn(async move {
-                run_sweeps(q, sd).await;
+            let rt = runtime.clone();
+            tasks.push(self.background.register(move || {
+                let (q, sd) = (q.clone(), sd.clone());
+                rt.spawn(async move {
+                    run_sweeps(q, sd).await;
+                })
             }));
         }
         tasks
@@ -5103,8 +5312,12 @@ impl Edge {
                     .and_then(|t| t.blackhole_rules_handle())
                 {
                     let sd = shutdown_rx.clone();
-                    tasks.push(tokio::spawn(async move {
-                        run_blackhole_pruner(rules, interval, sd).await;
+                    let rt = tokio::runtime::Handle::current();
+                    tasks.push(self.background.register(move || {
+                        let (rules, sd) = (rules.clone(), sd.clone());
+                        rt.spawn(async move {
+                            run_blackhole_pruner(rules, interval, sd).await;
+                        })
                     }));
                 }
             }
@@ -8803,6 +9016,7 @@ impl EdgeBuilder {
             verify,
             queue,
             signer,
+            load_ladder: Arc::new(crate::load_ladder::SharedLadder::default()),
             local_signer: self.local_signer,
             transports: self.transports,
             handlers: Arc::new(Mutex::new(HashMap::new())),
@@ -8840,6 +9054,9 @@ impl EdgeBuilder {
             reachability,
             #[cfg(feature = "_reticulum-module")]
             reticulum_transport: self.reticulum_transport,
+            background: crate::transport::lifecycle::PausableTasks::default(),
+            suspended: std::sync::atomic::AtomicBool::new(false),
+            lifecycle_op: tokio::sync::Mutex::new(()),
             #[cfg(feature = "_reticulum-module")]
             scope_lifecycle: match scope_lifecycle {
                 Some(lifecycle) => std::sync::OnceLock::from(lifecycle),
@@ -9014,6 +9231,8 @@ fn transport_error_class(e: &TransportError) -> &'static str {
         TransportError::LinkSealRefused { .. } => "link_seal_refused",
         // The peer's proof did not verify against the key held for it.
         TransportError::LinkProofRefused { .. } => "link_proof_refused",
+        // Lifecycle — the host is in the background; not a peer fault.
+        TransportError::Suspended => "suspended",
     }
 }
 
@@ -9455,7 +9674,7 @@ async fn emit_withdraws(
 
     // Wrap in a typed envelope addressed to the holder. The envelope's
     // hybrid signature IS the proof-of-authority — no body-internal
-    // signature (same shape as GoalRetirement, CIRISEdge#41).
+    // signature (the durable single-signer shape).
     let envelope_bytes = {
         let mut env = build_envelope(
             MessageType::Withdraws,
@@ -10017,7 +10236,7 @@ mod delegation_gate_tests {
         algorithm, attestation_type as att_type, identity_type, Attestation, KeyRecord,
         SignedAttestation, SignedKeyRecord,
     };
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
     use sha2::{Digest as _, Sha256};
 
     // ── v6.3.2 fixture-signature helpers ────────────────────────────
@@ -10167,11 +10386,17 @@ mod delegation_gate_tests {
                 obj.insert("sub_delegation".to_owned(), serde_json::json!(true));
             }
         }
+        // persist v60.0.0 (#1048): a term-bearing edge (`sub_delegation` here)
+        // must carry a bounded `delegation_valid_until`; persist's fixture helper
+        // adds one only when the edge is term-bearing.
+        ciris_persist::federation::admission::with_test_term(&mut envelope, now);
         // #598: bind the signed `asserted_at` into the envelope BEFORE signing.
         if let Some(obj) = envelope.as_object_mut() {
             obj.insert(
                 "asserted_at".to_owned(),
-                serde_json::json!(now.to_rfc3339()),
+                serde_json::json!(ciris_persist::federation::admission::render_signed_instant(
+                    now
+                )),
             );
         }
         let mut att = Attestation {
@@ -10222,7 +10447,9 @@ mod delegation_gate_tests {
         if let Some(obj) = envelope.as_object_mut() {
             obj.insert(
                 "asserted_at".to_owned(),
-                serde_json::json!(now.to_rfc3339()),
+                serde_json::json!(ciris_persist::federation::admission::render_signed_instant(
+                    now
+                )),
             );
         }
         let mut att = Attestation {
@@ -10259,7 +10486,7 @@ mod delegation_gate_tests {
         att
     }
 
-    async fn seed_keys(backend: &Arc<MemoryBackend>, keys: &[(&str, &str)]) {
+    async fn seed_keys(backend: &Arc<SqliteBackend>, keys: &[(&str, &str)]) {
         use ciris_persist::federation::FederationDirectory;
         for (kid, itype) in keys {
             backend
@@ -10271,7 +10498,7 @@ mod delegation_gate_tests {
         }
     }
 
-    async fn seed_attestation(backend: &Arc<MemoryBackend>, att: Attestation) {
+    async fn seed_attestation(backend: &Arc<SqliteBackend>, att: Attestation) {
         use ciris_persist::federation::FederationDirectory;
         backend
             .put_attestation(SignedAttestation { attestation: att })
@@ -10328,7 +10555,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn empty_trust_roots_refuses_with_no_trust_roots() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(&backend, &[("agent", identity_type::AGENT)]).await;
         let dir: Arc<dyn ciris_persist::federation::FederationDirectory> = backend;
         let out = verify_self_at_login_delegation(
@@ -10352,7 +10579,7 @@ mod delegation_gate_tests {
     // placeholder-signature fixture pattern.
     #[tokio::test]
     async fn happy_path_admits_signer_reached_via_in_scope_chain() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10382,7 +10609,7 @@ mod delegation_gate_tests {
     /// six-hop chain `user-root → d1 → … → d5 → agent`, every hop carrying the
     /// scope and `sub_delegation`. Built once, walked at two depths below.
     async fn six_hop_chain() -> Arc<dyn ciris_persist::federation::FederationDirectory> {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let keys = ["user-root", "d1", "d2", "d3", "d4", "d5", "agent"];
         let mut seeded = vec![("user-root", identity_type::USER)];
         for k in &keys[1..] {
@@ -10442,7 +10669,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn missing_delegation_refuses_with_signer_unreached() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10470,7 +10697,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn retracted_delegation_refuses_with_retracted_at_root() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10505,7 +10732,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn delegation_without_required_scope_refuses_with_missing_scope() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10545,7 +10772,7 @@ mod delegation_gate_tests {
     // signal across the union.
     #[tokio::test]
     async fn multi_root_fold_prefers_missing_scope_over_retracted() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10676,6 +10903,7 @@ mod inbound_ingest_tests {
         let registry = std::sync::Arc::new(ReplicationRegistry::new());
         let crpl =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
@@ -10709,6 +10937,7 @@ mod inbound_ingest_tests {
     async fn no_registry_falls_through() {
         let crpl =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
@@ -10732,6 +10961,7 @@ mod inbound_ingest_tests {
         }));
         let crpl =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
@@ -10844,6 +11074,7 @@ mod inbound_ingest_tests {
         };
         let key_frame =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
@@ -10881,6 +11112,7 @@ mod inbound_ingest_tests {
         let registry = make_registry(built.clone());
         let att =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Attestation,
                 refs: vec![],
             }));
@@ -11003,6 +11235,7 @@ mod inbound_ingest_tests {
         let frame = || InboundFrame {
             envelope_bytes: crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
                 SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Attestation,
                     refs: vec![],
                 },
@@ -11083,7 +11316,11 @@ mod inbound_ingest_tests {
     fn bootstrap_carve_out_admits_only_self_authenticating_bootstrap_kinds() {
         let with_link = |kind, link: Option<&str>| InboundFrame {
             envelope_bytes: crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
-                SummaryMessage { kind, refs: vec![] },
+                SummaryMessage {
+                    status: None,
+                    kind,
+                    refs: vec![],
+                },
             )),
             transport: TransportId::RETICULUM_RS,
             received_at: chrono::Utc::now(),
@@ -11166,7 +11403,7 @@ mod inbound_ingest_tests {
             let kind = EnvelopeKind::ALL[kind_idx];
             let frame = InboundFrame {
                 envelope_bytes: crate::replication::wire_frame::wrap(
-                    &ReplicationMessage::Summary(SummaryMessage { kind, refs: vec![] }),
+                    &ReplicationMessage::Summary(SummaryMessage { status: None, kind, refs: vec![] }),
                 ),
                 transport: TransportId::RETICULUM_RS,
                 received_at: chrono::Utc::now(),
@@ -11254,6 +11491,7 @@ mod inbound_ingest_tests {
         for _ in 0..ReplicationCoordinator::INBOUND_CHANNEL_CAPACITY {
             coord
                 .deliver_inbound(ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![],
                 }))
@@ -11267,6 +11505,7 @@ mod inbound_ingest_tests {
         let metrics = EdgeMetrics::new();
         let crpl =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));

@@ -127,6 +127,10 @@ pub(crate) enum RoundClass {
     NoRoute(String),
     /// Anything else: completed, refused, timed out, or another error.
     Other,
+    /// The transport is suspended (host in background): the round never
+    /// reached the wire, so it says nothing about the peer — no backoff is
+    /// entered, advanced or cleared.
+    Suspended,
 }
 
 impl RoundClass {
@@ -136,6 +140,7 @@ impl RoundClass {
             TransportError::NoRouteToPeer {
                 has_path: false, ..
             } => Some(Self::NoRoute(e.to_string())),
+            TransportError::Suspended => Some(Self::Suspended),
             _ => None,
         }
     }
@@ -362,6 +367,15 @@ impl NoRouteBackoff {
                 drop(peers);
                 self.clear(peer, BackoffExit::Expiry, Some(kind));
             }
+            // Suspended: no evidence either way. A probe gives its claim back
+            // so the first round after resume can probe; the window stands.
+            RoundClass::Suspended => {
+                if probe {
+                    if let Some(s) = peers.get_mut(peer) {
+                        s.probing = false;
+                    }
+                }
+            }
             // A round already in flight when another plane put the peer in
             // backoff (or one that cleared meanwhile): the state it finds stands.
             RoundClass::NoRoute(_) | RoundClass::Other => {}
@@ -519,6 +533,45 @@ mod tests {
         assert!(
             matches!(b.admit("p", EnvelopeKind::Attestation), Admission::Run(_)),
             "a dropped (cancelled) probe releases its claim"
+        );
+    }
+
+    /// Lifecycle — a round refused because the transport is suspended says
+    /// nothing about the peer: it enters no backoff, and a probe refused that
+    /// way neither clears nor widens the window, but gives its claim back.
+    #[tokio::test(start_paused = true)]
+    async fn a_suspended_round_neither_enters_widens_nor_clears_a_backoff() {
+        let b = NoRouteBackoff::with_jitter(|w| w);
+        let suspended = RoundClass::of_transport_error(&TransportError::Suspended)
+            .expect("Suspended is classified");
+        assert!(matches!(suspended, RoundClass::Suspended));
+        match b.admit("p", EnvelopeKind::Key) {
+            Admission::Run(t) => t.finish(RoundClass::Suspended),
+            Admission::Skip => panic!("a peer not backed off runs"),
+        }
+        assert!(b.snapshot().is_empty(), "no backoff entered");
+        match b.admit("p", EnvelopeKind::Key) {
+            Admission::Run(t) => t.finish(RoundClass::NoRoute("no route".into())),
+            Admission::Skip => panic!("due"),
+        }
+        tokio::time::advance(NO_ROUTE_BACKOFF_INITIAL).await;
+        match b.admit("p", EnvelopeKind::Key) {
+            Admission::Run(t) => t.finish(RoundClass::Suspended),
+            Admission::Skip => panic!("the expired delay admits a probe"),
+        }
+        let snap = b.snapshot();
+        assert_eq!(
+            snap.len(),
+            1,
+            "a suspended probe does not clear the backoff"
+        );
+        assert_eq!(
+            snap[0].current_delay, NO_ROUTE_BACKOFF_INITIAL,
+            "nor widen it"
+        );
+        assert!(
+            matches!(b.admit("p", EnvelopeKind::Key), Admission::Run(_)),
+            "the suspended probe gave its claim back"
         );
     }
 }

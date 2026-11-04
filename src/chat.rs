@@ -275,6 +275,11 @@ fn build_community(
     founded_at: chrono::DateTime<chrono::Utc>,
 ) -> ciris_persist::federation::types::Community {
     use ciris_persist::federation::types::{Community, CommunityMember};
+    // persist v61 (CC 2.6.2 strict) — the record's instants are signed `.sssZ`,
+    // which carries no sub-millisecond part: truncate once here so the signed
+    // bytes and the stored columns name the same millisecond.
+    let founded_at =
+        ciris_persist::federation::admission::truncate_to_substrate_resolution(founded_at);
     Community {
         community_key_id: community_key_id.to_owned(),
         community_name: community_name.to_owned(),

@@ -616,6 +616,14 @@ impl AvPublisher {
 /// wire bytes from one upstream [`AvInboundLink`], open the inbound outer
 /// AEAD, and re-seal per downstream subscriber via
 /// [`AvDispatcher::relay_chunk`]. The inner ciphertext is never touched.
+///
+/// A room call's chunks (`av_call`) carry their publisher's 64-byte source
+/// signature at the end of the inner unit
+/// (`transport::av_chunk_auth`); this relay forwards it byte for byte
+/// with the rest. It needs no DEK to check one: the signature covers the inner
+/// ciphertext, so a call relay built on this role can drop a forgery before
+/// forwarding with `ChunkAuth::check`. Dormant: nothing here wires that check
+/// today, because no production path runs this role.
 pub struct AvRelay {
     stream_id: StreamId,
     dispatcher: AvDispatcher,
@@ -1281,7 +1289,9 @@ pub(crate) use leviculum_link::{AvLinkQueue, QueueOffer};
 /// `_reticulum-module` — the only part of the runtime that depends on
 /// leviculum.
 #[cfg(feature = "_reticulum-module")]
-pub use leviculum_link::{LeviculumAvSender, LinkDataPump, PumpReceiver, AV_LINK_QUEUE_DEPTH};
+pub use leviculum_link::{
+    LeviculumAvSender, LinkDataPump, MediaTtl, PumpReceiver, AV_LINK_QUEUE_DEPTH,
+};
 
 #[cfg(feature = "_reticulum-module")]
 mod leviculum_link {
@@ -1364,6 +1374,7 @@ mod leviculum_link {
             let frame = InboundWireFrame {
                 dropped_before: self.dropped_since_queued,
                 bytes,
+                queued_at: Some(std::time::Instant::now()),
             };
             match self.tx.try_send(frame) {
                 Ok(()) => {
@@ -1376,6 +1387,50 @@ mod leviculum_link {
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => QueueOffer::ConsumerGone,
             }
+        }
+    }
+
+    /// ALM C5 — a leg's per-class time to live for media (leviculum#94
+    /// timed Channel frames). Zero means untimed: the frame rides the plain
+    /// Channel, as for a peer whose leviculum predates v0.33. The call layer
+    /// sets it once the peer said it takes timed frames (its C3 `CAPS`).
+    #[derive(Debug, Default)]
+    pub struct MediaTtl {
+        audio_ms: std::sync::atomic::AtomicU32,
+        video_ms: std::sync::atomic::AtomicU32,
+    }
+
+    impl MediaTtl {
+        /// Time media on this leg: codec-opaque chunks (audio) live `audio`,
+        /// layered video `video`.
+        pub fn set(&self, audio: std::time::Duration, video: std::time::Duration) {
+            use std::sync::atomic::Ordering::Relaxed;
+            let ms =
+                |d: std::time::Duration| u32::try_from(d.as_millis()).unwrap_or(u32::MAX).max(1);
+            self.audio_ms.store(ms(audio), Relaxed);
+            self.video_ms.store(ms(video), Relaxed);
+        }
+
+        /// Whether media on this leg is timed.
+        #[must_use]
+        pub fn is_timed(&self) -> bool {
+            self.audio_ms.load(std::sync::atomic::Ordering::Relaxed) > 0
+        }
+
+        /// The TTL for one sealed chunk wire (its clear header's `codec_id`,
+        /// byte 48: codec-opaque is the audio class), or `None` untimed.
+        #[must_use]
+        pub fn for_chunk(&self, wire: &[u8]) -> Option<std::time::Duration> {
+            use std::sync::atomic::Ordering::Relaxed;
+            let audio = wire
+                .get(48)
+                .map_or(true, |c| *c == crate::transport::realtime_av::CODEC_OPAQUE);
+            let ms = if audio {
+                self.audio_ms.load(Relaxed)
+            } else {
+                self.video_ms.load(Relaxed)
+            };
+            (ms > 0).then(|| std::time::Duration::from_millis(u64::from(ms)))
         }
     }
 
@@ -1404,6 +1459,8 @@ mod leviculum_link {
         /// inbound reaper reads this map and would otherwise close a link
         /// carrying media at its idle bound.
         outbound_liveness: Option<Arc<std::sync::Mutex<HashMap<LinkId, u64>>>>,
+        /// ALM C5 — the leg's media TTLs (shared with the call layer).
+        media_ttl: Arc<MediaTtl>,
     }
 
     impl LeviculumAvSender {
@@ -1425,7 +1482,15 @@ mod leviculum_link {
                 metrics: None,
                 direct_path: None,
                 outbound_liveness: None,
+                media_ttl: Arc::new(MediaTtl::default()),
             }
+        }
+
+        /// ALM C5 — this leg's media TTLs (set once the peer takes timed
+        /// frames).
+        #[must_use]
+        pub fn media_ttl(&self) -> Arc<MediaTtl> {
+            Arc::clone(&self.media_ttl)
         }
 
         /// CIRISEdge#863 item 6 — stamp every accepted send into the
@@ -1519,9 +1584,32 @@ mod leviculum_link {
         /// limit FIRST. leviculum refuses an oversized Channel message as
         /// `TooLarge` and `send_on_link` folds that into `LinkFailed`, so
         /// without this check an oversized chunk read as a link failure.
+        fn message_limit(&self) -> Option<usize> {
+            LeviculumAvSender::channel_limit(self)
+        }
+
         async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            self.send_with(bytes, None).await
+        }
+
+        async fn send_media(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            self.send_with(bytes, self.media_ttl.for_chunk(bytes)).await
+        }
+    }
+
+    impl LeviculumAvSender {
+        /// One Channel message, timed (leviculum#94: retransmitted only until
+        /// `ttl`, then an expired marker; dropped by the receiver if late)
+        /// or not. Both never wait (#591).
+        async fn send_with(
+            &self,
+            bytes: &[u8],
+            ttl: Option<std::time::Duration>,
+        ) -> Result<(), AvDispatcherError> {
             use leviculum_core::SendError;
             use leviculum_std::error::Error as LevError;
+            /// leviculum#94's timed wrapper: msgtype u16 ‖ sent_ms u32 ‖ ttl_ms u32.
+            const TIMED_HEADER_LEN: usize = 10;
 
             let Some(channel_limit) = self.channel_limit() else {
                 self.count(crate::observability::AV_SEND_LINK_GONE);
@@ -1553,9 +1641,27 @@ mod leviculum_link {
                     self.link_id
                 )));
             };
-            match self.node.link_handle(&self.link_id).try_send(&sealed).await {
+            // leviculum#94's timed wrapper rides inside the Channel message: a
+            // frame that fills the Channel without it cannot carry it, and
+            // goes untimed.
+            let ttl = ttl.filter(|_| {
+                let fits = bytes.len() + TIMED_HEADER_LEN <= channel_limit;
+                if !fits {
+                    self.count(crate::observability::AV_SENT_UNTIMED_FULL);
+                }
+                fits
+            });
+            let handle = self.node.link_handle(&self.link_id);
+            let sent = match ttl {
+                Some(ttl) => handle.try_send_timed(&sealed, ttl).await,
+                None => handle.try_send(&sealed).await,
+            };
+            match sent {
                 Ok(()) => {
                     self.count(crate::observability::AV_SENT);
+                    if ttl.is_some() {
+                        self.count(crate::observability::AV_SENT_TIMED);
+                    }
                     if let Some(stamps) = self.outbound_liveness.as_deref() {
                         crate::transport::reticulum::note_outbound_use(stamps, self.link_id);
                     }
@@ -1793,7 +1899,7 @@ mod tests {
         use ciris_persist::federation::FederationDirectory;
         use std::sync::Arc;
         let dir: Arc<dyn FederationDirectory> =
-            Arc::new(ciris_persist::store::MemoryBackend::new());
+            Arc::new(ciris_persist::store::test_backend::test_backend());
 
         let paused_gate = TransitGate::new(Arc::clone(&dir), Some("us".to_string()))
             .with_mesh_config(Some(Arc::new(MeshConfigReader::fixed_for_test(
@@ -1940,6 +2046,7 @@ mod tests {
                 .send(InboundWireFrame {
                     dropped_before,
                     bytes,
+                    queued_at: None,
                 })
                 .expect("feed");
         }

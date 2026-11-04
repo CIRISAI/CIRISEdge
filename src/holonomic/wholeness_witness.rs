@@ -103,8 +103,8 @@ use serde::{Deserialize, Serialize};
 /// empty-tree sentinel) is genuinely identical to the shared §19.1
 /// owner and is KAT-locked there, so edge re-exports it rather than
 /// maintaining a byte-for-byte twin. See
-/// [`ciris_verify_core::holonomic::wholeness_witness::compute_merkle_root`].
-pub use ciris_verify_core::holonomic::wholeness_witness::compute_merkle_root;
+/// [`ciris_verify_core::substrate::wholeness_witness::compute_merkle_root`].
+pub use ciris_verify_core::substrate::wholeness_witness::compute_merkle_root;
 
 /// CC 6.1.1 (rc9 b3bc620) — a witness leaf list carried a leaf more than once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,7 +332,7 @@ impl WholenessWitness {
     ///
     /// §19 re-export debt (CIRISEdge#359 F-4): the §19.1 signed preimage
     /// framing is owned by
-    /// [`ciris_verify_core::holonomic::wholeness_witness::WholenessWitness::canonical_preimage`]
+    /// [`ciris_verify_core::substrate::wholeness_witness::WholenessWitness::canonical_preimage`]
     /// (byte-frozen there by the §19.6 vectors). Edge's shape carries
     /// edge-only fields (the hybrid-signature trio, serde derives) so it
     /// cannot re-export verify's type wholesale; it delegates the shared
@@ -340,7 +340,7 @@ impl WholenessWitness {
     /// edge-authored and verify reproduces it, so the bytes are unchanged.
     #[must_use]
     pub fn canonical_preimage_bytes(&self) -> Vec<u8> {
-        ciris_verify_core::holonomic::wholeness_witness::WholenessWitness {
+        ciris_verify_core::substrate::wholeness_witness::WholenessWitness {
             peer_id: self.peer_id.clone(),
             epoch_id: self.epoch_id,
             claim_namespaces: self.claim_namespaces.clone(),

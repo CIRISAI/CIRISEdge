@@ -169,6 +169,41 @@ impl FetchBatch {
     }
 }
 
+/// CIRISEdge#937 — the answer to one subject `Pull`: the refs served and,
+/// when the responder's per-requester lookup limiter refused the Pull this
+/// window, the throttle it answers with instead. `refs` is empty whenever
+/// `throttled` is `Some`; the two are distinguishable on the wire by
+/// [`super::protocol::SummaryStatus`], which is the whole point (#937: a
+/// throttled Pull used to be indistinguishable from a subject nobody holds).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubjectPullAnswer {
+    /// The refs the requester may Diff/Fetch (see [`StateProvider::subject_refs`]).
+    pub refs: Vec<EnvelopeRef>,
+    /// `Some(window)` when the limiter denied: the window length in seconds
+    /// the requester should wait out (a policy constant, FSD_RATE_LIMIT D3).
+    pub throttled: Option<u64>,
+}
+
+impl SubjectPullAnswer {
+    /// The refs, with no throttle.
+    #[must_use]
+    pub fn served(refs: Vec<EnvelopeRef>) -> Self {
+        Self {
+            refs,
+            throttled: None,
+        }
+    }
+
+    /// A throttled answer: no refs, retry after `window_secs`.
+    #[must_use]
+    pub fn throttled(window_secs: u64) -> Self {
+        Self {
+            refs: Vec::new(),
+            throttled: Some(window_secs),
+        }
+    }
+}
+
 #[async_trait]
 pub trait StateProvider: Send + Sync {
     /// Snapshot the refs this node OFFERS to the round's peer for `kind` — the
@@ -331,6 +366,23 @@ pub trait StateProvider: Send + Sync {
     /// a well-formed no-op, never a panic.
     async fn subject_refs(&self, _kind: EnvelopeKind, _subject_key_id: &str) -> Vec<EnvelopeRef> {
         Vec::new()
+    }
+
+    /// CIRISEdge#937 — [`Self::subject_refs`] with its STATUS: the same refs,
+    /// plus whether the responder's lookup limiter refused the Pull this
+    /// window. The session's `on_pull` reads this one so a throttled answer
+    /// can say so on the wire ([`super::protocol::SummaryStatus`]) instead of
+    /// answering an empty list. Defaults to the refs with no status, so a
+    /// provider that never throttles need not override it.
+    async fn subject_pull_answer(
+        &self,
+        kind: EnvelopeKind,
+        subject_key_id: &str,
+    ) -> SubjectPullAnswer {
+        SubjectPullAnswer {
+            refs: self.subject_refs(kind, subject_key_id).await,
+            throttled: None,
+        }
     }
 
     /// CIRISEdge#474 — the accord-quorum-evidence CURSOR serve reader. Answers an

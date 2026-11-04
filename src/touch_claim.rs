@@ -591,7 +591,7 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
     use ciris_persist::federation::types::{algorithm, identity_type, KeyRecord, SignedKeyRecord};
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
 
     /// Deterministic 32-byte seed for `label` — first ≤32 bytes over a
     /// `0x11` fill (matching edge's existing fixture shape).
@@ -626,7 +626,7 @@ mod tests {
 
     /// Register `signer`'s hybrid pubkeys as a federation key so its touch
     /// signatures verify against the pinned directory entry.
-    async fn register(backend: &Arc<MemoryBackend>, signer: &LocalSigner) {
+    async fn register(backend: &Arc<SqliteBackend>, signer: &LocalSigner) {
         let ed_pub = HardwareSigner::public_key(signer.classical.as_ref())
             .await
             .expect("ed25519 pubkey");
@@ -665,8 +665,8 @@ mod tests {
             .expect("register federation key");
     }
 
-    fn backend() -> Arc<MemoryBackend> {
-        Arc::new(MemoryBackend::new())
+    fn backend() -> Arc<SqliteBackend> {
+        Arc::new(ciris_persist::store::test_backend::test_backend())
     }
 
     // ── round-trip: produced signed_envelope == signing_envelope(), and

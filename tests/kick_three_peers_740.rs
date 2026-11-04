@@ -17,8 +17,9 @@
 //! (self-signed hybrid keys whose ids bind their pubkeys, a real persist
 //! directory per node holding every node's key row and each hub↔peer
 //! hybrid-signed route, Reticulum over loopback TCP, `ReplicationRuntime`s
-//! routing inbound frames through the #393 gate), D1 replicating with three
-//! rooted peers over 14 kinds, the self room installed on D1 and its sibling
+//! routing inbound frames through the #393 gate), D1 replicating with five
+//! rooted peers over the 8 scheduled kinds (three over 14 before persist v61
+//! retired six of the planes), the self room installed on D1 and its sibling
 //! device. It runs on a runtime built exactly as the node's —
 //! `max_blocking_threads(32)` — in its own thread, and the test thread holds a
 //! hard wall-clock timeout on it (a wedged runtime cannot fire its own timers,
@@ -72,9 +73,13 @@ use tokio::sync::mpsc;
 const MAX_BLOCKING_THREADS: usize = 32;
 /// edge_node's worker count.
 const WORKER_THREADS: usize = 4;
-/// The field's per-peer plane count: 3 × 14 = 42 > 32.
-const KINDS: usize = 14;
-const PEERS: usize = 3;
+/// The scheduled planes per peer. persist v61 (CIRISPersist#991) retired the
+/// framed group, listing, KeyGrant and operational planes, and the runtime
+/// never schedules a retired plane, so a node rounds on the eight that carry
+/// anything; five peers keep the fan-out above the 32-slot pool (5 × 8 = 40 >
+/// 32), where the field's 3 × 14 = 42 used to put it.
+const KINDS: usize = 8;
+const PEERS: usize = 5;
 /// The hard wall-clock bound the test thread holds on the whole scenario.
 const HARD_TIMEOUT: Duration = Duration::from_secs(240);
 
@@ -417,7 +422,11 @@ async fn scenario(stage: Arc<AtomicU8>, d1_metrics: EdgeMetrics) -> Outcome {
         );
         peer_seen.push(seen);
     }
-    let kinds = &EnvelopeKind::ALL[..KINDS];
+    let kinds: Vec<EnvelopeKind> = EnvelopeKind::ALL
+        .into_iter()
+        .filter(|k| !k.is_retired_plane())
+        .collect();
+    assert_eq!(kinds.len(), KINDS, "the scheduled planes");
     let d1_peers: Vec<ReplicationPeer> = peers
         .iter()
         .flat_map(|p| {
@@ -487,7 +496,7 @@ async fn scenario(stage: Arc<AtomicU8>, d1_metrics: EdgeMetrics) -> Outcome {
     }
 }
 
-/// **The witness.** Three rooted peers × 14 planes = 42 `(peer, kind)` rounds
+/// **The witness.** Five rooted peers × 8 planes = 40 `(peer, kind)` rounds
 /// on a `max_blocking_threads(32)` runtime: the start-up fan-out and a kick
 /// both finish, every round reaching its peer. Pre-fix (v34.3.0) the runtime
 /// wedges and the hard timeout fires.

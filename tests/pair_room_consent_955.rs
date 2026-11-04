@@ -31,6 +31,7 @@ use ciris_edge::replication::protocol::EnvelopeKind;
 use ciris_edge::replication::summary::ApplyOutcome;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
+use ciris_persist::federation::group_plane::GroupPlaneFamily;
 use ciris_persist::federation::{Attestation, FederationDirectory, SignedAttestation};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
@@ -181,14 +182,24 @@ async fn deliver_row(
 async fn carry_plane(
     from: &FederationDirectoryReplicationBridge,
     to: &FederationDirectoryReplicationBridge,
-    kind: EnvelopeKind,
+    family: GroupPlaneFamily,
 ) -> Vec<ApplyOutcome> {
+    // persist v61 (CIRISPersist#991) — a group's record and its membership
+    // events are rows of `family` on the Attestation plane; the framed planes
+    // are retired. Carry exactly that family's rows.
+    let kind = EnvelopeKind::Attestation;
     let mut out = Vec::new();
     for r in from.list_envelope_refs(kind).await {
         let bytes = from
             .fetch_envelope_bytes(kind, &r.envelope_hash)
             .await
             .expect("an advertised envelope is fetchable");
+        let Ok(row) = serde_json::from_slice::<Attestation>(&bytes) else {
+            continue;
+        };
+        if GroupPlaneFamily::of_row(&row) != Some(family) {
+            continue;
+        }
         out.push(to.apply_envelope_bytes(kind, &bytes, None).await);
     }
     out
@@ -295,7 +306,7 @@ async fn a_pair_room_is_joined_by_proposal_acceptance_and_widening_across_two_no
     );
 
     // 2. The room record and the proposal reach Bob's node through its doors.
-    assert!(carry_plane(&bridge_a, &bridge_b, EnvelopeKind::Community)
+    assert!(carry_plane(&bridge_a, &bridge_b, GroupPlaneFamily::Roster)
         .await
         .iter()
         .all(ApplyOutcome::is_admitted));
@@ -347,12 +358,7 @@ async fn a_pair_room_is_joined_by_proposal_acceptance_and_widening_across_two_no
     assert_eq!(roster(&dir_a, &room).await, want);
 
     // 4. The widening reaches Bob's node: both read Bob as a founder.
-    let applied = carry_plane(
-        &bridge_a,
-        &bridge_b,
-        EnvelopeKind::CommunityMembershipWidening,
-    )
-    .await;
+    let applied = carry_plane(&bridge_a, &bridge_b, GroupPlaneFamily::Widening).await;
     assert_eq!(applied.len(), 1, "one widening");
     assert!(applied[0].is_admitted(), "{:?}", applied[0]);
     assert_eq!(roster(&dir_b, &room).await, want, "bob's node reads it too");

@@ -559,8 +559,8 @@ pub const DEFERRED_PENDING_PLANE: &[(&str, &str)] = &[
     ),
     (
         "delivery durability",
-        "processed by messages GoalDeclaration::DELIVERY / GoalRetirement::DELIVERY; covered \
-      by the messages module tests.",
+        "processed by messages Withdraws::DELIVERY (Durable: TTL, attempts, persistence); \
+      pinned by tests/ceg_content_discipline.rs.",
     ),
     (
         "holder staleness/TTL + ContentMiss->withdraws",
@@ -1883,7 +1883,7 @@ mod tests {
 
     /// CIRISEdge#706 item 1 — **replay the CC vectors against edge's matcher.**
     ///
-    /// All 1147 published `(dimension, family, refusal)` triples (CC rc8.1), exact: a
+    /// All 1244 published `(dimension, family, refusal)` triples (CC rc15), exact: a
     /// matcher that answers differently from the reference on any one fails
     /// the build, every mismatch named. Edge's matcher is persist's — the
     /// full-match, refusal-bearing `namespace::matcher::match_family` of

@@ -353,10 +353,36 @@ fifth verb (a fifth `ReplicationMessage` variant) that closes this:
   BOTH testimonial axes: `list_attestations_for` (about-the-subject)
   and `list_attestations_by` (authored-by-the-subject, recovery).
 - **Entitlement — fail-closed.** The responder serves a subject's rows
-  ONLY to a requester authenticated AS that subject (owner-delegation
-  via `owner_of` is a follow-up). Every byte is re-gated by the
-  responder's per-record serve gate (`fetch_envelope_bytes_for_peer`),
-  so a `Pull` widens nothing.
+  in full ONLY to a requester authenticated AS that subject
+  (owner-delegation via `owner_of` is a follow-up). A third party sharing
+  a trust root gets the public planes (#552) and the subject's announced
+  testimony (#907, `FSD/FIRST_CONTACT.md` §2.3). Every byte is re-gated by
+  the responder's per-record serve gate (`fetch_envelope_bytes_for_peer`).
+- **A throttled answer says so (CIRISEdge#937).** A `Pull` the responder's
+  per-requester lookup limiter denied answers a `Summary` with empty
+  `refs` and two OPTIONAL members:
+
+  ```json
+  {"type":"summary","kind":"attestation","refs":[],
+   "status":"subject_pull_throttled","retry_after_secs":60}
+  ```
+
+  `status` is the stable marker. `retry_after_secs` is the lookup window,
+  a policy constant (`docs/FSD_RATE_LIMIT.md` D3). The requester sends no
+  further `Pull` on that plane to that peer until it runs out, and caps a
+  hint at one hour. Absent, the frame is byte-identical to a pre-v44
+  `Summary`; a pre-v44 peer ignores both members and reads the empty list
+  as before; a `status` a reader does not know reads as no status. Not a
+  version bump.
+- **Charged once (CIRISEdge#936).** A third-party lookup is charged once
+  per `(requester, subject, window)` however many kinds it asks on, and
+  on one of two per-requester budgets: the public planes (60/min) or
+  announced testimony (12/min), so background catch-up cannot spend a
+  lookup a person is waiting on. A lookup repeated past 24 answers in its
+  window is charged again.
+- **Driven on its own exchange.** The requester drives each `Pull` on a
+  round of its own, to the apply, as frames land
+  (`FSD/REPLICATION_ROUND_CORRELATION.md` §5.3).
 - **G2 carve.** Consent-gated peer-authored scores about the subject
   (persist `admission::consent_gated_claim` — the `capacity:*`
   reputation family) are withheld on the data-subject axis: landing a

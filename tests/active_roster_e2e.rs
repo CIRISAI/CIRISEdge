@@ -57,7 +57,6 @@
 use std::sync::Arc;
 
 use ciris_persist::federation::FederationDirectory;
-use ciris_persist::store::MemoryBackend;
 
 // ─── Assertion 1 — reachable through `dyn FederationDirectory` ──────
 
@@ -67,7 +66,7 @@ use ciris_persist::store::MemoryBackend;
 /// compile.
 #[tokio::test]
 async fn v9_3_0_active_reads_callable_through_dyn_trait() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let dir: Arc<dyn FederationDirectory> = backend.clone();
 
     // 1 + 2 — the two `list_*_for_member_active` inverse reads return
@@ -94,7 +93,7 @@ async fn v9_3_0_active_reads_callable_through_dyn_trait() {
 /// like the inverse).
 #[tokio::test]
 async fn active_members_invalid_argument_on_unknown_group() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let dir: Arc<dyn FederationDirectory> = backend.clone();
 
     let community_err = dir.active_community_members("no-such-community").await;

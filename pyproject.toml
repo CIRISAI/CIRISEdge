@@ -103,8 +103,10 @@ classifiers = [
 # with the MAJOR.
 # v56.0.0 (CIRISPersist#1001/#1077/#1089) moves none of the four (and
 # DIRECTORY_ABI_VERSION stays 7); the floor moves with the MAJOR.
+# v61.0.0 moves DIRECTORY_ABI_VERSION to 12 (the six framed group listings,
+# ApplyReplicatedCommunity and the member listing leave the capsule).
 dependencies = [
-    "ciris-persist>=59,<60",
+    "ciris-persist>=61,<62",
 ]
 dynamic = ["version"]
 

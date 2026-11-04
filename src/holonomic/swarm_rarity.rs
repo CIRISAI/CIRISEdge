@@ -266,7 +266,7 @@ impl FountainHoldingClaim {
     ///
     /// §19 re-export debt (CIRISEdge#359 F-4): the §19.3 signed preimage
     /// is owned by
-    /// [`ciris_verify_core::holonomic::fountain::FountainHoldingClaim::signing_preimage`]
+    /// [`ciris_verify_core::substrate::fountain::FountainHoldingClaim::signing_preimage`]
     /// (byte-frozen there by the §19.6 vectors). Edge's shape carries
     /// edge-only fields (the hybrid-signature trio, serde derives, the
     /// `Message` impl) so it cannot re-export verify's type wholesale;
@@ -276,7 +276,7 @@ impl FountainHoldingClaim {
     #[must_use]
     #[allow(clippy::cast_sign_loss)] // observed_at_unix_ms is a unix-ms timestamp; i64→u64 is bit-preserving and byte-identical.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        ciris_verify_core::holonomic::fountain::FountainHoldingClaim {
+        ciris_verify_core::substrate::fountain::FountainHoldingClaim {
             peer_id: self.peer_id.clone(),
             content_id: self.content_id.clone(),
             symbol_ids: self.symbol_ids.clone(),
@@ -341,14 +341,14 @@ impl FountainCompressRequest {
     ///
     /// §19 re-export debt (CIRISEdge#359 F-4): delegates the shared
     /// §19.3 preimage to
-    /// [`ciris_verify_core::holonomic::fountain::FountainCompressRequest::signing_preimage`]
+    /// [`ciris_verify_core::substrate::fountain::FountainCompressRequest::signing_preimage`]
     /// byte-for-byte (same rationale as
     /// [`FountainHoldingClaim::canonical_bytes`] — edge-only signature
     /// fields prevent a wholesale re-export).
     #[must_use]
     #[allow(clippy::cast_sign_loss)] // deadline_unix_ms is a unix-ms timestamp; i64→u64 is bit-preserving and byte-identical.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        ciris_verify_core::holonomic::fountain::FountainCompressRequest {
+        ciris_verify_core::substrate::fountain::FountainCompressRequest {
             peer_id: self.peer_id.clone(),
             content_id: self.content_id.clone(),
             evicting_range_low: self.evicting_range_low,
@@ -693,7 +693,7 @@ pub fn should_eject_with_diversity(
 
 /// **§19.7.3 (CEG 1.0-RC17)** — construct an
 /// [`EjectionVerdict::EjectAggregatedTierOnly`] for the named pyramid
-/// stratum. Mirrors `ciris_verify_core::holonomic::aggregation::eject_aggregated_tier`
+/// stratum. Mirrors `ciris_verify_core::substrate::aggregation::eject_aggregated_tier`
 /// at the verdict-shape boundary.
 ///
 /// Use this when applying targeted pressure to a single intermediate

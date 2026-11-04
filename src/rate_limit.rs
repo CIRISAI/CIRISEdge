@@ -94,7 +94,7 @@ pub enum Decision {
     /// Do not proceed. `reason` is for the RECEIVER's operator.
     ///
     /// Deliberately carries **no retry-after** (D3): callers must not compute
-    /// one for the limited party either.
+    /// one from the limiter's state for the limited party either.
     Deny { reason: DenyReason },
 }
 

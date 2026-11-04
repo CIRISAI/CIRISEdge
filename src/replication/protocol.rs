@@ -300,6 +300,23 @@ impl EnvelopeKind {
         ciris_persist::federation::replication_policy::RETIRED_FRAMED.contains(&self.persist_kind())
     }
 
+    /// persist v60.0.0 / v61 (CIRISPersist#991) — is this a RETIRED PLANE: a
+    /// framed kind persist retired whose session plane carries no row of its
+    /// own? The operational trio (v60), the six group-plane kinds, the member
+    /// listing and the framed `KeyGrant` (v61). Their objects travel as rows on
+    /// the Attestation plane (or, for the listing, not at all), so nothing is
+    /// advertised, point-read, held or scheduled on them, and an inbound object
+    /// is refused `federation_envelope_kind_retired`. The key-plane kinds are
+    /// retired framed too but still carry their family's row
+    /// ([`Self::key_plane_family`], [`Self::carries_occurrence_withdrawals`]),
+    /// so they are not retired planes.
+    #[must_use]
+    pub fn is_retired_plane(self) -> bool {
+        self.is_framed_retired()
+            && self.key_plane_family().is_none()
+            && !self.carries_occurrence_withdrawals()
+    }
+
     /// persist v59.0.0 — the key-plane row family this SESSION plane carries,
     /// or `None` for a plane that carries no key-plane row.
     ///
@@ -439,8 +456,10 @@ impl EnvelopeKind {
 
     /// CIRISEdge#474 — is this kind served over the dedicated CURSOR path
     /// (`CursorPull` → `Deliver`, resume on `evidence_at`) rather than the
-    /// content-hash Summary/Diff/Fetch flow? EXACTLY the kinds with no
-    /// `signed_wire_index` entry ([`Self::persist_index_kind`] → None). Currently only
+    /// content-hash Summary/Diff/Fetch flow? EXACTLY the kinds that carry
+    /// anything (a [retired plane](Self::is_retired_plane) carries nothing) and
+    /// have no `signed_wire_index` entry ([`Self::persist_index_kind`] → None).
+    /// Currently only
     /// [`Self::AccordQuorumEvidence`]; checked over `ALL` in a test — and the
     /// serve/advertise manifest's `advertise`/`receive` cursor cells are DERIVED
     /// from this predicate in `serve_policy`'s tests, so a future cursor kind
@@ -505,8 +524,16 @@ impl EnvelopeKind {
     /// persist indexes no framed key-plane object any more. The serve twin
     /// re-checks what the row is, so the point-read never serves another
     /// row on these planes.
+    ///
+    /// persist v61 — a [retired plane](Self::is_retired_plane) has no serve
+    /// basis at all: `None`, so a peer that names a framed group record's hash
+    /// on the retired `Community` plane is never handed it past the
+    /// Attestation plane's audience gate.
     #[must_use]
     pub fn persist_index_kind(self) -> Option<&'static str> {
+        if self.is_retired_plane() {
+            return None;
+        }
         Some(match self {
             // #848 — a key_grant set IS an attestation row: it is point-read
             // through persist's Attestation content-hash index, never one of
@@ -605,6 +632,36 @@ pub struct EnvelopeRef {
 pub struct SummaryMessage {
     pub kind: EnvelopeKind,
     pub refs: Vec<EnvelopeRef>,
+    /// CIRISEdge#937 — why `refs` is what it is, when it is not simply the
+    /// responder's holdings. `None` (the overwhelmingly common case, and the
+    /// only value a pre-v44 peer ever sends) means "these are my refs". A
+    /// `Summary` answering a subject `Pull` the responder THROTTLED carries
+    /// [`SummaryStatus::SubjectPullThrottled`], so the requester can tell
+    /// "nothing held" from "not answered this window" — before this field the
+    /// two were byte-identical (an empty `refs`).
+    ///
+    /// Flattened, so the wire reads `{"type":"summary",…,"status":
+    /// "subject_pull_throttled","retry_after_secs":60}` and `None` is
+    /// byte-identical to a pre-v44 Summary. A pre-v44 peer ignores the two
+    /// members (no `deny_unknown_fields` on this path); a status THIS build
+    /// does not know reads as `None`, so a later status cannot fail a Summary.
+    /// See FSD/REPLICATION_WIRE_FORMAT_V1.md §3.4.1.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SummaryStatus>,
+}
+
+/// CIRISEdge#937 — the status a [`SummaryMessage`] may carry beside its refs.
+/// The `status` string is the stable marker a requester (or a harness reading
+/// the wire) keys on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SummaryStatus {
+    /// The responder's per-requester lookup limiter denied this subject
+    /// `Pull`: the empty `refs` is a refusal, not a statement about what the
+    /// responder holds. `retry_after_secs` is the limiter's WINDOW LENGTH — a
+    /// public policy constant, never the requester's own refill horizon
+    /// (docs/FSD_RATE_LIMIT.md D3).
+    SubjectPullThrottled { retry_after_secs: u64 },
 }
 
 /// "I want these envelopes." Receiver's response to a `SummaryMessage`
@@ -837,10 +894,64 @@ mod tests {
         h
     }
 
+    /// CIRISEdge#937 — the wire shape, pinned: flat, keyed on the stable
+    /// marker; absent ⇒ byte-identical to a pre-v44 Summary; a pre-v44 reader
+    /// ignores it; a status this build does not know is no status, not a
+    /// refused frame.
+    #[test]
+    fn summary_status_is_flat_optional_and_tolerant_937() {
+        // The same struct without the field.
+        #[derive(Deserialize)]
+        struct PreV44Summary {
+            kind: EnvelopeKind,
+            refs: Vec<EnvelopeRef>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum PreV44 {
+            Summary(PreV44Summary),
+        }
+        let plain = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
+            kind: EnvelopeKind::Attestation,
+            refs: vec![],
+        });
+        assert_eq!(
+            std::str::from_utf8(&plain.to_bytes()).unwrap(),
+            r#"{"type":"summary","kind":"attestation","refs":[]}"#,
+            "no status ⇒ the pre-v44 bytes"
+        );
+        let throttled = ReplicationMessage::Summary(SummaryMessage {
+            status: Some(SummaryStatus::SubjectPullThrottled {
+                retry_after_secs: 60,
+            }),
+            kind: EnvelopeKind::Attestation,
+            refs: vec![],
+        });
+        let bytes = throttled.to_bytes();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["status"], "subject_pull_throttled");
+        assert_eq!(wire["retry_after_secs"], 60);
+        assert_eq!(ReplicationMessage::from_bytes(&bytes).unwrap(), throttled);
+
+        // A pre-v44 peer's reader.
+        let PreV44::Summary(old) = serde_json::from_slice::<PreV44>(&bytes).unwrap();
+        assert_eq!(old.kind, EnvelopeKind::Attestation);
+        assert!(old.refs.is_empty(), "an old peer reads the empty list");
+
+        let future =
+            br#"{"type":"summary","kind":"attestation","refs":[],"status":"a_later_status"}"#;
+        match ReplicationMessage::from_bytes(future).unwrap() {
+            ReplicationMessage::Summary(s) => assert_eq!(s.status, None),
+            other => panic!("not a Summary: {other:?}"),
+        }
+    }
+
     /// Round-trip — JSON-encoded then parsed yields the same value.
     #[test]
     fn summary_round_trips_via_json() {
         let m = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Attestation,
             refs: vec![
                 EnvelopeRef {
@@ -986,7 +1097,7 @@ mod tests {
             let bases = [kind.persist_index_kind().is_some(), kind.is_cursor_served()];
             assert_eq!(
                 bases.iter().filter(|b| **b).count(),
-                1,
+                usize::from(!kind.is_retired_plane()),
                 "{kind:?}: must be exactly one of content-hash-indexed / cursor-served \
                  (none when retired and carrying nothing), got {bases:?}"
             );
@@ -997,23 +1108,49 @@ mod tests {
     /// `RETIRED_FRAMED`, read through `persist_kind`, and each names the kind
     /// persist's `retired_detail` names it (the label edge's retired ledger
     /// books under). Three of them carry a key-plane row family; the fourth
-    /// carries the occurrence `withdraws`.
+    /// carries the occurrence `withdraws`. persist v60.0.0 (§8) adds the three
+    /// operational kinds, which carry nothing (an organisation is an
+    /// affiliation, on the attestation plane).
     #[test]
-    fn the_retired_framed_kinds_are_persists_four_v59() {
+    fn the_retired_framed_kinds_are_persists_fifteen_v61() {
         use ciris_persist::federation::replication_policy::{retired_detail, RETIRED_FRAMED};
         let retired: Vec<EnvelopeKind> = EnvelopeKind::ALL
             .into_iter()
             .filter(|k| k.is_framed_retired())
             .collect();
+        // persist v61 (CIRISPersist#991) — the six group-plane kinds, the
+        // framed KeyGrant and the member listing join: fifteen, all but
+        // Attestation, TransportDestination, LocationProof and
+        // AccordQuorumEvidence.
         assert_eq!(
             retired,
             vec![
                 EnvelopeKind::Key,
                 EnvelopeKind::Revocation,
                 EnvelopeKind::IdentityOccurrence,
+                EnvelopeKind::Family,
+                EnvelopeKind::Community,
                 EnvelopeKind::IdentityOccurrenceRevocation,
+                EnvelopeKind::FamilyMembershipRevocation,
+                EnvelopeKind::CommunityMembershipRevocation,
+                EnvelopeKind::Organization,
+                EnvelopeKind::OrgMembership,
+                EnvelopeKind::PartnerRecord,
+                EnvelopeKind::KeyGrant,
+                EnvelopeKind::CommunityMembershipWidening,
+                EnvelopeKind::FamilyMembershipWidening,
+                EnvelopeKind::CommunityMembershipListing,
             ]
         );
+        // A retired PLANE carries nothing; the four key-plane kinds still carry
+        // their rows.
+        for k in &retired {
+            assert_eq!(
+                k.is_retired_plane(),
+                k.key_plane_family().is_none() && !k.carries_occurrence_withdrawals(),
+                "{k:?}"
+            );
+        }
         assert_eq!(retired.len(), RETIRED_FRAMED.len());
         for k in &retired {
             assert_eq!(retired_detail(k.persist_kind()), k.as_wire_str());
@@ -1028,8 +1165,11 @@ mod tests {
             );
             assert_eq!(
                 k.key_plane_family().is_some(),
-                k.is_framed_retired() && k != EnvelopeKind::IdentityOccurrenceRevocation,
-                "{k:?}: only a retired kind carries a key-plane row family"
+                matches!(
+                    k,
+                    EnvelopeKind::Key | EnvelopeKind::Revocation | EnvelopeKind::IdentityOccurrence
+                ),
+                "{k:?}: exactly the three retired key-plane kinds carry a row family"
             );
         }
     }
@@ -1164,7 +1304,11 @@ mod tests {
             };
             // The serde rename, the manifest key, and the pin all agree.
             assert_eq!(kind.as_wire_str(), wire, "{kind:?}: as_wire_str drifted");
-            let m = ReplicationMessage::Summary(SummaryMessage { kind, refs: vec![] });
+            let m = ReplicationMessage::Summary(SummaryMessage {
+                status: None,
+                kind,
+                refs: vec![],
+            });
             let bytes = m.to_bytes();
             let s = std::str::from_utf8(&bytes).unwrap();
             let cell = format!(r#""kind":"{wire}""#);

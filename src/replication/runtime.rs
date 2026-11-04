@@ -187,7 +187,6 @@ fn build_bridge(
         )
         .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
         .with_consent_subjects(config.consent_subject_key_ids.clone())
-        .with_consent_gated_routes(config.consent_gated_routes)
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
         // legs live (leg A ∧ leg B against this node's own trust base), the
         // owner-conferred rung fail-closed pending CIRISPersist#788. Installed
@@ -834,12 +833,6 @@ pub struct ReplicationRuntimeConfig {
     /// Empty (the default) falls back to `local_key_id`: correct wherever the
     /// agent and the node are one key.
     pub consent_subject_key_ids: Vec<String>,
-    /// CONSENT-GATED ROUTES (Eric 2026-10-30): serve a relayed route about an
-    /// owned node only to a peer its owner consented to. `false` by default.
-    ///
-    /// TODO(CIRISPersist#1165): default it on once a relay can hold contact
-    /// grants (see `FederationDirectoryReplicationBridge::with_consent_gated_routes`).
-    pub consent_gated_routes: bool,
     /// CIRISEdge#640 — everything a node needs to OPEN sealed content it did
     /// not seal, wired as ONE value (see [`SealedContentWiring`]): the engine
     /// that projects key-grant wraps into grants for this node's occurrences,
@@ -912,6 +905,37 @@ pub const BOOTSTRAP_ROUND_PLANES: [EnvelopeKind; 5] = [
     EnvelopeKind::Revocation,
     EnvelopeKind::IdentityOccurrenceRevocation,
 ];
+
+/// persist v60.0.0 / v61 (CIRISPersist#991) — drop every `(peer, kind)` on a
+/// [retired plane](EnvelopeKind::is_retired_plane). A host that still names one
+/// (the framed `Community` / `Family` / membership planes, the member listing,
+/// the framed `KeyGrant`, the operational trio) would otherwise get a
+/// coordinator per pair that lists nothing and refuses everything it is
+/// offered — a round of transport spent on a plane persist retired. Their rows
+/// ride the Attestation plane. Each dropped pair is logged once
+/// ([`note_retired_plane_skipped`]).
+fn without_retired_planes(peers: Vec<ReplicationPeer>) -> Vec<ReplicationPeer> {
+    peers
+        .into_iter()
+        .filter(|p| {
+            let retired = p.kind.is_retired_plane();
+            if retired {
+                note_retired_plane_skipped(&p.peer_key_id, p.kind);
+            }
+            !retired
+        })
+        .collect()
+}
+
+/// The one log line a skipped retired-plane peer gets.
+fn note_retired_plane_skipped(peer_key_id: &str, kind: EnvelopeKind) {
+    tracing::info!(
+        peer = peer_key_id,
+        kind = kind.as_wire_str(),
+        "replication peer on a RETIRED plane not scheduled: persist retired its framed \
+         carriage and its rows ride the Attestation plane (history: CIRISPersist#991)"
+    );
+}
 
 /// CIRISEdge#881 — the initiator peers the bundle's seated serve nodes
 /// (`serve_nodes`, the baked canonical ids) add: each on every
@@ -1202,7 +1226,7 @@ impl ReplicationRuntime {
                 config.local_key_id.as_deref(),
             )
         };
-        let peers = merge_peers(peers, &bundle_peers);
+        let peers = without_retired_planes(merge_peers(peers, &bundle_peers));
         if !bundle_peers.is_empty() {
             tracing::info!(
                 serve_nodes = bundle_peers.len() / BOOTSTRAP_ROUND_PLANES.len(),
@@ -1470,6 +1494,11 @@ impl ReplicationRuntime {
         kind: EnvelopeKind,
     ) -> Result<(), ReplicationRuntimeError> {
         let peer_key_id = peer_key_id.into();
+        // persist v61 — a retired plane carries nothing; it is never scheduled.
+        if kind.is_retired_plane() {
+            note_retired_plane_skipped(&peer_key_id, kind);
+            return Ok(());
+        }
         let key = (peer_key_id.clone(), kind);
 
         {
@@ -1494,9 +1523,13 @@ impl ReplicationRuntime {
     /// `subject_key_id`'s own testimony (and testimony ABOUT it) from
     /// `peer_key_id`. For each subject-pullable kind (the five replicated planes)
     /// this ensures a scheduled Initiator coordinator exists — so the reply's
-    /// drive loop is live — then sends a `Pull`. The peer answers with the
-    /// subject's refs (projection-gated + G2-carved by its `subject_holdings`),
-    /// and the node pulls the gap through the ordinary Diff/Deliver flow.
+    /// peer is known to the scheduler — then runs a Pull on an exchange of its
+    /// own ([`ReplicationCoordinator::pull_exchange`](super::coordinator::ReplicationCoordinator::pull_exchange)).
+    /// The peer answers with the subject's refs (projection-gated + G2-carved by
+    /// its `subject_holdings`), and the gap is fetched and applied in that
+    /// exchange, on the frames' own time and never on a round's. A plane the
+    /// peer throttled sends nothing until its hint runs out
+    /// ([`Self::subject_pull_retry_after`]).
     ///
     /// This is the mechanism the observation in #462 needs: a fedID that claimed
     /// a fresh node cannot otherwise obtain its own keys / occurrences / routes /
@@ -1695,6 +1728,19 @@ impl ReplicationRuntime {
         })
     }
 
+    /// CIRISEdge#937 — seconds left before `peer_key_id` will answer a subject
+    /// Pull again, on the plane it throttled longest; `None` when no plane is.
+    /// What a host reads to say "looking…" instead of "not found".
+    pub async fn subject_pull_retry_after(&self, peer_key_id: &str) -> Option<u64> {
+        let mut longest = None;
+        for kind in EnvelopeKind::subject_pullable() {
+            if let Some(coord) = self.registry.get_initiator(peer_key_id, kind).await {
+                longest = longest.max(coord.pull_retry_after_secs());
+            }
+        }
+        longest
+    }
+
     pub async fn pull_subject_testimony(
         &self,
         peer_key_id: &str,
@@ -1706,7 +1752,10 @@ impl ReplicationRuntime {
             // consumes the Pull's Summary reply.
             self.register_initiator_peer(peer_key_id, kind).await?;
             if let Some(coord) = self.registry.get_initiator(peer_key_id, kind).await {
-                if let Err(e) = coord.start_pull(subject_key_id).await {
+                if let Err(e) = coord
+                    .pull_exchange(subject_key_id, self.config.scheduler.round_timeout)
+                    .await
+                {
                     tracing::warn!(
                         peer = %peer_key_id,
                         subject = %subject_key_id,
@@ -1881,6 +1930,45 @@ impl ReplicationRuntime {
         self.bridge.release_bound_signer(kind, envelope_bytes)
     }
 
+    /// v44 (CIRISConstitution#198 §5) — a receiver of every later
+    /// decision-relevant-row event ([`crate::decision_rows`]). Nothing fires
+    /// while the node is suspended; rebuild from the last cursor with
+    /// [`crate::decision_rows::decision_rows_since`] on resume.
+    #[must_use]
+    pub fn subscribe_decision_rows(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::decision_rows::DecisionRowRef> {
+        self.bridge.subscribe_decision_rows()
+    }
+
+    /// v44 — the host wrote `row` locally: emit its decision-row event and
+    /// carry it to every peer now. `written_after` is an instant taken
+    /// before the write. See
+    /// [`FederationDirectoryReplicationBridge::note_local_write`].
+    pub async fn note_local_write(
+        &self,
+        row: &ciris_persist::federation::Attestation,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Option<crate::decision_rows::DecisionRowRef> {
+        self.bridge.note_local_write(row, written_after).await
+    }
+
+    /// v44 — the host wrote rows persist minted (a `put_*` roster door):
+    /// emit an event for every decision-relevant row served since
+    /// `written_after`, and carry them now. See
+    /// [`FederationDirectoryReplicationBridge::note_local_writes_since`].
+    ///
+    /// # Errors
+    /// persist's read failure.
+    pub async fn note_local_writes_since(
+        &self,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::decision_rows::DecisionRowRef>, ciris_persist::federation::Error> {
+        self.bridge
+            .note_local_writes_since(written_after, None)
+            .await
+    }
+
     /// The runtime's bridge. Useful for telemetry or tests that
     /// want to inspect cache state.
     pub fn bridge(&self) -> Arc<FederationDirectoryReplicationBridge> {
@@ -1961,7 +2049,6 @@ mod tests {
     }
 
     use super::*;
-    use ciris_persist::store::MemoryBackend;
     use std::sync::Arc;
 
     /// CIRISEdge#853 (Codex round two on #854) — a frame naming a NEW round
@@ -2064,7 +2151,7 @@ mod tests {
         use super::super::protocol::{ReplicationMessage, SummaryMessage};
         use super::super::registry::RouteOutcome;
 
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let sent = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let transport: Arc<dyn Transport> = Arc::new(RecordingTransport {
@@ -2078,6 +2165,7 @@ mod tests {
 
         let round_open =
             super::super::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
@@ -2119,7 +2207,7 @@ mod tests {
     /// the scheduler task; `shutdown` exits cleanly.
     #[tokio::test]
     async fn empty_peer_set_starts_and_shuts_down_cleanly() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2132,7 +2220,7 @@ mod tests {
     /// registry handle the listen loop would use.
     #[tokio::test]
     async fn one_initiator_peer_registered_at_start() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let peers = vec![ReplicationPeer {
@@ -2155,7 +2243,7 @@ mod tests {
     /// no longer defaults to a passive Responder).
     #[tokio::test]
     async fn register_peer_hot_adds() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2172,7 +2260,7 @@ mod tests {
     /// registry. Distinct from `register_peer` (Responder-only).
     #[tokio::test]
     async fn register_initiator_peer_hot_adds_initiator_role() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2200,7 +2288,7 @@ mod tests {
     /// registry. Idempotent.
     #[tokio::test]
     async fn remove_peer_drops_initiator_and_deregisters() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2226,7 +2314,7 @@ mod tests {
     /// a non-empty pre-existing set.
     #[tokio::test]
     async fn set_peers_diff_converges() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let initial = vec![
@@ -2277,7 +2365,7 @@ mod tests {
     /// `shutdown` is idempotent.
     #[tokio::test]
     async fn shutdown_is_idempotent() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2379,7 +2467,7 @@ mod tests {
             registries: &Registries,
             ledger: &Ledger,
         ) -> (ReplicationRuntime, EdgeMetrics) {
-            let backend = Arc::new(MemoryBackend::new());
+            let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
             let directory: Arc<dyn FederationDirectory> = backend;
             let transport: Arc<dyn Transport> = Arc::new(Loopback {
                 me: name.to_string(),

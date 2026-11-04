@@ -61,6 +61,9 @@ pub mod contact;
 pub mod content_occurrence;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
+/// v44 (CIRISConstitution#198 §5) — which decision-relevant rows landed, as
+/// an event and a rebuildable cursor; the queue itself is the host's.
+pub mod decision_rows;
 pub mod delivery_mode;
 pub mod detector;
 /// CIRISEdge#683 — first contact on the opaque plane (`FSD/FIRST_CONTACT.md` §2.2).
@@ -104,6 +107,7 @@ pub mod handler;
 pub mod holonomic;
 pub mod identity;
 pub mod key_boundary;
+pub mod load_ladder;
 pub mod log_throttle;
 pub mod manifest;
 /// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — nobody joins a
@@ -396,19 +400,18 @@ pub use key_boundary::{
     KeyBoundaryParseError, KeyBoundaryScope, KEY_BOUNDARY_PREFIX, KEY_BOUNDARY_SUFFIX,
     LEGACY_NO_SEED_IN_HEAP,
 };
+pub use load_ladder::{LoadPressure, ServiceTier};
 pub use messages::{
     is_federation_attestation_emitting_type, AccordCarrier, AccordSignature, AnnouncementKind,
     AnnouncementPriority, AttestationGossip, AttestationRef, AuthorityClass,
     BuildManifestPublication, BuildManifestPublicationResponse, ContentBody, ContentFetch,
     ContentMiss, DSARRequest, DSARResponse, DeliveryAttestation, DeliveryAttestationError,
-    DeliveryRefusalAttestation, EdgeEnvelope, FederationAnnouncement, GoalDeclaration,
-    GoalDeclarationResponse, GoalRetirement, GoalRetirementResponse, HintShape, Introductions,
+    DeliveryRefusalAttestation, EdgeEnvelope, FederationAnnouncement, HintShape, Introductions,
     MessageType, MissReason, OpaqueEvent, OpaqueRequest, OpaqueResponse, PublicKeyRegistration,
     PublicKeyRegistrationResponse, RefusalReason, SchemaVersion, StewardDirective,
     TestimonialWitness, TransportMedium, WithdrawalReason, Withdraws, ACCORD_THRESHOLD_M_OF_N,
     DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
     DELIVERY_REFUSAL_ATTESTATION_DOMAIN, FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN,
-    GOAL_DECLARATION_DOMAIN, GOAL_RETIREMENT_DOMAIN,
 };
 pub use mls::{
     unwrap_welcome, wrap_welcome, ArchiveMode, ArchiveModeError, FederationDirectoryEntry,

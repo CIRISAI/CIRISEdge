@@ -320,7 +320,7 @@ mod tests {
         algorithm, identity_type, Attestation, KeyRecord, SignedAttestation, SignedKeyRecord,
     };
     use ciris_persist::federation::{record_mesh_config_row, MeshConfigOutcome};
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
     use sha2::{Digest as _, Sha256};
 
     // ── Field-provenance fixtures — the same deterministic hybrid-signing
@@ -366,7 +366,7 @@ mod tests {
         (hash, B64.encode(&ed_sig), Some(B64.encode(&pqc_sig)))
     }
 
-    async fn seed_key(backend: &MemoryBackend, key_id: &str) {
+    async fn seed_key(backend: &SqliteBackend, key_id: &str) {
         let now = Utc::now();
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         let record = KeyRecord {
@@ -419,8 +419,11 @@ mod tests {
         let Some(obj) = envelope.as_object_mut() else {
             return;
         };
-        obj.entry("asserted_at")
-            .or_insert_with(|| serde_json::json!(asserted_at.to_rfc3339()));
+        obj.entry("asserted_at").or_insert_with(|| {
+            serde_json::json!(ciris_persist::federation::admission::render_signed_instant(
+                asserted_at
+            ))
+        });
         let mut row = serde_json::json!({
             "attestation_id": attestation_id,
             "attesting_key_id": attesting_key_id,
@@ -443,7 +446,7 @@ mod tests {
         use chrono::SubsecRound as _;
         // #598: the fold orders on the `asserted_at` COLUMN, so bind that instant
         // (µs-truncated) + the #643 `row` mirror into the envelope before signing.
-        let now = Utc::now().trunc_subsecs(6);
+        let now = Utc::now().trunc_subsecs(3);
         let attestation_id = uuid::Uuid::new_v4().to_string();
         bind_attestation_envelope(
             &mut envelope,
@@ -483,7 +486,7 @@ mod tests {
 
     /// The subscription edge: `delegates_to(node → root)` — "the trust edge is
     /// the subscription" (persist's `trusted_roots_of`).
-    async fn seed_subscription(backend: &MemoryBackend, node: &str, root: &str) {
+    async fn seed_subscription(backend: &SqliteBackend, node: &str, root: &str) {
         let envelope = serde_json::json!({
             "attesting_key_id": node,
             "attested_key_id": root,
@@ -530,7 +533,7 @@ mod tests {
         MeshConfigReader::baseline_for(Duration::from_secs(30), u32::MAX)
     }
 
-    async fn reader_over(backend: &Arc<MemoryBackend>) -> MeshConfigReader {
+    async fn reader_over(backend: &Arc<SqliteBackend>) -> MeshConfigReader {
         let dir: Arc<dyn FederationDirectory> = Arc::clone(backend) as _;
         MeshConfigReader::new(dir, "node-local".to_string(), baseline()).with_ttl(Duration::ZERO)
     }
@@ -540,7 +543,7 @@ mod tests {
     /// absence contract every consumer's `None` arm rides on.
     #[tokio::test]
     async fn absence_resolves_to_relief_none_exactly() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_key(&backend, "node-local").await;
         seed_key(&backend, "root-1").await;
         seed_subscription(&backend, "node-local", "root-1").await;
@@ -555,7 +558,7 @@ mod tests {
     /// shrinks the page.
     #[tokio::test]
     async fn admitted_relief_changes_cadence_and_page_limit() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_key(&backend, "node-local").await;
         seed_key(&backend, "root-1").await;
         seed_subscription(&backend, "node-local", "root-1").await;
@@ -590,7 +593,7 @@ mod tests {
     /// shows up as a crossed assertion rather than as a passing test.
     #[tokio::test]
     async fn admitted_redundancy_rows_populate_each_swarm_field_separately() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_key(&backend, "node-local").await;
         seed_key(&backend, "root-1").await;
         seed_subscription(&backend, "node-local", "root-1").await;
@@ -633,7 +636,7 @@ mod tests {
     /// holds for rows that arrive on the replication plane") flip both pauses.
     #[tokio::test]
     async fn replicated_feature_rows_flip_the_pauses() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_key(&backend, "node-local").await;
         seed_key(&backend, "root-1").await;
         seed_subscription(&backend, "node-local", "root-1").await;
@@ -663,7 +666,7 @@ mod tests {
     /// consumer keeps its configured cadence.
     #[tokio::test]
     async fn expansion_clamps_to_baseline_and_is_not_relief() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_key(&backend, "node-local").await;
         seed_key(&backend, "root-1").await;
         seed_subscription(&backend, "node-local", "root-1").await;
@@ -690,7 +693,7 @@ mod tests {
     /// count — "the trust edge is the subscription."
     #[tokio::test]
     async fn unsubscribed_root_rows_do_not_count() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_key(&backend, "node-local").await;
         seed_key(&backend, "root-stranger").await;
         // NO delegates_to(node → root-stranger).
@@ -713,7 +716,7 @@ mod tests {
     /// the window is invisible until expiry); TTL zero re-reads every call.
     #[tokio::test]
     async fn snapshot_ttl_bounds_the_re_read() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_key(&backend, "node-local").await;
         seed_key(&backend, "root-1").await;
         seed_subscription(&backend, "node-local", "root-1").await;

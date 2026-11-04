@@ -593,13 +593,6 @@ pub enum WithholdReason {
     /// Distinct from [`Self::IdentityRowNodeNotAnnounced`] so an operator is
     /// sent to the directory, not to the announce wizard.
     IdentityRowAnnounceUnresolved,
-    /// Eric 2026-10-30 (CONSENT-GATED ROUTES) — a relayed
-    /// `TransportDestination` row about an owned node, asked for by a peer
-    /// its owner has not consented to: no live `consent:replication` grant
-    /// authored by the node's owner names the peer or the peer's owner. A
-    /// contact request crosses through the canonical; only after consent does
-    /// the requester get the route that lets it dial direct.
-    RouteNotConsented,
     /// CIRISEdge#758 (CC 5.4.6) — a `Family` / `Community` RECORD asked for (on
     /// the advertise or the direct-fetch twin) by a peer whose person
     /// (`owner_of(peer)`, the peer itself when unowned) is neither a live
@@ -608,6 +601,9 @@ pub enum WithholdReason {
     /// hides a group's existence and membership from outsiders; a founder's
     /// node offering the record to every peer disclosed both. Not a fault —
     /// the peer is outside the group. `detail` names the plane and the site.
+    /// persist v61 (CIRISPersist#991): the record and its membership events are
+    /// `group:roster:v1` / `membership:*:v1` rows on the Attestation plane;
+    /// this is their withhold there.
     GroupRecordNotMemberOrInvitee,
 }
 
@@ -667,7 +663,6 @@ impl WithholdReason {
             Self::LxmfRetentionExpired => "lxmf_retention_expired",
             Self::IdentityRowNodeNotAnnounced => "identity_row_node_not_announced",
             Self::IdentityRowAnnounceUnresolved => "identity_row_announce_unresolved",
-            Self::RouteNotConsented => "route_not_consented",
             Self::GroupRecordNotMemberOrInvitee => "group_record_not_member_or_invitee",
         }
     }
@@ -921,9 +916,106 @@ pub const AV_CALL_FRAME_UNOPENED: &str = "av_call_frame_unopened";
 pub const AV_CALL_FRAME_NO_KEY: &str = "av_call_frame_no_key";
 /// CIRISEdge#805 item 5 — a call frame this node relayed to a member.
 pub const AV_CALL_RELAYED: &str = "av_call_relayed";
+/// CIRISEdge#805 — a call chunk whose source signature did not verify under
+/// its stream's bound chunk key (or carried none): not the publisher's,
+/// dropped and never relayed.
+pub const AV_CALL_FRAME_FORGED: &str = "av_call_frame_forged";
+/// CIRISEdge#805 — a call chunk for a `(stream, epoch)` with no verified
+/// chunk-key binding: dropped and never relayed.
+pub const AV_CALL_FRAME_UNBOUND: &str = "av_call_frame_unbound";
+/// CIRISEdge#805 — a stream's chunk-key binding verified (the publisher's
+/// hybrid signature) and installed.
+pub const AV_CALL_BINDING_INSTALLED: &str = "av_call_binding_installed";
+/// CIRISEdge#805 — a chunk-key binding refused (malformed, another room, not
+/// the publisher's stream, not a member, or a bad hybrid signature).
+pub const AV_CALL_BINDING_REFUSED: &str = "av_call_binding_refused";
 /// CIRISEdge#805 item 6 — this attendee's call row was refused; the call
 /// stays live.
 pub const AV_CALL_RECORD_REFUSED: &str = "av_call_record_refused";
+
+// ─── ALM stage 2 — `EdgeMetrics::av_plane` labels ────────────────────
+
+/// leviculum#94 — a media frame sent with a deadline (a timed Channel frame).
+pub const AV_SENT_TIMED: &str = "av_sent_timed";
+/// leviculum#94 — a media frame that fills its Channel and so cannot carry
+/// the 10-byte timed wrapper: sent untimed.
+pub const AV_SENT_UNTIMED_FULL: &str = "av_sent_untimed_full";
+/// leviculum#94 — this node's timed media frame passed its deadline
+/// unconfirmed (an expired marker went in its place).
+pub const AV_FRAME_EXPIRED_SENDER: &str = "av_frame_expired_sender";
+/// leviculum#94 — a peer's timed frame arrived as its expired marker.
+pub const AV_FRAME_EXPIRED_MARKED: &str = "av_frame_expired_marked";
+/// leviculum#94 — a peer's timed frame arrived past its time to live and was
+/// dropped, not delivered late.
+pub const AV_FRAME_EXPIRED_LATE: &str = "av_frame_expired_late";
+/// ALM C5 — a media frame older than its class budget dropped from the
+/// inbound queue by age (oldest first) before it was opened.
+pub const AV_FRAME_STALE_DROPPED: &str = "av_frame_stale_dropped";
+/// #591 — a chunk a leg refused under backpressure: dropped for that leg,
+/// never queued. `av_send_congested` also counts control-frame retries; this
+/// counts media actually lost to it.
+pub const AV_CHUNK_DROPPED_CONGESTED: &str = "av_chunk_dropped_congested";
+/// ALM C5 — a leg shed to the base layer after sustained congestion.
+pub const AV_LEG_SHED_TO_BASE: &str = "av_leg_shed_to_base";
+/// ALM C5 — a leg restored from the base layer after clean sends.
+pub const AV_LEG_RESTORED: &str = "av_leg_restored";
+/// ALM C3 — a control frame sent / received / refused as malformed.
+pub const ALM_C3_SENT: &str = "alm_c3_sent";
+/// ALM C3 — a control frame that could not be sent to its member.
+pub const ALM_C3_SEND_FAILED: &str = "alm_c3_send_failed";
+/// ALM C3 — a must-arrive control frame delivered by a resend after the
+/// link refused it.
+pub const ALM_C3_RESENT: &str = "alm_c3_resent";
+/// ALM C3 — a control frame received and applied.
+pub const ALM_C3_RECEIVED: &str = "alm_c3_received";
+/// ALM C3 — a frame that read as C3 and did not decode.
+pub const ALM_C3_MALFORMED: &str = "alm_c3_malformed";
+/// ALM C3 — a peer said it speaks C3 (its `CAPS`).
+pub const ALM_C3_PEER_CAPABLE: &str = "alm_c3_peer_capable";
+/// ALM C2 — a subscribe admitted / refused at this node.
+pub const ALM_ADMIT: &str = "alm_admit";
+/// ALM C2 — a subscribe refused at this node (the token is counted too).
+pub const ALM_REFUSE: &str = "alm_refuse";
+/// ALM C2 — a subscriber shed by this node.
+pub const ALM_SHED: &str = "alm_shed";
+/// ALM — a chunk this node forwarded as an admitted media parent.
+pub const ALM_FORWARDED: &str = "alm_forwarded";
+/// ALM C4 — this node's primary parent for a stream changed.
+pub const ALM_PARENT_CHANGE: &str = "alm_parent_change";
+/// FSD CIRIS_MESH R2 — an identity link established through a roster relay.
+pub const ALM_RELAY_TIER_ROSTER: &str = "alm_relay_tier_roster";
+/// FSD CIRIS_MESH R2 — a roster relay's one attempt did not establish.
+pub const ALM_RELAY_TIER_ROSTER_FAILED: &str = "alm_relay_tier_roster_failed";
+/// FSD CIRIS_MESH R2 — no roster relay established: the default path (last
+/// tier) was dialled.
+pub const ALM_RELAY_TIER_DEFAULT: &str = "alm_relay_tier_default";
+/// `FSD/CIRIS_MESH.md` §7.4 — one `load_ledger` cost entry.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct LoadLedgerEntry {
+    /// What it is: a forwarded link id (hex), a stream, or a peer.
+    pub subject: String,
+    /// Bits/s.
+    pub bps: f64,
+    /// Packets/s.
+    pub pps: f64,
+}
+
+/// `FSD/CIRIS_MESH.md` §7.4 — the `load_ledger` metrics family: the top cost
+/// entries this node carries, so shedding never sheds blind.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct LoadLedger {
+    /// The service tier now (0, 1, 2).
+    pub tier: u8,
+    /// Total forwarded packets/s.
+    pub transit_pps: f64,
+    /// Total forwarded bits/s.
+    pub transit_bps: f64,
+    /// The costliest forwarded links, most packets/s first (top 10).
+    pub transit: Vec<LoadLedgerEntry>,
+    /// The ladder's token counters (`load_tier:*` and their causes).
+    pub counters: std::collections::BTreeMap<String, u64>,
+}
+
 // ─── CC 5.3.3.5 E1 — `EdgeMetrics::link_seal` labels ─────────────────
 //
 // Every RNS link carries the CC 3.3.6.2 hybrid transit KEX as its first frame
@@ -1159,6 +1251,9 @@ pub const DIRECT_LINK_SKIPPED_NEIGHBOUR: &str = "direct_link_skipped_neighbour";
 /// No proposal: the member's last proposal failed and is backing off (or was
 /// refused on this link).
 pub const DIRECT_LINK_SKIPPED_BACKOFF: &str = "direct_link_skipped_backoff";
+/// v44 (leviculum#96) — this node wanted to propose on a link it did not
+/// initiate and left the proposal to the initiator (the glare tie-break).
+pub const DIRECT_LINK_YIELDED: &str = "direct_link_yielded";
 /// No proposal: no identity link to the member could be had.
 pub const DIRECT_LINK_SKIPPED_NO_LINK: &str = "direct_link_skipped_no_link";
 /// A peer's direct-link request, accepted: it shares a room with this node.
@@ -1181,6 +1276,50 @@ pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
 /// A direct A/V leg's path was judged gone and the leg fell back
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
+
+// ─── CIRISEdge#930 — `EdgeMetrics::key_plane_sweep` labels ──────────────
+//
+// The four per-subject key-plane listings (Key, IdentityOccurrence,
+// Revocation, IdentityOccurrenceRevocation) answer from a per-subject memo
+// invalidated by the store's admission cursor. Each listing books what it
+// cost, so a sweep that starts reading every subject again names itself.
+
+/// Key-plane listings answered (one per plane per peer round).
+pub const KEY_PLANE_LISTINGS: &str = "key_plane_listings";
+/// Listings that read the store for at least one subject.
+pub const KEY_PLANE_SWEEPS: &str = "key_plane_sweeps";
+/// Subjects read from the store (each is one to several persist reads).
+pub const KEY_PLANE_SUBJECT_READS: &str = "key_plane_subject_reads";
+/// Subjects answered from the memo, no store read.
+pub const KEY_PLANE_MEMO_HITS: &str = "key_plane_memo_hits";
+/// Subject reads the store did not serve (warned, not memoized, retried).
+pub const KEY_PLANE_READ_FAILURES: &str = "key_plane_read_failures";
+/// Wall-clock milliseconds spent in listings that read the store.
+pub const KEY_PLANE_SWEEP_MS: &str = "key_plane_sweep_ms";
+/// Change-probe pages read (`list_attestations_since` from the memo cursor).
+pub const KEY_PLANE_PROBE_READS: &str = "key_plane_probe_reads";
+/// Rows the change probe read.
+pub const KEY_PLANE_PROBE_ROWS: &str = "key_plane_probe_rows";
+/// Change probes the store did not serve (the memo was forgotten).
+pub const KEY_PLANE_PROBE_FAILURES: &str = "key_plane_probe_failures";
+/// Memoized answers dropped because a new row could change them.
+pub const KEY_PLANE_INVALIDATED: &str = "key_plane_invalidated";
+/// Memo rebuilds (first use, the TTL, or after a failed probe).
+pub const KEY_PLANE_REBUILDS: &str = "key_plane_rebuilds";
+
+// ─── CIRISEdge#926 — `EdgeMetrics::link_stall` labels ─────────────────
+//
+// The link stall guard (`transport::link_stall`): a Channel send that landed
+// nothing because the peer acknowledged nothing, and what the guard did once
+// a link's run of them made it dead.
+
+/// One Channel send landed zero fragments: the window never opened.
+pub const LINK_STALL_ZERO_LANDED_SEND: &str = "link_stall_zero_landed_send";
+/// A link judged dead was closed; the next send dials a fresh one.
+pub const LINK_STALL_CLOSED: &str = "link_stall_closed";
+/// A link judged dead on a punched interface was moved back onto its relayed
+/// path (leviculum#83 `retire_direct_link`) instead of closed.
+pub const LINK_STALL_RETIRED_DIRECT: &str = "link_stall_retired_direct";
 
 // ─── v43 InvalidProof triage — `EdgeMetrics::peer_binding` labels ──────
 //
@@ -1547,6 +1686,15 @@ pub struct EdgeMetrics {
     /// (`PEER_BINDING_*` constants in this module): wrong keys healed,
     /// corrected at dial, refused at prime, and proofs that failed.
     pub peer_binding: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#930 — the key-plane listings' cost ledger, by label
+    /// (`KEY_PLANE_*` constants in this module): listings, store sweeps,
+    /// subject reads, memo hits, change-probe reads and rows, invalidations,
+    /// rebuilds and the wall time spent reading.
+    pub key_plane_sweep: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#926 — the link stall guard by label (`LINK_STALL_*`
+    /// constants in this module): zero-landing Channel sends, and the dead
+    /// links it closed or moved off a punched path.
+    pub link_stall: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — peers with a direct path now, per reporting
     /// transport (keyed by its metrics source id, like `link_pool_sizes`).
     /// Read as [`Self::direct_links_active`] (the sum).
@@ -2256,6 +2404,21 @@ impl EdgeMetrics {
             .collect()
     }
 
+    /// CIRISEdge#926 — count one link-stall event by its `LINK_STALL_*` label.
+    pub fn inc_link_stall(&self, label: &'static str) {
+        *self.link_stall.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#926 — the link-stall ledger by label.
+    #[must_use]
+    pub fn link_stall(&self) -> HashMap<String, u64> {
+        self.link_stall
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
     /// Count one peer-binding event by its `PEER_BINDING_*` label.
     pub fn inc_peer_binding(&self, label: &'static str) {
         *self.peer_binding.write().entry(label).or_insert(0) += 1;
@@ -2265,6 +2428,23 @@ impl EdgeMetrics {
     #[must_use]
     pub fn peer_binding(&self) -> HashMap<String, u64> {
         self.peer_binding
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#930 — add `n` to a `KEY_PLANE_*` label.
+    pub fn add_key_plane_sweep(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.key_plane_sweep.write().entry(label).or_insert(0) += n;
+        }
+    }
+
+    /// The key-plane listing ledger by label (tests + the operator readback).
+    #[must_use]
+    pub fn key_plane_sweep(&self) -> HashMap<String, u64> {
+        self.key_plane_sweep
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -2994,6 +3174,8 @@ impl EdgeMetrics {
             link_shaping: self.link_shaping(),
             direct_link: self.direct_link(),
             peer_binding: self.peer_binding(),
+            key_plane_sweep: self.key_plane_sweep(),
+            link_stall: self.link_stall(),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
@@ -3276,6 +3458,10 @@ pub struct EdgeMetricsBundle {
     /// The peer bindings dials check link proofs against, by
     /// `PEER_BINDING_*` label.
     pub peer_binding: HashMap<String, u64>,
+    /// CIRISEdge#930 — the key-plane listings' cost by `KEY_PLANE_*` label.
+    pub key_plane_sweep: HashMap<String, u64>,
+    /// CIRISEdge#926 — the link stall guard by `LINK_STALL_*` label.
+    pub link_stall: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
     pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
@@ -3592,6 +3778,10 @@ impl EdgeMetricsBundle {
         f.family("direct_link", &self.direct_link);
         // The peer-binding ledger, `peer_binding.<label>`.
         f.family("peer_binding", &self.peer_binding);
+        // CIRISEdge#930 — the key-plane listings, `key_plane_sweep.<label>`.
+        f.family("key_plane_sweep", &self.key_plane_sweep);
+        // CIRISEdge#926 — the link stall guard, `link_stall.<label>`.
+        f.family("link_stall", &self.link_stall);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
             "direct_links_active".to_string(),
@@ -3806,6 +3996,8 @@ edge_metrics_bundle_fields!(
     link_shaping,
     direct_link,
     peer_binding,
+    key_plane_sweep,
+    link_stall,
     direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,

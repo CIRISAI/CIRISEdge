@@ -88,8 +88,8 @@ async fn reverse_pair(tag: &str) -> ReversePair {
     let key_b = TestFedKey::new("edge-key-bbbb", 0x0b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
 

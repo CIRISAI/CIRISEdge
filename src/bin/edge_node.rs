@@ -2057,7 +2057,7 @@ const _: () = {
     }
 };
 
-const DISCOVERY_PLANES: [EnvelopeKind; 6] = [
+const DISCOVERY_PLANES: [EnvelopeKind; 4] = [
     // The three that PROMOTE an advisory link to an attributed one. The harness
     // first registered `EnvelopeKind::ALL` (sixty coordinators — it saturated
     // the transport), then narrowed to `Key` + `Attestation`, which omits two
@@ -2066,15 +2066,12 @@ const DISCOVERY_PLANES: [EnvelopeKind; 6] = [
     EnvelopeKind::Key,
     EnvelopeKind::IdentityOccurrence,
     EnvelopeKind::TransportDestination,
-    // What discovery actually reads.
+    // What discovery actually reads. persist v61 (CIRISPersist#991) — and the
+    // pair room: its record and the creator's widening of the joiner are
+    // `group:roster:v1` / `membership:widening:v1` rows on this plane now (the
+    // framed Community / CommunityMembershipWidening planes are retired), as
+    // are the proposal and the acceptance.
     EnvelopeKind::Attestation,
-    // persist v52.0.0 (CIRISPersist#955) — the pair room is founded by its
-    // creator alone and the joiner is added by the creator's widening after it
-    // accepts, so the joiner can no longer author the room locally: the record
-    // and the widening must reach it. (The proposal and the acceptance ride the
-    // Attestation plane above.)
-    EnvelopeKind::Community,
-    EnvelopeKind::CommunityMembershipWidening,
 ];
 
 /// Build the whole occurrence: keys, sealed KV, directory, transport,

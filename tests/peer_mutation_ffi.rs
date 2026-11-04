@@ -167,7 +167,7 @@ async fn fresh_backend() -> (Arc<SqliteBackend>, FedKey) {
     let existing = FedKey::new("existing-peer-mut-ffi", 0xB0);
     for rec in [
         signed_record(&steward, &steward, "steward"),
-        signed_record(&existing, &steward, "agent"),
+        signed_record(&existing, &steward, "node"),
     ] {
         backend
             .put_public_key(SignedKeyRecord { record: rec })
@@ -826,7 +826,7 @@ async fn the_uniffi_snapshot_projects_every_bundle_field_and_queue_depth_is_resi
     let me = FedKey::new("edge-self-metrics-809", 0x01);
     backend
         .put_public_key(SignedKeyRecord {
-            record: signed_record(&me, &steward, "agent"),
+            record: signed_record(&me, &steward, "node"),
         })
         .await
         .expect("put_public_key(self)");

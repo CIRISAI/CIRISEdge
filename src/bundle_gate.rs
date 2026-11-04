@@ -660,7 +660,7 @@ pub async fn gated_save_provenance(
 }
 
 /// CIRISEdge#436/#437 shared test fixture — the FIELD-provenance artifact
-/// chain: a `MemoryBackend` federation directory seeded through persist's REAL
+/// chain: a `SqliteBackend` federation directory seeded through persist's REAL
 /// admission gates, plus a valid bundle minted with verify's own producers.
 /// `pub(crate)` so the #436 arrival-transport tests (`transport::reticulum`)
 /// drive the exact same artifacts the #437 gate tests pinned — one fixture,
@@ -670,7 +670,7 @@ pub(crate) mod test_support {
     use super::{SignedCegObject, BUILD_ATTESTATION_BUNDLE_KIND};
     use ciris_persist::federation::types::identity_type;
     use ciris_persist::federation::FederationDirectory;
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
     use ciris_verify_core::build_attestation_bundle::{
         produce_build_attestation_bundle, BundleInputs, PresentedBuild,
     };
@@ -792,7 +792,7 @@ pub(crate) mod test_support {
         }
     }
 
-    /// The full field fixture: a `MemoryBackend` federation directory holding
+    /// The full field fixture: a `SqliteBackend` federation directory holding
     /// - two accord-anchor rows REGISTERED UNDER the effective genesis
     ///   roster `key_id`s (the ids persist's `infra:attest` admission gate
     ///   resolves) with OUR minted pubkeys + hardware evidence,
@@ -803,8 +803,8 @@ pub(crate) mod test_support {
     ///
     /// plus a VALID bundle minted with verify's own producers — the exact
     /// artifact chain the field presents.
-    pub(crate) async fn field_fixture() -> (MemoryBackend, Vec<u8>) {
-        let backend = MemoryBackend::new();
+    pub(crate) async fn field_fixture() -> (SqliteBackend, Vec<u8>) {
+        let backend = ciris_persist::store::test_backend::test_backend();
 
         // The roster ids the admission quorum resolves — derived, not
         // invented, so the fixture tracks whichever genesis is effective.
@@ -880,8 +880,8 @@ pub(crate) mod test_support {
     /// plane: the pipeline is a plain `node` row (no `infra:attest`, no
     /// co-scrub), and nothing grants it the scope. A test adds the grant (the
     /// walk plane) or leaves it standing-less.
-    pub(crate) async fn plain_pipeline_fixture() -> (MemoryBackend, Vec<u8>) {
-        let backend = MemoryBackend::new();
+    pub(crate) async fn plain_pipeline_fixture() -> (SqliteBackend, Vec<u8>) {
+        let backend = ciris_persist::store::test_backend::test_backend();
         let pipeline = fixed_identity(PIPELINE, &PIPELINE_SEED);
         FederationDirectory::put_public_key(
             &backend,
@@ -899,7 +899,7 @@ pub(crate) mod test_support {
     /// manifest + presenter-signed bundle with verify's own producers — the
     /// exact field artifacts.
     async fn seed_presenter_and_mint_bundle(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         pipeline: &HybridSigningIdentity,
     ) -> Vec<u8> {
         let presenter = fixed_identity(PRESENTER, &PRESENTER_SEED);
@@ -961,7 +961,7 @@ mod tests {
     use super::*;
     use ciris_persist::federation::types::identity_type;
     use ciris_persist::federation::FederationDirectory;
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
 
     use crate::verify::{ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict};
 
@@ -1310,7 +1310,7 @@ mod tests {
     #[tokio::test]
     async fn missing_directory_pins_refuse_by_name() {
         let (_seeded, bytes) = field_fixture().await;
-        let empty = MemoryBackend::new();
+        let empty = ciris_persist::store::test_backend::test_backend();
 
         // No presenter row.
         assert_eq!(
@@ -1323,7 +1323,7 @@ mod tests {
         // Presenter present, pipeline row absent. (The pubkeys need not
         // match the bundle for THIS arm — the pin failure fires before any
         // signature check.)
-        let presenter_only = MemoryBackend::new();
+        let presenter_only = ciris_persist::store::test_backend::test_backend();
         let presenter = fixed_identity(PRESENTER, &PRESENTER_SEED);
         FederationDirectory::put_public_key(
             &presenter_only,
@@ -1398,7 +1398,7 @@ mod tests {
     /// Register `reader` (a node the bridge fixture signer can sign for) and
     /// give it the bridge fixtures' common root `root-r`: a charter with a
     /// recovery pre-commitment and `reader`'s acceptance of it.
-    async fn reader_accepts_common_root(backend: &MemoryBackend, reader: &str) {
+    async fn reader_accepts_common_root(backend: &SqliteBackend, reader: &str) {
         FederationDirectory::put_public_key(
             backend,
             ciris_persist::federation::SignedKeyRecord {
