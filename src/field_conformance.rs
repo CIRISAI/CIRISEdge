@@ -390,7 +390,7 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
             "tests/link_shaping_e1.rs#rho_and_the_window_move_the_real_share_and_the_delay",
             "src/transport/reticulum.rs#shaping_applies_only_to_identity_links",
             "src/transport/link_shaping.rs#the_shaper_emits_real_under_budget_then_cover_and_stops",
-            "src/transport/link_shaping.rs#the_node_cap_bounds_the_sum_of_agreed_rates",
+            "src/transport/link_shaping.rs#a_slow_rate_is_quoted_not_refused_and_divide_no_floor_keeps_the_sum_under_the_cap",
         ],
         supporting: false,
     },
