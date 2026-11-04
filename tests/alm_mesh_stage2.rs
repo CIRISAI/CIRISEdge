@@ -587,8 +587,8 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
     let mut seen = Vec::new();
     let whole = collect_from(&mut rx_c, &mut seen, &b.key.key_id, 40).await;
     if !whole {
-        let plane = |m: &EdgeMetrics| {
-            let mut v: Vec<(String, u64)> = m
+        let plane = |metrics: &EdgeMetrics| {
+            let mut v: Vec<(String, u64)> = metrics
                 .av_plane()
                 .into_iter()
                 .filter(|(k, _)| !k.starts_with("alm_c3"))
