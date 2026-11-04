@@ -311,7 +311,7 @@ max plaintext after    = channel_limit − 84 − 72 = channel_limit − 156    
 | Link MTU | link MDU | Channel limit | Max plaintext before | after | Binding parts (KAT size) |
 |---|---|---|---|---|---|
 | 500 (base) | 431 | 400 | 316 | 244 | 10 × ≤400 B |
-| 1400 (punched direct, `direct_path.rs:468`) | 1327 | 1296 | 1212 | 1140 | 3 × ≤1296 B |
+| 1400 (punched direct, `direct_path.rs:666`) | 1327 | 1296 | 1212 | 1140 | 3 × ≤1296 B |
 
 The call refuses a frame over the budget before sealing it. A smaller MTU
 shrinks every number in the row.

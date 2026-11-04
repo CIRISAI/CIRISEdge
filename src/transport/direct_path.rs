@@ -1098,7 +1098,7 @@ mod tests {
             .iter()
             .all(|j| (-RETRY_JITTER..=RETRY_JITTER).contains(j)));
         assert!(
-            draws.iter().any(|j| *j != draws[0]),
+            draws.iter().any(|j| (*j - draws[0]).abs() > f64::EPSILON),
             "the draw is not a constant"
         );
     }
