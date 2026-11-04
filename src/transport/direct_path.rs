@@ -66,6 +66,12 @@
 //! lockstep. The in-leviculum half (a glare reason, the responder's session
 //! dropped) is asked in leviculum#96.
 //!
+//! The jitter reaches what edge schedules: a `Rejected` proposal, which
+//! leviculum drops from its own retries. leviculum's background re-proposal
+//! after a timeout or a failed punch runs on its fixed `RETRY_BACKOFF_MS`,
+//! unjittered and past the tie-break; only a node that proposed retries, so it
+//! takes a responder's [`GLARE_WAIT`] fallback for both ends to be on it.
+//!
 //! # Scope of a proposal
 //!
 //! Proposing reveals this node's public address to the peer, so edge proposes
@@ -188,11 +194,6 @@ impl Proposing {
     }
 }
 
-/// The UDP port a canonical serves its facilitator on, assumed when the
-/// facilitator is resolved from the bundle (its serve-node hints carry the
-/// TCP dial only). leviculum's `probe_port` convention (rns-rs compatible).
-pub const BUNDLE_FACILITATOR_UDP_PORT: u16 = 4343;
-
 /// CIRISEdge#805 item 8 — direct links for this node. The default proposes
 /// ([`Proposing::On`]) with the facilitator the host's init resolves from
 /// the genesis bundle ([`Self::resolve_bundle_facilitator`]), serves no
@@ -237,15 +238,17 @@ impl DirectLinksConfig {
         self.proposing == Proposing::On && self.facilitator.is_some()
     }
 
-    /// The facilitator the genesis bundle implies: the first baked serve
-    /// node that carries an `ip` transport hint, on
-    /// [`BUNDLE_FACILITATOR_UDP_PORT`] (falling through the list past serve
-    /// nodes with no dial hint). `None` when the bundle names none.
+    /// The facilitator the genesis bundle implies: the `ip` transport hint of
+    /// the first baked serve node that carries one (falling through the list
+    /// past serve nodes with no dial hint), host AND port. A canonical answers
+    /// as a facilitator on UDP at its dial's own port (measured: CI run
+    /// 41869107100, `108.61.242.236:4242`), so there is no second port to
+    /// drift. `None` when the bundle names none.
     #[must_use]
     pub fn bundle_facilitator() -> Option<String> {
         crate::edge::baked_canonical_ip_dials()
             .into_iter()
-            .map(|(_, addr)| format!("{}:{}", addr.ip(), BUNDLE_FACILITATOR_UDP_PORT))
+            .map(|(_, addr)| addr.to_string())
             .next()
     }
 
@@ -961,7 +964,12 @@ mod tests {
     fn the_default_proposes_with_the_bundle_facilitator_and_off_never_does() {
         let bundle = DirectLinksConfig::bundle_facilitator()
             .expect("the baked genesis bundle names a serve node with an ip hint");
-        assert!(bundle.ends_with(&format!(":{BUNDLE_FACILITATOR_UDP_PORT}")));
+        let (_, dial) = crate::edge::baked_canonical_ip_dials()[0].clone();
+        assert_eq!(
+            bundle,
+            dial.to_string(),
+            "the facilitator is the ip hint itself, its port included"
+        );
         let d = DirectLinksConfig::default();
         assert_eq!(d.proposing, Proposing::On);
         assert!(!d.proposes(), "unresolved: nothing to propose with");
@@ -978,7 +986,7 @@ mod tests {
         assert!(!gated.proposes());
         let off = DirectLinksConfig {
             proposing: Proposing::Off,
-            facilitator: Some("127.0.0.1:4343".to_owned()),
+            facilitator: Some("127.0.0.1:4242".to_owned()),
             ..DirectLinksConfig::default()
         }
         .resolve_bundle_facilitator(true);
@@ -986,13 +994,13 @@ mod tests {
         assert!(!off.proposes());
         assert_eq!(off.leviculum_settings().facilitator, None);
         let named = DirectLinksConfig {
-            facilitator: Some("10.0.0.1:4343".to_owned()),
+            facilitator: Some("10.0.0.1:4242".to_owned()),
             ..DirectLinksConfig::default()
         }
         .resolve_bundle_facilitator(true);
         assert_eq!(
             named.facilitator.as_deref(),
-            Some("10.0.0.1:4343"),
+            Some("10.0.0.1:4242"),
             "a named one stays"
         );
         assert_eq!(Proposing::parse("on"), Some(Proposing::On));

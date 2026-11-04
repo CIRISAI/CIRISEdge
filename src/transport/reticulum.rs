@@ -3538,7 +3538,7 @@ impl ReticulumTransport {
             .enable_transport(config.enable_transport)
             // CIRISEdge#805 item 8 — always explicit, so the node never runs on
             // a leviculum default (or a stray config file's keys) edge did not
-            // choose. The default is inert.
+            // choose.
             .direct_link(config.direct_links.leviculum_settings());
         tracing::info!(
             proposes = config.direct_links.proposes(),
