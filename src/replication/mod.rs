@@ -166,6 +166,9 @@ pub mod session;
 mod sim;
 pub(crate) mod single_flight;
 pub mod storage_contention;
+pub(crate) mod subject_pull;
+#[cfg(test)]
+mod subject_pull_apply_tests;
 pub mod summary;
 #[cfg(test)]
 mod typed_refusal_858_tests;

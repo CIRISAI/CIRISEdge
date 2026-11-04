@@ -1381,9 +1381,13 @@ impl ReplicationRuntime {
     /// `subject_key_id`'s own testimony (and testimony ABOUT it) from
     /// `peer_key_id`. For each subject-pullable kind (the five replicated planes)
     /// this ensures a scheduled Initiator coordinator exists — so the reply's
-    /// drive loop is live — then sends a `Pull`. The peer answers with the
-    /// subject's refs (projection-gated + G2-carved by its `subject_holdings`),
-    /// and the node pulls the gap through the ordinary Diff/Deliver flow.
+    /// peer is known to the scheduler — then runs a Pull on an exchange of its
+    /// own ([`ReplicationCoordinator::pull_exchange`](super::coordinator::ReplicationCoordinator::pull_exchange)).
+    /// The peer answers with the subject's refs (projection-gated + G2-carved by
+    /// its `subject_holdings`), and the gap is fetched and applied in that
+    /// exchange, on the frames' own time and never on a round's. A plane the
+    /// peer throttled sends nothing until its hint runs out
+    /// ([`Self::subject_pull_retry_after`]).
     ///
     /// This is the mechanism the observation in #462 needs: a fedID that claimed
     /// a fresh node cannot otherwise obtain its own keys / occurrences / routes /
@@ -1582,6 +1586,19 @@ impl ReplicationRuntime {
         })
     }
 
+    /// CIRISEdge#937 — seconds left before `peer_key_id` will answer a subject
+    /// Pull again, on the plane it throttled longest; `None` when no plane is.
+    /// What a host reads to say "looking…" instead of "not found".
+    pub async fn subject_pull_retry_after(&self, peer_key_id: &str) -> Option<u64> {
+        let mut longest = None;
+        for kind in EnvelopeKind::subject_pullable() {
+            if let Some(coord) = self.registry.get_initiator(peer_key_id, kind).await {
+                longest = longest.max(coord.pull_retry_after_secs());
+            }
+        }
+        longest
+    }
+
     pub async fn pull_subject_testimony(
         &self,
         peer_key_id: &str,
@@ -1593,7 +1610,10 @@ impl ReplicationRuntime {
             // consumes the Pull's Summary reply.
             self.register_initiator_peer(peer_key_id, kind).await?;
             if let Some(coord) = self.registry.get_initiator(peer_key_id, kind).await {
-                if let Err(e) = coord.start_pull(subject_key_id).await {
+                if let Err(e) = coord
+                    .pull_exchange(subject_key_id, self.config.scheduler.round_timeout)
+                    .await
+                {
                     tracing::warn!(
                         peer = %peer_key_id,
                         subject = %subject_key_id,
@@ -2012,6 +2032,7 @@ mod tests {
 
         let round_open =
             super::super::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));

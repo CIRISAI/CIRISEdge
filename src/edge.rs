@@ -10897,6 +10897,7 @@ mod inbound_ingest_tests {
         let registry = std::sync::Arc::new(ReplicationRegistry::new());
         let crpl =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
@@ -10930,6 +10931,7 @@ mod inbound_ingest_tests {
     async fn no_registry_falls_through() {
         let crpl =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
@@ -10953,6 +10955,7 @@ mod inbound_ingest_tests {
         }));
         let crpl =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
@@ -11065,6 +11068,7 @@ mod inbound_ingest_tests {
         };
         let key_frame =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
@@ -11102,6 +11106,7 @@ mod inbound_ingest_tests {
         let registry = make_registry(built.clone());
         let att =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Attestation,
                 refs: vec![],
             }));
@@ -11224,6 +11229,7 @@ mod inbound_ingest_tests {
         let frame = || InboundFrame {
             envelope_bytes: crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
                 SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Attestation,
                     refs: vec![],
                 },
@@ -11304,7 +11310,11 @@ mod inbound_ingest_tests {
     fn bootstrap_carve_out_admits_only_self_authenticating_bootstrap_kinds() {
         let with_link = |kind, link: Option<&str>| InboundFrame {
             envelope_bytes: crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
-                SummaryMessage { kind, refs: vec![] },
+                SummaryMessage {
+                    status: None,
+                    kind,
+                    refs: vec![],
+                },
             )),
             transport: TransportId::RETICULUM_RS,
             received_at: chrono::Utc::now(),
@@ -11387,7 +11397,7 @@ mod inbound_ingest_tests {
             let kind = EnvelopeKind::ALL[kind_idx];
             let frame = InboundFrame {
                 envelope_bytes: crate::replication::wire_frame::wrap(
-                    &ReplicationMessage::Summary(SummaryMessage { kind, refs: vec![] }),
+                    &ReplicationMessage::Summary(SummaryMessage { status: None, kind, refs: vec![] }),
                 ),
                 transport: TransportId::RETICULUM_RS,
                 received_at: chrono::Utc::now(),
@@ -11475,6 +11485,7 @@ mod inbound_ingest_tests {
         for _ in 0..ReplicationCoordinator::INBOUND_CHANNEL_CAPACITY {
             coord
                 .deliver_inbound(ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![],
                 }))
@@ -11488,6 +11499,7 @@ mod inbound_ingest_tests {
         let metrics = EdgeMetrics::new();
         let crpl =
             crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));

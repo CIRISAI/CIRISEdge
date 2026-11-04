@@ -632,6 +632,36 @@ pub struct EnvelopeRef {
 pub struct SummaryMessage {
     pub kind: EnvelopeKind,
     pub refs: Vec<EnvelopeRef>,
+    /// CIRISEdge#937 — why `refs` is what it is, when it is not simply the
+    /// responder's holdings. `None` (the overwhelmingly common case, and the
+    /// only value a pre-v44 peer ever sends) means "these are my refs". A
+    /// `Summary` answering a subject `Pull` the responder THROTTLED carries
+    /// [`SummaryStatus::SubjectPullThrottled`], so the requester can tell
+    /// "nothing held" from "not answered this window" — before this field the
+    /// two were byte-identical (an empty `refs`).
+    ///
+    /// Flattened, so the wire reads `{"type":"summary",…,"status":
+    /// "subject_pull_throttled","retry_after_secs":60}` and `None` is
+    /// byte-identical to a pre-v44 Summary. A pre-v44 peer ignores the two
+    /// members (no `deny_unknown_fields` on this path); a status THIS build
+    /// does not know reads as `None`, so a later status cannot fail a Summary.
+    /// See FSD/REPLICATION_WIRE_FORMAT_V1.md §3.4.1.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SummaryStatus>,
+}
+
+/// CIRISEdge#937 — the status a [`SummaryMessage`] may carry beside its refs.
+/// The `status` string is the stable marker a requester (or a harness reading
+/// the wire) keys on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SummaryStatus {
+    /// The responder's per-requester lookup limiter denied this subject
+    /// `Pull`: the empty `refs` is a refusal, not a statement about what the
+    /// responder holds. `retry_after_secs` is the limiter's WINDOW LENGTH — a
+    /// public policy constant, never the requester's own refill horizon
+    /// (docs/FSD_RATE_LIMIT.md D3).
+    SubjectPullThrottled { retry_after_secs: u64 },
 }
 
 /// "I want these envelopes." Receiver's response to a `SummaryMessage`
@@ -864,10 +894,63 @@ mod tests {
         h
     }
 
+    /// CIRISEdge#937 — the wire shape, pinned: flat, keyed on the stable
+    /// marker; absent ⇒ byte-identical to a pre-v44 Summary; a pre-v44 reader
+    /// ignores it; a status this build does not know is no status, not a
+    /// refused frame.
+    #[test]
+    fn summary_status_is_flat_optional_and_tolerant_937() {
+        let plain = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
+            kind: EnvelopeKind::Attestation,
+            refs: vec![],
+        });
+        assert_eq!(
+            std::str::from_utf8(&plain.to_bytes()).unwrap(),
+            r#"{"type":"summary","kind":"attestation","refs":[]}"#,
+            "no status ⇒ the pre-v44 bytes"
+        );
+        let throttled = ReplicationMessage::Summary(SummaryMessage {
+            status: Some(SummaryStatus::SubjectPullThrottled {
+                retry_after_secs: 60,
+            }),
+            kind: EnvelopeKind::Attestation,
+            refs: vec![],
+        });
+        let bytes = throttled.to_bytes();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["status"], "subject_pull_throttled");
+        assert_eq!(wire["retry_after_secs"], 60);
+        assert_eq!(ReplicationMessage::from_bytes(&bytes).unwrap(), throttled);
+
+        // A pre-v44 peer's reader: the same struct without the field.
+        #[derive(Deserialize)]
+        struct PreV44Summary {
+            kind: EnvelopeKind,
+            refs: Vec<EnvelopeRef>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum PreV44 {
+            Summary(PreV44Summary),
+        }
+        let PreV44::Summary(old) = serde_json::from_slice::<PreV44>(&bytes).unwrap();
+        assert_eq!(old.kind, EnvelopeKind::Attestation);
+        assert!(old.refs.is_empty(), "an old peer reads the empty list");
+
+        let future =
+            br#"{"type":"summary","kind":"attestation","refs":[],"status":"a_later_status"}"#;
+        match ReplicationMessage::from_bytes(future).unwrap() {
+            ReplicationMessage::Summary(s) => assert_eq!(s.status, None),
+            other => panic!("not a Summary: {other:?}"),
+        }
+    }
+
     /// Round-trip — JSON-encoded then parsed yields the same value.
     #[test]
     fn summary_round_trips_via_json() {
         let m = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Attestation,
             refs: vec![
                 EnvelopeRef {
@@ -1220,7 +1303,11 @@ mod tests {
             };
             // The serde rename, the manifest key, and the pin all agree.
             assert_eq!(kind.as_wire_str(), wire, "{kind:?}: as_wire_str drifted");
-            let m = ReplicationMessage::Summary(SummaryMessage { kind, refs: vec![] });
+            let m = ReplicationMessage::Summary(SummaryMessage {
+                status: None,
+                kind,
+                refs: vec![],
+            });
             let bytes = m.to_bytes();
             let s = std::str::from_utf8(&bytes).unwrap();
             let cell = format!(r#""kind":"{wire}""#);

@@ -73,12 +73,16 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // with no Rooted floor on it (`FSD/FIRST_CONTACT.md` §2.3–§2.4). Who a
         // ceremony row is addressed to is persist's `may_receive` (CIRISEdge#761:
         // a proposal → every node whose principals include its invitee; an
-        // answer → the nodes of the held proposal's proposer).
+        // answer → the nodes of the held proposal's proposer). CC 5.4.6 — on a
+        // subject PULL, holding a person's live owner-binding is sufficient, for
+        // it and their root acceptance; the advertise keeps the publish set
+        // (`FSD/FIRST_CONTACT.md` §2.3).
         EnvelopeKind::Attestation => (
             "per_record_projection",
             "trace:* → capability:infra:serve; first contact → own allegiance facts \
              + live federation owner-bindings of nodes in the Key/IdentityOccurrence \
-             publish set + a membership:proposal|acceptance|decline:v1 persist \
+             publish set, or on a subject pull any held live one and its owner's \
+             root acceptance + a membership:proposal|acceptance|decline:v1 persist \
              may_receive admits as refers-to; else persist may_receive(peer, row) \
              (origin, refers-to — never for a key_grant set —, the membership \
              ceremony: proposal → invitee's nodes, answer → proposer's nodes, every \
