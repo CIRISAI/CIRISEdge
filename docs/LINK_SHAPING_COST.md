@@ -85,7 +85,8 @@ rides the shaped link in shaped-budget fragments and is counted
 `link_shaping_bulk_on_shaped_fallback`. The shaper paces it like every other
 frame, so the link stays constant-size and constant-rate. It is slow, but it
 does not fail. The bound is the window budget: at the `server` class on a 16 KB
-frame, about 0.2 real frames per second, or about 3 KB/s.
+frame, about 0.2 real frames per second, or 3.5 KB/s, so 1 MiB takes about five
+minutes.
 
 **The refusal.** The shaper itself still refuses a message beyond its reach
 outside that fallback (`link_shaping_bulk_refused`), and queues none of it. The
