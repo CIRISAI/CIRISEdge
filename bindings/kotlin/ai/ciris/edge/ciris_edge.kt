@@ -1470,6 +1470,10 @@ data class EdgeDeviceState (
     , 
     var `shapingOptIn`: kotlin.Boolean
     , 
+    var `shapingOptInCellular`: kotlin.Boolean
+    , 
+    var `clientOnly`: kotlin.Boolean
+    , 
     var `relayOverride`: kotlin.Boolean?
     
 ){
@@ -1491,6 +1495,8 @@ public object FfiConverterTypeEdgeDeviceState: FfiConverterRustBuffer<EdgeDevice
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterOptionalBoolean.read(buf),
         )
     }
@@ -1500,6 +1506,8 @@ public object FfiConverterTypeEdgeDeviceState: FfiConverterRustBuffer<EdgeDevice
             FfiConverterBoolean.allocationSize(value.`unmetered`) +
             FfiConverterBoolean.allocationSize(value.`charging`) +
             FfiConverterBoolean.allocationSize(value.`shapingOptIn`) +
+            FfiConverterBoolean.allocationSize(value.`shapingOptInCellular`) +
+            FfiConverterBoolean.allocationSize(value.`clientOnly`) +
             FfiConverterOptionalBoolean.allocationSize(value.`relayOverride`)
     )
 
@@ -1508,6 +1516,8 @@ public object FfiConverterTypeEdgeDeviceState: FfiConverterRustBuffer<EdgeDevice
             FfiConverterBoolean.write(value.`unmetered`, buf)
             FfiConverterBoolean.write(value.`charging`, buf)
             FfiConverterBoolean.write(value.`shapingOptIn`, buf)
+            FfiConverterBoolean.write(value.`shapingOptInCellular`, buf)
+            FfiConverterBoolean.write(value.`clientOnly`, buf)
             FfiConverterOptionalBoolean.write(value.`relayOverride`, buf)
     }
 }

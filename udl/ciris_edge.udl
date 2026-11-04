@@ -539,8 +539,14 @@ dictionary EdgeDeviceState {
     // on Wi-Fi / Ethernet (a phone that is not is on cellular)
     boolean unmetered;
     boolean charging;
-    // the person's opt-in to shaping every link at their class
+    // the person's opt-in to shaping every link at their class, on Wi-Fi for
+    // a phone
     boolean shaping_opt_in;
+    // the same for a phone on cellular, its own class with its own cost: off
+    // with shaping_opt_in on is shaping on Wi-Fi only
+    boolean shaping_opt_in_cellular;
+    // no listener, so no slot to give and never referred (every v44 phone)
+    boolean client_only;
     // the person's relay override, either way (null follows the policy)
     boolean? relay_override;
 };

@@ -273,8 +273,8 @@ pub enum ShapingScope {
 ///
 /// **Latency is the other cost** (CC 5.4.3 "the choice is explained before it
 /// is made"): a shaped link moves real bytes at ρ of its rate, 3.5 KB/s per
-/// peer at `server`, one frame per [`BudgetClass`] gap (2.3 s `server`, 4 s
-/// `home`, 8 s `phone-wifi`, 26–32 s `phone-cellular`); a row waits about one
+/// peer at `server`, one frame per [`BudgetClass`] gap (2.3 s `server`, 5.8 s
+/// `home`, 11.6 s `phone-wifi`, 47 s `phone-cellular`); a row waits about one
 /// gap, a reply two or three, and first contact or catch-up several times
 /// longer than unshaped (measured: a four-node bootstrap's rounds p90 35 s,
 /// p99 165 s against 53 s for the whole bootstrap unshaped). The client shows
@@ -455,10 +455,21 @@ pub struct DeviceState {
     /// On external power.
     pub charging: bool,
     /// The person opted into shaping every identity link at their class
-    /// (`home`, `phone-wifi`, `phone-cellular` are opt-in; [`FLEET_DEFAULTS`]).
-    /// A person's choice, not a network fact: it is kept when the device moves
-    /// between Wi-Fi and cellular ([`Self::with_network`]).
+    /// (`home`, `phone-wifi`; [`FLEET_DEFAULTS`]). A person's choice, not a
+    /// network fact: it is kept when the device moves between Wi-Fi and
+    /// cellular ([`Self::with_network`]). A phone chooses each network
+    /// separately ([`Self::shaping_opt_in_cellular`]).
     pub shaping_opt_in: bool,
+    /// The same choice for `phone-cellular`, its own class with its own cost:
+    /// a person can shape on Wi-Fi and not on cellular (`FSD/PRIVACY_MODES.md`
+    /// E17). A move to cellular with this off renegotiates to off, and the
+    /// move back restores Wi-Fi shaping.
+    pub shaping_opt_in_cellular: bool,
+    /// A client-only node: it dials and listens for nothing, so it has no slot
+    /// to give and is never referred, whatever its network, power or relay
+    /// override (`FSD/PRIVACY_MODES.md` E14). Every v44 phone is one
+    /// ([`Self::of`]). Off, a phone-class node follows the device policy.
+    pub client_only: bool,
     /// The user's relay override, either way (CC 5.4.6 item 1: "the user MAY
     /// override the policy either way"). `None` follows the device policy.
     pub relay_override: Option<bool>,
@@ -474,12 +485,23 @@ impl DeviceState {
             unmetered: true,
             charging: true,
             shaping_opt_in: false,
+            shaping_opt_in_cellular: false,
+            client_only: matches!(kind, DeviceKind::Phone),
             relay_override: None,
         }
     }
 
+    /// Whether the person opted in at the class this device is on now.
+    #[must_use]
+    pub const fn opted_in_here(&self) -> bool {
+        match self.budget_class() {
+            BudgetClass::PhoneCellular => self.shaping_opt_in_cellular,
+            _ => self.shaping_opt_in,
+        }
+    }
+
     /// The same device after a network or power change: the person's
-    /// opt-in and relay override are kept, whatever class the move lands on.
+    /// opt-ins and relay override are kept, whatever class the move lands on.
     #[must_use]
     pub const fn with_network(self, unmetered: bool, charging: bool) -> Self {
         Self {
@@ -555,11 +577,12 @@ impl ShapingPolicy {
     }
 
     /// The fleet default for a device in its current state, widened to every
-    /// identity link when the person opted in (any class, cellular included).
+    /// identity link when the person opted in at that class
+    /// ([`DeviceState::opted_in_here`]).
     #[must_use]
     pub fn for_device(d: &DeviceState) -> Self {
         let mut p = Self::fleet_default(d.budget_class());
-        if d.shaping_opt_in {
+        if d.opted_in_here() {
             p.scope = ShapingScope::AllIdentityLinks;
         }
         p
@@ -1228,9 +1251,10 @@ impl LinkShaper {
     /// How long to allow for `frames` queued bodies to leave: the Poisson
     /// p99 of that many gaps (about 4.74 gaps for one; `frames + 4.74 × √frames`
     /// for many), plus a margin, plus the window when the ρ budget cannot
-    /// admit them before it rolls; never more than [`ROW_LEAVE_MAX`] (a
-    /// sender that waited that long retracts and retries). The bound a sender
-    /// waits before calling a queued row undelivered ([`Self::ticket_left`]).
+    /// admit them before it rolls; never more than [`ROW_LEAVE_MAX`] or
+    /// [`ROW_LEAVE_MAX_GAPS`] gaps, the larger (a sender that waited that long
+    /// retracts and retries). The bound a sender waits before calling a queued
+    /// row undelivered ([`Self::ticket_left`]).
     #[must_use]
     pub fn leave_budget(&self, frames: usize) -> Duration {
         #[allow(clippy::cast_precision_loss)]
@@ -1240,7 +1264,7 @@ impl LinkShaper {
         if frames > usize::try_from(self.real_remaining()).unwrap_or(usize::MAX) {
             d += self.agreement.window;
         }
-        d.min(ROW_LEAVE_MAX)
+        d.min(ROW_LEAVE_MAX.max(self.frame_gap().mul_f64(ROW_LEAVE_MAX_GAPS)))
     }
 
     /// Whether every body up to `ticket` has left this node.
@@ -1525,6 +1549,19 @@ pub struct LinkShapers {
 /// saturated link (a window's budget spent) does not hold a dispatcher or a
 /// round gate for the whole window.
 pub const ROW_LEAVE_MAX: Duration = Duration::from_secs(60);
+
+/// The longest a sender waits, in the link's own gaps, where that is more than
+/// [`ROW_LEAVE_MAX`]: the p99 of a 64 KiB row (five frames, `5 + 4.74 × √5`
+/// gaps) with a margin. At `server` the 60 s rules; at the 47 s `phone-cellular`
+/// gap a fixed 60 s lost one single-frame row in four and nearly every full one,
+/// and their retries did not converge (`FSD/PRIVACY_MODES.md` E7).
+pub const ROW_LEAVE_MAX_GAPS: f64 = 16.0;
+
+/// How many frames of a bulk message may wait in a shaped link's queue at once
+/// on the slow path. The queue is one FIFO, so this is how far a row can be
+/// behind a file: a few gaps, never the whole file (`FSD/PRIVACY_MODES.md` E3,
+/// "a row behind a file is a starved row").
+pub const SLOW_PATH_QUEUED_MAX: usize = 4;
 
 /// How long a finished bulk fallback is remembered, so a retry that lost its
 /// wait does not send the whole message again.
@@ -2629,6 +2666,7 @@ mod tests {
             assert_eq!(o.class == BudgetClass::Off, !general, "{class:?}");
             // The person opts in: every class, cellular included, shapes all.
             d.shaping_opt_in = true;
+            d.shaping_opt_in_cellular = true;
             assert!(
                 ShapingPolicy::for_device(&d).offers_on(false),
                 "{class:?} opted in"
@@ -2686,6 +2724,7 @@ mod tests {
         let mut wifi = DeviceState::of(DeviceKind::Phone);
         wifi.charging = false;
         wifi.shaping_opt_in = true;
+        wifi.shaping_opt_in_cellular = true;
         let cell_peer = peer_offer_at(BudgetClass::PhoneCellular);
         let build = |d: &DeviceState| {
             let t = LinkShapers::new(ShapingPolicy::for_device(d));
@@ -2708,8 +2747,8 @@ mod tests {
         let t = build(&wifi);
         let cell = wifi.with_network(false, false);
         assert!(
-            cell.shaping_opt_in,
-            "a network change keeps the person's choice"
+            cell.shaping_opt_in && cell.shaping_opt_in_cellular,
+            "a network change keeps the person's choices"
         );
         let closed = t.set_policy(ShapingPolicy::for_device(&cell));
         assert_eq!(
@@ -2732,16 +2771,28 @@ mod tests {
         );
 
         // Not opted in: the move to cellular leaves only the layer link.
+        // This is Wi-Fi-only shaping (E17): the Wi-Fi choice stands, and the
+        // move back restores it.
         let mut quiet = wifi;
-        quiet.shaping_opt_in = false;
-        let t = build(&DeviceState {
-            shaping_opt_in: true,
-            ..quiet
-        });
-        let mut closed = t.set_policy(ShapingPolicy::for_device(&quiet.with_network(false, false)));
+        quiet.shaping_opt_in_cellular = false;
+        let t = build(&quiet);
+        let cellular = quiet.with_network(false, false);
+        assert!(cellular.shaping_opt_in && !cellular.shaping_opt_in_cellular);
+        let mut closed = t.set_policy(ShapingPolicy::for_device(&cellular));
         closed.sort_unstable();
         assert_eq!(closed, vec![[1u8; 16], [3u8; 16]]);
         assert!(t.is_shaped([2u8; 16]), "the layer link stays shaped");
+        assert_eq!(
+            t.offer_for([6u8; 16], 400, Some("friend")).class,
+            BudgetClass::Off,
+            "on cellular, not opted in: general links are offered nothing"
+        );
+        assert!(t.set_policy(ShapingPolicy::for_device(&quiet)).is_empty());
+        assert_eq!(
+            t.offer_for([7u8; 16], 400, Some("friend")).class,
+            BudgetClass::PhoneWifi,
+            "back on Wi-Fi: restored"
+        );
         // Turning shaping off closes every shaped link.
         assert_eq!(t.set_policy(ShapingPolicy::default()), vec![[2u8; 16]]);
         assert_eq!(t.shaped_count(), 0);
@@ -2956,6 +3007,30 @@ mod tests {
         }
         assert_eq!(firsts.len(), 4, "{firsts:?}");
         assert!(firsts.values().all(|n| *n <= 3), "{firsts:?}");
+    }
+
+    /// E7 — the wait follows the link's own gap: a full row can leave at every
+    /// class, and a fast link keeps the 60 s bound.
+    #[test]
+    fn a_full_row_has_time_to_leave_at_every_class() {
+        let shaper = |bytes: u32| {
+            let o = offer(BudgetClass::Server, 16_272, bytes, 0.5, 3600);
+            LinkShaper::new([1u8; 16], agree(&o, &o).expect("agreed"), 8)
+        };
+        let server = shaper(7_000);
+        assert!(server.leave_budget(5) <= ROW_LEAVE_MAX);
+        assert_eq!(
+            server.leave_budget(50),
+            ROW_LEAVE_MAX,
+            "a fast link keeps 60 s"
+        );
+        let cellular = shaper(350);
+        let p99 = cellular.frame_gap().mul_f64(5.0 + 4.74 * 5f64.sqrt());
+        assert!(
+            cellular.leave_budget(5) >= p99,
+            "{:?} < {p99:?}",
+            cellular.leave_budget(5)
+        );
     }
 
     /// **The viability rule** (FSD/TRANSPORT_TIERS_MODEL.md): a five-plane

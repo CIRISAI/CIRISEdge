@@ -24,7 +24,7 @@ person at the moment of choosing:
 
 | What | Unshaped | Shaped at the class rate |
 |---|---|---|
-| A row (a post, a message) to a peer | tens of milliseconds | about one frame gap: 2.3 s mean at `server`, 4 s `home`, 8 s `phone-wifi`, 26–32 s `phone-cellular` |
+| A row (a post, a message) to a peer | tens of milliseconds | about one frame gap: 2.3 s mean at `server`, 5.8 s `home`, 11.6 s `phone-wifi`, 47 s `phone-cellular` |
 | A reply, or a round of replication | a second | two to three gaps, so 5–7 s at `server` |
 | First contact and catch-up (many rows at once) | a four-node bootstrap in 53 s (measured) | several times slower: rounds p90 35 s, p99 165 s, max 221 s in the same bootstrap (measured, `server`, coalescing on), because the rows queue behind each other at 3.5 KB/s per peer |
 | Bulk (files, chunks, media) | unchanged | unchanged: bulk never rides a shaped link |
@@ -122,7 +122,9 @@ that the last entries are dropped). The body is JSON:
   The list is never skipped: an empty one means "no targets known". A 43.x dialler
   closes on the refusal's class byte either way.
 
-**Who is named.** Offering relay is the consent to be referred (Eric, 2026-11-04).
+**Who is named.** Offering relay is the consent to be referred (CC 5.4.3, 5.4.6
+rc17, `CLM-refusal-carries-referrals`): an owner who turns relay offering on hands
+the node's route to strangers for first contact and consent.
 A referral names any announced node, owned or not, that reports free shaped slots,
 with a live route carrying a transit pair. A node reports slots only while its
 relay offering is on (`onion::policy::relay_offering`: on for servers and home
@@ -153,9 +155,11 @@ list and the peer uses its fallback order** (other canonicals, CIRISEdge#935). A
 v44 that order is not built: an empty or exhausted list leaves the peer's row sends
 to that node failing by name for 120 s, with its bulk link unaffected.
 
-**Homing does not re-address a row.** The refused send still fails by name. The
-peer now holds a shaped link to the referred node, and what it sends there is the
-host's choice (`homed_on_referrals`).
+**A homed node is used.** Edge registers it as a replication peer on the bootstrap
+planes (`Key`, `IdentityOccurrence`, `TransportDestination` and their revocations)
+by itself, so a refused peer's first contact and consent flow there with no host
+step, and a host's later peer set keeps it. The refused send itself still fails by
+name: homing does not re-address a row.
 
 **`DivideNoFloor`** (`cap ÷ links`, however small) stays as the non-default arm
 for comparison. It does not conform to rc17.
@@ -167,12 +171,14 @@ latency per class is:
 
 | Class | Mean latency |
 |---|---|
-| `server` | about 1.6 s |
-| `home` | about 4 s |
-| `phone-wifi` | about 8 s |
-| `phone-cellular` | 26–32 s |
+| `server` | about 2.3 s |
+| `home` | about 5.8 s |
+| `phone-wifi` | about 11.6 s |
+| `phone-cellular` | about 47 s |
 
-These figures come from the CC 5.4.3 model.
+These are the link's own agreed mean, the frame size over the class budget, at the
+16 KB TCP frame (CC 5.4.3 rc17). At the Reticulum base frame they are about a fifth
+of that.
 
 ## Two planes
 

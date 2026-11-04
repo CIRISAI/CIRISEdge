@@ -7278,7 +7278,11 @@ impl ReticulumTransport {
         &self,
         policy: crate::transport::link_shaping::ShapingPolicy,
     ) -> usize {
-        let close = self.shapers.set_policy(policy);
+        let upgraded = !self.shapers.policy().offers_on(false) && policy.offers_on(false);
+        let mut close = self.shapers.set_policy(policy);
+        if upgraded {
+            close.extend(self.unshaped_row_links().await);
+        }
         for link in &close {
             let id = LinkId::new(*link);
             self.seals.refuse(*link);
@@ -7293,6 +7297,21 @@ impl ReticulumTransport {
             );
         }
         close.len()
+    }
+
+    /// `FSD/PRIVACY_MODES.md` E2 — the idle row links this node dialled that
+    /// run unshaped. An upgrade closes them, so the next row dials and offers:
+    /// the promise holds at once rather than when they happen to close. A bulk
+    /// link stays, and a link in flight stays until it next closes.
+    async fn unshaped_row_links(&self) -> Vec<[u8; 16]> {
+        let pool = self.reusable_dialed_link.lock().await;
+        let in_flight = self.link_in_flight.lock().await;
+        pool.values()
+            .flatten()
+            .filter(|id| !in_flight.contains(*id))
+            .map(|id| id.into_bytes())
+            .filter(|l| !self.shapers.is_shaped(*l) && !self.shapers.is_bulk(*l))
+            .collect()
     }
 
     /// The host's device facts changed (Wi-Fi ↔ cellular, charging): the
@@ -15017,30 +15036,39 @@ async fn run_bulk_fallback(
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs_f64(budget * 3.0)
         + Duration::from_secs(60);
+    // Rows now sit between this message's frames, so a retraction names this
+    // message's batches and never the range they span.
+    let mut batches: Vec<(u64, u64)> = Vec::new();
+    let retract = |batches: &[(u64, u64)]| {
+        for (lo, hi) in batches {
+            shaper.retract(*lo, *hi);
+        }
+    };
     let mut ticket = 0;
-    let mut first = 0;
     loop {
         if !node.link_is_established(&link) || shaper.is_stopped() {
-            shaper.retract(first, ticket);
+            retract(&batches);
             return Err(STOPPED.to_owned());
         }
         if tokio::time::Instant::now() > deadline {
-            shaper.retract(first, ticket);
+            retract(&batches);
             return Err(
                 "link_shaping_bulk_fallback_timeout: the shaped link did not take the \
                  message within its budget; the send is retried"
                     .to_owned(),
             );
         }
-        let room = shaper.room().min(frames.len());
+        // E3 — rows first: a few frames at a time, so a row queued now waits
+        // behind those and not behind the file.
+        let room = shaper.room().min(frames.len()).min(
+            crate::transport::link_shaping::SLOW_PATH_QUEUED_MAX.saturating_sub(shaper.queued()),
+        );
         if room > 0 {
             let n = u64::try_from(room).unwrap_or(u64::MAX);
             ticket = shaper
                 .enqueue_bulk_fallback(frames.drain(..room).collect())
                 .map_err(|e| e.to_string())?;
-            if first == 0 {
-                first = ticket + 1 - n;
-            }
+            batches.push((ticket + 1 - n, ticket));
         }
         if frames.is_empty() && shaper.ticket_left(ticket) {
             return Ok(());

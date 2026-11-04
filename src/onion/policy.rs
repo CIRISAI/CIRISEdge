@@ -65,10 +65,12 @@ pub fn device_relays(d: &DeviceState) -> bool {
 /// policy ([`device_relays`], `FSD/CIRIS_MESH.md` §3.2), less the operator's
 /// opt-out, which a seat does not have. It is also the consent to be referred:
 /// a node reports free shaped slots only while this holds
-/// ([`crate::transport::shaping_referral`]).
+/// ([`crate::transport::shaping_referral`]). A client-only node has nothing to
+/// offer, whatever its state or the user's override
+/// ([`DeviceState::client_only`]).
 #[must_use]
 pub fn relay_offering(p: &OnionPolicy, d: &DeviceState) -> bool {
-    device_relays(d) && (p.is_seat || !p.relay_opt_out)
+    !d.client_only && device_relays(d) && (p.is_seat || !p.relay_opt_out)
 }
 
 /// Whether the tier is active on this node: `Ok` or the reason, by token.
@@ -253,5 +255,26 @@ mod tests {
             Ok(()),
             "a seat cannot opt out"
         );
+    }
+
+    /// E14 — a client-only node offers nothing, on Wi-Fi while charging and
+    /// with the user's override on. A relay-capable node of phone class keeps
+    /// the device rule, for when phones can relay.
+    #[test]
+    fn a_client_only_node_never_offers_relay() {
+        let p = OnionPolicy::default();
+        let mut phone = DeviceState::of(DeviceKind::Phone);
+        assert!(phone.client_only, "every v44 phone");
+        assert!(phone.unmetered && phone.charging);
+        assert!(!relay_offering(&p, &phone));
+        phone.relay_override = Some(true);
+        assert!(!relay_offering(&p, &phone));
+
+        let mut capable = DeviceState::of(DeviceKind::Phone);
+        capable.client_only = false;
+        assert!(relay_offering(&p, &capable), "Wi-Fi while charging");
+        assert!(!relay_offering(&p, &capable.with_network(false, true)));
+        assert!(!relay_offering(&p, &capable.with_network(true, false)));
+        assert!(relay_offering(&p, &DeviceState::of(DeviceKind::Home)));
     }
 }

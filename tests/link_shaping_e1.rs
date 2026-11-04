@@ -1649,22 +1649,19 @@ async fn a_node_with_its_relay_offering_off_is_never_referred() {
     assert!(p.transport.homed_on_referrals().is_empty());
 }
 
-/// **A phone that loses Wi-Fi stops being referred on its next report.** The
-/// link stays up, so it is the report that takes the phone out, not a close.
+/// **A phone that loses Wi-Fi stops being referred on its next report.** A
+/// relay-capable node of phone class, for when phones can relay: every v44
+/// phone is client-only. The link stays up, so it is the report that takes the
+/// phone out, not a close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_phone_that_loses_wifi_stops_being_referred_on_the_next_report() {
-    let mut t = referral_pair(
-        "wifi",
-        0x5a,
-        DeviceState::of(DeviceKind::Phone),
-        None,
-        false,
-    )
-    .await;
+    let mut capable = DeviceState::of(DeviceKind::Phone);
+    capable.client_only = false;
+    let mut t = referral_pair("wifi", 0x5a, capable, None, false).await;
     assert!(t.r.transport.peer_free_slots(&t.w.key.key_id) > Some(0));
-    let mut on_cellular = DeviceState::of(DeviceKind::Phone);
-    on_cellular.unmetered = false;
-    t.w.transport.onion().set_device(on_cellular);
+    t.w.transport
+        .onion()
+        .set_device(capable.with_network(false, true));
     t.w.transport.onion_refresh();
     assert!(
         wait_until(Duration::from_secs(30), || async {
@@ -1738,5 +1735,138 @@ async fn a_homed_node_is_a_replication_peer_on_the_bootstrap_planes() {
         .await,
         "Z's record crossed on P's own round to W: {:?}",
         p.metrics.link_shaping()
+    );
+}
+
+/// E14 — **a client-only node never reports slots**: on Wi-Fi, charging, with
+/// the user's relay override on and shaped links to spare.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_only_node_never_reports_slots() {
+    let mut phone = DeviceState::of(DeviceKind::Phone);
+    phone.relay_override = Some(true);
+    let t = referral_pair("client", 0x7a, phone, None, false).await;
+    assert_eq!(t.r.transport.peer_free_slots(&t.w.key.key_id), Some(0));
+}
+
+/// E17 and E2 — **Wi-Fi-only shaping.** A phone opted in on Wi-Fi and not on
+/// cellular: the move to cellular closes its shaped link and rows then cross
+/// unshaped; the move back closes that unshaped link at once (E2), and the next
+/// row is shaped again. Mutation: one opt-in for both classes → the cellular leg
+/// stays shaped. Mutation: leave the unshaped link open → the last leg does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wifi_only_shaping_renegotiates_to_off_on_cellular_and_back() {
+    let mut wifi = DeviceState::of(DeviceKind::Phone);
+    wifi.shaping_opt_in = true;
+    let mut fast = ShapingPolicy::for_device(&wifi);
+    fast.bytes_per_s = 100_000;
+    let t = duo("e17", roomy(8), fast).await;
+    let a_id = t.a.key.key_id.clone();
+    let on_wifi = typed_payload("AttestationGossip", b"ON-WIFI-", 2_000);
+    t.b.transport
+        .send(&a_id, &on_wifi)
+        .await
+        .expect("a shaped row");
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            t.a.received(&on_wifi).await
+        })
+        .await
+    );
+    assert_eq!(t.b.transport.shaped_link_count(), 1);
+
+    let cellular = wifi.with_network(false, true);
+    assert_eq!(
+        t.b.transport.set_device_state(cellular).await,
+        1,
+        "renegotiated"
+    );
+    assert_eq!(t.b.transport.shaped_link_count(), 0);
+    let on_cell = typed_payload("AttestationGossip", b"ON-CELL-", 2_000);
+    t.b.transport
+        .send(&a_id, &on_cell)
+        .await
+        .expect("an unshaped row");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&on_cell).await
+        })
+        .await
+    );
+    assert_eq!(t.b.transport.shaped_link_count(), 0, "off on cellular");
+
+    assert_eq!(
+        t.b.transport.set_device_state(wifi).await,
+        1,
+        "E2: closed at once"
+    );
+    let back = typed_payload("AttestationGossip", b"BACK-ON-WIFI-", 2_000);
+    t.b.transport
+        .send(&a_id, &back)
+        .await
+        .expect("a shaped row again");
+    assert!(
+        wait_until(Duration::from_secs(90), || async {
+            t.a.received(&back).await
+        })
+        .await
+    );
+    assert_eq!(t.b.transport.shaped_link_count(), 1, "restored");
+}
+
+/// E3 — **a row behind a file is not starved.** A 1 MiB message rides the slow
+/// path, and a row sent after it has begun overtakes it: the file feeds the
+/// queue a few frames at a time. Mutation: feed by the queue's whole room → the
+/// row waits behind the file and arrives after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_behind_a_slow_path_file_overtakes_it() {
+    let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    let t = Arc::new(duo("rowsfirst", server.clone(), server).await);
+    let opener = typed_payload("AttestationGossip", b"RF-OPEN-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &opener)
+        .await
+        .expect("B dials A: the shaped link");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&opener).await
+        })
+        .await
+    );
+    t.a.transport.refuse_outbound_dials_for_test(true);
+    let file = typed_payload("AttestationGossip", b"RF-FILE-", 1 << 20);
+    let sender = Arc::clone(&t);
+    let body = file.clone();
+    let sending = tokio::spawn(async move {
+        let to = sender.b.key.key_id.clone();
+        sender.a.transport.send(&to, &body).await
+    });
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.shaping("link_shaping_bulk_on_shaped_fallback") == 1
+        })
+        .await,
+        "the file is on the slow path"
+    );
+    let row = typed_payload("AttestationGossip", b"RF-ROW-", 2_000);
+    t.a.transport
+        .send(&t.b.key.key_id, &row)
+        .await
+        .expect("the row is not held behind the file");
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            t.b.received(&row).await
+        })
+        .await
+    );
+    assert!(!t.b.received(&file).await, "the row overtook the file");
+    sending
+        .await
+        .expect("no panic")
+        .expect("the file completes");
+    assert!(
+        wait_until(Duration::from_secs(120), || async {
+            t.b.received(&file).await
+        })
+        .await
     );
 }

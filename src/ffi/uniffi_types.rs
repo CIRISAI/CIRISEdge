@@ -426,6 +426,8 @@ pub struct EdgeDeviceState {
     pub unmetered: bool,
     pub charging: bool,
     pub shaping_opt_in: bool,
+    pub shaping_opt_in_cellular: bool,
+    pub client_only: bool,
     pub relay_override: Option<bool>,
 }
 

@@ -619,15 +619,19 @@ public struct EdgeDeviceState: Equatable, Hashable {
     public var unmetered: Bool
     public var charging: Bool
     public var shapingOptIn: Bool
+    public var shapingOptInCellular: Bool
+    public var clientOnly: Bool
     public var relayOverride: Bool?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(deviceKind: String, unmetered: Bool, charging: Bool, shapingOptIn: Bool, relayOverride: Bool?) {
+    public init(deviceKind: String, unmetered: Bool, charging: Bool, shapingOptIn: Bool, shapingOptInCellular: Bool, clientOnly: Bool, relayOverride: Bool?) {
         self.deviceKind = deviceKind
         self.unmetered = unmetered
         self.charging = charging
         self.shapingOptIn = shapingOptIn
+        self.shapingOptInCellular = shapingOptInCellular
+        self.clientOnly = clientOnly
         self.relayOverride = relayOverride
     }
 
@@ -651,6 +655,8 @@ public struct FfiConverterTypeEdgeDeviceState: FfiConverterRustBuffer {
                 unmetered: FfiConverterBool.read(from: &buf), 
                 charging: FfiConverterBool.read(from: &buf), 
                 shapingOptIn: FfiConverterBool.read(from: &buf), 
+                shapingOptInCellular: FfiConverterBool.read(from: &buf), 
+                clientOnly: FfiConverterBool.read(from: &buf), 
                 relayOverride: FfiConverterOptionBool.read(from: &buf)
         )
     }
@@ -660,6 +666,8 @@ public struct FfiConverterTypeEdgeDeviceState: FfiConverterRustBuffer {
         FfiConverterBool.write(value.unmetered, into: &buf)
         FfiConverterBool.write(value.charging, into: &buf)
         FfiConverterBool.write(value.shapingOptIn, into: &buf)
+        FfiConverterBool.write(value.shapingOptInCellular, into: &buf)
+        FfiConverterBool.write(value.clientOnly, into: &buf)
         FfiConverterOptionBool.write(value.relayOverride, into: &buf)
     }
 }

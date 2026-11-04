@@ -1481,18 +1481,20 @@ class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
 
 @dataclass
 class EdgeDeviceState:
-    def __init__(self, *, device_kind:str, unmetered:bool, charging:bool, shaping_opt_in:bool, relay_override:typing.Optional[bool]):
+    def __init__(self, *, device_kind:str, unmetered:bool, charging:bool, shaping_opt_in:bool, shaping_opt_in_cellular:bool, client_only:bool, relay_override:typing.Optional[bool]):
         self.device_kind = device_kind
         self.unmetered = unmetered
         self.charging = charging
         self.shaping_opt_in = shaping_opt_in
+        self.shaping_opt_in_cellular = shaping_opt_in_cellular
+        self.client_only = client_only
         self.relay_override = relay_override
         
         
 
     
     def __str__(self):
-        return "EdgeDeviceState(device_kind={}, unmetered={}, charging={}, shaping_opt_in={}, relay_override={})".format(self.device_kind, self.unmetered, self.charging, self.shaping_opt_in, self.relay_override)
+        return "EdgeDeviceState(device_kind={}, unmetered={}, charging={}, shaping_opt_in={}, shaping_opt_in_cellular={}, client_only={}, relay_override={})".format(self.device_kind, self.unmetered, self.charging, self.shaping_opt_in, self.shaping_opt_in_cellular, self.client_only, self.relay_override)
     def __eq__(self, other):
         if self.device_kind != other.device_kind:
             return False
@@ -1501,6 +1503,10 @@ class EdgeDeviceState:
         if self.charging != other.charging:
             return False
         if self.shaping_opt_in != other.shaping_opt_in:
+            return False
+        if self.shaping_opt_in_cellular != other.shaping_opt_in_cellular:
+            return False
+        if self.client_only != other.client_only:
             return False
         if self.relay_override != other.relay_override:
             return False
@@ -1514,6 +1520,8 @@ class _UniffiFfiConverterTypeEdgeDeviceState(_UniffiConverterRustBuffer):
             unmetered=_UniffiFfiConverterBoolean.read(buf),
             charging=_UniffiFfiConverterBoolean.read(buf),
             shaping_opt_in=_UniffiFfiConverterBoolean.read(buf),
+            shaping_opt_in_cellular=_UniffiFfiConverterBoolean.read(buf),
+            client_only=_UniffiFfiConverterBoolean.read(buf),
             relay_override=_UniffiFfiConverterOptionalBoolean.read(buf),
         )
 
@@ -1523,6 +1531,8 @@ class _UniffiFfiConverterTypeEdgeDeviceState(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.check_lower(value.unmetered)
         _UniffiFfiConverterBoolean.check_lower(value.charging)
         _UniffiFfiConverterBoolean.check_lower(value.shaping_opt_in)
+        _UniffiFfiConverterBoolean.check_lower(value.shaping_opt_in_cellular)
+        _UniffiFfiConverterBoolean.check_lower(value.client_only)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.relay_override)
 
     @staticmethod
@@ -1531,6 +1541,8 @@ class _UniffiFfiConverterTypeEdgeDeviceState(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.unmetered, buf)
         _UniffiFfiConverterBoolean.write(value.charging, buf)
         _UniffiFfiConverterBoolean.write(value.shaping_opt_in, buf)
+        _UniffiFfiConverterBoolean.write(value.shaping_opt_in_cellular, buf)
+        _UniffiFfiConverterBoolean.write(value.client_only, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.relay_override, buf)
 
 @dataclass

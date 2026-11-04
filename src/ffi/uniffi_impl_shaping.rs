@@ -47,6 +47,8 @@ pub fn shaping_set_device_state(
             unmetered: state.unmetered,
             charging: state.charging,
             shaping_opt_in: state.shaping_opt_in,
+            shaping_opt_in_cellular: state.shaping_opt_in_cellular,
+            client_only: state.client_only,
             relay_override: state.relay_override,
         };
         let t = transport()?;
