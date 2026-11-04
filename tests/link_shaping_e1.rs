@@ -1117,5 +1117,7 @@ async fn at_the_bound_an_off_peer_still_gets_an_ordinary_unshaped_link() {
         "{:?}",
         t.a.metrics.link_shaping()
     );
-    assert_eq!(t.a.shaping("link_shaping_unshaped"), 1);
+    // An off peer sends no offer, so there is nothing for A to answer or
+    // count: the row crossing on an unshaped link is the witness.
+    assert_eq!(t.a.transport.shaped_link_count(), 0);
 }

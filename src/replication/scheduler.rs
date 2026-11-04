@@ -1008,6 +1008,10 @@ impl GatedRound<'_> {
         if let Some(m) = self.metrics {
             m.observe_round_duration(self.coord.kind(), started.elapsed());
         }
+        tracing::info!(
+            took_ms = started.elapsed().as_millis(),
+            "anti-entropy round ended"
+        );
         ticket.finish(class);
         true
     }
@@ -1088,6 +1092,7 @@ async fn round_and_report(
         // Complete after sending; the merged arm is defensive if it
         // ever leaks through.
         Ok(DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report)) => {
+            tracing::info!("round completed");
             RoundEvent::Completed(report)
         }
         Ok(DriveStep::Refused) => {

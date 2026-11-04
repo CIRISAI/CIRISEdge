@@ -705,7 +705,7 @@ async fn send_fragments_on_channel(
     // Channel still sequences and retransmits each frame.
     if let Some(shaper) = shapers.get(link_id.into_bytes()) {
         return match shaper.enqueue(fragments.to_vec()) {
-            Ok(()) => FragmentSendOutcome {
+            Ok(_) => FragmentSendOutcome {
                 sent: total,
                 total,
                 stalled: None,
@@ -4265,12 +4265,20 @@ impl ReticulumTransport {
                     last_inbound.get(&id).copied(),
                     last_outbound.get(&id).copied(),
                 );
+                // CC 5.4.3 — a shaped link's quiet is measured against its
+                // own frame gap: between two cover frames it is not idle, and
+                // a bound below the gap's p99 would reap a live shaped link
+                // (and the rows queued on it) between its frames.
+                let bound_here = self
+                    .shapers
+                    .get(id.into_bytes())
+                    .map_or(bound, |s| bound.max(s.frame_gap().mul_f64(4.74)));
                 inbound_link_idle_expired(
                     now_ms,
                     at,
                     snapshot.0.max(snapshot.1),
                     self.node.get_remote_identity(&id).is_some(),
-                    bound,
+                    bound_here,
                 )
                 .then_some((id, snapshot))
             })
@@ -4649,6 +4657,12 @@ impl ReticulumTransport {
                         in_flight.contains(id)
                             || inbound.contains(id)
                             || self.direct_paths.is_anchored(id)
+                            // CC 5.4.3 — a shaped lane with rows still queued
+                            // on its shaper is mid-transfer, not idle.
+                            || self
+                                .shapers
+                                .get(id.into_bytes())
+                                .is_some_and(|s| s.queued() > 0)
                     },
                     &mut last_used,
                     std::time::Instant::now(),
@@ -9238,8 +9252,38 @@ impl ReticulumTransport {
                         "shaped link: frame body too small to fragment".to_owned(),
                     ))
                 })?;
+            // A queued row is not delivered: the link can close before its
+            // frame fires (a reap, a peer gone) and the body goes with the
+            // shaper. `Ok` here is the durable dispatcher's transport ack, so
+            // it waits for the last fragment to LEAVE (the FIFO ticket against
+            // real frames confirmed sent), bounded by the Poisson p99 for
+            // that many frames; past the bound the send is retried.
+            let frames = fragments.len();
             return match shaper.enqueue(fragments) {
-                Ok(()) => Ok(()),
+                Ok(ticket) => {
+                    let first = ticket + 1 - u64::try_from(frames).unwrap_or(u64::MAX);
+                    let budget = shaper.leave_budget(frames);
+                    let deadline = tokio::time::Instant::now() + budget;
+                    loop {
+                        if shaper.ticket_left(ticket) {
+                            break Ok(());
+                        }
+                        if shaper.is_stopped() || !self.node.link_is_established(link_id) {
+                            shaper.retract(first, ticket);
+                            break Err(ShipError::Other(TransportError::Io(
+                                "the shaped link closed before the row's frames left (retried)"
+                                    .to_owned(),
+                            )));
+                        }
+                        if tokio::time::Instant::now() > deadline {
+                            // The unsent remainder is taken back so the retry
+                            // does not send the row twice.
+                            shaper.retract(first, ticket);
+                            break Err(ShipError::Other(TransportError::Timeout(budget)));
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
                 Err(crate::transport::link_shaping::ShapingError::QueueFull(_)) => {
                     if let Some(m) = self.metrics.get() {
                         m.inc_link_shaping(crate::observability::LINK_SHAPING_QUEUE_DEFERRED);
@@ -14176,7 +14220,26 @@ async fn shaped_inbound(
                 }
                 None
             }
+            Ok(ShapedFrame::Real(body))
+                if crate::transport::link_shaping::is_capability_body(&body) =>
+            {
+                // v44 — the peer announced multi-body frames: pack toward it.
+                s.enable_coalescing();
+                tracing::debug!(
+                    link = %hex::encode(link),
+                    "peer announced shaped-frame coalescing; packing bodies toward it"
+                );
+                None
+            }
             Ok(ShapedFrame::Real(body)) => Some(body),
+            Ok(ShapedFrame::Many(bodies)) => {
+                // Several bodies in one frame: each routes as a frame of its
+                // own, in order. (A Channel-lane frame is never a Resource.)
+                for body in bodies {
+                    route_opened(ctx, link_id, false, body).await;
+                }
+                None
+            }
             Err(e) => {
                 shaping_teardown(ctx, link_id, &e).await;
                 None
@@ -14213,7 +14276,11 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
             return;
         }
     };
-    if !ctx.shapers.has_offered(link) {
+    // The responder answers below; the dialler already offered and learns the
+    // outcome through its pending answer (`offer_shaping`), which counts and
+    // closes on its side.
+    let responder = !ctx.shapers.has_offered(link);
+    if responder {
         // Only identity links are shaped (CC 5.4.6; `shaping_applies_to`):
         // on a scoped or A/V link this node answers `off`, whatever its class.
         let (_, plane) = resolve_inbound_link(ctx, &link_id).await;
@@ -14266,6 +14333,11 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
                 "link SHAPED both ways: constant-size frames at Poisson times from here \
                  (CC 5.4.3, CLM-link-shaping)"
             );
+            // v44 — announce coalescing to the peer as the link's first real
+            // body (a 43.x peer drops it as an unparseable envelope).
+            // choke-ok: a full queue on a fresh link is impossible; the body
+            // is 5 bytes.
+            let _ = shaper.enqueue(vec![crate::transport::link_shaping::capability_body()]);
             spawn_shaper_task(
                 Arc::clone(ctx.av_node),
                 Arc::clone(ctx.seals),
@@ -14284,6 +14356,29 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
                 "shaping offers resolved to UNSHAPED (one side is off); the link runs bare \
                  (CC 5.4.3)"
             );
+        }
+        Err(ShapingError::HomeElsewhere) if !responder => {
+            // The dialler: its dial path counts the refusal and closes.
+        }
+        Err(ShapingError::HomeElsewhere) => {
+            // The refusal was just answered on the wire; the close must
+            // follow the answer, not race it, or the dialler sees a closed
+            // link instead of the token. Nothing more is sealed meanwhile.
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(ShapingError::HomeElsewhere.label());
+            }
+            tracing::info!(
+                link = %hex::encode(link),
+                reason = ShapingError::HomeElsewhere.label(),
+                "a shaping peer past this node's shaped-link bound: refused for rows, \
+                 homed elsewhere (CC 5.4.3; CIRISEdge#935)"
+            );
+            ctx.seals.refuse(link);
+            let node = Arc::clone(ctx.av_node);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let _ = node.close_link(&link_id).await;
+            });
         }
         Err(e) => shaping_teardown(ctx, link_id, &e).await,
     }
@@ -14428,11 +14523,14 @@ async fn run_bulk_fallback(
         + Duration::from_secs_f64(budget * 3.0)
         + Duration::from_secs(60);
     let mut ticket = 0;
+    let mut first = 0;
     loop {
         if !node.link_is_established(&link) || shaper.is_stopped() {
+            shaper.retract(first, ticket);
             return Err(STOPPED.to_owned());
         }
         if tokio::time::Instant::now() > deadline {
+            shaper.retract(first, ticket);
             return Err(
                 "link_shaping_bulk_fallback_timeout: the shaped link did not take the \
                  message within its budget; the send is retried"
@@ -14441,11 +14539,15 @@ async fn run_bulk_fallback(
         }
         let room = shaper.room().min(frames.len());
         if room > 0 {
+            let n = u64::try_from(room).unwrap_or(u64::MAX);
             ticket = shaper
                 .enqueue_bulk_fallback(frames.drain(..room).collect())
                 .map_err(|e| e.to_string())?;
+            if first == 0 {
+                first = ticket + 1 - n;
+            }
         }
-        if frames.is_empty() && shaper.real_sent() >= ticket {
+        if frames.is_empty() && shaper.ticket_left(ticket) {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -14467,8 +14569,12 @@ fn spawn_shaper_task(
     tokio::spawn(async move {
         let link = link_id.into_bytes();
         loop {
-            let (bytes, real) = match shaper.next_emission().await {
-                Emission::Frame { bytes, real } => (bytes, real),
+            let (bytes, real, ticket) = match shaper.next_emission().await {
+                Emission::Frame {
+                    bytes,
+                    real,
+                    ticket,
+                } => (bytes, real, ticket),
                 Emission::Stopped => break,
             };
             let Ok(sealed) = seals.seal(link, Lane::Channel, &bytes) else {
@@ -14485,8 +14591,15 @@ fn spawn_shaper_task(
             if let Ok(Ok(())) = sent {
                 seals.tap_frame(link, &sealed);
                 if real {
-                    shaper.note_real_sent();
+                    shaper.note_sent(ticket);
                 }
+                tracing::trace!(
+                    link = %hex::encode(link),
+                    real,
+                    queued = shaper.queued(),
+                    gap_ms = shaper.frame_gap().as_millis(),
+                    "shaped frame sent"
+                );
                 if let Some(m) = metrics.as_ref() {
                     m.inc_link_shaping(if real {
                         crate::observability::LINK_SHAPING_FRAMES_REAL

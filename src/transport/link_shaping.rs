@@ -50,6 +50,15 @@ pub const OFFER_LEN: usize = 4 + 1 + 1 + 2 + 4 + 2 + 4;
 pub const FRAME_HEADER_LEN: usize = 4 + 1 + 1 + 2;
 const KIND_COVER: u8 = 0x00;
 const KIND_REAL: u8 = 0x01;
+/// Several bodies in one frame, each `u16 len ‖ body` (v44; sent only to a
+/// peer that announced [`capability_body`]).
+const KIND_MULTI: u8 = 0x02;
+/// The in-band capability body each end queues on a fresh shaped link:
+/// `SHCP` ‖ version. A peer that knows it enables multi-body frames toward
+/// the sender; a 43.x peer routes it to its envelope parser and drops it.
+pub const CAP_MAGIC: [u8; 4] = *b"SHCP";
+/// The capability body's version.
+pub const CAP_VERSION: u8 = 1;
 /// The least frame rate an offer encodes (`rate_milli` 1). Not a floor on
 /// the link: under [`ShapedSharePolicy::DivideNoFloor`] a share runs however
 /// small, down to this.
@@ -666,6 +675,20 @@ pub fn is_offer(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes[..4] == OFFER_MAGIC
 }
 
+/// The capability body this node queues on a fresh shaped link.
+#[must_use]
+pub fn capability_body() -> Vec<u8> {
+    let mut v = CAP_MAGIC.to_vec();
+    v.push(CAP_VERSION);
+    v
+}
+
+/// Whether a real body is a peer's capability announcement.
+#[must_use]
+pub fn is_capability_body(body: &[u8]) -> bool {
+    body.len() == CAP_MAGIC.len() + 1 && body[..4] == CAP_MAGIC
+}
+
 /// Whether `bytes` is a `SHPF` shaped frame.
 #[must_use]
 pub fn is_shaped_frame(bytes: &[u8]) -> bool {
@@ -801,6 +824,8 @@ pub enum ShapedFrame {
     Cover,
     /// A real frame carrying `body` (a whole frame or one `CFRG` fragment).
     Real(Vec<u8>),
+    /// A real frame carrying several bodies (v44 coalescing).
+    Many(Vec<Vec<u8>>),
 }
 
 /// The body bytes one shaped frame of `frame_bytes` carries.
@@ -846,6 +871,41 @@ pub fn wrap(
     Ok(out)
 }
 
+/// Wrap several bodies as one `frame_bytes`-sized multi frame: the inner
+/// framing is `u16 len ‖ body` repeated; the header's length is the inner
+/// total.
+///
+/// # Errors
+/// [`ShapingError::BodyTooLarge`] when they do not fit together.
+pub fn wrap_multi(
+    frame_bytes: u16,
+    bodies: &[Vec<u8>],
+    pad: &mut dyn FnMut(&mut [u8]),
+) -> Result<Vec<u8>, ShapingError> {
+    let cap = body_capacity(frame_bytes);
+    let inner: usize = bodies.iter().map(|b| 2 + b.len()).sum();
+    if inner > cap || bodies.iter().any(|b| b.len() > usize::from(u16::MAX)) {
+        return Err(ShapingError::BodyTooLarge(inner, usize::from(frame_bytes)));
+    }
+    let mut out = vec![0u8; usize::from(frame_bytes)];
+    out[..4].copy_from_slice(&FRAME_MAGIC);
+    out[4] = SHAPING_VERSION;
+    out[5] = KIND_MULTI;
+    #[allow(clippy::cast_possible_truncation)]
+    let len = inner as u16;
+    out[6..8].copy_from_slice(&len.to_be_bytes());
+    let mut at = FRAME_HEADER_LEN;
+    for b in bodies {
+        #[allow(clippy::cast_possible_truncation)]
+        let l = b.len() as u16;
+        out[at..at + 2].copy_from_slice(&l.to_be_bytes());
+        out[at + 2..at + 2 + b.len()].copy_from_slice(b);
+        at += 2 + b.len();
+    }
+    pad(&mut out[at..]);
+    Ok(out)
+}
+
 /// Unwrap one shaped frame.
 ///
 /// # Errors
@@ -866,6 +926,23 @@ pub fn unwrap(bytes: &[u8]) -> Result<ShapedFrame, ShapingError> {
         KIND_REAL => Ok(ShapedFrame::Real(
             bytes[FRAME_HEADER_LEN..FRAME_HEADER_LEN + len].to_vec(),
         )),
+        KIND_MULTI => {
+            let inner = &bytes[FRAME_HEADER_LEN..FRAME_HEADER_LEN + len];
+            let mut bodies = Vec::new();
+            let mut at = 0usize;
+            while at < inner.len() {
+                if at + 2 > inner.len() {
+                    return Err(ShapingError::Malformed("multi frame body length"));
+                }
+                let l = usize::from(u16::from_be_bytes([inner[at], inner[at + 1]]));
+                if at + 2 + l > inner.len() {
+                    return Err(ShapingError::Malformed("multi frame body"));
+                }
+                bodies.push(inner[at + 2..at + 2 + l].to_vec());
+                at += 2 + l;
+            }
+            Ok(ShapedFrame::Many(bodies))
+        }
         _ => Err(ShapingError::Malformed("shaped frame kind")),
     }
 }
@@ -880,6 +957,9 @@ pub enum Emission {
         bytes: Vec<u8>,
         /// Real (a queued body) or cover.
         real: bool,
+        /// The highest body ticket the frame carries (0 for cover): the
+        /// sender reports it as sent ([`LinkShaper::note_sent`]).
+        ticket: u64,
     },
     /// The link is gone.
     Stopped,
@@ -896,8 +976,10 @@ pub const OFFER_ANSWER_BUDGET: Duration = Duration::from_secs(10);
 /// Poisson timer and the budget meter.
 pub struct LinkShaper {
     agreement: Agreement,
-    queue: Mutex<VecDeque<Vec<u8>>>,
+    queue: Mutex<VecDeque<(u64, Vec<u8>)>>,
     queue_cap: usize,
+    /// The peer announced multi-body frames ([`capability_body`]).
+    coalesce: std::sync::atomic::AtomicBool,
     notify: Notify,
     poisson: PoissonScheduler,
     scope: ScopeKey,
@@ -908,8 +990,10 @@ pub struct LinkShaper {
     /// it is queued ([`Self::enqueue_bulk_fallback`]).
     accepted: AtomicU64,
     /// Real frames the link really took ([`Self::note_real_sent`]). Serial and
-    /// FIFO with `accepted`, so a ticket at or below it has left this node.
-    real_sent: AtomicU64,
+    /// The highest ticket among the bodies the link really took
+    /// ([`Self::note_sent`]); FIFO with `accepted`, so a ticket at or below
+    /// it has left this node.
+    last_sent: AtomicU64,
     /// This sender's frame rate now (`f64` bits): the agreed λ, or lower when
     /// the node's cap is divided across more links ([`Self::set_share`]).
     lambda_now: AtomicU64,
@@ -947,6 +1031,7 @@ impl LinkShaper {
             agreement,
             queue: Mutex::new(VecDeque::new()),
             queue_cap,
+            coalesce: std::sync::atomic::AtomicBool::new(false),
             notify: Notify::new(),
             poisson,
             scope,
@@ -954,7 +1039,7 @@ impl LinkShaper {
             real: AtomicU64::new(0),
             cover: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
-            real_sent: AtomicU64::new(0),
+            last_sent: AtomicU64::new(0),
             lambda_now: AtomicU64::new(agreement.lambda.to_bits()),
             installed: std::time::Instant::now(),
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -1017,12 +1102,42 @@ impl LinkShaper {
     ///
     /// # Errors
     /// [`ShapingError::QueueFull`] (the caller defers), [`ShapingError::BodyTooLarge`].
-    pub fn enqueue(&self, bodies: Vec<Vec<u8>>) -> Result<(), ShapingError> {
+    pub fn enqueue(&self, bodies: Vec<Vec<u8>>) -> Result<u64, ShapingError> {
         let reach = self.reach_frames_now();
         if bodies.len() > reach {
             return Err(ShapingError::BulkBeyondReach(bodies.len(), reach));
         }
-        self.enqueue_within_queue(bodies).map(|_| ())
+        self.enqueue_within_queue(bodies)
+    }
+
+    /// The mean gap between this sender's frames now (`1 / λ`).
+    #[must_use]
+    pub fn frame_gap(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.lambda_now().max(MIN_LAMBDA))
+    }
+
+    /// How long to allow for `frames` queued bodies to leave: the Poisson
+    /// p99 of that many gaps (about 4.74 gaps for one; `frames + 4.74 × √frames`
+    /// for many), plus a margin, plus the window when the ρ budget cannot
+    /// admit them before it rolls; never more than [`ROW_LEAVE_MAX`] (a
+    /// sender that waited that long retracts and retries). The bound a sender
+    /// waits before calling a queued row undelivered ([`Self::ticket_left`]).
+    #[must_use]
+    pub fn leave_budget(&self, frames: usize) -> Duration {
+        #[allow(clippy::cast_precision_loss)]
+        let n = frames.max(1) as f64;
+        let gaps = n + 4.74 * n.sqrt();
+        let mut d = self.frame_gap().mul_f64(gaps) + Duration::from_secs(5);
+        if frames > usize::try_from(self.real_remaining()).unwrap_or(usize::MAX) {
+            d += self.agreement.window;
+        }
+        d.min(ROW_LEAVE_MAX)
+    }
+
+    /// Whether every body up to `ticket` has left this node.
+    #[must_use]
+    pub fn ticket_left(&self, ticket: u64) -> bool {
+        self.last_sent.load(Ordering::Acquire) >= ticket
     }
 
     /// This sender's frame rate now.
@@ -1074,15 +1189,43 @@ impl LinkShaper {
         self.installed.elapsed() < OFFER_ANSWER_BUDGET
     }
 
-    /// The emission task's report: one real frame was taken by the link.
-    pub fn note_real_sent(&self) {
-        self.real_sent.fetch_add(1, Ordering::AcqRel);
+    /// The emission task's report: the frame carrying bodies up to `ticket`
+    /// was taken by the link.
+    pub fn note_sent(&self, ticket: u64) {
+        self.last_sent.fetch_max(ticket, Ordering::AcqRel);
     }
 
-    /// Real frames the link has taken.
+    /// The peer announced multi-body frames: pack from here.
+    pub fn enable_coalescing(&self) {
+        self.coalesce.store(true, Ordering::Release);
+    }
+
+    /// Whether this sender packs several bodies per frame.
     #[must_use]
-    pub fn real_sent(&self) -> u64 {
-        self.real_sent.load(Ordering::Acquire)
+    pub fn coalescing(&self) -> bool {
+        self.coalesce.load(Ordering::Acquire)
+    }
+
+    /// Take back the queued bodies with tickets in `lo..=hi` that have not
+    /// left yet (a sender giving up its wait, so a retry does not send them
+    /// twice). Returns how many were removed.
+    pub fn retract(&self, lo: u64, hi: u64) -> usize {
+        let mut q = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = q.len();
+        q.retain(|(t, _)| *t < lo || *t > hi);
+        before - q.len()
+    }
+
+    /// Real frames this window's budget still admits.
+    #[must_use]
+    pub fn real_remaining(&self) -> u32 {
+        match self.budget.query(&self.scope) {
+            BudgetState::UnderBudget { real_remaining, .. } => real_remaining,
+            BudgetState::OverBudget { .. } | BudgetState::Unconfigured => 0,
+        }
     }
 
     /// Whether the shaper was stopped (its link closed or was renegotiated).
@@ -1128,11 +1271,15 @@ impl LinkShaper {
             return Err(ShapingError::QueueFull(self.queue_cap));
         }
         let count = u64::try_from(bodies.len()).unwrap_or(u64::MAX);
-        let ticket = self.accepted.fetch_add(count, Ordering::AcqRel) + count;
-        q.extend(bodies);
+        let first = self.accepted.fetch_add(count, Ordering::AcqRel) + 1;
+        let mut ticket = first;
+        for b in bodies {
+            q.push_back((ticket, b));
+            ticket += 1;
+        }
         drop(q);
         self.notify.notify_one();
-        Ok(ticket)
+        Ok(first + count - 1)
     }
 
     /// Stop the timer loop (the link closed).
@@ -1170,17 +1317,36 @@ impl LinkShaper {
             self.budget.query(&self.scope),
             BudgetState::UnderBudget { .. }
         );
-        let body = if under {
-            self.queue
+        // One frame: the head body, or, toward a peer that announced
+        // multi-body frames, as many heads as fit (v44 coalescing: a 200 B
+        // control message no longer spends a whole 16 KB slot).
+        let mut bodies: Vec<(u64, Vec<u8>)> = Vec::new();
+        if under {
+            let cap = body_capacity(self.agreement.frame_bytes);
+            let pack = self.coalescing();
+            let mut q = self
+                .queue
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_front()
-        } else {
-            None
-        };
-        let real = body.is_some();
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut used = 0usize;
+            while let Some((_, b)) = q.front() {
+                let need = if pack { 2 + b.len() } else { b.len() };
+                if !bodies.is_empty() && (!pack || used + need > cap) {
+                    break;
+                }
+                used += need;
+                bodies.push(q.pop_front().expect("front seen"));
+            }
+        }
+        let real = !bodies.is_empty();
+        let ticket = bodies.iter().map(|(t, _)| *t).max().unwrap_or(0);
         let mut pad = |buf: &mut [u8]| self.poisson.fill_bytes(buf);
-        let frame = if let Some(b) = body {
+        let frame = if bodies.len() > 1 {
+            self.budget.record_real(&self.scope);
+            self.real.fetch_add(1, Ordering::Relaxed);
+            let bs: Vec<Vec<u8>> = bodies.into_iter().map(|(_, b)| b).collect();
+            wrap_multi(self.agreement.frame_bytes, &bs, &mut pad)
+        } else if let Some((_, b)) = bodies.pop() {
             self.budget.record_real(&self.scope);
             self.real.fetch_add(1, Ordering::Relaxed);
             wrap(self.agreement.frame_bytes, Some(&b), &mut pad)
@@ -1190,7 +1356,11 @@ impl LinkShaper {
             wrap(self.agreement.frame_bytes, None, &mut pad)
         };
         match frame {
-            Ok(bytes) => Emission::Frame { bytes, real },
+            Ok(bytes) => Emission::Frame {
+                bytes,
+                real,
+                ticket,
+            },
             // Unreachable: enqueue bounded every body to the capacity.
             Err(_) => Emission::Stopped,
         }
@@ -1222,6 +1392,12 @@ pub struct LinkShapers {
     pending: Mutex<HashMap<[u8; 16], OfferAnswerTx>>,
     queue_cap: usize,
 }
+
+/// The most a sender waits for a queued row to leave a shaped link before it
+/// retracts the bodies and reports a retryable timeout: bounded so a
+/// saturated link (a window's budget spent) does not hold a dispatcher or a
+/// round gate for the whole window.
+pub const ROW_LEAVE_MAX: Duration = Duration::from_secs(60);
 
 /// How long a finished bulk fallback is remembered, so a retry that lost its
 /// wait does not send the whole message again.
@@ -1726,6 +1902,12 @@ impl LinkShapers {
     pub fn shaped_count(&self) -> usize {
         self.links().len()
     }
+
+    /// The shaped links' ids.
+    #[must_use]
+    pub fn shaped_links(&self) -> Vec<[u8; 16]> {
+        self.links().keys().copied().collect()
+    }
 }
 
 #[cfg(test)]
@@ -1995,7 +2177,7 @@ mod tests {
         let mut covers = 0;
         for _ in 0..40 {
             match s.next_emission().await {
-                Emission::Frame { bytes, real } => match unwrap(&bytes).unwrap() {
+                Emission::Frame { bytes, real, .. } => match unwrap(&bytes).unwrap() {
                     ShapedFrame::Real(_) => {
                         assert!(real);
                         reals += 1;
@@ -2004,6 +2186,7 @@ mod tests {
                         assert!(!real);
                         covers += 1;
                     }
+                    ShapedFrame::Many(_) => panic!("no coalescing was announced"),
                 },
                 Emission::Stopped => panic!("not stopped"),
             }
@@ -2266,6 +2449,61 @@ mod tests {
             f.recently_finished(&[1; 32]),
             "a finished one is not re-sent"
         );
+    }
+
+    /// v44 coalescing: a multi frame round-trips, is one frame size, and a
+    /// shaper whose peer announced the capability packs the queue into one
+    /// frame (the measured crawl: 55–220 B control bodies at one per 16 KB
+    /// frame); without the announcement it sends one body per frame. Tickets
+    /// and retraction: the frame's ticket is its highest body's, and a
+    /// retracted range never leaves.
+    #[tokio::test]
+    async fn a_peer_that_announced_coalescing_gets_many_bodies_per_frame() {
+        let mut pad = |b: &mut [u8]| b.iter_mut().for_each(|x| *x = 0xCD);
+        let bodies: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 200]).collect();
+        let f = wrap_multi(1400, &bodies, &mut pad).unwrap();
+        assert_eq!(f.len(), 1400);
+        assert_eq!(unwrap(&f).unwrap(), ShapedFrame::Many(bodies.clone()));
+        assert!(is_capability_body(&capability_body()));
+        let agreement = Agreement {
+            lambda: 200.0,
+            frame_bytes: 1400,
+            rho: 0.9,
+            window: Duration::from_secs(1),
+        };
+        let s = LinkShaper::new([3u8; 16], agreement, 64);
+        let last = s
+            .enqueue((0..20u8).map(|i| vec![i; 200]).collect())
+            .unwrap();
+        assert_eq!(last, 20);
+        // Not announced: one body per frame.
+        let Emission::Frame {
+            bytes,
+            real,
+            ticket,
+        } = s.next_emission().await
+        else {
+            panic!("stopped")
+        };
+        assert!(real);
+        assert_eq!(ticket, 1);
+        assert!(matches!(unwrap(&bytes).unwrap(), ShapedFrame::Real(_)));
+        // Announced: six 200 B bodies (6 × 202 ≤ 1392) in the next frame.
+        s.enable_coalescing();
+        let Emission::Frame { bytes, ticket, .. } = s.next_emission().await else {
+            panic!("stopped")
+        };
+        match unwrap(&bytes).unwrap() {
+            ShapedFrame::Many(got) => assert_eq!(got.len(), 6),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(ticket, 7);
+        s.note_sent(ticket);
+        assert!(s.ticket_left(7) && !s.ticket_left(8));
+        assert_eq!(s.queued(), 13);
+        assert_eq!(s.retract(15, 20), 6, "the unsent tail is taken back");
+        assert_eq!(s.queued(), 7);
+        assert_eq!(s.retract(1, 7), 0, "nothing of what left is in the queue");
     }
 
     /// The classifier's spellings ARE serde's: each bulk class is the JSON

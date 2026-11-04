@@ -579,6 +579,17 @@ async fn a_link_this_node_keeps_sending_on_is_not_reaped_854() {
 /// the first pass closes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_link_is_reaped_only_on_the_second_idle_observation_854() {
+    // CC 5.4.3 — under the suite's shaping switch the link is shaped, and a
+    // shaped link's idle is measured against its frame gap's p99 (about 11 s
+    // at the server class), not the 2 s bound: the two-observation logic is
+    // the same, the wait between passes is longer.
+    fn idle_wait() -> Duration {
+        if std::env::var_os("CIRIS_EDGE_TEST_SHAPING").is_some() {
+            Duration::from_secs(13)
+        } else {
+            BOUND + Duration::from_millis(1500)
+        }
+    }
     let mut p = pair_ticking("twice", BOUND, false).await;
     let a_key = p.a_key.clone();
     // B's pool is per destination, and A's first announce heals B's primed
@@ -596,7 +607,7 @@ async fn a_link_is_reaped_only_on_the_second_idle_observation_854() {
     // this witness's calls run a pass from here.
     p.a.set_inbound_link_idle_bound(BOUND);
     let link = a_inbound_link(&p).await;
-    tokio::time::sleep(BOUND + Duration::from_millis(1500)).await;
+    tokio::time::sleep(idle_wait()).await;
     assert_eq!(
         p.a.reap_idle_inbound_links().await,
         0,
@@ -621,7 +632,7 @@ async fn a_link_is_reaped_only_on_the_second_idle_observation_854() {
     );
     assert!(p.a.node_link_established_for_test(link));
 
-    tokio::time::sleep(BOUND + Duration::from_millis(1500)).await;
+    tokio::time::sleep(idle_wait()).await;
     assert_eq!(
         p.a.reap_idle_inbound_links().await,
         0,
