@@ -51,7 +51,7 @@ use ciris_edge::transport::av_leg_choice::{Leg, LegAction};
 use ciris_edge::transport::av_sink::AvArrival;
 use ciris_edge::transport::av_spine::AvSpine;
 use ciris_edge::transport::direct_path::{
-    DirectAccept, DirectLinksConfig, DirectPathEvent, DirectPathState,
+    DirectAccept, DirectLinksConfig, DirectPathEvent, DirectPathState, Proposing,
 };
 use ciris_edge::transport::federation_session::{OwnKexKeys, PeerKexPubkeys};
 use ciris_edge::transport::realtime_av::{
@@ -556,17 +556,30 @@ fn proposer() -> DirectLinksConfig {
     }
 }
 
-/// **W4** — the inert default: no proposal anywhere, and a call member behind
-/// `T` cannot be reached on its derived address. This is the gap item 8
-/// closes; W1 is the same dial with a facilitator configured.
+/// **W4** — proposing `off`, and an unresolved default: no proposal
+/// anywhere, leviculum's retry off, and a call member behind `T` cannot be
+/// reached on its derived address. This is the gap item 8 closes; W1 is the
+/// same dial with a facilitator (v44's resolved default).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_default_never_proposes_and_a_member_behind_t_is_unreachable() {
+async fn proposing_off_never_proposes_and_a_member_behind_t_is_unreachable() {
     let p = trio(
         "w4",
-        DirectLinksConfig::default(),
+        DirectLinksConfig {
+            proposing: Proposing::Off,
+            facilitator: Some("127.0.0.1:1".to_owned()),
+            ..DirectLinksConfig::default()
+        },
         DirectLinksConfig::default(),
     )
     .await;
+    assert!(
+        !p.a.transport.direct_link_retry_enabled(),
+        "off: no retry either"
+    );
+    assert!(
+        !p.b.transport.direct_link_retry_enabled(),
+        "an unresolved default proposes nothing, so no retry"
+    );
     let (_spine, b_addr) = open_call(&p).await;
     match p.a.transport.open_av_link(&p.b.key.key_id, &b_addr).await {
         Err(TransportError::NoRouteToPeer { .. }) => {}
@@ -618,6 +631,10 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
         unreachable!()
     };
     assert!(proposed, "A proposed");
+    assert!(
+        p.a.transport.direct_link_retry_enabled(),
+        "v44: a proposing node keeps leviculum's background re-proposal"
+    );
     assert_eq!(peer.as_deref(), Some(p.b.key.key_id.as_str()));
     let b_up = next_event(&mut p.b.events, Duration::from_secs(10), |e| {
         matches!(e, DirectPathEvent::Established { .. })

@@ -23,14 +23,31 @@
 //! broadcast then goes out on that interface too, and the A/V leg is a direct
 //! link from birth. The derived address is still never announced or pathed.
 //!
-//! # Why a configured facilitator means "propose", with no second switch
+//! # Proposing is ON by default (v44), with the bundle's canonical as facilitator
 //!
 //! CC 5.4.6 (CIRISConstitution#132): "Where the endpoints can bring the link
 //! direct ... the link MUST be brought direct and the forwarder drops out."
-//! A node with no facilitator CANNOT bring a NAT'd link direct, so the default
-//! ([`DirectLinksConfig::default`]: no facilitator) is conformant. Once an
-//! operator configures one, preferring the direct path is the CC's rule, not a
-//! preference; there is no "prefer direct" boolean to set wrong.
+//! Bringing a NAT'd link direct needs a facilitator (a reflector that tells
+//! this node its public address). [`DirectLinksConfig::default`] has
+//! [`Proposing::On`] and no facilitator named: the host's init resolves one
+//! from the baked genesis bundle's serve nodes (the canonical this node
+//! bootstraps from, `CIRIS_DIRECT_LINK_FACILITATOR=bootstrap`'s meaning;
+//! [`DirectLinksConfig::resolve_bundle_facilitator`]), under the same
+//! CIRISEdge#661 gate as the baked dials, so a test node never probes the
+//! production canonical. [`Proposing::Off`] is the operator's switch; a
+//! config with proposing on and no facilitator resolved proposes nothing and
+//! says so. Preferring the direct path once it can be had is the CC's rule,
+//! not a preference: there is no "prefer direct" boolean to set wrong.
+//!
+//! **History.** Proposing was held OFF from 2026-10-31: a punch that
+//! succeeded on one side only (Eric's desktop ↔ Francesco's node, both on
+//! edge v43.3.0) left links dead one way until leviculum closed them. Eric's
+//! conditions to turn it back on were leviculum#89 (the two-sided commit:
+//! the link moves only after both sides succeed; v0.33 tightened the rule
+//! to an address proven both ways) and CIRISEdge#926 (the Channel stall
+//! guard: a link whose sends land nothing is closed and re-dialled, and a
+//! punched one moved back to its relayed path). Both ship in v44, and
+//! proposing is ON from v44 (Eric, 2026-11-04).
 //!
 //! Accepting is separate: by default only from a peer this node shares a room
 //! with ([`DirectAccept::RoomPeers`]); [`DirectAccept::Off`] is the operator
@@ -121,15 +138,48 @@ pub enum DirectAccept {
     IdentifiedOnly,
 }
 
+/// Whether this node proposes direct links at all (v44: on by default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Proposing {
+    /// Propose, with the configured facilitator or the bundle's canonical.
+    #[default]
+    On,
+    /// The operator's switch: never propose, resolve no facilitator, and
+    /// turn leviculum's background re-proposal off too.
+    Off,
+}
+
+impl Proposing {
+    /// Parse an operator's setting: `on` or `off`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// The UDP port a canonical serves its facilitator on, assumed when the
+/// facilitator is resolved from the bundle (its serve-node hints carry the
+/// TCP dial only). leviculum's `probe_port` convention (rns-rs compatible).
+pub const BUNDLE_FACILITATOR_UDP_PORT: u16 = 4343;
+
 /// CIRISEdge#805 item 8 — direct links for this node. The default proposes
-/// nothing (no facilitator), serves no facilitator, and accepts from room
-/// peers only ([`DirectAccept::RoomPeers`]).
+/// ([`Proposing::On`]) with the facilitator the host's init resolves from
+/// the genesis bundle ([`Self::resolve_bundle_facilitator`]), serves no
+/// facilitator, and accepts from room peers only ([`DirectAccept::RoomPeers`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DirectLinksConfig {
+    /// Whether this node proposes at all (v44 default: on).
+    pub proposing: Proposing,
     /// The facilitator this node probes when it proposes, as `host:port`.
-    /// `None`: this node cannot bring a NAT'd link direct, and never proposes.
-    /// `Some`: every A/V dial to a call member that is not already a one-hop
-    /// neighbour proposes on the identity link to it (CC 5.4.6).
+    /// `None` with proposing on: unresolved; the host's init fills it from
+    /// the bundle, and a config that reaches the transport unresolved
+    /// proposes nothing. `Some`: every A/V dial to a call member that is not
+    /// already a one-hop neighbour proposes on the identity link to it
+    /// (CC 5.4.6), as does a send to a room peer over a transport node.
     pub facilitator: Option<String>,
     /// Run a facilitator on this UDP port (a reachable node: a canonical or
     /// any transport node with a public address).
@@ -153,10 +203,59 @@ impl DirectAccept {
 }
 
 impl DirectLinksConfig {
-    /// Whether this node proposes at all.
+    /// Whether this node proposes at all: proposing on AND a facilitator to
+    /// probe.
     #[must_use]
     pub fn proposes(&self) -> bool {
-        self.facilitator.is_some()
+        self.proposing == Proposing::On && self.facilitator.is_some()
+    }
+
+    /// The facilitator the genesis bundle implies: the first baked serve
+    /// node that carries an `ip` transport hint, on
+    /// [`BUNDLE_FACILITATOR_UDP_PORT`] (falling through the list past serve
+    /// nodes with no dial hint). `None` when the bundle names none.
+    #[must_use]
+    pub fn bundle_facilitator() -> Option<String> {
+        crate::edge::baked_canonical_ip_dials()
+            .into_iter()
+            .map(|(_, addr)| format!("{}:{}", addr.ip(), BUNDLE_FACILITATOR_UDP_PORT))
+            .next()
+    }
+
+    /// Fill an unnamed facilitator from the bundle when proposing is on and
+    /// `baked_dials_allowed` (the CIRISEdge#661 gate: a node under a test
+    /// trust root never touches the production canonical). `Off` resolves
+    /// nothing. Logged either way.
+    #[must_use]
+    pub fn resolve_bundle_facilitator(mut self, baked_dials_allowed: bool) -> Self {
+        match self.proposing {
+            Proposing::Off => {
+                self.facilitator = None;
+                tracing::info!("direct links: proposing OFF by the operator's setting");
+            }
+            Proposing::On if self.facilitator.is_some() => {}
+            Proposing::On if !baked_dials_allowed => {
+                tracing::warn!(
+                    "direct links: proposing on but no facilitator resolved: the baked \
+                     canonical is not dialled here (CIRISEdge#661), so nothing proposes"
+                );
+            }
+            Proposing::On => {
+                self.facilitator = Self::bundle_facilitator();
+                match &self.facilitator {
+                    Some(f) => tracing::info!(
+                        facilitator = %f,
+                        "direct links: facilitator resolved from the genesis bundle's first \
+                         serve node (v44: proposing on by default)"
+                    ),
+                    None => tracing::warn!(
+                        "direct links: proposing on but the genesis bundle names no serve \
+                         node with a dial hint: nothing proposes"
+                    ),
+                }
+            }
+        }
+        self
     }
 
     /// The settings handed to `ReticulumNodeBuilder::direct_link`, always,
@@ -170,7 +269,7 @@ impl DirectLinksConfig {
                 DirectAccept::Off => DirectLinkPolicy::Reject,
                 DirectAccept::IdentifiedOnly => DirectLinkPolicy::IdentifiedOnly,
             },
-            facilitator: self.facilitator.clone(),
+            facilitator: self.proposes().then(|| self.facilitator.clone()).flatten(),
             protocol: ProbeProtocol::Rnsp,
             facilitator_port: self.serve_facilitator,
         }
@@ -734,6 +833,53 @@ mod tests {
         }
         assert_eq!(DirectAccept::parse("on"), None);
         assert_eq!(DirectAccept::parse(""), None);
+    }
+
+    /// v44 — the default proposes: on, with the bundle's canonical as the
+    /// facilitator once the host's init resolves it. `Off` resolves none and
+    /// never proposes; an unresolved default proposes nothing. Mutation: a
+    /// default of `Proposing::Off` fails this test.
+    #[test]
+    fn the_default_proposes_with_the_bundle_facilitator_and_off_never_does() {
+        let bundle = DirectLinksConfig::bundle_facilitator()
+            .expect("the baked genesis bundle names a serve node with an ip hint");
+        assert!(bundle.ends_with(&format!(":{BUNDLE_FACILITATOR_UDP_PORT}")));
+        let d = DirectLinksConfig::default();
+        assert_eq!(d.proposing, Proposing::On);
+        assert!(!d.proposes(), "unresolved: nothing to propose with");
+        assert_eq!(d.leviculum_settings().facilitator, None);
+        let on = d.clone().resolve_bundle_facilitator(true);
+        assert_eq!(on.facilitator.as_deref(), Some(bundle.as_str()));
+        assert!(on.proposes());
+        assert_eq!(
+            on.leviculum_settings().facilitator.as_deref(),
+            Some(bundle.as_str())
+        );
+        let gated = d.resolve_bundle_facilitator(false);
+        assert_eq!(gated.facilitator, None);
+        assert!(!gated.proposes());
+        let off = DirectLinksConfig {
+            proposing: Proposing::Off,
+            facilitator: Some("127.0.0.1:4343".to_owned()),
+            ..DirectLinksConfig::default()
+        }
+        .resolve_bundle_facilitator(true);
+        assert_eq!(off.facilitator, None);
+        assert!(!off.proposes());
+        assert_eq!(off.leviculum_settings().facilitator, None);
+        let named = DirectLinksConfig {
+            facilitator: Some("10.0.0.1:4343".to_owned()),
+            ..DirectLinksConfig::default()
+        }
+        .resolve_bundle_facilitator(true);
+        assert_eq!(
+            named.facilitator.as_deref(),
+            Some("10.0.0.1:4343"),
+            "a named one stays"
+        );
+        assert_eq!(Proposing::parse("on"), Some(Proposing::On));
+        assert_eq!(Proposing::parse("off"), Some(Proposing::Off));
+        assert_eq!(Proposing::parse("yes"), None);
     }
 
     #[test]

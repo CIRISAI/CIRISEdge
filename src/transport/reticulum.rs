@@ -1993,9 +1993,11 @@ pub struct ReticulumTransportConfig {
     /// makes the `listen_addr` server + every bootstrap client a member-only port;
     /// `None` = open. Typed `interfaces` carry their own IFAC.
     pub ifac: Option<IfacConfig>,
-    /// CIRISEdge#805 item 8 — direct links through NAT (leviculum#70). The
-    /// default is inert: no facilitator (never proposes), none served, every
-    /// peer's request refused. See [`crate::transport::direct_path`].
+    /// CIRISEdge#805 item 8 — direct links through NAT (leviculum#70). v44:
+    /// proposing is ON by default, with the facilitator the host's init
+    /// resolves from the genesis bundle; a config that reaches the transport
+    /// with none resolved proposes nothing. Serving is off and accepting is
+    /// from room peers. See [`crate::transport::direct_path`].
     pub direct_links: crate::transport::direct_path::DirectLinksConfig,
     /// CC 5.4.3 — this node's link-shaping policy (`CLM-link-shaping`).
     /// Default `off`: nothing is offered and no link is shaped.
@@ -2947,6 +2949,9 @@ pub struct ReticulumTransport {
     /// knob, the per-peer state machine, the dials waiting on a proposal, the
     /// event broadcast and the anchored identity links.
     direct_paths: Arc<crate::transport::direct_path::DirectPaths>,
+    /// v44 — whether leviculum's background re-proposal of a failed direct
+    /// link is on for this node (its default; forced off when proposing is).
+    direct_link_retry: std::sync::atomic::AtomicBool,
     /// ALM stage 2 — per-link timed-frame expiries and learned relay routes
     /// (written by the event loop, read by the call layer).
     alm_links: Arc<crate::transport::alm_link::AlmLinkState>,
@@ -3537,6 +3542,8 @@ impl ReticulumTransport {
             .direct_link(config.direct_links.leviculum_settings());
         tracing::info!(
             proposes = config.direct_links.proposes(),
+            proposing = ?config.direct_links.proposing,
+            facilitator = ?config.direct_links.facilitator,
             serves_facilitator = ?config.direct_links.serve_facilitator,
             accept = ?config.direct_links.accept,
             "reticulum direct links (CIRISEdge#805 item 8, leviculum#70)"
@@ -3835,11 +3842,14 @@ impl ReticulumTransport {
             );
         }
         node.set_announce_control(Some(Box::new(announce_policy.clone())));
-        // leviculum v0.33 retries this node's failed direct-link proposals in
-        // the background by default. While edge does not propose (no
-        // facilitator — the production default, Eric's hold), no retry may
-        // propose for it either.
-        if !config.direct_links.proposes() {
+        // leviculum v0.32+ re-proposes a failed direct link on its own
+        // (1, 2, 5, 10, 15 min). That is wanted exactly when this node
+        // proposes (v44: on by default, with a resolved facilitator); while
+        // it does not (proposing off, or no facilitator resolved), no retry
+        // may propose for it either. Proposing was held off from 2026-10-31
+        // (the one-sided punch) until leviculum#89 and CIRISEdge#926 shipped.
+        let direct_link_retry = config.direct_links.proposes();
+        if !direct_link_retry {
             node.set_direct_link_retry(false);
         }
 
@@ -3851,13 +3861,6 @@ impl ReticulumTransport {
         node.start()
             .await
             .map_err(|e| TransportError::Io(format!("reticulum node start: {e}")))?;
-        // leviculum v0.32+ re-proposes a failed direct link on its own
-        // (1, 2, 5, 10, 15 min). While this node proposes nothing (the
-        // production default since the 2026-10-31 one-sided punch, until the
-        // host names a facilitator) the retry stays off with it.
-        if !config.direct_links.proposes() {
-            node.set_direct_link_retry(false);
-        }
         // ALM stage 2 — a transport node's C2 admission of the links it
         // forwards (leviculum#93). The hook runs under the node lock and reads
         // only the admission's own ledger.
@@ -4040,6 +4043,7 @@ impl ReticulumTransport {
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_paths,
+            direct_link_retry: std::sync::atomic::AtomicBool::new(direct_link_retry),
             alm_links: Arc::new(crate::transport::alm_link::AlmLinkState::new()),
             forward_admission,
             forward_load: Arc::new(std::sync::Mutex::new(
@@ -6469,6 +6473,14 @@ impl ReticulumTransport {
     /// request).
     pub fn forget_direct_contact(&self, node_key_id: &str) {
         self.direct_paths.forget_contact(node_key_id);
+    }
+
+    /// v44 — whether leviculum re-proposes this node's failed direct links in
+    /// the background: on iff this node proposes.
+    #[must_use]
+    pub fn direct_link_retry_enabled(&self) -> bool {
+        self.direct_link_retry
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// CIRISEdge#805 item 8 — every direct-path event this node sees (either
