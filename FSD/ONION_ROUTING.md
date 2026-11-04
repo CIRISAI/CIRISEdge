@@ -28,8 +28,9 @@ Today the canonical bundle seats one relay, so the floor fails on every node.
 - **Anonymous mode is row-plane only.** While the tier is active, a node starts no call and no
   stream (`onion_anonymous_no_media`).
 - **Shaping.** It is on by default for the `server` class only and is opt-in for every other class.
-  Whatever the class, a node running the tier always shapes its layer links, and those links get a
-  reserved share of the cap (`docs/LINK_SHAPING_COST.md`).
+  Whatever the class, a node running the tier always shapes its layer links, at the class rate and
+  counting within the eight links of CC 5.4.3 rc17; a `seat` link sits outside them
+  (`docs/LINK_SHAPING_COST.md`).
 
 **Still owed:**
 

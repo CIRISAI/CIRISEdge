@@ -121,6 +121,13 @@ impl OnionRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = d;
     }
 
+    /// Whether this node's relay offering is on
+    /// ([`super::policy::relay_offering`]).
+    #[must_use]
+    pub fn relay_offering(&self) -> bool {
+        super::policy::relay_offering(&self.policy(), &self.device())
+    }
+
     /// Install this period's deal (computed from the fold).
     pub fn install_deal(&self, deal: LayerDeal) {
         lock(&self.state).deal = Some(deal);
@@ -333,7 +340,7 @@ mod tests {
     }
 
     /// v44 ships DORMANT: a fresh runtime is not opted in, relays nothing
-    /// (refusing before any crypto), reserves no layer links, and leaves
+    /// (refusing before any crypto), names no layer neighbours, and leaves
     /// calls and streams alone.
     #[test]
     fn the_v44_runtime_is_dormant() {

@@ -772,6 +772,13 @@ impl ReplicationCoordinator {
         &self.peer_key_id
     }
 
+    /// CC 5.4.3 — the frame gap of the shaped link to this peer, when shaped
+    /// ([`Transport::pacing_gap`]): the scheduler paces this coordinator's
+    /// waits and interval by it.
+    pub(crate) fn pacing_gap(&self) -> Option<std::time::Duration> {
+        self.transport.pacing_gap(&self.peer_key_id)
+    }
+
     fn outcome_to_step(outcome: ReplicationOutcome) -> DriveStep {
         match outcome {
             ReplicationOutcome::Send(msgs) => DriveStep::SendThenWait(msgs),

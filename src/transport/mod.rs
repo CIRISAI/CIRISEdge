@@ -226,6 +226,8 @@ pub mod link_seal;
 /// (`CLM-pre-seal-route-fetch`).
 #[cfg(feature = "_reticulum-module")]
 pub mod route_fetch;
+#[cfg(feature = "_reticulum-module")]
+pub mod shaping_referral;
 
 /// CC 5.4.3 — link shaping (`CLM-link-shaping`): constant MDU-sized frames at
 /// Poisson times on a shaped identity link, both ways, negotiated right after
@@ -782,6 +784,16 @@ pub trait Transport: Send + Sync + 'static {
     /// it as the Edge's bag rather than minting a second one the
     /// transport would never count into. Default: none.
     fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {
+        None
+    }
+
+    /// CC 5.4.3 — the mean gap between frames on the shaped link to
+    /// `destination_key_id`, when the link is shaped: what a round's waits
+    /// are paced by (FSD/TRANSPORT_TIERS_MODEL.md: a per-wait timeout of about
+    /// 4.74 gaps and a round interval of about 7.75 gaps). `None` on an
+    /// unshaped link or a transport without shaping.
+    fn pacing_gap(&self, destination_key_id: &str) -> Option<std::time::Duration> {
+        let _ = destination_key_id;
         None
     }
 

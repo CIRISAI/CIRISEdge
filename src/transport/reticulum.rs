@@ -2026,9 +2026,10 @@ pub struct ReticulumTransportConfig {
     /// peer's request refused. See [`crate::transport::direct_path`].
     pub direct_links: crate::transport::direct_path::DirectLinksConfig,
     /// CC 5.4.3 — this node's link-shaping policy (`CLM-link-shaping`).
-    /// Default `off`: nothing is offered and no link is shaped. A host sets
-    /// its class's fleet default (`ShapingPolicy::for_device`): on for
-    /// `server`, opt-in for the rest.
+    /// The fleet defaults are `ShapingPolicy::for_device`: on for `server`,
+    /// the person's choice for the rest. A bare config is `off`, a library
+    /// state that names no class, never a fleet position: a host names its
+    /// class.
     pub shaping: crate::transport::link_shaping::ShapingPolicy,
     /// The device this node runs on (CC 5.4.6 item 1 relay policy; the
     /// mobile host updates it at runtime, `set_device_state`).
@@ -2611,6 +2612,14 @@ pub struct ReticulumTransport {
     /// without a dial for [`BULK_DIAL_NEGATIVE_TTL`] (the peer homes elsewhere,
     /// CIRISEdge#935); bulk still dials its unshaped link.
     row_homed_elsewhere: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// CC 5.4.3 referrals — refused dials with their referrals, to the homing
+    /// worker ([`run_homing`]). A channel and not a spawn: a dial that spawned
+    /// the next dial would be a future containing itself.
+    homing_tx: mpsc::Sender<HomingJob>,
+    /// The worker's end, taken by `listen`.
+    homing_rx: Mutex<Option<mpsc::Receiver<HomingJob>>>,
+    /// The nodes this node homed on, by the node that refused it.
+    homed: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead
     /// of the real one (see [`HandshakeOverride`]). `None` in production.
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
@@ -3308,6 +3317,9 @@ impl ReticulumTransport {
             test_refuse_dials: Arc::clone(&self.test_refuse_dials),
             test_refused_dials: Arc::clone(&self.test_refused_dials),
             row_homed_elsewhere: Arc::clone(&self.row_homed_elsewhere),
+            homing_tx: self.homing_tx.downgrade(),
+            homed: Arc::clone(&self.homed),
+            peers: Arc::clone(&self.peers),
             test_identify_last: Arc::clone(&self.test_identify_last),
             deferred_handshake_part: Arc::clone(&self.deferred_handshake_part),
             test_binding_key_only: Arc::clone(&self.test_binding_key_only),
@@ -3421,9 +3433,27 @@ impl ReticulumTransport {
             config.local_key_id.clone(),
         ));
         // CC 5.4.3 — the shaped-link table under this node's policy.
+        let (homing_tx, homing_rx) = mpsc::channel(HOMING_QUEUE);
         let shapers = Arc::new(crate::transport::link_shaping::LinkShapers::new(
             config.shaping.clone(),
         ));
+        // CC 5.4.3 referrals — free slots are reported from the start, while
+        // the relay offering is on (`onion_refresh` follows it from here).
+        shapers.enable_capacity_reports();
+        shapers.set_relay_offering(onion.relay_offering());
+        // CC 5.4.3 rc17 the `seat` class: the serve seats are the signed
+        // genesis bundle's, never self-declared; a seat-to-seat link is
+        // offered it.
+        {
+            let seated: std::collections::HashSet<String> =
+                ciris_persist::federation::genesis::canonical_genesis_bundle()
+                    .serve_nodes
+                    .iter()
+                    .map(|sr| sr.record.key_id.clone())
+                    .collect();
+            let own = seated.contains(&config.local_key_id);
+            shapers.set_seats(seated, own);
+        }
         if shapers.policy().enabled() {
             tracing::info!(
                 class = shapers.policy().class.as_str(),
@@ -3990,6 +4020,9 @@ impl ReticulumTransport {
             bulk_fallbacks: Arc::new(crate::transport::link_shaping::BulkFallbacks::default()),
             bulk_dial_failed: std::sync::Mutex::new(HashMap::new()),
             row_homed_elsewhere: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            homing_tx,
+            homing_rx: Mutex::new(Some(homing_rx)),
+            homed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             av_call_router: std::sync::OnceLock::new(),
             test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_handshake_part: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -6640,6 +6673,31 @@ impl ReticulumTransport {
             .len()
     }
 
+    /// Seat-tier test seam — name the serve seats and whether this node is one
+    /// (production reads the signed genesis bundle).
+    #[doc(hidden)]
+    pub fn set_seats_for_test(&self, seats: std::collections::HashSet<String>, own: bool) {
+        self.shapers.set_seats(seats, own);
+    }
+
+    /// Seat-tier test seam — seats by key-id prefix.
+    #[doc(hidden)]
+    pub fn set_seat_prefixes_for_test(&self, prefixes: Vec<String>, own: bool) {
+        self.shapers.set_seat_prefixes(prefixes, own);
+    }
+
+    /// Test seam — the agreed frame rate (λ) of each shaped link.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn shaped_rates_for_test(&self) -> Vec<f64> {
+        self.shapers
+            .shaped_links()
+            .into_iter()
+            .filter_map(|l| self.shapers.get(l))
+            .map(|s| s.agreement().lambda)
+            .collect()
+    }
+
     /// CC 5.4.3 two-planes test seam — dials refused so far.
     #[doc(hidden)]
     #[must_use]
@@ -7256,6 +7314,24 @@ impl ReticulumTransport {
     /// active names none and reserves nothing.
     pub fn onion_refresh(&self) {
         self.shapers.set_layer_peers(self.onion.layer_peers());
+        self.shapers.set_relay_offering(self.onion.relay_offering());
+    }
+
+    /// CC 5.4.3 referrals — the free slots `peer` last reported here.
+    #[must_use]
+    pub fn peer_free_slots(&self, peer: &str) -> Option<u8> {
+        self.shapers.peer_free_slots(peer)
+    }
+
+    /// CC 5.4.3 referrals — the nodes this node homed on after a refusal.
+    #[must_use]
+    pub fn homed_on_referrals(&self) -> Vec<String> {
+        self.homed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// CC 5.4.6 item 2 — publish `payload` through the tier: route over this
@@ -8636,12 +8712,23 @@ impl ReticulumTransport {
             // it is meant to gate is still running — the single-flight property
             // #532 installed would hold only for callers that survive.
             let gate = self.dial_gate_for(peer.dest_hash).await;
+            let gate_permits = if !bulk
+                && self.shapers.offers_to(Some(destination_key_id))
+                && !self.peer_row_link_is_unshaped(&peer.dest_hash).await
+            {
+                u32::try_from(MAX_CONCURRENT_DIALS_PER_DEST).unwrap_or(1)
+            } else {
+                1
+            };
             let ctx = lane_ctx();
             let peer_owned = peer;
             let dkid = destination_key_id.to_owned();
             let dial = tokio::spawn(async move {
+                // CC 5.4.3 rc17 — a row dial to a peer this node shapes toward
+                // takes the whole gate: two concurrent ones would each bring
+                // up a shaped link, and each spends one of the eight.
                 let _dial_permit = gate
-                    .acquire()
+                    .acquire_many(gate_permits)
                     .await
                     .map_err(|e| TransportError::Io(format!("dial gate closed: {e}")))?;
                 // Double-check: a concurrent dial we queued behind may have just
@@ -8663,6 +8750,22 @@ impl ReticulumTransport {
                 .map_err(|e| TransportError::Io(format!("dial task failed: {e}")))??
         };
         Ok(claim)
+    }
+
+    /// Whether a row link this node dialled to `dest` runs unshaped: the peer
+    /// has shown it does not shape, so its row dials need no single flight
+    /// for the bound and keep their ordinary lanes.
+    async fn peer_row_link_is_unshaped(&self, dest: &DestinationHash) -> bool {
+        self.reusable_dialed_link
+            .lock()
+            .await
+            .get(dest)
+            .is_some_and(|pool| {
+                pool.iter().any(|id| {
+                    let bytes = id.into_bytes();
+                    !self.shapers.is_shaped(bytes) && !self.shapers.is_bulk(bytes)
+                })
+            })
     }
 
     /// CIRISEdge#353 — the peer's freshest LIVE link that it dialled and
@@ -9463,6 +9566,10 @@ impl ReticulumTransport {
 // attributes the lint to the impl, so the allow lives here (v13.6.1).
 #[allow(clippy::too_many_lines)]
 impl Transport for ReticulumTransport {
+    fn pacing_gap(&self, destination_key_id: &str) -> Option<Duration> {
+        self.shapers.gap_to_peer(destination_key_id)
+    }
+
     fn id(&self) -> TransportId {
         TransportId::RETICULUM_RS
     }
@@ -9785,6 +9892,9 @@ impl Transport for ReticulumTransport {
             .await
             .take()
             .ok_or_else(|| TransportError::Config("listen called twice".into()))?;
+        if let Some(jobs) = self.homing_rx.lock().await.take() {
+            tokio::spawn(run_homing(self.dial_ctx(), jobs));
+        }
 
         tracing::info!(
             addr = %self.config.listen_addr,
@@ -10804,6 +10914,12 @@ struct DialCtx {
     /// Shared with the transport: peers whose row link was refused at a bound
     /// ([`ReticulumTransport::row_homed_elsewhere`]).
     row_homed_elsewhere: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Weak, so the worker's own context does not keep its channel open.
+    homing_tx: mpsc::WeakSender<HomingJob>,
+    /// See [`ReticulumTransport::homed`].
+    homed: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// The peer table: a referred node is installed here to be dialled.
+    peers: Arc<Mutex<HashMap<String, RootedPeer>>>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_identify_last`.
     test_identify_last: Arc<std::sync::atomic::AtomicBool>,
     /// CC 5.3.3.5 E1 test seam ([`HandshakeOverride::DeferLastPart`]): the
@@ -11631,6 +11747,182 @@ impl DialCtx {
         self.offer_shaping(link_id, peer).await
     }
 
+    /// CC 5.4.3 referrals — hand the referral that came with `peer`'s refusal
+    /// on `link` to the homing worker. A dialler refusing at its own bound
+    /// has none, and homes nowhere.
+    fn queue_homing(&self, peer: &str, link: [u8; 16]) {
+        let Some(frame) = self.shapers.take_referrals(link) else {
+            return;
+        };
+        let job = HomingJob {
+            refused_by: peer.to_owned(),
+            referrals: frame.referrals,
+        };
+        if let Some(tx) = self.homing_tx.upgrade() {
+            if tx.try_send(job).is_err() {
+                tracing::debug!(peer = %peer, "homing queue full; a referral is a hint");
+            }
+        }
+    }
+
+    /// Whether this node already holds a shaped link to a node it homed on.
+    fn holds_a_homed_link(&self) -> bool {
+        self.homed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .any(|n| self.shapers.peer_is_shaped(n))
+    }
+
+    /// Verify a referred node's route as a fetched one
+    /// ([`verify_route_answer`]) and install it to dial: `Advisory`, a routing
+    /// hint, its hybrid-signed row binding the transport identity to the key.
+    /// A node already held keeps what it holds.
+    async fn install_referred(
+        &self,
+        rooting: &dyn RootingDirectory,
+        key_id: &str,
+        answer: crate::transport::route_fetch::RouteAnswer,
+    ) -> Result<ResolvedPeer, String> {
+        let td = answer.route.transport_destination.clone();
+        verify_route_answer(rooting, key_id, answer)
+            .await
+            .map_err(|e| e.to_string())?;
+        let half = |b: Option<&str>| -> Option<[u8; 32]> {
+            base64::engine::general_purpose::STANDARD
+                .decode(b?)
+                .ok()?
+                .try_into()
+                .ok()
+        };
+        let (Some(x25519), Some(ed25519)) = (
+            half(td.transport_x25519_pubkey_base64.as_deref()),
+            half(td.transport_ed25519_pubkey_base64.as_deref()),
+        ) else {
+            return Err("the route carries no transport identity".to_owned());
+        };
+        let mut transport_pubkey64 = [0u8; 64];
+        transport_pubkey64[..32].copy_from_slice(&x25519);
+        transport_pubkey64[32..].copy_from_slice(&ed25519);
+        let dest_hash: [u8; 16] = hex::decode(&td.destination)
+            .ok()
+            .and_then(|d| d.try_into().ok())
+            .ok_or_else(|| "the route's destination is not a hash".to_owned())?;
+        if named_dest_of_transport(&transport_pubkey64) != Some(dest_hash) {
+            return Err("the transport identity does not reproduce the destination".to_owned());
+        }
+        let mut peers = self.peers.lock().await;
+        if let Some(held) = peers.get(key_id) {
+            return Ok(ResolvedPeer {
+                dest_hash: held.peer.dest_hash,
+                transport_ed25519: held.peer.transport_ed25519,
+            });
+        }
+        let peer = ResolvedPeer {
+            dest_hash: DestinationHash::new(dest_hash),
+            transport_ed25519: ed25519,
+        };
+        peers.insert(
+            key_id.to_owned(),
+            RootedPeer {
+                peer: ResolvedPeer {
+                    dest_hash: peer.dest_hash,
+                    transport_ed25519: ed25519,
+                },
+                epoch: 0,
+                chain: None,
+                provenance: ciris_persist::federation::self_at_login::BindingProvenance::Advisory,
+                transport_identity_hash: Identity::from_public_keys(&x25519, &ed25519)
+                    .map_or([0u8; 16], |id| *id.hash()),
+                owns_key: true,
+                transport_pubkey64,
+                last_seen: std::time::Instant::now(),
+                manifest_commitment: None,
+            },
+        );
+        Ok(peer)
+    }
+
+    /// CC 5.4.3 referrals — try a refusal's referrals in order until one takes
+    /// a shaped row link. A referred node treats this node as any shaping
+    /// peer, so a refusal here is one more stale hint and the next is tried.
+    /// When none takes, the peer is left to its fallback order.
+    async fn home_on_referrals(&self, job: HomingJob) {
+        use crate::observability as o;
+        let count = |label: &'static str| {
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_link_shaping(label);
+            }
+        };
+        if self.holds_a_homed_link() {
+            return;
+        }
+        let Some(rooting) = self.rooting.as_deref() else {
+            return;
+        };
+        let offered = job.referrals.len();
+        for answer in job.referrals {
+            count(o::LINK_SHAPING_REFERRAL_RECEIVED);
+            let key_id = answer.route.attesting_key_id.clone();
+            let refused_lately = self
+                .row_homed_elsewhere
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key_id)
+                .is_some_and(|at| at.elapsed() < BULK_DIAL_NEGATIVE_TTL);
+            if refused_lately || key_id == self.own_key_id || key_id == job.refused_by {
+                count(o::LINK_SHAPING_REFERRAL_FAILED);
+                continue;
+            }
+            let peer = match self.install_referred(rooting, &key_id, answer).await {
+                Ok(p) => p,
+                Err(detail) => {
+                    count(o::LINK_SHAPING_REFERRAL_REJECTED);
+                    tracing::warn!(
+                        referred = %key_id,
+                        refused_by = %job.refused_by,
+                        reason = o::LINK_SHAPING_REFERRAL_REJECTED,
+                        detail = %detail,
+                        "a referral failed verification; the next is tried (CC 5.4.3)"
+                    );
+                    continue;
+                }
+            };
+            let has_path = self.node.has_path(&peer.dest_hash);
+            let budget = if has_path {
+                LINK_ESTABLISH_TIMEOUT
+            } else {
+                NO_PATH_ESTABLISH_TIMEOUT
+            };
+            let dialled = self
+                .dial_and_identify(&key_id, &peer, has_path, budget)
+                .await;
+            if dialled.is_ok() && self.shapers.peer_is_shaped(&key_id) {
+                drop(dialled);
+                count(o::LINK_SHAPING_REFERRAL_HOMED);
+                tracing::info!(
+                    referred = %key_id,
+                    refused_by = %job.refused_by,
+                    reason = o::LINK_SHAPING_REFERRAL_HOMED,
+                    "homed on a referral after a refusal at the bound (CC 5.4.3)"
+                );
+                self.homed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(job.refused_by, key_id);
+                return;
+            }
+            count(o::LINK_SHAPING_REFERRAL_FAILED);
+        }
+        count(o::LINK_SHAPING_REFERRAL_EXHAUSTED);
+        tracing::info!(
+            refused_by = %job.refused_by,
+            offered,
+            reason = o::LINK_SHAPING_REFERRAL_EXHAUSTED,
+            "no referral took this node's row link: its fallback order applies (CC 5.4.3)"
+        );
+    }
+
     async fn offer_shaping(&self, link_id: LinkId, peer: &str) -> Result<(), TransportError> {
         use crate::transport::link_shaping::{ShapingError, OFFER_ANSWER_BUDGET};
         // CC 5.4.3 / 5.4.6 item 4 — nothing is offered to a peer this node
@@ -11693,11 +11985,14 @@ impl DialCtx {
                 Ok(())
             }
             Ok(Ok(Err(e))) => {
-                if matches!(e, ShapingError::HomeElsewhere) {
+                // A lost race for a slot beside the peer's own shaped link
+                // is no refusal of the peer: its rows ride that link.
+                if matches!(e, ShapingError::HomeElsewhere) && !self.shapers.peer_is_shaped(peer) {
                     self.row_homed_elsewhere
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(peer.to_owned(), std::time::Instant::now());
+                    self.queue_homing(peer, link);
                 }
                 let err = refuse(e);
                 self.close_refused(link_id).await;
@@ -11841,18 +12136,27 @@ impl DialCtx {
         // transfer already on it — which is the regression the M=4 sweep caught.
         // CC 5.4.3 rc16 two planes — a link belongs to one plane: the row lane
         // never takes a bulk link, the bulk lane never a shaped one.
-        let picked = pool
-            .iter()
-            .find(|id| {
-                !in_flight.contains(*id)
-                    && planes.get(*id) == Some(&LinkPlane::Identity)
-                    && if self.bulk_lane {
-                        !self.shapers.is_shaped(id.into_bytes())
-                    } else {
-                        !self.shapers.is_bulk(id.into_bytes())
-                    }
-            })
-            .copied();
+        // CC 5.4.3 rc17 — one shaped link to a peer, at the full class rate:
+        // rows share it, busy or not (its shaper is the queue, there is no
+        // Resource on it to collide with), so a burst of rows never opens a
+        // second shaped link and spends another of the eight.
+        let identity = |id: &&LinkId| planes.get(*id) == Some(&LinkPlane::Identity);
+        let picked = if self.bulk_lane {
+            pool.iter()
+                .filter(identity)
+                .find(|id| !in_flight.contains(*id) && !self.shapers.is_shaped(id.into_bytes()))
+                .copied()
+        } else {
+            pool.iter()
+                .filter(identity)
+                .find(|id| self.shapers.is_shaped(id.into_bytes()))
+                .or_else(|| {
+                    pool.iter().filter(identity).find(|id| {
+                        !in_flight.contains(*id) && !self.shapers.is_bulk(id.into_bytes())
+                    })
+                })
+                .copied()
+        };
         // CIRISEdge#819 (Codex on #821) — a hand-out RESERVES the lane: it is
         // marked in flight here, under the pool lock, so the caller owns the
         // transfer from this instant. A stamp alone was not enough: a
@@ -14198,6 +14502,16 @@ async fn shaped_inbound(
         handle_shaping_offer(ctx, link_id, &plain).await;
         return None;
     }
+    // CC 5.4.3 referrals — they precede the refusal, and are taken only while
+    // this node waits on its offer's answer.
+    if lane == Lane::Channel && crate::transport::shaping_referral::is_referral_frame(&plain) {
+        if !ctx.shapers.accept_referral_part(link, &plain) {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_REFERRAL_REJECTED);
+            }
+        }
+        return None;
+    }
     match ctx.shapers.get(link) {
         // The switch to shaped is not atomic across the two ends: a frame the
         // peer sent bare just before it installed its shaper lands here just
@@ -14224,7 +14538,7 @@ async fn shaped_inbound(
                 if crate::transport::link_shaping::is_capability_body(&body) =>
             {
                 // v44 — the peer announced multi-body frames: pack toward it.
-                s.enable_coalescing();
+                note_capability(ctx, &s, link, &body);
                 tracing::debug!(
                     link = %hex::encode(link),
                     "peer announced shaped-frame coalescing; packing bodies toward it"
@@ -14236,7 +14550,12 @@ async fn shaped_inbound(
                 // Several bodies in one frame: each routes as a frame of its
                 // own, in order. (A Channel-lane frame is never a Resource.)
                 for body in bodies {
-                    route_opened(ctx, link_id, false, body).await;
+                    // A capacity report sent mid-life rides with the rows.
+                    if crate::transport::link_shaping::is_capability_body(&body) {
+                        note_capability(ctx, &s, link, &body);
+                    } else {
+                        route_opened(ctx, link_id, false, body).await;
+                    }
                 }
                 None
             }
@@ -14256,6 +14575,78 @@ async fn shaped_inbound(
         }
         None => Some(plain),
     }
+}
+
+/// A capability body from the peer on `link`: it packs frames, and it reports
+/// free slots ([`crate::transport::link_shaping::capability_body`]).
+fn note_capability(
+    ctx: &EventCtx<'_>,
+    shaper: &crate::transport::link_shaping::LinkShaper,
+    link: [u8; 16],
+    body: &[u8],
+) {
+    shaper.enable_coalescing();
+    if let Some(free) = crate::transport::link_shaping::capability_free_slots(body) {
+        ctx.shapers.note_peer_capacity(link, free);
+    }
+}
+
+/// The responder's answer to `theirs`: its own offer, or the refusal with its
+/// referrals. `false` when the answer could not be sent; the link is torn down.
+async fn answer_shaping_offer(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    theirs: &crate::transport::link_shaping::ShapingOffer,
+) -> bool {
+    use crate::transport::link_shaping::ShapingError;
+    let link = link_id.into_bytes();
+    // Only identity links are shaped (CC 5.4.6; `shaping_applies_to`):
+    // on a scoped or A/V link this node answers `off`, whatever its class.
+    let (_, plane) = resolve_inbound_link(ctx, &link_id).await;
+    // The peer the handshake attributed the link to, when known: a layer
+    // neighbour is offered shaping under any scope and may take any of
+    // the eight (CIRISEdge v44, CC 5.4.3, 5.4.6 item 4).
+    let peer = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    let ours = if shaping_applies_to(plane) {
+        ctx.shapers.offer_for_answer(
+            link,
+            link_channel_mdu(ctx.node, &link_id),
+            peer.as_deref(),
+            theirs,
+        )
+    } else {
+        ctx.shapers.offer_off_for(link)
+    };
+    if ours.class == crate::transport::link_shaping::BudgetClass::HomeElsewhere {
+        let mut frames = referral_frames(ctx, link_id, peer.as_deref()).await;
+        frames.push(ours.encode());
+        spawn_refusal_send(
+            Arc::clone(ctx.av_node),
+            Arc::clone(ctx.seals),
+            Arc::clone(ctx.shapers),
+            link_id,
+            frames,
+        );
+    } else {
+        let out =
+            send_fragments_on_channel(ctx.node, ctx.seals, ctx.shapers, &link_id, &[ours.encode()])
+                .await;
+        if !out.complete() {
+            shaping_teardown(
+                ctx,
+                link_id,
+                &ShapingError::WrongKind("the answer was not sent"),
+            )
+            .await;
+            return false;
+        }
+    }
+    if ours.shapes() {
+        if let Some(m) = ctx.metrics {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
+        }
+    }
+    true
 }
 
 /// CC 5.4.3 — a peer's shaping offer landed on `link_id`. A link this node
@@ -14280,41 +14671,8 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
     // outcome through its pending answer (`offer_shaping`), which counts and
     // closes on its side.
     let responder = !ctx.shapers.has_offered(link);
-    if responder {
-        // Only identity links are shaped (CC 5.4.6; `shaping_applies_to`):
-        // on a scoped or A/V link this node answers `off`, whatever its class.
-        let (_, plane) = resolve_inbound_link(ctx, &link_id).await;
-        let ours = if shaping_applies_to(plane) {
-            // The peer the handshake attributed the link to, when known: a
-            // layer neighbour is offered shaping under any scope and draws on
-            // the reserve (CIRISEdge v44, CC 5.4.6 item 4).
-            let peer = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
-            ctx.shapers.offer_for_answer(
-                link,
-                link_channel_mdu(ctx.node, &link_id),
-                peer.as_deref(),
-                &theirs,
-            )
-        } else {
-            ctx.shapers.offer_off_for(link)
-        };
-        let out =
-            send_fragments_on_channel(ctx.node, ctx.seals, ctx.shapers, &link_id, &[ours.encode()])
-                .await;
-        if !out.complete() {
-            shaping_teardown(
-                ctx,
-                link_id,
-                &ShapingError::WrongKind("the answer was not sent"),
-            )
-            .await;
-            return;
-        }
-        if ours.shapes() {
-            if let Some(m) = ctx.metrics {
-                m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
-            }
-        }
+    if responder && !answer_shaping_offer(ctx, link_id, &theirs).await {
+        return;
     }
     match ctx.shapers.peer_offer(link, &theirs) {
         Ok(Some(shaper)) => {
@@ -14333,11 +14691,14 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
                 "link SHAPED both ways: constant-size frames at Poisson times from here \
                  (CC 5.4.3, CLM-link-shaping)"
             );
-            // v44 — announce coalescing to the peer as the link's first real
-            // body (a 43.x peer drops it as an unparseable envelope).
+            // v44 — announce coalescing and report free slots as the link's
+            // first real body (a 43.x peer drops it as an unparseable
+            // envelope).
             // choke-ok: a full queue on a fresh link is impossible; the body
-            // is 5 bytes.
-            let _ = shaper.enqueue(vec![crate::transport::link_shaping::capability_body()]);
+            // is 6 bytes.
+            let _ = shaper.enqueue(vec![crate::transport::link_shaping::capability_body(
+                ctx.shapers.reported_slots(),
+            )]);
             spawn_shaper_task(
                 Arc::clone(ctx.av_node),
                 Arc::clone(ctx.seals),
@@ -14361,9 +14722,8 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
             // The dialler: its dial path counts the refusal and closes.
         }
         Err(ShapingError::HomeElsewhere) => {
-            // The refusal was just answered on the wire; the close must
-            // follow the answer, not race it, or the dialler sees a closed
-            // link instead of the token. Nothing more is sealed meanwhile.
+            // The refusal is on its way ([`spawn_refusal_send`]), which seals
+            // nothing more after it and closes.
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(ShapingError::HomeElsewhere.label());
             }
@@ -14373,14 +14733,132 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
                 "a shaping peer past this node's shaped-link bound: refused for rows, \
                  homed elsewhere (CC 5.4.3; CIRISEdge#935)"
             );
-            ctx.seals.refuse(link);
-            let node = Arc::clone(ctx.av_node);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-                let _ = node.close_link(&link_id).await;
-            });
         }
         Err(e) => shaping_teardown(ctx, link_id, &e).await,
+    }
+}
+
+/// CC 5.4.3 referrals — what this node names in a refusal to `refused`: the
+/// candidates in rank order that can be referred, edge nodes first, one serve
+/// seat as the last entry when fewer than three edge nodes qualify.
+async fn pick_referrals(
+    ctx: &EventCtx<'_>,
+    ranked: Vec<crate::transport::shaping_referral::ReferralCandidate>,
+) -> Vec<(String, crate::transport::route_fetch::RouteAnswer)> {
+    use crate::transport::shaping_referral::{
+        referable_route, MAX_REFERRALS, REFERRAL_CANDIDATE_READS,
+    };
+    let Some(rooting) = ctx.rooting else {
+        return Vec::new();
+    };
+    let mut edge = Vec::new();
+    let mut seat = None;
+    for c in ranked.into_iter().take(REFERRAL_CANDIDATE_READS) {
+        if edge.len() == MAX_REFERRALS {
+            break;
+        }
+        if c.seat && seat.is_some() {
+            continue;
+        }
+        let announced = ctx.peers.lock().await.contains_key(&c.key_id);
+        match referable_route(rooting, &c.key_id, announced).await {
+            Some(answer) if c.seat => seat = Some((c.key_id, answer)),
+            Some(answer) => edge.push((c.key_id, answer)),
+            None => {
+                if let Some(m) = ctx.metrics {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_REFERRAL_WITHHELD);
+                }
+            }
+        }
+    }
+    if edge.len() < MAX_REFERRALS {
+        edge.extend(seat);
+    }
+    edge
+}
+
+/// CC 5.4.3 referrals — the frames that precede a refusal on `link_id`. They
+/// are never skipped: an empty list is the answer "no targets known". Bounded
+/// by [`REFERRAL_BUILD_BUDGET`], so the refusal is never late.
+///
+/// [`REFERRAL_BUILD_BUDGET`]: crate::transport::shaping_referral::REFERRAL_BUILD_BUDGET
+async fn referral_frames(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    refused: Option<&str>,
+) -> Vec<Vec<u8>> {
+    use crate::observability as o;
+    use crate::transport::shaping_referral::{
+        encode_referrals, ReferralAction, ReferralFrame, REFERRAL_BUILD_BUDGET,
+    };
+    let mut excluded: HashSet<String> = HashSet::from([ctx.local_key_id.to_owned()]);
+    excluded.extend(refused.map(ToOwned::to_owned));
+    let ranked = ctx.shapers.referral_candidates(&excluded);
+    let picked = tokio::time::timeout(REFERRAL_BUILD_BUDGET, pick_referrals(ctx, ranked))
+        .await
+        .unwrap_or_default();
+    let referred: Vec<String> = picked.iter().map(|(k, _)| k.clone()).collect();
+    let referral = ReferralFrame {
+        action: ReferralAction::Refused,
+        referrals: picked.into_iter().map(|(_, a)| a).collect(),
+    };
+    let (frames, named) = encode_referrals(referral, link_channel_mdu(ctx.node, &link_id))
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "a referral could not be framed; refused without one");
+            (Vec::new(), 0)
+        });
+    if let Some(first) = referred.first().filter(|_| named > 0) {
+        ctx.shapers.note_referred(first);
+    }
+    if let Some(m) = ctx.metrics {
+        if named == 0 {
+            m.inc_link_shaping(o::LINK_SHAPING_REFERRAL_EMPTY);
+        }
+        for _ in 0..named {
+            m.inc_link_shaping(o::LINK_SHAPING_REFERRAL_SENT);
+        }
+    }
+    tracing::info!(
+        link = %hex::encode(link_id.into_bytes()),
+        refused = refused.unwrap_or("-"),
+        reason = o::LINK_SHAPING_HOME_ELSEWHERE,
+        referrals = ?&referred[..named.min(referred.len())],
+        "refusing at the bound with referrals; an empty list leaves the peer its fallback \
+         order (CC 5.4.3)"
+    );
+    frames
+}
+
+/// CC 5.4.3 referrals — send a refusal off the event loop: the referral first
+/// (it can be many Channel frames, and the dialler closes on the answer), then
+/// the answer, then seal nothing more and close once the answer has had time
+/// to land.
+fn spawn_refusal_send(
+    node: Arc<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    link_id: LinkId,
+    frames: Vec<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        let out = send_fragments_on_channel(&node, &seals, &shapers, &link_id, &frames).await;
+        if !out.complete() {
+            tracing::debug!(
+                link = %hex::encode(link_id.into_bytes()),
+                "a refusal did not go out whole; the link closes regardless"
+            );
+        }
+        seals.refuse(link_id.into_bytes());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let _ = node.close_link(&link_id).await;
+    });
+}
+
+/// CC 5.4.3 referrals — the homing worker, one refusal at a time. It ends when
+/// the transport drops the channel.
+async fn run_homing(ctx: DialCtx, mut jobs: mpsc::Receiver<HomingJob>) {
+    while let Some(job) = jobs.recv().await {
+        ctx.home_on_referrals(job).await;
     }
 }
 
@@ -23136,6 +23614,18 @@ const VANISH_GRACE: Duration = Duration::from_secs(2);
 /// coordinators per peer, but they do not all ship simultaneously, and a link
 /// returns to the pool the moment its transfer ends.
 const MAX_CONCURRENT_DIALS_PER_DEST: usize = 4;
+
+/// CC 5.4.3 referrals — refusals waiting to be homed on, at most. Past it one
+/// is dropped: a referral is a hint.
+const HOMING_QUEUE: usize = 8;
+
+/// One refusal's referrals, for [`run_homing`].
+struct HomingJob {
+    /// The node that refused this one.
+    refused_by: String,
+    /// Whom it named, in the order to try them.
+    referrals: Vec<crate::transport::route_fetch::RouteAnswer>,
+}
 // A cap of 1 is a mutex, and a mutex here is the M=4 regression one layer up:
 // each waiter's resource-transfer clock would sit behind someone else's
 // handshake. Guarded at COMPILE time because the value is a constant and a

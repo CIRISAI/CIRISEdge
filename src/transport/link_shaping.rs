@@ -88,7 +88,21 @@ pub enum BudgetClass {
     /// shape (`link_shaping_home_elsewhere`). `off` for the agreement; the
     /// link closes. A 43.x peer reads it as a malformed class and closes too.
     HomeElsewhere = 5,
+    /// CC 5.4.3 rc17 **the `seat` class** (`CLM-seat-class`): offered only on
+    /// a link whose two ends both hold a serve seat, proved from the signed
+    /// roster and never self-declared; 33,000 B/s, ρ 0.5, W 600 s; its budget
+    /// sits outside the eight. On the wire it is the `server` byte with the
+    /// higher rate ([`Self::wire_byte`]), so a 43.x peer or a non-seat takes
+    /// the lower of the two offers and the link runs at the non-seat's class.
+    Seat = 6,
 }
+
+/// CC 5.4.3 rc17 — the `seat` row: byte budget per link.
+pub const SEAT_BYTES_PER_S: u32 = 33_000;
+/// CC 5.4.3 rc17 — the `seat` row: ρ × 1000.
+pub const SEAT_RHO_MILLI: u16 = 500;
+/// CC 5.4.3 rc17 — the `seat` row: W in seconds.
+pub const SEAT_WINDOW_S: u32 = 600;
 
 impl BudgetClass {
     /// The default per-link byte rate of the class (steward knobs may
@@ -97,6 +111,7 @@ impl BudgetClass {
     pub const fn default_bytes_per_s(self) -> u32 {
         match self {
             Self::Off | Self::HomeElsewhere => 0,
+            Self::Seat => SEAT_BYTES_PER_S,
             Self::PhoneCellular => 350,
             Self::PhoneWifi => 1400,
             Self::Home => 2800,
@@ -110,6 +125,7 @@ impl BudgetClass {
         match self {
             Self::Off => "off",
             Self::HomeElsewhere => "home-elsewhere",
+            Self::Seat => "seat",
             Self::PhoneCellular => "phone-cellular",
             Self::PhoneWifi => "phone-wifi",
             Self::Home => "home",
@@ -126,7 +142,18 @@ impl BudgetClass {
             "phone-wifi" | "wifi" | "phone" => Some(Self::PhoneWifi),
             "home" => Some(Self::Home),
             "server" => Some(Self::Server),
+            "seat" => Some(Self::Seat),
             _ => None,
+        }
+    }
+
+    /// The class byte on the wire: a seat offer travels as `server` (its
+    /// rate field carries the tier), so no peer meets an unknown byte.
+    #[must_use]
+    pub const fn wire_byte(self) -> u8 {
+        match self {
+            Self::Seat => Self::Server as u8,
+            other => other as u8,
         }
     }
 
@@ -146,8 +173,10 @@ impl BudgetClass {
 /// This node's shaping policy (config; PyO3/UniFFI mirror it).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShapingPolicy {
-    /// The class offered on every identity link. `Off` (the default) shapes
-    /// nothing.
+    /// The class this node offers. `Off` shapes nothing; it is the library's
+    /// unconfigured state, not a fleet default: a host names its class, and
+    /// the fleet defaults are [`FLEET_DEFAULTS`] (on for `server`, the person's
+    /// choice elsewhere).
     pub class: BudgetClass,
     /// The per-link byte rate for `class` (default
     /// [`BudgetClass::default_bytes_per_s`]).
@@ -170,20 +199,30 @@ pub struct ShapingPolicy {
     /// How the node cap is shared among the shaped links
     /// ([`ShapedSharePolicy`]). One line changes the default.
     pub share: ShapedSharePolicy,
-    /// How many links' worth of the node cap is held back for onion layer
-    /// neighbours that do not yet have a shaped link (CIRISEdge v44): a
-    /// first-come link to anyone else cannot take the share a layer link
-    /// needs. Reserved only while layer peers are named
-    /// ([`LinkShapers::set_layer_peers`]), so a node that does not run the
-    /// tier reserves nothing.
+    /// How many of the eight are kept from other peers while onion layer
+    /// neighbours named here still have no shaped link
+    /// ([`LinkShapers::set_layer_peers`]). Within the eight, never beside them;
+    /// zero in effect on a node that does not run the tier.
     pub layer_reserve_links: u32,
 }
 
-/// CC 5.4.3 — **how the node-wide cap is shared among the shaped links**
-/// (Eric, 2026-11-04: "we shape with shaped peers if possible, otherwise
-/// refuse and offer unshaped (bulk transfers) if available"). The default is
-/// [`Self::BoundedWithFloor`]; switching it is the one line in
+/// CC 5.4.3 rc17 — **the bound** (`CLM-shaped-link-bound-refuse`): "a node
+/// runs at most eight shaped links, each at the full rate of its class; a
+/// further peer that offers shaping is refused a row link and told to home
+/// elsewhere, and is offered an unshaped bulk link where one exists". The
+/// default is [`Self::BoundedWithFloor`]; switching it is the one line in
 /// [`ShapingPolicy::for_class`].
+///
+/// Displacement (`CLM-shaped-link-displacement`) is CIRISEdge#939: until it
+/// lands a higher-class newcomer at a full node is refused, not given a slot.
+///
+/// **The bound is a refusal, never a diluted link.** Every link runs at the
+/// one negotiated rate both ways, the class rate, onion layer links included.
+/// A layer link counts within the eight; a `seat` link sits outside them. So
+/// that a layer neighbour is not shut out by whoever came first, the links
+/// other peers may take stop short of the eight by the layer neighbours still
+/// waiting, up to [`ShapingPolicy::layer_reserve_links`]
+/// ([`LinkShapers::at_bound_for`]); nothing is ever taken from a running link.
 ///
 /// **The accepted leak.** A refused peer still gets an unshaped bulk link
 /// (files and calls keep working), and that link is observable: an observer
@@ -194,18 +233,17 @@ pub struct ShapingPolicy {
 /// never a row link run unshaped.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ShapedSharePolicy {
-    /// Every shaping peer is shaped, each link at `cap ÷ shaped links`,
-    /// however small, so the sum of rates never passes the cap. A link's rate
-    /// then publishes the node's shaped-link count, and at large counts a row
-    /// waits one frame gap (about 5 min at a thousand links). Not the default.
+    /// Every shaping peer is shaped at `cap ÷ shaped links`, however small,
+    /// as a local adjustment under the agreed offer. **Not conformant with
+    /// CC 5.4.3 rc17** ("refuses rather than run a shaped link below its
+    /// class"); kept as the non-default arm, for comparison only.
     DivideNoFloor,
-    /// At most `max_links` general shaped links, each at `floor_bytes_per_s`
-    /// (the class rate: no dilution); a shaping peer past the bound is
-    /// REFUSED for rows (`link_shaping_home_elsewhere`), never run unshaped,
-    /// and keeps its unshaped bulk link. Layer neighbours have their own
-    /// reserve and do not count.
+    /// At most `max_links` shaped links, each at `floor_bytes_per_s` (the
+    /// class rate); past the bound a shaping peer is REFUSED for rows
+    /// (`link_shaping_home_elsewhere`), never run unshaped, and keeps its
+    /// unshaped bulk link.
     BoundedWithFloor {
-        /// General shaped links at most.
+        /// Shaped links at most (eight; `seat` links are outside them).
         max_links: u32,
         /// Each shaped link's rate.
         floor_bytes_per_s: u32,
@@ -233,11 +271,27 @@ pub enum ShapingScope {
 /// change here; the witness
 /// `the_fleet_default_is_on_for_server_only_and_opt_in_elsewhere` reads it.
 ///
+/// **Latency is the other cost** (CC 5.4.3 "the choice is explained before it
+/// is made"): a shaped link moves real bytes at ρ of its rate, 3.5 KB/s per
+/// peer at `server`, one frame per [`BudgetClass`] gap (2.3 s `server`, 4 s
+/// `home`, 8 s `phone-wifi`, 26–32 s `phone-cellular`); a row waits about one
+/// gap, a reply two or three, and first contact or catch-up several times
+/// longer than unshaped (measured: a four-node bootstrap's rounds p90 35 s,
+/// p99 165 s against 53 s for the whole bootstrap unshaped). The client shows
+/// both columns at opt-in (`docs/LINK_SHAPING_COST.md`).
+///
 /// The cost columns are what a client shows at the moment of choosing: a
 /// shaped link always runs at its class rate (cover fills what real traffic
 /// leaves), each way, so at the eight-link node cap a month (30 days) costs
 /// `rate × 8 × 2,592,000 s` each way (`docs/LINK_SHAPING_COST.md`).
-pub const FLEET_DEFAULTS: [FleetDefault; 4] = [
+pub const FLEET_DEFAULTS: [FleetDefault; 5] = [
+    // seat <-> seat only (both proved from the signed roster); outside the eight
+    FleetDefault {
+        class: BudgetClass::Seat,
+        on_by_default: true,
+        gb_month_per_link_each_way: 85.5,
+        gb_month_at_cap_each_way: 684.3,
+    },
     // class                         on by default   GB/month/link  GB/month at cap (each way)
     FleetDefault {
         class: BudgetClass::Server,
@@ -333,8 +387,7 @@ pub fn is_bulk_class(envelope: &[u8]) -> bool {
         .any(|t| t.as_bytes() == &rest[..end])
 }
 
-/// The default share of the node cap held for layer neighbours: half of the
-/// eight links' worth.
+/// The default number of the eight kept for waiting layer neighbours.
 pub const DEFAULT_LAYER_RESERVE_LINKS: u32 = 4;
 
 /// How many links' worth of the class budget the node cap is (CC 5.4.3).
@@ -571,6 +624,26 @@ impl ShapingOffer {
         !matches!(self.class, BudgetClass::Off | BudgetClass::HomeElsewhere)
     }
 
+    /// The `seat` class's offer on a seat-to-seat link (CC 5.4.3 rc17): the
+    /// table's row at the link's frame, whatever this node's own settings.
+    #[must_use]
+    pub fn seat(frame_bytes: usize) -> Self {
+        let frame = u16::try_from(frame_bytes.min(usize::from(u16::MAX))).unwrap_or(u16::MAX);
+        if frame < MIN_FRAME_BYTES {
+            return Self::off();
+        }
+        let lambda = f64::from(SEAT_BYTES_PER_S) / f64::from(frame);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rate_milli = (lambda * 1000.0).round().max(1.0) as u32;
+        Self {
+            class: BudgetClass::Seat,
+            frame_bytes: frame,
+            rate_milli,
+            rho_milli: SEAT_RHO_MILLI,
+            window_s: SEAT_WINDOW_S,
+        }
+    }
+
     /// The `off` offer.
     #[must_use]
     pub const fn off() -> Self {
@@ -622,7 +695,7 @@ impl ShapingOffer {
         let mut out = Vec::with_capacity(OFFER_LEN);
         out.extend_from_slice(&OFFER_MAGIC);
         out.push(SHAPING_VERSION);
-        out.push(self.class as u8);
+        out.push(self.class.wire_byte());
         out.extend_from_slice(&self.frame_bytes.to_be_bytes());
         out.extend_from_slice(&self.rate_milli.to_be_bytes());
         out.extend_from_slice(&self.rho_milli.to_be_bytes());
@@ -675,18 +748,30 @@ pub fn is_offer(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes[..4] == OFFER_MAGIC
 }
 
-/// The capability body this node queues on a fresh shaped link.
+/// The capability body: `SHCP` ‖ version ‖ the free slots this node reports,
+/// zero when its relay offering is off ([`LinkShapers::reported_slots`]).
+/// It is queued on a fresh shaped link, and on every shaped link when the free
+/// slots change ([`LinkShapers::free_slots`]). It rides inside the constant
+/// frames, never in the fixed-length `SHAP` offer, so a 43.x peer is
+/// unaffected. A report is a hint ([`crate::transport::shaping_referral`]).
 #[must_use]
-pub fn capability_body() -> Vec<u8> {
+pub fn capability_body(free_slots: u8) -> Vec<u8> {
     let mut v = CAP_MAGIC.to_vec();
     v.push(CAP_VERSION);
+    v.push(free_slots);
     v
 }
 
 /// Whether a real body is a peer's capability announcement.
 #[must_use]
 pub fn is_capability_body(body: &[u8]) -> bool {
-    body.len() == CAP_MAGIC.len() + 1 && body[..4] == CAP_MAGIC
+    body.len() == CAP_MAGIC.len() + 2 && body[..4] == CAP_MAGIC
+}
+
+/// The free slots a capability body reports.
+#[must_use]
+pub fn capability_free_slots(body: &[u8]) -> Option<u8> {
+    is_capability_body(body).then(|| body[CAP_MAGIC.len() + 1])
 }
 
 /// Whether `bytes` is a `SHPF` shaped frame.
@@ -1019,7 +1104,31 @@ impl LinkShaper {
     /// bodies.
     #[must_use]
     pub fn new(link: [u8; 16], agreement: Agreement, queue_cap: usize) -> Self {
-        let poisson = PoissonScheduler::new();
+        Self::with_scheduler(link, agreement, queue_cap, PoissonScheduler::new())
+    }
+
+    /// [`Self::new`] on a seeded timer (tests: a deterministic frame stream).
+    #[must_use]
+    pub fn new_seeded(
+        link: [u8; 16],
+        agreement: Agreement,
+        queue_cap: usize,
+        seed: [u8; 32],
+    ) -> Self {
+        Self::with_scheduler(
+            link,
+            agreement,
+            queue_cap,
+            PoissonScheduler::from_seed(seed),
+        )
+    }
+
+    fn with_scheduler(
+        link: [u8; 16],
+        agreement: Agreement,
+        queue_cap: usize,
+        poisson: PoissonScheduler,
+    ) -> Self {
         let scope = ScopeKey::community(format!("link:{}", hex::encode(link)));
         poisson.set_rate(scope.clone(), agreement.lambda);
         let budget = BudgetMeter::new();
@@ -1272,10 +1381,8 @@ impl LinkShaper {
         }
         let count = u64::try_from(bodies.len()).unwrap_or(u64::MAX);
         let first = self.accepted.fetch_add(count, Ordering::AcqRel) + 1;
-        let mut ticket = first;
-        for b in bodies {
+        for (ticket, b) in (first..).zip(bodies) {
             q.push_back((ticket, b));
-            ticket += 1;
         }
         drop(q);
         self.notify.notify_one();
@@ -1375,7 +1482,7 @@ pub struct LinkShapers {
     policy: std::sync::RwLock<ShapingPolicy>,
     /// This node's onion layer neighbours by key id (empty unless the node
     /// runs the Anonymous Tier): their links are offered shaping under any
-    /// scope and draw on the reserve.
+    /// scope, count within the eight, and may take any of them.
     layer_peers: Mutex<std::collections::HashSet<String>>,
     /// The peer each offered or shaped link goes to, when known.
     link_peer: Mutex<HashMap<[u8; 16], String>>,
@@ -1385,6 +1492,26 @@ pub struct LinkShapers {
     bulk: Mutex<std::collections::HashSet<[u8; 16]>>,
     /// Whether the floors have the total past the cap ([`Self::rebalance`]).
     over_cap: std::sync::atomic::AtomicBool,
+    /// The free slots each shaped peer last reported, by key id: a hint for
+    /// referrals, gone with the peer's last link.
+    peer_free: Mutex<HashMap<String, u8>>,
+    /// Whether this node reports its free slots to its shaped peers.
+    reports_capacity: std::sync::atomic::AtomicBool,
+    /// This node's relay offering is on ([`Self::set_relay_offering`]).
+    relay_offering: std::sync::atomic::AtomicBool,
+    /// The free slots last reported.
+    last_reported: std::sync::atomic::AtomicU32,
+    /// Referral frames still arriving, by link.
+    referral_parts: Mutex<HashMap<[u8; 16], crate::transport::av_transit_handshake::Reassembler>>,
+    /// Whole referrals waiting for the refusal they precede, by link.
+    referrals: Mutex<HashMap<[u8; 16], crate::transport::shaping_referral::ReferralFrame>>,
+    /// The serve seats, from the signed genesis bundle (`serve_nodes`).
+    seats: Mutex<std::collections::HashSet<String>>,
+    /// This node is one of them.
+    own_seat: std::sync::atomic::AtomicBool,
+    /// Test seam: key-id prefixes that are seats (the harness's nodes are not
+    /// in any signed bundle).
+    seat_prefixes: Mutex<Vec<String>>,
     links: Mutex<HashMap<[u8; 16], Arc<LinkShaper>>>,
     /// Links this node sent an offer on, with that offer.
     offered: Mutex<HashMap<[u8; 16], ShapingOffer>>,
@@ -1480,6 +1607,15 @@ impl LinkShapers {
             link_peer: Mutex::new(HashMap::new()),
             bulk: Mutex::new(std::collections::HashSet::new()),
             over_cap: std::sync::atomic::AtomicBool::new(false),
+            peer_free: Mutex::new(HashMap::new()),
+            reports_capacity: std::sync::atomic::AtomicBool::new(false),
+            relay_offering: std::sync::atomic::AtomicBool::new(false),
+            last_reported: std::sync::atomic::AtomicU32::new(u32::MAX),
+            referral_parts: Mutex::new(HashMap::new()),
+            referrals: Mutex::new(HashMap::new()),
+            seats: Mutex::new(std::collections::HashSet::new()),
+            own_seat: std::sync::atomic::AtomicBool::new(false),
+            seat_prefixes: Mutex::new(Vec::new()),
             links: Mutex::new(HashMap::new()),
             offered: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -1534,7 +1670,7 @@ impl LinkShapers {
     }
 
     /// Name this node's onion layer neighbours (empty: the tier is not
-    /// running here, and nothing is reserved).
+    /// running here, and none of the eight is held).
     pub fn set_layer_peers(&self, peers: std::collections::HashSet<String>) {
         *self
             .layer_peers
@@ -1560,6 +1696,68 @@ impl LinkShapers {
         self.link_peer().clone()
     }
 
+    /// Name the serve seats (the genesis bundle's `serve_nodes`) and whether
+    /// this node is one. A seat-to-seat link is offered the seat tier.
+    pub fn set_seats(&self, seats: std::collections::HashSet<String>, own: bool) {
+        *self
+            .seats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = seats;
+        self.own_seat.store(own, Ordering::Release);
+        self.rebalance();
+    }
+
+    /// Test seam — seats by key-id prefix ([`Self::set_seats`] for production).
+    #[doc(hidden)]
+    pub fn set_seat_prefixes(&self, prefixes: Vec<String>, own: bool) {
+        *self
+            .seat_prefixes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = prefixes;
+        self.own_seat.store(own, Ordering::Release);
+        self.rebalance();
+    }
+
+    /// Whether a link to `peer` is a seat-to-seat link.
+    #[must_use]
+    pub fn is_seat_link(&self, peer: Option<&str>) -> bool {
+        self.own_seat.load(Ordering::Acquire) && peer.is_some_and(|p| self.is_seat(p))
+    }
+
+    /// Whether `peer` holds a serve seat, on the signed roster.
+    #[must_use]
+    pub fn is_seat(&self, peer: &str) -> bool {
+        self.seats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(peer)
+            || self
+                .seat_prefixes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|x| peer.starts_with(x.as_str()))
+    }
+
+    /// Whether `peer` holds a shaped link here.
+    #[must_use]
+    pub fn peer_is_shaped(&self, peer: &str) -> bool {
+        self.gap_to_peer(peer).is_some()
+    }
+
+    /// The mean frame gap of the fastest shaped link to `peer`, if any: what a
+    /// round's waits are paced by ([`crate::transport::Transport::pacing_gap`]).
+    #[must_use]
+    pub fn gap_to_peer(&self, peer: &str) -> Option<Duration> {
+        let links = self.links();
+        self.link_peer()
+            .iter()
+            .filter(|(_, p)| p.as_str() == peer)
+            .filter_map(|(l, _)| links.get(l))
+            .map(|s| s.frame_gap())
+            .min()
+    }
+
     /// Whether `peer` is one of this node's layer neighbours.
     #[must_use]
     pub fn is_layer_peer(&self, peer: Option<&str>) -> bool {
@@ -1578,60 +1776,58 @@ impl LinkShapers {
         self.policy().offers_on(self.is_layer_peer(peer))
     }
 
-    /// Bytes/s of the node cap held for onion layer neighbours, shaped or
-    /// not yet: `min(layer_reserve_links, layer peers) × the class rate`,
-    /// never more than the cap. Zero while the tier is not running here.
+    /// How many of the eight are kept from other peers now: the layer
+    /// neighbours with no shaped link yet, up to
+    /// [`ShapingPolicy::layer_reserve_links`]. Zero while the tier is not
+    /// running here.
     #[must_use]
-    pub fn layer_reserve(&self) -> u32 {
-        let policy = self.policy();
-        let named = u32::try_from(self.layer_peer_set().len()).unwrap_or(u32::MAX);
-        named
-            .min(policy.layer_reserve_links)
-            .saturating_mul(policy.bytes_per_s)
-            .min(policy.node_cap_bytes_per_s)
+    pub fn layer_held_slots(&self) -> u32 {
+        let layer = self.layer_peer_set();
+        if layer.is_empty() {
+            return 0;
+        }
+        let peers = self.link_peer_map();
+        let shaped: std::collections::HashSet<String> = self
+            .links()
+            .keys()
+            .filter_map(|l| peers.get(l).cloned())
+            .collect();
+        let waiting = layer.iter().filter(|p| !shaped.contains(*p)).count();
+        u32::try_from(waiting)
+            .unwrap_or(u32::MAX)
+            .min(self.policy().layer_reserve_links)
     }
 
-    /// CC 5.4.3 — **divide the node cap across the shaped links**: "a node's
-    /// shaped links together use at most eight links' worth of its class
-    /// budget". The layer reserve is held out and shared among the layer
-    /// neighbours; the rest is shared among the other links; no link goes
-    /// above the class rate. Run whenever a link or the policy changes. Each
-    /// share is applied locally ([`LinkShaper::set_share`]). Under
-    /// [`ShapedSharePolicy::BoundedWithFloor`] a general link's share is the
-    /// floor (the class rate) and the bound keeps the sum under the cap; under
-    /// [`ShapedSharePolicy::DivideNoFloor`] the share divides, however small.
+    /// Apply the share policy to every shaped link. Under the default each
+    /// link runs at the class rate, so this changes nothing on a live link;
+    /// under [`ShapedSharePolicy::DivideNoFloor`] the cap divides. A `seat`
+    /// link keeps its agreed rate, outside either. Run whenever a link or the
+    /// policy changes ([`LinkShaper::set_share`]).
     pub fn rebalance(&self) {
         let policy = self.policy();
-        let layer = self.layer_peer_set();
         let peers = self.link_peer_map();
         let links: Vec<([u8; 16], Arc<LinkShaper>)> = self
             .links()
             .iter()
             .map(|(l, s)| (*l, Arc::clone(s)))
             .collect();
-        let is_layer = |l: &[u8; 16]| peers.get(l).is_some_and(|p| layer.contains(p));
-        let general = links.iter().filter(|(l, _)| !is_layer(l)).count();
-        let held = f64::from(self.layer_reserve());
+        let is_seat = |l: &[u8; 16]| peers.get(l).is_some_and(|p| self.is_seat_link(Some(p)));
+        let counted = links.iter().filter(|(l, _)| !is_seat(l)).count();
         let cap = f64::from(policy.node_cap_bytes_per_s);
-        #[allow(clippy::cast_precision_loss)] // link counts
-        let (layer_share, general_share) = (
-            held / layer.len().max(1) as f64,
-            (cap - held).max(0.0) / general.max(1) as f64,
-        );
         let class = f64::from(policy.bytes_per_s);
-        let general_share = match policy.share {
-            ShapedSharePolicy::DivideNoFloor => general_share,
+        #[allow(clippy::cast_precision_loss)] // a link count
+        let share = match policy.share {
+            ShapedSharePolicy::DivideNoFloor => cap / counted.max(1) as f64,
             ShapedSharePolicy::BoundedWithFloor {
                 floor_bytes_per_s, ..
             } => f64::from(floor_bytes_per_s),
         };
         for (l, shaper) in &links {
-            let share = if is_layer(l) {
-                layer_share
+            if is_seat(l) {
+                shaper.set_share(f64::from(shaper.agreement().bytes_per_s()));
             } else {
-                general_share
-            };
-            shaper.set_share(share.min(class));
+                shaper.set_share(share.min(class));
+            }
         }
         let total = self.effective_total();
         let over = total > cap + 1.0 && !links.is_empty();
@@ -1643,40 +1839,210 @@ impl LinkShapers {
                 "the shaped links' rates pass the node cap (CC 5.4.3)"
             );
         }
+        self.report_capacity();
     }
 
-    /// General shaped links now (layer neighbours' links excluded).
-    fn general_shaped_count(&self) -> usize {
-        let layer = self.layer_peer_set();
-        let peers = self.link_peer();
+    /// The slots a new peer could take here now: the bound less the links and
+    /// the slots held for layer neighbours. Zero outside the default arm,
+    /// which has no bound to report against.
+    #[must_use]
+    pub fn free_slots(&self) -> u8 {
+        let ShapedSharePolicy::BoundedWithFloor { max_links, .. } = self.policy().share else {
+            return 0;
+        };
+        let used = u32::try_from(self.counted_links()).unwrap_or(u32::MAX);
+        let room = max_links
+            .saturating_sub(self.layer_held_slots())
+            .saturating_sub(used);
+        u8::try_from(room).unwrap_or(u8::MAX)
+    }
+
+    /// Start reporting free slots to shaped peers (the transport does, once).
+    pub fn enable_capacity_reports(&self) {
+        self.reports_capacity.store(true, Ordering::Release);
+    }
+
+    /// This node's relay offering turned on or off
+    /// ([`crate::onion::policy::relay_offering`]). Off reports nothing from
+    /// here on, and the zero goes out now so peers stop referring this node.
+    pub fn set_relay_offering(&self, on: bool) {
+        self.relay_offering.store(on, Ordering::Release);
+        self.report_capacity();
+    }
+
+    /// What this node reports to its shaped peers: the free slots while its
+    /// relay offering is on, zero (no claim) otherwise.
+    #[must_use]
+    pub fn reported_slots(&self) -> u8 {
+        if self.relay_offering.load(Ordering::Acquire) {
+            self.free_slots()
+        } else {
+            0
+        }
+    }
+
+    /// Tell every shaped peer what this node reports, when it changed.
+    fn report_capacity(&self) {
+        if !self.reports_capacity.load(Ordering::Acquire) {
+            return;
+        }
+        let free = self.reported_slots();
+        if self.last_reported.swap(u32::from(free), Ordering::AcqRel) == u32::from(free) {
+            return;
+        }
+        let shapers: Vec<Arc<LinkShaper>> = self.links().values().map(Arc::clone).collect();
+        for shaper in shapers {
+            // choke-ok: a report is a hint; a full queue carries the next one.
+            let _ = shaper.enqueue(vec![capability_body(free)]);
+        }
+    }
+
+    /// The peer on `link` reported `free` slots.
+    pub fn note_peer_capacity(&self, link: [u8; 16], free: u8) {
+        if let Some(peer) = self.link_peer().get(&link).cloned() {
+            self.peer_capacity().insert(peer, free);
+        }
+    }
+
+    /// The free slots `peer` last reported.
+    #[must_use]
+    pub fn peer_free_slots(&self, peer: &str) -> Option<u8> {
+        self.peer_capacity().get(peer).copied()
+    }
+
+    fn peer_capacity(&self) -> std::sync::MutexGuard<'_, HashMap<String, u8>> {
+        self.peer_free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The shaped peers to consider referring a refused peer to, best first
+    /// ([`crate::transport::shaping_referral::rank_referrals`]).
+    #[must_use]
+    pub fn referral_candidates<S: std::hash::BuildHasher>(
+        &self,
+        excluded: &std::collections::HashSet<String, S>,
+    ) -> Vec<crate::transport::shaping_referral::ReferralCandidate> {
+        let reported: Vec<(String, u8)> = self
+            .peer_capacity()
+            .iter()
+            .map(|(p, f)| (p.clone(), *f))
+            .collect();
+        let candidates = reported
+            .into_iter()
+            .map(
+                |(key_id, free_slots)| crate::transport::shaping_referral::ReferralCandidate {
+                    seat: self.is_seat(&key_id),
+                    key_id,
+                    free_slots,
+                },
+            )
+            .collect();
+        crate::transport::shaping_referral::rank_referrals(
+            candidates,
+            excluded,
+            &mut rand::thread_rng(),
+        )
+    }
+
+    /// `peer` was handed out first in a referral: one slot fewer in the local
+    /// hint until it next reports, so unequal capacity does not herd either.
+    pub fn note_referred(&self, peer: &str) {
+        if let Some(free) = self.peer_capacity().get_mut(peer) {
+            *free = free.saturating_sub(1);
+        }
+    }
+
+    /// A referral frame arrived on `link`. Taken only while this node waits on
+    /// its offer's answer; anything else is dropped. `false` is a frame that
+    /// could not be read.
+    pub fn accept_referral_part(&self, link: [u8; 16], part: &[u8]) -> bool {
+        use crate::transport::shaping_referral::{decode_referrals, referral_reassembler};
+        if !self.pending().contains_key(&link) {
+            return true;
+        }
+        let mut parts = self
+            .referral_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match parts
+            .entry(link)
+            .or_insert_with(referral_reassembler)
+            .push(part)
+        {
+            Ok(None) => true,
+            Ok(Some(body)) => {
+                parts.remove(&link);
+                drop(parts);
+                let Ok(frame) = decode_referrals(&body) else {
+                    return false;
+                };
+                self.referrals
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(link, frame);
+                true
+            }
+            Err(_) => {
+                parts.remove(&link);
+                false
+            }
+        }
+    }
+
+    /// The referral that came with `link`'s refusal.
+    #[must_use]
+    pub fn take_referrals(
+        &self,
+        link: [u8; 16],
+    ) -> Option<crate::transport::shaping_referral::ReferralFrame> {
+        self.referrals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&link)
+    }
+
+    /// Shaped links that count toward the bound: all but `seat` links.
+    fn counted_links(&self) -> usize {
+        let peers = self.link_peer_map();
         self.links()
             .keys()
-            .filter(|l| !peers.get(*l).is_some_and(|p| layer.contains(p)))
+            .filter(|l| !peers.get(*l).is_some_and(|p| self.is_seat_link(Some(p))))
             .count()
     }
 
-    /// [`ShapedSharePolicy::BoundedWithFloor`] — whether one more general
-    /// shaped link would pass the bound (`max_links` less the links' worth the
-    /// layer reserve holds).
+    /// CC 5.4.3 rc17 — whether a shaped link to `peer` would pass the bound.
+    /// A layer neighbour may take any of the eight; any other peer stops
+    /// short by [`Self::layer_held_slots`]. A `seat` link is never at the
+    /// bound.
     #[must_use]
-    pub fn at_bound(&self) -> bool {
+    pub fn at_bound_for(&self, peer: Option<&str>) -> bool {
         let policy = self.policy();
         let ShapedSharePolicy::BoundedWithFloor { max_links, .. } = policy.share else {
             return false;
         };
-        let reserved_links = if policy.bytes_per_s == 0 {
+        if self.is_seat_link(peer) {
+            return false;
+        }
+        let held = if self.is_layer_peer(peer) {
             0
         } else {
-            self.layer_reserve() / policy.bytes_per_s
+            self.layer_held_slots()
         };
-        let room = usize::try_from(max_links.saturating_sub(reserved_links)).unwrap_or(usize::MAX);
-        self.general_shaped_count() >= room
+        let room = usize::try_from(max_links.saturating_sub(held)).unwrap_or(usize::MAX);
+        self.counted_links() >= room
+    }
+
+    /// [`Self::at_bound_for`] for a peer of no standing here.
+    #[must_use]
+    pub fn at_bound(&self) -> bool {
+        self.at_bound_for(None)
     }
 
     /// The responder's answer to `theirs` on `link` to `peer`: this node's
     /// offer, or the refusal when `theirs` shapes and this node is at its
-    /// bound for a general link ([`Self::at_bound`]). The dialler learns the
-    /// same at [`Self::peer_offer`], after offering.
+    /// bound ([`Self::at_bound_for`]). The dialler learns the same at
+    /// [`Self::peer_offer`], after offering.
     #[must_use]
     pub fn offer_for_answer(
         &self,
@@ -1685,11 +2051,7 @@ impl LinkShapers {
         peer: Option<&str>,
         theirs: &ShapingOffer,
     ) -> ShapingOffer {
-        if theirs.shapes()
-            && self.policy().offers_on(self.is_layer_peer(peer))
-            && !self.is_layer_peer(peer)
-            && self.at_bound()
-        {
+        if theirs.shapes() && self.offers_to(peer) && self.at_bound_for(peer) {
             if let Some(p) = peer {
                 self.link_peer().insert(link, p.to_owned());
             }
@@ -1700,10 +2062,16 @@ impl LinkShapers {
         self.offer_for(link, frame_bytes, peer)
     }
 
-    /// Bytes per second this node's shaped links emit now, summed.
+    /// Bytes per second this node's shaped links under the bound emit now,
+    /// summed (`seat` links have their own budget and are not counted).
     #[must_use]
     pub fn effective_total(&self) -> f64 {
-        self.links().values().map(|s| s.bytes_per_s_now()).sum()
+        let peers = self.link_peer_map();
+        self.links()
+            .iter()
+            .filter(|(l, _)| !peers.get(*l).is_some_and(|p| self.is_seat_link(Some(p))))
+            .map(|(_, s)| s.bytes_per_s_now())
+            .sum()
     }
 
     fn links(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], Arc<LinkShaper>>> {
@@ -1761,7 +2129,9 @@ impl LinkShapers {
         peer: Option<&str>,
     ) -> ShapingOffer {
         let policy = self.policy();
-        let offer = if policy.offers_on(self.is_layer_peer(peer)) {
+        let offer = if policy.enabled() && self.is_seat_link(peer) {
+            ShapingOffer::seat(frame_bytes)
+        } else if policy.offers_on(self.is_layer_peer(peer)) {
             ShapingOffer::from_policy(&policy, frame_bytes)
         } else {
             ShapingOffer::off()
@@ -1801,10 +2171,7 @@ impl LinkShapers {
         let peer = self.link_peer().get(&link).cloned();
         let refused = ours.class == BudgetClass::HomeElsewhere
             || theirs.class == BudgetClass::HomeElsewhere
-            || (ours.shapes()
-                && theirs.shapes()
-                && !self.is_layer_peer(peer.as_deref())
-                && self.at_bound());
+            || (ours.shapes() && theirs.shapes() && self.at_bound_for(peer.as_deref()));
         let out = match agree(&ours, theirs) {
             _ if refused => Err(ShapingError::HomeElsewhere),
             Some(agreement) => {
@@ -1854,7 +2221,21 @@ impl LinkShapers {
         }
         self.offered().remove(link);
         self.pending().remove(link);
-        self.link_peer().remove(link);
+        let peer = self.link_peer().remove(link);
+        if let Some(peer) = peer {
+            let held = self.link_peer().values().any(|p| *p == peer);
+            if !held {
+                self.peer_capacity().remove(&peer);
+            }
+        }
+        self.referral_parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(link);
+        self.referrals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(link);
         self.bulk
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2145,6 +2526,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn frames_are_one_size_and_cover_is_told_from_real_only_inside() {
         let mut pad = |b: &mut [u8]| b.iter_mut().for_each(|x| *x = 0xAB);
         let real = wrap(400, Some(b"hello"), &mut pad).unwrap();
@@ -2270,7 +2652,7 @@ mod tests {
                 .filter(|r| r.on_by_default)
                 .map(|r| r.class)
                 .collect::<Vec<_>>(),
-            vec![BudgetClass::Server]
+            vec![BudgetClass::Seat, BudgetClass::Server]
         );
         assert_eq!(
             ShapingPolicy::for_class(BudgetClass::Server).share,
@@ -2451,6 +2833,195 @@ mod tests {
         );
     }
 
+    /// CC 5.4.3 rc17 `CLM-seat-class`: the table's row exactly (33,000 B/s,
+    /// ρ 0.5, W 600 s), offered only to a proved seat by a proved seat; a seat
+    /// beside a non-seat runs at the non-seat's class; a seat link sits
+    /// outside the eight; nothing a peer says makes it a seat.
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn a_seat_shapes_a_proved_seat_at_the_seat_row_outside_the_eight() {
+        let p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        let t = LinkShapers::new(p);
+        t.set_seats(
+            ["seat-b".to_owned(), "me".to_owned()].into_iter().collect(),
+            true,
+        );
+        let o = t.offer_for([1u8; 16], 16_272, Some("seat-b"));
+        assert_eq!(o.class, BudgetClass::Seat);
+        assert_eq!((o.rho_milli, o.window_s), (500, 600));
+        assert_eq!(o.rate_milli, 2028, "33,000 B/s at 16,272 B");
+        assert_eq!(
+            o.encode()[5],
+            BudgetClass::Server as u8,
+            "the wire byte is server"
+        );
+        let back = ShapingOffer::decode(&o.encode()).unwrap();
+        assert_eq!(back.class, BudgetClass::Server);
+        assert_eq!(back.rate_milli, 2028);
+        let a = agree(&o, &back).expect("seat to seat");
+        assert!(
+            (i64::from(a.bytes_per_s()) - 33_000).abs() <= 2,
+            "{}",
+            a.bytes_per_s()
+        );
+        let normal = t.offer_for([2u8; 16], 16_272, Some("home-node"));
+        assert_eq!(normal.class, BudgetClass::Server);
+        assert_eq!(normal.rate_milli, 430, "7000 B/s at 16,272 B");
+        let mixed = agree(&o, &normal).expect("seat to non-seat");
+        assert!(mixed.lambda < 0.5, "the lower of the two: {}", mixed.lambda);
+        t.peer_offer([1u8; 16], &back)
+            .unwrap()
+            .expect("seat link shaped");
+        shaped_links(&t, 8, "g", 10);
+        assert!(t.at_bound());
+        assert!(!t.at_bound_for(Some("seat-b")), "outside the eight");
+        assert_eq!(t.shaped_count(), 9);
+        assert!(
+            t.effective_total() <= 8.0 * 7000.0 + 8.0,
+            "{}",
+            t.effective_total()
+        );
+        let seat_rate = t.get([1u8; 16]).unwrap().bytes_per_s_now();
+        assert!((seat_rate - 33_000.0).abs() < 3.0, "{seat_rate}");
+        let u = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        u.set_seats(["seat-b".to_owned()].into_iter().collect(), false);
+        let o = u.offer_for([3u8; 16], 16_272, Some("seat-b"));
+        assert_eq!((o.class, o.rate_milli), (BudgetClass::Server, 430));
+        assert_eq!(BudgetClass::parse("seat"), Some(BudgetClass::Seat));
+    }
+
+    /// A node reports its free slots when they change, inside the frames; the
+    /// report tracks links, layer holds included, and a peer's report goes
+    /// with its last link.
+    #[test]
+    fn free_slots_follow_the_links_and_a_report_goes_with_its_peer() {
+        let t = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        assert_eq!(t.free_slots(), 8);
+        shaped_links(&t, 3, "g", 10);
+        assert_eq!(t.free_slots(), 5);
+        t.set_layer_peers((0..2).map(|i| format!("L{i}")).collect());
+        assert_eq!(t.free_slots(), 3, "two held for waiting layer neighbours");
+        t.note_peer_capacity([10u8; 16], 4);
+        assert_eq!(t.peer_free_slots("g0"), Some(4));
+        t.forget(&[10u8; 16]);
+        assert_eq!(t.peer_free_slots("g0"), None);
+    }
+
+    /// Eric 2026-11-04 — **offering relay is the consent to be referred.** A
+    /// node with its offering off reports zero, so a peer never ranks it; a
+    /// phone that loses Wi-Fi reports zero at once, on the running link.
+    #[test]
+    fn a_node_reports_slots_only_while_its_relay_offering_is_on() {
+        let r = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        r.enable_capacity_reports();
+        shaped_links(&r, 1, "g", 10);
+        assert_eq!(r.reported_slots(), 0, "off until the host says otherwise");
+        let idle = r.get([10u8; 16]).expect("a link").room();
+        r.set_relay_offering(true);
+        assert_eq!(r.reported_slots(), 7);
+        let link = r.get([10u8; 16]).expect("a link");
+        assert_eq!(link.room(), idle - 1, "the report went out on the link");
+        r.set_relay_offering(false);
+        assert_eq!(r.reported_slots(), 0);
+        assert_eq!(link.room(), idle - 2, "and so did the zero");
+
+        // The peer's side: a zero report takes the node out of the ranking.
+        let t = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        shaped_links(&t, 1, "phone", 10);
+        t.note_peer_capacity([10u8; 16], 4);
+        let none = std::collections::HashSet::<String>::new();
+        assert_eq!(t.referral_candidates(&none).len(), 1);
+        t.note_peer_capacity([10u8; 16], 0);
+        assert!(t.referral_candidates(&none).is_empty());
+    }
+
+    /// **The herding check:** ten refused peers spread across the referrals.
+    /// Four nodes tie on free slots: nobody is first more than three times,
+    /// because a node handed out first loses a slot in the local hint.
+    #[test]
+    fn ten_refused_peers_spread_across_the_referrals() {
+        let t = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        shaped_links(&t, 4, "g", 10);
+        for l in 10..14u8 {
+            t.note_peer_capacity([l; 16], 3);
+        }
+        let mut firsts: HashMap<String, u32> = HashMap::new();
+        for i in 0..10 {
+            let excluded: std::collections::HashSet<String> =
+                [format!("refused-{i}")].into_iter().collect();
+            let ranked = t.referral_candidates(&excluded);
+            let first = ranked[0].key_id.clone();
+            t.note_referred(&first);
+            *firsts.entry(first).or_insert(0) += 1;
+        }
+        assert_eq!(firsts.len(), 4, "{firsts:?}");
+        assert!(firsts.values().all(|n| *n <= 3), "{firsts:?}");
+    }
+
+    /// **The viability rule** (FSD/TRANSPORT_TIERS_MODEL.md): a five-plane
+    /// bootstrap round is five requests then five replies; on a seeded pair
+    /// of shapers it completes inside its λ-derived interval (7.75 gaps) in
+    /// at least 95 of 100 rounds WITH coalescing, and in well under 95
+    /// without (one body per frame: ten frames, about ten gaps). Paused
+    /// time: the Poisson stream is the seed's.
+    #[tokio::test(start_paused = true)]
+    async fn a_five_plane_round_fits_the_lambda_derived_interval_with_coalescing() {
+        async fn drain(s: &LinkShaper, ticket: u64) {
+            loop {
+                match s.next_emission().await {
+                    Emission::Frame {
+                        real, ticket: t, ..
+                    } => {
+                        if real {
+                            s.note_sent(t);
+                        }
+                        if s.ticket_left(ticket) {
+                            break;
+                        }
+                    }
+                    Emission::Stopped => panic!("stopped"),
+                }
+            }
+        }
+        async fn rounds_within(coalesce: bool) -> usize {
+            let agreement = Agreement {
+                lambda: 50.0,
+                frame_bytes: 1400,
+                rho: 0.9,
+                window: Duration::from_secs(10),
+            };
+            let a = LinkShaper::new_seeded([1u8; 16], agreement, 256, [7u8; 32]);
+            let b = LinkShaper::new_seeded([2u8; 16], agreement, 256, [9u8; 32]);
+            if coalesce {
+                a.enable_coalescing();
+                b.enable_coalescing();
+            }
+            let interval = a.frame_gap().mul_f64(7.75);
+            let mut ok = 0;
+            for _ in 0..100 {
+                let started = tokio::time::Instant::now();
+                let t = a.enqueue((0..5u8).map(|i| vec![i; 200]).collect()).unwrap();
+                drain(&a, t).await;
+                let t = b.enqueue((0..5u8).map(|i| vec![i; 200]).collect()).unwrap();
+                drain(&b, t).await;
+                if started.elapsed() <= interval {
+                    ok += 1;
+                }
+            }
+            ok
+        }
+        let with = rounds_within(true).await;
+        let without = rounds_within(false).await;
+        assert!(
+            with >= 95,
+            "with coalescing: {with} of 100 inside 7.75 gaps"
+        );
+        assert!(
+            without < 95,
+            "one per frame: {without} of 100 inside 7.75 gaps"
+        );
+    }
+
     /// v44 coalescing: a multi frame round-trips, is one frame size, and a
     /// shaper whose peer announced the capability packs the queue into one
     /// frame (the measured crawl: 55–220 B control bodies at one per 16 KB
@@ -2464,7 +3035,8 @@ mod tests {
         let f = wrap_multi(1400, &bodies, &mut pad).unwrap();
         assert_eq!(f.len(), 1400);
         assert_eq!(unwrap(&f).unwrap(), ShapedFrame::Many(bodies.clone()));
-        assert!(is_capability_body(&capability_body()));
+        assert!(is_capability_body(&capability_body(5)));
+        assert_eq!(capability_free_slots(&capability_body(5)), Some(5));
         let agreement = Agreement {
             lambda: 200.0,
             frame_bytes: 1400,
@@ -2557,41 +3129,60 @@ mod tests {
         assert_eq!(s.queued(), 40, "nothing of the bulk message was queued");
     }
 
-    /// The cap is shared, not first come, first served, and the layer
-    /// reserve is held out of it: with no layer peers (the tier not running)
-    /// nothing is reserved; with six named, four links' worth is theirs, and
-    /// the general links share the other four however many arrive first.
+    /// CC 5.4.3 rc17 — **layer links count within the eight**, each at the
+    /// class rate, and the bound is first come only among equals: while layer
+    /// neighbours wait, other peers stop short of the eight by up to
+    /// `layer_reserve_links`; a layer neighbour may take any of the eight; a
+    /// ninth link of any kind is refused; a `seat` layer link takes no slot.
+    /// With no layer peers (the tier not running) nothing is held.
     #[test]
-    fn the_cap_reserves_room_for_layer_neighbours() {
-        let mut p = ShapingPolicy::for_class(BudgetClass::Home);
-        p.share = ShapedSharePolicy::DivideNoFloor;
+    fn layer_links_take_slots_within_the_eight_at_the_class_rate() {
+        let p = ShapingPolicy::fleet_default(BudgetClass::Server);
         let t = LinkShapers::new(p.clone());
         shaped_links(&t, 8, "g", 10);
-        assert_eq!(t.layer_reserve(), 0);
-        assert!((t.get([10u8; 16]).unwrap().bytes_per_s_now() - 2800.0).abs() < 1.0);
+        assert_eq!(t.layer_held_slots(), 0);
+        assert!(t.at_bound());
 
         let t = LinkShapers::new(p);
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
         t.set_layer_peers((0..6).map(|i| format!("L{i}")).collect());
-        assert_eq!(t.layer_reserve(), 4 * 2800);
-        shaped_links(&t, 8, "g", 10);
-        let general = t.get([10u8; 16]).unwrap().bytes_per_s_now();
+        assert_eq!(t.layer_held_slots(), 4);
+        shaped_links(&t, 4, "g", 10);
         assert!(
-            (general - 1400.0).abs() < 1.0,
-            "the four left, over eight: {general}"
+            t.at_bound_for(Some("g-late")),
+            "four are held for the layer"
         );
-        shaped_links(&t, 6, "L", 100);
-        let layer = t.get([100u8; 16]).unwrap().bytes_per_s_now();
+        assert!(!t.at_bound_for(Some("L0")));
+        shaped_links(&t, 4, "L", 100);
+        assert_eq!(t.shaped_count(), 8);
+        for l in [10u8, 100, 103] {
+            let s = t.get([l; 16]).expect("a link");
+            assert!(
+                (s.bytes_per_s_now() - 7000.0).abs() < 1.0,
+                "the class rate, undiluted"
+            );
+        }
         assert!(
-            (layer - 4.0 * 2800.0 / 6.0).abs() < 1.0,
-            "their held share: {layer}"
+            t.at_bound_for(Some("L4")),
+            "a ninth link is refused, layer or not"
         );
+        let ours = t.offer_for_answer([120u8; 16], 400, Some("L4"), &peer);
+        assert_eq!(ours.class, BudgetClass::HomeElsewhere);
+        // A departure: the waiting layer neighbour goes first.
+        t.forget(&[10u8; 16]);
         assert!(
-            t.effective_total() <= 8.0 * 2800.0 + 1.0,
-            "{}",
-            t.effective_total()
+            t.at_bound_for(Some("g-late")),
+            "held for the two still waiting"
         );
-        // The reserve is held while a layer neighbour has no link at all.
-        t.set_layer_peers(["absent".to_owned()].into_iter().collect());
-        assert_eq!(t.layer_reserve(), 2800);
+        assert!(!t.at_bound_for(Some("L4")));
+        // A seat-to-seat layer link takes no slot.
+        t.set_seats(["L5".to_owned()].into_iter().collect(), true);
+        let o = t.offer_for([121u8; 16], 16_272, Some("L5"));
+        assert_eq!(o.class, BudgetClass::Seat);
+        assert!(!t.at_bound_for(Some("L5")));
+        t.peer_offer([121u8; 16], &ShapingOffer::decode(&o.encode()).unwrap())
+            .unwrap()
+            .expect("seat link");
+        assert!(t.effective_total() <= 8.0 * 7000.0 + 8.0);
     }
 }

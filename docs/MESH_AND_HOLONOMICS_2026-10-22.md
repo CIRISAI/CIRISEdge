@@ -209,5 +209,5 @@ which is fine (relays are already any node) and does not change the deal.
   and H = SHA-256(domain ‖ key_id ‖ BE64(period)); the Rust witness and the Python script agree on T0–T19.
 - Treat fountain survival numbers as a property of the model and the A/V codec, not of general content, until
   the swarm runtime is installed; treat the rendezvous mailbox as single-seat in v1.
-- Shaping is the live prerequisite and is off by default; the formal model's "shaped layer links" leg is a
+- Shaping is the live prerequisite (as of this document off by default; since CC rc16 on by default for `server`, see docs/LINK_SHAPING_COST.md); the formal model's "shaped layer links" leg is a
   real gate in 43.2 code (`link_shaping.rs`, `require_shaped_links`).

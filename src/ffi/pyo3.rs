@@ -7275,7 +7275,7 @@ pub fn init_edge_runtime(
         {
             use crate::transport::link_shaping::{DeviceKind, DeviceState};
             transport_config.device = match class {
-                BudgetClass::Server => DeviceState::of(DeviceKind::Server),
+                BudgetClass::Server | BudgetClass::Seat => DeviceState::of(DeviceKind::Server),
                 BudgetClass::Home => DeviceState::of(DeviceKind::Home),
                 BudgetClass::PhoneWifi => DeviceState::of(DeviceKind::Phone),
                 BudgetClass::PhoneCellular => {

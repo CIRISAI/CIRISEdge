@@ -941,28 +941,54 @@ async fn run_one_coordinator_forever(
                 // CIRISEdge#790 — instrumented, never entered (see the kick arm).
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
                 round.run().instrument(span).await;
-                if let Some(reader) = &mesh_config {
-                    let target = reader.relief().await.round_cadence.unwrap_or(cadence);
-                    if target != current_cadence {
-                        tracing::info!(
-                            peer = %peer_id,
-                            kind = %kind_str,
-                            from_secs = current_cadence.as_secs_f64(),
-                            to_secs = target.as_secs_f64(),
-                            "anti-entropy cadence changed by mesh-config relief \
-                             (antientropy.round_secs; CIRISEdge#440)"
-                        );
-                        current_cadence = target;
-                        interval = tokio::time::interval_at(
-                            tokio::time::Instant::now() + target,
-                            target,
-                        );
-                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    }
+                let relieved = match &mesh_config {
+                    Some(reader) => reader.relief().await.round_cadence.unwrap_or(cadence),
+                    None => cadence,
+                };
+                // CC 5.4.3 — on a shaped link the round interval follows the
+                // frame gap (about 7.75 gaps), else ticks queue behind rounds
+                // that each take several gaps.
+                let target = pacing_interval(relieved, coord.pacing_gap());
+                if target != current_cadence {
+                    tracing::info!(
+                        peer = %peer_id,
+                        kind = %kind_str,
+                        from_secs = current_cadence.as_secs_f64(),
+                        to_secs = target.as_secs_f64(),
+                        "anti-entropy cadence changed (mesh-config relief, CIRISEdge#440, or \
+                         the shaped link's frame gap, CC 5.4.3)"
+                    );
+                    current_cadence = target;
+                    interval = tokio::time::interval_at(
+                        tokio::time::Instant::now() + target,
+                        target,
+                    );
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 }
             }
         }
     }
+}
+
+/// The Poisson p99 of one frame wait, in gaps (FSD/TRANSPORT_TIERS_MODEL.md).
+pub const PACING_WAIT_GAPS: f64 = 4.74;
+/// A round interval that lets a request/reply round complete, in gaps.
+pub const PACING_INTERVAL_GAPS: f64 = 7.75;
+
+/// The per-wait timeout on a link with frame gap `gap`: never below the
+/// configured one, and at least [`PACING_WAIT_GAPS`] gaps.
+#[must_use]
+pub fn pacing_timeout(configured: Duration, gap: Option<Duration>) -> Duration {
+    gap.map_or(configured, |g| configured.max(g.mul_f64(PACING_WAIT_GAPS)))
+}
+
+/// The round interval on a link with frame gap `gap`: never below the
+/// configured cadence, and at least [`PACING_INTERVAL_GAPS`] gaps.
+#[must_use]
+pub fn pacing_interval(configured: Duration, gap: Option<Duration>) -> Duration {
+    gap.map_or(configured, |g| {
+        configured.max(g.mul_f64(PACING_INTERVAL_GAPS))
+    })
 }
 
 /// One coordinator's round, as both the tick and the kick arm run it: past the
@@ -998,13 +1024,12 @@ impl GatedRound<'_> {
         // permit to its outcome, whatever that outcome is: a round that
         // timed out after its full budget is exactly the one to see.
         let started = std::time::Instant::now();
-        let class = round_and_report(
-            self.coord,
-            self.round_timeout,
-            self.event_sink,
-            self.peer_id,
-        )
-        .await;
+        // CC 5.4.3 — on a shaped link a wait is paced by the link's frame
+        // gap: the per-wait timeout is at least the Poisson p99 of one gap
+        // (about 4.74 gaps), else every wait on a slow link times out.
+        let round_timeout = pacing_timeout(self.round_timeout, self.coord.pacing_gap());
+        let class =
+            round_and_report(self.coord, round_timeout, self.event_sink, self.peer_id).await;
         if let Some(m) = self.metrics {
             m.observe_round_duration(self.coord.kind(), started.elapsed());
         }

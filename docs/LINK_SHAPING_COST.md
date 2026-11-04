@@ -1,6 +1,6 @@
 # Link shaping: defaults and bandwidth cost per class (edge v44)
 
-CC 5.4.3 (rc16), `CLM-link-shaping`. Eric, as steward, ruled the fleet default
+CC 5.4.3 (rc17), `CLM-link-shaping`, `CLM-shaped-link-bound-refuse`, `CLM-seat-class`. Eric, as steward, ruled the fleet default
 on 2026-11-02; the ruling is final.
 
 | Class | On by default | Rate per link | ρ | W | Per link, per month, each way | At the 8-link cap, per month, each way |
@@ -9,6 +9,30 @@ on 2026-11-02; the ruling is final.
 | `home` | opt-in | 2,800 B/s | 0.5 | 600 s | 7.3 GB | 58.1 GB |
 | `phone-wifi` | opt-in | 1,400 B/s | 0.5 | 600 s | 3.6 GB | 29.0 GB |
 | `phone-cellular` | opt-in | 350 B/s | 0.5 | 3,600 s | 0.9 GB | **7.3 GB** |
+| `seat` | seat to seat only | 33,000 B/s | 0.5 | 600 s | 85.5 GB | outside the eight |
+
+The `seat` class runs only between two serve seats proved from the signed roster.
+Its budget sits outside the eight; beside a non-seat a seat runs at the non-seat's
+class.
+
+## What it costs in latency (CC 5.4.3: "the choice is explained before it is made")
+
+A shaped link carries real bytes at ρ of its rate: at the `server` class that is
+0.5 × 7,000 B/s = **3.5 KB/s of real bytes per peer**, however many lanes the
+peer has, and one 16 KB frame every 2.3 s on average. What that means for the
+person at the moment of choosing:
+
+| What | Unshaped | Shaped at the class rate |
+|---|---|---|
+| A row (a post, a message) to a peer | tens of milliseconds | about one frame gap: 2.3 s mean at `server`, 4 s `home`, 8 s `phone-wifi`, 26–32 s `phone-cellular` |
+| A reply, or a round of replication | a second | two to three gaps, so 5–7 s at `server` |
+| First contact and catch-up (many rows at once) | a four-node bootstrap in 53 s (measured) | several times slower: rounds p90 35 s, p99 165 s, max 221 s in the same bootstrap (measured, `server`, coalescing on), because the rows queue behind each other at 3.5 KB/s per peer |
+| Bulk (files, chunks, media) | unchanged | unchanged: bulk never rides a shaped link |
+
+In production only servers shape by default; a person who opts in pays the
+row latency above toward every peer that shapes too. A peer that does not shape
+leaves the link unshaped (lower of the two offers), so opting in costs nothing
+toward it.
 
 ## How to read the table
 
@@ -37,40 +61,104 @@ on 2026-11-02; the ruling is final.
   - Any other class is the person's opt-in for that class.
   - No class shapes the layer links only.
 
-## The node cap: shape with shaped peers if possible, otherwise refuse
+## The bound: shape with shaped peers if possible, otherwise refuse
 
-Eric, 2026-11-04: "we shape with shaped peers if possible, otherwise refuse and
-offer unshaped (bulk transfers) if available". The share policy is one enum,
-`ShapedSharePolicy`, and the default is one line in `ShapingPolicy::for_class`.
+CC 5.4.3 rc17: a node runs at most eight shaped links, each at the full rate of
+its class. **The bound is a refusal, never a diluted link.** The share policy is
+one enum, `ShapedSharePolicy`, and the default is one line in
+`ShapingPolicy::for_class`.
 
-**`BoundedWithFloor` (the default).** At most `max_links` (8, less the layer
-reserve) general shaped links, each at the full class rate, so the sum never
-passes the cap and a link's rate says nothing about how many peers the node
-has. A ninth shaping peer is refused for rows with
-`link_shaping_home_elsewhere`: the responder answers the refusal on the wire
-(class byte `home-elsewhere`; a 43.x peer reads it as malformed and closes too),
-a dialler at its own bound refuses at the answer, the link closes, and the row
-link is never run unshaped. The refused peer's row sends fail by name for 120 s
-without a dial; its bulk (over 64 KiB, chunks, media) still dials an unshaped
-link of its own and completes. A peer whose offer is `off` is not a shaping peer
-and gets its ordinary unshaped link. Homing the refused peer is CIRISEdge#935.
+- **One rate, both ways.** Every shaped link runs at the one negotiated rate.
+  Rows to a peer share its one shaped link; they never open a second.
+- **Layer links count within the eight**, at the class rate. A layer neighbour
+  has priority by holding, not by taking: while layer neighbours wait, other
+  peers stop short of the eight by up to `layer_reserve_links` (4). Nothing is
+  taken from a running link, and a ninth link of any kind is refused.
+- **`seat` links sit outside the eight**, so a seat-to-seat layer link takes no
+  slot.
+- **Past the bound** a shaping peer's row link is refused with
+  `link_shaping_home_elsewhere`: the responder answers the refusal on the wire
+  (class byte `home-elsewhere`; a 43.x peer reads it as malformed and closes
+  too), a dialler at its own bound refuses at the answer, and the row link is
+  never run unshaped. The refused peer's row sends fail by name for 120 s without
+  a dial; its bulk (over 64 KiB, chunks, media) still dials an unshaped link of
+  its own. A peer whose offer is `off` is not a shaping peer and gets its ordinary
+  unshaped link. The refusal carries referrals (below).
+
+**Fair order.** rc17 also admits a higher-class newcomer by displacing the
+lowest-class peer to a shaped peer below it. That, and the per-link carriage
+setting, are CIRISEdge#939; until then a higher-class newcomer at a full node is
+refused like any other.
 
 **The accepted leak.** The refused peer's bulk link is observable: an observer
 learns the node is at its bound and sees that peer's bulk in a Resource's shape.
-Prior art (Tarzan, Herd) homes the peer elsewhere instead; until #935 this spill
-is the trade-off, bounded to one unshaped link per refused peer.
+Prior art (Tarzan, Herd) homes the peer elsewhere; the referrals below do, and
+this spill stays as the trade-off for a peer's bulk, bounded to one unshaped link
+per refused peer.
 
-**`DivideNoFloor` (the other arm).** Every shaping peer is shaped at
-`cap ÷ shaped links`, however small, applied as a local downward adjustment of
-each sender's Poisson rate under the agreed offer (no wire exchange; shares rise
-when peers leave). The sum never passes the cap; a link's rate then publishes
-the shaped-link count, and a row waits one frame gap:
+## Referrals: where a refused peer goes
 
-| Shaping peers on a `server`, 16,272-byte frame | Rate per link | Mean wait for a frame |
-|---|---|---|
-| 8 | 7,000 B/s | 2.3 s |
-| 100 | 560 B/s | 29 s |
-| 1,000 | 56 B/s | 4.8 min |
+A peer bounced at the bound still has to reach a first contact, a consent, a
+contact request and its acceptance. So the refusal names up to three nodes that
+will take it. Module: `src/transport/shaping_referral.rs`.
+
+**The frame.** `SHRF` frames on the Channel, sealed like everything else on the
+link, in the `fragment_tagged` framing of the route answer, at most 96 KiB (past
+that the last entries are dropped). The body is JSON:
+
+```json
+{"action": "refused", "referrals": [{"route": <signed row>, "key_record_row": <row>}]}
+```
+
+- `action` is `refused`, or `move`, reserved for displacement (CIRISEdge#939): the
+  same frame, sent to a running shaped peer. v44 sends only `refused`.
+- Each entry is a route answer: the referred node's own hybrid-signed
+  `transport_destination` row and its `key:record:v1` row, all the peer needs to
+  dial without a lookup. The peer verifies it as it verifies a route it fetched
+  from that node, then installs it as an `Advisory` binding. A referrer can
+  withhold, and can vouch for nothing it could not have fetched.
+- The frames go **before** the `SHAP` refusal, because the dialler closes when the
+  answer lands. They are taken only while the dialler waits on its offer's answer.
+  The list is never skipped: an empty one means "no targets known". A 43.x dialler
+  closes on the refusal's class byte either way.
+
+**Who is named.** Offering relay is the consent to be referred (Eric, 2026-11-04).
+A referral names any announced node, owned or not, that reports free shaped slots,
+with a live route carrying a transit pair. A node reports slots only while its
+relay offering is on (`onion::policy::relay_offering`: on for servers and home
+nodes, a phone only on Wi-Fi while charging, the user's override either way, less
+the operator's relay opt-out). When the offering ends the node reports zero at
+once on its running links and peers stop ranking it. Edge nodes come first; one
+serve seat may take the last entry when fewer than three edge nodes qualify.
+
+**Capacity.** The free slots ride the in-band capability body
+(`SHCP ‖ version ‖ free_slots`, inside the constant frames, not in the fixed-length
+`SHAP` offer, so a 43.x peer is unaffected), sent on a fresh link and on every
+shaped link when the value changes. Zero means no claim.
+
+**Against herding.** Most free slots first, ties in random order, and a node handed
+out first loses a slot in the referrer's local hint until its next report. So
+refused peers spread even when one node reports more room than the rest.
+
+**On the receiving side.** The peer dials the referrals in order on its row lane
+and stops at the first that takes a shaped link. A referred node treats it as any
+shaping peer. It skips the node that refused it and any node that refused it within
+the last 120 s; those are the peer's exclusions, and no message carries them. The
+refusal's token and the outcome are logged and counted:
+`link_shaping_referral_{sent,empty,withheld,received,rejected,homed,failed,exhausted}`.
+
+**A referral is a hint, never a guarantee.** A stale report costs one refused dial
+and the peer tries the next. **With no targets known the refusal carries an empty
+list and the peer uses its fallback order** (other canonicals, CIRISEdge#935). At
+v44 that order is not built: an empty or exhausted list leaves the peer's row sends
+to that node failing by name for 120 s, with its bulk link unaffected.
+
+**Homing does not re-address a row.** The refused send still fails by name. The
+peer now holds a shaped link to the referred node, and what it sends there is the
+host's choice (`homed_on_referrals`).
+
+**`DivideNoFloor`** (`cap ÷ links`, however small) stays as the non-default arm
+for comparison. It does not conform to rc17.
 
 ## Latency
 

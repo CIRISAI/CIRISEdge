@@ -5,7 +5,7 @@ MEASURED = the shaping harness (`tests/shaping_measure_e1.rs::m4_rho_window_grid
 `local/shaping-measure`) running edge's production `PoissonScheduler` + `BudgetMeter` on a virtual
 clock, 2 simulated hours per cell, real row sizes from CIRISServer's kept T2 mesh (50 rows, mean
 8.5 KB). MODELLED = arithmetic from the design. Nothing here is from a live mesh yet: the 43.2
-shaper ships off by default; bench-mesh numbers follow the first fleet opt-in.
+shaper shipped off by default then (since CC rc16 on by default for `server`, see docs/LINK_SHAPING_COST.md); bench-mesh numbers follow the first fleet opt-in.
 
 ## What ρ and W are, and what they do not do
 

@@ -60,6 +60,17 @@ pub fn device_relays(d: &DeviceState) -> bool {
     }
 }
 
+/// **Relay offering is on**: this node offers to carry for others, whether or
+/// not the tier has run here yet. It is the owner's setting on the device
+/// policy ([`device_relays`], `FSD/CIRIS_MESH.md` §3.2), less the operator's
+/// opt-out, which a seat does not have. It is also the consent to be referred:
+/// a node reports free shaped slots only while this holds
+/// ([`crate::transport::shaping_referral`]).
+#[must_use]
+pub fn relay_offering(p: &OnionPolicy, d: &DeviceState) -> bool {
+    device_relays(d) && (p.is_seat || !p.relay_opt_out)
+}
+
 /// Whether the tier is active on this node: `Ok` or the reason, by token.
 ///
 /// # Errors
