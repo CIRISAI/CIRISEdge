@@ -2162,11 +2162,15 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
         .expect("R dials the fifth");
     assert!(r.transport.peer_shaping(&dialled.key.key_id).shaped_now);
     assert_eq!(r.transport.shaped_link_count(), 5);
-    let rates_before = {
-        let mut v = r.transport.shaped_rates_for_test();
-        v.sort_by(f64::total_cmp);
-        v
+    let sender_rates = || {
+        r.transport
+            .shaping_status()
+            .links
+            .into_iter()
+            .map(|l| (l.peer, l.bytes_per_s))
+            .collect::<std::collections::BTreeMap<_, _>>()
     };
+    let rates_before = sender_rates();
 
     let is_shaped = |n: &Node| r.transport.peer_shaping(&n.key.key_id).shaped_now;
     r.transport
@@ -2187,13 +2191,11 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
     }
 
     // Cover is not shed, and rows keep their place.
-    let mut rates = r.transport.shaped_rates_for_test();
-    rates.sort_by(f64::total_cmp);
+    let rates = sender_rates();
     assert_eq!(rates.len(), 3);
-    assert!(
-        rates.iter().all(|x| rates_before.contains(x)),
-        "{rates:?} against {rates_before:?}"
-    );
+    for (peer, rate) in &rates {
+        assert_eq!(Some(rate), rates_before.get(peer), "the sender's rate now");
+    }
     let cover = r.shaping("link_shaping_frames_cover");
     assert!(
         wait_until(Duration::from_secs(20), || async {

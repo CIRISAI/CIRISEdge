@@ -3895,14 +3895,13 @@ mod tests {
         shaped_links(&t, 1, "g", 10);
         let s = t.get([10u8; 16]).expect("a link");
         let before = (s.lambda_now(), s.bytes_per_s_now(), s.reach_frames_now());
+        let now = || (s.lambda_now(), s.bytes_per_s_now(), s.reach_frames_now());
         for tier in [T::AudioAndFiles, T::ChatAndContacts] {
             t.set_service_tier(tier);
+            assert_eq!(now(), before, "{tier:?}");
+            // A close elsewhere rebalances: the tier must not enter there.
             t.rebalance();
-            assert_eq!(
-                (s.lambda_now(), s.bytes_per_s_now(), s.reach_frames_now()),
-                before,
-                "{tier:?}"
-            );
+            assert_eq!(now(), before, "{tier:?} rebalanced");
         }
         assert_eq!(s.queued(), 0, "nothing real is waiting");
         assert!(matches!(
