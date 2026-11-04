@@ -124,7 +124,8 @@ fn party(name: &str, seed: u8) -> Party {
 /// its bridge.
 struct Node {
     dir: Arc<SqliteBackend>,
-    bridge: FederationDirectoryReplicationBridge,
+    // Boxed: the fixtures pass `[Node; 4]` by value.
+    bridge: Box<FederationDirectoryReplicationBridge>,
 }
 
 async fn node(me: &Party, all: &[&Party], widener: Option<MembershipWidener>) -> Node {
@@ -167,7 +168,10 @@ async fn node(me: &Party, all: &[&Party], widener: Option<MembershipWidener>) ->
     .with_local_key_id(Some(me.node.key_id.clone()))
     .with_self_provider(Some(Arc::new(move || publish.clone())))
     .with_membership_widener(widener);
-    Node { dir, bridge }
+    Node {
+        dir,
+        bridge: Box::new(bridge),
+    }
 }
 
 /// The room, founded by `founder` alone under `protocol`, held on every node

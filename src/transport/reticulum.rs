@@ -20001,6 +20001,7 @@ mod tests {
         fn summaries_and_non_bootstrap_kinds_name_nobody() {
             let summary = crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
                 SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![],
                 },

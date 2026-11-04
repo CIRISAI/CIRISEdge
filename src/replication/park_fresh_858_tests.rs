@@ -365,6 +365,7 @@ async fn round(
     let mut sess = Session::new(SessionRole::Initiator, KIND);
     let _ = sess.start_round(&provider).await;
     let summary = SummaryMessage {
+        status: None,
         kind: KIND,
         refs: rows
             .iter()

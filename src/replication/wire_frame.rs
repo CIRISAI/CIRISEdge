@@ -375,6 +375,7 @@ mod tests {
     #[test]
     fn wrap_unwrap_round_trip() {
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Attestation,
             refs: vec![],
         });
@@ -475,6 +476,7 @@ mod tests {
     #[test]
     fn wrap_at_version_forges_cross_version_frames() {
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
@@ -501,6 +503,7 @@ mod tests {
 
         fn summary() -> ReplicationMessage {
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Community,
                 refs: vec![],
             })
@@ -591,6 +594,7 @@ mod tests {
         let h = [7u8; 32];
         let cases = vec![
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![EnvelopeRef {
                     envelope_hash: h,
@@ -610,31 +614,38 @@ mod tests {
                 envelopes: vec![b"signed_envelope_bytes".to_vec()],
             }),
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Family,
                 refs: vec![],
             }),
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Community,
                 refs: vec![],
             }),
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::IdentityOccurrenceRevocation,
                 refs: vec![],
             }),
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::FamilyMembershipRevocation,
                 refs: vec![],
             }),
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::CommunityMembershipRevocation,
                 refs: vec![],
             }),
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::LocationProof,
                 refs: vec![],
             }),
             // v2 kinds — round-trip via wrap_for_kind (selects 0x02).
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Organization,
                 refs: vec![EnvelopeRef {
                     envelope_hash: h,
@@ -683,6 +694,7 @@ mod tests {
     fn wrap_for_kind_selects_version_per_kind() {
         // v1 trust kind → 0x01 framing.
         let msg_v1 = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
@@ -691,6 +703,7 @@ mod tests {
 
         // v2 operational kind → 0x02 framing.
         let msg_v2 = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Organization,
             refs: vec![],
         });
@@ -713,6 +726,7 @@ mod tests {
 
         // PartnerRecord → 0x02.
         let msg_v2 = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::PartnerRecord,
             refs: vec![],
         });
@@ -731,6 +745,7 @@ mod tests {
     #[test]
     fn v2_framing_accepts_v1_kinds() {
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
         });

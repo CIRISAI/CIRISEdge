@@ -80,7 +80,7 @@
 //! round is a missed cadence, not a fault. The next round will pick
 //! up whatever state changed in the meantime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -315,6 +315,9 @@ pub struct ReplicationScheduler {
     /// CIRISEdge#794 — the per-peer no-route backoff, shared by every
     /// coordinator task, the handle and the registry's inbound door.
     backoff: Arc<NoRouteBackoff>,
+    /// The peers a coordinator is driven toward, for
+    /// [`SchedulerHandle::drives_peer`].
+    driven: Arc<std::sync::Mutex<HashSet<String>>>,
     /// CIRISEdge#440 — the resolved mesh-config read seam. When `Some`, each
     /// coordinator loop re-checks `antientropy.round_secs` ONCE per round
     /// (after the round, before the next tick is scheduled): a live relief
@@ -422,6 +425,8 @@ pub struct SchedulerHandle {
     round_gate: Arc<RoundGate>,
     /// CIRISEdge#794 — the scheduler's no-route backoff.
     backoff: Arc<NoRouteBackoff>,
+    /// The peers a coordinator is driven toward (see [`Self::drives_peer`]).
+    driven: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl SchedulerHandle {
@@ -513,6 +518,51 @@ impl SchedulerHandle {
             .map_err(|_| SchedulerCommandError::SchedulerStopped)
     }
 
+    /// Does this scheduler drive a coordinator toward `peer_key_id`? The
+    /// answer to "is this a known replication peer", without a round-trip
+    /// through the command channel.
+    #[must_use]
+    pub fn drives_peer(&self, peer_key_id: &str) -> bool {
+        self.driven
+            .lock()
+            .is_ok_and(|driven| driven.contains(peer_key_id))
+    }
+
+    /// v44 (first-contact kick on a miss) — [`Self::round_now`] toward ONE
+    /// peer, never blocking (`try_send`, the [`Self::try_kick`] shape): called
+    /// from the serve path of a subject Pull that answered nothing for a
+    /// subject this node can resolve to that peer, so the rows are asked for
+    /// within a round-trip instead of at the next cadence tick. A full command
+    /// channel drops the kick and the cadence still asks. Returns whether the
+    /// kick was queued. See [`SchedulerCommand::RoundNow`].
+    #[must_use]
+    pub fn try_round_now(&self, peer_key_id: &str) -> bool {
+        self.command_tx
+            .try_send(SchedulerCommand::RoundNow {
+                peer_key_id: Some(peer_key_id.to_owned()),
+            })
+            .is_ok()
+    }
+
+    /// A handle whose command channel the TEST holds the receiving end of, so
+    /// a witness can observe the commands a caller queues without running a
+    /// scheduler.
+    #[cfg(test)]
+    pub(crate) fn test_pair(driven: &[&str]) -> (Self, mpsc::Receiver<SchedulerCommand>) {
+        let (command_tx, command_rx) = mpsc::channel(32);
+        (
+            Self {
+                command_tx,
+                round_gate: Arc::new(RoundGate::new(1)),
+                backoff: Arc::new(NoRouteBackoff::new()),
+                driven: Arc::new(std::sync::Mutex::new(
+                    driven.iter().map(|p| (*p).to_owned()).collect(),
+                )),
+            },
+            command_rx,
+        )
+    }
+
     /// CIRISEdge#776 — fire a round NOW on `(peer_key_id, kind)` only. Never
     /// blocks (`try_send`): it is called from the apply path; a full command
     /// channel drops the kick and the cadence still asks. Returns whether the
@@ -568,6 +618,7 @@ impl ReplicationScheduler {
             command_rx: None,
             round_gate: Arc::new(RoundGate::new(config.max_concurrent_rounds)),
             backoff: Arc::new(NoRouteBackoff::new()),
+            driven: Arc::default(),
             mesh_config: None,
             metrics: None,
         }
@@ -645,6 +696,7 @@ impl ReplicationScheduler {
             command_tx,
             round_gate: Arc::clone(&self.round_gate),
             backoff: Arc::clone(&self.backoff),
+            driven: Arc::clone(&self.driven),
         }
     }
 
@@ -698,6 +750,7 @@ impl ReplicationScheduler {
     /// telemetry consumers. Drop the receiver to stop receiving
     /// events; the scheduler tolerates a closed sink (the round
     /// loops continue).
+    #[allow(clippy::too_many_lines)] // one select loop: every command arm in one place
     pub async fn run_with_events(
         mut self,
         mut cancel: watch::Receiver<bool>,
@@ -718,6 +771,7 @@ impl ReplicationScheduler {
         let mesh_config = self.mesh_config.take();
         let metrics = self.metrics.take();
         for coord in self.coordinators.drain(..) {
+            note_driven(&self.driven, &coord);
             spawn_coord(
                 &mut per_coord,
                 &mut handles,
@@ -761,6 +815,7 @@ impl ReplicationScheduler {
                                 );
                                 continue;
                             }
+                            note_driven(&self.driven, &coord);
                             spawn_coord(
                                 &mut per_coord,
                                 &mut handles,
@@ -775,7 +830,13 @@ impl ReplicationScheduler {
                             );
                         }
                         SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
-                            remove_initiator(&mut per_coord, &backoff, &peer_key_id, kind);
+                            remove_initiator(
+                                &mut per_coord,
+                                &backoff,
+                                &self.driven,
+                                &peer_key_id,
+                                kind,
+                            );
                         }
                         SchedulerCommand::RoundNow { peer_key_id } => {
                             round_now_kick(&per_coord, peer_key_id.as_deref());
@@ -1210,6 +1271,7 @@ fn round_now_kick(
 fn remove_initiator(
     per_coord: &mut HashMap<(String, EnvelopeKind), CoordControl>,
     backoff: &NoRouteBackoff,
+    driven: &std::sync::Mutex<HashSet<String>>,
     peer_key_id: &str,
     kind: EnvelopeKind,
 ) {
@@ -1218,6 +1280,16 @@ fn remove_initiator(
     }
     if !per_coord.keys().any(|(p, _)| p == peer_key_id) {
         backoff.forget(peer_key_id);
+        if let Ok(mut driven) = driven.lock() {
+            driven.remove(peer_key_id);
+        }
+    }
+}
+
+/// Record that a coordinator is about to be driven toward its peer.
+fn note_driven(driven: &std::sync::Mutex<HashSet<String>>, coord: &ReplicationCoordinator) {
+    if let Ok(mut driven) = driven.lock() {
+        driven.insert(coord.peer_key_id().to_owned());
     }
 }
 

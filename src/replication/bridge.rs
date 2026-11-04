@@ -96,6 +96,9 @@ use async_trait::async_trait;
 use super::refusal_backoff::{RefusalBackoff, RetryDisposition};
 use super::resolved_state::{Reach, ResolvedPeerSet, ResolvedRecipient};
 use super::single_flight::SingleFlight;
+use super::subject_pull::{
+    LookupBudget, MISS_KICK_MAX_PEERS, MISS_KICK_WINDOW_SECS, PULL_OFFER_TTL_SECS,
+};
 use ciris_persist::federation::admission::has_accord_conferred_role;
 use ciris_persist::federation::consent_grammar::{self, ConsentTransferPolicy};
 use ciris_persist::federation::namespace::{self, Projection};
@@ -1742,6 +1745,16 @@ struct AttestationSweepCtx {
 /// walk fails closed.
 #[derive(Default)]
 struct AudienceMemo {
+    /// CC 5.4.6 — this row is being served to a subject PULL: the listing of
+    /// the #907 announced-testimony arm, or the fetch of a row that listing
+    /// offered this requester
+    /// ([`FederationDirectoryReplicationBridge::pull_offers`]). The
+    /// relayed-announce predicate widens here only: holding a live
+    /// federation-scope owner-binding is sufficient, whatever the host's
+    /// publish set says. Never set on a sweep, so the proactive advertise reach keeps
+    /// condition (d), and neither is it set for a stranger's fetch by hash
+    /// that no Pull offered (I21 keeps the twins in step).
+    subject_pull: bool,
     /// CIRISEdge#659 — `rooted_with` per peer, for one sweep. Sweep-scoped on
     /// purpose: the verdict is never cached past a `withdraws`, a halt or
     /// persist's `bounded_until`, because a sweep is seconds and the next one
@@ -2228,6 +2241,33 @@ pub struct FederationDirectoryReplicationBridge {
     ///
     /// Friction on a public plane, not confidentiality (CC 1.13.3.1).
     lookup_limiter: Mutex<crate::rate_limit::RateLimiter>,
+    /// CIRISEdge#936 — the announced-testimony arm's OWN budget (#907: a
+    /// stranger's Attestation Pull for a person's announced binding and root
+    /// acceptance — a contact lookup by name). Separate from
+    /// [`Self::lookup_limiter`] so a requester's catch-up polling on the
+    /// public planes can never spend the budget a person's contact lookup
+    /// draws on, and the reverse.
+    announced_testimony_limiter: Mutex<crate::rate_limit::RateLimiter>,
+    /// CIRISEdge#936 — one charge per `(requester, subject, budget, window)`.
+    /// A server's subject Pull is five sessions (four public kinds plus
+    /// Attestation) for ONE subject; charging each kind spent 5 of 60 per
+    /// lookup, so 12 lookups a minute throttled the 13th (the ce5 harness,
+    /// 16:39:17).
+    subject_pull_charges: Mutex<super::subject_pull::SubjectPullCharges>,
+    /// CC 5.4.6 — `(requester, hash)` of each row a subject Pull listed on the
+    /// widened reach: the `Deliver` answering that Pull has no Pull in hand,
+    /// and a listing its own fetch twin refuses is #429's
+    /// advertised-then-unfetchable. Per requester and short-lived, so the
+    /// widening reaches the Pull's own Diff and nothing else.
+    pull_offers: Mutex<super::subject_pull::PullOffers>,
+    /// v44 — subjects a miss has kicked a round for: one per
+    /// `(subject, MISS_KICK_WINDOW_SECS)`, so a requester polling a subject
+    /// nobody holds yet cannot turn the kick into a round storm.
+    miss_kicks: Mutex<super::subject_pull::MissKicks>,
+    /// Test clock for the limiters: seconds added to the wall clock, so a
+    /// witness can step past a window without sleeping through it.
+    #[cfg(test)]
+    clock_skew_secs: std::sync::atomic::AtomicU64,
     /// ROLE_MATRIX Axis 3 — this node's own serving tier, cached (sync reads
     /// on the apply loop, async refresh once per TTL). Fail-closed: reads
     /// `None` until first resolution.
@@ -2515,23 +2555,25 @@ impl FederationDirectoryReplicationBridge {
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             key_plane_memos: super::key_plane_memo::KeyPlaneMemos::default(),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
-            lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
-                crate::rate_limit::Policy::quota(
-                    Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
-                    Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
-                    Self::IDENTIFIER_LOOKUP_MAX_PEERS,
-                )
-                .with_long_windows([
-                    Some(crate::rate_limit::Quota::new(
-                        Self::IDENTIFIER_LOOKUPS_PER_HOUR,
-                        3_600,
-                    )),
-                    Some(crate::rate_limit::Quota::new(
-                        Self::IDENTIFIER_LOOKUPS_PER_DAY,
-                        86_400,
-                    )),
-                ]),
+            lookup_limiter: Self::lookup_budget(
+                Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
+                Self::IDENTIFIER_LOOKUPS_PER_HOUR,
+                Self::IDENTIFIER_LOOKUPS_PER_DAY,
+            ),
+            announced_testimony_limiter: Self::lookup_budget(
+                Self::ANNOUNCED_TESTIMONY_LOOKUPS_PER_WINDOW,
+                Self::ANNOUNCED_TESTIMONY_LOOKUPS_PER_HOUR,
+                Self::ANNOUNCED_TESTIMONY_LOOKUPS_PER_DAY,
+            ),
+            subject_pull_charges: Mutex::default(),
+            pull_offers: Mutex::new(super::subject_pull::WindowLedger::new(
+                super::subject_pull::LEDGER_CAP,
             )),
+            miss_kicks: Mutex::new(super::subject_pull::WindowLedger::new(
+                super::subject_pull::LEDGER_CAP,
+            )),
+            #[cfg(test)]
+            clock_skew_secs: std::sync::atomic::AtomicU64::new(0),
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
             serve_tier_subject: None,
@@ -4247,6 +4289,21 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         subject_key_id: &str,
         peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
+        self.subject_pull_answer(kind, subject_key_id, peer_key_id)
+            .await
+            .refs
+    }
+
+    /// CIRISEdge#937 — [`Self::subject_holdings`] with its status: a throttled
+    /// Pull answers as one, where it used to be the same empty list as a
+    /// subject nobody holds.
+    async fn subject_pull_answer(
+        &self,
+        kind: EnvelopeKind,
+        subject_key_id: &str,
+        peer_key_id: Option<&str>,
+    ) -> crate::replication::summary::SubjectPullAnswer {
+        use crate::replication::summary::SubjectPullAnswer;
         // Authorize BEFORE resolving. The subject and own-record arms need no
         // tier at all, and an unattributed requester needs nothing but a
         // refusal — so neither may reach the trust-graph walk. `CachedServeTier`
@@ -4304,15 +4361,16 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                         "identifier lookup refused: no mutual trust root — two \
                          nodes with no shared root compose nothing (CC 4)"
                     );
-                    return Vec::new();
+                    return SubjectPullAnswer::default();
                 }
-                let verdict = self.lookup_limiter.lock().map_or(
-                    crate::rate_limit::Decision::Allow {
-                        suppressed_since_last_allow: 0,
-                    },
-                    |mut rl| rl.check_from(&requester.to_owned(), Some(requester), unix_now_secs()),
-                );
-                if let crate::rate_limit::Decision::Deny { reason } = verdict {
+                let budget = if announced_testimony {
+                    LookupBudget::AnnouncedTestimony
+                } else {
+                    LookupBudget::PublicPlane
+                };
+                if let crate::rate_limit::Decision::Deny { reason } =
+                    self.charge_subject_pull(requester, subject_key_id, budget)
+                {
                     // THROTTLED. "Not asked again this window" was wrong — the
                     // limiter suppresses the directory work, not the peer's
                     // sending, so a rate-limited peer that keeps asking would
@@ -4333,12 +4391,12 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                              (FSD_RATE_LIMIT §5.4)"
                         );
                     }
-                    return Vec::new();
+                    return SubjectPullAnswer::throttled(Self::IDENTIFIER_LOOKUP_WINDOW_SECS);
                 }
             }
             self.refresh_serve_tier().await;
         }
-        match peer_key_id {
+        let refs = match peer_key_id {
             // Three entitled cases, in the order they were established:
             //   1. the subject itself — the data-subject access path (#462);
             //   2. this node's OWN record on a public plane — exactly what the
@@ -4379,7 +4437,16 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 );
                 Vec::new()
             }
+        };
+        // A third-party lookup that found nothing, on a plane a contact's
+        // first rows ride: a peer of this node may hold them.
+        if refs.is_empty()
+            && cohort_entitled
+            && matches!(kind, EnvelopeKind::Key | EnvelopeKind::Attestation)
+        {
+            self.kick_on_miss(subject_key_id).await;
         }
+        SubjectPullAnswer::served(refs)
     }
 
     /// CIRISEdge#379 — recipient-aware fetch: the serve-side twin of the
@@ -4502,10 +4569,29 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
 
 impl FederationDirectoryReplicationBridge {
     /// The body of [`ReplicationDirectory::fetch_envelope_bytes_for_peer`]:
-    /// every serve gate of the direct-fetch twin, with the peer-scoped memos in
+    /// CC 5.4.6 — a row a subject Pull offered this requester is served on the
+    /// Pull's reach ([`AudienceMemo::subject_pull`]); then every serve gate.
+    async fn serve_fetch(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: &[u8; 32],
+        peer_key_id: Option<&str>,
+        memos: &mut ServeMemos,
+    ) -> Option<Vec<u8>> {
+        memos.audience.subject_pull = kind == EnvelopeKind::Attestation
+            && peer_key_id.is_some_and(|peer| {
+                self.pull_offers.lock().is_ok_and(|mut offers| {
+                    offers.contains(&(peer.to_owned(), *envelope_hash), self.limiter_now())
+                })
+            });
+        self.serve_fetch_gated(kind, envelope_hash, peer_key_id, memos)
+            .await
+    }
+
+    /// Every serve gate of the direct-fetch twin, with the peer-scoped memos in
     /// `memos` (CIRISEdge#817: one call's, or one Deliver's).
     #[allow(clippy::too_many_lines)] // the serve-side twin set: five gates + the v18 projection twin
-    async fn serve_fetch(
+    async fn serve_fetch_gated(
         &self,
         kind: EnvelopeKind,
         envelope_hash: &[u8; 32],
@@ -5416,9 +5502,12 @@ impl FederationDirectoryReplicationBridge {
     /// owner-bindings (CC 2.4.1.2) or root acceptances (`trust:accepts:v1`, CC
     /// 4.4.3.8 item 3), and of those ONLY the ones the fetch twin would serve
     /// this requester ([`Self::fetch_envelope_bytes_for_peer`]). The fetch gate
-    /// is the whole disclosure decision, so the Pull widens timing, never reach:
-    /// a live announced binding of a published node rides (#752's rule), and a
-    /// row the requester could not fetch is never listed (#429).
+    /// is the whole disclosure decision, run on the Pull's reach
+    /// ([`AudienceMemo::subject_pull`], CC 5.4.6): a live announced binding
+    /// rides whether or not its node is published, and a row the requester
+    /// could not fetch is never listed
+    /// (#429). What is listed is recorded, so the Diff answering this Pull
+    /// fetches on the same reach.
     async fn announced_testimony_holdings(
         &self,
         subject_key_id: &str,
@@ -5459,11 +5548,27 @@ impl FederationDirectoryReplicationBridge {
             let Some((hash, _)) = content_hash_of(&att) else {
                 continue;
             };
+            let mut memos = ServeMemos::default();
+            memos.audience.subject_pull = true;
             if self
-                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some(requester))
+                .serve_fetch_gated(
+                    EnvelopeKind::Attestation,
+                    &hash,
+                    Some(requester),
+                    &mut memos,
+                )
                 .await
                 .is_some()
             {
+                if let Ok(mut offers) = self.pull_offers.lock() {
+                    let now = self.limiter_now();
+                    offers.insert(
+                        (requester.to_owned(), hash),
+                        (),
+                        now + PULL_OFFER_TTL_SECS,
+                        now,
+                    );
+                }
                 refs.push(EnvelopeRef {
                     envelope_hash: hash,
                     seq: Self::ms_seq(att.asserted_at),
@@ -7207,6 +7312,133 @@ impl FederationDirectoryReplicationBridge {
         mine.iter().any(|r| theirs.contains(r))
     }
 
+    /// CIRISEdge#936 — the limiter verdict for one lookup: a subject Pull is
+    /// charged once per `(requester, subject, budget, window)`, however many
+    /// kinds it asks on and however often a person's add re-asks it. The
+    /// ledger's lock is held across the charge: the five kinds of one Pull
+    /// arrive on five sessions at once, and two of them must not both pay.
+    fn charge_subject_pull(
+        &self,
+        requester: &str,
+        subject: &str,
+        budget: LookupBudget,
+    ) -> crate::rate_limit::Decision {
+        use crate::rate_limit::{Decision, DenyReason};
+        let allow = Decision::Allow {
+            suppressed_since_last_allow: 0,
+        };
+        let now = self.limiter_now();
+        let Ok(mut charges) = self.subject_pull_charges.lock() else {
+            return allow;
+        };
+        match charges.prior_verdict(requester, subject, budget, now) {
+            Some(true) => return allow,
+            Some(false) => {
+                return Decision::Deny {
+                    reason: DenyReason::QuotaSpent,
+                }
+            }
+            None => {}
+        }
+        let limiter = match budget {
+            LookupBudget::PublicPlane => &self.lookup_limiter,
+            LookupBudget::AnnouncedTestimony => &self.announced_testimony_limiter,
+        };
+        let verdict = limiter.lock().map_or(allow, |mut rl| {
+            rl.check_from(&requester.to_owned(), Some(requester), now)
+        });
+        let allowed = !matches!(verdict, Decision::Deny { .. });
+        let expires = now + Self::IDENTIFIER_LOOKUP_WINDOW_SECS;
+        charges.record(requester, subject, budget, allowed, expires, now);
+        verdict
+    }
+
+    /// One per-requester lookup budget: a burst quota, and the hourly and daily
+    /// ceilings a slow drain is measured against (FSD_RATE_LIMIT §5.4).
+    fn lookup_budget(
+        per_window: u32,
+        per_hour: u32,
+        per_day: u32,
+    ) -> Mutex<crate::rate_limit::RateLimiter> {
+        use crate::rate_limit::{Policy, Quota, RateLimiter};
+        Mutex::new(RateLimiter::new(
+            Policy::quota(
+                per_window,
+                Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
+                Self::IDENTIFIER_LOOKUP_MAX_PEERS,
+            )
+            .with_long_windows([
+                Some(Quota::new(per_hour, 3_600)),
+                Some(Quota::new(per_day, 86_400)),
+            ]),
+        ))
+    }
+
+    /// The clock the lookup limiters and their ledgers read.
+    #[cfg_attr(not(test), allow(clippy::unused_self))] // the skew is test-only
+    fn limiter_now(&self) -> crate::rate_limit::Ts {
+        #[cfg(test)]
+        let skew = self
+            .clock_skew_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let skew = 0;
+        unix_now_secs() + skew
+    }
+
+    /// v44 — a subject Pull served nothing for a subject that resolves to a
+    /// replication peer of this node: ask that peer now, once per
+    /// `(subject, MISS_KICK_WINDOW_SECS)`, so the requester's next ask finds
+    /// the rows instead of waiting out this node's cadence. The subject is the
+    /// peer, or a person whose nodes are. Only a peer the scheduler drives
+    /// claims the window, so a name that resolves to nobody yet does not spend
+    /// it, and nothing is dialled for a requester.
+    async fn kick_on_miss(&self, subject_key_id: &str) {
+        let Some(scheduler) = self.release_kick.get() else {
+            return;
+        };
+        let key = subject_key_id.to_owned();
+        let kicked_lately = |now| {
+            self.miss_kicks
+                .lock()
+                .map_or(true, |mut kicks| kicks.contains(&key, now))
+        };
+        if kicked_lately(self.limiter_now()) {
+            return;
+        }
+        let mut peers = vec![key.clone()];
+        peers.extend(
+            ciris_persist::federation::admission::nodes_owned_by(
+                &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
+                subject_key_id,
+            )
+            .await
+            .unwrap_or_default(),
+        );
+        peers.retain(|p| scheduler.drives_peer(p));
+        peers.sort_unstable();
+        peers.dedup();
+        peers.truncate(MISS_KICK_MAX_PEERS);
+        if peers.is_empty() {
+            return;
+        }
+        let now = self.limiter_now();
+        if kicked_lately(now) {
+            return;
+        }
+        if let Ok(mut kicks) = self.miss_kicks.lock() {
+            kicks.insert(key, (), now + MISS_KICK_WINDOW_SECS, now);
+        }
+        let kicked = peers.iter().filter(|p| scheduler.try_round_now(p)).count();
+        tracing::info!(
+            subject = %subject_key_id,
+            peers = ?peers,
+            kicked,
+            "subject Pull served nothing for a subject a replication peer answers \
+             for — a round toward it now, not at the next cadence tick"
+        );
+    }
+
     /// Identifier lookups one peer may make per window (FSD_RATE_LIMIT §5.4).
     ///
     /// Generous for a human walking a contact list, restrictive for a script
@@ -7230,6 +7462,18 @@ impl FederationDirectoryReplicationBridge {
     /// other here. Peer ids are attributed, so this is a backstop rather than
     /// the control.
     pub const IDENTIFIER_LOOKUP_MAX_PEERS: usize = 16_384;
+    /// CIRISEdge#936 — announced-testimony lookups (#907: a stranger's
+    /// Attestation Pull for a person by name) one peer may make per window,
+    /// on their OWN budget. Twelve a minute is a person adding contacts by
+    /// fedID as fast as they can type them; a script walking a dictionary of
+    /// names is what it bounds. The thirteenth in a window is answered
+    /// `subject_pull_throttled` (#937), never an empty list.
+    pub const ANNOUNCED_TESTIMONY_LOOKUPS_PER_WINDOW: u32 = 12;
+    /// The announced-testimony arm's hourly and daily ceilings — the same
+    /// slow-drain shape as the identifier budget's, at a tenth of its size.
+    pub const ANNOUNCED_TESTIMONY_LOOKUPS_PER_HOUR: u32 = 120;
+    /// Ditto, per day.
+    pub const ANNOUNCED_TESTIMONY_LOOKUPS_PER_DAY: u32 = 400;
 
     /// CIRISEdge#379 — does this attestation row require the recipient to hold
     /// [`Self::SERVE_CAPABILITY`]? True iff its `dimension` (CC 2.1 — inside
@@ -7919,7 +8163,13 @@ impl FederationDirectoryReplicationBridge {
     ///   gate reads ([`Self::live_announcing_rows`]: `retired_ids`, expiry, the
     ///   widening judged on its prior);
     /// - (d) its subject is in THIS relay's `Key` or `IdentityOccurrence`
-    ///   publish set — the host's [`KindPublishSelector`] answer.
+    ///   publish set — the host's [`KindPublishSelector`] answer. Serving a
+    ///   subject PULL ([`AudienceMemo::subject_pull`]) (d) does not apply:
+    ///   holding the live binding is sufficient (CC 5.4.6), so first contact
+    ///   never waits on a host's refresh of its set. The proactive advertise
+    ///   keeps (d); what a trust serves unasked is host policy (CC 3.2 T8).
+    ///   An owned node's ROUTE is no part of this: this predicate reads the
+    ///   Attestation plane only.
     ///
     /// No selector installed ⇒ `false` for every row: the first-contact reach is
     /// then exactly #671's, byte for byte.
@@ -7991,7 +8241,8 @@ impl FederationDirectoryReplicationBridge {
             && env.get("dimension").and_then(serde_json::Value::as_str)
                 == Some(ciris_persist::federation::trust_root::TRUST_ACCEPTS_DIMENSION)
         {
-            if !self.self_own_subjects(EnvelopeKind::Key).contains(owner) {
+            let published = self.self_own_subjects(EnvelopeKind::Key).contains(owner);
+            if !published && !memo.subject_pull {
                 return false;
             }
             if let Some(hit) = memo.relayed_announce.get(id) {
@@ -8007,21 +8258,24 @@ impl FederationDirectoryReplicationBridge {
                 .unwrap_or_default();
                 memo.roots.insert(owner.to_owned(), roots);
             }
-            let live = memo
+            let mut live = memo
                 .roots
                 .get(owner)
                 .is_some_and(|roots| roots.iter().any(|r| r == node));
+            if live && !published {
+                live = self.owner_announces_a_node(owner).await;
+            }
             memo.relayed_announce.insert(id.to_owned(), live);
             return live;
         }
         if !is_owner_binding_envelope(env) {
             return false;
         }
-        if !self.self_own_subjects(EnvelopeKind::Key).contains(node)
-            && !self
+        let published = self.self_own_subjects(EnvelopeKind::Key).contains(node)
+            || self
                 .self_own_subjects(EnvelopeKind::IdentityOccurrence)
-                .contains(node)
-        {
+                .contains(node);
+        if !published && !memo.subject_pull {
             return false;
         }
         if let Some(hit) = memo.relayed_announce.get(id) {
@@ -8036,6 +8290,27 @@ impl FederationDirectoryReplicationBridge {
         };
         memo.relayed_announce.insert(id.to_owned(), live);
         live
+    }
+
+    /// Condition (d) on a Pull for a root acceptance, whose subject is the root
+    /// and not a node: does this node hold a live announced binding by this
+    /// person? A person who announced no node is no contact anyone can reach,
+    /// and their acceptance does not ride ahead of it.
+    async fn owner_announces_a_node(&self, owner: &str) -> bool {
+        let Ok(nodes) = ciris_persist::federation::admission::nodes_owned_by(
+            &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
+            owner,
+        )
+        .await
+        else {
+            return false;
+        };
+        for node in nodes {
+            if self.node_is_announced(owner, &node).await.unwrap_or(false) {
+                return true;
+            }
+        }
+        false
     }
 
     /// The REACH half of the audience question, per recipient: which rows the
@@ -24390,6 +24665,471 @@ pub(crate) mod tests {
         );
     }
 
+    /// The contact harness's shape (ce5 / ce7): a canonical holds a new person's
+    /// live federation-scope owner-binding and `trust:accepts`, and its publish
+    /// selector names only itself. Everything alice's node gets here it gets by
+    /// asking for dan by name.
+    struct PullFixture {
+        backend: Arc<SqliteBackend>,
+        binding: [u8; 32],
+        acceptance: [u8; 32],
+    }
+
+    const CANONICAL: &str = "native-canonical-vyy5xptzpm";
+    const ALICE_NODE: &str = "native-alice-qy76zdvone";
+    const ALICE: &str = "alice-person-user-m2pi56gmbr";
+    const CAROL_NODE: &str = "native-carol-fsfy5f2zbi";
+    const CAROL: &str = "carol-person-user-ve6blk4c6g";
+    const DAN: &str = "dan-person-user-fqke4s6qgo";
+    const DAN_NODE: &str = "native-dan-xdr227svt6";
+
+    async fn pull_fixture() -> PullFixture {
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
+        register_fixture_keys(
+            &backend,
+            &[
+                (CANONICAL, identity_type::NODE),
+                (ALICE_NODE, identity_type::NODE),
+                (ALICE, identity_type::USER),
+                (CAROL_NODE, identity_type::NODE),
+                (CAROL, identity_type::USER),
+                (DAN, identity_type::USER),
+                (DAN_NODE, identity_type::NODE),
+            ],
+        )
+        .await;
+        seed_owner_binding(&backend, ALICE, ALICE_NODE).await;
+        seed_owner_binding(&backend, CAROL, CAROL_NODE).await;
+        seed_common_root(
+            &backend,
+            &[CANONICAL, ALICE, ALICE_NODE, CAROL, CAROL_NODE, DAN],
+        )
+        .await;
+        let binding = seed_owner_binding(&backend, DAN, DAN_NODE).await;
+        let binding = wire_hash_of(&backend, &binding).await;
+        let acceptance = acceptance_hash_of(&backend, DAN).await;
+        PullFixture {
+            backend,
+            binding,
+            acceptance,
+        }
+    }
+
+    async fn acceptance_hash_of(backend: &SqliteBackend, person: &str) -> [u8; 32] {
+        let rows = backend
+            .list_attestations_since(None, 4096)
+            .await
+            .expect("list");
+        let acc = rows
+            .iter()
+            .find(|r| {
+                r.attestation.attesting_key_id == person
+                    && r.attestation.attested_key_id == "root-r"
+                    && r.attestation.attestation_type == "delegates_to"
+            })
+            .expect("the acceptance was seeded");
+        content_hash_of(&acc.attestation).expect("hashable").0
+    }
+
+    /// The selector as the field had it: this node, and no dan.
+    fn canonical_bridge(backend: &Arc<SqliteBackend>) -> FederationDirectoryReplicationBridge {
+        let own = vec![CANONICAL.to_string()];
+        let publish = own.clone();
+        bridge_over(backend, &[])
+            .with_local_key_id(Some(CANONICAL.to_string()))
+            .with_self_provider(Some(Arc::new(move || publish.clone())))
+            .with_kind_publish_selector(Some(KindPublishSelector::from_sets(HashMap::from([
+                (EnvelopeKind::Key, own.clone()),
+                (EnvelopeKind::IdentityOccurrence, own),
+            ]))))
+    }
+
+    async fn pulled_hashes(
+        bridge: &FederationDirectoryReplicationBridge,
+        subject: &str,
+        requester: &str,
+    ) -> std::collections::BTreeSet<[u8; 32]> {
+        bridge
+            .subject_holdings(EnvelopeKind::Attestation, subject, Some(requester))
+            .await
+            .into_iter()
+            .map(|r| r.envelope_hash)
+            .collect()
+    }
+
+    /// CC 5.4.6, the ce5 field finding:
+    /// the canonical held dan's binding and `trust:accepts`, its selector
+    /// excluded dan, and alice's Pull served 0. Positive control first, then the
+    /// razors: every discriminator flips the row back out.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one scenario: the Pull, its wire, and each razor
+    async fn a_held_live_binding_is_served_to_a_strangers_pull_outside_the_publish_set() {
+        use crate::replication::directory::{DirectoryStateAdapter, MutableDirectoryStateAdapter};
+        use crate::replication::protocol::{DiffMessage, PullMessage, ReplicationMessage};
+        use crate::replication::session::{ReplicationOutcome, Session, SessionRole};
+        let PullFixture {
+            backend,
+            binding,
+            acceptance,
+        } = pull_fixture().await;
+        let bridge = Arc::new(canonical_bridge(&backend));
+
+        // Before anyone asks: dan's rows are not on the advertise, and no
+        // stranger can fetch them by hash. (d) stands for both.
+        let advertised: Vec<[u8; 32]> = bridge
+            .list_attestations_for_peer(Some(ALICE_NODE))
+            .await
+            .into_iter()
+            .map(|r| r.envelope_hash)
+            .collect();
+        assert!(
+            !advertised.contains(&binding) && !advertised.contains(&acceptance),
+            "the proactive advertise keeps (d): dan is not published"
+        );
+        for row in [&binding, &acceptance] {
+            assert!(
+                bridge
+                    .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, row, Some(ALICE_NODE))
+                    .await
+                    .is_none(),
+                "un-Pulled, the fetch twin agrees with the advertise (I21)"
+            );
+        }
+
+        // The Pull, over the wire shape: Pull → Summary, Diff → Deliver. A listing
+        // alone would pass while the Deliver came back empty.
+        let dir: Arc<dyn ReplicationDirectory> = bridge.clone();
+        let provider = DirectoryStateAdapter::new(dir.clone()).with_peer(ALICE_NODE);
+        let applier = MutableDirectoryStateAdapter::new(dir);
+        let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let pull = ReplicationMessage::Pull(PullMessage {
+            kind: EnvelopeKind::Attestation,
+            subject_key_id: DAN.to_string(),
+        });
+        let out = session
+            .on_message(pull, &provider, &applier, Some(ALICE_NODE))
+            .await;
+        let ReplicationOutcome::Send(msgs) = out else {
+            panic!("a Pull is answered: {out:?}");
+        };
+        let [ReplicationMessage::Summary(summary)] = msgs.as_slice() else {
+            panic!("a Pull's answer is one Summary: {msgs:?}");
+        };
+        assert_eq!(summary.status, None);
+        let listed: std::collections::BTreeSet<[u8; 32]> =
+            summary.refs.iter().map(|r| r.envelope_hash).collect();
+        assert_eq!(
+            listed,
+            std::collections::BTreeSet::from([binding, acceptance]),
+            "the stranger's Pull serves the binding and `trust:accepts`"
+        );
+        let diff = ReplicationMessage::Diff(DiffMessage {
+            kind: EnvelopeKind::Attestation,
+            want: listed.iter().copied().collect(),
+        });
+        let out = session
+            .on_message(diff, &provider, &applier, Some(ALICE_NODE))
+            .await;
+        let ReplicationOutcome::Send(msgs) = out else {
+            panic!("a Diff is answered: {out:?}");
+        };
+        let [ReplicationMessage::Deliver(deliver)] = msgs.as_slice() else {
+            panic!("a Diff's answer is one Deliver: {msgs:?}");
+        };
+        assert_eq!(
+            deliver.envelopes.len(),
+            2,
+            "and the Deliver carries what the Summary listed (#429)"
+        );
+
+        // RAZOR — the offer is this requester's alone.
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &binding,
+                    Some(CAROL_NODE)
+                )
+                .await
+                .is_none(),
+            "alice's Pull opens nothing for carol, who did not ask"
+        );
+        // RAZOR — and it does not outlive the exchange it was made for.
+        bridge.clock_skew_secs.store(
+            crate::replication::subject_pull::PULL_OFFER_TTL_SECS,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &binding,
+                    Some(ALICE_NODE)
+                )
+                .await
+                .is_none(),
+            "past its TTL the offer is gone"
+        );
+
+        // CC 5.4.6 — HOLDING is sufficient: a subject with no root in common
+        // with this node still has its binding served. Only the requester
+        // answers to a root (the #907 floor); it is the subject's testimony.
+        let (eve, eve_node) = ("eve-person-user-unrooted", "native-eve-unrooted");
+        register_fixture_keys(
+            &backend,
+            &[(eve, identity_type::USER), (eve_node, identity_type::NODE)],
+        )
+        .await;
+        let eves = seed_owner_binding(&backend, eve, eve_node).await;
+        assert_eq!(
+            pulled_hashes(&bridge, eve, ALICE_NODE).await,
+            std::collections::BTreeSet::from([wire_hash_of(&backend, &eves).await]),
+            "holding the live binding is sufficient (CC 5.4.6)"
+        );
+
+        // RAZOR — federation scope: the same person's `self`-scoped binding of
+        // another node, and a row that is no owner-binding at all.
+        let hidden = "native-dan-unannounced";
+        register_fixture_keys(&backend, &[(hidden, identity_type::NODE)]).await;
+        let unannounced = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &unannounced,
+            DAN,
+            hidden,
+            "delegates_to",
+            "self",
+            owner_binding_envelope(&unannounced, DAN, hidden),
+        )
+        .await;
+        let consent = uuid::Uuid::new_v4().to_string();
+        seed_raw_attestation(
+            &backend,
+            &consent,
+            DAN,
+            DAN_NODE,
+            "scores",
+            serde_json::json!({
+                "id": consent,
+                "attesting_key_id": DAN,
+                "attested_key_id": DAN_NODE,
+                "attestation_type": "scores",
+                "dimension": "consent:replication:v1",
+                "payload": { "grants": "transfer", "attestation_prefixes": ["trace:"] },
+            }),
+        )
+        .await;
+        bridge
+            .clock_skew_secs
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            pulled_hashes(&bridge, DAN, ALICE_NODE).await,
+            std::collections::BTreeSet::from([binding, acceptance]),
+            "an unannounced binding and a consent row stay out"
+        );
+    }
+
+    /// RAZOR on LIVE: a binding its owner withdrew does not ride the Pull's arm,
+    /// and the owner's acceptance goes with it (a person with no announced node).
+    #[tokio::test]
+    async fn a_withdrawn_binding_is_not_served_to_a_strangers_pull() {
+        let PullFixture { backend, .. } = pull_fixture().await;
+        let bridge = canonical_bridge(&backend);
+        let binding_id = backend
+            .list_attestations_since(None, 4096)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|r| {
+                r.attestation.attesting_key_id == DAN && r.attestation.attested_key_id == DAN_NODE
+            })
+            .expect("seeded")
+            .attestation
+            .attestation_id;
+        assert_eq!(
+            pulled_hashes(&bridge, DAN, ALICE_NODE).await.len(),
+            2,
+            "positive control: both rows serve while the binding is live"
+        );
+        let withdrawal = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &withdrawal,
+            DAN,
+            DAN_NODE,
+            "withdraws",
+            "federation",
+            serde_json::json!({
+                "id": withdrawal,
+                "attesting_key_id": DAN,
+                "attested_key_id": DAN_NODE,
+                "attestation_type": "withdraws",
+                "supersedes": binding_id,
+                "withdraws": binding_id,
+            }),
+        )
+        .await;
+        let bridge = canonical_bridge(&backend);
+        assert!(
+            pulled_hashes(&bridge, DAN, ALICE_NODE).await.is_empty(),
+            "withdrawn: neither the binding nor the acceptance rides"
+        );
+    }
+
+    /// v44 — a Pull that serves nothing for a subject resolving to a replication
+    /// peer kicks one round toward it, once per (subject, 60 s). The person's
+    /// node here is a peer of the canonical and only its `self`-scoped binding
+    /// is held, the announce not yet: the shape of a Pull racing a registration.
+    #[tokio::test]
+    async fn a_miss_on_a_peers_subject_kicks_one_round_per_window() {
+        use crate::replication::scheduler::{SchedulerCommand, SchedulerHandle};
+        let PullFixture { backend, .. } = pull_fixture().await;
+        let (eve, eve_node) = ("eve-person-user-unrooted", "native-eve-unrooted");
+        register_fixture_keys(
+            &backend,
+            &[(eve, identity_type::USER), (eve_node, identity_type::NODE)],
+        )
+        .await;
+        let unannounced = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &unannounced,
+            eve,
+            eve_node,
+            "delegates_to",
+            "self",
+            owner_binding_envelope(&unannounced, eve, eve_node),
+        )
+        .await;
+        let bridge = canonical_bridge(&backend);
+        let (handle, mut commands) = SchedulerHandle::test_pair(&[eve_node, DAN_NODE]);
+        bridge.install_release_kick(handle);
+        let expect_kick = |c: Result<SchedulerCommand, _>, peer: &str| match c {
+            Ok(SchedulerCommand::RoundNow {
+                peer_key_id: Some(p),
+            }) => assert_eq!(p, peer),
+            other => panic!("expected a round toward {peer}: {other:?}"),
+        };
+
+        assert!(pulled_hashes(&bridge, eve, ALICE_NODE).await.is_empty());
+        expect_kick(commands.try_recv(), eve_node);
+        // A second requester misses inside the window; the kick does not repeat.
+        assert!(pulled_hashes(&bridge, eve, CAROL_NODE).await.is_empty());
+        assert!(
+            commands.try_recv().is_err(),
+            "one kick per (subject, window)"
+        );
+
+        // RAZOR — a subject nobody peers with kicks nothing and claims nothing.
+        assert!(pulled_hashes(&bridge, "nobody", ALICE_NODE)
+            .await
+            .is_empty());
+        assert!(commands.try_recv().is_err(), "no peer, no kick");
+        // RAZOR — a Pull that served does not kick.
+        assert_eq!(pulled_hashes(&bridge, DAN, ALICE_NODE).await.len(), 2);
+        assert!(commands.try_recv().is_err(), "served ⇒ no kick");
+
+        // The next window kicks again.
+        bridge
+            .clock_skew_secs
+            .store(61, std::sync::atomic::Ordering::Relaxed);
+        assert!(pulled_hashes(&bridge, eve, ALICE_NODE).await.is_empty());
+        expect_kick(commands.try_recv(), eve_node);
+
+        // RAZOR — a THROTTLED Pull is not a miss: nothing was looked up.
+        bridge
+            .clock_skew_secs
+            .store(122, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..FederationDirectoryReplicationBridge::ANNOUNCED_TESTIMONY_LOOKUPS_PER_WINDOW {
+            let name = format!("nobody-{i}");
+            assert!(pulled_hashes(&bridge, &name, ALICE_NODE).await.is_empty());
+        }
+        let answer = bridge
+            .subject_pull_answer(EnvelopeKind::Attestation, eve, Some(ALICE_NODE))
+            .await;
+        assert!(answer.throttled.is_some());
+        assert!(commands.try_recv().is_err(), "throttled ⇒ no kick");
+    }
+
+    /// CIRISEdge#936's witness and #937's. A lookup is one charge across its
+    /// kinds and its re-asks; 12 people a minute are all answered; the 13th gets
+    /// the marker, not `served=0`; the first after the window gets rows; and
+    /// neither budget spends the other.
+    #[tokio::test]
+    async fn twelve_lookups_answer_the_thirteenth_is_throttled_and_says_so_936_937() {
+        let PullFixture { backend, .. } = pull_fixture().await;
+        let bridge = canonical_bridge(&backend);
+        let answer = |kind, subject: String| {
+            let bridge = &bridge;
+            async move {
+                bridge
+                    .subject_pull_answer(kind, &subject, Some(ALICE_NODE))
+                    .await
+            }
+        };
+        let quota = FederationDirectoryReplicationBridge::ANNOUNCED_TESTIMONY_LOOKUPS_PER_WINDOW;
+        assert_eq!(quota, 12);
+        // Dan first, on every kind, then re-asked as a person's add re-asks.
+        for _ in 0..4 {
+            for kind in EnvelopeKind::subject_pullable() {
+                let a = answer(kind, DAN.to_string()).await;
+                assert_eq!(a.throttled, None, "{kind:?}");
+            }
+        }
+        for i in 1..quota {
+            for kind in EnvelopeKind::subject_pullable() {
+                let a = answer(kind, format!("person-{i}")).await;
+                assert_eq!(a.throttled, None, "lookup {i} on {kind:?}");
+            }
+        }
+        let thirteenth = answer(EnvelopeKind::Attestation, "person-13".to_string()).await;
+        assert_eq!(
+            thirteenth,
+            crate::replication::summary::SubjectPullAnswer::throttled(60),
+            "the 13th is the marker with the window, not an empty answer"
+        );
+        // Asked again in the window it is the same verdict, on its own budget.
+        let again = answer(EnvelopeKind::Attestation, "person-13".to_string()).await;
+        assert_eq!(again.throttled, Some(60));
+        assert_eq!(
+            answer(EnvelopeKind::Key, "person-13".to_string())
+                .await
+                .throttled,
+            None,
+            "catch-up on the public planes is not spent by a person's lookups"
+        );
+        bridge
+            .clock_skew_secs
+            .store(61, std::sync::atomic::Ordering::Relaxed);
+        let after = answer(EnvelopeKind::Attestation, DAN.to_string()).await;
+        assert_eq!(after.throttled, None);
+        assert_eq!(after.refs.len(), 2, "the first after the window has rows");
+    }
+
+    /// CIRISEdge#936, the reverse: a requester whose catch-up spent the public
+    /// budget can still look a person up.
+    #[tokio::test]
+    async fn spent_catch_up_does_not_spend_a_persons_lookup_936() {
+        let PullFixture { backend, .. } = pull_fixture().await;
+        let bridge = canonical_bridge(&backend);
+        let public = FederationDirectoryReplicationBridge::IDENTIFIER_LOOKUPS_PER_WINDOW;
+        for i in 0..public {
+            let a = bridge
+                .subject_pull_answer(EnvelopeKind::Key, &format!("key-{i}"), Some(ALICE_NODE))
+                .await;
+            assert_eq!(a.throttled, None, "lookup {i}");
+        }
+        let spent = bridge
+            .subject_pull_answer(EnvelopeKind::Key, "key-spent", Some(ALICE_NODE))
+            .await;
+        assert_eq!(spent.throttled, Some(60));
+        let person = bridge
+            .subject_pull_answer(EnvelopeKind::Attestation, DAN, Some(ALICE_NODE))
+            .await;
+        assert_eq!(person.throttled, None);
+        assert_eq!(person.refs.len(), 2);
+    }
+
     /// CIRISEdge#907 — a first-contact requester's SUBJECT Pull of a third
     /// party's testimony on the Attestation plane. The relay (a conferred
     /// server Rooted with the requester) answers with exactly the subject's
@@ -24506,12 +25246,16 @@ pub(crate) mod tests {
                 .expect("o's acceptance was seeded");
             content_hash_of(&acc.attestation).expect("hashable").0
         };
+        // `node-e` is outside the publish set, and this relay holds its live
+        // binding: sufficient on a Pull (CC 5.4.6). The witness of that is
+        // `a_held_live_binding_is_served_to_a_strangers_pull_outside_the_publish_set`.
+        let rooted_hash = wire_hash_of(&backend, &unpublished).await;
         let got = pulled(peer).await;
         assert_eq!(
             got,
-            std::collections::BTreeSet::from([announced_hash, acceptance_hash]),
-            "a stranger's Pull gets exactly the announced binding of the published node and \
-             its owner's live root acceptance"
+            std::collections::BTreeSet::from([announced_hash, acceptance_hash, rooted_hash]),
+            "a stranger's Pull gets exactly the live announced bindings and their owner's \
+             live root acceptance"
         );
         assert!(
             relay_bridge()
@@ -24536,7 +25280,6 @@ pub(crate) mod tests {
             "every ref the Pull lists is fetchable by the same requester (#429)"
         );
         for (id, why) in [
-            (&unpublished, "a node the relay does not publish"),
             (&unannounced, "a binding at `self` (not announced)"),
             (&consent, "a consent row about a published node"),
         ] {
