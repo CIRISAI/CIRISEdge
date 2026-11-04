@@ -308,6 +308,11 @@ fn effective_control_channel_capacity(
 /// complete after the link is up.
 const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// CC 5.4.3 rc16 two planes — how long a failed bulk dial stands for its peer
+/// while the peer holds a shaped link: a NAT'd phone does not pay a dial
+/// before each fallback, and a peer that becomes dialable is tried again soon.
+const BULK_DIAL_NEGATIVE_TTL: Duration = Duration::from_secs(120);
+
 /// leviculum#52 — the dwell an operator should leave between
 /// `ifac_activate_next` and `ifac_seal_rotation` when they have no better
 /// number. **Anchored to [`RESOURCE_TRANSFER_TIMEOUT`], not chosen.**
@@ -2595,6 +2600,12 @@ pub struct ReticulumTransport {
     /// CC 5.4.6 — the Anonymous Tier on this node (dormant unless its
     /// operator opts in and the deal is available; [`crate::onion`]).
     onion: Arc<crate::onion::runtime::OnionRuntime>,
+    /// CC 5.4.3 rc16 two planes — the bulk fallbacks in progress
+    /// ([`Self::bulk_on_shaped`]).
+    bulk_fallbacks: Arc<crate::transport::link_shaping::BulkFallbacks>,
+    /// Peers whose bulk dial failed lately, so bulk to a peer reachable only
+    /// over its shaped link goes straight there ([`BULK_DIAL_NEGATIVE_TTL`]).
+    bulk_dial_failed: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead
     /// of the real one (see [`HandshakeOverride`]). `None` in production.
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
@@ -2608,6 +2619,8 @@ pub struct ReticulumTransport {
     test_unannounced: Arc<std::sync::atomic::AtomicBool>,
     /// Test seam — every outbound dial fails as unroutable (a NAT'd peer).
     test_refuse_dials: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — how many dials [`Self::test_refuse_dials`] refused.
+    test_refused_dials: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#805 item 5 — the router of peer-opened A/V links to the
     /// live calls, once one exists. It owns the A/V arrivals; `None` inside
     /// means another consumer took them first.
@@ -3288,6 +3301,7 @@ impl ReticulumTransport {
             handshake_override: Arc::clone(&self.handshake_override),
             test_unannounced: Arc::clone(&self.test_unannounced),
             test_refuse_dials: Arc::clone(&self.test_refuse_dials),
+            test_refused_dials: Arc::clone(&self.test_refused_dials),
             test_identify_last: Arc::clone(&self.test_identify_last),
             deferred_handshake_part: Arc::clone(&self.deferred_handshake_part),
             test_binding_key_only: Arc::clone(&self.test_binding_key_only),
@@ -3966,6 +3980,9 @@ impl ReticulumTransport {
             route_answer_override: Arc::new(std::sync::Mutex::new(None)),
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             test_refuse_dials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            test_refused_dials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bulk_fallbacks: Arc::new(crate::transport::link_shaping::BulkFallbacks::default()),
+            bulk_dial_failed: std::sync::Mutex::new(HashMap::new()),
             av_call_router: std::sync::OnceLock::new(),
             test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_handshake_part: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -6598,6 +6615,14 @@ impl ReticulumTransport {
             .len()
     }
 
+    /// CC 5.4.3 two-planes test seam — dials refused so far.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn refused_dials_for_test(&self) -> u64 {
+        self.test_refused_dials
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// CC 5.4.3 two-planes test seam — every outbound dial from this node
     /// fails as unroutable, as to a NAT'd peer: only links the peer dials in
     /// remain.
@@ -8631,70 +8656,111 @@ impl ReticulumTransport {
             .await
     }
 
+    /// Whether a bulk dial to `peer` failed within [`BULK_DIAL_NEGATIVE_TTL`].
+    fn bulk_dial_recently_failed(&self, peer: &str) -> bool {
+        let mut failed = self
+            .bulk_dial_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        failed.retain(|_, at| at.elapsed() < BULK_DIAL_NEGATIVE_TTL);
+        failed.contains_key(peer)
+    }
+
+    /// The live shaped link to `peer` that `envelope` would have to leave for
+    /// the bulk plane, if there is one.
+    async fn shaped_link_for_bulk(&self, peer: &str, envelope: &[u8]) -> Option<LinkId> {
+        self.live_link_to_where(peer, LinkPlane::Identity, |id| {
+            self.shapers.is_shaped(id.into_bytes())
+        })
+        .await
+        .filter(|l| self.shapers.needs_bulk_plane(l.into_bytes(), envelope))
+    }
+
     /// CC 5.4.3 rc16 two planes — the LAST RESORT for a payload that needs
     /// the bulk plane when no unshaped link to the peer could be had (the dial
     /// failed: a NAT'd peer reachable only over the link it dialled in, which
-    /// is shaped). The payload rides that shaped link in shaped-budget
-    /// fragments, paced by the shaper like every other frame: slow, never a
-    /// failure, counted `link_shaping_bulk_on_shaped_fallback`. With no live
-    /// shaped link, or a payload that does not need the bulk plane, the dial's
-    /// own error stands.
+    /// is shaped). With a live shaped link the payload rides it
+    /// ([`Self::bulk_on_shaped`]) and the failed dial is remembered for
+    /// [`BULK_DIAL_NEGATIVE_TTL`]; otherwise the dial's own error stands.
     async fn bulk_on_shaped_or(
         &self,
         destination_key_id: &str,
         envelope: &[u8],
         dial_error: TransportError,
     ) -> Result<TransportSendOutcome, TransportError> {
-        let shaped_live = self
-            .live_link_to_where(destination_key_id, LinkPlane::Identity, |id| {
-                self.shapers.is_shaped(id.into_bytes())
-            })
-            .await;
-        let Some(link) =
-            shaped_live.filter(|l| self.shapers.needs_bulk_plane(l.into_bytes(), envelope))
+        let Some(link) = self
+            .shaped_link_for_bulk(destination_key_id, envelope)
+            .await
         else {
             return Err(dial_error);
         };
-        let Some(shaper) = self.shapers.get(link.into_bytes()) else {
-            return Err(dial_error);
-        };
-        let cap = crate::transport::link_shaping::body_capacity(shaper.agreement().frame_bytes);
-        let Some(mut rest) = crate::transport::frame_fragment::fragment(envelope, cap) else {
-            return Err(dial_error);
-        };
-        if let Some(m) = self.metrics.get() {
-            m.inc_link_shaping(crate::observability::LINK_SHAPING_BULK_ON_SHAPED_FALLBACK);
-        }
+        self.bulk_dial_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(destination_key_id.to_owned(), std::time::Instant::now());
         tracing::info!(
             destination_key_id,
             link = ?link,
             bytes = envelope.len(),
-            frames = rest.len(),
             dial_error = %dial_error,
             "no unshaped link can reach this peer; bulk rides its shaped link in shaped-budget \
              fragments (slow, CC 5.4.3 two-planes last resort)"
         );
-        let deadline = tokio::time::Instant::now() + RESOURCE_TRANSFER_TIMEOUT;
-        while !rest.is_empty() {
-            if !self.node.link_is_established(&link) || shaper.is_stopped() {
-                return Err(TransportError::Io(
-                    "the shaped link closed during a bulk fallback".to_owned(),
-                ));
-            }
-            let room = shaper.room().min(rest.len());
-            if room == 0 {
-                if tokio::time::Instant::now() > deadline {
-                    return Err(TransportError::Timeout(RESOURCE_TRANSFER_TIMEOUT));
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-            let piece: Vec<Vec<u8>> = rest.drain(..room).collect();
-            shaper
-                .enqueue_bulk_fallback(piece)
-                .map_err(|e| TransportError::Io(e.to_string()))?;
+        self.bulk_on_shaped(destination_key_id, envelope, link)
+            .await
+    }
+
+    /// Send `envelope` over shaped `link` in shaped-budget fragments, paced by
+    /// the shaper like every other frame: slow, counted
+    /// `link_shaping_bulk_on_shaped_fallback`. `Delivered` means every fragment
+    /// left this node, because the durable dispatcher treats it as a transport
+    /// ack; a transfer that stops part-way is an `Io` error the dispatcher
+    /// retries. It runs detached and single-flight
+    /// ([`crate::transport::link_shaping::BulkFallbacks`]).
+    async fn bulk_on_shaped(
+        &self,
+        destination_key_id: &str,
+        envelope: &[u8],
+        link: LinkId,
+    ) -> Result<TransportSendOutcome, TransportError> {
+        use sha2::Digest as _;
+        let digest: [u8; 32] = sha2::Sha256::digest(envelope).into();
+        if self.bulk_fallbacks.recently_finished(&digest) {
+            return Ok(TransportSendOutcome::Delivered);
         }
-        Ok(TransportSendOutcome::Delivered)
+        let (mut outcome, owner) = self.bulk_fallbacks.join_or_start(digest);
+        if let Some(tx) = owner {
+            let shaper = self.shapers.get(link.into_bytes());
+            let frames = shaper.as_ref().and_then(|s| {
+                let cap = crate::transport::link_shaping::body_capacity(s.agreement().frame_bytes);
+                crate::transport::frame_fragment::fragment(envelope, cap)
+            });
+            let (Some(shaper), Some(frames)) = (shaper, frames) else {
+                self.bulk_fallbacks.finish(&digest, false);
+                return Err(TransportError::Io(format!(
+                    "the shaped link to {destination_key_id} cannot carry a bulk fallback"
+                )));
+            };
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_BULK_ON_SHAPED_FALLBACK);
+            }
+            let node = Arc::clone(&self.node);
+            let fallbacks = Arc::clone(&self.bulk_fallbacks);
+            tokio::spawn(async move {
+                let result = run_bulk_fallback(&node, link, &shaper, frames).await;
+                fallbacks.finish(&digest, result.is_ok());
+                // choke-ok: every waiter may have gone; the record above stands.
+                let _ = tx.send(Some(result));
+            });
+        }
+        let ended = outcome.wait_for(Option::is_some).await;
+        match ended.as_deref() {
+            Ok(Some(Ok(()))) => Ok(TransportSendOutcome::Delivered),
+            Ok(Some(Err(why))) => Err(TransportError::Io(why.clone())),
+            _ => Err(TransportError::Io(
+                "the bulk fallback's task ended without an outcome".to_owned(),
+            )),
+        }
     }
 
     /// CC 5.4.3 rc16 **two planes** — the reverse-path link for `envelope`
@@ -9462,12 +9528,22 @@ impl Transport for ReticulumTransport {
         // send to a peer this node shapes toward goes straight to the bulk
         // lane; any other send takes the row lane and moves to the bulk lane
         // only when the row link it got is shaped and the payload is too big.
-        let bulk_class = crate::transport::link_shaping::is_bulk_class(envelope_bytes);
+        let bulk = crate::transport::link_shaping::is_bulk_payload(envelope_bytes);
+        if bulk && self.bulk_dial_recently_failed(destination_key_id) {
+            if let Some(link) = self
+                .shaped_link_for_bulk(destination_key_id, envelope_bytes)
+                .await
+            {
+                return self
+                    .bulk_on_shaped(destination_key_id, envelope_bytes, link)
+                    .await;
+            }
+        }
         let lane = self
             .identity_lane(
                 destination_key_id,
                 &candidates,
-                bulk_class && self.shapers.offers_to(Some(destination_key_id)),
+                bulk && self.shapers.offers_to(Some(destination_key_id)),
             )
             .await;
         let mut claim = match lane {
@@ -10648,6 +10724,8 @@ struct DialCtx {
     test_unannounced: Arc<std::sync::atomic::AtomicBool>,
     /// Test seam — every outbound dial fails as unroutable (a NAT'd peer).
     test_refuse_dials: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — how many dials [`Self::test_refuse_dials`] refused.
+    test_refused_dials: Arc<std::sync::atomic::AtomicU64>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_identify_last`.
     test_identify_last: Arc<std::sync::atomic::AtomicBool>,
     /// CC 5.3.3.5 E1 test seam ([`HandshakeOverride::DeferLastPart`]): the
@@ -11120,6 +11198,8 @@ impl DialCtx {
             .test_refuse_dials
             .load(std::sync::atomic::Ordering::Acquire)
         {
+            self.test_refused_dials
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             return Err(TransportError::NoRouteToPeer {
                 key_id: destination_key_id.to_owned(),
                 target_dest: hex::encode(peer.dest_hash.into_bytes()),
@@ -14281,6 +14361,48 @@ async fn shaping_teardown(
     let _ = ctx.node.close_link(&link_id).await;
 }
 
+/// CC 5.4.3 rc16 two planes — feed `frames` to `shaper` as its queue allows
+/// and wait until the link has taken the last of them. The bound follows the
+/// message: three times what the link's real budget needs, plus a minute.
+async fn run_bulk_fallback(
+    node: &ReticulumNode,
+    link: LinkId,
+    shaper: &crate::transport::link_shaping::LinkShaper,
+    mut frames: Vec<Vec<u8>>,
+) -> Result<(), String> {
+    const STOPPED: &str = "link_shaping_bulk_fallback_interrupted: the shaped link closed \
+                           part-way; the message is not delivered and the send is retried";
+    let agreement = *shaper.agreement();
+    #[allow(clippy::cast_precision_loss)] // a frame count; a bound, not an amount
+    let budget = frames.len() as f64 / (agreement.rho * agreement.lambda).max(0.001);
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs_f64(budget * 3.0)
+        + Duration::from_secs(60);
+    let mut ticket = 0;
+    loop {
+        if !node.link_is_established(&link) || shaper.is_stopped() {
+            return Err(STOPPED.to_owned());
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(
+                "link_shaping_bulk_fallback_timeout: the shaped link did not take the \
+                 message within its budget; the send is retried"
+                    .to_owned(),
+            );
+        }
+        let room = shaper.room().min(frames.len());
+        if room > 0 {
+            ticket = shaper
+                .enqueue_bulk_fallback(frames.drain(..room).collect())
+                .map_err(|e| e.to_string())?;
+        }
+        if frames.is_empty() && shaper.real_sent() >= ticket {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// CC 5.4.3 — one shaped link's emission task: at every Poisson fire the
 /// shaper yields one frame (real or cover), sealed and sent on the Channel.
 /// A send that fails closes the link; the task ends when the shaper stops.
@@ -14313,6 +14435,9 @@ fn spawn_shaper_task(
             .await;
             if let Ok(Ok(())) = sent {
                 seals.tap_frame(link, &sealed);
+                if real {
+                    shaper.note_real_sent();
+                }
                 if let Some(m) = metrics.as_ref() {
                     m.inc_link_shaping(if real {
                         crate::observability::LINK_SHAPING_FRAMES_REAL

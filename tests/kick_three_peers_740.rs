@@ -210,6 +210,7 @@ async fn build_transport(
         }
         c.announce_interval = Duration::from_secs(5);
         let port = c.listen_addr.port();
+        common::apply_env_shaping(&mut c);
         match ReticulumTransport::new(c, auth(signer, dir)).await {
             Ok(t) => return (Arc::new(t.with_metrics(Some(metrics.clone()))), port),
             Err(e)

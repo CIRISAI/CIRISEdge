@@ -245,6 +245,23 @@ pub const BULK_MESSAGE_TYPES: [&str; 4] = [
     "BlobChunkBody",
 ];
 
+/// CC 5.4.3 rc16 two planes — the largest message a shaped link carries,
+/// whatever its type (Eric, 2026-11-04). The shaped link is for small rows:
+/// at the `server` class a link's real budget is ρ × 7,000 B/s = 3.5 KB/s, so
+/// 64 KiB already takes about 20 s, the most a row should wait. The window
+/// budget ([`Agreement::reach_frames`], 2.1 MB at `server`) is NOT this limit:
+/// a message that fits it can still take ten minutes. One constant; a larger
+/// message rides the bulk plane.
+pub const SHAPED_ROW_MAX_BYTES: usize = 64 * 1024;
+
+/// Whether an outbound envelope belongs on the bulk plane whatever link it
+/// was offered: bulk by kind ([`is_bulk_class`]) or over
+/// [`SHAPED_ROW_MAX_BYTES`].
+#[must_use]
+pub fn is_bulk_payload(envelope: &[u8]) -> bool {
+    envelope.len() > SHAPED_ROW_MAX_BYTES || is_bulk_class(envelope)
+}
+
 /// Whether an outbound envelope is bulk by kind ([`BULK_MESSAGE_TYPES`]).
 /// Reads only the envelope's head: `message_type` serializes before the body
 /// (`crate::messages::EdgeEnvelope`), so a megabyte body is never scanned.
@@ -801,6 +818,12 @@ pub struct LinkShaper {
     budget: BudgetMeter,
     real: AtomicU64,
     cover: AtomicU64,
+    /// Bodies ever queued, in FIFO order: a body's ticket is this count once
+    /// it is queued ([`Self::enqueue_bulk_fallback`]).
+    accepted: AtomicU64,
+    /// Real frames the link really took ([`Self::note_real_sent`]). Serial and
+    /// FIFO with `accepted`, so a ticket at or below it has left this node.
+    real_sent: AtomicU64,
     stopped: std::sync::atomic::AtomicBool,
     /// When the next frame is due, as an absolute instant (see
     /// [`Self::next_emission`]).
@@ -839,6 +862,8 @@ impl LinkShaper {
             budget,
             real: AtomicU64::new(0),
             cover: AtomicU64::new(0),
+            accepted: AtomicU64::new(0),
+            real_sent: AtomicU64::new(0),
             stopped: std::sync::atomic::AtomicBool::new(false),
             next_due: Mutex::new(None),
         }
@@ -904,7 +929,18 @@ impl LinkShaper {
         if bodies.len() > reach {
             return Err(ShapingError::BulkBeyondReach(bodies.len(), reach));
         }
-        self.enqueue_within_queue(bodies)
+        self.enqueue_within_queue(bodies).map(|_| ())
+    }
+
+    /// The emission task's report: one real frame was taken by the link.
+    pub fn note_real_sent(&self) {
+        self.real_sent.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Real frames the link has taken.
+    #[must_use]
+    pub fn real_sent(&self) -> u64 {
+        self.real_sent.load(Ordering::Acquire)
     }
 
     /// Whether the shaper was stopped (its link closed or was renegotiated).
@@ -924,15 +960,17 @@ impl LinkShaper {
     /// no unshaped link can exist to (a NAT'd peer this node cannot dial).
     /// The shaper still paces every body at the agreed λ under the ρ budget,
     /// so the link stays constant-size and constant-rate; the message is only
-    /// slow. The caller feeds it in pieces as [`Self::room`] allows.
+    /// slow. The caller feeds it in pieces as [`Self::room`] allows. Returns
+    /// the last body's ticket: it has left this node once [`Self::real_sent`]
+    /// reaches it.
     ///
     /// # Errors
     /// As [`Self::enqueue`], less the reach refusal.
-    pub fn enqueue_bulk_fallback(&self, bodies: Vec<Vec<u8>>) -> Result<(), ShapingError> {
+    pub fn enqueue_bulk_fallback(&self, bodies: Vec<Vec<u8>>) -> Result<u64, ShapingError> {
         self.enqueue_within_queue(bodies)
     }
 
-    fn enqueue_within_queue(&self, bodies: Vec<Vec<u8>>) -> Result<(), ShapingError> {
+    fn enqueue_within_queue(&self, bodies: Vec<Vec<u8>>) -> Result<u64, ShapingError> {
         let cap = body_capacity(self.agreement.frame_bytes);
         if let Some(b) = bodies.iter().find(|b| b.len() > cap) {
             return Err(ShapingError::BodyTooLarge(
@@ -947,10 +985,12 @@ impl LinkShaper {
         if q.len() + bodies.len() > self.queue_cap {
             return Err(ShapingError::QueueFull(self.queue_cap));
         }
+        let count = u64::try_from(bodies.len()).unwrap_or(u64::MAX);
+        let ticket = self.accepted.fetch_add(count, Ordering::AcqRel) + count;
         q.extend(bodies);
         drop(q);
         self.notify.notify_one();
-        Ok(())
+        Ok(ticket)
     }
 
     /// Stop the timer loop (the link closed).
@@ -1037,6 +1077,74 @@ pub struct LinkShapers {
     /// Dials waiting for the peer's answer ([`Self::begin_offer`]).
     pending: Mutex<HashMap<[u8; 16], OfferAnswerTx>>,
     queue_cap: usize,
+}
+
+/// How long a finished bulk fallback is remembered, so a retry that lost its
+/// wait does not send the whole message again.
+pub const BULK_FALLBACK_DONE_TTL: Duration = Duration::from_secs(600);
+
+/// The outcome of one bulk fallback: `Ok`, or why it stopped.
+pub type BulkFallbackResult = Option<Result<(), String>>;
+
+/// CC 5.4.3 rc16 two planes — the bulk fallbacks in progress, by envelope
+/// digest. A fallback takes minutes and its callers do not all wait that long:
+/// a responder cancels at 60 s, and a durable claim can expire and dispatch the
+/// same row again. So a transfer runs detached and single-flight: a cancelled
+/// wait abandons the wait, not the transfer, and a second send of the same
+/// envelope joins it instead of queueing the bytes twice.
+#[derive(Debug, Default)]
+pub struct BulkFallbacks {
+    running: Mutex<HashMap<[u8; 32], tokio::sync::watch::Receiver<BulkFallbackResult>>>,
+    finished: Mutex<HashMap<[u8; 32], std::time::Instant>>,
+}
+
+impl BulkFallbacks {
+    /// Whether this envelope finished within [`BULK_FALLBACK_DONE_TTL`].
+    #[must_use]
+    pub fn recently_finished(&self, digest: &[u8; 32]) -> bool {
+        let mut done = self
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        done.retain(|_, at| at.elapsed() < BULK_FALLBACK_DONE_TTL);
+        done.contains_key(digest)
+    }
+
+    /// Join the transfer of `digest`, or start one: a returned sender means
+    /// this caller owns the transfer and reports to it.
+    pub fn join_or_start(
+        &self,
+        digest: [u8; 32],
+    ) -> (
+        tokio::sync::watch::Receiver<BulkFallbackResult>,
+        Option<tokio::sync::watch::Sender<BulkFallbackResult>>,
+    ) {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rx) = running.get(&digest) {
+            return (rx.clone(), None);
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        running.insert(digest, rx.clone());
+        (rx, Some(tx))
+    }
+
+    /// The transfer of `digest` ended. A failed one is forgotten, so the
+    /// retry starts it again.
+    pub fn finish(&self, digest: &[u8; 32], ok: bool) {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(digest);
+        if ok {
+            self.finished
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(*digest, std::time::Instant::now());
+        }
+    }
 }
 
 /// Default bound on a shaped link's queue, in bodies.
@@ -1355,14 +1463,15 @@ impl LinkShapers {
 
     /// CC 5.4.3 rc16 **two planes** — whether `envelope` must leave `link`
     /// for an unshaped bulk link: `link` is shaped AND the envelope is bulk
-    /// by kind ([`is_bulk_class`]) or beyond one window's real-frame budget
-    /// ([`Agreement::reach_frames`]). An unshaped link carries anything.
+    /// ([`is_bulk_payload`]) or beyond one window's real-frame budget
+    /// ([`Agreement::reach_frames`], which a tiny budget can put below
+    /// [`SHAPED_ROW_MAX_BYTES`]). An unshaped link carries anything.
     #[must_use]
     pub fn needs_bulk_plane(&self, link: [u8; 16], envelope: &[u8]) -> bool {
         let Some(shaper) = self.get(link) else {
             return false;
         };
-        if is_bulk_class(envelope) {
+        if is_bulk_payload(envelope) {
             return true;
         }
         let cap = body_capacity(shaper.agreement().frame_bytes);
@@ -1763,6 +1872,27 @@ mod tests {
         assert!(t.is_bulk([4u8; 16]));
         t.forget(&[4u8; 16]);
         assert!(!t.is_bulk([4u8; 16]));
+    }
+
+    /// One constant decides: over 64 KiB is bulk whatever the type, and the
+    /// window budget does not. Two sends of one envelope are one transfer;
+    /// a failed one can start again and a finished one is not re-sent.
+    #[test]
+    fn the_row_limit_and_the_fallback_single_flight() {
+        assert!(!is_bulk_payload(&vec![b'r'; SHAPED_ROW_MAX_BYTES]));
+        assert!(is_bulk_payload(&vec![b'r'; SHAPED_ROW_MAX_BYTES + 1]));
+        let f = BulkFallbacks::default();
+        let (_, owner) = f.join_or_start([1; 32]);
+        assert!(owner.is_some());
+        assert!(f.join_or_start([1; 32]).1.is_none(), "a retry joins it");
+        f.finish(&[1; 32], false);
+        assert!(!f.recently_finished(&[1; 32]));
+        assert!(f.join_or_start([1; 32]).1.is_some(), "a failure restarts");
+        f.finish(&[1; 32], true);
+        assert!(
+            f.recently_finished(&[1; 32]),
+            "a finished one is not re-sent"
+        );
     }
 
     /// The classifier's spellings ARE serde's: each bulk class is the JSON

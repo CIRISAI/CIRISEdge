@@ -765,6 +765,11 @@ async fn bulk_to_a_peer_reachable_only_over_its_shaped_link_rides_it_slowly_and_
         t.a.metrics.link_shaping()
     );
     assert_eq!(t.a.shaping("link_shaping_bulk_refused"), 0);
+    assert_eq!(
+        t.a.transport.refused_dials_for_test(),
+        1,
+        "the first send paid one failed dial"
+    );
     let wire = t.a.transport.link_wire_tapped_for_test();
     let link = wire.first().expect("A sent on the link").0;
     assert!(
@@ -821,4 +826,147 @@ async fn assert_shaped_stream_constant(n: &Node) -> ([u8; 16], Vec<([u8; 16], Ve
             .collect::<Vec<_>>()
     );
     (shaped, wire)
+}
+
+/// The negative cache: a second bulk send to the NAT'd peer goes straight to
+/// its shaped link, with no second failed dial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_cannot_be_dialled_costs_one_failed_dial_not_one_per_send() {
+    let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    let t = duo("negative", server.clone(), server).await;
+    let row = typed_payload("AttestationGossip", b"NEG-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B dials A");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await
+    );
+    t.a.transport.refuse_outbound_dials_for_test(true);
+    for marker in [&b"NEG-ONE-"[..], &b"NEG-TWO-"[..]] {
+        let deliver = typed_payload("AttestationGossip", marker, 128 * 1024);
+        t.a.transport
+            .send(&t.b.key.key_id, &deliver)
+            .await
+            .expect("a bulk Deliver to a peer A cannot dial completes");
+        assert!(
+            wait_until(Duration::from_secs(60), || async {
+                t.b.received(&deliver).await
+            })
+            .await
+        );
+    }
+    assert_eq!(t.a.shaping("link_shaping_bulk_on_shaped_fallback"), 2);
+    assert_eq!(
+        t.a.transport.refused_dials_for_test(),
+        1,
+        "the second send skipped the dial"
+    );
+}
+
+/// `Delivered` is a transport ack to the durable dispatcher, so a fallback
+/// whose link closes part-way must be an error it retries, never a success.
+/// Mutation: report success once the fragments are queued → this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fallback_that_drops_part_way_is_an_error_the_dispatcher_retries() {
+    let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    let t = duo("dropped", server.clone(), server).await;
+    let row = typed_payload("AttestationGossip", b"DROP-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B dials A");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await
+    );
+    t.a.transport.set_link_wire_tap_for_test(true);
+    t.a.transport.refuse_outbound_dials_for_test(true);
+    let sender = Arc::clone(&t.a.transport);
+    let to = t.b.key.key_id.clone();
+    let deliver = typed_payload("AttestationGossip", b"DROP-DELIVER-", 1 << 20);
+    let send = tokio::spawn(async move { sender.send(&to, &deliver).await });
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.shaping("link_shaping_bulk_on_shaped_fallback") == 1
+                && t.a.shaping("link_shaping_frames_real") >= 3
+        })
+        .await,
+        "the fallback is under way: {:?}",
+        t.a.metrics.link_shaping()
+    );
+    assert!(!send.is_finished(), "the send waits for the last fragment");
+    let link = t.a.transport.link_wire_tapped_for_test()[0].0;
+    t.a.transport.link_teardown(&link).await.expect("teardown");
+    let out = tokio::time::timeout(Duration::from_secs(30), send)
+        .await
+        .expect("the send ends when the link does")
+        .expect("no panic");
+    let err = out.expect_err("a dropped fallback is not Delivered");
+    assert!(
+        err.to_string()
+            .contains("link_shaping_bulk_fallback_interrupted"),
+        "{err}"
+    );
+}
+
+/// **The row limit** (Eric, 2026-11-04): 64 KiB, whatever the type, and not
+/// the window budget. This budget's window holds 1 MB, so the 512 KiB Deliver
+/// fits it and moves only because of the limit. Mutation: raise
+/// `SHAPED_ROW_MAX_BYTES` to the window budget → this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_512_kib_deliver_takes_the_bulk_link_and_a_4_kib_deliver_stays_shaped() {
+    let server = policy(BudgetClass::Server, 200_000, 0.5, 10, false);
+    let t = duo("rowlimit", server.clone(), server).await;
+    t.b.transport.set_link_wire_tap_for_test(true);
+    let small = typed_payload("AttestationGossip", b"ROW-4K-", 4 * 1024);
+    t.b.transport
+        .send(&t.a.key.key_id, &small)
+        .await
+        .expect("4 KiB");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&small).await
+        })
+        .await
+    );
+    let wire = t.b.transport.link_wire_tapped_for_test();
+    let shaped = wire.first().expect("B dialled").0;
+    assert!(
+        wire.iter().all(|(l, _)| *l == shaped),
+        "4 KiB stayed on the shaped link: no second link"
+    );
+    let reals = t.b.shaping("link_shaping_frames_real");
+    let big = typed_payload("AttestationGossip", b"ROW-512K-", 512 * 1024);
+    t.b.transport
+        .send(&t.a.key.key_id, &big)
+        .await
+        .expect("512 KiB");
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            t.a.received(&big).await
+        })
+        .await
+    );
+    let on_other_links: usize =
+        t.b.transport
+            .link_wire_tapped_for_test()
+            .iter()
+            .filter(|(l, _)| *l != shaped)
+            .map(|(_, f)| f.len())
+            .sum();
+    assert!(
+        on_other_links >= 512 * 1024,
+        "512 KiB crossed on the bulk link: {on_other_links} B"
+    );
+    assert_eq!(
+        t.b.shaping("link_shaping_frames_real"),
+        reals,
+        "no real frame of it entered the shaper"
+    );
 }

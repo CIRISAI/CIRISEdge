@@ -54,8 +54,9 @@ These figures come from the CC 5.4.3 model.
 ## Two planes
 
 **The row plane is shaped.** A shaped link carries rows: posts, messages,
-reactions, and small images. A message counts as a row only if it fits within
-one window's real-frame budget, `ceil(ρ·λ·W)` frames. That budget is:
+reactions, and small images. A message counts as a row only if it is at most
+64 KiB and fits within one window's real-frame budget, `ceil(ρ·λ·W)` frames.
+That budget is:
 
 | Class | Real-frame budget per window |
 |---|---|
@@ -69,7 +70,10 @@ link is shaped and either of these holds:
 
 - it is bulk by kind: `ContentFetch`, `ContentBody`, `BlobChunkFetch` or
   `BlobChunkBody` (`BULK_MESSAGE_TYPES`, the wire spelling of `MessageType`);
-- it is larger than one window's real-frame budget.
+- it is larger than `SHAPED_ROW_MAX_BYTES`, 64 KiB, whatever its type. At the
+  `server` rate of 3.5 KB/s that is about 20 s, the most a row should wait;
+- it is larger than one window's real-frame budget (only a very small budget
+  puts this below 64 KiB).
 
 Such a message takes the freshest unshaped link to the peer. If there is none,
 the node dials one with no shaping offer and marks it bulk, so rows do not use
@@ -84,7 +88,11 @@ example, a NAT'd phone reachable only over the link it dialled in), the message
 rides the shaped link in shaped-budget fragments and is counted
 `link_shaping_bulk_on_shaped_fallback`. The shaper paces it like every other
 frame, so the link stays constant-size and constant-rate. It is slow, but it
-does not fail. The bound is the window budget: at the `server` class on a 16 KB
+does not fail: `Delivered` means every fragment left this node, and a transfer
+that stops part-way is an error the durable dispatcher retries. A second send of
+the same envelope joins the transfer rather than queueing it twice, and a failed
+dial stands for 120 s per peer, so a NAT'd peer costs one failed dial, not one
+per send. The rate is the link's real budget: at the `server` class on a 16 KB
 frame, about 0.2 real frames per second, or 3.5 KB/s, so 1 MiB takes about five
 minutes.
 
