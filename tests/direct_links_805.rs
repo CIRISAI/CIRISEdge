@@ -1944,10 +1944,11 @@ async fn a_send_outside_every_room_proposes_nothing_915() {
 /// **#920** — the live mesh's sequence: A, the room's creator, sends to B
 /// before B has joined, so B refuses A's proposal. B then joins and replies
 /// over A's own link (the reverse path), past leviculum's per-link proposal
-/// cooldown. That reply proposes, B now shares the room, and the link comes up
-/// direct. Before #920 the refusal was pinned to
-/// the link and B's reverse-path sends never proposed, so the pair room
-/// stayed relayed for good.
+/// cooldown. B is that link's responder, so its reply yields to A (v44,
+/// leviculum#96); A has nothing more to send, so B's timer proposes, B now
+/// shares the room, and the link comes up direct. Before #920 the refusal was
+/// pinned to the link and B's reverse-path sends never proposed, so the pair
+/// room stayed relayed for good.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_that_refused_before_joining_the_room_comes_up_direct_once_it_joins_920() {
     let mut p = trio("j920", proposer(), proposer()).await;
@@ -1987,11 +1988,13 @@ async fn a_peer_that_refused_before_joining_the_room_comes_up_direct_once_it_joi
         .send(&p.a.key.key_id, b"b-replies")
         .await
         .expect("B's reply rides A's link");
-    let up = next_event(&mut p.b.events, Duration::from_secs(20), |e| {
+    let wait = ciris_edge::transport::direct_path::GLARE_WAIT.mul_f64(1.25);
+    let up = next_event(&mut p.b.events, wait + Duration::from_secs(20), |e| {
         matches!(e, DirectPathEvent::Established { .. })
     })
     .await
     .expect("B's reply brings the link direct");
+    assert_eq!(dl(&p.b.metrics, "direct_link_yielded"), 1);
     assert!(
         matches!(&up, DirectPathEvent::Established { proposed: true, peer, .. }
             if peer.as_deref() == Some(p.a.key.key_id.as_str())),
@@ -2150,22 +2153,32 @@ async fn simultaneous_proposals_resolve_to_the_initiator_with_no_rejected_pair()
         p.b.transport
             .propose_direct_on_link_for_test(&p.a.key.key_id, link),
     );
+    let settled = |e: &DirectPathEvent| {
+        matches!(
+            e,
+            DirectPathEvent::Established { .. } | DirectPathEvent::Failed { .. }
+        )
+    };
+    let a_up = next_event(&mut p.a.events, Duration::from_secs(20), settled)
+        .await
+        .expect("A's outcome");
+    let b_up = next_event(&mut p.b.events, Duration::from_secs(20), settled)
+        .await
+        .expect("B's outcome");
+    let (a_rej, b_rej) = (
+        dl(&p.a.metrics, "direct_link_failed_rejected"),
+        dl(&p.b.metrics, "direct_link_failed_rejected"),
+    );
+    assert!(
+        a_rej == 0 && b_rej == 0,
+        "the Rejected(2) pair: A={ra} rejected={a_rej}, B={rb} rejected={b_rej}"
+    );
     assert_eq!(ra, "proposed", "the initiator proposes");
     assert_eq!(rb, "yield_to_initiator", "the responder yields");
-    let a_up = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
-        matches!(e, DirectPathEvent::Established { .. })
-    })
-    .await
-    .expect("A's Established");
     assert!(matches!(
         a_up,
         DirectPathEvent::Established { proposed: true, .. }
     ));
-    let b_up = next_event(&mut p.b.events, Duration::from_secs(20), |e| {
-        matches!(e, DirectPathEvent::Established { .. })
-    })
-    .await
-    .expect("B's Established");
     assert!(matches!(
         b_up,
         DirectPathEvent::Established {
@@ -2314,4 +2327,30 @@ async fn both_ends_dialling_a_call_propose_on_their_own_links() {
     assert_eq!(dl(&p.b.metrics, "direct_link_failed_rejected"), 0);
     assert_eq!(dl(&p.a.metrics, "direct_link_yielded"), 0);
     assert_eq!(dl(&p.b.metrics, "direct_link_yielded"), 0);
+}
+
+/// **A yield's timer stands down under suspend**: B yields, the transport
+/// suspends, and the timer's turn comes and goes without a proposal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_yields_timer_does_not_propose_while_suspended() {
+    let p = trio("glare-s", proposer(), proposer()).await;
+    p.a.transport
+        .send(&p.b.key.key_id, b"glare-s-0")
+        .await
+        .expect("A's send to B ships through T");
+    let link = shared_link(&p.a, &p.b);
+    let (_spine, _b_addr) = open_call(&p).await;
+    assert_eq!(
+        p.b.transport
+            .propose_direct_on_link_for_test(&p.a.key.key_id, link)
+            .await,
+        "yield_to_initiator"
+    );
+    let _ = p.b.transport.suspend(Duration::from_secs(5)).await;
+    assert!(p.b.transport.is_suspended());
+    tokio::time::sleep(
+        ciris_edge::transport::direct_path::GLARE_WAIT.mul_f64(1.25) + Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(dl(&p.b.metrics, "direct_link_proposed"), 0);
 }

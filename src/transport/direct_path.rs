@@ -61,7 +61,8 @@
 //! and, with the same backoff, both retry together. Edge breaks the tie with
 //! the link's direction, which both ends hold: only the link's INITIATOR
 //! proposes on it; the responder yields ([`glare_verdict`]) and proposes
-//! itself only after [`GLARE_WAIT`] without the initiator's proposal. Every
+//! itself only after [`GLARE_WAIT`] without the initiator's proposal, on a
+//! timer, so a peer that replied once still brings the link direct. Every
 //! retry is jittered ±25 % ([`RETRY_JITTER`]) so a pair never stays in
 //! lockstep. The in-leviculum half (a glare reason, the responder's session
 //! dropped) is asked in leviculum#96.
@@ -132,7 +133,8 @@ pub const RETRY_JITTER: f64 = 0.25;
 /// proposal that crosses its own on a link `REJECT_BUSY` before the host sees
 /// it, so the tie is broken here: only the link's initiator proposes on it.
 /// A responder facing a peer that never proposes (proposing off, an older
-/// edge) proposes after this wait.
+/// edge, or one that only sent before this node joined the room: #920) proposes
+/// after this wait, jittered, on a timer: the send that yielded may be its last.
 pub const GLARE_WAIT: Duration = Duration::from_secs(30);
 
 /// A punch that failed means a NAT that maps per destination (symmetric NAT,
@@ -277,16 +279,17 @@ impl DirectLinksConfig {
             }
             Proposing::On => {
                 self.facilitator = Self::bundle_facilitator();
-                match &self.facilitator {
-                    Some(f) => tracing::info!(
+                if let Some(f) = &self.facilitator {
+                    tracing::info!(
                         facilitator = %f,
                         "direct links: facilitator resolved from the genesis bundle's first \
                          serve node (v44: proposing on by default)"
-                    ),
-                    None => tracing::warn!(
+                    );
+                } else {
+                    tracing::warn!(
                         "direct links: proposing on but the genesis bundle names no serve \
                          node with a dial hint: nothing proposes"
-                    ),
+                    );
                 }
             }
         }
@@ -1128,15 +1131,14 @@ mod tests {
         t.proposed("b", link(1), Some(16_000), now);
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::InFlight));
         assert_eq!(
-            t.failed(link(1), Failure::Timeout, now, now, 0.0)
-                .as_deref(),
+            t.failed(link(1), Failure::Timeout, now, 0.0).as_deref(),
             Some("b")
         );
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::BackingOff));
         assert_eq!(t.admit("b", link(1), now + DIRECT_RETRY_BASE), Ok(()));
         // A second timeout doubles the wait.
         t.proposed("b", link(1), None, now);
-        t.failed(link(1), Failure::Timeout, now, now, 0.0);
+        t.failed(link(1), Failure::Timeout, now, 0.0);
         assert_eq!(
             t.admit("b", link(1), now + DIRECT_RETRY_BASE),
             Err(ProposeSkip::BackingOff)
@@ -1165,7 +1167,7 @@ mod tests {
         let now = Instant::now();
         let mut t = DirectPathTracker::default();
         t.proposed("b", link(1), None, now);
-        t.failed(link(1), Failure::Rejected(1), now, now, 0.0);
+        t.failed(link(1), Failure::Rejected(1), now, 0.0);
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::BackingOff));
         assert_eq!(
             t.admit("b", link(2), now),
@@ -1218,7 +1220,7 @@ mod tests {
     fn an_unknown_link_event_changes_nothing() {
         let now = Instant::now();
         let mut t = DirectPathTracker::default();
-        assert_eq!(t.failed(link(9), Failure::Timeout, now, now, 0.0), None);
+        assert_eq!(t.failed(link(9), Failure::Timeout, now, 0.0), None);
         assert_eq!(t.lost(link(9), now), None);
         assert_eq!(t.direct_count(), 0);
     }
