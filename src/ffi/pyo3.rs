@@ -556,6 +556,88 @@ impl PyEdge {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    /// `FSD/PRIVACY_MODES.md` §6.6, E8 — **the typed status** as JSON: `class`,
+    /// `bytes_per_s`, `figures` (`gap_s`, `gap_p95_s`, `gb_month_link`,
+    /// `gb_month_cap`, `file_1mb_s`, `file_10mb_s`), `device_figures` (a
+    /// phone's two networks), `shaped_links`, `free_slots`, `links`, `peers`
+    /// (each peer's `shapes`), `relays_answering` and `onion`, the `OnionStatus`
+    /// with `confines_media`. Every value is read from the running transport.
+    /// `None` with no Reticulum transport.
+    #[cfg(feature = "_reticulum-module")]
+    fn shaping_status_json(&self) -> PyResult<Option<String>> {
+        self.inner
+            .shaping_status()
+            .map(|s| serde_json::to_string(&s))
+            .transpose()
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// E8 — what this node knows of `peer`'s shaping, as JSON: `peer`,
+    /// `shapes` (null until it has answered an offer here), `shaped_now`,
+    /// `gap_s`. `None` with no Reticulum transport.
+    #[cfg(feature = "_reticulum-module")]
+    fn peer_shaping_json(&self, peer: &str) -> PyResult<Option<String>> {
+        self.inner
+            .peer_shaping(peer)
+            .map(|s| serde_json::to_string(&s))
+            .transpose()
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// CC 5.4.6 — the Anonymous Tier on this node, counts only, as JSON.
+    /// `None` with no Reticulum transport.
+    #[cfg(feature = "_reticulum-module")]
+    fn onion_status_json(&self) -> PyResult<Option<String>> {
+        self.inner
+            .onion_status()
+            .map(|s| serde_json::to_string(&s))
+            .transpose()
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.6, §6.10 — the host's device facts changed;
+    /// the class and the relay policy follow, the person's opt-ins kept.
+    /// `device_kind` is `server`, `home` or `phone`. Returns how many shaped
+    /// links closed to renegotiate, `None` with no Reticulum transport.
+    /// Raises `ValueError` on another kind.
+    #[cfg(feature = "_reticulum-module")]
+    #[pyo3(signature = (
+        device_kind,
+        unmetered=true,
+        charging=true,
+        shaping_opt_in=false,
+        shaping_opt_in_cellular=false,
+        client_only=false,
+        relay_override=None
+    ))]
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+    fn shaping_set_device_state(
+        &self,
+        py: Python<'_>,
+        device_kind: &str,
+        unmetered: bool,
+        charging: bool,
+        shaping_opt_in: bool,
+        shaping_opt_in_cellular: bool,
+        client_only: bool,
+        relay_override: Option<bool>,
+    ) -> PyResult<Option<usize>> {
+        use crate::transport::link_shaping::{DeviceKind, DeviceState};
+        let kind = DeviceKind::parse(device_kind)
+            .ok_or_else(|| PyValueError::new_err(format!("bad_device_kind: {device_kind:?}")))?;
+        let device = DeviceState {
+            kind,
+            unmetered,
+            charging,
+            shaping_opt_in,
+            shaping_opt_in_cellular,
+            client_only,
+            relay_override,
+        };
+        let edge = Arc::clone(&self.inner);
+        py.detach(|| self.block_on_transport(async move { edge.set_device_state(device).await }))
+    }
+
     /// CIRISEdge#437 — hand over a peer's presented build-attestation
     /// bundle (the JSON `SignedCegObject` bytes, `kind =
     /// "build_attestation_bundle"`, CIRISVerify#181) for the durable-save

@@ -115,6 +115,7 @@ pub mod manifest;
 /// widening, as producers and host calls.
 pub mod membership;
 pub mod messages;
+pub mod peer_obligation;
 // v6.0.0 (CIRISEdge#175, FSD §3.3 / §3.5 / §6) — substrate-tier MLS
 // state for scope-native privacy. Distinct from
 // `transport::realtime_av_mls` (per-stream AV MLS).

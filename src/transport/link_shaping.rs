@@ -1498,6 +1498,172 @@ impl LinkShaper {
     }
 }
 
+/// `FSD/PRIVACY_MODES.md` §2.4: the 95th percentile of an exponential wait, in
+/// mean gaps (`ln 20`).
+const P95_GAPS: f64 = 2.995_732_273_553_991;
+
+/// The frame a figure is stated at while this node holds no shaped link: a TCP
+/// link's channel payload (`FSD/TRANSPORT_TIERS_MODEL.md` §1), the largest a
+/// link runs at, "so a stated cost never understates the served one" (CC 5.4.3).
+pub const REFERENCE_FRAME_BYTES: u16 = 16_272;
+
+/// What a class costs a person, computed from the policy that governs it
+/// (`FSD/PRIVACY_MODES.md` §2.4, the §6.6 placeholders): raw values, which the
+/// client formats. Nothing here is read from a table.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ShapingFigures {
+    /// The class token.
+    pub class: &'static str,
+    /// The byte rate per link.
+    pub bytes_per_s: u32,
+    /// The node-wide cap on the sum of rates.
+    pub node_cap_bytes_per_s: u32,
+    /// ρ.
+    pub rho: f64,
+    /// W, in seconds.
+    pub window_s: u64,
+    /// The frame these are stated at.
+    pub frame_bytes: u16,
+    /// `gap_s`: the mean wait for a row, the frame over the rate.
+    pub gap_s: f64,
+    /// `gap_p95_s`: the 95th percentile of that wait.
+    pub gap_p95_s: f64,
+    /// `gb_month_link`: one link for 30 days, each way, in GB (10⁹ bytes).
+    pub gb_month_link: f64,
+    /// `gb_month_cap`: the node cap for 30 days, each way, in GB.
+    pub gb_month_cap: f64,
+    /// `file_1mb_s`: 1 MB by the slow path, sustained, at ρ × rate.
+    pub file_1mb_s: f64,
+    /// `file_10mb_s`: 10 MB by the slow path.
+    pub file_10mb_s: f64,
+}
+
+impl ShapingFigures {
+    /// The figures of `policy` at `frame_bytes`. `None` while it shapes
+    /// nothing, which has no cost to state.
+    #[must_use]
+    pub fn of(policy: &ShapingPolicy, frame_bytes: u16) -> Option<Self> {
+        if !policy.enabled() {
+            return None;
+        }
+        const MONTH_S: f64 = 2_592_000.0;
+        const GB: f64 = 1e9;
+        let rate = f64::from(policy.bytes_per_s);
+        let gap_s = f64::from(frame_bytes) / rate;
+        let real = policy.rho * rate;
+        Some(Self {
+            class: policy.class.as_str(),
+            bytes_per_s: policy.bytes_per_s,
+            node_cap_bytes_per_s: policy.node_cap_bytes_per_s,
+            rho: policy.rho,
+            window_s: policy.window.as_secs(),
+            frame_bytes,
+            gap_s,
+            gap_p95_s: gap_s * P95_GAPS,
+            gb_month_link: rate * MONTH_S / GB,
+            gb_month_cap: f64::from(policy.node_cap_bytes_per_s) * MONTH_S / GB,
+            file_1mb_s: 1e6 / real,
+            file_10mb_s: 1e7 / real,
+        })
+    }
+}
+
+/// One shaped link as it runs now (`FSD/PRIVACY_MODES.md` E8): the agreement
+/// both ends computed and this sender's rate under it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ShapedLinkStatus {
+    /// The peer's key id, when the handshake attributed the link.
+    pub peer: Option<String>,
+    /// A `seat` link, outside the bound.
+    pub seat: bool,
+    /// This node dialled it.
+    pub dialled_here: bool,
+    /// The agreed frame.
+    pub frame_bytes: u16,
+    /// The agreed rate.
+    pub agreed_bytes_per_s: u32,
+    /// This sender's rate now, at or below the agreed one.
+    pub bytes_per_s: f64,
+    /// The mean frame gap now.
+    pub gap_s: f64,
+    /// The 95th percentile of that wait.
+    pub gap_p95_s: f64,
+    /// The agreed ρ.
+    pub rho: f64,
+    /// The agreed W, in seconds.
+    pub window_s: u64,
+    /// Real frames one window admits at the rate now.
+    pub real_frames_per_window: usize,
+}
+
+/// One peer's shaping, as far as this node knows it (§3.1, E8).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PeerShaping {
+    /// The peer's key id.
+    pub peer: String,
+    /// Whether it shapes: `None` until it has answered an offer here. A peer
+    /// at its bound shapes; a peer that left an offer unanswered does not.
+    pub shapes: Option<bool>,
+    /// It holds a shaped link here now.
+    pub shaped_now: bool,
+    /// The mean gap of its fastest shaped link, while it holds one.
+    pub gap_s: Option<f64>,
+}
+
+/// **The typed status a host reads** (`FSD/PRIVACY_MODES.md` §6.6, E8): every
+/// value is read from the running shaper, policy or tier when asked.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ShapingStatus {
+    /// The class this node offers: the link class the client cannot know.
+    pub class: &'static str,
+    /// It offers shaping on some link.
+    pub enabled: bool,
+    /// Every identity link is offered it, not only the layer links.
+    pub all_links: bool,
+    /// An unshaped identity link is refused.
+    pub require_shaped_links: bool,
+    /// The byte rate per link in force.
+    pub bytes_per_s: u32,
+    /// The node-wide cap in force.
+    pub node_cap_bytes_per_s: u32,
+    /// What the class in force costs, at the largest agreed frame, or
+    /// [`REFERENCE_FRAME_BYTES`] with no shaped link. `None` when off.
+    pub figures: Option<ShapingFigures>,
+    /// The figures of each class this device runs at: both networks on a
+    /// phone (the `_cellular` set of §6.6), the one class elsewhere.
+    pub device_figures: Vec<ShapingFigures>,
+    /// `figures` came from a live agreement, not the reference frame.
+    pub frame_agreed: bool,
+    /// The service tier (0, 1, 2).
+    pub service_tier: u8,
+    /// Admit-close is on: no new shaped link for a non-obligation peer.
+    pub admit_closed: bool,
+    /// Shaped links now.
+    pub shaped_links: usize,
+    /// Those that count toward the bound (all but `seat` links).
+    pub counted_links: usize,
+    /// The bound, when the share policy has one.
+    pub max_links: Option<u32>,
+    /// The slots a new peer could take now.
+    pub free_slots: u8,
+    /// What this node tells its shaped peers it has.
+    pub reported_slots: u8,
+    /// Slots kept for onion layer neighbours.
+    pub layer_held_slots: u32,
+    /// This node's relay offering is on.
+    pub relay_offering: bool,
+    /// Each shaped link, by peer.
+    pub links: Vec<ShapedLinkStatus>,
+    /// Every peer with a known shaping fact, by key id.
+    pub peers: Vec<PeerShaping>,
+    /// `relays_answering`: relays answering across the three layers, by this
+    /// node's own measure. `None` until a layer deal is installed, when there
+    /// is no measure: the client shows the line without the count (§6.2).
+    pub relays_answering: Option<u32>,
+    /// The Anonymous Tier, counts only, with `confines_media`.
+    pub onion: crate::onion::runtime::OnionStatus,
+}
+
 /// The node's shaped links and its node-wide cap.
 #[derive(Debug)]
 pub struct LinkShapers {
@@ -1542,7 +1708,26 @@ pub struct LinkShapers {
     /// Dials waiting for the peer's answer ([`Self::begin_offer`]).
     pending: Mutex<HashMap<[u8; 16], OfferAnswerTx>>,
     queue_cap: usize,
+    /// The service tier in force (`FSD/PRIVACY_MODES.md` §6.12).
+    tier: std::sync::atomic::AtomicU8,
+    /// The shaped links a peer dialled here, by the order they were admitted:
+    /// what tier 2 may close, newest first. A link this node dialled is not
+    /// here: it carries this node's own rows and a close would only redial.
+    admitted: Mutex<HashMap<[u8; 16], u64>>,
+    /// Admissions so far.
+    admissions: std::sync::atomic::AtomicU64,
+    /// What each peer's last offer said: whether it shapes. Survives its
+    /// links, and holds at most [`PEER_SHAPING_FACTS_MAX`] peers.
+    peer_shapes: Mutex<HashMap<String, bool>>,
+    /// What a shed lever reads at decision time. Absent: nothing is shed.
+    obligations: std::sync::RwLock<Option<Arc<dyn crate::load_ladder::PeerObligations>>>,
+    /// Woken when tier 2 is in force.
+    shed_wake: tokio::sync::Notify,
 }
+
+/// Peers whose shaping fact is held, at most. Past it a newcomer takes the
+/// place of an arbitrary peer, whose fact returns with its next offer.
+pub const PEER_SHAPING_FACTS_MAX: usize = 4096;
 
 /// The most a sender waits for a queued row to leave a shaped link before it
 /// retracts the bodies and reports a retryable timeout: bounded so a
@@ -1657,7 +1842,233 @@ impl LinkShapers {
             offered: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             queue_cap: DEFAULT_QUEUE_CAP,
+            tier: std::sync::atomic::AtomicU8::new(0),
+            admitted: Mutex::new(HashMap::new()),
+            admissions: std::sync::atomic::AtomicU64::new(0),
+            peer_shapes: Mutex::new(HashMap::new()),
+            obligations: std::sync::RwLock::new(None),
+            shed_wake: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Install the read a shed lever makes ([`Self::obligation_of`]).
+    pub fn set_obligations(&self, reader: Arc<dyn crate::load_ladder::PeerObligations>) {
+        *self
+            .obligations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reader);
+    }
+
+    /// What this node owes `peer` now, read at the moment a lever acts. A link
+    /// no handshake attributed, or a node with no reader, is
+    /// [`PeerObligation::Unresolved`], and nothing is shed on that.
+    ///
+    /// [`PeerObligation::Unresolved`]: crate::load_ladder::PeerObligation::Unresolved
+    pub async fn obligation_of(&self, peer: Option<&str>) -> crate::load_ladder::PeerObligation {
+        let reader = self
+            .obligations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match (reader, peer) {
+            (Some(reader), Some(peer)) => reader.obligation_of(peer).await,
+            _ => crate::load_ladder::PeerObligation::Unresolved,
+        }
+    }
+
+    /// **Admit-close** (`FSD/PRIVACY_MODES.md` §6.12): whether `theirs`, an
+    /// offer on a link `peer` dialled, is refused for load. The refusal goes
+    /// out as one at the bound does, with referrals.
+    pub async fn load_refuses(&self, peer: Option<&str>, theirs: &ShapingOffer) -> bool {
+        !self.service_tier().admits_new_shaped_links()
+            && theirs.shapes()
+            && self.offers_to(peer)
+            && !self.obligation_of(peer).await.keeps_shaped_link()
+    }
+
+    /// **B-pause on the slow path** (§6.12): whether a transfer to `peer`
+    /// over a shaped link waits now. The row does not.
+    pub async fn slow_path_paused(&self, peer: &str) -> bool {
+        self.service_tier().pauses_bulk() && !self.obligation_of(Some(peer)).await.keeps_slow_path()
+    }
+
+    /// The newest shaped link tier 2 closes now, if any: every candidate's
+    /// peer is read when it comes up, so standing a peer gained a moment ago
+    /// counts. `None` at any other tier.
+    pub async fn next_shed(&self) -> Option<[u8; 16]> {
+        for (link, peer) in self.shed_candidates() {
+            if !self
+                .obligation_of(peer.as_deref())
+                .await
+                .keeps_shaped_link()
+            {
+                return self.service_tier().closes_shaped_links().then_some(link);
+            }
+        }
+        None
+    }
+
+    /// Resolves when tier 2 is (or has just been) put in force.
+    pub async fn shed_woken(&self) {
+        self.shed_wake.notified().await;
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.12 — the service tier changed. Nothing here
+    /// touches a shaper: cover is not shed, and a link runs at its class or
+    /// closes. Tier 1 and above report zero slots, and the zero goes out now
+    /// so peers stop referring this node.
+    pub fn set_service_tier(&self, tier: crate::load_ladder::ServiceTier) {
+        self.tier.store(tier.as_u8(), Ordering::Release);
+        self.report_capacity();
+        if tier.closes_shaped_links() {
+            self.shed_wake.notify_one();
+        }
+    }
+
+    /// The service tier in force.
+    #[must_use]
+    pub fn service_tier(&self) -> crate::load_ladder::ServiceTier {
+        crate::load_ladder::ServiceTier::from_u8(self.tier.load(Ordering::Acquire))
+    }
+
+    /// The links tier 2 may close, newest first, with their peers: the shaped
+    /// links peers dialled here. Who keeps one is the caller's question
+    /// ([`crate::load_ladder::PeerObligation`]), asked when it closes.
+    #[must_use]
+    pub fn shed_candidates(&self) -> Vec<([u8; 16], Option<String>)> {
+        let peers = self.link_peer_map();
+        let links = self.links();
+        let mut admitted: Vec<([u8; 16], u64)> = self
+            .admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(l, _)| links.contains_key(*l))
+            .map(|(l, n)| (*l, *n))
+            .collect();
+        admitted.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        admitted
+            .into_iter()
+            .map(|(l, _)| (l, peers.get(&l).cloned()))
+            .collect()
+    }
+
+    /// Record what `peer` offered, bounded.
+    fn note_peer_shapes(&self, peer: &str, shapes: bool) {
+        let mut facts = self
+            .peer_shapes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if facts.len() >= PEER_SHAPING_FACTS_MAX && !facts.contains_key(peer) {
+            let evicted = facts.keys().next().cloned();
+            if let Some(k) = evicted {
+                facts.remove(&k);
+            }
+        }
+        facts.insert(peer.to_owned(), shapes);
+    }
+
+    /// What this node knows of `peer`'s shaping (`FSD/PRIVACY_MODES.md` §3.1,
+    /// E8), from what `peer` itself offered and the links held now.
+    #[must_use]
+    pub fn peer_shaping(&self, peer: &str) -> PeerShaping {
+        let gap = self.gap_to_peer(peer);
+        let shapes = gap.is_some().then_some(true).or_else(|| {
+            self.peer_shapes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(peer)
+                .copied()
+        });
+        PeerShaping {
+            peer: peer.to_owned(),
+            shapes,
+            shaped_now: gap.is_some(),
+            gap_s: gap.map(|g| g.as_secs_f64()),
+        }
+    }
+
+    /// [`Self::peer_shaping`] of every peer with a known fact or a shaped
+    /// link, sorted by key id.
+    #[must_use]
+    pub fn peers_shaping(&self) -> Vec<PeerShaping> {
+        let mut keys: std::collections::BTreeSet<String> = self
+            .peer_shapes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        let peers = self.link_peer_map();
+        keys.extend(
+            self.links()
+                .keys()
+                .filter_map(|l| peers.get(l))
+                .map(Clone::clone),
+        );
+        keys.iter().map(|k| self.peer_shaping(k)).collect()
+    }
+
+    /// Each shaped link as it runs now: agreed values, read from its shaper.
+    #[must_use]
+    pub fn links_status(&self) -> Vec<ShapedLinkStatus> {
+        let peers = self.link_peer_map();
+        let admitted: std::collections::HashSet<[u8; 16]> = self
+            .admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect();
+        let shapers: Vec<([u8; 16], Arc<LinkShaper>)> = self
+            .links()
+            .iter()
+            .map(|(l, s)| (*l, Arc::clone(s)))
+            .collect();
+        let mut out: Vec<ShapedLinkStatus> = shapers
+            .iter()
+            .map(|(l, s)| {
+                let a = s.agreement();
+                let peer = peers.get(l).cloned();
+                let gap_s = s.frame_gap().as_secs_f64();
+                ShapedLinkStatus {
+                    seat: self.is_seat_link(peer.as_deref()),
+                    peer,
+                    dialled_here: !admitted.contains(l),
+                    frame_bytes: a.frame_bytes,
+                    agreed_bytes_per_s: a.bytes_per_s(),
+                    bytes_per_s: s.bytes_per_s_now(),
+                    gap_s,
+                    gap_p95_s: gap_s * P95_GAPS,
+                    rho: a.rho,
+                    window_s: a.window.as_secs(),
+                    real_frames_per_window: s.reach_frames_now(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.peer.cmp(&b.peer));
+        out
+    }
+
+    /// The bound in force, when the share policy has one.
+    #[must_use]
+    pub fn max_links(&self) -> Option<u32> {
+        match self.policy().share {
+            ShapedSharePolicy::BoundedWithFloor { max_links, .. } => Some(max_links),
+            ShapedSharePolicy::DivideNoFloor => None,
+        }
+    }
+
+    /// Links that count toward the bound (all but `seat` links).
+    #[must_use]
+    pub fn counted_link_count(&self) -> usize {
+        self.counted_links()
+    }
+
+    /// Whether this node's relay offering is on, as the slots report reads it.
+    #[must_use]
+    pub fn relay_offering(&self) -> bool {
+        self.relay_offering.load(Ordering::Acquire)
     }
 
     /// The policy in force (a snapshot: it may change at runtime).
@@ -1697,6 +2108,10 @@ impl LinkShapers {
             self.offered().remove(link);
             self.pending().remove(link);
             self.link_peer().remove(link);
+            self.admitted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(link);
         }
         *self
             .policy
@@ -1881,9 +2296,14 @@ impl LinkShapers {
 
     /// The slots a new peer could take here now: the bound less the links and
     /// the slots held for layer neighbours. Zero outside the default arm,
-    /// which has no bound to report against.
+    /// which has no bound to report against, and zero at tier 1 and above:
+    /// Admit-close takes no new link from a peer it owes nothing
+    /// (`FSD/PRIVACY_MODES.md` §6.12), so no slot is on offer.
     #[must_use]
     pub fn free_slots(&self) -> u8 {
+        if !self.service_tier().admits_new_shaped_links() {
+            return 0;
+        }
         let ShapedSharePolicy::BoundedWithFloor { max_links, .. } = self.policy().share else {
             return 0;
         };
@@ -2089,14 +2509,21 @@ impl LinkShapers {
         theirs: &ShapingOffer,
     ) -> ShapingOffer {
         if theirs.shapes() && self.offers_to(peer) && self.at_bound_for(peer) {
-            if let Some(p) = peer {
-                self.link_peer().insert(link, p.to_owned());
-            }
-            let refusal = ShapingOffer::home_elsewhere();
-            self.offered().insert(link, refusal);
-            return refusal;
+            return self.refusal_for(link, peer);
         }
         self.offer_for(link, frame_bytes, peer)
+    }
+
+    /// Record the refusal of a shaping peer on `link`, at the bound or under
+    /// Admit-close, and return it. [`Self::peer_offer`] answers the rest.
+    #[must_use]
+    pub fn refusal_for(&self, link: [u8; 16], peer: Option<&str>) -> ShapingOffer {
+        if let Some(p) = peer {
+            self.link_peer().insert(link, p.to_owned());
+        }
+        let refusal = ShapingOffer::home_elsewhere();
+        self.offered().insert(link, refusal);
+        refusal
     }
 
     /// Bytes per second this node's shaped links under the bound emit now,
@@ -2151,6 +2578,10 @@ impl LinkShapers {
     pub fn offer_unanswered(&self, link: [u8; 16]) {
         self.offered().insert(link, ShapingOffer::off());
         self.pending().remove(&link);
+        let peer = self.link_peer().get(&link).cloned();
+        if let Some(p) = peer {
+            self.note_peer_shapes(&p, false);
+        }
     }
 
     /// This node's offer for `link` to `peer` (recorded as sent): the class
@@ -2206,6 +2637,13 @@ impl LinkShapers {
             .insert(link, ShapingOffer::off())
             .unwrap_or_else(ShapingOffer::off);
         let peer = self.link_peer().get(&link).cloned();
+        if let Some(p) = peer.as_deref() {
+            // A refusal comes from a node that shapes and has no room.
+            self.note_peer_shapes(
+                p,
+                theirs.shapes() || theirs.class == BudgetClass::HomeElsewhere,
+            );
+        }
         let refused = ours.class == BudgetClass::HomeElsewhere
             || theirs.class == BudgetClass::HomeElsewhere
             || (ours.shapes() && theirs.shapes() && self.at_bound_for(peer.as_deref()));
@@ -2214,6 +2652,13 @@ impl LinkShapers {
             Some(agreement) => {
                 let shaper = Arc::new(LinkShaper::new(link, agreement, self.queue_cap));
                 self.links().insert(link, Arc::clone(&shaper));
+                if !self.pending().contains_key(&link) {
+                    let n = self.admissions.fetch_add(1, Ordering::AcqRel);
+                    self.admitted
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(link, n);
+                }
                 self.rebalance();
                 Ok(Some(shaper))
             }
@@ -2256,6 +2701,10 @@ impl LinkShapers {
         if let Some(s) = self.links().remove(link) {
             s.stop();
         }
+        self.admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(link);
         self.offered().remove(link);
         self.pending().remove(link);
         let peer = self.link_peer().remove(link);
@@ -3259,5 +3708,301 @@ mod tests {
             .unwrap()
             .expect("seat link");
         assert!(t.effective_total() <= 8.0 * 7000.0 + 8.0);
+    }
+
+    /// What a node owes each peer, as the production read answers it.
+    #[derive(Debug, Default)]
+    struct Owed(Mutex<HashMap<String, crate::load_ladder::PeerObligation>>);
+
+    impl Owed {
+        fn set(&self, peer: &str, o: crate::load_ladder::PeerObligation) {
+            self.0.lock().unwrap().insert(peer.to_owned(), o);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::load_ladder::PeerObligations for Arc<Owed> {
+        async fn obligation_of(&self, peer: &str) -> crate::load_ladder::PeerObligation {
+            self.0
+                .lock()
+                .unwrap()
+                .get(peer)
+                .copied()
+                .unwrap_or(crate::load_ladder::PeerObligation::Ordinary)
+        }
+    }
+
+    fn shedding(class: BudgetClass) -> (LinkShapers, Arc<Owed>) {
+        let t = LinkShapers::new(ShapingPolicy::fleet_default(class));
+        let owed = Arc::new(Owed::default());
+        t.set_obligations(Arc::new(Arc::clone(&owed)));
+        (t, owed)
+    }
+
+    fn shaping_peer() -> ShapingOffer {
+        offer(BudgetClass::Server, 400, 7000, 0.5, 600)
+    }
+
+    /// §6.12 tier 1: a peer owed nothing is refused; every peer a tier leaves
+    /// alone is admitted, and so is one the read could not place. Tier 0
+    /// refuses nobody, and a peer that does not shape is no shaped link.
+    /// Mutation: drop any exemption, or never refuse → this fails.
+    #[tokio::test]
+    async fn tier_one_refuses_only_a_peer_owed_nothing() {
+        use crate::load_ladder::{PeerObligation as O, ServiceTier as T};
+        let (t, owed) = shedding(BudgetClass::Server);
+        owed.set("device", O::OwnDevice);
+        owed.set("seat", O::Seat);
+        owed.set("contact", O::SendSet);
+        owed.set("unread", O::Unresolved);
+        let them = shaping_peer();
+        assert!(!t.load_refuses(Some("stranger"), &them).await, "tier 0");
+        t.set_service_tier(T::AudioAndFiles);
+        assert!(t.load_refuses(Some("stranger"), &them).await);
+        for keeps in ["device", "seat", "contact", "unread"] {
+            assert!(!t.load_refuses(Some(keeps), &them).await, "{keeps}");
+        }
+        assert!(
+            !t.load_refuses(None, &them).await,
+            "an unattributed link is unresolved"
+        );
+        assert!(
+            !t.load_refuses(Some("stranger"), &ShapingOffer::off()).await,
+            "a peer that does not shape keeps its ordinary link"
+        );
+        t.set_service_tier(T::ChatAndContacts);
+        assert!(t.load_refuses(Some("stranger"), &them).await, "tier 2 too");
+        let plain = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        plain.set_service_tier(T::ChatAndContacts);
+        assert!(
+            !plain.load_refuses(Some("stranger"), &them).await,
+            "with no read installed nothing is shed"
+        );
+    }
+
+    /// The refusal is the bound's: `home-elsewhere` on the wire, and
+    /// [`LinkShapers::peer_offer`] installs nothing.
+    #[test]
+    fn a_load_refusal_is_the_bounds_refusal_and_installs_nothing() {
+        let (t, _) = shedding(BudgetClass::Server);
+        let link = [40u8; 16];
+        let refusal = t.refusal_for(link, Some("stranger"));
+        assert_eq!(refusal.class, BudgetClass::HomeElsewhere);
+        assert!(matches!(
+            t.peer_offer(link, &shaping_peer()),
+            Err(ShapingError::HomeElsewhere)
+        ));
+        assert!(!t.is_shaped(link));
+        assert_eq!(t.free_slots(), 8, "a refused peer holds no slot");
+    }
+
+    /// §6.12 tier 1 **reports zero slots**, at once and on the wire, whatever
+    /// room the node has; the slots return with the tier. Mutation: leave
+    /// `free_slots` alone at tier 1 → this fails.
+    #[test]
+    fn tier_one_reports_zero_slots_at_once_and_the_slots_return_with_the_tier() {
+        use crate::load_ladder::ServiceTier as T;
+        let (t, _) = shedding(BudgetClass::Server);
+        t.enable_capacity_reports();
+        t.set_relay_offering(true);
+        shaped_links(&t, 1, "g", 10);
+        assert_eq!(t.reported_slots(), 7);
+        let link = t.get([10u8; 16]).expect("a link");
+        let idle = link.room();
+        t.set_service_tier(T::AudioAndFiles);
+        assert_eq!(t.free_slots(), 0);
+        assert_eq!(t.reported_slots(), 0);
+        assert_eq!(link.room(), idle - 1, "the zero went out on the link");
+        t.set_service_tier(T::ChatAndContacts);
+        assert_eq!(t.reported_slots(), 0);
+        assert_eq!(link.room(), idle - 1, "no change, no report");
+        t.set_service_tier(T::FullOps);
+        assert_eq!(t.free_slots(), 7);
+        assert_eq!(
+            link.room(),
+            idle - 2,
+            "and the slots went out with the tier"
+        );
+    }
+
+    /// §6.12 tier 2: newest first, one peer at a time, and never a peer a
+    /// tier leaves alone, however new. The read comes when the link comes up.
+    /// Mutation: drop the owner's or the seat's exemption, reverse the order,
+    /// or never shed → this fails.
+    #[tokio::test]
+    async fn tier_two_closes_the_newest_link_of_a_peer_owed_nothing() {
+        use crate::load_ladder::{PeerObligation as O, ServiceTier as T};
+        let (t, owed) = shedding(BudgetClass::Server);
+        // Admitted in this order; the protected are the newest.
+        shaped_links(&t, 2, "old", 10);
+        shaped_links(&t, 2, "new", 20);
+        shaped_links(&t, 1, "device", 30);
+        shaped_links(&t, 1, "seat", 40);
+        shaped_links(&t, 1, "contact", 50);
+        shaped_links(&t, 1, "unread", 60);
+        owed.set("device0", O::OwnDevice);
+        owed.set("seat0", O::Seat);
+        owed.set("contact0", O::SendSet);
+        owed.set("unread0", O::Unresolved);
+        assert_eq!(t.next_shed().await, None, "tier 0 closes nothing");
+        t.set_service_tier(T::AudioAndFiles);
+        assert_eq!(t.next_shed().await, None, "nor does tier 1");
+        t.set_service_tier(T::ChatAndContacts);
+        let mut closed = Vec::new();
+        while let Some(link) = t.next_shed().await {
+            closed.push(link[0]);
+            t.forget(&link);
+        }
+        assert_eq!(closed, vec![21, 20, 11, 10], "newest first");
+        assert_eq!(t.shaped_count(), 4, "the protected links stand");
+        // Standing lost a moment ago is read now, not at the tier change.
+        owed.set("seat0", O::Ordinary);
+        assert_eq!(t.next_shed().await, Some([40u8; 16]));
+        t.set_service_tier(T::AudioAndFiles);
+        assert_eq!(t.next_shed().await, None, "the tier fell");
+    }
+
+    /// A link this node dialled carries this node's own rows, and a close
+    /// would only redial it: tier 2 leaves it, as it leaves a home a refused
+    /// node found through a referral.
+    #[tokio::test]
+    async fn tier_two_leaves_a_link_this_node_dialled() {
+        use crate::load_ladder::ServiceTier as T;
+        let (t, _) = shedding(BudgetClass::Server);
+        let link = [70u8; 16];
+        let answer = t.begin_offer(link);
+        let _ = t.offer_for(link, 400, Some("home"));
+        t.peer_offer(link, &shaping_peer())
+            .unwrap()
+            .expect("shaped");
+        assert_eq!(answer.await.unwrap().unwrap(), true);
+        t.set_service_tier(T::ChatAndContacts);
+        assert_eq!(t.next_shed().await, None);
+        let s = t.links_status();
+        assert!(s[0].dialled_here);
+        assert!(t.is_shaped(link));
+    }
+
+    /// **Cover is not shed** (§6.12, CC 5.4.3): no tier moves a shaper's rate
+    /// or budget, on a link that stays. Mutation: thin the rate at tier 2 →
+    /// this fails.
+    #[tokio::test(start_paused = true)]
+    async fn no_tier_moves_a_shapers_rate_and_cover_goes_on() {
+        use crate::load_ladder::ServiceTier as T;
+        let (t, owed) = shedding(BudgetClass::Server);
+        owed.set("g0", crate::load_ladder::PeerObligation::OwnDevice);
+        shaped_links(&t, 1, "g", 10);
+        let s = t.get([10u8; 16]).expect("a link");
+        let before = (s.lambda_now(), s.bytes_per_s_now(), s.reach_frames_now());
+        for tier in [T::AudioAndFiles, T::ChatAndContacts] {
+            t.set_service_tier(tier);
+            t.rebalance();
+            assert_eq!(
+                (s.lambda_now(), s.bytes_per_s_now(), s.reach_frames_now()),
+                before,
+                "{tier:?}"
+            );
+        }
+        assert_eq!(s.queued(), 0, "nothing real is waiting");
+        assert!(matches!(
+            s.next_emission().await,
+            Emission::Frame { real: false, .. }
+        ));
+    }
+
+    /// §6.12, §7.2: B-pause spares the owner's devices alone. A seat and a
+    /// contact keep their links and their files wait; a read that failed
+    /// pauses nothing, and tiers 0 and 1 pause nothing.
+    #[tokio::test]
+    async fn the_slow_path_pauses_at_tier_two_for_all_but_the_owners_devices() {
+        use crate::load_ladder::{PeerObligation as O, ServiceTier as T};
+        let (t, owed) = shedding(BudgetClass::Server);
+        owed.set("device", O::OwnDevice);
+        owed.set("seat", O::Seat);
+        owed.set("contact", O::SendSet);
+        owed.set("unread", O::Unresolved);
+        for tier in [T::FullOps, T::AudioAndFiles] {
+            t.set_service_tier(tier);
+            assert!(!t.slow_path_paused("stranger").await, "{tier:?}");
+        }
+        t.set_service_tier(T::ChatAndContacts);
+        for paused in ["stranger", "seat", "contact"] {
+            assert!(t.slow_path_paused(paused).await, "{paused}");
+        }
+        for runs in ["device", "unread"] {
+            assert!(!t.slow_path_paused(runs).await, "{runs}");
+        }
+    }
+
+    /// E8: the figures are the policy's arithmetic, §2.4's values at the class
+    /// rates and something else at any other rate: a table restated would
+    /// not move. Off has no cost to state.
+    #[test]
+    fn the_figures_follow_the_policy_not_a_table() {
+        let home = ShapingPolicy::for_class(BudgetClass::Home);
+        let f = ShapingFigures::of(&home, REFERENCE_FRAME_BYTES).expect("home shapes");
+        assert_eq!(f.class, "home");
+        assert!((f.gap_s - 5.81).abs() < 0.01, "{}", f.gap_s);
+        assert!((f.gap_p95_s - 17.4).abs() < 0.1, "{}", f.gap_p95_s);
+        assert!((f.gb_month_link - 7.26).abs() < 0.01, "{}", f.gb_month_link);
+        assert!((f.gb_month_cap - 58.06).abs() < 0.01, "{}", f.gb_month_cap);
+        assert!((f.file_1mb_s - 714.3).abs() < 0.1, "{}", f.file_1mb_s);
+        assert!((f.file_10mb_s - 7142.9).abs() < 0.1, "{}", f.file_10mb_s);
+
+        let mut doubled = home.clone();
+        doubled.bytes_per_s *= 2;
+        doubled.node_cap_bytes_per_s *= 2;
+        let g = ShapingFigures::of(&doubled, REFERENCE_FRAME_BYTES).unwrap();
+        assert!((g.gap_s - f.gap_s / 2.0).abs() < 1e-9);
+        assert!((g.gb_month_cap - f.gb_month_cap * 2.0).abs() < 1e-9);
+        assert!((g.file_1mb_s - f.file_1mb_s / 2.0).abs() < 1e-9);
+        let small = ShapingFigures::of(&home, 3_254).unwrap();
+        assert!(
+            (small.gap_s - f.gap_s / 5.0).abs() < 0.01,
+            "a fifth at the base frame"
+        );
+        assert!(ShapingFigures::of(&ShapingPolicy::default(), 400).is_none());
+    }
+
+    /// E8: a peer's shaping is what the peer said. Unknown until it answers;
+    /// a link makes it known and known outlives the link; `off` and silence
+    /// say no; a refusal says yes, because a node with no room shapes.
+    #[test]
+    fn a_peers_shaping_is_what_the_peer_said() {
+        let t = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        assert_eq!(t.peer_shaping("g0").shapes, None);
+        shaped_links(&t, 1, "g", 10);
+        let p = t.peer_shaping("g0");
+        assert_eq!((p.shapes, p.shaped_now), (Some(true), true));
+        assert!(p.gap_s.is_some_and(|g| g > 0.0));
+        t.forget(&[10u8; 16]);
+        let p = t.peer_shaping("g0");
+        assert_eq!((p.shapes, p.shaped_now, p.gap_s), (Some(true), false, None));
+
+        let _ = t.offer_for([11u8; 16], 400, Some("bare"));
+        t.peer_offer([11u8; 16], &ShapingOffer::off()).unwrap();
+        assert_eq!(t.peer_shaping("bare").shapes, Some(false));
+
+        let _ = t.offer_for([12u8; 16], 400, Some("old"));
+        t.offer_unanswered([12u8; 16]);
+        assert_eq!(t.peer_shaping("old").shapes, Some(false));
+
+        let _ = t.offer_for([13u8; 16], 400, Some("full"));
+        assert!(t
+            .peer_offer([13u8; 16], &ShapingOffer::home_elsewhere())
+            .is_err());
+        assert_eq!(t.peer_shaping("full").shapes, Some(true));
+
+        let seen: Vec<String> = t.peers_shaping().into_iter().map(|p| p.peer).collect();
+        assert_eq!(seen, vec!["bare", "full", "g0", "old"]);
+    }
+
+    #[test]
+    fn peer_shaping_facts_are_bounded() {
+        let t = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        for i in 0..PEER_SHAPING_FACTS_MAX + 3 {
+            t.note_peer_shapes(&format!("p{i}"), true);
+        }
+        assert_eq!(t.peers_shaping().len(), PEER_SHAPING_FACTS_MAX);
     }
 }

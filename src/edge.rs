@@ -1153,6 +1153,20 @@ impl<T> std::fmt::Debug for ReinstallableCell<T> {
     }
 }
 
+/// `FSD/PRIVACY_MODES.md` §6.12 — the send set of the bridge installed now.
+#[cfg(feature = "_reticulum-module")]
+struct InstalledSendSet(
+    Arc<ReinstallableCell<crate::replication::FederationDirectoryReplicationBridge>>,
+);
+
+#[cfg(feature = "_reticulum-module")]
+#[async_trait::async_trait]
+impl crate::peer_obligation::SendSetRead for InstalledSendSet {
+    async fn reaches(&self, local: &str, peer: &str) -> Option<bool> {
+        self.0.get()?.send_set_reaches(local, peer).await
+    }
+}
+
 impl<T> ReinstallableCell<T> {
     fn new(what: &'static str) -> Self {
         Self {
@@ -2334,6 +2348,71 @@ impl Edge {
                 .collect(),
             ..crate::observability::LoadLedger::default()
         }
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.6, E8 — **the typed status a host reads**:
+    /// class, rate, gap, shaped links, free slots, each peer's shaping and
+    /// `OnionStatus`, read from the running transport when asked, at the tier
+    /// the ladder holds now. `None` with no Reticulum transport.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn shaping_status(&self) -> Option<crate::transport::link_shaping::ShapingStatus> {
+        self.service_tier();
+        Some(self.reticulum_transport.as_ref()?.shaping_status())
+    }
+
+    /// E8 — what this node knows of `peer`'s shaping (§3.1): whether it
+    /// shapes, as far as it has answered an offer here.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn peer_shaping(&self, peer: &str) -> Option<crate::transport::link_shaping::PeerShaping> {
+        Some(self.reticulum_transport.as_ref()?.peer_shaping(peer))
+    }
+
+    /// CC 5.4.6 — the Anonymous Tier on this node, counts only.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn onion_status(&self) -> Option<crate::onion::runtime::OnionStatus> {
+        Some(self.reticulum_transport.as_ref()?.onion().status())
+    }
+
+    /// CC 5.4.3 — the shaping policy in force.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn shaping_policy(&self) -> Option<crate::transport::link_shaping::ShapingPolicy> {
+        Some(self.reticulum_transport.as_ref()?.shaping_policy())
+    }
+
+    /// CC 5.4.3 — replace the shaping policy live (`FSD/PRIVACY_MODES.md`
+    /// §6.10). Returns how many links closed to renegotiate; `None` with no
+    /// Reticulum transport.
+    #[cfg(feature = "_reticulum-module")]
+    pub async fn set_shaping_policy(
+        &self,
+        policy: crate::transport::link_shaping::ShapingPolicy,
+    ) -> Option<usize> {
+        Some(
+            self.reticulum_transport
+                .as_ref()?
+                .set_shaping_policy(policy)
+                .await,
+        )
+    }
+
+    /// The host's device facts changed (§6.6): the class follows them, the
+    /// opt-in kept. Returns how many links closed to renegotiate; `None` with
+    /// no Reticulum transport.
+    #[cfg(feature = "_reticulum-module")]
+    pub async fn set_device_state(
+        &self,
+        device: crate::transport::link_shaping::DeviceState,
+    ) -> Option<usize> {
+        Some(
+            self.reticulum_transport
+                .as_ref()?
+                .set_device_state(device)
+                .await,
+        )
     }
 
     #[allow(clippy::unused_self)]
@@ -8970,6 +9049,22 @@ impl EdgeBuilder {
             canonical_id_set.extend(baked_canonical_genesis_ids());
         }
         let canonical_peers = Arc::new(std::sync::RwLock::new(canonical_id_set));
+        let introduction_bridge = Arc::new(ReinstallableCell::new("introduction_bridge"));
+        // `FSD/PRIVACY_MODES.md` §6.12 — what a shed lever on a shaped slot
+        // reads at decision time: the roster and the owner's devices from the
+        // directory, the send set from whichever bridge is installed then.
+        #[cfg(feature = "_reticulum-module")]
+        if let (Some(t), Some(directory)) = (
+            self.reticulum_transport.as_ref(),
+            self.federation_directory.as_ref(),
+        ) {
+            t.install_peer_obligations(Arc::new(crate::peer_obligation::LivePeerObligations::new(
+                Arc::clone(directory),
+                t.occurrence_key_id(),
+                Arc::clone(&canonical_peers),
+                Arc::new(InstalledSendSet(Arc::clone(&introduction_bridge))),
+            )));
+        }
 
         // CIRISEdge#809 — every transport counts into THIS edge's metrics
         // bag, attached here, at build, because no listener can exist yet:
@@ -9027,7 +9122,7 @@ impl EdgeBuilder {
             first_contact_gate: Arc::new(std::sync::Mutex::new(
                 crate::first_contact::FirstContactGate::new(),
             )),
-            introduction_bridge: Arc::new(ReinstallableCell::new("introduction_bridge")),
+            introduction_bridge,
             ephemeral_response_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             verified_envelope_tx,
             content_fetch_pending,
