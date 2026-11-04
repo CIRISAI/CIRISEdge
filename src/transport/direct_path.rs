@@ -66,6 +66,11 @@
 //! lockstep. The in-leviculum half (a glare reason, the responder's session
 //! dropped) is asked in leviculum#96.
 //!
+//! Only a send can yield: its proposal may ride the peer's link to this node
+//! (CIRISEdge#920), and it waits on nothing. A call's dial proposes on a link
+//! this node dialled (the identity lane's pool), so it is that link's initiator
+//! and never yields; two members dialling each other propose on two links.
+//!
 //! The jitter reaches what edge schedules: a `Rejected` proposal, which
 //! leviculum drops from its own retries. leviculum's background re-proposal
 //! after a timeout or a failed punch runs on its fixed `RETRY_BACKOFF_MS`,

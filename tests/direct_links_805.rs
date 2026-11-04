@@ -2228,3 +2228,90 @@ async fn the_yield_never_happens_before_mutual() {
         Some(DirectPathState::BackingOff)
     );
 }
+
+/// B's address for call member `member`, on the call `open_call` makes.
+fn call_address(side: &Side, member: &str) -> MemberAddress {
+    let stream = StreamId(sha2::Sha256::digest(b"av-stream-805-direct").into());
+    side.table
+        .send_address(&scope(), &av_addressing::stream_group_id(stream), member)
+        .expect("the member's call address")
+}
+
+/// **The responder's call dial never yields** — B holds A's link only as its
+/// responder, A never proposes, and B's call dial is the only thing that wants
+/// the path direct. The derived address answers nothing behind `T`, so a dial
+/// that yielded would fail. It does not yield: a call's identity lane comes
+/// from the pool of links this node dialled (`dial_and_identify`), so B is the
+/// initiator of the link it proposes on, and proposes at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_responders_call_dial_gets_a_direct_path_when_the_initiator_never_proposes() {
+    let p = trio("glare-d", proposer(), proposer()).await;
+    p.a.transport
+        .send(&p.b.key.key_id, b"glare-d-0")
+        .await
+        .expect("A's send to B ships through T");
+    let _link = shared_link(&p.a, &p.b);
+    let (_spine, _b_addr) = open_call(&p).await;
+    let a_addr = call_address(&p.b, &p.a.key.key_id);
+    let t0 = std::time::Instant::now();
+    let dial = p.b.transport.open_av_link(&p.a.key.key_id, &a_addr).await;
+    let took = t0.elapsed();
+    eprintln!(
+        "RESPONDER-DIAL ok={} took={took:?} yielded={} proposed={}",
+        dial.is_ok(),
+        dl(&p.b.metrics, "direct_link_yielded"),
+        dl(&p.b.metrics, "direct_link_proposed"),
+    );
+    assert!(dial.is_ok(), "the dial reaches A: {:?}", dial.err());
+    assert_eq!(dl(&p.b.metrics, "direct_link_proposed"), 1);
+    assert_eq!(
+        dl(&p.b.metrics, "direct_link_yielded"),
+        0,
+        "a dial never yields"
+    );
+    assert!(took < ciris_edge::transport::direct_path::DIRECT_PATH_BUDGET);
+}
+
+/// **Both ends dial the call at once**, which is every call start: each member
+/// dials each other member. Each proposes on the link it dialled, so the two
+/// proposals never cross on one link: both dials reach their member, neither
+/// yields, and neither end is refused `Rejected(2)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn both_ends_dialling_a_call_propose_on_their_own_links() {
+    let p = trio("glare-b", proposer(), proposer()).await;
+    p.a.transport
+        .send(&p.b.key.key_id, b"glare-b-0")
+        .await
+        .expect("A's send to B ships through T");
+    let _link = shared_link(&p.a, &p.b);
+    let (_spine, b_addr) = open_call(&p).await;
+    let a_addr = call_address(&p.b, &p.a.key.key_id);
+    let t0 = std::time::Instant::now();
+    let (from_a, from_b) = tokio::join!(
+        async {
+            let r = p.a.transport.open_av_link(&p.b.key.key_id, &b_addr).await;
+            (r, t0.elapsed())
+        },
+        async {
+            let r = p.b.transport.open_av_link(&p.a.key.key_id, &a_addr).await;
+            (r, t0.elapsed())
+        },
+    );
+    eprintln!(
+        "BOTH-DIAL a_ok={} a_took={:?} b_ok={} b_took={:?} a_prop={} b_prop={} a_rej={} b_rej={}",
+        from_a.0.is_ok(),
+        from_a.1,
+        from_b.0.is_ok(),
+        from_b.1,
+        dl(&p.a.metrics, "direct_link_proposed"),
+        dl(&p.b.metrics, "direct_link_proposed"),
+        dl(&p.a.metrics, "direct_link_failed_rejected"),
+        dl(&p.b.metrics, "direct_link_failed_rejected"),
+    );
+    assert!(from_a.0.is_ok(), "A's dial: {:?}", from_a.0.err());
+    assert!(from_b.0.is_ok(), "B's dial: {:?}", from_b.0.err());
+    assert_eq!(dl(&p.a.metrics, "direct_link_failed_rejected"), 0);
+    assert_eq!(dl(&p.b.metrics, "direct_link_failed_rejected"), 0);
+    assert_eq!(dl(&p.a.metrics, "direct_link_yielded"), 0);
+    assert_eq!(dl(&p.b.metrics, "direct_link_yielded"), 0);
+}
