@@ -6293,6 +6293,41 @@ impl ReticulumTransport {
             }
         };
         let now = std::time::Instant::now();
+        // v44 — proposal glare (leviculum#96): leviculum refuses a REQUEST
+        // that crosses this node's own proposal on the same link REJECT_BUSY
+        // before the host sees it, so both ends proposing at once both fail.
+        // The tie-break is the link's direction, an asymmetric fact both ends
+        // hold: only the INITIATOR proposes on a link; the responder yields,
+        // and proposes itself only after GLARE_WAIT without the initiator's
+        // proposal. A link of unknown direction is treated as initiated.
+        let initiator = self
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_link
+            .get(&link)
+            .map_or(true, |d| *d == LinkDirection::Outbound);
+        let since = self.direct_paths.yield_since(destination_key_id);
+        match crate::transport::direct_path::glare_verdict(initiator, since, now) {
+            crate::transport::direct_path::GlareVerdict::Yield => {
+                if since.is_none() {
+                    self.direct_paths.note_yield(destination_key_id, now);
+                }
+                count(crate::observability::DIRECT_LINK_YIELDED);
+                tracing::info!(
+                    key_id = %destination_key_id,
+                    link = %hex::encode(link.as_bytes()),
+                    "direct path: the peer initiated this link, so it proposes; yielding \
+                     (v44, leviculum#96)"
+                );
+                return Err(DirectPath::Unavailable {
+                    reason: "yield_to_initiator",
+                });
+            }
+            crate::transport::direct_path::GlareVerdict::Propose => {
+                self.direct_paths.clear_yield(destination_key_id);
+            }
+        }
         let admitted = self
             .direct_paths
             .tracker()
@@ -6473,6 +6508,28 @@ impl ReticulumTransport {
     /// request).
     pub fn forget_direct_contact(&self, node_key_id: &str) {
         self.direct_paths.forget_contact(node_key_id);
+    }
+
+    /// v44 test seam — propose to `peer` on `link` now, as a send over it
+    /// would (the standing check, then the glare tie-break and the
+    /// proposal). Returns what happened: `proposed`, `joined`, or the reason
+    /// nothing was proposed (`no_standing`, `yield_to_initiator`,
+    /// `backing_off`, …).
+    #[doc(hidden)]
+    pub async fn propose_direct_on_link_for_test(&self, peer: &str, link: [u8; 16]) -> String {
+        use crate::transport::direct_path::DirectPath;
+        if !self.direct_paths.config.proposes() {
+            return "not_configured".to_owned();
+        }
+        if !self.direct_standing(peer) {
+            return "no_standing".to_owned();
+        }
+        match self.start_or_join_proposal(peer, LinkId::new(link)).await {
+            Ok((l, _)) if l == LinkId::new(link) => "proposed".to_owned(),
+            Ok(_) => "joined".to_owned(),
+            Err(DirectPath::Unavailable { reason }) => reason.to_owned(),
+            Err(other) => format!("{other:?}"),
+        }
     }
 
     /// v44 — whether leviculum re-proposes this node's failed direct links in
@@ -15580,6 +15637,10 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
             ctx.direct_paths.config.accept,
             shares_room,
         );
+    // The initiator's proposal came: nothing left to yield to.
+    if let Some(p) = peer.as_deref() {
+        ctx.direct_paths.clear_yield(p);
+    }
     if let Some(m) = ctx.metrics {
         m.inc_direct_link(if accepted {
             crate::observability::DIRECT_LINK_REQUEST_ACCEPTED
@@ -15630,7 +15691,12 @@ async fn direct_link_failed(
     let peer = ctx
         .direct_paths
         .tracker()
-        .failed(link_id, failure, std::time::Instant::now())
+        .failed(
+            link_id,
+            failure,
+            std::time::Instant::now(),
+            crate::transport::direct_path::jitter_draw(),
+        )
         .or(hint);
     let reason = crate::transport::direct_path::failure_label(failure);
     if let Some(m) = ctx.metrics {

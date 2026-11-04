@@ -1219,6 +1219,9 @@ pub const DIRECT_LINK_SKIPPED_NEIGHBOUR: &str = "direct_link_skipped_neighbour";
 /// No proposal: the member's last proposal failed and is backing off (or was
 /// refused on this link).
 pub const DIRECT_LINK_SKIPPED_BACKOFF: &str = "direct_link_skipped_backoff";
+/// v44 (leviculum#96) — this node wanted to propose on a link it did not
+/// initiate and left the proposal to the initiator (the glare tie-break).
+pub const DIRECT_LINK_YIELDED: &str = "direct_link_yielded";
 /// No proposal: no identity link to the member could be had.
 pub const DIRECT_LINK_SKIPPED_NO_LINK: &str = "direct_link_skipped_no_link";
 /// A peer's direct-link request, accepted: it shares a room with this node.

@@ -53,6 +53,19 @@
 //! with ([`DirectAccept::RoomPeers`]); [`DirectAccept::Off`] is the operator
 //! override.
 //!
+//! # Glare (v44, leviculum#96)
+//!
+//! Two peers that both want a link direct propose on it within a round trip
+//! of each other, and leviculum refuses a REQUEST that crosses its own
+//! proposal on that link `REJECT_BUSY` before the host sees it, so both fail
+//! and, with the same backoff, both retry together. Edge breaks the tie with
+//! the link's direction, which both ends hold: only the link's INITIATOR
+//! proposes on it; the responder yields ([`glare_verdict`]) and proposes
+//! itself only after [`GLARE_WAIT`] without the initiator's proposal. Every
+//! retry is jittered ±25 % ([`RETRY_JITTER`]) so a pair never stays in
+//! lockstep. The in-leviculum half (a glare reason, the responder's session
+//! dropped) is asked in leviculum#96.
+//!
 //! # Scope of a proposal
 //!
 //! Proposing reveals this node's public address to the peer, so edge proposes
@@ -96,6 +109,20 @@ pub const DIRECT_RETRY_BASE: Duration =
 
 /// The longest a retryable failure backs off (the base doubles per attempt).
 pub const DIRECT_RETRY_CAP: Duration = Duration::from_secs(30 * 60);
+
+/// v44 — every retry is jittered by up to this fraction either way, so two
+/// peers that failed together never retry in lockstep (the CI baseline's
+/// glare: both proposing within 200 ms on every retry, 2 min then 4 min,
+/// identical on both sides, each refusing the other `Rejected(2)`).
+pub const RETRY_JITTER: f64 = 0.25;
+
+/// v44 — how long a link's RESPONDER waits for the initiator's proposal
+/// before proposing on that link itself (leviculum#96). leviculum refuses a
+/// proposal that crosses its own on a link `REJECT_BUSY` before the host sees
+/// it, so the tie is broken here: only the link's initiator proposes on it.
+/// A responder facing a peer that never proposes (proposing off, an older
+/// edge) proposes after this wait.
+pub const GLARE_WAIT: Duration = Duration::from_secs(30);
 
 /// A punch that failed means a NAT that maps per destination (symmetric NAT,
 /// common on cellular). It does not change between calls, so the peer is not
@@ -285,9 +312,63 @@ pub enum DirectRetry {
 }
 
 /// The retry policy for a failed proposal, `attempts` failures in a row so far
-/// (0 for the first).
+/// (0 for the first), with `jitter` in `[-RETRY_JITTER, RETRY_JITTER]` (clamped)
+/// applied to the wait.
 #[must_use]
-pub fn retry_after(failure: Failure, attempts: u32) -> DirectRetry {
+pub fn retry_after(failure: Failure, attempts: u32, jitter: f64) -> DirectRetry {
+    let DirectRetry::After(base) = retry_base(failure, attempts);
+    let j = if jitter.is_finite() {
+        jitter.clamp(-RETRY_JITTER, RETRY_JITTER)
+    } else {
+        0.0
+    };
+    DirectRetry::After(base.mul_f64(1.0 + j))
+}
+
+/// A jitter draw in `[-RETRY_JITTER, RETRY_JITTER]` from the OS RNG (0 if it
+/// cannot be read).
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn jitter_draw() -> f64 {
+    let mut b = [0u8; 2];
+    if ciris_crypto::random::fill(&mut b).is_err() {
+        return 0.0;
+    }
+    let unit = f64::from(u16::from_le_bytes(b)) / f64::from(u16::MAX);
+    2.0f64.mul_add(RETRY_JITTER * unit, -RETRY_JITTER)
+}
+
+/// v44 — who proposes on a link when both ends want it direct
+/// (leviculum#96).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlareVerdict {
+    /// Propose now.
+    Propose,
+    /// Leave it to the link's initiator; propose only after [`GLARE_WAIT`].
+    Yield,
+}
+
+/// The tie-break: the link's initiator proposes; the responder yields until
+/// it has waited [`GLARE_WAIT`] since `waiting_since` for the initiator's
+/// proposal. Pure, so it is a unit test.
+#[must_use]
+pub fn glare_verdict(
+    initiator: bool,
+    waiting_since: Option<Instant>,
+    now: Instant,
+) -> GlareVerdict {
+    if initiator
+        || waiting_since.is_some_and(|since| now.saturating_duration_since(since) >= GLARE_WAIT)
+    {
+        GlareVerdict::Propose
+    } else {
+        GlareVerdict::Yield
+    }
+}
+
+/// The unjittered retry policy.
+#[must_use]
+fn retry_base(failure: Failure, attempts: u32) -> DirectRetry {
     match failure {
         Failure::PunchFailed => DirectRetry::After(DIRECT_PUNCH_FAILED_BACKOFF),
         // A refusal is retried like a timeout (CIRISEdge#920). Under the
@@ -508,10 +589,17 @@ impl DirectPathTracker {
     }
 
     /// A proposal on `link` ended without a direct path. Returns the peer.
-    pub fn failed(&mut self, link: LinkId, failure: Failure, now: Instant) -> Option<String> {
+    /// `jitter` is the retry's draw ([`jitter_draw`]; 0 in tests).
+    pub fn failed(
+        &mut self,
+        link: LinkId,
+        failure: Failure,
+        now: Instant,
+        jitter: f64,
+    ) -> Option<String> {
         let peer = self.link_peer.remove(&link)?;
         let attempts = self.peers.get(&peer).map_or(0, |p| p.attempts);
-        let DirectRetry::After(wait) = retry_after(failure, attempts);
+        let DirectRetry::After(wait) = retry_after(failure, attempts, jitter);
         let entry = Entry::BackingOff { until: now + wait };
         self.peers.insert(
             peer.clone(),
@@ -676,6 +764,9 @@ pub(crate) struct DirectPaths {
     /// Peers (node key ids) the host named as consented contacts
     /// ([`Self::allow_contact`]): direct with them like a room peer.
     contacts: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// v44 — peers this node is yielding to on a link it did not initiate,
+    /// since when ([`glare_verdict`]).
+    yielding: std::sync::Mutex<HashMap<String, Instant>>,
 }
 
 /// Most consented contacts remembered for direct links.
@@ -690,7 +781,34 @@ impl DirectPaths {
             events: tokio::sync::broadcast::channel(64).0,
             anchors: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             contacts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            yielding: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// v44 — since when this node has been yielding to `peer`'s proposal.
+    pub(crate) fn yield_since(&self, peer: &str) -> Option<Instant> {
+        self.yielding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(peer)
+            .copied()
+    }
+
+    /// v44 — start yielding to `peer` at `now` (kept if already yielding).
+    pub(crate) fn note_yield(&self, peer: &str, now: Instant) {
+        self.yielding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(peer.to_owned())
+            .or_insert(now);
+    }
+
+    /// v44 — stop yielding to `peer` (its proposal came, or this node's turn).
+    pub(crate) fn clear_yield(&self, peer: &str) {
+        self.yielding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(peer);
     }
 
     /// Eric 2026-10-30: a node goes direct with "anyone who has consented to a
@@ -916,24 +1034,76 @@ mod tests {
     #[test]
     fn the_retry_policy_by_failure() {
         assert_eq!(
-            retry_after(Failure::Rejected(1), 0),
+            retry_after(Failure::Rejected(1), 0, 0.0),
             DirectRetry::After(DIRECT_RETRY_BASE)
         );
         assert_eq!(
-            retry_after(Failure::PunchFailed, 0),
+            retry_after(Failure::PunchFailed, 0, 0.0),
             DirectRetry::After(DIRECT_PUNCH_FAILED_BACKOFF)
         );
         assert_eq!(
-            retry_after(Failure::Timeout, 0),
+            retry_after(Failure::Timeout, 0, 0.0),
             DirectRetry::After(DIRECT_RETRY_BASE)
         );
         assert_eq!(
-            retry_after(Failure::ProbeFailed, 2),
+            retry_after(Failure::ProbeFailed, 2, 0.0),
             DirectRetry::After(DIRECT_RETRY_BASE * 4)
         );
         assert_eq!(
-            retry_after(Failure::Timeout, 40),
+            retry_after(Failure::Timeout, 40, 0.0),
             DirectRetry::After(DIRECT_RETRY_CAP)
+        );
+    }
+
+    /// v44 — the retry is jittered ±25 % (clamped), so two peers that failed
+    /// together do not retry in lockstep; the OS draw stays in range.
+    #[test]
+    fn the_retry_is_jittered_within_a_quarter() {
+        let base = DIRECT_RETRY_BASE;
+        assert_eq!(
+            retry_after(Failure::Timeout, 0, 0.25),
+            DirectRetry::After(base.mul_f64(1.25))
+        );
+        assert_eq!(
+            retry_after(Failure::Timeout, 0, -0.25),
+            DirectRetry::After(base.mul_f64(0.75))
+        );
+        assert_eq!(
+            retry_after(Failure::Timeout, 0, 0.9),
+            DirectRetry::After(base.mul_f64(1.25)),
+            "clamped"
+        );
+        assert_eq!(
+            retry_after(Failure::Timeout, 0, f64::NAN),
+            DirectRetry::After(base)
+        );
+        let draws: Vec<f64> = (0..64).map(|_| jitter_draw()).collect();
+        assert!(draws
+            .iter()
+            .all(|j| (-RETRY_JITTER..=RETRY_JITTER).contains(j)));
+        assert!(
+            draws.iter().any(|j| *j != draws[0]),
+            "the draw is not a constant"
+        );
+    }
+
+    /// v44 — the glare tie-break (leviculum#96): the link's initiator
+    /// proposes; the responder yields until it has waited GLARE_WAIT.
+    /// Mutation: a verdict that never yields fails this test.
+    #[test]
+    fn the_initiator_proposes_and_the_responder_yields_until_the_wait() {
+        let t0 = Instant::now();
+        assert_eq!(glare_verdict(true, None, t0), GlareVerdict::Propose);
+        assert_eq!(glare_verdict(true, Some(t0), t0), GlareVerdict::Propose);
+        assert_eq!(glare_verdict(false, None, t0), GlareVerdict::Yield);
+        assert_eq!(
+            glare_verdict(false, Some(t0), t0 + GLARE_WAIT / 2),
+            GlareVerdict::Yield
+        );
+        assert_eq!(
+            glare_verdict(false, Some(t0), t0 + GLARE_WAIT),
+            GlareVerdict::Propose,
+            "the initiator never proposed: the responder's turn"
         );
     }
 
@@ -945,14 +1115,15 @@ mod tests {
         t.proposed("b", link(1), Some(16_000), now);
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::InFlight));
         assert_eq!(
-            t.failed(link(1), Failure::Timeout, now).as_deref(),
+            t.failed(link(1), Failure::Timeout, now, now, 0.0)
+                .as_deref(),
             Some("b")
         );
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::BackingOff));
         assert_eq!(t.admit("b", link(1), now + DIRECT_RETRY_BASE), Ok(()));
         // A second timeout doubles the wait.
         t.proposed("b", link(1), None, now);
-        t.failed(link(1), Failure::Timeout, now);
+        t.failed(link(1), Failure::Timeout, now, now, 0.0);
         assert_eq!(
             t.admit("b", link(1), now + DIRECT_RETRY_BASE),
             Err(ProposeSkip::BackingOff)
@@ -981,7 +1152,7 @@ mod tests {
         let now = Instant::now();
         let mut t = DirectPathTracker::default();
         t.proposed("b", link(1), None, now);
-        t.failed(link(1), Failure::Rejected(1), now);
+        t.failed(link(1), Failure::Rejected(1), now, now, 0.0);
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::BackingOff));
         assert_eq!(
             t.admit("b", link(2), now),
@@ -1034,7 +1205,7 @@ mod tests {
     fn an_unknown_link_event_changes_nothing() {
         let now = Instant::now();
         let mut t = DirectPathTracker::default();
-        assert_eq!(t.failed(link(9), Failure::Timeout, now), None);
+        assert_eq!(t.failed(link(9), Failure::Timeout, now, now, 0.0), None);
         assert_eq!(t.lost(link(9), now), None);
         assert_eq!(t.direct_count(), 0);
     }

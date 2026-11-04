@@ -65,7 +65,7 @@ use ciris_edge::transport::realtime_av_mls::{mint_joiner_key_material, Member};
 use ciris_edge::transport::realtime_av_runtime::{AvPublisher, AvRelay, AvSubscriber, LegStreams};
 use ciris_edge::transport::realtime_av_session::AvSession;
 use ciris_edge::transport::reticulum::{
-    ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
+    LinkDirection, ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
 };
 use ciris_edge::transport::{InboundFrame, Transport as _, TransportError};
 use ciris_edge::verify::RootingDirectory;
@@ -2103,5 +2103,128 @@ async fn a_punched_link_that_stops_acking_is_retired_by_the_stall_guard() {
     assert!(
         !dead && zero == 0,
         "a fresh run on the relayed path: ({zero}, {dead})"
+    );
+}
+
+// ─── v44: proposal glare (leviculum#96) ─────────────────────────────────
+
+/// The one identity link both `a` and `b` hold between them: `a` dialled
+/// it (Outbound on `a`), `b` accepted it (Inbound on `b`).
+fn shared_link(a: &Side, b: &Side) -> [u8; 16] {
+    let outbound: Vec<[u8; 16]> = a
+        .transport
+        .link_directions_for_test()
+        .into_iter()
+        .filter(|(_, d)| *d == LinkDirection::Outbound)
+        .map(|(id, _)| id)
+        .collect();
+    b.transport
+        .link_directions_for_test()
+        .into_iter()
+        .filter(|(id, d)| *d == LinkDirection::Inbound && outbound.contains(id))
+        .map(|(id, _)| id)
+        .next()
+        .expect("one link A dialled to B")
+}
+
+/// **Glare** — both ends want the same link direct at the same instant. The
+/// link's initiator (A) proposes; the responder (B) yields instead of
+/// proposing, so leviculum never refuses either `Rejected(2)`, and the link
+/// goes direct on the first attempt. Mutation: a tie-break that never yields
+/// has both propose, both refused `REJECT_BUSY`, nothing direct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_proposals_resolve_to_the_initiator_with_no_rejected_pair() {
+    let mut p = trio("glare", proposer(), proposer()).await;
+    // The identity link first, with no room yet so the send proposes nothing.
+    p.a.transport
+        .send(&p.b.key.key_id, b"glare-0")
+        .await
+        .expect("A's send to B ships through T");
+    assert_eq!(dl(&p.a.metrics, "direct_link_proposed"), 0);
+    let link = shared_link(&p.a, &p.b);
+    // Now the room, and both propose on that link at once.
+    let (_spine, _b_addr) = open_call(&p).await;
+    let (ra, rb) = tokio::join!(
+        p.a.transport
+            .propose_direct_on_link_for_test(&p.b.key.key_id, link),
+        p.b.transport
+            .propose_direct_on_link_for_test(&p.a.key.key_id, link),
+    );
+    assert_eq!(ra, "proposed", "the initiator proposes");
+    assert_eq!(rb, "yield_to_initiator", "the responder yields");
+    let a_up = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("A's Established");
+    assert!(matches!(
+        a_up,
+        DirectPathEvent::Established { proposed: true, .. }
+    ));
+    let b_up = next_event(&mut p.b.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("B's Established");
+    assert!(matches!(
+        b_up,
+        DirectPathEvent::Established {
+            proposed: false,
+            ..
+        }
+    ));
+    assert_eq!(dl(&p.a.metrics, "direct_link_proposed"), 1);
+    assert_eq!(dl(&p.b.metrics, "direct_link_proposed"), 0);
+    assert_eq!(dl(&p.b.metrics, "direct_link_yielded"), 1);
+    assert_eq!(dl(&p.a.metrics, "direct_link_failed_rejected"), 0);
+    assert_eq!(dl(&p.b.metrics, "direct_link_failed_rejected"), 0);
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_accepted"), 1);
+}
+
+/// **The yield is never before mutual.** A named B a contact; B did not name
+/// A and shares no room with it. A's proposal is refused by B's host
+/// (`shares_room=false` before anything else, as the baseline's first
+/// attempt was), and B neither yields nor proposes: with no standing there
+/// is nothing to yield to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_yield_never_happens_before_mutual() {
+    let mut p = trio("glare-m", proposer(), proposer()).await;
+    assert!(p.a.transport.allow_direct_contact(&p.b.key.key_id));
+    p.a.transport
+        .send(&p.b.key.key_id, b"glare-m-0")
+        .await
+        .expect("A's send to B ships through T");
+    // A's send proposed (A has standing); B refused: no room, no contact.
+    let asked = next_event(&mut p.b.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Requested { .. })
+    })
+    .await
+    .expect("B is asked");
+    assert!(matches!(
+        asked,
+        DirectPathEvent::Requested {
+            accepted: false,
+            ..
+        }
+    ));
+    let link = shared_link(&p.a, &p.b);
+    let rb =
+        p.b.transport
+            .propose_direct_on_link_for_test(&p.a.key.key_id, link)
+            .await;
+    assert_eq!(rb, "no_standing", "B neither yields nor proposes");
+    assert_eq!(dl(&p.b.metrics, "direct_link_yielded"), 0);
+    assert_eq!(dl(&p.b.metrics, "direct_link_proposed"), 0);
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_refused"), 1);
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            dl(&p.a.metrics, "direct_link_failed_rejected") >= 1
+        })
+        .await,
+        "A's proposal was refused by policy"
+    );
+    assert_eq!(
+        p.a.transport.direct_path_state(&p.b.key.key_id),
+        Some(DirectPathState::BackingOff)
     );
 }
