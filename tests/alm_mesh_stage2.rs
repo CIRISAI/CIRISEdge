@@ -585,12 +585,34 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let mut seen = Vec::new();
-    assert!(
-        collect_from(&mut rx_c, &mut seen, &b.key.key_id, 40).await,
-        "C heard {} of B's 40 frames; A forwarded {}",
-        seen.len(),
-        ca.alm_counts().forwarded - forwarded_before
-    );
+    let whole = collect_from(&mut rx_c, &mut seen, &b.key.key_id, 40).await;
+    if !whole {
+        let plane = |m: &EdgeMetrics| {
+            let mut v: Vec<(String, u64)> = m
+                .av_plane()
+                .into_iter()
+                .filter(|(k, _)| !k.starts_with("alm_c3"))
+                .collect();
+            v.sort();
+            v
+        };
+        let heard: Vec<u64> = seen
+            .iter()
+            .filter(|f| f.publisher == b.key.key_id)
+            .map(|f| f.chunk_seq.0)
+            .collect();
+        panic!(
+            "C heard {} of B's 40 frames: {heard:?}; A forwarded {}; C reorder {:?}; C auth {:?}\n\
+             plane B {:?}\nplane A {:?}\nplane C {:?}",
+            heard.len(),
+            ca.alm_counts().forwarded - forwarded_before,
+            cc.reorder_counts(),
+            cc.chunk_auth_counts(),
+            plane(&b.metrics),
+            plane(&a.metrics),
+            plane(&c.metrics),
+        );
+    }
     let got: Vec<Vec<u8>> = seen
         .iter()
         .filter(|f| f.publisher == b.key.key_id)
@@ -642,9 +664,20 @@ async fn c3_admits_and_a_closed_relay_refuses_by_name() {
         ca.alm_own_children(),
         ca.alm_log()
     );
-    assert_eq!(
-        primary_for(&cb, ca.stream()).as_deref(),
-        Some(a.key.key_id.as_str())
+    // A's ledger moves when it decides; B's selector when the ADMIT lands.
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            primary_for(&cb, ca.stream()).as_deref() == Some(a.key.key_id.as_str())
+        })
+        .await,
+        "B records A as its parent: {:?} log {:?}; A's ledger {:?} legs {:?} c3 peers {:?} sent {} failed {}",
+        cb.alm_parents(),
+        cb.alm_log(),
+        ca.alm_own_children(),
+        ca.legs(),
+        ca.alm_c3_peers(),
+        av(&a.metrics, "alm_c3_sent"),
+        av(&a.metrics, "alm_c3_send_failed")
     );
 
     let refused = wait_until(Duration::from_secs(60), || async {

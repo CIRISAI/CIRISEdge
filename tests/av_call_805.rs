@@ -543,13 +543,10 @@ async fn a_three_member_room_call_over_keyed_links() {
     // ALM stage 2: C relays only to the members that SUBSCRIBED to it (C3).
     // B and A each take C as the warm standby for the other's stream (the
     // publisher is the primary); wait for both before publishing.
-    // C as primary or standby: either way C relays the stream to them.
     let standby_on_c = |call: &Call, stream| {
-        call.alm_parents().iter().any(|p| {
-            p.stream == stream
-                && (p.standby.as_deref() == Some(c.key.key_id.as_str())
-                    || p.primary.as_deref() == Some(c.key.key_id.as_str()))
-        })
+        call.alm_parents()
+            .iter()
+            .any(|p| p.stream == stream && p.standby.as_deref() == Some(c.key.key_id.as_str()))
     };
     assert!(
         wait_until(Duration::from_secs(60), || async {
@@ -586,6 +583,11 @@ async fn a_three_member_room_call_over_keyed_links() {
         }
     };
     for s in 0..30u64 {
+        // The periodic re-announce lands mid-stream: about ten Channel
+        // messages per leg, re-forwarded by C. It must cost no chunk.
+        if s == 12 {
+            call_a.reannounce_for_test().await;
+        }
         let report = call_a
             .publish(Frame {
                 codec_id: CODEC_OPAQUE,
@@ -610,10 +612,12 @@ async fn a_three_member_room_call_over_keyed_links() {
     let (mut seen_a, mut seen_b, mut seen_c) = (Vec::new(), Vec::new(), Vec::new());
     assert!(
         collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 30).await,
-        "B: {} of A's: {:?}, reorder {:?}",
+        "B: {} of A's: {:?}, reorder {:?}; parents {:?}; plane C {:?}",
         seen_b.len(),
         seen_b.iter().map(|f| f.chunk_seq.0).collect::<Vec<_>>(),
-        call_b.reorder_counts()
+        call_b.reorder_counts(),
+        call_b.alm_parents(),
+        c.metrics.av_plane()
     );
     assert!(
         collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 30).await,
@@ -821,9 +825,7 @@ async fn a_member_cannot_forge_another_members_stream_through_a_relay() {
     assert!(
         wait_until(Duration::from_secs(60), || async {
             call_b.alm_parents().iter().any(|p| {
-                p.stream == call_a.stream()
-                    && (p.standby.as_deref() == Some(c.key.key_id.as_str())
-                        || p.primary.as_deref() == Some(c.key.key_id.as_str()))
+                p.stream == call_a.stream() && p.standby.as_deref() == Some(c.key.key_id.as_str())
             })
         })
         .await,

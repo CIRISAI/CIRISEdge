@@ -83,6 +83,13 @@ pub fn is_control_frame(frame: &[u8]) -> bool {
     frame.len() >= HEADER_LEN && frame[..4] == CONTROL_MAGIC && frame[4] == CONTROL_VERSION
 }
 
+/// Whether `frame` is one a periodic resend replaces (an `OFFER`): every
+/// other kind changes state on one side only and must arrive.
+#[must_use]
+pub fn is_periodic(frame: &[u8]) -> bool {
+    frame.len() > 5 && frame[5] == KIND_OFFER
+}
+
 /// A decoded C3 frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WireFrame {

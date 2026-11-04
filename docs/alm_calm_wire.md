@@ -149,6 +149,10 @@ Field rules (enforced at decode):
    forwards only chunks that arrive from its own primary (or promoting) parent,
    once each, and never back to their sender or publisher (`forward_exclude`,
    `av_call/alm.rs:463`). This replaces the `CallOptions::relay` flood.
+   - **Direct first (FSD R1).** A viable publisher (depth 0) is taken before
+     any relay, whatever the relays score, and a relay gives way to a publisher
+     that becomes viable. A publisher with no room stops being viable, which is
+     how it sheds subscribers to relays.
    - **One exception: the join gap.** A publisher keeps sending its own stream
      to a C3 member that has not yet chosen a parent, for at most 10 s
      (`PROVISIONAL_MS`). The member's `SUBSCRIBE` or `UNSUBSCRIBE` ends it.
@@ -227,10 +231,25 @@ closes the link**: the E1 seal already authenticated its sender.
      - otherwise it feeds the selector. An offer older than 5 s is not a
        candidate.
 
-**Sending.** `send_alm` (`av_call.rs:2292`) sends nothing to a peer without
-`CAPS` bit 0. It sends on this node's own leg to the peer (one frame, five
-brief backpressure retries, no settle). Without a leg it uses the reverse
-direction of the peer's link to this node.
+**Sending.** `send_alm` (`av_call.rs`) sends nothing to a peer without
+`CAPS` bit 0. It sends on this node's own leg to the peer (five brief
+backpressure retries), or, without a leg, on the reverse direction of the
+peer's link to this node. A frame on a leg settles that leg for 50 ms
+(`C3_SETTLE`, `realtime_av_dispatcher.rs`): the Channel opens at a window of 2,
+so without it the chunk right behind an `OFFER` is refused and lost.
+
+**Delivery.** `OFFER` is periodic: one the link refuses is dropped, and the
+next replaces it. **Every other kind must arrive**, because it changes state on
+one side only (`is_periodic`, `wire.rs`). One the link refuses is resent off
+the data path for up to 2 s (`resend_c3`, `av_call.rs`), inside the 3 s request
+timeout.
+
+**A lost answer never strands a commitment.** A `SUBSCRIBE` unanswered after
+`REQUEST_TIMEOUT_MS` (3 s) is withdrawn with `UNSUBSCRIBE`, or, when it was a
+standby asking for the primary role, with `SUBSCRIBE` standby
+(`selector.rs`, `tick`). Without this a lost `ADMIT` leaves the forwarder
+committed to a subscriber that does not know it, and its offers then show that
+subscriber no room, so it never asks again.
 
 ## 7. KAT vectors
 

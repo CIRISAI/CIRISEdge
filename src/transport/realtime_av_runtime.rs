@@ -1652,9 +1652,6 @@ mod leviculum_link {
                 fits
             });
             let handle = self.node.link_handle(&self.link_id);
-            if ttl.is_some() {
-                self.count(crate::observability::AV_SENT_TIMED);
-            }
             let sent = match ttl {
                 Some(ttl) => handle.try_send_timed(&sealed, ttl).await,
                 None => handle.try_send(&sealed).await,
@@ -1662,6 +1659,9 @@ mod leviculum_link {
             match sent {
                 Ok(()) => {
                     self.count(crate::observability::AV_SENT);
+                    if ttl.is_some() {
+                        self.count(crate::observability::AV_SENT_TIMED);
+                    }
                     if let Some(stamps) = self.outbound_liveness.as_deref() {
                         crate::transport::reticulum::note_outbound_use(stamps, self.link_id);
                     }

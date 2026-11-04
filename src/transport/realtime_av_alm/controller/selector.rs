@@ -167,6 +167,9 @@ pub struct ParentSelector<P: PeerRef> {
     tiers: BTreeMap<P, Tier>,
     next_r3_probe_ms: u64,
     last_activity_ms: Option<u64>,
+    /// When the stream last went from idle to active: silence on a path is
+    /// never counted from before it (see `idle_aware_silence`).
+    activity_since_ms: u64,
 }
 
 impl<P: PeerRef> ParentSelector<P> {
@@ -193,6 +196,7 @@ impl<P: PeerRef> ParentSelector<P> {
             tiers: BTreeMap::new(),
             next_r3_probe_ms: 0,
             last_activity_ms: None,
+            activity_since_ms: 0,
         }
     }
 
@@ -405,6 +409,12 @@ impl<P: PeerRef> ParentSelector<P> {
         latency_ms: f64,
     ) {
         // The stream is active (on some path), whoever delivered it.
+        let resumed = self.last_activity_ms.map_or(true, |a| {
+            now_ms.saturating_sub(a) > self.cfg.suspect_silence_ms
+        });
+        if resumed {
+            self.activity_since_ms = now_ms;
+        }
         self.last_activity_ms = Some(now_ms);
         let Some(c) = self.cands.get_mut(from) else {
             return;
@@ -752,6 +762,16 @@ impl<P: PeerRef> ParentSelector<P> {
         // are compared only within it.
         let low = scored.iter().map(|(p, _)| self.cands[p].tier).min()?;
         scored.retain(|(p, _)| self.cands[p].tier == low);
+        // R1: direct first, whatever the relays score.
+        let is_direct = |p: &P| {
+            self.cands[p]
+                .offer
+                .as_ref()
+                .is_some_and(|o| o.depth == 0 && o.ancestry.is_empty())
+        };
+        if self.cfg.direct_first && scored.iter().any(|(p, _)| is_direct(p)) {
+            scored.retain(|(p, _)| is_direct(p));
+        }
         let best = scored.iter().map(|(_, s)| *s).fold(f64::MIN, f64::max);
         if scored.is_empty() {
             return None;
@@ -878,7 +898,11 @@ impl<P: PeerRef> ParentSelector<P> {
         // 1. Meters + health (C1 → C6).
         let mut rolled_standby = false;
         let standby = self.standby.clone();
-        let (idle_aware, activity) = (self.cfg.idle_aware_silence, self.last_activity_ms);
+        let (idle_aware, activity, resumed_at) = (
+            self.cfg.idle_aware_silence,
+            self.last_activity_ms,
+            self.activity_since_ms,
+        );
         for (p, c) in &mut self.cands {
             let rolled = c.meter.roll(now_ms);
             if rolled && standby.as_ref() == Some(p) {
@@ -896,6 +920,13 @@ impl<P: PeerRef> ParentSelector<P> {
                     // not this parent dead.
                     return 0;
                 }
+                // The stream's idle gap is nobody's silence: a path owes
+                // chunks only since the stream resumed.
+                let last = if idle_aware {
+                    last.max(resumed_at)
+                } else {
+                    last
+                };
                 now_ms.saturating_sub(last) * 2 / (2 + depth)
             });
             let snap = c.meter.snapshot();
@@ -922,6 +953,18 @@ impl<P: PeerRef> ParentSelector<P> {
             } = c.link
             {
                 if now_ms.saturating_sub(at_ms) > REQUEST_TIMEOUT_MS {
+                    // The answer never came, which does not mean the
+                    // forwarder never committed: say so, or a lost ADMIT
+                    // leaves a commitment this node does not know it holds,
+                    // whose offers then show no room to this node either.
+                    out.push(if was_standby {
+                        SelectorAction::Subscribe {
+                            parent: p.clone(),
+                            role: Role::Standby,
+                        }
+                    } else {
+                        SelectorAction::Unsubscribe { parent: p.clone() }
+                    });
                     c.failures += 1;
                     c.backoff_until = now_ms
                         + self
@@ -1111,7 +1154,25 @@ impl<P: PeerRef> ParentSelector<P> {
                 sc.better_windows = if better { sc.better_windows + 1 } else { 0 };
             }
             let held = self.cands[&s].better_windows >= self.cfg.hysteresis_hold_windows;
-            if calm && depth_ok && held && now_ms >= self.last_switch_ms + self.dwell_ms(now_ms) {
+            // R1 / M1: a healthy direct primary is never left for a relay by
+            // score, and a relay gives way to a direct standby by rule.
+            let direct = |c: &Cand<P>| c.offer.as_ref().is_some_and(|o| o.depth == 0);
+            let (to_direct, off_direct) = (
+                self.cfg.direct_first
+                    && direct(&self.cands[&s])
+                    && !direct(&self.cands[&p])
+                    && room,
+                self.cfg.direct_first
+                    && direct(&self.cands[&p])
+                    && !direct(&self.cands[&s])
+                    && self.cands[&p].health.state() == PeerState::Available,
+            );
+            if calm
+                && depth_ok
+                && (held || to_direct)
+                && !off_direct
+                && now_ms >= self.last_switch_ms + self.dwell_ms(now_ms)
+            {
                 self.cands.get_mut(&s).expect("present").better_windows = 0;
                 self.recent_switches.push(now_ms);
                 self.recent_switches
@@ -1293,6 +1354,170 @@ mod tests {
             &[(9, 50, 2.0), (2, 2, 300.0), (3, 2, 320.0)],
         );
         assert_eq!(s.primary(), Some(&9));
+    }
+
+    fn relay_offer(from: u32, cfg: &ControllerConfig) -> Offer<u32> {
+        Offer {
+            depth: 1,
+            ancestry: vec![2],
+            ..offer(from, 4, cfg)
+        }
+    }
+
+    /// R1: a viable publisher is taken before a better-scoring relay, on every
+    /// seed (the pick band's draw must not decide it), and stays the primary.
+    #[test]
+    fn r1_a_direct_path_comes_before_a_better_scoring_relay() {
+        for seed in 0..32u64 {
+            let mut cfg = ControllerConfig::interactive();
+            cfg.direct_first = true;
+            let mut s = ParentSelector::new(1u32, cfg.clone(), true);
+            s.set_members([1u32, 2, 3]);
+            let mut rng = SplitMix64(seed);
+            let mut log = DecisionLog::default();
+            let mut t = 0;
+            while t < 40_000 {
+                if t % 1_000 == 0 {
+                    // The publisher is far; the relay is near, with more room.
+                    s.on_offer(t, offer(2, 1, &cfg), 300.0, &mut log);
+                    s.on_offer(t, relay_offer(3, &cfg), 2.0, &mut log);
+                }
+                for a in s.tick(t, &mut rng, &mut log) {
+                    if let SelectorAction::Subscribe { parent, role } = a {
+                        let d = AdmitDecision::Admit { role };
+                        let _ = s.on_decision(t, &parent, &d, &mut rng, &mut log);
+                    }
+                }
+                for (p, role) in s.subscriptions() {
+                    s.on_chunk(t, &p, t / 250, role == Role::Primary, 6_000, 5.0);
+                }
+                t += 250;
+            }
+            assert_eq!(s.primary(), Some(&2), "seed {seed}");
+            assert_eq!(s.parent_changes(), 0, "seed {seed}");
+        }
+    }
+
+    /// M1: a member on a relay moves to the publisher when a direct path
+    /// appears, make-before-break.
+    #[test]
+    fn r1_a_relay_gives_way_to_a_direct_path_that_appears() {
+        let mut cfg = ControllerConfig::interactive();
+        cfg.direct_first = true;
+        let mut s = ParentSelector::new(1u32, cfg.clone(), true);
+        s.set_members([1u32, 2, 3]);
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        let mut t = 0;
+        while t < 60_000 {
+            if t % 1_000 == 0 {
+                s.on_offer(t, relay_offer(3, &cfg), 2.0, &mut log);
+                if t >= 20_000 {
+                    s.on_offer(t, offer(2, 4, &cfg), 40.0, &mut log);
+                }
+            }
+            if t == 19_750 {
+                assert_eq!(s.primary(), Some(&3), "only the relay so far");
+            }
+            for a in s.tick(t, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    let d = AdmitDecision::Admit { role };
+                    let _ = s.on_decision(t, &parent, &d, &mut rng, &mut log);
+                }
+            }
+            for (p, role) in s.subscriptions() {
+                for k in 0..10 {
+                    s.on_chunk(t, &p, t / 25 + k, role == Role::Primary, 6_000, 5.0);
+                }
+            }
+            t += 250;
+        }
+        assert_eq!(s.primary(), Some(&2));
+    }
+
+    /// A subscribe whose answer never came (a lost ADMIT) is withdrawn, so
+    /// the forwarder's commitment cannot outlive this node's knowledge of it.
+    #[test]
+    fn an_unanswered_subscribe_is_withdrawn() {
+        let cfg = ControllerConfig::interactive();
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2]);
+        let mut rng = SplitMix64(9);
+        let mut log = DecisionLog::default();
+        let mut asked_at = None;
+        let mut withdrawn = false;
+        let mut t = 0;
+        while t < 12_000 && !withdrawn {
+            if t % 1_000 == 0 {
+                s.on_offer(t, offer(2, 4, &cfg), 20.0, &mut log);
+            }
+            for a in s.tick(t, &mut rng, &mut log) {
+                match a {
+                    SelectorAction::Subscribe { .. } => asked_at = asked_at.or(Some(t)),
+                    SelectorAction::Unsubscribe { parent: 2 } => withdrawn = true,
+                    SelectorAction::Unsubscribe { .. } => {}
+                }
+            }
+            t += 250;
+        }
+        let at = asked_at.expect("it asked");
+        assert!(withdrawn, "the unanswered subscribe is withdrawn");
+        assert!(t > at + REQUEST_TIMEOUT_MS, "only after the timeout");
+        assert!(s.primary().is_none());
+    }
+
+    /// A live call's stream idles until its host publishes. When it resumes,
+    /// the first chunk lands on ONE path: the other parent must not be charged
+    /// the idle gap as silence (it would fail over at once, and the publisher
+    /// would stop sending to this member). It owes chunks only from then on.
+    #[test]
+    fn a_resuming_stream_does_not_charge_the_idle_gap_to_the_slower_path() {
+        let mut cfg = ControllerConfig::interactive();
+        cfg.idle_aware_silence = true;
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2, 3]);
+        let mut rng = SplitMix64(5);
+        let mut log = DecisionLog::default();
+        let mut t = 0;
+        // Both parents up, nobody publishing, for 30 s: neither is suspected.
+        while t < 30_000 {
+            if t % 1_000 == 0 {
+                s.on_offer(t, offer(2, 4, &cfg), 20.0, &mut log);
+                s.on_offer(t, offer(3, 4, &cfg), 20.0, &mut log);
+            }
+            for a in s.tick(t, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    let d = AdmitDecision::Admit { role };
+                    let _ = s.on_decision(t, &parent, &d, &mut rng, &mut log);
+                }
+            }
+            t += 250;
+        }
+        let (p, st) = (
+            *s.primary().expect("primary"),
+            *s.standby().expect("standby"),
+        );
+        // The host starts publishing: the standby's copy lands first.
+        s.on_chunk(t, &st, 1, false, 100, 5.0);
+        let _ = s.tick(t + 250, &mut rng, &mut log);
+        assert_eq!(
+            s.primary(),
+            Some(&p),
+            "the idle gap is not the primary's silence"
+        );
+        assert_eq!(s.state_of(&p), Some(PeerState::Available));
+        // The primary really is silent while the stream runs: that counts.
+        let mut now = t + 250;
+        for k in 2..12 {
+            now += 250;
+            s.on_chunk(now, &st, k, false, 100, 5.0);
+            let _ = s.tick(now, &mut rng, &mut log);
+        }
+        assert_ne!(
+            s.state_of(&p),
+            Some(PeerState::Available),
+            "real silence is seen"
+        );
     }
 
     /// §6.5 / V1: with no member, the canonical carries audio only (never a

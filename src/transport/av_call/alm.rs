@@ -205,6 +205,7 @@ impl AlmState {
     ) -> Self {
         let mut cfg = ControllerConfig::interactive();
         cfg.idle_aware_silence = true;
+        cfg.direct_first = true;
         let mut own = Admission::publisher(me.to_owned(), cfg.clone(), None);
         own.set_members(members.iter().cloned());
         let fanout = (members.len().saturating_sub(1) as u64).clamp(1, PUBLISHER_INITIAL_FANOUT);

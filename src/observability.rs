@@ -951,12 +951,18 @@ pub const AV_FRAME_EXPIRED_LATE: &str = "av_frame_expired_late";
 /// ALM C5 — a media frame older than its class budget dropped from the
 /// inbound queue by age (oldest first) before it was opened.
 pub const AV_FRAME_STALE_DROPPED: &str = "av_frame_stale_dropped";
+/// #591 — a chunk a leg refused under backpressure: dropped for that leg,
+/// never queued. `av_send_congested` also counts control-frame retries; this
+/// counts media actually lost to it.
+pub const AV_CHUNK_DROPPED_CONGESTED: &str = "av_chunk_dropped_congested";
 /// ALM C5 — a leg shed to the base layer after sustained congestion.
 pub const AV_LEG_SHED_TO_BASE: &str = "av_leg_shed_to_base";
 /// ALM C5 — a leg restored from the base layer after clean sends.
 pub const AV_LEG_RESTORED: &str = "av_leg_restored";
 /// ALM C3 — a control frame sent / received / refused as malformed.
 pub const ALM_C3_SENT: &str = "alm_c3_sent";
+/// ALM C3 — a control frame that could not be sent to its member.
+pub const ALM_C3_SEND_FAILED: &str = "alm_c3_send_failed";
 /// ALM C3 — a control frame received and applied.
 pub const ALM_C3_RECEIVED: &str = "alm_c3_received";
 /// ALM C3 — a frame that read as C3 and did not decode.

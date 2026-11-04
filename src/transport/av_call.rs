@@ -111,7 +111,7 @@ use crate::transport::realtime_av::{
     StreamId, AV_CHUNK_WIRE_OVERHEAD,
 };
 use crate::transport::realtime_av_alm::controller::wire::{
-    collides_with_control_frame, decode as decode_c3, is_control_frame, WireFrame,
+    collides_with_control_frame, decode as decode_c3, is_control_frame, is_periodic, WireFrame,
 };
 use crate::transport::realtime_av_dispatcher::{
     open_hop_outer, AvDispatcherError, AvLinkReceiver as _, AvLinkSender as _, AvSubscriberLink,
@@ -132,6 +132,10 @@ pub const MEDIA_STALE_BUDGET: Duration = Duration::from_millis(800);
 const LEG_SHED_AFTER: u32 = 3;
 /// ALM C5 — consecutive clean sends before a shed leg is restored.
 const LEG_RESTORE_AFTER: u32 = 50;
+/// ALM C3 — how long a must-arrive frame is retried against a congested link.
+const C3_RESEND_BUDGET: Duration = Duration::from_secs(2);
+/// ALM C3 — the pause between those retries.
+const C3_RESEND_PAUSE: Duration = Duration::from_millis(25);
 
 /// The tag of the frame a publisher sends first on its own link, after the
 /// transit KEX: `"CHLO" ‖ version ‖ stream_id[32]`.
@@ -804,8 +808,14 @@ impl StreamWindow {
     }
 
     fn observe_gap(&mut self, gap: Duration) {
-        // EWMA, alpha = 1/4.
-        self.gap_ewma = (self.gap_ewma * 3 + gap) / 4;
+        // Fast attack, slow decay, as a jitter buffer: a slower second leg
+        // must widen the window before its next copies come due, or they
+        // arrive past their deadline while a symmetric average catches up.
+        self.gap_ewma = if gap > self.gap_ewma {
+            (self.gap_ewma + gap * 3) / 4
+        } else {
+            (self.gap_ewma * 3 + gap) / 4
+        };
     }
 }
 
@@ -1546,7 +1556,9 @@ impl Call {
             .map_err(|e| CallError::Plumbing(e.to_string()))?;
         let mut exclude: Vec<String> = Shared::lock(&self.shared.test_withhold)
             .as_ref()
-            .filter(|(_, n)| *n > 0 && chunk_seq.0 % n == 0)
+            // Only once the window has measured a gap (two rounds in): before
+            // that it runs on its prior, which this seam is not testing.
+            .filter(|(_, n)| *n > 0 && chunk_seq.0 >= 2 * n && chunk_seq.0 % n == 0)
             .map(|(peer, _)| vec![peer.clone()])
             .unwrap_or_default();
         // ALM: this stream goes only to the members that hold a commitment on
@@ -1659,6 +1671,13 @@ impl Call {
     #[doc(hidden)]
     pub fn stall_inbound_for_test(&self, d: Duration) {
         *Shared::lock(&self.shared.test_stall_until) = Some(Instant::now() + d);
+    }
+
+    /// Test seam: re-send this stream's binding on every leg now, as the
+    /// periodic re-announce does.
+    #[doc(hidden)]
+    pub async fn reannounce_for_test(&self) {
+        reannounce(&self.shared).await;
     }
 
     /// Test seam: withhold every `every`th own chunk from `member`'s leg.
@@ -2272,6 +2291,7 @@ fn note_leg_outcomes(
                 }
             }
             LegSend::Failed(AvDispatcherError::Congested) => {
+                shared.count(crate::observability::AV_CHUNK_DROPPED_CONGESTED);
                 alm.on_dropped(wire_len);
                 e.1 = 0;
                 e.0 = e.0.saturating_add(1);
@@ -2319,8 +2339,51 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
         if ok {
             Shared::lock(&shared.alm).counts.c3_sent += 1;
             shared.count(crate::observability::ALM_C3_SENT);
+        } else if is_periodic(&o.frame) {
+            // The next offer replaces it.
+            shared.count(crate::observability::ALM_C3_SEND_FAILED);
+        } else {
+            // Everything else changes state on one side only: it must arrive,
+            // and it must not hold up the pump or the watch tick waiting.
+            let s = Arc::clone(shared);
+            tokio::spawn(async move { resend_c3(&s, o).await });
         }
     }
+}
+
+/// Retry a C3 frame a congested link refused, until [`C3_RESEND_BUDGET`]
+/// (shorter than a subscriber's request timeout, so a late answer still
+/// counts). Each try is one send: the publisher lock is never held to wait.
+async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
+    let deadline = tokio::time::Instant::now() + C3_RESEND_BUDGET;
+    while tokio::time::Instant::now() < deadline && !shared.ended.load(Ordering::Relaxed) {
+        tokio::time::sleep(C3_RESEND_PAUSE).await;
+        let sent = shared
+            .publisher
+            .lock()
+            .await
+            .dispatcher_mut()
+            .send_control_to(&o.to, &o.frame)
+            .await;
+        let mut ok = matches!(sent, Some(LegSend::Sent));
+        if !ok {
+            let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
+            if let Some(s) = sender {
+                ok = crate::transport::realtime_av_dispatcher::AvLinkSender::send(
+                    s.as_ref(),
+                    &o.frame,
+                )
+                .await
+                .is_ok();
+            }
+        }
+        if ok {
+            Shared::lock(&shared.alm).counts.c3_sent += 1;
+            shared.count(crate::observability::ALM_C3_SENT);
+            return;
+        }
+    }
+    shared.count(crate::observability::ALM_C3_SEND_FAILED);
 }
 
 /// One C3 frame from `peer`. A dialler hearing the responder's CAPS on its
@@ -2607,27 +2670,54 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
         }
     };
     if shared.opts.relay && (installed || binding.publisher == peer) {
-        let wire = wire.to_vec();
         let except = vec![peer.to_owned(), binding.publisher.clone()];
+        let wire = Arc::new(wire.to_vec());
+        if installed {
+            // Before the chunks it keys, which this pump forwards next.
+            send_binding_paced(shared, &wire, &except).await;
+        } else {
+            // A publisher's periodic re-send passing through: never in the
+            // way of the chunks queued behind it on this pump.
+            let s = Arc::clone(shared);
+            tokio::spawn(async move { send_binding_paced(&s, &wire, &except).await });
+        }
+    }
+}
+
+/// Send a binding's parts on every leg but `except`, ONE PART PER HOLD of the
+/// publisher lock. A binding is about ten Channel messages on a base-MTU link;
+/// sent whole, it holds every publish and forward for the entire burst, and
+/// the chunks behind it miss their reorder deadlines. Between parts the media
+/// path runs (its legs are settling, so a chunk retries the window instead of
+/// being dropped).
+async fn send_binding_paced(shared: &Arc<Shared>, wire: &Arc<Vec<u8>>, except: &[String]) {
+    for i in 0.. {
+        let more = AtomicBool::new(false);
         shared
             .publisher
             .lock()
             .await
             .dispatcher_mut()
-            .send_control_report(&except, &|limit| StreamKeyBinding::parts(&wire, limit))
+            .send_control_report(except, &|limit| {
+                let part = StreamKeyBinding::parts(wire, limit).into_iter().nth(i);
+                if part.is_some() {
+                    more.store(true, Ordering::Relaxed);
+                }
+                part.into_iter().collect()
+            })
             .await;
+        if !more.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::task::yield_now().await;
     }
 }
 
 /// Re-send this stream's current binding on every leg (a receiver whose
 /// inbound queue dropped a part gets it again).
 async fn reannounce(shared: &Arc<Shared>) {
-    let mut publisher = shared.publisher.lock().await;
     let wire = Arc::clone(&Shared::lock(&shared.own_key).wire);
-    publisher
-        .dispatcher_mut()
-        .send_control_report(&[], &|limit| StreamKeyBinding::parts(&wire, limit))
-        .await;
+    send_binding_paced(shared, &wire, &[]).await;
 }
 
 /// What [`forward`] needs to know about one chunk.
@@ -2797,7 +2887,8 @@ async fn watch_loop(shared: Arc<Shared>) {
             announce_attendees(&shared).await;
         }
         if n % reannounce_ticks() == 0 {
-            reannounce(&shared).await;
+            let s = Arc::clone(&shared);
+            tokio::spawn(async move { reannounce(&s).await });
         }
         if let Err(CallError::CallEnded(_)) = roll_if_moved(&shared).await {
             return;

@@ -509,10 +509,29 @@ struct OutboundState {
     /// the burst does not cost the chunks right behind it. `None` outside a
     /// burst: a congested chunk is dropped at once (#591).
     settle_until: Option<std::time::Instant>,
+    /// ALM C5 — when this leg last carried a chunk: one idle for
+    /// [`MEDIA_IDLE`] restarts at the Channel's floor window (see
+    /// [`MEDIA_RAMP`]).
+    last_media: Option<std::time::Instant>,
 }
+
+/// ALM C5 — a leg with no media for this long counts as idle.
+pub const MEDIA_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// ALM C5 — how long a leg resuming from idle settles. The Channel opens at a
+/// window of 2 and grows on acks, so the first chunks of a call, or of a
+/// stream after a mute, outrun it on any path whose RTT exceeds the frame
+/// interval. That is ramp-up, not congestion: they retry (bounded, one
+/// resume) instead of being dropped. Sustained backpressure is untouched: a
+/// leg past its ramp drops at once (#591).
+pub const MEDIA_RAMP: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// CIRISEdge#805 — how long a leg settles after a control burst.
 pub const CONTROL_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+/// ALM C3 — how long a leg settles after one control frame. The Channel opens
+/// at a window of 2 and offers run at 1 Hz, so without it the chunk right
+/// behind an offer is refused and lost. Short, because a congested chunk
+/// retries under the fan-out: this bounds what a C3 frame can cost other legs.
+pub const C3_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
 /// CIRISEdge#805 — the pause between retries of a settling leg's chunk.
 const SETTLE_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
 
@@ -617,6 +636,7 @@ impl AvDispatcher {
                     sender: link.outbound_send,
                     policy: ReceiverLayerPolicy::UNCAPPED,
                     settle_until: None,
+                    last_media: None,
                 },
             );
         }
@@ -822,8 +842,9 @@ impl AvDispatcher {
     }
 
     /// ALM stage 2 — send one control frame (C3) to ONE subscriber's leg,
-    /// retrying brief backpressure, WITHOUT settling the leg (a C3 frame is
-    /// one small message, not a burst). `None` when `subscriber` has no leg.
+    /// retrying brief backpressure, and settle the leg for [`C3_SETTLE`] so
+    /// the frame does not cost the chunk behind it. `None` when `subscriber`
+    /// has no leg.
     pub async fn send_control_to(
         &mut self,
         subscriber: &PeerKeyId,
@@ -835,7 +856,11 @@ impl AvDispatcher {
         let mut tries = 0;
         loop {
             match state.sender.send(frame).await {
-                Ok(()) => return Some(LegSend::Sent),
+                Ok(()) => {
+                    let until = std::time::Instant::now() + C3_SETTLE;
+                    state.settle_until = Some(state.settle_until.map_or(until, |u| u.max(until)));
+                    return Some(LegSend::Sent);
+                }
                 Err(AvDispatcherError::Congested) if tries < TRIES => {
                     tries += 1;
                     tokio::time::sleep(PAUSE).await;
@@ -925,6 +950,15 @@ impl AvDispatcher {
             // its counter is spent — a nonce that might have been emitted is
             // never used twice.
             let wire = sealed.to_bytes();
+            let now = std::time::Instant::now();
+            if state
+                .last_media
+                .map_or(true, |t| now.duration_since(t) > MEDIA_IDLE)
+            {
+                let until = now + MEDIA_RAMP;
+                state.settle_until = Some(state.settle_until.map_or(until, |u| u.max(until)));
+            }
+            state.last_media = Some(now);
             let mut sent = state.sender.send_media(&wire).await;
             while matches!(sent, Err(AvDispatcherError::Congested))
                 && state
@@ -1115,6 +1149,7 @@ impl AvDispatcher {
                 sender: link.outbound_send,
                 policy: ReceiverLayerPolicy::UNCAPPED,
                 settle_until: None,
+                last_media: None,
             },
         );
         Ok(())

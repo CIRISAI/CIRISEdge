@@ -234,6 +234,12 @@ pub struct ControllerConfig {
     /// publishes; an idle stream is not a dead parent). The link closing is
     /// then the hard down signal. Off in the sim, whose streams never idle.
     pub idle_aware_silence: bool,
+    /// `FSD/CIRIS_MESH.md` R1: a viable direct path (the publisher itself,
+    /// depth 0) is taken before any relay, and a relay gives way to it. Off
+    /// in the stage-1 sim, whose worlds exercise publisher shedding by score;
+    /// on for live calls (a publisher with no room still sheds to relays:
+    /// it stops being viable).
+    pub direct_first: bool,
     /// Score weights.
     pub weights: ScoreWeights,
 }
@@ -272,6 +278,7 @@ impl ControllerConfig {
             latency_budget_ms: 400,
             max_depth: 3,
             idle_aware_silence: false,
+            direct_first: false,
             weights: ScoreWeights {
                 delivery: 0.45,
                 capacity: 0.15,
