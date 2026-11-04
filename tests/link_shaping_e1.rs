@@ -2122,10 +2122,7 @@ async fn e15_tier_one_refuses_a_stranger_with_a_referral_and_admits_the_protecte
         "the owner's device and the seat were admitted"
     );
     assert_eq!(r.transport.shaped_link_count(), 3);
-    assert!(
-        r.received(&row).await == false,
-        "the refused row stayed off"
-    );
+    assert!(!r.received(&row).await, "the refused row stayed off");
 }
 
 /// **Tier 2 on real links.** Two strangers' links close newest first, one step
@@ -2135,6 +2132,7 @@ async fn e15_tier_one_refuses_a_stranger_with_a_referral_and_admits_the_protecte
 /// no restart: the roster is the active one. Mutation: drop the owner's or the
 /// seat's exemption, read a baked roster, or never shed → this fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one tier's whole story, in order
 async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
     let t = star("t2", 0xa0, 5).await;
     let Star {
@@ -2513,9 +2511,8 @@ async fn e8_the_status_tracks_the_bound_the_class_and_the_peers() {
     assert!((figures.gap_s - reference_gap).abs() < 1e-9);
     assert_eq!(a.peers.len(), 1);
     assert_eq!(a.peers[0].shapes, Some(true));
-    assert_eq!(
+    assert!(
         t.b.transport.shaping_status().links[0].dialled_here,
-        true,
         "B dialled it"
     );
 

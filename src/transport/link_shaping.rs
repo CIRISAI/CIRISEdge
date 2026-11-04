@@ -1543,11 +1543,11 @@ impl ShapingFigures {
     /// nothing, which has no cost to state.
     #[must_use]
     pub fn of(policy: &ShapingPolicy, frame_bytes: u16) -> Option<Self> {
+        const MONTH_S: f64 = 2_592_000.0;
+        const GB: f64 = 1e9;
         if !policy.enabled() {
             return None;
         }
-        const MONTH_S: f64 = 2_592_000.0;
-        const GB: f64 = 1e9;
         let rate = f64::from(policy.bytes_per_s);
         let gap_s = f64::from(frame_bytes) / rate;
         let real = policy.rho * rate;
@@ -1613,6 +1613,7 @@ pub struct PeerShaping {
 /// **The typed status a host reads** (`FSD/PRIVACY_MODES.md` §6.6, E8): every
 /// value is read from the running shaper, policy or tier when asked.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[allow(clippy::struct_excessive_bools)] // each a separate fact a host reads
 pub struct ShapingStatus {
     /// The class this node offers: the link class the client cannot know.
     pub class: &'static str,
@@ -3875,7 +3876,7 @@ mod tests {
         t.peer_offer(link, &shaping_peer())
             .unwrap()
             .expect("shaped");
-        assert_eq!(answer.await.unwrap().unwrap(), true);
+        assert!(answer.await.unwrap().unwrap());
         t.set_service_tier(T::ChatAndContacts);
         assert_eq!(t.next_shed().await, None);
         let s = t.links_status();

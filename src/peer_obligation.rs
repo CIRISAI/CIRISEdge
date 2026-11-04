@@ -53,9 +53,9 @@ pub const OBLIGATION_READ_BACKOFF: Duration = Duration::from_secs(5);
 ///
 /// # Errors
 /// The directory's.
-pub async fn holds_active_seat(
+pub async fn holds_active_seat<S: std::hash::BuildHasher + Sync>(
     directory: &dyn FederationDirectory,
-    recognised: &HashSet<String>,
+    recognised: &HashSet<String, S>,
     peer: &str,
 ) -> Result<bool, ciris_persist::federation::Error> {
     if directory.lookup_canonical_withdrawal(peer).await?.is_some() {
@@ -81,14 +81,17 @@ impl SendSetRead for crate::replication::FederationDirectoryReplicationBridge {
     }
 }
 
+/// The owner's devices, `None` when the read failed.
+type OwnDevices = Option<Arc<HashSet<String>>>;
+
 /// The production [`PeerObligations`].
 pub struct LivePeerObligations {
     directory: Arc<dyn FederationDirectory>,
     local: String,
     recognised: Arc<RwLock<HashSet<String>>>,
     send_set: Arc<dyn SendSetRead>,
-    /// The owner's devices, `None` when the read failed.
-    memo: tokio::sync::Mutex<Option<(Instant, Option<Arc<HashSet<String>>>)>>,
+    /// When the owner's devices were read, and what came back.
+    memo: tokio::sync::Mutex<Option<(Instant, OwnDevices)>>,
     backoff_until: std::sync::Mutex<Option<Instant>>,
 }
 
@@ -133,7 +136,7 @@ impl LivePeerObligations {
     }
 
     /// The memo, read again once it is older than [`OBLIGATION_MEMO_TTL`].
-    async fn own_devices_now(&self) -> Option<Arc<HashSet<String>>> {
+    async fn own_devices_now(&self) -> OwnDevices {
         let mut memo = self.memo.lock().await;
         if let Some((at, own)) = memo.as_ref() {
             if at.elapsed() < OBLIGATION_MEMO_TTL {
