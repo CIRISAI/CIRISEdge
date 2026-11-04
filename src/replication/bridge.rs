@@ -229,6 +229,17 @@ pub enum ApplyRefusalClass {
     /// the standing is judged against is not held yet), which classifies as
     /// [`Self::RetryAfterRoster`] instead.
     RosterAuthorityUnauthorized,
+    /// persist's `roster_consensus_insufficient`: the voices do not meet the
+    /// group's protocol **as this node holds it**. Transient, because this is
+    /// also how a seated moderator's solo roster change reads while its
+    /// `delegates_to` is still replicating: the door falls through to the
+    /// protocol and the rule is the same one a short set gets. The rule cannot
+    /// tell the two apart and neither can edge, so a short set takes the
+    /// transient schedule too, which ends on the terminal one
+    /// ([`TRANSIENT_CAP_HITS_BEFORE_TERMINAL`](super::refusal_backoff::TRANSIENT_CAP_HITS_BEFORE_TERMINAL)).
+    /// Since persist v61.0.2 (#1195) a moderator is an appointment at every
+    /// protocol, so the appointment arriving late is the ordinary case.
+    RetryAfterStanding,
     /// persist#757 (AV-45) — a `community`-scoped row whose writer is NOT in
     /// the roster this node holds. Until persist v47.0.0 this and "roster not
     /// held yet" were one refusal, and edge called both transient; persist
@@ -261,6 +272,7 @@ impl ApplyRefusalClass {
         Self::CommunityRosterFork,
         Self::RetryAfterRoster,
         Self::RosterAuthorityUnauthorized,
+        Self::RetryAfterStanding,
         Self::NotACommunityMember,
         Self::NotAFamilyMember,
         Self::ThirdPartyRow,
@@ -277,6 +289,7 @@ impl ApplyRefusalClass {
             Self::CommunityRosterFork => "community_roster_fork",
             Self::RetryAfterRoster => "retry_after_roster",
             Self::RosterAuthorityUnauthorized => "roster_authority_unauthorized",
+            Self::RetryAfterStanding => "retry_after_standing",
             Self::NotACommunityMember => "not_a_community_member",
             Self::NotAFamilyMember => "not_a_family_member",
             Self::ThirdPartyRow => "third_party_row",
@@ -297,7 +310,10 @@ impl ApplyRefusalClass {
     /// indistinguishable from "roster not held yet" and rode as transient.)
     #[must_use]
     pub fn is_transient(self) -> bool {
-        matches!(self, Self::RetryAfterRoster | Self::RetryAfterConsent)
+        matches!(
+            self,
+            Self::RetryAfterRoster | Self::RetryAfterStanding | Self::RetryAfterConsent
+        )
     }
 
     /// CIRISEdge#544 — the same disposition, in the vocabulary the RETRY loop
@@ -333,12 +349,18 @@ impl ApplyRefusalClass {
         use ciris_persist::scope::ScopeRefusalReason as R;
         match err {
             E::WriteScopeRefused(R::MembershipUnresolved) => Some(Self::RetryAfterRoster),
-            // v49.0.0 (#908): standing not yet judgeable ⇒ transient; every other
-            // rule is a verdict about the signers, not about this node's state.
+            // v49.0.0 (#908): standing not yet judgeable ⇒ transient. The rules
+            // after the next arm are verdicts about the signers; the next arm
+            // depends on this node's state (`RetryAfterStanding`).
             E::RosterAuthorityUnauthorized { rule, .. }
                 if *rule == ciris_persist::federation::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED =>
             {
                 Some(Self::RetryAfterRoster)
+            }
+            E::RosterAuthorityUnauthorized { rule, .. }
+                if *rule == ciris_persist::federation::ROSTER_CONSENSUS_INSUFFICIENT =>
+            {
+                Some(Self::RetryAfterStanding)
             }
             E::RosterAuthorityUnauthorized { .. } => Some(Self::RosterAuthorityUnauthorized),
             E::WriteScopeRefused(R::NoCommunityMembership) => Some(Self::NotACommunityMember),
@@ -620,6 +642,15 @@ pub(crate) fn typed_terminal_verdict(
 /// `takedown_content_unbound` (no row binding the content is held yet). Every
 /// other token (`purge_tombstoned`, `trace_run_kind_mock`, the other takedown
 /// tokens, a terminal `purge_unauthorised` reason) is a verdict on the bytes.
+///
+/// One `takedown_unauthorised` is not: the DUTY verdict, the only one whose
+/// body names the `communities` it judged (persist `takedown_authority`).
+/// It reads this node's rows, so a takedown-scoped `delegates_to` still
+/// replicating moves it, the same ordering gap `DelegatedScopeUnauthorized`
+/// has on the `moderation:*` door. Since persist v61.0.2 (#1195) every holder
+/// but a founder and the content's subjects is such an appointment, and a
+/// terminal reading parked their notice for half an hour. The other bodies of
+/// that token are about the notice itself.
 fn purge_refusal_terminal(token: &'static str, body: &serde_json::Value) -> Option<&'static str> {
     use ciris_persist::federation::steward_purge::{token as purge, unauthorised_reason};
     use ciris_persist::federation::takedown_tombstone::token as takedown;
@@ -630,7 +661,9 @@ fn purge_refusal_terminal(token: &'static str, body: &serde_json::Value) -> Opti
             .is_some_and(unauthorised_reason::is_retryable);
         return (!retryable).then_some(token);
     }
-    if token == takedown::CONTENT_UNBOUND {
+    if token == takedown::CONTENT_UNBOUND
+        || (token == takedown::UNAUTHORISED && body.get("communities").is_some())
+    {
         return None;
     }
     Some(token)
@@ -12727,6 +12760,14 @@ pub(crate) mod tests {
                 RetryDisposition::Transient,
             ),
             (takedown(takedown::UNAUTHORISED), RetryDisposition::Terminal),
+            // The duty verdict: a `delegates_to` still replicating can move it.
+            (
+                E::PurgeRefused {
+                    token: takedown::UNAUTHORISED,
+                    body: serde_json::json!({"notice_id": "t-1", "communities": ["room"]}),
+                },
+                RetryDisposition::Transient,
+            ),
             (
                 takedown(takedown::NOT_BYTES_PLANE),
                 RetryDisposition::Terminal,
@@ -22101,6 +22142,76 @@ pub(crate) mod tests {
             .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some("node-carol"))
             .await
             .is_none());
+    }
+
+    /// persist v61.0.2 (CIRISPersist#1195) — **an appointment reaches a
+    /// member's node the way the act it licenses does.** A delegated
+    /// moderator's act is admitted only where the founder's `delegates_to` is
+    /// held, so both must clear the serve gate for the same peer. Both are
+    /// `federation` rows: a Rooted, consented peer is offered them, and an
+    /// unrooted peer neither.
+    #[tokio::test]
+    async fn an_appointment_is_served_where_the_moderation_act_it_licenses_is() {
+        let backend = audience_backend().await;
+        let mut room = crate::chat::pair_community("person-alice", "person-bob", Utc::now());
+        room.community_key_id = "chat-room".to_owned();
+        backend
+            .put_community(sign_community_fixture("room-authority", room))
+            .await
+            .expect("seed the room: alice founds it, so she holds the duty");
+        // In the send set, and sharing no root with us (`node-stranger` in this
+        // fixture is Rooted: a consented peer is).
+        register_fixture_keys(&backend, &[("node-unrooted", identity_type::NODE)]).await;
+        seed_consent_membership_unrooted(&backend, "node-alice-a", "node-unrooted").await;
+        let publish: Vec<String> = vec!["node-alice-a".into(), "person-alice".into()];
+        let selector: CohortProvider = Arc::new(move || publish.clone());
+        let bridge = bridge_over(&backend, &["node-carol", "node-unrooted"])
+            .with_local_key_id(Some("node-alice-a".into()))
+            .with_self_provider(Some(selector));
+        let appointment = uuid::Uuid::new_v4().to_string();
+        let mut edge = ciris_persist::federation::delegates_to_envelope(
+            "person-bob",
+            &["moderate".to_owned()],
+            true,
+        );
+        ciris_persist::federation::admission::DelegationTermBounds::until(
+            Utc::now() + chrono::Duration::days(90),
+        )
+        .stamp(&mut edge);
+        seed_scoped_attestation(
+            &backend,
+            &appointment,
+            "person-alice",
+            "person-bob",
+            "delegates_to",
+            "federation",
+            edge,
+        )
+        .await;
+        let act = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &act,
+            "person-alice",
+            "person-carol",
+            "scores",
+            "federation",
+            serde_json::json!({
+                "dimension": "moderation:conduct:v1",
+                "community_id": "chat-room",
+                "allegation_type": "conduct",
+            }),
+        )
+        .await;
+        for id in [&appointment, &act] {
+            let hash = hash_of(&backend, id).await;
+            assert!(is_offered(&bridge, "node-carol", hash).await, "{id}");
+            assert!(bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some("node-carol"))
+                .await
+                .is_some());
+            assert!(!is_offered(&bridge, "node-unrooted", hash).await, "{id}");
+        }
     }
 
     /// persist v52.0.0 (CIRISPersist#955) — **a membership proposal reaches

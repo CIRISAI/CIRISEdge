@@ -1,6 +1,6 @@
 # Quorum and pending decisions: edge's part
 
-**Status:** normative for CIRISEdge v44 (persist v61.0.0, CC 1.0-rc16).
+**Status:** normative for CIRISEdge v44 (persist v61.0.2, CC 1.0-rc16).
 **Ownership:** [CIRISConstitution#198](https://github.com/CIRISAI/CIRISConstitution/issues/198) §5. This document covers only edge's share.
 
 | owner | owns |
@@ -35,10 +35,20 @@ Anywhere else, persist refuses by rule. The widener logs the refusal and leaves 
 |---|---|---|
 | C1 | `membership:{proposal,acceptance,decline,widening,removal,resignation}`, `group:roster`, `objection:*`, `moderation:*` and `accord:invoke:*` rows reach the act's standing set promptly. An admitted row propagates on the round that admitted it (CIRISEdge#636). A row written locally kicks every peer on the Attestation plane at once (`note_local_write`), rather than waiting for the next cadence tick. | `tests/quorum_carriage_v44.rs` |
 | C2 | Cosignatures travel with their row byte-for-byte: edge re-signs, re-orders and strips nothing. | the strip-a-cosign mutation in C-e2e |
-| C3 | Edge never withdraws a cosigned act, and never drops or re-orders one. Rule 0, CC 2.4.1.1: only a cosigned `withdraws` retracts it, and that is the server's act. | edge has no producer of `withdraws` over a roster row |
+| C3 | Edge never withdraws a cosigned act, and never drops or re-orders one. Rule 0, CC 2.4.1.1: only a cosigned `withdraws` retracts it, and that is the server's act. | edge has no producer of `withdraws` over a roster row; `one_signer_never_withdraws_a_cosigned_row` |
 | C4 | Edge stamps no window instant and carries the bytes untouched. A window is measured by EACH NODE from when it first held the proposal (CC 3.3.6.3; the halt fuse likewise, CC 4.2.1.1), never from a signer's own instant: `cosigned_at` stays beside the bytes and never decides a window, since a signer-chosen instant would let a late cosigner backdate into a closed window. That measurement is persist's, at each node. | the late-objection case in C-e2e |
 
 **Window basis (CC correction, 2026-11-02):** v61 judges the `open:self_admit` removal window (259 200 s) on the **local door's receipt**, and that is the CC's rule, not a gap: each node measures the window from when it first held the proposal (CC 3.3.6.3), never from a cosignature's signed instant. CIRISPersist#1189 (asking for a signed instant per cosignature) is superseded by that correction. Edge carries what persist defines and stamps nothing.
+
+## 2.1 Duties and removals since persist v61.0.2
+
+Edge reads no duty and counts no voice, so these changed verdicts at persist's door and no edge decision. They do change what the carriage has to guarantee.
+
+- **A duty is an appointment (CIRISPersist#1195).** `moderate`, `takedown` and `review` are held by a room's active, steward-bound founders and the keys they delegate each duty to, at every protocol. `community_authority_set_for` still answers who may sign. Edge has no appointment producer: `delegates_to` is the server's, and edge carries it.
+- **An act can outrun its appointment.** An appointment and the act it licenses are `federation` rows that clear the same serve gate, but nothing orders them. A refusal that a held `delegates_to` could change is therefore transient: the `moderation:*` door's `federation_delegated_scope_unauthorized`, the duty verdict of `takedown_unauthorised` (the body naming `communities`), and `roster_consensus_insufficient`, which is what a seated moderator's solo roster change reads as before its appointment lands (`ApplyRefusalClass::RetryAfterStanding`). `roster_consensus_insufficient` from a short set takes the same schedule, which ends on the terminal one. The rule does not tell the two apart.
+- **A `unanimous` removal is every other member (CIRISPersist#1192),** and those voices are a strict majority of the roster. At two members nobody is removable. A removal the removed member signs is their resignation. Admissions and subject-less roster changes still need everyone.
+
+Witnesses are in `tests/quorum_carriage_v44.rs`. A room with no active founder has no moderator and no way to appoint one yet (tracked on CIRISPersist#1195). `chat::community` refuses to build one, so edge's own producers do not reach that state.
 
 ## 3. Decision-relevant rows: event and cursor (`decision_rows`)
 

@@ -22,6 +22,14 @@
 //! 4. **Carriage that strips a cosignature changes the outcome** (the
 //!    mutation): the stripped row is refused on the node it reaches, and the
 //!    intact one is admitted.
+//! 5. **A duty is an appointment** (persist v61.0.2): a plain member's
+//!    moderation act and takedown are refused everywhere, a founder's and a
+//!    delegate's pass, and a delegate's act that outran its appointment lands
+//!    with it.
+//! 6. **A `unanimous` removal is every other member**; at two nobody is
+//!    removable and resignation is the exit.
+//! 7. **A moderator's removal that outran its appointment lands with it.**
+//! 8. **Rule 0:** one signer never withdraws a cosigned row.
 
 #![cfg(feature = "transport-reticulum")]
 
@@ -35,14 +43,21 @@ use ciris_edge::membership::{self, GroupScope, MembershipWidener};
 use ciris_edge::replication::bridge::FederationDirectoryReplicationBridge;
 use ciris_edge::replication::directory::ReplicationDirectory as _;
 use ciris_edge::replication::protocol::EnvelopeKind;
+use ciris_edge::replication::refusal_backoff::RetryDisposition;
 use ciris_edge::replication::summary::ApplyOutcome;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
+use ciris_persist::federation::admission::DelegationTermBounds;
 use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
-use ciris_persist::federation::types::consensus_protocol;
-use ciris_persist::federation::{Attestation, FederationDirectory, SignedAttestation};
+use ciris_persist::federation::attestation_emit;
+use ciris_persist::federation::envelope::EnvelopeCore;
+use ciris_persist::federation::types::{attestation_type, cohort_scope, consensus_protocol};
+use ciris_persist::federation::{
+    Attestation, EmitAttestationInput, FederationDirectory, SignedAttestation,
+};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
 use ciris_persist::store::sqlite::SqliteBackend;
+use sha2::Digest as _;
 
 fn ts() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
@@ -585,4 +600,606 @@ async fn a_cosigned_widening_lands_alike_everywhere_and_a_short_set_nowhere() {
         1,
         "concurrent assembly yields one row"
     );
+}
+
+// ── Duties are appointments (persist v61.0.2, CIRISPersist#1195) ─────────────
+
+/// One row, signed by `pen` through persist's own emit recipe.
+async fn signed_row(
+    mut input: EmitAttestationInput,
+    pen: &ciris_edge::identity::LocalSigner,
+) -> Attestation {
+    let canonical =
+        attestation_emit::stamp_and_canonicalize(&mut input, &pen.key_id, chrono::Utc::now())
+            .expect("stamp");
+    let sig = ciris_edge::identity::sign_hybrid_raw(pen, &canonical, "witness row")
+        .await
+        .expect("sign");
+    attestation_emit::assemble(pen.key_id.clone(), &canonical, sig, input)
+        .expect("assemble")
+        .0
+}
+
+/// The edge a host signs to appoint: `Engine::add_moderator`'s shape, a
+/// `delegates_to` keyed by its recipient, at `federation`, under a term.
+async fn appoint(by: &Party, to: &Party, duty: &str) -> Attestation {
+    let mut envelope = ciris_persist::federation::delegates_to_envelope(
+        &to.person.key_id,
+        &[duty.to_owned()],
+        true,
+    );
+    DelegationTermBounds::until(chrono::Utc::now() + chrono::Duration::days(90))
+        .stamp(&mut envelope);
+    let mut input = EmitAttestationInput::with_envelope(
+        attestation_type::DELEGATES_TO,
+        EnvelopeCore::from_value(envelope).expect("object"),
+        cohort_scope::FEDERATION,
+    );
+    input.attested_key_id = Some(to.person.key_id.clone());
+    signed_row(input, &by.person).await
+}
+
+/// A moderation act on `target` in `room`: the row CIRISServer's
+/// `emit_moderation_event` puts on the mesh.
+async fn moderation_act(by: &Party, room: &str, target: &Party, tag: &str) -> Attestation {
+    let mut input = EmitAttestationInput::with_envelope(
+        attestation_type::SCORES,
+        EnvelopeCore::from_value(serde_json::json!({
+            "dimension": "moderation:conduct:v1",
+            "community_id": room,
+            "allegation_type": "conduct",
+            "payload": { "tag": tag },
+        }))
+        .expect("object"),
+        cohort_scope::FEDERATION,
+    );
+    input.attested_key_id = Some(target.person.key_id.clone());
+    input.subject_key_ids = vec![target.person.key_id.clone()];
+    signed_row(input, &by.person).await
+}
+
+/// `author`'s row in `room` binding `sha`, the envelope naming the room by
+/// `member`.
+async fn content_row(author: &Party, room: &str, member: &str, sha: &str) -> Attestation {
+    let mut envelope = serde_json::json!({
+        "dimension": "content:established:v1",
+        "score": 1.0,
+        "confidence": 1.0,
+        "evidence_refs": [sha],
+    });
+    envelope[member] = room.into();
+    signed_row(
+        EmitAttestationInput::with_envelope(
+            attestation_type::SCORES,
+            EnvelopeCore::from_value(envelope).expect("object"),
+            cohort_scope::COMMUNITY,
+        ),
+        &author.person,
+    )
+    .await
+}
+
+/// A `takedown_notice:dmca512:v1` row signed by `by` over `sha`.
+async fn takedown_notice(by: &Party, sha: &str) -> Attestation {
+    let basis = "dmca512";
+    let mut input = EmitAttestationInput::with_envelope(
+        attestation_type::SCORES,
+        EnvelopeCore::from_value(serde_json::json!({
+            "dimension": ciris_persist::federation::takedown_tombstone::notice_dimension(basis),
+            "score": -1.0,
+            "confidence": 1.0,
+            "subject_kind": "takedown_notice",
+            "content_sha256": sha,
+            "claimant_key_id": by.person.key_id,
+            "legal_basis": basis,
+            "jurisdiction": "US",
+            "good_faith_statement": "good faith",
+            "claim_text": "claim",
+        }))
+        .expect("object"),
+        cohort_scope::FEDERATION,
+    );
+    input.expires_at = Some(chrono::Utc::now() + chrono::Duration::days(30));
+    signed_row(input, &by.person).await
+}
+
+/// `who` joins `room` on `founding`'s node: consent, then every seated voice.
+async fn seat(
+    founding: &Node,
+    room: &str,
+    founder: &Party,
+    seated: &[&Party],
+    who: &Party,
+    n: i64,
+) {
+    consent(&founding.dir, room, founder, who).await;
+    let pens: Vec<&ciris_edge::identity::LocalSigner> = seated.iter().map(|p| &*p.person).collect();
+    assert!(ciris_edge::community_roster::widen_community(
+        &*founding.dir,
+        room,
+        &who.person.key_id,
+        None,
+        at(n),
+        &pens,
+    )
+    .await
+    .expect("every seated voice seats a member"));
+}
+
+async fn apply(to: &Node, row: &Attestation, from: &Party) -> ApplyOutcome {
+    to.bridge
+        .apply_envelope_bytes(
+            EnvelopeKind::Attestation,
+            &serde_json::to_vec(row).expect("wire"),
+            Some(&from.node.key_id),
+        )
+        .await
+}
+
+#[track_caller]
+fn refused_as(outcome: &ApplyOutcome, token: &str) -> RetryDisposition {
+    let ApplyOutcome::Refused { reason, retry, .. } = outcome else {
+        panic!("expected a refusal naming {token}: {outcome:?}");
+    };
+    assert!(reason.contains(token), "expected {token}: {reason}");
+    *retry
+}
+
+async fn held(n: &Node, row: &Attestation) -> bool {
+    n.dir
+        .get_attestation(&row.attestation_id)
+        .await
+        .expect("read")
+        .is_some()
+}
+
+/// A room of seven under `protocol` on three nodes: alice founds it; mo and
+/// tess are seated and will be appointed; bob, carol and dave stay plain
+/// members; zoe authors the content, which makes her its subject and so a
+/// takedown holder in her own right.
+struct DutyRoom {
+    alice: Party,
+    bob: Party,
+    carol: Party,
+    dave: Party,
+    mo: Party,
+    tess: Party,
+    zoe: Party,
+    nodes: [Node; 3],
+    room: String,
+}
+
+async fn duty_room(protocol: &str) -> DutyRoom {
+    let alice = party("alice", 0x11);
+    let bob = party("bob", 0x22);
+    let carol = party("carol", 0x33);
+    let dave = party("dave", 0x44);
+    let mo = party("mo", 0x55);
+    let tess = party("tess", 0x66);
+    let zoe = party("zoe", 0x77);
+    let all = [&alice, &bob, &carol, &dave, &mo, &tess, &zoe];
+    let na = node(&alice, &all, None).await;
+    let nb = node(&bob, &all, None).await;
+    let nm = node(&mo, &all, None).await;
+    let room = found_room(&alice, protocol, &[&na, &nb, &nm]).await;
+    for (i, who) in all[1..].iter().copied().enumerate() {
+        let n = i64::try_from(i + 1).expect("a small room");
+        seat(&na, &room, &alice, &all[..=i], who, n).await;
+    }
+    for n in [&nb, &nm] {
+        carry_room(&na.bridge, &n.bridge, &room).await;
+        assert_eq!(
+            active(&n.dir, &room).await.len(),
+            7,
+            "{protocol}: the room lands on every node"
+        );
+    }
+    DutyRoom {
+        alice,
+        bob,
+        carol,
+        dave,
+        mo,
+        tess,
+        zoe,
+        nodes: [na, nb, nm],
+        room,
+    }
+}
+
+const DUTY_REFUSED: &str = "federation_delegated_scope_unauthorized";
+const TAKEDOWN_REFUSED: &str = "takedown_unauthorised";
+
+/// **5. A duty is an appointment, at every protocol, on every node** (persist
+/// v61.0.2, CIRISPersist#1195; CC 4.5.4, 4.5.13). Each plain member of a room
+/// of seven signs for the room and holds no duty: their moderation act and their
+/// takedown are refused by every node's door and not held. The founder's pass.
+/// A delegate's pass exactly where the appointment is held, and an act that
+/// outran its appointment lands when the appointment does, because the refusal
+/// is transient at the carriage layer. A delegated duty confers no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // the whole flow, per protocol, on purpose
+async fn a_duty_is_an_appointment_at_every_protocol_on_every_node() {
+    use ciris_persist::federation::admission::{
+        community_authority_set_for, moderators_of, DELEGATION_SCOPE_MODERATE,
+        DELEGATION_SCOPE_REVIEW, DELEGATION_SCOPE_TAKEDOWN,
+    };
+    for protocol in [
+        consensus_protocol::MAJORITY,
+        consensus_protocol::UNANIMOUS,
+        // M is absolute, and a room edge founds has one signer: a larger M
+        // could not seat its second member. One voice signing for the room is
+        // also the sharpest case for "a signer holds no duty".
+        "quorum:1/4",
+    ] {
+        let r = Box::pin(duty_room(protocol)).await;
+        let room = r.room.as_str();
+        let [na, nb, nm] = &r.nodes;
+        let plain = [&r.bob, &r.carol, &r.dave];
+        let sha = hex::encode(sha2::Sha256::digest(protocol.as_bytes()));
+        let content = content_row(&r.zoe, room, "community_id", &sha).await;
+        for n in &r.nodes {
+            let bound = apply(n, &content, &r.zoe).await;
+            assert!(
+                matches!(bound, ApplyOutcome::Admitted | ApplyOutcome::Duplicate),
+                "{protocol}: {bound:?}"
+            );
+        }
+
+        // Who may sign is a different question, and it is unchanged.
+        let record = na.dir.lookup_community(room).await.unwrap().unwrap();
+        let signers = community_authority_set_for(&*na.dir, &record)
+            .await
+            .unwrap();
+        for duty in [
+            DELEGATION_SCOPE_MODERATE,
+            DELEGATION_SCOPE_TAKEDOWN,
+            DELEGATION_SCOPE_REVIEW,
+        ] {
+            assert_eq!(
+                moderators_of(&*na.dir, room, duty).await.unwrap(),
+                vec![r.alice.person.key_id.clone()],
+                "{protocol}/{duty}: the founder alone, before any appointment"
+            );
+        }
+
+        // Every plain member, on every node.
+        for who in plain {
+            assert!(signers.contains(&who.person.key_id), "{protocol}: a signer");
+            let act = moderation_act(who, room, &r.tess, "plain").await;
+            let notice = takedown_notice(who, &sha).await;
+            for n in &r.nodes {
+                refused_as(&apply(n, &act, who).await, DUTY_REFUSED);
+                refused_as(&apply(n, &notice, who).await, TAKEDOWN_REFUSED);
+                assert!(
+                    !held(n, &act).await,
+                    "{protocol}: a refused act is not held"
+                );
+                assert!(!held(n, &notice).await, "{protocol}: nor a refused notice");
+            }
+        }
+
+        // The founder's pass on every node.
+        let act = moderation_act(&r.alice, room, &r.tess, "founder").await;
+        let notice = takedown_notice(&r.alice, &sha).await;
+        for n in &r.nodes {
+            assert!(apply(n, &act, &r.alice).await.is_admitted(), "{protocol}");
+            assert!(
+                apply(n, &notice, &r.alice).await.is_admitted(),
+                "{protocol}"
+            );
+        }
+
+        // A plain member's own edge roots nothing.
+        let forged = appoint(&r.bob, &r.mo, DELEGATION_SCOPE_MODERATE).await;
+        let _ = nb
+            .dir
+            .put_attestation(SignedAttestation {
+                attestation: forged,
+            })
+            .await;
+        let act = moderation_act(&r.mo, room, &r.tess, "self-appointed").await;
+        refused_as(&apply(nb, &act, &r.mo).await, DUTY_REFUSED);
+
+        // The appointments exist only on the founder's node so far, and the
+        // delegates' acts outrun them to bob's node.
+        let moderate = appoint(&r.alice, &r.mo, DELEGATION_SCOPE_MODERATE).await;
+        let takedown = appoint(&r.alice, &r.tess, DELEGATION_SCOPE_TAKEDOWN).await;
+        for row in [&moderate, &takedown] {
+            assert!(apply(na, row, &r.alice).await.is_admitted(), "{protocol}");
+        }
+        let act = moderation_act(&r.mo, room, &r.tess, "delegated").await;
+        let notice = takedown_notice(&r.tess, &sha).await;
+        assert!(apply(na, &act, &r.mo).await.is_admitted(), "{protocol}");
+        assert!(
+            apply(na, &notice, &r.tess).await.is_admitted(),
+            "{protocol}"
+        );
+        for n in [nb, nm] {
+            assert_eq!(
+                refused_as(&apply(n, &act, &r.mo).await, DUTY_REFUSED),
+                RetryDisposition::Transient,
+                "{protocol}: the next round re-offers it"
+            );
+            assert_eq!(
+                refused_as(&apply(n, &notice, &r.tess).await, TAKEDOWN_REFUSED),
+                RetryDisposition::Transient,
+                "{protocol}: a notice waits for its appointment, it is not parked"
+            );
+        }
+        for n in [nb, nm] {
+            for row in [&moderate, &takedown] {
+                assert!(apply(n, row, &r.alice).await.is_admitted(), "{protocol}");
+            }
+            assert!(apply(n, &act, &r.mo).await.is_admitted(), "{protocol}");
+            assert!(apply(n, &notice, &r.tess).await.is_admitted(), "{protocol}");
+        }
+
+        // A delegated duty confers no other.
+        let notice = takedown_notice(&r.mo, &sha).await;
+        for n in &r.nodes {
+            refused_as(&apply(n, &notice, &r.mo).await, TAKEDOWN_REFUSED);
+        }
+        let act = moderation_act(&r.tess, room, &r.bob, "takedown-only").await;
+        for n in &r.nodes {
+            refused_as(&apply(n, &act, &r.tess).await, DUTY_REFUSED);
+        }
+    }
+}
+
+/// **The room member a chat row names is the member a takedown reads.** Edge
+/// names the room `community_key_id` on every row it writes, persist's
+/// canonical cohort target, and `takedown_tombstone::content_binding` reads
+/// `community_id` alone. So content in a room binds no community, and the
+/// room's own founder holds no takedown over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "fails on persist v61.0.2: content_binding reads `community_id` only"]
+async fn a_founder_can_take_down_what_a_chat_row_binds_into_the_room() {
+    let r = Box::pin(duty_room(consensus_protocol::MAJORITY)).await;
+    let [na, ..] = &r.nodes;
+    let sha = hex::encode(sha2::Sha256::digest(b"a chat blob"));
+    let row = content_row(&r.zoe, &r.room, ciris_edge::chat::FIELD_COMMUNITY_ID, &sha).await;
+    assert!(apply(na, &row, &r.zoe).await.is_admitted());
+    let notice = takedown_notice(&r.alice, &sha).await;
+    let outcome = apply(na, &notice, &r.alice).await;
+    assert!(outcome.is_admitted(), "{outcome:?}");
+}
+
+/// **6. A `unanimous` removal is every other member, and at two nobody is
+/// removable** (persist v61.0.2, CIRISPersist#1192; CC 3.1.3.2). One founder
+/// cannot remove the other; the removed member's own signature is a
+/// resignation, the only exit at two. At three and four one short is refused
+/// on every node and the full set of others lands, without the removed member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_unanimous_removal_is_every_other_member_and_at_two_nobody_is_removable() {
+    use ciris_edge::chat::pair_community;
+    let alice = party("alice", 0x11);
+    let bob = party("bob", 0x22);
+    let carol = party("carol", 0x33);
+    let dave = party("dave", 0x44);
+    let all = [&alice, &bob, &carol, &dave];
+    let a = node(&alice, &all, None).await;
+    let b = node(&bob, &all, None).await;
+
+    // Two founders: the pair room's end state, and the shape it signs.
+    let opened = ciris_edge::chat::open_pair_room(
+        &*a.dir,
+        &alice.person.key_id,
+        &bob.person.key_id,
+        ts(),
+        chrono::Utc::now() + chrono::Duration::days(7),
+        &alice.person,
+    )
+    .await
+    .expect("the pair room");
+    let proposal = opened.proposal.expect("bob is proposed");
+    let pair = opened.room;
+    assert_eq!(
+        pair_community(&alice.person.key_id, &bob.person.key_id, ts()).consensus_protocol,
+        consensus_protocol::UNANIMOUS
+    );
+    membership::reply(&*a.dir, &proposal.attestation_id, true, &bob.person)
+        .await
+        .expect("bob accepts");
+    assert!(ciris_edge::community_roster::widen_community(
+        &*a.dir,
+        &pair,
+        &bob.person.key_id,
+        Some(MEMBER_ROLE_FOUNDER),
+        at(1),
+        &[&alice.person],
+    )
+    .await
+    .expect("the acceptance is the second voice"));
+    let removal = RosterEvent::revocation(&pair, &bob.person.key_id, at(2), None, &[]);
+    let err = assemble(
+        &*a.dir,
+        &removal,
+        vec![cosign(&removal, &alice.person).await.expect("sign")],
+    )
+    .await
+    .expect_err("at two, one voice is no majority");
+    assert!(
+        err.contains(ciris_persist::federation::ROSTER_CONSENSUS_INSUFFICIENT),
+        "{err}"
+    );
+    assert_eq!(active(&a.dir, &pair).await, sorted(&[&alice, &bob]));
+    // Resignation is the exit, and it needs no one else.
+    let resignation = RosterEvent::revocation(&pair, &bob.person.key_id, at(3), None, &[]);
+    assert!(assemble(
+        &*a.dir,
+        &resignation,
+        vec![cosign(&resignation, &bob.person).await.expect("sign")],
+    )
+    .await
+    .expect("a member leaves on their own signature"));
+    assert_eq!(active(&a.dir, &pair).await, sorted(&[&alice]));
+
+    // Three, then four.
+    let room = found_room(&alice, consensus_protocol::UNANIMOUS, &[&a, &b]).await;
+    seat(&a, &room, &alice, &[&alice], &bob, 1).await;
+    seat(&a, &room, &alice, &[&alice, &bob], &carol, 2).await;
+    seat(&a, &room, &alice, &[&alice, &bob, &carol], &dave, 3).await;
+    carry_room(&a.bridge, &b.bridge, &room).await;
+    assert_eq!(active(&b.dir, &room).await, sorted(&all));
+
+    // Four: two of the three others is one short, three is every other.
+    let removal = RosterEvent::revocation(&room, &dave.person.key_id, at(4), None, &[]);
+    let short = cosign_all(&removal, &[&alice.person, &bob.person])
+        .await
+        .expect("sign");
+    let err = assemble(&*a.dir, &removal, short)
+        .await
+        .expect_err("one other short");
+    assert!(
+        err.contains(ciris_persist::federation::ROSTER_CONSENSUS_INSUFFICIENT),
+        "{err}"
+    );
+    let every_other = cosign_all(&removal, &[&alice.person, &bob.person, &carol.person])
+        .await
+        .expect("sign");
+    assert!(assemble(&*a.dir, &removal, every_other)
+        .await
+        .expect("every other member removes, and the removed one is not a voice"));
+
+    // Three: the same on the smaller roster.
+    let removal = RosterEvent::revocation(&room, &carol.person.key_id, at(5), None, &[]);
+    assert!(assemble(
+        &*a.dir,
+        &removal,
+        cosign_all(&removal, &[&alice.person, &bob.person])
+            .await
+            .expect("sign"),
+    )
+    .await
+    .expect("two others of three remove the third"));
+
+    // The rows carry, and the same roster lands on the other node.
+    let outcomes = carry_room(&a.bridge, &b.bridge, &room).await;
+    assert_eq!(
+        active(&b.dir, &room).await,
+        sorted(&[&alice, &bob]),
+        "{outcomes:?}"
+    );
+}
+
+/// **7. A seated moderator's removal waits for its appointment.** The founder
+/// appoints mo and mo removes dave alone on the founder's node. On a node that
+/// has not held the appointment yet the row reads as a short set: the refusal
+/// must be transient, or a good removal sits out the terminal schedule while
+/// the roster reads differently on two nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_moderators_removal_that_outran_its_appointment_lands_with_it() {
+    use ciris_persist::federation::admission::DELEGATION_SCOPE_MODERATE;
+    let r = Box::pin(duty_room(consensus_protocol::MAJORITY)).await;
+    let [na, nb, _] = &r.nodes;
+    let room = r.room.as_str();
+    let edge = appoint(&r.alice, &r.mo, DELEGATION_SCOPE_MODERATE).await;
+    assert!(apply(na, &edge, &r.alice).await.is_admitted());
+    let removal = RosterEvent::revocation(
+        room,
+        &r.dave.person.key_id,
+        chrono::Utc::now(),
+        Some("by the moderator"),
+        &[],
+    );
+    assert!(assemble(
+        &*na.dir,
+        &removal,
+        vec![cosign(&removal, &r.mo.person).await.expect("sign")],
+    )
+    .await
+    .expect("a named moderator has standing alone"));
+    let rows = served(&na.bridge, |row| {
+        dimension(row).starts_with("membership:removal:")
+    })
+    .await;
+    let (_, bytes) = rows.first().expect("the removal is served");
+    let early = nb
+        .bridge
+        .apply_envelope_bytes(EnvelopeKind::Attestation, bytes, Some(&r.mo.node.key_id))
+        .await;
+    assert_eq!(
+        refused_as(
+            &early,
+            ciris_persist::federation::ROSTER_CONSENSUS_INSUFFICIENT
+        ),
+        RetryDisposition::Transient,
+        "{early:?}"
+    );
+    assert!(active(&nb.dir, room).await.contains(&r.dave.person.key_id));
+    assert!(apply(nb, &edge, &r.alice).await.is_admitted());
+    let landed = nb
+        .bridge
+        .apply_envelope_bytes(EnvelopeKind::Attestation, bytes, Some(&r.mo.node.key_id))
+        .await;
+    assert!(landed.is_admitted(), "{landed:?}");
+    assert_eq!(active(&nb.dir, room).await, active(&na.dir, room).await);
+}
+
+/// **8. Rule 0: one signer does not withdraw a cosigned row** (CC 2.4.1.1).
+/// Each of the row's two cosigners, the founder who did not sign and the
+/// member it seated each offer a lone `withdraws` of a cosigned widening. Each
+/// is refused where it is carried, and the row, its cosignatures and the seat
+/// stand on every node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_signer_never_withdraws_a_cosigned_row() {
+    let ([alice, bob, carol, dave], [na, nb, nc, nd], room) =
+        Box::pin(room_of_three_plus_dave()).await;
+    let event = RosterEvent::widening(&room, &dave.person.key_id, None, at(3));
+    let voices = vec![
+        cosign(&event, &bob.person).await.expect("bob"),
+        cosign(&event, &carol.person).await.expect("carol"),
+    ];
+    assert!(assemble(&*nb.dir, &event, voices)
+        .await
+        .expect("two of three"));
+    let is_dave = |r: &Attestation| {
+        dimension(r).starts_with("membership:widening:")
+            && r.attestation_envelope
+                .to_string()
+                .contains(&dave.person.key_id)
+    };
+    let rows = served(&nb.bridge, |r| in_room(&room)(r) && is_dave(r)).await;
+    let (row, bytes) = rows.first().cloned().expect("the widening is served");
+    for n in [&na, &nc, &nd] {
+        let landed = n
+            .bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &bytes, Some(&bob.node.key_id))
+            .await;
+        assert!(landed.is_admitted(), "{landed:?}");
+    }
+    assert!(!row.additional_scrubs.is_empty(), "a cosigned row");
+
+    let want = sorted(&[&alice, &bob, &carol, &dave]);
+    for signer in [&alice, &bob, &carol, &dave] {
+        let mut input = EmitAttestationInput::with_envelope(
+            attestation_type::WITHDRAWS,
+            EnvelopeCore::from_value(
+                ciris_persist::federation::replication::withdraws_attestation_envelope(
+                    &row.attestation_id,
+                    &row.attestation_type,
+                ),
+            )
+            .expect("object"),
+            cohort_scope::FEDERATION,
+        );
+        input.attested_key_id = Some(row.attested_key_id.clone());
+        let lone = signed_row(input, &signer.person).await;
+        for n in [&na, &nb, &nc, &nd] {
+            // By the tally: a refusal for anything else would witness nothing.
+            refused_as(
+                &apply(n, &lone, signer).await,
+                ciris_persist::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+            );
+            assert_eq!(active(&n.dir, &room).await, want, "the seat stands");
+            let still = n
+                .dir
+                .get_attestation(&row.attestation_id)
+                .await
+                .expect("read")
+                .expect("the row stands");
+            assert_eq!(still.additional_scrubs, row.additional_scrubs);
+        }
+    }
 }

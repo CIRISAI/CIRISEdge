@@ -6,7 +6,7 @@
 //! Persist reads only `transit_kex_pubkeys` off a signed
 //! `transport_destination` row; the CC's own member, `onion_hop_pubkeys`, and
 //! the `onion_relay` opt-out marker arrive with CIRISPersist#1181, which
-//! persist v61.0.1 does not carry. Until then [`HOP_KEY_SOURCE`] is
+//! persist v61.0.2 does not carry. Until then [`HOP_KEY_SOURCE`] is
 //! [`HopKeySource::TransitStandIn`]: [`hop_key_for`] returns the transit pair
 //! (the same two halves, ML-KEM-768 and X25519) and the node decapsulates with
 //! its transit custody in the split form ([`local_hop_secret_from_transit`]).

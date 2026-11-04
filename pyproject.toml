@@ -105,8 +105,17 @@ classifiers = [
 # DIRECTORY_ABI_VERSION stays 7); the floor moves with the MAJOR.
 # v61.0.0 moves DIRECTORY_ABI_VERSION to 12 (the six framed group listings,
 # ApplyReplicatedCommunity and the member listing leave the capsule).
+#
+# v61.0.2 (CIRISPersist#1195, #1192) is a PATCH that moves none of the four ABI
+# constants and still moves the floor, because the fix lives on the wheel's side
+# of the capsule. Under pyo3 edge's `Arc<dyn FederationDirectory>` is
+# `build_ops_directory`'s proxy: every door call dispatches inside the wheel's
+# `.so`. A 61.0.1 wheel loads clean beside this cdylib (DIRECTORY_ABI_VERSION is
+# 12 on both) and goes on admitting a plain member's `moderation:*` row and
+# counting the removed member as a voice on a `unanimous` removal. No gate fires:
+# only this line can exclude that wheel.
 dependencies = [
-    "ciris-persist>=61,<62",
+    "ciris-persist>=61.0.2,<62",
 ]
 dynamic = ["version"]
 

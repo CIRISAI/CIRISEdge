@@ -45,10 +45,18 @@
 //! envelope) to reach a threshold. A change that leaves the group with no
 //! founder is never admitted; no ending is retroactive. The refusal is
 //! `RosterAuthorityUnauthorized { rule }` — edge classifies it terminal except
-//! the rule `roster_authority_not_established` (retry after the roster).
-//! `witness_set` is stored, not counted. Whether `authority` SHOULD change
-//! this roster is therefore no longer only the caller's policy: the door
-//! enforces the room's own protocol.
+//! `roster_authority_not_established` (retry after the roster) and
+//! `roster_consensus_insufficient` (a moderator's `delegates_to` may still be
+//! replicating). `witness_set` is stored, not counted. Whether `authority`
+//! SHOULD change this roster is therefore no longer only the caller's policy:
+//! the door enforces the room's own protocol.
+//!
+//! # A removal under `unanimous` (persist v61.0.2, CIRISPersist#1192)
+//!
+//! Every OTHER active member signs, and those voices are a strict majority of
+//! the roster. At two members nobody is removable and resignation is the exit:
+//! a removal the removed member signs is their own resignation, whoever else
+//! signs it. An admission still needs every member.
 //!
 //! # v61: every voice cosigns the row; edge counts nothing
 //!
@@ -965,9 +973,17 @@ mod admit_tests {
                 .await
                 .expect("build");
         signed.authority_key_id = fed("alice-fed");
-        dir.put_community_membership_revocation(signed)
+        let msg = dir
+            .put_community_membership_revocation(signed)
             .await
-            .expect_err("a forged removal is refused at the signature, before the epoch bump");
+            .expect_err("a forged removal is refused at the signature, before the epoch bump")
+            .to_string();
+        // Alice alone is refused at two members anyway (CIRISPersist#1192), so
+        // the refusal has to name the signature or this witnesses nothing.
+        assert!(
+            msg.contains("signature") || msg.contains("verify") || msg.contains("Signature"),
+            "the refusal names the signature, not the tally: {msg}",
+        );
         assert_eq!(
             active(&dir, &room).await,
             [fed("alice-fed"), fed("bob-fed")],
