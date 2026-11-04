@@ -41,7 +41,7 @@ fn ts() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp(1_767_225_296, 789_000_000).expect("ts")
 }
 
-pub(super) struct Ident {
+struct Ident {
     key_id: String,
     seed: u8,
     ed: Ed25519SoftwareSigner,
@@ -49,7 +49,7 @@ pub(super) struct Ident {
 }
 
 impl Ident {
-    pub(super) fn new(key_id: &str, seed: u8) -> Self {
+    fn new(key_id: &str, seed: u8) -> Self {
         // The alias is `<label>-engine`, so a device's engine-derived id
         // (`derive_key_id(alias, pk)`) stays apart from this identity's own
         // derived id over the same key (CIRISPersist#1103).
@@ -120,18 +120,18 @@ impl Ident {
 }
 
 /// One node: its substrate, content store, engine key (the node), its owner.
-pub(super) struct Node {
-    pub(super) dir: Arc<SqliteBackend>,
+struct Node {
+    dir: Arc<SqliteBackend>,
     /// Kept alive with the node: the engine its occurrence was provisioned by.
     _store: PersistGroupContentStore,
-    pub(super) owner: String,
-    pub(super) me: String,
+    owner: String,
+    me: String,
 }
 
 /// A device of `owner`, the `family_files_wire_736::device` shape: the node
 /// key is `device`'s derived id, the owner binding is signed by `owner`, the
 /// engine occurrence is provisioned (node-signed) under the owner.
-pub(super) async fn device(seed_idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
+async fn device(seed_idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");

@@ -347,8 +347,13 @@ pub fn serve_advertise_policy_sha256() -> String {
 // trio's cells say `retired` too. Attestation, the key planes,
 // TransportDestination, LocationProof and AccordQuorumEvidence are unchanged.
 // **CIRISServer must mirror this pin.**
+//
+// CC 5.4.6 (rc17, v44) — RE-PINNED, 5904b100… → cb8e0728…: the Attestation
+// `serve` cell states that on a subject Pull, holding a live owner-binding is
+// sufficient for it and its owner's root acceptance, whatever the publish set
+// says; the advertise is unchanged. **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "5904b1001eb330fe2c3a5ea5864e628394c1a675023894ccf0e0606f63a90cb3";
+    "cb8e07289dcc9dd9a3e7cbace8fea3ab1f2803c200f45d59bb0df957d9f636be";
 
 #[cfg(test)]
 mod tests {

@@ -9,8 +9,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ciris_persist::federation::FederationDirectory;
+use ciris_persist::store::sqlite::SqliteBackend;
 
-use super::occurrence_before_binding_776_tests::{device, Ident, Node};
+use super::key_plane_v59_tests::NodeA;
+use super::park_fresh_858_tests::{hold, substrate, Ident};
 use super::protocol::EnvelopeKind;
 use super::registry::ReplicationRegistry;
 use super::{
@@ -62,14 +64,15 @@ impl Transport for Loopback {
 }
 
 async fn start(
-    node: &Node,
+    dir: &Arc<SqliteBackend>,
+    me: &str,
     peer: &str,
     publish: Vec<String>,
     registries: &Registries,
 ) -> ReplicationRuntime {
-    let me = node.me.clone();
+    let me = me.to_owned();
     let rt = ReplicationRuntime::start(
-        Arc::clone(&node.dir) as Arc<dyn FederationDirectory>,
+        Arc::clone(dir) as Arc<dyn FederationDirectory>,
         Arc::new(Loopback {
             me: me.clone(),
             registries: Arc::clone(registries),
@@ -105,7 +108,7 @@ async fn start(
     rt
 }
 
-async fn holds_key(dir: &Arc<ciris_persist::store::sqlite::SqliteBackend>, key_id: &str) -> bool {
+async fn holds_key(dir: &Arc<SqliteBackend>, key_id: &str) -> bool {
     matches!(
         FederationDirectory::lookup_public_key(&**dir, key_id).await,
         Ok(Some(_))
@@ -117,32 +120,32 @@ async fn holds_key(dir: &Arc<ciris_persist::store::sqlite::SqliteBackend>, key_i
 /// the wait this replaces (the reply parked until a driven round read it).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pulled_row_is_applied_within_two_seconds_not_on_the_tick() {
-    let dan = Ident::new("person-dan-apply", 0x91);
-    let dan_dev = Ident::new("node-dan-apply", 0x92);
-    let alice = Ident::new("person-alice-apply", 0x93);
-    let alice_dev = Ident::new("node-alice-apply", 0x94);
-    let holder = device(&[&dan], &dan, &dan_dev).await;
-    let asker = device(&[&alice], &alice, &alice_dev).await;
+    let holder = NodeA::build("pull-apply", 0x61).await;
+    let n = holder.n.key_id().to_owned();
+    let asker = Ident::mint("node-alice-pull-apply", "node", 0x71).await;
+    let asker_dir = substrate().await;
+    hold(&asker_dir, &asker).await;
+    let a = asker.key_id().to_owned();
 
     let registries: Registries = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    // The holder publishes only its owner, so anti-entropy cannot bring the
-    // node's own Key: only the Pull can.
-    let mut rt_holder = start(&holder, &asker.me, vec![holder.owner.clone()], &registries).await;
-    let mut rt_asker = start(&asker, &holder.me, vec![asker.owner.clone()], &registries).await;
+    // The holder publishes nothing, so anti-entropy cannot bring its own Key:
+    // only the Pull can.
+    let mut rt_holder = start(&holder.dir, &n, &a, Vec::new(), &registries).await;
+    let mut rt_asker = start(&asker_dir, &a, &n, vec![a.clone()], &registries).await;
     // Let the start-up fan-out finish: past this, nothing is driving a round.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(
-        !holds_key(&asker.dir, &holder.me).await,
+        !holds_key(&asker_dir, &n).await,
         "precondition: the row did not arrive by anti-entropy"
     );
 
     let asked_at = Instant::now();
     rt_asker
-        .pull_subject_testimony(&holder.me, &holder.me)
+        .pull_subject_testimony(&n, &n)
         .await
         .expect("the Pull leaves");
     let bound = Duration::from_secs(2);
-    while !holds_key(&asker.dir, &holder.me).await {
+    while !holds_key(&asker_dir, &n).await {
         assert!(
             asked_at.elapsed() < bound,
             "the holder's Key was not APPLIED within {bound:?} of the Pull: its reply \

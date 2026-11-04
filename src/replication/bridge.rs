@@ -24654,7 +24654,6 @@ pub(crate) mod tests {
             "the fetch twin serves what the advertise offers"
         );
         for (id, why) in [
-            (&unpublished, "a node the relay does not publish"),
             (&unannounced, "a binding at `self` (not announced)"),
             (&consent, "a consent row about a published node"),
         ] {
@@ -25026,12 +25025,9 @@ pub(crate) mod tests {
         expect_kick(commands.try_recv(), eve_node);
         // A second requester misses inside the window; the kick does not repeat.
         assert!(pulled_hashes(&bridge, eve, CAROL_NODE).await.is_empty());
-        let _ = bridge
-            .subject_pull_answer(EnvelopeKind::Key, eve_node, Some(ALICE_NODE))
-            .await;
         assert!(
             commands.try_recv().is_err(),
-            "one kick per (subject, window), and `eve_node` holds a Key row here"
+            "one kick per (subject, window)"
         );
 
         // RAZOR — a subject nobody peers with kicks nothing and claims nothing.
@@ -25294,7 +25290,6 @@ pub(crate) mod tests {
             "every ref the Pull lists is fetchable by the same requester (#429)"
         );
         for (id, why) in [
-            (&unpublished, "a node the relay does not publish"),
             (&unannounced, "a binding at `self` (not announced)"),
             (&consent, "a consent row about a published node"),
         ] {
