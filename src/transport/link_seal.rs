@@ -188,6 +188,15 @@ pub const AWAITING_BYTES_MAX: usize = 2 * 1024 * 1024;
 /// bound; this one bounds the bookkeeping of many tiny frames.
 pub const KEYING_HELD_FRAMES_MAX: usize = 256;
 
+/// How long a complete handshake on a link with no proven identity waits for
+/// its LINKIDENTIFY before the receiver order judges it unidentified. The
+/// dialler sends the identify first, but a loaded node can still see the
+/// handshake's frames ahead of it.
+pub const IDENTIFY_GRACE: Duration = Duration::from_secs(1);
+
+/// Most handshakes waiting for an identify; past it the next is judged at once.
+pub const DEFERRED_HANDSHAKES_MAX: usize = 128;
+
 /// How long a handshake that arrived within its budget has to key.
 pub const KEYING_BUDGET: Duration = av_transit_handshake::HANDSHAKE_BUDGET;
 
@@ -752,6 +761,8 @@ pub struct LinkSeals {
     receiver_order: ReceiverOrder,
     /// Frame events waiting on their link's keying.
     parked: Mutex<Parked>,
+    /// Complete handshakes waiting for their link's identify, and since when.
+    deferred: Mutex<HashMap<[u8; 16], (HandshakeJob, Instant)>>,
     /// The next keying ticket.
     next_ticket: AtomicU64,
     /// [`AWAITING_LINKS_MAX`], as a test knob.
@@ -793,6 +804,7 @@ impl LinkSeals {
             route_sender_limiter: route_fetch::SenderRouteLimiter::default(),
             receiver_order: ReceiverOrder::default(),
             parked: Mutex::new(Parked::default()),
+            deferred: Mutex::new(HashMap::new()),
             next_ticket: AtomicU64::new(0),
             awaiting_links_max: AtomicUsize::new(AWAITING_LINKS_MAX),
             awaiting_bytes_max: AtomicUsize::new(AWAITING_BYTES_MAX),
@@ -874,6 +886,52 @@ impl LinkSeals {
     /// The refusal, by name; the caller refuses the link.
     pub fn admit_handshake(&self, sender: Sender<'_>) -> Result<(), SealRefusal> {
         self.receiver_order.admit(sender)
+    }
+
+    fn deferred(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], (HandshakeJob, Instant)>> {
+        self.deferred
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// CIRISEdge#947 — hold a complete handshake for its link's identify, so
+    /// the receiver order judges the sender rather than the race. Handed back
+    /// when [`DEFERRED_HANDSHAKES_MAX`] already wait: judge it now.
+    ///
+    /// # Errors
+    /// The job, when there is no room for it.
+    pub fn defer_handshake(&self, job: HandshakeJob) -> Result<(), HandshakeJob> {
+        let mut deferred = self.deferred();
+        if deferred.len() >= DEFERRED_HANDSHAKES_MAX {
+            return Err(job);
+        }
+        deferred.insert(job.link, (job, Instant::now()));
+        Ok(())
+    }
+
+    /// CIRISEdge#947 — `link`'s identify arrived: its waiting handshake.
+    pub fn take_deferred(&self, link: [u8; 16]) -> Option<HandshakeJob> {
+        self.deferred().remove(&link).map(|(job, _)| job)
+    }
+
+    /// CIRISEdge#947 — whether any handshake waits for an identify.
+    #[must_use]
+    pub fn any_deferred(&self) -> bool {
+        !self.deferred().is_empty()
+    }
+
+    /// CIRISEdge#947 — the handshakes that have waited out [`IDENTIFY_GRACE`].
+    pub fn take_overdue_deferred(&self) -> Vec<HandshakeJob> {
+        let mut deferred = self.deferred();
+        let overdue: Vec<[u8; 16]> = deferred
+            .iter()
+            .filter(|(_, (_, since))| since.elapsed() >= IDENTIFY_GRACE)
+            .map(|(link, _)| *link)
+            .collect();
+        overdue
+            .iter()
+            .filter_map(|l| deferred.remove(l).map(|(job, _)| job))
+            .collect()
     }
 
     /// CIRISEdge#947 — run one job's KEX. Called by the keyer, off the event
@@ -1532,6 +1590,7 @@ impl LinkSeals {
         drop(links);
         self.before_keys().remove(&link);
         self.take_parked(link);
+        self.deferred().remove(&link);
         true
     }
 
@@ -1541,6 +1600,7 @@ impl LinkSeals {
         self.before_keys().remove(&link);
         self.route_answers().remove(&link);
         self.take_parked(link);
+        self.deferred().remove(&link);
     }
 
     /// Forget a closed link (its keys and anything held for it).
@@ -1553,6 +1613,7 @@ impl LinkSeals {
             .remove(link);
         self.before_keys().remove(link);
         self.take_parked(*link);
+        self.deferred().remove(link);
     }
 
     fn before_keys(&self) -> std::sync::MutexGuard<'_, BeforeKeys> {

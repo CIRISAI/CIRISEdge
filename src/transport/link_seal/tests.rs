@@ -899,3 +899,59 @@ fn a_route_request_is_charged_to_its_sender_before_the_node_947() {
         Inbound::RouteRequested { .. }
     ));
 }
+
+#[test]
+fn a_handshake_waits_for_its_identify_boundedly_and_goes_with_its_link_947() {
+    let b = seals(0x22, DIALLED);
+    let job = keying(&b, LINK);
+    let ticket = job.ticket();
+    b.defer_handshake(job).expect("room");
+    assert!(b.any_deferred());
+    assert!(b.take_overdue_deferred().is_empty(), "within its grace");
+    assert_eq!(b.take_deferred(LINK).expect("waiting").ticket(), ticket);
+    assert!(b.take_deferred(LINK).is_none(), "one job, once");
+
+    let job = keying(&b, [2; 16]);
+    b.defer_handshake(job).expect("room");
+    b.forget(&[2; 16]);
+    assert!(!b.any_deferred(), "a closed link's job goes with it");
+
+    let job = keying(&b, [3; 16]);
+    b.defer_handshake(job).expect("room");
+    assert!(b.expire([3; 16]));
+    assert!(!b.any_deferred(), "so does an expired one");
+
+    for i in 0..DEFERRED_HANDSHAKES_MAX {
+        let l = [
+            u8::try_from(i).unwrap(),
+            0xaa,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        b.defer_handshake(HandshakeJob {
+            link: l,
+            ticket: 0,
+            handshake: Vec::new(),
+        })
+        .expect("room");
+    }
+    assert!(b
+        .defer_handshake(HandshakeJob {
+            link: [0xfe; 16],
+            ticket: 0,
+            handshake: Vec::new(),
+        })
+        .is_err());
+}

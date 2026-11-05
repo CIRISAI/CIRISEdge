@@ -2269,6 +2269,29 @@ async fn standing_has_its_own_budget_and_an_announce_earns_none_947() {
     );
 }
 
+/// **Witness (#947)** — a handshake that beats its LINKIDENTIFY is judged by
+/// who sent it, not by that race: B holds standing at A and identifies only
+/// after its first frames, with the stranger rate at zero, and it still keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_that_beats_its_identify_keeps_its_standing_947() {
+    let t = trio("idrace", true, false, false).await;
+    t.a.transport.set_stranger_handshake_cap_for_test(0);
+    t.a.transport
+        .prime_peer(
+            &t.b.key.key_id,
+            t.b.transport.local_named_dest_hash(),
+            t.b.transport.local_transport_pubkey(),
+        )
+        .await
+        .expect("prime B at A");
+    t.b.transport.identify_last_for_test();
+    one_way(&t.b, &t.a, 1, b"947-IDRACE-B-")
+        .await
+        .expect("B keys on its standing though the handshake beat the identify");
+    assert_eq!(t.a.seal("link_seal_refused_handshake_sender_rate"), 0);
+    assert_eq!(t.a.seal("link_seal_refused_handshake_node_rate"), 0);
+}
+
 /// **Witness (#947)** — the `Awaiting` cap, on real links that never send a
 /// handshake: the oldest is refused by name and closed, the newest kept, and a
 /// real dial still keys while they sit there.

@@ -2,6 +2,9 @@
 //! lock and behind the receiver order**, because a stranger's first frame is
 //! the cheapest way to make a node do expensive work.
 //!
+//! [`IDENTIFY_GRACE`]: crate::transport::link_seal::IDENTIFY_GRACE
+//! [`DEFERRED_HANDSHAKES_MAX`]: crate::transport::link_seal::DEFERRED_HANDSHAKES_MAX
+//!
 //! [`LinkSeals::inbound`](crate::transport::link_seal::LinkSeals::inbound)
 //! hands a reassembled handshake back as a job and moves the link to `Keying`.
 //! From there:
@@ -24,12 +27,14 @@
 //! # What identifies a sender, and why never an address
 //!
 //! The sender is the link's **proven RNS identity** (LINKIDENTIFY, a signature
-//! over the link id), which the node holds from the moment the identify is
-//! processed, ahead of the handshake that follows it on the wire. An address
-//! is never read: one NAT hosts many honest peers, and each has its own
-//! identity, so none of them shares a budget with another. A link that has
-//! not identified shares ONE slot ([`HANDSHAKES_UNIDENTIFIED`]), because
-//! nothing else tells two such links apart.
+//! over the link id). The dialler sends it first, but a loaded node can still
+//! see the handshake ahead of it, so a handshake with no identity waits for
+//! one, within [`IDENTIFY_GRACE`] and [`DEFERRED_HANDSHAKES_MAX`], rather than
+//! be judged by that race. An address is never read: one NAT hosts many honest
+//! peers, and each has its own identity, so none of them shares a budget with
+//! another. A link still unidentified after that shares ONE slot
+//! ([`HANDSHAKES_UNIDENTIFIED`]), because nothing else tells two such links
+//! apart.
 //!
 //! Minting an identity costs an attacker a keypair, so the per-sender rate
 //! only stops a sender that does not bother. Against a flood of fresh
@@ -99,8 +104,8 @@ pub const HANDSHAKES_PER_STRANGER: usize = 16;
 pub const HANDSHAKES_PER_STANDING: usize = 64;
 
 /// Per window: every link with no proven identity, together. Every edge
-/// identifies before it keys, so this is reached only by a link whose identify
-/// was lost, and by a flood that never identifies.
+/// identifies before it keys, so past the identify's grace this is reached only
+/// by a link whose identify was lost, and by a flood that never identifies.
 pub const HANDSHAKES_UNIDENTIFIED: usize = 16;
 
 /// What the event path knows about who sent a handshake.

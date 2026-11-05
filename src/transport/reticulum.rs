@@ -10681,9 +10681,13 @@ impl ReticulumTransport {
                 Some(done) = keying_done.recv() => {
                     apply_keying(done, &ctx).await;
                 }
-                _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution() => {
+                _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution()
+                    || ctx.seals.any_deferred() => {
                     for link in ctx.seals.awaiting_attribution() {
                         release_held(&ctx, LinkId::new(link)).await;
+                    }
+                    for job in ctx.seals.take_overdue_deferred() {
+                        gate_handshake(&ctx, LinkId::new(job.link()), job).await;
                     }
                 }
                 _ = seat_tick.tick() => {
@@ -15511,10 +15515,30 @@ async fn identity_has_standing(ctx: &EventCtx<'_>, identity_hash: &[u8; 16]) -> 
         })
 }
 
+/// CIRISEdge#947 — a complete handshake arrived. On a link with no proven
+/// identity yet it waits a moment for the LINKIDENTIFY that was sent ahead of
+/// it (the `LinkIdentified` arm, or the grace on the attribution tick): judged
+/// now, a peer with standing would be judged as whoever lost that race.
+async fn admit_handshake(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    job: crate::transport::link_seal::HandshakeJob,
+) {
+    let job = if ctx.node.get_remote_identity(&link_id).is_some() {
+        job
+    } else {
+        match ctx.seals.defer_handshake(job) {
+            Ok(()) => return,
+            Err(job) => job,
+        }
+    };
+    gate_handshake(ctx, link_id, job).await;
+}
+
 /// CIRISEdge#947 — CC 5.3.3.5: a complete handshake goes behind the receiver
 /// order and into the keyer. No decapsulation, and no parse past the tag,
 /// happens on the event path. See [`crate::transport::link_keying`].
-async fn admit_handshake(
+async fn gate_handshake(
     ctx: &EventCtx<'_>,
     link_id: LinkId,
     job: crate::transport::link_seal::HandshakeJob,
@@ -16708,6 +16732,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         } => {
             // CIRISEdge#853 — a link whose `LinkEstablished` edge never saw.
             recover_unknown_link(ctx, link_id).await;
+            // CIRISEdge#947 — a handshake that beat this identify is judged now.
+            if let Some(job) = ctx.seals.take_deferred(link_id.into_bytes()) {
+                gate_handshake(ctx, link_id, job).await;
+            }
             // CIRISEdge#34 link half (v0.14.0) — emit `link_identified`
             // event with the peer's truncated identity hash. The peer
             // proved its identity over an already-established link via
