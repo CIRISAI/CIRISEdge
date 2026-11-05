@@ -1444,16 +1444,20 @@ pub const RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED: &str = "send_then_complete_
 /// CIRISEdge#943 — a frame that wanted an answer met a full reply lane: not
 /// stepped, not answered; the peer's round times out and its next one is served.
 pub const RESPONDER_ROUND_REPLY_SHED: &str = "reply_shed";
+/// v44 LTS — a frame that reads bodies went unanswered at the node-wide reply
+/// byte bound, its own lane having room.
+pub const RESPONDER_ROUND_REPLY_SHED_NODE: &str = "reply_shed_node";
 /// CIRISEdge#943 — a reply outlived its round in the lane and was not sent.
 pub const RESPONDER_ROUND_REPLY_EXPIRED: &str = "reply_expired";
 /// Every `responder_rounds_total` outcome token.
-pub const RESPONDER_ROUND_OUTCOMES: [&str; 7] = [
+pub const RESPONDER_ROUND_OUTCOMES: [&str; 8] = [
     RESPONDER_ROUND_STARTED,
     RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL,
     RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL,
     RESPONDER_ROUND_REPLY_SEND_FAILED,
     RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED,
     RESPONDER_ROUND_REPLY_SHED,
+    RESPONDER_ROUND_REPLY_SHED_NODE,
     RESPONDER_ROUND_REPLY_EXPIRED,
 ];
 

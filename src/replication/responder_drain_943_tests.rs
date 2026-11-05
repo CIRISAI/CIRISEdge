@@ -23,7 +23,9 @@ use super::directory::{
 };
 use super::protocol::{DeliverMessage, EnvelopeKind, EnvelopeRef, PullMessage, ReplicationMessage};
 use super::registry::ReplicationRegistry;
-use super::reply_lane::{ReplyLane, REPLY_QUEUE_BYTES, REPLY_QUEUE_JOBS};
+use super::reply_lane::{
+    ReplyBudget, ReplyLane, REPLY_NODE_BYTES, REPLY_QUEUE_BYTES, REPLY_QUEUE_JOBS,
+};
 use super::runtime::spawn_responder_drive;
 use super::session::{SessionRole, MAX_DELIVER_ENVELOPE_BYTES};
 use super::summary::ApplyOutcome;
@@ -257,6 +259,7 @@ fn responder() -> Responder {
     let seam = ReverseSeam::new();
     let metrics = EdgeMetrics::new();
     let reads = Arc::new(AtomicUsize::new(0));
+    let budget = Arc::<ReplyBudget>::default();
     let (d, s, m, c) = (
         Arc::clone(&dir),
         Arc::clone(&seam),
@@ -279,7 +282,7 @@ fn responder() -> Responder {
             )
             .with_metrics(Some(m.clone())),
         );
-        spawn_responder_drive(Arc::clone(&coord));
+        spawn_responder_drive(Arc::clone(&coord), Arc::clone(&budget));
         coord
     }));
     Responder {
@@ -521,7 +524,7 @@ async fn the_lane_is_bounded_in_bytes_and_gives_them_back_943() {
         Arc::new(DirectoryStateAdapter::new(Arc::clone(&directory))),
         Arc::new(MutableDirectoryStateAdapter::new(directory)),
     ));
-    let lane = ReplyLane::spawn(Arc::clone(&coord));
+    let lane = ReplyLane::spawn(Arc::clone(&coord), Arc::default());
     seam.hold(EnvelopeKind::Key);
     let page = || {
         vec![ReplicationMessage::Deliver(DeliverMessage {
@@ -542,6 +545,76 @@ async fn the_lane_is_bounded_in_bytes_and_gives_them_back_943() {
     seam.release(EnvelopeKind::Key);
     eventually("the pages leave", || seam.sent().len() == pages).await;
     eventually("their bytes come back", || lane.has_room()).await;
+}
+
+/// The bound for the node (`FSD/EVENT_PATH_MODEL.md` §3.2): every lane holds
+/// inside its own bound and together they would pin far more. Past
+/// [`REPLY_NODE_BYTES`] a frame that reads bodies is not answered; a `Summary`,
+/// which pins nothing, still is, so a few peers not reading cannot shut the
+/// node's rounds; and the bytes come back when the path does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_node_is_bounded_in_reply_bytes_across_its_lanes() {
+    let seam = ReverseSeam::new();
+    let directory: Arc<dyn ReplicationDirectory> = Arc::new(MockReplicationDirectory::new());
+    let budget = Arc::<ReplyBudget>::default();
+    seam.hold(EnvelopeKind::Key);
+    let lane_bytes = REPLY_QUEUE_BYTES;
+    let lanes = REPLY_NODE_BYTES.div_ceil(lane_bytes);
+    let page = || {
+        vec![ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::Key,
+            envelopes: vec![vec![0u8; MAX_DELIVER_ENVELOPE_BYTES]],
+        })]
+    };
+    let diff = ReplicationMessage::Diff(super::protocol::DiffMessage {
+        kind: EnvelopeKind::Key,
+        want: Vec::new(),
+    });
+    let summary = ReplicationMessage::Summary(super::protocol::SummaryMessage {
+        status: None,
+        kind: EnvelopeKind::Key,
+        refs: Vec::new(),
+    });
+    let mut held = Vec::new();
+    for n in 0..lanes {
+        let coord = Arc::new(ReplicationCoordinator::new(
+            Arc::clone(&seam) as Arc<dyn Transport>,
+            format!("peer-{n}"),
+            EnvelopeKind::Key,
+            SessionRole::Responder,
+            Arc::new(DirectoryStateAdapter::new(Arc::clone(&directory))),
+            Arc::new(MutableDirectoryStateAdapter::new(Arc::clone(&directory))),
+        ));
+        let lane = ReplyLane::spawn(Arc::clone(&coord), Arc::clone(&budget));
+        assert!(
+            lane.has_room_for(&diff),
+            "lane {n} is inside the node bound"
+        );
+        for _ in 0..lane_bytes / MAX_DELIVER_ENVELOPE_BYTES {
+            lane.enqueue(&coord, page(), 7, None);
+        }
+        held.push((coord, lane));
+    }
+    let coord = Arc::new(ReplicationCoordinator::new(
+        Arc::clone(&seam) as Arc<dyn Transport>,
+        "peer-last",
+        EnvelopeKind::Key,
+        SessionRole::Responder,
+        Arc::new(DirectoryStateAdapter::new(Arc::clone(&directory))),
+        Arc::new(MutableDirectoryStateAdapter::new(directory)),
+    ));
+    let fresh = ReplyLane::spawn(coord, Arc::clone(&budget));
+    assert!(fresh.has_room(), "its own lane is empty");
+    assert!(
+        !fresh.has_room_for(&diff),
+        "the node holds its bound: a frame that reads bodies waits"
+    );
+    assert!(
+        fresh.has_room_for(&summary),
+        "a frame that pins nothing is still answered"
+    );
+    seam.release(EnvelopeKind::Key);
+    eventually("the bytes come back", || fresh.has_room_for(&diff)).await;
 }
 
 /// A reply that outlived its round is not sent: on a dead path it would only

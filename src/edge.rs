@@ -11358,7 +11358,7 @@ mod inbound_ingest_tests {
                 Arc::new(ParkingProvider(gate_rx.clone())),
                 Arc::new(NoApply),
             ));
-            crate::replication::runtime::spawn_responder_drive(Arc::clone(&coord));
+            crate::replication::runtime::spawn_responder_drive(Arc::clone(&coord), Arc::default());
             coord
         }));
         let metrics = crate::observability::EdgeMetrics::default();

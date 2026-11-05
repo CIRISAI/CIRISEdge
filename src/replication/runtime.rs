@@ -531,7 +531,10 @@ fn responder_round_clock(
 // One driver loop with a lifecycle line and counter per arm (CIRISEdge#853);
 // splitting the arms out would separate each log line from the step it reports.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
+pub(crate) fn spawn_responder_drive(
+    coord: Arc<ReplicationCoordinator>,
+    reply_budget: Arc<crate::replication::reply_lane::ReplyBudget>,
+) {
     use crate::replication::coordinator::DriverPhase;
     use crate::replication::reply_lane::{self, Finish, ReplyLane};
     tokio::spawn(async move {
@@ -558,7 +561,7 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
         let mut timed_round: u64 = 0;
         // CIRISEdge#943 — this loop steps, the lane sends: a reply the reverse
         // path is holding never holds the frames behind it. See `reply_lane`.
-        let lane = ReplyLane::spawn(Arc::clone(&coord));
+        let lane = ReplyLane::spawn(Arc::clone(&coord), reply_budget);
         loop {
             // CIRISEdge#662 — the phase gauge: this loop is the responder's ONE
             // drain, and when its inbox fills the drop site reads which of the
@@ -582,8 +585,9 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
             }
             // The park here used to bound what a frame that wants an answer
             // could cost; a full lane is that bound now, before the step.
-            if reply_lane::wants_reply(&inbound.msg) && !lane.has_room() {
-                lane.shed(&coord, "frame");
+            if reply_lane::wants_reply(&inbound.msg) && !lane.has_room_for(&inbound.msg) {
+                let what = if lane.has_room() { "node" } else { "frame" };
+                lane.shed(&coord, what);
                 continue;
             }
             let began = responder_round_clock(
@@ -1264,6 +1268,8 @@ impl ReplicationRuntime {
             // CIRISEdge#441 — the responder coordinators fold peer Summaries
             // into the removal-receipt ledger; same handle the bridge uses.
             let factory_metrics = config.metrics.clone();
+            // One per node: every responder's reply lane draws on it.
+            let reply_budget = Arc::<crate::replication::reply_lane::ReplyBudget>::default();
             registry.set_responder_factory(Arc::new(move |peer_key_id: &str, kind| {
                 let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&factory_bridge) as _;
                 // CIRISEdge#379 — peer-bound provider: the observer-capability
@@ -1292,7 +1298,7 @@ impl ReplicationRuntime {
                 // never ran the recv_inbound → drive_round_step → send_message
                 // loop. Spawned ONCE per (peer, kind) — `get_or_register_with`
                 // calls the factory only on first insert.
-                spawn_responder_drive(Arc::clone(&coord));
+                spawn_responder_drive(Arc::clone(&coord), Arc::clone(&reply_budget));
                 coord
             }));
         }

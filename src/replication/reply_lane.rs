@@ -31,6 +31,12 @@
 //! same recovery. The rate at which those frames cost anything is still the
 //! rate replies leave.
 //!
+//! Those bounds are per lane, and lanes are per `(peer, kind)`, so on their own
+//! they scale with the peers a node has: 130 peers × 8 planes is 2.6 GiB against
+//! a canonical's 1 GB. [`ReplyBudget`] is the bound for the node. It is checked
+//! only for a frame that reads bodies: a `Summary` pins nothing, so a few peers
+//! not reading their pages cannot stop every other peer's rounds opening.
+//!
 //! A `Deliver` is never shed: it wants no answer, and it is the frame this
 //! lane exists for. It now applies at the rate a peer with a healthy reverse
 //! path could already drive, under the same inbox and the same admission gates.
@@ -84,6 +90,17 @@ pub(super) const REPLY_QUEUE_JOBS: usize = ReplicationCoordinator::INBOUND_CHANN
 /// Checked before a step, so a lane can pass it by one page.
 pub(super) const REPLY_QUEUE_BYTES: usize = 4 * MAX_DELIVER_ENVELOPE_BYTES;
 
+/// `Deliver` bytes every lane of a node may hold together: 3.7 times what a
+/// healthy canonical has in flight (`FSD/EVENT_PATH_MODEL.md` §3.2). Checked
+/// before a step, so concurrent lanes can pass it by a page each.
+pub(super) const REPLY_NODE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The bytes queued across every lane of one node. One per responder factory.
+#[derive(Debug, Default)]
+pub(crate) struct ReplyBudget {
+    bytes: AtomicUsize,
+}
+
 /// A round this reply belonged to that has been given up on: the longest a
 /// default initiator waits for a frame, paced as the scheduler paces it on a
 /// shaped link. Past this the reply answers nobody, and sending it down a dead
@@ -103,6 +120,18 @@ pub(super) fn wants_reply(msg: &ReplicationMessage) -> bool {
         | ReplicationMessage::Pull(_)
         | ReplicationMessage::CursorPull(_) => true,
         ReplicationMessage::Deliver(_) => false,
+    }
+}
+
+/// Does answering this frame read bodies? Exhaustive for the same reason.
+fn reads_bodies(msg: &ReplicationMessage) -> bool {
+    match msg {
+        ReplicationMessage::Diff(_)
+        | ReplicationMessage::Fetch(_)
+        | ReplicationMessage::CursorPull(_) => true,
+        ReplicationMessage::Summary(_)
+        | ReplicationMessage::Pull(_)
+        | ReplicationMessage::Deliver(_) => false,
     }
 }
 
@@ -137,6 +166,19 @@ struct LaneState {
     send_failed: AtomicBool,
     /// Jobs queued or on the wire: the depth the node's gauge reads.
     jobs: Arc<AtomicUsize>,
+    /// This lane's node.
+    budget: Arc<ReplyBudget>,
+}
+
+impl LaneState {
+    fn add(&self, bytes: usize) {
+        self.bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.budget.bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
+    fn give_back(&self, bytes: usize) {
+        self.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.budget.bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
 }
 
 /// The driver's end of the lane. Dropping it ends the task once the queue
@@ -160,9 +202,12 @@ fn count(coord: &ReplicationCoordinator, outcome: &'static str) {
 }
 
 impl ReplyLane {
-    pub(super) fn spawn(coord: Arc<ReplicationCoordinator>) -> Self {
+    pub(super) fn spawn(coord: Arc<ReplicationCoordinator>, budget: Arc<ReplyBudget>) -> Self {
         let (tx, rx) = mpsc::channel(REPLY_QUEUE_JOBS);
-        let state = Arc::new(LaneState::default());
+        let state = Arc::new(LaneState {
+            budget,
+            ..LaneState::default()
+        });
         if let Some(m) = coord.metrics() {
             m.telemetry.register_reply_lane(&state.jobs);
         }
@@ -176,6 +221,14 @@ impl ReplyLane {
         self.tx.capacity() > 0 && self.state.bytes.load(Ordering::Acquire) < REPLY_QUEUE_BYTES
     }
 
+    /// Is there room for the answer to `msg`, on this lane and on the node?
+    #[must_use]
+    pub(super) fn has_room_for(&self, msg: &ReplicationMessage) -> bool {
+        self.has_room()
+            && (!reads_bodies(msg)
+                || self.state.budget.bytes.load(Ordering::Acquire) < REPLY_NODE_BYTES)
+    }
+
     /// Whether a send failed since the last call.
     pub(super) fn take_send_failed(&self) -> bool {
         self.state.send_failed.swap(false, Ordering::AcqRel)
@@ -183,7 +236,14 @@ impl ReplyLane {
 
     /// A frame that wanted an answer, or an answer, with nowhere to go.
     pub(super) fn shed(&self, coord: &ReplicationCoordinator, what: &'static str) {
-        count(coord, obs::RESPONDER_ROUND_REPLY_SHED);
+        count(
+            coord,
+            if what == "node" {
+                obs::RESPONDER_ROUND_REPLY_SHED_NODE
+            } else {
+                obs::RESPONDER_ROUND_REPLY_SHED
+            },
+        );
         if let ThrottleDecision::Emit { suppressed_prev } = lane_log().check(coord.peer_key_id()) {
             tracing::warn!(
                 peer = %coord.peer_key_id(),
@@ -211,7 +271,7 @@ impl ReplyLane {
         finishes: Option<Finish>,
     ) {
         let bytes = deliver_bytes(&msgs);
-        self.state.bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.state.add(bytes);
         let job = ReplyJob {
             msgs,
             round,
@@ -222,7 +282,7 @@ impl ReplyLane {
         self.state.jobs.fetch_add(1, Ordering::Relaxed);
         if self.tx.try_send(job).is_err() {
             self.state.jobs.fetch_sub(1, Ordering::Relaxed);
-            self.state.bytes.fetch_sub(bytes, Ordering::AcqRel);
+            self.state.give_back(bytes);
             self.shed(coord, "reply");
         }
     }
@@ -256,7 +316,7 @@ async fn run(
         } else {
             send(&coord, &state, &job).await;
         }
-        state.bytes.fetch_sub(job.bytes, Ordering::AcqRel);
+        state.give_back(job.bytes);
         state.jobs.fetch_sub(1, Ordering::Relaxed);
     }
 }
