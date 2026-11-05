@@ -983,6 +983,24 @@ fn reverse_path_wait_step(
     ReverseWaitStep::Continue
 }
 
+/// How long a dial waits for the answer to the path request it just raised.
+/// A transport node answers from its path table after a 400 ms grace, so this
+/// is one grace and a few round trips, with room for a relay that has to ask
+/// on. It must leave the bootstrap dial's [`NO_PATH_ESTABLISH_TIMEOUT`] inside
+/// the send's 10 s round.
+const PATH_SEEK_BUDGET: Duration = Duration::from_secs(3);
+
+/// One path request per destination per this long, whatever is sending: at
+/// leviculum's own repeat interval (`PATH_REQUEST_MIN_INTERVAL_MS`). A path
+/// request is a broadcast, so a retry loop at a dead peer must not make one
+/// per send, and a send behind a recent unanswered ask fails as fast as it
+/// always did.
+const PATH_SEEK_MIN_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Path asks remembered at once. A full table drops the oldest half: the only
+/// cost of forgetting one is an early repeat.
+const PATH_SEEK_TRACKED: usize = 1_024;
+
 /// CIRISEdge#336 (fast heal) — minimum interval between EVENT-DRIVEN announces.
 ///
 /// RNS reachability is on-demand, not periodic: markqvist's reference stack
@@ -2977,6 +2995,8 @@ pub struct ReticulumTransport {
     /// second lane — and Tokio's is FIFO-fair, so a waiter cannot be starved by
     /// a steady arrival of new senders.
     dial_gate: Arc<Mutex<HashMap<DestinationHash, Arc<tokio::sync::Semaphore>>>>,
+    /// When a path to each destination was last asked for ([`Self::seek_paths`]).
+    path_seeks: std::sync::Mutex<HashMap<DestinationHash, std::time::Instant>>,
     /// CIRISEdge#739 — the SCOPED twin of `reusable_dialed_link`: identified
     /// links to a scope-derived member address, keyed by that address, fed
     /// only by [`Self::lease_scoped_link`]'s dial and tagged
@@ -4169,6 +4189,7 @@ impl ReticulumTransport {
             swallow_link_established: std::sync::atomic::AtomicBool::new(false),
             concluded_resources: std::sync::Mutex::new(HashMap::new()),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
+            path_seeks: std::sync::Mutex::new(HashMap::new()),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
@@ -6329,7 +6350,10 @@ impl ReticulumTransport {
                 };
             }
         }
-        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let mut candidates = self.resolve_dial_candidates(destination_key_id).await;
+        if candidates.is_empty() && self.seek_peer(destination_key_id).await {
+            candidates = self.resolve_dial_candidates(destination_key_id).await;
+        }
         if candidates.is_empty() {
             count(crate::observability::DIRECT_LINK_SKIPPED_NO_LINK);
             return DirectPath::Unavailable { reason: "no_link" };
@@ -8964,6 +8988,107 @@ impl ReticulumTransport {
         out
     }
 
+    /// Ask the network for a path to any of `dests`, and wait, boundedly, for
+    /// the answer. Returns whether one is known at the end.
+    ///
+    /// This is how a node learns a peer it wants. Waiting for the peer's
+    /// announce does not work: a relay holds no announce for a client that
+    /// connects later, and once a destination has used up the rate limit's
+    /// grace a transport node stops rebroadcasting it for up to
+    /// `announce_rate_target` (default 1 h, leviculum `DEFAULT_AR_TARGET`), so
+    /// on the 300 s default the second half of every hour is silent. It keeps
+    /// the path though, and answers a path request from it, past both that
+    /// limit and the ingress hold. The answer is the peer's own signed
+    /// announce, so it takes the ordinary rooting path.
+    ///
+    /// One ask per destination per [`PATH_SEEK_MIN_INTERVAL`]: a send behind
+    /// an ask still in flight waits out that ask, and a send behind an
+    /// unanswered one does not wait at all.
+    async fn seek_paths(&self, dests: &[DestinationHash]) -> bool {
+        let known = || dests.iter().any(|d| self.node.has_path(d));
+        if dests.is_empty() || known() {
+            return !dests.is_empty();
+        }
+        let now = std::time::Instant::now();
+        let mut ask: Vec<DestinationHash> = Vec::new();
+        let mut until = now;
+        {
+            let mut seeks = self
+                .path_seeks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if seeks.len() >= PATH_SEEK_TRACKED {
+                let mut ages: Vec<std::time::Instant> = seeks.values().copied().collect();
+                ages.sort_unstable();
+                let cut = ages[ages.len() / 2];
+                seeks.retain(|_, at| *at > cut);
+            }
+            for d in dests {
+                match seeks.get(d).copied() {
+                    Some(at) if now.duration_since(at) < PATH_SEEK_MIN_INTERVAL => {
+                        until = until.max(at + PATH_SEEK_BUDGET);
+                    }
+                    _ => {
+                        seeks.insert(*d, now);
+                        ask.push(*d);
+                        until = until.max(now + PATH_SEEK_BUDGET);
+                    }
+                }
+            }
+        }
+        for d in &ask {
+            if let Err(e) = self.node.request_path(d).await {
+                tracing::debug!(error = %e, "path request not sent");
+            }
+        }
+        while std::time::Instant::now() < until {
+            if known() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        known()
+    }
+
+    /// Ask for a peer this node wants and has not heard: through whatever it
+    /// can already address it by, and through the signed route row a directory
+    /// holds for it. A row only says where to ask; nothing is trusted from it,
+    /// because what comes back is the peer's own announce. Returns whether the
+    /// peer can be addressed now.
+    pub async fn seek_peer(&self, destination_key_id: &str) -> bool {
+        let mut dests: Vec<DestinationHash> = self
+            .resolve_dial_candidates(destination_key_id)
+            .await
+            .iter()
+            .map(|c| c.dest_hash)
+            .collect();
+        if let Some(rooting) = self.rooting.as_deref() {
+            if let Ok(Some(row)) = rooting.signed_reticulum_route(destination_key_id).await {
+                let bytes = hex::decode(&row.transport_destination.destination).ok();
+                if let Some(hash) = bytes.and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+                    let dest = DestinationHash::new(hash);
+                    if !dests.contains(&dest) {
+                        dests.push(dest);
+                    }
+                }
+            }
+        }
+        if !self.seek_paths(&dests).await {
+            return false;
+        }
+        // The path is known when the announce is; rooting it is the listener's.
+        let deadline = std::time::Instant::now() + PATH_SEEK_BUDGET;
+        loop {
+            if self.knows_peer(destination_key_id).await {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Single-winner resolution, preserved for the non-dial callers
     /// (`knows_peer` / dest readback). Legacy preference order: cached, else
     /// explicit-hash, else computed-named — byte-identical to the pre-v13.8.0
@@ -9297,6 +9422,25 @@ impl ReticulumTransport {
             // The gate is per-destination so other peers still dial in parallel.
             // CIRISEdge#568 — the dial runs in a SPAWNED task, not inline.
             //
+            // No path and no link: ask, before the bootstrap dial that only a
+            // one-hop neighbour can answer. Past the reuse check on purpose:
+            // a peer that dialled this node needs no path to be sent to.
+            let dests: Vec<DestinationHash> = candidates.iter().map(|c| c.dest_hash).collect();
+            let (peer, has_path, establish_timeout) = if !has_path && self.seek_paths(&dests).await
+            {
+                let pathed: Vec<(DialSource, bool)> = candidates
+                    .iter()
+                    .map(|c| (c.source, self.node.has_path(&c.dest_hash)))
+                    .collect();
+                let i = select_dial_candidate(&pathed).unwrap_or(chosen_idx);
+                let peer = ResolvedPeer {
+                    dest_hash: candidates[i].dest_hash,
+                    transport_ed25519: candidates[i].transport_ed25519,
+                };
+                (peer, pathed[i].1, LINK_ESTABLISH_TIMEOUT)
+            } else {
+                (peer, has_path, establish_timeout)
+            };
             // `round_timeout` is 10 s; a pathed peer's `establish_timeout` is
             // `LINK_ESTABLISH_TIMEOUT` (30 s). Inline, a cold dial could never
             // finish inside the round that started it, and the scheduler
@@ -10750,7 +10894,10 @@ impl ReticulumTransport {
         // set; the dial target is chosen by ROUTABILITY further down, after the
         // reverse-path attempt. See `resolve_dial_candidates` /
         // `select_dial_candidate` for the holistic-fix rationale.
-        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let mut candidates = self.resolve_dial_candidates(destination_key_id).await;
+        if candidates.is_empty() && self.seek_peer(destination_key_id).await {
+            candidates = self.resolve_dial_candidates(destination_key_id).await;
+        }
         if candidates.is_empty() {
             // CIRISEdge#292 (CIRISServer#205) — an admitted replication
             // target whose Reticulum destination we can't resolve is the

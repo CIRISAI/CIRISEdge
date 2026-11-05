@@ -204,6 +204,15 @@ async fn transport_node_ingress(
     facilitator_port: u16,
     ingress: bool,
 ) -> ReticulumNode {
+    transport_node_limited(tcp_port, facilitator_port, ingress, None).await
+}
+
+async fn transport_node_limited(
+    tcp_port: u16,
+    facilitator_port: u16,
+    ingress: bool,
+    announce_rate_target: Option<u32>,
+) -> ReticulumNode {
     let storage = tempfile::tempdir().expect("tempdir");
     let mut node = ReticulumNodeBuilder::new()
         .enable_transport(true)
@@ -213,6 +222,8 @@ async fn transport_node_ingress(
             listen_ip: Some("127.0.0.1".to_string()),
             listen_port: Some(tcp_port),
             ingress_control: Some(ingress),
+            announce_rate_target,
+            announce_rate_grace: announce_rate_target.map(|_| 5),
             ..Default::default()
         })
         .direct_link(leviculum_std::direct_link::DirectLinkSettings {
@@ -398,11 +409,16 @@ async fn pair(tag: &str, facilitated: bool) -> Pair {
                 .expect("seed the route");
         }
     }
+    // Each asks for the other. This waited for the announces alone, which is
+    // not a thing a node can wait for: A's start and B's can be 60 s apart on
+    // a loaded box, and by then T's rate limit (grace 5, A announcing every
+    // 5 s) has stopped relaying A for an hour. The node that joined late never
+    // heard it. A path request is what T still answers.
     let known = wait_until(Duration::from_secs(60), || async {
-        a.transport.knows_peer(&b.key.key_id).await && b.transport.knows_peer(&a.key.key_id).await
+        a.transport.seek_peer(&b.key.key_id).await && b.transport.seek_peer(&a.key.key_id).await
     })
     .await;
-    assert!(known, "A and B learn each other's announces through T");
+    assert!(known, "A and B reach each other through T");
 
     let room = format!("room-call-nat-{tag}");
     let ga = CohortGroup::create(store(&format!("{tag}-a")), &room, &a.key.key_id, 16)
@@ -614,6 +630,168 @@ async fn a_room_call_behind_t_without_a_facilitator_has_no_leg() {
     ));
 }
 
+/// `T` with `A` on it long enough that the relay's rate limit blocks A's
+/// re-announces, then `B` joining: A's announce is not coming. A's 1 s interval
+/// reaches the limiter's grace (5) within seconds; on the 300 s default it
+/// takes half an hour and then lasts about an hour.
+struct LateJoin {
+    t: ReticulumNode,
+    a: Side,
+    b: Side,
+    a_dir: Arc<SqliteBackend>,
+    b_dir: Arc<SqliteBackend>,
+    _tmp: tempfile::TempDir,
+}
+
+const LIMITER_ARMED: Duration = Duration::from_secs(12);
+
+async fn late_join(tag: &str) -> LateJoin {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (t_port, f_port) = (free_port(), free_udp_port());
+    let t = transport_node(t_port, f_port).await;
+    let key_a = Ident::new(&format!("node-a-{tag}"), 0x3a).await;
+    let key_b = Ident::new(&format!("node-b-{tag}"), 0x3b).await;
+    let records = vec![key_a.record().await, key_b.record().await];
+    let (a_dir, b_dir) = (
+        directory_with(records.clone()).await,
+        directory_with(records).await,
+    );
+    let every = Duration::from_secs(1);
+    let direct = DirectLinksConfig::default;
+    let a = side_every(
+        key_a,
+        &a_dir,
+        &tmp.path().join("a"),
+        t_port,
+        direct(),
+        every,
+    )
+    .await;
+    tokio::time::sleep(LIMITER_ARMED).await;
+    assert!(
+        t.transport_stats().drops_announce_rate_limited() > 0,
+        "the premise: the relay is blocking A's re-announces: {:?}",
+        t.transport_stats()
+    );
+    let b = side_every(
+        key_b,
+        &b_dir,
+        &tmp.path().join("b"),
+        t_port,
+        direct(),
+        every,
+    )
+    .await;
+    LateJoin {
+        t,
+        a,
+        b,
+        a_dir,
+        b_dir,
+        _tmp: tmp,
+    }
+}
+
+/// Copy `from`'s signed route rows into `to`, as replication does.
+async fn share_routes(from: &Side, from_dir: &Arc<SqliteBackend>, to: &Arc<SqliteBackend>) {
+    let routes = from_dir
+        .list_signed_transport_destinations_for(&from.key.key_id)
+        .await
+        .expect("list routes");
+    assert!(!routes.is_empty(), "the peer published its route");
+    for r in &routes {
+        FederationDirectory::put_signed_transport_destination(&**to, r)
+            .await
+            .expect("seed the route");
+    }
+}
+
+/// **The product bug behind the NAT flake.** A transport node relays a
+/// destination's announce until the rate limit's grace runs out, then not for
+/// up to an hour, so a node that joins later cannot wait for A's announce. It
+/// holds A's signed route, it wants A, and the relay still holds A's path: the
+/// send asks for it. Before the fix the send had no way to address A at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_joiner_reaches_its_peer_on_its_first_send() {
+    let j = late_join("late-send").await;
+    share_routes(&j.a, &j.a_dir, &j.b_dir).await;
+    let id_a = j.a.key.key_id.clone();
+    assert!(!j.b.transport.knows_peer(&id_a).await, "the premise");
+    let start = std::time::Instant::now();
+    let sent = j.b.transport.send(&id_a, b"{\"late\":true}").await;
+    eprintln!(
+        "[LATE] first send: {sent:?} in {:?}; T {:?}",
+        start.elapsed(),
+        j.t.transport_stats()
+    );
+    assert!(sent.is_ok(), "{sent:?}");
+    assert!(
+        j.b.transport.knows_peer(&id_a).await,
+        "A's announce came back"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// The same for a peer this node can already name but has no path to (a
+/// primed peer, or a directory-resolved one): the dial asks before it
+/// broadcasts a link request only a neighbour could answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_known_peer_with_no_path_is_asked_for_before_the_dial() {
+    let j = late_join("late-known").await;
+    share_routes(&j.a, &j.a_dir, &j.b_dir).await;
+    let id_a = j.a.key.key_id.clone();
+    j.b.transport
+        .prime_peer(
+            &id_a,
+            j.a.transport.local_named_dest_hash(),
+            j.a.transport.local_transport_pubkey(),
+        )
+        .await
+        .expect("prime");
+    let start = std::time::Instant::now();
+    let sent = j.b.transport.send(&id_a, b"{\"known\":true}").await;
+    eprintln!("[LATE] known peer: {sent:?} in {:?}", start.elapsed());
+    assert!(sent.is_ok(), "{sent:?}");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// The bound on the ask: a peer that is gone costs one wait, and the sends
+/// behind it fail as fast as they always did, so nothing here turns a retry
+/// loop into a broadcast loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_peer_costs_one_bounded_ask() {
+    let j = late_join("late-dead").await;
+    share_routes(&j.a, &j.a_dir, &j.b_dir).await;
+    let id_a = j.a.key.key_id.clone();
+    j.t.stop_shared().await.expect("T stops");
+    let send = |n: u8| {
+        let (t, id) = (std::sync::Arc::clone(&j.b.transport), id_a.clone());
+        async move {
+            let at = std::time::Instant::now();
+            let r = t.send(&id, &[b'{', n, b'}']).await;
+            (r.is_ok(), at.elapsed())
+        }
+    };
+    let (ok, first) = send(b'1').await;
+    let (_, second) = send(b'2').await;
+    eprintln!("[LATE] dead peer: first {first:?} ok={ok}, second {second:?}");
+    assert!(!ok, "the relay is gone: nothing can answer");
+    assert!(first < Duration::from_secs(5), "bounded: {first:?}");
+    assert!(
+        second < Duration::from_secs(1),
+        "no second wait: {second:?}"
+    );
+}
+
 fn env_secs(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -635,7 +813,10 @@ async fn late_joiner_measure() {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let (t_port, f_port) = (free_port(), free_udp_port());
-    let t = transport_node_ingress(t_port, f_port, ingress).await;
+    let target = u32::try_from(env_secs("LATE_TARGET", 0))
+        .ok()
+        .filter(|t| *t > 0);
+    let t = transport_node_limited(t_port, f_port, ingress, target).await;
     let key_a = Ident::new("node-a-late", 0x3a).await;
     let key_b = Ident::new("node-b-late", 0x3b).await;
     let (id_a, id_b) = (key_a.key_id.clone(), key_b.key_id.clone());
@@ -686,4 +867,84 @@ async fn late_joiner_measure() {
     );
     eprintln!("[LATE] T before B: {before:?}");
     eprintln!("[LATE] T after:    {:?}", t.transport_stats());
+}
+
+/// Measurement, run by hand: a real announce burst on a fresh `T` interface.
+/// `X` connects and announces `BURST_N` destinations at once; `Y`, already on
+/// `T`, reports when each reaches it. Held, dropped, and does it come back?
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: BURST_N, BURST_BUDGET, BURST_INGRESS"]
+async fn fresh_interface_burst_measure() {
+    use leviculum_core::Identity;
+    use leviculum_core::{Destination, DestinationType, Direction};
+    let (n, budget) = (env_secs("BURST_N", 12), env_secs("BURST_BUDGET", 150));
+    let ingress = env_secs("BURST_INGRESS", 1) == 1;
+    init_tracing();
+    let (t_port, f_port) = (free_port(), free_udp_port());
+    let t = transport_node_ingress(t_port, f_port, ingress).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{t_port}").parse().unwrap();
+    let client = || async {
+        let storage = tempfile::tempdir().expect("tempdir");
+        let mut node = ReticulumNodeBuilder::new()
+            .add_tcp_client(addr)
+            .storage_path(storage.path().to_path_buf())
+            .build()
+            .await
+            .expect("build a client");
+        std::mem::forget(storage);
+        node.start().await.expect("start a client");
+        let mut rx = node.take_event_receiver().expect("events");
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        node
+    };
+    let y = client().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let x = client().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut dests = Vec::new();
+    for i in 0..n {
+        let identity = Identity::generate(&mut rand::rngs::OsRng);
+        let aspect = format!("burst{i}");
+        let mut d = Destination::new(
+            Some(identity),
+            Direction::In,
+            DestinationType::Single,
+            "late",
+            &[aspect.as_str()],
+        )
+        .expect("destination");
+        d.set_accepts_links(true);
+        dests.push(*d.hash());
+        x.register_destination(d);
+    }
+    let start = std::time::Instant::now();
+    for d in &dests {
+        x.announce_destination(d, Some(b"burst"))
+            .await
+            .expect("announce");
+    }
+    let mut last = usize::MAX;
+    while start.elapsed() < Duration::from_secs(budget) {
+        let (at_t, at_y) = (
+            dests.iter().filter(|d| t.has_path(d)).count(),
+            dests.iter().filter(|d| y.has_path(d)).count(),
+        );
+        if at_t + at_y * 1_000 != last {
+            last = at_t + at_y * 1_000;
+            eprintln!(
+                "[BURST] t={:?} n={n} ingress={ingress} at_T={at_t} at_Y={at_y} ingress_drops={}",
+                start.elapsed(),
+                t.transport_stats().drops_ingress_burst_announce()
+            );
+        }
+        if at_y as u64 == n {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    eprintln!(
+        "[BURST] end {:?}: {:?}",
+        start.elapsed(),
+        t.transport_stats()
+    );
 }
