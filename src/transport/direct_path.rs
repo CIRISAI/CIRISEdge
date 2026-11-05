@@ -274,7 +274,7 @@ impl DirectLinksConfig {
             Proposing::On if !baked_dials_allowed => {
                 tracing::warn!(
                     "direct links: proposing on but no facilitator resolved: the baked \
-                     canonical is not dialled here (CIRISEdge#661), so nothing proposes"
+                     canonical is not dialled here (history: CIRISEdge#661), so nothing proposes"
                 );
             }
             Proposing::On => {
