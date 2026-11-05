@@ -16182,6 +16182,14 @@ async fn apply_keying(done: crate::transport::link_keying::KeyingDone, ctx: &Eve
         m.telemetry
             .observe_keying(done.standing, done.queued_at.elapsed());
     }
+    // A suspend can close the link and park this listener before its
+    // `LinkClosed` is drained, so the entry still says `Keying` here. The node
+    // no longer holds the link: there is nothing to key, and the close that
+    // follows finds it forgotten.
+    if !ctx.node.link_is_established(&link_id) {
+        ctx.seals.forget(&link);
+        return;
+    }
     match ctx.seals.finish_keying(link, done.ticket, done.outcome) {
         Inbound::Keyed { claimed } => {
             link_keyed(ctx, link_id, claimed).await;
