@@ -6108,8 +6108,8 @@ async fn note_backpressure_drop(
     // and sent the CIRISServer#607 RCA to the wrong place twice, while
     // the frames were queuing into an initiator that was never
     // listening. A responder's full inbox means its driver is stalled
-    // on a reply send (#373); an initiator's means replies outran the
-    // round being driven.
+    // in a step (#662; replies have their own lane since #943); an
+    // initiator's means replies outran the round being driven.
     let role_tag = match role {
         crate::replication::session::SessionRole::Initiator => "initiator",
         crate::replication::session::SessionRole::Responder => "responder",
@@ -6125,10 +6125,10 @@ async fn note_backpressure_drop(
         // was busy while the peer kept sending; say what it was busy
         // with. For a responder: `stepping` = inside the round step
         // (an apply that hybrid-verifies every row of a peer whose rows
-        // are all refused and re-offered each round), `sending` = a
-        // reply send to a churned peer (#373's stall), `idle` = the
+        // are all refused and re-offered each round), `idle` = the
         // driver is not running at all (a registered slot nobody
-        // drains — the trap the driver no longer falls into).
+        // drains — the trap the driver no longer falls into). A reply
+        // send is neither: the reply lane sends (#943).
         let (driver_phase, driver_phase_for_ms) = match registry.get(source, kind, role).await {
             Some(coord) => {
                 let (p, d) = coord.driver_phase();

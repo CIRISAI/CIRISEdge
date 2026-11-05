@@ -65,16 +65,6 @@ use super::session::SessionRole;
 use super::summary::{StateApplier, StateProvider};
 use crate::transport::Transport;
 
-/// CIRISEdge#373 — outer bound on a single responder reply send inside the drive
-/// loop, so a stalled reply can't park the inbound drain forever. Sized to sit
-/// just ABOVE the reverse-path progress-aware hard cap (`REVERSE_PATH_MAX_TRANSFER`
-/// = 45 s, v13.6.1) plus dial margin, so it never severs a LIVE, progressing
-/// large-resource transfer — that would re-open the exact live-link cut v13.6.1
-/// fixes. A DEAD link now fast-fails at the reverse-path no-progress window (~6 s),
-/// so this bound only bites a genuinely pathological send; a progressing transfer
-/// is delivering the trace, so letting it run is correct.
-const RESPONDER_REPLY_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// CIRISEdge#348 — drive a factory-created **Responder** coordinator.
 ///
 /// The registry only STORES a coordinator; the [`ReplicationScheduler`] drives
@@ -540,6 +530,7 @@ fn responder_round_clock(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
     use crate::replication::coordinator::DriverPhase;
+    use crate::replication::reply_lane::{self, Finish, ReplyLane};
     tokio::spawn(async move {
         use crate::observability as obs;
         let peer = coord.peer_key_id().to_string();
@@ -562,10 +553,13 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
         let mut round_began: Option<std::time::Instant> = None;
         // The round id the timer is anchored to (0: none / legacy).
         let mut timed_round: u64 = 0;
+        // CIRISEdge#943 — this loop steps, the lane sends: a reply the reverse
+        // path is holding never holds the frames behind it. See `reply_lane`.
+        let lane = ReplyLane::spawn(Arc::clone(&coord));
         loop {
             // CIRISEdge#662 — the phase gauge: this loop is the responder's ONE
             // drain, and when its inbox fills the drop site reads which of the
-            // three awaits below it was parked in, and for how long.
+            // two awaits below it was parked in, and for how long.
             coord.set_driver_phase(DriverPhase::Idle);
             // Channel closed ⇒ the coordinator was dropped; end the driver.
             // CIRISEdge#634 — take the frame WITH its round metadata so the
@@ -576,6 +570,15 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                 tracing::debug!(peer = %peer, ?kind, "responder driver ending (channel closed)");
                 break;
             };
+            if lane.take_send_failed() {
+                round_began = None;
+            }
+            // The park here used to bound what a frame that wants an answer
+            // could cost; a full lane is that bound now, before the step.
+            if reply_lane::wants_reply(&inbound.msg) && !lane.has_room() {
+                lane.shed(&coord, "frame");
+                continue;
+            }
             let began = responder_round_clock(
                 &mut round_began,
                 &mut timed_round,
@@ -585,78 +588,17 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
             coord.set_driver_phase(DriverPhase::Stepping);
             match coord.drive_round_step_framed(Some(inbound)).await {
                 Ok(DriveStep::SendThenWait(msgs)) => {
-                    coord.set_driver_phase(DriverPhase::Sending);
-                    for m in &msgs {
-                        // CIRISEdge#373 — BOUND the reply send. This loop is the
-                        // responder's only inbound drain; a reply that blocks here
-                        // (a reverse-path stall to a churning NAT'd peer + the
-                        // NAT-blocked dial fallback = up to ~130 s) parks the drain
-                        // while the peer keeps pushing frames, overflowing the
-                        // capacity-8 inbound channel and silently dropping 100% of
-                        // the trace. Cap it well under the round cadence so a stalled
-                        // reply yields the drain; the abandoned send is safe (its
-                        // awaits — resource wait, dial — are cancellation-tolerant,
-                        // and the anti-entropy protocol is idempotent + retried).
-                        match tokio::time::timeout(
-                            RESPONDER_REPLY_SEND_TIMEOUT,
-                            coord.send_message(m),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    peer = %peer, ?kind, error = %e,
-                                    link = %coord.last_inbound_link_hex(),
-                                    "responder reply send failed — round will not complete (history: CIRISEdge#348)"
-                                );
-                                count(obs::RESPONDER_ROUND_REPLY_SEND_FAILED);
-                                round_began = None;
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                count(obs::RESPONDER_ROUND_REPLY_SEND_FAILED);
-                                round_began = None;
-                                tracing::warn!(
-                                    peer = %peer, ?kind,
-                                    link = %coord.last_inbound_link_hex(),
-                                    timeout_secs = RESPONDER_REPLY_SEND_TIMEOUT.as_secs(),
-                                    "responder reply send TIMED OUT — abandoning it so the inbound \
-                                     drain resumes and the peer's trace is not dropped (history: CIRISEdge#373); \
-                                     the next round rides the peer's fresh link"
-                                );
-                                break;
-                            }
-                        }
+                    if !msgs.is_empty() {
+                        lane.enqueue(&coord, msgs, coord.current_round(), None);
                     }
                 }
                 // CIRISEdge#380 — defensive: `SendThenComplete` is initiator-only
                 // (`start_round` emits it; responders never start rounds). If it
                 // ever appears here, honor its semantics: send, then done.
                 Ok(DriveStep::SendThenComplete(msgs, report)) => {
-                    let mut failed = false;
-                    for m in &msgs {
-                        if let Err(e) = coord.send_message(m).await {
-                            tracing::warn!(
-                                peer = %peer, ?kind, error = %e,
-                                link = %coord.last_inbound_link_hex(),
-                                "responder SendThenComplete send failed (history: CIRISEdge#380)"
-                            );
-                            count(obs::RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED);
-                            failed = true;
-                            break;
-                        }
-                    }
                     round_began = None;
-                    if !failed {
-                        count(obs::RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL);
-                        tracing::info!(
-                            peer = %peer, ?kind, ?report,
-                            link = %coord.last_inbound_link_hex(),
-                            duration_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
-                            "responder round complete (initiator-final path, CIRISEdge#380)"
-                        );
-                    }
+                    let finish = Finish { report, began };
+                    lane.enqueue(&coord, msgs, coord.current_round(), Some(finish));
                 }
                 Ok(DriveStep::Complete(report)) => {
                     round_began = None;

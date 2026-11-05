@@ -199,8 +199,8 @@ pub struct ReplicationCoordinator {
     /// CIRISEdge#662 — what the DRIVER of this coordinator is doing right now
     /// (`DriverPhase` as `u8`), and since when (unix ms). A responder has ONE
     /// drain; when its inbox fills, the operator's only question is what that
-    /// drain was busy with — a reply send to a churned peer, or an apply that
-    /// hybrid-verifies every row of a peer whose rows are all refused. Read at
+    /// drain was busy with — an apply that hybrid-verifies every row of a peer
+    /// whose rows are all refused, say. Read at
     /// the drop site so the "inbox full" line answers it.
     driver_phase: std::sync::atomic::AtomicU8,
     driver_phase_since_ms: AtomicU64,
@@ -264,7 +264,7 @@ impl ReplicationCoordinator {
     pub const MAX_PULL_RETRY_AFTER_SECS: u64 = 3_600;
 
     /// CIRISEdge#662 — the driver records what it is doing. Called by the
-    /// responder driver around its three awaits; a coordinator nobody drives
+    /// responder driver around its two awaits; a coordinator nobody drives
     /// reads `Idle` since `0`.
     pub fn set_driver_phase(&self, phase: DriverPhase) {
         self.driver_phase.store(phase as u8, Ordering::Release);
@@ -921,13 +921,37 @@ impl ReplicationCoordinator {
             RoleInbox::Initiator { .. } => {
                 super::wire_frame::wrap_v3(msg, RoundSide::Initiator, self.on_demand_round())
             }
-            RoleInbox::Responder { bound_round, .. } => match bound_round.load(Ordering::Acquire) {
-                0 => super::wire_frame::wrap_for_kind(msg),
-                round => super::wire_frame::wrap_v3(msg, RoundSide::Responder, round),
-            },
+            RoleInbox::Responder { bound_round, .. } => {
+                Self::reply_frame(msg, bound_round.load(Ordering::Acquire))
+            }
         };
         self.transport
             .send(&self.peer_key_id, &bytes)
+            .await
+            .map(|_| ())
+            .map_err(CoordinatorError::from)
+    }
+
+    /// A responder's frame for `round`: echoed on v3, or on the v1/v2 raw path
+    /// when unbound (`0`, a pre-v26 initiator's legacy round).
+    fn reply_frame(msg: &ReplicationMessage, round: u64) -> Vec<u8> {
+        match round {
+            0 => super::wire_frame::wrap_for_kind(msg),
+            round => super::wire_frame::wrap_v3(msg, RoundSide::Responder, round),
+        }
+    }
+
+    /// Send a responder's reply stamped with `round`, the round bound when the
+    /// frame it answers was stepped (CIRISEdge#943): the reply lane sends after
+    /// the driver has moved on, and by then a `Pull`'s round may have rebound
+    /// this responder.
+    pub(super) async fn send_reply(
+        &self,
+        msg: &ReplicationMessage,
+        round: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.transport
+            .send(&self.peer_key_id, &Self::reply_frame(msg, round))
             .await
             .map(|_| ())
             .map_err(CoordinatorError::from)
@@ -1289,8 +1313,9 @@ impl ReplicationCoordinator {
 /// Step the [`ReplicationCoordinator::drive_round_step`] driver
 /// returns. The caller threads these to make progress on the round.
 /// CIRISEdge#662 — where a coordinator's driver is, as a closed set. The
-/// responder driver is one loop with three awaits, and an inbox that fills
-/// fills because that loop is parked in one of them.
+/// responder driver is one loop with two awaits, and an inbox that fills fills
+/// because that loop is parked in one of them. Replies are not one of them
+/// (CIRISEdge#943): the reply lane sends, and counts its own shed and expired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DriverPhase {
@@ -1300,9 +1325,6 @@ pub enum DriverPhase {
     /// Deliver's rows (persist hybrid-verifies each; a peer whose rows are all
     /// refused re-offers the same maximal Deliver every round).
     Stepping = 1,
-    /// Inside a reply `send_message` — the #373 stall: a reverse-path send to a
-    /// churned peer, bounded by `RESPONDER_REPLY_SEND_TIMEOUT`.
-    Sending = 2,
 }
 
 impl DriverPhase {
@@ -1310,7 +1332,6 @@ impl DriverPhase {
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Stepping,
-            2 => Self::Sending,
             _ => Self::Idle,
         }
     }
@@ -1319,7 +1340,6 @@ impl DriverPhase {
         match self {
             Self::Idle => "idle",
             Self::Stepping => "stepping",
-            Self::Sending => "sending",
         }
     }
 }

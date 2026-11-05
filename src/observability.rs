@@ -1422,13 +1422,20 @@ pub const RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL: &str = "completed_initiator
 pub const RESPONDER_ROUND_REPLY_SEND_FAILED: &str = "reply_send_failed";
 /// CIRISEdge#853 — a send on the initiator-final path failed.
 pub const RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED: &str = "send_then_complete_failed";
+/// CIRISEdge#943 — a frame that wanted an answer met a full reply lane: not
+/// stepped, not answered; the peer's round times out and its next one is served.
+pub const RESPONDER_ROUND_REPLY_SHED: &str = "reply_shed";
+/// CIRISEdge#943 — a reply outlived its round in the lane and was not sent.
+pub const RESPONDER_ROUND_REPLY_EXPIRED: &str = "reply_expired";
 /// Every `responder_rounds_total` outcome token.
-pub const RESPONDER_ROUND_OUTCOMES: [&str; 5] = [
+pub const RESPONDER_ROUND_OUTCOMES: [&str; 7] = [
     RESPONDER_ROUND_STARTED,
     RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL,
     RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL,
     RESPONDER_ROUND_REPLY_SEND_FAILED,
     RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED,
+    RESPONDER_ROUND_REPLY_SHED,
+    RESPONDER_ROUND_REPLY_EXPIRED,
 ];
 
 /// CIRISEdge#853 — `responder_link_up_seconds` stage: the dialer's link-borne

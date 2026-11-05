@@ -160,8 +160,8 @@ pub enum RegistryError {
     #[error("replication protocol error: {0}")]
     Protocol(#[from] CoordinatorError),
     /// The matching coordinator's inbox is full — back-pressure surfaces.
-    /// `role` says WHOSE inbox: a responder's means its driver is stalled on
-    /// a reply send (#373); an initiator's means replies outran the round
+    /// `role` says WHOSE inbox: a responder's means its driver is stalled in
+    /// a step (#662); an initiator's means replies outran the round
     /// being driven. The caller typically logs and drops.
     #[error("{role:?} inbox full for peer={peer_key_id} kind={kind:?}")]
     BackPressure {

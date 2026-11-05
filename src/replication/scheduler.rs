@@ -33,7 +33,8 @@
 //! Responder-side rounds need no scheduler: the runtime's
 //! `spawn_responder_drive` task drains the responder's inbox, steps the
 //! session (`drive_round_step_framed`, which rebinds and resets on a new
-//! round) and sends each reply stamped with the round it answers.
+//! round) and queues each reply, stamped with the round it answers, on its
+//! reply lane (CIRISEdge#943).
 //!
 //! ## Cancellation
 //!

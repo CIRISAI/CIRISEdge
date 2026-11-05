@@ -153,6 +153,7 @@ mod park_fresh_858_tests;
 pub mod protocol;
 pub mod refusal_backoff;
 pub mod registry;
+mod reply_lane;
 pub mod resolved_state;
 #[cfg(test)]
 mod responder_drain_943_tests;
