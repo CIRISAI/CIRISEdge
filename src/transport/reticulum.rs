@@ -8989,6 +8989,34 @@ impl ReticulumTransport {
         out
     }
 
+    /// No path and no link: ask, before the bootstrap dial that only a one-hop
+    /// neighbour can answer. The caller is past its reuse check on purpose: a
+    /// peer that dialled this node needs no path to be sent to. Returns the
+    /// dial target, unchanged unless the ask found a path.
+    async fn ask_before_dialling(
+        &self,
+        candidates: &[DialCandidate],
+        peer: ResolvedPeer,
+        has_path: bool,
+        establish_timeout: Duration,
+    ) -> (ResolvedPeer, bool, Duration) {
+        let dests: Vec<DestinationHash> = candidates.iter().map(|c| c.dest_hash).collect();
+        if !has_path && self.seek_paths(&dests).await {
+            let pathed: Vec<(DialSource, bool)> = candidates
+                .iter()
+                .map(|c| (c.source, self.node.has_path(&c.dest_hash)))
+                .collect();
+            if let Some(i) = select_dial_candidate(&pathed) {
+                let found = ResolvedPeer {
+                    dest_hash: candidates[i].dest_hash,
+                    transport_ed25519: candidates[i].transport_ed25519,
+                };
+                return (found, pathed[i].1, LINK_ESTABLISH_TIMEOUT);
+            }
+        }
+        (peer, has_path, establish_timeout)
+    }
+
     /// Ask the network for a path to any of `dests`, and wait, boundedly, for
     /// the answer. Returns whether one is known at the end.
     ///
@@ -9423,25 +9451,9 @@ impl ReticulumTransport {
             // The gate is per-destination so other peers still dial in parallel.
             // CIRISEdge#568 — the dial runs in a SPAWNED task, not inline.
             //
-            // No path and no link: ask, before the bootstrap dial that only a
-            // one-hop neighbour can answer. Past the reuse check on purpose:
-            // a peer that dialled this node needs no path to be sent to.
-            let dests: Vec<DestinationHash> = candidates.iter().map(|c| c.dest_hash).collect();
-            let (peer, has_path, establish_timeout) = if !has_path && self.seek_paths(&dests).await
-            {
-                let pathed: Vec<(DialSource, bool)> = candidates
-                    .iter()
-                    .map(|c| (c.source, self.node.has_path(&c.dest_hash)))
-                    .collect();
-                let i = select_dial_candidate(&pathed).unwrap_or(chosen_idx);
-                let peer = ResolvedPeer {
-                    dest_hash: candidates[i].dest_hash,
-                    transport_ed25519: candidates[i].transport_ed25519,
-                };
-                (peer, pathed[i].1, LINK_ESTABLISH_TIMEOUT)
-            } else {
-                (peer, has_path, establish_timeout)
-            };
+            let (peer, has_path, establish_timeout) = self
+                .ask_before_dialling(candidates, peer, has_path, establish_timeout)
+                .await;
             // `round_timeout` is 10 s; a pathed peer's `establish_timeout` is
             // `LINK_ESTABLISH_TIMEOUT` (30 s). Inline, a cold dial could never
             // finish inside the round that started it, and the scheduler
