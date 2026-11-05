@@ -2466,6 +2466,96 @@ async fn a_refused_dial_comes_back_off_the_beat() {
     );
 }
 
+/// **Witness (#947, v44 LTS)** — a transit KEX that panics costs one link: real
+/// handshake, real worker. The panic is contained and counted, the dialler's
+/// link is refused by name and closed, and the same pool keys its re-dial and
+/// other links, so the worker was not lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_keying_costs_one_link_and_no_worker_947() {
+    let t = trio("panic", true, false, false).await;
+    t.a.transport.panic_next_decaps_for_test(1);
+    let first = marked(b"LTS-PANIC-FIRST-", 600);
+    let _ = t.b.transport.send(&t.a.key.key_id, &first).await;
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.transport.keyer_panics_for_test() == 1
+        })
+        .await,
+        "the panic happened and was caught: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            t.a.seal(ciris_edge::observability::LINK_SEAL_REFUSED_MALFORMED) >= 1
+        })
+        .await,
+        "the link was refused by name: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(!t.a.received(&first).await, "nothing came through it");
+    one_way(&t.b, &t.a, 1, b"LTS-PANIC-REDIAL-")
+        .await
+        .expect("the pool keys the re-dial");
+    one_way(&t.c, &t.a, 2, b"LTS-PANIC-OTHER-")
+        .await
+        .expect("and another peer's link");
+    assert_eq!(
+        t.a.transport.keyer_load_for_test().0,
+        0,
+        "the queue drained"
+    );
+}
+
+/// **Witness (#947, v44 LTS)** — a suspend that lands while a link is keying
+/// leaves nothing behind: the suspend gets to quiescent with the decapsulation
+/// still on the blocking pool, its outcome lands on no link, and after resume
+/// the pool, the queue and a fresh dial all work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspend_during_keying_leaves_nothing_behind_947() {
+    let t = trio("suspendkey", true, false, false).await;
+    let hold = Duration::from_secs(3);
+    t.a.transport.set_decap_delay_for_test(hold);
+    let frame = marked(b"LTS-SUSPEND-KEYING-", 600);
+    let sender = Arc::clone(&t.b.transport);
+    let key = t.a.key.key_id.clone();
+    let bytes = frame.clone();
+    let send = tokio::spawn(async move { sender.send(&key, &bytes).await });
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.transport.decapsulations_for_test() > 0
+        })
+        .await,
+        "the keying is under way"
+    );
+    let report = t.a.transport.suspend(Duration::from_secs(10)).await;
+    assert!(
+        report.quiescent,
+        "suspended with a keying running: {report:?}"
+    );
+    assert!(report.links_open == 0, "{report:?}");
+    tokio::time::sleep(hold + Duration::from_millis(500)).await;
+    assert!(!t.a.received(&frame).await, "the keying opened nothing");
+    t.a.transport.set_decap_delay_for_test(Duration::ZERO);
+    t.a.transport.resume().await.expect("resume");
+    let _ = send.await;
+    assert_eq!(
+        t.a.transport.keyer_load_for_test().0,
+        0,
+        "the queue is empty"
+    );
+    let landed = wait_until(Duration::from_secs(30), || async {
+        one_way(&t.b, &t.a, 1, b"LTS-SUSPEND-AFTER-")
+            .await
+            .is_some()
+    })
+    .await;
+    assert!(
+        landed,
+        "a fresh dial keys after resume: {:?}",
+        t.a.metrics.link_seal()
+    );
+}
+
 /// A process restart of `B`: a new transport over the same identity and
 /// directory, holding what persist holds and nothing else.
 async fn restart_b(t: &Trio) -> (Arc<ReticulumTransport>, EdgeMetrics) {

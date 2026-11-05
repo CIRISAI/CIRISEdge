@@ -327,6 +327,12 @@ impl Keyer {
         q.standing.len() + q.strangers.len()
     }
 
+    /// Keyings that panicked and were contained.
+    #[must_use]
+    pub fn panicked(&self) -> u64 {
+        self.panicked.load(Ordering::Relaxed)
+    }
+
     /// The pool's size.
     #[must_use]
     pub fn workers(&self) -> usize {

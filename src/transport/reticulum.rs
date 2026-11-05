@@ -5820,6 +5820,18 @@ impl ReticulumTransport {
         self.seals.set_stranger_handshake_cap(cap);
     }
 
+    /// v44 LTS test seam — the next `n` decapsulations panic.
+    #[doc(hidden)]
+    pub fn panic_next_decaps_for_test(&self, n: u64) {
+        self.seals.panic_next_decaps(n);
+    }
+
+    /// v44 LTS test seam — keyings that panicked and were contained.
+    #[doc(hidden)]
+    pub fn keyer_panics_for_test(&self) -> u64 {
+        self.keyer.panicked()
+    }
+
     /// CIRISEdge#947 test seam — the caps on links awaiting a handshake.
     #[doc(hidden)]
     pub fn set_awaiting_caps_for_test(&self, links: usize, bytes: usize) {

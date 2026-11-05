@@ -773,6 +773,8 @@ pub struct LinkSeals {
     decap_delay_ms: AtomicU64,
     /// Decapsulations run.
     decaps: AtomicU64,
+    /// Test seam: how many decapsulations panic from now.
+    decap_panics: AtomicU64,
     /// Test seam: how long a responder's first words wait, in milliseconds.
     first_words_delay_ms: AtomicU64,
 }
@@ -810,6 +812,7 @@ impl LinkSeals {
             awaiting_bytes_max: AtomicUsize::new(AWAITING_BYTES_MAX),
             decap_delay_ms: AtomicU64::new(0),
             decaps: AtomicU64::new(0),
+            decap_panics: AtomicU64::new(0),
             first_words_delay_ms: AtomicU64::new(0),
         }
     }
@@ -949,11 +952,17 @@ impl LinkSeals {
         if !live {
             return None;
         }
+        self.decaps.fetch_add(1, Ordering::Relaxed);
         let delay = self.decap_delay_ms.load(Ordering::Relaxed);
         if delay > 0 {
             std::thread::sleep(Duration::from_millis(delay));
         }
-        self.decaps.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            self.decap_panics
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_err(),
+            "test seam: a panicking transit KEX"
+        );
         Some(av_transit_handshake::respond(
             &job.handshake,
             &job.link,
@@ -1074,6 +1083,11 @@ impl LinkSeals {
             u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+    }
+
+    /// Test seam: the next `n` decapsulations panic.
+    pub fn panic_next_decaps(&self, n: u64) {
+        self.decap_panics.store(n, Ordering::Relaxed);
     }
 
     /// Test seam: hold a responder's first words on a keyed link this long.
