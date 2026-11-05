@@ -1706,6 +1706,9 @@ enum SweepWindow<'a> {
     Watermark(&'a str),
 }
 
+/// The dimension prefix the per-recipient trace consent gate governs.
+const TRACE_DIMENSION_PREFIX: &str = "trace:";
+
 /// CIRISEdge#531 DEPTH — the Attestation sweep's per-ROUND state, threaded
 /// across the round's pages.
 ///
@@ -1727,6 +1730,8 @@ struct AttestationSweepCtx {
     serve_allowed: Option<bool>,
     /// CIRISEdge#396 item 6 — per-owner parsed consent grants.
     grant_cache: HashMap<String, Vec<ConsentTransferPolicy>>,
+    /// The per-recipient `trace:` consent reads, for this round and this peer.
+    trace_consent: TraceConsentMemo,
     /// CIRISEdge#440 — is the `trace:*` plane paused by a live relief?
     trace_paused: bool,
     /// Book the pause ONCE per round, not once per page and not once per row.
@@ -1736,6 +1741,29 @@ struct AttestationSweepCtx {
     /// CC 5.2 (v19.0.0) — the per-sweep principal / cohort memo for the
     /// AUDIENCE gate ([`FederationDirectoryReplicationBridge::audience_withholds`]).
     audience: AudienceMemo,
+}
+
+/// One live egress grant, reduced to what the per-recipient `trace:` gate asks
+/// of it: who it names and which dimensions it covers.
+struct TraceGrant {
+    subject_key_ids: Vec<String>,
+    attestation_prefixes: Vec<String>,
+}
+
+/// What [`FederationDirectoryReplicationBridge::trace_recipient_withholds`]
+/// reads, memoized for one round (the sweep) or one Deliver ([`ServeMemos`]) and
+/// never longer: every field is live directory state, read again next round, so
+/// a withdrawn grant or a changed owner reaches this gate at the next round.
+/// That is why the peer's owner is read here rather than through the bridge's
+/// 30 s owner memo. Scoped to one peer by both holders.
+#[derive(Default)]
+struct TraceConsentMemo {
+    /// The owners of this node's consent keys. `None`: not read yet.
+    own_owners: Option<HashSet<String>>,
+    /// Live egress grants by the key whose egress they cover.
+    grants: HashMap<String, Vec<TraceGrant>>,
+    /// The peer's owner. Outer `None`: not read yet.
+    peer_owner: Option<Option<String>>,
 }
 
 /// CC 5.2 / CIRISConstitution#23 (v19.0.0) — what the AUDIENCE gate resolves,
@@ -1788,6 +1816,7 @@ struct ServeMemos {
     audience: AudienceMemo,
     quarantine: HashMap<String, QuarantineConsult>,
     grants: HashMap<String, Vec<ConsentTransferPolicy>>,
+    trace_consent: TraceConsentMemo,
 }
 
 impl ServeMemos {
@@ -4811,6 +4840,19 @@ impl FederationDirectoryReplicationBridge {
                         // #433 — item 6 was the purest silent withhold on this path.
                         // Countable now, booked inside `recipient_capability_withholds`
                         // at the deciding branch, so this site does not re-count.
+                        return None;
+                    }
+                    // The per-recipient `trace:` consent, booked inside.
+                    if self
+                        .trace_recipient_withholds(
+                            inner,
+                            &Self::audience_of_row_value(inner),
+                            &recipient,
+                            &mut memos.trace_consent,
+                            "fetch",
+                        )
+                        .await
+                    {
                         return None;
                     }
                 }
@@ -7847,6 +7889,246 @@ impl FederationDirectoryReplicationBridge {
         false
     }
 
+    /// Is this placement delivered to a cohort rather than to the federation?
+    /// Membership is the authority over such a row: persist's audience resolver
+    /// puts the peer among its members (see the serve floor in
+    /// [`Self::audience_withholds`]).
+    fn audience_is_cohort_delivered(audience: &ciris_persist::federation::Audience) -> bool {
+        use ciris_persist::federation::Audience;
+        matches!(
+            audience,
+            Audience::SelfOnly
+                | Audience::Family { .. }
+                | Audience::Community { .. }
+                | Audience::Affiliations { .. }
+        )
+    }
+
+    /// **Sharing traces is its own consent, per recipient.** True iff serving
+    /// `row` to `peer` would hand a `trace:` row of this node's own authorship
+    /// (or its owner's) to a peer no live `consent:replication` grant covers it
+    /// for. Announce (be found) and share traces are separate consents, and
+    /// nothing else asks this: a grant's prefixes act at PROMOTION, by the union
+    /// of every grant, and the tier that results is global, while send-set
+    /// membership reads only `subject_key_ids`. One grant covering `trace:` would
+    /// otherwise reach every serve-capable consent peer, including one holding
+    /// only an announce grant.
+    ///
+    /// **`trace:` only.** A prefix test, not the `requires_serve_capability`
+    /// family gate, which also covers every family this build does not know.
+    ///
+    /// **Not gated, each on purpose:**
+    /// - *A relayed row.* A row some other key authored is that producer's flow,
+    ///   consented at its own node; a canonical passing an agent's traces to a
+    ///   lens holds no grant from that agent and needs none, since its reach is
+    ///   the #379 capability gate's. The author test is NOT the self-publish set:
+    ///   that set carries third parties' anchored keys, and the relay would be
+    ///   cut for exactly those.
+    /// - *A first party.* The subject's right to its own testimony, as on the
+    ///   subject-Pull and the fetch twin of `recipient_capability`.
+    /// - *A cohort-delivered placement.* The audience gate already narrowed it to
+    ///   the cohort's nodes, and the owner's own nodes hold no grant to read: an
+    ///   owner's consent to their own node is a category error (CC 3.2).
+    ///
+    /// **The grants read** are persist's
+    /// [`live_egress_grants_by_principals`](ciris_persist::federation::consent_by_humans::live_egress_grants_by_principals)
+    /// of each consent key and of the row's author: a machine's own grants and
+    /// the ones its stewards authored naming it in `for_key_id`, the set the
+    /// promotion sweep and the send set read. **The peer** is named by a grant's
+    /// subjects directly, or through its owner, the send set's own #524 axis (a
+    /// grant names a person; their node is how they are reached).
+    ///
+    /// Nothing here knows what a canonical is: a canonical is a peer like any
+    /// other, answered from live grants. The row-level `infra:serve` gate is what
+    /// asks about its standing.
+    ///
+    /// Booked here, on both paths; each path decides one row per call.
+    async fn trace_recipient_withholds(
+        &self,
+        row: &serde_json::Value,
+        audience: &Result<ciris_persist::federation::Audience, String>,
+        peer: &str,
+        memo: &mut TraceConsentMemo,
+        site: &str,
+    ) -> bool {
+        let dimension = Self::row_dimension(row);
+        if !dimension.starts_with(TRACE_DIMENSION_PREFIX)
+            || Self::attestation_is_first_party_to(row, peer)
+            || audience
+                .as_ref()
+                .is_ok_and(Self::audience_is_cohort_delivered)
+        {
+            return false;
+        }
+        let Some(author) = row.get("attesting_key_id").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let decision = match self.authors_own_traces(author, memo).await {
+            Ok(false) => return false,
+            Ok(true) => self.trace_grant_names(author, dimension, peer, memo).await,
+            Err(e) => Err(e),
+        };
+        self.book_trace_decision(decision, dimension, peer, site)
+    }
+
+    /// Book what [`Self::trace_recipient_withholds`] decided; `true` withholds.
+    /// Split out because the fail-closed arm is not reachable through a
+    /// `SqliteBackend` fixture: persist refuses a second owner-binding, so
+    /// `AmbiguousNodeOwner` cannot be seeded, and an in-memory read does not
+    /// fail.
+    fn book_trace_decision(
+        &self,
+        decision: Result<bool, ciris_persist::federation::Error>,
+        dimension: &str,
+        peer: &str,
+        site: &str,
+    ) -> bool {
+        use crate::observability::WithholdReason;
+        match decision {
+            Ok(true) => false,
+            Ok(false) => {
+                self.withhold(
+                    WithholdReason::TraceNotConsentedToRecipient,
+                    peer,
+                    dimension,
+                );
+                tracing::debug!(
+                    peer,
+                    dimension,
+                    site,
+                    "trace withheld — no live consent:replication grant naming this peer \
+                     (or its owner) covers the row's dimension"
+                );
+                true
+            }
+            Err(e) => {
+                self.withhold(WithholdReason::TraceConsentReadError, peer, dimension);
+                tracing::warn!(
+                    peer,
+                    dimension,
+                    site,
+                    error = %e,
+                    "trace withheld — the consent read FAILED (fail-closed). A read error, \
+                     not a statement about what was consented to"
+                );
+                true
+            }
+        }
+    }
+
+    /// Is `author` this node, one of its consent keys, or the owner of one? An
+    /// owner read that fails (`AmbiguousNodeOwner` among them) is an `Err`: this
+    /// node cannot then tell its owner's row from a relayed one.
+    async fn authors_own_traces(
+        &self,
+        author: &str,
+        memo: &mut TraceConsentMemo,
+    ) -> Result<bool, ciris_persist::federation::Error> {
+        let Some(local) = self.local_key_id.as_deref() else {
+            return Ok(false);
+        };
+        let keys = self.consent_keys(local);
+        if author == local || keys.contains(&author) {
+            return Ok(true);
+        }
+        if memo.own_owners.is_none() {
+            let mut owners = HashSet::new();
+            for key in keys.into_iter().chain(std::iter::once(local)) {
+                owners.extend(self.read_owner(key).await?);
+            }
+            memo.own_owners = Some(owners);
+        }
+        Ok(memo
+            .own_owners
+            .as_ref()
+            .is_some_and(|owners| owners.contains(author)))
+    }
+
+    /// Does a live grant over `author`'s egress, or a consent key's, cover
+    /// `dimension` and name `peer` or `peer`'s owner?
+    async fn trace_grant_names(
+        &self,
+        author: &str,
+        dimension: &str,
+        peer: &str,
+        memo: &mut TraceConsentMemo,
+    ) -> Result<bool, ciris_persist::federation::Error> {
+        let mut keys = self
+            .local_key_id
+            .as_deref()
+            .map_or_else(Vec::new, |local| self.consent_keys(local));
+        keys.push(author);
+        for key in &keys {
+            if !memo.grants.contains_key(*key) {
+                let grants = self.read_live_trace_grants(key).await?;
+                memo.grants.insert((*key).to_owned(), grants);
+            }
+        }
+        let subjects = || {
+            keys.iter()
+                .filter_map(|key| memo.grants.get(*key))
+                .flatten()
+                .filter(|g| consent_grammar::covers(&g.attestation_prefixes, dimension))
+                .flat_map(|g| g.subject_key_ids.iter())
+        };
+        if subjects().any(|s| s == peer) {
+            return Ok(true);
+        }
+        if subjects().next().is_none() {
+            return Ok(false);
+        }
+        let peer_owner = match &memo.peer_owner {
+            Some(owner) => owner.clone(),
+            None => self.read_owner(peer).await?,
+        };
+        let named = peer_owner
+            .as_deref()
+            .is_some_and(|owner| subjects().any(|s| s == owner));
+        memo.peer_owner = Some(peer_owner);
+        Ok(named)
+    }
+
+    /// `key`'s owner, read from the directory now: see [`TraceConsentMemo`].
+    async fn read_owner(
+        &self,
+        key: &str,
+    ) -> Result<Option<String>, ciris_persist::federation::Error> {
+        ciris_persist::federation::admission::owner_of(&*self.directory, key).await
+    }
+
+    /// The grants that authorize `key`'s egress of attestations NOW: the terms
+    /// the promotion sweep's `load_active_egress_grants` applies, so a grant that
+    /// sweep declines (ingress, a non-propagating principle, lapsed, malformed)
+    /// covers nothing here either.
+    async fn read_live_trace_grants(
+        &self,
+        key: &str,
+    ) -> Result<Vec<TraceGrant>, ciris_persist::federation::Error> {
+        let now = chrono::Utc::now();
+        let grants =
+            ciris_persist::federation::consent_by_humans::live_egress_grants_by_principals(
+                &*self.directory,
+                key,
+            )
+            .await?;
+        Ok(grants
+            .into_iter()
+            .filter(|grant| grant.expires_at.is_none_or(|at| at > now))
+            .filter_map(|grant| {
+                let policy =
+                    consent_grammar::parse_grant_payload(&grant.attestation_envelope).ok()?;
+                (policy.direction == consent_grammar::Direction::Egress
+                    && policy.principle.propagates()
+                    && policy.kinds.iter().any(|k| k == "Attestation")
+                    && policy.valid_until.is_none_or(|at| at > now))
+                .then(|| TraceGrant {
+                    subject_key_ids: grant.subject_key_ids,
+                    attestation_prefixes: policy.attestation_prefixes,
+                })
+            })
+            .collect())
+    }
+
     /// CIRISEdge#440 ask 3 — is this row's AUTHOR under a live tier-2
     /// quarantine (`quarantine:withheld:v1`, persist's marker fold)?
     ///
@@ -8570,13 +8852,7 @@ impl FederationDirectoryReplicationBridge {
         // 3.1.3.2; `membership_first_contact_756`, the second PR run's
         // finding). The floor narrows the federation-scope planes, which is
         // what CC rc9 I3 is about.
-        let cohort_delivered = matches!(
-            audience,
-            ciris_persist::federation::Audience::SelfOnly
-                | ciris_persist::federation::Audience::Family { .. }
-                | ciris_persist::federation::Audience::Community { .. }
-                | ciris_persist::federation::Audience::Affiliations { .. }
-        );
+        let cohort_delivered = Self::audience_is_cohort_delivered(&audience);
         let self_authored = self
             .self_provider
             .as_ref()
@@ -8797,6 +9073,19 @@ impl FederationDirectoryReplicationBridge {
             (peer != local && !peer.is_empty())
                 .then(|| ResolvedPeerSet::first_contact_recipient(peer))
         })
+    }
+
+    /// The keys whose consent the send set reads: the host's
+    /// `consent_subject_key_ids`, else `local`.
+    fn consent_keys<'a>(&'a self, local: &'a str) -> Vec<&'a str> {
+        if self.consent_subject_key_ids.is_empty() {
+            vec![local]
+        } else {
+            self.consent_subject_key_ids
+                .iter()
+                .map(String::as_str)
+                .collect()
+        }
     }
 
     /// The keys whose consent the send set reads, for a log line.
@@ -9077,16 +9366,8 @@ impl FederationDirectoryReplicationBridge {
         //
         // The keys whose consent is read are `consent_subject_key_ids` when
         // the host named them (the agent, on a split home), else `local`.
-        let subjects: Vec<&str> = if self.consent_subject_key_ids.is_empty() {
-            vec![local]
-        } else {
-            self.consent_subject_key_ids
-                .iter()
-                .map(String::as_str)
-                .collect()
-        };
         let mut peers: Vec<String> = Vec::new();
-        for subject in subjects {
+        for subject in self.consent_keys(local) {
             match ciris_persist::federation::consent_by_humans::consent_peers_by_principals(
                 &*self.directory,
                 subject,
@@ -9394,6 +9675,7 @@ impl FederationDirectoryReplicationBridge {
                 .collect(),
             serve_allowed: None,
             grant_cache: HashMap::new(),
+            trace_consent: TraceConsentMemo::default(),
             trace_paused: self.trace_plane_paused().await,
             trace_pause_booked: false,
             quarantine_memo: HashMap::new(),
@@ -9863,6 +10145,20 @@ impl FederationDirectoryReplicationBridge {
                         peer.as_str(),
                         peer.reach(),
                         &mut ctx.audience,
+                        "advertise",
+                    )
+                    .await
+                {
+                    continue;
+                }
+                // The per-recipient `trace:` consent, after the audience gate so
+                // a peer that gate refuses keeps its more specific reason.
+                if self
+                    .trace_recipient_withholds(
+                        &canonical_json,
+                        &Self::audience_of_view(&canonical_json),
+                        peer.as_str(),
+                        &mut ctx.trace_consent,
                         "advertise",
                     )
                     .await
@@ -26395,6 +26691,10 @@ pub(crate) mod tests {
     // CIRISEdge#817 — the sweep-bound witnesses: single-flight memos and the
     // permit around the membership-plane and send-set reads.
     mod sweep_bounds_817;
+
+    // Sharing traces is its own consent, per recipient: the serve gate's
+    // refuse and allow sides, and the live-state witnesses.
+    mod trace_recipient_consent;
 
     // CIRISServer native T2 — rows stranded behind the advertise watermark
     // when an advertise input changes, and the round summary's arithmetic.

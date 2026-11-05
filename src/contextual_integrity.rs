@@ -296,7 +296,9 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         WithholdReason::ServeCapabilityMissing
         | WithholdReason::ServeCapabilityReadError
         | WithholdReason::ServeCapabilityNotRooted
-        | WithholdReason::RecipientCapabilityRestriction => CiParameter::TransmissionPrinciple,
+        | WithholdReason::RecipientCapabilityRestriction
+        | WithholdReason::TraceNotConsentedToRecipient
+        | WithholdReason::TraceConsentReadError => CiParameter::TransmissionPrinciple,
 
         // CIRISEdge#169 — a propagation node's TERMS OF CARRIAGE. Each of
         // these is the node's published rule about how a flow may pass
@@ -858,7 +860,7 @@ mod tests {
     /// So: when adding a reason, add it here too, and on a merge that touches
     /// this file check the count against the enum rather than trusting a
     /// green suite.
-    const ALL_REASONS: [WithholdReason; 50] = [
+    const ALL_REASONS: [WithholdReason; 52] = [
         WithholdReason::EnvelopeUnfetchable,
         WithholdReason::LocalIdentityMissing,
         WithholdReason::SendSetUnresolved,
@@ -868,6 +870,8 @@ mod tests {
         WithholdReason::ServeCapabilityNotRooted,
         WithholdReason::TrustRootWalkError,
         WithholdReason::RecipientCapabilityRestriction,
+        WithholdReason::TraceNotConsentedToRecipient,
+        WithholdReason::TraceConsentReadError,
         WithholdReason::RowNotSerializable,
         WithholdReason::RowHashUndecodable,
         WithholdReason::ConfigPaused,
