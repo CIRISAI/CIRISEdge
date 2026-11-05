@@ -254,7 +254,7 @@ impl ReplyLane {
                 queued_bytes = self.state.bytes.load(Ordering::Acquire),
                 suppressed_prev,
                 "responder reply lane FULL — shed, unanswered: replies to this peer are not \
-                 leaving; its round times out and the next one is served (CIRISEdge#943)"
+                 leaving; its round times out and the next one is served (history: CIRISEdge#943)"
             );
         }
     }
@@ -310,7 +310,7 @@ async fn run(
                     queued_ms = u64::try_from(queued.as_millis()).unwrap_or(u64::MAX),
                     suppressed_prev,
                     "responder reply EXPIRED in the lane — its round has been given up on, \
-                     so it is not sent (CIRISEdge#943)"
+                     so it is not sent (history: CIRISEdge#943)"
                 );
             }
         } else {

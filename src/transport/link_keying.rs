@@ -341,7 +341,7 @@ impl Keyer {
                     tracing::error!(
                         link = %hex::encode(job.link()),
                         "the transit KEX panicked on a handshake; the link is refused and the \
-                         worker lives (CIRISEdge#947)"
+                         worker lives (history: CIRISEdge#947)"
                     );
                     Err(AvHandshakeError::Malformed("the transit KEX panicked"))
                 }
