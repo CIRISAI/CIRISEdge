@@ -196,6 +196,7 @@ fn every_label_constant_is_in_its_family_list() {
         ("AV_", AV_PLANE_LABELS),
         ("ALM_", AV_PLANE_LABELS),
         ("LINK_STALL_", LINK_STALL_LABELS),
+        ("ADVERTISE_", crate::observability::ADVERTISE_LABELS),
         ("PEER_BINDING_", PEER_BINDING_LABELS),
     ] {
         for value in constants(prefix) {

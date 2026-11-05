@@ -1576,6 +1576,8 @@ struct SweepCursors {
     /// Monotonic tick, incremented on every touch, so eviction can be LRU
     /// without a clock.
     tick: u64,
+    /// Evictions not yet counted ([`Self::take_evicted`]).
+    evicted: u64,
 }
 
 /// CIRISEdge#531 DEPTH — how many `(peer, plane)` watermarks are retained.
@@ -1669,17 +1671,34 @@ impl SweepCursors {
     }
 
     /// An advertise input changed: every watermark that passed a skipped row
-    /// rewinds its new-rows cursor to the earliest skip, so the next round
-    /// re-reads from there. Returns how many `(peer, plane)` watermarks moved.
+    /// re-reads from the earliest skip. Returns how many `(peer, plane)`
+    /// watermarks moved.
+    ///
+    /// A peer that has reached the tip keeps it: the re-read is the re-sweep's
+    /// to do, from the mark. Moving `high_water` there instead made the head
+    /// walk full pages back to the tip, and inputs changing faster than that
+    /// walk finished kept it there, reaching neither the tip nor the re-sweep,
+    /// so new rows stopped being listed. A peer still catching up has no
+    /// re-sweep: its forward walk is the sweep, and that is what rewinds.
     fn rewind_skipped(&mut self) -> usize {
         let mut moved = 0;
         for wm in self.by_peer_plane.values_mut() {
             if let Some(mark) = wm.skip_mark.take() {
-                wm.high_water = mark.into_since();
+                if wm.caught_up {
+                    wm.backfill = mark.into_since();
+                } else {
+                    wm.high_water = mark.into_since();
+                }
                 moved += 1;
             }
         }
         moved
+    }
+
+    /// Evictions since the last call, for the counter: this map has no
+    /// metrics handle.
+    fn take_evicted(&mut self) -> u64 {
+        std::mem::take(&mut self.evicted)
     }
 
     /// The new-rows and re-sweep positions for `key` (the round summary).
@@ -1727,6 +1746,18 @@ impl SweepCursors {
              CIRISEdge#531)"
         );
         self.by_peer_plane.remove(&victim);
+        self.evicted += 1;
+    }
+}
+
+/// A sweep page's read failed: distinct from an empty page, which is the end
+/// of the plane.
+#[derive(Debug)]
+struct SweepReadError(String);
+
+impl std::fmt::Display for SweepReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -3483,7 +3514,32 @@ impl FederationDirectoryReplicationBridge {
 
     /// CIRISEdge#531 DEPTH — this round's NEW-ROWS `since` for `key`.
     fn sweep_head(&self, key: &(String, EnvelopeKind)) -> Option<ResumeCursor> {
-        self.sweep_cursors.lock().ok().and_then(|mut c| c.head(key))
+        let (head, evicted) = self
+            .sweep_cursors
+            .lock()
+            .map(|mut c| (c.head(key), c.take_evicted()))
+            .unwrap_or_default();
+        if let Some(m) = &self.metrics {
+            for _ in 0..evicted {
+                m.inc_advertise(crate::observability::ADVERTISE_WATERMARK_EVICTED);
+            }
+        }
+        head
+    }
+
+    /// A sweep page's read failed. Its cursor holds: an empty page here would
+    /// read as the end of the plane, wrapping a re-sweep that never finished or
+    /// marking a cold peer caught up. The row is offered when the read works.
+    fn sweep_read_failed(&self, key: &(String, EnvelopeKind), error: &dyn std::fmt::Display) {
+        if let Some(m) = &self.metrics {
+            m.inc_advertise(crate::observability::ADVERTISE_READ_FAILED);
+        }
+        tracing::warn!(
+            peer = %key.0,
+            kind = ?key.1,
+            %error,
+            "advertise sweep read FAILED — the cursor holds and this round lists what it had"
+        );
     }
 
     /// CIRISEdge#531 DEPTH — record the new-rows page; get the backfill plan.
@@ -3532,7 +3588,7 @@ impl FederationDirectoryReplicationBridge {
         &self,
         since: Option<ResumeCursor>,
         budget: u32,
-    ) -> (Vec<Vec<u8>>, usize, Option<ResumeCursor>) {
+    ) -> Result<(Vec<Vec<u8>>, usize, Option<ResumeCursor>), SweepReadError> {
         let bundles = match self
             .directory
             .list_signed_accord_quorum_evidence_since(since, budget)
@@ -3544,7 +3600,7 @@ impl FederationDirectoryReplicationBridge {
                     error = %e,
                     "accord-quorum-evidence cursor serve read failed (history: CIRISEdge#474)"
                 );
-                return (Vec::new(), 0, None);
+                return Err(SweepReadError(e.to_string()));
             }
         };
         let read = bundles.len();
@@ -3601,7 +3657,7 @@ impl FederationDirectoryReplicationBridge {
                  rides the next round from this peer's watermark (CIRISEdge#531)"
             );
         }
-        (out, read, last)
+        Ok((out, read, last))
     }
 
     /// CIRISEdge#531 DEPTH — record the backfill page (advance, or wrap).
@@ -3654,7 +3710,7 @@ impl FederationDirectoryReplicationBridge {
     where
         T: serde::Serialize,
         Read: Fn(Option<ResumeCursor>, u32) -> Fut,
-        Fut: std::future::Future<Output = Vec<S>>,
+        Fut: std::future::Future<Output = Result<Vec<S>, SweepReadError>>,
         RS: Fn(&S) -> ResumeCursor,
         IN: Fn(&S) -> bool,
         TS: Fn(&S) -> u64,
@@ -3669,7 +3725,13 @@ impl FederationDirectoryReplicationBridge {
             for page in 0..MAX_FULL_DRAIN_PAGES {
                 let (served, last) = {
                     let _permit = self.sweep_gate.enter().await;
-                    let rows = read(since.clone(), budget).await;
+                    let rows = match read(since.clone(), budget).await {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            tracing::warn!(?kind, %error, "holdings sweep read FAILED");
+                            return refs;
+                        }
+                    };
                     self.record_page(rows.len());
                     self.advertise_page_into(
                         &rows,
@@ -3733,7 +3795,13 @@ impl FederationDirectoryReplicationBridge {
         let head = self.sweep_head(&key);
         let (served, last) = {
             let _permit = self.sweep_gate.enter().await;
-            let rows = read(head.clone(), budget).await;
+            let rows = match read(head.clone(), budget).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    self.sweep_read_failed(&key, &e);
+                    return refs;
+                }
+            };
             self.record_page(rows.len());
             if let Some(mark) = first_skip(&head, &rows) {
                 if let Ok(mut c) = self.sweep_cursors.lock() {
@@ -3746,7 +3814,13 @@ impl FederationDirectoryReplicationBridge {
         if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
             let (b_served, b_last) = {
                 let _permit = self.sweep_gate.enter().await;
-                let rows = read(plan.since.clone(), plan.budget).await;
+                let rows = match read(plan.since.clone(), plan.budget).await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        self.sweep_read_failed(&key, &e);
+                        return refs;
+                    }
+                };
                 self.record_page(rows.len());
                 if let Some(mark) = first_skip(&plan.since, &rows) {
                     if let Ok(mut c) = self.sweep_cursors.lock() {
@@ -4386,16 +4460,30 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             // An UNATTRIBUTED pull keeps no position — there is no peer to keep
             // it for. It gets one budgeted page from the declared floor, which
             // is the pre-#531 behaviour bounded.
-            return self.accord_evidence_page(floor, budget).await.0;
+            return self
+                .accord_evidence_page(floor, budget)
+                .await
+                .map_or_else(|_| Vec::new(), |page| page.0);
         };
         let head = Self::later_cursor(self.sweep_head(&key), floor.clone());
-        let (mut out, served, last) = self.accord_evidence_page(head, budget).await;
+        let (mut out, served, last) = match self.accord_evidence_page(head, budget).await {
+            Ok(page) => page,
+            Err(e) => {
+                self.sweep_read_failed(&key, &e);
+                return Vec::new();
+            }
+        };
         if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
-            let (mut more, b_served, b_last) = self
+            match self
                 .accord_evidence_page(Self::later_cursor(plan.since, floor), plan.budget)
-                .await;
-            out.append(&mut more);
-            self.sweep_after_backfill(&key, b_served, plan.budget, b_last);
+                .await
+            {
+                Ok((mut more, b_served, b_last)) => {
+                    out.append(&mut more);
+                    self.sweep_after_backfill(&key, b_served, plan.budget, b_last);
+                }
+                Err(e) => self.sweep_read_failed(&key, &e),
+            }
         }
         out
     }
@@ -7098,7 +7186,7 @@ impl FederationDirectoryReplicationBridge {
                 self.directory
                     .list_signed_transport_destinations_since(since, limit)
                     .await
-                    .unwrap_or_default()
+                    .map_err(|e| SweepReadError(e.to_string()))
             },
             ciris_persist::federation::ServedTransportDestination::resume_pair,
             |row| {
@@ -9937,7 +10025,7 @@ impl FederationDirectoryReplicationBridge {
             //    drained a page at a time. No peer ⇒ no watermark to keep.
             let mut since: Option<ResumeCursor> = None;
             for _ in 0..MAX_FULL_DRAIN_PAGES {
-                let (served, last, _counts) = self
+                let page = self
                     .attestation_page(
                         since.clone(),
                         budget,
@@ -9948,6 +10036,9 @@ impl FederationDirectoryReplicationBridge {
                         &mut seen,
                     )
                     .await;
+                let Ok((served, last, _counts)) = page else {
+                    break;
+                };
                 if served < budget as usize || last.is_none() || last == since {
                     break;
                 }
@@ -9968,7 +10059,7 @@ impl FederationDirectoryReplicationBridge {
             .map(|c| c.positions(&key))
             .unwrap_or_default();
         let head = self.sweep_head(&key);
-        let (served, last, head_counts) = self
+        let head_page = self
             .attestation_page(
                 head,
                 budget,
@@ -9979,6 +10070,13 @@ impl FederationDirectoryReplicationBridge {
                 &mut seen,
             )
             .await;
+        let (served, last, head_counts) = match head_page {
+            Ok(page) => page,
+            Err(e) => {
+                self.sweep_read_failed(&key, &e);
+                return refs;
+            }
+        };
         let mut listed = served;
         let mut counts = head_counts;
         let mut resweep: Option<(Option<ResumeCursor>, usize, bool)> = None;
@@ -9986,7 +10084,7 @@ impl FederationDirectoryReplicationBridge {
             if plan.since.is_none() {
                 self.resweep_cycle_started(&key);
             }
-            let (b_served, b_last, b_counts) = self
+            let page = self
                 .attestation_page(
                     plan.since.clone(),
                     plan.budget,
@@ -9997,15 +10095,21 @@ impl FederationDirectoryReplicationBridge {
                     &mut seen,
                 )
                 .await;
-            self.sweep_after_backfill(&key, b_served, plan.budget, b_last);
-            let wrapped = b_served < plan.budget as usize;
-            self.resweep_cycle_step(&key, wrapped);
-            listed += b_served;
-            counts.not_advertisable += b_counts.not_advertisable;
-            counts.duplicate += b_counts.duplicate;
-            counts.offered += b_counts.offered;
-            counts.reoffered_after_skip += b_counts.reoffered_after_skip;
-            resweep = Some((plan.since, b_served, wrapped));
+            match page {
+                Ok((b_served, b_last, b_counts)) => {
+                    self.sweep_after_backfill(&key, b_served, plan.budget, b_last);
+                    let wrapped = b_served < plan.budget as usize;
+                    self.resweep_cycle_step(&key, wrapped);
+                    listed += b_served;
+                    counts.not_advertisable += b_counts.not_advertisable;
+                    counts.duplicate += b_counts.duplicate;
+                    counts.offered += b_counts.offered;
+                    counts.reoffered_after_skip += b_counts.reoffered_after_skip;
+                    resweep = Some((plan.since, b_served, wrapped));
+                }
+                // The re-sweep holds where it was; the head page stands.
+                Err(e) => self.sweep_read_failed(&key, &e),
+            }
         }
         let (wm_after, _) = self
             .sweep_cursors
@@ -10199,7 +10303,7 @@ impl FederationDirectoryReplicationBridge {
         mark_key: Option<&(String, EnvelopeKind)>,
         refs: &mut Vec<EnvelopeRef>,
         seen: &mut HashSet<[u8; 32]>,
-    ) -> (usize, Option<ResumeCursor>, PageCounts) {
+    ) -> Result<(usize, Option<ResumeCursor>, PageCounts), SweepReadError> {
         let mut counts = PageCounts::default();
         let mut prev = since.clone();
         let _permit = self.sweep_gate.enter().await;
@@ -10207,7 +10311,7 @@ impl FederationDirectoryReplicationBridge {
             .directory
             .list_attestations_since(since, budget)
             .await
-            .unwrap_or_default();
+            .map_err(|e| SweepReadError(e.to_string()))?;
         self.record_page(attestations.len());
         let served = attestations.len();
         let last = attestations
@@ -10458,7 +10562,7 @@ impl FederationDirectoryReplicationBridge {
                 }
             }
         }
-        (served, last, counts)
+        Ok((served, last, counts))
     }
 
     /// Why [`Self::attestation_is_advertised`] refused a row (the only two
@@ -11176,7 +11280,7 @@ impl FederationDirectoryReplicationBridge {
                 self.directory
                     .list_signed_location_proofs_since(since, limit)
                     .await
-                    .unwrap_or_default()
+                    .map_err(|e| SweepReadError(e.to_string()))
             },
             ciris_persist::federation::ServedLocationProof::resume_pair,
             |s| cohort.contains(&s.proof.location_proof.subject_key_id),
@@ -26882,11 +26986,11 @@ pub(crate) mod tests {
                             async move {
                                 // persist's predicate, verbatim in Rust:
                                 // ORDER BY (pos, id), strictly greater than the PAIR.
-                                corpus
+                                Ok(corpus
                                     .into_iter()
                                     .filter(|(c, _)| since.as_ref().map_or(true, |sc| c > sc))
                                     .take(limit as usize)
-                                    .collect::<Vec<_>>()
+                                    .collect::<Vec<_>>())
                             }
                         },
                         |row: &(ResumeCursor, String)| row.0.clone(),
@@ -26904,6 +27008,127 @@ pub(crate) mod tests {
                  — the watermark is resuming on the timestamp instead of the \
                  `(pos, id)` pair persist serves (CIRISPersist#668/CIRISEdge#531)"
             );
+        }
+
+        /// A read that failed is not the end of the plane. On the head page a
+        /// cold peer must not be marked caught up, and on the re-sweep the
+        /// cycle must not wrap: the cursor holds, and the next good read
+        /// carries on from the same row.
+        #[tokio::test]
+        async fn a_failed_read_holds_the_cursor_on_the_head_and_on_the_resweep() {
+            let (_backend, bridge) = paged_bridge(&[], 2);
+            let tie = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("instant");
+            let corpus: Vec<(ResumeCursor, String)> = (0..5)
+                .map(|i| ((tie, format!("id-{i}")), format!("row-{i}")))
+                .collect();
+            let key = ("peer-fail".to_owned(), EnvelopeKind::Key);
+            let round = |fail_after: Option<usize>| {
+                let corpus = corpus.clone();
+                let bridge = &bridge;
+                async move {
+                    let reads = std::sync::atomic::AtomicUsize::new(0);
+                    bridge
+                        .sweep_paged(
+                            EnvelopeKind::Key,
+                            SweepWindow::Watermark("peer-fail"),
+                            |since: Option<ResumeCursor>, limit: u32| {
+                                let corpus = corpus.clone();
+                                let n = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                async move {
+                                    if fail_after.is_some_and(|f| n >= f) {
+                                        return Err(SweepReadError("the store is down".to_owned()));
+                                    }
+                                    Ok(corpus
+                                        .into_iter()
+                                        .filter(|(c, _)| since.as_ref().map_or(true, |sc| c > sc))
+                                        .take(limit as usize)
+                                        .collect::<Vec<_>>())
+                                }
+                            },
+                            |row: &(ResumeCursor, String)| row.0.clone(),
+                            |_| true,
+                            |_| 0u64,
+                            |row| &row.1,
+                        )
+                        .await
+                }
+            };
+            let positions = || bridge.sweep_cursors.lock().unwrap().positions(&key);
+            let caught_up = || {
+                bridge
+                    .sweep_cursors
+                    .lock()
+                    .unwrap()
+                    .by_peer_plane
+                    .get(&key)
+                    .is_some_and(|w| w.caught_up)
+            };
+            // A cold peer's head read fails: it is not caught up.
+            assert!(round(Some(0)).await.is_empty());
+            assert!(!caught_up(), "an empty failed read is not the plane's end");
+            assert_eq!(positions(), (None, None));
+            // Walk to the tip, a page a round, then a short page.
+            for _ in 0..3 {
+                round(None).await;
+            }
+            assert!(caught_up());
+            round(None).await;
+            let before = positions();
+            assert!(before.1.is_some(), "the re-sweep is under way: {before:?}");
+            // The head reads, the re-sweep fails: it holds, it does not wrap.
+            round(Some(1)).await;
+            assert_eq!(positions().1, before.1, "the re-sweep held its place");
+        }
+
+        /// A rewind on a peer at the tip goes to the re-sweep: with inputs
+        /// changing every round, the head stays at the tip and every new row
+        /// is still listed. Moved to the mark, the head walked pages back to
+        /// the tip and each change sent it back again.
+        #[test]
+        fn repeated_input_changes_leave_a_caught_up_head_at_the_tip() {
+            let mut c = SweepCursors::default();
+            let k = ("peer-tip".to_owned(), EnvelopeKind::Attestation);
+            c.after_head(&k, 1, 4, Some(cur(1))); // short: caught up
+            assert_eq!(c.head(&k), Some(cur(1)));
+            let early = cur(0);
+            for n in 2..50 {
+                c.note_skip(&k, SkipMark::before(Some(early.clone())));
+                assert_eq!(c.rewind_skipped(), 1);
+                let tip = c.head(&k);
+                assert_eq!(tip, Some(cur(n - 1)), "the head stays at the tip");
+                let plan = c
+                    .after_head(&k, 1, 4, Some(cur(n)))
+                    .expect("a short head leaves room for the re-sweep");
+                assert_eq!(
+                    plan.since,
+                    Some(early.clone()),
+                    "the re-read is the re-sweep's"
+                );
+            }
+        }
+
+        /// A peer still walking forward has no re-sweep to take the re-read:
+        /// its walk does.
+        #[test]
+        fn a_rewind_before_the_tip_moves_the_forward_walk() {
+            let mut c = SweepCursors::default();
+            let k = ("peer-cold".to_owned(), EnvelopeKind::Attestation);
+            c.after_head(&k, 4, 4, Some(cur(8)));
+            c.note_skip(&k, SkipMark::before(Some(cur(3))));
+            assert_eq!(c.rewind_skipped(), 1);
+            assert_eq!(c.head(&k), Some(cur(3)));
+        }
+
+        /// Every eviction reaches the counter, which is how a thrashing map
+        /// shows, the log being at DEBUG.
+        #[test]
+        fn an_eviction_is_counted_for_the_counter() {
+            let mut c = SweepCursors::default();
+            for i in 0..MAX_TRACKED_SWEEP_CURSORS + 3 {
+                c.head(&(format!("peer-{i}"), EnvelopeKind::Key));
+            }
+            assert_eq!(c.take_evicted(), 3);
+            assert_eq!(c.take_evicted(), 0, "taken once");
         }
 
         /// **The transient-refusal door-stop.** v18.4.0's AV-45

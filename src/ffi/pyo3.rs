@@ -3159,6 +3159,11 @@ fn metrics_bundle_to_pydict<'py>(
         link_stall.set_item(label.as_str(), *n)?;
     }
     root.set_item("link_stall", link_stall)?;
+    let advertise = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.advertise {
+        advertise.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("advertise", advertise)?;
     root.set_item("direct_links_active", bundle.direct_links_active)?;
     // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
     // a missing install and a membership refusal are two numbers.

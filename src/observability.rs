@@ -1259,6 +1259,11 @@ pub const ADVERTISE_REOFFERED_AFTER_SKIP: &str = "advertise_reoffered_after_skip
 pub const ADVERTISE_WATERMARK_REWOUND: &str = "advertise_watermark_rewound";
 /// A rolling re-sweep cycle that walked its plane to the end.
 pub const ADVERTISE_RESWEEP_CYCLE_COMPLETED: &str = "advertise_resweep_cycle_completed";
+/// v44 LTS — a `(peer, plane)` cursor evicted at the cap: that peer re-sweeps
+/// the plane from its start. Steady growth means the map is thrashing.
+pub const ADVERTISE_WATERMARK_EVICTED: &str = "advertise_watermark_evicted";
+/// v44 LTS — a sweep page's read failed: the cursor held, nothing wrapped.
+pub const ADVERTISE_READ_FAILED: &str = "advertise_read_failed";
 /// A rolling re-sweep cycle still running past its bound.
 pub const ADVERTISE_RESWEEP_CYCLE_OVERDUE: &str = "advertise_resweep_cycle_overdue";
 /// A request or response that completed on a link a peer dialled before the
@@ -1793,6 +1798,16 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_EPOCH_RESYNC,
     ALM_LOOP_DETECTED,
     ALM_OVER_CLAIM,
+];
+/// Every `advertise` key.
+pub const ADVERTISE_LABELS: &[&str] = &[
+    ADVERTISE_NOT_ADVERTISABLE,
+    ADVERTISE_REOFFERED_AFTER_SKIP,
+    ADVERTISE_WATERMARK_REWOUND,
+    ADVERTISE_WATERMARK_EVICTED,
+    ADVERTISE_READ_FAILED,
+    ADVERTISE_RESWEEP_CYCLE_COMPLETED,
+    ADVERTISE_RESWEEP_CYCLE_OVERDUE,
 ];
 /// Every `link_stall` key.
 pub const LINK_STALL_LABELS: &[&str] = &[
@@ -3598,6 +3613,7 @@ impl EdgeMetrics {
             peer_binding: registered(&self.peer_binding, PEER_BINDING_LABELS),
             key_plane_sweep: self.key_plane_sweep(),
             link_stall: registered(&self.link_stall, LINK_STALL_LABELS),
+            advertise: registered(&self.advertise, ADVERTISE_LABELS),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
@@ -3925,6 +3941,8 @@ pub struct EdgeMetricsBundle {
     pub key_plane_sweep: HashMap<String, u64>,
     /// CIRISEdge#926 — the link stall guard by `LINK_STALL_*` label.
     pub link_stall: HashMap<String, u64>,
+    /// `advertise.<label>`: the advertise sweep's ledger.
+    pub advertise: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
     pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
@@ -4343,6 +4361,7 @@ impl EdgeMetricsBundle {
         f.family("key_plane_sweep", &self.key_plane_sweep);
         // CIRISEdge#926 — the link stall guard, `link_stall.<label>`.
         f.family("link_stall", &self.link_stall);
+        f.family("advertise", &self.advertise);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
             "direct_links_active".to_string(),
@@ -4650,6 +4669,7 @@ edge_metrics_bundle_fields!(
     peer_binding,
     key_plane_sweep,
     link_stall,
+    advertise,
     direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,

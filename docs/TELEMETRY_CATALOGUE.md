@@ -109,7 +109,8 @@ counts handshakes whose link closed in the queue: they cost no crypto.
    `replication_reply_wait_seconds{kind}` separate the event loop from a
    responder lane. `replication_reply_queued{sum,max}`: `max` near 8 is one
    reverse-dead peer. `reply_shed` and `reply_expired` are in
-   `responder_rounds_total`.
+   `responder_rounds_total`. So is `reply_shed_node`: a frame that reads bodies
+   unanswered at the node-wide 64 MiB bound, its own lane having room.
 
 ### Why did this call fail over?
 
@@ -238,6 +239,7 @@ to it, and a 1 is not visible from anywhere else.
 | `peer_binding` | `ciris.edge.peer_binding` | counter | count | operator-only |
 | `key_plane_sweep` | `ciris.edge.key_plane.sweep` | counter | count | operator-only |
 | `link_stall` | `ciris.edge.link_stall` | counter | count | operator-only |
+| `advertise` | `ciris.edge.advertise` | counter | count | operator-only |
 | `direct_links_active` | `ciris.edge.direct_links.active` | gauge | count | operator-only |
 | `replication_routed_to_responder_total` | `ciris.edge.replication.routed.responder` | counter | count | operator-only |
 | `replication_routed_to_initiator_total` | `ciris.edge.replication.routed.initiator` | counter | count | operator-only |
