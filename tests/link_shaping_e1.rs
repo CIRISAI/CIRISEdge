@@ -22,6 +22,7 @@ use ciris_edge::replication::{
 };
 use ciris_edge::transport::link_shaping::{
     BudgetClass, DeviceKind, DeviceState, ShapedSharePolicy, ShapingPolicy, REFERENCE_FRAME_BYTES,
+    SEAT_BYTES_PER_S,
 };
 use ciris_edge::transport::reticulum::{
     ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
@@ -1133,10 +1134,78 @@ async fn at_the_bound_an_off_peer_still_gets_an_ordinary_unshaped_link() {
     assert_eq!(t.a.transport.shaped_link_count(), 0);
 }
 
+/// Frame size for the rate witness: about 37 frames/s at the seat row.
+const RATE_FRAME_BYTES: u16 = 900;
+/// How long the rate witness counts.
+const RATE_WINDOW: Duration = Duration::from_secs(20);
+/// A healthy stream is allowed to fall this far below λ: each gap is followed
+/// by a timer wake and a send, which on a real link are not free (measured
+/// about 5% at the 16 KB frame), so a real stream runs under a pure Poisson's.
+const STREAM_SLOWDOWN_ALLOWED: f64 = 0.8;
+/// The false-failure rate of each side of the rate witness.
+const STREAM_FALSE_FAILURE: f64 = 1e-6;
+
+/// `ln P(X = k)` for `X ~ Poisson(mu)`.
+#[allow(clippy::cast_precision_loss)] // counts far below 2^52
+fn poisson_ln_pmf(k: u64, mu: f64) -> f64 {
+    let ln_factorial: f64 = (2..=k).map(|i| (i as f64).ln()).sum();
+    k as f64 * mu.ln() - mu - ln_factorial
+}
+
+/// `P(X >= k)` for `X ~ Poisson(mu)`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // a small positive μ
+fn poisson_tail(k: u64, mu: f64) -> f64 {
+    let far = k + 40 + (20.0 * mu.sqrt()) as u64;
+    (k..far).map(|i| poisson_ln_pmf(i, mu).exp()).sum()
+}
+
+/// The counts a stream at rate `lambda` stays inside over `secs`, each side
+/// failing an honest stream at most [`STREAM_FALSE_FAILURE`]: the floor from a
+/// stream slowed by [`STREAM_SLOWDOWN_ALLOWED`], the ceiling from λ itself, as
+/// nothing makes a stream run fast. Panics unless the floor also catches a
+/// stream at HALF the rate, so a change of frame or window cannot quietly turn
+/// this into a bound that passes a collapse.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // a small positive μ
+fn stream_bounds(lambda: f64, secs: f64) -> (u64, u64) {
+    let mu = lambda * secs;
+    let slow = mu * STREAM_SLOWDOWN_ALLOWED;
+    let mut floor = 0;
+    let mut below = 0.0;
+    loop {
+        below += poisson_ln_pmf(floor, slow).exp();
+        if below > STREAM_FALSE_FAILURE {
+            break;
+        }
+        floor += 1;
+    }
+    let mut ceiling = mu as u64;
+    while poisson_tail(ceiling + 1, mu) > STREAM_FALSE_FAILURE {
+        ceiling += 1;
+    }
+    assert!(
+        poisson_tail(floor, mu / 2.0) < STREAM_FALSE_FAILURE,
+        "a stream at half the rate would pass a floor of {floor}"
+    );
+    (floor, ceiling)
+}
+
+/// The bounds come out as derived by hand, and they refuse to be built where
+/// they could not see a stream at half the rate.
+#[test]
+fn stream_bounds_separate_a_healthy_rate_from_half_of_it() {
+    let lambda = f64::from(SEAT_BYTES_PER_S) / f64::from(RATE_FRAME_BYTES);
+    let (floor, ceiling) = stream_bounds(lambda, RATE_WINDOW.as_secs_f64());
+    assert_eq!((floor, ceiling), (475, 866));
+    assert!(
+        std::panic::catch_unwind(|| stream_bounds(2.03, 10.0)).is_err(),
+        "the old 10 s count at 2/s cannot see half the rate"
+    );
+}
+
 /// **The `seat` class on a real pair** (CC 5.4.3 rc17, `CLM-seat-class`): two
 /// nodes both named serve seats agree the table's 33,000 B/s (about 2 frames/s
 /// at the loopback frame) and a row crosses; the frame stream runs at that
-/// rate. A seat facing a node it cannot prove a seat runs at the normal class
+/// rate, bounded by [`stream_bounds`] at a smaller frame. A seat facing a node it cannot prove a seat runs at the normal class
 /// (lower of the two offers).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_proved_seats_shape_at_the_seat_row_and_a_non_seat_gets_the_class() {
@@ -1163,14 +1232,47 @@ async fn two_proved_seats_shape_at_the_seat_row_and_a_non_seat_gets_the_class() 
         rates.iter().any(|l| (l - 2.03).abs() < 0.05),
         "the seat link agreed 33,000 B/s: {rates:?}"
     );
-    let frames0 =
-        t.b.shaping("link_shaping_frames_real") + t.b.shaping("link_shaping_frames_cover");
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    let frames = t.b.shaping("link_shaping_frames_real") + t.b.shaping("link_shaping_frames_cover")
-        - frames0;
+
+    // The stream runs at that rate. The rate is bytes over frame, so a small
+    // frame gives the count enough events to bound: this was once ~20 frames
+    // in 10 s against 12..=32, which fails an honest stream about 1 run in 40
+    // and cannot tell a stream at half the rate from a good one.
+    let r = duo("seat-rate", server.clone(), server.clone()).await;
+    let seats: std::collections::HashSet<String> = [r.a.key.key_id.clone(), r.b.key.key_id.clone()]
+        .into_iter()
+        .collect();
+    for n in [&r.a, &r.b] {
+        n.transport.set_seats_for_test(seats.clone(), true);
+        n.transport
+            .set_shaped_frame_cap_for_test(usize::from(RATE_FRAME_BYTES));
+    }
+    let row = typed_payload("AttestationGossip", b"SEAT-RATE-", 400);
+    r.b.transport
+        .send(&r.a.key.key_id, &row)
+        .await
+        .expect("seat -> seat");
     assert!(
-        (12..=32).contains(&frames),
-        "about 20 frames in 10 s at 2/s: {frames}"
+        wait_until(Duration::from_secs(30), || async {
+            r.a.received(&row).await
+        })
+        .await
+    );
+    let lambda = r.b.transport.shaped_rates_for_test()[0];
+    let nominal = f64::from(SEAT_BYTES_PER_S) / f64::from(RATE_FRAME_BYTES);
+    assert!(
+        (lambda / nominal - 1.0).abs() < 0.01,
+        "the agreed rate is the seat row: {lambda} against {nominal}"
+    );
+    let (floor, ceiling) = stream_bounds(lambda, RATE_WINDOW.as_secs_f64());
+    let count =
+        || r.b.shaping("link_shaping_frames_real") + r.b.shaping("link_shaping_frames_cover");
+    let frames0 = count();
+    tokio::time::sleep(RATE_WINDOW).await;
+    let frames = count() - frames0;
+    eprintln!("seat stream: {frames} frames, bounds {floor}..={ceiling}");
+    assert!(
+        (floor..=ceiling).contains(&frames),
+        "{frames} frames in {RATE_WINDOW:?} at {lambda}/s, bounds {floor}..={ceiling}"
     );
 
     // A seat and a node it cannot prove: the normal class.

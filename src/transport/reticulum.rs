@@ -5795,6 +5795,13 @@ impl ReticulumTransport {
         self.seals.set_decap_delay(delay);
     }
 
+    /// Test seam — cap the frame this node offers on a shaped link, so a rate
+    /// witness on a real link sees enough frames to bound.
+    #[doc(hidden)]
+    pub fn set_shaped_frame_cap_for_test(&self, bytes: usize) {
+        self.shapers.set_frame_cap_for_test(bytes);
+    }
+
     /// CIRISEdge#947 test seam — a responder's first words on a keyed link
     /// wait this long first, as they do on a link whose peer withholds its
     /// Channel proofs.
