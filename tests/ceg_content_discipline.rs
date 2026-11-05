@@ -23,6 +23,8 @@
 //! transformation (the spec is normative on the shape, not on which
 //! transport carries the holder list).
 
+#![cfg(feature = "_reticulum-module")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
