@@ -111,6 +111,19 @@ impl DecisionLog {
         self.hasher.update(&self.buf);
         self.count += 1;
         *self.counters.entry(kind).or_insert(0) += 1;
+        // The one place every decision passes. Peers only at DEBUG: an INFO
+        // line says what happened and never to whom.
+        tracing::debug!(
+            target: "edge.alm.decision",
+            ?kind,
+            subject = ?subject,
+            value,
+            reason,
+            "ALM decision"
+        );
+        if kind == DecisionKind::Failover {
+            tracing::info!(target: "edge.alm.failover", reason, value, "ALM failover");
+        }
         if self.tail_cap > 0 {
             if self.tail.len() == self.tail_cap {
                 self.tail.pop_front();

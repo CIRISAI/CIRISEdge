@@ -93,6 +93,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::observability::{LinkCloseCause, LinkPoolCloseReason};
+use crate::telemetry::{EventLabel, LoopName};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -2506,6 +2507,9 @@ pub struct ReticulumTransport {
     /// [`AnnounceCtx`]. `None` (the default) keeps every pre-#530 construction
     /// site compiling unchanged and leaves intake evictions loud-but-uncounted.
     metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
+    /// v44 — the node's ladder ([`Transport::attach_load_ladder`]): the node
+    /// tick folds edge's own signals and moves the shapers and admission.
+    load_ladder: std::sync::OnceLock<Arc<crate::load_ladder::SharedLadder>>,
     /// CIRISEdge#809 — this transport's process-unique id for the per-source
     /// gauges in [`crate::observability::EdgeMetrics`] (several transports
     /// may share one bag).
@@ -4078,6 +4082,7 @@ impl ReticulumTransport {
             config,
             // CIRISEdge#530 — off by default; attach with `with_metrics`.
             metrics: std::sync::OnceLock::new(),
+            load_ladder: std::sync::OnceLock::new(),
             metrics_source: {
                 static NEXT_METRICS_SOURCE: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(1);
@@ -6365,6 +6370,9 @@ impl ReticulumTransport {
             DirectOutcome, DirectPath, DirectPathState, DIRECT_PATH_BUDGET,
         };
         if !self.direct_paths.config.proposes() {
+            if let Some(m) = self.metrics.get() {
+                m.inc_direct_link(self.direct_paths.config.off_label());
+            }
             return DirectPath::NotConfigured;
         }
         // ONE deadline over the identity-link dial, the proposal and its
@@ -6614,6 +6622,9 @@ impl ReticulumTransport {
                 return;
             }
             direct_paths.clear_yield(&peer);
+            if let Some(m) = metrics.as_ref() {
+                m.inc_direct_link(crate::observability::DIRECT_LINK_YIELD_EXPIRED);
+            }
             let now = std::time::Instant::now();
             if lifecycle.is_suspended()
                 || !direct_standing(table.as_deref(), &direct_paths, &peer)
@@ -7780,7 +7791,13 @@ impl ReticulumTransport {
         &self,
         policy: crate::transport::link_shaping::ShapingPolicy,
     ) -> usize {
-        let upgraded = !self.shapers.policy().offers_on(false) && policy.offers_on(false);
+        let before = self.shapers.policy();
+        if before.class != policy.class || before.enabled() != policy.enabled() {
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_POLICY_MOVED);
+            }
+        }
+        let upgraded = !before.offers_on(false) && policy.offers_on(false);
         let mut close = self.shapers.set_policy(policy);
         if upgraded {
             close.extend(self.unshaped_row_links().await);
@@ -9571,6 +9588,7 @@ impl ReticulumTransport {
             }
             let node = Arc::clone(&self.node);
             let fallbacks = Arc::clone(&self.bulk_fallbacks);
+            let ledger = self.metrics.get().cloned();
             let pause = SlowPathPause {
                 shapers: Arc::clone(&self.shapers),
                 peer: destination_key_id.to_owned(),
@@ -9579,6 +9597,13 @@ impl ReticulumTransport {
             tokio::spawn(async move {
                 let result = run_bulk_fallback(&node, link, &shaper, frames, &pause).await;
                 fallbacks.finish(&digest, result.is_ok());
+                if let Some(m) = ledger {
+                    m.inc_link_shaping(if result.is_ok() {
+                        crate::observability::LINK_SHAPING_BULK_FALLBACK_OK
+                    } else {
+                        crate::observability::LINK_SHAPING_BULK_FALLBACK_FAILED
+                    });
+                }
                 // choke-ok: every waiter may have gone; the record above stands.
                 let _ = tx.send(Some(result));
             });
@@ -10069,6 +10094,18 @@ impl ReticulumTransport {
             // real frames confirmed sent), bounded by the Poisson p99 for
             // that many frames; past the bound the send is retried.
             let frames = fragments.len();
+            let queued_at = std::time::Instant::now();
+            let row_ledger = |labels: &[&'static str], stranded: usize| {
+                if let Some(m) = self.metrics.get() {
+                    for l in labels {
+                        m.inc_link_shaping(l);
+                    }
+                    m.add_link_shaping(
+                        crate::observability::LINK_SHAPING_BODIES_STRANDED,
+                        stranded as u64,
+                    );
+                }
+            };
             return match shaper.enqueue(fragments) {
                 Ok(ticket) => {
                     let first = ticket + 1 - u64::try_from(frames).unwrap_or(u64::MAX);
@@ -10076,10 +10113,19 @@ impl ReticulumTransport {
                     let deadline = tokio::time::Instant::now() + budget;
                     loop {
                         if shaper.ticket_left(ticket) {
+                            if let Some(m) = self.metrics.get() {
+                                m.telemetry
+                                    .shaping_windows
+                                    .note_row_wait(shaper.class(), queued_at.elapsed());
+                            }
                             break Ok(());
                         }
                         if shaper.is_stopped() || !self.node.link_is_established(link_id) {
-                            shaper.retract(first, ticket);
+                            let stranded = shaper.retract(first, ticket);
+                            row_ledger(
+                                &[crate::observability::LINK_SHAPING_ROW_RETRACTED],
+                                stranded,
+                            );
                             break Err(ShipError::Other(TransportError::Io(
                                 "the shaped link closed before the row's frames left (retried)"
                                     .to_owned(),
@@ -10089,6 +10135,13 @@ impl ReticulumTransport {
                             // The unsent remainder is taken back so the retry
                             // does not send the row twice.
                             shaper.retract(first, ticket);
+                            row_ledger(
+                                &[
+                                    crate::observability::LINK_SHAPING_ROW_RETRACTED,
+                                    crate::observability::LINK_SHAPING_ROW_LEFT_TIMEOUT,
+                                ],
+                                0,
+                            );
                             break Err(ShipError::Other(TransportError::Timeout(budget)));
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -10287,8 +10340,14 @@ impl Transport for ReticulumTransport {
     /// Edge's. The listener's per-event context reads the slot on every
     /// event, so an attach before `listen` is seen by the first one.
     fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        self.keyer.attach_metrics(metrics.clone());
+        self.shapers.attach_metrics(metrics.clone());
         let _ = self.metrics.set(metrics);
         self.report_signer_id_mismatch();
+    }
+
+    fn attach_load_ladder(&self, ladder: Arc<crate::load_ladder::SharedLadder>) {
+        let _ = self.load_ladder.set(ladder);
     }
 
     fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {
@@ -10301,6 +10360,9 @@ impl Transport for ReticulumTransport {
     fn refresh_metrics(&self) {
         let _ = self.known_destination_evictions();
         self.report_signer_id_mismatch();
+        if let Some(m) = self.metrics.get() {
+            mirror_planes(&self.node, m);
+        }
     }
 
     fn subscribe_reachability(&self) -> Option<tokio::sync::broadcast::Receiver<PeerReachable>> {
@@ -10363,6 +10425,17 @@ impl Transport for ReticulumTransport {
         }
 
         // `FSD/PRIVACY_MODES.md` §6.12 — while tier 2 is in force.
+        if let Some(m) = self.metrics.get() {
+            m.telemetry
+                .set_direct_link_proposing(self.direct_paths.config.proposes());
+        }
+        tracing::info!(
+            target: "edge.direct_link.posture",
+            proposes = self.direct_paths.config.proposes(),
+            proposing = ?self.direct_paths.config.proposing,
+            facilitator = self.direct_paths.config.facilitator.is_some(),
+            "direct links: this node's proposing posture"
+        );
         tokio::spawn(run_shaped_shed(
             Arc::downgrade(&self.node),
             Arc::clone(&self.seals),
@@ -10446,6 +10519,130 @@ impl Transport for ReticulumTransport {
     }
 }
 
+/// How often the event loop stamps its liveness.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// How often the node tick runs: the ladder's window.
+const NODE_TICK: Duration = Duration::from_secs(1);
+
+/// The closed `event` label of a node event.
+fn event_label(event: &NodeEvent) -> EventLabel {
+    match event {
+        NodeEvent::AnnounceReceived { .. } => EventLabel::Announce,
+        NodeEvent::LinkEstablished { .. } => EventLabel::LinkEstablished,
+        NodeEvent::LinkIdentified { .. } => EventLabel::LinkIdentified,
+        NodeEvent::MessageReceived { .. } | NodeEvent::LinkDataReceived { .. } => EventLabel::Frame,
+        NodeEvent::RequestReceived { .. } => EventLabel::Request,
+        NodeEvent::ResourceCompleted { .. } => EventLabel::ResourceCompleted,
+        NodeEvent::ResourceTransferStarted { .. } | NodeEvent::ResourceProgress { .. } => {
+            EventLabel::ResourceProgress
+        }
+        NodeEvent::ResourceAdvertised { .. } => EventLabel::ResourceAdvertised,
+        NodeEvent::ResourceFailed { .. } => EventLabel::ResourceFailed,
+        NodeEvent::LinkClosed { .. } => EventLabel::LinkClosed,
+        NodeEvent::LinkStale { .. } => EventLabel::LinkStale,
+        NodeEvent::DirectLinkEstablished { .. }
+        | NodeEvent::DirectLinkRequested { .. }
+        | NodeEvent::DirectLinkFailed { .. }
+        | NodeEvent::DirectLinkLost { .. } => EventLabel::DirectLink,
+        NodeEvent::PeerCongested { .. } => EventLabel::PeerCongested,
+        _ => EventLabel::Other,
+    }
+}
+
+/// Mirror leviculum's driver planes (the names `METRIC_CATALOG` gives
+/// `leviculum.events.*` and `leviculum.shed.packets`) into the bag. No
+/// recorder is wired, so `publish_metrics` would have nowhere to go.
+fn mirror_planes(node: &ReticulumNode, metrics: &crate::observability::EdgeMetrics) {
+    let p = node.plane_stats();
+    metrics.telemetry.set_leviculum_planes(
+        [p.control_queued, p.data_queued],
+        [p.control_capacity, p.data_capacity],
+        [p.control_dropped_total, p.data_dropped_total],
+        p.shed_packets_total,
+    );
+}
+
+/// What the node tick reads and moves.
+struct NodeTick {
+    node: std::sync::Weak<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    forward_admission: Arc<crate::transport::relay_tier::ForwardAdmission>,
+    forward_load: Arc<std::sync::Mutex<crate::transport::relay_tier::ForwardLoad>>,
+    ladder: Option<Arc<crate::load_ladder::SharedLadder>>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+}
+
+impl NodeTick {
+    /// Edge's own signals reach the shapers and forward admission here, and
+    /// not only when a host reads the tier: a raise from `relay_commit` or
+    /// `av_queue_age` used to wait for the next `set_load_pressure`, and with
+    /// no such caller, for nothing. The ladder's cooldowns run on this too.
+    fn apply_tier(&self) {
+        let Some(ladder) = &self.ladder else { return };
+        let load = self
+            .forward_load
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let tier = ladder.report(crate::load_ladder::EdgeLoadSignals {
+            transit_pps_ratio: load.pps_ratio,
+            ..crate::load_ladder::EdgeLoadSignals::default()
+        });
+        if tier != self.shapers.service_tier() {
+            self.forward_admission.set_tier(tier);
+            self.shapers.set_service_tier(tier);
+        }
+    }
+
+    fn publish(&self, m: &crate::observability::EdgeMetrics, node: &ReticulumNode) {
+        use crate::telemetry::ShapingClass;
+        let t = &m.telemetry;
+        let (links, bytes, held) = self.seals.occupancy();
+        t.set_seal_awaiting(links, bytes);
+        t.set_seal_held(held);
+        mirror_planes(node, m);
+        let policy = self.shapers.policy();
+        let seat = self.shapers.links_of(ShapingClass::Seat);
+        t.set_shaping(
+            policy.enabled(),
+            self.shapers.counted_link_count(),
+            seat,
+            self.shapers.free_slots(),
+        );
+        t.shaping_windows.tick(
+            t.now_ms(),
+            |class| self.shapers.links_of(class),
+            crate::transport::link_shaping::class_window,
+        );
+    }
+
+    fn turn(&self) -> bool {
+        self.apply_tier();
+        let Some(node) = self.node.upgrade() else {
+            return false;
+        };
+        if let Some(m) = &self.metrics {
+            m.telemetry.beat(LoopName::Ladder);
+            self.publish(m, &node);
+        }
+        true
+    }
+}
+
+/// The node tick, for as long as the listener runs.
+async fn run_node_tick(tick: NodeTick) {
+    let mut interval = tokio::time::interval(NODE_TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if !tick.turn() {
+            return;
+        }
+    }
+}
+
 /// Lifecycle — how long a resumed listener waits for an interface to come
 /// online before its first announce.
 const RESUME_ANNOUNCE_WAIT: Duration = Duration::from_secs(10);
@@ -10459,6 +10656,18 @@ enum ListenExit {
 }
 
 impl ReticulumTransport {
+    fn node_tick(&self) -> NodeTick {
+        NodeTick {
+            node: Arc::downgrade(&self.node),
+            seals: Arc::clone(&self.seals),
+            shapers: Arc::clone(&self.shapers),
+            forward_admission: Arc::clone(&self.forward_admission),
+            forward_load: Arc::clone(&self.forward_load),
+            ladder: self.load_ladder.get().cloned(),
+            metrics: self.metrics.get().cloned(),
+        }
+    }
+
     /// One active run of the listener: the announce timer, the link reapers,
     /// the attribution tick, the announce cold-start worker and the event
     /// loop. Returns when a suspend asks it to park (after draining the
@@ -10661,6 +10870,18 @@ impl ReticulumTransport {
             onion: &self.onion,
         };
         let mut keying_done = self.keying_done.lock().await;
+        // v44 — the event loop's liveness, on its own cadence and never per
+        // event: an age that follows the frames would be a clock of them.
+        let mut heartbeat = tokio::time::interval(HEARTBEAT);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // v44 — off this loop, so a wedged event never holds the ladder, and
+        // it ends with this run, so a parked node holds no timer.
+        let node_tick = tokio::spawn(run_node_tick(self.node_tick()));
+        let observe = |label: EventLabel, began: std::time::Instant| {
+            if let Some(m) = ctx.metrics {
+                m.telemetry.observe_event(label, began.elapsed());
+            }
+        };
         let exit = loop {
             tokio::select! {
                 // Lifecycle — a suspend: handle what the link closes already
@@ -10679,18 +10900,30 @@ impl ReticulumTransport {
                 // outcome is applied here, on the one thread of control that
                 // handles the link's frames.
                 Some(done) = keying_done.recv() => {
+                    let began = std::time::Instant::now();
                     apply_keying(done, &ctx).await;
+                    observe(EventLabel::KeyingApplied, began);
+                }
+                _ = heartbeat.tick() => {
+                    if let Some(m) = ctx.metrics {
+                        m.telemetry.beat(LoopName::Event);
+                    }
                 }
                 _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution()
                     || ctx.seals.any_deferred() => {
+                    let began = std::time::Instant::now();
                     for link in ctx.seals.awaiting_attribution() {
                         release_held(&ctx, LinkId::new(link)).await;
                     }
                     for job in ctx.seals.take_overdue_deferred() {
                         gate_handshake(&ctx, LinkId::new(job.link()), job).await;
                     }
+                    observe(EventLabel::AttributionTick, began);
                 }
                 _ = seat_tick.tick() => {
+                    if let Some(m) = ctx.metrics {
+                        m.telemetry.beat(LoopName::Seat);
+                    }
                     tokio::spawn(refresh_seats(
                         Arc::clone(&self.node),
                         Arc::clone(&self.seals),
@@ -10698,6 +10931,7 @@ impl ReticulumTransport {
                     ));
                 }
                 _ = pool_tick.tick() => {
+                    let began = std::time::Instant::now();
                     let closed = self.reap_idle_pooled_links().await;
                     if closed > 0 {
                         tracing::debug!(
@@ -10717,8 +10951,10 @@ impl ReticulumTransport {
                             "inbound reaper closed idle inbound links (CIRISEdge#853)"
                         );
                     }
+                    observe(EventLabel::PoolTick, began);
                 }
                 _ = announce_tick.tick() => {
+                    let began = std::time::Instant::now();
                     if unannounced() {
                         tracing::trace!("unannounced (test seam): no periodic announce");
                     } else if let Err(e) = self
@@ -10751,6 +10987,7 @@ impl ReticulumTransport {
                             )
                             .await;
                     }
+                    observe(EventLabel::AnnounceTick, began);
                 }
                 event = events.recv() => {
                     let Some(event) = event else {
@@ -10764,7 +11001,10 @@ impl ReticulumTransport {
                     // Rate-limited so rapid link churn can't storm announces.
                     let link_just_established =
                         matches!(event, NodeEvent::LinkEstablished { .. });
+                    let label = event_label(&event);
+                    let began = std::time::Instant::now();
                     handle_event(event, &ctx).await;
+                    observe(label, began);
 
                     // `map_or(true, …)` not `is_none_or` — MSRV 1.75 (is_none_or is 1.82).
                     if link_just_established
@@ -10773,6 +11013,7 @@ impl ReticulumTransport {
                             .map_or(true, |t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
                     {
                         last_event_announce = Some(std::time::Instant::now());
+                        let began = std::time::Instant::now();
                         match self
                             .node
                             .announce_destination(&self.local_named_dest_hash, Some(app_data))
@@ -10787,6 +11028,7 @@ impl ReticulumTransport {
                                 "event-driven announce (link up) failed"
                             ),
                         }
+                        observe(EventLabel::LinkUpAnnounce, began);
                     }
                 }
             }
@@ -10797,6 +11039,14 @@ impl ReticulumTransport {
         drop(announce_priority_tx);
         announce_worker.abort();
         let _ = announce_worker.await;
+        node_tick.abort();
+        let _ = node_tick.await;
+        // A parked loop is not a wedged one: its age reads "not running".
+        if let Some(m) = self.metrics.get() {
+            for name in [LoopName::Event, LoopName::Seat, LoopName::Ladder] {
+                m.telemetry.beat_off(name);
+            }
+        }
         exit
     }
 }
@@ -13003,10 +13253,14 @@ impl DialCtx {
         }
         if let Some(m) = self.metrics.as_ref() {
             m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED_DIALLED);
         }
         let refuse = |e: ShapingError| {
             if let Some(m) = self.metrics.as_ref() {
                 m.inc_link_shaping(e.label());
+                if matches!(e, ShapingError::HomeElsewhere) {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_HOME_ELSEWHERE_RECEIVED);
+                }
             }
             tracing::warn!(
                 peer = %peer,
@@ -15471,6 +15725,9 @@ fn admission_refused(
 ) {
     if let Some(m) = ctx.metrics {
         m.inc_link_seal(refusal.label());
+        if let Some(refined) = refusal.refined_label() {
+            m.inc_link_seal(refined);
+        }
     }
     drop_inbound(Some(link_id), refusal.label(), &refusal.to_string());
     ctx.seals.refuse(link_id.into_bytes());
@@ -15572,6 +15829,8 @@ async fn apply_keying(done: crate::transport::link_keying::KeyingDone, ctx: &Eve
     let link_id = LinkId::new(link);
     if let Some(m) = ctx.metrics {
         m.inc_link_seal(crate::observability::LINK_SEAL_DECAPSULATED);
+        m.telemetry
+            .observe_keying(done.standing, done.queued_at.elapsed());
     }
     match ctx.seals.finish_keying(link, done.ticket, done.outcome) {
         Inbound::Keyed { claimed } => {
@@ -15922,6 +16181,7 @@ async fn answer_shaping_offer(
     if ours.shapes() {
         if let Some(m) = ctx.metrics {
             m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED_ANSWERED);
         }
     }
     true
@@ -15956,6 +16216,7 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
         Ok(Some(shaper)) => {
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(crate::observability::LINK_SHAPING_AGREED);
+                m.inc_link_shaping(crate::observability::agreed_label(shaper.class()));
             }
             let a = *shaper.agreement();
             tracing::info!(
@@ -16004,6 +16265,15 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
             // nothing more after it and closes.
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(ShapingError::HomeElsewhere.label());
+                // The direction: the peer's own refusal reaches a responder
+                // here as well.
+                m.inc_link_shaping(
+                    if theirs.class == crate::transport::link_shaping::BudgetClass::HomeElsewhere {
+                        crate::observability::LINK_SHAPING_HOME_ELSEWHERE_RECEIVED
+                    } else {
+                        crate::observability::LINK_SHAPING_HOME_ELSEWHERE_GIVEN
+                    },
+                );
             }
             tracing::info!(
                 link = %hex::encode(link),
@@ -16294,7 +16564,11 @@ async fn refresh_seats(
     shapers: Arc<crate::transport::link_shaping::LinkShapers>,
 ) {
     for link in shapers.refresh_active_seats().await {
+        if let Some(m) = shapers.metrics() {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_SEAT_LOST);
+        }
         tracing::info!(
+            target: "edge.shaping.seat_lost",
             link = %hex::encode(link),
             "a seat link's peer left the active roster; closed to renegotiate (CC 5.4.3)"
         );
@@ -16465,6 +16739,9 @@ fn spawn_shaper_task(
                 seals.tap_frame(link, &sealed);
                 if real {
                     shaper.note_sent(ticket);
+                    if let Some(m) = metrics.as_ref() {
+                        m.telemetry.shaping_windows.note_real(shaper.class());
+                    }
                 }
                 tracing::trace!(
                     link = %hex::encode(link),

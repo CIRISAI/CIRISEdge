@@ -196,6 +196,15 @@ pub(super) struct AlmState {
     last_offer_ms: u64,
     pub(super) counts: AlmCounts,
     pub(super) labels: Vec<&'static str>,
+    /// Failovers waiting on the new parent's first chunk: when the old primary
+    /// was last heard, and why it failed.
+    failing_over: BTreeMap<StreamId, (u64, crate::telemetry::FailoverCause)>,
+    /// Finished failover gaps, for the call to book.
+    pub(super) gaps: Vec<(crate::telemetry::FailoverCause, std::time::Duration)>,
+    /// How many of each decision the `av_plane` ledger has heard of.
+    booked: BTreeMap<DecisionKind, u64>,
+    /// The newest room epoch seen on each stream.
+    epochs: BTreeMap<StreamId, u64>,
     video_unavailable: BTreeSet<StreamId>,
     pub(super) events: Vec<super::CallEvent>,
 }
@@ -245,6 +254,10 @@ impl AlmState {
             last_offer_ms: 0,
             counts: AlmCounts::default(),
             labels: Vec::new(),
+            failing_over: BTreeMap::new(),
+            gaps: Vec::new(),
+            booked: BTreeMap::new(),
+            epochs: BTreeMap::new(),
             video_unavailable: BTreeSet::new(),
             events: Vec::new(),
         }
@@ -295,6 +308,26 @@ impl AlmState {
     /// The decision log's rendered tail.
     pub(super) fn log_tail(&self) -> String {
         self.log.tail()
+    }
+
+    /// Tell the `av_plane` ledger of the decisions the log took since last
+    /// asked. The log is the one record of them, so the counters cannot drift
+    /// from what a field log replays.
+    pub(super) fn book_decisions(&mut self) {
+        use crate::observability as o;
+        for (kind, label) in [
+            (DecisionKind::Failover, o::ALM_FAILOVER),
+            (DecisionKind::Switch, o::ALM_SWITCH),
+            (DecisionKind::LoopDetected, o::ALM_LOOP_DETECTED),
+            (DecisionKind::OverClaim, o::ALM_OVER_CLAIM),
+        ] {
+            let seen = self.log.count(kind);
+            let booked = self.booked.entry(kind).or_insert(0);
+            for _ in *booked..seen {
+                self.labels.push(label);
+            }
+            *booked = seen;
+        }
     }
 
     fn label(&mut self, l: &'static str) {
@@ -574,6 +607,11 @@ impl AlmState {
             return;
         }
         let now = self.now_ms();
+        let newest = self.epochs.entry(stream).or_insert(epoch);
+        if epoch > *newest {
+            *newest = epoch;
+            self.labels.push(crate::observability::ALM_EPOCH_RESYNC);
+        }
         let wall = crate::transport::av_chunk_auth::unix_ms_now();
         let offset = wall as i64 - source_ms as i64;
         let entry = self.min_offset.entry(stream).or_insert((offset, now));
@@ -600,6 +638,12 @@ impl AlmState {
             latency_ms: latency,
         };
         sel.on_chunk(now, &from.to_owned(), chunk);
+        if role == Some(Role::Primary) {
+            if let Some((heard, cause)) = self.failing_over.remove(&stream) {
+                let gap = std::time::Duration::from_millis(now.saturating_sub(heard));
+                self.gaps.push((cause, gap));
+            }
+        }
         if sel.primary().is_some_and(|p| p == from) {
             self.rates
                 .entry(stream)
@@ -872,6 +916,9 @@ impl AlmState {
             let sel = self.sels.get_mut(&s).expect("present");
             sel.set_has_children(has_children);
             let acts = sel.tick(now, &mut self.rng, &mut log);
+            if let Some(failed) = sel.take_failover() {
+                self.failing_over.insert(s, failed);
+            }
             self.log = log;
             out.extend(self.action_frames(s, acts));
             self.sync_upstream(s);
@@ -1533,6 +1580,56 @@ mod tests {
     /// C's standby path loses none. The primary is Degraded, so direct-first
     /// no longer holds it, and the clean standby takes over by score. With a
     /// standby's skipped layers read as loss it can never win.
+    /// v44 — the decision log is the record; the ledger is told from it, so
+    /// the counter and a replayed log cannot disagree. A's direct path goes
+    /// silent while the stream runs on through C.
+    #[test]
+    fn a_failover_reaches_the_ledger_with_its_gap_and_cause() {
+        let mut m = Mesh::new();
+        m.run(15_000, 2, |_| {});
+        assert_eq!(m.b_parents().primary.as_deref(), Some("a"));
+        m.withhold_b = Some(1);
+        m.run(20_000, 2, |_| {});
+        let b = &mut m.nodes[B];
+        let failovers = b.log_count(DecisionKind::Failover);
+        assert!(failovers >= 1, "{}", b.log_tail());
+        b.labels.clear();
+        b.book_decisions();
+        let booked = |labels: &[&str]| {
+            labels
+                .iter()
+                .filter(|l| **l == crate::observability::ALM_FAILOVER)
+                .count() as u64
+        };
+        assert_eq!(booked(&b.labels), failovers);
+        b.labels.clear();
+        b.book_decisions();
+        assert_eq!(booked(&b.labels), 0, "booked once, never twice");
+        let (cause, gap) = b.gaps.pop().expect("the new parent's chunk closed the gap");
+        assert_eq!(cause, crate::telemetry::FailoverCause::LinkDown);
+        assert!(
+            gap >= std::time::Duration::from_millis(100),
+            "the gap runs from when the old primary was last heard: {gap:?}"
+        );
+        assert!(b.failing_over.is_empty());
+    }
+
+    #[test]
+    fn a_newer_epoch_is_one_resync_per_stream() {
+        let mut a = AlmState::new("a", s(0), &roster(), false, 1);
+        a.on_chunk(s(1), "b", 1, 5, 100, 0, true);
+        assert!(a.labels.is_empty(), "the first epoch seen is no resync");
+        a.on_chunk(s(1), "c", 2, 0, 100, 0, true);
+        a.on_chunk(s(1), "b", 2, 0, 100, 0, true);
+        a.on_chunk(s(1), "b", 1, 6, 100, 0, true);
+        let n = a
+            .labels
+            .iter()
+            .filter(|l| **l == crate::observability::ALM_EPOCH_RESYNC)
+            .count();
+        assert_eq!(n, 1);
+    }
+
     #[test]
     fn a_lossy_primary_gives_way_to_a_clean_layered_standby() {
         let mut m = Mesh::new();

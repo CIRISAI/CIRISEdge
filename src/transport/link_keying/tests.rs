@@ -219,3 +219,128 @@ async fn a_dead_link_in_the_queue_costs_no_decapsulation_947() {
     assert_eq!(d.link, [2; 16]);
     assert_eq!(s.decapsulations(), 1);
 }
+
+fn bag(keyer: &Keyer) -> crate::observability::EdgeMetrics {
+    let m = crate::observability::EdgeMetrics::new();
+    keyer.attach_metrics(m.clone());
+    m
+}
+
+/// v44 — `panicked` had no reader: the catch kept the worker and the count
+/// went nowhere. It reaches the bag the host reads now.
+#[test]
+fn a_keyer_panic_reaches_the_bag_and_the_worker_lives() {
+    let s = seals();
+    let (keyer, mut done) = stopped_pool(&s);
+    let m = bag(&keyer);
+    let key = o::LINK_SEAL_KEYER_PANICKED;
+    assert_eq!(m.snapshot().link_seal[key], 0, "a series before it happens");
+    s.decap_panics
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    keyer.submit(job(&s, [1; 16]), false).expect("room");
+    keyer.submit(job(&s, [2; 16]), false).expect("room");
+    run_worker(&keyer);
+    assert_eq!(m.snapshot().link_seal[key], 1);
+    assert!(done.try_recv().expect("refused").outcome.is_err());
+    assert!(done.try_recv().expect("the worker lived").outcome.is_ok());
+}
+
+#[test]
+fn a_stale_job_is_counted_and_never_reaches_the_event_loop() {
+    let s = seals();
+    let (keyer, mut done) = stopped_pool(&s);
+    let m = bag(&keyer);
+    let dead = job(&s, [1; 16]);
+    s.forget(&[1; 16]);
+    keyer.submit(dead, false).expect("room");
+    run_worker(&keyer);
+    assert_eq!(m.snapshot().link_seal[o::LINK_SEAL_KEYING_SKIPPED_STALE], 1);
+    assert!(done.try_recv().is_err());
+}
+
+/// The gauges read the queues as they are, by budget, and fall with them.
+#[test]
+fn the_keyer_gauges_follow_the_queues() {
+    let s = seals();
+    let (keyer, mut done) = stopped_pool(&s);
+    let m = bag(&keyer);
+    keyer.submit(job(&s, [1; 16]), true).expect("room");
+    keyer.submit(job(&s, [2; 16]), false).expect("room");
+    keyer.submit(job(&s, [3; 16]), false).expect("room");
+    let q = m.snapshot().seal_keyer_queued;
+    assert_eq!((q["standing"], q["stranger"]), (1, 2));
+    run_worker(&keyer);
+    let q = m.snapshot().seal_keyer_queued;
+    assert_eq!((q["standing"], q["stranger"]), (0, 0));
+    assert_eq!(m.snapshot().seal_keyer_workers["busy"], 0);
+    assert_eq!(
+        (
+            done.try_recv().expect("standing").standing,
+            done.try_recv().expect("a stranger").standing
+        ),
+        (true, false),
+        "an outcome says which budget it came through"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pool_reports_its_size_and_is_never_zero_once_attached() {
+    let s = seals();
+    let (keyer, mut done) = Keyer::new(Arc::clone(&s));
+    let m = bag(&keyer);
+    assert!(m.snapshot().seal_keyer_workers["configured"] >= 1);
+    keyer.submit(job(&s, [1; 16]), false).expect("room");
+    assert!(done.recv().await.is_some());
+}
+
+/// The label keeps what the error knew and the old ledger dropped.
+#[test]
+fn a_refusal_names_who_it_refused() {
+    let refused = |order: &ReceiverOrder, s: Sender<'_>| {
+        order
+            .admit(s)
+            .expect_err("over")
+            .refined_label()
+            .expect("refined")
+    };
+    let order = ReceiverOrder::default();
+    let none = Sender {
+        identity: None,
+        standing: false,
+    };
+    for _ in 0..HANDSHAKES_UNIDENTIFIED {
+        order.admit(none).expect("within the slot");
+    }
+    assert_eq!(
+        refused(&order, none),
+        o::LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_UNIDENTIFIED
+    );
+    let one = stranger("one");
+    for _ in 0..HANDSHAKES_PER_STRANGER {
+        order.admit(one).expect("within its rate");
+    }
+    assert_eq!(
+        refused(&order, one),
+        o::LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STRANGER
+    );
+    let known = Sender {
+        identity: Some("known"),
+        standing: true,
+    };
+    for _ in 0..HANDSHAKES_PER_STANDING {
+        order.admit(known).expect("within its rate");
+    }
+    assert_eq!(
+        refused(&order, known),
+        o::LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STANDING
+    );
+    order.set_stranger_cap(0);
+    assert_eq!(
+        refused(&order, stranger("two")),
+        o::LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STRANGER
+    );
+    assert_eq!(
+        SealRefusal::DecapSaturated { standing: true }.refined_label(),
+        Some(o::LINK_SEAL_REFUSED_DECAP_SATURATED_STANDING)
+    );
+}

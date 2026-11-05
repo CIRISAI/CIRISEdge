@@ -176,6 +176,9 @@ pub struct ParentSelector<P: PeerRef> {
     join_at: Option<u64>,
     last_switch_ms: u64,
     last_failover_ms: Option<u64>,
+    /// The latest failover, until the controller takes it: when the old
+    /// primary was last heard, and why it failed.
+    failed_over: Option<(u64, crate::telemetry::FailoverCause)>,
     recent_switches: Vec<u64>,
     last_standby_rotation_ms: Option<u64>,
     members: BTreeSet<P>,
@@ -205,6 +208,7 @@ impl<P: PeerRef> ParentSelector<P> {
             join_at: None,
             last_switch_ms: 0,
             last_failover_ms: None,
+            failed_over: None,
             recent_switches: Vec::new(),
             last_standby_rotation_ms: None,
             members: BTreeSet::new(),
@@ -456,6 +460,12 @@ impl<P: PeerRef> ParentSelector<P> {
                 s.meter.expect_base(chunk.pos);
             }
         }
+    }
+
+    /// The latest failover, once: when the old primary was last heard, and
+    /// why it failed.
+    pub fn take_failover(&mut self) -> Option<(u64, crate::telemetry::FailoverCause)> {
+        self.failed_over.take()
     }
 
     /// The link to `from` is gone.
@@ -1069,6 +1079,16 @@ impl<P: PeerRef> ParentSelector<P> {
                 .last_failover_ms
                 .map_or(true, |t| now_ms >= t + self.cfg.failover_min_interval_ms);
             if bad && allowed {
+                use crate::telemetry::FailoverCause;
+                let cause = if depth_bad {
+                    FailoverCause::Depth
+                } else if matches!(c.health.state(), PeerState::Suspected | PeerState::Down) {
+                    FailoverCause::LinkDown
+                } else {
+                    FailoverCause::Health
+                };
+                let heard = c.meter.last_arrival_ms().unwrap_or(now_ms).min(now_ms);
+                self.failed_over = Some((heard, cause));
                 self.last_failover_ms = Some(now_ms);
                 self.primary = None;
                 log.record(

@@ -484,6 +484,9 @@ fn spawn_scheduler_task(
         while let Some((peer, event)) = evt_rx.recv().await {
             if let Some(m) = &metrics {
                 m.inc_round_outcome(round_outcome_of(&event));
+                if matches!(event, RoundEvent::Completed(_)) {
+                    m.telemetry.note_round_completed();
+                }
             }
             if let RoundEvent::Completed(report) = &event {
                 if report.admitted > 0 {
@@ -570,6 +573,10 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                 tracing::debug!(peer = %peer, ?kind, "responder driver ending (channel closed)");
                 break;
             };
+            if let Some(m) = coord.metrics() {
+                m.telemetry
+                    .observe_inbound_wait(kind, inbound.queued_at.elapsed());
+            }
             if lane.take_send_failed() {
                 round_began = None;
             }

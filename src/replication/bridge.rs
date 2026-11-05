@@ -882,6 +882,7 @@ fn attestation_outcome_to_apply(
                     ),
                     retry,
                     awaits_signer: None,
+                    class: None,
                 },
                 Some(reason.as_str()),
             )
@@ -2649,6 +2650,15 @@ impl std::fmt::Debug for BridgeEngine {
     }
 }
 
+/// A row moves to the terminal schedule at most once per refusal memory, but
+/// a peer picks how many rows do.
+fn terminal_move_log() -> &'static crate::log_throttle::LogThrottle {
+    static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(4, std::time::Duration::from_secs(300), 64)
+    })
+}
+
 impl FederationDirectoryReplicationBridge {
     /// Construct with default [`BridgeConfig`], **v1-only** (no v2
     /// operational-kind admission). For v2 operational admission, use
@@ -2949,6 +2959,9 @@ impl FederationDirectoryReplicationBridge {
         // CIRISEdge P0 telemetry — the sweep gate records its permit wait
         // into the same bag.
         self.sweep_gate.metrics.clone_from(&metrics);
+        if let Some(m) = &metrics {
+            self.decision_rows.attach_telemetry(&m.telemetry);
+        }
         self.metrics = metrics;
         self
     }
@@ -6206,6 +6219,7 @@ impl FederationDirectoryReplicationBridge {
             reason: classified_refusal_reason(plane, content_hash, err, class),
             retry: class.retry(),
             awaits_signer: None,
+            class: Some(class.as_str()),
         }
     }
 
@@ -6235,11 +6249,53 @@ impl FederationDirectoryReplicationBridge {
         use sha2::{Digest as _, Sha256};
         let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
         match outcome.retry_disposition() {
-            None => self.refusal_backoff.clear(kind, &hash),
+            None => {
+                let forgotten = self.refusal_backoff.take(kind, &hash);
+                if let (Some(row), ApplyOutcome::Admitted, Some(m)) =
+                    (forgotten, outcome, self.metrics.as_ref())
+                {
+                    m.telemetry.note_refused_then_admitted(row.class);
+                    m.telemetry.observe_refusal_attempts(
+                        if row.disposition.is_terminal() {
+                            crate::telemetry::DispositionLabel::Terminal
+                        } else {
+                            crate::telemetry::DispositionLabel::Transient
+                        },
+                        u64::from(row.attempts),
+                    );
+                }
+            }
             Some(disposition) => {
-                let window =
-                    self.refusal_backoff
-                        .record_at(kind, hash, disposition, Instant::now());
+                let class = match outcome {
+                    ApplyOutcome::Refused { class, .. } => *class,
+                    _ => None,
+                };
+                let recorded = self.refusal_backoff.record_tracked_at(
+                    kind,
+                    hash,
+                    disposition,
+                    class,
+                    Instant::now(),
+                );
+                let window = recorded.window;
+                if recorded.moved_to_terminal {
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.telemetry.note_moved_to_terminal();
+                    }
+                    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                        terminal_move_log().check(kind.as_wire_str())
+                    {
+                        tracing::info!(
+                            target: "edge.refusal.terminal",
+                            kind = kind.as_wire_str(),
+                            class = class.unwrap_or(crate::telemetry::REFUSAL_CLASS_OTHER),
+                            next_ask_secs = window.as_secs(),
+                            suppressed_prev,
+                            "a refused row moved to the terminal schedule: its verdict waited \
+                             on nothing this node can see replicating (CIRISEdge#858)"
+                        );
+                    }
+                }
                 // DEBUG: the refusal itself already WARNs at the #425 choke with
                 // its reason and disposition. This line answers only "and for how
                 // long will the node stop asking", which is the operator's next

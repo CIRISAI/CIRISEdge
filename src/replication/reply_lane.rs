@@ -135,6 +135,8 @@ struct LaneState {
     bytes: AtomicUsize,
     /// A send failed since the driver last looked: the round's clock restarts.
     send_failed: AtomicBool,
+    /// Jobs queued or on the wire: the depth the node's gauge reads.
+    jobs: Arc<AtomicUsize>,
 }
 
 /// The driver's end of the lane. Dropping it ends the task once the queue
@@ -161,6 +163,9 @@ impl ReplyLane {
     pub(super) fn spawn(coord: Arc<ReplicationCoordinator>) -> Self {
         let (tx, rx) = mpsc::channel(REPLY_QUEUE_JOBS);
         let state = Arc::new(LaneState::default());
+        if let Some(m) = coord.metrics() {
+            m.telemetry.register_reply_lane(&state.jobs);
+        }
         tokio::spawn(run(coord, rx, Arc::clone(&state)));
         Self { tx, state }
     }
@@ -214,7 +219,9 @@ impl ReplyLane {
             bytes,
             finishes,
         };
+        self.state.jobs.fetch_add(1, Ordering::Relaxed);
         if self.tx.try_send(job).is_err() {
+            self.state.jobs.fetch_sub(1, Ordering::Relaxed);
             self.state.bytes.fetch_sub(bytes, Ordering::AcqRel);
             self.shed(coord, "reply");
         }
@@ -228,6 +235,9 @@ async fn run(
 ) {
     while let Some(job) = rx.recv().await {
         let queued = job.queued_at.elapsed();
+        if let Some(m) = coord.metrics() {
+            m.telemetry.observe_reply_wait(coord.kind(), queued);
+        }
         if queued > max_queued(&coord) {
             count(&coord, obs::RESPONDER_ROUND_REPLY_EXPIRED);
             if let ThrottleDecision::Emit { suppressed_prev } =
@@ -247,6 +257,7 @@ async fn run(
             send(&coord, &state, &job).await;
         }
         state.bytes.fetch_sub(job.bytes, Ordering::AcqRel);
+        state.jobs.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

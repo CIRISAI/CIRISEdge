@@ -280,6 +280,7 @@ pub const DECISION_ROW_CHANNEL_CAPACITY: usize = 1024;
 #[derive(Debug, Clone)]
 pub struct DecisionRowSignal {
     tx: tokio::sync::broadcast::Sender<DecisionRowRef>,
+    telemetry: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::telemetry::EdgeTelemetry>>>,
 }
 
 impl Default for DecisionRowSignal {
@@ -294,7 +295,32 @@ impl DecisionRowSignal {
     pub fn new() -> Self {
         Self {
             tx: tokio::sync::broadcast::channel(DECISION_ROW_CHANNEL_CAPACITY).0,
+            telemetry: std::sync::Arc::default(),
         }
+    }
+
+    /// Count unheard rows into `telemetry`, and let it read the subscribers.
+    pub fn attach_telemetry(&self, telemetry: &std::sync::Arc<crate::telemetry::EdgeTelemetry>) {
+        telemetry.watch_decision_rows(self.tx.clone());
+        let _ = self.telemetry.set(std::sync::Arc::clone(telemetry));
+    }
+
+    fn send(&self, r: DecisionRowRef) -> usize {
+        let kind = r.kind;
+        let heard = self.tx.send(r).unwrap_or(0);
+        if heard == 0 {
+            if let Some(t) = self.telemetry.get() {
+                t.note_decision_row_unheard(kind);
+            }
+        }
+        heard
+    }
+
+    /// Receivers listening now. Zero means every row since is unheard here
+    /// and rests on [`decision_rows_since`] for whoever asks.
+    #[must_use]
+    pub fn subscribers(&self) -> usize {
+        self.tx.receiver_count()
     }
 
     /// A new receiver of every later event.
@@ -306,7 +332,7 @@ impl DecisionRowSignal {
     /// Emit a reference already built (a rebuild scan's). Returns how many
     /// receivers it reached.
     pub fn emit(&self, r: DecisionRowRef) -> usize {
-        self.tx.send(r).unwrap_or(0)
+        self.send(r)
     }
 
     /// Emit `row` if it is decision-relevant (its cursor is a lower bound
@@ -322,7 +348,7 @@ impl DecisionRowSignal {
         if let Some(p) = proposal_id {
             r.proposal_id = Some(p.to_owned());
         }
-        let _ = self.tx.send(r.clone());
+        self.send(r.clone());
         Some(r)
     }
 }
@@ -418,6 +444,47 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<DecisionCursor>(&json).expect("de"),
             c
+        );
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use crate::observability::EdgeMetrics;
+
+    fn proposal() -> DecisionRowRef {
+        DecisionRowRef {
+            attestation_id: "a".to_owned(),
+            kind: DecisionRowKind::Objection,
+            cohort_scope: "community".to_owned(),
+            scope_id: None,
+            proposal_id: None,
+            cursor: DecisionCursor::at_or_before(chrono::Utc::now()),
+        }
+    }
+
+    /// The direction a host cares about: a row nobody heard is counted, a row
+    /// someone heard is not, and the gauge says which it was.
+    #[test]
+    fn a_row_with_no_receiver_is_unheard_and_one_with_a_receiver_is_not() {
+        let m = EdgeMetrics::new();
+        let signal = DecisionRowSignal::new();
+        signal.attach_telemetry(&m.telemetry);
+        assert_eq!(m.snapshot().decision_row_subscribers, 0);
+        assert_eq!(signal.emit(proposal()), 0);
+        assert_eq!(m.snapshot().decision_row_unheard_total["objection"], 1);
+
+        let rx = signal.subscribe();
+        assert_eq!(m.snapshot().decision_row_subscribers, 1);
+        assert_eq!(signal.emit(proposal()), 1);
+        assert_eq!(m.snapshot().decision_row_unheard_total["objection"], 1);
+
+        drop(rx);
+        assert_eq!(
+            m.snapshot().decision_row_subscribers,
+            0,
+            "read from the channel, not remembered"
         );
     }
 }

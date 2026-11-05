@@ -71,6 +71,8 @@ fn unix_secs() -> u64 {
 pub struct Inbound {
     pub msg: ReplicationMessage,
     pub meta: Option<RoundMeta>,
+    /// When it joined the inbox: `ciris.edge.replication.inbound.wait`.
+    pub queued_at: std::time::Instant,
 }
 
 /// Why an initiator refused a reply frame handed to it by the registry.
@@ -369,7 +371,11 @@ impl ReplicationCoordinator {
     pub fn deliver_inbound(&self, msg: ReplicationMessage) -> Result<(), CoordinatorError> {
         match &self.inbox {
             RoleInbox::Responder { inbound_tx, .. } => inbound_tx
-                .try_send(Inbound { msg, meta: None })
+                .try_send(Inbound {
+                    msg,
+                    meta: None,
+                    queued_at: std::time::Instant::now(),
+                })
                 .map_err(|_| CoordinatorError::NoRoundInProgress),
             RoleInbox::Initiator { round_tx, .. } => {
                 let tx = round_tx
@@ -400,7 +406,11 @@ impl ReplicationCoordinator {
     ) -> Result<(), CoordinatorError> {
         match &self.inbox {
             RoleInbox::Responder { inbound_tx, .. } => inbound_tx
-                .try_send(Inbound { msg, meta })
+                .try_send(Inbound {
+                    msg,
+                    meta,
+                    queued_at: std::time::Instant::now(),
+                })
                 .map_err(|_| CoordinatorError::NoRoundInProgress),
             RoleInbox::Initiator { .. } => Err(CoordinatorError::NoRoundInProgress),
         }
@@ -707,8 +717,12 @@ impl ReplicationCoordinator {
         &self,
         msg: Option<ReplicationMessage>,
     ) -> Result<DriveStep, CoordinatorError> {
-        self.drive_round_step_framed(msg.map(|msg| Inbound { msg, meta: None }))
-            .await
+        self.drive_round_step_framed(msg.map(|msg| Inbound {
+            msg,
+            meta: None,
+            queued_at: std::time::Instant::now(),
+        }))
+        .await
     }
 
     /// [`Self::drive_round_step`] with the inbound frame's round metadata
@@ -738,7 +752,7 @@ impl ReplicationCoordinator {
                 self.begin_round().await;
                 session.start_round(self.provider.as_ref()).await
             }
-            Some(Inbound { msg: m, meta }) => {
+            Some(Inbound { msg: m, meta, .. }) => {
                 if let RoleInbox::Responder { bound_round, .. } = &self.inbox {
                     let incoming = meta.map_or(0, |r| r.round);
                     let bound = bound_round.load(Ordering::Acquire);

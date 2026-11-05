@@ -70,6 +70,20 @@ pub const MAX_WINDOW_S: u32 = 86_400;
 /// The smallest frame worth shaping (a `CFRG` header and some body).
 pub const MIN_FRAME_BYTES: u16 = 96;
 
+/// The window W of a telemetry class: what its real-frame ledger is flushed
+/// on, the same W its budget runs over.
+#[must_use]
+pub fn class_window(class: crate::telemetry::ShapingClass) -> Duration {
+    use crate::telemetry::ShapingClass as C;
+    match class {
+        C::Seat => Duration::from_secs(u64::from(SEAT_WINDOW_S)),
+        C::Server => ShapingPolicy::for_class(BudgetClass::Server).window,
+        C::Home => ShapingPolicy::for_class(BudgetClass::Home).window,
+        C::PhoneWifi => ShapingPolicy::for_class(BudgetClass::PhoneWifi).window,
+        C::PhoneCellular => ShapingPolicy::for_class(BudgetClass::PhoneCellular).window,
+    }
+}
+
 /// A budget class: a per-link byte rate a node can afford on every shaped
 /// link it holds, and how a host names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -116,6 +130,23 @@ impl BudgetClass {
             Self::PhoneWifi => 1400,
             Self::Home => 2800,
             Self::Server => 7000,
+        }
+    }
+
+    /// The telemetry class of a link agreed between two offers: the lower of
+    /// the two, since the link runs at the lower rate. `Seat` is not an offer
+    /// here, it travels as `server`: the caller knows when both ends agreed it.
+    #[must_use]
+    pub fn link_class(self, other: Self, seat: bool) -> crate::telemetry::ShapingClass {
+        use crate::telemetry::ShapingClass as C;
+        if seat {
+            return C::Seat;
+        }
+        match self.min(other) {
+            Self::PhoneCellular => C::PhoneCellular,
+            Self::PhoneWifi => C::PhoneWifi,
+            Self::Home => C::Home,
+            Self::Off | Self::HomeElsewhere | Self::Server | Self::Seat => C::Server,
         }
     }
 
@@ -1113,6 +1144,8 @@ pub struct LinkShaper {
     /// When the shaper was installed ([`Self::in_transition`]).
     installed: std::time::Instant,
     stopped: std::sync::atomic::AtomicBool,
+    /// The class this link runs at, for the windowed ledger.
+    class: crate::telemetry::ShapingClass,
     /// When the next frame is due, as an absolute instant (see
     /// [`Self::next_emission`]).
     next_due: Mutex<Option<tokio::time::Instant>>,
@@ -1181,6 +1214,7 @@ impl LinkShaper {
             lambda_now: AtomicU64::new(agreement.lambda.to_bits()),
             installed: std::time::Instant::now(),
             stopped: std::sync::atomic::AtomicBool::new(false),
+            class: crate::telemetry::ShapingClass::Server,
             next_due: Mutex::new(None),
         }
     }
@@ -1222,6 +1256,18 @@ impl LinkShaper {
     fn quoted_at(mut self, frame_bytes: u16) -> Self {
         self.quoted_frame = frame_bytes;
         self
+    }
+
+    #[must_use]
+    fn of_class(mut self, class: crate::telemetry::ShapingClass) -> Self {
+        self.class = class;
+        self
+    }
+
+    /// The class this link runs at.
+    #[must_use]
+    pub fn class(&self) -> crate::telemetry::ShapingClass {
+        self.class
     }
 
     /// Whether `offer`, this node's offer at [`Self::quoted_frame`], covers what
@@ -1756,6 +1802,8 @@ pub struct LinkShapers {
     obligations: std::sync::RwLock<Option<Arc<dyn crate::load_ladder::PeerObligations>>>,
     /// Woken when tier 2 is in force.
     shed_wake: tokio::sync::Notify,
+    /// The node's bag, once attached.
+    metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
 }
 
 /// Peers whose shaping fact is held, at most. Past it a newcomer takes the
@@ -1883,6 +1931,7 @@ impl LinkShapers {
             seat_agreed: Mutex::new(std::collections::HashSet::new()),
             obligations: std::sync::RwLock::new(None),
             shed_wake: tokio::sync::Notify::new(),
+            metrics: std::sync::OnceLock::new(),
         }
     }
 
@@ -1958,6 +2007,23 @@ impl LinkShapers {
         if tier.closes_shaped_links() {
             self.shed_wake.notify_one();
         }
+    }
+
+    /// Count into the node's bag.
+    pub fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        let _ = self.metrics.set(metrics);
+    }
+
+    /// The node's bag, when one is attached.
+    #[must_use]
+    pub fn metrics(&self) -> Option<&crate::observability::EdgeMetrics> {
+        self.metrics.get()
+    }
+
+    /// Shaped links now, by class.
+    #[must_use]
+    pub fn links_of(&self, class: crate::telemetry::ShapingClass) -> usize {
+        self.links().values().filter(|s| s.class() == class).count()
     }
 
     /// The service tier in force.
@@ -2217,6 +2283,9 @@ impl LinkShapers {
         }) else {
             return Vec::new();
         };
+        if let Some(m) = self.metrics.get() {
+            m.telemetry.note_seat_roster_read();
+        }
         self.adopt_seats(active)
     }
 
@@ -2376,6 +2445,9 @@ impl LinkShapers {
         let total = self.effective_total();
         let over = total > cap + 1.0 && !links.is_empty();
         if over != self.over_cap.swap(over, Ordering::AcqRel) && over {
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_OVER_CAP);
+            }
             tracing::warn!(
                 links = links.len(),
                 total_bytes_per_s = total,
@@ -2765,16 +2837,18 @@ impl LinkShapers {
         let out = match agree(&ours, theirs) {
             _ if refused => Err(ShapingError::HomeElsewhere),
             Some(agreement) => {
-                let shaper = Arc::new(
-                    LinkShaper::new(link, agreement, self.queue_cap).quoted_at(ours.frame_bytes),
-                );
-                self.links().insert(link, Arc::clone(&shaper));
                 // A seat offer travels as `server`, so the peer's class says
                 // nothing: the link is a seat link when it runs at the seat
                 // rate this node offered.
-                if ours.class == BudgetClass::Seat
-                    && agreement.lambda >= f64::from(ours.rate_milli) / 1000.0 - 1e-6
-                {
+                let seat = ours.class == BudgetClass::Seat
+                    && agreement.lambda >= f64::from(ours.rate_milli) / 1000.0 - 1e-6;
+                let shaper = Arc::new(
+                    LinkShaper::new(link, agreement, self.queue_cap)
+                        .quoted_at(ours.frame_bytes)
+                        .of_class(ours.class.link_class(theirs.class, seat)),
+                );
+                self.links().insert(link, Arc::clone(&shaper));
+                if seat {
                     self.seat_agreed
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)

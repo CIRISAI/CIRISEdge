@@ -34,6 +34,7 @@
 //! the production type (LS1–LS5 in `closed_loop_sim`).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// The host's load verdict (L-S1). Promised to the server as
 /// `Edge::set_load_pressure(LoadPressure)`.
@@ -431,6 +432,8 @@ pub struct LoadLadder {
     calm_since: Option<u64>,
     changes: Vec<TierChange>,
     counters: BTreeMap<&'static str, u64>,
+    /// Changes [`SharedLadder`] has not told the telemetry of yet.
+    unbooked: Vec<TierChange>,
 }
 
 impl Default for LoadLadder {
@@ -454,6 +457,7 @@ impl LoadLadder {
             calm_since: None,
             changes: Vec::new(),
             counters: BTreeMap::new(),
+            unbooked: Vec::new(),
         }
     }
 
@@ -587,12 +591,14 @@ impl LoadLadder {
         if self.changes.len() == CHANGE_LOG {
             self.changes.remove(0);
         }
-        self.changes.push(TierChange {
+        let change = TierChange {
             at_ms: now_ms,
             from,
             to,
             cause,
-        });
+        };
+        self.changes.push(change.clone());
+        self.unbooked.push(change);
         tracing::info!(
             from = from.as_u8(),
             to = to.as_u8(),
@@ -611,6 +617,8 @@ impl LoadLadder {
 pub struct SharedLadder {
     t0: std::time::Instant,
     inner: std::sync::Mutex<(LoadLadder, EdgeLoadSignals, u64)>,
+    /// The node's telemetry, once attached, and how far its ledger has read.
+    telemetry: std::sync::OnceLock<Arc<crate::telemetry::EdgeTelemetry>>,
 }
 
 impl Default for SharedLadder {
@@ -626,7 +634,24 @@ impl SharedLadder {
         Self {
             t0: std::time::Instant::now(),
             inner: std::sync::Mutex::new((LoadLadder::new(cfg), EdgeLoadSignals::default(), 0)),
+            telemetry: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Book every tier change, the tier and the pressure into `telemetry`.
+    pub fn attach_telemetry(&self, telemetry: Arc<crate::telemetry::EdgeTelemetry>) {
+        let _ = self.telemetry.set(telemetry);
+    }
+
+    fn book(&self, ladder: &mut LoadLadder) {
+        let Some(t) = self.telemetry.get() else {
+            ladder.unbooked.clear();
+            return;
+        };
+        for change in ladder.unbooked.drain(..) {
+            t.note_tier_change(change.to.token(), change.cause);
+        }
+        t.set_load(ladder.tier().as_u8(), ladder.host_pressure().tier().as_u8());
     }
 
     fn now_ms(&self) -> u64 {
@@ -642,7 +667,14 @@ impl SharedLadder {
     /// The host's verdict (L-S1).
     pub fn set_host_pressure(&self, p: LoadPressure) -> ServiceTier {
         let now = self.now_ms();
-        self.lock().0.set_host_pressure(now, p)
+        let mut g = self.lock();
+        let tier = g.0.set_host_pressure(now, p);
+        self.book(&mut g.0);
+        drop(g);
+        if let Some(t) = self.telemetry.get() {
+            t.note_pressure_report();
+        }
+        tier
     }
 
     /// One source's signals for the current window: the worst of each
@@ -657,6 +689,7 @@ impl SharedLadder {
             let sig = std::mem::take(&mut g.1);
             g.2 = now;
             g.0.observe(now, sig);
+            self.book(&mut g.0);
         }
         g.0.tier()
     }

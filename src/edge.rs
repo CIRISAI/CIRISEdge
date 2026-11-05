@@ -28,7 +28,7 @@ use crate::messages::{
     FederationAnnouncement, MessageType, RefusalReason, ACCORD_THRESHOLD_M_OF_N,
 };
 use crate::outbound::{
-    run_dispatcher, run_sweeps, DispatcherConfig, OutboundHandle, PeerDirectory,
+    run_dispatcher_beating, run_sweeps_beating, DispatcherConfig, OutboundHandle, PeerDirectory,
     PeerSubscriptionFilter, StewardDirectory, StewardKey,
 };
 use crate::reachability::{record_if_tracking, AttemptOutcome, ReachabilityTracker};
@@ -3162,9 +3162,30 @@ impl Edge {
         payload: Vec<u8>,
         timeout_ms: u64,
     ) -> Result<crate::first_contact::OpaqueExchange, EdgeError> {
-        let own = self.own_key_record_row().await?;
-        self.send_opaque_request_inner(destination_key_id, kind, payload, Some(own), timeout_ms)
-            .await
+        use crate::telemetry::FirstContactOutcome as Outcome;
+        let began = std::time::Instant::now();
+        let answer = match self.own_key_record_row().await {
+            Ok(own) => {
+                self.send_opaque_request_inner(
+                    destination_key_id,
+                    kind,
+                    payload,
+                    Some(own),
+                    timeout_ms,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        let outcome = match &answer {
+            Ok(_) => Outcome::Answered,
+            Err(EdgeError::Transport(crate::TransportError::Timeout(_))) => Outcome::Timeout,
+            Err(_) => Outcome::Failed,
+        };
+        self.metrics
+            .telemetry
+            .observe_first_contact(outcome, began.elapsed());
+        answer
     }
 
     /// CIRISEdge#683 — this node's own key record, as the `key:record:v1` ROW
@@ -4936,6 +4957,7 @@ impl Edge {
         self.background.resume();
         self.suspended
             .store(false, std::sync::atomic::Ordering::Release);
+        self.metrics.telemetry.note_woken();
         Ok(())
     }
 
@@ -4984,16 +5006,18 @@ impl Edge {
             let sd = shutdown_rx.clone();
             let reach = Some(self.reachability.clone());
             let rt = runtime.clone();
+            let beat = Some(Arc::clone(&self.metrics.telemetry));
             tasks.push(self.background.register(move || {
-                let (q, ts, cfg, sd, reach) = (
+                let (q, ts, cfg, sd, reach, beat) = (
                     q.clone(),
                     ts.clone(),
                     cfg.clone(),
                     sd.clone(),
                     reach.clone(),
+                    beat.clone(),
                 );
                 rt.spawn(async move {
-                    run_dispatcher(q, ts, cfg, sd, reach).await;
+                    run_dispatcher_beating(q, ts, cfg, sd, reach, beat).await;
                 })
             }));
         }
@@ -5001,10 +5025,11 @@ impl Edge {
             let q = self.queue.clone();
             let sd = shutdown_rx.clone();
             let rt = runtime.clone();
+            let beat = Some(Arc::clone(&self.metrics.telemetry));
             tasks.push(self.background.register(move || {
-                let (q, sd) = (q.clone(), sd.clone());
+                let (q, sd, beat) = (q.clone(), sd.clone(), beat.clone());
                 rt.spawn(async move {
-                    run_sweeps(q, sd).await;
+                    run_sweeps_beating(q, sd, beat).await;
                 })
             }));
         }
@@ -9101,6 +9126,13 @@ impl EdgeBuilder {
         for transport in &self.transports {
             transport.attach_metrics(metrics.clone());
         }
+        // v44 — the ladder books into the same bag, and a transport with a
+        // tick of its own applies the tier without a host read.
+        let load_ladder = Arc::new(crate::load_ladder::SharedLadder::default());
+        load_ladder.attach_telemetry(Arc::clone(&metrics.telemetry));
+        for transport in &self.transports {
+            transport.attach_load_ladder(Arc::clone(&load_ladder));
+        }
         // CIRISEdge#771 — the wired chunk source counts into the SAME bag
         // (the legacy DAG walk): the one settled on above, never a second.
         if let Some(source) = self.blob_chunk_source.as_deref() {
@@ -9111,7 +9143,7 @@ impl EdgeBuilder {
             verify,
             queue,
             signer,
-            load_ladder: Arc::new(crate::load_ladder::SharedLadder::default()),
+            load_ladder,
             local_signer: self.local_signer,
             transports: self.transports,
             handlers: Arc::new(Mutex::new(HashMap::new())),
