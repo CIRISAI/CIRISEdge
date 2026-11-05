@@ -12060,14 +12060,15 @@ mod pyo3_tier2_tests {
     /// last is the scheduler's, so without this the test's outcome is too, and
     /// a test that accepts a downstream `Err` passes without having reached
     /// what it pins. GC first: an unreachable engine must be finalized before
-    /// the reset can clear it.
+    /// the reset can clear it. A reset that cannot run panics: swallowing it is
+    /// how this stayed a no-op.
     fn clear_engine_slate(py: Python<'_>) {
-        if let Ok(gc) = py.import("gc") {
-            let _ = gc.call_method0("collect");
-        }
-        if let Ok(persist) = py.import("ciris_persist") {
-            let _ = persist.call_method1("reset_engine", (5.0_f64,));
-        }
+        py.import("gc")
+            .and_then(|gc| gc.call_method0("collect"))
+            .expect("gc.collect");
+        py.import("ciris_persist")
+            .and_then(|persist| persist.call_method1("reset_engine", (5.0_f64,)))
+            .expect("reset_engine: the stand-in module carries it");
     }
 
     fn install_ciris_persist_module(py: Python<'_>) -> PyResult<()> {
@@ -12078,8 +12079,10 @@ mod pyo3_tier2_tests {
         if modules.contains("ciris_persist")? {
             return Ok(());
         }
+        // The whole module, as the wheel has it: `reset_engine` lives there, and
+        // [`clear_engine_slate`] needs it.
         let m = PyModule::new(py, "ciris_persist")?;
-        m.add_class::<ciris_persist::ffi::pyo3::PyEngine>()?;
+        ciris_persist::ffi::pyo3::register(py, &m)?;
         modules.set_item("ciris_persist", m)?;
         Ok(())
     }
