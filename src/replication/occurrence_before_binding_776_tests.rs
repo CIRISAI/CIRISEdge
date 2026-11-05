@@ -338,6 +338,12 @@ async fn an_occurrence_refused_before_its_binding_is_re_asked_when_the_binding_l
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // two runtimes and a loopback, one sequence on purpose
 async fn the_release_kicks_a_re_ask_of_the_peer_that_offered_the_row_776() {
+    release_scenario(None).await;
+}
+
+/// The release witness. `page`: the offering node's sweep page, in rows.
+#[allow(clippy::too_many_lines)] // two runtimes and a loopback, one sequence on purpose
+async fn release_scenario(page: Option<u32>) {
     use crate::replication::registry::ReplicationRegistry;
     use crate::replication::{
         self_publish_set, ReplicationPeer, ReplicationRuntime, ReplicationRuntimeConfig,
@@ -421,6 +427,12 @@ async fn the_release_kicks_a_re_ask_of_the_peer_that_offered_the_row_776() {
                         ..SchedulerConfig::default()
                     },
                     local_key_id: Some(me.clone()),
+                    bridge: page.map_or_else(BridgeConfig::default, |sweep_page_rows| {
+                        BridgeConfig {
+                            sweep_page_rows,
+                            ..BridgeConfig::default()
+                        }
+                    }),
                     ..ReplicationRuntimeConfig::default()
                 },
                 publish.map(self_publish_set),
@@ -478,6 +490,15 @@ async fn the_release_kicks_a_re_ask_of_the_peer_that_offered_the_row_776() {
     }
     rt_x.shutdown().await;
     rt_d.shutdown().await;
+}
+
+/// **`FSD/EVENT_PATH_MODEL.md` §1.5.** Past one page a release alone does not
+/// bring a row back: the kicked round's Summary is head plus a page, and the
+/// row is behind the watermark, so it waits for the re-sweep. The round the
+/// release kicks fetches the released row by hash instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_released_behind_the_watermark_is_fetched_at_once_776() {
+    release_scenario(Some(1)).await;
 }
 
 /// No kick loop, and no WARN per round (CIRISEdge#858 fix 4): a refusal whose

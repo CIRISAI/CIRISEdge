@@ -1016,6 +1016,26 @@ impl ReplicationCoordinator {
         Ok(Some(signer))
     }
 
+    /// What a recovery round asks this peer: a queued signer's `Pull` first
+    /// ([`Self::send_recovery_pull`]), else a `Fetch` of the rows released from
+    /// it (CIRISEdge#776). Returns what was asked, for the log, or `None` when
+    /// nothing is queued. A `Fetch` that fails or goes unanswered loses nothing
+    /// past what the re-sweep brings back: the rows are no longer suppressed.
+    pub async fn send_recovery_ask(&self) -> Result<Option<String>, CoordinatorError> {
+        if let Some(signer) = self.send_recovery_pull().await? {
+            return Ok(Some(signer));
+        }
+        let want = self
+            .provider
+            .take_released_rows_for(&self.peer_key_id, self.kind);
+        if want.is_empty() {
+            return Ok(None);
+        }
+        let rows = want.len();
+        self.start_fetch(want).await?;
+        Ok(Some(format!("{rows} released rows")))
+    }
+
     /// **A subject Pull, driven to the apply on its own exchange.** Sends
     /// `Pull{kind, subject}` on a round of its own and drives the answer
     /// (`Summary` → `Diff` → `Deliver` → apply) on a task of its own, with a
@@ -1267,10 +1287,7 @@ impl ReplicationCoordinator {
         // CIRISEdge#552 — record the EXACT hashes, so only these are applied.
         // A responder can append whatever it likes to the reply; appending does
         // not make it requested.
-        self.session
-            .lock()
-            .await
-            .expect_bodies(want.iter().copied());
+        self.session.lock().await.expect_fetched(&want);
         self.send_message(&fetch).await
     }
 

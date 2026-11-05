@@ -677,6 +677,13 @@ impl Session {
     /// those bodies are applied. Without this, a peer answering a Fetch could
     /// append arbitrary directory bodies and have every one accepted — the
     /// corpus-size and address-book properties lost to a generous responder.
+    pub fn expect_fetched(&mut self, hashes: &[[u8; 32]]) {
+        self.expect_bodies(hashes.iter().copied());
+        // The Deliver that answers a Fetch is solicited, as one answering a Diff.
+        self.diff_want_count = Some(hashes.len());
+    }
+
+    /// Record the hashes this node asked a peer for by name.
     pub fn expect_bodies(&mut self, hashes: impl IntoIterator<Item = [u8; 32]>) {
         self.expect_bodies_for_rounds(hashes, Self::DEFAULT_EXPECTATION_ROUNDS);
     }

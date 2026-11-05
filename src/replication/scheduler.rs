@@ -1571,7 +1571,7 @@ async fn run_one_recovery_round(
     let round = coord.begin_round().await;
     let bound = pacing_send_timeout(coord.pacing_gap());
     let pulled = seat
-        .send(round_timeout, bound, coord.send_recovery_pull())
+        .send(round_timeout, bound, coord.send_recovery_ask())
         .await;
     let signer = match pulled {
         Ok(Some(signer)) => signer,

@@ -1591,6 +1591,10 @@ struct SweepCursors {
 /// and a walk of a large plane never finishes (`FSD/EVENT_PATH_MODEL.md` §1.6).
 const MAX_TRACKED_SWEEP_CURSORS: usize = 8192;
 
+/// CIRISEdge#776 — released rows one `(peer, plane)` fetches by hash at once. A
+/// row past it comes back on the re-sweep, as every released row did before.
+const MAX_RELEASED_ASKS: usize = 64;
+
 impl SweepCursors {
     /// The `since` for this round's NEW-ROWS page.
     fn head(&mut self, key: &(String, EnvelopeKind)) -> Option<ResumeCursor> {
@@ -2463,6 +2467,9 @@ pub struct FederationDirectoryReplicationBridge {
     /// The shared [`crate::rate_limit::SourceLedger`] exists so the fix is
     /// imported rather than re-derived a fifth time.
     missing_signer_sources: Mutex<crate::rate_limit::SourceLedger>,
+    /// CIRISEdge#776 — rows released per `(peer, plane)`, for the round the
+    /// release kicks to fetch by hash. Taken whole by that round.
+    released_asks: Mutex<HashMap<(String, EnvelopeKind), Vec<[u8; 32]>>>,
     /// CIRISEdge#531 DEPTH — the largest row count ANY single page read has
     /// returned on this bridge. The flat bound's own witness, in the same
     /// discipline as [`Self::sweep_gate`]'s `max_in_flight` and
@@ -2741,6 +2748,7 @@ impl FederationDirectoryReplicationBridge {
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             requested_signers: Mutex::new(std::collections::BTreeSet::new()),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
+            released_asks: Mutex::default(),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             advertise_inputs: Mutex::new(AdvertiseInputs::default()),
             advertise_ledger: Mutex::new(AdvertiseLedger::default()),
@@ -4073,6 +4081,16 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
     }
 
+    fn take_released_rows_for(&self, peer_key_id: &str, kind: EnvelopeKind) -> Vec<[u8; 32]> {
+        self.released_asks.lock().map_or_else(
+            |_| Vec::new(),
+            |mut asks| {
+                asks.remove(&(peer_key_id.to_owned(), kind))
+                    .unwrap_or_default()
+            },
+        )
+    }
+
     fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
         // CIRISEdge#904 — a name a person is waiting on goes first, to
         // whichever peer's round comes next; it also leaves the repair queue
@@ -5042,9 +5060,21 @@ impl FederationDirectoryReplicationBridge {
     /// booked afresh and is never kicked twice by one release. Returns how many
     /// rows were released.
     fn release_and_kick(&self, signer: &str, cause: ReleaseCause) -> usize {
-        let (released, ask) = self.refusal_backoff.release_signer_from(signer);
+        let (released, rows) = self.refusal_backoff.release_signer_rows(signer);
         if released == 0 {
             return 0;
+        }
+        let mut ask: Vec<(EnvelopeKind, String)> = Vec::new();
+        if let Ok(mut asks) = self.released_asks.lock() {
+            for (plane, peer, row) in rows {
+                if !ask.iter().any(|(k, p)| *k == plane && *p == peer) {
+                    ask.push((plane, peer.clone()));
+                }
+                let queued = asks.entry((peer, plane)).or_default();
+                if !queued.contains(&row) && queued.len() < MAX_RELEASED_ASKS {
+                    queued.push(row);
+                }
+            }
         }
         self.signer_releases
             .fetch_add(released, std::sync::atomic::Ordering::Relaxed);

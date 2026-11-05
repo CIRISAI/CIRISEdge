@@ -268,6 +268,14 @@ pub trait ReplicationDirectory: Send + Sync {
         None
     }
 
+    /// See [`StateProvider::take_released_rows_for`].
+    ///
+    /// [`StateProvider::take_released_rows_for`]:
+    ///     super::summary::StateProvider::take_released_rows_for
+    fn take_released_rows_for(&self, _peer_key_id: &str, _kind: EnvelopeKind) -> Vec<[u8; 32]> {
+        Vec::new()
+    }
+
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
         false
     }
@@ -393,6 +401,10 @@ impl StateProvider for DirectoryStateAdapter {
 
     fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
         self.inner.take_missing_signer_for(peer_key_id)
+    }
+
+    fn take_released_rows_for(&self, peer_key_id: &str, kind: EnvelopeKind) -> Vec<[u8; 32]> {
+        self.inner.take_released_rows_for(peer_key_id, kind)
     }
 
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {

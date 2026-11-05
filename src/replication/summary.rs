@@ -320,6 +320,14 @@ pub trait StateProvider: Send + Sync {
         None
     }
 
+    /// CIRISEdge#776 — rows released from this peer on this plane, taken once.
+    /// A release can only re-open a row's offer, and past one page a peer names
+    /// a row once per re-sweep, so the round the release kicks fetches them by
+    /// hash: the ask the kick was for (`FSD/EVENT_PATH_MODEL.md` §1.5).
+    fn take_released_rows_for(&self, _peer_key_id: &str, _kind: EnvelopeKind) -> Vec<[u8; 32]> {
+        Vec::new()
+    }
+
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
         false
     }

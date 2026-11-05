@@ -711,6 +711,29 @@ impl RefusalBackoff {
         self.release_signer_from(signer).0
     }
 
+    /// [`Self::release_signer_from`], with the released rows themselves: the
+    /// `(plane, peer, row)` of each row booked with a peer.
+    pub fn release_signer_rows(
+        &self,
+        signer: &str,
+    ) -> (usize, Vec<(EnvelopeKind, String, [u8; 32])>) {
+        let mut st = self.lock();
+        let Some(rows) = st.by_signer.remove(signer) else {
+            return (0, Vec::new());
+        };
+        let mut released = 0;
+        let mut ask = Vec::new();
+        for key in rows {
+            if let Some(entry) = st.remove(&key) {
+                released += 1;
+                if let Some(peer) = entry.waiting_from {
+                    ask.push((key.0, peer, key.1));
+                }
+            }
+        }
+        (released, ask)
+    }
+
     /// CIRISEdge#776 — [`Self::release_signer`], also naming who to ask: the
     /// distinct `(plane, peer)` pairs the released rows were offered from
     /// (rows booked without a peer contribute to the count only). The caller
