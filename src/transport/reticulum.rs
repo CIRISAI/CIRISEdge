@@ -5970,6 +5970,7 @@ impl ReticulumTransport {
         let refused = |r: &crate::transport::link_seal::SealRefusal| {
             seal_refused(self.metrics.get(), peer_key_id, None, r, "dial")
         };
+        self.seek_if_unpathed(peer_key_id).await;
         // CC 3.3.6.2 in-row separation against the dialled node's keys this
         // device holds: its announced transport identity, (b) of persist's
         // other_keys groups.
@@ -6365,6 +6366,7 @@ impl ReticulumTransport {
                 member.as_deref().unwrap_or("<none>"),
             )));
         }
+        self.seek_if_unpathed(destination_key_id).await;
         // CIRISEdge#805 (CC 5.3.3.5 E1) — the link can only be keyed by the
         // dialled node's published transit pair: no pair, no dial, refused by
         // name before a link is spent on it.
@@ -9182,6 +9184,21 @@ impl ReticulumTransport {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         known()
+    }
+
+    /// [`Self::seek_peer`] for a dial that has nothing else to go on: a call or
+    /// a first contact to a peer with no path would otherwise wait on its
+    /// announce, which a relay may not pass for an hour. Bounded as that is.
+    async fn seek_if_unpathed(&self, destination_key_id: &str) {
+        let pathed = self
+            .resolve_dial_candidates(destination_key_id)
+            .await
+            .iter()
+            .any(|c| self.node.has_path(&c.dest_hash));
+        if !pathed {
+            let found = self.seek_peer(destination_key_id).await;
+            tracing::debug!(peer = %destination_key_id, found, "asked for a peer with no path");
+        }
     }
 
     /// Ask for a peer this node wants and has not heard: through whatever it

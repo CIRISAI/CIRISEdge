@@ -196,6 +196,17 @@ struct Node {
 }
 
 async fn node(key: Ident, dir: Arc<SqliteBackend>, base: &std::path::Path, peers: &[u16]) -> Node {
+    node_on(key, dir, base, peers, false).await
+}
+
+/// [`node`], forwarding for the nodes that connect to it when `forwards`.
+async fn node_on(
+    key: Ident,
+    dir: Arc<SqliteBackend>,
+    base: &std::path::Path,
+    peers: &[u16],
+    forwards: bool,
+) -> Node {
     let mut transport = None;
     let mut port = 0;
     for _ in 0..16 {
@@ -203,6 +214,7 @@ async fn node(key: Ident, dir: Arc<SqliteBackend>, base: &std::path::Path, peers
         port = free_port();
         c.listen_addr = format!("127.0.0.1:{port}").parse().unwrap();
         c.announce_interval = Duration::from_secs(3);
+        c.enable_transport = forwards;
         c.bootstrap_peers = peers
             .iter()
             .map(|p| format!("127.0.0.1:{p}").parse().unwrap())
@@ -310,6 +322,18 @@ fn store(tag: &str) -> ScopeStateProvider {
 /// `n` nodes in a TCP full mesh, each holding every other's signed route,
 /// each knowing every other; plus the room's MLS group over all of them.
 async fn mesh(tag: &str, n: usize) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
+    mesh_with(tag, n, false).await
+}
+
+/// [`mesh`]. With `late`, node 0 stops announcing before the last node exists,
+/// and the last node connects only to node 1, which forwards. A direct
+/// neighbour would hear node 0 anyway (leviculum re-announces on interface-up),
+/// so behind the hop it has heard nothing and holds only the signed route.
+async fn mesh_with(
+    tag: &str,
+    n: usize,
+    late: bool,
+) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut keys = Vec::new();
@@ -329,8 +353,22 @@ async fn mesh(tag: &str, n: usize) -> (Vec<Node>, Vec<CohortGroup>, tempfile::Te
     let mut nodes: Vec<Node> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
         let dir = directory_with(records.clone()).await;
-        let peers: Vec<u16> = nodes.iter().map(|n| n.port).collect();
-        nodes.push(node(key, dir, &tmp.path().join(format!("n{i}")), &peers).await);
+        let mut peers: Vec<u16> = nodes.iter().map(|n| n.port).collect();
+        if late && i == n - 1 {
+            nodes[0].transport.set_unannounced_for_test(true);
+            peers = vec![nodes[1].port];
+        }
+        let forwards = late && i == 1;
+        nodes.push(
+            node_on(
+                key,
+                dir,
+                &tmp.path().join(format!("n{i}")),
+                &peers,
+                forwards,
+            )
+            .await,
+        );
     }
     for (i, from) in nodes.iter().enumerate() {
         let routes = from
@@ -351,7 +389,13 @@ async fn mesh(tag: &str, n: usize) -> (Vec<Node>, Vec<CohortGroup>, tempfile::Te
     let known = wait_until(Duration::from_secs(90), || async {
         for a in &nodes {
             for b in &nodes {
-                if a.key.key_id != b.key.key_id && !a.transport.knows_peer(&b.key.key_id).await {
+                let unheard = late
+                    && a.key.key_id == nodes[n - 1].key.key_id
+                    && b.key.key_id == nodes[0].key.key_id;
+                if a.key.key_id != b.key.key_id
+                    && !unheard
+                    && !a.transport.knows_peer(&b.key.key_id).await
+                {
                     return false;
                 }
             }
@@ -487,6 +531,34 @@ async fn wait_bound(call: &Call, n: u64) {
         .await,
         "the call verifies its peers' bindings: {:?}",
         call.chunk_auth_counts()
+    );
+}
+
+/// **Witness (v44 LTS)** — a call to a member with no path asks for one. A is
+/// silent and the late joiner has only its signed route, so nothing but the
+/// call's bounded ask tells it who A is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_joiner_asks_for_a_member_it_has_never_heard() {
+    let tag = "late";
+    let (nodes, groups, _tmp) = mesh_with(tag, 3, true).await;
+    let (a, late) = (&nodes[0], &nodes[2]);
+    assert!(
+        !late.transport.knows_peer(&a.key.key_id).await,
+        "the late joiner has heard nothing of A"
+    );
+    let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
+    let _call_a = join(a, &groups[0], tag, CallOptions::default(), none())
+        .await
+        .expect("A joins");
+    let _call_late = join(late, &groups[2], tag, CallOptions::default(), none())
+        .await
+        .expect("the late joiner joins");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            late.transport.knows_peer(&a.key.key_id).await
+        })
+        .await,
+        "the call asked for A, and A is silent: no announce told it"
     );
 }
 
