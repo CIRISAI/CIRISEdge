@@ -360,6 +360,11 @@ async fn mesh_with(
         if late && i == n - 1 {
             nodes[0].transport.set_unannounced_for_test(true);
             peers = vec![nodes[1].port];
+            // The forwarder's own retry of A's last announce fires 5 to 5.5 s
+            // later (leviculum `PATHFINDER_G_MS` + `PATHFINDER_RW_MS`, one
+            // retry), and a joiner inside that window hears it: this witness
+            // passed with the ask disabled. A node that joins late joins after.
+            tokio::time::sleep(Duration::from_secs(7)).await;
         }
         let forwards = late && i == 1;
         nodes.push(
