@@ -422,16 +422,14 @@ async fn a_non_no_route_error_does_not_back_off_794() {
     let kinds = [EnvelopeKind::Key, EnvelopeKind::Attestation];
     let t = ScriptedTransport::new(&[("flaky", Route::Error)]);
     let rig = Rig::start(&t, &["flaky"], &kinds);
-    // Ticks at 0, 30, …, 150 s.
+    // A failed send re-dials in 15 to 45 s (CC 5.4.6, `draw_redial`), so every
+    // plane keeps its rounds, at least one per 45 s, with no window growing.
     tokio::time::sleep(Duration::from_secs(155)).await;
-    assert_eq!(
-        t.sends("flaky"),
-        6 * kinds.len(),
-        "a round per plane per tick"
+    assert!(
+        t.sends("flaky") >= 4 * kinds.len(),
+        "every plane keeps dialling: {}",
+        t.sends("flaky")
     );
-    assert!(rig.handle.try_kick("flaky", EnvelopeKind::Key));
-    settle().await;
-    assert_eq!(t.sends("flaky"), 6 * kinds.len() + 1, "the kick ran");
     assert!(
         backed_off(&rig.handle).is_empty(),
         "only route absence backs off"

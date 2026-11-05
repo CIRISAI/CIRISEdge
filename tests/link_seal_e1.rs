@@ -245,6 +245,18 @@ async fn seed_route(from: &Node, to: &Node) {
 /// trust bundle (and its own key); it is given nothing about `A` but what
 /// `A`'s announce carries.
 async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool, c_fresh: bool) -> Trio {
+    trio_on(tag, seed_a_at_clients, c_unannounced, c_fresh, false).await
+}
+
+/// [`trio`], with `A` forwarding for its clients when `forwards`, so `B` and
+/// `C` reach each other through it.
+async fn trio_on(
+    tag: &str,
+    seed_a_at_clients: bool,
+    c_unannounced: bool,
+    c_fresh: bool,
+    forwards: bool,
+) -> Trio {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let keys = [
@@ -280,6 +292,7 @@ async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool, c_fresh: 
                         c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
                     }
                     c.announce_interval = Duration::from_secs(5);
+                    c.enable_transport = forwards && i == 0;
                     (c, auth(signer, &dir))
                 }
             },
@@ -2453,22 +2466,16 @@ async fn a_refused_dial_comes_back_off_the_beat() {
     );
 }
 
-/// A process restart of `A`: a new transport over the same identity and
-/// directory on the same port, holding what persist holds and nothing else.
-async fn restart_a(
-    t: &Trio,
-) -> (
-    Arc<ReticulumTransport>,
-    EdgeMetrics,
-    tokio::task::JoinHandle<()>,
-) {
-    let report = t.a.transport.suspend(Duration::from_secs(10)).await;
+/// A process restart of `B`: a new transport over the same identity and
+/// directory, holding what persist holds and nothing else.
+async fn restart_b(t: &Trio) -> (Arc<ReticulumTransport>, EdgeMetrics) {
+    let report = t.b.transport.suspend(Duration::from_secs(10)).await;
     assert!(report.quiescent, "the old process is gone: {report:?}");
     let metrics = EdgeMetrics::new();
-    let base = t._tmp.path().join("n0");
-    let signer = t.a.key.signer();
-    let dir = Arc::clone(&t.a.dir);
-    let port = t.port_a;
+    let base = t._tmp.path().join("n1");
+    let signer = t.b.key.signer();
+    let dir = Arc::clone(&t.b.dir);
+    let port_a = t.port_a;
     let (transport, _) = common::build_reticulum_with_retry_metrics(
         || {
             let base = base.clone();
@@ -2477,7 +2484,8 @@ async fn restart_a(
             async move {
                 let mut c =
                     ReticulumTransportConfig::new(base.join("transport.id"), &signer.key_id);
-                c.listen_addr = format!("127.0.0.1:{port}").parse().unwrap();
+                c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+                c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
                 c.announce_interval = Duration::from_secs(5);
                 (c, auth(signer, &dir))
             }
@@ -2490,70 +2498,74 @@ async fn restart_a(
     tokio::spawn(async move {
         let _ = listener.listen(tx).await;
     });
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    (transport, metrics, drain)
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    (transport, metrics)
 }
 
 /// **Witness (v44 LTS, `FSD/EVENT_PATH_MODEL.md` §2.3)** — after a restart a
-/// peer bound in the directory, on the active roster, has standing from its
-/// first handshake: with the stranger rate at zero and no announce from it, it
-/// keys. A stranger beside it, which the directory binds to nothing, is still
-/// refused, so what the restart reads is the binding and not everyone.
+/// peer bound in the directory and on the active roster has standing from its
+/// first handshake. `C` reaches `B` through `A`, which forwards, so `B`'s
+/// restart drops no interface of `C`'s and nothing makes it announce: `B` has
+/// only persist to know it by. (A direct TCP client re-announces when it
+/// reconnects, which is why this needs a hop.) `A` is bound at `B` too and is
+/// not on the roster: a binding alone is still a stranger.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bound_peer_has_standing_from_its_first_handshake_after_a_restart() {
-    let t = trio("restart", true, false, false).await;
-    // Neither speaks again: a restart learns them from nothing but persist.
-    t.b.transport.set_unannounced_for_test(true);
-    t.c.transport.set_unannounced_for_test(true);
-    let (a, metrics, _drain) = restart_a(&t).await;
-    a.set_stranger_handshake_cap_for_test(0);
-    a.set_seats_for_test(std::iter::once(t.b.key.key_id.clone()).collect(), false);
-    let refused = || {
-        metrics
-            .link_seal()
-            .get("link_seal_refused_handshake_node_rate")
-            .copied()
-            .unwrap_or(0)
-    };
-    let keyed = || {
-        metrics
-            .link_seal()
-            .get(ciris_edge::observability::LINK_SEAL_DECAPSULATED)
-            .copied()
-            .unwrap_or(0)
-    };
-    let a_dest = a.local_named_dest_hash();
+    let t = trio_on("restart", true, false, false, true).await;
+    seed_route(&t.b, &t.c).await;
+    seed_route(&t.c, &t.b).await;
     assert!(
-        wait_until(Duration::from_secs(30), || async {
-            t.b.transport
-                .path_table_rows_for_test()
-                .iter()
-                .any(|(dest, _, _)| *dest == a_dest)
+        wait_until(Duration::from_secs(60), || async {
+            t.c.transport.knows_peer(&t.b.key.key_id).await
+                && t.b.transport.knows_peer(&t.c.key.key_id).await
         })
         .await,
-        "B holds a path back to A"
+        "B and C learn each other through A"
     );
-    let bound = marked(b"LTS-RESTART-BOUND-", 600);
-    let landed = wait_until(Duration::from_secs(30), || async {
-        let _ = t.b.transport.send(&t.a.key.key_id, &bound).await;
-        keyed() >= 1
-    })
-    .await;
+    t.c.transport.set_unannounced_for_test(true);
+    t.a.transport.set_unannounced_for_test(true);
+    let (b, metrics) = restart_b(&t).await;
+    b.set_stranger_handshake_cap_for_test(0);
+    b.set_seats_for_test(std::iter::once(t.c.key.key_id.clone()).collect(), false);
+    let counted = |label: &str| metrics.link_seal().get(label).copied().unwrap_or(0);
+    let accepted = || counted(ciris_edge::observability::LINK_SEAL_ACCEPTED);
+    let refused = || counted("link_seal_refused_handshake_node_rate");
+    let b_dest = b.local_named_dest_hash();
     assert!(
-        landed,
-        "the bound peer keys with the stranger rate at zero: {:?}",
+        wait_until(Duration::from_secs(30), || async {
+            t.c.transport
+                .path_table_rows_for_test()
+                .iter()
+                .any(|(dest, _, _)| *dest == b_dest)
+        })
+        .await,
+        "C holds a path to B"
+    );
+    assert!(
+        !b.knows_peer(&t.c.key.key_id).await,
+        "the restart holds no live binding for C"
+    );
+    let first = marked(b"LTS-RESTART-BOUND-", 600);
+    let sent = t.c.transport.send(&t.b.key.key_id, &first).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            accepted() >= 1 || refused() >= 1
+        })
+        .await,
+        "the handshake is judged: {sent:?} {:?}",
         metrics.link_seal()
     );
-    assert_eq!(refused(), 0, "{:?}", metrics.link_seal());
-    let stranger = marked(b"LTS-RESTART-STRANGER-", 600);
-    let refused_c = wait_until(Duration::from_secs(30), || async {
-        let _ = t.c.transport.send(&t.a.key.key_id, &stranger).await;
-        refused() >= 1
-    })
-    .await;
+    assert_eq!(
+        (accepted(), refused()),
+        (1, 0),
+        "C keys on its first handshake with the stranger rate at zero: {:?}",
+        metrics.link_seal()
+    );
+    let stranger = marked(b"LTS-RESTART-NOT-SEATED-", 600);
+    let _ = t.a.transport.send(&t.b.key.key_id, &stranger).await;
     assert!(
-        refused_c,
-        "a key the directory does not bind is a stranger: {:?}",
+        wait_until(Duration::from_secs(10), || async { refused() >= 1 }).await,
+        "a bound key off the roster is a stranger: {:?}",
         metrics.link_seal()
     );
 }

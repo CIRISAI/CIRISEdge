@@ -31,9 +31,11 @@
 //! - **Expiry**: the probe ended in anything but no-route. The other planes
 //!   are kicked; the probing one just ran.
 //!
-//! Only route absence backs off. A timeout, a refusal or a protocol error
-//! keeps the pre-#794 behaviour (a fresh round on the next tick). The peer is
-//! never dropped from the send set: it is a member and catches up on return.
+//! Only route absence backs off. A timeout or a protocol error keeps the
+//! pre-#794 behaviour (a fresh round on the next tick), and a send that failed
+//! re-dials on one jittered draw (`scheduler::draw_redial`, CC 5.4.6), with no
+//! window that grows. The peer is never dropped from the send set: it is a
+//! member and catches up on return.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -125,7 +127,11 @@ pub struct NoRouteBackoffEntry {
 pub(crate) enum RoundClass {
     /// The transport has no route to the peer; carries the error for the log.
     NoRoute(String),
-    /// Anything else: completed, refused, timed out, or another error.
+    /// The send failed with no route question in it: the dial was refused, or
+    /// the link it got closed under the frame. The peer's receiver order gives
+    /// no answer, so this is all a dialler ever sees of a refusal (CC 5.4.6).
+    SendFailed,
+    /// Anything else: completed, refused, timed out, or a protocol error.
     Other,
     /// The transport is suspended (host in background): the round never
     /// reached the wire, so it says nothing about the peer — no backoff is
@@ -363,7 +369,7 @@ impl NoRouteBackoff {
                     );
                 }
             }
-            RoundClass::Other if probe && backed_off => {
+            RoundClass::Other | RoundClass::SendFailed if probe && backed_off => {
                 drop(peers);
                 self.clear(peer, BackoffExit::Expiry, Some(kind));
             }
@@ -378,7 +384,7 @@ impl NoRouteBackoff {
             }
             // A round already in flight when another plane put the peer in
             // backoff (or one that cleared meanwhile): the state it finds stands.
-            RoundClass::NoRoute(_) | RoundClass::Other => {}
+            RoundClass::NoRoute(_) | RoundClass::Other | RoundClass::SendFailed => {}
         }
     }
 

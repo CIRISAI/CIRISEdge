@@ -949,6 +949,9 @@ async fn run_one_coordinator_forever(
     // rebuilds the interval, so a reader answering "no relief" forever never
     // perturbs the pre-#440 tick stream.
     let mut current_cadence = cadence;
+    // CC 5.4.6 — when the re-dial drawn after a failed send is due. Until then
+    // a kick does not dial: it would put a refused fleet back on one beat.
+    let mut redial_at: Option<tokio::time::Instant> = None;
 
     let peer_id = coord.peer_key_id().to_string();
     let kind_str = format!("{:?}", coord.kind());
@@ -991,9 +994,20 @@ async fn run_one_coordinator_forever(
                 // CIRISEdge#794 — a kick does not bypass the no-route backoff:
                 // a backed-off peer's coordinator ignores it (and takes no
                 // permit). The schedule is then left alone, not reset.
+                //
+                // CC 5.4.6 — nor the re-dial drawn after a failed send: that
+                // tick runs the round the kick wanted.
+                if redial_at.is_some_and(|at| tokio::time::Instant::now() < at) {
+                    tracing::trace!("kick held — this coordinator's re-dial is drawn (CC 5.4.6)");
+                    continue;
+                }
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str, kicked = true);
-                if round.run().instrument(span).await {
-                    interval.reset();
+                match round.run().instrument(span).await {
+                    RoundRan::Skipped => {}
+                    RoundRan::Ended => interval.reset(),
+                    RoundRan::SendFailed => {
+                        redial_at = Some(draw_redial(&mut interval, current_cadence));
+                    }
                 }
             }
             _ = interval.tick() => {
@@ -1002,7 +1016,7 @@ async fn run_one_coordinator_forever(
                 // fan-out too.
                 // CIRISEdge#790 — instrumented, never entered (see the kick arm).
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
-                round.run().instrument(span).await;
+                let ran = round.run().instrument(span).await;
                 let relieved = match &mesh_config {
                     Some(reader) => reader.relief().await.round_cadence.unwrap_or(cadence),
                     None => cadence,
@@ -1027,9 +1041,37 @@ async fn run_one_coordinator_forever(
                     );
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 }
+                // After the cadence settles, so the draw is on the one in force.
+                if ran == RoundRan::SendFailed {
+                    redial_at = Some(draw_redial(&mut interval, current_cadence));
+                }
             }
         }
     }
+}
+
+/// CC 5.4.6 (`FSD/EVENT_PATH_MODEL.md` §2.4) — a client retries jittered. The
+/// tick is 30 s and the receiver's limiter a 10 s sliding window, so a dial
+/// refused in the closed part comes back to the closed part, every time. After
+/// a round whose send failed this coordinator's next dial is drawn from 0.5 to
+/// 1.5 cadences, on a fresh draw per failure, and the tick carries on from
+/// there. A healthy round never comes here, so its tick stays where it was.
+///
+/// Why not a wider draw, or a shared one: the floor keeps a fleet refused at
+/// the same moment (a restart behind a closed limiter) from coming straight
+/// back, and each draw being its own is what spreads them. The first tick is
+/// left alone: a restart's own burst is what the budgets are sized for.
+fn draw_redial(interval: &mut tokio::time::Interval, cadence: Duration) -> tokio::time::Instant {
+    let delay = redial_delay(cadence);
+    interval.reset_after(delay);
+    tokio::time::Instant::now() + delay
+}
+
+/// Uniform over `[cadence / 2, cadence * 3 / 2]`, millisecond resolution.
+fn redial_delay(cadence: Duration) -> Duration {
+    use rand::Rng as _;
+    let ms = u64::try_from(cadence.as_millis()).unwrap_or(u64::MAX / 2);
+    Duration::from_millis(rand::thread_rng().gen_range(ms / 2..=ms.saturating_mul(3) / 2))
 }
 
 /// The Poisson p99 of one frame wait, in gaps (FSD/TRANSPORT_TIERS_MODEL.md).
@@ -1053,6 +1095,17 @@ pub fn pacing_interval(configured: Duration, gap: Option<Duration>) -> Duration 
     })
 }
 
+/// How [`GatedRound::run`] went, for the loop that owns the tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundRan {
+    /// The peer is backed off, or another plane found it unroutable meanwhile.
+    Skipped,
+    /// The round ended, whatever the outcome.
+    Ended,
+    /// The round's send failed, so the next round is a dial ([`draw_redial`]).
+    SendFailed,
+}
+
 /// One coordinator's round, as both the tick and the kick arm run it: past the
 /// no-route backoff (CIRISEdge#794), then through the round gate (#740).
 struct GatedRound<'a> {
@@ -1068,19 +1121,19 @@ struct GatedRound<'a> {
 }
 
 impl GatedRound<'_> {
-    /// Run the round unless the peer is backed off. Returns whether it ran.
-    async fn run(&self) -> bool {
+    /// Run the round unless the peer is backed off.
+    async fn run(&self) -> RoundRan {
         // Decided BEFORE the gate: a backed-off coordinator never holds or
         // queues for a permit.
         let Admission::Run(ticket) = self.backoff.admit(self.peer_id, self.coord.kind()) else {
             tracing::trace!("round skipped — peer is in no-route backoff (CIRISEdge#794)");
-            return false;
+            return RoundRan::Skipped;
         };
         let _permit = self.round_gate.enter(self.peer_id, self.kind_str).await;
         // Another plane may have found the peer unroutable while this one
         // waited for its permit.
         if ticket.overtaken() {
-            return false;
+            return RoundRan::Skipped;
         }
         // CIRISEdge P0 telemetry — the round's wall time, from holding the
         // permit to its outcome, whatever that outcome is: a round that
@@ -1099,8 +1152,13 @@ impl GatedRound<'_> {
             took_ms = started.elapsed().as_millis(),
             "anti-entropy round ended"
         );
+        let ran = if matches!(class, RoundClass::SendFailed) {
+            RoundRan::SendFailed
+        } else {
+            RoundRan::Ended
+        };
         ticket.finish(class);
-        true
+        ran
     }
 }
 
@@ -1108,7 +1166,7 @@ impl GatedRound<'_> {
 fn round_class_of(e: &RoundError) -> RoundClass {
     match e {
         RoundError::Coordinator(CoordinatorError::Transport(t)) => {
-            RoundClass::of_transport_error(t).unwrap_or(RoundClass::Other)
+            RoundClass::of_transport_error(t).unwrap_or(RoundClass::SendFailed)
         }
         RoundError::Coordinator(_) | RoundError::Timeout | RoundError::InboundClosed => {
             RoundClass::Other
@@ -2511,6 +2569,146 @@ mod tests {
             "a non-Key coordinator must not recover"
         );
         assert!(rx.try_recv().is_err(), "and must send nothing");
+    }
+
+    /// A transport whose every send fails as a refused dial fails in the field
+    /// (`a_refused_dial_comes_back_off_the_beat` read this error off real
+    /// links), or succeeds to a peer that never answers.
+    struct DialLog {
+        refused: std::sync::atomic::AtomicBool,
+        at: std::sync::Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    #[async_trait]
+    impl Transport for DialLog {
+        fn id(&self) -> TransportId {
+            TransportId::HTTP
+        }
+        async fn send(
+            &self,
+            _destination_key_id: &str,
+            _envelope_bytes: &[u8],
+        ) -> Result<TransportSendOutcome, TransportError> {
+            self.at.lock().unwrap().push(tokio::time::Instant::now());
+            if self.refused.load(Ordering::SeqCst) {
+                return Err(TransportError::Io(
+                    "reticulum resource send: resource transfer failed: LinkClosed".to_owned(),
+                ));
+            }
+            Ok(TransportSendOutcome::Delivered)
+        }
+        async fn listen(
+            &self,
+            _sink: tokio::sync::mpsc::Sender<InboundFrame>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    const REDIAL_CADENCE: Duration = Duration::from_secs(30);
+
+    /// One coordinator on a paused clock, with its log and a handle to kick it.
+    fn dial_log_scheduler(
+        refused: bool,
+    ) -> (
+        Arc<DialLog>,
+        SchedulerHandle,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let log = Arc::new(DialLog {
+            refused: std::sync::atomic::AtomicBool::new(refused),
+            at: std::sync::Mutex::default(),
+        });
+        let coord = Arc::new(ReplicationCoordinator::new(
+            Arc::clone(&log) as Arc<dyn Transport>,
+            "bob",
+            EnvelopeKind::Key,
+            SessionRole::Initiator,
+            Arc::new(StaticProvider {
+                state: LocalState::new(),
+                envelopes: HashMap::new(),
+            }),
+            RecordingApplier::with(HashMap::new(), std::collections::HashSet::new()),
+        ));
+        let mut sched = ReplicationScheduler::new(SchedulerConfig {
+            cadence: REDIAL_CADENCE,
+            round_timeout: Duration::from_secs(1),
+            ..SchedulerConfig::default()
+        });
+        sched.add_initiator(coord);
+        let handle = sched.install_control_channel();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let run = tokio::spawn(async move { sched.run_until_cancelled(cancel_rx).await });
+        (log, handle, cancel_tx, run)
+    }
+
+    fn gaps_secs(log: &DialLog) -> Vec<f64> {
+        log.at
+            .lock()
+            .unwrap()
+            .windows(2)
+            .map(|w| w[1].duration_since(w[0]).as_secs_f64())
+            .collect()
+    }
+
+    /// CC 5.4.6 — every dial after a refused one is drawn from 0.5 to 1.5
+    /// cadences, each on its own draw: a fleet refused at one moment spreads.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_dial_draws_its_next_dial_from_half_to_one_and_a_half_cadences() {
+        let (log, _handle, cancel, run) = dial_log_scheduler(true);
+        tokio::time::sleep(REDIAL_CADENCE * 40).await;
+        let gaps = gaps_secs(&log);
+        assert!(gaps.len() >= 20, "it keeps dialling: {gaps:.1?}");
+        assert!(
+            gaps.iter().all(|g| (15.0..=45.01).contains(g)),
+            "every re-dial in the draw: {gaps:.1?}"
+        );
+        let (lo, hi) = gaps
+            .iter()
+            .fold((f64::MAX, 0.0_f64), |(l, h), g| (l.min(*g), h.max(*g)));
+        assert!(hi - lo > 15.0, "fresh draws, not one offset: {gaps:.1?}");
+        let _ = cancel.send(true);
+        let _ = run.await;
+    }
+
+    /// The healthy tick stays: a send that left and a peer that stays silent is
+    /// a timed-out round, not a refused dial, and the beat does not move.
+    #[tokio::test(start_paused = true)]
+    async fn a_round_whose_send_left_keeps_the_tick() {
+        let (log, _handle, cancel, run) = dial_log_scheduler(false);
+        tokio::time::sleep(REDIAL_CADENCE * 8).await;
+        let gaps = gaps_secs(&log);
+        assert!(gaps.len() >= 6, "{gaps:.1?}");
+        assert!(
+            gaps.iter().all(|g| (*g - 30.0).abs() < 0.01),
+            "the tick is untouched: {gaps:.1?}"
+        );
+        let _ = cancel.send(true);
+        let _ = run.await;
+    }
+
+    /// A kick does not beat the draw: on a restart every coordinator is kicked
+    /// at once, and a kick that dialled would put a refused fleet back on one
+    /// beat. The drawn tick runs the round the kick wanted.
+    #[tokio::test(start_paused = true)]
+    async fn a_kick_does_not_beat_a_drawn_redial() {
+        let (log, handle, cancel, run) = dial_log_scheduler(true);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(log.at.lock().unwrap().len(), 1, "the first tick dialled");
+        for _ in 0..10 {
+            handle.round_now(None).await.expect("kick");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            log.at.lock().unwrap().len(),
+            1,
+            "inside the draw's floor no kick dials"
+        );
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert!(log.at.lock().unwrap().len() >= 2, "the draw still fires");
+        let _ = cancel.send(true);
+        let _ = run.await;
     }
 }
 
