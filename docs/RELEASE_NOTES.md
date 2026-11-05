@@ -1,31 +1,600 @@
 # CIRISEdge Release Notes
 
-# Unreleased: A/V chunk source authentication
+# v44.0.0 — the group plane as rows, calls on the ALM mesh, a phone that sleeps
 
-- **Source authentication for A/V chunks.** A call's stream keys come from the room's MLS group, so
-  every member can decrypt every stream. The inner seal alone therefore proves a chunk came from the
-  room, not from the stream's publisher. So the A/V chunk format carries the publisher's signature.
-  Receivers, and member relays (`CallOptions::relay`, room members) before they forward, drop any
-  chunk that doesn't verify. Members can decrypt each other's streams, but only a stream's publisher
-  can produce chunks for it.
-  - At stream start and at every epoch roll, the publisher makes an ephemeral Ed25519 chunk key. It
-    binds the key to the stream with its hybrid federation signature (Ed25519 + ML-DSA-65).
-  - Receivers verify a binding once, against persist's directory. Each chunk then costs one map
-    lookup and one Ed25519 verification, with no persist read per chunk.
-  - A member relay forwards only chunks whose verified publisher is the peer it heard them from.
-  - Bindings travel only on member-to-member A/V legs. A non-member transport forwarder never
-    receives one; it forwards the link-sealed frames opaque.
-  - Refusals are named by stable tokens (`av_chunk_unbound`, `av_chunk_trailer_invalid`, …).
-  - A binding is about ten Channel messages. A leg that has just carried one settles for 150 ms:
-    a chunk the link refuses as congested is retried rather than dropped, so the binding doesn't
-    cost the chunks right behind it. Outside that window, congested chunks are dropped as before.
-  - The chunk carries a 64-byte signature. The per-frame plaintext budget is therefore the link's
-    Channel limit less 148 bytes: 252 bytes on a base-MTU link.
-  - The wire layout and KAT vectors are in `docs/av_chunk_auth_wire.md`.
-- **Rust surface:** `av_call::CallDeps` gains two required fields, `signer` (the node's federation
-  signer, which binds its stream's chunk keys) and `verifier` (a `StreamKeyVerifier`;
-  `av_chunk_auth::DirectoryKeys` wraps a persist directory). `Edge::join_call` fills both.
-  `Call::chunk_auth_counts` reports what the check counted.
+**2026-11-05.** **MAJOR** from v43.4.1, and the **long-term support line** while persist does its
+refactor (Eric, 2026-11-05). Pins CIRISPersist **v61.0.3** (tag, 7894b39c), CIRISVerify **v22.0.0**
+(cbcd957) and leviculum **v0.33.0+ciris.1** (a3dc12cd). Python requires `ciris-persist>=61.0.3,<62`,
+which declares `ciris-verify>=22,<23`. Under pyo3 every door call runs inside the wheel, so an older
+61.0.x wheel loads clean and keeps its old verdicts: only that floor excludes it. CC v1.0-rc15
+namespace manifests stay vendored at ace6b74 (189 families, 1244 vectors, registry df79a1dd); the
+wire and the behaviour follow rc17 text, which the CC cuts on this tag.
+
+**A coordinated cut.** A v43.x peer cannot interoperate with a v61 node:
+
+- the six framed group kinds (`Family`, `Community`, the two widenings, the two revocations), the
+  member listing and the framed `KeyGrant` are refused `federation_envelope_kind_retired` in both
+  directions; a room's record and roster now travel only as rows;
+- a key record or revocation that v59/v60 signed with an offset-form instant (`+00:00`, six
+  digits) is refused on form until its signer re-signs it under v61 (CC 2.6.2 strict);
+- an A/V chunk without the v2 trailer, or a binding part a v43 node never sends, is dropped
+  (`av_chunk_unbound` / `av_chunk_trailer_invalid`): old and new nodes cannot exchange media;
+- the `DIRECTORY_ABI_VERSION` is 12 and `SERVE_ADVERTISE_POLICY_HASH` moved.
+
+Upgrade the canonical, the servers and every agent node together.
+
+## What the LTS changes for a holder of v43
+
+- **`SERVE_ADVERTISE_POLICY_HASH` = `83099f472ec6f9d378753239802393915aa7645f3ec25088c0fcf8f1db70b34d`**
+  (`ead63aac…` on v43). It moved three times in this cut: the v61 retired planes (`5904b100…`), first
+  contact on a held live binding (`cb8e0728…`), and the per-recipient trace consent (`83099f47…`).
+  CIRISServer mirrors the last value.
+- **`ApplyOutcome::Refused` gains a required `class: Option<&'static str>`**, the label
+  `refused_then_admitted` is booked under. A host that matches it exhaustively or constructs it adds
+  the field (`retry_after_standing`, for one, from persist 61.0.2 below).
+- **The `Transport` trait gains `attach_load_ladder`.** It has a no-op default, so an implementer
+  keeps compiling, and only `ReticulumTransport` needs it: the ladder's tier then reaches the shapers
+  and the shed levers.
+- **`EdgeDeviceState` has two new required fields, `shaping_opt_in_cellular` and `client_only`**
+  (UniFFI; CC 5.4.3 per-class opt-in, E17). Both default to `false` on PyO3's
+  `shaping_set_device_state`; a UniFFI host must set them. A person's opt-in on a phone is per class:
+  `shaping_opt_in` for Wi-Fi, `shaping_opt_in_cellular` for cellular, and both survive a network move.
+- **`ReticulumTransportConfig` gains four fields:** `device`, `steer_roster_relays`,
+  `relay_establish_budget` and `forward_admission`. There is no `Default` impl, so struct literals
+  must add them.
+- **`av_call::CallDeps` gains three required fields** (below). `widen_community` and
+  `revoke_community_member` take `pens: &[&LocalSigner]`.
+- **The wake sequence is `resume`, then `round_now_all`** (Python: `resume()`, then `kick()`). There
+  is no `catch_up_now`: `resume` brings the node back, and the kick makes this node's rounds run now
+  instead of on the next tick. The first such round is what `wake_first_round_duration_seconds`
+  measures.
+- **Direct links propose by default** (below), `direct_link_proposing="off"` being the operator's
+  switch.
+
+## The event path, for a long support window (CIRISEdge#947, #943, `FSD/EVENT_PATH_MODEL.md`)
+
+- **Decapsulation leaves the event path and the node-wide mutex (#947).** A handshake's last part
+  used to run the KEX under the `links` mutex on the event loop. It now moves the link to `Keying`:
+  the receiver order runs on the event path, up to `DECAP_WORKERS_MAX` (4) workers decapsulate off it,
+  and the event loop applies the outcome. A ticket gives each link one outcome, and an outcome for a
+  link a suspend already closed is dropped. Frame events on a keying link wait whole and replay in
+  order; a link that outruns `KEYING_HELD_FRAMES_MAX` (256) is refused by name and never trimmed.
+- **The receiver order is per link, per sender, node-wide last** (CC 5.3.3.5 E1 rule 9), and the
+  route request runs the same order before its parse. It used to charge the node-wide budget first,
+  so one prober could spend what honest strangers needed. Each rate charges only its own budget: a
+  frame refused per link or per sender spends nothing node-wide.
+- **A responder's first words leave the event path too.** `link_keyed` sent the announce and bundle
+  on the loop, and a keyed peer that withheld its proofs could hold every link's traffic for seconds.
+- **A handshake that beats its identify is judged by its sender, not the race.** It waits for the
+  identify, bounded by `IDENTIFY_GRACE` (1 s) and `DEFERRED_HANDSHAKES_MAX` (128), then re-runs the
+  gate.
+- **Standing has its own budgets and queue, drained first** (a Rooted binding, or a key owning its
+  binding with a seat on the active roster, a room or a contact). An announce earns none.
+- **Standing is read from persisted bindings at boot.** It came from the live `peers` map, which a
+  restart empties, so every ordinary peer behind a hop was a stranger after a restart. The store is
+  authority for the route, never for trust, so a row must prove what a live binding proves: Rooted is
+  the row's claim and a chain that roots here, otherwise the key hybrid-signed this route. A direct
+  TCP client re-announces on interface-up and always rebound on its own; this is the case behind a
+  hop.
+- **The constants the model moved** (each with a real-path or mutation witness):
+  `DECAP_QUEUE_STRANGER` 32 → 256, its own window budget, asserted at compile time;
+  `DECAP_QUEUE_STANDING` 64 → 1024; `MAX_TRACKED_SWEEP_CURSORS` 512 → 8192;
+  `STRANGER_KEYED_LINKS_MAX` = 512, oldest out by name (`link_seal_refused_stranger_cap`), since the
+  handshake rate alone held 3,072 keyed links against leviculum's 1,024 envelope;
+  `REPLY_NODE_BYTES` = 64 MiB (below).
+- **The reply lane (#943).** A responder's driver sent its replies inline, so a reply the reverse
+  path held held every frame behind it on that plane: 9.5 s measured on the real path, 79 s in the
+  field. There is now one FIFO lane per (peer, kind), and the driver stays the only stepper. Past the
+  lane's bound a frame that wants an answer is shed unstepped
+  (`responder_rounds_total{outcome="reply_shed"}`), a Deliver never is, and a reply that outlives an
+  initiator's wait is not sent (`reply_expired`). Every lane draws on one 64 MiB node budget; past it
+  a body-reading frame goes unanswered (`reply_shed_node`) while a Summary or Pull is still answered.
+- **A dialler cannot be starved by a dead peer.** A send held its `RoundGate` permit for the whole
+  establish timeout, so one dead peer stopped every other round (0 rounds to a live peer in 14 s,
+  25 after). A send now holds its permit for a round's budget and re-queues, under an outer bound of
+  180 s.
+- **A refused dial comes back off the beat** (CC 5.4.6). A 30 s tick against a 10 s sliding window
+  locks into the closed part. After a round whose dial failed, the next is drawn from 0.5 to 1.5
+  cadences; the healthy tick does not move, and a kick waits at most 45 s behind the draw.
+- **A node asks for the path to a peer it wants** (#945's late joiner). A relay stops rebroadcasting
+  an announce after its grace for up to an hour and replays nothing to a client that joins later, and
+  edge's dial never asked: a relay still holding the path gave no route. A dial, a call and a pinned
+  first contact with no path now raise a request and wait 3 s, one ask per destination per 20 s.
+- **A released row is fetched by hash (#776).** Past one page a release could not reach a row behind
+  the watermark. The release queues up to 64 rows per (peer, plane) and the kicked round sends a
+  Fetch of them; a Fetch that goes unanswered falls back to the ordinary round.
+- **Sweeps:** a failed read holds the cursor and counts `advertise_read_failed` instead of reading
+  as the end of a plane; a rewind leaves a caught-up peer's head at the tip; evictions count
+  (`advertise_watermark_evicted`). Four of the eight live planes take a cursor (Attestation,
+  TransportDestination, LocationProof, AccordQuorumEvidence).
+
+## Trace sharing is its own consent, per recipient
+
+- Announcing and sharing traces are two consents (Eric). A `trace:` row of this node's or its
+  owner's authorship reaches a peer only on a live `consent:replication` grant naming that peer or
+  its owner and covering the row's dimension, on the advertise and the direct fetch alike
+  (`trace_recipient_withholds`). Before this, one grant covering `trace:` reached every serve-capable
+  consent peer, including a canonical holding only an announce grant.
+- Relays keep flowing: a row another key authored is its producer's flow. A cohort placement is the
+  audience gate's, so a born-`self` trace still reaches the owner's second device. No migration:
+  existing grants and promoted rows are not touched.
+- A fetch with no peer is refused for a row with an audience gate; no production caller passes one.
+
+## Telemetry (`docs/TELEMETRY_CATALOGUE.md`)
+
+- **Every bundle field is catalogued** in `crate::telemetry::TELEMETRY_CATALOGUE`: a `ciris.edge.*`
+  name, kind, unit, bounded labels and an exposure. A closed label is present at zero from the first
+  snapshot, so a missing series means this build lacks it. Edge has no exporter and no recorder; the
+  host reads the bundle.
+- **One field is public-safe:** `node_alive`. Everything else is operator-only and the server
+  enforces it. A 1 Hz poller of `envelopes_sent_total` reads a shaped node's real activity directly.
+- **Shaped real traffic is not a live counter:** real frames and row wait wait in a per-class window
+  (600 s, 3600 s for `phone-cellular`), rounded to 16 frames, only for a class holding three links.
+- **New instruments** cover the event loop, the keyer, seal holds, the reply lane, the inbox, ladder
+  ticks, the shapers, refusal memory, decision rows and ALM, with log targets `edge.event_loop.slow`,
+  `edge.alm.decision`, `edge.alm.failover`, `edge.call.ended`, `edge.refusal.terminal`,
+  `edge.shaping.seat_lost` and `edge.direct_link.posture`.
+
+## persist v61.0.0 — the group plane rides the Attestation plane (CIRISPersist#991, #1148, #1122, #1123)
+
+- **A room's record and roster are rows.** A family's or community's record, a widening, a removal
+  and a resignation are `group:roster:v1` / `membership:widening:v1` / `membership:removal:v1` /
+  `membership:resignation:v1` rows on the Attestation plane, placed at the group
+  (`cohort_scope` `family` / `community`). Persist mints them from the signed object a `put_*`
+  stores, so the local doors are unchanged. Edge's own group-plane machinery (the `group_plane`
+  module, `GroupPlaneGate`, the gated sweep, `list_families..listings`, `apply_family..`) is
+  deleted: a retired framed kind is never advertised, point-read, held or scheduled
+  (`EnvelopeKind::is_retired_plane`), an inbound one is refused terminal, and the runtime drops
+  (peer, retired kind) pairs at start and on every `register`/`set_peers`. The rows keep the framed
+  planes' reach: advertised by every holder, served per peer by persist's `may_receive` alone
+  (members' nodes, live invitees' nodes, the named member's node), withheld as
+  `group_record_not_member_or_invitee`. The accord-relay invalidation the framed `Family` /
+  `FamilyMembershipRevocation` doors ran now runs on an admitted family group row.
+  *Why:* one plane, one audience rule, no second copy of the roster fold at edge. *Operator:*
+  nothing to configure; a mixed fleet does not replicate rooms, so cut together.
+- **The serve_policy cells for the six group kinds, the listing and `KeyGrant` say `retired`.** The
+  hash moved here first (`ead63aac…` → `5904b100…`; the final value is at the top). *Operator
+  (CIRISServer):* mirror the final pin beside persist's `REPLICATION_POLICY_HASH`.
+- **A row refused `not_in_audience` parks on what gates it (CIRISPersist#1148).** v61's replicated
+  doors ask `may_receive` for this node's own key before any door runs, and answer the retryable
+  `NotInAudience`. Edge books it terminal (the per-row backoff: quiet for `TERMINAL_BASE`, doubling
+  on a repeat, never a loop) and parks the row on ONE gate: `audience:group:<the room or family it
+  is placed at>`, else `audience:owner:<its attester>`, remembering the offering peer. An admitted
+  `group:roster` / `membership:*` row opens its group; an owner binding opens both its keys; a
+  `consent:replication` grant opens its author's owner axis. The release kicks the offering peer's
+  round at once, so a room row that arrived a round early lands right after the room record
+  (witness `a_room_row_refused_not_in_audience_lands_right_after_the_room_record_1148`). The
+  key-grant door's `recipient_not_in_audience` parks the same way (matched on the detail until
+  CIRISPersist#1184 types it). A host that writes locally releases with
+  `FederationDirectoryReplicationBridge::release_audience(group_or_key)` or
+  `release_bound_signer`. `DimensionRejected` now follows persist's `RETRYABLE` set (empty: every
+  reason terminal, including v61's `group_plane_row_shape` and `partnership_shape_retired`);
+  `GroupDissolved` is terminal.
+- **An agent key announces no route (CIRISPersist#1122).** Persist refuses a route at an
+  `agent`-typed key (`transport_destination_agent_key`) and deletes every such route at open.
+  Edge's `self_route` names the refusal (Deferred) instead of the #888 warning. *Operator:* an
+  agent-embedded node runs its transport under the NODE identity: `init_edge_runtime(...,
+  use_node_identity=True, node_identity_dir=...)` (CIRISEdge#541). An agent deployment left on the
+  actor key publishes no route and is unreachable.
+- **A signed instant is `.sssZ` and nothing else (CC 2.6.2).** Every edge producer renders the
+  canonical millisecond form: `self_route` bumps a re-signed route one millisecond (not one
+  microsecond) and renders `asserted_at` / `retired_at` through persist's `render_signed_instant`;
+  `chat::build_community` truncates `founded_at` and every founder's `joined_at`;
+  `content_occurrence` truncates the local occurrence's `asserted_at`; the announce write-through's
+  unsigned route truncates its instant. *Operator:* the first open after the upgrade runs persist's
+  instant-form pass (V211) over every stored attestation row, so a large node's first boot is
+  slower; a host that signs key records or revocations re-signs them on v61 before replicating.
+- **`founder_only` is refused above the family (CIRISPersist#1123, CC 4.5.13).** A community record
+  that names it is refused `founder_only_above_family`; a room already stored under it admits
+  exactly one event, the escape to another protocol. Edge's fixtures and `chat::build_community`
+  callers move to `majority`; a multi-member room is widened or pruned only with the members'
+  cosignatures (below). *Operator (CIRISServer):* a room stored under `founder_only` refuses every
+  event but a resignation until it migrates, by one supersede per room (`founder_only` → `majority`,
+  members unchanged, chained `prev_head_digest`, signed by a founder's person key). The server has no
+  door for it yet, pair rooms are `unanimous` and untouched, and families keep `founder_only`. Since
+  61.0.2 the migration does not make members moderators.
+- **Consent-gated routes retire** (CC rc15 5.4.6, 5.3.4 amended). v43.4.0's switch, rule, memo and
+  the `route_not_consented` withhold reason are gone: a forwarder holds no contact grant, so there
+  is nothing to gate on. CIRISEdge#911's "default on" plan is superseded (CIRISPersist#1165 was
+  reverted before persist's release). The sealed request/acceptance that carries a route is
+  CIRISEdge#922.
+- **Carried by pin, no edge code:** `subject_outside_audience` replaces AV-84's `named_subject`
+  (CIRISPersist#1161; edge's `ThirdPartyRow` witness names it); partnership halves are
+  `consent_record` rows (#1126); a serve seat needs an announced owner (#1101,
+  `Engine.serve_seat_owner_announced`); `register_self_federation_key` is idempotent on restart
+  (#1146); the raw-pubkey `takedown_notice` Contribution is gone; every Postgres checkout is bounded
+  (#1166; `PoolExhausted` is a variant of four exhaustive enums); the canonical read storm on a
+  SQLite store is fixed (pinned indexes, V212, ANALYZE at open; CIRISPersist#1177). The canonical
+  storm's root cause was persist's, not edge's: #930 below is the edge-side memo, not the fix.
+- **Tests:** `chat_message_federates`' three-member room stays `#[ignore]`d for the cosign flow;
+  `kick_three_peers_740` rounds on the eight scheduled planes.
+
+## persist 61.0.1, 61.0.2, 61.0.3
+
+- **61.0.1 (c28af914):** an invitee's node receives a group's record while its proposal is live
+  (#1193; on 61.0.0 no non-founder joiner's node could, in any family or room, so 61.0.0 was never an
+  adoptable pin). `KeyGrantRefused` carries the plane's reason typed (#1184), and edge's key-grant
+  park reads it in place of the detail string. A family's record and membership events project like
+  the retired framed planes, so a removal reaches every member (#1182).
+- **61.0.2 (60bafd60):** duties are appointments (#1195): a room's moderators are its founders and
+  those holding a `delegates_to`, no longer the whole roster. A `unanimous` removal needs every other
+  active member (#1192). Edge: `takedown_unauthorised` reads transient, told apart from the token's
+  other bodies by its `communities` member, and `roster_consensus_insufficient` takes the new
+  `RetryAfterStanding` class, because a delegate's act can arrive before its appointment.
+- **61.0.3 (7894b39c):** a founder can take down what a chat row binds into its room (#1199). A
+  moderator's signature alone removes nobody, in any protocol (#1200). `RetryAfterStanding` stays,
+  because a moderator's widening can still outrun its `delegates_to`; it names no dependency, so the
+  #858 cap moves it to the terminal schedule, re-asked at most every six hours. A node on 61.0.3
+  refuses a moderator's removal from an older node, so the fleet's rosters can differ until all
+  upgrade: one more reason this cut is coordinated.
+
+## CIRISVerify 22.0.0 (20.2.0 → 22.0.0)
+
+- **`ciris_verify_core::holonomic` is `::substrate`** (CC 6.1), no alias; every item under it is
+  unchanged. Edge's `ciris-keyring` / `ciris-crypto` / `ciris-verify-core` move to v22.0.0 and
+  `ciris-crypto` gains the `key-grant` feature to match persist's set.
+- **The trust root is the accord-authorized GenesisBundle** (21.0.0; CIRISVerify#176, #69):
+  `genesis_bundle::authorization_digest` moved from persist, `verify_genesis_bundle` checks the baked
+  A1/B1/C1 roster, `TrustRootValidator` selects the highest verified version. DNS sources, the
+  steward key, licence JWTs and the revocation list are removed; every deployment is community until
+  licensure rows (CC 4.4.3.8) are evaluated. `VerifyConfig` loses `dns_*` / `trust_model` /
+  `dns_transport`; `GetStewardKey` → `GetTrustRoot`.
+- **Keyring reopen (CIRISVerify#311):** storage opens the tier a key already lives in; only a fresh
+  alias gets the best tier. Automatic supersession is gone from the plugin and Secure Enclave genesis,
+  and a node whose software-tier key a pre-20.3.0 keyring archived as `*.superseded-pre-v8` reopens
+  with the same key (verify restores the archived files on open) instead of failing to boot.
+- **`k256` / `p256` 0.14** (RUSTSEC-2026-0387 cleared, crypto-bigint 0.7); public items carrying
+  those types moved. RUSTSEC-2026-0346–0349, 0367–0369, 0381, 0382, 0385, 0386 fixed by upgrade.
+
+## leviculum v0.33.0+ciris.1 (leviculum#91–#94; the punch fix)
+
+- **Relay steering (#91, #92).** The node records every relay a destination was heard through
+  (`relay_routes`, bounded 4 × 1024) and `connect_via(dest, key, relay, establish_timeout)` sends the
+  link request to that relay with one attempt per budget. Two links to one destination through
+  different relays can be up at once. `NodeEvent::RelayRouteLearned`; `request_path_on(dest,
+  interface)` asks one relay. Edge's relay tier (below) rides it.
+- **Timed frames (#94).** `try_send_timed(data, ttl)` retransmits only until the deadline, then an
+  expired marker keeps the sequence whole; a receiver drops a frame older than its ttl (age measured
+  above the fastest delivery seen). Wire `0xFD01` / `0xFD00`, understood only by 0.33+, so edge sends
+  timed media only to v0.33 peers.
+- **Forward admission and link stats (#93).** `set_forward_admission(hook)` sees each link request a
+  transport node would forward and answers `Refuse` or `Admit { max_bytes_per_s, max_packets_per_s }`
+  (per-link token buckets); `forwarded_links()` meters payload bytes, packets and drops per direction.
+- **The stricter punch.** A direct link completes only once one address is proven both ways (an
+  ack from it and a punch heard from it). This answers the 2026-10-31 one-sided punch; proposing
+  stays off (below).
+- Source break at the pin: `PacketDropped` grew fields; `Error::NoRouteViaRelay` is new.
+
+## Mobile background: suspend and resume (leviculum#90)
+
+- **`Edge::suspend(deadline) -> SuspendReport` / `Edge::resume()` / `is_suspended()`**, the same on
+  `ReticulumTransport`, and `PyEdge.suspend(deadline_secs) -> dict` / `resume()` / `is_suspended()`.
+  Suspend stops edge's background loops (durable dispatcher, sweeps, pruner), refuses sends with
+  `TransportError::Suspended` (in-flight ones cancelled), closes every link, parks the listener with
+  no timer, and stops the leviculum node (`ReticulumNode::stop_shared`): every socket and listener
+  closes and the event loop and traffic-counter thread end, so a node with a TCP server suspends
+  fully (`quiescent: true`, `node_tasks: 0`). Resume restarts the node under the original interface
+  indexes (`start_shared`), so a TCP client's tunnel-synthesize re-runs with the same tunnel id and
+  the path back comes by the same tunnel; the listener announces; the loops respawn. Idempotent.
+- **No new config field.** The interim `ReticulumTransportConfig::suspendable` was removed before
+  the cut (leviculum#95 does not reproduce): every node boots exactly as on main.
+- The replication scheduler and the durable dispatcher treat `Suspended` as skip-quietly, no
+  backoff; a round the suspend cancels is not charged. Decision-row events (below) do not fire while
+  suspended; rebuild from the last cursor on resume. *Operator (a phone host):* call `suspend` from
+  `enter_background(deadline)` and `resume` from `enter_foreground()`; `PyEdge.close()` now signals
+  the transport shutdown too.
+
+## #930 — key-plane listings answer from a per-subject memo
+
+- The four per-subject key-plane listings (Key, IdentityOccurrence, Revocation,
+  IdentityOccurrenceRevocation) re-read every subject of their set on every peer round; on the
+  canonical the two revocation planes walk `Projection::Global` (7,226 keys): about 800 mostly empty
+  indexed reads a second. Each plane now memoizes each subject's refs, invalidated from persist's
+  admission cursor (`list_attestations_since` from where it stopped): a `key:record` row drops that
+  key, a `key:revocation` drops the Revocation plane, an occurrence or a withdraws of one drops its
+  occurrence key, a carrier drops the occurrence-revocation plane. The cursor is the store's, so a
+  local `put_revocation` / `put_public_key` invalidates like a replicated row. A 600 s TTL rebuild
+  bounds what the cursor cannot see; one lock per plane makes N concurrent rounds one fill.
+- **This is not the canonical storm fix.** The storm was CIRISServer's equivocation query over
+  persist's `Live` view and is fixed in persist v61 (CIRISPersist#1177). #930 removes edge's own
+  share of the read load.
+- New `EdgeMetrics::key_plane_sweep` family (`key_plane_listings`, `key_plane_sweeps`,
+  `key_plane_subject_reads`, `key_plane_memo_hits`, `key_plane_read_failures`,
+  `key_plane_sweep_ms`, `key_plane_probe_reads`, `key_plane_probe_rows`,
+  `key_plane_probe_failures`, `key_plane_invalidated`, `key_plane_rebuilds`), in the bundle and the
+  PyO3 snapshot. A sweep that starts reading every subject again names itself.
+
+## A/V: chunk source authentication (CC 5.3.3.2.3; `docs/av_chunk_auth_wire.md`)
+
+- **Every chunk names its publisher.** A room call's stream DEK is derived from the room's MLS
+  exporter, so every member can open every stream and the inner AEAD proves only "from the room".
+  At stream start and every epoch roll the publisher mints an ephemeral Ed25519 chunk key and binds
+  it in a `StreamKeyBinding` (version `0x01`, room, publisher, join nonce, stream id, epoch, key),
+  hybrid-signed (Ed25519 + ML-DSA-65, the ML-DSA half 3309 bytes at parse) by its federation
+  identity. A receiver checks the room, re-derives the stream id, MLS membership and the hybrid
+  signature against persist's directory once per binding; each chunk then costs one map lookup and
+  one Ed25519 verify, no persist read.
+- **The first chunk's format.** The binding rides as size-bounded parts after the stream hello on
+  every leg, on every leg at each roll (under the lock that seals chunks, before the epoch's first
+  chunk) and every 10 s; a receiver that holds no binding for `(stream, epoch)` drops the chunk
+  `av_chunk_unbound`. A leg that has just carried a binding settles for 150 ms so the chunk behind
+  it is retried, not dropped.
+- **The v2 trailer with `source_ms`.** The trailer is
+  `u64_be(source_ms) ‖ Ed25519.sign(chunk_key, header ‖ source_ms ‖ inner_aead)` (72 bytes; domain
+  `ciris-edge:av-chunk-sig:v2`; a v1 trailer does not verify). The signed timestamp is the ALM C1
+  latency input: a receiver measures each path above the fastest delivery seen for the stream, so
+  host clock offset cancels and a relay cannot make its path look faster. The per-frame plaintext
+  budget is the link's Channel limit less 156 bytes (244 on a base-MTU link, 1140 on a punched one).
+- Receivers and member relays (`CallOptions::relay`) verify before anything else; a relay forwards
+  only chunks whose verified publisher is the link's peer, and bindings travel only on
+  member-to-member A/V legs (a non-member forwarder sees link-sealed frames, opaque). Refusals are
+  stable tokens (`AvAuthRefusal::as_str`: `av_chunk_unbound`, `av_chunk_trailer_missing`,
+  `av_chunk_trailer_invalid`, …) used as log reasons and `av_plane` labels; fixed-seed KAT vectors
+  in the doc and `kat_vectors_are_deterministic`.
+- **Rust surface:** `av_call::CallDeps` gains `signer: Arc<LocalSigner>`, `verifier: Arc<dyn
+  StreamKeyVerifier>` (`av_chunk_auth::DirectoryKeys` wraps a persist directory) and `load:
+  Option<Arc<SharedLadder>>`; `Edge::join_call` fills them. `Call::chunk_auth_counts` reports the
+  check. Enforced at once (above).
+
+## ALM stage 2 — live calls on the mesh (`FSD/CIRIS_MESH.md`; `docs/alm_calm_wire.md`)
+
+- **The relay flood is gone; C3 subscribe/admit replaces it.** Every call runs the closed-loop
+  controller (`av_call/alm.rs`): this node's stream is parent 0, every other stream has a C4
+  selector over its publisher and the member relays that offer it; a relay forwards only to the
+  members it admitted, only what arrives from its own parent, once. Roster membership gates
+  candidacy (fail-closed, before admission; CC 5.4.6 / E1 item 1 / 6.1.6). A small room starts as
+  the full mesh and measurement sheds to member relays; a member no one can reach directly is simply
+  never offered by its publisher, so roster relays carry it before any canonical.
+- **The CALM frame** (`"CALM" 0x01 kind body`; CAPS, SUBSCRIBE, UNSUBSCRIBE, ADMIT, REFUSE, SHED,
+  OFFER) rides the call's A/V links inside the E1 seal, capability-gated: the responder sends CAPS
+  first on the reverse direction; a pre-C3 peer keeps the old mesh and the legacy first-hand relay.
+  Must-arrive frames are resent off the data path for up to 2 s (`alm_c3_resent`) and an unanswered
+  subscribe is withdrawn; a C3 frame settles its leg 50 ms so the chunk behind it is not refused.
+  KATs per message kind in the doc.
+- **Stale media expires.** Media rides leviculum's timed frames to v0.33 peers (per class:
+  codec-opaque/audio vs layered video); a receiver drops inbound media older than 800 ms and a
+  sender-side expiry is reported to the queue as a drop so the hop counter never desyncs. A chunk at
+  exactly the call's budget goes untimed (`av_sent_untimed_full`). A congested leg is shed to the
+  base layer until clean; a leg resuming from idle retries its first chunks for 400 ms
+  (`MEDIA_RAMP`).
+- **Direct first (FSD R1).** A relay never out-scores the publisher while a direct path exists and
+  gives way when the publisher becomes viable; the canonical is a separate last tier never scored
+  against members, audio-only (≤ 5 % of measured; FSD 6.4 V2), never video. Silence counts only
+  while the stream is active on another path; a closed link is the hard down signal.
+- **Roster relays for identity dials (R2).** When a dial has no one-hop path, edge tries roster
+  relays (a room peer or consented contact) through `connect_via`, one attempt each, then the
+  default path (the canonical) last (`alm_relay_tier_roster` / `_failed` / `_default`).
+- **Forward admission at a transport node.** `ForwardAdmission` is the `set_forward_admission` hook:
+  C2 by link count against configured capacity, per-link token buckets, Admit-close at service tier
+  ≥ 1 with never-shed exemptions, refreshed from `forwarded_links()` once a second into the
+  `load_ledger`. `ForwardAdmissionConfig { per_link_bytes_per_s, per_link_packets_per_s,
+  capacity_pps, max_links, commit_fraction (0.65), admit_close_on_tier }` on the transport config;
+  no PyO3 kwarg yet (defaults: uncapped, unknown capacity).
+- **The meter reads what a path owed (#945).** An epoch roll is a resync, not a loss burst: it used
+  to read as a gap of about 2^32, which sat every path Degraded for about 5.9 s after each room
+  commit and could move a healthy direct parent onto a relay. A standby's skipped layers are not
+  loss; its loss is read against the primary, chunk by chunk. A shed layer on a primary is not loss:
+  a gap in the dense hop counter is, and each parent owes the base and audio the other delivered.
+- **Only the publisher the binding names holds depth 0 (#945 item 2).** An OFFER is attributed by
+  the link but not signed, so a member could rename the publisher and be asked for the stream. A
+  depth-0 claim is now checked against the stream's verified key binding and dropped whole otherwise
+  (`alm_offer_refused:not_publisher` / `:unbound`). A receive rule, no wire change.
+- **A closed link fails over a primary at once.** "Subscribed" read as "heard", so a Down flipped to
+  Recovering before the failover saw it, and the call sat on a dead parent for 1.5 s of silence. Only
+  a chunk that arrived after the verdict clears Down.
+- **An opaque chunk has no layers** (CC 5.3.3.2.1): `seal_av_inner` refuses anything but `{0,0,0}`
+  on `0xFF` by name.
+- **Sender-side detection for a layer-only refuser (Eric, 2026-11-05).** A herd losing only layers
+  holds still by design: children can't tell it from a shed, so the sender sees and curtails it.
+- **Witnesses:** the closed-loop sim (S1–S6, LS4; S1-mut must fail), `alm_mesh_stage2` on loopback
+  RNS, `av_call_805` A8/forge, 12/12 pinned to two cores. Still one hop by construction: no A/V
+  leg crosses the canonical (known limits).
+
+## #926 — a link whose Channel lands nothing is closed
+
+- The stall guard (`transport::link_stall`) counts Channel sends that land zero fragments because
+  the window never opened; a landed fragment or a delivery proof ends the run. Three zero-landing
+  sends (`STALL_MAX_ZERO_SENDS`), or a run of 30 s (`STALL_BOUND`), make the link dead: it leaves
+  the reverse-path pick and both pools and is closed, so the next send re-dials. A dead link on a
+  punched interface is retired to its relayed path (leviculum#83) instead. Family
+  `EdgeMetrics::link_stall`: `link_stall_zero_landed_send`, `link_stall_closed`,
+  `link_stall_retired_direct`. Witness: a punched link that stops acking is retired.
+
+## Direct links: proposing is ON by default
+
+- Direct-link proposing, held off since 2026-10-31 (the one-sided punch), is on by default: both conditions landed, leviculum v0.33's two-sided punch (an address must both ack and be heard) and the #926 stall guard. `off` stays available.
+- When the host names no facilitator, edge uses the genesis bundle's first serve node (`ip` hint,
+  host and port: a canonical answers as a facilitator on UDP at its dial's own port), under the #661
+  gate, so a test node never probes production. `direct_link_accept` stays `room_peers`.
+- **Glare (leviculum#96).** Two peers proposing at once refuse each other (`REJECT_BUSY`, `Rejected(2)`)
+  before the host sees it. Edge breaks the tie with the link's direction: only the link's initiator
+  proposes on it; the responder yields and proposes itself after `GLARE_WAIT` (30 s) without the
+  initiator's proposal, so a peer that replied once still comes direct. Every retry edge schedules is
+  jittered ±25 %. leviculum's own background re-proposal after a timeout or failed punch stays on its
+  fixed backoff; the in-leviculum half is asked in leviculum#96.
+- Server 0.5.245 restores its facilitator default to `bootstrap`; the agent's default is on from its v44 pin.
+
+## The load ladder (`FSD/CIRIS_MESH.md` §7; Eric 2026-11-01)
+
+- **`Edge::set_load_pressure(LoadPressure) -> ServiceTier`**, `Edge::service_tier()`,
+  `Edge::load_ledger() -> LoadLedger`; PyO3 `set_load_pressure("normal"|"warning"|"critical") ->
+  int`, `service_tier() -> int`, `load_ledger_json()`. The host's sampler says Normal / Warning /
+  Critical; edge maps it to tier 0 (full ops), 1 (audio and files: video on relayed legs shed, new
+  relay work refused, non-obligation rounds stretched) or 2 (chat and contacts: relayed audio shed
+  LIFO make-before-break, bulk paused, the node's own call audio-only), may hold a higher tier from
+  its own signals (relay commitment, A/V queue age, transit pps), raises at once and steps down one
+  tier per cooldown (60 s from 2, 120 s from 1). Federation duty is never shed locally.
+- `CallEvent::LoadTier`, `VideoUnavailable`, `VideoRestored`; tokens `load_tier:{0,1,2}` with their
+  causes in the ladder's counters; the `load_ledger` reports tier, total transit pps/bps and the
+  top-10 forwarded links.
+
+## Quorum carriage (`FSD/QUORUM_AND_PENDING_DECISIONS.md`; CIRISConstitution#198 §5)
+
+- **Edge evaluates no quorum.** It carries rows and their cosignatures byte for byte and tells the
+  host which rows landed; every "is this enough?" is persist's door's answer.
+- **Cosigned room roster changes.** `community_roster::RosterEvent::{widening, revocation}` are the
+  exact bytes persist verifies; `cosign(event, pen) -> RosterCosignature`; `assemble(dir, event,
+  signatures)` hands the first as authority and the rest as `cosignatures`, in order, unaltered.
+  `widen_community` / `revoke_community_member` now take `pens: &[&LocalSigner]` (the single-pen
+  form is gone). `membership::MembershipWidener` offers ONE voice (a room of one, a `founder_only`
+  family) and logs the refusal elsewhere. A short set is refused `roster_consensus_insufficient`
+  and surfaced verbatim.
+- **The decision-row event and cursor** (`decision_rows`): `ReplicationRuntime::subscribe_decision_rows()`
+  fires a `DecisionRowRef` when a decision-relevant row is admitted through the choke, when the
+  bridge's widener writes a widening (`proposal_id` set: the pair is complete), or when the host
+  reports a local write (`note_local_write(&row, written_after)` / `note_local_writes_since`).
+  A local write also kicks the Attestation plane at once (carriage C1). `DecisionCursor` is
+  persist's `(admitted_at, attestation_id)` serve position, text `"{rfc3339-ms}|{id}"`;
+  `decision_rows_since(dir, cursor, limit)` rebuilds after a suspend or a lagged receiver.
+- **Window basis (CC correction, 2026-11-02):** a window is measured by each node from when it
+  first held the proposal (CC 3.3.6.3), never from a cosignature's signed instant; edge stamps
+  nothing. CIRISPersist#1189 is superseded; #1190 (a narrowed cursor read), #1191 (callable
+  `mirror` / `cosigned` evaluators) and #1173 are open.
+- Witness `tests/quorum_carriage_v44.rs`: a 4-node room; two of three cosigns land alike everywhere,
+  one of three lands nowhere, a stripped cosign is refused where it is carried.
+
+## Link shaping (CC 5.4.3 rc17; `docs/LINK_SHAPING_COST.md`)
+
+- **The server class is on by default** (Eric, 2026-11-02, final). `FLEET_DEFAULTS`: `server`
+  7,000 B/s on (18.1 GB/month per link each way, 145 GB at the cap); `home` 2,800, `phone-wifi`
+  1,400 and `phone-cellular` 350 B/s opt-in. *Operator:* a server passes `shaping_class="server"`
+  (it names the device too, `DeviceKind::Server`); a person's opt-in at any class, cellular
+  included, shapes every identity link and survives a Wi-Fi ↔ cellular move
+  (`DeviceState::with_network`); with no class a node shapes only its onion layer links, i.e. none
+  while the tier is dormant. The mobile surface exposes `shaping_set_device_state`,
+  `shaping_status`, `shaping_class_table` (UniFFI; bindings regenerated).
+- **Two planes: bulk over 64 KiB rides an unshaped link of its own.** A message needs the bulk plane
+  when its link is shaped and it is bulk by kind (`ContentFetch`, `ContentBody`, `BlobChunkFetch`,
+  `BlobChunkBody`, the wire spelling) or over `SHAPED_ROW_MAX_BYTES` = 64 KiB (about 20 s at the
+  server class's 3.5 KB/s real rate) or beyond one window's real-frame budget. It takes the
+  freshest unshaped link or dials one with no offer, marked bulk so rows never use it; fetches are
+  bulk so the reply has an unshaped way back. A peer reachable only over the shaped link it dialled
+  in (a NAT'd phone) gets its bulk in shaped-budget fragments, slow but never failing
+  (`link_shaping_bulk_on_shaped_fallback`); `Delivered` means every fragment left, single-flight by
+  envelope digest, a failed bulk dial stands 120 s per peer. A pinned first-contact dial offers no
+  shaping (a server-class node could not onboard over a pairing pin before this).
+- **The bounded share policy** (`ShapedSharePolicy`, Eric 2026-11-04: "shape with shaped peers if
+  possible, otherwise refuse and offer unshaped"). `BoundedWithFloor` (default): at most 8 shaped
+  links less the layer reserve, each at the full class rate; a ninth shaping peer's row link is
+  refused `link_shaping_home_elsewhere` on both sides (class byte `home-elsewhere` on the wire; a
+  43.x peer reads it as malformed and closes too), its row sends fail by name for 120 s, its bulk
+  still completes on an unshaped link. The accepted leak: the refused peer's bulk link is visible
+  until homing (CIRISEdge#935). `DivideNoFloor` is the other arm (cap ÷ links, publishes N).
+- **Referrals at the bound (Eric, 2026-11-04).** The refusal carries up to `MAX_REFERRALS` (3)
+  nodes with capacity for the peer to home on for first contact and consent, preferring non-canonical
+  announced nodes with free slots and relay offering on (offering relay is the consent to be
+  referred). The refused peer verifies each route, dials, and completes there
+  (`a_refused_peer_homes_on_a_referral_and_its_contact_completes_there`). A referred stranger learns a
+  home node's route, an accepted trade.
+  `MIN_LAMBDA` is a floor, never off, so an opted-in cellular link on a 16 KB frame is shaped.
+- **The seat class (CC 5.4.3 rc17).** `BudgetClass::Seat` (`"seat"`, `SEAT_BYTES_PER_S` 33,000: 2
+  frames/s at 16 KB, about 85 GB/month per link each way) between serve seats, outside the eight. It
+  takes proof at both ends; operator config is no proof. Its offer travels as `server`, so a 43.x
+  peer or a non-seat takes the lower class. **The seats follow the active canonical roster** with no
+  restart (the bundle plus every conferred key, less every #377 tombstone, refreshed every 30 s by a
+  timer that ends with the listener): a canonical conferred later gets the class, and a retired one
+  loses the class and its exemption from the bound; such a link closes and renegotiates. A policy
+  change compares offers against the frame this node quoted at, so a link no longer closes because
+  lambda rounded a few bytes up.
+- **A typed status for hosts (E8).** `Edge::shaping_status`, `peer_shaping`, `onion_status`,
+  `shaping_policy`, `set_shaping_policy`, `set_device_state`; PyO3 `shaping_status_json`,
+  `peer_shaping_json`, `onion_status_json`, `shaping_set_device_state`. Read from the running
+  transport when asked; `relays_answering` is `None` until a deal is installed: no measure, not a
+  zero.
+- **Shed levers on shaped slots (E15).** Tier 1 refuses a new shaped link from a peer owed nothing,
+  with referrals, and reports zero slots at once. Tier 2 closes such links newest first, one a
+  second, and pauses the slow path for non-owner peers. An obligation peer is the owner, the owner's
+  devices, the send set and an active seat, read at decision time, and a read that fails sheds
+  nothing. A link this node dialled is not shed. Cover is never shed. `apply_service_tier` reaches
+  the shaper through `attach_load_ladder`.
+- **Coalescing and honest delivery.** A `0x02` multi-body frame (`u16 len ‖ body` repeated) is sent
+  only to a peer that announced the `SHCP` capability on a fresh shaped link (a 43.x peer never
+  receives one): the 4-node `group_record_reach_758` crawl went from 791 real frames to 340. A row's
+  `ship` on a shaped link waits for its frames to LEAVE (FIFO tickets, capped 60 s, unsent bodies
+  retracted on timeout) before `Ok`, so a reaped link no longer loses a row counted Delivered; the
+  reaper measures a shaped link's quiet against its frame gap's p99; a bare frame in the window
+  between the two ends installing their shapers is delivered, not refused.
+- **Timeouts derived from λ.** On a shaped link the anti-entropy round interval follows the frame
+  gap (`PACING_INTERVAL_GAPS` 7.75) and a per-wait timeout is at least `PACING_WAIT_GAPS` 4.74
+  gaps, so ticks no longer queue behind rounds that each take several gaps. Measured: a five-plane
+  round fits the interval with coalescing and does not without it.
+- The tokens: `link_shaping_offered`, `_agreed`, `_unshaped`, `_refused_unshaped_peer`,
+  `_home_elsewhere`, `_refused_malformed`, `_dropped_wrong_kind`, `_frames_real`, `_frames_cover`,
+  `_cover_received`, `_queue_deferred`, `_send_failed`, `_bulk_refused`,
+  `_bulk_on_shaped_fallback`; log reasons `link_shaping_bulk_fallback_timeout` /
+  `_interrupted`. `CIRIS_EDGE_TEST_SHAPING=server` runs any suite under the fleet default.
+
+## The Anonymous Tier, wired dormant (CC 5.4.6; `FSD/ONION_ROUTING.md`; `docs/onion_packet_wire.md`)
+
+- **`outfox-xwing-v1`**, edge's submission for CC 5.4.6 item 3: fixed 15,200-byte packets (six
+  1,168-byte slots + an 8,192-byte body), hop KEM draft-connolly X-Wing-06 with its SHA3-256
+  combiner (libcrux `XWingKemDraft06`; the split form over RustCrypto ML-KEM + x25519-dalek proven
+  byte-identical), LIONESS body per hop with a 16-byte zero check at the exit
+  (`onion_body_tampered`), chained 16-byte slot commitments (`onion_next_slot_mismatch`),
+  HKDF-SHA3-256 and AES-256-GCM; identifier
+  `onion_xwing06_hkdf_sha3_256_aes256gcm_lioness_shake256`. Fixed-seed KATs for the CC and
+  CIRISVerify. The tier is row-plane only: `join_call` and A/V dials refuse
+  `onion_anonymous_no_media`.
+- **Activation gate.** The runtime runs only when the operator opts in (`OnionPolicy::enabled`,
+  default off; `onion_set_enabled` / `onion_status` on the mobile surface) AND the layer deal reports
+  three answering relays per layer (nine conferred `infra:relay` standings across the three layers;
+  CIRISPersist#1119). Until the CC pins the packet and persist ships the `onion_hop_pubkeys` reader
+  (CIRISPersist#1181 is open and not in 61.0.3; the transit pair stands in today) every node answers
+  `onion_tier_not_opted_in` or `onion_tier_unavailable_floor` and relays nothing
+  (`RELAY_DORMANT`). The pseudonym / rendezvous gate is CIRISPersist#1149. Relays run on shaped
+  links only, inside the layer reserve of the 8-link cap.
+
+## What is dormant
+
+Shipped and off, each with its own gate:
+
+- **The Anonymous Tier:** off until opted in, the packet pinned, nine relays conferred and
+  `onion_hop_pubkeys` shipped. Layer links are not dialled. Anonymous mode stays held.
+- **Shaping on a canonical:** the `server` class default is on, but a canonical stays off until
+  measured, per-node; turning it on is Eric's go, and nothing claims the canonical shapes.
+- **`DivideNoFloor`:** a non-default share policy.
+- **`ForwardAdmission` limits:** the hook runs, uncapped per link with unknown capacity, until a
+  host configures it.
+
+## What is unmet
+
+Known at the tag, each tracked:
+
+- **#945 item 4 (sole black hole).** With `idle_aware_silence` on, a parent and standby that both
+  drop look like an idle stream; closing it needs a signal that the publisher is sending. Items 1-3,
+  link close and primary gaps are in this tag.
+- **E4.** A scoped (derived-address) link is never shaped, though CC 5.4.3 item 4 requires it at
+  rungs 2 and 3. A scoped body on such a lane is unshaped until then. Next release.
+- **E5.** Bulk is chosen by kind as well as size, so a small attachment takes the bulk link where the
+  CC's rule is size alone. Deferred: a shaped fetch could cap chunk pulls at one per gap, measure
+  first.
+- **CIRISEdge#939** (displacement to a shaped peer below, the carriage axis) and **#940** (rc17
+  "who carries what": the consent-free set on stranger links, the forwarder's yes, owned routes).
+  v44 ships the bound, the refusal and referrals. A shaped link to a stranger is not yet confined to
+  the consent-free set by edge.
+- **CIRISEdge#935.** Stable top-k homing across seats isn't built, and refused peers home on
+  referrals in the order given, so the row spill stays visible until then.
+- **Rooms at persist:** votes count by key, not by person (CIRISPersist#1198); `quorum:M/N` below M
+  cannot seat a second member (#1201); the last-founder rule holds a plain room's founder (#1202).
+  Moderation windows are v62 (#1173).
+- **Onion:** rooms over the tier (CC#202) and every gate under "dormant" above.
+
+## Known limits
+
+- **A/V through the canonical is not end to end.** A/V legs are still one hop by construction (a
+  derived address answers only a one-hop neighbour), so two hard-NAT phones whose only common node is
+  the canonical get no leg; the roster-relay tier and the audio-only canonical policy apply where a
+  member relay or a punched path exists. Media over identity links through a transport node is the
+  next stage (`FSD/CIRIS_MESH.md` §2.5–2.6, §4.4).
+- **No defensive dropping.** Shaped frames ride the leviculum Channel, so an adversary's drop becomes
+  a delay and nothing at the shaping layer tolerates or detects it (`FSD/TRANSPORT_TIERS_MODEL.md`
+  §9.4, open question 7).
+- `ForwardAdmissionConfig` has no PyO3 kwarg, and the decision-row, cosign and `release_audience`
+  surfaces are Rust-only. CIRISServer links the crate, so this reaches a Python-only host alone.
+- Homing, when it lands, is stable top-k, rebalanced only on a roster change (Eric, 2026-11-04):
+  rotation was a measured net loss (`FSD/TRANSPORT_TIERS_MODEL.md` §9.2).
+
+**For readers of persist rows:** `hard_case` rows replicate from persist v60, so a local admin read must filter `emitter_key_id` to this node, or a peer's admin decision counts as this node's. A top-level null envelope member is refused (`envelope_member_null`). Genesis `finish` and `plan` take a `GenesisScratch`.
 
 # v43.4.1 — a contact's key is asked of the contact, and relayed routes stop costing rounds
 
