@@ -390,6 +390,8 @@ async fn pair(tag: &str, facilitated: bool) -> Pair {
     let a_dir = directory_with(records.clone()).await;
     let b_dir = directory_with(records).await;
     let a = side(key_a, &a_dir, &tmp.path().join("a"), t_port, a_direct).await;
+    // A loaded box can start B a minute after A: this holds it there on demand.
+    tokio::time::sleep(Duration::from_secs(env_secs("NAT_B_DELAY", 0))).await;
     let b = side(
         key_b,
         &b_dir,

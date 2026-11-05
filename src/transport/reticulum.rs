@@ -153,8 +153,9 @@ const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 /// no-path link request with `hops = 1` and *broadcasts* it, so the only
 /// thing that can answer is a **directly-attached** neighbor on a live
 /// interface — which replies in a single interface round-trip. A
-/// relay-reachable peer would have produced a path-table entry (from its
-/// announce) and taken the [`LINK_ESTABLISH_TIMEOUT`] branch instead.
+/// relay-reachable peer has a path-table entry by now, from its announce or
+/// from the path request the dial just raised ([`PATH_SEEK_BUDGET`]), and took
+/// the [`LINK_ESTABLISH_TIMEOUT`] branch instead.
 /// Therefore, if a no-path link request has not established within this
 /// window, no amount of further waiting helps: there is no route. We fail
 /// fast with the self-diagnosing [`TransportError::NoRouteToPeer`] rather
