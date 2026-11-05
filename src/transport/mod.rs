@@ -221,6 +221,10 @@ pub mod transit_kex_peer;
 #[cfg(feature = "_reticulum-module")]
 pub mod av_transit_handshake;
 
+/// CIRISEdge#947 — CC 5.3.3.5: decapsulation outside any node-wide lock and
+/// behind the receiver order: the handshake gate and the bounded keyer.
+#[cfg(feature = "_reticulum-module")]
+pub mod link_keying;
 /// CC 5.3.3.5 E1 — the per-link seal: every edge frame on every RNS link,
 /// both directions and every lane, under the keys of that link's transit KEX.
 /// No classical fallback, no caller-supplied key, no compat path.

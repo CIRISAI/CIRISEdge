@@ -14,6 +14,18 @@ fn seals(seed: u8, id: &str) -> LinkSeals {
     )
 }
 
+/// One frame, and when it is a handshake's last part, its keying run to the
+/// end: what the event loop does around [`LinkSeals::inbound`].
+fn feed(s: &LinkSeals, lane: Lane, bytes: &[u8], we_dialled: bool) -> Inbound {
+    match s.inbound(LINK, lane, bytes, we_dialled, None) {
+        Inbound::Handshake(job) => {
+            let outcome = s.decapsulate(&job).expect("the link waits on this job");
+            s.finish_keying(job.link(), job.ticket(), outcome)
+        }
+        other => other,
+    }
+}
+
 /// A dialler and a dialled end, keyed on `LINK` through the table's own
 /// handshake path.
 fn keyed_pair() -> (LinkSeals, LinkSeals) {
@@ -27,7 +39,7 @@ fn keyed_pair() -> (LinkSeals, LinkSeals) {
     let mut keyed = None;
     for f in &frames {
         assert!(f.len() <= LIMIT);
-        match b.inbound(LINK, Lane::Channel, f, false) {
+        match feed(&b, Lane::Channel, f, false) {
             Inbound::Pending => {}
             Inbound::Keyed { claimed } => keyed = Some(claimed),
             other => panic!("unexpected {other:?}"),
@@ -46,7 +58,7 @@ fn frames_open_in_both_directions_on_every_lane_e1() {
         let bin = if lane.is_msgpack() { 2 } else { 0 };
         assert_eq!(up.len(), b"row bytes up".len() + SEAL_OVERHEAD + bin);
         assert!(!contains(&up, b"row bytes up"), "no plaintext on the wire");
-        match b.inbound(LINK, lane, &up, false) {
+        match feed(&b, lane, &up, false) {
             Inbound::Open(p) => assert_eq!(p, b"row bytes up"),
             other => panic!("{other:?}"),
         }
@@ -88,7 +100,7 @@ fn nothing_is_sealed_before_keys_e1() {
 fn a_non_ctkx_first_frame_is_refused_and_the_link_stays_refused_e1() {
     let b = seals(0x22, DIALLED);
     b.begin_responder(LINK);
-    match b.inbound(LINK, Lane::Channel, b"{\"plaintext\":true}", false) {
+    match feed(&b, Lane::Channel, b"{\"plaintext\":true}", false) {
         Inbound::Refuse(r) => {
             assert_eq!(
                 r.label(),
@@ -98,7 +110,7 @@ fn a_non_ctkx_first_frame_is_refused_and_the_link_stays_refused_e1() {
         other => panic!("{other:?}"),
     }
     assert!(matches!(
-        b.inbound(LINK, Lane::Channel, b"more", false),
+        feed(&b, Lane::Channel, b"more", false),
         Inbound::Closed
     ));
     assert!(
@@ -120,7 +132,7 @@ fn a_resource_before_the_handshake_is_held_and_opens_once_keyed_e1() {
     let (last, first) = frames.split_last().expect("a handshake");
     for f in first {
         assert!(matches!(
-            b.inbound(LINK, Lane::Channel, f, false),
+            feed(&b, Lane::Channel, f, false),
             Inbound::Pending
         ));
     }
@@ -131,7 +143,7 @@ fn a_resource_before_the_handshake_is_held_and_opens_once_keyed_e1() {
         b.open(LINK, Lane::Resource, &row),
         Inbound::HeldBeforeKeys
     ));
-    match b.inbound(LINK, Lane::Channel, last, false) {
+    match feed(&b, Lane::Channel, last, false) {
         Inbound::Keyed { claimed } => assert_eq!(claimed, DIALLER),
         other => panic!("{other:?}"),
     }
@@ -190,7 +202,7 @@ fn an_oversize_declaration_is_refused_e1() {
     start.push(0x00);
     start.extend_from_slice(&u32::MAX.to_be_bytes());
     start.extend_from_slice(&[1u8; 64]);
-    match b.inbound(LINK, Lane::Channel, &start, false) {
+    match feed(&b, Lane::Channel, &start, false) {
         Inbound::Refuse(r) => {
             assert_eq!(r.label(), crate::observability::LINK_SEAL_REFUSED_TOO_LARGE);
         }
@@ -202,7 +214,7 @@ fn an_oversize_declaration_is_refused_e1() {
 fn a_frame_before_the_dialler_keyed_is_refused_e1() {
     let a = seals(0x11, DIALLER);
     a.begin_initiator(LINK);
-    match a.inbound(LINK, Lane::Channel, b"early", true) {
+    match feed(&a, Lane::Channel, b"early", true) {
         Inbound::Refuse(r) => assert_eq!(
             r.label(),
             crate::observability::LINK_SEAL_REFUSED_FRAME_BEFORE_KEYS
@@ -227,7 +239,7 @@ fn a_tampered_frame_fails_to_open_and_refuses_the_link_e1() {
     let mut up = a.seal(LINK, Lane::Channel, b"payload").expect("seal");
     let last = up.len() - 1;
     up[last] ^= 1;
-    match b.inbound(LINK, Lane::Channel, &up, false) {
+    match feed(&b, Lane::Channel, &up, false) {
         Inbound::Refuse(r) => {
             assert_eq!(
                 r.label(),
@@ -263,7 +275,7 @@ fn a_frame_on_the_wrong_lane_does_not_open_e1() {
     let (a, b) = keyed_pair();
     let up = a.seal(LINK, Lane::Resource, b"payload").expect("seal");
     assert!(matches!(
-        b.inbound(LINK, Lane::Channel, &up, false),
+        feed(&b, Lane::Channel, &up, false),
         Inbound::Refuse(SealRefusal::OpenFailed)
     ));
 }
@@ -274,15 +286,15 @@ fn a_replayed_frame_is_dropped_and_the_link_kept_e1() {
     let f0 = a.seal(LINK, Lane::Channel, b"zero").expect("seal");
     let f1 = a.seal(LINK, Lane::Channel, b"one").expect("seal");
     assert!(matches!(
-        b.inbound(LINK, Lane::Channel, &f1, false),
+        feed(&b, Lane::Channel, &f1, false),
         Inbound::Open(_)
     ));
     // Reordered within the window: accepted once.
     assert!(matches!(
-        b.inbound(LINK, Lane::Channel, &f0, false),
+        feed(&b, Lane::Channel, &f0, false),
         Inbound::Open(_)
     ));
-    match b.inbound(LINK, Lane::Channel, &f0, false) {
+    match feed(&b, Lane::Channel, &f0, false) {
         Inbound::Drop(label) => assert_eq!(label, crate::observability::LINK_SEAL_DROPPED_REPLAY),
         other => panic!("{other:?}"),
     }
@@ -433,7 +445,7 @@ fn a_whole_envelope_that_overtakes_the_handshake_is_held_and_opens() {
     let (last, first) = frames.split_last().expect("a handshake");
     for f in first {
         assert!(matches!(
-            b.inbound(LINK, Lane::Channel, f, false),
+            feed(&b, Lane::Channel, f, false),
             Inbound::Pending
         ));
     }
@@ -445,7 +457,7 @@ fn a_whole_envelope_that_overtakes_the_handshake_is_held_and_opens() {
         row.len()
     );
     assert!(matches!(
-        b.inbound(LINK, Lane::Channel, last, false),
+        feed(&b, Lane::Channel, last, false),
         Inbound::Keyed { .. }
     ));
     let held = b.take_before_keys(LINK);
@@ -579,4 +591,311 @@ fn the_attribution_hold_keeps_order_and_refuses_at_its_budget_e1() {
         ),
         "past the bound: refused now, with the first refusal"
     );
+}
+
+/// The handshake parts for a fresh dialler, for a link of `b`'s.
+fn parts_for(link: [u8; 16], b: &LinkSeals) -> Vec<Vec<u8>> {
+    let a = seals(0x11, DIALLER);
+    a.begin_initiator(link);
+    a.initiate(link, DIALLER, DIALLED, b.secret().pair(), LIMIT)
+        .expect("initiate")
+        .0
+}
+
+/// `link`'s handshake fed whole: its job, the link keying.
+fn keying(b: &LinkSeals, link: [u8; 16]) -> HandshakeJob {
+    assert!(b.begin_responder(link));
+    let mut job = None;
+    for f in parts_for(link, b) {
+        match b.inbound(link, Lane::Channel, &f, false, None) {
+            Inbound::Pending => {}
+            Inbound::Handshake(j) => job = Some(j),
+            other => panic!("{other:?}"),
+        }
+    }
+    job.expect("the last part yields the job")
+}
+
+fn frame_event(link: [u8; 16], n: u8) -> NodeEvent {
+    NodeEvent::LinkDataReceived {
+        link_id: leviculum_core::LinkId::new(link),
+        data: vec![n],
+    }
+}
+
+#[test]
+fn inbound_never_decapsulates_947() {
+    let b = seals(0x22, DIALLED);
+    let job = keying(&b, LINK);
+    assert_eq!(b.decapsulations(), 0, "the last part only hands a job back");
+    assert!(b.is_keying(LINK));
+    assert!(!b.is_sealed(LINK));
+    assert!(matches!(
+        b.seal(LINK, Lane::Channel, b"x"),
+        Err(SealRefusal::Unsealed)
+    ));
+    let outcome = b.decapsulate(&job).expect("live");
+    assert_eq!(b.decapsulations(), 1);
+    assert!(b.is_keying(LINK), "keys wait for the event loop");
+    assert!(matches!(
+        b.finish_keying(LINK, job.ticket(), outcome),
+        Inbound::Keyed { .. }
+    ));
+    assert!(b.is_sealed(LINK));
+}
+
+#[test]
+fn a_link_has_one_keying_outcome_947() {
+    let b = seals(0x22, DIALLED);
+    let job = keying(&b, LINK);
+    let outcome = b.decapsulate(&job).expect("live");
+    // The budget gets there first: the outcome is discarded, keys never land.
+    assert!(b.expire(LINK));
+    assert!(matches!(
+        b.finish_keying(LINK, job.ticket(), outcome),
+        Inbound::Closed
+    ));
+    assert!(!b.is_sealed(LINK));
+    assert!(b.decapsulate(&job).is_none(), "a dead job does not run");
+
+    // A closed link's id coming back keying does not take the old outcome.
+    let c = seals(0x22, DIALLED);
+    let old = keying(&c, LINK);
+    let outcome = c.decapsulate(&old).expect("live");
+    c.forget(&LINK);
+    let new = keying(&c, LINK);
+    assert_ne!(old.ticket(), new.ticket());
+    assert!(matches!(
+        c.finish_keying(LINK, old.ticket(), outcome),
+        Inbound::Closed
+    ));
+    assert!(
+        c.is_keying(LINK),
+        "the new keying still waits on its own job"
+    );
+}
+
+#[test]
+fn a_failed_keying_refuses_the_link_once_947() {
+    let b = seals(0x22, DIALLED);
+    assert!(b.begin_responder(LINK));
+    let garbage =
+        crate::transport::av_transit_handshake::fragment(&[0x01; 900], LIMIT).expect("frames");
+    let mut job = None;
+    for f in garbage {
+        if let Inbound::Handshake(j) = b.inbound(LINK, Lane::Channel, &f, false, None) {
+            job = Some(j);
+        }
+    }
+    let job = job.expect("framing whole");
+    let outcome = b.decapsulate(&job).expect("live");
+    assert!(outcome.is_err(), "not a handshake");
+    assert!(matches!(
+        b.finish_keying(LINK, job.ticket(), outcome),
+        Inbound::Refuse(SealRefusal::Handshake(_))
+    ));
+    assert!(matches!(
+        feed(&b, Lane::Channel, b"late", false),
+        Inbound::Closed
+    ));
+}
+
+#[test]
+fn a_keying_link_is_never_expired_before_its_budget_and_route_budget_carries_947() {
+    let b = seals(0x22, DIALLED);
+    let _job = keying(&b, LINK);
+    assert!(b
+        .keying_budget_left(LINK)
+        .is_some_and(|l| l > Duration::ZERO));
+
+    let c = seals(0x22, DIALLED);
+    assert!(c.begin_responder(LINK));
+    let req = route_fetch::encode_request(&route_fetch::RouteRequest {
+        key_id: DIALLED.to_owned(),
+        holds_key_record: false,
+    });
+    assert!(matches!(
+        c.inbound(LINK, Lane::Channel, &req, false, None),
+        Inbound::RouteRequested { .. }
+    ));
+    for f in parts_for(LINK, &c) {
+        let _ = c.inbound(LINK, Lane::Channel, &f, false, None);
+    }
+    assert!(c.is_keying(LINK));
+    assert!(
+        c.route_budget_left(LINK).is_some(),
+        "the route fetch's budget survives into keying"
+    );
+}
+
+#[test]
+fn frames_wait_on_keying_in_order_and_go_with_the_link_947() {
+    let b = seals(0x22, DIALLED);
+    let _job = keying(&b, LINK);
+    for n in 0..3 {
+        b.park(LINK, frame_event(LINK, n), 1).expect("room");
+    }
+    let order: Vec<u8> = b
+        .take_parked(LINK)
+        .into_iter()
+        .map(|e| match e {
+            NodeEvent::LinkDataReceived { data, .. } => data[0],
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(order, vec![0, 1, 2]);
+    assert!(b.take_parked(LINK).is_empty());
+
+    b.park(LINK, frame_event(LINK, 9), 1).expect("room");
+    b.forget(&LINK);
+    assert!(
+        b.take_parked(LINK).is_empty(),
+        "a closed link holds nothing"
+    );
+    assert_eq!(b.parked().bytes, 0);
+}
+
+#[test]
+fn a_link_that_outruns_its_keying_hold_is_refused_by_name_947() {
+    let b = seals(0x22, DIALLED);
+    let _job = keying(&b, LINK);
+    for n in 0..KEYING_HELD_FRAMES_MAX {
+        b.park(LINK, frame_event(LINK, 0), 1)
+            .unwrap_or_else(|e| panic!("frame {n}: {e}"));
+    }
+    let refused = b
+        .park(LINK, frame_event(LINK, 0), 1)
+        .expect_err("past the frame bound");
+    assert_eq!(
+        refused.label(),
+        crate::observability::LINK_SEAL_REFUSED_KEYING_HOLD
+    );
+    assert_eq!(
+        b.parked().bytes,
+        0,
+        "the node-wide count let go of the link"
+    );
+
+    let c = seals(0x22, DIALLED);
+    c.begin_responder(LINK);
+    assert!(c
+        .park(LINK, frame_event(LINK, 0), HELD_BYTES_MAX + 1)
+        .is_err());
+    // Node-wide: other links' holds fill the bound.
+    for i in 0..8u8 {
+        let l = [i + 1; 16];
+        c.park(l, frame_event(l, 0), HELD_BYTES_MAX).expect("room");
+    }
+    assert!(c.park([0xee; 16], frame_event(LINK, 0), 1).is_err());
+}
+
+#[test]
+fn the_awaiting_cap_refuses_the_oldest_by_count_947() {
+    let b = seals(0x22, DIALLED);
+    b.set_awaiting_caps(2, AWAITING_BYTES_MAX);
+    assert!(b.begin_responder([1; 16]));
+    assert!(b.begin_responder([2; 16]));
+    assert!(b.take_evicted().is_empty());
+    assert!(b.begin_responder([3; 16]));
+    assert_eq!(b.take_evicted(), vec![[1; 16]], "the oldest gives way");
+    // It is refused: a frame still in flight finds it closed.
+    assert!(matches!(
+        b.inbound([1; 16], Lane::Channel, b"late", false, None),
+        Inbound::Closed
+    ));
+    // The newest stayed and can key; leaving `Awaiting` frees its slot.
+    let parts = parts_for([3; 16], &b);
+    for f in &parts {
+        let _ = b.inbound([3; 16], Lane::Channel, f, false, None);
+    }
+    assert!(b.is_keying([3; 16]));
+    assert!(b.begin_responder([4; 16]));
+    assert!(b.take_evicted().is_empty(), "keying is not awaiting");
+    // A link first heard of at its first frame is counted the same.
+    assert!(b.begin_responder([5; 16]));
+    assert_eq!(b.take_evicted(), vec![[2; 16]]);
+    let _ = b.inbound([6; 16], Lane::Channel, b"CTKX", false, None);
+    assert_eq!(b.take_evicted(), vec![[4; 16]]);
+}
+
+#[test]
+fn the_awaiting_cap_refuses_the_oldest_by_bytes_947() {
+    let b = seals(0x22, DIALLED);
+    let parts = parts_for([1; 16], &b);
+    assert!(parts.len() > 2, "a handshake of several parts");
+    b.set_awaiting_caps(AWAITING_LINKS_MAX, parts[0].len() * 2);
+    assert!(b.begin_responder([1; 16]));
+    assert!(matches!(
+        b.inbound([1; 16], Lane::Channel, &parts[0], false, None),
+        Inbound::Pending
+    ));
+    let other = parts_for([2; 16], &b);
+    assert!(b.begin_responder([2; 16]));
+    let _ = b.inbound([2; 16], Lane::Channel, &other[0], false, None);
+    assert!(b.take_evicted().is_empty(), "both fit");
+    let _ = b.inbound([2; 16], Lane::Channel, &other[1], false, None);
+    assert_eq!(b.take_evicted(), vec![[1; 16]], "the oldest pays");
+    let links = b.links();
+    assert_eq!(
+        links.ledger.bytes, links.ledger.links[&[2; 16]].1,
+        "the evicted link's bytes left the ledger"
+    );
+}
+
+#[test]
+fn the_ledger_follows_every_way_out_of_awaiting_947() {
+    let b = seals(0x22, DIALLED);
+    let parts = parts_for([1; 16], &b);
+    for (i, out) in ["refuse", "expire", "forget", "bad frame"]
+        .iter()
+        .enumerate()
+    {
+        let l = [u8::try_from(i).unwrap() + 1; 16];
+        assert!(b.begin_responder(l));
+        let _ = b.inbound(l, Lane::Channel, &parts[0], false, None);
+        assert!(b.links().ledger.bytes > 0, "{out}");
+        match *out {
+            "refuse" => b.refuse(l),
+            "expire" => assert!(b.expire(l)),
+            "forget" => b.forget(&l),
+            _ => assert!(matches!(
+                b.inbound(l, Lane::Channel, b"not a part", false, None),
+                Inbound::Refuse(_)
+            )),
+        }
+        assert_eq!(b.links().ledger.links.len(), 0, "{out}");
+        assert_eq!(b.links().ledger.by_age.len(), 0, "{out}");
+        assert_eq!(b.links().ledger.bytes, 0, "{out}");
+    }
+}
+
+#[test]
+fn a_route_request_is_charged_to_its_sender_before_the_node_947() {
+    let b = seals(0x22, DIALLED);
+    let req = route_fetch::encode_request(&route_fetch::RouteRequest {
+        key_id: DIALLED.to_owned(),
+        holds_key_record: false,
+    });
+    let cap = route_fetch::ROUTE_REQUESTS_PER_SENDER;
+    let mut refused = 0;
+    for i in 0..u8::try_from(route_fetch::ROUTE_REQUESTS_PER_WINDOW).unwrap() {
+        let l = [i; 16];
+        assert!(b.begin_responder(l));
+        if matches!(
+            b.inbound(l, Lane::Channel, &req, false, Some("one-prober")),
+            Inbound::Refuse(_)
+        ) {
+            refused += 1;
+        }
+    }
+    assert_eq!(
+        refused,
+        usize::try_from(route_fetch::ROUTE_REQUESTS_PER_WINDOW).unwrap() - cap
+    );
+    // The prober spent only its own budget: an honest stranger still gets in.
+    assert!(b.begin_responder([0xfe; 16]));
+    assert!(matches!(
+        b.inbound([0xfe; 16], Lane::Channel, &req, false, Some("honest")),
+        Inbound::RouteRequested { .. }
+    ));
 }

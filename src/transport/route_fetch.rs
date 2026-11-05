@@ -72,7 +72,8 @@ pub const ROUTE_REQUESTS_PER_SENDER: usize = 4;
 /// Links with no proven identity yet share ONE sender slot with this cap: an
 /// unidentified flood cannot take more than this of the node-wide budget.
 pub const ROUTE_REQUESTS_UNIDENTIFIED: usize = 8;
-/// Senders tracked at once (oldest-idle first out past the bound).
+/// Senders tracked at once. Past it, idle senders are dropped, and when none
+/// are idle a new sender goes untracked to the node-wide rate.
 pub const ROUTE_SENDERS_TRACKED: usize = 1024;
 
 /// CC 5.3.3.5 E1 — the route fetch runs on identity-plane links only. A
@@ -90,12 +91,31 @@ pub fn route_request_plane_allowed(identity_plane: bool) -> Result<(), RouteFetc
 }
 
 /// The per-sender receiver order: a sliding window per sender key, bounded.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SenderRouteLimiter {
+    per_sender: usize,
+    unidentified: usize,
     recent: Mutex<std::collections::HashMap<String, VecDeque<Instant>>>,
 }
 
+impl Default for SenderRouteLimiter {
+    fn default() -> Self {
+        Self::with_caps(ROUTE_REQUESTS_PER_SENDER, ROUTE_REQUESTS_UNIDENTIFIED)
+    }
+}
+
 impl SenderRouteLimiter {
+    /// At most `per_sender` per window per proven identity, and `unidentified`
+    /// per window across every link with none.
+    #[must_use]
+    pub fn with_caps(per_sender: usize, unidentified: usize) -> Self {
+        Self {
+            per_sender,
+            unidentified,
+            recent: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
     /// Admit one request from `sender` (`None` = an unidentified link) now.
     pub fn admit(&self, sender: Option<&str>) -> bool {
         self.admit_at(sender, Instant::now())
@@ -103,8 +123,8 @@ impl SenderRouteLimiter {
 
     fn admit_at(&self, sender: Option<&str>, now: Instant) -> bool {
         let (key, cap) = match sender {
-            Some(s) => (s.to_owned(), ROUTE_REQUESTS_PER_SENDER),
-            None => ("\u{0}unidentified".to_owned(), ROUTE_REQUESTS_UNIDENTIFIED),
+            Some(s) => (s.to_owned(), self.per_sender),
+            None => ("\u{0}unidentified".to_owned(), self.unidentified),
         };
         let mut map = self
             .recent
@@ -115,8 +135,13 @@ impl SenderRouteLimiter {
                 q.back()
                     .is_some_and(|t| now.duration_since(*t) < ROUTE_REQUEST_WINDOW)
             });
+            // Past the bound every sender is live inside the window: a flood
+            // of fresh identities, each with budget left by definition. This
+            // stage runs BEFORE the node-wide rate, so refusing here would
+            // refuse honest strangers for the flood's size. Hand it to the
+            // node-wide rate, which is what bounds that flood.
             if map.len() >= ROUTE_SENDERS_TRACKED {
-                return false;
+                return true;
             }
         }
         let q = map.entry(key).or_default();

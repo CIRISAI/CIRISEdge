@@ -56,8 +56,8 @@
 //! ```
 //!
 //! The receiver refuses a declared length over [`MAX_HANDSHAKE_BYTES`] at the
-//! START frame, before buffering anything, and never holds more than the
-//! declared length; a frame past it or a budget overrun ([`HANDSHAKE_BUDGET`])
+//! START frame, before buffering anything, holds only what has arrived, and
+//! never more than the declared length; a frame past it or a budget overrun ([`HANDSHAKE_BUDGET`])
 //! is a named refusal.
 //!
 //! **Telling handshake frames from sealed frames is positional, and the tag
@@ -403,7 +403,6 @@ impl Reassembler {
                     });
                 }
                 self.expected = Some(declared);
-                self.buf.reserve_exact(declared);
                 &b[START_HEADER_LEN..]
             }
             (KIND_START, Some(_)) => {
@@ -426,6 +425,9 @@ impl Reassembler {
                 "a part past the declared length",
             ));
         }
+        // Grown by what arrived, never by what was declared: a START frame
+        // alone must not pin [`MAX_HANDSHAKE_BYTES`] (CIRISEdge#947).
+        self.buf.reserve_exact(data.len());
         self.buf.extend_from_slice(data);
         Ok((self.buf.len() == expected).then(|| std::mem::take(&mut self.buf)))
     }

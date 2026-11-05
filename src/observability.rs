@@ -1257,6 +1257,25 @@ pub const ADVERTISE_RESWEEP_CYCLE_OVERDUE: &str = "advertise_resweep_cycle_overd
 /// Resource past the before-keys hold's bound: dropped, the link kept. The
 /// budget still closes a link whose handshake never comes.
 pub const LINK_SEAL_DROPPED_BEFORE_KEYS: &str = "link_seal_dropped_before_keys";
+/// CIRISEdge#947 — a complete handshake over its sender's rate; refused
+/// before it is parsed and the link closed.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE: &str = "link_seal_refused_handshake_sender_rate";
+/// CIRISEdge#947 — a complete handshake over the node-wide rate for its class;
+/// refused before it is parsed and the link closed.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE: &str = "link_seal_refused_handshake_node_rate";
+/// CIRISEdge#947 — the decapsulation queue for this handshake's class is full;
+/// the new handshake is refused and the link closed.
+pub const LINK_SEAL_REFUSED_DECAP_SATURATED: &str = "link_seal_refused_decap_saturated";
+/// CIRISEdge#947 — the node held the most links awaiting a handshake it holds,
+/// or the most bytes; the oldest such link is refused and closed.
+pub const LINK_SEAL_REFUSED_AWAITING_CAP: &str = "link_seal_refused_awaiting_cap";
+/// CIRISEdge#947 — more frames arrived on a link during its keying than it may
+/// hold; refused and closed rather than lose a frame its sender counted.
+pub const LINK_SEAL_REFUSED_KEYING_HOLD: &str = "link_seal_refused_keying_hold";
+/// CIRISEdge#947 — a frame waited on its link's keying (replayed in order).
+pub const LINK_SEAL_HELD_DURING_KEYING: &str = "link_seal_held_during_keying";
+/// CIRISEdge#947 — a decapsulation ran off the event path.
+pub const LINK_SEAL_DECAPSULATED: &str = "link_seal_decapsulated";
 /// A Resource that completed on a link a peer dialled before the event loop
 /// had answered its handshake, HELD sealed and opened once the link is keyed
 /// (bounded; past the bound it is `link_seal_dropped_before_keys`).
