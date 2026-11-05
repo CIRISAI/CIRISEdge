@@ -40,8 +40,8 @@ use crate::transport::realtime_av_alm::controller::wire::{
 };
 use crate::transport::realtime_av_alm::controller::{
     Admission, AdmitDecision, ChunkPos, ControlFrame, ControlMsg, ControllerConfig, DecisionKind,
-    DecisionLog, EgressMeter, ParentSelector, RefuseReason, Role, SelectorAction, ShedReason,
-    SplitMix64, SubscribeRequest,
+    DecisionLog, EgressMeter, ParentSelector, PathChunk, RefuseReason, Role, SelectorAction,
+    ShedReason, SplitMix64, SubscribeRequest,
 };
 
 /// How often a forwarder offers each stream it can serve.
@@ -551,8 +551,14 @@ impl AlmState {
             .find(|(p, _)| p == from)
             .map(|(_, r)| r);
         let full = role == Some(Role::Primary);
-        let pos = ChunkPos { epoch, seq };
-        sel.on_chunk(now, &from.to_owned(), pos, full, bytes, latency);
+        let chunk = PathChunk {
+            pos: ChunkPos { epoch, seq },
+            full,
+            base_or_audio,
+            bytes,
+            latency_ms: latency,
+        };
+        sel.on_chunk(now, &from.to_owned(), chunk);
         if sel.primary().is_some_and(|p| p == from) {
             self.rates
                 .entry(stream)
@@ -1151,6 +1157,8 @@ mod tests {
         c_offers_to_b: bool,
         /// Withhold every `n`th chunk of A's direct leg to B.
         withhold_b: Option<u64>,
+        /// Withhold every `n`th chunk of the relay's leg to B.
+        withhold_standby: Option<u64>,
     }
 
     impl Mesh {
@@ -1179,6 +1187,7 @@ mod tests {
                 ticks: 0,
                 c_offers_to_b: true,
                 withhold_b: None,
+                withhold_standby: None,
             }
         }
 
@@ -1243,7 +1252,8 @@ mod tests {
             let c_legs = vec!["a".to_owned(), "b".to_owned()];
             let forward =
                 self.nodes[C].forward_exclude(sa, epoch, seq, "a", "a", &c_legs, base_or_audio);
-            if forward.is_some_and(|skip| !skip.contains(&c_legs[1])) {
+            let dropped = self.withhold_standby.is_some_and(|n| seq % n == 0);
+            if forward.is_some_and(|skip| !skip.contains(&c_legs[1])) && !dropped {
                 self.nodes[C].on_sent("b", CHUNK);
                 self.nodes[B].on_chunk(sa, "c", epoch, seq, CHUNK, at, base_or_audio);
             }
@@ -1341,6 +1351,60 @@ mod tests {
             p.parent_changes,
             0,
             "the direct primary stayed: {}",
+            m.nodes[B].log_tail()
+        );
+    }
+
+    /// #945 item 3: a standby gets base and audio only, in a `chunk_seq`
+    /// shared with the layers above, so its path shows gaps it never owed.
+    #[test]
+    fn a_standby_skipping_layers_is_not_a_lossy_path() {
+        let mut m = Mesh::new();
+        m.run(15_000, 2, |_| {});
+        let p = m.b_parents();
+        assert_eq!(p.primary.as_deref(), Some("a"), "{p:?}");
+        assert_eq!(p.standby.as_deref(), Some("c"), "{p:?}");
+        let mut standby = Vec::new();
+        m.run(10_000, 2, |m| standby.extend(m.state_of("c")));
+        assert_eq!(
+            degraded_ticks(&standby),
+            0,
+            "a clean standby read as Degraded: {standby:?}"
+        );
+    }
+
+    /// #945 item 3: a standby that really drops base chunks still measures
+    /// as lossy. Mutation: ignoring a standby's gaps with nothing in their
+    /// place reads it as clean, and it would out-score an honest primary.
+    #[test]
+    fn a_standby_that_drops_base_chunks_is_lossy() {
+        let mut m = Mesh::new();
+        m.run(15_000, 2, |_| {});
+        assert_eq!(m.b_parents().standby.as_deref(), Some("c"));
+        m.withhold_standby = Some(4);
+        let mut standby = Vec::new();
+        m.run(6_000, 2, |m| standby.extend(m.state_of("c")));
+        assert!(
+            degraded_ticks(&standby) > 0,
+            "a quarter of the base chunks lost on the standby: {standby:?}"
+        );
+    }
+
+    /// #945 item 3, the takeover: A's direct leg to B really loses chunks and
+    /// C's standby path loses none. The primary is Degraded, so direct-first
+    /// no longer holds it, and the clean standby takes over by score. With a
+    /// standby's skipped layers read as loss it can never win.
+    #[test]
+    fn a_lossy_primary_gives_way_to_a_clean_layered_standby() {
+        let mut m = Mesh::new();
+        m.run(15_000, 2, |_| {});
+        assert_eq!(m.b_parents().standby.as_deref(), Some("c"));
+        m.withhold_b = Some(4);
+        m.run(30_000, 2, |_| {});
+        let p = m.b_parents();
+        assert!(
+            p.parent_changes > 0,
+            "the clean standby took over: {p:?}\n{}",
             m.nodes[B].log_tail()
         );
     }

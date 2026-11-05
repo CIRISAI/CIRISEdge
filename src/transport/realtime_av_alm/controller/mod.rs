@@ -83,9 +83,9 @@ pub mod wire;
 
 pub use admission::{Admission, ClassPolicy, Commitment, ForwarderKind};
 pub use decision_log::{DecisionKind, DecisionLog};
-pub use path_meter::{ChunkPos, EgressMeter, EgressWindow, PathMeter, PathSnapshot};
+pub use path_meter::{ChunkPos, EgressMeter, EgressWindow, PathLayers, PathMeter, PathSnapshot};
 pub use peer_state::{PeerHealth, PeerState};
-pub use selector::{ParentSelector, SelectorAction, UpstreamView};
+pub use selector::{ParentSelector, PathChunk, SelectorAction, UpstreamView};
 
 use crate::transport::realtime_av::StreamId;
 

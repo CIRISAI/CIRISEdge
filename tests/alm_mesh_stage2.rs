@@ -17,6 +17,8 @@
 //!   media rides leviculum's timed Channel frames between C3 peers.
 //! - **Epoch roll** (`an_epoch_roll_reads_as_a_resync_on_a_live_link`,
 //!   CIRISEdge#945): a real room commit is a meter resync, not a loss burst.
+//! - **Layered standby** (`a_layered_standby_is_not_read_as_lossy_on_a_live_call`,
+//!   CIRISEdge#945): the layers a standby never owed are not loss.
 //!
 //! Requires `transport-reticulum`:
 //! `cargo test --features "transport-http transport-reticulum" --test alm_mesh_stage2`
@@ -39,6 +41,7 @@ use ciris_edge::transport::av_call::{
 };
 use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{AvKeepTarget, StreamDekRegistrar};
+use ciris_edge::transport::realtime_av::{ChunkLayer, CODEC_AV1_SVC};
 use ciris_edge::transport::reticulum::{
     ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
 };
@@ -904,4 +907,84 @@ async fn an_epoch_roll_reads_as_a_resync_on_a_live_link() {
     );
     assert_eq!(lines, Vec::<String>::new(), "{:?}", cb.alm_log());
     task.abort();
+}
+
+/// **CIRISEdge#945 item 3, on a live call.** A publishes a base and an
+/// enhancement layer; B's primary is A, its standby the relay C, which sends
+/// it the base only. The enhancement chunks' sequence numbers are gaps on
+/// that path it never owed. Mutation: reading them as loss puts C in Degraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_layered_standby_is_not_read_as_lossy_on_a_live_call() {
+    let tag = "alm2-layered";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    let mut cc = join_loaded(c, &groups[2], tag, relay_opts(), None).await;
+    wait_legs(&ca, 2).await;
+    wait_legs(&cb, 2).await;
+    wait_legs(&cc, 2).await;
+    wait_bound(&cb, 2).await;
+    wait_bound(&cc, 2).await;
+    let (_, task_b) = drain(&mut cb);
+    let (_, task_c) = drain(&mut cc);
+    let layer = |base: bool, seq: u64| Frame {
+        codec_id: CODEC_AV1_SVC,
+        layer: if base {
+            ChunkLayer::BASE
+        } else {
+            ChunkLayer {
+                spatial: 1,
+                temporal: 0,
+                quality: 0,
+            }
+        },
+        bytes: body("a", seq),
+    };
+    // Media until C is B's standby, then long enough for its meter to read.
+    // Evenly spaced: a pair sent back to back into a Channel window is
+    // refused as Congested (#591), and real loss is not what this is about.
+    let mut standby_from = None;
+    for k in 0..4_000u64 {
+        ca.publish(layer(k % 2 == 0, k)).await.expect("publish");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let parents = cb.alm_parents();
+        let p = parents.iter().find(|p| p.stream == ca.stream());
+        let on = p.is_some_and(|p| {
+            p.primary.as_deref() == Some(a.key.key_id.as_str())
+                && p.standby.as_deref() == Some(c.key.key_id.as_str())
+        });
+        if on && standby_from.is_none() {
+            standby_from = Some((k, cc.alm_counts().forwarded));
+        }
+        if standby_from.is_some_and(|(at, _)| k >= at + 300) {
+            break;
+        }
+    }
+    let (_, forwarded_from) = standby_from.unwrap_or_else(|| {
+        panic!(
+            "C became B's standby: {:?} {:?}",
+            cb.alm_parents(),
+            cb.alm_log()
+        )
+    });
+    let forwarded = cc.alm_counts().forwarded - forwarded_from;
+    let lines = degraded_lines(&cb, &c.key.key_id);
+    let congested =
+        av(&a.metrics, "av_chunk_dropped_congested") + av(&c.metrics, "av_chunk_dropped_congested");
+    eprintln!(
+        "[ALM2] layered standby: C forwarded {forwarded} of 150 base chunks, Degraded lines {}, \
+         congested {congested}, shed {}",
+        lines.len(),
+        ca.alm_counts().shed
+    );
+    assert_eq!(congested, 0, "the premise: nothing really lost");
+    assert_eq!(ca.alm_counts().shed, 0, "the premise: nobody shed");
+    assert!(
+        forwarded >= 140,
+        "C really carried the base layer: {forwarded}"
+    );
+    assert_eq!(lines, Vec::<String>::new(), "{:?}", cb.alm_log());
+    task_b.abort();
+    task_c.abort();
 }
