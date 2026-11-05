@@ -18,11 +18,11 @@ synchronous. The call layer that sends and applies frames is
 - **Inside the E1 link seal** (CC 5.3.3.5), like every frame on the link. It
   takes **no A/V outer seal and no hop counter**, like a binding part
   (`docs/av_chunk_auth_wire.md` §1.4). A receiver's pending hop gap is carried
-  past a CALM frame unchanged (`av_call.rs:2540`).
+  past a CALM frame unchanged (`av_call.rs:2557`).
 - **In either direction of a link.** Each member pair normally holds two links,
   one dialled by each end. A member sends on the leg it dialled when it has
   one. Otherwise it sends on the reverse direction of the link the peer dialled
-  to it (`send_alm`, `av_call.rs:2343`).
+  to it (`send_alm`, `av_call.rs:2359`).
 
 ## 2. Framing
 
@@ -41,7 +41,7 @@ A frame is a CALM frame iff it is at least 6 bytes long and starts
 
 **Telling a frame from a chunk.** A chunk's first 32 bytes are its stream id. A
 publisher never mints a stream id that begins `"CALM" 0x01`: `start_stream`
-draws the join nonce again (`av_call.rs:1853`; `collides_with_control_frame`,
+draws the join nonce again (`av_call.rs:1869`; `collides_with_control_frame`,
 `wire.rs:76`). It already redraws for `"CSKB" 0x01`.
 
 **Version.** A frame with an unknown version is not a CALM frame. It falls
@@ -113,16 +113,16 @@ Field rules (enforced at decode):
    subscribe, unsubscribe or offer in another's name.
 2. **CAPS first, from the responder, on the reverse direction.** The responder
    of each A/V link sends `CAPS` on the reverse direction of the link it
-   accepted, right after the stream hello (`av_call.rs:2270`). It is the first
+   accepted, right after the stream hello (`av_call.rs:2286`). It is the first
    CALM frame on that link.
    - A pre-C3 dialler never reads that direction: it dropped its receiver, and
      the transport counts and drops the frame (`AvDelivery::ConsumerGone`). It
      is harmless there.
    - A C3 dialler answers with its own `CAPS` on its leg, once, only after
-     hearing one (`handle_c3`, `av_call.rs:2433`; `out_leg_reader`,
+     hearing one (`handle_c3`, `av_call.rs:2449`; `out_leg_reader`,
      `:2489`).
    - **No other kind is sent to a peer that has not sent `CAPS` with bit 0**
-     (`send_alm` filters on `speaks_c3`, `av_call.rs:2343`;
+     (`send_alm` filters on `speaks_c3`, `av_call.rs:2359`;
      `av_call/alm.rs:269`). A pre-C3 peer would read a CALM frame as a chunk
      that fails to open.
    - **Pre-C3 peers are served as before:** the full stream, plus the legacy
@@ -132,8 +132,8 @@ Field rules (enforced at decode):
    paragraph, E1 item 1, CC 6.1.6: tree nodes are members). The roster is the
    room's MLS group, updated at every epoch roll.
    - **Subscriber side.** A candidate outside the roster is never a primary or
-     a standby (`selector.rs:698`; `set_members`, `:271`). An `OFFER` from a
-     non-member is ignored (`av_call/alm.rs:763`). A parent that leaves the
+     a standby (`selector.rs:724`; `set_members`, `:271`). An `OFFER` from a
+     non-member is ignored (`av_call/alm.rs:759`). A parent that leaves the
      roster is dropped.
    - **Forwarder side.** `SUBSCRIBE` is refused `relay_nonmember_fanout` when
      the requester, or this forwarder itself, is outside the roster
@@ -207,10 +207,16 @@ closes the link**: the E1 seal already authenticated its sender.
 
 ## 6. Acceptance and validation order
 
-**Receiving (pump, `av_call.rs:2540`)**, per frame on an A/V link:
+**Receiving (pump, `av_call.rs:2557`)**, per frame on an A/V link:
 
 1. The E1 link seal opens it, or the transport closes the link (CC 5.3.3.5).
 2. The hop gap reported with the frame is folded in and stays pending.
+   The gap a chunk finally opens at, less this node's own age drops, is what
+   the receiver's path meter reads as loss. The counter takes no chunk the
+   sender's layer policy filtered or its link refused, so it needs no word on
+   the wire about that policy; CALM has none. `chunk_seq` gaps are not read as
+   loss on any path, because every layer spends that one sequence
+   (`realtime_av_alm/controller/path_meter.rs`).
 3. If the frame starts `"CALM" 0x01` it is C3. It is decoded with the link's
    attributed peer as the sender (§4.1):
    1. framing: magic, version, a known kind;
@@ -220,7 +226,7 @@ closes the link**: the E1 seal already authenticated its sender.
    4. no trailing bytes.
 
    Any failure is §5's decode refusal.
-4. A decoded frame is applied (`on_control`, `av_call/alm.rs:672`):
+4. A decoded frame is applied (`on_control`, `av_call/alm.rs:668`):
    - **`CAPS`** records the peer's bits. On the first `CAPS` from a member with
      bit 0, that member enters the join gap; with bit 1, its media is sent
      timed from then on.
@@ -255,7 +261,7 @@ closes the link**: the E1 seal already authenticated its sender.
      - otherwise it feeds the selector. An offer older than 5 s is not a
        candidate. It never names the publisher: the binding does.
 
-**Sending.** `send_alm` (`av_call.rs:2343`) sends nothing to a peer without
+**Sending.** `send_alm` (`av_call.rs:2359`) sends nothing to a peer without
 `CAPS` bit 0. It sends on this node's own leg to the peer (five brief
 backpressure retries), or, without a leg, on the reverse direction of the
 peer's link to this node. A frame on a leg settles that leg for 50 ms
@@ -265,10 +271,10 @@ so without it the chunk right behind an `OFFER` is refused and lost.
 **Delivery.** `OFFER` is periodic: one the link refuses is dropped, and the
 next replaces it. **Every other kind must arrive**, because it changes state on
 one side only (`is_periodic`, `wire.rs:89`). One the link refuses is resent off
-the data path for up to 2 s (`resend_c3`, `av_call.rs:2397`), inside the 3 s request
+the data path for up to 2 s (`resend_c3`, `av_call.rs:2413`), inside the 3 s request
 timeout.
 
-**Binding bursts are paced** (`send_binding_paced`, `av_call.rs:2737`): a
+**Binding bursts are paced** (`send_binding_paced`, `av_call.rs:2764`): a
 re-announced binding (about ten Channel messages on a base-MTU link) goes out
 one part per hold of the publisher lock, so publishing and forwarding run
 between its parts; a relay re-forwards it off its receive loop. **Unproven:**
@@ -280,7 +286,7 @@ what lost frame 12.
 **A lost answer never strands a commitment.** A `SUBSCRIBE` unanswered after
 `REQUEST_TIMEOUT_MS` (3 s) is withdrawn with `UNSUBSCRIBE`, or, when it was a
 standby asking for the primary role, with `SUBSCRIBE` standby
-(`selector.rs:980`, in `tick`). Without this a lost `ADMIT` leaves the forwarder
+(`selector.rs:1010`, in `tick`). Without this a lost `ADMIT` leaves the forwarder
 committed to a subscriber that does not know it, and its offers then show that
 subscriber no room, so it never asks again.
 

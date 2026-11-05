@@ -602,6 +602,7 @@ impl AlmState {
         bytes: u64,
         source_ms: u64,
         base_or_audio: bool,
+        hop_lost: u64,
     ) {
         if stream == self.own_stream {
             return;
@@ -624,16 +625,11 @@ impl AlmState {
         let Some(sel) = self.sels.get_mut(&stream) else {
             return;
         };
-        let role = sel
-            .subscriptions()
-            .into_iter()
-            .find(|(p, _)| p == from)
-            .map(|(_, r)| r);
-        let full = role == Some(Role::Primary);
         let chunk = PathChunk {
             pos: ChunkPos { epoch, seq },
-            full,
+            full: !base_or_audio,
             base_or_audio,
+            hop_lost,
             bytes,
             latency_ms: latency,
         };
@@ -1250,6 +1246,7 @@ mod tests {
     /// encoded and decoded as on a link, and which chunk reaches which path
     /// is what `own_exclude` and `forward_exclude` say, so a standby skips
     /// exactly what production skips. Time moves by shifting each clock.
+    #[allow(clippy::struct_excessive_bools)] // independent test switches
     struct Mesh {
         nodes: Vec<AlmState>,
         sa: StreamId,
@@ -1262,6 +1259,23 @@ mod tests {
         withhold_b: Option<u64>,
         /// Withhold every `n`th chunk of the relay's leg to B.
         withhold_standby: Option<u64>,
+        /// Whether A's leg to B is up.
+        a_to_b_up: bool,
+        /// A's leg to B is capped at the base layer (a host cap or a C5
+        /// shed: the dispatcher filters above it, before the hop counter).
+        a_caps_b: bool,
+        /// The relay's leg to B is capped at the base layer.
+        c_caps_b: bool,
+        /// Never send every `n`th base-or-audio chunk on A's leg to B.
+        withhold_base_b: Option<u64>,
+        /// Base-or-audio chunks A's fan-out has reached B's leg with.
+        base_to_b: u64,
+        /// Lose every `n`th chunk A's leg to B really sent, on the wire.
+        wire_lose_b: Option<u64>,
+        /// A's hop counter on the leg to B.
+        hop_to_b: u64,
+        /// Hop counters B has not seen a chunk for yet.
+        hop_gap_b: u64,
     }
 
     impl Mesh {
@@ -1293,6 +1307,14 @@ mod tests {
                 c_offers_to_b: true,
                 withhold_b: None,
                 withhold_standby: None,
+                a_to_b_up: true,
+                a_caps_b: false,
+                c_caps_b: false,
+                withhold_base_b: None,
+                base_to_b: 0,
+                wire_lose_b: None,
+                hop_to_b: 0,
+                hop_gap_b: 0,
             }
         }
 
@@ -1341,26 +1363,44 @@ mod tests {
             let (sa, epoch, seq) = (self.sa, self.epoch, self.seq);
             self.seq += 1;
             let at = crate::transport::av_chunk_auth::unix_ms_now();
+            // Tier 2: the chunk is sealed, its seq spent, and it goes nowhere.
+            if self.nodes[A].tier().own_call_audio_only() && !base_or_audio {
+                return;
+            }
             let legs = vec!["b".to_owned(), "c".to_owned()];
             let excluded = self.nodes[A].own_exclude(&legs, base_or_audio);
             self.nodes[A].on_own_published(CHUNK, base_or_audio);
-            let withheld = self.withhold_b.is_some_and(|n| seq % n == 0);
-            if !excluded.contains(&legs[0]) && !withheld {
+            let mut withheld = self.withhold_b.is_some_and(|n| seq % n == 0);
+            if base_or_audio {
+                self.base_to_b += 1;
+                withheld |= self
+                    .withhold_base_b
+                    .is_some_and(|n| self.base_to_b % n == 0);
+            }
+            let filtered = self.a_caps_b && !base_or_audio;
+            if !excluded.contains(&legs[0]) && !withheld && !filtered && self.a_to_b_up {
                 self.nodes[A].on_sent("b", CHUNK);
-                self.nodes[B].on_chunk(sa, "a", epoch, seq, CHUNK, at, base_or_audio);
+                self.hop_to_b += 1;
+                if self.wire_lose_b.is_some_and(|n| self.hop_to_b % n == 0) {
+                    self.hop_gap_b += 1;
+                } else {
+                    let lost = std::mem::take(&mut self.hop_gap_b);
+                    self.nodes[B].on_chunk(sa, "a", epoch, seq, CHUNK, at, base_or_audio, lost);
+                }
             }
             if excluded.contains(&legs[1]) {
                 return;
             }
             self.nodes[A].on_sent("c", CHUNK);
-            self.nodes[C].on_chunk(sa, "a", epoch, seq, CHUNK, at, base_or_audio);
+            self.nodes[C].on_chunk(sa, "a", epoch, seq, CHUNK, at, base_or_audio, 0);
             let c_legs = vec!["a".to_owned(), "b".to_owned()];
             let forward =
                 self.nodes[C].forward_exclude(sa, epoch, seq, "a", "a", &c_legs, base_or_audio);
-            let dropped = self.withhold_standby.is_some_and(|n| seq % n == 0);
+            let dropped = self.withhold_standby.is_some_and(|n| seq % n == 0)
+                || (self.c_caps_b && !base_or_audio);
             if forward.is_some_and(|skip| !skip.contains(&c_legs[1])) && !dropped {
                 self.nodes[C].on_sent("b", CHUNK);
-                self.nodes[B].on_chunk(sa, "c", epoch, seq, CHUNK, at, base_or_audio);
+                self.nodes[B].on_chunk(sa, "c", epoch, seq, CHUNK, at, base_or_audio, 0);
             }
         }
 
@@ -1663,5 +1703,177 @@ mod tests {
             "the clean standby took over: {p:?}\n{}",
             m.nodes[B].log_tail()
         );
+    }
+
+    /// #945 finding A: a closed link is a hard signal. B fails over on the
+    /// next tick, with no time for silence to pass, to the standby that is
+    /// still delivering. Mutation: `PeerHealth::update` reading "subscribed"
+    /// as "heard" flips Down to Recovering and no failover comes.
+    #[test]
+    fn a_primary_link_close_fails_over_at_once() {
+        let mut m = Mesh::new();
+        m.run(15_000, 2, |_| {});
+        let p = m.b_parents();
+        assert_eq!(p.primary.as_deref(), Some("a"), "{p:?}");
+        assert_eq!(p.standby.as_deref(), Some("c"), "{p:?}");
+
+        m.a_to_b_up = false;
+        m.nodes[B].on_parent_link_down("a");
+        m.tick();
+        let (p, log) = (m.b_parents(), m.nodes[B].log_tail());
+        assert_eq!(
+            m.nodes[B].log_count(DecisionKind::Failover),
+            1,
+            "one tick after the close, with no silence: {log}"
+        );
+        assert_eq!(p.primary.as_deref(), Some("c"), "{p:?}\n{log}");
+        assert_eq!(p.parent_changes, 1, "{p:?}\n{log}");
+    }
+
+    /// #945 finding A: a link that comes back before the failover does not
+    /// strand a parent in Down: a chunk that really arrives clears it.
+    #[test]
+    fn a_closed_link_that_delivers_again_recovers() {
+        let mut m = Mesh::new();
+        m.run(15_000, 2, |_| {});
+        m.nodes[B].on_parent_link_down("a");
+        assert_eq!(m.state_of("a"), Some(PeerState::Down));
+        m.advance(STEP_MS);
+        m.chunk(true);
+        m.tick();
+        assert_eq!(m.state_of("a"), Some(PeerState::Recovering));
+        assert_eq!(m.nodes[B].log_count(DecisionKind::Failover), 0);
+    }
+
+    /// B's primary A and standby C, with A's leg carrying `enhancement`
+    /// layers above the base.
+    fn settled(enhancement: u64) -> Mesh {
+        let mut m = Mesh::new();
+        m.run(15_000, enhancement, |_| {});
+        let p = m.b_parents();
+        assert_eq!(p.primary.as_deref(), Some("a"), "{p:?}");
+        assert_eq!(p.standby.as_deref(), Some("c"), "{p:?}");
+        m
+    }
+
+    /// Run on and give A's health per tick, the parents staying put.
+    fn primary_states(m: &mut Mesh, ms: u64, enhancement: u64) -> Vec<PeerState> {
+        let mut states = Vec::new();
+        m.run(ms, enhancement, |m| states.extend(m.state_of("a")));
+        states
+    }
+
+    /// #945 finding B: a leg capped at the base layer, by a C5 shed or a host
+    /// cap, skips the layers above it. The dispatcher filters them before the
+    /// hop counter and the standby delivers nothing A did not, so it is no
+    /// loss, the parents stay, and the cap's end changes nothing either.
+    #[test]
+    fn a_primary_capped_at_the_base_layer_reads_no_loss() {
+        let mut m = settled(2);
+        m.a_caps_b = true;
+        let capped = primary_states(&mut m, 20_000, 2);
+        m.a_caps_b = false;
+        let restored = primary_states(&mut m, 10_000, 2);
+        assert_eq!(degraded_ticks(&capped), 0, "capped: {capped:?}");
+        assert_eq!(degraded_ticks(&restored), 0, "restored: {restored:?}");
+        let p = m.b_parents();
+        assert_eq!(p.primary.as_deref(), Some("a"), "{p:?}");
+        assert_eq!(p.parent_changes, 0, "{}", m.nodes[B].log_tail());
+    }
+
+    /// #945 finding B: at tier 2 a publisher seals its layers and sends them
+    /// to nobody. No path owed them.
+    #[test]
+    fn a_publisher_shedding_its_own_layers_reads_no_loss_anywhere() {
+        let mut m = settled(2);
+        let _ = m.nodes[A].set_tier(ServiceTier::ChatAndContacts);
+        let (mut primary, mut standby) = (Vec::new(), Vec::new());
+        m.run(20_000, 2, |m| {
+            primary.extend(m.state_of("a"));
+            standby.extend(m.state_of("c"));
+        });
+        assert_eq!(degraded_ticks(&primary), 0, "primary: {primary:?}");
+        assert_eq!(degraded_ticks(&standby), 0, "standby: {standby:?}");
+        assert_eq!(m.b_parents().parent_changes, 0);
+    }
+
+    /// #945 finding B: the other side of the two above. A capped leg that
+    /// really drops base chunks reads lossy and gives way to the clean
+    /// standby. The chunks are never sent, so no hop counter shows them: only
+    /// the standby's delivery of what A went past does. Mutation: dropping
+    /// that reading makes this path clean, and the call stays on it.
+    #[test]
+    fn a_capped_primary_that_drops_base_chunks_is_lossy() {
+        let mut m = settled(2);
+        m.a_caps_b = true;
+        m.withhold_base_b = Some(4);
+        let states = primary_states(&mut m, 30_000, 2);
+        assert!(degraded_ticks(&states) > 0, "{states:?}");
+        assert!(
+            m.b_parents().parent_changes > 0,
+            "{}",
+            m.nodes[B].log_tail()
+        );
+    }
+
+    /// #945 finding B: the same drop on an uncapped primary, one base chunk in
+    /// four among two enhancement layers each. Reading it over every chunk
+    /// that arrived would dilute it below the threshold: base and audio are
+    /// measured against base and audio.
+    #[test]
+    fn dropped_base_chunks_are_not_diluted_by_the_layers_above() {
+        let mut m = settled(8);
+        m.withhold_base_b = Some(6);
+        let states = primary_states(&mut m, 12_000, 8);
+        assert!(degraded_ticks(&states) > 0, "{states:?}");
+    }
+
+    /// #945 finding B: with no second path, the hop counter is the reading: a
+    /// sent chunk that never arrived is loss whatever its layer, here on a
+    /// capped leg where every `chunk_seq` gap also means nothing. Mutation:
+    /// ignoring `hop_lost` reads this path clean.
+    #[test]
+    fn a_sole_capped_path_reads_its_hop_gaps() {
+        let mut m = Mesh::new();
+        m.c_offers_to_b = false;
+        m.run(15_000, 2, |_| {});
+        assert_eq!(m.b_parents().primary.as_deref(), Some("a"));
+        assert_eq!(m.b_parents().standby, None);
+        m.a_caps_b = true;
+        m.wire_lose_b = Some(5);
+        let states = primary_states(&mut m, 8_000, 2);
+        assert!(degraded_ticks(&states) > 0, "{states:?}");
+    }
+
+    /// #945 finding B: at the call layer `full` was the link's role, so a
+    /// make-before-break confirmed on any chunk. C can only send B the base
+    /// layer, so promoting it would lose the video: it must not confirm.
+    #[test]
+    fn a_make_before_break_does_not_confirm_on_base_chunks() {
+        let mut m = settled(2);
+        m.c_caps_b = true;
+        m.withhold_b = Some(4);
+        m.run(30_000, 2, |_| {});
+        let log = m.nodes[B].log_tail();
+        assert_eq!(m.nodes[B].log_count(DecisionKind::Switch), 0, "{log}");
+        assert!(
+            m.nodes[B].log_count(DecisionKind::PromoteStart) > 0,
+            "{log}"
+        );
+        assert!(log.contains("promote failed"), "{log}");
+        assert_eq!(m.b_parents().primary.as_deref(), Some("a"), "{log}");
+    }
+
+    /// #945 finding B: a stream with nothing above the base has no other
+    /// chunk to confirm on. Mutation: requiring an enhancement chunk strands
+    /// every audio-only call on a lossy parent.
+    #[test]
+    fn a_make_before_break_confirms_when_nothing_is_layered() {
+        let mut m = settled(0);
+        m.withhold_b = Some(4);
+        m.run(30_000, 0, |_| {});
+        let log = m.nodes[B].log_tail();
+        assert!(m.nodes[B].log_count(DecisionKind::Switch) > 0, "{log}");
+        assert!(m.b_parents().parent_changes > 0, "{log}");
     }
 }
