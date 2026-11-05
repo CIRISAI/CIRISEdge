@@ -635,7 +635,9 @@ async fn identity_plane_rows_admit_while_a_scoped_link_is_live_728() {
     );
 
     // And A's ROUND toward B completes within the bound — the same selection,
-    // through the scheduler.
+    // through the scheduler. v44: that round is read off the runtime's own
+    // events, so an open wake clock closes on it.
+    p.a.metrics.telemetry.note_woken();
     let sweeps = drive_a_until(&p, Duration::from_secs(60), || async {
         completed_rounds(&p.a.metrics) >= 1
     })
@@ -645,6 +647,13 @@ async fn identity_plane_rows_admit_while_a_scoped_link_is_live_728() {
         "A's round toward B must COMPLETE within {ROUND_BOUND} sweeps (took {sweeps:?}); \
          outcomes={:?}",
         p.a.metrics.snapshot().replication_round_outcomes_total
+    );
+    assert_eq!(
+        p.a.metrics
+            .snapshot()
+            .wake_first_round_duration_seconds
+            .count,
+        1
     );
 
     // Nothing B received from A was refused on plane, and nothing was

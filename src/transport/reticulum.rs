@@ -4916,10 +4916,18 @@ impl ReticulumTransport {
         if let Some(m) = metrics {
             // First handle wins (CIRISEdge#809): a bag set here is the one
             // `Edge::spawn_background_listeners` finds already attached.
-            let _ = self.metrics.set(m);
+            self.adopt_metrics(m);
         }
         self.report_signer_id_mismatch();
         self
+    }
+
+    /// Hand the bag to everything that counts into it. Both doors come here,
+    /// so a part cannot be left counting into nothing.
+    fn adopt_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        self.keyer.attach_metrics(metrics.clone());
+        self.shapers.attach_metrics(metrics.clone());
+        let _ = self.metrics.set(metrics);
     }
 
     /// CIRISEdge#437 — register (or replace) a peer's presented
@@ -10306,9 +10314,7 @@ impl Transport for ReticulumTransport {
     /// Edge's. The listener's per-event context reads the slot on every
     /// event, so an attach before `listen` is seen by the first one.
     fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
-        self.keyer.attach_metrics(metrics.clone());
-        self.shapers.attach_metrics(metrics.clone());
-        let _ = self.metrics.set(metrics);
+        self.adopt_metrics(metrics);
         self.report_signer_id_mismatch();
     }
 

@@ -245,8 +245,9 @@ impl Keyer {
     /// Count into the node's bag, the one the host reads: the seals' keyer is
     /// built before the Edge's bag exists.
     pub fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
-        metrics.telemetry.set_keyer_workers(self.workers, 0);
-        let _ = self.metrics.set(metrics);
+        if self.metrics.set(metrics).is_ok() {
+            self.publish(&self.queues());
+        }
     }
 
     /// The gauges, set where the queues change, under their lock: a load, not

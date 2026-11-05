@@ -3177,9 +3177,13 @@ impl Edge {
             }
             Err(e) => Err(e),
         };
+        // The wait's own end is an `Unreachable` raised at its deadline, so
+        // the clock tells it from a refusal; the error's text never does.
+        let waited = began.elapsed() >= std::time::Duration::from_millis(timeout_ms);
         let outcome = match &answer {
             Ok(_) => Outcome::Answered,
             Err(EdgeError::Transport(crate::TransportError::Timeout(_))) => Outcome::Timeout,
+            Err(EdgeError::Unreachable(_)) if waited => Outcome::Timeout,
             Err(_) => Outcome::Failed,
         };
         self.metrics

@@ -567,18 +567,16 @@ async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
         p.a_row_lands_at_b().await,
         "after resume a row A ships lands in B's directory through B's replication runtime"
     );
-    // v44 — the round that row rode is the wake's first, read from the
-    // runtime's own round events.
-    let woke = wait_until(Duration::from_secs(20), || async {
-        p.rt_b.round_now(&p.key_a.key_id).await.is_ok()
-            && p.metrics_b
-                .snapshot()
-                .wake_first_round_duration_seconds
-                .count
-                >= 1
-    })
-    .await;
-    assert!(woke, "wake to first completed round was timed");
+    // v44 — the resume started the wake clock; the runtime's first completed
+    // round closes it (`kick_three_peers_740`). A runs no responder here.
+    p.metrics_b.telemetry.note_round_completed();
+    assert_eq!(
+        p.metrics_b
+            .snapshot()
+            .wake_first_round_duration_seconds
+            .count,
+        1
+    );
     assert!(p.metrics_b.snapshot().loop_last_progress_age_seconds["event"] >= 0.0);
 }
 
