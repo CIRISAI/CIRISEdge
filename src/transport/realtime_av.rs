@@ -1054,6 +1054,34 @@ mod tests {
         EpochDek::from_bytes([3u8; 32])
     }
 
+    /// CC 5.3.3.2.1: `0xFF` is `{ 0, 0, 0 }`, refused by name otherwise, and a
+    /// layered codec keeps its layers.
+    #[test]
+    fn an_opaque_chunk_with_a_layer_is_refused_at_the_seal() {
+        let enhanced = ChunkLayer {
+            spatial: 1,
+            temporal: 0,
+            quality: 0,
+        };
+        let seal = |codec, layer| {
+            seal_av_inner(
+                b"frame",
+                &dummy_dek(),
+                dummy_stream(),
+                Epoch(1),
+                ChunkSeq(1),
+                codec,
+                layer,
+            )
+        };
+        assert!(matches!(
+            seal(CODEC_OPAQUE, enhanced),
+            Err(RealtimeAvError::OpaqueWithLayer(_))
+        ));
+        assert!(seal(CODEC_OPAQUE, ChunkLayer::BASE).is_ok());
+        assert!(seal(CODEC_AV1_SVC, enhanced).is_ok());
+    }
+
     fn dummy_transit() -> [u8; 32] {
         [11u8; 32]
     }
