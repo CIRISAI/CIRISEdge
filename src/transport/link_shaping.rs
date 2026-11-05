@@ -1728,6 +1728,10 @@ pub struct LinkShapers {
     /// Test seam: key-id prefixes that are seats (the harness's nodes are not
     /// in any signed bundle).
     seat_prefixes: Mutex<Vec<String>>,
+    /// Test seam: the most bytes a frame offered here may carry; 0 is no cap.
+    /// A rate is bytes over frame, so a small frame gives a witness the events
+    /// a statistical bound needs.
+    test_frame_cap: std::sync::atomic::AtomicUsize,
     links: Mutex<HashMap<[u8; 16], Arc<LinkShaper>>>,
     /// Links this node sent an offer on, with that offer.
     offered: Mutex<HashMap<[u8; 16], ShapingOffer>>,
@@ -1858,6 +1862,7 @@ impl LinkShapers {
             link_peer: Mutex::new(HashMap::new()),
             bulk: Mutex::new(std::collections::HashSet::new()),
             over_cap: std::sync::atomic::AtomicBool::new(false),
+            test_frame_cap: std::sync::atomic::AtomicUsize::new(0),
             peer_free: Mutex::new(HashMap::new()),
             reports_capacity: std::sync::atomic::AtomicBool::new(false),
             relay_offering: std::sync::atomic::AtomicBool::new(false),
@@ -2684,12 +2689,23 @@ impl LinkShapers {
         peer: Option<&str>,
     ) -> ShapingOffer {
         let policy = self.policy();
+        let cap = self.test_frame_cap.load(Ordering::Relaxed);
+        let frame_bytes = if cap > 0 {
+            frame_bytes.min(cap)
+        } else {
+            frame_bytes
+        };
         let offer = self.quote(&policy, frame_bytes, peer, self.is_layer_peer(peer));
         if let Some(p) = peer {
             self.link_peer().insert(link, p.to_owned());
         }
         self.offered().insert(link, offer);
         offer
+    }
+
+    /// Test seam: cap the frame this node offers.
+    pub fn set_frame_cap_for_test(&self, bytes: usize) {
+        self.test_frame_cap.store(bytes, Ordering::Relaxed);
     }
 
     /// What `policy` offers a link to `peer` at `frame_bytes`: one answer for a

@@ -2615,6 +2615,13 @@ pub struct ReticulumTransport {
     /// node's pair, and every link's keys. Every frame on every link is sealed
     /// and opened here.
     seals: Arc<crate::transport::link_seal::LinkSeals>,
+    /// CIRISEdge#947 — the bounded pool that runs handshakes' decapsulations
+    /// off the event path ([`crate::transport::link_keying`]).
+    keyer: Arc<crate::transport::link_keying::Keyer>,
+    /// CIRISEdge#947 — the keyer's outcomes, applied by the event loop. Here
+    /// rather than in the listen run: a suspend ends a run, and an outcome
+    /// outlives it.
+    keying_done: Mutex<mpsc::UnboundedReceiver<crate::transport::link_keying::KeyingDone>>,
     /// CC 5.4.3 — the shaped links and this node's shaping policy
     /// ([`crate::transport::link_shaping`]).
     shapers: Arc<crate::transport::link_shaping::LinkShapers>,
@@ -3492,6 +3499,7 @@ impl ReticulumTransport {
             transit_kex,
             config.local_key_id.clone(),
         ));
+        let (keyer, keying_done) = crate::transport::link_keying::Keyer::new(Arc::clone(&seals));
         // CC 5.4.3 — the shaped-link table under this node's policy.
         let (homing_tx, homing_rx) = mpsc::channel(HOMING_QUEUE);
         let shapers = Arc::new(crate::transport::link_shaping::LinkShapers::new(
@@ -4098,6 +4106,8 @@ impl ReticulumTransport {
             local_signer,
             self_route,
             seals,
+            keyer,
+            keying_done: Mutex::new(keying_done),
             shapers,
             onion,
             handshake_override: Arc::new(std::sync::Mutex::new(None)),
@@ -5776,6 +5786,54 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub fn set_route_request_cap_for_test(&self, cap: u32) {
         self.seals.set_route_request_cap(cap);
+    }
+
+    /// CIRISEdge#947 test seam — every decapsulation on this node takes this
+    /// long, off the event path.
+    #[doc(hidden)]
+    pub fn set_decap_delay_for_test(&self, delay: Duration) {
+        self.seals.set_decap_delay(delay);
+    }
+
+    /// Test seam — cap the frame this node offers on a shaped link, so a rate
+    /// witness on a real link sees enough frames to bound.
+    #[doc(hidden)]
+    pub fn set_shaped_frame_cap_for_test(&self, bytes: usize) {
+        self.shapers.set_frame_cap_for_test(bytes);
+    }
+
+    /// CIRISEdge#947 test seam — a responder's first words on a keyed link
+    /// wait this long first, as they do on a link whose peer withholds its
+    /// Channel proofs.
+    #[doc(hidden)]
+    pub fn set_first_words_delay_for_test(&self, delay: Duration) {
+        self.seals.set_first_words_delay(delay);
+    }
+
+    /// CIRISEdge#947 test seam — the node-wide rate of strangers' handshakes
+    /// per window.
+    #[doc(hidden)]
+    pub fn set_stranger_handshake_cap_for_test(&self, cap: u32) {
+        self.seals.set_stranger_handshake_cap(cap);
+    }
+
+    /// CIRISEdge#947 test seam — the caps on links awaiting a handshake.
+    #[doc(hidden)]
+    pub fn set_awaiting_caps_for_test(&self, links: usize, bytes: usize) {
+        self.seals.set_awaiting_caps(links, bytes);
+    }
+
+    /// CIRISEdge#947 test seam — decapsulations this node has run.
+    #[doc(hidden)]
+    pub fn decapsulations_for_test(&self) -> u64 {
+        self.seals.decapsulations()
+    }
+
+    /// CIRISEdge#947 test seam — handshakes waiting for a keyer worker, and
+    /// the pool's size.
+    #[doc(hidden)]
+    pub fn keyer_load_for_test(&self) -> (usize, usize) {
+        (self.keyer.depth(), self.keyer.workers())
     }
 
     /// CC 5.3.3.5 E1 test seam — start (or stop and clear) recording every
@@ -10598,23 +10656,38 @@ impl ReticulumTransport {
             direct_paths: &self.direct_paths,
             alm_links: &self.alm_links,
             seals: &self.seals,
+            keyer: &self.keyer,
             shapers: &self.shapers,
             onion: &self.onion,
         };
+        let mut keying_done = self.keying_done.lock().await;
         let exit = loop {
             tokio::select! {
                 // Lifecycle — a suspend: handle what the link closes already
                 // queued (so the pool and attribution maps forget the closed
                 // links), then stop. The timers above end with this run.
                 () = self.lifecycle.park_signal() => {
+                    while let Ok(done) = keying_done.try_recv() {
+                        apply_keying(done, &ctx).await;
+                    }
                     while let Ok(event) = events.try_recv() {
                         handle_event(event, &ctx).await;
                     }
                     break ListenExit::Park;
                 }
-                _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution() => {
+                // CIRISEdge#947 — a handshake's decapsulation came back. The
+                // outcome is applied here, on the one thread of control that
+                // handles the link's frames.
+                Some(done) = keying_done.recv() => {
+                    apply_keying(done, &ctx).await;
+                }
+                _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution()
+                    || ctx.seals.any_deferred() => {
                     for link in ctx.seals.awaiting_attribution() {
                         release_held(&ctx, LinkId::new(link)).await;
+                    }
+                    for job in ctx.seals.take_overdue_deferred() {
+                        gate_handshake(&ctx, LinkId::new(job.link()), job).await;
                     }
                 }
                 _ = seat_tick.tick() => {
@@ -13374,6 +13447,8 @@ struct EventCtx<'a> {
     /// CC 5.3.3.5 E1 — see `ReticulumTransport::seals`. An `Arc` so a link's
     /// handshake budget can outlive the event that armed it.
     seals: &'a Arc<crate::transport::link_seal::LinkSeals>,
+    /// CIRISEdge#947 — see `ReticulumTransport::keyer`.
+    keyer: &'a Arc<crate::transport::link_keying::Keyer>,
     /// CC 5.4.3 — see `ReticulumTransport::shapers`.
     shapers: &'a Arc<crate::transport::link_shaping::LinkShapers>,
     /// CC 5.4.6 — the Anonymous Tier: inbound onion frames are its.
@@ -15185,7 +15260,8 @@ async fn verify_route_answer(
 /// CC 5.3.3.5 E1 pre-seal route fetch (CLM-pre-seal-route-fetch) — the
 /// responder's half. A peer-dialled link's first frame was a route request
 /// that already passed the receiver order ([`LinkSeals::inbound`]: once per
-/// link, the node-wide rate, both before the request was read). This node
+/// link, the sender's rate and the node-wide rate, all before the request was
+/// read). This node
 /// answers ONLY for its own occurrence key, ONLY with its own live
 /// hybrid-signed route row carrying a transit pair (and its `key:record:v1`
 /// row when the dialler said it lacks the key), as `CTKA` frames on the
@@ -15211,18 +15287,11 @@ async fn answer_route_request(
     // A/V link is to a derived address, and answering "not ours" versus a
     // signed row there would tell a prober which identity owns it.
     let (_, plane) = resolve_inbound_link(ctx, &link_id).await;
-    let sender = ctx
-        .node
-        .get_remote_identity(&link_id)
-        .map(|id| hex::encode(id.hash()));
     let built: Result<Vec<Vec<u8>>, RouteFetchError> = async {
         crate::transport::route_fetch::route_request_plane_allowed(matches!(
             plane,
             LinkPlane::Identity
         ))?;
-        if !ctx.seals.admit_route_sender(sender.as_deref()) {
-            return Err(RouteFetchError::RateLimited);
-        }
         if key_id != ctx.local_key_id {
             return Err(RouteFetchError::NotOurs {
                 asked: key_id.to_owned(),
@@ -15351,6 +15420,7 @@ fn note_responder_link(ctx: &EventCtx<'_>, link_id: LinkId, we_dialled: bool) {
     if we_dialled || !ctx.seals.begin_responder(link_id.into_bytes()) {
         return;
     }
+    close_evicted(ctx);
     let node = Arc::clone(ctx.av_node);
     let seals = Arc::clone(ctx.seals);
     let metrics = ctx.metrics.cloned();
@@ -15361,6 +15431,11 @@ fn note_responder_link(ctx: &EventCtx<'_>, link_id: LinkId, we_dialled: bool) {
         // this node answered gets the fetch budget from that request: the
         // answer crosses, then the dialler's handshake.
         if let Some(left) = seals.route_budget_left(link_id.into_bytes()) {
+            tokio::time::sleep(left).await;
+        }
+        // CIRISEdge#947 — a handshake that arrived in time is judged by its
+        // keying, which gets a budget of its own from then.
+        if let Some(left) = seals.keying_budget_left(link_id.into_bytes()) {
             tokio::time::sleep(left).await;
         }
         if seals.expire(link_id.into_bytes()) {
@@ -15381,6 +15456,166 @@ fn note_responder_link(ctx: &EventCtx<'_>, link_id: LinkId, we_dialled: bool) {
             seals.forget(&link_id.into_bytes());
         }
     });
+}
+
+/// CIRISEdge#947 — refuse a link at the gate in front of the keyer, or at
+/// the `Awaiting` cap: counted under its name, said at WARN under the choke
+/// point's throttle (a flood makes one of these per link, and #508 showed what
+/// a per-event WARN does there), marked refused, and closed off the event path.
+/// The close is the dialler's signal: the responder may not speak first, and
+/// its dial path re-dials a link that closes.
+fn admission_refused(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    refusal: &crate::transport::link_seal::SealRefusal,
+) {
+    if let Some(m) = ctx.metrics {
+        m.inc_link_seal(refusal.label());
+    }
+    drop_inbound(Some(link_id), refusal.label(), &refusal.to_string());
+    ctx.seals.refuse(link_id.into_bytes());
+    let node = Arc::clone(ctx.av_node);
+    tokio::spawn(async move {
+        let _ = node.close_link(&link_id).await;
+    });
+}
+
+/// CIRISEdge#947 — close the links the `Awaiting` cap just refused.
+fn close_evicted(ctx: &EventCtx<'_>) {
+    for link in ctx.seals.take_evicted() {
+        admission_refused(
+            ctx,
+            LinkId::new(link),
+            &crate::transport::link_seal::SealRefusal::AwaitingCap,
+        );
+    }
+}
+
+/// CIRISEdge#947 — whether a proven transport identity is bound to a key this
+/// node already answers for, read from live tables and never the directory (it
+/// runs on the event path): a Rooted binding, or a key that owns its binding
+/// and holds a seat on the active roster or a room or contact standing. A bare
+/// announce is an `Advisory` binding, free to mint, and earns nothing here.
+async fn identity_has_standing(ctx: &EventCtx<'_>, identity_hash: &[u8; 16]) -> bool {
+    use ciris_persist::federation::self_at_login::BindingProvenance;
+    let peers = ctx.peers.lock().await;
+    identified_candidates(&peers, identity_hash)
+        .iter()
+        .any(|(key, _)| {
+            peers.get(key).is_some_and(|rp| {
+                matches!(rp.provenance, BindingProvenance::Rooted)
+                    || (rp.owns_key
+                        && (ctx.shapers.is_seat(key)
+                            || direct_standing(
+                                ctx.scope_addresses.get().map(Arc::as_ref),
+                                ctx.direct_paths,
+                                key,
+                            )))
+            })
+        })
+}
+
+/// CIRISEdge#947 — a complete handshake arrived. On a link with no proven
+/// identity yet it waits a moment for the LINKIDENTIFY that was sent ahead of
+/// it (the `LinkIdentified` arm, or the grace on the attribution tick): judged
+/// now, a peer with standing would be judged as whoever lost that race.
+async fn admit_handshake(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    job: crate::transport::link_seal::HandshakeJob,
+) {
+    let job = if ctx.node.get_remote_identity(&link_id).is_some() {
+        job
+    } else {
+        match ctx.seals.defer_handshake(job) {
+            Ok(()) => return,
+            Err(job) => job,
+        }
+    };
+    gate_handshake(ctx, link_id, job).await;
+}
+
+/// CIRISEdge#947 — CC 5.3.3.5: a complete handshake goes behind the receiver
+/// order and into the keyer. No decapsulation, and no parse past the tag,
+/// happens on the event path. See [`crate::transport::link_keying`].
+async fn gate_handshake(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    job: crate::transport::link_seal::HandshakeJob,
+) {
+    let identity = ctx.node.get_remote_identity(&link_id).map(|id| *id.hash());
+    let standing = match &identity {
+        Some(hash) => identity_has_standing(ctx, hash).await,
+        None => false,
+    };
+    let sender = identity.map(hex::encode);
+    let admitted = ctx
+        .seals
+        .admit_handshake(crate::transport::link_keying::Sender {
+            identity: sender.as_deref(),
+            standing,
+        })
+        .and_then(|()| ctx.keyer.submit(job, standing));
+    if let Err(refusal) = admitted {
+        admission_refused(ctx, link_id, &refusal);
+    }
+}
+
+/// CIRISEdge#947 — apply one keying's outcome on the event loop: the link
+/// keys, the responder speaks, then the frames that waited run through the
+/// event path in arrival order. Called only from the event loop, so nothing on
+/// this link can land between these steps. A link whose fate overtook its
+/// keying has already been counted and closed.
+async fn apply_keying(done: crate::transport::link_keying::KeyingDone, ctx: &EventCtx<'_>) {
+    use crate::transport::link_seal::Inbound;
+    let link = done.link;
+    let link_id = LinkId::new(link);
+    if let Some(m) = ctx.metrics {
+        m.inc_link_seal(crate::observability::LINK_SEAL_DECAPSULATED);
+    }
+    match ctx.seals.finish_keying(link, done.ticket, done.outcome) {
+        Inbound::Keyed { claimed } => {
+            link_keyed(ctx, link_id, claimed).await;
+            replay_before_keys(ctx, link_id).await;
+        }
+        Inbound::Refuse(r) => seal_teardown(ctx, link_id, &r).await,
+        // choke-ok: the outcome lost to a close, a refusal or the budget,
+        // each of which counted itself and let go of what the link held.
+        _ => {}
+    }
+    for event in ctx.seals.take_parked(link) {
+        handle_event(event, ctx).await;
+    }
+}
+
+/// CIRISEdge#947 — a frame event on a keying link waits for the outcome; every
+/// other event passes. `None` means it was taken.
+async fn park_while_keying(event: NodeEvent, ctx: &EventCtx<'_>) -> Option<NodeEvent> {
+    let (link_id, bytes) = match &event {
+        NodeEvent::MessageReceived { link_id, data, .. }
+        | NodeEvent::LinkDataReceived { link_id, data }
+        | NodeEvent::RequestReceived { link_id, data, .. }
+        | NodeEvent::ResourceCompleted {
+            link_id,
+            data,
+            is_sender: false,
+            ..
+        } => (*link_id, data.len()),
+        _ => return Some(event),
+    };
+    if !ctx.seals.is_keying(link_id.into_bytes()) {
+        return Some(event);
+    }
+    match ctx.seals.park(link_id.into_bytes(), event, bytes) {
+        Ok(()) => {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_seal(crate::observability::LINK_SEAL_HELD_DURING_KEYING);
+            }
+        }
+        Err(refusal) => admission_refused(ctx, link_id, &refusal),
+    }
+    // choke-ok: replayed by `apply_keying`, or the link refused by name.
+    None
 }
 
 /// CC 5.3.3.5 E1 — THE CLAIM: on a link this node RESPONDED on, the
@@ -15454,16 +15689,23 @@ async fn seal_inbound(
     note_responder_link(ctx, link_id, we_dialled);
     let link = link_id.into_bytes();
     let outcome = if lane == Lane::Channel {
-        ctx.seals.inbound(link, lane, data, we_dialled)
+        // Only a route request reads its sender, so only one pays for it.
+        let sender = crate::transport::route_fetch::is_route_request(data)
+            .then(|| ctx.node.get_remote_identity(&link_id))
+            .flatten()
+            .map(|id| hex::encode(id.hash()));
+        ctx.seals
+            .inbound(link, lane, data, we_dialled, sender.as_deref())
     } else {
         ctx.seals.open(link, lane, data)
     };
+    close_evicted(ctx);
     match outcome {
         Inbound::Open(plain) => shaped_inbound(ctx, link_id, lane, plain).await,
-        Inbound::Pending | Inbound::Closed | Inbound::RouteAnswered => None,
-        Inbound::Keyed { claimed } => {
-            link_keyed(ctx, link_id, claimed).await;
-            replay_before_keys(ctx, link_id).await;
+        // `Keyed` comes only from `finish_keying`, which `apply_keying` reads.
+        Inbound::Pending | Inbound::Closed | Inbound::RouteAnswered | Inbound::Keyed { .. } => None,
+        Inbound::Handshake(job) => {
+            admit_handshake(ctx, link_id, job).await;
             None
         }
         Inbound::RouteRequested {
@@ -16287,6 +16529,7 @@ async fn replay_before_keys(ctx: &EventCtx<'_>, link_id: LinkId) {
             // choke-ok: the link closed (or was refused) under the hold.
             Inbound::Closed
             | Inbound::Pending
+            | Inbound::Handshake(_)
             | Inbound::Keyed { .. }
             | Inbound::RouteRequested { .. }
             | Inbound::RouteAnswered
@@ -16295,6 +16538,34 @@ async fn replay_before_keys(ctx: &EventCtx<'_>, link_id: LinkId) {
             }
         }
     }
+}
+
+/// CIRISEdge#436/#627 — responder side: our announce rides the peer's link
+/// back to it, first, then the bundle. Not on a scoped link: those are
+/// identity-plane control frames (#728).
+///
+/// CIRISEdge#947 — off the event loop. These are Channel sends, and the
+/// Channel opens at a window of two: on a link whose peer withholds its proofs
+/// each send waits out [`CHANNEL_FRAGMENT_SEND_TIMEOUT`]. On the event loop
+/// that was seconds of every link's traffic, per keyed link, for the price of
+/// a handshake the receiver order had to admit. Admission bounds these tasks.
+/// Anything else this node sends on the link now rides beside these frames,
+/// which the fragment ids and the shaper's transition window already allow.
+fn spawn_first_words(ctx: &EventCtx<'_>, link_id: LinkId) {
+    let node = Arc::clone(ctx.av_node);
+    let seals = Arc::clone(ctx.seals);
+    let shapers = Arc::clone(ctx.shapers);
+    let announce = ctx.own_announce_frame.map(<[u8]>::to_vec);
+    let bundle = ctx.own_bundle.cloned();
+    tokio::spawn(async move {
+        seals.first_words_delay().await;
+        if let Some(frame) = &announce {
+            push_own_announce_frame(&node, &seals, &shapers, frame, &link_id).await;
+        }
+        if let Some(own) = &bundle {
+            push_own_bundle_frames(&node, &seals, &shapers, own, &link_id).await;
+        }
+    });
 }
 
 /// CC 5.3.3.5 E1 — a peer-dialled link's handshake was answered: the link is
@@ -16328,17 +16599,7 @@ async fn link_keyed(ctx: &EventCtx<'_>, link_id: LinkId, claimed: String) {
     );
     let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
     match plane {
-        LinkPlane::Identity => {
-            // CIRISEdge#436/#627 — responder side: our announce rides the
-            // peer's link back to it, FIRST, then the bundle. Not on a scoped
-            // link: those are identity-plane control frames (#728).
-            if let Some(frame) = ctx.own_announce_frame {
-                push_own_announce_frame(ctx.node, ctx.seals, ctx.shapers, frame, &link_id).await;
-            }
-            if let Some(own) = ctx.own_bundle {
-                push_own_bundle_frames(ctx.node, ctx.seals, ctx.shapers, own, &link_id).await;
-            }
-        }
+        LinkPlane::Identity => spawn_first_words(ctx, link_id),
         LinkPlane::Av => deliver_av_frame(ctx, link_id, dest, None).await,
         LinkPlane::Scoped => {}
     }
@@ -16346,6 +16607,11 @@ async fn link_keyed(ctx: &EventCtx<'_>, link_id: LinkId, claimed: String) {
 
 #[allow(clippy::too_many_lines)] // one exhaustive NodeEvent dispatch match; splitting it hurts readability
 async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
+    let Some(event) = park_while_keying(event, ctx).await else {
+        // choke-ok: held for replay by `apply_keying`, or the link refused by
+        // name; `park_while_keying` counts both.
+        return;
+    };
     match event {
         NodeEvent::AnnounceReceived { announce, .. } => {
             // CIRISEdge#627 — Stage 1 inline (directory-free; a parse, a
@@ -16466,6 +16732,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         } => {
             // CIRISEdge#853 — a link whose `LinkEstablished` edge never saw.
             recover_unknown_link(ctx, link_id).await;
+            // CIRISEdge#947 — a handshake that beat this identify is judged now.
+            if let Some(job) = ctx.seals.take_deferred(link_id.into_bytes()) {
+                gate_handshake(ctx, link_id, job).await;
+            }
             // CIRISEdge#34 link half (v0.14.0) — emit `link_identified`
             // event with the peer's truncated identity hash. The peer
             // proved its identity over an already-established link via

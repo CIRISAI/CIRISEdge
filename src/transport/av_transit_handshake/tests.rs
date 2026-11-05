@@ -273,3 +273,19 @@ fn only_a_sixteen_byte_link_id_is_bound() {
         Err(AvHandshakeError::LinkIdLength(_))
     ));
 }
+
+/// CIRISEdge#947 — a START frame declaring the most a responder reassembles
+/// reserves nothing it did not receive: half-open links pin what they sent.
+#[test]
+fn a_start_frame_pins_nothing_it_did_not_send_947() {
+    let mut r = Reassembler::new();
+    let frame = fragment(&vec![7u8; MAX_HANDSHAKE_BYTES], 400).expect("frames");
+    assert!(matches!(r.push(&frame[0]), Ok(None)));
+    assert_eq!(r.buffered(), frame[0].len() - START_HEADER_LEN);
+    assert!(
+        r.buf.capacity() <= frame[0].len(),
+        "capacity {} for {} bytes received",
+        r.buf.capacity(),
+        r.buffered()
+    );
+}
