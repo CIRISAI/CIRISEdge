@@ -331,6 +331,7 @@ async fn mesh(tag: &str, n: usize) -> (Vec<Node>, Vec<CohortGroup>, tempfile::Te
 /// and the last node connects only to node 1, which forwards. A direct
 /// neighbour would hear node 0 anyway (leviculum re-announces on interface-up),
 /// so behind the hop it has heard nothing and holds only the signed route.
+#[allow(clippy::too_many_lines)] // the mesh, the routes, the room, in one sequence
 async fn mesh_with(
     tag: &str,
     n: usize,

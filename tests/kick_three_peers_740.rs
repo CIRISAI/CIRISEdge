@@ -677,8 +677,9 @@ async fn a_dead_peer_cannot_starve_a_live_one_of_rounds() {
             .any(|(dest, _, _)| *dest == dead_dest)
     };
     let known = tokio::time::timeout(Duration::from_secs(90), async {
-        while !(hub_t.knows_peer(&live.key_id).await
-            && hub_t.knows_peer(&dead.key_id).await
+        // Asked, not awaited: a relay under load holds announces (#945).
+        while !(hub_t.seek_peer(&live.key_id).await
+            && hub_t.seek_peer(&dead.key_id).await
             && hub_has_path_to_dead()
             && dead_t.knows_peer(&hub.key_id).await
             && live_t.knows_peer(&hub.key_id).await)

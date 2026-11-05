@@ -324,27 +324,26 @@ impl<'a> RoundSeat<'a> {
         bound: Duration,
         send: impl std::future::Future<Output = Result<T, CoordinatorError>>,
     ) -> Result<T, RoundError> {
-        let send = tokio::time::timeout(bound, send);
-        tokio::pin!(send);
-        let sent = match tokio::time::timeout(hold, &mut send).await {
-            Ok(sent) => sent,
-            Err(_) => {
-                self.permit = None;
-                tracing::debug!(
-                    peer = %self.peer_id,
-                    kind = %self.kind,
-                    hold_ms = u64::try_from(hold.as_millis()).unwrap_or(u64::MAX),
-                    "round send still parked — its permit goes back to the gate"
-                );
-                let sent = send.await;
-                // Only a round that goes on reads again.
-                if matches!(sent, Ok(Ok(_))) {
-                    self.permit = Some(self.gate.enter(self.peer_id, self.kind).await);
-                }
-                sent
+        let bounded = tokio::time::timeout(bound, send);
+        tokio::pin!(bounded);
+        let outcome = if let Ok(landed) = tokio::time::timeout(hold, &mut bounded).await {
+            landed
+        } else {
+            self.permit = None;
+            tracing::debug!(
+                peer = %self.peer_id,
+                kind = %self.kind,
+                hold_ms = u64::try_from(hold.as_millis()).unwrap_or(u64::MAX),
+                "round send still parked — its permit goes back to the gate"
+            );
+            let landed = bounded.await;
+            // Only a round that goes on reads again.
+            if matches!(landed, Ok(Ok(_))) {
+                self.permit = Some(self.gate.enter(self.peer_id, self.kind).await);
             }
+            landed
         };
-        match sent {
+        match outcome {
             Ok(result) => result.map_err(RoundError::from),
             Err(_) => Err(RoundError::Timeout),
         }
@@ -1263,7 +1262,7 @@ impl GatedRound<'_> {
 fn round_class_of(e: &RoundError) -> RoundClass {
     match e {
         RoundError::Coordinator(CoordinatorError::Transport(t)) => {
-            RoundClass::of_transport_error(t).unwrap_or_else(|| match t {
+            RoundClass::of_transport_error(t).unwrap_or(match t {
                 // A dial was made or a link was used, and it failed.
                 TransportError::Io(_)
                 | TransportError::Timeout(_)
@@ -2612,8 +2611,8 @@ mod tests {
 
         // Times out waiting for a reply nobody sends; the wire is what matters.
         let gate = RoundGate::new(1);
-        let mut seat = RoundSeat::take(&gate, "peer", "kind").await;
-        let _ = run_one_recovery_round(&coord, Duration::from_millis(50), &mut seat).await;
+        let mut place = RoundSeat::take(&gate, "peer", "kind").await;
+        let _ = run_one_recovery_round(&coord, Duration::from_millis(50), &mut place).await;
 
         let mut sent = Vec::new();
         while let Ok(bytes) = rx.try_recv() {
@@ -2792,7 +2791,7 @@ mod tests {
         let (event_tx, mut events) = tokio::sync::mpsc::channel(64);
         let run =
             tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
-        tokio::time::sleep(ROUND_SEND_TIMEOUT - Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(175)).await;
         assert!(
             transport.live_sends.load(Ordering::SeqCst) >= 5,
             "the live peer keeps its rounds past the parked send"

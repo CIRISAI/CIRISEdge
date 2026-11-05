@@ -2719,8 +2719,9 @@ async fn bound_peer_after_a_restart(tag: &str, seated: bool) {
     seed_route(&t.c, &t.b).await;
     assert!(
         wait_until(Duration::from_secs(60), || async {
-            t.c.transport.knows_peer(&t.b.key.key_id).await
-                && t.b.transport.knows_peer(&t.c.key.key_id).await
+            // Asked, not awaited: a relay under load holds announces (#945).
+            t.c.transport.seek_peer(&t.b.key.key_id).await
+                && t.b.transport.seek_peer(&t.c.key.key_id).await
         })
         .await,
         "B and C learn each other through A"
@@ -2773,8 +2774,9 @@ async fn a_superseded_binding_gives_no_standing_after_a_restart() {
     seed_route(&t.c, &t.b).await;
     assert!(
         wait_until(Duration::from_secs(60), || async {
-            t.c.transport.knows_peer(&t.b.key.key_id).await
-                && t.b.transport.knows_peer(&t.c.key.key_id).await
+            // Asked, not awaited: a relay under load holds announces (#945).
+            t.c.transport.seek_peer(&t.b.key.key_id).await
+                && t.b.transport.seek_peer(&t.c.key.key_id).await
         })
         .await,
         "B and C learn each other through A"

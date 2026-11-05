@@ -22230,7 +22230,7 @@ mod tests {
         use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
 
         struct Rows {
-            rows: Vec<crate::verify::LiveTransportBinding>,
+            live: Vec<crate::verify::LiveTransportBinding>,
             signed: Vec<String>,
             read_fails: bool,
         }
@@ -22268,7 +22268,7 @@ mod tests {
                 if self.read_fails {
                     return Err("down".to_owned());
                 }
-                Ok(self.rows.clone())
+                Ok(self.live.clone())
             }
         }
 
@@ -22304,7 +22304,7 @@ mod tests {
             let mut wrong = row("mismatched", pubkey(4), Advisory);
             wrong.dest_hash = [0xee; 16];
             let mut dir = Rows {
-                rows: vec![
+                live: vec![
                     row("announced", pubkey(1), Advisory),
                     row("self-claimed-rooted", pubkey(2), Rooted),
                     row("signed", pubkey(3), Advisory),
@@ -22321,7 +22321,7 @@ mod tests {
             );
 
             // Retired, revoked or superseded: the directory stops listing it.
-            dir.rows.clear();
+            dir.live.clear();
             let second = read_persisted_standing(&dir, policy, &first).await;
             assert!(second.is_empty(), "the memo keeps nothing alive");
         }
@@ -22329,7 +22329,7 @@ mod tests {
         #[tokio::test]
         async fn a_directory_that_cannot_be_read_leaves_nobody_standing() {
             let dir = Rows {
-                rows: vec![row("signed", pubkey(3), Advisory)],
+                live: vec![row("signed", pubkey(3), Advisory)],
                 signed: vec!["signed".to_owned()],
                 read_fails: false,
             };

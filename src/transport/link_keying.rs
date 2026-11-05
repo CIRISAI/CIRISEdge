@@ -115,7 +115,7 @@ pub const HANDSHAKES_PER_STANDING: usize = 64;
 pub const HANDSHAKES_UNIDENTIFIED: usize = 16;
 
 // The queue holds what the receiver order lets through in a burst.
-const _: () = assert!(DECAP_QUEUE_STRANGER as u32 >= HANDSHAKES_STRANGER_NODE);
+const _: () = assert!(DECAP_QUEUE_STRANGER >= HANDSHAKES_STRANGER_NODE as usize);
 
 /// What the event path knows about who sent a handshake.
 #[derive(Debug, Clone, Copy)]

@@ -383,9 +383,7 @@ async fn the_release_kicks_a_re_ask_of_the_peer_that_offered_the_row_776() {
         self_publish_set, ReplicationPeer, ReplicationRuntime, ReplicationRuntimeConfig,
         SchedulerConfig,
     };
-    use crate::transport::{
-        InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
-    };
+    use crate::transport::Transport;
 
     let owner = Ident::new("person-o-776k", 0x81);
     let dev = Ident::new("node-d-776k", 0x82);

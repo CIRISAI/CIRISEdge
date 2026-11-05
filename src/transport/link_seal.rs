@@ -765,6 +765,9 @@ impl LinkTable {
     }
 }
 
+/// Keyed links with no standing: by age, each one's age, the next age.
+type StrangerLedger = (BTreeMap<u64, [u8; 16]>, HashMap<[u8; 16], u64>, u64);
+
 /// Frame events waiting on links' keying, and their total size.
 #[derive(Default)]
 struct Parked {
@@ -814,7 +817,7 @@ pub struct LinkSeals {
     /// [`AWAITING_LINKS_MAX`], as a test knob.
     awaiting_links_max: AtomicUsize,
     /// Keyed links with no standing, oldest first, and each one's place.
-    keyed_strangers: Mutex<(BTreeMap<u64, [u8; 16]>, HashMap<[u8; 16], u64>, u64)>,
+    keyed_strangers: Mutex<StrangerLedger>,
     /// [`STRANGER_KEYED_LINKS_MAX`], as a test knob.
     keyed_strangers_max: AtomicUsize,
     /// [`AWAITING_BYTES_MAX`], as a test knob.
@@ -1153,11 +1156,11 @@ impl LinkSeals {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (by_age, places, next) = &mut *ledger;
-        if !places.contains_key(&link) {
+        places.entry(link).or_insert_with(|| {
             by_age.insert(*next, link);
-            places.insert(link, *next);
             *next += 1;
-        }
+            *next - 1
+        });
         let mut over = Vec::new();
         while places.len() > max {
             let Some(oldest) = by_age.values().find(|l| **l != link).copied() else {

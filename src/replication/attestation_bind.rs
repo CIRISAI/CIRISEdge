@@ -1868,8 +1868,8 @@ mod advertise_tests {
     async fn the_canonical_dimension_makes_the_binding_advertisable() {
         for self_set in [&[][..], &["owner-a"][..], &["node-b"][..]] {
             assert_eq!(
-                offered(self_set, true).await,
-                offered(self_set, false).await + 1,
+                Box::pin(offered(self_set, true)).await,
+                Box::pin(offered(self_set, false)).await + 1,
                 "the binding must be offered regardless of the self-publish set \
                  (self_set={self_set:?})"
             );

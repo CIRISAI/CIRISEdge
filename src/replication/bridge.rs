@@ -1593,6 +1593,9 @@ struct SweepCursors {
 /// and a walk of a large plane never finishes (`FSD/EVENT_PATH_MODEL.md` §1.6).
 const MAX_TRACKED_SWEEP_CURSORS: usize = 8192;
 
+/// Rows released per `(peer, plane)`.
+type ReleasedAsks = HashMap<(String, EnvelopeKind), Vec<[u8; 32]>>;
+
 /// CIRISEdge#776 — released rows one `(peer, plane)` fetches by hash at once. A
 /// row past it comes back on the re-sweep, as every released row did before.
 const MAX_RELEASED_ASKS: usize = 64;
@@ -2500,7 +2503,7 @@ pub struct FederationDirectoryReplicationBridge {
     missing_signer_sources: Mutex<crate::rate_limit::SourceLedger>,
     /// CIRISEdge#776 — rows released per `(peer, plane)`, for the round the
     /// release kicks to fetch by hash. Taken whole by that round.
-    released_asks: Mutex<HashMap<(String, EnvelopeKind), Vec<[u8; 32]>>>,
+    released_asks: Mutex<ReleasedAsks>,
     /// CIRISEdge#531 DEPTH — the largest row count ANY single page read has
     /// returned on this bridge. The flat bound's own witness, in the same
     /// discipline as [`Self::sweep_gate`]'s `max_in_flight` and
