@@ -1716,6 +1716,22 @@ impl Call {
         *Shared::lock(&self.shared.test_withhold) = Some((member.to_owned(), every));
     }
 
+    /// Test seam: close this node's leg to `member` and leave it down, as a
+    /// path that really died: nothing re-dials it.
+    #[doc(hidden)]
+    pub async fn close_leg_for_test(&self, member: &str) {
+        Shared::lock(&self.shared.dialling).insert(
+            member.to_owned(),
+            Instant::now() + Duration::from_secs(3600),
+        );
+        let link = Shared::lock(&self.shared.out_legs)
+            .get(member)
+            .map(|l| l.link_id);
+        if let Some(link) = link {
+            let _ = self.shared.transport.link_teardown(&link).await;
+        }
+    }
+
     /// **Who attended** (item 6): the union of the subjects of every row of
     /// this call, plus this node's own attendance. A leaver stays.
     pub async fn attendees(&self) -> Vec<String> {

@@ -1215,6 +1215,8 @@ mod tests {
         withhold_b: Option<u64>,
         /// Withhold every `n`th chunk of the relay's leg to B.
         withhold_standby: Option<u64>,
+        /// Whether A's leg to B is up.
+        a_to_b_up: bool,
     }
 
     impl Mesh {
@@ -1246,6 +1248,7 @@ mod tests {
                 c_offers_to_b: true,
                 withhold_b: None,
                 withhold_standby: None,
+                a_to_b_up: true,
             }
         }
 
@@ -1298,7 +1301,7 @@ mod tests {
             let excluded = self.nodes[A].own_exclude(&legs, base_or_audio);
             self.nodes[A].on_own_published(CHUNK, base_or_audio);
             let withheld = self.withhold_b.is_some_and(|n| seq % n == 0);
-            if !excluded.contains(&legs[0]) && !withheld {
+            if !excluded.contains(&legs[0]) && !withheld && self.a_to_b_up {
                 self.nodes[A].on_sent("b", CHUNK);
                 self.nodes[B].on_chunk(sa, "a", epoch, seq, CHUNK, at, base_or_audio);
             }
@@ -1546,5 +1549,45 @@ mod tests {
             "the clean standby took over: {p:?}\n{}",
             m.nodes[B].log_tail()
         );
+    }
+
+    /// #945 finding A: a closed link is a hard signal. B fails over on the
+    /// next tick, with no time for silence to pass, to the standby that is
+    /// still delivering. Mutation: `PeerHealth::update` reading "subscribed"
+    /// as "heard" flips Down to Recovering and no failover comes.
+    #[test]
+    fn a_primary_link_close_fails_over_at_once() {
+        let mut m = Mesh::new();
+        m.run(15_000, 2, |_| {});
+        let p = m.b_parents();
+        assert_eq!(p.primary.as_deref(), Some("a"), "{p:?}");
+        assert_eq!(p.standby.as_deref(), Some("c"), "{p:?}");
+
+        m.a_to_b_up = false;
+        m.nodes[B].on_parent_link_down("a");
+        m.tick();
+        let (p, log) = (m.b_parents(), m.nodes[B].log_tail());
+        assert_eq!(
+            m.nodes[B].log_count(DecisionKind::Failover),
+            1,
+            "one tick after the close, with no silence: {log}"
+        );
+        assert_eq!(p.primary.as_deref(), Some("c"), "{p:?}\n{log}");
+        assert_eq!(p.parent_changes, 1, "{p:?}\n{log}");
+    }
+
+    /// #945 finding A: a link that comes back before the failover does not
+    /// strand a parent in Down: a chunk that really arrives clears it.
+    #[test]
+    fn a_closed_link_that_delivers_again_recovers() {
+        let mut m = Mesh::new();
+        m.run(15_000, 2, |_| {});
+        m.nodes[B].on_parent_link_down("a");
+        assert_eq!(m.state_of("a"), Some(PeerState::Down));
+        m.advance(STEP_MS);
+        m.chunk(true);
+        m.tick();
+        assert_eq!(m.state_of("a"), Some(PeerState::Recovering));
+        assert_eq!(m.nodes[B].log_count(DecisionKind::Failover), 0);
     }
 }

@@ -19,6 +19,9 @@
 //!   CIRISEdge#945): a real room commit is a meter resync, not a loss burst.
 //! - **Layered standby** (`a_layered_standby_is_not_read_as_lossy_on_a_live_call`,
 //!   CIRISEdge#945): the layers a standby never owed are not loss.
+//! - **Link close** (`a_closed_primary_link_fails_over_on_a_live_call`,
+//!   CIRISEdge#945): a primary's link closing fails over at once to a standby
+//!   that is still delivering, with no wait for silence.
 //! - **Depth 0** (`a_member_claiming_depth_zero_is_not_the_publisher`,
 //!   CIRISEdge#945): only the publisher the binding names holds depth 0.
 //!
@@ -998,6 +1001,127 @@ async fn a_layered_standby_is_not_read_as_lossy_on_a_live_call() {
         "C really carried the base layer: {forwarded}"
     );
     assert_eq!(lines, Vec::<String>::new(), "{:?}", cb.alm_log());
+    task_b.abort();
+    task_c.abort();
+}
+
+/// Publish A's stream (base, then an enhancement layer) until C is B's
+/// standby and A its primary, then `settle` chunks more. Evenly spaced: a
+/// pair sent back to back into a Channel window is refused as Congested
+/// (#591), and real loss is not what these are about.
+async fn layered_until_standby(
+    ca: &mut Call,
+    cb: &Call,
+    a: &str,
+    c: &str,
+    from: &mut u64,
+    settle: u64,
+) {
+    let mut standby_from = None;
+    for _ in 0..4_000u64 {
+        let k = *from;
+        *from += 1;
+        ca.publish(layered("a", k)).await.expect("publish");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let parents = cb.alm_parents();
+        let p = parents.iter().find(|p| p.stream == ca.stream());
+        let on =
+            p.is_some_and(|p| p.primary.as_deref() == Some(a) && p.standby.as_deref() == Some(c));
+        if on && standby_from.is_none() {
+            standby_from = Some(k);
+        }
+        if standby_from.is_some_and(|at| k >= at + settle) {
+            return;
+        }
+    }
+    panic!(
+        "C became B's standby: {:?} {:?}",
+        cb.alm_parents(),
+        cb.alm_log()
+    );
+}
+
+/// A chunk of a two-layer stream: even keys are base, odd keys enhancement.
+fn layered(who: &str, k: u64) -> Frame {
+    Frame {
+        codec_id: CODEC_AV1_SVC,
+        layer: if k % 2 == 0 {
+            ChunkLayer::BASE
+        } else {
+            ChunkLayer {
+                spatial: 1,
+                temporal: 0,
+                quality: 0,
+            }
+        },
+        bytes: body(who, k),
+    }
+}
+
+/// `tail`'s C7 line of `kind` about `peer`, with its time and value.
+fn log_line(tail: &str, kind: &str, peer: &str) -> Option<(u64, i64, String)> {
+    let subject = format!("subj=Some({peer:?}) v=");
+    tail.lines()
+        .filter(|l| l.contains(&format!(" {kind} ")) && l.contains(&subject))
+        .find_map(|l| {
+            let at = l.strip_prefix("t=")?.split(' ').next()?.parse().ok()?;
+            let value = l.split(&subject).nth(1)?.split(' ').next()?.parse().ok()?;
+            Some((at, value, l.to_owned()))
+        })
+}
+
+/// **CIRISEdge#945 finding A, on real links.** B's primary is A, its standby
+/// the relay C. A's leg to B closes and stays closed; C keeps delivering. The
+/// failover must come from the close, on B's next tick. Before the fix B read
+/// "subscribed" as "heard": A went Down, then Recovering, and the call sat on
+/// a dead parent until silence made it Suspected (v=2), at 1.5 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_closed_primary_link_fails_over_on_a_live_call() {
+    const DOWN: i64 = 3;
+    const SUSPECT_SILENCE_MS: u64 = 1_500;
+    let tag = "alm2-link-close";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    let mut cc = join_loaded(c, &groups[2], tag, relay_opts(), None).await;
+    wait_legs(&ca, 2).await;
+    wait_legs(&cb, 2).await;
+    wait_legs(&cc, 2).await;
+    wait_bound(&cb, 2).await;
+    wait_bound(&cc, 2).await;
+    let (_, task_b) = drain(&mut cb);
+    let (_, task_c) = drain(&mut cc);
+    let mut k = 0;
+    layered_until_standby(&mut ca, &cb, &a.key.key_id, &c.key.key_id, &mut k, 60).await;
+
+    ca.close_leg_for_test(&b.key.key_id).await;
+    let mut moved = false;
+    for _ in 0..300 {
+        ca.publish(layered("a", k)).await.expect("publish");
+        k += 1;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if primary_for(&cb, ca.stream()).as_deref() == Some(c.key.key_id.as_str()) {
+            moved = true;
+            break;
+        }
+    }
+    let log = cb.alm_log().2;
+    let (down_at, _, _) = log_line(&log, "PeerState", &a.key.key_id)
+        .filter(|l| l.1 == DOWN)
+        .unwrap_or_else(|| panic!("the close marked A Down: {log}"));
+    let (failover_at, state, line) =
+        log_line(&log, "Failover", &a.key.key_id).unwrap_or_else(|| panic!("B failed over: {log}"));
+    eprintln!(
+        "[ALM2] link close: failover {} ms after the close, in state {state}: {line}",
+        failover_at - down_at
+    );
+    assert_eq!(state, DOWN, "from the close, not from silence: {log}");
+    assert!(
+        failover_at - down_at < SUSPECT_SILENCE_MS,
+        "before silence could have done it: {log}"
+    );
+    assert!(moved, "C took over: {:?} {log}", cb.alm_parents());
     task_b.abort();
     task_c.abort();
 }

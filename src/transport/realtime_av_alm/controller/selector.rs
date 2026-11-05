@@ -963,7 +963,11 @@ impl<P: PeerRef> ParentSelector<P> {
             let degraded = c.link.subscribed()
                 && snap.windows >= 1
                 && (snap.loss >= self.cfg.degraded_loss || over_budget);
-            if let Some((_, to)) = c.health.update(now_ms, silent, degraded, &self.cfg) {
+            let last_arrival = c.meter.last_arrival_ms();
+            if let Some((_, to)) =
+                c.health
+                    .update(now_ms, silent, last_arrival, degraded, &self.cfg)
+            {
                 log.record(
                     now_ms,
                     &me,
@@ -1345,6 +1349,45 @@ mod tests {
             t += 250;
         }
         all
+    }
+
+    /// #945 finding A, at the selector: Down from a closed link, or from a
+    /// loop in the primary's own offer, is a verdict the same tick's failover
+    /// acts on. Being subscribed is not being heard.
+    #[test]
+    fn a_verdict_on_a_primary_reaches_the_tick_that_follows_it() {
+        for looped in [false, true] {
+            let mut cfg = ControllerConfig::interactive();
+            cfg.jitter = false;
+            let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+            s.set_members([1u32, 2, 3]);
+            let offers = [(2, 4, 20.0), (3, 4, 30.0)];
+            let _ = drive(&mut s, &cfg, 0, 12_000, &offers);
+            let (p, standby) = (*s.primary().expect("joined"), s.standby().copied());
+            assert!(standby.is_some());
+            let (mut rng, mut log) = (SplitMix64(1), DecisionLog::default());
+            let t = 12_000;
+            if looped {
+                let o = Offer {
+                    ancestry: vec![1],
+                    ..offer(p, 4, &cfg)
+                };
+                s.on_offer(t, o, 20.0, &mut log);
+            } else {
+                s.on_link_down(t, &p, &mut log);
+            }
+            assert_eq!(s.state_of(&p), Some(PeerState::Down));
+            let acts = s.tick(t, &mut rng, &mut log);
+            assert_eq!(s.primary(), None, "looped={looped}: {}", log.tail());
+            assert_eq!(log.count(DecisionKind::Failover), 1);
+            assert!(
+                acts.contains(&SelectorAction::Subscribe {
+                    parent: standby.expect("present"),
+                    role: Role::Primary,
+                }),
+                "looped={looped}: {acts:?}"
+            );
+        }
     }
 
     /// W1 (`FSD/CIRIS_MESH.md` §9): with any eligible member Available, the
