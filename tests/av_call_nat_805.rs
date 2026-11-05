@@ -880,7 +880,8 @@ async fn late_joiner_measure() {
 /// `X` connects and announces `BURST_N` destinations at once; `Y`, already on
 /// `T`, reports when each reaches it. Held, dropped, and does it come back?
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "a measurement: BURST_N, BURST_BUDGET, BURST_INGRESS"]
+#[ignore = "a measurement: BURST_N, BURST_BUDGET, BURST_INGRESS, BURST_ASK"]
+#[allow(clippy::many_single_char_names)] // t, x, y: the nodes as the test names them
 async fn fresh_interface_burst_measure() {
     use leviculum_core::Identity;
     use leviculum_core::{Destination, DestinationType, Direction};

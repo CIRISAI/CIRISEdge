@@ -625,6 +625,12 @@ async fn two_hops(seed_canonical_row: bool) {
         false,
     )
     .await;
+    // A loaded box can start C long after O: this holds it there on demand.
+    let held_back = std::env::var("SEALED_C_DELAY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    tokio::time::sleep(Duration::from_secs(held_back)).await;
     let (c_hop, _, c_rx) = hop(
         &c.key_id,
         c.signer(),

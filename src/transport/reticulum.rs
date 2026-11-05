@@ -9025,10 +9025,15 @@ impl ReticulumTransport {
     /// connects later, and once a destination has used up the rate limit's
     /// grace a transport node stops rebroadcasting it for up to
     /// `announce_rate_target` (default 1 h, leviculum `DEFAULT_AR_TARGET`), so
-    /// on the 300 s default the second half of every hour is silent. It keeps
-    /// the path though, and answers a path request from it, past both that
-    /// limit and the ingress hold. The answer is the peer's own signed
-    /// announce, so it takes the ordinary rooting path.
+    /// on the 300 s default about 65 minutes in every 70 are silent. It keeps
+    /// the path though, and answers a path request from it, past that limit.
+    /// The answer is the peer's own signed announce, so it takes the ordinary
+    /// rooting path, and this node's own ingress hold lets it through.
+    ///
+    /// What an ask cannot reach is an announce still held by a relay's ingress
+    /// control: that relay has no path to answer from until it releases it,
+    /// one per 5 s from 15 s after the burst, so that one takes the hold's
+    /// time, and a later send asks again.
     ///
     /// One ask per destination per [`PATH_SEEK_MIN_INTERVAL`]: a send behind
     /// an ask still in flight waits out that ask, and a send behind an
