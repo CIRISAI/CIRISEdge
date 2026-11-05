@@ -154,6 +154,8 @@ pub mod protocol;
 pub mod refusal_backoff;
 pub mod registry;
 pub mod resolved_state;
+#[cfg(test)]
+mod responder_drain_943_tests;
 /// CIRISEdge#552/#553 — how much of a plane this node keeps, and the
 /// revocation carve-out a configured retention cannot reach.
 pub mod retention;
