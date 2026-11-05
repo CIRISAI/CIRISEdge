@@ -17511,6 +17511,55 @@ pub(crate) mod tests {
         assert_eq!(read.obligation_of("node-nobody").await, O::Unresolved);
     }
 
+    /// `seat` class's roster at bootstrap: a directory with no rows is the
+    /// signed bundle, so a fresh node still knows its seats. A conferred key
+    /// joins in the bundle's own spelling, a tombstone takes out even a bundle
+    /// seat, and operator config proves nothing.
+    #[tokio::test]
+    async fn the_seat_roster_is_the_bundle_until_the_directory_says_more() {
+        use crate::load_ladder::PeerObligations as _;
+        use crate::peer_obligation::{LivePeerObligations, SendSetRead};
+        let backend = audience_backend().await;
+        let bundle: HashSet<String> = crate::baked_canonical_genesis_ids().into_iter().collect();
+        let first = bundle.iter().next().expect("a baked seat").clone();
+        let recognised = Arc::new(std::sync::RwLock::new(HashSet::from([
+            "node-operator-declared".to_owned(),
+        ])));
+        let bridge = Arc::new(audience_bridge(&backend));
+        let read = LivePeerObligations::new(
+            backend.clone(),
+            "node-alice-a",
+            recognised,
+            bridge as Arc<dyn SendSetRead>,
+        );
+        let active = read.active_seats().await.expect("a read");
+        assert_eq!(active.seats, bundle);
+        assert!(!active.own);
+
+        backend
+            .test_seam_set_key_identity_type("node-alice-a", "canonical,node")
+            .await
+            .expect("the role, conferred");
+        let active = read.active_seats().await.expect("a read");
+        assert!(active.seats.contains("node-alice-a"));
+        assert!(active.own);
+
+        backend
+            .record_canonical_withdrawal(&first, None, "sha256:e15-bundle-seat")
+            .await
+            .expect("tombstone");
+        backend
+            .record_canonical_withdrawal("node-alice-a", None, "sha256:e15-joined")
+            .await
+            .expect("tombstone");
+        let active = read.active_seats().await.expect("a read");
+        assert!(
+            !active.seats.contains(&first),
+            "a quorum outvotes the bundle"
+        );
+        assert!(!active.own);
+    }
+
     /// Seed a bare `consent:replication:v1` grant (NO restrictions) by `granter`
     /// naming `peer` — the minimum that puts `peer` in
     /// `list_consent_peers(granter)` so it clears the CIRISEdge#396 item-1

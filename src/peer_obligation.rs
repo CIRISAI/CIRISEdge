@@ -22,6 +22,13 @@
 //! and then answers [`PeerObligation::Unresolved`] for a backoff, so nothing
 //! queues on the directory under load.
 //!
+//! **`seat` class reads the same roster on a cadence** ([`active_seat_roster`]):
+//! a class offer and the bound are sync reads on hot paths, so they read a set
+//! the transport refreshes every [`SEAT_ROSTER_REFRESH`], and no offer waits
+//! on the directory. The one difference is proof: a seat there is the signed
+//! bundle or the conferred role. Operator config protects a peer from a shed,
+//! which is the safe direction, and proves no seat.
+//!
 //! **Which way it fails.** A read that errors, times out or was narrower than
 //! the truth answers `Unresolved`, and nothing is shed on that: a wrong refusal
 //! hurts quietly, a missed shed costs a little load and shows in the count.
@@ -65,6 +72,40 @@ pub async fn holds_active_seat<S: std::hash::BuildHasher + Sync>(
         || ciris_persist::federation::admission::is_canonical(directory, peer).await?)
 }
 
+/// How often the transport reads the active seats.
+pub const SEAT_ROSTER_REFRESH: Duration = Duration::from_secs(30);
+
+/// The spellings of the conferred role. Persist stores a set as a joined string
+/// (`canonical,node` in the bundle) and `list_keys_by_identity_type` matches it
+/// exactly; the set-aware `list_canonical_servers` is not on the trait.
+const CANONICAL_SPELLINGS: [&str; 3] = ["canonical", "canonical,node", "node,canonical"];
+
+/// **The active seats**: the signed bundle's serve nodes and every key conferred
+/// the role since, less every #377 tombstone. With an empty directory that is
+/// the bundle: absence of a row is not retirement.
+///
+/// # Errors
+/// The directory's.
+pub async fn active_seat_roster<S: std::hash::BuildHasher + Sync>(
+    directory: &dyn FederationDirectory,
+    bundle: &HashSet<String, S>,
+) -> Result<HashSet<String>, ciris_persist::federation::Error> {
+    let mut roster: HashSet<String> = bundle.iter().cloned().collect();
+    for spelling in CANONICAL_SPELLINGS {
+        roster.extend(
+            directory
+                .list_keys_by_identity_type(spelling)
+                .await?
+                .into_iter()
+                .map(|r| r.key_id),
+        );
+    }
+    for withdrawn in directory.list_canonical_withdrawals().await? {
+        roster.remove(&withdrawn.key_id);
+    }
+    Ok(roster)
+}
+
 /// The send set, as a lever reads it.
 #[async_trait::async_trait]
 pub trait SendSetRead: Send + Sync {
@@ -89,6 +130,7 @@ pub struct LivePeerObligations {
     directory: Arc<dyn FederationDirectory>,
     local: String,
     recognised: Arc<RwLock<HashSet<String>>>,
+    bundle_seats: HashSet<String>,
     send_set: Arc<dyn SendSetRead>,
     /// When the owner's devices were read, and what came back.
     memo: tokio::sync::Mutex<Option<(Instant, OwnDevices)>>,
@@ -104,7 +146,8 @@ impl std::fmt::Debug for LivePeerObligations {
 }
 
 impl LivePeerObligations {
-    /// `recognised` is the live recognition set, `Edge::canonical_peers`.
+    /// `recognised` is the live recognition set, `Edge::canonical_peers`. The
+    /// base of the seat roster is the signed bundle.
     #[must_use]
     pub fn new(
         directory: Arc<dyn FederationDirectory>,
@@ -116,6 +159,11 @@ impl LivePeerObligations {
             directory,
             local: local.into(),
             recognised,
+            bundle_seats: ciris_persist::federation::genesis::canonical_genesis_bundle()
+                .serve_nodes
+                .iter()
+                .map(|sr| sr.record.key_id.clone())
+                .collect(),
             send_set,
             memo: tokio::sync::Mutex::new(None),
             backoff_until: std::sync::Mutex::new(None),
@@ -182,6 +230,24 @@ impl LivePeerObligations {
 
 #[async_trait::async_trait]
 impl PeerObligations for LivePeerObligations {
+    async fn active_seats(&self) -> Option<crate::load_ladder::ActiveSeats> {
+        let read = active_seat_roster(&*self.directory, &self.bundle_seats);
+        match tokio::time::timeout(OBLIGATION_READ_BUDGET, read).await {
+            Ok(Ok(seats)) => Some(crate::load_ladder::ActiveSeats {
+                own: seats.contains(&self.local),
+                seats,
+            }),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "the seat roster did not read; the last one stands");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("the seat roster ran out of budget; the last one stands");
+                None
+            }
+        }
+    }
+
     async fn obligation_of(&self, peer: &str) -> PeerObligation {
         let backing_off = self
             .backoff_until

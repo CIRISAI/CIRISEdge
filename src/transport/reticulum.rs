@@ -3503,7 +3503,8 @@ impl ReticulumTransport {
         shapers.set_relay_offering(onion.relay_offering());
         // CC 5.4.3 rc17 the `seat` class: the serve seats are the signed
         // genesis bundle's, never self-declared; a seat-to-seat link is
-        // offered it.
+        // offered it. This is the bootstrap answer, with an empty directory;
+        // the listener keeps it to the active roster from here on.
         {
             let seated: std::collections::HashSet<String> =
                 ciris_persist::federation::genesis::canonical_genesis_bundle()
@@ -6937,6 +6938,13 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub fn set_seats_for_test(&self, seats: std::collections::HashSet<String>, own: bool) {
         self.shapers.set_seats(seats, own);
+    }
+
+    /// Seat-tier test seam — whether a link to `peer` is a seat link now.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_seat_link_for_test(&self, peer: &str) -> bool {
+        self.shapers.is_seat_link(Some(peer))
     }
 
     /// Seat-tier test seam — seats by key-id prefix.
@@ -10533,6 +10541,11 @@ impl ReticulumTransport {
         // (`release_held`) are re-checked on this tick, which runs only while
         // some wait: a binding healed in the cold-start worker raises no event
         // here, and a link still unattributed at the budget must be refused.
+        // The seat roster, on a bounded cadence and off this loop: an offer
+        // reads the set it leaves and never waits on the directory. The timer
+        // ends with this run, so a parked node holds none.
+        let mut seat_tick = tokio::time::interval(crate::peer_obligation::SEAT_ROSTER_REFRESH);
+        seat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut attribution_tick = tokio::time::interval(Duration::from_millis(100));
         attribution_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let ctx = EventCtx {
@@ -10603,6 +10616,13 @@ impl ReticulumTransport {
                     for link in ctx.seals.awaiting_attribution() {
                         release_held(&ctx, LinkId::new(link)).await;
                     }
+                }
+                _ = seat_tick.tick() => {
+                    tokio::spawn(refresh_seats(
+                        Arc::clone(&self.node),
+                        Arc::clone(&self.seals),
+                        Arc::clone(&self.shapers),
+                    ));
                 }
                 _ = pool_tick.tick() => {
                     let closed = self.reap_idle_pooled_links().await;
@@ -16023,6 +16043,22 @@ async fn shed_one_shaped_link(
     shapers.forget(&link);
     let _ = node.close_link(&LinkId::new(link)).await;
     true
+}
+
+/// Put the active seat roster in force and close what it no longer carries.
+async fn refresh_seats(
+    node: Arc<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+) {
+    for link in shapers.refresh_active_seats().await {
+        tracing::info!(
+            link = %hex::encode(link),
+            "a seat link's peer left the active roster; closed to renegotiate (CC 5.4.3)"
+        );
+        seals.refuse(link);
+        let _ = node.close_link(&LinkId::new(link)).await;
+    }
 }
 
 /// How often tier 2 closes one shaped link. A step at a time, so a tier that

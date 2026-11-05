@@ -298,6 +298,15 @@ impl PeerObligation {
     }
 }
 
+/// The active serve seats, as `seat` class reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ActiveSeats {
+    /// Every seat on the active roster.
+    pub seats: std::collections::HashSet<String>,
+    /// This node holds one.
+    pub own: bool,
+}
+
 /// The read a shed lever makes at decision time. Installed on the transport
 /// (`ReticulumTransport::install_peer_obligations`); production is
 /// [`crate::peer_obligation::LivePeerObligations`].
@@ -305,6 +314,12 @@ impl PeerObligation {
 pub trait PeerObligations: Send + Sync + std::fmt::Debug {
     /// What this node owes `peer` now.
     async fn obligation_of(&self, peer: &str) -> PeerObligation;
+
+    /// The active serve seats, for `seat` class. `None` when they cannot be
+    /// read: the last answer stands.
+    async fn active_seats(&self) -> Option<ActiveSeats> {
+        None
+    }
 }
 
 /// What a tier does to one flow.

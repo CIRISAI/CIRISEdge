@@ -1696,7 +1696,8 @@ pub struct LinkShapers {
     referral_parts: Mutex<HashMap<[u8; 16], crate::transport::av_transit_handshake::Reassembler>>,
     /// Whole referrals waiting for the refusal they precede, by link.
     referrals: Mutex<HashMap<[u8; 16], crate::transport::shaping_referral::ReferralFrame>>,
-    /// The serve seats, from the signed genesis bundle (`serve_nodes`).
+    /// The serve seats: the signed bundle's at boot, then the active roster
+    /// ([`Self::refresh_active_seats`]).
     seats: Mutex<std::collections::HashSet<String>>,
     /// This node is one of them.
     own_seat: std::sync::atomic::AtomicBool,
@@ -1720,6 +1721,9 @@ pub struct LinkShapers {
     /// What each peer's last offer said: whether it shapes. Survives its
     /// links, and holds at most [`PEER_SHAPING_FACTS_MAX`] peers.
     peer_shapes: Mutex<HashMap<String, bool>>,
+    /// The links both ends agreed at the `seat` class. A rate cannot say: the
+    /// offer rounds λ, so a class link can agree a few bytes above its class.
+    seat_agreed: Mutex<std::collections::HashSet<[u8; 16]>>,
     /// What a shed lever reads at decision time. Absent: nothing is shed.
     obligations: std::sync::RwLock<Option<Arc<dyn crate::load_ladder::PeerObligations>>>,
     /// Woken when tier 2 is in force.
@@ -1847,6 +1851,7 @@ impl LinkShapers {
             admitted: Mutex::new(HashMap::new()),
             admissions: std::sync::atomic::AtomicU64::new(0),
             peer_shapes: Mutex::new(HashMap::new()),
+            seat_agreed: Mutex::new(std::collections::HashSet::new()),
             obligations: std::sync::RwLock::new(None),
             shed_wake: tokio::sync::Notify::new(),
         }
@@ -2109,6 +2114,10 @@ impl LinkShapers {
             self.offered().remove(link);
             self.pending().remove(link);
             self.link_peer().remove(link);
+            self.seat_agreed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(link);
             self.admitted
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2158,6 +2167,58 @@ impl LinkShapers {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = seats;
         self.own_seat.store(own, Ordering::Release);
         self.rebalance();
+    }
+
+    /// Read the active roster and put it in force, with no restart: a new seat
+    /// is offered the class from here on, and a retired one stops being. A link
+    /// agreed at `seat` with a peer that no longer proves one is stopped and
+    /// returned for the caller to CLOSE, as [`Self::set_policy`] does: it
+    /// renegotiates, and it counts toward the bound if it comes back. A link to a new seat keeps its
+    /// agreement until it closes. A roster that cannot be read changes nothing.
+    pub async fn refresh_active_seats(&self) -> Vec<[u8; 16]> {
+        let reader = self
+            .obligations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(active) = (match reader {
+            Some(reader) => reader.active_seats().await,
+            None => None,
+        }) else {
+            return Vec::new();
+        };
+        self.adopt_seats(active)
+    }
+
+    /// Put `active` in force ([`Self::refresh_active_seats`]).
+    fn adopt_seats(&self, active: crate::load_ladder::ActiveSeats) -> Vec<[u8; 16]> {
+        *self
+            .seats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = active.seats;
+        // The harness's seats are by prefix, in no bundle and no directory.
+        let by_prefix = !self
+            .seat_prefixes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty();
+        if !by_prefix {
+            self.own_seat.store(active.own, Ordering::Release);
+        }
+        let peers = self.link_peer_map();
+        let stale: Vec<[u8; 16]> = self
+            .seat_agreed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|l| !peers.get(*l).is_some_and(|p| self.is_seat_link(Some(p))))
+            .copied()
+            .collect();
+        for link in &stale {
+            self.forget(link);
+        }
+        self.rebalance();
+        stale
     }
 
     /// Test seam — seats by key-id prefix ([`Self::set_seats`] for production).
@@ -2653,6 +2714,17 @@ impl LinkShapers {
             Some(agreement) => {
                 let shaper = Arc::new(LinkShaper::new(link, agreement, self.queue_cap));
                 self.links().insert(link, Arc::clone(&shaper));
+                // A seat offer travels as `server`, so the peer's class says
+                // nothing: the link is a seat link when it runs at the seat
+                // rate this node offered.
+                if ours.class == BudgetClass::Seat
+                    && agreement.lambda >= f64::from(ours.rate_milli) / 1000.0 - 1e-6
+                {
+                    self.seat_agreed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(link);
+                }
                 if !self.pending().contains_key(&link) {
                     let n = self.admissions.fetch_add(1, Ordering::AcqRel);
                     self.admitted
@@ -2702,6 +2774,10 @@ impl LinkShapers {
         if let Some(s) = self.links().remove(link) {
             s.stop();
         }
+        self.seat_agreed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(link);
         self.admitted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3995,6 +4071,88 @@ mod tests {
 
         let seen: Vec<String> = t.peers_shaping().into_iter().map(|p| p.peer).collect();
         assert_eq!(seen, vec!["bare", "full", "g0", "old"]);
+    }
+
+    /// The roster moves under running hot-path reads. A new seat gets the
+    /// offer and leaves the bound; a retired one takes the class, counts, and
+    /// its link above the class comes back to close; an unread roster moves
+    /// nothing. Mutation: keep the boot set → this fails.
+    #[test]
+    fn a_seat_follows_the_active_roster_with_no_restart() {
+        use crate::load_ladder::ActiveSeats;
+        let p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        let t = LinkShapers::new(p);
+        let seats = |s: &[&str], own: bool| ActiveSeats {
+            seats: s.iter().map(|k| (*k).to_owned()).collect(),
+            own,
+        };
+        let peer = shaping_peer();
+        assert_eq!(
+            t.offer_for([80u8; 16], 16_272, Some("joined")).class,
+            BudgetClass::Server,
+            "not yet a seat"
+        );
+        assert!(t.adopt_seats(seats(&["joined", "me"], true)).is_empty());
+        let o = t.offer_for([81u8; 16], 16_272, Some("joined"));
+        assert_eq!(o.class, BudgetClass::Seat);
+        // As it lands: a seat offer travels as `server`.
+        let seat = ShapingOffer::decode(&ShapingOffer::seat(16_272).encode()).unwrap();
+        t.peer_offer([81u8; 16], &seat).unwrap().expect("seat link");
+        assert_eq!(t.counted_link_count(), 0, "outside the bound");
+        assert!(!t.at_bound_for(Some("joined")));
+
+        // This node alone proved nothing: no proof on its own side, no class.
+        let u = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        let _ = u.adopt_seats(seats(&["joined"], false));
+        assert_eq!(
+            u.offer_for([82u8; 16], 16_272, Some("joined")).class,
+            BudgetClass::Server
+        );
+
+        assert_eq!(
+            t.adopt_seats(seats(&["me"], true)),
+            vec![[81u8; 16]],
+            "retired: its link above the class closes to renegotiate"
+        );
+        assert!(!t.is_shaped([81u8; 16]));
+        assert_eq!(
+            t.offer_for([83u8; 16], 16_272, Some("joined")).class,
+            BudgetClass::Server
+        );
+        t.peer_offer([83u8; 16], &peer)
+            .unwrap()
+            .expect("class link");
+        assert_eq!(t.counted_link_count(), 1, "and it counts");
+    }
+
+    /// A refresh closes a link for what was agreed on it, never for its rate.
+    /// The offer rounds λ, so this class link agrees above its class: read as a
+    /// rate it would close on every refresh, on every node. Mutation: compare
+    /// rates → this fails.
+    #[test]
+    fn a_refresh_leaves_a_class_link_that_rounded_above_its_class() {
+        let mut p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        p.bytes_per_s = 100_000;
+        p.share = ShapedSharePolicy::BoundedWithFloor {
+            max_links: 8,
+            floor_bytes_per_s: 100_000,
+        };
+        let t = LinkShapers::new(p.clone());
+        let link = [90u8; 16];
+        let _ = t.offer_for(link, 16_272, Some("peer"));
+        let shaper = t
+            .peer_offer(link, &ShapingOffer::from_policy(&p, 16_272))
+            .unwrap()
+            .expect("shaped");
+        assert!(
+            shaper.agreement().bytes_per_s() > p.bytes_per_s + 1,
+            "the case itself: {}",
+            shaper.agreement().bytes_per_s()
+        );
+        assert!(t
+            .adopt_seats(crate::load_ladder::ActiveSeats::default())
+            .is_empty());
+        assert!(t.is_shaped(link));
     }
 
     #[test]

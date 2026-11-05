@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ciris_edge::identity::{sign_bound_hybrid, LocalSigner};
-use ciris_edge::peer_obligation::LivePeerObligations;
+use ciris_edge::peer_obligation::{LivePeerObligations, SendSetRead};
 use ciris_edge::replication::attestation_bind::{bind_attestation_envelope, AttestationColumns};
 use ciris_edge::replication::{
     self_publish_set, InboundRouter, ReplicationRuntime, ReplicationRuntimeConfig, SchedulerConfig,
@@ -2587,4 +2587,191 @@ async fn e8_a_peer_that_answers_off_is_on_record_as_not_shaping() {
         t.a.metrics.link_shaping()
     );
     assert!(!t.a.transport.peer_shaping(&t.b.key.key_id).shaped_now);
+}
+
+// ─── `seat` class on the active roster ─────────────────────────────────────
+
+/// A node with no send set to speak of: these witnesses are about seats.
+struct NoSendSet;
+
+#[async_trait::async_trait]
+impl SendSetRead for NoSendSet {
+    async fn reaches(&self, _local: &str, _peer: &str) -> Option<bool> {
+        Some(false)
+    }
+}
+
+/// `n` keeps its seats to its own directory, on the production cadence.
+fn read_seats(n: &Node) {
+    n.transport
+        .install_peer_obligations(Arc::new(LivePeerObligations::new(
+            Arc::clone(&n.dir) as Arc<dyn FederationDirectory>,
+            n.key.key_id.clone(),
+            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(NoSendSet),
+        )));
+}
+
+/// The role conferred on `keys`, in the bundle's spelling, as `at` holds it.
+async fn confer(at: &Node, keys: &[&str]) {
+    for key in keys {
+        at.dir
+            .test_seam_set_key_identity_type(key, "canonical,node")
+            .await
+            .expect("the role");
+    }
+}
+
+/// `sender` dials `to` with a row and waits for the row: a fresh link.
+async fn fresh_link(sender: &Node, to: &Node, marker: &[u8]) {
+    let row = typed_payload("AttestationGossip", marker, 2_000);
+    sender
+        .transport
+        .send(&to.key.key_id, &row)
+        .await
+        .expect("the dial");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            to.received(&row).await
+        })
+        .await,
+        "the row crossed: {:?}",
+        sender.metrics.link_shaping()
+    );
+}
+
+/// Two servers at the class rate, A with a bound of one.
+fn one_slot() -> ShapingPolicy {
+    let mut p = policy(BudgetClass::Server, 7_000, 0.5, 600, false);
+    p.share = ShapedSharePolicy::BoundedWithFloor {
+        max_links: 1,
+        floor_bytes_per_s: 7_000,
+    };
+    p
+}
+
+const SEAT_RATE: u32 = 33_000;
+
+/// An agreed rate at `rate`: the offer carries λ to a thousandth, so it lands
+/// a few bytes off.
+fn at_rate(agreed: u32, rate: u32) -> bool {
+    agreed.abs_diff(rate) * 100 < rate
+}
+
+/// **A canonical that joins after boot** (`CC 5.4.3`, Eric's rule): the role
+/// lands in the directories of two running nodes and the next refresh makes
+/// their next link a seat link, with no restart. It takes both ends: while
+/// only A holds the proof the link runs at the class. Mutation: keep the boot
+/// set → this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_canonical_that_joins_after_boot_gets_the_seat_class_from_both_proofs() {
+    let t = duo("seat-joins", one_slot(), one_slot()).await;
+    read_seats(&t.a);
+    read_seats(&t.b);
+    let (a_id, b_id) = (t.a.key.key_id.clone(), t.b.key.key_id.clone());
+
+    confer(&t.a, &[a_id.as_str(), b_id.as_str()]).await;
+    assert!(
+        wait_until(Duration::from_secs(45), || async {
+            t.a.transport.is_seat_link_for_test(&b_id)
+        })
+        .await,
+        "A reads the roster on its own cadence"
+    );
+    fresh_link(&t.b, &t.a, b"JOIN-ONE-PROOF-").await;
+    let link = t.a.transport.shaping_status().links[0].clone();
+    assert!(
+        at_rate(link.agreed_bytes_per_s, 7_000),
+        "B has proved nothing yet: {}",
+        link.agreed_bytes_per_s
+    );
+    t.b.transport
+        .link_teardown(&t.b.transport.shaped_link_ids_for_test()[0])
+        .await
+        .expect("teardown");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.transport.shaped_link_count() == 0 && t.b.transport.shaped_link_count() == 0
+        })
+        .await
+    );
+
+    confer(&t.b, &[a_id.as_str(), b_id.as_str()]).await;
+    assert!(
+        wait_until(Duration::from_secs(45), || async {
+            t.b.transport.is_seat_link_for_test(&a_id)
+        })
+        .await,
+        "B reads it too"
+    );
+    fresh_link(&t.b, &t.a, b"JOIN-TWO-PROOFS-").await;
+    let status = t.a.transport.shaping_status();
+    assert!(
+        at_rate(status.links[0].agreed_bytes_per_s, SEAT_RATE),
+        "{:?}",
+        status.links
+    );
+    assert!(status.links[0].seat);
+    assert_eq!(status.counted_links, 0, "outside the bound");
+    assert_eq!(status.free_slots, 1, "the bound's one slot stays free");
+}
+
+/// **A canonical retired after boot.** Two seats hold a seat link outside A's
+/// bound of one. A tombstone lands, the next refresh closes the link with no
+/// restart, and the redial runs at the class and takes the slot: it lost the
+/// class and the exemption. Mutation: keep the boot set, or ignore the
+/// tombstone, or leave the running link → this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_canonical_retired_after_boot_loses_the_seat_class_and_the_bound_exemption() {
+    let t = duo("seat-retires", one_slot(), one_slot()).await;
+    let (a_id, b_id) = (t.a.key.key_id.clone(), t.b.key.key_id.clone());
+    for n in [&t.a, &t.b] {
+        confer(n, &[a_id.as_str(), b_id.as_str()]).await;
+        read_seats(n);
+    }
+    assert!(
+        wait_until(Duration::from_secs(45), || async {
+            t.a.transport.is_seat_link_for_test(&b_id) && t.b.transport.is_seat_link_for_test(&a_id)
+        })
+        .await,
+        "both hold the seats"
+    );
+    fresh_link(&t.b, &t.a, b"RETIRE-SEAT-").await;
+    let status = t.a.transport.shaping_status();
+    assert!(
+        at_rate(status.links[0].agreed_bytes_per_s, SEAT_RATE),
+        "{:?}",
+        status.links
+    );
+    assert_eq!((status.counted_links, status.free_slots), (0, 1));
+
+    for n in [&t.a, &t.b] {
+        n.dir
+            .record_canonical_withdrawal(&b_id, None, "sha256:seat-retired")
+            .await
+            .expect("tombstone");
+    }
+    assert!(
+        wait_until(Duration::from_secs(45), || async {
+            t.a.transport.shaped_link_count() == 0 && t.b.transport.shaped_link_count() == 0
+        })
+        .await,
+        "the seat link closes on the next refresh: {:?}",
+        t.a.transport.shaping_status().links
+    );
+    assert!(!t.a.transport.is_seat_link_for_test(&b_id));
+
+    fresh_link(&t.b, &t.a, b"RETIRE-CLASS-").await;
+    let status = t.a.transport.shaping_status();
+    assert!(
+        at_rate(status.links[0].agreed_bytes_per_s, 7_000),
+        "the class: {:?}",
+        status.links
+    );
+    assert!(!status.links[0].seat);
+    assert_eq!(
+        (status.counted_links, status.free_slots),
+        (1, 0),
+        "and it holds the bound's one slot"
+    );
 }
