@@ -4891,6 +4891,15 @@ impl FederationDirectoryReplicationBridge {
                         {
                             return None;
                         }
+                    } else if Self::row_has_audience_gate(inner) {
+                        // With no peer there is no one to put the row's
+                        // audience to: `may_receive` cannot say yes.
+                        self.withhold(
+                            crate::observability::WithholdReason::RecipientNotInSendSet,
+                            peer_label,
+                            "fetch: unattributed, and the row has an audience gate",
+                        );
+                        return None;
                     }
                 }
             }
@@ -8472,6 +8481,21 @@ impl FederationDirectoryReplicationBridge {
             target,
         )
         .map_err(|e| e.to_string())
+    }
+
+    /// Does serving `inner` depend on who asks? Everything but a commons row
+    /// does: a group-plane row answers to its group whatever its scope, and a
+    /// row whose audience cannot be read is treated as gated.
+    fn row_has_audience_gate(inner: &serde_json::Value) -> bool {
+        use ciris_persist::federation::Audience;
+        let commons = matches!(
+            Self::audience_of_row_value(inner),
+            Ok(Audience::Species | Audience::Biosphere | Audience::Federation)
+        );
+        !commons
+            || serde_json::from_value::<Attestation>(inner.clone()).map_or(true, |att| {
+                ciris_persist::federation::group_plane::is_group_plane_row(&att)
+            })
     }
 
     /// The row's `attestation_id`, for a withhold line: the advertise gate
@@ -12498,6 +12522,79 @@ pub(crate) mod tests {
                 .is_some(),
             "an advertised (federation-scope) row still serves the same peer — \
              the twin narrows nothing the advertise gate would have served"
+        );
+    }
+
+    /// An unattributed fetch has no peer to put to a row's audience, so a row
+    /// with an audience gate fails closed: this node's OWN `self` row passes the
+    /// projection twin (it is what this node advertises), and the audience gate
+    /// used to be skipped behind `if let Some(peer)`. A commons row has no gate.
+    #[tokio::test]
+    async fn an_unattributed_fetch_of_an_audience_gated_row_fails_closed() {
+        let local = "this-node";
+        let other = "other-node";
+        let (backend, bridge) = make_bridge(&[local.to_string(), other.to_string()]);
+        let metrics = crate::observability::EdgeMetrics::new();
+        let publish_set = vec![local.to_string()];
+        let selector: CohortProvider = Arc::new(move || publish_set.clone());
+        let bridge = bridge
+            .with_local_key_id(Some(local.to_string()))
+            .with_self_provider(Some(selector))
+            .with_metrics(Some(metrics.clone()));
+        for kid in [local, other] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_scoped_attestation(
+            &backend,
+            &uuid::Uuid::new_v4().to_string(),
+            local,
+            local,
+            "scores",
+            "self",
+            serde_json::json!({ "dimension": "identity:example:v1" }),
+        )
+        .await;
+        seed_delegates_to(&backend, local, other, &serde_json::json!(["infra:attest"])).await;
+
+        let (mut gated, mut commons) = (None, None);
+        for r in bridge.list_attestation_holdings().await {
+            let bytes = bridge
+                .fetch_envelope_bytes(EnvelopeKind::Attestation, &r.envelope_hash)
+                .await
+                .expect("holdings resolve to bytes");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("wire json");
+            if FederationDirectoryReplicationBridge::attestation_cohort_scope(&v) == "self" {
+                gated = Some(r.envelope_hash);
+            } else {
+                commons = Some(r.envelope_hash);
+            }
+        }
+        let gated = gated.expect("the self row is held");
+        let commons = commons.expect("the federation row is held");
+
+        let before = metrics.withholds(crate::observability::WithholdReason::RecipientNotInSendSet);
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &gated, None)
+                .await
+                .is_none(),
+            "a row with an audience gate is not served to nobody in particular"
+        );
+        assert!(
+            metrics.withholds(crate::observability::WithholdReason::RecipientNotInSendSet) > before,
+            "the refusal is booked"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &commons, None)
+                .await
+                .is_some(),
+            "a commons row has no audience to answer"
         );
     }
 
