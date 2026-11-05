@@ -936,6 +936,8 @@ impl EdgeTelemetry {
     }
 
     /// Project everything.
+    // Straight-line field projection; its length grows with the bundle.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn snapshot(&self) -> TelemetrySnapshot {
         let kinds = envelope_kind_tokens();
@@ -1203,6 +1205,8 @@ const fn spec(
 const REASON: Option<(&str, LabelValues)> = Some(("reason", LabelValues::Tokens));
 const KINDS: Option<(&str, LabelValues)> = Some(("kind", LabelValues::EnvelopeKinds));
 
+// A catalogue row's label is an `Option`; this is its closed spelling.
+#[allow(clippy::unnecessary_wraps)]
 const fn closed(
     key: &'static str,
     v: &'static [&'static str],

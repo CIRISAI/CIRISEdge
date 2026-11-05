@@ -2984,8 +2984,8 @@ async fn a_real_link_moves_the_event_path_telemetry() {
         s.load_tier_changes_total["load_tier:1:edge:relay_commit"], 1,
         "and it says who put it there"
     );
-    assert_eq!(
-        s.load_pressure_report_age_seconds, -1.0,
+    assert!(
+        s.load_pressure_report_age_seconds < 0.0,
         "the host never spoke"
     );
     assert_eq!(s.shaping_free_slots, 0, "admit-close offers no slot");

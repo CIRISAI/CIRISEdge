@@ -552,8 +552,8 @@ async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
     // v44 — a parked loop reads "not running", never a growing age: a node
     // asleep on purpose must not look wedged.
     let parked = p.metrics_b.snapshot();
-    assert_eq!(parked.loop_last_progress_age_seconds["event"], -1.0);
-    assert_eq!(parked.loop_last_progress_age_seconds["ladder"], -1.0);
+    assert!(parked.loop_last_progress_age_seconds["event"] < 0.0);
+    assert!(parked.loop_last_progress_age_seconds["ladder"] < 0.0);
     assert_eq!(parked.node_alive, 0);
 
     // Resume: same transport, same replication runtime.

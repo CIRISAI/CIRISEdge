@@ -1,6 +1,9 @@
 //! The catalogue's completeness, the bag's mechanics, and the witness harness
 //! every signal test leans on.
 
+// `-1.0` and `0.0` here are sentinels and whole seconds, stored exactly.
+#![allow(clippy::float_cmp)]
+
 use super::*;
 use crate::observability::{
     EdgeMetrics, FlatMetrics, AV_PLANE_LABELS, DIRECT_LINK_LABELS, EDGE_METRICS_BUNDLE_FIELDS,

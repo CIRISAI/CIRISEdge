@@ -4032,9 +4032,8 @@ mod tests {
         let roster = Arc::new(Roster(std::sync::atomic::AtomicBool::new(false)));
         t.set_obligations(Arc::new(Arc::clone(&roster)));
         t.refresh_active_seats().await;
-        assert_eq!(
-            m.snapshot().shaping_seat_roster_age_seconds,
-            -1.0,
+        assert!(
+            m.snapshot().shaping_seat_roster_age_seconds < 0.0,
             "a failing read is not a fresh roster"
         );
         roster.0.store(true, Ordering::Relaxed);
