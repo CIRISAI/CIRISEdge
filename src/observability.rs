@@ -296,6 +296,18 @@ pub enum WithholdReason {
     /// restriction to its own `consent:replication:v1` grant covering this row's
     /// dimension, and the recipient does not hold that capability.
     RecipientCapabilityRestriction,
+    /// A `trace:` row of this node's own (or its owner's) authorship was
+    /// withheld from a serve-capable consent peer because no live
+    /// `consent:replication` grant naming that peer covers the row's dimension.
+    /// Being found and sharing traces are two consents: a grant covering
+    /// `trace:` for one peer says nothing about another peer whose grant only
+    /// announces the node.
+    TraceNotConsentedToRecipient,
+    /// The read behind that decision failed (a grant, the owner of this node or
+    /// the owner of the peer). Fail-closed, and held apart from
+    /// [`Self::TraceNotConsentedToRecipient`]: a transient read error is not a
+    /// statement about what the owner consented to.
+    TraceConsentReadError,
     /// A row present in local state could not be serialized to its content hash
     /// (`content_hash_of` / `serde_json::to_value` returned nothing), so it is
     /// OMITTED from the advertise set and will never replicate. Near-impossible
@@ -623,6 +635,8 @@ impl WithholdReason {
             Self::TrustRootWalkError => "trust_root_walk_error",
             Self::RecipientNotRooted => "recipient_not_rooted",
             Self::RecipientCapabilityRestriction => "recipient_capability_restriction",
+            Self::TraceNotConsentedToRecipient => "trace_not_consented_to_recipient",
+            Self::TraceConsentReadError => "trace_consent_read_error",
             Self::RowNotSerializable => "row_not_serializable",
             Self::RowHashUndecodable => "row_hash_undecodable",
             Self::ConfigPaused => "config_paused",
