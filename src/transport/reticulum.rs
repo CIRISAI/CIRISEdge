@@ -15563,8 +15563,8 @@ async fn park_while_keying(event: NodeEvent, ctx: &EventCtx<'_>) -> Option<NodeE
     let (link_id, bytes) = match &event {
         NodeEvent::MessageReceived { link_id, data, .. }
         | NodeEvent::LinkDataReceived { link_id, data }
-        | NodeEvent::RequestReceived { link_id, data, .. } => (*link_id, data.len()),
-        NodeEvent::ResourceCompleted {
+        | NodeEvent::RequestReceived { link_id, data, .. }
+        | NodeEvent::ResourceCompleted {
             link_id,
             data,
             is_sender: false,
@@ -15671,14 +15671,10 @@ async fn seal_inbound(
     close_evicted(ctx);
     match outcome {
         Inbound::Open(plain) => shaped_inbound(ctx, link_id, lane, plain).await,
-        Inbound::Pending | Inbound::Closed | Inbound::RouteAnswered => None,
+        // `Keyed` comes only from `finish_keying`, which `apply_keying` reads.
+        Inbound::Pending | Inbound::Closed | Inbound::RouteAnswered | Inbound::Keyed { .. } => None,
         Inbound::Handshake(job) => {
             admit_handshake(ctx, link_id, job).await;
-            None
-        }
-        Inbound::Keyed { claimed } => {
-            link_keyed(ctx, link_id, claimed).await;
-            replay_before_keys(ctx, link_id).await;
             None
         }
         Inbound::RouteRequested {

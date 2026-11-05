@@ -89,10 +89,8 @@ fn a_fresh_identity_flood_stays_bounded_past_the_sender_table_947() {
     );
 }
 
-#[test]
-fn the_stranger_rate_covers_every_stranger_a_route_fetch_lets_through_947() {
-    assert!(HANDSHAKES_STRANGER_NODE >= ROUTE_REQUESTS_PER_WINDOW);
-}
+// Every stranger a route fetch lets through can also key.
+const _: () = assert!(HANDSHAKES_STRANGER_NODE >= ROUTE_REQUESTS_PER_WINDOW);
 
 fn seals() -> Arc<LinkSeals> {
     Arc::new(LinkSeals::new(

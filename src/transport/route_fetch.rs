@@ -22,9 +22,11 @@
 //! The dialler admits it through persist's key door (proof of possession,
 //! fingerprint) before the route row is read.
 //!
-//! Receiver order at the responder, BEFORE any directory read: one request
-//! per link, a node-wide rate ([`RouteRequestLimiter`]), only its own key
-//! answered. The responder serves nothing and buffers nothing until the
+//! Receiver order at the responder, BEFORE the request is parsed past its
+//! tag: one request per link, the sender's rate ([`SenderRouteLimiter`]), then
+//! the node-wide rate ([`RouteRequestLimiter`]) last, so a sender's refused
+//! requests spend only its own budget. Then, before any directory read, only
+//! its own key is answered. The responder serves nothing and buffers nothing until the
 //! seal completes; a link whose first frame is anything else is refused and
 //! closed (as every non-handshake first frame already is). Where no
 //! responder can be reached, the pairing pin (CC 3.2 (f)) is the failover.
@@ -190,9 +192,12 @@ pub enum RouteFetchError {
     /// A request of a framing version this build does not speak.
     #[error("route request framing version {0} is not supported")]
     UnsupportedVersion(u8),
-    /// A second request on the link, or one over the node-wide rate: refused
-    /// before anything is read.
-    #[error("route request refused by the receiver order (per link once; node-wide rate)")]
+    /// A second request on the link, or one over the sender's or the node-wide
+    /// rate: refused before anything is read.
+    #[error(
+        "route request refused by the receiver order (per link once; sender's rate; node-wide \
+         rate)"
+    )]
     RateLimited,
     /// A route request on a link that is not an identity-plane link (a scoped
     /// or A/V link to a derived address). Refused BEFORE the key is compared,

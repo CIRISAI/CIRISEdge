@@ -2371,6 +2371,8 @@ async fn measure_flood_cost_947() {
     };
     let (per_sec, secs) = (env("FLOOD_PER_SEC", 40), env("FLOOD_SECS", 20));
     let t = trio("measure", true, false, false).await;
+    t.a.transport
+        .set_decap_delay_for_test(Duration::from_millis(env("DECAP_MS", 0))); // seam-only
     one_way(&t.b, &t.a, 0, b"947-MEASURE-WARMUP-")
         .await
         .expect("B's link is up");

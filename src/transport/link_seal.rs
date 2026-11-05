@@ -33,8 +33,8 @@
 //!   at establishment (or at its first frame, when the establishment event
 //!   was lost). Until a valid handshake completes it delivers NOTHING upward
 //!   and the seal refuses every send. A route request as the first frame
-//!   passes the receiver order (once per link, the node-wide rate) BEFORE
-//!   it is read, and is answered only with this node's own signed row,
+//!   passes the receiver order (once per link, the sender's rate, the
+//!   node-wide rate) BEFORE it is read, and is answered only with this node's own signed row,
 //!   unsealed, the one thing besides the handshake that is. A non-`CTKX`,
 //!   non-`CTKR` first frame, a missing handshake (budget expiry,
 //!   [`LinkSeals::expire`]), an oversize declaration, a bad or

@@ -204,7 +204,7 @@ impl Keyer {
     /// admitted job, and admission is bounded by the queues.
     #[must_use]
     pub fn new(seals: Arc<LinkSeals>) -> (Arc<Self>, mpsc::UnboundedReceiver<KeyingDone>) {
-        let cores = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
+        let cores = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
         let (done, rx) = mpsc::unbounded_channel();
         (
             Arc::new(Self {
@@ -259,15 +259,16 @@ impl Keyer {
     /// the push, so a job is never left with no worker coming.
     fn drain(&self) {
         loop {
-            let job = {
+            let next = {
                 let mut q = self.queues();
-                match q.standing.pop_front().or_else(|| q.strangers.pop_front()) {
-                    Some(job) => job,
-                    None => {
-                        q.running -= 1;
-                        return;
-                    }
+                let next = q.standing.pop_front().or_else(|| q.strangers.pop_front());
+                if next.is_none() {
+                    q.running -= 1;
                 }
+                next
+            };
+            let Some(job) = next else {
+                return;
             };
             // Unwinding here would lose a worker for good, which is the wedge
             // in slow motion: a panic is one refused link instead.
