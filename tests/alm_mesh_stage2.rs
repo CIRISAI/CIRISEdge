@@ -15,6 +15,8 @@
 //!   a consumer that falls 1.5 s behind drops the media older than 800 ms by
 //!   age, the hop counter skips past it, and later frames open and arrive;
 //!   media rides leviculum's timed Channel frames between C3 peers.
+//! - **Epoch roll** (`an_epoch_roll_reads_as_a_resync_on_a_live_link`,
+//!   CIRISEdge#945): a real room commit is a meter resync, not a loss burst.
 //!
 //! Requires `transport-reticulum`:
 //! `cargo test --features "transport-http transport-reticulum" --test alm_mesh_stage2`
@@ -815,4 +817,91 @@ async fn a_refused_admit_is_resent_not_withdrawn() {
         "A resent: {:?}",
         a.metrics.av_plane()
     );
+}
+
+/// The C7 lines that put `peer` in `PeerState::Degraded` (value 1).
+fn degraded_lines(call: &Call, peer: &str) -> Vec<String> {
+    let subject = format!("subj=Some({peer:?}) v=1 ");
+    call.alm_log()
+        .2
+        .lines()
+        .filter(|l| l.contains(" PeerState ") && l.contains(&subject))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Keep `call`'s frame queue moving, and report the newest epoch heard.
+fn drain(call: &mut Call) -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+    let mut rx = call.frames().expect("the call's frames");
+    let newest = Arc::new(AtomicU64::new(0));
+    let seen = Arc::clone(&newest);
+    let task = tokio::spawn(async move {
+        while let Some(f) = rx.recv().await {
+            seen.fetch_max(f.epoch.0, Ordering::Relaxed);
+        }
+    });
+    (newest, task)
+}
+
+/// **CIRISEdge#945 item 1, on a live link.** A real room commit rolls A's
+/// stream: `chunk_seq` back to 0 in a new epoch, with B's parent direct and
+/// the loopback clean. B's path read nothing lost, so it stays Available.
+/// Mutation: one sequence key across epochs reads the roll as a loss of about
+/// 1.0 and the C7 log shows A going Degraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_epoch_roll_reads_as_a_resync_on_a_live_link() {
+    let tag = "alm2-roll";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    wait_bound(&cb, 1).await;
+    let (newest, task) = drain(&mut cb);
+    let parented = wait_until(Duration::from_secs(30), || async {
+        primary_for(&cb, ca.stream()).as_deref() == Some(a.key.key_id.as_str())
+    })
+    .await;
+    assert!(parented, "B chose A: {:?}", cb.alm_log());
+    for seq in 0..150 {
+        ca.publish(Frame::opaque(body("a", seq)))
+            .await
+            .expect("publish");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        degraded_lines(&cb, &a.key.key_id),
+        Vec::<String>::new(),
+        "clean before the roll"
+    );
+    let pre = ca.epoch().await;
+    let up = groups[0].rotate().await.expect("rotate");
+    let _ = groups[1]
+        .apply_remote_commit(up.commit())
+        .await
+        .expect("B applies");
+    for seq in 150..450 {
+        ca.publish(Frame::opaque(body("a", seq)))
+            .await
+            .expect("publish");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ca.epoch().await > pre, "A's stream rolled");
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            newest.load(Ordering::Relaxed) > pre.0
+        })
+        .await,
+        "B heard the new epoch"
+    );
+    let lines = degraded_lines(&cb, &a.key.key_id);
+    eprintln!(
+        "[ALM2] roll: {} -> {}, Degraded lines {}",
+        pre.0,
+        ca.epoch().await.0,
+        lines.len()
+    );
+    assert_eq!(lines, Vec::<String>::new(), "{:?}", cb.alm_log());
+    task.abort();
 }

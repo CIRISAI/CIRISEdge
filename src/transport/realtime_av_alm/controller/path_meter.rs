@@ -39,6 +39,18 @@ pub struct PathSnapshot {
     pub stability: f64,
 }
 
+/// Where a chunk sits in its stream, ordered by epoch, then sequence.
+///
+/// `chunk_seq` is epoch-local: it restarts at every epoch roll (#846), so
+/// sequence numbers compare only within one epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChunkPos {
+    /// The room epoch it was sealed in.
+    pub epoch: u64,
+    /// Its epoch-local sequence number.
+    pub seq: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct Acc {
     bytes: u64,
@@ -60,7 +72,7 @@ pub struct PathMeter {
     alpha: f64,
     window_start: Option<u64>,
     acc: Acc,
-    highest_seq: Option<u64>,
+    highest: Option<ChunkPos>,
     last_arrival_ms: Option<u64>,
     last_latency: Option<f64>,
     min_latency: Option<f64>,
@@ -85,7 +97,7 @@ impl PathMeter {
             alpha,
             window_start: None,
             acc: Acc::default(),
-            highest_seq: None,
+            highest: None,
             last_arrival_ms: None,
             last_latency: None,
             min_latency: None,
@@ -107,21 +119,25 @@ impl PathMeter {
     /// One chunk arrived on this path. `latency_ms` is source-to-here (the
     /// sim knows it; production uses the arrival lag behind the earliest copy
     /// plus the forwarder's advertised upstream latency).
+    ///
+    /// A chunk of a newer epoch is a resync, not a gap: its sequence number
+    /// restarted and says nothing about the old epoch's tail. A straggler
+    /// from an older epoch reads as reordered.
     #[allow(clippy::cast_precision_loss)]
-    pub fn on_chunk(&mut self, now_ms: u64, seq: u64, bytes: u64, latency_ms: f64) {
+    pub fn on_chunk(&mut self, now_ms: u64, pos: ChunkPos, bytes: u64, latency_ms: f64) {
         self.window_start.get_or_insert(now_ms);
-        match self.highest_seq {
-            Some(h) if seq <= h => return, // reordered / duplicate on this path
-            Some(h) => {
-                let gap = seq - h - 1;
+        match self.highest {
+            Some(h) if pos <= h => return, // reordered / duplicate on this path
+            Some(h) if pos.epoch == h.epoch => {
+                let gap = pos.seq - h.seq - 1;
                 self.acc.lost += gap;
                 if gap >= BURST_RUN {
                     self.acc.burst = true;
                 }
             }
-            None => {}
+            Some(_) | None => {}
         }
-        self.highest_seq = Some(seq);
+        self.highest = Some(pos);
         self.acc.bytes += bytes;
         self.acc.chunks += 1;
         self.acc.latency_sum += latency_ms;
@@ -146,7 +162,7 @@ impl PathMeter {
     /// Forget sequence continuity (the subscription restarted: a gap across
     /// an unsubscribed interval is not loss).
     pub fn restart(&mut self) {
-        self.highest_seq = None;
+        self.highest = None;
         self.last_latency = None;
     }
 
@@ -287,15 +303,19 @@ impl EgressMeter {
 mod tests {
     use super::*;
 
+    fn at(epoch: u64, seq: u64) -> ChunkPos {
+        ChunkPos { epoch, seq }
+    }
+
     #[test]
     fn meter_counts_gaps_bursts_and_rate() {
         let mut m = PathMeter::new(1_000, 1.0);
         for seq in 0..10 {
-            m.on_chunk(seq * 50, seq, 1_000, 40.0);
+            m.on_chunk(seq * 50, at(1, seq), 1_000, 40.0);
         }
         // seq 10..=13 lost (burst of 4), then 14..19 arrive.
         for seq in 14..20 {
-            m.on_chunk(seq * 50, seq, 1_000, 40.0);
+            m.on_chunk(seq * 50, at(1, seq), 1_000, 40.0);
         }
         assert!(m.roll(1_000));
         let s = m.snapshot();
@@ -309,11 +329,39 @@ mod tests {
     #[test]
     fn silence_is_not_loss_and_restart_forgets_continuity() {
         let mut m = PathMeter::new(1_000, 1.0);
-        m.on_chunk(0, 5, 100, 10.0);
+        m.on_chunk(0, at(1, 5), 100, 10.0);
         m.restart();
-        m.on_chunk(10, 50, 100, 10.0);
+        m.on_chunk(10, at(1, 50), 100, 10.0);
         assert!(m.roll(5_000));
         assert!(m.snapshot().loss.abs() < 1e-12);
+    }
+
+    /// #945 item 1: `chunk_seq` restarts at a roll, so the jump is no gap. A
+    /// gap inside the new epoch still is, and an old epoch's straggler is
+    /// reordered, not a rewind that would forgive the next gap.
+    #[test]
+    fn an_epoch_change_resyncs_and_a_straggler_changes_nothing() {
+        let mut m = PathMeter::new(1_000, 1.0);
+        for seq in 900..950 {
+            m.on_chunk(seq - 900, at(1, seq), 100, 10.0);
+        }
+        for seq in 0..50 {
+            m.on_chunk(50 + seq, at(2, seq), 100, 10.0);
+        }
+        assert!(m.roll(1_000));
+        let s = m.snapshot();
+        assert!(s.loss.abs() < 1e-12, "a roll is no loss: {}", s.loss);
+        assert!(s.burst.abs() < 1e-12, "a roll is no burst: {}", s.burst);
+
+        m.on_chunk(1_000, at(1, 950), 100, 10.0);
+        m.on_chunk(1_001, at(2, 50), 100, 10.0);
+        m.on_chunk(1_002, at(2, 52), 100, 10.0);
+        assert!(m.roll(2_000));
+        assert!(
+            (m.snapshot().loss - 1.0 / 3.0).abs() < 1e-9,
+            "one gap in the new epoch, the straggler uncounted: {}",
+            m.snapshot().loss
+        );
     }
 
     #[test]

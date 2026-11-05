@@ -39,7 +39,7 @@ use crate::transport::realtime_av_alm::controller::wire::{
     self, encode, encode_caps, CAPS_THIS_BUILD, CAP_C3_V1, CAP_RELAY, CAP_TIMED_FRAMES,
 };
 use crate::transport::realtime_av_alm::controller::{
-    Admission, AdmitDecision, ControlFrame, ControlMsg, ControllerConfig, DecisionKind,
+    Admission, AdmitDecision, ChunkPos, ControlFrame, ControlMsg, ControllerConfig, DecisionKind,
     DecisionLog, EgressMeter, ParentSelector, RefuseReason, Role, SelectorAction, ShedReason,
     SplitMix64, SubscribeRequest,
 };
@@ -551,8 +551,8 @@ impl AlmState {
             .find(|(p, _)| p == from)
             .map(|(_, r)| r);
         let full = role == Some(Role::Primary);
-        let key = (epoch << 32) | (seq & 0xFFFF_FFFF);
-        sel.on_chunk(now, &from.to_owned(), key, full, bytes, latency);
+        let pos = ChunkPos { epoch, seq };
+        sel.on_chunk(now, &from.to_owned(), pos, full, bytes, latency);
         if sel.primary().is_some_and(|p| p == from) {
             self.rates
                 .entry(stream)
@@ -994,6 +994,7 @@ impl AlmState {
 mod tests {
     use super::*;
     use crate::transport::realtime_av_alm::controller::wire::{decode, WireFrame};
+    use crate::transport::realtime_av_alm::controller::PeerState;
 
     fn s(b: u8) -> StreamId {
         StreamId([b; 32])
@@ -1123,5 +1124,224 @@ mod tests {
             }))
         )));
         assert!(a.relays[&s(7)].admit_closed());
+    }
+
+    // ── #945: three real controllers, C3 through the real encoder ────────
+
+    const A: usize = 0;
+    const B: usize = 1;
+    const C: usize = 2;
+    const NAMES: [&str; 3] = ["a", "b", "c"];
+    /// One chunk's size on the wire (bytes).
+    const CHUNK: u64 = 300;
+    /// One media step: a chunk period (ms).
+    const STEP_MS: u64 = 20;
+
+    /// A publishes, C relays, B subscribes. Every frame between them is
+    /// encoded and decoded as on a link, and which chunk reaches which path
+    /// is what `own_exclude` and `forward_exclude` say, so a standby skips
+    /// exactly what production skips. Time moves by shifting each clock.
+    struct Mesh {
+        nodes: Vec<AlmState>,
+        sa: StreamId,
+        epoch: u64,
+        seq: u64,
+        ticks: u64,
+        /// Whether C's offers reach B.
+        c_offers_to_b: bool,
+        /// Withhold every `n`th chunk of A's direct leg to B.
+        withhold_b: Option<u64>,
+    }
+
+    impl Mesh {
+        fn new() -> Self {
+            let sa = s(1);
+            let roster = roster();
+            let mut nodes = vec![
+                AlmState::new("a", sa, &roster, false, 1),
+                AlmState::new("b", s(2), &roster, false, 2),
+                AlmState::new("c", s(3), &roster, true, 3),
+            ];
+            for (i, n) in nodes.iter_mut().enumerate() {
+                for (j, peer) in NAMES.iter().enumerate() {
+                    if i != j {
+                        n.on_caps(peer, CAPS_THIS_BUILD);
+                    }
+                }
+            }
+            nodes[B].note_publisher(sa, "a");
+            nodes[C].note_publisher(sa, "a");
+            Self {
+                nodes,
+                sa,
+                epoch: 1,
+                seq: 0,
+                ticks: 0,
+                c_offers_to_b: true,
+                withhold_b: None,
+            }
+        }
+
+        fn advance(&mut self, ms: u64) {
+            for n in &mut self.nodes {
+                n.t0 =
+                    n.t0.checked_sub(Duration::from_millis(ms))
+                        .expect("the clock is past the shift");
+            }
+        }
+
+        fn route(&mut self, mut q: VecDeque<(usize, Outgoing)>) {
+            while let Some((from, o)) = q.pop_front() {
+                let to = NAMES.iter().position(|n| *n == o.to).expect("a member");
+                match decode(&o.frame, NAMES[from]).expect("decodes") {
+                    WireFrame::Caps(c) => {
+                        self.nodes[to].on_caps(NAMES[from], c);
+                    }
+                    WireFrame::Control(cf) => {
+                        for r in self.nodes[to].on_control(NAMES[from], cf, 20.0) {
+                            q.push_back((to, r));
+                        }
+                    }
+                }
+            }
+        }
+
+        fn tick(&mut self) {
+            let mut q = VecDeque::new();
+            for i in [A, B, C] {
+                let legs: Vec<String> = NAMES
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i && (i != C || *j != B || self.c_offers_to_b))
+                    .map(|(_, n)| (*n).to_owned())
+                    .collect();
+                for o in self.nodes[i].tick(&legs) {
+                    q.push_back((i, o));
+                }
+            }
+            self.route(q);
+        }
+
+        /// One chunk of A's stream, as the fan-out and the relay send it.
+        fn chunk(&mut self, base_or_audio: bool) {
+            let (sa, epoch, seq) = (self.sa, self.epoch, self.seq);
+            self.seq += 1;
+            let at = crate::transport::av_chunk_auth::unix_ms_now();
+            let legs = vec!["b".to_owned(), "c".to_owned()];
+            let excluded = self.nodes[A].own_exclude(&legs, base_or_audio);
+            self.nodes[A].on_own_published(CHUNK, base_or_audio);
+            let withheld = self.withhold_b.is_some_and(|n| seq % n == 0);
+            if !excluded.contains(&legs[0]) && !withheld {
+                self.nodes[A].on_sent("b", CHUNK);
+                self.nodes[B].on_chunk(sa, "a", epoch, seq, CHUNK, at, base_or_audio);
+            }
+            if excluded.contains(&legs[1]) {
+                return;
+            }
+            self.nodes[A].on_sent("c", CHUNK);
+            self.nodes[C].on_chunk(sa, "a", epoch, seq, CHUNK, at, base_or_audio);
+            let c_legs = vec!["a".to_owned(), "b".to_owned()];
+            let forward =
+                self.nodes[C].forward_exclude(sa, epoch, seq, "a", "a", &c_legs, base_or_audio);
+            if forward.is_some_and(|skip| !skip.contains(&c_legs[1])) {
+                self.nodes[C].on_sent("b", CHUNK);
+                self.nodes[B].on_chunk(sa, "c", epoch, seq, CHUNK, at, base_or_audio);
+            }
+        }
+
+        /// `ms` of media: each period one base-or-audio chunk and
+        /// `enhancement` chunks above it, ticking at 10 Hz.
+        fn run(&mut self, ms: u64, enhancement: u64, mut each_tick: impl FnMut(&Self)) {
+            for _ in 0..ms / STEP_MS {
+                self.advance(STEP_MS);
+                self.chunk(true);
+                for _ in 0..enhancement {
+                    self.chunk(false);
+                }
+                self.ticks += 1;
+                if self.ticks % 5 == 0 {
+                    self.tick();
+                    each_tick(self);
+                }
+            }
+        }
+
+        /// A's stream rolls: a new epoch, `chunk_seq` back to 0.
+        fn roll(&mut self) {
+            self.epoch += 1;
+            self.seq = 0;
+        }
+
+        fn b_sel(&self) -> &ParentSelector<String> {
+            &self.nodes[B].sels[&self.sa]
+        }
+
+        fn b_parents(&self) -> AlmParents {
+            self.nodes[B]
+                .parents()
+                .into_iter()
+                .find(|p| p.stream == self.sa)
+                .expect("B hears A's stream")
+        }
+
+        fn state_of(&self, p: &str) -> Option<PeerState> {
+            self.b_sel().state_of(&p.to_owned())
+        }
+    }
+
+    fn degraded_ticks(states: &[PeerState]) -> usize {
+        states.iter().filter(|s| **s == PeerState::Degraded).count()
+    }
+
+    /// #945 item 1: `chunk_seq` restarts at every roll. Neither path lost
+    /// anything, so neither goes Degraded. Mutation: back to one key across
+    /// epochs and both read a loss of about 1.0 for the roll's window.
+    #[test]
+    fn an_epoch_roll_is_a_resync_on_every_path() {
+        let mut m = Mesh::new();
+        m.run(15_000, 0, |_| {});
+        let p = m.b_parents();
+        assert_eq!(p.primary.as_deref(), Some("a"), "{p:?}");
+        assert_eq!(p.standby.as_deref(), Some("c"), "{p:?}");
+        m.roll();
+        let (mut primary, mut standby) = (Vec::new(), Vec::new());
+        m.run(12_000, 0, |m| {
+            primary.extend(m.state_of("a"));
+            standby.extend(m.state_of("c"));
+        });
+        assert_eq!(
+            (degraded_ticks(&primary), degraded_ticks(&standby)),
+            (0, 0),
+            "ticks Degraded after a loss-free roll: primary {primary:?} standby {standby:?}"
+        );
+    }
+
+    /// #945 item 1, the failover: a roll on a healthy direct primary must not
+    /// hand the stream to a relay. C's standby joins just after the roll, so
+    /// its meter never saw it: reading the roll as loss leaves the primary
+    /// scoring far below a clean standby.
+    #[test]
+    fn an_epoch_roll_does_not_move_a_direct_primary() {
+        let mut m = Mesh::new();
+        m.c_offers_to_b = false;
+        m.run(15_000, 0, |_| {});
+        assert_eq!(m.b_parents().primary.as_deref(), Some("a"));
+        assert_eq!(m.b_parents().standby, None);
+        m.roll();
+        m.c_offers_to_b = true;
+        m.run(20_000, 0, |_| {});
+        let p = m.b_parents();
+        assert_eq!(
+            p.standby.as_deref(),
+            Some("c"),
+            "the standby came up: {p:?}"
+        );
+        assert_eq!(p.primary.as_deref(), Some("a"), "{p:?}");
+        assert_eq!(
+            p.parent_changes,
+            0,
+            "the direct primary stayed: {}",
+            m.nodes[B].log_tail()
+        );
     }
 }

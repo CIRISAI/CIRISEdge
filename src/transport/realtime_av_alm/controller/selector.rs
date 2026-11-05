@@ -47,7 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::decision_log::{DecisionKind, DecisionLog};
-use super::path_meter::PathMeter;
+use super::path_meter::{ChunkPos, PathMeter};
 use super::peer_state::{PeerHealth, PeerState};
 use super::{AdmitDecision, ControllerConfig, JitterSource, Offer, PeerRef, Role, Tier};
 
@@ -403,7 +403,7 @@ impl<P: PeerRef> ParentSelector<P> {
         &mut self,
         now_ms: u64,
         from: &P,
-        seq: u64,
+        pos: ChunkPos,
         full: bool,
         bytes: u64,
         latency_ms: f64,
@@ -422,7 +422,7 @@ impl<P: PeerRef> ParentSelector<P> {
         if !c.link.subscribed() {
             return;
         }
-        c.meter.on_chunk(now_ms, seq, bytes, latency_ms);
+        c.meter.on_chunk(now_ms, pos, bytes, latency_ms);
         if let Link::Promoting {
             first_full_ms,
             full_chunks,
@@ -1256,6 +1256,10 @@ mod tests {
     use super::super::{AdmitDecision, SplitMix64};
     use super::*;
 
+    fn at(seq: u64) -> ChunkPos {
+        ChunkPos { epoch: 0, seq }
+    }
+
     fn offer(from: u32, headroom_streams: u64, cfg: &ControllerConfig) -> Offer<u32> {
         Offer {
             from,
@@ -1288,7 +1292,7 @@ mod tests {
             for (p, role) in s.subscriptions() {
                 let rtt = offers.iter().find(|o| o.0 == p).map_or(50.0, |o| o.2);
                 for k in 0..5 {
-                    s.on_chunk(t, &p, seq + k, role == Role::Primary, 6_000, rtt / 2.0);
+                    s.on_chunk(t, &p, at(seq + k), role == Role::Primary, 6_000, rtt / 2.0);
                 }
             }
             seq += 5;
@@ -1389,7 +1393,7 @@ mod tests {
                     }
                 }
                 for (p, role) in s.subscriptions() {
-                    s.on_chunk(t, &p, t / 250, role == Role::Primary, 6_000, 5.0);
+                    s.on_chunk(t, &p, at(t / 250), role == Role::Primary, 6_000, 5.0);
                 }
                 t += 250;
             }
@@ -1427,7 +1431,7 @@ mod tests {
             }
             for (p, role) in s.subscriptions() {
                 for k in 0..10 {
-                    s.on_chunk(t, &p, t / 25 + k, role == Role::Primary, 6_000, 5.0);
+                    s.on_chunk(t, &p, at(t / 25 + k), role == Role::Primary, 6_000, 5.0);
                 }
             }
             t += 250;
@@ -1498,7 +1502,7 @@ mod tests {
             *s.standby().expect("standby"),
         );
         // The host starts publishing: the standby's copy lands first.
-        s.on_chunk(t, &st, 1, false, 100, 5.0);
+        s.on_chunk(t, &st, at(1), false, 100, 5.0);
         let _ = s.tick(t + 250, &mut rng, &mut log);
         assert_eq!(
             s.primary(),
@@ -1510,7 +1514,7 @@ mod tests {
         let mut now = t + 250;
         for k in 2..12 {
             now += 250;
-            s.on_chunk(now, &st, k, false, 100, 5.0);
+            s.on_chunk(now, &st, at(k), false, 100, 5.0);
             let _ = s.tick(now, &mut rng, &mut log);
         }
         assert_ne!(
