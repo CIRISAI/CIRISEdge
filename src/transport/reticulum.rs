@@ -5856,13 +5856,13 @@ impl ReticulumTransport {
         self.seals.set_stranger_handshake_cap(cap);
     }
 
-    /// v44 LTS test seam — the next `n` decapsulations panic.
+    /// v44 LTS test seam — the next decapsulation panics.
     #[doc(hidden)]
     pub fn panic_next_decap_for_test(&self) {
         self.seals.panic_next_decap();
     }
 
-    /// v44 LTS test seam — keyings that panicked and were contained.
+    /// v44 LTS test seam — the cap on keyed strangers.
     #[doc(hidden)]
     pub fn set_keyed_strangers_max_for_test(&self, max: usize) {
         self.seals.set_keyed_strangers_max(max);
@@ -15921,6 +15921,35 @@ fn admission_refused(
     });
 }
 
+/// v44 LTS — count a keyed identity-plane link with no standing, and close the
+/// oldest past [`crate::transport::link_seal::STRANGER_KEYED_LINKS_MAX`]. A
+/// scoped or A/V link is not counted: reaching one takes the room's secret, and
+/// its derived identity is in no table that could show standing. One that has
+/// earned standing since it keyed is kept, and leaves the ledger for good.
+async fn bound_keyed_strangers(ctx: &EventCtx<'_>, link_id: LinkId) {
+    if has_standing_now(ctx, link_id).await {
+        return;
+    }
+    for link in ctx.seals.note_keyed_stranger(link_id.into_bytes()) {
+        let link = LinkId::new(link);
+        if !has_standing_now(ctx, link).await {
+            admission_refused(
+                ctx,
+                link,
+                &crate::transport::link_seal::SealRefusal::StrangerCap,
+            );
+        }
+    }
+}
+
+/// Whether `link`'s proven identity has standing now.
+async fn has_standing_now(ctx: &EventCtx<'_>, link: LinkId) -> bool {
+    match ctx.node.get_remote_identity(&link) {
+        Some(id) => identity_has_standing(ctx, id.hash()).await,
+        None => false,
+    }
+}
+
 /// CIRISEdge#947 — close the links the `Awaiting` cap just refused.
 fn close_evicted(ctx: &EventCtx<'_>) {
     for link in ctx.seals.take_evicted() {
@@ -17183,7 +17212,10 @@ async fn link_keyed(ctx: &EventCtx<'_>, link_id: LinkId, claimed: String) {
     );
     let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
     match plane {
-        LinkPlane::Identity => spawn_first_words(ctx, link_id),
+        LinkPlane::Identity => {
+            bound_keyed_strangers(ctx, link_id).await;
+            spawn_first_words(ctx, link_id);
+        }
         LinkPlane::Av => deliver_av_frame(ctx, link_id, dest, None).await,
         LinkPlane::Scoped => {}
     }

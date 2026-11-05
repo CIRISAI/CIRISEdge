@@ -2611,6 +2611,50 @@ async fn a_suspend_during_keying_leaves_nothing_behind_947() {
     );
 }
 
+/// **Witness (v44 LTS, `FSD/EVENT_PATH_MODEL.md` §2.6)** — keyed links with no
+/// standing are bounded by count, oldest out, on real links. The rate does not
+/// do it: these links stay keyed for the whole idle bound. A peer with standing
+/// is not counted, and its link stays up through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_oldest_keyed_stranger_gives_way_and_a_peer_with_standing_does_not() {
+    const CAP: u64 = 2;
+    const STRANGERS: u64 = 5;
+    let t = trio("strangercap", true, false, false).await;
+    t.a.transport
+        .prime_peer(
+            &t.b.key.key_id,
+            t.b.transport.local_named_dest_hash(),
+            t.b.transport.local_transport_pubkey(),
+        )
+        .await
+        .expect("prime B at A");
+    one_way(&t.b, &t.a, 1, b"LTS-CAP-BEFORE-")
+        .await
+        .expect("B's link is up");
+    t.a.transport.set_keyed_strangers_max_for_test(CAP as usize);
+    let f = flooder(&t).await;
+    for _ in 0..STRANGERS {
+        f.one(FloodIdentity::Fresh).await;
+    }
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.seal(ciris_edge::observability::LINK_SEAL_REFUSED_STRANGER_CAP) == STRANGERS - CAP
+        })
+        .await,
+        "the oldest strangers gave way: {:?}",
+        t.a.metrics.link_seal()
+    );
+    let links_before = t.b.transport.link_directions_for_test().len();
+    one_way(&t.b, &t.a, 2, b"LTS-CAP-AFTER-")
+        .await
+        .expect("B's link rode through it");
+    assert_eq!(
+        t.b.transport.link_directions_for_test().len(),
+        links_before,
+        "on the link it had"
+    );
+}
+
 /// A process restart of `B`: a new transport over the same identity and
 /// directory, holding what persist holds and nothing else.
 async fn restart_b(t: &Trio) -> (Arc<ReticulumTransport>, EdgeMetrics) {

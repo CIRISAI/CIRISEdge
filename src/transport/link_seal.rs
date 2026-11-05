@@ -180,6 +180,13 @@ pub const HELD_BYTES_NODE_MAX: usize = 8 * HELD_BYTES_MAX;
 /// links must give way first.
 pub const AWAITING_LINKS_MAX: usize = 1024;
 
+/// Most keyed identity-plane links with no standing, node-wide; past it the
+/// oldest is closed, for the reason [`AWAITING_LINKS_MAX`] refuses the oldest.
+/// The handshake rate does not bound these: 256 per 10 s held for the 120 s idle
+/// bound is 3,072 links, three times leviculum's envelope, and cutting the rate
+/// instead costs honest strangers their share (`FSD/EVENT_PATH_MODEL.md` §2.6).
+pub const STRANGER_KEYED_LINKS_MAX: usize = 512;
+
 /// Most handshake bytes reassembling, node-wide: 512 largest handshakes, or a
 /// full [`AWAITING_LINKS_MAX`] of today's 1.3 KB ones.
 pub const AWAITING_BYTES_MAX: usize = 2 * 1024 * 1024;
@@ -362,6 +369,10 @@ pub enum SealRefusal {
     /// are reassembling: this link, the oldest, gives way.
     #[error("the node holds too many half-open links; the oldest gives way, it re-dials")]
     AwaitingCap,
+    /// The node holds [`STRANGER_KEYED_LINKS_MAX`] keyed links with no
+    /// standing: this one, the oldest, gives way.
+    #[error("the node holds too many keyed strangers; the oldest gives way, it re-dials")]
+    StrangerCap,
     /// CIRISEdge#947 — more arrived on the link during its keying than it may
     /// hold.
     #[error(
@@ -419,6 +430,7 @@ impl SealRefusal {
             Self::HandshakeNodeRate { .. } => o::LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE,
             Self::DecapSaturated { .. } => o::LINK_SEAL_REFUSED_DECAP_SATURATED,
             Self::AwaitingCap => o::LINK_SEAL_REFUSED_AWAITING_CAP,
+            Self::StrangerCap => o::LINK_SEAL_REFUSED_STRANGER_CAP,
             Self::KeyingHold => o::LINK_SEAL_REFUSED_KEYING_HOLD,
         }
     }
@@ -801,12 +813,15 @@ pub struct LinkSeals {
     next_ticket: AtomicU64,
     /// [`AWAITING_LINKS_MAX`], as a test knob.
     awaiting_links_max: AtomicUsize,
+    /// Keyed links with no standing, oldest first, and each one's place.
+    keyed_strangers: Mutex<(BTreeMap<u64, [u8; 16]>, HashMap<[u8; 16], u64>, u64)>,
+    /// [`STRANGER_KEYED_LINKS_MAX`], as a test knob.
+    keyed_strangers_max: AtomicUsize,
     /// [`AWAITING_BYTES_MAX`], as a test knob.
     awaiting_bytes_max: AtomicUsize,
     /// Test seam: how long each decapsulation sits, in milliseconds.
     decap_delay_ms: AtomicU64,
     /// Test seam: the next decapsulation panics.
-    #[cfg(test)]
     pub(crate) decap_panics: std::sync::atomic::AtomicBool,
     /// Decapsulations run.
     decaps: AtomicU64,
@@ -844,9 +859,10 @@ impl LinkSeals {
             deferred: Mutex::new(HashMap::new()),
             next_ticket: AtomicU64::new(0),
             awaiting_links_max: AtomicUsize::new(AWAITING_LINKS_MAX),
+            keyed_strangers: Mutex::default(),
+            keyed_strangers_max: AtomicUsize::new(STRANGER_KEYED_LINKS_MAX),
             awaiting_bytes_max: AtomicUsize::new(AWAITING_BYTES_MAX),
             decap_delay_ms: AtomicU64::new(0),
-            #[cfg(test)]
             decap_panics: std::sync::atomic::AtomicBool::new(false),
             decaps: AtomicU64::new(0),
             first_words_delay_ms: AtomicU64::new(0),
@@ -981,7 +997,6 @@ impl LinkSeals {
         &self,
         job: &HandshakeJob,
     ) -> Option<Result<(LinkTransit, String), AvHandshakeError>> {
-        #[cfg(test)]
         assert!(
             !self.decap_panics.swap(false, Ordering::Relaxed),
             "the test seam's panic"
@@ -1126,6 +1141,39 @@ impl LinkSeals {
             self.before_keys().remove(link);
         }
         evicted
+    }
+
+    /// v44 LTS — a link with no standing just keyed. Returns the oldest such
+    /// links past [`STRANGER_KEYED_LINKS_MAX`], never this one, out of the
+    /// ledger: the caller closes each, unless it has since earned standing.
+    pub fn note_keyed_stranger(&self, link: [u8; 16]) -> Vec<[u8; 16]> {
+        let max = self.keyed_strangers_max.load(Ordering::Relaxed);
+        let mut ledger = self
+            .keyed_strangers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (by_age, places, next) = &mut *ledger;
+        if !places.contains_key(&link) {
+            by_age.insert(*next, link);
+            places.insert(link, *next);
+            *next += 1;
+        }
+        let mut over = Vec::new();
+        while places.len() > max {
+            let Some(oldest) = by_age.values().find(|l| **l != link).copied() else {
+                break;
+            };
+            if let Some(age) = places.remove(&oldest) {
+                by_age.remove(&age);
+            }
+            over.push(oldest);
+        }
+        over
+    }
+
+    /// Test knob: [`STRANGER_KEYED_LINKS_MAX`].
+    pub fn set_keyed_strangers_max(&self, max: usize) {
+        self.keyed_strangers_max.store(max, Ordering::Relaxed);
     }
 
     /// Test knobs: the `Awaiting` caps.
@@ -1685,6 +1733,14 @@ impl LinkSeals {
         self.before_keys().remove(link);
         self.take_parked(*link);
         self.deferred().remove(link);
+        let mut ledger = self
+            .keyed_strangers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (by_age, places, _) = &mut *ledger;
+        if let Some(age) = places.remove(link) {
+            by_age.remove(&age);
+        }
     }
 
     fn before_keys(&self) -> std::sync::MutexGuard<'_, BeforeKeys> {

@@ -67,13 +67,16 @@ Read this on the node that was dialled, then on the dialler.
 1. `seal_keyer_workers{configured}`: 0 means the keyer was never reached.
 2. `link_seal_refused_handshake_node_rate:{standing,stranger,unidentified}`,
    `..._sender_rate:*` and `link_seal_refused_decap_saturated:{standing,stranger}`
-   say which budget refused it. A burst of `:stranger` right after a restart is
-   expected.
-3. `seal_keyer_queued{standing,stranger}` against 64 and 32, and
+   say which budget refused it. A peer the directory binds has standing from
+   its first handshake after a restart, so a burst of `:stranger` then is first
+   contacts, or peers off the roster.
+3. `seal_keyer_queued{standing,stranger}` against 1024 and 256, and
    `seal_keying_duration_seconds` by standing, say whether the queue or the
    crypto is the wait.
 4. `seal_awaiting_links`, `seal_awaiting_bytes` and
    `link_seal_refused_awaiting_cap`: half-open links at the cap.
+   `link_seal_refused_stranger_cap`: the oldest keyed link with no standing,
+   closed at 512. It re-dials. A rate of these is a flood or a very busy door.
 5. `seal_held_bytes` and `link_seal_refused_keying_hold`: frames that arrived
    during keying.
 6. `link_shaping_home_elsewhere:given` on the dialled node means it refused at

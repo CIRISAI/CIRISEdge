@@ -1279,6 +1279,9 @@ pub const LINK_SEAL_REFUSED_DECAP_SATURATED: &str = "link_seal_refused_decap_sat
 /// CIRISEdge#947 — the node held the most links awaiting a handshake it holds,
 /// or the most bytes; the oldest such link is refused and closed.
 pub const LINK_SEAL_REFUSED_AWAITING_CAP: &str = "link_seal_refused_awaiting_cap";
+/// v44 LTS — the oldest keyed link with no standing, closed at
+/// [`crate::transport::link_seal::STRANGER_KEYED_LINKS_MAX`].
+pub const LINK_SEAL_REFUSED_STRANGER_CAP: &str = "link_seal_refused_stranger_cap";
 /// CIRISEdge#947 — more frames arrived on a link during its keying than it may
 /// hold; refused and closed rather than lose a frame its sender counted.
 pub const LINK_SEAL_REFUSED_KEYING_HOLD: &str = "link_seal_refused_keying_hold";
@@ -1650,6 +1653,7 @@ pub const LINK_SEAL_LABELS: &[&str] = &[
     LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE,
     LINK_SEAL_REFUSED_DECAP_SATURATED,
     LINK_SEAL_REFUSED_AWAITING_CAP,
+    LINK_SEAL_REFUSED_STRANGER_CAP,
     LINK_SEAL_REFUSED_KEYING_HOLD,
     LINK_SEAL_HELD_DURING_KEYING,
     LINK_SEAL_DECAPSULATED,
