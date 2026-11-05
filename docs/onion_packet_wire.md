@@ -321,4 +321,4 @@ n = 1, 2, 3.
 | `CONP` framing | `src/onion/relay.rs:24` |
 | Relay acceptance (steps 1, 9–11) | `src/onion/relay.rs:172` |
 | Refusal tokens | `src/onion/tokens.rs` |
-| Transport intake and forward | `src/transport/reticulum.rs:14204` (`handle_onion_frame`) |
+| Transport intake and forward | `src/transport/reticulum.rs`, `handle_onion_frame` |

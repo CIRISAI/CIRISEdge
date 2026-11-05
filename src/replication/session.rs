@@ -798,7 +798,7 @@ impl Session {
                 retry_after_secs,
                 "subject Pull THROTTLED by the peer (`subject_pull_throttled`): the \
                  answer is a refusal for this window, not an empty holding \
-                 (tracked: CIRISEdge#937)"
+                 (history: CIRISEdge#937)"
             );
         }
         // CIRISEdge#414 — RECEIVE axis: what this node still LACKS is computed

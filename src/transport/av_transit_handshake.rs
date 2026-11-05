@@ -13,8 +13,10 @@
 //! # Roles
 //!
 //! The **dialler is always the initiator** (verify's rule). Before it dials
-//! it resolves the dialled node's static transit pair (Rooted only, persist's
-//! `transit_kex_pair_for`, by the id it dials); once the link is established
+//! it resolves the dialled node's static transit pair by the id it dials, from
+//! a CC 3.3.6.2 source ([`PairSource`](crate::transport::transit_kex_peer::PairSource):
+//! a Rooted binding, its own signed route row, or the pairing pin; the row may
+//! also be fetched over the link); once the link is established
 //! it runs [`initiate`] and sends the frames as the link's FIRST messages.
 //! A dialled node with no usable pair cannot be keyed: the dial is refused by
 //! name ([`AvHandshakeError::NoTransitPair`]) and never made. There is no

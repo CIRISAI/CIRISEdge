@@ -73,8 +73,8 @@
 pub mod capacity;
 pub mod capacity_estimator;
 // Stage 1 of the closed-loop ALM controller (C1 meter, C2 admission, C4
-// selector, C6 peer states, C7 decision log). Pure and sync; not yet wired
-// into `av_call.rs`. Supersedes `join::AlmJoinPlanner` for parent selection.
+// selector, C6 peer states, C7 decision log). Pure and sync; `av_call/alm.rs`
+// runs it. Supersedes `join::AlmJoinPlanner` for parent selection.
 pub mod controller;
 pub mod delivered;
 pub mod heal;

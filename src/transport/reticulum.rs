@@ -9414,7 +9414,7 @@ impl ReticulumTransport {
                 action = "retired_direct",
                 "link Channel landed nothing for {zero_sends} sends in a row: the punched path \
                  stopped carrying the peer's acks, moved the link back onto its relayed path \
-                 (tracked: CIRISEdge#926, leviculum#89)"
+                 (history: CIRISEdge#926, leviculum#89)"
             );
             return;
         }
@@ -9428,7 +9428,7 @@ impl ReticulumTransport {
             stalled_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX),
             action = "closed",
             "link Channel landed nothing for {zero_sends} sends in a row: the peer acknowledges \
-             nothing on it, closed it and the next send re-dials (tracked: CIRISEdge#926)"
+             nothing on it, closed it and the next send re-dials (history: CIRISEdge#926)"
         );
         if let Err(e) = self
             .link_teardown_as(link_id, LinkCloseCause::LocalTeardown)
