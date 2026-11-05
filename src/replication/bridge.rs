@@ -23741,7 +23741,12 @@ pub(crate) mod tests {
         }
         let canon = by_id[CANON];
         let squat_hash = by_id[squat_id];
-        for peer in [Some("node-c"), None] {
+        // persist v61 (CIRISPersist#991): the record is a row on the Attestation
+        // plane, whose unbound (`None`) view is the local projection-only view:
+        // the enumeration above reads the squat through it. Every production
+        // provider is peer-bound, so the requester who proves nothing is a bound
+        // peer with no key on file: first contact, and the same two answers.
+        for peer in [Some("node-c"), Some("never-seen-761")] {
             assert!(
                 served_761(&bridge, kind, peer, canon).await,
                 "{peer:?}: the rooted trust-root community reaches every peer"
