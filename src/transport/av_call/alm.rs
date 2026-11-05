@@ -159,6 +159,9 @@ pub struct AlmCounts {
     pub stale_dropped: u64,
     /// Legs shed to the base layer under congestion (C5).
     pub legs_shed_to_base: u64,
+    /// `OFFER`s claiming depth 0 from anyone but the stream's publisher, or
+    /// before its binding arrived, dropped.
+    pub offers_refused: u64,
 }
 
 /// The call's ALM controller state (see the module docs).
@@ -174,6 +177,9 @@ pub(super) struct AlmState {
     relays: BTreeMap<StreamId, Admission<String>>,
     sels: BTreeMap<StreamId, ParentSelector<String>>,
     publisher_of: BTreeMap<StreamId, String>,
+    /// The publisher each stream's verified binding names: the one signed
+    /// source. `publisher_of` follows it, and a hello cannot override it.
+    bound_publisher: BTreeMap<StreamId, String>,
     caps: BTreeMap<String, u32>,
     provisional: BTreeMap<String, u64>,
     told_publisher: BTreeSet<StreamId>,
@@ -223,6 +229,7 @@ impl AlmState {
             relays: BTreeMap::new(),
             sels: BTreeMap::new(),
             publisher_of: BTreeMap::new(),
+            bound_publisher: BTreeMap::new(),
             caps: BTreeMap::new(),
             provisional: BTreeMap::new(),
             told_publisher: BTreeSet::new(),
@@ -384,13 +391,47 @@ impl AlmState {
         first
     }
 
-    /// `publisher` publishes `stream` (its own link's hello names it).
+    /// `publisher` publishes `stream` (its own link's hello names it). The
+    /// hello is unsigned, so this is a first guess: a binding overrides it
+    /// and it never overrides a binding.
     pub(super) fn note_publisher(&mut self, stream: StreamId, publisher: &str) {
         if stream == self.own_stream || publisher == self.me {
             return;
         }
-        self.publisher_of.insert(stream, publisher.to_owned());
+        if !self.bound_publisher.contains_key(&stream) {
+            self.publisher_of.insert(stream, publisher.to_owned());
+        }
         self.selector(stream);
+    }
+
+    /// A verified binding names `publisher` for `stream`. A stream id is
+    /// derived from its publisher, so this cannot change once known.
+    pub(super) fn note_bound_publisher(&mut self, stream: StreamId, publisher: &str) {
+        if stream == self.own_stream {
+            return;
+        }
+        self.bound_publisher.insert(stream, publisher.to_owned());
+        self.publisher_of.insert(stream, publisher.to_owned());
+    }
+
+    /// Why an `OFFER` from `peer` claiming depth 0 on `stream` is dropped, or
+    /// `None` when `peer` is the stream's publisher.
+    ///
+    /// Depth 0 is the publisher itself, and direct-first takes it over every
+    /// relay. An `OFFER` is attributed by the link but not signed, so the
+    /// claim is checked against the binding. A claim that fails is dropped
+    /// whole, not clamped to a relay's depth: nothing honest sends one (a
+    /// forwarder offers its own depth), and a clamped offer would still make
+    /// a liar a candidate with a depth and an empty ancestry it made up,
+    /// which blinds the loop check. With no binding held yet the claim cannot
+    /// be checked, and it is dropped too: chunks cannot be verified without a
+    /// binding either, and the publisher offers again within a second.
+    fn depth_zero_refusal(&self, stream: StreamId, peer: &str) -> Option<&'static str> {
+        match self.bound_publisher.get(&stream) {
+            Some(publisher) if publisher == peer => None,
+            Some(_) => Some(crate::observability::ALM_OFFER_REFUSED_NOT_PUBLISHER),
+            None => Some(crate::observability::ALM_OFFER_REFUSED_UNBOUND),
+        }
     }
 
     fn selector(&mut self, stream: StreamId) -> &mut ParentSelector<String> {
@@ -724,7 +765,21 @@ impl AlmState {
                     return out;
                 }
                 if o.depth == 0 {
-                    self.publisher_of.insert(stream, peer.to_owned());
+                    if let Some(reason) = self.depth_zero_refusal(stream, peer) {
+                        self.counts.offers_refused += 1;
+                        self.label(crate::observability::ALM_OFFER_REFUSED);
+                        self.label(reason);
+                        let subject = peer.to_owned();
+                        self.log.record(
+                            now,
+                            &self.me,
+                            DecisionKind::OfferRefused,
+                            Some(&subject),
+                            0,
+                            reason,
+                        );
+                        return out;
+                    }
                 }
                 let mut log = std::mem::take(&mut self.log);
                 self.selector(stream).on_offer(now, o, rtt_ms, &mut log);
@@ -1036,6 +1091,7 @@ mod tests {
         a.on_caps("c", CAPS_THIS_BUILD);
         b.on_caps("a", CAPS_THIS_BUILD);
         b.note_publisher(sa, "a");
+        b.note_bound_publisher(sa, "a");
         let legs = vec!["b".to_owned(), "c".to_owned()];
         // Both C3 peers are provisional at first: nobody excluded.
         assert!(a.own_exclude(&legs, false).is_empty());
@@ -1177,8 +1233,10 @@ mod tests {
                     }
                 }
             }
-            nodes[B].note_publisher(sa, "a");
-            nodes[C].note_publisher(sa, "a");
+            for n in [B, C] {
+                nodes[n].note_publisher(sa, "a");
+                nodes[n].note_bound_publisher(sa, "a");
+            }
             Self {
                 nodes,
                 sa,
@@ -1301,6 +1359,87 @@ mod tests {
 
     fn degraded_ticks(states: &[PeerState]) -> usize {
         states.iter().filter(|s| **s == PeerState::Degraded).count()
+    }
+
+    fn offer_frame(stream: StreamId, from: &str) -> Vec<u8> {
+        wire::encode(
+            stream,
+            &ControlMsg::Offer(crate::transport::realtime_av_alm::controller::Offer {
+                from: from.to_owned(),
+                depth: 0,
+                ancestry: Vec::new(),
+                headroom_bps: 100_000_000,
+                forwarder_headroom_bps: 100_000_000,
+                upstream_latency_ms: 0,
+                forwarding: true,
+            }),
+        )
+    }
+
+    fn is_candidate(sel: &ParentSelector<String>, p: &str) -> bool {
+        sel.candidates().iter().any(|(c, _, _)| c == p)
+    }
+
+    /// #945 item 2: C claims depth 0 on A's stream and the binding names A.
+    /// The claim changes nothing and is logged and counted.
+    #[test]
+    fn a_depth_zero_offer_from_another_member_is_dropped() {
+        let mut m = Mesh::new();
+        let frame = offer_frame(m.sa, "c");
+        m.route(VecDeque::from([(
+            C,
+            Outgoing {
+                to: "b".into(),
+                frame,
+            },
+        )]));
+        assert_eq!(m.nodes[B].parents()[0].publisher.as_deref(), Some("a"));
+        assert!(!is_candidate(m.b_sel(), "c"), "never scored");
+        assert_eq!(m.nodes[B].counts.offers_refused, 1);
+        assert_eq!(m.nodes[B].log_count(DecisionKind::OfferRefused), 1);
+        assert!(m.nodes[B].log_tail().contains("not_publisher"));
+        assert!(m.nodes[B]
+            .labels
+            .contains(&crate::observability::ALM_OFFER_REFUSED_NOT_PUBLISHER));
+    }
+
+    /// #945 item 2: a depth-0 claim that cannot be checked yet is dropped,
+    /// and the publisher's next offer, once its binding is in, gets through.
+    #[test]
+    fn a_depth_zero_offer_waits_for_the_binding() {
+        let sa = s(1);
+        let mut b = AlmState::new("b", s(2), &roster(), false, 2);
+        let offer = |b: &mut AlmState| {
+            let WireFrame::Control(cf) = decode(&offer_frame(sa, "a"), "a").unwrap() else {
+                panic!()
+            };
+            b.on_control("a", cf, 20.0);
+        };
+        offer(&mut b);
+        assert!(b.sels.is_empty(), "no selector from an unchecked claim");
+        assert_eq!(b.counts.offers_refused, 1);
+        assert!(b
+            .labels
+            .contains(&crate::observability::ALM_OFFER_REFUSED_UNBOUND));
+        b.note_bound_publisher(sa, "a");
+        offer(&mut b);
+        assert!(is_candidate(&b.sels[&sa], "a"));
+        assert_eq!(b.counts.offers_refused, 1, "the publisher passes");
+    }
+
+    /// #945 item 2: the hello is unsigned, so a member naming another's
+    /// stream as its own cannot rename a bound publisher, and a binding
+    /// corrects a hello that came first.
+    #[test]
+    fn a_hello_never_renames_a_bound_publisher() {
+        let sa = s(1);
+        let mut b = AlmState::new("b", s(2), &roster(), false, 2);
+        b.note_publisher(sa, "c");
+        assert_eq!(b.parents()[0].publisher.as_deref(), Some("c"));
+        b.note_bound_publisher(sa, "a");
+        assert_eq!(b.parents()[0].publisher.as_deref(), Some("a"));
+        b.note_publisher(sa, "c");
+        assert_eq!(b.parents()[0].publisher.as_deref(), Some("a"));
     }
 
     /// #945 item 1: `chunk_seq` restarts at every roll. Neither path lost
