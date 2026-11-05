@@ -203,6 +203,20 @@ async fn build_transport(
     dir: &Arc<SqliteBackend>,
     bootstrap: Option<u16>,
 ) -> (Arc<ReticulumTransport>, u16) {
+    build_transport_forwarding(metrics, base, who, dir, bootstrap, false).await
+}
+
+/// [`build_transport`], as a node that forwards for its clients when
+/// `forwards`: a client's path to another client then runs through it, and
+/// outlives that other client.
+async fn build_transport_forwarding(
+    metrics: &EdgeMetrics,
+    base: &std::path::Path,
+    who: &Ident,
+    dir: &Arc<SqliteBackend>,
+    bootstrap: Option<u16>,
+    forwards: bool,
+) -> (Arc<ReticulumTransport>, u16) {
     for _ in 0..16 {
         let signer = who.signer();
         let mut c = ReticulumTransportConfig::new(
@@ -214,6 +228,7 @@ async fn build_transport(
             c.bootstrap_peers = vec![format!("127.0.0.1:{port}").parse().unwrap()];
         }
         c.announce_interval = Duration::from_secs(5);
+        c.enable_transport = forwards;
         let port = c.listen_addr.port();
         common::apply_env_shaping(&mut c);
         match ReticulumTransport::new(c, auth(signer, dir)).await {
@@ -263,18 +278,32 @@ async fn node(
     peers: Vec<ReplicationPeer>,
     seen: SeenKinds,
 ) -> Arc<ReplicationRuntime> {
+    let scheduler = SchedulerConfig {
+        // Rounds after the start-up tick are driven by the test.
+        cadence: Duration::from_secs(3600),
+        round_timeout: Duration::from_secs(5),
+        ..SchedulerConfig::default()
+    };
+    node_with(key, dir, transport, metrics, peers, seen, scheduler).await
+}
+
+/// [`node`] on a scheduler of the test's own.
+async fn node_with(
+    key: &Ident,
+    dir: &Arc<SqliteBackend>,
+    transport: &Arc<ReticulumTransport>,
+    metrics: &EdgeMetrics,
+    peers: Vec<ReplicationPeer>,
+    seen: SeenKinds,
+    scheduler: SchedulerConfig,
+) -> Arc<ReplicationRuntime> {
     let runtime = Arc::new(
         ReplicationRuntime::start(
             Arc::clone(dir) as Arc<dyn FederationDirectory>,
             Arc::clone(transport) as Arc<dyn Transport>,
             peers,
             ReplicationRuntimeConfig {
-                scheduler: SchedulerConfig {
-                    // Rounds after the start-up tick are driven by the test.
-                    cadence: Duration::from_secs(3600),
-                    round_timeout: Duration::from_secs(5),
-                    ..SchedulerConfig::default()
-                },
+                scheduler,
                 local_key_id: Some(key.key_id.clone()),
                 metrics: Some(metrics.clone()),
                 ..Default::default()
@@ -557,5 +586,133 @@ fn three_peers_survive_a_kick_on_a_32_slot_blocking_pool_740() {
             .all(|&n| n == KINDS),
         "every (peer, kind) round of the kick reached its peer: {:?}",
         out.kinds_seen_per_peer_after_kick
+    );
+}
+
+/// **Witness (v44 LTS, the dialler's permit)** — real nodes, a real dead peer:
+/// the hub holds a path to `dead` through `live` (which forwards), and `dead`
+/// is gone, so a dial to it sits out the whole establish timeout. On a gate of
+/// one permit, a round parked in that send must not stop the hub's rounds to
+/// the live peer: a parked send costs a permit for at most a round's budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_peer_cannot_starve_a_live_one_of_rounds() {
+    const ROUND_TIMEOUT: Duration = Duration::from_secs(2);
+    const WINDOW: Duration = Duration::from_secs(14);
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let hub = Ident::new("hub-lts", 0x61).await;
+    let live = Ident::new("live-lts", 0x62).await;
+    let dead = Ident::new("dead-lts", 0x63).await;
+    let records = vec![
+        hub.record("node").await,
+        live.record("node").await,
+        dead.record("node").await,
+    ];
+    let hub_dir = directory_with(records.clone()).await;
+    let live_dir = directory_with(records.clone()).await;
+    let dead_dir = directory_with(records).await;
+    let (hub_m, live_m, dead_m) = (EdgeMetrics::new(), EdgeMetrics::new(), EdgeMetrics::new());
+    let (live_t, port) =
+        build_transport_forwarding(&live_m, tmp.path(), &live, &live_dir, None, true).await;
+    let (hub_t, _) = build_transport(&hub_m, tmp.path(), &hub, &hub_dir, Some(port)).await;
+    let (dead_t, _) = build_transport(&dead_m, tmp.path(), &dead, &dead_dir, Some(port)).await;
+    for (from, from_key, to) in [
+        (&live_dir, &live, &hub_dir),
+        (&dead_dir, &dead, &hub_dir),
+        (&hub_dir, &hub, &live_dir),
+        (&hub_dir, &hub, &dead_dir),
+    ] {
+        for r in &from
+            .list_signed_transport_destinations_for(&from_key.key_id)
+            .await
+            .expect("list routes")
+        {
+            FederationDirectory::put_signed_transport_destination(&**to, r)
+                .await
+                .expect("seed the route");
+        }
+    }
+    let seen: SeenKinds = Arc::default();
+    let _live_runtime = node(
+        &live,
+        &live_dir,
+        &live_t,
+        &live_m,
+        Vec::new(),
+        Arc::clone(&seen),
+    )
+    .await;
+    let _dead_runtime = node(
+        &dead,
+        &dead_dir,
+        &dead_t,
+        &dead_m,
+        Vec::new(),
+        Arc::clone(&seen),
+    )
+    .await;
+    let plane = |k: &Ident| ReplicationPeer {
+        peer_key_id: k.key_id.clone(),
+        kind: EnvelopeKind::Key,
+    };
+    let hub_rt = node_with(
+        &hub,
+        &hub_dir,
+        &hub_t,
+        &hub_m,
+        vec![plane(&dead), plane(&live)],
+        Arc::default(),
+        SchedulerConfig {
+            cadence: Duration::from_secs(3600),
+            round_timeout: ROUND_TIMEOUT,
+            max_concurrent_rounds: 1,
+        },
+    )
+    .await;
+    let dead_dest = dead_t.local_named_dest_hash();
+    let hub_has_path_to_dead = || {
+        hub_t
+            .path_table_rows_for_test()
+            .iter()
+            .any(|(dest, _, _)| *dest == dead_dest)
+    };
+    let known = tokio::time::timeout(Duration::from_secs(90), async {
+        while !(hub_t.knows_peer(&live.key_id).await
+            && hub_t.knows_peer(&dead.key_id).await
+            && hub_has_path_to_dead()
+            && dead_t.knows_peer(&hub.key_id).await
+            && live_t.knows_peer(&hub.key_id).await)
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(known.is_ok(), "the three learn each other");
+    let terminated = rounds_terminated(&hub_m);
+    while rounds_terminated(&hub_m) < terminated.max(2) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // `dead` goes, leaving the hub's path through `live` standing.
+    assert!(dead_t.suspend(Duration::from_secs(10)).await.quiescent);
+    assert!(hub_has_path_to_dead(), "the dial has a path to wait on");
+
+    hub_rt.round_now(&dead.key_id).await.expect("kick the dead");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The dead peer's round cannot end inside the window: its dial sits out
+    // the establish timeout. Every round that ends here is the live peer's.
+    let before = rounds_terminated(&hub_m);
+    let started = std::time::Instant::now();
+    let mut landed = 0_u64;
+    while started.elapsed() < WINDOW {
+        hub_rt.round_now(&live.key_id).await.expect("kick the live");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        landed = rounds_terminated(&hub_m) - before;
+    }
+    eprintln!("dead-peer witness: {landed} rounds to the live peer in {WINDOW:?}");
+    assert!(
+        landed >= 2,
+        "the live peer's rounds run past a dial parked on a dead peer: {landed} in {WINDOW:?}, \
+         gate {:?}",
+        hub_rt.round_bound()
     );
 }

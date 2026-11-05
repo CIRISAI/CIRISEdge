@@ -32,6 +32,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ciris_edge::identity::{sign_bound_hybrid, LocalSigner};
+use ciris_edge::replication::{
+    EnvelopeKind, ReplicationPeer, ReplicationRuntime, ReplicationRuntimeConfig, SchedulerConfig,
+};
 use ciris_edge::transport::reticulum::{
     HandshakeOverride, ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
     RouteAnswerOverride,
@@ -2377,6 +2380,181 @@ async fn a_responders_stalled_first_words_block_no_other_links_frames_947() {
         inside.elapsed() < WITHIN,
         "B's eight frames took {:?} against {SLOW:?} of first words",
         inside.elapsed()
+    );
+}
+
+/// **Witness (v44 LTS, CC 5.4.6: a client retries jittered)** — a real dial, on
+/// real links, refused by a real receiver order: the round that was refused
+/// comes back off the beat. A tick on a fixed multiple of the limiter's window
+/// locks into its closed part; the gaps here are the dials as the receiver saw
+/// them, so nothing but the dial itself is measured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_dial_comes_back_off_the_beat() {
+    const CADENCE: Duration = Duration::from_secs(2);
+    const GAPS: usize = 12;
+    let t = trio("jitter", true, false, false).await;
+    t.a.transport.set_stranger_handshake_cap_for_test(0);
+    let mut runtime = ReplicationRuntime::start(
+        Arc::clone(&t.c.dir) as Arc<dyn FederationDirectory>,
+        Arc::clone(&t.c.transport) as Arc<dyn Transport>,
+        vec![ReplicationPeer {
+            peer_key_id: t.a.key.key_id.clone(),
+            kind: EnvelopeKind::Key,
+        }],
+        ReplicationRuntimeConfig {
+            scheduler: SchedulerConfig {
+                cadence: CADENCE,
+                round_timeout: Duration::from_secs(1),
+                ..SchedulerConfig::default()
+            },
+            local_key_id: Some(t.c.key.key_id.clone()),
+            metrics: Some(t.c.metrics.clone()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let refused = || t.a.seal("link_seal_refused_handshake_node_rate");
+    let mut dials: Vec<std::time::Instant> = Vec::new();
+    let mut seen = refused();
+    let deadline = std::time::Instant::now() + CADENCE * u32::try_from(GAPS * 4).unwrap();
+    while dials.len() <= GAPS && std::time::Instant::now() < deadline {
+        let now = refused();
+        if now > seen {
+            seen = now;
+            dials.push(std::time::Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    runtime.shutdown().await;
+    assert!(
+        dials.len() > GAPS,
+        "the dialler keeps dialling: {} refused dials",
+        dials.len()
+    );
+    let gaps: Vec<f64> = dials
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]).as_secs_f64())
+        .collect();
+    let (min, max) = gaps
+        .iter()
+        .fold((f64::MAX, 0.0_f64), |(lo, hi), g| (lo.min(*g), hi.max(*g)));
+    let c = CADENCE.as_secs_f64();
+    eprintln!("dial jitter witness: gaps {gaps:.2?}");
+    assert!(
+        min >= 0.5 * c - 0.05,
+        "no re-dial inside half a cadence: {gaps:.2?}"
+    );
+    // A round takes some of a gap, so a gap can pass 1.5 by that much.
+    assert!(max <= 1.5 * c + 0.75, "a re-dial is not lost: {gaps:.2?}");
+    assert!(
+        max - min >= 0.5 * c,
+        "the re-dials are off the beat, not on a tick: {gaps:.2?}"
+    );
+}
+
+/// A process restart of `A`: a new transport over the same identity and
+/// directory on the same port, holding what persist holds and nothing else.
+async fn restart_a(
+    t: &Trio,
+) -> (
+    Arc<ReticulumTransport>,
+    EdgeMetrics,
+    tokio::task::JoinHandle<()>,
+) {
+    let report = t.a.transport.suspend(Duration::from_secs(10)).await;
+    assert!(report.quiescent, "the old process is gone: {report:?}");
+    let metrics = EdgeMetrics::new();
+    let base = t._tmp.path().join("n0");
+    let signer = t.a.key.signer();
+    let dir = Arc::clone(&t.a.dir);
+    let port = t.port_a;
+    let (transport, _) = common::build_reticulum_with_retry_metrics(
+        || {
+            let base = base.clone();
+            let signer = Arc::clone(&signer);
+            let dir = Arc::clone(&dir);
+            async move {
+                let mut c =
+                    ReticulumTransportConfig::new(base.join("transport.id"), &signer.key_id);
+                c.listen_addr = format!("127.0.0.1:{port}").parse().unwrap();
+                c.announce_interval = Duration::from_secs(5);
+                (c, auth(signer, &dir))
+            }
+        },
+        metrics.clone(),
+    )
+    .await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(256);
+    let listener = Arc::clone(&transport);
+    tokio::spawn(async move {
+        let _ = listener.listen(tx).await;
+    });
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    (transport, metrics, drain)
+}
+
+/// **Witness (v44 LTS, `FSD/EVENT_PATH_MODEL.md` §2.3)** — after a restart a
+/// peer bound in the directory, on the active roster, has standing from its
+/// first handshake: with the stranger rate at zero and no announce from it, it
+/// keys. A stranger beside it, which the directory binds to nothing, is still
+/// refused, so what the restart reads is the binding and not everyone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bound_peer_has_standing_from_its_first_handshake_after_a_restart() {
+    let t = trio("restart", true, false, false).await;
+    // Neither speaks again: a restart learns them from nothing but persist.
+    t.b.transport.set_unannounced_for_test(true);
+    t.c.transport.set_unannounced_for_test(true);
+    let (a, metrics, _drain) = restart_a(&t).await;
+    a.set_stranger_handshake_cap_for_test(0);
+    a.set_seats_for_test(std::iter::once(t.b.key.key_id.clone()).collect(), false);
+    let refused = || {
+        metrics
+            .link_seal()
+            .get("link_seal_refused_handshake_node_rate")
+            .copied()
+            .unwrap_or(0)
+    };
+    let keyed = || {
+        metrics
+            .link_seal()
+            .get(ciris_edge::observability::LINK_SEAL_DECAPSULATED)
+            .copied()
+            .unwrap_or(0)
+    };
+    let a_dest = a.local_named_dest_hash();
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.b.transport
+                .path_table_rows_for_test()
+                .iter()
+                .any(|(dest, _, _)| *dest == a_dest)
+        })
+        .await,
+        "B holds a path back to A"
+    );
+    let bound = marked(b"LTS-RESTART-BOUND-", 600);
+    let landed = wait_until(Duration::from_secs(30), || async {
+        let _ = t.b.transport.send(&t.a.key.key_id, &bound).await;
+        keyed() >= 1
+    })
+    .await;
+    assert!(
+        landed,
+        "the bound peer keys with the stranger rate at zero: {:?}",
+        metrics.link_seal()
+    );
+    assert_eq!(refused(), 0, "{:?}", metrics.link_seal());
+    let stranger = marked(b"LTS-RESTART-STRANGER-", 600);
+    let refused_c = wait_until(Duration::from_secs(30), || async {
+        let _ = t.c.transport.send(&t.a.key.key_id, &stranger).await;
+        refused() >= 1
+    })
+    .await;
+    assert!(
+        refused_c,
+        "a key the directory does not bind is a stranger: {:?}",
+        metrics.link_seal()
     );
 }
 
