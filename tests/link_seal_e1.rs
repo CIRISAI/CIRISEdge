@@ -2591,8 +2591,12 @@ async fn a_suspend_during_keying_leaves_nothing_behind_947() {
     tokio::time::sleep(hold + Duration::from_millis(500)).await;
     assert!(!t.a.received(&frame).await, "the keying opened nothing");
     t.a.transport.set_decap_delay_for_test(Duration::ZERO);
+    let accepted = || t.a.seal(ciris_edge::observability::LINK_SEAL_ACCEPTED);
+    let before = accepted();
     t.a.transport.resume().await.expect("resume");
     let _ = send.await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(accepted(), before, "the outcome landed on no link");
     assert_eq!(
         t.a.transport.keyer_load_for_test().0,
         0,
@@ -2696,11 +2700,21 @@ async fn restart_b(t: &Trio) -> (Arc<ReticulumTransport>, EdgeMetrics) {
 /// first handshake. `C` reaches `B` through `A`, which forwards, so `B`'s
 /// restart drops no interface of `C`'s and nothing makes it announce: `B` has
 /// only persist to know it by. (A direct TCP client re-announces when it
-/// reconnects, which is why this needs a hop.) `A` is bound at `B` too and is
-/// not on the roster: a binding alone is still a stranger.
+/// reconnects, which is why this needs a hop.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bound_peer_has_standing_from_its_first_handshake_after_a_restart() {
-    let t = trio_on("restart", true, false, false, true).await;
+    bound_peer_after_a_restart("restart", true).await;
+}
+
+/// **Witness (v44 LTS)** — the binding alone earns nothing: the same peer, off
+/// the active roster, is a stranger on the persisted arm too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bound_peer_off_the_roster_is_a_stranger_after_a_restart() {
+    bound_peer_after_a_restart("offroster", false).await;
+}
+
+async fn bound_peer_after_a_restart(tag: &str, seated: bool) {
+    let t = trio_on(tag, true, false, false, true).await;
     seed_route(&t.b, &t.c).await;
     seed_route(&t.c, &t.b).await;
     assert!(
@@ -2712,10 +2726,11 @@ async fn a_bound_peer_has_standing_from_its_first_handshake_after_a_restart() {
         "B and C learn each other through A"
     );
     t.c.transport.set_unannounced_for_test(true);
-    t.a.transport.set_unannounced_for_test(true);
     let (b, metrics) = restart_b(&t).await;
     b.set_stranger_handshake_cap_for_test(0);
-    b.set_seats_for_test(std::iter::once(t.c.key.key_id.clone()).collect(), false);
+    if seated {
+        b.set_seats_for_test(std::iter::once(t.c.key.key_id.clone()).collect(), false);
+    }
     let counted = |label: &str| metrics.link_seal().get(label).copied().unwrap_or(0);
     let accepted = || counted(ciris_edge::observability::LINK_SEAL_ACCEPTED);
     let refused = || counted("link_seal_refused_handshake_node_rate");
@@ -2744,19 +2759,8 @@ async fn a_bound_peer_has_standing_from_its_first_handshake_after_a_restart() {
         "the handshake is judged: {sent:?} {:?}",
         metrics.link_seal()
     );
-    assert_eq!(
-        (accepted(), refused()),
-        (1, 0),
-        "C keys on its first handshake with the stranger rate at zero: {:?}",
-        metrics.link_seal()
-    );
-    let stranger = marked(b"LTS-RESTART-NOT-SEATED-", 600);
-    let _ = t.a.transport.send(&t.b.key.key_id, &stranger).await;
-    assert!(
-        wait_until(Duration::from_secs(10), || async { refused() >= 1 }).await,
-        "a bound key off the roster is a stranger: {:?}",
-        metrics.link_seal()
-    );
+    let want = if seated { (1, 0) } else { (0, 1) };
+    assert_eq!((accepted(), refused()), want, "{:?}", metrics.link_seal());
 }
 
 /// **Witness (v44 LTS)** — a live binding for the key is the newer word. The
