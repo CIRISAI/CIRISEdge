@@ -210,12 +210,19 @@ impl Keyer {
     #[must_use]
     pub fn new(seals: Arc<LinkSeals>) -> (Arc<Self>, mpsc::UnboundedReceiver<KeyingDone>) {
         let cores = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
+        Self::with_workers(seals, (cores / 2).clamp(1, DECAP_WORKERS_MAX))
+    }
+
+    fn with_workers(
+        seals: Arc<LinkSeals>,
+        workers: usize,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<KeyingDone>) {
         let (done, rx) = mpsc::unbounded_channel();
         (
             Arc::new(Self {
                 seals,
                 queues: Mutex::new(Queues::default()),
-                workers: (cores / 2).clamp(1, DECAP_WORKERS_MAX),
+                workers,
                 done,
                 panicked: AtomicU64::new(0),
             }),

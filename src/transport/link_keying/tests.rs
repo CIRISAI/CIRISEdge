@@ -1,9 +1,8 @@
 use super::*;
 use crate::observability as o;
-use crate::transport::link_seal::{Inbound, Lane};
+use crate::transport::link_seal::{Inbound, Lane, SealRefusal};
 use crate::transport::route_fetch::ROUTE_REQUESTS_PER_WINDOW;
 use crate::transport::transit_kex_custody::TransitKexSecret;
-use std::time::Duration;
 
 fn stranger(id: &str) -> Sender<'_> {
     Sender {
@@ -118,77 +117,93 @@ fn job(s: &LinkSeals, link: [u8; 16]) -> HandshakeJob {
     out.expect("a whole handshake")
 }
 
+/// A pool that starts no worker of its own: what is queued stays queued until
+/// the test runs a worker, so nothing here depends on a clock.
+fn stopped_pool(s: &Arc<LinkSeals>) -> (Arc<Keyer>, mpsc::UnboundedReceiver<KeyingDone>) {
+    Keyer::with_workers(Arc::clone(s), 0)
+}
+
+/// Run one worker until the queues are empty.
+fn run_worker(keyer: &Keyer) {
+    keyer.queues().running += 1;
+    keyer.drain();
+}
+
+#[test]
+fn the_queue_never_grows_past_its_bound_947() {
+    let s = seals();
+    let (keyer, mut done) = stopped_pool(&s);
+    let mut admitted = 0_usize;
+    for i in 0..(DECAP_QUEUE_STRANGER + 20) {
+        match keyer.submit(job(&s, [u8::try_from(i).unwrap(); 16]), false) {
+            Ok(()) => admitted += 1,
+            Err(r) => assert_eq!(r.label(), o::LINK_SEAL_REFUSED_DECAP_SATURATED),
+        }
+    }
+    assert_eq!(
+        admitted, DECAP_QUEUE_STRANGER,
+        "refused by name past the bound"
+    );
+    assert_eq!(keyer.depth(), DECAP_QUEUE_STRANGER);
+    run_worker(&keyer);
+    assert_eq!(keyer.depth(), 0);
+    for _ in 0..admitted {
+        let d = done.try_recv().expect("every admitted job answers");
+        assert!(d.outcome.is_ok());
+    }
+    keyer
+        .submit(job(&s, [0xfe; 16]), false)
+        .expect("room again");
+    assert_eq!(keyer.queues().running, 0, "the worker came back down");
+}
+
+#[test]
+fn standing_is_drained_first_and_has_room_in_a_full_stranger_queue_947() {
+    let s = seals();
+    let (keyer, mut done) = stopped_pool(&s);
+    for i in 0..DECAP_QUEUE_STRANGER {
+        keyer
+            .submit(job(&s, [u8::try_from(i).unwrap(); 16]), false)
+            .expect("the queue holds them");
+    }
+    assert!(keyer
+        .submit(job(&s, [0xfc; 16]), false)
+        .is_err_and(|r| matches!(r, SealRefusal::DecapSaturated { standing: false })));
+    let known = [0xfd; 16];
+    keyer
+        .submit(job(&s, known), true)
+        .expect("standing has a queue of its own");
+    run_worker(&keyer);
+    assert_eq!(
+        done.try_recv().expect("an outcome").link,
+        known,
+        "the last in is the first out"
+    );
+    assert_eq!(done.try_recv().expect("then the strangers").link, [0; 16]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_queue_never_grows_past_its_bound_947() {
+async fn the_pool_starts_its_own_workers_and_lets_them_end_947() {
     let s = seals();
     let (keyer, mut done) = Keyer::new(Arc::clone(&s));
-    // Built first: a job's own KEX must not give the pool time to drain.
-    let total = DECAP_QUEUE_STRANGER + keyer.workers() + 20;
-    let jobs: Vec<HandshakeJob> = (0..total)
-        .map(|i| job(&s, [u8::try_from(i).unwrap(); 16]))
-        .collect();
-    s.set_decap_delay(Duration::from_millis(200));
-    let mut admitted = 0_usize;
-    let mut saturated = 0_usize;
-    for j in jobs {
-        match keyer.submit(j, false) {
-            Ok(()) => admitted += 1,
-            Err(r) => {
-                assert_eq!(r.label(), o::LINK_SEAL_REFUSED_DECAP_SATURATED);
-                saturated += 1;
-            }
-        }
-        assert!(keyer.depth() <= DECAP_QUEUE_STRANGER);
+    for i in 0..8 {
+        keyer
+            .submit(job(&s, [i; 16]), false)
+            .expect("the queue has room");
     }
-    assert!(
-        admitted <= DECAP_QUEUE_STRANGER + keyer.workers() && saturated >= 20,
-        "a stated refusal, not a growing queue: {admitted} admitted, {saturated} refused"
-    );
-    s.set_decap_delay(Duration::ZERO);
-    for _ in 0..admitted {
+    for _ in 0..8 {
         let d = done.recv().await.expect("every admitted job answers");
         assert!(d.outcome.is_ok());
     }
     assert_eq!(keyer.depth(), 0);
-    // The pool came back down and still takes work.
+    while keyer.queues().running > 0 {
+        tokio::task::yield_now().await;
+    }
     keyer.submit(job(&s, [0xfe; 16]), false).expect("room");
-    assert!(done.recv().await.is_some());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standing_is_drained_first_and_has_room_in_a_full_stranger_queue_947() {
-    let s = seals();
-    let (keyer, mut done) = Keyer::new(Arc::clone(&s));
-    // Built first: a job's own KEX must not run out the clock below.
-    let jobs: Vec<HandshakeJob> = (0..(DECAP_QUEUE_STRANGER + keyer.workers()))
-        .map(|i| job(&s, [u8::try_from(i).unwrap(); 16]))
-        .collect();
-    let known = job(&s, [0xfd; 16]);
-    s.set_decap_delay(Duration::from_millis(200));
-    let mut jobs = jobs.into_iter();
-    for j in jobs.by_ref().take(keyer.workers()) {
-        keyer.submit(j, false).expect("room");
-    }
-    // Every worker holds a job before the queue is filled behind them.
-    while keyer.depth() > 0 {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    for j in jobs {
-        keyer.submit(j, false).expect("the queue holds them");
-    }
-    assert_eq!(
-        keyer.depth(),
-        DECAP_QUEUE_STRANGER,
-        "the stranger queue is full"
+    assert!(
+        done.recv().await.is_some(),
+        "a later job starts a worker again"
     );
-    keyer.submit(known, true).expect("a separate queue");
-    // The jobs already running finish; the very next is standing's.
-    let mut seen = Vec::new();
-    for _ in 0..=keyer.workers() {
-        seen.push(done.recv().await.expect("an outcome").link);
-    }
-    s.set_decap_delay(Duration::ZERO);
-    assert_eq!(seen.last(), Some(&[0xfd; 16]), "order {seen:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
