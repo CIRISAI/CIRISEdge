@@ -215,7 +215,7 @@ struct Trio {
     b: Node,
     c: Node,
     port_a: u16,
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -250,6 +250,7 @@ async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool, c_fresh: 
 
 /// [`trio`], with `A` forwarding for its clients when `forwards`, so `B` and
 /// `C` reach each other through it.
+#[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)] // one fixture's switches
 async fn trio_on(
     tag: &str,
     seed_a_at_clients: bool,
@@ -353,7 +354,7 @@ async fn trio_on(
         b,
         c,
         port_a,
-        _tmp: tmp,
+        tmp,
         _tasks: tasks,
     }
 }
@@ -2635,7 +2636,8 @@ async fn the_oldest_keyed_stranger_gives_way_and_a_peer_with_standing_does_not()
     one_way(&t.b, &t.a, 1, b"LTS-CAP-BEFORE-")
         .await
         .expect("B's link is up");
-    t.a.transport.set_keyed_strangers_max_for_test(CAP as usize);
+    t.a.transport
+        .set_keyed_strangers_max_for_test(usize::try_from(CAP).unwrap());
     let f = flooder(&t).await;
     for _ in 0..STRANGERS {
         f.one(FloodIdentity::Fresh).await;
@@ -2665,7 +2667,7 @@ async fn restart_b(t: &Trio) -> (Arc<ReticulumTransport>, EdgeMetrics) {
     let report = t.b.transport.suspend(Duration::from_secs(10)).await;
     assert!(report.quiescent, "the old process is gone: {report:?}");
     let metrics = EdgeMetrics::new();
-    let base = t._tmp.path().join("n1");
+    let base = t.tmp.path().join("n1");
     let signer = t.b.key.signer();
     let dir = Arc::clone(&t.b.dir);
     let port_a = t.port_a;
