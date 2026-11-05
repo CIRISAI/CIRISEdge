@@ -757,6 +757,17 @@ async fn stale_media_is_dropped_by_age_and_the_hop_recovers() {
         "A hears B's CAPS"
     );
     let mut rx = cb.frames().expect("B's frames");
+    // A is B's parent before the stall: CALM rides the stalled pump too, and
+    // an unsubscribed path is not metered, so the frames below must land on
+    // a path that is.
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            primary_for(&cb, ca.stream()).as_deref() == Some(a.key.key_id.as_str())
+        })
+        .await,
+        "A is B's primary: {:?}",
+        cb.alm_log()
+    );
     cb.stall_inbound_for_test(Duration::from_millis(1_500));
     for seq in 0..60 {
         ca.publish(Frame::opaque(body("a", seq)))

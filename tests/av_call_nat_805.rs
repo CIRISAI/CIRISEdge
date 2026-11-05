@@ -196,6 +196,14 @@ impl Ident {
 
 /// `T`: a bare leviculum transport node with a TCP server and a facilitator.
 async fn transport_node(tcp_port: u16, facilitator_port: u16) -> ReticulumNode {
+    transport_node_ingress(tcp_port, facilitator_port, false).await
+}
+
+async fn transport_node_ingress(
+    tcp_port: u16,
+    facilitator_port: u16,
+    ingress: bool,
+) -> ReticulumNode {
     let storage = tempfile::tempdir().expect("tempdir");
     let mut node = ReticulumNodeBuilder::new()
         .enable_transport(true)
@@ -204,7 +212,7 @@ async fn transport_node(tcp_port: u16, facilitator_port: u16) -> ReticulumNode {
             interface_type: "TCPServerInterface".to_string(),
             listen_ip: Some("127.0.0.1".to_string()),
             listen_port: Some(tcp_port),
-            ingress_control: Some(false),
+            ingress_control: Some(ingress),
             ..Default::default()
         })
         .direct_link(leviculum_std::direct_link::DirectLinkSettings {
@@ -241,11 +249,22 @@ async fn side(
     t_port: u16,
     direct: DirectLinksConfig,
 ) -> Side {
+    side_every(key, dir, base, t_port, direct, Duration::from_secs(5)).await
+}
+
+async fn side_every(
+    key: Ident,
+    dir: &Arc<SqliteBackend>,
+    base: &std::path::Path,
+    t_port: u16,
+    direct: DirectLinksConfig,
+    announce_interval: Duration,
+) -> Side {
     let mut transport = None;
     for _ in 0..16 {
         let mut c = ReticulumTransportConfig::new(base.join("transport.id"), &key.key_id);
         c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-        c.announce_interval = Duration::from_secs(5);
+        c.announce_interval = announce_interval;
         c.bootstrap_peers = vec![format!("127.0.0.1:{t_port}").parse().unwrap()];
         let c = c.with_direct_links(direct.clone());
         let auth = ReticulumAuth {
@@ -593,4 +612,78 @@ async fn a_room_call_behind_t_without_a_facilitator_has_no_leg() {
         call_a.publish(Frame::opaque(body("A", 0))).await,
         Err(CallError::NoBudget)
     ));
+}
+
+fn env_secs(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Measurement, run by hand: how long a node that joins after its peer's
+/// announce takes to learn that peer through `T`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: LATE_GAP, LATE_BUDGET, LATE_INGRESS, LATE_INTERVAL"]
+async fn late_joiner_measure() {
+    let (gap, budget, interval) = (
+        env_secs("LATE_GAP", 8),
+        env_secs("LATE_BUDGET", 60),
+        env_secs("LATE_INTERVAL", 5),
+    );
+    let ingress = env_secs("LATE_INGRESS", 0) == 1;
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (t_port, f_port) = (free_port(), free_udp_port());
+    let t = transport_node_ingress(t_port, f_port, ingress).await;
+    let key_a = Ident::new("node-a-late", 0x3a).await;
+    let key_b = Ident::new("node-b-late", 0x3b).await;
+    let (id_a, id_b) = (key_a.key_id.clone(), key_b.key_id.clone());
+    let records = vec![key_a.record().await, key_b.record().await];
+    let (a_dir, b_dir) = (
+        directory_with(records.clone()).await,
+        directory_with(records).await,
+    );
+    let every = Duration::from_secs(interval);
+    let direct = DirectLinksConfig::default;
+    let a = side_every(
+        key_a,
+        &a_dir,
+        &tmp.path().join("a"),
+        t_port,
+        direct(),
+        every,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(gap)).await;
+    let before = t.transport_stats();
+    let b = side_every(
+        key_b,
+        &b_dir,
+        &tmp.path().join("b"),
+        t_port,
+        direct(),
+        every,
+    )
+    .await;
+    let start = std::time::Instant::now();
+    let (mut a_knows, mut b_knows) = (None, None);
+    while start.elapsed() < Duration::from_secs(budget) {
+        if a_knows.is_none() && a.transport.knows_peer(&id_b).await {
+            a_knows = Some(start.elapsed());
+        }
+        if b_knows.is_none() && b.transport.knows_peer(&id_a).await {
+            b_knows = Some(start.elapsed());
+        }
+        if a_knows.is_some() && b_knows.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eprintln!(
+        "[LATE] gap={gap}s interval={interval}s ingress={ingress} budget={budget}s \
+         a_knows_b={a_knows:?} b_knows_a={b_knows:?}"
+    );
+    eprintln!("[LATE] T before B: {before:?}");
+    eprintln!("[LATE] T after:    {:?}", t.transport_stats());
 }
