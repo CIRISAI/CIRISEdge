@@ -121,13 +121,17 @@ fn job(s: &LinkSeals, link: [u8; 16]) -> HandshakeJob {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_queue_never_grows_past_its_bound_947() {
     let s = seals();
-    s.set_decap_delay(Duration::from_millis(50));
     let (keyer, mut done) = Keyer::new(Arc::clone(&s));
+    // Built first: a job's own KEX must not give the pool time to drain.
+    let total = DECAP_QUEUE_STRANGER + keyer.workers() + 20;
+    let jobs: Vec<HandshakeJob> = (0..total)
+        .map(|i| job(&s, [u8::try_from(i).unwrap(); 16]))
+        .collect();
+    s.set_decap_delay(Duration::from_millis(200));
     let mut admitted = 0_usize;
     let mut saturated = 0_usize;
-    for i in 0..(DECAP_QUEUE_STRANGER + keyer.workers() + 20) {
-        let link = [u8::try_from(i).unwrap(); 16];
-        match keyer.submit(job(&s, link), false) {
+    for j in jobs {
+        match keyer.submit(j, false) {
             Ok(()) => admitted += 1,
             Err(r) => {
                 assert_eq!(r.label(), o::LINK_SEAL_REFUSED_DECAP_SATURATED);
@@ -136,13 +140,16 @@ async fn the_queue_never_grows_past_its_bound_947() {
         }
         assert!(keyer.depth() <= DECAP_QUEUE_STRANGER);
     }
-    assert!(saturated > 0, "a stated refusal, not a growing queue");
+    assert!(
+        admitted <= DECAP_QUEUE_STRANGER + keyer.workers() && saturated >= 20,
+        "a stated refusal, not a growing queue: {admitted} admitted, {saturated} refused"
+    );
+    s.set_decap_delay(Duration::ZERO);
     for _ in 0..admitted {
         let d = done.recv().await.expect("every admitted job answers");
         assert!(d.outcome.is_ok());
     }
     assert_eq!(keyer.depth(), 0);
-    s.set_decap_delay(Duration::ZERO);
     // The pool came back down and still takes work.
     keyer.submit(job(&s, [0xfe; 16]), false).expect("room");
     assert!(done.recv().await.is_some());
