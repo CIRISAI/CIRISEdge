@@ -22,6 +22,11 @@
 //! - **Link close** (`a_closed_primary_link_fails_over_on_a_live_call`,
 //!   CIRISEdge#945): a primary's link closing fails over at once to a standby
 //!   that is still delivering, with no wait for silence.
+//! - **Layered primary** (`a_capped_primary_is_not_read_as_lossy_on_a_live_call`,
+//!   `a_publisher_at_tier_two_is_not_read_as_lossy_on_a_live_call`,
+//!   `a_primary_dropping_base_is_read_as_lossy_on_a_live_call`, CIRISEdge#945):
+//!   gaps are read within what the path owed, so a cap or a shed is no loss
+//!   and a real base drop still is.
 //! - **Depth 0** (`a_member_claiming_depth_zero_is_not_the_publisher`,
 //!   CIRISEdge#945): only the publisher the binding names holds depth 0.
 //!
@@ -46,7 +51,7 @@ use ciris_edge::transport::av_call::{
 };
 use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{AvKeepTarget, StreamDekRegistrar};
-use ciris_edge::transport::realtime_av::{ChunkLayer, CODEC_AV1_SVC};
+use ciris_edge::transport::realtime_av::{ChunkLayer, ReceiverLayerPolicy, CODEC_AV1_SVC};
 use ciris_edge::transport::realtime_av_alm::controller::wire::encode;
 use ciris_edge::transport::realtime_av_alm::controller::{ControlMsg, DecisionKind, Offer};
 use ciris_edge::transport::reticulum::{
@@ -1124,6 +1129,149 @@ async fn a_closed_primary_link_fails_over_on_a_live_call() {
     assert!(moved, "C took over: {:?} {log}", cb.alm_parents());
     task_b.abort();
     task_c.abort();
+}
+
+/// Three members with A publishing layers; B's primary is A, its standby C.
+struct Layered {
+    ca: Call,
+    cb: Call,
+    _cc: Call,
+    tasks: [tokio::task::JoinHandle<()>; 2],
+    k: u64,
+}
+
+async fn layered_call(nodes: &[Node], groups: &[CohortGroup], tag: &str, load: Load) -> Layered {
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), load).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    let mut cc = join_loaded(c, &groups[2], tag, relay_opts(), None).await;
+    wait_legs(&ca, 2).await;
+    wait_legs(&cb, 2).await;
+    wait_legs(&cc, 2).await;
+    wait_bound(&cb, 2).await;
+    wait_bound(&cc, 2).await;
+    let (_, task_b) = drain(&mut cb);
+    let (_, task_c) = drain(&mut cc);
+    let mut k = 0;
+    layered_until_standby(&mut ca, &cb, &a.key.key_id, &c.key.key_id, &mut k, 90).await;
+    Layered {
+        ca,
+        cb,
+        _cc: cc,
+        tasks: [task_b, task_c],
+        k,
+    }
+}
+
+type Load = Option<Arc<ciris_edge::load_ladder::SharedLadder>>;
+
+impl Layered {
+    /// `n` more chunks, evenly spaced.
+    async fn publish(&mut self, n: u64) {
+        for _ in 0..n {
+            self.ca
+                .publish(layered("a", self.k))
+                .await
+                .expect("publish");
+            self.k += 1;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    }
+
+    fn abort(&self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+/// **CIRISEdge#945 finding B, on a live call.** A caps B's leg at the base
+/// layer, as a host cap and a C5 shed both do: half the `chunk_seq`s never go
+/// to B. Nothing was lost, so A stays Available and B stays on it. Before the
+/// fix each gap read as loss, about 0.5, and A went Degraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_capped_primary_is_not_read_as_lossy_on_a_live_call() {
+    let tag = "alm2-capped";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut call = layered_call(&nodes, &groups, tag, None).await;
+    call.ca
+        .set_layer_policy(&b.key.key_id, ReceiverLayerPolicy::BLINKING_DOT)
+        .await
+        .expect("A caps B");
+    call.publish(300).await;
+    let lines = degraded_lines(&call.cb, &a.key.key_id);
+    let congested = av(&a.metrics, "av_chunk_dropped_congested");
+    let parents = call.cb.alm_parents();
+    let p = parents.iter().find(|p| p.stream == call.ca.stream());
+    eprintln!(
+        "[ALM2] capped primary: Degraded lines {}, congested {congested}, parents {p:?}",
+        lines.len()
+    );
+    assert_eq!(congested, 0, "the premise: nothing really lost");
+    assert_eq!(lines, Vec::<String>::new(), "{:?}", call.cb.alm_log());
+    assert_eq!(
+        primary_for(&call.cb, call.ca.stream()).as_deref(),
+        Some(a.key.key_id.as_str()),
+        "{:?}",
+        call.cb.alm_log()
+    );
+    call.abort();
+}
+
+/// **CIRISEdge#945 finding B, on a live call.** At service tier 2 a publisher
+/// seals its layers and sends them to nobody. Its own shedding is nobody's
+/// loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_publisher_at_tier_two_is_not_read_as_lossy_on_a_live_call() {
+    let tag = "alm2-tier2";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let (a, c) = (&nodes[0], &nodes[2]);
+    let ladder = Arc::new(ciris_edge::load_ladder::SharedLadder::default());
+    let mut call = layered_call(&nodes, &groups, tag, Some(Arc::clone(&ladder))).await;
+    assert_eq!(
+        ladder.set_host_pressure(ciris_edge::LoadPressure::Critical),
+        ciris_edge::ServiceTier::ChatAndContacts
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            call.ca.service_tier() == ciris_edge::ServiceTier::ChatAndContacts
+        })
+        .await,
+        "A reads tier 2"
+    );
+    call.publish(300).await;
+    let (primary, standby) = (
+        degraded_lines(&call.cb, &a.key.key_id),
+        degraded_lines(&call.cb, &c.key.key_id),
+    );
+    eprintln!(
+        "[ALM2] tier 2: Degraded lines primary {} standby {}",
+        primary.len(),
+        standby.len()
+    );
+    assert_eq!(primary, Vec::<String>::new(), "{:?}", call.cb.alm_log());
+    assert_eq!(standby, Vec::<String>::new(), "{:?}", call.cb.alm_log());
+    call.abort();
+}
+
+/// **CIRISEdge#945 finding B, on a live call: the other side.** A never sends
+/// B half its base chunks, while C's path delivers them. They take no hop
+/// counter, so only the standby shows what A's path went past. A path really
+/// dropping base must read lossy. Mutation: without that reading it is clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_primary_dropping_base_is_read_as_lossy_on_a_live_call() {
+    let tag = "alm2-drops-base";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut call = layered_call(&nodes, &groups, tag, None).await;
+    // Every fourth seq: half the even, base ones, and no enhancement chunk.
+    call.ca.withhold_from_for_test(&b.key.key_id, 4);
+    call.publish(300).await;
+    let lines = degraded_lines(&call.cb, &a.key.key_id);
+    eprintln!("[ALM2] dropping base: Degraded lines {}", lines.len());
+    assert!(!lines.is_empty(), "{:?}", call.cb.alm_log());
+    call.abort();
 }
 
 /// **CIRISEdge#945 item 2, on real links.** `P` publishes; `C` cannot reach it

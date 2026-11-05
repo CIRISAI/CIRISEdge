@@ -2538,6 +2538,7 @@ async fn pump(
 ) {
     let mut next_seq: u64 = 0;
     let mut gap = HopGap::default();
+    let mut stale_skipped: u64 = 0;
     let mut guard = LinkIdGuard::default();
     let mut bindings = BindingAssembler::default();
     while let Ok(frame) = inbound.recv_frame().await {
@@ -2568,6 +2569,7 @@ async fn pump(
             );
             if age > MEDIA_STALE_BUDGET && !BindingAssembler::is_part(&frame.bytes) {
                 let _ = gap.report(1);
+                stale_skipped += 1;
                 Shared::lock(&shared.alm).counts.stale_dropped += 1;
                 shared.count(crate::observability::AV_FRAME_STALE_DROPPED);
                 continue;
@@ -2606,6 +2608,14 @@ async fn pump(
         };
         guard.opened();
         gap.resolved();
+        // What the sender put on this link and never reached this node. The
+        // counter is dense over what it sent: it advances past nothing its
+        // layer policy filtered or its link refused, so this is loss within
+        // the policy in force. This node's own age drops took counters too,
+        // and those are its own lag, not the path's.
+        let hop_lost = opened_at
+            .wrapping_sub(next_seq)
+            .saturating_sub(std::mem::take(&mut stale_skipped));
         next_seq = opened_at.wrapping_add(1);
         let signed = inner;
         let stream = signed.stream_id();
@@ -2643,6 +2653,7 @@ async fn pump(
             frame_len,
             source_ms,
             base_or_audio,
+            hop_lost,
         );
         // Forward as an admitted media parent (ALM), and first-hand copies to
         // pre-C3 members when this node relays (the legacy relay). The
