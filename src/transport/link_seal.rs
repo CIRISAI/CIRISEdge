@@ -762,6 +762,8 @@ pub struct LinkSeals {
     decap_delay_ms: AtomicU64,
     /// Decapsulations run.
     decaps: AtomicU64,
+    /// Test seam: how long a responder's first words wait, in milliseconds.
+    first_words_delay_ms: AtomicU64,
 }
 
 impl std::fmt::Debug for LinkSeals {
@@ -796,6 +798,7 @@ impl LinkSeals {
             awaiting_bytes_max: AtomicUsize::new(AWAITING_BYTES_MAX),
             decap_delay_ms: AtomicU64::new(0),
             decaps: AtomicU64::new(0),
+            first_words_delay_ms: AtomicU64::new(0),
         }
     }
 
@@ -1013,6 +1016,22 @@ impl LinkSeals {
             u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+    }
+
+    /// Test seam: hold a responder's first words on a keyed link this long.
+    pub fn set_first_words_delay(&self, delay: Duration) {
+        self.first_words_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The first-words test seam's wait; nothing in production.
+    pub async fn first_words_delay(&self) {
+        let ms = self.first_words_delay_ms.load(Ordering::Relaxed);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
     }
 
     /// Test knob: the node-wide stranger handshake rate.

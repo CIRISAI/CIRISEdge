@@ -5795,6 +5795,14 @@ impl ReticulumTransport {
         self.seals.set_decap_delay(delay);
     }
 
+    /// CIRISEdge#947 test seam — a responder's first words on a keyed link
+    /// wait this long first, as they do on a link whose peer withholds its
+    /// Channel proofs.
+    #[doc(hidden)]
+    pub fn set_first_words_delay_for_test(&self, delay: Duration) {
+        self.seals.set_first_words_delay(delay);
+    }
+
     /// CIRISEdge#947 test seam — the node-wide rate of strangers' handshakes
     /// per window.
     #[doc(hidden)]
@@ -16505,6 +16513,34 @@ async fn replay_before_keys(ctx: &EventCtx<'_>, link_id: LinkId) {
     }
 }
 
+/// CIRISEdge#436/#627 — responder side: our announce rides the peer's link
+/// back to it, first, then the bundle. Not on a scoped link: those are
+/// identity-plane control frames (#728).
+///
+/// CIRISEdge#947 — off the event loop. These are Channel sends, and the
+/// Channel opens at a window of two: on a link whose peer withholds its proofs
+/// each send waits out [`CHANNEL_FRAGMENT_SEND_TIMEOUT`]. On the event loop
+/// that was seconds of every link's traffic, per keyed link, for the price of
+/// a handshake the receiver order had to admit. Admission bounds these tasks.
+/// Anything else this node sends on the link now rides beside these frames,
+/// which the fragment ids and the shaper's transition window already allow.
+fn spawn_first_words(ctx: &EventCtx<'_>, link_id: LinkId) {
+    let node = Arc::clone(ctx.av_node);
+    let seals = Arc::clone(ctx.seals);
+    let shapers = Arc::clone(ctx.shapers);
+    let announce = ctx.own_announce_frame.map(<[u8]>::to_vec);
+    let bundle = ctx.own_bundle.cloned();
+    tokio::spawn(async move {
+        seals.first_words_delay().await;
+        if let Some(frame) = &announce {
+            push_own_announce_frame(&node, &seals, &shapers, frame, &link_id).await;
+        }
+        if let Some(own) = &bundle {
+            push_own_bundle_frames(&node, &seals, &shapers, own, &link_id).await;
+        }
+    });
+}
+
 /// CC 5.3.3.5 E1 — a peer-dialled link's handshake was answered: the link is
 /// sealed, and only now does this node say anything on it. A claim that
 /// already contradicts the link's attribution is refused here; otherwise the
@@ -16536,17 +16572,7 @@ async fn link_keyed(ctx: &EventCtx<'_>, link_id: LinkId, claimed: String) {
     );
     let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
     match plane {
-        LinkPlane::Identity => {
-            // CIRISEdge#436/#627 — responder side: our announce rides the
-            // peer's link back to it, FIRST, then the bundle. Not on a scoped
-            // link: those are identity-plane control frames (#728).
-            if let Some(frame) = ctx.own_announce_frame {
-                push_own_announce_frame(ctx.node, ctx.seals, ctx.shapers, frame, &link_id).await;
-            }
-            if let Some(own) = ctx.own_bundle {
-                push_own_bundle_frames(ctx.node, ctx.seals, ctx.shapers, own, &link_id).await;
-            }
-        }
+        LinkPlane::Identity => spawn_first_words(ctx, link_id),
         LinkPlane::Av => deliver_av_frame(ctx, link_id, dest, None).await,
         LinkPlane::Scoped => {}
     }

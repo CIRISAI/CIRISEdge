@@ -2319,6 +2319,42 @@ async fn the_awaiting_cap_refuses_the_oldest_by_name_and_keeps_new_links_working
     );
 }
 
+/// **Witness (#947)** — a responder's first words on a keyed link are Channel
+/// sends, which wait on the peer's proofs: held for three seconds, as on a link
+/// whose peer withholds them, they stall no other link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_responders_stalled_first_words_block_no_other_links_frames_947() {
+    const SLOW: Duration = Duration::from_secs(3);
+    let t = trio("firstwords", true, false, false).await;
+    one_way(&t.b, &t.a, 0, b"947-WORDS-WARMUP-")
+        .await
+        .expect("B's link is up");
+    t.a.transport.set_first_words_delay_for_test(SLOW);
+    let frame = marked(b"947-WORDS-C-", 700);
+    t.c.transport
+        .send(&t.a.key.key_id, &frame)
+        .await
+        .expect("C dials");
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.seal("link_seal_accepted") >= 2
+        })
+        .await,
+        "C's link keyed at A"
+    );
+    let inside = std::time::Instant::now();
+    for n in 1..=8 {
+        one_way(&t.b, &t.a, n, b"947-WORDS-B-")
+            .await
+            .expect("B's frame lands");
+    }
+    assert!(
+        inside.elapsed() < SLOW - Duration::from_millis(500),
+        "B's eight frames took {:?} against {SLOW:?} of first words",
+        inside.elapsed()
+    );
+}
+
 /// **Measurement (#947), loopback, all in one process**: what a flood of
 /// forged handshakes costs an established link. Not a CI test: run with
 /// `--ignored --nocapture`. Runs on the code before #947 too.
