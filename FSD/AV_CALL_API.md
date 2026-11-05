@@ -277,7 +277,7 @@ exist for it, and the recording is the after-the-fact CC 3.3.13 blob. No row or 
 
 ## 7. Signalling — the room's existing rows, no new wire (item 6, C3)
 
-There is no `chat:call:*` dimension and no call row of any kind. Signalling reuses what exists:
+Superseded in part (2026-10-15): each attendee writes one `chat:call:v1` row at the room's scope on joining (`write_call_row`), so attendees are data subjects; attendance is the union over a `call_id`, a leaver's row stands, and no row marks a call's end. That row also lets a room's members see a call has started. `Edge::ring` below is design: it is not in the code. Otherwise signalling reuses what exists:
 
 - **An in-room call needs no ring.** Every member of the room already may join; `join_call(room)`
   starts this node's stream, and the others see it arrive. "Accept" is joining, and "decline" is
@@ -376,7 +376,7 @@ refused frame).
 - **C2.** The call epoch is the room's MLS epoch. Any member may commit an Update at the cap, and
   there is no sub-epoch. Every Add and every Remove rotates (the CC table that exempts Add is an
   erratum) (§3.2).
-- **C3.** No `chat:call:*`. An ad-hoc call is an ephemeral community with a short `valid_until`;
+- **C3.** No `chat:call:*` as first designed; see §7 for the attendance row. An ad-hoc call is an ephemeral community with a short `valid_until`;
   ring, accept and decline are `membership:proposal|acceptance|decline:v1`; hang-up is forward-only
   withdraws; an in-room call needs no ring (§7).
 - **C4.** No presence row (confirmed).
