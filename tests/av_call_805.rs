@@ -48,7 +48,9 @@ use ciris_edge::transport::av_call::{
 use ciris_edge::transport::av_call_key::CallId;
 use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{AvKeep, AvKeepTarget, StreamDekRegistrar};
-use ciris_edge::transport::realtime_av::{ChunkLayer, ChunkSeq, ReceiverLayerPolicy, CODEC_OPAQUE};
+use ciris_edge::transport::realtime_av::{
+    ChunkLayer, ChunkSeq, ReceiverLayerPolicy, CODEC_AV1_SVC, CODEC_OPAQUE,
+};
 use ciris_edge::transport::reticulum::{
     ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
 };
@@ -662,7 +664,8 @@ async fn a_three_member_room_call_over_keyed_links() {
         }
         let report = call_a
             .publish(Frame {
-                codec_id: CODEC_OPAQUE,
+                // CC 5.3.3.2.1: a layered stream is a layered codec.
+                codec_id: CODEC_AV1_SVC,
                 layer: layer_of(s),
                 bytes: body("a", s),
             })

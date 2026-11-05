@@ -190,10 +190,11 @@ pub const CODEC_MDC: u8 = 0x03;
 
 /// Codec-opaque — v3.7.0 wire compatibility marker. A chunk with
 /// `codec_id == CODEC_OPAQUE` carries no scalable-coding semantics; its
-/// `layer` MUST be `ChunkLayer { 0, 0, 0 }` and receivers MUST admit it
-/// unconditionally regardless of their `ReceiverLayerPolicy`. This is
-/// the value the read-side stamps when parsing a pre-#128 wire that
-/// lacks the trailing 4-byte block.
+/// `layer` MUST be `ChunkLayer { 0, 0, 0 }` (CC 5.3.3.2.1), which
+/// [`seal_av_inner`] enforces. Every `ReceiverLayerPolicy` admits the base
+/// cell, so no receiver filters a conformant opaque chunk and no special case
+/// is needed for one. This is the value the read-side stamps when parsing a
+/// pre-#128 wire that lacks the trailing 4-byte block.
 pub const CODEC_OPAQUE: u8 = 0xFF;
 
 /// SVC layer descriptor — three monotonic axes addressing the
@@ -273,11 +274,10 @@ impl ReceiverLayerPolicy {
     /// Return `true` iff `layer` is within this receiver's per-axis
     /// caps.
     ///
-    /// Semantics — `admits` is purely the per-axis layer test. A chunk
-    /// tagged with [`CODEC_OPAQUE`] carries no scalable-coding
-    /// semantics and MUST be admitted by the caller unconditionally
-    /// regardless of policy; the fan-out filter (Layer 2 task T5)
-    /// handles that short-circuit before consulting `admits`.
+    /// Semantics — `admits` is purely the per-axis layer test, for every
+    /// codec. A [`CODEC_OPAQUE`] chunk is `{ 0, 0, 0 }` (CC 5.3.3.2.1), the
+    /// cell every policy admits, so it needs no short-circuit; one tagged
+    /// otherwise is not conformant and is filtered like any other.
     #[must_use]
     pub fn admits(self, layer: ChunkLayer) -> bool {
         layer.spatial <= self.max_spatial
@@ -440,6 +440,9 @@ impl SealedAvChunk {
 pub enum RealtimeAvError {
     #[error("inner AEAD failed: {0:?}")]
     InnerAead(ciris_crypto::CryptoError),
+    /// CC 5.3.3.2.1 — an opaque chunk has no layers.
+    #[error("CODEC_OPAQUE requires layer {{0,0,0}}, got {0:?}")]
+    OpaqueWithLayer(ChunkLayer),
     #[error("outer AEAD failed: {0:?}")]
     OuterAead(ciris_crypto::CryptoError),
     #[error("sealed wire too short: got {got} bytes, need at least {need}")]
@@ -593,6 +596,10 @@ pub fn seal_av_inner(
     codec_id: u8,
     layer: ChunkLayer,
 ) -> Result<InnerSealed, RealtimeAvError> {
+    // CC 5.3.3.2.1: `0xFF` has no layers.
+    if codec_id == CODEC_OPAQUE && layer != ChunkLayer::BASE {
+        return Err(RealtimeAvError::OpaqueWithLayer(layer));
+    }
     epoch_counter(chunk_seq)?;
     let inner_nonce = derive_inner_nonce(stream_id, epoch, chunk_seq);
     let inner_ciphertext = aes_gcm::encrypt(epoch_dek.as_bytes(), &inner_nonce, plaintext)
