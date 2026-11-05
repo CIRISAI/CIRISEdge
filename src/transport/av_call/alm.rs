@@ -1199,6 +1199,7 @@ mod tests {
     /// encoded and decoded as on a link, and which chunk reaches which path
     /// is what `own_exclude` and `forward_exclude` say, so a standby skips
     /// exactly what production skips. Time moves by shifting each clock.
+    #[allow(clippy::struct_excessive_bools)] // independent test switches
     struct Mesh {
         nodes: Vec<AlmState>,
         sa: StreamId,
