@@ -1084,6 +1084,11 @@ pub const OFFER_ANSWER_BUDGET: Duration = Duration::from_secs(10);
 /// Poisson timer and the budget meter.
 pub struct LinkShaper {
     agreement: Agreement,
+    /// The frame this node's offer was quoted at. The agreement's frame can be
+    /// a peer's smaller one, and λ rounds differently at each, so what this
+    /// node would offer now is only comparable at this one
+    /// ([`Self::carried_by`]).
+    quoted_frame: u16,
     queue: Mutex<VecDeque<(u64, Vec<u8>)>>,
     queue_cap: usize,
     /// The peer announced multi-body frames ([`capability_body`]).
@@ -1160,6 +1165,7 @@ impl LinkShaper {
             (agreement.rho * agreement.lambda * agreement.window.as_secs_f64()).ceil() as u32;
         budget.configure(scope.clone(), target.max(1), agreement.window);
         Self {
+            quoted_frame: agreement.frame_bytes,
             agreement,
             queue: Mutex::new(VecDeque::new()),
             queue_cap,
@@ -1209,6 +1215,24 @@ impl LinkShaper {
     #[must_use]
     pub fn agreement(&self) -> &Agreement {
         &self.agreement
+    }
+
+    /// Record the frame this node's offer was quoted at.
+    #[must_use]
+    fn quoted_at(mut self, frame_bytes: u16) -> Self {
+        self.quoted_frame = frame_bytes;
+        self
+    }
+
+    /// Whether `offer`, this node's offer at [`Self::quoted_frame`], covers what
+    /// was agreed here. Both sides are read at the quoted precision, never
+    /// against a nominal class rate: the offer rounds λ, so a link can agree a
+    /// few bytes above its class and an unchanged policy must still carry it.
+    /// An `off` offer quotes nothing, so it carries nothing.
+    fn carried_by(&self, offer: &ShapingOffer) -> bool {
+        let quoted = f64::from(offer.rate_milli) / 1000.0 * f64::from(offer.frame_bytes);
+        let agreed = self.agreement.lambda * f64::from(self.agreement.frame_bytes);
+        agreed <= quoted + 1e-6
     }
 
     /// Bodies waiting.
@@ -2087,11 +2111,11 @@ impl LinkShapers {
     }
 
     /// Replace the policy at runtime. A shaped link the new policy can no
-    /// longer carry (its agreed rate is above the new per-link rate, shaping
-    /// is now off, or the link is no longer offered under the new scope) is
-    /// stopped and forgotten here and returned for the caller to CLOSE: a
-    /// link is never left half-shaped, and a closed link is redialled and
-    /// renegotiated under the new policy. A link that still fits keeps its
+    /// longer carry (what was agreed is above what the new policy would offer
+    /// this link, at the frame its offer was quoted at, or that offer is now
+    /// `off`) is stopped and forgotten here and returned for the caller to
+    /// CLOSE: a link is never left half-shaped, and a closed link is redialled
+    /// and renegotiated under the new policy. A link that still fits keeps its
     /// agreement (an upgrade applies to links offered from now on).
     pub fn set_policy(&self, policy: ShapingPolicy) -> Vec<[u8; 16]> {
         let layer = self.layer_peer_set();
@@ -2100,9 +2124,10 @@ impl LinkShapers {
         {
             let mut links = self.links();
             links.retain(|link, shaper| {
-                let is_layer = peers.get(link).is_some_and(|p| layer.contains(p));
-                let keep = policy.offers_on(is_layer)
-                    && shaper.agreement().bytes_per_s() <= policy.bytes_per_s.saturating_add(1);
+                let peer = peers.get(link).map(String::as_str);
+                let is_layer = peer.is_some_and(|p| layer.contains(p));
+                let quoted = usize::from(shaper.quoted_frame);
+                let keep = shaper.carried_by(&self.quote(&policy, quoted, peer, is_layer));
                 if !keep {
                     shaper.stop();
                     close.push(*link);
@@ -2659,18 +2684,30 @@ impl LinkShapers {
         peer: Option<&str>,
     ) -> ShapingOffer {
         let policy = self.policy();
-        let offer = if policy.enabled() && self.is_seat_link(peer) {
-            ShapingOffer::seat(frame_bytes)
-        } else if policy.offers_on(self.is_layer_peer(peer)) {
-            ShapingOffer::from_policy(&policy, frame_bytes)
-        } else {
-            ShapingOffer::off()
-        };
+        let offer = self.quote(&policy, frame_bytes, peer, self.is_layer_peer(peer));
         if let Some(p) = peer {
             self.link_peer().insert(link, p.to_owned());
         }
         self.offered().insert(link, offer);
         offer
+    }
+
+    /// What `policy` offers a link to `peer` at `frame_bytes`: one answer for a
+    /// new link ([`Self::offer_for`]) and a held one ([`Self::set_policy`]).
+    fn quote(
+        &self,
+        policy: &ShapingPolicy,
+        frame_bytes: usize,
+        peer: Option<&str>,
+        is_layer: bool,
+    ) -> ShapingOffer {
+        if policy.enabled() && self.is_seat_link(peer) {
+            ShapingOffer::seat(frame_bytes)
+        } else if policy.offers_on(is_layer) {
+            ShapingOffer::from_policy(policy, frame_bytes)
+        } else {
+            ShapingOffer::off()
+        }
     }
 
     /// Record this node's `off` offer for `link` (a link that is never shaped,
@@ -2712,7 +2749,9 @@ impl LinkShapers {
         let out = match agree(&ours, theirs) {
             _ if refused => Err(ShapingError::HomeElsewhere),
             Some(agreement) => {
-                let shaper = Arc::new(LinkShaper::new(link, agreement, self.queue_cap));
+                let shaper = Arc::new(
+                    LinkShaper::new(link, agreement, self.queue_cap).quoted_at(ours.frame_bytes),
+                );
                 self.links().insert(link, Arc::clone(&shaper));
                 // A seat offer travels as `server`, so the peer's class says
                 // nothing: the link is a seat link when it runs at the seat
@@ -4153,6 +4192,162 @@ mod tests {
             .adopt_seats(crate::load_ladder::ActiveSeats::default())
             .is_empty());
         assert!(t.is_shaped(link));
+    }
+
+    /// A class policy at `bytes_per_s`, with room for the links a test holds.
+    fn class_policy(bytes_per_s: u32) -> ShapingPolicy {
+        let mut p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        p.bytes_per_s = bytes_per_s;
+        p.share = ShapedSharePolicy::BoundedWithFloor {
+            max_links: 8,
+            floor_bytes_per_s: bytes_per_s,
+        };
+        p
+    }
+
+    /// A policy change closes a link the new policy cannot carry, never one it
+    /// can. The offer rounds λ: at this frame a 100,000 B/s class link agrees at
+    /// 100,008, and 7,000 at the fleet's frames rounds DOWN, which cannot see
+    /// this. Read as a rate, every device or policy change would close a healthy
+    /// link, on every node. Mutations: compare the rates → this fails; keep
+    /// every link → the real cut below fails.
+    #[test]
+    fn a_policy_change_leaves_a_class_link_that_rounded_above_its_class() {
+        let p = class_policy(100_000);
+        let t = LinkShapers::new(p.clone());
+        let link = [91u8; 16];
+        let _ = t.offer_for(link, 16_384, Some("peer"));
+        let shaper = t
+            .peer_offer(link, &ShapingOffer::from_policy(&p, 16_384))
+            .unwrap()
+            .expect("shaped");
+        assert_eq!(
+            shaper.agreement().bytes_per_s(),
+            100_008,
+            "the case itself: the offer rounds up"
+        );
+
+        assert!(t.set_policy(p.clone()).is_empty(), "the same rate");
+        assert!(t.set_policy(class_policy(250_000)).is_empty(), "a raise");
+        assert!(t.set_policy(p).is_empty(), "and back");
+        assert!(t.is_shaped(link), "the link still runs");
+
+        assert_eq!(
+            t.set_policy(class_policy(99_000)),
+            vec![link],
+            "a real cut still closes it, to renegotiate"
+        );
+        assert!(!t.is_shaped(link));
+    }
+
+    /// The agreement's frame is not the frame this node quoted at, and the
+    /// rounding differs by frame: this offer rounds up at 16,384 and the same
+    /// policy rounds DOWN at the agreed 1,024. The link is held to the frame its
+    /// offer was made at. Mutation: quote at the agreed frame → this fails.
+    #[test]
+    fn a_policy_change_quotes_at_the_frame_the_offer_was_made_at() {
+        let p = class_policy(100_000);
+        let t = LinkShapers::new(p.clone());
+        let link = [92u8; 16];
+        let _ = t.offer_for(link, 16_384, Some("peer"));
+        let shaper = t
+            .peer_offer(
+                link,
+                &ShapingOffer::from_policy(&class_policy(200_000), 1_024),
+            )
+            .unwrap()
+            .expect("shaped");
+        assert_eq!(shaper.agreement().frame_bytes, 1_024);
+        assert_eq!(shaper.agreement().bytes_per_s(), 100_008);
+        let at_agreed = ShapingOffer::from_policy(&p, 1_024);
+        assert!(
+            f64::from(at_agreed.rate_milli) / 1000.0 * 1_024.0 < 100_000.0,
+            "the case itself: at the agreed frame the policy rounds down"
+        );
+
+        assert!(t.set_policy(p).is_empty());
+        assert!(t.is_shaped(link));
+    }
+
+    /// An unchanged policy carries every agreement it made: at any pair of
+    /// frames, with this node's offer the lower one, through the float round
+    /// trip of re-quoting a rate at the agreed frame. Mutation: drop the
+    /// tolerance → this fails.
+    #[test]
+    fn an_unchanged_policy_carries_its_own_agreement_at_every_frame() {
+        let peer = ShapingOffer::from_policy(&class_policy(u32::MAX / 2), 96);
+        for bytes_per_s in [1_000, 7_000, 12_345, 33_000, 100_000, 1_048_576] {
+            let p = class_policy(bytes_per_s);
+            for frame in (96..=u16::MAX).step_by(7) {
+                let ours = ShapingOffer::from_policy(&p, usize::from(frame));
+                for theirs in [ours, peer] {
+                    let agreed = agree(&ours, &theirs).expect("both shape");
+                    let shaper = LinkShaper::new([95u8; 16], agreed, 8).quoted_at(frame);
+                    assert!(
+                        shaper.carried_by(&ours),
+                        "{bytes_per_s} B/s at frame {frame}, agreed at {}",
+                        agreed.frame_bytes
+                    );
+                }
+            }
+        }
+    }
+
+    /// The test reads what was agreed, not what this node asked for: a peer's
+    /// lower offer set this link's rate, so a cut that still clears the agreed
+    /// rate leaves it alone. Mutation: compare this node's own offer → the first
+    /// assert fails.
+    #[test]
+    fn a_policy_change_reads_the_agreed_rate_not_the_rate_this_node_offered() {
+        let t = LinkShapers::new(class_policy(100_000));
+        let link = [93u8; 16];
+        let _ = t.offer_for(link, 1_024, Some("peer"));
+        t.peer_offer(
+            link,
+            &ShapingOffer::from_policy(&class_policy(50_000), 1_024),
+        )
+        .unwrap()
+        .expect("shaped");
+
+        assert!(t.set_policy(class_policy(60_000)).is_empty());
+        assert_eq!(t.set_policy(class_policy(40_000)), vec![link]);
+    }
+
+    /// A seat link is the table's row whatever this node's own settings
+    /// ([`LinkShapers::offer_for`]), so its class rate has no say in it: read
+    /// against the class, any change would close every seat link and the redial
+    /// would land on the same row. It closes when the policy would offer it
+    /// nothing, or the peer is no seat any more. Mutation: quote the class on a
+    /// seat link → this fails.
+    #[test]
+    fn a_policy_change_leaves_a_seat_link_at_the_seat_rate() {
+        let p = class_policy(7_000);
+        let t = LinkShapers::new(p.clone());
+        t.set_seat_prefixes(vec!["seat-".to_owned()], true);
+        let link = [94u8; 16];
+        let ours = t.offer_for(link, 400, Some("seat-b"));
+        assert_eq!(ours.class, BudgetClass::Seat);
+        let shaper = t
+            .peer_offer(link, &ShapingOffer::seat(400))
+            .unwrap()
+            .expect("shaped");
+        assert!(shaper.agreement().bytes_per_s() > p.bytes_per_s + 1);
+
+        assert!(t.set_policy(class_policy(3_000)).is_empty());
+        let mut layer_only = class_policy(7_000);
+        layer_only.scope = ShapingScope::LayerLinksOnly;
+        assert!(
+            t.set_policy(layer_only).is_empty(),
+            "offer_for still offers a seat its row under this scope"
+        );
+        assert!(t.is_shaped(link));
+
+        t.set_seat_prefixes(vec!["none-".to_owned()], true);
+        assert_eq!(
+            t.set_policy(class_policy(7_000)),
+            vec![link],
+            "no seat any more: the class rate cannot carry it"
+        );
     }
 
     #[test]
