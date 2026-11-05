@@ -2570,6 +2570,57 @@ async fn a_bound_peer_has_standing_from_its_first_handshake_after_a_restart() {
     );
 }
 
+/// **Witness (v44 LTS)** — a live binding for the key is the newer word. The
+/// directory still binds `C`'s old identity, a newer binding at `B` names
+/// another, so the old identity has no standing though the roster seats the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_binding_gives_no_standing_after_a_restart() {
+    let t = trio_on("superseded", true, false, false, true).await;
+    seed_route(&t.b, &t.c).await;
+    seed_route(&t.c, &t.b).await;
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            t.c.transport.knows_peer(&t.b.key.key_id).await
+                && t.b.transport.knows_peer(&t.c.key.key_id).await
+        })
+        .await,
+        "B and C learn each other through A"
+    );
+    t.c.transport.set_unannounced_for_test(true);
+    let (b, metrics) = restart_b(&t).await;
+    b.set_stranger_handshake_cap_for_test(0);
+    b.set_seats_for_test(std::iter::once(t.c.key.key_id.clone()).collect(), false);
+    b.inject_advisory_peer_with_transport_identity_for_test(
+        &t.c.key.key_id,
+        t.a.transport.local_named_dest_hash(),
+        t.a.transport.local_transport_pubkey(),
+    )
+    .await;
+    let b_dest = b.local_named_dest_hash();
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.c.transport
+                .path_table_rows_for_test()
+                .iter()
+                .any(|(dest, _, _)| *dest == b_dest)
+        })
+        .await,
+        "C holds a path to B"
+    );
+    let frame = marked(b"LTS-SUPERSEDED-", 600);
+    let _ = t.c.transport.send(&t.b.key.key_id, &frame).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            metrics
+                .link_seal()
+                .contains_key("link_seal_refused_handshake_node_rate")
+        })
+        .await,
+        "the superseded identity is a stranger: {:?}",
+        metrics.link_seal()
+    );
+}
+
 /// **Measurement (#947), loopback, all in one process**: what a flood of
 /// forged handshakes costs an established link. Not a CI test: run with
 /// `--ignored --nocapture`. Runs on the code before #947 too.

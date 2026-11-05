@@ -2580,6 +2580,8 @@ pub struct ReticulumTransport {
     /// `None` until installed: every scope-native lookup then declines and
     /// the federation-scope paths are unaffected.
     scope_addresses: OnceLock<Arc<ScopeAddressTable>>,
+    /// v44 LTS — see [`read_persisted_standing`].
+    persisted_standing: Arc<std::sync::RwLock<PersistedStandings>>,
     /// CIRISEdge#591 / leviculum#66 — per-interface circuit-breaker series,
     /// fed by `NodeEvent::PeerCongested`. Read via
     /// [`Self::congestion_gauges`].
@@ -4090,6 +4092,7 @@ impl ReticulumTransport {
             local_transport_pubkey,
             local_identity: identity.clone(),
             scope_addresses: OnceLock::new(),
+            persisted_standing: Arc::default(),
             congestion: Arc::new(crate::transport::av_backpressure::CongestionRegistry::default()),
             #[cfg(feature = "lxmf")]
             lxmf_serve: OnceLock::new(),
@@ -10606,8 +10609,29 @@ impl ReticulumTransport {
         seat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut attribution_tick = tokio::time::interval(Duration::from_millis(100));
         attribution_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // v44 LTS — before the first event: a peer this node answers for has
+        // standing from its first handshake. Bounded, so a slow directory
+        // delays no listener; the read finishes on its own if it runs over.
+        if let Some(rooting) = self.rooting.clone() {
+            let boot = tokio::spawn(refresh_persisted_standing(
+                rooting,
+                self.hybrid_policy,
+                Arc::clone(&self.persisted_standing),
+            ));
+            if tokio::time::timeout(PERSISTED_STANDING_BOOT_BUDGET, boot)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    budget_secs = PERSISTED_STANDING_BOOT_BUDGET.as_secs(),
+                    "persisted standing still reading at the listener's start; first \
+                     handshakes may be judged strangers until it lands"
+                );
+            }
+        }
         let ctx = EventCtx {
             node: &self.node,
+            persisted_standing: &self.persisted_standing,
             local_key_id: self.occurrence_key_id(),
             route_answer_override: &self.route_answer_override,
             peers: &self.peers,
@@ -10696,6 +10720,13 @@ impl ReticulumTransport {
                         Arc::clone(&self.seals),
                         Arc::clone(&self.shapers),
                     ));
+                    if let Some(rooting) = self.rooting.clone() {
+                        tokio::spawn(refresh_persisted_standing(
+                            rooting,
+                            self.hybrid_policy,
+                            Arc::clone(&self.persisted_standing),
+                        ));
+                    }
                 }
                 _ = pool_tick.tick() => {
                     let closed = self.reap_idle_pooled_links().await;
@@ -13306,6 +13337,9 @@ fn direct_standing(
 
 struct EventCtx<'a> {
     node: &'a ReticulumNode,
+    /// v44 LTS — the bindings a restart still answers for
+    /// ([`read_persisted_standing`]).
+    persisted_standing: &'a std::sync::RwLock<PersistedStandings>,
     /// CIRISEdge#621 — this node's own key id, so inbound attribution can
     /// refuse to resolve a link to ourselves regardless of what the peers map
     /// holds (see [`LinkAttribution::ResolvedToSelf`]).
@@ -15491,28 +15525,148 @@ fn close_evicted(ctx: &EventCtx<'_>) {
     }
 }
 
+/// v44 LTS — what a restart still knows about who it answers for. The live
+/// `peers` map starts empty, so without this every ordinary peer's first link
+/// after a restart was judged a stranger (`FSD/EVENT_PATH_MODEL.md` §2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedStanding {
+    key_id: String,
+    /// The row said Rooted and the key's chain roots HERE, re-walked.
+    rooted: bool,
+}
+
+/// Per proven transport identity, the bindings persist holds for it.
+type PersistedStandings = HashMap<[u8; 16], Vec<PersistedStanding>>;
+
+/// v44 LTS — read the persisted bindings a handshake may be judged by, off the
+/// event path. The store is authority for the route, never for trust
+/// (CIRISEdge#393): a replicated row's `Rooted` is its signer's own claim. So a
+/// row counts only if it proves the same two things a live binding has to:
+/// `rooted` is the claim AND a chain that roots here, walked as a heal walks it;
+/// otherwise the key must have hybrid-signed this very route, which is
+/// `owns_key`. A plain write-through of an announce proves neither and is
+/// dropped, since anyone can announce under anyone's key id.
+///
+/// `prior` memoises the walk: this runs on the roster's cadence, a binding that
+/// has not moved keeps its verdict, and a revocation is read every pass.
+async fn read_persisted_standing(
+    rooting: &dyn RootingDirectory,
+    policy: HybridPolicy,
+    prior: &PersistedStandings,
+) -> PersistedStandings {
+    use ciris_persist::federation::self_at_login::BindingProvenance;
+    let rows = match rooting.live_reticulum_bindings().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            // A hiccup must never widen anything: nobody, until the next read.
+            tracing::warn!(%error, "persisted standing could not be read; none this pass");
+            return PersistedStandings::new();
+        }
+    };
+    let mut out = PersistedStandings::new();
+    for row in rows {
+        // The identity must be the one this destination is derived from.
+        if named_dest_of_transport(&row.transport_pubkey64) != Some(row.dest_hash) {
+            continue;
+        }
+        let x25519: [u8; 32] = row.transport_pubkey64[..32].try_into().unwrap_or([0u8; 32]);
+        let ed25519: [u8; 32] = row.transport_pubkey64[32..].try_into().unwrap_or([0u8; 32]);
+        let Ok(identity) = Identity::from_public_keys(&x25519, &ed25519) else {
+            continue;
+        };
+        let identity = *identity.hash();
+        let known = prior
+            .get(&identity)
+            .and_then(|v| v.iter().find(|b| b.key_id == row.key_id));
+        let rooted = match known {
+            Some(b) => b.rooted,
+            None => {
+                matches!(row.provenance, BindingProvenance::Rooted)
+                    && store_claim_roots_here(rooting, &row.key_id, policy).await
+            }
+        };
+        if !rooted
+            && known.is_none()
+            && !rooting
+                .hybrid_transport_binding_exists(&row.key_id, row.dest_hash)
+                .await
+        {
+            continue;
+        }
+        out.entry(identity).or_default().push(PersistedStanding {
+            key_id: row.key_id,
+            rooted,
+        });
+    }
+    out
+}
+
+/// The standing rule, on what a binding has proven. The roster, the rooms and
+/// the contacts are read live either way.
+fn binding_has_standing(ctx: &EventCtx<'_>, key: &str, rooted: bool, owns_key: bool) -> bool {
+    rooted
+        || (owns_key
+            && (ctx.shapers.is_seat(key)
+                || direct_standing(
+                    ctx.scope_addresses.get().map(Arc::as_ref),
+                    ctx.direct_paths,
+                    key,
+                )))
+}
+
 /// CIRISEdge#947 — whether a proven transport identity is bound to a key this
 /// node already answers for, read from live tables and never the directory (it
 /// runs on the event path): a Rooted binding, or a key that owns its binding
 /// and holds a seat on the active roster or a room or contact standing. A bare
 /// announce is an `Advisory` binding, free to mint, and earns nothing here.
+///
+/// v44 LTS — a key with no live binding yet is judged by what persist holds
+/// ([`read_persisted_standing`]), so a restart does not make strangers of the
+/// peers it answers for. A live binding for the key is the newer word: if it
+/// names another identity the persisted one is superseded and gives nothing.
 async fn identity_has_standing(ctx: &EventCtx<'_>, identity_hash: &[u8; 16]) -> bool {
     use ciris_persist::federation::self_at_login::BindingProvenance;
     let peers = ctx.peers.lock().await;
-    identified_candidates(&peers, identity_hash)
+    let live = identified_candidates(&peers, identity_hash)
         .iter()
         .any(|(key, _)| {
             peers.get(key).is_some_and(|rp| {
-                matches!(rp.provenance, BindingProvenance::Rooted)
-                    || (rp.owns_key
-                        && (ctx.shapers.is_seat(key)
-                            || direct_standing(
-                                ctx.scope_addresses.get().map(Arc::as_ref),
-                                ctx.direct_paths,
-                                key,
-                            )))
+                binding_has_standing(
+                    ctx,
+                    key,
+                    matches!(rp.provenance, BindingProvenance::Rooted),
+                    rp.owns_key,
+                )
+            })
+        });
+    live || ctx
+        .persisted_standing
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(identity_hash)
+        .is_some_and(|bindings| {
+            bindings.iter().any(|b| {
+                !peers.contains_key(&b.key_id)
+                    && binding_has_standing(ctx, &b.key_id, b.rooted, true)
             })
         })
+}
+
+/// v44 LTS — read the persisted bindings again, so a route retired or
+/// superseded, or a key revoked, stops giving standing within one pass.
+async fn refresh_persisted_standing(
+    rooting: Arc<dyn RootingDirectory>,
+    policy: HybridPolicy,
+    table: Arc<std::sync::RwLock<PersistedStandings>>,
+) {
+    let prior = table
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let next = read_persisted_standing(rooting.as_ref(), policy, &prior).await;
+    *table
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
 }
 
 /// CIRISEdge#947 — a complete handshake arrived. On a link with no proven
@@ -16302,6 +16456,9 @@ async fn refresh_seats(
         let _ = node.close_link(&LinkId::new(link)).await;
     }
 }
+
+/// How long a listener's start waits for the persisted bindings.
+const PERSISTED_STANDING_BOOT_BUDGET: Duration = Duration::from_secs(10);
 
 /// How often tier 2 closes one shaped link. A step at a time, so a tier that
 /// falls leaves the older links standing, the way the A/V shed moves one leg
@@ -21583,6 +21740,130 @@ mod tests {
             let verdict = consult_and_prune_blackhole(&store, &rows, &[0xBB; 16], Utc::now()).await;
             assert!(matches!(verdict, BlackholeConsult::Clear));
             assert_eq!(mem.rows().len(), 1);
+        }
+    }
+
+    /// v44 LTS — what a persisted row has to prove. The store's `Rooted` is a
+    /// claim, a plain write-through proves nothing, and a row whose identity
+    /// is not its destination's is nobody's.
+    mod persisted_standing {
+        use super::*;
+        use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
+
+        struct Rows {
+            rows: Vec<crate::verify::LiveTransportBinding>,
+            signed: Vec<String>,
+            read_fails: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl RootingDirectory for Rows {
+            async fn root_binding(&self, key_id: &str, _claimed: &str) -> RootingVerdict {
+                RootingVerdict::Rejected {
+                    rejection: RootingRejection::UnknownKeyId {
+                        key_id: key_id.to_owned(),
+                    },
+                }
+            }
+            async fn provenance_chain(
+                &self,
+                key_id: &str,
+            ) -> Result<ProvenanceChain, RootingRejection> {
+                Err(RootingRejection::UnknownKeyId {
+                    key_id: key_id.to_owned(),
+                })
+            }
+            async fn registered_pubkey_ed25519_base64(&self, _key_id: &str) -> Option<String> {
+                Some("registered".to_owned())
+            }
+            async fn hybrid_transport_binding_exists(
+                &self,
+                key_id: &str,
+                _dest_hash: [u8; 16],
+            ) -> bool {
+                self.signed.iter().any(|k| k == key_id)
+            }
+            async fn live_reticulum_bindings(
+                &self,
+            ) -> Result<Vec<crate::verify::LiveTransportBinding>, String> {
+                if self.read_fails {
+                    return Err("down".to_owned());
+                }
+                Ok(self.rows.clone())
+            }
+        }
+
+        fn pubkey(seed: u8) -> [u8; 64] {
+            Identity::from_private_key_bytes(&[seed; 64])
+                .expect("an identity")
+                .public_key_bytes()
+        }
+
+        fn row(
+            key: &str,
+            pk: [u8; 64],
+            provenance: ciris_persist::federation::self_at_login::BindingProvenance,
+        ) -> crate::verify::LiveTransportBinding {
+            crate::verify::LiveTransportBinding {
+                key_id: key.to_owned(),
+                dest_hash: named_dest_of_transport(&pk).expect("a destination"),
+                transport_pubkey64: pk,
+                provenance,
+            }
+        }
+
+        fn keys(table: &PersistedStandings) -> Vec<String> {
+            let mut keys: Vec<String> =
+                table.values().flatten().map(|b| b.key_id.clone()).collect();
+            keys.sort();
+            keys
+        }
+
+        #[tokio::test]
+        async fn only_a_proven_binding_counts_and_a_gone_row_stops_counting() {
+            let policy = HybridPolicy::Ed25519Fallback;
+            let mut wrong = row("mismatched", pubkey(4), Advisory);
+            wrong.dest_hash = [0xee; 16];
+            let mut dir = Rows {
+                rows: vec![
+                    row("announced", pubkey(1), Advisory),
+                    row("self-claimed-rooted", pubkey(2), Rooted),
+                    row("signed", pubkey(3), Advisory),
+                    wrong,
+                ],
+                signed: vec!["signed".to_owned(), "mismatched".to_owned()],
+                read_fails: false,
+            };
+            let first = read_persisted_standing(&dir, policy, &PersistedStandings::new()).await;
+            assert_eq!(keys(&first), ["signed"]);
+            assert!(
+                !first.values().flatten().any(|b| b.rooted),
+                "a row's own Rooted is not a chain"
+            );
+
+            // Retired, revoked or superseded: the directory stops listing it.
+            dir.rows.clear();
+            let second = read_persisted_standing(&dir, policy, &first).await;
+            assert!(second.is_empty(), "the memo keeps nothing alive");
+        }
+
+        #[tokio::test]
+        async fn a_directory_that_cannot_be_read_leaves_nobody_standing() {
+            let dir = Rows {
+                rows: vec![row("signed", pubkey(3), Advisory)],
+                signed: vec!["signed".to_owned()],
+                read_fails: false,
+            };
+            let policy = HybridPolicy::Ed25519Fallback;
+            let held = read_persisted_standing(&dir, policy, &PersistedStandings::new()).await;
+            assert_eq!(keys(&held), ["signed"]);
+            let down = Rows {
+                read_fails: true,
+                ..dir
+            };
+            assert!(read_persisted_standing(&down, policy, &held)
+                .await
+                .is_empty());
         }
     }
 

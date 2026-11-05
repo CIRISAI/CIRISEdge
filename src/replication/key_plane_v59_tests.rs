@@ -150,6 +150,30 @@ async fn route(
     }
 }
 
+/// v44 LTS — the rows a restart may read standing from: a key that revoked
+/// itself offers none, though its route row is still there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_key_offers_no_live_binding() {
+    use crate::verify::RootingDirectory;
+    use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
+    let a = NodeA::build("lts-standing", 0x71).await;
+    RootingDirectory::persist_transport_binding(
+        &*a.dir,
+        a.k.key_id(),
+        [0xa1; 16],
+        [0x33; 64],
+        Rooted,
+        2,
+    )
+    .await;
+    let live = RootingDirectory::live_reticulum_bindings(&*a.dir)
+        .await
+        .expect("the rows read");
+    let keys: Vec<&str> = live.iter().map(|b| b.key_id.as_str()).collect();
+    assert!(keys.contains(&a.n.key_id()), "N is live: {keys:?}");
+    assert!(!keys.contains(&a.k.key_id()), "K revoked itself: {keys:?}");
+}
+
 /// Node A: a person P, its node N (P's occurrence of N, attested by P), a key
 /// K that revoked itself, and N's route — each written through the LOCAL
 /// authoring door, which mints the key-plane rows.

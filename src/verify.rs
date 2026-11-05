@@ -461,6 +461,31 @@ pub trait RootingDirectory: Send + Sync + 'static {
     async fn stored_reticulum_binding(&self, _key_id: &str) -> Option<StoredTransportBinding> {
         None
     }
+
+    /// v44 LTS — every live reticulum binding this node holds: one row per
+    /// destination (a superseded key is folded out), no retired route, and no
+    /// key with a revocation in effect. A row is a claim until the caller
+    /// proves it: see `read_persisted_standing` in the transport. Default
+    /// empty (test doubles / no directory ⇒ nobody has standing from it).
+    ///
+    /// # Errors
+    /// The directory could not be read.
+    async fn live_reticulum_bindings(&self) -> Result<Vec<LiveTransportBinding>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// v44 LTS — one row of [`RootingDirectory::live_reticulum_bindings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTransportBinding {
+    /// The bound federation key.
+    pub key_id: String,
+    /// The row's reticulum destination.
+    pub dest_hash: [u8; 16],
+    /// The full `(x25519 ‖ ed25519)` transport identity.
+    pub transport_pubkey64: [u8; 64],
+    /// What the row SAYS. A replicated row's token is its signer's own claim.
+    pub provenance: ciris_persist::federation::self_at_login::BindingProvenance,
 }
 
 /// CIRISEdge#432 — the durable transport binding as the divergence heal
@@ -964,6 +989,52 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             transport_pubkey64: pk,
             epoch: row.epoch,
         })
+    }
+
+    async fn live_reticulum_bindings(&self) -> Result<Vec<LiveTransportBinding>, String> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let half =
+            |field: Option<&str>| -> Option<[u8; 32]> { b64.decode(field?).ok()?.try_into().ok() };
+        let rows = FederationDirectory::list_all_transport_destinations(self)
+            .await
+            .map_err(|e| format!("list_all_transport_destinations: {e}"))?;
+        let now = chrono::Utc::now();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.transport_kind != "reticulum" || row.retired_at.is_some() {
+                continue;
+            }
+            let (Some(x25519), Some(ed25519)) = (
+                half(row.transport_x25519_pubkey_base64.as_deref()),
+                half(row.transport_ed25519_pubkey_base64.as_deref()),
+            ) else {
+                continue;
+            };
+            let Some(dest_hash) = hex::decode(&row.destination)
+                .ok()
+                .and_then(|d| <[u8; 16]>::try_from(d).ok())
+            else {
+                continue;
+            };
+            // Fail closed: a revocation that cannot be read is not absent.
+            let revoked = FederationDirectory::revocations_for(self, &row.occurrence_key_id)
+                .await
+                .map_or(true, |r| r.iter().any(|r| r.effective_at <= now));
+            if revoked {
+                continue;
+            }
+            let mut transport_pubkey64 = [0u8; 64];
+            transport_pubkey64[..32].copy_from_slice(&x25519);
+            transport_pubkey64[32..].copy_from_slice(&ed25519);
+            out.push(LiveTransportBinding {
+                key_id: row.occurrence_key_id,
+                dest_hash,
+                transport_pubkey64,
+                provenance: row.binding_provenance,
+            });
+        }
+        Ok(out)
     }
 
     async fn persist_transport_binding(
