@@ -2528,12 +2528,12 @@ async fn a_refused_dial_comes_back_off_the_beat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_panicking_keying_costs_one_link_and_no_worker_947() {
     let t = trio("panic", true, false, false).await;
-    t.a.transport.panic_next_decaps_for_test(1);
+    t.a.transport.panic_next_decap_for_test();
     let first = marked(b"LTS-PANIC-FIRST-", 600);
     let _ = t.b.transport.send(&t.a.key.key_id, &first).await;
     assert!(
         wait_until(Duration::from_secs(20), || async {
-            t.a.transport.keyer_panics_for_test() == 1
+            t.a.seal(ciris_edge::observability::LINK_SEAL_KEYER_PANICKED) == 1
         })
         .await,
         "the panic happened and was caught: {:?}",
