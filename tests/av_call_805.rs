@@ -549,9 +549,6 @@ async fn a_late_joiner_asks_for_a_member_it_has_never_heard() {
         "the late joiner has heard nothing of A"
     );
     let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
-    let _call_a = join(a, &groups[0], tag, CallOptions::default(), none())
-        .await
-        .expect("A joins");
     let _call_late = join(late, &groups[2], tag, CallOptions::default(), none())
         .await
         .expect("the late joiner joins");
