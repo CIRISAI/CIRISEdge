@@ -1689,6 +1689,20 @@ impl Call {
         self.shared.test_fail_c3.store(n, Ordering::Relaxed);
     }
 
+    /// Test seam: send one encoded C3 frame to `member` through the call's own
+    /// C3 path, whatever this node would itself say (a member that lies).
+    #[doc(hidden)]
+    pub async fn send_c3_for_test(&self, member: &str, frame: Vec<u8>) {
+        send_alm(
+            &self.shared,
+            vec![alm::Outgoing {
+                to: member.to_owned(),
+                frame,
+            }],
+        )
+        .await;
+    }
+
     /// Test seam: re-send this stream's binding on every leg now, as the
     /// periodic re-announce does.
     #[doc(hidden)]
@@ -2696,6 +2710,9 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
             return;
         }
     };
+    // The one signed statement of who publishes a stream: what an OFFER
+    // claiming depth 0 is checked against.
+    Shared::lock(&shared.alm).note_bound_publisher(binding.stream, &binding.publisher);
     if shared.opts.relay && (installed || binding.publisher == peer) {
         let except = vec![peer.to_owned(), binding.publisher.clone()];
         let wire = Arc::new(wire.to_vec());

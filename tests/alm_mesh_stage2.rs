@@ -15,6 +15,12 @@
 //!   a consumer that falls 1.5 s behind drops the media older than 800 ms by
 //!   age, the hop counter skips past it, and later frames open and arrive;
 //!   media rides leviculum's timed Channel frames between C3 peers.
+//! - **Epoch roll** (`an_epoch_roll_reads_as_a_resync_on_a_live_link`,
+//!   CIRISEdge#945): a real room commit is a meter resync, not a loss burst.
+//! - **Layered standby** (`a_layered_standby_is_not_read_as_lossy_on_a_live_call`,
+//!   CIRISEdge#945): the layers a standby never owed are not loss.
+//! - **Depth 0** (`a_member_claiming_depth_zero_is_not_the_publisher`,
+//!   CIRISEdge#945): only the publisher the binding names holds depth 0.
 //!
 //! Requires `transport-reticulum`:
 //! `cargo test --features "transport-http transport-reticulum" --test alm_mesh_stage2`
@@ -37,6 +43,9 @@ use ciris_edge::transport::av_call::{
 };
 use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{AvKeepTarget, StreamDekRegistrar};
+use ciris_edge::transport::realtime_av::{ChunkLayer, CODEC_AV1_SVC};
+use ciris_edge::transport::realtime_av_alm::controller::wire::encode;
+use ciris_edge::transport::realtime_av_alm::controller::{ControlMsg, DecisionKind, Offer};
 use ciris_edge::transport::reticulum::{
     ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
 };
@@ -701,7 +710,16 @@ async fn c3_admits_and_a_closed_relay_refuses_by_name() {
         cc.alm_relay_children(ca.stream()).is_empty(),
         "a closed relay admits nobody"
     );
-    assert!(av(&c.metrics, "load_refuse:admit_closed") > 0);
+    // The count moves as the frame lands; the label reaches the metrics on
+    // C's next watch tick.
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            av(&c.metrics, "load_refuse:admit_closed") > 0
+        })
+        .await,
+        "the refusal is counted under its token: {:?}",
+        c.metrics.av_plane()
+    );
     eprintln!(
         "[ALM2] c3: A admitted {:?}; C refused {:?}",
         ca.alm_own_children(),
@@ -814,5 +832,267 @@ async fn a_refused_admit_is_resent_not_withdrawn() {
         av(&a.metrics, "alm_c3_resent") > 0,
         "A resent: {:?}",
         a.metrics.av_plane()
+    );
+}
+
+/// The C7 lines that put `peer` in `PeerState::Degraded` (value 1).
+fn degraded_lines(call: &Call, peer: &str) -> Vec<String> {
+    let subject = format!("subj=Some({peer:?}) v=1 ");
+    call.alm_log()
+        .2
+        .lines()
+        .filter(|l| l.contains(" PeerState ") && l.contains(&subject))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Keep `call`'s frame queue moving, and report the newest epoch heard.
+fn drain(call: &mut Call) -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+    let mut rx = call.frames().expect("the call's frames");
+    let newest = Arc::new(AtomicU64::new(0));
+    let seen = Arc::clone(&newest);
+    let task = tokio::spawn(async move {
+        while let Some(f) = rx.recv().await {
+            seen.fetch_max(f.epoch.0, Ordering::Relaxed);
+        }
+    });
+    (newest, task)
+}
+
+/// **CIRISEdge#945 item 1, on a live link.** A real room commit rolls A's
+/// stream: `chunk_seq` back to 0 in a new epoch, with B's parent direct and
+/// the loopback clean. B's path read nothing lost, so it stays Available.
+/// Mutation: one sequence key across epochs reads the roll as a loss of about
+/// 1.0 and the C7 log shows A going Degraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_epoch_roll_reads_as_a_resync_on_a_live_link() {
+    let tag = "alm2-roll";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    wait_bound(&cb, 1).await;
+    let (newest, task) = drain(&mut cb);
+    let parented = wait_until(Duration::from_secs(30), || async {
+        primary_for(&cb, ca.stream()).as_deref() == Some(a.key.key_id.as_str())
+    })
+    .await;
+    assert!(parented, "B chose A: {:?}", cb.alm_log());
+    for seq in 0..150 {
+        ca.publish(Frame::opaque(body("a", seq)))
+            .await
+            .expect("publish");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        degraded_lines(&cb, &a.key.key_id),
+        Vec::<String>::new(),
+        "clean before the roll"
+    );
+    let pre = ca.epoch().await;
+    let up = groups[0].rotate().await.expect("rotate");
+    let _ = groups[1]
+        .apply_remote_commit(up.commit())
+        .await
+        .expect("B applies");
+    for seq in 150..450 {
+        ca.publish(Frame::opaque(body("a", seq)))
+            .await
+            .expect("publish");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ca.epoch().await > pre, "A's stream rolled");
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            newest.load(Ordering::Relaxed) > pre.0
+        })
+        .await,
+        "B heard the new epoch"
+    );
+    let lines = degraded_lines(&cb, &a.key.key_id);
+    eprintln!(
+        "[ALM2] roll: {} -> {}, Degraded lines {}",
+        pre.0,
+        ca.epoch().await.0,
+        lines.len()
+    );
+    assert_eq!(lines, Vec::<String>::new(), "{:?}", cb.alm_log());
+    task.abort();
+}
+
+/// **CIRISEdge#945 item 3, on a live call.** A publishes a base and an
+/// enhancement layer; B's primary is A, its standby the relay C, which sends
+/// it the base only. The enhancement chunks' sequence numbers are gaps on
+/// that path it never owed. Mutation: reading them as loss puts C in Degraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_layered_standby_is_not_read_as_lossy_on_a_live_call() {
+    let tag = "alm2-layered";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    let mut cc = join_loaded(c, &groups[2], tag, relay_opts(), None).await;
+    wait_legs(&ca, 2).await;
+    wait_legs(&cb, 2).await;
+    wait_legs(&cc, 2).await;
+    wait_bound(&cb, 2).await;
+    wait_bound(&cc, 2).await;
+    let (_, task_b) = drain(&mut cb);
+    let (_, task_c) = drain(&mut cc);
+    let layer = |base: bool, seq: u64| Frame {
+        codec_id: CODEC_AV1_SVC,
+        layer: if base {
+            ChunkLayer::BASE
+        } else {
+            ChunkLayer {
+                spatial: 1,
+                temporal: 0,
+                quality: 0,
+            }
+        },
+        bytes: body("a", seq),
+    };
+    // Media until C is B's standby, then long enough for its meter to read.
+    // Evenly spaced: a pair sent back to back into a Channel window is
+    // refused as Congested (#591), and real loss is not what this is about.
+    let mut standby_from = None;
+    for k in 0..4_000u64 {
+        ca.publish(layer(k % 2 == 0, k)).await.expect("publish");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let parents = cb.alm_parents();
+        let p = parents.iter().find(|p| p.stream == ca.stream());
+        let on = p.is_some_and(|p| {
+            p.primary.as_deref() == Some(a.key.key_id.as_str())
+                && p.standby.as_deref() == Some(c.key.key_id.as_str())
+        });
+        if on && standby_from.is_none() {
+            standby_from = Some((k, cc.alm_counts().forwarded));
+        }
+        if standby_from.is_some_and(|(at, _)| k >= at + 300) {
+            break;
+        }
+    }
+    let (_, forwarded_from) = standby_from.unwrap_or_else(|| {
+        panic!(
+            "C became B's standby: {:?} {:?}",
+            cb.alm_parents(),
+            cb.alm_log()
+        )
+    });
+    let forwarded = cc.alm_counts().forwarded - forwarded_from;
+    let lines = degraded_lines(&cb, &c.key.key_id);
+    let congested =
+        av(&a.metrics, "av_chunk_dropped_congested") + av(&c.metrics, "av_chunk_dropped_congested");
+    eprintln!(
+        "[ALM2] layered standby: C forwarded {forwarded} of 150 base chunks, Degraded lines {}, \
+         congested {congested}, shed {}",
+        lines.len(),
+        ca.alm_counts().shed
+    );
+    assert_eq!(congested, 0, "the premise: nothing really lost");
+    assert_eq!(ca.alm_counts().shed, 0, "the premise: nobody shed");
+    assert!(
+        forwarded >= 140,
+        "C really carried the base layer: {forwarded}"
+    );
+    assert_eq!(lines, Vec::<String>::new(), "{:?}", cb.alm_log());
+    task_b.abort();
+    task_c.abort();
+}
+
+/// **CIRISEdge#945 item 2, on real links.** `P` publishes; `C` cannot reach it
+/// and hears it through the roster relay `R`. `F`, a member with a link to `C`
+/// and no way to `P`, sends `C` real `OFFER`s claiming depth 0 on `P`'s
+/// stream. Only `P` may hold depth 0, and the binding names `P`: `C` keeps
+/// `P` as the publisher, stays on `R` and never asks `F`. Mutation: unchecked,
+/// the offer renames the publisher and direct-first sends `C` to `F`.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn a_member_claiming_depth_zero_is_not_the_publisher() {
+    let tag = "alm2-depth0";
+    // 0 = R, 1 = P, 2 = C, 3 = F (the room); 4 = T (transport only). P and C
+    // dial R, F dials C, T dials everyone.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        5,
+        4,
+        &[(0, 1), (0, 2), (2, 3), (0, 4), (1, 4), (2, 4), (3, 4)],
+        Some(4),
+    )
+    .await;
+    let (r, p, c, f) = (&nodes[0], &nodes[1], &nodes[2], &nodes[3]);
+    let cr = join_loaded(r, &groups[0], tag, relay_opts(), None).await;
+    let mut cp = join_loaded(p, &groups[1], tag, CallOptions::default(), None).await;
+    let cc = join_loaded(c, &groups[2], tag, CallOptions::default(), None).await;
+    let cf = join_loaded(f, &groups[3], tag, CallOptions::default(), None).await;
+    wait_legs(&cr, 2).await;
+    wait_legs(&cc, 2).await;
+    assert_eq!(cc.legs().len(), 2, "C reaches R and F: {:?}", cc.legs());
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            cf.alm_c3_peers().contains(&c.key.key_id)
+        })
+        .await,
+        "F hears C's CAPS"
+    );
+    let forged = encode(
+        cp.stream(),
+        &ControlMsg::Offer(Offer {
+            from: f.key.key_id.clone(),
+            depth: 0,
+            ancestry: Vec::new(),
+            headroom_bps: 100_000_000,
+            forwarder_headroom_bps: 100_000_000,
+            upstream_latency_ms: 0,
+            forwarding: true,
+        }),
+    );
+    // The lie runs from before C has any parent until it settled on one.
+    let stream = cp.stream();
+    let mut relayed = false;
+    for seq in 0..1_500u64 {
+        cf.send_c3_for_test(&c.key.key_id, forged.clone()).await;
+        cp.publish(Frame::opaque(body("p", seq)))
+            .await
+            .expect("publish");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        relayed = primary_for(&cc, stream).as_deref() == Some(r.key.key_id.as_str());
+        if relayed && seq >= 250 {
+            break;
+        }
+    }
+    let parents = cc.alm_parents();
+    let row = parents.iter().find(|x| x.stream == stream);
+    let asked = cf
+        .alm_counts()
+        .refused
+        .get("relay_upstream_unhealthy")
+        .copied()
+        .unwrap_or(0);
+    eprintln!("[ALM2] depth 0: C's row {row:?}, F was asked {asked} times");
+    assert_eq!(
+        row.and_then(|x| x.publisher.as_deref()),
+        Some(p.key.key_id.as_str()),
+        "the binding names the publisher: {:?}",
+        cc.alm_log()
+    );
+    assert!(relayed, "C stays on the relay: {:?}", cc.alm_log());
+    assert_eq!(asked, 0, "C never asked F: {:?}", cc.alm_log());
+    assert_ne!(
+        row.and_then(|x| x.standby.as_deref()),
+        Some(f.key.key_id.as_str()),
+        "F is no standby either"
+    );
+    assert!(cc.alm_counts().offers_refused > 0, "counted");
+    assert!(
+        cc.alm_log_count(DecisionKind::OfferRefused) > 0,
+        "in the C7 log"
+    );
+    assert!(
+        av(&c.metrics, "alm_offer_refused:not_publisher") > 0,
+        "{:?}",
+        c.metrics.av_plane()
     );
 }

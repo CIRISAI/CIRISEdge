@@ -39,9 +39,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
 use super::controller::{
-    Admission, ClassPolicy, ControlMsg, ControllerConfig, DecisionKind, DecisionLog, EgressMeter,
-    JitterSource, ParentSelector, Role, SelectorAction, ShedReason, SplitMix64, SubscribeRequest,
-    Tier,
+    Admission, ChunkPos, ClassPolicy, ControlMsg, ControllerConfig, DecisionKind, DecisionLog,
+    EgressMeter, JitterSource, ParentSelector, PathChunk, Role, SelectorAction, ShedReason,
+    SplitMix64, SubscribeRequest, Tier,
 };
 use crate::load_ladder::ServiceTier;
 
@@ -680,7 +680,15 @@ impl Sim {
                 };
                 let node = &mut self.nodes[to];
                 if let Some(sel) = node.sel.as_mut() {
-                    sel.on_chunk(at, &ev.from, seq, full, bytes, (at - emitted) as f64);
+                    // Every sim chunk carries the audio a standby receives.
+                    let chunk = PathChunk {
+                        pos: ChunkPos { epoch: 0, seq },
+                        full,
+                        base_or_audio: true,
+                        bytes,
+                        latency_ms: (at - emitted) as f64,
+                    };
+                    sel.on_chunk(at, &ev.from, chunk);
                 }
                 let first_any = node.got_any.set(seq);
                 let first_full = full && node.got_full.set(seq);

@@ -47,7 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::decision_log::{DecisionKind, DecisionLog};
-use super::path_meter::PathMeter;
+use super::path_meter::{ChunkPos, PathLayers, PathMeter};
 use super::peer_state::{PeerHealth, PeerState};
 use super::{AdmitDecision, ControllerConfig, JitterSource, Offer, PeerRef, Role, Tier};
 
@@ -121,6 +121,22 @@ struct Cand<P> {
     eligible: bool,
     tier: Tier,
     offer_at_ms: u64,
+}
+
+/// One chunk as a path delivered it.
+#[derive(Debug, Clone, Copy)]
+pub struct PathChunk {
+    /// Where it sits in the stream.
+    pub pos: ChunkPos,
+    /// Whether it arrived as the full stream (a make-before-break confirms
+    /// on these).
+    pub full: bool,
+    /// Whether it is base-layer or audio: what a standby also receives.
+    pub base_or_audio: bool,
+    /// Its size.
+    pub bytes: u64,
+    /// Its source-to-here latency (ms).
+    pub latency_ms: f64,
 }
 
 /// How long an unanswered subscribe waits before it counts as refused.
@@ -399,15 +415,7 @@ impl<P: PeerRef> ParentSelector<P> {
 
     /// A media chunk from `from` (after the caller's dedupe or not — the
     /// meter is per path, so duplicates across paths are counted per path).
-    pub fn on_chunk(
-        &mut self,
-        now_ms: u64,
-        from: &P,
-        seq: u64,
-        full: bool,
-        bytes: u64,
-        latency_ms: f64,
-    ) {
+    pub fn on_chunk(&mut self, now_ms: u64, from: &P, chunk: PathChunk) {
         // The stream is active (on some path), whoever delivered it.
         let resumed = self.last_activity_ms.map_or(true, |a| {
             now_ms.saturating_sub(a) > self.cfg.suspect_silence_ms
@@ -422,16 +430,30 @@ impl<P: PeerRef> ParentSelector<P> {
         if !c.link.subscribed() {
             return;
         }
-        c.meter.on_chunk(now_ms, seq, bytes, latency_ms);
+        let layers = if c.link == Link::Standby {
+            PathLayers::BaseOnly
+        } else {
+            PathLayers::All
+        };
+        let fresh = c
+            .meter
+            .on_chunk(now_ms, chunk.pos, layers, chunk.bytes, chunk.latency_ms);
+        let standby_owes = fresh && chunk.base_or_audio && c.link == Link::Primary;
         if let Link::Promoting {
             first_full_ms,
             full_chunks,
             ..
         } = &mut c.link
         {
-            if full {
+            if chunk.full {
                 first_full_ms.get_or_insert(now_ms);
                 *full_chunks += 1;
+            }
+        }
+        if standby_owes {
+            let standby = self.standby.as_ref().and_then(|s| self.cands.get_mut(s));
+            if let Some(s) = standby.filter(|s| s.link == Link::Standby) {
+                s.meter.expect_base(chunk.pos);
             }
         }
     }
@@ -565,6 +587,10 @@ impl<P: PeerRef> ParentSelector<P> {
                     self.standby = Some(from.clone());
                 }
                 Role::Primary => {
+                    // The path was unmetered while the ask was out, and a
+                    // standby's sequence skipped layers: the first full
+                    // chunk continues from nothing.
+                    self.cands.get_mut(from).expect("present").meter.restart();
                     if self.primary.is_some() {
                         let c = self.cands.get_mut(from).expect("present");
                         c.link = Link::Promoting {
@@ -589,7 +615,6 @@ impl<P: PeerRef> ParentSelector<P> {
                         c.failures = 0;
                         if !was_standby {
                             c.subscribed_at = now_ms;
-                            c.meter.restart();
                         }
                         self.set_primary(now_ms, from.clone(), log, "admitted");
                     }
@@ -1256,6 +1281,17 @@ mod tests {
     use super::super::{AdmitDecision, SplitMix64};
     use super::*;
 
+    /// A chunk at `seq` that every role receives.
+    fn at(seq: u64, full: bool, bytes: u64, latency_ms: f64) -> PathChunk {
+        PathChunk {
+            pos: ChunkPos { epoch: 0, seq },
+            full,
+            base_or_audio: true,
+            bytes,
+            latency_ms,
+        }
+    }
+
     fn offer(from: u32, headroom_streams: u64, cfg: &ControllerConfig) -> Offer<u32> {
         Offer {
             from,
@@ -1288,7 +1324,7 @@ mod tests {
             for (p, role) in s.subscriptions() {
                 let rtt = offers.iter().find(|o| o.0 == p).map_or(50.0, |o| o.2);
                 for k in 0..5 {
-                    s.on_chunk(t, &p, seq + k, role == Role::Primary, 6_000, rtt / 2.0);
+                    s.on_chunk(t, &p, at(seq + k, role == Role::Primary, 6_000, rtt / 2.0));
                 }
             }
             seq += 5;
@@ -1389,7 +1425,7 @@ mod tests {
                     }
                 }
                 for (p, role) in s.subscriptions() {
-                    s.on_chunk(t, &p, t / 250, role == Role::Primary, 6_000, 5.0);
+                    s.on_chunk(t, &p, at(t / 250, role == Role::Primary, 6_000, 5.0));
                 }
                 t += 250;
             }
@@ -1427,7 +1463,7 @@ mod tests {
             }
             for (p, role) in s.subscriptions() {
                 for k in 0..10 {
-                    s.on_chunk(t, &p, t / 25 + k, role == Role::Primary, 6_000, 5.0);
+                    s.on_chunk(t, &p, at(t / 25 + k, role == Role::Primary, 6_000, 5.0));
                 }
             }
             t += 250;
@@ -1498,7 +1534,7 @@ mod tests {
             *s.standby().expect("standby"),
         );
         // The host starts publishing: the standby's copy lands first.
-        s.on_chunk(t, &st, 1, false, 100, 5.0);
+        s.on_chunk(t, &st, at(1, false, 100, 5.0));
         let _ = s.tick(t + 250, &mut rng, &mut log);
         assert_eq!(
             s.primary(),
@@ -1510,7 +1546,7 @@ mod tests {
         let mut now = t + 250;
         for k in 2..12 {
             now += 250;
-            s.on_chunk(now, &st, k, false, 100, 5.0);
+            s.on_chunk(now, &st, at(k, false, 100, 5.0));
             let _ = s.tick(now, &mut rng, &mut log);
         }
         assert_ne!(
@@ -1518,6 +1554,46 @@ mod tests {
             Some(PeerState::Available),
             "real silence is seen"
         );
+    }
+
+    /// #945 item 3: a standby promoted to primary owes nothing from before
+    /// its admit. Mutation: keeping the standby's sequence across the
+    /// promotion reads the interval as a burst of loss on the new primary.
+    #[test]
+    fn a_promoted_standby_starts_a_fresh_sequence() {
+        let cfg = ControllerConfig::interactive();
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2, 3]);
+        let t = 20_000;
+        let _ = drive(&mut s, &cfg, 0, t, &[(2, 4, 40.0), (3, 4, 60.0)]);
+        let (p, st) = (
+            *s.primary().expect("a primary"),
+            *s.standby().expect("a standby"),
+        );
+        let mut rng = SplitMix64(11);
+        let mut log = DecisionLog::default();
+        s.on_shed(t, &p, &mut rng, &mut log);
+        let acts = s.tick(t, &mut rng, &mut log);
+        assert!(
+            acts.contains(&SelectorAction::Subscribe {
+                parent: st,
+                role: Role::Primary
+            }),
+            "{acts:?}"
+        );
+        let admit = AdmitDecision::Admit {
+            role: Role::Primary,
+        };
+        let _ = s.on_decision(t, &st, &admit, &mut rng, &mut log);
+        assert_eq!(s.primary(), Some(&st));
+        let first = 1_000_000;
+        for k in 0..100 {
+            let now = t + 25 * k;
+            s.on_chunk(now, &st, at(first + k, true, 6_000, 5.0));
+            s.on_offer(now, offer(st, 4, &cfg), 60.0, &mut log);
+            let _ = s.tick(now, &mut rng, &mut log);
+        }
+        assert_eq!(s.state_of(&st), Some(PeerState::Available));
     }
 
     /// §6.5 / V1: with no member, the canonical carries audio only (never a
