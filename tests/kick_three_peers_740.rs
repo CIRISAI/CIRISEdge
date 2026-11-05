@@ -595,6 +595,7 @@ fn three_peers_survive_a_kick_on_a_32_slot_blocking_pool_740() {
 /// one permit, a round parked in that send must not stop the hub's rounds to
 /// the live peer: a parked send costs a permit for at most a round's budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one field scenario, top to bottom
 async fn a_dead_peer_cannot_starve_a_live_one_of_rounds() {
     const ROUND_TIMEOUT: Duration = Duration::from_secs(2);
     const WINDOW: Duration = Duration::from_secs(14);
@@ -655,7 +656,7 @@ async fn a_dead_peer_cannot_starve_a_live_one_of_rounds() {
         peer_key_id: k.key_id.clone(),
         kind: EnvelopeKind::Key,
     };
-    let hub_rt = node_with(
+    let hub_runtime = node_with(
         &hub,
         &hub_dir,
         &hub_t,
@@ -697,7 +698,10 @@ async fn a_dead_peer_cannot_starve_a_live_one_of_rounds() {
     assert!(dead_t.suspend(Duration::from_secs(10)).await.quiescent);
     assert!(hub_has_path_to_dead(), "the dial has a path to wait on");
 
-    hub_rt.round_now(&dead.key_id).await.expect("kick the dead");
+    hub_runtime
+        .round_now(&dead.key_id)
+        .await
+        .expect("kick the dead");
     tokio::time::sleep(Duration::from_millis(200)).await;
     // The dead peer's round cannot end inside the window: its dial sits out
     // the establish timeout. Every round that ends here is the live peer's.
@@ -705,7 +709,10 @@ async fn a_dead_peer_cannot_starve_a_live_one_of_rounds() {
     let started = std::time::Instant::now();
     let mut landed = 0_u64;
     while started.elapsed() < WINDOW {
-        hub_rt.round_now(&live.key_id).await.expect("kick the live");
+        hub_runtime
+            .round_now(&live.key_id)
+            .await
+            .expect("kick the live");
         tokio::time::sleep(Duration::from_millis(500)).await;
         landed = rounds_terminated(&hub_m) - before;
     }
@@ -714,6 +721,6 @@ async fn a_dead_peer_cannot_starve_a_live_one_of_rounds() {
         landed >= 2,
         "the live peer's rounds run past a dial parked on a dead peer: {landed} in {WINDOW:?}, \
          gate {:?}",
-        hub_rt.round_bound()
+        hub_runtime.round_bound()
     );
 }
