@@ -11,10 +11,10 @@
 //! publish: a `Summary`, then a `Deliver` straight behind it. The Summary's
 //! reply parks in A's send; the question is what happens to the Deliver.
 //!
-//! - **Pre-fix (observed):** the Deliver is stepped only after the reply has
-//!   failed: the round's completion reads `reply_send_failed >= 1`.
-//! - **Post-fix:** the Deliver is stepped while the reply is still in flight,
-//!   and a round on a healed path then completes end to end.
+//! - **Pre-fix (observed):** the Deliver stepped 9.5 s after the round-open,
+//!   behind one failed send.
+//! - **Post-fix (observed):** it stepped at 33 ms; the reply failed at 9.5 s,
+//!   and a round on the healed path was answered.
 //!
 //! Order, not a stopwatch: the assertion is which of two counters moved first.
 //!
