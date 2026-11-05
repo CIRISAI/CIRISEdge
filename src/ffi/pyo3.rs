@@ -12054,6 +12054,22 @@ mod pyo3_tier2_tests {
     /// Idempotent — repeats are no-ops via the inner `if`. Safe to
     /// call from every test in this module under a fresh
     /// `Python::attach`.
+    /// A test with its own engine config starts from an empty
+    /// `ENGINE_SINGLETON`: a sibling's engine lingers past [`engine_lock`], and
+    /// constructing under it raises `EngineConfigMismatch`. Which sibling ran
+    /// last is the scheduler's, so without this the test's outcome is too, and
+    /// a test that accepts a downstream `Err` passes without having reached
+    /// what it pins. GC first: an unreachable engine must be finalized before
+    /// the reset can clear it.
+    fn clear_engine_slate(py: Python<'_>) {
+        if let Ok(gc) = py.import("gc") {
+            let _ = gc.call_method0("collect");
+        }
+        if let Ok(persist) = py.import("ciris_persist") {
+            let _ = persist.call_method1("reset_engine", (5.0_f64,));
+        }
+    }
+
     fn install_ciris_persist_module(py: Python<'_>) -> PyResult<()> {
         use pyo3::prelude::PyModule;
         use pyo3::types::PyAnyMethods;
@@ -12141,6 +12157,7 @@ mod pyo3_tier2_tests {
 
         let outcome: Result<String, PyErr> = Python::attach(|py| -> PyResult<String> {
             install_ciris_persist_module(py)?;
+            clear_engine_slate(py);
             let ciris_persist_mod = py.import("ciris_persist")?;
             let engine_cls = ciris_persist_mod.getattr("Engine")?;
             let kwargs = pyo3::types::PyDict::new(py);
@@ -12760,6 +12777,7 @@ mod pyo3_tier2_tests {
 
         let outcome: PyResult<(String, String)> = Python::attach(|py| {
             install_ciris_persist_module(py)?;
+            clear_engine_slate(py);
             let engine_cls = py.import("ciris_persist")?.getattr("Engine")?;
             let kwargs = pyo3::types::PyDict::new(py);
             kwargs.set_item("dsn", "sqlite::memory:")?;
@@ -12841,6 +12859,7 @@ mod pyo3_tier2_tests {
 
         let outcome: Result<String, PyErr> = Python::attach(|py| -> PyResult<String> {
             install_ciris_persist_module(py)?;
+            clear_engine_slate(py);
             let ciris_persist_mod = py.import("ciris_persist")?;
             let engine_cls = ciris_persist_mod.getattr("Engine")?;
             let kwargs = pyo3::types::PyDict::new(py);
@@ -13030,14 +13049,7 @@ mod pyo3_tier2_tests {
         let init_err: Option<String> = Python::attach(|py| -> PyResult<Option<String>> {
             install_ciris_persist_module(py)?;
             let ciris_persist_mod = py.import("ciris_persist")?;
-            // A sibling engine test's engine may linger in persist's
-            // ENGINE_SINGLETON (one engine per process); GC-collect any
-            // finalizable engine object, THEN reset so our construction below
-            // doesn't hit EngineConfigMismatch.
-            if let Ok(gc) = py.import("gc") {
-                let _ = gc.call_method0("collect");
-            }
-            let _ = ciris_persist_mod.call_method1("reset_engine", (5.0_f64,));
+            clear_engine_slate(py);
             let engine_cls = ciris_persist_mod.getattr("Engine")?;
             let kwargs = pyo3::types::PyDict::new(py);
             kwargs.set_item("dsn", "sqlite::memory:")?;
@@ -13167,6 +13179,7 @@ mod pyo3_tier2_tests {
 
         let outcome: Result<String, PyErr> = Python::attach(|py| -> PyResult<String> {
             install_ciris_persist_module(py)?;
+            clear_engine_slate(py);
             let ciris_persist_mod = py.import("ciris_persist")?;
             let engine_cls = ciris_persist_mod.getattr("Engine")?;
             let kwargs = pyo3::types::PyDict::new(py);
