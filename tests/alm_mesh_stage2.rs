@@ -803,6 +803,14 @@ async fn stale_media_is_dropped_by_age_and_the_hop_recovers() {
         "no frame failed its open"
     );
     assert_eq!(cb.legs(), vec![a.key.key_id.clone()], "the link stayed up");
+    // CIRISEdge#945: those frames took hop counters and reached this node.
+    // The lag was its own, so the path is not charged for them.
+    assert_eq!(
+        degraded_lines(&cb, &a.key.key_id),
+        Vec::<String>::new(),
+        "{:?}",
+        cb.alm_log()
+    );
 }
 
 /// **A lost ADMIT is resent, not withdrawn.** Every must-arrive C3 frame A
