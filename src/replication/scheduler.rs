@@ -93,6 +93,7 @@ use super::coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, Ro
 use super::no_route_backoff::{Admission, NoRouteBackoff, NoRouteBackoffEntry, RoundClass};
 use super::protocol::EnvelopeKind;
 use super::session::SessionRole;
+use crate::transport::TransportError;
 
 /// Scheduler configuration shared across all coordinators it drives.
 ///
@@ -264,6 +265,88 @@ impl RoundGate {
             in_flight: self.in_flight.load(Ordering::Acquire),
             peak_in_flight: self.peak_in_flight.load(Ordering::Acquire),
             waited: self.waited.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// The outer bound on one send of a round. A cold dial is at most 30 s and a
+/// live transfer at most 120 s on the dial path, so this only ends a send the
+/// transport itself never would: a live, progressing transfer is not severed.
+pub const ROUND_SEND_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// A shaped link's sender waits up to 16 of its gaps for a row to leave
+/// (`link_shaping::ROW_LEAVE_MAX_GAPS`); this is that, with a margin.
+pub const PACING_SEND_GAPS: f64 = 17.0;
+
+/// The bound on one send on a link with frame gap `gap`.
+#[must_use]
+pub fn pacing_send_timeout(gap: Option<Duration>) -> Duration {
+    gap.map_or(ROUND_SEND_TIMEOUT, |g| {
+        ROUND_SEND_TIMEOUT.max(g.mul_f64(PACING_SEND_GAPS))
+    })
+}
+
+/// A round's place at the gate. The gate bounds what rounds cost the blocking
+/// pool, and a round parked in a send costs it nothing, so a send gets as long
+/// under the permit as a wait for a reply does (`hold`) and then gives the
+/// permit back, keeps sending, and queues behind the rounds ahead before it
+/// steps again. A dead peer's dial sits out 30 s per plane; held for that long
+/// a few dead peers stopped every round to every live one.
+///
+/// The hold is not zero because the gate also paces a fan-out's dials: a start
+/// or a kick still opens at most the bound's worth per hold. This is not the
+/// reply lane of CIRISEdge#943: a responder has frames behind a reply to keep
+/// stepping, and an initiator's round has nothing to do until its send lands,
+/// so it keeps its send inline and gives up only what others need.
+struct RoundSeat<'a> {
+    gate: &'a RoundGate,
+    peer_id: &'a str,
+    kind: &'a str,
+    permit: Option<RoundPermit<'a>>,
+}
+
+impl<'a> RoundSeat<'a> {
+    async fn take(gate: &'a RoundGate, peer_id: &'a str, kind: &'a str) -> RoundSeat<'a> {
+        let permit = Some(gate.enter(peer_id, kind).await);
+        Self {
+            gate,
+            peer_id,
+            kind,
+            permit,
+        }
+    }
+
+    /// Run one send of the round. Past `bound` it is a [`RoundError::Timeout`];
+    /// the abandoned send is safe, sends being cancel-safe (CIRISEdge#853).
+    async fn send<T>(
+        &mut self,
+        hold: Duration,
+        bound: Duration,
+        send: impl std::future::Future<Output = Result<T, CoordinatorError>>,
+    ) -> Result<T, RoundError> {
+        let send = tokio::time::timeout(bound, send);
+        tokio::pin!(send);
+        let sent = match tokio::time::timeout(hold, &mut send).await {
+            Ok(sent) => sent,
+            Err(_) => {
+                self.permit = None;
+                tracing::debug!(
+                    peer = %self.peer_id,
+                    kind = %self.kind,
+                    hold_ms = u64::try_from(hold.as_millis()).unwrap_or(u64::MAX),
+                    "round send still parked — its permit goes back to the gate"
+                );
+                let sent = send.await;
+                // Only a round that goes on reads again.
+                if matches!(sent, Ok(Ok(_))) {
+                    self.permit = Some(self.gate.enter(self.peer_id, self.kind).await);
+                }
+                sent
+            }
+        };
+        match sent {
+            Ok(result) => result.map_err(RoundError::from),
+            Err(_) => Err(RoundError::Timeout),
         }
     }
 }
@@ -1137,7 +1220,7 @@ impl GatedRound<'_> {
             tracing::trace!("round skipped — peer is in no-route backoff (CIRISEdge#794)");
             return RoundRan::Skipped;
         };
-        let _permit = self.round_gate.enter(self.peer_id, self.kind_str).await;
+        let mut seat = RoundSeat::take(self.round_gate, self.peer_id, self.kind_str).await;
         // Another plane may have found the peer unroutable while this one
         // waited for its permit.
         if ticket.overtaken() {
@@ -1151,8 +1234,14 @@ impl GatedRound<'_> {
         // gap: the per-wait timeout is at least the Poisson p99 of one gap
         // (about 4.74 gaps), else every wait on a slow link times out.
         let round_timeout = pacing_timeout(self.round_timeout, self.coord.pacing_gap());
-        let class =
-            round_and_report(self.coord, round_timeout, self.event_sink, self.peer_id).await;
+        let class = round_and_report(
+            self.coord,
+            round_timeout,
+            self.event_sink,
+            self.peer_id,
+            &mut seat,
+        )
+        .await;
         if let Some(m) = self.metrics {
             m.observe_round_duration(self.coord.kind(), started.elapsed());
         }
@@ -1198,6 +1287,7 @@ async fn round_and_report(
     round_timeout: Duration,
     event_sink: Option<&tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
     peer_id: &str,
+    seat: &mut RoundSeat<'_>,
 ) -> RoundClass {
     // FSD-SIGNER-RECOVERY D3 — a recovery round REPLACES this
     // tick's ordinary round; the two never overlap. It costs one
@@ -1205,7 +1295,7 @@ async fn round_and_report(
     // name is actually queued. At most one name per peer can exist
     // (D4), so recovery displaces at most one ordinary round per
     // peer before it is done.
-    let recovery = match run_one_recovery_round(coord, round_timeout).await {
+    let recovery = match run_one_recovery_round(coord, round_timeout, seat).await {
         Ok(step) => step,
         Err(e) => {
             // Lifecycle — the transport is suspended: skip quietly. The
@@ -1249,7 +1339,7 @@ async fn round_and_report(
         }
         return RoundClass::Other;
     }
-    let outcome = run_one_round(coord, round_timeout).await;
+    let outcome = run_one_round(coord, round_timeout, seat).await;
     let class = match &outcome {
         Ok(_) => RoundClass::Other,
         Err(e) => round_class_of(e),
@@ -1439,11 +1529,12 @@ fn propagate_kick(
 async fn run_one_round(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,
+    seat: &mut RoundSeat<'_>,
 ) -> Result<DriveStep, RoundError> {
     // `drive_round_step(None)` opens the round (mints its id, creates its
     // inbox); `finish_round` closes it on every exit path (CIRISEdge#634).
     let first = coord.drive_round_step(None).await?;
-    let outcome = drive_exchange_to_completion(coord, round_timeout, first).await;
+    let outcome = drive_exchange_to_completion(coord, round_timeout, first, seat).await;
     finish_round(coord, &outcome).await;
     outcome
 }
@@ -1472,12 +1563,17 @@ async fn run_one_round(
 async fn run_one_recovery_round(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,
+    seat: &mut RoundSeat<'_>,
 ) -> Result<Option<DriveStep>, RoundError> {
     // CIRISEdge#634 — the Pull is a round-open too: mint the round FIRST so
     // the Pull is stamped with it and its Summary reply routes into this
     // round's inbox rather than the on-demand one.
     let round = coord.begin_round().await;
-    let signer = match coord.send_recovery_pull().await {
+    let bound = pacing_send_timeout(coord.pacing_gap());
+    let pulled = seat
+        .send(round_timeout, bound, coord.send_recovery_pull())
+        .await;
+    let signer = match pulled {
         Ok(Some(signer)) => signer,
         Ok(None) => {
             coord.end_round().await;
@@ -1485,7 +1581,7 @@ async fn run_one_recovery_round(
         }
         Err(e) => {
             coord.abandon_round().await;
-            return Err(RoundError::Coordinator(e));
+            return Err(e);
         }
     };
     tracing::debug!(
@@ -1495,9 +1591,13 @@ async fn run_one_recovery_round(
     );
     // `SendThenWait(∅)`: send nothing, wait. The Pull is already on the wire and
     // this node must NOT put a Summary beside it.
-    let outcome =
-        drive_exchange_to_completion(coord, round_timeout, DriveStep::SendThenWait(Vec::new()))
-            .await;
+    let outcome = drive_exchange_to_completion(
+        coord,
+        round_timeout,
+        DriveStep::SendThenWait(Vec::new()),
+        seat,
+    )
+    .await;
     finish_round(coord, &outcome).await;
     outcome.map(Some)
 }
@@ -1525,7 +1625,9 @@ async fn drive_exchange_to_completion(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,
     first_step: DriveStep,
+    seat: &mut RoundSeat<'_>,
 ) -> Result<DriveStep, RoundError> {
+    let bound = pacing_send_timeout(coord.pacing_gap());
     let mut step = first_step;
     loop {
         // CIRISEdge#380 — initiator-final: send the messages, then the round
@@ -1536,7 +1638,8 @@ async fn drive_exchange_to_completion(
         if let DriveStep::SendThenComplete(ref msgs, ref report) = step {
             let report = report.clone();
             for m in msgs {
-                coord.send_message(m).await?;
+                seat.send(round_timeout, bound, coord.send_message(m))
+                    .await?;
             }
             return Ok(DriveStep::Complete(report));
         }
@@ -1545,7 +1648,8 @@ async fn drive_exchange_to_completion(
             _ => return Ok(step),
         };
         for m in &msgs {
-            coord.send_message(m).await?;
+            seat.send(round_timeout, bound, coord.send_message(m))
+                .await?;
         }
         let next = match tokio::time::timeout(round_timeout, coord.recv_inbound()).await {
             Ok(Some(msg)) => msg,
@@ -1953,7 +2057,9 @@ mod tests {
             applier,
         );
 
-        let outcome = run_one_round(&coord, Duration::from_millis(50)).await;
+        let gate = RoundGate::new(1);
+        let mut seat = RoundSeat::take(&gate, "peer", "kind").await;
+        let outcome = run_one_round(&coord, Duration::from_millis(50), &mut seat).await;
         assert!(matches!(outcome, Err(RoundError::Timeout)), "{outcome:?}");
         assert_eq!(coord.current_round(), 0, "the dead round's id is cleared");
         assert_eq!(coord.inbound_depth(), 0, "no inbox survives the round");
@@ -2505,7 +2611,9 @@ mod tests {
         let (coord, mut rx) = recovery_coord("peer-1", Some("peer-1".to_string()));
 
         // Times out waiting for a reply nobody sends; the wire is what matters.
-        let _ = run_one_recovery_round(&coord, Duration::from_millis(50)).await;
+        let gate = RoundGate::new(1);
+        let mut seat = RoundSeat::take(&gate, "peer", "kind").await;
+        let _ = run_one_recovery_round(&coord, Duration::from_millis(50), &mut seat).await;
 
         let mut sent = Vec::new();
         while let Ok(bytes) = rx.try_recv() {
@@ -2539,7 +2647,9 @@ mod tests {
     async fn no_queued_signer_means_no_recovery_exchange() {
         let (coord, mut rx) = recovery_coord("peer-1", None);
 
-        let outcome = run_one_recovery_round(&coord, Duration::from_millis(50))
+        let gate = RoundGate::new(1);
+        let mut seat = RoundSeat::take(&gate, "peer", "kind").await;
+        let outcome = run_one_recovery_round(&coord, Duration::from_millis(50), &mut seat)
             .await
             .expect("no queued name is not an error");
         assert!(
@@ -2616,6 +2726,99 @@ mod tests {
         ) -> Result<(), TransportError> {
             Ok(())
         }
+    }
+
+    /// Sends to `dead` never return; every other send lands, to a peer that
+    /// does not answer.
+    struct ParkedPeer {
+        dead: String,
+        live_sends: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Transport for ParkedPeer {
+        fn id(&self) -> TransportId {
+            TransportId::HTTP
+        }
+        async fn send(
+            &self,
+            destination_key_id: &str,
+            _envelope_bytes: &[u8],
+        ) -> Result<TransportSendOutcome, TransportError> {
+            if destination_key_id == self.dead {
+                std::future::pending::<()>().await;
+            }
+            self.live_sends.fetch_add(1, Ordering::SeqCst);
+            Ok(TransportSendOutcome::Delivered)
+        }
+        async fn listen(
+            &self,
+            _sink: tokio::sync::mpsc::Sender<InboundFrame>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// A send that never returns gives its permit back after a round's budget
+    /// and ends at its own bound, so the gate is never held for it and the
+    /// coordinator is never parked for good.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_send_gives_back_its_permit_and_ends_at_its_bound() {
+        let transport = Arc::new(ParkedPeer {
+            dead: "dead".to_owned(),
+            live_sends: AtomicUsize::new(0),
+        });
+        let coord = |peer: &str| {
+            Arc::new(ReplicationCoordinator::new(
+                Arc::clone(&transport) as Arc<dyn Transport>,
+                peer,
+                EnvelopeKind::Key,
+                SessionRole::Initiator,
+                Arc::new(StaticProvider {
+                    state: LocalState::new(),
+                    envelopes: HashMap::new(),
+                }),
+                RecordingApplier::with(HashMap::new(), std::collections::HashSet::new()),
+            ))
+        };
+        let mut sched = ReplicationScheduler::new(SchedulerConfig {
+            cadence: Duration::from_secs(30),
+            round_timeout: Duration::from_secs(1),
+            max_concurrent_rounds: 1,
+        });
+        sched.add_initiator(coord("dead"));
+        sched.add_initiator(coord("live"));
+        let (cancel, cancel_rx) = watch::channel(false);
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(64);
+        let run =
+            tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
+        tokio::time::sleep(ROUND_SEND_TIMEOUT - Duration::from_secs(5)).await;
+        assert!(
+            transport.live_sends.load(Ordering::SeqCst) >= 5,
+            "the live peer keeps its rounds past the parked send"
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut dead_ended = false;
+        while let Ok((peer, event)) = events.try_recv() {
+            if peer == "dead" {
+                assert!(matches!(event, RoundEvent::TimedOut), "{event:?}");
+                dead_ended = true;
+            }
+        }
+        assert!(dead_ended, "the parked send ended at its bound");
+        let _ = cancel.send(true);
+        let _ = run.await;
+    }
+
+    #[test]
+    fn a_send_on_a_shaped_link_is_bounded_by_its_gaps() {
+        assert_eq!(pacing_send_timeout(None), ROUND_SEND_TIMEOUT);
+        assert_eq!(
+            pacing_send_timeout(Some(Duration::from_secs(1))),
+            ROUND_SEND_TIMEOUT
+        );
+        let cellular = Duration::from_secs(47);
+        assert!(pacing_send_timeout(Some(cellular)) > cellular.mul_f64(16.0));
     }
 
     const REDIAL_CADENCE: Duration = Duration::from_secs(30);
