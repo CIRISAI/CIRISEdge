@@ -930,8 +930,26 @@ async fn fresh_interface_burst_measure() {
             .await
             .expect("announce");
     }
+    // `Y` asks for the burst's last destination while T is holding it.
+    let asked = *dests.last().expect("a burst");
+    let ask = env_secs("BURST_ASK", 0) == 1;
+    let mut asked_yet = false;
+    let mut answered = None;
     let mut last = usize::MAX;
     while start.elapsed() < Duration::from_secs(budget) {
+        if ask && !asked_yet && start.elapsed() > Duration::from_secs(1) {
+            asked_yet = true;
+            y.request_path(&asked).await.expect("ask");
+            eprintln!(
+                "[BURST] asked at {:?}, T holds it: {}",
+                start.elapsed(),
+                !t.has_path(&asked)
+            );
+        }
+        if answered.is_none() && y.has_path(&asked) {
+            answered = Some(start.elapsed());
+            eprintln!("[BURST] the asked destination reached Y at {answered:?}");
+        }
         let (at_t, at_y) = (
             dests.iter().filter(|d| t.has_path(d)).count(),
             dests.iter().filter(|d| y.has_path(d)).count(),
