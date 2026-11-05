@@ -1,6 +1,6 @@
 # Quorum and pending decisions: edge's part
 
-**Status:** normative for CIRISEdge v44 (persist v61.0.2, CC 1.0-rc16).
+**Status:** normative for CIRISEdge v44 (persist v61.0.3, CC 1.0-rc16).
 **Ownership:** [CIRISConstitution#198](https://github.com/CIRISAI/CIRISConstitution/issues/198) §5. This document covers only edge's share.
 
 | owner | owns |
@@ -40,13 +40,14 @@ Anywhere else, persist refuses by rule. The widener logs the refusal and leaves 
 
 **Window basis (CC correction, 2026-11-02):** v61 judges the `open:self_admit` removal window (259 200 s) on the **local door's receipt**, and that is the CC's rule, not a gap: each node measures the window from when it first held the proposal (CC 3.3.6.3), never from a cosignature's signed instant. CIRISPersist#1189 (asking for a signed instant per cosignature) is superseded by that correction. Edge carries what persist defines and stamps nothing.
 
-## 2.1 Duties and removals since persist v61.0.2
+## 2.1 Duties and removals since persist v61.0.2 and v61.0.3
 
 Edge reads no duty and counts no voice, so these changed verdicts at persist's door and no edge decision. They do change what the carriage has to guarantee.
 
 - **A duty is an appointment (CIRISPersist#1195).** `moderate`, `takedown` and `review` are held by a room's active, steward-bound founders and the keys they delegate each duty to, at every protocol. `community_authority_set_for` still answers who may sign. Edge has no appointment producer: `delegates_to` is the server's, and edge carries it.
 - **An act can outrun its appointment.** An appointment and the act it licenses are `federation` rows that clear the same serve gate, but nothing orders them. A refusal that a held `delegates_to` could change is therefore transient: the `moderation:*` door's `federation_delegated_scope_unauthorized`, the duty verdict of `takedown_unauthorised` (the body naming `communities`), and `roster_consensus_insufficient`, which is what a seated moderator's solo roster change reads as before its appointment lands (`ApplyRefusalClass::RetryAfterStanding`). `roster_consensus_insufficient` from a short set takes the same schedule, which ends on the terminal one. The rule does not tell the two apart.
 - **A `unanimous` removal is every other member (CIRISPersist#1192),** and those voices are a strict majority of the roster. At two members nobody is removable. A removal the removed member signs is their resignation. Admissions and subject-less roster changes still need everyone.
+- **A moderator removes nobody (CIRISPersist#1200, CC 4.5.13).** A new removal meets the room's protocol in every protocol; a moderator's standing still reaches a widening. A removal already admitted stands in the fold. Since persist 61.0.3 a node refuses such a removal arriving from an older node, so the two can hold different rosters until the older node upgrades. That refusal is `roster_consensus_insufficient`, which edge cannot tell from a widening that outran its appointment: it takes the transient schedule and ends on the terminal one (CIRISEdge#858).
 
 Witnesses are in `tests/quorum_carriage_v44.rs`. A room with no active founder has no moderator and no way to appoint one yet (tracked on CIRISPersist#1195). `chat::community` refuses to build one, so edge's own producers do not reach that state.
 

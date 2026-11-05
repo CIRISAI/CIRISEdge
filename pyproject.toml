@@ -114,8 +114,12 @@ classifiers = [
 # 12 on both) and goes on admitting a plain member's `moderation:*` row and
 # counting the removed member as a voice on a `unanimous` removal. No gate fires:
 # only this line can exclude that wheel.
+#
+# v61.0.3 (CIRISPersist#1199, #1200) is the same shape: a 61.0.2 wheel goes on
+# binding no room to a chat row's takedown and admitting a moderator's solo
+# removal.
 dependencies = [
-    "ciris-persist>=61.0.2,<62",
+    "ciris-persist>=61.0.3,<62",
 ]
 dynamic = ["version"]
 
