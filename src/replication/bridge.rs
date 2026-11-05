@@ -1796,6 +1796,7 @@ struct TraceConsentMemo {
     /// Live egress grants by the key whose egress they cover.
     grants: HashMap<String, Vec<TraceGrant>>,
     /// The peer's owner. Outer `None`: not read yet.
+    #[allow(clippy::option_option)] // "not read" and "read: no owner" differ
     peer_owner: Option<Option<String>>,
 }
 
@@ -8228,15 +8229,15 @@ impl FederationDirectoryReplicationBridge {
             .await?;
         Ok(grants
             .into_iter()
-            .filter(|grant| grant.expires_at.is_none_or(|at| at > now))
+            .filter(|grant| grant.expires_at.map_or(true, |at| at > now))
             .filter_map(|grant| {
                 let policy =
                     consent_grammar::parse_grant_payload(&grant.attestation_envelope).ok()?;
                 (policy.direction == consent_grammar::Direction::Egress
                     && policy.principle.propagates()
                     && policy.kinds.iter().any(|k| k == "Attestation")
-                    && policy.valid_until.is_none_or(|at| at > now))
-                .then(|| TraceGrant {
+                    && policy.valid_until.map_or(true, |at| at > now))
+                .then_some(TraceGrant {
                     subject_key_ids: grant.subject_key_ids,
                     attestation_prefixes: policy.attestation_prefixes,
                 })
