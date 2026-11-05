@@ -76,10 +76,15 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // answer → the nodes of the held proposal's proposer). CC 5.4.6 — on a
         // subject PULL, holding a person's live owner-binding is sufficient, for
         // it and their root acceptance; the advertise keeps the publish set
-        // (`FSD/FIRST_CONTACT.md` §2.3).
+        // (`FSD/FIRST_CONTACT.md` §2.3). v44 — sharing traces is its own consent,
+        // per recipient, on the advertise and the direct fetch alike
+        // (`trace_recipient_withholds`); a relayed row is its producer's flow.
         EnvelopeKind::Attestation => (
             "per_record_projection",
-            "trace:* → capability:infra:serve; first contact → own allegiance facts \
+            "trace:* → capability:infra:serve, and a row this node or its owner \
+             authored outside a cohort placement → a live consent:replication grant \
+             naming the peer or its owner that covers the row's dimension; first \
+             contact → own allegiance facts \
              + live federation owner-bindings of nodes in the Key/IdentityOccurrence \
              publish set, or on a subject pull any held live one and its owner's \
              root acceptance + a membership:proposal|acceptance|decline:v1 persist \
@@ -352,8 +357,14 @@ pub fn serve_advertise_policy_sha256() -> String {
 // `serve` cell states that on a subject Pull, holding a live owner-binding is
 // sufficient for it and its owner's root acceptance, whatever the publish set
 // says; the advertise is unchanged. **CIRISServer must mirror this pin.**
+//
+// v44 (`e5ff87c`) — RE-PINNED, cb8e0728… → 83099f47…: the Attestation `serve`
+// cell states the per-recipient trace consent, which the code enforced from
+// that commit while the cell still read `capability:infra:serve` alone. The
+// other cells, persist 61.0.1-3 and the #943/#947 work leave the hash alone.
+// **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "cb8e07289dcc9dd9a3e7cbace8fea3ab1f2803c200f45d59bb0df957d9f636be";
+    "83099f472ec6f9d378753239802393915aa7645f3ec25088c0fcf8f1db70b34d";
 
 #[cfg(test)]
 mod tests {
