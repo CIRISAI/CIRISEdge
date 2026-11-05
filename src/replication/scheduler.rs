@@ -1061,11 +1061,19 @@ async fn run_one_coordinator_forever(
 /// the same moment (a restart behind a closed limiter) from coming straight
 /// back, and each draw being its own is what spreads them. The first tick is
 /// left alone: a restart's own burst is what the budgets are sized for.
+///
+/// A kick waits out the draw only up to [`KICK_HOLD_MAX`]: the jitter is sized
+/// for the default cadence, and on a long one a host's kick must not sit for half
+/// an hour behind one refused dial. The returned instant is that hold.
 fn draw_redial(interval: &mut tokio::time::Interval, cadence: Duration) -> tokio::time::Instant {
     let delay = redial_delay(cadence);
     interval.reset_after(delay);
-    tokio::time::Instant::now() + delay
+    tokio::time::Instant::now() + delay.min(KICK_HOLD_MAX)
 }
+
+/// The longest a kick waits behind a drawn re-dial: the draw's top at the
+/// default cadence.
+const KICK_HOLD_MAX: Duration = Duration::from_secs(45);
 
 /// Uniform over `[cadence / 2, cadence * 3 / 2]`, millisecond resolution.
 fn redial_delay(cadence: Duration) -> Duration {
@@ -1166,7 +1174,14 @@ impl GatedRound<'_> {
 fn round_class_of(e: &RoundError) -> RoundClass {
     match e {
         RoundError::Coordinator(CoordinatorError::Transport(t)) => {
-            RoundClass::of_transport_error(t).unwrap_or(RoundClass::SendFailed)
+            RoundClass::of_transport_error(t).unwrap_or_else(|| match t {
+                // A dial was made or a link was used, and it failed.
+                TransportError::Io(_)
+                | TransportError::Timeout(_)
+                | TransportError::LinkSealRefused { .. } => RoundClass::SendFailed,
+                // Nothing went out: no address, a ban, a body too large.
+                _ => RoundClass::Other,
+            })
         }
         RoundError::Coordinator(_) | RoundError::Timeout | RoundError::InboundClosed => {
             RoundClass::Other
@@ -1550,9 +1565,7 @@ mod tests {
     use crate::replication::summary::{
         ApplyOutcome, LocalState, StalenessSignal, StateApplier, StateProvider,
     };
-    use crate::transport::{
-        InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
-    };
+    use crate::transport::{InboundFrame, Transport, TransportId, TransportSendOutcome};
     use async_trait::async_trait;
     use std::collections::HashMap;
 
