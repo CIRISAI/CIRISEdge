@@ -1581,11 +1581,14 @@ struct SweepCursors {
 ///
 /// Peers churn (CIRISEdge#532's link churn is on the same node), and an
 /// unreapable per-peer map is exactly the shape CIRISEdge#530 is open about on
-/// the announce plane. 512 entries ≈ 40 peers × 13 planes; a `PlaneWatermark`
-/// is two small cursors, so the whole map is kilobytes. Evicting the
-/// least-recently-touched entry costs that peer one re-sweep from the
-/// beginning — the same "costs work, not correctness" trade the restart makes.
-const MAX_TRACKED_SWEEP_CURSORS: usize = 512;
+/// the announce plane. 8192 entries = 1000 peers × 8 planes (persist v61's
+/// live planes); a `PlaneWatermark` is two small cursors, so the whole map is
+/// under a few MiB. Evicting the least-recently-touched entry costs that peer
+/// one re-sweep from the beginning — the same "costs work, not correctness"
+/// trade the restart makes. That is cheap once and not as a habit: past
+/// peers × planes = this bound LRU thrashes, a cursor rarely survives a cycle
+/// and a walk of a large plane never finishes (`FSD/EVENT_PATH_MODEL.md` §1.6).
+const MAX_TRACKED_SWEEP_CURSORS: usize = 8192;
 
 impl SweepCursors {
     /// The `since` for this round's NEW-ROWS page.
@@ -26581,6 +26584,30 @@ pub(crate) mod tests {
             c.after_backfill(&k, 1, 4, Some(cur(5)));
             let plan = c.after_head(&k, 0, 4, None).expect("plan");
             assert_eq!(plan.since, None, "the end of the plane WRAPS the re-sweep");
+        }
+
+        /// `FSD/EVENT_PATH_MODEL.md` §1.6 — a thousand peers on eight planes
+        /// keep their cursors through a cycle, in the cyclic order that is LRU's
+        /// worst: past the cap no cursor survives and a walk never finishes.
+        #[test]
+        fn a_cursor_survives_a_cycle_of_a_thousand_peers_on_eight_planes() {
+            let kinds: Vec<EnvelopeKind> = EnvelopeKind::ALL
+                .into_iter()
+                .filter(|k| !k.is_retired_plane())
+                .collect();
+            assert_eq!(kinds.len(), 8, "the live planes");
+            let mut c = SweepCursors::default();
+            for cycle in 0..2 {
+                for peer in 0..1000 {
+                    for kind in &kinds {
+                        let k = (format!("peer-{peer}"), *kind);
+                        if cycle == 1 {
+                            assert!(c.head(&k).is_some(), "{k:?} lost its cursor");
+                        }
+                        c.after_head(&k, 1, 4, Some(cur(1)));
+                    }
+                }
+            }
         }
 
         /// The map is CAPPED and evicts least-recently-touched. Peers churn,

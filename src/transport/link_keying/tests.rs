@@ -135,7 +135,7 @@ fn the_queue_never_grows_past_its_bound_947() {
     let (keyer, mut done) = stopped_pool(&s);
     let mut admitted = 0_usize;
     for i in 0..(DECAP_QUEUE_STRANGER + 20) {
-        match keyer.submit(job(&s, [u8::try_from(i).unwrap(); 16]), false) {
+        match keyer.submit(job(&s, nth_link(i)), false) {
             Ok(()) => admitted += 1,
             Err(r) => assert_eq!(r.label(), o::LINK_SEAL_REFUSED_DECAP_SATURATED),
         }
@@ -157,13 +157,39 @@ fn the_queue_never_grows_past_its_bound_947() {
     assert_eq!(keyer.queues().running, 0, "the worker came back down");
 }
 
+/// A distinct link per `i`.
+fn nth_link(i: usize) -> [u8; 16] {
+    let mut link = [0u8; 16];
+    link[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+    link
+}
+
+/// `FSD/EVENT_PATH_MODEL.md` §2.5 — a queue smaller than the budget in front of
+/// it refuses what the budget admitted, after the slot is spent; and a
+/// canonical's 500 peers re-dialling at once fit the standing queue.
+#[test]
+fn the_queues_hold_what_the_budgets_let_through() {
+    let s = seals();
+    let (keyer, _done) = stopped_pool(&s);
+    for i in 0..HANDSHAKES_STRANGER_NODE as usize {
+        keyer
+            .submit(job(&s, nth_link(i)), false)
+            .unwrap_or_else(|r| panic!("stranger {i} was admitted and refused: {r}"));
+    }
+    for i in 0..500 {
+        keyer
+            .submit(job(&s, nth_link(10_000 + i)), true)
+            .unwrap_or_else(|r| panic!("peer {i} refused: {r}"));
+    }
+}
+
 #[test]
 fn standing_is_drained_first_and_has_room_in_a_full_stranger_queue_947() {
     let s = seals();
     let (keyer, mut done) = stopped_pool(&s);
     for i in 0..DECAP_QUEUE_STRANGER {
         keyer
-            .submit(job(&s, [u8::try_from(i).unwrap(); 16]), false)
+            .submit(job(&s, nth_link(i)), false)
             .expect("the queue holds them");
     }
     assert!(keyer
@@ -179,7 +205,10 @@ fn standing_is_drained_first_and_has_room_in_a_full_stranger_queue_947() {
         known,
         "the last in is the first out"
     );
-    assert_eq!(done.try_recv().expect("then the strangers").link, [0; 16]);
+    assert_eq!(
+        done.try_recv().expect("then the strangers").link,
+        nth_link(0)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

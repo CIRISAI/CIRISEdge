@@ -79,11 +79,17 @@ use crate::transport::route_fetch::{RouteRequestLimiter, SenderRouteLimiter};
 pub const DECAP_WORKERS_MAX: usize = 4;
 
 /// Handshakes with standing waiting for a worker. Sized for a canonical's
-/// peers re-dialling together after a restart; drained first.
-pub const DECAP_QUEUE_STANDING: usize = 64;
+/// peers re-dialling together after a restart, drained first: 500 links landing
+/// at once clear with this and not with 256 (`FSD/EVENT_PATH_MODEL.md` §2.5).
+/// It matters only when frames reach the keyer faster than it runs, and a job
+/// that waits out [`KEYING_BUDGET`](crate::transport::link_seal::KEYING_BUDGET)
+/// is skipped unstarted, so the bound on the wait is that budget, not this.
+pub const DECAP_QUEUE_STANDING: usize = 1024;
 
-/// Handshakes from strangers waiting for a worker.
-pub const DECAP_QUEUE_STRANGER: usize = 32;
+/// Handshakes from strangers waiting for a worker: [`HANDSHAKES_STRANGER_NODE`],
+/// the budget in front of it. A queue smaller than that budget refuses what the
+/// budget admitted, after the slot is spent.
+pub const DECAP_QUEUE_STRANGER: usize = 256;
 
 /// Per [`ROUTE_REQUEST_WINDOW`](crate::transport::route_fetch::ROUTE_REQUEST_WINDOW):
 /// strangers' handshakes admitted node-wide. A stranger who needs a route
@@ -107,6 +113,9 @@ pub const HANDSHAKES_PER_STANDING: usize = 64;
 /// identifies before it keys, so past the identify's grace this is reached only
 /// by a link whose identify was lost, and by a flood that never identifies.
 pub const HANDSHAKES_UNIDENTIFIED: usize = 16;
+
+// The queue holds what the receiver order lets through in a burst.
+const _: () = assert!(DECAP_QUEUE_STRANGER as u32 >= HANDSHAKES_STRANGER_NODE);
 
 /// What the event path knows about who sent a handshake.
 #[derive(Debug, Clone, Copy)]
