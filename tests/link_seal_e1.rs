@@ -2002,6 +2002,7 @@ async fn one_way(from: &Node, to: &Node, n: u64, tag: &[u8]) -> Option<Duration>
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_decapsulation_blocks_no_other_links_frames_947() {
     const SLOW: Duration = Duration::from_secs(3);
+    const WITHIN: Duration = Duration::from_millis(2_500);
     let t = trio("slowdecap", true, false, false).await;
     one_way(&t.b, &t.a, 0, b"947-SLOW-WARMUP-")
         .await
@@ -2028,7 +2029,7 @@ async fn a_slow_decapsulation_blocks_no_other_links_frames_947() {
         worst = worst.max(took);
     }
     assert!(
-        inside.elapsed() < SLOW - Duration::from_millis(500),
+        inside.elapsed() < WITHIN,
         "B's eight frames took {:?}, worst {worst:?}, against a {SLOW:?} decapsulation",
         inside.elapsed()
     );
@@ -2325,6 +2326,7 @@ async fn the_awaiting_cap_refuses_the_oldest_by_name_and_keeps_new_links_working
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_responders_stalled_first_words_block_no_other_links_frames_947() {
     const SLOW: Duration = Duration::from_secs(3);
+    const WITHIN: Duration = Duration::from_millis(2_500);
     let t = trio("firstwords", true, false, false).await;
     one_way(&t.b, &t.a, 0, b"947-WORDS-WARMUP-")
         .await
@@ -2349,7 +2351,7 @@ async fn a_responders_stalled_first_words_block_no_other_links_frames_947() {
             .expect("B's frame lands");
     }
     assert!(
-        inside.elapsed() < SLOW - Duration::from_millis(500),
+        inside.elapsed() < WITHIN,
         "B's eight frames took {:?} against {SLOW:?} of first words",
         inside.elapsed()
     );
@@ -2389,17 +2391,16 @@ async fn measure_flood_cost_947() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             took.sort();
-            let at = |q: f64| {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                took.get((took.len() as f64 * q) as usize)
+            let at = |pct: usize| {
+                took.get(took.len() * pct / 100)
                     .copied()
                     .unwrap_or_default()
             };
             println!(
                 "{label}: n={} lost={lost} p50={:?} p99={:?} max={:?}",
                 took.len(),
-                at(0.5),
-                at(0.99),
+                at(50),
+                at(99),
                 took.last().copied().unwrap_or_default()
             );
         }
