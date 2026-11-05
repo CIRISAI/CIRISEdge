@@ -9163,6 +9163,21 @@ impl FederationDirectoryReplicationBridge {
             .is_some_and(|set| set.recipient(node).is_some())
     }
 
+    /// `FSD/PRIVACY_MODES.md` §6.12 — whether `peer` is in this node's send
+    /// set now, by the one door rows go through: the memo, or one single-flight
+    /// read on a miss. `None` when no set resolved, and when the answer is
+    /// `false` from a set narrower than the truth
+    /// ([`ResolvedPeerSet::owner_walk_complete`]): "not in the set" is what a
+    /// shed acts on, so a fail-closed narrowing must not read as that.
+    pub async fn send_set_reaches(&self, local: &str, peer: &str) -> Option<bool> {
+        let set = self.resolved_peer_set(local).await?;
+        if set.recipient(peer).is_some() {
+            Some(true)
+        } else {
+            set.owner_walk_complete().then_some(false)
+        }
+    }
+
     /// The consent memo's value iff it is younger than
     /// [`CONSENT_SEND_SET_MEMO_TTL`].
     fn fresh_consent_memo(&self) -> Option<ResolvedPeerSet> {
@@ -17461,6 +17476,129 @@ pub(crate) mod tests {
             },
         });
         seed_raw_attestation(backend, &id, producer, recipient, "scores", envelope).await;
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.12 — the door a shed lever reads: `true` for
+    /// a consented peer, `false` for a stranger, and no answer at all when
+    /// the owner walk was narrower than the truth, which must not read as "not
+    /// in the set".
+    #[tokio::test]
+    async fn the_send_set_a_shed_reads_says_nothing_from_a_narrowed_set() {
+        let backend = audience_backend().await;
+        let local = "node-alice-a";
+        seed_consent_membership(&backend, local, "node-bob").await;
+        let bridge = audience_bridge(&backend);
+        assert_eq!(bridge.send_set_reaches(local, "node-bob").await, Some(true));
+        assert_eq!(
+            bridge.send_set_reaches(local, "node-nobody").await,
+            Some(false)
+        );
+        let narrowed = ResolvedPeerSet::from_consent_peers(vec!["node-bob".to_owned()])
+            .widened_by_owner_binding(Vec::new(), false);
+        *bridge.consent_memo.lock().unwrap() = Some((narrowed, Instant::now()));
+        assert_eq!(
+            bridge.send_set_reaches(local, "node-bob").await,
+            Some(true),
+            "what the narrowed set does name stands"
+        );
+        assert_eq!(bridge.send_set_reaches(local, "node-nobody").await, None);
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.12 — **the production read, on persist's own
+    /// rows.** The owner's second node is an own device even with a grant
+    /// naming it: `Reach` would say `Consent` there, which is why the read does
+    /// not ask `Reach`. A recognised canonical is a seat until a tombstone
+    /// names it, then a stranger on the very next read, with no restart.
+    #[tokio::test]
+    async fn the_obligation_read_places_each_peer_from_the_live_rows() {
+        use crate::load_ladder::{PeerObligation as O, PeerObligations as _};
+        use crate::peer_obligation::LivePeerObligations;
+        let backend = audience_backend().await;
+        let local = "node-alice-a";
+        seed_owner_binding(&backend, "person-alice", local).await;
+        seed_owner_binding(&backend, "person-alice", "node-alice-b").await;
+        seed_consent_membership(&backend, local, "node-alice-b").await;
+        seed_consent_membership(&backend, local, "node-bob").await;
+        let bridge = Arc::new(audience_bridge(&backend));
+        let recognised = Arc::new(std::sync::RwLock::new(HashSet::from([
+            "node-seat".to_owned()
+        ])));
+        let read = LivePeerObligations::new(
+            backend.clone(),
+            local,
+            Arc::clone(&recognised),
+            Arc::clone(&bridge) as Arc<dyn crate::peer_obligation::SendSetRead>,
+        );
+        assert_eq!(read.obligation_of("node-alice-b").await, O::OwnDevice);
+        assert_eq!(read.obligation_of("person-alice").await, O::OwnDevice);
+        assert_eq!(read.obligation_of("node-seat").await, O::Seat);
+        assert_eq!(read.obligation_of("node-bob").await, O::SendSet);
+        assert_eq!(read.obligation_of("node-nobody").await, O::Ordinary);
+
+        backend
+            .record_canonical_withdrawal("node-seat", None, "sha256:e15-retire")
+            .await
+            .expect("tombstone");
+        assert_eq!(
+            read.obligation_of("node-seat").await,
+            O::Ordinary,
+            "a retired canonical is protected by nothing now"
+        );
+
+        // The bridge narrowed: a peer in none of the sets is not ordinary.
+        let narrowed = ResolvedPeerSet::from_consent_peers(Vec::new())
+            .widened_by_owner_binding(Vec::new(), false);
+        *bridge.consent_memo.lock().unwrap() = Some((narrowed, Instant::now()));
+        assert_eq!(read.obligation_of("node-nobody").await, O::Unresolved);
+    }
+
+    /// `seat` class's roster at bootstrap: a directory with no rows is the
+    /// signed bundle, so a fresh node still knows its seats. A conferred key
+    /// joins in the bundle's own spelling, a tombstone takes out even a bundle
+    /// seat, and operator config proves nothing.
+    #[tokio::test]
+    async fn the_seat_roster_is_the_bundle_until_the_directory_says_more() {
+        use crate::load_ladder::PeerObligations as _;
+        use crate::peer_obligation::{LivePeerObligations, SendSetRead};
+        let backend = audience_backend().await;
+        let bundle: HashSet<String> = crate::baked_canonical_genesis_ids().into_iter().collect();
+        let first = bundle.iter().next().expect("a baked seat").clone();
+        let recognised = Arc::new(std::sync::RwLock::new(HashSet::from([
+            "node-operator-declared".to_owned(),
+        ])));
+        let bridge = Arc::new(audience_bridge(&backend));
+        let read = LivePeerObligations::new(
+            backend.clone(),
+            "node-alice-a",
+            recognised,
+            bridge as Arc<dyn SendSetRead>,
+        );
+        let active = read.active_seats().await.expect("a read");
+        assert_eq!(active.seats, bundle);
+        assert!(!active.own);
+
+        backend
+            .test_seam_set_key_identity_type("node-alice-a", "canonical,node")
+            .await
+            .expect("the role, conferred");
+        let active = read.active_seats().await.expect("a read");
+        assert!(active.seats.contains("node-alice-a"));
+        assert!(active.own);
+
+        backend
+            .record_canonical_withdrawal(&first, None, "sha256:e15-bundle-seat")
+            .await
+            .expect("tombstone");
+        backend
+            .record_canonical_withdrawal("node-alice-a", None, "sha256:e15-joined")
+            .await
+            .expect("tombstone");
+        let active = read.active_seats().await.expect("a read");
+        assert!(
+            !active.seats.contains(&first),
+            "a quorum outvotes the bundle"
+        );
+        assert!(!active.own);
     }
 
     /// Seed a bare `consent:replication:v1` grant (NO restrictions) by `granter`

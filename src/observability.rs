@@ -1214,6 +1214,14 @@ pub const LINK_SHAPING_BULK_REFUSED: &str = "link_shaping_bulk_refused";
 /// (it cannot be dialled). Slow, never a failure; the bulk plane is the
 /// preferred path and this is its last resort.
 pub const LINK_SHAPING_BULK_ON_SHAPED_FALLBACK: &str = "link_shaping_bulk_on_shaped_fallback";
+/// `FSD/PRIVACY_MODES.md` §6.12 — a non-obligation peer's new shaped link
+/// refused under Admit-close (`FSD/CIRIS_MESH.md` §7.3's token). It also counts
+/// under [`LINK_SHAPING_HOME_ELSEWHERE`].
+pub const LINK_SHAPING_LOAD_REFUSED: &str = "load_refuse:admit_closed";
+/// `FSD/PRIVACY_MODES.md` §6.12 — a shaped link closed at tier 2.
+pub const LINK_SHAPING_LOAD_SHED: &str = "load_shed:shaped";
+/// `FSD/PRIVACY_MODES.md` §6.12 — a slow-path transfer paused at tier 2.
+pub const LINK_SHAPING_LOAD_SHED_BULK: &str = "load_shed:bulk";
 /// A row the Attestation advertise's projection filter skipped (a `SelfOwn`
 /// row whose attester is not in this node's self-publish set, ...). Not a
 /// withhold: the row was not this node's to publish when it was read.

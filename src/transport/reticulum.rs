@@ -3503,7 +3503,8 @@ impl ReticulumTransport {
         shapers.set_relay_offering(onion.relay_offering());
         // CC 5.4.3 rc17 the `seat` class: the serve seats are the signed
         // genesis bundle's, never self-declared; a seat-to-seat link is
-        // offered it.
+        // offered it. This is the bootstrap answer, with an empty directory;
+        // the listener keeps it to the active roster from here on.
         {
             let seated: std::collections::HashSet<String> =
                 ciris_persist::federation::genesis::canonical_genesis_bundle()
@@ -6646,9 +6647,18 @@ impl ReticulumTransport {
     }
 
     /// ALM stage 2 (`FSD/CIRIS_MESH.md` §7) — the service tier: forwarded
-    /// links close to new admissions at tier ≥ 1.
+    /// links close to new admissions at tier ≥ 1, and so do shaped slots for
+    /// peers this node owes nothing; tier 2 sheds those links and pauses their
+    /// slow path (`FSD/PRIVACY_MODES.md` §6.12). Cover is not shed.
     pub fn set_service_tier(&self, tier: crate::load_ladder::ServiceTier) {
         self.forward_admission.set_tier(tier);
+        self.shapers.set_service_tier(tier);
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.12 — install what a shed lever reads at
+    /// decision time. With none, nothing on a shaped slot is shed.
+    pub fn install_peer_obligations(&self, reader: Arc<dyn crate::load_ladder::PeerObligations>) {
+        self.shapers.set_obligations(reader);
     }
 
     /// ALM stage 2 — the key id of the roster member (a room peer or a
@@ -6930,10 +6940,24 @@ impl ReticulumTransport {
         self.shapers.set_seats(seats, own);
     }
 
+    /// Seat-tier test seam — whether a link to `peer` is a seat link now.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_seat_link_for_test(&self, peer: &str) -> bool {
+        self.shapers.is_seat_link(Some(peer))
+    }
+
     /// Seat-tier test seam — seats by key-id prefix.
     #[doc(hidden)]
     pub fn set_seat_prefixes_for_test(&self, prefixes: Vec<String>, own: bool) {
         self.shapers.set_seat_prefixes(prefixes, own);
+    }
+
+    /// Test seam — the shaped links' ids.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn shaped_link_ids_for_test(&self) -> Vec<[u8; 16]> {
+        self.shapers.shaped_links()
     }
 
     /// Test seam — the agreed frame rate (λ) of each shaped link.
@@ -7616,6 +7640,79 @@ impl ReticulumTransport {
     #[must_use]
     pub fn shaped_link_count(&self) -> usize {
         self.shapers.shaped_count()
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.6, E8 — **the typed status a host reads**:
+    /// every value comes from the running policy, shapers, tier and tier
+    /// runtime when asked.
+    #[must_use]
+    pub fn shaping_status(&self) -> crate::transport::link_shaping::ShapingStatus {
+        use crate::transport::link_shaping::{
+            BudgetClass, DeviceKind, ShapingFigures, ShapingPolicy, ShapingScope, ShapingStatus,
+            REFERENCE_FRAME_BYTES,
+        };
+        let policy = self.shapers.policy();
+        let links = self.shapers.links_status();
+        let agreed_frame = links
+            .iter()
+            .filter(|l| !l.seat)
+            .map(|l| l.frame_bytes)
+            .max();
+        let frame = agreed_frame.unwrap_or(REFERENCE_FRAME_BYTES);
+        let onion = self.onion.status();
+        let device = self.onion.device();
+        let figures = ShapingFigures::of(&policy, frame);
+        // A phone's two networks (§6.6's `_cellular` set); the one in force
+        // comes from the policy, whatever a host set it to.
+        let device_figures = if device.kind == DeviceKind::Phone {
+            [BudgetClass::PhoneWifi, BudgetClass::PhoneCellular]
+                .into_iter()
+                .filter_map(|class| {
+                    if class == policy.class {
+                        ShapingFigures::of(&policy, frame)
+                    } else {
+                        ShapingFigures::of(&ShapingPolicy::for_class(class), frame)
+                    }
+                })
+                .collect()
+        } else {
+            figures.iter().cloned().collect()
+        };
+        let tier = self.shapers.service_tier();
+        ShapingStatus {
+            class: policy.class.as_str(),
+            enabled: policy.enabled(),
+            all_links: policy.scope == ShapingScope::AllIdentityLinks,
+            require_shaped_links: policy.require_shaped_links,
+            bytes_per_s: policy.bytes_per_s,
+            node_cap_bytes_per_s: policy.node_cap_bytes_per_s,
+            figures,
+            device_figures,
+            frame_agreed: agreed_frame.is_some(),
+            service_tier: tier.as_u8(),
+            admit_closed: !tier.admits_new_shaped_links(),
+            shaped_links: links.len(),
+            counted_links: self.shapers.counted_link_count(),
+            max_links: self.shapers.max_links(),
+            free_slots: self.shapers.free_slots(),
+            reported_slots: self.shapers.reported_slots(),
+            layer_held_slots: self.shapers.layer_held_slots(),
+            relay_offering: self.shapers.relay_offering(),
+            links,
+            peers: self.shapers.peers_shaping(),
+            relays_answering: self.onion.deal().map(|_| {
+                let n: usize = onion.answering.iter().sum();
+                u32::try_from(n).unwrap_or(u32::MAX)
+            }),
+            onion,
+        }
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §3.1, E8 — what this node knows of `peer`'s
+    /// shaping.
+    #[must_use]
+    pub fn peer_shaping(&self, peer: &str) -> crate::transport::link_shaping::PeerShaping {
+        self.shapers.peer_shaping(peer)
     }
 
     /// CC 5.4.3 — replace the shaping policy at runtime. Shaped links the new
@@ -9385,6 +9482,19 @@ impl ReticulumTransport {
         if self.bulk_fallbacks.recently_finished(&digest) {
             return Ok(TransportSendOutcome::Delivered);
         }
+        // `FSD/PRIVACY_MODES.md` §6.12 — the slow path is bulk: at tier 2 a
+        // file to a non-owner peer waits for the dispatcher's retry and holds
+        // nothing here.
+        if self.shapers.slow_path_paused(destination_key_id).await {
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_SHED_BULK);
+            }
+            return Err(TransportError::Io(format!(
+                "{}: the slow path to {destination_key_id} is paused at tier 2; the send is \
+                 retried",
+                crate::observability::LINK_SHAPING_LOAD_SHED_BULK
+            )));
+        }
         let (mut outcome, owner) = self.bulk_fallbacks.join_or_start(digest);
         if let Some(tx) = owner {
             let shaper = self.shapers.get(link.into_bytes());
@@ -9403,8 +9513,13 @@ impl ReticulumTransport {
             }
             let node = Arc::clone(&self.node);
             let fallbacks = Arc::clone(&self.bulk_fallbacks);
+            let pause = SlowPathPause {
+                shapers: Arc::clone(&self.shapers),
+                peer: destination_key_id.to_owned(),
+                metrics: self.metrics.get().cloned(),
+            };
             tokio::spawn(async move {
-                let result = run_bulk_fallback(&node, link, &shaper, frames).await;
+                let result = run_bulk_fallback(&node, link, &shaper, frames, &pause).await;
                 fallbacks.finish(&digest, result.is_ok());
                 // choke-ok: every waiter may have gone; the record above stands.
                 let _ = tx.send(Some(result));
@@ -10189,6 +10304,15 @@ impl Transport for ReticulumTransport {
             tokio::spawn(run_homing(self.dial_ctx(), jobs));
         }
 
+        // `FSD/PRIVACY_MODES.md` §6.12 — while tier 2 is in force.
+        tokio::spawn(run_shaped_shed(
+            Arc::downgrade(&self.node),
+            Arc::clone(&self.seals),
+            Arc::clone(&self.shapers),
+            Arc::clone(&self.lifecycle),
+            self.metrics.get().cloned(),
+        ));
+
         // ALM stage 2 — a transport node reads what it forwards once a
         // second: the admission ledger retires closed links, and the rates
         // feed the `load_ledger` and the ladder's `edge:transit_pps` signal.
@@ -10417,6 +10541,11 @@ impl ReticulumTransport {
         // (`release_held`) are re-checked on this tick, which runs only while
         // some wait: a binding healed in the cold-start worker raises no event
         // here, and a link still unattributed at the budget must be refused.
+        // The seat roster, on a bounded cadence and off this loop: an offer
+        // reads the set it leaves and never waits on the directory. The timer
+        // ends with this run, so a parked node holds none.
+        let mut seat_tick = tokio::time::interval(crate::peer_obligation::SEAT_ROSTER_REFRESH);
+        seat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut attribution_tick = tokio::time::interval(Duration::from_millis(100));
         attribution_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let ctx = EventCtx {
@@ -10487,6 +10616,13 @@ impl ReticulumTransport {
                     for link in ctx.seals.awaiting_attribution() {
                         release_held(&ctx, LinkId::new(link)).await;
                     }
+                }
+                _ = seat_tick.tick() => {
+                    tokio::spawn(refresh_seats(
+                        Arc::clone(&self.node),
+                        Arc::clone(&self.seals),
+                        Arc::clone(&self.shapers),
+                    ));
                 }
                 _ = pool_tick.tick() => {
                     let closed = self.reap_idle_pooled_links().await;
@@ -15494,12 +15630,26 @@ async fn answer_shaping_offer(
     // the eight (CIRISEdge v44, CC 5.4.3, 5.4.6 item 4).
     let peer = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
     let ours = if shaping_applies_to(plane) {
-        ctx.shapers.offer_for_answer(
-            link,
-            link_channel_mdu(ctx.node, &link_id),
-            peer.as_deref(),
-            theirs,
-        )
+        if ctx.shapers.load_refuses(peer.as_deref(), theirs).await {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_REFUSED);
+            }
+            tracing::info!(
+                link = %hex::encode(link),
+                peer = peer.as_deref().unwrap_or("-"),
+                token = crate::observability::LINK_SHAPING_LOAD_REFUSED,
+                tier = ctx.shapers.service_tier().as_u8(),
+                "a shaped link refused under load, with referrals (FSD/PRIVACY_MODES.md §6.12)"
+            );
+            ctx.shapers.refusal_for(link, peer.as_deref())
+        } else {
+            ctx.shapers.offer_for_answer(
+                link,
+                link_channel_mdu(ctx.node, &link_id),
+                peer.as_deref(),
+                theirs,
+            )
+        }
     } else {
         ctx.shapers.offer_off_for(link)
     };
@@ -15869,23 +16019,124 @@ async fn shaping_teardown(
     let _ = ctx.node.close_link(&link_id).await;
 }
 
+/// `FSD/PRIVACY_MODES.md` §6.12 — one step of a shed: the newest shaped link
+/// tier 2 closes. It ends whole, like any close: its rows retry and its peer
+/// redials into a refusal with referrals.
+async fn shed_one_shaped_link(
+    node: &ReticulumNode,
+    seals: &crate::transport::link_seal::LinkSeals,
+    shapers: &crate::transport::link_shaping::LinkShapers,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+) -> bool {
+    let Some(link) = shapers.next_shed().await else {
+        return false;
+    };
+    if let Some(m) = metrics {
+        m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_SHED);
+    }
+    tracing::info!(
+        link = %hex::encode(link),
+        token = crate::observability::LINK_SHAPING_LOAD_SHED,
+        "a shaped link closed at tier 2, newest first (FSD/PRIVACY_MODES.md §6.12)"
+    );
+    seals.refuse(link);
+    shapers.forget(&link);
+    let _ = node.close_link(&LinkId::new(link)).await;
+    true
+}
+
+/// Put the active seat roster in force and close what it no longer carries.
+async fn refresh_seats(
+    node: Arc<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+) {
+    for link in shapers.refresh_active_seats().await {
+        tracing::info!(
+            link = %hex::encode(link),
+            "a seat link's peer left the active roster; closed to renegotiate (CC 5.4.3)"
+        );
+        seals.refuse(link);
+        let _ = node.close_link(&LinkId::new(link)).await;
+    }
+}
+
+/// How often tier 2 closes one shaped link. A step at a time, so a tier that
+/// falls leaves the older links standing, the way the A/V shed moves one leg
+/// at a time.
+const SHAPED_SHED_STEP: Duration = Duration::from_secs(1);
+
+/// `FSD/PRIVACY_MODES.md` §6.12 — asleep until tier 2 is in force, then one
+/// close per step while it stays. It holds no timer while the transport is
+/// parked: the host's next sample wakes it.
+async fn run_shaped_shed(
+    node: std::sync::Weak<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    lifecycle: Arc<crate::transport::lifecycle::Lifecycle>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+) {
+    loop {
+        shapers.shed_woken().await;
+        while shapers.service_tier().closes_shaped_links() && !lifecycle.park_requested() {
+            let Some(node) = node.upgrade() else { return };
+            shed_one_shaped_link(&node, &seals, &shapers, metrics.as_ref()).await;
+            drop(node);
+            tokio::time::sleep(SHAPED_SHED_STEP).await;
+        }
+    }
+}
+
+/// `FSD/PRIVACY_MODES.md` §6.12 — what a running slow-path transfer checks.
+struct SlowPathPause {
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    peer: String,
+    metrics: Option<crate::observability::EdgeMetrics>,
+}
+
+impl SlowPathPause {
+    /// Whether the transfer waits now. `held` remembers one pause's answer, so
+    /// a transfer reads its peer once per pause and counts it once.
+    async fn holds(&self, held: &mut Option<bool>) -> bool {
+        if !self.shapers.service_tier().pauses_bulk() {
+            *held = None;
+            return false;
+        }
+        if let Some(answer) = *held {
+            return answer;
+        }
+        let paused = self.shapers.slow_path_paused(&self.peer).await;
+        if paused {
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_SHED_BULK);
+            }
+        }
+        *held = Some(paused);
+        paused
+    }
+}
+
 /// CC 5.4.3 rc16 two planes — feed `frames` to `shaper` as its queue allows
 /// and wait until the link has taken the last of them. The bound follows the
-/// message: three times what the link's real budget needs, plus a minute.
+/// message: three times what the link's real budget needs, plus a minute, and
+/// the time a pause holds it does not count. Paused at tier 2 it keeps its
+/// place in the message (§6.12) and resumes at tier ≤ 1; rows pass meanwhile.
 async fn run_bulk_fallback(
     node: &ReticulumNode,
     link: LinkId,
     shaper: &crate::transport::link_shaping::LinkShaper,
     mut frames: Vec<Vec<u8>>,
+    pause: &SlowPathPause,
 ) -> Result<(), String> {
     const STOPPED: &str = "link_shaping_bulk_fallback_interrupted: the shaped link closed \
                            part-way; the message is not delivered and the send is retried";
     let agreement = *shaper.agreement();
     #[allow(clippy::cast_precision_loss)] // a frame count; a bound, not an amount
     let budget = frames.len() as f64 / (agreement.rho * shaper.lambda_now()).max(0.001);
-    let deadline = tokio::time::Instant::now()
+    let mut deadline = tokio::time::Instant::now()
         + Duration::from_secs_f64(budget * 3.0)
         + Duration::from_secs(60);
+    let mut held = None;
     // Rows now sit between this message's frames, so a retraction names this
     // message's batches and never the range they span.
     let mut batches: Vec<(u64, u64)> = Vec::new();
@@ -15908,11 +16159,18 @@ async fn run_bulk_fallback(
                     .to_owned(),
             );
         }
+        let paused = pause.holds(&mut held).await;
         // E3 — rows first: a few frames at a time, so a row queued now waits
         // behind those and not behind the file.
-        let room = shaper.room().min(frames.len()).min(
-            crate::transport::link_shaping::SLOW_PATH_QUEUED_MAX.saturating_sub(shaper.queued()),
-        );
+        let room = if paused {
+            deadline += Duration::from_millis(100);
+            0
+        } else {
+            shaper.room().min(frames.len()).min(
+                crate::transport::link_shaping::SLOW_PATH_QUEUED_MAX
+                    .saturating_sub(shaper.queued()),
+            )
+        };
         if room > 0 {
             let n = u64::try_from(room).unwrap_or(u64::MAX);
             ticket = shaper

@@ -26,6 +26,10 @@
 //! devices and owner, federation duty, `control`, revocations) is never named
 //! by any lever: [`FlowClass::never_shed`] is checked before every shed.
 //!
+//! Shaped slots follow the same tiers (`FSD/PRIVACY_MODES.md` §6.12): what a
+//! lever owes a peer is [`PeerObligation`], read when it acts. Cover is not
+//! shed, and no lever touches a shaper.
+//!
 //! The state machine is pure and clock-injected (`now_ms`), so the sim drives
 //! the production type (LS1–LS5 in `closed_loop_sim`).
 
@@ -124,6 +128,22 @@ impl ServiceTier {
     #[must_use]
     pub const fn admits_new_relay_work(self) -> bool {
         matches!(self, Self::FullOps)
+    }
+
+    /// **Admit-close on shaped slots** (tier ≥ 1, `FSD/PRIVACY_MODES.md`
+    /// §6.12): a peer that is no obligation of this node gets no new shaped
+    /// link. It is refused with referrals, and the node reports zero slots.
+    #[must_use]
+    pub const fn admits_new_shaped_links(self) -> bool {
+        self.admits_new_relay_work()
+    }
+
+    /// **A shaped link sheds whole** (tier 2, §6.12): links to non-obligation
+    /// peers may close, newest first. Never below the class: cover is not
+    /// shed, and no lever here touches a shaper.
+    #[must_use]
+    pub const fn closes_shaped_links(self) -> bool {
+        matches!(self, Self::ChatAndContacts)
     }
 
     /// **V-shed** (tier ≥ 1): video on legs this node RELAYS goes to the base
@@ -226,6 +246,79 @@ impl FlowClass {
             self,
             Self::Control | Self::Revocation | Self::OwnDevice | Self::FederationDuty
         )
+    }
+}
+
+/// What this node owes a peer, read when a shed lever is about to act on it
+/// (`FSD/CIRIS_MESH.md` §7.1, §7.2; `FSD/PRIVACY_MODES.md` §6.12). The peers a
+/// tier leaves alone are the ones its Stretch row names, "the owner, own
+/// devices or the send set", and the serve seats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerObligation {
+    /// The owner or one of the owner's devices (L-A3).
+    OwnDevice,
+    /// A seat on the active canonical roster (L-A2).
+    Seat,
+    /// In the resolved send set: rounds are owed to it (L-A2).
+    SendSet,
+    /// None of these, on a complete read.
+    Ordinary,
+    /// The read failed or was narrower than the truth. A wrong refusal hurts
+    /// quietly and a missed shed costs a little load, so nothing is shed.
+    Unresolved,
+}
+
+impl PeerObligation {
+    /// The ladder's class of this peer's flows; `None` when not known.
+    #[must_use]
+    pub const fn flow_class(self) -> Option<FlowClass> {
+        match self {
+            Self::OwnDevice => Some(FlowClass::OwnDevice),
+            Self::Seat | Self::SendSet => Some(FlowClass::FederationDuty),
+            Self::Ordinary => Some(FlowClass::OrdinaryRound),
+            Self::Unresolved => None,
+        }
+    }
+
+    /// Whether this peer keeps its shaped slot under every tier: Admit-close
+    /// admits it and tier 2 never closes its link.
+    #[must_use]
+    pub const fn keeps_shaped_link(self) -> bool {
+        match self.flow_class() {
+            Some(class) => class.never_shed(),
+            None => true,
+        }
+    }
+
+    /// Whether this peer's slow path keeps running at tier 2: B-pause exempts
+    /// the owner's devices alone ("for non-owner peers", §7.2).
+    #[must_use]
+    pub const fn keeps_slow_path(self) -> bool {
+        matches!(self, Self::OwnDevice | Self::Unresolved)
+    }
+}
+
+/// The active serve seats, as `seat` class reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ActiveSeats {
+    /// Every seat on the active roster.
+    pub seats: std::collections::HashSet<String>,
+    /// This node holds one.
+    pub own: bool,
+}
+
+/// The read a shed lever makes at decision time. Installed on the transport
+/// (`ReticulumTransport::install_peer_obligations`); production is
+/// [`crate::peer_obligation::LivePeerObligations`].
+#[async_trait::async_trait]
+pub trait PeerObligations: Send + Sync + std::fmt::Debug {
+    /// What this node owes `peer` now.
+    async fn obligation_of(&self, peer: &str) -> PeerObligation;
+
+    /// The active serve seats, for `seat` class. `None` when they cannot be
+    /// read: the last answer stands.
+    async fn active_seats(&self) -> Option<ActiveSeats> {
+        None
     }
 }
 

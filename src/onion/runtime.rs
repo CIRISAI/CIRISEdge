@@ -24,7 +24,7 @@ use crate::transport::onion_liveness::{Availability, LivenessEvidence, LivenessF
 pub const EXIT_QUEUE_BOUND: usize = 64;
 
 /// What the client shows about the tier (counts only, never an identity).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[allow(clippy::struct_excessive_bools)] // each a separate fact the client shows
 pub struct OnionStatus {
     /// The operator opted in.
