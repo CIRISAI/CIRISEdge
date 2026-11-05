@@ -214,7 +214,14 @@ async fn transport_node_limited(
     announce_rate_target: Option<u32>,
 ) -> ReticulumNode {
     let storage = tempfile::tempdir().expect("tempdir");
-    let mut node = ReticulumNodeBuilder::new()
+    // Node-wide: the one setting that reaches the connections a listener spawns.
+    let mut builder = ReticulumNodeBuilder::new();
+    if announce_rate_target.is_some() {
+        let mut config = leviculum_std::config::Config::default();
+        config.reticulum.default_ar_target = announce_rate_target;
+        builder = builder.config(config);
+    }
+    let mut node = builder
         .enable_transport(true)
         .add_interface_config(leviculum_std::config::InterfaceConfig {
             name: "T TCP server".to_string(),
@@ -222,8 +229,6 @@ async fn transport_node_limited(
             listen_ip: Some("127.0.0.1".to_string()),
             listen_port: Some(tcp_port),
             ingress_control: Some(ingress),
-            announce_rate_target,
-            announce_rate_grace: announce_rate_target.map(|_| 5),
             ..Default::default()
         })
         .direct_link(leviculum_std::direct_link::DirectLinkSettings {
