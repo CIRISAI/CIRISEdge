@@ -14807,6 +14807,7 @@ pub(crate) mod tests {
     /// `membership:widening:v1` event carried A → B on the Attestation plane
     /// and applied through the replicated-attestation door land in the
     /// projection the roster reads. Before the rows arrive B knows no member.
+    #[cfg(feature = "_reticulum-module")]
     #[tokio::test]
     async fn the_av_roster_resolves_from_group_rows_on_the_attestation_plane() {
         use crate::transport::av_call::RoomRoster as _;
