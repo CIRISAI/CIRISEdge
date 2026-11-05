@@ -1615,6 +1615,26 @@ mod tests {
     }
 
     #[test]
+    fn every_decision_the_ledger_names_reaches_it() {
+        use crate::observability as o;
+        let mut a = AlmState::new("a", s(0), &roster(), false, 1);
+        let me = "a".to_owned();
+        for kind in [
+            DecisionKind::Switch,
+            DecisionKind::LoopDetected,
+            DecisionKind::OverClaim,
+            DecisionKind::Admit,
+        ] {
+            a.log.record(0, &me, kind, None, 0, "test");
+        }
+        a.book_decisions();
+        assert_eq!(
+            a.labels,
+            vec![o::ALM_SWITCH, o::ALM_LOOP_DETECTED, o::ALM_OVER_CLAIM]
+        );
+    }
+
+    #[test]
     fn a_newer_epoch_is_one_resync_per_stream() {
         let mut a = AlmState::new("a", s(0), &roster(), false, 1);
         a.on_chunk(s(1), "b", 1, 5, 100, 0, true);

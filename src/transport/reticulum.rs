@@ -94,6 +94,7 @@ use std::time::Duration;
 
 use crate::observability::{LinkCloseCause, LinkPoolCloseReason};
 use crate::telemetry::{EventLabel, LoopName};
+use crate::transport::link_shaping::{wait_row_left, RowLeft};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -10094,57 +10095,22 @@ impl ReticulumTransport {
             // real frames confirmed sent), bounded by the Poisson p99 for
             // that many frames; past the bound the send is retried.
             let frames = fragments.len();
-            let queued_at = std::time::Instant::now();
-            let row_ledger = |labels: &[&'static str], stranded: usize| {
-                if let Some(m) = self.metrics.get() {
-                    for l in labels {
-                        m.inc_link_shaping(l);
-                    }
-                    m.add_link_shaping(
-                        crate::observability::LINK_SHAPING_BODIES_STRANDED,
-                        stranded as u64,
-                    );
-                }
-            };
             return match shaper.enqueue(fragments) {
                 Ok(ticket) => {
                     let first = ticket + 1 - u64::try_from(frames).unwrap_or(u64::MAX);
                     let budget = shaper.leave_budget(frames);
-                    let deadline = tokio::time::Instant::now() + budget;
-                    loop {
-                        if shaper.ticket_left(ticket) {
-                            if let Some(m) = self.metrics.get() {
-                                m.telemetry
-                                    .shaping_windows
-                                    .note_row_wait(shaper.class(), queued_at.elapsed());
-                            }
-                            break Ok(());
-                        }
-                        if shaper.is_stopped() || !self.node.link_is_established(link_id) {
-                            let stranded = shaper.retract(first, ticket);
-                            row_ledger(
-                                &[crate::observability::LINK_SHAPING_ROW_RETRACTED],
-                                stranded,
-                            );
-                            break Err(ShipError::Other(TransportError::Io(
-                                "the shaped link closed before the row's frames left (retried)"
-                                    .to_owned(),
-                            )));
-                        }
-                        if tokio::time::Instant::now() > deadline {
-                            // The unsent remainder is taken back so the retry
-                            // does not send the row twice.
-                            shaper.retract(first, ticket);
-                            row_ledger(
-                                &[
-                                    crate::observability::LINK_SHAPING_ROW_RETRACTED,
-                                    crate::observability::LINK_SHAPING_ROW_LEFT_TIMEOUT,
-                                ],
-                                0,
-                            );
-                            break Err(ShipError::Other(TransportError::Timeout(budget)));
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    let link_up = || self.node.link_is_established(link_id);
+                    let left = wait_row_left(&shaper, first, ticket, budget, link_up).await;
+                    if let Some(m) = self.metrics.get() {
+                        left.book(m, shaper.class());
+                    }
+                    match left {
+                        RowLeft::Left(_) => Ok(()),
+                        RowLeft::LinkClosed { .. } => Err(ShipError::Other(TransportError::Io(
+                            "the shaped link closed before the row's frames left (retried)"
+                                .to_owned(),
+                        ))),
+                        RowLeft::TimedOut => Err(ShipError::Other(TransportError::Timeout(budget))),
                     }
                 }
                 Err(crate::transport::link_shaping::ShapingError::QueueFull(_)) => {
@@ -20943,6 +20909,9 @@ impl ReticulumTransport {
         let _op = self.lifecycle.lock_op().await;
         if !self.lifecycle.is_suspended() {
             return Ok(());
+        }
+        if let Some(m) = self.metrics.get() {
+            m.telemetry.note_woken();
         }
         self.wake_node().await?;
         let any_client =

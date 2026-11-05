@@ -13060,6 +13060,64 @@ pub(crate) mod tests {
         }
     }
 
+    /// v44 — the refusal's whole life, through the one choke: the silent move
+    /// to terminal, then the admission that says what the row cost and which
+    /// refusal it outlived (`FSD/EVENT_PATH_MODEL.md` M8).
+    #[test]
+    fn a_row_refused_past_the_cap_then_admitted_is_on_the_books() {
+        let (_backend, bridge) = make_bridge(&[]);
+        let m = crate::observability::EdgeMetrics::new();
+        let bridge = bridge.with_metrics(Some(m.clone()));
+        let refused = ApplyOutcome::Refused {
+            reason: "short set".to_owned(),
+            retry: RetryDisposition::Transient,
+            awaits_signer: None,
+            class: Some(ApplyRefusalClass::RetryAfterStanding.as_str()),
+        };
+        for _ in 0..7 {
+            bridge.remember_outcome(EnvelopeKind::Attestation, b"row", &refused);
+        }
+        assert_eq!(m.snapshot().apply_refusals["moved_to_terminal"], 0);
+        bridge.remember_outcome(EnvelopeKind::Attestation, b"row", &refused);
+        assert_eq!(m.snapshot().apply_refusals["moved_to_terminal"], 1);
+        bridge.remember_outcome(EnvelopeKind::Attestation, b"row", &refused);
+        assert_eq!(
+            m.snapshot().apply_refusals["moved_to_terminal"],
+            1,
+            "it moved once"
+        );
+
+        bridge.remember_outcome(EnvelopeKind::Attestation, b"row", &ApplyOutcome::Admitted);
+        let s = m.snapshot();
+        assert_eq!(
+            s.apply_refusals["refused_then_admitted:retry_after_standing"],
+            1
+        );
+        let attempts = &s.refusal_attempts["terminal"];
+        assert_eq!(attempts.count, 1);
+        assert!((attempts.sum_seconds - 9.0).abs() < 1e-9, "nine refusals");
+
+        bridge.remember_outcome(EnvelopeKind::Attestation, b"row", &ApplyOutcome::Duplicate);
+        bridge.remember_outcome(EnvelopeKind::Attestation, b"other", &ApplyOutcome::Admitted);
+        assert_eq!(
+            m.snapshot().apply_refusals["refused_then_admitted:retry_after_standing"],
+            1,
+            "a row with no refusal behind it is not a recovery"
+        );
+    }
+
+    #[test]
+    fn the_bridge_hands_its_decision_rows_to_the_bag() {
+        let (_backend, bridge) = make_bridge(&[]);
+        let m = crate::observability::EdgeMetrics::new();
+        let bridge = bridge.with_metrics(Some(m.clone()));
+        assert_eq!(m.snapshot().decision_row_subscribers, 0);
+        let rx = bridge.subscribe_decision_rows();
+        assert_eq!(m.snapshot().decision_row_subscribers, 1);
+        drop(rx);
+        assert_eq!(m.snapshot().decision_row_subscribers, 0);
+    }
+
     /// persist v55.0.0 — each typed verdict through the apply-door choke
     /// (`refuse`) earns `want`.
     fn assert_v55_dispositions(rows: Vec<(ciris_persist::federation::Error, RetryDisposition)>) {

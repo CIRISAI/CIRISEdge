@@ -586,11 +586,16 @@ async fn proposing_off_never_proposes_and_a_member_behind_t_is_unreachable() {
         other => panic!("a derived address behind T answers no dial: {other:?}"),
     }
     assert_eq!(dl(&p.a.metrics, "direct_link_proposed"), 0);
-    assert!(
-        p.a.metrics.direct_link().is_empty(),
-        "the default touches nothing: {:?}",
+    // v44 — silence here used to read like idle: it says why it is silent, and
+    // nothing else moved.
+    assert_eq!(dl(&p.a.metrics, "direct_link_off:proposing_off"), 1);
+    assert_eq!(
+        p.a.metrics.direct_link().len(),
+        1,
+        "the default touches nothing else: {:?}",
         p.a.metrics.direct_link()
     );
+    assert_eq!(p.a.metrics.snapshot().direct_link_proposing, 0);
     assert_eq!(p.a.transport.direct_path_state(&p.b.key.key_id), None);
 }
 

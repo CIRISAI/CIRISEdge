@@ -4957,7 +4957,6 @@ impl Edge {
         self.background.resume();
         self.suspended
             .store(false, std::sync::atomic::Ordering::Release);
-        self.metrics.telemetry.note_woken();
         Ok(())
     }
 

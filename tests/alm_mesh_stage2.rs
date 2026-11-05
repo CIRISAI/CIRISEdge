@@ -639,6 +639,20 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
         av(&c.metrics, "alm_c3_sent"),
         ca.alm_log().0
     );
+    // v44 — a call says it is there, so a silent ALM is not read as no call,
+    // and it says when its first frame came.
+    let live = c.metrics.snapshot();
+    assert_eq!(live.alm_active_calls, 1);
+    assert!(live.alm_c3_peers >= 1, "C knows A speaks C3");
+    assert_eq!(live.call_setup_duration_seconds["first_frame"].count, 1);
+    drop(cc);
+    let ended = c.metrics.snapshot();
+    assert_eq!(ended.alm_active_calls, 0, "a dropped call ends too");
+    assert_eq!(ended.alm_c3_peers, 0, "and takes its members with it");
+    assert_eq!(
+        ended.call_setup_duration_seconds["ended"].count, 0,
+        "its setup was already over"
+    );
 }
 
 /// **C3 admit / refuse**: A's own stream admits B (C2 over C3); C, a relay

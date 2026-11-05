@@ -70,6 +70,75 @@ pub const MAX_WINDOW_S: u32 = 86_400;
 /// The smallest frame worth shaping (a `CFRG` header and some body).
 pub const MIN_FRAME_BYTES: u16 = 96;
 
+/// How a queued row's wait ended ([`wait_row_left`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLeft {
+    /// Its last body left, after this long.
+    Left(Duration),
+    /// The link closed first, taking these bodies with it. The row retries.
+    LinkClosed {
+        /// Bodies still queued.
+        stranded: usize,
+    },
+    /// Its budget ran out. The unsent remainder was taken back, so the retry
+    /// does not send the row twice.
+    TimedOut,
+}
+
+impl RowLeft {
+    /// Put this ending on the books, on the link's `class`.
+    pub fn book(
+        self,
+        metrics: &crate::observability::EdgeMetrics,
+        class: crate::telemetry::ShapingClass,
+    ) {
+        use crate::observability as o;
+        match self {
+            Self::Left(waited) => metrics
+                .telemetry
+                .shaping_windows
+                .note_row_wait(class, waited),
+            Self::LinkClosed { stranded } => {
+                metrics.inc_link_shaping(o::LINK_SHAPING_ROW_RETRACTED);
+                metrics.add_link_shaping(o::LINK_SHAPING_BODIES_STRANDED, stranded as u64);
+            }
+            Self::TimedOut => {
+                metrics.inc_link_shaping(o::LINK_SHAPING_ROW_RETRACTED);
+                metrics.inc_link_shaping(o::LINK_SHAPING_ROW_LEFT_TIMEOUT);
+            }
+        }
+    }
+}
+
+/// Wait for bodies `first..=ticket` of `shaper` to leave, within `budget`: `Ok`
+/// to the durable dispatcher is its transport ack, so a queued row does not
+/// count until its last fragment left. What did not leave is taken back.
+pub async fn wait_row_left(
+    shaper: &LinkShaper,
+    first: u64,
+    ticket: u64,
+    budget: Duration,
+    link_up: impl Fn() -> bool,
+) -> RowLeft {
+    let began = tokio::time::Instant::now();
+    let deadline = began + budget;
+    loop {
+        if shaper.ticket_left(ticket) {
+            return RowLeft::Left(began.elapsed());
+        }
+        if shaper.is_stopped() || !link_up() {
+            return RowLeft::LinkClosed {
+                stranded: shaper.retract(first, ticket),
+            };
+        }
+        if tokio::time::Instant::now() > deadline {
+            shaper.retract(first, ticket);
+            return RowLeft::TimedOut;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The window W of a telemetry class: what its real-frame ledger is flushed
 /// on, the same W its budget runs over.
 #[must_use]
@@ -3936,6 +4005,142 @@ mod tests {
                 .copied()
                 .unwrap_or(crate::load_ladder::PeerObligation::Ordinary)
         }
+    }
+
+    /// v44 — a roster that reads and one that does not: the age is of the last
+    /// read that WORKED, so a stuck reader shows as age, not as "unchanged".
+    #[derive(Debug)]
+    struct Roster(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl crate::load_ladder::PeerObligations for Arc<Roster> {
+        async fn obligation_of(&self, _peer: &str) -> crate::load_ladder::PeerObligation {
+            crate::load_ladder::PeerObligation::Ordinary
+        }
+        async fn active_seats(&self) -> Option<crate::load_ladder::ActiveSeats> {
+            self.0
+                .load(Ordering::Relaxed)
+                .then(crate::load_ladder::ActiveSeats::default)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_seat_roster_age_is_of_the_last_read_that_worked() {
+        let t = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        let m = crate::observability::EdgeMetrics::new();
+        t.attach_metrics(m.clone());
+        let roster = Arc::new(Roster(std::sync::atomic::AtomicBool::new(false)));
+        t.set_obligations(Arc::new(Arc::clone(&roster)));
+        t.refresh_active_seats().await;
+        assert_eq!(
+            m.snapshot().shaping_seat_roster_age_seconds,
+            -1.0,
+            "a failing read is not a fresh roster"
+        );
+        roster.0.store(true, Ordering::Relaxed);
+        t.refresh_active_seats().await;
+        assert!(m.snapshot().shaping_seat_roster_age_seconds >= 0.0);
+    }
+
+    fn quiet_shaper() -> LinkShaper {
+        let a = Agreement {
+            lambda: 0.1,
+            frame_bytes: 1400,
+            rho: 0.5,
+            window: Duration::from_secs(600),
+        };
+        LinkShaper::new([9u8; 16], a, 16)
+    }
+
+    /// Every ending of a row's wait lands on its own key, and the windowed
+    /// wait is booked only for a row that left.
+    #[tokio::test]
+    async fn each_ending_of_a_rows_wait_is_on_the_books() {
+        use crate::observability::{self as o, EdgeMetrics};
+        use crate::telemetry::ShapingClass as C;
+        let m = EdgeMetrics::new();
+        let budget = Duration::from_millis(120);
+
+        let s = quiet_shaper();
+        let t = s.enqueue(vec![vec![1; 8], vec![2; 8]]).unwrap();
+        let out = wait_row_left(&s, t - 1, t, budget, || true).await;
+        assert_eq!(out, RowLeft::TimedOut, "nothing emits here");
+        assert_eq!(s.queued(), 0, "taken back, so a retry sends it once");
+        out.book(&m, C::Server);
+        let l = m.link_shaping();
+        assert_eq!(l[o::LINK_SHAPING_ROW_LEFT_TIMEOUT], 1);
+        assert_eq!(l[o::LINK_SHAPING_ROW_RETRACTED], 1);
+        assert!(!l.contains_key(o::LINK_SHAPING_BODIES_STRANDED));
+
+        let s = quiet_shaper();
+        let t = s.enqueue(vec![vec![1; 8], vec![2; 8]]).unwrap();
+        let out = wait_row_left(&s, t - 1, t, budget, || false).await;
+        assert_eq!(out, RowLeft::LinkClosed { stranded: 2 });
+        out.book(&m, C::Server);
+        let l = m.link_shaping();
+        assert_eq!(l[o::LINK_SHAPING_ROW_RETRACTED], 2);
+        assert_eq!(l[o::LINK_SHAPING_ROW_LEFT_TIMEOUT], 1, "not a timeout");
+        assert_eq!(l[o::LINK_SHAPING_BODIES_STRANDED], 2);
+
+        let s = quiet_shaper();
+        let t = s.enqueue(vec![vec![1; 8]]).unwrap();
+        s.note_sent(t);
+        let out = wait_row_left(&s, t, t, budget, || true).await;
+        assert!(matches!(out, RowLeft::Left(_)));
+        out.book(&m, C::Home);
+        m.telemetry
+            .shaping_windows
+            .tick(u64::MAX / 2, |_| 3, |_| Duration::ZERO);
+        m.telemetry
+            .shaping_windows
+            .tick(u64::MAX - 1, |_| 3, |_| Duration::ZERO);
+        let s = m.snapshot();
+        assert_eq!(s.shaping_row_wait_seconds["home"].count, 1);
+        assert_eq!(s.shaping_row_wait_seconds["server"].count, 0);
+    }
+
+    /// The edge of going over, once, not every rebalance while over.
+    #[test]
+    fn passing_the_node_cap_is_counted_once_per_crossing() {
+        use crate::observability::{self as o, EdgeMetrics};
+        let t = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        let m = EdgeMetrics::new();
+        t.attach_metrics(m.clone());
+        for i in 0..8u8 {
+            let _ = t.offer_for([i; 16], 1400, None);
+            t.peer_offer([i; 16], &offer(BudgetClass::Server, 1400, 7000, 0.5, 600))
+                .unwrap()
+                .expect("shaped");
+        }
+        assert!(!m.link_shaping().contains_key(o::LINK_SHAPING_OVER_CAP));
+        let mut low = t.policy();
+        low.node_cap_bytes_per_s = 7000;
+        let _ = t.set_policy(low);
+        t.rebalance();
+        t.rebalance();
+        assert_eq!(m.link_shaping()[o::LINK_SHAPING_OVER_CAP], 1);
+    }
+
+    #[test]
+    fn a_link_runs_in_the_lower_class_and_a_seat_only_by_agreement() {
+        use crate::telemetry::ShapingClass as C;
+        use BudgetClass as B;
+        assert_eq!(B::Server.link_class(B::Home, false), C::Home);
+        assert_eq!(
+            B::PhoneCellular.link_class(B::Server, false),
+            C::PhoneCellular
+        );
+        assert_eq!(B::Seat.link_class(B::Server, false), C::Server);
+        assert_eq!(B::Seat.link_class(B::Server, true), C::Seat);
+        let t = LinkShapers::new(ShapingPolicy::for_class(B::Server));
+        let _ = t.offer_for([1u8; 16], 1400, None);
+        let s = t
+            .peer_offer([1u8; 16], &offer(B::Home, 1400, 2800, 0.5, 600))
+            .unwrap()
+            .expect("shaped");
+        assert_eq!(s.class(), C::Home);
+        assert_eq!(t.links_of(C::Home), 1);
+        assert_eq!(t.links_of(C::Server), 0);
     }
 
     fn shedding(class: BudgetClass) -> (LinkShapers, Arc<Owed>) {

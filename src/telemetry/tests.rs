@@ -405,3 +405,21 @@ fn a_gauge_falls_too() {
     w.fell("seal_awaiting_links");
     w.fell("seal_awaiting_bytes");
 }
+
+/// The server enforces exposure from this page's list, so it may not drift.
+#[test]
+fn the_operators_page_lists_every_field_as_the_catalogue_does() {
+    let page = include_str!("../../docs/TELEMETRY_CATALOGUE.md");
+    for s in TELEMETRY_CATALOGUE {
+        let exposure = match s.exposure {
+            Exposure::PublicSafe => "public-safe",
+            Exposure::OperatorOnly => "operator-only",
+        };
+        let row = format!("| `{}` | `{}` |", s.field, s.name);
+        let line = page
+            .lines()
+            .find(|l| l.starts_with(&row))
+            .unwrap_or_else(|| panic!("{} is not on the page", s.field));
+        assert!(line.ends_with(&format!("| {exposure} |")), "{line}");
+    }
+}

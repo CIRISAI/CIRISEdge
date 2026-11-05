@@ -2087,6 +2087,14 @@ async fn frames_during_keying_are_neither_lost_nor_reordered_947() {
     for f in rest {
         t.b.transport.send(&t.a.key.key_id, f).await.expect("send");
     }
+    // v44 — the hold shows on the gauge while it is held, against its bound.
+    assert!(
+        wait_until(Duration::from_millis(1800), || async {
+            t.a.metrics.snapshot().seal_held_bytes > 0
+        })
+        .await,
+        "the node tick sees the frames held on the keying"
+    );
     assert!(
         wait_until(Duration::from_secs(30), || async {
             let seen = t.a.seen.lock().await;
@@ -2098,6 +2106,13 @@ async fn frames_during_keying_are_neither_lost_nor_reordered_947() {
         .await,
         "every frame landed: {:?}",
         t.a.metrics.link_seal()
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            t.a.metrics.snapshot().seal_held_bytes == 0
+        })
+        .await,
+        "and falls when the keying lets go"
     );
     let order: Vec<u8> = {
         let seen = t.a.seen.lock().await;
@@ -2188,6 +2203,37 @@ async fn a_stranger_flood_leaves_traffic_moving_and_first_contact_working_947() 
     let ran = t.a.transport.decapsulations_for_test() - before;
     let forged = sent.load(Relaxed);
     let refused = t.a.seal("link_seal_refused_handshake_node_rate");
+    // v44 — what the flood did to the event loop, by event: `--nocapture`.
+    let bundle = t.a.metrics.snapshot();
+    let mut held: Vec<_> = bundle.event_handler_duration_seconds.iter().collect();
+    held.sort_by(|a, b| b.1.sum_seconds.total_cmp(&a.1.sum_seconds));
+    for (event, h) in held.iter().filter(|(_, h)| h.count > 0) {
+        println!(
+            "[947 flood] {event}: n={} sum={:.3}s buckets={:?}",
+            h.count,
+            h.sum_seconds,
+            h.buckets()
+        );
+    }
+    println!(
+        "[947 flood] keying {:?}, control queued {}, dropped {:?}",
+        bundle
+            .seal_keying_duration_seconds
+            .iter()
+            .map(|(k, h)| (k.clone(), h.count, h.sum_seconds))
+            .collect::<Vec<_>>(),
+        bundle.leviculum_events_queued["control"],
+        bundle.leviculum_events_dropped
+    );
+    assert!(
+        bundle
+            .event_handler_duration_seconds
+            .values()
+            .map(|h| h.count)
+            .sum::<u64>()
+            > 0,
+        "the loop was timed through the flood"
+    );
     assert!(
         ran < forged,
         "{ran} decapsulations for {forged} forged handshakes"
@@ -2308,6 +2354,15 @@ async fn the_awaiting_cap_refuses_the_oldest_by_name_and_keeps_new_links_working
         links.push(f.open(FloodIdentity::Fresh).await.expect("a link"));
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    // v44 — half-open links show on the gauge, up to the cap.
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            t.a.metrics.snapshot().seal_awaiting_links == 2
+        })
+        .await,
+        "{:?}",
+        t.a.metrics.snapshot().seal_awaiting_links
+    );
     assert!(
         wait_until(Duration::from_secs(10), || async {
             t.a.seal("link_seal_refused_awaiting_cap") == 1
