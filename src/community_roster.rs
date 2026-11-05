@@ -40,14 +40,16 @@
 //! `effective_at` (`founder_only`, `unanimous`, `majority`, `quorum:M/N`,
 //! `reverse_quorum`, `weighted:*`/`custom:*` from the `policy_blob`; only
 //! founders count in `infrastructure` rooms), or is a member removing
-//! themself, or a moderator whose appointment was live at that instant.
+//! themself, or, for a widening, a moderator whose appointment was live at
+//! that instant. A moderator removes nobody (persist v61.0.3, CIRISPersist#1200):
+//! a removal meets the protocol. The fold keeps the ones already admitted.
 //! Rows may carry `cosignatures` (each hybrid-verified over the same
 //! envelope) to reach a threshold. A change that leaves the group with no
 //! founder is never admitted; no ending is retroactive. The refusal is
 //! `RosterAuthorityUnauthorized { rule }` — edge classifies it terminal except
 //! `roster_authority_not_established` (retry after the roster) and
-//! `roster_consensus_insufficient` (a moderator's `delegates_to` may still be
-//! replicating). `witness_set` is stored, not counted. Whether `authority`
+//! `roster_consensus_insufficient` (a moderator's widening may have outrun its
+//! `delegates_to`). `witness_set` is stored, not counted. Whether `authority`
 //! SHOULD change this roster is therefore no longer only the caller's policy:
 //! the door enforces the room's own protocol.
 //!

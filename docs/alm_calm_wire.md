@@ -1,7 +1,7 @@
 # CALM — the ALM control frame (C3) — wire layout
 
 Source for the CC rc16 draft (CC 5.3.3.2.3 / 6.1.6, with `FSD/CIRIS_MESH.md`
-§4). Everything here is read from the code on branch `feat/alm-stage2`;
+§4). Everything here is read from the code on branch `feat/onion-v44`;
 `file:line` points at it. Paths are under `src/`. Integers are big-endian.
 There is no CBOR and no JSON: every frame is a fixed concatenation.
 
@@ -18,11 +18,11 @@ synchronous. The call layer that sends and applies frames is
 - **Inside the E1 link seal** (CC 5.3.3.5), like every frame on the link. It
   takes **no A/V outer seal and no hop counter**, like a binding part
   (`docs/av_chunk_auth_wire.md` §1.4). A receiver's pending hop gap is carried
-  past a CALM frame unchanged (`av_call.rs:2521`).
+  past a CALM frame unchanged (`av_call.rs:2540`).
 - **In either direction of a link.** Each member pair normally holds two links,
   one dialled by each end. A member sends on the leg it dialled when it has
   one. Otherwise it sends on the reverse direction of the link the peer dialled
-  to it (`send_alm`, `av_call.rs:2324`).
+  to it (`send_alm`, `av_call.rs:2343`).
 
 ## 2. Framing
 
@@ -41,7 +41,7 @@ A frame is a CALM frame iff it is at least 6 bytes long and starts
 
 **Telling a frame from a chunk.** A chunk's first 32 bytes are its stream id. A
 publisher never mints a stream id that begins `"CALM" 0x01`: `start_stream`
-draws the join nonce again (`av_call.rs:1834`; `collides_with_control_frame`,
+draws the join nonce again (`av_call.rs:1853`; `collides_with_control_frame`,
 `wire.rs:76`). It already redraws for `"CSKB" 0x01`.
 
 **Version.** A frame with an unknown version is not a CALM frame. It falls
@@ -89,7 +89,8 @@ Field rules (enforced at decode):
   over-committed, 1 upstream lost, 2 preempted, 3 load shed. Unknown codes are
   malformed.
 - **OFFER**:
-  - `depth`: 0 is the publisher itself.
+  - `depth`: 0 is the publisher itself, and only the publisher may claim it
+    (§4 rule 5).
   - `forwarding`: `0x01` means the sender is receiving the stream now; any
     other value reads as false.
   - Both headroom fields are in the selector's nominal units: the forwarder
@@ -112,27 +113,27 @@ Field rules (enforced at decode):
    subscribe, unsubscribe or offer in another's name.
 2. **CAPS first, from the responder, on the reverse direction.** The responder
    of each A/V link sends `CAPS` on the reverse direction of the link it
-   accepted, right after the stream hello (`av_call.rs:2244`). It is the first
+   accepted, right after the stream hello (`av_call.rs:2270`). It is the first
    CALM frame on that link.
    - A pre-C3 dialler never reads that direction: it dropped its receiver, and
      the transport counts and drops the frame (`AvDelivery::ConsumerGone`). It
      is harmless there.
    - A C3 dialler answers with its own `CAPS` on its leg, once, only after
-     hearing one (`handle_c3`, `av_call.rs:2414`; `out_leg_reader`,
-     `:2470`).
+     hearing one (`handle_c3`, `av_call.rs:2433`; `out_leg_reader`,
+     `:2489`).
    - **No other kind is sent to a peer that has not sent `CAPS` with bit 0**
-     (`send_alm` filters on `speaks_c3`, `av_call.rs:2324`;
-     `av_call/alm.rs:262`). A pre-C3 peer would read a CALM frame as a chunk
+     (`send_alm` filters on `speaks_c3`, `av_call.rs:2343`;
+     `av_call/alm.rs:269`). A pre-C3 peer would read a CALM frame as a chunk
      that fails to open.
    - **Pre-C3 peers are served as before:** the full stream, plus the legacy
      first-hand relay when this node relays (`own_exclude`,
-     `av_call/alm.rs:437`).
+     `av_call/alm.rs:478`).
 3. **Membership gates media parents, in both directions** (CC 5.4.6 forwarder
    paragraph, E1 item 1, CC 6.1.6: tree nodes are members). The roster is the
    room's MLS group, updated at every epoch roll.
    - **Subscriber side.** A candidate outside the roster is never a primary or
-     a standby (`selector.rs:673`; `set_members`, `:255`). An `OFFER` from a
-     non-member is ignored (`av_call/alm.rs:717`). A parent that leaves the
+     a standby (`selector.rs:698`; `set_members`, `:271`). An `OFFER` from a
+     non-member is ignored (`av_call/alm.rs:763`). A parent that leaves the
      roster is dropped.
    - **Forwarder side.** `SUBSCRIBE` is refused `relay_nonmember_fanout` when
      the requester, or this forwarder itself, is outside the roster
@@ -148,7 +149,7 @@ Field rules (enforced at decode):
    get the full stream, standbys base-layer and codec-opaque chunks only. It
    forwards only chunks that arrive from its own primary (or promoting) parent,
    once each, and never back to their sender or publisher (`forward_exclude`,
-   `av_call/alm.rs:467`). This replaces the `CallOptions::relay` flood.
+   `av_call/alm.rs:508`). This replaces the `CallOptions::relay` flood.
    - **Direct first (FSD R1).** A viable publisher (depth 0) is taken before
      any relay, whatever the relays score, and a relay gives way to a publisher
      that becomes viable. A publisher with no room stops being viable, which is
@@ -156,6 +157,28 @@ Field rules (enforced at decode):
    - **One exception: the join gap.** A publisher keeps sending its own stream
      to a C3 member that has not yet chosen a parent, for at most 10 s
      (`PROVISIONAL_MS`). The member's `SUBSCRIBE` or `UNSUBSCRIBE` ends it.
+
+5. **Depth 0 is the stream's publisher, and the binding says who that is.**
+   An `OFFER` is attributed by the link (rule 1) but not signed, so a claim of
+   depth 0 is checked on receipt against the publisher named by the stream's
+   verified key binding (`docs/av_chunk_auth_wire.md`; a stream id is derived
+   from its publisher, so a member cannot bind another's). This is a receive
+   rule with no change to the frame.
+   - A claim from anyone else is **dropped whole**: it does not name the
+     publisher, does not reach the selector and is not scored as direct.
+     Nothing honest sends one. It is not clamped to a relay's depth, because
+     that would keep a liar as a candidate with a made-up depth and an empty
+     ancestry, which blinds the loop check.
+   - With no binding held yet the claim cannot be checked, so it is dropped
+     too. Chunks cannot be verified without the binding either, and the
+     publisher offers again within `OFFER_EVERY_MS` (1 s).
+   - Each drop is counted (`alm_offer_refused`, with
+     `alm_offer_refused:not_publisher` or `alm_offer_refused:unbound`;
+     `AlmCounts::offers_refused`) and recorded in the C7 decision log
+     (`DecisionKind::OfferRefused`). `unbound` is normal at a join.
+   - The stream hello is unsigned too. It only supplies a first guess at the
+     publisher, which a binding overrides and which never overrides a binding
+     (`note_publisher`, `av_call/alm.rs`).
 
 ## 5. Refusal and shed tokens
 
@@ -184,7 +207,7 @@ closes the link**: the E1 seal already authenticated its sender.
 
 ## 6. Acceptance and validation order
 
-**Receiving (pump, `av_call.rs:2521`)**, per frame on an A/V link:
+**Receiving (pump, `av_call.rs:2540`)**, per frame on an A/V link:
 
 1. The E1 link seal opens it, or the transport closes the link (CC 5.3.3.5).
 2. The hop gap reported with the frame is folded in and stays pending.
@@ -197,7 +220,7 @@ closes the link**: the E1 seal already authenticated its sender.
    4. no trailing bytes.
 
    Any failure is §5's decode refusal.
-4. A decoded frame is applied (`on_control`, `av_call/alm.rs:625`):
+4. A decoded frame is applied (`on_control`, `av_call/alm.rs:672`):
    - **`CAPS`** records the peer's bits. On the first `CAPS` from a member with
      bit 0, that member enters the join gap; with bit 1, its media is sent
      timed from then on.
@@ -227,11 +250,12 @@ closes the link**: the E1 seal already authenticated its sender.
      draining, and is unsubscribed once a replacement primary is up.
    - **`OFFER`**:
      - ignored from a non-member, or about this node's own stream;
-     - a depth-0 offer names the stream's publisher;
+     - a claim of depth 0 from anyone but the publisher the binding names is
+       dropped, logged and counted (§4 rule 5);
      - otherwise it feeds the selector. An offer older than 5 s is not a
-       candidate.
+       candidate. It never names the publisher: the binding does.
 
-**Sending.** `send_alm` (`av_call.rs:2324`) sends nothing to a peer without
+**Sending.** `send_alm` (`av_call.rs:2343`) sends nothing to a peer without
 `CAPS` bit 0. It sends on this node's own leg to the peer (five brief
 backpressure retries), or, without a leg, on the reverse direction of the
 peer's link to this node. A frame on a leg settles that leg for 50 ms
@@ -241,10 +265,10 @@ so without it the chunk right behind an `OFFER` is refused and lost.
 **Delivery.** `OFFER` is periodic: one the link refuses is dropped, and the
 next replaces it. **Every other kind must arrive**, because it changes state on
 one side only (`is_periodic`, `wire.rs:89`). One the link refuses is resent off
-the data path for up to 2 s (`resend_c3`, `av_call.rs:2378`), inside the 3 s request
+the data path for up to 2 s (`resend_c3`, `av_call.rs:2397`), inside the 3 s request
 timeout.
 
-**Binding bursts are paced** (`send_binding_paced`, `av_call.rs:2715`): a
+**Binding bursts are paced** (`send_binding_paced`, `av_call.rs:2737`): a
 re-announced binding (about ten Channel messages on a base-MTU link) goes out
 one part per hold of the publisher lock, so publishing and forwarding run
 between its parts; a relay re-forwards it off its receive loop. **Unproven:**
@@ -256,7 +280,7 @@ what lost frame 12.
 **A lost answer never strands a commitment.** A `SUBSCRIBE` unanswered after
 `REQUEST_TIMEOUT_MS` (3 s) is withdrawn with `UNSUBSCRIBE`, or, when it was a
 standby asking for the primary role, with `SUBSCRIBE` standby
-(`selector.rs:956`, in `tick`). Without this a lost `ADMIT` leaves the forwarder
+(`selector.rs:980`, in `tick`). Without this a lost `ADMIT` leaves the forwarder
 committed to a subscriber that does not know it, and its offers then show that
 subscriber no room, so it never asks again.
 

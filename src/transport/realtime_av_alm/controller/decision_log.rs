@@ -41,6 +41,8 @@ pub enum DecisionKind {
     Ceiling,
     /// Advertised capacity exceeds measured by more than the over-claim ratio.
     OverClaim,
+    /// An offer was dropped before it reached the selector.
+    OfferRefused,
 }
 
 impl DecisionKind {

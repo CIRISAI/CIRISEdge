@@ -986,6 +986,16 @@ pub const ALM_C3_RECEIVED: &str = "alm_c3_received";
 pub const ALM_C3_MALFORMED: &str = "alm_c3_malformed";
 /// ALM C3 — a peer said it speaks C3 (its `CAPS`).
 pub const ALM_C3_PEER_CAPABLE: &str = "alm_c3_peer_capable";
+/// ALM C3 — an `OFFER` claiming depth 0 was dropped: only a stream's
+/// publisher holds depth 0, and only its binding names that publisher.
+pub const ALM_OFFER_REFUSED: &str = "alm_offer_refused";
+/// [`ALM_OFFER_REFUSED`]: the binding names another member. Nothing honest
+/// sends this.
+pub const ALM_OFFER_REFUSED_NOT_PUBLISHER: &str = "alm_offer_refused:not_publisher";
+/// [`ALM_OFFER_REFUSED`]: no binding is held for the stream yet. Normal for
+/// the publisher's own first offers at a join: the next one, a second later,
+/// is checked again.
+pub const ALM_OFFER_REFUSED_UNBOUND: &str = "alm_offer_refused:unbound";
 /// ALM C2 — a subscribe admitted / refused at this node.
 pub const ALM_ADMIT: &str = "alm_admit";
 /// ALM C2 — a subscribe refused at this node (the token is counted too).

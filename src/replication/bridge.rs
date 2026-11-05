@@ -231,14 +231,17 @@ pub enum ApplyRefusalClass {
     RosterAuthorityUnauthorized,
     /// persist's `roster_consensus_insufficient`: the voices do not meet the
     /// group's protocol **as this node holds it**. Transient, because this is
-    /// also how a seated moderator's solo roster change reads while its
+    /// also how a seated moderator's solo WIDENING reads while its
     /// `delegates_to` is still replicating: the door falls through to the
-    /// protocol and the rule is the same one a short set gets. The rule cannot
-    /// tell the two apart and neither can edge, so a short set takes the
-    /// transient schedule too, which ends on the terminal one
-    /// ([`TRANSIENT_CAP_HITS_BEFORE_TERMINAL`](super::refusal_backoff::TRANSIENT_CAP_HITS_BEFORE_TERMINAL)).
-    /// Since persist v61.0.2 (#1195) a moderator is an appointment at every
-    /// protocol, so the appointment arriving late is the ordinary case.
+    /// protocol and the rule is the same one a short set gets. Since persist
+    /// v61.0.3 (#1200) a moderator's removal is never that case, but the
+    /// refusal does not say which it was, so edge cannot tell them apart. A
+    /// short set and a moderator's removal take the transient schedule too,
+    /// which ends on the terminal one
+    /// ([`TRANSIENT_CAP_HITS_BEFORE_TERMINAL`](super::refusal_backoff::TRANSIENT_CAP_HITS_BEFORE_TERMINAL)):
+    /// a verdict that never moves is re-asked at most every six hours. Since
+    /// persist v61.0.2 (#1195) a moderator is an appointment at every protocol,
+    /// so the appointment arriving late is the ordinary case.
     RetryAfterStanding,
     /// persist#757 (AV-45) — a `community`-scoped row whose writer is NOT in
     /// the roster this node holds. Until persist v47.0.0 this and "roster not
@@ -13539,6 +13542,34 @@ pub(crate) mod tests {
     /// persist v61 S2 (#1148) — the key-grant door's `not_in_audience` (typed
     /// on `KeyGrantRefused::attestation_reason` since persist v61.0.1, #1184) is
     /// recognised and parked like the general door's.
+    /// A permanent `roster_consensus_insufficient` (a short set, or a
+    /// moderator's removal offered by an older node) does not stay on the
+    /// transient ladder: nothing parks it, so the #858 cap moves it to the
+    /// terminal schedule. The class stays transient only for a widening that
+    /// outran its appointment. Mutation: drop the cap → this fails.
+    #[test]
+    fn a_standing_refusal_that_never_moves_ends_on_the_terminal_schedule() {
+        use crate::replication::refusal_backoff::{RefusalBackoff, TERMINAL_BASE};
+        let class = ApplyRefusalClass::classify(
+            &ciris_persist::federation::Error::RosterAuthorityUnauthorized {
+                group_key_id: "room".to_owned(),
+                offered_authority_key_id: "mo".to_owned(),
+                rule: ciris_persist::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+            },
+        )
+        .expect("a typed refusal");
+        assert_eq!(class, ApplyRefusalClass::RetryAfterStanding);
+        assert!(class.is_transient());
+        let backoff = RefusalBackoff::new();
+        let mut now = Instant::now();
+        let mut window = Duration::ZERO;
+        for _ in 0..16 {
+            window = backoff.record_at(EnvelopeKind::Attestation, [7u8; 32], class.retry(), now);
+            now += window;
+        }
+        assert!(window >= TERMINAL_BASE, "still transient: {window:?}");
+    }
+
     #[test]
     fn the_key_grant_doors_not_in_audience_is_recognised_1148() {
         let outcome = ApplyOutcome::refused_terminal(format!(

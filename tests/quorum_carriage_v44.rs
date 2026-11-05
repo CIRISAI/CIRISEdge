@@ -28,7 +28,9 @@
 //!    with it.
 //! 6. **A `unanimous` removal is every other member**; at two nobody is
 //!    removable and resignation is the exit.
-//! 7. **A moderator's removal that outran its appointment lands with it.**
+//! 7. **A moderator removes nobody** (persist v61.0.3): the door refuses it
+//!    alone, a removal under the protocol carries, and a moderator's widening
+//!    that outran its appointment lands with it.
 //! 8. **Rule 0:** one signer never withdraws a cosigned row.
 
 #![cfg(feature = "transport-reticulum")]
@@ -953,7 +955,6 @@ async fn a_duty_is_an_appointment_at_every_protocol_on_every_node() {
 /// `community_id` alone. So content in a room binds no community, and the
 /// room's own founder holds no takedown over it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails on persist v61.0.2: content_binding reads `community_id` only"]
 async fn a_founder_can_take_down_what_a_chat_row_binds_into_the_room() {
     let r = Box::pin(duty_room(consensus_protocol::MAJORITY)).await;
     let [na, ..] = &r.nodes;
@@ -1083,38 +1084,114 @@ async fn a_unanimous_removal_is_every_other_member_and_at_two_nobody_is_removabl
     );
 }
 
-/// **7. A seated moderator's removal waits for its appointment.** The founder
-/// appoints mo and mo removes dave alone on the founder's node. On a node that
-/// has not held the appointment yet the row reads as a short set: the refusal
-/// must be transient, or a good removal sits out the terminal schedule while
-/// the roster reads differently on two nodes.
+/// **7. A moderator removes nobody** (persist v61.0.3, CIRISPersist#1200; CC
+/// 4.5.13). The founder appoints mo, and mo's removal of dave alone is refused
+/// at the door, on the node that holds the appointment and on one that does not.
+/// The same removal under the room's protocol is admitted, carries, and folds to
+/// one roster on both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_moderators_removal_that_outran_its_appointment_lands_with_it() {
+async fn a_moderators_solo_removal_is_refused_and_the_protocols_removal_folds() {
     use ciris_persist::federation::admission::DELEGATION_SCOPE_MODERATE;
     let r = Box::pin(duty_room(consensus_protocol::MAJORITY)).await;
     let [na, nb, _] = &r.nodes;
     let room = r.room.as_str();
     let edge = appoint(&r.alice, &r.mo, DELEGATION_SCOPE_MODERATE).await;
     assert!(apply(na, &edge, &r.alice).await.is_admitted());
+    let dave = &r.dave.person.key_id;
     let removal = RosterEvent::revocation(
         room,
-        &r.dave.person.key_id,
+        dave,
         chrono::Utc::now(),
         Some("by the moderator"),
         &[],
     );
-    assert!(assemble(
-        &*na.dir,
+    for n in [na, nb] {
+        let err = assemble(
+            &*n.dir,
+            &removal,
+            vec![cosign(&removal, &r.mo.person).await.expect("sign")],
+        )
+        .await
+        .expect_err("a moderator's standing removes nobody");
+        assert!(
+            err.contains(ciris_persist::federation::ROSTER_CONSENSUS_INSUFFICIENT),
+            "{err}"
+        );
+        assert!(active(&n.dir, room).await.contains(dave), "dave stands");
+    }
+
+    let voices = cosign_all(
         &removal,
-        vec![cosign(&removal, &r.mo.person).await.expect("sign")],
+        &[
+            &r.alice.person,
+            &r.bob.person,
+            &r.carol.person,
+            &r.mo.person,
+        ],
     )
     .await
-    .expect("a named moderator has standing alone"));
+    .expect("sign");
+    assert!(assemble(&*na.dir, &removal, voices)
+        .await
+        .expect("a majority removes, the moderator one voice among them"));
+    let outcomes = carry_room(&na.bridge, &nb.bridge, room).await;
+    assert!(!active(&nb.dir, room).await.contains(dave), "{outcomes:?}");
+    assert_eq!(active(&nb.dir, room).await, active(&na.dir, room).await);
+}
+
+/// **A moderator's widening waits for its appointment.** A moderator's standing
+/// still reaches a widening, so on a node that has not held the appointment yet
+/// the row reads as a short set: the refusal must be transient, or a good row
+/// sits out the terminal schedule while the roster reads differently on two
+/// nodes. This is the case that keeps `roster_consensus_insufficient` transient.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_moderators_widening_that_outran_its_appointment_lands_with_it() {
+    use ciris_persist::federation::admission::DELEGATION_SCOPE_MODERATE;
+    let r = Box::pin(duty_room(consensus_protocol::MAJORITY)).await;
+    let [na, nb, _] = &r.nodes;
+    let room = r.room.as_str();
+    let dave = &r.dave.person.key_id;
+
+    // Dave leaves under the protocol, on every node, so mo has a seat to fill.
+    let out = RosterEvent::revocation(room, dave, chrono::Utc::now(), None, &[]);
+    let voices = cosign_all(
+        &out,
+        &[
+            &r.alice.person,
+            &r.bob.person,
+            &r.carol.person,
+            &r.tess.person,
+        ],
+    )
+    .await
+    .expect("sign");
+    assert!(assemble(&*na.dir, &out, voices).await.expect("a majority"));
+    carry_room(&na.bridge, &nb.bridge, room).await;
+    assert!(!active(&nb.dir, room).await.contains(dave));
+
+    // The appointment is held on the founder's node only.
+    let edge = appoint(&r.alice, &r.mo, DELEGATION_SCOPE_MODERATE).await;
+    assert!(apply(na, &edge, &r.alice).await.is_admitted());
+    consent(&na.dir, room, &r.alice, &r.dave).await;
+    assert!(ciris_edge::community_roster::widen_community(
+        &*na.dir,
+        room,
+        dave,
+        None,
+        chrono::Utc::now(),
+        &[&r.mo.person],
+    )
+    .await
+    .expect("a named moderator seats a member alone"));
+    assert!(active(&na.dir, room).await.contains(dave));
+
     let rows = served(&na.bridge, |row| {
-        dimension(row).starts_with("membership:removal:")
+        dimension(row).starts_with("membership:widening:")
+            && row.attestation_envelope.to_string().contains(dave)
+            && row.attesting_key_id == r.mo.person.key_id
     })
     .await;
-    let (_, bytes) = rows.first().expect("the removal is served");
+    let (_, bytes) = rows.first().expect("the widening is served");
     let early = nb
         .bridge
         .apply_envelope_bytes(EnvelopeKind::Attestation, bytes, Some(&r.mo.node.key_id))
@@ -1127,13 +1204,11 @@ async fn a_moderators_removal_that_outran_its_appointment_lands_with_it() {
         RetryDisposition::Transient,
         "{early:?}"
     );
-    assert!(active(&nb.dir, room).await.contains(&r.dave.person.key_id));
+    assert!(!active(&nb.dir, room).await.contains(dave));
+
     assert!(apply(nb, &edge, &r.alice).await.is_admitted());
-    let landed = nb
-        .bridge
-        .apply_envelope_bytes(EnvelopeKind::Attestation, bytes, Some(&r.mo.node.key_id))
-        .await;
-    assert!(landed.is_admitted(), "{landed:?}");
+    let outcomes = carry_room(&na.bridge, &nb.bridge, room).await;
+    assert!(active(&nb.dir, room).await.contains(dave), "{outcomes:?}");
     assert_eq!(active(&nb.dir, room).await, active(&na.dir, room).await);
 }
 

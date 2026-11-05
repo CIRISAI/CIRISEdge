@@ -9189,7 +9189,7 @@ impl ReticulumTransport {
                 action = "retired_direct",
                 "link Channel landed nothing for {zero_sends} sends in a row: the punched path \
                  stopped carrying the peer's acks, moved the link back onto its relayed path \
-                 (CIRISEdge#926, leviculum#89)"
+                 (tracked: CIRISEdge#926, leviculum#89)"
             );
             return;
         }
@@ -9203,7 +9203,7 @@ impl ReticulumTransport {
             stalled_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX),
             action = "closed",
             "link Channel landed nothing for {zero_sends} sends in a row: the peer acknowledges \
-             nothing on it, closed it and the next send re-dials (CIRISEdge#926)"
+             nothing on it, closed it and the next send re-dials (tracked: CIRISEdge#926)"
         );
         if let Err(e) = self
             .link_teardown_as(link_id, LinkCloseCause::LocalTeardown)
@@ -16208,7 +16208,7 @@ async fn handle_onion_frame(ctx: &EventCtx<'_>, link_id: LinkId, data: &[u8]) {
             drop_inbound(
                 Some(link_id),
                 tokens::EXIT_PENDING_PERSIST,
-                "a rendezvous mailbox deposit; persist has no mailbox door yet (CIRISPersist#1149)",
+                "a rendezvous mailbox deposit; persist has no mailbox door yet (tracked: CIRISPersist#1149)",
             );
         }
     }

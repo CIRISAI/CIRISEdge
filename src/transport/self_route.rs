@@ -180,7 +180,7 @@ impl SelfSignedRouteProducer {
                  at a transit key (it is reached through its node's binding). persist v61 \
                  REFUSES the route (transport_destination_agent_key), so this node publishes \
                  NO route and peers cannot attribute its frames. Run the transport under the \
-                 node key (use_node_identity) (history: CIRISEdge#888, CIRISPersist#1122)"
+                 node key (use_node_identity) (history: CIRISEdge#888, tracked: CIRISPersist#1122)"
             );
         }
     }
