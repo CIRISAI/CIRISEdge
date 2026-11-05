@@ -710,7 +710,16 @@ async fn c3_admits_and_a_closed_relay_refuses_by_name() {
         cc.alm_relay_children(ca.stream()).is_empty(),
         "a closed relay admits nobody"
     );
-    assert!(av(&c.metrics, "load_refuse:admit_closed") > 0);
+    // The count moves as the frame lands; the label reaches the metrics on
+    // C's next watch tick.
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            av(&c.metrics, "load_refuse:admit_closed") > 0
+        })
+        .await,
+        "the refusal is counted under its token: {:?}",
+        c.metrics.av_plane()
+    );
     eprintln!(
         "[ALM2] c3: A admitted {:?}; C refused {:?}",
         ca.alm_own_children(),
