@@ -385,7 +385,7 @@ async fn topo(
     let known = wait_until(Duration::from_secs(120), || async {
         for a in &nodes {
             for b in &nodes {
-                if a.key.key_id != b.key.key_id && !a.transport.knows_peer(&b.key.key_id).await {
+                if a.key.key_id != b.key.key_id && !a.transport.seek_peer(&b.key.key_id).await {
                     return false;
                 }
             }
