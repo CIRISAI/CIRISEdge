@@ -625,16 +625,16 @@ async fn a_failed_reply_is_retried_by_the_next_round_943() {
         loop {
             let frames = std::mem::take(&mut *r.seam.wire.lock().unwrap());
             for frame in frames {
-                let framed = wire_frame::try_unwrap_framed(&frame)
+                let reply = wire_frame::try_unwrap_framed(&frame)
                     .expect("well-formed")
                     .expect("CRPL");
-                let meta = framed.meta.expect("a reply to a v3 round is v3");
+                let meta = reply.meta.expect("a reply to a v3 round is v3");
                 assert_eq!(
                     meta.round, round,
                     "the dead round has no reply left in flight"
                 );
                 i.coord
-                    .deliver_reply(framed.msg, meta.round)
+                    .deliver_reply(reply.msg, meta.round)
                     .expect("the live round takes its reply");
                 let msg = i.coord.recv_inbound().await.expect("the round is open");
                 match i.coord.drive_round_step(Some(msg)).await.expect("a step") {
