@@ -14324,8 +14324,8 @@ pub(crate) mod tests {
         // (a) IDLE — nothing offered: both accepted-apply counters empty.
         let idle = metrics.snapshot();
         assert!(
-            idle.replication_applied_total.is_empty()
-                && idle.replication_duplicate_total.is_empty(),
+            idle.replication_applied_total.values().all(|n| *n == 0)
+                && idle.replication_duplicate_total.values().all(|n| *n == 0),
             "an idle node books no accepted applies"
         );
         // (b) Apply a FRESH (never-seeded) Key row → Admitted → applied_total.
@@ -14347,7 +14347,7 @@ pub(crate) mod tests {
         // The applied axis is distinct from the duplicate axis — an admit
         // books ONLY applied, never both (the #433 distinct-states rule).
         assert!(
-            snap.replication_duplicate_total.is_empty(),
+            snap.replication_duplicate_total.values().all(|n| *n == 0),
             "an Admitted apply books applied_total, not duplicate_total"
         );
     }
@@ -24658,7 +24658,7 @@ pub(crate) mod tests {
             snap.apply_refusals_by_kind
                 .get(&EnvelopeKind::Attestation)
                 .copied(),
-            None,
+            Some(0),
             "nothing was refused: {:?}",
             snap.apply_refusals_by_kind,
         );
