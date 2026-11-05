@@ -625,6 +625,11 @@ impl AlmState {
         let Some(sel) = self.sels.get_mut(&stream) else {
             return;
         };
+        let role = sel
+            .subscriptions()
+            .into_iter()
+            .find(|(p, _)| p == from)
+            .map(|(_, r)| r);
         let chunk = PathChunk {
             pos: ChunkPos { epoch, seq },
             full: !base_or_audio,
@@ -1677,11 +1682,11 @@ mod tests {
     #[test]
     fn a_newer_epoch_is_one_resync_per_stream() {
         let mut a = AlmState::new("a", s(0), &roster(), false, 1);
-        a.on_chunk(s(1), "b", 1, 5, 100, 0, true);
+        a.on_chunk(s(1), "b", 1, 5, 100, 0, true, 0);
         assert!(a.labels.is_empty(), "the first epoch seen is no resync");
-        a.on_chunk(s(1), "c", 2, 0, 100, 0, true);
-        a.on_chunk(s(1), "b", 2, 0, 100, 0, true);
-        a.on_chunk(s(1), "b", 1, 6, 100, 0, true);
+        a.on_chunk(s(1), "c", 2, 0, 100, 0, true, 0);
+        a.on_chunk(s(1), "b", 2, 0, 100, 0, true, 0);
+        a.on_chunk(s(1), "b", 1, 6, 100, 0, true, 0);
         let n = a
             .labels
             .iter()
