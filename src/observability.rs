@@ -1494,6 +1494,316 @@ pub const RESPONDER_LINK_UP_TRACKED_MAX: usize = 4096;
 /// `LinkEstablished` on the responder to the end of each link-up stage).
 pub const RESPONDER_LINK_UP_BUCKETS_SECONDS: &[f64] = &[0.01, 0.1, 0.5, 1.0, 5.0, 30.0];
 
+// ─── v44 labels on the existing ledgers ────────────────────────────────────
+// A key with a `:` refines the key before it, which still counts the total
+// (the `alm_offer_refused` pattern), so a dashboard sums one or the other.
+
+/// The keyer caught a panic in a decapsulation (CIRISEdge#947). One link was
+/// refused and the worker lived; nonzero is a bug.
+pub const LINK_SEAL_KEYER_PANICKED: &str = "link_seal_keyer_panicked";
+/// A queued handshake whose link closed or ran out its budget: skipped
+/// unstarted, so it never reaches [`LINK_SEAL_DECAPSULATED`].
+pub const LINK_SEAL_KEYING_SKIPPED_STALE: &str = "link_seal_keying_skipped_stale";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE`] for a sender with standing.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STANDING: &str =
+    "link_seal_refused_handshake_sender_rate:standing";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE`] for an identified stranger.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STRANGER: &str =
+    "link_seal_refused_handshake_sender_rate:stranger";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE`] for a link with no identity.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_UNIDENTIFIED: &str =
+    "link_seal_refused_handshake_sender_rate:unidentified";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE`] on the standing budget.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STANDING: &str =
+    "link_seal_refused_handshake_node_rate:standing";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE`] on the strangers' budget.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STRANGER: &str =
+    "link_seal_refused_handshake_node_rate:stranger";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE`] on the strangers' budget, from a
+/// link with no identity.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_UNIDENTIFIED: &str =
+    "link_seal_refused_handshake_node_rate:unidentified";
+/// [`LINK_SEAL_REFUSED_DECAP_SATURATED`], the standing queue.
+pub const LINK_SEAL_REFUSED_DECAP_SATURATED_STANDING: &str =
+    "link_seal_refused_decap_saturated:standing";
+/// [`LINK_SEAL_REFUSED_DECAP_SATURATED`], the strangers' queue.
+pub const LINK_SEAL_REFUSED_DECAP_SATURATED_STRANGER: &str =
+    "link_seal_refused_decap_saturated:stranger";
+
+/// [`LINK_SHAPING_HOME_ELSEWHERE`]: THIS node refused a peer. Includes the
+/// refusals [`LINK_SHAPING_LOAD_REFUSED`] names.
+pub const LINK_SHAPING_HOME_ELSEWHERE_GIVEN: &str = "link_shaping_home_elsewhere:given";
+/// [`LINK_SHAPING_HOME_ELSEWHERE`]: a peer refused THIS node. Those two are
+/// the two sides of a wire: only `given` says this node is at its bound.
+pub const LINK_SHAPING_HOME_ELSEWHERE_RECEIVED: &str = "link_shaping_home_elsewhere:received";
+/// [`LINK_SHAPING_OFFERED`] on a link this node dialled.
+pub const LINK_SHAPING_OFFERED_DIALLED: &str = "link_shaping_offered:dialled";
+/// [`LINK_SHAPING_OFFERED`] answering a peer's offer.
+pub const LINK_SHAPING_OFFERED_ANSWERED: &str = "link_shaping_offered:answered";
+/// [`LINK_SHAPING_AGREED`] at the `seat` class.
+pub const LINK_SHAPING_AGREED_SEAT: &str = "link_shaping_agreed:seat";
+/// [`LINK_SHAPING_AGREED`] at the `server` class.
+pub const LINK_SHAPING_AGREED_SERVER: &str = "link_shaping_agreed:server";
+/// [`LINK_SHAPING_AGREED`] at the `home` class.
+pub const LINK_SHAPING_AGREED_HOME: &str = "link_shaping_agreed:home";
+/// [`LINK_SHAPING_AGREED`] at the `phone-wifi` class.
+pub const LINK_SHAPING_AGREED_PHONE_WIFI: &str = "link_shaping_agreed:phone-wifi";
+/// [`LINK_SHAPING_AGREED`] at the `phone-cellular` class.
+pub const LINK_SHAPING_AGREED_PHONE_CELLULAR: &str = "link_shaping_agreed:phone-cellular";
+/// A seat link closed because its peer left the active roster.
+pub const LINK_SHAPING_SEAT_LOST: &str = "link_shaping_seat_lost";
+/// The shaped links' rates went past the node cap.
+pub const LINK_SHAPING_OVER_CAP: &str = "link_shaping_over_cap";
+/// A row was taken back from a shaper: the link closed, or its budget ran out.
+pub const LINK_SHAPING_ROW_RETRACTED: &str = "link_shaping_row_retracted";
+/// A row did not leave within its budget.
+pub const LINK_SHAPING_ROW_LEFT_TIMEOUT: &str = "link_shaping_row_left_timeout";
+/// Bodies a shaped link took with it when it closed. Their rows retry.
+pub const LINK_SHAPING_BODIES_STRANDED: &str = "link_shaping_bodies_stranded";
+/// A bulk message rode the shaped link to its end.
+pub const LINK_SHAPING_BULK_FALLBACK_OK: &str = "link_shaping_bulk_fallback:ok";
+/// A bulk message on the shaped link did not finish.
+pub const LINK_SHAPING_BULK_FALLBACK_FAILED: &str = "link_shaping_bulk_fallback:failed";
+/// A policy or device change moved this node's shaping.
+pub const LINK_SHAPING_POLICY_MOVED: &str = "link_shaping_policy_moved";
+
+/// Failure-driven primary change (ALM C6).
+pub const ALM_FAILOVER: &str = "alm_failover";
+/// Make-before-break primary change (ALM C4).
+pub const ALM_SWITCH: &str = "alm_switch";
+/// A path's sequence numbers restarted with a newer room epoch.
+pub const ALM_EPOCH_RESYNC: &str = "alm_epoch_resync";
+/// A loop reached the ancestry backstop.
+pub const ALM_LOOP_DETECTED: &str = "alm_loop_detected";
+/// A forwarder's advertised capacity passed what it measured.
+pub const ALM_OVER_CLAIM: &str = "alm_over_claim";
+
+/// A direct link was not proposed: the node's proposing switch is off.
+pub const DIRECT_LINK_OFF_PROPOSING_OFF: &str = "direct_link_off:proposing_off";
+/// A direct link was not proposed: no facilitator resolved.
+pub const DIRECT_LINK_OFF_NO_FACILITATOR: &str = "direct_link_off:no_facilitator";
+/// A yielded proposal's wait ran out and this end proposed after all.
+pub const DIRECT_LINK_YIELD_EXPIRED: &str = "direct_link_yield_expired";
+
+/// The `link_shaping_agreed` key of `class`.
+#[must_use]
+pub fn agreed_label(class: crate::telemetry::ShapingClass) -> &'static str {
+    use crate::telemetry::ShapingClass as C;
+    match class {
+        C::Seat => LINK_SHAPING_AGREED_SEAT,
+        C::Server => LINK_SHAPING_AGREED_SERVER,
+        C::Home => LINK_SHAPING_AGREED_HOME,
+        C::PhoneWifi => LINK_SHAPING_AGREED_PHONE_WIFI,
+        C::PhoneCellular => LINK_SHAPING_AGREED_PHONE_CELLULAR,
+    }
+}
+
+/// Every `link_seal` key.
+pub const LINK_SEAL_LABELS: &[&str] = &[
+    LINK_SEAL_INITIATED,
+    LINK_SEAL_ACCEPTED,
+    LINK_SEAL_REFUSED_NO_PAIR,
+    LINK_SEAL_REFUSED_LOOKUP,
+    LINK_SEAL_REFUSED_CLAIM_MISMATCH,
+    LINK_SEAL_REFUSED_RESPONDER_MISMATCH,
+    LINK_SEAL_REFUSED_NOT_A_HANDSHAKE,
+    LINK_SEAL_REFUSED_MALFORMED,
+    LINK_SEAL_REFUSED_TOO_LARGE,
+    LINK_SEAL_REFUSED_SUITE,
+    LINK_SEAL_REFUSED_KEX,
+    LINK_SEAL_REFUSED_TIMEOUT,
+    LINK_SEAL_REFUSED_SEND,
+    LINK_SEAL_REFUSED_FRAME_BEFORE_KEYS,
+    LINK_SEAL_REFUSED_OPEN_FAILED,
+    LINK_SEAL_REFUSED_FIRST_CONTACT_ONLY,
+    LINK_SEAL_REFUSED_FIRST_CONTACT_SIGNER,
+    LINK_SEAL_REFUSED_PIN,
+    LINK_SEAL_DROPPED_HELD_OVERFLOW,
+    LINK_SEAL_HELD_FOR_ATTRIBUTION,
+    LINK_SEAL_REFUSED_UNSEALED_SEND,
+    LINK_SEAL_DROPPED_REPLAY,
+    LINK_SEAL_PAIR_ROOTED,
+    LINK_SEAL_PAIR_SELF_SIGNED_ROW,
+    LINK_REKEYED_TO_WIRE_ID,
+    LINK_SEAL_PAIR_PIN,
+    LINK_SEAL_PAIR_ROUTE_FETCH,
+    LINK_SEAL_ROUTE_REQUEST_SENT,
+    LINK_SEAL_ROUTE_REQUESTED,
+    LINK_SEAL_ROUTE_ANSWERED,
+    LINK_SEAL_REFUSED_ROUTE_REQUEST,
+    LINK_SEAL_REFUSED_ROUTE_RATE_LIMITED,
+    LINK_SEAL_REFUSED_ROUTE_OFF_IDENTITY_PLANE,
+    LINK_SEAL_REFUSED_ROUTE_NOT_OURS,
+    LINK_SEAL_REFUSED_ROUTE_UNAVAILABLE,
+    LINK_SEAL_REFUSED_ROUTE_ANSWER,
+    LINK_SEAL_REFUSED_ROUTE_ANSWER_SIGNER,
+    LINK_SEAL_REFUSED_ROUTE_ANSWER_UNVERIFIED,
+    LINK_SEAL_REFUSED_ROUTE_TIMEOUT,
+    LINK_SEAL_REFUSED_ROUTE_CLOSED,
+    LINK_SEAL_REFUSED_ROUTE_SEND,
+    LINK_SEAL_DROPPED_BEFORE_KEYS,
+    LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE,
+    LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE,
+    LINK_SEAL_REFUSED_DECAP_SATURATED,
+    LINK_SEAL_REFUSED_AWAITING_CAP,
+    LINK_SEAL_REFUSED_KEYING_HOLD,
+    LINK_SEAL_HELD_DURING_KEYING,
+    LINK_SEAL_DECAPSULATED,
+    LINK_SEAL_HELD_BEFORE_KEYS,
+    LINK_SEAL_KEYER_PANICKED,
+    LINK_SEAL_KEYING_SKIPPED_STALE,
+    LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STANDING,
+    LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STRANGER,
+    LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_UNIDENTIFIED,
+    LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STANDING,
+    LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STRANGER,
+    LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_UNIDENTIFIED,
+    LINK_SEAL_REFUSED_DECAP_SATURATED_STANDING,
+    LINK_SEAL_REFUSED_DECAP_SATURATED_STRANGER,
+];
+/// Every `link_shaping` key but the raw real-frame count.
+pub const LINK_SHAPING_LABELS: &[&str] = &[
+    LINK_SHAPING_OFFERED,
+    LINK_SHAPING_AGREED,
+    LINK_SHAPING_UNSHAPED,
+    LINK_SHAPING_REFUSED_UNSHAPED_PEER,
+    LINK_SHAPING_HOME_ELSEWHERE,
+    LINK_SHAPING_REFERRAL_SENT,
+    LINK_SHAPING_REFERRAL_EMPTY,
+    LINK_SHAPING_REFERRAL_WITHHELD,
+    LINK_SHAPING_REFERRAL_RECEIVED,
+    LINK_SHAPING_REFERRAL_REJECTED,
+    LINK_SHAPING_REFERRAL_HOMED,
+    LINK_SHAPING_REFERRAL_FAILED,
+    LINK_SHAPING_REFERRAL_EXHAUSTED,
+    LINK_SHAPING_REFUSED_MALFORMED,
+    LINK_SHAPING_DROPPED_WRONG_KIND,
+    LINK_SHAPING_FRAMES_COVER,
+    LINK_SHAPING_COVER_RECEIVED,
+    LINK_SHAPING_QUEUE_DEFERRED,
+    LINK_SHAPING_SEND_FAILED,
+    LINK_SHAPING_BULK_REFUSED,
+    LINK_SHAPING_BULK_ON_SHAPED_FALLBACK,
+    LINK_SHAPING_LOAD_REFUSED,
+    LINK_SHAPING_LOAD_SHED,
+    LINK_SHAPING_LOAD_SHED_BULK,
+    LINK_SHAPING_HOME_ELSEWHERE_GIVEN,
+    LINK_SHAPING_HOME_ELSEWHERE_RECEIVED,
+    LINK_SHAPING_OFFERED_DIALLED,
+    LINK_SHAPING_OFFERED_ANSWERED,
+    LINK_SHAPING_AGREED_SEAT,
+    LINK_SHAPING_AGREED_SERVER,
+    LINK_SHAPING_AGREED_HOME,
+    LINK_SHAPING_AGREED_PHONE_WIFI,
+    LINK_SHAPING_AGREED_PHONE_CELLULAR,
+    LINK_SHAPING_SEAT_LOST,
+    LINK_SHAPING_OVER_CAP,
+    LINK_SHAPING_ROW_RETRACTED,
+    LINK_SHAPING_ROW_LEFT_TIMEOUT,
+    LINK_SHAPING_BODIES_STRANDED,
+    LINK_SHAPING_BULK_FALLBACK_OK,
+    LINK_SHAPING_BULK_FALLBACK_FAILED,
+    LINK_SHAPING_POLICY_MOVED,
+];
+/// Every `direct_link` key.
+pub const DIRECT_LINK_LABELS: &[&str] = &[
+    DIRECT_LINK_PROPOSED,
+    DIRECT_LINK_PROPOSE_REFUSED,
+    DIRECT_LINK_SKIPPED_NEIGHBOUR,
+    DIRECT_LINK_SKIPPED_BACKOFF,
+    DIRECT_LINK_YIELDED,
+    DIRECT_LINK_SKIPPED_NO_LINK,
+    DIRECT_LINK_REQUEST_ACCEPTED,
+    DIRECT_LINK_REQUEST_REFUSED,
+    DIRECT_LINK_ESTABLISHED,
+    DIRECT_LINK_FAILED_REJECTED,
+    DIRECT_LINK_FAILED_PROBE,
+    DIRECT_LINK_FAILED_TIMEOUT,
+    DIRECT_LINK_FAILED_PUNCH,
+    DIRECT_LINK_LOST,
+    DIRECT_LINK_LEG_FELL_BACK,
+    DIRECT_LINK_OFF_PROPOSING_OFF,
+    DIRECT_LINK_OFF_NO_FACILITATOR,
+    DIRECT_LINK_YIELD_EXPIRED,
+];
+/// Every `av_plane` key.
+pub const AV_PLANE_LABELS: &[&str] = &[
+    AV_SENT,
+    AV_SEND_REFUSED_CHUNK_TOO_LARGE,
+    AV_SEND_CONGESTED,
+    AV_SEND_LINK_GONE,
+    AV_SEND_FAILED,
+    AV_LINK_OPENED,
+    AV_LINK_ARRIVED,
+    AV_INBOUND_DELIVERED,
+    AV_INBOUND_DROPPED_QUEUE_FULL,
+    AV_INBOUND_DROPPED_UNATTRIBUTED,
+    AV_INBOUND_DROPPED_NO_CONSUMER,
+    AV_INBOUND_DROPPED_ARRIVALS_FULL,
+    AV_INBOUND_DROPPED_CONSUMER_GONE,
+    AV_INBOUND_DROPPED_RESOURCE,
+    AV_INBOUND_DUPLICATE_LEG,
+    AV_LINK_ID_MISMATCH,
+    AV_RELAY_DIALLER_REFUSED,
+    AV_RELAY_DIALLER_ADMITTED,
+    AV_CALL_FRAME_UNOPENED,
+    AV_CALL_FRAME_NO_KEY,
+    AV_CALL_RELAYED,
+    AV_CALL_FRAME_FORGED,
+    AV_CALL_FRAME_UNBOUND,
+    AV_CALL_BINDING_INSTALLED,
+    AV_CALL_BINDING_REFUSED,
+    AV_CALL_RECORD_REFUSED,
+    AV_SENT_TIMED,
+    AV_SENT_UNTIMED_FULL,
+    AV_FRAME_EXPIRED_SENDER,
+    AV_FRAME_EXPIRED_MARKED,
+    AV_FRAME_EXPIRED_LATE,
+    AV_FRAME_STALE_DROPPED,
+    AV_CHUNK_DROPPED_CONGESTED,
+    AV_LEG_SHED_TO_BASE,
+    AV_LEG_RESTORED,
+    ALM_C3_SENT,
+    ALM_C3_SEND_FAILED,
+    ALM_C3_RESENT,
+    ALM_C3_RECEIVED,
+    ALM_C3_MALFORMED,
+    ALM_C3_PEER_CAPABLE,
+    ALM_OFFER_REFUSED,
+    ALM_OFFER_REFUSED_NOT_PUBLISHER,
+    ALM_OFFER_REFUSED_UNBOUND,
+    ALM_ADMIT,
+    ALM_REFUSE,
+    ALM_SHED,
+    ALM_FORWARDED,
+    ALM_PARENT_CHANGE,
+    ALM_RELAY_TIER_ROSTER,
+    ALM_RELAY_TIER_ROSTER_FAILED,
+    ALM_RELAY_TIER_DEFAULT,
+    ALM_FAILOVER,
+    ALM_SWITCH,
+    ALM_EPOCH_RESYNC,
+    ALM_LOOP_DETECTED,
+    ALM_OVER_CLAIM,
+];
+/// Every `link_stall` key.
+pub const LINK_STALL_LABELS: &[&str] = &[
+    LINK_STALL_ZERO_LANDED_SEND,
+    LINK_STALL_CLOSED,
+    LINK_STALL_RETIRED_DIRECT,
+];
+/// Every `peer_binding` key.
+pub const PEER_BINDING_LABELS: &[&str] = &[
+    PEER_BINDING_TRANSPORT_KEY_HEALED,
+    PEER_BINDING_DIAL_KEY_FROM_ANNOUNCE,
+    PEER_BINDING_LINK_PROOF_REFUSED,
+    PEER_BINDING_PRIMED,
+    PEER_BINDING_PRIME_REFUSED,
+    PEER_BINDING_ATTRIBUTION_SHARED,
+    PEER_BINDING_ATTRIBUTION_BY_CLAIM,
+    PEER_BINDING_ATTRIBUTION_BY_NODE,
+];
+
 /// CIRISEdge P0 telemetry (CIRISServer `FSD/UNIFIED_TELEMETRY.md` §4) — the
 /// upper bounds, in seconds, of
 /// [`EdgeMetrics::replication_round_duration_seconds`]'s buckets. A final
@@ -2110,6 +2420,17 @@ pub struct EdgeMetrics {
     /// CIRISEdge#853 — ships refused because their lane was already claimed by
     /// another transfer. Unreachable by construction; non-zero is a regression.
     pub unclaimed_ship_refused_total: Arc<std::sync::atomic::AtomicU64>,
+    /// v44 — the operator's telemetry ([`crate::telemetry`]).
+    pub telemetry: Arc<crate::telemetry::EdgeTelemetry>,
+}
+
+/// A per-kind counter map with every [`EnvelopeKind`] present.
+fn every_kind(map: &RwLock<HashMap<EnvelopeKind, u64>>) -> HashMap<EnvelopeKind, u64> {
+    let held = map.read();
+    EnvelopeKind::ALL
+        .iter()
+        .map(|k| (*k, held.get(k).copied().unwrap_or(0)))
+        .collect()
 }
 
 /// A `&'static str`-keyed counter map, cloned out with owned keys for the
@@ -2119,6 +2440,17 @@ fn owned_keys<V: Copy>(map: &RwLock<HashMap<&'static str, V>>) -> HashMap<String
         .iter()
         .map(|(k, v)| ((*k).to_string(), *v))
         .collect()
+}
+
+/// [`owned_keys`] with every label of a closed family present, so a series
+/// that is absent is one this build does not have and 0 is one that did not
+/// happen.
+fn registered(map: &RwLock<HashMap<&'static str, u64>>, labels: &[&str]) -> HashMap<String, u64> {
+    let mut out = owned_keys(map);
+    for l in labels {
+        out.entry((*l).to_string()).or_insert(0);
+    }
+    out
 }
 
 impl EdgeMetrics {
@@ -2404,6 +2736,13 @@ impl EdgeMetrics {
     /// label.
     pub fn inc_link_seal(&self, label: &'static str) {
         *self.link_seal.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// Add `n` to a `LINK_SHAPING_*` key.
+    pub fn add_link_shaping(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.link_shaping.write().entry(label).or_insert(0) += n;
+        }
     }
 
     /// Count one link-shaping event by its `LINK_SHAPING_*` label.
@@ -3170,6 +3509,11 @@ impl EdgeMetrics {
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn snapshot(&self) -> EdgeMetricsBundle {
+        let t = self.telemetry.snapshot();
+        // The raw count of real frames is a clock of the node's real traffic;
+        // it leaves only through `ShapingWindows`.
+        let mut link_shaping = registered(&self.link_shaping, LINK_SHAPING_LABELS);
+        link_shaping.remove(LINK_SHAPING_FRAMES_REAL);
         EdgeMetricsBundle {
             envelopes_sent_total: self.envelopes_sent_total.read().clone(),
             envelopes_received_total: self.envelopes_received_total.read().clone(),
@@ -3181,7 +3525,18 @@ impl EdgeMetrics {
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             blob_serve_legacy_dag_walks: self.blob_serve_legacy_dag_walks(),
-            replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
+            replication_round_outcomes_total: {
+                let held = self.replication_round_outcomes_total.read();
+                [
+                    RoundOutcome::Completed,
+                    RoundOutcome::Refused,
+                    RoundOutcome::TimedOut,
+                    RoundOutcome::Error,
+                ]
+                .iter()
+                .map(|o| (*o, held.get(o).copied().unwrap_or(0)))
+                .collect()
+            },
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
             replication_inbound_backpressure_drops_by_role: self
                 .replication_inbound_backpressure_drops_by_role
@@ -3228,13 +3583,13 @@ impl EdgeMetrics {
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
             transport_inbound_drops: self.transport_inbound_drops(),
-            av_plane: self.av_plane(),
-            link_seal: self.link_seal(),
-            link_shaping: self.link_shaping(),
-            direct_link: self.direct_link(),
-            peer_binding: self.peer_binding(),
+            av_plane: registered(&self.av_plane, AV_PLANE_LABELS),
+            link_seal: registered(&self.link_seal, LINK_SEAL_LABELS),
+            link_shaping,
+            direct_link: registered(&self.direct_link, DIRECT_LINK_LABELS),
+            peer_binding: registered(&self.peer_binding, PEER_BINDING_LABELS),
             key_plane_sweep: self.key_plane_sweep(),
-            link_stall: self.link_stall(),
+            link_stall: registered(&self.link_stall, LINK_STALL_LABELS),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
@@ -3262,11 +3617,10 @@ impl EdgeMetrics {
             announce_to_binding_ms_last: self.announce_to_binding_ms_last(),
             withholds_by_reason: self.withholds_by_reason.read().clone(),
             recent_withholds: self.recent_withholds.read().iter().cloned().collect(),
-            replication_envelopes_served_total: self
-                .replication_envelopes_served_total
-                .read()
-                .clone(),
-            apply_refusals_by_kind: self.apply_refusals_by_kind.read().clone(),
+            replication_envelopes_served_total: every_kind(
+                &self.replication_envelopes_served_total,
+            ),
+            apply_refusals_by_kind: every_kind(&self.apply_refusals_by_kind),
             key_apply_refusals_by_reason: self.key_apply_refusals_by_reason.read().clone(),
             attestation_apply_refusals_by_reason: self
                 .attestation_apply_refusals_by_reason
@@ -3274,7 +3628,7 @@ impl EdgeMetrics {
                 .clone(),
             apply_refusals_by_class: self.apply_refusals_by_class.read().clone(),
             envelope_kind_retired_refusals: self.envelope_kind_retired_refusals.read().clone(),
-            rows_parked_on_signer: self.rows_parked_on_signer.read().clone(),
+            rows_parked_on_signer: every_kind(&self.rows_parked_on_signer),
             signer_releases: self.signer_releases(),
             retry_suppressions: self.retry_suppressions(),
             signer_park_evictions: self.signer_park_evictions(),
@@ -3282,15 +3636,19 @@ impl EdgeMetrics {
             refusal_memory_capacity: self.refusal_memory().capacity,
             parked_on_signer_len: self.refusal_memory().parked_on_signer_len,
             parked_on_signer_capacity: self.refusal_memory().parked_on_signer_capacity,
-            replication_applied_total: self.replication_applied_total.read().clone(),
-            replication_duplicate_total: self.replication_duplicate_total.read().clone(),
+            replication_applied_total: every_kind(&self.replication_applied_total),
+            replication_duplicate_total: every_kind(&self.replication_duplicate_total),
             removal_delivery: self.removal_receipts.read().delta(),
-            replication_round_duration_seconds: self
-                .replication_round_duration_seconds
-                .read()
-                .iter()
-                .map(|(k, h)| (*k, h.snapshot(REPLICATION_ROUND_DURATION_BUCKETS_SECONDS)))
-                .collect(),
+            replication_round_duration_seconds: {
+                let held = self.replication_round_duration_seconds.read();
+                EnvelopeKind::ALL
+                    .iter()
+                    .map(|k| {
+                        let h = held.get(k).cloned().unwrap_or_default();
+                        (*k, h.snapshot(REPLICATION_ROUND_DURATION_BUCKETS_SECONDS))
+                    })
+                    .collect()
+            },
             sweep_permit_wait_seconds: self
                 .sweep_permit_wait_seconds
                 .read()
@@ -3300,6 +3658,44 @@ impl EdgeMetrics {
             responder_link_up_total: self.responder_link_up_total(),
             recovered_links_total: self.recovered_links_total(),
             unclaimed_ship_refused_total: self.unclaimed_ship_refused_total(),
+            event_handler_duration_seconds: t.event_handler_duration_seconds,
+            seal_keying_duration_seconds: t.seal_keying_duration_seconds,
+            replication_inbound_wait_seconds: t.replication_inbound_wait_seconds,
+            replication_reply_wait_seconds: t.replication_reply_wait_seconds,
+            shaping_row_wait_seconds: t.shaping_row_wait_seconds,
+            alm_failover_gap_seconds: t.alm_failover_gap_seconds,
+            call_setup_duration_seconds: t.call_setup_duration_seconds,
+            first_contact_duration_seconds: t.first_contact_duration_seconds,
+            refusal_attempts: t.refusal_attempts,
+            wake_first_round_duration_seconds: t.wake_first_round_duration_seconds,
+            seal_keyer_queued: t.seal_keyer_queued,
+            seal_keyer_workers: t.seal_keyer_workers,
+            seal_awaiting_links: t.seal_awaiting_links,
+            seal_awaiting_bytes: t.seal_awaiting_bytes,
+            seal_held_bytes: t.seal_held_bytes,
+            replication_reply_queued: t.replication_reply_queued,
+            load_tier: t.load_tier,
+            load_host_pressure: t.load_host_pressure,
+            load_pressure_report_age_seconds: t.load_pressure_report_age_seconds,
+            load_tier_changes_total: t.load_tier_changes_total,
+            shaping_enabled: t.shaping_enabled,
+            shaping_links: t.shaping_links,
+            shaping_free_slots: t.shaping_free_slots,
+            shaping_seat_roster_age_seconds: t.shaping_seat_roster_age_seconds,
+            shaping_frames_real_windowed: t.shaping_frames_real_windowed,
+            shaping_windows_withheld: t.shaping_windows_withheld,
+            leviculum_events_queued: t.leviculum_events_queued,
+            leviculum_events_capacity: t.leviculum_events_capacity,
+            leviculum_events_dropped: t.leviculum_events_dropped,
+            leviculum_shed_packets: t.leviculum_shed_packets,
+            direct_link_proposing: t.direct_link_proposing,
+            alm_active_calls: t.alm_active_calls,
+            alm_c3_peers: t.alm_c3_peers,
+            decision_row_unheard_total: t.decision_row_unheard_total,
+            decision_row_subscribers: t.decision_row_subscribers,
+            apply_refusals: t.apply_refusals,
+            loop_last_progress_age_seconds: t.loop_last_progress_age_seconds,
+            node_alive: t.node_alive,
         }
     }
 }
@@ -3643,6 +4039,82 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#853 — ships refused on a lane another transfer held.
     /// Unreachable by construction; non-zero is a regression.
     pub unclaimed_ship_refused_total: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub event_handler_duration_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_keying_duration_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub replication_inbound_wait_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub replication_reply_wait_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_row_wait_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub alm_failover_gap_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub call_setup_duration_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub first_contact_duration_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub refusal_attempts: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub wake_first_round_duration_seconds: HistogramSnapshot,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_keyer_queued: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_keyer_workers: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_awaiting_links: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_awaiting_bytes: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_held_bytes: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub replication_reply_queued: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_tier: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_host_pressure: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_pressure_report_age_seconds: f64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_tier_changes_total: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_enabled: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_links: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_free_slots: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_seat_roster_age_seconds: f64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_frames_real_windowed: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_windows_withheld: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub leviculum_events_queued: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub leviculum_events_capacity: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub leviculum_events_dropped: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub leviculum_shed_packets: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub direct_link_proposing: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub alm_active_calls: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub alm_c3_peers: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub decision_row_unheard_total: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub decision_row_subscribers: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub apply_refusals: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub loop_last_progress_age_seconds: HashMap<String, f64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub node_alive: u64,
 }
 
 /// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
@@ -3669,6 +4141,28 @@ impl FlatMetrics {
         for (label, v) in entries {
             total = total.saturating_add(*v);
             self.counters.insert(format!("{name}.{label}"), *v);
+        }
+        self.counters.insert(name.to_string(), total);
+    }
+
+    /// A labelled gauge family: `name` = the largest value, `name.<label>` =
+    /// each.
+    fn gauge_family(&mut self, name: &str, entries: &HashMap<String, f64>) {
+        let mut most = f64::NEG_INFINITY;
+        for (label, v) in entries {
+            most = most.max(*v);
+            self.gauges.insert(format!("{name}.{label}"), *v);
+        }
+        self.gauges.insert(name.to_string(), most.max(-1.0));
+    }
+
+    /// A labelled histogram family: `name` = every observation, and each
+    /// label under `name.<label>`.
+    fn histogram_family(&mut self, name: &str, entries: &HashMap<String, HistogramSnapshot>) {
+        let mut total = 0u64;
+        for (label, h) in entries {
+            total = total.saturating_add(h.count);
+            self.histogram(&format!("{name}.{label}"), h);
         }
         self.counters.insert(name.to_string(), total);
     }
@@ -3995,6 +4489,97 @@ impl EdgeMetricsBundle {
             #[allow(clippy::cast_precision_loss)]
             f.gauges.insert(name.to_string(), value as f64);
         }
+        // v44 — the operator's telemetry. Closed labels are present at zero.
+        for (name, family) in [
+            (
+                "event_handler_duration_seconds",
+                &self.event_handler_duration_seconds,
+            ),
+            (
+                "seal_keying_duration_seconds",
+                &self.seal_keying_duration_seconds,
+            ),
+            (
+                "replication_inbound_wait_seconds",
+                &self.replication_inbound_wait_seconds,
+            ),
+            (
+                "replication_reply_wait_seconds",
+                &self.replication_reply_wait_seconds,
+            ),
+            ("shaping_row_wait_seconds", &self.shaping_row_wait_seconds),
+            ("alm_failover_gap_seconds", &self.alm_failover_gap_seconds),
+            (
+                "call_setup_duration_seconds",
+                &self.call_setup_duration_seconds,
+            ),
+            (
+                "first_contact_duration_seconds",
+                &self.first_contact_duration_seconds,
+            ),
+            ("refusal_attempts", &self.refusal_attempts),
+        ] {
+            f.histogram_family(name, family);
+        }
+        f.histogram(
+            "wake_first_round_duration_seconds",
+            &self.wake_first_round_duration_seconds,
+        );
+        f.counters.insert(
+            "wake_first_round_duration_seconds".to_string(),
+            self.wake_first_round_duration_seconds.count,
+        );
+        for (name, family) in [
+            ("seal_keyer_queued", &self.seal_keyer_queued),
+            ("seal_keyer_workers", &self.seal_keyer_workers),
+            ("replication_reply_queued", &self.replication_reply_queued),
+            ("load_tier_changes_total", &self.load_tier_changes_total),
+            ("shaping_links", &self.shaping_links),
+            (
+                "shaping_frames_real_windowed",
+                &self.shaping_frames_real_windowed,
+            ),
+            ("shaping_windows_withheld", &self.shaping_windows_withheld),
+            ("leviculum_events_queued", &self.leviculum_events_queued),
+            ("leviculum_events_capacity", &self.leviculum_events_capacity),
+            ("leviculum_events_dropped", &self.leviculum_events_dropped),
+            (
+                "decision_row_unheard_total",
+                &self.decision_row_unheard_total,
+            ),
+            ("apply_refusals", &self.apply_refusals),
+        ] {
+            f.family(name, family);
+        }
+        for (name, value) in [
+            ("seal_awaiting_links", self.seal_awaiting_links),
+            ("seal_awaiting_bytes", self.seal_awaiting_bytes),
+            ("seal_held_bytes", self.seal_held_bytes),
+            ("load_tier", self.load_tier),
+            ("load_host_pressure", self.load_host_pressure),
+            ("shaping_enabled", self.shaping_enabled),
+            ("shaping_free_slots", self.shaping_free_slots),
+            ("leviculum_shed_packets", self.leviculum_shed_packets),
+            ("direct_link_proposing", self.direct_link_proposing),
+            ("alm_active_calls", self.alm_active_calls),
+            ("alm_c3_peers", self.alm_c3_peers),
+            ("decision_row_subscribers", self.decision_row_subscribers),
+            ("node_alive", self.node_alive),
+        ] {
+            f.counters.insert(name.to_string(), value);
+        }
+        f.gauges.insert(
+            "load_pressure_report_age_seconds".to_string(),
+            self.load_pressure_report_age_seconds,
+        );
+        f.gauges.insert(
+            "shaping_seat_roster_age_seconds".to_string(),
+            self.shaping_seat_roster_age_seconds,
+        );
+        f.gauge_family(
+            "loop_last_progress_age_seconds",
+            &self.loop_last_progress_age_seconds,
+        );
         f
     }
 }
@@ -4102,6 +4687,44 @@ edge_metrics_bundle_fields!(
     responder_link_up_total,
     recovered_links_total,
     unclaimed_ship_refused_total,
+    event_handler_duration_seconds,
+    seal_keying_duration_seconds,
+    replication_inbound_wait_seconds,
+    replication_reply_wait_seconds,
+    shaping_row_wait_seconds,
+    alm_failover_gap_seconds,
+    call_setup_duration_seconds,
+    first_contact_duration_seconds,
+    refusal_attempts,
+    wake_first_round_duration_seconds,
+    seal_keyer_queued,
+    seal_keyer_workers,
+    seal_awaiting_links,
+    seal_awaiting_bytes,
+    seal_held_bytes,
+    replication_reply_queued,
+    load_tier,
+    load_host_pressure,
+    load_pressure_report_age_seconds,
+    load_tier_changes_total,
+    shaping_enabled,
+    shaping_links,
+    shaping_free_slots,
+    shaping_seat_roster_age_seconds,
+    shaping_frames_real_windowed,
+    shaping_windows_withheld,
+    leviculum_events_queued,
+    leviculum_events_capacity,
+    leviculum_events_dropped,
+    leviculum_shed_packets,
+    direct_link_proposing,
+    alm_active_calls,
+    alm_c3_peers,
+    decision_row_unheard_total,
+    decision_row_subscribers,
+    apply_refusals,
+    loop_last_progress_age_seconds,
+    node_alive,
 );
 
 #[cfg(test)]
@@ -4234,11 +4857,12 @@ mod tests {
             snap.replication_round_outcomes_total[&RoundOutcome::Refused],
             1
         );
-        // Never-emitted outcome stays absent (not zero-initialised) — the map
-        // is a sparse bag, mirroring the other per-key counters.
-        assert!(!snap
-            .replication_round_outcomes_total
-            .contains_key(&RoundOutcome::Error));
+        // v44 — a never-emitted outcome is present at zero: a missing series
+        // and a 0 are different answers.
+        assert_eq!(
+            snap.replication_round_outcomes_total[&RoundOutcome::Error],
+            0
+        );
         assert_eq!(RoundOutcome::TimedOut.as_str(), "timed_out");
     }
 
@@ -4278,9 +4902,11 @@ mod tests {
                 .copied(),
             Some(1)
         );
-        assert!(!snap
-            .replication_applied_total
-            .contains_key(&EnvelopeKind::Attestation));
+        assert_eq!(
+            snap.replication_applied_total[&EnvelopeKind::Attestation],
+            0,
+            "v44: a series before it happens, and one the other axis did not move"
+        );
     }
 
     /// CIRISEdge#441 — the receipt ledger's three-state contract, driven with
@@ -4447,11 +5073,10 @@ mod p0_telemetry_tests {
             Some(&("+Inf".to_string(), 1)),
             "the +Inf bucket is the count"
         );
-        assert!(
-            !snap
-                .replication_round_duration_seconds
-                .contains_key(&EnvelopeKind::Revocation),
-            "a kind with no rounds has no series"
+        assert_eq!(
+            snap.replication_round_duration_seconds[&EnvelopeKind::Revocation].count,
+            0,
+            "v44: a kind with no rounds is a series at zero"
         );
     }
 

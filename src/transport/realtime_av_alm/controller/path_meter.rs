@@ -2,7 +2,7 @@
 //!
 //! [`PathMeter`] sits on the RECEIVING side of one (forwarder → subscriber)
 //! path and measures what that path actually delivers: rate, loss and burst
-//! loss (from per-path sequence gaps), source-to-here latency, RFC 3550
+//! loss, source-to-here latency, RFC 3550
 //! interarrival jitter, queue delay (latency above the path's own floor),
 //! RTT, and stability. Raw counts accumulate in a window of
 //! `meter_window_ms`; a closed window folds into EWMAs.
@@ -16,12 +16,31 @@
 //! Silence is NOT loss here: a path that delivers nothing has no gaps.
 //! Silence is the peer-state machine's input ([`super::peer_state`]).
 //!
-//! A warm standby is the exception to reading loss from gaps. It gets base
-//! and audio chunks only ([`PathLayers::BaseOnly`]) out of a `chunk_seq`
-//! shared with every layer, so its gaps are the layers above, which it never
-//! owed. Nothing on the chunk tells the two apart, so its loss is read
-//! against the primary instead: a base-or-audio chunk the primary delivered
-//! ([`PathMeter::expect_base`]) that this path, in order, went past.
+//! **Loss is never read from `chunk_seq`.** Every layer of a stream spends the
+//! one sequence, so a gap says only that some chunk existed. A standby never
+//! gets the layers above the base, a leg shed or capped at the base layer
+//! does not either, and a publisher at service tier 2 seals its layers and
+//! sends them to nobody: on the receiver those gaps look exactly like loss.
+//! The filter sits on the sender and no frame names it. Loss comes from two
+//! things the receiver does hold instead, both within what the path owed:
+//!
+//! 1. **The hop counter.** A link's counter is dense over what its sender put
+//!    on it: it advances past nothing the policy in force filtered and nothing
+//!    the link refused. A gap in it is a chunk that policy admitted and that
+//!    never arrived, whatever its layer.
+//! 2. **The other path.** A base-or-audio chunk one subscribed parent delivered
+//!    that this one, in order, went past ([`PathMeter::expect_base`]). Every
+//!    policy admits the base and audio, so every path owes them. This sees what
+//!    the hop counter cannot: a chunk the sender never sent, because it was
+//!    refused by its own link or lost upstream of a relay.
+//!
+//! The two read different populations, so each is measured against its own
+//! (hops against chunks, base and audio against base and audio), and a window's
+//! loss is the worse of them: one lost chunk may show in both.
+//!
+//! What this leaves unseen: a chunk never sent, on a path with no second path
+//! to compare, and one every path lost. With no second path there is nothing
+//! to move to either, so no selector decision rests on that reading.
 
 use std::collections::VecDeque;
 
@@ -60,21 +79,16 @@ pub struct ChunkPos {
     pub seq: u64,
 }
 
-/// Which of the stream's chunks a path owes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PathLayers {
-    /// All of them: a gap in the sequence is loss.
-    All,
-    /// Base and audio only: gaps in the sequence are the layers it never
-    /// owed, and loss comes from [`PathMeter::expect_base`].
-    BaseOnly,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct Acc {
     bytes: u64,
     chunks: u64,
-    lost: u64,
+    /// Chunks this path was sent and never delivered.
+    hop_lost: u64,
+    /// Base-or-audio chunks this path delivered.
+    base: u64,
+    /// Base-or-audio chunks the other path delivered and this one went past.
+    base_lost: u64,
     burst: bool,
     latency_sum: f64,
 }
@@ -84,8 +98,8 @@ pub const BURST_RUN: u64 = 3;
 
 const STABILITY_WINDOWS: usize = 4;
 
-/// Base chunks a [`PathLayers::BaseOnly`] path remembers, each way: more than
-/// any lag between two parents, so a chunk falling out of either list is old.
+/// Base chunks a path remembers, each way: more than any lag between two
+/// parents, so a chunk falling out of either list is old.
 const BASE_TRACKED: usize = 256;
 
 /// C1 receive-side meter for one path.
@@ -100,9 +114,9 @@ pub struct PathMeter {
     last_latency: Option<f64>,
     min_latency: Option<f64>,
     recent_loss: [f64; STABILITY_WINDOWS],
-    /// Base chunks the primary delivered, ahead of this path, in order.
+    /// Base chunks the other path delivered, ahead of this path, in order.
     base_owed: VecDeque<ChunkPos>,
-    /// Chunks this path delivered as base-only, in order.
+    /// Base chunks this path delivered, in order.
     base_delivered: VecDeque<ChunkPos>,
     snap: PathSnapshot,
 }
@@ -145,41 +159,36 @@ impl PathMeter {
         }
     }
 
-    /// One chunk arrived on this path. `latency_ms` is source-to-here (the
-    /// sim knows it; production uses the arrival lag behind the earliest copy
-    /// plus the forwarder's advertised upstream latency).
+    /// One chunk arrived on this path. `base_or_audio` is its own class, from
+    /// its layer and codec; `hop_lost` is how many chunks its sender put on
+    /// this link ahead of it that never arrived. `latency_ms` is
+    /// source-to-here (the sim knows it; production uses the arrival lag
+    /// behind the earliest copy plus the forwarder's advertised upstream
+    /// latency).
     ///
-    /// A chunk of a newer epoch is a resync, not a gap: its sequence number
-    /// restarted and says nothing about the old epoch's tail. A straggler
-    /// from an older epoch reads as reordered. Returns whether the chunk was
-    /// new on this path.
-    #[allow(clippy::cast_precision_loss)]
+    /// A chunk at or behind this path's position reads as reordered, across
+    /// an epoch roll too. Returns whether the chunk was new on this path.
     pub fn on_chunk(
         &mut self,
         now_ms: u64,
         pos: ChunkPos,
-        layers: PathLayers,
+        base_or_audio: bool,
+        hop_lost: u64,
         bytes: u64,
         latency_ms: f64,
     ) -> bool {
         self.window_start.get_or_insert(now_ms);
-        match self.highest {
-            Some(h) if pos <= h => return false, // reordered / duplicate on this path
-            Some(h) if pos.epoch == h.epoch && layers == PathLayers::All => {
-                let gap = pos.seq - h.seq - 1;
-                self.acc.lost += gap;
-                if gap >= BURST_RUN {
-                    self.acc.burst = true;
-                }
-            }
-            Some(_) | None => {}
+        self.acc.hop_lost += hop_lost;
+        if hop_lost >= BURST_RUN {
+            self.acc.burst = true;
+        }
+        if self.highest.is_some_and(|h| pos <= h) {
+            return false;
         }
         self.highest = Some(pos);
         self.acc.bytes += bytes;
         self.acc.chunks += 1;
-        if layers == PathLayers::BaseOnly {
-            self.settle_base(pos);
-        }
+        self.settle_base(pos, base_or_audio);
         self.acc.latency_sum += latency_ms;
         if let Some(prev) = self.last_latency {
             let d = (latency_ms - prev).abs();
@@ -193,24 +202,31 @@ impl PathMeter {
 
     /// This path delivered `pos`, in order: whatever it still owed before
     /// `pos` it went past, and that is loss.
-    fn settle_base(&mut self, pos: ChunkPos) {
+    fn settle_base(&mut self, pos: ChunkPos, base_or_audio: bool) {
+        let mut run = 0;
         while let Some(owed) = self.base_owed.front().copied().filter(|o| *o <= pos) {
             self.base_owed.pop_front();
             if owed < pos {
-                self.acc.lost += 1;
+                self.acc.base_lost += 1;
+                run += 1;
             }
         }
-        self.base_delivered.push_back(pos);
-        if self.base_delivered.len() > BASE_TRACKED {
-            self.base_delivered.pop_front();
+        if run >= BURST_RUN {
+            self.acc.burst = true;
+        }
+        if base_or_audio {
+            self.acc.base += 1;
+            self.base_delivered.push_back(pos);
+            if self.base_delivered.len() > BASE_TRACKED {
+                self.base_delivered.pop_front();
+            }
         }
     }
 
-    /// The primary delivered the base-or-audio chunk `pos`: a
-    /// [`PathLayers::BaseOnly`] path owes it too. What matters is order, not
-    /// timing, so no lag between the two parents reads as loss, either way
-    /// round. A path owes nothing from before its first chunk since it
-    /// (re)started.
+    /// The other subscribed path delivered the base-or-audio chunk `pos`: this
+    /// path owes it too. What matters is order, not timing, so no lag between
+    /// the two parents reads as loss, either way round. A path owes nothing
+    /// from before its first chunk since it (re)started.
     pub fn expect_base(&mut self, pos: ChunkPos) {
         let Some(highest) = self.highest else {
             return;
@@ -219,13 +235,13 @@ impl PathMeter {
             self.base_owed.push_back(pos);
             if self.base_owed.len() > BASE_TRACKED {
                 self.base_owed.pop_front();
-                self.acc.lost += 1;
+                self.acc.base_lost += 1;
             }
         } else if self.base_delivered.front().is_some_and(|f| pos > *f)
             && self.base_delivered.binary_search(&pos).is_err()
         {
-            // This path is ahead of the primary, and went past it.
-            self.acc.lost += 1;
+            // This path is ahead of the other, and went past it.
+            self.acc.base_lost += 1;
         }
     }
 
@@ -260,12 +276,15 @@ impl PathMeter {
         let a = std::mem::take(&mut self.acc);
         let first = self.snap.windows == 0;
         let bps = a.bytes as f64 * 8.0 * 1000.0 / self.window_ms as f64;
-        let total = a.chunks + a.lost;
-        let loss = if total == 0 {
-            0.0
-        } else {
-            a.lost as f64 / total as f64
+        let share = |lost: u64, delivered: u64| {
+            let total = lost + delivered;
+            if total == 0 {
+                0.0
+            } else {
+                lost as f64 / total as f64
+            }
         };
+        let loss = share(a.hop_lost, a.chunks).max(share(a.base_lost, a.base));
         let s = &mut self.snap;
         s.delivered_bps = ewma(s.delivered_bps, bps, self.alpha, first);
         s.loss = ewma(s.loss, loss, self.alpha, first);
@@ -389,14 +408,15 @@ mod tests {
     }
 
     #[test]
-    fn meter_counts_gaps_bursts_and_rate() {
+    fn meter_counts_hop_gaps_bursts_and_rate() {
         let mut m = PathMeter::new(1_000, 1.0);
         for seq in 0..10 {
-            m.on_chunk(seq * 50, at(1, seq), PathLayers::All, 1_000, 40.0);
+            m.on_chunk(seq * 50, at(1, seq), true, 0, 1_000, 40.0);
         }
         // seq 10..=13 lost (burst of 4), then 14..19 arrive.
         for seq in 14..20 {
-            m.on_chunk(seq * 50, at(1, seq), PathLayers::All, 1_000, 40.0);
+            let lost = if seq == 14 { 4 } else { 0 };
+            m.on_chunk(seq * 50, at(1, seq), true, lost, 1_000, 40.0);
         }
         assert!(m.roll(1_000));
         let s = m.snapshot();
@@ -410,9 +430,9 @@ mod tests {
     #[test]
     fn silence_is_not_loss_and_restart_forgets_continuity() {
         let mut m = PathMeter::new(1_000, 1.0);
-        m.on_chunk(0, at(1, 5), PathLayers::All, 100, 10.0);
+        m.on_chunk(0, at(1, 5), true, 0, 100, 10.0);
         m.restart();
-        m.on_chunk(10, at(1, 50), PathLayers::All, 100, 10.0);
+        m.on_chunk(10, at(1, 50), true, 0, 100, 10.0);
         assert!(m.roll(5_000));
         assert!(m.snapshot().loss.abs() < 1e-12);
     }
@@ -424,19 +444,19 @@ mod tests {
     fn an_epoch_change_resyncs_and_a_straggler_changes_nothing() {
         let mut m = PathMeter::new(1_000, 1.0);
         for seq in 900..950 {
-            m.on_chunk(seq - 900, at(1, seq), PathLayers::All, 100, 10.0);
+            m.on_chunk(seq - 900, at(1, seq), true, 0, 100, 10.0);
         }
         for seq in 0..50 {
-            m.on_chunk(50 + seq, at(2, seq), PathLayers::All, 100, 10.0);
+            m.on_chunk(50 + seq, at(2, seq), true, 0, 100, 10.0);
         }
         assert!(m.roll(1_000));
         let s = m.snapshot();
         assert!(s.loss.abs() < 1e-12, "a roll is no loss: {}", s.loss);
         assert!(s.burst.abs() < 1e-12, "a roll is no burst: {}", s.burst);
 
-        m.on_chunk(1_000, at(1, 950), PathLayers::All, 100, 10.0);
-        m.on_chunk(1_001, at(2, 50), PathLayers::All, 100, 10.0);
-        m.on_chunk(1_002, at(2, 52), PathLayers::All, 100, 10.0);
+        m.on_chunk(1_000, at(1, 950), true, 0, 100, 10.0);
+        m.on_chunk(1_001, at(2, 50), true, 0, 100, 10.0);
+        m.on_chunk(1_002, at(2, 52), true, 1, 100, 10.0);
         assert!(m.roll(2_000));
         assert!(
             (m.snapshot().loss - 1.0 / 3.0).abs() < 1e-9,
@@ -451,11 +471,11 @@ mod tests {
     #[test]
     fn a_base_only_path_reads_no_gaps_and_real_shortfalls() {
         let mut m = PathMeter::new(1_000, 1.0);
-        m.on_chunk(0, at(1, 0), PathLayers::BaseOnly, 100, 10.0);
+        m.on_chunk(0, at(1, 0), true, 0, 100, 10.0);
         // One base chunk in three: every gap here is two skipped layers.
         for k in 1..30 {
             m.expect_base(at(1, k * 3));
-            m.on_chunk(k * 30, at(1, k * 3), PathLayers::BaseOnly, 100, 10.0);
+            m.on_chunk(k * 30, at(1, k * 3), true, 0, 100, 10.0);
         }
         assert!(m.roll(1_000));
         let s = m.snapshot();
@@ -465,7 +485,7 @@ mod tests {
         for k in 30..60 {
             m.expect_base(at(1, k * 3));
             if k % 3 != 0 {
-                m.on_chunk(k * 30, at(1, k * 3), PathLayers::BaseOnly, 100, 10.0);
+                m.on_chunk(k * 30, at(1, k * 3), true, 0, 100, 10.0);
             }
         }
         assert!(m.roll(2_000));
@@ -483,13 +503,13 @@ mod tests {
         // Behind, by a lag that swings from 8 chunks to 1 across a window
         // edge: 8 owed at the close are delivered in the next window.
         let mut m = PathMeter::new(1_000, 1.0);
-        m.on_chunk(0, at(1, 0), PathLayers::BaseOnly, 100, 10.0);
+        m.on_chunk(0, at(1, 0), true, 0, 100, 10.0);
         for k in 1..=8 {
             m.expect_base(at(1, k));
         }
         assert!(m.roll(1_000));
         for k in 1..=8 {
-            m.on_chunk(1_000 + k, at(1, k), PathLayers::BaseOnly, 100, 10.0);
+            m.on_chunk(1_000 + k, at(1, k), true, 0, 100, 10.0);
         }
         assert!(m.roll(2_000));
         assert!(m.snapshot().loss.abs() < 1e-12, "{}", m.snapshot().loss);
@@ -497,7 +517,7 @@ mod tests {
         // Ahead: 20 delivered, the primary follows, one was skipped here.
         let mut m = PathMeter::new(1_000, 1.0);
         for k in (0..20).filter(|k| *k != 7) {
-            m.on_chunk(k, at(1, k), PathLayers::BaseOnly, 100, 10.0);
+            m.on_chunk(k, at(1, k), true, 0, 100, 10.0);
         }
         for k in 0..20 {
             m.expect_base(at(1, k));
@@ -514,13 +534,66 @@ mod tests {
         for k in 0..8 {
             m.expect_base(at(1, k));
         }
-        m.on_chunk(0, at(1, 20), PathLayers::BaseOnly, 100, 10.0);
+        m.on_chunk(0, at(1, 20), true, 0, 100, 10.0);
         m.expect_base(at(1, 15));
         for k in 21..40 {
-            m.on_chunk(k, at(1, k), PathLayers::BaseOnly, 100, 10.0);
+            m.on_chunk(k, at(1, k), true, 0, 100, 10.0);
         }
         assert!(m.roll(1_000));
         assert!(m.snapshot().loss.abs() < 1e-12);
+    }
+
+    /// #945: a `chunk_seq` gap alone proves nothing on any path, however
+    /// long and whatever layers arrive around it.
+    #[test]
+    fn a_sequence_gap_is_not_loss() {
+        let mut m = PathMeter::new(1_000, 1.0);
+        for k in 0..30 {
+            m.on_chunk(k * 30, at(1, k * 10), k % 2 == 0, 0, 100, 10.0);
+        }
+        assert!(m.roll(1_000));
+        assert!(m.snapshot().loss.abs() < 1e-12, "{}", m.snapshot().loss);
+        assert!(m.snapshot().burst.abs() < 1e-12);
+    }
+
+    /// #945: base chunks are measured against base chunks. One in four lost
+    /// among nine layers each is a quarter of what every policy admits, not
+    /// the 2 % of everything that arrived.
+    #[test]
+    fn base_loss_is_not_diluted_by_the_layers_above() {
+        let mut m = PathMeter::new(1_000, 1.0);
+        let mut seq = 0;
+        for k in 0..40 {
+            m.expect_base(at(1, seq));
+            if k % 4 != 3 {
+                m.on_chunk(seq, at(1, seq), true, 0, 100, 10.0);
+            }
+            for layer in 1..10 {
+                m.on_chunk(seq + layer, at(1, seq + layer), false, 0, 100, 10.0);
+            }
+            seq += 10;
+        }
+        assert!(m.roll(1_000));
+        let loss = m.snapshot().loss;
+        assert!((loss - 0.25).abs() < 0.03, "{loss}");
+    }
+
+    /// #945: three base chunks gone in a row is a burst, read either way.
+    #[test]
+    fn a_run_of_base_chunks_or_hops_is_a_burst() {
+        let mut m = PathMeter::new(1_000, 1.0);
+        m.on_chunk(0, at(1, 0), true, 0, 100, 10.0);
+        for k in 1..=3 {
+            m.expect_base(at(1, k));
+        }
+        m.on_chunk(1, at(1, 4), true, 0, 100, 10.0);
+        assert!(m.roll(1_000));
+        assert!((m.snapshot().burst - 1.0).abs() < 1e-9);
+
+        let mut m = PathMeter::new(1_000, 1.0);
+        m.on_chunk(0, at(1, 0), false, BURST_RUN, 100, 10.0);
+        assert!(m.roll(1_000));
+        assert!((m.snapshot().burst - 1.0).abs() < 1e-9);
     }
 
     #[test]

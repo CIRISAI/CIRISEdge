@@ -245,6 +245,16 @@ impl DirectLinksConfig {
         self.proposing == Proposing::On && self.facilitator.is_some()
     }
 
+    /// Why [`Self::proposes`] says no, as a `direct_link` key.
+    #[must_use]
+    pub fn off_label(&self) -> &'static str {
+        if self.proposing == Proposing::On {
+            crate::observability::DIRECT_LINK_OFF_NO_FACILITATOR
+        } else {
+            crate::observability::DIRECT_LINK_OFF_PROPOSING_OFF
+        }
+    }
+
     /// The facilitator the genesis bundle implies: the `ip` transport hint of
     /// the first baked serve node that carries one (falling through the list
     /// past serve nodes with no dial hint), host AND port. A canonical answers

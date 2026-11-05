@@ -882,6 +882,7 @@ fn attestation_outcome_to_apply(
                     ),
                     retry,
                     awaits_signer: None,
+                    class: None,
                 },
                 Some(reason.as_str()),
             )
@@ -2652,6 +2653,15 @@ impl std::fmt::Debug for BridgeEngine {
     }
 }
 
+/// A row moves to the terminal schedule at most once per refusal memory, but
+/// a peer picks how many rows do.
+fn terminal_move_log() -> &'static crate::log_throttle::LogThrottle {
+    static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(4, std::time::Duration::from_secs(300), 64)
+    })
+}
+
 impl FederationDirectoryReplicationBridge {
     /// Construct with default [`BridgeConfig`], **v1-only** (no v2
     /// operational-kind admission). For v2 operational admission, use
@@ -2952,6 +2962,9 @@ impl FederationDirectoryReplicationBridge {
         // CIRISEdge P0 telemetry — the sweep gate records its permit wait
         // into the same bag.
         self.sweep_gate.metrics.clone_from(&metrics);
+        if let Some(m) = &metrics {
+            self.decision_rows.attach_telemetry(&m.telemetry);
+        }
         self.metrics = metrics;
         self
     }
@@ -6209,6 +6222,7 @@ impl FederationDirectoryReplicationBridge {
             reason: classified_refusal_reason(plane, content_hash, err, class),
             retry: class.retry(),
             awaits_signer: None,
+            class: Some(class.as_str()),
         }
     }
 
@@ -6238,11 +6252,53 @@ impl FederationDirectoryReplicationBridge {
         use sha2::{Digest as _, Sha256};
         let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
         match outcome.retry_disposition() {
-            None => self.refusal_backoff.clear(kind, &hash),
+            None => {
+                let forgotten = self.refusal_backoff.take(kind, &hash);
+                if let (Some(row), ApplyOutcome::Admitted, Some(m)) =
+                    (forgotten, outcome, self.metrics.as_ref())
+                {
+                    m.telemetry.note_refused_then_admitted(row.class);
+                    m.telemetry.observe_refusal_attempts(
+                        if row.disposition.is_terminal() {
+                            crate::telemetry::DispositionLabel::Terminal
+                        } else {
+                            crate::telemetry::DispositionLabel::Transient
+                        },
+                        u64::from(row.attempts),
+                    );
+                }
+            }
             Some(disposition) => {
-                let window =
-                    self.refusal_backoff
-                        .record_at(kind, hash, disposition, Instant::now());
+                let class = match outcome {
+                    ApplyOutcome::Refused { class, .. } => *class,
+                    _ => None,
+                };
+                let recorded = self.refusal_backoff.record_tracked_at(
+                    kind,
+                    hash,
+                    disposition,
+                    class,
+                    Instant::now(),
+                );
+                let window = recorded.window;
+                if recorded.moved_to_terminal {
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.telemetry.note_moved_to_terminal();
+                    }
+                    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                        terminal_move_log().check(kind.as_wire_str())
+                    {
+                        tracing::info!(
+                            target: "edge.refusal.terminal",
+                            kind = kind.as_wire_str(),
+                            class = class.unwrap_or(crate::telemetry::REFUSAL_CLASS_OTHER),
+                            next_ask_secs = window.as_secs(),
+                            suppressed_prev,
+                            "a refused row moved to the terminal schedule: its verdict waited \
+                             on nothing this node can see replicating (CIRISEdge#858)"
+                        );
+                    }
+                }
                 // DEBUG: the refusal itself already WARNs at the #425 choke with
                 // its reason and disposition. This line answers only "and for how
                 // long will the node stop asking", which is the operator's next
@@ -13007,6 +13063,64 @@ pub(crate) mod tests {
         }
     }
 
+    /// v44 — the refusal's whole life, through the one choke: the silent move
+    /// to terminal, then the admission that says what the row cost and which
+    /// refusal it outlived (`FSD/EVENT_PATH_MODEL.md` M8).
+    #[test]
+    fn a_row_refused_past_the_cap_then_admitted_is_on_the_books() {
+        let (_backend, bridge) = make_bridge(&[]);
+        let m = crate::observability::EdgeMetrics::new();
+        let bridge = bridge.with_metrics(Some(m.clone()));
+        let refused = ApplyOutcome::Refused {
+            reason: "short set".to_owned(),
+            retry: RetryDisposition::Transient,
+            awaits_signer: None,
+            class: Some(ApplyRefusalClass::RetryAfterStanding.as_str()),
+        };
+        for _ in 0..7 {
+            bridge.remember_outcome(EnvelopeKind::Attestation, b"row", &refused);
+        }
+        assert_eq!(m.snapshot().apply_refusals["moved_to_terminal"], 0);
+        bridge.remember_outcome(EnvelopeKind::Attestation, b"row", &refused);
+        assert_eq!(m.snapshot().apply_refusals["moved_to_terminal"], 1);
+        bridge.remember_outcome(EnvelopeKind::Attestation, b"row", &refused);
+        assert_eq!(
+            m.snapshot().apply_refusals["moved_to_terminal"],
+            1,
+            "it moved once"
+        );
+
+        bridge.remember_outcome(EnvelopeKind::Attestation, b"row", &ApplyOutcome::Admitted);
+        let s = m.snapshot();
+        assert_eq!(
+            s.apply_refusals["refused_then_admitted:retry_after_standing"],
+            1
+        );
+        let attempts = &s.refusal_attempts["terminal"];
+        assert_eq!(attempts.count, 1);
+        assert!((attempts.sum_seconds - 9.0).abs() < 1e-9, "nine refusals");
+
+        bridge.remember_outcome(EnvelopeKind::Attestation, b"row", &ApplyOutcome::Duplicate);
+        bridge.remember_outcome(EnvelopeKind::Attestation, b"other", &ApplyOutcome::Admitted);
+        assert_eq!(
+            m.snapshot().apply_refusals["refused_then_admitted:retry_after_standing"],
+            1,
+            "a row with no refusal behind it is not a recovery"
+        );
+    }
+
+    #[test]
+    fn the_bridge_hands_its_decision_rows_to_the_bag() {
+        let (_backend, bridge) = make_bridge(&[]);
+        let m = crate::observability::EdgeMetrics::new();
+        let bridge = bridge.with_metrics(Some(m.clone()));
+        assert_eq!(m.snapshot().decision_row_subscribers, 0);
+        let rx = bridge.subscribe_decision_rows();
+        assert_eq!(m.snapshot().decision_row_subscribers, 1);
+        drop(rx);
+        assert_eq!(m.snapshot().decision_row_subscribers, 0);
+    }
+
     /// persist v55.0.0 — each typed verdict through the apply-door choke
     /// (`refuse`) earns `want`.
     fn assert_v55_dispositions(rows: Vec<(ciris_persist::federation::Error, RetryDisposition)>) {
@@ -14213,8 +14327,8 @@ pub(crate) mod tests {
         // (a) IDLE — nothing offered: both accepted-apply counters empty.
         let idle = metrics.snapshot();
         assert!(
-            idle.replication_applied_total.is_empty()
-                && idle.replication_duplicate_total.is_empty(),
+            idle.replication_applied_total.values().all(|n| *n == 0)
+                && idle.replication_duplicate_total.values().all(|n| *n == 0),
             "an idle node books no accepted applies"
         );
         // (b) Apply a FRESH (never-seeded) Key row → Admitted → applied_total.
@@ -14236,7 +14350,7 @@ pub(crate) mod tests {
         // The applied axis is distinct from the duplicate axis — an admit
         // books ONLY applied, never both (the #433 distinct-states rule).
         assert!(
-            snap.replication_duplicate_total.is_empty(),
+            snap.replication_duplicate_total.values().all(|n| *n == 0),
             "an Admitted apply books applied_total, not duplicate_total"
         );
     }
@@ -24547,7 +24661,7 @@ pub(crate) mod tests {
             snap.apply_refusals_by_kind
                 .get(&EnvelopeKind::Attestation)
                 .copied(),
-            None,
+            Some(0),
             "nothing was refused: {:?}",
             snap.apply_refusals_by_kind,
         );

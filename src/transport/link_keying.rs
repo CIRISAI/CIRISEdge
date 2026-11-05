@@ -64,8 +64,8 @@
 //! costs nothing to drain.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 
@@ -168,11 +168,13 @@ impl ReceiverOrder {
         if !senders.admit(sender.identity) {
             return Err(SealRefusal::HandshakeSenderRate {
                 identified: sender.identity.is_some(),
+                standing: sender.standing,
             });
         }
         if !node.admit() {
             return Err(SealRefusal::HandshakeNodeRate {
                 standing: sender.standing,
+                identified: sender.identity.is_some(),
             });
         }
         Ok(())
@@ -193,12 +195,16 @@ pub struct KeyingDone {
     pub ticket: u64,
     /// What `respond` answered.
     pub outcome: Result<(LinkTransit, String), AvHandshakeError>,
+    /// Which budget it came through.
+    pub standing: bool,
+    /// When it joined the queue.
+    pub queued_at: Instant,
 }
 
 #[derive(Debug, Default)]
 struct Queues {
-    standing: VecDeque<HandshakeJob>,
-    strangers: VecDeque<HandshakeJob>,
+    standing: VecDeque<(HandshakeJob, Instant)>,
+    strangers: VecDeque<(HandshakeJob, Instant)>,
     running: usize,
 }
 
@@ -209,7 +215,7 @@ pub struct Keyer {
     queues: Mutex<Queues>,
     workers: usize,
     done: mpsc::UnboundedSender<KeyingDone>,
-    panicked: AtomicU64,
+    metrics: OnceLock<crate::observability::EdgeMetrics>,
 }
 
 impl Keyer {
@@ -233,7 +239,7 @@ impl Keyer {
                 queues: Mutex::new(Queues::default()),
                 workers,
                 done,
-                panicked: AtomicU64::new(0),
+                metrics: OnceLock::new(),
             }),
             rx,
         )
@@ -243,6 +249,30 @@ impl Keyer {
         self.queues
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Count into the node's bag, the one the host reads: the seals' keyer is
+    /// built before the Edge's bag exists.
+    pub fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        if self.metrics.set(metrics).is_ok() {
+            self.publish(&self.queues());
+        }
+    }
+
+    /// The gauges, set where the queues change, under their lock: a load, not
+    /// a walk, for whoever reads them.
+    fn publish(&self, q: &Queues) {
+        if let Some(m) = self.metrics.get() {
+            m.telemetry
+                .set_keyer_queued(q.standing.len(), q.strangers.len());
+            m.telemetry.set_keyer_workers(self.workers, q.running);
+        }
+    }
+
+    fn count(&self, label: &'static str) {
+        if let Some(m) = self.metrics.get() {
+            m.inc_link_seal(label);
+        }
     }
 
     /// Queue one admitted job, or refuse it: the queues never grow past their
@@ -261,11 +291,12 @@ impl Keyer {
             if queue.len() >= bound {
                 return Err(SealRefusal::DecapSaturated { standing });
             }
-            queue.push_back(job);
+            queue.push_back((job, Instant::now()));
             let start = q.running < self.workers;
             if start {
                 q.running += 1;
             }
+            self.publish(&q);
             start
         };
         if start_worker {
@@ -282,13 +313,15 @@ impl Keyer {
         loop {
             let next = {
                 let mut q = self.queues();
-                let next = q.standing.pop_front().or_else(|| q.strangers.pop_front());
+                let standing = q.standing.pop_front().map(|j| (j, true));
+                let next = standing.or_else(|| q.strangers.pop_front().map(|j| (j, false)));
                 if next.is_none() {
                     q.running -= 1;
                 }
+                self.publish(&q);
                 next
             };
-            let Some(job) = next else {
+            let Some(((job, queued_at), standing)) = next else {
                 return;
             };
             // Unwinding here would lose a worker for good, which is the wedge
@@ -299,9 +332,12 @@ impl Keyer {
             let outcome = match ran {
                 Ok(Some(outcome)) => outcome,
                 // The link closed or ran out its budget in the queue.
-                Ok(None) => continue,
+                Ok(None) => {
+                    self.count(crate::observability::LINK_SEAL_KEYING_SKIPPED_STALE);
+                    continue;
+                }
                 Err(_) => {
-                    self.panicked.fetch_add(1, Ordering::Relaxed);
+                    self.count(crate::observability::LINK_SEAL_KEYER_PANICKED);
                     tracing::error!(
                         link = %hex::encode(job.link()),
                         "the transit KEX panicked on a handshake; the link is refused and the \
@@ -316,6 +352,8 @@ impl Keyer {
                 link: job.link(),
                 ticket: job.ticket(),
                 outcome,
+                standing,
+                queued_at,
             });
         }
     }

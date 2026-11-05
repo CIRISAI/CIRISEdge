@@ -77,6 +77,9 @@ pub mod rate_limit;
 #[cfg(test)]
 mod role_matrix_gauntlet;
 pub mod runtime_budget;
+/// v44 — the operator's telemetry: the catalogue, lock-free histograms and
+/// gauges, and shaping's windowed ledger (`docs/TELEMETRY_CATALOGUE.md`).
+pub mod telemetry;
 // v6.1.0 (CIRISEdge#175, FSD §3.3) — announce-suppression policy
 // + edge-side registry mirroring the recommended Leviculum
 // `AnnounceControl` extension shape.

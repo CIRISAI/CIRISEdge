@@ -36,12 +36,12 @@
 )]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
 use super::controller::{
     Admission, ChunkPos, ClassPolicy, ControlMsg, ControllerConfig, DecisionKind, DecisionLog,
-    EgressMeter, JitterSource, ParentSelector, PathChunk, Role, SelectorAction, ShedReason,
-    SplitMix64, SubscribeRequest, Tier,
+    EgressMeter, JitterSource, ParentSelector, PathChunk, PeerState, Role, SelectorAction,
+    ShedReason, SplitMix64, SubscribeRequest, Tier,
 };
 use crate::load_ladder::ServiceTier;
 
@@ -116,7 +116,13 @@ impl NodeSpec {
 
 #[derive(Debug, Clone)]
 enum Payload {
-    Chunk { seq: u64, full: bool, emitted: u64 },
+    Chunk {
+        seq: u64,
+        full: bool,
+        emitted: u64,
+        /// The sender's per-link counter: dense over what it really sent.
+        hop: u64,
+    },
     Ctrl(ControlMsg<u32>),
     LinkDown,
 }
@@ -227,6 +233,31 @@ pub struct Sim {
     pub canonical_video: Vec<(u64, u32)>,
     /// Stage 2: the canonical's peak audio commitment (bps).
     pub canonical_peak_bps: u64,
+    /// One sequence number in this many is base-or-audio, in a `chunk_seq`
+    /// shared with the layers above it, as in production; the rest go only
+    /// to primaries. 1 is the unlayered world: every chunk carries the audio.
+    pub layer_period: u64,
+    /// Whether a layered primary's base chunks are video-sized, not audio.
+    pub heavy_base: bool,
+    /// Legs capped at the base layer by the host (`set_layer_policy`).
+    pub capped_legs: HashSet<(u32, u32)>,
+    /// Whether the publisher sends only its base layer (tier 2). The chunks
+    /// above it still spend their sequence numbers.
+    pub publisher_audio_only: bool,
+    /// A leg that never sends every `n`th base-or-audio chunk (before its
+    /// hop counter, as a relay that just does not forward them).
+    pub withhold_base: Option<(u32, u32, u64)>,
+    /// Whether a leg that stays refused is shed to the base layer (C5).
+    pub c5: bool,
+    /// Legs shed so far (C5).
+    pub legs_shed: u64,
+    /// Chunks an uplink refused: `(base-or-audio, above the base)`.
+    pub refused: (u64, u64),
+    /// Per leg: consecutive refusals, consecutive sends, shed now.
+    leg_cong: HashMap<(u32, u32), (u32, u32, bool)>,
+    base_sent: HashMap<(u32, u32), u64>,
+    hop_sent: HashMap<(u32, u32), u64>,
+    hop_heard: HashMap<(u32, u32), u64>,
 }
 
 impl Sim {
@@ -310,6 +341,18 @@ impl Sim {
             canonical: None,
             canonical_video: Vec::new(),
             canonical_peak_bps: 0,
+            layer_period: 1,
+            heavy_base: false,
+            capped_legs: HashSet::new(),
+            publisher_audio_only: false,
+            withhold_base: None,
+            c5: false,
+            legs_shed: 0,
+            refused: (0, 0),
+            leg_cong: HashMap::new(),
+            base_sent: HashMap::new(),
+            hop_sent: HashMap::new(),
+            hop_heard: HashMap::new(),
         }
     }
 
@@ -521,6 +564,10 @@ impl Sim {
         fresh.uplink_free_at = self.now as f64;
         fresh.last_unserved = self.now;
         self.nodes[i] = fresh;
+        // Its links are new, and so are their counters.
+        for hops in [&mut self.hop_sent, &mut self.hop_heard] {
+            hops.retain(|(from, to), _| *from != n && *to != n);
+        }
     }
 
     pub fn alive(&self, n: u32) -> bool {
@@ -548,24 +595,89 @@ impl Sim {
         self.push(at + lat.ceil() as u64, from, to, Payload::Ctrl(msg));
     }
 
-    fn send_chunk(&mut self, at: u64, from: u32, to: u32, seq: u64, full: bool, emitted: u64) {
-        let bytes = if full {
+    /// Whether `seq` is base-or-audio.
+    fn essential(&self, seq: u64) -> bool {
+        seq % self.layer_period.max(1) == 0
+    }
+
+    fn chunk_bytes(&self, seq: u64, full: bool) -> u64 {
+        if full && (self.layer_period <= 1 || self.heavy_base || !self.essential(seq)) {
             self.full_bytes
         } else {
             self.audio_bytes
-        };
+        }
+    }
+
+    fn next_hop(&mut self, from: u32, to: u32) -> u64 {
+        let hop = self.hop_sent.entry((from, to)).or_insert(0);
+        *hop += 1;
+        *hop - 1
+    }
+
+    /// C5, as `note_leg_outcomes`: a refused chunk or a sent one on this leg.
+    fn note_leg(&mut self, from: u32, to: u32, refused: bool) {
+        if !self.c5 {
+            return;
+        }
+        let e = self.leg_cong.entry((from, to)).or_insert((0, 0, false));
+        if refused {
+            e.1 = 0;
+            e.0 = e.0.saturating_add(1);
+            if !e.2 && e.0 >= 3 {
+                e.2 = true;
+                self.legs_shed += 1;
+            }
+        } else {
+            e.0 = 0;
+            e.1 = e.1.saturating_add(1);
+            if e.2 && e.1 >= 50 {
+                e.2 = false;
+            }
+        }
+    }
+
+    /// Whether the leg's layer policy (the host's cap, or C5) filters `seq`.
+    fn leg_filters(&self, from: u32, to: u32, seq: u64) -> bool {
+        !self.essential(seq)
+            && (self.capped_legs.contains(&(from, to))
+                || self.leg_cong.get(&(from, to)).is_some_and(|e| e.2))
+    }
+
+    fn send_chunk(&mut self, at: u64, from: u32, to: u32, seq: u64, full: bool, emitted: u64) {
+        if self.leg_filters(from, to, seq) {
+            return;
+        }
+        if self.essential(seq) {
+            if let Some((f, t, n)) = self.withhold_base.filter(|w| (w.0, w.1) == (from, to)) {
+                let sent = self.base_sent.entry((f, t)).or_insert(0);
+                *sent += 1;
+                if *sent % n == 0 {
+                    return;
+                }
+            }
+        }
+        let bytes = self.chunk_bytes(seq, full);
         let nowf = at as f64;
         let node = &mut self.nodes[from as usize];
         let start = node.uplink_free_at.max(nowf);
         let q = start - nowf;
         if q > MAX_QUEUE_MS {
+            // Refused by the uplink: no hop counter, as a Busy send takes none.
             node.egress.on_dropped(at, bytes);
+            if self.essential(seq) {
+                self.refused.0 += 1;
+            } else {
+                self.refused.1 += 1;
+            }
+            self.note_leg(from, to, true);
             return;
         }
         let rate = node.spec.uplink_streams * self.cfg.stream_bps as f64;
         let depart = start + bytes as f64 * 8_000.0 / rate;
         node.uplink_free_at = depart;
         node.egress.on_sent(at, bytes, q);
+        self.note_leg(from, to, false);
+        let hop = self.next_hop(from, to);
         let jitter_draw = self.net.unit();
         let flip_draw = self.net.unit();
         let mut retry_draws = [0.0f64; MAX_ARQ_TRIES as usize];
@@ -617,7 +729,12 @@ impl Sim {
             arrival.ceil() as u64,
             from,
             to,
-            Payload::Chunk { seq, full, emitted },
+            Payload::Chunk {
+                seq,
+                full,
+                emitted,
+                hop,
+            },
         );
     }
 
@@ -635,7 +752,11 @@ impl Sim {
         }
         let r = (seq as usize) % kids.len();
         kids.rotate_left(r);
+        let essential = self.essential(seq);
         for (k, role) in kids {
+            if role == Role::Standby && !essential {
+                continue;
+            }
             if first_any {
                 self.send_chunk(at, n, k, seq, full && role == Role::Primary, emitted);
             } else if full && role == Role::Primary {
@@ -672,19 +793,27 @@ impl Sim {
         }
         let at = ev.at;
         match ev.payload {
-            Payload::Chunk { seq, full, emitted } => {
-                let bytes = if full {
-                    self.full_bytes
-                } else {
-                    self.audio_bytes
-                };
+            Payload::Chunk {
+                seq,
+                full,
+                emitted,
+                hop,
+            } => {
+                let bytes = self.chunk_bytes(seq, full);
+                let essential = self.essential(seq);
+                // Unlayered, one sim chunk carries both the video and the
+                // audio a standby receives; layered, it is one or the other.
+                let above_standby = full && (self.layer_period <= 1 || !essential);
+                let heard = self.hop_heard.entry((ev.from, ev.to)).or_insert(0);
+                let hop_lost = hop.saturating_sub(*heard);
+                *heard = hop + 1;
                 let node = &mut self.nodes[to];
                 if let Some(sel) = node.sel.as_mut() {
-                    // Every sim chunk carries the audio a standby receives.
                     let chunk = PathChunk {
                         pos: ChunkPos { epoch: 0, seq },
-                        full,
-                        base_or_audio: true,
+                        full: above_standby,
+                        base_or_audio: essential,
+                        hop_lost,
                         bytes,
                         latency_ms: (at - emitted) as f64,
                     };
@@ -920,10 +1049,13 @@ impl Sim {
             let seq = t / CHUNK_MS;
             self.nodes[0].got_full.set(seq);
             self.nodes[0].got_any.set(seq);
-            self.forward(t, 0, seq, true, t, true);
+            if !self.publisher_audio_only || self.essential(seq) {
+                self.forward(t, 0, seq, true, t, true);
+            }
             if let Some(c) = self.canonical {
                 if self.nodes[c as usize].alive {
                     let lat = self.base_latency(0, c);
+                    let hop = self.next_hop(0, c);
                     self.push(
                         t + lat.ceil() as u64,
                         0,
@@ -932,6 +1064,7 @@ impl Sim {
                             seq,
                             full: true,
                             emitted: t,
+                            hop,
                         },
                     );
                 }
@@ -969,6 +1102,13 @@ impl Sim {
             .sel
             .as_ref()
             .and_then(|s| s.standby().copied())
+    }
+    /// `n`'s health reading of its candidate `p`.
+    pub fn state_of(&self, n: u32, p: u32) -> Option<PeerState> {
+        self.nodes[n as usize]
+            .sel
+            .as_ref()
+            .and_then(|s| s.state_of(&p))
     }
     pub fn children_of(&self, n: u32) -> Vec<(u32, Role)> {
         self.nodes[n as usize]
@@ -1306,6 +1446,239 @@ mod scenarios {
                 m.flips >= 5 || m.change_rate_per_120s > 1.0,
                 "mutant did not oscillate{}",
                 sim.report(None, "")
+            );
+        }
+    }
+
+    // ── #945: layered primaries. Every leg here carries the base and its
+    // layers in one `chunk_seq`, so a leg that does not carry them all shows
+    // gaps that mean nothing. The unlayered worlds above always delivered
+    // every seq, which is why they could not see this.
+
+    const LAYER_PERIOD: u64 = 3;
+
+    /// A small layered room, settled: `(world, leaf, its primary, its
+    /// standby)`, for the first leaf that holds both.
+    fn layered_world(seed: u64) -> (Sim, u32, u32, u32) {
+        let mut others = vec![NodeSpec::relay(4.0), NodeSpec::relay(4.0)];
+        others.extend(std::iter::repeat(NodeSpec::leaf()).take(3));
+        let mut sim = Sim::new(
+            seed,
+            ControllerConfig::interactive(),
+            NodeSpec::relay(10.0),
+            &others,
+            Candidates::All,
+            None,
+        );
+        sim.layer_period = LAYER_PERIOD;
+        sim.run_until(30 * SECOND);
+        let n = sim.node_count() as u32;
+        let leaf = (3..n)
+            .find(|l| sim.primary_of(*l).is_some() && sim.standby_of(*l).is_some())
+            .expect("a leaf with both parents");
+        let (p, s) = (sim.primary_of(leaf).unwrap(), sim.standby_of(leaf).unwrap());
+        (sim, leaf, p, s)
+    }
+
+    /// Run to `to_ms`; the seconds `p` read Degraded at `leaf`.
+    fn degraded_seconds(sim: &mut Sim, to_ms: u64, leaf: u32, p: u32) -> usize {
+        let mut seconds = 0;
+        while sim.now < to_ms {
+            sim.run_until(sim.now + SECOND);
+            seconds += usize::from(sim.state_of(leaf, p) == Some(PeerState::Degraded));
+        }
+        seconds
+    }
+
+    /// **L1 — a capped primary is not a lossy one.** A host cap or a shed on
+    /// the leg leaves gaps on the primary. Pass: never Degraded, never moved.
+    #[test]
+    fn l1_a_capped_layered_primary_keeps_its_parent() {
+        for seed in [1u64, 2, 3] {
+            let (mut sim, leaf, p, s) = layered_world(seed);
+            sim.capped_legs.insert((p, leaf));
+            let bad = degraded_seconds(&mut sim, 70 * SECOND, leaf, p);
+            eprintln!("[ALM-CTRL] L1 seed={seed} leaf={leaf} {p}/{s} degraded={bad}s");
+            assert_eq!(bad, 0, "{}", sim.report(Some(leaf), "capped read as lossy"));
+            assert_eq!(
+                sim.primary_of(leaf),
+                Some(p),
+                "{}",
+                sim.report(Some(leaf), "a cap moved the call")
+            );
+        }
+    }
+
+    /// **L2 — a publisher shedding its own layers is nobody's loss** (tier 2).
+    #[test]
+    fn l2_a_publisher_at_tier_two_moves_nobody() {
+        for seed in [1u64, 2, 3] {
+            let (mut sim, leaf, p, s) = layered_world(seed);
+            sim.publisher_audio_only = true;
+            let before: Vec<_> = (1..sim.node_count() as u32)
+                .map(|n| sim.primary_of(n))
+                .collect();
+            let bad = degraded_seconds(&mut sim, 70 * SECOND, leaf, p);
+            eprintln!("[ALM-CTRL] L2 seed={seed} leaf={leaf} {p}/{s} degraded={bad}s");
+            assert_eq!(bad, 0, "{}", sim.report(Some(leaf), "tier 2 read as loss"));
+            let after: Vec<_> = (1..sim.node_count() as u32)
+                .map(|n| sim.primary_of(n))
+                .collect();
+            assert_eq!(before, after, "{}", sim.report(None, "tier 2 moved a node"));
+        }
+    }
+
+    /// **L3 — a primary really dropping base does read lossy**, capped or not,
+    /// and the leaf moves off it. The chunks are never sent, so no hop counter
+    /// shows them. Pass: Degraded, then a new primary.
+    #[test]
+    fn l3_a_layered_primary_dropping_base_is_left() {
+        for capped in [false, true] {
+            for seed in [1u64, 2, 3] {
+                let (mut sim, leaf, p, s) = layered_world(seed);
+                if capped {
+                    sim.capped_legs.insert((p, leaf));
+                }
+                sim.withhold_base = Some((p, leaf, 3));
+                let bad = degraded_seconds(&mut sim, 90 * SECOND, leaf, p);
+                eprintln!(
+                    "[ALM-CTRL] L3 seed={seed} capped={capped} leaf={leaf} {p}/{s} \
+                     degraded={bad}s now={:?}",
+                    sim.primary_of(leaf)
+                );
+                assert!(
+                    sim.primary_of(leaf) != Some(p),
+                    "{}",
+                    sim.report(Some(leaf), "stayed on a parent dropping base")
+                );
+            }
+        }
+    }
+
+    /// The T1 world with `period` chunks to a layer group.
+    fn run_t1_layered(
+        seed: u64,
+        cfg: ControllerConfig,
+        period: u64,
+        configure: impl Fn(&mut Sim),
+    ) -> (Sim, Metrics) {
+        let mut sim = t1_world(seed, cfg);
+        sim.layer_period = period;
+        configure(&mut sim);
+        sim.run_until(T1_END);
+        let s = subs(&sim);
+        let m = sim.metrics(30 * SECOND, T1_END, &s);
+        (sim, m)
+    }
+
+    /// **L4 — a herd that drops base still oscillates on layered primaries.**
+    /// With the controls off and a video-sized base, the overload refuses base
+    /// chunks. They take no hop counter, and no `chunk_seq` gap is read any
+    /// more, so the other path is what shows it. Mutation: no cross-path
+    /// reading on a primary, and this goes quiet.
+    #[test]
+    fn l4_a_layered_herd_dropping_base_still_oscillates() {
+        for seed in [1u64, 2] {
+            let (sim, m) =
+                run_t1_layered(seed, ControllerConfig::interactive(), LAYER_PERIOD, |_| {});
+            emit("L4", &sim, &m);
+            assert_eq!(m.overcap_samples, 0, "{}", sim.report(None, "over cap"));
+            assert_eq!(m.flips, 0, "{}", sim.report(None, "flips"));
+            let cfg = ControllerConfig::interactive().herding_mutant();
+            let (sim, m) = run_t1_layered(seed, cfg, LAYER_PERIOD, |s| s.heavy_base = true);
+            emit("L4-mut", &sim, &m);
+            eprintln!("[ALM-CTRL] L4-mut seed={seed} refused={:?}", sim.refused);
+            assert!(sim.refused.0 > 0, "the premise: base really refused");
+            assert!(
+                m.flips >= 5 || m.change_rate_per_120s > 1.0,
+                "the mutant held still{}",
+                sim.report(None, "")
+            );
+        }
+    }
+
+    /// **L5 — a herd that only loses layers does NOT oscillate, by design.**
+    /// With a light base an overload refuses only the layers above it, on the
+    /// sender, before the hop counter, and base and audio keep arriving: to a
+    /// child that is what a cap or a shed looks like, and no chunk it was owed
+    /// without question went missing. So children hold still (the old meter
+    /// flipped them 744 and 2309 times on these gaps) and this failure belongs
+    /// to the sender: the commitment over the uplink stays visible, and the
+    /// real controller's own uplink meter curtails it (L6). C5 is on, with
+    /// enough layers in a row for a leg to reach its refusal streak.
+    #[test]
+    fn l5_a_layers_only_herd_settles_and_stays_visible_at_the_sender() {
+        for seed in [1u64, 2] {
+            let cfg = ControllerConfig::interactive().herding_mutant();
+            let (sim, m) = run_t1_layered(seed, cfg, 5, |s| s.c5 = true);
+            emit("L5-mut", &sim, &m);
+            eprintln!(
+                "[ALM-CTRL] L5-mut seed={seed} legs_shed={} refused={:?}",
+                sim.legs_shed, sim.refused
+            );
+            assert!(sim.refused.1 > 0, "the premise: layers really refused");
+            assert_eq!(sim.refused.0, 0, "the premise: no base refused");
+            assert!(sim.legs_shed > 0, "the premise: C5 shed legs");
+            assert!(
+                t1_verdict(&sim, &m).is_err() && m.overcap_samples > 0,
+                "a herd reads as healthy{}",
+                sim.report(None, "")
+            );
+        }
+    }
+
+    /// **L6 — the real controller stops a layers-only overload at the sender.**
+    /// A liar's uplink refuses layers while base and audio get through, so no
+    /// child reads it as loss: its own egress meter has to catch it, flag the
+    /// over-claim and bring its commitment under what it measured.
+    #[test]
+    fn l6_a_layered_liar_is_curtailed_from_its_own_uplink() {
+        for seed in [1u64, 2, 3] {
+            let liar = 1u32;
+            let streams = 6.0;
+            let mut others = vec![
+                NodeSpec {
+                    uplink_streams: streams,
+                    advertised_streams: Some(120.0),
+                    forwarder: true,
+                    member: true,
+                },
+                NodeSpec::relay(8.0),
+                NodeSpec::relay(8.0),
+            ];
+            others.extend(std::iter::repeat(NodeSpec::leaf()).take(T1_LEAVES));
+            let mut sim = Sim::new(
+                seed,
+                ControllerConfig::interactive(),
+                NodeSpec::relay(4.0),
+                &others,
+                Candidates::All,
+                None,
+            );
+            sim.layer_period = LAYER_PERIOD;
+            sim.c5 = true;
+            sim.run_until(T1_END);
+            let cap = sim.cfg.commit_fraction * streams * sim.cfg.stream_bps as f64;
+            eprintln!(
+                "[ALM-CTRL] L6 seed={seed} ceiling={:?} committed={} refused={:?} legs_shed={} \
+                 overclaims={}",
+                sim.ceiling(liar),
+                sim.committed(liar),
+                sim.refused,
+                sim.legs_shed,
+                sim.log.count(DecisionKind::OverClaim)
+            );
+            assert!(sim.refused.1 > 0, "the premise: layers really refused");
+            assert!(
+                sim.log.count(DecisionKind::OverClaim) >= 1,
+                "over-claim never flagged{}",
+                sim.report(Some(liar), "")
+            );
+            assert!(
+                (sim.committed(liar) as f64) <= cap + 1.0,
+                "liar committed {} > 0.65 × measured{}",
+                sim.committed(liar),
+                sim.report(Some(liar), "")
             );
         }
     }

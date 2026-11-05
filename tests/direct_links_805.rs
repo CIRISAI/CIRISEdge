@@ -406,11 +406,14 @@ async fn trio(tag: &str, a_direct: DirectLinksConfig, b_direct: DirectLinksConfi
                 .expect("seed the route");
         }
     }
+    // Each asks for the other: T's announce rate limit stops relaying a node
+    // after its grace (about 30 s at 5 s), so a node that starts later on a
+    // loaded box would wait for an announce that is not coming.
     let known = wait_until(Duration::from_secs(60), || async {
-        a.transport.knows_peer(&b.key.key_id).await && b.transport.knows_peer(&a.key.key_id).await
+        a.transport.seek_peer(&b.key.key_id).await && b.transport.seek_peer(&a.key.key_id).await
     })
     .await;
-    assert!(known, "A and B learn each other's announces through T");
+    assert!(known, "A and B reach each other through T");
     Trio {
         t,
         a,
@@ -586,11 +589,16 @@ async fn proposing_off_never_proposes_and_a_member_behind_t_is_unreachable() {
         other => panic!("a derived address behind T answers no dial: {other:?}"),
     }
     assert_eq!(dl(&p.a.metrics, "direct_link_proposed"), 0);
-    assert!(
-        p.a.metrics.direct_link().is_empty(),
-        "the default touches nothing: {:?}",
+    // v44 — silence here used to read like idle: it says why it is silent, and
+    // nothing else moved.
+    assert_eq!(dl(&p.a.metrics, "direct_link_off:proposing_off"), 1);
+    assert_eq!(
+        p.a.metrics.direct_link().len(),
+        1,
+        "the default touches nothing else: {:?}",
         p.a.metrics.direct_link()
     );
+    assert_eq!(p.a.metrics.snapshot().direct_link_proposing, 0);
     assert_eq!(p.a.transport.direct_path_state(&p.b.key.key_id), None);
 }
 
@@ -895,12 +903,12 @@ async fn quad(tag: &str) -> Quad {
         }
     }
     let known = wait_until(Duration::from_secs(90), || async {
-        a.transport.knows_peer(&b.key.key_id).await
-            && b.transport.knows_peer(&a.key.key_id).await
-            && a.transport.knows_peer(&r.key.key_id).await
-            && b.transport.knows_peer(&r.key.key_id).await
-            && c.transport.knows_peer(&r.key.key_id).await
-            && r.transport.knows_peer(&c.key.key_id).await
+        a.transport.seek_peer(&b.key.key_id).await
+            && b.transport.seek_peer(&a.key.key_id).await
+            && a.transport.seek_peer(&r.key.key_id).await
+            && b.transport.seek_peer(&r.key.key_id).await
+            && c.transport.seek_peer(&r.key.key_id).await
+            && r.transport.seek_peer(&c.key.key_id).await
     })
     .await;
     assert!(known, "every node learns the others it needs through R");
@@ -1694,7 +1702,7 @@ async fn one_occurrence_key_id_keys_a_hop_under_use_node_identity() {
     );
     assert!(
         wait_until(Duration::from_secs(60), || async {
-            a.transport.knows_peer(&r_id).await && r.transport.knows_peer(&a_id).await
+            a.transport.seek_peer(&r_id).await && r.transport.seek_peer(&a_id).await
         })
         .await,
         "A and R learn each other"

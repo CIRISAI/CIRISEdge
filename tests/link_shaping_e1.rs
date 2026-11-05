@@ -180,6 +180,7 @@ struct Node {
     dir: Arc<SqliteBackend>,
     seen: Arc<Mutex<Vec<InboundFrame>>>,
     runtime: Option<Arc<ReplicationRuntime>>,
+    ladder: Arc<ciris_edge::load_ladder::SharedLadder>,
 }
 
 impl Node {
@@ -301,6 +302,10 @@ async fn duo(tag: &str, policy_a: ShapingPolicy, policy_b: ShapingPolicy) -> Duo
         if i == 0 {
             port_a = addr.port();
         }
+        // As `EdgeBuilder::build` does.
+        let ladder = Arc::new(ciris_edge::load_ladder::SharedLadder::default());
+        ladder.attach_telemetry(Arc::clone(&metrics.telemetry));
+        transport.attach_load_ladder(Arc::clone(&ladder));
         let seen: Arc<Mutex<Vec<InboundFrame>>> = Arc::new(Mutex::new(Vec::new()));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(256);
         let listener = Arc::clone(&transport);
@@ -320,6 +325,7 @@ async fn duo(tag: &str, policy_a: ShapingPolicy, policy_b: ShapingPolicy) -> Duo
             dir,
             seen,
             runtime: None,
+            ladder,
         });
     }
     let b = nodes.pop().expect("b");
@@ -779,6 +785,12 @@ async fn bulk_to_a_peer_reachable_only_over_its_shaped_link_rides_it_slowly_and_
         "{:?}",
         t.a.metrics.link_shaping()
     );
+    assert_eq!(
+        t.a.shaping("link_shaping_bulk_fallback:ok"),
+        1,
+        "v44: it says how it ended"
+    );
+    assert_eq!(t.a.shaping("link_shaping_bulk_fallback:failed"), 0);
     assert_eq!(t.a.shaping("link_shaping_bulk_refused"), 0);
     assert_eq!(
         t.a.transport.refused_dials_for_test(),
@@ -1068,6 +1080,12 @@ async fn at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_cro
         "{:?}",
         t.b.metrics.link_shaping()
     );
+    // v44 — one number used to count both ends. Only the refuser is at its
+    // bound; the refused node's count says nothing about its own room.
+    assert_eq!(t.a.shaping("link_shaping_home_elsewhere:given"), 1);
+    assert_eq!(t.a.shaping("link_shaping_home_elsewhere:received"), 0);
+    assert_eq!(t.b.shaping("link_shaping_home_elsewhere:received"), 1);
+    assert_eq!(t.b.shaping("link_shaping_home_elsewhere:given"), 0);
     assert_eq!(t.a.transport.shaped_link_count(), 0);
     assert!(!t.a.received(&row).await, "the row never crossed unshaped");
     let err =
@@ -1489,6 +1507,7 @@ async fn start_node(
             dir,
             seen,
             runtime,
+            ladder: Arc::default(),
         },
         addr.port(),
     )
@@ -1878,6 +1897,7 @@ async fn wifi_only_shaping_renegotiates_to_off_on_cellular_and_back() {
         .await
     );
     assert_eq!(t.b.transport.shaped_link_count(), 1);
+    assert_eq!(t.b.shaping("link_shaping_policy_moved"), 0);
 
     let cellular = wifi.with_network(false, true);
     assert_eq!(
@@ -1885,6 +1905,7 @@ async fn wifi_only_shaping_renegotiates_to_off_on_cellular_and_back() {
         1,
         "renegotiated"
     );
+    assert_eq!(t.b.shaping("link_shaping_policy_moved"), 1);
     assert_eq!(t.b.transport.shaped_link_count(), 0);
     let on_cell = typed_payload("AttestationGossip", b"ON-CELL-", 2_000);
     t.b.transport
@@ -2862,6 +2883,10 @@ async fn a_canonical_retired_after_boot_loses_the_seat_class_and_the_bound_exemp
         t.a.transport.shaping_status().links
     );
     assert!(!t.a.transport.is_seat_link_for_test(&b_id));
+    assert!(
+        t.a.shaping("link_shaping_seat_lost") + t.b.shaping("link_shaping_seat_lost") >= 1,
+        "v44: a lost seat is counted, not only logged"
+    );
 
     fresh_link(&t.b, &t.a, b"RETIRE-CLASS-").await;
     let status = t.a.transport.shaping_status();
@@ -2876,4 +2901,92 @@ async fn a_canonical_retired_after_boot_loses_the_seat_class_and_the_bound_exemp
         (1, 0),
         "and it holds the bound's one slot"
     );
+}
+
+/// v44 — a real link through two real listeners moves the event path's
+/// telemetry, each signal from where production books it, on the bag a host
+/// reads. The liveness signals read true with nothing else to say.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_link_moves_the_event_path_telemetry() {
+    let fast = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    let t = duo("tele", fast.clone(), fast).await;
+    let row = marked(b"TELE-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B -> A shaped");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "A delivered B's row"
+    );
+    let shown = wait_until(Duration::from_secs(5), || async {
+        let s = t.a.metrics.snapshot();
+        s.node_alive == 1 && s.shaping_links["counted"] >= 1
+    })
+    .await;
+    assert!(shown, "the node tick has run since the link came up");
+
+    let a = t.a.metrics.snapshot();
+    let b = t.b.metrics.snapshot();
+    // The event loop: the responder saw each of these, timed.
+    assert!(a.event_handler_duration_seconds["link_established"].count >= 1);
+    assert!(a.event_handler_duration_seconds["frame"].count >= 1);
+    assert_eq!(a.event_handler_duration_seconds["keying_applied"].count, 1);
+    assert!(a.leviculum_events_capacity["control"] > 0, "bridged, live");
+    // Keying: on the responder only, on one budget or the other.
+    let keyed = |s: &ciris_edge::observability::EdgeMetricsBundle| {
+        s.seal_keying_duration_seconds["standing"].count
+            + s.seal_keying_duration_seconds["stranger"].count
+    };
+    assert_eq!(keyed(&a), 1, "A answered B's handshake");
+    assert_eq!(keyed(&b), 0, "the dialler decapsulates nothing");
+    assert!(a.seal_keyer_workers["configured"] >= 1);
+    assert_eq!(a.seal_keyer_queued["stranger"], 0, "and it drained");
+    // Both directions of an offer, and the class it landed at.
+    assert_eq!(t.b.shaping("link_shaping_offered:dialled"), 1);
+    assert_eq!(t.b.shaping("link_shaping_offered:answered"), 0);
+    assert_eq!(t.a.shaping("link_shaping_offered:answered"), 1);
+    assert_eq!(t.a.shaping("link_shaping_agreed:server"), 1);
+    assert_eq!(a.shaping_enabled, 1);
+
+    // Shaping's secret: real frames left, and the bundle cannot say so yet.
+    assert!(t.b.shaping("link_shaping_frames_real") >= 1, "they left");
+    assert!(!b.link_shaping.contains_key("link_shaping_frames_real"));
+    assert_eq!(b.shaping_frames_real_windowed["server"], 0);
+    assert_eq!(b.shaping_row_wait_seconds["server"].count, 0);
+    // A closed window with the floor met shows the production path filled it,
+    // in this link's class.
+    let windows = &t.b.metrics.telemetry.shaping_windows;
+    windows.tick(u64::MAX / 2, |_| 3, |_| Duration::ZERO);
+    let flushed = t.b.metrics.snapshot();
+    assert_eq!(flushed.shaping_row_wait_seconds["server"].count, 1);
+    assert_eq!(flushed.shaping_row_wait_seconds["home"].count, 0);
+
+    // The behaviour: edge's own signal reaches the shapers on a tick, with no
+    // `set_load_pressure` and no reader of `service_tier`. Nothing below reads
+    // the tier through the Edge, so only the node tick can move the shaper.
+    assert_eq!(t.a.transport.shaping_status().service_tier, 0);
+    let raised = wait_until(Duration::from_secs(10), || async {
+        t.a.ladder.report(ciris_edge::load_ladder::EdgeLoadSignals {
+            relay_commit_ratio: 1.0,
+            ..Default::default()
+        });
+        t.a.transport.shaping_status().service_tier == 1
+    })
+    .await;
+    assert!(raised, "the raise reached the shapers on the tick");
+    let s = t.a.metrics.snapshot();
+    assert_eq!(s.load_tier, 1);
+    assert_eq!(
+        s.load_tier_changes_total["load_tier:1:edge:relay_commit"], 1,
+        "and it says who put it there"
+    );
+    assert!(
+        s.load_pressure_report_age_seconds < 0.0,
+        "the host never spoke"
+    );
+    assert_eq!(s.shaping_free_slots, 0, "admit-close offers no slot");
 }

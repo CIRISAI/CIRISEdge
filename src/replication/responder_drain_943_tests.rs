@@ -665,3 +665,46 @@ async fn a_failed_reply_is_retried_by_the_next_round_943() {
         .expect("the round after the failure completes");
     assert_eq!(report.kind, EnvelopeKind::Key);
 }
+
+/// v44 — the three signals M2 is read from: the frame's wait in the inbox,
+/// the reply's wait in the lane, and the lane's depth, which rises while the
+/// reverse path holds and falls when it lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_reply_shows_on_the_lane_gauges_and_its_wait_on_the_histograms() {
+    let r = responder();
+    let i = initiator(EnvelopeKind::Key, &[b"key-row-1"]).await;
+    let frames = i.open_round().await;
+    let key = EnvelopeKind::Key.as_wire_str();
+    let snapshot = r.metrics.snapshot();
+    assert_eq!(snapshot.replication_reply_queued["sum"], 0);
+    assert_eq!(snapshot.replication_inbound_wait_seconds[key].count, 0);
+
+    r.seam.hold(EnvelopeKind::Key);
+    r.route(&frames).await;
+    r.drained(EnvelopeKind::Key).await;
+    eventually("the reply reaches the held send", || {
+        !r.seam.entered().is_empty()
+    })
+    .await;
+    let held = r.metrics.snapshot();
+    assert!(
+        held.replication_reply_queued["sum"] >= 1,
+        "the lane holds it"
+    );
+    assert_eq!(
+        held.replication_reply_queued["max"], held.replication_reply_queued["sum"],
+        "one lane"
+    );
+    assert_eq!(
+        held.replication_inbound_wait_seconds[key].count,
+        frames.len() as u64,
+        "every stepped frame was timed"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    r.seam.release(EnvelopeKind::Key);
+    eventually("the lane drains", || {
+        r.metrics.snapshot().replication_reply_queued["sum"] == 0
+    })
+    .await;
+    assert!(r.metrics.snapshot().replication_reply_wait_seconds[key].count >= 1);
+}

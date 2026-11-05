@@ -335,6 +335,8 @@ pub enum SealRefusal {
     HandshakeSenderRate {
         /// Whether the sender is a proven identity, or the shared slot.
         identified: bool,
+        /// Whether the sender had standing.
+        standing: bool,
     },
     /// CIRISEdge#947 — a complete handshake over the node-wide rate.
     #[error(
@@ -344,6 +346,8 @@ pub enum SealRefusal {
     HandshakeNodeRate {
         /// Whether the sender had standing.
         standing: bool,
+        /// Whether the sender is a proven identity.
+        identified: bool,
     },
     /// CIRISEdge#947 — the decapsulation queue is full.
     #[error(
@@ -368,6 +372,36 @@ pub enum SealRefusal {
 }
 
 impl SealRefusal {
+    /// The key under [`Self::label`] that says who was refused, when the
+    /// refusal has one.
+    #[must_use]
+    pub fn refined_label(&self) -> Option<&'static str> {
+        use crate::observability as o;
+        Some(match self {
+            Self::HandshakeSenderRate {
+                identified: false, ..
+            } => o::LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_UNIDENTIFIED,
+            Self::HandshakeSenderRate { standing: true, .. } => {
+                o::LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STANDING
+            }
+            Self::HandshakeSenderRate { .. } => o::LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STRANGER,
+            Self::HandshakeNodeRate { standing: true, .. } => {
+                o::LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STANDING
+            }
+            Self::HandshakeNodeRate {
+                identified: false, ..
+            } => o::LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_UNIDENTIFIED,
+            Self::HandshakeNodeRate { .. } => o::LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STRANGER,
+            Self::DecapSaturated { standing: true } => {
+                o::LINK_SEAL_REFUSED_DECAP_SATURATED_STANDING
+            }
+            Self::DecapSaturated { standing: false } => {
+                o::LINK_SEAL_REFUSED_DECAP_SATURATED_STRANGER
+            }
+            _ => return None,
+        })
+    }
+
     /// The `link_seal` metric label.
     #[must_use]
     pub fn label(&self) -> &'static str {
@@ -771,6 +805,9 @@ pub struct LinkSeals {
     awaiting_bytes_max: AtomicUsize,
     /// Test seam: how long each decapsulation sits, in milliseconds.
     decap_delay_ms: AtomicU64,
+    /// Test seam: the next decapsulation panics.
+    #[cfg(test)]
+    pub(crate) decap_panics: std::sync::atomic::AtomicBool,
     /// Decapsulations run.
     decaps: AtomicU64,
     /// Test seam: how many decapsulations panic from now.
@@ -811,6 +848,8 @@ impl LinkSeals {
             awaiting_links_max: AtomicUsize::new(AWAITING_LINKS_MAX),
             awaiting_bytes_max: AtomicUsize::new(AWAITING_BYTES_MAX),
             decap_delay_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            decap_panics: std::sync::atomic::AtomicBool::new(false),
             decaps: AtomicU64::new(0),
             decap_panics: AtomicU64::new(0),
             first_words_delay_ms: AtomicU64::new(0),
@@ -945,6 +984,11 @@ impl LinkSeals {
         &self,
         job: &HandshakeJob,
     ) -> Option<Result<(LinkTransit, String), AvHandshakeError>> {
+        #[cfg(test)]
+        assert!(
+            !self.decap_panics.swap(false, Ordering::Relaxed),
+            "the test seam's panic"
+        );
         let live = matches!(
             self.links().map.get(&job.link),
             Some(State::Keying { ticket, .. }) if *ticket == job.ticket
@@ -1059,6 +1103,28 @@ impl LinkSeals {
             }
             None => VecDeque::new(),
         }
+    }
+
+    /// v44 — the holds, for the gauges, once a tick: `Awaiting` links and
+    /// their bytes, and the bytes held across every hold. The two
+    /// `before_keys` maps are walked here rather than kept in a total, as
+    /// their own bound is.
+    #[must_use]
+    pub fn occupancy(&self) -> (usize, usize, usize) {
+        let (links, bytes) = {
+            let t = self.links();
+            (t.ledger.links.len(), t.ledger.bytes)
+        };
+        let keying = self.parked().bytes;
+        let resources: usize = self.before_keys().values().map(|(_, b)| *b).sum();
+        let attribution: usize = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|h| h.bytes)
+            .sum();
+        (links, bytes, keying + resources + attribution)
     }
 
     /// CIRISEdge#947 — links the `Awaiting` cap refused since the last call,

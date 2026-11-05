@@ -306,6 +306,7 @@ async fn pair(tag: &str) -> Pair {
     let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(64);
     let (tx_b, mut rx_b) = mpsc::channel::<InboundFrame>(64);
     let metrics_b = EdgeMetrics::new();
+    b.attach_metrics(metrics_b.clone());
     let replication_b = Arc::new(
         ReplicationRuntime::start(
             Arc::clone(&b_dir) as Arc<dyn FederationDirectory>,
@@ -471,6 +472,11 @@ async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
     let p = pair("mid").await;
     p.b_reaches_a(b"warm-up").await;
     assert!(p.b.link_count().await >= 1, "B holds a link to A");
+    let alive = wait_until(Duration::from_secs(5), || async {
+        p.metrics_b.snapshot().node_alive == 1
+    })
+    .await;
+    assert!(alive, "the event loop and the ladder are both turning");
 
     // A send stuck mid-ship, and a round toward A.
     p.b.delay_resource_ships_for_test(60_000);
@@ -543,6 +549,12 @@ async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
     let again = p.b.suspend(Duration::from_secs(5)).await;
     assert!(again.already_suspended, "suspend is idempotent: {again:?}");
     assert_quiet(&again, "second suspend");
+    // v44 — a parked loop reads "not running", never a growing age: a node
+    // asleep on purpose must not look wedged.
+    let parked = p.metrics_b.snapshot();
+    assert!(parked.loop_last_progress_age_seconds["event"] < 0.0);
+    assert!(parked.loop_last_progress_age_seconds["ladder"] < 0.0);
+    assert_eq!(parked.node_alive, 0);
 
     // Resume: same transport, same replication runtime.
     p.b.delay_resource_ships_for_test(0);
@@ -555,6 +567,17 @@ async fn suspend_mid_round_leaves_nothing_open_and_resume_replicates() {
         p.a_row_lands_at_b().await,
         "after resume a row A ships lands in B's directory through B's replication runtime"
     );
+    // v44 — the resume started the wake clock; the runtime's first completed
+    // round closes it (`kick_three_peers_740`). A runs no responder here.
+    p.metrics_b.telemetry.note_round_completed();
+    assert_eq!(
+        p.metrics_b
+            .snapshot()
+            .wake_first_round_duration_seconds
+            .count,
+        1
+    );
+    assert!(p.metrics_b.snapshot().loop_last_progress_age_seconds["event"] >= 0.0);
 }
 
 /// **Cycles.** Suspend → resume four times; each suspend is quiescent, each

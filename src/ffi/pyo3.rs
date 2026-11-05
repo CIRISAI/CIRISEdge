@@ -3443,6 +3443,7 @@ fn metrics_bundle_to_pydict<'py>(
         bundle.unclaimed_ship_refused_total,
     )?;
 
+    telemetry_into_pydict(py, &root, bundle)?;
     Ok(root)
 }
 
@@ -3484,6 +3485,109 @@ fn link_info_to_pydict<'py>(
         },
     )?;
     Ok(out)
+}
+
+/// v44 — the operator's telemetry, one dict entry per bundle field
+/// (`crate::telemetry::TELEMETRY_CATALOGUE`). Closed labels are present at
+/// zero.
+fn telemetry_into_pydict(
+    py: Python<'_>,
+    root: &Bound<'_, pyo3::types::PyDict>,
+    b: &crate::observability::EdgeMetricsBundle,
+) -> PyResult<()> {
+    for (name, family) in [
+        (
+            "event_handler_duration_seconds",
+            &b.event_handler_duration_seconds,
+        ),
+        (
+            "seal_keying_duration_seconds",
+            &b.seal_keying_duration_seconds,
+        ),
+        (
+            "replication_inbound_wait_seconds",
+            &b.replication_inbound_wait_seconds,
+        ),
+        (
+            "replication_reply_wait_seconds",
+            &b.replication_reply_wait_seconds,
+        ),
+        ("shaping_row_wait_seconds", &b.shaping_row_wait_seconds),
+        ("alm_failover_gap_seconds", &b.alm_failover_gap_seconds),
+        (
+            "call_setup_duration_seconds",
+            &b.call_setup_duration_seconds,
+        ),
+        (
+            "first_contact_duration_seconds",
+            &b.first_contact_duration_seconds,
+        ),
+        ("refusal_attempts", &b.refusal_attempts),
+    ] {
+        let out = pyo3::types::PyDict::new(py);
+        for (label, h) in family {
+            out.set_item(label.as_str(), histogram_to_pydict(py, h)?)?;
+        }
+        root.set_item(name, out)?;
+    }
+    root.set_item(
+        "wake_first_round_duration_seconds",
+        histogram_to_pydict(py, &b.wake_first_round_duration_seconds)?,
+    )?;
+    for (name, family) in [
+        ("seal_keyer_queued", &b.seal_keyer_queued),
+        ("seal_keyer_workers", &b.seal_keyer_workers),
+        ("replication_reply_queued", &b.replication_reply_queued),
+        ("load_tier_changes_total", &b.load_tier_changes_total),
+        ("shaping_links", &b.shaping_links),
+        (
+            "shaping_frames_real_windowed",
+            &b.shaping_frames_real_windowed,
+        ),
+        ("shaping_windows_withheld", &b.shaping_windows_withheld),
+        ("leviculum_events_queued", &b.leviculum_events_queued),
+        ("leviculum_events_capacity", &b.leviculum_events_capacity),
+        ("leviculum_events_dropped", &b.leviculum_events_dropped),
+        ("decision_row_unheard_total", &b.decision_row_unheard_total),
+        ("apply_refusals", &b.apply_refusals),
+    ] {
+        let out = pyo3::types::PyDict::new(py);
+        for (label, n) in family {
+            out.set_item(label.as_str(), *n)?;
+        }
+        root.set_item(name, out)?;
+    }
+    for (name, value) in [
+        ("seal_awaiting_links", b.seal_awaiting_links),
+        ("seal_awaiting_bytes", b.seal_awaiting_bytes),
+        ("seal_held_bytes", b.seal_held_bytes),
+        ("load_tier", b.load_tier),
+        ("load_host_pressure", b.load_host_pressure),
+        ("shaping_enabled", b.shaping_enabled),
+        ("shaping_free_slots", b.shaping_free_slots),
+        ("leviculum_shed_packets", b.leviculum_shed_packets),
+        ("direct_link_proposing", b.direct_link_proposing),
+        ("alm_active_calls", b.alm_active_calls),
+        ("alm_c3_peers", b.alm_c3_peers),
+        ("decision_row_subscribers", b.decision_row_subscribers),
+        ("node_alive", b.node_alive),
+    ] {
+        root.set_item(name, value)?;
+    }
+    root.set_item(
+        "load_pressure_report_age_seconds",
+        b.load_pressure_report_age_seconds,
+    )?;
+    root.set_item(
+        "shaping_seat_roster_age_seconds",
+        b.shaping_seat_roster_age_seconds,
+    )?;
+    let ages = pyo3::types::PyDict::new(py);
+    for (name, age) in &b.loop_last_progress_age_seconds {
+        ages.set_item(name.as_str(), *age)?;
+    }
+    root.set_item("loop_last_progress_age_seconds", ages)?;
+    Ok(())
 }
 
 /// One histogram as `{"buckets": {"0.1": n, …, "+Inf": n}, "count": n,
@@ -4289,6 +4393,7 @@ pub const PY_CALL_VERBS: &[&str] = &[
     "epoch",
     "chunk_plaintext_budget",
     "legs",
+    "alm_log",
     "publish",
     "frames",
     "events",
@@ -4368,6 +4473,19 @@ impl PyCall {
     /// The members this node has a leg to, sorted.
     fn legs(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         self.with_call(py, |c| Box::pin(async move { Ok(c.legs()) }))
+    }
+
+    /// ALM C7 — the decision log: `{"hash", "records", "tail"}`. The tail
+    /// names peers, so it belongs to the owner's own session and never to a
+    /// metric. The chained hash and the count are safe to log.
+    fn alm_log(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let (hash, records, tail) =
+            self.with_call(py, |c| Box::pin(async move { Ok(c.alm_log()) }))?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("hash", hash)?;
+        d.set_item("records", records)?;
+        d.set_item("tail", tail)?;
+        Ok(d.into_any().unbind())
     }
 
     /// Seal once and fan out. Returns `{"epoch", "chunk_seq", "delivered",

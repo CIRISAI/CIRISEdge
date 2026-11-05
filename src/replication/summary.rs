@@ -463,6 +463,9 @@ pub enum ApplyOutcome {
         reason: String,
         retry: RetryDisposition,
         awaits_signer: Option<AwaitedSigner>,
+        /// Edge's class for the refusal, when it has one: what
+        /// `refused_then_admitted` is labelled by.
+        class: Option<&'static str>,
     },
     /// The delivered bytes failed to deserialize into the plane's record type — a
     /// producer/consumer wire-shape skew, not absence of work. WARN with the error.
@@ -504,6 +507,7 @@ impl ApplyOutcome {
             reason: reason.into(),
             retry: RetryDisposition::Transient,
             awaits_signer: None,
+            class: None,
         }
     }
 
@@ -516,6 +520,7 @@ impl ApplyOutcome {
             reason: reason.into(),
             retry: RetryDisposition::Transient,
             awaits_signer: Some(AwaitedSigner::Key(signer.into())),
+            class: None,
         }
     }
 
@@ -529,6 +534,7 @@ impl ApplyOutcome {
             reason: reason.into(),
             retry: RetryDisposition::Transient,
             awaits_signer: Some(AwaitedSigner::ActsFor(signer.into())),
+            class: None,
         }
     }
 
@@ -543,6 +549,7 @@ impl ApplyOutcome {
             reason: reason.into(),
             retry: RetryDisposition::Terminal,
             awaits_signer: None,
+            class: None,
         }
     }
 

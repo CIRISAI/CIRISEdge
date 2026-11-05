@@ -47,7 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::decision_log::{DecisionKind, DecisionLog};
-use super::path_meter::{ChunkPos, PathLayers, PathMeter};
+use super::path_meter::{ChunkPos, PathMeter};
 use super::peer_state::{PeerHealth, PeerState};
 use super::{AdmitDecision, ControllerConfig, JitterSource, Offer, PeerRef, Role, Tier};
 
@@ -128,11 +128,16 @@ struct Cand<P> {
 pub struct PathChunk {
     /// Where it sits in the stream.
     pub pos: ChunkPos,
-    /// Whether it arrived as the full stream (a make-before-break confirms
-    /// on these).
+    /// Whether it is more than a standby receives, so it shows a path
+    /// delivering the full stream (a make-before-break confirms on these).
+    /// A property of the chunk: a link's role says what was asked for, not
+    /// what arrives.
     pub full: bool,
     /// Whether it is base-layer or audio: what a standby also receives.
     pub base_or_audio: bool,
+    /// Chunks the sender put on this link ahead of it that never arrived
+    /// (the link's hop counter): loss within the sender's policy.
+    pub hop_lost: u64,
     /// Its size.
     pub bytes: u64,
     /// Its source-to-here latency (ms).
@@ -150,6 +155,12 @@ pub const STANDBY_SHARED_DOMAIN_FACTOR: f64 = 0.6;
 
 /// A standby without room to take over scores this much.
 pub const STANDBY_NO_ROOM_FACTOR: f64 = 0.7;
+
+/// How long after the last [`PathChunk::full`] chunk on any path the stream
+/// still counts as layered. Past it nothing above the base is flowing (an
+/// audio-only stream, a publisher at tier 2, a shed primary), so no other
+/// chunk exists to confirm a make-before-break on.
+pub const LAYERED_RECENT_MS: u64 = 2_000;
 
 /// Window over which voluntary switches double the dwell.
 pub const FLAP_WINDOW_MS: u64 = 120_000;
@@ -176,6 +187,9 @@ pub struct ParentSelector<P: PeerRef> {
     join_at: Option<u64>,
     last_switch_ms: u64,
     last_failover_ms: Option<u64>,
+    /// The latest failover, until the controller takes it: when the old
+    /// primary was last heard, and why it failed.
+    failed_over: Option<(u64, crate::telemetry::FailoverCause)>,
     recent_switches: Vec<u64>,
     last_standby_rotation_ms: Option<u64>,
     members: BTreeSet<P>,
@@ -186,6 +200,8 @@ pub struct ParentSelector<P: PeerRef> {
     /// When the stream last went from idle to active: silence on a path is
     /// never counted from before it (see `idle_aware_silence`).
     activity_since_ms: u64,
+    /// When a [`PathChunk::full`] chunk last arrived on any path.
+    last_full_ms: Option<u64>,
 }
 
 impl<P: PeerRef> ParentSelector<P> {
@@ -205,6 +221,7 @@ impl<P: PeerRef> ParentSelector<P> {
             join_at: None,
             last_switch_ms: 0,
             last_failover_ms: None,
+            failed_over: None,
             recent_switches: Vec::new(),
             last_standby_rotation_ms: None,
             members: BTreeSet::new(),
@@ -213,6 +230,7 @@ impl<P: PeerRef> ParentSelector<P> {
             next_r3_probe_ms: 0,
             last_activity_ms: None,
             activity_since_ms: 0,
+            last_full_ms: None,
         }
     }
 
@@ -424,38 +442,56 @@ impl<P: PeerRef> ParentSelector<P> {
             self.activity_since_ms = now_ms;
         }
         self.last_activity_ms = Some(now_ms);
+        if chunk.full {
+            self.last_full_ms = Some(now_ms);
+        }
+        let layered = self
+            .last_full_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) <= LAYERED_RECENT_MS);
         let Some(c) = self.cands.get_mut(from) else {
             return;
         };
         if !c.link.subscribed() {
             return;
         }
-        let layers = if c.link == Link::Standby {
-            PathLayers::BaseOnly
-        } else {
-            PathLayers::All
-        };
-        let fresh = c
-            .meter
-            .on_chunk(now_ms, chunk.pos, layers, chunk.bytes, chunk.latency_ms);
-        let standby_owes = fresh && chunk.base_or_audio && c.link == Link::Primary;
+        let fresh = c.meter.on_chunk(
+            now_ms,
+            chunk.pos,
+            chunk.base_or_audio,
+            chunk.hop_lost,
+            chunk.bytes,
+            chunk.latency_ms,
+        );
         if let Link::Promoting {
             first_full_ms,
             full_chunks,
             ..
         } = &mut c.link
         {
-            if chunk.full {
+            if chunk.full || !layered {
                 first_full_ms.get_or_insert(now_ms);
                 *full_chunks += 1;
             }
         }
-        if standby_owes {
-            let standby = self.standby.as_ref().and_then(|s| self.cands.get_mut(s));
-            if let Some(s) = standby.filter(|s| s.link == Link::Standby) {
-                s.meter.expect_base(chunk.pos);
+        // Each parent owes the base and audio the other delivered.
+        let (owing, link) = match c.link {
+            Link::Primary => (self.standby.as_ref(), Link::Standby),
+            Link::Standby => (self.primary.as_ref(), Link::Primary),
+            _ => (None, Link::None),
+        };
+        if fresh && chunk.base_or_audio {
+            if let Some(other) = owing.and_then(|p| self.cands.get_mut(p)) {
+                if other.link == link {
+                    other.meter.expect_base(chunk.pos);
+                }
             }
         }
+    }
+
+    /// The latest failover, once: when the old primary was last heard, and
+    /// why it failed.
+    pub fn take_failover(&mut self) -> Option<(u64, crate::telemetry::FailoverCause)> {
+        self.failed_over.take()
     }
 
     /// The link to `from` is gone.
@@ -963,7 +999,11 @@ impl<P: PeerRef> ParentSelector<P> {
             let degraded = c.link.subscribed()
                 && snap.windows >= 1
                 && (snap.loss >= self.cfg.degraded_loss || over_budget);
-            if let Some((_, to)) = c.health.update(now_ms, silent, degraded, &self.cfg) {
+            let last_arrival = c.meter.last_arrival_ms();
+            if let Some((_, to)) =
+                c.health
+                    .update(now_ms, silent, last_arrival, degraded, &self.cfg)
+            {
                 log.record(
                     now_ms,
                     &me,
@@ -1069,6 +1109,16 @@ impl<P: PeerRef> ParentSelector<P> {
                 .last_failover_ms
                 .map_or(true, |t| now_ms >= t + self.cfg.failover_min_interval_ms);
             if bad && allowed {
+                use crate::telemetry::FailoverCause;
+                let cause = if depth_bad {
+                    FailoverCause::Depth
+                } else if matches!(c.health.state(), PeerState::Suspected | PeerState::Down) {
+                    FailoverCause::LinkDown
+                } else {
+                    FailoverCause::Health
+                };
+                let heard = c.meter.last_arrival_ms().unwrap_or(now_ms).min(now_ms);
+                self.failed_over = Some((heard, cause));
                 self.last_failover_ms = Some(now_ms);
                 self.primary = None;
                 log.record(
@@ -1287,6 +1337,7 @@ mod tests {
             pos: ChunkPos { epoch: 0, seq },
             full,
             base_or_audio: true,
+            hop_lost: 0,
             bytes,
             latency_ms,
         }
@@ -1345,6 +1396,45 @@ mod tests {
             t += 250;
         }
         all
+    }
+
+    /// #945 finding A, at the selector: Down from a closed link, or from a
+    /// loop in the primary's own offer, is a verdict the same tick's failover
+    /// acts on. Being subscribed is not being heard.
+    #[test]
+    fn a_verdict_on_a_primary_reaches_the_tick_that_follows_it() {
+        for looped in [false, true] {
+            let mut cfg = ControllerConfig::interactive();
+            cfg.jitter = false;
+            let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+            s.set_members([1u32, 2, 3]);
+            let offers = [(2, 4, 20.0), (3, 4, 30.0)];
+            let _ = drive(&mut s, &cfg, 0, 12_000, &offers);
+            let (p, standby) = (*s.primary().expect("joined"), s.standby().copied());
+            assert!(standby.is_some());
+            let (mut rng, mut log) = (SplitMix64(1), DecisionLog::default());
+            let t = 12_000;
+            if looped {
+                let o = Offer {
+                    ancestry: vec![1],
+                    ..offer(p, 4, &cfg)
+                };
+                s.on_offer(t, o, 20.0, &mut log);
+            } else {
+                s.on_link_down(t, &p, &mut log);
+            }
+            assert_eq!(s.state_of(&p), Some(PeerState::Down));
+            let acts = s.tick(t, &mut rng, &mut log);
+            assert_eq!(s.primary(), None, "looped={looped}: {}", log.tail());
+            assert_eq!(log.count(DecisionKind::Failover), 1);
+            assert!(
+                acts.contains(&SelectorAction::Subscribe {
+                    parent: standby.expect("present"),
+                    role: Role::Primary,
+                }),
+                "looped={looped}: {acts:?}"
+            );
+        }
     }
 
     /// W1 (`FSD/CIRIS_MESH.md` §9): with any eligible member Available, the

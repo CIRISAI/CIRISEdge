@@ -1228,6 +1228,7 @@ impl Session {
                     reason,
                     retry,
                     awaits_signer,
+                    ..
                 } => {
                     refused += 1;
                     // An UNSOLICITED Deliver (a peer's proactive push) is rare, and

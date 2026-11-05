@@ -813,6 +813,10 @@ pub trait Transport: Send + Sync + 'static {
     /// `Arc`, so the clone shares, never copies.
     fn attach_metrics(&self, _metrics: crate::observability::EdgeMetrics) {}
 
+    /// v44 — the node's service ladder, for a transport whose own tick folds
+    /// edge's signals and applies the tier. Called once by `EdgeBuilder::build`.
+    fn attach_load_ladder(&self, _ladder: std::sync::Arc<crate::load_ladder::SharedLadder>) {}
+
     /// CC 5.4.3 referrals — each node this transport homes on after a refusal
     /// at a bound, so the replication runtime can round with it. `None`: this
     /// transport has no bound to be refused at.

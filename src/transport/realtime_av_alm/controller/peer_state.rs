@@ -98,11 +98,17 @@ impl PeerHealth {
 
     /// Re-evaluate. `silent_ms` is `Some` only while subscribed (time since
     /// the path last delivered, or since the subscription began);
-    /// `degraded` is the meter's verdict for the last window.
+    /// `last_arrival_ms` is when it last delivered anything; `degraded` is
+    /// the meter's verdict for the last window.
+    ///
+    /// Being subscribed is not being heard. Down comes from a closed link or
+    /// a loop as well as from silence, and those leave `silent_ms` small, so
+    /// only a chunk that arrived after the verdict clears it.
     pub fn update(
         &mut self,
         now_ms: u64,
         silent_ms: Option<u64>,
+        last_arrival_ms: Option<u64>,
         degraded: bool,
         cfg: &ControllerConfig,
     ) -> Option<(PeerState, PeerState)> {
@@ -117,9 +123,11 @@ impl PeerHealth {
                 };
             }
         }
-        let heard = silent_ms.is_some();
+        let subscribed = silent_ms.is_some();
+        let delivered_since = last_arrival_ms.is_some_and(|t| t > self.since_ms);
         match self.state {
-            PeerState::Suspected | PeerState::Down if heard => {
+            PeerState::Suspected if subscribed => self.go(PeerState::Recovering, now_ms),
+            PeerState::Down if subscribed && delivered_since => {
                 self.go(PeerState::Recovering, now_ms)
             }
             PeerState::Recovering => {
@@ -150,16 +158,16 @@ mod tests {
         let cfg = ControllerConfig::interactive();
         let mut h = PeerHealth::new(0);
         assert_eq!(
-            h.update(100, Some(0), true, &cfg).map(|t| t.1),
+            h.update(100, Some(0), None, true, &cfg).map(|t| t.1),
             Some(PeerState::Degraded)
         );
         assert_eq!(
-            h.update(200, Some(cfg.suspect_silence_ms), false, &cfg)
+            h.update(200, Some(cfg.suspect_silence_ms), None, false, &cfg)
                 .map(|t| t.1),
             Some(PeerState::Suspected)
         );
         assert_eq!(
-            h.update(300, Some(cfg.down_silence_ms), false, &cfg)
+            h.update(300, Some(cfg.down_silence_ms), None, false, &cfg)
                 .map(|t| t.1),
             Some(PeerState::Down)
         );
@@ -174,11 +182,28 @@ mod tests {
             Some(PeerState::Recovering)
         );
         let t = 300 + cfg.down_hold_ms;
-        assert_eq!(h.update(t + 100, Some(0), false, &cfg), None);
+        assert_eq!(h.update(t + 100, Some(0), None, false, &cfg), None);
         assert_eq!(
-            h.update(t + cfg.recover_clean_ms, Some(0), false, &cfg)
+            h.update(t + cfg.recover_clean_ms, Some(0), None, false, &cfg)
                 .map(|t| t.1),
             Some(PeerState::Available)
+        );
+    }
+
+    /// #945 finding A: a subscribed parent reporting no silence is not heard,
+    /// and a chunk from before the verdict proves nothing.
+    #[test]
+    fn down_is_cleared_only_by_a_delivery_after_it() {
+        let cfg = ControllerConfig::interactive();
+        let mut h = PeerHealth::new(0);
+        h.mark_down(1_000);
+        assert_eq!(h.update(1_250, Some(0), Some(990), false, &cfg), None);
+        assert_eq!(h.update(1_250, Some(0), Some(1_000), false, &cfg), None);
+        assert_eq!(h.state(), PeerState::Down);
+        assert_eq!(
+            h.update(1_500, Some(0), Some(1_400), false, &cfg)
+                .map(|t| t.1),
+            Some(PeerState::Recovering)
         );
     }
 }

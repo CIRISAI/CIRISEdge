@@ -93,6 +93,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::observability::{LinkCloseCause, LinkPoolCloseReason};
+use crate::telemetry::{EventLabel, LoopName};
+use crate::transport::link_shaping::{wait_row_left, RowLeft};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -153,8 +155,9 @@ const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 /// no-path link request with `hops = 1` and *broadcasts* it, so the only
 /// thing that can answer is a **directly-attached** neighbor on a live
 /// interface — which replies in a single interface round-trip. A
-/// relay-reachable peer would have produced a path-table entry (from its
-/// announce) and taken the [`LINK_ESTABLISH_TIMEOUT`] branch instead.
+/// relay-reachable peer has a path-table entry by now, from its announce or
+/// from the path request the dial just raised ([`PATH_SEEK_BUDGET`]), and took
+/// the [`LINK_ESTABLISH_TIMEOUT`] branch instead.
 /// Therefore, if a no-path link request has not established within this
 /// window, no amount of further waiting helps: there is no route. We fail
 /// fast with the self-diagnosing [`TransportError::NoRouteToPeer`] rather
@@ -982,6 +985,24 @@ fn reverse_path_wait_step(
     }
     ReverseWaitStep::Continue
 }
+
+/// How long a dial waits for the answer to the path request it just raised.
+/// A transport node answers from its path table after a 400 ms grace, so this
+/// is one grace and a few round trips, with room for a relay that has to ask
+/// on. It must leave the bootstrap dial's [`NO_PATH_ESTABLISH_TIMEOUT`] inside
+/// the send's 10 s round.
+const PATH_SEEK_BUDGET: Duration = Duration::from_secs(3);
+
+/// One path request per destination per this long, whatever is sending: at
+/// leviculum's own repeat interval (`PATH_REQUEST_MIN_INTERVAL_MS`). A path
+/// request is a broadcast, so a retry loop at a dead peer must not make one
+/// per send, and a send behind a recent unanswered ask fails as fast as it
+/// always did.
+const PATH_SEEK_MIN_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Path asks remembered at once. A full table drops the oldest half: the only
+/// cost of forgetting one is an early repeat.
+const PATH_SEEK_TRACKED: usize = 1_024;
 
 /// CIRISEdge#336 (fast heal) — minimum interval between EVENT-DRIVEN announces.
 ///
@@ -2506,6 +2527,9 @@ pub struct ReticulumTransport {
     /// [`AnnounceCtx`]. `None` (the default) keeps every pre-#530 construction
     /// site compiling unchanged and leaves intake evictions loud-but-uncounted.
     metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
+    /// v44 — the node's ladder ([`Transport::attach_load_ladder`]): the node
+    /// tick folds edge's own signals and moves the shapers and admission.
+    load_ladder: std::sync::OnceLock<Arc<crate::load_ladder::SharedLadder>>,
     /// CIRISEdge#809 — this transport's process-unique id for the per-source
     /// gauges in [`crate::observability::EdgeMetrics`] (several transports
     /// may share one bag).
@@ -2986,6 +3010,8 @@ pub struct ReticulumTransport {
     /// second lane — and Tokio's is FIFO-fair, so a waiter cannot be starved by
     /// a steady arrival of new senders.
     dial_gate: Arc<Mutex<HashMap<DestinationHash, Arc<tokio::sync::Semaphore>>>>,
+    /// When a path to each destination was last asked for ([`Self::seek_paths`]).
+    path_seeks: std::sync::Mutex<HashMap<DestinationHash, std::time::Instant>>,
     /// CIRISEdge#739 — the SCOPED twin of `reusable_dialed_link`: identified
     /// links to a scope-derived member address, keyed by that address, fed
     /// only by [`Self::lease_scoped_link`]'s dial and tagged
@@ -4080,6 +4106,7 @@ impl ReticulumTransport {
             config,
             // CIRISEdge#530 — off by default; attach with `with_metrics`.
             metrics: std::sync::OnceLock::new(),
+            load_ladder: std::sync::OnceLock::new(),
             metrics_source: {
                 static NEXT_METRICS_SOURCE: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(1);
@@ -4182,6 +4209,7 @@ impl ReticulumTransport {
             swallow_link_established: std::sync::atomic::AtomicBool::new(false),
             concluded_resources: std::sync::Mutex::new(HashMap::new()),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
+            path_seeks: std::sync::Mutex::new(HashMap::new()),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
@@ -4913,10 +4941,18 @@ impl ReticulumTransport {
         if let Some(m) = metrics {
             // First handle wins (CIRISEdge#809): a bag set here is the one
             // `Edge::spawn_background_listeners` finds already attached.
-            let _ = self.metrics.set(m);
+            self.adopt_metrics(m);
         }
         self.report_signer_id_mismatch();
         self
+    }
+
+    /// Hand the bag to everything that counts into it. Both doors come here,
+    /// so a part cannot be left counting into nothing.
+    fn adopt_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        self.keyer.attach_metrics(metrics.clone());
+        self.shapers.attach_metrics(metrics.clone());
+        let _ = self.metrics.set(metrics);
     }
 
     /// CIRISEdge#437 — register (or replace) a peer's presented
@@ -6380,6 +6416,9 @@ impl ReticulumTransport {
             DirectOutcome, DirectPath, DirectPathState, DIRECT_PATH_BUDGET,
         };
         if !self.direct_paths.config.proposes() {
+            if let Some(m) = self.metrics.get() {
+                m.inc_direct_link(self.direct_paths.config.off_label());
+            }
             return DirectPath::NotConfigured;
         }
         // ONE deadline over the identity-link dial, the proposal and its
@@ -6402,7 +6441,10 @@ impl ReticulumTransport {
                 };
             }
         }
-        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let mut candidates = self.resolve_dial_candidates(destination_key_id).await;
+        if candidates.is_empty() && self.seek_peer(destination_key_id).await {
+            candidates = self.resolve_dial_candidates(destination_key_id).await;
+        }
         if candidates.is_empty() {
             count(crate::observability::DIRECT_LINK_SKIPPED_NO_LINK);
             return DirectPath::Unavailable { reason: "no_link" };
@@ -6629,6 +6671,9 @@ impl ReticulumTransport {
                 return;
             }
             direct_paths.clear_yield(&peer);
+            if let Some(m) = metrics.as_ref() {
+                m.inc_direct_link(crate::observability::DIRECT_LINK_YIELD_EXPIRED);
+            }
             let now = std::time::Instant::now();
             if lifecycle.is_suspended()
                 || !direct_standing(table.as_deref(), &direct_paths, &peer)
@@ -7795,7 +7840,13 @@ impl ReticulumTransport {
         &self,
         policy: crate::transport::link_shaping::ShapingPolicy,
     ) -> usize {
-        let upgraded = !self.shapers.policy().offers_on(false) && policy.offers_on(false);
+        let before = self.shapers.policy();
+        if before.class != policy.class || before.enabled() != policy.enabled() {
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_POLICY_MOVED);
+            }
+        }
+        let upgraded = !before.offers_on(false) && policy.offers_on(false);
         let mut close = self.shapers.set_policy(policy);
         if upgraded {
             close.extend(self.unshaped_row_links().await);
@@ -9037,6 +9088,141 @@ impl ReticulumTransport {
         out
     }
 
+    /// No path and no link: ask, before the bootstrap dial that only a one-hop
+    /// neighbour can answer. The caller is past its reuse check on purpose: a
+    /// peer that dialled this node needs no path to be sent to. Returns the
+    /// dial target, unchanged unless the ask found a path.
+    async fn ask_before_dialling(
+        &self,
+        candidates: &[DialCandidate],
+        peer: ResolvedPeer,
+        has_path: bool,
+        establish_timeout: Duration,
+    ) -> (ResolvedPeer, bool, Duration) {
+        let dests: Vec<DestinationHash> = candidates.iter().map(|c| c.dest_hash).collect();
+        if !has_path && self.seek_paths(&dests).await {
+            let pathed: Vec<(DialSource, bool)> = candidates
+                .iter()
+                .map(|c| (c.source, self.node.has_path(&c.dest_hash)))
+                .collect();
+            if let Some(i) = select_dial_candidate(&pathed) {
+                let found = ResolvedPeer {
+                    dest_hash: candidates[i].dest_hash,
+                    transport_ed25519: candidates[i].transport_ed25519,
+                };
+                return (found, pathed[i].1, LINK_ESTABLISH_TIMEOUT);
+            }
+        }
+        (peer, has_path, establish_timeout)
+    }
+
+    /// Ask the network for a path to any of `dests`, and wait, boundedly, for
+    /// the answer. Returns whether one is known at the end.
+    ///
+    /// This is how a node learns a peer it wants. Waiting for the peer's
+    /// announce does not work: a relay holds no announce for a client that
+    /// connects later, and once a destination has used up the rate limit's
+    /// grace a transport node stops rebroadcasting it for up to
+    /// `announce_rate_target` (default 1 h, leviculum `DEFAULT_AR_TARGET`), so
+    /// on the 300 s default one announce in about 65 minutes gets through. It
+    /// keeps the path though, and answers a path request from it, past that
+    /// limit.
+    /// The answer is the peer's own signed announce, so it takes the ordinary
+    /// rooting path, and this node's own ingress hold lets it through.
+    ///
+    /// What an ask cannot reach is an announce still held by a relay's ingress
+    /// control: that relay has no path to answer from until it releases it,
+    /// one per 5 s from 15 s after the burst, so that one takes the hold's
+    /// time, and a later send asks again.
+    ///
+    /// One ask per destination per [`PATH_SEEK_MIN_INTERVAL`]: a send behind
+    /// an ask still in flight waits out that ask, and a send behind an
+    /// unanswered one does not wait at all.
+    async fn seek_paths(&self, dests: &[DestinationHash]) -> bool {
+        let known = || dests.iter().any(|d| self.node.has_path(d));
+        if dests.is_empty() || known() {
+            return !dests.is_empty();
+        }
+        let now = std::time::Instant::now();
+        let mut ask: Vec<DestinationHash> = Vec::new();
+        let mut until = now;
+        {
+            let mut seeks = self
+                .path_seeks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if seeks.len() >= PATH_SEEK_TRACKED {
+                let mut ages: Vec<std::time::Instant> = seeks.values().copied().collect();
+                ages.sort_unstable();
+                let cut = ages[ages.len() / 2];
+                seeks.retain(|_, at| *at > cut);
+            }
+            for d in dests {
+                match seeks.get(d).copied() {
+                    Some(at) if now.duration_since(at) < PATH_SEEK_MIN_INTERVAL => {
+                        until = until.max(at + PATH_SEEK_BUDGET);
+                    }
+                    _ => {
+                        seeks.insert(*d, now);
+                        ask.push(*d);
+                        until = until.max(now + PATH_SEEK_BUDGET);
+                    }
+                }
+            }
+        }
+        for d in &ask {
+            if let Err(e) = self.node.request_path(d).await {
+                tracing::debug!(error = %e, "path request not sent");
+            }
+        }
+        while std::time::Instant::now() < until {
+            if known() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        known()
+    }
+
+    /// Ask for a peer this node wants and has not heard: through whatever it
+    /// can already address it by, and through the signed route row a directory
+    /// holds for it. A row only says where to ask; nothing is trusted from it,
+    /// because what comes back is the peer's own announce. Returns whether the
+    /// peer can be addressed now.
+    pub async fn seek_peer(&self, destination_key_id: &str) -> bool {
+        let mut dests: Vec<DestinationHash> = self
+            .resolve_dial_candidates(destination_key_id)
+            .await
+            .iter()
+            .map(|c| c.dest_hash)
+            .collect();
+        if let Some(rooting) = self.rooting.as_deref() {
+            if let Ok(Some(row)) = rooting.signed_reticulum_route(destination_key_id).await {
+                let bytes = hex::decode(&row.transport_destination.destination).ok();
+                if let Some(hash) = bytes.and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+                    let dest = DestinationHash::new(hash);
+                    if !dests.contains(&dest) {
+                        dests.push(dest);
+                    }
+                }
+            }
+        }
+        if !self.seek_paths(&dests).await {
+            return false;
+        }
+        // The path is known when the announce is; rooting it is the listener's.
+        let deadline = std::time::Instant::now() + PATH_SEEK_BUDGET;
+        loop {
+            if self.knows_peer(destination_key_id).await {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Single-winner resolution, preserved for the non-dial callers
     /// (`knows_peer` / dest readback). Legacy preference order: cached, else
     /// explicit-hash, else computed-named — byte-identical to the pre-v13.8.0
@@ -9370,6 +9556,9 @@ impl ReticulumTransport {
             // The gate is per-destination so other peers still dial in parallel.
             // CIRISEdge#568 — the dial runs in a SPAWNED task, not inline.
             //
+            let (peer, has_path, establish_timeout) = self
+                .ask_before_dialling(candidates, peer, has_path, establish_timeout)
+                .await;
             // `round_timeout` is 10 s; a pathed peer's `establish_timeout` is
             // `LINK_ESTABLISH_TIMEOUT` (30 s). Inline, a cold dial could never
             // finish inside the round that started it, and the scheduler
@@ -9586,6 +9775,7 @@ impl ReticulumTransport {
             }
             let node = Arc::clone(&self.node);
             let fallbacks = Arc::clone(&self.bulk_fallbacks);
+            let ledger = self.metrics.get().cloned();
             let pause = SlowPathPause {
                 shapers: Arc::clone(&self.shapers),
                 peer: destination_key_id.to_owned(),
@@ -9594,6 +9784,13 @@ impl ReticulumTransport {
             tokio::spawn(async move {
                 let result = run_bulk_fallback(&node, link, &shaper, frames, &pause).await;
                 fallbacks.finish(&digest, result.is_ok());
+                if let Some(m) = ledger {
+                    m.inc_link_shaping(if result.is_ok() {
+                        crate::observability::LINK_SHAPING_BULK_FALLBACK_OK
+                    } else {
+                        crate::observability::LINK_SHAPING_BULK_FALLBACK_FAILED
+                    });
+                }
                 // choke-ok: every waiter may have gone; the record above stands.
                 let _ = tx.send(Some(result));
             });
@@ -10088,25 +10285,18 @@ impl ReticulumTransport {
                 Ok(ticket) => {
                     let first = ticket + 1 - u64::try_from(frames).unwrap_or(u64::MAX);
                     let budget = shaper.leave_budget(frames);
-                    let deadline = tokio::time::Instant::now() + budget;
-                    loop {
-                        if shaper.ticket_left(ticket) {
-                            break Ok(());
-                        }
-                        if shaper.is_stopped() || !self.node.link_is_established(link_id) {
-                            shaper.retract(first, ticket);
-                            break Err(ShipError::Other(TransportError::Io(
-                                "the shaped link closed before the row's frames left (retried)"
-                                    .to_owned(),
-                            )));
-                        }
-                        if tokio::time::Instant::now() > deadline {
-                            // The unsent remainder is taken back so the retry
-                            // does not send the row twice.
-                            shaper.retract(first, ticket);
-                            break Err(ShipError::Other(TransportError::Timeout(budget)));
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    let link_up = || self.node.link_is_established(link_id);
+                    let left = wait_row_left(&shaper, first, ticket, budget, link_up).await;
+                    if let Some(m) = self.metrics.get() {
+                        left.book(m, shaper.class());
+                    }
+                    match left {
+                        RowLeft::Left(_) => Ok(()),
+                        RowLeft::LinkClosed { .. } => Err(ShipError::Other(TransportError::Io(
+                            "the shaped link closed before the row's frames left (retried)"
+                                .to_owned(),
+                        ))),
+                        RowLeft::TimedOut => Err(ShipError::Other(TransportError::Timeout(budget))),
                     }
                 }
                 Err(crate::transport::link_shaping::ShapingError::QueueFull(_)) => {
@@ -10302,8 +10492,12 @@ impl Transport for ReticulumTransport {
     /// Edge's. The listener's per-event context reads the slot on every
     /// event, so an attach before `listen` is seen by the first one.
     fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
-        let _ = self.metrics.set(metrics);
+        self.adopt_metrics(metrics);
         self.report_signer_id_mismatch();
+    }
+
+    fn attach_load_ladder(&self, ladder: Arc<crate::load_ladder::SharedLadder>) {
+        let _ = self.load_ladder.set(ladder);
     }
 
     fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {
@@ -10316,6 +10510,9 @@ impl Transport for ReticulumTransport {
     fn refresh_metrics(&self) {
         let _ = self.known_destination_evictions();
         self.report_signer_id_mismatch();
+        if let Some(m) = self.metrics.get() {
+            mirror_planes(&self.node, m);
+        }
     }
 
     fn subscribe_reachability(&self) -> Option<tokio::sync::broadcast::Receiver<PeerReachable>> {
@@ -10378,6 +10575,17 @@ impl Transport for ReticulumTransport {
         }
 
         // `FSD/PRIVACY_MODES.md` §6.12 — while tier 2 is in force.
+        if let Some(m) = self.metrics.get() {
+            m.telemetry
+                .set_direct_link_proposing(self.direct_paths.config.proposes());
+        }
+        tracing::info!(
+            target: "edge.direct_link.posture",
+            proposes = self.direct_paths.config.proposes(),
+            proposing = ?self.direct_paths.config.proposing,
+            facilitator = self.direct_paths.config.facilitator.is_some(),
+            "direct links: this node's proposing posture"
+        );
         tokio::spawn(run_shaped_shed(
             Arc::downgrade(&self.node),
             Arc::clone(&self.seals),
@@ -10461,6 +10669,130 @@ impl Transport for ReticulumTransport {
     }
 }
 
+/// How often the event loop stamps its liveness.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// How often the node tick runs: the ladder's window.
+const NODE_TICK: Duration = Duration::from_secs(1);
+
+/// The closed `event` label of a node event.
+fn event_label(event: &NodeEvent) -> EventLabel {
+    match event {
+        NodeEvent::AnnounceReceived { .. } => EventLabel::Announce,
+        NodeEvent::LinkEstablished { .. } => EventLabel::LinkEstablished,
+        NodeEvent::LinkIdentified { .. } => EventLabel::LinkIdentified,
+        NodeEvent::MessageReceived { .. } | NodeEvent::LinkDataReceived { .. } => EventLabel::Frame,
+        NodeEvent::RequestReceived { .. } => EventLabel::Request,
+        NodeEvent::ResourceCompleted { .. } => EventLabel::ResourceCompleted,
+        NodeEvent::ResourceTransferStarted { .. } | NodeEvent::ResourceProgress { .. } => {
+            EventLabel::ResourceProgress
+        }
+        NodeEvent::ResourceAdvertised { .. } => EventLabel::ResourceAdvertised,
+        NodeEvent::ResourceFailed { .. } => EventLabel::ResourceFailed,
+        NodeEvent::LinkClosed { .. } => EventLabel::LinkClosed,
+        NodeEvent::LinkStale { .. } => EventLabel::LinkStale,
+        NodeEvent::DirectLinkEstablished { .. }
+        | NodeEvent::DirectLinkRequested { .. }
+        | NodeEvent::DirectLinkFailed { .. }
+        | NodeEvent::DirectLinkLost { .. } => EventLabel::DirectLink,
+        NodeEvent::PeerCongested { .. } => EventLabel::PeerCongested,
+        _ => EventLabel::Other,
+    }
+}
+
+/// Mirror leviculum's driver planes (the names `METRIC_CATALOG` gives
+/// `leviculum.events.*` and `leviculum.shed.packets`) into the bag. No
+/// recorder is wired, so `publish_metrics` would have nowhere to go.
+fn mirror_planes(node: &ReticulumNode, metrics: &crate::observability::EdgeMetrics) {
+    let p = node.plane_stats();
+    metrics.telemetry.set_leviculum_planes(
+        [p.control_queued, p.data_queued],
+        [p.control_capacity, p.data_capacity],
+        [p.control_dropped_total, p.data_dropped_total],
+        p.shed_packets_total,
+    );
+}
+
+/// What the node tick reads and moves.
+struct NodeTick {
+    node: std::sync::Weak<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    forward_admission: Arc<crate::transport::relay_tier::ForwardAdmission>,
+    forward_load: Arc<std::sync::Mutex<crate::transport::relay_tier::ForwardLoad>>,
+    ladder: Option<Arc<crate::load_ladder::SharedLadder>>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+}
+
+impl NodeTick {
+    /// Edge's own signals reach the shapers and forward admission here, and
+    /// not only when a host reads the tier: a raise from `relay_commit` or
+    /// `av_queue_age` used to wait for the next `set_load_pressure`, and with
+    /// no such caller, for nothing. The ladder's cooldowns run on this too.
+    fn apply_tier(&self) {
+        let Some(ladder) = &self.ladder else { return };
+        let load = self
+            .forward_load
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let tier = ladder.report(crate::load_ladder::EdgeLoadSignals {
+            transit_pps_ratio: load.pps_ratio,
+            ..crate::load_ladder::EdgeLoadSignals::default()
+        });
+        if tier != self.shapers.service_tier() {
+            self.forward_admission.set_tier(tier);
+            self.shapers.set_service_tier(tier);
+        }
+    }
+
+    fn publish(&self, m: &crate::observability::EdgeMetrics, node: &ReticulumNode) {
+        use crate::telemetry::ShapingClass;
+        let t = &m.telemetry;
+        let (links, bytes, held) = self.seals.occupancy();
+        t.set_seal_awaiting(links, bytes);
+        t.set_seal_held(held);
+        mirror_planes(node, m);
+        let policy = self.shapers.policy();
+        let seat = self.shapers.links_of(ShapingClass::Seat);
+        t.set_shaping(
+            policy.enabled(),
+            self.shapers.counted_link_count(),
+            seat,
+            self.shapers.free_slots(),
+        );
+        t.shaping_windows.tick(
+            t.now_ms(),
+            |class| self.shapers.links_of(class),
+            crate::transport::link_shaping::class_window,
+        );
+    }
+
+    fn turn(&self) -> bool {
+        self.apply_tier();
+        let Some(node) = self.node.upgrade() else {
+            return false;
+        };
+        if let Some(m) = &self.metrics {
+            m.telemetry.beat(LoopName::Ladder);
+            self.publish(m, &node);
+        }
+        true
+    }
+}
+
+/// The node tick, for as long as the listener runs.
+async fn run_node_tick(tick: NodeTick) {
+    let mut interval = tokio::time::interval(NODE_TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if !tick.turn() {
+            return;
+        }
+    }
+}
+
 /// Lifecycle — how long a resumed listener waits for an interface to come
 /// online before its first announce.
 const RESUME_ANNOUNCE_WAIT: Duration = Duration::from_secs(10);
@@ -10474,6 +10806,18 @@ enum ListenExit {
 }
 
 impl ReticulumTransport {
+    fn node_tick(&self) -> NodeTick {
+        NodeTick {
+            node: Arc::downgrade(&self.node),
+            seals: Arc::clone(&self.seals),
+            shapers: Arc::clone(&self.shapers),
+            forward_admission: Arc::clone(&self.forward_admission),
+            forward_load: Arc::clone(&self.forward_load),
+            ladder: self.load_ladder.get().cloned(),
+            metrics: self.metrics.get().cloned(),
+        }
+    }
+
     /// One active run of the listener: the announce timer, the link reapers,
     /// the attribution tick, the announce cold-start worker and the event
     /// loop. Returns when a suspend asks it to park (after draining the
@@ -10697,6 +11041,18 @@ impl ReticulumTransport {
             onion: &self.onion,
         };
         let mut keying_done = self.keying_done.lock().await;
+        // v44 — the event loop's liveness, on its own cadence and never per
+        // event: an age that follows the frames would be a clock of them.
+        let mut heartbeat = tokio::time::interval(HEARTBEAT);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // v44 — off this loop, so a wedged event never holds the ladder, and
+        // it ends with this run, so a parked node holds no timer.
+        let node_tick = tokio::spawn(run_node_tick(self.node_tick()));
+        let observe = |label: EventLabel, began: std::time::Instant| {
+            if let Some(m) = ctx.metrics {
+                m.telemetry.observe_event(label, began.elapsed());
+            }
+        };
         let exit = loop {
             tokio::select! {
                 // Lifecycle — a suspend: handle what the link closes already
@@ -10715,18 +11071,30 @@ impl ReticulumTransport {
                 // outcome is applied here, on the one thread of control that
                 // handles the link's frames.
                 Some(done) = keying_done.recv() => {
+                    let began = std::time::Instant::now();
                     apply_keying(done, &ctx).await;
+                    observe(EventLabel::KeyingApplied, began);
+                }
+                _ = heartbeat.tick() => {
+                    if let Some(m) = ctx.metrics {
+                        m.telemetry.beat(LoopName::Event);
+                    }
                 }
                 _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution()
                     || ctx.seals.any_deferred() => {
+                    let began = std::time::Instant::now();
                     for link in ctx.seals.awaiting_attribution() {
                         release_held(&ctx, LinkId::new(link)).await;
                     }
                     for job in ctx.seals.take_overdue_deferred() {
                         gate_handshake(&ctx, LinkId::new(job.link()), job).await;
                     }
+                    observe(EventLabel::AttributionTick, began);
                 }
                 _ = seat_tick.tick() => {
+                    if let Some(m) = ctx.metrics {
+                        m.telemetry.beat(LoopName::Seat);
+                    }
                     tokio::spawn(refresh_seats(
                         Arc::clone(&self.node),
                         Arc::clone(&self.seals),
@@ -10741,6 +11109,7 @@ impl ReticulumTransport {
                     }
                 }
                 _ = pool_tick.tick() => {
+                    let began = std::time::Instant::now();
                     let closed = self.reap_idle_pooled_links().await;
                     if closed > 0 {
                         tracing::debug!(
@@ -10760,8 +11129,10 @@ impl ReticulumTransport {
                             "inbound reaper closed idle inbound links (CIRISEdge#853)"
                         );
                     }
+                    observe(EventLabel::PoolTick, began);
                 }
                 _ = announce_tick.tick() => {
+                    let began = std::time::Instant::now();
                     if unannounced() {
                         tracing::trace!("unannounced (test seam): no periodic announce");
                     } else if let Err(e) = self
@@ -10794,6 +11165,7 @@ impl ReticulumTransport {
                             )
                             .await;
                     }
+                    observe(EventLabel::AnnounceTick, began);
                 }
                 event = events.recv() => {
                     let Some(event) = event else {
@@ -10807,7 +11179,10 @@ impl ReticulumTransport {
                     // Rate-limited so rapid link churn can't storm announces.
                     let link_just_established =
                         matches!(event, NodeEvent::LinkEstablished { .. });
+                    let label = event_label(&event);
+                    let began = std::time::Instant::now();
                     handle_event(event, &ctx).await;
+                    observe(label, began);
 
                     // `map_or(true, …)` not `is_none_or` — MSRV 1.75 (is_none_or is 1.82).
                     if link_just_established
@@ -10816,6 +11191,7 @@ impl ReticulumTransport {
                             .map_or(true, |t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
                     {
                         last_event_announce = Some(std::time::Instant::now());
+                        let began = std::time::Instant::now();
                         match self
                             .node
                             .announce_destination(&self.local_named_dest_hash, Some(app_data))
@@ -10830,6 +11206,7 @@ impl ReticulumTransport {
                                 "event-driven announce (link up) failed"
                             ),
                         }
+                        observe(EventLabel::LinkUpAnnounce, began);
                     }
                 }
             }
@@ -10840,6 +11217,14 @@ impl ReticulumTransport {
         drop(announce_priority_tx);
         announce_worker.abort();
         let _ = announce_worker.await;
+        node_tick.abort();
+        let _ = node_tick.await;
+        // A parked loop is not a wedged one: its age reads "not running".
+        if let Some(m) = self.metrics.get() {
+            for name in [LoopName::Event, LoopName::Seat, LoopName::Ladder] {
+                m.telemetry.beat_off(name);
+            }
+        }
         exit
     }
 }
@@ -10866,7 +11251,10 @@ impl ReticulumTransport {
         // set; the dial target is chosen by ROUTABILITY further down, after the
         // reverse-path attempt. See `resolve_dial_candidates` /
         // `select_dial_candidate` for the holistic-fix rationale.
-        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let mut candidates = self.resolve_dial_candidates(destination_key_id).await;
+        if candidates.is_empty() && self.seek_peer(destination_key_id).await {
+            candidates = self.resolve_dial_candidates(destination_key_id).await;
+        }
         if candidates.is_empty() {
             // CIRISEdge#292 (CIRISServer#205) — an admitted replication
             // target whose Reticulum destination we can't resolve is the
@@ -13046,10 +13434,14 @@ impl DialCtx {
         }
         if let Some(m) = self.metrics.as_ref() {
             m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED_DIALLED);
         }
         let refuse = |e: ShapingError| {
             if let Some(m) = self.metrics.as_ref() {
                 m.inc_link_shaping(e.label());
+                if matches!(e, ShapingError::HomeElsewhere) {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_HOME_ELSEWHERE_RECEIVED);
+                }
             }
             tracing::warn!(
                 peer = %peer,
@@ -15517,6 +15909,9 @@ fn admission_refused(
 ) {
     if let Some(m) = ctx.metrics {
         m.inc_link_seal(refusal.label());
+        if let Some(refined) = refusal.refined_label() {
+            m.inc_link_seal(refined);
+        }
     }
     drop_inbound(Some(link_id), refusal.label(), &refusal.to_string());
     ctx.seals.refuse(link_id.into_bytes());
@@ -15738,6 +16133,8 @@ async fn apply_keying(done: crate::transport::link_keying::KeyingDone, ctx: &Eve
     let link_id = LinkId::new(link);
     if let Some(m) = ctx.metrics {
         m.inc_link_seal(crate::observability::LINK_SEAL_DECAPSULATED);
+        m.telemetry
+            .observe_keying(done.standing, done.queued_at.elapsed());
     }
     match ctx.seals.finish_keying(link, done.ticket, done.outcome) {
         Inbound::Keyed { claimed } => {
@@ -16088,6 +16485,7 @@ async fn answer_shaping_offer(
     if ours.shapes() {
         if let Some(m) = ctx.metrics {
             m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED_ANSWERED);
         }
     }
     true
@@ -16122,6 +16520,7 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
         Ok(Some(shaper)) => {
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(crate::observability::LINK_SHAPING_AGREED);
+                m.inc_link_shaping(crate::observability::agreed_label(shaper.class()));
             }
             let a = *shaper.agreement();
             tracing::info!(
@@ -16170,6 +16569,15 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
             // nothing more after it and closes.
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(ShapingError::HomeElsewhere.label());
+                // The direction: the peer's own refusal reaches a responder
+                // here as well.
+                m.inc_link_shaping(
+                    if theirs.class == crate::transport::link_shaping::BudgetClass::HomeElsewhere {
+                        crate::observability::LINK_SHAPING_HOME_ELSEWHERE_RECEIVED
+                    } else {
+                        crate::observability::LINK_SHAPING_HOME_ELSEWHERE_GIVEN
+                    },
+                );
             }
             tracing::info!(
                 link = %hex::encode(link),
@@ -16460,7 +16868,11 @@ async fn refresh_seats(
     shapers: Arc<crate::transport::link_shaping::LinkShapers>,
 ) {
     for link in shapers.refresh_active_seats().await {
+        if let Some(m) = shapers.metrics() {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_SEAT_LOST);
+        }
         tracing::info!(
+            target: "edge.shaping.seat_lost",
             link = %hex::encode(link),
             "a seat link's peer left the active roster; closed to renegotiate (CC 5.4.3)"
         );
@@ -16634,6 +17046,9 @@ fn spawn_shaper_task(
                 seals.tap_frame(link, &sealed);
                 if real {
                     shaper.note_sent(ticket);
+                    if let Some(m) = metrics.as_ref() {
+                        m.telemetry.shaping_windows.note_real(shaper.class());
+                    }
                 }
                 tracing::trace!(
                     link = %hex::encode(link),
@@ -20835,6 +21250,9 @@ impl ReticulumTransport {
         let _op = self.lifecycle.lock_op().await;
         if !self.lifecycle.is_suspended() {
             return Ok(());
+        }
+        if let Some(m) = self.metrics.get() {
+            m.telemetry.note_woken();
         }
         self.wake_node().await?;
         let any_client =

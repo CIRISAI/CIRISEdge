@@ -1119,6 +1119,14 @@ struct Shared {
     ended: AtomicBool,
     published: AtomicU64,
     metrics: Option<crate::observability::EdgeMetrics>,
+    /// When the join began: `ciris.edge.call.setup.duration`.
+    setup_began: std::time::Instant,
+    /// The setup has ended, one way or the other.
+    setup_done: AtomicBool,
+    /// The call's end has been booked.
+    summary_done: AtomicBool,
+    /// The C3 members this call last told the node's gauge of.
+    c3_reported: AtomicU64,
     /// Test seam: hold every relayed copy this long before forwarding it.
     test_relay_delay_ms: AtomicU64,
     /// Test seam: withhold every `n`th own chunk (`chunk_seq % n == 0`) from
@@ -1210,6 +1218,51 @@ impl Shared {
             m.inc_av_plane(label);
         }
     }
+
+    /// The first frame heard ends this call's setup.
+    fn note_first_frame(&self) {
+        use crate::telemetry::CallSetupOutcome;
+        if !self.setup_done.swap(true, Ordering::Relaxed) {
+            if let Some(m) = &self.metrics {
+                m.telemetry
+                    .observe_call_setup(CallSetupOutcome::FirstFrame, self.setup_began.elapsed());
+            }
+        }
+    }
+
+    /// The call is over: one summary line, with the decision log's hash and
+    /// counts, so a field failure can be matched to a replay. No room, no
+    /// peers. Called on every way a call ends; the first call counts.
+    fn book_end(&self, cause: &str) {
+        use crate::telemetry::CallSetupOutcome;
+        use crate::transport::realtime_av_alm::controller::DecisionKind as K;
+        if self.summary_done.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let setup_open = !self.setup_done.swap(true, Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            if setup_open {
+                m.telemetry
+                    .observe_call_setup(CallSetupOutcome::Ended, self.setup_began.elapsed());
+            }
+            m.telemetry
+                .call_ended(self.c3_reported.swap(0, Ordering::Relaxed));
+        }
+        let a = Self::lock(&self.alm);
+        tracing::info!(
+            target: "edge.call.ended",
+            cause,
+            c7_hash = %a.log_hash(),
+            decisions = a.log_len(),
+            failovers = a.log_count(K::Failover),
+            switches = a.log_count(K::Switch),
+            frames_published = self.published.load(Ordering::Relaxed),
+            forwarded = a.counts.forwarded,
+            stale_dropped = a.counts.stale_dropped,
+            offers_refused = a.counts.offers_refused,
+            "call ended"
+        );
+    }
 }
 
 /// A live call: this node's stream in a room's call, and every other
@@ -1236,6 +1289,7 @@ impl std::fmt::Debug for Call {
 impl Drop for Call {
     fn drop(&mut self) {
         self.shared.ended.store(true, Ordering::Relaxed);
+        self.shared.book_end("dropped");
         self.router.unregister(&self.shared.group_id);
         for t in &self.tasks {
             t.abort();
@@ -1364,6 +1418,10 @@ impl Call {
             leg_cong: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
             load,
+            setup_began: std::time::Instant::now(),
+            setup_done: AtomicBool::new(false),
+            summary_done: AtomicBool::new(false),
+            c3_reported: AtomicU64::new(0),
             test_stall_until: StdMutex::new(None),
             test_fail_c3: AtomicU64::new(0),
         });
@@ -1372,6 +1430,9 @@ impl Call {
                 epoch: refused.epoch,
                 reason: refused.kind,
             });
+        }
+        if let Some(m) = &shared.metrics {
+            m.telemetry.call_began();
         }
         tracing::info!(
             room = %room,
@@ -1716,6 +1777,22 @@ impl Call {
         *Shared::lock(&self.shared.test_withhold) = Some((member.to_owned(), every));
     }
 
+    /// Test seam: close this node's leg to `member` and leave it down, as a
+    /// path that really died: nothing re-dials it.
+    #[doc(hidden)]
+    pub async fn close_leg_for_test(&self, member: &str) {
+        Shared::lock(&self.shared.dialling).insert(
+            member.to_owned(),
+            Instant::now() + Duration::from_secs(3600),
+        );
+        let link = Shared::lock(&self.shared.out_legs)
+            .get(member)
+            .map(|l| l.link_id);
+        if let Some(link) = link {
+            let _ = self.shared.transport.link_teardown(&link).await;
+        }
+    }
+
     /// **Who attended** (item 6): the union of the subjects of every row of
     /// this call, plus this node's own attendance. A leaver stays.
     pub async fn attendees(&self) -> Vec<String> {
@@ -1761,6 +1838,7 @@ impl Call {
         }
         *Shared::lock(&self.shared.state) = CallState::Ended(EndCause::HungUp);
         self.shared.ended.store(true, Ordering::Relaxed);
+        self.shared.book_end("hung_up");
         self.router.unregister(&self.shared.group_id);
         let legs: Vec<[u8; 16]> = Shared::lock(&self.shared.out_legs)
             .drain()
@@ -1925,6 +2003,7 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     let members = shared.room_group.member_key_ids().await;
     if !members.iter().any(|m| *m == shared.own) {
         *Shared::lock(&shared.state) = CallState::Ended(EndCause::Revoked);
+        shared.book_end("revoked");
         return Err(CallError::CallEnded(EndCause::Revoked));
     }
     let to = Epoch(room_epoch);
@@ -2522,6 +2601,7 @@ async fn pump(
 ) {
     let mut next_seq: u64 = 0;
     let mut gap = HopGap::default();
+    let mut stale_skipped: u64 = 0;
     let mut guard = LinkIdGuard::default();
     let mut bindings = BindingAssembler::default();
     while let Ok(frame) = inbound.recv_frame().await {
@@ -2552,6 +2632,7 @@ async fn pump(
             );
             if age > MEDIA_STALE_BUDGET && !BindingAssembler::is_part(&frame.bytes) {
                 let _ = gap.report(1);
+                stale_skipped += 1;
                 Shared::lock(&shared.alm).counts.stale_dropped += 1;
                 shared.count(crate::observability::AV_FRAME_STALE_DROPPED);
                 continue;
@@ -2590,6 +2671,14 @@ async fn pump(
         };
         guard.opened();
         gap.resolved();
+        // What the sender put on this link and never reached this node. The
+        // counter is dense over what it sent: it advances past nothing its
+        // layer policy filtered or its link refused, so this is loss within
+        // the policy in force. This node's own age drops took counters too,
+        // and those are its own lag, not the path's.
+        let hop_lost = opened_at
+            .wrapping_sub(next_seq)
+            .saturating_sub(std::mem::take(&mut stale_skipped));
         next_seq = opened_at.wrapping_add(1);
         let signed = inner;
         let stream = signed.stream_id();
@@ -2619,6 +2708,7 @@ async fn pump(
         };
         // C1, receiver side: this path delivered this chunk.
         let base_or_audio = is_base_or_audio(signed.codec_id(), signed.layer());
+        shared.note_first_frame();
         Shared::lock(&shared.alm).on_chunk(
             stream,
             peer,
@@ -2627,6 +2717,7 @@ async fn pump(
             frame_len,
             source_ms,
             base_or_audio,
+            hop_lost,
         );
         // Forward as an admitted media parent (ALM), and first-hand copies to
         // pre-C3 members when this node relays (the legacy relay). The
@@ -2980,19 +3071,29 @@ async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], u64
             .filter(|m| (outs.contains_key(m) || ins.contains_key(m)) && a.speaks_c3(m))
             .collect()
     };
-    let (out, events, labels, commit) = {
+    let (out, events, labels, gaps, commit) = {
         let mut a = Shared::lock(&shared.alm);
         let mut out = a.set_tier(tier);
         out.extend(a.tick(&c3_legs));
+        a.book_decisions();
         (
             out,
             std::mem::take(&mut a.events),
             std::mem::take(&mut a.labels),
+            std::mem::take(&mut a.gaps),
             a.relay_commit_ratio(),
         )
     };
     for l in labels {
         shared.count(l);
+    }
+    if let Some(m) = &shared.metrics {
+        for (cause, gap) in gaps {
+            m.telemetry.observe_failover_gap(cause, gap);
+        }
+        let now = c3_legs.len() as u64;
+        let before = shared.c3_reported.swap(now, Ordering::Relaxed);
+        m.telemetry.move_c3_peers(before, now);
     }
     for e in events {
         shared.emit(e);
