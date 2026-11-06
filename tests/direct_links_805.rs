@@ -365,6 +365,58 @@ async fn side_cfg_auth(
     }
 }
 
+/// A TCP pipe to `T` on `t_port` that holds the client's bytes toward `T` for
+/// `held_ms` (read per chunk, so a test turns it on after setup), in order;
+/// `T`'s bytes back pass at once. It gives the field's asymmetry a shape on
+/// loopback: what `B` says reaches `A` late, what `A` says reaches `B` at once.
+/// Returns the port to dial.
+async fn held_uplink(t_port: u16, held_ms: Arc<std::sync::atomic::AtomicU64>) -> u16 {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the uplink");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(upstream) = tokio::net::TcpStream::connect(("127.0.0.1", t_port)).await else {
+                continue;
+            };
+            let (mut client_rx, mut client_tx) = client.into_split();
+            let (mut up_rx, mut up_tx) = upstream.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut up_rx, &mut client_tx).await;
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+            let held = Arc::clone(&held_ms);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = client_rx.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    let ms = held.load(std::sync::atomic::Ordering::Relaxed);
+                    let due = tokio::time::Instant::now() + Duration::from_millis(ms);
+                    if tx.send((due, buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some((due, bytes)) = rx.recv().await {
+                    tokio::time::sleep_until(due).await;
+                    if up_tx.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
 struct Trio {
     t: ReticulumNode,
     a: Side,
@@ -376,11 +428,31 @@ struct Trio {
 /// `T`, then `A` and `B` as its clients, each holding the other's
 /// hybrid-signed route, each having learned the other's announce through `T`.
 async fn trio(tag: &str, a_direct: DirectLinksConfig, b_direct: DirectLinksConfig) -> Trio {
+    trio_uplink(tag, a_direct, b_direct, None, None).await
+}
+
+/// [`trio`], with a side reaching `T` through a [`held_uplink`] when its uplink
+/// is named.
+async fn trio_uplink(
+    tag: &str,
+    a_direct: DirectLinksConfig,
+    b_direct: DirectLinksConfig,
+    a_uplink: Option<Arc<std::sync::atomic::AtomicU64>>,
+    b_uplink: Option<Arc<std::sync::atomic::AtomicU64>>,
+) -> Trio {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let t_port = free_port();
     let f_port = free_udp_port();
     let t = transport_node(t_port, f_port).await;
+    let a_t_port = match a_uplink {
+        Some(held) => held_uplink(t_port, held).await,
+        None => t_port,
+    };
+    let b_t_port = match b_uplink {
+        Some(held) => held_uplink(t_port, held).await,
+        None => t_port,
+    };
     let facilitator = format!("127.0.0.1:{f_port}");
     let fill = |c: DirectLinksConfig| DirectLinksConfig {
         facilitator: c.facilitator.map(|_| facilitator.clone()),
@@ -392,8 +464,22 @@ async fn trio(tag: &str, a_direct: DirectLinksConfig, b_direct: DirectLinksConfi
     let records = vec![key_a.record().await, key_b.record().await];
     let a_dir = directory_with(records.clone()).await;
     let b_dir = directory_with(records).await;
-    let a = side(key_a, &a_dir, &tmp.path().join("a"), t_port, fill(a_direct)).await;
-    let b = side(key_b, &b_dir, &tmp.path().join("b"), t_port, fill(b_direct)).await;
+    let a = side(
+        key_a,
+        &a_dir,
+        &tmp.path().join("a"),
+        a_t_port,
+        fill(a_direct),
+    )
+    .await;
+    let b = side(
+        key_b,
+        &b_dir,
+        &tmp.path().join("b"),
+        b_t_port,
+        fill(b_direct),
+    )
+    .await;
 
     for (from, from_key, to) in [(&a_dir, &a.key, &b_dir), (&b_dir, &b.key, &a_dir)] {
         let routes = from
@@ -1370,6 +1456,35 @@ async fn a_relay_leg_carrying_media_outlives_the_reaper_863() {
     )
     .expect("B subscribes over R");
 
+    // A row from A: an identity link, inbound at R and on no punched interface.
+    // A's call must not hold it: only a punched link is held for a call.
+    q.a.transport
+        .send(&r_id, b"row-from-a")
+        .await
+        .expect("A's row to R");
+    let a_dialled: Vec<[u8; 16]> =
+        q.a.transport
+            .link_directions_for_test()
+            .into_iter()
+            .filter(|(_, d)| *d == LinkDirection::Outbound)
+            .map(|(id, _)| id)
+            .collect();
+    let identity_from_a =
+        |planes: Vec<([u8; 16], ciris_edge::transport::reticulum::LinkPlane, bool)>| {
+            planes
+                .iter()
+                .filter(|(id, plane, _)| {
+                    *plane == ciris_edge::transport::reticulum::LinkPlane::Identity
+                        && a_dialled.contains(id)
+                })
+                .count()
+        };
+    assert_eq!(
+        identity_from_a(q.r.transport.link_planes_for_test().await),
+        1,
+        "the row's link"
+    );
+
     // A 2 s idle bound on both ends; media every 100 ms for 6 s; a reap
     // pass on both ends every 500 ms.
     let bound = Duration::from_secs(2);
@@ -1408,6 +1523,11 @@ async fn a_relay_leg_carrying_media_outlives_the_reaper_863() {
         held(q.b.transport.link_planes_for_test().await),
         "B kept the leg it only receives on (reaped at B: {})",
         reaped.1
+    );
+    assert_eq!(
+        identity_from_a(q.r.transport.link_planes_for_test().await),
+        0,
+        "a relayed identity link ages through its peer's call"
     );
     // And it is still carrying media: the last chunk arrives.
     let last = seq - 1;
@@ -2361,4 +2481,303 @@ async fn a_yields_timer_does_not_propose_while_suspended() {
     )
     .await;
     assert_eq!(dl(&p.b.metrics, "direct_link_proposed"), 0);
+}
+
+/// **v44 — one side moves, the other holds.** The wedge of the first cross-NAT
+/// run (agent run 42157633553), with the real path: `A` proposes on its
+/// identity link, both punches land, and one side's COMPLETE arrives late, so
+/// the other is on the punched interface at the direct MTU while this one is
+/// still committing on the relay at the link's old one. A frame this side
+/// ships now is advertised to a peer that has already lowered its MTU: the
+/// peer sizes the parts from its own MTU, refuses every part this side cuts
+/// (`InvalidPart`, `len=16348`), and leviculum holds this side's move on the
+/// Resource that cannot finish. Returns the behind side's metrics.
+///
+/// `proposer_behind` picks the side that sends: `A`, or the accepting `B`.
+/// `pinned` sends on the upgrading link itself, as an answer does.
+async fn one_side_moves_the_other_sends(
+    tag: &str,
+    proposer_behind: bool,
+    pinned: bool,
+) -> EdgeMetrics {
+    use ciris_edge::transport::{ReplyPath, TransportId};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // How long the behind side stays behind, and so the headroom a slow runner
+    // has for the send below to start inside the window. On from before the
+    // link is dialled: the Channel has to learn this RTT, or a hold that
+    // appears on a millisecond link exhausts its retries and closes it.
+    const HOLD: Duration = Duration::from_secs(2);
+
+    let held = Arc::new(AtomicU64::new(0));
+    // The ahead side's bytes are the late ones: it moves on the behind side's
+    // COMPLETE at once, and the behind side hears its COMPLETE a HOLD later.
+    let (a_uplink, b_uplink) = if proposer_behind {
+        (None, Some(Arc::clone(&held)))
+    } else {
+        (Some(Arc::clone(&held)), None)
+    };
+    let mut p = trio_uplink(
+        tag,
+        proposer(),
+        DirectLinksConfig::default(),
+        a_uplink,
+        b_uplink,
+    )
+    .await;
+    held.store(u64::try_from(HOLD.as_millis()).unwrap(), Ordering::Relaxed);
+    // A's first send, before any room: the link exists and nothing proposes.
+    p.a.transport
+        .send(&p.b.key.key_id, b"before-the-room")
+        .await
+        .expect("A's send to B ships through T");
+    let (_spine, _b_addr) = open_call(&p).await;
+    let link = shared_link(&p.a, &p.b);
+
+    let proposed =
+        p.a.transport
+            .propose_direct_on_link_for_test(&p.b.key.key_id, link)
+            .await;
+    assert_eq!(proposed, "proposed");
+    let (behind, ahead) = if proposer_behind {
+        (&mut p.a, &mut p.b)
+    } else {
+        (&mut p.b, &mut p.a)
+    };
+    let moved = next_event(&mut ahead.events, Duration::from_secs(30), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the side ahead moves: the other's COMPLETE reached it");
+    assert!(
+        matches!(&moved, DirectPathEvent::Established { proposed, .. }
+            if *proposed != proposer_behind),
+        "{moved:?}"
+    );
+    assert!(
+        behind.transport.direct_link_interface(link).is_none(),
+        "the side behind has not moved: the COMPLETE is still on the held uplink"
+    );
+
+    // Over the Channel-first cap, so this is a Resource by size; random so it
+    // does not compress below it.
+    let mut frame = vec![0u8; 400 * 1024];
+    ciris_crypto::random::fill(&mut frame).expect("random frame");
+    let sender = Arc::clone(&behind.transport);
+    let to = ahead.key.key_id.clone();
+    let in_flight = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let sent = if pinned {
+            let path = ReplyPath::new(TransportId::RETICULUM_RS, link);
+            sender.send_on_reply_path_only(&to, &path, &frame).await
+        } else {
+            sender.send(&to, &frame).await
+        };
+        (sent, started.elapsed())
+    });
+
+    let up = next_event(&mut behind.events, HOLD + Duration::from_secs(25), |e| {
+        matches!(
+            e,
+            DirectPathEvent::Established { .. } | DirectPathEvent::Failed { .. }
+        )
+    })
+    .await;
+    assert!(
+        matches!(&up, Some(DirectPathEvent::Established { .. })),
+        "the side behind moves once the COMPLETE lands, a frame in flight or not: {up:?}"
+    );
+    assert!(behind.transport.direct_link_interface(link).is_some());
+    let (sent, took) = tokio::time::timeout(Duration::from_secs(60), in_flight)
+        .await
+        .expect("the send ends")
+        .expect("the send task");
+    sent.unwrap_or_else(|e| panic!("the frame is delivered ({took:?}): {e:?}"));
+
+    // The outcome ends the guard: the same size on the same link now ships
+    // with nothing refused, at the MTU both ends hold.
+    let total = |m: &EdgeMetrics| m.direct_link_upgrade_guarded().values().sum::<u64>();
+    let refused = total(&behind.metrics);
+    let mut again = vec![0u8; 400 * 1024];
+    ciris_crypto::random::fill(&mut again).expect("random frame");
+    let path = ReplyPath::new(TransportId::RETICULUM_RS, link);
+    behind
+        .transport
+        .send_on_reply_path_only(&ahead.key.key_id, &path, &again)
+        .await
+        .expect("a frame on the moved link");
+    assert_eq!(
+        total(&behind.metrics),
+        refused,
+        "the guard ended at the move"
+    );
+    behind.metrics.clone()
+}
+
+fn guarded(m: &EdgeMetrics, label: &str) -> u64 {
+    m.direct_link_upgrade_guarded()
+        .get(label)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The proposer behind, sending by key: its dialled lane is upgrading, so the
+/// pool passes over it and the frame takes another lane.
+/// Mutation: the pool's filter gone, the send takes the upgrading link and the
+/// ship refusal is what counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_by_key_during_an_upgrade_takes_another_lane() {
+    let m = Box::pin(one_side_moves_the_other_sends("upg-key", true, false)).await;
+    assert!(guarded(&m, "upgrade_guarded_pool") > 0);
+    assert_eq!(guarded(&m, "upgrade_guarded_ship"), 0);
+}
+
+/// The proposer behind, answering on the upgrading link: no other lane may
+/// carry it. The send gets `Busy`, its Channel fragments (cut for the old MTU)
+/// do not finish before the move shrinks the link under them, and the bounded
+/// retry ships the Resource once this side has moved: the upgrade finished
+/// first, and the frame is cut for the MTU both ends hold.
+/// Mutation: the ship refusal gone, the wedge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_pinned_to_an_upgrading_link_waits_for_the_move() {
+    let m = Box::pin(one_side_moves_the_other_sends("upg-pin", true, true)).await;
+    assert!(guarded(&m, "upgrade_guarded_ship") > 0);
+}
+
+/// The ACCEPTOR behind: it knows of the upgrade only by the peer's request.
+/// Mutation: no acceptance record, the wedge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acceptor_sending_during_an_upgrade_starts_no_resource() {
+    let m = Box::pin(one_side_moves_the_other_sends("upg-acc", false, false)).await;
+    assert!(guarded(&m, "upgrade_guarded_ship") > 0);
+}
+
+/// A/V up to a punched interface, with `B`'s inbound idle bound short. Returns
+/// the trio, the leg's two ends, and the identity link the interface belongs
+/// to: on `B` it is an inbound link that media never touches.
+async fn call_on_a_punched_interface(
+    tag: &str,
+    bound: Duration,
+) -> (
+    Trio,
+    AvSpine,
+    ciris_edge::transport::av_sink::AvLink,
+    ciris_edge::transport::av_sink::AcceptedAvArrival,
+    [u8; 16],
+) {
+    let mut p = trio(tag, proposer(), DirectLinksConfig::default()).await;
+    let mut arrivals = p.b.transport.take_av_arrivals().expect("B's arrivals");
+    let (spine, b_addr) = open_call(&p).await;
+    let leg =
+        p.a.transport
+            .open_av_link(&p.b.key.key_id, &b_addr)
+            .await
+            .expect("A's dial over the punched interface");
+    assert!(leg.sender.is_direct());
+    let up = next_event(&mut p.a.events, Duration::from_secs(5), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the identity link came up direct");
+    let DirectPathEvent::Established { link_id, .. } = up else {
+        unreachable!()
+    };
+    let arrival = tokio::time::timeout(Duration::from_secs(20), arrivals.recv())
+        .await
+        .expect("the leg arrives at B")
+        .expect("arrivals open");
+    let accepted =
+        p.b.transport
+            .accept_av_arrival(arrival)
+            .await
+            .expect("B answers the leg's KEX");
+    p.b.transport.set_inbound_link_idle_bound(bound);
+    (p, spine, leg, accepted, link_id)
+}
+
+/// **v44** — the punched interface lives as long as the identity link it was
+/// punched for, and that link is inbound on the side that did not dial it,
+/// where media never touches it. So the inbound reaper closed it at its idle
+/// bound and took a live call's interface with it (A kept sending, nothing
+/// arrived). A peer's live A/V link makes the punched link busy; when the call
+/// ends the link ages as any other.
+/// Mutation: without the busy mark, the frames stop at the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_on_a_punched_interface_outlives_the_inbound_idle_bound() {
+    const BOUND: Duration = Duration::from_secs(2);
+    let (p, _spine, leg, accepted, identity) =
+        Box::pin(call_on_a_punched_interface("reap-call", BOUND)).await;
+
+    let started = tokio::time::Instant::now();
+    let mut frames = 0u32;
+    while started.elapsed() < BOUND * 3 {
+        leg.sender
+            .send(format!("media-{frames}").as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("frame {frames} sends: {e:?}"));
+        tokio::time::timeout(Duration::from_secs(10), accepted.arrival.inbound.recv())
+            .await
+            .unwrap_or_else(|_| panic!("frame {frames} crosses, {:?} in", started.elapsed()))
+            .expect("the leg is open");
+        frames += 1;
+        p.b.transport.reap_idle_inbound_links().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        p.b.transport.direct_link_interface(identity).is_some(),
+        "the interface outlived the bound, {frames} frames in"
+    );
+
+    // The call ended: nothing holds the link, and it ages.
+    p.a.transport
+        .link_teardown(&leg.link_id)
+        .await
+        .expect("A hangs up");
+    let aged = wait_until(BOUND * 3 + Duration::from_secs(30), || async {
+        p.b.transport.reap_idle_inbound_links().await;
+        p.b.transport.direct_link_interface(identity).is_none()
+    })
+    .await;
+    assert!(aged, "with the call gone the link is reaped at its bound");
+}
+
+/// **v44** — the reaper stays what ends a wedge. A punched link with no call
+/// whose inbound transfer stopped arriving is the wedge as the moved side sees
+/// it: busy for the transfer's stall window, then reaped. The state is marked
+/// here, not produced, the guard having removed the way to it. An idle punched
+/// link with no call ages too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wedged_punched_link_with_no_call_is_still_reaped() {
+    let mut p = trio("reap-wedge", proposer(), DirectLinksConfig::default()).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    p.a.transport
+        .send(&p.b.key.key_id, b"go-direct")
+        .await
+        .expect("the send that proposes");
+    let up = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the link comes up direct");
+    let DirectPathEvent::Established { link_id, .. } = up else {
+        unreachable!()
+    };
+    assert!(p.b.transport.direct_link_interface(link_id).is_some());
+
+    p.b.transport.note_inbound_transfer_for_test(link_id, true);
+    p.b.transport
+        .set_inbound_link_idle_bound(Duration::from_secs(1));
+    // Past the idle bound, inside the stall window: the transfer holds it.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    p.b.transport.reap_idle_inbound_links().await;
+    p.b.transport.reap_idle_inbound_links().await;
+    assert!(
+        p.b.transport.direct_link_interface(link_id).is_some(),
+        "a transfer inside its stall window holds the link"
+    );
+    let reaped = wait_until(Duration::from_secs(60), || async {
+        p.b.transport.reap_idle_inbound_links().await;
+        p.b.transport.direct_link_interface(link_id).is_none()
+    })
+    .await;
+    assert!(reaped, "the wedge ends: no call holds this link");
 }

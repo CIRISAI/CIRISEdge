@@ -1331,11 +1331,27 @@ pub const DIRECT_LINK_FAILED_PROBE: &str = "direct_link_failed_probe";
 pub const DIRECT_LINK_FAILED_TIMEOUT: &str = "direct_link_failed_timeout";
 /// No punch got through (symmetric NAT, a firewall, no route).
 pub const DIRECT_LINK_FAILED_PUNCH: &str = "direct_link_failed_punch";
+/// A punched link waited on the relay for a transfer to finish, and its unused
+/// interface died first: leviculum says `Timeout`, later than any session
+/// could (`direct_path::held_failure`).
+pub const DIRECT_LINK_FAILED_HELD: &str = "direct_link_failed_held";
 /// A punched interface went down; its link is back on its relayed path.
 pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
 /// A direct A/V leg's path was judged gone and the leg fell back
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
+
+// ─── v44 — `EdgeMetrics::direct_link_upgrade_guarded` labels ──────────
+//
+// A Resource kept off a link with an upgrade in flight
+// (`direct_path::DirectPathTracker::upgrade_in_flight`).
+
+/// The identity pool passed over an upgrading link: the send took another
+/// lane or dialled one.
+pub const UPGRADE_GUARDED_POOL: &str = "upgrade_guarded_pool";
+/// A send already on an upgrading link was refused its Resource: it tries the
+/// Channel, then the bounded retry.
+pub const UPGRADE_GUARDED_SHIP: &str = "upgrade_guarded_ship";
 
 // ─── CIRISEdge#930 — `EdgeMetrics::key_plane_sweep` labels ──────────────
 //
@@ -1733,6 +1749,7 @@ pub const DIRECT_LINK_LABELS: &[&str] = &[
     DIRECT_LINK_FAILED_PROBE,
     DIRECT_LINK_FAILED_TIMEOUT,
     DIRECT_LINK_FAILED_PUNCH,
+    DIRECT_LINK_FAILED_HELD,
     DIRECT_LINK_LOST,
     DIRECT_LINK_LEG_FELL_BACK,
     DIRECT_LINK_OFF_PROPOSING_OFF,
@@ -1815,6 +1832,8 @@ pub const LINK_STALL_LABELS: &[&str] = &[
     LINK_STALL_CLOSED,
     LINK_STALL_RETIRED_DIRECT,
 ];
+/// Every `direct_link_upgrade_guarded` key.
+pub const UPGRADE_GUARDED_LABELS: &[&str] = &[UPGRADE_GUARDED_POOL, UPGRADE_GUARDED_SHIP];
 /// Every `peer_binding` key.
 pub const PEER_BINDING_LABELS: &[&str] = &[
     PEER_BINDING_TRANSPORT_KEY_HEALED,
@@ -2087,6 +2106,9 @@ pub struct EdgeMetrics {
     /// constants in this module): zero-landing Channel sends, and the dead
     /// links it closed or moved off a punched path.
     pub link_stall: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// v44 — Resources kept off a link with an upgrade in flight, by
+    /// `UPGRADE_GUARDED_*` label.
+    pub direct_link_upgrade_guarded: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — peers with a direct path now, per reporting
     /// transport (keyed by its metrics source id, like `link_pool_sizes`).
     /// Read as [`Self::direct_links_active`] (the sum).
@@ -2819,6 +2841,26 @@ impl EdgeMetrics {
     #[must_use]
     pub fn direct_link(&self) -> HashMap<String, u64> {
         self.direct_link
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// v44 — count one Resource kept off an upgrading link by its
+    /// `UPGRADE_GUARDED_*` label.
+    pub fn inc_direct_link_upgrade_guarded(&self, label: &'static str) {
+        *self
+            .direct_link_upgrade_guarded
+            .write()
+            .entry(label)
+            .or_insert(0) += 1;
+    }
+
+    /// v44 — the upgrade guard's ledger by label.
+    #[must_use]
+    pub fn direct_link_upgrade_guarded(&self) -> HashMap<String, u64> {
+        self.direct_link_upgrade_guarded
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -3613,6 +3655,10 @@ impl EdgeMetrics {
             peer_binding: registered(&self.peer_binding, PEER_BINDING_LABELS),
             key_plane_sweep: self.key_plane_sweep(),
             link_stall: registered(&self.link_stall, LINK_STALL_LABELS),
+            direct_link_upgrade_guarded: registered(
+                &self.direct_link_upgrade_guarded,
+                UPGRADE_GUARDED_LABELS,
+            ),
             advertise: registered(&self.advertise, ADVERTISE_LABELS),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
@@ -3941,6 +3987,8 @@ pub struct EdgeMetricsBundle {
     pub key_plane_sweep: HashMap<String, u64>,
     /// CIRISEdge#926 — the link stall guard by `LINK_STALL_*` label.
     pub link_stall: HashMap<String, u64>,
+    /// v44 — Resources kept off an upgrading link by `UPGRADE_GUARDED_*` label.
+    pub direct_link_upgrade_guarded: HashMap<String, u64>,
     /// `advertise.<label>`: the advertise sweep's ledger.
     pub advertise: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
@@ -4361,6 +4409,11 @@ impl EdgeMetricsBundle {
         f.family("key_plane_sweep", &self.key_plane_sweep);
         // CIRISEdge#926 — the link stall guard, `link_stall.<label>`.
         f.family("link_stall", &self.link_stall);
+        // v44 — the upgrade guard, `direct_link_upgrade_guarded.<label>`.
+        f.family(
+            "direct_link_upgrade_guarded",
+            &self.direct_link_upgrade_guarded,
+        );
         f.family("advertise", &self.advertise);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
@@ -4669,6 +4722,7 @@ edge_metrics_bundle_fields!(
     peer_binding,
     key_plane_sweep,
     link_stall,
+    direct_link_upgrade_guarded,
     advertise,
     direct_links_active,
     replication_routed_to_responder_total,

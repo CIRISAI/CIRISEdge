@@ -3159,6 +3159,11 @@ fn metrics_bundle_to_pydict<'py>(
         link_stall.set_item(label.as_str(), *n)?;
     }
     root.set_item("link_stall", link_stall)?;
+    let direct_link_upgrade_guarded = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.direct_link_upgrade_guarded {
+        direct_link_upgrade_guarded.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("direct_link_upgrade_guarded", direct_link_upgrade_guarded)?;
     let advertise = pyo3::types::PyDict::new(py);
     for (label, n) in &bundle.advertise {
         advertise.set_item(label.as_str(), *n)?;

@@ -8,7 +8,7 @@ use super::*;
 use crate::observability::{
     EdgeMetrics, FlatMetrics, AV_PLANE_LABELS, DIRECT_LINK_LABELS, EDGE_METRICS_BUNDLE_FIELDS,
     LINK_SEAL_LABELS, LINK_SHAPING_FRAMES_REAL, LINK_SHAPING_LABELS, LINK_STALL_LABELS,
-    PEER_BINDING_LABELS,
+    PEER_BINDING_LABELS, UPGRADE_GUARDED_LABELS,
 };
 
 fn flat(m: &EdgeMetrics) -> FlatMetrics {
@@ -196,6 +196,7 @@ fn every_label_constant_is_in_its_family_list() {
         ("AV_", AV_PLANE_LABELS),
         ("ALM_", AV_PLANE_LABELS),
         ("LINK_STALL_", LINK_STALL_LABELS),
+        ("UPGRADE_GUARDED_", UPGRADE_GUARDED_LABELS),
         ("ADVERTISE_", crate::observability::ADVERTISE_LABELS),
         ("PEER_BINDING_", PEER_BINDING_LABELS),
     ] {
