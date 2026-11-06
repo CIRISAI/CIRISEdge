@@ -394,7 +394,24 @@ async fn a_held_reply_never_held_another_plane_943() {
             .any(|s| s.kind == EnvelopeKind::Key && s.what == "diff")
     })
     .await;
-    assert_eq!(r.dir.count(EnvelopeKind::Key).await, 1);
+    // The `Diff` leaving says the `Summary` was stepped. The `Deliver` is the
+    // driver's next frame, and the lane does not wait for it, so the row lands
+    // after the reply. A held plane never lands it, however long this waits.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while r.dir.count(EnvelopeKind::Key).await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the Key plane's Deliver did not land past the held plane"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        r.seam
+            .sent()
+            .iter()
+            .all(|s| s.kind != EnvelopeKind::Attestation),
+        "the other plane's reply was still held throughout"
+    );
     r.seam.release(EnvelopeKind::Attestation);
 }
 
