@@ -524,6 +524,24 @@ fn link_channel_mdu(node: &ReticulumNode, link_id: &LinkId) -> usize {
     node.link_mdu(link_id).map_or(0, channel_payload_mdu)
 }
 
+/// CC 5.4.3 `CLM-shaped-link-one-hop` — **whether a forwarder carries `link`**:
+/// it left no punched interface to run on, and the path to `dest` is more than
+/// one hop. No path is not a forwarder: a request with no path is a broadcast,
+/// and a transport node forwards a request only as its designated next hop
+/// (leviculum `handle_link_request`), so a link that established without one
+/// was answered one hop away. leviculum keeps a link's hops and does not
+/// expose them at this pin, so the path stands in for them.
+fn link_is_forwarded(
+    node: &ReticulumNode,
+    link_id: &LinkId,
+    dest: Option<DestinationHash>,
+) -> bool {
+    node.direct_link_interface(link_id).is_none()
+        && dest
+            .and_then(|d| node.hops_to(&d))
+            .is_some_and(|hops| hops > 1)
+}
+
 /// CC 5.4.3 — which links are offered shaping: the identity plane only. An
 /// A/V link is a burst a GPA can see regardless (CC 5.3.3.2) and would pay
 /// seconds of jitter for nothing; a scoped link is one hop of scoped content
@@ -2556,6 +2574,9 @@ pub struct ReticulumTransport {
     /// [`AnnounceCtx`]. `None` (the default) keeps every pre-#530 construction
     /// site compiling unchanged and leaves intake evictions loud-but-uncounted.
     metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
+    /// Test seam — offer shaping through a forwarder, as a peer older than
+    /// `CLM-shaped-link-one-hop` does.
+    test_offer_forwarded: Arc<std::sync::atomic::AtomicBool>,
     /// Test seam — a dial's establish budget in ms, 0 for the real one.
     test_establish_budget_ms: std::sync::atomic::AtomicU64,
     /// v44 — the node's ladder ([`Transport::attach_load_ladder`]): the node
@@ -3429,6 +3450,7 @@ impl ReticulumTransport {
             own_key_id: self.occurrence_key_id().to_owned(),
             handshake_override: Arc::clone(&self.handshake_override),
             test_unannounced: Arc::clone(&self.test_unannounced),
+            test_offer_forwarded: Arc::clone(&self.test_offer_forwarded),
             test_refuse_dials: Arc::clone(&self.test_refuse_dials),
             test_refused_dials: Arc::clone(&self.test_refused_dials),
             row_homed_elsewhere: Arc::clone(&self.row_homed_elsewhere),
@@ -4136,6 +4158,7 @@ impl ReticulumTransport {
             config,
             // CIRISEdge#530 — off by default; attach with `with_metrics`.
             metrics: std::sync::OnceLock::new(),
+            test_offer_forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             test_establish_budget_ms: std::sync::atomic::AtomicU64::new(0),
             load_ladder: std::sync::OnceLock::new(),
             metrics_source: {
@@ -4661,6 +4684,30 @@ impl ReticulumTransport {
     pub fn drop_next_inbound_link_established_for_test(&self) {
         self.swallow_link_established
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test seam — offer shaping through a forwarder, as an older peer does.
+    #[doc(hidden)]
+    pub fn set_offer_forwarded_for_test(&self, on: bool) {
+        self.test_offer_forwarded
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test seam — a shaped link's agreed frame and bytes/s, `None` unshaped.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn shaped_agreement_for_test(&self, link: [u8; 16]) -> Option<(u16, u32)> {
+        self.shapers.get(link).map(|s| {
+            let a = s.agreement();
+            (a.frame_bytes, a.bytes_per_s())
+        })
+    }
+
+    /// Test seam — the frame a link's Channel carries now.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn link_channel_mdu_for_test(&self, link: [u8; 16]) -> usize {
+        link_channel_mdu(&self.node, &LinkId::new(link))
     }
 
     /// Test seam — a dial's establish budget, in place of the real one.
@@ -9814,6 +9861,56 @@ impl ReticulumTransport {
         }
     }
 
+    /// CC 5.4.3 `CLM-shaped-link-one-hop` — the refusal of a row under
+    /// `require_shaped_links` when `link` runs through a forwarder, or has gone
+    /// direct and is not shaped yet. The direct proposal goes FIRST: a refusal that came before it would leave the link
+    /// forwarded for good, and the rung would deadlock. Bulk and shaped links
+    /// are not this refusal's business, and a node that does not require
+    /// shaped links sends the row sealed and unshaped.
+    async fn row_refused_off_direct(
+        &self,
+        destination_key_id: &str,
+        link: LinkId,
+        envelope: &[u8],
+        candidates: &[DialCandidate],
+    ) -> Option<TransportError> {
+        let id = link.into_bytes();
+        if !self.shapers.policy().require_shaped_links
+            || crate::transport::link_shaping::is_bulk_payload(envelope)
+            || self.shapers.is_shaped(id)
+            || self.shapers.is_bulk(id)
+        {
+            return None;
+        }
+        // A punched link that is not shaped yet is the window between
+        // `DirectLinkEstablished` and the shaper: its offer is on the way, and
+        // a row sent now would cross unshaped. It waits like a forwarded one.
+        let punched = self.node.direct_link_interface(&link).is_some();
+        let dest = self.peer_dest(destination_key_id).await;
+        if !punched && !link_is_forwarded(&self.node, &link, dest) {
+            return None;
+        }
+        if !punched {
+            self.propose_direct_to_room_peer(destination_key_id, link, candidates)
+                .await;
+        }
+        if let Some(m) = self.metrics.get() {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_NO_DIRECT_PATH);
+        }
+        Some(TransportError::LinkSealRefused {
+            peer: destination_key_id.to_owned(),
+            reason: crate::observability::LINK_SHAPING_NO_DIRECT_PATH,
+            detail: "this node requires shaped links, a shaped link is one direct hop, and \
+                     this link is not shaped yet; a direct path was proposed or is keying"
+                .to_owned(),
+        })
+    }
+
+    /// The destination this node holds for `peer`.
+    async fn peer_dest(&self, peer: &str) -> Option<DestinationHash> {
+        self.peers.lock().await.get(peer).map(|r| r.peer.dest_hash)
+    }
+
     /// **A failed bulk dial never falls back onto shaped frames** (CC 5.4.3,
     /// `CLM-shaped-link-one-hop`). With a live shaped link the payload would
     /// have to leave, the failure is remembered for
@@ -11255,10 +11352,27 @@ impl ReticulumTransport {
                     // Rate-limited so rapid link churn can't storm announces.
                     let link_just_established =
                         matches!(event, NodeEvent::LinkEstablished { .. });
+                    // CC 5.4.3 — off the loop, on a task of its own that ends
+                    // with the offer: nothing long-lived holds the node.
+                    let direct_move = match &event {
+                        NodeEvent::DirectLinkEstablished { link_id, .. } => Some((*link_id, true)),
+                        NodeEvent::DirectLinkLost { link_id, .. } => Some((*link_id, false)),
+                        _ => None,
+                    };
                     let label = event_label(&event);
                     let began = std::time::Instant::now();
                     handle_event(event, &ctx).await;
                     observe(label, began);
+                    if let Some((link_id, up)) = direct_move {
+                        let dial = self.dial_ctx();
+                        tokio::spawn(async move {
+                            if up {
+                                dial.shape_after_direct(link_id).await;
+                            } else {
+                                dial.close_shaped_off_direct(link_id).await;
+                            }
+                        });
+                    }
 
                     // `map_or(true, …)` not `is_none_or` — MSRV 1.75 (is_none_or is 1.82).
                     if link_just_established
@@ -11399,6 +11513,18 @@ impl ReticulumTransport {
         }
 
         // CIRISEdge#353 — REVERSE PATH FIRST (see `send_via_reverse_path`).
+        // CC 5.4.3 — under `require_shaped_links` a row never rides a forwarder.
+        if let Some(link) = self
+            .live_link_to(destination_key_id, LinkPlane::Identity)
+            .await
+        {
+            if let Some(refusal) = self
+                .row_refused_off_direct(destination_key_id, link, envelope_bytes, &candidates)
+                .await
+            {
+                return Err(refusal);
+            }
+        }
         // Ordered AFTER the blackhole check so an operator ban still wins.
         if self
             .send_via_reverse_path(destination_key_id, envelope_bytes, None)
@@ -11491,6 +11617,13 @@ impl ReticulumTransport {
         // a dial publishes it claimed), so there is no unclaimed lane to ship
         // on: the "claim lost, ship anyway" path is gone.
         let link_id = claim.link_id();
+        if let Some(refusal) = self
+            .row_refused_off_direct(destination_key_id, link_id, envelope_bytes, &candidates)
+            .await
+        {
+            claim.release().await;
+            return Err(refusal);
+        }
         // A `Busy` collision here is not the reverse-path retry case, so both
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
@@ -12284,6 +12417,8 @@ async fn lease_pooled_scoped_link(
 /// equal values diverge.
 #[derive(Clone)]
 struct DialCtx {
+    /// Test seam — [`ReticulumTransport::set_offer_forwarded_for_test`].
+    test_offer_forwarded: Arc<std::sync::atomic::AtomicBool>,
     /// CC 5.4.3 rc16 two planes — this context's lane: `false` the row lane
     /// (dials offer shaping per policy; the pool never hands out a bulk
     /// link), `true` the bulk lane (dials offer none and are marked bulk; the
@@ -13493,6 +13628,57 @@ impl DialCtx {
         );
     }
 
+    /// CC 5.4.3 — a dialled link moved onto a punched interface: it is one hop
+    /// now, so the first `SHAP` goes out, at the link's MDU. The dialler offers
+    /// and the peer answers, as on any dial; the seal's transition window
+    /// covers frames that cross it.
+    async fn shape_after_direct(&self, link_id: LinkId) {
+        let link = link_id.into_bytes();
+        if self.shapers.is_shaped(link)
+            || self.shapers.has_offered(link)
+            || self.shapers.is_bulk(link)
+        {
+            return;
+        }
+        let Some(dest) = self.dialed_link_dest.lock().await.get(&link_id).copied() else {
+            return;
+        };
+        let peer = self
+            .peers
+            .lock()
+            .await
+            .iter()
+            .find(|(_, p)| p.peer.dest_hash == dest)
+            .map(|(key_id, _)| key_id.clone());
+        let Some(peer) = peer else { return };
+        if let Err(e) = self.offer_shaping(link_id, &peer).await {
+            tracing::info!(
+                peer = %peer,
+                link = %hex::encode(link),
+                error = %e,
+                "a direct link's shaping offer did not land (CC 5.4.3)"
+            );
+        }
+    }
+
+    /// CC 5.4.3 — a shaped link fell off its punched interface and would run
+    /// through a forwarder, so it closes. The next send dials, unshaped, and
+    /// proposes again.
+    async fn close_shaped_off_direct(&self, link_id: LinkId) {
+        if !self.shapers.is_shaped(link_id.into_bytes()) {
+            return;
+        }
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_DIRECT_LOST);
+        }
+        tracing::info!(
+            link = %hex::encode(link_id.into_bytes()),
+            reason = crate::observability::LINK_SHAPING_DIRECT_LOST,
+            "a shaped link lost its direct path and closes: a shaped link is one hop (CC 5.4.3)"
+        );
+        let _ = self.node.close_link(&link_id).await;
+    }
+
     async fn offer_shaping(&self, link_id: LinkId, peer: &str) -> Result<(), TransportError> {
         use crate::transport::link_shaping::{ShapingError, OFFER_ANSWER_BUDGET};
         // CC 5.4.3 / 5.4.6 item 4 — nothing is offered to a peer this node
@@ -13508,6 +13694,27 @@ impl DialCtx {
             .get(&link_id)
             .is_some_and(|p| shaping_applies_to(*p))
         {
+            return Ok(());
+        }
+        // CC 5.4.3 `CLM-shaped-link-one-hop` — a shaped link is one direct hop.
+        // Through a forwarder nothing is offered and the link runs sealed and
+        // unshaped; it is offered when it goes direct
+        // ([`Self::shape_after_direct`]). The link stays up either way: under
+        // `require_shaped_links` the proposal rides it, and only rows wait.
+        let dest = self.dialed_link_dest.lock().await.get(&link_id).copied();
+        if link_is_forwarded(&self.node, &link_id, dest)
+            && !self
+                .test_offer_forwarded
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_FORWARDED);
+            }
+            tracing::debug!(
+                peer = %peer,
+                link = %hex::encode(link_id.into_bytes()),
+                "no shaping offer: a forwarder carries this link (CC 5.4.3)"
+            );
             return Ok(());
         }
         let link = link_id.into_bytes();
@@ -16503,7 +16710,20 @@ async fn answer_shaping_offer(
     // neighbour is offered shaping under any scope and may take any of
     // the eight (CIRISEdge v44, CC 5.4.3, 5.4.6 item 4).
     let peer = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
-    let ours = if shaping_applies_to(plane) {
+    // CC 5.4.3 `CLM-shaped-link-one-hop` — a link a forwarder carries answers
+    // `off`. No path here is no evidence of one: a leaf newly dialled in must
+    // keep its shaped home link.
+    let dest = match peer.as_deref() {
+        Some(p) => ctx.peers.lock().await.get(p).map(|r| r.peer.dest_hash),
+        None => None,
+    };
+    let forwarded = link_is_forwarded(ctx.node, &link_id, dest);
+    if forwarded {
+        if let Some(m) = ctx.metrics {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_FORWARDED);
+        }
+    }
+    let ours = if shaping_applies_to(plane) && !forwarded {
         if ctx.shapers.load_refuses(peer.as_deref(), theirs).await {
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_REFUSED);

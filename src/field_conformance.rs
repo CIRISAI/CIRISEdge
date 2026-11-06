@@ -553,6 +553,19 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
     TestEvidence {
         cc: "5.4.3",
         clm: "CLM-shaped-link-one-hop",
+        property: "a link a forwarder carries is never offered shaping and answers off; a link that goes direct starts shaping at its MDU, and closes if it leaves that path",
+        impl_anchor: "src/transport/reticulum.rs#link_is_forwarded",
+        witness: &[
+            "tests/direct_links_805.rs#a_forwarded_link_is_never_shaped",
+            "tests/direct_links_805.rs#a_forwarded_offer_is_answered_off",
+            "tests/direct_links_805.rs#a_link_that_goes_direct_shapes_at_the_mdu_and_closes_when_it_falls_back",
+            "tests/direct_links_805.rs#a_required_shaped_link_proposes_before_it_refuses_and_the_rung_opens",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.4.3",
+        clm: "CLM-shaped-link-one-hop",
         property: "a failed bulk dial never falls back onto shaped frames: the send is refused by name and retried on its schedule",
         impl_anchor: "src/transport/reticulum.rs#ReticulumTransport::bulk_dial_refused",
         witness: &[

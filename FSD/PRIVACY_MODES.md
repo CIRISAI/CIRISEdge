@@ -110,7 +110,9 @@ crawls at rung 3. Live media is never on them and stops at rung 3. Rung 4 publis
 > **Superseded by CC 5.4.3 rc17, `CLM-shaped-link-one-hop`.** Bulk is unshaped only, and a failed bulk
 > dial refuses by name, retries on its schedule or goes by a carrier that said yes. The slow path this
 > section and §6.12 describe is removed; every slow-path figure below records the old design. How a
-> rung 3 node carries files is 44.2's routing work.
+> rung 3 node carries files is 44.2's routing work. A shaped link is one direct hop: a peer with no
+> direct path gets none, and what reaches it crosses a forwarder sealed and unshaped, or refuses under
+> `require_shaped_links`.
 
 **Slow, not impossible.** The CC rules: a chunk MAY ride a shaped link chunk by chunk when the node has no bulk link,
 within the row budget, rows first. The mechanism exists: `bulk_on_shaped` (`reticulum.rs:8859`) carries a message in

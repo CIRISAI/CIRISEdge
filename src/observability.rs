@@ -1205,6 +1205,14 @@ pub const LINK_SHAPING_AGREED: &str = "link_shaping_agreed";
 /// One side offered `off` (or the peer never answered): the link runs
 /// unshaped, by both sides' agreement.
 pub const LINK_SHAPING_UNSHAPED: &str = "link_shaping_unshaped";
+/// CC 5.4.3 `CLM-shaped-link-one-hop` — a link left unshaped because a
+/// forwarder carries it: nothing offered, or an offer answered `off`.
+pub const LINK_SHAPING_FORWARDED: &str = "link_shaping_unshaped:forwarded";
+/// CC 5.4.3 — a row refused under `require_shaped_links`: the peer has no
+/// direct path yet. A direct link was proposed before the refusal.
+pub const LINK_SHAPING_NO_DIRECT_PATH: &str = "link_shaping_no_direct_path";
+/// CC 5.4.3 — a shaped link closed because it left its direct path.
+pub const LINK_SHAPING_DIRECT_LOST: &str = "link_shaping_direct_lost";
 /// Refused: the peer offers no shaping and this node requires shaped links;
 /// the link closed.
 pub const LINK_SHAPING_REFUSED_UNSHAPED_PEER: &str = "link_shaping_refused_unshaped_peer";
@@ -1726,6 +1734,9 @@ pub const LINK_SHAPING_LABELS: &[&str] = &[
     LINK_SHAPING_OFFERED,
     LINK_SHAPING_AGREED,
     LINK_SHAPING_UNSHAPED,
+    LINK_SHAPING_FORWARDED,
+    LINK_SHAPING_NO_DIRECT_PATH,
+    LINK_SHAPING_DIRECT_LOST,
     LINK_SHAPING_REFUSED_UNSHAPED_PEER,
     LINK_SHAPING_HOME_ELSEWHERE,
     LINK_SHAPING_REFERRAL_SENT,
