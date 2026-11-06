@@ -2715,6 +2715,25 @@ async fn a_bound_peer_off_the_roster_is_a_stranger_after_a_restart() {
     bound_peer_after_a_restart("offroster", false).await;
 }
 
+/// `C` sends `B` `frame` until a handshake has reached `B`, however it was
+/// judged. The path `C` holds can be from before the restart: until `A` has
+/// heard the new `B`, a dial over it goes nowhere and times out, and that is
+/// no handshake of `C`'s. Returns the last send's result.
+async fn dial_until_judged(
+    t: &Trio,
+    frame: &[u8],
+    judged: impl Fn() -> bool,
+) -> impl std::fmt::Debug {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let sent = t.c.transport.send(&t.b.key.key_id, frame).await;
+        let done = wait_until(Duration::from_secs(10), || async { judged() }).await;
+        if done || tokio::time::Instant::now() >= deadline {
+            return sent;
+        }
+    }
+}
+
 async fn bound_peer_after_a_restart(tag: &str, seated: bool) {
     let t = trio_on(tag, true, false, false, true).await;
     seed_route(&t.b, &t.c).await;
@@ -2753,12 +2772,10 @@ async fn bound_peer_after_a_restart(tag: &str, seated: bool) {
         "the restart holds no live binding for C"
     );
     let first = marked(b"LTS-RESTART-BOUND-", 600);
-    let sent = t.c.transport.send(&t.b.key.key_id, &first).await;
+    let judged = || accepted() >= 1 || refused() >= 1;
+    let sent = dial_until_judged(&t, &first, judged).await;
     assert!(
-        wait_until(Duration::from_secs(10), || async {
-            accepted() >= 1 || refused() >= 1
-        })
-        .await,
+        judged(),
         "the handshake is judged: {sent:?} {:?}",
         metrics.link_seal()
     );
@@ -2805,15 +2822,15 @@ async fn a_superseded_binding_gives_no_standing_after_a_restart() {
         "C holds a path to B"
     );
     let frame = marked(b"LTS-SUPERSEDED-", 600);
-    let _ = t.c.transport.send(&t.b.key.key_id, &frame).await;
+    let refused = || {
+        metrics
+            .link_seal()
+            .contains_key("link_seal_refused_handshake_node_rate")
+    };
+    let sent = dial_until_judged(&t, &frame, refused).await;
     assert!(
-        wait_until(Duration::from_secs(10), || async {
-            metrics
-                .link_seal()
-                .contains_key("link_seal_refused_handshake_node_rate")
-        })
-        .await,
-        "the superseded identity is a stranger: {:?}",
+        refused(),
+        "the superseded identity is a stranger: {sent:?} {:?}",
         metrics.link_seal()
     );
 }
