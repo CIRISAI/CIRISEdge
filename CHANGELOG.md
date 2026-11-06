@@ -12,6 +12,8 @@ new.
 
 Every step of a late subject Pull gets the late window, so a Deliver behind a late Summary is kept.
 The retired-plane line logs at debug at the hot-add door. Test fixes and the 44.0.0 notes date.
+`anti-entropy round ended` carries `outcome` and `error`; a failing round says why at INFO, once per
+(peer, kind) in five minutes.
 
 ## 44.0.0 — 2026-11-06
 

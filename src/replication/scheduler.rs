@@ -1233,12 +1233,14 @@ impl GatedRound<'_> {
         // gap: the per-wait timeout is at least the Poisson p99 of one gap
         // (about 4.74 gaps), else every wait on a slow link times out.
         let round_timeout = pacing_timeout(self.round_timeout, self.coord.pacing_gap());
+        let mut ended = RoundEnded::default();
         let class = round_and_report(
             self.coord,
             round_timeout,
             self.event_sink,
             self.peer_id,
             &mut seat,
+            &mut ended,
         )
         .await;
         if let Some(m) = self.metrics {
@@ -1246,6 +1248,8 @@ impl GatedRound<'_> {
         }
         tracing::info!(
             took_ms = started.elapsed().as_millis(),
+            outcome = ended.outcome,
+            error = ended.error.as_deref().unwrap_or(""),
             "anti-entropy round ended"
         );
         let ran = if matches!(class, RoundClass::SendFailed) {
@@ -1278,6 +1282,53 @@ fn round_class_of(e: &RoundError) -> RoundClass {
     }
 }
 
+/// How a round ended, for its `anti-entropy round ended` line: the
+/// `replication_round_outcomes_total` label, and an error's text.
+struct RoundEnded {
+    outcome: &'static str,
+    error: Option<String>,
+}
+
+impl Default for RoundEnded {
+    fn default() -> Self {
+        Self {
+            outcome: "skipped",
+            error: None,
+        }
+    }
+}
+
+impl RoundEnded {
+    /// What `event` says.
+    fn of(event: &RoundEvent) -> Self {
+        let (outcome, error) = match event {
+            RoundEvent::Completed(_) => ("completed", None),
+            RoundEvent::Refused => ("refused", None),
+            RoundEvent::TimedOut => ("timed_out", None),
+            RoundEvent::Error(e) => ("error", Some(e.clone())),
+        };
+        Self { outcome, error }
+    }
+}
+
+/// How often one `(peer, kind)` may say why its rounds fail.
+const ROUND_ERROR_LOG_WINDOW: Duration = Duration::from_secs(300);
+
+fn round_error_log() -> &'static crate::log_throttle::LogThrottle {
+    static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(1, ROUND_ERROR_LOG_WINDOW, 8192))
+}
+
+/// Say why a round failed, at most once per `(peer, kind)` in a window. The
+/// round's span names both.
+fn log_round_error(peer: &str, kind: EnvelopeKind, what: &'static str, error: &str) {
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        round_error_log().check(&format!("{peer}:{kind:?}"))
+    {
+        tracing::info!(suppressed_prev, %error, "{what}");
+    }
+}
+
 /// One anti-entropy round toward this coordinator's peer — the signer-recovery
 /// attempt first, then the ordinary round — and its [`RoundEvent`] to the sink.
 /// Shared by the cadence tick and the [`SchedulerCommand::RoundNow`] kick.
@@ -1288,6 +1339,7 @@ async fn round_and_report(
     event_sink: Option<&tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
     peer_id: &str,
     seat: &mut RoundSeat<'_>,
+    ended: &mut RoundEnded,
 ) -> RoundClass {
     // FSD-SIGNER-RECOVERY D3 — a recovery round REPLACES this
     // tick's ordinary round; the two never overlap. It costs one
@@ -1308,9 +1360,15 @@ async fn round_and_report(
             // CIRISEdge#794 — no route: the ordinary round would fail the
             // same way, so it does not run; the backoff takes over.
             if let RoundClass::NoRoute(error) = round_class_of(&e) {
-                tracing::debug!(%error, "signer-recovery round: no route to peer (CIRISEdge#794)");
+                log_round_error(
+                    peer_id,
+                    coord.kind(),
+                    "signer-recovery round: no route to peer (CIRISEdge#794)",
+                    &error,
+                );
+                let event = RoundEvent::Error(format!("transport: {error}"));
+                *ended = RoundEnded::of(&event);
                 if let Some(sink) = event_sink {
-                    let event = RoundEvent::Error(format!("transport: {error}"));
                     let _ = sink.send((peer_id.to_string(), event)).await;
                 }
                 return RoundClass::NoRoute(error);
@@ -1334,6 +1392,7 @@ async fn round_and_report(
             DriveStep::Refused => RoundEvent::Refused,
             DriveStep::SendThenWait(_) => RoundEvent::TimedOut,
         };
+        *ended = RoundEnded::of(&event);
         if let Some(sink) = event_sink {
             let _ = sink.send((peer_id.to_string(), event)).await;
         }
@@ -1376,18 +1435,30 @@ async fn round_and_report(
         // CIRISEdge#794 — no route is logged once per backoff entry and
         // exit by the backoff, never once per round.
         Err(RoundError::Coordinator(e)) if matches!(class, RoundClass::NoRoute(_)) => {
-            tracing::debug!(error = %e, "round: no route to peer (CIRISEdge#794)");
+            log_round_error(
+                peer_id,
+                coord.kind(),
+                "round: no route to peer (CIRISEdge#794)",
+                &e.to_string(),
+            );
             RoundEvent::Error(e.to_string())
         }
         Err(RoundError::Coordinator(e)) => {
-            tracing::warn!(error = %e, "coordinator error during round");
+            log_round_error(
+                peer_id,
+                coord.kind(),
+                "coordinator error during round",
+                &e.to_string(),
+            );
             RoundEvent::Error(e.to_string())
         }
         Err(RoundError::InboundClosed) => {
-            tracing::warn!("inbound channel closed; cannot complete round");
-            RoundEvent::Error("inbound channel closed".to_string())
+            let error = "inbound channel closed";
+            log_round_error(peer_id, coord.kind(), "round cannot complete", error);
+            RoundEvent::Error(error.to_string())
         }
     };
+    *ended = RoundEnded::of(&event);
     if let Some(sink) = event_sink {
         // Sink-closed isn't a fault — the metrics consumer
         // dropped their receiver. Round loops continue.
@@ -1662,6 +1733,20 @@ async fn drive_exchange_to_completion(
 
 #[cfg(test)]
 mod tests {
+    use super::{RoundEnded, RoundEvent};
+
+    /// The round-ended line carries why: canonical-1's 178 `error` outcomes
+    /// left no reason anywhere (error 178, completed 0).
+    #[test]
+    fn a_round_ended_line_names_the_outcome_and_the_error() {
+        let ended = RoundEnded::of(&RoundEvent::Error("transport: no route".to_owned()));
+        assert_eq!(ended.outcome, "error");
+        assert_eq!(ended.error.as_deref(), Some("transport: no route"));
+        let ended = RoundEnded::of(&RoundEvent::TimedOut);
+        assert_eq!((ended.outcome, ended.error), ("timed_out", None));
+        assert_eq!(RoundEnded::default().outcome, "skipped");
+    }
+
     use super::*;
     use crate::replication::coordinator::ReplicationCoordinator;
     use crate::replication::protocol::{EnvelopeKind, EnvelopeRef};

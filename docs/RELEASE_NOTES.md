@@ -31,6 +31,9 @@ v22.0.0, leviculum v0.33.0+ciris.1.
   behind a late Summary still got only the caller's wait and was dropped. Each step now gets
   `PULL_LATE_WINDOW`. The caller's wait, the re-asks and the bound of 16 per peer and plane are
   unchanged.
+- **A round that fails says why.** `anti-entropy round ended` carries `outcome` and `error`, and the
+  no-route, coordinator and closed-inbound paths log at INFO, at most once per `(peer, kind)` in five
+  minutes. Rounds behave as before.
 - **The retired-plane line logs at debug at the hot-add door,** which a host's reconcile can reach
   on every pass. Nothing was scheduled either way.
 - **Tests.** The superseded-binding witness injects a binding newer than the announce it outranks,
