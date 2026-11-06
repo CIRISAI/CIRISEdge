@@ -244,6 +244,7 @@ pub struct ReplicationCoordinator {
     peer_lacks_nothing: std::sync::atomic::AtomicU64,
     /// Rings when an ordinary round ends: a held round asks again on this.
     round_finished: tokio::sync::Notify,
+    last_round_lost: std::sync::atomic::AtomicBool,
     /// CIRISEdge#634 — the role-specific inbox. A responder has a standing
     /// bounded inbox its driver drains continuously; an initiator has a
     /// round inbox that lives exactly as long as the driven round, plus an
@@ -349,6 +350,7 @@ impl ReplicationCoordinator {
             session: Mutex::new(Session::new(role, kind)),
             peer_lacks_nothing: std::sync::atomic::AtomicU64::new(0),
             round_finished: tokio::sync::Notify::new(),
+            last_round_lost: std::sync::atomic::AtomicBool::new(false),
             inbox,
             pull_exchanges: std::sync::Mutex::new(HashMap::new()),
             pull_retry_at_secs: AtomicU64::new(0),
@@ -880,7 +882,13 @@ impl ReplicationCoordinator {
     /// ([`StateProvider::round_ended`]).
     pub(crate) fn note_round_ended(&self, lost: bool) {
         self.provider.round_ended(self.kind, lost);
+        self.last_round_lost.store(lost, Ordering::Release);
         self.round_finished.notify_one();
+    }
+
+    /// Was the latest ordinary round lost? `false` before the first ends.
+    pub(crate) fn last_round_lost(&self) -> bool {
+        self.last_round_lost.load(Ordering::Acquire)
     }
 
     /// Wait for an ordinary round to end.

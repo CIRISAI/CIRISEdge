@@ -557,7 +557,8 @@ type BootstrapPlanes = Arc<
 /// Only a peer added while the scheduler runs is held, so a restart's peer list
 /// never is, and at most [`BOOTSTRAP_HOLDS`] at once. A plane is asked again
 /// when its round has ended and the wait has doubled, never on a tick, and a
-/// peer with no route is not asked at all. Bounded by [`BOOTSTRAP_HOLD`]. A
+/// round that was lost ends the hold: that peer is not answering, and asking
+/// again buys nothing. Bounded by [`BOOTSTRAP_HOLD`]. A
 /// peer with none of these planes has no wait past [`BOOTSTRAP_LOOK`].
 async fn hold_for_bootstrap(
     coord: &ReplicationCoordinator,
@@ -583,6 +584,9 @@ async fn hold_for_bootstrap(
         let seen = plane.peer_lacks_nothing();
         let mut wait = BOOTSTRAP_LOOK;
         while plane.peer_lacks_nothing() == seen {
+            if plane.last_round_lost() {
+                return;
+            }
             kick.notify_one();
             let ended = tokio::time::timeout_at(deadline, plane.round_finished());
             if ended.await.is_ok() && plane.peer_lacks_nothing() == seen {
