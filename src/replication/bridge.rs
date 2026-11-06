@@ -10859,7 +10859,8 @@ impl FederationDirectoryReplicationBridge {
     ///   node of, or it is placed in a public group the peer is in.
     /// - Required, CC 5.4.6: what a stranger is handed (group-plane rows, this
     ///   node's allegiance facts, the announced bindings it relays, a grant
-    ///   naming the peer), tombstones and a duty's appointments.
+    ///   naming the peer), tombstones, a duty's appointments, and a root's
+    ///   charter, without which `Rooted` cannot be read at all.
     /// - The class a live `consent:replication` grant names, of this node's own
     ///   rows (CC 3.3.7): the grant moves that class and nothing else. This
     ///   node's own conferrals move with its allegiance facts.
@@ -10893,6 +10894,8 @@ impl FederationDirectoryReplicationBridge {
             || att.attestation_type == attestation_type::RECANTS
             || (att.attestation_type == attestation_type::SUPERSEDES
                 && Self::row_dimension(view).is_empty())
+            || Self::row_dimension(view)
+                == ciris_persist::federation::trust_root::TRUST_CHARTER_DIMENSION
             || Self::is_appointment(att)
         {
             return true;
