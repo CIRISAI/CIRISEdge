@@ -2475,20 +2475,21 @@ mod tests {
             // Bob comes up after alice's start-up round has already fired
             // toward him: the ordering a loaded host produced at random.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let (mut bob, bob_m) = node("bob", "alice", &registries, &ledger).await;
-
-            // Both sides are initiators toward each other; neither has a
-            // responder yet.
-            assert!(alice
-                .registry()
-                .get_initiator("bob", EnvelopeKind::Key)
-                .await
-                .is_some());
+            // Read before bob exists: his own start-up round can reach alice
+            // as soon as he does, and a responder there is the case under test.
             assert!(alice
                 .registry()
                 .get_responder("bob", EnvelopeKind::Key)
                 .await
                 .is_none());
+            let (mut bob, bob_m) = node("bob", "alice", &registries, &ledger).await;
+
+            // Both sides are initiators toward each other.
+            assert!(alice
+                .registry()
+                .get_initiator("bob", EnvelopeKind::Key)
+                .await
+                .is_some());
             assert!(bob
                 .registry()
                 .get_initiator("alice", EnvelopeKind::Key)
