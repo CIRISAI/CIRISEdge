@@ -550,6 +550,17 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
         ],
         supporting: false,
     },
+    TestEvidence {
+        cc: "5.4.3",
+        clm: "CLM-shaped-link-one-hop",
+        property: "a failed bulk dial never falls back onto shaped frames: the send is refused by name and retried on its schedule",
+        impl_anchor: "src/transport/reticulum.rs#ReticulumTransport::bulk_dial_refused",
+        witness: &[
+            "tests/link_shaping_e1.rs#a_failed_bulk_dial_is_refused_by_name_and_never_rides_the_shaped_link",
+            "tests/link_shaping_e1.rs#a_peer_that_cannot_be_dialled_costs_one_failed_dial_not_one_per_send",
+        ],
+        supporting: false,
+    },
 ];
 
 /// Every edge-tagged field edge does NOT process with a runtime value-check —

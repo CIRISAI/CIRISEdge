@@ -136,7 +136,7 @@ counts handshakes whose link closed in the queue: they cost no crypto.
    tier 0 means nothing. A large age means the host stopped.
 3. `load_tier_changes_total{to:cause}`: `host:*`, `edge:transit_pps`,
    `edge:relay_commit`, `edge:av_queue_age`, or `cooldown` for a step down.
-4. Did shedding work: `load_shed:shaped`, `load_shed:bulk` and
+4. Did shedding work: `load_shed:shaped` and
    `load_refuse:admit_closed` in `link_shaping`, then `load_tier` falling.
 
 The tier reaches the shapers on a one-second tick, so edge needs no host read to
@@ -166,7 +166,7 @@ renewed in 30 s lapses to normal. The tier does not close forwarding.
    their budget and rows taken back. `link_shaping_bodies_stranded`: bodies a
    closing link took with it. All of them retry.
 4. `link_shaping_queue_deferred`, `link_shaping_over_cap`,
-   `link_shaping_bulk_refused`, `link_shaping_bulk_fallback:{ok,failed}`.
+   `link_shaping_bulk_refused`.
 5. `shaping_frames_real_windowed{class}` over W against the class's real budget.
 6. `shaping_windows_withheld{class}` rising means the class is under three links
    and the two above are not being published. That is not the same as no traffic.

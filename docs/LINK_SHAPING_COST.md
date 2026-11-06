@@ -215,20 +215,12 @@ a peer this node cannot dial.
 **Live media.** An A/V leg is on the `Av` plane and is never shaped. A scoped
 link is never shaped either. Neither makes a shaping claim.
 
-**The last resort.** If no unshaped link can be had because the dial fails (for
+**No fallback.** If no unshaped link can be had because the dial fails (for
 example, a NAT'd phone reachable only over the link it dialled in), the message
-rides the shaped link in shaped-budget fragments and is counted
-`link_shaping_bulk_on_shaped_fallback`. The shaper paces it like every other
-frame, so the link stays constant-size and constant-rate. It is slow, but it
-does not fail: `Delivered` means every fragment left this node, and a transfer
-that stops part-way is an error the durable dispatcher retries. A second send of
-the same envelope joins the transfer rather than queueing it twice, and a failed
-dial stands for 120 s per peer, so a NAT'd peer costs one failed dial, not one
-per send. The rate is the link's real budget: at the `server` class on a 16 KB
-frame, about 0.2 real frames per second, or 3.5 KB/s, so 1 MiB takes about five
-minutes.
+is refused by name, `link_shaping_bulk_refused`, and the durable dispatcher
+retries it on its schedule (CC 5.4.3, `CLM-shaped-link-one-hop`). It never rides
+the shaped link. A failed dial stands for 120 s per peer, so a NAT'd peer costs
+one failed dial, not one per send.
 
-**The refusal.** The shaper itself still refuses a message beyond its reach
-outside that fallback (`link_shaping_bulk_refused`), and queues none of it. The
-send paths move bulk before it gets there, so a count here means a path that
-skipped them.
+The shaper itself also refuses a message beyond its reach, under the same token,
+and queues none of it. The send paths move bulk before it gets there.

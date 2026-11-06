@@ -92,8 +92,7 @@ pub enum ServiceTier {
     /// links are not: a canonical is the last relay tier.
     AudioAndFiles = 1,
     /// Tier 2: chat and contacts. Relayed audio is shed (LIFO,
-    /// make-before-break), bulk transfer pauses, this node's own call is
-    /// audio only.
+    /// make-before-break), and this node's own call is audio only.
     ChatAndContacts = 2,
 }
 
@@ -166,13 +165,6 @@ impl ServiceTier {
     /// with a `Shed` notice so the requester moves make-before-break.
     #[must_use]
     pub const fn sheds_relayed_audio(self) -> bool {
-        matches!(self, Self::ChatAndContacts)
-    }
-
-    /// **B-pause** (tier 2): bulk transfer for non-owner peers pauses (not
-    /// cancelled; it resumes from its cursor at tier ≤ 1).
-    #[must_use]
-    pub const fn pauses_bulk(self) -> bool {
         matches!(self, Self::ChatAndContacts)
     }
 
@@ -297,13 +289,6 @@ impl PeerObligation {
             Some(class) => class.never_shed(),
             None => true,
         }
-    }
-
-    /// Whether this peer's slow path keeps running at tier 2: B-pause exempts
-    /// the owner's devices alone ("for non-owner peers", §7.2).
-    #[must_use]
-    pub const fn keeps_slow_path(self) -> bool {
-        matches!(self, Self::OwnDevice | Self::Unresolved)
     }
 }
 

@@ -1200,7 +1200,7 @@ pub struct LinkShaper {
     real: AtomicU64,
     cover: AtomicU64,
     /// Bodies ever queued, in FIFO order: a body's ticket is this count once
-    /// it is queued ([`Self::enqueue_bulk_fallback`]).
+    /// it is queued ([`Self::enqueue`]).
     accepted: AtomicU64,
     /// Real frames the link really took ([`Self::note_real_sent`]). Serial and
     /// The highest ticket among the bodies the link really took
@@ -1510,21 +1510,6 @@ impl LinkShaper {
     #[must_use]
     pub fn room(&self) -> usize {
         self.queue_cap.saturating_sub(self.queued())
-    }
-
-    /// CC 5.4.3 rc16 two planes — the LAST-RESORT bulk path: queue part of a
-    /// bulk message on this shaped link without the reach check, for a peer
-    /// no unshaped link can exist to (a NAT'd peer this node cannot dial).
-    /// The shaper still paces every body at the agreed λ under the ρ budget,
-    /// so the link stays constant-size and constant-rate; the message is only
-    /// slow. The caller feeds it in pieces as [`Self::room`] allows. Returns
-    /// the last body's ticket: it has left this node once [`Self::real_sent`]
-    /// reaches it.
-    ///
-    /// # Errors
-    /// As [`Self::enqueue`], less the reach refusal.
-    pub fn enqueue_bulk_fallback(&self, bodies: Vec<Vec<u8>>) -> Result<u64, ShapingError> {
-        self.enqueue_within_queue(bodies)
     }
 
     fn enqueue_within_queue(&self, bodies: Vec<Vec<u8>>) -> Result<u64, ShapingError> {
@@ -1892,80 +1877,6 @@ pub const ROW_LEAVE_MAX: Duration = Duration::from_secs(60);
 /// and their retries did not converge (`FSD/PRIVACY_MODES.md` E7).
 pub const ROW_LEAVE_MAX_GAPS: f64 = 16.0;
 
-/// How many frames of a bulk message may wait in a shaped link's queue at once
-/// on the slow path. The queue is one FIFO, so this is how far a row can be
-/// behind a file: a few gaps, never the whole file (`FSD/PRIVACY_MODES.md` E3,
-/// "a row behind a file is a starved row").
-pub const SLOW_PATH_QUEUED_MAX: usize = 4;
-
-/// How long a finished bulk fallback is remembered, so a retry that lost its
-/// wait does not send the whole message again.
-pub const BULK_FALLBACK_DONE_TTL: Duration = Duration::from_secs(600);
-
-/// The outcome of one bulk fallback: `Ok`, or why it stopped.
-pub type BulkFallbackResult = Option<Result<(), String>>;
-
-/// CC 5.4.3 rc16 two planes — the bulk fallbacks in progress, by envelope
-/// digest. A fallback takes minutes and its callers do not all wait that long:
-/// a responder cancels at 60 s, and a durable claim can expire and dispatch the
-/// same row again. So a transfer runs detached and single-flight: a cancelled
-/// wait abandons the wait, not the transfer, and a second send of the same
-/// envelope joins it instead of queueing the bytes twice.
-#[derive(Debug, Default)]
-pub struct BulkFallbacks {
-    running: Mutex<HashMap<[u8; 32], tokio::sync::watch::Receiver<BulkFallbackResult>>>,
-    finished: Mutex<HashMap<[u8; 32], std::time::Instant>>,
-}
-
-impl BulkFallbacks {
-    /// Whether this envelope finished within [`BULK_FALLBACK_DONE_TTL`].
-    #[must_use]
-    pub fn recently_finished(&self, digest: &[u8; 32]) -> bool {
-        let mut done = self
-            .finished
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        done.retain(|_, at| at.elapsed() < BULK_FALLBACK_DONE_TTL);
-        done.contains_key(digest)
-    }
-
-    /// Join the transfer of `digest`, or start one: a returned sender means
-    /// this caller owns the transfer and reports to it.
-    pub fn join_or_start(
-        &self,
-        digest: [u8; 32],
-    ) -> (
-        tokio::sync::watch::Receiver<BulkFallbackResult>,
-        Option<tokio::sync::watch::Sender<BulkFallbackResult>>,
-    ) {
-        let mut running = self
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(rx) = running.get(&digest) {
-            return (rx.clone(), None);
-        }
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        running.insert(digest, rx.clone());
-        (rx, Some(tx))
-    }
-
-    /// The transfer of `digest` ended. A failed one is forgotten, so the
-    /// retry starts it again.
-    pub fn finish(&self, digest: &[u8; 32], ok: bool) {
-        self.running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(digest);
-        if ok {
-            self.finished
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(*digest, std::time::Instant::now());
-        }
-    }
-}
-
 /// Default bound on a shaped link's queue, in bodies.
 pub const DEFAULT_QUEUE_CAP: usize = 4096;
 
@@ -2037,12 +1948,6 @@ impl LinkShapers {
             && theirs.shapes()
             && self.offers_to(peer)
             && !self.obligation_of(peer).await.keeps_shaped_link()
-    }
-
-    /// **B-pause on the slow path** (§6.12): whether a transfer to `peer`
-    /// over a shaped link waits now. The row does not.
-    pub async fn slow_path_paused(&self, peer: &str) -> bool {
-        self.service_tier().pauses_bulk() && !self.obligation_of(Some(peer)).await.keeps_slow_path()
     }
 
     /// The newest shaped link tier 2 closes now, if any: every candidate's
@@ -3588,24 +3493,11 @@ mod tests {
     }
 
     /// One constant decides: over 64 KiB is bulk whatever the type, and the
-    /// window budget does not. Two sends of one envelope are one transfer;
-    /// a failed one can start again and a finished one is not re-sent.
+    /// window budget does not.
     #[test]
-    fn the_row_limit_and_the_fallback_single_flight() {
+    fn the_row_limit_is_one_constant() {
         assert!(!is_bulk_payload(&vec![b'r'; SHAPED_ROW_MAX_BYTES]));
         assert!(is_bulk_payload(&vec![b'r'; SHAPED_ROW_MAX_BYTES + 1]));
-        let f = BulkFallbacks::default();
-        let (_, owner) = f.join_or_start([1; 32]);
-        assert!(owner.is_some());
-        assert!(f.join_or_start([1; 32]).1.is_none(), "a retry joins it");
-        f.finish(&[1; 32], false);
-        assert!(!f.recently_finished(&[1; 32]));
-        assert!(f.join_or_start([1; 32]).1.is_some(), "a failure restarts");
-        f.finish(&[1; 32], true);
-        assert!(
-            f.recently_finished(&[1; 32]),
-            "a finished one is not re-sent"
-        );
     }
 
     /// CC 5.4.3 rc17 `CLM-seat-class`: the table's row exactly (33,000 B/s,
@@ -4317,30 +4209,6 @@ mod tests {
             s.next_emission().await,
             Emission::Frame { real: false, .. }
         ));
-    }
-
-    /// §6.12, §7.2: B-pause spares the owner's devices alone. A seat and a
-    /// contact keep their links and their files wait; a read that failed
-    /// pauses nothing, and tiers 0 and 1 pause nothing.
-    #[tokio::test]
-    async fn the_slow_path_pauses_at_tier_two_for_all_but_the_owners_devices() {
-        use crate::load_ladder::{PeerObligation as O, ServiceTier as T};
-        let (t, owed) = shedding(BudgetClass::Server);
-        owed.set("device", O::OwnDevice);
-        owed.set("seat", O::Seat);
-        owed.set("contact", O::SendSet);
-        owed.set("unread", O::Unresolved);
-        for tier in [T::FullOps, T::AudioAndFiles] {
-            t.set_service_tier(tier);
-            assert!(!t.slow_path_paused("stranger").await, "{tier:?}");
-        }
-        t.set_service_tier(T::ChatAndContacts);
-        for paused in ["stranger", "seat", "contact"] {
-            assert!(t.slow_path_paused(paused).await, "{paused}");
-        }
-        for runs in ["device", "unread"] {
-            assert!(!t.slow_path_paused(runs).await, "{runs}");
-        }
     }
 
     /// E8: the figures are the policy's arithmetic, §2.4's values at the class

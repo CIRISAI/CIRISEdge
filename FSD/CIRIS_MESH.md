@@ -765,7 +765,6 @@ A tier is a set of shed levers. Each tier includes every lever of the tiers abov
 | **Admit-close:** no new relay reservations or A/V relay legs; C2 answers `Refuse { retry_after }`; the relay offer is re-signed with a 0 bucket. Forwarded links are not relay work here and are admitted at every tier | – | **on** | on |
 | **Stretch:** expensive non-obligation replication rounds, i.e. rounds to relayed peers that are not the owner, own devices or the send set. Moved to the host's `walk` lever (§7.7); the tier does not pull it | host | host | host |
 | **A-shed:** audio relay legs this node carries are shed newest-first (LIFO, `ShedReason::OverCommitted`, token `load_shed:audio`), each with a `Shed` notice so the requester moves make-before-break | – | – | **on** |
-| **B-pause:** a shaped link's slow path for non-owner peers waits. Blob swarm pulls and the durability pass are the host's `bulk` lever (§7.7), and the tier does not pull it | – | – | **on** |
 | **Own A/V:** this node's OWN call (as a publisher and receiver) | full | full; video is host-degraded on `CallEvent::LoadTier` | audio only |
 
 **What keeps working.**
@@ -788,7 +787,7 @@ A tier is a set of shed levers. Each tier includes every lever of the tiers abov
 | `Attestation`, `chat:*` and `consent:*` rows | chat and contacts | full | full |
 | `Attestation`, everything else (file descriptors, call rows, scores, other) | ordinary | Stretch for non-obligation peers | Stretch ×8; file descriptors still flow so a paused file resumes |
 | `LocationProof`, `Organization`, `OrgMembership`, `PartnerRecord` | ordinary | Stretch for non-obligation peers | Stretch ×8 |
-| Blob/file chunk transfer (blob swarm), the durability pass | bulk | full | B-pause (own devices' self-tier durability excepted, L-A3) |
+| Blob/file chunk transfer (blob swarm), the durability pass | bulk | the host's `bulk` lever (§7.7) | the host's `bulk` lever |
 | A/V: legs this node *relays* (member relay or non-member forwarder) | relay | V-shed, Admit-close | A-shed |
 | A/V: this node's own call | own | host-degraded video | audio only |
 | Transit: relayed links this node forwards (RNS transport) | never-shed (L-A3) | full; configured per-link caps (L3) hold at every tier | full |
@@ -837,7 +836,7 @@ This mirrors the agent's resource monitor
   - Each tier change and each shed decision is logged with a stable token. The tokens are:
     - `load_tier:{0,1,2}` with the cause (`host:warning`, `edge:relay_commit`, `edge:av_queue_age`,
       `edge:transit_pps`);
-    - `load_shed:{video,audio,bulk,transit}`;
+    - `load_shed:{video,audio,shaped}`;
     - `load_refuse:admit_closed`;
     - `load_stretch:{plane}`.
   - Each token is counted under its label.

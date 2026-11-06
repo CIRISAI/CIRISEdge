@@ -107,6 +107,11 @@ crawls at rung 3. Live media is never on them and stops at rung 3. Rung 4 publis
 
 ### 2.3 At rung 3, are files impossible or just slow?
 
+> **Superseded by CC 5.4.3 rc17, `CLM-shaped-link-one-hop`.** Bulk is unshaped only, and a failed bulk
+> dial refuses by name, retries on its schedule or goes by a carrier that said yes. The slow path this
+> section and §6.12 describe is removed; every slow-path figure below records the old design. How a
+> rung 3 node carries files is 44.2's routing work.
+
 **Slow, not impossible.** The CC rules: a chunk MAY ride a shaped link chunk by chunk when the node has no bulk link,
 within the row budget, rows first. The mechanism exists: `bulk_on_shaped` (`reticulum.rs:8859`) carries a message in
 shaped-budget fragments, paced by the same timer, so the link stays one size and one rate. A witness carries 1 MiB
@@ -652,7 +657,7 @@ Eric's fleet default is on for `server` (CC 5.4.3), but the canonical has no wiz
   Tier 2: may close shaped links, newest first, for non-obligation peers, never the owner's devices or a `seat` link. A closure is visible, and that is
   the accepted cost; it says a link closed, not how loaded the rest are. As built (`feat/v44-status-shed`): one link a second, links this node dialled are not closed, and a refusal at tier 1 carries `load_shed:shaped`.
 - **Rows keep their place.** Tier 2 keeps chat and contacts on the shaped link at the unchanged real budget.
-- **The slow path is bulk.** B-pause stops it at tier 2 for non-owner peers (`CIRIS_MESH.md` §7.2), so a rung 3 file waits, by kind, and the row does not.
+- **The slow path is gone** (CC 5.4.3 rc17). What followed read: B-pause stops it at tier 2 for non-owner peers (`CIRIS_MESH.md` §7.2), so a rung 3 file waits, by kind, and the row does not.
 - The ladder and the shaper are not yet on one branch: `feat/onion-v44` has no `load_ladder`; v44 integration brings them together.
 
 ---
