@@ -4403,6 +4403,9 @@ impl ReticulumTransport {
     ///   [`INBOUND_TRANSFER_STALL`], e.g. a large LXMF response);
     /// - an LXMF serve link, for one bound after its last LXMF activity
     ///   (`lxmf_serve_links`);
+    /// - a link on a punched interface whose peer holds a live A/V link: the
+    ///   interface goes with the link, and the call rides it
+    ///   ([`Self::punched_links_under_a_call`]);
     /// - a link still in its attribution handshake (see
     ///   [`inbound_link_idle_expired`]).
     ///
@@ -4445,6 +4448,7 @@ impl ReticulumTransport {
                 .filter(|(_, at)| at.elapsed() < bound)
                 .map(|(id, _)| *id),
         );
+        busy.extend(self.punched_links_under_a_call(&candidates).await);
         let established_at = self.link_established_at.lock().await.clone();
         let last_inbound = self.link_last_inbound_at.lock().await.clone();
         let last_outbound = self
@@ -4525,6 +4529,30 @@ impl ReticulumTransport {
             }
         }
         due.len()
+    }
+
+    /// v44 — which of `links` run on a punched interface and belong to a peer
+    /// with a live A/V link. leviculum closes the interface with the link it
+    /// was punched for, and media rides the leg, never that link: on the side
+    /// that did not dial it nothing stamps it and no [`DirectPathGuard`] is
+    /// held. Only that much is busy. A punched link with no call ages, so the
+    /// reaper still ends a wedge, and the A/V link is reaped for its own
+    /// silence, which releases this one.
+    ///
+    /// [`DirectPathGuard`]: crate::transport::direct_path::DirectPathGuard
+    async fn punched_links_under_a_call(&self, links: &[LinkId]) -> Vec<LinkId> {
+        let mut held = Vec::new();
+        for id in links {
+            if self.node.direct_link_interface(id).is_none() {
+                continue;
+            }
+            let peer = self.link_to_peer_key_id.lock().await.get(id).cloned();
+            let Some(peer) = peer else { continue };
+            if self.live_link_to(&peer, LinkPlane::Av).await.is_some() {
+                held.push(*id);
+            }
+        }
+        held
     }
 
     /// **CIRISEdge#853 — reconcile edge's link book against the node.** A
