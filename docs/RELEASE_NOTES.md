@@ -2,7 +2,7 @@
 
 # v44.0.0 — the group plane as rows, calls on the ALM mesh, a phone that sleeps
 
-**2026-11-05.** **MAJOR** from v43.4.1, and the **long-term support line** while persist does its
+**2026-11-06.** **MAJOR** from v43.4.1, and the **long-term support line** while persist does its
 refactor (Eric, 2026-11-05). Pins CIRISPersist **v61.0.4** (tag, e7ead8fc), CIRISVerify **v22.0.0**
 (cbcd957) and leviculum **v0.33.0+ciris.1** (a3dc12cd). Python requires `ciris-persist>=61.0.4,<62`,
 which declares `ciris-verify>=22,<23`. Under pyo3 every door call runs inside the wheel, so an older

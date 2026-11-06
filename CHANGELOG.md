@@ -2,7 +2,7 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
-## 44.0.0 — 2026-11-05
+## 44.0.0 — 2026-11-06
 
 Long-term support line. Pins persist 61.0.4, verify 22.0.0, leviculum 0.33.0+ciris.1. Coordinated
 cut: a v43.x peer cannot interoperate.

@@ -1242,12 +1242,13 @@ impl ReplicationCoordinator {
         mut inbox: mpsc::Receiver<ReplicationMessage>,
         reply_timeout: Duration,
     ) -> Result<Option<RoundReport>, &'static str> {
-        let mut late = false;
         loop {
+            // Each step gets the window: what came late may be a Summary, with
+            // the Deliver behind it on the same slow path.
             let msg = match tokio::time::timeout(reply_timeout, inbox.recv()).await {
                 Ok(Some(msg)) => msg,
-                Err(_) if !late => {
-                    late = true;
+                Ok(None) => return Err("no reply in time"),
+                Err(_) => {
                     self.pull_went_late(round);
                     let Ok(Some(msg)) =
                         tokio::time::timeout(Self::PULL_LATE_WINDOW, inbox.recv()).await
@@ -1257,7 +1258,6 @@ impl ReplicationCoordinator {
                     tracing::info!("subject Pull: a reply came after its wait, and is kept");
                     msg
                 }
-                Ok(None) | Err(_) => return Err("no reply in time"),
             };
             self.note_removal_ack(&msg);
             let throttled = match &msg {
@@ -2055,6 +2055,39 @@ mod tests {
         let diff = next_frame(&to_bob).await;
         assert_eq!(diff.meta.expect("v3").round, first);
         assert!(matches!(diff.msg, ReplicationMessage::Diff(_)));
+    }
+
+    /// The Deliver behind a late Summary is as late as the Summary was.
+    #[tokio::test(start_paused = true)]
+    async fn a_deliver_behind_a_late_summary_is_kept() {
+        let (alice, to_bob) = pull_rig(HashMap::new());
+        let t = Duration::from_millis(30);
+        let _ = alice.pull_exchange("dan", t).await.unwrap();
+        let round = next_frame(&to_bob).await.meta.expect("v3").round;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        alice
+            .deliver_reply(
+                summary_of(
+                    vec![EnvelopeRef {
+                        envelope_hash: h(3),
+                        seq: 1,
+                    }],
+                    None,
+                ),
+                round,
+            )
+            .expect("a late answer still routes");
+        let _ = next_frame(&to_bob).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        alice
+            .deliver_reply(
+                ReplicationMessage::Deliver(DeliverMessage {
+                    kind: EnvelopeKind::Attestation,
+                    envelopes: vec![b"binding".to_vec()],
+                }),
+                round,
+            )
+            .expect("its Deliver routes after the step's wait");
     }
 
     /// Asks that never hear back cost a bounded number of listeners.

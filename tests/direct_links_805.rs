@@ -221,7 +221,25 @@ where
 /// `T`: a bare leviculum transport node with a TCP server and a facilitator,
 /// the role a canonical plays. Its events are drained so its queue never
 /// backs up.
-async fn transport_node(tcp_port: u16, facilitator_port: u16) -> ReticulumNode {
+///
+/// On ports of its own. A port [`free_port`] named can be taken before the
+/// bind, by anything on the host, so an address in use is a redraw.
+async fn transport_node_on_free_ports() -> (ReticulumNode, u16, u16) {
+    let mut left = 8;
+    loop {
+        let (t_port, f_port) = (free_port(), free_udp_port());
+        match try_transport_node(t_port, f_port).await {
+            Ok(node) => return (node, t_port, f_port),
+            Err(e) if left > 0 => {
+                left -= 1;
+                tracing::debug!("T's ports were taken, redrawing: {e}");
+            }
+            Err(e) => panic!("start T: {e}"),
+        }
+    }
+}
+
+async fn try_transport_node(tcp_port: u16, facilitator_port: u16) -> Result<ReticulumNode, String> {
     let storage = tempfile::tempdir().expect("tempdir");
     let mut node = ReticulumNodeBuilder::new()
         .enable_transport(true)
@@ -242,10 +260,10 @@ async fn transport_node(tcp_port: u16, facilitator_port: u16) -> ReticulumNode {
         .await
         .expect("build T");
     std::mem::forget(storage);
-    node.start().await.expect("start T");
+    node.start().await.map_err(|e| format!("{e:?}"))?;
     let mut rx = node.take_event_receiver().expect("T's events");
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    node
+    Ok(node)
 }
 
 /// One edge node: a TCP client of `T` only, its scope table and lifecycle
@@ -442,9 +460,7 @@ async fn trio_uplink(
 ) -> Trio {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let t_port = free_port();
-    let f_port = free_udp_port();
-    let t = transport_node(t_port, f_port).await;
+    let (t, t_port, f_port) = transport_node_on_free_ports().await;
     let a_t_port = match a_uplink {
         Some(held) => held_uplink(t_port, held).await,
         None => t_port,

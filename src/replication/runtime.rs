@@ -1450,8 +1450,13 @@ impl ReplicationRuntime {
     ) -> Result<(), ReplicationRuntimeError> {
         let peer_key_id = peer_key_id.into();
         // persist v61 — a retired plane carries nothing; it is never scheduled.
+        // Debug: a host's reconcile can name one on every pass.
         if kind.is_retired_plane() {
-            note_retired_plane_skipped(&peer_key_id, kind);
+            tracing::debug!(
+                peer = %peer_key_id,
+                kind = kind.as_wire_str(),
+                "replication peer on a RETIRED plane not scheduled"
+            );
             return Ok(());
         }
         let key = (peer_key_id.clone(), kind);
