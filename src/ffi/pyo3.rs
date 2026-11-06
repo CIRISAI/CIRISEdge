@@ -2915,6 +2915,8 @@ impl PyEdge {
         // unless `use_node_identity` split them, and where they differ, using
         // the actor here silently disables a blessed node's directory role.
         config.serve_tier_subject_key_id = Some(self.inner.advertised_key_id());
+        // CC 5.2 — only two seats walk the commons, by the active roster.
+        config.recognised_seats = Some(self.inner.recognised_seats());
         // CIRISEdge#370 — hand the live metrics bag to the runtime so its
         // scheduler event-sink consumer folds each round's outcome into the
         // round-outcome counter surfaced by `metrics_snapshot`. Cheap clone;

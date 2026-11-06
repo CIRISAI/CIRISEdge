@@ -1931,6 +1931,13 @@ impl Edge {
             .is_ok_and(|set| set.contains(key_id))
     }
 
+    /// CC 5.2 — the live canonical set, for the replication runtime: the
+    /// active roster reads it at each sweep.
+    #[must_use]
+    pub fn recognised_seats(&self) -> Arc<std::sync::RwLock<HashSet<String>>> {
+        Arc::clone(&self.canonical_peers)
+    }
+
     /// CIRISEdge#46 (v0.18.0) — snapshot of the canonical set as a
     /// `Vec<String>` (cloned key_ids). Useful for diagnostics and the
     /// `peer_list` projection (although the projection's hot path

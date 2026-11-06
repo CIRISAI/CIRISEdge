@@ -1805,9 +1805,15 @@ mod advertise_tests {
         let publish_set: Vec<String> = self_set.iter().map(|s| (*s).to_string()).collect();
         let provider: crate::replication::bridge::CohortProvider =
             Arc::new(move || publish_set.clone());
+        // A third party's binding is the commons: two seats walk it (CC 5.2),
+        // and a contact asks for it (#907).
         bridge
             .with_local_key_id(Some("local-node".to_string()))
             .with_self_provider(Some(provider))
+            .with_recognised_seats(crate::replication::bridge::tests::seats(&[
+                "local-node",
+                "peer-1",
+            ]))
     }
 
     /// **persist v44.8.0 C2 (CIRISPersist#867) — the promoter READS the

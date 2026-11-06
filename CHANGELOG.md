@@ -2,7 +2,13 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
-## 44.0.1 — 2026-11-06
+## 44.1.0 — 2026-11-06
+
+What moves to a peer (CC 5.2): a row moves when it is requested, or required, and appropriate, never
+because it is federation-tier. Two serve seats keep the commons walk; every other peer starts with
+what is required, and of the walk is offered only what is required or appropriate and live. The rest
+waits on the peer's pull. `SERVE_ADVERTISE_POLICY_HASH` is 14aedf25…; `advertise_awaits_request` is
+new.
 
 Every step of a late subject Pull gets the late window, so a Deliver behind a late Summary is kept.
 The retired-plane line logs at debug at the hot-add door. Test fixes and the 44.0.0 notes date.

@@ -278,8 +278,10 @@ async fn one_deliver_walks_the_trust_root_once_and_the_next_sees_a_revocation_81
     let scope = serde_json::json!(["infra:attest", "infra:serve"]);
     let peer_accepts = seed_acceptance_edge(&backend, peer, "root-r", &scope).await;
     seed_consent_membership_unrooted(&backend, local, peer).await;
-    let bridge =
-        bridge_over(&backend, &[local, producer, peer]).with_local_key_id(Some(local.to_owned()));
+    // The third party's rows are the commons, which two seats walk (CC 5.2).
+    let bridge = bridge_over(&backend, &[local, producer, peer])
+        .with_local_key_id(Some(local.to_owned()))
+        .with_recognised_seats(seats(&[local, peer]));
 
     let offered = bridge.list_attestations_for_peer(Some(peer)).await;
     let walks = || bridge.rooted_walks.load(Ordering::SeqCst);

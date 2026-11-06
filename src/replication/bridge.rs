@@ -1485,7 +1485,7 @@ impl AdvertiseLedger {
 }
 
 /// One Attestation advertise round for one peer: the counts add up,
-/// `listed == not_advertisable + withheld + duplicate + offered`.
+/// `listed == not_advertisable + awaits_request + withheld + duplicate + offered`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AdvertiseRoundSummary {
     peer: String,
@@ -1496,6 +1496,8 @@ struct AdvertiseRoundSummary {
     duplicate: usize,
     offered: usize,
     reoffered_after_skip: usize,
+    /// CC 5.2 — rows read and not offered: they wait on the peer's pull.
+    awaits_request: usize,
 }
 
 /// The per-page counts of [`FederationDirectoryReplicationBridge::attestation_page`].
@@ -1505,6 +1507,7 @@ struct PageCounts {
     duplicate: usize,
     offered: usize,
     reoffered_after_skip: usize,
+    awaits_request: usize,
 }
 
 fn advertise_summary_log() -> &'static crate::log_throttle::LogThrottle {
@@ -1599,6 +1602,16 @@ type ReleasedAsks = HashMap<(String, EnvelopeKind), Vec<[u8; 32]>>;
 /// CIRISEdge#776 — released rows one `(peer, plane)` fetches by hash at once. A
 /// row past it comes back on the re-sweep, as every released row did before.
 const MAX_RELEASED_ASKS: usize = 64;
+
+impl PageCounts {
+    fn merge(&mut self, other: Self) {
+        self.not_advertisable += other.not_advertisable;
+        self.duplicate += other.duplicate;
+        self.offered += other.offered;
+        self.reoffered_after_skip += other.reoffered_after_skip;
+        self.awaits_request += other.awaits_request;
+    }
+}
 
 impl SweepCursors {
     /// The `since` for this round's NEW-ROWS page.
@@ -1819,7 +1832,39 @@ struct AttestationSweepCtx {
     /// CC 5.2 (v19.0.0) — the per-sweep principal / cohort memo for the
     /// AUDIENCE gate ([`FederationDirectoryReplicationBridge::audience_withholds`]).
     audience: AudienceMemo,
+    /// CC 5.2 — what this peer is offered unasked, for this sweep.
+    moves: UnaskedOffer,
+    /// `peer` and the principals it answers for.
+    peer_principals: HashSet<String>,
+    /// CC 5.2 — the active members of each public group a row was placed in.
+    public_members: HashMap<String, HashSet<String>>,
+    /// CC 5.2 — the rows the required read already put through the gates, so
+    /// the walk does not judge (and book) them twice in one sweep.
+    judged: HashSet<String>,
 }
+
+/// CC 5.2 — what a node offers a peer that has not asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnaskedOffer {
+    /// Two serve seats (anti-entropy over the commons), or the peer-blind
+    /// view, which offers nothing to anyone.
+    Commons,
+    /// One of the owner's own nodes, or a peer whose reach already confines
+    /// it: the required rows first, then the walk under its gates. A person's
+    /// own nodes are not contacts.
+    ByReach,
+    /// A contact, or a seat and a node that is not one: the required rows
+    /// first, and of the walk only what is required or appropriate and live.
+    RequiredOrAppropriate,
+}
+
+/// CC 5.2 — the page of each required read. Rows past it are the walk's.
+const REQUIRED_READ_PAGE: std::num::NonZeroU32 =
+    ciris_persist::federation::attestation_query::page_size(64);
+
+/// CC 5.2 — the `seq` of a required row. The outgoing push goes oldest `seq`
+/// first, and what is required moves before any walk.
+const REQUIRED_ROW_SEQ: u64 = 0;
 
 /// One live egress grant, reduced to what the per-recipient `trace:` gate asks
 /// of it: who it names and which dimensions it covers.
@@ -2470,6 +2515,10 @@ pub struct FederationDirectoryReplicationBridge {
     /// the E3 truster and the own-record Pull subject. `None` falls back to
     /// `local_key_id`, correct wherever the two coincide.
     serve_tier_subject: Option<String>,
+    /// The recognised serve seats (`Edge::recognised_seats`): the bundle's and
+    /// any this node was told of. The active roster is this, plus the role as
+    /// conferred, less the #377 tombstones ([`crate::peer_obligation::holds_active_seat`]).
+    recognised_seats: Option<Arc<std::sync::RwLock<HashSet<String>>>>,
     /// Whose consent the attestation send set reads: the union of
     /// `consent_peers_by_principals(k)` over these keys. Empty falls back to
     /// `local_key_id`. Consent is the agent's: on a split home the owner's
@@ -2779,6 +2828,7 @@ impl FederationDirectoryReplicationBridge {
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
             serve_tier_subject: None,
+            recognised_seats: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             requested_signers: Mutex::new(std::collections::BTreeSet::new()),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
@@ -2898,6 +2948,17 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_local_key_id(mut self, local_key_id: Option<String>) -> Self {
         self.local_key_id = local_key_id;
+        self
+    }
+
+    /// CC 5.2 — install the recognised serve seats (builder). Seat-to-seat
+    /// anti-entropy reads the active roster through them.
+    #[must_use]
+    pub fn with_recognised_seats(
+        mut self,
+        seats: Option<Arc<std::sync::RwLock<HashSet<String>>>>,
+    ) -> Self {
+        self.recognised_seats = seats;
         self
     }
 
@@ -10016,7 +10077,28 @@ impl FederationDirectoryReplicationBridge {
             trace_pause_booked: false,
             quarantine_memo: HashMap::new(),
             audience: AudienceMemo::default(),
+            moves: UnaskedOffer::Commons,
+            peer_principals: HashSet::new(),
+            public_members: HashMap::new(),
+            judged: HashSet::new(),
         };
+        if let Some(peer) = ctx
+            .resolved_recipient
+            .as_ref()
+            .map(ResolvedRecipient::as_str)
+        {
+            let peer = peer.to_owned();
+            ctx.peer_principals = self.principals_with_self(&peer).await;
+            ctx.moves = self
+                .unasked_offer(
+                    ctx.resolved_recipient
+                        .as_ref()
+                        .map(ResolvedRecipient::reach),
+                    &peer,
+                    &ctx.peer_principals,
+                )
+                .await;
+        }
         let budget = self.sweep_page_budget().await;
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
@@ -10054,6 +10136,21 @@ impl FederationDirectoryReplicationBridge {
         if let Ok(mut open) = self.round_withholds.lock() {
             open.insert(peer_label.to_owned(), BTreeMap::new());
         }
+        // CC 5.2 — what is required moves before any walk.
+        let mut listed = 0;
+        let mut counts = PageCounts::default();
+        if ctx.moves != UnaskedOffer::Commons {
+            let required = self.required_rows(&key.0, &ctx.peer_principals).await;
+            if let Ok(required) = self
+                .offer_rows(
+                    required, None, &mut ctx, peer_label, None, &mut refs, &mut seen,
+                )
+                .await
+            {
+                listed = required.0;
+                counts = required.2;
+            }
+        }
         let (wm_before, resweep_before) = self
             .sweep_cursors
             .lock()
@@ -10078,8 +10175,8 @@ impl FederationDirectoryReplicationBridge {
                 return refs;
             }
         };
-        let mut listed = served;
-        let mut counts = head_counts;
+        listed += served;
+        counts.merge(head_counts);
         let mut resweep: Option<(Option<ResumeCursor>, usize, bool)> = None;
         if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
             if plan.since.is_none() {
@@ -10102,10 +10199,7 @@ impl FederationDirectoryReplicationBridge {
                     let wrapped = b_served < plan.budget as usize;
                     self.resweep_cycle_step(&key, wrapped);
                     listed += b_served;
-                    counts.not_advertisable += b_counts.not_advertisable;
-                    counts.duplicate += b_counts.duplicate;
-                    counts.offered += b_counts.offered;
-                    counts.reoffered_after_skip += b_counts.reoffered_after_skip;
+                    counts.merge(b_counts);
                     resweep = Some((plan.since, b_served, wrapped));
                 }
                 // The re-sweep holds where it was; the head page stands.
@@ -10125,6 +10219,7 @@ impl FederationDirectoryReplicationBridge {
             .unwrap_or_default();
         let withheld = listed
             .saturating_sub(counts.not_advertisable)
+            .saturating_sub(counts.awaits_request)
             .saturating_sub(counts.duplicate)
             .saturating_sub(counts.offered);
         let booked: u64 = withheld_by_reason.values().sum();
@@ -10141,6 +10236,7 @@ impl FederationDirectoryReplicationBridge {
             duplicate: counts.duplicate,
             offered: counts.offered,
             reoffered_after_skip: counts.reoffered_after_skip,
+            awaits_request: counts.awaits_request,
         };
         Self::log_advertise_round(
             &summary,
@@ -10174,11 +10270,12 @@ impl FederationDirectoryReplicationBridge {
             ),
         };
         let line = format!(
-            "attestation advertise round: listed={} not_advertisable={} withheld={} {:?} \
-             duplicate={} offered={} (re-offered after skip: {}); watermark {} -> {}; {pass}; \
-             re-sweep position before {}; inputs generation {generation}",
+            "attestation advertise round: listed={} not_advertisable={} awaits_request={} \
+             withheld={} {:?} duplicate={} offered={} (re-offered after skip: {}); watermark {} \
+             -> {}; {pass}; re-sweep position before {}; inputs generation {generation}",
             r.listed,
             r.not_advertisable,
+            r.awaits_request,
             r.withheld,
             r.withheld_by_reason,
             r.duplicate,
@@ -10305,16 +10402,37 @@ impl FederationDirectoryReplicationBridge {
         refs: &mut Vec<EnvelopeRef>,
         seen: &mut HashSet<[u8; 32]>,
     ) -> Result<(usize, Option<ResumeCursor>, PageCounts), SweepReadError> {
-        let mut counts = PageCounts::default();
-        let mut prev = since.clone();
         let _permit = self.sweep_gate.enter().await;
         let attestations = self
             .directory
-            .list_attestations_since(since, budget)
+            .list_attestations_since(since.clone(), budget)
             .await
             .map_err(|e| SweepReadError(e.to_string()))?;
         self.record_page(attestations.len());
+        self.offer_rows(attestations, since, ctx, peer_label, mark_key, refs, seen)
+            .await
+    }
+
+    /// Run the full per-record gate stack over `attestations`, appending into
+    /// the round's accumulators ([`Self::attestation_page`]).
+    #[allow(clippy::too_many_lines)] // one gate loop; every gate is a named helper already
+    #[allow(clippy::too_many_arguments)] // the round's accumulators plus the watermark key
+    async fn offer_rows(
+        &self,
+        attestations: Vec<ciris_persist::federation::ServedAttestation>,
+        since: Option<ResumeCursor>,
+        ctx: &mut AttestationSweepCtx,
+        peer_label: &str,
+        mark_key: Option<&(String, EnvelopeKind)>,
+        refs: &mut Vec<EnvelopeRef>,
+        seen: &mut HashSet<[u8; 32]>,
+    ) -> Result<(usize, Option<ResumeCursor>, PageCounts), SweepReadError> {
+        let mut counts = PageCounts::default();
+        let mut prev = since;
         let served = attestations.len();
+        // A required read keeps no position: its rows are the walk's as well.
+        let required_read = mark_key.is_none() && ctx.moves != UnaskedOffer::Commons;
+        let mut retired: Option<HashSet<String>> = None;
         let last = attestations
             .last()
             .map(ciris_persist::federation::ServedAttestation::resume_pair);
@@ -10323,6 +10441,12 @@ impl FederationDirectoryReplicationBridge {
             let before = prev.replace(ciris_persist::federation::ServedAttestation::resume_pair(
                 att,
             ));
+            if required_read {
+                ctx.judged.insert(att.attestation.attestation_id.clone());
+            } else if ctx.judged.contains(&att.attestation.attestation_id) {
+                counts.duplicate += 1;
+                continue;
+            }
             // CIRISEdge#531, SECOND HALF — the gates below read exactly FOUR
             // strings, and this used to hand them a full `serde_json::to_value`
             // of the whole row: ~19 fields serialised AND a deep clone of the
@@ -10518,6 +10642,34 @@ impl FederationDirectoryReplicationBridge {
                     continue;
                 }
             }
+            // CC 5.2 — a row may be sent to this peer, which is everything
+            // above; that is not a reason to offer it unasked. The peer can
+            // still ask: the fetch twin and the subject Pull do not read this.
+            if ctx.moves == UnaskedOffer::RequiredOrAppropriate {
+                let moves = self
+                    .moves_unasked(&canonical_json, &att.attestation, peer_label, ctx)
+                    .await;
+                if !moves {
+                    counts.awaits_request += 1;
+                    if let Some(m) = &self.metrics {
+                        m.inc_advertise(crate::observability::ADVERTISE_AWAITS_REQUEST);
+                    }
+                    continue;
+                }
+                if retired.is_none() {
+                    retired = Some(self.retired_of(&attestations).await);
+                }
+                if retired
+                    .as_ref()
+                    .is_some_and(|r| r.contains(&att.attestation.attestation_id))
+                {
+                    counts.awaits_request += 1;
+                    if let Some(m) = &self.metrics {
+                        m.inc_advertise(crate::observability::ADVERTISE_AWAITS_REQUEST);
+                    }
+                    continue;
+                }
+            }
             let Some((hash, _bytes)) = content_hash_of(&att.attestation) else {
                 // CIRISEdge#433 — cleared every gate, then could not be hashed:
                 // eligible and not served, which is the ledger's exact definition.
@@ -10534,7 +10686,11 @@ impl FederationDirectoryReplicationBridge {
             }
             refs.push(EnvelopeRef {
                 envelope_hash: hash,
-                seq: Self::ms_seq(att.admitted_at),
+                seq: if required_read {
+                    REQUIRED_ROW_SEQ
+                } else {
+                    Self::ms_seq(att.admitted_at)
+                },
             });
             counts.offered += 1;
             if let Some(k) = mark_key {
@@ -10564,6 +10720,312 @@ impl FederationDirectoryReplicationBridge {
             }
         }
         Ok((served, last, counts))
+    }
+
+    /// `key` and the principals it answers for (persist's `principals_of`). A
+    /// read that fails leaves `key` alone: the peer is then offered less for a
+    /// round, never more.
+    async fn principals_with_self(&self, key: &str) -> HashSet<String> {
+        let mut out: HashSet<String> =
+            ciris_persist::federation::self_collective::principals_of(&*self.directory, key)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        out.insert(key.to_owned());
+        out
+    }
+
+    /// Does `key` hold a serve seat on the active roster? A read that fails
+    /// answers no: seat anti-entropy pauses for a round, and the required rows
+    /// still move.
+    async fn holds_seat(&self, key: &str) -> bool {
+        let recognised = self
+            .recognised_seats
+            .as_ref()
+            .and_then(|s| s.read().ok().map(|set| set.clone()))
+            .unwrap_or_default();
+        crate::peer_obligation::holds_active_seat(&*self.directory, &recognised, key)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// **CC 5.2 — what `peer` is offered unasked this sweep.** Anti-entropy over
+    /// the commons is what two seats do; everywhere else a row moves when it
+    /// is requested, or required, and appropriate. A person's own nodes are not
+    /// contacts, and a `self_collective`, `family` or first-contact reach
+    /// is already confined by its own gate.
+    async fn unasked_offer(
+        &self,
+        reach: Option<Reach>,
+        peer: &str,
+        peer_principals: &HashSet<String>,
+    ) -> UnaskedOffer {
+        let Some(local) = self
+            .serve_tier_subject
+            .as_deref()
+            .or(self.local_key_id.as_deref())
+        else {
+            return UnaskedOffer::ByReach;
+        };
+        if self.holds_seat(local).await && self.holds_seat(peer).await {
+            return UnaskedOffer::Commons;
+        }
+        if reach != Some(Reach::Consent)
+            || !self
+                .principals_with_self(local)
+                .await
+                .is_disjoint(peer_principals)
+        {
+            return UnaskedOffer::ByReach;
+        }
+        UnaskedOffer::RequiredOrAppropriate
+    }
+
+    /// **CC 5.2 — the rows a peer's offer starts with**, read by their own
+    /// indexes so that a fresh grant or a contact's own row never waits behind
+    /// history: the live grants naming the peer, the rows addressed to it or
+    /// to its person, its own rows, and this node's allegiance rows. Every row
+    /// still crosses the whole gate stack. Each read is one page, newest first;
+    /// what is past it is the walk's. A failed read is the walk's as well.
+    async fn required_rows(
+        &self,
+        peer: &str,
+        peer_principals: &HashSet<String>,
+    ) -> Vec<ciris_persist::federation::ServedAttestation> {
+        use ciris_persist::federation::attestation_query::AttestationQuery;
+        use ciris_persist::federation::types::attestation_type;
+        let _permit = self.sweep_gate.enter().await;
+        let mut rows: Vec<Attestation> = Vec::new();
+        let mut local: Vec<String> = Vec::new();
+        if let Some(key) = self.local_key_id.as_deref() {
+            local.extend(self.consent_keys(key).into_iter().map(str::to_owned));
+            local.extend(self.principals_with_self(key).await);
+            local.sort();
+            local.dedup();
+        }
+        for key in &local {
+            match ciris_persist::federation::consent_by_humans::live_egress_grants_by_principals(
+                &*self.directory,
+                key,
+            )
+            .await
+            {
+                Ok(grants) => rows.extend(grants.into_iter().filter(|g| {
+                    g.subject_key_ids
+                        .iter()
+                        .any(|s| peer_principals.contains(s))
+                })),
+                Err(e) => tracing::debug!(peer, error = %e, "required read: grants not served"),
+            }
+        }
+        let mut queries: Vec<AttestationQuery> = peer_principals
+            .iter()
+            .map(|p| AttestationQuery::to(p, REQUIRED_READ_PAGE))
+            .collect();
+        queries.push(AttestationQuery::by(peer, REQUIRED_READ_PAGE));
+        queries.extend(local.iter().map(|key| {
+            AttestationQuery::by(key, REQUIRED_READ_PAGE).types(&[attestation_type::DELEGATES_TO])
+        }));
+        for query in queries {
+            match query.pages().next(&*self.directory).await {
+                Ok(Some(page)) => rows.extend(page),
+                Ok(None) => {}
+                Err(e) => tracing::debug!(peer, error = %e, "required read: page not served"),
+            }
+        }
+        self.record_page(rows.len());
+        let mut seen = HashSet::new();
+        rows.retain(|r| seen.insert(r.attestation_id.clone()));
+        rows.into_iter()
+            .map(|attestation| ciris_persist::federation::ServedAttestation {
+                admitted_at: attestation.asserted_at,
+                attestation,
+            })
+            .collect()
+    }
+
+    /// **CC 5.2 — does this row move to `peer` without being asked?** It has
+    /// passed every gate that says it MAY reach the peer; this is whether it
+    /// is required or appropriate, the family's replication tier and audience
+    /// deciding. `federation` means a row can be shared, not that it is copied
+    /// to everyone.
+    ///
+    /// - The family's own tier: `Global` (trust-root commons, a substrate's
+    ///   self-report) and a capability family whose token the peer cleared
+    ///   above. The accord family in either namespace (the halt).
+    /// - Appropriate: persist's `may_receive` names the peer (its row, a row
+    ///   about it, its cohort), or the row is about the person the peer is the
+    ///   node of, or it is placed in a public group the peer is in.
+    /// - Required, CC 5.4.6: what a stranger is handed (group-plane rows, this
+    ///   node's allegiance facts, the announced bindings it relays, a grant
+    ///   naming the peer), tombstones and a duty's appointments.
+    /// - The class a live `consent:replication` grant names, of this node's own
+    ///   rows (CC 3.3.7): the grant moves that class and nothing else. This
+    ///   node's own conferrals move with its allegiance facts.
+    async fn moves_unasked(
+        &self,
+        view: &serde_json::Value,
+        att: &Attestation,
+        peer: &str,
+        ctx: &mut AttestationSweepCtx,
+    ) -> bool {
+        use ciris_persist::federation::replication_audience::{Reason, Verdict};
+        use ciris_persist::federation::types::attestation_type;
+        if Self::attestation_is_accord(view)
+            || matches!(
+                Self::attestation_projection(view),
+                Projection::Global | Projection::Capability(_)
+            )
+        {
+            return true;
+        }
+        if matches!(
+            self.may_receive_cached(att, peer, &mut ctx.audience).await,
+            Verdict::Yes(Reason::Origin | Reason::RefersTo | Reason::Cohort)
+        ) || ctx.peer_principals.contains(&att.attested_key_id)
+            || att
+                .subject_key_ids
+                .iter()
+                .any(|s| ctx.peer_principals.contains(s))
+            || ciris_persist::federation::group_plane::is_group_plane_row(att)
+            || att.attestation_type == attestation_type::WITHDRAWS
+            || att.attestation_type == attestation_type::RECANTS
+            || (att.attestation_type == attestation_type::SUPERSEDES
+                && Self::row_dimension(view).is_empty())
+            || Self::is_appointment(att)
+        {
+            return true;
+        }
+        if self.placed_in_a_group_of(view, ctx).await
+            || self
+                .attestation_is_allegiance_fact(view, &mut ctx.audience)
+                .await
+            || self
+                .attestation_is_relayed_announce(view, &mut ctx.audience)
+                .await
+            || self.consent_grant_names(view, peer).await
+        {
+            return true;
+        }
+        if !matches!(
+            self.authors_own_traces(&att.attesting_key_id, &mut ctx.trace_consent)
+                .await,
+            Ok(true)
+        ) {
+            return false;
+        }
+        att.attestation_type == attestation_type::DELEGATES_TO
+            || self
+                .trace_grant_names(
+                    &att.attesting_key_id,
+                    Self::row_dimension(view),
+                    peer,
+                    &mut ctx.trace_consent,
+                )
+                .await
+                .unwrap_or(false)
+    }
+
+    /// Is this row a duty's appointment: a `delegates_to` naming scopes, neither
+    /// an owner-binding nor a trust edge? A delegated act is admitted only where
+    /// its appointment is held, so the appointment goes where the act goes, and
+    /// that is not knowable from the row (persist v61.0.2 #1195).
+    fn is_appointment(att: &Attestation) -> bool {
+        let env = &att.attestation_envelope;
+        att.attestation_type == ciris_persist::federation::types::attestation_type::DELEGATES_TO
+            && env.get("dimension").is_none()
+            && !ciris_persist::federation::admission::is_owner_binding_envelope(env)
+            && env
+                .get("scope")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|scope| !scope.is_empty())
+    }
+
+    /// Is this row placed in a public group the peer belongs to? `may_receive`
+    /// answers `Public` for a public group's rows before it asks about
+    /// membership, so the membership is read here.
+    async fn placed_in_a_group_of(
+        &self,
+        view: &serde_json::Value,
+        ctx: &mut AttestationSweepCtx,
+    ) -> bool {
+        use ciris_persist::federation::Audience;
+        let (target, family) = match Self::audience_of_view(view) {
+            Ok(Audience::Community { community_key_id }) => (community_key_id, false),
+            Ok(Audience::Affiliations { community_key_id }) => (community_key_id, false),
+            Ok(Audience::Family { family_key_id }) => (family_key_id, true),
+            _ => return false,
+        };
+        if !ctx.public_members.contains_key(&target) {
+            let members = if family {
+                self.directory
+                    .active_family_members(&target)
+                    .await
+                    .map(|m| m.into_iter().map(|m| m.key_id).collect())
+            } else {
+                self.directory
+                    .active_community_members(&target)
+                    .await
+                    .map(|m| m.into_iter().map(|m| m.key_id).collect())
+            };
+            ctx.public_members
+                .insert(target.clone(), members.unwrap_or_default());
+        }
+        ctx.public_members
+            .get(&target)
+            .is_some_and(|members| !members.is_disjoint(&ctx.peer_principals))
+    }
+
+    /// **CC 5.2 — the ids among `rows` that are not the live state**: withdrawn
+    /// or recanted (persist's §6.1 fold), superseded by their own author, or
+    /// past their signed expiry. One read for a page. A read that fails retires
+    /// nothing: the peer is offered a stale row for a round, never denied a
+    /// live one.
+    async fn retired_of(
+        &self,
+        rows: &[ciris_persist::federation::ServedAttestation],
+    ) -> HashSet<String> {
+        use ciris_persist::federation::precedence;
+        use ciris_persist::federation::types::attestation_type;
+        let now = chrono::Utc::now();
+        let ids: Vec<String> = rows
+            .iter()
+            .map(|r| r.attestation.attestation_id.clone())
+            .collect();
+        let composers = self
+            .directory
+            .list_composers_referencing_any(&ids, None, None)
+            .await
+            .unwrap_or_default();
+        let held: Vec<&Attestation> = rows
+            .iter()
+            .map(|r| &r.attestation)
+            .chain(composers.iter())
+            .collect();
+        let mut retired = precedence::retired_ids(&held);
+        for composer in &composers {
+            if composer.attestation_type != attestation_type::SUPERSEDES {
+                continue;
+            }
+            let Some(target) =
+                precedence::references_attestation_id_from_envelope(&composer.attestation_envelope)
+            else {
+                continue;
+            };
+            if rows.iter().any(|r| {
+                r.attestation.attestation_id == target
+                    && r.attestation.attesting_key_id == composer.attesting_key_id
+            }) {
+                retired.insert(target.to_owned());
+            }
+        }
+        retired.extend(
+            rows.iter()
+                .filter(|r| r.attestation.expires_at.is_some_and(|at| at <= now))
+                .map(|r| r.attestation.attestation_id.clone()),
+        );
+        retired
     }
 
     /// Why [`Self::attestation_is_advertised`] refused a row (the only two
@@ -12228,6 +12690,13 @@ pub(crate) mod tests {
     /// persist change that gates the trait door turns every caller of this
     /// fixture red; re-mint here (`fixture_label` already strips a derived
     /// suffix for the seed).
+    /// The recognised serve seats of a fixture (CC 5.2).
+    pub(crate) fn seats(keys: &[&str]) -> Option<Arc<std::sync::RwLock<HashSet<String>>>> {
+        Some(Arc::new(std::sync::RwLock::new(
+            keys.iter().map(|k| (*k).to_owned()).collect(),
+        )))
+    }
+
     pub(crate) fn fixture_key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
         let now = Utc::now();
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
@@ -18691,7 +19160,11 @@ pub(crate) mod tests {
             peer_in.to_string(),
             peer_out.to_string(),
         ]);
-        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        // The bound is what this asks; two seats walk the commons (CC 5.2), so
+        // the included peer's whole plane is its measure.
+        let bridge = bridge
+            .with_local_key_id(Some(local.to_string()))
+            .with_recognised_seats(seats(&[local, peer_in]));
         for key_id in [local, producer, peer_in, peer_out] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -26363,8 +26836,11 @@ pub(crate) mod tests {
         .await;
         seed_advertised_attestation(&backend, producer).await;
         seed_consent_membership(&backend, local, "person-bob").await;
-        let bridge =
-            bridge_over(&backend, &["node-bob"]).with_local_key_id(Some(local.to_string()));
+        // Routing is what this asks; two seats walk the commons (CC 5.2), so
+        // the routed node's whole plane is its measure.
+        let bridge = bridge_over(&backend, &["node-bob"])
+            .with_local_key_id(Some(local.to_string()))
+            .with_recognised_seats(seats(&[local, "node-bob"]));
 
         let baseline = bridge.list_attestations_for_peer(None).await;
         assert!(
@@ -27480,6 +27956,7 @@ pub(crate) mod tests {
 
     // Sharing traces is its own consent, per recipient: the serve gate's
     // refuse and allow sides, and the live-state witnesses.
+    mod moves_5_2;
     mod trace_recipient_consent;
 
     // CIRISServer native T2 — rows stranded behind the advertise watermark

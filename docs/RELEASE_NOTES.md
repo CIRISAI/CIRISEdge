@@ -1,10 +1,32 @@
 # CIRISEdge Release Notes
 
-# v44.0.1 — every step of a late Pull is kept
+# v44.1.0 — what moves to a peer
 
-**2026-11-06.** **PATCH** on the LTS line. Same pins as v44.0.0: persist v61.0.4, CIRISVerify
+**2026-11-06.** **MINOR** on the LTS line. Same pins as v44.0.0: persist v61.0.4, CIRISVerify
 v22.0.0, leviculum v0.33.0+ciris.1.
 
+- **What moves to a peer (CC 5.2, `CLM-moves-requested-required-appropriate`).** A row moves when
+  it is requested, or required, and appropriate, never because it is federation-tier. Until now a
+  single `consent:replication` grant made a peer a mirror: every federation row passing the audience
+  gates was offered, oldest first, so a new contact was offered 11,662 rows (42 MB) and a fresh grant
+  at the tip was not held after five minutes.
+  - **Two seats** on the active roster keep the anti-entropy walk, unchanged.
+  - **Every other peer** starts with the required read, by index and ahead of any walk: the live
+    grants naming it, the rows addressed to it or its person, its own rows, and this node's
+    allegiance rows.
+  - **A contact, or a seat and a node that is not one,** is then offered of the walk only what is
+    required or appropriate and live: the family's own `Global` or capability tier, the accord family,
+    rows `may_receive` gives it as its own, about it or in its cohort, rows of a public group it
+    belongs to, what a stranger is handed, tombstones, a duty's appointments, and the class a grant
+    names, of this node's own rows.
+  - **Nothing else changed.** A person's own nodes are not contacts. The fetch twin and the subject
+    Pull are untouched: a row not offered, a superseded row included, moves on request. The key,
+    occurrence, route and revocation planes are the required set of CC 5.4.6 already and read their
+    own publish sets.
+  - **Pinned:** `SERVE_ADVERTISE_POLICY_HASH` = `14aedf2590745dbac03b9f1f859085c43ead0ce0c67e46d10321d88257aded09` (the Attestation `advertise` cell).
+    **CIRISServer must mirror this pin.** `advertise_awaits_request` counts the rows that wait.
+  - **`session:claim` is placed at its community.** Edge places none. A claim at `federation` is no
+    longer offered to a contact, and the placement is the emitter's to fix.
 - **A late subject Pull keeps its Deliver.** v44.0.0 gave an exchange one late wait, so a Deliver
   behind a late Summary still got only the caller's wait and was dropped. Each step now gets
   `PULL_LATE_WINDOW`. The caller's wait, the re-asks and the bound of 16 per peer and plane are

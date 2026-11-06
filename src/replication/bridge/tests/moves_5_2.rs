@@ -1,0 +1,483 @@
+//! **CC 5.2 — what moves to a peer** (`CLM-moves-requested-required-appropriate`).
+//!
+//! A row moves when it is requested, or required, and appropriate, never
+//! because it is federation-tier. Every witness reads the production advertise
+//! (`list_envelope_refs_for_peer`) over a store with a history in it, and each
+//! fails on the walk it replaced, where a consented peer was offered every
+//! federation row oldest first.
+use super::*;
+
+const LOCAL: &str = "moves-node";
+const CONTACT: &str = "moves-contact";
+const SEAT: &str = "moves-seat";
+const THIRD: &str = "moves-third";
+/// Rows of history, and the page that reads them.
+const HISTORY: usize = 40;
+const PAGE: u32 = 8;
+
+fn page_bridge(backend: &Arc<SqliteBackend>) -> FederationDirectoryReplicationBridge {
+    let dir: Arc<dyn FederationDirectory> = backend.clone();
+    let cohort: CohortProvider = Arc::new(|| vec![LOCAL.to_owned()]);
+    FederationDirectoryReplicationBridge::with_config(
+        dir,
+        cohort,
+        BridgeConfig {
+            sweep_page_rows: PAGE,
+            ..BridgeConfig::default()
+        },
+    )
+    .with_local_key_id(Some(LOCAL.to_owned()))
+}
+
+async fn fixture() -> Arc<SqliteBackend> {
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
+    register_fixture_keys(
+        &backend,
+        &[
+            (LOCAL, identity_type::NODE),
+            (CONTACT, identity_type::NODE),
+            (SEAT, identity_type::NODE),
+            (THIRD, identity_type::NODE),
+        ],
+    )
+    .await;
+    backend
+}
+
+/// One federation-scoped `scores` row. Returns its id.
+async fn row(backend: &SqliteBackend, author: &str, about: &str, dimension: &str) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let envelope = serde_json::json!({
+        "id": id,
+        "attesting_key_id": author,
+        "attested_key_id": about,
+        "attestation_type": "scores",
+        "dimension": dimension,
+    });
+    seed_raw_attestation(backend, &id, author, about, "scores", envelope).await;
+    id
+}
+
+/// A composer of `target` by `author`, of `kind`. Returns its id.
+async fn composer(
+    backend: &SqliteBackend,
+    author: &str,
+    about: &str,
+    kind: &str,
+    target: &str,
+) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let envelope = serde_json::json!({
+        "id": id,
+        "attesting_key_id": author,
+        "attested_key_id": about,
+        "attestation_type": kind,
+        "kind": kind,
+        "references_attestation_id": target,
+        "references_attestation_type": "scores",
+    });
+    seed_raw_attestation(backend, &id, author, about, kind, envelope).await;
+    id
+}
+
+/// A contact's grant: this node's `consent:replication` naming it, for `prefixes`.
+async fn grant(backend: &SqliteBackend, peer: &str, prefixes: &[&str]) -> String {
+    seed_common_root(backend, &[LOCAL, peer]).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let envelope = serde_json::json!({
+        "id": id,
+        "attesting_key_id": LOCAL,
+        "attested_key_id": peer,
+        "attestation_type": "scores",
+        "dimension": "consent:replication:v1",
+        "payload": { "grants": "transfer", "attestation_prefixes": prefixes },
+    });
+    seed_raw_attestation(backend, &id, LOCAL, peer, "scores", envelope).await;
+    id
+}
+
+async fn history(backend: &SqliteBackend) -> Vec<String> {
+    let mut ids = Vec::new();
+    for _ in 0..HISTORY {
+        ids.push(row(backend, THIRD, THIRD, "observation:reachability:v1").await);
+    }
+    ids
+}
+
+async fn offer(bridge: &FederationDirectoryReplicationBridge, peer: &str) -> Vec<EnvelopeRef> {
+    bridge
+        .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+        .await
+}
+
+async fn offers(
+    backend: &SqliteBackend,
+    bridge: &FederationDirectoryReplicationBridge,
+    peer: &str,
+    id: &str,
+) -> bool {
+    let hash = hash_of(backend, id).await;
+    offer(bridge, peer)
+        .await
+        .iter()
+        .any(|r| r.envelope_hash == hash)
+}
+
+/// The field case: a new contact, a large store, a fresh grant at the tip. The
+/// grant is first in the very first offer, and no history is offered at all.
+#[tokio::test]
+async fn a_fresh_grant_moves_first_and_history_is_not_offered() {
+    let backend = fixture().await;
+    let past = history(&backend).await;
+    let fresh = grant(&backend, CONTACT, &["trace:"]).await;
+    let bridge = page_bridge(&backend);
+
+    let refs = offer(&bridge, CONTACT).await;
+    let hash = hash_of(&backend, &fresh).await;
+    assert_eq!(
+        refs.first().map(|r| r.envelope_hash),
+        Some(hash),
+        "the grant leads the first offer, ahead of any walk: {refs:?}"
+    );
+    assert_eq!(
+        refs.first().map(|r| r.seq),
+        Some(REQUIRED_ROW_SEQ),
+        "and the push, which goes oldest seq first, sends it first too"
+    );
+    for id in &past {
+        let old = hash_of(&backend, id).await;
+        assert!(
+            !refs.iter().any(|r| r.envelope_hash == old),
+            "a third party's federation row is not offered to a contact"
+        );
+    }
+    // The walk still reads the plane, and offers none of it across its rounds.
+    for _ in 0..(HISTORY as u32 / PAGE + 2) {
+        let round = offer(&bridge, CONTACT).await;
+        assert!(
+            round.len() <= 3,
+            "a contact's offer stays the required rows: {round:?}"
+        );
+    }
+    let summary = bridge
+        .last_advertise_round
+        .lock()
+        .expect("the round summary")
+        .clone()
+        .expect("a round ran");
+    assert!(
+        summary.awaits_request > 0,
+        "the rows the walk passed are counted, not silent: {summary:?}"
+    );
+}
+
+/// The row the server's contact flow turns on: a contact's grant to us, carried
+/// by a node that holds it (`inbound_chat_grants` reads it for request-seen and
+/// mutual). It reaches the peer it names in the first offer, over history, on
+/// the attested-key read, and this node holds no grant of its own for the peer.
+#[tokio::test]
+async fn a_contacts_grant_reaches_the_peer_it_names_ahead_of_history() {
+    let backend = fixture().await;
+    history(&backend).await;
+    seed_common_root(&backend, &[LOCAL, THIRD, CONTACT]).await;
+    let theirs = uuid::Uuid::new_v4().to_string();
+    let envelope = serde_json::json!({
+        "id": theirs,
+        "attesting_key_id": THIRD,
+        "attested_key_id": CONTACT,
+        "attestation_type": "scores",
+        "dimension": "consent:replication:v1",
+        "payload": {
+            "grants": "transfer",
+            "attestation_prefixes": ["chat:", "ownership:", "self:delegates_to:"],
+        },
+    });
+    seed_raw_attestation(&backend, &theirs, THIRD, CONTACT, "scores", envelope).await;
+    let bridge = page_bridge(&backend);
+
+    let refs = offer(&bridge, CONTACT).await;
+    let hash = hash_of(&backend, &theirs).await;
+    let held = refs.iter().find(|r| r.envelope_hash == hash);
+    assert_eq!(
+        held.map(|r| r.seq),
+        Some(REQUIRED_ROW_SEQ),
+        "offered in the first round as a required row: {refs:?}"
+    );
+}
+
+/// A contact grant names a person, signed by a person, and the two nodes are
+/// how they are reached (#524): the grant leads the offer to the named person's
+/// node.
+#[tokio::test]
+async fn a_person_named_grant_reaches_that_persons_node_first() {
+    let backend = fixture().await;
+    history(&backend).await;
+    register_fixture_keys(
+        &backend,
+        &[
+            ("moves-us", identity_type::USER),
+            ("moves-them", identity_type::USER),
+        ],
+    )
+    .await;
+    for (owner, node, class) in [
+        ("moves-us", LOCAL, "laptop"),
+        ("moves-them", CONTACT, "phone"),
+    ] {
+        seed_owner_binding(&backend, owner, node).await;
+        seed_device_occurrence(&backend, owner, node, class).await;
+    }
+    seed_common_root(&backend, &["moves-us", "moves-them"]).await;
+    let grant = uuid::Uuid::new_v4().to_string();
+    let envelope = serde_json::json!({
+        "id": grant,
+        "attesting_key_id": "moves-us",
+        "attested_key_id": "moves-them",
+        "attestation_type": "scores",
+        "dimension": "consent:replication:v1",
+        "payload": {
+            "grants": "transfer",
+            "attestation_prefixes": ["chat:", "ownership:", "self:delegates_to:"],
+        },
+    });
+    seed_raw_attestation(
+        &backend,
+        &grant,
+        "moves-us",
+        "moves-them",
+        "scores",
+        envelope,
+    )
+    .await;
+    let bridge = page_bridge(&backend);
+
+    let refs = offer(&bridge, CONTACT).await;
+    let hash = hash_of(&backend, &grant).await;
+    assert_eq!(
+        refs.iter().find(|r| r.envelope_hash == hash).map(|r| r.seq),
+        Some(REQUIRED_ROW_SEQ),
+        "the person-named grant moves ahead of any walk: {refs:?}"
+    );
+}
+
+/// A row addressed to the contact never waits behind history either.
+#[tokio::test]
+async fn a_contacts_own_row_moves_ahead_of_the_walk() {
+    let backend = fixture().await;
+    history(&backend).await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    let about = row(&backend, THIRD, CONTACT, "observation:reachability:v1").await;
+    let own = row(&backend, CONTACT, THIRD, "observation:reachability:v1").await;
+    let bridge = page_bridge(&backend);
+
+    for id in [&about, &own] {
+        assert!(
+            offers(&backend, &bridge, CONTACT, id).await,
+            "the first round's page of the walk holds no such row"
+        );
+    }
+}
+
+/// A grant moves the class it names and nothing else (CC 3.3.7), and it is a
+/// grant of the node's own rows.
+#[tokio::test]
+async fn a_grant_moves_the_class_it_names_and_nothing_else() {
+    let backend = fixture().await;
+    grant(&backend, CONTACT, &["observation:"]).await;
+    let named = row(&backend, LOCAL, LOCAL, "observation:reachability:v1").await;
+    let other = row(&backend, LOCAL, LOCAL, "provenance:note:v1").await;
+    let relayed = row(&backend, THIRD, THIRD, "observation:reachability:v1").await;
+    let bridge = page_bridge(&backend);
+
+    assert!(offers(&backend, &bridge, CONTACT, &named).await);
+    assert!(
+        !offers(&backend, &bridge, CONTACT, &other).await,
+        "a class the grant does not name stays here"
+    );
+    assert!(
+        !offers(&backend, &bridge, CONTACT, &relayed).await,
+        "the grant is of this node's own rows, not a mirror of its corpus"
+    );
+}
+
+/// A session claim at the commons reaches no contact (CC 5.2: its community's
+/// cohort, never everyone), whoever placed it there.
+#[tokio::test]
+async fn a_session_claim_is_not_offered_across_the_commons() {
+    let backend = fixture().await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    let claim = uuid::Uuid::new_v4().to_string();
+    let envelope = serde_json::json!({
+        "id": claim,
+        "attesting_key_id": THIRD,
+        "attested_key_id": THIRD,
+        "attestation_type": "scores",
+        "dimension": "session:claim:v1",
+        "community_id": "moves-room",
+        "session_id": "moves-session",
+        "claimed_at": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "valid_until": (Utc::now() + chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    });
+    seed_raw_attestation(&backend, &claim, THIRD, THIRD, "scores", envelope).await;
+    let bridge = page_bridge(&backend);
+
+    assert!(!offers(&backend, &bridge, CONTACT, &claim).await);
+}
+
+/// **Requested.** What is not offered is still served to the peer that asks:
+/// the fetch twin answers for a row no offer named.
+#[tokio::test]
+async fn a_row_not_offered_is_served_to_the_peer_that_asks() {
+    let backend = fixture().await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    let third = row(&backend, THIRD, THIRD, "observation:reachability:v1").await;
+    let bridge = page_bridge(&backend);
+
+    assert!(!offers(&backend, &bridge, CONTACT, &third).await);
+    let hash = hash_of(&backend, &third).await;
+    assert!(
+        bridge
+            .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some(CONTACT))
+            .await
+            .is_some(),
+        "asking is the peer's own pull: the gate is on the unasked offer only"
+    );
+}
+
+/// What is offered unasked is the live state; a superseded row moves on
+/// request, by the contact's Pull for its own subject and by hash.
+#[tokio::test]
+async fn a_superseded_row_is_served_on_request_and_never_offered() {
+    let backend = fixture().await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    let old = row(&backend, CONTACT, THIRD, "observation:reachability:v1").await;
+    let new = composer(&backend, CONTACT, THIRD, "supersedes", &old).await;
+    let bridge = page_bridge(&backend);
+
+    let refs = offer(&bridge, CONTACT).await;
+    let (old_hash, new_hash) = (hash_of(&backend, &old).await, hash_of(&backend, &new).await);
+    assert!(
+        !refs.iter().any(|r| r.envelope_hash == old_hash),
+        "the superseded row is not the live state: {refs:?}"
+    );
+    assert!(
+        refs.iter().any(|r| r.envelope_hash == new_hash),
+        "its successor is"
+    );
+    let pulled = bridge
+        .subject_holdings(EnvelopeKind::Attestation, CONTACT, Some(CONTACT))
+        .await;
+    assert!(
+        pulled.iter().any(|r| r.envelope_hash == old_hash),
+        "the contact's Pull for itself is a request, and lists it"
+    );
+    assert!(bridge
+        .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &old_hash, Some(CONTACT))
+        .await
+        .is_some());
+}
+
+/// A superseding row by anyone but the row's author does not take it off the
+/// offer: that would let a stranger silence a row.
+#[tokio::test]
+async fn a_foreign_supersede_does_not_retire_a_row() {
+    let backend = fixture().await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    let held = row(&backend, THIRD, CONTACT, "observation:reachability:v1").await;
+    composer(&backend, SEAT, SEAT, "supersedes", &held).await;
+    let bridge = page_bridge(&backend);
+
+    assert!(offers(&backend, &bridge, CONTACT, &held).await);
+}
+
+/// The tombstones are of the consent-free set: a holder of a copy must hear.
+#[tokio::test]
+async fn a_tombstone_moves_to_a_contact() {
+    let backend = fixture().await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    let target = row(&backend, THIRD, THIRD, "observation:reachability:v1").await;
+    let tombstone = composer(&backend, THIRD, THIRD, "withdraws", &target).await;
+    let bridge = page_bridge(&backend);
+
+    assert!(offers(&backend, &bridge, CONTACT, &tombstone).await);
+    assert!(!offers(&backend, &bridge, CONTACT, &target).await);
+}
+
+/// **Serve seats walk the commons among themselves**, oldest first and in
+/// full: the same store, the same grant shape, and a contact beside it is
+/// offered none of it.
+#[tokio::test]
+async fn two_seats_walk_the_commons_and_a_contact_beside_them_does_not() {
+    let backend = fixture().await;
+    let past = history(&backend).await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    grant(&backend, SEAT, &["trace:"]).await;
+    let bridge = page_bridge(&backend).with_recognised_seats(seats(&[LOCAL, SEAT]));
+
+    let mut walked = HashSet::new();
+    for round in 0..(HISTORY as u32 / PAGE + 2) {
+        let refs = offer(&bridge, SEAT).await;
+        if round == 0 {
+            assert!(
+                refs.len() <= PAGE as usize,
+                "a page a round, as ever: {}",
+                refs.len()
+            );
+            assert_eq!(
+                refs.first().map(|r| r.envelope_hash),
+                Some(hash_of(&backend, &past[0]).await),
+                "the walk is oldest first, no required read ahead of it"
+            );
+        }
+        walked.extend(refs.into_iter().map(|r| r.envelope_hash));
+    }
+    for id in &past {
+        assert!(
+            walked.contains(&hash_of(&backend, id).await),
+            "a seat is offered the whole commons"
+        );
+    }
+    assert!(!offers(&backend, &bridge, CONTACT, &past[0]).await);
+}
+
+/// A seat that has lost its seat is a node: the roster is the active one, so a
+/// #377 tombstone ends the walk.
+#[tokio::test]
+async fn a_withdrawn_seat_is_not_walked_with() {
+    let backend = fixture().await;
+    let past = history(&backend).await;
+    grant(&backend, SEAT, &["trace:"]).await;
+    backend
+        .record_canonical_withdrawal(SEAT, None, "digest")
+        .await
+        .expect("record the tombstone");
+    let bridge = page_bridge(&backend).with_recognised_seats(seats(&[LOCAL, SEAT]));
+
+    assert!(!offers(&backend, &bridge, SEAT, &past[0]).await);
+}
+
+/// A person's own nodes are not contacts: a grant between them keeps the walk.
+#[tokio::test]
+async fn an_owners_own_node_is_not_a_contact() {
+    let backend = fixture().await;
+    register_fixture_keys(&backend, &[("moves-owner", identity_type::USER)]).await;
+    seed_owner_binding(&backend, "moves-owner", LOCAL).await;
+    seed_owner_binding(&backend, "moves-owner", CONTACT).await;
+    seed_device_occurrence(&backend, "moves-owner", LOCAL, "laptop").await;
+    seed_device_occurrence(&backend, "moves-owner", CONTACT, "phone").await;
+    seed_common_root(&backend, &["moves-owner"]).await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    let third = row(&backend, THIRD, THIRD, "observation:reachability:v1").await;
+    let bridge = page_bridge(&backend);
+
+    let hash = hash_of(&backend, &third).await;
+    let mut walked = false;
+    for _ in 0..4 {
+        walked |= offer(&bridge, CONTACT)
+            .await
+            .iter()
+            .any(|r| r.envelope_hash == hash);
+    }
+    assert!(walked, "the walk reaches it, a page a round");
+}

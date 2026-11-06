@@ -1250,6 +1250,9 @@ pub const LINK_SHAPING_LOAD_SHED_BULK: &str = "load_shed:bulk";
 /// row whose attester is not in this node's self-publish set, ...). Not a
 /// withhold: the row was not this node's to publish when it was read.
 pub const ADVERTISE_NOT_ADVERTISABLE: &str = "advertise_not_advertisable";
+/// CC 5.2 — a row a peer may receive and was not offered unasked: it is
+/// neither required nor appropriate for it, or it is not the live state.
+pub const ADVERTISE_AWAITS_REQUEST: &str = "advertise_awaits_request";
 /// A row offered after an earlier round skipped it as not advertisable (its
 /// reason has since cleared).
 pub const ADVERTISE_REOFFERED_AFTER_SKIP: &str = "advertise_reoffered_after_skip";
@@ -1842,6 +1845,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
 /// Every `advertise` key.
 pub const ADVERTISE_LABELS: &[&str] = &[
     ADVERTISE_NOT_ADVERTISABLE,
+    ADVERTISE_AWAITS_REQUEST,
     ADVERTISE_REOFFERED_AFTER_SKIP,
     ADVERTISE_WATERMARK_REWOUND,
     ADVERTISE_WATERMARK_EVICTED,
