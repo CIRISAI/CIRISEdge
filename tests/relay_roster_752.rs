@@ -714,6 +714,7 @@ struct Roster {
 
 struct Fixture {
     c: Node,
+    transport_c: Arc<ReticulumTransport>,
     x: Node,
     roster: Roster,
     rt_c: Arc<ReplicationRuntime>,
@@ -830,6 +831,7 @@ async fn fixture(tag: u8, with_selector: bool) -> Fixture {
         (cfg, x.auth())
     })
     .await;
+    let transport_c = Arc::clone(&tc);
     let rt_c = start_runtime(&c, tc, &x.key, selector).await;
     let rt_x = start_runtime(&x, tx_, &c.key, None).await;
     wait_for_own_route(&c, Duration::from_secs(150)).await;
@@ -838,6 +840,7 @@ async fn fixture(tag: u8, with_selector: bool) -> Fixture {
     seed_route(&x, &c).await;
     Fixture {
         c,
+        transport_c,
         x,
         roster: Roster {
             o,
@@ -947,7 +950,7 @@ async fn a_stranger_lists_a_relays_published_device_under_its_owner_752() {
 async fn a_relay_at_the_top_tier_with_every_lever_pulled_serves_first_contact() {
     init_tracing();
     let f = fixture(0x10, true).await;
-    f.c.transport
+    f.transport_c
         .set_service_tier(ciris_edge::ServiceTier::ChatAndContacts);
     let levers = &f.c.metrics.telemetry.levers;
     levers.set_steps(Duration::ZERO, Duration::from_secs(30));
