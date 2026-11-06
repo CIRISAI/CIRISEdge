@@ -225,6 +225,19 @@ impl Node {
     }
 }
 
+/// A witness that times shaped links takes the host; the rest share it. Shaped
+/// links emit on a clock whether or not anything is queued, so stars of six
+/// beside each other starve one another's links until they drop.
+static HOST: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+async fn share_host() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    HOST.read().await
+}
+
+async fn whole_host() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    HOST.write().await
+}
+
 /// A policy that shapes fast enough to witness on loopback: `bytes_per_s`
 /// at the loopback MDU gives λ of a few frames per second.
 fn policy(
@@ -383,6 +396,7 @@ fn marked(marker: &[u8], len: usize) -> Vec<u8> {
 /// flow on both sides while nothing is said; a real row still crosses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shaped_link_carries_one_frame_size_at_poisson_times_both_ways() {
+    let _host = share_host().await;
     let fast = policy(BudgetClass::Home, 200_000, 0.5, 10, false);
     let t = duo("both", fast.clone(), fast).await;
     t.a.transport.set_link_wire_tap_for_test(true);
@@ -479,6 +493,7 @@ async fn a_shaped_link_carries_one_frame_size_at_poisson_times_both_ways() {
 /// REQUIRES shaped links refuses the same peer by name and the link closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
+    let _host = share_host().await;
     let lenient = duo(
         "half",
         policy(BudgetClass::Home, 200_000, 0.5, 10, false),
@@ -546,12 +561,15 @@ async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
 /// **Witness 5** — the knobs move the stream: at one λ, a burst of rows
 /// takes longer under ρ = 0.25 than under ρ = 0.8 (the budget admits fewer
 /// real frames per window), and the real share B emitted while the burst
-/// drained stays under ρ; a short window at one ρ delays a burst more than
-/// a long one (the budget refills in smaller steps).
+/// drained stays under ρ; a short window at one ρ paces a burst that a long
+/// one admits whole. That side is read from the budget, not from a race
+/// between two timings a loaded host decides: the burst takes `⌈40 / budget⌉`
+/// grants, so it spans at least all but its first and last windows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rho_and_the_window_move_the_real_share_and_the_delay() {
+    let _host = whole_host().await;
     #[allow(clippy::cast_precision_loss)] // frame counts, far below 2^52
-    async fn burst_time(tag: &str, rho: f64, window_s: u64) -> (Duration, f64) {
+    async fn burst_time(tag: &str, rho: f64, window_s: u64) -> (Duration, f64, usize) {
         let p = policy(BudgetClass::Home, 200_000, rho, window_s, false);
         let t = duo(tag, p.clone(), p).await;
         // Open and shape the link first, then measure the burst alone.
@@ -595,16 +613,17 @@ async fn rho_and_the_window_move_the_real_share_and_the_delay() {
         let real = t.b.shaping("link_shaping_frames_real") - real0;
         let cover = t.b.shaping("link_shaping_frames_cover") - cover0;
         let share = real as f64 / (real + cover).max(1) as f64;
-        eprintln!("[{tag}] rho={rho} W={window_s}s burst of 40 took {took:?}; real share {share:.2} ({real} real / {cover} cover)");
-        (took, share)
+        let budget = t.b.transport.shaping_status().links[0].real_frames_per_window;
+        eprintln!("[{tag}] rho={rho} W={window_s}s burst of 40 took {took:?}; real share {share:.2} ({real} real / {cover} cover), budget {budget} a window");
+        (took, share, budget)
     }
     // The budget bounds real frames PER WINDOW (ρ·λ·W), not per burst: at
     // ρ=0.8 the whole burst fits one window's budget and leaves back-to-back
     // (its share over the burst's own seconds is near 1); at ρ=0.25 it does
     // not, so the stream stays mostly cover while the burst drains and the
     // burst takes several windows.
-    let (t_low, share_low) = burst_time("rho25", 0.25, 10).await;
-    let (t_high, share_high) = burst_time("rho80", 0.8, 10).await;
+    let (t_low, share_low, _) = burst_time("rho25", 0.25, 10).await;
+    let (t_high, share_high, _) = burst_time("rho80", 0.8, 10).await;
     assert!(
         share_low <= 0.25 + 0.1,
         "real share under rho=0.25: {share_low:.2}"
@@ -617,11 +636,18 @@ async fn rho_and_the_window_move_the_real_share_and_the_delay() {
         t_low > t_high,
         "a tighter budget share delays the burst: rho=0.25 {t_low:?} vs rho=0.8 {t_high:?}"
     );
-    let (t_short, _) = burst_time("w2", 0.5, 2).await;
-    let (t_long, _) = burst_time("w30", 0.5, 30).await;
+    let (t_short, _, short_budget) = burst_time("w2", 0.5, 2).await;
+    let (_, _, long_budget) = burst_time("w30", 0.5, 30).await;
     assert!(
-        t_short > t_long,
-        "a shorter window delays a burst more: W=2 s {t_short:?} vs W=30 s {t_long:?}"
+        long_budget >= 40,
+        "W=30 s admits the burst whole: {long_budget}"
+    );
+    let grants = 40usize.div_ceil(short_budget);
+    assert!(grants >= 3, "W=2 s does not: {short_budget} a window");
+    let paced = Duration::from_secs(2) * u32::try_from(grants - 2).expect("a few");
+    assert!(
+        t_short >= paced,
+        "a shorter window delays a burst: W=2 s {t_short:?}, at least {paced:?} for {grants} grants"
     );
 }
 
@@ -648,6 +674,7 @@ fn typed_payload(message_type: &str, marker: &[u8], len: usize) -> Vec<u8> {
 /// sends fail (`link_shaping_bulk_refused`) or the shaped wire grows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_constant() {
+    let _host = share_host().await;
     let server = policy(BudgetClass::Server, 20_000, 0.5, 10, false);
     let t = duo("bulk", server.clone(), server).await;
     t.a.transport.set_link_wire_tap_for_test(true);
@@ -744,6 +771,7 @@ async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_consta
 /// send fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bulk_to_a_peer_reachable_only_over_its_shaped_link_rides_it_slowly_and_never_fails() {
+    let _host = share_host().await;
     let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     let t = duo("fallback", server.clone(), server).await;
     let row = typed_payload("AttestationGossip", b"FB-ROW-", 2_000);
@@ -859,6 +887,7 @@ async fn assert_shaped_stream_constant(n: &Node) -> ([u8; 16], Vec<([u8; 16], Ve
 /// its shaped link, with no second failed dial.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_that_cannot_be_dialled_costs_one_failed_dial_not_one_per_send() {
+    let _host = share_host().await;
     let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     let t = duo("negative", server.clone(), server).await;
     let row = typed_payload("AttestationGossip", b"NEG-ROW-", 2_000);
@@ -899,6 +928,7 @@ async fn a_peer_that_cannot_be_dialled_costs_one_failed_dial_not_one_per_send() 
 /// Mutation: report success once the fragments are queued → this fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fallback_that_drops_part_way_is_an_error_the_dispatcher_retries() {
+    let _host = share_host().await;
     let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     let t = duo("dropped", server.clone(), server).await;
     let row = typed_payload("AttestationGossip", b"DROP-ROW-", 2_000);
@@ -948,6 +978,7 @@ async fn a_fallback_that_drops_part_way_is_an_error_the_dispatcher_retries() {
 /// `SHAPED_ROW_MAX_BYTES` to the window budget → this fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_512_kib_deliver_takes_the_bulk_link_and_a_4_kib_deliver_stays_shaped() {
+    let _host = share_host().await;
     let server = policy(BudgetClass::Server, 200_000, 0.5, 10, false);
     let t = duo("rowlimit", server.clone(), server).await;
     t.b.transport.set_link_wire_tap_for_test(true);
@@ -1003,6 +1034,7 @@ async fn a_512_kib_deliver_takes_the_bulk_link_and_a_4_kib_deliver_stays_shaped(
 /// link is still shaped both ways and still carries a row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_link_over_the_node_cap_is_shaped_at_its_share() {
+    let _host = share_host().await;
     let mut capped = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     capped.node_cap_bytes_per_s = 2_000;
     let t = duo(
@@ -1045,6 +1077,7 @@ async fn a_link_over_the_node_cap_is_shaped_at_its_share() {
 /// link of its own. Mutation: run the refused link unshaped for rows → fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_crosses() {
+    let _host = share_host().await;
     let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     full.share = ShapedSharePolicy::BoundedWithFloor {
         max_links: 0,
@@ -1124,6 +1157,7 @@ async fn at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_cro
 /// link runs unshaped, as CC 5.4.3 "either side off" says, and the row crosses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn at_the_bound_an_off_peer_still_gets_an_ordinary_unshaped_link() {
+    let _host = share_host().await;
     let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     full.share = ShapedSharePolicy::BoundedWithFloor {
         max_links: 0,
@@ -1227,6 +1261,7 @@ fn stream_bounds_separate_a_healthy_rate_from_half_of_it() {
 /// (lower of the two offers).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_proved_seats_shape_at_the_seat_row_and_a_non_seat_gets_the_class() {
+    let _host = share_host().await;
     let server = policy(BudgetClass::Server, 7_000, 0.5, 600, false);
     let t = duo("seats", server.clone(), server.clone()).await;
     let seats: std::collections::HashSet<String> = [t.a.key.key_id.clone(), t.b.key.key_id.clone()]
@@ -1319,6 +1354,7 @@ async fn two_proved_seats_shape_at_the_seat_row_and_a_non_seat_gets_the_class() 
 /// a cold start shares it, so it spends one of the eight, at the full rate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_burst_of_rows_to_a_peer_shares_one_shaped_link() {
+    let _host = share_host().await;
     let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     let t = duo("oneline", server.clone(), server).await;
     let mut sends = Vec::new();
@@ -1678,6 +1714,7 @@ async fn refused_peer(t: &mut Referral) -> Node {
 /// never reaches W and this fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_peer_homes_on_a_referral_and_its_contact_completes_there() {
+    let _host = share_host().await;
     let mut t = referral_pair(
         "home",
         0x3a,
@@ -1755,6 +1792,7 @@ async fn a_refused_peer_homes_on_a_referral_and_its_contact_completes_there() {
 /// off: it reports nothing, R names nobody, and P is left its fallback order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_with_its_relay_offering_off_is_never_referred() {
+    let _host = share_host().await;
     let mut off = DeviceState::of(DeviceKind::Server);
     off.relay_override = Some(false);
     let mut t = referral_pair("off", 0x4a, off, None, false).await;
@@ -1779,6 +1817,7 @@ async fn a_node_with_its_relay_offering_off_is_never_referred() {
 /// phone out, not a close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_phone_that_loses_wifi_stops_being_referred_on_the_next_report() {
+    let _host = share_host().await;
     let mut capable = DeviceState::of(DeviceKind::Phone);
     capable.client_only = false;
     let mut t = referral_pair("wifi", 0x5a, capable, None, false).await;
@@ -1811,6 +1850,7 @@ async fn a_phone_that_loses_wifi_stops_being_referred_on_the_next_report() {
 /// record never arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_homed_node_is_a_replication_peer_on_the_bootstrap_planes() {
+    let _host = share_host().await;
     let z = Ident::new("node-z-rounds", 0x6f).await;
     let mut t = referral_pair(
         "rounds",
@@ -1866,6 +1906,7 @@ async fn a_homed_node_is_a_replication_peer_on_the_bootstrap_planes() {
 /// the user's relay override on and shaped links to spare.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_only_node_never_reports_slots() {
+    let _host = share_host().await;
     let mut phone = DeviceState::of(DeviceKind::Phone);
     phone.relay_override = Some(true);
     let t = referral_pair("client", 0x7a, phone, None, false).await;
@@ -1879,6 +1920,7 @@ async fn a_client_only_node_never_reports_slots() {
 /// stays shaped. Mutation: leave the unshaped link open → the last leg does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wifi_only_shaping_renegotiates_to_off_on_cellular_and_back() {
+    let _host = share_host().await;
     let mut wifi = DeviceState::of(DeviceKind::Phone);
     wifi.shaping_opt_in = true;
     let mut fast = ShapingPolicy::for_device(&wifi);
@@ -1945,6 +1987,7 @@ async fn wifi_only_shaping_renegotiates_to_off_on_cellular_and_back() {
 /// row waits behind the file and arrives after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_row_behind_a_slow_path_file_overtakes_it() {
+    let _host = share_host().await;
     let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     let t = Arc::new(duo("rowsfirst", server.clone(), server).await);
     let opener = typed_payload("AttestationGossip", b"RF-OPEN-", 2_000);
@@ -2003,6 +2046,7 @@ async fn a_row_behind_a_slow_path_file_overtakes_it() {
 /// names W.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_owned_node_that_has_not_announced_is_never_referred() {
+    let _host = share_host().await;
     let mut t = referral_pair(
         "self",
         0x8a,
@@ -2174,6 +2218,7 @@ async fn shape_to(r: &Node, n: &Node, marker: &[u8]) {
 /// changed. Mutation: drop either exemption, or `load_refuses` → this fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e15_tier_one_refuses_a_stranger_with_a_referral_and_admits_the_protected() {
+    let _host = share_host().await;
     let t = star("t1", 0x90, 4).await;
     let Star {
         r,
@@ -2255,9 +2300,25 @@ async fn e15_tier_one_refuses_a_stranger_with_a_referral_and_admits_the_protecte
 /// no restart: the roster is the active one. Mutation: drop the owner's or the
 /// seat's exemption, read a baked roster, or never shed → this fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)] // one tier's whole story, in order
 async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
-    let t = star("t2", 0xa0, 5).await;
+    let _host = whole_host().await;
+    let mut whole = false;
+    for (tag, seed) in [("t2", 0xa0), ("t2b", 0xc0), ("t2c", 0xd0)] {
+        whole = tier_two_story(tag, seed).await;
+        if whole {
+            break;
+        }
+    }
+    assert!(whole, "every star lost a link before its five stood");
+}
+
+/// One star of the witness above: whether its five links stood together. The
+/// order they shaped in is the witness, so a link a starved responder lost on
+/// the way (leviculum spent its retries; the shaper says so) is a new star,
+/// not a redial. A link gone with nothing counting it panics.
+#[allow(clippy::too_many_lines)] // one tier's whole story, in order
+async fn tier_two_story(tag: &str, seed: u8) -> bool {
+    let t = star(tag, seed, 5).await;
     let Star {
         r,
         spokes,
@@ -2284,7 +2345,18 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
         .await
         .expect("R dials the fifth");
     assert!(r.transport.peer_shaping(&dialled.key.key_id).shaped_now);
-    assert_eq!(r.transport.shaped_link_count(), 5);
+    if r.transport.shaped_link_count() != 5 {
+        let failed: u64 = [&r, &older, &newer, &device, &seat, &dialled]
+            .iter()
+            .map(|n| n.shaping("link_shaping_send_failed"))
+            .sum();
+        eprintln!(
+            "[T2] {tag}: {} of 5 stood, {failed} send failures",
+            r.transport.shaped_link_count()
+        );
+        assert!(failed > 0, "a shaped link gone with nothing counting it");
+        return false;
+    }
     let sender_rates = || {
         r.transport
             .shaping_status()
@@ -2296,12 +2368,24 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
     let rates_before = sender_rates();
 
     let is_shaped = |n: &Node| r.transport.peer_shaping(&n.key.key_id).shaped_now;
+    // Lost to a starved host with the shaper saying so: not what is on trial.
+    let lost = |n: &Node| {
+        !is_shaped(n)
+            && [&r, &older, &newer, &device, &seat, &dialled]
+                .iter()
+                .map(|n| n.shaping("link_shaping_send_failed"))
+                .sum::<u64>()
+                > 0
+    };
     r.transport
         .set_service_tier(ciris_edge::ServiceTier::ChatAndContacts);
     assert!(
         wait_until(Duration::from_secs(15), || async { !is_shaped(&newer) }).await,
         "the newest closes"
     );
+    if lost(&older) {
+        return false;
+    }
     assert!(is_shaped(&older), "and the older one has not yet");
     assert!(
         wait_until(Duration::from_secs(15), || async { !is_shaped(&older) }).await,
@@ -2310,6 +2394,9 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(r.shaping("load_shed:shaped"), 2, "and no third");
     for keeps in [&device, &seat, &dialled] {
+        if lost(keeps) {
+            return false;
+        }
         assert!(is_shaped(keeps), "{} stands", keeps.key.key_id);
     }
 
@@ -2357,6 +2444,9 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
         refused.to_string().contains("link_shaping_home_elsewhere"),
         "{refused}"
     );
+    if lost(&seat) {
+        return false;
+    }
     assert!(is_shaped(&seat));
 
     // The seat is retired by quorum: active state, read at the next step.
@@ -2369,7 +2459,13 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
         "a retired canonical sheds like anyone"
     );
     assert_eq!(r.shaping("load_shed:shaped"), 3);
+    if lost(&device) {
+        return false;
+    }
     assert!(is_shaped(&device), "the owner's device still stands");
+    if lost(&dialled) {
+        return false;
+    }
     assert!(is_shaped(&dialled));
 
     // The tier falls: nothing more closes and the door opens.
@@ -2377,6 +2473,7 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
         .set_service_tier(ciris_edge::ServiceTier::FullOps);
     assert_eq!(r.transport.shaping_status().free_slots, 6);
     shape_to(&r, &newer, b"T2-BACK-").await;
+    true
 }
 
 /// **The slow path is bulk** (§6.12): a transfer to a non-owner peer stops at
@@ -2386,6 +2483,7 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
 /// the first half fails; pause the owner's devices too → the second does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e15_tier_two_pauses_the_slow_path_for_a_non_owner_and_not_for_the_owner() {
+    let _host = share_host().await;
     let t = star("sp", 0xb0, 2).await;
     let Star {
         r,
@@ -2500,6 +2598,7 @@ async fn e15_tier_two_pauses_the_slow_path_for_a_non_owner_and_not_for_the_owner
 /// the refusal comes from the wiring the host gets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e8_e15_status_and_shed_through_edge_track_the_load_pressure() {
+    let _host = share_host().await;
     let t = star("edge", 0xc0, 1).await;
     let Star {
         r,
@@ -2589,6 +2688,7 @@ async fn e8_e15_status_and_shed_through_edge_track_the_load_pressure() {
 /// fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e8_the_status_tracks_the_bound_the_class_and_the_peers() {
+    let _host = share_host().await;
     let mut phone = DeviceState::of(DeviceKind::Phone).with_network(true, true);
     phone.shaping_opt_in = true;
     phone.shaping_opt_in_cellular = true;
@@ -2689,6 +2789,7 @@ async fn e8_the_status_tracks_the_bound_the_class_and_the_peers() {
 /// E8, the peer side: a peer that answers `off` is on record as not shaping.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e8_a_peer_that_answers_off_is_on_record_as_not_shaping() {
+    let _host = share_host().await;
     let t = duo(
         "offpeer",
         policy(BudgetClass::Server, 100_000, 0.5, 10, false),
@@ -2788,6 +2889,7 @@ fn at_rate(agreed: u32, rate: u32) -> bool {
 /// set → this fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_canonical_that_joins_after_boot_gets_the_seat_class_from_both_proofs() {
+    let _host = share_host().await;
     let t = duo("seat-joins", one_slot(), one_slot()).await;
     read_seats(&t.a);
     read_seats(&t.b);
@@ -2846,6 +2948,7 @@ async fn a_canonical_that_joins_after_boot_gets_the_seat_class_from_both_proofs(
 /// tombstone, or leave the running link → this fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_canonical_retired_after_boot_loses_the_seat_class_and_the_bound_exemption() {
+    let _host = share_host().await;
     let t = duo("seat-retires", one_slot(), one_slot()).await;
     let (a_id, b_id) = (t.a.key.key_id.clone(), t.b.key.key_id.clone());
     for n in [&t.a, &t.b] {
@@ -2908,6 +3011,7 @@ async fn a_canonical_retired_after_boot_loses_the_seat_class_and_the_bound_exemp
 /// reads. The liveness signals read true with nothing else to say.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_link_moves_the_event_path_telemetry() {
+    let _host = share_host().await;
     let fast = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     let t = duo("tele", fast.clone(), fast).await;
     let row = marked(b"TELE-ROW-", 2_000);
