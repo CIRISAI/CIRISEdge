@@ -1267,7 +1267,8 @@ fn round_class_of(e: &RoundError) -> RoundClass {
                 TransportError::Io(_)
                 | TransportError::Timeout(_)
                 | TransportError::LinkSealRefused { .. } => RoundClass::SendFailed,
-                // Nothing went out: no address, a ban, a body too large.
+                // Nothing went out: a ban, a body too large, an unreachable
+                // medium. No address at all is the no-route class above.
                 _ => RoundClass::Other,
             })
         }

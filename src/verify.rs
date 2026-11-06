@@ -801,7 +801,6 @@ where
     Ok(found)
 }
 
-#[async_trait]
 /// A stored route as a [`LiveTransportBinding`]: a live reticulum row with both
 /// identity halves and a well-formed destination, else `None`.
 fn live_binding_of(
@@ -828,6 +827,7 @@ fn live_binding_of(
     })
 }
 
+#[async_trait]
 impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
     async fn root_binding(
         &self,

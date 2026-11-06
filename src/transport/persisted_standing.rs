@@ -160,7 +160,19 @@ pub(crate) struct StandingRefresh {
     pub(super) table: RwLock<PersistedStandings>,
     running: AtomicBool,
     walk: tokio::sync::Mutex<Walk>,
+    wanted: std::sync::Mutex<Wanted>,
 }
+
+/// Peers a send found no address for, and those whose route has since landed.
+#[derive(Default)]
+struct Wanted {
+    peers: HashMap<String, std::time::Instant>,
+    landed: Vec<String>,
+}
+
+/// Peers remembered as wanted. A full set drops the oldest half: the only cost
+/// of forgetting one is its next probe re-noting it.
+const WANTED_TRACKED: usize = 1_024;
 
 /// Holds the single flight; a cut or panicking pass gives it back.
 struct Flight<'a>(&'a AtomicBool);
@@ -172,6 +184,40 @@ impl Drop for Flight<'_> {
 }
 
 impl StandingRefresh {
+    /// A send found no address for `key`. The no-route backoff now paces its
+    /// retries, so its path ask must not wait on them: the cursors below see
+    /// its route row land.
+    pub(super) fn note_unaddressed(&self, key: &str) {
+        let mut wanted = self.wanted.lock().unwrap_or_else(PoisonError::into_inner);
+        if wanted.peers.len() >= WANTED_TRACKED && !wanted.peers.contains_key(key) {
+            let mut ages: Vec<std::time::Instant> = wanted.peers.values().copied().collect();
+            ages.sort_unstable();
+            let cut = ages[ages.len() / 2];
+            wanted.peers.retain(|_, at| *at > cut);
+        }
+        wanted
+            .peers
+            .insert(key.to_owned(), std::time::Instant::now());
+    }
+
+    /// Wanted peers whose route row landed since the last call.
+    pub(super) fn take_landed(&self) -> Vec<String> {
+        std::mem::take(
+            &mut self
+                .wanted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .landed,
+        )
+    }
+
+    fn note_route_landed(&self, key: &str) {
+        let mut wanted = self.wanted.lock().unwrap_or_else(PoisonError::into_inner);
+        if wanted.peers.remove(key).is_some() {
+            wanted.landed.push(key.to_owned());
+        }
+    }
+
     /// One tick's pass. Single-flight and bounded: see the module docs.
     pub(crate) async fn pass(
         self: Arc<Self>,
@@ -413,6 +459,7 @@ impl StandingRefresh {
             walk.last_read = Some(Instant::now());
             walk.sweep_now |= changes.whole;
             for key in changes.routes {
+                self.note_route_landed(&key);
                 walk.queue(key);
             }
             for key in changes.subjects {
@@ -507,6 +554,8 @@ mod tests {
         latency: Mutex<Duration>,
         /// `live_binding_rows` never answers.
         list_hangs: AtomicBool,
+        /// `binding_changes` never answers.
+        changes_hang: AtomicBool,
         lists: AtomicUsize,
         walks: AtomicUsize,
         stands: AtomicUsize,
@@ -596,6 +645,9 @@ mod tests {
             _cursors: &mut BindingCursors,
             _page: u32,
         ) -> Result<BindingChanges, String> {
+            if self.changes_hang.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             if self.read_fails.load(Ordering::SeqCst) {
                 return Err("down".to_owned());
             }
@@ -652,6 +704,17 @@ mod tests {
 
     const POLICY: HybridPolicy = HybridPolicy::Ed25519Fallback;
 
+    /// `span` of ordinary 30 s ticks: the change read stays fresh throughout.
+    async fn ticks(refresh: &Arc<StandingRefresh>, dir: &Arc<Rows>, span: Duration) {
+        let tick = Duration::from_secs(30);
+        let mut left = span;
+        while !left.is_zero() {
+            tokio::time::advance(tick).await;
+            pass(refresh, dir).await;
+            left = left.saturating_sub(tick);
+        }
+    }
+
     async fn pass(refresh: &Arc<StandingRefresh>, dir: &Arc<Rows>) -> PassEnd {
         let dir: Arc<dyn RootingDirectory> = dir.clone();
         Arc::clone(refresh).pass(dir, POLICY, None).await
@@ -662,7 +725,7 @@ mod tests {
         Arc::clone(refresh).boot(dir, POLICY, None).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn only_a_proven_binding_counts_and_a_gone_row_stops_counting() {
         let mut wrong = row("mismatched", 4, Advisory);
         wrong.dest_hash = [0xee; 16];
@@ -690,9 +753,7 @@ mod tests {
 
         // Retired, revoked or superseded: the list stops holding it.
         dir.live.lock().unwrap().clear();
-        tokio::time::pause();
-        tokio::time::advance(SWEEP_EVERY).await;
-        assert_eq!(pass(&refresh, &dir).await, PassEnd::Done);
+        ticks(&refresh, &dir, SWEEP_EVERY).await;
         assert!(keys(&refresh).is_empty(), "the memo keeps nothing alive");
     }
 
@@ -836,8 +897,7 @@ mod tests {
         assert_eq!(dir.walks.load(Ordering::SeqCst), 1);
 
         // The next sweep leaves it alone.
-        tokio::time::advance(SWEEP_EVERY).await;
-        pass(&refresh, &dir).await;
+        ticks(&refresh, &dir, SWEEP_EVERY).await;
         assert_eq!(dir.lists.load(Ordering::SeqCst), 2, "a sweep ran");
         assert_eq!(
             dir.walks.load(Ordering::SeqCst),
@@ -863,9 +923,10 @@ mod tests {
         let refresh = Arc::new(StandingRefresh::default());
         pass(&refresh, &dir).await;
         dir.signed.lock().unwrap().push("late".to_owned());
-        tokio::time::advance(UNPROVEN_TTL + SWEEP_EVERY).await;
-        // A tick keeps the change read fresh; only the sweep walks.
-        pass(&refresh, &dir).await;
+        // Short of its expiry, a sweep leaves it unproven.
+        ticks(&refresh, &dir, SWEEP_EVERY).await;
+        assert!(keys(&refresh).is_empty(), "memoised");
+        ticks(&refresh, &dir, UNPROVEN_TTL + SWEEP_EVERY).await;
         assert_eq!(keys(&refresh), ["late"]);
     }
 
@@ -941,7 +1002,27 @@ mod tests {
         assert!(keys(&refresh).is_empty());
     }
 
-    /// A table no change read has reached in this long is not vouched for.
+    /// The late joiner: a peer a send found no address for is handed to the
+    /// path ask when its route lands, and once. Anyone else's route is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_wanted_peers_landing_route_is_handed_to_the_path_ask() {
+        let dir = Arc::new(Rows::default());
+        let refresh = Arc::new(StandingRefresh::default());
+        pass(&refresh, &dir).await;
+        refresh.note_unaddressed("late-joiner");
+        assert!(refresh.take_landed().is_empty(), "no route yet");
+        dir.changes.lock().unwrap().push_back(BindingChanges {
+            routes: vec!["late-joiner".to_owned(), "anyone-else".to_owned()],
+            ..Default::default()
+        });
+        pass(&refresh, &dir).await;
+        assert_eq!(refresh.take_landed(), ["late-joiner"]);
+        assert!(refresh.take_landed().is_empty(), "handed over once");
+    }
+
+    /// A pass cut for slowness keeps the table: a busy store is not a failed
+    /// read. But a table no change read has reached in this long is one a
+    /// revocation cannot reach either.
     #[tokio::test(start_paused = true)]
     async fn a_table_that_stops_being_read_is_forgotten() {
         let dir = Arc::new(Rows::default());
@@ -950,9 +1031,11 @@ mod tests {
         let refresh = Arc::new(StandingRefresh::default());
         pass(&refresh, &dir).await;
         assert_eq!(keys(&refresh), ["signed"]);
+        dir.changes_hang.store(true, Ordering::SeqCst);
+        assert_eq!(pass(&refresh, &dir).await, PassEnd::Cut);
+        assert_eq!(keys(&refresh), ["signed"], "slow is not failed");
         tokio::time::advance(STALE_AFTER).await;
-        dir.read_fails.store(true, Ordering::SeqCst);
-        assert_eq!(pass(&refresh, &dir).await, PassEnd::Failed);
+        assert_eq!(pass(&refresh, &dir).await, PassEnd::Cut);
         assert!(keys(&refresh).is_empty());
     }
 }

@@ -335,7 +335,9 @@ pub fn routing_reverse_table() -> Result<Vec<crate::EdgeReverseEntry>, crate::Ed
 #[cfg(feature = "_reticulum-module")]
 fn map_transport_err(e: TransportError) -> crate::EdgeBindingsError {
     match e {
-        TransportError::Unreachable(_) => crate::EdgeBindingsError::NotFound,
+        TransportError::Unreachable(_) | TransportError::NoDialCandidate { .. } => {
+            crate::EdgeBindingsError::NotFound
+        }
         TransportError::Config(_) => crate::EdgeBindingsError::InvalidArgument,
         // PeerBlackholed collapses into the typed Transport class on
         // the FFI side; the calling language differentiates via the

@@ -674,7 +674,9 @@ async fn dispatch_one(
         Err(e) => {
             let class = match &e {
                 TransportError::Suspended => "suspended",
-                TransportError::Unreachable(_) => "unreachable",
+                TransportError::Unreachable(_) | TransportError::NoDialCandidate { .. } => {
+                    "unreachable"
+                }
                 TransportError::Timeout(_) => "timeout",
                 TransportError::Config(_) => "config",
                 TransportError::Io(_) => "io",

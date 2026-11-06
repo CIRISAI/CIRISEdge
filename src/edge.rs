@@ -9342,7 +9342,7 @@ fn transport_id_from_medium(
 /// and durable-dispatcher-path (the dispatcher's mapping) outcomes.
 fn transport_error_class(e: &TransportError) -> &'static str {
     match e {
-        TransportError::Unreachable(_) => "unreachable",
+        TransportError::Unreachable(_) | TransportError::NoDialCandidate { .. } => "unreachable",
         TransportError::Timeout(_) => "timeout",
         TransportError::Config(_) => "config",
         TransportError::Io(_) => "io",

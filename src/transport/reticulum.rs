@@ -60,7 +60,7 @@
 //! that seed peers from a directory query rather than announces.
 //!
 //! If the peer is not yet resolvable, `send` returns
-//! [`TransportError::Unreachable`] and edge's durable dispatcher
+//! [`TransportError::NoDialCandidate`] and edge's durable dispatcher
 //! retries (FSD/EDGE_OUTBOUND_QUEUE.md §4).
 //!
 //! ## Wire framing
@@ -3013,7 +3013,7 @@ pub struct ReticulumTransport {
     /// a steady arrival of new senders.
     dial_gate: Arc<Mutex<HashMap<DestinationHash, Arc<tokio::sync::Semaphore>>>>,
     /// When a path to each destination was last asked for ([`Self::seek_paths`]).
-    path_seeks: std::sync::Mutex<HashMap<DestinationHash, std::time::Instant>>,
+    path_seeks: PathSeeks,
     /// CIRISEdge#739 — the SCOPED twin of `reusable_dialed_link`: identified
     /// links to a scope-derived member address, keyed by that address, fed
     /// only by [`Self::lease_scoped_link`]'s dial and tagged
@@ -4211,7 +4211,7 @@ impl ReticulumTransport {
             swallow_link_established: std::sync::atomic::AtomicBool::new(false),
             concluded_resources: std::sync::Mutex::new(HashMap::new()),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
-            path_seeks: std::sync::Mutex::new(HashMap::new()),
+            path_seeks: PathSeeks::default(),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
@@ -7584,6 +7584,13 @@ impl ReticulumTransport {
         if let Some(m) = self.metrics.get() {
             m.inc_peer_binding(crate::observability::PEER_BINDING_PRIMED);
         }
+        // CIRISEdge#794 — the host just gave this node somewhere to send: a
+        // peer with no candidate has been in the no-route backoff since before
+        // this binding existed, and no announce may follow to clear it.
+        let _ = self.peer_reachable.send(PeerReachable::new(
+            destination_key_id.to_string(),
+            ReachabilityEvidence::PathLearned,
+        ));
         tracing::debug!(
             key_id = %destination_key_id,
             dest = %hex::encode(dest_hash),
@@ -9147,38 +9154,7 @@ impl ReticulumTransport {
         if dests.is_empty() || known() {
             return !dests.is_empty();
         }
-        let now = std::time::Instant::now();
-        let mut ask: Vec<DestinationHash> = Vec::new();
-        let mut until = now;
-        {
-            let mut seeks = self
-                .path_seeks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if seeks.len() >= PATH_SEEK_TRACKED {
-                let mut ages: Vec<std::time::Instant> = seeks.values().copied().collect();
-                ages.sort_unstable();
-                let cut = ages[ages.len() / 2];
-                seeks.retain(|_, at| *at > cut);
-            }
-            for d in dests {
-                match seeks.get(d).copied() {
-                    Some(at) if now.duration_since(at) < PATH_SEEK_MIN_INTERVAL => {
-                        until = until.max(at + PATH_SEEK_BUDGET);
-                    }
-                    _ => {
-                        seeks.insert(*d, now);
-                        ask.push(*d);
-                        until = until.max(now + PATH_SEEK_BUDGET);
-                    }
-                }
-            }
-        }
-        for d in &ask {
-            if let Err(e) = self.node.request_path(d).await {
-                tracing::debug!(error = %e, "path request not sent");
-            }
-        }
+        let until = ask_for_paths(&self.node, &self.path_seeks, dests).await;
         while std::time::Instant::now() < until {
             if known() {
                 return true;
@@ -11120,6 +11096,15 @@ impl ReticulumTransport {
                         Arc::clone(&self.shapers),
                     ));
                     if let Some(rooting) = self.rooting.clone() {
+                        let landed = self.persisted_standing.take_landed();
+                        if !landed.is_empty() {
+                            tokio::spawn(ask_through_landed_routes(
+                                Arc::clone(&self.node),
+                                Arc::clone(&rooting),
+                                Arc::clone(&self.path_seeks),
+                                landed,
+                            ));
+                        }
                         tokio::spawn(Arc::clone(&self.persisted_standing).pass(
                             rooting,
                             self.hybrid_policy,
@@ -11299,7 +11284,16 @@ impl ReticulumTransport {
             // failed. Admission-time hybrid-PQC verification is the
             // operator's concern; the queued bytes are the byte-exact
             // signed envelope, carried verbatim.
-            if self.delivery == crate::transport::PendingDelivery::PendingOrLive {
+            //
+            // Never a replication frame: it belongs to a round that is over
+            // by any wake-up, and anti-entropy catches the peer up on its
+            // return. Queued, it cost the round its no-route answer (`Queued`
+            // reads as sent, so every plane waited out its reply and swept
+            // again at full cadence), and took the slot of a message the
+            // queue is there for (CIRISEdge#794).
+            if self.delivery == crate::transport::PendingDelivery::PendingOrLive
+                && !is_replication_frame(envelope_bytes)
+            {
                 if let Some(saf) = &self.store_and_forward {
                     saf.queue(destination_key_id, envelope_bytes)
                         .map_err(|e| TransportError::Io(format!("store-and-forward queue: {e}")))?;
@@ -11311,10 +11305,10 @@ impl ReticulumTransport {
                     return Ok(TransportSendOutcome::Queued);
                 }
             }
-            return Err(TransportError::Unreachable(format!(
-                "no Reticulum destination known for destination_key_id={destination_key_id} \
-                 (not directory-resolvable and no announce received)"
-            )));
+            self.persisted_standing.note_unaddressed(destination_key_id);
+            return Err(TransportError::NoDialCandidate {
+                key_id: destination_key_id.to_owned(),
+            });
         }
 
         // CIRISEdge#33 (v0.15.0) — operator-deny-list check BEFORE the
@@ -18550,6 +18544,79 @@ fn route_supersession_by_route(
     RouteSupersession::IgnoreStale
 }
 
+/// Whether `envelope` is a CRPL replication frame, not a signed envelope.
+fn is_replication_frame(envelope: &[u8]) -> bool {
+    envelope.starts_with(&crate::replication::wire_frame::REPLICATION_FRAME_MAGIC)
+}
+
+/// One path ask per destination per [`PATH_SEEK_MIN_INTERVAL`].
+type PathSeeks = Arc<std::sync::Mutex<HashMap<DestinationHash, std::time::Instant>>>;
+
+/// Raise the path requests `dests` are due. Returns when the answers can
+/// stop being waited for: an ask still in flight counts, an old one does not.
+async fn ask_for_paths(
+    node: &ReticulumNode,
+    seeks: &PathSeeks,
+    dests: &[DestinationHash],
+) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let mut ask: Vec<DestinationHash> = Vec::new();
+    let mut until = now;
+    {
+        let mut seeks = seeks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seeks.len() >= PATH_SEEK_TRACKED {
+            let mut ages: Vec<std::time::Instant> = seeks.values().copied().collect();
+            ages.sort_unstable();
+            let cut = ages[ages.len() / 2];
+            seeks.retain(|_, at| *at > cut);
+        }
+        for d in dests {
+            match seeks.get(d).copied() {
+                Some(at) if now.duration_since(at) < PATH_SEEK_MIN_INTERVAL => {
+                    until = until.max(at + PATH_SEEK_BUDGET);
+                }
+                _ => {
+                    seeks.insert(*d, now);
+                    ask.push(*d);
+                    until = until.max(now + PATH_SEEK_BUDGET);
+                }
+            }
+        }
+    }
+    for d in &ask {
+        if let Err(e) = node.request_path(d).await {
+            tracing::debug!(error = %e, "path request not sent");
+        }
+    }
+    until
+}
+
+/// The late joiner's ask (#945), for a peer the no-route backoff has stopped
+/// trying: its signed route row just landed, so there is now somewhere to ask,
+/// and the next probe may be a quarter of an hour away. What comes back is its
+/// own announce, which roots it and clears the backoff the ordinary way.
+async fn ask_through_landed_routes(
+    node: Arc<ReticulumNode>,
+    rooting: Arc<dyn RootingDirectory>,
+    seeks: PathSeeks,
+    keys: Vec<String>,
+) {
+    for key in keys {
+        let Ok(Some(row)) = rooting.signed_reticulum_route(&key).await else {
+            continue;
+        };
+        let hash = hex::decode(&row.transport_destination.destination)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok());
+        if let Some(hash) = hash {
+            tracing::debug!(peer = %key, "a wanted peer's route landed; asking for its path");
+            ask_for_paths(&node, &seeks, &[DestinationHash::new(hash)]).await;
+        }
+    }
+}
+
 /// Tests outside the transport: the named destination of a full key.
 #[cfg(test)]
 pub(crate) fn named_dest_for_test(transport_pubkey64: &[u8; 64]) -> [u8; 16] {
@@ -25376,6 +25443,67 @@ mod scope_native_addressing_tests {
         )
         .await
         .expect("bare transport")
+    }
+
+    /// What a server's round met, on the real send path: `PendingOrLive` with
+    /// a queue, and a peer with no candidate. A replication frame is answered
+    /// no-route and queues nothing; a signed envelope still waits for the
+    /// wake-up. Before: both queued, the round read `Queued` as sent and waited
+    /// out its reply, so the peer never backed off (CIRISEdge#794).
+    #[tokio::test]
+    async fn a_replication_frame_to_no_candidate_is_no_route_and_never_queued() {
+        use crate::replication::protocol::{EnvelopeKind, ReplicationMessage, SummaryMessage};
+        use crate::transport::store_and_forward::{
+            MemoryStoreAndForward, StoreAndForward, StoreAndForwardConfig,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue: Arc<dyn StoreAndForward> =
+            Arc::new(MemoryStoreAndForward::new(StoreAndForwardConfig::default()));
+        let transport = bare_transport(dir.path(), "local-key")
+            .await
+            .with_store_and_forward(
+                Arc::clone(&queue),
+                crate::transport::PendingDelivery::PendingOrLive,
+            );
+        let frame =
+            crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
+                kind: EnvelopeKind::Key,
+                refs: Vec::new(),
+            }));
+        let sent = Transport::send(&transport, "nobody", &frame).await;
+        assert!(
+            matches!(sent, Err(TransportError::NoDialCandidate { .. })),
+            "{sent:?}"
+        );
+        assert_eq!(queue.pending_count("nobody"), 0, "the frame was not queued");
+
+        let queued = Transport::send(&transport, "nobody", b"{\"signed\":true}").await;
+        assert!(
+            matches!(queued, Ok(TransportSendOutcome::Queued)),
+            "{queued:?}"
+        );
+        assert_eq!(queue.pending_count("nobody"), 1, "the envelope still waits");
+    }
+
+    /// A host's prime is a route arriving: a peer in the no-route backoff has
+    /// no announce coming to clear it.
+    #[tokio::test]
+    async fn a_prime_is_reachability_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "local-key").await;
+        let mut events = transport.subscribe_reachability().expect("subscribable");
+        let pubkey = Identity::from_private_key_bytes(&[0x51; 64])
+            .expect("an identity")
+            .public_key_bytes();
+        let dest = named_dest_of_transport(&pubkey).expect("a destination");
+        transport
+            .prime_peer("primed", dest, pubkey)
+            .await
+            .expect("primed");
+        let seen = events.try_recv().expect("evidence was sent");
+        assert_eq!(seen.peer_key_id, "primed");
+        assert_eq!(seen.evidence, ReachabilityEvidence::PathLearned);
     }
 
     fn table_with_group(
