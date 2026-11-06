@@ -2,6 +2,11 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 44.0.1 — 2026-11-06
+
+Every step of a late subject Pull gets the late window, so a Deliver behind a late Summary is kept.
+The retired-plane line logs at debug at the hot-add door. Test fixes and the 44.0.0 notes date.
+
 ## 44.0.0 — 2026-11-06
 
 Long-term support line. Pins persist 61.0.4, verify 22.0.0, leviculum 0.33.0+ciris.1. Coordinated

@@ -1,5 +1,20 @@
 # CIRISEdge Release Notes
 
+# v44.0.1 — every step of a late Pull is kept
+
+**2026-11-06.** **PATCH** on the LTS line. Same pins as v44.0.0: persist v61.0.4, CIRISVerify
+v22.0.0, leviculum v0.33.0+ciris.1.
+
+- **A late subject Pull keeps its Deliver.** v44.0.0 gave an exchange one late wait, so a Deliver
+  behind a late Summary still got only the caller's wait and was dropped. Each step now gets
+  `PULL_LATE_WINDOW`. The caller's wait, the re-asks and the bound of 16 per peer and plane are
+  unchanged.
+- **The retired-plane line logs at debug at the hot-add door,** which a host's reconcile can reach
+  on every pass. Nothing was scheduled either way.
+- **Tests.** The superseded-binding witness injects a binding newer than the announce it outranks,
+  and C announces on every run. The direct-links transport fixture redraws a port taken before its
+  bind. The 44.0.0 notes carry the tag's date.
+
 # v44.0.0 — the group plane as rows, calls on the ALM mesh, a phone that sleeps
 
 **2026-11-06.** **MAJOR** from v43.4.1, and the **long-term support line** while persist does its
