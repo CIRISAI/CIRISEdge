@@ -2705,7 +2705,7 @@ async fn call_on_a_punched_interface(
 async fn a_call_on_a_punched_interface_outlives_the_inbound_idle_bound() {
     const BOUND: Duration = Duration::from_secs(2);
     let (p, _spine, leg, accepted, identity) =
-        call_on_a_punched_interface("reap-call", BOUND).await;
+        Box::pin(call_on_a_punched_interface("reap-call", BOUND)).await;
 
     let started = tokio::time::Instant::now();
     let mut frames = 0u32;
