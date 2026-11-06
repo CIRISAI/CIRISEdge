@@ -2558,6 +2558,24 @@ async fn one_side_moves_the_other_sends(
         .expect("the send ends")
         .expect("the send task");
     sent.unwrap_or_else(|e| panic!("the frame is delivered ({took:?}): {e:?}"));
+
+    // The outcome ends the guard: the same size on the same link now ships
+    // with nothing refused, at the MTU both ends hold.
+    let total = |m: &EdgeMetrics| m.direct_link_upgrade_guarded().values().sum::<u64>();
+    let refused = total(&behind.metrics);
+    let mut again = vec![0u8; 400 * 1024];
+    ciris_crypto::random::fill(&mut again).expect("random frame");
+    let path = ReplyPath::new(TransportId::RETICULUM_RS, link);
+    behind
+        .transport
+        .send_on_reply_path_only(&ahead.key.key_id, &path, &again)
+        .await
+        .expect("a frame on the moved link");
+    assert_eq!(
+        total(&behind.metrics),
+        refused,
+        "the guard ended at the move"
+    );
     behind.metrics.clone()
 }
 
