@@ -826,6 +826,7 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
 
 /// One call of the witness above: whether it ran whole. Media lost with
 /// something counting it is `false`; lost with nothing counting it panics.
+#[allow(clippy::too_many_lines)]
 async fn removed_member_call(tag: &str) -> bool {
     let (nodes, groups, _tmp) = mesh(tag, 3).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
@@ -946,7 +947,6 @@ async fn removed_member_call(tag: &str) -> bool {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_member_cannot_forge_another_members_stream_through_a_relay() {
-    let _call = one_call().await;
     use ciris_edge::cohort_scope::CohortScope;
     use ciris_edge::transport::av_call::{call_group_id, call_id_for_room};
     use ciris_edge::transport::av_call_key::stream_epoch_dek;
@@ -955,6 +955,7 @@ async fn a_member_cannot_forge_another_members_stream_through_a_relay() {
     use ciris_edge::transport::realtime_av_dispatcher::{AvDispatcherError, AvLinkSender as _};
 
     const FORGED: &[u8] = b"FORGED-BY-B";
+    let _call = one_call().await;
     let tag = "forge";
     let (nodes, groups, _tmp) = mesh(tag, 3).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);

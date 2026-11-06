@@ -569,7 +569,6 @@ async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
 /// unpaced burst clears the same bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rho_and_the_window_move_the_real_share_and_the_delay() {
-    let _host = whole_host().await;
     #[allow(clippy::cast_precision_loss)] // frame counts, far below 2^52
     async fn burst_time(tag: &str, rho: f64, window_s: u64) -> (Duration, f64, usize) {
         let p = policy(BudgetClass::Home, 200_000, rho, window_s, false);
@@ -619,6 +618,7 @@ async fn rho_and_the_window_move_the_real_share_and_the_delay() {
         eprintln!("[{tag}] rho={rho} W={window_s}s burst of 40 took {took:?}; real share {share:.2} ({real} real / {cover} cover), budget {budget} a window");
         (took, share, budget)
     }
+    let _host = whole_host().await;
     // The budget bounds real frames PER WINDOW (ρ·λ·W), not per burst: at
     // ρ=0.8 the whole burst fits one window's budget and leaves back-to-back
     // (its share over the burst's own seconds is near 1); at ρ=0.25 it does

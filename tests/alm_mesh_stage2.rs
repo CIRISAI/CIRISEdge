@@ -1196,9 +1196,9 @@ fn newest_line_at(tail: &str) -> u64 {
 /// a dead parent until silence made it Suspected (v=2), at 1.5 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_closed_primary_link_fails_over_on_a_live_call() {
-    let _call = one_call().await;
     const DOWN: i64 = 3;
     const SUSPECT_SILENCE_MS: u64 = 1_500;
+    let _call = one_call().await;
     let tag = "alm2-link-close";
     let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
