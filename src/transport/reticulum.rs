@@ -4412,6 +4412,9 @@ impl ReticulumTransport {
     /// Starts with [`Self::reconcile_vanished_links`]. Runs on
     /// [`Transport::listen`]'s pool tick; public so a host or a test can run
     /// it on demand. Returns how many links it closed.
+    // One pass over one busy set; splitting it would scatter the reasons a link
+    // is left alone away from the list in this doc.
+    #[allow(clippy::too_many_lines)]
     pub async fn reap_idle_inbound_links(&self) -> usize {
         self.reconcile_vanished_links().await;
         let candidates = self
