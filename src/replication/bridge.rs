@@ -5143,6 +5143,14 @@ impl FederationDirectoryReplicationBridge {
     fn release_and_kick(&self, signer: &str, cause: ReleaseCause) -> usize {
         let (released, rows) = self.refusal_backoff.release_signer_rows(signer);
         if released == 0 {
+            // Says a landing was not what the parked rows were waiting on. A
+            // run read as a Key "not landing" could not tell that from silence.
+            if matches!(cause, ReleaseCause::KeyAdmitted) {
+                tracing::debug!(
+                    signer = %signer,
+                    "signer's Key landed with no rows parked on it"
+                );
+            }
             return 0;
         }
         let mut ask: Vec<(EnvelopeKind, String)> = Vec::new();
