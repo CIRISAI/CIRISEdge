@@ -52,3 +52,5 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 5.4.3	CLM-seat-class	CIRISEdge	src/transport/link_shaping.rs#LinkShapers::is_seat_link	ciris-edge@v44.0.0
 5.4.3	CLM-refusal-carries-referrals	CIRISEdge	src/transport/shaping_referral.rs#rank_referrals	ciris-edge@v44.0.0
 5.4.6	CLM-first-contact-live-binding	CIRISEdge	src/replication/bridge.rs#attestation_is_relayed_announce	ciris-edge@v44.0.0
+5.3.3.5	CLM-pre-seal-bounded-hold	CIRISEdge	src/transport/link_seal.rs#LinkSeals::hold_before_keys	ciris-edge@v44.0.0
+5.3.3.5	CLM-receiver-rates-no-cross-charge	CIRISEdge	src/transport/link_keying.rs#ReceiverOrder::admit	ciris-edge@v44.0.0

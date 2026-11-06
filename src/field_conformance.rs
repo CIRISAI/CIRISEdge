@@ -527,6 +527,29 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
         ],
         supporting: false,
     },
+    TestEvidence {
+        cc: "5.3.3.5",
+        clm: "CLM-pre-seal-bounded-hold",
+        property: "nothing is served or delivered before the seal; sealed frames sit in a bounded hold that refuses on overflow by name",
+        impl_anchor: "src/transport/link_seal.rs#LinkSeals::hold_before_keys",
+        witness: &[
+            "src/transport/link_seal/tests.rs#the_holds_are_bounded_across_links",
+            "src/transport/link_seal/tests.rs#the_identity_hold_is_bounded_and_replays_in_order_e1",
+            "src/transport/link_seal/tests.rs#a_link_that_outruns_its_keying_hold_is_refused_by_name_947",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.3.3.5",
+        clm: "CLM-receiver-rates-no-cross-charge",
+        property: "per-link, per-sender and node-wide rates each charge only their own budget",
+        impl_anchor: "src/transport/link_keying.rs#ReceiverOrder::admit",
+        witness: &[
+            "src/transport/link_keying/tests.rs#a_sender_over_its_rate_spends_none_of_the_node_budget_947",
+            "src/transport/link_seal/tests.rs#a_route_request_is_charged_to_its_sender_before_the_node_947",
+        ],
+        supporting: false,
+    },
 ];
 
 /// Every edge-tagged field edge does NOT process with a runtime value-check —
