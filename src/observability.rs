@@ -1367,6 +1367,29 @@ pub const KEY_PLANE_INVALIDATED: &str = "key_plane_invalidated";
 /// Memo rebuilds (first use, the TTL, or after a failed probe).
 pub const KEY_PLANE_REBUILDS: &str = "key_plane_rebuilds";
 
+// ─── v44 LTS — `EdgeMetrics::persisted_standing` labels ─────────────────
+//
+// The refresh of the bindings a restart judges handshakes by
+// (`transport::persisted_standing`). One pass at a time, bounded, paid for by
+// what changed; `pass_ms / passes` is what a pass costs.
+
+/// Passes run, whatever they found.
+pub const PERSISTED_STANDING_PASSES: &str = "persisted_standing_passes";
+/// Wall-clock milliseconds in those passes.
+pub const PERSISTED_STANDING_PASS_MS: &str = "persisted_standing_pass_ms";
+/// Ticks skipped because a pass was still running.
+pub const PERSISTED_STANDING_PASSES_SKIPPED: &str = "persisted_standing_passes_skipped";
+/// Passes cut at the bound: a read outlasted it.
+pub const PERSISTED_STANDING_PASSES_CUT: &str = "persisted_standing_passes_cut";
+/// Passes ended by a read the store did not serve (nobody stands until one is).
+pub const PERSISTED_STANDING_READ_FAILURES: &str = "persisted_standing_read_failures";
+/// Keys judged because a change named them.
+pub const PERSISTED_STANDING_CHANGES_JUDGED: &str = "persisted_standing_changes_judged";
+/// Sweeps of the whole list started.
+pub const PERSISTED_STANDING_SWEEPS: &str = "persisted_standing_sweeps";
+/// Rows a sweep walked.
+pub const PERSISTED_STANDING_ROWS_WALKED: &str = "persisted_standing_rows_walked";
+
 // ─── CIRISEdge#926 — `EdgeMetrics::link_stall` labels ─────────────────
 //
 // The link stall guard (`transport::link_stall`): a Channel send that landed
@@ -2083,6 +2106,10 @@ pub struct EdgeMetrics {
     /// subject reads, memo hits, change-probe reads and rows, invalidations,
     /// rebuilds and the wall time spent reading.
     pub key_plane_sweep: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// v44 LTS — the persisted-standing refresh by label
+    /// (`PERSISTED_STANDING_*` constants in this module): passes, their wall
+    /// time, ticks skipped, passes cut, sweeps and rows walked.
+    pub persisted_standing: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#926 — the link stall guard by label (`LINK_STALL_*`
     /// constants in this module): zero-landing Channel sends, and the dead
     /// links it closed or moved off a punched path.
@@ -2872,6 +2899,23 @@ impl EdgeMetrics {
             .collect()
     }
 
+    /// v44 LTS — add `n` to a `PERSISTED_STANDING_*` label.
+    pub fn add_persisted_standing(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.persisted_standing.write().entry(label).or_insert(0) += n;
+        }
+    }
+
+    /// The persisted-standing ledger by label.
+    #[must_use]
+    pub fn persisted_standing(&self) -> HashMap<String, u64> {
+        self.persisted_standing
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
     /// CIRISEdge#805 item 8 — `source`'s count of peers with a direct path.
     pub fn set_direct_links_active(&self, source: u64, active: u64) {
         self.direct_links_active.write().insert(source, active);
@@ -3612,6 +3656,7 @@ impl EdgeMetrics {
             direct_link: registered(&self.direct_link, DIRECT_LINK_LABELS),
             peer_binding: registered(&self.peer_binding, PEER_BINDING_LABELS),
             key_plane_sweep: self.key_plane_sweep(),
+            persisted_standing: self.persisted_standing(),
             link_stall: registered(&self.link_stall, LINK_STALL_LABELS),
             advertise: registered(&self.advertise, ADVERTISE_LABELS),
             direct_links_active: self.direct_links_active(),
@@ -3939,6 +3984,8 @@ pub struct EdgeMetricsBundle {
     pub peer_binding: HashMap<String, u64>,
     /// CIRISEdge#930 — the key-plane listings' cost by `KEY_PLANE_*` label.
     pub key_plane_sweep: HashMap<String, u64>,
+    /// v44 LTS — the persisted-standing refresh by `PERSISTED_STANDING_*` label.
+    pub persisted_standing: HashMap<String, u64>,
     /// CIRISEdge#926 — the link stall guard by `LINK_STALL_*` label.
     pub link_stall: HashMap<String, u64>,
     /// `advertise.<label>`: the advertise sweep's ledger.
@@ -4359,6 +4406,8 @@ impl EdgeMetricsBundle {
         f.family("peer_binding", &self.peer_binding);
         // CIRISEdge#930 — the key-plane listings, `key_plane_sweep.<label>`.
         f.family("key_plane_sweep", &self.key_plane_sweep);
+        // v44 LTS — the persisted-standing refresh, `persisted_standing.<label>`.
+        f.family("persisted_standing", &self.persisted_standing);
         // CIRISEdge#926 — the link stall guard, `link_stall.<label>`.
         f.family("link_stall", &self.link_stall);
         f.family("advertise", &self.advertise);
@@ -4668,6 +4717,7 @@ edge_metrics_bundle_fields!(
     direct_link,
     peer_binding,
     key_plane_sweep,
+    persisted_standing,
     link_stall,
     advertise,
     direct_links_active,

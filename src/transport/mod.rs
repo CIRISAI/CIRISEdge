@@ -196,6 +196,10 @@ pub use lifecycle::SuspendReport;
 #[cfg(feature = "_reticulum-module")]
 pub mod reticulum;
 
+/// v44 LTS — the persisted bindings a restart judges handshakes by.
+#[cfg(feature = "_reticulum-module")]
+pub(crate) mod persisted_standing;
+
 /// CIRISEdge#406 — the hybrid-signed `SignedTransportDestination`
 /// producer + bootstrap for edge's OWN reticulum destination (the #393
 /// item-2 gate's missing producer). Wired by the Reticulum transport,
