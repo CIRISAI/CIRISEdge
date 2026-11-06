@@ -613,8 +613,12 @@ async fn rho_and_the_window_move_the_real_share_and_the_delay() {
         );
         let real = t.b.shaping("link_shaping_frames_real") - real0;
         let cover = t.b.shaping("link_shaping_frames_cover") - cover0;
-        let share = real as f64 / (real + cover).max(1) as f64;
         let budget = t.b.transport.shaping_status().links[0].real_frames_per_window;
+        // The share of the slots the link owned, ρ·λ·W being the budget. Not of
+        // the frames it emitted: a timer lagging on a loaded host emits fewer,
+        // which reads as a larger share, and that measures the host and not ρ.
+        let lambda = budget as f64 / (rho * window_s as f64);
+        let share = real as f64 / (lambda * took.as_secs_f64()).max(1.0);
         eprintln!("[{tag}] rho={rho} W={window_s}s burst of 40 took {took:?}; real share {share:.2} ({real} real / {cover} cover), budget {budget} a window");
         (took, share, budget)
     }
