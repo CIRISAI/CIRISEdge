@@ -503,6 +503,15 @@ fn body(who: &str, seq: u64) -> Vec<u8> {
     b
 }
 
+/// One live call at a time in this binary: these witnesses time a call's own
+/// delivery (the reorder window is 400 ms at most), so a neighbouring call on
+/// the same host must not be what they measure.
+static ONE_CALL: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+async fn one_call() -> tokio::sync::SemaphorePermit<'static> {
+    ONE_CALL.acquire().await.expect("never closed")
+}
+
 /// Collect frames from `rx` until `want` frames of `publisher` arrived.
 async fn collect_from(
     rx: &mut mpsc::Receiver<ReceivedFrame>,
@@ -547,6 +556,7 @@ async fn wait_bound(call: &Call, n: u64) {
 /// call's bounded ask tells it who A is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_late_joiner_asks_for_a_member_it_has_never_heard() {
+    let _call = one_call().await;
     let tag = "late";
     let (nodes, groups, _tmp) = mesh_with(tag, 3, true).await;
     let (a, late) = (&nodes[0], &nodes[2]);
@@ -571,6 +581,7 @@ async fn a_late_joiner_asks_for_a_member_it_has_never_heard() {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_three_member_room_call_over_keyed_links() {
+    let _call = one_call().await;
     let tag = "a8";
     let (nodes, groups, _tmp) = mesh(tag, 3).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
@@ -760,6 +771,7 @@ async fn a_three_member_room_call_over_keyed_links() {
 /// chunks and C hears none of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_removed_member_hears_nothing_after_the_roll() {
+    let _call = one_call().await;
     let tag = "a3";
     let (nodes, groups, _tmp) = mesh(tag, 3).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
@@ -863,6 +875,7 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_member_cannot_forge_another_members_stream_through_a_relay() {
+    let _call = one_call().await;
     use ciris_edge::cohort_scope::CohortScope;
     use ciris_edge::transport::av_call::{call_group_id, call_id_for_room};
     use ciris_edge::transport::av_call_key::stream_epoch_dek;
@@ -1050,6 +1063,7 @@ async fn a_member_cannot_forge_another_members_stream_through_a_relay() {
 /// the keep door is never touched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn budget_keep_refused_and_no_key_door() {
+    let _call = one_call().await;
     let tag = "a7";
     let (nodes, groups, _tmp) = mesh(tag, 2).await;
     let (a, b) = (&nodes[0], &nodes[1]);
@@ -1155,6 +1169,7 @@ async fn budget_keep_refused_and_no_key_door() {
 /// **A2** — joining is membership, refused by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn joining_is_membership_by_name() {
+    let _call = one_call().await;
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let key = Ident::new("node-x-call-a2", 0x71).await;
@@ -1239,6 +1254,7 @@ impl CallRecord for RefusingRecord {
 /// stays live, and frames still flow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_refused_call_row_is_one_event_and_the_call_lives() {
+    let _call = one_call().await;
     let tag = "rr";
     let (nodes, groups, _tmp) = mesh(tag, 2).await;
     let (a, b) = (&nodes[0], &nodes[1]);

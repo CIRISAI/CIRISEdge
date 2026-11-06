@@ -442,21 +442,57 @@ fn body(who: &str, seq: u64) -> Vec<u8> {
     b
 }
 
-/// Collect frames from `rx` until `want` frames of `publisher` arrived.
-async fn collect_from(
+/// How long a witness may look for media that ran undisturbed. A host can be
+/// starved for a while, and a stretch needs a ceiling learned in that spell to
+/// go stale; it cannot be starved for good, so running out is a failure.
+const QUIET_BUDGET: Duration = Duration::from_secs(300);
+
+/// Everything on `nodes` that says media really went missing or a commitment
+/// really moved: what a stretch must not contain for its meters to mean what
+/// a witness says they mean.
+fn disturbances(nodes: &[Node]) -> u64 {
+    nodes
+        .iter()
+        .map(|n| {
+            [
+                "av_chunk_dropped_congested",
+                "av_frame_expired_sender",
+                "av_frame_expired_late",
+                "av_frame_stale_dropped",
+                "alm_shed",
+            ]
+            .iter()
+            .map(|label| av(&n.metrics, label))
+            .sum::<u64>()
+        })
+        .sum()
+}
+
+/// The frames of `want` that arrive from `publisher`, in arrival order, until
+/// all did or 5 s pass with none.
+async fn collect_stretch(
     rx: &mut mpsc::Receiver<ReceivedFrame>,
-    seen: &mut Vec<ReceivedFrame>,
     publisher: &str,
-    want: usize,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while seen.iter().filter(|f| f.publisher == publisher).count() < want {
-        match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(f)) => seen.push(f),
-            _ => return false,
+    want: &[Vec<u8>],
+) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    while got.len() < want.len() {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(f)) if f.publisher == publisher && want.contains(&f.bytes) => got.push(f.bytes),
+            Ok(Some(_)) => {}
+            _ => break,
         }
     }
-    true
+    got
+}
+
+/// One live call at a time in this binary. These witnesses read a call's own
+/// meters, so a neighbouring call on the same host must not be what they
+/// measure: without this, a 4-core runner carries four 3-node calls at once.
+static ONE_CALL: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+async fn one_call() -> tokio::sync::SemaphorePermit<'static> {
+    ONE_CALL.acquire().await.expect("never closed")
 }
 
 async fn wait_legs(call: &Call, n: usize) {
@@ -535,6 +571,7 @@ fn primary_for(
 #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
+    let _call = one_call().await;
     let tag = "alm2-roster";
     // 0 = A, 1 = B, 2 = C (the room); 3 = T (canonical: transport on, no
     // member). B and C dial A; T dials everyone. B and C share nothing.
@@ -593,18 +630,45 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
         "A admitted C for B's stream: {kids:?}"
     );
 
-    // B's frames reach C byte-identical and in order, through A.
+    // B's frames reach C byte-identical and in order, through A. A starved
+    // host really loses frames, and then something counts them: only that
+    // earns another try. Frames gone with nothing to show for it are a bug.
     let mut rx_c = cc.frames().expect("C's frames");
-    let forwarded_before = ca.alm_counts().forwarded;
-    for seq in 0..40 {
-        cb.publish(Frame::opaque(body("b", seq)))
-            .await
-            .expect("B publishes");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let mut seen = Vec::new();
-    let whole = collect_from(&mut rx_c, &mut seen, &b.key.key_id, 40).await;
-    if !whole {
+    let deadline = tokio::time::Instant::now() + QUIET_BUDGET;
+    let mut seq = 0;
+    let forwarded_before = loop {
+        assert!(
+            wait_until(Duration::from_secs(90), || async {
+                primary_for(&cc, cb.stream()).as_deref() == Some(a.key.key_id.as_str())
+            })
+            .await,
+            "C is back on A: {:?}; A's log {:?}",
+            cc.alm_parents(),
+            ca.alm_log()
+        );
+        let from = seq;
+        let forwarded_before = ca.alm_counts().forwarded;
+        let lost_before = disturbances(&nodes);
+        for _ in 0..40 {
+            cb.publish(Frame::opaque(body("b", seq)))
+                .await
+                .expect("B publishes");
+            seq += 1;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let want: Vec<Vec<u8>> = (from..seq).map(|s| body("b", s)).collect();
+        let got = collect_stretch(&mut rx_c, &b.key.key_id, &want).await;
+        let order: Vec<usize> = got
+            .iter()
+            .filter_map(|g| want.iter().position(|w| w == g))
+            .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "byte-identical, in order: {order:?}"
+        );
+        if got == want {
+            break forwarded_before;
+        }
         let plane = |metrics: &EdgeMetrics| {
             let mut v: Vec<(String, u64)> = metrics
                 .av_plane()
@@ -614,15 +678,10 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
             v.sort();
             v
         };
-        let heard: Vec<u64> = seen
-            .iter()
-            .filter(|f| f.publisher == b.key.key_id)
-            .map(|f| f.chunk_seq.0)
-            .collect();
-        panic!(
-            "C heard {} of B's 40 frames: {heard:?}; A forwarded {}; C reorder {:?}; C auth {:?}\n\
+        let context = format!(
+            "C heard {} of B's 40 frames: {order:?}; A forwarded {}; C reorder {:?}; C auth {:?}\n\
              plane B {:?}\nplane A {:?}\nplane C {:?}",
-            heard.len(),
+            got.len(),
             ca.alm_counts().forwarded - forwarded_before,
             cc.reorder_counts(),
             cc.chunk_auth_counts(),
@@ -630,18 +689,19 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
             plane(&a.metrics),
             plane(&c.metrics),
         );
-    }
-    let got: Vec<Vec<u8>> = seen
-        .iter()
-        .filter(|f| f.publisher == b.key.key_id)
-        .map(|f| f.bytes.clone())
-        .collect();
-    let want: Vec<Vec<u8>> = (0..40).map(|s| body("b", s)).collect();
-    assert_eq!(got, want, "byte-identical, in order");
+        assert!(
+            disturbances(&nodes) > lost_before,
+            "frames lost with nothing counting them: {context}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no whole stretch: {context}"
+        );
+    };
     assert!(ca.alm_counts().forwarded - forwarded_before >= 40);
     assert!(av(&a.metrics, "alm_c3_received") > 0 && av(&c.metrics, "alm_c3_sent") > 0);
     eprintln!(
-        "[ALM2] roster relay: C<-A<-B 40/40, A forwarded {}, A admitted {}, C3 sent by C {}, log(A)={}",
+        "[ALM2] roster relay: C<-A<-B 40/40 after {seq} sent, A forwarded {}, A admitted {}, C3 sent by C {}, log(A)={}",
         ca.alm_counts().forwarded - forwarded_before,
         ca.alm_counts().admitted,
         av(&c.metrics, "alm_c3_sent"),
@@ -668,6 +728,7 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
 /// for A's stream by name, `load_refuse:admit_closed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn c3_admits_and_a_closed_relay_refuses_by_name() {
+    let _call = one_call().await;
     let tag = "alm2-c3";
     let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
@@ -755,6 +816,7 @@ async fn c3_admits_and_a_closed_relay_refuses_by_name() {
 /// arrive. Media between C3 peers rides timed Channel frames.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn stale_media_is_dropped_by_age_and_the_hop_recovers() {
+    let _call = one_call().await;
     let tag = "alm2-stale";
     let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
     let (a, b) = (&nodes[0], &nodes[1]);
@@ -845,6 +907,7 @@ async fn stale_media_is_dropped_by_age_and_the_hop_recovers() {
 /// resend, B gets no ADMIT at all, times out and withdraws.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_refused_admit_is_resent_not_withdrawn() {
+    let _call = one_call().await;
     let tag = "alm2-resend";
     let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
     let (a, b) = (&nodes[0], &nodes[1]);
@@ -887,6 +950,13 @@ fn degraded_lines(call: &Call, peer: &str) -> Vec<String> {
         .collect()
 }
 
+/// `peer`'s latest C7 state in `call`'s log (value 1 is `Degraded`).
+fn last_state(call: &Call, peer: &str) -> Option<i64> {
+    log_lines(&call.alm_log().2, "PeerState", peer)
+        .last()
+        .map(|l| l.1)
+}
+
 /// Keep `call`'s frame queue moving, and report the newest epoch heard.
 fn drain(call: &mut Call) -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
     let mut rx = call.frames().expect("the call's frames");
@@ -907,6 +977,7 @@ fn drain(call: &mut Call) -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
 /// 1.0 and the C7 log shows A going Degraded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn an_epoch_roll_reads_as_a_resync_on_a_live_link() {
+    let _call = one_call().await;
     let tag = "alm2-roll";
     let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
     let (a, b) = (&nodes[0], &nodes[1]);
@@ -969,78 +1040,35 @@ async fn an_epoch_roll_reads_as_a_resync_on_a_live_link() {
 /// that path it never owed. Mutation: reading them as loss puts C in Degraded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_layered_standby_is_not_read_as_lossy_on_a_live_call() {
+    let _call = one_call().await;
     let tag = "alm2-layered";
     let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
-    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
-    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
-    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
-    let mut cc = join_loaded(c, &groups[2], tag, relay_opts(), None).await;
-    wait_legs(&ca, 2).await;
-    wait_legs(&cb, 2).await;
-    wait_legs(&cc, 2).await;
-    wait_bound(&cb, 2).await;
-    wait_bound(&cc, 2).await;
-    let (_, task_b) = drain(&mut cb);
-    let (_, task_c) = drain(&mut cc);
-    let layer = |base: bool, seq: u64| Frame {
-        codec_id: CODEC_AV1_SVC,
-        layer: if base {
-            ChunkLayer::BASE
-        } else {
-            ChunkLayer {
-                spatial: 1,
-                temporal: 0,
-                quality: 0,
-            }
-        },
-        bytes: body("a", seq),
-    };
-    // Media until C is B's standby, then long enough for its meter to read.
-    // Evenly spaced: a pair sent back to back into a Channel window is
-    // refused as Congested (#591), and real loss is not what this is about.
-    let mut standby_from = None;
-    for k in 0..4_000u64 {
-        ca.publish(layer(k % 2 == 0, k)).await.expect("publish");
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        let parents = cb.alm_parents();
-        let p = parents.iter().find(|p| p.stream == ca.stream());
-        let on = p.is_some_and(|p| {
-            p.primary.as_deref() == Some(a.key.key_id.as_str())
-                && p.standby.as_deref() == Some(c.key.key_id.as_str())
-        });
-        if on && standby_from.is_none() {
-            standby_from = Some((k, cc.alm_counts().forwarded));
-        }
-        if standby_from.is_some_and(|(at, _)| k >= at + 300) {
-            break;
-        }
-    }
-    let (_, forwarded_from) = standby_from.unwrap_or_else(|| {
-        panic!(
-            "C became B's standby: {:?} {:?}",
-            cb.alm_parents(),
-            cb.alm_log()
-        )
-    });
-    let forwarded = cc.alm_counts().forwarded - forwarded_from;
-    let lines = degraded_lines(&cb, &c.key.key_id);
-    let congested =
-        av(&a.metrics, "av_chunk_dropped_congested") + av(&c.metrics, "av_chunk_dropped_congested");
+    let mut call = layered_call(&nodes, &groups, tag, None).await;
+    let quiet = call.quiet_stretch(&nodes, 300, true).await;
     eprintln!(
-        "[ALM2] layered standby: C forwarded {forwarded} of 150 base chunks, Degraded lines {}, \
-         congested {congested}, shed {}",
-        lines.len(),
-        ca.alm_counts().shed
+        "[ALM2] layered standby: C forwarded {} of 150 base chunks, Degraded lines {}, after {} sheds",
+        quiet.forwarded,
+        quiet.standby.len(),
+        call.ca.alm_counts().shed
     );
-    assert_eq!(congested, 0, "the premise: nothing really lost");
-    assert_eq!(ca.alm_counts().shed, 0, "the premise: nobody shed");
     assert!(
-        forwarded >= 140,
-        "C really carried the base layer: {forwarded}"
+        quiet.forwarded >= 140,
+        "C really carried the base layer: {}",
+        quiet.forwarded
     );
-    assert_eq!(lines, Vec::<String>::new(), "{:?}", cb.alm_log());
-    task_b.abort();
-    task_c.abort();
+    assert_eq!(
+        quiet.standby,
+        Vec::<String>::new(),
+        "{:?}",
+        call.cb.alm_log()
+    );
+    assert_eq!(
+        quiet.primary,
+        Vec::<String>::new(),
+        "{:?}",
+        call.cb.alm_log()
+    );
+    call.abort();
 }
 
 /// Publish A's stream (base, then an enhancement layer) until C is B's
@@ -1050,13 +1078,17 @@ async fn a_layered_standby_is_not_read_as_lossy_on_a_live_call() {
 async fn layered_until_standby(
     ca: &mut Call,
     cb: &Call,
+    cc: &Call,
     a: &str,
     c: &str,
     from: &mut u64,
     settle: u64,
 ) {
     let mut standby_from = None;
-    for _ in 0..4_000u64 {
+    // A ceiling learned twice stands 60 s after its last congested window, a
+    // third time 120 s, and until it goes A has no room for a second child.
+    let deadline = tokio::time::Instant::now() + QUIET_BUDGET;
+    while tokio::time::Instant::now() < deadline {
         let k = *from;
         *from += 1;
         ca.publish(layered("a", k)).await.expect("publish");
@@ -1073,9 +1105,18 @@ async fn layered_until_standby(
         }
     }
     panic!(
-        "C became B's standby: {:?} {:?}",
+        "C became B's standby: {:?} {:?}\nA's children {:?} committed {:?} counts {:?} log {:?}\n\
+         C's parents {:?} forwards {:?} counts {:?} log {:?}",
         cb.alm_parents(),
-        cb.alm_log()
+        cb.alm_log(),
+        ca.alm_own_children(),
+        ca.alm_committed(),
+        ca.alm_counts(),
+        ca.alm_log().2,
+        cc.alm_parents(),
+        cc.alm_relay_children(ca.stream()),
+        cc.alm_counts(),
+        cc.alm_log().2,
     );
 }
 
@@ -1096,16 +1137,25 @@ fn layered(who: &str, k: u64) -> Frame {
     }
 }
 
-/// `tail`'s C7 line of `kind` about `peer`, with its time and value.
-fn log_line(tail: &str, kind: &str, peer: &str) -> Option<(u64, i64, String)> {
+/// `tail`'s C7 lines of `kind` about `peer`, each with its time and value.
+fn log_lines(tail: &str, kind: &str, peer: &str) -> Vec<(u64, i64, String)> {
     let subject = format!("subj=Some({peer:?}) v=");
     tail.lines()
         .filter(|l| l.contains(&format!(" {kind} ")) && l.contains(&subject))
-        .find_map(|l| {
+        .filter_map(|l| {
             let at = l.strip_prefix("t=")?.split(' ').next()?.parse().ok()?;
             let value = l.split(&subject).nth(1)?.split(' ').next()?.parse().ok()?;
             Some((at, value, l.to_owned()))
         })
+        .collect()
+}
+
+/// The time of `tail`'s newest C7 line.
+fn newest_line_at(tail: &str) -> u64 {
+    tail.lines()
+        .filter_map(|l| l.strip_prefix("t=")?.split(' ').next()?.parse().ok())
+        .max()
+        .unwrap_or(0)
 }
 
 /// **CIRISEdge#945 finding A, on real links.** B's primary is A, its standby
@@ -1115,6 +1165,7 @@ fn log_line(tail: &str, kind: &str, peer: &str) -> Option<(u64, i64, String)> {
 /// a dead parent until silence made it Suspected (v=2), at 1.5 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_closed_primary_link_fails_over_on_a_live_call() {
+    let _call = one_call().await;
     const DOWN: i64 = 3;
     const SUSPECT_SILENCE_MS: u64 = 1_500;
     let tag = "alm2-link-close";
@@ -1131,8 +1182,10 @@ async fn a_closed_primary_link_fails_over_on_a_live_call() {
     let (_, task_b) = drain(&mut cb);
     let (_, task_c) = drain(&mut cc);
     let mut k = 0;
-    layered_until_standby(&mut ca, &cb, &a.key.key_id, &c.key.key_id, &mut k, 60).await;
+    layered_until_standby(&mut ca, &cb, &cc, &a.key.key_id, &c.key.key_id, &mut k, 60).await;
 
+    // Only what follows the close: a starved host may have marked anything.
+    let closed_at = newest_line_at(&cb.alm_log().2);
     ca.close_leg_for_test(&b.key.key_id).await;
     let mut moved = false;
     for _ in 0..300 {
@@ -1145,11 +1198,14 @@ async fn a_closed_primary_link_fails_over_on_a_live_call() {
         }
     }
     let log = cb.alm_log().2;
-    let (down_at, _, _) = log_line(&log, "PeerState", &a.key.key_id)
-        .filter(|l| l.1 == DOWN)
+    let (down_at, _, _) = log_lines(&log, "PeerState", &a.key.key_id)
+        .into_iter()
+        .find(|l| l.0 >= closed_at && l.1 == DOWN)
         .unwrap_or_else(|| panic!("the close marked A Down: {log}"));
-    let (failover_at, state, line) =
-        log_line(&log, "Failover", &a.key.key_id).unwrap_or_else(|| panic!("B failed over: {log}"));
+    let (failover_at, state, line) = log_lines(&log, "Failover", &a.key.key_id)
+        .into_iter()
+        .find(|l| l.0 >= closed_at)
+        .unwrap_or_else(|| panic!("B failed over: {log}"));
     eprintln!(
         "[ALM2] link close: failover {} ms after the close, in state {state}: {line}",
         failover_at - down_at
@@ -1168,9 +1224,19 @@ async fn a_closed_primary_link_fails_over_on_a_live_call() {
 struct Layered {
     ca: Call,
     cb: Call,
-    _cc: Call,
+    cc: Call,
     tasks: [tokio::task::JoinHandle<()>; 2],
     k: u64,
+}
+
+/// What a stretch of undisturbed media showed.
+struct Stretch {
+    /// B's new `Degraded` lines about its primary, A.
+    primary: Vec<String>,
+    /// B's new `Degraded` lines about its standby, C.
+    standby: Vec<String>,
+    /// Chunks the relay C forwarded.
+    forwarded: u64,
 }
 
 async fn layered_call(nodes: &[Node], groups: &[CohortGroup], tag: &str, load: Load) -> Layered {
@@ -1186,11 +1252,11 @@ async fn layered_call(nodes: &[Node], groups: &[CohortGroup], tag: &str, load: L
     let (_, task_b) = drain(&mut cb);
     let (_, task_c) = drain(&mut cc);
     let mut k = 0;
-    layered_until_standby(&mut ca, &cb, &a.key.key_id, &c.key.key_id, &mut k, 90).await;
+    layered_until_standby(&mut ca, &cb, &cc, &a.key.key_id, &c.key.key_id, &mut k, 90).await;
     Layered {
         ca,
         cb,
-        _cc: cc,
+        cc,
         tasks: [task_b, task_c],
         k,
     }
@@ -1216,6 +1282,58 @@ impl Layered {
             t.abort();
         }
     }
+
+    /// `n` chunks that ran undisturbed, and what B's meters read over them. A
+    /// loaded host really loses media and really sheds (the congestion
+    /// controller doing its work), so a call's lifetime counters say nothing
+    /// about these paths: the witness is the stretch where nothing was lost,
+    /// nobody moved (`parents_stay`: B on A with C its standby throughout)
+    /// and neither path started out `Degraded`, which is how a misreading
+    /// could otherwise hide in an earlier line. Running out of
+    /// [`QUIET_BUDGET`] fails, so a path that never reads clean stays red.
+    async fn quiet_stretch(&mut self, nodes: &[Node], n: u64, parents_stay: bool) -> Stretch {
+        const DEGRADED: i64 = 1;
+        let (a, c) = (nodes[0].key.key_id.clone(), nodes[2].key.key_id.clone());
+        let deadline = tokio::time::Instant::now() + QUIET_BUDGET;
+        loop {
+            if parents_stay {
+                layered_until_standby(&mut self.ca, &self.cb, &self.cc, &a, &c, &mut self.k, 0)
+                    .await;
+            }
+            let disturbed = disturbances(nodes);
+            let (from_a, from_c) = (degraded_lines(&self.cb, &a), degraded_lines(&self.cb, &c));
+            let forwarded = self.cc.alm_counts().forwarded;
+            let clean_start = last_state(&self.cb, &a) != Some(DEGRADED)
+                && last_state(&self.cb, &c) != Some(DEGRADED);
+            self.publish(n).await;
+            let parents = self.cb.alm_parents();
+            let p = parents.iter().find(|p| p.stream == self.ca.stream());
+            let stayed = !parents_stay
+                || p.is_some_and(|p| {
+                    p.primary.as_deref() == Some(a.as_str())
+                        && p.standby.as_deref() == Some(c.as_str())
+                });
+            if clean_start && stayed && disturbances(nodes) == disturbed {
+                let fresh = |before: &[String], peer: &str| -> Vec<String> {
+                    degraded_lines(&self.cb, peer)
+                        .into_iter()
+                        .filter(|l| !before.contains(l))
+                        .collect()
+                };
+                return Stretch {
+                    primary: fresh(&from_a, &a),
+                    standby: fresh(&from_c, &c),
+                    forwarded: self.cc.alm_counts().forwarded - forwarded,
+                };
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no undisturbed stretch of {n} chunks: disturbances {}, parents {parents:?}, B's log {:?}",
+                disturbances(nodes),
+                self.cb.alm_log()
+            );
+        }
+    }
 }
 
 /// **CIRISEdge#945 finding B, on a live call.** A caps B's leg at the base
@@ -1224,6 +1342,7 @@ impl Layered {
 /// fix each gap read as loss, about 0.5, and A went Degraded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_capped_primary_is_not_read_as_lossy_on_a_live_call() {
+    let _call = one_call().await;
     let tag = "alm2-capped";
     let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
     let (a, b) = (&nodes[0], &nodes[1]);
@@ -1232,17 +1351,18 @@ async fn a_capped_primary_is_not_read_as_lossy_on_a_live_call() {
         .set_layer_policy(&b.key.key_id, ReceiverLayerPolicy::BLINKING_DOT)
         .await
         .expect("A caps B");
-    call.publish(300).await;
-    let lines = degraded_lines(&call.cb, &a.key.key_id);
-    let congested = av(&a.metrics, "av_chunk_dropped_congested");
-    let parents = call.cb.alm_parents();
-    let p = parents.iter().find(|p| p.stream == call.ca.stream());
+    let quiet = call.quiet_stretch(&nodes, 300, true).await;
     eprintln!(
-        "[ALM2] capped primary: Degraded lines {}, congested {congested}, parents {p:?}",
-        lines.len()
+        "[ALM2] capped primary: Degraded lines {}, after {} sheds",
+        quiet.primary.len(),
+        call.ca.alm_counts().shed
     );
-    assert_eq!(congested, 0, "the premise: nothing really lost");
-    assert_eq!(lines, Vec::<String>::new(), "{:?}", call.cb.alm_log());
+    assert_eq!(
+        quiet.primary,
+        Vec::<String>::new(),
+        "{:?}",
+        call.cb.alm_log()
+    );
     assert_eq!(
         primary_for(&call.cb, call.ca.stream()).as_deref(),
         Some(a.key.key_id.as_str()),
@@ -1257,9 +1377,9 @@ async fn a_capped_primary_is_not_read_as_lossy_on_a_live_call() {
 /// loss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_publisher_at_tier_two_is_not_read_as_lossy_on_a_live_call() {
+    let _call = one_call().await;
     let tag = "alm2-tier2";
     let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
-    let (a, c) = (&nodes[0], &nodes[2]);
     let ladder = Arc::new(ciris_edge::load_ladder::SharedLadder::default());
     let mut call = layered_call(&nodes, &groups, tag, Some(Arc::clone(&ladder))).await;
     assert_eq!(
@@ -1273,18 +1393,24 @@ async fn a_publisher_at_tier_two_is_not_read_as_lossy_on_a_live_call() {
         .await,
         "A reads tier 2"
     );
-    call.publish(300).await;
-    let (primary, standby) = (
-        degraded_lines(&call.cb, &a.key.key_id),
-        degraded_lines(&call.cb, &c.key.key_id),
-    );
+    let quiet = call.quiet_stretch(&nodes, 300, false).await;
     eprintln!(
         "[ALM2] tier 2: Degraded lines primary {} standby {}",
-        primary.len(),
-        standby.len()
+        quiet.primary.len(),
+        quiet.standby.len()
     );
-    assert_eq!(primary, Vec::<String>::new(), "{:?}", call.cb.alm_log());
-    assert_eq!(standby, Vec::<String>::new(), "{:?}", call.cb.alm_log());
+    assert_eq!(
+        quiet.primary,
+        Vec::<String>::new(),
+        "{:?}",
+        call.cb.alm_log()
+    );
+    assert_eq!(
+        quiet.standby,
+        Vec::<String>::new(),
+        "{:?}",
+        call.cb.alm_log()
+    );
     call.abort();
 }
 
@@ -1294,16 +1420,37 @@ async fn a_publisher_at_tier_two_is_not_read_as_lossy_on_a_live_call() {
 /// dropping base must read lossy. Mutation: without that reading it is clean.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_primary_dropping_base_is_read_as_lossy_on_a_live_call() {
+    let _call = one_call().await;
     let tag = "alm2-drops-base";
     let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
     let (a, b) = (&nodes[0], &nodes[1]);
     let mut call = layered_call(&nodes, &groups, tag, None).await;
-    // Every fourth seq: half the even, base ones, and no enhancement chunk.
-    call.ca.withhold_from_for_test(&b.key.key_id, 4);
-    call.publish(300).await;
-    let lines = degraded_lines(&call.cb, &a.key.key_id);
-    eprintln!("[ALM2] dropping base: Degraded lines {}", lines.len());
-    assert!(!lines.is_empty(), "{:?}", call.cb.alm_log());
+    // Reads lossy from a clean start, over media that lost nothing but what
+    // A withheld: real congestion reading lossy would prove nothing.
+    let deadline = tokio::time::Instant::now() + QUIET_BUDGET;
+    loop {
+        call.ca.withhold_from_for_test(&b.key.key_id, 0);
+        let _ = call.quiet_stretch(&nodes, 120, true).await;
+        let before = degraded_lines(&call.cb, &a.key.key_id);
+        let disturbed = disturbances(&nodes);
+        // Every fourth seq: half the even, base ones, and no enhancement chunk.
+        call.ca.withhold_from_for_test(&b.key.key_id, 4);
+        call.publish(300).await;
+        let lines: Vec<String> = degraded_lines(&call.cb, &a.key.key_id)
+            .into_iter()
+            .filter(|l| !before.contains(l))
+            .collect();
+        if disturbances(&nodes) == disturbed {
+            eprintln!("[ALM2] dropping base: Degraded lines {}", lines.len());
+            assert!(!lines.is_empty(), "{:?}", call.cb.alm_log());
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no undisturbed stretch: {:?}",
+            call.cb.alm_log()
+        );
+    }
     call.abort();
 }
 
@@ -1316,6 +1463,7 @@ async fn a_primary_dropping_base_is_read_as_lossy_on_a_live_call() {
 #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn a_member_claiming_depth_zero_is_not_the_publisher() {
+    let _call = one_call().await;
     let tag = "alm2-depth0";
     // 0 = R, 1 = P, 2 = C, 3 = F (the room); 4 = T (transport only). P and C
     // dial R, F dials C, T dials everyone.
@@ -1334,6 +1482,7 @@ async fn a_member_claiming_depth_zero_is_not_the_publisher() {
     let cf = join_loaded(f, &groups[3], tag, CallOptions::default(), None).await;
     wait_legs(&cr, 2).await;
     wait_legs(&cc, 2).await;
+    wait_legs(&cp, 1).await;
     assert_eq!(cc.legs().len(), 2, "C reaches R and F: {:?}", cc.legs());
     assert!(
         wait_until(Duration::from_secs(30), || async {
