@@ -119,6 +119,47 @@ impl Ident {
     }
 }
 
+type Registries =
+    Arc<std::sync::Mutex<HashMap<String, Arc<crate::replication::registry::ReplicationRegistry>>>>;
+struct Loopback {
+    me: String,
+    registries: Registries,
+}
+#[async_trait::async_trait]
+impl crate::transport::Transport for Loopback {
+    fn id(&self) -> crate::transport::TransportId {
+        crate::transport::TransportId::HTTP
+    }
+    async fn send(
+        &self,
+        destination_key_id: &str,
+        envelope_bytes: &[u8],
+    ) -> Result<crate::transport::TransportSendOutcome, crate::transport::TransportError> {
+        let dest = self
+            .registries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(destination_key_id)
+            .cloned();
+        let Some(dest) = dest else {
+            return Err(crate::transport::TransportError::Io(format!(
+                "no node {destination_key_id}"
+            )));
+        };
+        let (me, bytes) = (self.me.clone(), envelope_bytes.to_vec());
+        tokio::spawn(async move {
+            let _ = dest.route_inbound_bytes(&me, &bytes).await;
+        });
+        Ok(crate::transport::TransportSendOutcome::Delivered)
+    }
+    async fn listen(
+        &self,
+        _sink: tokio::sync::mpsc::Sender<crate::transport::InboundFrame>,
+    ) -> Result<(), crate::transport::TransportError> {
+        Ok(())
+    }
+}
+
 /// One node: its substrate, content store, engine key (the node), its owner.
 struct Node {
     dir: Arc<SqliteBackend>,
@@ -338,52 +379,11 @@ async fn an_occurrence_refused_before_its_binding_is_re_asked_when_the_binding_l
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // two runtimes and a loopback, one sequence on purpose
 async fn the_release_kicks_a_re_ask_of_the_peer_that_offered_the_row_776() {
-    use crate::replication::registry::ReplicationRegistry;
     use crate::replication::{
         self_publish_set, ReplicationPeer, ReplicationRuntime, ReplicationRuntimeConfig,
         SchedulerConfig,
     };
-    use crate::transport::{
-        InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
-    };
-
-    type Registries = Arc<std::sync::Mutex<HashMap<String, Arc<ReplicationRegistry>>>>;
-    struct Loopback {
-        me: String,
-        registries: Registries,
-    }
-    #[async_trait::async_trait]
-    impl Transport for Loopback {
-        fn id(&self) -> TransportId {
-            TransportId::HTTP
-        }
-        async fn send(
-            &self,
-            destination_key_id: &str,
-            envelope_bytes: &[u8],
-        ) -> Result<TransportSendOutcome, TransportError> {
-            let dest = self
-                .registries
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(destination_key_id)
-                .cloned();
-            let Some(dest) = dest else {
-                return Err(TransportError::Io(format!("no node {destination_key_id}")));
-            };
-            let (me, bytes) = (self.me.clone(), envelope_bytes.to_vec());
-            tokio::spawn(async move {
-                let _ = dest.route_inbound_bytes(&me, &bytes).await;
-            });
-            Ok(TransportSendOutcome::Delivered)
-        }
-        async fn listen(
-            &self,
-            _sink: tokio::sync::mpsc::Sender<InboundFrame>,
-        ) -> Result<(), TransportError> {
-            Ok(())
-        }
-    }
+    use crate::transport::Transport;
 
     let owner = Ident::new("person-o-776k", 0x81);
     let dev = Ident::new("node-d-776k", 0x82);
@@ -473,6 +473,149 @@ async fn the_release_kicks_a_re_ask_of_the_peer_that_offered_the_row_776() {
             "D's occurrence was not re-asked within {bound_by:?} of its binding landing: \
              the release did not kick a round toward the peer that offered it \
              (CIRISEdge#776)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    rt_x.shutdown().await;
+    rt_d.shutdown().await;
+}
+
+/// A route row `signer` signed for itself.
+async fn signed_route(
+    signer: &Ident,
+) -> ciris_persist::federation::self_at_login::SignedTransportDestination {
+    use ciris_persist::federation::self_at_login::{
+        BindingProvenance, SignedTransportDestination, TransportDestination,
+    };
+    let row = TransportDestination {
+        occurrence_key_id: signer.key_id.clone(),
+        transport_kind: "reticulum".to_owned(),
+        destination: "a0".repeat(16),
+        asserted_at: ts(),
+        last_seen_at: None,
+        transport_ed25519_pubkey_base64: Some(B64.encode([0xbb; 32])),
+        transport_x25519_pubkey_base64: Some(B64.encode([0xcc; 32])),
+        binding_provenance: BindingProvenance::Rooted,
+        epoch: 1,
+        retired_at: None,
+    };
+    let envelope = serde_json::to_value(&row).expect("route");
+    let canonical = ciris_verify_core::jcs::canonicalize(&envelope).expect("jcs");
+    let (ed, pqc) = crate::identity::sign_bound_hybrid(&signer.signer(), &canonical, "route")
+        .await
+        .expect("sign");
+    SignedTransportDestination {
+        attesting_key_id: signer.key_id.clone(),
+        transport_destination: row,
+        signed_envelope: envelope,
+        signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+            ed25519_signature_base64: ed,
+            mldsa65_signature_base64: pqc,
+        },
+    }
+}
+
+/// **`FSD/EVENT_PATH_MODEL.md` §1.5, on a plane with a cursor.** Only four
+/// planes keep one, and past one page a release alone does not bring a row
+/// back: the kicked round's Summary is head plus a page, and the row is behind
+/// the watermark, so it waits for the re-sweep. With the cadence an hour, only
+/// the round the release kicks can bring this row in time, by hash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_released_behind_the_watermark_is_fetched_at_once_776() {
+    use crate::replication::{
+        self_publish_set, ReplicationPeer, ReplicationRuntime, ReplicationRuntimeConfig,
+        SchedulerConfig,
+    };
+    let owner = Ident::new("person-o-776f", 0x91);
+    let dev = Ident::new("node-d-776f", 0x92);
+    let watcher_owner = Ident::new("person-w-776f", 0x93);
+    let watcher_dev = Ident::new("node-x-776f", 0x94);
+    let signer = Ident::new("node-s-776f", 0x95);
+    let d = device(&[&owner, &signer], &owner, &dev).await;
+    let x = device(&[&owner, &watcher_owner], &watcher_owner, &watcher_dev).await;
+    let route = signed_route(&signer).await;
+    d.dir
+        .put_signed_transport_destination(&route)
+        .await
+        .expect("D holds the signer's route");
+    let registries: Registries = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let start = |node: &Node, peer: &str, publish: Option<Vec<String>>| {
+        let registries = Arc::clone(&registries);
+        let dir = Arc::clone(&node.dir);
+        let me = node.me.clone();
+        let peer = peer.to_owned();
+        async move {
+            let rt = ReplicationRuntime::start(
+                dir as Arc<dyn FederationDirectory>,
+                Arc::new(Loopback {
+                    me: me.clone(),
+                    registries: Arc::clone(&registries),
+                }) as Arc<dyn crate::transport::Transport>,
+                vec![ReplicationPeer {
+                    peer_key_id: peer,
+                    kind: EnvelopeKind::TransportDestination,
+                }],
+                ReplicationRuntimeConfig {
+                    scheduler: SchedulerConfig {
+                        cadence: Duration::from_secs(3600),
+                        round_timeout: Duration::from_secs(5),
+                        ..SchedulerConfig::default()
+                    },
+                    local_key_id: Some(me.clone()),
+                    bridge: BridgeConfig {
+                        sweep_page_rows: 1,
+                        ..BridgeConfig::default()
+                    },
+                    ..ReplicationRuntimeConfig::default()
+                },
+                publish.map(self_publish_set),
+            )
+            .await;
+            registries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(me, rt.registry());
+            rt
+        }
+    };
+    let publish = vec![d.me.clone(), owner.key_id.clone(), signer.key_id.clone()];
+    let mut rt_d = start(&d, &x.me, Some(publish)).await;
+    let mut rt_x = start(&x, &d.me, None).await;
+
+    // X asks D: the route's signer is not held at X, so the row parks.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while rt_x.bridge().parked_on_signer_len() == 0 {
+        rt_x.round_now(&d.me).await.expect("kick X → D");
+        assert!(
+            Instant::now() < deadline,
+            "precondition: X parked the route on its absent signer"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The signer's Key lands locally, and the host releases what waited on it.
+    x.dir
+        .put_public_key(SignedKeyRecord {
+            record: signer.record().await,
+        })
+        .await
+        .expect("the signer's key at X");
+    let released_at = Instant::now();
+    assert!(rt_x.release_signer(&signer.key_id) >= 1, "the row released");
+    let bound_by = Duration::from_secs(5);
+    loop {
+        let held = x
+            .dir
+            .list_transport_destinations_for(&signer.key_id)
+            .await
+            .unwrap_or_default();
+        if !held.is_empty() {
+            break;
+        }
+        assert!(
+            released_at.elapsed() < bound_by,
+            "the released row was not fetched within {bound_by:?}: past a page a release \
+             alone waits for the re-sweep (CIRISEdge#776)"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

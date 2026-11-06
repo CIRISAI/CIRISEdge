@@ -244,6 +244,26 @@ namespace ciris_edge {
 
     [Throws=EdgeBindingsError]
     sequence<EdgeReverseEntry> routing_reverse_table();
+
+    // v44 (CC 5.4.3 / 5.4.6) — link shaping and the Anonymous Tier for the
+    // mobile host. The host reports its device facts whenever they change
+    // (Wi-Fi <-> cellular, plugged in <-> battery); the shaping class and the
+    // relay policy follow, and the person's opt-in is kept across the change.
+    // `shaping_class_table` is the per-class default and its monthly cost,
+    // for the client to show at the moment of choosing.
+    [Throws=EdgeBindingsError]
+    u32 shaping_set_device_state(EdgeDeviceState state);
+
+    [Throws=EdgeBindingsError]
+    EdgeShapingStatus shaping_status();
+
+    sequence<EdgeShapingClassInfo> shaping_class_table();
+
+    [Throws=EdgeBindingsError]
+    void onion_set_enabled(boolean enabled);
+
+    [Throws=EdgeBindingsError]
+    EdgeOnionStatus onion_status();
 };
 
 // ─── Error type ─────────────────────────────────────────────────────
@@ -509,4 +529,56 @@ dictionary EdgeReverseEntry {
     bytes source_hash;
     bytes destination_hash;
     string last_seen_at;
+};
+
+// ─── v44 shaping + Anonymous Tier (CC 5.4.3 / 5.4.6) ───────────────
+
+dictionary EdgeDeviceState {
+    // "server" | "home" | "phone"
+    string device_kind;
+    // on Wi-Fi / Ethernet (a phone that is not is on cellular)
+    boolean unmetered;
+    boolean charging;
+    // the person's opt-in to shaping every link at their class, on Wi-Fi for
+    // a phone
+    boolean shaping_opt_in;
+    // the same for a phone on cellular, its own class with its own cost: off
+    // with shaping_opt_in on is shaping on Wi-Fi only
+    boolean shaping_opt_in_cellular;
+    // no listener, so no slot to give and never referred (every v44 phone)
+    boolean client_only;
+    // the person's relay override, either way (null follows the policy)
+    boolean? relay_override;
+};
+
+dictionary EdgeShapingStatus {
+    string budget_class;
+    // shaping every identity link (else only onion layer links)
+    boolean all_links;
+    u32 bytes_per_s;
+    u32 node_cap_bytes_per_s;
+    u32 shaped_links;
+    u32 layer_reserve_links;
+};
+
+dictionary EdgeShapingClassInfo {
+    string budget_class;
+    boolean on_by_default;
+    u32 bytes_per_s;
+    double gb_month_per_link_each_way;
+    double gb_month_at_cap_each_way;
+};
+
+dictionary EdgeOnionStatus {
+    boolean enabled;
+    boolean active;
+    string? reason;
+    sequence<u32> dealt;
+    sequence<u32> answering;
+    boolean relaying;
+    string? relay_reason;
+    boolean small_set;
+    string hop_key_source;
+    // while active this node is confined to the row plane: no call, no stream
+    boolean confines_media;
 };

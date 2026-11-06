@@ -1784,13 +1784,13 @@ pub(crate) mod tests {
     /// alice (a person) with a personal phone and a server-class node she
     /// claimed, her family `fam-763` (alice alone), and mallory with a phone
     /// of her own. Real persist rows, so the audience is persist's.
-    pub(crate) async fn cohort_directory_763() -> Arc<ciris_persist::store::MemoryBackend> {
+    pub(crate) async fn cohort_directory_763() -> Arc<ciris_persist::store::SqliteBackend> {
         use crate::replication::bridge::tests::{
             fixture_family_founded, register_fixture_keys, seed_device_occurrence,
             seed_owner_binding, sign_family_fixture,
         };
         use ciris_persist::federation::types::{device_class, identity_type};
-        let backend = Arc::new(ciris_persist::store::MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[

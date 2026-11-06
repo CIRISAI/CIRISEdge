@@ -1149,7 +1149,7 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
             })
             .collect(),
         founded_at: ts(),
-        consensus_protocol: "founder_only".to_owned(),
+        consensus_protocol: "majority".to_owned(),
         policy_blob: None,
         persist_row_hash: String::new(),
         prev_head_digest: String::new(),
@@ -6710,16 +6710,19 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     // ── 6. The epoch rotates; a member granted only at e1 cannot read e0. ──
     let alice_signer = edge_signer_for(&alice);
     let now = chrono::Utc::now();
+    // persist v61 (#1123, CC 4.5.13): under `majority` a removal takes the
+    // room's votes; erin's own RESIGNATION is hers alone, and it rotates the
+    // DEK the same way.
     let removal = ciris_edge::community_roster::community_membership_revocation(
         ROOM,
         &erin.key_id,
         now,
         None,
         &[],
-        &alice_signer,
+        &edge_signer_for(&erin),
     )
     .await
-    .expect("the founder signs erin's removal");
+    .expect("erin signs her resignation");
     for n in nodes {
         n.dir
             .put_community_membership_revocation(removal.clone())
@@ -6758,7 +6761,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
                 .expect("the consent rows cross");
         }
     }
-    let (member_d, spec_d) = ciris_edge::community_roster::community_membership_widening(
+    let (member_d, mut spec_d) = ciris_edge::community_roster::community_membership_widening(
         &*node_a.dir,
         ROOM,
         &dave.key_id,
@@ -6768,11 +6771,52 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     )
     .await
     .expect("the founder signs dave's widening");
+    // persist v61 (#1123): one voice never widens a room above the family —
+    // under `majority`, bob and carol co-sign the same widening envelope.
+    {
+        let widening = ciris_persist::federation::CommunityMembershipWidening {
+            community_key_id: ROOM.to_owned(),
+            member_key_id: member_d.key_id.clone(),
+            joined_at: member_d.joined_at,
+            effective_at: member_d.joined_at,
+            role: member_d.role.clone(),
+            persist_row_hash: String::new(),
+        };
+        let canonical =
+            ciris_persist::prelude::ceg_produce_canonicalize(&widening.signing_envelope())
+                .expect("canonicalize the widening");
+        // bob AND carol: the fold counts the seats at the widening's instant,
+        // which is erin's resignation's too, so a majority of four is three.
+        for voter in [&bob, &carol] {
+            let (classical, pqc) = ciris_edge::identity::sign_bound_hybrid(
+                &edge_signer_for(voter),
+                &canonical,
+                "widening cosign",
+            )
+            .await
+            .expect("co-signs");
+            spec_d
+                .cosignatures
+                .push(ciris_persist::federation::types::RosterCosignature {
+                    authority_key_id: voter.key_id.clone(),
+                    scrub_signature_classical: classical,
+                    scrub_signature_pqc: pqc,
+                });
+        }
+    }
     for n in nodes {
-        n.dir
+        let added = n
+            .dir
             .add_community_member(ROOM, member_d.clone(), &spec_d)
             .await
             .expect("every directory folds the widening");
+        assert!(added, "the cosigned widening seats dave");
+        assert!(
+            ciris_persist::federation::is_active_community_member(&*n.dir, ROOM, &dave.key_id)
+                .await
+                .expect("roster"),
+            "dave is active after the widening"
+        );
     }
     let post = node_a
         .store

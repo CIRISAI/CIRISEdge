@@ -65,16 +65,6 @@ use super::session::SessionRole;
 use super::summary::{StateApplier, StateProvider};
 use crate::transport::Transport;
 
-/// CIRISEdge#373 — outer bound on a single responder reply send inside the drive
-/// loop, so a stalled reply can't park the inbound drain forever. Sized to sit
-/// just ABOVE the reverse-path progress-aware hard cap (`REVERSE_PATH_MAX_TRANSFER`
-/// = 45 s, v13.6.1) plus dial margin, so it never severs a LIVE, progressing
-/// large-resource transfer — that would re-open the exact live-link cut v13.6.1
-/// fixes. A DEAD link now fast-fails at the reverse-path no-progress window (~6 s),
-/// so this bound only bites a genuinely pathological send; a progressing transfer
-/// is delivering the trace, so letting it run is correct.
-const RESPONDER_REPLY_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// CIRISEdge#348 — drive a factory-created **Responder** coordinator.
 ///
 /// The registry only STORES a coordinator; the [`ReplicationScheduler`] drives
@@ -187,7 +177,6 @@ fn build_bridge(
         )
         .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
         .with_consent_subjects(config.consent_subject_key_ids.clone())
-        .with_consent_gated_routes(config.consent_gated_routes)
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
         // legs live (leg A ∧ leg B against this node's own trust base), the
         // owner-conferred rung fail-closed pending CIRISPersist#788. Installed
@@ -495,6 +484,9 @@ fn spawn_scheduler_task(
         while let Some((peer, event)) = evt_rx.recv().await {
             if let Some(m) = &metrics {
                 m.inc_round_outcome(round_outcome_of(&event));
+                if matches!(event, RoundEvent::Completed(_)) {
+                    m.telemetry.note_round_completed();
+                }
             }
             if let RoundEvent::Completed(report) = &event {
                 if report.admitted > 0 {
@@ -539,8 +531,12 @@ fn responder_round_clock(
 // One driver loop with a lifecycle line and counter per arm (CIRISEdge#853);
 // splitting the arms out would separate each log line from the step it reports.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
+pub(crate) fn spawn_responder_drive(
+    coord: Arc<ReplicationCoordinator>,
+    reply_budget: Arc<crate::replication::reply_lane::ReplyBudget>,
+) {
     use crate::replication::coordinator::DriverPhase;
+    use crate::replication::reply_lane::{self, Finish, ReplyLane};
     tokio::spawn(async move {
         use crate::observability as obs;
         let peer = coord.peer_key_id().to_string();
@@ -563,10 +559,13 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
         let mut round_began: Option<std::time::Instant> = None;
         // The round id the timer is anchored to (0: none / legacy).
         let mut timed_round: u64 = 0;
+        // CIRISEdge#943 — this loop steps, the lane sends: a reply the reverse
+        // path is holding never holds the frames behind it. See `reply_lane`.
+        let lane = ReplyLane::spawn(Arc::clone(&coord), reply_budget);
         loop {
             // CIRISEdge#662 — the phase gauge: this loop is the responder's ONE
             // drain, and when its inbox fills the drop site reads which of the
-            // three awaits below it was parked in, and for how long.
+            // two awaits below it was parked in, and for how long.
             coord.set_driver_phase(DriverPhase::Idle);
             // Channel closed ⇒ the coordinator was dropped; end the driver.
             // CIRISEdge#634 — take the frame WITH its round metadata so the
@@ -577,6 +576,20 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                 tracing::debug!(peer = %peer, ?kind, "responder driver ending (channel closed)");
                 break;
             };
+            if let Some(m) = coord.metrics() {
+                m.telemetry
+                    .observe_inbound_wait(kind, inbound.queued_at.elapsed());
+            }
+            if lane.take_send_failed() {
+                round_began = None;
+            }
+            // The park here used to bound what a frame that wants an answer
+            // could cost; a full lane is that bound now, before the step.
+            if reply_lane::wants_reply(&inbound.msg) && !lane.has_room_for(&inbound.msg) {
+                let what = if lane.has_room() { "node" } else { "frame" };
+                lane.shed(&coord, what);
+                continue;
+            }
             let began = responder_round_clock(
                 &mut round_began,
                 &mut timed_round,
@@ -586,78 +599,17 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
             coord.set_driver_phase(DriverPhase::Stepping);
             match coord.drive_round_step_framed(Some(inbound)).await {
                 Ok(DriveStep::SendThenWait(msgs)) => {
-                    coord.set_driver_phase(DriverPhase::Sending);
-                    for m in &msgs {
-                        // CIRISEdge#373 — BOUND the reply send. This loop is the
-                        // responder's only inbound drain; a reply that blocks here
-                        // (a reverse-path stall to a churning NAT'd peer + the
-                        // NAT-blocked dial fallback = up to ~130 s) parks the drain
-                        // while the peer keeps pushing frames, overflowing the
-                        // capacity-8 inbound channel and silently dropping 100% of
-                        // the trace. Cap it well under the round cadence so a stalled
-                        // reply yields the drain; the abandoned send is safe (its
-                        // awaits — resource wait, dial — are cancellation-tolerant,
-                        // and the anti-entropy protocol is idempotent + retried).
-                        match tokio::time::timeout(
-                            RESPONDER_REPLY_SEND_TIMEOUT,
-                            coord.send_message(m),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    peer = %peer, ?kind, error = %e,
-                                    link = %coord.last_inbound_link_hex(),
-                                    "responder reply send failed — round will not complete (history: CIRISEdge#348)"
-                                );
-                                count(obs::RESPONDER_ROUND_REPLY_SEND_FAILED);
-                                round_began = None;
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                count(obs::RESPONDER_ROUND_REPLY_SEND_FAILED);
-                                round_began = None;
-                                tracing::warn!(
-                                    peer = %peer, ?kind,
-                                    link = %coord.last_inbound_link_hex(),
-                                    timeout_secs = RESPONDER_REPLY_SEND_TIMEOUT.as_secs(),
-                                    "responder reply send TIMED OUT — abandoning it so the inbound \
-                                     drain resumes and the peer's trace is not dropped (history: CIRISEdge#373); \
-                                     the next round rides the peer's fresh link"
-                                );
-                                break;
-                            }
-                        }
+                    if !msgs.is_empty() {
+                        lane.enqueue(&coord, msgs, coord.current_round(), None);
                     }
                 }
                 // CIRISEdge#380 — defensive: `SendThenComplete` is initiator-only
                 // (`start_round` emits it; responders never start rounds). If it
                 // ever appears here, honor its semantics: send, then done.
                 Ok(DriveStep::SendThenComplete(msgs, report)) => {
-                    let mut failed = false;
-                    for m in &msgs {
-                        if let Err(e) = coord.send_message(m).await {
-                            tracing::warn!(
-                                peer = %peer, ?kind, error = %e,
-                                link = %coord.last_inbound_link_hex(),
-                                "responder SendThenComplete send failed (history: CIRISEdge#380)"
-                            );
-                            count(obs::RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED);
-                            failed = true;
-                            break;
-                        }
-                    }
                     round_began = None;
-                    if !failed {
-                        count(obs::RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL);
-                        tracing::info!(
-                            peer = %peer, ?kind, ?report,
-                            link = %coord.last_inbound_link_hex(),
-                            duration_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
-                            "responder round complete (initiator-final path, CIRISEdge#380)"
-                        );
-                    }
+                    let finish = Finish { report, began };
+                    lane.enqueue(&coord, msgs, coord.current_round(), Some(finish));
                 }
                 Ok(DriveStep::Complete(report)) => {
                     round_began = None;
@@ -834,12 +786,6 @@ pub struct ReplicationRuntimeConfig {
     /// Empty (the default) falls back to `local_key_id`: correct wherever the
     /// agent and the node are one key.
     pub consent_subject_key_ids: Vec<String>,
-    /// CONSENT-GATED ROUTES (Eric 2026-10-30): serve a relayed route about an
-    /// owned node only to a peer its owner consented to. `false` by default.
-    ///
-    /// TODO(CIRISPersist#1165): default it on once a relay can hold contact
-    /// grants (see `FederationDirectoryReplicationBridge::with_consent_gated_routes`).
-    pub consent_gated_routes: bool,
     /// CIRISEdge#640 — everything a node needs to OPEN sealed content it did
     /// not seal, wired as ONE value (see [`SealedContentWiring`]): the engine
     /// that projects key-grant wraps into grants for this node's occurrences,
@@ -913,6 +859,37 @@ pub const BOOTSTRAP_ROUND_PLANES: [EnvelopeKind; 5] = [
     EnvelopeKind::IdentityOccurrenceRevocation,
 ];
 
+/// persist v60.0.0 / v61 (CIRISPersist#991) — drop every `(peer, kind)` on a
+/// [retired plane](EnvelopeKind::is_retired_plane). A host that still names one
+/// (the framed `Community` / `Family` / membership planes, the member listing,
+/// the framed `KeyGrant`, the operational trio) would otherwise get a
+/// coordinator per pair that lists nothing and refuses everything it is
+/// offered — a round of transport spent on a plane persist retired. Their rows
+/// ride the Attestation plane. Each dropped pair is logged once
+/// ([`note_retired_plane_skipped`]).
+fn without_retired_planes(peers: Vec<ReplicationPeer>) -> Vec<ReplicationPeer> {
+    peers
+        .into_iter()
+        .filter(|p| {
+            let retired = p.kind.is_retired_plane();
+            if retired {
+                note_retired_plane_skipped(&p.peer_key_id, p.kind);
+            }
+            !retired
+        })
+        .collect()
+}
+
+/// The one log line a skipped retired-plane peer gets.
+fn note_retired_plane_skipped(peer_key_id: &str, kind: EnvelopeKind) {
+    tracing::info!(
+        peer = peer_key_id,
+        kind = kind.as_wire_str(),
+        "replication peer on a RETIRED plane not scheduled: persist retired its framed \
+         carriage and its rows ride the Attestation plane (history: CIRISPersist#991)"
+    );
+}
+
 /// CIRISEdge#881 — the initiator peers the bundle's seated serve nodes
 /// (`serve_nodes`, the baked canonical ids) add: each on every
 /// [`BOOTSTRAP_ROUND_PLANES`] plane, never this node itself.
@@ -948,6 +925,130 @@ pub fn merge_peers(
         }
     }
     peers
+}
+
+/// CC 5.4.3 referrals — what a homed node's rounds are built from: a peer
+/// refused at a bound homes on a referred node, and its first contact and
+/// consent only flow there if something rounds with it. The transport says who;
+/// this registers it on the bootstrap planes, as a bundle peer is, and every
+/// later [`ReplicationRuntime::set_peers`] keeps it.
+#[derive(Clone)]
+struct HomedPeers {
+    transport: Arc<dyn Transport>,
+    registry: Arc<ReplicationRegistry>,
+    bridge: Arc<FederationDirectoryReplicationBridge>,
+    applier: Arc<dyn StateApplier>,
+    scheduler_handle: SchedulerHandle,
+    current_initiators: Arc<Mutex<HashSet<(String, EnvelopeKind)>>>,
+    proactive_publish: bool,
+    /// Held across peer sets ([`ReplicationRuntime::set_peers`]).
+    peers: Arc<Mutex<Vec<ReplicationPeer>>>,
+}
+
+impl HomedPeers {
+    async fn register(&self, node: &str) {
+        for kind in BOOTSTRAP_ROUND_PLANES {
+            self.peers.lock().await.push(ReplicationPeer {
+                peer_key_id: node.to_owned(),
+                kind,
+            });
+            if !self
+                .current_initiators
+                .lock()
+                .await
+                .insert((node.to_owned(), kind))
+            {
+                continue;
+            }
+            let coord = build_peer_coordinator(
+                &self.transport,
+                &self.bridge,
+                &self.applier,
+                self.proactive_publish,
+                node,
+                kind,
+                SessionRole::Initiator,
+            );
+            self.registry
+                .register(node.to_owned(), kind, Arc::clone(&coord))
+                .await;
+            if let Err(e) = self.scheduler_handle.add_initiator(coord).await {
+                tracing::warn!(error = %e, node, "a homed node's rounds did not start");
+                return;
+            }
+        }
+        tracing::info!(
+            node,
+            planes = ?BOOTSTRAP_ROUND_PLANES,
+            "replication rounds with the node this one homed on after a refusal, on the \
+             bootstrap planes (CC 5.4.3)"
+        );
+    }
+}
+
+/// CC 5.4.3 referrals — register each node the transport homes on. A
+/// transport with no such events spawns nothing.
+fn spawn_homed_forwarder(homed: HomedPeers, cancel_rx: &watch::Receiver<bool>) {
+    use tokio::sync::broadcast::error::RecvError;
+    let Some(mut events) = homed.transport.subscribe_homed() else {
+        return;
+    };
+    let mut cancel = cancel_rx.clone();
+    tokio::spawn(async move {
+        // Subscribed first: one homed before this runtime came up is still used.
+        for node in homed.transport.homed_peers() {
+            homed.register(&node).await;
+        }
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => {
+                    if *cancel.borrow() {
+                        return;
+                    }
+                }
+                event = events.recv() => match event {
+                    Ok(node) => homed.register(&node).await,
+                    Err(RecvError::Lagged(_)) => {
+                        for node in homed.transport.homed_peers() {
+                            homed.register(&node).await;
+                        }
+                    }
+                    Err(RecvError::Closed) => return,
+                },
+            }
+        }
+    });
+}
+
+/// A coordinator in `role` over the runtime's shared parts.
+fn build_peer_coordinator(
+    transport: &Arc<dyn Transport>,
+    bridge: &Arc<FederationDirectoryReplicationBridge>,
+    applier: &Arc<dyn StateApplier>,
+    proactive_publish: bool,
+    peer_key_id: &str,
+    kind: EnvelopeKind,
+    role: SessionRole,
+) -> Arc<ReplicationCoordinator> {
+    let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(bridge) as _;
+    // CIRISEdge#379 — peer-bound provider (observer gate).
+    let provider: Arc<dyn StateProvider> =
+        Arc::new(DirectoryStateAdapter::new(bridge_dir).with_peer(peer_key_id));
+    // CIRISEdge#370 — hot-adds share the runtime's ONE no-mutex applier.
+    let applier = Arc::clone(applier);
+    // CIRISEdge#927 — hot-added Initiators inherit the runtime's proactive-
+    // publish posture. Harmless for Responders (they never `start_round`).
+    Arc::new(
+        ReplicationCoordinator::new(
+            Arc::clone(transport),
+            peer_key_id.to_string(),
+            kind,
+            role,
+            provider,
+            applier,
+        )
+        .with_proactive_publish(proactive_publish),
+    )
 }
 
 pub struct ReplicationRuntime {
@@ -986,6 +1087,8 @@ pub struct ReplicationRuntime {
     /// CIRISEdge#881 — the bundle-seeded bootstrap peers merged into every
     /// peer set this runtime is given (`start`, `set_peers`).
     bundle_peers: Vec<ReplicationPeer>,
+    /// CC 5.4.3 referrals — the nodes homed on, merged the same way.
+    homed_peers: Arc<Mutex<Vec<ReplicationPeer>>>,
     /// CIRISEdge#927 — whether this node's Initiator rounds proactively deliver
     /// their publish set (set iff `start` got a `self_provider`). Applied to
     /// every Initiator coordinator this runtime builds, including hot-adds.
@@ -1076,7 +1179,7 @@ impl ReplicationRuntime {
                 config.local_key_id.as_deref(),
             )
         };
-        let peers = merge_peers(peers, &bundle_peers);
+        let peers = without_retired_planes(merge_peers(peers, &bundle_peers));
         if !bundle_peers.is_empty() {
             tracing::info!(
                 serve_nodes = bundle_peers.len() / BOOTSTRAP_ROUND_PLANES.len(),
@@ -1165,6 +1268,8 @@ impl ReplicationRuntime {
             // CIRISEdge#441 — the responder coordinators fold peer Summaries
             // into the removal-receipt ledger; same handle the bridge uses.
             let factory_metrics = config.metrics.clone();
+            // One per node: every responder's reply lane draws on it.
+            let reply_budget = Arc::<crate::replication::reply_lane::ReplyBudget>::default();
             registry.set_responder_factory(Arc::new(move |peer_key_id: &str, kind| {
                 let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&factory_bridge) as _;
                 // CIRISEdge#379 — peer-bound provider: the observer-capability
@@ -1193,7 +1298,7 @@ impl ReplicationRuntime {
                 // never ran the recv_inbound → drive_round_step → send_message
                 // loop. Spawned ONCE per (peer, kind) — `get_or_register_with`
                 // calls the factory only on first insert.
-                spawn_responder_drive(Arc::clone(&coord));
+                spawn_responder_drive(Arc::clone(&coord), Arc::clone(&reply_budget));
                 coord
             }));
         }
@@ -1249,6 +1354,21 @@ impl ReplicationRuntime {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let key_grant_emitter = spawn_key_grant_emitter_for(&config, key_grant_wake, &cancel_rx);
         spawn_reachability_forwarder(&transport, &scheduler_handle, &cancel_rx);
+        let current_initiators = Arc::new(Mutex::new(initial_initiator_set));
+        let homed_peers = Arc::new(Mutex::new(Vec::new()));
+        spawn_homed_forwarder(
+            HomedPeers {
+                transport: Arc::clone(&transport),
+                registry: Arc::clone(&registry),
+                bridge: Arc::clone(&bridge),
+                applier: Arc::clone(&shared_applier),
+                scheduler_handle: scheduler_handle.clone(),
+                current_initiators: Arc::clone(&current_initiators),
+                proactive_publish,
+                peers: Arc::clone(&homed_peers),
+            },
+            &cancel_rx,
+        );
         // CIRISEdge#370/#636 — see [`spawn_scheduler_task`] for the event sink.
         let scheduler_task = spawn_scheduler_task(scheduler, &scheduler_handle, cancel_rx, &config);
 
@@ -1267,8 +1387,9 @@ impl ReplicationRuntime {
             key_grant_emitter,
             config,
             scheduler_handle,
-            current_initiators: Arc::new(Mutex::new(initial_initiator_set)),
+            current_initiators,
             bundle_peers,
+            homed_peers,
             proactive_publish,
             mesh_config,
         }
@@ -1328,6 +1449,11 @@ impl ReplicationRuntime {
         kind: EnvelopeKind,
     ) -> Result<(), ReplicationRuntimeError> {
         let peer_key_id = peer_key_id.into();
+        // persist v61 — a retired plane carries nothing; it is never scheduled.
+        if kind.is_retired_plane() {
+            note_retired_plane_skipped(&peer_key_id, kind);
+            return Ok(());
+        }
         let key = (peer_key_id.clone(), kind);
 
         {
@@ -1352,9 +1478,13 @@ impl ReplicationRuntime {
     /// `subject_key_id`'s own testimony (and testimony ABOUT it) from
     /// `peer_key_id`. For each subject-pullable kind (the five replicated planes)
     /// this ensures a scheduled Initiator coordinator exists — so the reply's
-    /// drive loop is live — then sends a `Pull`. The peer answers with the
-    /// subject's refs (projection-gated + G2-carved by its `subject_holdings`),
-    /// and the node pulls the gap through the ordinary Diff/Deliver flow.
+    /// peer is known to the scheduler — then runs a Pull on an exchange of its
+    /// own ([`ReplicationCoordinator::pull_exchange`](super::coordinator::ReplicationCoordinator::pull_exchange)).
+    /// The peer answers with the subject's refs (projection-gated + G2-carved by
+    /// its `subject_holdings`), and the gap is fetched and applied in that
+    /// exchange, on the frames' own time and never on a round's. A plane the
+    /// peer throttled sends nothing until its hint runs out
+    /// ([`Self::subject_pull_retry_after`]).
     ///
     /// This is the mechanism the observation in #462 needs: a fedID that claimed
     /// a fresh node cannot otherwise obtain its own keys / occurrences / routes /
@@ -1553,6 +1683,19 @@ impl ReplicationRuntime {
         })
     }
 
+    /// CIRISEdge#937 — seconds left before `peer_key_id` will answer a subject
+    /// Pull again, on the plane it throttled longest; `None` when no plane is.
+    /// What a host reads to say "looking…" instead of "not found".
+    pub async fn subject_pull_retry_after(&self, peer_key_id: &str) -> Option<u64> {
+        let mut longest = None;
+        for kind in EnvelopeKind::subject_pullable() {
+            if let Some(coord) = self.registry.get_initiator(peer_key_id, kind).await {
+                longest = longest.max(coord.pull_retry_after_secs());
+            }
+        }
+        longest
+    }
+
     pub async fn pull_subject_testimony(
         &self,
         peer_key_id: &str,
@@ -1564,7 +1707,10 @@ impl ReplicationRuntime {
             // consumes the Pull's Summary reply.
             self.register_initiator_peer(peer_key_id, kind).await?;
             if let Some(coord) = self.registry.get_initiator(peer_key_id, kind).await {
-                if let Err(e) = coord.start_pull(subject_key_id).await {
+                if let Err(e) = coord
+                    .pull_exchange(subject_key_id, self.config.scheduler.round_timeout)
+                    .await
+                {
                     tracing::warn!(
                         peer = %peer_key_id,
                         subject = %subject_key_id,
@@ -1648,6 +1794,7 @@ impl ReplicationRuntime {
     ) -> Result<(), ReplicationRuntimeError> {
         // CIRISEdge#881 — the bundle's bootstrap peers ride every peer set.
         let desired = merge_peers(desired, &self.bundle_peers);
+        let desired = merge_peers(desired, &self.homed_peers.lock().await);
         let desired_set: HashSet<(String, EnvelopeKind)> = desired
             .iter()
             .map(|p| (p.peer_key_id.clone(), p.kind))
@@ -1679,24 +1826,14 @@ impl ReplicationRuntime {
         kind: EnvelopeKind,
         role: SessionRole,
     ) -> Arc<ReplicationCoordinator> {
-        let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&self.bridge) as _;
-        // CIRISEdge#379 — peer-bound provider (observer gate).
-        let provider: Arc<dyn StateProvider> =
-            Arc::new(DirectoryStateAdapter::new(bridge_dir).with_peer(peer_key_id));
-        // CIRISEdge#370 — hot-adds share the runtime's ONE no-mutex applier.
-        let applier = Arc::clone(&self.applier);
-        // CIRISEdge#927 — hot-added Initiators inherit the runtime's proactive-
-        // publish posture. Harmless for Responders (they never `start_round`).
-        Arc::new(
-            ReplicationCoordinator::new(
-                Arc::clone(&self.transport),
-                peer_key_id.to_string(),
-                kind,
-                role,
-                provider,
-                applier,
-            )
-            .with_proactive_publish(self.proactive_publish),
+        build_peer_coordinator(
+            &self.transport,
+            &self.bridge,
+            &self.applier,
+            self.proactive_publish,
+            peer_key_id,
+            kind,
+            role,
         )
     }
 
@@ -1746,6 +1883,45 @@ impl ReplicationRuntime {
     /// [`FederationDirectoryReplicationBridge::release_bound_signer`].
     pub fn release_bound_signer(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> usize {
         self.bridge.release_bound_signer(kind, envelope_bytes)
+    }
+
+    /// v44 (CIRISConstitution#198 §5) — a receiver of every later
+    /// decision-relevant-row event ([`crate::decision_rows`]). Nothing fires
+    /// while the node is suspended; rebuild from the last cursor with
+    /// [`crate::decision_rows::decision_rows_since`] on resume.
+    #[must_use]
+    pub fn subscribe_decision_rows(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::decision_rows::DecisionRowRef> {
+        self.bridge.subscribe_decision_rows()
+    }
+
+    /// v44 — the host wrote `row` locally: emit its decision-row event and
+    /// carry it to every peer now. `written_after` is an instant taken
+    /// before the write. See
+    /// [`FederationDirectoryReplicationBridge::note_local_write`].
+    pub async fn note_local_write(
+        &self,
+        row: &ciris_persist::federation::Attestation,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Option<crate::decision_rows::DecisionRowRef> {
+        self.bridge.note_local_write(row, written_after).await
+    }
+
+    /// v44 — the host wrote rows persist minted (a `put_*` roster door):
+    /// emit an event for every decision-relevant row served since
+    /// `written_after`, and carry them now. See
+    /// [`FederationDirectoryReplicationBridge::note_local_writes_since`].
+    ///
+    /// # Errors
+    /// persist's read failure.
+    pub async fn note_local_writes_since(
+        &self,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::decision_rows::DecisionRowRef>, ciris_persist::federation::Error> {
+        self.bridge
+            .note_local_writes_since(written_after, None)
+            .await
     }
 
     /// The runtime's bridge. Useful for telemetry or tests that
@@ -1828,7 +2004,6 @@ mod tests {
     }
 
     use super::*;
-    use ciris_persist::store::MemoryBackend;
     use std::sync::Arc;
 
     /// CIRISEdge#853 (Codex round two on #854) — a frame naming a NEW round
@@ -1931,7 +2106,7 @@ mod tests {
         use super::super::protocol::{ReplicationMessage, SummaryMessage};
         use super::super::registry::RouteOutcome;
 
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let sent = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let transport: Arc<dyn Transport> = Arc::new(RecordingTransport {
@@ -1945,6 +2120,7 @@ mod tests {
 
         let round_open =
             super::super::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
@@ -1986,7 +2162,7 @@ mod tests {
     /// the scheduler task; `shutdown` exits cleanly.
     #[tokio::test]
     async fn empty_peer_set_starts_and_shuts_down_cleanly() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -1999,7 +2175,7 @@ mod tests {
     /// registry handle the listen loop would use.
     #[tokio::test]
     async fn one_initiator_peer_registered_at_start() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let peers = vec![ReplicationPeer {
@@ -2022,7 +2198,7 @@ mod tests {
     /// no longer defaults to a passive Responder).
     #[tokio::test]
     async fn register_peer_hot_adds() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2039,7 +2215,7 @@ mod tests {
     /// registry. Distinct from `register_peer` (Responder-only).
     #[tokio::test]
     async fn register_initiator_peer_hot_adds_initiator_role() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2067,7 +2243,7 @@ mod tests {
     /// registry. Idempotent.
     #[tokio::test]
     async fn remove_peer_drops_initiator_and_deregisters() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2093,7 +2269,7 @@ mod tests {
     /// a non-empty pre-existing set.
     #[tokio::test]
     async fn set_peers_diff_converges() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let initial = vec![
@@ -2144,7 +2320,7 @@ mod tests {
     /// `shutdown` is idempotent.
     #[tokio::test]
     async fn shutdown_is_idempotent() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2246,7 +2422,7 @@ mod tests {
             registries: &Registries,
             ledger: &Ledger,
         ) -> (ReplicationRuntime, EdgeMetrics) {
-            let backend = Arc::new(MemoryBackend::new());
+            let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
             let directory: Arc<dyn FederationDirectory> = backend;
             let transport: Arc<dyn Transport> = Arc::new(Loopback {
                 me: name.to_string(),
@@ -2299,20 +2475,21 @@ mod tests {
             // Bob comes up after alice's start-up round has already fired
             // toward him: the ordering a loaded host produced at random.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let (mut bob, bob_m) = node("bob", "alice", &registries, &ledger).await;
-
-            // Both sides are initiators toward each other; neither has a
-            // responder yet.
-            assert!(alice
-                .registry()
-                .get_initiator("bob", EnvelopeKind::Key)
-                .await
-                .is_some());
+            // Read before bob exists: his own start-up round can reach alice
+            // as soon as he does, and a responder there is the case under test.
             assert!(alice
                 .registry()
                 .get_responder("bob", EnvelopeKind::Key)
                 .await
                 .is_none());
+            let (mut bob, bob_m) = node("bob", "alice", &registries, &ledger).await;
+
+            // Both sides are initiators toward each other.
+            assert!(alice
+                .registry()
+                .get_initiator("bob", EnvelopeKind::Key)
+                .await
+                .is_some());
             assert!(bob
                 .registry()
                 .get_initiator("alice", EnvelopeKind::Key)

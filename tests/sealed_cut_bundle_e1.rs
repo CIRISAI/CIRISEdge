@@ -625,6 +625,12 @@ async fn two_hops(seed_canonical_row: bool) {
         false,
     )
     .await;
+    // A loaded box can start C long after O: this holds it there on demand.
+    let held_back = std::env::var("SEALED_C_DELAY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    tokio::time::sleep(Duration::from_secs(held_back)).await;
     let (c_hop, _, c_rx) = hop(
         &c.key_id,
         c.signer(),
@@ -724,13 +730,11 @@ async fn two_hops(seed_canonical_row: bool) {
     );
 
     // HOP TWO: C seals its first contact to O, across the canonical.
-    assert!(
-        wait_until(Duration::from_secs(60), || async {
-            c_hop.transport.knows_peer(&o.key_id).await
-        })
-        .await,
-        "C hears O's announce through the canonical"
-    );
+    // The send asks the canonical for O's path, through the route C just
+    // replicated. This waited for O's announce, which C cannot wait for: O
+    // re-announces every 3 s, so the canonical's rate limit (grace 5) stops
+    // relaying it about 18 s after O starts, and a C that connects later
+    // never hears it.
     let request = first_contact_request(&c.key_id, &o.key_id, &c_record);
     c_hop
         .transport

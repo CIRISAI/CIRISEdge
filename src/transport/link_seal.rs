@@ -33,14 +33,43 @@
 //!   at establishment (or at its first frame, when the establishment event
 //!   was lost). Until a valid handshake completes it delivers NOTHING upward
 //!   and the seal refuses every send. A route request as the first frame
-//!   passes the receiver order (once per link, the node-wide rate) BEFORE
-//!   it is read, and is answered only with this node's own signed row,
+//!   passes the receiver order (once per link, the sender's rate, the
+//!   node-wide rate) BEFORE it is read, and is answered only with this node's own signed row,
 //!   unsealed, the one thing besides the handshake that is. A non-`CTKX`,
 //!   non-`CTKR` first frame, a missing handshake (budget expiry,
 //!   [`LinkSeals::expire`]), an oversize declaration, a bad or
 //!   classical-only suite, and a failed respond are each a named refusal
 //!   ([`SealRefusal::label`]), after which the link is closed. There is
 //!   never a plaintext edge frame in either direction.
+//!
+//! # Keying runs off the event path (CIRISEdge#947)
+//!
+//! A handshake's last part moves its link from `Awaiting` to `Keying` and
+//! hands the bytes back ([`Inbound::Handshake`]); nothing here decapsulates.
+//! The caller puts the job through [`crate::transport::link_keying`]: the
+//! receiver order, then a bounded pool, and the event loop applies the outcome
+//! ([`LinkSeals::finish_keying`]). Through that window:
+//!
+//! - **The link has one outcome.** A ticket ties a result to the link's one
+//!   `Keying` entry; a link closed, refused or out of budget meanwhile
+//!   discards it, and a job not yet started never runs.
+//! - **Frames keep their order.** Every frame event on the link waits whole
+//!   ([`LinkSeals::park`]) and the event loop replays them after the link is
+//!   keyed and the responder has spoken, so nothing overtakes the keying and
+//!   nothing meets a link with no keys. A link that outruns the bound is
+//!   refused by name, never trimmed: its sender counted those frames sent.
+//! - **The responder still does not speak first**, and [`LinkSeals::seal`]
+//!   refuses a `Keying` link as it refuses an `Awaiting` one.
+//! - **The budget still ends it**: a handshake that arrived in time has
+//!   [`KEYING_BUDGET`] from then to key, and [`LinkSeals::expire`] refuses it
+//!   past that.
+//!
+//! `Awaiting` itself is capped node-wide ([`AWAITING_LINKS_MAX`],
+//! [`AWAITING_BYTES_MAX`]). Past either the OLDEST such link is refused by name
+//! ([`SealRefusal::AwaitingCap`]), not the newest: refusing the newest would
+//! let links that never finish a handshake shut every later dialler out,
+//! strangers and known peers alike, while an honest link leaves this state
+//! within a few round trips and is never the oldest for long.
 //!
 //! # The claim and the first-contact carve-out
 //!
@@ -84,16 +113,18 @@
 //! so the peer holds the keys, and a window overrun under reordering is not
 //! an attack worth a teardown.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ciris_crypto::transit_kex::TransitRole;
 use ciris_persist::federation::self_at_login::TransitKexPair;
+use leviculum_std::NodeEvent;
 use zeroize::Zeroizing;
 
 use crate::transport::av_transit_handshake::{self, AvHandshakeError, LinkTransit, Reassembler};
+use crate::transport::link_keying::{ReceiverOrder, Sender};
 use crate::transport::route_fetch::{self, RouteFetchError, RouteRequestLimiter};
 use crate::transport::transit_kex_custody::TransitKexSecret;
 use crate::transport::transit_kex_peer::PeerTransitResolver;
@@ -143,6 +174,38 @@ pub const HELD_BYTES_MAX: usize = crate::transport::frame_fragment::MAX_BODY_BYT
 /// their handshake cannot pin unbounded memory: a few links' worth of
 /// largest frames. A frame past it is dropped by name.
 pub const HELD_BYTES_NODE_MAX: usize = 8 * HELD_BYTES_MAX;
+
+/// Most links awaiting a handshake, node-wide: leviculum holds about this many
+/// established links before it starts evicting live ones (#508), so half-open
+/// links must give way first.
+pub const AWAITING_LINKS_MAX: usize = 1024;
+
+/// Most keyed identity-plane links with no standing, node-wide; past it the
+/// oldest is closed, for the reason [`AWAITING_LINKS_MAX`] refuses the oldest.
+/// The handshake rate does not bound these: 256 per 10 s held for the 120 s idle
+/// bound is 3,072 links, three times leviculum's envelope, and cutting the rate
+/// instead costs honest strangers their share (`FSD/EVENT_PATH_MODEL.md` §2.6).
+pub const STRANGER_KEYED_LINKS_MAX: usize = 512;
+
+/// Most handshake bytes reassembling, node-wide: 512 largest handshakes, or a
+/// full [`AWAITING_LINKS_MAX`] of today's 1.3 KB ones.
+pub const AWAITING_BYTES_MAX: usize = 2 * 1024 * 1024;
+
+/// Most frames waiting on one link's keying. [`HELD_BYTES_MAX`] is the real
+/// bound; this one bounds the bookkeeping of many tiny frames.
+pub const KEYING_HELD_FRAMES_MAX: usize = 256;
+
+/// How long a complete handshake on a link with no proven identity waits for
+/// its LINKIDENTIFY before the receiver order judges it unidentified. The
+/// dialler sends the identify first, but a loaded node can still see the
+/// handshake's frames ahead of it.
+pub const IDENTIFY_GRACE: Duration = Duration::from_secs(1);
+
+/// Most handshakes waiting for an identify; past it the next is judged at once.
+pub const DEFERRED_HANDSHAKES_MAX: usize = 128;
+
+/// How long a handshake that arrived within its budget has to key.
+pub const KEYING_BUDGET: Duration = av_transit_handshake::HANDSHAKE_BUDGET;
 
 /// How long an ordinary frame on a peer-dialled link waits for the link's
 /// attribution before the first-contact carve-out judges the link as
@@ -271,9 +334,85 @@ pub enum SealRefusal {
     /// ([`crate::transport::route_fetch`]).
     #[error("pre-seal route fetch: {0}")]
     RouteFetch(RouteFetchError),
+    /// CIRISEdge#947 — a complete handshake over its sender's rate.
+    #[error(
+        "transit KEX handshake over the sender's rate (identified: {identified}); refused \
+         before decapsulation, the dialler re-dials (CC 5.3.3.5 receiver order)"
+    )]
+    HandshakeSenderRate {
+        /// Whether the sender is a proven identity, or the shared slot.
+        identified: bool,
+        /// Whether the sender had standing.
+        standing: bool,
+    },
+    /// CIRISEdge#947 — a complete handshake over the node-wide rate.
+    #[error(
+        "transit KEX handshake over the node-wide rate (standing: {standing}); refused before \
+         decapsulation, the dialler re-dials (CC 5.3.3.5 receiver order)"
+    )]
+    HandshakeNodeRate {
+        /// Whether the sender had standing.
+        standing: bool,
+        /// Whether the sender is a proven identity.
+        identified: bool,
+    },
+    /// CIRISEdge#947 — the decapsulation queue is full.
+    #[error(
+        "the decapsulation queue is full (standing: {standing}); the new handshake is refused, \
+         the dialler re-dials"
+    )]
+    DecapSaturated {
+        /// Whether the sender had standing.
+        standing: bool,
+    },
+    /// CIRISEdge#947 — too many links await a handshake, or too many bytes
+    /// are reassembling: this link, the oldest, gives way.
+    #[error("the node holds too many half-open links; the oldest gives way, it re-dials")]
+    AwaitingCap,
+    /// The node holds [`STRANGER_KEYED_LINKS_MAX`] keyed links with no
+    /// standing: this one, the oldest, gives way.
+    #[error("the node holds too many keyed strangers; the oldest gives way, it re-dials")]
+    StrangerCap,
+    /// CIRISEdge#947 — more arrived on the link during its keying than it may
+    /// hold.
+    #[error(
+        "more frames arrived during the link's keying than it may hold; refused rather than \
+         lose one the sender counted sent"
+    )]
+    KeyingHold,
 }
 
 impl SealRefusal {
+    /// The key under [`Self::label`] that says who was refused, when the
+    /// refusal has one.
+    #[must_use]
+    pub fn refined_label(&self) -> Option<&'static str> {
+        use crate::observability as o;
+        Some(match self {
+            Self::HandshakeSenderRate {
+                identified: false, ..
+            } => o::LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_UNIDENTIFIED,
+            Self::HandshakeSenderRate { standing: true, .. } => {
+                o::LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STANDING
+            }
+            Self::HandshakeSenderRate { .. } => o::LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STRANGER,
+            Self::HandshakeNodeRate { standing: true, .. } => {
+                o::LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STANDING
+            }
+            Self::HandshakeNodeRate {
+                identified: false, ..
+            } => o::LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_UNIDENTIFIED,
+            Self::HandshakeNodeRate { .. } => o::LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STRANGER,
+            Self::DecapSaturated { standing: true } => {
+                o::LINK_SEAL_REFUSED_DECAP_SATURATED_STANDING
+            }
+            Self::DecapSaturated { standing: false } => {
+                o::LINK_SEAL_REFUSED_DECAP_SATURATED_STRANGER
+            }
+            _ => return None,
+        })
+    }
+
     /// The `link_seal` metric label.
     #[must_use]
     pub fn label(&self) -> &'static str {
@@ -287,7 +426,37 @@ impl SealRefusal {
             Self::FirstContactOnly => o::LINK_SEAL_REFUSED_FIRST_CONTACT_ONLY,
             Self::FirstContactSignerMismatch { .. } => o::LINK_SEAL_REFUSED_FIRST_CONTACT_SIGNER,
             Self::RouteFetch(e) => e.label(),
+            Self::HandshakeSenderRate { .. } => o::LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE,
+            Self::HandshakeNodeRate { .. } => o::LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE,
+            Self::DecapSaturated { .. } => o::LINK_SEAL_REFUSED_DECAP_SATURATED,
+            Self::AwaitingCap => o::LINK_SEAL_REFUSED_AWAITING_CAP,
+            Self::StrangerCap => o::LINK_SEAL_REFUSED_STRANGER_CAP,
+            Self::KeyingHold => o::LINK_SEAL_REFUSED_KEYING_HOLD,
         }
+    }
+}
+
+/// One complete handshake on its way to a decapsulation
+/// ([`crate::transport::link_keying`]). Holds no key material: only what the
+/// peer sent.
+#[derive(Debug)]
+pub struct HandshakeJob {
+    link: [u8; 16],
+    ticket: u64,
+    handshake: Vec<u8>,
+}
+
+impl HandshakeJob {
+    /// The link.
+    #[must_use]
+    pub fn link(&self) -> [u8; 16] {
+        self.link
+    }
+
+    /// Which `Keying` entry this job belongs to.
+    #[must_use]
+    pub fn ticket(&self) -> u64 {
+        self.ticket
     }
 }
 
@@ -296,9 +465,14 @@ impl SealRefusal {
 pub enum Inbound {
     /// A handshake part, buffered. Nothing to deliver.
     Pending,
-    /// The handshake completed and was answered: the link is sealed from now
-    /// on. `claimed` is the initiator the handshake names (a claim the
-    /// caller holds to the link's attribution). Nothing to deliver.
+    /// The handshake's last part: the link is keying. The caller puts this
+    /// through the receiver order and the keyer
+    /// ([`crate::transport::link_keying`]); nothing to deliver.
+    Handshake(HandshakeJob),
+    /// [`LinkSeals::finish_keying`]: the handshake was answered and the link
+    /// is sealed from now on. `claimed` is the initiator the handshake names
+    /// (a claim the caller holds to the link's attribution). Nothing to
+    /// deliver.
     Keyed {
         /// The handshake's `initiator_key_id`.
         claimed: String,
@@ -499,11 +673,106 @@ enum State {
         /// refused, and the handshake budget runs from here for the fetch.
         route_requested_at: Option<Instant>,
     },
+    /// A peer dialled; its handshake is whole and on its way through the
+    /// keyer. Its frames wait ([`LinkSeals::park`]).
+    Keying {
+        ticket: u64,
+        since: Instant,
+        /// Carried over: a route-fetched link keeps that budget.
+        route_requested_at: Option<Instant>,
+    },
     /// Keys installed.
     Sealed(Arc<SealedLink>),
     /// Refused; the link is closing. Kept so a frame still in flight is not
     /// counted again or taken for a new link.
     Refused,
+}
+
+/// The node-wide ledger of `Awaiting` links, oldest first. Kept beside the map
+/// and moved only by [`LinkTable`]'s two writers, so it cannot drift from it.
+#[derive(Debug, Default)]
+struct AwaitingLedger {
+    by_age: BTreeMap<u64, [u8; 16]>,
+    /// Per link: its place in `by_age` and the bytes it is reassembling.
+    links: HashMap<[u8; 16], (u64, usize)>,
+    bytes: usize,
+    next: u64,
+}
+
+impl AwaitingLedger {
+    fn add(&mut self, link: [u8; 16]) {
+        let age = self.next;
+        self.next += 1;
+        self.by_age.insert(age, link);
+        self.links.insert(link, (age, 0));
+    }
+
+    fn remove(&mut self, link: &[u8; 16]) {
+        if let Some((age, bytes)) = self.links.remove(link) {
+            self.by_age.remove(&age);
+            self.bytes -= bytes;
+        }
+    }
+
+    fn set_bytes(&mut self, link: &[u8; 16], now: usize) {
+        if let Some((_, bytes)) = self.links.get_mut(link) {
+            self.bytes = self.bytes - *bytes + now;
+            *bytes = now;
+        }
+    }
+
+    fn oldest_other_than(&self, keep: &[u8; 16]) -> Option<[u8; 16]> {
+        self.by_age.values().find(|l| *l != keep).copied()
+    }
+}
+
+/// The link states, and the `Awaiting` ledger they imply. Every write goes
+/// through [`Self::set`] or [`Self::remove`]; `map` is read freely.
+#[derive(Default)]
+struct LinkTable {
+    map: HashMap<[u8; 16], State>,
+    ledger: AwaitingLedger,
+    /// Links the cap refused; the caller closes them ([`LinkSeals::take_evicted`]).
+    evicted: Vec<[u8; 16]>,
+}
+
+impl LinkTable {
+    fn set(&mut self, link: [u8; 16], state: State) {
+        let awaiting = matches!(state, State::Awaiting { .. });
+        let was = matches!(self.map.insert(link, state), Some(State::Awaiting { .. }));
+        match (was, awaiting) {
+            (true, false) => self.ledger.remove(&link),
+            (false, true) => self.ledger.add(link),
+            _ => {}
+        }
+    }
+
+    fn remove(&mut self, link: &[u8; 16]) {
+        self.map.remove(link);
+        self.ledger.remove(link);
+    }
+
+    /// Refuse the oldest `Awaiting` links, never `keep`, until the ledger is
+    /// within its caps.
+    fn enforce_caps(&mut self, keep: &[u8; 16], links_max: usize, bytes_max: usize) {
+        while self.ledger.links.len() > links_max || self.ledger.bytes > bytes_max {
+            let Some(oldest) = self.ledger.oldest_other_than(keep) else {
+                return;
+            };
+            self.set(oldest, State::Refused);
+            self.evicted.push(oldest);
+        }
+    }
+}
+
+/// Keyed links with no standing: by age, each one's age, the next age.
+type StrangerLedger = (BTreeMap<u64, [u8; 16]>, HashMap<[u8; 16], u64>, u64);
+
+/// Frame events waiting on links' keying, and their total size.
+#[derive(Default)]
+struct Parked {
+    links: HashMap<[u8; 16], (VecDeque<NodeEvent>, usize)>,
+    bytes: usize,
 }
 
 /// Per link: the sealed Resources held before its handshake, and their bytes.
@@ -516,7 +785,7 @@ type RouteAnswerTx = tokio::sync::oneshot::Sender<Result<Vec<u8>, RouteFetchErro
 
 /// The Reticulum transport's per-link seal table. See the module docs.
 pub struct LinkSeals {
-    links: Mutex<HashMap<[u8; 16], State>>,
+    links: Mutex<LinkTable>,
     secret: TransitKexSecret,
     local_key_id: String,
     resolver: PeerTransitResolver,
@@ -537,6 +806,30 @@ pub struct LinkSeals {
     route_limiter: RouteRequestLimiter,
     /// The per-sender receiver order for route requests.
     route_sender_limiter: route_fetch::SenderRouteLimiter,
+    /// The receiver order for handshakes.
+    receiver_order: ReceiverOrder,
+    /// Frame events waiting on their link's keying.
+    parked: Mutex<Parked>,
+    /// Complete handshakes waiting for their link's identify, and since when.
+    deferred: Mutex<HashMap<[u8; 16], (HandshakeJob, Instant)>>,
+    /// The next keying ticket.
+    next_ticket: AtomicU64,
+    /// [`AWAITING_LINKS_MAX`], as a test knob.
+    awaiting_links_max: AtomicUsize,
+    /// Keyed links with no standing, oldest first, and each one's place.
+    keyed_strangers: Mutex<StrangerLedger>,
+    /// [`STRANGER_KEYED_LINKS_MAX`], as a test knob.
+    keyed_strangers_max: AtomicUsize,
+    /// [`AWAITING_BYTES_MAX`], as a test knob.
+    awaiting_bytes_max: AtomicUsize,
+    /// Test seam: how long each decapsulation sits, in milliseconds.
+    decap_delay_ms: AtomicU64,
+    /// Test seam: the next decapsulation panics.
+    pub(crate) decap_panics: std::sync::atomic::AtomicBool,
+    /// Decapsulations run.
+    decaps: AtomicU64,
+    /// Test seam: how long a responder's first words wait, in milliseconds.
+    first_words_delay_ms: AtomicU64,
 }
 
 impl std::fmt::Debug for LinkSeals {
@@ -554,7 +847,7 @@ impl LinkSeals {
     #[must_use]
     pub fn new(secret: TransitKexSecret, local_key_id: impl Into<String>) -> Self {
         Self {
-            links: Mutex::new(HashMap::new()),
+            links: Mutex::new(LinkTable::default()),
             secret,
             local_key_id: local_key_id.into(),
             resolver: PeerTransitResolver::new(),
@@ -564,6 +857,18 @@ impl LinkSeals {
             route_answers: Mutex::new(HashMap::new()),
             route_limiter: RouteRequestLimiter::default(),
             route_sender_limiter: route_fetch::SenderRouteLimiter::default(),
+            receiver_order: ReceiverOrder::default(),
+            parked: Mutex::new(Parked::default()),
+            deferred: Mutex::new(HashMap::new()),
+            next_ticket: AtomicU64::new(0),
+            awaiting_links_max: AtomicUsize::new(AWAITING_LINKS_MAX),
+            keyed_strangers: Mutex::default(),
+            keyed_strangers_max: AtomicUsize::new(STRANGER_KEYED_LINKS_MAX),
+            awaiting_bytes_max: AtomicUsize::new(AWAITING_BYTES_MAX),
+            decap_delay_ms: AtomicU64::new(0),
+            decap_panics: std::sync::atomic::AtomicBool::new(false),
+            decaps: AtomicU64::new(0),
+            first_words_delay_ms: AtomicU64::new(0),
         }
     }
 
@@ -582,7 +887,7 @@ impl LinkSeals {
     /// refused or forgotten first.
     pub fn begin_route_fetch(&self, link: [u8; 16]) -> RouteAnswerRx {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.links().insert(
+        self.links().set(
             link,
             State::FetchingRoute(route_fetch::answer_reassembler()),
         );
@@ -606,20 +911,326 @@ impl LinkSeals {
     /// `None` when the link awaits no handshake or asked for no route.
     #[must_use]
     pub fn route_budget_left(&self, link: [u8; 16]) -> Option<Duration> {
-        match self.links().get(&link) {
-            Some(State::Awaiting {
-                route_requested_at: Some(at),
-                ..
-            }) => Some(route_fetch::ROUTE_FETCH_BUDGET.saturating_sub(at.elapsed())),
+        match self.links().map.get(&link) {
+            Some(
+                State::Awaiting {
+                    route_requested_at: Some(at),
+                    ..
+                }
+                | State::Keying {
+                    route_requested_at: Some(at),
+                    ..
+                },
+            ) => Some(route_fetch::ROUTE_FETCH_BUDGET.saturating_sub(at.elapsed())),
             _ => None,
         }
     }
 
-    /// Pre-seal route fetch — the per-sender receiver order (`sender` = the
-    /// link's proven identity, `None` before its LINKIDENTIFY). `false` means
-    /// refuse, before anything is read from the directory.
-    pub fn admit_route_sender(&self, sender: Option<&str>) -> bool {
-        self.route_sender_limiter.admit(sender)
+    /// CIRISEdge#947 — what is left of a keying link's [`KEYING_BUDGET`];
+    /// `None` for a link that is not keying.
+    #[must_use]
+    pub fn keying_budget_left(&self, link: [u8; 16]) -> Option<Duration> {
+        match self.links().map.get(&link) {
+            Some(State::Keying { since, .. }) => {
+                Some(KEYING_BUDGET.saturating_sub(since.elapsed()))
+            }
+            _ => None,
+        }
+    }
+
+    /// CIRISEdge#947 — the receiver order for one complete handshake.
+    ///
+    /// # Errors
+    /// The refusal, by name; the caller refuses the link.
+    pub fn admit_handshake(&self, sender: Sender<'_>) -> Result<(), SealRefusal> {
+        self.receiver_order.admit(sender)
+    }
+
+    fn deferred(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], (HandshakeJob, Instant)>> {
+        self.deferred
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// CIRISEdge#947 — hold a complete handshake for its link's identify, so
+    /// the receiver order judges the sender rather than the race. Handed back
+    /// when [`DEFERRED_HANDSHAKES_MAX`] already wait: judge it now.
+    ///
+    /// # Errors
+    /// The job, when there is no room for it.
+    pub fn defer_handshake(&self, job: HandshakeJob) -> Result<(), HandshakeJob> {
+        let mut deferred = self.deferred();
+        if deferred.len() >= DEFERRED_HANDSHAKES_MAX {
+            return Err(job);
+        }
+        deferred.insert(job.link, (job, Instant::now()));
+        Ok(())
+    }
+
+    /// CIRISEdge#947 — `link`'s identify arrived: its waiting handshake.
+    pub fn take_deferred(&self, link: [u8; 16]) -> Option<HandshakeJob> {
+        self.deferred().remove(&link).map(|(job, _)| job)
+    }
+
+    /// CIRISEdge#947 — whether any handshake waits for an identify.
+    #[must_use]
+    pub fn any_deferred(&self) -> bool {
+        !self.deferred().is_empty()
+    }
+
+    /// CIRISEdge#947 — the handshakes that have waited out [`IDENTIFY_GRACE`].
+    pub fn take_overdue_deferred(&self) -> Vec<HandshakeJob> {
+        let mut deferred = self.deferred();
+        let overdue: Vec<[u8; 16]> = deferred
+            .iter()
+            .filter(|(_, (_, since))| since.elapsed() >= IDENTIFY_GRACE)
+            .map(|(link, _)| *link)
+            .collect();
+        overdue
+            .iter()
+            .filter_map(|l| deferred.remove(l).map(|(job, _)| job))
+            .collect()
+    }
+
+    /// CIRISEdge#947 — run one job's KEX. Called by the keyer, off the event
+    /// path, with no seal lock held across the crypto. `None` when the link no
+    /// longer waits on this job: nothing is decapsulated for it.
+    #[must_use]
+    pub fn decapsulate(
+        &self,
+        job: &HandshakeJob,
+    ) -> Option<Result<(LinkTransit, String), AvHandshakeError>> {
+        assert!(
+            !self.decap_panics.swap(false, Ordering::Relaxed),
+            "the test seam's panic"
+        );
+        let live = matches!(
+            self.links().map.get(&job.link),
+            Some(State::Keying { ticket, .. }) if *ticket == job.ticket
+        );
+        if !live {
+            return None;
+        }
+        self.decaps.fetch_add(1, Ordering::Relaxed);
+        let delay = self.decap_delay_ms.load(Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        Some(av_transit_handshake::respond(
+            &job.handshake,
+            &job.link,
+            &self.local_key_id,
+            &self.secret,
+        ))
+    }
+
+    /// CIRISEdge#947 — apply one keying's outcome. The event loop alone calls
+    /// this. [`Inbound::Keyed`] or [`Inbound::Refuse`] for the job the link
+    /// waits on; [`Inbound::Closed`] for anything else, which the link's fate
+    /// has already overtaken and counted.
+    pub fn finish_keying(
+        &self,
+        link: [u8; 16],
+        ticket: u64,
+        outcome: Result<(LinkTransit, String), AvHandshakeError>,
+    ) -> Inbound {
+        let mut links = self.links();
+        let waits = matches!(
+            links.map.get(&link),
+            Some(State::Keying { ticket: t, .. }) if *t == ticket
+        );
+        if !waits {
+            return Inbound::Closed;
+        }
+        match outcome {
+            Ok((transit, claimed)) => {
+                links.set(
+                    link,
+                    State::Sealed(Arc::new(SealedLink::new(
+                        link,
+                        transit,
+                        Some(claimed.clone()),
+                    ))),
+                );
+                Inbound::Keyed { claimed }
+            }
+            Err(e) => {
+                links.set(link, State::Refused);
+                Inbound::Refuse(SealRefusal::Handshake(e))
+            }
+        }
+    }
+
+    /// CIRISEdge#947 — whether `link` is keying: its frame events wait
+    /// ([`Self::park`]).
+    #[must_use]
+    pub fn is_keying(&self, link: [u8; 16]) -> bool {
+        matches!(self.links().map.get(&link), Some(State::Keying { .. }))
+    }
+
+    fn parked(&self) -> std::sync::MutexGuard<'_, Parked> {
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// CIRISEdge#947 — one frame event on a keying link waits, whole, for the
+    /// outcome. `bytes` is its frame's size. A frame is never dropped from the
+    /// hold: past [`KEYING_HELD_FRAMES_MAX`], [`HELD_BYTES_MAX`] or
+    /// [`HELD_BYTES_NODE_MAX`] the link's holds are discarded and the caller
+    /// refuses the link, so its dialler re-sends on a fresh one.
+    ///
+    /// # Errors
+    /// [`SealRefusal::KeyingHold`].
+    pub fn park(&self, link: [u8; 16], event: NodeEvent, bytes: usize) -> Result<(), SealRefusal> {
+        let mut parked = self.parked();
+        let node = parked.bytes;
+        let (frames, held) = parked.links.entry(link).or_default();
+        if frames.len() >= KEYING_HELD_FRAMES_MAX
+            || *held + bytes > HELD_BYTES_MAX
+            || node + bytes > HELD_BYTES_NODE_MAX
+        {
+            let dropped = *held;
+            parked.links.remove(&link);
+            parked.bytes -= dropped;
+            return Err(SealRefusal::KeyingHold);
+        }
+        frames.push_back(event);
+        *held += bytes;
+        parked.bytes += bytes;
+        Ok(())
+    }
+
+    /// CIRISEdge#947 — the frame events that waited on `link`'s keying, oldest
+    /// first, and nothing held after.
+    pub fn take_parked(&self, link: [u8; 16]) -> VecDeque<NodeEvent> {
+        let mut parked = self.parked();
+        match parked.links.remove(&link) {
+            Some((frames, held)) => {
+                parked.bytes -= held;
+                frames
+            }
+            None => VecDeque::new(),
+        }
+    }
+
+    /// v44 — the holds, for the gauges, once a tick: `Awaiting` links and
+    /// their bytes, and the bytes held across every hold. The two
+    /// `before_keys` maps are walked here rather than kept in a total, as
+    /// their own bound is.
+    #[must_use]
+    pub fn occupancy(&self) -> (usize, usize, usize) {
+        let (links, bytes) = {
+            let t = self.links();
+            (t.ledger.links.len(), t.ledger.bytes)
+        };
+        let keying = self.parked().bytes;
+        let resources: usize = self.before_keys().values().map(|(_, b)| *b).sum();
+        let attribution: usize = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|h| h.bytes)
+            .sum();
+        (links, bytes, keying + resources + attribution)
+    }
+
+    /// CIRISEdge#947 — links the `Awaiting` cap refused since the last call,
+    /// for the caller to close and count. Their holds go with them.
+    pub fn take_evicted(&self) -> Vec<[u8; 16]> {
+        let evicted = std::mem::take(&mut self.links().evicted);
+        for link in &evicted {
+            self.before_keys().remove(link);
+        }
+        evicted
+    }
+
+    /// v44 LTS — a link with no standing just keyed. Returns the oldest such
+    /// links past [`STRANGER_KEYED_LINKS_MAX`], never this one, out of the
+    /// ledger: the caller closes each, unless it has since earned standing.
+    pub fn note_keyed_stranger(&self, link: [u8; 16]) -> Vec<[u8; 16]> {
+        let max = self.keyed_strangers_max.load(Ordering::Relaxed);
+        let mut ledger = self
+            .keyed_strangers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (by_age, places, next) = &mut *ledger;
+        places.entry(link).or_insert_with(|| {
+            by_age.insert(*next, link);
+            *next += 1;
+            *next - 1
+        });
+        let mut over = Vec::new();
+        while places.len() > max {
+            let Some(oldest) = by_age.values().find(|l| **l != link).copied() else {
+                break;
+            };
+            if let Some(age) = places.remove(&oldest) {
+                by_age.remove(&age);
+            }
+            over.push(oldest);
+        }
+        over
+    }
+
+    /// Test knob: [`STRANGER_KEYED_LINKS_MAX`].
+    pub fn set_keyed_strangers_max(&self, max: usize) {
+        self.keyed_strangers_max.store(max, Ordering::Relaxed);
+    }
+
+    /// Test knobs: the `Awaiting` caps.
+    pub fn set_awaiting_caps(&self, links: usize, bytes: usize) {
+        self.awaiting_links_max.store(links, Ordering::Relaxed);
+        self.awaiting_bytes_max.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Test seam: hold each decapsulation this long, off the event path.
+    pub fn set_decap_delay(&self, delay: Duration) {
+        self.decap_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Test seam: the next decapsulation panics.
+    pub fn panic_next_decap(&self) {
+        self.decap_panics.store(true, Ordering::Relaxed);
+    }
+
+    /// Test seam: hold a responder's first words on a keyed link this long.
+    pub fn set_first_words_delay(&self, delay: Duration) {
+        self.first_words_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The first-words test seam's wait; nothing in production.
+    pub async fn first_words_delay(&self) {
+        let ms = self.first_words_delay_ms.load(Ordering::Relaxed);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+    }
+
+    /// Test knob: the node-wide stranger handshake rate.
+    pub fn set_stranger_handshake_cap(&self, cap: u32) {
+        self.receiver_order.set_stranger_cap(cap);
+    }
+
+    /// Decapsulations run since this table was made.
+    #[must_use]
+    pub fn decapsulations(&self) -> u64 {
+        self.decaps.load(Ordering::Relaxed)
+    }
+
+    fn enforce_awaiting_caps(&self, links: &mut LinkTable, keep: &[u8; 16]) {
+        links.enforce_caps(
+            keep,
+            self.awaiting_links_max.load(Ordering::Relaxed),
+            self.awaiting_bytes_max.load(Ordering::Relaxed),
+        );
     }
 
     /// Test knob: the node-wide route-request cap per window.
@@ -627,7 +1238,7 @@ impl LinkSeals {
         self.route_limiter.set_cap(cap);
     }
 
-    fn links(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], State>> {
+    fn links(&self) -> std::sync::MutexGuard<'_, LinkTable> {
         self.links
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -698,7 +1309,7 @@ impl LinkSeals {
     /// it is delivered, and nothing is sent on it, until
     /// [`Self::install_initiator`].
     pub fn begin_initiator(&self, link: [u8; 16]) {
-        self.links().insert(link, State::Initiating);
+        self.links().set(link, State::Initiating);
     }
 
     /// Build the dialler's handshake for `link` against `pair`, claiming
@@ -721,7 +1332,7 @@ impl LinkSeals {
 
     /// Install the dialler's keys: the link is sealed from now on.
     pub fn install_initiator(&self, link: [u8; 16], transit: LinkTransit) {
-        self.links().insert(
+        self.links().set(
             link,
             State::Sealed(Arc::new(SealedLink::new(link, transit, None))),
         );
@@ -732,7 +1343,7 @@ impl LinkSeals {
     /// [`Self::seal_first_contact`] seals on it. `false` when the link is not
     /// keyed.
     pub fn pin_first_contact_only(&self, link: [u8; 16]) -> bool {
-        match self.links().get(&link) {
+        match self.links().map.get(&link) {
             Some(State::Sealed(s)) => {
                 s.pinned.store(true, Ordering::Relaxed);
                 true
@@ -744,58 +1355,81 @@ impl LinkSeals {
     /// CC 3.2 (f) — whether `link` was keyed from a pairing-pinned pair.
     #[must_use]
     pub fn is_pinned(&self, link: [u8; 16]) -> bool {
-        matches!(self.links().get(&link), Some(State::Sealed(s)) if s.pinned.load(Ordering::Relaxed))
+        matches!(self.links().map.get(&link), Some(State::Sealed(s)) if s.pinned.load(Ordering::Relaxed))
     }
 
     /// Record a link a peer dialled, awaiting its handshake. `true` only when
     /// the link was not known before (the caller then starts its budget).
     pub fn begin_responder(&self, link: [u8; 16]) -> bool {
         let mut links = self.links();
-        if links.contains_key(&link) {
+        if links.map.contains_key(&link) {
             return false;
         }
-        links.insert(
+        links.set(
             link,
             State::Awaiting {
                 reasm: Reassembler::new(),
                 route_requested_at: None,
             },
         );
+        self.enforce_awaiting_caps(&mut links, &link);
         true
     }
 
     /// One frame received on `link` over `lane`. `we_dialled` is whether
-    /// this node opened the link (its connect-time record).
+    /// this node opened the link (its connect-time record). `sender` is the
+    /// link's proven identity; only a route request reads it, so the caller
+    /// need fetch it only for one ([`route_fetch::is_route_request`]).
     /// Only the Channel carries a handshake; any other lane is
     /// [`Self::open`].
-    pub fn inbound(&self, link: [u8; 16], lane: Lane, bytes: &[u8], we_dialled: bool) -> Inbound {
+    pub fn inbound(
+        &self,
+        link: [u8; 16],
+        lane: Lane,
+        bytes: &[u8],
+        we_dialled: bool,
+        sender: Option<&str>,
+    ) -> Inbound {
         if lane != Lane::Channel {
             return self.open(link, lane, bytes);
         }
         let mut links = self.links();
-        let state = match links.get_mut(&link) {
-            Some(s) => s,
-            None if we_dialled => {
-                links.insert(link, State::Refused);
+        if !links.map.contains_key(&link) {
+            if we_dialled {
+                links.set(link, State::Refused);
                 return Inbound::Refuse(SealRefusal::FrameBeforeKeys);
             }
-            None => links.entry(link).or_insert_with(|| State::Awaiting {
-                reasm: Reassembler::new(),
-                route_requested_at: None,
-            }),
+            links.set(
+                link,
+                State::Awaiting {
+                    reasm: Reassembler::new(),
+                    route_requested_at: None,
+                },
+            );
+            self.enforce_awaiting_caps(&mut links, &link);
+        }
+        let Some(state) = links.map.get_mut(&link) else {
+            return Inbound::Closed;
         };
         match state {
             State::Refused => Inbound::Closed,
             State::Initiating => {
-                *state = State::Refused;
+                links.set(link, State::Refused);
                 Inbound::Refuse(SealRefusal::FrameBeforeKeys)
             }
             State::FetchingRoute(reasm) => {
                 let (next, out) = self.route_answer_part(link, reasm.push(bytes));
                 if let Some(next) = next {
-                    *state = next;
+                    links.set(link, next);
                 }
                 out
+            }
+            // The caller parks a keying link's frames before they get here
+            // (`Self::park`); one that does is its keying's to order, so it
+            // cannot be opened or dropped here.
+            State::Keying { .. } => {
+                links.set(link, State::Refused);
+                Inbound::Refuse(SealRefusal::KeyingHold)
             }
             State::Sealed(sealed) => {
                 let sealed = Arc::clone(sealed);
@@ -814,33 +1448,43 @@ impl LinkSeals {
                     return match self.admit_route_request(
                         reasm.started(),
                         route_requested_at,
+                        sender,
                         bytes,
                     ) {
                         Ok(out) => out,
                         Err(refusal) => {
-                            *state = State::Refused;
+                            links.set(link, State::Refused);
                             Inbound::Refuse(refusal)
                         }
                     };
                 }
-                let answered = match reasm.push(bytes) {
-                    Ok(None) => return Inbound::Pending,
-                    Ok(Some(hs)) => {
-                        av_transit_handshake::respond(&hs, &link, &self.local_key_id, &self.secret)
+                let route_requested_at = *route_requested_at;
+                let pushed = reasm.push(bytes);
+                let buffered = reasm.buffered();
+                match pushed {
+                    Ok(None) => {
+                        links.ledger.set_bytes(&link, buffered);
+                        self.enforce_awaiting_caps(&mut links, &link);
+                        Inbound::Pending
                     }
-                    Err(e) => Err(e),
-                };
-                match answered {
-                    Ok((transit, claimed)) => {
-                        *state = State::Sealed(Arc::new(SealedLink::new(
+                    Ok(Some(handshake)) => {
+                        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+                        links.set(
                             link,
-                            transit,
-                            Some(claimed.clone()),
-                        )));
-                        Inbound::Keyed { claimed }
+                            State::Keying {
+                                ticket,
+                                since: Instant::now(),
+                                route_requested_at,
+                            },
+                        );
+                        Inbound::Handshake(HandshakeJob {
+                            link,
+                            ticket,
+                            handshake,
+                        })
                     }
                     Err(e) => {
-                        *state = State::Refused;
+                        links.set(link, State::Refused);
                         Inbound::Refuse(SealRefusal::Handshake(e))
                     }
                 }
@@ -884,14 +1528,21 @@ impl LinkSeals {
     /// Pre-seal route fetch, a peer-dialled link: a route request as the
     /// first frame. The receiver order runs BEFORE the request is read past
     /// its tag: once per link (`requested_at` unset, no handshake part held),
-    /// then the node-wide rate. On `Err` the caller refuses the link.
+    /// then the sender's rate, then the node-wide rate LAST, so one sender's
+    /// refused requests spend only its own budget. On `Err` the caller refuses
+    /// the link.
     fn admit_route_request(
         &self,
         handshake_started: bool,
         requested_at: &mut Option<Instant>,
+        sender: Option<&str>,
         bytes: &[u8],
     ) -> Result<Inbound, SealRefusal> {
-        if requested_at.is_some() || handshake_started || !self.route_limiter.admit() {
+        if requested_at.is_some()
+            || handshake_started
+            || !self.route_sender_limiter.admit(sender)
+            || !self.route_limiter.admit()
+        {
             return Err(SealRefusal::RouteFetch(RouteFetchError::RateLimited));
         }
         let req = route_fetch::decode_request(bytes).map_err(SealRefusal::RouteFetch)?;
@@ -913,7 +1564,7 @@ impl LinkSeals {
         lane: Lane,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, SealRefusal> {
-        let sealed = match self.links().get(&link) {
+        let sealed = match self.links().map.get(&link) {
             Some(State::Sealed(s)) => Arc::clone(s),
             _ => return Err(SealRefusal::Unsealed),
         };
@@ -937,7 +1588,7 @@ impl LinkSeals {
         lane: Lane,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, SealRefusal> {
-        let sealed = match self.links().get(&link) {
+        let sealed = match self.links().map.get(&link) {
             Some(State::Sealed(s)) if s.pinned.load(Ordering::Relaxed) => Arc::clone(s),
             _ => return Err(SealRefusal::Unsealed),
         };
@@ -974,10 +1625,10 @@ impl LinkSeals {
         // through `self.refuse` (which takes the lock again).
         let sealed = {
             let mut links = self.links();
-            match links.get(&link) {
+            match links.map.get(&link) {
                 Some(State::Sealed(s)) => Arc::clone(s),
                 Some(State::Refused) => return Inbound::Closed,
-                Some(State::Awaiting { .. }) => {
+                Some(State::Awaiting { .. } | State::Keying { .. }) => {
                     // A Resource can overtake the last handshake part (they
                     // ride different event planes): hold it sealed and open
                     // it once the link is keyed, within the hold's bounds.
@@ -989,7 +1640,7 @@ impl LinkSeals {
                     return Inbound::Drop(crate::observability::LINK_SEAL_DROPPED_BEFORE_KEYS);
                 }
                 _ => {
-                    links.insert(link, State::Refused);
+                    links.set(link, State::Refused);
                     return Inbound::Refuse(SealRefusal::Unsealed);
                 }
             }
@@ -1014,7 +1665,7 @@ impl LinkSeals {
     /// this node responded on, the handshake's claimed initiator.
     #[must_use]
     pub fn transit(&self, link: [u8; 16]) -> Option<(LinkTransit, Option<String>)> {
-        match self.links().get(&link) {
+        match self.links().map.get(&link) {
             Some(State::Sealed(s)) => Some((s.transit.clone(), s.claimed_initiator.clone())),
             _ => None,
         }
@@ -1024,7 +1675,7 @@ impl LinkSeals {
     /// link it dialled (the KEX authenticated that peer) or one not sealed.
     #[must_use]
     pub fn claimed_initiator(&self, link: [u8; 16]) -> Option<String> {
-        match self.links().get(&link) {
+        match self.links().map.get(&link) {
             Some(State::Sealed(s)) if s.transit.role() == TransitRole::Responder => {
                 s.claimed_initiator.clone()
             }
@@ -1036,35 +1687,42 @@ impl LinkSeals {
     /// initiating or refused).
     #[must_use]
     pub fn knows(&self, link: [u8; 16]) -> bool {
-        self.links().contains_key(&link)
+        self.links().map.contains_key(&link)
     }
 
     /// Whether `link` carries keys.
     #[must_use]
     pub fn is_sealed(&self, link: [u8; 16]) -> bool {
-        matches!(self.links().get(&link), Some(State::Sealed(_)))
+        matches!(self.links().map.get(&link), Some(State::Sealed(_)))
     }
 
     /// The responder's budget ran out: `true` (and the link marked refused)
-    /// when it was still awaiting its handshake.
+    /// when it was still awaiting its handshake or the keying of one. A
+    /// keying's outcome landing after this is discarded by
+    /// [`Self::finish_keying`], and a job not yet started does not run.
     pub fn expire(&self, link: [u8; 16]) -> bool {
         let mut links = self.links();
-        match links.get_mut(&link) {
-            Some(s @ State::Awaiting { .. }) => {
-                *s = State::Refused;
-                drop(links);
-                self.before_keys().remove(&link);
-                true
-            }
-            _ => false,
+        if !matches!(
+            links.map.get(&link),
+            Some(State::Awaiting { .. } | State::Keying { .. })
+        ) {
+            return false;
         }
+        links.set(link, State::Refused);
+        drop(links);
+        self.before_keys().remove(&link);
+        self.take_parked(link);
+        self.deferred().remove(&link);
+        true
     }
 
     /// Mark `link` refused: nothing more is sealed for it or opened on it.
     pub fn refuse(&self, link: [u8; 16]) {
-        self.links().insert(link, State::Refused);
+        self.links().set(link, State::Refused);
         self.before_keys().remove(&link);
         self.route_answers().remove(&link);
+        self.take_parked(link);
+        self.deferred().remove(&link);
     }
 
     /// Forget a closed link (its keys and anything held for it).
@@ -1076,6 +1734,16 @@ impl LinkSeals {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(link);
         self.before_keys().remove(link);
+        self.take_parked(*link);
+        self.deferred().remove(link);
+        let mut ledger = self
+            .keyed_strangers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (by_age, places, _) = &mut *ledger;
+        if let Some(age) = places.remove(link) {
+            by_age.remove(&age);
+        }
     }
 
     fn before_keys(&self) -> std::sync::MutexGuard<'_, BeforeKeys> {

@@ -177,10 +177,10 @@ impl SelfSignedRouteProducer {
                 key_id = %signer.key_id,
                 dest = %hex::encode(dest_hash),
                 "self route under an AGENT-typed federation key: an agent does not announce \
-                 at a transit key (it is reached through its node's binding). Run the \
-                 transport under the node key (use_node_identity). The route is still \
-                 published on this line; a node key bound to the same destination wins every \
-                 attribution tie (history: CIRISEdge#888)"
+                 at a transit key (it is reached through its node's binding). persist v61 \
+                 REFUSES the route (transport_destination_agent_key), so this node publishes \
+                 NO route and peers cannot attribute its frames. Run the transport under the \
+                 node key (use_node_identity) (history: CIRISEdge#888, history: CIRISPersist#1122)"
             );
         }
     }
@@ -441,13 +441,44 @@ fn transit_kex_member(pair: &TransitKexPair) -> serde_json::Value {
     })
 }
 
-/// The row's `asserted_at`: now, µs-truncated, and strictly after `not_after`
-/// (the stored signed row's), so a re-sign never lands on the stored clock.
+/// The row's `asserted_at`: now, truncated to the substrate's millisecond, and
+/// strictly after `not_after` (the stored signed row's), so a re-sign never
+/// lands on the stored clock.
+///
+/// persist v61 (CC 2.6.2 strict): the bump is ONE MILLISECOND. A signed instant
+/// is `.sssZ` and nothing finer verifies, so the v43 one-microsecond bump
+/// produced an instant the canonical form cannot carry (persist refuses a
+/// sub-millisecond `asserted_at` on a signed route).
 fn next_asserted_at(not_after: Option<DateTime<Utc>>) -> DateTime<Utc> {
     let now = ciris_persist::federation::admission::truncate_to_substrate_resolution(Utc::now());
     match not_after {
-        Some(floor) if now <= floor => floor + chrono::Duration::microseconds(1),
+        Some(floor) if now <= floor => {
+            ciris_persist::federation::admission::truncate_to_substrate_resolution(floor)
+                + chrono::Duration::milliseconds(1)
+        }
         _ => now,
+    }
+}
+
+/// persist v61 (CC 2.6.2 strict) — the signed route envelope writes its
+/// instants in the one canonical form, `YYYY-MM-DDTHH:MM:SS.sssZ`, whatever
+/// the typed row's serde writes (chrono's default omits the fraction on a
+/// whole second, and persist refuses any other form at admission). The typed
+/// column holds the same millisecond, so the envelope and the column agree.
+fn render_route_instants(envelope: &mut serde_json::Value, row: &TransportDestination) {
+    use ciris_persist::federation::admission::render_signed_instant;
+    let Some(obj) = envelope.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "asserted_at".into(),
+        serde_json::Value::String(render_signed_instant(row.asserted_at)),
+    );
+    if let Some(retired_at) = row.retired_at {
+        obj.insert(
+            "retired_at".into(),
+            serde_json::Value::String(render_signed_instant(retired_at)),
+        );
     }
 }
 
@@ -509,6 +540,7 @@ async fn build_and_sign_self_route(
         tracing::warn!(error = %e, "history: CIRISEdge#406: route envelope serialize failed");
         SelfRouteOutcome::Deferred(format!("envelope serialize: {e}"))
     })?;
+    render_route_instants(&mut envelope, &row);
     if let Some(pair) = transit {
         let Some(obj) = envelope.as_object_mut() else {
             return Err(SelfRouteOutcome::Deferred(
@@ -654,7 +686,7 @@ mod tests {
     use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
     use ciris_persist::federation::types::{algorithm, identity_type, KeyRecord, SignedKeyRecord};
     use ciris_persist::federation::FederationDirectory;
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
 
     const DEST: [u8; 16] = [0xab; 16];
     const OTHER_DEST: [u8; 16] = [0xcd; 16];
@@ -705,12 +737,12 @@ mod tests {
 
     /// Register `signer`'s pubkeys as a federation key so its signatures
     /// verify against the PINNED directory entry at admission.
-    async fn register(backend: &Arc<MemoryBackend>, signer: &LocalSigner) {
+    async fn register(backend: &Arc<SqliteBackend>, signer: &LocalSigner) {
         register_as(backend, signer, identity_type::NODE).await;
     }
 
     /// [`register`] under a chosen `identity_type` (CIRISEdge#888).
-    async fn register_as(backend: &Arc<MemoryBackend>, signer: &LocalSigner, kind: &str) {
+    async fn register_as(backend: &Arc<SqliteBackend>, signer: &LocalSigner, kind: &str) {
         let ed_pub = HardwareSigner::public_key(signer.classical.as_ref())
             .await
             .expect("ed25519 pubkey");
@@ -758,8 +790,8 @@ mod tests {
             .clone()
     }
 
-    fn backend() -> Arc<MemoryBackend> {
-        Arc::new(MemoryBackend::new())
+    fn backend() -> Arc<SqliteBackend> {
+        Arc::new(ciris_persist::store::test_backend::test_backend())
     }
 
     /// The headline field-provenance test: the producer emits through
@@ -811,28 +843,28 @@ mod tests {
         );
     }
 
-    /// CIRISEdge#888 — a transport under an agent-typed key is named (once)
-    /// but still publishes on this line: refusing would drop pre-split nodes
-    /// off the mesh. The #888 fix is attribution, where an agent row loses
-    /// every tie to a node key.
+    /// CIRISEdge#888 — a transport under an agent-typed key is named (once).
+    /// persist v61 (CIRISPersist#1122): the route is REFUSED by name
+    /// (`transport_destination_agent_key`) — the dated fleet floor this line
+    /// waited for — and the outcome says so (Deferred, never swallowed).
     #[tokio::test]
-    async fn an_agent_typed_key_is_named_and_still_publishes_888() {
+    async fn an_agent_typed_key_is_named_and_its_route_refused_888() {
         let backend = backend();
         let signer = hybrid_signer("self-route-agent");
         register_as(&backend, &signer, identity_type::AGENT).await;
         let dir: &dyn RootingDirectory = backend.as_ref();
         let producer = SelfSignedRouteProducer::new();
         let out = producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await;
-        assert_eq!(
-            out,
-            SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Inserted)
+        assert!(
+            matches!(&out, SelfRouteOutcome::Deferred(why) if why.contains("transport_destination_agent_key")),
+            "persist refuses an agent-key route by name: {out:?}"
         );
         assert!(
             producer.warned_actor_key.load(Ordering::Relaxed),
             "named once"
         );
         assert!(
-            dir.hybrid_transport_binding_exists(&signer.key_id, DEST)
+            !dir.hybrid_transport_binding_exists(&signer.key_id, DEST)
                 .await
         );
     }
@@ -1135,7 +1167,7 @@ mod tests {
         }
     }
 
-    async fn backend_with(signer: &LocalSigner) -> Arc<MemoryBackend> {
+    async fn backend_with(signer: &LocalSigner) -> Arc<SqliteBackend> {
         let b = backend();
         register(&b, signer).await;
         b
@@ -1223,9 +1255,18 @@ mod tests {
     fn next_asserted_at_strictly_exceeds_the_stored_clock() {
         let ahead = Utc::now() + chrono::Duration::seconds(60);
         let ahead = ciris_persist::federation::admission::truncate_to_substrate_resolution(ahead);
+        // persist v61 (CC 2.6.2 strict): the bump is one millisecond, so the
+        // re-signed instant is still `.sssZ`.
         assert_eq!(
             next_asserted_at(Some(ahead)),
-            ahead + chrono::Duration::microseconds(1)
+            ahead + chrono::Duration::milliseconds(1)
+        );
+        assert_eq!(
+            ciris_persist::federation::admission::truncate_to_substrate_resolution(
+                next_asserted_at(Some(ahead))
+            ),
+            next_asserted_at(Some(ahead)),
+            "the bumped instant carries no sub-millisecond part"
         );
         let behind = Utc::now() - chrono::Duration::seconds(60);
         assert!(next_asserted_at(Some(behind)) > behind);

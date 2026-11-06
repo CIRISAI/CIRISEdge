@@ -174,6 +174,67 @@ pub async fn prime_v7_peer_pair(
         .await;
 }
 
+/// CC 5.4.3 rc16 — `CIRIS_EDGE_TEST_SHAPING=server` runs every transport a
+/// suite builds under the server class's fleet default (shaping ON on every
+/// identity link), so a suite witnesses its traffic with shaping on: rows on
+/// the shaped link, bulk on the unshaped bulk plane. Unset, nothing changes;
+/// a transport whose suite set its own policy is never overridden.
+#[cfg(feature = "transport-reticulum")]
+#[allow(dead_code)]
+pub fn apply_env_shaping(cfg: &mut ciris_edge::transport::reticulum::ReticulumTransportConfig) {
+    use ciris_edge::transport::link_shaping::{DeviceKind, DeviceState, ShapingPolicy};
+    // Only where the suite left shaping at its default: a test that names
+    // its own policy (tests/link_shaping_e1.rs) keeps it.
+    if std::env::var("CIRIS_EDGE_TEST_SHAPING").as_deref() == Ok("server")
+        && cfg.shaping == ShapingPolicy::default()
+    {
+        // The production mix: with `CIRIS_EDGE_TEST_SHAPING_SERVERS=<key-id
+        // prefixes>` only those nodes are server-class and every other node
+        // is explicitly Off (a person who did not opt in), so lower-of-two
+        // leaves their links to the server unshaped.
+        let servers = std::env::var("CIRIS_EDGE_TEST_SHAPING_SERVERS").unwrap_or_default();
+        let selected = servers.is_empty()
+            || servers
+                .split(',')
+                .any(|p| !p.is_empty() && cfg.local_key_id.starts_with(p.trim()));
+        if selected {
+            let device = DeviceState::of(DeviceKind::Server);
+            cfg.shaping = ShapingPolicy::for_device(&device);
+            cfg.device = device;
+        } else {
+            cfg.shaping = ShapingPolicy {
+                layer_reserve_links: 0,
+                ..ShapingPolicy::default()
+            };
+        }
+    }
+}
+
+/// `CIRIS_EDGE_TEST_SHAPING_SEATS=<key-id prefixes>`: the nodes whose key id
+/// starts with one are serve seats to each other (the seat tier, Eric
+/// 2026-11-04), as the signed bundle's `serve_nodes` would make them in
+/// production. Applied after construction.
+#[cfg(feature = "transport-reticulum")]
+#[allow(dead_code)]
+pub fn apply_env_seats(
+    transport: &ciris_edge::transport::reticulum::ReticulumTransport,
+    local_key_id: &str,
+) {
+    let seats = std::env::var("CIRIS_EDGE_TEST_SHAPING_SEATS").unwrap_or_default();
+    if seats.is_empty() {
+        return;
+    }
+    let prefixes: Vec<String> = seats
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.trim().to_owned())
+        .collect();
+    let own = prefixes
+        .iter()
+        .any(|p| local_key_id.starts_with(p.as_str()));
+    transport.set_seat_prefixes_for_test(prefixes, own);
+}
+
 /// Build a [`ReticulumTransport`], retrying on the transient
 /// "address already in use" race.
 ///
@@ -212,10 +273,15 @@ where
     const MAX_ATTEMPTS: usize = 16;
     let mut last_err = None;
     for _ in 0..MAX_ATTEMPTS {
-        let (cfg, auth) = make().await;
+        let (mut cfg, auth) = make().await;
+        apply_env_shaping(&mut cfg);
         let addr = cfg.listen_addr;
+        let cfg_key = cfg.local_key_id.clone();
         match ReticulumTransport::new(cfg, auth).await {
-            Ok(transport) => return (Arc::new(transport), addr),
+            Ok(transport) => {
+                apply_env_seats(&transport, &cfg_key);
+                return (Arc::new(transport), addr);
+            }
             Err(err) if is_addr_in_use(&err) => {
                 // Re-pick a port and rebuild on the next loop iteration.
                 last_err = Some(err);
@@ -255,14 +321,17 @@ where
     const MAX_ATTEMPTS: usize = 16;
     let mut last_err = None;
     for _ in 0..MAX_ATTEMPTS {
-        let (cfg, auth) = make().await;
+        let (mut cfg, auth) = make().await;
+        apply_env_shaping(&mut cfg);
         let addr = cfg.listen_addr;
+        let cfg_key = cfg.local_key_id.clone();
         match ReticulumTransport::new(cfg, auth).await {
             Ok(transport) => {
+                apply_env_seats(&transport, &cfg_key);
                 return (
                     Arc::new(transport.with_metrics(Some(metrics.clone()))),
                     addr,
-                )
+                );
             }
             Err(err) if is_addr_in_use(&err) => {
                 last_err = Some(err);

@@ -218,10 +218,6 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         WithholdReason::IdentityRowNodeNotAnnounced
         | WithholdReason::IdentityRowAnnounceUnresolved => CiParameter::Recipient,
 
-        // Eric 2026-10-30 — a relayed route reaches only the peers its node's
-        // owner consented to: a recipient bound, like the announce reach.
-        WithholdReason::RouteNotConsented => CiParameter::Recipient,
-
         // CIRISEdge#758 (CC 5.4.6) — a group's record reaches its members and
         // its live invitees; anyone else is outside the group's context. A
         // recipient bound: the record is admitted information, the audience
@@ -300,7 +296,9 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         WithholdReason::ServeCapabilityMissing
         | WithholdReason::ServeCapabilityReadError
         | WithholdReason::ServeCapabilityNotRooted
-        | WithholdReason::RecipientCapabilityRestriction => CiParameter::TransmissionPrinciple,
+        | WithholdReason::RecipientCapabilityRestriction
+        | WithholdReason::TraceNotConsentedToRecipient
+        | WithholdReason::TraceConsentReadError => CiParameter::TransmissionPrinciple,
 
         // CIRISEdge#169 — a propagation node's TERMS OF CARRIAGE. Each of
         // these is the node's published rule about how a flow may pass
@@ -862,7 +860,7 @@ mod tests {
     /// So: when adding a reason, add it here too, and on a merge that touches
     /// this file check the count against the enum rather than trusting a
     /// green suite.
-    const ALL_REASONS: [WithholdReason; 51] = [
+    const ALL_REASONS: [WithholdReason; 52] = [
         WithholdReason::EnvelopeUnfetchable,
         WithholdReason::LocalIdentityMissing,
         WithholdReason::SendSetUnresolved,
@@ -872,6 +870,8 @@ mod tests {
         WithholdReason::ServeCapabilityNotRooted,
         WithholdReason::TrustRootWalkError,
         WithholdReason::RecipientCapabilityRestriction,
+        WithholdReason::TraceNotConsentedToRecipient,
+        WithholdReason::TraceConsentReadError,
         WithholdReason::RowNotSerializable,
         WithholdReason::RowHashUndecodable,
         WithholdReason::ConfigPaused,
@@ -912,7 +912,6 @@ mod tests {
         WithholdReason::HoldingScopeRecipientReadError,
         WithholdReason::IdentityRowNodeNotAnnounced,
         WithholdReason::IdentityRowAnnounceUnresolved,
-        WithholdReason::RouteNotConsented,
         WithholdReason::GroupRecordNotMemberOrInvitee,
     ];
 }

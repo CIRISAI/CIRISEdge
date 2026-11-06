@@ -127,6 +127,22 @@ pub trait ReplicationDirectory: Send + Sync {
         Vec::new()
     }
 
+    /// CIRISEdge#937 — [`Self::subject_holdings`] with its status: the same
+    /// refs, plus the throttle when the per-requester lookup limiter refused
+    /// this Pull for the window. The production bridge overrides it; the
+    /// default is the refs with no status.
+    async fn subject_pull_answer(
+        &self,
+        kind: EnvelopeKind,
+        subject_key_id: &str,
+        peer_key_id: Option<&str>,
+    ) -> super::summary::SubjectPullAnswer {
+        super::summary::SubjectPullAnswer::served(
+            self.subject_holdings(kind, subject_key_id, peer_key_id)
+                .await,
+        )
+    }
+
     /// CIRISEdge#474 — the accord-quorum-evidence CURSOR serve reader: the
     /// byte-exact bundles held with `evidence_at > since`, JSON-serialized ready to
     /// wrap in a `Deliver`. Answers an inbound `CursorPull` for a plane that has NO
@@ -250,6 +266,14 @@ pub trait ReplicationDirectory: Send + Sync {
     ///     super::summary::StateProvider::take_missing_signer_for
     fn take_missing_signer_for(&self, _peer_key_id: &str) -> Option<String> {
         None
+    }
+
+    /// See [`StateProvider::take_released_rows_for`].
+    ///
+    /// [`StateProvider::take_released_rows_for`]:
+    ///     super::summary::StateProvider::take_released_rows_for
+    fn take_released_rows_for(&self, _peer_key_id: &str, _kind: EnvelopeKind) -> Vec<[u8; 32]> {
+        Vec::new()
     }
 
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
@@ -379,6 +403,10 @@ impl StateProvider for DirectoryStateAdapter {
         self.inner.take_missing_signer_for(peer_key_id)
     }
 
+    fn take_released_rows_for(&self, peer_key_id: &str, kind: EnvelopeKind) -> Vec<[u8; 32]> {
+        self.inner.take_released_rows_for(peer_key_id, kind)
+    }
+
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
         self.inner.retry_suppressed(kind, envelope_hash)
     }
@@ -416,6 +444,18 @@ impl StateProvider for DirectoryStateAdapter {
     async fn subject_refs(&self, kind: EnvelopeKind, subject_key_id: &str) -> Vec<EnvelopeRef> {
         self.inner
             .subject_holdings(kind, subject_key_id, self.peer_key_id.as_deref())
+            .await
+    }
+
+    /// CIRISEdge#937 — the Pull answer WITH its throttle status, for the
+    /// session's `on_pull`. Same bound requester, same entitlement gate.
+    async fn subject_pull_answer(
+        &self,
+        kind: EnvelopeKind,
+        subject_key_id: &str,
+    ) -> super::summary::SubjectPullAnswer {
+        self.inner
+            .subject_pull_answer(kind, subject_key_id, self.peer_key_id.as_deref())
             .await
     }
 

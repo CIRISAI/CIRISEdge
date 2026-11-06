@@ -5,7 +5,7 @@
 //!
 //! The two §Q signed wire shapes — [`StorageBudgetV1`] (owner per-`cohort_scope`
 //! budget + `pinned_class`) and [`CorpusWantV1`] (want/have + `size_cap`) — live
-//! in [`ciris_verify_core::holonomic::storage_contention`], the canonical home
+//! in [`ciris_verify_core::substrate::storage_contention`], the canonical home
 //! for every §19/§Q signed shape, on verify's shared `Preimage` builder +
 //! bound-hybrid gate (verify v8.7.0). Edge **re-exports** them here so the
 //! replication layer keeps one import path, and adds the B5 consumption
@@ -30,8 +30,8 @@ use std::collections::BTreeMap;
 use ciris_persist::fountain::FountainHeldMeta;
 
 // ── the canonical §Q signed shapes + verify gates (verify-owned) ──────
-pub use ciris_verify_core::holonomic::preimage::{DOMAIN_CORPUS_WANT, DOMAIN_STORAGE_BUDGET};
-pub use ciris_verify_core::holonomic::storage_contention::{
+pub use ciris_verify_core::substrate::preimage::{DOMAIN_CORPUS_WANT, DOMAIN_STORAGE_BUDGET};
+pub use ciris_verify_core::substrate::storage_contention::{
     verify_corpus_want_v1, verify_storage_budget_v1, CorpusWantV1, ScopeBudget, StorageBudgetV1,
     StorageContentionError, StorageContentionVerification,
 };

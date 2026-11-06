@@ -167,7 +167,7 @@ async fn fresh_backend() -> (Arc<SqliteBackend>, FedKey) {
     let existing = FedKey::new("existing-peer-mut-ffi", 0xB0);
     for rec in [
         signed_record(&steward, &steward, "steward"),
-        signed_record(&existing, &steward, "agent"),
+        signed_record(&existing, &steward, "node"),
     ] {
         backend
             .put_public_key(SignedKeyRecord { record: rec })
@@ -552,6 +552,7 @@ fn edge_peer_trust_variants_align_with_persist_trust_class_wire_strings() {
 struct RecordingTransport {
     attached: std::sync::Mutex<Option<ciris_edge::observability::EdgeMetrics>>,
     evictions_to_report: u64,
+    ladder: std::sync::Mutex<Option<Arc<ciris_edge::load_ladder::SharedLadder>>>,
 }
 
 #[async_trait]
@@ -578,6 +579,9 @@ impl Transport for RecordingTransport {
     }
     fn attached_metrics(&self) -> Option<ciris_edge::observability::EdgeMetrics> {
         self.attached.lock().expect("attached").clone()
+    }
+    fn attach_load_ladder(&self, ladder: Arc<ciris_edge::load_ladder::SharedLadder>) {
+        *self.ladder.lock().expect("ladder") = Some(ladder);
     }
     fn refresh_metrics(&self) {
         if let Some(m) = self.attached.lock().expect("attached").as_ref() {
@@ -623,6 +627,7 @@ async fn the_edge_attaches_its_metrics_to_every_transport_at_build_809() {
     let transport = Arc::new(RecordingTransport {
         attached: std::sync::Mutex::new(None),
         evictions_to_report: 0,
+        ladder: std::sync::Mutex::new(None),
     });
     let edge =
         build_edge_with_transport(tmp.path(), backend, transport.clone() as Arc<dyn Transport>)
@@ -656,6 +661,7 @@ async fn the_edge_adopts_a_bag_the_transport_was_built_with_809() {
     let transport = Arc::new(RecordingTransport {
         attached: std::sync::Mutex::new(Some(callers_bag.clone())),
         evictions_to_report: 0,
+        ladder: std::sync::Mutex::new(None),
     });
     let edge =
         build_edge_with_transport(tmp.path(), backend, transport.clone() as Arc<dyn Transport>)
@@ -680,6 +686,7 @@ async fn build_refuses_transports_with_different_metrics_bags_809() {
         Arc::new(RecordingTransport {
             attached: std::sync::Mutex::new(bag),
             evictions_to_report: 0,
+            ladder: std::sync::Mutex::new(None),
         })
     };
     let build = |a: Arc<dyn Transport>, b: Arc<dyn Transport>, tmp: std::path::PathBuf| async move {
@@ -738,6 +745,7 @@ async fn the_uniffi_snapshot_carries_both_pressure_signals_and_refreshes_first_8
     let transport = Arc::new(RecordingTransport {
         attached: std::sync::Mutex::new(None),
         evictions_to_report: 42,
+        ladder: std::sync::Mutex::new(None),
     });
     let edge = Arc::new(
         build_edge_with_transport(tmp.path(), backend, transport.clone() as Arc<dyn Transport>)
@@ -779,6 +787,7 @@ async fn the_uniffi_snapshot_carries_the_av_plane_ledger_805() {
     let transport = Arc::new(RecordingTransport {
         attached: std::sync::Mutex::new(None),
         evictions_to_report: 0,
+        ladder: std::sync::Mutex::new(None),
     });
     let edge = Arc::new(
         build_edge_with_transport(tmp.path(), backend, transport.clone() as Arc<dyn Transport>)
@@ -826,18 +835,32 @@ async fn the_uniffi_snapshot_projects_every_bundle_field_and_queue_depth_is_resi
     let me = FedKey::new("edge-self-metrics-809", 0x01);
     backend
         .put_public_key(SignedKeyRecord {
-            record: signed_record(&me, &steward, "agent"),
+            record: signed_record(&me, &steward, "node"),
         })
         .await
         .expect("put_public_key(self)");
     let transport = Arc::new(RecordingTransport {
         attached: std::sync::Mutex::new(None),
         evictions_to_report: 0,
+        ladder: std::sync::Mutex::new(None),
     });
     let edge = Arc::new(
-        build_edge_with_transport(tmp.path(), backend, transport as Arc<dyn Transport>).await,
+        build_edge_with_transport(
+            tmp.path(),
+            backend,
+            Arc::clone(&transport) as Arc<dyn Transport>,
+        )
+        .await,
     );
     ciris_edge::ffi::uniffi_impl::install_edge_handle(&edge);
+
+    // v44 — the production build hands the transport the Edge's own ladder,
+    // and the ladder books into the Edge's own bag.
+    let ladder = transport.ladder.lock().expect("ladder").clone();
+    let ladder = ladder.expect("EdgeBuilder::build attaches the ladder");
+    assert!(Arc::ptr_eq(&ladder, &edge.load_ladder()));
+    ladder.set_host_pressure(ciris_edge::LoadPressure::Critical);
+    assert_eq!(edge.metrics().snapshot().load_tier, 2);
 
     let snap = ciris_edge::ffi::uniffi_impl::metrics_snapshot().expect("snapshot");
     let missing: Vec<&str> = ciris_edge::observability::EDGE_METRICS_BUNDLE_FIELDS

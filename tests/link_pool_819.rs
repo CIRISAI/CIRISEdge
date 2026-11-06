@@ -117,8 +117,8 @@ async fn pair_with(tag: &str, bound: Duration) -> Pair {
     let key_b = TestFedKey::new(&format!("edge-b-819-{tag}"), 0x0b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
     let (a, addr_a) = build_reticulum_with_retry(|| {

@@ -160,8 +160,8 @@ pub enum RegistryError {
     #[error("replication protocol error: {0}")]
     Protocol(#[from] CoordinatorError),
     /// The matching coordinator's inbox is full — back-pressure surfaces.
-    /// `role` says WHOSE inbox: a responder's means its driver is stalled on
-    /// a reply send (#373); an initiator's means replies outran the round
+    /// `role` says WHOSE inbox: a responder's means its driver is stalled in
+    /// a step (#662); an initiator's means replies outran the round
     /// being driven. The caller typically logs and drops.
     #[error("{role:?} inbox full for peer={peer_key_id} kind={kind:?}")]
     BackPressure {
@@ -678,6 +678,7 @@ mod tests {
 
         // Build a Summary message wrapped in the CRPL frame.
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
@@ -699,6 +700,7 @@ mod tests {
         let registry = ReplicationRegistry::new();
         // Don't register anything; build a valid frame anyway.
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Attestation,
             refs: vec![],
         });
@@ -731,6 +733,7 @@ mod tests {
             .is_none());
 
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::IdentityOccurrence,
             refs: vec![],
         });
@@ -760,6 +763,7 @@ mod tests {
         registry.register("dave", EnvelopeKind::Key, coord).await;
         // Frame for a DIFFERENT kind than what's registered.
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Revocation,
             refs: vec![],
         });
@@ -793,6 +797,7 @@ mod tests {
         // Forge a v3 frame (v1 and v2 are both recognized as of
         // CIRISEdge v2.0.0; v3 is reserved for a future cut).
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
@@ -812,6 +817,7 @@ mod tests {
         let coord = make_responder("eve", EnvelopeKind::Key);
         registry.register("eve", EnvelopeKind::Key, coord).await;
         let msg = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
@@ -944,6 +950,7 @@ mod tests {
 
         fn summary() -> ReplicationMessage {
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Community,
                 refs: vec![],
             })

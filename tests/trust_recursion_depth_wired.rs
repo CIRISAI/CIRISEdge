@@ -211,8 +211,8 @@ async fn build_edge_with_recursion_depth(
 
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&local, &steward, "agent"),
-        signed_record(&remote, &steward, "agent"),
+        signed_record(&local, &steward, "node"),
+        signed_record(&remote, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -341,8 +341,8 @@ async fn agent_mode_server_apply_defaults_threads_depth_one_into_edge_config() {
     let remote = FedKey::new("remote-peer", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&local, &steward, "agent"),
-        signed_record(&remote, &steward, "agent"),
+        signed_record(&local, &steward, "node"),
+        signed_record(&remote, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();

@@ -306,6 +306,17 @@ RustBuffer uniffi_ciris_edge_fn_func_metrics_snapshot(RustCallStatus *_Nonnull o
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ONION_SET_ENABLED
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ONION_SET_ENABLED
+void uniffi_ciris_edge_fn_func_onion_set_enabled(int8_t enabled, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ONION_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ONION_STATUS
+RustBuffer uniffi_ciris_edge_fn_func_onion_status(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_PATH_TABLE
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_PATH_TABLE
 RustBuffer uniffi_ciris_edge_fn_func_path_table(RustCallStatus *_Nonnull out_status
@@ -458,6 +469,23 @@ uint64_t uniffi_ciris_edge_fn_func_routing_transport_uptime(RustCallStatus *_Non
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_TUNNELS
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_TUNNELS
 RustBuffer uniffi_ciris_edge_fn_func_routing_tunnels(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_SHAPING_CLASS_TABLE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_SHAPING_CLASS_TABLE
+RustBuffer uniffi_ciris_edge_fn_func_shaping_class_table(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_SHAPING_SET_DEVICE_STATE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_SHAPING_SET_DEVICE_STATE
+uint32_t uniffi_ciris_edge_fn_func_shaping_set_device_state(RustBuffer state, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_SHAPING_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_SHAPING_STATUS
+RustBuffer uniffi_ciris_edge_fn_func_shaping_status(RustCallStatus *_Nonnull out_status
     
 );
 #endif
@@ -833,6 +861,18 @@ uint16_t uniffi_ciris_edge_checksum_func_metrics_snapshot(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ONION_SET_ENABLED
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ONION_SET_ENABLED
+uint16_t uniffi_ciris_edge_checksum_func_onion_set_enabled(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ONION_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ONION_STATUS
+uint16_t uniffi_ciris_edge_checksum_func_onion_status(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_PATH_TABLE
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_PATH_TABLE
 uint16_t uniffi_ciris_edge_checksum_func_path_table(void
@@ -1004,6 +1044,24 @@ uint16_t uniffi_ciris_edge_checksum_func_routing_transport_uptime(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_TUNNELS
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_TUNNELS
 uint16_t uniffi_ciris_edge_checksum_func_routing_tunnels(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_SHAPING_CLASS_TABLE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_SHAPING_CLASS_TABLE
+uint16_t uniffi_ciris_edge_checksum_func_shaping_class_table(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_SHAPING_SET_DEVICE_STATE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_SHAPING_SET_DEVICE_STATE
+uint16_t uniffi_ciris_edge_checksum_func_shaping_set_device_state(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_SHAPING_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_SHAPING_STATUS
+uint16_t uniffi_ciris_edge_checksum_func_shaping_status(void
     
 );
 #endif

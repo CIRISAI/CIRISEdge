@@ -226,9 +226,9 @@ async fn build_edge_with_directories(
 
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&local, &steward, "agent"),
-        signed_record(&peer_family, &steward, "agent"),
-        signed_record(&peer_public, &steward, "agent"),
+        signed_record(&local, &steward, "node"),
+        signed_record(&peer_family, &steward, "node"),
+        signed_record(&peer_public, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -603,8 +603,8 @@ async fn build_edge_with_remote_peer(
 
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&local, &steward, "agent"),
-        signed_record(&remote, &steward, "agent"),
+        signed_record(&local, &steward, "node"),
+        signed_record(&remote, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();

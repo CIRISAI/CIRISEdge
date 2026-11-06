@@ -188,6 +188,8 @@ pub const TRANSIENT_CAP_HITS_BEFORE_TERMINAL: u32 = 3;
 type RowKey = (EnvelopeKind, [u8; 32]);
 
 struct Entry {
+    /// The latest refusal's class, when it had one.
+    class: Option<&'static str>,
     /// Consecutive refusals of these bytes. Drives the doubling; reset only by
     /// [`RefusalBackoff::clear`] (an admit), a release, or eviction.
     attempts: u32,
@@ -369,10 +371,32 @@ impl State {
                 waiting_from: None,
                 cap_hits: 0,
                 park_stamp: None,
+                class: None,
             },
         );
         self.order.push_back(key);
     }
+}
+
+/// What one booked refusal did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    /// The suppression window installed.
+    pub window: Duration,
+    /// This refusal moved the row from the transient schedule to the terminal
+    /// one.
+    pub moved_to_terminal: bool,
+}
+
+/// What the memory held of a row it forgot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Forgotten {
+    /// Refusals booked.
+    pub attempts: u32,
+    /// The schedule it was on.
+    pub disposition: RetryDisposition,
+    /// The last refusal's class, if it had one.
+    pub class: Option<&'static str>,
 }
 
 /// The node-wide refusal memory.
@@ -467,11 +491,27 @@ impl RefusalBackoff {
         disposition: RetryDisposition,
         now: Instant,
     ) -> Duration {
+        self.record_tracked_at(kind, envelope_hash, disposition, None, now)
+            .window
+    }
+
+    /// [`Self::record_at`], remembering the refusal's `class` and saying
+    /// whether this refusal is the one that moved the row to the terminal
+    /// schedule.
+    pub fn record_tracked_at(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: [u8; 32],
+        disposition: RetryDisposition,
+        class: Option<&'static str>,
+        now: Instant,
+    ) -> Recorded {
         let key = (kind, envelope_hash);
         let mut st = self.lock();
 
         if let Some(e) = st.entries.get_mut(&key) {
             e.attempts = e.attempts.saturating_add(1);
+            e.class = class.or(e.class);
             if disposition == RetryDisposition::Transient && e.park_stamp.is_none() {
                 if RetryDisposition::Transient.window(e.attempts) >= TRANSIENT_CAP {
                     e.cap_hits = e.cap_hits.saturating_add(1);
@@ -479,15 +519,22 @@ impl RefusalBackoff {
                 if e.cap_hits > TRANSIENT_CAP_HITS_BEFORE_TERMINAL {
                     let window = RetryDisposition::Terminal
                         .window(e.cap_hits - TRANSIENT_CAP_HITS_BEFORE_TERMINAL);
+                    let moved_to_terminal = e.disposition != RetryDisposition::Terminal;
                     e.disposition = RetryDisposition::Terminal;
                     e.retry_at = now + window;
-                    return window;
+                    return Recorded {
+                        window,
+                        moved_to_terminal,
+                    };
                 }
             }
             e.disposition = disposition;
             let window = disposition.window(e.attempts);
             e.retry_at = now + window;
-            return window;
+            return Recorded {
+                window,
+                moved_to_terminal: false,
+            };
         }
 
         // New key — evict the oldest ORDINARY row first if at capacity
@@ -495,7 +542,13 @@ impl RefusalBackoff {
         // grow this unbounded.
         let window = disposition.window(1);
         st.insert_ordinary(key, disposition, now + window, self.max_keys);
-        window
+        if let Some(e) = st.entries.get_mut(&key) {
+            e.class = class;
+        }
+        Recorded {
+            window,
+            moved_to_terminal: false,
+        }
     }
 
     /// CIRISEdge#679 — book a STRUCTURAL refusal: `(kind, envelope_hash)` was
@@ -658,6 +711,29 @@ impl RefusalBackoff {
         self.release_signer_from(signer).0
     }
 
+    /// [`Self::release_signer_from`], with the released rows themselves: the
+    /// `(plane, peer, row)` of each row booked with a peer.
+    pub fn release_signer_rows(
+        &self,
+        signer: &str,
+    ) -> (usize, Vec<(EnvelopeKind, String, [u8; 32])>) {
+        let mut st = self.lock();
+        let Some(rows) = st.by_signer.remove(signer) else {
+            return (0, Vec::new());
+        };
+        let mut released = 0;
+        let mut ask = Vec::new();
+        for key in rows {
+            if let Some(entry) = st.remove(&key) {
+                released += 1;
+                if let Some(peer) = entry.waiting_from {
+                    ask.push((key.0, peer, key.1));
+                }
+            }
+        }
+        (released, ask)
+    }
+
     /// CIRISEdge#776 — [`Self::release_signer`], also naming who to ask: the
     /// distinct `(plane, peer)` pairs the released rows were offered from
     /// (rows booked without a peer contribute to the count only). The caller
@@ -751,7 +827,21 @@ impl RefusalBackoff {
     /// every non-refusing apply outcome so a row that recovers does not carry a
     /// stale attempt count into a future refusal of the same bytes.
     pub fn clear(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) {
-        self.lock().remove(&(kind, *envelope_hash));
+        let _ = self.take(kind, envelope_hash);
+    }
+
+    /// [`Self::clear`], saying what the memory held: the one point a row's
+    /// attempts can be read, since they go with it.
+    pub fn take(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> Option<Forgotten> {
+        let mut st = self.lock();
+        let key = (kind, *envelope_hash);
+        let held = st.entries.get(&key).map(|e| Forgotten {
+            attempts: e.attempts,
+            disposition: e.disposition,
+            class: e.class,
+        });
+        st.remove(&key);
+        held
     }
 
     /// How many rows are currently remembered, both classes. The memory's own
@@ -1162,5 +1252,54 @@ mod tests {
         b.record_at(EnvelopeKind::Key, hash(1), RetryDisposition::Transient, t0);
         let w = b.record_at(EnvelopeKind::Key, hash(1), RetryDisposition::Terminal, t0);
         assert_eq!(w, RetryDisposition::Terminal.window(2));
+    }
+}
+
+#[cfg(test)]
+mod tracked_tests {
+    use super::*;
+
+    const H: [u8; 32] = [7; 32];
+
+    fn refuse(m: &RefusalBackoff, class: Option<&'static str>, now: Instant) -> Recorded {
+        m.record_tracked_at(
+            EnvelopeKind::Attestation,
+            H,
+            RetryDisposition::Transient,
+            class,
+            now,
+        )
+    }
+
+    /// The silent transition: once, at the refusal that makes it, and on the
+    /// schedule `FSD/EVENT_PATH_MODEL.md` M8 predicts (the 8th).
+    #[test]
+    fn a_transient_row_moves_to_terminal_exactly_once() {
+        let m = RefusalBackoff::new();
+        let now = Instant::now();
+        let moved: Vec<usize> = (1..=12)
+            .filter(|_| refuse(&m, Some("retry_after_standing"), now).moved_to_terminal)
+            .collect();
+        assert_eq!(moved, vec![8]);
+    }
+
+    #[test]
+    fn a_forgotten_row_says_what_it_cost_and_why() {
+        let m = RefusalBackoff::new();
+        let now = Instant::now();
+        refuse(&m, None, now);
+        refuse(&m, Some("retry_after_roster"), now);
+        refuse(&m, None, now);
+        let held = m
+            .take(EnvelopeKind::Attestation, &H)
+            .expect("the memory held it");
+        assert_eq!(held.attempts, 3);
+        assert_eq!(
+            held.class,
+            Some("retry_after_roster"),
+            "the last class named"
+        );
+        assert_eq!(held.disposition, RetryDisposition::Transient);
+        assert!(m.take(EnvelopeKind::Attestation, &H).is_none());
     }
 }

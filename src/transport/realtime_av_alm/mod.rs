@@ -72,6 +72,10 @@
 
 pub mod capacity;
 pub mod capacity_estimator;
+// Stage 1 of the closed-loop ALM controller (C1 meter, C2 admission, C4
+// selector, C6 peer states, C7 decision log). Pure and sync; `av_call/alm.rs`
+// runs it. Supersedes `join::AlmJoinPlanner` for parent selection.
+pub mod controller;
 pub mod delivered;
 pub mod heal;
 pub mod join;
@@ -84,6 +88,11 @@ pub mod transit_gate;
 // `#[cfg(test)] mod sim;` — see the module docs for the fault model + metrics.
 #[cfg(test)]
 mod sim;
+
+// The closed-loop substrate (uplinks, bounded queues, burst loss, churn) the
+// controller's T1–T7 + multi-hop scenarios run on.
+#[cfg(test)]
+mod closed_loop_sim;
 
 pub use capacity::{
     AlmCapacityError, PeerKeyId, PeerSigningPubkeys, RelayCapacity, SignedRelayCapacity,

@@ -37,7 +37,7 @@
 
 use super::protocol::{
     CursorPullMessage, DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage,
-    PullMessage, ReplicationMessage, SummaryMessage,
+    PullMessage, ReplicationMessage, SummaryMessage, SummaryStatus,
 };
 use super::retention::{retention_for, Retention};
 use super::summary::{
@@ -449,6 +449,7 @@ impl Session {
         }
         let refs = provider.local_refs(self.kind).await;
         let summary = SummaryMessage {
+            status: None,
             kind: self.kind,
             refs: refs.clone(),
         };
@@ -676,6 +677,13 @@ impl Session {
     /// those bodies are applied. Without this, a peer answering a Fetch could
     /// append arbitrary directory bodies and have every one accepted — the
     /// corpus-size and address-book properties lost to a generous responder.
+    pub fn expect_fetched(&mut self, hashes: &[[u8; 32]]) {
+        self.expect_bodies(hashes.iter().copied());
+        // The Deliver that answers a Fetch is solicited, as one answering a Diff.
+        self.diff_want_count = Some(hashes.len());
+    }
+
+    /// Record the hashes this node asked a peer for by name.
     pub fn expect_bodies(&mut self, hashes: impl IntoIterator<Item = [u8; 32]>) {
         self.expect_bodies_for_rounds(hashes, Self::DEFAULT_EXPECTATION_ROUNDS);
     }
@@ -738,10 +746,27 @@ impl Session {
         if pull.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
-        let refs = provider.subject_refs(self.kind, &pull.subject_key_id).await;
+        // CIRISEdge#937 — a throttled Pull is answered as one: the Summary
+        // carries `subject_pull_throttled` with the window, instead of an
+        // empty `refs` indistinguishable from "nothing held". Old peers ignore
+        // the field and read the empty list exactly as before.
+        let answer = provider
+            .subject_pull_answer(self.kind, &pull.subject_key_id)
+            .await;
+        let status = answer.throttled.map(|retry_after_secs| {
+            tracing::info!(
+                kind = ?self.kind,
+                subject = %pull.subject_key_id,
+                retry_after_secs,
+                "subject Pull answered `subject_pull_throttled`: the requester's \
+                 lookup budget for this window is spent (CIRISEdge#937)"
+            );
+            SummaryStatus::SubjectPullThrottled { retry_after_secs }
+        });
         let summary = SummaryMessage {
+            status,
             kind: self.kind,
-            refs,
+            refs: answer.refs,
         };
         // Record what we offered so a subsequent Diff for these refs is served
         // (the responder path reads `last_summary_sent` conceptually via
@@ -763,6 +788,19 @@ impl Session {
             return ReplicationOutcome::UnexpectedMessage;
         }
         self.last_remote_summary = Some(remote.clone());
+        // CIRISEdge#937 — the peer throttled our subject Pull: its empty refs
+        // are a refusal for this window, not what it holds. One line, so a
+        // harness reading the requester's log can tell the two apart too.
+        if let Some(SummaryStatus::SubjectPullThrottled { retry_after_secs }) = remote.status {
+            tracing::warn!(
+                kind = ?self.kind,
+                peer = ?source_peer,
+                retry_after_secs,
+                "subject Pull THROTTLED by the peer (`subject_pull_throttled`): the \
+                 answer is a refusal for this window, not an empty holding \
+                 (history: CIRISEdge#937)"
+            );
+        }
         // CIRISEdge#414 — RECEIVE axis: what this node still LACKS is computed
         // from its REAL holdings, not from its (send-gated) offer. Using
         // `local_refs` here fused the #396 SEND gate onto the RECEIVE side — a
@@ -857,6 +895,7 @@ impl Session {
         if matches!(self.role, SessionRole::Responder) && self.last_summary_sent.is_none() {
             let my_refs = provider.local_refs(self.kind).await;
             let my_summary = SummaryMessage {
+                status: None,
                 kind: self.kind,
                 refs: my_refs,
             };
@@ -1196,6 +1235,7 @@ impl Session {
                     reason,
                     retry,
                     awaits_signer,
+                    ..
                 } => {
                     refused += 1;
                     // An UNSOLICITED Deliver (a peer's proactive push) is rare, and
@@ -1291,7 +1331,7 @@ impl Session {
                             suppressed_prev,
                             "delivered envelope REFUSED — not applied (history: CIRISEdge#425 apply choke \
                              point); further refusals naming this signer on this plane log at \
-                             DEBUG for the next 30 min (tracked: CIRISEdge#858)"
+                             DEBUG for the next 30 min (history: CIRISEdge#858)"
                         ),
                         ThrottleDecision::Suppress => tracing::debug!(
                             kind = ?self.kind,
@@ -1909,6 +1949,7 @@ mod tests {
         let applier = applier_for(&[]);
 
         let remote_summary = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Attestation,
             refs: vec![
                 EnvelopeRef {
@@ -2132,6 +2173,7 @@ mod tests {
         let _ = s
             .on_message(
                 ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Attestation,
                     refs: vec![EnvelopeRef {
                         envelope_hash: h(1),
@@ -2314,6 +2356,7 @@ mod tests {
         let _ = s
             .on_message(
                 ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![EnvelopeRef {
                         envelope_hash: h(1),
@@ -2356,6 +2399,7 @@ mod tests {
         let _ = s
             .on_message(
                 ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![
                         EnvelopeRef {
@@ -2429,6 +2473,7 @@ mod tests {
         let applier = applier_for(&[(h(1), b"e1".to_vec())]);
         let bob_summary = || {
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![super::super::protocol::EnvelopeRef {
                     envelope_hash: h(1),
@@ -2528,6 +2573,7 @@ mod tests {
         let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
         // Skip the wire dance — drive on_message directly.
         let bob_summary = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![
                 super::super::protocol::EnvelopeRef {
@@ -2875,6 +2921,7 @@ mod tests {
         // plane that cannot retract anything, which is what hash-first is for.
         let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Key);
         let remote = SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![
                 EnvelopeRef {
@@ -2953,6 +3000,7 @@ mod tests {
         let _ = session
             .on_message(
                 ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![EnvelopeRef {
                         envelope_hash: h(1),
@@ -3015,6 +3063,7 @@ mod tests {
         session.expect_on_demand_reply();
 
         let reply = SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![EnvelopeRef {
                 envelope_hash: h(1),
@@ -3076,6 +3125,7 @@ mod tests {
         let mut session = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
         session.expect_on_demand_reply();
         let summary = |n: u8| SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![EnvelopeRef {
                 envelope_hash: h(n),
@@ -3173,6 +3223,7 @@ mod tests {
 
         let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Revocation);
         let remote = SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Revocation,
             refs: vec![EnvelopeRef {
                 envelope_hash: h(1),
@@ -3231,6 +3282,7 @@ mod tests {
         // The peer advertises BOTH rows — including the one we cannot admit. It
         // has no way to know, and does not need one.
         let remote = SummaryMessage {
+            status: None,
             kind: EnvelopeKind::Key,
             refs: vec![
                 EnvelopeRef {
@@ -3614,6 +3666,7 @@ mod tests {
         let out = s
             .on_message(
                 ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![],
                 }),
@@ -3668,6 +3721,7 @@ mod tests {
         let provider = provider_with(&[(EnvelopeKind::Key, h(9), b"e9".to_vec(), 9)]);
         let summary_r = || {
             ReplicationMessage::Summary(SummaryMessage {
+                status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![super::super::protocol::EnvelopeRef {
                     envelope_hash: h(1),
@@ -3779,6 +3833,7 @@ mod tests {
         let _ = alice
             .on_message(
                 ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![super::super::protocol::EnvelopeRef {
                         envelope_hash: h(9),

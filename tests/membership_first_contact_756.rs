@@ -287,15 +287,13 @@ impl Node {
 }
 
 /// The planes the ceremony and the member path ride.
-const KINDS: [EnvelopeKind; 8] = [
+const KINDS: [EnvelopeKind; 4] = [
     EnvelopeKind::Key,
     EnvelopeKind::IdentityOccurrence,
     EnvelopeKind::TransportDestination,
+    // persist v61 (CIRISPersist#991): the group records and the membership
+    // events ride this plane as `group:roster:v1` / `membership:*:v1` rows.
     EnvelopeKind::Attestation,
-    EnvelopeKind::Community,
-    EnvelopeKind::CommunityMembershipWidening,
-    EnvelopeKind::Family,
-    EnvelopeKind::FamilyMembershipWidening,
 ];
 
 async fn start_runtime(
@@ -449,7 +447,7 @@ async fn found(node: &Node, scope: GroupScope, group: &str) {
                     role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
                 }],
                 founded_at: at,
-                consensus_protocol: "founder_only".to_owned(),
+                consensus_protocol: "majority".to_owned(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
                 prev_head_digest: String::new(),

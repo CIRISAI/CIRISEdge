@@ -108,8 +108,8 @@ async fn paired_transports(
     let key_b = TestFedKey::new("edge-link-bbbb", 0x2b);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&key_a, &steward, "agent"),
-        signed_record(&key_b, &steward, "agent"),
+        signed_record(&key_a, &steward, "node"),
+        signed_record(&key_b, &steward, "node"),
     ])
     .await;
 

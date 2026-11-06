@@ -296,6 +296,18 @@ pub enum WithholdReason {
     /// restriction to its own `consent:replication:v1` grant covering this row's
     /// dimension, and the recipient does not hold that capability.
     RecipientCapabilityRestriction,
+    /// A `trace:` row of this node's own (or its owner's) authorship was
+    /// withheld from a serve-capable consent peer because no live
+    /// `consent:replication` grant naming that peer covers the row's dimension.
+    /// Being found and sharing traces are two consents: a grant covering
+    /// `trace:` for one peer says nothing about another peer whose grant only
+    /// announces the node.
+    TraceNotConsentedToRecipient,
+    /// The read behind that decision failed (a grant, the owner of this node or
+    /// the owner of the peer). Fail-closed, and held apart from
+    /// [`Self::TraceNotConsentedToRecipient`]: a transient read error is not a
+    /// statement about what the owner consented to.
+    TraceConsentReadError,
     /// A row present in local state could not be serialized to its content hash
     /// (`content_hash_of` / `serde_json::to_value` returned nothing), so it is
     /// OMITTED from the advertise set and will never replicate. Near-impossible
@@ -593,13 +605,6 @@ pub enum WithholdReason {
     /// Distinct from [`Self::IdentityRowNodeNotAnnounced`] so an operator is
     /// sent to the directory, not to the announce wizard.
     IdentityRowAnnounceUnresolved,
-    /// Eric 2026-10-30 (CONSENT-GATED ROUTES) — a relayed
-    /// `TransportDestination` row about an owned node, asked for by a peer
-    /// its owner has not consented to: no live `consent:replication` grant
-    /// authored by the node's owner names the peer or the peer's owner. A
-    /// contact request crosses through the canonical; only after consent does
-    /// the requester get the route that lets it dial direct.
-    RouteNotConsented,
     /// CIRISEdge#758 (CC 5.4.6) — a `Family` / `Community` RECORD asked for (on
     /// the advertise or the direct-fetch twin) by a peer whose person
     /// (`owner_of(peer)`, the peer itself when unowned) is neither a live
@@ -608,6 +613,9 @@ pub enum WithholdReason {
     /// hides a group's existence and membership from outsiders; a founder's
     /// node offering the record to every peer disclosed both. Not a fault —
     /// the peer is outside the group. `detail` names the plane and the site.
+    /// persist v61 (CIRISPersist#991): the record and its membership events are
+    /// `group:roster:v1` / `membership:*:v1` rows on the Attestation plane;
+    /// this is their withhold there.
     GroupRecordNotMemberOrInvitee,
 }
 
@@ -627,6 +635,8 @@ impl WithholdReason {
             Self::TrustRootWalkError => "trust_root_walk_error",
             Self::RecipientNotRooted => "recipient_not_rooted",
             Self::RecipientCapabilityRestriction => "recipient_capability_restriction",
+            Self::TraceNotConsentedToRecipient => "trace_not_consented_to_recipient",
+            Self::TraceConsentReadError => "trace_consent_read_error",
             Self::RowNotSerializable => "row_not_serializable",
             Self::RowHashUndecodable => "row_hash_undecodable",
             Self::ConfigPaused => "config_paused",
@@ -667,7 +677,6 @@ impl WithholdReason {
             Self::LxmfRetentionExpired => "lxmf_retention_expired",
             Self::IdentityRowNodeNotAnnounced => "identity_row_node_not_announced",
             Self::IdentityRowAnnounceUnresolved => "identity_row_announce_unresolved",
-            Self::RouteNotConsented => "route_not_consented",
             Self::GroupRecordNotMemberOrInvitee => "group_record_not_member_or_invitee",
         }
     }
@@ -921,9 +930,116 @@ pub const AV_CALL_FRAME_UNOPENED: &str = "av_call_frame_unopened";
 pub const AV_CALL_FRAME_NO_KEY: &str = "av_call_frame_no_key";
 /// CIRISEdge#805 item 5 — a call frame this node relayed to a member.
 pub const AV_CALL_RELAYED: &str = "av_call_relayed";
+/// CIRISEdge#805 — a call chunk whose source signature did not verify under
+/// its stream's bound chunk key (or carried none): not the publisher's,
+/// dropped and never relayed.
+pub const AV_CALL_FRAME_FORGED: &str = "av_call_frame_forged";
+/// CIRISEdge#805 — a call chunk for a `(stream, epoch)` with no verified
+/// chunk-key binding: dropped and never relayed.
+pub const AV_CALL_FRAME_UNBOUND: &str = "av_call_frame_unbound";
+/// CIRISEdge#805 — a stream's chunk-key binding verified (the publisher's
+/// hybrid signature) and installed.
+pub const AV_CALL_BINDING_INSTALLED: &str = "av_call_binding_installed";
+/// CIRISEdge#805 — a chunk-key binding refused (malformed, another room, not
+/// the publisher's stream, not a member, or a bad hybrid signature).
+pub const AV_CALL_BINDING_REFUSED: &str = "av_call_binding_refused";
 /// CIRISEdge#805 item 6 — this attendee's call row was refused; the call
 /// stays live.
 pub const AV_CALL_RECORD_REFUSED: &str = "av_call_record_refused";
+
+// ─── ALM stage 2 — `EdgeMetrics::av_plane` labels ────────────────────
+
+/// leviculum#94 — a media frame sent with a deadline (a timed Channel frame).
+pub const AV_SENT_TIMED: &str = "av_sent_timed";
+/// leviculum#94 — a media frame that fills its Channel and so cannot carry
+/// the 10-byte timed wrapper: sent untimed.
+pub const AV_SENT_UNTIMED_FULL: &str = "av_sent_untimed_full";
+/// leviculum#94 — this node's timed media frame passed its deadline
+/// unconfirmed (an expired marker went in its place).
+pub const AV_FRAME_EXPIRED_SENDER: &str = "av_frame_expired_sender";
+/// leviculum#94 — a peer's timed frame arrived as its expired marker.
+pub const AV_FRAME_EXPIRED_MARKED: &str = "av_frame_expired_marked";
+/// leviculum#94 — a peer's timed frame arrived past its time to live and was
+/// dropped, not delivered late.
+pub const AV_FRAME_EXPIRED_LATE: &str = "av_frame_expired_late";
+/// ALM C5 — a media frame older than its class budget dropped from the
+/// inbound queue by age (oldest first) before it was opened.
+pub const AV_FRAME_STALE_DROPPED: &str = "av_frame_stale_dropped";
+/// #591 — a chunk a leg refused under backpressure: dropped for that leg,
+/// never queued. `av_send_congested` also counts control-frame retries; this
+/// counts media actually lost to it.
+pub const AV_CHUNK_DROPPED_CONGESTED: &str = "av_chunk_dropped_congested";
+/// ALM C5 — a leg shed to the base layer after sustained congestion.
+pub const AV_LEG_SHED_TO_BASE: &str = "av_leg_shed_to_base";
+/// ALM C5 — a leg restored from the base layer after clean sends.
+pub const AV_LEG_RESTORED: &str = "av_leg_restored";
+/// ALM C3 — a control frame sent / received / refused as malformed.
+pub const ALM_C3_SENT: &str = "alm_c3_sent";
+/// ALM C3 — a control frame that could not be sent to its member.
+pub const ALM_C3_SEND_FAILED: &str = "alm_c3_send_failed";
+/// ALM C3 — a must-arrive control frame delivered by a resend after the
+/// link refused it.
+pub const ALM_C3_RESENT: &str = "alm_c3_resent";
+/// ALM C3 — a control frame received and applied.
+pub const ALM_C3_RECEIVED: &str = "alm_c3_received";
+/// ALM C3 — a frame that read as C3 and did not decode.
+pub const ALM_C3_MALFORMED: &str = "alm_c3_malformed";
+/// ALM C3 — a peer said it speaks C3 (its `CAPS`).
+pub const ALM_C3_PEER_CAPABLE: &str = "alm_c3_peer_capable";
+/// ALM C3 — an `OFFER` claiming depth 0 was dropped: only a stream's
+/// publisher holds depth 0, and only its binding names that publisher.
+pub const ALM_OFFER_REFUSED: &str = "alm_offer_refused";
+/// [`ALM_OFFER_REFUSED`]: the binding names another member. Nothing honest
+/// sends this.
+pub const ALM_OFFER_REFUSED_NOT_PUBLISHER: &str = "alm_offer_refused:not_publisher";
+/// [`ALM_OFFER_REFUSED`]: no binding is held for the stream yet. Normal for
+/// the publisher's own first offers at a join: the next one, a second later,
+/// is checked again.
+pub const ALM_OFFER_REFUSED_UNBOUND: &str = "alm_offer_refused:unbound";
+/// ALM C2 — a subscribe admitted / refused at this node.
+pub const ALM_ADMIT: &str = "alm_admit";
+/// ALM C2 — a subscribe refused at this node (the token is counted too).
+pub const ALM_REFUSE: &str = "alm_refuse";
+/// ALM C2 — a subscriber shed by this node.
+pub const ALM_SHED: &str = "alm_shed";
+/// ALM — a chunk this node forwarded as an admitted media parent.
+pub const ALM_FORWARDED: &str = "alm_forwarded";
+/// ALM C4 — this node's primary parent for a stream changed.
+pub const ALM_PARENT_CHANGE: &str = "alm_parent_change";
+/// FSD CIRIS_MESH R2 — an identity link established through a roster relay.
+pub const ALM_RELAY_TIER_ROSTER: &str = "alm_relay_tier_roster";
+/// FSD CIRIS_MESH R2 — a roster relay's one attempt did not establish.
+pub const ALM_RELAY_TIER_ROSTER_FAILED: &str = "alm_relay_tier_roster_failed";
+/// FSD CIRIS_MESH R2 — no roster relay established: the default path (last
+/// tier) was dialled.
+pub const ALM_RELAY_TIER_DEFAULT: &str = "alm_relay_tier_default";
+/// `FSD/CIRIS_MESH.md` §7.4 — one `load_ledger` cost entry.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct LoadLedgerEntry {
+    /// What it is: a forwarded link id (hex), a stream, or a peer.
+    pub subject: String,
+    /// Bits/s.
+    pub bps: f64,
+    /// Packets/s.
+    pub pps: f64,
+}
+
+/// `FSD/CIRIS_MESH.md` §7.4 — the `load_ledger` metrics family: the top cost
+/// entries this node carries, so shedding never sheds blind.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct LoadLedger {
+    /// The service tier now (0, 1, 2).
+    pub tier: u8,
+    /// Total forwarded packets/s.
+    pub transit_pps: f64,
+    /// Total forwarded bits/s.
+    pub transit_bps: f64,
+    /// The costliest forwarded links, most packets/s first (top 10).
+    pub transit: Vec<LoadLedgerEntry>,
+    /// The ladder's token counters (`load_tier:*` and their causes).
+    pub counters: std::collections::BTreeMap<String, u64>,
+}
+
 // ─── CC 5.3.3.5 E1 — `EdgeMetrics::link_seal` labels ─────────────────
 //
 // Every RNS link carries the CC 3.3.6.2 hybrid transit KEX as its first frame
@@ -1073,6 +1189,30 @@ pub const LINK_SHAPING_UNSHAPED: &str = "link_shaping_unshaped";
 /// Refused: the peer offers no shaping and this node requires shaped links;
 /// the link closed.
 pub const LINK_SHAPING_REFUSED_UNSHAPED_PEER: &str = "link_shaping_refused_unshaped_peer";
+/// CC 5.4.3 — a shaping peer past this node's shaped-link bound (or this
+/// node past the peer's): the row link is refused and closed, never run
+/// unshaped; the peer homes elsewhere (CIRISEdge#935) and keeps its unshaped
+/// bulk link.
+pub const LINK_SHAPING_HOME_ELSEWHERE: &str = "link_shaping_home_elsewhere";
+/// One node named in a refusal this node sent (CC 5.4.3 referrals).
+pub const LINK_SHAPING_REFERRAL_SENT: &str = "link_shaping_referral_sent";
+/// A refusal went out with no node to name: no shaped peer reported room, or
+/// none could be referred. The peer uses its fallback order.
+pub const LINK_SHAPING_REFERRAL_EMPTY: &str = "link_shaping_referral_empty";
+/// A candidate with free slots was not referred: not announced (for an owned
+/// node, no live federation-scope owner binding), or with no live route
+/// carrying a transit pair.
+pub const LINK_SHAPING_REFERRAL_WITHHELD: &str = "link_shaping_referral_withheld";
+/// One node a refusal named reached this node.
+pub const LINK_SHAPING_REFERRAL_RECEIVED: &str = "link_shaping_referral_received";
+/// A referral failed verification, or its frame could not be read.
+pub const LINK_SHAPING_REFERRAL_REJECTED: &str = "link_shaping_referral_rejected";
+/// A referred node took this node's row link: homed.
+pub const LINK_SHAPING_REFERRAL_HOMED: &str = "link_shaping_referral_homed";
+/// A referred node could not be dialled, or refused too; the next is tried.
+pub const LINK_SHAPING_REFERRAL_FAILED: &str = "link_shaping_referral_failed";
+/// No referral took: the peer falls back to its fallback order.
+pub const LINK_SHAPING_REFERRAL_EXHAUSTED: &str = "link_shaping_referral_exhausted";
 /// Refused: a malformed offer or shaped frame; the link closed.
 pub const LINK_SHAPING_REFUSED_MALFORMED: &str = "link_shaping_refused_malformed";
 /// Dropped and the link closed: a bare frame on a shaped link, a shaped
@@ -1089,6 +1229,23 @@ pub const LINK_SHAPING_COVER_RECEIVED: &str = "link_shaping_cover_received";
 pub const LINK_SHAPING_QUEUE_DEFERRED: &str = "link_shaping_queue_deferred";
 /// A shaped frame could not be sent; the link closed.
 pub const LINK_SHAPING_SEND_FAILED: &str = "link_shaping_send_failed";
+/// CC 5.4.3 rc16 two planes — a frame beyond a shaped link's real-frame
+/// budget for one window (bulk: a large blob) was refused from the row
+/// plane; bulk rides an unshaped link of its own and makes no shaping claim.
+pub const LINK_SHAPING_BULK_REFUSED: &str = "link_shaping_bulk_refused";
+/// CC 5.4.3 rc16 two planes — a bulk message sent over a SHAPED link in
+/// shaped-budget fragments because no unshaped link to the peer could exist
+/// (it cannot be dialled). Slow, never a failure; the bulk plane is the
+/// preferred path and this is its last resort.
+pub const LINK_SHAPING_BULK_ON_SHAPED_FALLBACK: &str = "link_shaping_bulk_on_shaped_fallback";
+/// `FSD/PRIVACY_MODES.md` §6.12 — a non-obligation peer's new shaped link
+/// refused under Admit-close (`FSD/CIRIS_MESH.md` §7.3's token). It also counts
+/// under [`LINK_SHAPING_HOME_ELSEWHERE`].
+pub const LINK_SHAPING_LOAD_REFUSED: &str = "load_refuse:admit_closed";
+/// `FSD/PRIVACY_MODES.md` §6.12 — a shaped link closed at tier 2.
+pub const LINK_SHAPING_LOAD_SHED: &str = "load_shed:shaped";
+/// `FSD/PRIVACY_MODES.md` §6.12 — a slow-path transfer paused at tier 2.
+pub const LINK_SHAPING_LOAD_SHED_BULK: &str = "load_shed:bulk";
 /// A row the Attestation advertise's projection filter skipped (a `SelfOwn`
 /// row whose attester is not in this node's self-publish set, ...). Not a
 /// withhold: the row was not this node's to publish when it was read.
@@ -1102,6 +1259,11 @@ pub const ADVERTISE_REOFFERED_AFTER_SKIP: &str = "advertise_reoffered_after_skip
 pub const ADVERTISE_WATERMARK_REWOUND: &str = "advertise_watermark_rewound";
 /// A rolling re-sweep cycle that walked its plane to the end.
 pub const ADVERTISE_RESWEEP_CYCLE_COMPLETED: &str = "advertise_resweep_cycle_completed";
+/// v44 LTS — a `(peer, plane)` cursor evicted at the cap: that peer re-sweeps
+/// the plane from its start. Steady growth means the map is thrashing.
+pub const ADVERTISE_WATERMARK_EVICTED: &str = "advertise_watermark_evicted";
+/// v44 LTS — a sweep page's read failed: the cursor held, nothing wrapped.
+pub const ADVERTISE_READ_FAILED: &str = "advertise_read_failed";
 /// A rolling re-sweep cycle still running past its bound.
 pub const ADVERTISE_RESWEEP_CYCLE_OVERDUE: &str = "advertise_resweep_cycle_overdue";
 /// A request or response that completed on a link a peer dialled before the
@@ -1110,6 +1272,28 @@ pub const ADVERTISE_RESWEEP_CYCLE_OVERDUE: &str = "advertise_resweep_cycle_overd
 /// Resource past the before-keys hold's bound: dropped, the link kept. The
 /// budget still closes a link whose handshake never comes.
 pub const LINK_SEAL_DROPPED_BEFORE_KEYS: &str = "link_seal_dropped_before_keys";
+/// CIRISEdge#947 — a complete handshake over its sender's rate; refused
+/// before it is parsed and the link closed.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE: &str = "link_seal_refused_handshake_sender_rate";
+/// CIRISEdge#947 — a complete handshake over the node-wide rate for its class;
+/// refused before it is parsed and the link closed.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE: &str = "link_seal_refused_handshake_node_rate";
+/// CIRISEdge#947 — the decapsulation queue for this handshake's class is full;
+/// the new handshake is refused and the link closed.
+pub const LINK_SEAL_REFUSED_DECAP_SATURATED: &str = "link_seal_refused_decap_saturated";
+/// CIRISEdge#947 — the node held the most links awaiting a handshake it holds,
+/// or the most bytes; the oldest such link is refused and closed.
+pub const LINK_SEAL_REFUSED_AWAITING_CAP: &str = "link_seal_refused_awaiting_cap";
+/// v44 LTS — the oldest keyed link with no standing, closed at
+/// [`crate::transport::link_seal::STRANGER_KEYED_LINKS_MAX`].
+pub const LINK_SEAL_REFUSED_STRANGER_CAP: &str = "link_seal_refused_stranger_cap";
+/// CIRISEdge#947 — more frames arrived on a link during its keying than it may
+/// hold; refused and closed rather than lose a frame its sender counted.
+pub const LINK_SEAL_REFUSED_KEYING_HOLD: &str = "link_seal_refused_keying_hold";
+/// CIRISEdge#947 — a frame waited on its link's keying (replayed in order).
+pub const LINK_SEAL_HELD_DURING_KEYING: &str = "link_seal_held_during_keying";
+/// CIRISEdge#947 — a decapsulation ran off the event path.
+pub const LINK_SEAL_DECAPSULATED: &str = "link_seal_decapsulated";
 /// A Resource that completed on a link a peer dialled before the event loop
 /// had answered its handshake, HELD sealed and opened once the link is keyed
 /// (bounded; past the bound it is `link_seal_dropped_before_keys`).
@@ -1127,6 +1311,9 @@ pub const DIRECT_LINK_SKIPPED_NEIGHBOUR: &str = "direct_link_skipped_neighbour";
 /// No proposal: the member's last proposal failed and is backing off (or was
 /// refused on this link).
 pub const DIRECT_LINK_SKIPPED_BACKOFF: &str = "direct_link_skipped_backoff";
+/// v44 (leviculum#96) — this node wanted to propose on a link it did not
+/// initiate and left the proposal to the initiator (the glare tie-break).
+pub const DIRECT_LINK_YIELDED: &str = "direct_link_yielded";
 /// No proposal: no identity link to the member could be had.
 pub const DIRECT_LINK_SKIPPED_NO_LINK: &str = "direct_link_skipped_no_link";
 /// A peer's direct-link request, accepted: it shares a room with this node.
@@ -1144,11 +1331,94 @@ pub const DIRECT_LINK_FAILED_PROBE: &str = "direct_link_failed_probe";
 pub const DIRECT_LINK_FAILED_TIMEOUT: &str = "direct_link_failed_timeout";
 /// No punch got through (symmetric NAT, a firewall, no route).
 pub const DIRECT_LINK_FAILED_PUNCH: &str = "direct_link_failed_punch";
+/// A punched link waited on the relay for a transfer to finish, and its unused
+/// interface died first: leviculum says `Timeout`, later than any session
+/// could (`direct_path::held_failure`).
+pub const DIRECT_LINK_FAILED_HELD: &str = "direct_link_failed_held";
 /// A punched interface went down; its link is back on its relayed path.
 pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
 /// A direct A/V leg's path was judged gone and the leg fell back
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
+
+// ─── v44 — `EdgeMetrics::direct_link_upgrade_guarded` labels ──────────
+//
+// A Resource kept off a link with an upgrade in flight
+// (`direct_path::DirectPathTracker::upgrade_in_flight`).
+
+/// The identity pool passed over an upgrading link: the send took another
+/// lane or dialled one.
+pub const UPGRADE_GUARDED_POOL: &str = "upgrade_guarded_pool";
+/// A send already on an upgrading link was refused its Resource: it tries the
+/// Channel, then the bounded retry.
+pub const UPGRADE_GUARDED_SHIP: &str = "upgrade_guarded_ship";
+
+// ─── CIRISEdge#930 — `EdgeMetrics::key_plane_sweep` labels ──────────────
+//
+// The four per-subject key-plane listings (Key, IdentityOccurrence,
+// Revocation, IdentityOccurrenceRevocation) answer from a per-subject memo
+// invalidated by the store's admission cursor. Each listing books what it
+// cost, so a sweep that starts reading every subject again names itself.
+
+/// Key-plane listings answered (one per plane per peer round).
+pub const KEY_PLANE_LISTINGS: &str = "key_plane_listings";
+/// Listings that read the store for at least one subject.
+pub const KEY_PLANE_SWEEPS: &str = "key_plane_sweeps";
+/// Subjects read from the store (each is one to several persist reads).
+pub const KEY_PLANE_SUBJECT_READS: &str = "key_plane_subject_reads";
+/// Subjects answered from the memo, no store read.
+pub const KEY_PLANE_MEMO_HITS: &str = "key_plane_memo_hits";
+/// Subject reads the store did not serve (warned, not memoized, retried).
+pub const KEY_PLANE_READ_FAILURES: &str = "key_plane_read_failures";
+/// Wall-clock milliseconds spent in listings that read the store.
+pub const KEY_PLANE_SWEEP_MS: &str = "key_plane_sweep_ms";
+/// Change-probe pages read (`list_attestations_since` from the memo cursor).
+pub const KEY_PLANE_PROBE_READS: &str = "key_plane_probe_reads";
+/// Rows the change probe read.
+pub const KEY_PLANE_PROBE_ROWS: &str = "key_plane_probe_rows";
+/// Change probes the store did not serve (the memo was forgotten).
+pub const KEY_PLANE_PROBE_FAILURES: &str = "key_plane_probe_failures";
+/// Memoized answers dropped because a new row could change them.
+pub const KEY_PLANE_INVALIDATED: &str = "key_plane_invalidated";
+/// Memo rebuilds (first use, the TTL, or after a failed probe).
+pub const KEY_PLANE_REBUILDS: &str = "key_plane_rebuilds";
+
+// ─── v44 LTS — `EdgeMetrics::persisted_standing` labels ─────────────────
+//
+// The refresh of the bindings a restart judges handshakes by
+// (`transport::persisted_standing`). One pass at a time, bounded, paid for by
+// what changed; `pass_ms / passes` is what a pass costs.
+
+/// Passes run, whatever they found.
+pub const PERSISTED_STANDING_PASSES: &str = "persisted_standing_passes";
+/// Wall-clock milliseconds in those passes.
+pub const PERSISTED_STANDING_PASS_MS: &str = "persisted_standing_pass_ms";
+/// Ticks skipped because a pass was still running.
+pub const PERSISTED_STANDING_PASSES_SKIPPED: &str = "persisted_standing_passes_skipped";
+/// Passes cut at the bound: a read outlasted it.
+pub const PERSISTED_STANDING_PASSES_CUT: &str = "persisted_standing_passes_cut";
+/// Passes ended by a read the store did not serve (nobody stands until one is).
+pub const PERSISTED_STANDING_READ_FAILURES: &str = "persisted_standing_read_failures";
+/// Keys judged because a change named them.
+pub const PERSISTED_STANDING_CHANGES_JUDGED: &str = "persisted_standing_changes_judged";
+/// Sweeps of the whole list started.
+pub const PERSISTED_STANDING_SWEEPS: &str = "persisted_standing_sweeps";
+/// Rows a sweep walked.
+pub const PERSISTED_STANDING_ROWS_WALKED: &str = "persisted_standing_rows_walked";
+
+// ─── CIRISEdge#926 — `EdgeMetrics::link_stall` labels ─────────────────
+//
+// The link stall guard (`transport::link_stall`): a Channel send that landed
+// nothing because the peer acknowledged nothing, and what the guard did once
+// a link's run of them made it dead.
+
+/// One Channel send landed zero fragments: the window never opened.
+pub const LINK_STALL_ZERO_LANDED_SEND: &str = "link_stall_zero_landed_send";
+/// A link judged dead was closed; the next send dials a fresh one.
+pub const LINK_STALL_CLOSED: &str = "link_stall_closed";
+/// A link judged dead on a punched interface was moved back onto its relayed
+/// path (leviculum#83 `retire_direct_link`) instead of closed.
+pub const LINK_STALL_RETIRED_DIRECT: &str = "link_stall_retired_direct";
 
 // ─── v43 InvalidProof triage — `EdgeMetrics::peer_binding` labels ──────
 //
@@ -1218,13 +1488,24 @@ pub const RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL: &str = "completed_initiator
 pub const RESPONDER_ROUND_REPLY_SEND_FAILED: &str = "reply_send_failed";
 /// CIRISEdge#853 — a send on the initiator-final path failed.
 pub const RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED: &str = "send_then_complete_failed";
+/// CIRISEdge#943 — a frame that wanted an answer met a full reply lane: not
+/// stepped, not answered; the peer's round times out and its next one is served.
+pub const RESPONDER_ROUND_REPLY_SHED: &str = "reply_shed";
+/// v44 LTS — a frame that reads bodies went unanswered at the node-wide reply
+/// byte bound, its own lane having room.
+pub const RESPONDER_ROUND_REPLY_SHED_NODE: &str = "reply_shed_node";
+/// CIRISEdge#943 — a reply outlived its round in the lane and was not sent.
+pub const RESPONDER_ROUND_REPLY_EXPIRED: &str = "reply_expired";
 /// Every `responder_rounds_total` outcome token.
-pub const RESPONDER_ROUND_OUTCOMES: [&str; 5] = [
+pub const RESPONDER_ROUND_OUTCOMES: [&str; 8] = [
     RESPONDER_ROUND_STARTED,
     RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL,
     RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL,
     RESPONDER_ROUND_REPLY_SEND_FAILED,
     RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED,
+    RESPONDER_ROUND_REPLY_SHED,
+    RESPONDER_ROUND_REPLY_SHED_NODE,
+    RESPONDER_ROUND_REPLY_EXPIRED,
 ];
 
 /// CIRISEdge#853 — `responder_link_up_seconds` stage: the dialer's link-borne
@@ -1263,6 +1544,330 @@ pub const RESPONDER_LINK_UP_TRACKED_MAX: usize = 4096;
 /// [`EdgeMetrics::responder_link_up_seconds`]'s buckets (time from
 /// `LinkEstablished` on the responder to the end of each link-up stage).
 pub const RESPONDER_LINK_UP_BUCKETS_SECONDS: &[f64] = &[0.01, 0.1, 0.5, 1.0, 5.0, 30.0];
+
+// ─── v44 labels on the existing ledgers ────────────────────────────────────
+// A key with a `:` refines the key before it, which still counts the total
+// (the `alm_offer_refused` pattern), so a dashboard sums one or the other.
+
+/// The keyer caught a panic in a decapsulation (CIRISEdge#947). One link was
+/// refused and the worker lived; nonzero is a bug.
+pub const LINK_SEAL_KEYER_PANICKED: &str = "link_seal_keyer_panicked";
+/// A queued handshake whose link closed or ran out its budget: skipped
+/// unstarted, so it never reaches [`LINK_SEAL_DECAPSULATED`].
+pub const LINK_SEAL_KEYING_SKIPPED_STALE: &str = "link_seal_keying_skipped_stale";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE`] for a sender with standing.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STANDING: &str =
+    "link_seal_refused_handshake_sender_rate:standing";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE`] for an identified stranger.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STRANGER: &str =
+    "link_seal_refused_handshake_sender_rate:stranger";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE`] for a link with no identity.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_UNIDENTIFIED: &str =
+    "link_seal_refused_handshake_sender_rate:unidentified";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE`] on the standing budget.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STANDING: &str =
+    "link_seal_refused_handshake_node_rate:standing";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE`] on the strangers' budget.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STRANGER: &str =
+    "link_seal_refused_handshake_node_rate:stranger";
+/// [`LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE`] on the strangers' budget, from a
+/// link with no identity.
+pub const LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_UNIDENTIFIED: &str =
+    "link_seal_refused_handshake_node_rate:unidentified";
+/// [`LINK_SEAL_REFUSED_DECAP_SATURATED`], the standing queue.
+pub const LINK_SEAL_REFUSED_DECAP_SATURATED_STANDING: &str =
+    "link_seal_refused_decap_saturated:standing";
+/// [`LINK_SEAL_REFUSED_DECAP_SATURATED`], the strangers' queue.
+pub const LINK_SEAL_REFUSED_DECAP_SATURATED_STRANGER: &str =
+    "link_seal_refused_decap_saturated:stranger";
+
+/// [`LINK_SHAPING_HOME_ELSEWHERE`]: THIS node refused a peer. Includes the
+/// refusals [`LINK_SHAPING_LOAD_REFUSED`] names.
+pub const LINK_SHAPING_HOME_ELSEWHERE_GIVEN: &str = "link_shaping_home_elsewhere:given";
+/// [`LINK_SHAPING_HOME_ELSEWHERE`]: a peer refused THIS node. Those two are
+/// the two sides of a wire: only `given` says this node is at its bound.
+pub const LINK_SHAPING_HOME_ELSEWHERE_RECEIVED: &str = "link_shaping_home_elsewhere:received";
+/// [`LINK_SHAPING_OFFERED`] on a link this node dialled.
+pub const LINK_SHAPING_OFFERED_DIALLED: &str = "link_shaping_offered:dialled";
+/// [`LINK_SHAPING_OFFERED`] answering a peer's offer.
+pub const LINK_SHAPING_OFFERED_ANSWERED: &str = "link_shaping_offered:answered";
+/// [`LINK_SHAPING_AGREED`] at the `seat` class.
+pub const LINK_SHAPING_AGREED_SEAT: &str = "link_shaping_agreed:seat";
+/// [`LINK_SHAPING_AGREED`] at the `server` class.
+pub const LINK_SHAPING_AGREED_SERVER: &str = "link_shaping_agreed:server";
+/// [`LINK_SHAPING_AGREED`] at the `home` class.
+pub const LINK_SHAPING_AGREED_HOME: &str = "link_shaping_agreed:home";
+/// [`LINK_SHAPING_AGREED`] at the `phone-wifi` class.
+pub const LINK_SHAPING_AGREED_PHONE_WIFI: &str = "link_shaping_agreed:phone-wifi";
+/// [`LINK_SHAPING_AGREED`] at the `phone-cellular` class.
+pub const LINK_SHAPING_AGREED_PHONE_CELLULAR: &str = "link_shaping_agreed:phone-cellular";
+/// A seat link closed because its peer left the active roster.
+pub const LINK_SHAPING_SEAT_LOST: &str = "link_shaping_seat_lost";
+/// The shaped links' rates went past the node cap.
+pub const LINK_SHAPING_OVER_CAP: &str = "link_shaping_over_cap";
+/// A row was taken back from a shaper: the link closed, or its budget ran out.
+pub const LINK_SHAPING_ROW_RETRACTED: &str = "link_shaping_row_retracted";
+/// A row did not leave within its budget.
+pub const LINK_SHAPING_ROW_LEFT_TIMEOUT: &str = "link_shaping_row_left_timeout";
+/// Bodies a shaped link took with it when it closed. Their rows retry.
+pub const LINK_SHAPING_BODIES_STRANDED: &str = "link_shaping_bodies_stranded";
+/// A bulk message rode the shaped link to its end.
+pub const LINK_SHAPING_BULK_FALLBACK_OK: &str = "link_shaping_bulk_fallback:ok";
+/// A bulk message on the shaped link did not finish.
+pub const LINK_SHAPING_BULK_FALLBACK_FAILED: &str = "link_shaping_bulk_fallback:failed";
+/// A policy or device change moved this node's shaping.
+pub const LINK_SHAPING_POLICY_MOVED: &str = "link_shaping_policy_moved";
+
+/// Failure-driven primary change (ALM C6).
+pub const ALM_FAILOVER: &str = "alm_failover";
+/// Make-before-break primary change (ALM C4).
+pub const ALM_SWITCH: &str = "alm_switch";
+/// A path's sequence numbers restarted with a newer room epoch.
+pub const ALM_EPOCH_RESYNC: &str = "alm_epoch_resync";
+/// A loop reached the ancestry backstop.
+pub const ALM_LOOP_DETECTED: &str = "alm_loop_detected";
+/// A forwarder's advertised capacity passed what it measured.
+pub const ALM_OVER_CLAIM: &str = "alm_over_claim";
+
+/// A direct link was not proposed: the node's proposing switch is off.
+pub const DIRECT_LINK_OFF_PROPOSING_OFF: &str = "direct_link_off:proposing_off";
+/// A direct link was not proposed: no facilitator resolved.
+pub const DIRECT_LINK_OFF_NO_FACILITATOR: &str = "direct_link_off:no_facilitator";
+/// A yielded proposal's wait ran out and this end proposed after all.
+pub const DIRECT_LINK_YIELD_EXPIRED: &str = "direct_link_yield_expired";
+
+/// The `link_shaping_agreed` key of `class`.
+#[must_use]
+pub fn agreed_label(class: crate::telemetry::ShapingClass) -> &'static str {
+    use crate::telemetry::ShapingClass as C;
+    match class {
+        C::Seat => LINK_SHAPING_AGREED_SEAT,
+        C::Server => LINK_SHAPING_AGREED_SERVER,
+        C::Home => LINK_SHAPING_AGREED_HOME,
+        C::PhoneWifi => LINK_SHAPING_AGREED_PHONE_WIFI,
+        C::PhoneCellular => LINK_SHAPING_AGREED_PHONE_CELLULAR,
+    }
+}
+
+/// Every `link_seal` key.
+pub const LINK_SEAL_LABELS: &[&str] = &[
+    LINK_SEAL_INITIATED,
+    LINK_SEAL_ACCEPTED,
+    LINK_SEAL_REFUSED_NO_PAIR,
+    LINK_SEAL_REFUSED_LOOKUP,
+    LINK_SEAL_REFUSED_CLAIM_MISMATCH,
+    LINK_SEAL_REFUSED_RESPONDER_MISMATCH,
+    LINK_SEAL_REFUSED_NOT_A_HANDSHAKE,
+    LINK_SEAL_REFUSED_MALFORMED,
+    LINK_SEAL_REFUSED_TOO_LARGE,
+    LINK_SEAL_REFUSED_SUITE,
+    LINK_SEAL_REFUSED_KEX,
+    LINK_SEAL_REFUSED_TIMEOUT,
+    LINK_SEAL_REFUSED_SEND,
+    LINK_SEAL_REFUSED_FRAME_BEFORE_KEYS,
+    LINK_SEAL_REFUSED_OPEN_FAILED,
+    LINK_SEAL_REFUSED_FIRST_CONTACT_ONLY,
+    LINK_SEAL_REFUSED_FIRST_CONTACT_SIGNER,
+    LINK_SEAL_REFUSED_PIN,
+    LINK_SEAL_DROPPED_HELD_OVERFLOW,
+    LINK_SEAL_HELD_FOR_ATTRIBUTION,
+    LINK_SEAL_REFUSED_UNSEALED_SEND,
+    LINK_SEAL_DROPPED_REPLAY,
+    LINK_SEAL_PAIR_ROOTED,
+    LINK_SEAL_PAIR_SELF_SIGNED_ROW,
+    LINK_REKEYED_TO_WIRE_ID,
+    LINK_SEAL_PAIR_PIN,
+    LINK_SEAL_PAIR_ROUTE_FETCH,
+    LINK_SEAL_ROUTE_REQUEST_SENT,
+    LINK_SEAL_ROUTE_REQUESTED,
+    LINK_SEAL_ROUTE_ANSWERED,
+    LINK_SEAL_REFUSED_ROUTE_REQUEST,
+    LINK_SEAL_REFUSED_ROUTE_RATE_LIMITED,
+    LINK_SEAL_REFUSED_ROUTE_OFF_IDENTITY_PLANE,
+    LINK_SEAL_REFUSED_ROUTE_NOT_OURS,
+    LINK_SEAL_REFUSED_ROUTE_UNAVAILABLE,
+    LINK_SEAL_REFUSED_ROUTE_ANSWER,
+    LINK_SEAL_REFUSED_ROUTE_ANSWER_SIGNER,
+    LINK_SEAL_REFUSED_ROUTE_ANSWER_UNVERIFIED,
+    LINK_SEAL_REFUSED_ROUTE_TIMEOUT,
+    LINK_SEAL_REFUSED_ROUTE_CLOSED,
+    LINK_SEAL_REFUSED_ROUTE_SEND,
+    LINK_SEAL_DROPPED_BEFORE_KEYS,
+    LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE,
+    LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE,
+    LINK_SEAL_REFUSED_DECAP_SATURATED,
+    LINK_SEAL_REFUSED_AWAITING_CAP,
+    LINK_SEAL_REFUSED_STRANGER_CAP,
+    LINK_SEAL_REFUSED_KEYING_HOLD,
+    LINK_SEAL_HELD_DURING_KEYING,
+    LINK_SEAL_DECAPSULATED,
+    LINK_SEAL_HELD_BEFORE_KEYS,
+    LINK_SEAL_KEYER_PANICKED,
+    LINK_SEAL_KEYING_SKIPPED_STALE,
+    LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STANDING,
+    LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STRANGER,
+    LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_UNIDENTIFIED,
+    LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STANDING,
+    LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_STRANGER,
+    LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE_UNIDENTIFIED,
+    LINK_SEAL_REFUSED_DECAP_SATURATED_STANDING,
+    LINK_SEAL_REFUSED_DECAP_SATURATED_STRANGER,
+];
+/// Every `link_shaping` key but the raw real-frame count.
+pub const LINK_SHAPING_LABELS: &[&str] = &[
+    LINK_SHAPING_OFFERED,
+    LINK_SHAPING_AGREED,
+    LINK_SHAPING_UNSHAPED,
+    LINK_SHAPING_REFUSED_UNSHAPED_PEER,
+    LINK_SHAPING_HOME_ELSEWHERE,
+    LINK_SHAPING_REFERRAL_SENT,
+    LINK_SHAPING_REFERRAL_EMPTY,
+    LINK_SHAPING_REFERRAL_WITHHELD,
+    LINK_SHAPING_REFERRAL_RECEIVED,
+    LINK_SHAPING_REFERRAL_REJECTED,
+    LINK_SHAPING_REFERRAL_HOMED,
+    LINK_SHAPING_REFERRAL_FAILED,
+    LINK_SHAPING_REFERRAL_EXHAUSTED,
+    LINK_SHAPING_REFUSED_MALFORMED,
+    LINK_SHAPING_DROPPED_WRONG_KIND,
+    LINK_SHAPING_FRAMES_COVER,
+    LINK_SHAPING_COVER_RECEIVED,
+    LINK_SHAPING_QUEUE_DEFERRED,
+    LINK_SHAPING_SEND_FAILED,
+    LINK_SHAPING_BULK_REFUSED,
+    LINK_SHAPING_BULK_ON_SHAPED_FALLBACK,
+    LINK_SHAPING_LOAD_REFUSED,
+    LINK_SHAPING_LOAD_SHED,
+    LINK_SHAPING_LOAD_SHED_BULK,
+    LINK_SHAPING_HOME_ELSEWHERE_GIVEN,
+    LINK_SHAPING_HOME_ELSEWHERE_RECEIVED,
+    LINK_SHAPING_OFFERED_DIALLED,
+    LINK_SHAPING_OFFERED_ANSWERED,
+    LINK_SHAPING_AGREED_SEAT,
+    LINK_SHAPING_AGREED_SERVER,
+    LINK_SHAPING_AGREED_HOME,
+    LINK_SHAPING_AGREED_PHONE_WIFI,
+    LINK_SHAPING_AGREED_PHONE_CELLULAR,
+    LINK_SHAPING_SEAT_LOST,
+    LINK_SHAPING_OVER_CAP,
+    LINK_SHAPING_ROW_RETRACTED,
+    LINK_SHAPING_ROW_LEFT_TIMEOUT,
+    LINK_SHAPING_BODIES_STRANDED,
+    LINK_SHAPING_BULK_FALLBACK_OK,
+    LINK_SHAPING_BULK_FALLBACK_FAILED,
+    LINK_SHAPING_POLICY_MOVED,
+];
+/// Every `direct_link` key.
+pub const DIRECT_LINK_LABELS: &[&str] = &[
+    DIRECT_LINK_PROPOSED,
+    DIRECT_LINK_PROPOSE_REFUSED,
+    DIRECT_LINK_SKIPPED_NEIGHBOUR,
+    DIRECT_LINK_SKIPPED_BACKOFF,
+    DIRECT_LINK_YIELDED,
+    DIRECT_LINK_SKIPPED_NO_LINK,
+    DIRECT_LINK_REQUEST_ACCEPTED,
+    DIRECT_LINK_REQUEST_REFUSED,
+    DIRECT_LINK_ESTABLISHED,
+    DIRECT_LINK_FAILED_REJECTED,
+    DIRECT_LINK_FAILED_PROBE,
+    DIRECT_LINK_FAILED_TIMEOUT,
+    DIRECT_LINK_FAILED_PUNCH,
+    DIRECT_LINK_FAILED_HELD,
+    DIRECT_LINK_LOST,
+    DIRECT_LINK_LEG_FELL_BACK,
+    DIRECT_LINK_OFF_PROPOSING_OFF,
+    DIRECT_LINK_OFF_NO_FACILITATOR,
+    DIRECT_LINK_YIELD_EXPIRED,
+];
+/// Every `av_plane` key.
+pub const AV_PLANE_LABELS: &[&str] = &[
+    AV_SENT,
+    AV_SEND_REFUSED_CHUNK_TOO_LARGE,
+    AV_SEND_CONGESTED,
+    AV_SEND_LINK_GONE,
+    AV_SEND_FAILED,
+    AV_LINK_OPENED,
+    AV_LINK_ARRIVED,
+    AV_INBOUND_DELIVERED,
+    AV_INBOUND_DROPPED_QUEUE_FULL,
+    AV_INBOUND_DROPPED_UNATTRIBUTED,
+    AV_INBOUND_DROPPED_NO_CONSUMER,
+    AV_INBOUND_DROPPED_ARRIVALS_FULL,
+    AV_INBOUND_DROPPED_CONSUMER_GONE,
+    AV_INBOUND_DROPPED_RESOURCE,
+    AV_INBOUND_DUPLICATE_LEG,
+    AV_LINK_ID_MISMATCH,
+    AV_RELAY_DIALLER_REFUSED,
+    AV_RELAY_DIALLER_ADMITTED,
+    AV_CALL_FRAME_UNOPENED,
+    AV_CALL_FRAME_NO_KEY,
+    AV_CALL_RELAYED,
+    AV_CALL_FRAME_FORGED,
+    AV_CALL_FRAME_UNBOUND,
+    AV_CALL_BINDING_INSTALLED,
+    AV_CALL_BINDING_REFUSED,
+    AV_CALL_RECORD_REFUSED,
+    AV_SENT_TIMED,
+    AV_SENT_UNTIMED_FULL,
+    AV_FRAME_EXPIRED_SENDER,
+    AV_FRAME_EXPIRED_MARKED,
+    AV_FRAME_EXPIRED_LATE,
+    AV_FRAME_STALE_DROPPED,
+    AV_CHUNK_DROPPED_CONGESTED,
+    AV_LEG_SHED_TO_BASE,
+    AV_LEG_RESTORED,
+    ALM_C3_SENT,
+    ALM_C3_SEND_FAILED,
+    ALM_C3_RESENT,
+    ALM_C3_RECEIVED,
+    ALM_C3_MALFORMED,
+    ALM_C3_PEER_CAPABLE,
+    ALM_OFFER_REFUSED,
+    ALM_OFFER_REFUSED_NOT_PUBLISHER,
+    ALM_OFFER_REFUSED_UNBOUND,
+    ALM_ADMIT,
+    ALM_REFUSE,
+    ALM_SHED,
+    ALM_FORWARDED,
+    ALM_PARENT_CHANGE,
+    ALM_RELAY_TIER_ROSTER,
+    ALM_RELAY_TIER_ROSTER_FAILED,
+    ALM_RELAY_TIER_DEFAULT,
+    ALM_FAILOVER,
+    ALM_SWITCH,
+    ALM_EPOCH_RESYNC,
+    ALM_LOOP_DETECTED,
+    ALM_OVER_CLAIM,
+];
+/// Every `advertise` key.
+pub const ADVERTISE_LABELS: &[&str] = &[
+    ADVERTISE_NOT_ADVERTISABLE,
+    ADVERTISE_REOFFERED_AFTER_SKIP,
+    ADVERTISE_WATERMARK_REWOUND,
+    ADVERTISE_WATERMARK_EVICTED,
+    ADVERTISE_READ_FAILED,
+    ADVERTISE_RESWEEP_CYCLE_COMPLETED,
+    ADVERTISE_RESWEEP_CYCLE_OVERDUE,
+];
+/// Every `link_stall` key.
+pub const LINK_STALL_LABELS: &[&str] = &[
+    LINK_STALL_ZERO_LANDED_SEND,
+    LINK_STALL_CLOSED,
+    LINK_STALL_RETIRED_DIRECT,
+];
+/// Every `direct_link_upgrade_guarded` key.
+pub const UPGRADE_GUARDED_LABELS: &[&str] = &[UPGRADE_GUARDED_POOL, UPGRADE_GUARDED_SHIP];
+/// Every `peer_binding` key.
+pub const PEER_BINDING_LABELS: &[&str] = &[
+    PEER_BINDING_TRANSPORT_KEY_HEALED,
+    PEER_BINDING_DIAL_KEY_FROM_ANNOUNCE,
+    PEER_BINDING_LINK_PROOF_REFUSED,
+    PEER_BINDING_PRIMED,
+    PEER_BINDING_PRIME_REFUSED,
+    PEER_BINDING_ATTRIBUTION_SHARED,
+    PEER_BINDING_ATTRIBUTION_BY_CLAIM,
+    PEER_BINDING_ATTRIBUTION_BY_NODE,
+];
 
 /// CIRISEdge P0 telemetry (CIRISServer `FSD/UNIFIED_TELEMETRY.md` §4) — the
 /// upper bounds, in seconds, of
@@ -1515,6 +2120,22 @@ pub struct EdgeMetrics {
     /// (`PEER_BINDING_*` constants in this module): wrong keys healed,
     /// corrected at dial, refused at prime, and proofs that failed.
     pub peer_binding: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#930 — the key-plane listings' cost ledger, by label
+    /// (`KEY_PLANE_*` constants in this module): listings, store sweeps,
+    /// subject reads, memo hits, change-probe reads and rows, invalidations,
+    /// rebuilds and the wall time spent reading.
+    pub key_plane_sweep: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// v44 LTS — the persisted-standing refresh by label
+    /// (`PERSISTED_STANDING_*` constants in this module): passes, their wall
+    /// time, ticks skipped, passes cut, sweeps and rows walked.
+    pub persisted_standing: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#926 — the link stall guard by label (`LINK_STALL_*`
+    /// constants in this module): zero-landing Channel sends, and the dead
+    /// links it closed or moved off a punched path.
+    pub link_stall: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// v44 — Resources kept off a link with an upgrade in flight, by
+    /// `UPGRADE_GUARDED_*` label.
+    pub direct_link_upgrade_guarded: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — peers with a direct path now, per reporting
     /// transport (keyed by its metrics source id, like `link_pool_sizes`).
     /// Read as [`Self::direct_links_active`] (the sum).
@@ -1871,6 +2492,17 @@ pub struct EdgeMetrics {
     /// CIRISEdge#853 — ships refused because their lane was already claimed by
     /// another transfer. Unreachable by construction; non-zero is a regression.
     pub unclaimed_ship_refused_total: Arc<std::sync::atomic::AtomicU64>,
+    /// v44 — the operator's telemetry ([`crate::telemetry`]).
+    pub telemetry: Arc<crate::telemetry::EdgeTelemetry>,
+}
+
+/// A per-kind counter map with every [`EnvelopeKind`] present.
+fn every_kind(map: &RwLock<HashMap<EnvelopeKind, u64>>) -> HashMap<EnvelopeKind, u64> {
+    let held = map.read();
+    EnvelopeKind::ALL
+        .iter()
+        .map(|k| (*k, held.get(k).copied().unwrap_or(0)))
+        .collect()
 }
 
 /// A `&'static str`-keyed counter map, cloned out with owned keys for the
@@ -1880,6 +2512,17 @@ fn owned_keys<V: Copy>(map: &RwLock<HashMap<&'static str, V>>) -> HashMap<String
         .iter()
         .map(|(k, v)| ((*k).to_string(), *v))
         .collect()
+}
+
+/// [`owned_keys`] with every label of a closed family present, so a series
+/// that is absent is one this build does not have and 0 is one that did not
+/// happen.
+fn registered(map: &RwLock<HashMap<&'static str, u64>>, labels: &[&str]) -> HashMap<String, u64> {
+    let mut out = owned_keys(map);
+    for l in labels {
+        out.entry((*l).to_string()).or_insert(0);
+    }
+    out
 }
 
 impl EdgeMetrics {
@@ -2167,6 +2810,13 @@ impl EdgeMetrics {
         *self.link_seal.write().entry(label).or_insert(0) += 1;
     }
 
+    /// Add `n` to a `LINK_SHAPING_*` key.
+    pub fn add_link_shaping(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.link_shaping.write().entry(label).or_insert(0) += n;
+        }
+    }
+
     /// Count one link-shaping event by its `LINK_SHAPING_*` label.
     pub fn inc_link_shaping(&self, label: &'static str) {
         *self.link_shaping.write().entry(label).or_insert(0) += 1;
@@ -2224,6 +2874,41 @@ impl EdgeMetrics {
             .collect()
     }
 
+    /// v44 — count one Resource kept off an upgrading link by its
+    /// `UPGRADE_GUARDED_*` label.
+    pub fn inc_direct_link_upgrade_guarded(&self, label: &'static str) {
+        *self
+            .direct_link_upgrade_guarded
+            .write()
+            .entry(label)
+            .or_insert(0) += 1;
+    }
+
+    /// v44 — the upgrade guard's ledger by label.
+    #[must_use]
+    pub fn direct_link_upgrade_guarded(&self) -> HashMap<String, u64> {
+        self.direct_link_upgrade_guarded
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#926 — count one link-stall event by its `LINK_STALL_*` label.
+    pub fn inc_link_stall(&self, label: &'static str) {
+        *self.link_stall.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#926 — the link-stall ledger by label.
+    #[must_use]
+    pub fn link_stall(&self) -> HashMap<String, u64> {
+        self.link_stall
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
     /// Count one peer-binding event by its `PEER_BINDING_*` label.
     pub fn inc_peer_binding(&self, label: &'static str) {
         *self.peer_binding.write().entry(label).or_insert(0) += 1;
@@ -2233,6 +2918,40 @@ impl EdgeMetrics {
     #[must_use]
     pub fn peer_binding(&self) -> HashMap<String, u64> {
         self.peer_binding
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#930 — add `n` to a `KEY_PLANE_*` label.
+    pub fn add_key_plane_sweep(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.key_plane_sweep.write().entry(label).or_insert(0) += n;
+        }
+    }
+
+    /// The key-plane listing ledger by label (tests + the operator readback).
+    #[must_use]
+    pub fn key_plane_sweep(&self) -> HashMap<String, u64> {
+        self.key_plane_sweep
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// v44 LTS — add `n` to a `PERSISTED_STANDING_*` label.
+    pub fn add_persisted_standing(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.persisted_standing.write().entry(label).or_insert(0) += n;
+        }
+    }
+
+    /// The persisted-standing ledger by label.
+    #[must_use]
+    pub fn persisted_standing(&self) -> HashMap<String, u64> {
+        self.persisted_standing
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -2569,11 +3288,10 @@ impl EdgeMetrics {
 
     /// CIRISEdge#433 — increment the replication-plane served counter for `kind`.
     ///
-    /// Called at the bridge's serve exit — the moment the bridge hands the wire
-    /// bytes back to the pack path. Mirrors the CIRISEdge#28 precedent at
-    /// `edge.rs` "durable enqueue is the metric-visible moment": the counter marks
-    /// the point where THIS layer's part of the transaction is definitely
-    /// complete, not the point where the peer acknowledged it.
+    /// Called by the coordinator once per envelope of a `Deliver` whose send
+    /// returned: not at a fetch, because a proactive push fetches before
+    /// anything has left. It marks the transport taking the frame, not the
+    /// peer acknowledging it.
     pub fn inc_replication_served(&self, kind: EnvelopeKind) {
         let mut guard = self.replication_envelopes_served_total.write();
         *guard.entry(kind).or_insert(0) += 1;
@@ -2899,6 +3617,11 @@ impl EdgeMetrics {
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn snapshot(&self) -> EdgeMetricsBundle {
+        let t = self.telemetry.snapshot();
+        // The raw count of real frames is a clock of the node's real traffic;
+        // it leaves only through `ShapingWindows`.
+        let mut link_shaping = registered(&self.link_shaping, LINK_SHAPING_LABELS);
+        link_shaping.remove(LINK_SHAPING_FRAMES_REAL);
         EdgeMetricsBundle {
             envelopes_sent_total: self.envelopes_sent_total.read().clone(),
             envelopes_received_total: self.envelopes_received_total.read().clone(),
@@ -2910,7 +3633,18 @@ impl EdgeMetrics {
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             blob_serve_legacy_dag_walks: self.blob_serve_legacy_dag_walks(),
-            replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
+            replication_round_outcomes_total: {
+                let held = self.replication_round_outcomes_total.read();
+                [
+                    RoundOutcome::Completed,
+                    RoundOutcome::Refused,
+                    RoundOutcome::TimedOut,
+                    RoundOutcome::Error,
+                ]
+                .iter()
+                .map(|o| (*o, held.get(o).copied().unwrap_or(0)))
+                .collect()
+            },
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
             replication_inbound_backpressure_drops_by_role: self
                 .replication_inbound_backpressure_drops_by_role
@@ -2957,11 +3691,19 @@ impl EdgeMetrics {
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
             transport_inbound_drops: self.transport_inbound_drops(),
-            av_plane: self.av_plane(),
-            link_seal: self.link_seal(),
-            link_shaping: self.link_shaping(),
-            direct_link: self.direct_link(),
-            peer_binding: self.peer_binding(),
+            av_plane: registered(&self.av_plane, AV_PLANE_LABELS),
+            link_seal: registered(&self.link_seal, LINK_SEAL_LABELS),
+            link_shaping,
+            direct_link: registered(&self.direct_link, DIRECT_LINK_LABELS),
+            peer_binding: registered(&self.peer_binding, PEER_BINDING_LABELS),
+            key_plane_sweep: self.key_plane_sweep(),
+            persisted_standing: self.persisted_standing(),
+            link_stall: registered(&self.link_stall, LINK_STALL_LABELS),
+            direct_link_upgrade_guarded: registered(
+                &self.direct_link_upgrade_guarded,
+                UPGRADE_GUARDED_LABELS,
+            ),
+            advertise: registered(&self.advertise, ADVERTISE_LABELS),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
@@ -2989,11 +3731,10 @@ impl EdgeMetrics {
             announce_to_binding_ms_last: self.announce_to_binding_ms_last(),
             withholds_by_reason: self.withholds_by_reason.read().clone(),
             recent_withholds: self.recent_withholds.read().iter().cloned().collect(),
-            replication_envelopes_served_total: self
-                .replication_envelopes_served_total
-                .read()
-                .clone(),
-            apply_refusals_by_kind: self.apply_refusals_by_kind.read().clone(),
+            replication_envelopes_served_total: every_kind(
+                &self.replication_envelopes_served_total,
+            ),
+            apply_refusals_by_kind: every_kind(&self.apply_refusals_by_kind),
             key_apply_refusals_by_reason: self.key_apply_refusals_by_reason.read().clone(),
             attestation_apply_refusals_by_reason: self
                 .attestation_apply_refusals_by_reason
@@ -3001,7 +3742,7 @@ impl EdgeMetrics {
                 .clone(),
             apply_refusals_by_class: self.apply_refusals_by_class.read().clone(),
             envelope_kind_retired_refusals: self.envelope_kind_retired_refusals.read().clone(),
-            rows_parked_on_signer: self.rows_parked_on_signer.read().clone(),
+            rows_parked_on_signer: every_kind(&self.rows_parked_on_signer),
             signer_releases: self.signer_releases(),
             retry_suppressions: self.retry_suppressions(),
             signer_park_evictions: self.signer_park_evictions(),
@@ -3009,15 +3750,19 @@ impl EdgeMetrics {
             refusal_memory_capacity: self.refusal_memory().capacity,
             parked_on_signer_len: self.refusal_memory().parked_on_signer_len,
             parked_on_signer_capacity: self.refusal_memory().parked_on_signer_capacity,
-            replication_applied_total: self.replication_applied_total.read().clone(),
-            replication_duplicate_total: self.replication_duplicate_total.read().clone(),
+            replication_applied_total: every_kind(&self.replication_applied_total),
+            replication_duplicate_total: every_kind(&self.replication_duplicate_total),
             removal_delivery: self.removal_receipts.read().delta(),
-            replication_round_duration_seconds: self
-                .replication_round_duration_seconds
-                .read()
-                .iter()
-                .map(|(k, h)| (*k, h.snapshot(REPLICATION_ROUND_DURATION_BUCKETS_SECONDS)))
-                .collect(),
+            replication_round_duration_seconds: {
+                let held = self.replication_round_duration_seconds.read();
+                EnvelopeKind::ALL
+                    .iter()
+                    .map(|k| {
+                        let h = held.get(k).cloned().unwrap_or_default();
+                        (*k, h.snapshot(REPLICATION_ROUND_DURATION_BUCKETS_SECONDS))
+                    })
+                    .collect()
+            },
             sweep_permit_wait_seconds: self
                 .sweep_permit_wait_seconds
                 .read()
@@ -3027,6 +3772,44 @@ impl EdgeMetrics {
             responder_link_up_total: self.responder_link_up_total(),
             recovered_links_total: self.recovered_links_total(),
             unclaimed_ship_refused_total: self.unclaimed_ship_refused_total(),
+            event_handler_duration_seconds: t.event_handler_duration_seconds,
+            seal_keying_duration_seconds: t.seal_keying_duration_seconds,
+            replication_inbound_wait_seconds: t.replication_inbound_wait_seconds,
+            replication_reply_wait_seconds: t.replication_reply_wait_seconds,
+            shaping_row_wait_seconds: t.shaping_row_wait_seconds,
+            alm_failover_gap_seconds: t.alm_failover_gap_seconds,
+            call_setup_duration_seconds: t.call_setup_duration_seconds,
+            first_contact_duration_seconds: t.first_contact_duration_seconds,
+            refusal_attempts: t.refusal_attempts,
+            wake_first_round_duration_seconds: t.wake_first_round_duration_seconds,
+            seal_keyer_queued: t.seal_keyer_queued,
+            seal_keyer_workers: t.seal_keyer_workers,
+            seal_awaiting_links: t.seal_awaiting_links,
+            seal_awaiting_bytes: t.seal_awaiting_bytes,
+            seal_held_bytes: t.seal_held_bytes,
+            replication_reply_queued: t.replication_reply_queued,
+            load_tier: t.load_tier,
+            load_host_pressure: t.load_host_pressure,
+            load_pressure_report_age_seconds: t.load_pressure_report_age_seconds,
+            load_tier_changes_total: t.load_tier_changes_total,
+            shaping_enabled: t.shaping_enabled,
+            shaping_links: t.shaping_links,
+            shaping_free_slots: t.shaping_free_slots,
+            shaping_seat_roster_age_seconds: t.shaping_seat_roster_age_seconds,
+            shaping_frames_real_windowed: t.shaping_frames_real_windowed,
+            shaping_windows_withheld: t.shaping_windows_withheld,
+            leviculum_events_queued: t.leviculum_events_queued,
+            leviculum_events_capacity: t.leviculum_events_capacity,
+            leviculum_events_dropped: t.leviculum_events_dropped,
+            leviculum_shed_packets: t.leviculum_shed_packets,
+            direct_link_proposing: t.direct_link_proposing,
+            alm_active_calls: t.alm_active_calls,
+            alm_c3_peers: t.alm_c3_peers,
+            decision_row_unheard_total: t.decision_row_unheard_total,
+            decision_row_subscribers: t.decision_row_subscribers,
+            apply_refusals: t.apply_refusals,
+            loop_last_progress_age_seconds: t.loop_last_progress_age_seconds,
+            node_alive: t.node_alive,
         }
     }
 }
@@ -3244,6 +4027,16 @@ pub struct EdgeMetricsBundle {
     /// The peer bindings dials check link proofs against, by
     /// `PEER_BINDING_*` label.
     pub peer_binding: HashMap<String, u64>,
+    /// CIRISEdge#930 — the key-plane listings' cost by `KEY_PLANE_*` label.
+    pub key_plane_sweep: HashMap<String, u64>,
+    /// v44 LTS — the persisted-standing refresh by `PERSISTED_STANDING_*` label.
+    pub persisted_standing: HashMap<String, u64>,
+    /// CIRISEdge#926 — the link stall guard by `LINK_STALL_*` label.
+    pub link_stall: HashMap<String, u64>,
+    /// v44 — Resources kept off an upgrading link by `UPGRADE_GUARDED_*` label.
+    pub direct_link_upgrade_guarded: HashMap<String, u64>,
+    /// `advertise.<label>`: the advertise sweep's ledger.
+    pub advertise: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
     pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
@@ -3366,6 +4159,82 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#853 — ships refused on a lane another transfer held.
     /// Unreachable by construction; non-zero is a regression.
     pub unclaimed_ship_refused_total: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub event_handler_duration_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_keying_duration_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub replication_inbound_wait_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub replication_reply_wait_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_row_wait_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub alm_failover_gap_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub call_setup_duration_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub first_contact_duration_seconds: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub refusal_attempts: HashMap<String, HistogramSnapshot>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub wake_first_round_duration_seconds: HistogramSnapshot,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_keyer_queued: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_keyer_workers: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_awaiting_links: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_awaiting_bytes: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub seal_held_bytes: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub replication_reply_queued: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_tier: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_host_pressure: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_pressure_report_age_seconds: f64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_tier_changes_total: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_enabled: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_links: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_free_slots: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_seat_roster_age_seconds: f64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_frames_real_windowed: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub shaping_windows_withheld: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub leviculum_events_queued: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub leviculum_events_capacity: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub leviculum_events_dropped: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub leviculum_shed_packets: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub direct_link_proposing: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub alm_active_calls: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub alm_c3_peers: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub decision_row_unheard_total: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub decision_row_subscribers: u64,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub apply_refusals: HashMap<String, u64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub loop_last_progress_age_seconds: HashMap<String, f64>,
+    /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub node_alive: u64,
 }
 
 /// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
@@ -3392,6 +4261,28 @@ impl FlatMetrics {
         for (label, v) in entries {
             total = total.saturating_add(*v);
             self.counters.insert(format!("{name}.{label}"), *v);
+        }
+        self.counters.insert(name.to_string(), total);
+    }
+
+    /// A labelled gauge family: `name` = the largest value, `name.<label>` =
+    /// each.
+    fn gauge_family(&mut self, name: &str, entries: &HashMap<String, f64>) {
+        let mut most = f64::NEG_INFINITY;
+        for (label, v) in entries {
+            most = most.max(*v);
+            self.gauges.insert(format!("{name}.{label}"), *v);
+        }
+        self.gauges.insert(name.to_string(), most.max(-1.0));
+    }
+
+    /// A labelled histogram family: `name` = every observation, and each
+    /// label under `name.<label>`.
+    fn histogram_family(&mut self, name: &str, entries: &HashMap<String, HistogramSnapshot>) {
+        let mut total = 0u64;
+        for (label, h) in entries {
+            total = total.saturating_add(h.count);
+            self.histogram(&format!("{name}.{label}"), h);
         }
         self.counters.insert(name.to_string(), total);
     }
@@ -3560,6 +4451,18 @@ impl EdgeMetricsBundle {
         f.family("direct_link", &self.direct_link);
         // The peer-binding ledger, `peer_binding.<label>`.
         f.family("peer_binding", &self.peer_binding);
+        // CIRISEdge#930 — the key-plane listings, `key_plane_sweep.<label>`.
+        f.family("key_plane_sweep", &self.key_plane_sweep);
+        // v44 LTS — the persisted-standing refresh, `persisted_standing.<label>`.
+        f.family("persisted_standing", &self.persisted_standing);
+        // CIRISEdge#926 — the link stall guard, `link_stall.<label>`.
+        f.family("link_stall", &self.link_stall);
+        // v44 — the upgrade guard, `direct_link_upgrade_guarded.<label>`.
+        f.family(
+            "direct_link_upgrade_guarded",
+            &self.direct_link_upgrade_guarded,
+        );
+        f.family("advertise", &self.advertise);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
             "direct_links_active".to_string(),
@@ -3714,6 +4617,97 @@ impl EdgeMetricsBundle {
             #[allow(clippy::cast_precision_loss)]
             f.gauges.insert(name.to_string(), value as f64);
         }
+        // v44 — the operator's telemetry. Closed labels are present at zero.
+        for (name, family) in [
+            (
+                "event_handler_duration_seconds",
+                &self.event_handler_duration_seconds,
+            ),
+            (
+                "seal_keying_duration_seconds",
+                &self.seal_keying_duration_seconds,
+            ),
+            (
+                "replication_inbound_wait_seconds",
+                &self.replication_inbound_wait_seconds,
+            ),
+            (
+                "replication_reply_wait_seconds",
+                &self.replication_reply_wait_seconds,
+            ),
+            ("shaping_row_wait_seconds", &self.shaping_row_wait_seconds),
+            ("alm_failover_gap_seconds", &self.alm_failover_gap_seconds),
+            (
+                "call_setup_duration_seconds",
+                &self.call_setup_duration_seconds,
+            ),
+            (
+                "first_contact_duration_seconds",
+                &self.first_contact_duration_seconds,
+            ),
+            ("refusal_attempts", &self.refusal_attempts),
+        ] {
+            f.histogram_family(name, family);
+        }
+        f.histogram(
+            "wake_first_round_duration_seconds",
+            &self.wake_first_round_duration_seconds,
+        );
+        f.counters.insert(
+            "wake_first_round_duration_seconds".to_string(),
+            self.wake_first_round_duration_seconds.count,
+        );
+        for (name, family) in [
+            ("seal_keyer_queued", &self.seal_keyer_queued),
+            ("seal_keyer_workers", &self.seal_keyer_workers),
+            ("replication_reply_queued", &self.replication_reply_queued),
+            ("load_tier_changes_total", &self.load_tier_changes_total),
+            ("shaping_links", &self.shaping_links),
+            (
+                "shaping_frames_real_windowed",
+                &self.shaping_frames_real_windowed,
+            ),
+            ("shaping_windows_withheld", &self.shaping_windows_withheld),
+            ("leviculum_events_queued", &self.leviculum_events_queued),
+            ("leviculum_events_capacity", &self.leviculum_events_capacity),
+            ("leviculum_events_dropped", &self.leviculum_events_dropped),
+            (
+                "decision_row_unheard_total",
+                &self.decision_row_unheard_total,
+            ),
+            ("apply_refusals", &self.apply_refusals),
+        ] {
+            f.family(name, family);
+        }
+        for (name, value) in [
+            ("seal_awaiting_links", self.seal_awaiting_links),
+            ("seal_awaiting_bytes", self.seal_awaiting_bytes),
+            ("seal_held_bytes", self.seal_held_bytes),
+            ("load_tier", self.load_tier),
+            ("load_host_pressure", self.load_host_pressure),
+            ("shaping_enabled", self.shaping_enabled),
+            ("shaping_free_slots", self.shaping_free_slots),
+            ("leviculum_shed_packets", self.leviculum_shed_packets),
+            ("direct_link_proposing", self.direct_link_proposing),
+            ("alm_active_calls", self.alm_active_calls),
+            ("alm_c3_peers", self.alm_c3_peers),
+            ("decision_row_subscribers", self.decision_row_subscribers),
+            ("node_alive", self.node_alive),
+        ] {
+            f.counters.insert(name.to_string(), value);
+        }
+        f.gauges.insert(
+            "load_pressure_report_age_seconds".to_string(),
+            self.load_pressure_report_age_seconds,
+        );
+        f.gauges.insert(
+            "shaping_seat_roster_age_seconds".to_string(),
+            self.shaping_seat_roster_age_seconds,
+        );
+        f.gauge_family(
+            "loop_last_progress_age_seconds",
+            &self.loop_last_progress_age_seconds,
+        );
         f
     }
 }
@@ -3774,6 +4768,11 @@ edge_metrics_bundle_fields!(
     link_shaping,
     direct_link,
     peer_binding,
+    key_plane_sweep,
+    persisted_standing,
+    link_stall,
+    direct_link_upgrade_guarded,
+    advertise,
     direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,
@@ -3819,6 +4818,44 @@ edge_metrics_bundle_fields!(
     responder_link_up_total,
     recovered_links_total,
     unclaimed_ship_refused_total,
+    event_handler_duration_seconds,
+    seal_keying_duration_seconds,
+    replication_inbound_wait_seconds,
+    replication_reply_wait_seconds,
+    shaping_row_wait_seconds,
+    alm_failover_gap_seconds,
+    call_setup_duration_seconds,
+    first_contact_duration_seconds,
+    refusal_attempts,
+    wake_first_round_duration_seconds,
+    seal_keyer_queued,
+    seal_keyer_workers,
+    seal_awaiting_links,
+    seal_awaiting_bytes,
+    seal_held_bytes,
+    replication_reply_queued,
+    load_tier,
+    load_host_pressure,
+    load_pressure_report_age_seconds,
+    load_tier_changes_total,
+    shaping_enabled,
+    shaping_links,
+    shaping_free_slots,
+    shaping_seat_roster_age_seconds,
+    shaping_frames_real_windowed,
+    shaping_windows_withheld,
+    leviculum_events_queued,
+    leviculum_events_capacity,
+    leviculum_events_dropped,
+    leviculum_shed_packets,
+    direct_link_proposing,
+    alm_active_calls,
+    alm_c3_peers,
+    decision_row_unheard_total,
+    decision_row_subscribers,
+    apply_refusals,
+    loop_last_progress_age_seconds,
+    node_alive,
 );
 
 #[cfg(test)]
@@ -3951,11 +4988,12 @@ mod tests {
             snap.replication_round_outcomes_total[&RoundOutcome::Refused],
             1
         );
-        // Never-emitted outcome stays absent (not zero-initialised) — the map
-        // is a sparse bag, mirroring the other per-key counters.
-        assert!(!snap
-            .replication_round_outcomes_total
-            .contains_key(&RoundOutcome::Error));
+        // v44 — a never-emitted outcome is present at zero: a missing series
+        // and a 0 are different answers.
+        assert_eq!(
+            snap.replication_round_outcomes_total[&RoundOutcome::Error],
+            0
+        );
         assert_eq!(RoundOutcome::TimedOut.as_str(), "timed_out");
     }
 
@@ -3995,9 +5033,11 @@ mod tests {
                 .copied(),
             Some(1)
         );
-        assert!(!snap
-            .replication_applied_total
-            .contains_key(&EnvelopeKind::Attestation));
+        assert_eq!(
+            snap.replication_applied_total[&EnvelopeKind::Attestation],
+            0,
+            "v44: a series before it happens, and one the other axis did not move"
+        );
     }
 
     /// CIRISEdge#441 — the receipt ledger's three-state contract, driven with
@@ -4164,11 +5204,10 @@ mod p0_telemetry_tests {
             Some(&("+Inf".to_string(), 1)),
             "the +Inf bucket is the count"
         );
-        assert!(
-            !snap
-                .replication_round_duration_seconds
-                .contains_key(&EnvelopeKind::Revocation),
-            "a kind with no rounds has no series"
+        assert_eq!(
+            snap.replication_round_duration_seconds[&EnvelopeKind::Revocation].count,
+            0,
+            "v44: a kind with no rounds is a series at zero"
         );
     }
 

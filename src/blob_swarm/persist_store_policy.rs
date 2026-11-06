@@ -656,7 +656,7 @@ mod directory_tests {
                 role: Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
             }],
             founded_at: ts(),
-            consensus_protocol: "founder_only".to_owned(),
+            consensus_protocol: "unanimous".to_owned(),
             policy_blob: None,
             persist_row_hash: String::new(),
             prev_head_digest: String::new(),

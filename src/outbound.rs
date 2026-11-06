@@ -452,9 +452,23 @@ pub async fn run_dispatcher(
     queue: Arc<dyn OutboundHandle>,
     transports: Vec<Arc<dyn Transport>>,
     config: DispatcherConfig,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     reachability: Option<Arc<ReachabilityTracker>>,
 ) {
+    run_dispatcher_beating(queue, transports, config, shutdown, reachability, None).await;
+}
+
+/// [`run_dispatcher`], stamping `loop.last_progress_age{loop=dispatcher}` each
+/// turn: on the idle poll's cadence, so it carries no traffic while idle.
+pub async fn run_dispatcher_beating(
+    queue: Arc<dyn OutboundHandle>,
+    transports: Vec<Arc<dyn Transport>>,
+    config: DispatcherConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    reachability: Option<Arc<ReachabilityTracker>>,
+    telemetry: Option<Arc<crate::telemetry::EdgeTelemetry>>,
+) {
+    use crate::telemetry::LoopName;
     if transports.is_empty() {
         tracing::warn!("dispatcher: no transports configured; outbound loop idle");
         return;
@@ -463,7 +477,13 @@ pub async fn run_dispatcher(
     loop {
         if *shutdown.borrow() {
             tracing::info!("dispatcher: shutdown signal received");
+            if let Some(t) = &telemetry {
+                t.beat_off(LoopName::Dispatcher);
+            }
             return;
+        }
+        if let Some(t) = &telemetry {
+            t.beat(LoopName::Dispatcher);
         }
 
         let claimed = match queue
@@ -640,9 +660,23 @@ async fn dispatch_one(
                 );
             }
         }
+        Err(TransportError::Suspended) => {
+            // Lifecycle — the transport is suspended (host in background):
+            // nothing was attempted, so no attempt is charged and no backoff
+            // drawn. The row stays claimed; its claim lapses and the row is
+            // claimed again after resume. (`Edge::suspend` stops this
+            // dispatcher first; this arm covers a transport suspended alone.)
+            tracing::debug!(
+                queue_id = ?row.queue_id,
+                "dispatcher: transport suspended; row left for after resume"
+            );
+        }
         Err(e) => {
             let class = match &e {
-                TransportError::Unreachable(_) => "unreachable",
+                TransportError::Suspended => "suspended",
+                TransportError::Unreachable(_) | TransportError::NoDialCandidate { .. } => {
+                    "unreachable"
+                }
                 TransportError::Timeout(_) => "timeout",
                 TransportError::Config(_) => "config",
                 TransportError::Io(_) => "io",
@@ -740,16 +774,38 @@ fn preferred_transport_index(
 /// Run the periodic-sweep tasks. Spawned alongside `run_dispatcher`.
 pub async fn run_sweeps(
     queue: Arc<dyn OutboundHandle>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    run_sweeps_beating(queue, shutdown, None).await;
+}
+
+/// [`run_sweeps`], stamping `loop.last_progress_age{loop=sweep}` on each sweep.
+pub async fn run_sweeps_beating(
+    queue: Arc<dyn OutboundHandle>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    telemetry: Option<Arc<crate::telemetry::EdgeTelemetry>>,
+) {
+    use crate::telemetry::LoopName;
+    let beat = || {
+        if let Some(t) = &telemetry {
+            t.beat(LoopName::Sweep);
+        }
+    };
+    beat();
     let mut tick_ack = tokio::time::interval(Duration::from_secs(30));
     let mut tick_ttl = tokio::time::interval(Duration::from_secs(60));
     let mut tick_claim = tokio::time::interval(Duration::from_secs(30));
 
     loop {
         tokio::select! {
-            _ = shutdown.changed() => return,
+            _ = shutdown.changed() => {
+                if let Some(t) = &telemetry {
+                    t.beat_off(LoopName::Sweep);
+                }
+                return;
+            }
             _ = tick_ack.tick() => {
+                beat();
                 if let Err(e) = queue.sweep_ack_timeouts().await {
                     tracing::warn!(error = %e, "sweep_ack_timeouts failed");
                 }

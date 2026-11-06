@@ -657,6 +657,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_ciris_edge_checksum_func_metrics_snapshot(
     ): Short
+    external fun uniffi_ciris_edge_checksum_func_onion_set_enabled(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_onion_status(
+    ): Short
     external fun uniffi_ciris_edge_checksum_func_path_table(
     ): Short
     external fun uniffi_ciris_edge_checksum_func_peer_add(
@@ -715,6 +719,12 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_ciris_edge_checksum_func_routing_tunnels(
     ): Short
+    external fun uniffi_ciris_edge_checksum_func_shaping_class_table(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_shaping_set_device_state(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_shaping_status(
+    ): Short
     external fun uniffi_ciris_edge_checksum_func_transport_add(
     ): Short
     external fun uniffi_ciris_edge_checksum_func_transport_config_blob(
@@ -767,6 +777,10 @@ external fun uniffi_ciris_edge_fn_func_link_request(`linkHandle`: RustBuffer.ByV
 external fun uniffi_ciris_edge_fn_func_link_teardown(`linkId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_ciris_edge_fn_func_metrics_snapshot(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_onion_set_enabled(`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_onion_status(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_path_table(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -825,6 +839,12 @@ external fun uniffi_ciris_edge_fn_func_routing_transport_id(uniffi_out_err: Unif
 external fun uniffi_ciris_edge_fn_func_routing_transport_uptime(uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_ciris_edge_fn_func_routing_tunnels(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_shaping_class_table(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_shaping_set_device_state(`state`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Int
+external fun uniffi_ciris_edge_fn_func_shaping_status(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_transport_add(`spec`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -996,6 +1016,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ciris_edge_checksum_func_metrics_snapshot() != 47202.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ciris_edge_checksum_func_onion_set_enabled() != 16650.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_onion_status() != 32810.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ciris_edge_checksum_func_path_table() != 4368.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1081,6 +1107,15 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_routing_tunnels() != 56409.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_shaping_class_table() != 15177.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_shaping_set_device_state() != 22932.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_shaping_status() != 58105.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_transport_add() != 59654.toShort()) {
@@ -1426,6 +1461,69 @@ public object FfiConverterTypeEdgeBlackholeEntry: FfiConverterRustBuffer<EdgeBla
 
 
 
+data class EdgeDeviceState (
+    var `deviceKind`: kotlin.String
+    , 
+    var `unmetered`: kotlin.Boolean
+    , 
+    var `charging`: kotlin.Boolean
+    , 
+    var `shapingOptIn`: kotlin.Boolean
+    , 
+    var `shapingOptInCellular`: kotlin.Boolean
+    , 
+    var `clientOnly`: kotlin.Boolean
+    , 
+    var `relayOverride`: kotlin.Boolean?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeDeviceState: FfiConverterRustBuffer<EdgeDeviceState> {
+    override fun read(buf: ByteBuffer): EdgeDeviceState {
+        return EdgeDeviceState(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeDeviceState) = (
+            FfiConverterString.allocationSize(value.`deviceKind`) +
+            FfiConverterBoolean.allocationSize(value.`unmetered`) +
+            FfiConverterBoolean.allocationSize(value.`charging`) +
+            FfiConverterBoolean.allocationSize(value.`shapingOptIn`) +
+            FfiConverterBoolean.allocationSize(value.`shapingOptInCellular`) +
+            FfiConverterBoolean.allocationSize(value.`clientOnly`) +
+            FfiConverterOptionalBoolean.allocationSize(value.`relayOverride`)
+    )
+
+    override fun write(value: EdgeDeviceState, buf: ByteBuffer) {
+            FfiConverterString.write(value.`deviceKind`, buf)
+            FfiConverterBoolean.write(value.`unmetered`, buf)
+            FfiConverterBoolean.write(value.`charging`, buf)
+            FfiConverterBoolean.write(value.`shapingOptIn`, buf)
+            FfiConverterBoolean.write(value.`shapingOptInCellular`, buf)
+            FfiConverterBoolean.write(value.`clientOnly`, buf)
+            FfiConverterOptionalBoolean.write(value.`relayOverride`, buf)
+    }
+}
+
+
+
 data class EdgeErrorEvent (
     var `at`: kotlin.String
     , 
@@ -1729,6 +1827,84 @@ public object FfiConverterTypeEdgeNetworkEvent: FfiConverterRustBuffer<EdgeNetwo
             FfiConverterString.write(value.`kind`, buf)
             FfiConverterString.write(value.`severity`, buf)
             FfiConverterString.write(value.`bodyJson`, buf)
+    }
+}
+
+
+
+data class EdgeOnionStatus (
+    var `enabled`: kotlin.Boolean
+    , 
+    var `active`: kotlin.Boolean
+    , 
+    var `reason`: kotlin.String?
+    , 
+    var `dealt`: List<kotlin.UInt>
+    , 
+    var `answering`: List<kotlin.UInt>
+    , 
+    var `relaying`: kotlin.Boolean
+    , 
+    var `relayReason`: kotlin.String?
+    , 
+    var `smallSet`: kotlin.Boolean
+    , 
+    var `hopKeySource`: kotlin.String
+    , 
+    var `confinesMedia`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeOnionStatus: FfiConverterRustBuffer<EdgeOnionStatus> {
+    override fun read(buf: ByteBuffer): EdgeOnionStatus {
+        return EdgeOnionStatus(
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterSequenceUInt.read(buf),
+            FfiConverterSequenceUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeOnionStatus) = (
+            FfiConverterBoolean.allocationSize(value.`enabled`) +
+            FfiConverterBoolean.allocationSize(value.`active`) +
+            FfiConverterOptionalString.allocationSize(value.`reason`) +
+            FfiConverterSequenceUInt.allocationSize(value.`dealt`) +
+            FfiConverterSequenceUInt.allocationSize(value.`answering`) +
+            FfiConverterBoolean.allocationSize(value.`relaying`) +
+            FfiConverterOptionalString.allocationSize(value.`relayReason`) +
+            FfiConverterBoolean.allocationSize(value.`smallSet`) +
+            FfiConverterString.allocationSize(value.`hopKeySource`) +
+            FfiConverterBoolean.allocationSize(value.`confinesMedia`)
+    )
+
+    override fun write(value: EdgeOnionStatus, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`enabled`, buf)
+            FfiConverterBoolean.write(value.`active`, buf)
+            FfiConverterOptionalString.write(value.`reason`, buf)
+            FfiConverterSequenceUInt.write(value.`dealt`, buf)
+            FfiConverterSequenceUInt.write(value.`answering`, buf)
+            FfiConverterBoolean.write(value.`relaying`, buf)
+            FfiConverterOptionalString.write(value.`relayReason`, buf)
+            FfiConverterBoolean.write(value.`smallSet`, buf)
+            FfiConverterString.write(value.`hopKeySource`, buf)
+            FfiConverterBoolean.write(value.`confinesMedia`, buf)
     }
 }
 
@@ -2254,6 +2430,117 @@ public object FfiConverterTypeEdgeRoutingPathEntry: FfiConverterRustBuffer<EdgeR
             FfiConverterByteArray.write(value.`nextHop`, buf)
             FfiConverterString.write(value.`lastSeenAt`, buf)
             FfiConverterString.write(value.`expiresAt`, buf)
+    }
+}
+
+
+
+data class EdgeShapingClassInfo (
+    var `budgetClass`: kotlin.String
+    , 
+    var `onByDefault`: kotlin.Boolean
+    , 
+    var `bytesPerS`: kotlin.UInt
+    , 
+    var `gbMonthPerLinkEachWay`: kotlin.Double
+    , 
+    var `gbMonthAtCapEachWay`: kotlin.Double
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeShapingClassInfo: FfiConverterRustBuffer<EdgeShapingClassInfo> {
+    override fun read(buf: ByteBuffer): EdgeShapingClassInfo {
+        return EdgeShapingClassInfo(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterDouble.read(buf),
+            FfiConverterDouble.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeShapingClassInfo) = (
+            FfiConverterString.allocationSize(value.`budgetClass`) +
+            FfiConverterBoolean.allocationSize(value.`onByDefault`) +
+            FfiConverterUInt.allocationSize(value.`bytesPerS`) +
+            FfiConverterDouble.allocationSize(value.`gbMonthPerLinkEachWay`) +
+            FfiConverterDouble.allocationSize(value.`gbMonthAtCapEachWay`)
+    )
+
+    override fun write(value: EdgeShapingClassInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`budgetClass`, buf)
+            FfiConverterBoolean.write(value.`onByDefault`, buf)
+            FfiConverterUInt.write(value.`bytesPerS`, buf)
+            FfiConverterDouble.write(value.`gbMonthPerLinkEachWay`, buf)
+            FfiConverterDouble.write(value.`gbMonthAtCapEachWay`, buf)
+    }
+}
+
+
+
+data class EdgeShapingStatus (
+    var `budgetClass`: kotlin.String
+    , 
+    var `allLinks`: kotlin.Boolean
+    , 
+    var `bytesPerS`: kotlin.UInt
+    , 
+    var `nodeCapBytesPerS`: kotlin.UInt
+    , 
+    var `shapedLinks`: kotlin.UInt
+    , 
+    var `layerReserveLinks`: kotlin.UInt
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeShapingStatus: FfiConverterRustBuffer<EdgeShapingStatus> {
+    override fun read(buf: ByteBuffer): EdgeShapingStatus {
+        return EdgeShapingStatus(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeShapingStatus) = (
+            FfiConverterString.allocationSize(value.`budgetClass`) +
+            FfiConverterBoolean.allocationSize(value.`allLinks`) +
+            FfiConverterUInt.allocationSize(value.`bytesPerS`) +
+            FfiConverterUInt.allocationSize(value.`nodeCapBytesPerS`) +
+            FfiConverterUInt.allocationSize(value.`shapedLinks`) +
+            FfiConverterUInt.allocationSize(value.`layerReserveLinks`)
+    )
+
+    override fun write(value: EdgeShapingStatus, buf: ByteBuffer) {
+            FfiConverterString.write(value.`budgetClass`, buf)
+            FfiConverterBoolean.write(value.`allLinks`, buf)
+            FfiConverterUInt.write(value.`bytesPerS`, buf)
+            FfiConverterUInt.write(value.`nodeCapBytesPerS`, buf)
+            FfiConverterUInt.write(value.`shapedLinks`, buf)
+            FfiConverterUInt.write(value.`layerReserveLinks`, buf)
     }
 }
 
@@ -3142,6 +3429,34 @@ public object FfiConverterOptionalTypeEdgePeerTrust: FfiConverterRustBuffer<Edge
 /**
  * @suppress
  */
+public object FfiConverterSequenceUInt: FfiConverterRustBuffer<List<kotlin.UInt>> {
+    override fun read(buf: ByteBuffer): List<kotlin.UInt> {
+        val len = buf.getInt()
+        return List<kotlin.UInt>(len) {
+            FfiConverterUInt.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.UInt>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterUInt.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<kotlin.UInt>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterUInt.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
     override fun read(buf: ByteBuffer): List<kotlin.String> {
         val len = buf.getInt()
@@ -3478,6 +3793,34 @@ public object FfiConverterSequenceTypeEdgeRoutingPathEntry: FfiConverterRustBuff
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeEdgeShapingClassInfo: FfiConverterRustBuffer<List<EdgeShapingClassInfo>> {
+    override fun read(buf: ByteBuffer): List<EdgeShapingClassInfo> {
+        val len = buf.getInt()
+        return List<EdgeShapingClassInfo>(len) {
+            FfiConverterTypeEdgeShapingClassInfo.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<EdgeShapingClassInfo>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeEdgeShapingClassInfo.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<EdgeShapingClassInfo>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeEdgeShapingClassInfo.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeEdgeTransportInfo: FfiConverterRustBuffer<List<EdgeTransportInfo>> {
     override fun read(buf: ByteBuffer): List<EdgeTransportInfo> {
         val len = buf.getInt()
@@ -3757,6 +4100,27 @@ public object FfiConverterMapStringByteArray: FfiConverterRustBuffer<Map<kotlin.
             return FfiConverterTypeEdgeMetricsSnapshot.lift(
     uniffiRustCallWithError(EdgeBindingsException) { _status ->
     UniffiLib.uniffi_ciris_edge_fn_func_metrics_snapshot(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `onionSetEnabled`(`enabled`: kotlin.Boolean)
+        = 
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_onion_set_enabled(
+    
+        FfiConverterBoolean.lower(`enabled`),_status)
+}
+    
+    
+
+    @Throws(EdgeBindingsException::class) fun `onionStatus`(): EdgeOnionStatus {
+            return FfiConverterTypeEdgeOnionStatus.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_onion_status(
     
         _status)
 }
@@ -4066,6 +4430,38 @@ public object FfiConverterMapStringByteArray: FfiConverterRustBuffer<Map<kotlin.
             return FfiConverterSequenceTypeEdgeTunnelInfo.lift(
     uniffiRustCallWithError(EdgeBindingsException) { _status ->
     UniffiLib.uniffi_ciris_edge_fn_func_routing_tunnels(
+    
+        _status)
+}
+    )
+    }
+    
+ fun `shapingClassTable`(): List<EdgeShapingClassInfo> {
+            return FfiConverterSequenceTypeEdgeShapingClassInfo.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_shaping_class_table(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `shapingSetDeviceState`(`state`: EdgeDeviceState): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_shaping_set_device_state(
+    
+        FfiConverterTypeEdgeDeviceState.lower(`state`),_status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `shapingStatus`(): EdgeShapingStatus {
+            return FfiConverterTypeEdgeShapingStatus.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_shaping_status(
     
         _status)
 }

@@ -264,7 +264,7 @@ async fn seed_room_named(node: &Node, room: &str, founder: &Ident, members: &[&I
             })
             .collect(),
         founded_at: ts(),
-        consensus_protocol: "founder_only".to_owned(),
+        consensus_protocol: "unanimous".to_owned(),
         policy_blob: None,
         persist_row_hash: String::new(),
         prev_head_digest: String::new(),
@@ -552,6 +552,120 @@ async fn late_device_scenario(history: RoomHistory) {
     }
     // The emitter is the runtime's: it stops with it.
     rt_a.shutdown().await;
+    rt_b.shutdown().await;
+}
+
+/// persist v61 S2 (CIRISPersist#1148) — **a room row refused `not_in_audience`
+/// lands right after the room's record lands, not after the terminal window.**
+///
+/// Two real substrates: A holds room {P, Q}; B (Q's node) does not hold it
+/// yet. P's room row offered to B is refused `not_in_audience` by persist's
+/// replicated door and parked on the room. The room's `group:roster:v1` row
+/// then arrives at B on the Attestation plane: the bridge releases the park
+/// (the row is no longer suppressed — asked again at once), and the re-offer
+/// is admitted. Mutation: without the release in `park_or_release` the
+/// "released" assertions fail and the row waits out `TERMINAL_BASE` (30 min).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_room_row_refused_not_in_audience_lands_right_after_the_room_record_1148() {
+    use ciris_persist::federation::attestation_emit;
+    use ciris_persist::federation::group_plane::GroupPlaneFamily;
+    let p = Ident::new("person-p-1148", 0x51);
+    let q = Ident::new("person-q-1148", 0x52);
+    let a_dev = Ident::new("node-a-1148", 0x61);
+    let b_dev = Ident::new("node-b-1148", 0x62);
+    let a = device(&[&p, &q], &p, &a_dev).await;
+    let b = device(&[&p, &q], &q, &b_dev).await;
+    seed_room(&a, &p, &[&p, &q]).await; // B does NOT hold the room yet.
+    let mut rt_b = runtime(&b).await;
+    let bridge_b = rt_b.bridge();
+
+    // B knows A's node (key, owner binding, occurrence).
+    let (a_rec, a_binding, a_occ) = device_rows(&a).await;
+    b.dir
+        .put_public_key(SignedKeyRecord { record: a_rec })
+        .await
+        .expect("A's key at B");
+    let _ = bridge_b
+        .apply_envelope_bytes(EnvelopeKind::Attestation, &a_binding, Some(&a.me))
+        .await;
+    let _ = bridge_b
+        .apply_envelope_bytes(EnvelopeKind::IdentityOccurrence, &a_occ, None)
+        .await;
+
+    // P's chat row in the room, as a peer offers it.
+    let mut extra = serde_json::Map::new();
+    extra.insert("community_key_id".into(), ROOM.into());
+    extra.insert("score".into(), 1.0.into());
+    let mut input = ciris_persist::federation::EmitAttestationInput::with_envelope(
+        "scores",
+        ciris_persist::federation::envelope::EnvelopeCore {
+            dimension: Some(crate::chat::CHAT_MESSAGE_DIMENSION.to_owned()),
+            extra,
+            ..Default::default()
+        },
+        "community",
+    );
+    let canonical =
+        attestation_emit::stamp_and_canonicalize(&mut input, &p.key_id, chrono::Utc::now())
+            .expect("stamp");
+    let sig = crate::identity::sign_hybrid_raw(&p.signer(), &canonical, "room row")
+        .await
+        .expect("sign");
+    let row = attestation_emit::assemble(p.key_id.clone(), &canonical, sig, input)
+        .expect("assemble")
+        .0;
+    let wire = serde_json::to_vec(&row).expect("wire");
+    let hash: [u8; 32] = sha2::Sha256::digest(&wire).into();
+
+    let first = bridge_b
+        .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some(&a.me))
+        .await;
+    assert!(
+        crate::replication::bridge::is_not_in_audience_refusal(&first),
+        "B is outside the room's audience: persist refuses not_in_audience, got {first:?}"
+    );
+    let backoff = bridge_b.refusal_backoff_for_test();
+    let gate = format!("audience:group:{ROOM}");
+    assert_eq!(backoff.parked_on(&gate), 1, "parked on the room");
+    assert!(
+        backoff.suppressed_at(
+            EnvelopeKind::Attestation,
+            &hash,
+            Instant::now() + Duration::from_secs(60)
+        ),
+        "quiet while B is outside the room"
+    );
+
+    // The room's record arrives at B on the Attestation plane.
+    let roster = FederationDirectory::list_attestations_since(&*a.dir, None, 512)
+        .await
+        .expect("list A's rows")
+        .into_iter()
+        .map(|r| r.attestation)
+        .find(|r| GroupPlaneFamily::of_row(r) == Some(GroupPlaneFamily::Roster))
+        .expect("A minted the room's group:roster:v1 row");
+    let landed = bridge_b
+        .apply_envelope_bytes(
+            EnvelopeKind::Attestation,
+            &serde_json::to_vec(&roster).expect("wire"),
+            Some(&a.me),
+        )
+        .await;
+    assert!(
+        landed.is_admitted(),
+        "the room's record lands at B: {landed:?}"
+    );
+    assert_eq!(backoff.parked_on(&gate), 0, "released by the room's record");
+    assert!(
+        !backoff.suppressed_at(EnvelopeKind::Attestation, &hash, Instant::now()),
+        "asked for again at once, not after the 30 min terminal window"
+    );
+
+    // The re-offer lands.
+    let second = bridge_b
+        .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some(&a.me))
+        .await;
+    assert!(second.is_admitted(), "the re-offer is admitted: {second:?}");
     rt_b.shutdown().await;
 }
 

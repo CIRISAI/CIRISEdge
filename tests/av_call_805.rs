@@ -12,7 +12,9 @@
 //!   other publisher arrives byte-identical and in chunk order; C relays with
 //!   a capped layer policy for B, A's direct leg to B loses every third chunk
 //!   and C's relay leg is delayed, and B's `frames()` is still strictly
-//!   increasing with nothing skipped; only base-layer chunks are relayed.
+//!   increasing with nothing skipped; only base-layer chunks are relayed. With
+//!   ALM stage 2, C forwards only to the members that subscribed to it over
+//!   C3: B and A each take C as the warm standby for the other's stream.
 //! - **A3** (`a_removed_member_hears_nothing_after_the_roll`): the room
 //!   removes C; A's stream rolls; B hears the post-roll chunks, C hears none.
 //! - **A4 / A7 / A12** (`budget_keep_refused_and_no_key_door`): a Kept stream
@@ -44,8 +46,11 @@ use ciris_edge::transport::av_call::{
     Frame, LegOutcome, ReceivedFrame, RoomRoster,
 };
 use ciris_edge::transport::av_call_key::CallId;
+use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{AvKeep, AvKeepTarget, StreamDekRegistrar};
-use ciris_edge::transport::realtime_av::{ChunkLayer, ChunkSeq, ReceiverLayerPolicy, CODEC_OPAQUE};
+use ciris_edge::transport::realtime_av::{
+    ChunkLayer, ChunkSeq, ReceiverLayerPolicy, CODEC_AV1_SVC, CODEC_OPAQUE,
+};
 use ciris_edge::transport::reticulum::{
     ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
 };
@@ -193,6 +198,17 @@ struct Node {
 }
 
 async fn node(key: Ident, dir: Arc<SqliteBackend>, base: &std::path::Path, peers: &[u16]) -> Node {
+    node_on(key, dir, base, peers, false).await
+}
+
+/// [`node`], forwarding for the nodes that connect to it when `forwards`.
+async fn node_on(
+    key: Ident,
+    dir: Arc<SqliteBackend>,
+    base: &std::path::Path,
+    peers: &[u16],
+    forwards: bool,
+) -> Node {
     let mut transport = None;
     let mut port = 0;
     for _ in 0..16 {
@@ -200,6 +216,7 @@ async fn node(key: Ident, dir: Arc<SqliteBackend>, base: &std::path::Path, peers
         port = free_port();
         c.listen_addr = format!("127.0.0.1:{port}").parse().unwrap();
         c.announce_interval = Duration::from_secs(3);
+        c.enable_transport = forwards;
         c.bootstrap_peers = peers
             .iter()
             .map(|p| format!("127.0.0.1:{p}").parse().unwrap())
@@ -307,6 +324,19 @@ fn store(tag: &str) -> ScopeStateProvider {
 /// `n` nodes in a TCP full mesh, each holding every other's signed route,
 /// each knowing every other; plus the room's MLS group over all of them.
 async fn mesh(tag: &str, n: usize) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
+    mesh_with(tag, n, false).await
+}
+
+/// [`mesh`]. With `late`, node 0 stops announcing before the last node exists,
+/// and the last node connects only to node 1, which forwards. A direct
+/// neighbour would hear node 0 anyway (leviculum re-announces on interface-up),
+/// so behind the hop it has heard nothing and holds only the signed route.
+#[allow(clippy::too_many_lines)] // the mesh, the routes, the room, in one sequence
+async fn mesh_with(
+    tag: &str,
+    n: usize,
+    late: bool,
+) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut keys = Vec::new();
@@ -326,8 +356,27 @@ async fn mesh(tag: &str, n: usize) -> (Vec<Node>, Vec<CohortGroup>, tempfile::Te
     let mut nodes: Vec<Node> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
         let dir = directory_with(records.clone()).await;
-        let peers: Vec<u16> = nodes.iter().map(|n| n.port).collect();
-        nodes.push(node(key, dir, &tmp.path().join(format!("n{i}")), &peers).await);
+        let mut peers: Vec<u16> = nodes.iter().map(|n| n.port).collect();
+        if late && i == n - 1 {
+            nodes[0].transport.set_unannounced_for_test(true);
+            peers = vec![nodes[1].port];
+            // The forwarder's own retry of A's last announce fires 5 to 5.5 s
+            // later (leviculum `PATHFINDER_G_MS` + `PATHFINDER_RW_MS`, one
+            // retry), and a joiner inside that window hears it: this witness
+            // passed with the ask disabled. A node that joins late joins after.
+            tokio::time::sleep(Duration::from_secs(7)).await;
+        }
+        let forwards = late && i == 1;
+        nodes.push(
+            node_on(
+                key,
+                dir,
+                &tmp.path().join(format!("n{i}")),
+                &peers,
+                forwards,
+            )
+            .await,
+        );
     }
     for (i, from) in nodes.iter().enumerate() {
         let routes = from
@@ -348,7 +397,13 @@ async fn mesh(tag: &str, n: usize) -> (Vec<Node>, Vec<CohortGroup>, tempfile::Te
     let known = wait_until(Duration::from_secs(90), || async {
         for a in &nodes {
             for b in &nodes {
-                if a.key.key_id != b.key.key_id && !a.transport.knows_peer(&b.key.key_id).await {
+                let unheard = late
+                    && a.key.key_id == nodes[n - 1].key.key_id
+                    && b.key.key_id == nodes[0].key.key_id;
+                if a.key.key_id != b.key.key_id
+                    && !unheard
+                    && !a.transport.knows_peer(&b.key.key_id).await
+                {
                     return false;
                 }
             }
@@ -425,6 +480,9 @@ async fn join_recorded(
             events: None,
             metrics: Some(node.metrics.clone()),
             record,
+            signer: node.key.signer(),
+            verifier: Arc::clone(&node.dir) as Arc<dyn StreamKeyVerifier>,
+            load: None,
         },
         opts,
     )
@@ -443,6 +501,38 @@ fn body(who: &str, seq: u64) -> Vec<u8> {
     let mut b = format!("{who}-frame-{seq:04}-").into_bytes();
     b.resize(96, b'.');
     b
+}
+
+/// One live call at a time in this binary: these witnesses time a call's own
+/// delivery (the reorder window is 400 ms at most), so a neighbouring call on
+/// the same host must not be what they measure.
+static ONE_CALL: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+async fn one_call() -> tokio::sync::SemaphorePermit<'static> {
+    ONE_CALL.acquire().await.expect("never closed")
+}
+
+/// Everything that says media on `nodes` really went missing, plus chunks
+/// that arrived past `calls`' reorder window. A starved host loses frames and
+/// something counts them: that earns a witness another call. Not `skipped`: a
+/// frame gone with no trace is skipped too, and that is the bug.
+fn counted_loss(nodes: &[Node], calls: &[&Call]) -> u64 {
+    let planes: u64 = nodes
+        .iter()
+        .map(|n| {
+            [
+                "av_chunk_dropped_congested",
+                "av_frame_expired_sender",
+                "av_frame_expired_late",
+                "av_frame_stale_dropped",
+                "alm_shed",
+            ]
+            .iter()
+            .map(|label| av(&n.metrics, label))
+            .sum::<u64>()
+        })
+        .sum();
+    planes + calls.iter().map(|c| c.reorder_counts().late).sum::<u64>()
 }
 
 /// Collect frames from `rx` until `want` frames of `publisher` arrived.
@@ -470,11 +560,66 @@ async fn wait_legs(call: &Call, n: usize) {
     );
 }
 
+/// Wait until `call` has verified `n` other publishers' stream key bindings:
+/// the setup step after the legs (a hybrid verification each, once), before
+/// which a receiver holds its first chunks in the link's queue.
+async fn wait_bound(call: &Call, n: u64) {
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            call.chunk_auth_counts().bindings_installed >= n
+        })
+        .await,
+        "the call verifies its peers' bindings: {:?}",
+        call.chunk_auth_counts()
+    );
+}
+
+/// **Witness (v44 LTS)** — a call to a member with no path asks for one. A is
+/// silent and the late joiner has only its signed route, so nothing but the
+/// call's bounded ask tells it who A is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_joiner_asks_for_a_member_it_has_never_heard() {
+    let _call = one_call().await;
+    let tag = "late";
+    let (nodes, groups, _tmp) = mesh_with(tag, 3, true).await;
+    let (a, late) = (&nodes[0], &nodes[2]);
+    assert!(
+        !late.transport.knows_peer(&a.key.key_id).await,
+        "the late joiner has heard nothing of A"
+    );
+    let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
+    let _call_late = join(late, &groups[2], tag, CallOptions::default(), none())
+        .await
+        .expect("the late joiner joins");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            late.transport.knows_peer(&a.key.key_id).await
+        })
+        .await,
+        "the call asked for A, and A is silent: no announce told it"
+    );
+}
+
 /// **A8** — a three-member room call over keyed loopback links.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_three_member_room_call_over_keyed_links() {
-    let tag = "a8";
+    let _call = one_call().await;
+    // Calls it may place before a host that keeps losing media fails it.
+    let mut whole = false;
+    for tag in ["a8", "a8b", "a8c", "a8d"] {
+        whole = three_member_call(tag).await;
+        if whole {
+            break;
+        }
+    }
+    assert!(whole, "every call lost media");
+}
+
+/// One call of the witness above: whether it ran whole. Media lost with
+/// something counting it is `false`; lost with nothing counting it panics.
+#[allow(clippy::too_many_lines)]
+async fn three_member_call(tag: &str) -> bool {
     let (nodes, groups, _tmp) = mesh(tag, 3).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
     let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
@@ -499,6 +644,9 @@ async fn a_three_member_room_call_over_keyed_links() {
     for call in [&call_a, &call_b, &call_c] {
         wait_legs(call, 2).await;
     }
+    for call in [&call_a, &call_b, &call_c] {
+        wait_bound(call, 2).await;
+    }
     for nd in [a, b, c] {
         // CC 5.3.3.5 E1 — every link is keyed by the link layer (identity
         // links too), so the two call legs it dialled are at least two.
@@ -515,6 +663,24 @@ async fn a_three_member_room_call_over_keyed_links() {
         })
         .await,
         "every leg dialled to a node was answered after the claim check"
+    );
+
+    // ALM stage 2: C relays only to the members that SUBSCRIBED to it (C3).
+    // B and A each take C as the warm standby for the other's stream (the
+    // publisher is the primary); wait for both before publishing.
+    let standby_on_c = |call: &Call, stream| {
+        call.alm_parents()
+            .iter()
+            .any(|p| p.stream == stream && p.standby.as_deref() == Some(c.key.key_id.as_str()))
+    };
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            standby_on_c(&call_b, call_a.stream()) && standby_on_c(&call_a, call_b.stream())
+        })
+        .await,
+        "B and A take C as standby: B {:?} A {:?}",
+        call_b.alm_parents(),
+        call_a.alm_parents()
     );
 
     // C relays to B at the base layer only; A's direct leg to B loses every
@@ -542,9 +708,15 @@ async fn a_three_member_room_call_over_keyed_links() {
         }
     };
     for s in 0..30u64 {
+        // The periodic re-announce lands mid-stream: about ten Channel
+        // messages per leg, re-forwarded by C. It must cost no chunk.
+        if s == 12 {
+            call_a.reannounce_for_test().await;
+        }
         let report = call_a
             .publish(Frame {
-                codec_id: CODEC_OPAQUE,
+                // CC 5.3.3.2.1: a layered stream is a layered codec.
+                codec_id: CODEC_AV1_SVC,
                 layer: layer_of(s),
                 bytes: body("a", s),
             })
@@ -564,24 +736,29 @@ async fn a_three_member_room_call_over_keyed_links() {
         tokio::time::sleep(Duration::from_millis(33)).await;
     }
     let (mut seen_a, mut seen_b, mut seen_c) = (Vec::new(), Vec::new(), Vec::new());
-    assert!(
-        collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 30).await,
-        "B: {} of A's: {:?}, reorder {:?}",
-        seen_b.len(),
-        seen_b.iter().map(|f| f.chunk_seq.0).collect::<Vec<_>>(),
-        call_b.reorder_counts()
-    );
-    assert!(
-        collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 30).await,
-        "C: {}",
-        seen_c.len()
-    );
-    assert!(
-        collect_from(&mut frames_a, &mut seen_a, &b.key.key_id, 10).await,
-        "A: {}",
-        seen_a.len()
-    );
-    assert!(collect_from(&mut frames_c, &mut seen_c, &b.key.key_id, 10).await);
+    let whole = collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 30).await
+        && collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 30).await
+        && collect_from(&mut frames_a, &mut seen_a, &b.key.key_id, 10).await
+        && collect_from(&mut frames_c, &mut seen_c, &b.key.key_id, 10).await;
+    if !whole {
+        let lost = counted_loss(&nodes, &[&call_a, &call_b, &call_c]);
+        let heard = |seen: &[ReceivedFrame]| {
+            seen.iter()
+                .map(|f| (f.publisher.len(), f.chunk_seq.0))
+                .collect::<Vec<_>>()
+        };
+        eprintln!(
+            "[A8] {tag}: counted loss {lost}: B {:?} C {:?} A {:?}, reorder {:?}; parents {:?}; plane C {:?}",
+            heard(&seen_b),
+            heard(&seen_c),
+            heard(&seen_a),
+            call_b.reorder_counts(),
+            call_b.alm_parents(),
+            c.metrics.av_plane()
+        );
+        assert!(lost > 0, "frames gone with nothing counting them");
+        return false;
+    }
 
     // Byte-identical and strictly in chunk order, per publisher.
     for (seen, from, n, who) in [
@@ -615,16 +792,42 @@ async fn a_three_member_room_call_over_keyed_links() {
          dropped, never queued): {:?}",
         c.metrics.av_plane()
     );
+    // Every chunk heard was its publisher's: each binding (direct, and
+    // forwarded by C) arrived before the chunks it keys.
+    for call in [&call_a, &call_b, &call_c] {
+        let auth = call.chunk_auth_counts();
+        assert_eq!((auth.forged, auth.unbound), (0, 0), "{auth:?}");
+        assert!(
+            auth.verified > 0 && auth.bindings_installed >= 2,
+            "{auth:?}"
+        );
+    }
     assert_eq!(call_a.state(), CallState::Live);
     let summary = call_a.leave().await.expect("A leaves");
     assert_eq!(summary.frames_published, 30);
+    true
 }
 
 /// **A3** — the room removes C: A's stream rolls; B hears the post-roll
 /// chunks and C hears none of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_removed_member_hears_nothing_after_the_roll() {
-    let tag = "a3";
+    let _call = one_call().await;
+    // Calls it may place before a host that keeps losing media fails it.
+    let mut whole = false;
+    for tag in ["a3", "a3b", "a3c", "a3d"] {
+        whole = removed_member_call(tag).await;
+        if whole {
+            break;
+        }
+    }
+    assert!(whole, "every call lost media");
+}
+
+/// One call of the witness above: whether it ran whole. Media lost with
+/// something counting it is `false`; lost with nothing counting it panics.
+#[allow(clippy::too_many_lines)]
+async fn removed_member_call(tag: &str) -> bool {
     let (nodes, groups, _tmp) = mesh(tag, 3).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
     let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
@@ -638,6 +841,9 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
         .await
         .expect("C");
     wait_legs(&call_a, 2).await;
+    for call in [&call_a, &call_b, &call_c] {
+        wait_bound(call, 2).await;
+    }
     let mut events_a = call_a.events().expect("A's events");
     let mut frames_b = call_b.frames().expect("B");
     let mut frames_c = call_c.frames().expect("C");
@@ -649,10 +855,13 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
     let (mut seen_b, mut seen_c) = (Vec::new(), Vec::new());
-    assert!(
-        collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 5).await,
-        "C hears the pre-roll stream"
-    );
+    if !collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 5).await {
+        assert!(
+            counted_loss(&nodes, &[&call_b, &call_c]) > 0,
+            "C lost the pre-roll stream with nothing counting it"
+        );
+        return false;
+    }
     let pre_epoch = call_a.epoch().await;
 
     // The room removes C (A commits, B applies; C's state is left behind).
@@ -688,11 +897,24 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
     })
     .await;
     assert_eq!(rolled, Ok(true), "A's call rolled with the room");
-    assert!(
-        collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 15).await,
-        "B hears all 15: {}",
-        seen_b.len()
-    );
+    if !collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 15).await {
+        let lost = counted_loss(&nodes, &[&call_b]);
+        eprintln!(
+            "[A3] {tag}: counted loss {lost}: B {:?}; reorder {:?}; parents {:?}; legs A {:?} B {:?}\nplane A {:?}\nplane B {:?}",
+            seen_b
+                .iter()
+                .map(|f| (f.epoch.0, f.chunk_seq.0))
+                .collect::<Vec<_>>(),
+            call_b.reorder_counts(),
+            call_b.alm_parents(),
+            call_a.legs(),
+            call_b.legs(),
+            a.metrics.av_plane(),
+            b.metrics.av_plane()
+        );
+        assert!(lost > 0, "B lost frames with nothing counting them");
+        return false;
+    }
     let post: Vec<&ReceivedFrame> = seen_b.iter().filter(|f| f.epoch > pre_epoch).collect();
     assert_eq!(post.len(), 10);
     // C: nothing from the new epoch, ever.
@@ -713,6 +935,199 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
         !call_a.legs().contains(&c.key.key_id),
         "A closed its leg to C"
     );
+    true
+}
+
+/// **Source authentication** — B, a room member, can derive A's stream DEK.
+/// It opens its own link to C (a relay), names A's stream in the hello as if
+/// it were A, and sends chunks for A's stream that are validly encrypted under
+/// that DEK and signed with a chunk key of its own. C drops every one as not
+/// A's and counts it; C delivers none, relays none, and A's own chunks still
+/// reach B and C, directly and through C's relay.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_member_cannot_forge_another_members_stream_through_a_relay() {
+    use ciris_edge::cohort_scope::CohortScope;
+    use ciris_edge::transport::av_call::{call_group_id, call_id_for_room};
+    use ciris_edge::transport::av_call_key::stream_epoch_dek;
+    use ciris_edge::transport::av_chunk_auth::ChunkSigner;
+    use ciris_edge::transport::realtime_av::{seal_av_inner, seal_av_outer};
+    use ciris_edge::transport::realtime_av_dispatcher::{AvDispatcherError, AvLinkSender as _};
+
+    const FORGED: &[u8] = b"FORGED-BY-B";
+    let _call = one_call().await;
+    let tag = "forge";
+    let (nodes, groups, _tmp) = mesh(tag, 3).await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
+    let mut call_a = join(a, &groups[0], tag, CallOptions::default(), none())
+        .await
+        .expect("A joins");
+    let mut call_b = join(b, &groups[1], tag, CallOptions::default(), none())
+        .await
+        .expect("B joins");
+    let mut call_c = join(
+        c,
+        &groups[2],
+        tag,
+        CallOptions {
+            relay: true,
+            ..CallOptions::default()
+        },
+        none(),
+    )
+    .await
+    .expect("C joins as a relay");
+    for call in [&call_a, &call_b, &call_c] {
+        wait_legs(call, 2).await;
+    }
+    for call in [&call_a, &call_b, &call_c] {
+        wait_bound(call, 2).await;
+    }
+    // ALM stage 2: C relays A's stream to B once B took it as standby (C3).
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            call_b.alm_parents().iter().any(|p| {
+                p.stream == call_a.stream() && p.standby.as_deref() == Some(c.key.key_id.as_str())
+            })
+        })
+        .await,
+        "B takes C as standby for A's stream: {:?}",
+        call_b.alm_parents()
+    );
+    let mut frames_a = call_a.frames().expect("A's frames");
+    let mut frames_b = call_b.frames().expect("B's frames");
+    let mut frames_c = call_c.frames().expect("C's frames");
+
+    // A's real stream reaches B and C: C now holds A's verified binding.
+    for s in 0..5u64 {
+        call_a
+            .publish(Frame::opaque(body("a", s)))
+            .await
+            .expect("A publishes");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let (mut seen_b, mut seen_c) = (Vec::new(), Vec::new());
+    assert!(collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 5).await);
+    assert!(collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 5).await);
+    let relayed_before = av(&c.metrics, "av_call_relayed");
+
+    // B forges: A's stream, A's epoch, A's DEK (derived from B's own room
+    // state), B's own chunk key, on a link B dials to C naming A's stream.
+    let stream_a = call_a.stream();
+    let epoch = call_a.epoch().await;
+    let dek = stream_epoch_dek(&groups[1], stream_a, epoch)
+        .await
+        .expect("a member derives every stream's DEK");
+    let room = room_of(tag);
+    let address = b
+        .lifecycle
+        .table()
+        .send_address(
+            &CohortScope::Cohort {
+                cohort_id: room.clone(),
+            },
+            &call_group_id(call_id_for_room(&room)),
+            &c.key.key_id,
+        )
+        .expect("C's call address");
+    let link = b
+        .transport
+        .open_av_link(&c.key.key_id, &address)
+        .await
+        .expect("B dials C");
+    let send = |bytes: Vec<u8>| {
+        let sender = &link.sender;
+        async move {
+            for _ in 0..200 {
+                match sender.send(&bytes).await {
+                    Ok(()) => return,
+                    Err(AvDispatcherError::Congested) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(e) => panic!("forger send: {e}"),
+                }
+            }
+            panic!("forger send stayed congested");
+        }
+    };
+    let mut hello = b"CHLO".to_vec();
+    hello.push(1);
+    hello.extend_from_slice(&stream_a.0);
+    send(hello).await;
+    let forger = ChunkSigner::generate(stream_a, epoch).expect("B's chunk key");
+    let forgeries = 10u64;
+    for i in 0..forgeries {
+        let inner = seal_av_inner(
+            FORGED,
+            &dek,
+            stream_a,
+            epoch,
+            ChunkSeq(1000 + i),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
+        )
+        .expect("validly encrypted");
+        let signed = forger.sign(&inner).expect("signed by B");
+        let wire = seal_av_outer(&signed, &link.transit.seal_key(), &link.link_id, i)
+            .expect("hop seal")
+            .to_bytes();
+        send(wire).await;
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            av(&c.metrics, "av_call_frame_forged") >= forgeries
+        })
+        .await,
+        "C drops and counts every forgery: {:?}",
+        c.metrics.av_plane()
+    );
+    assert!(call_c.chunk_auth_counts().forged >= forgeries);
+    assert_eq!(
+        av(&c.metrics, "av_call_relayed"),
+        relayed_before,
+        "C relays no forgery"
+    );
+    // Nothing forged is ever delivered, at C or (through C) at A.
+    for (rx, who) in [(&mut frames_c, "C"), (&mut frames_a, "A")] {
+        let got = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(f) = rx.recv().await {
+                if f.bytes == FORGED {
+                    return Some(f);
+                }
+            }
+            None
+        })
+        .await;
+        assert!(
+            !matches!(got, Ok(Some(_))),
+            "{who} delivered a forged chunk: {got:?}"
+        );
+    }
+
+    // A's real chunks still flow, direct and through C's relay.
+    for s in 5..10u64 {
+        call_a
+            .publish(Frame::opaque(body("a", s)))
+            .await
+            .expect("A publishes");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    assert!(collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 10).await);
+    assert!(collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 10).await);
+    for seen in [&seen_b, &seen_c] {
+        let got: Vec<u64> = seen
+            .iter()
+            .filter(|f| f.publisher == a.key.key_id)
+            .map(|f| f.chunk_seq.0)
+            .collect();
+        assert_eq!(got, (0..10).collect::<Vec<_>>());
+    }
+    assert!(
+        av(&c.metrics, "av_call_relayed") > relayed_before,
+        "C relays A's real chunks"
+    );
+    assert!(call_b.chunk_auth_counts().verified >= 10);
 }
 
 /// **A4 / A7 / A12** — a Kept stream is refused by name and the call lives
@@ -720,6 +1135,7 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
 /// the keep door is never touched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn budget_keep_refused_and_no_key_door() {
+    let _call = one_call().await;
     let tag = "a7";
     let (nodes, groups, _tmp) = mesh(tag, 2).await;
     let (a, b) = (&nodes[0], &nodes[1]);
@@ -765,7 +1181,16 @@ async fn budget_keep_refused_and_no_key_door() {
         .publish(Frame::opaque(vec![0x5a; budget]))
         .await
         .expect("exactly the budget is delivered");
-    assert_eq!(at.delivered(), 1);
+    assert_eq!(
+        at.delivered(),
+        1,
+        "report {:?}; A's ALM {:?} children {:?} c3 {:?}; B's parents {:?}",
+        at.legs,
+        call_a.alm_counts(),
+        call_a.alm_own_children(),
+        call_a.alm_c3_peers(),
+        call_b.alm_parents()
+    );
     let before = call_a.next_chunk_seq_for_test().await;
     match call_a.publish(Frame::opaque(vec![0x5a; budget + 1])).await {
         Err(CallError::FrameTooLarge { bytes, budget: b }) => {
@@ -816,6 +1241,7 @@ async fn budget_keep_refused_and_no_key_door() {
 /// **A2** — joining is membership, refused by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn joining_is_membership_by_name() {
+    let _call = one_call().await;
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let key = Ident::new("node-x-call-a2", 0x71).await;
@@ -830,6 +1256,9 @@ async fn joining_is_membership_by_name() {
         events: None,
         metrics: None,
         record: None,
+        signer: x.key.signer(),
+        verifier: Arc::clone(&x.dir) as Arc<dyn StreamKeyVerifier>,
+        load: None,
     };
     // A room X is not in.
     let other = CohortGroup::create(store("a2-other"), "room-a2", "someone-else", 16)
@@ -897,6 +1326,7 @@ impl CallRecord for RefusingRecord {
 /// stays live, and frames still flow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_refused_call_row_is_one_event_and_the_call_lives() {
+    let _call = one_call().await;
     let tag = "rr";
     let (nodes, groups, _tmp) = mesh(tag, 2).await;
     let (a, b) = (&nodes[0], &nodes[1]);

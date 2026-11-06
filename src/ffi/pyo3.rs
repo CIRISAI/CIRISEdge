@@ -348,18 +348,43 @@ pub struct PyEdge {
     ///
     /// `None` for `for_test` builds and HTTPS-only transport
     /// posture — there's nothing to listen on.
-    _transport_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    transport_runtime: Option<Arc<tokio::runtime::Runtime>>,
     _transport_listener_handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// CIRISEdge#243 — the `watch::Sender` for the outbound dispatcher's
     /// shutdown signal. Held (never dropped early) so `run_dispatcher`'s
     /// idle-poll `select!` on `shutdown.changed()` never sees a closed
     /// channel — a dropped sender makes `changed()` return `Err`
     /// immediately and hot-spins the claim loop. Declared AFTER
-    /// `_transport_runtime` so field drop-order tears the runtime down
+    /// `transport_runtime` so field drop-order tears the runtime down
     /// first (aborting the dispatcher task) before this sender drops —
-    /// no busy-loop window at teardown, no explicit signal needed.
+    /// no busy-loop window at teardown. `close()` also sends `true` on
+    /// it, so the dispatcher and sweeps end cleanly before the runtime goes.
     /// `None` when there's no transport runtime (`for_test` / HTTPS-only).
-    _transport_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    transport_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl PyEdge {
+    /// Signal the outbound dispatcher and sweeps to stop (`close()`), so
+    /// they end cleanly instead of being torn down mid-claim with the runtime.
+    fn stop_transport_dispatch(&self) {
+        if let Some(tx) = self.transport_shutdown_tx.as_ref() {
+            tx.send_replace(true);
+        }
+    }
+
+    /// Run a lifecycle future on the edge-side transport runtime (its tokio
+    /// time driver is the one edge's timers need — CIRISEdge#217/#220), or on
+    /// a throwaway current-thread runtime when this edge has none.
+    fn block_on_transport<F: std::future::Future>(&self, fut: F) -> PyResult<F::Output> {
+        if let Some(rt) = self.transport_runtime.as_ref() {
+            return Ok(rt.block_on(fut));
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("lifecycle runtime: {e}")))?;
+        Ok(rt.block_on(fut))
+    }
 }
 
 /// v2.4.0 (CIRISEdge#103) — best-effort cleanup if the Python caller
@@ -489,9 +514,9 @@ impl PyEdge {
             // v7.1.0 (CIRISEdge#220) — `for_test` builds don't run
             // background listeners; tests drive `dispatch_inbound_for_test`
             // directly when they need the inbound path.
-            _transport_runtime: None,
+            transport_runtime: None,
             _transport_listener_handles: std::sync::Mutex::new(Vec::new()),
-            _transport_shutdown_tx: None,
+            transport_shutdown_tx: None,
         }
     }
 }
@@ -504,6 +529,113 @@ impl PyEdge {
     #[staticmethod]
     fn crate_version() -> &'static str {
         VERSION
+    }
+
+    /// `FSD/CIRIS_MESH.md` §7.3 L-S1 — **the host's load verdict**:
+    /// `"normal"`, `"warning"` or `"critical"`. Returns the effective service
+    /// tier (0 full ops, 1 audio and files, 2 chat and contacts). Raises
+    /// `ValueError` on another spelling.
+    fn set_load_pressure(&self, pressure: &str) -> PyResult<u8> {
+        let p = crate::LoadPressure::parse(pressure).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "bad_load_pressure: {pressure:?} is not normal, warning or critical"
+            ))
+        })?;
+        Ok(self.inner.set_load_pressure(p).as_u8())
+    }
+
+    /// `FSD/CIRIS_MESH.md` §7.2 — the service tier this node runs at: 0 full
+    /// ops, 1 audio and files, 2 chat and contacts.
+    fn service_tier(&self) -> u8 {
+        self.inner.service_tier().as_u8()
+    }
+
+    /// `FSD/CIRIS_MESH.md` §7.4 — the `load_ledger` as JSON.
+    fn load_ledger_json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.inner.load_ledger())
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.6, E8 — **the typed status** as JSON: `class`,
+    /// `bytes_per_s`, `figures` (`gap_s`, `gap_p95_s`, `gb_month_link`,
+    /// `gb_month_cap`, `file_1mb_s`, `file_10mb_s`), `device_figures` (a
+    /// phone's two networks), `shaped_links`, `free_slots`, `links`, `peers`
+    /// (each peer's `shapes`), `relays_answering` and `onion`, the `OnionStatus`
+    /// with `confines_media`. Every value is read from the running transport.
+    /// `None` with no Reticulum transport.
+    #[cfg(feature = "_reticulum-module")]
+    fn shaping_status_json(&self) -> PyResult<Option<String>> {
+        self.inner
+            .shaping_status()
+            .map(|s| serde_json::to_string(&s))
+            .transpose()
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// E8 — what this node knows of `peer`'s shaping, as JSON: `peer`,
+    /// `shapes` (null until it has answered an offer here), `shaped_now`,
+    /// `gap_s`. `None` with no Reticulum transport.
+    #[cfg(feature = "_reticulum-module")]
+    fn peer_shaping_json(&self, peer: &str) -> PyResult<Option<String>> {
+        self.inner
+            .peer_shaping(peer)
+            .map(|s| serde_json::to_string(&s))
+            .transpose()
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// CC 5.4.6 — the Anonymous Tier on this node, counts only, as JSON.
+    /// `None` with no Reticulum transport.
+    #[cfg(feature = "_reticulum-module")]
+    fn onion_status_json(&self) -> PyResult<Option<String>> {
+        self.inner
+            .onion_status()
+            .map(|s| serde_json::to_string(&s))
+            .transpose()
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.6, §6.10 — the host's device facts changed;
+    /// the class and the relay policy follow, the person's opt-ins kept.
+    /// `device_kind` is `server`, `home` or `phone`. Returns how many shaped
+    /// links closed to renegotiate, `None` with no Reticulum transport.
+    /// Raises `ValueError` on another kind.
+    #[cfg(feature = "_reticulum-module")]
+    #[pyo3(signature = (
+        device_kind,
+        unmetered=true,
+        charging=true,
+        shaping_opt_in=false,
+        shaping_opt_in_cellular=false,
+        client_only=false,
+        relay_override=None
+    ))]
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+    fn shaping_set_device_state(
+        &self,
+        py: Python<'_>,
+        device_kind: &str,
+        unmetered: bool,
+        charging: bool,
+        shaping_opt_in: bool,
+        shaping_opt_in_cellular: bool,
+        client_only: bool,
+        relay_override: Option<bool>,
+    ) -> PyResult<Option<usize>> {
+        use crate::transport::link_shaping::{DeviceKind, DeviceState};
+        let kind = DeviceKind::parse(device_kind)
+            .ok_or_else(|| PyValueError::new_err(format!("bad_device_kind: {device_kind:?}")))?;
+        let device = DeviceState {
+            kind,
+            unmetered,
+            charging,
+            shaping_opt_in,
+            shaping_opt_in_cellular,
+            client_only,
+            relay_override,
+        };
+        let edge = Arc::clone(&self.inner);
+        py.detach(|| self.block_on_transport(async move { edge.set_device_state(device).await }))
     }
 
     /// CIRISEdge#437 — hand over a peer's presented build-attestation
@@ -598,6 +730,7 @@ impl PyEdge {
     #[cfg(feature = "transport-reticulum-local")]
     #[allow(clippy::unnecessary_wraps)] // Keep PyResult for future-proofing the pymethod shape
     fn close(&self, py: Python<'_>) -> PyResult<()> {
+        self.stop_transport_dispatch();
         let Ok(mut guard) = self.shared_instance_cleanup.lock() else {
             // PoisonError: a prior caller panicked inside the lock.
             // Treat as already-closed and return Ok — re-panicking from
@@ -653,8 +786,56 @@ impl PyEdge {
     /// Python API surface is feature-invariant (callers don't need to
     /// `hasattr(edge, "close")` based on the wheel's feature set).
     #[cfg(not(feature = "transport-reticulum-local"))]
+    #[allow(clippy::unnecessary_wraps)] // the pymethod shape is PyResult on every build
     fn close(&self, _py: Python<'_>) -> PyResult<()> {
+        self.stop_transport_dispatch();
         Ok(())
+    }
+
+    /// **Mobile background: suspend** (secondary path — a Rust host calls
+    /// `Edge::suspend` directly). Stops edge's background loops, refuses
+    /// sends, closes every link, parks the listener and detaches the
+    /// interfaces; returns once nothing is left open or after
+    /// `deadline_secs`. Returns the report as a dict: `already_suspended`,
+    /// `quiescent`, `elapsed_secs`, `links_open`, `interfaces_open`,
+    /// `listener_open`, `tasks_running`, `sends_in_flight`, `edge_tasks`,
+    /// `node_tasks`. Idempotent; never raises for the suspend itself.
+    fn suspend<'py>(
+        &self,
+        py: Python<'py>,
+        deadline_secs: f64,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let deadline = std::time::Duration::try_from_secs_f64(deadline_secs.max(0.0))
+            .map_err(|e| PyValueError::new_err(format!("deadline_secs: {e}")))?;
+        let edge = Arc::clone(&self.inner);
+        let report =
+            py.detach(|| self.block_on_transport(async move { edge.suspend(deadline).await }))?;
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("already_suspended", report.already_suspended)?;
+        dict.set_item("quiescent", report.quiescent)?;
+        dict.set_item("elapsed_secs", report.elapsed.as_secs_f64())?;
+        dict.set_item("links_open", report.links_open)?;
+        dict.set_item("interfaces_open", report.interfaces_open)?;
+        dict.set_item("listener_open", report.listener_open)?;
+        dict.set_item("tasks_running", report.tasks_running)?;
+        dict.set_item("sends_in_flight", report.sends_in_flight)?;
+        dict.set_item("edge_tasks", report.edge_tasks)?;
+        dict.set_item("node_tasks", report.node_tasks)?;
+        Ok(dict)
+    }
+
+    /// **Mobile background: resume** — reattach the interfaces, reopen sends,
+    /// wake the listener (it announces) and respawn edge's background loops.
+    /// Idempotent; a no-op when not suspended.
+    fn resume(&self, py: Python<'_>) -> PyResult<()> {
+        let edge = Arc::clone(&self.inner);
+        py.detach(|| self.block_on_transport(async move { edge.resume().await }))?
+            .map_err(|e| PyRuntimeError::new_err(format!("resume: {e}")))
+    }
+
+    /// Whether `suspend` is in force.
+    fn is_suspended(&self) -> bool {
+        self.inner.is_suspended()
     }
 
     /// v2.4.0 (CIRISEdge#103) — context-manager support so callers
@@ -2639,11 +2820,13 @@ impl PyEdge {
     /// directory + transport.
     ///
     /// `peers` is a list of `(peer_key_id, kind_str)` tuples where
-    /// `kind_str` is one of the 10 wire-stable kinds per FSD §3.3:
-    /// "key" / "attestation" / "revocation" / "identity_occurrence"
-    /// / "family" / "community" / "identity_occurrence_revocation"
-    /// / "family_membership_revocation" /
-    /// "community_membership_revocation" / "location_proof".
+    /// `kind_str` is a wire-stable kind (`EnvelopeKind::as_wire_str`).
+    /// persist v61 — a RETIRED plane ("family", "community", the four
+    /// membership planes, "community_membership_listing", "key_grant", the
+    /// three operational kinds) still parses but is never scheduled (logged
+    /// once): its rows ride "attestation". Name "key" / "identity_occurrence" /
+    /// "transport_destination" / "attestation" (and "revocation" /
+    /// "identity_occurrence_revocation" / "location_proof" as needed).
     ///
     /// `cadence_seconds` overrides the scheduler's default 30 s
     /// per-round cadence; `None` keeps the default. The round
@@ -2964,6 +3147,34 @@ fn metrics_bundle_to_pydict<'py>(
         peer_binding.set_item(label.as_str(), *n)?;
     }
     root.set_item("peer_binding", peer_binding)?;
+    // CIRISEdge#930 — the key-plane listings' cost ledger.
+    let key_plane_sweep = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.key_plane_sweep {
+        key_plane_sweep.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("key_plane_sweep", key_plane_sweep)?;
+    // v44 LTS — the persisted-standing refresh.
+    let persisted_standing = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.persisted_standing {
+        persisted_standing.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("persisted_standing", persisted_standing)?;
+    // CIRISEdge#926 — the link stall guard by label.
+    let link_stall = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.link_stall {
+        link_stall.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("link_stall", link_stall)?;
+    let direct_link_upgrade_guarded = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.direct_link_upgrade_guarded {
+        direct_link_upgrade_guarded.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("direct_link_upgrade_guarded", direct_link_upgrade_guarded)?;
+    let advertise = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.advertise {
+        advertise.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("advertise", advertise)?;
     root.set_item("direct_links_active", bundle.direct_links_active)?;
     // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
     // a missing install and a membership refusal are two numbers.
@@ -3248,6 +3459,7 @@ fn metrics_bundle_to_pydict<'py>(
         bundle.unclaimed_ship_refused_total,
     )?;
 
+    telemetry_into_pydict(py, &root, bundle)?;
     Ok(root)
 }
 
@@ -3289,6 +3501,109 @@ fn link_info_to_pydict<'py>(
         },
     )?;
     Ok(out)
+}
+
+/// v44 — the operator's telemetry, one dict entry per bundle field
+/// (`crate::telemetry::TELEMETRY_CATALOGUE`). Closed labels are present at
+/// zero.
+fn telemetry_into_pydict(
+    py: Python<'_>,
+    root: &Bound<'_, pyo3::types::PyDict>,
+    b: &crate::observability::EdgeMetricsBundle,
+) -> PyResult<()> {
+    for (name, family) in [
+        (
+            "event_handler_duration_seconds",
+            &b.event_handler_duration_seconds,
+        ),
+        (
+            "seal_keying_duration_seconds",
+            &b.seal_keying_duration_seconds,
+        ),
+        (
+            "replication_inbound_wait_seconds",
+            &b.replication_inbound_wait_seconds,
+        ),
+        (
+            "replication_reply_wait_seconds",
+            &b.replication_reply_wait_seconds,
+        ),
+        ("shaping_row_wait_seconds", &b.shaping_row_wait_seconds),
+        ("alm_failover_gap_seconds", &b.alm_failover_gap_seconds),
+        (
+            "call_setup_duration_seconds",
+            &b.call_setup_duration_seconds,
+        ),
+        (
+            "first_contact_duration_seconds",
+            &b.first_contact_duration_seconds,
+        ),
+        ("refusal_attempts", &b.refusal_attempts),
+    ] {
+        let out = pyo3::types::PyDict::new(py);
+        for (label, h) in family {
+            out.set_item(label.as_str(), histogram_to_pydict(py, h)?)?;
+        }
+        root.set_item(name, out)?;
+    }
+    root.set_item(
+        "wake_first_round_duration_seconds",
+        histogram_to_pydict(py, &b.wake_first_round_duration_seconds)?,
+    )?;
+    for (name, family) in [
+        ("seal_keyer_queued", &b.seal_keyer_queued),
+        ("seal_keyer_workers", &b.seal_keyer_workers),
+        ("replication_reply_queued", &b.replication_reply_queued),
+        ("load_tier_changes_total", &b.load_tier_changes_total),
+        ("shaping_links", &b.shaping_links),
+        (
+            "shaping_frames_real_windowed",
+            &b.shaping_frames_real_windowed,
+        ),
+        ("shaping_windows_withheld", &b.shaping_windows_withheld),
+        ("leviculum_events_queued", &b.leviculum_events_queued),
+        ("leviculum_events_capacity", &b.leviculum_events_capacity),
+        ("leviculum_events_dropped", &b.leviculum_events_dropped),
+        ("decision_row_unheard_total", &b.decision_row_unheard_total),
+        ("apply_refusals", &b.apply_refusals),
+    ] {
+        let out = pyo3::types::PyDict::new(py);
+        for (label, n) in family {
+            out.set_item(label.as_str(), *n)?;
+        }
+        root.set_item(name, out)?;
+    }
+    for (name, value) in [
+        ("seal_awaiting_links", b.seal_awaiting_links),
+        ("seal_awaiting_bytes", b.seal_awaiting_bytes),
+        ("seal_held_bytes", b.seal_held_bytes),
+        ("load_tier", b.load_tier),
+        ("load_host_pressure", b.load_host_pressure),
+        ("shaping_enabled", b.shaping_enabled),
+        ("shaping_free_slots", b.shaping_free_slots),
+        ("leviculum_shed_packets", b.leviculum_shed_packets),
+        ("direct_link_proposing", b.direct_link_proposing),
+        ("alm_active_calls", b.alm_active_calls),
+        ("alm_c3_peers", b.alm_c3_peers),
+        ("decision_row_subscribers", b.decision_row_subscribers),
+        ("node_alive", b.node_alive),
+    ] {
+        root.set_item(name, value)?;
+    }
+    root.set_item(
+        "load_pressure_report_age_seconds",
+        b.load_pressure_report_age_seconds,
+    )?;
+    root.set_item(
+        "shaping_seat_roster_age_seconds",
+        b.shaping_seat_roster_age_seconds,
+    )?;
+    let ages = pyo3::types::PyDict::new(py);
+    for (name, age) in &b.loop_last_progress_age_seconds {
+        ages.set_item(name.as_str(), *age)?;
+    }
+    root.set_item("loop_last_progress_age_seconds", ages)?;
+    Ok(())
 }
 
 /// One histogram as `{"buckets": {"0.1": n, …, "+Inf": n}, "count": n,
@@ -3955,6 +4270,7 @@ fn call_err_token(e: &crate::transport::av_call::CallError) -> &'static str {
         E::CallEnded(_) => "call_ended",
         E::ActorIsNotTheSubject { .. } => "actor_is_not_the_subject",
         E::Plumbing(_) => "plumbing",
+        E::AnonymousMode => crate::onion::tokens::ANONYMOUS_NO_MEDIA,
     }
 }
 
@@ -3968,7 +4284,8 @@ fn call_err_to_py(e: &crate::transport::av_call::CallError) -> PyErr {
         E::NotARoomMember { .. }
         | E::ConsentMissing { .. }
         | E::FrameTooLarge { .. }
-        | E::ActorIsNotTheSubject { .. } => PyValueError::new_err(msg),
+        | E::ActorIsNotTheSubject { .. }
+        | E::AnonymousMode => PyValueError::new_err(msg),
         _ => PyRuntimeError::new_err(msg),
     }
 }
@@ -4013,6 +4330,19 @@ fn call_event_to_pydict<'py>(
         V::RecordRefused { reason } => {
             d.set_item("kind", "record_refused")?;
             d.set_item("reason", reason)?;
+        }
+        V::VideoUnavailable { publisher, reason } => {
+            d.set_item("kind", "video_unavailable")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("reason", *reason)?;
+        }
+        V::VideoRestored { publisher } => {
+            d.set_item("kind", "video_restored")?;
+            d.set_item("publisher", publisher)?;
+        }
+        V::LoadTier { tier } => {
+            d.set_item("kind", "load_tier")?;
+            d.set_item("tier", *tier)?;
         }
     }
     Ok(d)
@@ -4079,6 +4409,7 @@ pub const PY_CALL_VERBS: &[&str] = &[
     "epoch",
     "chunk_plaintext_budget",
     "legs",
+    "alm_log",
     "publish",
     "frames",
     "events",
@@ -4158,6 +4489,19 @@ impl PyCall {
     /// The members this node has a leg to, sorted.
     fn legs(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         self.with_call(py, |c| Box::pin(async move { Ok(c.legs()) }))
+    }
+
+    /// ALM C7 — the decision log: `{"hash", "records", "tail"}`. The tail
+    /// names peers, so it belongs to the owner's own session and never to a
+    /// metric. The chained hash and the count are safe to log.
+    fn alm_log(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let (hash, records, tail) =
+            self.with_call(py, |c| Box::pin(async move { Ok(c.alm_log()) }))?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("hash", hash)?;
+        d.set_item("records", records)?;
+        d.set_item("tail", tail)?;
+        Ok(d.into_any().unbind())
     }
 
     /// Seal once and fan out. Returns `{"epoch", "chunk_seq", "delivered",
@@ -6023,11 +6367,14 @@ enum LocalInstanceRole {
     // production dials while a test trust root is active); an explicit
     // bool is the caller's word.
     baked_canonical_dials = None,
-    // CIRISEdge#915 — direct links. Absent: no facilitator, none served,
-    // upgrades accepted from room peers only (today's behaviour).
+    // CIRISEdge#915 — direct links. v44: proposing is on by default; with
+    // no facilitator named it is the genesis bundle's first serve node
+    // (`CIRIS_DIRECT_LINK_FACILITATOR=bootstrap`), under the #661 gate.
+    // None served, upgrades accepted from room peers only.
     direct_link_facilitator = None,
     direct_link_serve_port = None,
     direct_link_accept = "room_peers",
+    direct_link_proposing = "on",
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -6092,10 +6439,12 @@ pub fn init_edge_runtime(
     // When `local_instance_name` is `None`, neither parameter has
     // any effect — v2.2.x behavior is preserved exactly.
     local_instance_name: Option<&str>,
-    // CC 5.4.3 (CLM-link-shaping) — this node's link-shaping policy. `None`
-    // / `off` (the default) offers nothing. `shaping_class` is one of
-    // `server`, `home`, `phone-wifi`, `phone-cellular`, `off`; ρ and W default
-    // to the modelled values (0.5, 600 s); the node cap to eight links' worth.
+    // CC 5.4.3 (CLM-link-shaping) — this node's link-shaping class.
+    // `server` shapes every identity link (the fleet default for servers);
+    // `home`, `phone-wifi`, `phone-cellular` are the person's opt-in for that
+    // class; `off` offers nothing; `None` shapes only onion layer links (none
+    // while the Anonymous Tier is dormant). ρ and W default to the modelled
+    // values (0.5, 600 s; 3600 s cellular); the node cap to eight links' worth.
     shaping_class: Option<String>,
     shaping_rho: Option<f64>,
     shaping_window_seconds: Option<u64>,
@@ -6246,14 +6595,16 @@ pub fn init_edge_runtime(
     node_keystore_alias: Option<&str>,
     baked_canonical_dials: Option<bool>,
     // CIRISEdge#915 — `"host:port"` of the facilitator this node probes when
-    // it proposes a direct link (the server it links to). `None`: it never
-    // proposes.
+    // it proposes a direct link. `None` (v44): the genesis bundle's first
+    // serve node, when the baked canonical dials are allowed (#661).
     direct_link_facilitator: Option<String>,
     // CIRISEdge#915 — run a facilitator on this UDP port (a node with a
     // public address).
     direct_link_serve_port: Option<u16>,
     // CIRISEdge#915 — `room_peers` (default), `identified_only` or `off`.
     direct_link_accept: &str,
+    // v44 — `on` (default) or `off`: whether this node proposes direct links.
+    direct_link_proposing: &str,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -7231,6 +7582,13 @@ pub fn init_edge_runtime(
     // CIRISEdge#915 — direct links. leviculum fixes these at node build, so
     // they are set here, before the transport is built, or never.
     transport_config.direct_links = crate::transport::direct_path::DirectLinksConfig {
+        proposing: crate::transport::direct_path::Proposing::parse(direct_link_proposing)
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "init_edge_runtime: direct_link_proposing {direct_link_proposing:?} is not \
+                     on or off"
+                ))
+            })?,
         facilitator: direct_link_facilitator,
         serve_facilitator: direct_link_serve_port,
         accept: crate::transport::direct_path::DirectAccept::parse(direct_link_accept).ok_or_else(
@@ -7241,7 +7599,14 @@ pub fn init_edge_runtime(
                 ))
             },
         )?,
-    };
+    }
+    // v44 — proposing on by default: the bundle's canonical is the
+    // facilitator when the host named none, under the #661 gate (a node under
+    // a test trust root never probes the production canonical).
+    .resolve_bundle_facilitator(crate::edge::baked_canonical_dials_allowed(
+        baked_canonical_dials,
+        crate::edge::test_trust_root_override_active(),
+    ));
     // CC 5.4.3 — link shaping policy.
     if let Some(class) = shaping_class.as_deref() {
         use crate::transport::link_shaping::{BudgetClass, ShapingPolicy};
@@ -7267,6 +7632,34 @@ pub fn init_edge_runtime(
             policy.node_cap_bytes_per_s = cap;
         }
         policy.require_shaped_links = require_shaped_links;
+        // The class names the device too (CC 5.4.6 item 1 relay policy).
+        {
+            use crate::transport::link_shaping::{DeviceKind, DeviceState};
+            transport_config.device = match class {
+                BudgetClass::Server | BudgetClass::Seat => DeviceState::of(DeviceKind::Server),
+                BudgetClass::Home => DeviceState::of(DeviceKind::Home),
+                BudgetClass::PhoneWifi => DeviceState::of(DeviceKind::Phone),
+                BudgetClass::PhoneCellular => {
+                    DeviceState::of(DeviceKind::Phone).with_network(false, true)
+                }
+                BudgetClass::Off | BudgetClass::HomeElsewhere => {
+                    DeviceState::of(DeviceKind::platform_default())
+                }
+            };
+        }
+        transport_config = transport_config.with_shaping(policy);
+    } else {
+        // CC 5.4.3 rc16 fleet default (Eric, 2026-11-02, final): shaping is
+        // ON by default for `server` only, which a server host names by
+        // passing `shaping_class="server"`. Naming any other class is the
+        // person's opt-in for that class (cellular included). With no class
+        // the node shapes only its onion layer links (none unless its tier
+        // runs), at the platform's class.
+        use crate::transport::link_shaping::{DeviceKind, DeviceState, ShapingPolicy};
+        let device = DeviceState::of(DeviceKind::platform_default());
+        let mut policy = ShapingPolicy::for_device(&device);
+        policy.require_shaped_links = require_shaped_links;
+        transport_config.device = device;
         transport_config = transport_config.with_shaping(policy);
     }
     // CIRISEdge#168 (v5.0) — Transport-node mode (§24 NAT-traversal).
@@ -8237,7 +8630,7 @@ pub fn init_edge_runtime(
     // Python runtime instead of enqueuing forever. Pre-#243 only the listeners
     // ran here (ephemeral `send_opaque_request` transmits inline, so it was
     // unaffected). The `watch::Sender` is stashed on `PyEdge`
-    // (`_transport_shutdown_tx`) for the runtime's lifetime — see that field's
+    // (`transport_shutdown_tx`) for the runtime's lifetime — see that field's
     // busy-loop note.
     let (transport_handles, transport_shutdown_tx): (
         Vec<tokio::task::JoinHandle<()>>,
@@ -8259,9 +8652,9 @@ pub fn init_edge_runtime(
         _dev_cert_tmpdir: https_dev_cert_tmpdir,
         #[cfg(feature = "transport-reticulum-local")]
         shared_instance_cleanup: std::sync::Mutex::new(shared_instance_cleanup),
-        _transport_runtime: transport_runtime,
+        transport_runtime,
         _transport_listener_handles: std::sync::Mutex::new(transport_handles),
-        _transport_shutdown_tx: transport_shutdown_tx,
+        transport_shutdown_tx,
     })
 }
 
@@ -11795,6 +12188,23 @@ mod pyo3_tier2_tests {
     /// Idempotent — repeats are no-ops via the inner `if`. Safe to
     /// call from every test in this module under a fresh
     /// `Python::attach`.
+    /// A test with its own engine config starts from an empty
+    /// `ENGINE_SINGLETON`: a sibling's engine lingers past [`engine_lock`], and
+    /// constructing under it raises `EngineConfigMismatch`. Which sibling ran
+    /// last is the scheduler's, so without this the test's outcome is too, and
+    /// a test that accepts a downstream `Err` passes without having reached
+    /// what it pins. GC first: an unreachable engine must be finalized before
+    /// the reset can clear it. A reset that cannot run panics: swallowing it is
+    /// how this stayed a no-op.
+    fn clear_engine_slate(py: Python<'_>) {
+        py.import("gc")
+            .and_then(|gc| gc.call_method0("collect"))
+            .expect("gc.collect");
+        py.import("ciris_persist")
+            .and_then(|persist| persist.call_method1("reset_engine", (5.0_f64,)))
+            .expect("reset_engine: the stand-in module carries it");
+    }
+
     fn install_ciris_persist_module(py: Python<'_>) -> PyResult<()> {
         use pyo3::prelude::PyModule;
         use pyo3::types::PyAnyMethods;
@@ -11803,8 +12213,10 @@ mod pyo3_tier2_tests {
         if modules.contains("ciris_persist")? {
             return Ok(());
         }
+        // The whole module, as the wheel has it: `reset_engine` lives there, and
+        // [`clear_engine_slate`] needs it.
         let m = PyModule::new(py, "ciris_persist")?;
-        m.add_class::<ciris_persist::ffi::pyo3::PyEngine>()?;
+        ciris_persist::ffi::pyo3::register(py, &m)?;
         modules.set_item("ciris_persist", m)?;
         Ok(())
     }
@@ -11882,6 +12294,7 @@ mod pyo3_tier2_tests {
 
         let outcome: Result<String, PyErr> = Python::attach(|py| -> PyResult<String> {
             install_ciris_persist_module(py)?;
+            clear_engine_slate(py);
             let ciris_persist_mod = py.import("ciris_persist")?;
             let engine_cls = ciris_persist_mod.getattr("Engine")?;
             let kwargs = pyo3::types::PyDict::new(py);
@@ -11949,6 +12362,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -12080,6 +12494,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -12250,6 +12665,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )?;
             Ok(())
         });
@@ -12373,6 +12789,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -12497,6 +12914,7 @@ mod pyo3_tier2_tests {
 
         let outcome: PyResult<(String, String)> = Python::attach(|py| {
             install_ciris_persist_module(py)?;
+            clear_engine_slate(py);
             let engine_cls = py.import("ciris_persist")?.getattr("Engine")?;
             let kwargs = pyo3::types::PyDict::new(py);
             kwargs.set_item("dsn", "sqlite::memory:")?;
@@ -12578,6 +12996,7 @@ mod pyo3_tier2_tests {
 
         let outcome: Result<String, PyErr> = Python::attach(|py| -> PyResult<String> {
             install_ciris_persist_module(py)?;
+            clear_engine_slate(py);
             let ciris_persist_mod = py.import("ciris_persist")?;
             let engine_cls = ciris_persist_mod.getattr("Engine")?;
             let kwargs = pyo3::types::PyDict::new(py);
@@ -12654,6 +13073,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -12766,14 +13186,7 @@ mod pyo3_tier2_tests {
         let init_err: Option<String> = Python::attach(|py| -> PyResult<Option<String>> {
             install_ciris_persist_module(py)?;
             let ciris_persist_mod = py.import("ciris_persist")?;
-            // A sibling engine test's engine may linger in persist's
-            // ENGINE_SINGLETON (one engine per process); GC-collect any
-            // finalizable engine object, THEN reset so our construction below
-            // doesn't hit EngineConfigMismatch.
-            if let Ok(gc) = py.import("gc") {
-                let _ = gc.call_method0("collect");
-            }
-            let _ = ciris_persist_mod.call_method1("reset_engine", (5.0_f64,));
+            clear_engine_slate(py);
             let engine_cls = ciris_persist_mod.getattr("Engine")?;
             let kwargs = pyo3::types::PyDict::new(py);
             kwargs.set_item("dsn", "sqlite::memory:")?;
@@ -12830,6 +13243,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             );
             // Cleanup: drop OUR engine from the singleton so the next real-engine
             // sibling test constructs cleanly (one persist engine per process).
@@ -12902,6 +13316,7 @@ mod pyo3_tier2_tests {
 
         let outcome: Result<String, PyErr> = Python::attach(|py| -> PyResult<String> {
             install_ciris_persist_module(py)?;
+            clear_engine_slate(py);
             let ciris_persist_mod = py.import("ciris_persist")?;
             let engine_cls = ciris_persist_mod.getattr("Engine")?;
             let kwargs = pyo3::types::PyDict::new(py);
@@ -12968,6 +13383,7 @@ mod pyo3_tier2_tests {
                 None,         // CIRISEdge#915 direct_link_facilitator
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
+                "on",         // direct_link_proposing (v44 default)
             )?;
             Ok(edge.signer_key_id())
         });

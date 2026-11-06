@@ -54,7 +54,7 @@ use crate::transport::TransportId;
 /// can hold an `Arc<dyn VerifyDirectory>` — `FederationDirectory`
 /// itself uses `impl Future` returns (RPIT in trait) which makes it
 /// non-dyn-compatible. Blanket-implemented for any
-/// `FederationDirectory`, so hosts can pass `Arc::new(MemoryBackend)`
+/// `FederationDirectory`, so hosts can pass `Arc::new(SqliteBackend)`
 /// or `Arc::new(PostgresBackend)` without picking edge's generics.
 #[async_trait]
 pub trait VerifyDirectory: Send + Sync + 'static {
@@ -399,6 +399,14 @@ pub trait RootingDirectory: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// CC 5.4.6 — whether `node` is announced in the CC's sense: an owned node
+    /// has a live owner binding at federation scope; an unowned node has no one
+    /// to announce it, and its own announce stands. Default `Err` (no directory
+    /// ⇒ unknown, which a caller treats as not announced).
+    async fn node_announced(&self, _node: &str) -> Result<bool, String> {
+        Err("no federation directory wired (RootingDirectory default)".to_string())
+    }
+
     /// CC 5.3.3.5 E1 pre-seal route fetch — this node's own `key:record:v1`
     /// row for `key_id` (persist's projection of the key as a row), carried
     /// in a route answer to a dialler that does not hold the key. Default
@@ -453,6 +461,89 @@ pub trait RootingDirectory: Send + Sync + 'static {
     async fn stored_reticulum_binding(&self, _key_id: &str) -> Option<StoredTransportBinding> {
         None
     }
+
+    /// v44 LTS — every live reticulum route this node holds, as ONE read: no
+    /// fold and no revocation read, because the caller proves a row before
+    /// those are worth paying for ([`Self::binding_stands`]). A row is a claim
+    /// until the caller proves it: see `transport::persisted_standing`. Default
+    /// empty (test doubles / no directory ⇒ nobody has standing from it).
+    ///
+    /// # Errors
+    /// The directory could not be read.
+    async fn live_binding_rows(&self) -> Result<Vec<LiveTransportBinding>, String> {
+        Ok(Vec::new())
+    }
+
+    /// v44 LTS — `key_id`'s live reticulum routes.
+    ///
+    /// # Errors
+    /// The directory could not be read.
+    async fn live_bindings_of(&self, _key_id: &str) -> Result<Vec<LiveTransportBinding>, String> {
+        Ok(Vec::new())
+    }
+
+    /// v44 LTS — is `row` still the live word for its destination, with no
+    /// revocation in effect against its key: not folded out by a newer route of
+    /// a tied key. Fail-closed: a read that failed is not a clean read.
+    async fn binding_stands(&self, _row: &LiveTransportBinding) -> bool {
+        false
+    }
+
+    /// v44 LTS — one page of what moved since `cursors`, which it advances:
+    /// the admission cursors persist moves for a local write and a replicated
+    /// apply alike. A retired route is served there too.
+    ///
+    /// # Errors
+    /// The directory could not be read; `cursors` are then not advanced.
+    async fn binding_changes(
+        &self,
+        _cursors: &mut BindingCursors,
+        _page: u32,
+    ) -> Result<BindingChanges, String> {
+        Ok(BindingChanges {
+            drained: true,
+            ..BindingChanges::default()
+        })
+    }
+}
+
+/// v44 LTS — persist's `(serve_position, resume_id)` admission cursor.
+pub type BindingCursor = (chrono::DateTime<chrono::Utc>, String);
+
+/// v44 LTS — where [`RootingDirectory::binding_changes`] has read to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindingCursors {
+    /// The route cursor.
+    pub routes: Option<BindingCursor>,
+    /// The attestation cursor: key records, revocations, delegations.
+    pub attestations: Option<BindingCursor>,
+}
+
+/// v44 LTS — one page of [`RootingDirectory::binding_changes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindingChanges {
+    /// Keys whose route moved: new, superseded or retired.
+    pub routes: Vec<String>,
+    /// Keys something landed about: a key record, a revocation, a delegation.
+    pub subjects: Vec<String>,
+    /// A revocation named no key this node can read (a digest): any row may
+    /// be under it.
+    pub whole: bool,
+    /// Both cursors reached the end of what is admitted.
+    pub drained: bool,
+}
+
+/// v44 LTS — one row of [`RootingDirectory::live_binding_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTransportBinding {
+    /// The bound federation key.
+    pub key_id: String,
+    /// The row's reticulum destination.
+    pub dest_hash: [u8; 16],
+    /// The full `(x25519 ‖ ed25519)` transport identity.
+    pub transport_pubkey64: [u8; 64],
+    /// What the row SAYS. A replicated row's token is its signer's own claim.
+    pub provenance: ciris_persist::federation::self_at_login::BindingProvenance,
 }
 
 /// CIRISEdge#432 — the durable transport binding as the divergence heal
@@ -710,6 +801,32 @@ where
     Ok(found)
 }
 
+/// A stored route as a [`LiveTransportBinding`]: a live reticulum row with both
+/// identity halves and a well-formed destination, else `None`.
+fn live_binding_of(
+    row: &ciris_persist::federation::self_at_login::TransportDestination,
+) -> Option<LiveTransportBinding> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let half =
+        |field: Option<&str>| -> Option<[u8; 32]> { b64.decode(field?).ok()?.try_into().ok() };
+    if row.transport_kind != "reticulum" || row.retired_at.is_some() {
+        return None;
+    }
+    let x25519 = half(row.transport_x25519_pubkey_base64.as_deref())?;
+    let ed25519 = half(row.transport_ed25519_pubkey_base64.as_deref())?;
+    let dest_hash = <[u8; 16]>::try_from(hex::decode(&row.destination).ok()?).ok()?;
+    let mut transport_pubkey64 = [0u8; 64];
+    transport_pubkey64[..32].copy_from_slice(&x25519);
+    transport_pubkey64[32..].copy_from_slice(&ed25519);
+    Some(LiveTransportBinding {
+        key_id: row.occurrence_key_id.clone(),
+        dest_hash,
+        transport_pubkey64,
+        provenance: row.binding_provenance,
+    })
+}
+
 #[async_trait]
 impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
     async fn root_binding(
@@ -777,6 +894,19 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         key_id: &str,
     ) -> Result<Option<ciris_persist::federation::self_at_login::TransitKexPair>, String> {
         authenticated_self_signed_transit_pair(self, key_id).await
+    }
+
+    async fn node_announced(&self, node: &str) -> Result<bool, String> {
+        let owner = ciris_persist::federation::admission::owner_of(self, node)
+            .await
+            .map_err(|e| format!("owner_of: {e}"))?;
+        let Some(owner) = owner else {
+            return Ok(true);
+        };
+        crate::replication::bridge::live_announcing_rows(self, &owner, node)
+            .await
+            .map(|rows| !rows.is_empty())
+            .map_err(|e| format!("live_announcing_rows: {e}"))
     }
 
     async fn own_key_record_row(
@@ -945,6 +1075,118 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         })
     }
 
+    async fn live_binding_rows(&self) -> Result<Vec<LiveTransportBinding>, String> {
+        let rows = FederationDirectory::list_all_transport_destinations_unfolded(self)
+            .await
+            .map_err(|e| format!("list_all_transport_destinations_unfolded: {e}"))?;
+        Ok(rows.iter().filter_map(live_binding_of).collect())
+    }
+
+    async fn live_bindings_of(&self, key_id: &str) -> Result<Vec<LiveTransportBinding>, String> {
+        let rows = FederationDirectory::list_transport_destinations_for(self, key_id)
+            .await
+            .map_err(|e| format!("list_transport_destinations_for: {e}"))?;
+        Ok(rows.iter().filter_map(live_binding_of).collect())
+    }
+
+    async fn binding_stands(&self, row: &LiveTransportBinding) -> bool {
+        // Fail closed: neither a fold nor a revocation that cannot be read is
+        // absent.
+        let Ok(claimants) =
+            FederationDirectory::list_transport_destinations_by_destination_unfolded(
+                self,
+                &hex::encode(row.dest_hash),
+            )
+            .await
+        else {
+            return false;
+        };
+        // This key's rows, not the destination's: folding every claimant costs
+        // an owner read per pair, and anyone can claim one destination with
+        // thousands of keys. The sweep runs this per row.
+        let own: Vec<_> = claimants
+            .into_iter()
+            .filter(|c| c.occurrence_key_id == row.key_id && c.retired_at.is_none())
+            .collect();
+        if own.is_empty() {
+            return false;
+        }
+        let Ok(kept) =
+            ciris_persist::federation::transport_routes::fold_one_live_key(self, own).await
+        else {
+            return false;
+        };
+        if kept.is_empty() {
+            return false;
+        }
+        let now = chrono::Utc::now();
+        FederationDirectory::revocations_for(self, &row.key_id)
+            .await
+            .is_ok_and(|r| r.iter().all(|r| r.effective_at > now))
+    }
+
+    async fn binding_changes(
+        &self,
+        cursors: &mut BindingCursors,
+        page: u32,
+    ) -> Result<BindingChanges, String> {
+        use ciris_persist::federation::key_plane::{self, KeyPlaneFamily};
+        use ciris_persist::federation::types::attestation_type::DELEGATES_TO;
+        let full = usize::try_from(page).unwrap_or(usize::MAX);
+        let routes = FederationDirectory::list_signed_transport_destinations_since(
+            self,
+            cursors.routes.clone(),
+            page,
+        )
+        .await
+        .map_err(|e| format!("list_signed_transport_destinations_since: {e}"))?;
+        let rows =
+            FederationDirectory::list_attestations_since(self, cursors.attestations.clone(), page)
+                .await
+                .map_err(|e| format!("list_attestations_since: {e}"))?;
+        let mut changes = BindingChanges {
+            drained: routes.len() < full && rows.len() < full,
+            ..BindingChanges::default()
+        };
+        for served in &rows {
+            let row = &served.attestation;
+            match KeyPlaneFamily::of_row(row) {
+                Some(KeyPlaneFamily::KeyRecord) => {
+                    changes.subjects.push(row.attested_key_id.clone());
+                    if let Some(record) = key_plane::key_record_of_row(row) {
+                        changes.subjects.push(record.key_id);
+                    }
+                }
+                Some(KeyPlaneFamily::KeyRevocation) => {
+                    match key_plane::revocation_of_row(row).and_then(|r| r.revoked_key_id) {
+                        Some(key) => changes.subjects.push(key),
+                        None => changes.whole = true,
+                    }
+                }
+                _ if row.attestation_type == DELEGATES_TO => {
+                    changes.subjects.push(row.attested_key_id.clone());
+                }
+                _ => {}
+            }
+        }
+        changes.routes = routes
+            .iter()
+            .map(|r| {
+                r.destination
+                    .transport_destination
+                    .occurrence_key_id
+                    .clone()
+            })
+            .collect();
+        if let Some(last) = routes.last() {
+            cursors.routes = Some(last.resume_pair());
+        }
+        if let Some(last) = rows.last() {
+            cursors.attestations = Some(last.resume_pair());
+        }
+        Ok(changes)
+    }
+
     async fn persist_transport_binding(
         &self,
         key_id: &str,
@@ -960,7 +1202,10 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             occurrence_key_id: key_id.to_string(),
             transport_kind: "reticulum".to_string(),
             destination: hex::encode(dest_hash),
-            asserted_at: chrono::Utc::now(),
+            // persist v61 (CC 2.6.2 strict): a route instant is `.sssZ`.
+            asserted_at: ciris_persist::federation::admission::truncate_to_substrate_resolution(
+                chrono::Utc::now(),
+            ),
             last_seen_at: None,
             transport_ed25519_pubkey_base64: Some(b64.encode(&transport_pubkey[32..64])),
             transport_x25519_pubkey_base64: Some(b64.encode(&transport_pubkey[0..32])),

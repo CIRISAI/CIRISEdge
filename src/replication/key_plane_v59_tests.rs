@@ -61,7 +61,7 @@ fn bridge(
 
 /// `key`'s self-revocation, hybrid-signed by `key` over persist's bound
 /// envelope (the path a self-revocation takes; no `slash` conferral needed).
-async fn self_revocation(dir: &SqliteBackend, key: &Ident) -> Revocation {
+pub(super) async fn self_revocation(dir: &SqliteBackend, key: &Ident) -> Revocation {
     use sha2::Digest as _;
     let now = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(
         chrono::Utc::now().timestamp_micros(),
@@ -122,10 +122,11 @@ async fn route(
         occurrence_key_id: node.key_id().to_owned(),
         transport_kind: "reticulum".to_owned(),
         destination: "a0".repeat(16),
-        asserted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_micros(
-            chrono::Utc::now().timestamp_micros(),
+        // persist v61 (CC 2.6.2 strict): the route's instant is `.sssZ`.
+        asserted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            chrono::Utc::now().timestamp_millis(),
         )
-        .expect("micros"),
+        .expect("millis"),
         last_seen_at: None,
         transport_ed25519_pubkey_base64: Some(b64.encode([0xbb; 32])),
         transport_x25519_pubkey_base64: Some(b64.encode([0xcc; 32])),
@@ -149,18 +150,69 @@ async fn route(
     }
 }
 
+/// v44 LTS — the rows a restart may read standing from: a key that revoked
+/// itself offers none, though its route row is still there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_key_offers_no_live_binding() {
+    use crate::verify::RootingDirectory;
+    use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
+    let a = NodeA::build("lts-standing", 0x71).await;
+    RootingDirectory::persist_transport_binding(
+        &*a.dir,
+        a.k.key_id(),
+        [0xa1; 16],
+        [0x33; 64],
+        Rooted,
+        2,
+    )
+    .await;
+    let rows = RootingDirectory::live_binding_rows(&*a.dir)
+        .await
+        .expect("the rows read");
+    let row_of = |key: &str| {
+        rows.iter()
+            .find(|b| b.key_id == key)
+            .unwrap_or_else(|| panic!("{key} has a route row: {rows:?}"))
+    };
+    assert!(
+        RootingDirectory::binding_stands(&*a.dir, row_of(a.n.key_id())).await,
+        "N is live"
+    );
+    assert!(
+        !RootingDirectory::binding_stands(&*a.dir, row_of(a.k.key_id())).await,
+        "K revoked itself"
+    );
+    // The change read names it, from the store's own cursor: a revocation is
+    // what ends standing, so it cannot wait for the sweep.
+    let mut cursors = crate::verify::BindingCursors::default();
+    let mut named = Vec::new();
+    loop {
+        let page = RootingDirectory::binding_changes(&*a.dir, &mut cursors, 64)
+            .await
+            .expect("the changes read");
+        named.extend(page.subjects);
+        if page.drained {
+            break;
+        }
+    }
+    assert!(
+        named.iter().any(|k| k == a.k.key_id()),
+        "the revocation names K: {named:?}"
+    );
+}
+
 /// Node A: a person P, its node N (P's occurrence of N, attested by P), a key
 /// K that revoked itself, and N's route — each written through the LOCAL
 /// authoring door, which mints the key-plane rows.
-struct NodeA {
-    p: Ident,
-    n: Ident,
-    k: Ident,
-    dir: Arc<SqliteBackend>,
+pub(super) struct NodeA {
+    pub(super) p: Ident,
+    pub(super) n: Ident,
+    pub(super) k: Ident,
+    pub(super) dir: Arc<SqliteBackend>,
 }
 
 impl NodeA {
-    async fn build(tag: &str, seed: u8) -> Self {
+    pub(super) async fn build(tag: &str, seed: u8) -> Self {
         let p = Ident::mint(&format!("person-p-{tag}"), "user", seed).await;
         let n = Ident::mint(&format!("node-n-{tag}"), "node", seed + 1).await;
         let k = Ident::mint(&format!("node-k-{tag}"), "node", seed + 2).await;
@@ -199,7 +251,7 @@ impl NodeA {
     /// P withdraws its occurrence of N: the `withdraws` of N's
     /// `identity:occurrence:v1` row (persist v59.0.0's occurrence revocation),
     /// authored at A. Returns the row.
-    async fn withdraw_occurrence(&self) -> Attestation {
+    pub(super) async fn withdraw_occurrence(&self) -> Attestation {
         let target =
             crate::replication::key_plane_rows::occurrence_rows_about(&*self.dir, self.p.key_id())
                 .await
@@ -232,11 +284,11 @@ impl NodeA {
     /// N, a node (single-signer: CC 3.1.5 rule A), revokes its occurrence
     /// `occurrence` as a framed object; A holds its
     /// `identity:occurrence_revocation:v1` carrier. Returns the row.
-    async fn carrier_revoking_node_occurrence(&self, occurrence: &str) -> Attestation {
+    pub(super) async fn carrier_revoking_node_occurrence(&self, occurrence: &str) -> Attestation {
         use ciris_persist::federation::occurrence_revocation_carrier::{
             carrier_row, FramedOccurrenceRevocation,
         };
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let envelope = serde_json::json!({
             "attesting_key_id": self.n.key_id(),
             "identity_key_id": self.n.key_id(),
@@ -282,7 +334,7 @@ fn messages(outcome: ReplicationOutcome) -> Vec<ReplicationMessage> {
 
 /// One `kind` round: B initiates against A, and the two sessions exchange
 /// until neither has anything to say.
-async fn round(
+pub(super) async fn round(
     kind: EnvelopeKind,
     a: &Arc<FederationDirectoryReplicationBridge>,
     a_id: &str,
@@ -335,6 +387,13 @@ async fn an_outbound_serve_offers_no_framed_key_plane_object_v59() {
         .filter(|k| k.is_framed_retired())
     {
         let refs = bridge.list_envelope_refs_for_peer(kind, Some(PEER)).await;
+        // persist v60.0.0 (§8) / v61 (#991) — a retired PLANE (the operational
+        // trio, the group-plane kinds, the listing, the framed KeyGrant) is
+        // retired outright: nothing is offered on it.
+        if kind.is_retired_plane() {
+            assert!(refs.is_empty(), "{kind:?}: a retired plane offers nothing");
+            continue;
+        }
         let Some(family) = kind.key_plane_family() else {
             // The occurrence-revocation plane: only the occurrence's withdraws.
             assert_eq!(refs.len(), 1, "{kind:?}: the one withdraws: {refs:?}");

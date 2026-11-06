@@ -44,3 +44,8 @@ pub mod uniffi_impl_links;
 // mgmt scope.
 #[cfg(feature = "ffi-uniffi")]
 pub mod uniffi_impl_routing;
+
+// v44 (CC 5.4.3 / 5.4.6) — the mobile shaping + Anonymous Tier surface:
+// device state in, shaping and tier status out.
+#[cfg(feature = "ffi-uniffi")]
+pub mod uniffi_impl_shaping;

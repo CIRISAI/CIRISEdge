@@ -161,8 +161,8 @@ async fn subscribe_resource_events_yields_durable_queue_pressure() {
     let peer = FedKey::new("remote-peer", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&local, &steward, "agent"),
-        signed_record(&peer, &steward, "agent"),
+        signed_record(&local, &steward, "node"),
+        signed_record(&peer, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();

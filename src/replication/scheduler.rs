@@ -33,7 +33,8 @@
 //! Responder-side rounds need no scheduler: the runtime's
 //! `spawn_responder_drive` task drains the responder's inbox, steps the
 //! session (`drive_round_step_framed`, which rebinds and resets on a new
-//! round) and sends each reply stamped with the round it answers.
+//! round) and queues each reply, stamped with the round it answers, on its
+//! reply lane (CIRISEdge#943).
 //!
 //! ## Cancellation
 //!
@@ -80,7 +81,7 @@
 //! round is a missed cadence, not a fault. The next round will pick
 //! up whatever state changed in the meantime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +93,7 @@ use super::coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, Ro
 use super::no_route_backoff::{Admission, NoRouteBackoff, NoRouteBackoffEntry, RoundClass};
 use super::protocol::EnvelopeKind;
 use super::session::SessionRole;
+use crate::transport::TransportError;
 
 /// Scheduler configuration shared across all coordinators it drives.
 ///
@@ -267,6 +269,87 @@ impl RoundGate {
     }
 }
 
+/// The outer bound on one send of a round. A cold dial is at most 30 s and a
+/// live transfer at most 120 s on the dial path, so this only ends a send the
+/// transport itself never would: a live, progressing transfer is not severed.
+pub const ROUND_SEND_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// A shaped link's sender waits up to 16 of its gaps for a row to leave
+/// (`link_shaping::ROW_LEAVE_MAX_GAPS`); this is that, with a margin.
+pub const PACING_SEND_GAPS: f64 = 17.0;
+
+/// The bound on one send on a link with frame gap `gap`.
+#[must_use]
+pub fn pacing_send_timeout(gap: Option<Duration>) -> Duration {
+    gap.map_or(ROUND_SEND_TIMEOUT, |g| {
+        ROUND_SEND_TIMEOUT.max(g.mul_f64(PACING_SEND_GAPS))
+    })
+}
+
+/// A round's place at the gate. The gate bounds what rounds cost the blocking
+/// pool, and a round parked in a send costs it nothing, so a send gets as long
+/// under the permit as a wait for a reply does (`hold`) and then gives the
+/// permit back, keeps sending, and queues behind the rounds ahead before it
+/// steps again. A dead peer's dial sits out 30 s per plane; held for that long
+/// a few dead peers stopped every round to every live one.
+///
+/// The hold is not zero because the gate also paces a fan-out's dials: a start
+/// or a kick still opens at most the bound's worth per hold. This is not the
+/// reply lane of CIRISEdge#943: a responder has frames behind a reply to keep
+/// stepping, and an initiator's round has nothing to do until its send lands,
+/// so it keeps its send inline and gives up only what others need.
+struct RoundSeat<'a> {
+    gate: &'a RoundGate,
+    peer_id: &'a str,
+    kind: &'a str,
+    permit: Option<RoundPermit<'a>>,
+}
+
+impl<'a> RoundSeat<'a> {
+    async fn take(gate: &'a RoundGate, peer_id: &'a str, kind: &'a str) -> RoundSeat<'a> {
+        let permit = Some(gate.enter(peer_id, kind).await);
+        Self {
+            gate,
+            peer_id,
+            kind,
+            permit,
+        }
+    }
+
+    /// Run one send of the round. Past `bound` it is a [`RoundError::Timeout`];
+    /// the abandoned send is safe, sends being cancel-safe (CIRISEdge#853).
+    async fn send<T>(
+        &mut self,
+        hold: Duration,
+        bound: Duration,
+        send: impl std::future::Future<Output = Result<T, CoordinatorError>>,
+    ) -> Result<T, RoundError> {
+        let bounded = tokio::time::timeout(bound, send);
+        tokio::pin!(bounded);
+        let outcome = if let Ok(landed) = tokio::time::timeout(hold, &mut bounded).await {
+            landed
+        } else {
+            self.permit = None;
+            tracing::debug!(
+                peer = %self.peer_id,
+                kind = %self.kind,
+                hold_ms = u64::try_from(hold.as_millis()).unwrap_or(u64::MAX),
+                "round send still parked — its permit goes back to the gate"
+            );
+            let landed = bounded.await;
+            // Only a round that goes on reads again.
+            if matches!(landed, Ok(Ok(_))) {
+                self.permit = Some(self.gate.enter(self.peer_id, self.kind).await);
+            }
+            landed
+        };
+        match outcome {
+            Ok(result) => result.map_err(RoundError::from),
+            Err(_) => Err(RoundError::Timeout),
+        }
+    }
+}
+
 /// What the scheduler observed running one round on one coordinator.
 /// Surfaced via the run loop's `tracing` span so metrics / dashboards
 /// see per-round outcome.
@@ -315,6 +398,9 @@ pub struct ReplicationScheduler {
     /// CIRISEdge#794 — the per-peer no-route backoff, shared by every
     /// coordinator task, the handle and the registry's inbound door.
     backoff: Arc<NoRouteBackoff>,
+    /// The peers a coordinator is driven toward, for
+    /// [`SchedulerHandle::drives_peer`].
+    driven: Arc<std::sync::Mutex<HashSet<String>>>,
     /// CIRISEdge#440 — the resolved mesh-config read seam. When `Some`, each
     /// coordinator loop re-checks `antientropy.round_secs` ONCE per round
     /// (after the round, before the next tick is scheduled): a live relief
@@ -422,6 +508,8 @@ pub struct SchedulerHandle {
     round_gate: Arc<RoundGate>,
     /// CIRISEdge#794 — the scheduler's no-route backoff.
     backoff: Arc<NoRouteBackoff>,
+    /// The peers a coordinator is driven toward (see [`Self::drives_peer`]).
+    driven: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl SchedulerHandle {
@@ -513,6 +601,51 @@ impl SchedulerHandle {
             .map_err(|_| SchedulerCommandError::SchedulerStopped)
     }
 
+    /// Does this scheduler drive a coordinator toward `peer_key_id`? The
+    /// answer to "is this a known replication peer", without a round-trip
+    /// through the command channel.
+    #[must_use]
+    pub fn drives_peer(&self, peer_key_id: &str) -> bool {
+        self.driven
+            .lock()
+            .is_ok_and(|driven| driven.contains(peer_key_id))
+    }
+
+    /// v44 (first-contact kick on a miss) — [`Self::round_now`] toward ONE
+    /// peer, never blocking (`try_send`, the [`Self::try_kick`] shape): called
+    /// from the serve path of a subject Pull that answered nothing for a
+    /// subject this node can resolve to that peer, so the rows are asked for
+    /// within a round-trip instead of at the next cadence tick. A full command
+    /// channel drops the kick and the cadence still asks. Returns whether the
+    /// kick was queued. See [`SchedulerCommand::RoundNow`].
+    #[must_use]
+    pub fn try_round_now(&self, peer_key_id: &str) -> bool {
+        self.command_tx
+            .try_send(SchedulerCommand::RoundNow {
+                peer_key_id: Some(peer_key_id.to_owned()),
+            })
+            .is_ok()
+    }
+
+    /// A handle whose command channel the TEST holds the receiving end of, so
+    /// a witness can observe the commands a caller queues without running a
+    /// scheduler.
+    #[cfg(test)]
+    pub(crate) fn test_pair(driven: &[&str]) -> (Self, mpsc::Receiver<SchedulerCommand>) {
+        let (command_tx, command_rx) = mpsc::channel(32);
+        (
+            Self {
+                command_tx,
+                round_gate: Arc::new(RoundGate::new(1)),
+                backoff: Arc::new(NoRouteBackoff::new()),
+                driven: Arc::new(std::sync::Mutex::new(
+                    driven.iter().map(|p| (*p).to_owned()).collect(),
+                )),
+            },
+            command_rx,
+        )
+    }
+
     /// CIRISEdge#776 — fire a round NOW on `(peer_key_id, kind)` only. Never
     /// blocks (`try_send`): it is called from the apply path; a full command
     /// channel drops the kick and the cadence still asks. Returns whether the
@@ -568,6 +701,7 @@ impl ReplicationScheduler {
             command_rx: None,
             round_gate: Arc::new(RoundGate::new(config.max_concurrent_rounds)),
             backoff: Arc::new(NoRouteBackoff::new()),
+            driven: Arc::default(),
             mesh_config: None,
             metrics: None,
         }
@@ -645,6 +779,7 @@ impl ReplicationScheduler {
             command_tx,
             round_gate: Arc::clone(&self.round_gate),
             backoff: Arc::clone(&self.backoff),
+            driven: Arc::clone(&self.driven),
         }
     }
 
@@ -698,6 +833,7 @@ impl ReplicationScheduler {
     /// telemetry consumers. Drop the receiver to stop receiving
     /// events; the scheduler tolerates a closed sink (the round
     /// loops continue).
+    #[allow(clippy::too_many_lines)] // one select loop: every command arm in one place
     pub async fn run_with_events(
         mut self,
         mut cancel: watch::Receiver<bool>,
@@ -718,6 +854,7 @@ impl ReplicationScheduler {
         let mesh_config = self.mesh_config.take();
         let metrics = self.metrics.take();
         for coord in self.coordinators.drain(..) {
+            note_driven(&self.driven, &coord);
             spawn_coord(
                 &mut per_coord,
                 &mut handles,
@@ -761,6 +898,7 @@ impl ReplicationScheduler {
                                 );
                                 continue;
                             }
+                            note_driven(&self.driven, &coord);
                             spawn_coord(
                                 &mut per_coord,
                                 &mut handles,
@@ -775,7 +913,13 @@ impl ReplicationScheduler {
                             );
                         }
                         SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
-                            remove_initiator(&mut per_coord, &backoff, &peer_key_id, kind);
+                            remove_initiator(
+                                &mut per_coord,
+                                &backoff,
+                                &self.driven,
+                                &peer_key_id,
+                                kind,
+                            );
                         }
                         SchedulerCommand::RoundNow { peer_key_id } => {
                             round_now_kick(&per_coord, peer_key_id.as_deref());
@@ -887,6 +1031,9 @@ async fn run_one_coordinator_forever(
     // rebuilds the interval, so a reader answering "no relief" forever never
     // perturbs the pre-#440 tick stream.
     let mut current_cadence = cadence;
+    // CC 5.4.6 — when the re-dial drawn after a failed send is due. Until then
+    // a kick does not dial: it would put a refused fleet back on one beat.
+    let mut redial_at: Option<tokio::time::Instant> = None;
 
     let peer_id = coord.peer_key_id().to_string();
     let kind_str = format!("{:?}", coord.kind());
@@ -929,9 +1076,20 @@ async fn run_one_coordinator_forever(
                 // CIRISEdge#794 — a kick does not bypass the no-route backoff:
                 // a backed-off peer's coordinator ignores it (and takes no
                 // permit). The schedule is then left alone, not reset.
+                //
+                // CC 5.4.6 — nor the re-dial drawn after a failed send: that
+                // tick runs the round the kick wanted.
+                if redial_at.is_some_and(|at| tokio::time::Instant::now() < at) {
+                    tracing::trace!("kick held — this coordinator's re-dial is drawn (CC 5.4.6)");
+                    continue;
+                }
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str, kicked = true);
-                if round.run().instrument(span).await {
-                    interval.reset();
+                match round.run().instrument(span).await {
+                    RoundRan::Skipped => {}
+                    RoundRan::Ended => interval.reset(),
+                    RoundRan::SendFailed => {
+                        redial_at = Some(draw_redial(&mut interval, current_cadence));
+                    }
                 }
             }
             _ = interval.tick() => {
@@ -940,29 +1098,102 @@ async fn run_one_coordinator_forever(
                 // fan-out too.
                 // CIRISEdge#790 — instrumented, never entered (see the kick arm).
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
-                round.run().instrument(span).await;
-                if let Some(reader) = &mesh_config {
-                    let target = reader.relief().await.round_cadence.unwrap_or(cadence);
-                    if target != current_cadence {
-                        tracing::info!(
-                            peer = %peer_id,
-                            kind = %kind_str,
-                            from_secs = current_cadence.as_secs_f64(),
-                            to_secs = target.as_secs_f64(),
-                            "anti-entropy cadence changed by mesh-config relief \
-                             (antientropy.round_secs; CIRISEdge#440)"
-                        );
-                        current_cadence = target;
-                        interval = tokio::time::interval_at(
-                            tokio::time::Instant::now() + target,
-                            target,
-                        );
-                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    }
+                let ran = round.run().instrument(span).await;
+                let relieved = match &mesh_config {
+                    Some(reader) => reader.relief().await.round_cadence.unwrap_or(cadence),
+                    None => cadence,
+                };
+                // CC 5.4.3 — on a shaped link the round interval follows the
+                // frame gap (about 7.75 gaps), else ticks queue behind rounds
+                // that each take several gaps.
+                let target = pacing_interval(relieved, coord.pacing_gap());
+                if target != current_cadence {
+                    tracing::info!(
+                        peer = %peer_id,
+                        kind = %kind_str,
+                        from_secs = current_cadence.as_secs_f64(),
+                        to_secs = target.as_secs_f64(),
+                        "anti-entropy cadence changed (mesh-config relief, CIRISEdge#440, or \
+                         the shaped link's frame gap, CC 5.4.3)"
+                    );
+                    current_cadence = target;
+                    interval = tokio::time::interval_at(
+                        tokio::time::Instant::now() + target,
+                        target,
+                    );
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                }
+                // After the cadence settles, so the draw is on the one in force.
+                if ran == RoundRan::SendFailed {
+                    redial_at = Some(draw_redial(&mut interval, current_cadence));
                 }
             }
         }
     }
+}
+
+/// CC 5.4.6 (`FSD/EVENT_PATH_MODEL.md` §2.4) — a client retries jittered. The
+/// tick is 30 s and the receiver's limiter a 10 s sliding window, so a dial
+/// refused in the closed part comes back to the closed part, every time. After
+/// a round whose send failed this coordinator's next dial is drawn from 0.5 to
+/// 1.5 cadences, on a fresh draw per failure, and the tick carries on from
+/// there. A healthy round never comes here, so its tick stays where it was.
+///
+/// Why not a wider draw, or a shared one: the floor keeps a fleet refused at
+/// the same moment (a restart behind a closed limiter) from coming straight
+/// back, and each draw being its own is what spreads them. The first tick is
+/// left alone: a restart's own burst is what the budgets are sized for.
+///
+/// A kick waits out the draw only up to [`KICK_HOLD_MAX`]: the jitter is sized
+/// for the default cadence, and on a long one a host's kick must not sit for half
+/// an hour behind one refused dial. The returned instant is that hold.
+fn draw_redial(interval: &mut tokio::time::Interval, cadence: Duration) -> tokio::time::Instant {
+    let delay = redial_delay(cadence);
+    interval.reset_after(delay);
+    tokio::time::Instant::now() + delay.min(KICK_HOLD_MAX)
+}
+
+/// The longest a kick waits behind a drawn re-dial: the draw's top at the
+/// default cadence.
+const KICK_HOLD_MAX: Duration = Duration::from_secs(45);
+
+/// Uniform over `[cadence / 2, cadence * 3 / 2]`, millisecond resolution.
+fn redial_delay(cadence: Duration) -> Duration {
+    use rand::Rng as _;
+    let ms = u64::try_from(cadence.as_millis()).unwrap_or(u64::MAX / 2);
+    Duration::from_millis(rand::thread_rng().gen_range(ms / 2..=ms.saturating_mul(3) / 2))
+}
+
+/// The Poisson p99 of one frame wait, in gaps (FSD/TRANSPORT_TIERS_MODEL.md).
+pub const PACING_WAIT_GAPS: f64 = 4.74;
+/// A round interval that lets a request/reply round complete, in gaps.
+pub const PACING_INTERVAL_GAPS: f64 = 7.75;
+
+/// The per-wait timeout on a link with frame gap `gap`: never below the
+/// configured one, and at least [`PACING_WAIT_GAPS`] gaps.
+#[must_use]
+pub fn pacing_timeout(configured: Duration, gap: Option<Duration>) -> Duration {
+    gap.map_or(configured, |g| configured.max(g.mul_f64(PACING_WAIT_GAPS)))
+}
+
+/// The round interval on a link with frame gap `gap`: never below the
+/// configured cadence, and at least [`PACING_INTERVAL_GAPS`] gaps.
+#[must_use]
+pub fn pacing_interval(configured: Duration, gap: Option<Duration>) -> Duration {
+    gap.map_or(configured, |g| {
+        configured.max(g.mul_f64(PACING_INTERVAL_GAPS))
+    })
+}
+
+/// How [`GatedRound::run`] went, for the loop that owns the tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundRan {
+    /// The peer is backed off, or another plane found it unroutable meanwhile.
+    Skipped,
+    /// The round ended, whatever the outcome.
+    Ended,
+    /// The round's send failed, so the next round is a dial ([`draw_redial`]).
+    SendFailed,
 }
 
 /// One coordinator's round, as both the tick and the kick arm run it: past the
@@ -980,36 +1211,50 @@ struct GatedRound<'a> {
 }
 
 impl GatedRound<'_> {
-    /// Run the round unless the peer is backed off. Returns whether it ran.
-    async fn run(&self) -> bool {
+    /// Run the round unless the peer is backed off.
+    async fn run(&self) -> RoundRan {
         // Decided BEFORE the gate: a backed-off coordinator never holds or
         // queues for a permit.
         let Admission::Run(ticket) = self.backoff.admit(self.peer_id, self.coord.kind()) else {
             tracing::trace!("round skipped — peer is in no-route backoff (CIRISEdge#794)");
-            return false;
+            return RoundRan::Skipped;
         };
-        let _permit = self.round_gate.enter(self.peer_id, self.kind_str).await;
+        let mut seat = RoundSeat::take(self.round_gate, self.peer_id, self.kind_str).await;
         // Another plane may have found the peer unroutable while this one
         // waited for its permit.
         if ticket.overtaken() {
-            return false;
+            return RoundRan::Skipped;
         }
         // CIRISEdge P0 telemetry — the round's wall time, from holding the
         // permit to its outcome, whatever that outcome is: a round that
         // timed out after its full budget is exactly the one to see.
         let started = std::time::Instant::now();
+        // CC 5.4.3 — on a shaped link a wait is paced by the link's frame
+        // gap: the per-wait timeout is at least the Poisson p99 of one gap
+        // (about 4.74 gaps), else every wait on a slow link times out.
+        let round_timeout = pacing_timeout(self.round_timeout, self.coord.pacing_gap());
         let class = round_and_report(
             self.coord,
-            self.round_timeout,
+            round_timeout,
             self.event_sink,
             self.peer_id,
+            &mut seat,
         )
         .await;
         if let Some(m) = self.metrics {
             m.observe_round_duration(self.coord.kind(), started.elapsed());
         }
+        tracing::info!(
+            took_ms = started.elapsed().as_millis(),
+            "anti-entropy round ended"
+        );
+        let ran = if matches!(class, RoundClass::SendFailed) {
+            RoundRan::SendFailed
+        } else {
+            RoundRan::Ended
+        };
         ticket.finish(class);
-        true
+        ran
     }
 }
 
@@ -1017,7 +1262,15 @@ impl GatedRound<'_> {
 fn round_class_of(e: &RoundError) -> RoundClass {
     match e {
         RoundError::Coordinator(CoordinatorError::Transport(t)) => {
-            RoundClass::of_transport_error(t).unwrap_or(RoundClass::Other)
+            RoundClass::of_transport_error(t).unwrap_or(match t {
+                // A dial was made or a link was used, and it failed.
+                TransportError::Io(_)
+                | TransportError::Timeout(_)
+                | TransportError::LinkSealRefused { .. } => RoundClass::SendFailed,
+                // Nothing went out: a ban, a body too large, an unreachable
+                // medium. No address at all is the no-route class above.
+                _ => RoundClass::Other,
+            })
         }
         RoundError::Coordinator(_) | RoundError::Timeout | RoundError::InboundClosed => {
             RoundClass::Other
@@ -1034,6 +1287,7 @@ async fn round_and_report(
     round_timeout: Duration,
     event_sink: Option<&tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
     peer_id: &str,
+    seat: &mut RoundSeat<'_>,
 ) -> RoundClass {
     // FSD-SIGNER-RECOVERY D3 — a recovery round REPLACES this
     // tick's ordinary round; the two never overlap. It costs one
@@ -1041,9 +1295,16 @@ async fn round_and_report(
     // name is actually queued. At most one name per peer can exist
     // (D4), so recovery displaces at most one ordinary round per
     // peer before it is done.
-    let recovery = match run_one_recovery_round(coord, round_timeout).await {
+    let recovery = match run_one_recovery_round(coord, round_timeout, seat).await {
         Ok(step) => step,
         Err(e) => {
+            // Lifecycle — the transport is suspended: skip quietly. The
+            // ordinary round would be refused the same way; nothing is
+            // reported and no backoff moves.
+            if matches!(round_class_of(&e), RoundClass::Suspended) {
+                tracing::debug!("signer-recovery round skipped: transport suspended");
+                return RoundClass::Suspended;
+            }
             // CIRISEdge#794 — no route: the ordinary round would fail the
             // same way, so it does not run; the backoff takes over.
             if let RoundClass::NoRoute(error) = round_class_of(&e) {
@@ -1078,16 +1339,23 @@ async fn round_and_report(
         }
         return RoundClass::Other;
     }
-    let outcome = run_one_round(coord, round_timeout).await;
+    let outcome = run_one_round(coord, round_timeout, seat).await;
     let class = match &outcome {
         Ok(_) => RoundClass::Other,
         Err(e) => round_class_of(e),
     };
+    // Lifecycle — a round refused because the transport is suspended is not
+    // an error of the round: skip quietly, no event, no backoff.
+    if matches!(class, RoundClass::Suspended) {
+        tracing::debug!("round skipped: transport suspended");
+        return class;
+    }
     let event = match outcome {
         // CIRISEdge#380 — run_one_round converts SendThenComplete to
         // Complete after sending; the merged arm is defensive if it
         // ever leaks through.
         Ok(DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report)) => {
+            tracing::info!("round completed");
             RoundEvent::Completed(report)
         }
         Ok(DriveStep::Refused) => {
@@ -1197,6 +1465,7 @@ fn round_now_kick(
 fn remove_initiator(
     per_coord: &mut HashMap<(String, EnvelopeKind), CoordControl>,
     backoff: &NoRouteBackoff,
+    driven: &std::sync::Mutex<HashSet<String>>,
     peer_key_id: &str,
     kind: EnvelopeKind,
 ) {
@@ -1205,6 +1474,16 @@ fn remove_initiator(
     }
     if !per_coord.keys().any(|(p, _)| p == peer_key_id) {
         backoff.forget(peer_key_id);
+        if let Ok(mut driven) = driven.lock() {
+            driven.remove(peer_key_id);
+        }
+    }
+}
+
+/// Record that a coordinator is about to be driven toward its peer.
+fn note_driven(driven: &std::sync::Mutex<HashSet<String>>, coord: &ReplicationCoordinator) {
+    if let Ok(mut driven) = driven.lock() {
+        driven.insert(coord.peer_key_id().to_owned());
     }
 }
 
@@ -1250,11 +1529,12 @@ fn propagate_kick(
 async fn run_one_round(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,
+    seat: &mut RoundSeat<'_>,
 ) -> Result<DriveStep, RoundError> {
     // `drive_round_step(None)` opens the round (mints its id, creates its
     // inbox); `finish_round` closes it on every exit path (CIRISEdge#634).
     let first = coord.drive_round_step(None).await?;
-    let outcome = drive_exchange_to_completion(coord, round_timeout, first).await;
+    let outcome = drive_exchange_to_completion(coord, round_timeout, first, seat).await;
     finish_round(coord, &outcome).await;
     outcome
 }
@@ -1283,12 +1563,17 @@ async fn run_one_round(
 async fn run_one_recovery_round(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,
+    seat: &mut RoundSeat<'_>,
 ) -> Result<Option<DriveStep>, RoundError> {
     // CIRISEdge#634 — the Pull is a round-open too: mint the round FIRST so
     // the Pull is stamped with it and its Summary reply routes into this
     // round's inbox rather than the on-demand one.
     let round = coord.begin_round().await;
-    let signer = match coord.send_recovery_pull().await {
+    let bound = pacing_send_timeout(coord.pacing_gap());
+    let pulled = seat
+        .send(round_timeout, bound, coord.send_recovery_ask())
+        .await;
+    let signer = match pulled {
         Ok(Some(signer)) => signer,
         Ok(None) => {
             coord.end_round().await;
@@ -1296,7 +1581,7 @@ async fn run_one_recovery_round(
         }
         Err(e) => {
             coord.abandon_round().await;
-            return Err(RoundError::Coordinator(e));
+            return Err(e);
         }
     };
     tracing::debug!(
@@ -1306,9 +1591,13 @@ async fn run_one_recovery_round(
     );
     // `SendThenWait(∅)`: send nothing, wait. The Pull is already on the wire and
     // this node must NOT put a Summary beside it.
-    let outcome =
-        drive_exchange_to_completion(coord, round_timeout, DriveStep::SendThenWait(Vec::new()))
-            .await;
+    let outcome = drive_exchange_to_completion(
+        coord,
+        round_timeout,
+        DriveStep::SendThenWait(Vec::new()),
+        seat,
+    )
+    .await;
     finish_round(coord, &outcome).await;
     outcome.map(Some)
 }
@@ -1336,7 +1625,9 @@ async fn drive_exchange_to_completion(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,
     first_step: DriveStep,
+    seat: &mut RoundSeat<'_>,
 ) -> Result<DriveStep, RoundError> {
+    let bound = pacing_send_timeout(coord.pacing_gap());
     let mut step = first_step;
     loop {
         // CIRISEdge#380 — initiator-final: send the messages, then the round
@@ -1347,7 +1638,8 @@ async fn drive_exchange_to_completion(
         if let DriveStep::SendThenComplete(ref msgs, ref report) = step {
             let report = report.clone();
             for m in msgs {
-                coord.send_message(m).await?;
+                seat.send(round_timeout, bound, coord.send_message(m))
+                    .await?;
             }
             return Ok(DriveStep::Complete(report));
         }
@@ -1356,7 +1648,8 @@ async fn drive_exchange_to_completion(
             _ => return Ok(step),
         };
         for m in &msgs {
-            coord.send_message(m).await?;
+            seat.send(round_timeout, bound, coord.send_message(m))
+                .await?;
         }
         let next = match tokio::time::timeout(round_timeout, coord.recv_inbound()).await {
             Ok(Some(msg)) => msg,
@@ -1376,9 +1669,7 @@ mod tests {
     use crate::replication::summary::{
         ApplyOutcome, LocalState, StalenessSignal, StateApplier, StateProvider,
     };
-    use crate::transport::{
-        InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
-    };
+    use crate::transport::{InboundFrame, Transport, TransportId, TransportSendOutcome};
     use async_trait::async_trait;
     use std::collections::HashMap;
 
@@ -1766,7 +2057,9 @@ mod tests {
             applier,
         );
 
-        let outcome = run_one_round(&coord, Duration::from_millis(50)).await;
+        let gate = RoundGate::new(1);
+        let mut seat = RoundSeat::take(&gate, "peer", "kind").await;
+        let outcome = run_one_round(&coord, Duration::from_millis(50), &mut seat).await;
         assert!(matches!(outcome, Err(RoundError::Timeout)), "{outcome:?}");
         assert_eq!(coord.current_round(), 0, "the dead round's id is cleared");
         assert_eq!(coord.inbound_depth(), 0, "no inbox survives the round");
@@ -2215,7 +2508,7 @@ mod tests {
         use crate::replication::mesh_config::{MeshConfigReader, MeshConfigRelief};
         use ciris_persist::federation::FederationDirectory;
         let dir: Arc<dyn FederationDirectory> =
-            Arc::new(ciris_persist::store::MemoryBackend::new());
+            Arc::new(ciris_persist::store::test_backend::test_backend());
 
         let config = SchedulerConfig {
             cadence: Duration::from_millis(20),
@@ -2318,7 +2611,9 @@ mod tests {
         let (coord, mut rx) = recovery_coord("peer-1", Some("peer-1".to_string()));
 
         // Times out waiting for a reply nobody sends; the wire is what matters.
-        let _ = run_one_recovery_round(&coord, Duration::from_millis(50)).await;
+        let gate = RoundGate::new(1);
+        let mut place = RoundSeat::take(&gate, "peer", "kind").await;
+        let _ = run_one_recovery_round(&coord, Duration::from_millis(50), &mut place).await;
 
         let mut sent = Vec::new();
         while let Ok(bytes) = rx.try_recv() {
@@ -2352,7 +2647,9 @@ mod tests {
     async fn no_queued_signer_means_no_recovery_exchange() {
         let (coord, mut rx) = recovery_coord("peer-1", None);
 
-        let outcome = run_one_recovery_round(&coord, Duration::from_millis(50))
+        let gate = RoundGate::new(1);
+        let mut seat = RoundSeat::take(&gate, "peer", "kind").await;
+        let outcome = run_one_recovery_round(&coord, Duration::from_millis(50), &mut seat)
             .await
             .expect("no queued name is not an error");
         assert!(
@@ -2395,6 +2692,239 @@ mod tests {
             "a non-Key coordinator must not recover"
         );
         assert!(rx.try_recv().is_err(), "and must send nothing");
+    }
+
+    /// A transport whose every send fails as a refused dial fails in the field
+    /// (`a_refused_dial_comes_back_off_the_beat` read this error off real
+    /// links), or succeeds to a peer that never answers.
+    struct DialLog {
+        refused: std::sync::atomic::AtomicBool,
+        at: std::sync::Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    #[async_trait]
+    impl Transport for DialLog {
+        fn id(&self) -> TransportId {
+            TransportId::HTTP
+        }
+        async fn send(
+            &self,
+            _destination_key_id: &str,
+            _envelope_bytes: &[u8],
+        ) -> Result<TransportSendOutcome, TransportError> {
+            self.at.lock().unwrap().push(tokio::time::Instant::now());
+            if self.refused.load(Ordering::SeqCst) {
+                return Err(TransportError::Io(
+                    "reticulum resource send: resource transfer failed: LinkClosed".to_owned(),
+                ));
+            }
+            Ok(TransportSendOutcome::Delivered)
+        }
+        async fn listen(
+            &self,
+            _sink: tokio::sync::mpsc::Sender<InboundFrame>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// Sends to `dead` never return; every other send lands, to a peer that
+    /// does not answer.
+    struct ParkedPeer {
+        dead: String,
+        live_sends: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Transport for ParkedPeer {
+        fn id(&self) -> TransportId {
+            TransportId::HTTP
+        }
+        async fn send(
+            &self,
+            destination_key_id: &str,
+            _envelope_bytes: &[u8],
+        ) -> Result<TransportSendOutcome, TransportError> {
+            if destination_key_id == self.dead {
+                std::future::pending::<()>().await;
+            }
+            self.live_sends.fetch_add(1, Ordering::SeqCst);
+            Ok(TransportSendOutcome::Delivered)
+        }
+        async fn listen(
+            &self,
+            _sink: tokio::sync::mpsc::Sender<InboundFrame>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// A send that never returns gives its permit back after a round's budget
+    /// and ends at its own bound, so the gate is never held for it and the
+    /// coordinator is never parked for good.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_send_gives_back_its_permit_and_ends_at_its_bound() {
+        let transport = Arc::new(ParkedPeer {
+            dead: "dead".to_owned(),
+            live_sends: AtomicUsize::new(0),
+        });
+        let coord = |peer: &str| {
+            Arc::new(ReplicationCoordinator::new(
+                Arc::clone(&transport) as Arc<dyn Transport>,
+                peer,
+                EnvelopeKind::Key,
+                SessionRole::Initiator,
+                Arc::new(StaticProvider {
+                    state: LocalState::new(),
+                    envelopes: HashMap::new(),
+                }),
+                RecordingApplier::with(HashMap::new(), std::collections::HashSet::new()),
+            ))
+        };
+        let mut sched = ReplicationScheduler::new(SchedulerConfig {
+            cadence: Duration::from_secs(30),
+            round_timeout: Duration::from_secs(1),
+            max_concurrent_rounds: 1,
+        });
+        sched.add_initiator(coord("dead"));
+        sched.add_initiator(coord("live"));
+        let (cancel, cancel_rx) = watch::channel(false);
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(64);
+        let run =
+            tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
+        tokio::time::sleep(Duration::from_secs(175)).await;
+        assert!(
+            transport.live_sends.load(Ordering::SeqCst) >= 5,
+            "the live peer keeps its rounds past the parked send"
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut dead_ended = false;
+        while let Ok((peer, event)) = events.try_recv() {
+            if peer == "dead" {
+                assert!(matches!(event, RoundEvent::TimedOut), "{event:?}");
+                dead_ended = true;
+            }
+        }
+        assert!(dead_ended, "the parked send ended at its bound");
+        let _ = cancel.send(true);
+        let _ = run.await;
+    }
+
+    #[test]
+    fn a_send_on_a_shaped_link_is_bounded_by_its_gaps() {
+        assert_eq!(pacing_send_timeout(None), ROUND_SEND_TIMEOUT);
+        assert_eq!(
+            pacing_send_timeout(Some(Duration::from_secs(1))),
+            ROUND_SEND_TIMEOUT
+        );
+        let cellular = Duration::from_secs(47);
+        assert!(pacing_send_timeout(Some(cellular)) > cellular.mul_f64(16.0));
+    }
+
+    const REDIAL_CADENCE: Duration = Duration::from_secs(30);
+
+    /// One coordinator on a paused clock, with its log and a handle to kick it.
+    fn dial_log_scheduler(
+        refused: bool,
+    ) -> (
+        Arc<DialLog>,
+        SchedulerHandle,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let log = Arc::new(DialLog {
+            refused: std::sync::atomic::AtomicBool::new(refused),
+            at: std::sync::Mutex::default(),
+        });
+        let coord = Arc::new(ReplicationCoordinator::new(
+            Arc::clone(&log) as Arc<dyn Transport>,
+            "bob",
+            EnvelopeKind::Key,
+            SessionRole::Initiator,
+            Arc::new(StaticProvider {
+                state: LocalState::new(),
+                envelopes: HashMap::new(),
+            }),
+            RecordingApplier::with(HashMap::new(), std::collections::HashSet::new()),
+        ));
+        let mut sched = ReplicationScheduler::new(SchedulerConfig {
+            cadence: REDIAL_CADENCE,
+            round_timeout: Duration::from_secs(1),
+            ..SchedulerConfig::default()
+        });
+        sched.add_initiator(coord);
+        let handle = sched.install_control_channel();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let run = tokio::spawn(async move { sched.run_until_cancelled(cancel_rx).await });
+        (log, handle, cancel_tx, run)
+    }
+
+    fn gaps_secs(log: &DialLog) -> Vec<f64> {
+        log.at
+            .lock()
+            .unwrap()
+            .windows(2)
+            .map(|w| w[1].duration_since(w[0]).as_secs_f64())
+            .collect()
+    }
+
+    /// CC 5.4.6 — every dial after a refused one is drawn from 0.5 to 1.5
+    /// cadences, each on its own draw: a fleet refused at one moment spreads.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_dial_draws_its_next_dial_from_half_to_one_and_a_half_cadences() {
+        let (log, _handle, cancel, run) = dial_log_scheduler(true);
+        tokio::time::sleep(REDIAL_CADENCE * 40).await;
+        let gaps = gaps_secs(&log);
+        assert!(gaps.len() >= 20, "it keeps dialling: {gaps:.1?}");
+        assert!(
+            gaps.iter().all(|g| (15.0..=45.01).contains(g)),
+            "every re-dial in the draw: {gaps:.1?}"
+        );
+        let (lo, hi) = gaps
+            .iter()
+            .fold((f64::MAX, 0.0_f64), |(l, h), g| (l.min(*g), h.max(*g)));
+        assert!(hi - lo > 15.0, "fresh draws, not one offset: {gaps:.1?}");
+        let _ = cancel.send(true);
+        let _ = run.await;
+    }
+
+    /// The healthy tick stays: a send that left and a peer that stays silent is
+    /// a timed-out round, not a refused dial, and the beat does not move.
+    #[tokio::test(start_paused = true)]
+    async fn a_round_whose_send_left_keeps_the_tick() {
+        let (log, _handle, cancel, run) = dial_log_scheduler(false);
+        tokio::time::sleep(REDIAL_CADENCE * 8).await;
+        let gaps = gaps_secs(&log);
+        assert!(gaps.len() >= 6, "{gaps:.1?}");
+        assert!(
+            gaps.iter().all(|g| (*g - 30.0).abs() < 0.01),
+            "the tick is untouched: {gaps:.1?}"
+        );
+        let _ = cancel.send(true);
+        let _ = run.await;
+    }
+
+    /// A kick does not beat the draw: on a restart every coordinator is kicked
+    /// at once, and a kick that dialled would put a refused fleet back on one
+    /// beat. The drawn tick runs the round the kick wanted.
+    #[tokio::test(start_paused = true)]
+    async fn a_kick_does_not_beat_a_drawn_redial() {
+        let (log, handle, cancel, run) = dial_log_scheduler(true);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(log.at.lock().unwrap().len(), 1, "the first tick dialled");
+        for _ in 0..10 {
+            handle.round_now(None).await.expect("kick");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            log.at.lock().unwrap().len(),
+            1,
+            "inside the draw's floor no kick dials"
+        );
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert!(log.at.lock().unwrap().len() >= 2, "the draw still fires");
+        let _ = cancel.send(true);
+        let _ = run.await;
     }
 }
 

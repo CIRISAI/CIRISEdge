@@ -275,6 +275,11 @@ fn build_community(
     founded_at: chrono::DateTime<chrono::Utc>,
 ) -> ciris_persist::federation::types::Community {
     use ciris_persist::federation::types::{Community, CommunityMember};
+    // persist v61 (CC 2.6.2 strict) — the record's instants are signed `.sssZ`,
+    // which carries no sub-millisecond part: truncate once here so the signed
+    // bytes and the stored columns name the same millisecond.
+    let founded_at =
+        ciris_persist::federation::admission::truncate_to_substrate_resolution(founded_at);
     Community {
         community_key_id: community_key_id.to_owned(),
         community_name: community_name.to_owned(),
@@ -305,15 +310,20 @@ fn build_community(
 /// # What is refused, and why it is refused HERE
 ///
 /// CC 4.5.4 / §11.11: no unmoderated federated space. Persist refuses to
-/// federate any content keyed on a community with no live named moderator,
-/// and a named moderator exists iff the community's authority set has a
-/// steward-bound root. The authority set is every `founder`, plus — under
-/// any protocol but `founder_only` — every member. So a roster with no
-/// `founder` under `founder_only` is a room whose messages persist will
-/// admit locally and never carry, and the failure surfaces as silence at the
-/// far end. This builder refuses that roster, and an empty or duplicated
-/// one, at construction — where the caller still holds the roster — rather
-/// than at some reader's screen.
+/// federate any content keyed on a community nobody could appoint a moderator
+/// for: a roster with no steward-bound signer. The signers are every
+/// `founder`, plus — under any protocol but `founder_only` and
+/// `open:self_admit` — every member. So a roster with no `founder` under
+/// `founder_only` is a room whose messages persist will admit locally and
+/// never carry, and the failure surfaces as silence at the far end.
+///
+/// Under any other protocol that roster federates and is still unmoderated.
+/// Since persist v61.0.2 (#1195) `moderate`, `takedown` and `review` are held
+/// only by active steward-bound founders and the keys they delegate to, at
+/// every protocol, so a room with no founder has no moderator and no way to
+/// appoint one. This builder refuses that roster too, and an empty or
+/// duplicated one, at construction — where the caller still holds the roster
+/// — rather than at some reader's screen.
 ///
 /// Whether the founder is steward-bound (a `user`-role identity, an
 /// occurrence of one, or delegated from one) is a directory fact the caller
@@ -348,8 +358,8 @@ pub fn community(
     {
         return Err(format!(
             "room {community_key_id}: no member is tagged `{MEMBER_ROLE_FOUNDER}` — a room \
-             with no founder has no authority root, so it has no named moderator and \
-             persist will refuse to federate anything keyed on it (CC 4.5.4)"
+             with no founder has no named moderator and no way to appoint one, and under \
+             `founder_only` persist will refuse to federate anything keyed on it (CC 4.5.4)"
         ));
     }
     Ok(build_community(

@@ -61,6 +61,9 @@ pub mod contact;
 pub mod content_occurrence;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
+/// v44 (CIRISConstitution#198 §5) — which decision-relevant rows landed, as
+/// an event and a rebuildable cursor; the queue itself is the host's.
+pub mod decision_rows;
 pub mod delivery_mode;
 pub mod detector;
 /// CIRISEdge#683 — first contact on the opaque plane (`FSD/FIRST_CONTACT.md` §2.2).
@@ -68,10 +71,15 @@ pub mod first_contact;
 pub mod group_content;
 /// CIRISEdge#554 — the receiver-side budget on unsolicited contact requests.
 pub mod invite_gate;
+/// CC 5.4.6 — the Anonymous Tier's packet codec (FSD/ONION_ROUTING.md).
+pub mod onion;
 pub mod rate_limit;
 #[cfg(test)]
 mod role_matrix_gauntlet;
 pub mod runtime_budget;
+/// v44 — the operator's telemetry: the catalogue, lock-free histograms and
+/// gauges, and shaping's windowed ledger (`docs/TELEMETRY_CATALOGUE.md`).
+pub mod telemetry;
 // v6.1.0 (CIRISEdge#175, FSD §3.3) — announce-suppression policy
 // + edge-side registry mirroring the recommended Leviculum
 // `AnnounceControl` extension shape.
@@ -102,6 +110,7 @@ pub mod handler;
 pub mod holonomic;
 pub mod identity;
 pub mod key_boundary;
+pub mod load_ladder;
 pub mod log_throttle;
 pub mod manifest;
 /// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — nobody joins a
@@ -109,6 +118,7 @@ pub mod manifest;
 /// widening, as producers and host calls.
 pub mod membership;
 pub mod messages;
+pub mod peer_obligation;
 // v6.0.0 (CIRISEdge#175, FSD §3.3 / §3.5 / §6) — substrate-tier MLS
 // state for scope-native privacy. Distinct from
 // `transport::realtime_av_mls` (per-stream AV MLS).
@@ -394,19 +404,18 @@ pub use key_boundary::{
     KeyBoundaryParseError, KeyBoundaryScope, KEY_BOUNDARY_PREFIX, KEY_BOUNDARY_SUFFIX,
     LEGACY_NO_SEED_IN_HEAP,
 };
+pub use load_ladder::{LoadPressure, ServiceTier};
 pub use messages::{
     is_federation_attestation_emitting_type, AccordCarrier, AccordSignature, AnnouncementKind,
     AnnouncementPriority, AttestationGossip, AttestationRef, AuthorityClass,
     BuildManifestPublication, BuildManifestPublicationResponse, ContentBody, ContentFetch,
     ContentMiss, DSARRequest, DSARResponse, DeliveryAttestation, DeliveryAttestationError,
-    DeliveryRefusalAttestation, EdgeEnvelope, FederationAnnouncement, GoalDeclaration,
-    GoalDeclarationResponse, GoalRetirement, GoalRetirementResponse, HintShape, Introductions,
+    DeliveryRefusalAttestation, EdgeEnvelope, FederationAnnouncement, HintShape, Introductions,
     MessageType, MissReason, OpaqueEvent, OpaqueRequest, OpaqueResponse, PublicKeyRegistration,
     PublicKeyRegistrationResponse, RefusalReason, SchemaVersion, StewardDirective,
     TestimonialWitness, TransportMedium, WithdrawalReason, Withdraws, ACCORD_THRESHOLD_M_OF_N,
     DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
     DELIVERY_REFUSAL_ATTESTATION_DOMAIN, FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN,
-    GOAL_DECLARATION_DOMAIN, GOAL_RETIREMENT_DOMAIN,
 };
 pub use mls::{
     unwrap_welcome, wrap_welcome, ArchiveMode, ArchiveModeError, FederationDirectoryEntry,
@@ -472,6 +481,10 @@ pub use ffi::uniffi_types::{
     EdgeTransportHandle, EdgeTransportHealth, EdgeTransportInfo, EdgeTransportSpec,
     EdgeTransportStats, EdgeTunnelInfo,
 };
+#[cfg(feature = "ffi-uniffi")]
+pub use ffi::uniffi_types::{
+    EdgeDeviceState, EdgeOnionStatus, EdgeShapingClassInfo, EdgeShapingStatus,
+};
 
 // UDL function bodies live in `ffi::uniffi_impl` — re-exported here
 // under their UDL names. The scaffolding's marshalling shells look up
@@ -510,6 +523,10 @@ pub use ffi::uniffi_impl_routing::{
     routing_path_drop_via, routing_path_request, routing_path_table, routing_path_to,
     routing_rate_table, routing_reverse_table, routing_transport_id, routing_transport_uptime,
     routing_tunnels,
+};
+#[cfg(feature = "ffi-uniffi")]
+pub use ffi::uniffi_impl_shaping::{
+    onion_set_enabled, onion_status, shaping_class_table, shaping_set_device_state, shaping_status,
 };
 
 // The included scaffolding emits ~30 `#[unsafe(no_mangle)]` FFI shim

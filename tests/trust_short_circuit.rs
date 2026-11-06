@@ -205,8 +205,8 @@ async fn build_edge(
 
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&local, &steward, "agent"),
-        signed_record(&remote, &steward, "agent"),
+        signed_record(&local, &steward, "node"),
+        signed_record(&remote, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -244,8 +244,8 @@ async fn build_edge_without_scorer(
 
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&local, &steward, "agent"),
-        signed_record(&remote, &steward, "agent"),
+        signed_record(&local, &steward, "node"),
+        signed_record(&remote, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();
@@ -729,8 +729,8 @@ async fn a_split_home_accepts_envelopes_addressed_to_its_advertised_node() {
     let remote = FedKey::new("remote-peer", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&local, &steward, "agent"),
-        signed_record(&remote, &steward, "agent"),
+        signed_record(&local, &steward, "node"),
+        signed_record(&remote, &steward, "node"),
     ])
     .await;
     let edge = Edge::builder()

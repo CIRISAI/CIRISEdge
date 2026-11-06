@@ -62,7 +62,7 @@ async fn av42_spoofed_key_id_fails_root_binding_pubkey_mismatch() {
     // way it cannot impersonate the victim row).
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&victim, &steward, "agent"),
+        signed_record(&victim, &steward, "node"),
     ])
     .await;
     let rooting: std::sync::Arc<dyn RootingDirectory> = directory;

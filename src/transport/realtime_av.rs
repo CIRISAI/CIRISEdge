@@ -100,7 +100,7 @@ use crate::transport::TransportId;
 /// Per-stream identity — 32 bytes, derived by callers as `sha256(stream_meta)`.
 /// The exact derivation lives upstream (lens / agent UX); this module treats
 /// it as an opaque key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId(pub [u8; 32]);
 
 /// THE spelling of a stream's id as a string: `av-` + the lowercase hex of its
@@ -190,10 +190,11 @@ pub const CODEC_MDC: u8 = 0x03;
 
 /// Codec-opaque — v3.7.0 wire compatibility marker. A chunk with
 /// `codec_id == CODEC_OPAQUE` carries no scalable-coding semantics; its
-/// `layer` MUST be `ChunkLayer { 0, 0, 0 }` and receivers MUST admit it
-/// unconditionally regardless of their `ReceiverLayerPolicy`. This is
-/// the value the read-side stamps when parsing a pre-#128 wire that
-/// lacks the trailing 4-byte block.
+/// `layer` MUST be `ChunkLayer { 0, 0, 0 }` (CC 5.3.3.2.1), which
+/// [`seal_av_inner`] enforces. Every `ReceiverLayerPolicy` admits the base
+/// cell, so no receiver filters a conformant opaque chunk and no special case
+/// is needed for one. This is the value the read-side stamps when parsing a
+/// pre-#128 wire that lacks the trailing 4-byte block.
 pub const CODEC_OPAQUE: u8 = 0xFF;
 
 /// SVC layer descriptor — three monotonic axes addressing the
@@ -273,11 +274,10 @@ impl ReceiverLayerPolicy {
     /// Return `true` iff `layer` is within this receiver's per-axis
     /// caps.
     ///
-    /// Semantics — `admits` is purely the per-axis layer test. A chunk
-    /// tagged with [`CODEC_OPAQUE`] carries no scalable-coding
-    /// semantics and MUST be admitted by the caller unconditionally
-    /// regardless of policy; the fan-out filter (Layer 2 task T5)
-    /// handles that short-circuit before consulting `admits`.
+    /// Semantics — `admits` is purely the per-axis layer test, for every
+    /// codec. A [`CODEC_OPAQUE`] chunk is `{ 0, 0, 0 }` (CC 5.3.3.2.1), the
+    /// cell every policy admits, so it needs no short-circuit; one tagged
+    /// otherwise is not conformant and is filtered like any other.
     #[must_use]
     pub fn admits(self, layer: ChunkLayer) -> bool {
         layer.spatial <= self.max_spatial
@@ -440,6 +440,9 @@ impl SealedAvChunk {
 pub enum RealtimeAvError {
     #[error("inner AEAD failed: {0:?}")]
     InnerAead(ciris_crypto::CryptoError),
+    /// CC 5.3.3.2.1 — an opaque chunk has no layers.
+    #[error("CODEC_OPAQUE requires layer {{0,0,0}}, got {0:?}")]
+    OpaqueWithLayer(ChunkLayer),
     #[error("outer AEAD failed: {0:?}")]
     OuterAead(ciris_crypto::CryptoError),
     #[error("sealed wire too short: got {got} bytes, need at least {need}")]
@@ -477,7 +480,7 @@ fn epoch_counter(chunk_seq: ChunkSeq) -> Result<u32, RealtimeAvError> {
 ///
 /// §19 re-export debt (CIRISEdge#359 F-4): the SHA-256 construction is
 /// the §10.5.8 A/V nonce shape owned by
-/// [`ciris_verify_core::holonomic::av_chunk::inner_nonce`] (KAT-locked
+/// [`ciris_verify_core::substrate::av_chunk::inner_nonce`] (KAT-locked
 /// there). This edge-newtyped wrapper delegates to it byte-for-byte —
 /// `StreamId`/`Epoch`/`ChunkSeq` are edge-only newtypes so a plain
 /// re-export is not type-compatible.
@@ -489,7 +492,7 @@ fn epoch_counter(chunk_seq: ChunkSeq) -> Result<u32, RealtimeAvError> {
 /// this keeps the v19 construction byte-for-byte until then.
 #[allow(deprecated)]
 pub fn derive_inner_nonce(stream_id: StreamId, epoch: Epoch, chunk_seq: ChunkSeq) -> [u8; 12] {
-    ciris_verify_core::holonomic::av_chunk::inner_nonce(&stream_id.0, epoch.0, chunk_seq.0)
+    ciris_verify_core::substrate::av_chunk::inner_nonce(&stream_id.0, epoch.0, chunk_seq.0)
 }
 
 /// Derive the outer-AEAD nonce per Link from `(link_id, link_seq)`.
@@ -499,9 +502,9 @@ pub fn derive_inner_nonce(stream_id: StreamId, epoch: Epoch, chunk_seq: ChunkSeq
 ///
 /// §19 re-export debt (CIRISEdge#359 F-4): delegates to the shared
 /// §10.5.8 nonce owner
-/// [`ciris_verify_core::holonomic::av_chunk::outer_nonce`] byte-for-byte.
+/// [`ciris_verify_core::substrate::av_chunk::outer_nonce`] byte-for-byte.
 pub fn derive_outer_nonce(link_id: &[u8], link_seq: u64) -> [u8; 12] {
-    ciris_verify_core::holonomic::av_chunk::outer_nonce(link_id, link_seq)
+    ciris_verify_core::substrate::av_chunk::outer_nonce(link_id, link_seq)
 }
 
 /// The inner-sealed half of a chunk — E2E ciphertext shared across the
@@ -593,6 +596,10 @@ pub fn seal_av_inner(
     codec_id: u8,
     layer: ChunkLayer,
 ) -> Result<InnerSealed, RealtimeAvError> {
+    // CC 5.3.3.2.1: `0xFF` has no layers.
+    if codec_id == CODEC_OPAQUE && layer != ChunkLayer::BASE {
+        return Err(RealtimeAvError::OpaqueWithLayer(layer));
+    }
     epoch_counter(chunk_seq)?;
     let inner_nonce = derive_inner_nonce(stream_id, epoch, chunk_seq);
     let inner_ciphertext = aes_gcm::encrypt(epoch_dek.as_bytes(), &inner_nonce, plaintext)
@@ -1045,6 +1052,34 @@ mod tests {
 
     fn dummy_dek() -> EpochDek {
         EpochDek::from_bytes([3u8; 32])
+    }
+
+    /// CC 5.3.3.2.1: `0xFF` is `{ 0, 0, 0 }`, refused by name otherwise, and a
+    /// layered codec keeps its layers.
+    #[test]
+    fn an_opaque_chunk_with_a_layer_is_refused_at_the_seal() {
+        let enhanced = ChunkLayer {
+            spatial: 1,
+            temporal: 0,
+            quality: 0,
+        };
+        let seal = |codec, layer| {
+            seal_av_inner(
+                b"frame",
+                &dummy_dek(),
+                dummy_stream(),
+                Epoch(1),
+                ChunkSeq(1),
+                codec,
+                layer,
+            )
+        };
+        assert!(matches!(
+            seal(CODEC_OPAQUE, enhanced),
+            Err(RealtimeAvError::OpaqueWithLayer(_))
+        ));
+        assert!(seal(CODEC_OPAQUE, ChunkLayer::BASE).is_ok());
+        assert!(seal(CODEC_AV1_SVC, enhanced).is_ok());
     }
 
     fn dummy_transit() -> [u8; 32] {

@@ -614,6 +614,80 @@ public func FfiConverterTypeEdgeBlackholeEntry_lower(_ value: EdgeBlackholeEntry
 }
 
 
+public struct EdgeDeviceState: Equatable, Hashable {
+    public var deviceKind: String
+    public var unmetered: Bool
+    public var charging: Bool
+    public var shapingOptIn: Bool
+    public var shapingOptInCellular: Bool
+    public var clientOnly: Bool
+    public var relayOverride: Bool?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(deviceKind: String, unmetered: Bool, charging: Bool, shapingOptIn: Bool, shapingOptInCellular: Bool, clientOnly: Bool, relayOverride: Bool?) {
+        self.deviceKind = deviceKind
+        self.unmetered = unmetered
+        self.charging = charging
+        self.shapingOptIn = shapingOptIn
+        self.shapingOptInCellular = shapingOptInCellular
+        self.clientOnly = clientOnly
+        self.relayOverride = relayOverride
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeDeviceState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeDeviceState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeDeviceState {
+        return
+            try EdgeDeviceState(
+                deviceKind: FfiConverterString.read(from: &buf), 
+                unmetered: FfiConverterBool.read(from: &buf), 
+                charging: FfiConverterBool.read(from: &buf), 
+                shapingOptIn: FfiConverterBool.read(from: &buf), 
+                shapingOptInCellular: FfiConverterBool.read(from: &buf), 
+                clientOnly: FfiConverterBool.read(from: &buf), 
+                relayOverride: FfiConverterOptionBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeDeviceState, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.deviceKind, into: &buf)
+        FfiConverterBool.write(value.unmetered, into: &buf)
+        FfiConverterBool.write(value.charging, into: &buf)
+        FfiConverterBool.write(value.shapingOptIn, into: &buf)
+        FfiConverterBool.write(value.shapingOptInCellular, into: &buf)
+        FfiConverterBool.write(value.clientOnly, into: &buf)
+        FfiConverterOptionBool.write(value.relayOverride, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeDeviceState_lift(_ buf: RustBuffer) throws -> EdgeDeviceState {
+    return try FfiConverterTypeEdgeDeviceState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeDeviceState_lower(_ value: EdgeDeviceState) -> RustBuffer {
+    return FfiConverterTypeEdgeDeviceState.lower(value)
+}
+
+
 public struct EdgeErrorEvent: Equatable, Hashable {
     public var at: String
     public var className: String
@@ -999,6 +1073,92 @@ public func FfiConverterTypeEdgeNetworkEvent_lift(_ buf: RustBuffer) throws -> E
 #endif
 public func FfiConverterTypeEdgeNetworkEvent_lower(_ value: EdgeNetworkEvent) -> RustBuffer {
     return FfiConverterTypeEdgeNetworkEvent.lower(value)
+}
+
+
+public struct EdgeOnionStatus: Equatable, Hashable {
+    public var enabled: Bool
+    public var active: Bool
+    public var reason: String?
+    public var dealt: [UInt32]
+    public var answering: [UInt32]
+    public var relaying: Bool
+    public var relayReason: String?
+    public var smallSet: Bool
+    public var hopKeySource: String
+    public var confinesMedia: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(enabled: Bool, active: Bool, reason: String?, dealt: [UInt32], answering: [UInt32], relaying: Bool, relayReason: String?, smallSet: Bool, hopKeySource: String, confinesMedia: Bool) {
+        self.enabled = enabled
+        self.active = active
+        self.reason = reason
+        self.dealt = dealt
+        self.answering = answering
+        self.relaying = relaying
+        self.relayReason = relayReason
+        self.smallSet = smallSet
+        self.hopKeySource = hopKeySource
+        self.confinesMedia = confinesMedia
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeOnionStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeOnionStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeOnionStatus {
+        return
+            try EdgeOnionStatus(
+                enabled: FfiConverterBool.read(from: &buf), 
+                active: FfiConverterBool.read(from: &buf), 
+                reason: FfiConverterOptionString.read(from: &buf), 
+                dealt: FfiConverterSequenceUInt32.read(from: &buf), 
+                answering: FfiConverterSequenceUInt32.read(from: &buf), 
+                relaying: FfiConverterBool.read(from: &buf), 
+                relayReason: FfiConverterOptionString.read(from: &buf), 
+                smallSet: FfiConverterBool.read(from: &buf), 
+                hopKeySource: FfiConverterString.read(from: &buf), 
+                confinesMedia: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeOnionStatus, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.enabled, into: &buf)
+        FfiConverterBool.write(value.active, into: &buf)
+        FfiConverterOptionString.write(value.reason, into: &buf)
+        FfiConverterSequenceUInt32.write(value.dealt, into: &buf)
+        FfiConverterSequenceUInt32.write(value.answering, into: &buf)
+        FfiConverterBool.write(value.relaying, into: &buf)
+        FfiConverterOptionString.write(value.relayReason, into: &buf)
+        FfiConverterBool.write(value.smallSet, into: &buf)
+        FfiConverterString.write(value.hopKeySource, into: &buf)
+        FfiConverterBool.write(value.confinesMedia, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeOnionStatus_lift(_ buf: RustBuffer) throws -> EdgeOnionStatus {
+    return try FfiConverterTypeEdgeOnionStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeOnionStatus_lower(_ value: EdgeOnionStatus) -> RustBuffer {
+    return FfiConverterTypeEdgeOnionStatus.lower(value)
 }
 
 
@@ -1655,6 +1815,142 @@ public func FfiConverterTypeEdgeRoutingPathEntry_lift(_ buf: RustBuffer) throws 
 #endif
 public func FfiConverterTypeEdgeRoutingPathEntry_lower(_ value: EdgeRoutingPathEntry) -> RustBuffer {
     return FfiConverterTypeEdgeRoutingPathEntry.lower(value)
+}
+
+
+public struct EdgeShapingClassInfo: Equatable, Hashable {
+    public var budgetClass: String
+    public var onByDefault: Bool
+    public var bytesPerS: UInt32
+    public var gbMonthPerLinkEachWay: Double
+    public var gbMonthAtCapEachWay: Double
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(budgetClass: String, onByDefault: Bool, bytesPerS: UInt32, gbMonthPerLinkEachWay: Double, gbMonthAtCapEachWay: Double) {
+        self.budgetClass = budgetClass
+        self.onByDefault = onByDefault
+        self.bytesPerS = bytesPerS
+        self.gbMonthPerLinkEachWay = gbMonthPerLinkEachWay
+        self.gbMonthAtCapEachWay = gbMonthAtCapEachWay
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeShapingClassInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeShapingClassInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeShapingClassInfo {
+        return
+            try EdgeShapingClassInfo(
+                budgetClass: FfiConverterString.read(from: &buf), 
+                onByDefault: FfiConverterBool.read(from: &buf), 
+                bytesPerS: FfiConverterUInt32.read(from: &buf), 
+                gbMonthPerLinkEachWay: FfiConverterDouble.read(from: &buf), 
+                gbMonthAtCapEachWay: FfiConverterDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeShapingClassInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.budgetClass, into: &buf)
+        FfiConverterBool.write(value.onByDefault, into: &buf)
+        FfiConverterUInt32.write(value.bytesPerS, into: &buf)
+        FfiConverterDouble.write(value.gbMonthPerLinkEachWay, into: &buf)
+        FfiConverterDouble.write(value.gbMonthAtCapEachWay, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeShapingClassInfo_lift(_ buf: RustBuffer) throws -> EdgeShapingClassInfo {
+    return try FfiConverterTypeEdgeShapingClassInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeShapingClassInfo_lower(_ value: EdgeShapingClassInfo) -> RustBuffer {
+    return FfiConverterTypeEdgeShapingClassInfo.lower(value)
+}
+
+
+public struct EdgeShapingStatus: Equatable, Hashable {
+    public var budgetClass: String
+    public var allLinks: Bool
+    public var bytesPerS: UInt32
+    public var nodeCapBytesPerS: UInt32
+    public var shapedLinks: UInt32
+    public var layerReserveLinks: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(budgetClass: String, allLinks: Bool, bytesPerS: UInt32, nodeCapBytesPerS: UInt32, shapedLinks: UInt32, layerReserveLinks: UInt32) {
+        self.budgetClass = budgetClass
+        self.allLinks = allLinks
+        self.bytesPerS = bytesPerS
+        self.nodeCapBytesPerS = nodeCapBytesPerS
+        self.shapedLinks = shapedLinks
+        self.layerReserveLinks = layerReserveLinks
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeShapingStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeShapingStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeShapingStatus {
+        return
+            try EdgeShapingStatus(
+                budgetClass: FfiConverterString.read(from: &buf), 
+                allLinks: FfiConverterBool.read(from: &buf), 
+                bytesPerS: FfiConverterUInt32.read(from: &buf), 
+                nodeCapBytesPerS: FfiConverterUInt32.read(from: &buf), 
+                shapedLinks: FfiConverterUInt32.read(from: &buf), 
+                layerReserveLinks: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeShapingStatus, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.budgetClass, into: &buf)
+        FfiConverterBool.write(value.allLinks, into: &buf)
+        FfiConverterUInt32.write(value.bytesPerS, into: &buf)
+        FfiConverterUInt32.write(value.nodeCapBytesPerS, into: &buf)
+        FfiConverterUInt32.write(value.shapedLinks, into: &buf)
+        FfiConverterUInt32.write(value.layerReserveLinks, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeShapingStatus_lift(_ buf: RustBuffer) throws -> EdgeShapingStatus {
+    return try FfiConverterTypeEdgeShapingStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeShapingStatus_lower(_ value: EdgeShapingStatus) -> RustBuffer {
+    return FfiConverterTypeEdgeShapingStatus.lower(value)
 }
 
 
@@ -2705,6 +3001,31 @@ fileprivate struct FfiConverterOptionTypeEdgePeerTrust: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt32]
+
+    public static func write(_ value: [UInt32], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterUInt32.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt32]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterUInt32.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -3005,6 +3326,31 @@ fileprivate struct FfiConverterSequenceTypeEdgeRoutingPathEntry: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeEdgeShapingClassInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [EdgeShapingClassInfo]
+
+    public static func write(_ value: [EdgeShapingClassInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeEdgeShapingClassInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [EdgeShapingClassInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [EdgeShapingClassInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeEdgeShapingClassInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeEdgeTransportInfo: FfiConverterRustBuffer {
     typealias SwiftType = [EdgeTransportInfo]
 
@@ -3198,6 +3544,18 @@ public func linkTeardown(linkId: Data)throws   {try rustCallWithError(FfiConvert
 public func metricsSnapshot()throws  -> EdgeMetricsSnapshot  {
     return try  FfiConverterTypeEdgeMetricsSnapshot_lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
     uniffi_ciris_edge_fn_func_metrics_snapshot($0
+    )
+})
+}
+public func onionSetEnabled(enabled: Bool)throws   {try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_onion_set_enabled(
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+public func onionStatus()throws  -> EdgeOnionStatus  {
+    return try  FfiConverterTypeEdgeOnionStatus_lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_onion_status($0
     )
 })
 }
@@ -3396,6 +3754,25 @@ public func routingTunnels()throws  -> [EdgeTunnelInfo]  {
     )
 })
 }
+public func shapingClassTable() -> [EdgeShapingClassInfo]  {
+    return try!  FfiConverterSequenceTypeEdgeShapingClassInfo.lift(try! rustCall() {
+    uniffi_ciris_edge_fn_func_shaping_class_table($0
+    )
+})
+}
+public func shapingSetDeviceState(state: EdgeDeviceState)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_shaping_set_device_state(
+        FfiConverterTypeEdgeDeviceState_lower(state),$0
+    )
+})
+}
+public func shapingStatus()throws  -> EdgeShapingStatus  {
+    return try  FfiConverterTypeEdgeShapingStatus_lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_shaping_status($0
+    )
+})
+}
 public func transportAdd(spec: EdgeTransportSpec)throws  -> EdgeTransportHandle  {
     return try  FfiConverterTypeEdgeTransportHandle_lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
     uniffi_ciris_edge_fn_func_transport_add(
@@ -3505,6 +3882,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ciris_edge_checksum_func_metrics_snapshot() != 47202) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_ciris_edge_checksum_func_onion_set_enabled() != 16650) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_onion_status() != 32810) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ciris_edge_checksum_func_path_table() != 4368) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3590,6 +3973,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_routing_tunnels() != 56409) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_shaping_class_table() != 15177) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_shaping_set_device_state() != 22932) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_shaping_status() != 58105) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_transport_add() != 59654) {

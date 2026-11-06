@@ -23,18 +23,89 @@
 //! broadcast then goes out on that interface too, and the A/V leg is a direct
 //! link from birth. The derived address is still never announced or pathed.
 //!
-//! # Why a configured facilitator means "propose", with no second switch
+//! # Proposing is ON by default (v44), with the bundle's canonical as facilitator
 //!
 //! CC 5.4.6 (CIRISConstitution#132): "Where the endpoints can bring the link
 //! direct ... the link MUST be brought direct and the forwarder drops out."
-//! A node with no facilitator CANNOT bring a NAT'd link direct, so the default
-//! ([`DirectLinksConfig::default`]: no facilitator) is conformant. Once an
-//! operator configures one, preferring the direct path is the CC's rule, not a
-//! preference; there is no "prefer direct" boolean to set wrong.
+//! Bringing a NAT'd link direct needs a facilitator (a reflector that tells
+//! this node its public address). [`DirectLinksConfig::default`] has
+//! [`Proposing::On`] and no facilitator named: the host's init resolves one
+//! from the baked genesis bundle's serve nodes (the canonical this node
+//! bootstraps from, `CIRIS_DIRECT_LINK_FACILITATOR=bootstrap`'s meaning;
+//! [`DirectLinksConfig::resolve_bundle_facilitator`]), under the same
+//! CIRISEdge#661 gate as the baked dials, so a test node never probes the
+//! production canonical. [`Proposing::Off`] is the operator's switch; a
+//! config with proposing on and no facilitator resolved proposes nothing and
+//! says so. Preferring the direct path once it can be had is the CC's rule,
+//! not a preference: there is no "prefer direct" boolean to set wrong.
+//!
+//! **History.** Proposing was held OFF from 2026-10-31: a punch that
+//! succeeded on one side only (Eric's desktop ↔ Francesco's node, both on
+//! edge v43.3.0) left links dead one way until leviculum closed them. Eric's
+//! conditions to turn it back on were leviculum#89 (the two-sided commit:
+//! the link moves only after both sides succeed; v0.33 tightened the rule
+//! to an address proven both ways) and CIRISEdge#926 (the Channel stall
+//! guard: a link whose sends land nothing is closed and re-dialled, and a
+//! punched one moved back to its relayed path). Both ship in v44, and
+//! proposing is ON from v44 (Eric, 2026-11-04).
 //!
 //! Accepting is separate: by default only from a peer this node shares a room
 //! with ([`DirectAccept::RoomPeers`]); [`DirectAccept::Off`] is the operator
 //! override.
+//!
+//! # Glare (v44, leviculum#96)
+//!
+//! Two peers that both want a link direct propose on it within a round trip
+//! of each other, and leviculum refuses a REQUEST that crosses its own
+//! proposal on that link `REJECT_BUSY` before the host sees it, so both fail
+//! and, with the same backoff, both retry together. Edge breaks the tie with
+//! the link's direction, which both ends hold: only the link's INITIATOR
+//! proposes on it; the responder yields ([`glare_verdict`]) and proposes
+//! itself only after [`GLARE_WAIT`] without the initiator's proposal, on a
+//! timer, so a peer that replied once still brings the link direct. Every
+//! retry is jittered ±25 % ([`RETRY_JITTER`]) so a pair never stays in
+//! lockstep. The in-leviculum half (a glare reason, the responder's session
+//! dropped) is asked in leviculum#96.
+//!
+//! Only a send can yield: its proposal may ride the peer's link to this node
+//! (CIRISEdge#920), and it waits on nothing. A call's dial proposes on a link
+//! this node dialled (the identity lane's pool), so it is that link's initiator
+//! and never yields; two members dialling each other propose on two links.
+//!
+//! The jitter reaches what edge schedules: a `Rejected` proposal, which
+//! leviculum drops from its own retries. leviculum's background re-proposal
+//! after a timeout or a failed punch runs on its fixed `RETRY_BACKOFF_MS`,
+//! unjittered and past the tie-break; only a node that proposed retries, so it
+//! takes a responder's [`GLARE_WAIT`] fallback for both ends to be on it.
+//!
+//! # An upgrade in flight starts no Resource (v44)
+//!
+//! The two ends of an upgrade do not move at the same instant. A side moves
+//! when it holds the peer's COMPLETE, and moving lowers the link's MTU. A
+//! Resource advertised to a peer that already moved is sized by the peer from
+//! its lowered MTU, while the sender, still on the relay, cuts parts for the
+//! old one; every part is refused, the transfer cannot finish, and leviculum
+//! holds the sender's own move on that transfer with no deadline (agent run
+//! 42157633553, leviculum's issue is the proper fix). So from the moment an
+//! upgrade starts until its outcome, this node starts no Resource on that
+//! link ([`DirectPathTracker::upgrade_in_flight`]): the identity pool hands
+//! out another lane, and a send that already holds the link gets `Busy`, whose
+//! path is the Channel and then a bounded retry, which ships once the link has
+//! moved. Past that retry a by-key send dials and a pinned answer fails, for
+//! its round to send again. Nothing here waits, and the upgrade needs no
+//! Resource, so the guard cannot deadlock it. It ends at
+//! [`UPGRADE_GUARD_BOUND`] whatever happened to the outcome.
+//!
+//! What it does not see:
+//!
+//! - leviculum's background re-proposal, which tells edge nothing until its
+//!   outcome. The peer's side of one is guarded as any request is, this
+//!   side's is not.
+//! - a Resource that started before the upgrade did. Its advertisement went
+//!   first, so the peer sized it before moving and it finishes; a transfer
+//!   split into segments advertises each one, so a later segment can still
+//!   meet a moved peer.
+//! - a peer without this guard, which can wedge itself against this node.
 //!
 //! # Scope of a proposal
 //!
@@ -71,6 +142,24 @@ pub const DIRECT_PATH_BUDGET: Duration = Duration::from_secs(20);
 /// so a peer can never be wedged `InFlight`.
 pub const DIRECT_PROPOSING_STALE: Duration = Duration::from_secs(40);
 
+/// v44 — the longest a leviculum upgrade session can run: every phase of the
+/// proposing side at its deadline, end to end. No session of its own reaches
+/// a `Timeout` later than this after it started, which is how edge tells a
+/// [`held_failure`], and an upgrade with no outcome by then has released
+/// [`DirectPathTracker::upgrade_in_flight`].
+pub const UPGRADE_GUARD_BOUND: Duration = Duration::from_millis(
+    leviculum_core::direct_link::session::DISCOVER_TIMEOUT_MS
+        + leviculum_core::direct_link::session::PROPOSE_TIMEOUT_MS
+        + leviculum_core::direct_link::session::READY_TIMEOUT_MS
+        + leviculum_core::direct_link::session::PUNCH_TIMEOUT_MS
+        + leviculum_core::direct_link::session::COMMIT_TIMEOUT_MS,
+);
+
+/// How long a record of an upgrade outlives its guard, so a hold that ended
+/// late is still named. Past it the record goes, on the next upgrade: a link
+/// that closes mid-session reports no outcome.
+const UPGRADE_RECORD_TTL: Duration = Duration::from_secs(10 * 60);
+
 /// The first retry after a proposal that timed out, failed its probe, or lost
 /// its direct path: leviculum's own per-link proposal cooldown
 /// (`PROPOSAL_COOLDOWN_MS`), so a retry is never refused as `CoolingDown`.
@@ -79,6 +168,21 @@ pub const DIRECT_RETRY_BASE: Duration =
 
 /// The longest a retryable failure backs off (the base doubles per attempt).
 pub const DIRECT_RETRY_CAP: Duration = Duration::from_secs(30 * 60);
+
+/// v44 — every retry is jittered by up to this fraction either way, so two
+/// peers that failed together never retry in lockstep (the CI baseline's
+/// glare: both proposing within 200 ms on every retry, 2 min then 4 min,
+/// identical on both sides, each refusing the other `Rejected(2)`).
+pub const RETRY_JITTER: f64 = 0.25;
+
+/// v44 — how long a link's RESPONDER waits for the initiator's proposal
+/// before proposing on that link itself (leviculum#96). leviculum refuses a
+/// proposal that crosses its own on a link `REJECT_BUSY` before the host sees
+/// it, so the tie is broken here: only the link's initiator proposes on it.
+/// A responder facing a peer that never proposes (proposing off, an older
+/// edge, or one that only sent before this node joined the room: #920) proposes
+/// after this wait, jittered, on a timer: the send that yielded may be its last.
+pub const GLARE_WAIT: Duration = Duration::from_secs(30);
 
 /// A punch that failed means a NAT that maps per destination (symmetric NAT,
 /// common on cellular). It does not change between calls, so the peer is not
@@ -121,15 +225,43 @@ pub enum DirectAccept {
     IdentifiedOnly,
 }
 
+/// Whether this node proposes direct links at all (v44: on by default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Proposing {
+    /// Propose, with the configured facilitator or the bundle's canonical.
+    #[default]
+    On,
+    /// The operator's switch: never propose, resolve no facilitator, and
+    /// turn leviculum's background re-proposal off too.
+    Off,
+}
+
+impl Proposing {
+    /// Parse an operator's setting: `on` or `off`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
 /// CIRISEdge#805 item 8 — direct links for this node. The default proposes
-/// nothing (no facilitator), serves no facilitator, and accepts from room
-/// peers only ([`DirectAccept::RoomPeers`]).
+/// ([`Proposing::On`]) with the facilitator the host's init resolves from
+/// the genesis bundle ([`Self::resolve_bundle_facilitator`]), serves no
+/// facilitator, and accepts from room peers only ([`DirectAccept::RoomPeers`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DirectLinksConfig {
+    /// Whether this node proposes at all (v44 default: on).
+    pub proposing: Proposing,
     /// The facilitator this node probes when it proposes, as `host:port`.
-    /// `None`: this node cannot bring a NAT'd link direct, and never proposes.
-    /// `Some`: every A/V dial to a call member that is not already a one-hop
-    /// neighbour proposes on the identity link to it (CC 5.4.6).
+    /// `None` with proposing on: unresolved; the host's init fills it from
+    /// the bundle, and a config that reaches the transport unresolved
+    /// proposes nothing. `Some`: every A/V dial to a call member that is not
+    /// already a one-hop neighbour proposes on the identity link to it
+    /// (CC 5.4.6), as does a send to a room peer over a transport node.
     pub facilitator: Option<String>,
     /// Run a facilitator on this UDP port (a reachable node: a canonical or
     /// any transport node with a public address).
@@ -153,10 +285,72 @@ impl DirectAccept {
 }
 
 impl DirectLinksConfig {
-    /// Whether this node proposes at all.
+    /// Whether this node proposes at all: proposing on AND a facilitator to
+    /// probe.
     #[must_use]
     pub fn proposes(&self) -> bool {
-        self.facilitator.is_some()
+        self.proposing == Proposing::On && self.facilitator.is_some()
+    }
+
+    /// Why [`Self::proposes`] says no, as a `direct_link` key.
+    #[must_use]
+    pub fn off_label(&self) -> &'static str {
+        if self.proposing == Proposing::On {
+            crate::observability::DIRECT_LINK_OFF_NO_FACILITATOR
+        } else {
+            crate::observability::DIRECT_LINK_OFF_PROPOSING_OFF
+        }
+    }
+
+    /// The facilitator the genesis bundle implies: the `ip` transport hint of
+    /// the first baked serve node that carries one (falling through the list
+    /// past serve nodes with no dial hint), host AND port. A canonical answers
+    /// as a facilitator on UDP at its dial's own port (measured: CI run
+    /// 41869107100, `108.61.242.236:4242`), so there is no second port to
+    /// drift. `None` when the bundle names none.
+    #[must_use]
+    pub fn bundle_facilitator() -> Option<String> {
+        crate::edge::baked_canonical_ip_dials()
+            .into_iter()
+            .map(|(_, addr)| addr.to_string())
+            .next()
+    }
+
+    /// Fill an unnamed facilitator from the bundle when proposing is on and
+    /// `baked_dials_allowed` (the CIRISEdge#661 gate: a node under a test
+    /// trust root never touches the production canonical). `Off` resolves
+    /// nothing. Logged either way.
+    #[must_use]
+    pub fn resolve_bundle_facilitator(mut self, baked_dials_allowed: bool) -> Self {
+        match self.proposing {
+            Proposing::Off => {
+                self.facilitator = None;
+                tracing::info!("direct links: proposing OFF by the operator's setting");
+            }
+            Proposing::On if self.facilitator.is_some() => {}
+            Proposing::On if !baked_dials_allowed => {
+                tracing::warn!(
+                    "direct links: proposing on but no facilitator resolved: the baked \
+                     canonical is not dialled here (history: CIRISEdge#661), so nothing proposes"
+                );
+            }
+            Proposing::On => {
+                self.facilitator = Self::bundle_facilitator();
+                if let Some(f) = &self.facilitator {
+                    tracing::info!(
+                        facilitator = %f,
+                        "direct links: facilitator resolved from the genesis bundle's first \
+                         serve node (v44: proposing on by default)"
+                    );
+                } else {
+                    tracing::warn!(
+                        "direct links: proposing on but the genesis bundle names no serve \
+                         node with a dial hint: nothing proposes"
+                    );
+                }
+            }
+        }
+        self
     }
 
     /// The settings handed to `ReticulumNodeBuilder::direct_link`, always,
@@ -170,7 +364,7 @@ impl DirectLinksConfig {
                 DirectAccept::Off => DirectLinkPolicy::Reject,
                 DirectAccept::IdentifiedOnly => DirectLinkPolicy::IdentifiedOnly,
             },
-            facilitator: self.facilitator.clone(),
+            facilitator: self.proposes().then(|| self.facilitator.clone()).flatten(),
             protocol: ProbeProtocol::Rnsp,
             facilitator_port: self.serve_facilitator,
         }
@@ -186,9 +380,63 @@ pub enum DirectRetry {
 }
 
 /// The retry policy for a failed proposal, `attempts` failures in a row so far
-/// (0 for the first).
+/// (0 for the first), with `jitter` in `[-RETRY_JITTER, RETRY_JITTER]` (clamped)
+/// applied to the wait.
 #[must_use]
-pub fn retry_after(failure: Failure, attempts: u32) -> DirectRetry {
+pub fn retry_after(failure: Failure, attempts: u32, jitter: f64) -> DirectRetry {
+    let DirectRetry::After(base) = retry_base(failure, attempts);
+    let j = if jitter.is_finite() {
+        jitter.clamp(-RETRY_JITTER, RETRY_JITTER)
+    } else {
+        0.0
+    };
+    DirectRetry::After(base.mul_f64(1.0 + j))
+}
+
+/// A jitter draw in `[-RETRY_JITTER, RETRY_JITTER]` from the OS RNG (0 if it
+/// cannot be read).
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn jitter_draw() -> f64 {
+    let mut b = [0u8; 2];
+    if ciris_crypto::random::fill(&mut b).is_err() {
+        return 0.0;
+    }
+    let unit = f64::from(u16::from_le_bytes(b)) / f64::from(u16::MAX);
+    2.0f64.mul_add(RETRY_JITTER * unit, -RETRY_JITTER)
+}
+
+/// v44 — who proposes on a link when both ends want it direct
+/// (leviculum#96).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlareVerdict {
+    /// Propose now.
+    Propose,
+    /// Leave it to the link's initiator; propose only after [`GLARE_WAIT`].
+    Yield,
+}
+
+/// The tie-break: the link's initiator proposes; the responder yields until
+/// it has waited [`GLARE_WAIT`] since `waiting_since` for the initiator's
+/// proposal. Pure, so it is a unit test.
+#[must_use]
+pub fn glare_verdict(
+    initiator: bool,
+    waiting_since: Option<Instant>,
+    now: Instant,
+) -> GlareVerdict {
+    if initiator
+        || waiting_since.is_some_and(|since| now.saturating_duration_since(since) >= GLARE_WAIT)
+    {
+        GlareVerdict::Propose
+    } else {
+        GlareVerdict::Yield
+    }
+}
+
+/// The unjittered retry policy.
+#[must_use]
+fn retry_base(failure: Failure, attempts: u32) -> DirectRetry {
     match failure {
         Failure::PunchFailed => DirectRetry::After(DIRECT_PUNCH_FAILED_BACKOFF),
         // A refusal is retried like a timeout (CIRISEdge#920). Under the
@@ -229,6 +477,16 @@ pub const fn failure_label(failure: Failure) -> &'static str {
         Failure::Timeout => crate::observability::DIRECT_LINK_FAILED_TIMEOUT,
         Failure::PunchFailed => crate::observability::DIRECT_LINK_FAILED_PUNCH,
     }
+}
+
+/// Whether `failure`, on an upgrade that started `age` ago, is leviculum giving
+/// up a HOLD rather than a session. A link whose punch landed waits on the
+/// relay for a transfer to finish, with no deadline; the session ended when it
+/// started waiting, and when the unused punched interface dies the failure
+/// reads `Timeout`. A session's own `Timeout` cannot be this late.
+#[must_use]
+pub fn held_failure(failure: Failure, age: Duration) -> bool {
+    matches!(failure, Failure::Timeout) && age >= UPGRADE_GUARD_BOUND
 }
 
 /// CIRISEdge#805 item 8 — THE liveness decision for a direct A/V leg: is its
@@ -294,6 +552,32 @@ enum Entry {
     },
 }
 
+/// Which side of an upgrade this node is on, for the guard's line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeSide {
+    /// This node proposed.
+    Proposer,
+    /// A peer proposed and this node accepted.
+    Acceptor,
+}
+
+impl UpgradeSide {
+    /// Stable token for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposer => "proposer",
+            Self::Acceptor => "acceptor",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Upgrade {
+    side: UpgradeSide,
+    since: Instant,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PeerDirect {
     entry: Entry,
@@ -309,6 +593,11 @@ pub struct DirectPathTracker {
     peers: HashMap<String, PeerDirect>,
     /// The peer each tracked link belongs to (events name links).
     link_peer: HashMap<LinkId, String>,
+    /// Upgrades with no outcome yet, by link, either side. By link and apart
+    /// from `peers`: a peer holds one [`Entry`], and accepting on one link must
+    /// neither replace its `Direct` or `Proposing` on another nor back it off
+    /// when it fails.
+    upgrades: HashMap<LinkId, Upgrade>,
 }
 
 impl DirectPathTracker {
@@ -316,9 +605,14 @@ impl DirectPathTracker {
     ///
     /// # Errors
     /// The [`ProposeSkip`] that applies.
-    /// `_link` is the link a proposal would ride; whether to propose is a
+    /// `link` is the link a proposal would ride; whether to propose is a
     /// property of the peer, not of one link to it.
-    pub fn admit(&self, peer: &str, _link: LinkId, now: Instant) -> Result<(), ProposeSkip> {
+    pub fn admit(&self, peer: &str, link: LinkId, now: Instant) -> Result<(), ProposeSkip> {
+        // Except that a link this node is accepting on is busy, and leviculum
+        // would refuse the proposal and back the peer off for nothing.
+        if self.upgrade_side(&link, now) == Some(UpgradeSide::Acceptor) {
+            return Err(ProposeSkip::InFlight);
+        }
         let Some(p) = self.peers.get(peer) else {
             return Ok(());
         };
@@ -345,6 +639,7 @@ impl DirectPathTracker {
         now: Instant,
     ) {
         let attempts = self.peers.get(peer).map_or(0, |p| p.attempts);
+        self.note_upgrade(link, UpgradeSide::Proposer, now);
         self.link_peer.insert(link, peer.to_owned());
         self.peers.insert(
             peer.to_owned(),
@@ -362,6 +657,7 @@ impl DirectPathTracker {
     /// leviculum refused to start the proposal (`CoolingDown`,
     /// `AlreadyUpgrading`, `ChannelBusy`, …): back off one base period.
     pub fn propose_refused(&mut self, peer: &str, link: LinkId, now: Instant) {
+        self.upgrades.remove(&link);
         self.link_peer.remove(&link);
         let attempts = self.peers.get(peer).map_or(0, |p| p.attempts);
         self.peers.insert(
@@ -384,6 +680,7 @@ impl DirectPathTracker {
         interface: usize,
         peer: Option<&str>,
     ) -> Option<(String, Option<usize>)> {
+        self.upgrades.remove(&link);
         let peer = self
             .link_peer
             .get(&link)
@@ -409,10 +706,18 @@ impl DirectPathTracker {
     }
 
     /// A proposal on `link` ended without a direct path. Returns the peer.
-    pub fn failed(&mut self, link: LinkId, failure: Failure, now: Instant) -> Option<String> {
+    /// `jitter` is the retry's draw ([`jitter_draw`]; 0 in tests).
+    pub fn failed(
+        &mut self,
+        link: LinkId,
+        failure: Failure,
+        now: Instant,
+        jitter: f64,
+    ) -> Option<String> {
+        self.upgrades.remove(&link);
         let peer = self.link_peer.remove(&link)?;
         let attempts = self.peers.get(&peer).map_or(0, |p| p.attempts);
-        let DirectRetry::After(wait) = retry_after(failure, attempts);
+        let DirectRetry::After(wait) = retry_after(failure, attempts, jitter);
         let entry = Entry::BackingOff { until: now + wait };
         self.peers.insert(
             peer.clone(),
@@ -427,6 +732,7 @@ impl DirectPathTracker {
     /// `link`'s punched interface went down; the link is back on its relayed
     /// path (or closed). The peer may be asked again after the base period.
     pub fn lost(&mut self, link: LinkId, now: Instant) -> Option<String> {
+        self.upgrades.remove(&link);
         let peer = self.link_peer.remove(&link)?;
         self.peers.insert(
             peer.clone(),
@@ -438,6 +744,44 @@ impl DirectPathTracker {
             },
         );
         Some(peer)
+    }
+
+    /// This node accepted a peer's upgrade on `link`. Its outcome ends the
+    /// guard as a proposal's does; an answer leviculum no longer wanted leaves
+    /// it to [`UPGRADE_GUARD_BOUND`].
+    pub fn accepted(&mut self, link: LinkId, now: Instant) {
+        self.note_upgrade(link, UpgradeSide::Acceptor, now);
+    }
+
+    fn note_upgrade(&mut self, link: LinkId, side: UpgradeSide, now: Instant) {
+        self.upgrades
+            .retain(|_, u| now.saturating_duration_since(u.since) < UPGRADE_RECORD_TTL);
+        self.upgrades.insert(link, Upgrade { side, since: now });
+    }
+
+    /// The side of the upgrade guarding `link` at `now`, if one is.
+    #[must_use]
+    pub fn upgrade_side(&self, link: &LinkId, now: Instant) -> Option<UpgradeSide> {
+        self.upgrades
+            .get(link)
+            .filter(|u| now.saturating_duration_since(u.since) < UPGRADE_GUARD_BOUND)
+            .map(|u| u.side)
+    }
+
+    /// Whether `link` has an upgrade in flight at `now`, so no Resource may
+    /// start on it. From the proposal or the accept until the outcome, and
+    /// never past [`UPGRADE_GUARD_BOUND`].
+    #[must_use]
+    pub fn upgrade_in_flight(&self, link: &LinkId, now: Instant) -> bool {
+        self.upgrade_side(link, now).is_some()
+    }
+
+    /// [`held_failure`] for `link`'s upgrade, while its record stands.
+    #[must_use]
+    pub fn failure_was_a_hold(&self, link: &LinkId, failure: Failure, now: Instant) -> bool {
+        self.upgrades
+            .get(link)
+            .is_some_and(|u| held_failure(failure, now.saturating_duration_since(u.since)))
     }
 
     /// Where `peer`'s direct path stands, if it was ever proposed to.
@@ -577,6 +921,9 @@ pub(crate) struct DirectPaths {
     /// Peers (node key ids) the host named as consented contacts
     /// ([`Self::allow_contact`]): direct with them like a room peer.
     contacts: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// v44 — peers this node is yielding to on a link it did not initiate,
+    /// since when ([`glare_verdict`]).
+    yielding: std::sync::Mutex<HashMap<String, Instant>>,
 }
 
 /// Most consented contacts remembered for direct links.
@@ -591,7 +938,34 @@ impl DirectPaths {
             events: tokio::sync::broadcast::channel(64).0,
             anchors: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             contacts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            yielding: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// v44 — since when this node has been yielding to `peer`'s proposal.
+    pub(crate) fn yield_since(&self, peer: &str) -> Option<Instant> {
+        self.yielding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(peer)
+            .copied()
+    }
+
+    /// v44 — start yielding to `peer` at `now` (kept if already yielding).
+    pub(crate) fn note_yield(&self, peer: &str, now: Instant) {
+        self.yielding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(peer.to_owned())
+            .or_insert(now);
+    }
+
+    /// v44 — stop yielding to `peer` (its proposal came, or this node's turn).
+    pub(crate) fn clear_yield(&self, peer: &str) {
+        self.yielding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(peer);
     }
 
     /// Eric 2026-10-30: a node goes direct with "anyone who has consented to a
@@ -628,6 +1002,10 @@ impl DirectPaths {
     }
 
     /// The tracker, locked. Never held across an `.await`.
+    pub(crate) fn upgrade_in_flight(&self, link: &LinkId) -> Option<UpgradeSide> {
+        self.tracker().upgrade_side(link, Instant::now())
+    }
+
     pub(crate) fn tracker(&self) -> std::sync::MutexGuard<'_, DirectPathTracker> {
         self.tracker
             .lock()
@@ -736,6 +1114,58 @@ mod tests {
         assert_eq!(DirectAccept::parse(""), None);
     }
 
+    /// v44 — the default proposes: on, with the bundle's canonical as the
+    /// facilitator once the host's init resolves it. `Off` resolves none and
+    /// never proposes; an unresolved default proposes nothing. Mutation: a
+    /// default of `Proposing::Off` fails this test.
+    #[test]
+    fn the_default_proposes_with_the_bundle_facilitator_and_off_never_does() {
+        let bundle = DirectLinksConfig::bundle_facilitator()
+            .expect("the baked genesis bundle names a serve node with an ip hint");
+        let (_, dial) = crate::edge::baked_canonical_ip_dials()[0].clone();
+        assert_eq!(
+            bundle,
+            dial.to_string(),
+            "the facilitator is the ip hint itself, its port included"
+        );
+        let d = DirectLinksConfig::default();
+        assert_eq!(d.proposing, Proposing::On);
+        assert!(!d.proposes(), "unresolved: nothing to propose with");
+        assert_eq!(d.leviculum_settings().facilitator, None);
+        let on = d.clone().resolve_bundle_facilitator(true);
+        assert_eq!(on.facilitator.as_deref(), Some(bundle.as_str()));
+        assert!(on.proposes());
+        assert_eq!(
+            on.leviculum_settings().facilitator.as_deref(),
+            Some(bundle.as_str())
+        );
+        let gated = d.resolve_bundle_facilitator(false);
+        assert_eq!(gated.facilitator, None);
+        assert!(!gated.proposes());
+        let off = DirectLinksConfig {
+            proposing: Proposing::Off,
+            facilitator: Some("127.0.0.1:4242".to_owned()),
+            ..DirectLinksConfig::default()
+        }
+        .resolve_bundle_facilitator(true);
+        assert_eq!(off.facilitator, None);
+        assert!(!off.proposes());
+        assert_eq!(off.leviculum_settings().facilitator, None);
+        let named = DirectLinksConfig {
+            facilitator: Some("10.0.0.1:4242".to_owned()),
+            ..DirectLinksConfig::default()
+        }
+        .resolve_bundle_facilitator(true);
+        assert_eq!(
+            named.facilitator.as_deref(),
+            Some("10.0.0.1:4242"),
+            "a named one stays"
+        );
+        assert_eq!(Proposing::parse("on"), Some(Proposing::On));
+        assert_eq!(Proposing::parse("off"), Some(Proposing::Off));
+        assert_eq!(Proposing::parse("yes"), None);
+    }
+
     #[test]
     fn a_facilitator_does_not_imply_accepting() {
         let c = DirectLinksConfig {
@@ -770,24 +1200,76 @@ mod tests {
     #[test]
     fn the_retry_policy_by_failure() {
         assert_eq!(
-            retry_after(Failure::Rejected(1), 0),
+            retry_after(Failure::Rejected(1), 0, 0.0),
             DirectRetry::After(DIRECT_RETRY_BASE)
         );
         assert_eq!(
-            retry_after(Failure::PunchFailed, 0),
+            retry_after(Failure::PunchFailed, 0, 0.0),
             DirectRetry::After(DIRECT_PUNCH_FAILED_BACKOFF)
         );
         assert_eq!(
-            retry_after(Failure::Timeout, 0),
+            retry_after(Failure::Timeout, 0, 0.0),
             DirectRetry::After(DIRECT_RETRY_BASE)
         );
         assert_eq!(
-            retry_after(Failure::ProbeFailed, 2),
+            retry_after(Failure::ProbeFailed, 2, 0.0),
             DirectRetry::After(DIRECT_RETRY_BASE * 4)
         );
         assert_eq!(
-            retry_after(Failure::Timeout, 40),
+            retry_after(Failure::Timeout, 40, 0.0),
             DirectRetry::After(DIRECT_RETRY_CAP)
+        );
+    }
+
+    /// v44 — the retry is jittered ±25 % (clamped), so two peers that failed
+    /// together do not retry in lockstep; the OS draw stays in range.
+    #[test]
+    fn the_retry_is_jittered_within_a_quarter() {
+        let base = DIRECT_RETRY_BASE;
+        assert_eq!(
+            retry_after(Failure::Timeout, 0, 0.25),
+            DirectRetry::After(base.mul_f64(1.25))
+        );
+        assert_eq!(
+            retry_after(Failure::Timeout, 0, -0.25),
+            DirectRetry::After(base.mul_f64(0.75))
+        );
+        assert_eq!(
+            retry_after(Failure::Timeout, 0, 0.9),
+            DirectRetry::After(base.mul_f64(1.25)),
+            "clamped"
+        );
+        assert_eq!(
+            retry_after(Failure::Timeout, 0, f64::NAN),
+            DirectRetry::After(base)
+        );
+        let draws: Vec<f64> = (0..64).map(|_| jitter_draw()).collect();
+        assert!(draws
+            .iter()
+            .all(|j| (-RETRY_JITTER..=RETRY_JITTER).contains(j)));
+        assert!(
+            draws.iter().any(|j| (*j - draws[0]).abs() > f64::EPSILON),
+            "the draw is not a constant"
+        );
+    }
+
+    /// v44 — the glare tie-break (leviculum#96): the link's initiator
+    /// proposes; the responder yields until it has waited GLARE_WAIT.
+    /// Mutation: a verdict that never yields fails this test.
+    #[test]
+    fn the_initiator_proposes_and_the_responder_yields_until_the_wait() {
+        let t0 = Instant::now();
+        assert_eq!(glare_verdict(true, None, t0), GlareVerdict::Propose);
+        assert_eq!(glare_verdict(true, Some(t0), t0), GlareVerdict::Propose);
+        assert_eq!(glare_verdict(false, None, t0), GlareVerdict::Yield);
+        assert_eq!(
+            glare_verdict(false, Some(t0), t0 + GLARE_WAIT / 2),
+            GlareVerdict::Yield
+        );
+        assert_eq!(
+            glare_verdict(false, Some(t0), t0 + GLARE_WAIT),
+            GlareVerdict::Propose,
+            "the initiator never proposed: the responder's turn"
         );
     }
 
@@ -799,19 +1281,123 @@ mod tests {
         t.proposed("b", link(1), Some(16_000), now);
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::InFlight));
         assert_eq!(
-            t.failed(link(1), Failure::Timeout, now).as_deref(),
+            t.failed(link(1), Failure::Timeout, now, 0.0).as_deref(),
             Some("b")
         );
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::BackingOff));
         assert_eq!(t.admit("b", link(1), now + DIRECT_RETRY_BASE), Ok(()));
         // A second timeout doubles the wait.
         t.proposed("b", link(1), None, now);
-        t.failed(link(1), Failure::Timeout, now);
+        t.failed(link(1), Failure::Timeout, now, 0.0);
         assert_eq!(
             t.admit("b", link(1), now + DIRECT_RETRY_BASE),
             Err(ProposeSkip::BackingOff)
         );
         assert_eq!(t.admit("b", link(1), now + DIRECT_RETRY_BASE * 2), Ok(()));
+    }
+
+    #[test]
+    fn a_proposal_guards_its_link_until_the_outcome() {
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        assert!(!t.upgrade_in_flight(&link(1), now));
+        t.proposed("b", link(1), Some(16_000), now);
+        assert!(t.upgrade_in_flight(&link(1), now));
+        assert!(!t.upgrade_in_flight(&link(2), now), "only that link");
+        assert_eq!(t.upgrade_side(&link(1), now), Some(UpgradeSide::Proposer));
+        t.established(link(1), 7, None);
+        assert!(!t.upgrade_in_flight(&link(1), now));
+
+        t.proposed("c", link(3), None, now);
+        t.failed(link(3), Failure::Timeout, now, 0.0);
+        assert!(!t.upgrade_in_flight(&link(3), now));
+
+        t.proposed("d", link(4), None, now);
+        t.propose_refused("d", link(4), now);
+        assert!(!t.upgrade_in_flight(&link(4), now));
+    }
+
+    /// The accepting side is the one the trace's wedge also needs: it starts
+    /// a Resource on a link it agreed to move, and only a Requested says so.
+    #[test]
+    fn an_acceptance_guards_its_link_and_leaves_the_peers_entry_alone() {
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        // B is direct with A on another link; A now proposes on this one.
+        t.established(link(1), 7, Some("a"));
+        t.accepted(link(2), now);
+        assert_eq!(t.upgrade_side(&link(2), now), Some(UpgradeSide::Acceptor));
+        assert!(
+            matches!(t.state("a"), Some(DirectPathState::Direct { .. })),
+            "the peer's direct path on the other link stands"
+        );
+        // A link being accepted is no link to propose on: leviculum would
+        // refuse it `AlreadyUpgrading` and back the peer off.
+        assert_eq!(t.admit("c", link(2), now), Err(ProposeSkip::InFlight));
+
+        // The accepting side's failure names no peer and backs nobody off.
+        assert_eq!(t.failed(link(2), Failure::PunchFailed, now, 0.0), None);
+        assert!(!t.upgrade_in_flight(&link(2), now));
+        assert_eq!(t.admit("c", link(2), now), Ok(()));
+        assert!(matches!(t.state("a"), Some(DirectPathState::Direct { .. })));
+
+        t.accepted(link(3), now);
+        t.established(link(3), 8, Some("c"));
+        assert!(!t.upgrade_in_flight(&link(3), now));
+    }
+
+    /// The bound: an upgrade that never reports must release the link, on
+    /// both sides, or the guard is the wedge.
+    #[test]
+    fn an_upgrade_with_no_outcome_releases_the_guard_at_the_bound() {
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        t.proposed("b", link(1), None, now);
+        t.accepted(link(2), now);
+        let at = now + UPGRADE_GUARD_BOUND;
+        let before = at
+            .checked_sub(Duration::from_millis(1))
+            .expect("an instant");
+        assert!(t.upgrade_in_flight(&link(1), before));
+        assert!(t.upgrade_in_flight(&link(2), before));
+        assert!(!t.upgrade_in_flight(&link(1), at));
+        assert!(!t.upgrade_in_flight(&link(2), at));
+        assert_eq!(t.admit("c", link(2), at), Ok(()));
+    }
+
+    /// A link that closes mid-session reports no outcome, so a record must
+    /// not stand for ever.
+    #[test]
+    fn a_record_with_no_outcome_goes_on_the_next_upgrade() {
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        t.proposed("b", link(1), None, now);
+        t.accepted(link(2), now);
+        t.proposed("c", link(3), None, now + UPGRADE_RECORD_TTL);
+        assert_eq!(t.upgrades.len(), 1);
+        assert!(t.upgrades.contains_key(&link(3)));
+    }
+
+    /// The trace's numbers: proposed at 03:40:40.9, `Timeout` at 03:43:36.3.
+    #[test]
+    fn a_timeout_later_than_any_session_was_a_hold() {
+        let held = Duration::from_secs(175);
+        assert!(held_failure(Failure::Timeout, held));
+        assert!(held_failure(Failure::Timeout, UPGRADE_GUARD_BOUND));
+        let just_under = UPGRADE_GUARD_BOUND
+            .checked_sub(Duration::from_millis(1))
+            .expect("a bound");
+        assert!(!held_failure(Failure::Timeout, just_under));
+        assert!(!held_failure(Failure::PunchFailed, held));
+        assert!(!held_failure(Failure::ProbeFailed, held));
+
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        t.proposed("b", link(1), None, now);
+        assert!(t.failure_was_a_hold(&link(1), Failure::Timeout, now + held));
+        assert!(!t.failure_was_a_hold(&link(1), Failure::Timeout, now));
+        // leviculum's own retry told edge nothing, so edge cannot say.
+        assert!(!t.failure_was_a_hold(&link(9), Failure::Timeout, now + held));
     }
 
     #[test]
@@ -835,7 +1421,7 @@ mod tests {
         let now = Instant::now();
         let mut t = DirectPathTracker::default();
         t.proposed("b", link(1), None, now);
-        t.failed(link(1), Failure::Rejected(1), now);
+        t.failed(link(1), Failure::Rejected(1), now, 0.0);
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::BackingOff));
         assert_eq!(
             t.admit("b", link(2), now),
@@ -888,7 +1474,7 @@ mod tests {
     fn an_unknown_link_event_changes_nothing() {
         let now = Instant::now();
         let mut t = DirectPathTracker::default();
-        assert_eq!(t.failed(link(9), Failure::Timeout, now), None);
+        assert_eq!(t.failed(link(9), Failure::Timeout, now, 0.0), None);
         assert_eq!(t.lost(link(9), now), None);
         assert_eq!(t.direct_count(), 0);
     }

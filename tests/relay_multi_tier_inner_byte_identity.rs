@@ -14,6 +14,8 @@
 //! holds a DIFFERENT per-link transit key and NONE of them holds the
 //! epoch DEK.
 
+#![cfg(feature = "_reticulum-module")]
+
 use ciris_edge::transport::realtime_av::{
     open_av_outer, seal_av_inner, seal_av_outer, ChunkLayer, ChunkSeq, Epoch, EpochDek,
     RealtimeAvError, ReceiverLayerPolicy, StreamId, CODEC_AV1_SVC,

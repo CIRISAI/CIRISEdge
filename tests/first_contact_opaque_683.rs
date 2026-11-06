@@ -710,3 +710,40 @@ async fn an_answer_on_another_transport_introduces_nothing_683() {
     );
     ask.abort();
 }
+
+/// v44 — `ciris.edge.first_contact.duration`, as the requester saw it: one
+/// that ends unanswered is a timeout, and an answered one is timed to its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_contact_is_timed_by_how_it_ended() {
+    let count = |edge: &Edge, outcome: &str| {
+        edge.metrics().snapshot().first_contact_duration_seconds[outcome].count
+    };
+    let p = pair(true).await;
+    let unanswered = p
+        .edge_b
+        .send_opaque_request_introducing(&p.a.key_id, JOIN, b"join".to_vec(), 50)
+        .await;
+    assert!(unanswered.is_err());
+    assert_eq!(count(&p.edge_b, "timeout"), 1);
+    assert_eq!(count(&p.edge_b, "answered"), 0);
+    let _ = wait_sent(&p.t_b).await;
+
+    let _seen = answer_joins(&p.edge_a, Vec::new());
+    let (edge_b, a_id) = (Arc::clone(&p.edge_b), p.a.key_id.clone());
+    let ask = tokio::spawn(async move {
+        edge_b
+            .send_opaque_request_introducing(&a_id, JOIN, b"join".to_vec(), 10_000)
+            .await
+    });
+    let request = wait_sent(&p.t_b).await;
+    p.edge_a
+        .dispatch_inbound_for_test(frame(request.bytes, Some(ReplyPath::new(TID, LINK))))
+        .await;
+    let answer = wait_sent(&p.t_a).await;
+    p.edge_b
+        .dispatch_inbound_for_test(frame(answer.bytes, Some(ReplyPath::new(TID, LINK))))
+        .await;
+    ask.await.expect("the task").expect("answered");
+    assert_eq!(count(&p.edge_b, "answered"), 1);
+    assert_eq!(count(&p.edge_b, "timeout"), 1, "the first still stands");
+}

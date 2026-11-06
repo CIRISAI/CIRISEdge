@@ -184,11 +184,21 @@ pub mod peer_bundle_frame;
 #[cfg(feature = "_reticulum-module")]
 pub mod identity_model;
 
+/// Mobile-background lifecycle: suspend and resume a transport in-process
+/// (no socket, link, listener or edge task while suspended). See the module
+/// docs for the platform rules it answers and the interim design.
+pub mod lifecycle;
+pub use lifecycle::SuspendReport;
+
 /// Reticulum-native transport (OQ-07 first impl). Backed by Leviculum
 /// (`reticulum-core` + `reticulum-std`). Canonical wire per
 /// `MISSION.md` §2; HTTP is the documented fallback.
 #[cfg(feature = "_reticulum-module")]
 pub mod reticulum;
+
+/// v44 LTS — the persisted bindings a restart judges handshakes by.
+#[cfg(feature = "_reticulum-module")]
+pub(crate) mod persisted_standing;
 
 /// CIRISEdge#406 — the hybrid-signed `SignedTransportDestination`
 /// producer + bootstrap for edge's OWN reticulum destination (the #393
@@ -215,6 +225,10 @@ pub mod transit_kex_peer;
 #[cfg(feature = "_reticulum-module")]
 pub mod av_transit_handshake;
 
+/// CIRISEdge#947 — CC 5.3.3.5: decapsulation outside any node-wide lock and
+/// behind the receiver order: the handshake gate and the bounded keyer.
+#[cfg(feature = "_reticulum-module")]
+pub mod link_keying;
 /// CC 5.3.3.5 E1 — the per-link seal: every edge frame on every RNS link,
 /// both directions and every lane, under the keys of that link's transit KEX.
 /// No classical fallback, no caller-supplied key, no compat path.
@@ -226,6 +240,8 @@ pub mod link_seal;
 /// (`CLM-pre-seal-route-fetch`).
 #[cfg(feature = "_reticulum-module")]
 pub mod route_fetch;
+#[cfg(feature = "_reticulum-module")]
+pub mod shaping_referral;
 
 /// CC 5.4.3 — link shaping (`CLM-link-shaping`): constant MDU-sized frames at
 /// Poisson times on a shaped identity link, both ways, negotiated right after
@@ -233,10 +249,37 @@ pub mod route_fetch;
 #[cfg(feature = "_reticulum-module")]
 pub mod link_shaping;
 
+/// CC 5.4.6 item 4 — the onion layer deal (`CLM-onion-layer-deal`): relay
+/// membership for a period and the three layers, a pure function of the fold.
+pub mod onion_layers;
+
+/// ALM stage 2 — what the A/V controller reads off the Reticulum transport:
+/// per-link delivery telemetry, timed-frame expiries, learned relay routes.
+#[cfg(feature = "_reticulum-module")]
+pub mod alm_link;
+/// CIRISEdge#926 — the link stall guard: a link whose Channel lands nothing
+/// for a run of sends is never chosen again and is closed (or moved off a
+/// dead punched path).
+#[cfg(feature = "_reticulum-module")]
+pub mod link_stall;
+/// CC 5.4.6 item 4 (steward 2026-10-22) — the per-node liveness fold beside
+/// the deal: availability = the floor ∧ ≥ 3 answering relays per layer.
+pub mod onion_liveness;
+/// ALM stage 2 — the transport relay tier (`FSD/CIRIS_MESH.md` R2): roster
+/// relays before the canonical for a link that cannot be direct, and a
+/// relay's C2 admission of the links it forwards.
+#[cfg(feature = "_reticulum-module")]
+pub mod relay_tier;
+
 /// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
 /// live streams (`FSD/AV_CALL_API.md`).
 #[cfg(feature = "_reticulum-module")]
 pub mod av_call;
+
+/// CIRISEdge#805 — source authentication for a call's chunks: a per-epoch
+/// Ed25519 chunk key per stream, bound by the publisher's hybrid signature.
+#[cfg(feature = "_reticulum-module")]
+pub mod av_chunk_auth;
 
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
 /// edges (CIRISEdge#169). CEG-native (the Scope-B queue: byte-exact
@@ -328,6 +371,20 @@ pub enum PendingDelivery {
 pub enum TransportError {
     #[error("destination unreachable: {0}")]
     Unreachable(String),
+    /// The peer has no dial candidate: this node holds no destination for it
+    /// at all, and a path ask found none. Nothing was dialled. Distinct from
+    /// [`Self::Unreachable`] because replication backs off on it by type
+    /// (CIRISEdge#794), and from [`Self::NoRouteToPeer`] because there is no
+    /// target destination to name. It classes as `unreachable` to every caller
+    /// outside replication.
+    #[error(
+        "destination unreachable: no Reticulum destination known for \
+         destination_key_id={key_id} (not directory-resolvable and no announce received)"
+    )]
+    NoDialCandidate {
+        /// The federation key_id the send was routed to.
+        key_id: String,
+    },
     #[error("transport timeout after {0:?}")]
     Timeout(std::time::Duration),
     #[error("transport configuration error: {0}")]
@@ -412,6 +469,12 @@ pub enum TransportError {
         /// What happened.
         detail: String,
     },
+    /// The transport is suspended (the host is in the background — see
+    /// [`lifecycle`]). Nothing was sent and nothing about the peer was
+    /// learned: callers skip quietly and retry after resume, with no backoff
+    /// and no failure recorded against the peer.
+    #[error("transport suspended (host in background); retry after resume")]
+    Suspended,
 }
 
 /// CIRISEdge#393 (E3) — a transport-attributed source `key_id` that is
@@ -768,12 +831,38 @@ pub trait Transport: Send + Sync + 'static {
     /// `Arc`, so the clone shares, never copies.
     fn attach_metrics(&self, _metrics: crate::observability::EdgeMetrics) {}
 
+    /// v44 — the node's service ladder, for a transport whose own tick folds
+    /// edge's signals and applies the tier. Called once by `EdgeBuilder::build`.
+    fn attach_load_ladder(&self, _ladder: std::sync::Arc<crate::load_ladder::SharedLadder>) {}
+
+    /// CC 5.4.3 referrals — each node this transport homes on after a refusal
+    /// at a bound, so the replication runtime can round with it. `None`: this
+    /// transport has no bound to be refused at.
+    fn subscribe_homed(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        None
+    }
+
+    /// CC 5.4.3 referrals — the nodes homed on so far.
+    fn homed_peers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// CIRISEdge#809 — the bag this transport already counts into, if a
     /// caller attached one before handing it to `EdgeBuilder` (e.g.
     /// `ReticulumTransport::with_metrics(Some(..))`). The builder ADOPTS
     /// it as the Edge's bag rather than minting a second one the
     /// transport would never count into. Default: none.
     fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {
+        None
+    }
+
+    /// CC 5.4.3 — the mean gap between frames on the shaped link to
+    /// `destination_key_id`, when the link is shaped: what a round's waits
+    /// are paced by (FSD/TRANSPORT_TIERS_MODEL.md: a per-wait timeout of about
+    /// 4.74 gaps and a round interval of about 7.75 gaps). `None` on an
+    /// unshaped link or a transport without shaping.
+    fn pacing_gap(&self, destination_key_id: &str) -> Option<std::time::Duration> {
+        let _ = destination_key_id;
         None
     }
 

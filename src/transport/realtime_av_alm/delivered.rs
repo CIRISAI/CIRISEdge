@@ -683,7 +683,7 @@ mod tests {
         STATE_GRANTED_PREFIX, STATE_REVOKED_PREFIX,
     };
     use ciris_persist::federation::types::{algorithm, KeyRecord, SignedKeyRecord};
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
     use tokio::time::{timeout, Duration};
 
     fn stream(seed: u8) -> StreamId {
@@ -1149,8 +1149,8 @@ mod tests {
         }
     }
 
-    async fn seeded_backend(relay: &str, consumer: &str) -> Arc<MemoryBackend> {
-        let backend = Arc::new(MemoryBackend::new());
+    async fn seeded_backend(relay: &str, consumer: &str) -> Arc<SqliteBackend> {
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         for kid in [relay, consumer] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -1164,7 +1164,7 @@ mod tests {
 
     #[tokio::test]
     async fn emit_withholds_an_empty_window() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let signer = local_signer("cap-consumer-empty");
         let mut obs = observation("cap-relay-empty");
         obs.window_end_unix_ms = obs.window_start_unix_ms; // not a measurement
@@ -1188,7 +1188,7 @@ mod tests {
     /// for persist's stated reason).
     #[tokio::test]
     async fn emit_refuses_self_emission_via_persists_own_rule() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let signer = local_signer("cap-self");
         let obs = observation("cap-self"); // advertiser == signer
         let out = emit_delivered_observation(&*backend, &signer, &obs, true, Utc::now())

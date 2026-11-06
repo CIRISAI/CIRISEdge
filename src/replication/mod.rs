@@ -121,14 +121,18 @@ pub mod attestation_bind;
 pub mod bridge;
 pub mod convergence;
 pub mod coordinator;
+#[cfg(test)]
+mod counting_directory_930;
 pub mod directory;
-/// CIRISEdge#761 — the `(scope, group, named)` a membership-plane row is about,
-/// for persist's `may_receive_group_plane` serve gate.
-pub mod group_plane;
 /// CIRISEdge#552 — hashes known to exist whose bodies this node does not
 /// hold. NEVER holdings; see the module docs for why that distinction is the
 /// whole safety of the design.
 pub mod key_grant_emitter;
+/// CIRISEdge#930 — the key-plane listings, memoized per subject on the
+/// store's admission cursor.
+pub(crate) mod key_plane_memo;
+#[cfg(test)]
+mod key_plane_memo_930_tests;
 pub(crate) mod key_plane_rows;
 #[cfg(test)]
 mod key_plane_v59_tests;
@@ -146,10 +150,15 @@ mod no_route_backoff_794_tests;
 mod occurrence_before_binding_776_tests;
 #[cfg(test)]
 mod park_fresh_858_tests;
+#[cfg(all(test, feature = "_reticulum-module"))]
+mod persisted_standing_timing_tests;
 pub mod protocol;
 pub mod refusal_backoff;
 pub mod registry;
+mod reply_lane;
 pub mod resolved_state;
+#[cfg(test)]
+mod responder_drain_943_tests;
 /// CIRISEdge#552/#553 — how much of a plane this node keeps, and the
 /// revocation carve-out a configured retention cannot reach.
 pub mod retention;
@@ -162,6 +171,9 @@ pub mod session;
 mod sim;
 pub(crate) mod single_flight;
 pub mod storage_contention;
+pub(crate) mod subject_pull;
+#[cfg(test)]
+mod subject_pull_apply_tests;
 pub mod summary;
 #[cfg(test)]
 mod typed_refusal_858_tests;
@@ -376,7 +388,6 @@ pub use accord_relay_gate::{
 #[doc(inline)]
 pub use bridge::{
     ApplyRefusalClass, BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge,
-    KeyDirectoryProvider, OperationalProviders, RootStewardsProvider, StewardRosterProvider,
 };
 #[doc(inline)]
 pub use coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};

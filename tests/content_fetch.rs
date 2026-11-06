@@ -18,6 +18,8 @@
 //! pattern, same `FedKey` seed generator, same `NullTransport` shape
 //! plus a small `InjectTransport` for the receive path.
 
+#![cfg(feature = "_reticulum-module")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -297,8 +299,8 @@ where
 
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&sender, &steward, "agent"),
-        signed_record(&receiver, &steward, "agent"),
+        signed_record(&sender, &steward, "node"),
+        signed_record(&receiver, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();

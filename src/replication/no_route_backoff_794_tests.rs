@@ -43,6 +43,11 @@ enum Route {
     Delivered,
     /// A transport error that is NOT route absence.
     Error,
+    /// `NoDialCandidate` — no address known at all, what a server's peer with
+    /// nothing in its live `peers` map answers.
+    NoCandidate,
+    /// `PeerBlackholed` — an operator's ban: its own treatment.
+    Banned,
 }
 
 /// Counts every send per peer and answers per [`Route`]; emits reachability
@@ -102,6 +107,14 @@ impl Transport for ScriptedTransport {
             }),
             Route::Delivered => Ok(TransportSendOutcome::Delivered),
             Route::Error => Err(TransportError::Timeout(Duration::from_secs(5))),
+            Route::NoCandidate => Err(TransportError::NoDialCandidate {
+                key_id: destination_key_id.to_owned(),
+            }),
+            Route::Banned => Err(TransportError::PeerBlackholed {
+                identity_hash: vec![0; 16],
+                reason: None,
+                until: None,
+            }),
         }
     }
     async fn listen(
@@ -116,6 +129,24 @@ impl Transport for ScriptedTransport {
 }
 
 struct Empty;
+
+/// As [`Empty`], counting each sweep: what a round pays before its send,
+/// whether or not the send goes anywhere.
+struct Sweeping {
+    sweeps: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl StateProvider for Sweeping {
+    async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        self.sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Vec::new()
+    }
+    async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+        None
+    }
+}
 
 #[async_trait]
 impl StateProvider for Empty {
@@ -149,6 +180,20 @@ struct Rig {
 
 impl Rig {
     fn start(transport: &Arc<ScriptedTransport>, peers: &[&str], kinds: &[EnvelopeKind]) -> Self {
+        Self::start_with(
+            transport,
+            peers,
+            kinds,
+            &(Arc::new(Empty) as Arc<dyn StateProvider>),
+        )
+    }
+
+    fn start_with(
+        transport: &Arc<ScriptedTransport>,
+        peers: &[&str],
+        kinds: &[EnvelopeKind],
+        provider: &Arc<dyn StateProvider>,
+    ) -> Self {
         let mut sched = ReplicationScheduler::new(SchedulerConfig {
             cadence: CADENCE,
             round_timeout: Duration::from_secs(1),
@@ -163,7 +208,7 @@ impl Rig {
                     *peer,
                     *kind,
                     SessionRole::Initiator,
-                    Arc::new(Empty),
+                    Arc::clone(provider),
                     Arc::new(Empty),
                 )));
             }
@@ -238,6 +283,98 @@ async fn unroutable_peer_costs_the_backoff_schedule_across_every_kind_and_kick_7
         "probes at 30/90/210/450 s: {snap:?}"
     );
     assert_eq!(snap[0].current_delay, Duration::from_secs(480), "{snap:?}");
+    rig.stop().await;
+}
+
+/// A peer with no dial candidate: every plane's sweep stops at the backoff,
+/// ticks and kicks alike, and a route arriving resumes every plane at once.
+/// Before: `NoDialCandidate` was `Unreachable`, classed `Other`, so each plane
+/// swept on every tick and every kick with nothing to send to.
+#[tokio::test(start_paused = true)]
+async fn a_peer_with_no_candidate_stops_sweeping_and_a_route_resumes_it_at_once_794() {
+    let kinds = [
+        EnvelopeKind::Key,
+        EnvelopeKind::Attestation,
+        EnvelopeKind::TransportDestination,
+    ];
+    let sweeps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider: Arc<dyn StateProvider> = Arc::new(Sweeping {
+        sweeps: Arc::clone(&sweeps),
+    });
+    let swept = || sweeps.load(std::sync::atomic::Ordering::SeqCst);
+    let t = ScriptedTransport::new(&[("nowhere", Route::NoCandidate)]);
+    let rig = Rig::start_with(&t, &["nowhere"], &kinds, &provider);
+    let (_fwd_cancel, fwd_cancel_rx) = watch::channel(false);
+    super::runtime::spawn_reachability_forwarder(
+        &(Arc::clone(&t) as Arc<dyn Transport>),
+        &rig.handle,
+        &fwd_cancel_rx,
+    );
+    settle().await;
+    assert_eq!(
+        backed_off(&rig.handle),
+        ["nowhere"],
+        "no candidate is no route"
+    );
+    let entry = swept();
+    assert!(entry <= kinds.len(), "the first fan-out: {entry}");
+
+    // Ten minutes of cadence and a kick burst every 10 s.
+    for _ in 0..60 {
+        rig.handle
+            .round_now(Some("nowhere"))
+            .await
+            .expect("round_now");
+        rig.handle
+            .propagate("elsewhere", EnvelopeKind::Attestation)
+            .await
+            .expect("propagate");
+        assert!(rig.handle.try_kick("nowhere", EnvelopeKind::Key), "kicked");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    let idle = swept();
+    assert!(
+        idle <= entry + 4,
+        "the probes at 30/90/210/450 s are all that swept: {entry} then {idle} \
+         (a plane on every tick alone is {})",
+        kinds.len() * 20
+    );
+
+    // The route arrives, well away from a tick and from the next probe.
+    let before = (swept(), t.sends("nowhere"));
+    t.set("nowhere", Route::Delivered);
+    t.reach
+        .send(PeerReachable::new(
+            "nowhere",
+            ReachabilityEvidence::PathLearned,
+        ))
+        .expect("the forwarder is subscribed");
+    settle().await;
+    assert!(backed_off(&rig.handle).is_empty(), "the backoff cleared");
+    assert_eq!(
+        t.sends("nowhere") - before.1,
+        kinds.len(),
+        "every plane ran at once"
+    );
+    assert_eq!(swept() - before.0, kinds.len());
+    rig.stop().await;
+}
+
+/// A ban is not route absence. A banned peer's rounds keep their own treatment:
+/// no shared backoff, and the planes stay on their cadence.
+#[tokio::test(start_paused = true)]
+async fn a_banned_peer_does_not_enter_the_backoff_794() {
+    let kinds = [EnvelopeKind::Key, EnvelopeKind::Attestation];
+    let t = ScriptedTransport::new(&[("banned", Route::Banned)]);
+    let rig = Rig::start(&t, &["banned"], &kinds);
+    tokio::time::sleep(CADENCE * 3).await;
+    settle().await;
+    assert!(backed_off(&rig.handle).is_empty());
+    assert!(
+        t.sends("banned") >= kinds.len() * 3,
+        "still on its cadence: {} sends",
+        t.sends("banned")
+    );
     rig.stop().await;
 }
 
@@ -316,6 +453,7 @@ async fn inbound_frame_resets_and_the_release_kick_is_not_swallowed_794() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     t.set("gone", Route::Delivered);
     let frame = super::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+        status: None,
         kind: EnvelopeKind::IdentityOccurrence,
         refs: vec![],
     }));
@@ -421,16 +559,14 @@ async fn a_non_no_route_error_does_not_back_off_794() {
     let kinds = [EnvelopeKind::Key, EnvelopeKind::Attestation];
     let t = ScriptedTransport::new(&[("flaky", Route::Error)]);
     let rig = Rig::start(&t, &["flaky"], &kinds);
-    // Ticks at 0, 30, …, 150 s.
+    // A failed send re-dials in 15 to 45 s (CC 5.4.6, `draw_redial`), so every
+    // plane keeps its rounds, at least one per 45 s, with no window growing.
     tokio::time::sleep(Duration::from_secs(155)).await;
-    assert_eq!(
-        t.sends("flaky"),
-        6 * kinds.len(),
-        "a round per plane per tick"
+    assert!(
+        t.sends("flaky") >= 4 * kinds.len(),
+        "every plane keeps dialling: {}",
+        t.sends("flaky")
     );
-    assert!(rig.handle.try_kick("flaky", EnvelopeKind::Key));
-    settle().await;
-    assert_eq!(t.sends("flaky"), 6 * kinds.len() + 1, "the kick ran");
     assert!(
         backed_off(&rig.handle).is_empty(),
         "only route absence backs off"

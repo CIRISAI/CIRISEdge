@@ -32,6 +32,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ciris_edge::identity::{sign_bound_hybrid, LocalSigner};
+use ciris_edge::replication::{
+    EnvelopeKind, ReplicationPeer, ReplicationRuntime, ReplicationRuntimeConfig, SchedulerConfig,
+};
 use ciris_edge::transport::reticulum::{
     HandshakeOverride, ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
     RouteAnswerOverride,
@@ -211,7 +214,8 @@ struct Trio {
     a: Node,
     b: Node,
     c: Node,
-    _tmp: tempfile::TempDir,
+    port_a: u16,
+    tmp: tempfile::TempDir,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -241,6 +245,19 @@ async fn seed_route(from: &Node, to: &Node) {
 /// trust bundle (and its own key); it is given nothing about `A` but what
 /// `A`'s announce carries.
 async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool, c_fresh: bool) -> Trio {
+    trio_on(tag, seed_a_at_clients, c_unannounced, c_fresh, false).await
+}
+
+/// [`trio`], with `A` forwarding for its clients when `forwards`, so `B` and
+/// `C` reach each other through it.
+#[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)] // one fixture's switches
+async fn trio_on(
+    tag: &str,
+    seed_a_at_clients: bool,
+    c_unannounced: bool,
+    c_fresh: bool,
+    forwards: bool,
+) -> Trio {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let keys = [
@@ -276,6 +293,7 @@ async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool, c_fresh: 
                         c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
                     }
                     c.announce_interval = Duration::from_secs(5);
+                    c.enable_transport = forwards && i == 0;
                     (c, auth(signer, &dir))
                 }
             },
@@ -335,7 +353,8 @@ async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool, c_fresh: 
         a,
         b,
         c,
-        _tmp: tmp,
+        port_a,
+        tmp,
         _tasks: tasks,
     }
 }
@@ -1814,4 +1833,1080 @@ async fn a_second_node_key_on_the_dialler_identity_yields_to_the_corroborated_cl
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_key_on_the_dialler_identity_never_takes_the_node_s_link_888() {
     shared_identity_witness("shared-agent", "agent").await;
+}
+
+// ---------------------------------------------------------------------------
+// CIRISEdge#947 — CC 5.3.3.5: decapsulation runs outside any node-wide lock and
+// behind the receiver order.
+// ---------------------------------------------------------------------------
+
+/// How a flood's link identifies itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloodIdentity {
+    /// A fresh RNS identity per link: the Sybil.
+    Fresh,
+    /// One identity on every link.
+    Same,
+}
+
+/// A stranger: a bare leviculum client of `A` opening real links and sending
+/// real frames, with nothing edge-shaped behind it.
+struct Flooder {
+    node: leviculum_std::driver::ReticulumNode,
+    dest: leviculum_core::DestinationHash,
+    signing: [u8; 32],
+    pair: ciris_persist::federation::self_at_login::TransitKexPair,
+    a_key: String,
+    same: leviculum_core::Identity,
+}
+
+async fn flooder(t: &Trio) -> Arc<Flooder> {
+    let storage = tempfile::tempdir().expect("tempdir");
+    let mut node = leviculum_std::driver::ReticulumNodeBuilder::new()
+        .add_interface_config(leviculum_std::config::InterfaceConfig {
+            name: "flooder".to_string(),
+            interface_type: "TCPClientInterface".to_string(),
+            target_host: Some("127.0.0.1".to_string()),
+            target_port: Some(t.port_a),
+            ..Default::default()
+        })
+        .storage_path(storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build the flooder");
+    std::mem::forget(storage);
+    node.start().await.expect("start the flooder");
+    let mut rx = node.take_event_receiver().expect("its events");
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let dest = leviculum_core::DestinationHash::new(t.a.transport.local_named_dest_hash());
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            let _ = node.request_path(&dest).await;
+            node.get_identity(&dest).is_some()
+        })
+        .await,
+        "the flooder learns A's path"
+    );
+    let known = node.get_identity(&dest).expect("A's identity");
+    let mut signing = [0u8; 32];
+    signing.copy_from_slice(&known.public_key_bytes()[32..64]);
+    let routes =
+        t.a.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("A's routes");
+    let pair = routes
+        .iter()
+        .find_map(|r| r.transit_kex_pair().ok().flatten())
+        .expect("A's published pair");
+    Arc::new(Flooder {
+        node,
+        dest,
+        signing,
+        pair,
+        a_key: t.a.key.key_id.clone(),
+        same: leviculum_std::generate_identity(),
+    })
+}
+
+/// A handshake with the field's exact shape, every length and id right, whose
+/// ML-KEM ciphertext is junk: it parses, names A, and forces a decapsulation,
+/// which rejects implicitly and yields keys nobody else holds.
+fn forged_handshake(f: &Flooder, link: [u8; 16]) -> Vec<Vec<u8>> {
+    use ciris_edge::transport::av_transit_handshake as hs;
+    const LIMIT: usize = 380;
+    let (frames, _) =
+        hs::initiate(&link, "flood-key", &f.a_key, &f.pair, LIMIT).expect("a handshake");
+    let mut bytes = Vec::new();
+    for (i, part) in frames.iter().enumerate() {
+        let header = if i == 0 {
+            hs::START_HEADER_LEN
+        } else {
+            hs::CONTINUATION_HEADER_LEN
+        };
+        bytes.extend_from_slice(&part[header..]);
+    }
+    let len = bytes.len();
+    for b in &mut bytes[len - 512..] {
+        *b ^= 0x5a;
+    }
+    hs::fragment(&bytes, LIMIT).expect("frames")
+}
+
+impl Flooder {
+    /// Open a real link and identify it, as every edge does before it keys.
+    async fn open(&self, who: FloodIdentity) -> Option<leviculum_core::LinkId> {
+        let (link, established) = self
+            .node
+            .connect_awaited(&self.dest, &self.signing)
+            .await
+            .ok()?;
+        tokio::time::timeout(Duration::from_secs(10), established)
+            .await
+            .ok()?
+            .ok()?;
+        let id = *link.link_id();
+        let identity = match who {
+            FloodIdentity::Fresh => leviculum_std::generate_identity(),
+            FloodIdentity::Same => self.same.clone(),
+        };
+        self.node.identify_link(&id, &identity).await.ok()?;
+        Some(id)
+    }
+
+    /// One forged handshake on a fresh link.
+    async fn one(&self, who: FloodIdentity) -> bool {
+        let Some(id) = self.open(who).await else {
+            return false;
+        };
+        for frame in forged_handshake(self, id.into_bytes()) {
+            let sent = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.node.link_handle(&id).send(&frame),
+            )
+            .await;
+            if !matches!(sent, Ok(Ok(()))) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Run a flood at about `per_sec` links a second until `stop`.
+fn flood(
+    f: &Arc<Flooder>,
+    who: FloodIdentity,
+    per_sec: u64,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    sent: Arc<std::sync::atomic::AtomicU64>,
+) -> tokio::task::JoinHandle<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let f = Arc::clone(f);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(1000 / per_sec));
+        while !stop.load(Relaxed) {
+            tick.tick().await;
+            let (f, sent) = (Arc::clone(&f), Arc::clone(&sent));
+            tokio::spawn(async move {
+                if f.one(who).await {
+                    sent.fetch_add(1, Relaxed);
+                }
+            });
+        }
+    })
+}
+
+/// How long one frame takes from `from`'s send to `to`'s delivery upward.
+async fn one_way(from: &Node, to: &Node, n: u64, tag: &[u8]) -> Option<Duration> {
+    let mut frame = marked(tag, 300);
+    frame.extend_from_slice(n.to_string().as_bytes());
+    let started = std::time::Instant::now();
+    from.transport.send(&to.key.key_id, &frame).await.ok()?;
+    let deadline = started + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if to.received(&frame).await {
+            return Some(started.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    None
+}
+
+/// **Witness (#947)** — a decapsulation that takes three seconds, on a real
+/// link's real handshake, stalls nothing else: frames on B's established link
+/// keep landing at A inside it, and C's frame lands after its keying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_decapsulation_blocks_no_other_links_frames_947() {
+    const SLOW: Duration = Duration::from_secs(3);
+    const WITHIN: Duration = Duration::from_millis(2_500);
+    let t = trio("slowdecap", true, false, false).await;
+    one_way(&t.b, &t.a, 0, b"947-SLOW-WARMUP-")
+        .await
+        .expect("B's link is up");
+    t.a.transport.set_decap_delay_for_test(SLOW);
+    let c_frame = marked(b"947-SLOW-C-", 700);
+    let c = Arc::clone(&t.c.transport);
+    let (a_key, frame) = (t.a.key.key_id.clone(), c_frame.clone());
+    let dial = tokio::spawn(async move { c.send(&a_key, &frame).await });
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.c.seal("link_seal_initiated") >= 1
+        })
+        .await,
+        "C sent its handshake"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let inside = std::time::Instant::now();
+    let mut worst = Duration::ZERO;
+    for n in 1..=8 {
+        let took = one_way(&t.b, &t.a, n, b"947-SLOW-B-")
+            .await
+            .expect("B's frame lands");
+        worst = worst.max(took);
+    }
+    assert!(
+        inside.elapsed() < WITHIN,
+        "B's eight frames took {:?}, worst {worst:?}, against a {SLOW:?} decapsulation",
+        inside.elapsed()
+    );
+    assert!(
+        !t.a.received(&c_frame).await,
+        "C's frame waits on its keying rather than overtaking it"
+    );
+    t.a.transport.set_decap_delay_for_test(Duration::ZERO);
+    dial.await.expect("joined").expect("C's send");
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.received(&c_frame).await
+        })
+        .await,
+        "C's frame lands once the link is keyed: {:?}",
+        t.a.metrics.link_seal()
+    );
+}
+
+/// **Witness (#947)** — frames that arrive while the link keys are neither
+/// lost nor reordered, on the Channel and on a Resource, and the responder
+/// says nothing until it has keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn frames_during_keying_are_neither_lost_nor_reordered_947() {
+    let t = trio("duringkey", true, false, false).await;
+    t.a.transport
+        .set_decap_delay_for_test(Duration::from_secs(2));
+    t.a.transport.set_link_wire_tap_for_test(true);
+    let small: Vec<Vec<u8>> = (0..12)
+        .map(|i| {
+            let mut f = marked(format!("947-ORDER-{i:02}-").as_bytes(), 300);
+            f.push(i);
+            f
+        })
+        .collect();
+    let big = marked(b"947-KEYING-RESOURCE-", 200_000);
+    let (first, rest) = small.split_at(6);
+    for f in first {
+        t.b.transport.send(&t.a.key.key_id, f).await.expect("send");
+    }
+    let spoke = t.a.transport.link_wire_tapped_for_test();
+    assert!(
+        spoke.is_empty(),
+        "A has no keys yet and says nothing: {} frames",
+        spoke.len()
+    );
+    assert!(
+        !t.a.received(&first[0]).await,
+        "nothing is delivered before the keys"
+    );
+    t.b.transport
+        .send(&t.a.key.key_id, &big)
+        .await
+        .expect("the Resource");
+    for f in rest {
+        t.b.transport.send(&t.a.key.key_id, f).await.expect("send");
+    }
+    // v44 — the hold shows on the gauge while it is held, against its bound.
+    assert!(
+        wait_until(Duration::from_millis(1800), || async {
+            t.a.metrics.snapshot().seal_held_bytes > 0
+        })
+        .await,
+        "the node tick sees the frames held on the keying"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            let seen = t.a.seen.lock().await;
+            small
+                .iter()
+                .chain([&big])
+                .all(|f| seen.iter().any(|s| &s.envelope_bytes == f))
+        })
+        .await,
+        "every frame landed: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            t.a.metrics.snapshot().seal_held_bytes == 0
+        })
+        .await,
+        "and falls when the keying lets go"
+    );
+    let order: Vec<u8> = {
+        let seen = t.a.seen.lock().await;
+        small
+            .iter()
+            .filter_map(|f| seen.iter().position(|s| &s.envelope_bytes == f))
+            .map(|p| u8::try_from(p).unwrap_or(u8::MAX))
+            .collect()
+    };
+    assert!(
+        order.windows(2).all(|w| w[0] < w[1]),
+        "Channel frames land in the order they were sent: {order:?}"
+    );
+    assert!(
+        t.a.seal("link_seal_held_during_keying") >= 6,
+        "they waited on the keying: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert_eq!(t.a.seal("link_seal_dropped_before_keys"), 0);
+    assert_eq!(t.a.seal("link_seal_refused_keying_hold"), 0);
+    assert_eq!(t.a.seal("link_seal_accepted"), 1, "one keying outcome");
+}
+
+/// **Witness (#947)** — a flood of well-formed forged handshakes from fresh
+/// identities on real links: the established link keeps moving, the node runs
+/// only the decapsulations its rate allows and refuses the rest by name, and a
+/// real stranger's first contact gets through by re-dialling. The flood is
+/// paced at three times the rate; a stranger's chance per attempt is the rate
+/// over the flood, which is the most a rate can do against fresh identities.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranger_flood_leaves_traffic_moving_and_first_contact_working_947() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    const CAP: u32 = 30;
+    let t = trio("flood", true, true, false).await;
+    one_way(&t.b, &t.a, 0, b"947-FLOOD-WARMUP-")
+        .await
+        .expect("B's link is up");
+    t.a.transport.set_stranger_handshake_cap_for_test(CAP);
+    let before = t.a.transport.decapsulations_for_test();
+    let f = flooder(&t).await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicU64::new(0));
+    let flood_task = flood(
+        &f,
+        FloodIdentity::Fresh,
+        10,
+        Arc::clone(&stop),
+        Arc::clone(&sent),
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.seal("link_seal_refused_handshake_node_rate") >= 1
+        })
+        .await,
+        "the flood reaches the rate: {:?}",
+        t.a.metrics.link_seal()
+    );
+    let mut worst = Duration::ZERO;
+    for n in 1..=20 {
+        let took = one_way(&t.b, &t.a, n, b"947-FLOOD-B-")
+            .await
+            .expect("B's established link keeps moving under the flood");
+        worst = worst.max(took);
+    }
+    assert!(worst < Duration::from_secs(3), "worst {worst:?}");
+
+    let request = serde_json::to_vec(&serde_json::json!({
+        "message_type": "OpaqueRequest",
+        "signing_key_id": t.c.key.key_id,
+        "body": {"kind": 2, "payload": "device-join-947"},
+    }))
+    .expect("json");
+    let mut attempts = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline && !t.a.received(&request).await {
+        attempts += 1;
+        let _ = t.c.transport.send(&t.a.key.key_id, &request).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+    let landed = t.a.received(&request).await;
+    stop.store(true, Relaxed);
+    let _ = flood_task.await;
+    assert!(
+        landed,
+        "a real first contact gets through the flood after {attempts} attempts: {:?}",
+        t.a.metrics.link_seal()
+    );
+    let ran = t.a.transport.decapsulations_for_test() - before;
+    let forged = sent.load(Relaxed);
+    let refused = t.a.seal("link_seal_refused_handshake_node_rate");
+    // v44 — what the flood did to the event loop, by event: `--nocapture`.
+    let bundle = t.a.metrics.snapshot();
+    let mut held: Vec<_> = bundle.event_handler_duration_seconds.iter().collect();
+    held.sort_by(|a, b| b.1.sum_seconds.total_cmp(&a.1.sum_seconds));
+    for (event, h) in held.iter().filter(|(_, h)| h.count > 0) {
+        println!(
+            "[947 flood] {event}: n={} sum={:.3}s buckets={:?}",
+            h.count,
+            h.sum_seconds,
+            h.buckets()
+        );
+    }
+    println!(
+        "[947 flood] keying {:?}, control queued {}, dropped {:?}",
+        bundle
+            .seal_keying_duration_seconds
+            .iter()
+            .map(|(k, h)| (k.clone(), h.count, h.sum_seconds))
+            .collect::<Vec<_>>(),
+        bundle.leviculum_events_queued["control"],
+        bundle.leviculum_events_dropped
+    );
+    assert!(
+        bundle
+            .event_handler_duration_seconds
+            .values()
+            .map(|h| h.count)
+            .sum::<u64>()
+            > 0,
+        "the loop was timed through the flood"
+    );
+    assert!(
+        ran < forged,
+        "{ran} decapsulations for {forged} forged handshakes"
+    );
+    assert!(refused >= 1);
+    assert_eq!(
+        t.a.transport.keyer_load_for_test().0,
+        0,
+        "the queue drained"
+    );
+}
+
+/// **Witness (#947)** — one sender repeating itself is held to its own rate
+/// and costs the node-wide rate nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_sender_is_held_to_its_own_rate_947() {
+    let t = trio("onesender", true, false, false).await;
+    let f = flooder(&t).await;
+    for _ in 0..24 {
+        f.one(FloodIdentity::Same).await;
+    }
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.seal("link_seal_refused_handshake_sender_rate") >= 1
+        })
+        .await,
+        "{:?}",
+        t.a.metrics.link_seal()
+    );
+    assert_eq!(t.a.seal("link_seal_refused_handshake_node_rate"), 0);
+    assert!(
+        t.a.transport.decapsulations_for_test() <= 16,
+        "the sender's rate held: {}",
+        t.a.transport.decapsulations_for_test()
+    );
+}
+
+/// **Witness (#947)** — standing is live state and has its own budget: with
+/// the stranger rate at zero a Rooted peer still keys; a peer known only by
+/// its announce is a stranger and is refused by name; lift the rate and it
+/// gets through on a re-dial, so a refusal never finished it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standing_has_its_own_budget_and_an_announce_earns_none_947() {
+    let t = trio("standing", true, false, false).await;
+    t.a.transport.set_stranger_handshake_cap_for_test(0);
+    // C is known to A only by its announce.
+    let announced = marked(b"947-ANNOUNCED-ONLY-", 600);
+    let _ = t.c.transport.send(&t.a.key.key_id, &announced).await;
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.seal("link_seal_refused_handshake_node_rate") >= 1
+        })
+        .await,
+        "an announced stranger is refused by name: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(!t.a.received(&announced).await);
+    // A Rooted binding at A: B has standing.
+    t.a.transport
+        .prime_peer(
+            &t.b.key.key_id,
+            t.b.transport.local_named_dest_hash(),
+            t.b.transport.local_transport_pubkey(),
+        )
+        .await
+        .expect("prime B at A");
+    one_way(&t.b, &t.a, 1, b"947-STANDING-B-")
+        .await
+        .expect("a peer with standing keys with the stranger rate at zero");
+    t.a.transport.set_stranger_handshake_cap_for_test(256);
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            let _ = t.c.transport.send(&t.a.key.key_id, &announced).await;
+            t.a.received(&announced).await
+        })
+        .await,
+        "the refused stranger re-dials and gets in: {:?}",
+        t.a.metrics.link_seal()
+    );
+}
+
+/// **Witness (#947)** — a handshake that beats its LINKIDENTIFY is judged by
+/// who sent it, not by that race: B holds standing at A and identifies only
+/// after its first frames, with the stranger rate at zero, and it still keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_that_beats_its_identify_keeps_its_standing_947() {
+    let t = trio("idrace", true, false, false).await;
+    t.a.transport.set_stranger_handshake_cap_for_test(0);
+    t.a.transport
+        .prime_peer(
+            &t.b.key.key_id,
+            t.b.transport.local_named_dest_hash(),
+            t.b.transport.local_transport_pubkey(),
+        )
+        .await
+        .expect("prime B at A");
+    t.b.transport.identify_last_for_test();
+    one_way(&t.b, &t.a, 1, b"947-IDRACE-B-")
+        .await
+        .expect("B keys on its standing though the handshake beat the identify");
+    assert_eq!(t.a.seal("link_seal_refused_handshake_sender_rate"), 0);
+    assert_eq!(t.a.seal("link_seal_refused_handshake_node_rate"), 0);
+}
+
+/// **Witness (#947)** — the `Awaiting` cap, on real links that never send a
+/// handshake: the oldest is refused by name and closed, the newest kept, and a
+/// real dial still keys while they sit there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_awaiting_cap_refuses_the_oldest_by_name_and_keeps_new_links_working_947() {
+    let t = trio("awaitcap", true, false, false).await;
+    one_way(&t.b, &t.a, 0, b"947-AWAIT-WARMUP-")
+        .await
+        .expect("B's link is up");
+    t.a.transport.set_awaiting_caps_for_test(2, 1 << 20);
+    let f = flooder(&t).await;
+    let mut links = Vec::new();
+    for _ in 0..3 {
+        links.push(f.open(FloodIdentity::Fresh).await.expect("a link"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // v44 — half-open links show on the gauge, up to the cap.
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            t.a.metrics.snapshot().seal_awaiting_links == 2
+        })
+        .await,
+        "{:?}",
+        t.a.metrics.snapshot().seal_awaiting_links
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            t.a.seal("link_seal_refused_awaiting_cap") == 1
+        })
+        .await,
+        "{:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            !f.node.link_is_established(&links[0])
+        })
+        .await,
+        "the oldest was closed"
+    );
+    assert!(
+        f.node.link_is_established(&links[2]),
+        "the newest stands: {:?}",
+        t.a.metrics.link_seal()
+    );
+    let frame = marked(b"947-AWAIT-C-", 700);
+    t.c.transport
+        .send(&t.a.key.key_id, &frame)
+        .await
+        .expect("C dials");
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.received(&frame).await
+        })
+        .await,
+        "a real dial keys past half-open links: {:?}",
+        t.a.metrics.link_seal()
+    );
+}
+
+/// **Witness (#947)** — a responder's first words on a keyed link are Channel
+/// sends, which wait on the peer's proofs: held for three seconds, as on a link
+/// whose peer withholds them, they stall no other link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_responders_stalled_first_words_block_no_other_links_frames_947() {
+    const SLOW: Duration = Duration::from_secs(3);
+    const WITHIN: Duration = Duration::from_millis(2_500);
+    let t = trio("firstwords", true, false, false).await;
+    one_way(&t.b, &t.a, 0, b"947-WORDS-WARMUP-")
+        .await
+        .expect("B's link is up");
+    t.a.transport.set_first_words_delay_for_test(SLOW);
+    let frame = marked(b"947-WORDS-C-", 700);
+    t.c.transport
+        .send(&t.a.key.key_id, &frame)
+        .await
+        .expect("C dials");
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.seal("link_seal_accepted") >= 2
+        })
+        .await,
+        "C's link keyed at A"
+    );
+    let inside = std::time::Instant::now();
+    for n in 1..=8 {
+        one_way(&t.b, &t.a, n, b"947-WORDS-B-")
+            .await
+            .expect("B's frame lands");
+    }
+    assert!(
+        inside.elapsed() < WITHIN,
+        "B's eight frames took {:?} against {SLOW:?} of first words",
+        inside.elapsed()
+    );
+}
+
+/// **Witness (v44 LTS, CC 5.4.6: a client retries jittered)** — a real dial, on
+/// real links, refused by a real receiver order: the round that was refused
+/// comes back off the beat. A tick on a fixed multiple of the limiter's window
+/// locks into its closed part; the gaps here are the dials as the receiver saw
+/// them, so nothing but the dial itself is measured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_dial_comes_back_off_the_beat() {
+    const CADENCE: Duration = Duration::from_secs(2);
+    const GAPS: usize = 12;
+    let t = trio("jitter", true, false, false).await;
+    t.a.transport.set_stranger_handshake_cap_for_test(0);
+    let mut runtime = ReplicationRuntime::start(
+        Arc::clone(&t.c.dir) as Arc<dyn FederationDirectory>,
+        Arc::clone(&t.c.transport) as Arc<dyn Transport>,
+        vec![ReplicationPeer {
+            peer_key_id: t.a.key.key_id.clone(),
+            kind: EnvelopeKind::Key,
+        }],
+        ReplicationRuntimeConfig {
+            scheduler: SchedulerConfig {
+                cadence: CADENCE,
+                round_timeout: Duration::from_secs(1),
+                ..SchedulerConfig::default()
+            },
+            local_key_id: Some(t.c.key.key_id.clone()),
+            metrics: Some(t.c.metrics.clone()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let refused = || t.a.seal("link_seal_refused_handshake_node_rate");
+    let mut dials: Vec<std::time::Instant> = Vec::new();
+    let mut seen = refused();
+    let deadline = std::time::Instant::now() + CADENCE * u32::try_from(GAPS * 4).unwrap();
+    while dials.len() <= GAPS && std::time::Instant::now() < deadline {
+        let now = refused();
+        if now > seen {
+            seen = now;
+            dials.push(std::time::Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    runtime.shutdown().await;
+    assert!(
+        dials.len() > GAPS,
+        "the dialler keeps dialling: {} refused dials",
+        dials.len()
+    );
+    let gaps: Vec<f64> = dials
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]).as_secs_f64())
+        .collect();
+    let (min, max) = gaps
+        .iter()
+        .fold((f64::MAX, 0.0_f64), |(lo, hi), g| (lo.min(*g), hi.max(*g)));
+    let c = CADENCE.as_secs_f64();
+    eprintln!("dial jitter witness: gaps {gaps:.2?}");
+    assert!(
+        min >= 0.5 * c - 0.05,
+        "no re-dial inside half a cadence: {gaps:.2?}"
+    );
+    // A round takes some of a gap, so a gap can pass 1.5 by that much.
+    assert!(max <= 1.5 * c + 0.75, "a re-dial is not lost: {gaps:.2?}");
+    assert!(
+        max - min >= 0.5 * c,
+        "the re-dials are off the beat, not on a tick: {gaps:.2?}"
+    );
+}
+
+/// **Witness (#947, v44 LTS)** — a transit KEX that panics costs one link: real
+/// handshake, real worker. The panic is contained and counted, the dialler's
+/// link is refused by name and closed, and the same pool keys its re-dial and
+/// other links, so the worker was not lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_keying_costs_one_link_and_no_worker_947() {
+    let t = trio("panic", true, false, false).await;
+    t.a.transport.panic_next_decap_for_test();
+    let first = marked(b"LTS-PANIC-FIRST-", 600);
+    let _ = t.b.transport.send(&t.a.key.key_id, &first).await;
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.seal(ciris_edge::observability::LINK_SEAL_KEYER_PANICKED) == 1
+        })
+        .await,
+        "the panic happened and was caught: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            t.a.seal(ciris_edge::observability::LINK_SEAL_REFUSED_MALFORMED) >= 1
+        })
+        .await,
+        "the link was refused by name: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(!t.a.received(&first).await, "nothing came through it");
+    one_way(&t.b, &t.a, 1, b"LTS-PANIC-REDIAL-")
+        .await
+        .expect("the pool keys the re-dial");
+    one_way(&t.c, &t.a, 2, b"LTS-PANIC-OTHER-")
+        .await
+        .expect("and another peer's link");
+    assert_eq!(
+        t.a.transport.keyer_load_for_test().0,
+        0,
+        "the queue drained"
+    );
+}
+
+/// **Witness (#947, v44 LTS)** — a suspend that lands while a link is keying
+/// leaves nothing behind: the suspend gets to quiescent with the decapsulation
+/// still on the blocking pool, its outcome lands on no link, and after resume
+/// the pool, the queue and a fresh dial all work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspend_during_keying_leaves_nothing_behind_947() {
+    let t = trio("suspendkey", true, false, false).await;
+    let hold = Duration::from_secs(3);
+    t.a.transport.set_decap_delay_for_test(hold);
+    let frame = marked(b"LTS-SUSPEND-KEYING-", 600);
+    let sender = Arc::clone(&t.b.transport);
+    let key = t.a.key.key_id.clone();
+    let bytes = frame.clone();
+    let send = tokio::spawn(async move { sender.send(&key, &bytes).await });
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.transport.decapsulations_for_test() > 0
+        })
+        .await,
+        "the keying is under way"
+    );
+    let report = t.a.transport.suspend(Duration::from_secs(10)).await;
+    assert!(
+        report.quiescent,
+        "suspended with a keying running: {report:?}"
+    );
+    assert!(report.links_open == 0, "{report:?}");
+    tokio::time::sleep(hold + Duration::from_millis(500)).await;
+    assert!(!t.a.received(&frame).await, "the keying opened nothing");
+    t.a.transport.set_decap_delay_for_test(Duration::ZERO);
+    let accepted = || t.a.seal(ciris_edge::observability::LINK_SEAL_ACCEPTED);
+    let before = accepted();
+    t.a.transport.resume().await.expect("resume");
+    let _ = send.await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(accepted(), before, "the outcome landed on no link");
+    assert_eq!(
+        t.a.transport.keyer_load_for_test().0,
+        0,
+        "the queue is empty"
+    );
+    let landed = wait_until(Duration::from_secs(30), || async {
+        one_way(&t.b, &t.a, 1, b"LTS-SUSPEND-AFTER-")
+            .await
+            .is_some()
+    })
+    .await;
+    assert!(
+        landed,
+        "a fresh dial keys after resume: {:?}",
+        t.a.metrics.link_seal()
+    );
+}
+
+/// **Witness (v44 LTS, `FSD/EVENT_PATH_MODEL.md` §2.6)** — keyed links with no
+/// standing are bounded by count, oldest out, on real links. The rate does not
+/// do it: these links stay keyed for the whole idle bound. A peer with standing
+/// is not counted, and its link stays up through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_oldest_keyed_stranger_gives_way_and_a_peer_with_standing_does_not() {
+    const CAP: u64 = 2;
+    const STRANGERS: u64 = 5;
+    let t = trio("strangercap", true, false, false).await;
+    t.a.transport
+        .prime_peer(
+            &t.b.key.key_id,
+            t.b.transport.local_named_dest_hash(),
+            t.b.transport.local_transport_pubkey(),
+        )
+        .await
+        .expect("prime B at A");
+    one_way(&t.b, &t.a, 1, b"LTS-CAP-BEFORE-")
+        .await
+        .expect("B's link is up");
+    t.a.transport
+        .set_keyed_strangers_max_for_test(usize::try_from(CAP).unwrap());
+    let f = flooder(&t).await;
+    for _ in 0..STRANGERS {
+        f.one(FloodIdentity::Fresh).await;
+    }
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.seal(ciris_edge::observability::LINK_SEAL_REFUSED_STRANGER_CAP) == STRANGERS - CAP
+        })
+        .await,
+        "the oldest strangers gave way: {:?}",
+        t.a.metrics.link_seal()
+    );
+    let links_before = t.b.transport.link_directions_for_test().len();
+    one_way(&t.b, &t.a, 2, b"LTS-CAP-AFTER-")
+        .await
+        .expect("B's link rode through it");
+    assert_eq!(
+        t.b.transport.link_directions_for_test().len(),
+        links_before,
+        "on the link it had"
+    );
+}
+
+/// A process restart of `B`: a new transport over the same identity and
+/// directory, holding what persist holds and nothing else.
+async fn restart_b(t: &Trio) -> (Arc<ReticulumTransport>, EdgeMetrics) {
+    let report = t.b.transport.suspend(Duration::from_secs(10)).await;
+    assert!(report.quiescent, "the old process is gone: {report:?}");
+    let metrics = EdgeMetrics::new();
+    let base = t.tmp.path().join("n1");
+    let signer = t.b.key.signer();
+    let dir = Arc::clone(&t.b.dir);
+    let port_a = t.port_a;
+    let (transport, _) = common::build_reticulum_with_retry_metrics(
+        || {
+            let base = base.clone();
+            let signer = Arc::clone(&signer);
+            let dir = Arc::clone(&dir);
+            async move {
+                let mut c =
+                    ReticulumTransportConfig::new(base.join("transport.id"), &signer.key_id);
+                c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+                c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
+                c.announce_interval = Duration::from_secs(5);
+                (c, auth(signer, &dir))
+            }
+        },
+        metrics.clone(),
+    )
+    .await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(256);
+    let listener = Arc::clone(&transport);
+    tokio::spawn(async move {
+        let _ = listener.listen(tx).await;
+    });
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    (transport, metrics)
+}
+
+/// **Witness (v44 LTS, `FSD/EVENT_PATH_MODEL.md` §2.3)** — after a restart a
+/// peer bound in the directory and on the active roster has standing from its
+/// first handshake. `C` reaches `B` through `A`, which forwards, so `B`'s
+/// restart drops no interface of `C`'s and nothing makes it announce: `B` has
+/// only persist to know it by. (A direct TCP client re-announces when it
+/// reconnects, which is why this needs a hop.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bound_peer_has_standing_from_its_first_handshake_after_a_restart() {
+    bound_peer_after_a_restart("restart", true).await;
+}
+
+/// **Witness (v44 LTS)** — the binding alone earns nothing: the same peer, off
+/// the active roster, is a stranger on the persisted arm too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bound_peer_off_the_roster_is_a_stranger_after_a_restart() {
+    bound_peer_after_a_restart("offroster", false).await;
+}
+
+/// `C` sends `B` `frame` until a handshake has reached `B`, however it was
+/// judged. The path `C` holds can be from before the restart: until `A` has
+/// heard the new `B`, a dial over it goes nowhere and times out, and that is
+/// no handshake of `C`'s. Returns the last send's result.
+async fn dial_until_judged(
+    t: &Trio,
+    frame: &[u8],
+    judged: impl Fn() -> bool,
+) -> impl std::fmt::Debug {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let sent = t.c.transport.send(&t.b.key.key_id, frame).await;
+        let done = wait_until(Duration::from_secs(10), || async { judged() }).await;
+        if done || tokio::time::Instant::now() >= deadline {
+            return sent;
+        }
+    }
+}
+
+async fn bound_peer_after_a_restart(tag: &str, seated: bool) {
+    let t = trio_on(tag, true, false, false, true).await;
+    seed_route(&t.b, &t.c).await;
+    seed_route(&t.c, &t.b).await;
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            // Asked, not awaited: a relay under load holds announces (#945).
+            t.c.transport.seek_peer(&t.b.key.key_id).await
+                && t.b.transport.seek_peer(&t.c.key.key_id).await
+        })
+        .await,
+        "B and C learn each other through A"
+    );
+    t.c.transport.set_unannounced_for_test(true);
+    let (b, metrics) = restart_b(&t).await;
+    b.set_stranger_handshake_cap_for_test(0);
+    if seated {
+        b.set_seats_for_test(std::iter::once(t.c.key.key_id.clone()).collect(), false);
+    }
+    let counted = |label: &str| metrics.link_seal().get(label).copied().unwrap_or(0);
+    let accepted = || counted(ciris_edge::observability::LINK_SEAL_ACCEPTED);
+    let refused = || counted("link_seal_refused_handshake_node_rate");
+    let b_dest = b.local_named_dest_hash();
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.c.transport
+                .path_table_rows_for_test()
+                .iter()
+                .any(|(dest, _, _)| *dest == b_dest)
+        })
+        .await,
+        "C holds a path to B"
+    );
+    assert!(
+        !b.knows_peer(&t.c.key.key_id).await,
+        "the restart holds no live binding for C"
+    );
+    let first = marked(b"LTS-RESTART-BOUND-", 600);
+    let judged = || accepted() >= 1 || refused() >= 1;
+    let sent = dial_until_judged(&t, &first, judged).await;
+    assert!(
+        judged(),
+        "the handshake is judged: {sent:?} {:?}",
+        metrics.link_seal()
+    );
+    let want = if seated { (1, 0) } else { (0, 1) };
+    assert_eq!((accepted(), refused()), want, "{:?}", metrics.link_seal());
+}
+
+/// **Witness (v44 LTS)** — a live binding for the key is the newer word. The
+/// directory still binds `C`'s old identity, a newer binding at `B` names
+/// another, so the old identity has no standing though the roster seats the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_binding_gives_no_standing_after_a_restart() {
+    let t = trio_on("superseded", true, false, false, true).await;
+    seed_route(&t.b, &t.c).await;
+    seed_route(&t.c, &t.b).await;
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            // Asked, not awaited: a relay under load holds announces (#945).
+            t.c.transport.seek_peer(&t.b.key.key_id).await
+                && t.b.transport.seek_peer(&t.c.key.key_id).await
+        })
+        .await,
+        "B and C learn each other through A"
+    );
+    t.c.transport.set_unannounced_for_test(true);
+    let (b, metrics) = restart_b(&t).await;
+    b.set_stranger_handshake_cap_for_test(0);
+    b.set_seats_for_test(std::iter::once(t.c.key.key_id.clone()).collect(), false);
+    b.inject_advisory_peer_with_transport_identity_for_test(
+        &t.c.key.key_id,
+        t.a.transport.local_named_dest_hash(),
+        t.a.transport.local_transport_pubkey(),
+    )
+    .await;
+    let b_dest = b.local_named_dest_hash();
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.c.transport
+                .path_table_rows_for_test()
+                .iter()
+                .any(|(dest, _, _)| *dest == b_dest)
+        })
+        .await,
+        "C holds a path to B"
+    );
+    let frame = marked(b"LTS-SUPERSEDED-", 600);
+    let refused = || {
+        metrics
+            .link_seal()
+            .contains_key("link_seal_refused_handshake_node_rate")
+    };
+    let sent = dial_until_judged(&t, &frame, refused).await;
+    assert!(
+        refused(),
+        "the superseded identity is a stranger: {sent:?} {:?}",
+        metrics.link_seal()
+    );
+}
+
+/// **Measurement (#947), loopback, all in one process**: what a flood of
+/// forged handshakes costs an established link. Not a CI test: run with
+/// `--ignored --nocapture`. Runs on the code before #947 too.
+/// `FLOOD_PER_SEC` (default 40), `FLOOD_SECS` (default 20).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement"]
+async fn measure_flood_cost_947() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (per_sec, secs) = (env("FLOOD_PER_SEC", 40), env("FLOOD_SECS", 20));
+    let t = trio("measure", true, false, false).await;
+    t.a.transport
+        .set_decap_delay_for_test(Duration::from_millis(env("DECAP_MS", 0))); // seam-only
+    one_way(&t.b, &t.a, 0, b"947-MEASURE-WARMUP-")
+        .await
+        .expect("B's link is up");
+    let sample = |label: &'static str, from: u64, n: u64| {
+        let t = &t;
+        async move {
+            let mut took = Vec::new();
+            let mut lost = 0;
+            for i in 0..n {
+                match one_way(&t.b, &t.a, from + i, b"947-MEASURE-B-").await {
+                    Some(d) => took.push(d),
+                    None => lost += 1,
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            took.sort();
+            let at = |pct: usize| {
+                took.get(took.len() * pct / 100)
+                    .copied()
+                    .unwrap_or_default()
+            };
+            println!(
+                "{label}: n={} lost={lost} p50={:?} p99={:?} max={:?}",
+                took.len(),
+                at(50),
+                at(99),
+                took.last().copied().unwrap_or_default()
+            );
+        }
+    };
+    sample("baseline", 1_000, 60).await;
+    let f = flooder(&t).await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicU64::new(0));
+    let accepted = t.a.seal("link_seal_accepted");
+    let flood_task = flood(
+        &f,
+        FloodIdentity::Fresh,
+        per_sec,
+        Arc::clone(&stop),
+        Arc::clone(&sent),
+    );
+    sample("under flood", 2_000, secs * 1000 / 55).await;
+    stop.store(true, Relaxed);
+    let _ = flood_task.await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    println!(
+        "flood: {per_sec}/s asked, {} forged handshakes sent, keyed at A {}, by name: {:?}",
+        sent.load(Relaxed),
+        t.a.seal("link_seal_accepted") - accepted,
+        t.a.metrics
+            .link_seal()
+            .into_iter()
+            .filter(|(k, _)| k.contains("refused") || k.contains("decap"))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    );
 }

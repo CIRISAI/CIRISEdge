@@ -260,8 +260,8 @@ async fn build_edge_pair(
     let peer = FedKey::new("remote-peer", 0xAA);
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
-        signed_record(&local, &steward, "agent"),
-        signed_record(&peer, &steward, "agent"),
+        signed_record(&local, &steward, "node"),
+        signed_record(&peer, &steward, "node"),
     ])
     .await;
     let queue = directory.clone();

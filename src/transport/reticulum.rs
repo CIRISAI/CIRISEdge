@@ -60,7 +60,7 @@
 //! that seed peers from a directory query rather than announces.
 //!
 //! If the peer is not yet resolvable, `send` returns
-//! [`TransportError::Unreachable`] and edge's durable dispatcher
+//! [`TransportError::NoDialCandidate`] and edge's durable dispatcher
 //! retries (FSD/EDGE_OUTBOUND_QUEUE.md §4).
 //!
 //! ## Wire framing
@@ -93,17 +93,22 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::observability::{LinkCloseCause, LinkPoolCloseReason};
+use crate::telemetry::{EventLabel, LoopName};
+use crate::transport::link_shaping::{wait_row_left, RowLeft};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::transport::lifecycle::SuspendReport;
 use leviculum_core::link::LinkId;
 use leviculum_core::resource::ResourceStrategy;
 use leviculum_core::{Destination, DestinationHash, DestinationType, Direction, Identity};
 use leviculum_std::driver::{CompletionError, EventReceiver, ReticulumNode, ReticulumNodeBuilder};
 use leviculum_std::NodeEvent;
+
+use super::persisted_standing::{PersistedStandings, StandingRefresh};
 
 use super::attestation::{
     AnnounceAttestation, AttestationError, AttestationPayload, TransportBindingEnforcement,
@@ -152,8 +157,9 @@ const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 /// no-path link request with `hops = 1` and *broadcasts* it, so the only
 /// thing that can answer is a **directly-attached** neighbor on a live
 /// interface — which replies in a single interface round-trip. A
-/// relay-reachable peer would have produced a path-table entry (from its
-/// announce) and taken the [`LINK_ESTABLISH_TIMEOUT`] branch instead.
+/// relay-reachable peer has a path-table entry by now, from its announce or
+/// from the path request the dial just raised ([`PATH_SEEK_BUDGET`]), and took
+/// the [`LINK_ESTABLISH_TIMEOUT`] branch instead.
 /// Therefore, if a no-path link request has not established within this
 /// window, no amount of further waiting helps: there is no route. We fail
 /// fast with the self-diagnosing [`TransportError::NoRouteToPeer`] rather
@@ -307,6 +313,11 @@ fn effective_control_channel_capacity(
 /// How long [`Transport::send`] waits for a resource transfer to
 /// complete after the link is up.
 const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// CC 5.4.3 rc16 two planes — how long a failed bulk dial stands for its peer
+/// while the peer holds a shaped link: a NAT'd phone does not pay a dial
+/// before each fallback, and a peer that becomes dialable is tried again soon.
+const BULK_DIAL_NEGATIVE_TTL: Duration = Duration::from_secs(120);
 
 /// leviculum#52 — the dwell an operator should leave between
 /// `ifac_activate_next` and `ifac_seal_rotation` when they have no better
@@ -522,6 +533,23 @@ const fn shaping_applies_to(plane: LinkPlane) -> bool {
     matches!(plane, LinkPlane::Identity)
 }
 
+#[cfg(test)]
+mod shaping_plane_tests {
+    use super::{shaping_applies_to, LinkPlane};
+
+    /// CC 5.4.3 rc16 **two planes**: a link belongs to one plane, and only
+    /// the identity (row) plane is ever shaped. An A/V leg (a call or a
+    /// stream) never takes a shaped link, on either end; neither does a
+    /// scoped link. Bulk on an identity link is refused at the shaper
+    /// (`link_shaping::a_shaped_link_carries_rows_and_refuses_bulk_by_name`).
+    #[test]
+    fn only_the_row_plane_is_shaped_and_av_legs_never_are() {
+        assert!(shaping_applies_to(LinkPlane::Identity));
+        assert!(!shaping_applies_to(LinkPlane::Av));
+        assert!(!shaping_applies_to(LinkPlane::Scoped));
+    }
+}
+
 /// CC 5.4.3 — the most plaintext one outbound frame on `link_id` carries:
 /// on a shaped link the shaped frame's body ([`link_shaping::body_capacity`]
 /// of the agreed frame), else the link's Channel MDU.
@@ -683,7 +711,7 @@ async fn send_fragments_on_channel(
     // Channel still sequences and retransmits each frame.
     if let Some(shaper) = shapers.get(link_id.into_bytes()) {
         return match shaper.enqueue(fragments.to_vec()) {
-            Ok(()) => FragmentSendOutcome {
+            Ok(_) => FragmentSendOutcome {
                 sent: total,
                 total,
                 stalled: None,
@@ -693,6 +721,13 @@ async fn send_fragments_on_channel(
                     sent: 0,
                     total,
                     stalled: Some("shaping_queue_full"),
+                }
+            }
+            Err(crate::transport::link_shaping::ShapingError::BulkBeyondReach(..)) => {
+                FragmentSendOutcome {
+                    sent: 0,
+                    total,
+                    stalled: Some(crate::observability::LINK_SHAPING_BULK_REFUSED),
                 }
             }
             Err(_) => FragmentSendOutcome {
@@ -953,6 +988,24 @@ fn reverse_path_wait_step(
     ReverseWaitStep::Continue
 }
 
+/// How long a dial waits for the answer to the path request it just raised.
+/// A transport node answers from its path table after a 400 ms grace, so this
+/// is one grace and a few round trips, with room for a relay that has to ask
+/// on. It must leave the bootstrap dial's [`NO_PATH_ESTABLISH_TIMEOUT`] inside
+/// the send's 10 s round.
+const PATH_SEEK_BUDGET: Duration = Duration::from_secs(3);
+
+/// One path request per destination per this long, whatever is sending: at
+/// leviculum's own repeat interval (`PATH_REQUEST_MIN_INTERVAL_MS`). A path
+/// request is a broadcast, so a retry loop at a dead peer must not make one
+/// per send, and a send behind a recent unanswered ask fails as fast as it
+/// always did.
+const PATH_SEEK_MIN_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Path asks remembered at once. A full table drops the oldest half: the only
+/// cost of forgetting one is an early repeat.
+const PATH_SEEK_TRACKED: usize = 1_024;
+
 /// CIRISEdge#336 (fast heal) — minimum interval between EVENT-DRIVEN announces.
 ///
 /// RNS reachability is on-demand, not periodic: markqvist's reference stack
@@ -1120,6 +1173,33 @@ static NAT_TOPOLOGY_DIAGNOSIS_LOG: std::sync::OnceLock<crate::log_throttle::LogT
 fn reverse_path_fallback_log() -> &'static crate::log_throttle::LogThrottle {
     REVERSE_PATH_FALLBACK_LOG
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+}
+
+static UPGRADE_GUARD_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// v44 — one Resource kept off a link with an upgrade in flight: `label` says
+/// where (`UPGRADE_GUARDED_*`). Counted every time; the line is throttled per
+/// label, and names no peer at INFO.
+fn note_upgrade_guarded(
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    label: &'static str,
+    side: Option<crate::transport::direct_path::UpgradeSide>,
+) {
+    if let Some(m) = metrics {
+        m.inc_direct_link_upgrade_guarded(label);
+    }
+    let throttle = UPGRADE_GUARD_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 16));
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } = throttle.check(label) {
+        tracing::info!(
+            guarded = label,
+            side = side.map_or("-", crate::transport::direct_path::UpgradeSide::as_str),
+            suppressed_prev,
+            "direct link: no Resource on a link with an upgrade in flight; another lane, or the \
+             Channel and a bounded retry (v44, the first cross-NAT run's hold)"
+        );
+    }
 }
 
 static INBOUND_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1992,13 +2072,35 @@ pub struct ReticulumTransportConfig {
     /// makes the `listen_addr` server + every bootstrap client a member-only port;
     /// `None` = open. Typed `interfaces` carry their own IFAC.
     pub ifac: Option<IfacConfig>,
-    /// CIRISEdge#805 item 8 — direct links through NAT (leviculum#70). The
-    /// default is inert: no facilitator (never proposes), none served, every
-    /// peer's request refused. See [`crate::transport::direct_path`].
+    /// CIRISEdge#805 item 8 — direct links through NAT (leviculum#70). v44:
+    /// proposing is ON by default, with the facilitator the host's init
+    /// resolves from the genesis bundle; a config that reaches the transport
+    /// with none resolved proposes nothing. Serving is off and accepting is
+    /// from room peers. See [`crate::transport::direct_path`].
     pub direct_links: crate::transport::direct_path::DirectLinksConfig,
     /// CC 5.4.3 — this node's link-shaping policy (`CLM-link-shaping`).
-    /// Default `off`: nothing is offered and no link is shaped.
+    /// The fleet defaults are `ShapingPolicy::for_device`: on for `server`,
+    /// the person's choice for the rest. A bare config is `off`, a library
+    /// state that names no class, never a fleet position: a host names its
+    /// class.
     pub shaping: crate::transport::link_shaping::ShapingPolicy,
+    /// The device this node runs on (CC 5.4.6 item 1 relay policy; the
+    /// mobile host updates it at runtime, `set_device_state`).
+    pub device: crate::transport::link_shaping::DeviceState,
+    /// ALM stage 2 (`FSD/CIRIS_MESH.md` R2) — an identity dial to a peer
+    /// with no one-hop path tries ROSTER relays (relays the destination was
+    /// heard through whose node shares a room with this node or is a
+    /// consented contact) before the default path (in production, the
+    /// canonical). Default on: it only reorders paths that already exist.
+    pub steer_roster_relays: bool,
+    /// The establish budget per roster relay (one attempt each; edge owns
+    /// the failover to the next, then to the default path).
+    pub relay_establish_budget: Duration,
+    /// ALM stage 2 — a transport node's C2 admission of the links it
+    /// forwards for others (leviculum#93). Installed when
+    /// `enable_transport`; the default admits uncapped at tier 0 and closes
+    /// to new forwarded links at service tier ≥ 1 (§7.2 Admit-close).
+    pub forward_admission: crate::transport::relay_tier::ForwardAdmissionConfig,
 }
 
 impl ReticulumTransportConfig {
@@ -2026,6 +2128,12 @@ impl ReticulumTransportConfig {
             ifac: None,
             direct_links: crate::transport::direct_path::DirectLinksConfig::default(),
             shaping: crate::transport::link_shaping::ShapingPolicy::default(),
+            device: crate::transport::link_shaping::DeviceState::of(
+                crate::transport::link_shaping::DeviceKind::platform_default(),
+            ),
+            steer_roster_relays: true,
+            relay_establish_budget: Duration::from_secs(5),
+            forward_admission: crate::transport::relay_tier::ForwardAdmissionConfig::default(),
         }
     }
 
@@ -2448,6 +2556,9 @@ pub struct ReticulumTransport {
     /// [`AnnounceCtx`]. `None` (the default) keeps every pre-#530 construction
     /// site compiling unchanged and leaves intake evictions loud-but-uncounted.
     metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
+    /// v44 — the node's ladder ([`Transport::attach_load_ladder`]): the node
+    /// tick folds edge's own signals and moves the shapers and admission.
+    load_ladder: std::sync::OnceLock<Arc<crate::load_ladder::SharedLadder>>,
     /// CIRISEdge#809 — this transport's process-unique id for the per-source
     /// gauges in [`crate::observability::EdgeMetrics`] (several transports
     /// may share one bag).
@@ -2522,6 +2633,8 @@ pub struct ReticulumTransport {
     /// `None` until installed: every scope-native lookup then declines and
     /// the federation-scope paths are unaffected.
     scope_addresses: OnceLock<Arc<ScopeAddressTable>>,
+    /// v44 LTS — see [`super::persisted_standing`].
+    persisted_standing: Arc<StandingRefresh>,
     /// CIRISEdge#591 / leviculum#66 — per-interface circuit-breaker series,
     /// fed by `NodeEvent::PeerCongested`. Read via
     /// [`Self::congestion_gauges`].
@@ -2557,9 +2670,40 @@ pub struct ReticulumTransport {
     /// node's pair, and every link's keys. Every frame on every link is sealed
     /// and opened here.
     seals: Arc<crate::transport::link_seal::LinkSeals>,
+    /// CIRISEdge#947 — the bounded pool that runs handshakes' decapsulations
+    /// off the event path ([`crate::transport::link_keying`]).
+    keyer: Arc<crate::transport::link_keying::Keyer>,
+    /// CIRISEdge#947 — the keyer's outcomes, applied by the event loop. Here
+    /// rather than in the listen run: a suspend ends a run, and an outcome
+    /// outlives it.
+    keying_done: Mutex<mpsc::UnboundedReceiver<crate::transport::link_keying::KeyingDone>>,
     /// CC 5.4.3 — the shaped links and this node's shaping policy
     /// ([`crate::transport::link_shaping`]).
     shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    /// CC 5.4.6 — the Anonymous Tier on this node (dormant unless its
+    /// operator opts in and the deal is available; [`crate::onion`]).
+    onion: Arc<crate::onion::runtime::OnionRuntime>,
+    /// CC 5.4.3 rc16 two planes — the bulk fallbacks in progress
+    /// ([`Self::bulk_on_shaped`]).
+    bulk_fallbacks: Arc<crate::transport::link_shaping::BulkFallbacks>,
+    /// Peers whose bulk dial failed lately, so bulk to a peer reachable only
+    /// over its shaped link goes straight there ([`BULK_DIAL_NEGATIVE_TTL`]).
+    bulk_dial_failed: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// Peers that refused this node's row link at their bound, or that this
+    /// node refused at its own, lately: a row send to one fails by name
+    /// without a dial for [`BULK_DIAL_NEGATIVE_TTL`] (the peer homes elsewhere,
+    /// CIRISEdge#935); bulk still dials its unshaped link.
+    row_homed_elsewhere: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// CC 5.4.3 referrals — refused dials with their referrals, to the homing
+    /// worker ([`run_homing`]). A channel and not a spawn: a dial that spawned
+    /// the next dial would be a future containing itself.
+    homing_tx: mpsc::Sender<HomingJob>,
+    /// The worker's end, taken by `listen`.
+    homing_rx: Mutex<Option<mpsc::Receiver<HomingJob>>>,
+    /// The nodes this node homed on, by the node that refused it.
+    homed: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Each node as it is homed on ([`Transport::subscribe_homed`]).
+    homed_events: tokio::sync::broadcast::Sender<String>,
     /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead
     /// of the real one (see [`HandshakeOverride`]). `None` in production.
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
@@ -2571,6 +2715,10 @@ pub struct ReticulumTransport {
     /// binding, so a peer it dials cannot attribute the link. `false` in
     /// production.
     test_unannounced: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — every outbound dial fails as unroutable (a NAT'd peer).
+    test_refuse_dials: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — how many dials [`Self::test_refuse_dials`] refused.
+    test_refused_dials: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#805 item 5 — the router of peer-opened A/V links to the
     /// live calls, once one exists. It owns the A/V arrivals; `None` inside
     /// means another consumer took them first.
@@ -2595,6 +2743,9 @@ pub struct ReticulumTransport {
     /// `.try_recv()` surface — call sites unchanged, field type
     /// updated.
     events: Mutex<Option<EventReceiver>>,
+    /// Mobile-background lifecycle (see [`crate::transport::lifecycle`]): the
+    /// send gate, the listeners' park signal, and the counters suspend reads.
+    lifecycle: Arc<crate::transport::lifecycle::Lifecycle>,
     /// `key_id → rooted peer`, populated by the authenticated
     /// cold-start path from received announces. Every entry has been
     /// rooted against the persist directory + had its attestation
@@ -2623,6 +2774,15 @@ pub struct ReticulumTransport {
     /// CIRISEdge#853 test seam — see
     /// [`ReticulumTransport::delay_channel_sends_for_test`]. 0 in production.
     test_channel_delay_ms: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#926 — the link stall guard
+    /// ([`crate::transport::link_stall`]): per-link runs of Channel sends that
+    /// landed nothing. A link it judged dead is never picked for a send.
+    stall_guard: Arc<crate::transport::link_stall::LinkStallGuard>,
+    /// CIRISEdge#926 test seam — links whose peer has "stopped
+    /// acknowledging", each with how many fragments of a frame still land
+    /// before the window stops opening. Empty in production. See
+    /// [`ReticulumTransport::stop_acks_on_link_for_test`].
+    test_unacked_links: std::sync::Mutex<HashMap<LinkId, usize>>,
     /// CIRISEdge#853 test seam — see
     /// [`ReticulumTransport::delay_resource_ships_for_test`]. 0 in production.
     test_ship_delay_ms: std::sync::atomic::AtomicU64,
@@ -2879,6 +3039,8 @@ pub struct ReticulumTransport {
     /// second lane — and Tokio's is FIFO-fair, so a waiter cannot be starved by
     /// a steady arrival of new senders.
     dial_gate: Arc<Mutex<HashMap<DestinationHash, Arc<tokio::sync::Semaphore>>>>,
+    /// When a path to each destination was last asked for ([`Self::seek_paths`]).
+    path_seeks: PathSeeks,
     /// CIRISEdge#739 — the SCOPED twin of `reusable_dialed_link`: identified
     /// links to a scope-derived member address, keyed by that address, fed
     /// only by [`Self::lease_scoped_link`]'s dial and tagged
@@ -2917,6 +3079,23 @@ pub struct ReticulumTransport {
     /// knob, the per-peer state machine, the dials waiting on a proposal, the
     /// event broadcast and the anchored identity links.
     direct_paths: Arc<crate::transport::direct_path::DirectPaths>,
+    /// v44 — whether leviculum's background re-proposal of a failed direct
+    /// link is on for this node (its default; forced off when proposing is).
+    direct_link_retry: std::sync::atomic::AtomicBool,
+    /// ALM stage 2 — per-link timed-frame expiries and learned relay routes
+    /// (written by the event loop, read by the call layer).
+    alm_links: Arc<crate::transport::alm_link::AlmLinkState>,
+    /// ALM stage 2 — this node's C2 admission of the links it forwards
+    /// (installed on the node when `enable_transport`).
+    forward_admission: Arc<crate::transport::relay_tier::ForwardAdmission>,
+    /// ALM stage 2 — the last forwarded-load reading (`load_ledger`, ladder).
+    forward_load: Arc<std::sync::Mutex<crate::transport::relay_tier::ForwardLoad>>,
+    /// ALM stage 2 — roster relays before the default path (R2).
+    steer_roster_relays: bool,
+    /// ALM stage 2 — establish budget per roster relay.
+    relay_establish_budget: Duration,
+    /// Whether this node forwards for others.
+    forwards_for_others: bool,
     /// CIRISEdge#805 test seam — fail the next N derived-link identifies
     /// ([`Self::fail_next_derived_identifies_for_test`]). Zero in production.
     fail_derived_identify: Arc<std::sync::atomic::AtomicU32>,
@@ -3218,8 +3397,19 @@ impl ReticulumTransport {
 
     /// CIRISEdge#568 — a cloneable handle to the state a cold dial needs, so
     /// the dial can be spawned and survive its round being abandoned.
+    /// CC 5.4.3 rc16 two planes — a dial context for the BULK lane: its pool
+    /// hands out only unshaped links, and its dials offer no shaping (the
+    /// link is marked bulk and carries bulk; [`Transport::send`]).
+    fn bulk_dial_ctx(&self) -> DialCtx {
+        DialCtx {
+            bulk_lane: true,
+            ..self.dial_ctx()
+        }
+    }
+
     fn dial_ctx(&self) -> DialCtx {
         DialCtx {
+            bulk_lane: false,
             node: Arc::clone(&self.node),
             local_identity: self.local_identity.clone(),
             own_bundle: self.own_bundle.clone(),
@@ -3239,9 +3429,25 @@ impl ReticulumTransport {
             own_key_id: self.occurrence_key_id().to_owned(),
             handshake_override: Arc::clone(&self.handshake_override),
             test_unannounced: Arc::clone(&self.test_unannounced),
+            test_refuse_dials: Arc::clone(&self.test_refuse_dials),
+            test_refused_dials: Arc::clone(&self.test_refused_dials),
+            row_homed_elsewhere: Arc::clone(&self.row_homed_elsewhere),
+            homing_tx: self.homing_tx.downgrade(),
+            homed: Arc::clone(&self.homed),
+            homed_events: self.homed_events.clone(),
+            peers: Arc::clone(&self.peers),
             test_identify_last: Arc::clone(&self.test_identify_last),
             deferred_handshake_part: Arc::clone(&self.deferred_handshake_part),
             test_binding_key_only: Arc::clone(&self.test_binding_key_only),
+            stall_guard: Arc::clone(&self.stall_guard),
+            direct_paths: Arc::clone(&self.direct_paths),
+            relay_steer: self.steer_roster_relays.then(|| RelaySteer {
+                budget: self.relay_establish_budget,
+                established: Arc::clone(&self.established_links),
+                peers: Arc::clone(&self.peers),
+                table: self.scope_addresses.get().cloned(),
+                direct_paths: Arc::clone(&self.direct_paths),
+            }),
         }
     }
 
@@ -3331,14 +3537,50 @@ impl ReticulumTransport {
 
         // CC 5.3.3.5 E1 — the per-link seal table, keyed by those transit keys
         // and answering every dialler's handshake as the advertised id.
+        // CC 5.4.6 — the Anonymous Tier, dormant until opted in. Under the
+        // transit stand-in the node's hop key IS its transit pair
+        // (`crate::onion::hop_key`), so the relay decapsulates with the
+        // transit custody in the split form.
+        let onion = Arc::new(crate::onion::runtime::OnionRuntime::new(
+            config.local_key_id.clone(),
+            config.device,
+        ));
+        match crate::onion::hop_key::local_hop_secret_from_transit(&transit_kex) {
+            Ok(hop) => onion.set_relay(Some(crate::onion::relay::OnionRelay::new(hop, None))),
+            Err(e) => tracing::warn!(
+                reason = crate::onion::tokens::NO_VALID_HOP_KEY,
+                error = %e,
+                "no onion hop secret: this node cannot relay (CC 3.3.6.2)"
+            ),
+        }
         let seals = Arc::new(crate::transport::link_seal::LinkSeals::new(
             transit_kex,
             config.local_key_id.clone(),
         ));
+        let (keyer, keying_done) = crate::transport::link_keying::Keyer::new(Arc::clone(&seals));
         // CC 5.4.3 — the shaped-link table under this node's policy.
+        let (homing_tx, homing_rx) = mpsc::channel(HOMING_QUEUE);
         let shapers = Arc::new(crate::transport::link_shaping::LinkShapers::new(
             config.shaping.clone(),
         ));
+        // CC 5.4.3 referrals — free slots are reported from the start, while
+        // the relay offering is on (`onion_refresh` follows it from here).
+        shapers.enable_capacity_reports();
+        shapers.set_relay_offering(onion.relay_offering());
+        // CC 5.4.3 rc17 the `seat` class: the serve seats are the signed
+        // genesis bundle's, never self-declared; a seat-to-seat link is
+        // offered it. This is the bootstrap answer, with an empty directory;
+        // the listener keeps it to the active roster from here on.
+        {
+            let seated: std::collections::HashSet<String> =
+                ciris_persist::federation::genesis::canonical_genesis_bundle()
+                    .serve_nodes
+                    .iter()
+                    .map(|sr| sr.record.key_id.clone())
+                    .collect();
+            let own = seated.contains(&config.local_key_id);
+            shapers.set_seats(seated, own);
+        }
         if shapers.policy().enabled() {
             tracing::info!(
                 class = shapers.policy().class.as_str(),
@@ -3347,8 +3589,10 @@ impl ReticulumTransport {
                 window_s = shapers.policy().window.as_secs(),
                 node_cap_bytes_per_s = shapers.policy().node_cap_bytes_per_s,
                 require_shaped_links = shapers.policy().require_shaped_links,
-                "link shaping ON: every identity link is offered shaping (CC 5.4.3, \
-                 CLM-link-shaping)"
+                all_identity_links = shapers.policy().scope
+                    == crate::transport::link_shaping::ShapingScope::AllIdentityLinks,
+                "link shaping ON at this class: every identity link when all_identity_links, \
+                 else the onion layer links only (CC 5.4.3, CLM-link-shaping)"
             );
         }
 
@@ -3481,10 +3725,12 @@ impl ReticulumTransport {
             .enable_transport(config.enable_transport)
             // CIRISEdge#805 item 8 — always explicit, so the node never runs on
             // a leviculum default (or a stray config file's keys) edge did not
-            // choose. The default is inert.
+            // choose.
             .direct_link(config.direct_links.leviculum_settings());
         tracing::info!(
             proposes = config.direct_links.proposes(),
+            proposing = ?config.direct_links.proposing,
+            facilitator = ?config.direct_links.facilitator,
             serves_facilitator = ?config.direct_links.serve_facilitator,
             accept = ?config.direct_links.accept,
             "reticulum direct links (CIRISEdge#805 item 8, leviculum#70)"
@@ -3783,6 +4029,16 @@ impl ReticulumTransport {
             );
         }
         node.set_announce_control(Some(Box::new(announce_policy.clone())));
+        // leviculum v0.32+ re-proposes a failed direct link on its own
+        // (1, 2, 5, 10, 15 min). That is wanted exactly when this node
+        // proposes (v44: on by default, with a resolved facilitator); while
+        // it does not (proposing off, or no facilitator resolved), no retry
+        // may propose for it either. Proposing was held off from 2026-10-31
+        // (the one-sided punch) until leviculum#89 and CIRISEdge#926 shipped.
+        let direct_link_retry = config.direct_links.proposes();
+        if !direct_link_retry {
+            node.set_direct_link_retry(false);
+        }
 
         // Take the single event receiver before starting, then start
         // the event loop. `listen` claims the stashed receiver.
@@ -3792,6 +4048,16 @@ impl ReticulumTransport {
         node.start()
             .await
             .map_err(|e| TransportError::Io(format!("reticulum node start: {e}")))?;
+        // ALM stage 2 — a transport node's C2 admission of the links it
+        // forwards (leviculum#93). The hook runs under the node lock and reads
+        // only the admission's own ledger.
+        let forward_admission = Arc::new(crate::transport::relay_tier::ForwardAdmission::new(
+            config.forward_admission.clone(),
+        ));
+        if config.enable_transport {
+            let fa = Arc::clone(&forward_admission);
+            node.set_forward_admission(Some(Box::new(move |req| fa.decide(req))));
+        }
 
         tracing::info!(
             addr = %config.listen_addr,
@@ -3861,10 +4127,16 @@ impl ReticulumTransport {
         let direct_paths = Arc::new(crate::transport::direct_path::DirectPaths::new(
             config.direct_links.clone(),
         ));
+        let (steer_roster_relays, relay_establish_budget, forwards_for_others) = (
+            config.steer_roster_relays,
+            config.relay_establish_budget,
+            config.enable_transport,
+        );
         Ok(Self {
             config,
             // CIRISEdge#530 — off by default; attach with `with_metrics`.
             metrics: std::sync::OnceLock::new(),
+            load_ladder: std::sync::OnceLock::new(),
             metrics_source: {
                 static NEXT_METRICS_SOURCE: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(1);
@@ -3877,6 +4149,7 @@ impl ReticulumTransport {
             local_transport_pubkey,
             local_identity: identity.clone(),
             scope_addresses: OnceLock::new(),
+            persisted_standing: Arc::default(),
             congestion: Arc::new(crate::transport::av_backpressure::CongestionRegistry::default()),
             #[cfg(feature = "lxmf")]
             lxmf_serve: OnceLock::new(),
@@ -3893,20 +4166,35 @@ impl ReticulumTransport {
             local_signer,
             self_route,
             seals,
+            keyer,
+            keying_done: Mutex::new(keying_done),
             shapers,
+            onion,
             handshake_override: Arc::new(std::sync::Mutex::new(None)),
             route_answer_override: Arc::new(std::sync::Mutex::new(None)),
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            test_refuse_dials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            test_refused_dials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bulk_fallbacks: Arc::new(crate::transport::link_shaping::BulkFallbacks::default()),
+            bulk_dial_failed: std::sync::Mutex::new(HashMap::new()),
+            row_homed_elsewhere: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            homing_tx,
+            homing_rx: Mutex::new(Some(homing_rx)),
+            homed: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            homed_events: tokio::sync::broadcast::channel(16).0,
             av_call_router: std::sync::OnceLock::new(),
             test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_handshake_part: Arc::new(std::sync::Mutex::new(HashMap::new())),
             test_binding_key_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             events: Mutex::new(Some(events)),
+            lifecycle: Arc::new(crate::transport::lifecycle::Lifecycle::default()),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
             test_force_busy: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             test_channel_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            stall_guard: Arc::default(),
+            test_unacked_links: std::sync::Mutex::new(HashMap::new()),
             test_ship_delay_ms: std::sync::atomic::AtomicU64::new(0),
             test_publish_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             resolver,
@@ -3951,11 +4239,21 @@ impl ReticulumTransport {
             swallow_link_established: std::sync::atomic::AtomicBool::new(false),
             concluded_resources: std::sync::Mutex::new(HashMap::new()),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
+            path_seeks: PathSeeks::default(),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_paths,
+            direct_link_retry: std::sync::atomic::AtomicBool::new(direct_link_retry),
+            alm_links: Arc::new(crate::transport::alm_link::AlmLinkState::new()),
+            forward_admission,
+            forward_load: Arc::new(std::sync::Mutex::new(
+                crate::transport::relay_tier::ForwardLoad::default(),
+            )),
+            steer_roster_relays,
+            relay_establish_budget,
+            forwards_for_others,
             fail_derived_identify: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             tear_down_reply_link: std::sync::atomic::AtomicU32::new(0),
             scoped_pool_bypass: std::sync::atomic::AtomicBool::new(false),
@@ -4107,12 +4405,18 @@ impl ReticulumTransport {
     ///   [`INBOUND_TRANSFER_STALL`], e.g. a large LXMF response);
     /// - an LXMF serve link, for one bound after its last LXMF activity
     ///   (`lxmf_serve_links`);
+    /// - a link on a punched interface whose peer holds a live A/V link: the
+    ///   interface goes with the link, and the call rides it
+    ///   ([`Self::punched_links_under_a_call`]);
     /// - a link still in its attribution handshake (see
     ///   [`inbound_link_idle_expired`]).
     ///
     /// Starts with [`Self::reconcile_vanished_links`]. Runs on
     /// [`Transport::listen`]'s pool tick; public so a host or a test can run
     /// it on demand. Returns how many links it closed.
+    // One pass over one busy set; splitting it would scatter the reasons a link
+    // is left alone away from the list in this doc.
+    #[allow(clippy::too_many_lines)]
     pub async fn reap_idle_inbound_links(&self) -> usize {
         self.reconcile_vanished_links().await;
         let candidates = self
@@ -4149,6 +4453,7 @@ impl ReticulumTransport {
                 .filter(|(_, at)| at.elapsed() < bound)
                 .map(|(id, _)| *id),
         );
+        busy.extend(self.punched_links_under_a_call(&candidates).await);
         let established_at = self.link_established_at.lock().await.clone();
         let last_inbound = self.link_last_inbound_at.lock().await.clone();
         let last_outbound = self
@@ -4172,12 +4477,20 @@ impl ReticulumTransport {
                     last_inbound.get(&id).copied(),
                     last_outbound.get(&id).copied(),
                 );
+                // CC 5.4.3 — a shaped link's quiet is measured against its
+                // own frame gap: between two cover frames it is not idle, and
+                // a bound below the gap's p99 would reap a live shaped link
+                // (and the rows queued on it) between its frames.
+                let bound_here = self
+                    .shapers
+                    .get(id.into_bytes())
+                    .map_or(bound, |s| bound.max(s.frame_gap().mul_f64(4.74)));
                 inbound_link_idle_expired(
                     now_ms,
                     at,
                     snapshot.0.max(snapshot.1),
                     self.node.get_remote_identity(&id).is_some(),
-                    bound,
+                    bound_here,
                 )
                 .then_some((id, snapshot))
             })
@@ -4221,6 +4534,30 @@ impl ReticulumTransport {
             }
         }
         due.len()
+    }
+
+    /// v44 — which of `links` run on a punched interface and belong to a peer
+    /// with a live A/V link. leviculum closes the interface with the link it
+    /// was punched for, and media rides the leg, never that link: on the side
+    /// that did not dial it nothing stamps it and no [`DirectPathGuard`] is
+    /// held. Only that much is busy. A punched link with no call ages, so the
+    /// reaper still ends a wedge, and the A/V link is reaped for its own
+    /// silence, which releases this one.
+    ///
+    /// [`DirectPathGuard`]: crate::transport::direct_path::DirectPathGuard
+    async fn punched_links_under_a_call(&self, links: &[LinkId]) -> Vec<LinkId> {
+        let mut held = Vec::new();
+        for id in links {
+            if self.node.direct_link_interface(id).is_none() {
+                continue;
+            }
+            let peer = self.link_to_peer_key_id.lock().await.get(id).cloned();
+            let Some(peer) = peer else { continue };
+            if self.live_link_to(&peer, LinkPlane::Av).await.is_some() {
+                held.push(*id);
+            }
+        }
+        held
     }
 
     /// **CIRISEdge#853 — reconcile edge's link book against the node.** A
@@ -4556,6 +4893,12 @@ impl ReticulumTransport {
                         in_flight.contains(id)
                             || inbound.contains(id)
                             || self.direct_paths.is_anchored(id)
+                            // CC 5.4.3 — a shaped lane with rows still queued
+                            // on its shaper is mid-transfer, not idle.
+                            || self
+                                .shapers
+                                .get(id.into_bytes())
+                                .is_some_and(|s| s.queued() > 0)
                     },
                     &mut last_used,
                     std::time::Instant::now(),
@@ -4659,10 +5002,18 @@ impl ReticulumTransport {
         if let Some(m) = metrics {
             // First handle wins (CIRISEdge#809): a bag set here is the one
             // `Edge::spawn_background_listeners` finds already attached.
-            let _ = self.metrics.set(m);
+            self.adopt_metrics(m);
         }
         self.report_signer_id_mismatch();
         self
+    }
+
+    /// Hand the bag to everything that counts into it. Both doors come here,
+    /// so a part cannot be left counting into nothing.
+    fn adopt_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        self.keyer.attach_metrics(metrics.clone());
+        self.shapers.attach_metrics(metrics.clone());
+        let _ = self.metrics.set(metrics);
     }
 
     /// CIRISEdge#437 — register (or replace) a peer's presented
@@ -5270,6 +5621,7 @@ impl ReticulumTransport {
         }
         if let Some(lease) = lease_pooled_scoped_link(
             &self.node,
+            &self.stall_guard,
             &self.reusable_scoped_link,
             &self.scoped_link_leased,
             &self.link_plane,
@@ -5296,7 +5648,9 @@ impl ReticulumTransport {
         let leased = Arc::clone(&self.scoped_link_leased);
         let last_used = Arc::clone(&self.pool_last_used);
         let dkid = destination_key_id.to_owned();
-        let dial = tokio::spawn(async move {
+        // Lifecycle — a dial is refused while suspended and cancelled by one.
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let dial = tokio::spawn(lifecycle.guard_task(async move {
             let _dial_permit = gate
                 .acquire()
                 .await
@@ -5305,6 +5659,7 @@ impl ReticulumTransport {
             // just published an idle lane.
             if let Some(lease) = lease_pooled_scoped_link(
                 &ctx.node,
+                &ctx.stall_guard,
                 &pool,
                 &leased,
                 &ctx.link_plane,
@@ -5330,7 +5685,7 @@ impl ReticulumTransport {
                 .or_default()
                 .push(link_id);
             Ok(lease)
-        });
+        }));
         dial.await
             .map_err(|e| TransportError::Io(format!("scoped dial task failed: {e}")))?
     }
@@ -5533,6 +5888,66 @@ impl ReticulumTransport {
         self.seals.set_route_request_cap(cap);
     }
 
+    /// CIRISEdge#947 test seam — every decapsulation on this node takes this
+    /// long, off the event path.
+    #[doc(hidden)]
+    pub fn set_decap_delay_for_test(&self, delay: Duration) {
+        self.seals.set_decap_delay(delay);
+    }
+
+    /// Test seam — cap the frame this node offers on a shaped link, so a rate
+    /// witness on a real link sees enough frames to bound.
+    #[doc(hidden)]
+    pub fn set_shaped_frame_cap_for_test(&self, bytes: usize) {
+        self.shapers.set_frame_cap_for_test(bytes);
+    }
+
+    /// CIRISEdge#947 test seam — a responder's first words on a keyed link
+    /// wait this long first, as they do on a link whose peer withholds its
+    /// Channel proofs.
+    #[doc(hidden)]
+    pub fn set_first_words_delay_for_test(&self, delay: Duration) {
+        self.seals.set_first_words_delay(delay);
+    }
+
+    /// CIRISEdge#947 test seam — the node-wide rate of strangers' handshakes
+    /// per window.
+    #[doc(hidden)]
+    pub fn set_stranger_handshake_cap_for_test(&self, cap: u32) {
+        self.seals.set_stranger_handshake_cap(cap);
+    }
+
+    /// v44 LTS test seam — the next decapsulation panics.
+    #[doc(hidden)]
+    pub fn panic_next_decap_for_test(&self) {
+        self.seals.panic_next_decap();
+    }
+
+    /// v44 LTS test seam — the cap on keyed strangers.
+    #[doc(hidden)]
+    pub fn set_keyed_strangers_max_for_test(&self, max: usize) {
+        self.seals.set_keyed_strangers_max(max);
+    }
+
+    /// CIRISEdge#947 test seam — the caps on links awaiting a handshake.
+    #[doc(hidden)]
+    pub fn set_awaiting_caps_for_test(&self, links: usize, bytes: usize) {
+        self.seals.set_awaiting_caps(links, bytes);
+    }
+
+    /// CIRISEdge#947 test seam — decapsulations this node has run.
+    #[doc(hidden)]
+    pub fn decapsulations_for_test(&self) -> u64 {
+        self.seals.decapsulations()
+    }
+
+    /// CIRISEdge#947 test seam — handshakes waiting for a keyer worker, and
+    /// the pool's size.
+    #[doc(hidden)]
+    pub fn keyer_load_for_test(&self) -> (usize, usize) {
+        (self.keyer.depth(), self.keyer.workers())
+    }
+
     /// CC 5.3.3.5 E1 test seam — start (or stop and clear) recording every
     /// frame this node hands leviculum on any link, exactly as sent: the
     /// handshake parts and every sealed frame.
@@ -5616,6 +6031,7 @@ impl ReticulumTransport {
         let refused = |r: &crate::transport::link_seal::SealRefusal| {
             seal_refused(self.metrics.get(), peer_key_id, None, r, "dial")
         };
+        self.seek_if_unpathed(peer_key_id).await;
         // CC 3.3.6.2 in-row separation against the dialled node's keys this
         // device holds: its announced transport identity, (b) of persist's
         // other_keys groups.
@@ -5667,7 +6083,11 @@ impl ReticulumTransport {
         } else {
             NO_PATH_ESTABLISH_TIMEOUT
         };
-        let ctx = self.dial_ctx();
+        // CC 3.2 (f) + CC 5.4.3 — no shaping offer: this link carries first
+        // contact only, sent frame by frame below, and neither an offer nor a
+        // shaped frame is first contact. A shaped link would refuse those bare
+        // frames as the wrong kind and close.
+        let ctx = self.bulk_dial_ctx();
         let link_id = ctx
             .connect_and_key(
                 peer_key_id,
@@ -5743,6 +6163,15 @@ impl ReticulumTransport {
         address: &MemberAddress,
         initiator_key_id: &str,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
+        // CC 5.4.3 rc16 — a node in anonymous mode is confined to the row
+        // plane: it opens no A/V leg (no call, no stream).
+        if let Err(token) = self.onion.media_allowed() {
+            self.onion.count(token);
+            return Err(TransportError::Config(format!(
+                "{token}: this node is in anonymous mode (its Anonymous Tier is active); \
+                 no call and no stream ride its links (CC 5.4.3)"
+            )));
+        }
         let (dest_hash, transport_keys, pair) =
             self.av_dial_target(destination_key_id, address).await?;
         // CIRISEdge#805 item 8 — a derived address answers only a one-hop
@@ -5998,6 +6427,7 @@ impl ReticulumTransport {
                 member.as_deref().unwrap_or("<none>"),
             )));
         }
+        self.seek_if_unpathed(destination_key_id).await;
         // CIRISEdge#805 (CC 5.3.3.5 E1) — the link can only be keyed by the
         // dialled node's published transit pair: no pair, no dial, refused by
         // name before a link is spent on it.
@@ -6049,6 +6479,9 @@ impl ReticulumTransport {
             DirectOutcome, DirectPath, DirectPathState, DIRECT_PATH_BUDGET,
         };
         if !self.direct_paths.config.proposes() {
+            if let Some(m) = self.metrics.get() {
+                m.inc_direct_link(self.direct_paths.config.off_label());
+            }
             return DirectPath::NotConfigured;
         }
         // ONE deadline over the identity-link dial, the proposal and its
@@ -6071,7 +6504,10 @@ impl ReticulumTransport {
                 };
             }
         }
-        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let mut candidates = self.resolve_dial_candidates(destination_key_id).await;
+        if candidates.is_empty() && self.seek_peer(destination_key_id).await {
+            candidates = self.resolve_dial_candidates(destination_key_id).await;
+        }
         if candidates.is_empty() {
             count(crate::observability::DIRECT_LINK_SKIPPED_NO_LINK);
             return DirectPath::Unavailable { reason: "no_link" };
@@ -6088,7 +6524,7 @@ impl ReticulumTransport {
         // abandons the wait, not the link.
         let lane = with_timeout(
             remaining(),
-            self.identity_lane(destination_key_id, &candidates),
+            self.identity_lane(destination_key_id, &candidates, false),
         )
         .await;
         let link = match lane {
@@ -6193,6 +6629,42 @@ impl ReticulumTransport {
             }
         };
         let now = std::time::Instant::now();
+        // v44 — proposal glare (leviculum#96): leviculum refuses a REQUEST
+        // that crosses this node's own proposal on the same link REJECT_BUSY
+        // before the host sees it, so both ends proposing at once both fail.
+        // The tie-break is the link's direction, an asymmetric fact both ends
+        // hold: only the INITIATOR proposes on a link; the responder yields,
+        // and proposes itself only after GLARE_WAIT without the initiator's
+        // proposal. A link of unknown direction is treated as initiated.
+        let initiator = self
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_link
+            .get(&link)
+            .map_or(true, |d| *d == LinkDirection::Outbound);
+        let since = self.direct_paths.yield_since(destination_key_id);
+        match crate::transport::direct_path::glare_verdict(initiator, since, now) {
+            crate::transport::direct_path::GlareVerdict::Yield => {
+                if since.is_none() {
+                    self.direct_paths.note_yield(destination_key_id, now);
+                    self.spawn_yield_fallback(destination_key_id, link);
+                }
+                count(crate::observability::DIRECT_LINK_YIELDED);
+                tracing::info!(
+                    key_id = %destination_key_id,
+                    link = %hex::encode(link.as_bytes()),
+                    "direct path: the peer initiated this link, so it proposes; yielding \
+                     (v44, leviculum#96)"
+                );
+                return Err(DirectPath::Unavailable {
+                    reason: "yield_to_initiator",
+                });
+            }
+            crate::transport::direct_path::GlareVerdict::Propose => {
+                self.direct_paths.clear_yield(destination_key_id);
+            }
+        }
         let admitted = self
             .direct_paths
             .tracker()
@@ -6226,41 +6698,56 @@ impl ReticulumTransport {
                 // interface: the Lost event is on its way. Dial as without.
                 Err(DirectPath::Unavailable { reason: "pending" })
             }
-            Ok(()) => {
-                // Registered BEFORE the dispatch, so the outcome cannot precede
-                // the registration.
-                let rx = self.direct_paths.wait_for(link);
-                let before = link_channel_message_limit(&self.node, &link);
-                self.direct_paths
-                    .tracker()
-                    .proposed(destination_key_id, link, before, now);
-                if let Err(e) = self.node.propose_direct_link(&link).await {
-                    self.direct_paths.forget(link);
-                    self.direct_paths
-                        .tracker()
-                        .propose_refused(destination_key_id, link, now);
-                    count(crate::observability::DIRECT_LINK_PROPOSE_REFUSED);
-                    tracing::info!(
-                        key_id = %destination_key_id,
-                        link = %hex::encode(link.as_bytes()),
-                        error = %e,
-                        "direct path: leviculum refused the proposal (CIRISEdge#805 item 8)"
-                    );
-                    return Err(DirectPath::Unavailable {
-                        reason: "propose_refused",
-                    });
-                }
-                count(crate::observability::DIRECT_LINK_PROPOSED);
-                tracing::info!(
-                    key_id = %destination_key_id,
-                    link = %hex::encode(link.as_bytes()),
-                    channel_limit_before = ?before,
-                    "direct path: PROPOSED on the identity link to a call member or room \
-                     peer (CIRISEdge#805 item 8, #915)"
-                );
-                Ok((link, rx))
-            }
+            Ok(()) => dispatch_proposal(
+                &self.node,
+                &self.direct_paths,
+                self.metrics.get(),
+                destination_key_id,
+                link,
+                now,
+            )
+            .await
+            .map(|rx| (link, rx)),
         }
+    }
+
+    /// v44 (leviculum#96) — the end of a yield: after [`GLARE_WAIT`], jittered,
+    /// propose on `link` if nothing has settled it. A timer, because the send
+    /// that yielded may be this node's last on the link (#920: a peer that only
+    /// replies must still bring it direct). Nothing happens if the initiator's
+    /// proposal came meanwhile, a send took this node's turn, the standing is
+    /// gone, the link is gone, or the transport is suspended.
+    ///
+    /// [`GLARE_WAIT`]: crate::transport::direct_path::GLARE_WAIT
+    fn spawn_yield_fallback(&self, peer: &str, link: LinkId) {
+        use crate::transport::direct_path::{jitter_draw, GLARE_WAIT};
+        let peer = peer.to_owned();
+        let node = Arc::clone(&self.node);
+        let direct_paths = Arc::clone(&self.direct_paths);
+        let table = self.scope_addresses.get().cloned();
+        let metrics = self.metrics.get().cloned();
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let wait = GLARE_WAIT.mul_f64(1.0 + jitter_draw());
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            if direct_paths.yield_since(&peer).is_none() {
+                return;
+            }
+            direct_paths.clear_yield(&peer);
+            if let Some(m) = metrics.as_ref() {
+                m.inc_direct_link(crate::observability::DIRECT_LINK_YIELD_EXPIRED);
+            }
+            let now = std::time::Instant::now();
+            if lifecycle.is_suspended()
+                || !direct_standing(table.as_deref(), &direct_paths, &peer)
+                || !node.link_is_established(&link)
+                || direct_paths.tracker().admit(&peer, link, now).is_err()
+            {
+                return;
+            }
+            let _ =
+                dispatch_proposal(&node, &direct_paths, metrics.as_ref(), &peer, link, now).await;
+        });
     }
 
     /// CIRISEdge#805 item 8 — THE accept decision for a peer's direct-link
@@ -6293,6 +6780,83 @@ impl ReticulumTransport {
         )
     }
 
+    /// ALM stage 2 — one A/V link's delivery telemetry (leviculum#35), or
+    /// `None` when leviculum no longer holds the link.
+    #[must_use]
+    pub fn av_link_stats(
+        &self,
+        link: &[u8; 16],
+    ) -> Option<crate::transport::alm_link::AvLinkStats> {
+        let st = self.node.link_stats(&LinkId::new(*link))?;
+        Some(crate::transport::alm_link::AvLinkStats {
+            bytes_delivered: st.bytes_delivered(),
+            srtt_ms: st.srtt_ms(),
+            min_rtt_ms: st.min_rtt_ms(),
+            busy_rejections: st.busy_rejections(),
+            pacing_rejections: st.pacing_rejections(),
+            window: st.window(),
+            window_max: st.window_max(),
+        })
+    }
+
+    /// ALM stage 2 — timed media frames on `link` that never arrived fresh
+    /// (leviculum#94), by side.
+    #[must_use]
+    pub fn av_link_expired(&self, link: &[u8; 16]) -> crate::transport::alm_link::ExpiredCounts {
+        self.alm_links.expired(link)
+    }
+
+    /// ALM stage 2 — the transport's ALM state (learned relay routes).
+    #[must_use]
+    pub fn alm_links(&self) -> &crate::transport::alm_link::AlmLinkState {
+        &self.alm_links
+    }
+
+    /// ALM stage 2 — this node's C2 admission of forwarded links.
+    #[must_use]
+    pub fn forward_admission(&self) -> &crate::transport::relay_tier::ForwardAdmission {
+        &self.forward_admission
+    }
+
+    /// ALM stage 2 — the last forwarded-load reading (zero on a leaf).
+    #[must_use]
+    pub fn forward_load(&self) -> crate::transport::relay_tier::ForwardLoad {
+        self.forward_load
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// ALM stage 2 (`FSD/CIRIS_MESH.md` §7) — the service tier: forwarded
+    /// links close to new admissions at tier ≥ 1, and so do shaped slots for
+    /// peers this node owes nothing; tier 2 sheds those links and pauses their
+    /// slow path (`FSD/PRIVACY_MODES.md` §6.12). Cover is not shed.
+    pub fn set_service_tier(&self, tier: crate::load_ladder::ServiceTier) {
+        self.forward_admission.set_tier(tier);
+        self.shapers.set_service_tier(tier);
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.12 — install what a shed lever reads at
+    /// decision time. With none, nothing on a shaped slot is shed.
+    pub fn install_peer_obligations(&self, reader: Arc<dyn crate::load_ladder::PeerObligations>) {
+        self.shapers.set_obligations(reader);
+    }
+
+    /// ALM stage 2 — the key id of the roster member (a room peer or a
+    /// consented contact) whose transport identity hash is `relay`, if any:
+    /// the roster relay tier's eligibility (R2, §3.3).
+    pub async fn roster_relay_key(&self, relay: &[u8; 16]) -> Option<String> {
+        RelaySteer {
+            budget: self.relay_establish_budget,
+            established: Arc::clone(&self.established_links),
+            peers: Arc::clone(&self.peers),
+            table: self.scope_addresses.get().cloned(),
+            direct_paths: Arc::clone(&self.direct_paths),
+        }
+        .roster_key(relay)
+        .await
+    }
+
     /// Eric 2026-10-30 — name `node_key_id` a consented contact: this node
     /// accepts a direct link from it and proposes one to it, like a room
     /// peer. Call on sending a contact request and on accepting one, with the
@@ -6305,6 +6869,36 @@ impl ReticulumTransport {
     /// request).
     pub fn forget_direct_contact(&self, node_key_id: &str) {
         self.direct_paths.forget_contact(node_key_id);
+    }
+
+    /// v44 test seam — propose to `peer` on `link` now, as a send over it
+    /// would (the standing check, then the glare tie-break and the
+    /// proposal). Returns what happened: `proposed`, `joined`, or the reason
+    /// nothing was proposed (`no_standing`, `yield_to_initiator`,
+    /// `backing_off`, …).
+    #[doc(hidden)]
+    pub async fn propose_direct_on_link_for_test(&self, peer: &str, link: [u8; 16]) -> String {
+        use crate::transport::direct_path::DirectPath;
+        if !self.direct_paths.config.proposes() {
+            return "not_configured".to_owned();
+        }
+        if !self.direct_standing(peer) {
+            return "no_standing".to_owned();
+        }
+        match self.start_or_join_proposal(peer, LinkId::new(link)).await {
+            Ok((l, _)) if l == LinkId::new(link) => "proposed".to_owned(),
+            Ok(_) => "joined".to_owned(),
+            Err(DirectPath::Unavailable { reason }) => reason.to_owned(),
+            Err(other) => format!("{other:?}"),
+        }
+    }
+
+    /// v44 — whether leviculum re-proposes this node's failed direct links in
+    /// the background: on iff this node proposes.
+    #[must_use]
+    pub fn direct_link_retry_enabled(&self) -> bool {
+        self.direct_link_retry
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// CIRISEdge#805 item 8 — every direct-path event this node sees (either
@@ -6518,6 +7112,62 @@ impl ReticulumTransport {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    /// Seat-tier test seam — name the serve seats and whether this node is one
+    /// (production reads the signed genesis bundle).
+    #[doc(hidden)]
+    pub fn set_seats_for_test(&self, seats: std::collections::HashSet<String>, own: bool) {
+        self.shapers.set_seats(seats, own);
+    }
+
+    /// Seat-tier test seam — whether a link to `peer` is a seat link now.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_seat_link_for_test(&self, peer: &str) -> bool {
+        self.shapers.is_seat_link(Some(peer))
+    }
+
+    /// Seat-tier test seam — seats by key-id prefix.
+    #[doc(hidden)]
+    pub fn set_seat_prefixes_for_test(&self, prefixes: Vec<String>, own: bool) {
+        self.shapers.set_seat_prefixes(prefixes, own);
+    }
+
+    /// Test seam — the shaped links' ids.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn shaped_link_ids_for_test(&self) -> Vec<[u8; 16]> {
+        self.shapers.shaped_links()
+    }
+
+    /// Test seam — the agreed frame rate (λ) of each shaped link.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn shaped_rates_for_test(&self) -> Vec<f64> {
+        self.shapers
+            .shaped_links()
+            .into_iter()
+            .filter_map(|l| self.shapers.get(l))
+            .map(|s| s.agreement().lambda)
+            .collect()
+    }
+
+    /// CC 5.4.3 two-planes test seam — dials refused so far.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn refused_dials_for_test(&self) -> u64 {
+        self.test_refused_dials
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// CC 5.4.3 two-planes test seam — every outbound dial from this node
+    /// fails as unroutable, as to a NAT'd peer: only links the peer dials in
+    /// remain.
+    #[doc(hidden)]
+    pub fn refuse_outbound_dials_for_test(&self, on: bool) {
+        self.test_refuse_dials
+            .store(on, std::sync::atomic::Ordering::Release);
     }
 
     /// CIRISEdge#805 test seam — the next `n` derived-link dials fail at
@@ -6774,6 +7424,29 @@ impl ReticulumTransport {
             .map(|p| p.dest_hash.into_bytes())
     }
 
+    /// Lifecycle test seam — the tunnel ids this node synthesized on its TCP
+    /// clients (leviculum `ReticulumNode::tunnel_ids`).
+    #[doc(hidden)]
+    pub fn tunnel_ids_for_test(&self) -> Vec<[u8; 32]> {
+        self.node.tunnel_ids()
+    }
+
+    /// Lifecycle test seam — the node's interface names now.
+    #[doc(hidden)]
+    pub fn interface_names_for_test(&self) -> Vec<String> {
+        self.node
+            .interface_stats()
+            .into_iter()
+            .map(|i| i.name)
+            .collect()
+    }
+
+    /// Lifecycle test seam — sends running through the lifecycle gate now.
+    #[doc(hidden)]
+    pub fn sends_in_flight_for_test(&self) -> usize {
+        self.lifecycle.sends_in_flight()
+    }
+
     /// v7.0.0 (CIRISEdge#191 / #195) test seam — install a synthetic
     /// rooted-peer entry that bypasses the announce-rooting cold-start.
     ///
@@ -6821,6 +7494,84 @@ impl ReticulumTransport {
     pub fn delay_dial_publish_for_test(&self, ms: u64) {
         self.test_publish_delay_ms
             .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#926 test seam — the peer "stops acknowledging" on `link`:
+    /// every Channel send on it lands its first `land` fragments and then
+    /// waits out the pacing bound with the window shut (the field's
+    /// `0/N landed … fragment_pacing_timeout` when `land == 0`; a slow link
+    /// that still lands some when `land > 0`), and its Resource slot stays
+    /// held (`Busy`). `None` restores the link.
+    #[doc(hidden)]
+    pub fn stop_acks_on_link_for_test(&self, link: [u8; 16], land: Option<usize>) {
+        let mut links = self
+            .test_unacked_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match land {
+            Some(n) => {
+                links.insert(LinkId::new(link), n);
+            }
+            None => {
+                links.remove(&LinkId::new(link));
+            }
+        }
+    }
+
+    /// CIRISEdge#926 test seam — one guarded Channel send of `bytes` on
+    /// `link`, exactly as the reverse path makes one; `(sent, total)`.
+    #[doc(hidden)]
+    pub async fn send_channel_for_test(&self, link: [u8; 16], bytes: &[u8]) -> (usize, usize) {
+        let id = LinkId::new(link);
+        let mdu = send_mdu(&self.node, &self.shapers, &id);
+        let Some(fragments) = crate::transport::frame_fragment::fragment(bytes, mdu) else {
+            return (0, 0);
+        };
+        let out = self.send_channel_marked(id, &fragments).await;
+        (out.sent, out.total)
+    }
+
+    /// CIRISEdge#926 test seam — the plaintext size one Channel fragment
+    /// carries on `link` (what the fragmenter cuts a frame to).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn channel_fragment_bytes_for_test(&self, link: [u8; 16]) -> usize {
+        send_mdu(&self.node, &self.shapers, &LinkId::new(link))
+    }
+
+    /// CIRISEdge#926 test seam — zero-landing sends in `link`'s current stall
+    /// run, and whether the guard judged it dead.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn link_stall_for_test(&self, link: [u8; 16]) -> (u32, bool) {
+        (
+            self.stall_guard.zero_sends(&link),
+            self.stall_guard.is_dead(&link),
+        )
+    }
+
+    /// CIRISEdge#926 test seam — `link`'s Channel has nothing outstanding
+    /// (every frame sent on it so far was acknowledged), so no delivery proof
+    /// is still on its way to restart a stall run under a witness.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn link_channel_settled_for_test(&self, link: [u8; 16]) -> bool {
+        self.node
+            .link_stats(&LinkId::new(link))
+            .is_some_and(|s| s.tx_ring_size() == 0)
+    }
+
+    /// CIRISEdge#926 test seam — the links the peer `peer` identified to this
+    /// node (the reverse-path candidates), live at the node.
+    #[doc(hidden)]
+    pub async fn reverse_links_for_test(&self, peer: &str) -> Vec<[u8; 16]> {
+        self.link_to_peer_key_id
+            .lock()
+            .await
+            .iter()
+            .filter(|(id, p)| p.as_str() == peer && self.node.link_is_established(id))
+            .map(|(id, _)| id.into_bytes())
+            .collect()
     }
 
     pub fn force_next_sends_busy_for_test(&self, n: u32) {
@@ -6892,6 +7643,13 @@ impl ReticulumTransport {
         if let Some(m) = self.metrics.get() {
             m.inc_peer_binding(crate::observability::PEER_BINDING_PRIMED);
         }
+        // CIRISEdge#794 — the host just gave this node somewhere to send: a
+        // peer with no candidate has been in the no-route backoff since before
+        // this binding existed, and no announce may follow to clear it.
+        let _ = self.peer_reachable.send(PeerReachable::new(
+            destination_key_id.to_string(),
+            ReachabilityEvidence::PathLearned,
+        ));
         tracing::debug!(
             key_id = %destination_key_id,
             dest = %hex::encode(dest_hash),
@@ -7052,6 +7810,264 @@ impl ReticulumTransport {
     // ALSO emit `LinkEvent`s on `event_bus.emit_link(...)` so the
     // `subscribe_link_events` AsyncIterator (closes the link half of
     // CIRISEdge#34) actually fires.
+
+    /// CC 5.4.6 — this node's Anonymous Tier (dormant in v44 unless opted in
+    /// and available).
+    #[must_use]
+    pub fn onion(&self) -> &Arc<crate::onion::runtime::OnionRuntime> {
+        &self.onion
+    }
+
+    /// CC 5.4.3 — this node's shaping policy now.
+    #[must_use]
+    pub fn shaping_policy(&self) -> crate::transport::link_shaping::ShapingPolicy {
+        self.shapers.policy()
+    }
+
+    /// Shaped links now.
+    #[must_use]
+    pub fn shaped_link_count(&self) -> usize {
+        self.shapers.shaped_count()
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §6.6, E8 — **the typed status a host reads**:
+    /// every value comes from the running policy, shapers, tier and tier
+    /// runtime when asked.
+    #[must_use]
+    pub fn shaping_status(&self) -> crate::transport::link_shaping::ShapingStatus {
+        use crate::transport::link_shaping::{
+            BudgetClass, DeviceKind, ShapingFigures, ShapingPolicy, ShapingScope, ShapingStatus,
+            REFERENCE_FRAME_BYTES,
+        };
+        let policy = self.shapers.policy();
+        let links = self.shapers.links_status();
+        let agreed_frame = links
+            .iter()
+            .filter(|l| !l.seat)
+            .map(|l| l.frame_bytes)
+            .max();
+        let frame = agreed_frame.unwrap_or(REFERENCE_FRAME_BYTES);
+        let onion = self.onion.status();
+        let device = self.onion.device();
+        let figures = ShapingFigures::of(&policy, frame);
+        // A phone's two networks (§6.6's `_cellular` set); the one in force
+        // comes from the policy, whatever a host set it to.
+        let device_figures = if device.kind == DeviceKind::Phone {
+            [BudgetClass::PhoneWifi, BudgetClass::PhoneCellular]
+                .into_iter()
+                .filter_map(|class| {
+                    if class == policy.class {
+                        ShapingFigures::of(&policy, frame)
+                    } else {
+                        ShapingFigures::of(&ShapingPolicy::for_class(class), frame)
+                    }
+                })
+                .collect()
+        } else {
+            figures.iter().cloned().collect()
+        };
+        let tier = self.shapers.service_tier();
+        ShapingStatus {
+            class: policy.class.as_str(),
+            enabled: policy.enabled(),
+            all_links: policy.scope == ShapingScope::AllIdentityLinks,
+            require_shaped_links: policy.require_shaped_links,
+            bytes_per_s: policy.bytes_per_s,
+            node_cap_bytes_per_s: policy.node_cap_bytes_per_s,
+            figures,
+            device_figures,
+            frame_agreed: agreed_frame.is_some(),
+            service_tier: tier.as_u8(),
+            admit_closed: !tier.admits_new_shaped_links(),
+            shaped_links: links.len(),
+            counted_links: self.shapers.counted_link_count(),
+            max_links: self.shapers.max_links(),
+            free_slots: self.shapers.free_slots(),
+            reported_slots: self.shapers.reported_slots(),
+            layer_held_slots: self.shapers.layer_held_slots(),
+            relay_offering: self.shapers.relay_offering(),
+            links,
+            peers: self.shapers.peers_shaping(),
+            relays_answering: self.onion.deal().map(|_| {
+                let n: usize = onion.answering.iter().sum();
+                u32::try_from(n).unwrap_or(u32::MAX)
+            }),
+            onion,
+        }
+    }
+
+    /// `FSD/PRIVACY_MODES.md` §3.1, E8 — what this node knows of `peer`'s
+    /// shaping.
+    #[must_use]
+    pub fn peer_shaping(&self, peer: &str) -> crate::transport::link_shaping::PeerShaping {
+        self.shapers.peer_shaping(peer)
+    }
+
+    /// CC 5.4.3 — replace the shaping policy at runtime. Shaped links the new
+    /// policy cannot carry are closed (never left half-shaped) and redial
+    /// under it. Returns how many closed.
+    pub async fn set_shaping_policy(
+        &self,
+        policy: crate::transport::link_shaping::ShapingPolicy,
+    ) -> usize {
+        let before = self.shapers.policy();
+        if before.class != policy.class || before.enabled() != policy.enabled() {
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_POLICY_MOVED);
+            }
+        }
+        let upgraded = !before.offers_on(false) && policy.offers_on(false);
+        let mut close = self.shapers.set_policy(policy);
+        if upgraded {
+            close.extend(self.unshaped_row_links().await);
+        }
+        for link in &close {
+            let id = LinkId::new(*link);
+            self.seals.refuse(*link);
+            let _ = self.node.close_link(&id).await;
+        }
+        if !close.is_empty() {
+            tracing::info!(
+                closed = close.len(),
+                class = self.shapers.policy().class.as_str(),
+                "shaping policy changed at runtime; links it no longer carries were closed \
+                 to renegotiate (CC 5.4.3)"
+            );
+        }
+        close.len()
+    }
+
+    /// `FSD/PRIVACY_MODES.md` E2 — the idle row links this node dialled that
+    /// run unshaped. An upgrade closes them, so the next row dials and offers:
+    /// the promise holds at once rather than when they happen to close. A bulk
+    /// link stays, and a link in flight stays until it next closes.
+    async fn unshaped_row_links(&self) -> Vec<[u8; 16]> {
+        let pool = self.reusable_dialed_link.lock().await;
+        let in_flight = self.link_in_flight.lock().await;
+        pool.values()
+            .flatten()
+            .filter(|id| !in_flight.contains(*id))
+            .map(|id| id.into_bytes())
+            .filter(|l| !self.shapers.is_shaped(*l) && !self.shapers.is_bulk(*l))
+            .collect()
+    }
+
+    /// The host's device facts changed (Wi-Fi ↔ cellular, charging): the
+    /// shaping class follows the device ([`ShapingPolicy::for_device`],
+    /// the person's opt-in kept) and so does the relay policy. Returns how
+    /// many shaped links closed to renegotiate.
+    ///
+    /// [`ShapingPolicy::for_device`]: crate::transport::link_shaping::ShapingPolicy::for_device
+    pub async fn set_device_state(
+        &self,
+        device: crate::transport::link_shaping::DeviceState,
+    ) -> usize {
+        self.onion.set_device(device);
+        let mut policy = crate::transport::link_shaping::ShapingPolicy::for_device(&device);
+        policy.require_shaped_links = self.shapers.policy().require_shaped_links;
+        let closed = self.set_shaping_policy(policy).await;
+        self.onion_refresh();
+        closed
+    }
+
+    /// CC 5.4.6 — re-read the tier's layer peers into the shaper (call after
+    /// the opt-in, the deal or the device changes). A node whose tier is not
+    /// active names none and reserves nothing.
+    pub fn onion_refresh(&self) {
+        self.shapers.set_layer_peers(self.onion.layer_peers());
+        self.shapers.set_relay_offering(self.onion.relay_offering());
+    }
+
+    /// CC 5.4.3 referrals — the free slots `peer` last reported here.
+    #[must_use]
+    pub fn peer_free_slots(&self, peer: &str) -> Option<u8> {
+        self.shapers.peer_free_slots(peer)
+    }
+
+    /// CC 5.4.3 referrals — the nodes this node homed on after a refusal.
+    #[must_use]
+    pub fn homed_on_referrals(&self) -> Vec<String> {
+        self.homed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// CC 5.4.6 item 2 — publish `payload` through the tier: route over this
+    /// period's deal (one answering relay per layer), resolve each relay's
+    /// destination and hop key with `resolve`, build the packet, and queue
+    /// it on the SHAPED link to the first hop. Every refusal is a token.
+    ///
+    /// # Errors
+    /// The tier's tokens; [`crate::onion::tokens::ROUTE_FAILED`];
+    /// [`crate::onion::tokens::FIRST_HOP_UNSHAPED`].
+    pub async fn onion_publish(
+        &self,
+        payload: &[u8],
+        resolve: &crate::onion::sender::HopResolver<'_>,
+    ) -> Result<(), &'static str> {
+        use crate::onion::tokens;
+        let onion = &self.onion;
+        let out = async {
+            onion.tier()?;
+            let deal = onion.deal().ok_or(tokens::UNAVAILABLE_FLOOR)?;
+            let mut rng = crate::onion::packet::SystemEntropy;
+            let pick = crate::onion::sender::pick_route(
+                &deal,
+                self.occurrence_key_id(),
+                &|k| onion.answering(k),
+                &mut rng,
+            )?;
+            let mut hops = Vec::with_capacity(3);
+            for k in &pick {
+                let (dest, key) = resolve(k).ok_or(tokens::ROUTE_FAILED)?;
+                hops.push(crate::onion::sender::RouteHop {
+                    key_id: k.clone(),
+                    dest,
+                    key,
+                });
+            }
+            let route: [crate::onion::sender::RouteHop; 3] =
+                hops.try_into().map_err(|_| tokens::ROUTE_FAILED)?;
+            let first = route[0].dest;
+            let link = {
+                let dialled = self.dialed_link_dest.lock().await;
+                dialled
+                    .iter()
+                    .find(|(l, d)| {
+                        d.into_bytes() == first && self.shapers.is_shaped(l.into_bytes())
+                    })
+                    .map(|(l, _)| *l)
+            }
+            .ok_or(tokens::FIRST_HOP_UNSHAPED)?;
+            let shaper = self
+                .shapers
+                .get(link.into_bytes())
+                .ok_or(tokens::FIRST_HOP_UNSHAPED)?;
+            let packet = crate::onion::sender::build_publication(
+                &route,
+                payload,
+                deal.period,
+                onion.policy().mix_mean_delay_ms,
+                &mut rng,
+            )
+            .map_err(|e| e.label())?;
+            let frame = crate::onion::relay::onion_frame(&packet);
+            let cap = crate::transport::link_shaping::body_capacity(shaper.agreement().frame_bytes);
+            let frags = crate::transport::frame_fragment::fragment(&frame, cap)
+                .ok_or(tokens::ROUTE_FAILED)?;
+            shaper.enqueue(frags).map_err(|e| e.label())?;
+            Ok(())
+        }
+        .await;
+        onion.count(match out {
+            Ok(()) => tokens::PUBLISHED,
+            Err(t) => t,
+        });
+        out
+    }
 
     /// Snapshot every link the event loop has seen reach `Active`.
     /// State is `Active` by definition (closed/stale links are removed
@@ -8142,6 +9158,125 @@ impl ReticulumTransport {
         out
     }
 
+    /// No path and no link: ask, before the bootstrap dial that only a one-hop
+    /// neighbour can answer. The caller is past its reuse check on purpose: a
+    /// peer that dialled this node needs no path to be sent to. Returns the
+    /// dial target, unchanged unless the ask found a path.
+    async fn ask_before_dialling(
+        &self,
+        candidates: &[DialCandidate],
+        peer: ResolvedPeer,
+        has_path: bool,
+        establish_timeout: Duration,
+    ) -> (ResolvedPeer, bool, Duration) {
+        let dests: Vec<DestinationHash> = candidates.iter().map(|c| c.dest_hash).collect();
+        if !has_path && self.seek_paths(&dests).await {
+            let pathed: Vec<(DialSource, bool)> = candidates
+                .iter()
+                .map(|c| (c.source, self.node.has_path(&c.dest_hash)))
+                .collect();
+            if let Some(i) = select_dial_candidate(&pathed) {
+                let found = ResolvedPeer {
+                    dest_hash: candidates[i].dest_hash,
+                    transport_ed25519: candidates[i].transport_ed25519,
+                };
+                return (found, pathed[i].1, LINK_ESTABLISH_TIMEOUT);
+            }
+        }
+        (peer, has_path, establish_timeout)
+    }
+
+    /// Ask the network for a path to any of `dests`, and wait, boundedly, for
+    /// the answer. Returns whether one is known at the end.
+    ///
+    /// This is how a node learns a peer it wants. Waiting for the peer's
+    /// announce does not work: a relay holds no announce for a client that
+    /// connects later, and once a destination has used up the rate limit's
+    /// grace a transport node stops rebroadcasting it for up to
+    /// `announce_rate_target` (default 1 h, leviculum `DEFAULT_AR_TARGET`), so
+    /// on the 300 s default one announce in about 65 minutes gets through. It
+    /// keeps the path though, and answers a path request from it, past that
+    /// limit.
+    /// The answer is the peer's own signed announce, so it takes the ordinary
+    /// rooting path, and this node's own ingress hold lets it through.
+    ///
+    /// What an ask cannot reach is an announce still held by a relay's ingress
+    /// control: that relay has no path to answer from until it releases it,
+    /// one per 5 s from 15 s after the burst, so that one takes the hold's
+    /// time, and a later send asks again.
+    ///
+    /// One ask per destination per [`PATH_SEEK_MIN_INTERVAL`]: a send behind
+    /// an ask still in flight waits out that ask, and a send behind an
+    /// unanswered one does not wait at all.
+    async fn seek_paths(&self, dests: &[DestinationHash]) -> bool {
+        let known = || dests.iter().any(|d| self.node.has_path(d));
+        if dests.is_empty() || known() {
+            return !dests.is_empty();
+        }
+        let until = ask_for_paths(&self.node, &self.path_seeks, dests).await;
+        while std::time::Instant::now() < until {
+            if known() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        known()
+    }
+
+    /// [`Self::seek_peer`] for a dial that has nothing else to go on: a call or
+    /// a first contact to a peer with no path would otherwise wait on its
+    /// announce, which a relay may not pass for an hour. Bounded as that is.
+    async fn seek_if_unpathed(&self, destination_key_id: &str) {
+        let pathed = self
+            .resolve_dial_candidates(destination_key_id)
+            .await
+            .iter()
+            .any(|c| self.node.has_path(&c.dest_hash));
+        if !pathed {
+            let found = self.seek_peer(destination_key_id).await;
+            tracing::debug!(peer = %destination_key_id, found, "asked for a peer with no path");
+        }
+    }
+
+    /// Ask for a peer this node wants and has not heard: through whatever it
+    /// can already address it by, and through the signed route row a directory
+    /// holds for it. A row only says where to ask; nothing is trusted from it,
+    /// because what comes back is the peer's own announce. Returns whether the
+    /// peer can be addressed now.
+    pub async fn seek_peer(&self, destination_key_id: &str) -> bool {
+        let mut dests: Vec<DestinationHash> = self
+            .resolve_dial_candidates(destination_key_id)
+            .await
+            .iter()
+            .map(|c| c.dest_hash)
+            .collect();
+        if let Some(rooting) = self.rooting.as_deref() {
+            if let Ok(Some(row)) = rooting.signed_reticulum_route(destination_key_id).await {
+                let bytes = hex::decode(&row.transport_destination.destination).ok();
+                if let Some(hash) = bytes.and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+                    let dest = DestinationHash::new(hash);
+                    if !dests.contains(&dest) {
+                        dests.push(dest);
+                    }
+                }
+            }
+        }
+        if !self.seek_paths(&dests).await {
+            return false;
+        }
+        // The path is known when the announce is; rooting it is the listener's.
+        let deadline = std::time::Instant::now() + PATH_SEEK_BUDGET;
+        loop {
+            if self.knows_peer(destination_key_id).await {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Single-winner resolution, preserved for the non-dial callers
     /// (`knows_peer` / dest readback). Legacy preference order: cached, else
     /// explicit-hash, else computed-named — byte-identical to the pre-v13.8.0
@@ -8193,13 +9328,151 @@ impl ReticulumTransport {
         fragments: &[Vec<u8>],
     ) -> FragmentSendOutcome {
         let _busy = OutboundShipGuard::new(&self.outbound_ship_active, link_id);
+        let started = std::time::Instant::now();
         let delay = self
             .test_channel_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        send_fragments_on_channel(&self.node, &self.seals, &self.shapers, &link_id, fragments).await
+        let unacked = self
+            .test_unacked_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&link_id)
+            .copied();
+        let outcome = match unacked {
+            None => {
+                send_fragments_on_channel(
+                    &self.node,
+                    &self.seals,
+                    &self.shapers,
+                    &link_id,
+                    fragments,
+                )
+                .await
+            }
+            // CIRISEdge#926 test seam: the first `land` fragments go out for
+            // real, then the window never opens again (no acks come back), so
+            // the next fragment's pacing wait runs out exactly as in the field.
+            Some(land) => {
+                let landed = fragments.len().min(land);
+                let head = send_fragments_on_channel(
+                    &self.node,
+                    &self.seals,
+                    &self.shapers,
+                    &link_id,
+                    &fragments[..landed],
+                )
+                .await;
+                if landed < fragments.len() && head.complete() {
+                    tokio::time::sleep(CHANNEL_FRAGMENT_SEND_TIMEOUT).await;
+                    FragmentSendOutcome {
+                        sent: head.sent,
+                        total: fragments.len(),
+                        stalled: Some("fragment_pacing_timeout"),
+                    }
+                } else {
+                    FragmentSendOutcome {
+                        total: fragments.len(),
+                        ..head
+                    }
+                }
+            }
+        };
+        self.observe_channel_send(link_id, &outcome, started).await;
+        outcome
+    }
+
+    /// CIRISEdge#926 — feed one Channel send on `link_id` to the stall guard
+    /// ([`crate::transport::link_stall`]) and act on a link it judges dead:
+    /// one that landed nothing for [`STALL_MAX_ZERO_SENDS`] sends in a row, or
+    /// for [`STALL_BOUND`], with no delivery proof from the peer between.
+    ///
+    /// [`STALL_MAX_ZERO_SENDS`]: crate::transport::link_stall::STALL_MAX_ZERO_SENDS
+    /// [`STALL_BOUND`]: crate::transport::link_stall::STALL_BOUND
+    async fn observe_channel_send(
+        &self,
+        link_id: LinkId,
+        outcome: &FragmentSendOutcome,
+        started: std::time::Instant,
+    ) {
+        use crate::transport::link_stall::{ChannelLanding, StallVerdict};
+        let landing = ChannelLanding::classify(outcome.sent, outcome.total, outcome.stalled);
+        if landing == ChannelLanding::Starved {
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_stall(crate::observability::LINK_STALL_ZERO_LANDED_SEND);
+            }
+        }
+        let delivered = self.node.link_stats(&link_id).map(|s| s.bytes_delivered());
+        let verdict =
+            self.stall_guard
+                .observe(link_id.into_bytes(), landing, delivered, started, |id| {
+                    self.node.link_is_established(&LinkId::new(*id))
+                });
+        if let StallVerdict::Dead {
+            zero_sends,
+            stalled_for,
+        } = verdict
+        {
+            self.act_on_stalled_link(link_id, zero_sends, stalled_for)
+                .await;
+        }
+    }
+
+    /// CIRISEdge#926 — the stall guard judged `link_id` dead. A link on a
+    /// punched interface moves back onto its relayed path (leviculum#83
+    /// `retire_direct_link`: the punched path is what stopped carrying the
+    /// peer's acks) and starts a fresh run there. Any other link is closed: it
+    /// already left every pick (`is_dead`), the teardown forgets it everywhere,
+    /// and the next send to the peer re-dials (through the canonical when the
+    /// peer is behind NAT) or rides the peer's next link to us. One line.
+    async fn act_on_stalled_link(&self, link_id: LinkId, zero_sends: u32, stalled_for: Duration) {
+        let peer = self
+            .link_to_peer_key_id
+            .lock()
+            .await
+            .get(&link_id)
+            .cloned()
+            .unwrap_or_else(|| "-".to_owned());
+        let link = hex::encode(link_id.as_bytes());
+        if self.node.direct_link_interface(&link_id).is_some()
+            && self.node.retire_direct_link(&link_id).await.is_ok()
+        {
+            self.stall_guard.forget(&link_id.into_bytes());
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_stall(crate::observability::LINK_STALL_RETIRED_DIRECT);
+            }
+            tracing::warn!(
+                link = %link,
+                peer = %peer,
+                zero_sends,
+                stalled_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX),
+                action = "retired_direct",
+                "link Channel landed nothing for {zero_sends} sends in a row: the punched path \
+                 stopped carrying the peer's acks, moved the link back onto its relayed path \
+                 (history: CIRISEdge#926, leviculum#89)"
+            );
+            return;
+        }
+        if let Some(m) = self.metrics.get() {
+            m.inc_link_stall(crate::observability::LINK_STALL_CLOSED);
+        }
+        tracing::warn!(
+            link = %link,
+            peer = %peer,
+            zero_sends,
+            stalled_ms = u64::try_from(stalled_for.as_millis()).unwrap_or(u64::MAX),
+            action = "closed",
+            "link Channel landed nothing for {zero_sends} sends in a row: the peer acknowledges \
+             nothing on it, closed it and the next send re-dials (history: CIRISEdge#926)"
+        );
+        if let Err(e) = self
+            .link_teardown_as(link_id, LinkCloseCause::LocalTeardown)
+            .await
+        {
+            tracing::debug!(error = %e, "stalled link teardown failed (CIRISEdge#926)");
+        }
     }
 
     /// CIRISEdge#853 — wrap a claimed lane in a [`LinkClaim`], so the claim is
@@ -8235,7 +9508,15 @@ impl ReticulumTransport {
         &self,
         destination_key_id: &str,
         candidates: &[DialCandidate],
+        bulk: bool,
     ) -> Result<LinkClaim, TransportError> {
+        let lane_ctx = || {
+            if bulk {
+                self.bulk_dial_ctx()
+            } else {
+                self.dial_ctx()
+            }
+        };
         // CIRISEdge#336 (v13.8.0) — ROUTE-TABLE-FIRST dial selection. The route
         // table is the source of dial truth; identity math only proposed the
         // candidates (`resolve_dial_candidates`). `select_dial_candidate` picks a PATHED candidate
@@ -8314,7 +9595,7 @@ impl ReticulumTransport {
         // repeating it per send was the waste.
         // CIRISEdge#819 — `reserved`: the lane came from the pool already
         // marked in flight for this send (see `DialCtx::reusable_link_to`).
-        let reused = self.reusable_link_to(&peer.dest_hash).await;
+        let reused = lane_ctx().reusable_link_to(&peer.dest_hash).await;
         let claim = if let Some(existing) = reused {
             tracing::trace!(
                 key_id = %destination_key_id,
@@ -8329,6 +9610,9 @@ impl ReticulumTransport {
             // The gate is per-destination so other peers still dial in parallel.
             // CIRISEdge#568 — the dial runs in a SPAWNED task, not inline.
             //
+            let (peer, has_path, establish_timeout) = self
+                .ask_before_dialling(candidates, peer, has_path, establish_timeout)
+                .await;
             // `round_timeout` is 10 s; a pathed peer's `establish_timeout` is
             // `LINK_ESTABLISH_TIMEOUT` (30 s). Inline, a cold dial could never
             // finish inside the round that started it, and the scheduler
@@ -8349,12 +9633,20 @@ impl ReticulumTransport {
             // it is meant to gate is still running — the single-flight property
             // #532 installed would hold only for callers that survive.
             let gate = self.dial_gate_for(peer.dest_hash).await;
-            let ctx = self.dial_ctx();
+            let gate_permits = self
+                .dial_gate_permits(destination_key_id, &peer.dest_hash, bulk)
+                .await;
+            let ctx = lane_ctx();
             let peer_owned = peer;
             let dkid = destination_key_id.to_owned();
-            let dial = tokio::spawn(async move {
+            // Lifecycle — a dial is refused while suspended and cancelled by one.
+            let lifecycle = Arc::clone(&self.lifecycle);
+            let dial = tokio::spawn(lifecycle.guard_task(async move {
+                // CC 5.4.3 rc17 — a row dial to a peer this node shapes toward
+                // takes the whole gate: two concurrent ones would each bring
+                // up a shaped link, and each spends one of the eight.
                 let _dial_permit = gate
-                    .acquire()
+                    .acquire_many(gate_permits)
                     .await
                     .map_err(|e| TransportError::Io(format!("dial gate closed: {e}")))?;
                 // Double-check: a concurrent dial we queued behind may have just
@@ -8371,11 +9663,40 @@ impl ReticulumTransport {
                 }
                 ctx.dial_and_identify(&dkid, &peer_owned, has_path, establish_timeout)
                     .await
-            });
+            }));
             dial.await
                 .map_err(|e| TransportError::Io(format!("dial task failed: {e}")))??
         };
         Ok(claim)
+    }
+
+    /// How much of a peer's dial gate this dial takes: all of it for a row dial
+    /// that would bring up a shaped link.
+    async fn dial_gate_permits(&self, peer: &str, dest: &DestinationHash, bulk: bool) -> u32 {
+        if !bulk
+            && self.shapers.offers_to(Some(peer))
+            && !self.peer_row_link_is_unshaped(dest).await
+        {
+            u32::try_from(MAX_CONCURRENT_DIALS_PER_DEST).unwrap_or(1)
+        } else {
+            1
+        }
+    }
+
+    /// Whether a row link this node dialled to `dest` runs unshaped: the peer
+    /// has shown it does not shape, so its row dials need no single flight
+    /// for the bound and keep their ordinary lanes.
+    async fn peer_row_link_is_unshaped(&self, dest: &DestinationHash) -> bool {
+        self.reusable_dialed_link
+            .lock()
+            .await
+            .get(dest)
+            .is_some_and(|pool| {
+                pool.iter().any(|id| {
+                    let bytes = id.into_bytes();
+                    !self.shapers.is_shaped(bytes) && !self.shapers.is_bulk(bytes)
+                })
+            })
     }
 
     /// CIRISEdge#353 — the peer's freshest LIVE link that it dialled and
@@ -8390,6 +9711,194 @@ impl ReticulumTransport {
     /// frame we put there is dropped `UNATTRIBUTED`. A link with no plane
     /// record is never selected (fail-closed; every established link has one).
     async fn live_link_to(&self, destination_key_id: &str, plane: LinkPlane) -> Option<LinkId> {
+        self.live_link_to_where(destination_key_id, plane, |_| true)
+            .await
+    }
+
+    /// Whether `peer`'s row link was refused at a bound within
+    /// [`BULK_DIAL_NEGATIVE_TTL`].
+    fn row_recently_homed_elsewhere(&self, peer: &str) -> bool {
+        let mut m = self
+            .row_homed_elsewhere
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        m.retain(|_, at| at.elapsed() < BULK_DIAL_NEGATIVE_TTL);
+        m.contains_key(peer)
+    }
+
+    /// Whether a bulk dial to `peer` failed within [`BULK_DIAL_NEGATIVE_TTL`].
+    fn bulk_dial_recently_failed(&self, peer: &str) -> bool {
+        let mut failed = self
+            .bulk_dial_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        failed.retain(|_, at| at.elapsed() < BULK_DIAL_NEGATIVE_TTL);
+        failed.contains_key(peer)
+    }
+
+    /// The live shaped link to `peer` that `envelope` would have to leave for
+    /// the bulk plane, if there is one.
+    async fn shaped_link_for_bulk(&self, peer: &str, envelope: &[u8]) -> Option<LinkId> {
+        self.live_link_to_where(peer, LinkPlane::Identity, |id| {
+            self.shapers.is_shaped(id.into_bytes())
+        })
+        .await
+        .filter(|l| self.shapers.needs_bulk_plane(l.into_bytes(), envelope))
+    }
+
+    /// CC 5.4.3 rc16 two planes — the LAST RESORT for a payload that needs
+    /// the bulk plane when no unshaped link to the peer could be had (the dial
+    /// failed: a NAT'd peer reachable only over the link it dialled in, which
+    /// is shaped). With a live shaped link the payload rides it
+    /// ([`Self::bulk_on_shaped`]) and the failed dial is remembered for
+    /// [`BULK_DIAL_NEGATIVE_TTL`]; otherwise the dial's own error stands.
+    async fn bulk_on_shaped_or(
+        &self,
+        destination_key_id: &str,
+        envelope: &[u8],
+        dial_error: TransportError,
+    ) -> Result<TransportSendOutcome, TransportError> {
+        let Some(link) = self
+            .shaped_link_for_bulk(destination_key_id, envelope)
+            .await
+        else {
+            return Err(dial_error);
+        };
+        self.bulk_dial_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(destination_key_id.to_owned(), std::time::Instant::now());
+        tracing::info!(
+            destination_key_id,
+            link = ?link,
+            bytes = envelope.len(),
+            dial_error = %dial_error,
+            "no unshaped link can reach this peer; bulk rides its shaped link in shaped-budget \
+             fragments (slow, CC 5.4.3 two-planes last resort)"
+        );
+        self.bulk_on_shaped(destination_key_id, envelope, link)
+            .await
+    }
+
+    /// Send `envelope` over shaped `link` in shaped-budget fragments, paced by
+    /// the shaper like every other frame: slow, counted
+    /// `link_shaping_bulk_on_shaped_fallback`. `Delivered` means every fragment
+    /// left this node, because the durable dispatcher treats it as a transport
+    /// ack; a transfer that stops part-way is an `Io` error the dispatcher
+    /// retries. It runs detached and single-flight
+    /// ([`crate::transport::link_shaping::BulkFallbacks`]).
+    async fn bulk_on_shaped(
+        &self,
+        destination_key_id: &str,
+        envelope: &[u8],
+        link: LinkId,
+    ) -> Result<TransportSendOutcome, TransportError> {
+        use sha2::Digest as _;
+        let digest: [u8; 32] = sha2::Sha256::digest(envelope).into();
+        if self.bulk_fallbacks.recently_finished(&digest) {
+            return Ok(TransportSendOutcome::Delivered);
+        }
+        // `FSD/PRIVACY_MODES.md` §6.12 — the slow path is bulk: at tier 2 a
+        // file to a non-owner peer waits for the dispatcher's retry and holds
+        // nothing here.
+        if self.shapers.slow_path_paused(destination_key_id).await {
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_SHED_BULK);
+            }
+            return Err(TransportError::Io(format!(
+                "{}: the slow path to {destination_key_id} is paused at tier 2; the send is \
+                 retried",
+                crate::observability::LINK_SHAPING_LOAD_SHED_BULK
+            )));
+        }
+        let (mut outcome, owner) = self.bulk_fallbacks.join_or_start(digest);
+        if let Some(tx) = owner {
+            let shaper = self.shapers.get(link.into_bytes());
+            let frames = shaper.as_ref().and_then(|s| {
+                let cap = crate::transport::link_shaping::body_capacity(s.agreement().frame_bytes);
+                crate::transport::frame_fragment::fragment(envelope, cap)
+            });
+            let (Some(shaper), Some(frames)) = (shaper, frames) else {
+                self.bulk_fallbacks.finish(&digest, false);
+                return Err(TransportError::Io(format!(
+                    "the shaped link to {destination_key_id} cannot carry a bulk fallback"
+                )));
+            };
+            if let Some(m) = self.metrics.get() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_BULK_ON_SHAPED_FALLBACK);
+            }
+            let node = Arc::clone(&self.node);
+            let fallbacks = Arc::clone(&self.bulk_fallbacks);
+            let ledger = self.metrics.get().cloned();
+            let pause = SlowPathPause {
+                shapers: Arc::clone(&self.shapers),
+                peer: destination_key_id.to_owned(),
+                metrics: self.metrics.get().cloned(),
+            };
+            tokio::spawn(async move {
+                let result = run_bulk_fallback(&node, link, &shaper, frames, &pause).await;
+                fallbacks.finish(&digest, result.is_ok());
+                if let Some(m) = ledger {
+                    m.inc_link_shaping(if result.is_ok() {
+                        crate::observability::LINK_SHAPING_BULK_FALLBACK_OK
+                    } else {
+                        crate::observability::LINK_SHAPING_BULK_FALLBACK_FAILED
+                    });
+                }
+                // choke-ok: every waiter may have gone; the record above stands.
+                let _ = tx.send(Some(result));
+            });
+        }
+        let ended = outcome.wait_for(Option::is_some).await;
+        match ended.as_deref() {
+            Ok(Some(Ok(()))) => Ok(TransportSendOutcome::Delivered),
+            Ok(Some(Err(why))) => Err(TransportError::Io(why.clone())),
+            _ => Err(TransportError::Io(
+                "the bulk fallback's task ended without an outcome".to_owned(),
+            )),
+        }
+    }
+
+    /// CC 5.4.3 rc16 **two planes** — the reverse-path link for `envelope`
+    /// to `destination_key_id`. Bulk never rides a shaped link: when the
+    /// freshest identity link is shaped and the payload needs the bulk plane,
+    /// the freshest UNSHAPED identity link is taken instead (none: the send
+    /// dials the bulk lane). A row prefers a shaped link when the peer holds
+    /// one, so rows stay on the shaped row plane and off a bulk link.
+    async fn reply_link_for(&self, destination_key_id: &str, envelope: &[u8]) -> Option<LinkId> {
+        let pick = self
+            .live_link_to(destination_key_id, LinkPlane::Identity)
+            .await?;
+        if self.shapers.needs_bulk_plane(pick.into_bytes(), envelope) {
+            return self
+                .live_link_to_where(destination_key_id, LinkPlane::Identity, |id| {
+                    !self.shapers.is_shaped(id.into_bytes())
+                })
+                .await;
+        }
+        if self.shapers.is_shaped(pick.into_bytes()) {
+            return Some(pick);
+        }
+        let shaped = self
+            .live_link_to_where(destination_key_id, LinkPlane::Identity, |id| {
+                self.shapers.is_shaped(id.into_bytes())
+            })
+            .await;
+        // A row lands on an unshaped (possibly bulk) link only when the peer
+        // holds no shaped link that can carry it.
+        match shaped {
+            Some(s) if !self.shapers.needs_bulk_plane(s.into_bytes(), envelope) => Some(s),
+            _ => Some(pick),
+        }
+    }
+
+    /// [`Self::live_link_to`], over the links `keep` admits.
+    async fn live_link_to_where(
+        &self,
+        destination_key_id: &str,
+        plane: LinkPlane,
+        keep: impl Fn(&LinkId) -> bool,
+    ) -> Option<LinkId> {
         let candidates: Vec<LinkId> = {
             let planes = self.link_plane.lock().await;
             self.link_to_peer_key_id
@@ -8397,7 +9906,9 @@ impl ReticulumTransport {
                 .await
                 .iter()
                 .filter(|(id, peer)| {
-                    peer.as_str() == destination_key_id && planes.get(*id) == Some(&plane)
+                    peer.as_str() == destination_key_id
+                        && planes.get(*id) == Some(&plane)
+                        && keep(id)
                 })
                 .map(|(id, _)| *id)
                 .collect()
@@ -8410,9 +9921,13 @@ impl ReticulumTransport {
         // NOT sufficient (a NAT-dead link stays `Active` for the whole stale
         // window), so the selector additionally prefers the freshest INBOUND —
         // the link the peer is demonstrably sending on right now.
+        // CIRISEdge#926 — and never a link the stall guard judged dead: the
+        // peer acknowledges nothing on it, whatever leviculum still holds.
         let live: Vec<(LinkId, u64, u64)> = candidates
             .into_iter()
-            .filter(|id| self.node.link_is_established(id))
+            .filter(|id| {
+                self.node.link_is_established(id) && !self.stall_guard.is_dead(&id.into_bytes())
+            })
             .map(|id| {
                 (
                     id,
@@ -8480,9 +9995,26 @@ impl ReticulumTransport {
         let mut attempts: u32 = 0;
         loop {
             let live = match pinned {
-                Some(id) => Some(id).filter(|id| self.node.link_is_established(id)),
+                // CC 5.4.3 rc16 two planes — a pinned link that is shaped
+                // cannot carry bulk: answer the link's attributed peer on its
+                // bulk plane instead (an unattributable requester's answer
+                // falls through to the dial, which cannot reach it either).
+                Some(id)
+                    if self
+                        .shapers
+                        .needs_bulk_plane(id.into_bytes(), envelope_bytes) =>
+                {
+                    let peer = self.link_to_peer_key_id.lock().await.get(&id).cloned();
+                    match peer {
+                        Some(p) => self.reply_link_for(&p, envelope_bytes).await,
+                        None => None,
+                    }
+                }
+                Some(id) => Some(id).filter(|id| {
+                    self.node.link_is_established(id) && !self.stall_guard.is_dead(&id.into_bytes())
+                }),
                 None => {
-                    self.live_link_to(destination_key_id, LinkPlane::Identity)
+                    self.reply_link_for(destination_key_id, envelope_bytes)
                         .await
                 }
             };
@@ -8766,6 +10298,16 @@ impl ReticulumTransport {
         {
             return Err(ShipError::Busy);
         }
+        // CIRISEdge#926 test seam — a link whose peer stopped acknowledging
+        // holds its one Resource slot with a transfer that never proves.
+        if self
+            .test_unacked_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(link_id)
+        {
+            return Err(ShipError::Busy);
+        }
         // CIRISEdge#853 — busy for the inbound reaper until this returns.
         let _ship = OutboundShipGuard::new(&self.outbound_ship_active, *link_id);
         let delay = self
@@ -8786,16 +10328,66 @@ impl ReticulumTransport {
                         "shaped link: frame body too small to fragment".to_owned(),
                     ))
                 })?;
+            // A queued row is not delivered: the link can close before its
+            // frame fires (a reap, a peer gone) and the body goes with the
+            // shaper. `Ok` here is the durable dispatcher's transport ack, so
+            // it waits for the last fragment to LEAVE (the FIFO ticket against
+            // real frames confirmed sent), bounded by the Poisson p99 for
+            // that many frames; past the bound the send is retried.
+            let frames = fragments.len();
             return match shaper.enqueue(fragments) {
-                Ok(()) => Ok(()),
+                Ok(ticket) => {
+                    let first = ticket + 1 - u64::try_from(frames).unwrap_or(u64::MAX);
+                    let budget = shaper.leave_budget(frames);
+                    let link_up = || self.node.link_is_established(link_id);
+                    let left = wait_row_left(&shaper, first, ticket, budget, link_up).await;
+                    if let Some(m) = self.metrics.get() {
+                        left.book(m, shaper.class());
+                    }
+                    match left {
+                        RowLeft::Left(_) => Ok(()),
+                        RowLeft::LinkClosed { .. } => Err(ShipError::Other(TransportError::Io(
+                            "the shaped link closed before the row's frames left (retried)"
+                                .to_owned(),
+                        ))),
+                        RowLeft::TimedOut => Err(ShipError::Other(TransportError::Timeout(budget))),
+                    }
+                }
                 Err(crate::transport::link_shaping::ShapingError::QueueFull(_)) => {
                     if let Some(m) = self.metrics.get() {
                         m.inc_link_shaping(crate::observability::LINK_SHAPING_QUEUE_DEFERRED);
                     }
                     Err(ShipError::Busy)
                 }
+                // CC 5.4.3 rc16 two planes — bulk never rides the shaped row
+                // plane: refused by name, counted, nothing queued.
+                Err(e @ crate::transport::link_shaping::ShapingError::BulkBeyondReach(..)) => {
+                    if let Some(m) = self.metrics.get() {
+                        m.inc_link_shaping(e.label());
+                    }
+                    tracing::warn!(
+                        link = ?link_id,
+                        bytes = envelope_bytes.len(),
+                        reason = e.label(),
+                        "a message beyond the shaped link's reach was refused: bulk rides an \
+                         unshaped link of its own (CC 5.4.3 two planes)"
+                    );
+                    Err(ShipError::Other(TransportError::Io(e.to_string())))
+                }
                 Err(e) => Err(ShipError::Other(TransportError::Io(e.to_string()))),
             };
+        }
+        // v44 — no Resource starts on a link with an upgrade in flight: the
+        // peer may already be at the direct MTU, and this end's parts would be
+        // refused for good (`direct_path` module docs). `Busy` is the caller's
+        // Channel path and bounded retry; the upgrade waits on neither.
+        if let Some(side) = self.direct_paths.upgrade_in_flight(link_id) {
+            note_upgrade_guarded(
+                self.metrics.get(),
+                crate::observability::UPGRADE_GUARDED_SHIP,
+                Some(side),
+            );
+            return Err(ShipError::Busy);
         }
         // CC 5.3.3.5 E1 — the Resource carries the SEALED envelope; a link
         // with no keys ships nothing (and opens no Resource lane).
@@ -8952,6 +10544,10 @@ impl ReticulumTransport {
 // attributes the lint to the impl, so the allow lives here (v13.6.1).
 #[allow(clippy::too_many_lines)]
 impl Transport for ReticulumTransport {
+    fn pacing_gap(&self, destination_key_id: &str) -> Option<Duration> {
+        self.shapers.gap_to_peer(destination_key_id)
+    }
+
     fn id(&self) -> TransportId {
         TransportId::RETICULUM_RS
     }
@@ -8962,8 +10558,12 @@ impl Transport for ReticulumTransport {
     /// Edge's. The listener's per-event context reads the slot on every
     /// event, so an attach before `listen` is seen by the first one.
     fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
-        let _ = self.metrics.set(metrics);
+        self.adopt_metrics(metrics);
         self.report_signer_id_mismatch();
+    }
+
+    fn attach_load_ladder(&self, ladder: Arc<crate::load_ladder::SharedLadder>) {
+        let _ = self.load_ladder.set(ladder);
     }
 
     fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {
@@ -8976,10 +10576,21 @@ impl Transport for ReticulumTransport {
     fn refresh_metrics(&self) {
         let _ = self.known_destination_evictions();
         self.report_signer_id_mismatch();
+        if let Some(m) = self.metrics.get() {
+            mirror_planes(&self.node, m);
+        }
     }
 
     fn subscribe_reachability(&self) -> Option<tokio::sync::broadcast::Receiver<PeerReachable>> {
         Some(self.peer_reachable.subscribe())
+    }
+
+    fn subscribe_homed(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        Some(self.homed_events.subscribe())
+    }
+
+    fn homed_peers(&self) -> Vec<String> {
+        self.homed_on_referrals()
     }
 
     async fn send(
@@ -8987,175 +10598,21 @@ impl Transport for ReticulumTransport {
         destination_key_id: &str,
         envelope_bytes: &[u8],
     ) -> Result<TransportSendOutcome, TransportError> {
-        // AV-13: reject oversized payloads before touching the network.
-        if envelope_bytes.len() > MAX_BODY_BYTES {
-            return Err(TransportError::BodyTooLarge {
-                actual: envelope_bytes.len(),
-                limit: MAX_BODY_BYTES,
-            });
-        }
-
-        // CIRISEdge#336 (v13.8.0) — resolve the peer's FULL candidate address
-        // set; the dial target is chosen by ROUTABILITY further down, after the
-        // reverse-path attempt. See `resolve_dial_candidates` /
-        // `select_dial_candidate` for the holistic-fix rationale.
-        let candidates = self.resolve_dial_candidates(destination_key_id).await;
-        if candidates.is_empty() {
-            // CIRISEdge#292 (CIRISServer#205) — an admitted replication
-            // target whose Reticulum destination we can't resolve is the
-            // silent-zero-delivery class: the round fires, this send
-            // fails, and without this line nothing in the log says why.
-            // WARN naming the actionable causes (explicit-hash peers must
-            // be `prime_peer`'d; announce-rooted peers need a received
-            // announce) so an unrooted-but-admitted peer is a log line,
-            // not a live-map interrogation. `knows_peer(key_id)` is the
-            // readback for the same condition.
-            tracing::warn!(
-                destination_key_id,
-                "replication/send: target is admitted but NOT rooted \
-                 (knows_peer=false) — no Reticulum destination resolved. \
-                 Cause: a v7 explicit-hash peer (e.g. ciris-canonical-1) that \
-                 was never prime_peer'd, or an announce-rooted peer whose \
-                 announce has not been received. This send cannot address the \
-                 peer; anti-entropy will not converge until it roots."
-            );
-            // §24 NAT-traversal (CIRISEdge#169): an unreachable
-            // destination under `PendingOrLive` with a wired queue is
-            // stored for the destination's wake-up fetch rather than
-            // failed. Admission-time hybrid-PQC verification is the
-            // operator's concern; the queued bytes are the byte-exact
-            // signed envelope, carried verbatim.
-            if self.delivery == crate::transport::PendingDelivery::PendingOrLive {
-                if let Some(saf) = &self.store_and_forward {
-                    saf.queue(destination_key_id, envelope_bytes)
-                        .map_err(|e| TransportError::Io(format!("store-and-forward queue: {e}")))?;
-                    tracing::info!(
-                        destination_key_id,
-                        "replication/send: unrooted target queued for \
-                         store-and-forward wake-up fetch (§24)"
-                    );
-                    return Ok(TransportSendOutcome::Queued);
-                }
-            }
-            return Err(TransportError::Unreachable(format!(
-                "no Reticulum destination known for destination_key_id={destination_key_id} \
-                 (not directory-resolvable and no announce received)"
-            )));
-        }
-
-        // CIRISEdge#33 (v0.15.0) — operator-deny-list check BEFORE the
-        // leviculum connect call. The blackhole keys on the peer's
-        // 16-byte Reticulum destination_hash (the same bytes
-        // `path_table` returns), so an operator that snapshots the
-        // path table and decides to ban a peer can pass the hash back
-        // unchanged.
-        //
-        // v13.8.0 hardening: check EVERY candidate address, not just the one we
-        // end up dialing — route-table-first selection must never let a ban on
-        // one of the peer's addresses be bypassed by dialing an alternate.
-        for candidate in &candidates {
-            self.check_blackhole(&candidate.dest_hash.into_bytes())
-                .await?;
-        }
-
-        // CIRISEdge#353 — REVERSE PATH FIRST (see `send_via_reverse_path`).
-        // Ordered AFTER the blackhole check so an operator ban still wins.
-        if self
-            .send_via_reverse_path(destination_key_id, envelope_bytes, None)
+        // Lifecycle — refused while suspended, cancelled if a suspend lands.
+        self.lifecycle
+            .guard(self.send_live(destination_key_id, envelope_bytes))
             .await
-        {
-            // CIRISEdge#920 — the peer's own link to us is the identity link
-            // between the two nodes too: a room peer that only ever replies
-            // must still bring it direct.
-            if let Some(link) = self
-                .live_link_to(destination_key_id, LinkPlane::Identity)
-                .await
-            {
-                self.propose_direct_to_room_peer(destination_key_id, link, &candidates)
-                    .await;
-            }
-            return Ok(TransportSendOutcome::Delivered);
-        }
-
-        let claim = self.identity_lane(destination_key_id, &candidates).await?;
-
-        // CIRISEdge#532 — hold the link for the duration of the transfer, so a
-        // concurrent send to this peer takes another pooled link or dials one
-        // rather than queueing behind this resource. Reticulum runs ONE resource
-        // per link; without this the pool would hand the same link to everyone
-        // and reuse would become serialisation.
-        //
-        // Released on EVERY exit path, including the error paths the durable
-        // dispatcher retries through — a leaked marker would retire the link
-        // from the pool permanently while it sat there perfectly usable.
-        // CIRISEdge#853 — and a CANCELLED send: the claim is a guard released
-        // on drop (the responder's 60 s reply timeout cancels ships that may
-        // run 120 s), so a dropped future no longer retires the lane. Both
-        // arms above return the lane ALREADY CLAIMED (a pool take reserves it;
-        // a dial publishes it claimed), so there is no unclaimed lane to ship
-        // on: the "claim lost, ship anyway" path is gone.
-        let link_id = claim.link_id();
-        // A `Busy` collision here is not the reverse-path retry case, so both
-        // variants surface as the send's transport error (the durable dispatcher
-        // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
-        // hard cap (v13.6.1 progress-aware wait).
-        let shipped = self
-            .ship_resource_on_link(
-                &link_id,
-                envelope_bytes,
-                DIAL_NO_PROGRESS_WINDOW,
-                RESOURCE_TRANSFER_TIMEOUT,
-            )
-            .await;
-        claim.release().await;
-        shipped.map_err(ShipError::into_transport)?;
-        // CIRISEdge#915 — a room peer reached through a transport node: try
-        // to bring this link direct for the room's later traffic.
-        self.propose_direct_to_room_peer(destination_key_id, link_id, &candidates)
-            .await;
-
-        Ok(TransportSendOutcome::Delivered)
     }
 
-    /// CIRISEdge#683 — answer on the link the request arrived on. A path minted
-    /// by another transport, or a link that has since closed, falls back to the
-    /// by-key [`Self::send`] (which still tries the peer's attributed links and
-    /// then a dial).
     async fn send_on_reply_path(
         &self,
         destination_key_id: &str,
         path: &crate::transport::ReplyPath,
         envelope_bytes: &[u8],
     ) -> Result<TransportSendOutcome, TransportError> {
-        if envelope_bytes.len() > MAX_BODY_BYTES {
-            return Err(TransportError::BodyTooLarge {
-                actual: envelope_bytes.len(),
-                limit: MAX_BODY_BYTES,
-            });
-        }
-        // The operator ban still wins over the reply path, exactly as it wins
-        // over `send`'s reverse path (v13.8.0: every candidate address).
-        for candidate in &self.resolve_dial_candidates(destination_key_id).await {
-            self.check_blackhole(&candidate.dest_hash.into_bytes())
-                .await?;
-        }
-        if path.transport() == TransportId::RETICULUM_RS
-            && self
-                .send_via_reverse_path(
-                    destination_key_id,
-                    envelope_bytes,
-                    Some(LinkId::new(path.token())),
-                )
-                .await
-        {
-            tracing::debug!(
-                destination_key_id,
-                link = %hex::encode(path.token()),
-                "answer delivered on the link its request arrived on (CIRISEdge#683/#353)"
-            );
-            return Ok(TransportSendOutcome::Delivered);
-        }
-        self.send(destination_key_id, envelope_bytes).await
+        self.lifecycle
+            .guard(self.send_on_reply_path_live(destination_key_id, path, envelope_bytes))
+            .await
     }
 
     async fn send_on_reply_path_only(
@@ -9164,47 +10621,9 @@ impl Transport for ReticulumTransport {
         path: &crate::transport::ReplyPath,
         envelope_bytes: &[u8],
     ) -> Result<TransportSendOutcome, TransportError> {
-        if envelope_bytes.len() > MAX_BODY_BYTES {
-            return Err(TransportError::BodyTooLarge {
-                actual: envelope_bytes.len(),
-                limit: MAX_BODY_BYTES,
-            });
-        }
-        for candidate in &self.resolve_dial_candidates(destination_key_id).await {
-            self.check_blackhole(&candidate.dest_hash.into_bytes())
-                .await?;
-        }
-        if self
-            .tear_down_reply_link
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |n| n.checked_sub(1),
-            )
-            .is_ok()
-        {
-            let _ = self.node.close_link(&LinkId::new(path.token())).await;
-        }
-        // CIRISEdge#739 — the arrival link, PINNED, whatever its plane (#728:
-        // the reply's plane is the request's by construction); no by-key
-        // fallback on any failure — the caller decides what a missing path
-        // means for its message class.
-        if path.transport() == TransportId::RETICULUM_RS
-            && self
-                .send_via_reverse_path(
-                    destination_key_id,
-                    envelope_bytes,
-                    Some(LinkId::new(path.token())),
-                )
-                .await
-        {
-            return Ok(TransportSendOutcome::Delivered);
-        }
-        Err(TransportError::Unreachable(format!(
-            "no live reply path {} to {destination_key_id} — the link the request arrived \
-             on is gone or would not carry the reply (CIRISEdge#739)",
-            hex::encode(path.token())
-        )))
+        self.lifecycle
+            .guard(self.send_on_reply_path_only_live(destination_key_id, path, envelope_bytes))
+            .await
     }
 
     async fn listen(&self, sink: mpsc::Sender<InboundFrame>) -> Result<(), TransportError> {
@@ -9217,6 +10636,52 @@ impl Transport for ReticulumTransport {
             .await
             .take()
             .ok_or_else(|| TransportError::Config("listen called twice".into()))?;
+        if let Some(jobs) = self.homing_rx.lock().await.take() {
+            tokio::spawn(run_homing(self.dial_ctx(), jobs));
+        }
+
+        // `FSD/PRIVACY_MODES.md` §6.12 — while tier 2 is in force.
+        if let Some(m) = self.metrics.get() {
+            m.telemetry
+                .set_direct_link_proposing(self.direct_paths.config.proposes());
+        }
+        tracing::info!(
+            target: "edge.direct_link.posture",
+            proposes = self.direct_paths.config.proposes(),
+            proposing = ?self.direct_paths.config.proposing,
+            facilitator = self.direct_paths.config.facilitator.is_some(),
+            "direct links: this node's proposing posture"
+        );
+        tokio::spawn(run_shaped_shed(
+            Arc::downgrade(&self.node),
+            Arc::clone(&self.seals),
+            Arc::clone(&self.shapers),
+            Arc::clone(&self.lifecycle),
+            self.metrics.get().cloned(),
+        ));
+
+        // ALM stage 2 — a transport node reads what it forwards once a
+        // second: the admission ledger retires closed links, and the rates
+        // feed the `load_ledger` and the ladder's `edge:transit_pps` signal.
+        if self.forwards_for_others {
+            let node_w = Arc::downgrade(&self.node);
+            let fa = Arc::clone(&self.forward_admission);
+            let out = Arc::clone(&self.forward_load);
+            tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    let Some(node) = node_w.upgrade() else { return };
+                    let links = node.forwarded_links();
+                    drop(node);
+                    let now = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let load = fa.refresh(&links, now);
+                    *out.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = load;
+                }
+            });
+        }
 
         tracing::info!(
             addr = %self.config.listen_addr,
@@ -9237,6 +10702,221 @@ impl Transport for ReticulumTransport {
                     self.config.listen_addr, self.local_dest_hash, self.local_named_dest_hash,
                 ),
             ));
+        }
+
+        // Lifecycle — the listener runs active (timers, reaper, announce
+        // worker) until a suspend asks it to park, parks with no timer until
+        // resume, and runs active again: one `listen` for the transport's
+        // whole life, holding the node's single event receiver throughout.
+        let _listener = self.lifecycle.listener();
+        let mut woken = false;
+        loop {
+            if self.lifecycle.park_requested() {
+                self.lifecycle.park_until_woken().await;
+            }
+            match self.listen_active(&mut events, &sink, woken).await {
+                ListenExit::Park => woken = true,
+                ListenExit::EventsClosed => break,
+            }
+        }
+
+        // CIRISEdge#34 — emit `transport_down` interface event on
+        // listener exit. Symmetric with the `transport_up` emission
+        // above; consumers observe shutdown via the same channel.
+        if let Some(bus) = self.event_bus.as_ref() {
+            bus.emit_interface(crate::events::NetworkEvent::interface(
+                crate::events::EventKind::TransportDown,
+                "reticulum-rs",
+                "Reticulum transport listen loop exited",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// How often the event loop stamps its liveness.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// How often the node tick runs: the ladder's window.
+const NODE_TICK: Duration = Duration::from_secs(1);
+
+/// The closed `event` label of a node event.
+fn event_label(event: &NodeEvent) -> EventLabel {
+    match event {
+        NodeEvent::AnnounceReceived { .. } => EventLabel::Announce,
+        NodeEvent::LinkEstablished { .. } => EventLabel::LinkEstablished,
+        NodeEvent::LinkIdentified { .. } => EventLabel::LinkIdentified,
+        NodeEvent::MessageReceived { .. } | NodeEvent::LinkDataReceived { .. } => EventLabel::Frame,
+        NodeEvent::RequestReceived { .. } => EventLabel::Request,
+        NodeEvent::ResourceCompleted { .. } => EventLabel::ResourceCompleted,
+        NodeEvent::ResourceTransferStarted { .. } | NodeEvent::ResourceProgress { .. } => {
+            EventLabel::ResourceProgress
+        }
+        NodeEvent::ResourceAdvertised { .. } => EventLabel::ResourceAdvertised,
+        NodeEvent::ResourceFailed { .. } => EventLabel::ResourceFailed,
+        NodeEvent::LinkClosed { .. } => EventLabel::LinkClosed,
+        NodeEvent::LinkStale { .. } => EventLabel::LinkStale,
+        NodeEvent::DirectLinkEstablished { .. }
+        | NodeEvent::DirectLinkRequested { .. }
+        | NodeEvent::DirectLinkFailed { .. }
+        | NodeEvent::DirectLinkLost { .. } => EventLabel::DirectLink,
+        NodeEvent::PeerCongested { .. } => EventLabel::PeerCongested,
+        _ => EventLabel::Other,
+    }
+}
+
+/// Mirror leviculum's driver planes (the names `METRIC_CATALOG` gives
+/// `leviculum.events.*` and `leviculum.shed.packets`) into the bag. No
+/// recorder is wired, so `publish_metrics` would have nowhere to go.
+fn mirror_planes(node: &ReticulumNode, metrics: &crate::observability::EdgeMetrics) {
+    let p = node.plane_stats();
+    metrics.telemetry.set_leviculum_planes(
+        [p.control_queued, p.data_queued],
+        [p.control_capacity, p.data_capacity],
+        [p.control_dropped_total, p.data_dropped_total],
+        p.shed_packets_total,
+    );
+}
+
+/// What the node tick reads and moves.
+struct NodeTick {
+    node: std::sync::Weak<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    forward_admission: Arc<crate::transport::relay_tier::ForwardAdmission>,
+    forward_load: Arc<std::sync::Mutex<crate::transport::relay_tier::ForwardLoad>>,
+    ladder: Option<Arc<crate::load_ladder::SharedLadder>>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+}
+
+impl NodeTick {
+    /// Edge's own signals reach the shapers and forward admission here, and
+    /// not only when a host reads the tier: a raise from `relay_commit` or
+    /// `av_queue_age` used to wait for the next `set_load_pressure`, and with
+    /// no such caller, for nothing. The ladder's cooldowns run on this too.
+    fn apply_tier(&self) {
+        let Some(ladder) = &self.ladder else { return };
+        let load = self
+            .forward_load
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let tier = ladder.report(crate::load_ladder::EdgeLoadSignals {
+            transit_pps_ratio: load.pps_ratio,
+            ..crate::load_ladder::EdgeLoadSignals::default()
+        });
+        if tier != self.shapers.service_tier() {
+            self.forward_admission.set_tier(tier);
+            self.shapers.set_service_tier(tier);
+        }
+    }
+
+    fn publish(&self, m: &crate::observability::EdgeMetrics, node: &ReticulumNode) {
+        use crate::telemetry::ShapingClass;
+        let t = &m.telemetry;
+        let (links, bytes, held) = self.seals.occupancy();
+        t.set_seal_awaiting(links, bytes);
+        t.set_seal_held(held);
+        mirror_planes(node, m);
+        let policy = self.shapers.policy();
+        let seat = self.shapers.links_of(ShapingClass::Seat);
+        t.set_shaping(
+            policy.enabled(),
+            self.shapers.counted_link_count(),
+            seat,
+            self.shapers.free_slots(),
+        );
+        t.shaping_windows.tick(
+            t.now_ms(),
+            |class| self.shapers.links_of(class),
+            crate::transport::link_shaping::class_window,
+        );
+    }
+
+    fn turn(&self) -> bool {
+        self.apply_tier();
+        let Some(node) = self.node.upgrade() else {
+            return false;
+        };
+        if let Some(m) = &self.metrics {
+            m.telemetry.beat(LoopName::Ladder);
+            self.publish(m, &node);
+        }
+        true
+    }
+}
+
+/// The node tick, for as long as the listener runs.
+async fn run_node_tick(tick: NodeTick) {
+    let mut interval = tokio::time::interval(NODE_TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if !tick.turn() {
+            return;
+        }
+    }
+}
+
+/// Lifecycle — how long a resumed listener waits for an interface to come
+/// online before its first announce.
+const RESUME_ANNOUNCE_WAIT: Duration = Duration::from_secs(10);
+
+/// Why [`ReticulumTransport::listen_active`] returned.
+enum ListenExit {
+    /// A suspend asked the listener to park.
+    Park,
+    /// The node's event channel closed: the listener ends.
+    EventsClosed,
+}
+
+impl ReticulumTransport {
+    fn node_tick(&self) -> NodeTick {
+        NodeTick {
+            node: Arc::downgrade(&self.node),
+            seals: Arc::clone(&self.seals),
+            shapers: Arc::clone(&self.shapers),
+            forward_admission: Arc::clone(&self.forward_admission),
+            forward_load: Arc::clone(&self.forward_load),
+            ladder: self.load_ladder.get().cloned(),
+            metrics: self.metrics.get().cloned(),
+        }
+    }
+
+    /// One active run of the listener: the announce timer, the link reapers,
+    /// the attribution tick, the announce cold-start worker and the event
+    /// loop. Returns when a suspend asks it to park (after draining the
+    /// events already queued and ending the worker) or when the event channel
+    /// closes. `woken` — a run after a resume: its first announce waits
+    /// (bounded) for an interface to come online, since the resumed TCP
+    /// clients are still connecting.
+    // The body is the pre-lifecycle `listen` loop, unchanged but for the park
+    // arm and the worker's end; splitting it would scatter its borrows.
+    #[allow(clippy::too_many_lines)]
+    async fn listen_active(
+        &self,
+        events: &mut EventReceiver,
+        sink: &mpsc::Sender<InboundFrame>,
+        woken: bool,
+    ) -> ListenExit {
+        let _active = self.lifecycle.task();
+        if woken {
+            let deadline = tokio::time::Instant::now() + RESUME_ANNOUNCE_WAIT;
+            let online = tokio::select! {
+                // Suspended again before an interface came up.
+                () = self.lifecycle.park_signal() => return ListenExit::Park,
+                online = crate::transport::lifecycle::settle(deadline, || {
+                    let up = self.node.interface_stats().iter().any(|i| i.online);
+                    async move { up }
+                }) => online,
+            };
+            if !online {
+                tracing::info!(
+                    "resume: no interface online within {RESUME_ANNOUNCE_WAIT:?}; announcing \
+                     anyway (the interfaces re-announce when they connect)"
+                );
+            }
         }
 
         // v7.4.0 (CIRISEdge#231) — announce edge's NAMED destination
@@ -9325,7 +11005,9 @@ impl Transport for ReticulumTransport {
         // first-contact peer ever being the one shed.
         let (announce_priority_tx, mut announce_priority_rx) =
             mpsc::channel::<AnnounceView>(ANNOUNCE_PRIORITY_QUEUE_DEPTH);
-        tokio::spawn(async move {
+        let worker_lifecycle = Arc::clone(&self.lifecycle);
+        let announce_worker = tokio::spawn(async move {
+            let _task = worker_lifecycle.task();
             loop {
                 let next = tokio::select! {
                     biased;
@@ -9342,16 +11024,42 @@ impl Transport for ReticulumTransport {
         // (`release_held`) are re-checked on this tick, which runs only while
         // some wait: a binding healed in the cold-start worker raises no event
         // here, and a link still unattributed at the budget must be refused.
+        // The seat roster, on a bounded cadence and off this loop: an offer
+        // reads the set it leaves and never waits on the directory. The timer
+        // ends with this run, so a parked node holds none.
+        let mut seat_tick = tokio::time::interval(crate::peer_obligation::SEAT_ROSTER_REFRESH);
+        seat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut attribution_tick = tokio::time::interval(Duration::from_millis(100));
         attribution_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // v44 LTS — before the first event: a peer this node answers for has
+        // standing from its first handshake. Bounded, so a slow directory
+        // delays no listener; the read finishes on its own if it runs over.
+        if let Some(rooting) = self.rooting.clone() {
+            let boot = tokio::spawn(Arc::clone(&self.persisted_standing).boot(
+                rooting,
+                self.hybrid_policy,
+                self.metrics.get().cloned(),
+            ));
+            if tokio::time::timeout(PERSISTED_STANDING_BOOT_BUDGET, boot)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    budget_secs = PERSISTED_STANDING_BOOT_BUDGET.as_secs(),
+                    "persisted standing still reading at the listener's start; first \
+                     handshakes may be judged strangers until it lands"
+                );
+            }
+        }
         let ctx = EventCtx {
             node: &self.node,
+            persisted_standing: &self.persisted_standing.table,
             local_key_id: self.occurrence_key_id(),
             route_answer_override: &self.route_answer_override,
             peers: &self.peers,
             established_links: &self.established_links,
             sent_resource_progress: &self.sent_resource_progress,
-            sink: &sink,
+            sink,
             rooting: self.rooting.as_deref(),
             hybrid_policy: self.hybrid_policy,
             binding_cache: &self.binding_cache,
@@ -9392,17 +11100,91 @@ impl Transport for ReticulumTransport {
             av_node: &self.node,
             av_dialed_peer: &self.av_dialed_peer,
             direct_paths: &self.direct_paths,
+            alm_links: &self.alm_links,
             seals: &self.seals,
+            keyer: &self.keyer,
             shapers: &self.shapers,
+            onion: &self.onion,
         };
-        loop {
+        let mut keying_done = self.keying_done.lock().await;
+        // v44 — the event loop's liveness, on its own cadence and never per
+        // event: an age that follows the frames would be a clock of them.
+        let mut heartbeat = tokio::time::interval(HEARTBEAT);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // v44 — off this loop, so a wedged event never holds the ladder, and
+        // it ends with this run, so a parked node holds no timer.
+        let node_tick = tokio::spawn(run_node_tick(self.node_tick()));
+        let observe = |label: EventLabel, began: std::time::Instant| {
+            if let Some(m) = ctx.metrics {
+                m.telemetry.observe_event(label, began.elapsed());
+            }
+        };
+        let exit = loop {
             tokio::select! {
-                _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution() => {
+                // Lifecycle — a suspend: handle what the link closes already
+                // queued (so the pool and attribution maps forget the closed
+                // links), then stop. The timers above end with this run.
+                () = self.lifecycle.park_signal() => {
+                    while let Ok(done) = keying_done.try_recv() {
+                        apply_keying(done, &ctx).await;
+                    }
+                    while let Ok(event) = events.try_recv() {
+                        handle_event(event, &ctx).await;
+                    }
+                    break ListenExit::Park;
+                }
+                // CIRISEdge#947 — a handshake's decapsulation came back. The
+                // outcome is applied here, on the one thread of control that
+                // handles the link's frames.
+                Some(done) = keying_done.recv() => {
+                    let began = std::time::Instant::now();
+                    apply_keying(done, &ctx).await;
+                    observe(EventLabel::KeyingApplied, began);
+                }
+                _ = heartbeat.tick() => {
+                    if let Some(m) = ctx.metrics {
+                        m.telemetry.beat(LoopName::Event);
+                    }
+                }
+                _ = attribution_tick.tick(), if ctx.seals.any_awaiting_attribution()
+                    || ctx.seals.any_deferred() => {
+                    let began = std::time::Instant::now();
                     for link in ctx.seals.awaiting_attribution() {
                         release_held(&ctx, LinkId::new(link)).await;
                     }
+                    for job in ctx.seals.take_overdue_deferred() {
+                        gate_handshake(&ctx, LinkId::new(job.link()), job).await;
+                    }
+                    observe(EventLabel::AttributionTick, began);
+                }
+                _ = seat_tick.tick() => {
+                    if let Some(m) = ctx.metrics {
+                        m.telemetry.beat(LoopName::Seat);
+                    }
+                    tokio::spawn(refresh_seats(
+                        Arc::clone(&self.node),
+                        Arc::clone(&self.seals),
+                        Arc::clone(&self.shapers),
+                    ));
+                    if let Some(rooting) = self.rooting.clone() {
+                        let landed = self.persisted_standing.take_landed();
+                        if !landed.is_empty() {
+                            tokio::spawn(ask_through_landed_routes(
+                                Arc::clone(&self.node),
+                                Arc::clone(&rooting),
+                                Arc::clone(&self.path_seeks),
+                                landed,
+                            ));
+                        }
+                        tokio::spawn(Arc::clone(&self.persisted_standing).pass(
+                            rooting,
+                            self.hybrid_policy,
+                            self.metrics.get().cloned(),
+                        ));
+                    }
                 }
                 _ = pool_tick.tick() => {
+                    let began = std::time::Instant::now();
                     let closed = self.reap_idle_pooled_links().await;
                     if closed > 0 {
                         tracing::debug!(
@@ -9422,8 +11204,10 @@ impl Transport for ReticulumTransport {
                             "inbound reaper closed idle inbound links (CIRISEdge#853)"
                         );
                     }
+                    observe(EventLabel::PoolTick, began);
                 }
                 _ = announce_tick.tick() => {
+                    let began = std::time::Instant::now();
                     if unannounced() {
                         tracing::trace!("unannounced (test seam): no periodic announce");
                     } else if let Err(e) = self
@@ -9456,11 +11240,12 @@ impl Transport for ReticulumTransport {
                             )
                             .await;
                     }
+                    observe(EventLabel::AnnounceTick, began);
                 }
                 event = events.recv() => {
                     let Some(event) = event else {
                         tracing::info!("Reticulum event channel closed; listener exiting");
-                        break;
+                        break ListenExit::EventsClosed;
                     };
                     // CIRISEdge#336 (fast heal) — RNS-aligned event-driven announce.
                     // A `LinkEstablished` means a peer just connected; re-announce so
@@ -9469,7 +11254,10 @@ impl Transport for ReticulumTransport {
                     // Rate-limited so rapid link churn can't storm announces.
                     let link_just_established =
                         matches!(event, NodeEvent::LinkEstablished { .. });
+                    let label = event_label(&event);
+                    let began = std::time::Instant::now();
                     handle_event(event, &ctx).await;
+                    observe(label, began);
 
                     // `map_or(true, …)` not `is_none_or` — MSRV 1.75 (is_none_or is 1.82).
                     if link_just_established
@@ -9478,6 +11266,7 @@ impl Transport for ReticulumTransport {
                             .map_or(true, |t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
                     {
                         last_event_announce = Some(std::time::Instant::now());
+                        let began = std::time::Instant::now();
                         match self
                             .node
                             .announce_destination(&self.local_named_dest_hash, Some(app_data))
@@ -9492,23 +11281,326 @@ impl Transport for ReticulumTransport {
                                 "event-driven announce (link up) failed"
                             ),
                         }
+                        observe(EventLabel::LinkUpAnnounce, began);
                     }
                 }
             }
+        };
+        // End this run's announce worker: its queues close with `ctx` and the
+        // senders; the abort ends a cold-start resolution still in progress.
+        drop(announce_tx);
+        drop(announce_priority_tx);
+        announce_worker.abort();
+        let _ = announce_worker.await;
+        node_tick.abort();
+        let _ = node_tick.await;
+        // A parked loop is not a wedged one: its age reads "not running".
+        if let Some(m) = self.metrics.get() {
+            for name in [LoopName::Event, LoopName::Seat, LoopName::Ladder] {
+                m.telemetry.beat_off(name);
+            }
+        }
+        exit
+    }
+}
+
+/// The [`Transport`] send bodies, run by the trait methods behind the
+/// lifecycle gate ([`crate::transport::lifecycle`]).
+impl ReticulumTransport {
+    // The send's one ordered story: the plane, the bound, the bulk paths.
+    #[allow(clippy::too_many_lines)]
+    async fn send_live(
+        &self,
+        destination_key_id: &str,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        // AV-13: reject oversized payloads before touching the network.
+        if envelope_bytes.len() > MAX_BODY_BYTES {
+            return Err(TransportError::BodyTooLarge {
+                actual: envelope_bytes.len(),
+                limit: MAX_BODY_BYTES,
+            });
         }
 
-        // CIRISEdge#34 — emit `transport_down` interface event on
-        // listener exit. Symmetric with the `transport_up` emission
-        // above; consumers observe shutdown via the same channel.
-        if let Some(bus) = self.event_bus.as_ref() {
-            bus.emit_interface(crate::events::NetworkEvent::interface(
-                crate::events::EventKind::TransportDown,
-                "reticulum-rs",
-                "Reticulum transport listen loop exited",
-            ));
+        // CIRISEdge#336 (v13.8.0) — resolve the peer's FULL candidate address
+        // set; the dial target is chosen by ROUTABILITY further down, after the
+        // reverse-path attempt. See `resolve_dial_candidates` /
+        // `select_dial_candidate` for the holistic-fix rationale.
+        let mut candidates = self.resolve_dial_candidates(destination_key_id).await;
+        if candidates.is_empty() && self.seek_peer(destination_key_id).await {
+            candidates = self.resolve_dial_candidates(destination_key_id).await;
+        }
+        if candidates.is_empty() {
+            // CIRISEdge#292 (CIRISServer#205) — an admitted replication
+            // target whose Reticulum destination we can't resolve is the
+            // silent-zero-delivery class: the round fires, this send
+            // fails, and without this line nothing in the log says why.
+            // WARN naming the actionable causes (explicit-hash peers must
+            // be `prime_peer`'d; announce-rooted peers need a received
+            // announce) so an unrooted-but-admitted peer is a log line,
+            // not a live-map interrogation. `knows_peer(key_id)` is the
+            // readback for the same condition.
+            tracing::warn!(
+                destination_key_id,
+                "replication/send: target is admitted but NOT rooted \
+                 (knows_peer=false) — no Reticulum destination resolved. \
+                 Cause: a v7 explicit-hash peer (e.g. ciris-canonical-1) that \
+                 was never prime_peer'd, or an announce-rooted peer whose \
+                 announce has not been received. This send cannot address the \
+                 peer; anti-entropy will not converge until it roots."
+            );
+            // §24 NAT-traversal (CIRISEdge#169): an unreachable
+            // destination under `PendingOrLive` with a wired queue is
+            // stored for the destination's wake-up fetch rather than
+            // failed. Admission-time hybrid-PQC verification is the
+            // operator's concern; the queued bytes are the byte-exact
+            // signed envelope, carried verbatim.
+            //
+            // Never a replication frame: it belongs to a round that is over
+            // by any wake-up, and anti-entropy catches the peer up on its
+            // return. Queued, it cost the round its no-route answer (`Queued`
+            // reads as sent, so every plane waited out its reply and swept
+            // again at full cadence), and took the slot of a message the
+            // queue is there for (CIRISEdge#794).
+            if self.delivery == crate::transport::PendingDelivery::PendingOrLive
+                && !is_replication_frame(envelope_bytes)
+            {
+                if let Some(saf) = &self.store_and_forward {
+                    saf.queue(destination_key_id, envelope_bytes)
+                        .map_err(|e| TransportError::Io(format!("store-and-forward queue: {e}")))?;
+                    tracing::info!(
+                        destination_key_id,
+                        "replication/send: unrooted target queued for \
+                         store-and-forward wake-up fetch (§24)"
+                    );
+                    return Ok(TransportSendOutcome::Queued);
+                }
+            }
+            self.persisted_standing.note_unaddressed(destination_key_id);
+            return Err(TransportError::NoDialCandidate {
+                key_id: destination_key_id.to_owned(),
+            });
         }
 
-        Ok(())
+        // CIRISEdge#33 (v0.15.0) — operator-deny-list check BEFORE the
+        // leviculum connect call. The blackhole keys on the peer's
+        // 16-byte Reticulum destination_hash (the same bytes
+        // `path_table` returns), so an operator that snapshots the
+        // path table and decides to ban a peer can pass the hash back
+        // unchanged.
+        //
+        // v13.8.0 hardening: check EVERY candidate address, not just the one we
+        // end up dialing — route-table-first selection must never let a ban on
+        // one of the peer's addresses be bypassed by dialing an alternate.
+        for candidate in &candidates {
+            self.check_blackhole(&candidate.dest_hash.into_bytes())
+                .await?;
+        }
+
+        // CIRISEdge#353 — REVERSE PATH FIRST (see `send_via_reverse_path`).
+        // Ordered AFTER the blackhole check so an operator ban still wins.
+        if self
+            .send_via_reverse_path(destination_key_id, envelope_bytes, None)
+            .await
+        {
+            // CIRISEdge#920 — the peer's own link to us is the identity link
+            // between the two nodes too: a room peer that only ever replies
+            // must still bring it direct.
+            if let Some(link) = self
+                .live_link_to(destination_key_id, LinkPlane::Identity)
+                .await
+            {
+                self.propose_direct_to_room_peer(destination_key_id, link, &candidates)
+                    .await;
+            }
+            return Ok(TransportSendOutcome::Delivered);
+        }
+
+        // CC 5.4.3 rc16 two planes — bulk (a chunk, a content body, a fetch
+        // for one, or anything beyond the shaped link's reach) rides an
+        // UNSHAPED link of its own and never the shaped row link. A bulk-class
+        // send to a peer this node shapes toward goes straight to the bulk
+        // lane; any other send takes the row lane and moves to the bulk lane
+        // only when the row link it got is shaped and the payload is too big.
+        let bulk = crate::transport::link_shaping::is_bulk_payload(envelope_bytes);
+        if !bulk && self.row_recently_homed_elsewhere(destination_key_id) {
+            return Err(TransportError::LinkSealRefused {
+                peer: destination_key_id.to_owned(),
+                reason: crate::observability::LINK_SHAPING_HOME_ELSEWHERE,
+                detail: "the row link to this peer was refused at a shaped-link bound lately; \
+                         it is homed elsewhere (CIRISEdge#935), bulk still rides its own link"
+                    .to_owned(),
+            });
+        }
+        if bulk && self.bulk_dial_recently_failed(destination_key_id) {
+            if let Some(link) = self
+                .shaped_link_for_bulk(destination_key_id, envelope_bytes)
+                .await
+            {
+                return self
+                    .bulk_on_shaped(destination_key_id, envelope_bytes, link)
+                    .await;
+            }
+        }
+        let lane = self
+            .identity_lane(
+                destination_key_id,
+                &candidates,
+                bulk && self.shapers.offers_to(Some(destination_key_id)),
+            )
+            .await;
+        let mut claim = match lane {
+            Ok(c) => c,
+            Err(e) => {
+                return self
+                    .bulk_on_shaped_or(destination_key_id, envelope_bytes, e)
+                    .await
+            }
+        };
+        if self
+            .shapers
+            .needs_bulk_plane(claim.link_id().into_bytes(), envelope_bytes)
+        {
+            claim.release().await;
+            claim = match self
+                .identity_lane(destination_key_id, &candidates, true)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return self
+                        .bulk_on_shaped_or(destination_key_id, envelope_bytes, e)
+                        .await
+                }
+            };
+        }
+
+        // CIRISEdge#532 — hold the link for the duration of the transfer, so a
+        // concurrent send to this peer takes another pooled link or dials one
+        // rather than queueing behind this resource. Reticulum runs ONE resource
+        // per link; without this the pool would hand the same link to everyone
+        // and reuse would become serialisation.
+        //
+        // Released on EVERY exit path, including the error paths the durable
+        // dispatcher retries through — a leaked marker would retire the link
+        // from the pool permanently while it sat there perfectly usable.
+        // CIRISEdge#853 — and a CANCELLED send: the claim is a guard released
+        // on drop (the responder's 60 s reply timeout cancels ships that may
+        // run 120 s), so a dropped future no longer retires the lane. Both
+        // arms above return the lane ALREADY CLAIMED (a pool take reserves it;
+        // a dial publishes it claimed), so there is no unclaimed lane to ship
+        // on: the "claim lost, ship anyway" path is gone.
+        let link_id = claim.link_id();
+        // A `Busy` collision here is not the reverse-path retry case, so both
+        // variants surface as the send's transport error (the durable dispatcher
+        // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
+        // hard cap (v13.6.1 progress-aware wait).
+        let shipped = self
+            .ship_resource_on_link(
+                &link_id,
+                envelope_bytes,
+                DIAL_NO_PROGRESS_WINDOW,
+                RESOURCE_TRANSFER_TIMEOUT,
+            )
+            .await;
+        claim.release().await;
+        shipped.map_err(ShipError::into_transport)?;
+        // CIRISEdge#915 — a room peer reached through a transport node: try
+        // to bring this link direct for the room's later traffic.
+        self.propose_direct_to_room_peer(destination_key_id, link_id, &candidates)
+            .await;
+
+        Ok(TransportSendOutcome::Delivered)
+    }
+
+    /// CIRISEdge#683 — answer on the link the request arrived on. A path minted
+    /// by another transport, or a link that has since closed, falls back to the
+    /// by-key [`Self::send`] (which still tries the peer's attributed links and
+    /// then a dial).
+    async fn send_on_reply_path_live(
+        &self,
+        destination_key_id: &str,
+        path: &crate::transport::ReplyPath,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        if envelope_bytes.len() > MAX_BODY_BYTES {
+            return Err(TransportError::BodyTooLarge {
+                actual: envelope_bytes.len(),
+                limit: MAX_BODY_BYTES,
+            });
+        }
+        // The operator ban still wins over the reply path, exactly as it wins
+        // over `send`'s reverse path (v13.8.0: every candidate address).
+        for candidate in &self.resolve_dial_candidates(destination_key_id).await {
+            self.check_blackhole(&candidate.dest_hash.into_bytes())
+                .await?;
+        }
+        if path.transport() == TransportId::RETICULUM_RS
+            && self
+                .send_via_reverse_path(
+                    destination_key_id,
+                    envelope_bytes,
+                    Some(LinkId::new(path.token())),
+                )
+                .await
+        {
+            tracing::debug!(
+                destination_key_id,
+                link = %hex::encode(path.token()),
+                "answer delivered on the link its request arrived on (CIRISEdge#683/#353)"
+            );
+            return Ok(TransportSendOutcome::Delivered);
+        }
+        self.send(destination_key_id, envelope_bytes).await
+    }
+
+    async fn send_on_reply_path_only_live(
+        &self,
+        destination_key_id: &str,
+        path: &crate::transport::ReplyPath,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        if envelope_bytes.len() > MAX_BODY_BYTES {
+            return Err(TransportError::BodyTooLarge {
+                actual: envelope_bytes.len(),
+                limit: MAX_BODY_BYTES,
+            });
+        }
+        for candidate in &self.resolve_dial_candidates(destination_key_id).await {
+            self.check_blackhole(&candidate.dest_hash.into_bytes())
+                .await?;
+        }
+        if self
+            .tear_down_reply_link
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            let _ = self.node.close_link(&LinkId::new(path.token())).await;
+        }
+        // CIRISEdge#739 — the arrival link, PINNED, whatever its plane (#728:
+        // the reply's plane is the request's by construction); no by-key
+        // fallback on any failure — the caller decides what a missing path
+        // means for its message class.
+        if path.transport() == TransportId::RETICULUM_RS
+            && self
+                .send_via_reverse_path(
+                    destination_key_id,
+                    envelope_bytes,
+                    Some(LinkId::new(path.token())),
+                )
+                .await
+        {
+            return Ok(TransportSendOutcome::Delivered);
+        }
+        Err(TransportError::Unreachable(format!(
+            "no live reply path {} to {destination_key_id} — the link the request arrived \
+             on is gone or would not carry the reply (CIRISEdge#739)",
+            hex::encode(path.token())
+        )))
     }
 }
 
@@ -10131,8 +12223,11 @@ impl Drop for OutboundShipGuard<'_> {
 /// lock so two concurrent leases cannot pick the same lane. Dead entries are
 /// evicted on the way out — the map is a cache over leviculum's link registry,
 /// and leviculum is the authority.
+// CIRISEdge#926 — the stall guard joined the pool's other per-link state.
+#[allow(clippy::too_many_arguments)]
 async fn lease_pooled_scoped_link(
     node: &ReticulumNode,
+    stall_guard: &crate::transport::link_stall::LinkStallGuard,
     pool: &Mutex<HashMap<DestinationHash, Vec<LinkId>>>,
     leased: &Arc<std::sync::Mutex<HashSet<LinkId>>>,
     planes: &Mutex<HashMap<LinkId, LinkPlane>>,
@@ -10143,7 +12238,8 @@ async fn lease_pooled_scoped_link(
     let mut map = pool.lock().await;
     let links = map.get_mut(dest)?;
     let before = links.len();
-    links.retain(|id| node.link_is_established(id));
+    // CIRISEdge#926 — a link the stall guard judged dead is never leased.
+    links.retain(|id| node.link_is_established(id) && !stall_guard.is_dead(&id.into_bytes()));
     note_pool_links_closed(metrics, before - links.len());
     if links.is_empty() {
         map.remove(dest);
@@ -10188,6 +12284,11 @@ async fn lease_pooled_scoped_link(
 /// equal values diverge.
 #[derive(Clone)]
 struct DialCtx {
+    /// CC 5.4.3 rc16 two planes — this context's lane: `false` the row lane
+    /// (dials offer shaping per policy; the pool never hands out a bulk
+    /// link), `true` the bulk lane (dials offer none and are marked bulk; the
+    /// pool never hands out a shaped link).
+    bulk_lane: bool,
     node: Arc<ReticulumNode>,
     local_identity: Identity,
     own_bundle: Option<OwnBuildBundle>,
@@ -10223,6 +12324,21 @@ struct DialCtx {
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_unannounced`.
     test_unannounced: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — every outbound dial fails as unroutable (a NAT'd peer).
+    test_refuse_dials: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — how many dials [`Self::test_refuse_dials`] refused.
+    test_refused_dials: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared with the transport: peers whose row link was refused at a bound
+    /// ([`ReticulumTransport::row_homed_elsewhere`]).
+    row_homed_elsewhere: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Weak, so the worker's own context does not keep its channel open.
+    homing_tx: mpsc::WeakSender<HomingJob>,
+    /// See [`ReticulumTransport::homed`].
+    homed: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// See [`ReticulumTransport::homed_events`].
+    homed_events: tokio::sync::broadcast::Sender<String>,
+    /// The peer table: a referred node is installed here to be dialled.
+    peers: Arc<Mutex<HashMap<String, RootedPeer>>>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_identify_last`.
     test_identify_last: Arc<std::sync::atomic::AtomicBool>,
     /// CC 5.3.3.5 E1 test seam ([`HandshakeOverride::DeferLastPart`]): the
@@ -10230,6 +12346,38 @@ struct DialCtx {
     deferred_handshake_part: Arc<std::sync::Mutex<HashMap<LinkId, Vec<u8>>>>,
     /// Test seam — see `ReticulumTransport::test_binding_key_only`.
     test_binding_key_only: Arc<std::sync::atomic::AtomicBool>,
+    /// CIRISEdge#926 — see `ReticulumTransport::stall_guard`: the pool never
+    /// hands out a link it judged dead.
+    stall_guard: Arc<crate::transport::link_stall::LinkStallGuard>,
+    /// v44 — the pool hands out no link with an upgrade in flight.
+    direct_paths: Arc<crate::transport::direct_path::DirectPaths>,
+    /// ALM stage 2 — roster relays before the default path (R2); `None`
+    /// when the transport's `steer_roster_relays` is off.
+    relay_steer: Option<RelaySteer>,
+}
+
+/// ALM stage 2 (`FSD/CIRIS_MESH.md` R2) — what an identity dial needs to
+/// steer through a roster relay.
+#[derive(Clone)]
+struct RelaySteer {
+    budget: Duration,
+    established: Arc<Mutex<HashSet<LinkId>>>,
+    peers: Arc<Mutex<HashMap<String, RootedPeer>>>,
+    table: Option<Arc<ScopeAddressTable>>,
+    direct_paths: Arc<crate::transport::direct_path::DirectPaths>,
+}
+
+impl RelaySteer {
+    /// The roster member (a room peer or a consented contact) whose
+    /// transport identity hash is `relay`, if any (§3.3 eligibility).
+    async fn roster_key(&self, relay: &[u8; 16]) -> Option<String> {
+        let peers = self.peers.lock().await;
+        peers.iter().find_map(|(key_id, rp)| {
+            (TransportIdentityPub::from_pub64(&rp.transport_pubkey64).hash()[..] == relay[..]
+                && direct_standing(self.table.as_deref(), &self.direct_paths, key_id))
+            .then(|| key_id.clone())
+        })
+    }
 }
 
 impl DialCtx {
@@ -10691,6 +12839,19 @@ impl DialCtx {
         has_path: bool,
         establish_timeout: Duration,
     ) -> Result<LinkClaim, TransportError> {
+        if self
+            .test_refuse_dials
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.test_refused_dials
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            return Err(TransportError::NoRouteToPeer {
+                key_id: destination_key_id.to_owned(),
+                target_dest: hex::encode(peer.dest_hash.into_bytes()),
+                has_path,
+                paths: "test seam: outbound dials refused".to_owned(),
+            });
+        }
         // CIRISEdge#484 — leviculum v0.16 `connect_awaited` returns the handle
         // immediately AND a completion future for `LinkEstablished`, registered
         // BEFORE dispatch (edge no longer needs to observe the event loop `listen`
@@ -10864,6 +13025,110 @@ impl DialCtx {
     /// and the plane (#728), await establishment, identify (#340), and key the
     /// link with `pair` claiming `claim` (CC 5.3.3.5 E1). Pushes nothing and
     /// publishes nothing; the caller decides what the link may carry.
+    /// Tag an identity-plane dial before it establishes: the initiator side
+    /// of the seal (CC 5.3.3.5 E1), the dialled destination (#424: a reply on
+    /// the reverse path attributes to this peer) and the plane (#728: the
+    /// pool and the reverse-path selector never see an untagged link).
+    async fn tag_identity_dial(&self, link_id: LinkId, dest: DestinationHash) {
+        self.seals.begin_initiator(link_id.into_bytes());
+        self.dialed_link_dest.lock().await.insert(link_id, dest);
+        self.link_plane
+            .lock()
+            .await
+            .insert(link_id, LinkPlane::Identity);
+    }
+
+    /// ALM stage 2 (`FSD/CIRIS_MESH.md` R2) — dial `dest` through a ROSTER
+    /// relay: one the destination was heard through whose node shares a room
+    /// with this node or is a consented contact. R2 order (fewest hops, then
+    /// a seeded draw among equals, `relay_tier::roster_relays_first`), ONE
+    /// establish attempt per relay (`connect_via` with a budget), edge owning
+    /// the failover. `None` when no roster relay establishes: the caller
+    /// falls to the default path, the last tier.
+    async fn dial_via_roster_relay(
+        &self,
+        destination_key_id: &str,
+        dest: &DestinationHash,
+        signing_key: &[u8; 32],
+    ) -> Option<LinkId> {
+        let steer = self.relay_steer.clone()?;
+        let routes = self.node.relay_routes(dest);
+        if routes.is_empty() {
+            return None;
+        }
+        let mut keys: HashMap<[u8; 16], String> = HashMap::new();
+        for r in &routes {
+            if let Some(k) = steer.roster_key(&r.relay).await {
+                if k != destination_key_id {
+                    keys.insert(r.relay, k);
+                }
+            }
+        }
+        if keys.is_empty() {
+            return None;
+        }
+        let mut seed = [0u8; 8];
+        let _ = ciris_crypto::random::fill(&mut seed);
+        let candidates = crate::transport::relay_tier::roster_relays_first(
+            &routes,
+            |r| keys.get(r).cloned(),
+            u64::from_le_bytes(seed),
+        );
+        let budget = steer.budget;
+        for c in candidates {
+            let link = match self
+                .node
+                .connect_via(dest, signing_key, c.relay, Some(budget))
+                .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::debug!(
+                        key_id = %destination_key_id,
+                        relay = %c.key_id,
+                        error = %e,
+                        "roster relay: no route through it (leviculum#91)"
+                    );
+                    continue;
+                }
+            };
+            let link_id = *link.link_id();
+            self.tag_identity_dial(link_id, *dest).await;
+            let deadline = tokio::time::Instant::now() + budget + Duration::from_millis(500);
+            let established = loop {
+                if steer.established.lock().await.contains(&link_id) {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            if established {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.inc_av_plane(crate::observability::ALM_RELAY_TIER_ROSTER);
+                }
+                tracing::info!(
+                    key_id = %destination_key_id,
+                    relay = %c.key_id,
+                    hops = c.hops,
+                    link = %hex::encode(link_id.into_bytes()),
+                    "identity link through a ROSTER relay, before the canonical \
+                     (FSD CIRIS_MESH R2, leviculum#91)"
+                );
+                return Some(link_id);
+            }
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_av_plane(crate::observability::ALM_RELAY_TIER_ROSTER_FAILED);
+            }
+            let _ = self.node.close_link(&link_id).await;
+        }
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_av_plane(crate::observability::ALM_RELAY_TIER_DEFAULT);
+        }
+        None
+    }
+
     async fn connect_and_key(
         &self,
         destination_key_id: &str,
@@ -10875,36 +13140,35 @@ impl DialCtx {
     ) -> Result<LinkId, TransportError> {
         let signing_key =
             self.dial_signing_key(destination_key_id, &peer.dest_hash, &peer.transport_ed25519);
-        let (link, established) = self
-            .node
-            .connect_awaited(&peer.dest_hash, &signing_key)
-            .await
-            .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
-        let link_id = *link.link_id();
-        self.seals.begin_initiator(link_id.into_bytes());
-        // CIRISEdge#424 — record the dest we dialed for THIS link so an inbound
-        // reply arriving over it (the initiator-side reverse path a NAT'd peer's
-        // responder uses) attributes to this peer even though leviculum's
-        // `link_destination` returns `None` for our own dialed links.
-        self.dialed_link_dest
-            .lock()
-            .await
-            .insert(link_id, peer.dest_hash);
-        // CIRISEdge#728 — an identity-plane dial by construction: `peer` came
-        // from `resolve_dial_candidates` (announced / directory-resolved
-        // destinations; a derived address is neither). Tagged before
-        // establishment so the pool and the reverse-path selector never see an
-        // untagged link.
-        self.link_plane
-            .lock()
-            .await
-            .insert(link_id, LinkPlane::Identity);
-
-        // Await `LinkEstablished` on BOTH ends — the peer must have accepted the
-        // LINK_REQUEST or a resource transfer cannot start. `established` resolves
-        // `Ok(())` on establishment, `Err(LinkClosed)` if the peer refused / the link
-        // died first; a timeout means no route or a stalled dial.
-        let outcome = with_timeout(establish_timeout, established).await;
+        // ALM stage 2 (`FSD/CIRIS_MESH.md` R2) — no one-hop path: roster
+        // relays first, each one attempt; the default path (the canonical in
+        // production) is the last tier, below.
+        let steered = if self.relay_steer.is_some()
+            && has_path
+            && self.node.hops_to(&peer.dest_hash).is_some_and(|h| h > 1)
+        {
+            self.dial_via_roster_relay(destination_key_id, &peer.dest_hash, &signing_key)
+                .await
+        } else {
+            None
+        };
+        let (link_id, outcome) = if let Some(link_id) = steered {
+            (link_id, Some(Ok(())))
+        } else {
+            let (link, established) = self
+                .node
+                .connect_awaited(&peer.dest_hash, &signing_key)
+                .await
+                .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
+            let link_id = *link.link_id();
+            self.tag_identity_dial(link_id, peer.dest_hash).await;
+            // Await `LinkEstablished` on BOTH ends — the peer must have accepted
+            // the LINK_REQUEST or a resource transfer cannot start. `established`
+            // resolves `Ok(())` on establishment, `Err(LinkClosed)` if the peer
+            // refused / the link died first; a timeout means no route or a
+            // stalled dial.
+            (link_id, with_timeout(establish_timeout, established).await)
+        };
         if let Some(refused) =
             self.link_proof_refused(destination_key_id, &peer.dest_hash, outcome.as_ref())
         {
@@ -11003,9 +13267,7 @@ impl DialCtx {
         };
         self.key_link(link_id, destination_key_id, pair, claim)
             .await?;
-        // CC 5.4.3 — the shaping offer is the link's first sealed frame; the
-        // dial waits for the peer's offer before anything else rides the link.
-        self.offer_shaping(link_id, destination_key_id).await?;
+        self.settle_plane(link_id, destination_key_id).await?;
         Ok(link_id)
     }
 
@@ -11015,14 +13277,216 @@ impl DialCtx {
     /// against it ([`LinkShapers::peer_offer`], run by the event loop when
     /// the answer lands). No answer within [`OFFER_ANSWER_BUDGET`] leaves the
     /// link unshaped for good (or closes it under `require_shaped_links`).
-    /// With an `off` policy nothing is sent and the link runs unshaped; a
-    /// peer that requires shaping closes it on its side.
+    /// With an `off` policy nothing is sent and the link runs unshaped. A
+    /// responder only reacts to an offer, so a peer that requires shaping
+    /// learns nothing here and the link stays up unshaped on its side too.
     ///
     /// [`LinkShapers::peer_offer`]: crate::transport::link_shaping::LinkShapers::peer_offer
     /// [`OFFER_ANSWER_BUDGET`]: crate::transport::link_shaping::OFFER_ANSWER_BUDGET
+    /// CC 5.4.3 — the dialled link's plane, settled right after the transit
+    /// KEX: a row-lane dial sends its shaping offer as the link's first
+    /// sealed frame and waits for the peer's ([`Self::offer_shaping`]); a
+    /// bulk-lane dial (CC 5.4.3 rc16 two planes) offers nothing, so the link
+    /// runs unshaped (a responder only ever answers an offer), and is marked
+    /// bulk, so no row lane takes it.
+    async fn settle_plane(&self, link_id: LinkId, peer: &str) -> Result<(), TransportError> {
+        if self.bulk_lane {
+            self.shapers.mark_bulk(link_id.into_bytes());
+            tracing::debug!(
+                peer = %peer,
+                link = %hex::encode(link_id.into_bytes()),
+                "bulk-plane link up, unshaped (CC 5.4.3 two planes)"
+            );
+            return Ok(());
+        }
+        self.offer_shaping(link_id, peer).await
+    }
+
+    /// CC 5.4.3 referrals — hand the referral that came with `peer`'s refusal
+    /// on `link` to the homing worker. A dialler refusing at its own bound
+    /// has none, and homes nowhere.
+    fn queue_homing(&self, peer: &str, link: [u8; 16]) {
+        let Some(frame) = self.shapers.take_referrals(link) else {
+            return;
+        };
+        let job = HomingJob {
+            refused_by: peer.to_owned(),
+            referrals: frame.referrals,
+        };
+        if let Some(tx) = self.homing_tx.upgrade() {
+            if tx.try_send(job).is_err() {
+                tracing::debug!(peer = %peer, "homing queue full; a referral is a hint");
+            }
+        }
+    }
+
+    /// Whether this node already holds a shaped link to a node it homed on.
+    fn holds_a_homed_link(&self) -> bool {
+        self.homed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .any(|n| self.shapers.peer_is_shaped(n))
+    }
+
+    /// Verify a referred node's route as a fetched one
+    /// ([`verify_route_answer`]) and install it to dial: `Advisory`, a routing
+    /// hint, its hybrid-signed row binding the transport identity to the key.
+    /// A node already held keeps what it holds.
+    async fn install_referred(
+        &self,
+        rooting: &dyn RootingDirectory,
+        key_id: &str,
+        answer: crate::transport::route_fetch::RouteAnswer,
+    ) -> Result<ResolvedPeer, String> {
+        let td = answer.route.transport_destination.clone();
+        verify_route_answer(rooting, key_id, answer)
+            .await
+            .map_err(|e| e.to_string())?;
+        let half = |b: Option<&str>| -> Option<[u8; 32]> {
+            base64::engine::general_purpose::STANDARD
+                .decode(b?)
+                .ok()?
+                .try_into()
+                .ok()
+        };
+        let (Some(x25519), Some(ed25519)) = (
+            half(td.transport_x25519_pubkey_base64.as_deref()),
+            half(td.transport_ed25519_pubkey_base64.as_deref()),
+        ) else {
+            return Err("the route carries no transport identity".to_owned());
+        };
+        let mut transport_pubkey64 = [0u8; 64];
+        transport_pubkey64[..32].copy_from_slice(&x25519);
+        transport_pubkey64[32..].copy_from_slice(&ed25519);
+        let dest_hash: [u8; 16] = hex::decode(&td.destination)
+            .ok()
+            .and_then(|d| d.try_into().ok())
+            .ok_or_else(|| "the route's destination is not a hash".to_owned())?;
+        if named_dest_of_transport(&transport_pubkey64) != Some(dest_hash) {
+            return Err("the transport identity does not reproduce the destination".to_owned());
+        }
+        let mut peers = self.peers.lock().await;
+        if let Some(held) = peers.get(key_id) {
+            return Ok(ResolvedPeer {
+                dest_hash: held.peer.dest_hash,
+                transport_ed25519: held.peer.transport_ed25519,
+            });
+        }
+        let peer = ResolvedPeer {
+            dest_hash: DestinationHash::new(dest_hash),
+            transport_ed25519: ed25519,
+        };
+        peers.insert(
+            key_id.to_owned(),
+            RootedPeer {
+                peer: ResolvedPeer {
+                    dest_hash: peer.dest_hash,
+                    transport_ed25519: ed25519,
+                },
+                epoch: 0,
+                chain: None,
+                provenance: ciris_persist::federation::self_at_login::BindingProvenance::Advisory,
+                transport_identity_hash: Identity::from_public_keys(&x25519, &ed25519)
+                    .map_or([0u8; 16], |id| *id.hash()),
+                owns_key: true,
+                transport_pubkey64,
+                last_seen: std::time::Instant::now(),
+                manifest_commitment: None,
+            },
+        );
+        Ok(peer)
+    }
+
+    /// CC 5.4.3 referrals — try a refusal's referrals in order until one takes
+    /// a shaped row link. A referred node treats this node as any shaping
+    /// peer, so a refusal here is one more stale hint and the next is tried.
+    /// When none takes, the peer is left to its fallback order.
+    async fn home_on_referrals(&self, job: HomingJob) {
+        use crate::observability as o;
+        let count = |label: &'static str| {
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_link_shaping(label);
+            }
+        };
+        if self.holds_a_homed_link() {
+            return;
+        }
+        let Some(rooting) = self.rooting.as_deref() else {
+            return;
+        };
+        let offered = job.referrals.len();
+        for answer in job.referrals {
+            count(o::LINK_SHAPING_REFERRAL_RECEIVED);
+            let key_id = answer.route.attesting_key_id.clone();
+            let refused_lately = self
+                .row_homed_elsewhere
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key_id)
+                .is_some_and(|at| at.elapsed() < BULK_DIAL_NEGATIVE_TTL);
+            if refused_lately || key_id == self.own_key_id || key_id == job.refused_by {
+                count(o::LINK_SHAPING_REFERRAL_FAILED);
+                continue;
+            }
+            let peer = match self.install_referred(rooting, &key_id, answer).await {
+                Ok(p) => p,
+                Err(detail) => {
+                    count(o::LINK_SHAPING_REFERRAL_REJECTED);
+                    tracing::warn!(
+                        referred = %key_id,
+                        refused_by = %job.refused_by,
+                        reason = o::LINK_SHAPING_REFERRAL_REJECTED,
+                        detail = %detail,
+                        "a referral failed verification; the next is tried (CC 5.4.3)"
+                    );
+                    continue;
+                }
+            };
+            let has_path = self.node.has_path(&peer.dest_hash);
+            let budget = if has_path {
+                LINK_ESTABLISH_TIMEOUT
+            } else {
+                NO_PATH_ESTABLISH_TIMEOUT
+            };
+            let dialled = self
+                .dial_and_identify(&key_id, &peer, has_path, budget)
+                .await;
+            if dialled.is_ok() && self.shapers.peer_is_shaped(&key_id) {
+                drop(dialled);
+                count(o::LINK_SHAPING_REFERRAL_HOMED);
+                tracing::info!(
+                    referred = %key_id,
+                    refused_by = %job.refused_by,
+                    reason = o::LINK_SHAPING_REFERRAL_HOMED,
+                    "homed on a referral after a refusal at the bound (CC 5.4.3)"
+                );
+                self.homed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(job.refused_by, key_id.clone());
+                // choke-ok: no subscriber is a transport with no runtime; the
+                // list above still names the node.
+                let _ = self.homed_events.send(key_id);
+                return;
+            }
+            count(o::LINK_SHAPING_REFERRAL_FAILED);
+        }
+        count(o::LINK_SHAPING_REFERRAL_EXHAUSTED);
+        tracing::info!(
+            refused_by = %job.refused_by,
+            offered,
+            reason = o::LINK_SHAPING_REFERRAL_EXHAUSTED,
+            "no referral took this node's row link: its fallback order applies (CC 5.4.3)"
+        );
+    }
+
     async fn offer_shaping(&self, link_id: LinkId, peer: &str) -> Result<(), TransportError> {
         use crate::transport::link_shaping::{ShapingError, OFFER_ANSWER_BUDGET};
-        if !self.shapers.policy().enabled() {
+        // CC 5.4.3 / 5.4.6 item 4 — nothing is offered to a peer this node
+        // does not shape toward (shaping off, or a general link under a
+        // layer-links-only scope such as phone-on-cellular).
+        if !self.shapers.offers_to(Some(peer)) {
             return Ok(());
         }
         if !self
@@ -11036,9 +13500,9 @@ impl DialCtx {
         }
         let link = link_id.into_bytes();
         let answer = self.shapers.begin_offer(link);
-        let offer = self
-            .shapers
-            .offer_for(link, link_channel_mdu(&self.node, &link_id));
+        let offer =
+            self.shapers
+                .offer_for(link, link_channel_mdu(&self.node, &link_id), Some(peer));
         let out = send_fragments_on_channel(
             &self.node,
             &self.seals,
@@ -11056,10 +13520,14 @@ impl DialCtx {
         }
         if let Some(m) = self.metrics.as_ref() {
             m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED_DIALLED);
         }
         let refuse = |e: ShapingError| {
             if let Some(m) = self.metrics.as_ref() {
                 m.inc_link_shaping(e.label());
+                if matches!(e, ShapingError::HomeElsewhere) {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_HOME_ELSEWHERE_RECEIVED);
+                }
             }
             tracing::warn!(
                 peer = %peer,
@@ -11079,6 +13547,15 @@ impl DialCtx {
                 Ok(())
             }
             Ok(Ok(Err(e))) => {
+                // A lost race for a slot beside the peer's own shaped link
+                // is no refusal of the peer: its rows ride that link.
+                if matches!(e, ShapingError::HomeElsewhere) && !self.shapers.peer_is_shaped(peer) {
+                    self.row_homed_elsewhere
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(peer.to_owned(), std::time::Instant::now());
+                    self.queue_homing(peer, link);
+                }
                 let err = refuse(e);
                 self.close_refused(link_id).await;
                 Err(err)
@@ -11208,7 +13685,11 @@ impl DialCtx {
         // pool slot forever. The map is a cache over the link registry and the
         // registry is the authority.
         let before = pool.len();
-        pool.retain(|id| self.node.link_is_established(id));
+        // CIRISEdge#926 — nor a link the stall guard judged dead (it is being
+        // closed; until the close lands it must not be handed out).
+        pool.retain(|id| {
+            self.node.link_is_established(id) && !self.stall_guard.is_dead(&id.into_bytes())
+        });
         note_pool_links_closed(self.metrics.as_ref(), before - pool.len());
         if pool.is_empty() {
             map.remove(dest);
@@ -11219,10 +13700,56 @@ impl DialCtx {
         // IDLE only. A link mid-transfer is not available: Reticulum runs one
         // resource per link, so handing it out serialises the caller behind the
         // transfer already on it — which is the regression the M=4 sweep caught.
-        let picked = pool
+        // CC 5.4.3 rc16 two planes — a link belongs to one plane: the row lane
+        // never takes a bulk link, the bulk lane never a shaped one.
+        // CC 5.4.3 rc17 — one shaped link to a peer, at the full class rate:
+        // rows share it, busy or not (its shaper is the queue, there is no
+        // Resource on it to collide with), so a burst of rows never opens a
+        // second shaped link and spends another of the eight.
+        let identity = |id: &&LinkId| planes.get(*id) == Some(&LinkPlane::Identity);
+        // v44 — nor a link with an upgrade in flight: the send takes another
+        // lane, or dials one (`direct_path` module docs). A shaped link has no
+        // Resource lane to keep off.
+        let upgrading: HashMap<LinkId, _> = pool
             .iter()
-            .find(|id| !in_flight.contains(*id) && planes.get(*id) == Some(&LinkPlane::Identity))
-            .copied();
+            .filter_map(|id| Some((*id, self.direct_paths.upgrade_in_flight(id)?)))
+            .collect();
+        let picked = if self.bulk_lane {
+            pool.iter()
+                .filter(identity)
+                .find(|id| {
+                    !in_flight.contains(*id)
+                        && !self.shapers.is_shaped(id.into_bytes())
+                        && !upgrading.contains_key(*id)
+                })
+                .copied()
+        } else {
+            pool.iter()
+                .filter(identity)
+                .find(|id| self.shapers.is_shaped(id.into_bytes()))
+                .or_else(|| {
+                    pool.iter().filter(identity).find(|id| {
+                        !in_flight.contains(*id)
+                            && !self.shapers.is_bulk(id.into_bytes())
+                            && !upgrading.contains_key(*id)
+                    })
+                })
+                .copied()
+        };
+        if !picked.is_some_and(|id| self.shapers.is_shaped(id.into_bytes())) {
+            let passed = pool
+                .iter()
+                .filter(identity)
+                .filter(|id| !in_flight.contains(*id))
+                .find_map(|id| upgrading.get(id));
+            if let Some(side) = passed {
+                note_upgrade_guarded(
+                    self.metrics.as_ref(),
+                    crate::observability::UPGRADE_GUARDED_POOL,
+                    Some(*side),
+                );
+            }
+        }
         // CIRISEdge#819 (Codex on #821) — a hand-out RESERVES the lane: it is
         // marked in flight here, under the pool lock, so the caller owns the
         // transfer from this instant. A stamp alone was not enough: a
@@ -11269,6 +13796,54 @@ struct AnnounceCtx {
 /// Shared handles the event loop hands to [`handle_event`].
 /// Whether `peer` may share a direct path with this node: a room peer, or a
 /// consented contact. Shared by the accept decision and the proposal hook.
+/// Start a proposal to `peer` on `link`: the tracker's record, the waiter for
+/// its outcome, and leviculum's dispatch. The caller has admitted it.
+async fn dispatch_proposal(
+    node: &ReticulumNode,
+    direct_paths: &crate::transport::direct_path::DirectPaths,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    peer: &str,
+    link: LinkId,
+    now: std::time::Instant,
+) -> Result<
+    tokio::sync::oneshot::Receiver<crate::transport::direct_path::DirectOutcome>,
+    crate::transport::direct_path::DirectPath,
+> {
+    let count = |label: &'static str| {
+        if let Some(m) = metrics {
+            m.inc_direct_link(label);
+        }
+    };
+    // Registered BEFORE the dispatch, so the outcome cannot precede the
+    // registration.
+    let rx = direct_paths.wait_for(link);
+    let before = link_channel_message_limit(node, &link);
+    direct_paths.tracker().proposed(peer, link, before, now);
+    if let Err(e) = node.propose_direct_link(&link).await {
+        direct_paths.forget(link);
+        direct_paths.tracker().propose_refused(peer, link, now);
+        count(crate::observability::DIRECT_LINK_PROPOSE_REFUSED);
+        tracing::info!(
+            key_id = %peer,
+            link = %hex::encode(link.as_bytes()),
+            error = %e,
+            "direct path: leviculum refused the proposal (CIRISEdge#805 item 8)"
+        );
+        return Err(crate::transport::direct_path::DirectPath::Unavailable {
+            reason: "propose_refused",
+        });
+    }
+    count(crate::observability::DIRECT_LINK_PROPOSED);
+    tracing::info!(
+        key_id = %peer,
+        link = %hex::encode(link.as_bytes()),
+        channel_limit_before = ?before,
+        "direct path: PROPOSED on the identity link to a call member or room peer \
+         (CIRISEdge#805 item 8, #915)"
+    );
+    Ok(rx)
+}
+
 fn direct_standing(
     table: Option<&ScopeAddressTable>,
     direct_paths: &crate::transport::direct_path::DirectPaths,
@@ -11279,6 +13854,9 @@ fn direct_standing(
 
 struct EventCtx<'a> {
     node: &'a ReticulumNode,
+    /// v44 LTS — the bindings a restart still answers for
+    /// ([`super::persisted_standing`]).
+    persisted_standing: &'a std::sync::RwLock<PersistedStandings>,
     /// CIRISEdge#621 — this node's own key id, so inbound attribution can
     /// refuse to resolve a link to ourselves regardless of what the peers map
     /// holds (see [`LinkAttribution::ResolvedToSelf`]).
@@ -11415,11 +13993,17 @@ struct EventCtx<'a> {
     /// CIRISEdge#805 item 8 — see the field of the same name on
     /// [`ReticulumTransport`].
     direct_paths: &'a crate::transport::direct_path::DirectPaths,
+    /// ALM stage 2 — see the field of the same name on [`ReticulumTransport`].
+    alm_links: &'a crate::transport::alm_link::AlmLinkState,
     /// CC 5.3.3.5 E1 — see `ReticulumTransport::seals`. An `Arc` so a link's
     /// handshake budget can outlive the event that armed it.
     seals: &'a Arc<crate::transport::link_seal::LinkSeals>,
+    /// CIRISEdge#947 — see `ReticulumTransport::keyer`.
+    keyer: &'a Arc<crate::transport::link_keying::Keyer>,
     /// CC 5.4.3 — see `ReticulumTransport::shapers`.
     shapers: &'a Arc<crate::transport::link_shaping::LinkShapers>,
+    /// CC 5.4.6 — the Anonymous Tier: inbound onion frames are its.
+    onion: &'a Arc<crate::onion::runtime::OnionRuntime>,
 }
 
 impl EventCtx<'_> {
@@ -12150,6 +14734,15 @@ async fn attribute_and_deliver(
         }
         // choke-ok: consumed as a transport control frame; every refusal
         // inside goes through `drop_inbound` by name.
+        return;
+    }
+    // CC 5.4.6 — an onion packet (`CONP`) is a transport frame for the
+    // Anonymous Tier, consumed here: relayed over a shaped link, or refused
+    // by name (an unshaped link, a node not running the tier).
+    if crate::onion::relay::is_onion_frame(&data) {
+        handle_onion_frame(ctx, link_id, &data).await;
+        // choke-ok: consumed as a transport control frame; every refusal is
+        // counted by token in the onion runtime and said by `drop_inbound`.
         return;
     }
     if crate::transport::peer_bundle_frame::is_peer_bundle_frame(&data) {
@@ -13218,7 +15811,8 @@ async fn verify_route_answer(
 /// CC 5.3.3.5 E1 pre-seal route fetch (CLM-pre-seal-route-fetch) — the
 /// responder's half. A peer-dialled link's first frame was a route request
 /// that already passed the receiver order ([`LinkSeals::inbound`]: once per
-/// link, the node-wide rate, both before the request was read). This node
+/// link, the sender's rate and the node-wide rate, all before the request was
+/// read). This node
 /// answers ONLY for its own occurrence key, ONLY with its own live
 /// hybrid-signed route row carrying a transit pair (and its `key:record:v1`
 /// row when the dialler said it lacks the key), as `CTKA` frames on the
@@ -13244,18 +15838,11 @@ async fn answer_route_request(
     // A/V link is to a derived address, and answering "not ours" versus a
     // signed row there would tell a prober which identity owns it.
     let (_, plane) = resolve_inbound_link(ctx, &link_id).await;
-    let sender = ctx
-        .node
-        .get_remote_identity(&link_id)
-        .map(|id| hex::encode(id.hash()));
     let built: Result<Vec<Vec<u8>>, RouteFetchError> = async {
         crate::transport::route_fetch::route_request_plane_allowed(matches!(
             plane,
             LinkPlane::Identity
         ))?;
-        if !ctx.seals.admit_route_sender(sender.as_deref()) {
-            return Err(RouteFetchError::RateLimited);
-        }
         if key_id != ctx.local_key_id {
             return Err(RouteFetchError::NotOurs {
                 asked: key_id.to_owned(),
@@ -13384,6 +15971,7 @@ fn note_responder_link(ctx: &EventCtx<'_>, link_id: LinkId, we_dialled: bool) {
     if we_dialled || !ctx.seals.begin_responder(link_id.into_bytes()) {
         return;
     }
+    close_evicted(ctx);
     let node = Arc::clone(ctx.av_node);
     let seals = Arc::clone(ctx.seals);
     let metrics = ctx.metrics.cloned();
@@ -13394,6 +15982,11 @@ fn note_responder_link(ctx: &EventCtx<'_>, link_id: LinkId, we_dialled: bool) {
         // this node answered gets the fetch budget from that request: the
         // answer crosses, then the dialler's handshake.
         if let Some(left) = seals.route_budget_left(link_id.into_bytes()) {
+            tokio::time::sleep(left).await;
+        }
+        // CIRISEdge#947 — a handshake that arrived in time is judged by its
+        // keying, which gets a budget of its own from then.
+        if let Some(left) = seals.keying_budget_left(link_id.into_bytes()) {
             tokio::time::sleep(left).await;
         }
         if seals.expire(link_id.into_bytes()) {
@@ -13414,6 +16007,235 @@ fn note_responder_link(ctx: &EventCtx<'_>, link_id: LinkId, we_dialled: bool) {
             seals.forget(&link_id.into_bytes());
         }
     });
+}
+
+/// CIRISEdge#947 — refuse a link at the gate in front of the keyer, or at
+/// the `Awaiting` cap: counted under its name, said at WARN under the choke
+/// point's throttle (a flood makes one of these per link, and #508 showed what
+/// a per-event WARN does there), marked refused, and closed off the event path.
+/// The close is the dialler's signal: the responder may not speak first, and
+/// its dial path re-dials a link that closes.
+fn admission_refused(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    refusal: &crate::transport::link_seal::SealRefusal,
+) {
+    if let Some(m) = ctx.metrics {
+        m.inc_link_seal(refusal.label());
+        if let Some(refined) = refusal.refined_label() {
+            m.inc_link_seal(refined);
+        }
+    }
+    drop_inbound(Some(link_id), refusal.label(), &refusal.to_string());
+    ctx.seals.refuse(link_id.into_bytes());
+    let node = Arc::clone(ctx.av_node);
+    tokio::spawn(async move {
+        let _ = node.close_link(&link_id).await;
+    });
+}
+
+/// v44 LTS — count a keyed identity-plane link with no standing, and close the
+/// oldest past [`crate::transport::link_seal::STRANGER_KEYED_LINKS_MAX`]. A
+/// scoped or A/V link is not counted: reaching one takes the room's secret, and
+/// its derived identity is in no table that could show standing. One that has
+/// earned standing since it keyed is kept, and leaves the ledger for good.
+async fn bound_keyed_strangers(ctx: &EventCtx<'_>, link_id: LinkId) {
+    if has_standing_now(ctx, link_id).await {
+        return;
+    }
+    for link in ctx.seals.note_keyed_stranger(link_id.into_bytes()) {
+        let link = LinkId::new(link);
+        if !has_standing_now(ctx, link).await {
+            admission_refused(
+                ctx,
+                link,
+                &crate::transport::link_seal::SealRefusal::StrangerCap,
+            );
+        }
+    }
+}
+
+/// Whether `link`'s proven identity has standing now.
+async fn has_standing_now(ctx: &EventCtx<'_>, link: LinkId) -> bool {
+    match ctx.node.get_remote_identity(&link) {
+        Some(id) => identity_has_standing(ctx, id.hash()).await,
+        None => false,
+    }
+}
+
+/// CIRISEdge#947 — close the links the `Awaiting` cap just refused.
+fn close_evicted(ctx: &EventCtx<'_>) {
+    for link in ctx.seals.take_evicted() {
+        admission_refused(
+            ctx,
+            LinkId::new(link),
+            &crate::transport::link_seal::SealRefusal::AwaitingCap,
+        );
+    }
+}
+
+/// The standing rule, on what a binding has proven. The roster, the rooms and
+/// the contacts are read live either way.
+fn binding_has_standing(ctx: &EventCtx<'_>, key: &str, rooted: bool, owns_key: bool) -> bool {
+    rooted
+        || (owns_key
+            && (ctx.shapers.is_seat(key)
+                || direct_standing(
+                    ctx.scope_addresses.get().map(Arc::as_ref),
+                    ctx.direct_paths,
+                    key,
+                )))
+}
+
+/// CIRISEdge#947 — whether a proven transport identity is bound to a key this
+/// node already answers for, read from live tables and never the directory (it
+/// runs on the event path): a Rooted binding, or a key that owns its binding
+/// and holds a seat on the active roster or a room or contact standing. A bare
+/// announce is an `Advisory` binding, free to mint, and earns nothing here.
+///
+/// v44 LTS — a key with no live binding yet is judged by what persist holds
+/// ([`super::persisted_standing`]), so a restart does not make strangers of the
+/// peers it answers for. A live binding for the key is the newer word: if it
+/// names another identity the persisted one is superseded and gives nothing.
+async fn identity_has_standing(ctx: &EventCtx<'_>, identity_hash: &[u8; 16]) -> bool {
+    use ciris_persist::federation::self_at_login::BindingProvenance;
+    let peers = ctx.peers.lock().await;
+    let live = identified_candidates(&peers, identity_hash)
+        .iter()
+        .any(|(key, _)| {
+            peers.get(key).is_some_and(|rp| {
+                binding_has_standing(
+                    ctx,
+                    key,
+                    matches!(rp.provenance, BindingProvenance::Rooted),
+                    rp.owns_key,
+                )
+            })
+        });
+    live || ctx
+        .persisted_standing
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(identity_hash)
+        .is_some_and(|bindings| {
+            bindings.iter().any(|b| {
+                !peers.contains_key(&b.key_id)
+                    && binding_has_standing(ctx, &b.key_id, b.rooted, true)
+            })
+        })
+}
+
+/// CIRISEdge#947 — a complete handshake arrived. On a link with no proven
+/// identity yet it waits a moment for the LINKIDENTIFY that was sent ahead of
+/// it (the `LinkIdentified` arm, or the grace on the attribution tick): judged
+/// now, a peer with standing would be judged as whoever lost that race.
+async fn admit_handshake(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    job: crate::transport::link_seal::HandshakeJob,
+) {
+    let job = if ctx.node.get_remote_identity(&link_id).is_some() {
+        job
+    } else {
+        match ctx.seals.defer_handshake(job) {
+            Ok(()) => return,
+            Err(job) => job,
+        }
+    };
+    gate_handshake(ctx, link_id, job).await;
+}
+
+/// CIRISEdge#947 — CC 5.3.3.5: a complete handshake goes behind the receiver
+/// order and into the keyer. No decapsulation, and no parse past the tag,
+/// happens on the event path. See [`crate::transport::link_keying`].
+async fn gate_handshake(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    job: crate::transport::link_seal::HandshakeJob,
+) {
+    let identity = ctx.node.get_remote_identity(&link_id).map(|id| *id.hash());
+    let standing = match &identity {
+        Some(hash) => identity_has_standing(ctx, hash).await,
+        None => false,
+    };
+    let sender = identity.map(hex::encode);
+    let admitted = ctx
+        .seals
+        .admit_handshake(crate::transport::link_keying::Sender {
+            identity: sender.as_deref(),
+            standing,
+        })
+        .and_then(|()| ctx.keyer.submit(job, standing));
+    if let Err(refusal) = admitted {
+        admission_refused(ctx, link_id, &refusal);
+    }
+}
+
+/// CIRISEdge#947 — apply one keying's outcome on the event loop: the link
+/// keys, the responder speaks, then the frames that waited run through the
+/// event path in arrival order. Called only from the event loop, so nothing on
+/// this link can land between these steps. A link whose fate overtook its
+/// keying has already been counted and closed.
+async fn apply_keying(done: crate::transport::link_keying::KeyingDone, ctx: &EventCtx<'_>) {
+    use crate::transport::link_seal::Inbound;
+    let link = done.link;
+    let link_id = LinkId::new(link);
+    if let Some(m) = ctx.metrics {
+        m.inc_link_seal(crate::observability::LINK_SEAL_DECAPSULATED);
+        m.telemetry
+            .observe_keying(done.standing, done.queued_at.elapsed());
+    }
+    // A suspend can close the link and park this listener before its
+    // `LinkClosed` is drained, so the entry still says `Keying` here. The node
+    // no longer holds the link: there is nothing to key, and the close that
+    // follows finds it forgotten.
+    if !ctx.node.link_is_established(&link_id) {
+        ctx.seals.forget(&link);
+        return;
+    }
+    match ctx.seals.finish_keying(link, done.ticket, done.outcome) {
+        Inbound::Keyed { claimed } => {
+            link_keyed(ctx, link_id, claimed).await;
+            replay_before_keys(ctx, link_id).await;
+        }
+        Inbound::Refuse(r) => seal_teardown(ctx, link_id, &r).await,
+        // choke-ok: the outcome lost to a close, a refusal or the budget,
+        // each of which counted itself and let go of what the link held.
+        _ => {}
+    }
+    for event in ctx.seals.take_parked(link) {
+        handle_event(event, ctx).await;
+    }
+}
+
+/// CIRISEdge#947 — a frame event on a keying link waits for the outcome; every
+/// other event passes. `None` means it was taken.
+async fn park_while_keying(event: NodeEvent, ctx: &EventCtx<'_>) -> Option<NodeEvent> {
+    let (link_id, bytes) = match &event {
+        NodeEvent::MessageReceived { link_id, data, .. }
+        | NodeEvent::LinkDataReceived { link_id, data }
+        | NodeEvent::RequestReceived { link_id, data, .. }
+        | NodeEvent::ResourceCompleted {
+            link_id,
+            data,
+            is_sender: false,
+            ..
+        } => (*link_id, data.len()),
+        _ => return Some(event),
+    };
+    if !ctx.seals.is_keying(link_id.into_bytes()) {
+        return Some(event);
+    }
+    match ctx.seals.park(link_id.into_bytes(), event, bytes) {
+        Ok(()) => {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_seal(crate::observability::LINK_SEAL_HELD_DURING_KEYING);
+            }
+        }
+        Err(refusal) => admission_refused(ctx, link_id, &refusal),
+    }
+    // choke-ok: replayed by `apply_keying`, or the link refused by name.
+    None
 }
 
 /// CC 5.3.3.5 E1 — THE CLAIM: on a link this node RESPONDED on, the
@@ -13487,16 +16309,23 @@ async fn seal_inbound(
     note_responder_link(ctx, link_id, we_dialled);
     let link = link_id.into_bytes();
     let outcome = if lane == Lane::Channel {
-        ctx.seals.inbound(link, lane, data, we_dialled)
+        // Only a route request reads its sender, so only one pays for it.
+        let sender = crate::transport::route_fetch::is_route_request(data)
+            .then(|| ctx.node.get_remote_identity(&link_id))
+            .flatten()
+            .map(|id| hex::encode(id.hash()));
+        ctx.seals
+            .inbound(link, lane, data, we_dialled, sender.as_deref())
     } else {
         ctx.seals.open(link, lane, data)
     };
+    close_evicted(ctx);
     match outcome {
         Inbound::Open(plain) => shaped_inbound(ctx, link_id, lane, plain).await,
-        Inbound::Pending | Inbound::Closed | Inbound::RouteAnswered => None,
-        Inbound::Keyed { claimed } => {
-            link_keyed(ctx, link_id, claimed).await;
-            replay_before_keys(ctx, link_id).await;
+        // `Keyed` comes only from `finish_keying`, which `apply_keying` reads.
+        Inbound::Pending | Inbound::Closed | Inbound::RouteAnswered | Inbound::Keyed { .. } => None,
+        Inbound::Handshake(job) => {
+            admit_handshake(ctx, link_id, job).await;
             None
         }
         Inbound::RouteRequested {
@@ -13557,7 +16386,21 @@ async fn shaped_inbound(
         handle_shaping_offer(ctx, link_id, &plain).await;
         return None;
     }
+    // CC 5.4.3 referrals — they precede the refusal, and are taken only while
+    // this node waits on its offer's answer.
+    if lane == Lane::Channel && crate::transport::shaping_referral::is_referral_frame(&plain) {
+        if !ctx.shapers.accept_referral_part(link, &plain) {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_REFERRAL_REJECTED);
+            }
+        }
+        return None;
+    }
     match ctx.shapers.get(link) {
+        // The switch to shaped is not atomic across the two ends: a frame the
+        // peer sent bare just before it installed its shaper lands here just
+        // after this end did (`LinkShaper::in_transition`).
+        Some(s) if lane != Lane::Channel && s.in_transition() => Some(plain),
         Some(_) if lane != Lane::Channel => {
             shaping_teardown(
                 ctx,
@@ -13567,14 +16410,39 @@ async fn shaped_inbound(
             .await;
             None
         }
-        Some(_) => match unwrap(&plain) {
+        Some(s) => match unwrap(&plain) {
+            Err(ShapingError::WrongKind(_)) if s.in_transition() => Some(plain),
             Ok(ShapedFrame::Cover) => {
                 if let Some(m) = ctx.metrics {
                     m.inc_link_shaping(crate::observability::LINK_SHAPING_COVER_RECEIVED);
                 }
                 None
             }
+            Ok(ShapedFrame::Real(body))
+                if crate::transport::link_shaping::is_capability_body(&body) =>
+            {
+                // v44 — the peer announced multi-body frames: pack toward it.
+                note_capability(ctx, &s, link, &body);
+                tracing::debug!(
+                    link = %hex::encode(link),
+                    "peer announced shaped-frame coalescing; packing bodies toward it"
+                );
+                None
+            }
             Ok(ShapedFrame::Real(body)) => Some(body),
+            Ok(ShapedFrame::Many(bodies)) => {
+                // Several bodies in one frame: each routes as a frame of its
+                // own, in order. (A Channel-lane frame is never a Resource.)
+                for body in bodies {
+                    // A capacity report sent mid-life rides with the rows.
+                    if crate::transport::link_shaping::is_capability_body(&body) {
+                        note_capability(ctx, &s, link, &body);
+                    } else {
+                        route_opened(ctx, link_id, false, body).await;
+                    }
+                }
+                None
+            }
             Err(e) => {
                 shaping_teardown(ctx, link_id, &e).await;
                 None
@@ -13593,34 +16461,71 @@ async fn shaped_inbound(
     }
 }
 
-/// CC 5.4.3 — a peer's shaping offer landed on `link_id`. A link this node
-/// has not offered on yet (the responder side) answers with its own offer
-/// first, bare; then both offers resolve to the one agreement
-/// ([`LinkShapers::peer_offer`]) and, when shaped, the link's emission task
-/// starts. A peer that offers `off` to a node requiring shaped links is
-/// refused by name.
-///
-/// [`LinkShapers::peer_offer`]: crate::transport::link_shaping::LinkShapers::peer_offer
-async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8]) {
-    use crate::transport::link_shaping::{BudgetClass, ShapingError, ShapingOffer};
+/// A capability body from the peer on `link`: it packs frames, and it reports
+/// free slots ([`crate::transport::link_shaping::capability_body`]).
+fn note_capability(
+    ctx: &EventCtx<'_>,
+    shaper: &crate::transport::link_shaping::LinkShaper,
+    link: [u8; 16],
+    body: &[u8],
+) {
+    shaper.enable_coalescing();
+    if let Some(free) = crate::transport::link_shaping::capability_free_slots(body) {
+        ctx.shapers.note_peer_capacity(link, free);
+    }
+}
+
+/// The responder's answer to `theirs`: its own offer, or the refusal with its
+/// referrals. `false` when the answer could not be sent; the link is torn down.
+async fn answer_shaping_offer(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    theirs: &crate::transport::link_shaping::ShapingOffer,
+) -> bool {
+    use crate::transport::link_shaping::ShapingError;
     let link = link_id.into_bytes();
-    let theirs = match ShapingOffer::decode(bytes) {
-        Ok(o) => o,
-        Err(e) => {
-            shaping_teardown(ctx, link_id, &e).await;
-            return;
-        }
-    };
-    if !ctx.shapers.has_offered(link) {
-        // Only identity links are shaped (CC 5.4.6; `shaping_applies_to`):
-        // on a scoped or A/V link this node answers `off`, whatever its class.
-        let (_, plane) = resolve_inbound_link(ctx, &link_id).await;
-        let ours = if shaping_applies_to(plane) {
-            ctx.shapers
-                .offer_for(link, link_channel_mdu(ctx.node, &link_id))
+    // Only identity links are shaped (CC 5.4.6; `shaping_applies_to`):
+    // on a scoped or A/V link this node answers `off`, whatever its class.
+    let (_, plane) = resolve_inbound_link(ctx, &link_id).await;
+    // The peer the handshake attributed the link to, when known: a layer
+    // neighbour is offered shaping under any scope and may take any of
+    // the eight (CIRISEdge v44, CC 5.4.3, 5.4.6 item 4).
+    let peer = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    let ours = if shaping_applies_to(plane) {
+        if ctx.shapers.load_refuses(peer.as_deref(), theirs).await {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_REFUSED);
+            }
+            tracing::info!(
+                link = %hex::encode(link),
+                peer = peer.as_deref().unwrap_or("-"),
+                token = crate::observability::LINK_SHAPING_LOAD_REFUSED,
+                tier = ctx.shapers.service_tier().as_u8(),
+                "a shaped link refused under load, with referrals (FSD/PRIVACY_MODES.md §6.12)"
+            );
+            ctx.shapers.refusal_for(link, peer.as_deref())
         } else {
-            ctx.shapers.offer_off_for(link)
-        };
+            ctx.shapers.offer_for_answer(
+                link,
+                link_channel_mdu(ctx.node, &link_id),
+                peer.as_deref(),
+                theirs,
+            )
+        }
+    } else {
+        ctx.shapers.offer_off_for(link)
+    };
+    if ours.class == crate::transport::link_shaping::BudgetClass::HomeElsewhere {
+        let mut frames = referral_frames(ctx, link_id, peer.as_deref()).await;
+        frames.push(ours.encode());
+        spawn_refusal_send(
+            Arc::clone(ctx.av_node),
+            Arc::clone(ctx.seals),
+            Arc::clone(ctx.shapers),
+            link_id,
+            frames,
+        );
+    } else {
         let out =
             send_fragments_on_channel(ctx.node, ctx.seals, ctx.shapers, &link_id, &[ours.encode()])
                 .await;
@@ -13631,18 +16536,48 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
                 &ShapingError::WrongKind("the answer was not sent"),
             )
             .await;
+            return false;
+        }
+    }
+    if ours.shapes() {
+        if let Some(m) = ctx.metrics {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED_ANSWERED);
+        }
+    }
+    true
+}
+
+/// CC 5.4.3 — a peer's shaping offer landed on `link_id`. A link this node
+/// has not offered on yet (the responder side) answers with its own offer
+/// first, bare; then both offers resolve to the one agreement
+/// ([`LinkShapers::peer_offer`]) and, when shaped, the link's emission task
+/// starts. A peer that offers `off` to a node requiring shaped links is
+/// refused by name.
+///
+/// [`LinkShapers::peer_offer`]: crate::transport::link_shaping::LinkShapers::peer_offer
+async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8]) {
+    use crate::transport::link_shaping::{ShapingError, ShapingOffer};
+    let link = link_id.into_bytes();
+    let theirs = match ShapingOffer::decode(bytes) {
+        Ok(o) => o,
+        Err(e) => {
+            shaping_teardown(ctx, link_id, &e).await;
             return;
         }
-        if ours.class != BudgetClass::Off {
-            if let Some(m) = ctx.metrics {
-                m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
-            }
-        }
+    };
+    // The responder answers below; the dialler already offered and learns the
+    // outcome through its pending answer (`offer_shaping`), which counts and
+    // closes on its side.
+    let responder = !ctx.shapers.has_offered(link);
+    if responder && !answer_shaping_offer(ctx, link_id, &theirs).await {
+        return;
     }
     match ctx.shapers.peer_offer(link, &theirs) {
         Ok(Some(shaper)) => {
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(crate::observability::LINK_SHAPING_AGREED);
+                m.inc_link_shaping(crate::observability::agreed_label(shaper.class()));
             }
             let a = *shaper.agreement();
             tracing::info!(
@@ -13656,6 +16591,14 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
                 "link SHAPED both ways: constant-size frames at Poisson times from here \
                  (CC 5.4.3, CLM-link-shaping)"
             );
+            // v44 — announce coalescing and report free slots as the link's
+            // first real body (a 43.x peer drops it as an unparseable
+            // envelope).
+            // choke-ok: a full queue on a fresh link is impossible; the body
+            // is 6 bytes.
+            let _ = shaper.enqueue(vec![crate::transport::link_shaping::capability_body(
+                ctx.shapers.reported_slots(),
+            )]);
             spawn_shaper_task(
                 Arc::clone(ctx.av_node),
                 Arc::clone(ctx.seals),
@@ -13675,7 +16618,257 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
                  (CC 5.4.3)"
             );
         }
+        Err(ShapingError::HomeElsewhere) if !responder => {
+            // The dialler: its dial path counts the refusal and closes.
+        }
+        Err(ShapingError::HomeElsewhere) => {
+            // The refusal is on its way ([`spawn_refusal_send`]), which seals
+            // nothing more after it and closes.
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(ShapingError::HomeElsewhere.label());
+                // The direction: the peer's own refusal reaches a responder
+                // here as well.
+                m.inc_link_shaping(
+                    if theirs.class == crate::transport::link_shaping::BudgetClass::HomeElsewhere {
+                        crate::observability::LINK_SHAPING_HOME_ELSEWHERE_RECEIVED
+                    } else {
+                        crate::observability::LINK_SHAPING_HOME_ELSEWHERE_GIVEN
+                    },
+                );
+            }
+            tracing::info!(
+                link = %hex::encode(link),
+                reason = ShapingError::HomeElsewhere.label(),
+                "a shaping peer past this node's shaped-link bound: refused for rows, \
+                 homed elsewhere (CC 5.4.3; CIRISEdge#935)"
+            );
+        }
         Err(e) => shaping_teardown(ctx, link_id, &e).await,
+    }
+}
+
+/// CC 5.4.3 referrals — what this node names in a refusal to `refused`: the
+/// candidates in rank order that can be referred, edge nodes first, one serve
+/// seat as the last entry when fewer than three edge nodes qualify.
+async fn pick_referrals(
+    ctx: &EventCtx<'_>,
+    ranked: Vec<crate::transport::shaping_referral::ReferralCandidate>,
+) -> Vec<(String, crate::transport::route_fetch::RouteAnswer)> {
+    use crate::transport::shaping_referral::{
+        referable_route, MAX_REFERRALS, REFERRAL_CANDIDATE_READS,
+    };
+    let Some(rooting) = ctx.rooting else {
+        return Vec::new();
+    };
+    let mut edge = Vec::new();
+    let mut seat = None;
+    for c in ranked.into_iter().take(REFERRAL_CANDIDATE_READS) {
+        if edge.len() == MAX_REFERRALS {
+            break;
+        }
+        if c.seat && seat.is_some() {
+            continue;
+        }
+        let announced = ctx.peers.lock().await.contains_key(&c.key_id);
+        match referable_route(rooting, &c.key_id, announced).await {
+            Some(answer) if c.seat => seat = Some((c.key_id, answer)),
+            Some(answer) => edge.push((c.key_id, answer)),
+            None => {
+                if let Some(m) = ctx.metrics {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_REFERRAL_WITHHELD);
+                }
+            }
+        }
+    }
+    if edge.len() < MAX_REFERRALS {
+        edge.extend(seat);
+    }
+    edge
+}
+
+/// CC 5.4.3 referrals — the frames that precede a refusal on `link_id`. They
+/// are never skipped: an empty list is the answer "no targets known". Bounded
+/// by [`REFERRAL_BUILD_BUDGET`], so the refusal is never late.
+///
+/// [`REFERRAL_BUILD_BUDGET`]: crate::transport::shaping_referral::REFERRAL_BUILD_BUDGET
+async fn referral_frames(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    refused: Option<&str>,
+) -> Vec<Vec<u8>> {
+    use crate::observability as o;
+    use crate::transport::shaping_referral::{
+        encode_referrals, ReferralAction, ReferralFrame, REFERRAL_BUILD_BUDGET,
+    };
+    let mut excluded: HashSet<String> = HashSet::from([ctx.local_key_id.to_owned()]);
+    excluded.extend(refused.map(ToOwned::to_owned));
+    let ranked = ctx.shapers.referral_candidates(&excluded);
+    let picked = tokio::time::timeout(REFERRAL_BUILD_BUDGET, pick_referrals(ctx, ranked))
+        .await
+        .unwrap_or_default();
+    let referred: Vec<String> = picked.iter().map(|(k, _)| k.clone()).collect();
+    let referral = ReferralFrame {
+        action: ReferralAction::Refused,
+        referrals: picked.into_iter().map(|(_, a)| a).collect(),
+    };
+    let (frames, named) = encode_referrals(referral, link_channel_mdu(ctx.node, &link_id))
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "a referral could not be framed; refused without one");
+            (Vec::new(), 0)
+        });
+    if let Some(first) = referred.first().filter(|_| named > 0) {
+        ctx.shapers.note_referred(first);
+    }
+    if let Some(m) = ctx.metrics {
+        if named == 0 {
+            m.inc_link_shaping(o::LINK_SHAPING_REFERRAL_EMPTY);
+        }
+        for _ in 0..named {
+            m.inc_link_shaping(o::LINK_SHAPING_REFERRAL_SENT);
+        }
+    }
+    tracing::info!(
+        link = %hex::encode(link_id.into_bytes()),
+        refused = refused.unwrap_or("-"),
+        reason = o::LINK_SHAPING_HOME_ELSEWHERE,
+        referrals = ?&referred[..named.min(referred.len())],
+        "refusing at the bound with referrals; an empty list leaves the peer its fallback \
+         order (CC 5.4.3)"
+    );
+    frames
+}
+
+/// CC 5.4.3 referrals — send a refusal off the event loop: the referral first
+/// (it can be many Channel frames, and the dialler closes on the answer), then
+/// the answer, then seal nothing more and close once the answer has had time
+/// to land.
+fn spawn_refusal_send(
+    node: Arc<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    link_id: LinkId,
+    frames: Vec<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        let out = send_fragments_on_channel(&node, &seals, &shapers, &link_id, &frames).await;
+        if !out.complete() {
+            tracing::debug!(
+                link = %hex::encode(link_id.into_bytes()),
+                "a refusal did not go out whole; the link closes regardless"
+            );
+        }
+        seals.refuse(link_id.into_bytes());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let _ = node.close_link(&link_id).await;
+    });
+}
+
+/// CC 5.4.3 referrals — the homing worker, one refusal at a time. It ends when
+/// the transport drops the channel.
+async fn run_homing(ctx: DialCtx, mut jobs: mpsc::Receiver<HomingJob>) {
+    while let Some(job) = jobs.recv().await {
+        ctx.home_on_referrals(job).await;
+    }
+}
+
+/// CC 5.4.6 — the shaped link to the node whose identity destination is
+/// `dest`, if this node holds one (a link it dialled to `dest`, or a link
+/// attributed to the peer announced at `dest`).
+async fn shaped_link_to_dest(ctx: &EventCtx<'_>, dest: [u8; 16]) -> Option<LinkId> {
+    let dialled: Vec<LinkId> = ctx
+        .dialed_link_dest
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, d)| d.into_bytes() == dest)
+        .map(|(l, _)| *l)
+        .collect();
+    if let Some(l) = dialled
+        .into_iter()
+        .find(|l| ctx.shapers.is_shaped(l.into_bytes()))
+    {
+        return Some(l);
+    }
+    let key_ids: Vec<String> = ctx
+        .peers
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, p)| p.peer.dest_hash.into_bytes() == dest)
+        .map(|(k, _)| k.clone())
+        .collect();
+    if key_ids.is_empty() {
+        return None;
+    }
+    ctx.link_to_peer_key_id
+        .lock()
+        .await
+        .iter()
+        .find(|(l, k)| key_ids.contains(k) && ctx.shapers.is_shaped(l.into_bytes()))
+        .map(|(l, _)| *l)
+}
+
+/// CC 5.4.6 — one inbound onion frame: the runtime decides (dormant, an
+/// unshaped link, a replay, ... refused by token before or after the peel);
+/// a forward waits out its delay and leaves on the next hop's SHAPED link
+/// only; a final hop's publication waits for persist's exit door.
+async fn handle_onion_frame(ctx: &EventCtx<'_>, link_id: LinkId, data: &[u8]) {
+    use crate::onion::relay::RelayAction;
+    use crate::onion::tokens;
+    let on_shaped_link = ctx.shapers.is_shaped(link_id.into_bytes());
+    let now = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+    let period = crate::transport::onion_layers::period_of(now);
+    let body = &data[crate::onion::relay::ONION_FRAME_MAGIC.len()..];
+    match ctx.onion.accept_inbound(body, on_shaped_link, period) {
+        Err(token) => drop_inbound(
+            Some(link_id),
+            token,
+            "an onion frame refused by the Anonymous Tier (CC 5.4.6)",
+        ),
+        Ok(RelayAction::Forward {
+            next_dest,
+            delay,
+            packet,
+            hold,
+        }) => {
+            let Some(next) = shaped_link_to_dest(ctx, next_dest).await else {
+                ctx.onion.count(tokens::NEXT_HOP_UNROUTABLE);
+                drop_inbound(
+                    Some(link_id),
+                    tokens::NEXT_HOP_UNROUTABLE,
+                    "no shaped link to the onion packet's next hop (CC 5.4.6)",
+                );
+                return;
+            };
+            let Some(shaper) = ctx.shapers.get(next.into_bytes()) else {
+                ctx.onion.count(tokens::NEXT_HOP_UNROUTABLE);
+                return;
+            };
+            let onion = Arc::clone(ctx.onion);
+            tokio::spawn(async move {
+                let _hold = hold;
+                tokio::time::sleep(delay).await;
+                let frame = crate::onion::relay::onion_frame(&packet);
+                let cap =
+                    crate::transport::link_shaping::body_capacity(shaper.agreement().frame_bytes);
+                let sent = crate::transport::frame_fragment::fragment(&frame, cap)
+                    .is_some_and(|f| shaper.enqueue(f).is_ok());
+                onion.count(if sent {
+                    tokens::FORWARDED
+                } else {
+                    tokens::NEXT_HOP_UNROUTABLE
+                });
+            });
+        }
+        Ok(RelayAction::Store { payload }) => ctx.onion.push_exit(payload),
+        Ok(RelayAction::Mailbox { .. }) => {
+            ctx.onion.count(tokens::EXIT_PENDING_PERSIST);
+            drop_inbound(
+                Some(link_id),
+                tokens::EXIT_PENDING_PERSIST,
+                "a rendezvous mailbox deposit; persist has no mailbox door yet (tracked: CIRISPersist#1149)",
+            );
+        }
     }
 }
 
@@ -13699,6 +16892,179 @@ async fn shaping_teardown(
     let _ = ctx.node.close_link(&link_id).await;
 }
 
+/// `FSD/PRIVACY_MODES.md` §6.12 — one step of a shed: the newest shaped link
+/// tier 2 closes. It ends whole, like any close: its rows retry and its peer
+/// redials into a refusal with referrals.
+async fn shed_one_shaped_link(
+    node: &ReticulumNode,
+    seals: &crate::transport::link_seal::LinkSeals,
+    shapers: &crate::transport::link_shaping::LinkShapers,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+) -> bool {
+    let Some(link) = shapers.next_shed().await else {
+        return false;
+    };
+    if let Some(m) = metrics {
+        m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_SHED);
+    }
+    tracing::info!(
+        link = %hex::encode(link),
+        token = crate::observability::LINK_SHAPING_LOAD_SHED,
+        "a shaped link closed at tier 2, newest first (FSD/PRIVACY_MODES.md §6.12)"
+    );
+    seals.refuse(link);
+    shapers.forget(&link);
+    let _ = node.close_link(&LinkId::new(link)).await;
+    true
+}
+
+/// Put the active seat roster in force and close what it no longer carries.
+async fn refresh_seats(
+    node: Arc<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+) {
+    for link in shapers.refresh_active_seats().await {
+        if let Some(m) = shapers.metrics() {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_SEAT_LOST);
+        }
+        tracing::info!(
+            target: "edge.shaping.seat_lost",
+            link = %hex::encode(link),
+            "a seat link's peer left the active roster; closed to renegotiate (CC 5.4.3)"
+        );
+        seals.refuse(link);
+        let _ = node.close_link(&LinkId::new(link)).await;
+    }
+}
+
+/// How long a listener's start waits for the persisted bindings.
+const PERSISTED_STANDING_BOOT_BUDGET: Duration = Duration::from_secs(10);
+
+/// How often tier 2 closes one shaped link. A step at a time, so a tier that
+/// falls leaves the older links standing, the way the A/V shed moves one leg
+/// at a time.
+const SHAPED_SHED_STEP: Duration = Duration::from_secs(1);
+
+/// `FSD/PRIVACY_MODES.md` §6.12 — asleep until tier 2 is in force, then one
+/// close per step while it stays. It holds no timer while the transport is
+/// parked: the host's next sample wakes it.
+async fn run_shaped_shed(
+    node: std::sync::Weak<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    lifecycle: Arc<crate::transport::lifecycle::Lifecycle>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+) {
+    loop {
+        shapers.shed_woken().await;
+        while shapers.service_tier().closes_shaped_links() && !lifecycle.park_requested() {
+            let Some(node) = node.upgrade() else { return };
+            shed_one_shaped_link(&node, &seals, &shapers, metrics.as_ref()).await;
+            drop(node);
+            tokio::time::sleep(SHAPED_SHED_STEP).await;
+        }
+    }
+}
+
+/// `FSD/PRIVACY_MODES.md` §6.12 — what a running slow-path transfer checks.
+struct SlowPathPause {
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    peer: String,
+    metrics: Option<crate::observability::EdgeMetrics>,
+}
+
+impl SlowPathPause {
+    /// Whether the transfer waits now. `held` remembers one pause's answer, so
+    /// a transfer reads its peer once per pause and counts it once.
+    async fn holds(&self, held: &mut Option<bool>) -> bool {
+        if !self.shapers.service_tier().pauses_bulk() {
+            *held = None;
+            return false;
+        }
+        if let Some(answer) = *held {
+            return answer;
+        }
+        let paused = self.shapers.slow_path_paused(&self.peer).await;
+        if paused {
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_SHED_BULK);
+            }
+        }
+        *held = Some(paused);
+        paused
+    }
+}
+
+/// CC 5.4.3 rc16 two planes — feed `frames` to `shaper` as its queue allows
+/// and wait until the link has taken the last of them. The bound follows the
+/// message: three times what the link's real budget needs, plus a minute, and
+/// the time a pause holds it does not count. Paused at tier 2 it keeps its
+/// place in the message (§6.12) and resumes at tier ≤ 1; rows pass meanwhile.
+async fn run_bulk_fallback(
+    node: &ReticulumNode,
+    link: LinkId,
+    shaper: &crate::transport::link_shaping::LinkShaper,
+    mut frames: Vec<Vec<u8>>,
+    pause: &SlowPathPause,
+) -> Result<(), String> {
+    const STOPPED: &str = "link_shaping_bulk_fallback_interrupted: the shaped link closed \
+                           part-way; the message is not delivered and the send is retried";
+    let agreement = *shaper.agreement();
+    #[allow(clippy::cast_precision_loss)] // a frame count; a bound, not an amount
+    let budget = frames.len() as f64 / (agreement.rho * shaper.lambda_now()).max(0.001);
+    let mut deadline = tokio::time::Instant::now()
+        + Duration::from_secs_f64(budget * 3.0)
+        + Duration::from_secs(60);
+    let mut held = None;
+    // Rows now sit between this message's frames, so a retraction names this
+    // message's batches and never the range they span.
+    let mut batches: Vec<(u64, u64)> = Vec::new();
+    let retract = |batches: &[(u64, u64)]| {
+        for (lo, hi) in batches {
+            shaper.retract(*lo, *hi);
+        }
+    };
+    let mut ticket = 0;
+    loop {
+        if !node.link_is_established(&link) || shaper.is_stopped() {
+            retract(&batches);
+            return Err(STOPPED.to_owned());
+        }
+        if tokio::time::Instant::now() > deadline {
+            retract(&batches);
+            return Err(
+                "link_shaping_bulk_fallback_timeout: the shaped link did not take the \
+                 message within its budget; the send is retried"
+                    .to_owned(),
+            );
+        }
+        let paused = pause.holds(&mut held).await;
+        // E3 — rows first: a few frames at a time, so a row queued now waits
+        // behind those and not behind the file.
+        let room = if paused {
+            deadline += Duration::from_millis(100);
+            0
+        } else {
+            shaper.room().min(frames.len()).min(
+                crate::transport::link_shaping::SLOW_PATH_QUEUED_MAX
+                    .saturating_sub(shaper.queued()),
+            )
+        };
+        if room > 0 {
+            let n = u64::try_from(room).unwrap_or(u64::MAX);
+            ticket = shaper
+                .enqueue_bulk_fallback(frames.drain(..room).collect())
+                .map_err(|e| e.to_string())?;
+            batches.push((ticket + 1 - n, ticket));
+        }
+        if frames.is_empty() && shaper.ticket_left(ticket) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// CC 5.4.3 — one shaped link's emission task: at every Poisson fire the
 /// shaper yields one frame (real or cover), sealed and sent on the Channel.
 /// A send that fails closes the link; the task ends when the shaper stops.
@@ -13714,8 +17080,12 @@ fn spawn_shaper_task(
     tokio::spawn(async move {
         let link = link_id.into_bytes();
         loop {
-            let (bytes, real) = match shaper.next_emission().await {
-                Emission::Frame { bytes, real } => (bytes, real),
+            let (bytes, real, ticket) = match shaper.next_emission().await {
+                Emission::Frame {
+                    bytes,
+                    real,
+                    ticket,
+                } => (bytes, real, ticket),
                 Emission::Stopped => break,
             };
             let Ok(sealed) = seals.seal(link, Lane::Channel, &bytes) else {
@@ -13731,6 +17101,19 @@ fn spawn_shaper_task(
             .await;
             if let Ok(Ok(())) = sent {
                 seals.tap_frame(link, &sealed);
+                if real {
+                    shaper.note_sent(ticket);
+                    if let Some(m) = metrics.as_ref() {
+                        m.telemetry.shaping_windows.note_real(shaper.class());
+                    }
+                }
+                tracing::trace!(
+                    link = %hex::encode(link),
+                    real,
+                    queued = shaper.queued(),
+                    gap_ms = shaper.frame_gap().as_millis(),
+                    "shaped frame sent"
+                );
                 if let Some(m) = metrics.as_ref() {
                     m.inc_link_shaping(if real {
                         crate::observability::LINK_SHAPING_FRAMES_REAL
@@ -13787,6 +17170,7 @@ async fn replay_before_keys(ctx: &EventCtx<'_>, link_id: LinkId) {
             // choke-ok: the link closed (or was refused) under the hold.
             Inbound::Closed
             | Inbound::Pending
+            | Inbound::Handshake(_)
             | Inbound::Keyed { .. }
             | Inbound::RouteRequested { .. }
             | Inbound::RouteAnswered
@@ -13795,6 +17179,34 @@ async fn replay_before_keys(ctx: &EventCtx<'_>, link_id: LinkId) {
             }
         }
     }
+}
+
+/// CIRISEdge#436/#627 — responder side: our announce rides the peer's link
+/// back to it, first, then the bundle. Not on a scoped link: those are
+/// identity-plane control frames (#728).
+///
+/// CIRISEdge#947 — off the event loop. These are Channel sends, and the
+/// Channel opens at a window of two: on a link whose peer withholds its proofs
+/// each send waits out [`CHANNEL_FRAGMENT_SEND_TIMEOUT`]. On the event loop
+/// that was seconds of every link's traffic, per keyed link, for the price of
+/// a handshake the receiver order had to admit. Admission bounds these tasks.
+/// Anything else this node sends on the link now rides beside these frames,
+/// which the fragment ids and the shaper's transition window already allow.
+fn spawn_first_words(ctx: &EventCtx<'_>, link_id: LinkId) {
+    let node = Arc::clone(ctx.av_node);
+    let seals = Arc::clone(ctx.seals);
+    let shapers = Arc::clone(ctx.shapers);
+    let announce = ctx.own_announce_frame.map(<[u8]>::to_vec);
+    let bundle = ctx.own_bundle.cloned();
+    tokio::spawn(async move {
+        seals.first_words_delay().await;
+        if let Some(frame) = &announce {
+            push_own_announce_frame(&node, &seals, &shapers, frame, &link_id).await;
+        }
+        if let Some(own) = &bundle {
+            push_own_bundle_frames(&node, &seals, &shapers, own, &link_id).await;
+        }
+    });
 }
 
 /// CC 5.3.3.5 E1 — a peer-dialled link's handshake was answered: the link is
@@ -13829,15 +17241,8 @@ async fn link_keyed(ctx: &EventCtx<'_>, link_id: LinkId, claimed: String) {
     let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
     match plane {
         LinkPlane::Identity => {
-            // CIRISEdge#436/#627 — responder side: our announce rides the
-            // peer's link back to it, FIRST, then the bundle. Not on a scoped
-            // link: those are identity-plane control frames (#728).
-            if let Some(frame) = ctx.own_announce_frame {
-                push_own_announce_frame(ctx.node, ctx.seals, ctx.shapers, frame, &link_id).await;
-            }
-            if let Some(own) = ctx.own_bundle {
-                push_own_bundle_frames(ctx.node, ctx.seals, ctx.shapers, own, &link_id).await;
-            }
+            bound_keyed_strangers(ctx, link_id).await;
+            spawn_first_words(ctx, link_id);
         }
         LinkPlane::Av => deliver_av_frame(ctx, link_id, dest, None).await,
         LinkPlane::Scoped => {}
@@ -13846,6 +17251,11 @@ async fn link_keyed(ctx: &EventCtx<'_>, link_id: LinkId, claimed: String) {
 
 #[allow(clippy::too_many_lines)] // one exhaustive NodeEvent dispatch match; splitting it hurts readability
 async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
+    let Some(event) = park_while_keying(event, ctx).await else {
+        // choke-ok: held for replay by `apply_keying`, or the link refused by
+        // name; `park_while_keying` counts both.
+        return;
+    };
     match event {
         NodeEvent::AnnounceReceived { announce, .. } => {
             // CIRISEdge#627 — Stage 1 inline (directory-free; a parse, a
@@ -13966,6 +17376,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         } => {
             // CIRISEdge#853 — a link whose `LinkEstablished` edge never saw.
             recover_unknown_link(ctx, link_id).await;
+            // CIRISEdge#947 — a handshake that beat this identify is judged now.
+            if let Some(job) = ctx.seals.take_deferred(link_id.into_bytes()) {
+                gate_handshake(ctx, link_id, job).await;
+            }
             // CIRISEdge#34 link half (v0.14.0) — emit `link_identified`
             // event with the peer's truncated identity hash. The peer
             // proved its identity over an already-established link via
@@ -14483,6 +17897,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 link_id,
             );
             ctx.link_book().forget(link_id, close_cause(reason)).await;
+            ctx.alm_links.forget(&link_id.into_bytes());
             if pooled {
                 note_starved_pool_close(reason, &link_id);
             }
@@ -14698,6 +18113,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             reason,
             interface_in,
             hops,
+            ..
         } => {
             note_packet_dropped(
                 ctx.metrics,
@@ -14706,6 +18122,48 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 interface_in,
                 hops,
             );
+        }
+        // ALM stage 2 (leviculum#94) — a timed media frame never arrived
+        // fresh. On the RECEIVING side it took a hop counter on the sender
+        // that no frame will show: report it to the A/V queue as a drop, so
+        // the next frame's open skips past it exactly as an overflow drop.
+        NodeEvent::ChannelMessageExpired {
+            link_id, expiry, ..
+        } => {
+            use leviculum_core::node::FrameExpiry;
+            let (sender, marked, label) = match expiry {
+                FrameExpiry::Sender => (true, false, crate::observability::AV_FRAME_EXPIRED_SENDER),
+                FrameExpiry::MarkedByPeer => {
+                    (false, true, crate::observability::AV_FRAME_EXPIRED_MARKED)
+                }
+                FrameExpiry::ArrivedLate { .. } => {
+                    (false, false, crate::observability::AV_FRAME_EXPIRED_LATE)
+                }
+            };
+            ctx.alm_links
+                .note_expired(link_id.into_bytes(), sender, marked);
+            if !sender {
+                ctx.av_sink.note_dropped_before_sink(link_id);
+            }
+            if let Some(m) = ctx.metrics {
+                m.inc_av_plane(label);
+            }
+        }
+        // ALM stage 2 (leviculum#91) — a relay a destination is reachable
+        // through: a candidate for the roster relay tier.
+        NodeEvent::RelayRouteLearned {
+            destination_hash,
+            relay,
+            interface_index,
+            hops,
+        } => {
+            ctx.alm_links
+                .note_learned(crate::transport::alm_link::LearnedRelayRoute {
+                    destination: destination_hash.into_bytes(),
+                    relay,
+                    interface_index,
+                    hops,
+                });
         }
         // CIRISEdge#805 item 8 — direct links (leviculum#70).
         NodeEvent::DirectLinkEstablished {
@@ -14815,6 +18273,17 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
             ctx.direct_paths.config.accept,
             shares_room,
         );
+    // v44 — before the answer goes, so the outcome cannot precede the record:
+    // from here this link may move under a Resource (`direct_path` docs).
+    if accepted {
+        ctx.direct_paths
+            .tracker()
+            .accepted(link_id, std::time::Instant::now());
+    }
+    // The initiator's proposal came: nothing left to yield to.
+    if let Some(p) = peer.as_deref() {
+        ctx.direct_paths.clear_yield(p);
+    }
     if let Some(m) = ctx.metrics {
         m.inc_direct_link(if accepted {
             crate::observability::DIRECT_LINK_REQUEST_ACCEPTED
@@ -14862,12 +18331,25 @@ async fn direct_link_failed(
     proposed: bool,
 ) {
     let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
-    let peer = ctx
-        .direct_paths
-        .tracker()
-        .failed(link_id, failure, std::time::Instant::now())
-        .or(hint);
-    let reason = crate::transport::direct_path::failure_label(failure);
+    let now = std::time::Instant::now();
+    let (peer, held) = {
+        let mut tracker = ctx.direct_paths.tracker();
+        let held = tracker.failure_was_a_hold(&link_id, failure, now);
+        let peer = tracker
+            .failed(
+                link_id,
+                failure,
+                now,
+                crate::transport::direct_path::jitter_draw(),
+            )
+            .or(hint);
+        (peer, held)
+    };
+    let reason = if held {
+        crate::observability::DIRECT_LINK_FAILED_HELD
+    } else {
+        crate::transport::direct_path::failure_label(failure)
+    };
     if let Some(m) = ctx.metrics {
         m.inc_direct_link(reason);
     }
@@ -14875,6 +18357,7 @@ async fn direct_link_failed(
         link = %hex::encode(link_id.as_bytes()),
         peer = peer.as_deref().unwrap_or("<unattributed>"),
         ?failure,
+        held,
         proposed,
         "direct link FAILED: the link keeps its relayed path (CIRISEdge#805 item 8)"
     );
@@ -15177,10 +18660,97 @@ fn route_supersession_by_route(
     RouteSupersession::IgnoreStale
 }
 
+/// Whether `envelope` is a CRPL replication frame, not a signed envelope.
+fn is_replication_frame(envelope: &[u8]) -> bool {
+    envelope.starts_with(&crate::replication::wire_frame::REPLICATION_FRAME_MAGIC)
+}
+
+/// One path ask per destination per [`PATH_SEEK_MIN_INTERVAL`].
+type PathSeeks = Arc<std::sync::Mutex<HashMap<DestinationHash, std::time::Instant>>>;
+
+/// Raise the path requests `dests` are due. Returns when the answers can
+/// stop being waited for: an ask still in flight counts, an old one does not.
+async fn ask_for_paths(
+    node: &ReticulumNode,
+    seeks: &PathSeeks,
+    dests: &[DestinationHash],
+) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let mut ask: Vec<DestinationHash> = Vec::new();
+    let mut until = now;
+    {
+        let mut seeks = seeks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seeks.len() >= PATH_SEEK_TRACKED {
+            let mut ages: Vec<std::time::Instant> = seeks.values().copied().collect();
+            ages.sort_unstable();
+            let cut = ages[ages.len() / 2];
+            seeks.retain(|_, at| *at > cut);
+        }
+        for d in dests {
+            match seeks.get(d).copied() {
+                Some(at) if now.duration_since(at) < PATH_SEEK_MIN_INTERVAL => {
+                    until = until.max(at + PATH_SEEK_BUDGET);
+                }
+                _ => {
+                    seeks.insert(*d, now);
+                    ask.push(*d);
+                    until = until.max(now + PATH_SEEK_BUDGET);
+                }
+            }
+        }
+    }
+    for d in &ask {
+        if let Err(e) = node.request_path(d).await {
+            tracing::debug!(error = %e, "path request not sent");
+        }
+    }
+    until
+}
+
+/// The late joiner's ask (#945), for a peer the no-route backoff has stopped
+/// trying: its signed route row just landed, so there is now somewhere to ask,
+/// and the next probe may be a quarter of an hour away. What comes back is its
+/// own announce, which roots it and clears the backoff the ordinary way.
+async fn ask_through_landed_routes(
+    node: Arc<ReticulumNode>,
+    rooting: Arc<dyn RootingDirectory>,
+    seeks: PathSeeks,
+    keys: Vec<String>,
+) {
+    for key in keys {
+        let Ok(Some(row)) = rooting.signed_reticulum_route(&key).await else {
+            continue;
+        };
+        let hash = hex::decode(&row.transport_destination.destination)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok());
+        if let Some(hash) = hash {
+            tracing::debug!(peer = %key, "a wanted peer's route landed; asking for its path");
+            ask_for_paths(&node, &seeks, &[DestinationHash::new(hash)]).await;
+        }
+    }
+}
+
+/// Tests outside the transport: the named destination of a full key.
+#[cfg(test)]
+pub(crate) fn named_dest_for_test(transport_pubkey64: &[u8; 64]) -> [u8; 16] {
+    named_dest_of_transport(transport_pubkey64).expect("an identity")
+}
+
+/// The 16-byte identity hash of a full `(x25519 ‖ ed25519)` transport key.
+pub(super) fn identity_of_transport(transport_pubkey64: &[u8; 64]) -> Option<[u8; 16]> {
+    let x25519: [u8; 32] = transport_pubkey64[..32].try_into().ok()?;
+    let ed25519: [u8; 32] = transport_pubkey64[32..].try_into().ok()?;
+    let identity = Identity::from_public_keys(&x25519, &ed25519).ok()?;
+    Some(*identity.hash())
+}
+
 /// The named destination a 64-byte transport identity (`x25519 ‖ ed25519`)
 /// announces on: `truncated_hash(name_hash("ciris","edge") ‖ identity_hash)`.
 /// `None` for bytes that are not an identity.
-fn named_dest_of_transport(transport_pubkey64: &[u8; 64]) -> Option<[u8; 16]> {
+pub(super) fn named_dest_of_transport(transport_pubkey64: &[u8; 64]) -> Option<[u8; 16]> {
     let x25519: [u8; 32] = transport_pubkey64[..32].try_into().ok()?;
     let ed25519: [u8; 32] = transport_pubkey64[32..].try_into().ok()?;
     let identity = Identity::from_public_keys(&x25519, &ed25519).ok()?;
@@ -15343,7 +18913,7 @@ enum DivergenceHeal {
 /// announce path runs (`root_binding`, with the record's own registered
 /// pubkey as the claim), so a durable-store heal can never confer more trust
 /// than a fresh announce would. Fail-closed on any read failure.
-async fn store_claim_roots_here(
+pub(super) async fn store_claim_roots_here(
     rooting: &dyn RootingDirectory,
     key_id: &str,
     policy: HybridPolicy,
@@ -15893,7 +19463,7 @@ fn peer_bundle_link_binding_ok(
 /// [`gated_save_provenance`]: crate::bundle_gate::gated_save_provenance
 // The parameter list IS the test seam: exactly the operands the wrapper reads
 // off the EventCtx, split out so the field-provenance tests can drive the full
-// chain against a real `MemoryBackend` + peers map without a live node
+// chain against a real `SqliteBackend` + peers map without a live node
 // (the #424 "the layer the loopback harness cannot reach" lesson).
 #[allow(clippy::too_many_arguments)]
 async fn process_peer_bundle_frame(
@@ -16249,14 +19819,14 @@ async fn receive_announce(ctx: &EventCtx<'_>, view: AnnounceView, link: Option<L
                 tracing::warn!(
                     key_id = ?key_id,
                     "announce Stage 2 shed — re-announce of a bound peer, worker queue full \
-                     (backpressure); RNS re-announce will retry (tracked: CIRISEdge#482 item 3)"
+                     (backpressure); RNS re-announce will retry (history: CIRISEdge#482 item 3)"
                 );
             }
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             tracing::error!(
                 "announce Stage 2 DROPPED — cold-start worker is GONE (channel closed: the \
-                 worker task exited); rooting is no longer being processed (tracked: CIRISEdge#482 \
+                 worker task exited); rooting is no longer being processed (history: CIRISEdge#482 \
                  item 3)"
             );
         }
@@ -17757,6 +21327,209 @@ fn set_owner_only(_path: &std::path::Path) -> Result<(), TransportError> {
 /// predicate. IFAC-only → `add_tcp_server_ifac`; no-transit-only →
 /// `add_tcp_server_no_transit`; the IFAC+no-transit combo (a member-only LEAF
 /// port — no convenience method covers it) → the general `add_interface_config`.
+/// Lifecycle — how long [`ReticulumTransport::resume`] waits for its TCP
+/// clients to connect before reopening the send gate, so the first sends after
+/// a resume do not dial into an interface that is still connecting.
+const RESUME_CONNECT_WAIT: Duration = Duration::from_secs(5);
+
+/// Lifecycle — the most a suspend waits after closing its links for their
+/// LINKCLOSE packets to be written before the interfaces go.
+const SUSPEND_FLUSH_GRACE: Duration = Duration::from_millis(100);
+
+/// Leviculum's own tasks while the node runs: its event loop and its
+/// traffic-counter thread. Suspend stops both (`stop_shared`).
+const NODE_TASKS_WHILE_RUNNING: usize = 2;
+
+/// **Mobile-background lifecycle** — see [`crate::transport::lifecycle`] for
+/// the platform rules and the interim design.
+impl ReticulumTransport {
+    /// Whether the transport is suspended (sends refused with
+    /// [`TransportError::Suspended`]).
+    #[must_use]
+    pub fn is_suspended(&self) -> bool {
+        self.lifecycle.is_suspended()
+    }
+
+    /// Suspend: refuse sends, close every link, park the listener, detach the
+    /// interfaces, and return once nothing is left open — or at `deadline`,
+    /// reporting what still is. Idempotent: a second call redoes every step
+    /// (each is idempotent) and reports `already_suspended`, so it also
+    /// finishes what a suspend cut short by its deadline left behind. Never
+    /// fails; [`SuspendReport::quiescent`] says whether it got there.
+    pub async fn suspend(&self, deadline: Duration) -> SuspendReport {
+        use crate::transport::lifecycle::settle;
+        let started = std::time::Instant::now();
+        let until = tokio::time::Instant::now() + deadline;
+        let Ok(_op) = tokio::time::timeout_at(until, self.lifecycle.lock_op()).await else {
+            // A resume still running holds the lock past our whole budget.
+            return self.suspend_report(started, self.lifecycle.is_suspended());
+        };
+        let already = self.lifecycle.close_gate();
+        if !already {
+            tracing::info!(
+                links = self.node.link_list().len(),
+                ?deadline,
+                "transport SUSPENDING (host entering background): sends refused, \
+                 closing links, parking the listener, detaching interfaces"
+            );
+        }
+        // Close every link — pooled, inbound, A/V, scoped, direct — at the
+        // node, while the interfaces are still up to carry the LINKCLOSEs.
+        for info in self.node.link_list() {
+            if self.node.direct_link_interface(&info.link_id).is_some() {
+                let _ = self.node.retire_direct_link(&info.link_id).await;
+            }
+            let _ = self.node.close_link(&info.link_id).await;
+        }
+        settle(until, || {
+            let open = self.node.link_list().len();
+            async move { open == 0 }
+        })
+        .await;
+        // Park the listener: it drains the closes' events and stops its
+        // timers and its announce worker.
+        self.lifecycle.request_park(true);
+        let flush = tokio::time::Instant::now() + SUSPEND_FLUSH_GRACE;
+        settle(until.min(flush), || {
+            let unparked = self.lifecycle.listeners_unparked();
+            async move { unparked == 0 }
+        })
+        .await;
+        self.quiesce_node().await;
+        settle(until, || {
+            let quiet = self.quiescent_now();
+            async move { quiet }
+        })
+        .await;
+        let report = self.suspend_report(started, already);
+        tracing::info!(?report, "transport suspended");
+        report
+    }
+
+    /// Resume: reattach the interfaces, reopen the send gate and wake the
+    /// listener, whose first run announces. Idempotent, and a no-op when not
+    /// suspended. On an error the transport stays suspended.
+    pub async fn resume(&self) -> Result<(), TransportError> {
+        let _op = self.lifecycle.lock_op().await;
+        if !self.lifecycle.is_suspended() {
+            return Ok(());
+        }
+        if let Some(m) = self.metrics.get() {
+            m.telemetry.note_woken();
+        }
+        self.wake_node().await?;
+        let any_client =
+            !self.config.bootstrap_peers.is_empty() || !self.config.interfaces.is_empty();
+        if any_client {
+            let until = tokio::time::Instant::now() + RESUME_CONNECT_WAIT;
+            let connected = crate::transport::lifecycle::settle(until, || {
+                let up = self.node.interface_stats().iter().any(|i| i.online);
+                async move { up }
+            })
+            .await;
+            if !connected {
+                tracing::info!(
+                    "resume: no TCP client connected within {RESUME_CONNECT_WAIT:?}; \
+                     reopening sends anyway (the clients keep reconnecting)"
+                );
+            }
+        }
+        self.lifecycle.open_gate();
+        self.lifecycle.request_park(false);
+        // The interfaces were detached, so the node forgot the paths learned
+        // through them; ask again for every peer we hold, instead of waiting
+        // for each peer's next announce.
+        let dests: Vec<DestinationHash> = self
+            .peers
+            .lock()
+            .await
+            .values()
+            .map(|p| p.peer.dest_hash)
+            .collect();
+        for dest in &dests {
+            let _ = self.node.request_path(dest).await;
+        }
+        tracing::info!(
+            paths_requested = dests.len(),
+            "transport RESUMED (host in foreground): interfaces reattached, sends open"
+        );
+        Ok(())
+    }
+
+    /// Take the node down (leviculum#90, `stop_shared`): its event loop
+    /// exits, every interface socket and listener closes, its traffic-counter
+    /// thread ends, and calls that need a run fail as not running until
+    /// [`Self::wake_node`]. The node keeps its identity, destinations, announce
+    /// policy and event channel — the receiver the parked listener holds.
+    async fn quiesce_node(&self) {
+        if let Err(e) = self.node.stop_shared().await {
+            tracing::warn!(error = %e, "suspend: leviculum node stop failed");
+        }
+    }
+
+    /// Bring the node back (`start_shared`): it rebuilds its configured
+    /// interfaces under their original indexes — so a TCP client's
+    /// tunnel-synthesize re-runs with the same tunnel id and the node it dials
+    /// restores its paths back here — and re-announces. Starting a running node
+    /// is a no-op here.
+    async fn wake_node(&self) -> Result<(), TransportError> {
+        if self.node.is_running() {
+            return Ok(());
+        }
+        self.node
+            .start_shared()
+            .await
+            .map_err(|e| TransportError::Io(format!("resume: leviculum node start: {e}")))
+    }
+
+    /// `(interfaces, listener)` still open. A stopped node holds none —
+    /// `stop_shared` returns only once every interface socket and listener is
+    /// closed — whatever its (frozen) interface tables still list.
+    fn open_sockets(&self) -> (usize, bool) {
+        if self.node.is_running() {
+            (
+                self.node.interface_stats().len(),
+                !self.node.tcp_listen_addrs().is_empty(),
+            )
+        } else {
+            (0, false)
+        }
+    }
+
+    fn quiescent_now(&self) -> bool {
+        let (interfaces, listener) = self.open_sockets();
+        !self.node.is_running()
+            && self.node.link_list().is_empty()
+            && interfaces == 0
+            && !listener
+            && self.lifecycle.edge_tasks() == 0
+            && self.lifecycle.sends_in_flight() == 0
+            && self.lifecycle.listeners_unparked() == 0
+    }
+
+    fn suspend_report(&self, started: std::time::Instant, already: bool) -> SuspendReport {
+        let edge_tasks = self.lifecycle.edge_tasks();
+        let node_tasks = if self.node.is_running() {
+            NODE_TASKS_WHILE_RUNNING
+        } else {
+            0
+        };
+        let (interfaces_open, listener_open) = self.open_sockets();
+        SuspendReport {
+            already_suspended: already,
+            quiescent: self.lifecycle.is_suspended() && self.quiescent_now(),
+            elapsed: started.elapsed(),
+            links_open: self.node.link_list().len(),
+            interfaces_open,
+            listener_open,
+            tasks_running: edge_tasks + node_tasks,
+            sends_in_flight: self.lifecycle.sends_in_flight(),
+            edge_tasks,
+            node_tasks,
+        }
+    }
+}
+
 fn apply_tcp_server_transit(
     builder: ReticulumNodeBuilder,
     addr: SocketAddr,
@@ -18563,6 +22336,9 @@ mod tests {
         }
     }
 
+    /// v44 LTS — what a persisted row has to prove. The store's `Rooted` is a
+    /// claim, a plain write-through proves nothing, and a row whose identity
+    /// is not its destination's is nobody's.
     /// CIRISEdge#460 — the `LinkClosed` severity mapping. Routine turnover
     /// (`Normal`, `Stale`) is `Info`; every fault reason is `Warning`. Pins that
     /// a routine idle reap never re-enters the WARN stream (70% of the server's
@@ -18909,6 +22685,7 @@ mod tests {
         fn summaries_and_non_bootstrap_kinds_name_nobody() {
             let summary = crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
                 SummaryMessage {
+                    status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![],
                 },
@@ -20364,7 +24141,7 @@ mod tests {
 
     /// CIRISEdge#299 — the full write-through → persist → boot-load →
     /// resolve round-trip through a real `FederationDirectory`
-    /// (`MemoryBackend`): a rooted transport identity persisted via
+    /// (`SqliteBackend`): a rooted transport identity persisted via
     /// `RootingDirectory::persist_transport_binding` is read back by
     /// `list_all_transport_destinations` and reconstructed into the same
     /// 64-byte `(x25519 ‖ ed25519)` a `PersistedBindingResolver` serves.
@@ -20373,9 +24150,8 @@ mod tests {
         use crate::verify::RootingDirectory;
         use base64::Engine as _;
         use ciris_persist::federation::FederationDirectory;
-        use ciris_persist::store::MemoryBackend;
 
-        let backend = MemoryBackend::new();
+        let backend = ciris_persist::store::test_backend::test_backend();
         // CIRISPersist#1103 — derived from the key the fixture row carries.
         let key_id: &str = &ciris_verify_core::fedcode::derive_key_id("peer-roundtrip", &[7u8; 32]);
         let dest_hash = [7u8; 16];
@@ -20400,7 +24176,8 @@ mod tests {
             },
             pubkey_ml_dsa_65_base64: None,
             algorithm: "hybrid".to_string(),
-            identity_type: "agent".to_string(),
+            // persist v61 (#1122): an agent key announces no route.
+            identity_type: "node".to_string(),
             identity_ref: format!("ref-{key_id}"),
             valid_from: chrono::Utc::now(),
             valid_until: None,
@@ -20490,7 +24267,8 @@ mod tests {
             pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
             pubkey_ml_dsa_65_base64: None,
             algorithm: "hybrid".to_string(),
-            identity_type: "agent".to_string(),
+            // persist v61 (#1122): an agent key announces no route.
+            identity_type: "node".to_string(),
             identity_ref: format!("ref-{key_id}"),
             valid_from: chrono::Utc::now(),
             valid_until: None,
@@ -20596,9 +24374,8 @@ mod tests {
     async fn stored_reticulum_binding_returns_the_best_live_row() {
         use crate::verify::RootingDirectory;
         use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
-        use ciris_persist::store::MemoryBackend;
 
-        let backend = MemoryBackend::new();
+        let backend = ciris_persist::store::test_backend::test_backend();
         // CIRISPersist#1103 — derived from the key the fixture row carries.
         let key_id: &str = &ciris_verify_core::fedcode::derive_key_id("peer-heal-read", &[7u8; 32]);
         // FK gate: the occurrence's federation_keys row must exist.
@@ -21784,6 +25561,67 @@ mod scope_native_addressing_tests {
         .expect("bare transport")
     }
 
+    /// What a server's round met, on the real send path: `PendingOrLive` with
+    /// a queue, and a peer with no candidate. A replication frame is answered
+    /// no-route and queues nothing; a signed envelope still waits for the
+    /// wake-up. Before: both queued, the round read `Queued` as sent and waited
+    /// out its reply, so the peer never backed off (CIRISEdge#794).
+    #[tokio::test]
+    async fn a_replication_frame_to_no_candidate_is_no_route_and_never_queued() {
+        use crate::replication::protocol::{EnvelopeKind, ReplicationMessage, SummaryMessage};
+        use crate::transport::store_and_forward::{
+            MemoryStoreAndForward, StoreAndForward, StoreAndForwardConfig,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue: Arc<dyn StoreAndForward> =
+            Arc::new(MemoryStoreAndForward::new(StoreAndForwardConfig::default()));
+        let transport = bare_transport(dir.path(), "local-key")
+            .await
+            .with_store_and_forward(
+                Arc::clone(&queue),
+                crate::transport::PendingDelivery::PendingOrLive,
+            );
+        let frame =
+            crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
+                kind: EnvelopeKind::Key,
+                refs: Vec::new(),
+            }));
+        let sent = Transport::send(&transport, "nobody", &frame).await;
+        assert!(
+            matches!(sent, Err(TransportError::NoDialCandidate { .. })),
+            "{sent:?}"
+        );
+        assert_eq!(queue.pending_count("nobody"), 0, "the frame was not queued");
+
+        let queued = Transport::send(&transport, "nobody", b"{\"signed\":true}").await;
+        assert!(
+            matches!(queued, Ok(TransportSendOutcome::Queued)),
+            "{queued:?}"
+        );
+        assert_eq!(queue.pending_count("nobody"), 1, "the envelope still waits");
+    }
+
+    /// A host's prime is a route arriving: a peer in the no-route backoff has
+    /// no announce coming to clear it.
+    #[tokio::test]
+    async fn a_prime_is_reachability_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "local-key").await;
+        let mut events = transport.subscribe_reachability().expect("subscribable");
+        let pubkey = Identity::from_private_key_bytes(&[0x51; 64])
+            .expect("an identity")
+            .public_key_bytes();
+        let dest = named_dest_of_transport(&pubkey).expect("a destination");
+        transport
+            .prime_peer("primed", dest, pubkey)
+            .await
+            .expect("primed");
+        let seen = events.try_recv().expect("evidence was sent");
+        assert_eq!(seen.peer_key_id, "primed");
+        assert_eq!(seen.evidence, ReachabilityEvidence::PathLearned);
+    }
+
     fn table_with_group(
         scope: &CohortScope,
         group_id: &str,
@@ -22267,6 +26105,18 @@ const VANISH_GRACE: Duration = Duration::from_secs(2);
 /// coordinators per peer, but they do not all ship simultaneously, and a link
 /// returns to the pool the moment its transfer ends.
 const MAX_CONCURRENT_DIALS_PER_DEST: usize = 4;
+
+/// CC 5.4.3 referrals — refusals waiting to be homed on, at most. Past it one
+/// is dropped: a referral is a hint.
+const HOMING_QUEUE: usize = 8;
+
+/// One refusal's referrals, for [`run_homing`].
+struct HomingJob {
+    /// The node that refused this one.
+    refused_by: String,
+    /// Whom it named, in the order to try them.
+    referrals: Vec<crate::transport::route_fetch::RouteAnswer>,
+}
 // A cap of 1 is a mutex, and a mutex here is the M=4 regression one layer up:
 // each waiter's resource-transfer clock would sit behind someone else's
 // handshake. Guarded at COMPILE time because the value is a constant and a

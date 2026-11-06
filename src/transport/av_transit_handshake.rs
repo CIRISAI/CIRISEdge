@@ -13,8 +13,10 @@
 //! # Roles
 //!
 //! The **dialler is always the initiator** (verify's rule). Before it dials
-//! it resolves the dialled node's static transit pair (Rooted only, persist's
-//! `transit_kex_pair_for`, by the id it dials); once the link is established
+//! it resolves the dialled node's static transit pair by the id it dials, from
+//! a CC 3.3.6.2 source ([`PairSource`](crate::transport::transit_kex_peer::PairSource):
+//! a Rooted binding, its own signed route row, or the pairing pin; the row may
+//! also be fetched over the link); once the link is established
 //! it runs [`initiate`] and sends the frames as the link's FIRST messages.
 //! A dialled node with no usable pair cannot be keyed: the dial is refused by
 //! name ([`AvHandshakeError::NoTransitPair`]) and never made. There is no
@@ -56,8 +58,8 @@
 //! ```
 //!
 //! The receiver refuses a declared length over [`MAX_HANDSHAKE_BYTES`] at the
-//! START frame, before buffering anything, and never holds more than the
-//! declared length; a frame past it or a budget overrun ([`HANDSHAKE_BUDGET`])
+//! START frame, before buffering anything, holds only what has arrived, and
+//! never more than the declared length; a frame past it or a budget overrun ([`HANDSHAKE_BUDGET`])
 //! is a named refusal.
 //!
 //! **Telling handshake frames from sealed frames is positional, and the tag
@@ -403,7 +405,6 @@ impl Reassembler {
                     });
                 }
                 self.expected = Some(declared);
-                self.buf.reserve_exact(declared);
                 &b[START_HEADER_LEN..]
             }
             (KIND_START, Some(_)) => {
@@ -426,6 +427,9 @@ impl Reassembler {
                 "a part past the declared length",
             ));
         }
+        // Grown by what arrived, never by what was declared: a START frame
+        // alone must not pin [`MAX_HANDSHAKE_BYTES`] (CIRISEdge#947).
+        self.buf.reserve_exact(data.len());
         self.buf.extend_from_slice(data);
         Ok((self.buf.len() == expected).then(|| std::mem::take(&mut self.buf)))
     }

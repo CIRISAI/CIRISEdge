@@ -191,12 +191,23 @@ per round), so it resets the session too.
 
 ### 5.3 On-demand `Pull` / `CursorPull` (#462, #474)
 
-`start_pull` outside a driven round mints a **pull round** (`pull_round`) with
-its own inbox; the reply is routed by that id and consumed by the next driven
-round through `select!` over both inboxes (the `pull_exempt_rounds` exemption in
-`Session::on_summary` is unchanged). Inside a driven round `start_pull` uses the
-driven round's id. A pull round is superseded by the next `start_pull`; its
-inbox is bounded (8) like every other.
+**A subject `Pull` a caller asks for (`pull_subject_testimony`) is an exchange of
+its own** (`ReplicationCoordinator::pull_exchange`, v44): a fresh round id, a
+bounded inbox and a `Session` of its own, driven to the apply on its own task as
+frames land, entered in `deliver_reply` before any other round. It shares nothing
+with the scheduled round, so it needs neither a cadence tick nor the round gate.
+At most `MAX_PULL_EXCHANGES` (8) run per `(peer, kind)`, one per subject.
+
+The earlier shape put the `Pull` on the coordinator's one session and left the
+reply for the next driven round. CIRISServer's contact harness measured what that
+costs: the canonical served at 16:55:18.5 and alice applied at 16:56:03.5, with
+`inbox full while its driver was idle` and `answers no round this node is driving`
+in between.
+
+A **recovery** `Pull` is still a driven round (FSD-SIGNER-RECOVERY): `start_pull`
+inside the bracket stamps the driven round's id. `start_pull` outside one mints a
+**pull round** (`pull_round`) routed to the on-demand inbox, read only by a driven
+round, which is why no production caller does that any more.
 
 ## 6. What changed in code
 
