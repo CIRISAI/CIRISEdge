@@ -563,8 +563,10 @@ async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
 /// real frames per window), and the real share B emitted while the burst
 /// drained stays under ρ; a short window at one ρ paces a burst that a long
 /// one admits whole. That side is read from the budget, not from a race
-/// between two timings a loaded host decides: the burst takes `⌈40 / budget⌉`
-/// grants, so it spans at least all but its first and last windows.
+/// between two timings a loaded host decides: the burst takes
+/// `⌈40 / budget⌉` grants, so it spans at least all but its first and last
+/// windows. At ρ = 0.25, since at ρ = 0.5 the budget barely binds and an
+/// unpaced burst clears the same bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rho_and_the_window_move_the_real_share_and_the_delay() {
     let _host = whole_host().await;
@@ -636,14 +638,14 @@ async fn rho_and_the_window_move_the_real_share_and_the_delay() {
         t_low > t_high,
         "a tighter budget share delays the burst: rho=0.25 {t_low:?} vs rho=0.8 {t_high:?}"
     );
-    let (t_short, _, short_budget) = burst_time("w2", 0.5, 2).await;
-    let (_, _, long_budget) = burst_time("w30", 0.5, 30).await;
+    let (t_short, _, short_budget) = burst_time("w2", 0.25, 2).await;
+    let (_, _, long_budget) = burst_time("w30", 0.25, 30).await;
     assert!(
         long_budget >= 40,
         "W=30 s admits the burst whole: {long_budget}"
     );
     let grants = 40usize.div_ceil(short_budget);
-    assert!(grants >= 3, "W=2 s does not: {short_budget} a window");
+    assert!(grants >= 6, "W=2 s does not: {short_budget} a window");
     let paced = Duration::from_secs(2) * u32::try_from(grants - 2).expect("a few");
     assert!(
         t_short >= paced,
