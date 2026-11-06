@@ -48,3 +48,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 6.1.1	CLM-member-commitment-unique	CIRISEdge	src/holonomic/wholeness_witness.rs#unique_merkle_root	ciris-edge@v44.0.0
 6.1.1	CLM-member-commitment-unique	CIRISEdge	src/holonomic/aggregation.rs#first_repeated_source_id	ciris-edge@v44.0.0
 5.4.6	CLM-serve-seat-announced	CIRISEdge	src/replication/bridge.rs#IdentityRowReach::withholds	ciris-edge@v44.0.0
+5.4.3	CLM-shaped-link-bound-refuse	CIRISEdge	src/transport/link_shaping.rs#LinkShapers::at_bound_for	ciris-edge@v44.0.0
+5.4.3	CLM-seat-class	CIRISEdge	src/transport/link_shaping.rs#LinkShapers::is_seat_link	ciris-edge@v44.0.0
+5.4.3	CLM-refusal-carries-referrals	CIRISEdge	src/transport/shaping_referral.rs#rank_referrals	ciris-edge@v44.0.0
+5.4.6	CLM-first-contact-live-binding	CIRISEdge	src/replication/bridge.rs#attestation_is_relayed_announce	ciris-edge@v44.0.0

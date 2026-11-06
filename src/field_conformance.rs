@@ -479,6 +479,54 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
         ],
         supporting: true,
     },
+    TestEvidence {
+        cc: "5.4.3",
+        clm: "CLM-shaped-link-bound-refuse",
+        property: "past the bound of eight a shaping peer is refused by name, and its bulk still crosses",
+        impl_anchor: "src/transport/link_shaping.rs#LinkShapers::at_bound_for",
+        witness: &[
+            "src/transport/link_shaping.rs#at_the_bound_a_ninth_shaping_peer_is_refused_and_an_off_peer_is_not",
+            "tests/link_shaping_e1.rs#at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_crosses",
+            "tests/link_shaping_e1.rs#at_the_bound_an_off_peer_still_gets_an_ordinary_unshaped_link",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.4.3",
+        clm: "CLM-seat-class",
+        property: "seat class needs both ends to prove a seat on the active roster, outside the eight",
+        impl_anchor: "src/transport/link_shaping.rs#LinkShapers::is_seat_link",
+        witness: &[
+            "src/transport/link_shaping.rs#a_seat_shapes_a_proved_seat_at_the_seat_row_outside_the_eight",
+            "src/transport/link_shaping.rs#a_seat_follows_the_active_roster_with_no_restart",
+            "tests/link_shaping_e1.rs#two_proved_seats_shape_at_the_seat_row_and_a_non_seat_gets_the_class",
+            "tests/link_shaping_e1.rs#a_canonical_retired_after_boot_loses_the_seat_class_and_the_bound_exemption",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.4.3",
+        clm: "CLM-refusal-carries-referrals",
+        property: "a refusal at the bound carries up to three referrals to nodes with capacity, and a refused peer homes there",
+        impl_anchor: "src/transport/shaping_referral.rs#rank_referrals",
+        witness: &[
+            "tests/link_shaping_e1.rs#a_refused_peer_homes_on_a_referral_and_its_contact_completes_there",
+            "tests/link_shaping_e1.rs#a_node_with_its_relay_offering_off_is_never_referred",
+            "tests/link_shaping_e1.rs#an_owned_node_that_has_not_announced_is_never_referred",
+            "src/transport/link_shaping.rs#ten_refused_peers_spread_across_the_referrals",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.4.6",
+        clm: "CLM-first-contact-live-binding",
+        property: "a stranger's Pull is served the announced testimony of a subject whose live binding is held",
+        impl_anchor: "src/replication/bridge.rs#attestation_is_relayed_announce",
+        witness: &[
+            "src/replication/bridge.rs#a_held_live_binding_is_served_to_a_strangers_pull_outside_the_publish_set",
+        ],
+        supporting: false,
+    },
 ];
 
 /// Every edge-tagged field edge does NOT process with a runtime value-check —
