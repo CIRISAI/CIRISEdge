@@ -242,6 +242,8 @@ pub struct ReplicationCoordinator {
     /// How many empty `Diff`s the peer has sent: each is its word that it
     /// holds, or will not ask for, everything this node offered it.
     peer_lacks_nothing: std::sync::atomic::AtomicU64,
+    /// Rings when an ordinary round ends: a held round asks again on this.
+    round_finished: tokio::sync::Notify,
     /// CIRISEdge#634 — the role-specific inbox. A responder has a standing
     /// bounded inbox its driver drains continuously; an initiator has a
     /// round inbox that lives exactly as long as the driven round, plus an
@@ -346,6 +348,7 @@ impl ReplicationCoordinator {
             applier,
             session: Mutex::new(Session::new(role, kind)),
             peer_lacks_nothing: std::sync::atomic::AtomicU64::new(0),
+            round_finished: tokio::sync::Notify::new(),
             inbox,
             pull_exchanges: std::sync::Mutex::new(HashMap::new()),
             pull_retry_at_secs: AtomicU64::new(0),
@@ -871,6 +874,18 @@ impl ReplicationCoordinator {
     /// when fanning round cadence across (peer × kind) pairs.
     pub fn kind(&self) -> EnvelopeKind {
         self.kind
+    }
+
+    /// An ordinary round ended, `lost` when it did not complete
+    /// ([`StateProvider::round_ended`]).
+    pub(crate) fn note_round_ended(&self, lost: bool) {
+        self.provider.round_ended(self.kind, lost);
+        self.round_finished.notify_one();
+    }
+
+    /// Wait for an ordinary round to end.
+    pub(crate) async fn round_finished(&self) {
+        self.round_finished.notified().await;
     }
 
     /// [`Self::peer_lacks_nothing`]'s count so far.

@@ -41,7 +41,14 @@ v22.0.0, leviculum v0.33.0+ciris.1.
   the round timeout: 11 s of contact on the rig. The round now waits until the peer's empty `Diff`
   says it lacks nothing on Key, IdentityOccurrence and TransportDestination, asked in that order,
   for at most five seconds. A round's end was not enough: the peer had refused the route for a key
-  still landing. The round timeout is unchanged.
+  still landing. The round timeout is unchanged. Only a peer added while the scheduler runs is held,
+  so a restart's peer list never is, and at most eight at once; a plane is asked again when its round
+  ends, on a doubling wait, through the round gate.
+- **A lost round's rows are in the next round.** The watermark moved when a round listed, so a round
+  lost after that left its rows behind it until the re-sweep came round. A round that does not
+  complete now puts the watermark back and the next round lists them again, at most three times
+  running, so a peer that always fails cannot pin a walk on one page. The required rows of CC 5.2 are
+  listed every round either way.
 - **The retired-plane line logs at debug at the hot-add door,** which a host's reconcile can reach
   on every pass. Nothing was scheduled either way.
 - **Tests.** The superseded-binding witness injects a binding newer than the announce it outranks,

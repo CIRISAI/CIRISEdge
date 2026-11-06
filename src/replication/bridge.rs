@@ -1399,9 +1399,19 @@ struct PlaneWatermark {
     /// [`SweepCursors::rewind_skipped`] moves [`Self::high_water`] back here so
     /// the next round re-reads it instead of waiting out a re-sweep cycle.
     skip_mark: Option<SkipMark>,
+    /// Where [`Self::high_water`] stood before the latest head read: a round
+    /// that listed and was lost puts it back ([`SweepCursors::round_ended`]).
+    rollback: Option<Option<ResumeCursor>>,
+    /// How many lost rounds in a row have been put back.
+    lost_rounds: u8,
     /// Monotonic touch tick, for the cap's least-recently-used eviction.
     touched: u64,
 }
+
+/// How many lost rounds in a row get their rows listed again. Past it the
+/// watermark moves as it would have and the re-sweep carries what was passed,
+/// so a peer that always fails does not pin a walk on one page.
+const MAX_ROUND_RESTORES: u8 = 3;
 
 /// What the advertise predicate reads besides the row: the self-publish set,
 /// the per-kind publish selector's answers, and the cohort. A change in any of
@@ -1634,6 +1644,7 @@ impl SweepCursors {
     ) -> Option<BackfillPage> {
         let wm = self.touch(key);
         let short = served < budget as usize;
+        wm.rollback = Some(wm.high_water.clone());
         if let Some(c) = last {
             wm.high_water = Some(c);
         }
@@ -1657,6 +1668,32 @@ impl SweepCursors {
             since: wm.backfill.clone(),
             budget: remaining,
         })
+    }
+
+    /// The round that made the latest head read ended. Listing is not delivery:
+    /// a round lost after it would leave its rows behind the watermark until
+    /// the re-sweep came round, so a lost round puts the watermark back and the
+    /// next round lists them again. At most [`MAX_ROUND_RESTORES`] in a row.
+    /// Returns whether it moved. A responder's listing has no such end, and is
+    /// only ever replaced here: the rollback is the latest listing's.
+    fn round_ended(&mut self, key: &(String, EnvelopeKind), lost: bool) -> bool {
+        let Some(wm) = self.by_peer_plane.get_mut(key) else {
+            return false;
+        };
+        let rollback = wm.rollback.take();
+        if !lost {
+            wm.lost_rounds = 0;
+            return false;
+        }
+        let Some(position) = rollback else {
+            return false;
+        };
+        if wm.lost_rounds >= MAX_ROUND_RESTORES {
+            return false;
+        }
+        wm.lost_rounds += 1;
+        wm.high_water = position;
+        true
     }
 
     /// Record the backfill page: advance, or WRAP to the beginning when the
@@ -4885,6 +4922,19 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// CIRISEdge#544 — the round's want-diff asks this before putting a hash on
     /// the wire. Pure in-memory probe of the refusal memory; counts the drops so
     /// the traffic that did NOT happen is observable.
+    fn round_ended(&self, peer_key_id: &str, kind: EnvelopeKind, lost: bool) {
+        let moved = self
+            .sweep_cursors
+            .lock()
+            .map(|mut c| c.round_ended(&(peer_key_id.to_owned(), kind), lost))
+            .unwrap_or(false);
+        if moved {
+            if let Some(m) = &self.metrics {
+                m.inc_advertise(crate::observability::ADVERTISE_WATERMARK_REWOUND);
+            }
+        }
+    }
+
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
         let hit = self
             .refusal_backoff

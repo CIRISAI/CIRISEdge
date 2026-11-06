@@ -154,10 +154,13 @@ async fn a_fresh_grant_moves_first_and_history_is_not_offered() {
     // The walk still reads the plane, and offers none of it across its rounds.
     for _ in 0..(HISTORY as u32 / PAGE + 2) {
         let round = offer(&bridge, CONTACT).await;
-        assert!(
-            round.len() <= 3,
-            "a contact's offer stays the required rows: {round:?}"
-        );
+        for id in &past {
+            let old = hash_of(&backend, id).await;
+            assert!(
+                !round.iter().any(|r| r.envelope_hash == old),
+                "a contact's offer stays the required rows, round after round"
+            );
+        }
     }
     let summary = bridge
         .last_advertise_round
@@ -480,4 +483,58 @@ async fn an_owners_own_node_is_not_a_contact() {
             .any(|r| r.envelope_hash == hash);
     }
     assert!(walked, "the walk reaches it, a page a round");
+}
+
+/// **A round lost after listing leaves its rows for the next round.** The
+/// watermark moved at the listing, so they waited for the re-sweep to come round:
+/// on a plane of pages, a whole cycle. A round that ends well moves on.
+#[tokio::test]
+async fn a_lost_round_leaves_its_rows_for_the_next_round() {
+    let backend = fixture().await;
+    history(&backend).await;
+    grant(&backend, SEAT, &["trace:"]).await;
+    let bridge = page_bridge(&backend).with_recognised_seats(seats(&[LOCAL, SEAT]));
+    let kind = EnvelopeKind::Attestation;
+
+    let first = offer(&bridge, SEAT).await;
+    assert!(!first.is_empty());
+    bridge.round_ended(SEAT, kind, true);
+    assert_eq!(
+        offer(&bridge, SEAT).await,
+        first,
+        "the same rows, in the next round and not the re-sweep"
+    );
+    bridge.round_ended(SEAT, kind, false);
+    let next = offer(&bridge, SEAT).await;
+    assert_ne!(next, first, "a round that completed moves on");
+    assert!(!next.iter().any(|r| first.contains(r)));
+}
+
+/// A peer that always fails does not pin the walk on one page: past the bound
+/// the watermark moves as it would have, and a completed round earns it back.
+#[tokio::test]
+async fn a_peer_that_always_fails_does_not_list_one_page_for_ever() {
+    let backend = fixture().await;
+    history(&backend).await;
+    grant(&backend, SEAT, &["trace:"]).await;
+    let bridge = page_bridge(&backend).with_recognised_seats(seats(&[LOCAL, SEAT]));
+    let kind = EnvelopeKind::Attestation;
+
+    let first = offer(&bridge, SEAT).await;
+    for _ in 0..MAX_ROUND_RESTORES {
+        bridge.round_ended(SEAT, kind, true);
+        assert_eq!(offer(&bridge, SEAT).await, first);
+    }
+    bridge.round_ended(SEAT, kind, true);
+    let moved = offer(&bridge, SEAT).await;
+    assert_ne!(moved, first, "the bound passed: the walk goes on");
+
+    bridge.round_ended(SEAT, kind, false);
+    let page = offer(&bridge, SEAT).await;
+    bridge.round_ended(SEAT, kind, true);
+    assert_eq!(
+        offer(&bridge, SEAT).await,
+        page,
+        "a success resets the bound"
+    );
 }

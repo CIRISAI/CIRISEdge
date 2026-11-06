@@ -527,9 +527,15 @@ const BOOTSTRAP_ORDER: [EnvelopeKind; 3] = [
 /// Past it the round runs: a plane that cannot land costs what it always did.
 const BOOTSTRAP_HOLD: Duration = Duration::from_secs(5);
 
-/// How often a held Attestation round looks, and asks the plane again. It also
-/// lets a host finish adding a peer's planes.
+/// How long a held round lets a host finish adding a peer's planes, and the
+/// first wait before a plane is asked again. Each wait doubles, so a held plane
+/// is asked at most six times inside [`BOOTSTRAP_HOLD`].
 const BOOTSTRAP_LOOK: Duration = Duration::from_millis(250);
+
+/// How many new peers may be held at once. Past it a new peer's round runs as
+/// it would have: a burst of hot-adds never multiplies rounds. Every round a
+/// hold asks for goes through the round gate like any other.
+const BOOTSTRAP_HOLDS: usize = 8;
 
 /// The running [`BOOTSTRAP_ORDER`] coordinators, for a held Attestation round.
 type BootstrapPlanes = Arc<
@@ -547,11 +553,23 @@ type BootstrapPlanes = Arc<
 /// refused for a key still on its way. An empty `Diff` does, on the peer's own
 /// word, so each plane is asked until the peer lacks nothing of it, in order,
 /// since a route refused for its key is out of the `Diff` until the key lands.
-/// Bounded by [`BOOTSTRAP_HOLD`]. A peer with none of these planes has no wait.
-async fn hold_for_bootstrap(coord: &ReplicationCoordinator, planes: &BootstrapPlanes) {
+///
+/// Only a peer added while the scheduler runs is held, so a restart's peer list
+/// never is, and at most [`BOOTSTRAP_HOLDS`] at once. A plane is asked again
+/// when its round has ended and the wait has doubled, never on a tick, and a
+/// peer with no route is not asked at all. Bounded by [`BOOTSTRAP_HOLD`]. A
+/// peer with none of these planes has no wait past [`BOOTSTRAP_LOOK`].
+async fn hold_for_bootstrap(
+    coord: &ReplicationCoordinator,
+    planes: &BootstrapPlanes,
+    holds: Option<Arc<tokio::sync::Semaphore>>,
+) {
     if coord.kind() != EnvelopeKind::Attestation {
         return;
     }
+    let Some(_permit) = holds.and_then(|h| h.try_acquire_owned().ok()) else {
+        return;
+    };
     tokio::time::sleep(BOOTSTRAP_LOOK).await;
     let deadline = tokio::time::Instant::now() + BOOTSTRAP_HOLD - BOOTSTRAP_LOOK;
     for kind in BOOTSTRAP_ORDER {
@@ -563,7 +581,14 @@ async fn hold_for_bootstrap(coord: &ReplicationCoordinator, planes: &BootstrapPl
             continue;
         };
         let seen = plane.peer_lacks_nothing();
+        let mut wait = BOOTSTRAP_LOOK;
         while plane.peer_lacks_nothing() == seen {
+            kick.notify_one();
+            let ended = tokio::time::timeout_at(deadline, plane.round_finished());
+            if ended.await.is_ok() && plane.peer_lacks_nothing() == seen {
+                tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + wait)).await;
+                wait *= 2;
+            }
             if tokio::time::Instant::now() >= deadline {
                 tracing::info!(
                     waiting_on = ?kind,
@@ -572,8 +597,6 @@ async fn hold_for_bootstrap(coord: &ReplicationCoordinator, planes: &BootstrapPl
                 );
                 return;
             }
-            kick.notify_one();
-            tokio::time::sleep(BOOTSTRAP_LOOK).await;
         }
     }
 }
@@ -936,6 +959,7 @@ impl ReplicationScheduler {
         let mesh_config = self.mesh_config.take();
         let metrics = self.metrics.take();
         let bootstrap = BootstrapPlanes::default();
+        let bootstrap_holds = Arc::new(tokio::sync::Semaphore::new(BOOTSTRAP_HOLDS));
         for coord in self.coordinators.drain(..) {
             note_driven(&self.driven, &coord);
             spawn_coord(
@@ -950,6 +974,7 @@ impl ReplicationScheduler {
                 Arc::clone(&backoff),
                 metrics.clone(),
                 Arc::clone(&bootstrap),
+                None,
             );
         }
 
@@ -995,6 +1020,7 @@ impl ReplicationScheduler {
                                 Arc::clone(&backoff),
                                 metrics.clone(),
                                 Arc::clone(&bootstrap),
+                                Some(Arc::clone(&bootstrap_holds)),
                             );
                         }
                         SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
@@ -1062,6 +1088,7 @@ fn spawn_coord(
     backoff: Arc<NoRouteBackoff>,
     metrics: Option<crate::observability::EdgeMetrics>,
     bootstrap: BootstrapPlanes,
+    bootstrap_holds: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     debug_assert_eq!(
         coord.role(),
@@ -1099,6 +1126,7 @@ fn spawn_coord(
             backoff,
             metrics,
             bootstrap,
+            bootstrap_holds,
         )
         .await;
     });
@@ -1118,6 +1146,7 @@ async fn run_one_coordinator_forever(
     backoff: Arc<NoRouteBackoff>,
     metrics: Option<crate::observability::EdgeMetrics>,
     bootstrap: BootstrapPlanes,
+    bootstrap_holds: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     tokio::select! {
         biased;
@@ -1126,7 +1155,7 @@ async fn run_one_coordinator_forever(
                 return;
             }
         }
-        () = hold_for_bootstrap(&coord, &bootstrap) => {}
+        () = hold_for_bootstrap(&coord, &bootstrap, bootstrap_holds) => {}
     }
     let mut interval = tokio::time::interval(cadence);
     // `Burst` is the default; with `MissedTickBehavior::Skip` a
@@ -1516,6 +1545,7 @@ async fn round_and_report(
     // an error of the round: skip quietly, no event, no backoff.
     if matches!(class, RoundClass::Suspended) {
         tracing::debug!("round skipped: transport suspended");
+        coord.note_round_ended(true);
         return class;
     }
     let event = match outcome {
@@ -1568,6 +1598,7 @@ async fn round_and_report(
         }
     };
     *ended = RoundEnded::of(&event);
+    coord.note_round_ended(!matches!(event, RoundEvent::Completed(_)));
     if let Some(sink) = event_sink {
         // Sink-closed isn't a fault — the metrics consumer
         // dropped their receiver. Round loops continue.
