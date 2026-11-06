@@ -1354,8 +1354,10 @@ mod tests {
         let mut t = DirectPathTracker::default();
         t.proposed("b", link(1), None, now);
         t.accepted(link(2), now);
-        let before = now + UPGRADE_GUARD_BOUND - Duration::from_millis(1);
         let at = now + UPGRADE_GUARD_BOUND;
+        let before = at
+            .checked_sub(Duration::from_millis(1))
+            .expect("an instant");
         assert!(t.upgrade_in_flight(&link(1), before));
         assert!(t.upgrade_in_flight(&link(2), before));
         assert!(!t.upgrade_in_flight(&link(1), at));
@@ -1382,10 +1384,10 @@ mod tests {
         let held = Duration::from_secs(175);
         assert!(held_failure(Failure::Timeout, held));
         assert!(held_failure(Failure::Timeout, UPGRADE_GUARD_BOUND));
-        assert!(!held_failure(
-            Failure::Timeout,
-            UPGRADE_GUARD_BOUND - Duration::from_millis(1)
-        ));
+        let just_under = UPGRADE_GUARD_BOUND
+            .checked_sub(Duration::from_millis(1))
+            .expect("a bound");
+        assert!(!held_failure(Failure::Timeout, just_under));
         assert!(!held_failure(Failure::PunchFailed, held));
         assert!(!held_failure(Failure::ProbeFailed, held));
 
