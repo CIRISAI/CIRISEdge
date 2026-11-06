@@ -18,6 +18,9 @@
 //!   from 1 to 0). React fast, recover slowly: a shed costs requesters a
 //!   make-before-break move, so a flapping tier would herd them.
 //! - **Every change is logged and counted** (L-S4) under a stable token.
+//! - **The host's verdict is a lease** (L-S5): one not renewed within
+//!   [`LadderConfig::host_lease_ms`] counts as `Normal`, so a dead or wedged
+//!   server falls back to serving, through the same cooldowns.
 //!
 //! # What each tier sheds (§7.2)
 //!
@@ -25,6 +28,10 @@
 //! ladder's own decisions must never be load. The never-shed set (L-A3: own
 //! devices and owner, federation duty, `control`, revocations) is never named
 //! by any lever: [`FlowClass::never_shed`] is checked before every shed.
+//!
+//! **The tier does not touch forwarding** (§7.2, Eric 2026-11-06): the node
+//! keeps forwarding link requests at every tier, and what sheds the walk and
+//! bulk is the host's own levers, [`crate::load_levers`].
 //!
 //! Shaped slots follow the same tiers (`FSD/PRIVACY_MODES.md` §6.12): what a
 //! lever owes a peer is [`PeerObligation`], read when it acts. Cover is not
@@ -81,7 +88,8 @@ pub enum ServiceTier {
     #[default]
     FullOps = 0,
     /// Tier 1: audio and files. Video on relayed legs is shed to the base
-    /// layer, new relay work is refused, non-obligation rounds stretch.
+    /// layer, and new A/V relay legs and shaped slots are refused. Forwarded
+    /// links are not: a canonical is the last relay tier.
     AudioAndFiles = 1,
     /// Tier 2: chat and contacts. Relayed audio is shed (LIFO,
     /// make-before-break), bulk transfer pauses, this node's own call is
@@ -123,9 +131,9 @@ impl ServiceTier {
         }
     }
 
-    /// **Admit-close** (tier ≥ 1): no new relayed links, relay reservations
-    /// or A/V relay legs; C2 answers `Refuse { retry_after }` with
-    /// `load_refuse:admit_closed`.
+    /// **Admit-close** (tier ≥ 1): no new relay reservations or A/V relay
+    /// legs, with `load_refuse:admit_closed`. A forwarded link is not relay
+    /// work in this sense and is admitted at every tier.
     #[must_use]
     pub const fn admits_new_relay_work(self) -> bool {
         matches!(self, Self::FullOps)
@@ -235,7 +243,7 @@ pub enum FlowClass {
     RelayedVideo,
     /// This node's own call's video.
     OwnCallVideo,
-    /// A NEW relayed link, reservation or A/V relay leg.
+    /// A NEW relay reservation or A/V relay leg. Never a forwarded link.
     NewRelayWork,
 }
 
@@ -371,6 +379,8 @@ pub struct LadderConfig {
     pub cooldown_2_to_1_ms: u64,
     /// Calm time before tier 1 → 0, ms.
     pub cooldown_1_to_0_ms: u64,
+    /// How long one host verdict holds without a renewal (L-S5), ms.
+    pub host_lease_ms: u64,
 }
 
 impl Default for LadderConfig {
@@ -385,6 +395,8 @@ impl Default for LadderConfig {
             lower_factor: 0.8,
             cooldown_2_to_1_ms: 60_000,
             cooldown_1_to_0_ms: 120_000,
+            // The server reports once a second; a backgrounded one every five.
+            host_lease_ms: 30_000,
         }
     }
 }
@@ -424,6 +436,7 @@ const CHANGE_LOG: usize = 64;
 pub struct LoadLadder {
     cfg: LadderConfig,
     host: LoadPressure,
+    host_at_ms: u64,
     tier: ServiceTier,
     relay_streak: u32,
     queue_streak: u32,
@@ -449,6 +462,7 @@ impl LoadLadder {
         Self {
             cfg,
             host: LoadPressure::Normal,
+            host_at_ms: 0,
             tier: ServiceTier::FullOps,
             relay_streak: 0,
             queue_streak: 0,
@@ -488,6 +502,7 @@ impl LoadLadder {
     /// The host's verdict (L-S1). Raising takes effect at once.
     pub fn set_host_pressure(&mut self, now_ms: u64, p: LoadPressure) -> ServiceTier {
         self.host = p;
+        self.host_at_ms = now_ms;
         self.settle(now_ms)
     }
 
@@ -546,6 +561,17 @@ impl LoadLadder {
     }
 
     fn settle(&mut self, now_ms: u64) -> ServiceTier {
+        if self.host != LoadPressure::Normal
+            && now_ms.saturating_sub(self.host_at_ms) >= self.cfg.host_lease_ms
+        {
+            tracing::warn!(
+                pressure = ?self.host,
+                lease_ms = self.cfg.host_lease_ms,
+                "the host's load verdict was not renewed: it lapses to normal, and the \
+                 tier falls through its cooldowns (FSD CIRIS_MESH L-S5)"
+            );
+            self.host = LoadPressure::Normal;
+        }
         let host_t = self.host.tier();
         let target = host_t.max(self.edge_tier);
         if target > self.tier {
@@ -809,11 +835,46 @@ mod tests {
     #[test]
     fn edge_never_lowers_below_the_host() {
         let mut l = LoadLadder::default();
-        l.set_host_pressure(0, LoadPressure::Warning);
         for t in 0..400 {
+            l.set_host_pressure(t * 1_000, LoadPressure::Warning);
             l.observe(t * 1_000, EdgeLoadSignals::default());
         }
         assert_eq!(l.tier(), ServiceTier::AudioAndFiles);
+    }
+
+    /// L-S5: a host that stops reporting does not hold the node down. Its
+    /// verdict lapses, and the tier falls one cooldown at a time.
+    #[test]
+    fn a_host_verdict_not_renewed_lapses_through_the_cooldowns() {
+        let mut l = LoadLadder::default();
+        l.set_host_pressure(0, LoadPressure::Critical);
+        let mut fell_at = Vec::new();
+        for s in 1..400 {
+            let was = l.tier();
+            l.observe(s * 1_000, EdgeLoadSignals::default());
+            if l.tier() != was {
+                fell_at.push((s, l.tier()));
+            }
+        }
+        assert_eq!(l.host_pressure(), LoadPressure::Normal);
+        assert_eq!(
+            fell_at,
+            vec![
+                (90, ServiceTier::AudioAndFiles),
+                (210, ServiceTier::FullOps)
+            ],
+            "30 s of lease, then 60 s and 120 s of cooldown"
+        );
+    }
+
+    /// A renewed verdict is the same verdict: the lease never moves the tier.
+    #[test]
+    fn a_renewed_verdict_holds_past_any_one_lease() {
+        let mut l = LoadLadder::default();
+        for s in 0..1_000 {
+            l.set_host_pressure(s * 1_000, LoadPressure::Critical);
+            assert_eq!(l.tier(), ServiceTier::ChatAndContacts);
+        }
     }
 
     #[test]
@@ -925,8 +986,9 @@ mod tests {
     #[test]
     fn ls2_never_shed_holds_for_ten_minutes_at_critical() {
         let mut l = LoadLadder::default();
-        l.set_host_pressure(0, LoadPressure::Critical);
         for t in 0..600u64 {
+            // The server's sampler renews its verdict every second (L-S5).
+            l.set_host_pressure(t * 1_000, LoadPressure::Critical);
             let tier = l.observe(t * 1_000, EdgeLoadSignals::default());
             for c in [
                 FlowClass::Control,

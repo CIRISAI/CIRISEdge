@@ -718,12 +718,17 @@ canonical's *standing* class policy. This ladder is how *any* node degrades unde
 
 ### 7.1 Authority: what a node may shed on its own, and what it may not
 
-- **L-A1. Transport load is the node's own decision.** A node MAY shed its transit and A/V relay
-  load at any time, under any tier:
-  - forwarding for others;
+- **L-A1. Transport load is the node's own decision.** A node MAY shed its A/V relay load at any
+  time, under any tier:
   - relayed links it admitted;
   - A/V relay legs;
   - its relay offer.
+
+  It does not close forwarding on a tier. A canonical is the last relay tier, so a link it refuses
+  has nowhere else to go, and the dialler's next try is one more request (Eric, 2026-11-06; v44
+  turned one refused dial into 48 retries and stalled first contact for the ladder's cooldown).
+  What bounds forwarding is a configured link bound and the link table's cap, fixed process bounds
+  set before the node starts.
 
   *Why:* this is a node's own transport decision, the same as refusing a link (CC 5.3.3.5 E1 item 1,
   under which a responder serves nothing and tears down on a named refusal). The CC reads lending a
@@ -742,6 +747,9 @@ canonical's *standing* class policy. This ladder is how *any* node degrades unde
   - the node's own devices and its owner;
   - federation duty (L-A2);
   - `control` traffic: KEX, route fetch, path requests, first contact, push-to-wake;
+  - the minimum viable role of a transport node, which is what first contact needs (CC 5.4.6):
+    forwarding link requests and keyed links, answering subject Pulls for keys, occurrences, routes
+    and owner bindings, and announces;
   - revocations of every kind.
 
   *Why:* shedding any of these turns pressure into a security or availability failure instead of a
@@ -754,10 +762,10 @@ A tier is a set of shed levers. Each tier includes every lever of the tiers abov
 | Lever | Tier 0, full ops | Tier 1, audio + files | Tier 2, basic chat + contacts |
 |---|---|---|---|
 | **V-shed:** video and heavy A/V on legs this node relays. Relayed legs are degraded to base/audio layer (`set_layer_policy` toward `BLINKING_DOT`, then audio only); standbys go keepalive-only | – | **on** | on |
-| **Admit-close:** no new relayed links, relay reservations or A/V relay legs; C2 answers `Refuse { retry_after }`; the relay offer is re-signed with a 0 bucket | – | **on** | on |
-| **Stretch:** expensive non-obligation replication rounds, i.e. rounds to relayed peers that are not the owner, own devices or the send set; their interval is lengthened ×4 and they are served after obligation rounds | – | **on** | on, ×8 |
+| **Admit-close:** no new relay reservations or A/V relay legs; C2 answers `Refuse { retry_after }`; the relay offer is re-signed with a 0 bucket. Forwarded links are not relay work here and are admitted at every tier | – | **on** | on |
+| **Stretch:** expensive non-obligation replication rounds, i.e. rounds to relayed peers that are not the owner, own devices or the send set. Moved to the host's `walk` lever (§7.7); the tier does not pull it | host | host | host |
 | **A-shed:** audio relay legs this node carries are shed newest-first (LIFO, `ShedReason::OverCommitted`, token `load_shed:audio`), each with a `Shed` notice so the requester moves make-before-break | – | – | **on** |
-| **B-pause:** bulk file/blob transfer (blob swarm pulls and serves for non-owner peers) and the durability and blob passes (`src/blob_swarm/durability.rs`) are paused, not cancelled; they resume from their cursor at tier ≤ 1 | – | – | **on** |
+| **B-pause:** a shaped link's slow path for non-owner peers waits. Blob swarm pulls and the durability pass are the host's `bulk` lever (§7.7), and the tier does not pull it | – | – | **on** |
 | **Own A/V:** this node's OWN call (as a publisher and receiver) | full | full; video is host-degraded on `CallEvent::LoadTier` | audio only |
 
 **What keeps working.**
@@ -783,7 +791,7 @@ A tier is a set of shed levers. Each tier includes every lever of the tiers abov
 | Blob/file chunk transfer (blob swarm), the durability pass | bulk | full | B-pause (own devices' self-tier durability excepted, L-A3) |
 | A/V: legs this node *relays* (member relay or non-member forwarder) | relay | V-shed, Admit-close | A-shed |
 | A/V: this node's own call | own | host-degraded video | audio only |
-| Transit: relayed links this node forwards (RNS transport) | relay | Admit-close; existing links keep the default allowance; per-link caps (L3) cut video-rate links to the audio class | Existing reserved links shed LIFO make-before-break; unreserved links keep the default `control`/`replication` allowance only |
+| Transit: relayed links this node forwards (RNS transport) | never-shed (L-A3) | full; configured per-link caps (L3) hold at every tier | full |
 
 An `Attestation` row is classed by its attestation type prefix. That is a field the row is already
 routed on (§7.5), so classification reads no row body.
@@ -805,8 +813,8 @@ This mirrors the agent's resource monitor
     PyO3).
   - Normal maps to tier 0, Warning to tier 1, Critical to tier 2.
 
-  *Why:* the server already owns the host budget, as the agent's monitor does. Edge is a consumer that
-  decides its own levers.
+  *Why:* the server already owns the host budget, as the agent's monitor does. It reads edge's gauges
+  beside its own and pulls edge's levers (§7.7).
 - **L-S2. Edge's own signals** MAY raise the tier and never lower it below the host tier:
 
   | Signal | Tier 1 | Tier 2 |
@@ -835,6 +843,10 @@ This mirrors the agent's resource monitor
   - Each token is counted under its label.
   - Each shed decision is a C7 decision-log record, so a field event replays in the sim.
   - The host gets `CallEvent::LoadTier` and a transport event.
+
+- **L-S5. The host's verdict is a lease.** A verdict not renewed in 30 s lapses to Normal, and the
+  tier falls through its cooldowns. *Why:* a dead or wedged server must leave a node that serves, not
+  one held at the last pressure it reported.
 
 ### 7.4 Identify: the `load_ledger`
 
@@ -879,6 +891,9 @@ the ladder shed the costliest non-obligation consumer first.
 
 ### 7.6 Tests for the ladder
 
+Stretch and bulk moved to the levers of §7.7 and are witnessed there. LS1 and LS2's bulk and
+ordinary-round rows read through those levers.
+
 These are sim scenarios in `closed_loop_sim` with a host-pressure input. They use the same seeds, log
 hash and soak as §10.
 
@@ -891,6 +906,47 @@ hash and soak as §10.
 | **LS5 Edge self-raise** | No host pressure. Transit pps climbs to 95% of measured | The tier rises to 1 at 65% and to 2 at 90%. The cause is logged as `edge:transit_pps`. It returns to 0 only after the cooldowns |
 | **LS5-mut** | LS3 with the hysteresis and cooldowns set to 0 | MUST fail LS3 |
 | **LS6 Router** | 5,000 subjects, 50 peers × all kinds, a steady state of rounds, then one consent grant | Per-round persist reads in steady state are O(rows advertised), not O(subjects × peers): the count is asserted flat as subjects grow 10×. One grant triggers exactly one ready-set recompute for the affected peers |
+
+### 7.7 The host's levers (Eric, 2026-11-06)
+
+Edge implements the gauges and the levers. The server reads and pulls them in concert with its own,
+and edge decides nothing here. With no host pulling, every lever is at 0 and the node serves its
+whole role.
+
+**The rules, for every lever.**
+
+- **No lever is a scram.** It moves one step at a time: at most one up per 10 s and one down per 30 s.
+  Each step halves a cost and none ends one, so no step takes the node off a role. Pulling or releasing
+  a lever does not itself cause work: nothing a lever touches is refused, so nothing it does is
+  retried, and nothing piles up behind it to burst on release.
+- **A lever is a lease.** A pull holds for its lease, at most 300 s, and the host renews by pulling
+  again. A lease that runs out walks the lever down at the release pace. A dead or wedged server
+  leaves a node that serves.
+- **The minimum viable role is not on a lever.** No lever names forwarding, subject Pulls, announces
+  or the planes L-A3 keeps. Fixed process bounds stay what they are, and are not levers.
+
+**The levers.** `Edge::pull_shed_lever(lever, level, lease)`, `pull_shed_lever` in PyO3; read back in
+`Edge::shed_levers()` and `load_ledger`.
+
+| Lever | Sheds, per step | At the top (3) | Costs | Stays |
+|---|---|---|---|---|
+| `walk` | Cadence ticks of `Attestation`, `LocationProof`, `Organization`, `OrgMembership`, `PartnerRecord` toward a peer owed nothing, ×2 | ×8 | Convergence with that peer takes longer. A row a peer was not sent by a kick waits up to ×8 cadence | Kicks; every round to own devices, seats and the send set; every other plane. A failed obligation read stretches nothing |
+| `page` | The Attestation advertise page, ½, to a floor of 32 rows | ⅛ | The re-sweep and catch-up take more rounds. Bears on every peer, which L-A2 allows | First-contact sweeps; subject Pulls; the rows themselves, which the next round reads |
+| `bulk` | The blob puller's concurrent pulls, ½, to a floor of 1; the durability pass runs on every 2nd tick | ⅛, one pull; pass ×8 | Files arrive later; repairs wait | Running pulls finish. Serving chunks to peers: a refused serve is retried, so it is not levered |
+
+**The gauges.** `load_ledger` and the telemetry catalogue.
+
+| Question | Gauge |
+|---|---|
+| What is forwarded | `forward_links_live`, `forward_admitted_total`, `forward_packets_per_second`, `forward_bits_per_second`, the ledger's top links |
+| What is refused | `forward_refusals_total{load_refuse:capacity}`, with an INFO line per move |
+| What each plane costs | `replication_round_duration_seconds`, `replication_envelopes_served_total`, `replication_inbound_wait_seconds`, `replication_reply_wait_seconds`, `sweep_permit_wait_seconds`, `responder_rounds_total` |
+| Queue and link pressure | `replication_reply_queued`, `seal_keyer_queued`, `seal_held_bytes`, `seal_awaiting_links`, `leviculum_events_queued`, `leviculum_events_dropped`, `leviculum_shed_packets`, `inbound_links`, `outbound_links`, `link_pool_links` |
+| What is shed now | `load_lever_level`, `load_lever_lease_seconds`, `load_lever_changes_total`, `load_tier`, `load_tier_changes_total` |
+
+**Tests.** A relay at tier 2 with every lever at the top forwards a stranger's link and serves it the
+rows of first contact. A lever pulled to the top and left walks home with no second of the walk above
+its unlevered peak, while `Key` and owed rounds keep their cadence and a kick still runs.
 
 ---
 
@@ -1071,3 +1127,8 @@ the same seed gives the same decision-log hash.
 - 2026-11-04: §8 rewritten on Eric's BoundedWithFloor ruling (L = 8 shaped links at the class rate,
   refuse and offer bulk past the bound); the model's A, D, E recomputed on it; homing rotation left
   open with the exposure decision table.
+- 2026-11-06: Eric's ruling: the tier no longer closes forwarding (L-A1, §7.2), and transit joins the
+  never-shed set with the rest of a transport node's minimum viable role (L-A3). The host's verdict is
+  a lease (L-S5). §7.7 adds the host's levers and gauges: edge implements, the server pulls, and every
+  lever is graduated, leased and refuses nothing. Stretch and the blob half of B-pause, which no code
+  ever consumed, move there.

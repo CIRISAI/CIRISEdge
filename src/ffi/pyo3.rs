@@ -544,6 +544,22 @@ impl PyEdge {
         Ok(self.inner.set_load_pressure(p).as_u8())
     }
 
+    /// `FSD/CIRIS_MESH.md` §7.7 — **pull a shed lever**: `"walk"`, `"page"` or
+    /// `"bulk"`, toward `level` (0 to 3) for `lease_secs`, renewed by calling
+    /// again. Returns the level in force. It rises one step per 10 s, falls one
+    /// per 30 s, and falls on its own when the lease runs out. The levers read
+    /// back in `load_ledger_json`. Raises `ValueError` on another spelling.
+    fn pull_shed_lever(&self, lever: &str, level: u8, lease_secs: f64) -> PyResult<u8> {
+        let l = crate::ShedLever::parse(lever).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "bad_shed_lever: {lever:?} is not walk, page or bulk"
+            ))
+        })?;
+        let lease = std::time::Duration::try_from_secs_f64(lease_secs)
+            .map_err(|e| PyValueError::new_err(format!("bad_lease: {e}")))?;
+        Ok(self.inner.pull_shed_lever(l, level, lease))
+    }
+
     /// `FSD/CIRIS_MESH.md` §7.2 — the service tier this node runs at: 0 full
     /// ops, 1 audio and files, 2 chat and contacts.
     fn service_tier(&self) -> u8 {

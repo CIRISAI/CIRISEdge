@@ -2282,6 +2282,28 @@ impl Edge {
         tier
     }
 
+    /// **Pull a shed lever** (`FSD/CIRIS_MESH.md` §7.7): toward `level` for
+    /// `lease`, renewed by calling again. Edge decides nothing here: the host
+    /// reads the gauges and pulls. It moves one step per
+    /// [`crate::load_levers::RAISE_STEP`], so ask and renew; a lease not
+    /// renewed walks back to serving, one step per
+    /// [`crate::load_levers::RELEASE_STEP`], and `level` 0 releases at the
+    /// same pace. Returns the level in force.
+    pub fn pull_shed_lever(
+        &self,
+        lever: crate::ShedLever,
+        level: u8,
+        lease: std::time::Duration,
+    ) -> u8 {
+        self.metrics.telemetry.levers.pull(lever, level, lease)
+    }
+
+    /// The shed levers as they stand.
+    #[must_use]
+    pub fn shed_levers(&self) -> Vec<crate::LeverStatus> {
+        self.metrics.telemetry.levers.status()
+    }
+
     /// The service tier this node runs at (`FSD/CIRIS_MESH.md` §7.2):
     /// `FullOps` (0), `AudioAndFiles` (1), `ChatAndContacts` (2). Folds in
     /// the transport's forwarded-load signal (`edge:transit_pps`) first.
@@ -2317,7 +2339,14 @@ impl Edge {
         #[cfg(feature = "_reticulum-module")]
         if let Some(t) = self.reticulum_transport.as_ref() {
             let load = t.forward_load();
+            let forward = t.forward_admission().counts();
             return crate::observability::LoadLedger {
+                forward: crate::observability::LoadLedgerForward {
+                    admitted: forward.admitted,
+                    refused_capacity: forward.refused_capacity,
+                    live: forward.live,
+                },
+                levers: self.shed_levers(),
                 tier: self.load_ladder.tier().as_u8(),
                 transit_pps: load.pps,
                 transit_bps: load.bps,
@@ -2346,6 +2375,7 @@ impl Edge {
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v))
                 .collect(),
+            levers: self.shed_levers(),
             ..crate::observability::LoadLedger::default()
         }
     }
@@ -9082,16 +9112,19 @@ impl EdgeBuilder {
         // reads at decision time: the roster and the owner's devices from the
         // directory, the send set from whichever bridge is installed then.
         #[cfg(feature = "_reticulum-module")]
+        let mut peer_obligations: Option<Arc<crate::peer_obligation::LivePeerObligations>> = None;
         if let (Some(t), Some(directory)) = (
             self.reticulum_transport.as_ref(),
             self.federation_directory.as_ref(),
         ) {
-            t.install_peer_obligations(Arc::new(crate::peer_obligation::LivePeerObligations::new(
+            let reader = Arc::new(crate::peer_obligation::LivePeerObligations::new(
                 Arc::clone(directory),
                 t.occurrence_key_id(),
                 Arc::clone(&canonical_peers),
                 Arc::new(InstalledSendSet(Arc::clone(&introduction_bridge))),
-            )));
+            ));
+            t.install_peer_obligations(Arc::clone(&reader) as _);
+            peer_obligations = Some(reader);
         }
 
         // CIRISEdge#809 — every transport counts into THIS edge's metrics
@@ -9126,6 +9159,9 @@ impl EdgeBuilder {
             }
         }
         let metrics = preattached.unwrap_or_default();
+        if let Some(reader) = peer_obligations {
+            metrics.telemetry.levers.install_obligations(reader);
+        }
         for transport in &self.transports {
             transport.attach_metrics(metrics.clone());
         }

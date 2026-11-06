@@ -291,6 +291,25 @@ pub struct PullConfig {
 /// chunk count at `files::publish`'s segment size.
 pub const DEFAULT_DAG_ADOPT_BATCH_CHUNKS: usize = 16;
 
+/// Move `held` toward `want` permits kept out of `limiter`: taking every free
+/// one it can, and giving back at most one a call, so a release is paced by
+/// the caller's tick. A permit in use is never taken.
+pub(crate) fn hold_back(
+    limiter: &Arc<tokio::sync::Semaphore>,
+    held: &mut Vec<tokio::sync::OwnedSemaphorePermit>,
+    want: usize,
+) {
+    while held.len() < want {
+        let Ok(permit) = Arc::clone(limiter).try_acquire_owned() else {
+            break;
+        };
+        held.push(permit);
+    }
+    if held.len() > want {
+        held.pop();
+    }
+}
+
 /// CIRISEdge#763 — the default durability pass cadence (see
 /// [`PullConfig::durability_interval`]): well inside the 24 h re-file horizon
 /// ([`CUSTODY_REFRESH`](super::durability::CUSTODY_REFRESH)), and often
@@ -1610,6 +1629,13 @@ where
         // is skipped. Its repairs are dispatched here when it finishes.
         let mut sweep_task: Option<tokio::task::JoinHandle<super::durability::DurabilitySweep>> =
             None;
+        // FSD CIRIS_MESH §7.7 — the host's bulk lever. Permits held back from
+        // the limiter, so no pull is cancelled or refused: one in flight
+        // finishes and the next waits. A release gives one back a tick, and a
+        // pull waiting on its permit has spent no attempt, so nothing retries.
+        let mut held_back: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
+        let mut durability_ticks: u64 = 0;
+        let max = self.config.max_in_flight.max(1);
         loop {
             tokio::select! {
                 () = async {
@@ -1618,7 +1644,9 @@ where
                         None => std::future::pending::<()>().await,
                     }
                 } => {
-                    if sweep_task.is_none() {
+                    durability_ticks += 1;
+                    let every = self.edge.metrics().telemetry.levers.durability_every();
+                    if sweep_task.is_none() && durability_ticks % every == 0 {
                         let me = Arc::clone(&self);
                         sweep_task = Some(tokio::spawn(async move { me.durability_sweep().await }));
                     }
@@ -1648,6 +1676,8 @@ where
                     }
                 }
                 _ = tick.tick() => {
+                    let allowed = self.edge.metrics().telemetry.levers.bulk_in_flight(max);
+                    hold_back(&limiter, &mut held_back, max - allowed);
                     for r in self.due_retries() {
                         self.dispatch(&limiter, r.row, r.sha, r.attempts);
                     }
@@ -4056,6 +4086,41 @@ where
                 PullOutcome::StoreFailed(e.to_string())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hold_back_tests {
+    use super::hold_back;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    /// The bulk lever takes only free permits, so nothing running is cancelled
+    /// and nothing retries, and it gives them back one a tick.
+    #[test]
+    fn permits_are_held_back_from_what_is_free_and_returned_one_a_tick() {
+        let limiter = Arc::new(Semaphore::new(4));
+        let running = Arc::clone(&limiter).try_acquire_owned().expect("one runs");
+        let mut held = Vec::new();
+
+        hold_back(&limiter, &mut held, 8);
+        assert_eq!(held.len(), 3, "never more than is free");
+        assert_eq!(limiter.available_permits(), 0);
+        drop(running);
+        hold_back(&limiter, &mut held, 3);
+        assert_eq!(held.len(), 3);
+        assert_eq!(
+            limiter.available_permits(),
+            1,
+            "the pull's end frees a slot"
+        );
+
+        let mut free = Vec::new();
+        for _ in 0..4 {
+            hold_back(&limiter, &mut held, 0);
+            free.push(limiter.available_permits());
+        }
+        assert_eq!(free, vec![2, 3, 4, 4], "a release is paced, one a tick");
     }
 }
 

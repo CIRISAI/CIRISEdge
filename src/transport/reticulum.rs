@@ -2556,6 +2556,8 @@ pub struct ReticulumTransport {
     /// [`AnnounceCtx`]. `None` (the default) keeps every pre-#530 construction
     /// site compiling unchanged and leaves intake evictions loud-but-uncounted.
     metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
+    /// Test seam — a dial's establish budget in ms, 0 for the real one.
+    test_establish_budget_ms: std::sync::atomic::AtomicU64,
     /// v44 — the node's ladder ([`Transport::attach_load_ladder`]): the node
     /// tick folds edge's own signals and moves the shapers and admission.
     load_ladder: std::sync::OnceLock<Arc<crate::load_ladder::SharedLadder>>,
@@ -4136,6 +4138,7 @@ impl ReticulumTransport {
             config,
             // CIRISEdge#530 — off by default; attach with `with_metrics`.
             metrics: std::sync::OnceLock::new(),
+            test_establish_budget_ms: std::sync::atomic::AtomicU64::new(0),
             load_ladder: std::sync::OnceLock::new(),
             metrics_source: {
                 static NEXT_METRICS_SOURCE: std::sync::atomic::AtomicU64 =
@@ -4661,6 +4664,15 @@ impl ReticulumTransport {
     pub fn drop_next_inbound_link_established_for_test(&self) {
         self.swallow_link_established
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test seam — a dial's establish budget, in place of the real one.
+    #[doc(hidden)]
+    pub fn set_establish_budget_for_test(&self, budget: Option<Duration>) {
+        self.test_establish_budget_ms.store(
+            budget.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// CIRISEdge#853 test seam — close `link` at the node and DROP the
@@ -6827,12 +6839,12 @@ impl ReticulumTransport {
             .clone()
     }
 
-    /// ALM stage 2 (`FSD/CIRIS_MESH.md` §7) — the service tier: forwarded
-    /// links close to new admissions at tier ≥ 1, and so do shaped slots for
-    /// peers this node owes nothing; tier 2 sheds those links and pauses their
-    /// slow path (`FSD/PRIVACY_MODES.md` §6.12). Cover is not shed.
+    /// ALM stage 2 (`FSD/CIRIS_MESH.md` §7) — the service tier: shaped slots
+    /// close to new peers this node owes nothing at tier ≥ 1; tier 2 sheds
+    /// those links and pauses their slow path (`FSD/PRIVACY_MODES.md` §6.12).
+    /// Cover is not shed, and forwarding does not follow the tier: a canonical
+    /// is the last relay tier.
     pub fn set_service_tier(&self, tier: crate::load_ladder::ServiceTier) {
-        self.forward_admission.set_tier(tier);
         self.shapers.set_service_tier(tier);
     }
 
@@ -8279,6 +8291,7 @@ impl ReticulumTransport {
             return Err(refused);
         }
         if !matches!(outcome, Some(Ok(()))) {
+            ctx.abandon_dial(link_id).await;
             return Err(TransportError::Timeout(timeout));
         }
         // CIRISEdge#867 — bind everything below to the link's wire id.
@@ -9598,6 +9611,13 @@ impl ReticulumTransport {
         } else {
             NO_PATH_ESTABLISH_TIMEOUT
         };
+        let establish_timeout = match self
+            .test_establish_budget_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => establish_timeout,
+            ms => Duration::from_millis(ms),
+        };
 
         // ── CIRISEdge#532: REUSE BEFORE DIALING ──────────────────────────────
         // A live, identified link to this dest is a finished handshake. Sending
@@ -10685,9 +10705,12 @@ impl Transport for ReticulumTransport {
             let node_w = Arc::downgrade(&self.node);
             let fa = Arc::clone(&self.forward_admission);
             let out = Arc::clone(&self.forward_load);
+            let metrics = self.metrics.get().cloned();
+            let ladder = self.load_ladder.get().cloned();
             tokio::spawn(async move {
                 let t0 = std::time::Instant::now();
                 let mut tick = tokio::time::interval(Duration::from_secs(1));
+                let mut told = 0;
                 loop {
                     tick.tick().await;
                     let Some(node) = node_w.upgrade() else { return };
@@ -10695,6 +10718,11 @@ impl Transport for ReticulumTransport {
                     drop(node);
                     let now = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let load = fa.refresh(&links, now);
+                    let counts = fa.counts();
+                    told = say_forward_refusals(counts, told, ladder.as_deref(), &fa);
+                    if let Some(m) = &metrics {
+                        m.telemetry.set_forward(counts, &load);
+                    }
                     *out.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = load;
                 }
@@ -10797,12 +10825,35 @@ fn mirror_planes(node: &ReticulumNode, metrics: &crate::observability::EdgeMetri
     );
 }
 
+/// `FSD/CIRIS_MESH.md` §7.7 — a forwarded link this node refused is a dial
+/// that failed somewhere else, so every move of the count is said, once, off
+/// the node lock. Returns the count it has told.
+fn say_forward_refusals(
+    counts: crate::transport::relay_tier::ForwardCounts,
+    told: u64,
+    ladder: Option<&crate::load_ladder::SharedLadder>,
+    fa: &crate::transport::relay_tier::ForwardAdmission,
+) -> u64 {
+    let refused = counts.refused_capacity;
+    if refused > told {
+        tracing::info!(
+            delta = refused - told,
+            reason = crate::observability::FORWARD_REFUSED_CAPACITY,
+            tier = ladder.map_or(0, |l| l.tier().as_u8()),
+            cause = "configured_link_bound",
+            live = counts.live,
+            limit = ?fa.link_limit(),
+            "forward admission refused link requests"
+        );
+    }
+    refused
+}
+
 /// What the node tick reads and moves.
 struct NodeTick {
     node: std::sync::Weak<ReticulumNode>,
     seals: Arc<crate::transport::link_seal::LinkSeals>,
     shapers: Arc<crate::transport::link_shaping::LinkShapers>,
-    forward_admission: Arc<crate::transport::relay_tier::ForwardAdmission>,
     forward_load: Arc<std::sync::Mutex<crate::transport::relay_tier::ForwardLoad>>,
     ladder: Option<Arc<crate::load_ladder::SharedLadder>>,
     metrics: Option<crate::observability::EdgeMetrics>,
@@ -10825,7 +10876,6 @@ impl NodeTick {
             ..crate::load_ladder::EdgeLoadSignals::default()
         });
         if tier != self.shapers.service_tier() {
-            self.forward_admission.set_tier(tier);
             self.shapers.set_service_tier(tier);
         }
     }
@@ -10859,6 +10909,8 @@ impl NodeTick {
         };
         if let Some(m) = &self.metrics {
             m.telemetry.beat(LoopName::Ladder);
+            // A lease that ran out is said here, with nothing else reading it.
+            let _ = m.telemetry.levers.status();
             self.publish(m, &node);
         }
         true
@@ -10895,7 +10947,6 @@ impl ReticulumTransport {
             node: Arc::downgrade(&self.node),
             seals: Arc::clone(&self.seals),
             shapers: Arc::clone(&self.shapers),
-            forward_admission: Arc::clone(&self.forward_admission),
             forward_load: Arc::clone(&self.forward_load),
             ladder: self.load_ladder.get().cloned(),
             metrics: self.metrics.get().cloned(),
@@ -12710,6 +12761,13 @@ impl DialCtx {
         Ok(())
     }
 
+    /// Close a dial that did not establish in its budget. `close_link`
+    /// resolves a re-keyed id, is a no-op on a link already gone, and its
+    /// `LinkClosed` lets go of every per-link record.
+    async fn abandon_dial(&self, link_id: LinkId) {
+        let _ = self.node.close_link(&link_id).await;
+    }
+
     /// Close a link whose seal was refused: it is marked refused first, so
     /// nothing is sealed for it while the close is in flight.
     async fn close_refused(&self, link_id: LinkId) {
@@ -13194,6 +13252,11 @@ impl DialCtx {
         }
         let established_ok = matches!(outcome, Some(Ok(())));
         if !established_ok {
+            // A timed-out dial leaves a pending link behind it, and the peer's
+            // proof may still be on its way. Nothing here will key it, so it
+            // is closed: left alone it would establish unkeyed, with the next
+            // dial's frames looking for a seal it never got.
+            self.abandon_dial(link_id).await;
             // CIRISEdge#336 — a no-path target that never established is
             // un-routable, not slow: fail fast with the self-diagnosing error
             // (naming target dest, key_id, and the paths we DO hold — the

@@ -139,8 +139,22 @@ counts handshakes whose link closed in the queue: they cost no crypto.
 4. Did shedding work: `load_shed:shaped`, `load_shed:bulk` and
    `load_refuse:admit_closed` in `link_shaping`, then `load_tier` falling.
 
-The tier reaches the shapers and forward admission on a one-second tick, so edge
-needs no host read to act on its own signals, and the cooldowns run on that tick.
+The tier reaches the shapers on a one-second tick, so edge needs no host read to
+act on its own signals, and the cooldowns run on that tick. A host verdict not
+renewed in 30 s lapses to normal. The tier does not close forwarding.
+
+### What is a relay refusing, and what has the host shed?
+
+1. `forward_refusals_total{load_refuse:capacity}` against `forward_admitted_total`:
+   the only refusal left is a configured link bound, and each move of it is an
+   INFO line, `forward admission refused link requests`, with `delta`, `reason`,
+   `tier` and `cause`. Non-zero with no bound configured is a bug.
+2. `forward_links_live`, `forward_packets_per_second`, `forward_bits_per_second`.
+3. `load_lever_level{walk,page,bulk}`, and `load_lever_lease_seconds`: a level
+   above 0 with a lease of 0 means the host stopped renewing and the lever is
+   walking home.
+4. `load_lever_changes_total{lever:cause}`, and the INFO line `load lever moved`.
+   `lease_expired` with a live server means its renewal is too slow.
 
 ### Is shaped traffic within budget, by class?
 
@@ -307,6 +321,14 @@ to it, and a 1 is not visible from anywhere else.
 | `load_host_pressure` | `ciris.edge.load.host_pressure` | gauge | count | operator-only |
 | `load_pressure_report_age_seconds` | `ciris.edge.load.pressure_report_age` | gauge | seconds | operator-only |
 | `load_tier_changes_total` | `ciris.edge.load.tier_changes` | counter | count | operator-only |
+| `load_lever_level` | `ciris.edge.load.lever.level` | gauge | count | operator-only |
+| `load_lever_lease_seconds` | `ciris.edge.load.lever.lease` | gauge | seconds | operator-only |
+| `load_lever_changes_total` | `ciris.edge.load.lever.changes` | counter | count | operator-only |
+| `forward_links_live` | `ciris.edge.forward.links` | gauge | count | operator-only |
+| `forward_admitted_total` | `ciris.edge.forward.admitted` | counter | count | operator-only |
+| `forward_refusals_total` | `ciris.edge.forward.refused` | counter | count | operator-only |
+| `forward_packets_per_second` | `ciris.edge.forward.packets` | gauge | count | operator-only |
+| `forward_bits_per_second` | `ciris.edge.forward.bits` | gauge | count | operator-only |
 | `shaping_enabled` | `ciris.edge.shaping.enabled` | gauge | count | operator-only |
 | `shaping_links` | `ciris.edge.shaping.links` | gauge | count | operator-only |
 | `shaping_free_slots` | `ciris.edge.shaping.free_slots` | gauge | count | operator-only |

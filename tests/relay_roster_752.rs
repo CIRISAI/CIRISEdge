@@ -939,6 +939,35 @@ async fn a_stranger_lists_a_relays_published_device_under_its_owner_752() {
     );
 }
 
+/// `FSD/CIRIS_MESH.md` §7.7 (CC 5.4.6) — **the claims that answer first contact
+/// are served at the relay's worst.** The same stranger, the same rows, with the
+/// relay at tier 2 and every lever at the top: serving them is what the
+/// minimum viable role is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_at_the_top_tier_with_every_lever_pulled_serves_first_contact() {
+    init_tracing();
+    let f = fixture(0x10, true).await;
+    f.c.transport
+        .set_service_tier(ciris_edge::ServiceTier::ChatAndContacts);
+    let levers = &f.c.metrics.telemetry.levers;
+    levers.set_steps(Duration::ZERO, Duration::from_secs(30));
+    for lever in ciris_edge::ShedLever::ALL {
+        for _ in 0..3 {
+            levers.pull(lever, 3, Duration::from_secs(300));
+        }
+    }
+    let r = &f.roster;
+    let listed = drive_until(&[&f.rt_x, &f.rt_c], Duration::from_secs(240), || async {
+        f.x.holds_key(&r.d).await
+            && f.x.holds_key(&r.o).await
+            && f.x.holds(&r.announced).await
+            && f.x.holds_occurrence(&r.o, &r.d).await
+            && f.x.lists_under(&r.o).await.contains(&r.d.key_id)
+    })
+    .await;
+    assert!(listed, "first contact is served at every tier and lever");
+}
+
 /// Selector unset ⇒ #671 exactly: the stranger receives the relay's own
 /// allegiance facts (the positive control that the pair is talking) and
 /// nothing about O's devices — no key, no binding, no roster entry.

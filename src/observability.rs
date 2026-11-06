@@ -1038,7 +1038,26 @@ pub struct LoadLedger {
     pub transit: Vec<LoadLedgerEntry>,
     /// The ladder's token counters (`load_tier:*` and their causes).
     pub counters: std::collections::BTreeMap<String, u64>,
+    /// What this node forwards for others.
+    pub forward: LoadLedgerForward,
+    /// The host's shed levers (`FSD/CIRIS_MESH.md` §7.7).
+    pub levers: Vec<crate::load_levers::LeverStatus>,
 }
+
+/// The forwarding half of the `load_ledger`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LoadLedgerForward {
+    /// Forwarded links admitted.
+    pub admitted: u64,
+    /// Link requests refused at a configured bound.
+    pub refused_capacity: u64,
+    /// Forwarded links now.
+    pub live: u64,
+}
+
+/// `FSD/CIRIS_MESH.md` §7.7 — a link request refused at the configured link
+/// bound. The one refusal of a forwarded link: the service tier makes none.
+pub const FORWARD_REFUSED_CAPACITY: &str = "load_refuse:capacity";
 
 // ─── CC 5.3.3.5 E1 — `EdgeMetrics::link_seal` labels ─────────────────
 //
@@ -3792,6 +3811,14 @@ impl EdgeMetrics {
             load_host_pressure: t.load_host_pressure,
             load_pressure_report_age_seconds: t.load_pressure_report_age_seconds,
             load_tier_changes_total: t.load_tier_changes_total,
+            load_lever_level: t.load_lever_level,
+            load_lever_lease_seconds: t.load_lever_lease_seconds,
+            load_lever_changes_total: t.load_lever_changes_total,
+            forward_links_live: t.forward_links_live,
+            forward_admitted_total: t.forward_admitted_total,
+            forward_refusals_total: t.forward_refusals_total,
+            forward_packets_per_second: t.forward_packets_per_second,
+            forward_bits_per_second: t.forward_bits_per_second,
             shaping_enabled: t.shaping_enabled,
             shaping_links: t.shaping_links,
             shaping_free_slots: t.shaping_free_slots,
@@ -4199,6 +4226,22 @@ pub struct EdgeMetricsBundle {
     pub load_pressure_report_age_seconds: f64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub load_tier_changes_total: HashMap<String, u64>,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_lever_level: HashMap<String, u64>,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_lever_lease_seconds: HashMap<String, u64>,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_lever_changes_total: HashMap<String, u64>,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub forward_links_live: u64,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub forward_admitted_total: u64,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub forward_refusals_total: HashMap<String, u64>,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub forward_packets_per_second: u64,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub forward_bits_per_second: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub shaping_enabled: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
@@ -4662,6 +4705,10 @@ impl EdgeMetricsBundle {
             ("seal_keyer_workers", &self.seal_keyer_workers),
             ("replication_reply_queued", &self.replication_reply_queued),
             ("load_tier_changes_total", &self.load_tier_changes_total),
+            ("load_lever_level", &self.load_lever_level),
+            ("load_lever_lease_seconds", &self.load_lever_lease_seconds),
+            ("load_lever_changes_total", &self.load_lever_changes_total),
+            ("forward_refusals_total", &self.forward_refusals_total),
             ("shaping_links", &self.shaping_links),
             (
                 "shaping_frames_real_windowed",
@@ -4685,6 +4732,13 @@ impl EdgeMetricsBundle {
             ("seal_held_bytes", self.seal_held_bytes),
             ("load_tier", self.load_tier),
             ("load_host_pressure", self.load_host_pressure),
+            ("forward_links_live", self.forward_links_live),
+            ("forward_admitted_total", self.forward_admitted_total),
+            (
+                "forward_packets_per_second",
+                self.forward_packets_per_second,
+            ),
+            ("forward_bits_per_second", self.forward_bits_per_second),
             ("shaping_enabled", self.shaping_enabled),
             ("shaping_free_slots", self.shaping_free_slots),
             ("leviculum_shed_packets", self.leviculum_shed_packets),
@@ -4838,6 +4892,14 @@ edge_metrics_bundle_fields!(
     load_host_pressure,
     load_pressure_report_age_seconds,
     load_tier_changes_total,
+    load_lever_level,
+    load_lever_lease_seconds,
+    load_lever_changes_total,
+    forward_links_live,
+    forward_admitted_total,
+    forward_refusals_total,
+    forward_packets_per_second,
+    forward_bits_per_second,
     shaping_enabled,
     shaping_links,
     shaping_free_slots,
