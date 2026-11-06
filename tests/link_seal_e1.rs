@@ -2804,12 +2804,17 @@ async fn a_superseded_binding_gives_no_standing_after_a_restart() {
     let (b, metrics) = restart_b(&t).await;
     b.set_stranger_handshake_cap_for_test(0);
     b.set_seats_for_test(std::iter::once(t.c.key.key_id.clone()).collect(), false);
-    b.inject_advisory_peer_with_transport_identity_for_test(
+    b.inject_advisory_peer_at_epoch_for_test(
         &t.c.key.key_id,
         t.a.transport.local_named_dest_hash(),
         t.a.transport.local_transport_pubkey(),
+        1,
     )
     .await;
+    // C speaks again. Its announce is epoch 0, and at an equal epoch an owner's
+    // reroute heals (#336): the newer word has to be newer.
+    t.c.transport.set_unannounced_for_test(false);
+    tokio::time::sleep(Duration::from_secs(12)).await;
     let b_dest = b.local_named_dest_hash();
     assert!(
         wait_until(Duration::from_secs(30), || async {

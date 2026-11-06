@@ -7766,6 +7766,24 @@ impl ReticulumTransport {
         dest_hash: [u8; 16],
         transport_pubkey64: [u8; 64],
     ) {
+        self.inject_advisory_peer_at_epoch_for_test(
+            destination_key_id,
+            dest_hash,
+            transport_pubkey64,
+            0,
+        )
+        .await;
+    }
+
+    /// As above, at a chosen epoch: the binding an older announce cannot move.
+    #[doc(hidden)]
+    pub async fn inject_advisory_peer_at_epoch_for_test(
+        &self,
+        destination_key_id: &str,
+        dest_hash: [u8; 16],
+        transport_pubkey64: [u8; 64],
+        epoch: u64,
+    ) {
         let x25519: [u8; 32] = transport_pubkey64[..32].try_into().unwrap_or([0u8; 32]);
         let ed25519: [u8; 32] = transport_pubkey64[32..].try_into().unwrap_or([0u8; 32]);
         let transport_identity_hash =
@@ -7778,7 +7796,7 @@ impl ReticulumTransport {
                     dest_hash: DestinationHash::new(dest_hash),
                     transport_ed25519: ed25519,
                 },
-                epoch: 0,
+                epoch,
                 chain: None,
                 provenance: ciris_persist::federation::self_at_login::BindingProvenance::Advisory,
                 transport_identity_hash,
