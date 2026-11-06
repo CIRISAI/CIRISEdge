@@ -239,6 +239,9 @@ pub struct ReplicationCoordinator {
     /// tasks; the mutex serializes them — anti-entropy is sequential
     /// per peer-pair by protocol).
     session: Mutex<Session>,
+    /// How many empty `Diff`s the peer has sent: each is its word that it
+    /// holds, or will not ask for, everything this node offered it.
+    peer_lacks_nothing: std::sync::atomic::AtomicU64,
     /// CIRISEdge#634 — the role-specific inbox. A responder has a standing
     /// bounded inbox its driver drains continuously; an initiator has a
     /// round inbox that lives exactly as long as the driven round, plus an
@@ -342,6 +345,7 @@ impl ReplicationCoordinator {
             provider,
             applier,
             session: Mutex::new(Session::new(role, kind)),
+            peer_lacks_nothing: std::sync::atomic::AtomicU64::new(0),
             inbox,
             pull_exchanges: std::sync::Mutex::new(HashMap::new()),
             pull_retry_at_secs: AtomicU64::new(0),
@@ -789,6 +793,9 @@ impl ReplicationCoordinator {
                     }
                 }
                 self.note_removal_ack(&m);
+                if matches!(&m, ReplicationMessage::Diff(d) if d.want.is_empty()) {
+                    self.peer_lacks_nothing.fetch_add(1, Ordering::AcqRel);
+                }
                 session
                     .on_message(
                         m,
@@ -864,6 +871,11 @@ impl ReplicationCoordinator {
     /// when fanning round cadence across (peer × kind) pairs.
     pub fn kind(&self) -> EnvelopeKind {
         self.kind
+    }
+
+    /// [`Self::peer_lacks_nothing`]'s count so far.
+    pub(crate) fn peer_lacks_nothing(&self) -> u64 {
+        self.peer_lacks_nothing.load(Ordering::Acquire)
     }
 
     /// The peer identity this coordinator is bound to. Fixed at

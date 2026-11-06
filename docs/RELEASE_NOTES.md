@@ -17,7 +17,8 @@ v22.0.0, leviculum v0.33.0+ciris.1.
   - **A contact, or a seat and a node that is not one,** is then offered of the walk only what is
     required or appropriate and live: the family's own `Global` or capability tier, the accord family,
     rows `may_receive` gives it as its own, about it or in its cohort, rows of a public group it
-    belongs to, what a stranger is handed, tombstones, a duty's appointments, and the class a grant
+    belongs to, what a stranger is handed, tombstones, a duty's appointments, a root's charter, and the
+    class a grant
     names, of this node's own rows.
   - **Nothing else changed.** A person's own nodes are not contacts. The fetch twin and the subject
     Pull are untouched: a row not offered, a superseded row included, moves on request. The key,
@@ -33,7 +34,14 @@ v22.0.0, leviculum v0.33.0+ciris.1.
   unchanged.
 - **A round that fails says why.** `anti-entropy round ended` carries `outcome` and `error`, and the
   no-route, coordinator and closed-inbound paths log at INFO, at most once per `(peer, kind)` in five
-  minutes. Rounds behave as before.
+  minutes. `replication_round_outcomes_total` gains `no_route`: an offline client is no longer booked
+  as `error`. Rounds behave as before.
+- **A new peer's first Attestation round is not lost to attribution.** It left with the bootstrap
+  planes, the peer dropped frames it could not attribute until A's route row landed, and A sat out
+  the round timeout: 11 s of contact on the rig. The round now waits until the peer's empty `Diff`
+  says it lacks nothing on Key, IdentityOccurrence and TransportDestination, asked in that order,
+  for at most five seconds. A round's end was not enough: the peer had refused the route for a key
+  still landing. The round timeout is unchanged.
 - **The retired-plane line logs at debug at the hot-add door,** which a host's reconcile can reach
   on every pass. Nothing was scheduled either way.
 - **Tests.** The superseded-binding witness injects a binding newer than the announce it outranks,

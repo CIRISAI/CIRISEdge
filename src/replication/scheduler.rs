@@ -514,6 +514,70 @@ struct CoordControl {
     kick: Arc<tokio::sync::Notify>,
 }
 
+/// The planes a peer must hold before it can attribute this node's frames, in
+/// the order they land: a route row is refused until its signer's key is held.
+/// Their frames are admitted unattributed (#402).
+const BOOTSTRAP_ORDER: [EnvelopeKind; 3] = [
+    EnvelopeKind::Key,
+    EnvelopeKind::IdentityOccurrence,
+    EnvelopeKind::TransportDestination,
+];
+
+/// How long a new peer's first Attestation round waits for [`BOOTSTRAP_ORDER`].
+/// Past it the round runs: a plane that cannot land costs what it always did.
+const BOOTSTRAP_HOLD: Duration = Duration::from_secs(5);
+
+/// How often a held Attestation round looks, and asks the plane again. It also
+/// lets a host finish adding a peer's planes.
+const BOOTSTRAP_LOOK: Duration = Duration::from_millis(250);
+
+/// The running [`BOOTSTRAP_ORDER`] coordinators, for a held Attestation round.
+type BootstrapPlanes = Arc<
+    std::sync::Mutex<
+        HashMap<(String, EnvelopeKind), (Arc<ReplicationCoordinator>, Arc<tokio::sync::Notify>)>,
+    >,
+>;
+
+/// **A new peer's first Attestation round waits until the peer can read it.**
+/// It cannot attribute a frame until it holds this node's route row, and it
+/// drops what it cannot attribute (`SkippedNoSourceKeyId`), which costs a whole
+/// round timeout. Started with the bootstrap planes, that round is lost.
+///
+/// A round's end does not say the peer holds the row: the row may have been
+/// refused for a key still on its way. An empty `Diff` does, on the peer's own
+/// word, so each plane is asked until the peer lacks nothing of it, in order,
+/// since a route refused for its key is out of the `Diff` until the key lands.
+/// Bounded by [`BOOTSTRAP_HOLD`]. A peer with none of these planes has no wait.
+async fn hold_for_bootstrap(coord: &ReplicationCoordinator, planes: &BootstrapPlanes) {
+    if coord.kind() != EnvelopeKind::Attestation {
+        return;
+    }
+    tokio::time::sleep(BOOTSTRAP_LOOK).await;
+    let deadline = tokio::time::Instant::now() + BOOTSTRAP_HOLD - BOOTSTRAP_LOOK;
+    for kind in BOOTSTRAP_ORDER {
+        let plane = planes.lock().ok().and_then(|p| {
+            p.get(&(coord.peer_key_id().to_owned(), kind))
+                .map(|(c, k)| (Arc::clone(c), Arc::clone(k)))
+        });
+        let Some((plane, kick)) = plane else {
+            continue;
+        };
+        let seen = plane.peer_lacks_nothing();
+        while plane.peer_lacks_nothing() == seen {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::info!(
+                    waiting_on = ?kind,
+                    "first Attestation round not held past the bound: the peer has not \
+                     confirmed this plane"
+                );
+                return;
+            }
+            kick.notify_one();
+            tokio::time::sleep(BOOTSTRAP_LOOK).await;
+        }
+    }
+}
+
 /// External handle for mutating a running scheduler's Initiator set.
 ///
 /// Acquired via [`ReplicationScheduler::install_control_channel`]
@@ -871,6 +935,7 @@ impl ReplicationScheduler {
 
         let mesh_config = self.mesh_config.take();
         let metrics = self.metrics.take();
+        let bootstrap = BootstrapPlanes::default();
         for coord in self.coordinators.drain(..) {
             note_driven(&self.driven, &coord);
             spawn_coord(
@@ -884,6 +949,7 @@ impl ReplicationScheduler {
                 Arc::clone(&round_gate),
                 Arc::clone(&backoff),
                 metrics.clone(),
+                Arc::clone(&bootstrap),
             );
         }
 
@@ -928,6 +994,7 @@ impl ReplicationScheduler {
                                 Arc::clone(&round_gate),
                                 Arc::clone(&backoff),
                                 metrics.clone(),
+                                Arc::clone(&bootstrap),
                             );
                         }
                         SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
@@ -938,6 +1005,9 @@ impl ReplicationScheduler {
                                 &peer_key_id,
                                 kind,
                             );
+                            if let Ok(mut planes) = bootstrap.lock() {
+                                planes.remove(&(peer_key_id, kind));
+                            }
                         }
                         SchedulerCommand::RoundNow { peer_key_id } => {
                             round_now_kick(&per_coord, peer_key_id.as_deref());
@@ -991,6 +1061,7 @@ fn spawn_coord(
     round_gate: Arc<RoundGate>,
     backoff: Arc<NoRouteBackoff>,
     metrics: Option<crate::observability::EdgeMetrics>,
+    bootstrap: BootstrapPlanes,
 ) {
     debug_assert_eq!(
         coord.role(),
@@ -1007,6 +1078,14 @@ fn spawn_coord(
             kick: Arc::clone(&kick),
         },
     );
+    if BOOTSTRAP_ORDER.contains(&coord.kind()) {
+        if let Ok(mut planes) = bootstrap.lock() {
+            planes.insert(
+                (coord.peer_key_id().to_owned(), coord.kind()),
+                (Arc::clone(&coord), Arc::clone(&kick)),
+            );
+        }
+    }
     let h = tokio::spawn(async move {
         run_one_coordinator_forever(
             coord,
@@ -1019,6 +1098,7 @@ fn spawn_coord(
             round_gate,
             backoff,
             metrics,
+            bootstrap,
         )
         .await;
     });
@@ -1037,7 +1117,17 @@ async fn run_one_coordinator_forever(
     round_gate: Arc<RoundGate>,
     backoff: Arc<NoRouteBackoff>,
     metrics: Option<crate::observability::EdgeMetrics>,
+    bootstrap: BootstrapPlanes,
 ) {
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => {
+            if *cancel.borrow() {
+                return;
+            }
+        }
+        () = hold_for_bootstrap(&coord, &bootstrap) => {}
+    }
     let mut interval = tokio::time::interval(cadence);
     // `Burst` is the default; with `MissedTickBehavior::Skip` a
     // long-delayed task wouldn't fire bursts to catch up. We want

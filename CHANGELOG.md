@@ -14,6 +14,9 @@ Every step of a late subject Pull gets the late window, so a Deliver behind a la
 The retired-plane line logs at debug at the hot-add door. Test fixes and the 44.0.0 notes date.
 `anti-entropy round ended` carries `outcome` and `error`; a failing round says why at INFO, once per
 (peer, kind) in five minutes.
+`replication_round_outcomes_total` gains `no_route`. A new peer's first Attestation round waits for
+the peer to confirm the bootstrap planes, at most five seconds, so a contact no longer loses a round
+timeout to attribution.
 
 ## 44.0.0 — 2026-11-06
 
