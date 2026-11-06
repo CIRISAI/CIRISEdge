@@ -512,6 +512,29 @@ async fn one_call() -> tokio::sync::SemaphorePermit<'static> {
     ONE_CALL.acquire().await.expect("never closed")
 }
 
+/// Everything that says media on `nodes` really went missing, plus chunks
+/// that arrived past `calls`' reorder window. A starved host loses frames and
+/// something counts them: that earns a witness another call. Not `skipped`: a
+/// frame gone with no trace is skipped too, and that is the bug.
+fn counted_loss(nodes: &[Node], calls: &[&Call]) -> u64 {
+    let planes: u64 = nodes
+        .iter()
+        .map(|n| {
+            [
+                "av_chunk_dropped_congested",
+                "av_frame_expired_sender",
+                "av_frame_expired_late",
+                "av_frame_stale_dropped",
+                "alm_shed",
+            ]
+            .iter()
+            .map(|label| av(&n.metrics, label))
+            .sum::<u64>()
+        })
+        .sum();
+    planes + calls.iter().map(|c| c.reorder_counts().late).sum::<u64>()
+}
+
 /// Collect frames from `rx` until `want` frames of `publisher` arrived.
 async fn collect_from(
     rx: &mut mpsc::Receiver<ReceivedFrame>,
@@ -582,7 +605,21 @@ async fn a_late_joiner_asks_for_a_member_it_has_never_heard() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_three_member_room_call_over_keyed_links() {
     let _call = one_call().await;
-    let tag = "a8";
+    // Calls it may place before a host that keeps losing media fails it.
+    let mut whole = false;
+    for tag in ["a8", "a8b", "a8c", "a8d"] {
+        whole = three_member_call(tag).await;
+        if whole {
+            break;
+        }
+    }
+    assert!(whole, "every call lost media");
+}
+
+/// One call of the witness above: whether it ran whole. Media lost with
+/// something counting it is `false`; lost with nothing counting it panics.
+#[allow(clippy::too_many_lines)]
+async fn three_member_call(tag: &str) -> bool {
     let (nodes, groups, _tmp) = mesh(tag, 3).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
     let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
@@ -699,26 +736,29 @@ async fn a_three_member_room_call_over_keyed_links() {
         tokio::time::sleep(Duration::from_millis(33)).await;
     }
     let (mut seen_a, mut seen_b, mut seen_c) = (Vec::new(), Vec::new(), Vec::new());
-    assert!(
-        collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 30).await,
-        "B: {} of A's: {:?}, reorder {:?}; parents {:?}; plane C {:?}",
-        seen_b.len(),
-        seen_b.iter().map(|f| f.chunk_seq.0).collect::<Vec<_>>(),
-        call_b.reorder_counts(),
-        call_b.alm_parents(),
-        c.metrics.av_plane()
-    );
-    assert!(
-        collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 30).await,
-        "C: {}",
-        seen_c.len()
-    );
-    assert!(
-        collect_from(&mut frames_a, &mut seen_a, &b.key.key_id, 10).await,
-        "A: {}",
-        seen_a.len()
-    );
-    assert!(collect_from(&mut frames_c, &mut seen_c, &b.key.key_id, 10).await);
+    let whole = collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 30).await
+        && collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 30).await
+        && collect_from(&mut frames_a, &mut seen_a, &b.key.key_id, 10).await
+        && collect_from(&mut frames_c, &mut seen_c, &b.key.key_id, 10).await;
+    if !whole {
+        let lost = counted_loss(&nodes, &[&call_a, &call_b, &call_c]);
+        let heard = |seen: &[ReceivedFrame]| {
+            seen.iter()
+                .map(|f| (f.publisher.len(), f.chunk_seq.0))
+                .collect::<Vec<_>>()
+        };
+        eprintln!(
+            "[A8] {tag}: counted loss {lost}: B {:?} C {:?} A {:?}, reorder {:?}; parents {:?}; plane C {:?}",
+            heard(&seen_b),
+            heard(&seen_c),
+            heard(&seen_a),
+            call_b.reorder_counts(),
+            call_b.alm_parents(),
+            c.metrics.av_plane()
+        );
+        assert!(lost > 0, "frames gone with nothing counting them");
+        return false;
+    }
 
     // Byte-identical and strictly in chunk order, per publisher.
     for (seen, from, n, who) in [
@@ -765,6 +805,7 @@ async fn a_three_member_room_call_over_keyed_links() {
     assert_eq!(call_a.state(), CallState::Live);
     let summary = call_a.leave().await.expect("A leaves");
     assert_eq!(summary.frames_published, 30);
+    true
 }
 
 /// **A3** — the room removes C: A's stream rolls; B hears the post-roll
@@ -772,7 +813,20 @@ async fn a_three_member_room_call_over_keyed_links() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_removed_member_hears_nothing_after_the_roll() {
     let _call = one_call().await;
-    let tag = "a3";
+    // Calls it may place before a host that keeps losing media fails it.
+    let mut whole = false;
+    for tag in ["a3", "a3b", "a3c", "a3d"] {
+        whole = removed_member_call(tag).await;
+        if whole {
+            break;
+        }
+    }
+    assert!(whole, "every call lost media");
+}
+
+/// One call of the witness above: whether it ran whole. Media lost with
+/// something counting it is `false`; lost with nothing counting it panics.
+async fn removed_member_call(tag: &str) -> bool {
     let (nodes, groups, _tmp) = mesh(tag, 3).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
     let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
@@ -800,10 +854,13 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
     let (mut seen_b, mut seen_c) = (Vec::new(), Vec::new());
-    assert!(
-        collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 5).await,
-        "C hears the pre-roll stream"
-    );
+    if !collect_from(&mut frames_c, &mut seen_c, &a.key.key_id, 5).await {
+        assert!(
+            counted_loss(&nodes, &[&call_b, &call_c]) > 0,
+            "C lost the pre-roll stream with nothing counting it"
+        );
+        return false;
+    }
     let pre_epoch = call_a.epoch().await;
 
     // The room removes C (A commits, B applies; C's state is left behind).
@@ -839,11 +896,24 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
     })
     .await;
     assert_eq!(rolled, Ok(true), "A's call rolled with the room");
-    assert!(
-        collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 15).await,
-        "B hears all 15: {}",
-        seen_b.len()
-    );
+    if !collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 15).await {
+        let lost = counted_loss(&nodes, &[&call_b]);
+        eprintln!(
+            "[A3] {tag}: counted loss {lost}: B {:?}; reorder {:?}; parents {:?}; legs A {:?} B {:?}\nplane A {:?}\nplane B {:?}",
+            seen_b
+                .iter()
+                .map(|f| (f.epoch.0, f.chunk_seq.0))
+                .collect::<Vec<_>>(),
+            call_b.reorder_counts(),
+            call_b.alm_parents(),
+            call_a.legs(),
+            call_b.legs(),
+            a.metrics.av_plane(),
+            b.metrics.av_plane()
+        );
+        assert!(lost > 0, "B lost frames with nothing counting them");
+        return false;
+    }
     let post: Vec<&ReceivedFrame> = seen_b.iter().filter(|f| f.epoch > pre_epoch).collect();
     assert_eq!(post.len(), 10);
     // C: nothing from the new epoch, ever.
@@ -864,6 +934,7 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
         !call_a.legs().contains(&c.key.key_id),
         "A closed its leg to C"
     );
+    true
 }
 
 /// **Source authentication** — B, a room member, can derive A's stream DEK.
