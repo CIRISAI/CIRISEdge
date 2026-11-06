@@ -134,7 +134,7 @@ impl Walk {
             && (self.sweep_now
                 || self
                     .swept_at
-                    .is_none_or(|at| now.saturating_duration_since(at) >= SWEEP_EVERY))
+                    .map_or(true, |at| now.saturating_duration_since(at) >= SWEEP_EVERY))
     }
 }
 
@@ -361,22 +361,21 @@ impl StandingRefresh {
             return;
         }
         let known = if changed { None } else { self.known(walk, key) };
-        let rooted = match known {
-            Some(rooted) => rooted,
-            None => {
-                let rooted = matches!(row.provenance, BindingProvenance::Rooted)
-                    && store_claim_roots_here(rooting, key, policy).await;
-                if !rooted
-                    && !rooting
-                        .hybrid_transport_binding_exists(key, row.dest_hash)
-                        .await
-                {
-                    walk.unproven.insert(key.clone(), now + UNPROVEN_TTL);
-                    self.remove(walk, key);
-                    return;
-                }
-                rooted
+        let rooted = if let Some(rooted) = known {
+            rooted
+        } else {
+            let rooted = matches!(row.provenance, BindingProvenance::Rooted)
+                && store_claim_roots_here(rooting, key, policy).await;
+            if !rooted
+                && !rooting
+                    .hybrid_transport_binding_exists(key, row.dest_hash)
+                    .await
+            {
+                walk.unproven.insert(key.clone(), now + UNPROVEN_TTL);
+                self.remove(walk, key);
+                return;
             }
+            rooted
         };
         // Read last, and only for a row that proved something: the fold and
         // the revocations are a read each, and a row that proved nothing is
@@ -444,7 +443,30 @@ impl StandingRefresh {
                 attestations: Some((from, String::new())),
             };
         }
-        // What changed.
+        if !self.drain_changes(walk, rooting, deadline).await {
+            return PassEnd::Failed;
+        }
+        while let Some(key) = walk.pending.front().cloned() {
+            if Instant::now() >= deadline {
+                return PassEnd::OutOfBudget;
+            }
+            self.rejudge(walk, rooting, policy, &key).await;
+            walk.pending.pop_front();
+            walk.queued.remove(&key);
+            book(obs::PERSISTED_STANDING_CHANGES_JUDGED, 1);
+        }
+        self.sweep_behind(walk, rooting, policy, deadline, book)
+            .await
+    }
+
+    /// Read what changed into the queue. `false`: a read the store did not
+    /// serve, and nobody stands.
+    async fn drain_changes(
+        &self,
+        walk: &mut Walk,
+        rooting: &dyn RootingDirectory,
+        deadline: Instant,
+    ) -> bool {
         while walk.pending.len() < MAX_PENDING {
             let mut cursors = walk.cursors.clone();
             let changes = match rooting.binding_changes(&mut cursors, CHANGE_PAGE).await {
@@ -452,7 +474,7 @@ impl StandingRefresh {
                 Err(error) => {
                     tracing::warn!(%error, "persisted standing: changes could not be read; none stand this pass");
                     self.forget_all(walk);
-                    return PassEnd::Failed;
+                    return false;
                 }
             };
             walk.cursors = cursors;
@@ -471,16 +493,18 @@ impl StandingRefresh {
                 break;
             }
         }
-        while let Some(key) = walk.pending.front().cloned() {
-            if Instant::now() >= deadline {
-                return PassEnd::OutOfBudget;
-            }
-            self.rejudge(walk, rooting, policy, &key).await;
-            walk.pending.pop_front();
-            walk.queued.remove(&key);
-            book(obs::PERSISTED_STANDING_CHANGES_JUDGED, 1);
-        }
-        // The sweep behind.
+        true
+    }
+
+    /// Start the sweep when it is due, and walk it to the deadline.
+    async fn sweep_behind(
+        &self,
+        walk: &mut Walk,
+        rooting: &dyn RootingDirectory,
+        policy: HybridPolicy,
+        deadline: Instant,
+        book: &(impl Fn(&'static str, u64) + Sync),
+    ) -> PassEnd {
         if walk.sweep_due(Instant::now()) {
             let rows = match rooting.live_binding_rows().await {
                 Ok(rows) => rows,
@@ -498,10 +522,7 @@ impl StandingRefresh {
                 rows: rows.into(),
             });
         }
-        loop {
-            let Some(row) = walk.sweep.as_ref().and_then(|s| s.rows.front().cloned()) else {
-                break;
-            };
+        while let Some(row) = walk.sweep.as_ref().and_then(|s| s.rows.front().cloned()) {
             if Instant::now() >= deadline {
                 return PassEnd::OutOfBudget;
             }
