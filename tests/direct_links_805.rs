@@ -2616,3 +2616,134 @@ async fn an_acceptor_sending_during_an_upgrade_starts_no_resource() {
     let m = Box::pin(one_side_moves_the_other_sends("upg-acc", false, false)).await;
     assert!(guarded(&m, "upgrade_guarded_ship") > 0);
 }
+
+/// A/V up to a punched interface, with `B`'s inbound idle bound short. Returns
+/// the trio, the leg's two ends, and the identity link the interface belongs
+/// to: on `B` it is an inbound link that media never touches.
+async fn call_on_a_punched_interface(
+    tag: &str,
+    bound: Duration,
+) -> (
+    Trio,
+    AvSpine,
+    ciris_edge::transport::av_sink::AvLink,
+    ciris_edge::transport::av_sink::AcceptedAvArrival,
+    [u8; 16],
+) {
+    let mut p = trio(tag, proposer(), DirectLinksConfig::default()).await;
+    let mut arrivals = p.b.transport.take_av_arrivals().expect("B's arrivals");
+    let (spine, b_addr) = open_call(&p).await;
+    let leg =
+        p.a.transport
+            .open_av_link(&p.b.key.key_id, &b_addr)
+            .await
+            .expect("A's dial over the punched interface");
+    assert!(leg.sender.is_direct());
+    let up = next_event(&mut p.a.events, Duration::from_secs(5), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the identity link came up direct");
+    let DirectPathEvent::Established { link_id, .. } = up else {
+        unreachable!()
+    };
+    let arrival = tokio::time::timeout(Duration::from_secs(20), arrivals.recv())
+        .await
+        .expect("the leg arrives at B")
+        .expect("arrivals open");
+    let accepted =
+        p.b.transport
+            .accept_av_arrival(arrival)
+            .await
+            .expect("B answers the leg's KEX");
+    p.b.transport.set_inbound_link_idle_bound(bound);
+    (p, spine, leg, accepted, link_id)
+}
+
+/// **v44** — the punched interface lives as long as the identity link it was
+/// punched for, and that link is inbound on the side that did not dial it,
+/// where media never touches it. So the inbound reaper closed it at its idle
+/// bound and took a live call's interface with it (A kept sending, nothing
+/// arrived). A peer's live A/V link makes the punched link busy; when the call
+/// ends the link ages as any other.
+/// Mutation: without the busy mark, the frames stop at the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_on_a_punched_interface_outlives_the_inbound_idle_bound() {
+    const BOUND: Duration = Duration::from_secs(2);
+    let (p, _spine, leg, accepted, identity) =
+        call_on_a_punched_interface("reap-call", BOUND).await;
+
+    let started = tokio::time::Instant::now();
+    let mut frames = 0u32;
+    while started.elapsed() < BOUND * 3 {
+        leg.sender
+            .send(format!("media-{frames}").as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("frame {frames} sends: {e:?}"));
+        tokio::time::timeout(Duration::from_secs(10), accepted.arrival.inbound.recv())
+            .await
+            .unwrap_or_else(|_| panic!("frame {frames} crosses, {:?} in", started.elapsed()))
+            .expect("the leg is open");
+        frames += 1;
+        p.b.transport.reap_idle_inbound_links().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        p.b.transport.direct_link_interface(identity).is_some(),
+        "the interface outlived the bound, {frames} frames in"
+    );
+
+    // The call ended: nothing holds the link, and it ages.
+    p.a.transport
+        .link_teardown(&leg.link_id)
+        .await
+        .expect("A hangs up");
+    let aged = wait_until(BOUND * 3 + Duration::from_secs(30), || async {
+        p.b.transport.reap_idle_inbound_links().await;
+        p.b.transport.direct_link_interface(identity).is_none()
+    })
+    .await;
+    assert!(aged, "with the call gone the link is reaped at its bound");
+}
+
+/// **v44** — the reaper stays what ends a wedge. A punched link with no call
+/// whose inbound transfer stopped arriving is the wedge as the moved side sees
+/// it: busy for the transfer's stall window, then reaped. The state is marked
+/// here, not produced, the guard having removed the way to it. An idle punched
+/// link with no call ages too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wedged_punched_link_with_no_call_is_still_reaped() {
+    let mut p = trio("reap-wedge", proposer(), DirectLinksConfig::default()).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    p.a.transport
+        .send(&p.b.key.key_id, b"go-direct")
+        .await
+        .expect("the send that proposes");
+    let up = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the link comes up direct");
+    let DirectPathEvent::Established { link_id, .. } = up else {
+        unreachable!()
+    };
+    assert!(p.b.transport.direct_link_interface(link_id).is_some());
+
+    p.b.transport.note_inbound_transfer_for_test(link_id, true);
+    p.b.transport
+        .set_inbound_link_idle_bound(Duration::from_secs(1));
+    // Past the idle bound, inside the stall window: the transfer holds it.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    p.b.transport.reap_idle_inbound_links().await;
+    p.b.transport.reap_idle_inbound_links().await;
+    assert!(
+        p.b.transport.direct_link_interface(link_id).is_some(),
+        "a transfer inside its stall window holds the link"
+    );
+    let reaped = wait_until(Duration::from_secs(60), || async {
+        p.b.transport.reap_idle_inbound_links().await;
+        p.b.transport.direct_link_interface(link_id).is_none()
+    })
+    .await;
+    assert!(reaped, "the wedge ends: no call holds this link");
+}
