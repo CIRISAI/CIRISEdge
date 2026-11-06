@@ -196,6 +196,10 @@ pub use lifecycle::SuspendReport;
 #[cfg(feature = "_reticulum-module")]
 pub mod reticulum;
 
+/// v44 LTS — the persisted bindings a restart judges handshakes by.
+#[cfg(feature = "_reticulum-module")]
+pub(crate) mod persisted_standing;
+
 /// CIRISEdge#406 — the hybrid-signed `SignedTransportDestination`
 /// producer + bootstrap for edge's OWN reticulum destination (the #393
 /// item-2 gate's missing producer). Wired by the Reticulum transport,
@@ -367,6 +371,20 @@ pub enum PendingDelivery {
 pub enum TransportError {
     #[error("destination unreachable: {0}")]
     Unreachable(String),
+    /// The peer has no dial candidate: this node holds no destination for it
+    /// at all, and a path ask found none. Nothing was dialled. Distinct from
+    /// [`Self::Unreachable`] because replication backs off on it by type
+    /// (CIRISEdge#794), and from [`Self::NoRouteToPeer`] because there is no
+    /// target destination to name. It classes as `unreachable` to every caller
+    /// outside replication.
+    #[error(
+        "destination unreachable: no Reticulum destination known for \
+         destination_key_id={key_id} (not directory-resolvable and no announce received)"
+    )]
+    NoDialCandidate {
+        /// The federation key_id the send was routed to.
+        key_id: String,
+    },
     #[error("transport timeout after {0:?}")]
     Timeout(std::time::Duration),
     #[error("transport configuration error: {0}")]

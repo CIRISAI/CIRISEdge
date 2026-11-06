@@ -238,6 +238,7 @@ to it, and a 1 is not visible from anywhere else.
 | `direct_link` | `ciris.edge.direct_link` | counter | count | operator-only |
 | `peer_binding` | `ciris.edge.peer_binding` | counter | count | operator-only |
 | `key_plane_sweep` | `ciris.edge.key_plane.sweep` | counter | count | operator-only |
+| `persisted_standing` | `ciris.edge.persisted_standing` | counter | count | operator-only |
 | `link_stall` | `ciris.edge.link_stall` | counter | count | operator-only |
 | `direct_link_upgrade_guarded` | `ciris.edge.direct_link.upgrade_guarded` | counter | count | operator-only |
 | `advertise` | `ciris.edge.advertise` | counter | count | operator-only |

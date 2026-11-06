@@ -3153,6 +3153,12 @@ fn metrics_bundle_to_pydict<'py>(
         key_plane_sweep.set_item(label.as_str(), *n)?;
     }
     root.set_item("key_plane_sweep", key_plane_sweep)?;
+    // v44 LTS — the persisted-standing refresh.
+    let persisted_standing = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.persisted_standing {
+        persisted_standing.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("persisted_standing", persisted_standing)?;
     // CIRISEdge#926 — the link stall guard by label.
     let link_stall = pyo3::types::PyDict::new(py);
     for (label, n) in &bundle.link_stall {

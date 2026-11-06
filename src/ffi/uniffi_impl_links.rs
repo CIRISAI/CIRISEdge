@@ -192,7 +192,9 @@ pub fn link_request(
 #[cfg(feature = "_reticulum-module")]
 fn map_transport_err(e: TransportError) -> crate::EdgeBindingsError {
     match e {
-        TransportError::Unreachable(_) => crate::EdgeBindingsError::NotFound,
+        TransportError::Unreachable(_) | TransportError::NoDialCandidate { .. } => {
+            crate::EdgeBindingsError::NotFound
+        }
         TransportError::Config(_) => crate::EdgeBindingsError::InvalidArgument,
         // Timeout / Io / BodyTooLarge collapse to the typed Transport
         // error class — the bindings caller distinguishes via the

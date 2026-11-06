@@ -60,7 +60,7 @@
 //! that seed peers from a directory query rather than announces.
 //!
 //! If the peer is not yet resolvable, `send` returns
-//! [`TransportError::Unreachable`] and edge's durable dispatcher
+//! [`TransportError::NoDialCandidate`] and edge's durable dispatcher
 //! retries (FSD/EDGE_OUTBOUND_QUEUE.md §4).
 //!
 //! ## Wire framing
@@ -107,6 +107,8 @@ use leviculum_core::resource::ResourceStrategy;
 use leviculum_core::{Destination, DestinationHash, DestinationType, Direction, Identity};
 use leviculum_std::driver::{CompletionError, EventReceiver, ReticulumNode, ReticulumNodeBuilder};
 use leviculum_std::NodeEvent;
+
+use super::persisted_standing::{PersistedStandings, StandingRefresh};
 
 use super::attestation::{
     AnnounceAttestation, AttestationError, AttestationPayload, TransportBindingEnforcement,
@@ -2631,8 +2633,8 @@ pub struct ReticulumTransport {
     /// `None` until installed: every scope-native lookup then declines and
     /// the federation-scope paths are unaffected.
     scope_addresses: OnceLock<Arc<ScopeAddressTable>>,
-    /// v44 LTS — see [`read_persisted_standing`].
-    persisted_standing: Arc<std::sync::RwLock<PersistedStandings>>,
+    /// v44 LTS — see [`super::persisted_standing`].
+    persisted_standing: Arc<StandingRefresh>,
     /// CIRISEdge#591 / leviculum#66 — per-interface circuit-breaker series,
     /// fed by `NodeEvent::PeerCongested`. Read via
     /// [`Self::congestion_gauges`].
@@ -3038,7 +3040,7 @@ pub struct ReticulumTransport {
     /// a steady arrival of new senders.
     dial_gate: Arc<Mutex<HashMap<DestinationHash, Arc<tokio::sync::Semaphore>>>>,
     /// When a path to each destination was last asked for ([`Self::seek_paths`]).
-    path_seeks: std::sync::Mutex<HashMap<DestinationHash, std::time::Instant>>,
+    path_seeks: PathSeeks,
     /// CIRISEdge#739 — the SCOPED twin of `reusable_dialed_link`: identified
     /// links to a scope-derived member address, keyed by that address, fed
     /// only by [`Self::lease_scoped_link`]'s dial and tagged
@@ -4237,7 +4239,7 @@ impl ReticulumTransport {
             swallow_link_established: std::sync::atomic::AtomicBool::new(false),
             concluded_resources: std::sync::Mutex::new(HashMap::new()),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
-            path_seeks: std::sync::Mutex::new(HashMap::new()),
+            path_seeks: PathSeeks::default(),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
@@ -7641,6 +7643,13 @@ impl ReticulumTransport {
         if let Some(m) = self.metrics.get() {
             m.inc_peer_binding(crate::observability::PEER_BINDING_PRIMED);
         }
+        // CIRISEdge#794 — the host just gave this node somewhere to send: a
+        // peer with no candidate has been in the no-route backoff since before
+        // this binding existed, and no announce may follow to clear it.
+        let _ = self.peer_reachable.send(PeerReachable::new(
+            destination_key_id.to_string(),
+            ReachabilityEvidence::PathLearned,
+        ));
         tracing::debug!(
             key_id = %destination_key_id,
             dest = %hex::encode(dest_hash),
@@ -9204,38 +9213,7 @@ impl ReticulumTransport {
         if dests.is_empty() || known() {
             return !dests.is_empty();
         }
-        let now = std::time::Instant::now();
-        let mut ask: Vec<DestinationHash> = Vec::new();
-        let mut until = now;
-        {
-            let mut seeks = self
-                .path_seeks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if seeks.len() >= PATH_SEEK_TRACKED {
-                let mut ages: Vec<std::time::Instant> = seeks.values().copied().collect();
-                ages.sort_unstable();
-                let cut = ages[ages.len() / 2];
-                seeks.retain(|_, at| *at > cut);
-            }
-            for d in dests {
-                match seeks.get(d).copied() {
-                    Some(at) if now.duration_since(at) < PATH_SEEK_MIN_INTERVAL => {
-                        until = until.max(at + PATH_SEEK_BUDGET);
-                    }
-                    _ => {
-                        seeks.insert(*d, now);
-                        ask.push(*d);
-                        until = until.max(now + PATH_SEEK_BUDGET);
-                    }
-                }
-            }
-        }
-        for d in &ask {
-            if let Err(e) = self.node.request_path(d).await {
-                tracing::debug!(error = %e, "path request not sent");
-            }
-        }
+        let until = ask_for_paths(&self.node, &self.path_seeks, dests).await;
         while std::time::Instant::now() < until {
             if known() {
                 return true;
@@ -11057,10 +11035,10 @@ impl ReticulumTransport {
         // standing from its first handshake. Bounded, so a slow directory
         // delays no listener; the read finishes on its own if it runs over.
         if let Some(rooting) = self.rooting.clone() {
-            let boot = tokio::spawn(refresh_persisted_standing(
+            let boot = tokio::spawn(Arc::clone(&self.persisted_standing).boot(
                 rooting,
                 self.hybrid_policy,
-                Arc::clone(&self.persisted_standing),
+                self.metrics.get().cloned(),
             ));
             if tokio::time::timeout(PERSISTED_STANDING_BOOT_BUDGET, boot)
                 .await
@@ -11075,7 +11053,7 @@ impl ReticulumTransport {
         }
         let ctx = EventCtx {
             node: &self.node,
-            persisted_standing: &self.persisted_standing,
+            persisted_standing: &self.persisted_standing.table,
             local_key_id: self.occurrence_key_id(),
             route_answer_override: &self.route_answer_override,
             peers: &self.peers,
@@ -11189,10 +11167,19 @@ impl ReticulumTransport {
                         Arc::clone(&self.shapers),
                     ));
                     if let Some(rooting) = self.rooting.clone() {
-                        tokio::spawn(refresh_persisted_standing(
+                        let landed = self.persisted_standing.take_landed();
+                        if !landed.is_empty() {
+                            tokio::spawn(ask_through_landed_routes(
+                                Arc::clone(&self.node),
+                                Arc::clone(&rooting),
+                                Arc::clone(&self.path_seeks),
+                                landed,
+                            ));
+                        }
+                        tokio::spawn(Arc::clone(&self.persisted_standing).pass(
                             rooting,
                             self.hybrid_policy,
-                            Arc::clone(&self.persisted_standing),
+                            self.metrics.get().cloned(),
                         ));
                     }
                 }
@@ -11368,7 +11355,16 @@ impl ReticulumTransport {
             // failed. Admission-time hybrid-PQC verification is the
             // operator's concern; the queued bytes are the byte-exact
             // signed envelope, carried verbatim.
-            if self.delivery == crate::transport::PendingDelivery::PendingOrLive {
+            //
+            // Never a replication frame: it belongs to a round that is over
+            // by any wake-up, and anti-entropy catches the peer up on its
+            // return. Queued, it cost the round its no-route answer (`Queued`
+            // reads as sent, so every plane waited out its reply and swept
+            // again at full cadence), and took the slot of a message the
+            // queue is there for (CIRISEdge#794).
+            if self.delivery == crate::transport::PendingDelivery::PendingOrLive
+                && !is_replication_frame(envelope_bytes)
+            {
                 if let Some(saf) = &self.store_and_forward {
                     saf.queue(destination_key_id, envelope_bytes)
                         .map_err(|e| TransportError::Io(format!("store-and-forward queue: {e}")))?;
@@ -11380,10 +11376,10 @@ impl ReticulumTransport {
                     return Ok(TransportSendOutcome::Queued);
                 }
             }
-            return Err(TransportError::Unreachable(format!(
-                "no Reticulum destination known for destination_key_id={destination_key_id} \
-                 (not directory-resolvable and no announce received)"
-            )));
+            self.persisted_standing.note_unaddressed(destination_key_id);
+            return Err(TransportError::NoDialCandidate {
+                key_id: destination_key_id.to_owned(),
+            });
         }
 
         // CIRISEdge#33 (v0.15.0) — operator-deny-list check BEFORE the
@@ -13859,7 +13855,7 @@ fn direct_standing(
 struct EventCtx<'a> {
     node: &'a ReticulumNode,
     /// v44 LTS — the bindings a restart still answers for
-    /// ([`read_persisted_standing`]).
+    /// ([`super::persisted_standing`]).
     persisted_standing: &'a std::sync::RwLock<PersistedStandings>,
     /// CIRISEdge#621 — this node's own key id, so inbound attribution can
     /// refuse to resolve a link to ourselves regardless of what the peers map
@@ -16078,82 +16074,6 @@ fn close_evicted(ctx: &EventCtx<'_>) {
     }
 }
 
-/// v44 LTS — what a restart still knows about who it answers for. The live
-/// `peers` map starts empty, so without this every ordinary peer's first link
-/// after a restart was judged a stranger (`FSD/EVENT_PATH_MODEL.md` §2.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PersistedStanding {
-    key_id: String,
-    /// The row said Rooted and the key's chain roots HERE, re-walked.
-    rooted: bool,
-}
-
-/// Per proven transport identity, the bindings persist holds for it.
-type PersistedStandings = HashMap<[u8; 16], Vec<PersistedStanding>>;
-
-/// v44 LTS — read the persisted bindings a handshake may be judged by, off the
-/// event path. The store is authority for the route, never for trust
-/// (CIRISEdge#393): a replicated row's `Rooted` is its signer's own claim. So a
-/// row counts only if it proves the same two things a live binding has to:
-/// `rooted` is the claim AND a chain that roots here, walked as a heal walks it;
-/// otherwise the key must have hybrid-signed this very route, which is
-/// `owns_key`. A plain write-through of an announce proves neither and is
-/// dropped, since anyone can announce under anyone's key id.
-///
-/// `prior` memoises the walk: this runs on the roster's cadence, a binding that
-/// has not moved keeps its verdict, and a revocation is read every pass.
-async fn read_persisted_standing(
-    rooting: &dyn RootingDirectory,
-    policy: HybridPolicy,
-    prior: &PersistedStandings,
-) -> PersistedStandings {
-    use ciris_persist::federation::self_at_login::BindingProvenance;
-    let rows = match rooting.live_reticulum_bindings().await {
-        Ok(rows) => rows,
-        Err(error) => {
-            // A hiccup must never widen anything: nobody, until the next read.
-            tracing::warn!(%error, "persisted standing could not be read; none this pass");
-            return PersistedStandings::new();
-        }
-    };
-    let mut out = PersistedStandings::new();
-    for row in rows {
-        // The identity must be the one this destination is derived from.
-        if named_dest_of_transport(&row.transport_pubkey64) != Some(row.dest_hash) {
-            continue;
-        }
-        let x25519: [u8; 32] = row.transport_pubkey64[..32].try_into().unwrap_or([0u8; 32]);
-        let ed25519: [u8; 32] = row.transport_pubkey64[32..].try_into().unwrap_or([0u8; 32]);
-        let Ok(identity) = Identity::from_public_keys(&x25519, &ed25519) else {
-            continue;
-        };
-        let identity = *identity.hash();
-        let known = prior
-            .get(&identity)
-            .and_then(|v| v.iter().find(|b| b.key_id == row.key_id));
-        let rooted = match known {
-            Some(b) => b.rooted,
-            None => {
-                matches!(row.provenance, BindingProvenance::Rooted)
-                    && store_claim_roots_here(rooting, &row.key_id, policy).await
-            }
-        };
-        if !rooted
-            && known.is_none()
-            && !rooting
-                .hybrid_transport_binding_exists(&row.key_id, row.dest_hash)
-                .await
-        {
-            continue;
-        }
-        out.entry(identity).or_default().push(PersistedStanding {
-            key_id: row.key_id,
-            rooted,
-        });
-    }
-    out
-}
-
 /// The standing rule, on what a binding has proven. The roster, the rooms and
 /// the contacts are read live either way.
 fn binding_has_standing(ctx: &EventCtx<'_>, key: &str, rooted: bool, owns_key: bool) -> bool {
@@ -16174,7 +16094,7 @@ fn binding_has_standing(ctx: &EventCtx<'_>, key: &str, rooted: bool, owns_key: b
 /// announce is an `Advisory` binding, free to mint, and earns nothing here.
 ///
 /// v44 LTS — a key with no live binding yet is judged by what persist holds
-/// ([`read_persisted_standing`]), so a restart does not make strangers of the
+/// ([`super::persisted_standing`]), so a restart does not make strangers of the
 /// peers it answers for. A live binding for the key is the newer word: if it
 /// names another identity the persisted one is superseded and gives nothing.
 async fn identity_has_standing(ctx: &EventCtx<'_>, identity_hash: &[u8; 16]) -> bool {
@@ -16203,23 +16123,6 @@ async fn identity_has_standing(ctx: &EventCtx<'_>, identity_hash: &[u8; 16]) -> 
                     && binding_has_standing(ctx, &b.key_id, b.rooted, true)
             })
         })
-}
-
-/// v44 LTS — read the persisted bindings again, so a route retired or
-/// superseded, or a key revoked, stops giving standing within one pass.
-async fn refresh_persisted_standing(
-    rooting: Arc<dyn RootingDirectory>,
-    policy: HybridPolicy,
-    table: Arc<std::sync::RwLock<PersistedStandings>>,
-) {
-    let prior = table
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let next = read_persisted_standing(rooting.as_ref(), policy, &prior).await;
-    *table
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
 }
 
 /// CIRISEdge#947 — a complete handshake arrived. On a link with no proven
@@ -18757,10 +18660,97 @@ fn route_supersession_by_route(
     RouteSupersession::IgnoreStale
 }
 
+/// Whether `envelope` is a CRPL replication frame, not a signed envelope.
+fn is_replication_frame(envelope: &[u8]) -> bool {
+    envelope.starts_with(&crate::replication::wire_frame::REPLICATION_FRAME_MAGIC)
+}
+
+/// One path ask per destination per [`PATH_SEEK_MIN_INTERVAL`].
+type PathSeeks = Arc<std::sync::Mutex<HashMap<DestinationHash, std::time::Instant>>>;
+
+/// Raise the path requests `dests` are due. Returns when the answers can
+/// stop being waited for: an ask still in flight counts, an old one does not.
+async fn ask_for_paths(
+    node: &ReticulumNode,
+    seeks: &PathSeeks,
+    dests: &[DestinationHash],
+) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let mut ask: Vec<DestinationHash> = Vec::new();
+    let mut until = now;
+    {
+        let mut seeks = seeks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seeks.len() >= PATH_SEEK_TRACKED {
+            let mut ages: Vec<std::time::Instant> = seeks.values().copied().collect();
+            ages.sort_unstable();
+            let cut = ages[ages.len() / 2];
+            seeks.retain(|_, at| *at > cut);
+        }
+        for d in dests {
+            match seeks.get(d).copied() {
+                Some(at) if now.duration_since(at) < PATH_SEEK_MIN_INTERVAL => {
+                    until = until.max(at + PATH_SEEK_BUDGET);
+                }
+                _ => {
+                    seeks.insert(*d, now);
+                    ask.push(*d);
+                    until = until.max(now + PATH_SEEK_BUDGET);
+                }
+            }
+        }
+    }
+    for d in &ask {
+        if let Err(e) = node.request_path(d).await {
+            tracing::debug!(error = %e, "path request not sent");
+        }
+    }
+    until
+}
+
+/// The late joiner's ask (#945), for a peer the no-route backoff has stopped
+/// trying: its signed route row just landed, so there is now somewhere to ask,
+/// and the next probe may be a quarter of an hour away. What comes back is its
+/// own announce, which roots it and clears the backoff the ordinary way.
+async fn ask_through_landed_routes(
+    node: Arc<ReticulumNode>,
+    rooting: Arc<dyn RootingDirectory>,
+    seeks: PathSeeks,
+    keys: Vec<String>,
+) {
+    for key in keys {
+        let Ok(Some(row)) = rooting.signed_reticulum_route(&key).await else {
+            continue;
+        };
+        let hash = hex::decode(&row.transport_destination.destination)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok());
+        if let Some(hash) = hash {
+            tracing::debug!(peer = %key, "a wanted peer's route landed; asking for its path");
+            ask_for_paths(&node, &seeks, &[DestinationHash::new(hash)]).await;
+        }
+    }
+}
+
+/// Tests outside the transport: the named destination of a full key.
+#[cfg(test)]
+pub(crate) fn named_dest_for_test(transport_pubkey64: &[u8; 64]) -> [u8; 16] {
+    named_dest_of_transport(transport_pubkey64).expect("an identity")
+}
+
+/// The 16-byte identity hash of a full `(x25519 ‖ ed25519)` transport key.
+pub(super) fn identity_of_transport(transport_pubkey64: &[u8; 64]) -> Option<[u8; 16]> {
+    let x25519: [u8; 32] = transport_pubkey64[..32].try_into().ok()?;
+    let ed25519: [u8; 32] = transport_pubkey64[32..].try_into().ok()?;
+    let identity = Identity::from_public_keys(&x25519, &ed25519).ok()?;
+    Some(*identity.hash())
+}
+
 /// The named destination a 64-byte transport identity (`x25519 ‖ ed25519`)
 /// announces on: `truncated_hash(name_hash("ciris","edge") ‖ identity_hash)`.
 /// `None` for bytes that are not an identity.
-fn named_dest_of_transport(transport_pubkey64: &[u8; 64]) -> Option<[u8; 16]> {
+pub(super) fn named_dest_of_transport(transport_pubkey64: &[u8; 64]) -> Option<[u8; 16]> {
     let x25519: [u8; 32] = transport_pubkey64[..32].try_into().ok()?;
     let ed25519: [u8; 32] = transport_pubkey64[32..].try_into().ok()?;
     let identity = Identity::from_public_keys(&x25519, &ed25519).ok()?;
@@ -18923,7 +18913,7 @@ enum DivergenceHeal {
 /// announce path runs (`root_binding`, with the record's own registered
 /// pubkey as the claim), so a durable-store heal can never confer more trust
 /// than a fresh announce would. Fail-closed on any read failure.
-async fn store_claim_roots_here(
+pub(super) async fn store_claim_roots_here(
     rooting: &dyn RootingDirectory,
     key_id: &str,
     policy: HybridPolicy,
@@ -22349,127 +22339,6 @@ mod tests {
     /// v44 LTS — what a persisted row has to prove. The store's `Rooted` is a
     /// claim, a plain write-through proves nothing, and a row whose identity
     /// is not its destination's is nobody's.
-    mod persisted_standing {
-        use super::*;
-        use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
-
-        struct Rows {
-            live: Vec<crate::verify::LiveTransportBinding>,
-            signed: Vec<String>,
-            read_fails: bool,
-        }
-
-        #[async_trait::async_trait]
-        impl RootingDirectory for Rows {
-            async fn root_binding(&self, key_id: &str, _claimed: &str) -> RootingVerdict {
-                RootingVerdict::Rejected {
-                    rejection: RootingRejection::UnknownKeyId {
-                        key_id: key_id.to_owned(),
-                    },
-                }
-            }
-            async fn provenance_chain(
-                &self,
-                key_id: &str,
-            ) -> Result<ProvenanceChain, RootingRejection> {
-                Err(RootingRejection::UnknownKeyId {
-                    key_id: key_id.to_owned(),
-                })
-            }
-            async fn registered_pubkey_ed25519_base64(&self, _key_id: &str) -> Option<String> {
-                Some("registered".to_owned())
-            }
-            async fn hybrid_transport_binding_exists(
-                &self,
-                key_id: &str,
-                _dest_hash: [u8; 16],
-            ) -> bool {
-                self.signed.iter().any(|k| k == key_id)
-            }
-            async fn live_reticulum_bindings(
-                &self,
-            ) -> Result<Vec<crate::verify::LiveTransportBinding>, String> {
-                if self.read_fails {
-                    return Err("down".to_owned());
-                }
-                Ok(self.live.clone())
-            }
-        }
-
-        fn pubkey(seed: u8) -> [u8; 64] {
-            Identity::from_private_key_bytes(&[seed; 64])
-                .expect("an identity")
-                .public_key_bytes()
-        }
-
-        fn row(
-            key: &str,
-            pk: [u8; 64],
-            provenance: ciris_persist::federation::self_at_login::BindingProvenance,
-        ) -> crate::verify::LiveTransportBinding {
-            crate::verify::LiveTransportBinding {
-                key_id: key.to_owned(),
-                dest_hash: named_dest_of_transport(&pk).expect("a destination"),
-                transport_pubkey64: pk,
-                provenance,
-            }
-        }
-
-        fn keys(table: &PersistedStandings) -> Vec<String> {
-            let mut keys: Vec<String> =
-                table.values().flatten().map(|b| b.key_id.clone()).collect();
-            keys.sort();
-            keys
-        }
-
-        #[tokio::test]
-        async fn only_a_proven_binding_counts_and_a_gone_row_stops_counting() {
-            let policy = HybridPolicy::Ed25519Fallback;
-            let mut wrong = row("mismatched", pubkey(4), Advisory);
-            wrong.dest_hash = [0xee; 16];
-            let mut dir = Rows {
-                live: vec![
-                    row("announced", pubkey(1), Advisory),
-                    row("self-claimed-rooted", pubkey(2), Rooted),
-                    row("signed", pubkey(3), Advisory),
-                    wrong,
-                ],
-                signed: vec!["signed".to_owned(), "mismatched".to_owned()],
-                read_fails: false,
-            };
-            let first = read_persisted_standing(&dir, policy, &PersistedStandings::new()).await;
-            assert_eq!(keys(&first), ["signed"]);
-            assert!(
-                !first.values().flatten().any(|b| b.rooted),
-                "a row's own Rooted is not a chain"
-            );
-
-            // Retired, revoked or superseded: the directory stops listing it.
-            dir.live.clear();
-            let second = read_persisted_standing(&dir, policy, &first).await;
-            assert!(second.is_empty(), "the memo keeps nothing alive");
-        }
-
-        #[tokio::test]
-        async fn a_directory_that_cannot_be_read_leaves_nobody_standing() {
-            let dir = Rows {
-                live: vec![row("signed", pubkey(3), Advisory)],
-                signed: vec!["signed".to_owned()],
-                read_fails: false,
-            };
-            let policy = HybridPolicy::Ed25519Fallback;
-            let held = read_persisted_standing(&dir, policy, &PersistedStandings::new()).await;
-            assert_eq!(keys(&held), ["signed"]);
-            let down = Rows {
-                read_fails: true,
-                ..dir
-            };
-            assert!(read_persisted_standing(&down, policy, &held)
-                .await
-                .is_empty());
-        }
-    }
-
     /// CIRISEdge#460 — the `LinkClosed` severity mapping. Routine turnover
     /// (`Normal`, `Stale`) is `Info`; every fault reason is `Warning`. Pins that
     /// a routine idle reap never re-enters the WARN stream (70% of the server's
@@ -25690,6 +25559,67 @@ mod scope_native_addressing_tests {
         )
         .await
         .expect("bare transport")
+    }
+
+    /// What a server's round met, on the real send path: `PendingOrLive` with
+    /// a queue, and a peer with no candidate. A replication frame is answered
+    /// no-route and queues nothing; a signed envelope still waits for the
+    /// wake-up. Before: both queued, the round read `Queued` as sent and waited
+    /// out its reply, so the peer never backed off (CIRISEdge#794).
+    #[tokio::test]
+    async fn a_replication_frame_to_no_candidate_is_no_route_and_never_queued() {
+        use crate::replication::protocol::{EnvelopeKind, ReplicationMessage, SummaryMessage};
+        use crate::transport::store_and_forward::{
+            MemoryStoreAndForward, StoreAndForward, StoreAndForwardConfig,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue: Arc<dyn StoreAndForward> =
+            Arc::new(MemoryStoreAndForward::new(StoreAndForwardConfig::default()));
+        let transport = bare_transport(dir.path(), "local-key")
+            .await
+            .with_store_and_forward(
+                Arc::clone(&queue),
+                crate::transport::PendingDelivery::PendingOrLive,
+            );
+        let frame =
+            crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
+                kind: EnvelopeKind::Key,
+                refs: Vec::new(),
+            }));
+        let sent = Transport::send(&transport, "nobody", &frame).await;
+        assert!(
+            matches!(sent, Err(TransportError::NoDialCandidate { .. })),
+            "{sent:?}"
+        );
+        assert_eq!(queue.pending_count("nobody"), 0, "the frame was not queued");
+
+        let queued = Transport::send(&transport, "nobody", b"{\"signed\":true}").await;
+        assert!(
+            matches!(queued, Ok(TransportSendOutcome::Queued)),
+            "{queued:?}"
+        );
+        assert_eq!(queue.pending_count("nobody"), 1, "the envelope still waits");
+    }
+
+    /// A host's prime is a route arriving: a peer in the no-route backoff has
+    /// no announce coming to clear it.
+    #[tokio::test]
+    async fn a_prime_is_reachability_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "local-key").await;
+        let mut events = transport.subscribe_reachability().expect("subscribable");
+        let pubkey = Identity::from_private_key_bytes(&[0x51; 64])
+            .expect("an identity")
+            .public_key_bytes();
+        let dest = named_dest_of_transport(&pubkey).expect("a destination");
+        transport
+            .prime_peer("primed", dest, pubkey)
+            .await
+            .expect("primed");
+        let seen = events.try_recv().expect("evidence was sent");
+        assert_eq!(seen.peer_key_id, "primed");
+        assert_eq!(seen.evidence, ReachabilityEvidence::PathLearned);
     }
 
     fn table_with_group(

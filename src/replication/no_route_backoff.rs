@@ -2,7 +2,8 @@
 //!
 //! A round whose send fails with [`TransportError::NoRouteToPeer`] (the
 //! transport held no path to the peer and nothing answered the broadcast link
-//! request) puts that PEER — every coordinator toward it, on every plane — into
+//! request) or [`TransportError::NoDialCandidate`] (it holds no address for the
+//! peer at all) puts that PEER — every coordinator toward it, on every plane — into
 //! one shared backoff. While it holds, the peer's coordinators skip their
 //! cadence ticks AND their kicks (`RoundNow`, `Propagate`, `Kick`): before this,
 //! an offline device cost every plane a round on every tick and every kick,
@@ -140,12 +141,16 @@ pub(crate) enum RoundClass {
 }
 
 impl RoundClass {
-    /// Typed, never by message: only `NoRouteToPeer` with `has_path: false`.
+    /// Typed, never by message: `NoRouteToPeer` with `has_path: false`, and a
+    /// peer with no dial candidate at all. A ban is neither: it is its own
+    /// error, reached only with a candidate in hand, and a banned peer keeps
+    /// its own treatment.
     pub(crate) fn of_transport_error(e: &TransportError) -> Option<Self> {
         match e {
             TransportError::NoRouteToPeer {
                 has_path: false, ..
-            } => Some(Self::NoRoute(e.to_string())),
+            }
+            | TransportError::NoDialCandidate { .. } => Some(Self::NoRoute(e.to_string())),
             TransportError::Suspended => Some(Self::Suspended),
             _ => None,
         }

@@ -150,6 +150,8 @@ mod no_route_backoff_794_tests;
 mod occurrence_before_binding_776_tests;
 #[cfg(test)]
 mod park_fresh_858_tests;
+#[cfg(all(test, feature = "_reticulum-module"))]
+mod persisted_standing_timing_tests;
 pub mod protocol;
 pub mod refusal_backoff;
 pub mod registry;

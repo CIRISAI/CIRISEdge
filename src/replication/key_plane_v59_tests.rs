@@ -166,12 +166,39 @@ async fn a_revoked_key_offers_no_live_binding() {
         2,
     )
     .await;
-    let live = RootingDirectory::live_reticulum_bindings(&*a.dir)
+    let rows = RootingDirectory::live_binding_rows(&*a.dir)
         .await
         .expect("the rows read");
-    let keys: Vec<&str> = live.iter().map(|b| b.key_id.as_str()).collect();
-    assert!(keys.contains(&a.n.key_id()), "N is live: {keys:?}");
-    assert!(!keys.contains(&a.k.key_id()), "K revoked itself: {keys:?}");
+    let row_of = |key: &str| {
+        rows.iter()
+            .find(|b| b.key_id == key)
+            .unwrap_or_else(|| panic!("{key} has a route row: {rows:?}"))
+    };
+    assert!(
+        RootingDirectory::binding_stands(&*a.dir, row_of(a.n.key_id())).await,
+        "N is live"
+    );
+    assert!(
+        !RootingDirectory::binding_stands(&*a.dir, row_of(a.k.key_id())).await,
+        "K revoked itself"
+    );
+    // The change read names it, from the store's own cursor: a revocation is
+    // what ends standing, so it cannot wait for the sweep.
+    let mut cursors = crate::verify::BindingCursors::default();
+    let mut named = Vec::new();
+    loop {
+        let page = RootingDirectory::binding_changes(&*a.dir, &mut cursors, 64)
+            .await
+            .expect("the changes read");
+        named.extend(page.subjects);
+        if page.drained {
+            break;
+        }
+    }
+    assert!(
+        named.iter().any(|k| k == a.k.key_id()),
+        "the revocation names K: {named:?}"
+    );
 }
 
 /// Node A: a person P, its node N (P's occurrence of N, attested by P), a key

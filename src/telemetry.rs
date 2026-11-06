@@ -1250,6 +1250,7 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("direct_link", "ciris.edge.direct_link", Counter, Count, closed("reason", obs::DIRECT_LINK_LABELS), "Direct-link attempts and outcomes."),
     spec("peer_binding", "ciris.edge.peer_binding", Counter, Count, closed("reason", obs::PEER_BINDING_LABELS), "Peer binding outcomes."),
     spec("key_plane_sweep", "ciris.edge.key_plane.sweep", Counter, Count, REASON, "Key-plane sweep counts."),
+    spec("persisted_standing", "ciris.edge.persisted_standing", Counter, Count, REASON, "Persisted-standing refresh: passes, pass milliseconds, ticks skipped, passes cut, sweeps and rows walked."),
     spec("link_stall", "ciris.edge.link_stall", Counter, Count, closed("reason", obs::LINK_STALL_LABELS), "Stalled-link guard outcomes."),
     spec("direct_link_upgrade_guarded", "ciris.edge.direct_link.upgrade_guarded", Counter, Count, closed("reason", obs::UPGRADE_GUARDED_LABELS), "Resources kept off a link with an upgrade in flight. `upgrade_guarded_ship` growing steadily means sends keep arriving on links mid-upgrade and waiting; `direct_link_failed_held` in `direct_link` is the wedge this guards, on a peer or a retry the guard cannot see."),
     spec("advertise", "ciris.edge.advertise", Counter, Count, closed("reason", obs::ADVERTISE_LABELS), "The advertise sweep. `advertise_watermark_evicted` growing steadily means the cursor map is thrashing; `advertise_read_failed` is a page whose read failed, with its cursor held."),
