@@ -365,6 +365,58 @@ async fn side_cfg_auth(
     }
 }
 
+/// A TCP pipe to `T` on `t_port` that holds the client's bytes toward `T` for
+/// `held_ms` (read per chunk, so a test turns it on after setup), in order;
+/// `T`'s bytes back pass at once. It gives the field's asymmetry a shape on
+/// loopback: what `B` says reaches `A` late, what `A` says reaches `B` at once.
+/// Returns the port to dial.
+async fn held_uplink(t_port: u16, held_ms: Arc<std::sync::atomic::AtomicU64>) -> u16 {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the uplink");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(upstream) = tokio::net::TcpStream::connect(("127.0.0.1", t_port)).await else {
+                continue;
+            };
+            let (mut client_rx, mut client_tx) = client.into_split();
+            let (mut up_rx, mut up_tx) = upstream.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut up_rx, &mut client_tx).await;
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+            let held = Arc::clone(&held_ms);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = client_rx.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    let ms = held.load(std::sync::atomic::Ordering::Relaxed);
+                    let due = tokio::time::Instant::now() + Duration::from_millis(ms);
+                    if tx.send((due, buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some((due, bytes)) = rx.recv().await {
+                    tokio::time::sleep_until(due).await;
+                    if up_tx.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
 struct Trio {
     t: ReticulumNode,
     a: Side,
@@ -376,11 +428,26 @@ struct Trio {
 /// `T`, then `A` and `B` as its clients, each holding the other's
 /// hybrid-signed route, each having learned the other's announce through `T`.
 async fn trio(tag: &str, a_direct: DirectLinksConfig, b_direct: DirectLinksConfig) -> Trio {
+    trio_uplink(tag, a_direct, b_direct, None).await
+}
+
+/// [`trio`], with B reaching `T` through a [`held_uplink`] when `b_uplink`
+/// names one.
+async fn trio_uplink(
+    tag: &str,
+    a_direct: DirectLinksConfig,
+    b_direct: DirectLinksConfig,
+    b_uplink: Option<Arc<std::sync::atomic::AtomicU64>>,
+) -> Trio {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let t_port = free_port();
     let f_port = free_udp_port();
     let t = transport_node(t_port, f_port).await;
+    let b_t_port = match b_uplink {
+        Some(held) => held_uplink(t_port, held).await,
+        None => t_port,
+    };
     let facilitator = format!("127.0.0.1:{f_port}");
     let fill = |c: DirectLinksConfig| DirectLinksConfig {
         facilitator: c.facilitator.map(|_| facilitator.clone()),
@@ -393,7 +460,14 @@ async fn trio(tag: &str, a_direct: DirectLinksConfig, b_direct: DirectLinksConfi
     let a_dir = directory_with(records.clone()).await;
     let b_dir = directory_with(records).await;
     let a = side(key_a, &a_dir, &tmp.path().join("a"), t_port, fill(a_direct)).await;
-    let b = side(key_b, &b_dir, &tmp.path().join("b"), t_port, fill(b_direct)).await;
+    let b = side(
+        key_b,
+        &b_dir,
+        &tmp.path().join("b"),
+        b_t_port,
+        fill(b_direct),
+    )
+    .await;
 
     for (from, from_key, to) in [(&a_dir, &a.key, &b_dir), (&b_dir, &b.key, &a_dir)] {
         let routes = from
@@ -2361,4 +2435,98 @@ async fn a_yields_timer_does_not_propose_while_suspended() {
     )
     .await;
     assert_eq!(dl(&p.b.metrics, "direct_link_proposed"), 0);
+}
+
+/// **v44 — one side moves, the other holds.** The wedge of the first cross-NAT
+/// run (agent run 42157633553), with the real path: `A` proposes on its
+/// identity link, both punches land, and `B`'s COMPLETE reaches `A` late, so
+/// `B` is on the punched interface at the direct MTU while `A` is still
+/// committing on the relay at the link's old one. A frame `A` ships now is
+/// advertised to a `B` that has already lowered its MTU: `B` sizes the parts
+/// from its own MTU, refuses every part `A` cuts, and leviculum holds `A`'s
+/// move on the Resource that cannot finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_sent_while_the_peer_has_moved_does_not_hold_the_upgrade() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // How long `A` stays behind `B`, and so the headroom a slow runner has for
+    // the send below to start inside the window. On from before the link is
+    // dialled: the Channel has to learn this RTT, or a hold that appears on a
+    // millisecond link exhausts its retries and closes it.
+    const HOLD: Duration = Duration::from_secs(2);
+
+    let held = Arc::new(AtomicU64::new(0));
+    let mut p = trio_uplink(
+        "upg",
+        proposer(),
+        DirectLinksConfig::default(),
+        Some(Arc::clone(&held)),
+    )
+    .await;
+    held.store(u64::try_from(HOLD.as_millis()).unwrap(), Ordering::Relaxed);
+    // A's first send, before any room: the link exists and nothing proposes.
+    p.a.transport
+        .send(&p.b.key.key_id, b"before-the-room")
+        .await
+        .expect("A's send to B ships through T");
+    let (_spine, _b_addr) = open_call(&p).await;
+    let link = shared_link(&p.a, &p.b);
+
+    let proposed =
+        p.a.transport
+            .propose_direct_on_link_for_test(&p.b.key.key_id, link)
+            .await;
+    assert_eq!(proposed, "proposed");
+    let moved = next_event(&mut p.b.events, Duration::from_secs(30), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("B moves: A's COMPLETE reached it");
+    assert!(
+        matches!(
+            &moved,
+            DirectPathEvent::Established {
+                proposed: false,
+                ..
+            }
+        ),
+        "{moved:?}"
+    );
+    assert!(
+        p.a.transport.direct_link_interface(link).is_none(),
+        "A has not moved yet: B's COMPLETE is still on the held uplink"
+    );
+
+    // Over the Channel-first cap, so this is a Resource by size; random so it
+    // does not compress below it.
+    let mut frame = vec![0u8; 400 * 1024];
+    ciris_crypto::random::fill(&mut frame).expect("random frame");
+    let sender = Arc::clone(&p.a.transport);
+    let b_key = p.b.key.key_id.clone();
+    let send = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let sent = sender.send(&b_key, &frame).await;
+        (sent, started.elapsed())
+    });
+
+    let up = next_event(&mut p.a.events, HOLD + Duration::from_secs(25), |e| {
+        matches!(
+            e,
+            DirectPathEvent::Established { .. } | DirectPathEvent::Failed { .. }
+        )
+    })
+    .await;
+    held.store(0, Ordering::Relaxed);
+    assert!(
+        matches!(
+            &up,
+            Some(DirectPathEvent::Established { proposed: true, .. })
+        ),
+        "A moves once B's COMPLETE lands, the frame in flight or not: {up:?}"
+    );
+    assert!(p.a.transport.direct_link_interface(link).is_some());
+    let (sent, took) = tokio::time::timeout(Duration::from_secs(60), send)
+        .await
+        .expect("the send ends")
+        .expect("the send task");
+    sent.unwrap_or_else(|e| panic!("the frame is delivered ({took:?}): {e:?}"));
 }
