@@ -16,7 +16,8 @@ cut: a v43.x peer cannot interoperate.
 - **Fixed:** decapsulation and a responder's first frames left the event path (#947); replies have
   their own lane (#943); ALM meter and depth-0 claims (#945 items 1-3); stall guard (#926); key-plane
   memo (#930); late joiners ask for a path; a refused dial is jittered; standing survives a restart;
-  a publisher keeps one stream under any measured ceiling, and a ceiling goes stale (#945).
+  a publisher keeps one stream under any measured ceiling, a ceiling goes stale, and the periodic
+  binding re-announce no longer reads as congestion (#945).
 - **Breaking:** `SERVE_ADVERTISE_POLICY_HASH` is `83099f47…`; `ApplyOutcome::Refused` gains `class`;
   `ReticulumTransportConfig`, `CallDeps` and `EdgeDeviceState` gain required fields; `Transport`
   gains `attach_load_ladder`, with a default.

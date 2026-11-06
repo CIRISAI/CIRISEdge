@@ -2809,23 +2809,38 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
         let wire = Arc::new(wire.to_vec());
         if installed {
             // Before the chunks it keys, which this pump forwards next.
-            send_binding_paced(shared, &wire, &except).await;
+            send_binding_paced(shared, &wire, &except, None).await;
         } else {
             // A publisher's periodic re-send passing through: never in the
             // way of the chunks queued behind it on this pump.
             let s = Arc::clone(shared);
-            tokio::spawn(async move { send_binding_paced(&s, &wire, &except).await });
+            tokio::spawn(async move {
+                send_binding_paced(&s, &wire, &except, Some(REANNOUNCE_PART_GAP)).await;
+            });
         }
     }
 }
+
+/// The wait between a periodic re-announce's parts. Sent back to back, about
+/// ten Channel messages per leg fill the window every
+/// [`BINDING_REANNOUNCE`]: media is refused, the RTT spikes, and its smoothed
+/// value reads as queue delay for seconds. The egress meter takes that for
+/// the uplink, on a schedule, so a measured ceiling never goes stale. A
+/// binding nobody lost can arrive half a second later.
+pub const REANNOUNCE_PART_GAP: Duration = Duration::from_millis(50);
 
 /// Send a binding's parts on every leg but `except`, ONE PART PER HOLD of the
 /// publisher lock. A binding is about ten Channel messages on a base-MTU link;
 /// sent whole, it holds every publish and forward for the entire burst, and
 /// the chunks behind it miss their reorder deadlines. Between parts the media
 /// path runs (its legs are settling, so a chunk retries the window instead of
-/// being dropped).
-async fn send_binding_paced(shared: &Arc<Shared>, wire: &Arc<Vec<u8>>, except: &[String]) {
+/// being dropped), for `gap` when nobody is waiting on this binding.
+async fn send_binding_paced(
+    shared: &Arc<Shared>,
+    wire: &Arc<Vec<u8>>,
+    except: &[String],
+    gap: Option<Duration>,
+) {
     for i in 0.. {
         let more = AtomicBool::new(false);
         shared
@@ -2844,7 +2859,10 @@ async fn send_binding_paced(shared: &Arc<Shared>, wire: &Arc<Vec<u8>>, except: &
         if !more.load(Ordering::Relaxed) {
             return;
         }
-        tokio::task::yield_now().await;
+        match gap {
+            Some(gap) => tokio::time::sleep(gap).await,
+            None => tokio::task::yield_now().await,
+        }
     }
 }
 
@@ -2852,7 +2870,7 @@ async fn send_binding_paced(shared: &Arc<Shared>, wire: &Arc<Vec<u8>>, except: &
 /// inbound queue dropped a part gets it again).
 async fn reannounce(shared: &Arc<Shared>) {
     let wire = Arc::clone(&Shared::lock(&shared.own_key).wire);
-    send_binding_paced(shared, &wire, &[]).await;
+    send_binding_paced(shared, &wire, &[], Some(REANNOUNCE_PART_GAP)).await;
 }
 
 /// What [`forward`] needs to know about one chunk.

@@ -29,6 +29,9 @@
 //!   and a real base drop still is.
 //! - **Depth 0** (`a_member_claiming_depth_zero_is_not_the_publisher`,
 //!   CIRISEdge#945): only the publisher the binding names holds depth 0.
+//! - **Re-announce** (`a_reannounce_is_spread_over_its_parts`, CIRISEdge#945):
+//!   the periodic binding is no burst for the egress meter to take for the
+//!   uplink.
 //!
 //! Requires `transport-reticulum`:
 //! `cargo test --features "transport-http transport-reticulum" --test alm_mesh_stage2`
@@ -47,7 +50,7 @@ use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
 use ciris_edge::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
 use ciris_edge::transport::av_call::{
-    Call, CallDeps, CallOptions, Frame, ReceivedFrame, RoomRoster,
+    Call, CallDeps, CallOptions, Frame, ReceivedFrame, RoomRoster, REANNOUNCE_PART_GAP,
 };
 use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{AvKeepTarget, StreamDekRegistrar};
@@ -900,6 +903,33 @@ async fn stale_media_is_dropped_by_age_and_the_hop_recovers() {
     );
 }
 
+/// **The periodic re-announce is no burst.** Sent back to back, its parts
+/// fill the Channel window every 10 s and the egress meter reads that as the
+/// uplink: on a loaded host nearly all a call's later congestion followed it,
+/// and it kept any ceiling from going stale. A lower bound, so a slow host
+/// cannot fail it. Mutation: without the gap the parts go in no time at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_reannounce_is_spread_over_its_parts() {
+    let _call = one_call().await;
+    let tag = "alm2-spread";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    wait_bound(&cb, 1).await;
+    // A hybrid binding is kilobytes over a base-MTU Channel: many parts.
+    let started = tokio::time::Instant::now();
+    ca.reannounce_for_test().await;
+    let took = started.elapsed();
+    eprintln!("[ALM2] re-announce took {took:?}");
+    assert!(
+        took >= REANNOUNCE_PART_GAP * 4,
+        "spread over its parts, not one burst: {took:?}"
+    );
+}
+
 /// **A lost ADMIT is resent, not withdrawn.** Every must-arrive C3 frame A
 /// sends is refused on its first attempt, as a congested link refuses it. B
 /// still records A as its parent from the resent ADMIT, and never has to
@@ -1046,10 +1076,11 @@ async fn a_layered_standby_is_not_read_as_lossy_on_a_live_call() {
     let mut call = layered_call(&nodes, &groups, tag, None).await;
     let quiet = call.quiet_stretch(&nodes, 300, true).await;
     eprintln!(
-        "[ALM2] layered standby: C forwarded {} of 150 base chunks, Degraded lines {}, after {} sheds",
+        "[ALM2] layered standby: C forwarded {} of 150 base chunks, Degraded lines {}, after {} sheds, {} ceilings",
         quiet.forwarded,
         quiet.standby.len(),
-        call.ca.alm_counts().shed
+        call.ca.alm_counts().shed,
+        call.ca.alm_log_count(DecisionKind::Ceiling)
     );
     assert!(
         quiet.forwarded >= 140,
@@ -1353,9 +1384,10 @@ async fn a_capped_primary_is_not_read_as_lossy_on_a_live_call() {
         .expect("A caps B");
     let quiet = call.quiet_stretch(&nodes, 300, true).await;
     eprintln!(
-        "[ALM2] capped primary: Degraded lines {}, after {} sheds",
+        "[ALM2] capped primary: Degraded lines {}, after {} sheds, {} ceilings",
         quiet.primary.len(),
-        call.ca.alm_counts().shed
+        call.ca.alm_counts().shed,
+        call.ca.alm_log_count(DecisionKind::Ceiling)
     );
     assert_eq!(
         quiet.primary,
