@@ -942,8 +942,18 @@ impl ReplicationCoordinator {
         self.transport
             .send(&self.peer_key_id, &bytes)
             .await
-            .map(|_| ())
+            .map(|_| self.book_served(msg))
             .map_err(CoordinatorError::from)
+    }
+
+    /// CIRISEdge#433 — `replication_envelopes_served_total`, at the one moment
+    /// it is true: a `Deliver`'s send returned.
+    fn book_served(&self, msg: &ReplicationMessage) {
+        if let (Some(metrics), ReplicationMessage::Deliver(deliver)) = (&self.metrics, msg) {
+            for _ in &deliver.envelopes {
+                metrics.inc_replication_served(deliver.kind);
+            }
+        }
     }
 
     /// A responder's frame for `round`: echoed on v3, or on the v1/v2 raw path
@@ -967,7 +977,7 @@ impl ReplicationCoordinator {
         self.transport
             .send(&self.peer_key_id, &Self::reply_frame(msg, round))
             .await
-            .map(|_| ())
+            .map(|_| self.book_served(msg))
             .map_err(CoordinatorError::from)
     }
 
@@ -1151,7 +1161,7 @@ impl ReplicationCoordinator {
         self.transport
             .send(&self.peer_key_id, &bytes)
             .await
-            .map(|_| ())
+            .map(|_| self.book_served(msg))
             .map_err(CoordinatorError::from)
     }
 
@@ -2187,6 +2197,48 @@ mod tests {
             r,
             Err(CoordinatorError::Transport(TransportError::Unreachable(_)))
         ));
+    }
+
+    /// `replication_envelopes_served_total` counts what left: a `Deliver` whose
+    /// send failed is none of it, however many rows were fetched to pack it.
+    #[tokio::test]
+    async fn a_deliver_counts_as_served_only_when_it_left() {
+        let metrics = crate::observability::EdgeMetrics::default();
+        let (alice_t, _bob_t) = alice_bob_transports();
+        let alice_t = Arc::new(alice_t);
+        let coord_to = |peer: &str| {
+            ReplicationCoordinator::new(
+                Arc::clone(&alice_t) as Arc<dyn Transport>,
+                peer,
+                EnvelopeKind::Key,
+                SessionRole::Initiator,
+                Arc::new(StaticProvider {
+                    state: LocalState::new(),
+                    envelopes: HashMap::new(),
+                }),
+                RecordingApplier::with(HashMap::new(), std::collections::HashSet::new()),
+            )
+            .with_metrics(Some(metrics.clone()))
+        };
+        let deliver = ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::Key,
+            envelopes: vec![b"one".to_vec(), b"two".to_vec()],
+        });
+        let served = || {
+            metrics
+                .snapshot()
+                .replication_envelopes_served_total
+                .get(&EnvelopeKind::Key)
+                .copied()
+                .unwrap_or(0)
+        };
+        assert!(coord_to("nobody_home")
+            .send_message(&deliver)
+            .await
+            .is_err());
+        assert_eq!(served(), 0, "the send failed: nothing was served");
+        coord_to("bob").send_message(&deliver).await.expect("sent");
+        assert_eq!(served(), 2, "one per envelope that left");
     }
 
     /// `drive_round_step(None)` from an Initiator yields a Summary

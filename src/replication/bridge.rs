@@ -5111,20 +5111,10 @@ impl FederationDirectoryReplicationBridge {
                 }
             }
         }
-        // CIRISEdge#433 — the replication plane's metric-visible moment. This is
-        // where the bridge hands the wire bytes back to `pack_bounded_deliver`;
-        // every gate has cleared and local state resolved the row, so THIS layer's
-        // part of the transaction is definitely complete. Mirrors the CIRISEdge#28
-        // precedent (`edge.rs`: "durable enqueue is the metric-visible moment"):
-        // count where success is definite for the layer doing the counting, not at
-        // a peer acknowledgement this layer never observes. Two known, deliberate
-        // imprecisions, both bounded and both in the honest direction: the caller
-        // may drop the LAST fetched envelope when it would exceed
-        // `MAX_DELIVER_ENVELOPE_BYTES` (at most one per Deliver, re-served next
-        // round), and a Deliver frame lost in flight still counts as served — the
-        // same semantics `envelopes_sent_total` has carried since v0.19.0.
+        // Not `replication_envelopes_served_total`: this is a fetch, and an
+        // initiator's proactive push fetches before anything has left. The
+        // coordinator counts a Deliver when its send returns.
         if let Some(m) = self.metrics.as_ref() {
-            m.inc_replication_served(kind);
             // CIRISEdge#441 — a removal-class serve is an OFFER in the receipt
             // ledger: this peer was handed the row; the ack arrives when its
             // own next Summary advertises the hash.
@@ -19968,14 +19958,6 @@ pub(crate) mod tests {
             "an IDLE node withholds nothing — its ledger is empty, got {:?}",
             idle.withholds_by_reason
         );
-        assert_eq!(
-            idle.replication_envelopes_served_total
-                .get(&EnvelopeKind::Attestation)
-                .copied()
-                .unwrap_or(0),
-            idle_refs.len() as u64,
-            "an IDLE node's carriage equals what it advertised"
-        );
 
         // (b) WITHHOLDING — same wiring, plus one `trace:*` row the peer may not
         //     have (it holds no accord-conferred `infra:serve`).
@@ -20012,10 +19994,7 @@ pub(crate) mod tests {
             held.withholds_by_reason
         );
         assert_eq!(
-            held.replication_envelopes_served_total
-                .get(&EnvelopeKind::Attestation)
-                .copied()
-                .unwrap_or(0),
+            hold_refs_served(&held),
             0,
             "and it served NOTHING — the state that used to look identical to idle"
         );
@@ -20027,14 +20006,19 @@ pub(crate) mod tests {
         );
     }
 
-    /// CIRISEdge#433 — a serve that MOVES a row bumps
-    /// `replication_envelopes_served_total`, keyed by the same `EnvelopeKind` the
-    /// wire uses. This is the mirror-image defect: `inc_sent` is called only from
-    /// `src/edge.rs`, so before this counter a node that moved N rows through
-    /// anti-entropy rounds reported `envelopes_sent_total: 0` — reporting broken
-    /// while working.
+    fn hold_refs_served(snap: &crate::observability::EdgeMetricsBundle) -> u64 {
+        snap.replication_envelopes_served_total
+            .get(&EnvelopeKind::Attestation)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// CIRISEdge#433 — a fetch is not a serve: a proactive push fetches before
+    /// anything has left, so a node with no links read as carrying rows. The
+    /// count is the coordinator's, at the send
+    /// (`a_deliver_counts_as_served_only_when_it_left`).
     #[tokio::test]
-    async fn a_serve_that_moves_rows_bumps_the_replication_served_counter() {
+    async fn a_fetch_alone_does_not_count_as_served() {
         let local = "this-node";
         let producer = "agent-producer";
         let peer = "peer-consented";
@@ -20073,8 +20057,9 @@ pub(crate) mod tests {
                 .get(&EnvelopeKind::Attestation)
                 .copied()
                 .unwrap_or(0),
-            refs.len() as u64,
-            "one bump per envelope the bridge handed to the wire path"
+            0,
+            "nothing went anywhere: {} rows were only fetched",
+            refs.len()
         );
         assert!(
             snap.withholds_by_reason.is_empty(),

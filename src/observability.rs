@@ -3246,11 +3246,10 @@ impl EdgeMetrics {
 
     /// CIRISEdge#433 — increment the replication-plane served counter for `kind`.
     ///
-    /// Called at the bridge's serve exit — the moment the bridge hands the wire
-    /// bytes back to the pack path. Mirrors the CIRISEdge#28 precedent at
-    /// `edge.rs` "durable enqueue is the metric-visible moment": the counter marks
-    /// the point where THIS layer's part of the transaction is definitely
-    /// complete, not the point where the peer acknowledged it.
+    /// Called by the coordinator once per envelope of a `Deliver` whose send
+    /// returned: not at a fetch, because a proactive push fetches before
+    /// anything has left. It marks the transport taking the frame, not the
+    /// peer acknowledging it.
     pub fn inc_replication_served(&self, kind: EnvelopeKind) {
         let mut guard = self.replication_envelopes_served_total.write();
         *guard.entry(kind).or_insert(0) += 1;
