@@ -368,6 +368,24 @@ pub enum RoundEvent {
     /// Transport / protocol error during the round. The scheduler
     /// logged it; the next interval tick will try fresh.
     Error(String),
+    /// The transport has no route to the peer (CIRISEdge#794): an offline
+    /// client, which the backoff takes over, not a fault of the round.
+    NoRoute(String),
+}
+
+impl RoundEvent {
+    /// The `replication_round_outcomes_total` label this event books.
+    #[must_use]
+    pub fn outcome(&self) -> crate::observability::RoundOutcome {
+        use crate::observability::RoundOutcome;
+        match self {
+            Self::Completed(_) => RoundOutcome::Completed,
+            Self::Refused => RoundOutcome::Refused,
+            Self::TimedOut => RoundOutcome::TimedOut,
+            Self::Error(_) => RoundOutcome::Error,
+            Self::NoRoute(_) => RoundOutcome::NoRoute,
+        }
+    }
 }
 
 /// Periodically drive anti-entropy rounds on a set of Initiator-side
@@ -1301,13 +1319,14 @@ impl Default for RoundEnded {
 impl RoundEnded {
     /// What `event` says.
     fn of(event: &RoundEvent) -> Self {
-        let (outcome, error) = match event {
-            RoundEvent::Completed(_) => ("completed", None),
-            RoundEvent::Refused => ("refused", None),
-            RoundEvent::TimedOut => ("timed_out", None),
-            RoundEvent::Error(e) => ("error", Some(e.clone())),
+        let error = match event {
+            RoundEvent::Error(e) | RoundEvent::NoRoute(e) => Some(e.clone()),
+            RoundEvent::Completed(_) | RoundEvent::Refused | RoundEvent::TimedOut => None,
         };
-        Self { outcome, error }
+        Self {
+            outcome: event.outcome().as_str(),
+            error,
+        }
     }
 }
 
@@ -1366,7 +1385,7 @@ async fn round_and_report(
                     "signer-recovery round: no route to peer (CIRISEdge#794)",
                     &error,
                 );
-                let event = RoundEvent::Error(format!("transport: {error}"));
+                let event = RoundEvent::NoRoute(format!("transport: {error}"));
                 *ended = RoundEnded::of(&event);
                 if let Some(sink) = event_sink {
                     let _ = sink.send((peer_id.to_string(), event)).await;
@@ -1441,7 +1460,7 @@ async fn round_and_report(
                 "round: no route to peer (CIRISEdge#794)",
                 &e.to_string(),
             );
-            RoundEvent::Error(e.to_string())
+            RoundEvent::NoRoute(e.to_string())
         }
         Err(RoundError::Coordinator(e)) => {
             log_round_error(
@@ -1742,6 +1761,9 @@ mod tests {
         let ended = RoundEnded::of(&RoundEvent::Error("transport: no route".to_owned()));
         assert_eq!(ended.outcome, "error");
         assert_eq!(ended.error.as_deref(), Some("transport: no route"));
+        let ended = RoundEnded::of(&RoundEvent::NoRoute("transport: offline".to_owned()));
+        assert_eq!(ended.outcome, "no_route");
+        assert_eq!(ended.error.as_deref(), Some("transport: offline"));
         let ended = RoundEnded::of(&RoundEvent::TimedOut);
         assert_eq!((ended.outcome, ended.error), ("timed_out", None));
         assert_eq!(RoundEnded::default().outcome, "skipped");

@@ -1228,7 +1228,7 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("transport_bytes_out_total", "ciris.edge.transport.bytes.out", Counter, Bytes, Some(("transport", LabelValues::Tokens)), "Bytes sent, by transport."),
     spec("peer_reachability_ratio", "ciris.edge.peer.reachability", Gauge, Ratio, Some(("peer", LabelValues::PeerKeyed)), "Per-peer send success. Names peers: never public."),
     spec("inbound_dropped_low_trust", "ciris.edge.inbound.dropped_low_trust", Counter, Count, None, "Envelopes dropped by the trust short-circuit."),
-    spec("replication_round_outcomes_total", "ciris.edge.round.outcomes", Counter, Count, closed("outcome", &["completed", "refused", "timed_out", "error"]), "Anti-entropy rounds, by outcome."),
+    spec("replication_round_outcomes_total", "ciris.edge.round.outcomes", Counter, Count, closed("outcome", &["completed", "refused", "timed_out", "error", "no_route"]), "Anti-entropy rounds, by outcome."),
     spec("replication_inbound_backpressure_drops", "ciris.edge.replication.inbound.backpressure_drops", Counter, Count, None, "Frames dropped at a full coordinator inbox."),
     spec("replication_inbound_backpressure_drops_by_role", "ciris.edge.replication.inbound.backpressure_drops_by_role", Counter, Count, Some(("role", LabelValues::Tokens)), "The same, by role."),
     spec("blob_route_refusals", "ciris.edge.blob.route_refusals", Counter, Count, REASON, "Blob holders dropped from a pull, by refusal."),

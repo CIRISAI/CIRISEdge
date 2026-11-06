@@ -192,6 +192,8 @@ pub enum RoundOutcome {
     TimedOut,
     /// A transport / protocol / inbound-closed error aborted the round.
     Error,
+    /// The transport has no route to the peer: an offline client, not a fault.
+    NoRoute,
 }
 
 impl RoundOutcome {
@@ -204,6 +206,7 @@ impl RoundOutcome {
             Self::Refused => "refused",
             Self::TimedOut => "timed_out",
             Self::Error => "error",
+            Self::NoRoute => "no_route",
         }
     }
 }
@@ -3644,6 +3647,7 @@ impl EdgeMetrics {
                     RoundOutcome::Refused,
                     RoundOutcome::TimedOut,
                     RoundOutcome::Error,
+                    RoundOutcome::NoRoute,
                 ]
                 .iter()
                 .map(|o| (*o, held.get(o).copied().unwrap_or(0)))

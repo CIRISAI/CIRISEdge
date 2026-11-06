@@ -653,13 +653,7 @@ pub(crate) fn spawn_responder_drive(
 /// dropped here — high-cardinality per-round detail rides the round's
 /// tracing span, not the counter key.
 fn round_outcome_of(event: &RoundEvent) -> crate::observability::RoundOutcome {
-    use crate::observability::RoundOutcome;
-    match event {
-        RoundEvent::Completed(_) => RoundOutcome::Completed,
-        RoundEvent::Refused => RoundOutcome::Refused,
-        RoundEvent::TimedOut => RoundOutcome::TimedOut,
-        RoundEvent::Error(_) => RoundOutcome::Error,
-    }
+    event.outcome()
 }
 
 /// A `(peer_key_id, kind)` pair the runtime should anti-entropy with
