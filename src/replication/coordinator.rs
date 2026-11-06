@@ -175,6 +175,9 @@ pub enum PullDispatched {
 struct PullExchange {
     subject: String,
     replies: mpsc::Sender<ReplicationMessage>,
+    /// When its wait ran out. From then a re-ask does not count it, and it only
+    /// listens. See [`ReplicationCoordinator::PULL_LATE_WINDOW`].
+    late_since: Option<tokio::time::Instant>,
 }
 
 /// Binds one [`Session`] to one transport peer. The application
@@ -260,6 +263,18 @@ impl ReplicationCoordinator {
     /// waiting on it, and a fan-out of rounds must not queue it), so this is
     /// their bound. Past it the Pull fails to dispatch and the caller retries.
     pub const MAX_PULL_EXCHANGES: usize = 8;
+
+    /// How long a subject Pull still takes its answer after the caller's wait
+    /// ran out. The caller's wait is unchanged and re-asks go out on it; this
+    /// only stops a signed answer being dropped for arriving after its round.
+    /// On a canonical behind on its listings, Key answers reached a node after
+    /// their exchanges had closed, and were dropped, for minutes on end.
+    pub const PULL_LATE_WINDOW: Duration = Duration::from_secs(120);
+
+    /// Exchanges past their wait kept listening per `(peer, kind)`; the oldest
+    /// makes way. An asker's re-ask opens one about every 10 s, so this holds a
+    /// [`Self::PULL_LATE_WINDOW`] for one subject.
+    pub const MAX_LATE_PULL_EXCHANGES: usize = 16;
 
     /// The longest a peer's `retry_after_secs` is believed, so a hostile or
     /// broken hint cannot silence this node's Pulls.
@@ -1101,14 +1116,22 @@ impl ReplicationCoordinator {
                 .pull_exchanges
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if live.values().any(|e| e.subject == subject_key_id) {
+            let waiting = || live.values().filter(|e| e.late_since.is_none());
+            if waiting().any(|e| e.subject == subject_key_id) {
                 return Ok(PullDispatched::InFlight);
             }
-            if live.len() >= Self::MAX_PULL_EXCHANGES {
+            if waiting().count() >= Self::MAX_PULL_EXCHANGES {
                 return Err(CoordinatorError::TooManyPulls);
             }
             let subject = subject_key_id.to_owned();
-            live.insert(round, PullExchange { subject, replies });
+            live.insert(
+                round,
+                PullExchange {
+                    subject,
+                    replies,
+                    late_since: None,
+                },
+            );
         }
         let pull = ReplicationMessage::Pull(PullMessage {
             kind: self.kind,
@@ -1145,6 +1168,27 @@ impl ReplicationCoordinator {
         (left > 0).then_some(left)
     }
 
+    /// The wait ran out: stop counting this exchange as the ask in flight, and
+    /// keep listening. Past [`Self::MAX_LATE_PULL_EXCHANGES`] the oldest closes.
+    fn pull_went_late(&self, round: u64) {
+        let mut live = self
+            .pull_exchanges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(exchange) = live.get_mut(&round) {
+            exchange.late_since = Some(tokio::time::Instant::now());
+        }
+        let mut late: Vec<_> = live
+            .iter()
+            .filter_map(|(round, e)| e.late_since.map(|at| (at, *round)))
+            .collect();
+        late.sort_unstable();
+        let over = late.len().saturating_sub(Self::MAX_LATE_PULL_EXCHANGES);
+        for (_, oldest) in late.into_iter().take(over) {
+            live.remove(&oldest);
+        }
+    }
+
     fn close_pull_exchange(&self, round: u64) {
         self.pull_exchanges
             .lock()
@@ -1176,13 +1220,13 @@ impl ReplicationCoordinator {
             .step_pull_exchange(session, round, inbox, reply_timeout)
             .await
         {
-            Ok(Some(report)) => tracing::debug!(
+            Ok(Some(report)) => tracing::info!(
                 admitted = report.admitted,
                 refused = report.refused,
                 "subject Pull answered and applied"
             ),
-            Ok(None) => {}
-            Err(reason) => tracing::debug!(
+            Ok(None) => tracing::info!("subject Pull throttled by the peer"),
+            Err(reason) => tracing::info!(
                 reason,
                 "subject Pull exchange ended short; a later ask re-runs it"
             ),
@@ -1198,9 +1242,22 @@ impl ReplicationCoordinator {
         mut inbox: mpsc::Receiver<ReplicationMessage>,
         reply_timeout: Duration,
     ) -> Result<Option<RoundReport>, &'static str> {
+        let mut late = false;
         loop {
-            let Ok(Some(msg)) = tokio::time::timeout(reply_timeout, inbox.recv()).await else {
-                return Err("no reply in time");
+            let msg = match tokio::time::timeout(reply_timeout, inbox.recv()).await {
+                Ok(Some(msg)) => msg,
+                Err(_) if !late => {
+                    late = true;
+                    self.pull_went_late(round);
+                    let Ok(Some(msg)) =
+                        tokio::time::timeout(Self::PULL_LATE_WINDOW, inbox.recv()).await
+                    else {
+                        return Err("no reply in time");
+                    };
+                    tracing::info!("subject Pull: a reply came after its wait, and is kept");
+                    msg
+                }
+                Ok(None) | Err(_) => return Err("no reply in time"),
             };
             self.note_removal_ack(&msg);
             let throttled = match &msg {
@@ -1956,15 +2013,71 @@ mod tests {
     }
 
     /// A Pull that could not leave is the caller's to retry, and leaves no slot.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_silent_peers_exchange_times_out_and_frees_its_slot() {
         let (alice, _to_bob) = pull_rig(HashMap::new());
-        let _ = alice
-            .pull_exchange("dan", Duration::from_millis(30))
-            .await
-            .unwrap();
+        let t = Duration::from_millis(30);
+        let _ = alice.pull_exchange("dan", t).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            alice.pull_exchange("dan", t).await.unwrap(),
+            PullDispatched::Sent,
+            "the wait is over, so a re-ask goes out"
+        );
+        tokio::time::sleep(ReplicationCoordinator::PULL_LATE_WINDOW + t * 2).await;
         assert!(alice.pull_exchanges.lock().unwrap().is_empty());
+    }
+
+    /// The answer to an ask whose wait ran out is still that ask's answer, even
+    /// with a re-ask out.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_after_the_wait_is_kept() {
+        let (alice, to_bob) = pull_rig(HashMap::new());
+        let t = Duration::from_millis(30);
+        let _ = alice.pull_exchange("dan", t).await.unwrap();
+        let first = next_frame(&to_bob).await.meta.expect("v3").round;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = alice.pull_exchange("dan", t).await.unwrap();
+        let _ = next_frame(&to_bob).await;
+
+        alice
+            .deliver_reply(
+                summary_of(
+                    vec![EnvelopeRef {
+                        envelope_hash: h(3),
+                        seq: 1,
+                    }],
+                    None,
+                ),
+                first,
+            )
+            .expect("a late answer still routes");
+        let diff = next_frame(&to_bob).await;
+        assert_eq!(diff.meta.expect("v3").round, first);
+        assert!(matches!(diff.msg, ReplicationMessage::Diff(_)));
+    }
+
+    /// Asks that never hear back cost a bounded number of listeners.
+    #[tokio::test(start_paused = true)]
+    async fn exchanges_past_their_wait_are_bounded() {
+        let (alice, to_bob) = pull_rig(HashMap::new());
+        let t = Duration::from_millis(30);
+        let cap = ReplicationCoordinator::MAX_LATE_PULL_EXCHANGES;
+        let mut rounds = Vec::new();
+        for _ in 0..=cap {
+            let _ = alice.pull_exchange("dan", t).await.unwrap();
+            rounds.push(next_frame(&to_bob).await.meta.expect("v3").round);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(alice.pull_exchanges.lock().unwrap().len(), cap);
+        assert!(
+            !alice
+                .pull_exchanges
+                .lock()
+                .unwrap()
+                .contains_key(&rounds[0]),
+            "the oldest made way"
+        );
     }
 
     /// CIRISEdge#462 — the INITIATION drives the full RECEIVE cycle end-to-end: a
