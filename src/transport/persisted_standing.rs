@@ -557,6 +557,7 @@ mod tests {
         /// `binding_changes` never answers.
         changes_hang: AtomicBool,
         lists: AtomicUsize,
+        point_reads: AtomicUsize,
         walks: AtomicUsize,
         stands: AtomicUsize,
         in_flight: AtomicUsize,
@@ -625,6 +626,7 @@ mod tests {
             &self,
             key_id: &str,
         ) -> Result<Vec<LiveTransportBinding>, String> {
+            self.point_reads.fetch_add(1, Ordering::SeqCst);
             self.cost().await;
             Ok(self
                 .live
@@ -939,7 +941,6 @@ mod tests {
         let refresh = Arc::new(StandingRefresh::default());
         pass(&refresh, &dir).await;
         assert!(keys(&refresh).is_empty());
-        let walks = dir.walks.load(Ordering::SeqCst);
         dir.rooted.lock().unwrap().push("claimed".to_owned());
         dir.changes.lock().unwrap().push_back(BindingChanges {
             subjects: vec!["claimed".to_owned(), "a-stranger".to_owned()],
@@ -958,9 +959,9 @@ mod tests {
             "its chain roots here now"
         );
         assert_eq!(
-            dir.walks.load(Ordering::SeqCst),
-            walks,
-            "no stranger walked"
+            dir.point_reads.load(Ordering::SeqCst),
+            1,
+            "one key judged: the stranger cost no read"
         );
     }
 
