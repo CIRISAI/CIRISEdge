@@ -1092,18 +1092,31 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
     async fn binding_stands(&self, row: &LiveTransportBinding) -> bool {
         // Fail closed: neither a fold nor a revocation that cannot be read is
         // absent.
-        let Ok(claimants) = FederationDirectory::list_transport_destinations_by_destination(
-            self,
-            &hex::encode(row.dest_hash),
-        )
-        .await
+        let Ok(claimants) =
+            FederationDirectory::list_transport_destinations_by_destination_unfolded(
+                self,
+                &hex::encode(row.dest_hash),
+            )
+            .await
         else {
             return false;
         };
-        if !claimants
-            .iter()
-            .any(|c| c.occurrence_key_id == row.key_id && c.retired_at.is_none())
-        {
+        // This key's rows, not the destination's: folding every claimant costs
+        // an owner read per pair, and anyone can claim one destination with
+        // thousands of keys. The sweep runs this per row.
+        let own: Vec<_> = claimants
+            .into_iter()
+            .filter(|c| c.occurrence_key_id == row.key_id && c.retired_at.is_none())
+            .collect();
+        if own.is_empty() {
+            return false;
+        }
+        let Ok(kept) =
+            ciris_persist::federation::transport_routes::fold_one_live_key(self, own).await
+        else {
+            return false;
+        };
+        if kept.is_empty() {
             return false;
         }
         let now = chrono::Utc::now();

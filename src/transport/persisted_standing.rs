@@ -522,14 +522,17 @@ impl StandingRefresh {
                 rows: rows.into(),
             });
         }
-        while let Some(row) = walk.sweep.as_ref().and_then(|s| s.rows.front().cloned()) {
+        while walk.sweep.as_ref().is_some_and(|s| !s.rows.is_empty()) {
             if Instant::now() >= deadline {
                 return PassEnd::OutOfBudget;
             }
+            // Off the list before the judging: a row that outlasts the pass
+            // bound is dropped with the pass, and left on the list it would be
+            // the first row of every later pass, for good.
+            let Some(row) = walk.sweep.as_mut().and_then(|s| s.rows.pop_front()) else {
+                break;
+            };
             self.judge(walk, rooting, policy, &row, false).await;
-            if let Some(sweep) = &mut walk.sweep {
-                sweep.rows.pop_front();
-            }
             book(obs::PERSISTED_STANDING_ROWS_WALKED, 1);
         }
         if let Some(sweep) = walk.sweep.take() {
@@ -577,6 +580,8 @@ mod tests {
         list_hangs: AtomicBool,
         /// `binding_changes` never answers.
         changes_hang: AtomicBool,
+        /// `binding_stands` never answers for these keys.
+        stands_hang_for: Mutex<std::collections::HashSet<String>>,
         lists: AtomicUsize,
         point_reads: AtomicUsize,
         walks: AtomicUsize,
@@ -661,6 +666,9 @@ mod tests {
         async fn binding_stands(&self, row: &LiveTransportBinding) -> bool {
             self.stands.fetch_add(1, Ordering::SeqCst);
             self.cost().await;
+            if self.stands_hang_for.lock().unwrap().contains(&row.key_id) {
+                std::future::pending::<()>().await;
+            }
             !self.revoked.lock().unwrap().contains(&row.key_id)
         }
         async fn binding_changes(
@@ -882,6 +890,27 @@ mod tests {
             pass(&refresh, &dir).await,
             PassEnd::Skipped,
             "a cut pass gives the flight back"
+        );
+    }
+
+    /// A row whose judging never returns costs one pass, not every later one:
+    /// the sweep goes on past it.
+    #[tokio::test(start_paused = true)]
+    async fn a_row_that_outlasts_the_bound_does_not_hold_the_sweep() {
+        let dir = Arc::new(Rows::default());
+        *dir.live.lock().unwrap() = vec![row("stuck", 1, Advisory), row("next", 2, Advisory)];
+        *dir.signed.lock().unwrap() = vec!["stuck".to_owned(), "next".to_owned()];
+        dir.stands_hang_for
+            .lock()
+            .unwrap()
+            .insert("stuck".to_owned());
+        let refresh = Arc::new(StandingRefresh::default());
+        assert_eq!(pass(&refresh, &dir).await, PassEnd::Cut);
+        assert_eq!(pass(&refresh, &dir).await, PassEnd::Done);
+        assert_eq!(
+            dir.stands.load(Ordering::SeqCst),
+            2,
+            "the stuck row was tried once and the next row was reached"
         );
     }
 
