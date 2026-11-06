@@ -2306,7 +2306,7 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
     let _host = whole_host().await;
     let mut whole = false;
     for (tag, seed) in [("t2", 0xa0), ("t2b", 0xc0), ("t2c", 0xd0)] {
-        whole = tier_two_story(tag, seed).await;
+        whole = Box::pin(tier_two_story(tag, seed)).await;
         if whole {
             break;
         }
