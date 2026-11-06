@@ -1456,6 +1456,35 @@ async fn a_relay_leg_carrying_media_outlives_the_reaper_863() {
     )
     .expect("B subscribes over R");
 
+    // A row from A: an identity link, inbound at R and on no punched interface.
+    // A's call must not hold it: only a punched link is held for a call.
+    q.a.transport
+        .send(&r_id, b"row-from-a")
+        .await
+        .expect("A's row to R");
+    let a_dialled: Vec<[u8; 16]> =
+        q.a.transport
+            .link_directions_for_test()
+            .into_iter()
+            .filter(|(_, d)| *d == LinkDirection::Outbound)
+            .map(|(id, _)| id)
+            .collect();
+    let identity_from_a =
+        |planes: Vec<([u8; 16], ciris_edge::transport::reticulum::LinkPlane, bool)>| {
+            planes
+                .iter()
+                .filter(|(id, plane, _)| {
+                    *plane == ciris_edge::transport::reticulum::LinkPlane::Identity
+                        && a_dialled.contains(id)
+                })
+                .count()
+        };
+    assert_eq!(
+        identity_from_a(q.r.transport.link_planes_for_test().await),
+        1,
+        "the row's link"
+    );
+
     // A 2 s idle bound on both ends; media every 100 ms for 6 s; a reap
     // pass on both ends every 500 ms.
     let bound = Duration::from_secs(2);
@@ -1494,6 +1523,11 @@ async fn a_relay_leg_carrying_media_outlives_the_reaper_863() {
         held(q.b.transport.link_planes_for_test().await),
         "B kept the leg it only receives on (reaped at B: {})",
         reaped.1
+    );
+    assert_eq!(
+        identity_from_a(q.r.transport.link_planes_for_test().await),
+        0,
+        "a relayed identity link ages through its peer's call"
     );
     // And it is still carrying media: the last chunk arrives.
     let last = seq - 1;
