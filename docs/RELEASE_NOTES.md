@@ -50,6 +50,13 @@ Upgrade the canonical, the servers and every agent node together.
   measures.
 - **Direct links propose by default** (below), `direct_link_proposing="off"` being the operator's
   switch.
+- **`TransportError` gains `NoDialCandidate { key_id }`.** It is not `non_exhaustive`, so a host that
+  matches it exhaustively adds the arm. It reads `unreachable` to every caller outside replication.
+- **`RootingDirectory::live_reticulum_bindings` is gone** (it never reached a tag, only candidates of
+  this cut). Four methods replace it: `live_binding_rows` (one read, no fold and no revocation read),
+  `live_bindings_of(key_id)`, `binding_stands(row)` and `binding_changes(cursors, page)`. Every one has
+  a default, and the defaults stand nobody up: `binding_stands` is `false`. A directory that wants
+  persisted standing implements all four; the blanket impl over `FederationDirectory` does.
 
 ## The event path, for a long support window (CIRISEdge#947, #943, `FSD/EVENT_PATH_MODEL.md`)
 
@@ -76,6 +83,15 @@ Upgrade the canonical, the servers and every agent node together.
   the row's claim and a chain that roots here, otherwise the key hybrid-signed this route. A direct
   TCP client re-announces on interface-up and always rebound on its own; this is the case behind a
   hop.
+- **That read is one bounded pass, paid for by what changed.** As first written, each 30 s tick
+  spawned a pass over every live route: at the production copy's 18,060 routes a pass outlasted its
+  tick and they stacked, ~15 MB a tick, linear to 1,326 MB. Now one pass runs at a time, and a tick
+  that finds one running is skipped and counted. A pass stops at 10 s and is cut at 20 s. A tick drains
+  persist's route and attestation admission cursors, which a local write moves as an apply does, and
+  judges only the keys they name. A paced sweep walks the whole list every 10 min for what the cursors
+  cannot show. A row that proved nothing is memoised for 30 min, and a change naming its key ends the
+  memo. The fold and the revocations are read last, for a row that proved something. A read the store
+  did not serve leaves nobody standing, as before, and so does 10 min without a change read.
 - **The constants the model moved** (each with a real-path or mutation witness):
   `DECAP_QUEUE_STRANGER` 32 → 256, its own window budget, asserted at compile time;
   `DECAP_QUEUE_STANDING` 64 → 1024; `MAX_TRACKED_SWEEP_CURSORS` 512 → 8192;
@@ -99,7 +115,17 @@ Upgrade the canonical, the servers and every agent node together.
 - **A node asks for the path to a peer it wants** (#945's late joiner). A relay stops rebroadcasting
   an announce after its grace for up to an hour and replays nothing to a client that joins later, and
   edge's dial never asked: a relay still holding the path gave no route. A dial, a call and a pinned
-  first contact with no path now raise a request and wait 3 s, one ask per destination per 20 s.
+  first contact with no path now raise a request and wait 3 s, one ask per destination per 20 s. It
+  does not wait for a probe either, which may be 15 min off: a wanted peer's route landing on the
+  admission cursor raises the ask within a tick, and its announce clears the backoff the ordinary way.
+- **A peer with no dial candidate backs off, on a server too (#794).** `send` answered `Unreachable`,
+  which classed `Other`; on a server, which wires store-and-forward under `PendingOrLive`, it answered
+  `Queued`, so the round read as sent, waited out its reply and ended `timed_out`, the only outcome
+  the production copy books. Every plane swept before every send, on every tick and kick, and the
+  queue filled with frames of rounds already over. A replication frame is no longer queued, and no
+  candidate is the typed `NoDialCandidate`, which classes no-route. A ban is its own error, reached
+  only with a candidate in hand. A host's prime now emits `PathLearned`, since no announce may follow
+  one.
 - **A released row is fetched by hash (#776).** Past one page a release could not reach a row behind
   the watermark. The release queues up to 64 rows per (peer, plane) and the kicked round sends a
   Fetch of them; a Fetch that goes unanswered falls back to the ordinary round.
@@ -134,6 +160,14 @@ Upgrade the canonical, the servers and every agent node together.
   ticks, the shapers, refusal memory, decision rows and ALM, with log targets `edge.event_loop.slow`,
   `edge.alm.decision`, `edge.alm.failover`, `edge.call.ended`, `edge.refusal.terminal`,
   `edge.shaping.seat_lost` and `edge.direct_link.posture`.
+- **`persisted_standing`** counts the refresh: `persisted_standing_passes`, `_pass_ms`,
+  `_passes_skipped`, `_passes_cut`, `_read_failures`, `_changes_judged`, `_sweeps`, `_rows_walked`.
+  **`direct_link_upgrade_guarded`** is below.
+- **`replication_envelopes_served_total` counts at the send.** It was booked at the bridge's fetch,
+  and an initiator's proactive push fetches before anything has left, so a node with no links reported
+  rows served (+2,024 attestation and +1,398 transport_destination in 909 s on the production copy).
+  It is booked at the coordinator now, per envelope of a Deliver whose send returned, on all three
+  send doors. The receipt ledger's `removal_offer` still books at the fetch.
 
 ## persist v61.0.0 — the group plane rides the Attestation plane (CIRISPersist#991, #1148, #1122, #1123)
 
@@ -390,6 +424,25 @@ Upgrade the canonical, the servers and every agent node together.
   RNS, `av_call_805` A8/forge, 12/12 pinned to two cores. Still one hop by construction: no A/V
   leg crosses the canonical (known limits).
 
+## A/V: a call's own control traffic is not congestion (#945)
+
+- **The periodic binding re-announce no longer reads as congestion.** Every 10 s a publisher re-sent
+  its hybrid-signed binding, about ten Channel messages per leg with only a yield between them. That
+  filled the window, media was refused, the RTT spiked, and the egress meter took the smoothed RTT for
+  the uplink: a call learned a ceiling and shed its members on a schedule, each cycle resetting the
+  staleness that would have let the ceiling go. The parts are now 50 ms apart
+  (`REANNOUNCE_PART_GAP`), on the publisher's re-send and a relay's pass-through. A setup binding keeps
+  its pace: someone is waiting on it. On a 2-core load the mesh witnesses went from 3 of 11 failing to
+  12 of 12 passing, with no sheds and no ceilings.
+- **A measured ceiling goes stale.** A few seconds of congestion used to silence a publisher for the
+  rest of its call: each congested window lowered the ceiling toward what was sent, each shed sent
+  less, and nothing could lift it. Shedding under real congestion stays. A ceiling with no congested
+  window for 30 s is now forgotten, and each one learned again stands twice as long, up to 240 s. A
+  forwarder flagged for over-claiming keeps its ceiling.
+- **A publisher's measured ceiling is never read below one stream:** it is the one path nothing
+  replaces. Only the measurement gives way; an advertised cap and the uplink's other streams still
+  bind. Offers round, so one stream of room reads as one stream.
+
 ## #926 — a link whose Channel lands nothing is closed
 
 - The stall guard (`transport::link_stall`) counts Channel sends that land zero fragments because
@@ -412,6 +465,22 @@ Upgrade the canonical, the servers and every agent node together.
   initiator's proposal, so a peer that replied once still comes direct. Every retry edge schedules is
   jittered ±25 %. leviculum's own background re-proposal after a timeout or failed punch stays on its
   fixed backoff; the in-leviculum half is asked in leviculum#96.
+- **No Resource starts on a link with an upgrade in flight.** The two ends do not move at the same
+  instant and moving lowers the link's MTU, so a Resource advertised to a peer that already moved is
+  cut for the old MTU: every part is refused, and leviculum holds this end's move on the transfer with
+  no deadline. On the first cross-NAT run that lasted until the inbound reaper ended it at 120 s. The
+  identity pool now passes over an upgrading link and a send already on one gets `Busy`, whose path is
+  the Channel and the bounded retry (`direct_link_upgrade_guarded`: `upgrade_guarded_pool`,
+  `upgrade_guarded_ship`). Nothing waits, and the guard ends at the outcome or at `UPGRADE_GUARD_BOUND`,
+  every phase of a session at its deadline. A `Timeout` later than any session could be is
+  `direct_link_failed_held` in `direct_link`: the wedge, on a peer or a retry the guard cannot see.
+  It does not see leviculum's own re-proposals on the proposing side, a segmented transfer that began
+  before the upgrade, or a peer without this guard (leviculum#98 below).
+- **The inbound reaper leaves a punched link under a live call.** The punched interface closes with
+  the identity link it was punched for, and that link is inbound on the side that did not dial it,
+  where media never touches it. So the reaper closed it at its idle bound and cut a live call. A link
+  on a punched interface whose peer holds a live A/V link now counts as busy. A punched link with no
+  call ages, so the reaper still ends a wedge.
 - Server 0.5.245 restores its facilitator default to `bootstrap`; the agent's default is on from its v44 pin.
 
 ## The load ladder (`FSD/CIRIS_MESH.md` §7; Eric 2026-11-01)
@@ -568,6 +637,12 @@ Known at the tag, each tracked:
 - **E5.** Bulk is chosen by kind as well as size, so a small attachment takes the bulk link where the
   CC's rule is size alone. Deferred: a shaped fetch could cap chunk pulls at one per gap, measure
   first.
+- **leviculum#98 (a Resource across the move).** The guard above covers what edge can see. The
+  held side's `deferred` still has no deadline in leviculum, and the Resource's part size still follows
+  the current link MTU.
+- **leviculum#97 (`stop_shared`).** A link landing between edge's close pass and the node stopping
+  stays frozen, so that suspend runs to its deadline and reports `quiescent: false`. Low rate; edge
+  cannot close a link on a stopped node.
 - **CIRISEdge#939** (displacement to a shaped peer below, the carriage axis) and **#940** (rc17
   "who carries what": the consent-free set on stranger links, the forwarder's yes, owned routes).
   v44 ships the bound, the refusal and referrals. A shaped link to a stranger is not yet confined to
@@ -581,6 +656,11 @@ Known at the tag, each tracked:
 
 ## Known limits
 
+- **A relay with no floor can wait 30-240 s after a real shed.** The one-stream floor is a
+  publisher's. A relay's ceiling lifts only when it goes stale, so a child it shed under real
+  congestion waits that long to be taken back, longest for a relay that has re-learned the ceiling.
+- **A/V across real NATs is unproven.** The first cross-NAT run found the upgrade wedge and the reaper
+  above; no end-to-end call across real NATs has been shown on this tag.
 - **A/V through the canonical is not end to end.** A/V legs are still one hop by construction (a
   derived address answers only a one-hop neighbour), so two hard-NAT phones whose only common node is
   the canonical get no leg; the roster-relay tier and the audio-only canonical policy apply where a

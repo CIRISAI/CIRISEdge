@@ -971,7 +971,7 @@ impl AvSpine {
                         channel_limit = refusal.channel_limit,
                         suppressed_prev,
                         "AV spine publish: chunk REFUSED — larger than the link Channel \
-                         carries (tracked: CIRISEdge#720); cut chunks to fit"
+                         carries (history: CIRISEdge#720); cut chunks to fit"
                     );
                 }
                 LegOutcome::Oversized { refusal }

@@ -19819,14 +19819,14 @@ async fn receive_announce(ctx: &EventCtx<'_>, view: AnnounceView, link: Option<L
                 tracing::warn!(
                     key_id = ?key_id,
                     "announce Stage 2 shed — re-announce of a bound peer, worker queue full \
-                     (backpressure); RNS re-announce will retry (tracked: CIRISEdge#482 item 3)"
+                     (backpressure); RNS re-announce will retry (history: CIRISEdge#482 item 3)"
                 );
             }
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             tracing::error!(
                 "announce Stage 2 DROPPED — cold-start worker is GONE (channel closed: the \
-                 worker task exited); rooting is no longer being processed (tracked: CIRISEdge#482 \
+                 worker task exited); rooting is no longer being processed (history: CIRISEdge#482 \
                  item 3)"
             );
         }

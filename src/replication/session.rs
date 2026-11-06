@@ -1331,7 +1331,7 @@ impl Session {
                             suppressed_prev,
                             "delivered envelope REFUSED — not applied (history: CIRISEdge#425 apply choke \
                              point); further refusals naming this signer on this plane log at \
-                             DEBUG for the next 30 min (tracked: CIRISEdge#858)"
+                             DEBUG for the next 30 min (history: CIRISEdge#858)"
                         ),
                         ThrottleDecision::Suppress => tracing::debug!(
                             kind = ?self.kind,
