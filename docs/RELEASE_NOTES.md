@@ -3,8 +3,8 @@
 # v44.0.0 — the group plane as rows, calls on the ALM mesh, a phone that sleeps
 
 **2026-11-05.** **MAJOR** from v43.4.1, and the **long-term support line** while persist does its
-refactor (Eric, 2026-11-05). Pins CIRISPersist **v61.0.3** (tag, 7894b39c), CIRISVerify **v22.0.0**
-(cbcd957) and leviculum **v0.33.0+ciris.1** (a3dc12cd). Python requires `ciris-persist>=61.0.3,<62`,
+refactor (Eric, 2026-11-05). Pins CIRISPersist **v61.0.4** (tag, e7ead8fc), CIRISVerify **v22.0.0**
+(cbcd957) and leviculum **v0.33.0+ciris.1** (a3dc12cd). Python requires `ciris-persist>=61.0.4,<62`,
 which declares `ciris-verify>=22,<23`. Under pyo3 every door call runs inside the wheel, so an older
 61.0.x wheel loads clean and keeps its old verdicts: only that floor excludes it. CC v1.0-rc15
 namespace manifests stay vendored at ace6b74 (189 families, 1244 vectors, registry df79a1dd); the
@@ -243,7 +243,7 @@ Upgrade the canonical, the servers and every agent node together.
 - **Tests:** `chat_message_federates`' three-member room stays `#[ignore]`d for the cosign flow;
   `kick_three_peers_740` rounds on the eight scheduled planes.
 
-## persist 61.0.1, 61.0.2, 61.0.3
+## persist 61.0.1, 61.0.2, 61.0.3, 61.0.4
 
 - **61.0.1 (c28af914):** an invitee's node receives a group's record while its proposal is live
   (#1193; on 61.0.0 no non-founder joiner's node could, in any family or room, so 61.0.0 was never an
@@ -261,6 +261,25 @@ Upgrade the canonical, the servers and every agent node together.
   #858 cap moves it to the terminal schedule, re-asked at most every six hours. A node on 61.0.3
   refuses a moderator's removal from an older node, so the fleet's rosters can differ until all
   upgrade: one more reason this cut is coordinated.
+
+- **61.0.4 (e7ead8fc):** a route fold reads each key's owner once (#1222). It asked per pair of
+  claimants on a destination, and one production destination holds 3,281 keys. It also adds a SQLite
+  statement cache.
+
+## A crowded destination no longer costs a node its CPU
+
+A standing check read its whole destination folded, at about 10.7M reads for the production
+destination above. The pass bound dropped the check, the row stayed at the head of the sweep, and
+every later pass repeated it: an idle node read about 4,000 times a second for as long as it ran. A
+check now folds only that key's rows, and a row leaves the sweep before it is judged, so a row that
+outlasts the bound costs one pass. Anyone can mint this shape, so the fix does not rest on the rows
+being cleaned up.
+
+## A subject Pull keeps an answer that comes after its wait
+
+An exchange closed when its caller's wait ran out, so a peer slower than that had every answer
+dropped as answering no round. The wait is unchanged and re-asks go out on it; the exchange listens
+on for 120 s (`PULL_LATE_WINDOW`), at most 16 per peer and plane. Pull outcomes log at INFO.
 
 ## CIRISVerify 22.0.0 (20.2.0 → 22.0.0)
 

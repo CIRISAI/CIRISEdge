@@ -441,7 +441,7 @@ publish = false
 #     registers a SINGLE-role `identity_type` — no fixture encoded the
 #     repealed loophole.
 #   * 2566bc54 still pins CIRISVerify v13.6.1 — one `ciris-verify-core`.
-# v44.0.0 (CIRISPersist v61.0.3, 7894b39c; #1199 #1200 on 61.0.2, 60bafd60; #1195 #1192 on 61.0.1, c28af914; #1193 #1184 #1182 on 61.0.0, 4f4dcc48). Prestaged by rev on
+# v44.0.0 (CIRISPersist v61.0.4, e7ead8fc, a fold of k keys reads each owner once, #1222; 61.0.3, 7894b39c; #1199 #1200 on 61.0.2, 60bafd60; #1195 #1192 on 61.0.1, c28af914; #1193 #1184 #1182 on 61.0.0, 4f4dcc48). Prestaged by rev on
 # release-61.0.0 (ac9d78c6 -> c9644c67 -> b4bb9e9a -> 3de0cd44) and flipped to
 # the tag. ABI 12: the six framed group kinds, the member listing, the framed
 # KeyGrant and the org/partner planes retire; the group plane rides the
@@ -451,7 +451,7 @@ publish = false
 # (#1192). 61.0.3 likewise: a takedown binds a chat row's room (#1199) and a
 # moderator's signature removes nobody (#1200). The doors run in the wheel, so
 # pyproject's floor moves with this pin.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.0.3", version = "61", features = ["sqlite", "encrypted-kv"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.0.4", version = "61", features = ["sqlite", "encrypted-kv"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -1619,7 +1619,7 @@ async-trait        = "0.1"
 # two `ciris-verify-core` cdylibs — the empty-stdout SIGSEGV class).
 # v38.6.0 (CIRISPersist#774) — held in lockstep with the runtime pin above
 # through the RC-adopt and back onto `tag`. These two move together, always.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.0.3", version = "61", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv", "test-anchor"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.0.4", version = "61", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv", "test-anchor"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3
