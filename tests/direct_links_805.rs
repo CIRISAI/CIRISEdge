@@ -2530,7 +2530,7 @@ async fn one_side_moves_the_other_sends(
     ciris_crypto::random::fill(&mut frame).expect("random frame");
     let sender = Arc::clone(&behind.transport);
     let to = ahead.key.key_id.clone();
-    let send = tokio::spawn(async move {
+    let in_flight = tokio::spawn(async move {
         let started = std::time::Instant::now();
         let sent = if pinned {
             let path = ReplyPath::new(TransportId::RETICULUM_RS, link);
@@ -2553,7 +2553,7 @@ async fn one_side_moves_the_other_sends(
         "the side behind moves once the COMPLETE lands, a frame in flight or not: {up:?}"
     );
     assert!(behind.transport.direct_link_interface(link).is_some());
-    let (sent, took) = tokio::time::timeout(Duration::from_secs(60), send)
+    let (sent, took) = tokio::time::timeout(Duration::from_secs(60), in_flight)
         .await
         .expect("the send ends")
         .expect("the send task");
@@ -2592,7 +2592,7 @@ fn guarded(m: &EdgeMetrics, label: &str) -> u64 {
 /// ship refusal is what counts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_send_by_key_during_an_upgrade_takes_another_lane() {
-    let m = one_side_moves_the_other_sends("upg-key", true, false).await;
+    let m = Box::pin(one_side_moves_the_other_sends("upg-key", true, false)).await;
     assert!(guarded(&m, "upgrade_guarded_pool") > 0);
     assert_eq!(guarded(&m, "upgrade_guarded_ship"), 0);
 }
@@ -2605,7 +2605,7 @@ async fn a_send_by_key_during_an_upgrade_takes_another_lane() {
 /// Mutation: the ship refusal gone, the wedge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_pinned_to_an_upgrading_link_waits_for_the_move() {
-    let m = one_side_moves_the_other_sends("upg-pin", true, true).await;
+    let m = Box::pin(one_side_moves_the_other_sends("upg-pin", true, true)).await;
     assert!(guarded(&m, "upgrade_guarded_ship") > 0);
 }
 
@@ -2613,6 +2613,6 @@ async fn an_answer_pinned_to_an_upgrading_link_waits_for_the_move() {
 /// Mutation: no acceptance record, the wedge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_acceptor_sending_during_an_upgrade_starts_no_resource() {
-    let m = one_side_moves_the_other_sends("upg-acc", false, false).await;
+    let m = Box::pin(one_side_moves_the_other_sends("upg-acc", false, false)).await;
     assert!(guarded(&m, "upgrade_guarded_ship") > 0);
 }
