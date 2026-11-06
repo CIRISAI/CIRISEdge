@@ -1173,6 +1173,33 @@ fn reverse_path_fallback_log() -> &'static crate::log_throttle::LogThrottle {
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
 }
 
+static UPGRADE_GUARD_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// v44 — one Resource kept off a link with an upgrade in flight: `label` says
+/// where (`UPGRADE_GUARDED_*`). Counted every time; the line is throttled per
+/// label, and names no peer at INFO.
+fn note_upgrade_guarded(
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    label: &'static str,
+    side: Option<crate::transport::direct_path::UpgradeSide>,
+) {
+    if let Some(m) = metrics {
+        m.inc_direct_link_upgrade_guarded(label);
+    }
+    let throttle = UPGRADE_GUARD_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 16));
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } = throttle.check(label) {
+        tracing::info!(
+            guarded = label,
+            side = side.map_or("-", crate::transport::direct_path::UpgradeSide::as_str),
+            suppressed_prev,
+            "direct link: no Resource on a link with an upgrade in flight; another lane, or the \
+             Channel and a bounded retry (v44, the first cross-NAT run's hold)"
+        );
+    }
+}
+
 static INBOUND_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
 
@@ -3411,6 +3438,7 @@ impl ReticulumTransport {
             deferred_handshake_part: Arc::clone(&self.deferred_handshake_part),
             test_binding_key_only: Arc::clone(&self.test_binding_key_only),
             stall_guard: Arc::clone(&self.stall_guard),
+            direct_paths: Arc::clone(&self.direct_paths),
             relay_steer: self.steer_roster_relays.then(|| RelaySteer {
                 budget: self.relay_establish_budget,
                 established: Arc::clone(&self.established_links),
@@ -10340,6 +10368,18 @@ impl ReticulumTransport {
                 Err(e) => Err(ShipError::Other(TransportError::Io(e.to_string()))),
             };
         }
+        // v44 — no Resource starts on a link with an upgrade in flight: the
+        // peer may already be at the direct MTU, and this end's parts would be
+        // refused for good (`direct_path` module docs). `Busy` is the caller's
+        // Channel path and bounded retry; the upgrade waits on neither.
+        if let Some(side) = self.direct_paths.upgrade_in_flight(link_id) {
+            note_upgrade_guarded(
+                self.metrics.get(),
+                crate::observability::UPGRADE_GUARDED_SHIP,
+                Some(side),
+            );
+            return Err(ShipError::Busy);
+        }
         // CC 5.3.3.5 E1 — the Resource carries the SEALED envelope; a link
         // with no keys ships nothing (and opens no Resource lane).
         let sealed = self
@@ -12282,6 +12322,8 @@ struct DialCtx {
     /// CIRISEdge#926 — see `ReticulumTransport::stall_guard`: the pool never
     /// hands out a link it judged dead.
     stall_guard: Arc<crate::transport::link_stall::LinkStallGuard>,
+    /// v44 — the pool hands out no link with an upgrade in flight.
+    direct_paths: Arc<crate::transport::direct_path::DirectPaths>,
     /// ALM stage 2 — roster relays before the default path (R2); `None`
     /// when the transport's `steer_roster_relays` is off.
     relay_steer: Option<RelaySteer>,
@@ -13638,10 +13680,21 @@ impl DialCtx {
         // Resource on it to collide with), so a burst of rows never opens a
         // second shaped link and spends another of the eight.
         let identity = |id: &&LinkId| planes.get(*id) == Some(&LinkPlane::Identity);
+        // v44 — nor a link with an upgrade in flight: the send takes another
+        // lane, or dials one (`direct_path` module docs). A shaped link has no
+        // Resource lane to keep off.
+        let upgrading: HashMap<LinkId, _> = pool
+            .iter()
+            .filter_map(|id| Some((*id, self.direct_paths.upgrade_in_flight(id)?)))
+            .collect();
         let picked = if self.bulk_lane {
             pool.iter()
                 .filter(identity)
-                .find(|id| !in_flight.contains(*id) && !self.shapers.is_shaped(id.into_bytes()))
+                .find(|id| {
+                    !in_flight.contains(*id)
+                        && !self.shapers.is_shaped(id.into_bytes())
+                        && !upgrading.contains_key(*id)
+                })
                 .copied()
         } else {
             pool.iter()
@@ -13649,11 +13702,27 @@ impl DialCtx {
                 .find(|id| self.shapers.is_shaped(id.into_bytes()))
                 .or_else(|| {
                     pool.iter().filter(identity).find(|id| {
-                        !in_flight.contains(*id) && !self.shapers.is_bulk(id.into_bytes())
+                        !in_flight.contains(*id)
+                            && !self.shapers.is_bulk(id.into_bytes())
+                            && !upgrading.contains_key(*id)
                     })
                 })
                 .copied()
         };
+        if !picked.is_some_and(|id| self.shapers.is_shaped(id.into_bytes())) {
+            let passed = pool
+                .iter()
+                .filter(identity)
+                .filter(|id| !in_flight.contains(*id))
+                .find_map(|id| upgrading.get(id));
+            if let Some(side) = passed {
+                note_upgrade_guarded(
+                    self.metrics.as_ref(),
+                    crate::observability::UPGRADE_GUARDED_POOL,
+                    Some(*side),
+                );
+            }
+        }
         // CIRISEdge#819 (Codex on #821) — a hand-out RESERVES the lane: it is
         // marked in flight here, under the pool lock, so the caller owns the
         // transfer from this instant. A stamp alone was not enough: a
@@ -18270,6 +18339,13 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
             ctx.direct_paths.config.accept,
             shares_room,
         );
+    // v44 — before the answer goes, so the outcome cannot precede the record:
+    // from here this link may move under a Resource (`direct_path` docs).
+    if accepted {
+        ctx.direct_paths
+            .tracker()
+            .accepted(link_id, std::time::Instant::now());
+    }
     // The initiator's proposal came: nothing left to yield to.
     if let Some(p) = peer.as_deref() {
         ctx.direct_paths.clear_yield(p);
@@ -18321,17 +18397,25 @@ async fn direct_link_failed(
     proposed: bool,
 ) {
     let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
-    let peer = ctx
-        .direct_paths
-        .tracker()
-        .failed(
-            link_id,
-            failure,
-            std::time::Instant::now(),
-            crate::transport::direct_path::jitter_draw(),
-        )
-        .or(hint);
-    let reason = crate::transport::direct_path::failure_label(failure);
+    let now = std::time::Instant::now();
+    let (peer, held) = {
+        let mut tracker = ctx.direct_paths.tracker();
+        let held = tracker.failure_was_a_hold(&link_id, failure, now);
+        let peer = tracker
+            .failed(
+                link_id,
+                failure,
+                now,
+                crate::transport::direct_path::jitter_draw(),
+            )
+            .or(hint);
+        (peer, held)
+    };
+    let reason = if held {
+        crate::observability::DIRECT_LINK_FAILED_HELD
+    } else {
+        crate::transport::direct_path::failure_label(failure)
+    };
     if let Some(m) = ctx.metrics {
         m.inc_direct_link(reason);
     }
@@ -18339,6 +18423,7 @@ async fn direct_link_failed(
         link = %hex::encode(link_id.as_bytes()),
         peer = peer.as_deref().unwrap_or("<unattributed>"),
         ?failure,
+        held,
         proposed,
         "direct link FAILED: the link keeps its relayed path (CIRISEdge#805 item 8)"
     );

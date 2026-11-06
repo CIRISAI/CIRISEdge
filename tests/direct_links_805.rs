@@ -428,15 +428,16 @@ struct Trio {
 /// `T`, then `A` and `B` as its clients, each holding the other's
 /// hybrid-signed route, each having learned the other's announce through `T`.
 async fn trio(tag: &str, a_direct: DirectLinksConfig, b_direct: DirectLinksConfig) -> Trio {
-    trio_uplink(tag, a_direct, b_direct, None).await
+    trio_uplink(tag, a_direct, b_direct, None, None).await
 }
 
-/// [`trio`], with B reaching `T` through a [`held_uplink`] when `b_uplink`
-/// names one.
+/// [`trio`], with a side reaching `T` through a [`held_uplink`] when its uplink
+/// is named.
 async fn trio_uplink(
     tag: &str,
     a_direct: DirectLinksConfig,
     b_direct: DirectLinksConfig,
+    a_uplink: Option<Arc<std::sync::atomic::AtomicU64>>,
     b_uplink: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> Trio {
     init_tracing();
@@ -444,6 +445,10 @@ async fn trio_uplink(
     let t_port = free_port();
     let f_port = free_udp_port();
     let t = transport_node(t_port, f_port).await;
+    let a_t_port = match a_uplink {
+        Some(held) => held_uplink(t_port, held).await,
+        None => t_port,
+    };
     let b_t_port = match b_uplink {
         Some(held) => held_uplink(t_port, held).await,
         None => t_port,
@@ -459,7 +464,14 @@ async fn trio_uplink(
     let records = vec![key_a.record().await, key_b.record().await];
     let a_dir = directory_with(records.clone()).await;
     let b_dir = directory_with(records).await;
-    let a = side(key_a, &a_dir, &tmp.path().join("a"), t_port, fill(a_direct)).await;
+    let a = side(
+        key_a,
+        &a_dir,
+        &tmp.path().join("a"),
+        a_t_port,
+        fill(a_direct),
+    )
+    .await;
     let b = side(
         key_b,
         &b_dir,
@@ -2439,27 +2451,43 @@ async fn a_yields_timer_does_not_propose_while_suspended() {
 
 /// **v44 — one side moves, the other holds.** The wedge of the first cross-NAT
 /// run (agent run 42157633553), with the real path: `A` proposes on its
-/// identity link, both punches land, and `B`'s COMPLETE reaches `A` late, so
-/// `B` is on the punched interface at the direct MTU while `A` is still
-/// committing on the relay at the link's old one. A frame `A` ships now is
-/// advertised to a `B` that has already lowered its MTU: `B` sizes the parts
-/// from its own MTU, refuses every part `A` cuts, and leviculum holds `A`'s
-/// move on the Resource that cannot finish.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_frame_sent_while_the_peer_has_moved_does_not_hold_the_upgrade() {
+/// identity link, both punches land, and one side's COMPLETE arrives late, so
+/// the other is on the punched interface at the direct MTU while this one is
+/// still committing on the relay at the link's old one. A frame this side
+/// ships now is advertised to a peer that has already lowered its MTU: the
+/// peer sizes the parts from its own MTU, refuses every part this side cuts
+/// (`InvalidPart`, `len=16348`), and leviculum holds this side's move on the
+/// Resource that cannot finish. Returns the behind side's metrics.
+///
+/// `proposer_behind` picks the side that sends: `A`, or the accepting `B`.
+/// `pinned` sends on the upgrading link itself, as an answer does.
+async fn one_side_moves_the_other_sends(
+    tag: &str,
+    proposer_behind: bool,
+    pinned: bool,
+) -> EdgeMetrics {
+    use ciris_edge::transport::{ReplyPath, TransportId};
     use std::sync::atomic::{AtomicU64, Ordering};
-    // How long `A` stays behind `B`, and so the headroom a slow runner has for
-    // the send below to start inside the window. On from before the link is
-    // dialled: the Channel has to learn this RTT, or a hold that appears on a
-    // millisecond link exhausts its retries and closes it.
+    // How long the behind side stays behind, and so the headroom a slow runner
+    // has for the send below to start inside the window. On from before the
+    // link is dialled: the Channel has to learn this RTT, or a hold that
+    // appears on a millisecond link exhausts its retries and closes it.
     const HOLD: Duration = Duration::from_secs(2);
 
     let held = Arc::new(AtomicU64::new(0));
+    // The ahead side's bytes are the late ones: it moves on the behind side's
+    // COMPLETE at once, and the behind side hears its COMPLETE a HOLD later.
+    let (a_uplink, b_uplink) = if proposer_behind {
+        (None, Some(Arc::clone(&held)))
+    } else {
+        (Some(Arc::clone(&held)), None)
+    };
     let mut p = trio_uplink(
-        "upg",
+        tag,
         proposer(),
         DirectLinksConfig::default(),
-        Some(Arc::clone(&held)),
+        a_uplink,
+        b_uplink,
     )
     .await;
     held.store(u64::try_from(HOLD.as_millis()).unwrap(), Ordering::Relaxed);
@@ -2476,57 +2504,97 @@ async fn a_frame_sent_while_the_peer_has_moved_does_not_hold_the_upgrade() {
             .propose_direct_on_link_for_test(&p.b.key.key_id, link)
             .await;
     assert_eq!(proposed, "proposed");
-    let moved = next_event(&mut p.b.events, Duration::from_secs(30), |e| {
+    let (behind, ahead) = if proposer_behind {
+        (&mut p.a, &mut p.b)
+    } else {
+        (&mut p.b, &mut p.a)
+    };
+    let moved = next_event(&mut ahead.events, Duration::from_secs(30), |e| {
         matches!(e, DirectPathEvent::Established { .. })
     })
     .await
-    .expect("B moves: A's COMPLETE reached it");
+    .expect("the side ahead moves: the other's COMPLETE reached it");
     assert!(
-        matches!(
-            &moved,
-            DirectPathEvent::Established {
-                proposed: false,
-                ..
-            }
-        ),
+        matches!(&moved, DirectPathEvent::Established { proposed, .. }
+            if *proposed != proposer_behind),
         "{moved:?}"
     );
     assert!(
-        p.a.transport.direct_link_interface(link).is_none(),
-        "A has not moved yet: B's COMPLETE is still on the held uplink"
+        behind.transport.direct_link_interface(link).is_none(),
+        "the side behind has not moved: the COMPLETE is still on the held uplink"
     );
 
     // Over the Channel-first cap, so this is a Resource by size; random so it
     // does not compress below it.
     let mut frame = vec![0u8; 400 * 1024];
     ciris_crypto::random::fill(&mut frame).expect("random frame");
-    let sender = Arc::clone(&p.a.transport);
-    let b_key = p.b.key.key_id.clone();
+    let sender = Arc::clone(&behind.transport);
+    let to = ahead.key.key_id.clone();
     let send = tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let sent = sender.send(&b_key, &frame).await;
+        let sent = if pinned {
+            let path = ReplyPath::new(TransportId::RETICULUM_RS, link);
+            sender.send_on_reply_path_only(&to, &path, &frame).await
+        } else {
+            sender.send(&to, &frame).await
+        };
         (sent, started.elapsed())
     });
 
-    let up = next_event(&mut p.a.events, HOLD + Duration::from_secs(25), |e| {
+    let up = next_event(&mut behind.events, HOLD + Duration::from_secs(25), |e| {
         matches!(
             e,
             DirectPathEvent::Established { .. } | DirectPathEvent::Failed { .. }
         )
     })
     .await;
-    held.store(0, Ordering::Relaxed);
     assert!(
-        matches!(
-            &up,
-            Some(DirectPathEvent::Established { proposed: true, .. })
-        ),
-        "A moves once B's COMPLETE lands, the frame in flight or not: {up:?}"
+        matches!(&up, Some(DirectPathEvent::Established { .. })),
+        "the side behind moves once the COMPLETE lands, a frame in flight or not: {up:?}"
     );
-    assert!(p.a.transport.direct_link_interface(link).is_some());
+    assert!(behind.transport.direct_link_interface(link).is_some());
     let (sent, took) = tokio::time::timeout(Duration::from_secs(60), send)
         .await
         .expect("the send ends")
         .expect("the send task");
     sent.unwrap_or_else(|e| panic!("the frame is delivered ({took:?}): {e:?}"));
+    behind.metrics.clone()
+}
+
+fn guarded(m: &EdgeMetrics, label: &str) -> u64 {
+    m.direct_link_upgrade_guarded()
+        .get(label)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The proposer behind, sending by key: its dialled lane is upgrading, so the
+/// pool passes over it and the frame takes another lane.
+/// Mutation: the pool's filter gone, the send takes the upgrading link and the
+/// ship refusal is what counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_by_key_during_an_upgrade_takes_another_lane() {
+    let m = one_side_moves_the_other_sends("upg-key", true, false).await;
+    assert!(guarded(&m, "upgrade_guarded_pool") > 0);
+    assert_eq!(guarded(&m, "upgrade_guarded_ship"), 0);
+}
+
+/// The proposer behind, answering on the upgrading link: no other lane may
+/// carry it. The send gets `Busy`, its Channel fragments (cut for the old MTU)
+/// do not finish before the move shrinks the link under them, and the bounded
+/// retry ships the Resource once this side has moved: the upgrade finished
+/// first, and the frame is cut for the MTU both ends hold.
+/// Mutation: the ship refusal gone, the wedge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_pinned_to_an_upgrading_link_waits_for_the_move() {
+    let m = one_side_moves_the_other_sends("upg-pin", true, true).await;
+    assert!(guarded(&m, "upgrade_guarded_ship") > 0);
+}
+
+/// The ACCEPTOR behind: it knows of the upgrade only by the peer's request.
+/// Mutation: no acceptance record, the wedge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acceptor_sending_during_an_upgrade_starts_no_resource() {
+    let m = one_side_moves_the_other_sends("upg-acc", false, false).await;
+    assert!(guarded(&m, "upgrade_guarded_ship") > 0);
 }

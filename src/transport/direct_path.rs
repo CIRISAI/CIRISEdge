@@ -78,6 +78,35 @@
 //! unjittered and past the tie-break; only a node that proposed retries, so it
 //! takes a responder's [`GLARE_WAIT`] fallback for both ends to be on it.
 //!
+//! # An upgrade in flight starts no Resource (v44)
+//!
+//! The two ends of an upgrade do not move at the same instant. A side moves
+//! when it holds the peer's COMPLETE, and moving lowers the link's MTU. A
+//! Resource advertised to a peer that already moved is sized by the peer from
+//! its lowered MTU, while the sender, still on the relay, cuts parts for the
+//! old one; every part is refused, the transfer cannot finish, and leviculum
+//! holds the sender's own move on that transfer with no deadline (agent run
+//! 42157633553, leviculum's issue is the proper fix). So from the moment an
+//! upgrade starts until its outcome, this node starts no Resource on that
+//! link ([`DirectPathTracker::upgrade_in_flight`]): the identity pool hands
+//! out another lane, and a send that already holds the link gets `Busy`, whose
+//! path is the Channel and then a bounded retry, which ships once the link has
+//! moved. Past that retry a by-key send dials and a pinned answer fails, for
+//! its round to send again. Nothing here waits, and the upgrade needs no
+//! Resource, so the guard cannot deadlock it. It ends at
+//! [`UPGRADE_GUARD_BOUND`] whatever happened to the outcome.
+//!
+//! What it does not see:
+//!
+//! - leviculum's background re-proposal, which tells edge nothing until its
+//!   outcome. The peer's side of one is guarded as any request is, this
+//!   side's is not.
+//! - a Resource that started before the upgrade did. Its advertisement went
+//!   first, so the peer sized it before moving and it finishes; a transfer
+//!   split into segments advertises each one, so a later segment can still
+//!   meet a moved peer.
+//! - a peer without this guard, which can wedge itself against this node.
+//!
 //! # Scope of a proposal
 //!
 //! Proposing reveals this node's public address to the peer, so edge proposes
@@ -112,6 +141,24 @@ pub const DIRECT_PATH_BUDGET: Duration = Duration::from_secs(20);
 /// was cancelled before the proposal was dispatched, or its event was lost),
 /// so a peer can never be wedged `InFlight`.
 pub const DIRECT_PROPOSING_STALE: Duration = Duration::from_secs(40);
+
+/// v44 — the longest a leviculum upgrade session can run: every phase of the
+/// proposing side at its deadline, end to end. No session of its own reaches
+/// a `Timeout` later than this after it started, which is how edge tells a
+/// [`held_failure`], and an upgrade with no outcome by then has released
+/// [`DirectPathTracker::upgrade_in_flight`].
+pub const UPGRADE_GUARD_BOUND: Duration = Duration::from_millis(
+    leviculum_core::direct_link::session::DISCOVER_TIMEOUT_MS
+        + leviculum_core::direct_link::session::PROPOSE_TIMEOUT_MS
+        + leviculum_core::direct_link::session::READY_TIMEOUT_MS
+        + leviculum_core::direct_link::session::PUNCH_TIMEOUT_MS
+        + leviculum_core::direct_link::session::COMMIT_TIMEOUT_MS,
+);
+
+/// How long a record of an upgrade outlives its guard, so a hold that ended
+/// late is still named. Past it the record goes, on the next upgrade: a link
+/// that closes mid-session reports no outcome.
+const UPGRADE_RECORD_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// The first retry after a proposal that timed out, failed its probe, or lost
 /// its direct path: leviculum's own per-link proposal cooldown
@@ -432,6 +479,16 @@ pub const fn failure_label(failure: Failure) -> &'static str {
     }
 }
 
+/// Whether `failure`, on an upgrade that started `age` ago, is leviculum giving
+/// up a HOLD rather than a session. A link whose punch landed waits on the
+/// relay for a transfer to finish, with no deadline; the session ended when it
+/// started waiting, and when the unused punched interface dies the failure
+/// reads `Timeout`. A session's own `Timeout` cannot be this late.
+#[must_use]
+pub fn held_failure(failure: Failure, age: Duration) -> bool {
+    matches!(failure, Failure::Timeout) && age >= UPGRADE_GUARD_BOUND
+}
+
 /// CIRISEdge#805 item 8 — THE liveness decision for a direct A/V leg: is its
 /// path gone? `congested_streak` is the leg's consecutive `Congested`
 /// refusals; `since_progress` is how long its Channel has made no progress.
@@ -495,6 +552,32 @@ enum Entry {
     },
 }
 
+/// Which side of an upgrade this node is on, for the guard's line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeSide {
+    /// This node proposed.
+    Proposer,
+    /// A peer proposed and this node accepted.
+    Acceptor,
+}
+
+impl UpgradeSide {
+    /// Stable token for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposer => "proposer",
+            Self::Acceptor => "acceptor",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Upgrade {
+    side: UpgradeSide,
+    since: Instant,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PeerDirect {
     entry: Entry,
@@ -510,6 +593,11 @@ pub struct DirectPathTracker {
     peers: HashMap<String, PeerDirect>,
     /// The peer each tracked link belongs to (events name links).
     link_peer: HashMap<LinkId, String>,
+    /// Upgrades with no outcome yet, by link, either side. By link and apart
+    /// from `peers`: a peer holds one [`Entry`], and accepting on one link must
+    /// neither replace its `Direct` or `Proposing` on another nor back it off
+    /// when it fails.
+    upgrades: HashMap<LinkId, Upgrade>,
 }
 
 impl DirectPathTracker {
@@ -517,9 +605,14 @@ impl DirectPathTracker {
     ///
     /// # Errors
     /// The [`ProposeSkip`] that applies.
-    /// `_link` is the link a proposal would ride; whether to propose is a
+    /// `link` is the link a proposal would ride; whether to propose is a
     /// property of the peer, not of one link to it.
-    pub fn admit(&self, peer: &str, _link: LinkId, now: Instant) -> Result<(), ProposeSkip> {
+    pub fn admit(&self, peer: &str, link: LinkId, now: Instant) -> Result<(), ProposeSkip> {
+        // Except that a link this node is accepting on is busy, and leviculum
+        // would refuse the proposal and back the peer off for nothing.
+        if self.upgrade_side(&link, now) == Some(UpgradeSide::Acceptor) {
+            return Err(ProposeSkip::InFlight);
+        }
         let Some(p) = self.peers.get(peer) else {
             return Ok(());
         };
@@ -546,6 +639,7 @@ impl DirectPathTracker {
         now: Instant,
     ) {
         let attempts = self.peers.get(peer).map_or(0, |p| p.attempts);
+        self.note_upgrade(link, UpgradeSide::Proposer, now);
         self.link_peer.insert(link, peer.to_owned());
         self.peers.insert(
             peer.to_owned(),
@@ -563,6 +657,7 @@ impl DirectPathTracker {
     /// leviculum refused to start the proposal (`CoolingDown`,
     /// `AlreadyUpgrading`, `ChannelBusy`, …): back off one base period.
     pub fn propose_refused(&mut self, peer: &str, link: LinkId, now: Instant) {
+        self.upgrades.remove(&link);
         self.link_peer.remove(&link);
         let attempts = self.peers.get(peer).map_or(0, |p| p.attempts);
         self.peers.insert(
@@ -585,6 +680,7 @@ impl DirectPathTracker {
         interface: usize,
         peer: Option<&str>,
     ) -> Option<(String, Option<usize>)> {
+        self.upgrades.remove(&link);
         let peer = self
             .link_peer
             .get(&link)
@@ -618,6 +714,7 @@ impl DirectPathTracker {
         now: Instant,
         jitter: f64,
     ) -> Option<String> {
+        self.upgrades.remove(&link);
         let peer = self.link_peer.remove(&link)?;
         let attempts = self.peers.get(&peer).map_or(0, |p| p.attempts);
         let DirectRetry::After(wait) = retry_after(failure, attempts, jitter);
@@ -635,6 +732,7 @@ impl DirectPathTracker {
     /// `link`'s punched interface went down; the link is back on its relayed
     /// path (or closed). The peer may be asked again after the base period.
     pub fn lost(&mut self, link: LinkId, now: Instant) -> Option<String> {
+        self.upgrades.remove(&link);
         let peer = self.link_peer.remove(&link)?;
         self.peers.insert(
             peer.clone(),
@@ -646,6 +744,44 @@ impl DirectPathTracker {
             },
         );
         Some(peer)
+    }
+
+    /// This node accepted a peer's upgrade on `link`. Its outcome ends the
+    /// guard as a proposal's does; an answer leviculum no longer wanted leaves
+    /// it to [`UPGRADE_GUARD_BOUND`].
+    pub fn accepted(&mut self, link: LinkId, now: Instant) {
+        self.note_upgrade(link, UpgradeSide::Acceptor, now);
+    }
+
+    fn note_upgrade(&mut self, link: LinkId, side: UpgradeSide, now: Instant) {
+        self.upgrades
+            .retain(|_, u| now.saturating_duration_since(u.since) < UPGRADE_RECORD_TTL);
+        self.upgrades.insert(link, Upgrade { side, since: now });
+    }
+
+    /// The side of the upgrade guarding `link` at `now`, if one is.
+    #[must_use]
+    pub fn upgrade_side(&self, link: &LinkId, now: Instant) -> Option<UpgradeSide> {
+        self.upgrades
+            .get(link)
+            .filter(|u| now.saturating_duration_since(u.since) < UPGRADE_GUARD_BOUND)
+            .map(|u| u.side)
+    }
+
+    /// Whether `link` has an upgrade in flight at `now`, so no Resource may
+    /// start on it. From the proposal or the accept until the outcome, and
+    /// never past [`UPGRADE_GUARD_BOUND`].
+    #[must_use]
+    pub fn upgrade_in_flight(&self, link: &LinkId, now: Instant) -> bool {
+        self.upgrade_side(link, now).is_some()
+    }
+
+    /// [`held_failure`] for `link`'s upgrade, while its record stands.
+    #[must_use]
+    pub fn failure_was_a_hold(&self, link: &LinkId, failure: Failure, now: Instant) -> bool {
+        self.upgrades
+            .get(link)
+            .is_some_and(|u| held_failure(failure, now.saturating_duration_since(u.since)))
     }
 
     /// Where `peer`'s direct path stands, if it was ever proposed to.
@@ -866,6 +1002,10 @@ impl DirectPaths {
     }
 
     /// The tracker, locked. Never held across an `.await`.
+    pub(crate) fn upgrade_in_flight(&self, link: &LinkId) -> Option<UpgradeSide> {
+        self.tracker().upgrade_side(link, Instant::now())
+    }
+
     pub(crate) fn tracker(&self) -> std::sync::MutexGuard<'_, DirectPathTracker> {
         self.tracker
             .lock()
@@ -1154,6 +1294,108 @@ mod tests {
             Err(ProposeSkip::BackingOff)
         );
         assert_eq!(t.admit("b", link(1), now + DIRECT_RETRY_BASE * 2), Ok(()));
+    }
+
+    #[test]
+    fn a_proposal_guards_its_link_until_the_outcome() {
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        assert!(!t.upgrade_in_flight(&link(1), now));
+        t.proposed("b", link(1), Some(16_000), now);
+        assert!(t.upgrade_in_flight(&link(1), now));
+        assert!(!t.upgrade_in_flight(&link(2), now), "only that link");
+        assert_eq!(t.upgrade_side(&link(1), now), Some(UpgradeSide::Proposer));
+        t.established(link(1), 7, None);
+        assert!(!t.upgrade_in_flight(&link(1), now));
+
+        t.proposed("c", link(3), None, now);
+        t.failed(link(3), Failure::Timeout, now, 0.0);
+        assert!(!t.upgrade_in_flight(&link(3), now));
+
+        t.proposed("d", link(4), None, now);
+        t.propose_refused("d", link(4), now);
+        assert!(!t.upgrade_in_flight(&link(4), now));
+    }
+
+    /// The accepting side is the one the trace's wedge also needs: it starts
+    /// a Resource on a link it agreed to move, and only a Requested says so.
+    #[test]
+    fn an_acceptance_guards_its_link_and_leaves_the_peers_entry_alone() {
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        // B is direct with A on another link; A now proposes on this one.
+        t.established(link(1), 7, Some("a"));
+        t.accepted(link(2), now);
+        assert_eq!(t.upgrade_side(&link(2), now), Some(UpgradeSide::Acceptor));
+        assert!(
+            matches!(t.state("a"), Some(DirectPathState::Direct { .. })),
+            "the peer's direct path on the other link stands"
+        );
+        // A link being accepted is no link to propose on: leviculum would
+        // refuse it `AlreadyUpgrading` and back the peer off.
+        assert_eq!(t.admit("c", link(2), now), Err(ProposeSkip::InFlight));
+
+        // The accepting side's failure names no peer and backs nobody off.
+        assert_eq!(t.failed(link(2), Failure::PunchFailed, now, 0.0), None);
+        assert!(!t.upgrade_in_flight(&link(2), now));
+        assert_eq!(t.admit("c", link(2), now), Ok(()));
+        assert!(matches!(t.state("a"), Some(DirectPathState::Direct { .. })));
+
+        t.accepted(link(3), now);
+        t.established(link(3), 8, Some("c"));
+        assert!(!t.upgrade_in_flight(&link(3), now));
+    }
+
+    /// The bound: an upgrade that never reports must release the link, on
+    /// both sides, or the guard is the wedge.
+    #[test]
+    fn an_upgrade_with_no_outcome_releases_the_guard_at_the_bound() {
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        t.proposed("b", link(1), None, now);
+        t.accepted(link(2), now);
+        let before = now + UPGRADE_GUARD_BOUND - Duration::from_millis(1);
+        let at = now + UPGRADE_GUARD_BOUND;
+        assert!(t.upgrade_in_flight(&link(1), before));
+        assert!(t.upgrade_in_flight(&link(2), before));
+        assert!(!t.upgrade_in_flight(&link(1), at));
+        assert!(!t.upgrade_in_flight(&link(2), at));
+        assert_eq!(t.admit("c", link(2), at), Ok(()));
+    }
+
+    /// A link that closes mid-session reports no outcome, so a record must
+    /// not stand for ever.
+    #[test]
+    fn a_record_with_no_outcome_goes_on_the_next_upgrade() {
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        t.proposed("b", link(1), None, now);
+        t.accepted(link(2), now);
+        t.proposed("c", link(3), None, now + UPGRADE_RECORD_TTL);
+        assert_eq!(t.upgrades.len(), 1);
+        assert!(t.upgrades.contains_key(&link(3)));
+    }
+
+    /// The trace's numbers: proposed at 03:40:40.9, `Timeout` at 03:43:36.3.
+    #[test]
+    fn a_timeout_later_than_any_session_was_a_hold() {
+        let held = Duration::from_secs(175);
+        assert!(held_failure(Failure::Timeout, held));
+        assert!(held_failure(Failure::Timeout, UPGRADE_GUARD_BOUND));
+        assert!(!held_failure(
+            Failure::Timeout,
+            UPGRADE_GUARD_BOUND - Duration::from_millis(1)
+        ));
+        assert!(!held_failure(Failure::PunchFailed, held));
+        assert!(!held_failure(Failure::ProbeFailed, held));
+
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        t.proposed("b", link(1), None, now);
+        assert!(t.failure_was_a_hold(&link(1), Failure::Timeout, now + held));
+        assert!(!t.failure_was_a_hold(&link(1), Failure::Timeout, now));
+        // leviculum's own retry told edge nothing, so edge cannot say.
+        assert!(!t.failure_was_a_hold(&link(9), Failure::Timeout, now + held));
     }
 
     #[test]
