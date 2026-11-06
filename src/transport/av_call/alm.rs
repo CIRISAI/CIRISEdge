@@ -844,7 +844,8 @@ impl AlmState {
     fn nominal(&self, bps: u64, rate: &Rate) -> u64 {
         let (measured, _) = rate.costs();
         let scale = self.cfg.stream_bps as f64 / measured.max(1) as f64;
-        (bps as f64 * scale).min(u64::MAX as f64 / 2.0) as u64
+        // Rounded: exactly one stream of room must read as one stream.
+        (bps as f64 * scale).min(u64::MAX as f64 / 2.0).round() as u64
     }
 
     /// One watch tick: egress windows (C2 measurement and over-commit
@@ -1426,6 +1427,22 @@ mod tests {
             }
         }
 
+        /// `ms` of A's host starved: it publishes, its links refuse nearly
+        /// everything and nothing arrives anywhere (a window sends a trickle
+        /// and drops the rest).
+        fn starve(&mut self, ms: u64) {
+            for _ in 0..ms / STEP_MS {
+                self.advance(STEP_MS);
+                self.nodes[A].on_own_published(CHUNK, true);
+                self.nodes[A].on_sent("b", 1);
+                self.nodes[A].on_dropped(CHUNK);
+                self.ticks += 1;
+                if self.ticks % 5 == 0 {
+                    self.tick();
+                }
+            }
+        }
+
         /// A's stream rolls: a new epoch, `chunk_seq` back to 0.
         fn roll(&mut self) {
             self.epoch += 1;
@@ -1493,6 +1510,65 @@ mod tests {
         assert!(m.nodes[B]
             .labels
             .contains(&crate::observability::ALM_OFFER_REFUSED_NOT_PUBLISHER));
+    }
+
+    /// The v44 CI stall, deterministically: a few seconds of a starved host
+    /// must not silence a publisher for the rest of its call. The congestion
+    /// sheds, as it should; then the stream comes back on the one stream a
+    /// publisher always keeps, and the mesh regrows when the ceiling goes
+    /// stale. Mutations: with no floor A keeps nobody and offers no room, so
+    /// nobody hears it again; with no staleness the ceiling binds for good.
+    #[test]
+    fn a_starved_publisher_is_heard_again() {
+        let mut m = Mesh::new();
+        m.run(30_000, 1, |_| {});
+        assert_eq!(m.b_parents().primary.as_deref(), Some("a"), "the premise");
+        assert_eq!(m.b_parents().standby.as_deref(), Some("c"), "the premise");
+
+        m.starve(8_000);
+        assert!(
+            m.nodes[A].counts.shed > 0,
+            "the premise: A shed: {}",
+            m.nodes[A].log_tail()
+        );
+        assert!(
+            !m.nodes[A].own_children().is_empty(),
+            "a publisher keeps one child: {}",
+            m.nodes[A].log_tail()
+        );
+
+        // The stream is back well before the ceiling goes stale.
+        m.run(10_000, 1, |_| {});
+        let heard = |m: &Mesh, n: usize| {
+            m.nodes[n]
+                .parents()
+                .iter()
+                .find(|p| p.stream == m.sa)
+                .is_some_and(|p| p.primary.is_some())
+        };
+        assert!(
+            heard(&m, B) && heard(&m, C),
+            "both hear A: B {:?}; A {}\nB {}\nC {}",
+            m.b_parents(),
+            m.nodes[A].log_tail(),
+            m.nodes[B].log_tail(),
+            m.nodes[C].log_tail()
+        );
+
+        // And the direct mesh regrows once the ceiling is stale.
+        m.run(
+            crate::transport::realtime_av_alm::controller::admission::CEILING_STALE_MS + 20_000,
+            1,
+            |_| {},
+        );
+        assert_eq!(
+            m.b_parents().primary.as_deref(),
+            Some("a"),
+            "direct first, again: {}",
+            m.nodes[B].log_tail()
+        );
+        assert_eq!(m.b_parents().standby.as_deref(), Some("c"));
+        assert_eq!(m.nodes[A].own_children().len(), 2, "both direct");
     }
 
     /// #945 item 2: a depth-0 claim that cannot be checked yet is dropped,

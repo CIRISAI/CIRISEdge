@@ -18,6 +18,20 @@
 //! - **committed** is a live ledger keyed by subscriber (primary = stream
 //!   rate, standby = audio rate), not static config.
 //!
+//! A measured ceiling is an estimate of a moment, not a property of the
+//! uplink: one that stands [`CEILING_STALE_MS`] with no congested window is
+//! forgotten and growth goes back to the probe allowance
+//! (`docs/AV_ALM_DESIGN.md` §5.1, "a ceiling gone stale"). Nothing else could
+//! lift it: it rises only on a window that sent more than it, and a forwarder
+//! that was shed down to its ceiling, and offers no room, sends less. A
+//! forwarder flagged for over-claiming keeps its ceiling.
+//!
+//! A publisher's ceiling is never read below one stream. Every relay can be
+//! replaced by another path; the publisher cannot, so with no child its
+//! stream reaches nobody and no relay has anything to offer. Only the
+//! measurement gives way: an advertised cap and the uplink's other streams
+//! still bind.
+//!
 //! A forwarder whose ceiling drops below its commitments sheds the most
 //! recent admittee first (LIFO, deterministic) until it fits. One whose claim
 //! exceeds its measurement by `over_claim_ratio` is flagged
@@ -148,6 +162,14 @@ struct Drain {
     until_ms: u64,
 }
 
+/// How long a measured ceiling stands with no congested window before it is
+/// stale. Each ceiling learned again waits twice as long, up to
+/// [`CEILING_STALE_MAX_MS`], so a really limited uplink costs its subscribers
+/// a move rarely, not every half minute (react fast, recover slowly).
+pub const CEILING_STALE_MS: u64 = 30_000;
+/// The longest a ceiling stands before it is stale.
+pub const CEILING_STALE_MAX_MS: u64 = 240_000;
+
 /// C2 admission for one forwarder and one stream.
 // Independent state flags (root, upstream health, probe demand, over-claim
 // latch), not a mode enum in disguise.
@@ -159,6 +181,8 @@ pub struct Admission<P: PeerRef> {
     is_root: bool,
     advertised_bps: Option<u64>,
     ceiling_bps: Option<f64>,
+    ceiling_stale_ms: u64,
+    last_congested_ms: u64,
     floor_bps: f64,
     probe_bps: f64,
     clean_streak: u32,
@@ -217,6 +241,8 @@ impl<P: PeerRef> Admission<P> {
             is_root: false,
             advertised_bps,
             ceiling_bps: None,
+            ceiling_stale_ms: CEILING_STALE_MS,
+            last_congested_ms: 0,
             floor_bps: 0.0,
             probe_bps: probe,
             clean_streak: 0,
@@ -414,11 +440,21 @@ impl<P: PeerRef> Admission<P> {
     #[allow(clippy::cast_precision_loss)]
     pub fn hard_limit_bps(&self) -> f64 {
         let adv = self.advertised_bps.map_or(f64::INFINITY, |a| a as f64);
-        let measured = self.ceiling_bps.unwrap_or(f64::INFINITY);
-        (self.fraction() * adv.min(measured)
+        (self.fraction() * adv.min(self.measured_bps())
             - self.cfg.reserve_bps as f64
             - self.external_committed as f64)
             .max(0.0)
+    }
+
+    /// What the uplink measured. A publisher's is never read below one
+    /// stream (see the module docs): it is the one path nothing can replace.
+    #[allow(clippy::cast_precision_loss)]
+    fn measured_bps(&self) -> f64 {
+        match self.ceiling_bps {
+            None => f64::INFINITY,
+            Some(c) if self.is_root => c.max(self.cfg.stream_bps as f64 / self.fraction()),
+            Some(c) => c,
+        }
     }
 
     fn fraction(&self) -> f64 {
@@ -431,8 +467,7 @@ impl<P: PeerRef> Admission<P> {
     #[allow(clippy::cast_precision_loss)]
     pub fn limit_bps(&self) -> f64 {
         let adv = self.advertised_bps.map_or(f64::INFINITY, |a| a as f64);
-        let measured = self.ceiling_bps.unwrap_or(f64::INFINITY);
-        let hard = self.fraction() * adv.min(measured);
+        let hard = self.fraction() * adv.min(self.measured_bps());
         let probe = match (self.ceiling_bps, self.class.trial_slot) {
             (Some(_), _) => f64::INFINITY,
             (None, true) => self.floor_bps + self.probe_bps,
@@ -504,8 +539,9 @@ impl<P: PeerRef> Admission<P> {
             from: self.me.clone(),
             depth: self.depth.unwrap_or(u8::MAX),
             ancestry: self.ancestry.clone(),
-            headroom_bps: headroom as u64,
-            forwarder_headroom_bps: forwarder_headroom as u64,
+            // Rounded: exactly one stream of room must read as one stream.
+            headroom_bps: headroom.round() as u64,
+            forwarder_headroom_bps: forwarder_headroom.round() as u64,
             upstream_latency_ms: self.upstream_latency_ms,
             forwarding: self.forwarding(),
         }
@@ -714,6 +750,9 @@ impl<P: PeerRef> Admission<P> {
         log: &mut DecisionLog,
     ) -> Vec<P> {
         self.expire_drains(now_ms);
+        if w.congested {
+            self.last_congested_ms = now_ms;
+        }
         if w.congested && w.sent_bps > 0.0 {
             self.clean_streak = 0;
             self.congested_streak += 1;
@@ -751,6 +790,15 @@ impl<P: PeerRef> Admission<P> {
             if let Some(c) = self.ceiling_bps {
                 if w.sent_bps > c {
                     self.ceiling_bps = Some(w.sent_bps);
+                }
+                // Not for a forwarder caught over-claiming: that measurement
+                // is what disproved its word, and it stays disproved.
+                if !self.over_claim_flagged
+                    && now_ms.saturating_sub(self.last_congested_ms) >= self.ceiling_stale_ms
+                {
+                    self.ceiling_bps = None;
+                    self.ceiling_stale_ms = (self.ceiling_stale_ms * 2).min(CEILING_STALE_MAX_MS);
+                    log.record(now_ms, &self.me, DecisionKind::Ceiling, None, 0, "stale");
                 }
             } else {
                 self.floor_bps = self.floor_bps.max(w.sent_bps);
@@ -906,6 +954,169 @@ mod tests {
         );
         assert_eq!(log.count(DecisionKind::OverClaim), 1);
         let _ = &mut rng;
+    }
+
+    fn window(sent_bps: f64, congested: bool) -> EgressWindow {
+        EgressWindow {
+            sent_bps,
+            dropped_bytes: u64::from(congested) * 1_000,
+            max_queue_ms: if congested { 500.0 } else { 0.0 },
+            congested,
+        }
+    }
+
+    /// A publisher whose two children were admitted on the probe.
+    fn publisher_of_two() -> (Admission<u32>, DecisionLog, ControllerConfig) {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::publisher(0u32, cfg.clone(), None);
+        roster(&mut a);
+        a.set_probe_streams(2);
+        let mut rng = SplitMix64(1);
+        let mut log = DecisionLog::new(64);
+        for s in [1, 2] {
+            assert!(matches!(
+                a.request(0, &req(s, Role::Primary), &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ));
+        }
+        (a, log, cfg)
+    }
+
+    /// CIRISEdge#945, the v44 CI stall: a host starved for a few seconds drove
+    /// the ceiling far under one stream. Mutation: without the floor the last
+    /// child is shed, the offer shows no room, and nobody ever asks again.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_publisher_keeps_one_stream_under_any_ceiling() {
+        let (mut a, mut log, cfg) = publisher_of_two();
+        let tiny = cfg.stream_bps as f64 / 50.0;
+        assert!(a
+            .on_egress_window(1_000, &window(tiny, true), &mut log)
+            .is_empty());
+        let shed = a.on_egress_window(2_000, &window(tiny, true), &mut log);
+        assert_eq!(shed, vec![2], "LIFO, and only down to one");
+        assert_eq!(a.ledger().len(), 1, "the oldest child stays");
+
+        let mut rng = SplitMix64(1);
+        a.release(&1);
+        let offer = a.offer();
+        assert_eq!(
+            offer.headroom_bps, cfg.stream_bps,
+            "an empty publisher offers its one stream"
+        );
+        assert!(
+            matches!(
+                a.request(3_000, &req(2, Role::Primary), &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ),
+            "and admits it"
+        );
+        assert!(
+            matches!(
+                a.request(3_000, &req(3, Role::Primary), &mut rng, &mut log),
+                AdmitDecision::Refuse { .. }
+            ),
+            "one stream, not two: the ceiling still binds"
+        );
+    }
+
+    /// A relay has no such floor: its child can go elsewhere.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_relay_has_no_one_stream_floor() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::relay(9u32, cfg.clone(), None);
+        roster(&mut a);
+        a.set_upstream(Some(1), vec![0], true, 10);
+        let mut rng = SplitMix64(1);
+        let mut log = DecisionLog::new(64);
+        assert!(matches!(
+            a.request(0, &req(1, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+        let tiny = cfg.stream_bps as f64 / 50.0;
+        let _ = a.on_egress_window(1_000, &window(tiny, true), &mut log);
+        assert_eq!(
+            a.on_egress_window(2_000, &window(tiny, true), &mut log),
+            vec![1]
+        );
+    }
+
+    /// A ceiling learned in a bad moment does not bind for the rest of the
+    /// call, even with nothing sent that could lift it. Mutation: without the
+    /// staleness the second child's room never comes back.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_ceiling_goes_stale_after_a_clean_stretch() {
+        let (mut a, mut log, cfg) = publisher_of_two();
+        let tiny = cfg.stream_bps as f64 / 50.0;
+        let _ = a.on_egress_window(1_000, &window(tiny, true), &mut log);
+        let _ = a.on_egress_window(2_000, &window(tiny, true), &mut log);
+        assert!(a.ceiling_bps().is_some());
+        assert_eq!(a.offer().headroom_bps, 0, "the one stream is taken");
+
+        let clean = window(0.0, false);
+        let before = 2_000 + CEILING_STALE_MS - 1;
+        let _ = a.on_egress_window(before, &clean, &mut log);
+        assert!(a.ceiling_bps().is_some(), "not before it is stale");
+        let _ = a.on_egress_window(2_000 + CEILING_STALE_MS, &clean, &mut log);
+        assert_eq!(a.ceiling_bps(), None, "stale");
+        assert_eq!(
+            a.offer().headroom_bps,
+            cfg.stream_bps,
+            "the probe's second stream is back"
+        );
+    }
+
+    /// The measurement that disproved a forwarder's word stands (T2 in the
+    /// closed-loop sim is this on a live world).
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn an_over_claimer_keeps_its_ceiling() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::relay(9u32, cfg.clone(), Some(100 * cfg.stream_bps));
+        roster(&mut a);
+        a.set_upstream(Some(1), vec![0], true, 10);
+        let mut log = DecisionLog::new(64);
+        let bps = 4.0 * cfg.stream_bps as f64;
+        let _ = a.on_egress_window(1_000, &window(bps, true), &mut log);
+        let _ = a.on_egress_window(2_000, &window(bps, true), &mut log);
+        assert_eq!(log.count(DecisionKind::OverClaim), 1, "the premise");
+        let _ = a.on_egress_window(10 * CEILING_STALE_MAX_MS, &window(bps, false), &mut log);
+        assert!(a.ceiling_bps().is_some());
+    }
+
+    /// A congested window keeps a ceiling current, and a really limited
+    /// uplink is re-probed less and less often.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_ceiling_learned_again_stands_twice_as_long() {
+        let (mut a, mut log, cfg) = publisher_of_two();
+        let bps = cfg.stream_bps as f64;
+        let clean = window(0.0, false);
+        let mut at = 1_000;
+        for stands in [CEILING_STALE_MS, 2 * CEILING_STALE_MS, 4 * CEILING_STALE_MS] {
+            let _ = a.on_egress_window(at, &window(bps, true), &mut log);
+            at += 1_000;
+            let _ = a.on_egress_window(at, &window(bps, true), &mut log);
+            assert!(a.ceiling_bps().is_some());
+            let _ = a.on_egress_window(at + stands - 1, &clean, &mut log);
+            assert!(a.ceiling_bps().is_some(), "stands {stands} ms");
+            at += stands;
+            let _ = a.on_egress_window(at, &clean, &mut log);
+            assert_eq!(a.ceiling_bps(), None, "stale after {stands} ms");
+            at += 1_000;
+        }
+        // Capped.
+        for _ in 0..8 {
+            let _ = a.on_egress_window(at, &window(bps, true), &mut log);
+            at += 1_000;
+            let _ = a.on_egress_window(at, &window(bps, true), &mut log);
+            at += CEILING_STALE_MAX_MS;
+            let _ = a.on_egress_window(at, &clean, &mut log);
+            assert_eq!(a.ceiling_bps(), None, "never longer than the cap");
+            at += 1_000;
+        }
     }
 
     #[test]

@@ -361,6 +361,14 @@ config, `ControllerConfig::transport_relay()`, with the same structure as `::int
   `commit_fraction = 0.65` of measured. There is one trial slot while unmeasured, and the most recent
   admittee is shed first (LIFO) on sustained over-commit.
 
+  `measured` recovers. A ceiling with no congested window for 30 s is stale and forgotten, and growth
+  returns to the probe allowance; each ceiling learned again stands twice as long, up to 240 s. A
+  publisher's `measured` is never read below one stream. *Why:* a ceiling rises only on a window that
+  sent more than it, and a forwarder shed down to it sends less and offers no room, so nothing else
+  could lift it. A publisher is the one path nothing replaces: with no child, its stream reaches
+  nobody and no relay has anything to offer. An advertised cap and the uplink's other streams still
+  bind, and a forwarder flagged for over-claiming keeps its ceiling.
+
   For a transport node, `measured` is a **vector**: egress bps *and* forwarded packets/s. `usable`
   is the minimum across both. *Why:* a relay's forwarding runs under leviculum's single node lock
   (leviculum#29), so packet rate can bind before bytes (§6.2). This is the one extension to C2, and
