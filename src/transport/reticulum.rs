@@ -2116,8 +2116,8 @@ pub struct ReticulumTransportConfig {
     pub relay_establish_budget: Duration,
     /// ALM stage 2 — a transport node's C2 admission of the links it
     /// forwards for others (leviculum#93). Installed when
-    /// `enable_transport`; the default admits uncapped at tier 0 and closes
-    /// to new forwarded links at service tier ≥ 1 (§7.2 Admit-close).
+    /// `enable_transport`; the default admits every link, uncapped, at every
+    /// service tier (`FSD/CIRIS_MESH.md` §7.2).
     pub forward_admission: crate::transport::relay_tier::ForwardAdmissionConfig,
 }
 
@@ -3585,6 +3585,11 @@ impl ReticulumTransport {
         let shapers = Arc::new(crate::transport::link_shaping::LinkShapers::new(
             config.shaping.clone(),
         ));
+        // `CLM-shaped-link-bound-refuse` — anonymous mode refuses past the bound.
+        {
+            let onion = Arc::clone(&onion);
+            shapers.set_anonymous_read(move || onion.media_allowed().is_err());
+        }
         // CC 5.4.3 referrals — free slots are reported from the start, while
         // the relay offering is on (`onion_refresh` follows it from here).
         shapers.enable_capacity_reports();
@@ -13717,6 +13722,16 @@ impl DialCtx {
             );
             return Ok(());
         }
+        // `CLM-shaped-link-bound-refuse` — a dialler past its own bound offers
+        // nothing, so no shaper starts at the other end alone: both ends read
+        // the link as unshaped. A shaped-only node offers, and refuses at the
+        // answer.
+        if self.shapers.at_bound_for(Some(peer)) && !self.shapers.refuses_past_bound() {
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_PAST_BOUND);
+            }
+            return Ok(());
+        }
         let link = link_id.into_bytes();
         let answer = self.shapers.begin_offer(link);
         let offer =
@@ -13763,6 +13778,11 @@ impl DialCtx {
         match tokio::time::timeout(OFFER_ANSWER_BUDGET, answer).await {
             Ok(Ok(Ok(shaped))) => {
                 tracing::debug!(peer = %peer, link = %hex::encode(link), shaped, "shaping offer answered");
+                // A peer with no slot may have named others: a hint, and the
+                // link stays up unshaped whatever comes of it.
+                if !shaped {
+                    self.queue_homing(peer, link);
+                }
                 Ok(())
             }
             Ok(Ok(Err(e))) => {
@@ -16735,7 +16755,7 @@ async fn answer_shaping_offer(
                 tier = ctx.shapers.service_tier().as_u8(),
                 "a shaped link refused under load, with referrals (FSD/PRIVACY_MODES.md §6.12)"
             );
-            ctx.shapers.refusal_for(link, peer.as_deref())
+            ctx.shapers.past_bound_answer(link, peer.as_deref())
         } else {
             ctx.shapers.offer_for_answer(
                 link,
@@ -16747,7 +16767,21 @@ async fn answer_shaping_offer(
     } else {
         ctx.shapers.offer_off_for(link)
     };
-    if ours.class == crate::transport::link_shaping::BudgetClass::HomeElsewhere {
+    // `CLM-shaped-link-bound-refuse` — no slot for a peer that offers: the
+    // referrals go out either way. A refusal then closes the link; an `off`
+    // leaves it up, unshaped.
+    let no_slot = shaping_applies_to(plane)
+        && !forwarded
+        && theirs.shapes()
+        && !ours.shapes()
+        && ctx.shapers.offers_to(peer.as_deref());
+    let refused = ours.class == crate::transport::link_shaping::BudgetClass::HomeElsewhere;
+    if refused || no_slot {
+        if !refused {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_PAST_BOUND);
+            }
+        }
         let mut frames = referral_frames(ctx, link_id, peer.as_deref()).await;
         frames.push(ours.encode());
         spawn_refusal_send(
@@ -16756,6 +16790,7 @@ async fn answer_shaping_offer(
             Arc::clone(ctx.shapers),
             link_id,
             frames,
+            refused,
         );
     } else {
         let out =
@@ -16980,9 +17015,13 @@ fn spawn_refusal_send(
     shapers: Arc<crate::transport::link_shaping::LinkShapers>,
     link_id: LinkId,
     frames: Vec<Vec<u8>>,
+    closes: bool,
 ) {
     tokio::spawn(async move {
         let out = send_fragments_on_channel(&node, &seals, &shapers, &link_id, &frames).await;
+        if !closes {
+            return;
+        }
         if !out.complete() {
             tracing::debug!(
                 link = %hex::encode(link_id.into_bytes()),

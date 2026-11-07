@@ -152,6 +152,13 @@ the last 120 s; those are the peer's exclusions, and no message carries them. Th
 refusal's token and the outcome are logged and counted:
 `link_shaping_referral_{sent,empty,withheld,received,rejected,homed,failed,exhausted}`.
 
+**Past the bound.** Only a node set to shaped-only or to the anonymous tier refuses
+(CIRISEdge#952). Any other node answers `off`, sends its referrals as a hint, and
+the link runs unshaped, counted `link_shaping_unshaped:past_bound` at the end that
+had no slot. A dialler past its own bound offers nothing, so no shaper starts at
+the other end alone. A refusal is the peer's choice and does not count against
+its reachability.
+
 **A referral is a hint, never a guarantee.** A stale report costs one refused dial
 and the peer tries the next. **With no targets known the refusal carries an empty
 list and the peer uses its fallback order** (other canonicals, CIRISEdge#935). At

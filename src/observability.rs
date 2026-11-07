@@ -1208,6 +1208,9 @@ pub const LINK_SHAPING_UNSHAPED: &str = "link_shaping_unshaped";
 /// CC 5.4.3 `CLM-shaped-link-one-hop` — a link left unshaped because a
 /// forwarder carries it: nothing offered, or an offer answered `off`.
 pub const LINK_SHAPING_FORWARDED: &str = "link_shaping_unshaped:forwarded";
+/// `CLM-shaped-link-bound-refuse` — a link left unshaped past the bound, on a
+/// node set neither to shaped-only nor to the anonymous tier.
+pub const LINK_SHAPING_PAST_BOUND: &str = "link_shaping_unshaped:past_bound";
 /// CC 5.4.3 — a row refused under `require_shaped_links`: the peer has no
 /// direct path yet. A direct link was proposed before the refusal.
 pub const LINK_SHAPING_NO_DIRECT_PATH: &str = "link_shaping_no_direct_path";
@@ -1735,6 +1738,7 @@ pub const LINK_SHAPING_LABELS: &[&str] = &[
     LINK_SHAPING_AGREED,
     LINK_SHAPING_UNSHAPED,
     LINK_SHAPING_FORWARDED,
+    LINK_SHAPING_PAST_BOUND,
     LINK_SHAPING_NO_DIRECT_PATH,
     LINK_SHAPING_DIRECT_LOST,
     LINK_SHAPING_REFUSED_UNSHAPED_PEER,

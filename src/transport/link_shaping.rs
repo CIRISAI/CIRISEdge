@@ -306,17 +306,19 @@ pub struct ShapingPolicy {
     pub layer_reserve_links: u32,
 }
 
-/// CC 5.4.3 rc17 — **the bound** (`CLM-shaped-link-bound-refuse`): "a node
-/// runs at most eight shaped links, each at the full rate of its class; a
-/// further peer that offers shaping is refused a row link and told to home
-/// elsewhere, and is offered an unshaped bulk link where one exists". The
-/// default is [`Self::BoundedWithFloor`]; switching it is the one line in
+/// CC 5.4.3 — **the bound** (`CLM-shaped-link-bound-refuse`, CIRISEdge#952):
+/// a node runs at most eight shaped links, each at the full rate of its class.
+/// At the bound, a node set to shaped-only or to the anonymous tier refuses a
+/// ninth shaping peer with referrals; any other node runs the ninth link
+/// unshaped; a shaped link is never run below its class. Eight shaped links do
+/// not stop new connections (Eric, 2026-11-06). The default is
+/// [`Self::BoundedWithFloor`]; switching it is the one line in
 /// [`ShapingPolicy::for_class`].
 ///
 /// Displacement (`CLM-shaped-link-displacement`) is CIRISEdge#939: until it
 /// lands a higher-class newcomer at a full node is refused, not given a slot.
 ///
-/// **The bound is a refusal, never a diluted link.** Every link runs at the
+/// **The bound is never a diluted link.** Every shaped link runs at the
 /// one negotiated rate both ways, the class rate, onion layer links included.
 /// A layer link counts within the eight; a `seat` link sits outside them. So
 /// that a layer neighbour is not shut out by whoever came first, the links
@@ -324,13 +326,12 @@ pub struct ShapingPolicy {
 /// waiting, up to [`ShapingPolicy::layer_reserve_links`]
 /// ([`LinkShapers::at_bound_for`]); nothing is ever taken from a running link.
 ///
-/// **The accepted leak.** A refused peer still gets an unshaped bulk link
-/// (files and calls keep working), and that link is observable: an observer
-/// learns the node is at its bound, and the peer's bulk crosses in the clear
-/// shape a Resource has. Prior art (Tarzan, Herd) homes the extra peer
-/// elsewhere instead; until homing lands (CIRISEdge#935) the spill is the
-/// trade-off, and it is bounded: at most one unshaped link per refused peer,
-/// never a row link run unshaped.
+/// **The accepted leak.** A link past the bound runs unshaped, and that link
+/// is observable: an observer learns the node is at its bound, and the rows on
+/// it cross sealed in the shape of ordinary traffic (CC 5.4.3: "a node not
+/// opted in carries the same classes on ordinary links"). The referrals go out
+/// with the answer as a hint, so a peer may home elsewhere (CIRISEdge#935). A
+/// node that will not accept that sets shaped-only and refuses instead.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ShapedSharePolicy {
     /// Every shaping peer is shaped at `cap ÷ shaped links`, however small,
@@ -339,9 +340,9 @@ pub enum ShapedSharePolicy {
     /// class"); kept as the non-default arm, for comparison only.
     DivideNoFloor,
     /// At most `max_links` shaped links, each at `floor_bytes_per_s` (the
-    /// class rate); past the bound a shaping peer is REFUSED for rows
-    /// (`link_shaping_home_elsewhere`), never run unshaped, and keeps its
-    /// unshaped bulk link.
+    /// class rate); past the bound a shaping peer's link runs unshaped, or on
+    /// a shaped-only or anonymous-tier node is refused for rows
+    /// (`link_shaping_home_elsewhere`) and keeps its unshaped bulk link.
     BoundedWithFloor {
         /// Shaped links at most (eight; `seat` links are outside them).
         max_links: u32,
@@ -985,9 +986,10 @@ pub enum ShapingError {
     /// The peer offered `off` and this node requires shaped links.
     #[error("the peer offers no shaping and this node requires shaped links")]
     UnshapedPeer,
-    /// A shaping peer past this node's bound, or this node past the peer's:
-    /// the row link is refused, never run unshaped; bulk still has its own
-    /// unshaped link ([`ShapedSharePolicy::BoundedWithFloor`]).
+    /// A shaped-only or anonymous-tier node past its bound, or a peer that is:
+    /// the row link is refused by that node's choice, and bulk still has its
+    /// own unshaped link ([`ShapedSharePolicy::BoundedWithFloor`]). The peer is
+    /// not dead, and is not counted as if it were.
     #[error(
         "a shaping peer past the shaped-link bound: homed elsewhere (link_shaping_home_elsewhere)"
     )]
@@ -1853,6 +1855,8 @@ pub struct LinkShapers {
     /// offer rounds λ, so a class link can agree a few bytes above its class.
     seat_agreed: Mutex<std::collections::HashSet<[u8; 16]>>,
     /// What a shed lever reads at decision time. Absent: nothing is shed.
+    /// Says this node is in anonymous mode ([`Self::refuses_past_bound`]).
+    anonymous_read: std::sync::OnceLock<AnonymousRead>,
     obligations: std::sync::RwLock<Option<Arc<dyn crate::load_ladder::PeerObligations>>>,
     /// Woken when tier 2 is in force.
     shed_wake: tokio::sync::Notify,
@@ -1876,6 +1880,15 @@ pub const ROW_LEAVE_MAX: Duration = Duration::from_secs(60);
 /// gap a fixed 60 s lost one single-frame row in four and nearly every full one,
 /// and their retries did not converge (`FSD/PRIVACY_MODES.md` E7).
 pub const ROW_LEAVE_MAX_GAPS: f64 = 16.0;
+
+/// What says a node is in anonymous mode.
+struct AnonymousRead(Box<dyn Fn() -> bool + Send + Sync>);
+
+impl std::fmt::Debug for AnonymousRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AnonymousRead")
+    }
+}
 
 /// Default bound on a shaped link's queue, in bodies.
 pub const DEFAULT_QUEUE_CAP: usize = 4096;
@@ -1909,6 +1922,7 @@ impl LinkShapers {
             admissions: std::sync::atomic::AtomicU64::new(0),
             peer_shapes: Mutex::new(HashMap::new()),
             seat_agreed: Mutex::new(std::collections::HashSet::new()),
+            anonymous_read: std::sync::OnceLock::new(),
             obligations: std::sync::RwLock::new(None),
             shed_wake: tokio::sync::Notify::new(),
             metrics: std::sync::OnceLock::new(),
@@ -2647,9 +2661,43 @@ impl LinkShapers {
         theirs: &ShapingOffer,
     ) -> ShapingOffer {
         if theirs.shapes() && self.offers_to(peer) && self.at_bound_for(peer) {
-            return self.refusal_for(link, peer);
+            return self.past_bound_answer(link, peer);
         }
         self.offer_for(link, frame_bytes, peer)
+    }
+
+    /// Whether this node refuses a shaping peer it cannot shape, by the choice
+    /// of being shaped-only or in anonymous mode. Every other node runs that
+    /// link unshaped (`CLM-shaped-link-bound-refuse`).
+    #[must_use]
+    pub fn refuses_past_bound(&self) -> bool {
+        self.policy().require_shaped_links
+            || self.anonymous_read.get().is_some_and(|read| (read.0)())
+    }
+
+    /// Shaped links now, of any class.
+    #[cfg(test)]
+    fn links_of_all(&self) -> usize {
+        self.links().len()
+    }
+
+    /// Install what says this node is in anonymous mode.
+    pub fn set_anonymous_read(&self, read: impl Fn() -> bool + Send + Sync + 'static) {
+        let _ = self.anonymous_read.set(AnonymousRead(Box::new(read)));
+    }
+
+    /// The answer to a shaping peer this node has no slot for: the refusal
+    /// where [`Self::refuses_past_bound`], else `off`, and the link runs
+    /// unshaped at both ends.
+    #[must_use]
+    pub fn past_bound_answer(&self, link: [u8; 16], peer: Option<&str>) -> ShapingOffer {
+        if self.refuses_past_bound() {
+            return self.refusal_for(link, peer);
+        }
+        if let Some(p) = peer {
+            self.link_peer().insert(link, p.to_owned());
+        }
+        self.offer_off_for(link)
     }
 
     /// Record the refusal of a shaping peer on `link`, at the bound or under
@@ -2807,7 +2855,10 @@ impl LinkShapers {
         }
         let refused = ours.class == BudgetClass::HomeElsewhere
             || theirs.class == BudgetClass::HomeElsewhere
-            || (ours.shapes() && theirs.shapes() && self.at_bound_for(peer.as_deref()));
+            || (ours.shapes()
+                && theirs.shapes()
+                && self.refuses_past_bound()
+                && self.at_bound_for(peer.as_deref()));
         let out = match agree(&ours, theirs) {
             _ if refused => Err(ShapingError::HomeElsewhere),
             Some(agreement) => {
@@ -3065,8 +3116,44 @@ mod tests {
     /// a shaping peer and gets its ordinary unshaped link. Mutation: run the
     /// ninth link instead of refusing → this fails.
     #[test]
-    fn at_the_bound_a_ninth_shaping_peer_is_refused_and_an_off_peer_is_not() {
-        let p = ShapingPolicy::fleet_default(BudgetClass::Server);
+    fn at_the_bound_a_node_that_did_not_opt_in_runs_the_ninth_unshaped() {
+        let t = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        shaped_links(&t, 8, "g", 10);
+        assert!(t.at_bound());
+        assert!(!t.refuses_past_bound());
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
+        let ours = t.offer_for_answer([100u8; 16], 400, Some("ninth"), &peer);
+        assert_eq!(ours.class, BudgetClass::Off, "an answer, not a refusal");
+        assert!(matches!(t.peer_offer([100u8; 16], &peer), Ok(None)));
+        assert!(!t.is_shaped([100u8; 16]), "unshaped at this end");
+        assert_eq!(t.links_of_all(), 8, "the eight run at their class");
+        let ours = t.offer_for_answer([103u8; 16], 400, Some("quiet"), &ShapingOffer::off());
+        assert!(ours.shapes(), "an off peer is not a shaping peer");
+        assert!(t
+            .peer_offer([103u8; 16], &ShapingOffer::off())
+            .unwrap()
+            .is_none());
+    }
+
+    /// Anonymous mode refuses as shaped-only does.
+    #[test]
+    fn at_the_bound_anonymous_mode_refuses_the_ninth() {
+        let t = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        t.set_anonymous_read(|| true);
+        shaped_links(&t, 8, "g", 10);
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
+        let ours = t.offer_for_answer([100u8; 16], 400, Some("ninth"), &peer);
+        assert_eq!(ours.class, BudgetClass::HomeElsewhere);
+        assert!(matches!(
+            t.peer_offer([100u8; 16], &peer),
+            Err(ShapingError::HomeElsewhere)
+        ));
+    }
+
+    #[test]
+    fn at_the_bound_a_shaped_only_node_refuses_the_ninth() {
+        let mut p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        p.require_shaped_links = true;
         let cap = f64::from(p.node_cap_bytes_per_s);
         let t = LinkShapers::new(p);
         shaped_links(&t, 8, "g", 10);
@@ -3108,12 +3195,6 @@ mod tests {
             t.peer_offer([102u8; 16], &ShapingOffer::home_elsewhere()),
             Err(ShapingError::HomeElsewhere)
         ));
-        let ours = t.offer_for_answer([103u8; 16], 400, Some("quiet"), &ShapingOffer::off());
-        assert!(ours.shapes());
-        assert!(t
-            .peer_offer([103u8; 16], &ShapingOffer::off())
-            .unwrap()
-            .is_none());
         assert_eq!(t.shaped_count(), 8);
         t.forget(&[10u8; 16]);
         assert!(!t.at_bound());
@@ -3828,7 +3909,9 @@ mod tests {
     /// With no layer peers (the tier not running) nothing is held.
     #[test]
     fn layer_links_take_slots_within_the_eight_at_the_class_rate() {
-        let p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        // The eight and the reserve are read at a node that refuses past them.
+        let mut p = ShapingPolicy::fleet_default(BudgetClass::Server);
+        p.require_shaped_links = true;
         let t = LinkShapers::new(p.clone());
         shaped_links(&t, 8, "g", 10);
         assert_eq!(t.layer_held_slots(), 0);

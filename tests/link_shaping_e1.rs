@@ -1010,7 +1010,7 @@ async fn a_link_over_the_node_cap_is_shaped_at_its_share() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_crosses() {
     let _host = share_host().await;
-    let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, true);
     full.share = ShapedSharePolicy::BoundedWithFloor {
         max_links: 0,
         floor_bytes_per_s: 100_000,
@@ -1083,6 +1083,96 @@ async fn at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_cro
         0,
         "still nothing shaped at A"
     );
+}
+
+/// **`CLM-shaped-link-bound-refuse`, CIRISEdge#952** — eight shaped links do not
+/// stop new connections. A is at its bound and is neither shaped-only nor in
+/// the anonymous tier: B's row link stays up unshaped at BOTH ends, the row
+/// crosses, and the next one rides the same link with no second offer. Two ends
+/// that disagree would close on the first frame of the wrong kind. Mutation:
+/// refuse past the bound regardless → this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_the_bound_a_ninth_shaping_peer_runs_unshaped_and_its_rows_move() {
+    let _host = share_host().await;
+    let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    full.share = ShapedSharePolicy::BoundedWithFloor {
+        max_links: 0,
+        floor_bytes_per_s: 100_000,
+    };
+    let t = duo(
+        "ninth",
+        full,
+        policy(BudgetClass::Server, 100_000, 0.5, 10, false),
+    )
+    .await;
+    let row = typed_payload("AttestationGossip", b"NINTH-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("the ninth link runs");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "the row crossed: {:?}",
+        t.a.metrics.link_shaping()
+    );
+    assert_eq!(t.a.shaping("link_shaping_unshaped:past_bound"), 1);
+    assert_eq!(t.a.shaping("link_shaping_home_elsewhere"), 0);
+    assert_eq!(t.b.shaping("link_shaping_home_elsewhere"), 0);
+    assert_eq!(t.a.transport.shaped_link_count(), 0, "unshaped at A");
+    assert_eq!(t.b.transport.shaped_link_count(), 0, "and at B");
+    let next = typed_payload("AttestationGossip", b"NINTH-NEXT-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &next)
+        .await
+        .expect("the next row rides the same link");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&next).await
+        })
+        .await
+    );
+    assert_eq!(
+        t.a.shaping("link_shaping_unshaped:past_bound"),
+        1,
+        "one link, one answer"
+    );
+}
+
+/// A dialler past its OWN bound offers nothing, so the peer never starts a
+/// shaper alone. Mutation: offer past the bound → the views disagree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn past_its_own_bound_a_dialler_offers_nothing_and_both_ends_agree() {
+    let _host = share_host().await;
+    let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    full.share = ShapedSharePolicy::BoundedWithFloor {
+        max_links: 0,
+        floor_bytes_per_s: 100_000,
+    };
+    let t = duo(
+        "ownbound",
+        policy(BudgetClass::Server, 100_000, 0.5, 10, false),
+        full,
+    )
+    .await;
+    let row = typed_payload("AttestationGossip", b"OWN-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B, past its bound, still connects");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await
+    );
+    assert_eq!(t.b.shaping("link_shaping_unshaped:past_bound"), 1);
+    assert_eq!(t.b.shaping("link_shaping_offered"), 0);
+    assert_eq!(t.a.shaping("link_shaping_offered"), 0);
+    assert_eq!(t.a.transport.shaped_link_count(), 0);
+    assert_eq!(t.b.transport.shaped_link_count(), 0);
 }
 
 /// A peer whose class is Off is not a shaping peer: at A's bound its row
@@ -1517,10 +1607,13 @@ async fn referral_pair(
     );
     let mut tasks = Vec::new();
     let all = vec![r_record.clone(), w_record.clone(), p_record.clone()];
+    // Referrals close the link only on a node that refuses (CIRISEdge#952).
+    let mut refuser = roomy(1);
+    refuser.require_shaped_links = true;
     let (r, r_port) = start_node(
         tmp.path(),
         r_key,
-        roomy(1),
+        refuser,
         DeviceState::of(DeviceKind::Server),
         all.clone(),
         Vec::new(),
@@ -2002,6 +2095,17 @@ struct Star {
 }
 
 async fn star(tag: &str, seed: u8, spokes: usize) -> Star {
+    star_of(tag, seed, spokes, roomy(8)).await
+}
+
+/// [`star`], with a shaped-only hub: the one that refuses (CIRISEdge#952).
+async fn star_shaped_only(tag: &str, seed: u8, spokes: usize) -> Star {
+    let mut hub = roomy(8);
+    hub.require_shaped_links = true;
+    star_of(tag, seed, spokes, hub).await
+}
+
+async fn star_of(tag: &str, seed: u8, spokes: usize, hub: ShapingPolicy) -> Star {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let r_key = Ident::new(&format!("node-r-{tag}"), seed).await;
@@ -2021,7 +2125,7 @@ async fn star(tag: &str, seed: u8, spokes: usize) -> Star {
     let (r, r_port) = start_node(
         tmp.path(),
         r_key,
-        roomy(8),
+        hub,
         DeviceState::of(DeviceKind::Server),
         records.clone(),
         Vec::new(),
@@ -2092,7 +2196,7 @@ async fn shape_to(r: &Node, n: &Node, marker: &[u8]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e15_tier_one_refuses_a_stranger_with_a_referral_and_admits_the_protected() {
     let _host = share_host().await;
-    let t = star("t1", 0x90, 4).await;
+    let t = star_shaped_only("t1", 0x90, 4).await;
     let Star {
         r,
         spokes,
@@ -2166,6 +2270,42 @@ async fn e15_tier_one_refuses_a_stranger_with_a_referral_and_admits_the_protecte
     assert!(!r.received(&row).await, "the refused row stayed off");
 }
 
+/// **Admit-close stops a slot, not a connection** (CIRISEdge#952). At tier 1 a
+/// node that did not opt in to refusing answers a stranger `off`, with its
+/// referrals as a hint, and the link stays up unshaped at both ends: a load
+/// tier is no more a reason to drop a dialler than eight shaped links are.
+/// Mutation: refuse at tier 1 regardless → this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e15_tier_one_keeps_a_strangers_link_unshaped_on_a_node_that_did_not_opt_in() {
+    let _host = share_host().await;
+    let t = star("t1soft", 0xc0, 1).await;
+    let Star {
+        r,
+        spokes,
+        _tmp,
+        _tasks,
+    } = t;
+    let [stranger] = <[Node; 1]>::try_from(spokes).ok().expect("one");
+    read_obligations(&r, &[]);
+    r.transport
+        .set_service_tier(ciris_edge::ServiceTier::AudioAndFiles);
+    let row = typed_payload("AttestationGossip", b"T1SOFT-ROW-", 2_000);
+    stranger
+        .transport
+        .send(&r.key.key_id, &row)
+        .await
+        .expect("the link stands, unshaped");
+    assert!(
+        wait_until(Duration::from_secs(30), || async { r.received(&row).await }).await,
+        "the row crossed: {:?}",
+        r.metrics.link_shaping()
+    );
+    assert_eq!(r.shaping("load_refuse:admit_closed"), 1, "no slot, by name");
+    assert_eq!(r.shaping("link_shaping_home_elsewhere"), 0);
+    assert_eq!(r.transport.shaped_link_count(), 0);
+    assert_eq!(stranger.transport.shaped_link_count(), 0);
+}
+
 /// **Tier 2 on real links.** Two strangers' links close newest first, one step
 /// at a time. The owner's device, a seat and a link R dialled stand, and their
 /// rows cross at the unchanged real budget, cover running at the unchanged
@@ -2191,7 +2331,7 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
 /// not a redial. A link gone with nothing counting it panics.
 #[allow(clippy::too_many_lines)] // one tier's whole story, in order
 async fn tier_two_story(tag: &str, seed: u8) -> bool {
-    let t = star(tag, seed, 5).await;
+    let t = star_shaped_only(tag, seed, 5).await;
     let Star {
         r,
         spokes,
@@ -2356,7 +2496,7 @@ async fn tier_two_story(tag: &str, seed: u8) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e8_e15_status_and_shed_through_edge_track_the_load_pressure() {
     let _host = share_host().await;
-    let t = star("edge", 0xc0, 1).await;
+    let t = star_shaped_only("edge", 0xc0, 1).await;
     let Star {
         r,
         spokes,

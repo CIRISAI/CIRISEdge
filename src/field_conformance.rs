@@ -482,11 +482,15 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
     TestEvidence {
         cc: "5.4.3",
         clm: "CLM-shaped-link-bound-refuse",
-        property: "past the bound of eight a shaping peer is refused by name, and its bulk still crosses",
+        property: "at the bound, a node set to shaped-only or to the anonymous tier refuses a ninth shaping peer with referrals; any other node runs the ninth link unshaped; a shaped link is never run below its class",
         impl_anchor: "src/transport/link_shaping.rs#LinkShapers::at_bound_for",
         witness: &[
-            "src/transport/link_shaping.rs#at_the_bound_a_ninth_shaping_peer_is_refused_and_an_off_peer_is_not",
+            "src/transport/link_shaping.rs#at_the_bound_a_shaped_only_node_refuses_the_ninth",
+            "src/transport/link_shaping.rs#at_the_bound_a_node_that_did_not_opt_in_runs_the_ninth_unshaped",
+            "src/transport/link_shaping.rs#at_the_bound_anonymous_mode_refuses_the_ninth",
             "tests/link_shaping_e1.rs#at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_crosses",
+            "tests/link_shaping_e1.rs#at_the_bound_a_ninth_shaping_peer_runs_unshaped_and_its_rows_move",
+            "tests/link_shaping_e1.rs#past_its_own_bound_a_dialler_offers_nothing_and_both_ends_agree",
             "tests/link_shaping_e1.rs#at_the_bound_an_off_peer_still_gets_an_ordinary_unshaped_link",
         ],
         supporting: false,

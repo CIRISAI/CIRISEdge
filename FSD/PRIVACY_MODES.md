@@ -191,8 +191,10 @@ The link runs at the lower of two offers, so a node requiring shaping closes the
 
 ### 3.2 Eight peers, and a full node
 
-- **Eight links at a time** (CC 5.4.3 the bound). Rung 3 has no unshaped link to spill onto, so a ninth
-  peer waits for a slot to free; a lane idle for 120 s frees one. Relay offering spends the same slots
+- **Eight links at a time** (CC 5.4.3 the bound, CIRISEdge#952). A node set to shaped-only or to the
+  anonymous tier refuses a ninth shaping peer with referrals, and that peer waits for a slot to free; a
+  lane idle for 120 s frees one. Any other node runs the ninth link unshaped, and a shaped link is never
+  run below its class. Relay offering spends the same slots
   (§5.4).
 - **A full peer.** Past its eight, a peer refuses your row link and offers a bulk link "where one exists"
   (CC 5.4.3). A shaped-only node has none, so that peer is unreachable until a slot frees or a referral
@@ -655,7 +657,7 @@ Eric's fleet default is on for `server` (CC 5.4.3), but the canonical has no wiz
   neither (item 2). Thinning cover would show a watcher the node's load, which is the thing shaping hides. And there is little to save: outbound
   is fixed at the cap, 56 KB/s at `server`, under 2 % of a vCPU per 1,000 peers **[model]** (`TRANSPORT_TIERS_MODEL.md` §8), and cover never reaches
   the DB.
-- **A shaped link sheds whole.** Tier 1 (Admit-close): no new shaped links for non-obligation peers: refused with referrals, reports zero slots.
+- **A shaped link sheds whole.** Tier 1 (Admit-close): no new shaped links for non-obligation peers, and zero slots reported. A shaped-only or anonymous-tier node refuses them with referrals; any other node answers `off` with its referrals as a hint, and the link runs unshaped (CIRISEdge#952).
   Tier 2: may close shaped links, newest first, for non-obligation peers, never the owner's devices or a `seat` link. A closure is visible, and that is
   the accepted cost; it says a link closed, not how loaded the rest are. As built (`feat/v44-status-shed`): one link a second, links this node dialled are not closed, and a refusal at tier 1 carries `load_shed:shaped`.
 - **Rows keep their place.** Tier 2 keeps chat and contacts on the shaped link at the unchanged real budget.
