@@ -152,6 +152,25 @@ the last 120 s; those are the peer's exclusions, and no message carries them. Th
 refusal's token and the outcome are logged and counted:
 `link_shaping_referral_{sent,empty,withheld,received,rejected,homed,failed,exhausted}`.
 
+**Asked of a node that does not offer.** The setting says whether a node offers
+shaping by default; the capability is every node's (CC 5.4.3,
+`CLM-shaping-offered-never-refused`). On a direct link a node with shaping off
+answers a peer that asks at its own device class, and the agreement takes the lower of
+the two, so a phone on cellular pays no more than its class. The wire does not
+change: an old peer's `off` ends as it always did. The node drops the link ten
+minutes after its last real frame, either way, with up to a tenth more by link so
+a fleet's links do not close together; cover does not count. The ten minutes are
+the operator's, `Edge::set_shaping_asked_idle_ttl`. The close is a plain one
+(`link_shaping_asked_idle_closed`), and the asker dials again when it has something
+to send.
+
+**Past the bound.** Only a node set to shaped-only or to the anonymous tier refuses
+(CIRISEdge#952). Any other node answers `off`, sends its referrals as a hint, and
+the link runs unshaped, counted `link_shaping_unshaped:past_bound` at the end that
+had no slot. A dialler past its own bound offers nothing, so no shaper starts at
+the other end alone. A refusal is the peer's choice and does not count against
+its reachability.
+
 **A referral is a hint, never a guarantee.** A stale report costs one refused dial
 and the peer tries the next. **With no targets known the refusal carries an empty
 list and the peer uses its fallback order** (other canonicals, CIRISEdge#935). At
@@ -215,20 +234,12 @@ a peer this node cannot dial.
 **Live media.** An A/V leg is on the `Av` plane and is never shaped. A scoped
 link is never shaped either. Neither makes a shaping claim.
 
-**The last resort.** If no unshaped link can be had because the dial fails (for
+**No fallback.** If no unshaped link can be had because the dial fails (for
 example, a NAT'd phone reachable only over the link it dialled in), the message
-rides the shaped link in shaped-budget fragments and is counted
-`link_shaping_bulk_on_shaped_fallback`. The shaper paces it like every other
-frame, so the link stays constant-size and constant-rate. It is slow, but it
-does not fail: `Delivered` means every fragment left this node, and a transfer
-that stops part-way is an error the durable dispatcher retries. A second send of
-the same envelope joins the transfer rather than queueing it twice, and a failed
-dial stands for 120 s per peer, so a NAT'd peer costs one failed dial, not one
-per send. The rate is the link's real budget: at the `server` class on a 16 KB
-frame, about 0.2 real frames per second, or 3.5 KB/s, so 1 MiB takes about five
-minutes.
+is refused by name, `link_shaping_bulk_refused`, and the durable dispatcher
+retries it on its schedule (CC 5.4.3, `CLM-shaped-link-one-hop`). It never rides
+the shaped link. A failed dial stands for 120 s per peer, so a NAT'd peer costs
+one failed dial, not one per send.
 
-**The refusal.** The shaper itself still refuses a message beyond its reach
-outside that fallback (`link_shaping_bulk_refused`), and queues none of it. The
-send paths move bulk before it gets there, so a count here means a path that
-skipped them.
+The shaper itself also refuses a message beyond its reach, under the same token,
+and queues none of it. The send paths move bulk before it gets there.

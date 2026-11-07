@@ -79,8 +79,14 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // (`FSD/FIRST_CONTACT.md` §2.3). v44 — sharing traces is its own consent,
         // per recipient, on the advertise and the direct fetch alike
         // (`trace_recipient_withholds`); a relayed row is its producer's flow.
+        //
+        // CC 5.2 (v44.1) — the advertise is the commons between two seats on the
+        // active roster; to a contact, or between a seat and a node, it is the
+        // required rows first, then only what is required or appropriate and
+        // live. Serving is unchanged: the rest waits on the peer's pull.
         EnvelopeKind::Attestation => (
-            "per_record_projection",
+            "per_record_projection; seat_to_seat: commons; else required_first, \
+             required_or_appropriate_live",
             "trace:* → capability:infra:serve, and a row this node or its owner \
              authored outside a cohort placement → a live consent:replication grant \
              naming the peer or its owner that covers the row's dimension; first \
@@ -363,8 +369,11 @@ pub fn serve_advertise_policy_sha256() -> String {
 // that commit while the cell still read `capability:infra:serve` alone. The
 // other cells, persist 61.0.1-3 and the #943/#947 work leave the hash alone.
 // **CIRISServer must mirror this pin.**
+//
+// v44.1 (CC 5.2) — RE-PINNED, 83099f47… → 14aedf25…: the Attestation `advertise`
+// cell states what moves to a peer unasked. **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "83099f472ec6f9d378753239802393915aa7645f3ec25088c0fcf8f1db70b34d";
+    "14aedf2590745dbac03b9f1f859085c43ead0ce0c67e46d10321d88257aded09";
 
 #[cfg(test)]
 mod tests {

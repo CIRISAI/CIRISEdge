@@ -1581,9 +1581,8 @@ mod leviculum_link {
         /// caller can tell "defer this" from "this went wrong".
         ///
         /// CIRISEdge#720 — the frame is sized against the link's Channel
-        /// limit FIRST. leviculum refuses an oversized Channel message as
-        /// `TooLarge` and `send_on_link` folds that into `LinkFailed`, so
-        /// without this check an oversized chunk read as a link failure.
+        /// limit FIRST, and leviculum's own `TooLarge` is the backstop for a
+        /// link whose limit moved since.
         fn message_limit(&self) -> Option<usize> {
             LeviculumAvSender::channel_limit(self)
         }
@@ -1673,6 +1672,15 @@ mod leviculum_link {
                 Err(LevError::Send(SendError::Busy | SendError::PacingDelay { .. })) => {
                     self.count(crate::observability::AV_SEND_CONGESTED);
                     Err(AvDispatcherError::Congested)
+                }
+                Err(LevError::Send(SendError::TooLarge)) => {
+                    self.count(crate::observability::AV_SEND_FAILED);
+                    Err(AvDispatcherError::SendFailed(format!(
+                        "frame of {} bytes is over the Channel limit of link {:?}, which is \
+                         alive",
+                        bytes.len(),
+                        self.link_id
+                    )))
                 }
                 Err(e) => {
                     self.count(crate::observability::AV_SEND_FAILED);

@@ -80,7 +80,8 @@ impl ChannelLanding {
         }
         match stalled {
             Some("fragment_pacing_timeout" | "frame_budget_exhausted") => Self::Starved,
-            // `link_unsealed`, `link_send_error`, `shaping_body_too_large`, a
+            // `link_unsealed`, `link_send_error`, `frame_over_channel_limit`,
+            // `shaping_body_too_large`, a
             // sequence that did not stop (cannot happen with `sent == 0 < total`),
             // or `shaping_queue_full`: a SHAPED link's queue filling behind its
             // Poisson window is load, not a dead Channel (CC 5.4.3; its cover

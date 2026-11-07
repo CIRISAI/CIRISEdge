@@ -544,6 +544,33 @@ impl PyEdge {
         Ok(self.inner.set_load_pressure(p).as_u8())
     }
 
+    /// `CLM-shaping-offered-never-refused` — seconds past its last real frame
+    /// that a shaped link a peer asked of this node lives. Raises `ValueError`
+    /// on a value that is no duration.
+    fn set_shaping_asked_idle_ttl(&self, secs: f64) -> PyResult<()> {
+        let ttl = std::time::Duration::try_from_secs_f64(secs)
+            .map_err(|e| PyValueError::new_err(format!("bad_ttl: {e}")))?;
+        self.inner.set_shaping_asked_idle_ttl(ttl);
+        Ok(())
+    }
+
+    /// `FSD/CIRIS_MESH.md` §7.7 — **pull a shed lever**: `"walk"`, `"page"` or
+    /// `"bulk"`, toward `level` (0 to 3) for `lease_secs`, renewed by calling
+    /// again. Returns the level in force. It rises one step per 10 s, falls one
+    /// per 30 s, and falls on its own when the lease runs out. The levers read
+    /// back in `load_ledger_json`. Raises `ValueError` on another spelling.
+    #[allow(clippy::similar_names)] // a lever and its level
+    fn pull_shed_lever(&self, lever: &str, level: u8, lease_secs: f64) -> PyResult<u8> {
+        let l = crate::ShedLever::parse(lever).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "bad_shed_lever: {lever:?} is not walk, page or bulk"
+            ))
+        })?;
+        let lease = std::time::Duration::try_from_secs_f64(lease_secs)
+            .map_err(|e| PyValueError::new_err(format!("bad_lease: {e}")))?;
+        Ok(self.inner.pull_shed_lever(l, level, lease))
+    }
+
     /// `FSD/CIRIS_MESH.md` §7.2 — the service tier this node runs at: 0 full
     /// ops, 1 audio and files, 2 chat and contacts.
     fn service_tier(&self) -> u8 {
@@ -2915,6 +2942,8 @@ impl PyEdge {
         // unless `use_node_identity` split them, and where they differ, using
         // the actor here silently disables a blessed node's directory role.
         config.serve_tier_subject_key_id = Some(self.inner.advertised_key_id());
+        // CC 5.2 — only two seats walk the commons, by the active roster.
+        config.recognised_seats = Some(self.inner.recognised_seats());
         // CIRISEdge#370 — hand the live metrics bag to the runtime so its
         // scheduler event-sink consumer folds each round's outcome into the
         // round-outcome counter surfaced by `metrics_snapshot`. Cheap clone;

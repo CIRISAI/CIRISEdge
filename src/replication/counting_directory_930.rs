@@ -5,9 +5,9 @@
 //! persist's `scripts/gen_directory_double.py`) at the pinned tag v59.1.2:
 //! the same delegations, each fault check replaced by a counter bump. It
 //! wraps a REAL directory, so every call keeps real behaviour; a trait method
-//! with a default body is not delegated and runs that default over the
-//! counted required methods, so a composite read is counted as the reads it
-//! is made of. The count is per METHOD NAME, independent of edge's own
+//! with a default body is delegated too where it is a read a store overrides,
+//! since the default answers `Unsupported`; a composite read is then counted
+//! as the one read a store serves it with. The count is per METHOD NAME, independent of edge's own
 //! bookkeeping: a witness that edge read less cannot be satisfied by edge
 //! saying so.
 //!
@@ -74,6 +74,453 @@ impl CountingDirectory {
 
 #[async_trait::async_trait]
 impl FederationDirectory for CountingDirectory {
+    async fn list_holders_sized(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<renditions::HolderClaim>, Error> {
+        self.hit("list_holders_sized");
+        self.inner.list_holders_sized(sha256).await
+    }
+    async fn lookup_canonical_withdrawal(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<admission::CanonicalWithdrawal>, Error> {
+        self.hit("lookup_canonical_withdrawal");
+        self.inner.lookup_canonical_withdrawal(key_id).await
+    }
+    async fn list_canonical_withdrawals(
+        &self,
+    ) -> Result<Vec<admission::CanonicalWithdrawal>, Error> {
+        self.hit("list_canonical_withdrawals");
+        self.inner.list_canonical_withdrawals().await
+    }
+    async fn lookup_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+    ) -> Result<Option<admission::RoleWithdrawal>, Error> {
+        self.hit("lookup_role_withdrawal");
+        self.inner.lookup_role_withdrawal(role, key_id).await
+    }
+    async fn list_attestations_for(
+        &self,
+        attested_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("list_attestations_for");
+        self.inner.list_attestations_for(attested_key_id).await
+    }
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("list_attestations_by");
+        self.inner.list_attestations_by(attesting_key_id).await
+    }
+    async fn list_composers_referencing_any(
+        &self,
+        target_attestation_ids: &[String],
+        attested_key_id: Option<&str>,
+        attesting_key_id: Option<&str>,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("list_composers_referencing_any");
+        self.inner
+            .list_composers_referencing_any(
+                target_attestation_ids,
+                attested_key_id,
+                attesting_key_id,
+            )
+            .await
+    }
+    async fn list_consent_peers(&self, node_key_id: &str) -> Result<Vec<String>, Error> {
+        self.hit("list_consent_peers");
+        self.inner.list_consent_peers(node_key_id).await
+    }
+    async fn list_consent_peers_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        self.hit("list_consent_peers_for");
+        self.inner.list_consent_peers_for(for_key_id).await
+    }
+    async fn list_live_consent_grants_by(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("list_live_consent_grants_by");
+        self.inner.list_live_consent_grants_by(node_key_id).await
+    }
+    async fn list_live_consent_grants_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("list_live_consent_grants_for");
+        self.inner.list_live_consent_grants_for(for_key_id).await
+    }
+    async fn list_local_tier_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("list_local_tier_attestations");
+        self.inner
+            .list_local_tier_attestations(after_attestation_id, limit)
+            .await
+    }
+    async fn list_widening_candidates(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("list_widening_candidates");
+        self.inner
+            .list_widening_candidates(after_attestation_id, limit)
+            .await
+    }
+    async fn list_attestations_for_migration(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("list_attestations_for_migration");
+        self.inner
+            .list_attestations_for_migration(after_attestation_id, limit)
+            .await
+    }
+    async fn list_key_plane_wire_hashes_since(
+        &self,
+        family: &str,
+        after_content_hash: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, Error> {
+        self.hit("list_key_plane_wire_hashes_since");
+        self.inner
+            .list_key_plane_wire_hashes_since(family, after_content_hash, limit)
+            .await
+    }
+    async fn list_expired_attestation_ids(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<String>, Error> {
+        self.hit("list_expired_attestation_ids");
+        self.inner
+            .list_expired_attestation_ids(now, limit, offset)
+            .await
+    }
+    async fn lookup_trusted_publisher_chain(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("lookup_trusted_publisher_chain");
+        self.inner
+            .lookup_trusted_publisher_chain(content_sha256)
+            .await
+    }
+    async fn list_signed_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<SignedIdentityOccurrence>, Error> {
+        self.hit("list_signed_identity_occurrences_for");
+        self.inner
+            .list_signed_identity_occurrences_for(identity_key_id)
+            .await
+    }
+    async fn list_attestation_log(
+        &self,
+        subject_key_id: Option<&str>,
+        cursor: Option<ciris_persist::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<ciris_persist::read::ScoresPage, Error> {
+        self.hit("list_attestation_log");
+        self.inner
+            .list_attestation_log(subject_key_id, cursor, limit)
+            .await
+    }
+    async fn list_announced_peers(&self) -> Result<Vec<types::AnnouncedPeer>, Error> {
+        self.hit("list_announced_peers");
+        self.inner.list_announced_peers().await
+    }
+    async fn list_purge_executions_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<steward_purge::PurgeExecution>, Error> {
+        self.hit("list_purge_executions_since");
+        self.inner.list_purge_executions_since(since, limit).await
+    }
+    async fn list_identity_occurrences_active(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error> {
+        self.hit("list_identity_occurrences_active");
+        self.inner
+            .list_identity_occurrences_active(identity_key_id)
+            .await
+    }
+    async fn list_families_for_member_active(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Family>, Error> {
+        self.hit("list_families_for_member_active");
+        self.inner
+            .list_families_for_member_active(member_identity_key_id)
+            .await
+    }
+    async fn list_communities_for_member_active(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Community>, Error> {
+        self.hit("list_communities_for_member_active");
+        self.inner
+            .list_communities_for_member_active(member_identity_key_id)
+            .await
+    }
+    async fn active_family_members(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<types::FamilyMember>, Error> {
+        self.hit("active_family_members");
+        self.inner.active_family_members(family_key_id).await
+    }
+    async fn active_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<String, Error> {
+        self.hit("active_identity_for_occurrence");
+        self.inner
+            .active_identity_for_occurrence(occurrence_key_id)
+            .await
+    }
+    async fn active_identities_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        self.hit("active_identities_for_occurrence");
+        self.inner
+            .active_identities_for_occurrence(occurrence_key_id)
+            .await
+    }
+    async fn active_family_key_ids_for(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        self.hit("active_family_key_ids_for");
+        self.inner
+            .active_family_key_ids_for(member_identity_key_id)
+            .await
+    }
+    async fn active_community_key_ids_for(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        self.hit("active_community_key_ids_for");
+        self.inner
+            .active_community_key_ids_for(member_identity_key_id)
+            .await
+    }
+    async fn active_community_members(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<types::CommunityMember>, Error> {
+        self.hit("active_community_members");
+        self.inner.active_community_members(community_key_id).await
+    }
+    async fn active_members(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<cohort::RosterMember>, Error> {
+        self.hit("active_members");
+        self.inner.active_members(cohort, group_key_id).await
+    }
+    async fn list_signed_records(
+        &self,
+        kind: namespace::ReplicatedKind,
+        subject_key_id: &str,
+    ) -> Result<Vec<namespace::SignedReplicatedRecord>, Error> {
+        self.hit("list_signed_records");
+        self.inner.list_signed_records(kind, subject_key_id).await
+    }
+    async fn active_member_keys(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<types::KeyRecord>, Error> {
+        self.hit("active_member_keys");
+        self.inner.active_member_keys(cohort, group_key_id).await
+    }
+    async fn lookup_group(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Option<cohort::GroupRef>, Error> {
+        self.hit("lookup_group");
+        self.inner.lookup_group(cohort, group_key_id).await
+    }
+    async fn groups_of(
+        &self,
+        cohort: cohort::Cohort,
+        member_key_id: &str,
+    ) -> Result<Vec<cohort::GroupRef>, Error> {
+        self.hit("groups_of");
+        self.inner.groups_of(cohort, member_key_id).await
+    }
+    async fn delegations_to(&self, key_id: &str) -> Result<Vec<Attestation>, Error> {
+        self.hit("delegations_to");
+        self.inner.delegations_to(key_id).await
+    }
+    async fn lookup_trust(&self, key: &str) -> Result<Option<TrustRow>, Error> {
+        self.hit("lookup_trust");
+        self.inner.lookup_trust(key).await
+    }
+    async fn list_trusted_keys(&self, filter: TrustFilter) -> Result<Vec<TrustRow>, Error> {
+        self.hit("list_trusted_keys");
+        self.inner.list_trusted_keys(filter).await
+    }
+    async fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>, Error> {
+        self.hit("get_goal");
+        self.inner.get_goal(goal_id).await
+    }
+    async fn list_goals(&self, filter: GoalsFilter) -> Result<Vec<Goal>, Error> {
+        self.hit("list_goals");
+        self.inner.list_goals(filter).await
+    }
+    async fn lookup_shared_instance_lease(
+        &self,
+        instance_name: &str,
+    ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
+        self.hit("lookup_shared_instance_lease");
+        self.inner.lookup_shared_instance_lease(instance_name).await
+    }
+    async fn list_signed_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::SignedTransportDestination>, Error> {
+        self.hit("list_signed_transport_destinations_for");
+        self.inner
+            .list_signed_transport_destinations_for(occurrence_key_id)
+            .await
+    }
+    async fn list_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        self.hit("list_transport_destinations_for");
+        self.inner
+            .list_transport_destinations_for(occurrence_key_id)
+            .await
+    }
+    async fn list_transport_destinations_for_unfolded(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        self.hit("list_transport_destinations_for_unfolded");
+        self.inner
+            .list_transport_destinations_for_unfolded(occurrence_key_id)
+            .await
+    }
+    async fn list_all_transport_destinations(
+        &self,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        self.hit("list_all_transport_destinations");
+        self.inner.list_all_transport_destinations().await
+    }
+    async fn list_all_transport_destinations_unfolded(
+        &self,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        self.hit("list_all_transport_destinations_unfolded");
+        self.inner.list_all_transport_destinations_unfolded().await
+    }
+    async fn list_transport_destinations_by_destination(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        self.hit("list_transport_destinations_by_destination");
+        self.inner
+            .list_transport_destinations_by_destination(destination)
+            .await
+    }
+    async fn list_transport_destinations_by_destination_unfolded(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        self.hit("list_transport_destinations_by_destination_unfolded");
+        self.inner
+            .list_transport_destinations_by_destination_unfolded(destination)
+            .await
+    }
+    async fn lookup_freshness_floor(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+    ) -> Result<Option<types::SignedTouchClaim>, Error> {
+        self.hit("lookup_freshness_floor");
+        self.inner
+            .lookup_freshness_floor(target_key_id, target_kind)
+            .await
+    }
+    async fn list_hard_case_events(
+        &self,
+        filter: hard_case::HardCaseFilter,
+    ) -> Result<Vec<hard_case::HardCaseEvent>, Error> {
+        self.hit("list_hard_case_events");
+        self.inner.list_hard_case_events(filter).await
+    }
+    async fn list_wholeness_witnesses_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<ciris_persist::witness::StoredWitness>, Error> {
+        self.hit("list_wholeness_witnesses_for_peer");
+        self.inner.list_wholeness_witnesses_for_peer(peer_id).await
+    }
+    async fn list_witness_peer_ids(&self) -> Result<Vec<String>, Error> {
+        self.hit("list_witness_peer_ids");
+        self.inner.list_witness_peer_ids().await
+    }
+    async fn list_witness_equivocations(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<ciris_persist::witness::WitnessEquivocationRecord>, Error> {
+        self.hit("list_witness_equivocations");
+        self.inner.list_witness_equivocations(peer_id).await
+    }
+    async fn list_consent_revocations(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("list_consent_revocations");
+        self.inner.list_consent_revocations(since).await
+    }
+    async fn list_consent_revocation_promotion_overdue(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        sla: std::time::Duration,
+    ) -> Result<Vec<hard_case::ConsentPromotionOverdueRow>, Error> {
+        self.hit("list_consent_revocation_promotion_overdue");
+        self.inner
+            .list_consent_revocation_promotion_overdue(now, sla)
+            .await
+    }
+    async fn list_consent_revocation_promotion_overdue_readonly(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        sla: std::time::Duration,
+    ) -> Result<Vec<hard_case::ConsentPromotionOverdueRow>, Error> {
+        self.hit("list_consent_revocation_promotion_overdue_readonly");
+        self.inner
+            .list_consent_revocation_promotion_overdue_readonly(now, sla)
+            .await
+    }
+    async fn list_accord_proposals_by_payload(
+        &self,
+        payload_sha256: &str,
+    ) -> Result<Vec<ciris_verify_core::accord_live_quorum::AccordProposal>, Error> {
+        self.hit("list_accord_proposals_by_payload");
+        self.inner
+            .list_accord_proposals_by_payload(payload_sha256)
+            .await
+    }
     async fn apply_replicated_accord_evidence(
         &self,
         evidence: &accord_carriage::AccordQuorumEvidence,

@@ -280,6 +280,10 @@ pub trait ReplicationDirectory: Send + Sync {
         false
     }
 
+    /// The round this node drove toward `peer_key_id` on `kind` ended, `lost`
+    /// when it did not complete.
+    fn round_ended(&self, _peer_key_id: &str, _kind: EnvelopeKind, _lost: bool) {}
+
     /// Apply one envelope to local state. The implementation verifies the signed
     /// envelope's signature + canonical-bytes hash before admitting; the merge
     /// layer in persist is the canonical anti-rollback authority. Returns an
@@ -409,6 +413,12 @@ impl StateProvider for DirectoryStateAdapter {
 
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
         self.inner.retry_suppressed(kind, envelope_hash)
+    }
+
+    fn round_ended(&self, kind: EnvelopeKind, lost: bool) {
+        if let Some(peer) = self.peer_key_id.as_deref() {
+            self.inner.round_ended(peer, kind, lost);
+        }
     }
 
     async fn fetch_envelope(

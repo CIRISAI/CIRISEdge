@@ -164,6 +164,11 @@ fn every_closed_label_is_present_at_zero_on_a_fresh_bag() {
             .counters
             .contains_key(&format!("load_tier_changes_total.{key}")));
     }
+    for key in crate::load_levers::lever_change_keys() {
+        assert!(f
+            .counters
+            .contains_key(&format!("load_lever_changes_total.{key}")));
+    }
     for class in REFUSAL_CLASSES {
         let key = format!("apply_refusals.{APPLY_REFUSAL_REFUSED_THEN_ADMITTED}:{class}");
         assert!(f.counters.contains_key(&key), "{key}");
@@ -399,6 +404,47 @@ fn a_tier_change_is_booked_with_who_put_it_there() {
     w.rose("load_host_pressure");
     w.rose("load_tier_changes_total.load_tier:2:host:critical");
     assert!(m.snapshot().load_pressure_report_age_seconds >= 0.0);
+}
+
+/// A pulled lever shows on the gauges a host reads, with its move counted.
+#[test]
+fn a_pulled_lever_is_a_gauge_and_a_counter() {
+    let m = crate::observability::EdgeMetrics::default();
+    let w = Witness::of(&m);
+    m.telemetry.levers.pull(
+        crate::ShedLever::Bulk,
+        1,
+        std::time::Duration::from_secs(60),
+    );
+    w.rose("load_lever_level.bulk");
+    w.rose("load_lever_lease_seconds.bulk");
+    w.rose("load_lever_changes_total.bulk:host");
+}
+
+#[test]
+fn a_forward_reading_is_gauges_and_counters() {
+    let m = crate::observability::EdgeMetrics::default();
+    let w = Witness::of(&m);
+    m.telemetry.set_forward(
+        crate::transport::relay_tier::ForwardCounts {
+            admitted: 3,
+            refused_capacity: 2,
+            live: 1,
+        },
+        &crate::transport::relay_tier::ForwardLoad {
+            pps: 9.0,
+            bps: 90.0,
+            ..Default::default()
+        },
+    );
+    w.rose("forward_links_live");
+    w.rose("forward_admitted_total");
+    w.rose(&format!(
+        "forward_refusals_total.{}",
+        crate::observability::FORWARD_REFUSED_CAPACITY
+    ));
+    w.rose("forward_packets_per_second");
+    w.rose("forward_bits_per_second");
 }
 
 #[test]
