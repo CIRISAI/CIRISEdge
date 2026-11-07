@@ -4899,7 +4899,7 @@ impl Edge {
         self: &Arc<Self>,
         runtime: &tokio::runtime::Handle,
     ) -> Vec<tokio::task::JoinHandle<()>> {
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundFrame>(1024);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundFrame>(1024);
         let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         // One listen task per registered transport. Each `listen()`
