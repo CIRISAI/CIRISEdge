@@ -783,11 +783,15 @@ async fn send_fragments_on_channel(
         .await
         {
             Ok(Ok(())) => sent += 1,
-            Ok(Err(_)) => {
+            Ok(Err(e)) => {
                 return FragmentSendOutcome {
                     sent,
                     total,
-                    stalled: Some("link_send_error"),
+                    stalled: Some(if is_over_channel_limit(&e) {
+                        FRAME_OVER_CHANNEL_LIMIT
+                    } else {
+                        "link_send_error"
+                    }),
                 }
             }
             Err(_elapsed) => {
@@ -805,6 +809,26 @@ async fn send_fragments_on_channel(
         stalled: None,
     }
 }
+/// A send refused because the frame is over the Channel's limit (leviculum
+/// 0.34 says so; it used to read `LinkFailed`). The link is alive: its MDU
+/// shrank under a frame cut earlier, on a move to a direct path.
+const FRAME_OVER_CHANNEL_LIMIT: &str = "frame_over_channel_limit";
+
+fn is_over_channel_limit(e: &leviculum_std::error::Error) -> bool {
+    matches!(
+        e,
+        leviculum_std::error::Error::Send(leviculum_core::SendError::TooLarge)
+    )
+}
+
+/// The Resource window policy: `Adaptive` on a fast duplex path, `Current`
+/// everywhere else, decided per resource from the link's interface and round
+/// trip (leviculum#103). `Current` caps the window at the slow tier past about
+/// 31 ms. A radio hot-plugged later (`add_rnode_channel_interface`) reads
+/// `InterfaceKind::Rnode`, so resources on it stay `Current`.
+const RESOURCE_WINDOW_POLICY: leviculum_std::resource_policy::WindowPolicy =
+    leviculum_std::resource_policy::WindowPolicy::ByMedium;
+
 /// Pause between busy-retries on the reverse path.
 const REVERSE_PATH_BUSY_BACKOFF: Duration = Duration::from_millis(500);
 /// CIRISEdge#353b/v13.6.1 — PROGRESS-AWARE reverse-path resource wait.
@@ -3759,7 +3783,8 @@ impl ReticulumTransport {
             // CIRISEdge#805 item 8 — always explicit, so the node never runs on
             // a leviculum default (or a stray config file's keys) edge did not
             // choose.
-            .direct_link(config.direct_links.leviculum_settings());
+            .direct_link(config.direct_links.leviculum_settings())
+            .resource_window_policy(RESOURCE_WINDOW_POLICY);
         tracing::info!(
             proposes = config.direct_links.proposes(),
             proposing = ?config.direct_links.proposing,
@@ -17378,6 +17403,22 @@ fn spawn_shaper_task(
                 }
                 continue;
             }
+            if matches!(&sent, Ok(Err(e)) if is_over_channel_limit(e)) {
+                if real {
+                    shaper.note_sent(ticket);
+                }
+                if let Some(m) = metrics.as_ref() {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_FRAME_TOO_LARGE);
+                }
+                tracing::warn!(
+                    link = %hex::encode(link),
+                    real,
+                    bytes = sealed.len(),
+                    "a shaped frame is over the link's Channel limit: dropped, the link is \
+                     alive (CC 5.4.3)"
+                );
+                continue;
+            }
             if let Some(m) = metrics.as_ref() {
                 m.inc_link_shaping(crate::observability::LINK_SHAPING_SEND_FAILED);
             }
@@ -22105,6 +22146,38 @@ async fn with_timeout<F: std::future::Future>(dur: Duration, fut: F) -> Option<F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A radio keeps `Current`, built in or hot-plugged: `ByMedium` decides per
+    /// resource from the interface, so a node with no radio at build time is
+    /// safe when one arrives. A fast path past the old 31 ms cliff opens up.
+    #[test]
+    fn the_window_policy_is_by_medium_and_a_radio_keeps_current() {
+        use leviculum_core::traits::InterfaceKind;
+        use leviculum_std::resource_policy::WindowPolicy;
+        assert_eq!(RESOURCE_WINDOW_POLICY, WindowPolicy::ByMedium);
+        let on = |kind, rtt| RESOURCE_WINDOW_POLICY.for_path(Some(kind), rtt);
+        assert_eq!(on(InterfaceKind::Rnode, 40), WindowPolicy::Current);
+        assert_eq!(on(InterfaceKind::Tcp, 40), WindowPolicy::Adaptive);
+        assert_eq!(
+            on(InterfaceKind::Tcp, 2_000),
+            WindowPolicy::Current,
+            "a slow round trip is a radio hop behind a fast first hop"
+        );
+    }
+
+    /// A frame over the Channel limit is named. It used to read as a dead link.
+    #[test]
+    fn a_frame_over_the_channel_limit_is_not_a_dead_link() {
+        use crate::transport::link_stall::ChannelLanding;
+        use leviculum_core::SendError;
+        use leviculum_std::error::Error;
+        assert!(is_over_channel_limit(&Error::Send(SendError::TooLarge)));
+        assert!(!is_over_channel_limit(&Error::Send(SendError::LinkFailed)));
+        assert_eq!(
+            ChannelLanding::classify(0, 1, Some(FRAME_OVER_CHANNEL_LIMIT)),
+            ChannelLanding::Refused,
+        );
+    }
 
     /// CIRISEdge#716 — every piece the fragmenter produces for a link must be
     /// accepted by leviculum's Channel on that link. Checked against the

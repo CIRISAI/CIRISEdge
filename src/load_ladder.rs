@@ -198,7 +198,6 @@ impl ServiceTier {
             (FlowClass::RelayedVideo, _) => Lever::BaseLayer,
             (FlowClass::RelayedAudio | FlowClass::Bulk, Self::AudioAndFiles) => Lever::Full,
             (FlowClass::RelayedAudio, Self::ChatAndContacts) => Lever::Shed,
-            (FlowClass::Bulk, Self::ChatAndContacts) => Lever::Pause,
             (FlowClass::OrdinaryRound, t) => Lever::Stretch(t.stretch()),
             (FlowClass::OwnCallVideo, Self::AudioAndFiles) => Lever::BaseLayer,
             (FlowClass::OwnCallVideo, Self::ChatAndContacts) => Lever::Shed,
@@ -325,8 +324,6 @@ pub enum Lever {
     Stretch(u32),
     /// Video degraded to the base layer.
     BaseLayer,
-    /// Paused, resumable from its cursor.
-    Pause,
     /// Shed (LIFO, with a notice).
     Shed,
     /// Refused (`load_refuse:admit_closed`).
@@ -890,10 +887,6 @@ mod tests {
         assert_eq!(
             ServiceTier::ChatAndContacts.lever(FlowClass::RelayedAudio),
             Lever::Shed
-        );
-        assert_eq!(
-            ServiceTier::ChatAndContacts.lever(FlowClass::Bulk),
-            Lever::Pause
         );
     }
 

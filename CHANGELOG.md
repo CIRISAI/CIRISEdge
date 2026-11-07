@@ -2,13 +2,23 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
-## 44.1.0 — 2026-11-06
+## 44.1.0 — 2026-11-07
 
 What moves to a peer (CC 5.2): a row moves when it is requested, or required, and appropriate, never
 because it is federation-tier. Two serve seats keep the commons walk; every other peer starts with
 what is required, and of the walk is offered only what is required or appropriate and live. The rest
 waits on the peer's pull. `SERVE_ADVERTISE_POLICY_HASH` is 14aedf25…; `advertise_awaits_request` is
 new.
+
+Adopts leviculum 0.34.0+ciris.1. The Resource window is `ByMedium`, radio included. Direct-link
+`Glare`, `InterfaceLost`, `HeldTooLong` and `PeerFellBack` have retries and labels, and a frame over
+the Channel limit is named, not a dead link. The load tier leaves forwarding alone and the host gets
+leased shed levers. Every node can shape on a direct link, a shaped link is one direct hop, eight
+shaped links do not stop new connections, and a failed bulk dial refuses by name.
+
+**Server must:** mirror the policy hash; take the `no_route` outcome and `RoundEvent::NoRoute`; set
+`ReplicationRuntimeConfig::recognised_seats` from `Edge::recognised_seats()` on a Rust host; build its
+shaping policy with `ShapingPolicy::for_device`; pull the leased levers (`pull_shed_lever`).
 
 Every step of a late subject Pull gets the late window, so a Deliver behind a late Summary is kept.
 The retired-plane line logs at debug at the hot-add door. Test fixes and the 44.0.0 notes date.

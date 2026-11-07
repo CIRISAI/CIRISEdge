@@ -2,8 +2,32 @@
 
 # v44.1.0 — what moves to a peer
 
-**2026-11-06.** **MINOR** on the LTS line. Same pins as v44.0.0: persist v61.0.4, CIRISVerify
-v22.0.0, leviculum v0.33.0+ciris.1.
+**2026-11-07.** **MINOR** on the LTS line. Pins persist v61.0.4, CIRISVerify v22.0.0 and leviculum
+**v0.34.0+ciris.1** (cfe450ec).
+
+**What server must do:**
+- Mirror `SERVE_ADVERTISE_POLICY_HASH` = `14aedf2590745dbac03b9f1f859085c43ead0ce0c67e46d10321d88257aded09`.
+- Take the `no_route` outcome in `replication_round_outcomes_total`, and handle `RoundEvent::NoRoute`
+  anywhere it matches exhaustively.
+- Set `ReplicationRuntimeConfig::recognised_seats` from `Edge::recognised_seats()` on a Rust host. The
+  PyO3 path sets it. Without it a node reads seats from the directory alone.
+- Build the shaping policy with `ShapingPolicy::for_device`.
+- Pull the leased levers (`pull_shed_lever`, `walk`, `page`, `bulk`). A lever left alone sits at 0.
+
+- **leviculum 0.34.** The Resource window is `WindowPolicy::ByMedium`: `Adaptive` on TCP, UDP, Auto and
+  Local under 1 s round trip, `Current` everywhere else, decided per resource, so a radio hot-plugged
+  later stays `Current` and there is no radio exception. This ends the cliff past about 31 ms.
+  Direct-link `Glare` costs no doubling; `InterfaceLost`, `HeldTooLong` and `PeerFellBack` back off as
+  a failed attempt, with `direct_link_failed_glare`, `_interface_lost` and `_peer_fell_back` new and
+  `HeldTooLong` on `_held`. A send over the Channel limit reads `frame_over_channel_limit` and a
+  shaped frame over it is dropped by name (`link_shaping_frame_too_large`) with the link left up: it
+  used to close the link. Edge's upgrade guard stays, for pre-0.34 peers.
+- **The load tier leaves forwarding alone; the host gets leased levers** (`FSD/CIRIS_MESH.md` §7.7).
+  `ServiceTier::lever`'s `Bulk` → `Pause` and `Lever::Pause` are gone: nothing read them.
+- **Shaping.** Every node can shape on a direct link. A shaped link is one direct hop: a link a
+  forwarder carries is never offered shaping. Eight shaped links do not stop new connections: at the
+  bound a shaped-only or anonymous node refuses by name with referrals, and any other node runs the
+  link unshaped. A failed bulk dial refuses by name and never rides a shaped link.
 
 - **What moves to a peer (CC 5.2, `CLM-moves-requested-required-appropriate`).** A row moves when
   it is requested, or required, and appropriate, never because it is federation-tier. Until now a
@@ -18,8 +42,7 @@ v22.0.0, leviculum v0.33.0+ciris.1.
     required or appropriate and live: the family's own `Global` or capability tier, the accord family,
     rows `may_receive` gives it as its own, about it or in its cohort, rows of a public group it
     belongs to, what a stranger is handed, tombstones, a duty's appointments, a root's charter, and the
-    class a grant
-    names, of this node's own rows.
+    class a grant names, of this node's own rows.
   - **Nothing else changed.** A person's own nodes are not contacts. The fetch twin and the subject
     Pull are untouched: a row not offered, a superseded row included, moves on request. The key,
     occurrence, route and revocation planes are the required set of CC 5.4.6 already and read their

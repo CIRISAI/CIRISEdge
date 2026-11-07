@@ -1271,6 +1271,9 @@ pub const LINK_SHAPING_SEND_FAILED: &str = "link_shaping_send_failed";
 /// budget for one window (bulk: a large blob) was refused from the row
 /// plane; bulk rides an unshaped link of its own and makes no shaping claim.
 pub const LINK_SHAPING_BULK_REFUSED: &str = "link_shaping_bulk_refused";
+/// `link_shaping` key — a shaped frame over the Channel limit, dropped by name:
+/// the link is alive (a move made its MDU smaller).
+pub const LINK_SHAPING_FRAME_TOO_LARGE: &str = "link_shaping_frame_too_large";
 /// `FSD/PRIVACY_MODES.md` §6.12 — a non-obligation peer's new shaped link
 /// refused under Admit-close (`FSD/CIRIS_MESH.md` §7.3's token). It also counts
 /// under [`LINK_SHAPING_HOME_ELSEWHERE`].
@@ -1369,6 +1372,13 @@ pub const DIRECT_LINK_FAILED_PUNCH: &str = "direct_link_failed_punch";
 /// interface died first: leviculum says `Timeout`, later than any session
 /// could (`direct_path::held_failure`).
 pub const DIRECT_LINK_FAILED_HELD: &str = "direct_link_failed_held";
+/// `direct_link` key — two proposals crossed and the peer's won (leviculum#96).
+pub const DIRECT_LINK_FAILED_GLARE: &str = "direct_link_failed_glare";
+/// `direct_link` key — the punched interface went down mid-move (leviculum#98).
+pub const DIRECT_LINK_FAILED_INTERFACE_LOST: &str = "direct_link_failed_interface_lost";
+/// `direct_link` key — the peer gave up the move and this end followed
+/// (leviculum#98).
+pub const DIRECT_LINK_FAILED_PEER_FELL_BACK: &str = "direct_link_failed_peer_fell_back";
 /// A punched interface went down; its link is back on its relayed path.
 pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
 /// A direct A/V leg's path was judged gone and the leg fell back
@@ -1771,6 +1781,7 @@ pub const LINK_SHAPING_LABELS: &[&str] = &[
     LINK_SHAPING_QUEUE_DEFERRED,
     LINK_SHAPING_SEND_FAILED,
     LINK_SHAPING_BULK_REFUSED,
+    LINK_SHAPING_FRAME_TOO_LARGE,
     LINK_SHAPING_LOAD_REFUSED,
     LINK_SHAPING_LOAD_SHED,
     LINK_SHAPING_HOME_ELSEWHERE_GIVEN,
@@ -1805,6 +1816,9 @@ pub const DIRECT_LINK_LABELS: &[&str] = &[
     DIRECT_LINK_FAILED_TIMEOUT,
     DIRECT_LINK_FAILED_PUNCH,
     DIRECT_LINK_FAILED_HELD,
+    DIRECT_LINK_FAILED_GLARE,
+    DIRECT_LINK_FAILED_INTERFACE_LOST,
+    DIRECT_LINK_FAILED_PEER_FELL_BACK,
     DIRECT_LINK_LOST,
     DIRECT_LINK_LEG_FELL_BACK,
     DIRECT_LINK_OFF_PROPOSING_OFF,
