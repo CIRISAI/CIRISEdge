@@ -10152,7 +10152,15 @@ impl FederationDirectoryReplicationBridge {
                 )
                 .await;
         }
+        // FSD CIRIS_MESH §7.7 — the host's page lever bears on this advertise
+        // and nothing else: a full drain's budget is a page size, so shrinking
+        // one costs more reads, and the first-contact sweeps are not levered.
+        // The rows it leaves are the next round's. Nothing is refused.
         let budget = self.sweep_page_budget().await;
+        let budget = self
+            .metrics
+            .as_ref()
+            .map_or(budget, |m| m.telemetry.levers.page_budget(budget));
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
 
@@ -27472,6 +27480,31 @@ pub(crate) mod tests {
                  read was wired past the page driver (CIRISEdge#531)",
                 bridge.max_sweep_page_rows()
             );
+        }
+
+        /// FSD CIRIS_MESH §7.7 — the page lever shrinks the Attestation page a
+        /// sweep reads, and the rows it leaves are still read.
+        #[tokio::test]
+        async fn the_page_lever_shrinks_the_attestation_page_and_loses_no_row() {
+            let ids: Vec<String> = (0..100).map(|i| format!("producer-{i}")).collect();
+            let (backend, bridge) = paged_bridge(&ids, 64);
+            let metrics = crate::observability::EdgeMetrics::default();
+            let bridge = bridge.with_metrics(Some(metrics.clone()));
+            for id in &ids {
+                backend
+                    .put_public_key(SignedKeyRecord {
+                        record: fixture_key_record(id, identity_type::AGENT),
+                    })
+                    .await
+                    .expect("seed key");
+                seed_advertised_attestation(&backend, id).await;
+            }
+            let levers = &metrics.telemetry.levers;
+            levers.set_steps(Duration::ZERO, Duration::ZERO);
+            levers.pull(crate::ShedLever::Page, 1, Duration::from_secs(60));
+            let refs = bridge.list_envelope_refs(EnvelopeKind::Attestation).await;
+            assert_eq!(refs.len(), 100, "every row is still read");
+            assert_eq!(bridge.max_sweep_page_rows(), 32, "½ of the 64 page");
         }
 
         /// **The timestamp-collision hazard, which persist already closed and

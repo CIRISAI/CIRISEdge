@@ -1172,6 +1172,7 @@ async fn run_one_coordinator_forever(
     // rebuilds the interval, so a reader answering "no relief" forever never
     // perturbs the pre-#440 tick stream.
     let mut current_cadence = cadence;
+    let mut walk_stretch_was = 1;
     // CC 5.4.6 — when the re-dial drawn after a failed send is due. Until then
     // a kick does not dial: it would put a refused fleet back on one beat.
     let mut redial_at: Option<tokio::time::Instant> = None;
@@ -1244,19 +1245,36 @@ async fn run_one_coordinator_forever(
                     Some(reader) => reader.relief().await.round_cadence.unwrap_or(cadence),
                     None => cadence,
                 };
+                // FSD CIRIS_MESH §7.7 — the host's walk lever, read here at the
+                // round boundary: this coordinator keeps its own phase, so a
+                // raise and a release both reach the plane spread over one
+                // interval, never as one tick. A kick is not stretched.
+                let stretch = match &metrics {
+                    Some(m) => {
+                        m.telemetry
+                            .levers
+                            .walk_stretch(coord.kind(), coord.peer_key_id())
+                            .await
+                    }
+                    None => 1,
+                };
                 // CC 5.4.3 — on a shaped link the round interval follows the
                 // frame gap (about 7.75 gaps), else ticks queue behind rounds
                 // that each take several gaps.
-                let target = pacing_interval(relieved, coord.pacing_gap());
+                let target = pacing_interval(relieved * stretch, coord.pacing_gap());
                 if target != current_cadence {
-                    tracing::info!(
-                        peer = %peer_id,
-                        kind = %kind_str,
-                        from_secs = current_cadence.as_secs_f64(),
-                        to_secs = target.as_secs_f64(),
-                        "anti-entropy cadence changed (mesh-config relief, CIRISEdge#440, or \
-                         the shaped link's frame gap, CC 5.4.3)"
-                    );
+                    // One line per lever move is the lever's own; a line per
+                    // coordinator would be P × K of them.
+                    if stretch == walk_stretch_was {
+                        tracing::info!(
+                            peer = %peer_id,
+                            kind = %kind_str,
+                            from_secs = current_cadence.as_secs_f64(),
+                            to_secs = target.as_secs_f64(),
+                            "anti-entropy cadence changed (mesh-config relief, CIRISEdge#440, or \
+                             the shaped link's frame gap, CC 5.4.3)"
+                        );
+                    }
                     current_cadence = target;
                     interval = tokio::time::interval_at(
                         tokio::time::Instant::now() + target,
@@ -1264,6 +1282,7 @@ async fn run_one_coordinator_forever(
                     );
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 }
+                walk_stretch_was = stretch;
                 // After the cadence settles, so the draw is on the one in force.
                 if ran == RoundRan::SendFailed {
                     redial_at = Some(draw_redial(&mut interval, current_cadence));
@@ -2394,6 +2413,181 @@ mod tests {
             .await
             .expect("shutdown")
             .expect("join");
+    }
+
+    /// What the walk reads of every peer in the lever witnesses.
+    #[derive(Debug)]
+    struct OwedNothing;
+
+    #[async_trait::async_trait]
+    impl crate::load_ladder::PeerObligations for OwedNothing {
+        async fn obligation_of(&self, peer: &str) -> crate::load_ladder::PeerObligation {
+            if peer.starts_with("owed") {
+                crate::load_ladder::PeerObligation::SendSet
+            } else {
+                crate::load_ladder::PeerObligation::Ordinary
+            }
+        }
+    }
+
+    fn idle_coord(peer: &str, kind: EnvelopeKind) -> Arc<ReplicationCoordinator> {
+        let transport: Arc<dyn Transport> = Arc::new(InMemTransport {
+            peer_inbox: HashMap::new(),
+        });
+        let provider: Arc<dyn StateProvider> = Arc::new(StaticProvider {
+            state: LocalState::new(),
+            envelopes: HashMap::new(),
+        });
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
+        Arc::new(ReplicationCoordinator::new(
+            transport,
+            peer,
+            kind,
+            SessionRole::Initiator,
+            provider,
+            applier,
+        ))
+    }
+
+    /// Rounds a peer class ran in a span of seconds.
+    fn rounds_in(log: &[(u64, String)], from: u64, to: u64, class: &str) -> usize {
+        log.iter()
+            .filter(|(s, p)| *s >= from && *s < to && p.starts_with(class))
+            .count()
+    }
+
+    /// The most rounds of one peer class in any one second of a span.
+    fn peak_in(log: &[(u64, String)], from: u64, to: u64, class: &str) -> usize {
+        (from..to)
+            .map(|s| rounds_in(log, s, s + 1, class))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// FSD CIRIS_MESH §7.7, on the production coordinator loop and the paused
+    /// clock: **the walk is what is shed, the rounds a peer is owed are not,
+    /// and neither the pull nor the lease running out is a surge.**
+    ///
+    /// 30 ordinary peers on `Attestation` (the walk), 10 of them on `Key`
+    /// (the first-contact plane), and 10 owed peers on `Attestation`, all on a
+    /// 30 s cadence and spread over it. The lever is pulled to the top once and
+    /// never renewed: a dead host.
+    #[tokio::test(start_paused = true)]
+    async fn the_walk_lever_sheds_the_walk_alone_and_walks_home_with_no_surge() {
+        const CADENCE: u64 = 30;
+        // Baseline: 120 s of an unlevered walk.
+        const PULL: u64 = 180;
+        const SILENT: u64 = PULL + 600;
+        const HOME: u64 = SILENT + 300;
+        let metrics = crate::observability::EdgeMetrics::default();
+        let levers = &metrics.telemetry.levers;
+        levers.install_obligations(Arc::new(OwedNothing));
+        levers.set_steps(Duration::ZERO, crate::load_levers::RELEASE_STEP);
+
+        let mut sched = ReplicationScheduler::new(SchedulerConfig {
+            cadence: Duration::from_secs(CADENCE),
+            round_timeout: Duration::from_millis(80),
+            ..SchedulerConfig::default()
+        })
+        .with_metrics(Some(metrics.clone()));
+        let control = sched.install_control_channel();
+        let (event_tx, mut event_rx) = mpsc::channel::<(String, RoundEvent)>(4096);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let sched_handle =
+            tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
+
+        // Spread over the cadence, as peers that connected over time are.
+        let t0 = tokio::time::Instant::now();
+        let mut peers = Vec::new();
+        for i in 0..30 {
+            peers.push((format!("walk-{i}"), EnvelopeKind::Attestation));
+        }
+        for i in 0..10 {
+            peers.push((format!("key-{i}"), EnvelopeKind::Key));
+            peers.push((format!("owed-{i}"), EnvelopeKind::Attestation));
+        }
+        let gap = Duration::from_secs(CADENCE) / u32::try_from(peers.len()).unwrap();
+        for (peer, kind) in &peers {
+            control
+                .add_initiator(idle_coord(peer, *kind))
+                .await
+                .expect("add");
+            tokio::time::sleep(gap).await;
+        }
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::<(u64, String)>::new()));
+        let sink = Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Some((peer, _)) = event_rx.recv().await {
+                let at = tokio::time::Instant::now().duration_since(t0).as_secs();
+                sink.lock().unwrap().push((at, peer));
+            }
+        });
+
+        let settle = |at: u64| tokio::time::sleep_until(t0 + Duration::from_secs(at));
+        settle(PULL).await;
+        for _ in 0..3 {
+            levers.pull(
+                crate::ShedLever::Walk,
+                crate::load_levers::MAX_LEVEL,
+                crate::load_levers::LEASE_MAX,
+            );
+        }
+        assert_eq!(levers.level(crate::ShedLever::Walk), 3);
+
+        // A kick is not a cadence tick: it still runs at the top step.
+        settle(PULL + 300).await;
+        let before = log.lock().unwrap().len();
+        control.round_now(Some("walk-0")).await.expect("kick");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            log.lock().unwrap()[before..]
+                .iter()
+                .any(|(_, p)| p == "walk-0"),
+            "a kick runs with the walk stretched"
+        );
+
+        settle(HOME + 300).await;
+        assert_eq!(levers.level(crate::ShedLever::Walk), 0, "the lease ran out");
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sched_handle)
+            .await
+            .expect("shutdown")
+            .expect("join");
+
+        let log = log.lock().unwrap().clone();
+        let base = rounds_in(&log, 60, PULL, "walk");
+        let peak = peak_in(&log, 60, PULL, "walk");
+        // Every ordinary coordinator ticks once a cadence: 30 × 4.
+        assert!((100..=140).contains(&base), "baseline {base}");
+
+        // Shed: the top step is ×8. The first 240 s drain the last ticks at
+        // the old cadence, so the span is measured after them.
+        let held = rounds_in(&log, PULL + 240, PULL + 480, "walk");
+        let base_span = base * 2;
+        assert!(
+            held <= base_span / 7,
+            "the walk is shed: {held} rounds against {base_span} over the same span"
+        );
+        // Kept: the plane first contact runs on, and the rounds a peer is owed.
+        for class in ["key", "owed"] {
+            let kept = rounds_in(&log, PULL + 240, PULL + 480, class);
+            let was = rounds_in(&log, 60, PULL, class) * 2;
+            assert!(
+                (was.saturating_sub(2)..=was + 2).contains(&kept),
+                "{class} keeps its cadence: {kept} against {was}"
+            );
+        }
+        // Neither the pull nor the fall is a surge: at no second does the walk
+        // run harder than it did unlevered, all the way home.
+        let fall = peak_in(&log, PULL, HOME + 300, "walk");
+        assert!(
+            fall <= peak + 1,
+            "a surge: {fall} rounds in a second against {peak} unlevered"
+        );
+        // And it got home: the walk runs at its cadence again.
+        let after = rounds_in(&log, HOME + 120, HOME + 240, "walk");
+        assert!((100..=140).contains(&after), "serving again: {after}");
     }
 
     /// CIRISEdge#740 — a kick is bounded. N+1 coordinators are kicked at once

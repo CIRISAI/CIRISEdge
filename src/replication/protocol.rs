@@ -251,6 +251,25 @@ impl EnvelopeKind {
     /// `REPLICATION_POLICY_HASH`). Basis for the serve/advertise manifest
     /// (CIRISEdge#393 item 3). `AccordQuorumEvidence` (CIRISEdge#474) is appended
     /// last — order is hashed, so it MUST stay at the end.
+    /// **The `walk` lever** (`FSD/CIRIS_MESH.md` §7.2): whether this plane's
+    /// cadence ticks may lengthen toward a peer owed nothing. False for what
+    /// first contact and a key's life run on (the bootstrap kinds, every
+    /// revocation) and for what chat and rooms need to open (`KeyGrant`, the
+    /// rosters). `Attestation` stretches: it carries the walk's real cost, and
+    /// chat and consent toward a peer owed them are kept by the obligation
+    /// read, and elsewhere by the kicks a write sends, which no lever touches.
+    #[must_use]
+    pub const fn walk_stretches(self) -> bool {
+        matches!(
+            self,
+            Self::Attestation
+                | Self::LocationProof
+                | Self::Organization
+                | Self::OrgMembership
+                | Self::PartnerRecord
+        )
+    }
+
     pub const ALL: [EnvelopeKind; 19] = [
         Self::Key,
         Self::Attestation,

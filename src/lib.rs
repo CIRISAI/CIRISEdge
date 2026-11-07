@@ -111,6 +111,7 @@ pub mod holonomic;
 pub mod identity;
 pub mod key_boundary;
 pub mod load_ladder;
+pub mod load_levers;
 pub mod log_throttle;
 pub mod manifest;
 /// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — nobody joins a
@@ -405,6 +406,7 @@ pub use key_boundary::{
     LEGACY_NO_SEED_IN_HEAP,
 };
 pub use load_ladder::{LoadPressure, ServiceTier};
+pub use load_levers::{LeverStatus, ShedLever};
 pub use messages::{
     is_federation_attestation_emitting_type, AccordCarrier, AccordSignature, AnnouncementKind,
     AnnouncementPriority, AttestationGossip, AttestationRef, AuthorityClass,

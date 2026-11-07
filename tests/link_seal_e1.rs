@@ -2734,6 +2734,86 @@ async fn dial_until_judged(
     }
 }
 
+/// `FSD/CIRIS_MESH.md` §7.2, §7.7 (Eric 2026-11-06) — **a relay at its worst
+/// still forwards.** `A` forwards for `B` and `C`, sits at tier 2 with every
+/// lever at the top, and a stranger's link and its sealed first frame cross it.
+/// v44 refused this, 48 times, until the ladder came down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_at_the_top_tier_with_every_lever_pulled_still_forwards() {
+    let t = trio_on("forward", true, false, false, true).await;
+    seed_route(&t.b, &t.c).await;
+    seed_route(&t.c, &t.b).await;
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            t.c.transport.seek_peer(&t.b.key.key_id).await
+                && t.b.transport.seek_peer(&t.c.key.key_id).await
+        })
+        .await,
+        "B and C learn each other through A"
+    );
+    t.a.transport
+        .set_service_tier(ciris_edge::ServiceTier::ChatAndContacts);
+    let levers = &t.a.metrics.telemetry.levers;
+    levers.set_steps(Duration::ZERO, Duration::from_secs(30));
+    for lever in ciris_edge::ShedLever::ALL {
+        for _ in 0..3 {
+            levers.pull(lever, 3, Duration::from_secs(300));
+        }
+    }
+    let row = marked(b"E1-FORWARD-MARKER-", 512);
+    t.b.transport
+        .send(&t.c.key.key_id, &row)
+        .await
+        .expect("B -> C, through A at the top tier");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.c.received(&row).await
+        })
+        .await,
+        "C delivered B's frame"
+    );
+    let forward = t.a.transport.forward_admission().counts();
+    assert!(forward.admitted >= 1, "the link crossed A: {forward:?}");
+    assert_eq!(forward.refused_capacity, 0);
+}
+
+/// A dial past its budget leaves no pending link behind it: the peer's proof,
+/// still on its way, finds nothing, so no link establishes with no one left to
+/// key it. The next dial is a clean one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_past_its_budget_is_closed_and_never_establishes_unkeyed() {
+    let t = trio("budget", true, false, false).await;
+    let before = t.b.transport.link_planes_for_test().await;
+    t.b.transport
+        .set_establish_budget_for_test(Some(Duration::from_millis(1)));
+    let row = marked(b"E1-BUDGET-MARKER-", 512);
+    assert!(
+        t.b.transport.send(&t.a.key.key_id, &row).await.is_err(),
+        "a 1 ms budget beats the proof"
+    );
+    // Well past the proof's round trip on loopback.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let after = t.b.transport.link_planes_for_test().await;
+    let late: Vec<_> = after
+        .iter()
+        .filter(|(link, _, dialled)| *dialled && !before.iter().any(|(l, _, _)| l == link))
+        .collect();
+    assert!(late.is_empty(), "a closed dial established: {late:?}");
+
+    t.b.transport.set_establish_budget_for_test(None);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("the next dial is clean");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "and keyed: A delivered it"
+    );
+}
+
 async fn bound_peer_after_a_restart(tag: &str, seated: bool) {
     let t = trio_on(tag, true, false, false, true).await;
     seed_route(&t.b, &t.c).await;

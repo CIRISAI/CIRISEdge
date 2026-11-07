@@ -1041,7 +1041,26 @@ pub struct LoadLedger {
     pub transit: Vec<LoadLedgerEntry>,
     /// The ladder's token counters (`load_tier:*` and their causes).
     pub counters: std::collections::BTreeMap<String, u64>,
+    /// What this node forwards for others.
+    pub forward: LoadLedgerForward,
+    /// The host's shed levers (`FSD/CIRIS_MESH.md` §7.7).
+    pub levers: Vec<crate::load_levers::LeverStatus>,
 }
+
+/// The forwarding half of the `load_ledger`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LoadLedgerForward {
+    /// Forwarded links admitted.
+    pub admitted: u64,
+    /// Link requests refused at a configured bound.
+    pub refused_capacity: u64,
+    /// Forwarded links now.
+    pub live: u64,
+}
+
+/// `FSD/CIRIS_MESH.md` §7.7 — a link request refused at the configured link
+/// bound. The one refusal of a forwarded link: the service tier makes none.
+pub const FORWARD_REFUSED_CAPACITY: &str = "load_refuse:capacity";
 
 // ─── CC 5.3.3.5 E1 — `EdgeMetrics::link_seal` labels ─────────────────
 //
@@ -1189,6 +1208,22 @@ pub const LINK_SHAPING_AGREED: &str = "link_shaping_agreed";
 /// One side offered `off` (or the peer never answered): the link runs
 /// unshaped, by both sides' agreement.
 pub const LINK_SHAPING_UNSHAPED: &str = "link_shaping_unshaped";
+/// CC 5.4.3 `CLM-shaped-link-one-hop` — a link left unshaped because a
+/// forwarder carries it: nothing offered, or an offer answered `off`.
+pub const LINK_SHAPING_FORWARDED: &str = "link_shaping_unshaped:forwarded";
+/// `CLM-shaping-offered-never-refused` — a node that does not offer shaping
+/// gave a shaped link to a peer that asked.
+pub const LINK_SHAPING_ASKED: &str = "link_shaping_agreed:asked";
+/// `CLM-shaping-offered-never-refused` — such a link closed, idle past its TTL.
+pub const LINK_SHAPING_ASKED_IDLE: &str = "link_shaping_asked_idle_closed";
+/// `CLM-shaped-link-bound-refuse` — a link left unshaped past the bound, on a
+/// node set neither to shaped-only nor to the anonymous tier.
+pub const LINK_SHAPING_PAST_BOUND: &str = "link_shaping_unshaped:past_bound";
+/// CC 5.4.3 — a row refused under `require_shaped_links`: the peer has no
+/// direct path yet. A direct link was proposed before the refusal.
+pub const LINK_SHAPING_NO_DIRECT_PATH: &str = "link_shaping_no_direct_path";
+/// CC 5.4.3 — a shaped link closed because it left its direct path.
+pub const LINK_SHAPING_DIRECT_LOST: &str = "link_shaping_direct_lost";
 /// Refused: the peer offers no shaping and this node requires shaped links;
 /// the link closed.
 pub const LINK_SHAPING_REFUSED_UNSHAPED_PEER: &str = "link_shaping_refused_unshaped_peer";
@@ -1236,19 +1271,12 @@ pub const LINK_SHAPING_SEND_FAILED: &str = "link_shaping_send_failed";
 /// budget for one window (bulk: a large blob) was refused from the row
 /// plane; bulk rides an unshaped link of its own and makes no shaping claim.
 pub const LINK_SHAPING_BULK_REFUSED: &str = "link_shaping_bulk_refused";
-/// CC 5.4.3 rc16 two planes — a bulk message sent over a SHAPED link in
-/// shaped-budget fragments because no unshaped link to the peer could exist
-/// (it cannot be dialled). Slow, never a failure; the bulk plane is the
-/// preferred path and this is its last resort.
-pub const LINK_SHAPING_BULK_ON_SHAPED_FALLBACK: &str = "link_shaping_bulk_on_shaped_fallback";
 /// `FSD/PRIVACY_MODES.md` §6.12 — a non-obligation peer's new shaped link
 /// refused under Admit-close (`FSD/CIRIS_MESH.md` §7.3's token). It also counts
 /// under [`LINK_SHAPING_HOME_ELSEWHERE`].
 pub const LINK_SHAPING_LOAD_REFUSED: &str = "load_refuse:admit_closed";
 /// `FSD/PRIVACY_MODES.md` §6.12 — a shaped link closed at tier 2.
 pub const LINK_SHAPING_LOAD_SHED: &str = "load_shed:shaped";
-/// `FSD/PRIVACY_MODES.md` §6.12 — a slow-path transfer paused at tier 2.
-pub const LINK_SHAPING_LOAD_SHED_BULK: &str = "load_shed:bulk";
 /// A row the Attestation advertise's projection filter skipped (a `SelfOwn`
 /// row whose attester is not in this node's self-publish set, ...). Not a
 /// withhold: the row was not this node's to publish when it was read.
@@ -1617,10 +1645,6 @@ pub const LINK_SHAPING_ROW_RETRACTED: &str = "link_shaping_row_retracted";
 pub const LINK_SHAPING_ROW_LEFT_TIMEOUT: &str = "link_shaping_row_left_timeout";
 /// Bodies a shaped link took with it when it closed. Their rows retry.
 pub const LINK_SHAPING_BODIES_STRANDED: &str = "link_shaping_bodies_stranded";
-/// A bulk message rode the shaped link to its end.
-pub const LINK_SHAPING_BULK_FALLBACK_OK: &str = "link_shaping_bulk_fallback:ok";
-/// A bulk message on the shaped link did not finish.
-pub const LINK_SHAPING_BULK_FALLBACK_FAILED: &str = "link_shaping_bulk_fallback:failed";
 /// A policy or device change moved this node's shaping.
 pub const LINK_SHAPING_POLICY_MOVED: &str = "link_shaping_policy_moved";
 
@@ -1724,6 +1748,12 @@ pub const LINK_SHAPING_LABELS: &[&str] = &[
     LINK_SHAPING_OFFERED,
     LINK_SHAPING_AGREED,
     LINK_SHAPING_UNSHAPED,
+    LINK_SHAPING_FORWARDED,
+    LINK_SHAPING_PAST_BOUND,
+    LINK_SHAPING_ASKED,
+    LINK_SHAPING_ASKED_IDLE,
+    LINK_SHAPING_NO_DIRECT_PATH,
+    LINK_SHAPING_DIRECT_LOST,
     LINK_SHAPING_REFUSED_UNSHAPED_PEER,
     LINK_SHAPING_HOME_ELSEWHERE,
     LINK_SHAPING_REFERRAL_SENT,
@@ -1741,10 +1771,8 @@ pub const LINK_SHAPING_LABELS: &[&str] = &[
     LINK_SHAPING_QUEUE_DEFERRED,
     LINK_SHAPING_SEND_FAILED,
     LINK_SHAPING_BULK_REFUSED,
-    LINK_SHAPING_BULK_ON_SHAPED_FALLBACK,
     LINK_SHAPING_LOAD_REFUSED,
     LINK_SHAPING_LOAD_SHED,
-    LINK_SHAPING_LOAD_SHED_BULK,
     LINK_SHAPING_HOME_ELSEWHERE_GIVEN,
     LINK_SHAPING_HOME_ELSEWHERE_RECEIVED,
     LINK_SHAPING_OFFERED_DIALLED,
@@ -1759,8 +1787,6 @@ pub const LINK_SHAPING_LABELS: &[&str] = &[
     LINK_SHAPING_ROW_RETRACTED,
     LINK_SHAPING_ROW_LEFT_TIMEOUT,
     LINK_SHAPING_BODIES_STRANDED,
-    LINK_SHAPING_BULK_FALLBACK_OK,
-    LINK_SHAPING_BULK_FALLBACK_FAILED,
     LINK_SHAPING_POLICY_MOVED,
 ];
 /// Every `direct_link` key.
@@ -3800,6 +3826,14 @@ impl EdgeMetrics {
             load_host_pressure: t.load_host_pressure,
             load_pressure_report_age_seconds: t.load_pressure_report_age_seconds,
             load_tier_changes_total: t.load_tier_changes_total,
+            load_lever_level: t.load_lever_level,
+            load_lever_lease_seconds: t.load_lever_lease_seconds,
+            load_lever_changes_total: t.load_lever_changes_total,
+            forward_links_live: t.forward_links_live,
+            forward_admitted_total: t.forward_admitted_total,
+            forward_refusals_total: t.forward_refusals_total,
+            forward_packets_per_second: t.forward_packets_per_second,
+            forward_bits_per_second: t.forward_bits_per_second,
             shaping_enabled: t.shaping_enabled,
             shaping_links: t.shaping_links,
             shaping_free_slots: t.shaping_free_slots,
@@ -4207,6 +4241,22 @@ pub struct EdgeMetricsBundle {
     pub load_pressure_report_age_seconds: f64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub load_tier_changes_total: HashMap<String, u64>,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_lever_level: HashMap<String, u64>,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_lever_lease_seconds: HashMap<String, u64>,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub load_lever_changes_total: HashMap<String, u64>,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub forward_links_live: u64,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub forward_admitted_total: u64,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub forward_refusals_total: HashMap<String, u64>,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub forward_packets_per_second: u64,
+    /// v44.1 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub forward_bits_per_second: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub shaping_enabled: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
@@ -4670,6 +4720,10 @@ impl EdgeMetricsBundle {
             ("seal_keyer_workers", &self.seal_keyer_workers),
             ("replication_reply_queued", &self.replication_reply_queued),
             ("load_tier_changes_total", &self.load_tier_changes_total),
+            ("load_lever_level", &self.load_lever_level),
+            ("load_lever_lease_seconds", &self.load_lever_lease_seconds),
+            ("load_lever_changes_total", &self.load_lever_changes_total),
+            ("forward_refusals_total", &self.forward_refusals_total),
             ("shaping_links", &self.shaping_links),
             (
                 "shaping_frames_real_windowed",
@@ -4693,6 +4747,13 @@ impl EdgeMetricsBundle {
             ("seal_held_bytes", self.seal_held_bytes),
             ("load_tier", self.load_tier),
             ("load_host_pressure", self.load_host_pressure),
+            ("forward_links_live", self.forward_links_live),
+            ("forward_admitted_total", self.forward_admitted_total),
+            (
+                "forward_packets_per_second",
+                self.forward_packets_per_second,
+            ),
+            ("forward_bits_per_second", self.forward_bits_per_second),
             ("shaping_enabled", self.shaping_enabled),
             ("shaping_free_slots", self.shaping_free_slots),
             ("leviculum_shed_packets", self.leviculum_shed_packets),
@@ -4846,6 +4907,14 @@ edge_metrics_bundle_fields!(
     load_host_pressure,
     load_pressure_report_age_seconds,
     load_tier_changes_total,
+    load_lever_level,
+    load_lever_lease_seconds,
+    load_lever_changes_total,
+    forward_links_live,
+    forward_admitted_total,
+    forward_refusals_total,
+    forward_packets_per_second,
+    forward_bits_per_second,
     shaping_enabled,
     shaping_links,
     shaping_free_slots,
