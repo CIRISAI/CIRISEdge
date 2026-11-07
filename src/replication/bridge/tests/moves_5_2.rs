@@ -14,6 +14,8 @@ const THIRD: &str = "moves-third";
 /// Rows of history, and the page that reads them.
 const HISTORY: usize = 40;
 const PAGE: u32 = 8;
+/// Rounds that walk all of it, a page a round.
+const WALK_ROUNDS: u32 = 7;
 
 fn page_bridge(backend: &Arc<SqliteBackend>) -> FederationDirectoryReplicationBridge {
     let dir: Arc<dyn FederationDirectory> = backend.clone();
@@ -152,7 +154,7 @@ async fn a_fresh_grant_moves_first_and_history_is_not_offered() {
         );
     }
     // The walk still reads the plane, and offers none of it across its rounds.
-    for _ in 0..(HISTORY as u32 / PAGE + 2) {
+    for _ in 0..WALK_ROUNDS {
         let round = offer(&bridge, CONTACT).await;
         for id in &past {
             let old = hash_of(&backend, id).await;
@@ -419,7 +421,7 @@ async fn two_seats_walk_the_commons_and_a_contact_beside_them_does_not() {
     let bridge = page_bridge(&backend).with_recognised_seats(seats(&[LOCAL, SEAT]));
 
     let mut walked = HashSet::new();
-    for round in 0..(HISTORY as u32 / PAGE + 2) {
+    for round in 0..WALK_ROUNDS {
         let refs = offer(&bridge, SEAT).await;
         if round == 0 {
             assert!(

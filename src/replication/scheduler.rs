@@ -1475,6 +1475,7 @@ fn log_round_error(peer: &str, kind: EnvelopeKind, what: &'static str, error: &s
 /// attempt first, then the ordinary round — and its [`RoundEvent`] to the sink.
 /// Shared by the cadence tick and the [`SchedulerCommand::RoundNow`] kick.
 /// Returns how the round ended, for the no-route backoff (CIRISEdge#794).
+#[allow(clippy::too_many_lines)] // the round's one exit table: every arm is a log and an event
 async fn round_and_report(
     coord: &Arc<ReplicationCoordinator>,
     round_timeout: Duration,

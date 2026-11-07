@@ -1401,12 +1401,16 @@ struct PlaneWatermark {
     skip_mark: Option<SkipMark>,
     /// Where [`Self::high_water`] stood before the latest head read: a round
     /// that listed and was lost puts it back ([`SweepCursors::round_ended`]).
-    rollback: Option<Option<ResumeCursor>>,
+    rollback: Option<ListedFrom>,
     /// How many lost rounds in a row have been put back.
     lost_rounds: u8,
     /// Monotonic touch tick, for the cap's least-recently-used eviction.
     touched: u64,
 }
+
+/// The position a head read started from, the plane's beginning included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedFrom(Option<ResumeCursor>);
 
 /// How many lost rounds in a row get their rows listed again. Past it the
 /// watermark moves as it would have and the re-sweep carries what was passed,
@@ -1644,7 +1648,7 @@ impl SweepCursors {
     ) -> Option<BackfillPage> {
         let wm = self.touch(key);
         let short = served < budget as usize;
-        wm.rollback = Some(wm.high_water.clone());
+        wm.rollback = Some(ListedFrom(wm.high_water.clone()));
         if let Some(c) = last {
             wm.high_water = Some(c);
         }
@@ -1685,7 +1689,7 @@ impl SweepCursors {
             wm.lost_rounds = 0;
             return false;
         }
-        let Some(position) = rollback else {
+        let Some(ListedFrom(position)) = rollback else {
             return false;
         };
         if wm.lost_rounds >= MAX_ROUND_RESTORES {
@@ -4926,8 +4930,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         let moved = self
             .sweep_cursors
             .lock()
-            .map(|mut c| c.round_ended(&(peer_key_id.to_owned(), kind), lost))
-            .unwrap_or(false);
+            .is_ok_and(|mut c| c.round_ended(&(peer_key_id.to_owned(), kind), lost));
         if moved {
             if let Some(m) = &self.metrics {
                 m.inc_advertise(crate::observability::ADVERTISE_WATERMARK_REWOUND);
@@ -11005,8 +11008,10 @@ impl FederationDirectoryReplicationBridge {
     ) -> bool {
         use ciris_persist::federation::Audience;
         let (target, family) = match Self::audience_of_view(view) {
-            Ok(Audience::Community { community_key_id }) => (community_key_id, false),
-            Ok(Audience::Affiliations { community_key_id }) => (community_key_id, false),
+            Ok(
+                Audience::Community { community_key_id }
+                | Audience::Affiliations { community_key_id },
+            ) => (community_key_id, false),
             Ok(Audience::Family { family_key_id }) => (family_key_id, true),
             _ => return false,
         };
@@ -12743,7 +12748,8 @@ pub(crate) mod tests {
     /// persist change that gates the trait door turns every caller of this
     /// fixture red; re-mint here (`fixture_label` already strips a derived
     /// suffix for the seed).
-    /// The recognised serve seats of a fixture (CC 5.2).
+    /// The recognised serve seats of a fixture (CC 5.2), as the builder takes them.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn seats(keys: &[&str]) -> Option<Arc<std::sync::RwLock<HashSet<String>>>> {
         Some(Arc::new(std::sync::RwLock::new(
             keys.iter().map(|k| (*k).to_owned()).collect(),
