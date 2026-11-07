@@ -685,3 +685,108 @@ async fn a_pair_rooms_proposal_is_read_by_its_room() {
     assert_eq!(found.proposal.attestation_id, invitation.attestation_id);
     assert_eq!(counting.count("list_attestations_since"), 0);
 }
+
+/// A bridge that reads through a counter of every store call.
+fn counted_bridge(
+    backend: &Arc<SqliteBackend>,
+    history_every: Duration,
+) -> (CountingDirectory, FederationDirectoryReplicationBridge) {
+    let counting = CountingDirectory::new(Arc::clone(backend) as Arc<dyn FederationDirectory>);
+    let dir: Arc<dyn FederationDirectory> = Arc::new(counting.clone());
+    let cohort: CohortProvider = Arc::new(|| vec![LOCAL.to_owned()]);
+    let bridge = FederationDirectoryReplicationBridge::with_config(
+        dir,
+        cohort,
+        BridgeConfig {
+            sweep_page_rows: PAGE,
+            tip_margin: Duration::ZERO,
+            history_page_every: history_every,
+            ..BridgeConfig::default()
+        },
+    )
+    .with_local_key_id(Some(LOCAL.to_owned()));
+    (counting, bridge)
+}
+
+/// **A row naming the peer only in `subject_key_ids`, written before it
+/// connects, arrives.** A third party's invitation: no index reads it, it is
+/// past the tip, and it is nobody's row here. The history read is what carries
+/// it, and it does.
+#[tokio::test]
+async fn a_row_written_before_the_peer_connects_arrives() {
+    let backend = fixture().await;
+    register_fixture_keys(&backend, &[("moves-founder", identity_type::USER)]).await;
+    seed_common_root(&backend, &["moves-founder", LOCAL, CONTACT]).await;
+    let room = crate::chat::pair_community("moves-founder", CONTACT, Utc::now());
+    let group = room.community_key_id.clone();
+    backend
+        .put_community(sign_community_fixture("moves-founder", room))
+        .await
+        .expect("the room");
+    let invitation = crate::membership::propose(
+        &*backend,
+        crate::membership::GroupScope::Community,
+        &group,
+        CONTACT,
+        None,
+        Utc::now() + chrono::Duration::days(1),
+        &fixture_local_signer("moves-founder"),
+    )
+    .await
+    .expect("the invitation");
+    assert_ne!(
+        invitation.attested_key_id, CONTACT,
+        "no `to` index holds it"
+    );
+    history(&backend).await;
+    let (_, bridge) = counted_bridge(&backend, Duration::ZERO);
+
+    let hash = hash_of(&backend, &invitation.attestation_id).await;
+    let first = offer(&bridge, CONTACT).await;
+    assert!(
+        !first.iter().any(|r| r.envelope_hash == hash),
+        "not in the first offer: this is what the required read cannot see"
+    );
+    let mut arrived = false;
+    for _ in 0..WALK_ROUNDS * 2 {
+        arrived |= offer(&bridge, CONTACT)
+            .await
+            .iter()
+            .any(|r| r.envelope_hash == hash);
+    }
+    assert!(arrived, "the history read reaches every row");
+}
+
+/// **The store's side of a contact's round.** Counted at the directory, not by
+/// edge: past the first round a contact costs one plane read a round, however
+/// large the plane, and a bounded handful of indexed reads.
+#[tokio::test]
+async fn a_contacts_round_costs_a_bounded_count_of_store_reads() {
+    let backend = fixture().await;
+    history(&backend).await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    let (counting, bridge) = counted_bridge(&backend, Duration::from_secs(3_600));
+    for _ in 0..2 {
+        offer(&bridge, CONTACT).await;
+    }
+    counting.reset();
+    const ROUNDS: usize = 10;
+    for _ in 0..ROUNDS {
+        offer(&bridge, CONTACT).await;
+    }
+    let reads = counting.total();
+    eprintln!(
+        "store reads in {ROUNDS} rounds: {reads}: {:?}",
+        counting.counts()
+    );
+    assert_eq!(
+        counting.count("list_attestations_since"),
+        ROUNDS,
+        "one read past the tip a round, and no page of history"
+    );
+    assert!(
+        reads / ROUNDS <= 60,
+        "a round's store reads stay a small constant: {} a round",
+        reads / ROUNDS
+    );
+}

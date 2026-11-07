@@ -977,12 +977,23 @@ pub struct BridgeConfig {
     /// CC 5.2 — how far behind now a peer that gets no walk starts reading new
     /// rows ([`Self::DEFAULT_TIP_MARGIN`]).
     pub tip_margin: Duration,
+    /// CC 5.2 — how often a peer that gets no walk reads a full page of history
+    /// ([`Self::DEFAULT_HISTORY_PAGE_EVERY`]).
+    pub history_page_every: Duration,
 }
 
 impl BridgeConfig {
-    /// A peer with no walk starts this far behind now, so a row written just
-    /// before its first round is still a new row.
+    /// A peer with no walk starts this far behind now, so a row written in the
+    /// seconds before its link came up is a new row. Older is history's: the
+    /// rolling read below reaches every row, within `rows / page` of these.
     pub const DEFAULT_TIP_MARGIN: Duration = Duration::from_secs(60);
+
+    /// A peer with no walk reads one full page of history this often: what
+    /// its required read and new rows do not carry, such as a third party's
+    /// invitation written while it was away, or the rows of a room it has just
+    /// joined. Slow on purpose: this is not anti-entropy. 1024 rows a minute
+    /// walks 11k rows in 11 minutes.
+    pub const DEFAULT_HISTORY_PAGE_EVERY: Duration = Duration::from_secs(60);
 
     /// Default for [`Self::operational_page_limit`].
     pub const DEFAULT_OPERATIONAL_PAGE_LIMIT: u32 = u32::MAX;
@@ -1112,6 +1123,7 @@ impl Default for BridgeConfig {
             advertise_sweep_permits: Self::DEFAULT_ADVERTISE_SWEEP_PERMITS,
             sweep_page_rows: Self::DEFAULT_SWEEP_PAGE_ROWS,
             tip_margin: Self::DEFAULT_TIP_MARGIN,
+            history_page_every: Self::DEFAULT_HISTORY_PAGE_EVERY,
         }
     }
 }
@@ -1422,11 +1434,6 @@ struct PlaneWatermark {
 /// The position a head read started from, the plane's beginning included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ListedFrom(Option<ResumeCursor>);
-
-/// How often a peer that gets no walk reads a page of history: what its
-/// required read and new rows do not carry, such as the rows of a room it has
-/// just joined. Slow on purpose: this is not anti-entropy.
-const HISTORY_PAGE_EVERY: Duration = Duration::from_secs(60);
 
 /// How many lost rounds in a row get their rows listed again. Past it the
 /// watermark moves as it would have and the re-sweep carries what was passed,
@@ -1794,10 +1801,10 @@ impl SweepCursors {
     }
 
     /// A page of history was read. A short one was all of it, and a plane that
-    /// fits one page is not a walk; past a full one the next waits out
-    /// [`HISTORY_PAGE_EVERY`], however many rounds come.
-    fn history_read(&mut self, key: &(String, EnvelopeKind), full: bool, now: Instant) {
-        self.touch(key).history_at = full.then_some(now + HISTORY_PAGE_EVERY);
+    /// fits one page is not a walk; past a full one the next waits until `next`,
+    /// however many rounds come.
+    fn history_read(&mut self, key: &(String, EnvelopeKind), full: bool, next: Instant) {
+        self.touch(key).history_at = full.then_some(next);
     }
 
     /// The new-rows and re-sweep positions for `key` (the round summary).
@@ -10329,7 +10336,8 @@ impl FederationDirectoryReplicationBridge {
                     let wrapped = b_served < plan.budget as usize;
                     if no_walk {
                         if let Ok(mut c) = self.sweep_cursors.lock() {
-                            c.history_read(&key, !wrapped, Instant::now());
+                            let next = Instant::now() + self.config.history_page_every;
+                            c.history_read(&key, !wrapped, next);
                         }
                     }
                     self.resweep_cycle_step(&key, wrapped);
