@@ -488,7 +488,8 @@ async fn a_shaped_link_carries_one_frame_size_at_poisson_times_both_ways() {
     }
 }
 
-/// **Witness 2** — one side `off`: the offers resolve to UNSHAPED by
+/// **Witness 2** — a peer older than `CLM-shaping-offered-never-refused` still
+/// answers `off`, and the wire ends cleanly: the offers resolve to UNSHAPED by
 /// agreement and the link runs bare (counted on both ends); a node that
 /// REQUIRES shaped links refuses the same peer by name and the link closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -500,6 +501,7 @@ async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
         explicit_off(),
     )
     .await;
+    lenient.b.transport.answer_off_like_an_old_peer_for_test();
     // A (shaping) dials B (off): A offers, B answers off.
     lenient
         .a
@@ -540,6 +542,7 @@ async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
         explicit_off(),
     )
     .await;
+    strict.b.transport.answer_off_like_an_old_peer_for_test();
     match strict
         .a
         .transport
@@ -2683,7 +2686,8 @@ async fn e8_the_status_tracks_the_bound_the_class_and_the_peers() {
     );
 }
 
-/// E8, the peer side: a peer that answers `off` is on record as not shaping.
+/// E8, the peer side: a peer that answers `off`, an old one now, is on record as
+/// not shaping.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e8_a_peer_that_answers_off_is_on_record_as_not_shaping() {
     let _host = share_host().await;
@@ -2693,6 +2697,7 @@ async fn e8_a_peer_that_answers_off_is_on_record_as_not_shaping() {
         explicit_off(),
     )
     .await;
+    t.b.transport.answer_off_like_an_old_peer_for_test();
     assert_eq!(t.a.transport.peer_shaping(&t.b.key.key_id).shapes, None);
     let row = typed_payload("AttestationGossip", b"OFFPEER-", 2_000);
     t.a.transport

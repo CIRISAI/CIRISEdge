@@ -544,6 +544,16 @@ impl PyEdge {
         Ok(self.inner.set_load_pressure(p).as_u8())
     }
 
+    /// `CLM-shaping-offered-never-refused` — seconds past its last real frame
+    /// that a shaped link a peer asked of this node lives. Raises `ValueError`
+    /// on a value that is no duration.
+    fn set_shaping_asked_idle_ttl(&self, secs: f64) -> PyResult<()> {
+        let ttl = std::time::Duration::try_from_secs_f64(secs)
+            .map_err(|e| PyValueError::new_err(format!("bad_ttl: {e}")))?;
+        self.inner.set_shaping_asked_idle_ttl(ttl);
+        Ok(())
+    }
+
     /// `FSD/CIRIS_MESH.md` §7.7 — **pull a shed lever**: `"walk"`, `"page"` or
     /// `"bulk"`, toward `level` (0 to 3) for `lease_secs`, renewed by calling
     /// again. Returns the level in force. It rises one step per 10 s, falls one

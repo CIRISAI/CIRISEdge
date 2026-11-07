@@ -2282,6 +2282,17 @@ impl Edge {
         tier
     }
 
+    /// `CLM-shaping-offered-never-refused` — how long past its last real frame
+    /// a shaped link a peer asked of this node lives, when this node does not
+    /// offer shaping by default. Default ten minutes.
+    pub fn set_shaping_asked_idle_ttl(&self, ttl: std::time::Duration) {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            t.set_shaping_asked_idle_ttl(ttl);
+        }
+        let _ = ttl;
+    }
+
     /// **Pull a shed lever** (`FSD/CIRIS_MESH.md` §7.7): toward `level` for
     /// `lease`, renewed by calling again. Edge decides nothing here: the host
     /// reads the gauges and pulls. It moves one step per

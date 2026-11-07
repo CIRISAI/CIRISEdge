@@ -3590,6 +3590,12 @@ impl ReticulumTransport {
             let onion = Arc::clone(&onion);
             shapers.set_anonymous_read(move || onion.media_allowed().is_err());
         }
+        // `CLM-shaping-offered-never-refused` — the class a node answers at
+        // when asked, from the device as it stands.
+        {
+            let onion = Arc::clone(&onion);
+            shapers.set_device_read(move || onion.device());
+        }
         // CC 5.4.3 referrals — free slots are reported from the start, while
         // the relay offering is on (`onion_refresh` follows it from here).
         shapers.enable_capacity_reports();
@@ -4689,6 +4695,19 @@ impl ReticulumTransport {
     pub fn drop_next_inbound_link_established_for_test(&self) {
         self.swallow_link_established
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `CLM-shaping-offered-never-refused` — how long past its last real frame
+    /// a link a peer asked of this node lives. The operator's setting.
+    pub fn set_shaping_asked_idle_ttl(&self, ttl: Duration) {
+        self.shapers.set_asked_idle_ttl(ttl);
+    }
+
+    /// Test seam — answer `off` when asked, as a peer older than
+    /// `CLM-shaping-offered-never-refused` does.
+    #[doc(hidden)]
+    pub fn answer_off_like_an_old_peer_for_test(&self) {
+        self.shapers.set_old_peer_for_test(true);
     }
 
     /// Test seam — offer shaping through a forwarder, as an older peer does.
@@ -10724,6 +10743,12 @@ impl Transport for ReticulumTransport {
             facilitator = self.direct_paths.config.facilitator.is_some(),
             "direct links: this node's proposing posture"
         );
+        tokio::spawn(run_asked_idle(
+            Arc::downgrade(&self.node),
+            Arc::clone(&self.seals),
+            Arc::clone(&self.shapers),
+            self.metrics.get().cloned(),
+        ));
         tokio::spawn(run_shaped_shed(
             Arc::downgrade(&self.node),
             Arc::clone(&self.seals),
@@ -16668,8 +16693,12 @@ async fn shaped_inbound(
                 );
                 None
             }
-            Ok(ShapedFrame::Real(body)) => Some(body),
+            Ok(ShapedFrame::Real(body)) => {
+                s.note_real();
+                Some(body)
+            }
             Ok(ShapedFrame::Many(bodies)) => {
+                s.note_real();
                 // Several bodies in one frame: each routes as a frame of its
                 // own, in order. (A Channel-lane frame is never a Resource.)
                 for body in bodies {
@@ -16845,6 +16874,9 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(crate::observability::LINK_SHAPING_AGREED);
                 m.inc_link_shaping(crate::observability::agreed_label(shaper.class()));
+                if !ctx.shapers.offers_to(None) {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_ASKED);
+                }
             }
             let a = *shaper.agreement();
             tracing::info!(
@@ -17234,6 +17266,41 @@ async fn run_shaped_shed(
             shed_one_shaped_link(&node, &seals, &shapers, metrics.as_ref()).await;
             drop(node);
             tokio::time::sleep(SHAPED_SHED_STEP).await;
+        }
+    }
+}
+
+/// How often the links a peer asked for are read against their TTL.
+const ASKED_IDLE_STEP: Duration = Duration::from_secs(15);
+
+/// `CLM-shaping-offered-never-refused` — a node that does not offer shaping
+/// stops paying cover for a peer that asked and went quiet. The close is a
+/// plain one: the asker reads no fault in it and dials again when it has
+/// something to send, so an idle link costs nothing and nothing storms.
+async fn run_asked_idle(
+    node: std::sync::Weak<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+) {
+    let mut tick = tokio::time::interval(ASKED_IDLE_STEP);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Some(node) = node.upgrade() else { return };
+        for link in shapers.asked_links_idle() {
+            if let Some(m) = metrics.as_ref() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_ASKED_IDLE);
+            }
+            tracing::info!(
+                link = %hex::encode(link),
+                reason = crate::observability::LINK_SHAPING_ASKED_IDLE,
+                "a shaped link this node was asked for closed, idle past its TTL: the peer \
+                 dials again when it has something to send (CC 5.4.3)"
+            );
+            seals.refuse(link);
+            shapers.forget(&link);
+            let _ = node.close_link(&LinkId::new(link)).await;
         }
     }
 }

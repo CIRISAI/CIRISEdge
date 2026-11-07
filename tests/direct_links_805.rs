@@ -296,6 +296,12 @@ async fn side(
         c.bootstrap_peers = vec![format!("127.0.0.1:{t_port}").parse().unwrap()];
         if let Some(policy) = shaping {
             c.shaping = policy.clone();
+            // An off node's class is its device's: a home node here.
+            if !policy.enabled() {
+                c.device = ciris_edge::transport::link_shaping::DeviceState::of(
+                    ciris_edge::transport::link_shaping::DeviceKind::Home,
+                );
+            }
         }
         c
     })
@@ -884,6 +890,100 @@ async fn a_link_that_goes_direct_shapes_at_the_mdu_and_closes_when_it_falls_back
         "the shaped link closed with its direct path"
     );
     assert_eq!(shaped(&p.a.metrics, "link_shaping_direct_lost"), 1);
+}
+
+/// **`CLM-shaping-offered-never-refused`** — A is shaped-only and B has shaping
+/// off. Through the forwarder there is no shaped link to give, so A's row
+/// refuses; on the direct path B answers at its own device class, the link runs
+/// at the lower of the two, and the row goes. Mutation: an off node refuses to
+/// be asked → this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_off_node_gives_a_shaped_only_peer_a_shaped_link_on_a_direct_path() {
+    use ciris_edge::transport::link_shaping::{BudgetClass, ShapingPolicy};
+    let mut p = trio_shaped(
+        "asked",
+        proposer(),
+        DirectLinksConfig::default(),
+        None,
+        None,
+        Some((shaping_all(true), ShapingPolicy::default())),
+    )
+    .await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    let row = a_row(b"ASKED-ROW-");
+    let err =
+        p.a.transport
+            .send(&p.b.key.key_id, &row)
+            .await
+            .expect_err("forwarded: nothing to shape, so a shaped-only node refuses");
+    assert!(
+        err.to_string().contains("link_shaping_no_direct_path"),
+        "{err}"
+    );
+    let up = next_event(&mut p.a.events, Duration::from_secs(30), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("A's Established");
+    let DirectPathEvent::Established { link_id, .. } = up else {
+        unreachable!()
+    };
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            p.a.transport.send(&p.b.key.key_id, &row).await.is_ok()
+        })
+        .await,
+        "the row goes: {:?}",
+        p.a.metrics.link_shaping()
+    );
+    assert_eq!(
+        shaped(&p.b.metrics, "link_shaping_offered"),
+        1,
+        "B answered"
+    );
+    assert_eq!(shaped(&p.b.metrics, "link_shaping_agreed:asked"), 1);
+    let (_, bytes_per_s) =
+        p.a.transport
+            .shaped_agreement_for_test(link_id)
+            .expect("shaped");
+    let home = ShapingPolicy::for_class(BudgetClass::Home).bytes_per_s;
+    assert!(
+        bytes_per_s.abs_diff(home) * 100 <= home,
+        "the lower of the two, B's class: {bytes_per_s} against {home}"
+    );
+}
+
+/// Two nodes with shaping off stay unshaped on a direct path: nobody asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn off_with_off_stays_unshaped_on_a_direct_path() {
+    use ciris_edge::transport::link_shaping::ShapingPolicy;
+    let mut p = trio_shaped(
+        "offoff",
+        proposer(),
+        DirectLinksConfig::default(),
+        None,
+        None,
+        Some((ShapingPolicy::default(), ShapingPolicy::default())),
+    )
+    .await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    p.a.transport
+        .send(&p.b.key.key_id, &a_row(b"OFFOFF-ROW-"))
+        .await
+        .expect("an ordinary row");
+    assert!(
+        next_event(&mut p.a.events, Duration::from_secs(30), |e| {
+            matches!(e, DirectPathEvent::Established { .. })
+        })
+        .await
+        .is_some(),
+        "the link went direct"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(shaped(&p.a.metrics, "link_shaping_offered"), 0);
+    assert_eq!(shaped(&p.b.metrics, "link_shaping_offered"), 0);
+    assert_eq!(shaped(&p.a.metrics, "link_shaping_agreed"), 0);
+    assert_eq!(shaped(&p.b.metrics, "link_shaping_agreed"), 0);
 }
 
 /// CC 5.4.3 — under `require_shaped_links` a row to a peer with no direct path

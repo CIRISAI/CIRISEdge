@@ -556,6 +556,19 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
     },
     TestEvidence {
         cc: "5.4.3",
+        clm: "CLM-shaping-offered-never-refused",
+        property: "a node with shaping off gives a shaped link to a peer that asks on a direct link, at its own device class, and drops it ten minutes past the last real frame, cover not counting",
+        impl_anchor: "src/transport/link_shaping.rs#LinkShapers::asked_links_idle",
+        witness: &[
+            "src/transport/link_shaping.rs#an_off_node_answers_a_peer_that_asks_at_its_own_class",
+            "src/transport/link_shaping.rs#a_link_asked_of_an_off_node_closes_ttl_past_its_last_real_frame",
+            "tests/direct_links_805.rs#an_off_node_gives_a_shaped_only_peer_a_shaped_link_on_a_direct_path",
+            "tests/direct_links_805.rs#off_with_off_stays_unshaped_on_a_direct_path",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.4.3",
         clm: "CLM-shaped-link-one-hop",
         property: "a link a forwarder carries is never offered shaping and answers off; a link that goes direct starts shaping at its MDU, and closes if it leaves that path",
         impl_anchor: "src/transport/reticulum.rs#link_is_forwarded",

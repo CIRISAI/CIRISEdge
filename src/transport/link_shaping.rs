@@ -1185,6 +1185,9 @@ pub const OFFER_ANSWER_BUDGET: Duration = Duration::from_secs(10);
 /// One shaped link's sender-side state: the queue of real bodies, the
 /// Poisson timer and the budget meter.
 pub struct LinkShaper {
+    /// When a real frame last crossed this link, either way. Cover never moves
+    /// it: a link whose only traffic is cover has no one using it.
+    last_real: Mutex<tokio::time::Instant>,
     agreement: Agreement,
     /// The frame this node's offer was quoted at. The agreement's frame can be
     /// a peer's smaller one, and λ rounds differently at each, so what this
@@ -1270,6 +1273,7 @@ impl LinkShaper {
         budget.configure(scope.clone(), target.max(1), agreement.window);
         Self {
             quoted_frame: agreement.frame_bytes,
+            last_real: Mutex::new(tokio::time::Instant::now()),
             agreement,
             queue: Mutex::new(VecDeque::new()),
             queue_cap,
@@ -1539,6 +1543,23 @@ impl LinkShaper {
         Ok(first + count - 1)
     }
 
+    /// A real frame crossed this link, either way.
+    pub fn note_real(&self) {
+        *self
+            .last_real
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tokio::time::Instant::now();
+    }
+
+    /// How long since a real frame crossed this link.
+    #[must_use]
+    pub fn idle_for(&self) -> Duration {
+        self.last_real
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .elapsed()
+    }
+
     /// Stop the timer loop (the link closed).
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
@@ -1598,6 +1619,9 @@ impl LinkShaper {
         let real = !bodies.is_empty();
         let ticket = bodies.iter().map(|(t, _)| *t).max().unwrap_or(0);
         let mut pad = |buf: &mut [u8]| self.poisson.fill_bytes(buf);
+        if real {
+            self.note_real();
+        }
         let frame = if bodies.len() > 1 {
             self.budget.record_real(&self.scope);
             self.real.fetch_add(1, Ordering::Relaxed);
@@ -1855,6 +1879,14 @@ pub struct LinkShapers {
     /// offer rounds λ, so a class link can agree a few bytes above its class.
     seat_agreed: Mutex<std::collections::HashSet<[u8; 16]>>,
     /// What a shed lever reads at decision time. Absent: nothing is shed.
+    /// Test seam ([`Self::set_old_peer_for_test`]).
+    test_old_peer: std::sync::atomic::AtomicBool,
+    /// The links a peer asked this node for ([`Self::answer_asked`]).
+    asked: Mutex<std::collections::HashSet<[u8; 16]>>,
+    /// [`Self::asked_idle_ttl`], in ms.
+    asked_ttl_ms: std::sync::atomic::AtomicU64,
+    /// Reads this node's device state ([`Self::asked_policy`]).
+    device_read: std::sync::OnceLock<DeviceRead>,
     /// Says this node is in anonymous mode ([`Self::refuses_past_bound`]).
     anonymous_read: std::sync::OnceLock<AnonymousRead>,
     obligations: std::sync::RwLock<Option<Arc<dyn crate::load_ladder::PeerObligations>>>,
@@ -1880,6 +1912,19 @@ pub const ROW_LEAVE_MAX: Duration = Duration::from_secs(60);
 /// gap a fixed 60 s lost one single-frame row in four and nearly every full one,
 /// and their retries did not converge (`FSD/PRIVACY_MODES.md` E7).
 pub const ROW_LEAVE_MAX_GAPS: f64 = 16.0;
+
+/// `CLM-shaping-offered-never-refused` — how long past its last real frame a
+/// node that does not offer shaping keeps a link a peer asked it for.
+pub const DEFAULT_ASKED_IDLE_TTL: Duration = Duration::from_secs(600);
+
+/// What reads a node's device state.
+struct DeviceRead(Box<dyn Fn() -> DeviceState + Send + Sync>);
+
+impl std::fmt::Debug for DeviceRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceRead")
+    }
+}
 
 /// What says a node is in anonymous mode.
 struct AnonymousRead(Box<dyn Fn() -> bool + Send + Sync>);
@@ -1922,6 +1967,12 @@ impl LinkShapers {
             admissions: std::sync::atomic::AtomicU64::new(0),
             peer_shapes: Mutex::new(HashMap::new()),
             seat_agreed: Mutex::new(std::collections::HashSet::new()),
+            test_old_peer: std::sync::atomic::AtomicBool::new(false),
+            asked: Mutex::new(std::collections::HashSet::new()),
+            asked_ttl_ms: std::sync::atomic::AtomicU64::new(
+                u64::try_from(DEFAULT_ASKED_IDLE_TTL.as_millis()).unwrap_or(u64::MAX),
+            ),
+            device_read: std::sync::OnceLock::new(),
             anonymous_read: std::sync::OnceLock::new(),
             obligations: std::sync::RwLock::new(None),
             shed_wake: tokio::sync::Notify::new(),
@@ -2186,7 +2237,8 @@ impl LinkShapers {
                 let peer = peers.get(link).map(String::as_str);
                 let is_layer = peer.is_some_and(|p| layer.contains(p));
                 let quoted = usize::from(shaper.quoted_frame);
-                let keep = shaper.carried_by(&self.quote(&policy, quoted, peer, is_layer));
+                let keep = shaper.carried_by(&self.quote(&policy, quoted, peer, is_layer))
+                    || self.asked().contains(link);
                 if !keep {
                     shaper.stop();
                     close.push(*link);
@@ -2660,10 +2712,107 @@ impl LinkShapers {
         peer: Option<&str>,
         theirs: &ShapingOffer,
     ) -> ShapingOffer {
+        if theirs.shapes() && !self.offers_to(peer) && !self.test_old_peer.load(Ordering::Relaxed) {
+            return self.answer_asked(link, frame_bytes, peer);
+        }
         if theirs.shapes() && self.offers_to(peer) && self.at_bound_for(peer) {
             return self.past_bound_answer(link, peer);
         }
         self.offer_for(link, frame_bytes, peer)
+    }
+
+    /// **`CLM-shaping-offered-never-refused`** — a peer asked this node, which
+    /// does not offer shaping by default, for a shaped link. The setting says
+    /// only what this node offers; the capability is every node's. It answers
+    /// at its own device class, and [`agree`] takes the lower of the two, so a
+    /// phone on cellular pays no more than its own class. The bound and the
+    /// load tier apply as to any peer; a link taken this way closes
+    /// [`Self::asked_idle_ttl`] after its last real frame.
+    fn answer_asked(&self, link: [u8; 16], frame_bytes: usize, peer: Option<&str>) -> ShapingOffer {
+        if self.at_bound_for(peer) || !self.service_tier().admits_new_shaped_links() {
+            return self.past_bound_answer(link, peer);
+        }
+        let Some(policy) = self.asked_policy() else {
+            return self.offer_off_for(link);
+        };
+        let cap = self.test_frame_cap.load(Ordering::Relaxed);
+        let frame_bytes = if cap > 0 {
+            frame_bytes.min(cap)
+        } else {
+            frame_bytes
+        };
+        let offer = ShapingOffer::from_policy(&policy, frame_bytes);
+        if let Some(p) = peer {
+            self.link_peer().insert(link, p.to_owned());
+        }
+        self.offered().insert(link, offer);
+        if offer.shapes() {
+            self.asked().insert(link);
+        }
+        offer
+    }
+
+    /// What this node shapes at when asked: its policy where that names a
+    /// class, else its device's. `None` with no device to read.
+    fn asked_policy(&self) -> Option<ShapingPolicy> {
+        let policy = self.policy();
+        if policy.enabled() {
+            return Some(policy);
+        }
+        self.device_read
+            .get()
+            .map(|read| ShapingPolicy::for_class((read.0)().budget_class()))
+    }
+
+    /// Install what reads this node's device state, for
+    /// [`Self::answer_asked`].
+    pub fn set_device_read(&self, read: impl Fn() -> DeviceState + Send + Sync + 'static) {
+        let _ = self.device_read.set(DeviceRead(Box::new(read)));
+    }
+
+    /// How long past its last real frame a link this node was asked for lives.
+    #[must_use]
+    pub fn asked_idle_ttl(&self) -> Duration {
+        Duration::from_millis(self.asked_ttl_ms.load(Ordering::Relaxed))
+    }
+
+    /// Set [`Self::asked_idle_ttl`]; the operator's, default ten minutes.
+    pub fn set_asked_idle_ttl(&self, ttl: Duration) {
+        self.asked_ttl_ms.store(
+            u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// **The links to close now**: those this node was asked for, whose last
+    /// real frame is older than the TTL, each with a share of up to a tenth
+    /// more of its own, from its link id, so a fleet's links do not close
+    /// together. A node that offers shaping by default keeps its links.
+    #[must_use]
+    pub fn asked_links_idle(&self) -> Vec<[u8; 16]> {
+        if self.policy().offers_on(false) {
+            return Vec::new();
+        }
+        let ttl = self.asked_idle_ttl();
+        let mut asked = self.asked();
+        let links = self.links();
+        asked.retain(|l| links.contains_key(l));
+        asked
+            .iter()
+            .filter(|l| {
+                let share = f64::from(u16::from_be_bytes([l[0], l[1]])) / f64::from(u16::MAX);
+                links
+                    .get(*l)
+                    .is_some_and(|s| s.idle_for() >= ttl.mul_f64(1.0 + 0.1 * share))
+            })
+            .copied()
+            .collect()
+    }
+
+    fn asked(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<[u8; 16]>> {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether this node refuses a shaping peer it cannot shape, by the choice
@@ -2797,6 +2946,12 @@ impl LinkShapers {
         offer
     }
 
+    /// Test seam: answer `off` when asked, as a peer older than
+    /// `CLM-shaping-offered-never-refused` does.
+    pub fn set_old_peer_for_test(&self, on: bool) {
+        self.test_old_peer.store(on, Ordering::Relaxed);
+    }
+
     /// Test seam: cap the frame this node offers.
     pub fn set_frame_cap_for_test(&self, bytes: usize) {
         self.test_frame_cap.store(bytes, Ordering::Relaxed);
@@ -2928,6 +3083,7 @@ impl LinkShapers {
         if let Some(s) = self.links().remove(link) {
             s.stop();
         }
+        self.asked().remove(link);
         self.seat_agreed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3133,6 +3289,159 @@ mod tests {
             .peer_offer([103u8; 16], &ShapingOffer::off())
             .unwrap()
             .is_none());
+    }
+
+    fn off_at(kind: DeviceKind) -> LinkShapers {
+        let t = LinkShapers::new(ShapingPolicy::default());
+        t.set_device_read(move || DeviceState::of(kind));
+        t
+    }
+
+    /// An off node asked for a shaped link answers at its device's class, and
+    /// the agreement is the lower of the two.
+    #[test]
+    fn an_off_node_answers_a_peer_that_asks_at_its_own_class() {
+        let t = off_at(DeviceKind::Home);
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
+        let ours = t.offer_for_answer([1u8; 16], 400, Some("asker"), &peer);
+        assert_eq!(ours.class, BudgetClass::Home);
+        let shaper = t.peer_offer([1u8; 16], &peer).unwrap().expect("shaped");
+        let home = ShapingPolicy::for_class(BudgetClass::Home).bytes_per_s;
+        assert!(shaper.agreement().bytes_per_s().abs_diff(home.min(7000)) <= 7);
+    }
+
+    /// A phone on cellular pays its own class, not the asker's.
+    #[test]
+    fn a_phone_on_cellular_is_asked_at_its_cellular_class() {
+        let t = LinkShapers::new(ShapingPolicy::default());
+        t.set_device_read(|| DeviceState::of(DeviceKind::Phone).with_network(false, true));
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
+        let ours = t.offer_for_answer([1u8; 16], 400, Some("asker"), &peer);
+        assert_eq!(ours.class, BudgetClass::PhoneCellular);
+    }
+
+    /// Off with off stays off, and off offers nothing unasked.
+    #[test]
+    fn nobody_asks_and_nothing_is_shaped() {
+        let t = off_at(DeviceKind::Server);
+        let ours = t.offer_for_answer([1u8; 16], 400, Some("quiet"), &ShapingOffer::off());
+        assert!(!ours.shapes());
+        assert!(t
+            .peer_offer([1u8; 16], &ShapingOffer::off())
+            .unwrap()
+            .is_none());
+        assert!(!t.offers_to(Some("quiet")), "the setting: not by default");
+    }
+
+    /// A peer that asks past the bound or under Admit-close gets the rule any
+    /// peer gets.
+    #[test]
+    fn an_off_node_keeps_the_bound_and_the_load_tier_when_asked() {
+        use crate::load_ladder::ServiceTier as T;
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
+        let t = off_at(DeviceKind::Server);
+        t.set_service_tier(T::AudioAndFiles);
+        assert!(!t
+            .offer_for_answer([1u8; 16], 400, Some("a"), &peer)
+            .shapes());
+        let t = off_at(DeviceKind::Server);
+        for i in 0..8u8 {
+            let _ = t.offer_for_answer([i + 10; 16], 400, Some(&format!("p{i}")), &peer);
+            t.peer_offer([i + 10; 16], &peer).unwrap().expect("shaped");
+        }
+        assert!(!t
+            .offer_for_answer([9u8; 16], 400, Some("ninth"), &peer)
+            .shapes());
+    }
+
+    /// **The TTL counts real frames.** Paused clock: a link idle to the TTL
+    /// closes; a real frame renews it; cover does not, however much of it runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_link_asked_of_an_off_node_closes_ttl_past_its_last_real_frame() {
+        let t = off_at(DeviceKind::Home);
+        let link = [0u8; 16];
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
+        let _ = t.offer_for_answer(link, 400, Some("asker"), &peer);
+        let shaper = t.peer_offer(link, &peer).unwrap().expect("shaped");
+        let ttl = t.asked_idle_ttl();
+        assert_eq!(ttl, Duration::from_secs(600), "the rule's ten minutes");
+
+        tokio::time::advance(ttl - Duration::from_secs(1)).await;
+        assert!(t.asked_links_idle().is_empty(), "inside the TTL");
+        shaper.note_real();
+        tokio::time::advance(ttl - Duration::from_secs(1)).await;
+        assert!(t.asked_links_idle().is_empty(), "a real frame renewed it");
+
+        // Cover runs right up to the read, past the TTL and its jitter: a link
+        // that cover renewed would read as busy here.
+        for _ in 0..16 {
+            tokio::time::advance(ttl / 8).await;
+            assert!(matches!(
+                shaper.next_emission().await,
+                Emission::Frame { real: false, .. }
+            ));
+        }
+        assert_eq!(t.asked_links_idle(), vec![link], "cover renewed nothing");
+    }
+
+    /// A real frame this node sends renews it too.
+    #[tokio::test(start_paused = true)]
+    async fn a_real_frame_out_renews_the_ttl() {
+        let t = off_at(DeviceKind::Home);
+        let link = [0u8; 16];
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
+        let _ = t.offer_for_answer(link, 400, Some("asker"), &peer);
+        let shaper = t.peer_offer(link, &peer).unwrap().expect("shaped");
+        tokio::time::advance(t.asked_idle_ttl() - Duration::from_secs(1)).await;
+        shaper.enqueue(vec![b"row".to_vec()]).expect("queued");
+        assert!(matches!(
+            shaper.next_emission().await,
+            Emission::Frame { real: true, .. }
+        ));
+        assert!(shaper.idle_for() < Duration::from_secs(60));
+    }
+
+    /// The close is spread over a tenth of the TTL, by link: a fleet's links do
+    /// not close together, and none closes before the TTL.
+    #[tokio::test(start_paused = true)]
+    async fn idle_links_close_spread_and_never_early() {
+        let t = off_at(DeviceKind::Server);
+        t.set_asked_idle_ttl(Duration::from_secs(100));
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
+        for hi in [0u8, 128, 255] {
+            let mut link = [0u8; 16];
+            link[0] = hi;
+            let _ = t.offer_for_answer(link, 400, Some(&format!("p{hi}")), &peer);
+            t.peer_offer(link, &peer).unwrap().expect("shaped");
+        }
+        tokio::time::advance(Duration::from_secs(99)).await;
+        assert!(t.asked_links_idle().is_empty());
+        let mut counts = Vec::new();
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            counts.push(t.asked_links_idle().len());
+        }
+        assert_eq!(counts[0], 1, "the first at the TTL");
+        assert_eq!(*counts.last().unwrap(), 3, "the last within a tenth more");
+        assert!(counts.contains(&2), "and one between: {counts:?}");
+    }
+
+    /// A node that offers by default keeps its links, and a policy update does
+    /// not take a link a peer asked for.
+    #[tokio::test(start_paused = true)]
+    async fn the_ttl_binds_only_a_node_that_does_not_offer() {
+        let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
+        let on = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
+        let _ = on.offer_for_answer([1u8; 16], 400, Some("p"), &peer);
+        on.peer_offer([1u8; 16], &peer).unwrap().expect("shaped");
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        assert!(on.asked_links_idle().is_empty());
+
+        let off = off_at(DeviceKind::Home);
+        let _ = off.offer_for_answer([2u8; 16], 400, Some("p"), &peer);
+        off.peer_offer([2u8; 16], &peer).unwrap().expect("shaped");
+        assert!(off.set_policy(ShapingPolicy::default()).is_empty());
+        assert!(off.is_shaped([2u8; 16]));
     }
 
     /// Anonymous mode refuses as shaped-only does.

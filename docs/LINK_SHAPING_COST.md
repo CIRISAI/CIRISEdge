@@ -152,6 +152,18 @@ the last 120 s; those are the peer's exclusions, and no message carries them. Th
 refusal's token and the outcome are logged and counted:
 `link_shaping_referral_{sent,empty,withheld,received,rejected,homed,failed,exhausted}`.
 
+**Asked of a node that does not offer.** The setting says whether a node offers
+shaping by default; the capability is every node's (CC 5.4.3,
+`CLM-shaping-offered-never-refused`). On a direct link a node with shaping off
+answers a peer that asks at its own device class, and the agreement takes the lower of
+the two, so a phone on cellular pays no more than its class. The wire does not
+change: an old peer's `off` ends as it always did. The node drops the link ten
+minutes after its last real frame, either way, with up to a tenth more by link so
+a fleet's links do not close together; cover does not count. The ten minutes are
+the operator's, `Edge::set_shaping_asked_idle_ttl`. The close is a plain one
+(`link_shaping_asked_idle_closed`), and the asker dials again when it has something
+to send.
+
 **Past the bound.** Only a node set to shaped-only or to the anonymous tier refuses
 (CIRISEdge#952). Any other node answers `off`, sends its referrals as a hint, and
 the link runs unshaped, counted `link_shaping_unshaped:past_bound` at the end that
