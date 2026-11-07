@@ -946,6 +946,49 @@ fn record_chunk_answer(
     answered
 }
 
+/// How many non-replication frames may be in dispatch at once on the
+/// background listener. Past it a frame is dropped and counted: nothing may hold
+/// the loop, or a replication frame would wait behind it.
+const INBOUND_DISPATCH_SLOTS: usize = 256;
+
+/// **The inbound loop.** One blob serve took 9.7 s on a real run, and this loop
+/// used to await it: eight chunks left replication behind them for over a
+/// minute, and the retries re-served. A replication frame is routed here, in
+/// arrival order, so frames for one `(peer, plane)` never reorder and never wait
+/// behind a serve; everything else is dispatched on its own task, as
+/// [`Edge::run`] does, and the serves are bounded by
+/// [`ChunkWaits::serve_permits`](crate::blob_swarm::chunk_waits::ChunkWaits::serve_permits).
+async fn drain_inbound<R, RF, D, DF, F>(
+    mut inbound: tokio::sync::mpsc::Receiver<InboundFrame>,
+    slots: usize,
+    route: R,
+    dispatch: D,
+    full: F,
+) where
+    R: Fn(InboundFrame) -> RF,
+    RF: std::future::Future<Output = Option<InboundFrame>>,
+    D: Fn(InboundFrame) -> DF,
+    DF: std::future::Future<Output = ()> + Send + 'static,
+    F: Fn(),
+{
+    let slots = Arc::new(tokio::sync::Semaphore::new(slots));
+    while let Some(frame) = inbound.recv().await {
+        let Some(frame) = route(frame).await else {
+            continue;
+        };
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            tracing::warn!("inbound frame dropped: every dispatch slot is taken");
+            full();
+            continue;
+        };
+        let dispatched = dispatch(frame);
+        tokio::spawn(async move {
+            dispatched.await;
+            drop(slot);
+        });
+    }
+}
+
 /// CIRISEdge#887 — the holder's mark that an answer for one chunk to one
 /// requester is in flight; cleared when the serve ends, however it ends.
 struct ServeInFlight<'a> {
@@ -4160,6 +4203,12 @@ impl Edge {
                     .map_err(|e| {
                         EdgeError::Config(format!("scope-native blob fetch lease: {e}"))
                     })?;
+                tracing::info!(
+                    event = "edge.blob_chunk_fetch.link",
+                    holder = %recipient.peer_key_id(),
+                    link = %hex::encode(lease.link_id_bytes()),
+                    "scoped fetch rides this link",
+                );
                 transport
                     .send_on_scoped_lease(&lease, envelope_bytes)
                     .await
@@ -4880,27 +4929,34 @@ impl Edge {
         // those default to `None` in production so the production-path
         // behaviour is byte-equal to what [`Self::run`]'s inline loop
         // would have done.
+        let edge_for_route = Arc::clone(self);
         let edge_for_dispatch = Arc::clone(self);
-        tasks.push(runtime.spawn(async move {
-            while let Some(frame) = inbound_rx.recv().await {
-                // CIRISEdge#348 — route CRPL replication frames to the registry
-                // FIRST (the hop `run` had but this loop was missing, so the agent
-                // never delivered round-opens to the responder). Only fall through
-                // to envelope dispatch when it's not consumed by replication.
-                if route_replication_frame(
-                    edge_for_dispatch.replication_registry.get().as_ref(),
-                    &frame,
-                    Some(&edge_for_dispatch.metrics()),
-                )
-                .await
-                {
-                    continue;
-                }
-                edge_for_dispatch
-                    .dispatch_inbound_observed_outcome_for_test(frame)
+        let edge_for_full = Arc::clone(self);
+        tasks.push(runtime.spawn(drain_inbound(
+            inbound_rx,
+            INBOUND_DISPATCH_SLOTS,
+            // CIRISEdge#348 — route CRPL replication frames to the registry
+            // FIRST (the hop `run` had but this loop was missing, so the agent
+            // never delivered round-opens to the responder). Only fall through
+            // to envelope dispatch when it's not consumed by replication.
+            move |frame| {
+                let edge = Arc::clone(&edge_for_route);
+                async move {
+                    let consumed = route_replication_frame(
+                        edge.replication_registry.get().as_ref(),
+                        &frame,
+                        Some(&edge.metrics()),
+                    )
                     .await;
-            }
-        }));
+                    (!consumed).then_some(frame)
+                }
+            },
+            move |frame| {
+                let edge = Arc::clone(&edge_for_dispatch);
+                async move { edge.dispatch_inbound_for_test(frame).await }
+            },
+            move || edge_for_full.metrics().inc_transport_packet_dropped(),
+        )));
 
         tasks
     }
@@ -7152,6 +7208,15 @@ async fn dispatch_inbound(
                         metrics.inc_blob_scoped_carrier("serve:coalesced_in_flight");
                         return;
                     }
+                    // Held to the end of the serve. Parallel serves multiply
+                    // the Resource window's rate, so they are few.
+                    let serve_permits = blob_chunk_fetch_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .serve_permits();
+                    let Ok(_serve_permit) = serve_permits.acquire_owned().await else {
+                        return;
+                    };
                     // CIRISEdge#587 — the verified envelope's signer IS the
                     // requesting peer; hand it to the source so a
                     // persist-backed impl can name the requester at
@@ -12314,5 +12379,108 @@ impl crate::transport::av_call::RoomRoster for DirectoryRoster {
         ciris_persist::federation::is_active_community_member(self.0.as_ref(), room, key_id)
             .await
             .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod inbound_drain_tests {
+    use super::{drain_inbound, InboundFrame};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn frame(tag: u8) -> InboundFrame {
+        InboundFrame {
+            envelope_bytes: vec![tag],
+            transport: crate::transport::TransportId::HTTP,
+            received_at: chrono::Utc::now(),
+            source_key_id: None,
+            link_key_id: None,
+            arrival_scope: None,
+            reply_path: None,
+        }
+    }
+
+    /// `1..` is replication, routed in place; `0` a serve, which never ends.
+    struct Rig {
+        tx: tokio::sync::mpsc::Sender<InboundFrame>,
+        routed: Arc<Mutex<Vec<u8>>>,
+        dispatched: Arc<AtomicUsize>,
+        full: Arc<AtomicUsize>,
+    }
+
+    fn rig(slots: usize) -> Rig {
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        let routed = Arc::new(Mutex::new(Vec::new()));
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let full = Arc::new(AtomicUsize::new(0));
+        let (r, d, f) = (
+            Arc::clone(&routed),
+            Arc::clone(&dispatched),
+            Arc::clone(&full),
+        );
+        tokio::spawn(drain_inbound(
+            rx,
+            slots,
+            move |frame| {
+                let r = Arc::clone(&r);
+                async move {
+                    let tag = frame.envelope_bytes[0];
+                    if tag == 0 {
+                        return Some(frame);
+                    }
+                    r.lock().unwrap().push(tag);
+                    None
+                }
+            },
+            move |_| {
+                d.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>()
+            },
+            move || {
+                f.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        Rig {
+            tx,
+            routed,
+            dispatched,
+            full,
+        }
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    /// **A slow serve does not delay a replication frame**, under load, and
+    /// the frames of a plane keep their order past it.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_serve_does_not_delay_a_replication_frame() {
+        let rig = rig(16);
+        for _ in 0..8 {
+            rig.tx.send(frame(0)).await.unwrap();
+        }
+        for tag in 1..=5 {
+            rig.tx.send(frame(tag)).await.unwrap();
+        }
+        settle().await;
+        assert_eq!(rig.dispatched.load(Ordering::SeqCst), 8, "all in flight");
+        assert_eq!(*rig.routed.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+    }
+
+    /// The tasks are bounded: past the slots a frame is counted and dropped, and
+    /// replication still does not wait.
+    #[tokio::test(start_paused = true)]
+    async fn the_dispatch_slots_are_a_bound_and_replication_is_outside_it() {
+        let rig = rig(4);
+        for _ in 0..6 {
+            rig.tx.send(frame(0)).await.unwrap();
+        }
+        rig.tx.send(frame(9)).await.unwrap();
+        settle().await;
+        assert_eq!(rig.dispatched.load(Ordering::SeqCst), 4);
+        assert_eq!(rig.full.load(Ordering::SeqCst), 2);
+        assert_eq!(*rig.routed.lock().unwrap(), vec![9]);
     }
 }

@@ -73,6 +73,7 @@ pub(crate) struct ChunkWaits {
     slots: HashMap<ChunkKey, Slot>,
     /// `(requester key_id, chunk)` → when this node started answering it.
     serving: HashMap<(String, ChunkKey), Instant>,
+    serve_permits: ServePermits,
 }
 
 /// The longest an answer is treated as in flight. The reply path's own
@@ -80,7 +81,28 @@ pub(crate) struct ChunkWaits {
 /// dial fallback); this only reclaims an entry whose guard never ran.
 pub(crate) const SERVE_IN_FLIGHT_MAX: Duration = Duration::from_secs(120);
 
+/// How many chunk serves run at once. Each is a Resource on the wire, and
+/// parallel Resources multiply the window's rate.
+pub(crate) const SERVE_PERMITS: usize = 2;
+
+/// [`SERVE_PERMITS`] of them, shared by one node's serves.
+#[derive(Debug)]
+struct ServePermits(std::sync::Arc<tokio::sync::Semaphore>);
+
+impl Default for ServePermits {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::Semaphore::new(
+            SERVE_PERMITS,
+        )))
+    }
+}
+
 impl ChunkWaits {
+    /// The node's chunk-serve permits; a serve holds one to its end.
+    pub(crate) fn serve_permits(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        std::sync::Arc::clone(&self.serve_permits.0)
+    }
+
     /// Register a fetch of `key`. A kept late answer is handed over at once.
     /// Re-registering while another fetch waits replaces that waiter, which
     /// then sees a closed channel (the scheduler's per-peer cap keeps this

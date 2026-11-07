@@ -19,6 +19,8 @@ the peer to confirm the bootstrap planes, at most five seconds, so a contact no 
 timeout to attribution.
 A round lost after listing puts the watermark back, at most three times running, so its rows are in
 the next round and not the re-sweep.
+On a PyO3 host a blob serve no longer holds the inbound loop: replication is routed in place, other
+frames run on their own task, and two chunk serves run at once.
 
 ## 44.0.0 — 2026-11-06
 

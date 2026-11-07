@@ -44,6 +44,12 @@ v22.0.0, leviculum v0.33.0+ciris.1.
   still landing. The round timeout is unchanged. Only a peer added while the scheduler runs is held,
   so a restart's peer list never is, and at most eight at once; a plane is asked again when its round
   ends, on a doubling wait, through the round gate.
+- **A blob serve does not hold the inbound loop.** `spawn_background_listeners` awaited dispatch in
+  the loop, so on a PyO3 host one chunk serve, 9.7 s on a real run, held every frame behind it. A
+  replication frame is routed in the loop, in arrival order, so a `(peer, plane)` never reorders.
+  Everything else runs on its own task, as `Edge::run` always did, at most 256 at once, and past that
+  a frame is dropped and counted. Two chunk serves run at once. `edge.blob_chunk_fetch.link` names
+  the link a scoped fetch rides, after the lease.
 - **A lost round's rows are in the next round.** The watermark moved when a round listed, so a round
   lost after that left its rows behind it until the re-sweep came round. A round that does not
   complete now puts the watermark back and the next round lists them again, at most three times
