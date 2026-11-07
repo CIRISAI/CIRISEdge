@@ -16,6 +16,10 @@ the Channel limit is named, not a dead link. The load tier leaves forwarding alo
 leased shed levers. Every node can shape on a direct link, a shaped link is one direct hop, eight
 shaped links do not stop new connections, and a failed bulk dial refuses by name.
 
+A peer that is neither a seat nor its owner's no longer walks the plane: it reads new rows from the
+tip, and history at one full page a minute. This node's own invitations and their answers are required
+reads. `chat::pair_proposal_for` reads the room's index; `membership::pending_proposal_in` is new.
+
 **Server must:** mirror the policy hash; take the `no_route` outcome and `RoundEvent::NoRoute`; set
 `ReplicationRuntimeConfig::recognised_seats` from `Edge::recognised_seats()` on a Rust host; build its
 shaping policy with `ShapingPolicy::for_device`; pull the leased levers (`pull_shed_lever`).

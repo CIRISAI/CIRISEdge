@@ -974,9 +974,16 @@ pub struct BridgeConfig {
     /// bound that costs nothing but rounds. The effective page is the `min` of
     /// the two.
     pub sweep_page_rows: u32,
+    /// CC 5.2 — how far behind now a peer that gets no walk starts reading new
+    /// rows ([`Self::DEFAULT_TIP_MARGIN`]).
+    pub tip_margin: Duration,
 }
 
 impl BridgeConfig {
+    /// A peer with no walk starts this far behind now, so a row written just
+    /// before its first round is still a new row.
+    pub const DEFAULT_TIP_MARGIN: Duration = Duration::from_secs(60);
+
     /// Default for [`Self::operational_page_limit`].
     pub const DEFAULT_OPERATIONAL_PAGE_LIMIT: u32 = u32::MAX;
 
@@ -1104,6 +1111,7 @@ impl Default for BridgeConfig {
             operational_page_limit: Self::DEFAULT_OPERATIONAL_PAGE_LIMIT,
             advertise_sweep_permits: Self::DEFAULT_ADVERTISE_SWEEP_PERMITS,
             sweep_page_rows: Self::DEFAULT_SWEEP_PAGE_ROWS,
+            tip_margin: Self::DEFAULT_TIP_MARGIN,
         }
     }
 }
@@ -1404,6 +1412,9 @@ struct PlaneWatermark {
     rollback: Option<ListedFrom>,
     /// How many lost rounds in a row have been put back.
     lost_rounds: u8,
+    /// When a peer that gets no walk may read its next page of history
+    /// ([`SweepCursors::history_due`]).
+    history_at: Option<Instant>,
     /// Monotonic touch tick, for the cap's least-recently-used eviction.
     touched: u64,
 }
@@ -1411,6 +1422,11 @@ struct PlaneWatermark {
 /// The position a head read started from, the plane's beginning included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ListedFrom(Option<ResumeCursor>);
+
+/// How often a peer that gets no walk reads a page of history: what its
+/// required read and new rows do not carry, such as the rows of a room it has
+/// just joined. Slow on purpose: this is not anti-entropy.
+const HISTORY_PAGE_EVERY: Duration = Duration::from_secs(60);
 
 /// How many lost rounds in a row get their rows listed again. Past it the
 /// watermark moves as it would have and the re-sweep carries what was passed,
@@ -1756,6 +1772,32 @@ impl SweepCursors {
     /// metrics handle.
     fn take_evicted(&mut self) -> u64 {
         std::mem::take(&mut self.evicted)
+    }
+
+    /// A peer with no walk reads new rows from `tip`, not from the beginning.
+    /// Only a position this map does not hold yet moves: a peer already reading
+    /// keeps its place.
+    /// Returns whether this was the first time.
+    fn start_at_tip(&mut self, key: &(String, EnvelopeKind), tip: ResumeCursor) -> bool {
+        if self.by_peer_plane.contains_key(key) {
+            return false;
+        }
+        let wm = self.touch(key);
+        wm.high_water = Some(tip);
+        wm.caught_up = true;
+        true
+    }
+
+    /// May a peer with no walk read a page of history now?
+    fn history_due(&mut self, key: &(String, EnvelopeKind), now: Instant) -> bool {
+        !self.touch(key).history_at.is_some_and(|at| now < at)
+    }
+
+    /// A page of history was read. A short one was all of it, and a plane that
+    /// fits one page is not a walk; past a full one the next waits out
+    /// [`HISTORY_PAGE_EVERY`], however many rounds come.
+    fn history_read(&mut self, key: &(String, EnvelopeKind), full: bool, now: Instant) {
+        self.touch(key).history_at = full.then_some(now + HISTORY_PAGE_EVERY);
     }
 
     /// The new-rows and re-sweep positions for `key` (the round summary).
@@ -3659,6 +3701,13 @@ impl FederationDirectoryReplicationBridge {
             .lock()
             .ok()
             .and_then(|mut c| c.after_head(key, served, budget, last))
+    }
+
+    /// [`SweepCursors::history_due`] for `key`, now.
+    fn sweep_history_due(&self, key: &(String, EnvelopeKind)) -> bool {
+        self.sweep_cursors
+            .lock()
+            .is_ok_and(|mut c| c.history_due(key, Instant::now()))
     }
 
     /// CIRISEdge#531 DEPTH — the LATER of two cursor positions, treating
@@ -10197,6 +10246,23 @@ impl FederationDirectoryReplicationBridge {
         if let Ok(mut open) = self.round_withholds.lock() {
             open.insert(peer_label.to_owned(), BTreeMap::new());
         }
+        // CC 5.2 — among contacts there is no diff walk: a peer that is not a
+        // seat and not its owner's reads new rows from the tip, and its history
+        // a page at a time at a pace that is not a walk.
+        let no_walk = ctx.moves == UnaskedOffer::RequiredOrAppropriate
+            || ctx
+                .resolved_recipient
+                .as_ref()
+                .map(ResolvedRecipient::reach)
+                == Some(Reach::FirstContact)
+                && ctx.moves != UnaskedOffer::Commons;
+        let mut first_at_tip = false;
+        if no_walk {
+            let margin = chrono::Duration::from_std(self.config.tip_margin).unwrap_or_default();
+            if let Ok(mut c) = self.sweep_cursors.lock() {
+                first_at_tip = c.start_at_tip(&key, (chrono::Utc::now() - margin, String::new()));
+            }
+        }
         // CC 5.2 — what is required moves before any walk.
         let mut listed = 0;
         let mut counts = PageCounts::default();
@@ -10239,7 +10305,10 @@ impl FederationDirectoryReplicationBridge {
         listed += served;
         counts.merge(head_counts);
         let mut resweep: Option<(Option<ResumeCursor>, usize, bool)> = None;
-        if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
+        let plan = self
+            .sweep_after_head(&key, served, budget, last)
+            .filter(|_| !first_at_tip && (!no_walk || self.sweep_history_due(&key)));
+        if let Some(plan) = plan {
             if plan.since.is_none() {
                 self.resweep_cycle_started(&key);
             }
@@ -10258,6 +10327,11 @@ impl FederationDirectoryReplicationBridge {
                 Ok((b_served, b_last, b_counts)) => {
                     self.sweep_after_backfill(&key, b_served, plan.budget, b_last);
                     let wrapped = b_served < plan.budget as usize;
+                    if no_walk {
+                        if let Ok(mut c) = self.sweep_cursors.lock() {
+                            c.history_read(&key, !wrapped, Instant::now());
+                        }
+                    }
                     self.resweep_cycle_step(&key, wrapped);
                     listed += b_served;
                     counts.merge(b_counts);
@@ -10887,6 +10961,17 @@ impl FederationDirectoryReplicationBridge {
         queries.push(AttestationQuery::by(peer, REQUIRED_READ_PAGE));
         queries.extend(local.iter().map(|key| {
             AttestationQuery::by(key, REQUIRED_READ_PAGE).types(&[attestation_type::DELEGATES_TO])
+        }));
+        // An invitation names its invitee in `subject_key_ids` alone, which no
+        // index reads, so this node's own ceremony rows are read by author.
+        // They are consent-free, and on a store of 11k rows waiting for the
+        // walk cost a contact 200 s.
+        queries.extend(local.iter().map(|key| {
+            AttestationQuery::by(key, REQUIRED_READ_PAGE).dimension_any_of(&[
+                ciris_persist::federation::membership_acceptance::PROPOSAL_DIMENSION,
+                ciris_persist::federation::membership_acceptance::ACCEPTANCE_DIMENSION,
+                ciris_persist::federation::membership_acceptance::DECLINE_DIMENSION,
+            ])
         }));
         for query in queries {
             match query.pages().next(&*self.directory).await {

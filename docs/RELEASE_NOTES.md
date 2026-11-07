@@ -14,6 +14,19 @@
 - Build the shaping policy with `ShapingPolicy::for_device`.
 - Pull the leased levers (`pull_shed_lever`, `walk`, `page`, `bulk`). A lever left alone sits at 0.
 
+- **No walk in the read path.** A person-store fixture of 11k rows took 233 s to `keyed` in both
+  directions, and read the store 480 times.
+  - **The 233 s was the walk.** An invitation names its invitee only in `subject_key_ids`, which no
+    index reads, so it reached the peer when the peer's walk reached the tip, a page a round. This
+    node's own proposals, acceptances and declines are now required reads, by author.
+  - **A peer that is neither a seat nor its owner's has no walk.** It starts at the tip, 60 s back,
+    and reads new rows from there. History is one full page a minute, and a plane that fits one page
+    reads as before. A row older than the margin that nothing indexes now waits for that page: a new
+    room member's history, or a relayed invitation.
+  - **The 480 reads were mostly a scan.** `membership::pending_proposals_for` walks the plane, and a
+    host polling a pair room called it about 1.6 times a second. `chat::pair_proposal_for` now reads
+    the room's index through `membership::pending_proposal_in`. The inbox still scans: nothing
+    indexes a row by subject (a persist ask).
 - **leviculum 0.34.** The Resource window is `WindowPolicy::ByMedium`: `Adaptive` on TCP, UDP, Auto and
   Local under 1 s round trip, `Current` everywhere else, decided per resource, so a radio hot-plugged
   later stays `Current` and there is no radio exception. This ends the cliff past about 31 ms.

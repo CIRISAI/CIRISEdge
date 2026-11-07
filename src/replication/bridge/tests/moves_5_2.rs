@@ -6,6 +6,7 @@
 //! fails on the walk it replaced, where a consented peer was offered every
 //! federation row oldest first.
 use super::*;
+use crate::replication::counting_directory_930::CountingDirectory;
 
 const LOCAL: &str = "moves-node";
 const CONTACT: &str = "moves-contact";
@@ -25,6 +26,7 @@ fn page_bridge(backend: &Arc<SqliteBackend>) -> FederationDirectoryReplicationBr
         cohort,
         BridgeConfig {
             sweep_page_rows: PAGE,
+            tip_margin: Duration::from_secs(3_600),
             ..BridgeConfig::default()
         },
     )
@@ -154,8 +156,15 @@ async fn a_fresh_grant_moves_first_and_history_is_not_offered() {
         );
     }
     // The walk still reads the plane, and offers none of it across its rounds.
+    let mut waiting = 0;
     for _ in 0..WALK_ROUNDS {
         let round = offer(&bridge, CONTACT).await;
+        waiting += bridge
+            .last_advertise_round
+            .lock()
+            .expect("the round summary")
+            .as_ref()
+            .map_or(0, |r| r.awaits_request);
         for id in &past {
             let old = hash_of(&backend, id).await;
             assert!(
@@ -164,15 +173,9 @@ async fn a_fresh_grant_moves_first_and_history_is_not_offered() {
             );
         }
     }
-    let summary = bridge
-        .last_advertise_round
-        .lock()
-        .expect("the round summary")
-        .clone()
-        .expect("a round ran");
     assert!(
-        summary.awaits_request > 0,
-        "the rows the walk passed are counted, not silent: {summary:?}"
+        waiting > 0,
+        "the rows the walk passed are counted, not silent"
     );
 }
 
@@ -539,4 +542,146 @@ async fn a_peer_that_always_fails_does_not_list_one_page_for_ever() {
         page,
         "a success resets the bound"
     );
+}
+
+/// A bridge whose contacts start at the tip now.
+fn tip_bridge(backend: &Arc<SqliteBackend>) -> FederationDirectoryReplicationBridge {
+    let dir: Arc<dyn FederationDirectory> = backend.clone();
+    let cohort: CohortProvider = Arc::new(|| vec![LOCAL.to_owned()]);
+    FederationDirectoryReplicationBridge::with_config(
+        dir,
+        cohort,
+        BridgeConfig {
+            sweep_page_rows: PAGE,
+            tip_margin: Duration::ZERO,
+            ..BridgeConfig::default()
+        },
+    )
+    .with_local_key_id(Some(LOCAL.to_owned()))
+}
+
+/// **Among contacts there is no diff walk, in the read path too.** A store of
+/// history and rounds on rounds: a contact costs a head read past the tip each
+/// round and one page of history, not a page a round.
+#[tokio::test]
+async fn a_contacts_rounds_do_not_read_the_plane() {
+    let backend = fixture().await;
+    let past = history(&backend).await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    let bridge = tip_bridge(&backend);
+
+    let mut read = 0;
+    for _ in 0..20 {
+        let refs = offer(&bridge, CONTACT).await;
+        assert!(!refs.is_empty(), "the required rows still move");
+        let round = bridge
+            .last_advertise_round
+            .lock()
+            .expect("the round summary")
+            .clone()
+            .expect("a round ran");
+        read += round.listed - round.offered.min(round.listed);
+    }
+    assert!(
+        read <= 2 * PAGE as usize,
+        "one page of history in the whole run, not one a round: {read} rows read past the \
+         required ones"
+    );
+    assert!(!offers(&backend, &bridge, CONTACT, &past[0]).await);
+}
+
+/// A row written after the contact's first round is a new row, in the next
+/// round, and two seats still walk.
+#[tokio::test]
+async fn a_new_row_for_a_contact_is_read_from_the_tip() {
+    let backend = fixture().await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    let bridge = tip_bridge(&backend);
+    offer(&bridge, CONTACT).await;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let envelope = serde_json::json!({
+        "id": id,
+        "attesting_key_id": THIRD,
+        "attested_key_id": THIRD,
+        "attestation_type": "withdraws",
+        "kind": "withdraws",
+        "references_attestation_id": "gone",
+        "references_attestation_type": "scores",
+    });
+    seed_raw_attestation(&backend, &id, THIRD, THIRD, "withdraws", envelope).await;
+    assert!(
+        offers(&backend, &bridge, CONTACT, &id).await,
+        "a tombstone written now reaches the contact in its next round, by no index"
+    );
+}
+
+/// **An invitation does not wait for a walk.** It names its invitee only in
+/// `subject_key_ids`, which no index reads: the field's 233 s to keyed. Written
+/// long before the contact's first round, it still leads the offer.
+#[tokio::test]
+async fn an_invitation_moves_ahead_of_the_walk() {
+    let backend = fixture().await;
+    register_fixture_keys(&backend, &[("moves-founder", identity_type::USER)]).await;
+    seed_owner_binding(&backend, "moves-founder", LOCAL).await;
+    seed_device_occurrence(&backend, "moves-founder", LOCAL, "laptop").await;
+    seed_common_root(&backend, &["moves-founder", CONTACT]).await;
+    let room = crate::chat::pair_community("moves-founder", CONTACT, Utc::now());
+    let group = room.community_key_id.clone();
+    backend
+        .put_community(sign_community_fixture("moves-founder", room))
+        .await
+        .expect("the room");
+    history(&backend).await;
+    let invitation = crate::membership::propose(
+        &*backend,
+        crate::membership::GroupScope::Community,
+        &group,
+        CONTACT,
+        None,
+        Utc::now() + chrono::Duration::days(1),
+        &fixture_local_signer("moves-founder"),
+    )
+    .await
+    .expect("the invitation");
+    let bridge = tip_bridge(&backend);
+
+    let hash = hash_of(&backend, &invitation.attestation_id).await;
+    let refs = offer(&bridge, CONTACT).await;
+    assert!(
+        refs.iter().any(|r| r.envelope_hash == hash),
+        "in the first offer, with the tip already past it: {refs:?}"
+    );
+}
+
+/// The inbox a host polls for a pair room reads the room's index, not the plane.
+#[tokio::test]
+async fn a_pair_rooms_proposal_is_read_by_its_room() {
+    let backend = fixture().await;
+    register_fixture_keys(&backend, &[("moves-founder", identity_type::USER)]).await;
+    let room = crate::chat::pair_community("moves-founder", CONTACT, Utc::now());
+    let group = room.community_key_id.clone();
+    backend
+        .put_community(sign_community_fixture("moves-founder", room))
+        .await
+        .expect("the room");
+    let invitation = crate::membership::propose(
+        &*backend,
+        crate::membership::GroupScope::Community,
+        &group,
+        CONTACT,
+        None,
+        Utc::now() + chrono::Duration::days(1),
+        &fixture_local_signer("moves-founder"),
+    )
+    .await
+    .expect("the invitation");
+    let counting = CountingDirectory::new(Arc::clone(&backend) as Arc<dyn FederationDirectory>);
+
+    let found = crate::membership::pending_proposal_in(&counting, CONTACT, &group)
+        .await
+        .expect("read")
+        .expect("the proposal");
+    assert_eq!(found.proposal.attestation_id, invitation.attestation_id);
+    assert_eq!(counting.count("list_attestations_since"), 0);
 }

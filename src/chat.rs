@@ -583,10 +583,7 @@ pub async fn pair_proposal_for(
     peer: &str,
 ) -> Result<Option<crate::membership::PendingProposal>, crate::membership::MembershipError> {
     let room = pair_community_key_id(me, peer);
-    Ok(crate::membership::pending_proposals_for(directory, me)
-        .await?
-        .into_iter()
-        .find(|p| p.group_key_id == room))
+    crate::membership::pending_proposal_in(directory, me, &room).await
 }
 
 /// **Host call: accept a pair-room proposal** — `signer` acts for the
