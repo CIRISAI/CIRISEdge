@@ -559,6 +559,7 @@ impl PyEdge {
     /// again. Returns the level in force. It rises one step per 10 s, falls one
     /// per 30 s, and falls on its own when the lease runs out. The levers read
     /// back in `load_ledger_json`. Raises `ValueError` on another spelling.
+    #[allow(clippy::similar_names)] // a lever and its level
     fn pull_shed_lever(&self, lever: &str, level: u8, lease_secs: f64) -> PyResult<u8> {
         let l = crate::ShedLever::parse(lever).ok_or_else(|| {
             PyValueError::new_err(format!(

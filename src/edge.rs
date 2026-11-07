@@ -2300,6 +2300,7 @@ impl Edge {
     /// renewed walks back to serving, one step per
     /// [`crate::load_levers::RELEASE_STEP`], and `level` 0 releases at the
     /// same pace. Returns the level in force.
+    #[allow(clippy::similar_names)] // a lever and its level
     pub fn pull_shed_lever(
         &self,
         lever: crate::ShedLever,

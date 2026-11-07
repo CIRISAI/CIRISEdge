@@ -2242,6 +2242,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_walk_lever_sheds_the_walk_alone_and_walks_home_with_no_surge() {
         const CADENCE: u64 = 30;
+        // Baseline: 120 s of an unlevered walk.
+        const PULL: u64 = 180;
+        const SILENT: u64 = PULL + 600;
+        const HOME: u64 = SILENT + 300;
         let metrics = crate::observability::EdgeMetrics::default();
         let levers = &metrics.telemetry.levers;
         levers.install_obligations(Arc::new(OwedNothing));
@@ -2288,10 +2292,6 @@ mod tests {
         });
 
         let settle = |at: u64| tokio::time::sleep_until(t0 + Duration::from_secs(at));
-        // Baseline: 120 s of an unlevered walk.
-        const PULL: u64 = 180;
-        const SILENT: u64 = PULL + 600;
-        const HOME: u64 = SILENT + 300;
         settle(PULL).await;
         for _ in 0..3 {
             levers.pull(

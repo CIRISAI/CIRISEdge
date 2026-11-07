@@ -259,6 +259,7 @@ impl LoadLevers {
     /// and renews until it is reached. `level` above [`MAX_LEVEL`] is the top;
     /// a `lease` over [`LEASE_MAX`] is [`LEASE_MAX`]. `level` 0 releases, one
     /// step per [`RELEASE_STEP`]. Returns the level in force now.
+    #[allow(clippy::similar_names)] // a lever and its level
     pub fn pull(&self, lever: ShedLever, level: u8, lease: Duration) -> u8 {
         let now = self.now_ms();
         let (raise, release) = (self.raise_ms.load(Ordering::Relaxed), self.release());

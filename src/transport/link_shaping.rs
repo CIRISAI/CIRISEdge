@@ -3366,10 +3366,10 @@ mod tests {
         let ttl = t.asked_idle_ttl();
         assert_eq!(ttl, Duration::from_secs(600), "the rule's ten minutes");
 
-        tokio::time::advance(ttl - Duration::from_secs(1)).await;
+        tokio::time::advance(ttl.saturating_sub(Duration::from_secs(1))).await;
         assert!(t.asked_links_idle().is_empty(), "inside the TTL");
         shaper.note_real();
-        tokio::time::advance(ttl - Duration::from_secs(1)).await;
+        tokio::time::advance(ttl.saturating_sub(Duration::from_secs(1))).await;
         assert!(t.asked_links_idle().is_empty(), "a real frame renewed it");
 
         // Cover runs right up to the read, past the TTL and its jitter: a link
@@ -3392,7 +3392,7 @@ mod tests {
         let peer = offer(BudgetClass::Server, 400, 7000, 0.5, 600);
         let _ = t.offer_for_answer(link, 400, Some("asker"), &peer);
         let shaper = t.peer_offer(link, &peer).unwrap().expect("shaped");
-        tokio::time::advance(t.asked_idle_ttl() - Duration::from_secs(1)).await;
+        tokio::time::advance(t.asked_idle_ttl().saturating_sub(Duration::from_secs(1))).await;
         shaper.enqueue(vec![b"row".to_vec()]).expect("queued");
         assert!(matches!(
             shaper.next_emission().await,

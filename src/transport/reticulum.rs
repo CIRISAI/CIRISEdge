@@ -4717,6 +4717,18 @@ impl ReticulumTransport {
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// How long a dial may take to establish.
+    fn establish_budget(&self, has_path: bool) -> Duration {
+        match self
+            .test_establish_budget_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 if has_path => LINK_ESTABLISH_TIMEOUT,
+            0 => NO_PATH_ESTABLISH_TIMEOUT,
+            ms => Duration::from_millis(ms),
+        }
+    }
+
     /// Test seam — a shaped link's agreed frame and bytes/s, `None` unshaped.
     #[doc(hidden)]
     #[must_use]
@@ -9674,18 +9686,7 @@ impl ReticulumTransport {
                 );
             }
         }
-        let establish_timeout = if has_path {
-            LINK_ESTABLISH_TIMEOUT
-        } else {
-            NO_PATH_ESTABLISH_TIMEOUT
-        };
-        let establish_timeout = match self
-            .test_establish_budget_ms
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            0 => establish_timeout,
-            ms => Duration::from_millis(ms),
-        };
+        let establish_timeout = self.establish_budget(has_path);
 
         // ── CIRISEdge#532: REUSE BEFORE DIALING ──────────────────────────────
         // A live, identified link to this dest is a finished handshake. Sending
@@ -13658,6 +13659,58 @@ impl DialCtx {
         );
     }
 
+    /// A dial's refusal, counted and named.
+    fn shaping_refused(
+        &self,
+        peer: &str,
+        link: [u8; 16],
+        e: &crate::transport::link_shaping::ShapingError,
+    ) -> TransportError {
+        use crate::transport::link_shaping::ShapingError;
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_link_shaping(e.label());
+            if matches!(e, ShapingError::HomeElsewhere) {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_HOME_ELSEWHERE_RECEIVED);
+            }
+        }
+        tracing::warn!(
+            peer = %peer,
+            link = %hex::encode(link),
+            reason = e.label(),
+            "link shaping refused on a dial; the link is closed (CC 5.4.3)"
+        );
+        TransportError::LinkSealRefused {
+            peer: peer.to_owned(),
+            reason: e.label(),
+            detail: e.to_string(),
+        }
+    }
+
+    /// Why this node offers nothing on a link it would otherwise offer on.
+    ///
+    /// CC 5.4.3 `CLM-shaped-link-one-hop`: a shaped link is one direct hop.
+    /// Through a forwarder nothing is offered and the link runs sealed and
+    /// unshaped; it is offered when it goes direct
+    /// ([`Self::shape_after_direct`]). The link stays up either way: under
+    /// `require_shaped_links` the proposal rides it, and only rows wait.
+    ///
+    /// `CLM-shaped-link-bound-refuse`: a dialler past its own bound offers
+    /// nothing, so no shaper starts at the other end alone, and both ends read
+    /// the link as unshaped. A shaped-only node offers, and refuses at the
+    /// answer.
+    async fn offer_withheld(&self, link_id: LinkId, peer: &str) -> Option<&'static str> {
+        let dest = self.dialed_link_dest.lock().await.get(&link_id).copied();
+        if link_is_forwarded(&self.node, &link_id, dest)
+            && !self
+                .test_offer_forwarded
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Some(crate::observability::LINK_SHAPING_FORWARDED);
+        }
+        (self.shapers.at_bound_for(Some(peer)) && !self.shapers.refuses_past_bound())
+            .then_some(crate::observability::LINK_SHAPING_PAST_BOUND)
+    }
+
     /// CC 5.4.3 — a dialled link moved onto a punched interface: it is one hop
     /// now, so the first `SHAP` goes out, at the link's MDU. The dialler offers
     /// and the peer answers, as on any dial; the seal's transition window
@@ -13726,35 +13779,16 @@ impl DialCtx {
         {
             return Ok(());
         }
-        // CC 5.4.3 `CLM-shaped-link-one-hop` — a shaped link is one direct hop.
-        // Through a forwarder nothing is offered and the link runs sealed and
-        // unshaped; it is offered when it goes direct
-        // ([`Self::shape_after_direct`]). The link stays up either way: under
-        // `require_shaped_links` the proposal rides it, and only rows wait.
-        let dest = self.dialed_link_dest.lock().await.get(&link_id).copied();
-        if link_is_forwarded(&self.node, &link_id, dest)
-            && !self
-                .test_offer_forwarded
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if let Some(label) = self.offer_withheld(link_id, peer).await {
             if let Some(m) = self.metrics.as_ref() {
-                m.inc_link_shaping(crate::observability::LINK_SHAPING_FORWARDED);
+                m.inc_link_shaping(label);
             }
             tracing::debug!(
                 peer = %peer,
                 link = %hex::encode(link_id.into_bytes()),
-                "no shaping offer: a forwarder carries this link (CC 5.4.3)"
+                reason = label,
+                "no shaping offer on this link (CC 5.4.3)"
             );
-            return Ok(());
-        }
-        // `CLM-shaped-link-bound-refuse` — a dialler past its own bound offers
-        // nothing, so no shaper starts at the other end alone: both ends read
-        // the link as unshaped. A shaped-only node offers, and refuses at the
-        // answer.
-        if self.shapers.at_bound_for(Some(peer)) && !self.shapers.refuses_past_bound() {
-            if let Some(m) = self.metrics.as_ref() {
-                m.inc_link_shaping(crate::observability::LINK_SHAPING_PAST_BOUND);
-            }
             return Ok(());
         }
         let link = link_id.into_bytes();
@@ -13781,25 +13815,6 @@ impl DialCtx {
             m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
             m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED_DIALLED);
         }
-        let refuse = |e: ShapingError| {
-            if let Some(m) = self.metrics.as_ref() {
-                m.inc_link_shaping(e.label());
-                if matches!(e, ShapingError::HomeElsewhere) {
-                    m.inc_link_shaping(crate::observability::LINK_SHAPING_HOME_ELSEWHERE_RECEIVED);
-                }
-            }
-            tracing::warn!(
-                peer = %peer,
-                link = %hex::encode(link),
-                reason = e.label(),
-                "link shaping refused on a dial; the link is closed (CC 5.4.3)"
-            );
-            TransportError::LinkSealRefused {
-                peer: peer.to_owned(),
-                reason: e.label(),
-                detail: e.to_string(),
-            }
-        };
         match tokio::time::timeout(OFFER_ANSWER_BUDGET, answer).await {
             Ok(Ok(Ok(shaped))) => {
                 tracing::debug!(peer = %peer, link = %hex::encode(link), shaped, "shaping offer answered");
@@ -13820,7 +13835,7 @@ impl DialCtx {
                         .insert(peer.to_owned(), std::time::Instant::now());
                     self.queue_homing(peer, link);
                 }
-                let err = refuse(e);
+                let err = self.shaping_refused(peer, link, &e);
                 self.close_refused(link_id).await;
                 Err(err)
             }
@@ -13830,7 +13845,7 @@ impl DialCtx {
             Err(_elapsed) => {
                 self.shapers.offer_unanswered(link);
                 if self.shapers.policy().require_shaped_links {
-                    let err = refuse(ShapingError::UnshapedPeer);
+                    let err = self.shaping_refused(peer, link, &ShapingError::UnshapedPeer);
                     self.close_refused(link_id).await;
                     return Err(err);
                 }

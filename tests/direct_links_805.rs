@@ -732,11 +732,6 @@ async fn proposing_off_never_proposes_and_a_member_behind_t_is_unreachable() {
     assert_eq!(p.a.transport.direct_path_state(&p.b.key.key_id), None);
 }
 
-/// **W1 + W5** — A's A/V dial to a member behind `T` proposes on the identity
-/// link first; both ends move onto a punched interface; the A/V leg then
-/// establishes over it, carries frames, and keeps carrying them with `T`
-/// gone. The moved identity link's Channel limit drops to 1400-MTU size.
-#[allow(clippy::too_many_lines)]
 /// Both ends' row policy, at the server class's rate: everything offers.
 fn shaping_all(strict: bool) -> ciris_edge::transport::link_shaping::ShapingPolicy {
     use ciris_edge::transport::link_shaping::{BudgetClass, ShapingPolicy, ShapingScope};
@@ -1035,6 +1030,11 @@ async fn a_required_shaped_link_proposes_before_it_refuses_and_the_rung_opens() 
     );
 }
 
+/// **W1 + W5** — A's A/V dial to a member behind `T` proposes on the identity
+/// link first; both ends move onto a punched interface; the A/V leg then
+/// establishes over it, carries frames, and keeps carrying them with `T`
+/// gone. The moved identity link's Channel limit drops to 1400-MTU size.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
     // B on the default: accept room peers, asked per request.
