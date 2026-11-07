@@ -786,7 +786,7 @@ async fn a_contacts_round_costs_a_bounded_count_of_store_reads() {
         "one read past the tip a round, and no page of history"
     );
     assert!(
-        reads / ROUNDS <= 110,
+        reads / ROUNDS <= 65,
         "a round's store reads stay a small constant: {} a round",
         reads / ROUNDS
     );
@@ -864,4 +864,119 @@ async fn a_peer_back_from_offline_gets_what_names_it_on_the_first_round() {
             "{what} in the first offer"
         );
     }
+}
+
+/// A pair room with `CONTACT` in it, founded by `moves-founder`, whose record
+/// is on the group plane. Returns its key id.
+async fn room_with_contact(backend: &Arc<SqliteBackend>) -> String {
+    register_fixture_keys(
+        backend,
+        &[
+            ("moves-founder", identity_type::USER),
+            ("moves-member", identity_type::USER),
+        ],
+    )
+    .await;
+    for (owner, node, class) in [
+        ("moves-founder", LOCAL, "laptop"),
+        ("moves-member", CONTACT, "phone"),
+    ] {
+        seed_owner_binding(backend, owner, node).await;
+        seed_device_occurrence(backend, owner, node, class).await;
+    }
+    seed_common_root(backend, &["moves-founder", "moves-member"]).await;
+    let room = fixture_community_founded("moves-room", "moves-founder", "moves-member");
+    backend
+        .put_community(sign_community_fixture("moves-founder", room))
+        .await
+        .expect("the room");
+    "moves-room".to_owned()
+}
+
+/// **A new member's roster moves ahead of history**, by the group's index: on a
+/// store past one page, past the margin, the record is in the first offer. It
+/// is read once, when the peer's groups change.
+#[tokio::test]
+async fn a_new_members_roster_moves_on_the_first_round() {
+    use ciris_persist::federation::attestation_query::AttestationQuery;
+    use ciris_persist::federation::group_plane::GROUP_ROSTER_DIMENSION;
+    let backend = fixture().await;
+    let group = room_with_contact(&backend).await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    history(&backend).await;
+    let roster = AttestationQuery::to(&group, REQUIRED_READ_PAGE)
+        .dimension(GROUP_ROSTER_DIMENSION)
+        .pages()
+        .next(&*backend)
+        .await
+        .expect("read")
+        .and_then(|page| page.into_iter().next())
+        .expect("the record is a row");
+    let (counting, bridge) = counted_bridge(&backend, Duration::from_secs(3_600));
+
+    let hash = hash_of(&backend, &roster.attestation_id).await;
+    assert!(
+        offer(&bridge, CONTACT)
+            .await
+            .iter()
+            .any(|r| r.envelope_hash == hash),
+        "the record leads, with the tip past it and no history page due"
+    );
+    counting.reset();
+    offer(&bridge, CONTACT).await;
+    assert_eq!(
+        counting.count("list_targeted_by_dimension_prefix"),
+        0,
+        "the group read runs when the peer's groups change, not every round"
+    );
+}
+
+/// **A key grant naming the peer is on the required read.** It is a `scores`
+/// row on the `key_grant:` dimensions, attested to its recipient; a member with
+/// no wrap sits in a room it cannot read. The query is checked against persist's
+/// own predicate over the row's shape: storing a wrap needs a real epoch mint,
+/// which the put door refuses from a fixture.
+#[test]
+fn a_key_grant_is_on_the_required_read() {
+    use ciris_persist::federation::key_grant::{KeyGrantAxis, KeyGrantRow};
+    let row = KeyGrantRow {
+        axis: KeyGrantAxis::Epoch {
+            community_key_id: "moves-room".to_owned(),
+            minter_key_id: LOCAL.to_owned(),
+            epoch: 1,
+        },
+        wrap: ciris_persist::federation::blobs::GrantWrap {
+            recipient_key_id: CONTACT.to_owned(),
+            wrapped_dek: "d3JhcA==".to_owned(),
+            wrap_algorithm: "ml-kem-768".to_owned(),
+        },
+    };
+    let mut stored: Attestation = serde_json::from_value(serde_json::json!({
+        "attestation_id": "wrap",
+        "attesting_key_id": LOCAL,
+        "attested_key_id": CONTACT,
+        "attestation_type": "scores",
+        "weight": null,
+        "asserted_at": "2026-05-01T00:00:00Z",
+        "expires_at": null,
+        "attestation_envelope": {},
+        "original_content_hash": "",
+        "scrub_signature_classical": "",
+        "scrub_signature_pqc": null,
+        "scrub_key_id": LOCAL,
+        "scrub_timestamp": "2026-05-01T00:00:00Z",
+        "pqc_completed_at": null,
+        "persist_row_hash": "",
+        "subject_key_ids": [],
+        "withdraws_admission_rule": null,
+        "cohort_scope": "community",
+        "tier": "federation",
+        "promoted_at": null,
+        "additional_scrubs": []
+    }))
+    .expect("the row's columns");
+    stored.attestation_envelope = row.envelope();
+    assert!(FederationDirectoryReplicationBridge::key_grants_to(CONTACT).admits(&stored));
+    stored.attested_key_id = THIRD.to_owned();
+    assert!(!FederationDirectoryReplicationBridge::key_grants_to(CONTACT).admits(&stored));
 }

@@ -10954,7 +10954,6 @@ impl FederationDirectoryReplicationBridge {
         use ciris_persist::federation::attestation_query::AttestationQuery;
         use ciris_persist::federation::consent_grammar::GRANT_DIMENSION;
         use ciris_persist::federation::group_plane as gp;
-        use ciris_persist::federation::key_grant::KEY_GRANT_DIMENSION_PREFIX;
         use ciris_persist::federation::types::attestation_type;
         let peer = key.0.as_str();
         let _permit = self.sweep_gate.enter().await;
@@ -10988,9 +10987,7 @@ impl FederationDirectoryReplicationBridge {
         for p in peer_principals {
             queries.push(AttestationQuery::to(p, REQUIRED_READ_PAGE));
             queries.push(AttestationQuery::to(p, REQUIRED_READ_PAGE).dimension(GRANT_DIMENSION));
-            queries.push(
-                AttestationQuery::to(p, REQUIRED_READ_PAGE).type_prefix(KEY_GRANT_DIMENSION_PREFIX),
-            );
+            queries.push(Self::key_grants_to(p));
             queries.push(
                 AttestationQuery::to(p, REQUIRED_READ_PAGE).dimension_any_of(&[
                     gp::MEMBERSHIP_WIDENING_DIMENSION,
@@ -11049,6 +11046,12 @@ impl FederationDirectoryReplicationBridge {
                 attestation,
             })
             .collect()
+    }
+
+    /// The required read of the wraps attested to `key`.
+    fn key_grants_to(key: &str) -> ciris_persist::federation::attestation_query::AttestationQuery {
+        ciris_persist::federation::attestation_query::AttestationQuery::to(key, REQUIRED_READ_PAGE)
+            .dimension_prefix(ciris_persist::federation::key_grant::KEY_GRANT_DIMENSION_PREFIX)
     }
 
     /// **CC 5.2 — the rows of the groups the peer is in**, read when that set
@@ -17286,6 +17289,31 @@ pub(crate) mod tests {
         subject: &str,
         attestation_type: &str,
         cohort_scope: &str,
+        envelope: serde_json::Value,
+    ) -> Result<(), String> {
+        try_seed_naming(
+            backend,
+            id,
+            attester,
+            subject,
+            &[subject],
+            attestation_type,
+            cohort_scope,
+            envelope,
+        )
+        .await
+    }
+
+    /// [`try_seed_scoped_attestation`] with its `subject_key_ids` stated.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_seed_naming(
+        backend: &SqliteBackend,
+        id: &str,
+        attester: &str,
+        subject: &str,
+        subjects: &[&str],
+        attestation_type: &str,
+        cohort_scope: &str,
         mut envelope: serde_json::Value,
     ) -> Result<(), String> {
         // CIRISPersist#598 (v31.0.0): truncate to MICROSECONDS — postgres TIMESTAMPTZ
@@ -17304,7 +17332,7 @@ pub(crate) mod tests {
             attester,
             attestation_type,
             subject,
-            &[subject],
+            subjects,
             cohort_scope,
         );
         let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attester, &envelope);
@@ -17324,7 +17352,7 @@ pub(crate) mod tests {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            subject_key_ids: vec![subject.to_string()],
+            subject_key_ids: subjects.iter().map(|s| (*s).to_owned()).collect(),
             withdraws_admission_rule: None,
             additional_scrubs: Vec::new(),
             cohort_scope: cohort_scope.to_string(),
