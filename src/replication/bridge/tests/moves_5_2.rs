@@ -17,6 +17,8 @@ const HISTORY: usize = 40;
 const PAGE: u32 = 8;
 /// Rounds that walk all of it, a page a round.
 const WALK_ROUNDS: u32 = 7;
+/// Rounds a store-read count runs over.
+const ROUNDS: usize = 10;
 
 fn page_bridge(backend: &Arc<SqliteBackend>) -> FederationDirectoryReplicationBridge {
     let dir: Arc<dyn FederationDirectory> = backend.clone();
@@ -770,7 +772,6 @@ async fn a_contacts_round_costs_a_bounded_count_of_store_reads() {
         offer(&bridge, CONTACT).await;
     }
     counting.reset();
-    const ROUNDS: usize = 10;
     for _ in 0..ROUNDS {
         offer(&bridge, CONTACT).await;
     }
@@ -785,8 +786,82 @@ async fn a_contacts_round_costs_a_bounded_count_of_store_reads() {
         "one read past the tip a round, and no page of history"
     );
     assert!(
-        reads / ROUNDS <= 60,
+        reads / ROUNDS <= 110,
         "a round's store reads stay a small constant: {} a round",
         reads / ROUNDS
     );
+}
+
+/// **A peer back from a long sleep gets what names it on its first round**, on
+/// a store past one page, past the margin: its invitation, a contact's grant and
+/// that grant's `withdraws`.
+#[tokio::test]
+async fn a_peer_back_from_offline_gets_what_names_it_on_the_first_round() {
+    let backend = fixture().await;
+    register_fixture_keys(&backend, &[("moves-founder", identity_type::USER)]).await;
+    seed_owner_binding(&backend, "moves-founder", LOCAL).await;
+    seed_device_occurrence(&backend, "moves-founder", LOCAL, "laptop").await;
+    seed_common_root(&backend, &["moves-founder", CONTACT, THIRD]).await;
+    let room = crate::chat::pair_community("moves-founder", CONTACT, Utc::now());
+    let group = room.community_key_id.clone();
+    backend
+        .put_community(sign_community_fixture("moves-founder", room))
+        .await
+        .expect("the room");
+    let invitation = crate::membership::propose(
+        &*backend,
+        crate::membership::GroupScope::Community,
+        &group,
+        CONTACT,
+        None,
+        Utc::now() + chrono::Duration::days(1),
+        &fixture_local_signer("moves-founder"),
+    )
+    .await
+    .expect("the invitation");
+    let contacts_grant = uuid::Uuid::new_v4().to_string();
+    let envelope = serde_json::json!({
+        "id": contacts_grant,
+        "attesting_key_id": THIRD,
+        "attested_key_id": CONTACT,
+        "attestation_type": "scores",
+        "dimension": "consent:replication:v1",
+        "payload": { "grants": "transfer", "attestation_prefixes": ["chat:"] },
+    });
+    seed_raw_attestation(
+        &backend,
+        &contacts_grant,
+        THIRD,
+        CONTACT,
+        "scores",
+        envelope,
+    )
+    .await;
+    let withdrawn = uuid::Uuid::new_v4().to_string();
+    let envelope = serde_json::json!({
+        "id": withdrawn,
+        "attesting_key_id": SEAT,
+        "attested_key_id": CONTACT,
+        "attestation_type": "scores",
+        "dimension": "consent:replication:v1",
+        "payload": { "grants": "transfer", "attestation_prefixes": ["chat:"] },
+    });
+    seed_raw_attestation(&backend, &withdrawn, SEAT, CONTACT, "scores", envelope).await;
+    let retraction = composer(&backend, SEAT, SEAT, "withdraws", &withdrawn).await;
+    grant(&backend, CONTACT, &["trace:"]).await;
+    history(&backend).await;
+    let bridge = tip_bridge(&backend);
+
+    let refs = offer(&bridge, CONTACT).await;
+    for (what, id) in [
+        ("invitation", &invitation.attestation_id),
+        ("contact's grant", &contacts_grant),
+        ("another's withdraws", &retraction),
+    ] {
+        let hash = hash_of(&backend, id).await;
+        assert!(
+            refs.iter().any(|r| r.envelope_hash == hash),
+            "{what} in the first offer"
+        );
+    }
 }

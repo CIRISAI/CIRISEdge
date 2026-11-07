@@ -24,8 +24,12 @@
     History is one full page a minute (`history_page_every`), and a plane that fits one page reads as
     before. Every row is still reached: a row older than the margin that no index reads, such as a
     third party's invitation written while the peer was away, waits at most `rows / 1024` minutes.
-    Past its first round a contact costs one plane read a round, whatever the plane's size. A read by
-    subject over `attestation_subjects` would end that wait (a persist ask, not needed for this).
+    Past its first round a contact costs one plane read a round, whatever the plane's size.
+  - **What names the reader moves at any age.** The required read takes grants, key grants and roster
+    events on their own pages, so a flood of rows naming a peer cannot push them off, reads a grant's
+    `withdraws` through the grant, and reads the record and roster events of each group the peer is in
+    when that set changes. The one row it cannot reach is a third party's `membership:proposal:v1`
+    older than the margin, which waits for the history read until persist has a read by subject.
   - **The 480 reads were mostly a scan.** `membership::pending_proposals_for` walks the plane, and a
     host polling a pair room called it about 1.6 times a second. `chat::pair_proposal_for` now reads
     the room's index through `membership::pending_proposal_in`. The inbox still scans: nothing

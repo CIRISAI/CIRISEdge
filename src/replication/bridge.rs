@@ -1424,6 +1424,8 @@ struct PlaneWatermark {
     rollback: Option<ListedFrom>,
     /// How many lost rounds in a row have been put back.
     lost_rounds: u8,
+    /// The groups this peer was last read for ([`SweepCursors::groups_changed`]).
+    groups: BTreeSet<String>,
     /// When a peer that gets no walk may read its next page of history
     /// ([`SweepCursors::history_due`]).
     history_at: Option<Instant>,
@@ -1795,6 +1797,16 @@ impl SweepCursors {
         true
     }
 
+    /// `groups` is the set of groups the peer is in now: is it new here?
+    fn groups_changed(&mut self, key: &(String, EnvelopeKind), groups: &BTreeSet<String>) -> bool {
+        let wm = self.touch(key);
+        if wm.groups == *groups {
+            return false;
+        }
+        wm.groups.clone_from(groups);
+        true
+    }
+
     /// May a peer with no walk read a page of history now?
     fn history_due(&mut self, key: &(String, EnvelopeKind), now: Instant) -> bool {
         !self.touch(key).history_at.is_some_and(|at| now < at)
@@ -1951,6 +1963,9 @@ enum UnaskedOffer {
 /// CC 5.2 — the page of each required read. Rows past it are the walk's.
 const REQUIRED_READ_PAGE: std::num::NonZeroU32 =
     ciris_persist::federation::attestation_query::page_size(64);
+
+/// CC 5.2 — how many of a peer's groups the required read covers.
+const REQUIRED_GROUPS: usize = 32;
 
 /// CC 5.2 — the `seq` of a required row. The outgoing push goes oldest `seq`
 /// first, and what is required moves before any walk.
@@ -10274,7 +10289,7 @@ impl FederationDirectoryReplicationBridge {
         let mut listed = 0;
         let mut counts = PageCounts::default();
         if ctx.moves != UnaskedOffer::Commons {
-            let required = self.required_rows(&key.0, &ctx.peer_principals).await;
+            let required = self.required_rows(&key, &ctx.peer_principals).await;
             if let Ok(required) = self
                 .offer_rows(
                     required, None, &mut ctx, peer_label, None, &mut refs, &mut seen,
@@ -10933,11 +10948,15 @@ impl FederationDirectoryReplicationBridge {
     /// what is past it is the walk's. A failed read is the walk's as well.
     async fn required_rows(
         &self,
-        peer: &str,
+        key: &(String, EnvelopeKind),
         peer_principals: &HashSet<String>,
     ) -> Vec<ciris_persist::federation::ServedAttestation> {
         use ciris_persist::federation::attestation_query::AttestationQuery;
+        use ciris_persist::federation::consent_grammar::GRANT_DIMENSION;
+        use ciris_persist::federation::group_plane as gp;
+        use ciris_persist::federation::key_grant::KEY_GRANT_DIMENSION_PREFIX;
         use ciris_persist::federation::types::attestation_type;
+        let peer = key.0.as_str();
         let _permit = self.sweep_gate.enter().await;
         let mut rows: Vec<Attestation> = Vec::new();
         let mut local: Vec<String> = Vec::new();
@@ -10962,10 +10981,24 @@ impl FederationDirectoryReplicationBridge {
                 Err(e) => tracing::debug!(peer, error = %e, "required read: grants not served"),
             }
         }
-        let mut queries: Vec<AttestationQuery> = peer_principals
-            .iter()
-            .map(|p| AttestationQuery::to(p, REQUIRED_READ_PAGE))
-            .collect();
+        // What names the reader, whatever its age, each kind on its own page so
+        // that a flood of rows naming the peer cannot push a grant off the
+        // general one.
+        let mut queries: Vec<AttestationQuery> = Vec::new();
+        for p in peer_principals {
+            queries.push(AttestationQuery::to(p, REQUIRED_READ_PAGE));
+            queries.push(AttestationQuery::to(p, REQUIRED_READ_PAGE).dimension(GRANT_DIMENSION));
+            queries.push(
+                AttestationQuery::to(p, REQUIRED_READ_PAGE).type_prefix(KEY_GRANT_DIMENSION_PREFIX),
+            );
+            queries.push(
+                AttestationQuery::to(p, REQUIRED_READ_PAGE).dimension_any_of(&[
+                    gp::MEMBERSHIP_WIDENING_DIMENSION,
+                    gp::MEMBERSHIP_REMOVAL_DIMENSION,
+                    gp::MEMBERSHIP_RESIGNATION_DIMENSION,
+                ]),
+            );
+        }
         queries.push(AttestationQuery::by(peer, REQUIRED_READ_PAGE));
         queries.extend(local.iter().map(|key| {
             AttestationQuery::by(key, REQUIRED_READ_PAGE).types(&[attestation_type::DELEGATES_TO])
@@ -10988,6 +11021,25 @@ impl FederationDirectoryReplicationBridge {
                 Err(e) => tracing::debug!(peer, error = %e, "required read: page not served"),
             }
         }
+        // A grant's `withdraws` is attested to its grantor: it is read through
+        // the grant it retires.
+        let grants: Vec<String> = rows
+            .iter()
+            .filter(|r| {
+                ciris_persist::federation::admission::envelope_dimension(&r.attestation_envelope)
+                    == Some(GRANT_DIMENSION)
+            })
+            .map(|r| r.attestation_id.clone())
+            .collect();
+        match self
+            .directory
+            .list_composers_referencing_any(&grants, None, None)
+            .await
+        {
+            Ok(composers) => rows.extend(composers),
+            Err(e) => tracing::debug!(peer, error = %e, "required read: composers not served"),
+        }
+        rows.extend(self.required_group_rows(key, peer_principals).await);
         self.record_page(rows.len());
         let mut seen = HashSet::new();
         rows.retain(|r| seen.insert(r.attestation_id.clone()));
@@ -10997,6 +11049,63 @@ impl FederationDirectoryReplicationBridge {
                 attestation,
             })
             .collect()
+    }
+
+    /// **CC 5.2 — the rows of the groups the peer is in**, read when that set
+    /// changes and not every round: a new member's record and roster events,
+    /// by each group's own index. Without them it sits in an empty room. A group
+    /// past [`REQUIRED_GROUPS`] is history's.
+    async fn required_group_rows(
+        &self,
+        key: &(String, EnvelopeKind),
+        peer_principals: &HashSet<String>,
+    ) -> Vec<Attestation> {
+        use ciris_persist::federation::attestation_query::AttestationQuery;
+        use ciris_persist::federation::group_plane as gp;
+        use ciris_persist::federation::types::cohort_scope;
+        let mut groups = BTreeSet::new();
+        for p in peer_principals {
+            let read = tokio::join!(
+                self.directory.active_community_key_ids_for(p),
+                self.directory.active_family_key_ids_for(p)
+            );
+            groups.extend(read.0.unwrap_or_default());
+            groups.extend(read.1.unwrap_or_default());
+        }
+        let changed = self
+            .sweep_cursors
+            .lock()
+            .is_ok_and(|mut c| c.groups_changed(key, &groups));
+        if !changed {
+            return Vec::new();
+        }
+        let mut rows = Vec::new();
+        for group in groups.iter().take(REQUIRED_GROUPS) {
+            if let Ok(Some(page)) = AttestationQuery::to(group, REQUIRED_READ_PAGE)
+                .dimension(gp::GROUP_ROSTER_DIMENSION)
+                .pages()
+                .next(&*self.directory)
+                .await
+            {
+                rows.extend(page);
+            }
+            if let Ok(page) = self
+                .directory
+                .list_targeted_by_dimension_prefix(
+                    &[
+                        cohort_scope::FAMILY,
+                        cohort_scope::COMMUNITY,
+                        cohort_scope::AFFILIATIONS,
+                    ],
+                    group,
+                    "membership:",
+                )
+                .await
+            {
+                rows.extend(page.into_iter().take(REQUIRED_READ_PAGE.get() as usize));
+            }
+        }
+        rows
     }
 
     /// **CC 5.2 — does this row move to `peer` without being asked?** It has
