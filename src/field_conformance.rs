@@ -553,6 +553,17 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
     TestEvidence {
         cc: "5.2",
         clm: "CLM-moves-requested-required-appropriate",
+        property: "a third party's invitation naming the reader moves on the first round at any age, read by subject newest-first within a round budget",
+        impl_anchor: "src/replication/bridge.rs#invitations_naming",
+        witness: &[
+            "src/replication/bridge/tests/moves_5_2.rs#a_row_written_before_the_peer_connects_arrives",
+            "src/replication/bridge/tests/moves_5_2.rs#a_contacts_round_costs_a_bounded_count_of_store_reads",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.2",
+        clm: "CLM-moves-requested-required-appropriate",
         property: "anti-entropy over the commons needs both ends on the active roster, and a person's own nodes are not contacts",
         impl_anchor: "src/replication/bridge.rs#unasked_offer",
         witness: &[
