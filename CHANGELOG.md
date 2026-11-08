@@ -35,6 +35,12 @@ stream key bindings, ALM and the roll all read that set. A node whose owner is n
 acts for an attendee it is not bound to, is refused; removing a person ends their nodes' part at the
 next epoch. Rooms whose leaves are nodes work as before.
 
+A call's addresses no longer equal its room's. They were derived from the room's own destination
+secret for the same members at the same epoch, so a node that had installed the room's addresses
+refused the call as `address collision … reused exporter_secret?`. A call now derives them from
+`call_destination_secret` (HKDF over the room's destination secret with `ciris-edge:call-destination:v1`
+and the call's group id). Every member of a call must run this release: a call address changed.
+
 
 What moves to a peer (CC 5.2): a row moves when it is requested, or required, and appropriate, never
 because it is federation-tier. Two serve seats keep the commons walk; every other peer starts with
