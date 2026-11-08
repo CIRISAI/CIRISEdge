@@ -24,6 +24,14 @@
 //! - **A2** (`joining_is_membership_by_name`): a key outside the room's group
 //!   is `NotARoomMember`; one in the group with no active roster membership
 //!   is `ConsentMissing`.
+//! - **44.1 person leaves** (`a_room_of_person_leaves_is_called_through_their_nodes`,
+//!   `a_removed_person_s_node_hears_nothing_after_the_roll`): the room's MLS
+//!   leaves are PERSONS (the server mints room keys as the owner) and each
+//!   node acts for its owner by persist's owner binding. Both nodes join,
+//!   publish and hear each other; a node whose owner is not a leaf, or that
+//!   names an owner it is not bound to, is refused; a node that lies about
+//!   its owner to itself is refused by every other member; removing a person
+//!   ends their node's part at the next epoch.
 //!
 //! Requires `transport-reticulum`:
 //! `cargo test --features "transport-http transport-reticulum" --test av_call_805`
@@ -39,11 +47,12 @@ use std::time::Duration;
 use ciris_edge::identity::{sign_bound_hybrid, LocalSigner};
 use ciris_edge::mls::cohort_group::mint_cohort_key_material;
 use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
+use ciris_edge::replication::attestation_bind::{bind_attestation_envelope, AttestationColumns};
 use ciris_edge::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
 use ciris_edge::transport::av_call::{
-    Call, CallAttendance, CallDeps, CallError, CallEvent, CallOptions, CallRecord, CallState,
-    Frame, LegOutcome, ReceivedFrame, RoomRoster,
+    Call, CallAttendance, CallDeps, CallError, CallEvent, CallOptions, CallOwners, CallRecord,
+    CallState, Frame, LegOutcome, ReceivedFrame, RoomRoster,
 };
 use ciris_edge::transport::av_call_key::CallId;
 use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
@@ -59,7 +68,7 @@ use ciris_edge::verify::RootingDirectory;
 use ciris_edge::EdgeMetrics;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::encrypted_kv::XChaChaKvStore;
-use ciris_persist::federation::{BlobError, FederationDirectory};
+use ciris_persist::federation::{Attestation, BlobError, FederationDirectory, SignedAttestation};
 use ciris_persist::store::sqlite::SqliteBackend;
 use common::directory_with;
 use sha2::Digest as _;
@@ -136,13 +145,16 @@ impl Ident {
         Arc::new(LocalSigner::new(self.key_id.clone(), classical, Some(pqc)))
     }
     async fn record(&self) -> ciris_persist::federation::KeyRecord {
+        self.record_as("node").await
+    }
+    async fn record_as(&self, identity_type: &str) -> ciris_persist::federation::KeyRecord {
         let ed_b64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &self.ed_pub);
         let mut envelope = serde_json::json!({});
         ciris_persist::federation::admission::bind_subject_into_envelope(
             &mut envelope,
             &self.key_id,
-            "node",
+            identity_type,
             &ed_b64,
             Some(&self.pqc_pub_b64),
             None,
@@ -162,7 +174,7 @@ impl Ident {
             pubkey_ed25519_base64: ed_b64,
             pubkey_ml_dsa_65_base64: Some(self.pqc_pub_b64.clone()),
             algorithm: "hybrid".to_string(),
-            identity_type: "node".to_string(),
+            identity_type: identity_type.to_string(),
             identity_ref: self.key_id.clone(),
             valid_from: now,
             valid_until: None,
@@ -181,6 +193,63 @@ impl Ident {
             consent_role: None,
             additional_scrubs: Vec::new(),
         }
+    }
+}
+
+/// The owner binding `delegates_to(owner → node)` as
+/// `attestation_bind::owner_binding_attestation` mints it (a federation-tier
+/// row, signed by the owner): what persist's `owner_of(node)` answers from.
+async fn owner_binding(owner: &Ident, node: &str) -> Attestation {
+    let asserted_at = ciris_edge::replication::attestation_bind::truncate_to_substrate_resolution(
+        chrono::Utc::now(),
+    );
+    let attestation_id = format!("owner-binding-{node}");
+    let subjects = vec![node.to_owned()];
+    let mut envelope =
+        ciris_persist::federation::self_at_login::owner_binding_delegates_to_envelope(
+            node,
+            &["infra:network_presence".to_string()],
+        );
+    bind_attestation_envelope(
+        &mut envelope,
+        asserted_at,
+        &AttestationColumns {
+            attestation_id: &attestation_id,
+            attesting_key_id: &owner.key_id,
+            attestation_type: "delegates_to",
+            attested_key_id: node,
+            subject_key_ids: &subjects,
+            cohort_scope: "federation",
+            weight: None,
+        },
+    );
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
+    let digest = sha2::Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) = sign_bound_hybrid(&owner.signer(), &canonical, "owner binding")
+        .await
+        .expect("hybrid sign");
+    Attestation {
+        attestation_id,
+        attesting_key_id: owner.key_id.clone(),
+        attested_key_id: node.to_owned(),
+        attestation_type: "delegates_to".to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: owner.key_id.clone(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: "federation".to_owned(),
+        tier: "federation".to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
     }
 }
 
@@ -327,16 +396,61 @@ async fn mesh(tag: &str, n: usize) -> (Vec<Node>, Vec<CohortGroup>, tempfile::Te
     mesh_with(tag, n, false).await
 }
 
+/// How a room's MLS leaves are minted.
+#[derive(Clone, Copy)]
+enum Leaves {
+    /// Every node is its own leaf (edge mints room keys as the node).
+    Nodes,
+    /// Every node has an owner (a person, bound by a signed owner binding in
+    /// every node's directory) and the first `n` OWNERS are the room's leaves
+    /// (the server mints room keys as the person): node `i < n` holds its
+    /// owner's leaf; the others hold none.
+    Persons(usize),
+}
+
+/// [`mesh`], with the room's leaves minted as `leaves` says. Returns the
+/// leaf key ids (node `i`'s leaf at `i`) and, under [`Leaves::Persons`],
+/// every node's owner.
+async fn mesh_leaves(
+    tag: &str,
+    n: usize,
+    leaves: Leaves,
+) -> (
+    Vec<Node>,
+    Vec<CohortGroup>,
+    Vec<String>,
+    Vec<Ident>,
+    tempfile::TempDir,
+) {
+    mesh_inner(tag, n, false, leaves).await
+}
+
 /// [`mesh`]. With `late`, node 0 stops announcing before the last node exists,
 /// and the last node connects only to node 1, which forwards. A direct
 /// neighbour would hear node 0 anyway (leviculum re-announces on interface-up),
 /// so behind the hop it has heard nothing and holds only the signed route.
-#[allow(clippy::too_many_lines)] // the mesh, the routes, the room, in one sequence
 async fn mesh_with(
     tag: &str,
     n: usize,
     late: bool,
 ) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
+    let (nodes, groups, _, _, tmp) = mesh_inner(tag, n, late, Leaves::Nodes).await;
+    (nodes, groups, tmp)
+}
+
+#[allow(clippy::too_many_lines)] // the mesh, the routes, the room, in one sequence
+async fn mesh_inner(
+    tag: &str,
+    n: usize,
+    late: bool,
+    leaves: Leaves,
+) -> (
+    Vec<Node>,
+    Vec<CohortGroup>,
+    Vec<String>,
+    Vec<Ident>,
+    tempfile::TempDir,
+) {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut keys = Vec::new();
@@ -353,9 +467,32 @@ async fn mesh_with(
     for k in &keys {
         records.push(k.record().await);
     }
+    let mut owners: Vec<Ident> = Vec::new();
+    let mut bindings = Vec::new();
+    if let Leaves::Persons(_) = leaves {
+        for (i, k) in keys.iter().enumerate() {
+            let owner = Ident::new(
+                &format!("person-{i}-call-{tag}"),
+                sha2::Sha256::digest(tag.as_bytes())[1]
+                    .wrapping_add(0x80)
+                    .wrapping_add(u8::try_from(i).unwrap()),
+            )
+            .await;
+            records.push(owner.record_as("user").await);
+            bindings.push(owner_binding(&owner, &k.key_id).await);
+            owners.push(owner);
+        }
+    }
     let mut nodes: Vec<Node> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
         let dir = directory_with(records.clone()).await;
+        for b in &bindings {
+            dir.put_attestation(SignedAttestation {
+                attestation: b.clone(),
+            })
+            .await
+            .expect("the owner binding");
+        }
         let mut peers: Vec<u16> = nodes.iter().map(|n| n.port).collect();
         if late && i == n - 1 {
             nodes[0].transport.set_unannounced_for_test(true);
@@ -415,15 +552,19 @@ async fn mesh_with(
 
     // The room: node 0 founds it and adds the others, each applying the
     // commits that came before its own Add.
+    let leaf_ids: Vec<String> = match leaves {
+        Leaves::Nodes => nodes.iter().map(|nd| nd.key.key_id.clone()).collect(),
+        Leaves::Persons(k) => owners.iter().take(k).map(|o| o.key_id.clone()).collect(),
+    };
     let room = format!("room-call-{tag}");
-    let first = CohortGroup::create(store(&format!("{tag}-0")), &room, &nodes[0].key.key_id, 16)
+    let first = CohortGroup::create(store(&format!("{tag}-0")), &room, &leaf_ids[0], 16)
         .await
         .expect("found the room");
     let mut groups = vec![first];
-    for (i, nd) in nodes.iter().enumerate().skip(1) {
-        let (material, kp) = mint_cohort_key_material(&nd.key.key_id).expect("key material");
+    for (i, leaf) in leaf_ids.iter().enumerate().skip(1) {
+        let (material, kp) = mint_cohort_key_material(leaf).expect("key material");
         let add = groups[0]
-            .add_member(&nd.key.key_id, kp)
+            .add_member(leaf, kp)
             .await
             .expect("add the member");
         for g in groups.iter().skip(1) {
@@ -443,7 +584,7 @@ async fn mesh_with(
         .expect("join from the Welcome");
         groups.push(joined);
     }
-    (nodes, groups, tmp)
+    (nodes, groups, leaf_ids, owners, tmp)
 }
 
 fn room_of(tag: &str) -> String {
@@ -468,12 +609,38 @@ async fn join_recorded(
     registrar: Arc<dyn StreamDekRegistrar>,
     record: Option<Arc<dyn CallRecord>>,
 ) -> Result<Call, CallError> {
+    join_with(
+        node,
+        group,
+        tag,
+        opts,
+        registrar,
+        record,
+        Arc::new(Roster(true)),
+        Arc::clone(&node.dir) as Arc<dyn CallOwners>,
+    )
+    .await
+}
+
+/// [`join_recorded`] with a chosen roster and owner-binding door.
+#[allow(clippy::too_many_arguments)]
+async fn join_with(
+    node: &Node,
+    group: &CohortGroup,
+    tag: &str,
+    opts: CallOptions,
+    registrar: Arc<dyn StreamDekRegistrar>,
+    record: Option<Arc<dyn CallRecord>>,
+    roster: Arc<dyn RoomRoster>,
+    owners: Arc<dyn CallOwners>,
+) -> Result<Call, CallError> {
     Call::join(
         &room_of(tag),
         &node.key.key_id,
         CallDeps {
             room_group: group.clone(),
-            roster: Arc::new(Roster(true)),
+            roster,
+            owners,
             transport: Arc::clone(&node.transport),
             lifecycle: Arc::clone(&node.lifecycle),
             registrar,
@@ -816,7 +983,7 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
     // Calls it may place before a host that keeps losing media fails it.
     let mut whole = false;
     for tag in ["a3", "a3b", "a3c", "a3d"] {
-        whole = removed_member_call(tag).await;
+        whole = removed_member_call(tag, Leaves::Nodes).await;
         if whole {
             break;
         }
@@ -827,8 +994,8 @@ async fn a_removed_member_hears_nothing_after_the_roll() {
 /// One call of the witness above: whether it ran whole. Media lost with
 /// something counting it is `false`; lost with nothing counting it panics.
 #[allow(clippy::too_many_lines)]
-async fn removed_member_call(tag: &str) -> bool {
-    let (nodes, groups, _tmp) = mesh(tag, 3).await;
+async fn removed_member_call(tag: &str, leaves: Leaves) -> bool {
+    let (nodes, groups, leaf_ids, _owners, _tmp) = mesh_leaves(tag, 3, leaves).await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
     let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
     let mut call_a = join(a, &groups[0], tag, CallOptions::default(), none())
@@ -865,8 +1032,9 @@ async fn removed_member_call(tag: &str) -> bool {
     let pre_epoch = call_a.epoch().await;
 
     // The room removes C (A commits, B applies; C's state is left behind).
+    // Under person leaves it is C's OWNER the room removes.
     let rm = groups[0]
-        .remove_member(&c.key.key_id)
+        .remove_member(&leaf_ids[2])
         .await
         .expect("remove C");
     let _ = groups[1]
@@ -1238,6 +1406,257 @@ async fn budget_keep_refused_and_no_key_door() {
     );
 }
 
+/// **44.1 (W4)** — the room's leaves are persons; the room removes C's OWNER:
+/// A's stream rolls, B hears the post-roll chunks, C's node hears none and A
+/// closes its leg to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_removed_person_s_node_hears_nothing_after_the_roll() {
+    let _call = one_call().await;
+    let mut whole = false;
+    for tag in ["pa3", "pa3b", "pa3c", "pa3d"] {
+        whole = removed_member_call(tag, Leaves::Persons(3)).await;
+        if whole {
+            break;
+        }
+    }
+    assert!(whole, "every call lost media");
+}
+
+/// A roster that holds exactly `0` active (the room's persons).
+struct RosterOf(Vec<String>);
+
+#[async_trait::async_trait]
+impl RoomRoster for RosterOf {
+    async fn is_active_member(&self, _room: &str, key_id: &str) -> Result<bool, String> {
+        Ok(self.0.iter().any(|k| k == key_id))
+    }
+}
+
+/// An owner door that tells one node a lie about itself: `node` is owned by
+/// `claimed`. Every other answer is the directory's.
+struct LyingOwners {
+    dir: Arc<SqliteBackend>,
+    node: String,
+    claimed: String,
+}
+
+#[async_trait::async_trait]
+impl CallOwners for LyingOwners {
+    async fn owner_of(&self, node: &str) -> Option<String> {
+        if node == self.node {
+            return Some(self.claimed.clone());
+        }
+        CallOwners::owner_of(&*self.dir, node).await
+    }
+    async fn nodes_owned_by(&self, person: &str) -> Result<Vec<String>, String> {
+        let mut nodes = CallOwners::nodes_owned_by(&*self.dir, person).await?;
+        if person == self.claimed {
+            nodes.push(self.node.clone());
+        }
+        Ok(nodes)
+    }
+}
+
+/// **44.1 (W1–W3)** — a room whose MLS leaves are PERSONS (the server mints
+/// room keys as the owner), called through their nodes by persist's owner
+/// binding. A and B (owners P0, P1: the leaves) join, publish and hear each
+/// other; the roster is asked about the persons. C's owner P2 is no leaf: C
+/// is refused (W2); C naming P0 as the attendee it acts for is refused (W3);
+/// and a C that believes P0 owns it joins on its own say-so, yet A and B
+/// never take its link, its binding or its stream (W3, the receiving side).
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_room_of_person_leaves_is_called_through_their_nodes() {
+    let _call = one_call().await;
+    let tag = "pl";
+    let (nodes, groups, leaf_ids, owners, _tmp) = mesh_leaves(tag, 3, Leaves::Persons(2)).await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    assert_eq!(
+        leaf_ids,
+        vec![owners[0].key_id.clone(), owners[1].key_id.clone()],
+        "the leaves are the persons"
+    );
+    for nd in [a, b] {
+        assert!(
+            !groups[0].member_key_ids().await.contains(&nd.key.key_id),
+            "no node is a leaf"
+        );
+    }
+    let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
+    let persons = || Arc::new(RosterOf(leaf_ids.clone())) as Arc<dyn RoomRoster>;
+    let dir_of = |nd: &Node| Arc::clone(&nd.dir) as Arc<dyn CallOwners>;
+
+    // W2 — C's owner P2 is not in the room's group.
+    match join_with(
+        c,
+        &groups[0],
+        tag,
+        CallOptions::default(),
+        none(),
+        None,
+        persons(),
+        dir_of(c),
+    )
+    .await
+    {
+        Err(CallError::NotARoomMember { key_id, .. }) => assert_eq!(key_id, c.key.key_id),
+        other => panic!("a node whose owner is no leaf is refused: {other:?}"),
+    }
+    // W3 — C names P0 (a leaf) as the attendee it acts for: no binding says
+    // so, and C is no member through any leaf.
+    match join_with(
+        c,
+        &groups[0],
+        tag,
+        CallOptions::default(),
+        none(),
+        Some(Arc::new(RefusingRecord(owners[0].key_id.clone())) as Arc<dyn CallRecord>),
+        persons(),
+        dir_of(c),
+    )
+    .await
+    {
+        Err(CallError::NotARoomMember { key_id, .. }) => assert_eq!(key_id, c.key.key_id),
+        other => panic!("a node acting for an owner it is not bound to is refused: {other:?}"),
+    }
+    // W3 — B (a member through P1) names P0 as the attendee it acts for.
+    match join_with(
+        b,
+        &groups[1],
+        tag,
+        CallOptions::default(),
+        none(),
+        Some(Arc::new(RefusingRecord(owners[0].key_id.clone())) as Arc<dyn CallRecord>),
+        persons(),
+        dir_of(b),
+    )
+    .await
+    {
+        Err(CallError::NotARoomMember { key_id, .. }) => assert_eq!(key_id, owners[0].key_id),
+        other => panic!("a node acting for another member's person is refused: {other:?}"),
+    }
+
+    // W1 — A and B, each acting for its owner (attending as the node, and as
+    // the person), the roster asked about the persons only.
+    let mut call_a = join_with(
+        a,
+        &groups[0],
+        tag,
+        CallOptions::default(),
+        none(),
+        None,
+        persons(),
+        dir_of(a),
+    )
+    .await
+    .expect("A joins for P0");
+    let mut call_b = join_with(
+        b,
+        &groups[1],
+        tag,
+        CallOptions::default(),
+        none(),
+        Some(Arc::new(RefusingRecord(owners[1].key_id.clone())) as Arc<dyn CallRecord>),
+        persons(),
+        dir_of(b),
+    )
+    .await
+    .expect("B joins as P1");
+    wait_legs(&call_a, 1).await;
+    wait_legs(&call_b, 1).await;
+    wait_bound(&call_a, 1).await;
+    wait_bound(&call_b, 1).await;
+    assert_eq!(
+        call_a.legs(),
+        vec![b.key.key_id.clone()],
+        "A dials B's node"
+    );
+    assert_eq!(
+        call_b.legs(),
+        vec![a.key.key_id.clone()],
+        "B dials A's node"
+    );
+
+    // W3, receiving side — C tells itself P0 owns it, and so joins.
+    let mut call_c = join_with(
+        c,
+        &groups[0],
+        tag,
+        CallOptions::default(),
+        none(),
+        None,
+        persons(),
+        Arc::new(LyingOwners {
+            dir: Arc::clone(&c.dir),
+            node: c.key.key_id.clone(),
+            claimed: owners[0].key_id.clone(),
+        }),
+    )
+    .await
+    .expect("C joins on its own say-so");
+
+    let mut frames_a = call_a.frames().expect("A's frames");
+    let mut frames_b = call_b.frames().expect("B's frames");
+    for s in 0..10u64 {
+        call_a
+            .publish(Frame::opaque(body("a", s)))
+            .await
+            .expect("A publishes");
+        call_b
+            .publish(Frame::opaque(body("b", s)))
+            .await
+            .expect("B publishes");
+        // C has no leg to publish on (no member took its link): it may be
+        // refused outright, and must never be heard.
+        let _ = call_c.publish(Frame::opaque(body("c", s))).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let (mut seen_a, mut seen_b) = (Vec::new(), Vec::new());
+    assert!(
+        collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 10).await,
+        "B hears A's node: {:?}",
+        b.metrics.av_plane()
+    );
+    assert!(
+        collect_from(&mut frames_a, &mut seen_a, &b.key.key_id, 10).await,
+        "A hears B's node: {:?}",
+        a.metrics.av_plane()
+    );
+    for (seen, from, who) in [(&seen_b, &a.key.key_id, "a"), (&seen_a, &b.key.key_id, "b")] {
+        let got: Vec<&ReceivedFrame> = seen.iter().filter(|f| f.publisher == *from).collect();
+        assert_eq!(
+            got.iter().map(|f| f.chunk_seq.0).collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+        for f in got {
+            assert_eq!(f.bytes, body(who, f.chunk_seq.0), "byte-identical");
+        }
+    }
+    // C's dials had time; nothing of C's was taken.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    while let Ok(f) = frames_a.try_recv() {
+        seen_a.push(f);
+    }
+    while let Ok(f) = frames_b.try_recv() {
+        seen_b.push(f);
+    }
+    for (seen, call) in [(&seen_a, &call_a), (&seen_b, &call_b)] {
+        assert!(
+            seen.iter().all(|f| f.publisher != c.key.key_id),
+            "a node not bound to a leaf was heard"
+        );
+        assert!(!call.legs().contains(&c.key.key_id), "a leg to C");
+        assert_eq!(
+            call.chunk_auth_counts().bindings_installed,
+            1,
+            "only the other member's binding: {:?}",
+            call.chunk_auth_counts()
+        );
+    }
+    assert_eq!(call_a.state(), CallState::Live);
+    assert_eq!(call_b.state(), CallState::Live);
+}
+
 /// **A2** — joining is membership, refused by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn joining_is_membership_by_name() {
@@ -1250,6 +1669,7 @@ async fn joining_is_membership_by_name() {
     let deps = |group: &CohortGroup, active: bool| CallDeps {
         room_group: group.clone(),
         roster: Arc::new(Roster(active)),
+        owners: Arc::clone(&x.dir) as Arc<dyn CallOwners>,
         transport: Arc::clone(&x.transport),
         lifecycle: Arc::clone(&x.lifecycle),
         registrar: Arc::new(CountingRegistrar::default()),

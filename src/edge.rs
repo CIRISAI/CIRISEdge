@@ -4774,6 +4774,10 @@ impl Edge {
             &own,
             CallDeps {
                 room_group,
+                // 44.1 — a room whose leaves are persons (the server mints
+                // room keys as the owner) is called through their nodes, by
+                // persist's owner binding.
+                owners: Arc::new(DirectoryOwners(Arc::clone(&directory))),
                 roster: Arc::new(DirectoryRoster(directory)),
                 transport,
                 lifecycle,
@@ -12429,6 +12433,22 @@ impl crate::transport::av_call::RoomRoster for DirectoryRoster {
         ciris_persist::federation::is_active_community_member(self.0.as_ref(), room, key_id)
             .await
             .map_err(|e| e.to_string())
+    }
+}
+
+/// The call's owner bindings over the node's federation directory (44.1).
+#[cfg(feature = "_reticulum-module")]
+struct DirectoryOwners(Arc<dyn ciris_persist::federation::FederationDirectory>);
+
+#[cfg(feature = "_reticulum-module")]
+#[async_trait::async_trait]
+impl crate::transport::av_call::CallOwners for DirectoryOwners {
+    async fn owner_of(&self, node: &str) -> Option<String> {
+        crate::transport::av_call::CallOwners::owner_of(self.0.as_ref(), node).await
+    }
+
+    async fn nodes_owned_by(&self, person: &str) -> Result<Vec<String>, String> {
+        crate::transport::av_call::CallOwners::nodes_owned_by(self.0.as_ref(), person).await
     }
 }
 

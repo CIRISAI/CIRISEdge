@@ -459,6 +459,7 @@ async fn join(side: &Side, group: &CohortGroup, room: &str) -> Result<Call, Call
         CallDeps {
             room_group: group.clone(),
             roster: Arc::new(Roster),
+            owners: Arc::clone(&side.dir) as Arc<dyn ciris_edge::transport::av_call::CallOwners>,
             transport: Arc::clone(&side.transport),
             lifecycle: Arc::clone(&side.lifecycle),
             registrar: Arc::new(UnwiredRegistrar) as Arc<dyn StreamDekRegistrar>,
