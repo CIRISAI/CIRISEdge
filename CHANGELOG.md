@@ -13,6 +13,10 @@ like the other onion refusals; no held tag is evicted, and a replay of a held ta
 `accept_inbound` only on a link that keyed behind `ReceiverOrder::admit`, and `accept_inbound`'s
 `link_shaped` is documented as the transport's own shaping state.
 
+A node that turned on the Anonymous Tier no longer offers relay (CC 5.4.6 rc17,
+`CLM-referred-peer-is-proxy`): `relay_offering` is false while `OnionPolicy::enabled` holds, so it
+reports no free shaped slots and is never referred as a proxy. It still relays onion packets.
+
 ## 44.1.0 — 2026-11-07
 
 What moves to a peer (CC 5.2): a row moves when it is requested, or required, and appropriate, never

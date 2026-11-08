@@ -516,6 +516,7 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
         witness: &[
             "tests/link_shaping_e1.rs#a_refused_peer_homes_on_a_referral_and_its_contact_completes_there",
             "tests/link_shaping_e1.rs#a_node_with_its_relay_offering_off_is_never_referred",
+            "tests/link_shaping_e1.rs#an_onion_enabled_node_reports_no_capacity_and_is_never_referred",
             "tests/link_shaping_e1.rs#an_owned_node_that_has_not_announced_is_never_referred",
             "src/transport/link_shaping.rs#ten_refused_peers_spread_across_the_referrals",
         ],

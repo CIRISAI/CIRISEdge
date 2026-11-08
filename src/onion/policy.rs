@@ -68,9 +68,19 @@ pub fn device_relays(d: &DeviceState) -> bool {
 /// ([`crate::transport::shaping_referral`]). A client-only node has nothing to
 /// offer, whatever its state or the user's override
 /// ([`DeviceState::client_only`]).
+///
+/// **A node that activated the tier offers nothing** (CC 5.4.6 rc17,
+/// `CLM-referred-peer-is-proxy`): it holds its anonymous identity alone, and a
+/// proxy is an offering node under its public identity, so a public route at
+/// the same address would hand the anonymous identity's guard the name behind
+/// it. The rule attaches to the operator's opt-in ([`OnionPolicy::enabled`]),
+/// not to the tier being available this period: a node does not go back to
+/// proxying because its layers fell under the floor. It still relays onion
+/// packets ([`relay_decision`]); that is the tier's own carrying, not this
+/// offer. A person who wants both runs two nodes.
 #[must_use]
 pub fn relay_offering(p: &OnionPolicy, d: &DeviceState) -> bool {
-    !d.client_only && device_relays(d) && (p.is_seat || !p.relay_opt_out)
+    !p.enabled && !d.client_only && device_relays(d) && (p.is_seat || !p.relay_opt_out)
 }
 
 /// Whether the tier is active on this node: `Ok` or the reason, by token.
@@ -276,5 +286,37 @@ mod tests {
         assert!(!relay_offering(&p, &capable.with_network(false, true)));
         assert!(!relay_offering(&p, &capable.with_network(true, false)));
         assert!(relay_offering(&p, &DeviceState::of(DeviceKind::Home)));
+    }
+
+    /// CC 5.4.6 rc17 `CLM-referred-peer-is-proxy` — **a node that activated
+    /// the tier proxies nothing**: with the opt-in on, no device, override,
+    /// seat or availability makes it offer relay, and turning the opt-in off
+    /// gives the offer back.
+    #[test]
+    fn an_onion_enabled_node_never_offers_relay() {
+        let on = OnionPolicy {
+            enabled: true,
+            ..OnionPolicy::default()
+        };
+        let mut forced = DeviceState::of(DeviceKind::Server);
+        forced.relay_override = Some(true);
+        for d in [
+            DeviceState::of(DeviceKind::Server),
+            DeviceState::of(DeviceKind::Home),
+            forced,
+        ] {
+            assert!(relay_offering(&OnionPolicy::default(), &d), "{d:?}");
+            assert!(!relay_offering(&on, &d), "{d:?}");
+            let seat = OnionPolicy {
+                is_seat: true,
+                ..on.clone()
+            };
+            assert!(!relay_offering(&seat, &d), "a seat too: {d:?}");
+        }
+        // It still relays onion packets once the tier is active.
+        assert_eq!(
+            relay_decision(&on, &DeviceState::of(DeviceKind::Server), true, true),
+            Ok(())
+        );
     }
 }

@@ -1871,6 +1871,52 @@ async fn a_phone_that_loses_wifi_stops_being_referred_on_the_next_report() {
     assert_eq!(t.r.shaping("link_shaping_referral_sent"), 0);
 }
 
+/// CC 5.4.6 rc17 `CLM-referred-peer-is-proxy` — **a node that turns on the
+/// Anonymous Tier stops being referred on its next report**: it holds the
+/// anonymous identity alone and proxies nothing, so its free slots go to zero
+/// with the link still up, and a refused peer gets no referral to it. The
+/// opt-in alone does it: the tier need not be available. Mutation: drop the
+/// opt-in from `relay_offering` → W keeps its slots and is referred.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_onion_enabled_node_reports_no_capacity_and_is_never_referred() {
+    let _host = share_host().await;
+    let mut t = referral_pair(
+        "anon",
+        0x7a,
+        DeviceState::of(DeviceKind::Server),
+        None,
+        false,
+    )
+    .await;
+    assert!(t.r.transport.peer_free_slots(&t.w.key.key_id) > Some(0));
+    t.w.transport
+        .onion()
+        .set_policy(ciris_edge::onion::policy::OnionPolicy {
+            enabled: true,
+            ..ciris_edge::onion::policy::OnionPolicy::default()
+        });
+    t.w.transport.onion_refresh();
+    assert!(!t.w.transport.onion().relay_offering());
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.r.transport.peer_free_slots(&t.w.key.key_id) == Some(0)
+        })
+        .await
+    );
+    assert_eq!(t.r.transport.shaped_link_count(), 1, "the link stayed up");
+    let p = refused_peer(&mut t).await;
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            p.shaping("link_shaping_referral_exhausted") == 1
+        })
+        .await,
+        "{:?}",
+        p.metrics.link_shaping()
+    );
+    assert_eq!(t.r.shaping("link_shaping_referral_sent"), 0);
+    assert!(p.transport.homed_on_referrals().is_empty());
+}
+
 /// **A homed node is really used.** Edge registers the node P homed on as a
 /// replication peer on the bootstrap planes by itself: no host adds it, and a
 /// host's later peer set does not drop it. A key record P can have from nowhere
