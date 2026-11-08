@@ -839,6 +839,7 @@ impl EdgeTelemetry {
     }
 
     /// What this node forwards for others, from its one-second reading.
+    #[cfg(feature = "_reticulum-module")]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn set_forward(
         &self,

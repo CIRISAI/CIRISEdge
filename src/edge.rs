@@ -9197,6 +9197,7 @@ impl EdgeBuilder {
         // directory, the send set from whichever bridge is installed then.
         #[cfg(feature = "_reticulum-module")]
         let mut peer_obligations: Option<Arc<crate::peer_obligation::LivePeerObligations>> = None;
+        #[cfg(feature = "_reticulum-module")]
         if let (Some(t), Some(directory)) = (
             self.reticulum_transport.as_ref(),
             self.federation_directory.as_ref(),
@@ -9243,6 +9244,7 @@ impl EdgeBuilder {
             }
         }
         let metrics = preattached.unwrap_or_default();
+        #[cfg(feature = "_reticulum-module")]
         if let Some(reader) = peer_obligations {
             metrics.telemetry.levers.install_obligations(reader);
         }

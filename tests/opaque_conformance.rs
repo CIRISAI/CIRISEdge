@@ -41,8 +41,8 @@
 /// build; this test is the assertion side of that gate.
 #[test]
 fn wire_vocabulary_hash_pinned() {
-    // sha256 of the registry-owned WIRE_VOCABULARY.md v1.0.1 §3.3.
-    const HEX: &str = "c6bd6aa44111b226a6f204801b1afaa7153fb43296652c1f7cbc23228ac9346c";
+    // sha256 of the CC-owned WIRE_VOCABULARY.md v1.0.2 (rc17 db0d051).
+    const HEX: &str = "38bd4847c1203ae6da7b26c560ee51b577daaab4ef2d7924067995769100829e";
     let expected: [u8; 32] = hex::decode(HEX)
         .expect("hex-decode wire-vocabulary hash")
         .as_slice()
@@ -51,7 +51,7 @@ fn wire_vocabulary_hash_pinned() {
     assert_eq!(
         ciris_edge::WIRE_VOCABULARY_HASH,
         expected,
-        "crate WIRE_VOCABULARY_HASH drifted from registry spec v1.0.1"
+        "crate WIRE_VOCABULARY_HASH drifted from WIRE_VOCABULARY.md v1.0.2"
     );
 }
 

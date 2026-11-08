@@ -421,6 +421,7 @@ fn a_pulled_lever_is_a_gauge_and_a_counter() {
     w.rose("load_lever_changes_total.bulk:host");
 }
 
+#[cfg(feature = "_reticulum-module")]
 #[test]
 fn a_forward_reading_is_gauges_and_counters() {
     let m = crate::observability::EdgeMetrics::default();

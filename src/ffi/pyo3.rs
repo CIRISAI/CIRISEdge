@@ -3205,6 +3205,26 @@ fn metrics_bundle_to_pydict<'py>(
     }
     root.set_item("advertise", advertise)?;
     root.set_item("direct_links_active", bundle.direct_links_active)?;
+    // v44.1 — the host's shed levers and what this node forwards for others.
+    for (key, map) in [
+        ("load_lever_level", &bundle.load_lever_level),
+        ("load_lever_lease_seconds", &bundle.load_lever_lease_seconds),
+        ("load_lever_changes_total", &bundle.load_lever_changes_total),
+        ("forward_refusals_total", &bundle.forward_refusals_total),
+    ] {
+        let d = pyo3::types::PyDict::new(py);
+        for (label, n) in map {
+            d.set_item(label.as_str(), *n)?;
+        }
+        root.set_item(key, d)?;
+    }
+    root.set_item("forward_links_live", bundle.forward_links_live)?;
+    root.set_item("forward_admitted_total", bundle.forward_admitted_total)?;
+    root.set_item(
+        "forward_packets_per_second",
+        bundle.forward_packets_per_second,
+    )?;
+    root.set_item("forward_bits_per_second", bundle.forward_bits_per_second)?;
     // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
     // a missing install and a membership refusal are two numbers.
     let route_refusals = pyo3::types::PyDict::new(py);
