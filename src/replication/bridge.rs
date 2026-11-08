@@ -990,8 +990,8 @@ impl BridgeConfig {
 
     /// A peer with no walk reads one full page of history this often: what
     /// its required read and new rows do not carry, such as a third party's
-    /// invitation written while it was away, or the rows of a room it has just
-    /// joined. Slow on purpose: this is not anti-entropy. 1024 rows a minute
+    /// invitation past the subject read's budget, or the rows of a room it has
+    /// just joined. Slow on purpose: this is not anti-entropy. 1024 rows a minute
     /// walks 11k rows in 11 minutes.
     pub const DEFAULT_HISTORY_PAGE_EVERY: Duration = Duration::from_secs(60);
 
@@ -1963,6 +1963,12 @@ enum UnaskedOffer {
 /// CC 5.2 — the page of each required read. Rows past it are the walk's.
 const REQUIRED_READ_PAGE: std::num::NonZeroU32 =
     ciris_persist::federation::attestation_query::page_size(64);
+
+/// CC 5.2 — the rows a round reads of the invitations naming a peer as a
+/// subject (persist v61.0.5 #1225), shared across the peer's principals. A
+/// stranger can name a key as often as it likes and postgres sorts that whole
+/// set on every page, so the read stops here; what is past it is the walk's.
+const SUBJECT_READ_BUDGET: usize = 256;
 
 /// CC 5.2 — how many of a peer's groups the required read covers.
 const REQUIRED_GROUPS: usize = 32;
@@ -10943,9 +10949,10 @@ impl FederationDirectoryReplicationBridge {
     /// **CC 5.2 — the rows a peer's offer starts with**, read by their own
     /// indexes so that a fresh grant or a contact's own row never waits behind
     /// history: the live grants naming the peer, the rows addressed to it or
-    /// to its person, its own rows, and this node's allegiance rows. Every row
-    /// still crosses the whole gate stack. Each read is one page, newest first;
-    /// what is past it is the walk's. A failed read is the walk's as well.
+    /// to its person, the invitations naming it, its own rows, and this node's
+    /// allegiance rows. Every row still crosses the whole gate stack. Each read
+    /// is one page, newest first (the invitations a budget of pages); what is
+    /// past it is the walk's. A failed read is the walk's as well.
     async fn required_rows(
         &self,
         key: &(String, EnvelopeKind),
@@ -11000,10 +11007,10 @@ impl FederationDirectoryReplicationBridge {
         queries.extend(local.iter().map(|key| {
             AttestationQuery::by(key, REQUIRED_READ_PAGE).types(&[attestation_type::DELEGATES_TO])
         }));
-        // An invitation names its invitee in `subject_key_ids` alone, which no
-        // index reads, so this node's own ceremony rows are read by author.
-        // They are consent-free, and on a store of 11k rows waiting for the
-        // walk cost a contact 200 s.
+        // This node's own ceremony rows, read by author: the replies name no
+        // reader on any index. They are consent-free, and on a store of 11k
+        // rows waiting for the walk cost a contact 200 s. Another's invitation
+        // is read by its subject, below.
         queries.extend(local.iter().map(|key| {
             AttestationQuery::by(key, REQUIRED_READ_PAGE).dimension_any_of(&[
                 ciris_persist::federation::membership_acceptance::PROPOSAL_DIMENSION,
@@ -11018,6 +11025,7 @@ impl FederationDirectoryReplicationBridge {
                 Err(e) => tracing::debug!(peer, error = %e, "required read: page not served"),
             }
         }
+        rows.extend(self.invitations_naming(peer, peer_principals).await);
         // A grant's `withdraws` is attested to its grantor: it is read through
         // the grant it retires.
         let grants: Vec<String> = rows
@@ -11046,6 +11054,63 @@ impl FederationDirectoryReplicationBridge {
                 attestation,
             })
             .collect()
+    }
+
+    /// **CC 5.2 — the invitations naming the peer**, whoever wrote them. A
+    /// `membership:proposal:v1` names its invitee in `subject_key_ids` alone,
+    /// so a third party's invitation relayed here is on no `to` index; it is
+    /// read by persist's subject seek (v61.0.5 #1225), for each of the peer's
+    /// principals. Newest first from the head every round, never from a
+    /// high-water cursor: the order is the signer's `asserted_at`, and a row
+    /// relayed late, dated before one already passed, would sort behind it.
+    /// [`SUBJECT_READ_BUDGET`] rows a round across the principals, each its
+    /// share, so a flood naming one key costs a bounded read and cannot push
+    /// the other's invitation off. A failed read is the walk's.
+    async fn invitations_naming(
+        &self,
+        peer: &str,
+        peer_principals: &HashSet<String>,
+    ) -> Vec<Attestation> {
+        use ciris_persist::federation::membership_acceptance::PROPOSAL_DIMENSION;
+        let mut principals: Vec<&String> = peer_principals.iter().collect();
+        principals.sort();
+        let share = SUBJECT_READ_BUDGET.div_ceil(principals.len().max(1));
+        let mut left_in_round = SUBJECT_READ_BUDGET;
+        let mut rows = Vec::new();
+        for principal in principals {
+            let mut left = share.min(left_in_round);
+            let mut cursor = None;
+            while left > 0 {
+                let limit = REQUIRED_READ_PAGE
+                    .get()
+                    .min(u32::try_from(left).unwrap_or(u32::MAX));
+                let page = match self
+                    .directory
+                    .list_attestations_naming_by_dimension(
+                        principal,
+                        PROPOSAL_DIMENSION,
+                        cursor.take(),
+                        i64::from(limit),
+                    )
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(e) => {
+                        tracing::debug!(peer, error = %e, "required read: invitations not served");
+                        break;
+                    }
+                };
+                let read = page.items.len().min(left);
+                left -= read;
+                left_in_round -= read;
+                rows.extend(page.items.into_iter().take(read));
+                match page.next_cursor {
+                    Some(next) if read > 0 => cursor = Some(next),
+                    _ => break,
+                }
+            }
+        }
+        rows
     }
 
     /// The required read of the wraps attested to `key`.

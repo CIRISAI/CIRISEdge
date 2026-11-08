@@ -768,6 +768,21 @@ impl FederationDirectory for CountingDirectory {
         self.hit("list_attestations_since");
         self.inner.list_attestations_since(since, limit).await
     }
+    // persist v61.0.5 (#1225): defaulted `Unsupported`, overridden by every
+    // backend, so delegated. persist's own `FaultInjectingDirectory` at
+    // 3a9456bf does NOT list it in DELEGATED_DEFAULTS.
+    async fn list_attestations_naming_by_dimension(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        cursor: Option<ciris_persist::ceg::AttestationCursor>,
+        limit: i64,
+    ) -> Result<ciris_persist::ceg::ScoresPage, Error> {
+        self.hit("list_attestations_naming_by_dimension");
+        self.inner
+            .list_attestations_naming_by_dimension(subject_key_id, dimension, cursor, limit)
+            .await
+    }
     async fn list_communities_for_member(
         &self,
         member_identity_key_id: &str,

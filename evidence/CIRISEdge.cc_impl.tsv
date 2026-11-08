@@ -53,6 +53,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 5.4.3	CLM-refusal-carries-referrals	CIRISEdge	src/transport/shaping_referral.rs#rank_referrals	ciris-edge@v44.1.0
 5.2	CLM-moves-requested-required-appropriate	CIRISEdge	src/replication/bridge.rs#moves_unasked	ciris-edge@v44.1.0
 5.2	CLM-moves-requested-required-appropriate	CIRISEdge	src/replication/bridge.rs#required_rows	ciris-edge@v44.1.0
+5.2	CLM-moves-requested-required-appropriate	CIRISEdge	src/replication/bridge.rs#invitations_naming	ciris-edge@v44.1.0
 5.2	CLM-moves-requested-required-appropriate	CIRISEdge	src/replication/bridge.rs#unasked_offer	ciris-edge@v44.1.0
 5.4.6	CLM-first-contact-live-binding	CIRISEdge	src/replication/bridge.rs#attestation_is_relayed_announce	ciris-edge@v44.1.0
 5.3.3.5	CLM-pre-seal-bounded-hold	CIRISEdge	src/transport/link_seal.rs#LinkSeals::hold_before_keys	ciris-edge@v44.1.0
