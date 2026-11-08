@@ -7,8 +7,11 @@
 > and the overview at [ciris.ai/mdd](https://ciris.ai/mdd).
 
 **Version**: 2.0
-**Status**: v1.0.0 — Agent 3.0 / CEWP GA
-**Date**: 2026-05-30
+**Status**: written at v1.0.0 (Agent 3.0 / CEWP GA, 2026-05-30); the
+shipped line is **v44.x** (v44.1.0: persist v61.0.4, CIRISVerify v22.0.0,
+leviculum v0.34.0+ciris.1, CC 1.0-rc17, wire vocabulary v1.0.2). §11 is the
+v1.0 record; the current threat surface is `docs/THREAT_MODEL.md`.
+**Date**: 2026-05-30 (status line 2026-11-08)
 
 This is the reverse-engineered MDD charter for CIRISEdge: it maps the
 four pillars — Mission (WHY) / Protocols (WHO) / Schemas (WHAT) / Logic
@@ -334,9 +337,9 @@ said.
   bytes. Edge holds NO Tier-2 `kind` range and owns NO app semantics,
   NO typed struct, NO canonical-bytes knowledge for any migrant
   payload: it carries **reach, not meaning** (§1.3). The authoritative
-  vocabulary is `CIRISRegistry`'s `manifests/WIRE_VOCABULARY.md`
-  (v1.0.1 §3.3), pinned into the crate via the build-gate
-  `WIRE_VOCABULARY_HASH: [u8; 32]` (`src/messages/mod.rs`, a sha256
+  vocabulary is `CIRISConstitution`'s `manifests/WIRE_VOCABULARY.md`
+  (v1.0.2; the Tier-1/Tier-2 split is §3.3), pinned into the crate via the build-gate
+  `WIRE_VOCABULARY_HASH: [u8; 32]` (`src/lib.rs`, a sha256
   over the spec, guarded by the `wire_vocabulary_hash_pinned` test) —
   crate-vs-registry drift fails the build. This IS the coordinated
   wire break: `SchemaVersion::V2_0_0` is the new strict-flip default.

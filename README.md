@@ -82,25 +82,33 @@ real video + real blobs through real relays, in CI).
 
 ## Status
 
-**v18.2.x — measured, not promised.** The acceptance sweep is at **100%**:
-across every tested group size, real encrypted video and files were
-delivered between separate machines through a relay that can neither read
-them nor learn the group exists; members joined mid-stream; keys rotated
-without a single lost frame; retired addresses verifiably went dark while
-their successors kept answering; outsiders were refused. Every one of those
-sentences is a test that fails loudly if it stops being true
-([`bench-mesh/`](bench-mesh/README.md); labels and evidence in
-[`docs/LIGHTNET_DARKNET.md`](docs/LIGHTNET_DARKNET.md)).
+**v44.1.0, the 44.x long-term support line.** Pins `ciris-persist` v61.0.4,
+CIRISVerify v22.0.0 and leviculum v0.34.0+ciris.1 (`Cargo.toml`); CC 1.0-rc17;
+wire vocabulary v1.0.2. Release notes: [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md);
+threat model and its stated residuals: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 
-Under the hood: production CEG-native transport, scope-native addressing end
-to end (`#499`), the A/V mesh spine, and the delivery-model completion cut
-(v18.2.0: every replication plane activatable, every special case a named
-tested predicate, spec re-synced to code). Reticulum + HTTPS + packet-radio
-transports; the anti-entropy replication engine; the `#393` two-item
-attribution gate; MLS cohorts (TreeKEM, X-Wing) with scope-derived
-addressing and seal/retirement; mandatory hybrid Ed25519 + ML-DSA-65 on
-every producer; PyO3 + UniFFI mobile surfaces (Android floor: API 24).
-Pinned in lockstep to `ciris-persist` via drift-witnessed policy hashes.
+**Measured, and its scope.** The multi-container acceptance sweep
+([`bench-mesh/`](bench-mesh/README.md); labels and evidence in
+[`docs/LIGHTNET_DARKNET.md`](docs/LIGHTNET_DARKNET.md)) delivered real
+encrypted video and files through a relay that can neither read them nor learn
+the group exists, with mid-stream joins, key rotation without frame loss,
+address retirement and outsider refusal. Its scope is one host, one relay, up
+to four subscribers (seven containers), and its committed baselines are from
+v18.6–v18.8; the weekly lane has not passed since 2026-10-12, so no sweep is
+recorded green on 44.x. Real NATs, WAN latency, radio and larger meshes are
+not measured by it, and A/V across real NATs is unproven
+([`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) §9.1).
+
+Under the hood: production CEG-native transport with a hybrid transit seal on
+every Reticulum link (CC 5.3.3.5 E1); per-link traffic shaping under CC 5.4.3
+(one hop, eight links, bulk and A/V unshaped); the CC 5.2 rule for what moves
+to a peer; scope-native addressing end to end (`#499`); the A/V mesh spine;
+Reticulum + HTTPS + packet-radio transports; the anti-entropy replication
+engine; the `#393` two-item attribution gate; MLS cohorts (TreeKEM, X-Wing)
+with scope-derived addressing and seal/retirement; mandatory hybrid Ed25519 +
+ML-DSA-65 on every producer; PyO3 + UniFFI mobile surfaces (Android floor:
+API 24). The Anonymous Tier is wired and dormant. Pinned in lockstep to
+`ciris-persist` via drift-witnessed policy hashes.
 
 ## Sister repos
 
