@@ -451,7 +451,11 @@ publish = false
 # (#1192). 61.0.3 likewise: a takedown binds a chat row's room (#1199) and a
 # moderator's signature removes nobody (#1200). The doors run in the wheel, so
 # pyproject's floor moves with this pin.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.0.4", version = "61", features = ["sqlite", "encrypted-kv"] }
+# v44.1.0 prestages persist 61.0.5 by rev: 3a9456bf on `subject-read` (61.0.4 +
+# #1225, `list_attestations_naming_by_dimension`, capsule op appended, ABI stays
+# 12). Swap `rev = "3a9456bf…"` for `tag = "v61.0.5"` on both lines at the tag,
+# and move pyproject's floor to 61.0.5 then: the new op runs in the wheel.
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", rev = "3a9456bf1ea2a0abbfaf5502658731fe92ca2b6b", version = "61", features = ["sqlite", "encrypted-kv"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -1619,7 +1623,7 @@ async-trait        = "0.1"
 # two `ciris-verify-core` cdylibs — the empty-stdout SIGSEGV class).
 # v38.6.0 (CIRISPersist#774) — held in lockstep with the runtime pin above
 # through the RC-adopt and back onto `tag`. These two move together, always.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.0.4", version = "61", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv", "test-anchor"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", rev = "3a9456bf1ea2a0abbfaf5502658731fe92ca2b6b", version = "61", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv", "test-anchor"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3

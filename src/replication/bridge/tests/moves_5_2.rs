@@ -711,9 +711,10 @@ fn counted_bridge(
 }
 
 /// **A row naming the peer only in `subject_key_ids`, written before it
-/// connects, arrives.** A third party's invitation: no index reads it, it is
-/// past the tip, and it is nobody's row here. The history read is what carries
-/// it, and it does.
+/// connects, arrives on the first round.** A third party's invitation: no `to`
+/// index reads it, it is past the tip, and it is nobody's row here. persist's
+/// subject read (v61.0.5 #1225) carries it, read from the head and not from
+/// the tip, with no page of history due.
 #[tokio::test]
 async fn a_row_written_before_the_peer_connects_arrives() {
     let backend = fixture().await;
@@ -741,22 +742,18 @@ async fn a_row_written_before_the_peer_connects_arrives() {
         "no `to` index holds it"
     );
     history(&backend).await;
-    let (_, bridge) = counted_bridge(&backend, Duration::ZERO);
+    let (counting, bridge) = counted_bridge(&backend, Duration::from_secs(3_600));
 
     let hash = hash_of(&backend, &invitation.attestation_id).await;
     let first = offer(&bridge, CONTACT).await;
     assert!(
-        !first.iter().any(|r| r.envelope_hash == hash),
-        "not in the first offer: this is what the required read cannot see"
+        first.iter().any(|r| r.envelope_hash == hash),
+        "in the first offer, with the tip past it and no history page due: {first:?}"
     );
-    let mut arrived = false;
-    for _ in 0..WALK_ROUNDS * 2 {
-        arrived |= offer(&bridge, CONTACT)
-            .await
-            .iter()
-            .any(|r| r.envelope_hash == hash);
-    }
-    assert!(arrived, "the history read reaches every row");
+    assert!(
+        counting.count("list_attestations_naming_by_dimension") >= 1,
+        "read by its subject"
+    );
 }
 
 /// **The store's side of a contact's round.** Counted at the directory, not by
@@ -784,6 +781,11 @@ async fn a_contacts_round_costs_a_bounded_count_of_store_reads() {
         counting.count("list_attestations_since"),
         ROUNDS,
         "one read past the tip a round, and no page of history"
+    );
+    assert_eq!(
+        counting.count("list_attestations_naming_by_dimension"),
+        ROUNDS,
+        "one subject read a round for a peer with one principal and no flood"
     );
     assert!(
         reads / ROUNDS <= 65,

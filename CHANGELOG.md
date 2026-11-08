@@ -43,6 +43,11 @@ shaped links do not stop new connections, and a failed bulk dial refuses by name
 A peer that is neither a seat nor its owner's no longer walks the plane: it reads new rows from the
 tip, and history at one full page a minute. This node's own invitations and their answers are required
 reads. `chat::pair_proposal_for` reads the room's index; `membership::pending_proposal_in` is new.
+A third party's invitation relayed here, of any age, is in the invitee's first offer: the required
+read takes the `membership:proposal:v1` rows naming each of the peer's principals by persist's
+subject read (`list_attestations_naming_by_dimension`, persist 61.0.5 #1225, pinned by rev
+3a9456bf until the tag), newest first from the head each round, at most 256 rows a round, and every
+row still crosses the serve gate. Before, it waited on the history page, up to 52 minutes on 52k rows.
 
 **Server must:** mirror the policy hash; take the `no_route` outcome and `RoundEvent::NoRoute`; set
 `ReplicationRuntimeConfig::recognised_seats` from `Edge::recognised_seats()` on a Rust host; build its
