@@ -13,6 +13,22 @@
 # meaningful role rather than a third leaf: relays run with
 # `with_transport_node(true)` and carry other nodes' frames.
 #
+# ── A/V legs: the relay is the rendezvous, not the path ─────────────
+#
+# Since #805 item 4 the stream rides the A/V plane: each leg dials a
+# member's DERIVED call address, which is announce-suppressed and answers
+# only a one-hop neighbour — it cannot establish across a relay
+# (CIRISEdge#336). Production carries those legs on DIRECT links (#805
+# item 8): the publisher proposes on its IDENTITY link to the member, both
+# ends probe the facilitator over UDP, the path is punched, and the leg is
+# born on the punched interface. Here relay-1 plays the canonical's part —
+# it serves the facilitator on UDP at its dial port (as a canonical does)
+# — and every other node names it, because a node under a test trust
+# root never resolves the bundle's canonical (#661). Every container sits
+# on one bridge, so the punch crosses no NAT: this witnesses the protocol,
+# not NAT traversal. Rows, chat, blobs and the identity link still transit
+# the relay exactly as before.
+#
 # ── Distinct occurrences, enforced by the infrastructure ────────────
 #
 # Every container gets its OWN named volume at `/state`. Its federation
@@ -106,6 +122,9 @@ x-node: &node
     # The transport's own INFO wiring-decision log is the authority; the
     # mesh.standup leg detail records the intent.
     CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY: "2048"
+    # CIRISEdge#805 item 8 — the facilitator a node probes when it proposes
+    # a direct link (UDP; relay-1 serves it, see the header).
+    EDGE_DIRECT_FACILITATOR: "relay-1:4242"
     RUST_BACKTRACE: "1"
   volumes:
     - mesh:/mesh
@@ -144,6 +163,10 @@ services:
       EDGE_ROLE: relay
       EDGE_NODE_ID: relay-1
       EDGE_ADVERTISE: "relay-1:4242"
+      # The canonical's part: serve the facilitator on UDP at the dial port.
+      # A relay proposes nothing itself (empty = no facilitator).
+      EDGE_SERVE_FACILITATOR_PORT: "4242"
+      EDGE_DIRECT_FACILITATOR: ""
       EDGE_BOOTSTRAP: "publisher:4242"
     volumes:
       - state-relay-1:/state
@@ -161,6 +184,7 @@ services:
       EDGE_ROLE: relay
       EDGE_NODE_ID: relay-2
       EDGE_ADVERTISE: "relay-2:4242"
+      EDGE_DIRECT_FACILITATOR: ""
       EDGE_BOOTSTRAP: "relay-1:4242"
     volumes:
       - state-relay-2:/state
