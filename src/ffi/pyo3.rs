@@ -5193,9 +5193,13 @@ pub struct PyDurableHandle {
 /// running"` panic.
 ///
 /// What IS safe inside the spawned future:
-/// - Calls to persist's public async API (`Engine::*`, trait methods
-///   on `Arc<dyn FederationDirectory>` / `BackendDispatch`) — those
-///   dispatch into persist's `.so` and use persist's tokio.
+/// - Calls through trait objects persist's `.so` built
+///   (`Arc<dyn FederationDirectory>`) — those dispatch into persist's
+///   `.so` and use persist's tokio.
+/// - NOT the concrete `BackendDispatch` arms: `Arc<PostgresBackend>`'s
+///   methods are monomorphic, so they compile into EDGE's copy of persist
+///   and resolve tokio through edge's copy. See [`EdgeTokioContext`] for
+///   how such a call is kept off persist's runtime internals.
 /// - `std::sync::mpsc` / std primitives (no tokio involvement).
 /// - Pure-CPU work + `.await` points on persist-side futures.
 ///
@@ -5211,6 +5215,59 @@ pub struct PyDurableHandle {
 /// pinpoints the hang point in real time. Set to `0` to disable
 /// the watchdog (plain `rx.recv()`, no timer overhead).
 type BoxedFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+/// The tokio context edge's own code finds while persist's worker polls it.
+///
+/// A future handed to persist's executor is polled on persist's worker, where
+/// edge's copy of tokio has no runtime: its thread-locals are edge's, and
+/// unset. Edge code that reaches tokio there either panics ("no reactor
+/// running") or, worse, takes a fallback that drives a runtime persist built.
+/// Persist v59.1.2's `checkout_bounded` (`store/postgres.rs`) is the live
+/// case: compiled into edge's copy (a `BackendDispatch::Postgres` call),
+/// `Handle::try_current()` asks edge's tokio, fails, and the checkout spawns
+/// its timer on `persist_rt`, a `Handle` persist's `.so` built with ITS
+/// tokio. Edge's tokio code then walks a foreign runtime's task list
+/// (different tokio patch versions, different layouts) and SIGSEGVs every
+/// postgres `init_edge_runtime` in cohabitation.
+///
+/// Every poll of such a future enters this runtime's handle first, so edge's
+/// copy finds a runtime of its own: timers, `tokio::spawn` and the checkout's
+/// inline branch all land on edge's tokio, and edge never touches a `Handle`
+/// persist built. Persist's own code on the same thread is untouched: its
+/// tokio keeps its own thread-locals. One small worker, built on first use.
+fn edge_tokio_handle() -> &'static tokio::runtime::Handle {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("ciris-edge-ctx")
+            .enable_all()
+            .build()
+            .expect("ciris-edge-ctx runtime")
+    })
+    .handle()
+}
+
+/// Polls the wrapped future inside [`edge_tokio_handle`]'s context.
+struct EdgeTokioContext(BoxedFut);
+
+impl std::future::Future for EdgeTokioContext {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        // The guard is scoped to this one poll and dropped before it returns,
+        // never held across an await.
+        let _guard = edge_tokio_handle().enter();
+        self.0.as_mut().poll(cx)
+    }
+}
+
+/// Wraps `fut` for persist's executor: see [`EdgeTokioContext`].
+fn in_edge_tokio(fut: BoxedFut) -> BoxedFut {
+    Box::pin(EdgeTokioContext(fut))
+}
 
 fn run_async<F, T>(executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor, fut: F) -> T
 where
@@ -5235,7 +5292,7 @@ where
     // `Box::into_raw`'d `Box<Pin<Box<dyn Future<Output = ()> + Send +
     // 'static>>>`. Construct that outer Box, lower to *mut TaskOpaque,
     // hand to the vtable.
-    let outer_box: Box<BoxedFut> = Box::new(inner_fut);
+    let outer_box: Box<BoxedFut> = Box::new(in_edge_tokio(inner_fut));
     let task_ptr: *mut ciris_persist::ffi::executor_capsule::TaskOpaque =
         Box::into_raw(outer_box).cast();
     // SAFETY: `executor.data` and `task_ptr` satisfy the safety
@@ -8343,7 +8400,7 @@ pub fn init_edge_runtime(
                     }
                 }
             });
-            let outer_box: Box<BoxedFut> = Box::new(heartbeat_fut);
+            let outer_box: Box<BoxedFut> = Box::new(in_edge_tokio(heartbeat_fut));
             let task_ptr: *mut ciris_persist::ffi::executor_capsule::TaskOpaque =
                 Box::into_raw(outer_box).cast();
             // SAFETY: same contract as `run_async` — `executor.data` and

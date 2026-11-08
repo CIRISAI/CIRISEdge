@@ -51,6 +51,45 @@ X25519 + Ed25519 dual-key bytes for persist's LocalIdentityAggregate
 RET-transport role (CIRISPersist#199).
 """
 
+
+def _share_persist_sqlite() -> None:
+    """Make edge's sqlite3_* calls resolve to persist's bundled sqlite (Linux).
+
+    CIRISEdge#50: edge runs persist's SqliteBackend code (compiled into
+    edge's .so) on connections persist opened, so both MUST call ONE sqlite.
+    A repaired wheel shares it by NEEDED name; a source build
+    (``pip install git+...``) links the system ``libsqlite3.so.0``, a second
+    instance never initialised, and the first ``sqlite3_prepare_v2`` on
+    persist's connection jumps through a null ``xMalloc`` (SIGSEGV, no
+    output). Loading persist's copy RTLD_GLOBAL first puts it ahead in the
+    global scope, so edge's ``sqlite3_*`` bind to it whatever edge linked.
+
+    Never raises: no persist, no bundled lib, or a load failure is a no-op.
+    """
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+        import glob
+        import importlib.util
+        import os
+
+        spec = importlib.util.find_spec("ciris_persist")
+        if spec is None or not spec.submodule_search_locations:
+            return
+        pkg_dir = os.path.abspath(list(spec.submodule_search_locations)[0])
+        libs_dir = os.path.join(os.path.dirname(pkg_dir), "ciris_persist.libs")
+        for lib in sorted(glob.glob(os.path.join(libs_dir, "libsqlite3-*.so*"))):
+            ctypes.CDLL(lib, mode=os.RTLD_NOW | os.RTLD_GLOBAL)
+            return
+    except Exception:  # noqa: BLE001 - a preload must never break the import
+        return
+
+
+_share_persist_sqlite()
+
 from .ciris_edge import (
     SUPPORTED_SCHEMA_VERSIONS,
     DurableHandle,
