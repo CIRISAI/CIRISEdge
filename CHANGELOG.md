@@ -2,7 +2,7 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
-## Unreleased
+## 44.1.0 — 2026-11-08
 
 The onion relay's replay set is a bounded hold (CIRISEdge#955, CC 5.3.3.5 E1 rule 9). It holds at
 most `REPLAY_BOUND` = 62,134 tags a period: the `seat` rate on the node cap's eight shaped links,
@@ -17,7 +17,16 @@ A node that turned on the Anonymous Tier no longer offers relay (CC 5.4.6 rc17,
 `CLM-referred-peer-is-proxy`): `relay_offering` is false while `OnionPolicy::enabled` holds, so it
 reports no free shaped slots and is never referred as a proxy. It still relays onion packets.
 
-## 44.1.0 — 2026-11-07
+The process loads one tokio and one sqlite: on a PyO3 host, edge's calls run inside a runtime edge
+owns, so edge's copy of persist code never reaches a runtime persist's .so built (a linux + postgres
+SIGSEGV), and a source-built edge on Linux binds persist's bundled sqlite (CIRISEdge#50).
+
+The weekly bench mesh's A/V legs ride direct links, as production's do: the harness configures direct
+links with the relay as facilitator, cuts the stream to the leg's budget, paces it, and dials a late
+joiner beside the stream. No leg's assertion changed.
+
+The threat model and README are regenerated for the 44.x line (CIRISEdge#956).
+
 
 What moves to a peer (CC 5.2): a row moves when it is requested, or required, and appropriate, never
 because it is federation-tier. Two serve seats keep the commons walk; every other peer starts with
