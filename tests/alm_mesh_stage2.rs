@@ -533,6 +533,7 @@ async fn join_loaded(
         CallDeps {
             room_group: group.clone(),
             roster: Arc::new(Roster(true)),
+            owners: Arc::clone(&node.dir) as Arc<dyn ciris_edge::transport::av_call::CallOwners>,
             transport: Arc::clone(&node.transport),
             lifecycle: Arc::clone(&node.lifecycle),
             registrar: Arc::new(CountingRegistrar::default()),

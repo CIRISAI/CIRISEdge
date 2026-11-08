@@ -27,6 +27,14 @@ joiner beside the stream. No leg's assertion changed.
 
 The threat model and README are regenerated for the 44.x line (CIRISEdge#956).
 
+A call in a room whose MLS leaves are persons is joined through their nodes. The server mints room
+keys as the owner, so no node was a leaf and `join_call` refused every node as `NotARoomMember`. A
+call's members are now the room's leaves with each person replaced by the nodes it owns, by
+persist's owner binding (`nodes_owned_by`/`owner_of`, `CallDeps::owners`); the join, inbound links,
+stream key bindings, ALM and the roll all read that set. A node whose owner is not a leaf, or that
+acts for an attendee it is not bound to, is refused; removing a person ends their nodes' part at the
+next epoch. Rooms whose leaves are nodes work as before.
+
 
 What moves to a peer (CC 5.2): a row moves when it is requested, or required, and appropriate, never
 because it is federation-tier. Two serve seats keep the commons walk; every other peer starts with
