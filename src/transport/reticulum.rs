@@ -17158,6 +17158,10 @@ async fn shaped_link_to_dest(ctx: &EventCtx<'_>, dest: [u8; 16]) -> Option<LinkI
 async fn handle_onion_frame(ctx: &EventCtx<'_>, link_id: LinkId, data: &[u8]) {
     use crate::onion::relay::RelayAction;
     use crate::onion::tokens;
+    // CIRISEdge#955 — the transport's own shaping state for this link, never
+    // a peer's claim; `accept_inbound` refuses an unshaped link before any
+    // cryptography. The link keyed behind the receiver order
+    // (`ReceiverOrder::admit` in `gate_handshake`) before this frame opened.
     let on_shaped_link = ctx.shapers.is_shaped(link_id.into_bytes());
     let now = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
     let period = crate::transport::onion_layers::period_of(now);
@@ -22754,6 +22758,131 @@ mod tests {
             "history: CIRISEdge#425 — un-instrumented inbound exit(s); route through `drop_inbound(...)` \
              or a `tracing::` log, or annotate `// choke-ok: <why it is not a silent drop>`:\n{}",
             violations.join("\n")
+        );
+    }
+
+    /// CIRISEdge#955 — **an onion frame is read only behind the receiver
+    /// order** (CC 5.3.3.5 E1 rule 9: the receiver rates run before expensive
+    /// work). The onion decapsulation (`accept_inbound`) is reached only from
+    /// an OPENED sealed frame; a frame opens only on a keyed link; a link keys
+    /// only through the keyer; and the one door into the keyer is
+    /// `gate_handshake`, which runs `ReceiverOrder::admit` first. Pinned on the
+    /// source, call site by call site, so a new path to the onion handler, or
+    /// a keyer submit ahead of the admit, fails here.
+    #[test]
+    fn an_onion_frame_is_read_only_behind_the_receiver_order() {
+        let src = include_str!("reticulum.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        // The `#[cfg(test)] mod … { … }` ranges: their lines are not call sites.
+        let in_test_mod: Vec<bool> = {
+            let mut v = vec![false; lines.len()];
+            let mut i = 0;
+            while i + 1 < lines.len() {
+                if lines[i] == "#[cfg(test)]" && lines[i + 1].starts_with("mod ") {
+                    let end = lines[i + 2..]
+                        .iter()
+                        .position(|l| *l == "}")
+                        .map_or(lines.len(), |p| i + 2 + p);
+                    v[i..end].iter_mut().for_each(|b| *b = true);
+                    i = end;
+                }
+                i += 1;
+            }
+            v
+        };
+        let enclosing = |idx: usize| -> &str {
+            lines[..=idx]
+                .iter()
+                .rev()
+                .find_map(|l| {
+                    l.strip_prefix("async fn ")
+                        .or_else(|| l.strip_prefix("fn "))
+                        .map(|r| r.split('(').next().unwrap_or(r))
+                })
+                .unwrap_or("?")
+        };
+        // Production call sites of `needle`: line index and enclosing fn.
+        let calls = |needle: &str| -> Vec<(usize, &str)> {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(i, l)| {
+                    let t = l.trim_start();
+                    !in_test_mod[*i]
+                        && l.contains(needle)
+                        && !t.starts_with("//")
+                        && !l.starts_with("async fn ")
+                })
+                .map(|(i, _)| (i, enclosing(i)))
+                .collect()
+        };
+        let only_in = |needle: &str, fns: &[&str]| {
+            let sites = calls(needle);
+            assert!(
+                !sites.is_empty(),
+                "characterization pin: no call to {needle}"
+            );
+            for (i, f) in &sites {
+                assert!(
+                    fns.contains(f),
+                    "{needle} called from `{f}` at line {}; only {fns:?} may",
+                    i + 1
+                );
+            }
+            sites
+        };
+        // The onion handler, and the chain up to the opened frame.
+        assert_eq!(
+            only_in("handle_onion_frame(ctx", &["attribute_and_deliver"]).len(),
+            1
+        );
+        only_in("attribute_and_deliver(ctx", &["route_now"]);
+        only_in("route_now(ctx", &["route_opened", "release_held"]);
+        only_in("seals.hold(", &["route_opened"]);
+        for (i, f) in only_in(
+            "route_opened(ctx",
+            &["shaped_inbound", "replay_before_keys", "handle_event"],
+        ) {
+            let opened = match f {
+                "replay_before_keys" => lines[i].contains("Inbound::Open(plain) =>"),
+                "handle_event" => lines[i.saturating_sub(15)..i]
+                    .iter()
+                    .any(|l| l.contains("seal_inbound(")),
+                _ => true,
+            };
+            assert!(
+                opened,
+                "route_opened at line {} is not on an opened frame",
+                i + 1
+            );
+        }
+        for (i, _) in only_in("shaped_inbound(ctx", &["seal_inbound"]) {
+            assert!(
+                lines[i].contains("Inbound::Open(plain) =>"),
+                "line {}",
+                i + 1
+            );
+        }
+        // The one door into the keyer runs the receiver order first.
+        let submits = only_in("keyer.submit(", &["gate_handshake"]);
+        assert_eq!(submits.len(), 1);
+        let (at, _) = submits[0];
+        assert!(
+            lines[at]
+                .trim_start()
+                .starts_with(".and_then(|()| ctx.keyer.submit("),
+            "the keyer runs only once the receiver order admitted: {}",
+            lines[at]
+        );
+        let start = lines[..at]
+            .iter()
+            .rposition(|l| l.starts_with("async fn gate_handshake("))
+            .expect("gate_handshake");
+        assert!(
+            lines[start..at]
+                .iter()
+                .any(|l| l.contains(".admit_handshake(")),
+            "gate_handshake must call the receiver order before the keyer"
         );
     }
 

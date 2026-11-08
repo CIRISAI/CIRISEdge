@@ -2,6 +2,17 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## Unreleased
+
+The onion relay's replay set is a bounded hold (CIRISEdge#955, CC 5.3.3.5 E1 rule 9). It holds at
+most `REPLAY_BOUND` = 62,134 tags a period: the `seat` rate on the node cap's eight shaped links,
+264,000 B/s, over the 3,600 s period, divided by the 15,296-byte packet. With the last period's tags
+that is under 8.3 MiB. Past the bound a new packet is refused as `onion_replay_set_full`, counted
+like the other onion refusals; no held tag is evicted, and a replay of a held tag is still
+`onion_replay`. The bound is fixed, not a lever. A source witness pins that an onion frame reaches
+`accept_inbound` only on a link that keyed behind `ReceiverOrder::admit`, and `accept_inbound`'s
+`link_shaped` is documented as the transport's own shaping state.
+
 ## 44.1.0 — 2026-11-07
 
 What moves to a peer (CC 5.2): a row moves when it is requested, or required, and appropriate, never

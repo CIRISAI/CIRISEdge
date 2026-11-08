@@ -248,6 +248,16 @@ impl OnionRuntime {
     /// An onion packet that arrived on a link: relay it, or say why not. A
     /// node whose tier is not running refuses before any cryptography.
     ///
+    /// `link_shaped` is transport state, not a caller's claim: the one
+    /// production call site (`handle_onion_frame` in
+    /// `src/transport/reticulum.rs`) derives it from
+    /// `ctx.shapers.is_shaped(link_id)`, the transport's own shaping table for
+    /// the link the frame arrived on, which a peer cannot set by saying so.
+    /// That frame has already passed the receiver order
+    /// (`ReceiverOrder::admit`, CIRISEdge#947) when its link keyed: only a
+    /// keyed link's sealed frame opens to reach here. The tests pass both
+    /// values deliberately.
+    ///
     /// # Errors
     /// [`relay_decision`]'s tokens, then the relay's.
     pub fn accept_inbound(
@@ -361,6 +371,50 @@ mod tests {
         assert!(!st.active && !st.relaying && st.confines_media);
         assert_eq!(st.hop_key_source, "transit_kex_pubkeys");
         assert_eq!(rt.counters()[tokens::RELAY_DORMANT], 1);
+    }
+
+    /// CIRISEdge#955 — a full replay set refuses by name and the runtime
+    /// counts it like every other refusal (and the replay of an admitted
+    /// packet stays a replay).
+    #[test]
+    fn a_full_replay_set_is_refused_and_counted_by_name() {
+        use crate::onion::packet::{build_packet, HopSpec, RoutingBlock, FLAG_FINAL};
+        let rt = OnionRuntime::new("me", DeviceState::of(DeviceKind::Server));
+        rt.set_policy(OnionPolicy {
+            enabled: true,
+            ..OnionPolicy::default()
+        });
+        forced_available(&rt, "me");
+        let secret = || HopSecret::from_xwing_seed(&[1; 32]).unwrap();
+        rt.set_relay(Some(OnionRelay::new(secret(), None).with_replay_bound(1)));
+        let pkt = || {
+            build_packet(
+                &[HopSpec {
+                    key: secret().public().clone(),
+                    block: RoutingBlock {
+                        next_dest: [0; 16],
+                        flags: FLAG_FINAL,
+                        delay_ms: 0,
+                        period: 5,
+                    },
+                }],
+                b"p",
+            )
+            .unwrap()
+        };
+        let (a, b) = (pkt(), pkt());
+        assert!(matches!(
+            rt.accept_inbound(&a, true, 5),
+            Ok(RelayAction::Store { .. })
+        ));
+        assert_eq!(
+            rt.accept_inbound(&b, true, 5).unwrap_err(),
+            tokens::REPLAY_SET_FULL
+        );
+        assert_eq!(rt.accept_inbound(&a, true, 5).unwrap_err(), tokens::REPLAY);
+        let c = rt.counters();
+        assert_eq!(c[tokens::REPLAY_SET_FULL], 1);
+        assert_eq!(c[tokens::REPLAY], 1);
     }
 
     /// Opted in and available: the node relays (on shaped links only), its

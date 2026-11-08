@@ -9,8 +9,21 @@
 //! 2. the packet peels under the current hop key or, for one period of
 //!    rotation overlap, the previous one ([`packet::peel`]'s refusals);
 //! 3. its period is this one or the last, else [`tokens::PERIOD_MISMATCH`];
-//! 4. its encapsulation is new within two periods, else [`tokens::REPLAY`];
+//! 4. its encapsulation is new within two periods, else [`tokens::REPLAY`],
+//!    and there is room for it in this period's replay set, else
+//!    [`tokens::REPLAY_SET_FULL`] ([`REPLAY_BOUND`]);
 //! 5. a forward fits under the hold bound, else [`tokens::HOLD_DEFERRED`].
+//!
+//! **The replay set is a hold** (CIRISEdge#955; CC 5.3.3.5 E1 rule 9: what a
+//! node holds is bounded, refuses on overflow by name and never trims). Hop
+//! keys are published, so anyone can mint valid packets with fresh
+//! encapsulations; each would otherwise add an entry held for two periods.
+//! The set therefore holds at most [`REPLAY_BOUND`] tags per period. Past it a
+//! NEW tag is refused by name, never admitted by evicting a live one: evicting
+//! would forget a tag a replay could then reuse. A replay of a tag already
+//! held is still [`tokens::REPLAY`], full or not. The bound is a fixed
+//! process bound derived from what the shaped links can legitimately carry,
+//! not a lever.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,6 +50,37 @@ pub fn onion_frame(packet: &[u8]) -> Vec<u8> {
     f.extend_from_slice(packet);
     f
 }
+
+/// CIRISEdge#955 — the byte rate onion packets can legitimately reach a relay
+/// at: the highest class a shaped link is agreed at (`seat`,
+/// `link_shaping::SEAT_BYTES_PER_S` = 33,000 B/s) on every one of the node
+/// cap's eight links (`link_shaping::NODE_CAP_LINKS`). Cover is dropped at the
+/// shaper and a real body is at most ρ of the rate, so this over-counts what
+/// can arrive: the bound errs toward admitting.
+pub const REPLAY_ADMITTED_BYTES_PER_S: u64 = 33_000 * 8;
+
+/// CIRISEdge#955 — the most replay tags a relay holds for one period: the
+/// admitted rate × the period ([`PERIOD_SECONDS`], 3,600 s) ÷ the fixed packet
+/// size ([`packet::PACKET`], 15,296 B), rounded up: **62,134**. The set holds
+/// this period's tags and the last's, so at most 124,268 tags; a `HashSet` of
+/// 62,134 32-byte tags sits in 131,072 buckets of 33 bytes, about 4.1 MiB, so
+/// the whole set stays under 8.3 MiB.
+///
+/// [`PERIOD_SECONDS`]: crate::transport::onion_layers::PERIOD_SECONDS
+#[allow(clippy::cast_possible_truncation, clippy::cast_lossless)] // 62,134 fits; `From` is not const
+pub const REPLAY_BOUND: usize = (REPLAY_ADMITTED_BYTES_PER_S
+    * crate::transport::onion_layers::PERIOD_SECONDS)
+    .div_ceil(packet::PACKET as u64) as usize;
+
+const _: () = assert!(REPLAY_BOUND == 62_134);
+// The bound's inputs are the shaping layer's own constants, not copies that
+// can drift (the shaping layer is compiled only with the Reticulum module).
+#[cfg(feature = "_reticulum-module")]
+const _: () = assert!(
+    REPLAY_ADMITTED_BYTES_PER_S
+        == crate::transport::link_shaping::SEAT_BYTES_PER_S as u64
+            * crate::transport::link_shaping::NODE_CAP_LINKS as u64
+);
 
 /// How many packets a relay holds waiting out their delay (FSD §6).
 pub const DEFAULT_HOLD_BOUND: usize = 256;
@@ -82,16 +126,33 @@ impl Drop for HoldSlot {
     }
 }
 
-#[derive(Debug, Default)]
+/// The tags a relay has decapsulated this period and the last, at most
+/// `bound` per period. See [the module docs](self).
+#[derive(Debug)]
 struct ReplaySet {
     period: u64,
+    bound: usize,
     current: HashSet<[u8; 32]>,
     previous: HashSet<[u8; 32]>,
 }
 
 impl ReplaySet {
-    /// Insert `tag` seen in `period`; `false` when already seen.
-    fn insert(&mut self, tag: [u8; 32], period: u64) -> bool {
+    fn new(bound: usize) -> Self {
+        Self {
+            period: 0,
+            bound,
+            current: HashSet::new(),
+            previous: HashSet::new(),
+        }
+    }
+
+    /// Admit `tag` seen in `period`.
+    ///
+    /// # Errors
+    /// [`tokens::REPLAY`] when the tag is held (this period or the last);
+    /// [`tokens::REPLAY_SET_FULL`] when this period already holds `bound`
+    /// tags. Nothing held is ever evicted to make room.
+    fn insert(&mut self, tag: [u8; 32], period: u64) -> Result<(), &'static str> {
         if period > self.period {
             if period == self.period + 1 {
                 self.previous = std::mem::take(&mut self.current);
@@ -102,10 +163,18 @@ impl ReplaySet {
             self.period = period;
         }
         if self.current.contains(&tag) || self.previous.contains(&tag) {
-            return false;
+            return Err(tokens::REPLAY);
+        }
+        if self.current.len() >= self.bound {
+            return Err(tokens::REPLAY_SET_FULL);
         }
         self.current.insert(tag);
-        true
+        Ok(())
+    }
+
+    /// Tags held, this period and the last.
+    fn len(&self) -> usize {
+        self.current.len() + self.previous.len()
     }
 }
 
@@ -140,7 +209,7 @@ impl OnionRelay {
         Self {
             current,
             previous,
-            replay: Mutex::new(ReplaySet::default()),
+            replay: Mutex::new(ReplaySet::new(REPLAY_BOUND)),
             held: Arc::new(AtomicUsize::new(0)),
             hold_bound: DEFAULT_HOLD_BOUND,
         }
@@ -153,10 +222,30 @@ impl OnionRelay {
         self
     }
 
+    /// A smaller replay bound, so a test can fill the set with real packets.
+    #[cfg(test)]
+    pub(crate) fn with_replay_bound(self, bound: usize) -> Self {
+        *self
+            .replay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ReplaySet::new(bound);
+        self
+    }
+
     /// The public hop key this relay answers to.
     #[must_use]
     pub fn hop_key(&self) -> &packet::HopKey {
         self.current.public()
+    }
+
+    /// CIRISEdge#955 — replay tags now held, this period and the last (at most
+    /// twice [`REPLAY_BOUND`]).
+    #[must_use]
+    pub fn replay_tags_held(&self) -> usize {
+        self.replay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Packets now held.
@@ -189,14 +278,10 @@ impl OnionRelay {
         if p != low32(now_period) && p != low32(now_period.wrapping_sub(1)) {
             return Err(tokens::PERIOD_MISMATCH);
         }
-        if !self
-            .replay
+        self.replay
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(peeled.replay_tag, now_period)
-        {
-            return Err(tokens::REPLAY);
-        }
+            .insert(peeled.replay_tag, now_period)?;
         let flags = peeled.block.flags;
         if flags & FLAG_FINAL != 0 {
             return Ok(RelayAction::Store {
@@ -322,6 +407,126 @@ mod tests {
             relay.accept(&fin, true, 10),
             Ok(RelayAction::Store { payload }) if payload == b"p"
         ));
+    }
+
+    /// CIRISEdge#955 — **the bound is the admitted rate × the period**: eight
+    /// shaped links at the highest class, each carrying back-to-back packets
+    /// for a whole period, fit under it, and it is no looser than one packet
+    /// per link of rounding.
+    #[test]
+    fn the_replay_bound_is_the_admitted_rate_over_one_period() {
+        let per_link_per_period =
+            33_000 * crate::transport::onion_layers::PERIOD_SECONDS / packet::PACKET as u64;
+        let eight_links = usize::try_from(8 * per_link_per_period).unwrap();
+        assert!(
+            eight_links <= REPLAY_BOUND,
+            "{eight_links} > {REPLAY_BOUND}"
+        );
+        assert!(
+            REPLAY_BOUND - eight_links <= 8,
+            "the bound is the rate, not slack"
+        );
+        assert_eq!(REPLAY_BOUND, 62_134);
+    }
+
+    fn tag(i: usize) -> [u8; 32] {
+        let mut t = [0u8; 32];
+        t[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        t[31] = 0xA5;
+        t
+    }
+
+    /// CIRISEdge#955 — **a flood past the bound is refused by name and the set
+    /// stays bounded** (CC 5.3.3.5 E1 rule 9), at the production bound: eight
+    /// links each present three times their share of distinct tags in one
+    /// period. Exactly [`REPLAY_BOUND`] are admitted, every other one is
+    /// [`tokens::REPLAY_SET_FULL`], the table never grows past what the bound
+    /// filled, and every admitted tag is still [`tokens::REPLAY`] afterwards,
+    /// in this period and across the rotation into the next, whose own flood
+    /// is bounded the same way.
+    #[test]
+    fn a_replay_flood_past_the_bound_is_refused_by_name_and_held_tags_stay_refused() {
+        const LINKS: usize = 8;
+        let mut set = ReplaySet::new(REPLAY_BOUND);
+        let flood = 3 * REPLAY_BOUND;
+        let (mut admitted, mut full) = (Vec::new(), 0usize);
+        let mut filled_capacity = None;
+        // Interleave the eight links' packets, as the shaped links deliver them.
+        for i in 0..flood {
+            let (link, seq) = (i % LINKS, i / LINKS);
+            let t = tag(link * flood + seq);
+            match set.insert(t, 10) {
+                Ok(()) => admitted.push(t),
+                Err(e) => {
+                    assert_eq!(e, tokens::REPLAY_SET_FULL);
+                    full += 1;
+                    filled_capacity.get_or_insert(set.current.capacity());
+                }
+            }
+        }
+        assert_eq!(admitted.len(), REPLAY_BOUND);
+        assert_eq!(full, flood - REPLAY_BOUND);
+        assert_eq!(set.len(), REPLAY_BOUND);
+        assert_eq!(
+            Some(set.current.capacity()),
+            filled_capacity,
+            "the overflow allocated nothing"
+        );
+        // About 4.1 MiB per period at 33 bytes a bucket.
+        assert!(set.current.capacity() * 33 <= 5 << 20);
+        for t in &admitted {
+            assert_eq!(
+                set.insert(*t, 10),
+                Err(tokens::REPLAY),
+                "nothing was evicted"
+            );
+        }
+        // The next period: last period's tags are still refused as replays,
+        // and the new flood is bounded on its own.
+        let mut admitted_next = 0usize;
+        for i in 0..flood {
+            match set.insert(tag(LINKS * flood + i), 11) {
+                Ok(()) => admitted_next += 1,
+                Err(e) => assert_eq!(e, tokens::REPLAY_SET_FULL),
+            }
+        }
+        assert_eq!(admitted_next, REPLAY_BOUND);
+        assert_eq!(set.len(), 2 * REPLAY_BOUND);
+        for t in &admitted {
+            assert_eq!(set.insert(*t, 11), Err(tokens::REPLAY), "across rotation");
+        }
+    }
+
+    /// CIRISEdge#955 — the same through the relay step with real packets: at
+    /// the bound a fresh packet is [`tokens::REPLAY_SET_FULL`], an admitted
+    /// one is still [`tokens::REPLAY`], and the next period has room again
+    /// while the last period's packets stay refused.
+    #[test]
+    fn a_full_replay_set_refuses_a_fresh_packet_and_still_refuses_a_replay() {
+        let r = relay(1);
+        let relay = OnionRelay::new(relay(1), None).with_replay_bound(2);
+        let (a, b, c) = (pkt(&r, 10, true), pkt(&r, 10, true), pkt(&r, 10, true));
+        assert!(matches!(
+            relay.accept(&a, true, 10),
+            Ok(RelayAction::Store { .. })
+        ));
+        assert!(matches!(
+            relay.accept(&b, true, 10),
+            Ok(RelayAction::Store { .. })
+        ));
+        assert_eq!(
+            relay.accept(&c, true, 10).unwrap_err(),
+            tokens::REPLAY_SET_FULL
+        );
+        assert_eq!(relay.accept(&a, true, 10).unwrap_err(), tokens::REPLAY);
+        assert_eq!(relay.replay_tags_held(), 2);
+        assert_eq!(relay.accept(&a, true, 11).unwrap_err(), tokens::REPLAY);
+        assert_eq!(relay.accept(&b, true, 11).unwrap_err(), tokens::REPLAY);
+        assert!(matches!(
+            relay.accept(&c, true, 11),
+            Ok(RelayAction::Store { .. })
+        ));
+        assert_eq!(relay.replay_tags_held(), 3);
     }
 
     fn relay_other() -> HopSecret {

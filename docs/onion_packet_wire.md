@@ -192,8 +192,19 @@ step names the refusal.
 | 7 | Non-final hop: `slot_commit(next[0..1184]) == next_commit`. | `onion_next_slot_mismatch` |
 | 8 | FINAL hop: the body's first 16 bytes are zero. | `onion_body_tampered` |
 | 9 | `period` is this period or the last (low 32 bits). | `onion_period_mismatch` |
-| 10 | The replay tag is unseen within two periods. | `onion_replay` |
+| 10 | The replay tag is unseen within two periods (else `onion_replay`), and this period holds fewer than 62,134 tags (else `onion_replay_set_full`). | `onion_replay`, `onion_replay_set_full` |
 | 11 | Forward only: fewer than 256 packets are held. | `onion_hold_deferred` |
+
+**The replay bound** (CIRISEdge#955; CC 5.3.3.5 E1 rule 9, a hold is
+bounded, refuses on overflow by name and never trims). The bound is the rate
+packets can legitimately arrive at times the period: the `seat` class
+(33,000 B/s) on each of the node cap's eight shaped links is 264,000 B/s;
+over one 3,600 s period that is 62,134 packets of 15,296 bytes, rounded up.
+The set keeps this period's tags and the last's, so at most 124,268 tags,
+about 8.3 MiB. Past the bound a new packet is refused by name; no held tag
+is evicted, since an evicted tag could be replayed. A replay of a held tag is
+`onion_replay` whether or not the set is full. The bound is fixed, not a
+setting.
 
 After step 11:
 
@@ -240,6 +251,7 @@ frames, so it looks like any other real frame (CC 5.4.6 item 5).
 | `onion_body_tampered` | Acceptance step 8: the exit's zero check failed. |
 | `onion_period_mismatch` | Acceptance step 9: the period is neither this one nor the last. |
 | `onion_replay` | Acceptance step 10: the replay tag was already seen. |
+| `onion_replay_set_full` | Acceptance step 10: this period's replay set already holds its bound of 62,134 tags. |
 | `onion_hold_deferred` | Acceptance step 11: the relay already holds 256 packets. |
 | `onion_next_hop_unroutable` | No shaped link to the next hop. |
 | `onion_exit_pending_persist` | A FINAL or MAILBOX packet waits for persist's door (v44). |
