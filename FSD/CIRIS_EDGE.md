@@ -1,6 +1,9 @@
 # FSD: CIRISEdge — Reticulum-native federation transport for the CIRIS stack
 
-**Status:** Proposed
+**Status:** Implemented. This is the original architecture spec (2026-05);
+the shipped line is v44.x (v44.1.0). The protocol as it stands is
+[`FSD/CIRIS_EDGE_TRANSPORT.md`](CIRIS_EDGE_TRANSPORT.md); the threat surface
+is [`docs/THREAT_MODEL.md`](../docs/THREAT_MODEL.md).
 **Author:** Eric Moore (CIRIS Team) with Claude Opus 4.7
 **Created:** 2026-05-03
 **Repo:** `~/CIRISEdge` (this document is the spec; code lands in this repo)
@@ -129,8 +132,8 @@ ciris-edge/
 │   ├── handler.rs          ← register_handler, dispatch, error mapping
 │   ├── observability.rs    ← OTLP metrics, structured log hooks
 │   └── messages/
-│       ├── mod.rs          ← shared envelope + signed-bytes canonicalization;
-│       │                      WIRE_VOCABULARY_HASH build-gate pin (CC 0.7)
+│       ├── mod.rs          ← shared envelope + signed-bytes canonicalization
+│       │                      (WIRE_VOCABULARY_HASH pin lives in src/lib.rs)
 │       ├── accord.rs       ← Tier-1 constitutional bodies (DSARRequest stays
 │       │                      Tier-1); PublicKeyRegistration
 │       ├── manifest.rs     ← BuildManifestPublication, ManifestQuery
@@ -266,10 +269,10 @@ existing dedup-key tuple covers application-layer replay detection.
 
 CC 0.7 splits the `MessageType` body union into a **two-tier
 constitutional model**. The authoritative vocabulary lives in
-`CIRISRegistry`'s `manifests/WIRE_VOCABULARY.md` (v1.0.1 §3.3), pinned
-into the crate as the build-gate constant `WIRE_VOCABULARY_HASH:
-[u8; 32]` (`src/messages/mod.rs`) — a sha256 over the spec, guarded by
-the `wire_vocabulary_hash_pinned` test so crate-vs-registry drift fails
+`CIRISConstitution`'s `manifests/WIRE_VOCABULARY.md` (v1.0.2; the split
+is §3.3), pinned into the crate as the build-gate constant
+`WIRE_VOCABULARY_HASH: [u8; 32]` (`src/lib.rs`) — a sha256 over the spec,
+guarded by the `wire_vocabulary_hash_pinned` test so crate-vs-spec drift fails
 the build. `SchemaVersion::V2_0_0` is the new strict-flip default; this
 IS the coordinated wire break.
 
