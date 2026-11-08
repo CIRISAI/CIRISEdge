@@ -2,8 +2,8 @@
 
 # v44.1.0 — what moves to a peer
 
-**2026-11-07.** **MINOR** on the LTS line. Pins persist v61.0.4, CIRISVerify v22.0.0 and leviculum
-**v0.34.0+ciris.1** (cfe450ec).
+**2026-11-08.** **MINOR** on the LTS line. Pins persist **v61.0.5** (048f0993), CIRISVerify v22.0.0 and
+leviculum **v0.34.0+ciris.1** (cfe450ec). Python requires `ciris-persist>=61.0.5,<62`.
 
 **What server must do:**
 - Mirror `SERVE_ADVERTISE_POLICY_HASH` = `14aedf2590745dbac03b9f1f859085c43ead0ce0c67e46d10321d88257aded09`.
@@ -28,12 +28,29 @@
   - **What names the reader moves at any age.** The required read takes grants, key grants and roster
     events on their own pages, so a flood of rows naming a peer cannot push them off, reads a grant's
     `withdraws` through the grant, and reads the record and roster events of each group the peer is in
-    when that set changes. The one row it cannot reach is a third party's `membership:proposal:v1`
-    older than the margin, which waits for the history read until persist has a read by subject.
+    when that set changes. A third party's `membership:proposal:v1` naming the reader, the one row no
+    `to(...)` read reaches, is read by subject through persist 61.0.5's
+    `list_attestations_naming_by_dimension`, newest first from the head every round within a 256-row
+    budget, so it moves on the first round at any age.
   - **The 480 reads were mostly a scan.** `membership::pending_proposals_for` walks the plane, and a
     host polling a pair room called it about 1.6 times a second. `chat::pair_proposal_for` now reads
     the room's index through `membership::pending_proposal_in`. The inbox still scans: nothing
     indexes a row by subject (a persist ask).
+- **One tokio and one sqlite per process.** On a PyO3 host edge's calls run inside a runtime edge
+  owns, so edge's copy of persist code never spawns on a runtime persist's `.so` built (a linux +
+  postgres SIGSEGV in every edge-runtime script, CIRISPersist#1231 for the root). A source-built edge
+  on Linux binds persist's bundled sqlite (CIRISEdge#50 class); a release wheel already shares it and
+  the preload is a no-op there.
+- **The onion relay's replay set is a bounded hold** (CIRISEdge#955, CC 5.3.3.5 E1 rule 9): at most
+  62,134 tags a period, under 8.3 MiB with the last period's; past it a packet is refused
+  `onion_replay_set_full`, never evicted. A node that turned on the Anonymous Tier offers no relay
+  and is never referred as a proxy (CC 5.4.6).
+- **The seat roster reads on a PyO3 host.** A directory capsule lists only the accord set, so the roster
+  read used to fail every 30 s; the bundle's seats now stand and withdrawals still apply.
+- **The wire vocabulary is v1.0.2** (CC rc17 db0d051): `WIRE_VOCABULARY_HASH` = `38bd4847…`, with
+  `GoalDeclaration` and `GoalRetirement` retired, as CC 3.1.9.7 already said.
+- **The weekly bench mesh's A/V legs ride direct links,** as production's do. The threat model and README
+  are regenerated for the 44.x line (CIRISEdge#956).
 - **leviculum 0.34.** The Resource window is `WindowPolicy::ByMedium`: `Adaptive` on TCP, UDP, Auto and
   Local under 1 s round trip, `Current` everywhere else, decided per resource, so a radio hot-plugged
   later stays `Current` and there is no radio exception. This ends the cliff past about 31 ms.
