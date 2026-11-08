@@ -84,12 +84,15 @@ COPY . /src
 
 ARG FEATURES="transport-reticulum,mesh-harness,test-anchor"
 ARG PROFILE=release
+# Cap rustc parallelism on a shared box (`--build-arg BUILD_JOBS=4`); empty
+# = cargo's default (every core), which is what CI uses.
+ARG BUILD_JOBS=""
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     set -eux; \
-    cargo build --profile "${PROFILE}" --features "${FEATURES}" --bin edge_node; \
+    cargo build ${BUILD_JOBS:+-j "${BUILD_JOBS}"} --profile "${PROFILE}" --features "${FEATURES}" --bin edge_node; \
     install -Dm0755 "/src/target/${PROFILE}/edge_node" /out/edge_node
 
 # ─── Stage 3: runtime ───────────────────────────────────────────────

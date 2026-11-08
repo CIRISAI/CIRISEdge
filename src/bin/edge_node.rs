@@ -425,6 +425,15 @@ struct Config {
     /// Ceiling on any single barrier.
     barrier_timeout: Duration,
     results: Option<PathBuf>,
+    /// CIRISEdge#805 item 8 — the facilitator (`host:port`, UDP) this node
+    /// probes when it proposes a direct link. Production resolves it from
+    /// the genesis bundle's canonical, which a node under a test trust root
+    /// never dials (#661), so the harness names its own: the relay, which
+    /// plays the canonical's part (`EDGE_DIRECT_FACILITATOR`).
+    direct_facilitator: Option<String>,
+    /// The UDP port this node serves a facilitator on (a relay, as a
+    /// canonical does at its dial port; `EDGE_SERVE_FACILITATOR_PORT`).
+    serve_facilitator: Option<u16>,
 }
 
 fn env_str(k: &str) -> Option<String> {
@@ -508,6 +517,13 @@ impl Config {
             root_timeout: env_secs("EDGE_ROOT_TIMEOUT_SECS", 120),
             barrier_timeout: env_secs("EDGE_BARRIER_TIMEOUT_SECS", 180),
             results: env_str("EDGE_RESULTS").map(PathBuf::from),
+            direct_facilitator: env_str("EDGE_DIRECT_FACILITATOR"),
+            serve_facilitator: env_str("EDGE_SERVE_FACILITATOR_PORT")
+                .map(|v| {
+                    v.parse()
+                        .map_err(|e| format!("EDGE_SERVE_FACILITATOR_PORT={v:?}: {e}"))
+                })
+                .transpose()?,
         })
     }
 }
@@ -1644,6 +1660,12 @@ struct AvPlaneMediaLink {
     /// Backpressure refusals (#591): the chunk was dropped for that member,
     /// never queued.
     congested: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#805 item 8 — links that came up holding a punched interface.
+    direct: std::sync::atomic::AtomicUsize,
+    /// Sends that met backpressure and went later, inside their deadline.
+    deferred: std::sync::atomic::AtomicUsize,
+    /// How long one chunk may wait out backpressure: the source's pace.
+    patience_ms: std::sync::atomic::AtomicU64,
 }
 
 impl AvPlaneMediaLink {
@@ -1653,6 +1675,9 @@ impl AvPlaneMediaLink {
             links: Mutex::new(BTreeMap::new()),
             refused_too_large: std::sync::atomic::AtomicUsize::new(0),
             congested: std::sync::atomic::AtomicUsize::new(0),
+            direct: std::sync::atomic::AtomicUsize::new(0),
+            deferred: std::sync::atomic::AtomicUsize::new(0),
+            patience_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1668,6 +1693,10 @@ impl AvPlaneMediaLink {
         // The inbound half is unused: members send nothing back on the call
         // link. Dropping it leaves frames on it counted, never routed.
         drop(link.inbound);
+        if link.sender.is_direct() {
+            self.direct
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.links
             .lock()
             .await
@@ -1682,6 +1711,62 @@ impl AvPlaneMediaLink {
     async fn has(&self, member: &str) -> bool {
         self.links.lock().await.contains_key(member)
     }
+
+    /// CIRISEdge#720 — the smallest Channel limit over the opened links: the
+    /// most one wire frame may carry to every member. `None` before any link
+    /// is up.
+    async fn channel_limit(&self) -> Option<usize> {
+        self.links
+            .lock()
+            .await
+            .values()
+            .filter_map(|s| s.channel_limit())
+            .min()
+    }
+}
+
+/// The source's pace: one chunk per this interval (`EDGE_CHUNK_INTERVAL_MS`,
+/// default one per frame of the 15 fps fixture). A live source emits at its
+/// media rate; one that fires every chunk at once is a flood, and the A/V
+/// plane answers a flood with `Congested` by design (#591), never a queue.
+const DEFAULT_CHUNK_INTERVAL_MS: u64 = 66;
+
+/// CIRISEdge#720 — the bytes one media wire frame adds to its plaintext: the
+/// harness frame (magic, kind, header) and both AEAD layers, measured by
+/// sealing an empty plaintext under a header whose numbers are their widest.
+fn media_frame_overhead(
+    stream_id: StreamId,
+    from: &str,
+    dek_bytes: [u8; 32],
+    transit: &[u8; 32],
+) -> Result<usize, String> {
+    let inner = seal_av_inner(
+        &[],
+        &EpochDek::from_bytes(dek_bytes),
+        stream_id,
+        Epoch(u64::MAX),
+        // The widest seq an epoch takes (its counter is u32).
+        ChunkSeq(u64::from(u32::MAX)),
+        CODEC_OPAQUE,
+        ChunkLayer::BASE,
+    )
+    .map_err(|e| format!("seal_av_inner (overhead probe): {e}"))?;
+    let sealed = seal_av_outer(&inner, transit, from.as_bytes(), u64::MAX)
+        .map_err(|e| format!("seal_av_outer (overhead probe): {e}"))?;
+    let header = serde_json::json!({ "seq": usize::MAX, "epoch": u64::MAX, "from": from });
+    Ok(encode_frame(KIND_MEDIA, &header, &sealed.to_bytes()).len())
+}
+
+/// CIRISEdge#720 — cut the encoded stream to the legs' budget, as a media
+/// host does before `Call::publish` (which refuses a frame over
+/// `chunk_plaintext_budget`): every access unit in order, each split into
+/// pieces of at most `budget` bytes. Every piece is real encoded video.
+fn packetize(units: &[Vec<u8>], budget: usize) -> Vec<Vec<u8>> {
+    let budget = budget.max(1);
+    units
+        .iter()
+        .flat_map(|u| u.chunks(budget).map(<[u8]>::to_vec))
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -1702,18 +1787,49 @@ impl MediaLink for AvPlaneMediaLink {
             return Err(format!("no A/V link to {to} (its Ready has not arrived)"));
         };
         let bytes = encode_frame(KIND_MEDIA, header, chunk);
-        match sender.send(&bytes).await {
-            Ok(()) => Ok(()),
-            Err(AvDispatcherError::ChunkTooLarge(refusal)) => {
-                self.refused_too_large.fetch_add(1, Relaxed);
-                Err(refusal.to_string())
+        // Backpressure is waited out until the chunk's own deadline, the next
+        // chunk's slot, and no further: what a call does on a fresh leg
+        // (`av_call::send_patiently`), whose Channel opens at a window of 2
+        // with its handshake still unacked. A chunk the link will not take by
+        // then is dropped and counted, never queued (#591).
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(self.patience_ms.load(Relaxed));
+        loop {
+            match sender.send(&bytes).await {
+                Ok(()) => return Ok(()),
+                Err(AvDispatcherError::ChunkTooLarge(refusal)) => {
+                    self.refused_too_large.fetch_add(1, Relaxed);
+                    return Err(refusal.to_string());
+                }
+                Err(AvDispatcherError::Congested) if tokio::time::Instant::now() < deadline => {
+                    self.deferred.fetch_add(1, Relaxed);
+                    tokio::time::sleep(BACKPRESSURE_RETRY).await;
+                }
+                Err(AvDispatcherError::Congested) => {
+                    self.congested.fetch_add(1, Relaxed);
+                    return Err(AvDispatcherError::Congested.to_string());
+                }
+                Err(e) => return Err(e.to_string()),
             }
-            Err(AvDispatcherError::Congested) => {
-                self.congested.fetch_add(1, Relaxed);
-                Err(AvDispatcherError::Congested.to_string())
-            }
-            Err(e) => Err(e.to_string()),
         }
+    }
+}
+
+/// How long a backpressured chunk waits before it asks the link again (the
+/// call's own `send_patiently` step).
+const BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
+
+/// A late joiner's spawned A/V dial, folded into the leg's open failures.
+async fn finish_av_open(
+    task: tokio::task::JoinHandle<Result<(), String>>,
+    failures: &mut Vec<String>,
+) {
+    let outcome = task
+        .await
+        .unwrap_or_else(|e| Err(format!("A/V dial task: {e}")));
+    if let Err(e) = outcome {
+        tracing::warn!(error = %e, "A/V link did not open (tracked: CIRISEdge#805)");
+        failures.push(e);
     }
 }
 
@@ -2575,6 +2691,23 @@ async fn stand_up(
     }
     // A relay carries other nodes' traffic; leaves do not.
     tcfg = tcfg.with_transport_node(cfg.role == Role::Relay);
+    // CIRISEdge#805 item 8 — direct links, built exactly as the host init
+    // builds them (`init_edge_runtime`, ffi/pyo3.rs): the v44 defaults
+    // (proposing on, accept room peers), the facilitator the host names,
+    // else the bundle's under the #661 gate. A call leg dials a DERIVED
+    // address, which answers only a one-hop neighbour, so across the relay a
+    // leg stands only on a punched interface. With no facilitator nothing
+    // proposes and every leg fails `has_path=false` (CIRISEdge#336): what
+    // this harness measured from 861fdba (#805 item 4) until this was wired.
+    tcfg.direct_links = ciris_edge::transport::direct_path::DirectLinksConfig {
+        facilitator: cfg.direct_facilitator.clone(),
+        serve_facilitator: cfg.serve_facilitator,
+        ..ciris_edge::transport::direct_path::DirectLinksConfig::default()
+    }
+    .resolve_bundle_facilitator(ciris_edge::baked_canonical_dials_allowed(
+        None,
+        ciris_edge::test_trust_root_override_active(),
+    ));
 
     let auth = ReticulumAuth {
         signer: Some(signer),
@@ -4534,7 +4667,7 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
     // admitted member said Ready, i.e. it listens on its call address. A
     // member whose link does not open is reported and its frames fail
     // visibly; the run does not stop.
-    let link = AvPlaneMediaLink::new(Arc::clone(&occ.transport));
+    let link = Arc::new(AvPlaneMediaLink::new(Arc::clone(&occ.transport)));
     let mut av_open_failures: Vec<String> = Vec::new();
     for m in &admitted {
         let opened = match occ.call_address(m) {
@@ -4546,8 +4679,47 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
             av_open_failures.push(e);
         }
     }
+    // CIRISEdge#720 — the stream is cut to what every open leg carries, the
+    // host's half of the contract (`Call::publish` refuses a frame over the
+    // budget; the A/V sender refuses a wire frame over the Channel limit).
+    // With no leg up there is no budget, the units go as they are, and the
+    // open failures above already fail the leg.
+    let chunk_budget = match link.channel_limit().await {
+        Some(limit) => {
+            let (d, t) = epoch_keys(
+                group
+                    .record_secret()
+                    .await
+                    .map_err(|e| format!("record_secret: {e}"))?
+                    .as_bytes(),
+                &stream_id,
+                group.epoch().await,
+            )?;
+            Some(limit.saturating_sub(media_frame_overhead(stream_id, &cfg.node_id, d, &t)?))
+        }
+        None => None,
+    };
+    let units = match chunk_budget {
+        Some(b) => packetize(&units, b),
+        None => units,
+    };
+    let chunk_interval = Duration::from_millis(
+        env_str("EDGE_CHUNK_INTERVAL_MS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_CHUNK_INTERVAL_MS),
+    );
+    link.patience_ms.store(
+        u64::try_from(chunk_interval.as_millis()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let mut pace = tokio::time::interval(chunk_interval);
+    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // A member admitted mid-stream gets its link when its Ready arrives.
     let mut pending_av_open: Option<String> = None;
+    // Its dial runs BESIDE the stream, as a call's legs do (`av_call`
+    // `reconcile_legs` spawns `dial_leg`): a dial that punches first takes
+    // seconds, and a source that stalls for it then fires its backlog at once.
+    let mut av_open_task: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
     let mut delivery_failures = 0usize;
     let mut frames_awaiting_link = 0usize;
     let mut record = *group
@@ -4572,6 +4744,7 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
     let stream_start = Instant::now();
 
     for seq in 0..cfg.frames {
+        pace.tick().await;
         // Mid-stream epoch advance: admit the late joiner, then move the
         // addresses make-before-break. Every existing member must keep
         // receiving across this.
@@ -4693,16 +4866,24 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 .mailbox
                 .try_control_where(|c| matches!(c, Control::Ready { key_id, .. } if *key_id == j))
                 .await;
-            if ready.is_some() {
-                pending_av_open = None;
-                let opened = match occ.call_address(&j) {
-                    Some(addr) => link.open(&j, &addr).await,
-                    None => Err(format!("no call address for {j} in the table")),
-                };
-                if let Err(e) = opened {
-                    tracing::warn!(peer = %j, error = %e, "A/V link did not open (tracked: CIRISEdge#805)");
-                    av_open_failures.push(e);
+            if ready.is_some() && av_open_task.is_none() {
+                let address = occ.call_address(&j);
+                let link = Arc::clone(&link);
+                av_open_task = Some(tokio::spawn(async move {
+                    match address {
+                        Some(addr) => link.open(&j, &addr).await,
+                        None => Err(format!("no call address for {j} in the table")),
+                    }
+                }));
+            }
+            if av_open_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                if let Some(task) = av_open_task.take() {
+                    finish_av_open(task, &mut av_open_failures).await;
                 }
+                pending_av_open = None;
             }
         }
         let plaintext = &units[seq % units.len()];
@@ -4775,6 +4956,11 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
     // The fan-out window is the streaming wall time MINUS the rotation
     // barrier — the barrier is a wait for a peer, not fan-out work.
     let stream_elapsed = stream_start.elapsed().saturating_sub(rotation_stall);
+    // A late joiner's dial still running when the stream ended: its outcome
+    // is still this leg's to report.
+    if let Some(task) = av_open_task.take() {
+        finish_av_open(task, &mut av_open_failures).await;
+    }
 
     for m in &live {
         let _ = send_control(&occ.transport, m, &Control::StreamEnd { frames_sent }).await;
@@ -4815,6 +5001,12 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
             // CIRISEdge#805/#720 — the A/V plane's own numbers.
             "av_links_opened": link.opened().await,
             "av_link_open_failures": av_open_failures,
+            // CIRISEdge#805 item 8 — of the opened links, those riding a
+            // punched interface (the relay is the rendezvous, not the path).
+            "av_links_direct": link.direct.load(std::sync::atomic::Ordering::Relaxed),
+            "chunk_plaintext_budget": chunk_budget,
+            "chunks_in_stream": units.len(),
+            "chunk_interval_ms": chunk_interval.as_millis(),
             "member_delivery_failures": delivery_failures,
             "member_sends_delivered": member_sends_delivered,
             "frames_awaiting_link": frames_awaiting_link,
@@ -4822,6 +5014,7 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 .refused_too_large
                 .load(std::sync::atomic::Ordering::Relaxed),
             "chunks_congested": link.congested.load(std::sync::atomic::Ordering::Relaxed),
+            "sends_deferred_by_backpressure": link.deferred.load(std::sync::atomic::Ordering::Relaxed),
             "observers": cfg.observers.len(),
             "observer_frames_each": OBSERVER_FRAMES.min(cfg.frames),
             "observer_sends_excluded_from_throughput": true,
