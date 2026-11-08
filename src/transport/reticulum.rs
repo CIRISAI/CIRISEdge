@@ -22761,6 +22761,24 @@ mod tests {
         );
     }
 
+    /// The lines inside a `#[cfg(test)] mod … { … }`: not call sites.
+    fn test_mod_lines(lines: &[&str]) -> Vec<bool> {
+        let mut v = vec![false; lines.len()];
+        let mut i = 0;
+        while i + 1 < lines.len() {
+            if lines[i] == "#[cfg(test)]" && lines[i + 1].starts_with("mod ") {
+                let end = lines[i + 2..]
+                    .iter()
+                    .position(|l| *l == "}")
+                    .map_or(lines.len(), |p| i + 2 + p);
+                v[i..end].iter_mut().for_each(|b| *b = true);
+                i = end;
+            }
+            i += 1;
+        }
+        v
+    }
+
     /// CIRISEdge#955 — **an onion frame is read only behind the receiver
     /// order** (CC 5.3.3.5 E1 rule 9: the receiver rates run before expensive
     /// work). The onion decapsulation (`accept_inbound`) is reached only from
@@ -22773,23 +22791,7 @@ mod tests {
     fn an_onion_frame_is_read_only_behind_the_receiver_order() {
         let src = include_str!("reticulum.rs");
         let lines: Vec<&str> = src.lines().collect();
-        // The `#[cfg(test)] mod … { … }` ranges: their lines are not call sites.
-        let in_test_mod: Vec<bool> = {
-            let mut v = vec![false; lines.len()];
-            let mut i = 0;
-            while i + 1 < lines.len() {
-                if lines[i] == "#[cfg(test)]" && lines[i + 1].starts_with("mod ") {
-                    let end = lines[i + 2..]
-                        .iter()
-                        .position(|l| *l == "}")
-                        .map_or(lines.len(), |p| i + 2 + p);
-                    v[i..end].iter_mut().for_each(|b| *b = true);
-                    i = end;
-                }
-                i += 1;
-            }
-            v
-        };
+        let in_test_mod = test_mod_lines(&lines);
         let enclosing = |idx: usize| -> &str {
             lines[..=idx]
                 .iter()
