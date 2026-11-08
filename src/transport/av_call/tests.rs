@@ -427,3 +427,66 @@ async fn admit_takes_a_node_for_its_verified_owner_only() {
         .await
         .expect("a node leaf attending as its owner");
 }
+
+/// **44.1** — a room and its call, installed for the same members at the
+/// same epoch in one table, never collide: the call's addresses are derived
+/// from the call's own secret, not the room's (the field refusal was
+/// `address collision on member … (epoch 1) — reused exporter_secret?`).
+#[tokio::test]
+async fn a_call_s_addresses_are_never_its_room_s() {
+    use crate::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
+    let room = "room-addr";
+    let g = group_of(b"addr", room, &["node-a", "node-b"]).await;
+    let table = ScopeAddressTable::new(Arc::new(ScopePrivacyDeriver));
+    // The room, as `ensure_room_addresses` installs it.
+    let room_snap = crate::cohort_addressing::snapshot(&g).await.unwrap();
+    let room_scope = crate::cohort_addressing::scope_for(room);
+    table
+        .install_group(
+            &room_scope,
+            &room_snap.group_id,
+            room_snap.epoch,
+            &room_snap.destination_secret,
+            &room_snap.members,
+        )
+        .expect("the room's addresses");
+    // Its call, for the same members at the same epoch.
+    let call_group = call_group_id(call_id_for_room(room));
+    let call_snap = room_snapshot(&g, &call_group, &room_snap.members)
+        .await
+        .unwrap();
+    assert_eq!(call_snap.epoch, room_snap.epoch);
+    assert_ne!(call_snap.destination_secret, room_snap.destination_secret);
+    let call_scope = CohortScope::Cohort {
+        cohort_id: room.to_owned(),
+    };
+    table
+        .install_group(
+            &call_scope,
+            &call_group,
+            call_snap.epoch,
+            &call_snap.destination_secret,
+            &call_snap.members,
+        )
+        .expect("the call installs beside its room");
+    for m in ["node-a", "node-b"] {
+        let at_room = table
+            .send_address(&room_scope, &room_snap.group_id, m)
+            .unwrap();
+        let at_call = table.send_address(&call_scope, &call_group, m).unwrap();
+        assert_ne!(at_room, at_call, "{m}'s call address is its room address");
+    }
+    // Deterministic, and bound to the call's group id.
+    let again = room_snapshot(&g, &call_group, &room_snap.members)
+        .await
+        .unwrap();
+    assert_eq!(again.destination_secret, call_snap.destination_secret);
+    assert_ne!(
+        crate::transport::av_call_key::call_destination_secret(
+            &room_snap.destination_secret,
+            &call_group_id(call_id_for_room("room-other")),
+        )
+        .unwrap(),
+        call_snap.destination_secret
+    );
+}

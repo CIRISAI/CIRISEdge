@@ -1536,6 +1536,23 @@ async fn a_room_of_person_leaves_is_called_through_their_nodes() {
         other => panic!("a node acting for another member's person is refused: {other:?}"),
     }
 
+    // The room's own addresses first, as the server's
+    // `ensure_room_addresses` installs them: the person leaves mapped to
+    // their nodes, at the room's epoch. The call installs beside them.
+    let room_nodes = vec![a.key.key_id.clone(), b.key.key_id.clone()];
+    for (nd, g) in [(a, &groups[0]), (b, &groups[1])] {
+        let mut snap = ciris_edge::cohort_addressing::snapshot(g)
+            .await
+            .expect("the room's snapshot");
+        snap.members.clone_from(&room_nodes);
+        nd.lifecycle
+            .install(
+                &ciris_edge::cohort_addressing::scope_for(&room_of(tag)),
+                &snap,
+            )
+            .expect("the room's addresses");
+    }
+
     // W1 — A and B, each acting for its owner (attending as the node, and as
     // the person), the roster asked about the persons only.
     let mut call_a = join_with(

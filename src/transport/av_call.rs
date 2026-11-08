@@ -2085,6 +2085,8 @@ fn leg_outcome(leg: LegSend) -> LegOutcome {
     }
 }
 
+/// The call's addressing snapshot: its members at the room's epoch, under
+/// the call's destination secret ([`crate::transport::av_call_key::call_destination_secret`]).
 async fn room_snapshot(
     room_group: &CohortGroup,
     group_id: &str,
@@ -2098,11 +2100,16 @@ async fn room_snapshot(
                 room: group_id.to_owned(),
                 detail: e.to_string(),
             })?;
+    // The call's own secret, never the room's: the room installs its
+    // addresses for the same members at the same epoch.
+    let destination_secret =
+        crate::transport::av_call_key::call_destination_secret(secret.as_bytes(), group_id)
+            .map_err(|e| CallError::Plumbing(format!("call destination secret: {e:?}")))?;
     Ok(ScopeGroupSnapshot {
         group_id: group_id.to_owned(),
         epoch: room_group.epoch().await,
         members: members.to_vec(),
-        destination_secret: *secret.as_bytes(),
+        destination_secret,
     })
 }
 

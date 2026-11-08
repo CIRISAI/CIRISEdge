@@ -62,6 +62,42 @@ pub enum StreamKeyError {
     Kdf(ciris_crypto::CryptoError),
 }
 
+/// The HKDF info prefix of a room call's destination secret (44.1).
+pub const CALL_DESTINATION_INFO: &[u8] = b"ciris-edge:call-destination:v1";
+
+/// **A room call's destination secret** (44.1): the room's destination-plane
+/// secret `S_dest` (CC 5.4.6, exported under `DESTINATION_EXPORTER_LABEL`)
+/// expanded for the call:
+///
+/// ```text
+/// S_call = HKDF-SHA256(ikm = S_dest, salt = ∅, info = "ciris-edge:call-destination:v1" ‖ utf8(call_group_id))
+/// ```
+///
+/// A call's addresses are derived from `S_call`, never from `S_dest` itself:
+/// a call addresses the same members at the same epoch as its room, so under
+/// the room's own secret every call address WAS the room's address for that
+/// member, and a node holding both in one table refused the call as an
+/// address collision (and an arrival could not say which group it was for).
+/// The info binds the call's group id (`av-stream:` ‖ hex(call id)), so a call
+/// is separated from its room and from every other call. No new MLS exporter
+/// label: the room's destination secret is the one addressing input, as for
+/// every derived address.
+///
+/// # Errors
+/// The HKDF step failed.
+pub fn call_destination_secret(
+    room_destination_secret: &[u8; 32],
+    call_group_id: &str,
+) -> Result<[u8; 32], ciris_crypto::CryptoError> {
+    let mut info = Vec::with_capacity(CALL_DESTINATION_INFO.len() + call_group_id.len());
+    info.extend_from_slice(CALL_DESTINATION_INFO);
+    info.extend_from_slice(call_group_id.as_bytes());
+    let okm = ciris_crypto::kdf::hkdf_sha256(room_destination_secret, &[], &info, 32)?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&okm);
+    Ok(out)
+}
+
 /// The HKDF info of `stream_id`'s DEK at `epoch`: `L ‖ stream_id_utf8 ‖
 /// u64_be(epoch)`.
 #[must_use]
