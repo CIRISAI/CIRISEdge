@@ -2,6 +2,40 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 44.1.2 — 2026-11-09
+
+**`FountainHoldingClaim` is no longer a wire kind** (CIRISEdge#959, CC wire vocabulary v1.0.3, rc17
+a08db38). Holding on the chunk plane is a sealed-chunk custody fact carried as rows and
+acknowledgements (CC 5.3.3.2.4, CC 6.1.5.1). Nothing in production emitted the kind: no edge host
+installs the swarm runtime, and server's shipped wheel never did.
+- **Hash:** `WIRE_VOCABULARY_HASH` = `e0ffb58b0f15938c186f6a4eaa0fbf7393a8a10b9d18378e56b658c25f85a2b6`.
+- **Rejected at decode:** `MessageType::FountainHoldingClaim` is `#[serde(skip_deserializing)]`, so
+  an envelope naming it fails the typed decode (verify step 2) as an unknown kind, before replay,
+  signature or dispatch. That is the vocabulary's "a decoder MUST reject it".
+- **Dropped by name:** the refusal is `VerifyError::SchemaInvalid` led by the token
+  `retired_wire_kind` (`verify::RETIRED_WIRE_KIND_REASON`), a throttled warn
+  `edge.verify.retired_wire_kind_dropped`, and the counter `verify::retired_wire_kind_drops()`. It
+  still counts under `verify_failures_total{schema_invalid}`. `messages::RETIRED_WIRE_KINDS` and
+  `messages::retired_wire_kind` name it.
+- **No fold:** the dispatch arm that fed verified claims into the converged view and an installed
+  swarm runtime (CIRISEdge#184/#545/#763) is gone. `Edge::swarm_convergence` and
+  `converged_claim_view` stay; an armed view now reads converged-to-nothing.
+- **Rust types stay on 44.x:** the variant still serializes, and `FountainHoldingClaim`,
+  `HOLDING_CLAIM_DOMAIN`, `FountainSwarmRuntime` and the `codec-fountain` feature are unchanged, so
+  server's in-process benchmark builds as before. They are removed on the next line that may break,
+  once server 0.5.246 is off them.
+- **Tests:** `tests/retired_wire_kind_959.rs` drives a hybrid-signed claim from a directoried peer
+  through the receive path (`a_received_fountain_holding_claim_is_dropped_by_name_959`, and its twin
+  with a runtime installed). Restoring the fold fails both. `swarm_converger_e2e`'s discriminator
+  test now witnesses the rejection; its envelope round trip and
+  `https_round_trip_fountain_holding_claim` are retired, since they witnessed only the retired kind.
+- **Evidence:** a supporting `CLM-policy-versioning` (CC 2.6.4) row, `src/verify.rs#VerifyPipeline::verify`.
+
+**The Python persist requirement is `ciris-persist>=61.0.5,<61.1`** (was `<62`). Edge 44.1.x is built
+against persist 61.0.5, and some capsules (`BackendDispatch`, `TrustScoring`, the local signer) read
+persist's Rust layout directly with no ABI check. Persist 61.1.0 adds trait methods, so a pip pairing
+with it could misdispatch. The Rust pin is unchanged.
+
 ## 44.1.1 — 2026-11-09
 
 **The shaped frame is 1,400 bytes** (CIRISEdge#963, CC 5.4.3 rc17 a3dd97a). Every shaped link's

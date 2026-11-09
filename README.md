@@ -84,7 +84,7 @@ real video + real blobs through real relays, in CI).
 
 **v44.1.0, the 44.x long-term support line.** Pins `ciris-persist` v61.0.4,
 CIRISVerify v22.0.0 and leviculum v0.34.0+ciris.1 (`Cargo.toml`); CC 1.0-rc17;
-wire vocabulary v1.0.2. Release notes: [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md);
+wire vocabulary v1.0.3 (since v44.1.2). Release notes: [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md);
 threat model and its stated residuals: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 
 **Measured, and its scope.** The multi-container acceptance sweep

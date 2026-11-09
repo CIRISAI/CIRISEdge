@@ -1395,11 +1395,12 @@ pub struct Edge {
     swarm_runtime: Arc<ReinstallableCell<crate::swarm::FountainSwarmRuntime>>,
     /// CIRISEdge#545 — the READ side of the holonomic claim plane.
     ///
-    /// [`Self::swarm_runtime`] above is the WRITE side: verified inbound
-    /// `FountainHoldingClaim` envelopes go into the converger and stop
-    /// there. This is the tap that makes the converged state askable —
-    /// see [`crate::holonomic::converged_view`] for why it taps the
-    /// dispatch arm rather than projecting the converger's own map.
+    /// [`Self::swarm_runtime`] above was the WRITE side: verified inbound
+    /// `FountainHoldingClaim` envelopes went into the converger. That wire
+    /// kind is retired (CIRISEdge#959, CC wire vocabulary v1.0.3) and is
+    /// rejected at decode, so since 44.1.2 nothing on the wire feeds this
+    /// view: an armed view reads converged-to-nothing. The reader stays as
+    /// public API until the types are removed on a breaking line.
     ///
     /// NOT a `ReinstallableCell`: unlike the runtime, this is always
     /// present (an unarmed view answers "unknown", which is the correct
@@ -2640,10 +2641,12 @@ impl Edge {
     ///
     /// - [`Self::swarm_runtime_handle`] returns the registered
     ///   runtime (None until install).
-    /// - The operator's inbound dispatch path routes verified
-    ///   [`MessageType::FountainHoldingClaim`] envelopes into
-    ///   [`crate::swarm::FountainSwarmRuntime::register_observed_claim`]
-    ///   (CIRISEdge#184 v6.3.0 — the v5.2.0 deferral closed here).
+    /// - CIRISEdge#959 (44.1.2): inbound dispatch NO LONGER routes
+    ///   anything into the runtime. The `FountainHoldingClaim` wire kind it
+    ///   fed (CIRISEdge#184) is retired by the CC wire vocabulary v1.0.3 and
+    ///   rejected at decode; an installed runtime only sees what its host
+    ///   hands [`crate::swarm::FountainSwarmRuntime::register_observed_claim`]
+    ///   in-process.
     ///
     /// CIRISEdge#391 — LAST-WINS (was set-once first-wins): a re-install
     /// replaces the prior runtime and is live from the next inbound frame
@@ -2671,6 +2674,11 @@ impl Edge {
     /// CIRISEdge#545 — **read the converged view**: what this node has
     /// converged about its cohort, from the signed `FountainHoldingClaim`
     /// plane its peers publish on.
+    ///
+    /// CIRISEdge#959 (44.1.2) — that plane is retired on the wire (CC wire
+    /// vocabulary v1.0.3): a received claim is rejected at decode, so this
+    /// reader no longer sees any peer's claim and an armed view reads
+    /// converged-to-nothing. Kept as public API for the 44.x line.
     ///
     /// Counts only. No peer id, `content_id`, or symbol id is reachable
     /// through this surface — the intended consumer is a public
@@ -4553,8 +4561,6 @@ impl Edge {
             self.config.delegation_graph_max_depth,
             self.canonical_peers.clone(),
             self.blob_chunk_source.get(),
-            self.swarm_runtime.get().as_ref(),
-            &self.converged_claims,
             &self.blob_scope_router(),
             &self.first_contact_wiring(),
         )
@@ -5591,11 +5597,8 @@ impl Edge {
         let delegation_trust_roots = self.canonical_peers.clone();
         // CIRISEdge#55 v3.4.0-pre1 — server-side responder hook.
         let blob_chunk_source = Arc::clone(&self.blob_chunk_source);
-        // CIRISEdge#184 (v6.3.0) — swarm-runtime inbound hook for
-        // verified `MessageType::FountainHoldingClaim` envelopes.
-        // Clone of the `Arc<OnceLock<Arc<FountainSwarmRuntime>>>`; the
-        // OnceLock load inside the dispatch is a cheap atomic.
-        let swarm_runtime = self.swarm_runtime.clone();
+        // CIRISEdge#959 — no swarm-runtime inbound hook: the wire kind it
+        // fed (`FountainHoldingClaim`) is retired and rejected at decode.
         // CIRISEdge#545 — arm the READ side here, at the top of the
         // inbound loop, and NOT lazily on the first observed claim.
         // Arming is what turns silence into evidence: from this instant
@@ -5605,7 +5608,6 @@ impl Edge {
         // observation window rather than re-reporting a known-empty mesh
         // as unknown.
         self.converged_claims.arm();
-        let converged_claims = self.converged_claims.clone();
         // CIRISEdge#499 — the handle the blob scope gate reads its address table
         // from. Captured as the TRANSPORT, not as a pre-built router, because
         // `install_scope_address_table` may fire after `run` starts (the MLS
@@ -5670,8 +5672,6 @@ impl Edge {
                     let delegation_trust_roots_clone = delegation_trust_roots.clone();
                     // Per frame: `Edge::arm_fold_host` may set it after `run`.
                     let blob_chunk_source_clone = blob_chunk_source.get().cloned();
-                    let swarm_runtime_clone = swarm_runtime.clone();
-                    let converged_claims_clone = converged_claims.clone();
                     // CIRISEdge#683 — per frame, like the registry: the bridge
                     // may be (re-)installed after `run` starts.
                     let first_contact_clone = FirstContactWiring {
@@ -5723,8 +5723,6 @@ impl Edge {
                             delegation_graph_max_depth,
                             delegation_trust_roots_clone,
                             blob_chunk_source_clone.as_ref(),
-                            swarm_runtime_clone.get().as_ref(),
-                            &converged_claims_clone,
                             &blob_scope_router,
                             &first_contact_clone,
                         ).await;
@@ -6454,8 +6452,6 @@ fn select_reply_transport(
         trust_scoring,
         delegation_trust_roots,
         blob_chunk_source,
-        swarm_runtime,
-        converged_claims,
         blob_scope_router,
         first_contact,
     ),
@@ -6544,20 +6540,6 @@ async fn dispatch_inbound(
     // inbound `BlobChunkFetch` envelopes. None → silently drop the
     // envelope (same posture as ContentFetch in edge#21 phase 1).
     blob_chunk_source: Option<&Arc<dyn crate::blob_swarm::BlobChunkSource>>,
-    // CIRISEdge#184 (v6.3.0) — optional swarm orchestration runtime.
-    // When set (via `Edge::install_swarm_runtime`), verified inbound
-    // `MessageType::FountainHoldingClaim` envelopes are routed into
-    // `register_observed_claim`. When None, the envelope is observed
-    // (verify still runs) but no runtime hook fires — same posture as
-    // `blob_chunk_source` for the chunked-blob swarm.
-    swarm_runtime: Option<&Arc<crate::swarm::FountainSwarmRuntime>>,
-    // CIRISEdge#545 — the READ side of the same claim plane. NOT
-    // `Option`: the tap fires on every verified holding claim whether or
-    // not a converger is installed, because "what has this node
-    // converged about its cohort" is a question about the claim plane,
-    // not about whether an eviction policy happens to be running. The
-    // old arm dropped the envelope entirely with no runtime installed.
-    converged_claims: &crate::holonomic::converged_view::ConvergedClaimView,
     // CIRISEdge#499 — the blob plane's scope-address resolver, read from the
     // transport's installed table so there is exactly ONE source of truth for
     // "is this node scope-native". Default (no table) leaves the blob serve gate
@@ -7895,71 +7877,13 @@ async fn dispatch_inbound(
     // (the body is already a `RawValue`), and keeping the two paths
     // independent is structurally simpler than threading a parsed
     // body through the erased dispatch.
-    // CIRISEdge#184 (v6.3.0) — swarm-converger wire-up. Verified
-    // `MessageType::FountainHoldingClaim` envelopes route into the
-    // installed runtime's `register_observed_claim`. AV-9 verify-then-
-    // dispatch invariant is preserved because we're past the verify
-    // gate at this point. When no runtime is installed, the envelope
-    // is observed but no hook fires (same posture as `blob_chunk_source`
-    // for the chunked-blob swarm).
-    //
-    // CIRISEdge#545 — the parse moved OUT of the `if let Some(runtime)`
-    // and the READ-side tap fires first, unconditionally. Two
-    // consequences, both wanted: the converged view answers on a node
-    // that never installed a converger (the claim plane is what it
-    // reports on, not the eviction policy), and a malformed body on a
-    // VERIFIED envelope now warns whether or not a runtime is listening
-    // — that warning was previously invisible on exactly the
-    // deployments least likely to notice.
-    if envelope.message_type == MessageType::FountainHoldingClaim {
-        match serde_json::from_str::<crate::holonomic::swarm_rarity::FountainHoldingClaim>(
-            envelope.body.get(),
-        ) {
-            Ok(claim) => {
-                // CIRISEdge#763 (CC 6.1.5.3) — a `self`/`family` holding
-                // claim counts only from a SIGNER inside the content's cohort
-                // audience (persist's answer; the runtime checks the claim's
-                // `peer_id` as well). A refused claim reaches neither the
-                // converged view nor the converger.
-                let admitted = match swarm_runtime {
-                    Some(runtime) => runtime
-                        .claim_admission(&claim.content_id, &envelope.signing_key_id)
-                        .await
-                        .is_announced(),
-                    None => true,
-                };
-                // Tap by reference, then hand the claim to the converger
-                // by value — no clone. Both sides see the identical
-                // post-AV-9 claim.
-                if admitted {
-                    converged_claims.observe(&claim);
-                }
-                if let Some(runtime) = swarm_runtime.filter(|_| admitted) {
-                    // CIRISEdge#582 — SignatureOnly, and precisely that. We
-                    // are past the AV-9 verify gate, so the claim's hybrid
-                    // signature is real; nothing here or anywhere else in
-                    // the protocol has asked this peer to prove it holds
-                    // the bytes. Naming the weaker state is what keeps a
-                    // signature from being counted as possession on the one
-                    // path that deletes.
-                    runtime
-                        .register_observed_claim(
-                            claim,
-                            crate::holonomic::swarm_rarity::HoldingClaimVerification::SignatureOnly,
-                        )
-                        .await;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    transport = ?transport,
-                    sender_key_id = %envelope.signing_key_id,
-                    "FountainHoldingClaim body parse failed at dispatch (history: CIRISEdge#184)",
-                );
-            }
-        }
-    }
+    // CIRISEdge#959 — no `FountainHoldingClaim` arm. The wire vocabulary
+    // v1.0.3 retired the kind; `MessageType::FountainHoldingClaim` is
+    // `skip_deserializing`, so such an envelope is rejected as an unknown
+    // kind at the typed decode (verify step 2, named there as
+    // `retired_wire_kind`) and can never reach this point. The arm that
+    // folded verified claims into the converged view and the installed
+    // swarm runtime (CIRISEdge#184/#545/#763) is gone with it.
 
     // CC 0.7 opaque wire vocabulary (CIRISEdge#241, v8.0.0) — three
     // dispatch arms. Edge treats `payload` as opaque bytes throughout;

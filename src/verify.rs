@@ -1324,6 +1324,46 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
     }
 }
 
+/// CIRISEdge#959 — the stable reason token for an inbound envelope naming a
+/// wire kind the CC wire vocabulary has retired
+/// ([`crate::messages::RETIRED_WIRE_KINDS`]). It leads the
+/// [`VerifyError::SchemaInvalid`] text and is the `reason` field of the
+/// throttled drop warn.
+pub const RETIRED_WIRE_KIND_REASON: &str = "retired_wire_kind";
+
+static RETIRED_WIRE_KIND_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static RETIRED_WIRE_KIND_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#959 — process-wide count of inbound envelopes dropped at the
+/// typed decode because they named a retired wire kind. Monotonic; a reader
+/// diffs two samples.
+#[must_use]
+pub fn retired_wire_kind_drops() -> u64 {
+    RETIRED_WIRE_KIND_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// CIRISEdge#959 — the named drop of a retired wire kind: count it, and warn
+/// at most a few times a minute per kind (a peer still running a pre-44.1.2
+/// publisher repeats every `publish_cadence`).
+fn drop_retired_wire_kind(kind: &'static str) {
+    RETIRED_WIRE_KIND_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let throttle = RETIRED_WIRE_KIND_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(60), 8)
+    });
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } = throttle.check(kind) {
+        tracing::warn!(
+            event = "edge.verify.retired_wire_kind_dropped",
+            reason = RETIRED_WIRE_KIND_REASON,
+            kind,
+            suppressed_prev,
+            "inbound envelope DROPPED — retired wire kind, rejected at decode as an unknown \
+             kind (CC wire vocabulary v1.0.3; tracked: CIRISEdge#959)"
+        );
+    }
+}
+
 /// Verify-pipeline errors. Each maps to a typed wire reject code
 /// returned to the sender — no silent drops (MISSION.md §3 anti-
 /// pattern 6).
@@ -1484,8 +1524,25 @@ impl VerifyPipeline {
         }
 
         // Step 2 — typed envelope deserialize (AV-14).
-        let envelope: EdgeEnvelope = serde_json::from_slice(envelope_bytes)
-            .map_err(|e| VerifyError::SchemaInvalid(format!("envelope parse: {e}")))?;
+        //
+        // CIRISEdge#959 — a discriminator the wire vocabulary has retired
+        // (`MessageType::FountainHoldingClaim`, v1.0.3) is
+        // `skip_deserializing`, so it fails HERE as an unknown kind, before
+        // replay, signature or dispatch. The failure is named, not filed as
+        // generic garbage: a stable `retired_wire_kind` reason token on a
+        // throttled warn, and the error text carries the kind.
+        let envelope: EdgeEnvelope = serde_json::from_slice(envelope_bytes).map_err(|e| {
+            match crate::messages::retired_wire_kind(envelope_bytes) {
+                Some(kind) => {
+                    drop_retired_wire_kind(kind);
+                    VerifyError::SchemaInvalid(format!(
+                        "{RETIRED_WIRE_KIND_REASON}: {kind} is not a wire kind \
+                         (CC wire vocabulary v1.0.3)"
+                    ))
+                }
+                None => VerifyError::SchemaInvalid(format!("envelope parse: {e}")),
+            }
+        })?;
 
         // Step 3 — schema-version allowlist (AV-7). Exhaustive match
         // means a future variant rejects at compile time until we

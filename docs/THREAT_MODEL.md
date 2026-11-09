@@ -13,7 +13,7 @@ line, not per minor; a minor that changes a vector below amends it in place.
 | `leviculum-core` / `-std` / `-lxmf` | tag `v0.34.0+ciris.1` | `Cargo.toml:952-963` |
 | Python wheel floor | `ciris-persist>=61.0.4,<62` | `pyproject.toml:123` |
 | Constitution text | CC 1.0-rc17 (namespace manifests vendored at rc15, `ace6b74`) | `docs/RELEASE_NOTES.md` (v44.0.0); `src/cc_namespace.rs:31` |
-| Wire vocabulary | `WIRE_VOCABULARY.md` **v1.0.2**, sha256 `38bd4847…` | `src/lib.rs:159-169`; `CIRISConstitution/manifests/WIRE_VOCABULARY.md` |
+| Wire vocabulary | `WIRE_VOCABULARY.md` **v1.0.3** (v44.1.2; `FountainHoldingClaim` retired, rejected at decode, CIRISEdge#959), sha256 `e0ffb58b…` | `src/lib.rs:160-173`; `CIRISConstitution/manifests/WIRE_VOCABULARY.md` |
 
 **Audience:** federation peers integrating against `ciris-edge`, security
 reviewers, downstream substrate consumers (`CIRISServer`, `CIRISAgent`,
@@ -372,7 +372,7 @@ AV-4 residual). Edge inherits the same exposure and the same closure
 path — a future change to persist's canonicalizer rolls out via persist
 version pin in edge's `Cargo.toml`.
 
-**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md §3.3; v1.0.1 when written, unchanged in v1.0.2):** for a Tier-2
+**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md §3.3; v1.0.1 when written, unchanged through v1.0.3):** for a Tier-2
 opaque `payload` (`OpaqueRequest` / `OpaqueResponse` / `OpaqueEvent`),
 **edge canonicalizes nothing** — the `payload` is opaque bytes edge
 carries verbatim, so the AV-5 canonicalization-mismatch surface does
@@ -455,7 +455,7 @@ verify under some condition. PR review + the verify_enforcement test
 category catch this; the test passes only if zero unverified
 invocations occur over N>=1M fuzz runs.
 
-**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md §3.3; v1.0.1 when written, unchanged in v1.0.2):** a verified
+**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md §3.3; v1.0.1 when written, unchanged through v1.0.3):** a verified
 Tier-2 `OpaqueRequest` whose `kind: u32` has no registered handler is
 **not** silently dropped. The handler replies
 `OpaqueResponse { kind: <echo>, status: 501, payload: b"unknown kind" }`
@@ -541,7 +541,7 @@ upstream of edge.
 transports, body-size flood is a defense-in-depth gap on novel
 transports. Track at every new-transport PR.
 
-**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md §3.3; v1.0.1 when written, unchanged in v1.0.2):** the
+**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md §3.3; v1.0.1 when written, unchanged through v1.0.3):** the
 `MAX_BODY_BYTES` cap applies to the Tier-2 opaque `payload` on
 `OpaqueRequest` / `OpaqueResponse` / `OpaqueEvent` exactly as it does
 to any Tier-1 body. Edge treats `payload` as opaque bytes and enforces
@@ -1465,7 +1465,8 @@ disagreeing about state.
 
 **Implementation surfaces (v3.10.0, locked at v1)**:
 
-- `src/holonomic/swarm_rarity.rs` — `FountainHoldingClaim` canonical
+- `src/holonomic/swarm_rarity.rs` — `FountainHoldingClaim` (no longer a
+  wire kind since v44.1.2, CIRISEdge#959; the Rust type stays on 44.x) canonical
   field order: `(peer_id, content_id, symbol_ids, observed_at_unix_ms,
   claim_version)`; `compute_rarity_score` deterministic by holding-
   claim count and lex-min tie-break.
@@ -2006,7 +2007,7 @@ If any of these is violated, the threat model breaks.
 6. **Clocks within ~5 minutes** across peers (AV-3); onion periods assume
    the same global clock (CC 5.4.6 item 7).
 7. **The wire vocabulary pin matches the CC artifact** (`WIRE_VOCABULARY.md`
-   v1.0.2, `src/lib.rs:169`; test `wire_vocabulary_hash_pinned`).
+   v1.0.3, `src/lib.rs:170`; test `wire_vocabulary_hash_pinned`).
 8. **The host is not compromised at root** (process memory, debugger,
    coredump are out of scope).
 9. **The host pulls the levers it is meant to pull.** With no host pulling,

@@ -158,17 +158,18 @@ pub mod verify;
 pub mod version;
 
 /// CC 0.7 wire-vocabulary pin (CIRISEdge#241, v8.0.0). The SHA-256 of
-/// `WIRE_VOCABULARY.md` as ratified (v1.0.2, rc17 db0d051: the retired
-/// `GoalDeclaration` / `GoalRetirement` kinds, CC 3.1.9.7, are gone).
+/// `WIRE_VOCABULARY.md` as ratified (v1.0.3, rc17 a08db38: the retired
+/// `GoalDeclaration` / `GoalRetirement` kinds, CC 3.1.9.7, are gone since
+/// v1.0.2, and `FountainHoldingClaim` is retired in v1.0.3, CIRISEdge#959).
 /// Downstream conformance harnesses assert this const matches the spec
 /// byte-hash they carry, so an accidental vocabulary drift
 /// (new typed variant re-introduced, opaque contract changed) is a
 /// compile-visible pin failure rather than a silent wire skew.
 ///
-/// sha256 = 38bd4847c1203ae6da7b26c560ee51b577daaab4ef2d7924067995769100829e
+/// sha256 = e0ffb58b0f15938c186f6a4eaa0fbf7393a8a10b9d18378e56b658c25f85a2b6
 pub const WIRE_VOCABULARY_HASH: [u8; 32] = [
-    0x38, 0xbd, 0x48, 0x47, 0xc1, 0x20, 0x3a, 0xe6, 0xda, 0x7b, 0x26, 0xc5, 0x60, 0xee, 0x51, 0xb5,
-    0x77, 0xda, 0xaa, 0xb4, 0xef, 0x2d, 0x79, 0x24, 0x06, 0x79, 0x95, 0x76, 0x91, 0x00, 0x82, 0x9e,
+    0xe0, 0xff, 0xb5, 0x8b, 0x0f, 0x15, 0x93, 0x8c, 0x18, 0x6f, 0x6a, 0x4e, 0xaa, 0x0f, 0xbf, 0x73,
+    0x93, 0xa8, 0xa1, 0x0b, 0x9d, 0x18, 0x37, 0x8e, 0x56, 0xb6, 0x58, 0xc2, 0x5f, 0x85, 0xa2, 0xb6,
 ];
 
 #[cfg(test)]
@@ -179,7 +180,7 @@ mod wire_vocabulary_hash_tests {
     /// A drift here is a coordinated wire-break signal, not a bug fix.
     #[test]
     fn wire_vocabulary_hash_pinned() {
-        const HEX: &str = "38bd4847c1203ae6da7b26c560ee51b577daaab4ef2d7924067995769100829e";
+        const HEX: &str = "e0ffb58b0f15938c186f6a4eaa0fbf7393a8a10b9d18378e56b658c25f85a2b6";
         let mut expected = [0u8; 32];
         for (i, byte) in expected.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&HEX[i * 2..i * 2 + 2], 16).unwrap();

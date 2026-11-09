@@ -231,23 +231,53 @@ pub enum MessageType {
     Withdraws,
 
     // ─── CIRISEdge#184 (v6.3.0) — swarm-converger wire-up ───────────
-    /// Federation-level fountain holding claim. Signed wire discriminator
-    /// for the substrate's
-    /// [`crate::holonomic::swarm_rarity::FountainHoldingClaim`] body
-    /// (locked v1 canonical-bytes layout per
-    /// [`crate::holonomic::swarm_rarity::HOLDING_CLAIM_DOMAIN`]). The
-    /// FountainSwarmRuntime publisher emits one envelope per held
-    /// `content_id` per cohort peer on each `publish_cadence` tick;
-    /// inbound dispatch routes verified envelopes into
-    /// [`crate::swarm::FountainSwarmRuntime::register_observed_claim`].
+    // ─── RETIRED by WIRE_VOCABULARY.md v1.0.3 (CC rc17 a08db38) ─────
+    /// **Retired wire kind** (CIRISEdge#959, edge 44.1.2). Was the signed
+    /// discriminator for the substrate's
+    /// [`crate::holonomic::swarm_rarity::FountainHoldingClaim`] body.
     ///
-    /// Ephemeral, fire-and-forget — the substrate composes whether or
-    /// not peers respond, and stale observations age out via the
-    /// runtime's TTL prune.
+    /// The wire vocabulary v1.0.3 retires it: holding on the chunk plane is a
+    /// sealed-chunk custody fact (CC 5.3.3.2.4, CC 6.1.5.1) carried as rows
+    /// and acknowledgements, and "a decoder that meets the discriminator MUST
+    /// reject it as an unknown kind". `skip_deserializing` is that rejection:
+    /// an inbound envelope naming `"FountainHoldingClaim"` fails the typed
+    /// envelope decode (verify step 2, AV-14) exactly as an unknown kind does,
+    /// so it never reaches the verify path, the converged view or a swarm
+    /// runtime. The verify pipeline names the drop
+    /// ([`retired_wire_kind`]).
     ///
-    /// Closes the v5.2.0 wire-tier deferral (the runtime's publisher
-    /// shipped `canonical_bytes` raw until this discriminator landed).
+    /// The variant itself stays SERIALIZABLE on the 44.x LTS line only so the
+    /// Rust types downstream benches still build against keep compiling
+    /// (`FountainSwarmRuntime`'s signed publisher, `impl Message for
+    /// FountainHoldingClaim`); nothing in production emits it. The variant and
+    /// its Rust types are removed on the next line that may break.
+    #[serde(skip_deserializing)]
     FountainHoldingClaim,
+}
+
+/// CIRISEdge#959 — the wire discriminators the CC wire vocabulary has retired
+/// and that [`MessageType`] still names as a Rust variant. Each is
+/// `#[serde(skip_deserializing)]`, so a decoder rejects it as an unknown kind;
+/// this list lets the rejection be named rather than read as generic garbage.
+pub const RETIRED_WIRE_KINDS: &[&str] = &["FountainHoldingClaim"];
+
+/// CIRISEdge#959 — the retired wire kind an envelope names, if any.
+///
+/// Called only on the failure path of the typed envelope decode: it re-reads
+/// the bytes for a string `message_type` and matches it against
+/// [`RETIRED_WIRE_KINDS`]. `None` for anything else, including bytes that are
+/// not a JSON object at all.
+#[must_use]
+pub fn retired_wire_kind(envelope_bytes: &[u8]) -> Option<&'static str> {
+    #[derive(Deserialize)]
+    struct KindPeek {
+        message_type: String,
+    }
+    let peek: KindPeek = serde_json::from_slice(envelope_bytes).ok()?;
+    RETIRED_WIRE_KINDS
+        .iter()
+        .copied()
+        .find(|kind| *kind == peek.message_type)
 }
 
 /// CIRISEdge#37 — `testimonial_witness` envelope slot per FSD-002
@@ -2076,6 +2106,47 @@ impl Message for Withdraws {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CIRISEdge#959 — the retired discriminator fails the typed envelope
+    /// decode as an unknown kind, and [`retired_wire_kind`] names it on that
+    /// failure path (and names nothing else).
+    #[test]
+    fn a_retired_wire_kind_fails_the_envelope_decode_and_is_named_959() {
+        let envelope = |kind: &str| {
+            serde_json::json!({
+                "edge_schema_version": "v2_0_0",
+                "signing_key_id": "alice",
+                "destination_key_id": "bob",
+                "message_type": kind,
+                "sent_at": "2026-11-09T00:00:00Z",
+                "nonce": [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                "body": {"peer_id": "alice", "content_id": "c", "symbol_ids": [1],
+                         "observed_at_unix_ms": 1},
+                "signature": "",
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let retired = envelope("FountainHoldingClaim");
+        let err = serde_json::from_slice::<EdgeEnvelope>(&retired)
+            .expect_err("a retired wire kind must not decode");
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+        assert_eq!(retired_wire_kind(&retired), Some("FountainHoldingClaim"));
+
+        // A live kind decodes and is not named retired.
+        let live = envelope("OpaqueEvent");
+        let parsed: EdgeEnvelope = serde_json::from_slice(&live).expect("live kind decodes");
+        assert_eq!(parsed.message_type, MessageType::OpaqueEvent);
+        assert_eq!(retired_wire_kind(&live), None);
+        // Garbage and an unknown-but-never-ours kind are not named retired.
+        assert_eq!(retired_wire_kind(b"not json"), None);
+        assert_eq!(retired_wire_kind(&envelope("NoSuchKind")), None);
+        // The Rust variant still serializes for the 44.x line.
+        assert_eq!(
+            serde_json::to_string(&MessageType::FountainHoldingClaim).unwrap(),
+            "\"FountainHoldingClaim\""
+        );
+    }
 
     fn fixture_attestation() -> DeliveryAttestation {
         // Same fixture as persist v2.2.0

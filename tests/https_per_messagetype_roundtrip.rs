@@ -514,19 +514,9 @@ async fn https_round_trip_withdraws() {
     .await;
 }
 
-#[tokio::test]
-async fn https_round_trip_fountain_holding_claim() {
-    // CIRISEdge#184 (v6.3.0) — swarm-converger wire-up. Body shape
-    // mirrors `FountainHoldingClaim` minus the hybrid-PQC signature
-    // fields (signatures ride the envelope layer, not the body —
-    // matches the substrate's locked v1 canonical bytes contract).
-    https_envelope_round_trip(
-        0x1b,
-        "FountainHoldingClaim",
-        br#"{"peer_id":"alice","content_id":"shard-X","symbol_ids":[1,2,3],"observed_at_unix_ms":1700000000,"claim_version":1}"#,
-    )
-    .await;
-}
+// CIRISEdge#959 (44.1.2) — `https_round_trip_fountain_holding_claim` is
+// retired: `FountainHoldingClaim` is no longer a wire kind (CC wire vocabulary
+// v1.0.3), so there is no per-kind HTTPS round trip to witness.
 
 // ─── Cross-cutting: mTLS-required rejects un-directoried client ────-
 
@@ -726,6 +716,8 @@ fn all_message_types_have_https_round_trip_test() {
         (MessageType::BlobChunkMiss, "BlobChunkMiss"),
         (MessageType::StewardDirective, "StewardDirective"),
         (MessageType::Withdraws, "Withdraws"),
+        // CIRISEdge#959 — still serializes (Rust type kept on 44.x); it no
+        // longer decodes, see tests/retired_wire_kind_959.rs.
         (MessageType::FountainHoldingClaim, "FountainHoldingClaim"),
     ] {
         let serde_repr = serde_json::to_value(variant).expect("serde MessageType");

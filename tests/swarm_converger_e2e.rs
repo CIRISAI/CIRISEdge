@@ -8,9 +8,12 @@
 //!
 //! ## Test plan
 //!
-//! 1. **Wire-format round-trip**: `MessageType::FountainHoldingClaim`
-//!    discriminator string is `"FountainHoldingClaim"`; the body
-//!    serializes via `EdgeEnvelope` and round-trips byte-for-byte.
+//! 1. **Wire kind retired** (CIRISEdge#959, 44.1.2): the CC wire
+//!    vocabulary v1.0.3 retires `FountainHoldingClaim`. The discriminator
+//!    still SERIALIZES (the Rust type stays on 44.x) but no longer decodes —
+//!    it is rejected as an unknown kind. The former envelope byte-for-byte
+//!    round-trip test is retired: it witnessed only the retired wire kind.
+//!    The receive-path witness is `tests/retired_wire_kind_959.rs`.
 //! 2. **Diversity-aware ejection**: five-peer cluster where two are
 //!    low-RTT to the local peer and three are high-RTT. Over-target
 //!    condition. Assert the local peer's `should_eject_with_diversity`
@@ -31,75 +34,27 @@ use ciris_edge::holonomic::swarm_rarity::{
     should_eject_above_target, should_eject_with_diversity, ConsentState, EjectionVerdict,
     FountainHoldingClaim, HoldingClaimVerification, RarityScore,
 };
-use ciris_edge::messages::{EdgeEnvelope, MessageType, SchemaVersion};
+use ciris_edge::messages::MessageType;
 use ciris_edge::swarm::{
     diversity_contribution, diversity_scores_for, NullRttObserver, PeerRttObserver,
 };
 
 // ─── Wire-format round-trip ──────────────────────────────────────
 
-/// Test fixture: build an `EdgeEnvelope` around a `FountainHoldingClaim`
-/// body with empty signatures (we're asserting the wire shape, not
-/// the verify path).
-fn fixture_envelope(claim: &FountainHoldingClaim) -> EdgeEnvelope {
-    let body_value = serde_json::to_value(claim).expect("body serialize");
-    let body = serde_json::value::to_raw_value(&body_value).expect("body raw");
-    EdgeEnvelope {
-        edge_schema_version: SchemaVersion::V2_0_0,
-        signing_key_id: "alice".to_string(),
-        destination_key_id: "bob".to_string(),
-        message_type: MessageType::FountainHoldingClaim,
-        sent_at: chrono::Utc::now(),
-        nonce: [0u8; 16],
-        body,
-        signature: String::new(),
-        signature_pqc: None,
-        in_reply_to: None,
-        testimonial_witness: None,
-        key_boundary_scope: None,
-        cohort_scope: None,
-    }
-}
-
+/// CIRISEdge#959 — the discriminator string is unchanged on serialize, and
+/// a decoder rejects it as an unknown kind (WIRE_VOCABULARY.md v1.0.3).
 #[test]
-fn fountain_holding_claim_message_type_serializes_to_expected_wire_string() {
+fn fountain_holding_claim_discriminator_is_rejected_at_decode_959() {
     let m = MessageType::FountainHoldingClaim;
     let s = serde_json::to_string(&m).expect("serialize");
-    // MessageType has no #[serde(rename_all = ...)] so the wire form
-    // is the bare PascalCase variant name in double quotes. This is
-    // the discriminator the registry CEG §11 cross-reference comment
-    // names — locked here as a regression gate.
     assert_eq!(s, "\"FountainHoldingClaim\"");
 
-    // Deserialize round-trip — the wire string is the discriminator
-    // peers MUST recognize.
-    let parsed: MessageType =
-        serde_json::from_str("\"FountainHoldingClaim\"").expect("deserialize");
-    assert_eq!(parsed, MessageType::FountainHoldingClaim);
-}
-
-#[test]
-fn fountain_holding_claim_envelope_round_trips_byte_for_byte() {
-    let claim = FountainHoldingClaim::new(
-        "alice".to_string(),
-        "content-X".to_string(),
-        vec![1, 2, 3],
-        1_700_000_000,
+    let err = serde_json::from_str::<MessageType>("\"FountainHoldingClaim\"")
+        .expect_err("a retired wire kind must not decode");
+    assert!(
+        err.to_string().contains("unknown variant"),
+        "rejected as an unknown kind, got: {err}"
     );
-    let env = fixture_envelope(&claim);
-    let serialized = serde_json::to_string(&env).expect("envelope serialize");
-    let parsed: EdgeEnvelope = serde_json::from_str(&serialized).expect("envelope deserialize");
-    assert_eq!(parsed.message_type, MessageType::FountainHoldingClaim);
-    assert_eq!(parsed.signing_key_id, "alice");
-    assert_eq!(parsed.destination_key_id, "bob");
-
-    // The body must decode to a FountainHoldingClaim and match the
-    // original.
-    let body: FountainHoldingClaim = serde_json::from_str(parsed.body.get()).expect("body decode");
-    assert_eq!(body.peer_id, "alice");
-    assert_eq!(body.content_id, "content-X");
-    assert_eq!(body.symbol_ids, vec![1, 2, 3]);
-    assert_eq!(body.observed_at_unix_ms, 1_700_000_000);
 }
 
 // ─── Diversity-aware ejection ─────────────────────────────────────

@@ -668,6 +668,19 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
         ],
         supporting: false,
     },
+    TestEvidence {
+        cc: "2.6.4",
+        clm: "CLM-policy-versioning",
+        property: "a Tier-1 kind the hash-pinned wire vocabulary retires (FountainHoldingClaim, v1.0.3) is rejected at the typed decode as an unknown kind and dropped by name; it never reaches dispatch",
+        impl_anchor: "src/verify.rs#VerifyPipeline::verify",
+        witness: &[
+            "tests/retired_wire_kind_959.rs#a_received_fountain_holding_claim_is_dropped_by_name_959",
+            "tests/retired_wire_kind_959.rs#a_received_fountain_holding_claim_never_reaches_an_installed_runtime_959",
+            "src/messages/mod.rs#a_retired_wire_kind_fails_the_envelope_decode_and_is_named_959",
+            "tests/opaque_conformance.rs#wire_vocabulary_hash_pinned",
+        ],
+        supporting: true,
+    },
 ];
 
 /// Every edge-tagged field edge does NOT process with a runtime value-check —
