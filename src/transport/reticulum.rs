@@ -715,11 +715,16 @@ impl FragmentSendOutcome {
 /// CC 5.3.3.5 E1 — each fragment is SEALED under the link's keys first. A link
 /// with no keys sends nothing (`link_unsealed`, counted by the caller's
 /// metrics as `link_seal_refused_unsealed_send`).
+///
+/// CIRISEdge#962 — `lane` is the shaper lane the fragments queue on when the
+/// link is shaped (the caller reads it from the whole frame,
+/// [`crate::transport::link_shaping::Lane::of`]); unshaped, it is unused.
 async fn send_fragments_on_channel(
     node: &ReticulumNode,
     seals: &crate::transport::link_seal::LinkSeals,
     shapers: &crate::transport::link_shaping::LinkShapers,
     link_id: &LinkId,
+    lane: crate::transport::link_shaping::Lane,
     fragments: &[Vec<u8>],
 ) -> FragmentSendOutcome {
     let total = fragments.len();
@@ -728,7 +733,7 @@ async fn send_fragments_on_channel(
     // shaped body size by `send_mdu`). Queued is sent, for this outcome: the
     // Channel still sequences and retransmits each frame.
     if let Some(shaper) = shapers.get(link_id.into_bytes()) {
-        return match shaper.enqueue(fragments.to_vec()) {
+        return match shaper.enqueue(lane, fragments.to_vec()) {
             Ok(_) => FragmentSendOutcome {
                 sent: total,
                 total,
@@ -5836,7 +5841,13 @@ impl ReticulumTransport {
         if let Some(fragments) = crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
             .filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
         {
-            let outcome = self.send_channel_marked(link_id, &fragments).await;
+            let outcome = self
+                .send_channel_marked(
+                    link_id,
+                    crate::transport::link_shaping::Lane::of(envelope_bytes),
+                    &fragments,
+                )
+                .await;
             if outcome.complete() {
                 // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
                 note_outbound_use(&self.link_last_outbound_at, link_id);
@@ -7644,7 +7655,13 @@ impl ReticulumTransport {
         let Some(fragments) = crate::transport::frame_fragment::fragment(bytes, mdu) else {
             return (0, 0);
         };
-        let out = self.send_channel_marked(id, &fragments).await;
+        let out = self
+            .send_channel_marked(
+                id,
+                crate::transport::link_shaping::Lane::of(bytes),
+                &fragments,
+            )
+            .await;
         (out.sent, out.total)
     }
 
@@ -8193,7 +8210,9 @@ impl ReticulumTransport {
             let cap = crate::transport::link_shaping::body_capacity(shaper.agreement().frame_bytes);
             let frags = crate::transport::frame_fragment::fragment(&frame, cap)
                 .ok_or(tokens::ROUTE_FAILED)?;
-            shaper.enqueue(frags).map_err(|e| e.label())?;
+            shaper
+                .enqueue(crate::transport::link_shaping::Lane::Sync, frags)
+                .map_err(|e| e.label())?;
             Ok(())
         }
         .await;
@@ -9461,6 +9480,7 @@ impl ReticulumTransport {
     async fn send_channel_marked(
         &self,
         link_id: LinkId,
+        lane: crate::transport::link_shaping::Lane,
         fragments: &[Vec<u8>],
     ) -> FragmentSendOutcome {
         let _busy = OutboundShipGuard::new(&self.outbound_ship_active, link_id);
@@ -9484,6 +9504,7 @@ impl ReticulumTransport {
                     &self.seals,
                     &self.shapers,
                     &link_id,
+                    lane,
                     fragments,
                 )
                 .await
@@ -9498,6 +9519,7 @@ impl ReticulumTransport {
                     &self.seals,
                     &self.shapers,
                     &link_id,
+                    lane,
                     &fragments[..landed],
                 )
                 .await;
@@ -10188,7 +10210,13 @@ impl ReticulumTransport {
                 if let Some(fragments) =
                     fragments.filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
                 {
-                    let outcome = self.send_channel_marked(link_id, &fragments).await;
+                    let outcome = self
+                        .send_channel_marked(
+                            link_id,
+                            crate::transport::link_shaping::Lane::of(envelope_bytes),
+                            &fragments,
+                        )
+                        .await;
                     if outcome.complete() {
                         // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
                         note_outbound_use(&self.link_last_outbound_at, link_id);
@@ -10278,7 +10306,13 @@ impl ReticulumTransport {
                     {
                         // CIRISEdge#636 — absorb the Channel's pacing instead of
                         // reading it as failure (the `fragments_sent=0` signature).
-                        let outcome = self.send_channel_marked(link_id, &fragments).await;
+                        let outcome = self
+                            .send_channel_marked(
+                                link_id,
+                                crate::transport::link_shaping::Lane::of(envelope_bytes),
+                                &fragments,
+                            )
+                            .await;
                         let (sent, total) = (outcome.sent, outcome.total);
                         if outcome.complete() {
                             // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
@@ -10448,11 +10482,16 @@ impl ReticulumTransport {
             // A queued row is not delivered: the link can close before its
             // frame fires (a reap, a peer gone) and the body goes with the
             // shaper. `Ok` here is the durable dispatcher's transport ack, so
-            // it waits for the last fragment to LEAVE (the FIFO ticket against
-            // real frames confirmed sent), bounded by the Poisson p99 for
-            // that many frames; past the bound the send is retried.
+            // it waits for the last fragment to LEAVE (its lane's ticket
+            // against real frames confirmed sent, CIRISEdge#962), bounded by
+            // the Poisson p99 for that many frames; past the bound the send is
+            // retried. A contact row (`Lane::of`) leaves ahead of the link's
+            // serve and sync backlog.
             let frames = fragments.len();
-            return match shaper.enqueue(fragments) {
+            return match shaper.enqueue(
+                crate::transport::link_shaping::Lane::of(envelope_bytes),
+                fragments,
+            ) {
                 Ok(ticket) => {
                     let first = ticket + 1 - u64::try_from(frames).unwrap_or(u64::MAX);
                     let budget = shaper.leave_budget(frames);
@@ -10663,6 +10702,10 @@ impl ReticulumTransport {
 impl Transport for ReticulumTransport {
     fn pacing_gap(&self, destination_key_id: &str) -> Option<Duration> {
         self.shapers.gap_to_peer(destination_key_id)
+    }
+
+    fn pacing_row_bound(&self, destination_key_id: &str) -> Option<Duration> {
+        self.shapers.row_bound_to_peer(destination_key_id)
     }
 
     fn id(&self) -> TransportId {
@@ -13737,8 +13780,9 @@ impl DialCtx {
     }
 
     /// CC 5.4.3 — a dialled link moved onto a punched interface: it is one hop
-    /// now, so the first `SHAP` goes out, at the link's MDU. The dialler offers
-    /// and the peer answers, as on any dial; the seal's transition window
+    /// now, so the first `SHAP` goes out, at the shaped frame (1,400 B, or the
+    /// link's smaller MDU). The dialler offers and the peer answers, as on any
+    /// dial; the seal's transition window
     /// covers frames that cross it.
     async fn shape_after_direct(&self, link_id: LinkId) {
         let link = link_id.into_bytes();
@@ -13826,6 +13870,7 @@ impl DialCtx {
             &self.seals,
             &self.shapers,
             &link_id,
+            crate::transport::link_shaping::Lane::Contact,
             &[offer.encode()],
         )
         .await;
@@ -16862,9 +16907,15 @@ async fn answer_shaping_offer(
             refused,
         );
     } else {
-        let out =
-            send_fragments_on_channel(ctx.node, ctx.seals, ctx.shapers, &link_id, &[ours.encode()])
-                .await;
+        let out = send_fragments_on_channel(
+            ctx.node,
+            ctx.seals,
+            ctx.shapers,
+            &link_id,
+            crate::transport::link_shaping::Lane::Contact,
+            &[ours.encode()],
+        )
+        .await;
         if !out.complete() {
             shaping_teardown(
                 ctx,
@@ -16935,9 +16986,12 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
             // envelope).
             // choke-ok: a full queue on a fresh link is impossible; the body
             // is 6 bytes.
-            let _ = shaper.enqueue(vec![crate::transport::link_shaping::capability_body(
-                ctx.shapers.reported_slots(),
-            )]);
+            let _ = shaper.enqueue(
+                crate::transport::link_shaping::Lane::Contact,
+                vec![crate::transport::link_shaping::capability_body(
+                    ctx.shapers.reported_slots(),
+                )],
+            );
             spawn_shaper_task(
                 Arc::clone(ctx.av_node),
                 Arc::clone(ctx.seals),
@@ -17090,7 +17144,15 @@ fn spawn_refusal_send(
     closes: bool,
 ) {
     tokio::spawn(async move {
-        let out = send_fragments_on_channel(&node, &seals, &shapers, &link_id, &frames).await;
+        let out = send_fragments_on_channel(
+            &node,
+            &seals,
+            &shapers,
+            &link_id,
+            crate::transport::link_shaping::Lane::Contact,
+            &frames,
+        )
+        .await;
         if !closes {
             return;
         }
@@ -17198,8 +17260,12 @@ async fn handle_onion_frame(ctx: &EventCtx<'_>, link_id: LinkId, data: &[u8]) {
                 let frame = crate::onion::relay::onion_frame(&packet);
                 let cap =
                     crate::transport::link_shaping::body_capacity(shaper.agreement().frame_bytes);
-                let sent = crate::transport::frame_fragment::fragment(&frame, cap)
-                    .is_some_and(|f| shaper.enqueue(f).is_ok());
+                let sent =
+                    crate::transport::frame_fragment::fragment(&frame, cap).is_some_and(|f| {
+                        shaper
+                            .enqueue(crate::transport::link_shaping::Lane::Sync, f)
+                            .is_ok()
+                    });
                 onion.count(if sent {
                     tokens::FORWARDED
                 } else {
@@ -17364,12 +17430,12 @@ fn spawn_shaper_task(
     tokio::spawn(async move {
         let link = link_id.into_bytes();
         loop {
-            let (bytes, real, ticket) = match shaper.next_emission().await {
+            let (bytes, real, tickets) = match shaper.next_emission().await {
                 Emission::Frame {
                     bytes,
                     real,
-                    ticket,
-                } => (bytes, real, ticket),
+                    tickets,
+                } => (bytes, real, tickets),
                 Emission::Stopped => break,
             };
             let Ok(sealed) = seals.seal(link, Lane::Channel, &bytes) else {
@@ -17386,7 +17452,7 @@ fn spawn_shaper_task(
             if let Ok(Ok(())) = sent {
                 seals.tap_frame(link, &sealed);
                 if real {
-                    shaper.note_sent(ticket);
+                    shaper.note_sent(tickets);
                     if let Some(m) = metrics.as_ref() {
                         m.telemetry.shaping_windows.note_real(shaper.class());
                     }
@@ -17409,7 +17475,7 @@ fn spawn_shaper_task(
             }
             if matches!(&sent, Ok(Err(e)) if is_over_channel_limit(e)) {
                 if real {
-                    shaper.note_sent(ticket);
+                    shaper.note_sent(tickets);
                 }
                 if let Some(m) = metrics.as_ref() {
                     m.inc_link_shaping(crate::observability::LINK_SHAPING_FRAME_TOO_LARGE);
@@ -19483,7 +19549,15 @@ async fn push_own_announce_frame(
         }
         return;
     };
-    let outcome = send_fragments_on_channel(node, seals, shapers, link_id, &fragments).await;
+    let outcome = send_fragments_on_channel(
+        node,
+        seals,
+        shapers,
+        link_id,
+        crate::transport::link_shaping::Lane::Contact,
+        &fragments,
+    )
+    .await;
     let (sent, total) = (outcome.sent, outcome.total);
     if outcome.complete() {
         tracing::debug!(link = ?link_id, bytes = frame.len(), fragments = total,
@@ -19539,7 +19613,15 @@ async fn push_own_owner_binding(
         }
         return;
     };
-    let outcome = send_fragments_on_channel(node, seals, shapers, link_id, &fragments).await;
+    let outcome = send_fragments_on_channel(
+        node,
+        seals,
+        shapers,
+        link_id,
+        crate::transport::link_shaping::Lane::Contact,
+        &fragments,
+    )
+    .await;
     if outcome.complete() {
         if let Some(m) = metrics {
             m.inc_first_contact(crate::first_contact::OWNER_BINDING_PUSHED);
@@ -19593,7 +19675,15 @@ async fn push_own_bundle_frames(
         }
         return;
     };
-    let outcome = send_fragments_on_channel(node, seals, shapers, link_id, &fragments).await;
+    let outcome = send_fragments_on_channel(
+        node,
+        seals,
+        shapers,
+        link_id,
+        crate::transport::link_shaping::Lane::Contact,
+        &fragments,
+    )
+    .await;
     let (sent, total) = (outcome.sent, outcome.total);
     if outcome.complete() {
         tracing::debug!(

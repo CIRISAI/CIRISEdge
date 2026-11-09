@@ -915,6 +915,13 @@ impl ReplicationCoordinator {
         self.transport.pacing_gap(&self.peer_key_id)
     }
 
+    /// CIRISEdge#963 — the longest the shaped link to this peer lets one row
+    /// wait to leave ([`Transport::pacing_row_bound`]): the scheduler's outer
+    /// bound on a send exceeds it.
+    pub(crate) fn pacing_row_bound(&self) -> Option<std::time::Duration> {
+        self.transport.pacing_row_bound(&self.peer_key_id)
+    }
+
     fn outcome_to_step(outcome: ReplicationOutcome) -> DriveStep {
         match outcome {
             ReplicationOutcome::Send(msgs) => DriveStep::SendThenWait(msgs),

@@ -274,16 +274,15 @@ impl RoundGate {
 /// transport itself never would: a live, progressing transfer is not severed.
 pub const ROUND_SEND_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// A shaped link's sender waits up to 16 of its gaps for a row to leave
-/// (`link_shaping::ROW_LEAVE_MAX_GAPS`); this is that, with a margin.
-pub const PACING_SEND_GAPS: f64 = 17.0;
-
-/// The bound on one send on a link with frame gap `gap`.
+/// The bound on one send on a link whose sender lets a row wait up to
+/// `row_bound` to leave ([`crate::transport::Transport::pacing_row_bound`],
+/// `link_shaping::LinkShaper::row_leave_cap`): that, with a sixteenth more, so
+/// the shaper's own retraction always ends the send first and the retry never
+/// sends a row twice. CIRISEdge#963: it was 17 gaps against the shaper's 16,
+/// which held only while a 64 KiB row was five frames.
 #[must_use]
-pub fn pacing_send_timeout(gap: Option<Duration>) -> Duration {
-    gap.map_or(ROUND_SEND_TIMEOUT, |g| {
-        ROUND_SEND_TIMEOUT.max(g.mul_f64(PACING_SEND_GAPS))
-    })
+pub fn pacing_send_timeout(row_bound: Option<Duration>) -> Duration {
+    row_bound.map_or(ROUND_SEND_TIMEOUT, |b| ROUND_SEND_TIMEOUT.max(b + b / 16))
 }
 
 /// A round's place at the gate. The gate bounds what rounds cost the blocking
@@ -1804,7 +1803,7 @@ async fn run_one_recovery_round(
     // the Pull is stamped with it and its Summary reply routes into this
     // round's inbox rather than the on-demand one.
     let round = coord.begin_round().await;
-    let bound = pacing_send_timeout(coord.pacing_gap());
+    let bound = pacing_send_timeout(coord.pacing_row_bound());
     let pulled = seat
         .send(round_timeout, bound, coord.send_recovery_ask())
         .await;
@@ -1862,7 +1861,7 @@ async fn drive_exchange_to_completion(
     first_step: DriveStep,
     seat: &mut RoundSeat<'_>,
 ) -> Result<DriveStep, RoundError> {
-    let bound = pacing_send_timeout(coord.pacing_gap());
+    let bound = pacing_send_timeout(coord.pacing_row_bound());
     let mut step = first_step;
     loop {
         // CIRISEdge#380 — initiator-final: send the messages, then the round
@@ -3237,15 +3236,19 @@ mod tests {
         let _ = run.await;
     }
 
+    /// CIRISEdge#963 — the outer bound on a send outlasts the shaper's own
+    /// row bound, so the shaper retracts first: a 64 KiB row on
+    /// `phone-cellular` at the 1,400 B frame waits about 330 s, past the
+    /// 180 s floor.
     #[test]
-    fn a_send_on_a_shaped_link_is_bounded_by_its_gaps() {
+    fn a_send_on_a_shaped_link_is_bounded_by_its_row_bound() {
         assert_eq!(pacing_send_timeout(None), ROUND_SEND_TIMEOUT);
         assert_eq!(
-            pacing_send_timeout(Some(Duration::from_secs(1))),
+            pacing_send_timeout(Some(Duration::from_secs(60))),
             ROUND_SEND_TIMEOUT
         );
-        let cellular = Duration::from_secs(47);
-        assert!(pacing_send_timeout(Some(cellular)) > cellular.mul_f64(16.0));
+        let cellular_row = Duration::from_secs(328);
+        assert!(pacing_send_timeout(Some(cellular_row)) > cellular_row);
     }
 
     const REDIAL_CADENCE: Duration = Duration::from_secs(30);

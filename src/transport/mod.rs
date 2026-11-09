@@ -243,8 +243,9 @@ pub mod route_fetch;
 #[cfg(feature = "_reticulum-module")]
 pub mod shaping_referral;
 
-/// CC 5.4.3 — link shaping (`CLM-link-shaping`): constant MDU-sized frames at
-/// Poisson times on a shaped identity link, both ways, negotiated right after
+/// CC 5.4.3 — link shaping (`CLM-link-shaping`): constant 1,400 B frames (or
+/// the link's smaller MDU) at Poisson times on a shaped identity link, both
+/// ways, two queue lanes (contact first), negotiated right after
 /// the transit KEX; budget classes, ρ and W as steward knobs; A/V excluded.
 #[cfg(feature = "_reticulum-module")]
 pub mod link_shaping;
@@ -862,6 +863,17 @@ pub trait Transport: Send + Sync + 'static {
     /// 4.74 gaps and a round interval of about 7.75 gaps). `None` on an
     /// unshaped link or a transport without shaping.
     fn pacing_gap(&self, destination_key_id: &str) -> Option<std::time::Duration> {
+        let _ = destination_key_id;
+        None
+    }
+
+    /// CIRISEdge#963 — the longest the shaped link to `destination_key_id`
+    /// lets one row wait to leave before its sender retracts it (the leave
+    /// budget of the largest shaped row at the link's frame): what the outer
+    /// bound on a round's send must exceed. `None` on an unshaped link or a
+    /// transport without shaping. It is a time, not a count of gaps, because a
+    /// row's frames depend on the frame size (five at 16 KB, 48 at 1,400 B).
+    fn pacing_row_bound(&self, destination_key_id: &str) -> Option<std::time::Duration> {
         let _ = destination_key_id;
         None
     }

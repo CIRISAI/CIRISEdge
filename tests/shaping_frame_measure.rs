@@ -1,10 +1,12 @@
 //! CC 5.4.3 measurement — the shaped frame at the link's channel payload MDU
-//! (16,272 B over TCP, today) against a capped frame (the 1,400 B proposal,
-//! with 1,200 / 2,048 / 4,096 beside it). Not a gate: every test here is
-//! `#[ignore]`; run with `--ignored --nocapture`.
+//! (16,272 B over TCP, the 44.1.0 frame) against a capped frame (1,400 B, the
+//! production frame since CC 5.4.3 rc17 and edge 44.1.1, with 1,200 / 2,048 /
+//! 4,096 beside it). Not a gate: every test here is `#[ignore]`; run with
+//! `--ignored --nocapture`.
 //!
-//! Everything runs edge's PRODUCTION primitives: the agreement comes from
-//! `ShapingOffer::from_policy` + `agree` at each frame; frames are cut by
+//! Everything runs edge's PRODUCTION primitives: the agreement is the class
+//! byte rate at each frame (production offers quote at most 1,400 B, so the
+//! arms above it are built at the frame directly); frames are cut by
 //! `frame_fragment::fragment` at `body_capacity`; `wrap`/`wrap_multi`/`unwrap`
 //! frame them; the `PoissonScheduler` and `BudgetMeter` drive the stream; the
 //! contact story runs real `LinkShaper`s (coalescing on, as between v44
@@ -28,8 +30,8 @@ use std::time::{Duration, Instant};
 use ciris_edge::emission::{BudgetMeter, BudgetState, PoissonScheduler, ScopeKey};
 use ciris_edge::transport::frame_fragment::{fragment, Reassembler};
 use ciris_edge::transport::link_shaping::{
-    agree, body_capacity, unwrap, wrap, wrap_multi, Agreement, BudgetClass, Emission, LinkShaper,
-    ShapedFrame, ShapingOffer, ShapingPolicy, DEFAULT_QUEUE_CAP,
+    agree, body_capacity, queue_bytes_for, unwrap, wrap, wrap_multi, Agreement, BudgetClass,
+    Emission, Lane, LinkShaper, ShapedFrame, ShapingOffer, ShapingPolicy,
 };
 
 /// The TCP channel payload MDU the 0.5.245 rig agreed (`REFERENCE_FRAME_BYTES`).
@@ -54,11 +56,22 @@ fn frames() -> Vec<usize> {
     env_list("FM_FRAMES", &[MDU, 4096, 2048, 1400, 1200])
 }
 
-/// The proposal: min(cap, MDU), the agreement both ends compute.
+/// The agreement at min(frame, MDU): the production one both ends compute at
+/// 1,400 B and below, and the class byte rate at the frame above it.
 fn agreement(class: BudgetClass, frame: usize) -> Agreement {
     let p = ShapingPolicy::for_class(class);
-    let o = ShapingOffer::from_policy(&p, frame.min(MDU));
-    agree(&o, &o).expect("both shape")
+    let frame = frame.min(MDU);
+    let o = ShapingOffer::from_policy(&p, frame);
+    let a = agree(&o, &o).expect("both shape");
+    if usize::from(a.frame_bytes) == frame {
+        return a;
+    }
+    let frame_bytes = u16::try_from(frame).expect("a u16 frame");
+    Agreement {
+        lambda: f64::from(p.bytes_per_s) / f64::from(frame_bytes),
+        frame_bytes,
+        ..a
+    }
 }
 
 fn class_of(name: &str) -> BudgetClass {
@@ -343,7 +356,7 @@ fn fm1_real_share_grid() {
 fn fm1b_catch_up_burst() {
     let classes: Vec<String> = env_list("FM_CLASSES", &["server".to_owned(), "home".to_owned()]);
     let bursts: Vec<usize> = env_list("FM_BURST_ROWS", &[50usize, 200, 400]);
-    println!("FM1B class burst_rows burst_bytes frame lambda target drain_p50_s drain_max_s blocked first_win_share max_queue queue_cap");
+    println!("FM1B class burst_rows burst_bytes frame lambda target drain_p50_s drain_max_s blocked first_win_share max_queue queue_bytes");
     for c in &classes {
         let class = class_of(c);
         let rate = f64::from(ShapingPolicy::for_class(class).bytes_per_s);
@@ -371,7 +384,7 @@ fn fm1b_catch_up_burst() {
                     s.blocked,
                     s.max_window_share,
                     s.max_queue,
-                    DEFAULT_QUEUE_CAP,
+                    queue_bytes_for(&a),
                 );
             }
         }
@@ -442,10 +455,10 @@ fn run_direction(
                 Emission::Frame {
                     bytes,
                     real,
-                    ticket,
+                    tickets,
                 } => {
                     if real {
-                        s.note_sent(ticket);
+                        s.note_sent(tickets);
                     }
                     if deliver.send(bytes).is_err() {
                         return;
@@ -498,7 +511,7 @@ impl Pair {
             let sh = Arc::new(LinkShaper::new_seeded(
                 [s; 16],
                 a,
-                DEFAULT_QUEUE_CAP,
+                queue_bytes_for(&a),
                 [s; 32],
             ));
             sh.enable_coalescing();
@@ -535,7 +548,7 @@ impl Pair {
 
 fn send(s: &LinkShaper, msg: &[u8]) {
     let cap = body_capacity(s.agreement().frame_bytes);
-    s.enqueue(fragment(msg, cap).expect("fragments"))
+    s.enqueue(Lane::of(msg), fragment(msg, cap).expect("fragments"))
         .expect("queued");
 }
 

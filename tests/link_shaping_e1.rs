@@ -2677,7 +2677,7 @@ async fn e8_the_status_tracks_the_bound_the_class_and_the_peers() {
     );
     let figures = a.figures.as_ref().expect("shapes");
     assert_eq!(figures.frame_bytes, link.frame_bytes);
-    // A TCP link's channel payload is the reference frame, measured here.
+    // A TCP link runs the shaped frame, the reference one (CC 5.4.3 rc17).
     assert_eq!(figures.frame_bytes, REFERENCE_FRAME_BYTES);
     assert!((figures.gap_s - reference_gap).abs() < 1e-9);
     assert_eq!(a.peers.len(), 1);
@@ -3043,9 +3043,10 @@ async fn a_real_link_moves_the_event_path_telemetry() {
     assert_eq!(s.shaping_free_slots, 0, "admit-close offers no slot");
 }
 
-/// The shaped frame the 1,400 B proposal caps a link at (plaintext, the `SHPF`
-/// header included, before the E1 seal).
-const ONION_TEST_FRAME: usize = 1_400;
+/// The production shaped frame (CC 5.4.3 rc17: 1,400 B plaintext, the `SHPF`
+/// header included, before the E1 seal), which a loopback TCP link (16,272 B
+/// channel payload) runs at with no test cap.
+const ONION_TEST_FRAME: usize = ciris_edge::transport::link_shaping::SHAPED_FRAME_BYTES as usize;
 
 /// Both ends of `t` run the Anonymous Tier as relays: a deal of nine stand-in
 /// relays per period (three a layer, every one answering), this node's hop
@@ -3086,9 +3087,9 @@ fn onion_relay_on(
 
 /// **CC 5.4.3 × 5.4.6 — an onion packet crosses a 1,400 B shaped link in
 /// fragments and arrives intact.** An onion packet is a fixed 15,296 B
-/// (`onion::packet::PACKET`); at the TCP channel payload MDU it rides one
-/// shaped frame body, at a 1,400 B frame it is cut by the `CFRG` fragmenter
-/// into twelve. B publishes over a route A → B → A, so the packet crosses the
+/// (`onion::packet::PACKET`); at the TCP channel payload MDU it rode one
+/// shaped frame body, at the production 1,400 B frame (no test cap: the link
+/// agrees it on its own) it is cut by the `CFRG` fragmenter into twelve. B publishes over a route A → B → A, so the packet crosses the
 /// capped link three times (B→A, A→B, B→A), each time fragmented at the
 /// sender's shaper, reassembled at the receiver and PEELED there: a single
 /// wrong byte fails the hop's AEAD, and only an intact packet at the last hop
@@ -3105,13 +3106,9 @@ async fn an_onion_packet_crosses_a_1400_byte_shaped_link_in_fragments_and_arrive
     let _host = share_host().await;
     let fast = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     let t = duo("onion1400", fast.clone(), fast).await;
-    t.a.transport
-        .set_shaped_frame_cap_for_test(ONION_TEST_FRAME);
-    t.b.transport
-        .set_shaped_frame_cap_for_test(ONION_TEST_FRAME);
     t.a.transport.set_link_wire_tap_for_test(true);
     t.b.transport.set_link_wire_tap_for_test(true);
-    // The link comes up shaped at the capped frame.
+    // The link comes up shaped at the production frame.
     let hello = marked(b"ONION-LINK-UP-", 600);
     t.b.transport
         .send(&t.a.key.key_id, &hello)
@@ -3136,7 +3133,7 @@ async fn an_onion_packet_crosses_a_1400_byte_shaped_link_in_fragments_and_arrive
     assert_eq!(
         usize::from(frame),
         ONION_TEST_FRAME,
-        "agreed at the capped frame"
+        "agreed at the shaped frame, below the link's MDU"
     );
     // The onion frame (`CONP` ‖ packet) spans many shaped frames here.
     let onion_frame = 4 + PACKET;
@@ -3227,7 +3224,7 @@ async fn an_onion_packet_crosses_a_1400_byte_shaped_link_in_fragments_and_arrive
 /// **Measurement, not a gate** — contact-like latency over a REAL loopback
 /// shaped pair: `FM_K` request/response exchanges (B asks, A answers), `FM_REQ`
 /// / `FM_RESP` bytes, at `FM_RATE` B/s per link (default 7,000, `server`) and
-/// a frame capped at `FM_CAP` (0 = the link's channel payload MDU),
+/// a frame capped at `FM_CAP` (0 = the production shaped frame, 1,400 B),
 /// `FM_SAMPLES` contacts. Prints p50/p90.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measurement, not a gate"]
