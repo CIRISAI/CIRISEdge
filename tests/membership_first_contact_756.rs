@@ -759,10 +759,11 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
         joined,
         "the reply comes back to the proposer's node and A widens K in (I22)"
     );
-    assert!(
-        !b.holds(&to_z).await,
-        "a proposal to a third person never reached B while it was a stranger"
-    );
+    // CIRISEdge#968 — no post-join `to_z` check here. B's person is a member
+    // now, and a family-target proposal reaching a member's node is persist's
+    // `may_receive` to decide (CC 5.2). The old clause passed only while A's
+    // send-set memo was stale for 10 s after the widening. The stranger
+    // period is checked above, before the acceptance.
 
     // 3. K is a member; A consents to B and a later G row reaches B on the
     //    ordinary member path (consent reach + the group's audience).

@@ -1137,6 +1137,7 @@ fn spawn_coord(
 }
 
 #[allow(clippy::too_many_arguments)] // the per-coordinator loop's wiring, one seam each
+#[allow(clippy::too_many_lines)] // one select loop: the kick and tick arms decide the next round together
 async fn run_one_coordinator_forever(
     coord: Arc<ReplicationCoordinator>,
     cadence: Duration,
@@ -1237,19 +1238,18 @@ async fn run_one_coordinator_forever(
                         redial_at = Some(hold);
                         (delay, NextRound::Redial)
                     }
-                    RoundRan::Unanswered => match first_contact.unanswered(
-                        peer_answers_elsewhere(&bootstrap, &peer_id, coord.kind(), current_cadence),
-                        current_cadence,
-                    ) {
-                        Some(delay) => {
+                    RoundRan::Unanswered => {
+                        if let Some(delay) = first_contact.unanswered(
+                            peer_answers_elsewhere(&bootstrap, &peer_id, coord.kind(), current_cadence),
+                            current_cadence,
+                        ) {
                             interval.reset_after(delay);
                             (delay, NextRound::FirstContactRetry)
-                        }
-                        None => {
+                        } else {
                             interval.reset();
                             (current_cadence, NextRound::Cadence)
                         }
-                    },
+                    }
                     RoundRan::Completed | RoundRan::Ended => {
                         if ran == RoundRan::Completed {
                             first_contact.answered();

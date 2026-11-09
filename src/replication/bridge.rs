@@ -12137,24 +12137,6 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// CIRISEdge#523 — the node whose `owner_of` an ADMITTED attestation could
-    /// have moved, if any. Three shapes, and the split is deliberate:
-    ///
-    /// - a `delegates_to` is an owner-binding only when persist's OWN predicate
-    ///   ([`is_owner_binding_envelope`](ciris_persist::federation::admission::is_owner_binding_envelope))
-    ///   says so — never a locally re-derived dimension string (the capability-token
-    ///   provenance rule: import the authority's predicate, don't reinvent it);
-    /// - a `withdraws` / `recants` carries NO owner-binding dimension of its own
-    ///   — it names the edge it retracts by `references_attestation_id` — so it
-    ///   is impossible to tell from the row alone whether it retracts one. We
-    ///   drop the entry for its subject regardless: a memo eviction costs one
-    ///   directory walk, and the other direction is a node keeping a withdrawn
-    ///   owner for a whole TTL;
-    /// - a `supersedes` carrying the owner-binding body is the WIDENING persist's
-    ///   `widen_audience` writes — the announce route (CIRISEdge#682) — and moves
-    ///   announce state;
-    /// - everything else (`scores`, …) moves nothing, so the highest-volume
-    ///   plane pays only a string compare.
     /// CIRISEdge#968 — `(what, author, subject, id)` for a row a first
     /// contact waits on: an owner-binding (`owner → node`, persist's
     /// `is_owner_binding_envelope`) or a chat KeyPackage. `None` for every
@@ -12175,10 +12157,28 @@ impl FederationDirectoryReplicationBridge {
             what,
             att.attesting_key_id.clone(),
             att.attested_key_id.clone(),
-            att.attestation_id.to_string(),
+            att.attestation_id.clone(),
         ))
     }
 
+    /// CIRISEdge#523 — the node whose `owner_of` an ADMITTED attestation could
+    /// have moved, if any. Three shapes, and the split is deliberate:
+    ///
+    /// - a `delegates_to` is an owner-binding only when persist's OWN predicate
+    ///   ([`is_owner_binding_envelope`](ciris_persist::federation::admission::is_owner_binding_envelope))
+    ///   says so — never a locally re-derived dimension string (the capability-token
+    ///   provenance rule: import the authority's predicate, don't reinvent it);
+    /// - a `withdraws` / `recants` carries NO owner-binding dimension of its own
+    ///   — it names the edge it retracts by `references_attestation_id` — so it
+    ///   is impossible to tell from the row alone whether it retracts one. We
+    ///   drop the entry for its subject regardless: a memo eviction costs one
+    ///   directory walk, and the other direction is a node keeping a withdrawn
+    ///   owner for a whole TTL;
+    /// - a `supersedes` carrying the owner-binding body is the WIDENING persist's
+    ///   `widen_audience` writes — the announce route (CIRISEdge#682) — and moves
+    ///   announce state;
+    /// - everything else (`scores`, …) moves nothing, so the highest-volume
+    ///   plane pays only a string compare.
     fn owner_binding_touched(attestation: &Attestation) -> Option<&str> {
         use ciris_persist::federation::types::attestation_type;
         match attestation.attestation_type.as_str() {
