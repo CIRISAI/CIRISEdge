@@ -165,41 +165,116 @@ where
     }
 }
 
+/// One TCP socket in the kernel's table: its local port, its remote port
+/// (`None` for a listener) and whether it is ESTABLISHED or LISTEN.
+struct KernelSocket {
+    local: u16,
+    remote: Option<u16>,
+    established: bool,
+    listening: bool,
+}
+
+/// The kernel's TCP table. Linux reads `/proc/self/net/tcp{,6}` (the
+/// namespace's table); macOS has no `/proc` and asks `netstat`. The ports are
+/// this process's own ephemeral ones, so the system-wide table is the same
+/// count. A table that cannot be read PANICS: it read as empty on macOS
+/// (CI darwin, v44.0.0 tag run), so every `== 0` check here passed for no
+/// reason and every `>= 2` failed for none.
+fn kernel_tcp() -> Vec<KernelSocket> {
+    #[cfg(target_os = "linux")]
+    {
+        let port = |hex_addr: &str| {
+            hex_addr
+                .rsplit(':')
+                .next()
+                .and_then(|h| u16::from_str_radix(h, 16).ok())
+        };
+        let tables: Vec<String> = ["/proc/self/net/tcp", "/proc/self/net/tcp6"]
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect();
+        assert!(!tables.is_empty(), "the kernel's TCP table is unreadable");
+        tables
+            .iter()
+            .flat_map(|t| t.lines().skip(1))
+            .filter_map(|line| {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() <= 3 {
+                    return None;
+                }
+                let listening = cols[3] == "0A";
+                Some(KernelSocket {
+                    local: port(cols[1])?,
+                    remote: if listening { None } else { port(cols[2]) },
+                    established: cols[3] == "01",
+                    listening,
+                })
+            })
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `tcp4  0  0  127.0.0.1.50444  127.0.0.1.50445  ESTABLISHED`: the
+        // port is the last dot-separated field of an address, `*` for none.
+        let out = std::process::Command::new("netstat")
+            .args(["-an", "-p", "tcp"])
+            .output()
+            .expect("the kernel's TCP table: netstat runs");
+        assert!(out.status.success(), "netstat -an -p tcp: {:?}", out.status);
+        let port = |addr: &str| addr.rsplit('.').next().and_then(|p| p.parse::<u16>().ok());
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("tcp"))
+            .filter_map(|line| {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() < 6 {
+                    return None;
+                }
+                let listening = cols[5] == "LISTEN";
+                Some(KernelSocket {
+                    local: port(cols[3])?,
+                    remote: if listening { None } else { port(cols[4]) },
+                    established: cols[5] == "ESTABLISHED",
+                    listening,
+                })
+            })
+            .collect()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        panic!("no reader for the kernel's TCP table on this OS");
+    }
+}
+
 /// ESTABLISHED TCP connections on loopback with `port` at either end — the
 /// kernel's view, not the node's. Both nodes live in this process, so a
 /// connection B holds to A shows up twice (B's end and A's accepted end).
 fn established_on(port: u16) -> usize {
-    let hex_port = format!("{port:04X}");
-    ["/proc/self/net/tcp", "/proc/self/net/tcp6"]
+    kernel_tcp()
         .iter()
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .flat_map(|t| t.lines().skip(1).map(str::to_owned).collect::<Vec<_>>())
-        .filter(|line| {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            cols.len() > 3
-                && cols[3] == "01"
-                && (cols[1].ends_with(&format!(":{hex_port}"))
-                    || cols[2].ends_with(&format!(":{hex_port}")))
-        })
+        .filter(|s| s.established && (s.local == port || s.remote == Some(port)))
         .count()
 }
 
 /// LISTEN sockets on `port` (kernel view).
 fn listening_on(port: u16) -> usize {
-    let hex_port = format!(":{port:04X}");
-    ["/proc/self/net/tcp", "/proc/self/net/tcp6"]
+    kernel_tcp()
         .iter()
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .flat_map(|t| t.lines().skip(1).map(str::to_owned).collect::<Vec<_>>())
-        .filter(|line| {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            cols.len() > 3 && cols[3] == "0A" && cols[1].ends_with(&hex_port)
-        })
+        .filter(|s| s.listening && s.local == port)
         .count()
 }
 
+/// This process's open file descriptors (`/proc/self/fd` on Linux, `/dev/fd`
+/// on macOS). Unreadable PANICS, for the reason [`kernel_tcp`] does.
 fn open_fds() -> usize {
-    std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count)
+    let dir = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("open fds: {dir}: {e}"))
+        .count()
 }
 
 /// The tests here measure process-wide state (fds, the kernel's TCP table);
