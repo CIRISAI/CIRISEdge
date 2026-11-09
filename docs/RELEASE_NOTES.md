@@ -1,5 +1,25 @@
 # CIRISEdge Release Notes
 
+# v44.1.2 — FountainHoldingClaim retired from the wire
+
+**2026-11-09.** **PATCH** on the LTS line. Pins are unchanged from v44.1.1: persist v61.0.5,
+CIRISVerify v22.0.0, leviculum v0.34.0+ciris.1. The wire vocabulary is **v1.0.3** (CC rc17 a08db38).
+Its one change retires a kind nothing in production emits, so no deployed peer loses traffic.
+
+**What server must do:**
+- Re-pin its wire-vocabulary gate to `e0ffb58b0f15938c186f6a4eaa0fbf7393a8a10b9d18378e56b658c25f85a2b6`.
+- Move the `bench-results` mesh benchmark off `holonomic::swarm_rarity::{FountainHoldingClaim,
+  HOLDING_CLAIM_DOMAIN}` and `FountainSwarmRuntime` in 0.5.246. They still build on 44.x and are
+  removed on the next line that may break.
+
+- **Rejected at decode** (CIRISEdge#959): an envelope naming `FountainHoldingClaim` fails the typed
+  envelope decode as an unknown kind, is dropped by name (`retired_wire_kind`), and never reaches
+  dispatch, the converged view or a swarm runtime.
+- **The converged view reads converged-to-nothing.** Its only feed was that kind. The readers stay
+  as public API.
+
+See CHANGELOG.md for the detail.
+
 # v44.1.1 — the 1,400-byte shaped frame, contact first
 
 **2026-11-09.** **PATCH** on the LTS line. Pins are unchanged from v44.1.0: persist v61.0.5,
