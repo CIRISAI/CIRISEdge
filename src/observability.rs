@@ -93,6 +93,9 @@ pub enum VerifyErrorClass {
     UnknownKey,
     SignatureMismatch,
     PqcPendingStrictReject,
+    /// CIRISEdge#957 / CIRISPersist#1233 — a verifier policy other than
+    /// `Strict` reached persist's verify door.
+    PolicyViolation,
     CanonicalizationFailed,
     VerifyUnavailable,
     ContentIntegrity,
@@ -112,6 +115,7 @@ impl VerifyErrorClass {
             Self::UnknownKey => "unknown_key",
             Self::SignatureMismatch => "signature_mismatch",
             Self::PqcPendingStrictReject => "pqc_pending_strict_reject",
+            Self::PolicyViolation => "verify_policy_violation",
             Self::CanonicalizationFailed => "canonicalization_failed",
             Self::VerifyUnavailable => "verify_unavailable",
             Self::ContentIntegrity => "content_integrity",
@@ -133,6 +137,7 @@ impl VerifyErrorClass {
             V::UnknownKey(_) => Self::UnknownKey,
             V::SignatureMismatch(_) => Self::SignatureMismatch,
             V::PqcPendingStrictReject => Self::PqcPendingStrictReject,
+            V::PolicyViolation(_) => Self::PolicyViolation,
             V::CanonicalizationFailed(_) => Self::CanonicalizationFailed,
             V::VerifyUnavailable(_) => Self::VerifyUnavailable,
             V::ContentIntegrity { .. } => Self::ContentIntegrity,

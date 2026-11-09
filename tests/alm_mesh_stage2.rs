@@ -226,7 +226,7 @@ async fn node(
             signer: Some(key.signer()),
             rooting: Some(Arc::clone(&dir) as Arc<dyn RootingDirectory>),
             resolver: None,
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             blackhole_rules: Some(
                 Arc::clone(&dir) as Arc<dyn ciris_persist::federation::BlackholeRules>
             ),
@@ -251,7 +251,7 @@ async fn node(
         .signer(key.signer())
         .transport(Arc::clone(&transport) as Arc<dyn ciris_edge::transport::Transport>)
         .config(ciris_edge::EdgeConfig {
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             ..ciris_edge::EdgeConfig::default()
         })
         .build()

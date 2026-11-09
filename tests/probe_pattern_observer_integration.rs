@@ -200,7 +200,7 @@ async fn build_edge_with_detector_enabled(
         cohort_centroids: std::collections::HashMap::new(),
     };
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         probe_pattern_observer_enabled: true,
         probe_pattern_observer_config: detector_cfg,
         ..EdgeConfig::default()
@@ -226,7 +226,7 @@ async fn build_edge_with_detector_disabled(
 ) -> Edge {
     let signer = me.local_signer(tmp.path()).await;
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         probe_pattern_observer_enabled: false,
         ..EdgeConfig::default()
     };

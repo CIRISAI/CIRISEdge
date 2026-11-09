@@ -280,7 +280,7 @@ impl Node {
             signer: Some(self.key.signer()),
             rooting: Some(Arc::clone(&self.dir) as Arc<dyn RootingDirectory>),
             resolver: None,
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             ..ReticulumAuth::default()
         }
     }

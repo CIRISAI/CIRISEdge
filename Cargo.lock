@@ -1193,8 +1193,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "61.0.5"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v61.0.5#048f0993eccbbb81813de9a726b43472b47d9e06"
+version = "61.1.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v61.1.0#8a7e83e26a513d9e4ab8d13a84c23828f74bfe6f"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6549,7 +6549,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.5.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.59.0",
@@ -7612,7 +7612,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

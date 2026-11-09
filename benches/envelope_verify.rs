@@ -3,7 +3,7 @@
 //! verify-via-directory primitive composes the Ed25519 check;
 //! ML-DSA-65 lands on rows whose `pqc_completed_at` is set, which
 //! these fixtures intentionally leave as `None` to exercise the
-//! single-curve Ed25519 path under [`HybridPolicy::Ed25519Fallback`]).
+//! single-curve Ed25519 path under [`HybridPolicy::Strict`]).
 //!
 //! # Expected curve (per BENCHMARKS.md "Reading the curves")
 //!
@@ -64,7 +64,7 @@ async fn setup() -> (Arc<VerifyPipeline>, Arc<LocalSigner>, tempfile::TempDir) {
     let signer = bench_local_signer(&me, &tmp).await;
     let verify = Arc::new(VerifyPipeline::new(
         directory as Arc<dyn VerifyDirectory>,
-        HybridPolicy::Ed25519Fallback, // accept the bench fixtures' hybrid-pending rows
+        HybridPolicy::Strict, // the only verifier policy (CIRISEdge#957); fixtures are hybrid
         me.key_id.clone(),
         16 * 1024 * 1024,
         300,

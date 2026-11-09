@@ -141,7 +141,7 @@ async fn auth_for(
         signer: Some(signer_for(key, base).await),
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -358,7 +358,7 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
             .transport(transport_a.clone() as Arc<dyn Transport>)
             .reticulum_transport(transport_a.clone())
             .config(EdgeConfig {
-                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                hybrid_policy: HybridPolicy::Strict,
                 cohort_scope_enforcement: ciris_edge::CohortScopeEnforcement::Off,
                 ..EdgeConfig::default()
             })
@@ -373,7 +373,7 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
             .transport(transport_b.clone() as Arc<dyn Transport>)
             .reticulum_transport(transport_b.clone())
             .config(EdgeConfig {
-                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                hybrid_policy: HybridPolicy::Strict,
                 cohort_scope_enforcement: ciris_edge::CohortScopeEnforcement::Off,
                 ..EdgeConfig::default()
             })

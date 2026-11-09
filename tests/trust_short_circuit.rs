@@ -180,7 +180,7 @@ impl Transport for NopTransport {
 /// Configured `EdgeConfig` for a trust-short-circuit fixture.
 fn config_with_trust(threshold: f64, enabled: bool) -> EdgeConfig {
     EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         trust_threshold: threshold,
         trust_short_circuit_enabled: enabled,
         // The cohort_scope consumer-side check runs first; pin its

@@ -201,7 +201,7 @@ async fn build_edge(tmp: &Path, backend: Arc<SqliteBackend>) -> Edge {
     }
     backend.set_node_key_id(me.key_id.clone());
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     };
     Edge::builder()
@@ -598,7 +598,7 @@ async fn build_edge_with_transport(
     let me = FedKey::new("edge-self-metrics-809", 0x01);
     let signer = me.local_signer(tmp).await;
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     };
     Edge::builder()
@@ -701,7 +701,7 @@ async fn build_refuses_transports_with_different_metrics_bags_809() {
             .transport(a)
             .transport(b)
             .config(EdgeConfig {
-                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                hybrid_policy: HybridPolicy::Strict,
                 ..EdgeConfig::default()
             })
             .build()

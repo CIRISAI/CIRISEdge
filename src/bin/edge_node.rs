@@ -2713,7 +2713,7 @@ async fn stand_up(
         signer: Some(signer),
         rooting: Some(Arc::clone(&directory) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         // CIRISEdge#727 — this node's own owner-binding rides every link it
         // dials (the owner-binding rung). A harness node is unowned unless
         // its fixture claims it, in which case the source finds the row.
@@ -2793,7 +2793,7 @@ async fn stand_up(
                 dir: Arc::clone(&directory),
             }))
             .config(ciris_edge::EdgeConfig {
-                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                hybrid_policy: HybridPolicy::Strict,
                 ..ciris_edge::EdgeConfig::default()
             })
             .build()

@@ -5665,22 +5665,20 @@ fn extract_canonical_bootstrap_peer(
     })
 }
 
-/// `HybridPolicy` discriminants; kept as `&str` rather than a
-/// `#[pyclass]` to keep the surface minimal — the policy choice is
-/// a single switch the host configures once.
-///
-/// The `soft` variant takes a window in seconds via the
-/// `soft_freshness_window_seconds` kwarg on the constructor.
-fn parse_hybrid_policy(s: &str, soft_freshness_window_seconds: u64) -> PyResult<HybridPolicy> {
+/// The verifier policy a host may pass. CIRISEdge#957 / CIRISPersist#1233
+/// (CC 5.3.2.4.3.1): hybrid-required is always on and never an operator
+/// toggle, so `"strict"` is the only accepted value. Every other string,
+/// including the retired `"soft"` and `"ed25519_fallback"`, is refused with
+/// `ValueError("verify_policy_violation: ...")`, the token persist's
+/// `Engine.verify_hybrid` raises for the same input. The kwarg and
+/// `soft_freshness_window_seconds` stay (ignored) until persist v62 removes
+/// the argument, so an existing call that passes `"strict"` is unchanged.
+fn parse_hybrid_policy(s: &str, _soft_freshness_window_seconds: u64) -> PyResult<HybridPolicy> {
     match s {
         "strict" | "Strict" => Ok(HybridPolicy::Strict),
-        "soft" | "SoftFreshness" | "soft_freshness" => Ok(HybridPolicy::SoftFreshness {
-            window: Duration::from_secs(soft_freshness_window_seconds),
-        }),
-        "ed25519_fallback" | "Ed25519Fallback" | "fallback" => Ok(HybridPolicy::Ed25519Fallback),
         other => Err(PyValueError::new_err(format!(
-            "unknown hybrid_policy {other:?}; expected one of \
-             \"strict\" / \"soft\" / \"ed25519_fallback\""
+            "verify_policy_violation: hybrid_policy {other:?} refused; \"strict\" is the \
+             only verifier policy (CC 5.3.2.4.3.1, CIRISEdge#957)"
         ))),
     }
 }

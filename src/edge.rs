@@ -285,7 +285,10 @@ pub struct CanonicalBootstrapPeer {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct EdgeConfig {
-    /// Consumer-side hybrid PQC acceptance policy (OQ-11).
+    /// Consumer-side hybrid PQC acceptance policy (OQ-11). Only
+    /// [`HybridPolicy::Strict`] is accepted (CIRISEdge#957, CC 5.3.2.4.3.1):
+    /// [`EdgeBuilder::build`] refuses any other with `verify_policy_violation`.
+    /// The field stays until persist v62 removes the argument.
     pub hybrid_policy: HybridPolicy,
     /// Replay-window width (AV-3, OQ-08). Default 5 minutes.
     pub replay_window_seconds: u64,
@@ -9017,6 +9020,12 @@ impl EdgeBuilder {
         if self.transports.is_empty() {
             return Err(EdgeError::Config("no transport configured".into()));
         }
+        // CIRISEdge#957 / CIRISPersist#1233 (CC 5.3.2.4.3.1): hybrid-required
+        // is the only verifier policy. Persist refuses any other at its verify
+        // doors; refusing it here too means an edge never builds with a policy
+        // that would refuse every inbound envelope at verify time.
+        crate::verify::require_strict_policy(self.config.hybrid_policy)
+            .map_err(EdgeError::Config)?;
 
         // A split home is addressed at the node it advertises and signs as
         // the actor: both are this node (AV-8).

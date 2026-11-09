@@ -157,7 +157,7 @@ async fn directory_with(records: Vec<KeyRecord>) -> Arc<SqliteBackend> {
 
 fn test_edge_config() -> EdgeConfig {
     EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         // Phase 2 — `OpaqueRequest` sends now genuinely await a
         // correlated response; these tests wire no responder, so a
         // short timeout keeps each (ignored-result) send from parking

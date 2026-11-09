@@ -3569,6 +3569,10 @@ impl ReticulumTransport {
             own_build_bundle,
             own_owner_binding,
         } = auth;
+        // CIRISEdge#957 / CIRISPersist#1233 (CC 5.3.2.4.3.1): the announce and
+        // store-heal rooting judge every chain hybrid-required; a transport is
+        // never built with another policy.
+        crate::verify::require_strict_policy(hybrid_policy).map_err(TransportError::Config)?;
 
         // v3.1.0 (CIRISEdge#99) — when the host wired a
         // `TransportIdentityKeystore`, load/adopt/generate via the
@@ -21697,27 +21701,24 @@ fn attestation_self_verifies(
     true
 }
 
-/// Whether `policy` accepts a rooted provenance `chain` (CIRISEdge#15
-/// step 4).
+/// Whether a rooted provenance `chain` is acceptable (CIRISEdge#15 step 4):
+/// every [`ProvenanceLink`] must be hybrid-complete, so a link with
+/// `pubkey_ml_dsa_65_base64 == None` or `scrub_signature_pqc == None` (a
+/// hybrid-pending row) refuses the chain.
 ///
-/// - `Strict` — every [`ProvenanceLink`] must be hybrid-complete:
-///   reject if any link has `pubkey_ml_dsa_65_base64 == None` or
-///   `scrub_signature_pqc == None` (a hybrid-pending row).
-/// - `Ed25519Fallback` — accept the `Confirmed` verdict as-is; the
-///   Ed25519-rooted chain is sufficient.
-/// - `SoftFreshness { window }` — the freshness window is a per-row
-///   age input the announce path does not carry, so this collapses
-///   to "accept the rooted chain", consistent with `verify.rs`'s
-///   documented `row_age = None` treatment of `SoftFreshness`.
+/// CIRISEdge#957 (CC 5.3.2.4.3.1, CIRISPersist#1233): hybrid-required is the
+/// only verifier posture, so `policy` no longer selects anything. The
+/// retired `Ed25519Fallback` / `SoftFreshness` arms accepted a hybrid-pending
+/// chain; every variant now asks the same check. The transport constructor
+/// already refuses a non-`Strict` policy, so this is the second wall, not the
+/// first.
 ///
 /// [`ProvenanceLink`]: crate::verify::ProvenanceLink
-fn hybrid_policy_accepts(policy: HybridPolicy, chain: &ProvenanceChain) -> bool {
-    match policy {
-        HybridPolicy::Strict => chain.chain.iter().all(|link| {
-            link.pubkey_ml_dsa_65_base64.is_some() && link.scrub_signature_pqc.is_some()
-        }),
-        HybridPolicy::Ed25519Fallback | HybridPolicy::SoftFreshness { .. } => true,
-    }
+fn hybrid_policy_accepts(_policy: HybridPolicy, chain: &ProvenanceChain) -> bool {
+    chain
+        .chain
+        .iter()
+        .all(|link| link.pubkey_ml_dsa_65_base64.is_some() && link.scrub_signature_pqc.is_some())
 }
 
 /// Build edge's own announce attestation app-data — the CIRISEdge#15

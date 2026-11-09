@@ -509,7 +509,7 @@ fn auth_for(node: &Node) -> ReticulumAuth {
         signer: Some(Arc::clone(&node.signer)),
         rooting: Some(Arc::clone(&node.dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -572,7 +572,7 @@ async fn spawn_member(node: Node, rt: Arc<ReticulumTransport>, arming: Arming) -
         .signer(node.signer.clone())
         .reticulum_transport(Arc::clone(&rt))
         .config(EdgeConfig {
-            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            hybrid_policy: HybridPolicy::Strict,
             ..EdgeConfig::default()
         });
     if arming == Arming::AtBuild {
@@ -1259,7 +1259,7 @@ async fn a_split_home_arms_its_lifecycle_for_the_node_not_the_actor() {
         .signer(actor.signer.clone())
         .reticulum_transport(Arc::clone(&rt))
         .config(EdgeConfig {
-            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            hybrid_policy: HybridPolicy::Strict,
             advertised_key_id: Some(node_a.me.clone()),
             ..EdgeConfig::default()
         })

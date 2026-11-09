@@ -733,7 +733,7 @@ mod tests {
         keys
     }
 
-    const POLICY: HybridPolicy = HybridPolicy::Ed25519Fallback;
+    const POLICY: HybridPolicy = HybridPolicy::Strict;
 
     /// `span` of ordinary 30 s ticks: the change read stays fresh throughout.
     async fn ticks(refresh: &Arc<StandingRefresh>, dir: &Arc<Rows>, span: Duration) {

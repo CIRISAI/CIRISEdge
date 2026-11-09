@@ -201,7 +201,7 @@ impl StewardDirectory for StaticStewardDir {
 
 fn config_with_enforcement(mode: CohortScopeEnforcement) -> EdgeConfig {
     EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         cohort_scope_enforcement: mode,
         // Phase 2 — ephemeral typed sends now genuinely await a
         // correlated response; no responder is wired in these tests,

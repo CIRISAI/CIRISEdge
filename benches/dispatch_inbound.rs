@@ -79,7 +79,7 @@ async fn build_fixture() -> Fixture {
     // verify passes against the federation_keys row.
     let sender_signer = bench_local_signer(&me, &tmp).await;
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     };
     let edge = Edge::builder()

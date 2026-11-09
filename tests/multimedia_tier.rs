@@ -206,7 +206,7 @@ async fn build_edge(
 
 fn cfg_with(mode: AgentMode, cdn_enabled: bool, cdn_base: Option<&str>) -> EdgeConfig {
     EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         agent_mode: mode,
         l1_cdn_edge_enabled: cdn_enabled,
         l1_cdn_edge_external_uri_base: cdn_base.map(str::to_string),
@@ -767,7 +767,7 @@ async fn takedown_notice_respects_cohort_scope_refusal() {
         .expect("add_peer_record sender");
     let queue = directory.clone();
     let cfg = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         cohort_scope_enforcement: CohortScopeEnforcement::Strict,
         ..EdgeConfig::default()
     };
@@ -814,7 +814,7 @@ async fn key_grant_respects_cohort_scope_refusal() {
         .expect("add_peer_record sender");
     let queue = directory.clone();
     let cfg = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         cohort_scope_enforcement: CohortScopeEnforcement::Strict,
         ..EdgeConfig::default()
     };
@@ -868,7 +868,7 @@ async fn takedown_notice_with_matching_cohort_scope_proceeds_to_fast_path() {
         .expect("update_peer_policy sender");
     let queue = directory.clone();
     let cfg = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         cohort_scope_enforcement: CohortScopeEnforcement::Strict,
         ..EdgeConfig::default()
     };

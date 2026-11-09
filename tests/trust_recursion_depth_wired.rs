@@ -224,7 +224,7 @@ async fn build_edge_with_recursion_depth(
     let scorer_arc: Arc<dyn TrustScoring> = recorder.clone();
 
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         trust_threshold: 0.5,
         trust_short_circuit_enabled: true,
         trust_recursion_depth: recursion_depth,
@@ -354,7 +354,7 @@ async fn agent_mode_server_apply_defaults_threads_depth_one_into_edge_config() {
     let scorer_arc: Arc<dyn TrustScoring> = recorder.clone();
 
     let mut config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         trust_threshold: 0.5,
         trust_short_circuit_enabled: true,
         cohort_scope_enforcement: ciris_edge::CohortScopeEnforcement::Off,

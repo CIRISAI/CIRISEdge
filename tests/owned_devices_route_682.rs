@@ -409,7 +409,7 @@ async fn pair_with(tag: &str, scope: &str, d2: D2Starts) -> Pair {
         signer: Some(key.signer()),
         rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         // CIRISEdge#727 — the production wiring: a node pushes its own
         // owner-binding on every link it dials.
         own_owner_binding: Some(Arc::new(DirectoryOwnerBinding::new(
@@ -1099,7 +1099,7 @@ async fn a_node_pushes_its_binding_only_on_a_link_it_dialed_727() {
                 signer: Some(s.signer()),
                 rooting: Some(Arc::clone(&dir_s) as Arc<dyn RootingDirectory>),
                 resolver: None,
-                hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+                hybrid_policy: ciris_edge::HybridPolicy::Strict,
                 own_owner_binding: Some(Arc::new(DirectoryOwnerBinding::new(
                     Arc::clone(&dir_s) as Arc<dyn FederationDirectory>,
                     s.key_id.clone(),

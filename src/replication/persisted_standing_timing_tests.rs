@@ -158,7 +158,7 @@ async fn persisted_standing_timing_at_the_production_row_count() {
     let began = Instant::now();
     seed(&store).await;
     eprintln!("seeded {ROWS} rows in {:?}", began.elapsed());
-    let policy = HybridPolicy::Ed25519Fallback;
+    let policy = HybridPolicy::Strict;
 
     for proven in [false, true] {
         eprintln!(

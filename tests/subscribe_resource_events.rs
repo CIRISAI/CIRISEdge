@@ -180,7 +180,7 @@ async fn subscribe_resource_events_yields_durable_queue_pressure() {
         .transport(Arc::new(NopTransport) as Arc<dyn Transport>)
         .events(bus.clone())
         .config(EdgeConfig {
-            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            hybrid_policy: HybridPolicy::Strict,
             ..EdgeConfig::default()
         })
         .build()

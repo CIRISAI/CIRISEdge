@@ -371,7 +371,7 @@ fn auth_for(node: &Node) -> ReticulumAuth {
         signer: Some(Arc::clone(&node.signer)),
         rooting: Some(Arc::clone(&node.dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -476,7 +476,7 @@ async fn member(
         }))
         .scope_native_addressing(Duration::from_secs(300))
         .config(EdgeConfig {
-            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            hybrid_policy: HybridPolicy::Strict,
             ..EdgeConfig::default()
         })
         .build()

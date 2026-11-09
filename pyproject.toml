@@ -125,8 +125,13 @@ classifiers = [
 # reinterpret persist's Rust layout directly with no ABI check. A 61.1.0 wheel
 # adds trait methods, so pairing it with this cdylib could misdispatch a call
 # through a vtable that no ABI constant guards.
+#
+# Persist v61.1.0 adopt: the pair moves together, floor 61.1.0 and ceiling
+# <61.2. 61.1 changed PostgresBackend's layout (CIRISPersist#1231), and 61.2
+# renames the raw-layout capsules with the crate version (CIRISEdge#960), so
+# neither neighbour minor may load beside this cdylib.
 dependencies = [
-    "ciris-persist>=61.0.5,<61.1",
+    "ciris-persist>=61.1.0,<61.2",
 ]
 dynamic = ["version"]
 

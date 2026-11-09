@@ -1396,6 +1396,12 @@ pub enum VerifyError {
     /// our consumer policy is `Strict`.
     #[error("hybrid-pending under strict policy")]
     PqcPendingStrictReject,
+    /// Step 7 — the pipeline was handed a verifier policy other than
+    /// [`HybridPolicy::Strict`]; persist refuses it before any lookup or
+    /// crypto (CIRISPersist#1233, CIRISEdge#957, CC 5.3.2.4.3.1). The
+    /// message leads with `verify_policy_violation`.
+    #[error("{0}")]
+    PolicyViolation(String),
     /// Step 6 — canonicalization round-trip failed (envelope shape
     /// rejected by persist's canonicalizer).
     #[error("canonicalization failed: {0}")]
@@ -1611,7 +1617,11 @@ impl VerifyPipeline {
 fn map_verify_error(signing_key_id: &str) -> impl FnOnce(HybridVerifyError) -> VerifyError + '_ {
     move |e| {
         let msg = format!("{e}");
-        if msg.contains("verify_unknown_key") {
+        // CIRISPersist#1233: typed, before the message heuristics below (its
+        // message names "Strict", which the hybrid-pending arm would claim).
+        if let HybridVerifyError::PolicyViolation { .. } = e {
+            VerifyError::PolicyViolation(msg)
+        } else if msg.contains("verify_unknown_key") {
             VerifyError::UnknownKey(signing_key_id.to_string())
         } else if msg.contains("HybridPendingRejected")
             || msg.contains("hybrid-pending")
@@ -1624,6 +1634,19 @@ fn map_verify_error(signing_key_id: &str) -> impl FnOnce(HybridVerifyError) -> V
             VerifyError::SignatureMismatch(msg)
         }
     }
+}
+
+/// CIRISEdge#957 (CC 5.3.2.4.3.1, CIRISPersist#1233) — the one check every
+/// edge door that takes a verifier policy asks: [`HybridPolicy::Strict`] or a
+/// refusal whose text leads with persist's `verify_policy_violation` token.
+/// It is persist's own `require_strict_policy`, so the two cannot disagree on
+/// which policy is accepted.
+///
+/// # Errors
+///
+/// Any policy other than `Strict`, as persist's message.
+pub fn require_strict_policy(policy: HybridPolicy) -> Result<(), String> {
+    ciris_persist::verify::hybrid::require_strict_policy(&policy).map_err(|e| e.to_string())
 }
 
 /// Bounded LRU replay-window. AV-3 closure for the on-wire portion;
