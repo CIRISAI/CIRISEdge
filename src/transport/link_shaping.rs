@@ -1,9 +1,11 @@
 //! CC 5.4.3 **link shaping** (rc10, `CLM-link-shaping`; CIRISEdge 43.2).
 //!
-//! A shaped link carries constant-size frames (the link's channel payload
-//! MDU) at Poisson times in BOTH directions, whatever either end has to say:
-//! real frames when the per-link budget admits one and the queue holds one,
-//! cover frames otherwise. A wire observer sees the same stream whether the
+//! A shaped link carries constant-size frames (the shaped frame,
+//! [`SHAPED_FRAME_BYTES`] = 1,400 B, or the link's smaller channel payload
+//! MDU: CC 5.4.3 rc17) at Poisson times in BOTH directions, whatever either
+//! end has to say: real frames when the per-link budget admits one and the
+//! queue holds one, cover frames otherwise. The queue has two lanes
+//! ([`Lane`]): contact rows take the next real frame ahead of serve and sync. A wire observer sees the same stream whether the
 //! link is idle or busy; what remains visible is that the link exists and
 //! when it was set up, which the CC states. Shaping is a LINK property,
 //! negotiated right after the transit KEX in each side's first sealed
@@ -69,6 +71,42 @@ pub const MIN_LAMBDA: f64 = 0.001;
 pub const MAX_WINDOW_S: u32 = 86_400;
 /// The smallest frame worth shaping (a `CFRG` header and some body).
 pub const MIN_FRAME_BYTES: u16 = 96;
+
+/// **CC 5.4.3 rc17 (CIRISConstitution a3dd97a) — the shaped frame.** One
+/// constant of the Part: 1,400 bytes before the link's E1 transit seal, the
+/// `SHPF` header included, or the link's channel payload MDU where that is
+/// smaller (about 400 bytes at the Reticulum base MTU). It is not per class and
+/// not negotiated: every offer this node makes quotes at most this
+/// ([`ShapingOffer::from_policy`], [`ShapingOffer::seat`]), and [`agree`] takes
+/// the smaller of the two frames, so a 44.x peer that still offers its 16,272 B
+/// MDU agrees at 1,400 too.
+///
+/// The rate is a byte rate, so the byte budget, the cover volume, what the
+/// wire's observer sees and the time a volume of bytes takes to cross are the
+/// same at any frame; the frame moves only the first byte, which now waits a
+/// fraction of a second (0.2 s at `server`) where it waited 2.3 s at the MDU.
+/// What the smaller frame costs is on the wire: [`wire_factor`].
+pub const SHAPED_FRAME_BYTES: u16 = 1_400;
+
+/// What the transport puts around each frame on the wire beside the E1 seal:
+/// the Reticulum packet header and token (107 B) and the proof the receiver
+/// returns for it (83 B). Edge's measurement, carried by CC 5.4.3 rc17 and
+/// `formal/transport_tiers/frame_ab.py`.
+pub const PACKET_WIRE_OVERHEAD_BYTES: usize = 107 + 83;
+
+/// CC 5.4.3 rc17 — "the budget is a rate of frame bytes, and the transport's
+/// per-packet header and proof add about a tenth to the bytes on the wire at
+/// this frame against about one per cent at the MDU, which a stated cost
+/// includes": the bytes on the wire per budget byte at `frame_bytes`, the E1
+/// seal, the packet header and the proof included. 1.154 at
+/// [`SHAPED_FRAME_BYTES`]; 1.014 at the 16,272 B TCP MDU.
+#[must_use]
+pub fn wire_factor(frame_bytes: u16) -> f64 {
+    let frame = f64::from(frame_bytes.max(1));
+    #[allow(clippy::cast_precision_loss)]
+    let around = (crate::transport::link_seal::SEAL_OVERHEAD + PACKET_WIRE_OVERHEAD_BYTES) as f64;
+    (frame + around) / frame
+}
 
 /// How a queued row's wait ended ([`wait_row_left`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,49 +412,51 @@ pub enum ShapingScope {
 ///
 /// **Latency is the other cost** (CC 5.4.3 "the choice is explained before it
 /// is made"): a shaped link moves real bytes at ρ of its rate, 3.5 KB/s per
-/// peer at `server`, one frame per [`BudgetClass`] gap (2.3 s `server`, 5.8 s
-/// `home`, 11.6 s `phone-wifi`, 47 s `phone-cellular`); a row waits about one
-/// gap, a reply two or three, and first contact or catch-up several times
-/// longer than unshaped (measured: a four-node bootstrap's rounds p90 35 s,
-/// p99 165 s against 53 s for the whole bootstrap unshaped). The client shows
-/// both columns at opt-in (`docs/LINK_SHAPING_COST.md`).
+/// peer at `server`, one [`SHAPED_FRAME_BYTES`] frame per gap (0.2 s `server`,
+/// 0.5 s `home`, 1.0 s `phone-wifi`, 4 s `phone-cellular`); a row's first byte
+/// waits about one gap, and a volume of bytes takes its bytes over the real
+/// rate whatever the frame. The client shows both columns at opt-in
+/// (`docs/LINK_SHAPING_COST.md`).
 ///
-/// The cost columns are what a client shows at the moment of choosing: a
-/// shaped link always runs at its class rate (cover fills what real traffic
-/// leaves), each way, so at the eight-link node cap a month (30 days) costs
-/// `rate × 8 × 2,592,000 s` each way (`docs/LINK_SHAPING_COST.md`).
+/// The cost columns are what a client shows at the moment of choosing, **on
+/// the wire**: a shaped link always runs at its class rate (cover fills what
+/// real traffic leaves), each way, so at the eight-link node cap a month (30
+/// days) costs `rate × 8 × 2,592,000 s` of frame bytes each way, and the E1
+/// seal, packet header and proof around each 1,400 B frame add
+/// [`wire_factor`] (about 15 %) on top, "which a stated cost includes" (CC
+/// 5.4.3 rc17: cellular at the cap is about 8 GB a month each way on the wire).
 pub const FLEET_DEFAULTS: [FleetDefault; 5] = [
     // seat <-> seat only (both proved from the signed roster); outside the eight
     FleetDefault {
         class: BudgetClass::Seat,
         on_by_default: true,
-        gb_month_per_link_each_way: 85.5,
-        gb_month_at_cap_each_way: 684.3,
+        gb_month_per_link_each_way: 98.7,
+        gb_month_at_cap_each_way: 789.4,
     },
-    // class                         on by default   GB/month/link  GB/month at cap (each way)
+    // class                         on by default   GB/month/link  GB/month at cap (each way, on the wire)
     FleetDefault {
         class: BudgetClass::Server,
         on_by_default: true,
-        gb_month_per_link_each_way: 18.1,
-        gb_month_at_cap_each_way: 145.2,
+        gb_month_per_link_each_way: 20.9,
+        gb_month_at_cap_each_way: 167.4,
     },
     FleetDefault {
         class: BudgetClass::Home,
         on_by_default: false,
-        gb_month_per_link_each_way: 7.3,
-        gb_month_at_cap_each_way: 58.1,
+        gb_month_per_link_each_way: 8.4,
+        gb_month_at_cap_each_way: 67.0,
     },
     FleetDefault {
         class: BudgetClass::PhoneWifi,
         on_by_default: false,
-        gb_month_per_link_each_way: 3.6,
-        gb_month_at_cap_each_way: 29.0,
+        gb_month_per_link_each_way: 4.2,
+        gb_month_at_cap_each_way: 33.5,
     },
     FleetDefault {
         class: BudgetClass::PhoneCellular,
         on_by_default: false,
-        gb_month_per_link_each_way: 0.9,
-        gb_month_at_cap_each_way: 7.3,
+        gb_month_per_link_each_way: 1.0,
+        gb_month_at_cap_each_way: 8.4,
     },
 ];
 
@@ -427,9 +467,10 @@ pub struct FleetDefault {
     pub class: BudgetClass,
     /// Shaping on every identity link without the person opting in.
     pub on_by_default: bool,
-    /// One shaped link for a month, each way, in GB (10⁹ bytes).
+    /// One shaped link for a month, each way, in GB (10⁹ bytes), on the wire
+    /// ([`wire_factor`] at [`SHAPED_FRAME_BYTES`]).
     pub gb_month_per_link_each_way: f64,
-    /// The eight-link cap for a month, each way, in GB.
+    /// The eight-link cap for a month, each way, in GB, on the wire.
     pub gb_month_at_cap_each_way: f64,
 }
 
@@ -486,6 +527,221 @@ pub fn is_bulk_class(envelope: &[u8]) -> bool {
     BULK_MESSAGE_TYPES
         .iter()
         .any(|t| t.as_bytes() == &rest[..end])
+}
+
+/// CIRISEdge#962 — the two lanes of a shaped link's queue. The wire does not
+/// change: one Poisson stream of constant frames, real or cover. What changes
+/// is which queued body the next real frame takes: the contact lane's head
+/// whenever it has one, so a first contact, a key row or a consent grant waits
+/// at most for the frame already due, never behind a serve or sync backlog on
+/// the same link (measured on 44.1.0: shaped first contact +40 s behind an
+/// 11k-row store's serve).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lane {
+    /// First contact and its rungs: the bootstrap planes (keys, identity
+    /// occurrences, transport destinations) and their revocations, consent
+    /// grants and owner bindings, key registrations, the node's own link-up
+    /// pushes (announce, owner binding, build bundle) and the link's own
+    /// control (capability reports, referrals). [`Lane::of`] reads it.
+    Contact,
+    /// Everything else: serve, sync, chat, the onion.
+    Sync,
+}
+
+/// CIRISEdge#962 — the most real frames in a row that carry contact bodies
+/// and no sync body while the sync lane waits: at least one real frame in
+/// every `CONTACT_RUN_MAX + 1` (four) carries a sync body when both lanes
+/// hold some (a coalesced frame carrying both counts). Strict priority would
+/// let a peer starve this link's sync by inducing contact traffic (pulling key
+/// rows this node serves as contact `Deliver`s); this bounds the contact
+/// lane's share at three quarters of the real frames, and leaves a contact
+/// row that arrives at a quiet contact lane its next frame.
+pub const CONTACT_RUN_MAX: u8 = 3;
+
+/// The ticket bit of a [`Lane::Contact`] body. Each lane numbers its bodies on
+/// its own, in its own FIFO order, so a lane's tickets are a contiguous run per
+/// enqueue and a per-lane high-water mark says which have left
+/// ([`LinkShaper::ticket_left`]); the bit keeps the two runs apart in one `u64`.
+const CONTACT_TICKET_BIT: u64 = 1 << 63;
+
+impl Lane {
+    /// The lanes in the order a frame takes from them.
+    pub const ORDER: [Self; 2] = [Self::Contact, Self::Sync];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Contact => 0,
+            Self::Sync => 1,
+        }
+    }
+
+    const fn ticket_bit(self) -> u64 {
+        match self {
+            Self::Contact => CONTACT_TICKET_BIT,
+            Self::Sync => 0,
+        }
+    }
+
+    /// The lane a ticket was issued on.
+    #[must_use]
+    pub const fn of_ticket(ticket: u64) -> Self {
+        if ticket & CONTACT_TICKET_BIT == 0 {
+            Self::Sync
+        } else {
+            Self::Contact
+        }
+    }
+
+    /// The stable token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Contact => "contact",
+            Self::Sync => "sync",
+        }
+    }
+
+    /// The lane of an outbound frame, read from its bytes the way
+    /// [`is_bulk_class`] reads a bulk one:
+    ///
+    /// - an `EdgeEnvelope` whose `message_type` is one of
+    ///   [`CONTACT_MESSAGE_TYPES`];
+    /// - a replication frame (`CRPL`) of any verb on one of
+    ///   [`CONTACT_ENVELOPE_KINDS`] (a `Pull` for a stranger's key, its
+    ///   `Deliver`, a `Summary` of the transport-destination plane);
+    /// - a replication `Deliver` on the `Attestation` plane every row of which
+    ///   is a `consent:replication:v1` grant, an owner binding, or a
+    ///   retraction (`withdraws` / `recants`, which revoke them; CC 5.4.3
+    ///   first contact: the request, the acceptance, the binding that roots
+    ///   the stranger, and their undoing). A page that mixes them with other
+    ///   rows is serve, and stays behind;
+    ///
+    /// and everything else is [`Lane::Sync`]. The route fetch, its answer and
+    /// the CTKX handshake never reach a shaper: they run before the seal, bare
+    /// on the link, before any shaping offer.
+    #[must_use]
+    pub fn of(frame: &[u8]) -> Self {
+        if is_contact_message_type(frame) || is_contact_replication_frame(frame) {
+            Self::Contact
+        } else {
+            Self::Sync
+        }
+    }
+}
+
+/// CIRISEdge#962 — the `MessageType`s that ride the contact lane: a new peer's
+/// key registration. The WIRE spellings of `crate::messages::MessageType`,
+/// pinned to serde's own output by
+/// `contact_classes_are_the_wire_spelling_of_their_types`.
+pub const CONTACT_MESSAGE_TYPES: [&str; 1] = ["PublicKeyRegistration"];
+
+/// CIRISEdge#962 — the replication planes whose every verb rides the contact
+/// lane: the bootstrap planes a stranger needs to be reached and rooted
+/// (`EnvelopeKind::BOOTSTRAP_PLANES`) and the revocations that end them. The
+/// WIRE spellings of `crate::replication::protocol::EnvelopeKind`, pinned to
+/// serde's output by `contact_classes_are_the_wire_spelling_of_their_types`.
+pub const CONTACT_ENVELOPE_KINDS: [&str; 5] = [
+    "key",
+    "identity_occurrence",
+    "transport_destination",
+    "revocation",
+    "identity_occurrence_revocation",
+];
+
+/// Whether an `EdgeEnvelope`'s head names a [`CONTACT_MESSAGE_TYPES`] type.
+fn is_contact_message_type(envelope: &[u8]) -> bool {
+    head_value(envelope, b"\"message_type\":\"", 1024)
+        .is_some_and(|t| CONTACT_MESSAGE_TYPES.iter().any(|c| c.as_bytes() == t))
+}
+
+/// The string value after `key` within the first `within` bytes of `bytes`.
+fn head_value<'a>(bytes: &'a [u8], key: &[u8], within: usize) -> Option<&'a [u8]> {
+    let head = &bytes[..bytes.len().min(within)];
+    let at = head.windows(key.len()).position(|w| w == key)?;
+    let rest = &head[at + key.len()..];
+    let end = rest.iter().position(|&b| b == b'"')?;
+    Some(&rest[..end])
+}
+
+/// Whether a `CRPL` frame is contact: any verb on a contact plane, or an
+/// `Attestation` `Deliver` of consent grants and owner bindings only.
+fn is_contact_replication_frame(frame: &[u8]) -> bool {
+    use crate::replication::protocol::{EnvelopeKind, ReplicationMessage};
+    use crate::replication::wire_frame::{
+        PREAMBLE_LEN, PREAMBLE_LEN_V3, REPLICATION_FRAME_MAGIC, WIRE_PROTOCOL_VERSION_V3,
+    };
+    if frame.len() <= PREAMBLE_LEN || frame[..4] != REPLICATION_FRAME_MAGIC {
+        return false;
+    }
+    let body = if frame[4] == WIRE_PROTOCOL_VERSION_V3 {
+        frame.get(PREAMBLE_LEN_V3..).unwrap_or_default()
+    } else {
+        &frame[PREAMBLE_LEN..]
+    };
+    // Every verb's `kind` sits in its head (`type`, an optional `status`, then
+    // `kind`), so the plane is read without scanning the rows.
+    let Some(kind) = head_value(body, b"\"kind\":\"", 256) else {
+        return false;
+    };
+    if CONTACT_ENVELOPE_KINDS.iter().any(|k| k.as_bytes() == kind) {
+        return true;
+    }
+    if kind != b"attestation" || head_value(body, b"\"type\":\"", 32) != Some(b"deliver") {
+        return false;
+    }
+    match ReplicationMessage::from_bytes(body) {
+        Ok(ReplicationMessage::Deliver(d)) if d.kind == EnvelopeKind::Attestation => {
+            !d.envelopes.is_empty() && d.envelopes.iter().all(|row| is_contact_attestation(row))
+        }
+        _ => false,
+    }
+}
+
+/// Whether one signed attestation row is a `consent:replication:v1` grant
+/// (persist's [`DIMENSION`]), an owner binding (persist's
+/// [`is_owner_binding_envelope`]), or a retraction (`withdraws` / `recants`):
+/// the rows a contact is made and unmade of.
+///
+/// A retraction must be at least as fast as the grant it undoes: revocation is
+/// the privacy-critical direction. Persist's consent fold
+/// ([`revocation_fold_target`]) revokes on any `withdraws` / `recants` that
+/// references a grant, and the row names only the referenced id and type
+/// (`withdraws_attestation_envelope`: `references_attestation_id`,
+/// `references_attestation_type`), never the grant's dimension; so the bytes
+/// cannot tell a consent withdrawal from another one, and every retraction
+/// rides the contact lane. `supersedes` replaces rather than revokes and stays
+/// sync. The lane's share bound ([`CONTACT_RUN_MAX`]) keeps this from
+/// starving sync.
+///
+/// [`DIMENSION`]: ciris_persist::federation::consent_peer_set::DIMENSION
+/// [`is_owner_binding_envelope`]: ciris_persist::federation::admission::is_owner_binding_envelope
+/// [`revocation_fold_target`]: ciris_persist::federation::consent_peer_set::revocation_fold_target
+fn is_contact_attestation(row: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        attestation_type: String,
+        attestation_envelope: serde_json::Value,
+    }
+    #[derive(serde::Deserialize)]
+    struct Signed {
+        attestation: Row,
+    }
+    let Ok(Signed { attestation: a }) = serde_json::from_slice::<Signed>(row) else {
+        return false;
+    };
+    let consent = a
+        .attestation_envelope
+        .get("dimension")
+        .and_then(serde_json::Value::as_str)
+        == Some(ciris_persist::federation::consent_peer_set::DIMENSION);
+    let binding = a.attestation_type
+        == ciris_persist::federation::types::attestation_type::DELEGATES_TO
+        && ciris_persist::federation::admission::is_owner_binding_envelope(&a.attestation_envelope);
+    let retraction = {
+        use ciris_persist::federation::types::attestation_type as t;
+        a.attestation_type == t::WITHDRAWS || a.attestation_type == t::RECANTS
+    };
+    consent || binding || retraction
 }
 
 /// The default number of the eight kept for waiting layer neighbours.
@@ -716,8 +972,9 @@ impl ShapingPolicy {
 pub struct ShapingOffer {
     /// The class (informational beyond `Off`; the rate is what binds).
     pub class: BudgetClass,
-    /// The frame size this side will send and accept: its channel payload
-    /// MDU on the link.
+    /// The frame size this side will send and accept: the shaped frame
+    /// ([`shaped_frame`], 1,400 B or the link's smaller channel payload MDU).
+    /// A 44.0/44.1 peer still quotes its MDU here; [`agree`] takes the smaller.
     pub frame_bytes: u16,
     /// λ × 1000, frames per second this side can afford here (after its
     /// node-wide cap). Zero with `class == Off`.
@@ -749,10 +1006,11 @@ impl ShapingOffer {
     }
 
     /// The `seat` class's offer on a seat-to-seat link (CC 5.4.3 rc17): the
-    /// table's row at the link's frame, whatever this node's own settings.
+    /// table's row at the shaped frame ([`shaped_frame`] of the link's channel
+    /// payload MDU `frame_bytes`), whatever this node's own settings.
     #[must_use]
     pub fn seat(frame_bytes: usize) -> Self {
-        let frame = u16::try_from(frame_bytes.min(usize::from(u16::MAX))).unwrap_or(u16::MAX);
+        let frame = shaped_frame(frame_bytes);
         if frame < MIN_FRAME_BYTES {
             return Self::off();
         }
@@ -781,7 +1039,9 @@ impl ShapingOffer {
     }
 
     /// Build this node's offer for a link whose channel payload MDU is
-    /// `frame_bytes`: the class rate, whatever the node's other links.
+    /// `frame_bytes`: the class rate, whatever the node's other links, at the
+    /// shaped frame ([`shaped_frame`]: [`SHAPED_FRAME_BYTES`], or the MDU where
+    /// that is smaller).
     ///
     /// The node-wide cap is deliberately NOT in the offer. An offer is an upper
     /// bound for the link's life, and the cap is divided across the links a
@@ -795,7 +1055,7 @@ impl ShapingOffer {
         if !policy.enabled() {
             return Self::off();
         }
-        let frame = u16::try_from(frame_bytes.min(usize::from(u16::MAX))).unwrap_or(u16::MAX);
+        let frame = shaped_frame(frame_bytes);
         if frame < MIN_FRAME_BYTES {
             return Self::off();
         }
@@ -864,6 +1124,14 @@ impl ShapingOffer {
         }
         Ok(offer)
     }
+}
+
+/// CC 5.4.3 rc17 — the shaped frame on a link whose channel payload MDU is
+/// `channel_mdu`: [`SHAPED_FRAME_BYTES`], or the MDU where that is smaller.
+/// One constant, never per class and never negotiated upward.
+#[must_use]
+pub fn shaped_frame(channel_mdu: usize) -> u16 {
+    u16::try_from(channel_mdu.min(usize::from(SHAPED_FRAME_BYTES))).unwrap_or(SHAPED_FRAME_BYTES)
 }
 
 /// Whether `bytes` is a `SHAP` offer.
@@ -997,8 +1265,8 @@ pub enum ShapingError {
     /// A shaped frame on an unshaped link, or a bare frame on a shaped one.
     #[error("a frame of the wrong kind for this link's shaping state: {0}")]
     WrongKind(&'static str),
-    /// The link's queue is full: the caller defers and retries.
-    #[error("the shaped link's queue is full ({0} frames)")]
+    /// The link's lane is full: the caller defers and retries.
+    #[error("the shaped link's queue lane is full ({0} body bytes)")]
     QueueFull(usize),
     /// A body larger than the shaped frame carries.
     #[error("a {0}-byte body does not fit a {1}-byte shaped frame")]
@@ -1167,9 +1435,9 @@ pub enum Emission {
         bytes: Vec<u8>,
         /// Real (a queued body) or cover.
         real: bool,
-        /// The highest body ticket the frame carries (0 for cover): the
-        /// sender reports it as sent ([`LinkShaper::note_sent`]).
-        ticket: u64,
+        /// The highest body ticket the frame carries per lane (none for
+        /// cover): the sender reports them as sent ([`LinkShaper::note_sent`]).
+        tickets: FrameTickets,
     },
     /// The link is gone.
     Stopped,
@@ -1182,7 +1450,74 @@ type OfferAnswerTx = tokio::sync::oneshot::Sender<Result<bool, ShapingError>>;
 /// How long a dialler waits for the peer's offer after sending its own.
 pub const OFFER_ANSWER_BUDGET: Duration = Duration::from_secs(10);
 
-/// One shaped link's sender-side state: the queue of real bodies, the
+/// The tickets the bodies in one emitted frame carry: per lane, the highest
+/// (0 where the frame took nothing from that lane). The emission task reports
+/// them once the link took the frame ([`LinkShaper::note_sent`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameTickets {
+    /// The highest [`Lane::Contact`] ticket in the frame.
+    pub contact: u64,
+    /// The highest [`Lane::Sync`] ticket in the frame.
+    pub sync: u64,
+}
+
+impl FrameTickets {
+    fn note(&mut self, ticket: u64) {
+        let slot = match Lane::of_ticket(ticket) {
+            Lane::Contact => &mut self.contact,
+            Lane::Sync => &mut self.sync,
+        };
+        *slot = (*slot).max(ticket);
+    }
+}
+
+/// A shaped link's queued bodies, by lane. Each lane is FIFO and numbers its
+/// own bodies ([`Lane`]'s ticket bit), so its tickets are contiguous per
+/// enqueue and leave in order.
+#[derive(Debug, Default)]
+struct Lanes {
+    q: [VecDeque<(u64, Vec<u8>)>; 2],
+    /// Body bytes queued per lane (what [`queue_bytes_for`] bounds).
+    bytes: [usize; 2],
+    /// Bodies ever queued per lane: a body's ticket is its lane's bit and this
+    /// count once it is queued.
+    accepted: [u64; 2],
+    /// Real frames in a row that carried contact and no sync body while sync
+    /// waited ([`CONTACT_RUN_MAX`]).
+    contact_run: u8,
+}
+
+impl Lanes {
+    fn len(&self) -> usize {
+        self.q.iter().map(VecDeque::len).sum()
+    }
+
+    fn pop(&mut self, lane: Lane) -> Option<(u64, Vec<u8>)> {
+        let out = self.q[lane.index()].pop_front()?;
+        self.bytes[lane.index()] -= out.1.len();
+        Some(out)
+    }
+}
+
+/// CIRISEdge#963 — how many body bytes one lane of a shaped link under
+/// `agreement` holds: one window's real budget in body bytes
+/// (`ceil(ρ·λ·W)` frames, [`Agreement::reach_frames`]), and never less than one
+/// largest row ([`SHAPED_ROW_MAX_BYTES`]). Everything a lane holds can then
+/// leave within one window, and a burst past it is a retryable refusal
+/// ([`ShapingError::QueueFull`]) the caller defers, never a queue the timer
+/// cannot drain. At 1,400 B: about 2.1 MB at `server`, 840 KB `home`, 420 KB
+/// `phone-wifi`, 630 KB `phone-cellular` (the hour window), 9.8 MB `seat`.
+/// The cap was 4,096 bodies, which was 67 MB of 16 KB frames and would have
+/// been 5.7 MB of 1,400 B ones, at every class alike.
+#[must_use]
+pub fn queue_bytes_for(agreement: &Agreement) -> usize {
+    agreement
+        .reach_frames()
+        .saturating_mul(body_capacity(agreement.frame_bytes))
+        .max(SHAPED_ROW_MAX_BYTES)
+}
+
+/// One shaped link's sender-side state: the two lanes of real bodies, the
 /// Poisson timer and the budget meter.
 pub struct LinkShaper {
     /// When a real frame last crossed this link, either way. Cover never moves
@@ -1194,8 +1529,10 @@ pub struct LinkShaper {
     /// node would offer now is only comparable at this one
     /// ([`Self::carried_by`]).
     quoted_frame: u16,
-    queue: Mutex<VecDeque<(u64, Vec<u8>)>>,
-    queue_cap: usize,
+    /// The two lanes' queued bodies ([`Lane`]), each FIFO in itself.
+    queue: Mutex<Lanes>,
+    /// The most body bytes one lane holds ([`queue_bytes_for`]).
+    queue_bytes: usize,
     /// The peer announced multi-body frames ([`capability_body`]).
     coalesce: std::sync::atomic::AtomicBool,
     notify: Notify,
@@ -1204,14 +1541,11 @@ pub struct LinkShaper {
     budget: BudgetMeter,
     real: AtomicU64,
     cover: AtomicU64,
-    /// Bodies ever queued, in FIFO order: a body's ticket is this count once
-    /// it is queued ([`Self::enqueue`]).
-    accepted: AtomicU64,
-    /// Real frames the link really took ([`Self::note_real_sent`]). Serial and
-    /// The highest ticket among the bodies the link really took
-    /// ([`Self::note_sent`]); FIFO with `accepted`, so a ticket at or below
-    /// it has left this node.
-    last_sent: AtomicU64,
+    /// Per lane, the highest ticket among the bodies the link really took
+    /// ([`Self::note_sent`]). A lane is FIFO with its own numbering
+    /// ([`Lanes::accepted`]), so a ticket at or below its lane's mark has left
+    /// this node, whatever the other lane did meanwhile.
+    last_sent: [AtomicU64; 2],
     /// This sender's frame rate now (`f64` bits): the agreed λ, or lower when
     /// the node's cap is divided across more links ([`Self::set_share`]).
     lambda_now: AtomicU64,
@@ -1235,11 +1569,11 @@ impl std::fmt::Debug for LinkShaper {
 }
 
 impl LinkShaper {
-    /// A shaper for `link` under `agreement`, holding at most `queue_cap`
-    /// bodies.
+    /// A shaper for `link` under `agreement`, holding at most `queue_bytes`
+    /// body bytes in each lane ([`queue_bytes_for`] in production).
     #[must_use]
-    pub fn new(link: [u8; 16], agreement: Agreement, queue_cap: usize) -> Self {
-        Self::with_scheduler(link, agreement, queue_cap, PoissonScheduler::new())
+    pub fn new(link: [u8; 16], agreement: Agreement, queue_bytes: usize) -> Self {
+        Self::with_scheduler(link, agreement, queue_bytes, PoissonScheduler::new())
     }
 
     /// [`Self::new`] on a seeded timer (tests: a deterministic frame stream).
@@ -1247,13 +1581,13 @@ impl LinkShaper {
     pub fn new_seeded(
         link: [u8; 16],
         agreement: Agreement,
-        queue_cap: usize,
+        queue_bytes: usize,
         seed: [u8; 32],
     ) -> Self {
         Self::with_scheduler(
             link,
             agreement,
-            queue_cap,
+            queue_bytes,
             PoissonScheduler::from_seed(seed),
         )
     }
@@ -1261,7 +1595,7 @@ impl LinkShaper {
     fn with_scheduler(
         link: [u8; 16],
         agreement: Agreement,
-        queue_cap: usize,
+        queue_bytes: usize,
         poisson: PoissonScheduler,
     ) -> Self {
         let scope = ScopeKey::community(format!("link:{}", hex::encode(link)));
@@ -1275,8 +1609,8 @@ impl LinkShaper {
             quoted_frame: agreement.frame_bytes,
             last_real: Mutex::new(tokio::time::Instant::now()),
             agreement,
-            queue: Mutex::new(VecDeque::new()),
-            queue_cap,
+            queue: Mutex::new(Lanes::default()),
+            queue_bytes,
             coalesce: std::sync::atomic::AtomicBool::new(false),
             notify: Notify::new(),
             poisson,
@@ -1284,8 +1618,7 @@ impl LinkShaper {
             budget,
             real: AtomicU64::new(0),
             cover: AtomicU64::new(0),
-            accepted: AtomicU64::new(0),
-            last_sent: AtomicU64::new(0),
+            last_sent: [AtomicU64::new(0), AtomicU64::new(0)],
             lambda_now: AtomicU64::new(agreement.lambda.to_bits()),
             installed: std::time::Instant::now(),
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -1356,13 +1689,22 @@ impl LinkShaper {
         agreed <= quoted + 1e-6
     }
 
-    /// Bodies waiting.
+    /// Bodies waiting, both lanes.
     #[must_use]
     pub fn queued(&self) -> usize {
+        self.lanes().len()
+    }
+
+    /// Bodies waiting in `lane`.
+    #[must_use]
+    pub fn queued_in(&self, lane: Lane) -> usize {
+        self.lanes().q[lane.index()].len()
+    }
+
+    fn lanes(&self) -> std::sync::MutexGuard<'_, Lanes> {
         self.queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
     }
 
     /// Real and cover frames emitted so far.
@@ -1374,17 +1716,19 @@ impl LinkShaper {
         )
     }
 
-    /// Queue the bodies of one frame (each at most [`body_capacity`]), all
-    /// or none.
+    /// Queue the bodies of one message (each at most [`body_capacity`]) on
+    /// `lane`, all or none. Returns the last body's ticket; the message's
+    /// tickets are the contiguous run ending there ([`Self::ticket_left`],
+    /// [`Self::retract`]).
     ///
     /// # Errors
     /// [`ShapingError::QueueFull`] (the caller defers), [`ShapingError::BodyTooLarge`].
-    pub fn enqueue(&self, bodies: Vec<Vec<u8>>) -> Result<u64, ShapingError> {
+    pub fn enqueue(&self, lane: Lane, bodies: Vec<Vec<u8>>) -> Result<u64, ShapingError> {
         let reach = self.reach_frames_now();
         if bodies.len() > reach {
             return Err(ShapingError::BulkBeyondReach(bodies.len(), reach));
         }
-        self.enqueue_within_queue(bodies)
+        self.enqueue_within_queue(lane, bodies)
     }
 
     /// The mean gap between this sender's frames now (`1 / λ`).
@@ -1394,28 +1738,40 @@ impl LinkShaper {
     }
 
     /// How long to allow for `frames` queued bodies to leave: the Poisson
-    /// p99 of that many gaps (about 4.74 gaps for one; `frames + 4.74 × √frames`
-    /// for many), plus a margin, plus the window when the ρ budget cannot
-    /// admit them before it rolls; never more than [`ROW_LEAVE_MAX`] or
-    /// [`ROW_LEAVE_MAX_GAPS`] gaps, the larger (a sender that waited that long
-    /// retracts and retries). The bound a sender waits before calling a queued
-    /// row undelivered ([`Self::ticket_left`]).
+    /// p99 of that many gaps ([`p99_gaps`]), plus a margin, plus the window
+    /// when the ρ budget cannot admit them before it rolls; never more than
+    /// [`Self::row_leave_cap`] (a sender that waited that long retracts and
+    /// retries). The bound a sender waits before calling a queued row
+    /// undelivered ([`Self::ticket_left`]).
     #[must_use]
     pub fn leave_budget(&self, frames: usize) -> Duration {
-        #[allow(clippy::cast_precision_loss)]
-        let n = frames.max(1) as f64;
-        let gaps = n + 4.74 * n.sqrt();
-        let mut d = self.frame_gap().mul_f64(gaps) + Duration::from_secs(5);
+        let mut d = self.frame_gap().mul_f64(p99_gaps(frames)) + ROW_LEAVE_MARGIN;
         if frames > usize::try_from(self.real_remaining()).unwrap_or(usize::MAX) {
             d += self.agreement.window;
         }
-        d.min(ROW_LEAVE_MAX.max(self.frame_gap().mul_f64(ROW_LEAVE_MAX_GAPS)))
+        d.min(self.row_leave_cap())
     }
 
-    /// Whether every body up to `ticket` has left this node.
+    /// CIRISEdge#963 — the longest a sender waits for one row to leave this
+    /// link: the leave budget of the largest row a shaped link carries
+    /// ([`SHAPED_ROW_MAX_BYTES`], cut to this link's frame:
+    /// [`row_frames`]), or [`ROW_LEAVE_MAX`] where that is more. Stated in
+    /// row bytes, not in gaps: at the 16 KB frame a 64 KiB row was five frames
+    /// and sixteen gaps covered it, at 1,400 B it is 48, and a cap of sixteen
+    /// gaps timed out every full row on `phone-cellular` and retried it for
+    /// ever.
+    #[must_use]
+    pub fn row_leave_cap(&self) -> Duration {
+        let row = row_frames(SHAPED_ROW_MAX_BYTES, self.agreement.frame_bytes);
+        ROW_LEAVE_MAX.max(self.frame_gap().mul_f64(p99_gaps(row)) + ROW_LEAVE_MARGIN)
+    }
+
+    /// Whether every body of `ticket`'s lane up to `ticket` has left this
+    /// node. Each lane leaves in its own order, so the other lane's bodies say
+    /// nothing about it.
     #[must_use]
     pub fn ticket_left(&self, ticket: u64) -> bool {
-        self.last_sent.load(Ordering::Acquire) >= ticket
+        self.last_sent[Lane::of_ticket(ticket).index()].load(Ordering::Acquire) >= ticket
     }
 
     /// This sender's frame rate now.
@@ -1467,10 +1823,19 @@ impl LinkShaper {
         self.installed.elapsed() < OFFER_ANSWER_BUDGET
     }
 
-    /// The emission task's report: the frame carrying bodies up to `ticket`
-    /// was taken by the link.
-    pub fn note_sent(&self, ticket: u64) {
-        self.last_sent.fetch_max(ticket, Ordering::AcqRel);
+    /// The emission task's report: the frame carrying `tickets` was taken by
+    /// the link.
+    pub fn note_sent(&self, tickets: FrameTickets) {
+        for t in [tickets.contact, tickets.sync] {
+            if t != 0 {
+                self.note_ticket_sent(t);
+            }
+        }
+    }
+
+    /// The bodies of `ticket`'s lane up to `ticket` were taken by the link.
+    pub fn note_ticket_sent(&self, ticket: u64) {
+        self.last_sent[Lane::of_ticket(ticket).index()].fetch_max(ticket, Ordering::AcqRel);
     }
 
     /// The peer announced multi-body frames: pack from here.
@@ -1484,16 +1849,25 @@ impl LinkShaper {
         self.coalesce.load(Ordering::Acquire)
     }
 
-    /// Take back the queued bodies with tickets in `lo..=hi` that have not
-    /// left yet (a sender giving up its wait, so a retry does not send them
-    /// twice). Returns how many were removed.
+    /// Take back the queued bodies with tickets in `lo..=hi` (one message's
+    /// run, so one lane) that have not left yet (a sender giving up its wait,
+    /// so a retry does not send them twice). Returns how many were removed.
     pub fn retract(&self, lo: u64, hi: u64) -> usize {
-        let mut q = self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lane = Lane::of_ticket(hi);
+        if Lane::of_ticket(lo) != lane {
+            return 0;
+        }
+        let mut lanes = self.lanes();
+        let Lanes { q, bytes, .. } = &mut *lanes;
+        let (q, bytes) = (&mut q[lane.index()], &mut bytes[lane.index()]);
         let before = q.len();
-        q.retain(|(t, _)| *t < lo || *t > hi);
+        q.retain(|(t, b)| {
+            let keep = *t < lo || *t > hi;
+            if !keep {
+                *bytes -= b.len();
+            }
+            keep
+        });
         before - q.len()
     }
 
@@ -1512,13 +1886,14 @@ impl LinkShaper {
         self.stopped.load(Ordering::Acquire)
     }
 
-    /// The queue's free room, in bodies.
+    /// `lane`'s free room, in body bytes.
     #[must_use]
-    pub fn room(&self) -> usize {
-        self.queue_cap.saturating_sub(self.queued())
+    pub fn room(&self, lane: Lane) -> usize {
+        self.queue_bytes
+            .saturating_sub(self.lanes().bytes[lane.index()])
     }
 
-    fn enqueue_within_queue(&self, bodies: Vec<Vec<u8>>) -> Result<u64, ShapingError> {
+    fn enqueue_within_queue(&self, lane: Lane, bodies: Vec<Vec<u8>>) -> Result<u64, ShapingError> {
         let cap = body_capacity(self.agreement.frame_bytes);
         if let Some(b) = bodies.iter().find(|b| b.len() > cap) {
             return Err(ShapingError::BodyTooLarge(
@@ -1526,21 +1901,22 @@ impl LinkShaper {
                 usize::from(self.agreement.frame_bytes),
             ));
         }
-        let mut q = self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if q.len() + bodies.len() > self.queue_cap {
-            return Err(ShapingError::QueueFull(self.queue_cap));
+        let size: usize = bodies.iter().map(Vec::len).sum();
+        let mut lanes = self.lanes();
+        let i = lane.index();
+        if lanes.bytes[i] + size > self.queue_bytes {
+            return Err(ShapingError::QueueFull(self.queue_bytes));
         }
         let count = u64::try_from(bodies.len()).unwrap_or(u64::MAX);
-        let first = self.accepted.fetch_add(count, Ordering::AcqRel) + 1;
-        for (ticket, b) in (first..).zip(bodies) {
-            q.push_back((ticket, b));
+        let first = lanes.accepted[i] + 1;
+        lanes.accepted[i] += count;
+        lanes.bytes[i] += size;
+        for (seq, b) in (first..).zip(bodies) {
+            lanes.q[i].push_back((lane.ticket_bit() | seq, b));
         }
-        drop(q);
+        drop(lanes);
         self.notify.notify_one();
-        Ok(first + count - 1)
+        Ok(lane.ticket_bit() | (first + count - 1))
     }
 
     /// A real frame crossed this link, either way.
@@ -1597,27 +1973,47 @@ impl LinkShaper {
         );
         // One frame: the head body, or, toward a peer that announced
         // multi-body frames, as many heads as fit (v44 coalescing: a 200 B
-        // control message no longer spends a whole 16 KB slot).
+        // control message does not spend a whole slot). CIRISEdge#962: the
+        // contact lane's heads first, then the sync lane's; the frame on the
+        // wire is the same either way.
         let mut bodies: Vec<(u64, Vec<u8>)> = Vec::new();
         if under {
             let cap = body_capacity(self.agreement.frame_bytes);
             let pack = self.coalescing();
-            let mut q = self
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut lanes = self.lanes();
             let mut used = 0usize;
-            while let Some((_, b)) = q.front() {
-                let need = if pack { 2 + b.len() } else { b.len() };
-                if !bodies.is_empty() && (!pack || used + need > cap) {
-                    break;
+            let sync_waits = !lanes.q[Lane::Sync.index()].is_empty();
+            // The share bound: past CONTACT_RUN_MAX contact-only frames the
+            // sync lane's head goes first.
+            let order = if sync_waits && lanes.contact_run >= CONTACT_RUN_MAX {
+                [Lane::Sync, Lane::Contact]
+            } else {
+                Lane::ORDER
+            };
+            'lanes: for lane in order {
+                while let Some((_, b)) = lanes.q[lane.index()].front() {
+                    let need = if pack { 2 + b.len() } else { b.len() };
+                    if !bodies.is_empty() && (!pack || used + need > cap) {
+                        break 'lanes;
+                    }
+                    used += need;
+                    bodies.push(lanes.pop(lane).expect("front seen"));
                 }
-                used += need;
-                bodies.push(q.pop_front().expect("front seen"));
             }
+            let took_sync = bodies
+                .iter()
+                .any(|(t, _)| Lane::of_ticket(*t) == Lane::Sync);
+            lanes.contact_run = if took_sync || !sync_waits || bodies.is_empty() {
+                0
+            } else {
+                lanes.contact_run.saturating_add(1)
+            };
         }
         let real = !bodies.is_empty();
-        let ticket = bodies.iter().map(|(t, _)| *t).max().unwrap_or(0);
+        let mut tickets = FrameTickets::default();
+        for (t, _) in &bodies {
+            tickets.note(*t);
+        }
         let mut pad = |buf: &mut [u8]| self.poisson.fill_bytes(buf);
         if real {
             self.note_real();
@@ -1640,7 +2036,7 @@ impl LinkShaper {
             Ok(bytes) => Emission::Frame {
                 bytes,
                 real,
-                ticket,
+                tickets,
             },
             // Unreachable: enqueue bounded every body to the capacity.
             Err(_) => Emission::Stopped,
@@ -1652,10 +2048,12 @@ impl LinkShaper {
 /// mean gaps (`ln 20`).
 const P95_GAPS: f64 = 2.995_732_273_553_991;
 
-/// The frame a figure is stated at while this node holds no shaped link: a TCP
-/// link's channel payload (`FSD/TRANSPORT_TIERS_MODEL.md` §1), the largest a
-/// link runs at, "so a stated cost never understates the served one" (CC 5.4.3).
-pub const REFERENCE_FRAME_BYTES: u16 = 16_272;
+/// The frame a figure is stated at while this node holds no shaped link: the
+/// shaped frame ([`SHAPED_FRAME_BYTES`]), the largest a link runs at since CC
+/// 5.4.3 rc17 (a link whose MDU is smaller runs a smaller frame and a shorter
+/// gap), "so a stated cost never understates the served one". It was the TCP
+/// channel payload, 16,272 B, while the frame was the MDU.
+pub const REFERENCE_FRAME_BYTES: u16 = SHAPED_FRAME_BYTES;
 
 /// What a class costs a person, computed from the policy that governs it
 /// (`FSD/PRIVACY_MODES.md` §2.4, the §6.6 placeholders): raw values, which the
@@ -1678,9 +2076,14 @@ pub struct ShapingFigures {
     pub gap_s: f64,
     /// `gap_p95_s`: the 95th percentile of that wait.
     pub gap_p95_s: f64,
-    /// `gb_month_link`: one link for 30 days, each way, in GB (10⁹ bytes).
+    /// `wire_overhead`: what the seal, packet header and proof add on the wire
+    /// at this frame, as a fraction of the budget ([`wire_factor`] − 1;
+    /// about 0.15 at 1,400 B).
+    pub wire_overhead: f64,
+    /// `gb_month_link`: one link for 30 days, each way, in GB (10⁹ bytes), on
+    /// the wire (CC 5.4.3 rc17: a stated cost includes the overhead).
     pub gb_month_link: f64,
-    /// `gb_month_cap`: the node cap for 30 days, each way, in GB.
+    /// `gb_month_cap`: the node cap for 30 days, each way, in GB, on the wire.
     pub gb_month_cap: f64,
     /// `file_1mb_s`: 1 MB by the slow path, sustained, at ρ × rate.
     pub file_1mb_s: f64,
@@ -1701,6 +2104,7 @@ impl ShapingFigures {
         let rate = f64::from(policy.bytes_per_s);
         let gap_s = f64::from(frame_bytes) / rate;
         let real = policy.rho * rate;
+        let wire = wire_factor(frame_bytes);
         Some(Self {
             class: policy.class.as_str(),
             bytes_per_s: policy.bytes_per_s,
@@ -1710,8 +2114,9 @@ impl ShapingFigures {
             frame_bytes,
             gap_s,
             gap_p95_s: gap_s * P95_GAPS,
-            gb_month_link: rate * MONTH_S / GB,
-            gb_month_cap: f64::from(policy.node_cap_bytes_per_s) * MONTH_S / GB,
+            wire_overhead: wire - 1.0,
+            gb_month_link: rate * MONTH_S * wire / GB,
+            gb_month_cap: f64::from(policy.node_cap_bytes_per_s) * MONTH_S * wire / GB,
             file_1mb_s: 1e6 / real,
             file_10mb_s: 1e7 / real,
         })
@@ -1863,7 +2268,6 @@ pub struct LinkShapers {
     offered: Mutex<HashMap<[u8; 16], ShapingOffer>>,
     /// Dials waiting for the peer's answer ([`Self::begin_offer`]).
     pending: Mutex<HashMap<[u8; 16], OfferAnswerTx>>,
-    queue_cap: usize,
     /// The service tier in force (`FSD/PRIVACY_MODES.md` §6.12).
     tier: std::sync::atomic::AtomicU8,
     /// The shaped links a peer dialled here, by the order they were admitted:
@@ -1906,12 +2310,33 @@ pub const PEER_SHAPING_FACTS_MAX: usize = 4096;
 /// round gate for the whole window.
 pub const ROW_LEAVE_MAX: Duration = Duration::from_secs(60);
 
-/// The longest a sender waits, in the link's own gaps, where that is more than
-/// [`ROW_LEAVE_MAX`]: the p99 of a 64 KiB row (five frames, `5 + 4.74 × √5`
-/// gaps) with a margin. At `server` the 60 s rules; at the 47 s `phone-cellular`
-/// gap a fixed 60 s lost one single-frame row in four and nearly every full one,
-/// and their retries did not converge (`FSD/PRIVACY_MODES.md` E7).
-pub const ROW_LEAVE_MAX_GAPS: f64 = 16.0;
+/// The margin a leave budget allows on top of its Poisson p99.
+pub const ROW_LEAVE_MARGIN: Duration = Duration::from_secs(5);
+
+/// The Poisson p99 of `frames` frame gaps, in gaps: about 4.74 for one,
+/// `n + 4.74 × √n` for many.
+#[must_use]
+pub fn p99_gaps(frames: usize) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let n = frames.max(1) as f64;
+    n + 4.74 * n.sqrt()
+}
+
+/// The shaped frames a message of `bytes` takes at `frame_bytes`: one body
+/// when it fits, else `CFRG` fragments of the body less the fragment header
+/// ([`crate::transport::frame_fragment::fragment`]). A 64 KiB row is 48
+/// frames at [`SHAPED_FRAME_BYTES`]; it was five at the 16 KB MDU.
+#[must_use]
+pub fn row_frames(bytes: usize, frame_bytes: u16) -> usize {
+    let body = body_capacity(frame_bytes);
+    if bytes <= body {
+        return 1;
+    }
+    bytes.div_ceil(
+        body.saturating_sub(crate::transport::frame_fragment::FRAGMENT_HEADER_LEN)
+            .max(1),
+    )
+}
 
 /// `CLM-shaping-offered-never-refused` — how long past its last real frame a
 /// node that does not offer shaping keeps a link a peer asked it for.
@@ -1934,9 +2359,6 @@ impl std::fmt::Debug for AnonymousRead {
         f.write_str("AnonymousRead")
     }
 }
-
-/// Default bound on a shaped link's queue, in bodies.
-pub const DEFAULT_QUEUE_CAP: usize = 4096;
 
 impl LinkShapers {
     /// A table under `policy`.
@@ -1961,7 +2383,6 @@ impl LinkShapers {
             links: Mutex::new(HashMap::new()),
             offered: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
-            queue_cap: DEFAULT_QUEUE_CAP,
             tier: std::sync::atomic::AtomicU8::new(0),
             admitted: Mutex::new(HashMap::new()),
             admissions: std::sync::atomic::AtomicU64::new(0),
@@ -2411,6 +2832,20 @@ impl LinkShapers {
             .min()
     }
 
+    /// CIRISEdge#963 — the longest any shaped link to `peer` lets one row wait
+    /// to leave ([`LinkShaper::row_leave_cap`]): what the outer bound on a
+    /// round's send must exceed ([`crate::transport::Transport::pacing_row_bound`]).
+    #[must_use]
+    pub fn row_bound_to_peer(&self, peer: &str) -> Option<Duration> {
+        let links = self.links();
+        self.link_peer()
+            .iter()
+            .filter(|(_, p)| p.as_str() == peer)
+            .filter_map(|(l, _)| links.get(l))
+            .map(|s| s.row_leave_cap())
+            .max()
+    }
+
     /// Whether `peer` is one of this node's layer neighbours.
     #[must_use]
     pub fn is_layer_peer(&self, peer: Option<&str>) -> bool {
@@ -2554,7 +2989,7 @@ impl LinkShapers {
         let shapers: Vec<Arc<LinkShaper>> = self.links().values().map(Arc::clone).collect();
         for shaper in shapers {
             // choke-ok: a report is a hint; a full queue carries the next one.
-            let _ = shaper.enqueue(vec![capability_body(free)]);
+            let _ = shaper.enqueue(Lane::Contact, vec![capability_body(free)]);
         }
     }
 
@@ -3023,7 +3458,7 @@ impl LinkShapers {
                 let seat = ours.class == BudgetClass::Seat
                     && agreement.lambda >= f64::from(ours.rate_milli) / 1000.0 - 1e-6;
                 let shaper = Arc::new(
-                    LinkShaper::new(link, agreement, self.queue_cap)
+                    LinkShaper::new(link, agreement, queue_bytes_for(&agreement))
                         .quoted_at(ours.frame_bytes)
                         .of_class(ours.class.link_class(theirs.class, seat)),
                 );
@@ -3393,7 +3828,9 @@ mod tests {
         let _ = t.offer_for_answer(link, 400, Some("asker"), &peer);
         let shaper = t.peer_offer(link, &peer).unwrap().expect("shaped");
         tokio::time::advance(t.asked_idle_ttl().saturating_sub(Duration::from_secs(1))).await;
-        shaper.enqueue(vec![b"row".to_vec()]).expect("queued");
+        shaper
+            .enqueue(Lane::Sync, vec![b"row".to_vec()])
+            .expect("queued");
         assert!(matches!(
             shaper.next_emission().await,
             Emission::Frame { real: true, .. }
@@ -3555,15 +3992,16 @@ mod tests {
     }
 
     /// No floor anywhere a shaping peer could be turned off: a cellular class
-    /// on a 16 KB frame is quoted at its true rate (one frame per 46 s), and
-    /// under `DivideNoFloor` a hundred links each take a hundredth of the cap
-    /// and the sum stays under it.
+    /// on a 16 KB link is quoted at its true rate at the shaped frame (one
+    /// 1,400 B frame per 4 s), and under `DivideNoFloor` a hundred links each
+    /// take a hundredth of the cap and the sum stays under it.
     #[test]
     fn a_slow_rate_is_quoted_not_refused_and_divide_no_floor_keeps_the_sum_under_the_cap() {
         let cell = ShapingPolicy::for_class(BudgetClass::PhoneCellular);
         let o = ShapingOffer::from_policy(&cell, 16_272);
-        assert!(o.shapes(), "350 B/s on a 16 KB frame is quoted, not off");
-        assert_eq!(o.rate_milli, 22);
+        assert!(o.shapes(), "350 B/s on a 16 KB link is quoted, not off");
+        assert_eq!(o.frame_bytes, SHAPED_FRAME_BYTES);
+        assert_eq!(o.rate_milli, 250);
         let mut p = ShapingPolicy::fleet_default(BudgetClass::Server);
         p.share = ShapedSharePolicy::DivideNoFloor;
         let cap = f64::from(p.node_cap_bytes_per_s);
@@ -3609,8 +4047,9 @@ mod tests {
             rho: 0.5,
             window: Duration::from_secs(1),
         };
-        let s = LinkShaper::new([9u8; 16], agreement, 16);
-        s.enqueue(vec![b"a".to_vec(), b"b".to_vec()]).unwrap();
+        let s = LinkShaper::new([9u8; 16], agreement, 160);
+        s.enqueue(Lane::Sync, vec![b"a".to_vec(), b"b".to_vec()])
+            .unwrap();
         let mut reals = 0;
         let mut covers = 0;
         for _ in 0..40 {
@@ -3632,12 +4071,21 @@ mod tests {
         assert_eq!(reals, 2, "both bodies went, once each");
         assert_eq!(covers, 38);
         assert!(matches!(
-            s.enqueue(vec![vec![0u8; 300]]),
+            s.enqueue(Lane::Sync, vec![vec![0u8; 300]]),
             Err(ShapingError::BodyTooLarge(..))
         ));
         assert!(matches!(
-            s.enqueue(vec![vec![0u8; 10]; 17]),
-            Err(ShapingError::QueueFull(16))
+            s.enqueue(Lane::Sync, vec![vec![0u8; 10]; 17]),
+            Err(ShapingError::QueueFull(160))
+        ));
+        // The cap is per lane, in body bytes: a full sync lane leaves the
+        // contact lane its room.
+        s.enqueue(Lane::Sync, vec![vec![0u8; 10]; 16]).unwrap();
+        assert_eq!(s.room(Lane::Sync), 0);
+        s.enqueue(Lane::Contact, vec![vec![0u8; 10]; 16]).unwrap();
+        assert!(matches!(
+            s.enqueue(Lane::Contact, vec![vec![0u8; 1]]),
+            Err(ShapingError::QueueFull(160))
         ));
         s.stop();
         assert!(matches!(s.next_emission().await, Emission::Stopped));
@@ -3690,10 +4138,13 @@ mod tests {
                 ShapingPolicy::for_device(&d).offers_on(false),
                 "{class:?} opted in"
             );
-            // The table's cost columns follow the rate (within rounding).
+            // The table's cost columns follow the rate, on the wire at the
+            // shaped frame (CC 5.4.3 rc17: a stated cost includes the seal,
+            // the packet header and the proof), within rounding.
             let row = fleet_default_row(class).expect("a row per class");
             #[allow(clippy::cast_precision_loss)]
-            let per_link = ShapingPolicy::for_class(class).monthly_bytes_per_link() as f64 / 1e9;
+            let per_link = ShapingPolicy::for_class(class).monthly_bytes_per_link() as f64 / 1e9
+                * wire_factor(SHAPED_FRAME_BYTES);
             assert!(
                 (row.gb_month_per_link_each_way - per_link).abs() < 0.06,
                 "{class:?}"
@@ -3906,7 +4357,11 @@ mod tests {
         let o = t.offer_for([1u8; 16], 16_272, Some("seat-b"));
         assert_eq!(o.class, BudgetClass::Seat);
         assert_eq!((o.rho_milli, o.window_s), (500, 600));
-        assert_eq!(o.rate_milli, 2028, "33,000 B/s at 16,272 B");
+        assert_eq!(
+            o.frame_bytes, SHAPED_FRAME_BYTES,
+            "a seat link gets the one frame too"
+        );
+        assert_eq!(o.rate_milli, 23_571, "33,000 B/s at 1,400 B");
         assert_eq!(
             o.encode()[5],
             BudgetClass::Server as u8,
@@ -3914,7 +4369,7 @@ mod tests {
         );
         let back = ShapingOffer::decode(&o.encode()).unwrap();
         assert_eq!(back.class, BudgetClass::Server);
-        assert_eq!(back.rate_milli, 2028);
+        assert_eq!(back.rate_milli, 23_571);
         let a = agree(&o, &back).expect("seat to seat");
         assert!(
             (i64::from(a.bytes_per_s()) - 33_000).abs() <= 2,
@@ -3923,9 +4378,13 @@ mod tests {
         );
         let normal = t.offer_for([2u8; 16], 16_272, Some("home-node"));
         assert_eq!(normal.class, BudgetClass::Server);
-        assert_eq!(normal.rate_milli, 430, "7000 B/s at 16,272 B");
+        assert_eq!(normal.rate_milli, 5_000, "7000 B/s at 1,400 B");
         let mixed = agree(&o, &normal).expect("seat to non-seat");
-        assert!(mixed.lambda < 0.5, "the lower of the two: {}", mixed.lambda);
+        assert!(
+            (mixed.lambda - 5.0).abs() < 1e-6,
+            "the lower of the two, 7,000 B/s at 1,400 B: {}",
+            mixed.lambda
+        );
         t.peer_offer([1u8; 16], &back)
             .unwrap()
             .expect("seat link shaped");
@@ -3943,7 +4402,7 @@ mod tests {
         let u = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
         u.set_seats(["seat-b".to_owned()].into_iter().collect(), false);
         let o = u.offer_for([3u8; 16], 16_272, Some("seat-b"));
-        assert_eq!((o.class, o.rate_milli), (BudgetClass::Server, 430));
+        assert_eq!((o.class, o.rate_milli), (BudgetClass::Server, 5_000));
         assert_eq!(BudgetClass::parse("seat"), Some(BudgetClass::Seat));
     }
 
@@ -3973,14 +4432,22 @@ mod tests {
         r.enable_capacity_reports();
         shaped_links(&r, 1, "g", 10);
         assert_eq!(r.reported_slots(), 0, "off until the host says otherwise");
-        let idle = r.get([10u8; 16]).expect("a link").room();
+        let idle = r.get([10u8; 16]).expect("a link").queued_in(Lane::Contact);
         r.set_relay_offering(true);
         assert_eq!(r.reported_slots(), 7);
         let link = r.get([10u8; 16]).expect("a link");
-        assert_eq!(link.room(), idle - 1, "the report went out on the link");
+        assert_eq!(
+            link.queued_in(Lane::Contact),
+            idle + 1,
+            "the report went out on the link"
+        );
         r.set_relay_offering(false);
         assert_eq!(r.reported_slots(), 0);
-        assert_eq!(link.room(), idle - 2, "and so did the zero");
+        assert_eq!(
+            link.queued_in(Lane::Contact),
+            idle + 2,
+            "and so did the zero"
+        );
 
         // The peer's side: a zero report takes the node out of the ranking.
         let t = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
@@ -4015,28 +4482,50 @@ mod tests {
         assert!(firsts.values().all(|n| *n <= 3), "{firsts:?}");
     }
 
-    /// E7 — the wait follows the link's own gap: a full row can leave at every
-    /// class, and a fast link keeps the 60 s bound.
+    /// E7, CIRISEdge#963 — the wait follows the link's own gap and is bounded
+    /// in row bytes: an offer quoted at the TCP MDU agrees at the shaped
+    /// frame, the largest row (64 KiB, 48 frames there) has its Poisson p99
+    /// at every class, and a fast link keeps the 60 s bound.
+    /// Mutation: the old cap of sixteen gaps → `phone-cellular` and
+    /// `phone-wifi` fall short of the p99.
     #[test]
     fn a_full_row_has_time_to_leave_at_every_class() {
         let shaper = |bytes: u32| {
             let o = offer(BudgetClass::Server, 16_272, bytes, 0.5, 3600);
-            LinkShaper::new([1u8; 16], agree(&o, &o).expect("agreed"), 8)
+            let a = agree(&o, &o).expect("agreed");
+            assert_eq!(
+                a.frame_bytes, SHAPED_FRAME_BYTES,
+                "quoted at the shaped frame"
+            );
+            LinkShaper::new([1u8; 16], a, queue_bytes_for(&a))
         };
-        let server = shaper(7_000);
-        assert!(server.leave_budget(5) <= ROW_LEAVE_MAX);
+        let row = row_frames(SHAPED_ROW_MAX_BYTES, SHAPED_FRAME_BYTES);
+        assert_eq!(row, 48, "a 64 KiB row at 1,400 B");
         assert_eq!(
-            server.leave_budget(50),
+            row_frames(SHAPED_ROW_MAX_BYTES, 16_272),
+            5,
+            "and at the MDU"
+        );
+        assert_eq!(row_frames(100, SHAPED_FRAME_BYTES), 1);
+        let server = shaper(7_000);
+        assert_eq!(
+            server.row_leave_cap(),
             ROW_LEAVE_MAX,
             "a fast link keeps 60 s"
         );
+        assert!(server.leave_budget(row) <= ROW_LEAVE_MAX);
+        for bytes in [7_000, 2_800, 1_400, 350] {
+            let s = shaper(bytes);
+            let p99 = s.frame_gap().mul_f64(p99_gaps(row));
+            assert!(
+                s.leave_budget(row) >= p99 && s.row_leave_cap() >= p99,
+                "{bytes} B/s: {:?} < {p99:?}",
+                s.leave_budget(row)
+            );
+        }
         let cellular = shaper(350);
-        let p99 = cellular.frame_gap().mul_f64(5.0 + 4.74 * 5f64.sqrt());
-        assert!(
-            cellular.leave_budget(5) >= p99,
-            "{:?} < {p99:?}",
-            cellular.leave_budget(5)
-        );
+        assert_eq!(cellular.frame_gap(), Duration::from_secs(4));
+        assert!(cellular.row_leave_cap() > Duration::from_secs(320));
     }
 
     /// **The viability rule** (FSD/TRANSPORT_TIERS_MODEL.md): a five-plane
@@ -4051,7 +4540,7 @@ mod tests {
             loop {
                 match s.next_emission().await {
                     Emission::Frame {
-                        real, ticket: t, ..
+                        real, tickets: t, ..
                     } => {
                         if real {
                             s.note_sent(t);
@@ -4071,8 +4560,8 @@ mod tests {
                 rho: 0.9,
                 window: Duration::from_secs(10),
             };
-            let a = LinkShaper::new_seeded([1u8; 16], agreement, 256, [7u8; 32]);
-            let b = LinkShaper::new_seeded([2u8; 16], agreement, 256, [9u8; 32]);
+            let a = LinkShaper::new_seeded([1u8; 16], agreement, 256 * 1400, [7u8; 32]);
+            let b = LinkShaper::new_seeded([2u8; 16], agreement, 256 * 1400, [9u8; 32]);
             if coalesce {
                 a.enable_coalescing();
                 b.enable_coalescing();
@@ -4081,9 +4570,13 @@ mod tests {
             let mut ok = 0;
             for _ in 0..100 {
                 let started = tokio::time::Instant::now();
-                let t = a.enqueue((0..5u8).map(|i| vec![i; 200]).collect()).unwrap();
+                let t = a
+                    .enqueue(Lane::Sync, (0..5u8).map(|i| vec![i; 200]).collect())
+                    .unwrap();
                 drain(&a, t).await;
-                let t = b.enqueue((0..5u8).map(|i| vec![i; 200]).collect()).unwrap();
+                let t = b
+                    .enqueue(Lane::Sync, (0..5u8).map(|i| vec![i; 200]).collect())
+                    .unwrap();
                 drain(&b, t).await;
                 if started.elapsed() <= interval {
                     ok += 1;
@@ -4124,34 +4617,34 @@ mod tests {
             rho: 0.9,
             window: Duration::from_secs(1),
         };
-        let s = LinkShaper::new([3u8; 16], agreement, 64);
+        let s = LinkShaper::new([3u8; 16], agreement, 64 * 200);
         let last = s
-            .enqueue((0..20u8).map(|i| vec![i; 200]).collect())
+            .enqueue(Lane::Sync, (0..20u8).map(|i| vec![i; 200]).collect())
             .unwrap();
         assert_eq!(last, 20);
         // Not announced: one body per frame.
         let Emission::Frame {
             bytes,
             real,
-            ticket,
+            tickets,
         } = s.next_emission().await
         else {
             panic!("stopped")
         };
         assert!(real);
-        assert_eq!(ticket, 1);
+        assert_eq!(tickets.sync, 1);
         assert!(matches!(unwrap(&bytes).unwrap(), ShapedFrame::Real(_)));
         // Announced: six 200 B bodies (6 × 202 ≤ 1392) in the next frame.
         s.enable_coalescing();
-        let Emission::Frame { bytes, ticket, .. } = s.next_emission().await else {
+        let Emission::Frame { bytes, tickets, .. } = s.next_emission().await else {
             panic!("stopped")
         };
         match unwrap(&bytes).unwrap() {
             ShapedFrame::Many(got) => assert_eq!(got.len(), 6),
             other => panic!("{other:?}"),
         }
-        assert_eq!(ticket, 7);
-        s.note_sent(ticket);
+        assert_eq!(tickets.sync, 7);
+        s.note_sent(tickets);
         assert!(s.ticket_left(7) && !s.ticket_left(8));
         assert_eq!(s.queued(), 13);
         assert_eq!(s.retract(15, 20), 6, "the unsent tail is taken back");
@@ -4183,6 +4676,596 @@ mod tests {
         assert_eq!(wire, BULK_MESSAGE_TYPES.map(str::to_owned).to_vec());
     }
 
+    /// CIRISEdge#962 — the contact lane's spellings ARE serde's: each contact
+    /// `MessageType` and each contact replication plane is the JSON string its
+    /// type serializes to, so a rename on either side fails here instead of
+    /// silently putting first contact back behind the sync backlog.
+    #[test]
+    fn contact_classes_are_the_wire_spelling_of_their_types() {
+        use crate::messages::MessageType as M;
+        use crate::replication::protocol::EnvelopeKind as K;
+        let spell = |v: serde_json::Value| v.as_str().unwrap().to_owned();
+        assert_eq!(
+            [M::PublicKeyRegistration]
+                .iter()
+                .map(|t| spell(serde_json::to_value(t).unwrap()))
+                .collect::<Vec<_>>(),
+            CONTACT_MESSAGE_TYPES.map(str::to_owned).to_vec()
+        );
+        assert_eq!(
+            [
+                K::Key,
+                K::IdentityOccurrence,
+                K::TransportDestination,
+                K::Revocation,
+                K::IdentityOccurrenceRevocation,
+            ]
+            .iter()
+            .map(|k| spell(serde_json::to_value(k).unwrap()))
+            .collect::<Vec<_>>(),
+            CONTACT_ENVELOPE_KINDS.map(str::to_owned).to_vec()
+        );
+        // The bootstrap planes are all contact planes.
+        for k in K::BOOTSTRAP_PLANES {
+            let w = spell(serde_json::to_value(k).unwrap());
+            assert!(CONTACT_ENVELOPE_KINDS.contains(&w.as_str()), "{k:?}");
+        }
+    }
+
+    /// **CIRISEdge#963, CC 5.4.3 rc17 — the shaped frame is one constant.**
+    /// Every class and the seat row quote 1,400 B on a TCP link and the MDU on
+    /// a smaller one; a 44.0/44.1 peer's offer at its 16,272 B MDU agrees at
+    /// 1,400 B at its own byte rate; the wire costs about 15 % over the budget
+    /// there against about 1 % at the MDU.
+    /// Mutation: drop the cap in `shaped_frame` → every offer quotes the MDU.
+    #[test]
+    fn the_shaped_frame_is_one_constant_and_an_mdu_offer_agrees_at_it() {
+        for class in [
+            BudgetClass::Server,
+            BudgetClass::Home,
+            BudgetClass::PhoneWifi,
+            BudgetClass::PhoneCellular,
+        ] {
+            let p = ShapingPolicy::for_class(class);
+            assert_eq!(
+                ShapingOffer::from_policy(&p, 16_272).frame_bytes,
+                SHAPED_FRAME_BYTES,
+                "{class:?}"
+            );
+            assert_eq!(ShapingOffer::from_policy(&p, 431).frame_bytes, 431);
+        }
+        assert_eq!(ShapingOffer::seat(16_272).frame_bytes, SHAPED_FRAME_BYTES);
+        assert_eq!(shaped_frame(usize::MAX), SHAPED_FRAME_BYTES);
+        // A 44.1.0 server offers 7,000 B/s at its 16,272 B MDU.
+        let old = ShapingOffer {
+            class: BudgetClass::Server,
+            frame_bytes: 16_272,
+            rate_milli: 430,
+            rho_milli: 500,
+            window_s: 600,
+        };
+        let ours =
+            ShapingOffer::from_policy(&ShapingPolicy::for_class(BudgetClass::Server), 16_272);
+        let a = agree(&ours, &old).expect("agreed");
+        assert_eq!(a.frame_bytes, SHAPED_FRAME_BYTES);
+        assert!(
+            (f64::from(a.bytes_per_s()) - 6_997.0).abs() < 1.0,
+            "{}",
+            a.bytes_per_s()
+        );
+        assert!((a.lambda - 5.0).abs() < 0.01, "0.2 s gaps: {}", a.lambda);
+        assert!((wire_factor(SHAPED_FRAME_BYTES) - 1.154).abs() < 0.001);
+        assert!(wire_factor(16_272) < 1.015);
+    }
+
+    /// One signed attestation row as the replication plane carries it, with
+    /// `envelope` as its `attestation_envelope`.
+    fn attestation_row(attestation_type: &str, envelope: &serde_json::Value) -> Vec<u8> {
+        serde_json::json!({
+            "attestation": {
+                "attestation_id": "a-1",
+                "attestation_type": attestation_type,
+                "attestation_envelope": envelope,
+            },
+            "signature": "s",
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn deliver(
+        kind: crate::replication::protocol::EnvelopeKind,
+        rows: Vec<Vec<u8>>,
+    ) -> crate::replication::protocol::ReplicationMessage {
+        crate::replication::protocol::ReplicationMessage::Deliver(
+            crate::replication::protocol::DeliverMessage {
+                kind,
+                envelopes: rows,
+            },
+        )
+    }
+
+    /// CIRISEdge#962 — the lane is read from the frame the field produces:
+    /// the real `wire_frame` wrappers (v1 and the v3 round frame) and the
+    /// edge's envelope order. Bootstrap planes in any verb, a Deliver of
+    /// consent grants, owner bindings and their withdrawals and recants, and a
+    /// key registration are contact; an attestation page that mixes in other
+    /// rows, a supersede, a Summary of the attestation plane, chat, the onion
+    /// and junk are sync.
+    /// Mutation: drop the retraction class → a grant's withdrawal reads sync.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table of frames and their lanes
+    fn the_lane_is_read_off_the_frame() {
+        use crate::messages::MessageType as M;
+        use crate::replication::protocol::{
+            EnvelopeKind as K, PullMessage, ReplicationMessage as R, SummaryMessage,
+        };
+        use crate::replication::wire_frame::{wrap, wrap_for_kind, wrap_v3, RoundSide};
+        let env = |t: M| {
+            let mut v = serde_json::json!({
+                "edge_schema_version": crate::messages::SchemaVersion::default(),
+                "signing_key_id": "a",
+                "destination_key_id": "b",
+                "message_type": t,
+            })
+            .to_string()
+            .into_bytes();
+            v.pop();
+            v.extend_from_slice(br#","body":{"x":1},"signature":"s"}"#);
+            v
+        };
+        assert_eq!(Lane::of(&env(M::PublicKeyRegistration)), Lane::Contact);
+        for t in [M::OpaqueEvent, M::OpaqueRequest, M::AttestationGossip] {
+            assert_eq!(Lane::of(&env(t.clone())), Lane::Sync, "{t:?}");
+        }
+        let consent = attestation_row(
+            "scores",
+            &serde_json::json!({
+                "dimension": ciris_persist::federation::consent_peer_set::DIMENSION,
+            }),
+        );
+        let binding = attestation_row(
+            ciris_persist::federation::types::attestation_type::DELEGATES_TO,
+            &serde_json::json!({
+                "dimension": ciris_persist::federation::types::owner_binding::DIMENSION,
+            }),
+        );
+        let chat = attestation_row(
+            "scores",
+            &serde_json::json!({"dimension": "chat:message:v1"}),
+        );
+        // Revocation is the privacy-critical direction: the withdrawal of a
+        // grant (persist's own envelope) and the recant of an owner binding
+        // ride with the rows they undo.
+        let withdraw_grant = attestation_row(
+            ciris_persist::federation::types::attestation_type::WITHDRAWS,
+            &ciris_persist::federation::replication::withdraws_attestation_envelope(
+                "grant-1",
+                ciris_persist::federation::types::attestation_type::SCORES,
+            ),
+        );
+        let recant_binding = attestation_row(
+            ciris_persist::federation::types::attestation_type::RECANTS,
+            &serde_json::json!({
+                "kind": "recants",
+                "references_attestation_id": "binding-1",
+                "references_attestation_type":
+                    ciris_persist::federation::types::attestation_type::DELEGATES_TO,
+            }),
+        );
+        let supersede = attestation_row(
+            ciris_persist::federation::types::attestation_type::SUPERSEDES,
+            &serde_json::json!({"kind": "supersedes", "references_attestation_id": "x"}),
+        );
+        for (kind, rows) in [
+            (K::Attestation, vec![withdraw_grant.clone()]),
+            (
+                K::Attestation,
+                vec![recant_binding.clone(), consent.clone()],
+            ),
+            (K::Key, vec![b"{}".to_vec()]),
+            (K::IdentityOccurrence, vec![b"{}".to_vec()]),
+            (K::TransportDestination, vec![b"{}".to_vec()]),
+            (K::Revocation, vec![b"{}".to_vec()]),
+            (K::IdentityOccurrenceRevocation, vec![b"{}".to_vec()]),
+            (K::Attestation, vec![consent.clone()]),
+            (K::Attestation, vec![binding.clone(), consent.clone()]),
+        ] {
+            let m = deliver(kind, rows);
+            assert_eq!(Lane::of(&wrap(&m)), Lane::Contact, "{kind:?} v1");
+            assert_eq!(Lane::of(&wrap_for_kind(&m)), Lane::Contact, "{kind:?}");
+            assert_eq!(
+                Lane::of(&wrap_v3(&m, RoundSide::Responder, 9)),
+                Lane::Contact,
+                "{kind:?} v3"
+            );
+        }
+        let pull = R::Pull(PullMessage {
+            kind: K::TransportDestination,
+            subject_key_id: "stranger".to_owned(),
+        });
+        assert_eq!(
+            Lane::of(&wrap_v3(&pull, RoundSide::Initiator, 3)),
+            Lane::Contact
+        );
+        for (what, m) in [
+            (
+                "a mixed page",
+                deliver(K::Attestation, vec![consent, chat.clone()]),
+            ),
+            ("a chat page", deliver(K::Attestation, vec![chat.clone()])),
+            (
+                "a withdrawal beside chat",
+                deliver(K::Attestation, vec![withdraw_grant, chat]),
+            ),
+            ("a supersede", deliver(K::Attestation, vec![supersede])),
+            ("an empty page", deliver(K::Attestation, Vec::new())),
+            ("a family page", deliver(K::Family, vec![b"{}".to_vec()])),
+            (
+                "an attestation summary",
+                R::Summary(SummaryMessage {
+                    kind: K::Attestation,
+                    refs: Vec::new(),
+                    status: None,
+                }),
+            ),
+        ] {
+            assert_eq!(Lane::of(&wrap(&m)), Lane::Sync, "{what}");
+            assert_eq!(
+                Lane::of(&wrap_v3(&m, RoundSide::Responder, 9)),
+                Lane::Sync,
+                "{what} v3"
+            );
+        }
+        assert_eq!(Lane::of(b"CONP\x00\x01"), Lane::Sync, "an onion frame");
+        assert_eq!(Lane::of(b"CRPL"), Lane::Sync, "a bare preamble");
+        assert_eq!(Lane::of(b"not a frame"), Lane::Sync);
+    }
+
+    /// CIRISEdge#962 — tickets and retraction stay exact across the two
+    /// lanes. A contact message queued after a sync backlog leaves first; its
+    /// leaving says nothing about the sync bodies queued before it (a single
+    /// FIFO high-water mark would call them gone); a retraction takes back
+    /// exactly its own run, in its own lane; a coalesced frame reports both
+    /// lanes' tickets.
+    /// Mutation: one high-water mark for both lanes (`ticket_left` reading
+    /// the contact lane's mark for every ticket) → the sync row reads as left
+    /// while all three of its bodies are still queued.
+    #[tokio::test]
+    async fn tickets_and_retraction_hold_across_the_lanes() {
+        let agreement = Agreement {
+            lambda: 200.0,
+            frame_bytes: 1400,
+            rho: 0.9,
+            window: Duration::from_secs(1),
+        };
+        let s = LinkShaper::new([5u8; 16], agreement, 64 * 1400);
+        let a = s.enqueue(Lane::Sync, vec![vec![1; 100]; 3]).unwrap();
+        let c = s.enqueue(Lane::Contact, vec![vec![2; 100]; 2]).unwrap();
+        let b = s.enqueue(Lane::Sync, vec![vec![3; 100]; 2]).unwrap();
+        assert_eq!(
+            (Lane::of_ticket(a), Lane::of_ticket(c)),
+            (Lane::Sync, Lane::Contact)
+        );
+        assert_eq!(a, 3, "the sync lane numbers its own bodies");
+        assert_eq!(b, 5);
+        for want in [2u8, 2] {
+            let Emission::Frame { bytes, tickets, .. } = s.next_emission().await else {
+                panic!("stopped")
+            };
+            assert_eq!(unwrap(&bytes).unwrap(), ShapedFrame::Real(vec![want; 100]));
+            assert_eq!(tickets.sync, 0, "the contact lane goes first");
+            s.note_sent(tickets);
+        }
+        assert!(s.ticket_left(c), "the contact message left");
+        assert!(!s.ticket_left(a), "the sync row queued before it did not");
+        assert!(!s.ticket_left(b));
+        assert_eq!(s.queued_in(Lane::Sync), 5);
+        // A retraction names one message's run and takes back only it.
+        assert_eq!(s.retract(c - 1, c), 0, "what left is not in the queue");
+        assert_eq!(s.retract(a - 2, c), 0, "a run never spans the two lanes");
+        assert_eq!(s.retract(b - 1, b), 2, "row B is taken back");
+        assert_eq!(s.queued_in(Lane::Sync), 3);
+        assert_eq!(s.room(Lane::Sync), 64 * 1400 - 300);
+        // Coalescing: one frame carries a contact body and the sync row.
+        s.enable_coalescing();
+        let c2 = s.enqueue(Lane::Contact, vec![vec![4; 100]]).unwrap();
+        let Emission::Frame { bytes, tickets, .. } = s.next_emission().await else {
+            panic!("stopped")
+        };
+        let ShapedFrame::Many(got) = unwrap(&bytes).unwrap() else {
+            panic!("a multi frame")
+        };
+        assert_eq!(got[0], vec![4; 100], "contact first inside the frame too");
+        assert_eq!(got.len(), 4);
+        assert_eq!(
+            tickets,
+            FrameTickets {
+                contact: c2,
+                sync: a
+            }
+        );
+        assert!(!s.ticket_left(a), "not left until the link took it");
+        s.note_sent(tickets);
+        assert!(s.ticket_left(a) && s.ticket_left(c2));
+        assert_eq!(s.queued(), 0);
+        assert_eq!(s.room(Lane::Sync), 64 * 1400);
+        assert_eq!(s.room(Lane::Contact), 64 * 1400);
+    }
+
+    /// The emission task of `spawn_shaper_task` without the link: every frame
+    /// the shaper yields is taken at once and its tickets reported.
+    fn spawn_emitter(s: &Arc<LinkShaper>) -> tokio::task::JoinHandle<()> {
+        let s = Arc::clone(s);
+        tokio::spawn(async move {
+            while let Emission::Frame { real, tickets, .. } = s.next_emission().await {
+                if real {
+                    s.note_sent(tickets);
+                }
+            }
+        })
+    }
+
+    /// The fragments `frame` takes on `s`, as the send path cuts them.
+    fn cut(s: &LinkShaper, frame: &[u8]) -> Vec<Vec<u8>> {
+        crate::transport::frame_fragment::fragment(frame, body_capacity(s.agreement().frame_bytes))
+            .expect("fragments")
+    }
+
+    /// **CIRISEdge#962 — a contact row leaves within about one frame gap
+    /// behind a sync backlog.** A `server`-class link at the production frame
+    /// holds 300 sync rows (3 KB attestation pages, three frames each: 900
+    /// frames, three minutes of real frames at 0.2 s); then twenty contact
+    /// rows (a key `Deliver`, as `Lane::of` reads it off the real wire frame)
+    /// arrive one by one, a round trip apart as first contact's steps are.
+    /// Each leaves at the next fire or close to it: no wait over five gaps,
+    /// the mean under two (one is the Poisson mean). Twenty more back to back
+    /// (a sustained contact stream) pay the sync share, one frame in four: no
+    /// wait over twelve gaps, the mean under three. Paused clock, seeded timer.
+    /// Mutation: the frame takes the sync lane first (FIFO behind the
+    /// backlog) → the first contact row waits about 900 gaps.
+    #[tokio::test(start_paused = true)]
+    async fn a_contact_row_leaves_within_a_gap_behind_a_sync_backlog() {
+        use crate::replication::protocol::EnvelopeKind as K;
+        use crate::replication::wire_frame::{wrap_v3, RoundSide};
+        let quoted = offer(BudgetClass::Server, 16_272, 7_000, 0.5, 600);
+        let agreed = agree(&quoted, &quoted).expect("agreed");
+        assert_eq!(agreed.frame_bytes, SHAPED_FRAME_BYTES);
+        let s = Arc::new(LinkShaper::new_seeded(
+            [6u8; 16],
+            agreed,
+            queue_bytes_for(&agreed),
+            [21u8; 32],
+        ));
+        let emit = spawn_emitter(&s);
+        let page = wrap_v3(
+            &deliver(
+                K::Attestation,
+                vec![attestation_row(
+                    "scores",
+                    &serde_json::json!({"dimension": "chat:message:v1", "pad": "x".repeat(700)}),
+                )],
+            ),
+            RoundSide::Responder,
+            4,
+        );
+        assert_eq!(Lane::of(&page), Lane::Sync);
+        let mut backlog = 0usize;
+        for _ in 0..300 {
+            let f = cut(&s, &page);
+            backlog += f.len();
+            s.enqueue(Lane::of(&page), f).expect("the backlog queues");
+        }
+        assert!(backlog >= 900, "{backlog} frames of sync backlog");
+        let gap = s.frame_gap();
+        // Spaced: each contact row comes a round trip after the last, as
+        // first contact's steps do (sync frames run between them). Back to
+        // back: a sustained contact stream, which the share bound
+        // (CONTACT_RUN_MAX) holds to three frames in four.
+        for (spaced, worst_max, mean_max) in [(true, 5.0, 2.0), (false, 12.0, 3.0)] {
+            let mut waits = Vec::new();
+            for i in 0..20u8 {
+                if spaced {
+                    tokio::time::sleep(gap * 3).await;
+                }
+                let key = wrap_v3(
+                    &deliver(K::Key, vec![vec![i; 600]]),
+                    RoundSide::Responder,
+                    5,
+                );
+                let lane = Lane::of(&key);
+                assert_eq!(lane, Lane::Contact);
+                let f = cut(&s, &key);
+                let n = u64::try_from(f.len()).unwrap();
+                let started = tokio::time::Instant::now();
+                let last = s.enqueue(lane, f).expect("queued");
+                let budget = s.leave_budget(usize::try_from(n).unwrap());
+                let out = wait_row_left(&s, last + 1 - n, last, budget, || true).await;
+                assert!(matches!(out, RowLeft::Left(_)), "contact row {i}: {out:?}");
+                waits.push(started.elapsed().as_secs_f64() / gap.as_secs_f64());
+            }
+            assert!(
+                s.queued_in(Lane::Sync) > 0,
+                "the backlog is still there: the contact rows went ahead of it"
+            );
+            let worst = waits.iter().copied().fold(0.0, f64::max);
+            #[allow(clippy::cast_precision_loss)]
+            let mean = waits.iter().sum::<f64>() / waits.len() as f64;
+            eprintln!("spaced={spaced}: contact waits worst {worst:.2} mean {mean:.2} gaps");
+            assert!(
+                worst <= worst_max,
+                "spaced={spaced}: worst contact wait {worst:.1} gaps: {waits:?}"
+            );
+            assert!(
+                mean <= mean_max,
+                "spaced={spaced}: mean contact wait {mean:.2} gaps: {waits:?}"
+            );
+        }
+        s.stop();
+        emit.await.unwrap();
+    }
+
+    /// **CIRISEdge#962 — a contact flood does not starve sync.** Both lanes
+    /// hold 400 single-frame bodies; of the first 200 real frames at least
+    /// one in every four carries a sync body, and sync drains at a quarter of
+    /// the real rate (50 of 200), coalescing on or off. Once the contact
+    /// lane is quiet, a new contact body still takes the very next frame.
+    /// Mutation: drop the share bound (strict priority) → no sync body leaves
+    /// while the flood lasts.
+    #[tokio::test]
+    async fn a_contact_flood_does_not_starve_the_sync_lane() {
+        let agreement = Agreement {
+            lambda: 400.0,
+            frame_bytes: 1400,
+            rho: 1.0,
+            window: Duration::from_secs(60),
+        };
+        for coalesce in [false, true] {
+            let s = LinkShaper::new([8u8; 16], agreement, 4096 * 1400);
+            if coalesce {
+                s.enable_coalescing();
+            }
+            // 700 B bodies: two never share a 1,400 B frame, coalesced or not.
+            for _ in 0..400 {
+                s.enqueue(Lane::Contact, vec![vec![1; 700]]).unwrap();
+                s.enqueue(Lane::Sync, vec![vec![2; 700]]).unwrap();
+            }
+            let mut carried_sync = Vec::new();
+            while carried_sync.len() < 200 {
+                let Emission::Frame { real, tickets, .. } = s.next_emission().await else {
+                    panic!("stopped")
+                };
+                if real {
+                    carried_sync.push(tickets.sync != 0);
+                    s.note_sent(tickets);
+                }
+            }
+            let sync = carried_sync.iter().filter(|c| **c).count();
+            assert!(
+                sync >= 50,
+                "coalesce={coalesce}: {sync} of 200 frames carried sync"
+            );
+            for (i, w) in carried_sync.windows(4).enumerate() {
+                assert!(
+                    w.iter().any(|c| *c),
+                    "coalesce={coalesce}: frames {i}..{} carried no sync",
+                    i + 3
+                );
+            }
+            assert!(
+                s.queued_in(Lane::Contact) > 0,
+                "coalesce={coalesce}: contact still led: the flood outlasted the window"
+            );
+        }
+        // A quiet contact lane: a contact body takes the next frame even
+        // behind a sync backlog.
+        let s = LinkShaper::new([8u8; 16], agreement, 4096 * 1400);
+        s.enqueue(Lane::Sync, vec![vec![2; 680]; 100]).unwrap();
+        for _ in 0..10 {
+            let Emission::Frame { tickets, .. } = s.next_emission().await else {
+                panic!("stopped")
+            };
+            s.note_sent(tickets);
+        }
+        let c = s.enqueue(Lane::Contact, vec![vec![1; 680]]).unwrap();
+        let Emission::Frame { tickets, .. } = s.next_emission().await else {
+            panic!("stopped")
+        };
+        assert_eq!(tickets.contact, c, "the next frame after a sync run");
+    }
+
+    /// **CIRISEdge#963 — round waits at the 1,400 B frame are pinned.** A
+    /// wait covers a 16,272 B reply (one 44.1.0 frame) at the p99 of its
+    /// frames here, so in time it is at or below 44.1.0's wait (4.74 gaps of
+    /// the 16 KB frame) at every class, and never shorter than that reply's
+    /// p99. The round interval sits above the wait and at or below 44.1.0's
+    /// 7.75 gaps. A later frame change that moves the reply's frame count
+    /// fails here instead of silently shortening cellular waits.
+    #[test]
+    fn round_waits_at_the_shaped_frame_are_pinned_against_44_1_0() {
+        use crate::replication::scheduler::{
+            pacing_interval, pacing_timeout, SchedulerConfig, PACING_WAIT_GAPS,
+        };
+        const OLD_FRAME: f64 = 16_272.0;
+        let reply = row_frames(16_272, SHAPED_FRAME_BYTES);
+        assert_eq!(reply, 12);
+        assert!(
+            PACING_WAIT_GAPS >= p99_gaps(reply) - 0.05,
+            "{PACING_WAIT_GAPS} gaps against a reply's p99 of {}",
+            p99_gaps(reply)
+        );
+        let floor = SchedulerConfig::DEFAULT_ROUND_TIMEOUT;
+        for (class, rate, want_s) in [
+            (BudgetClass::Server, 7_000.0, 10.0),
+            (BudgetClass::Home, 2_800.0, 14.2),
+            (BudgetClass::PhoneWifi, 1_400.0, 28.4),
+            (BudgetClass::PhoneCellular, 350.0, 113.6),
+        ] {
+            assert!((f64::from(ShapingPolicy::for_class(class).bytes_per_s) - rate).abs() < 1e-9);
+            let gap = Duration::from_secs_f64(f64::from(SHAPED_FRAME_BYTES) / rate);
+            let old_gap = Duration::from_secs_f64(OLD_FRAME / rate);
+            let wait = pacing_timeout(floor, Some(gap));
+            let old_wait = floor.max(old_gap.mul_f64(4.74));
+            assert!(
+                wait <= old_wait,
+                "{class:?}: {wait:?} > 44.1.0's {old_wait:?}"
+            );
+            assert!(
+                (wait.as_secs_f64() - want_s).abs() < 0.1,
+                "{class:?}: {wait:?}, not {want_s} s"
+            );
+            assert!(wait >= floor.max(gap.mul_f64(p99_gaps(reply) - 0.05)));
+            let interval = pacing_interval(floor, Some(gap));
+            assert!(interval >= wait, "{class:?}");
+            assert!(interval <= floor.max(old_gap.mul_f64(7.75)), "{class:?}");
+        }
+    }
+
+    /// **CIRISEdge#963 — a 64 KiB row converges on `phone-cellular` at the
+    /// 1,400 B frame.** The largest row a shaped link carries is 48 frames
+    /// there (it was five at the 16 KB MDU), about 192 s of 4 s gaps. Its leave
+    /// budget is its own Poisson p99, so on ten seeded timers every such row
+    /// leaves inside it, and nothing is retracted for a retry that would only
+    /// time out again.
+    /// Mutation: cap the budget at sixteen gaps (the old
+    /// `ROW_LEAVE_MAX_GAPS`, 64 s here) → every row times out.
+    #[tokio::test(start_paused = true)]
+    async fn a_64_kib_row_converges_on_phone_cellular_at_the_shaped_frame() {
+        let quoted = offer(BudgetClass::PhoneCellular, 16_272, 350, 0.5, 3600);
+        let agreed = agree(&quoted, &quoted).expect("agreed");
+        assert_eq!(agreed.frame_bytes, SHAPED_FRAME_BYTES);
+        let row = vec![7u8; SHAPED_ROW_MAX_BYTES];
+        for seed in 0..10u8 {
+            let s = Arc::new(LinkShaper::new_seeded(
+                [7u8; 16],
+                agreed,
+                queue_bytes_for(&agreed),
+                [seed; 32],
+            ));
+            let emit = spawn_emitter(&s);
+            let f = cut(&s, &row);
+            assert_eq!(
+                f.len(),
+                row_frames(SHAPED_ROW_MAX_BYTES, agreed.frame_bytes)
+            );
+            assert_eq!(f.len(), 48);
+            let n = u64::try_from(f.len()).unwrap();
+            let last = s.enqueue(Lane::Sync, f).expect("a row fits the lane");
+            let budget = s.leave_budget(48);
+            let out = wait_row_left(&s, last + 1 - n, last, budget, || true).await;
+            assert!(
+                matches!(out, RowLeft::Left(_)),
+                "seed {seed}: {out:?} in {budget:?}"
+            );
+            assert!(
+                budget > s.frame_gap().mul_f64(16.0),
+                "{budget:?}: more than the sixteen gaps it was"
+            );
+            s.stop();
+            emit.await.unwrap();
+        }
+    }
+
     /// CC 5.4.3 rc16 **two planes**: a shaped link carries rows, never bulk.
     /// A message within one window's real-frame budget is queued; one beyond
     /// it (a large blob) is refused by name and never queued, so a blob
@@ -4202,9 +5285,11 @@ mod tests {
         assert_eq!(reach, 1500, "0.5 × 5 frames/s × 600 s");
         let body = body_capacity(1400);
         assert!(reach * body > 2_000_000 && reach * body < 2_200_000);
-        s.enqueue(vec![vec![1u8; body]; 40])
+        s.enqueue(Lane::Sync, vec![vec![1u8; body]; 40])
             .expect("a row (a small image) rides");
-        let e = s.enqueue(vec![vec![1u8; body]; reach + 1]).unwrap_err();
+        let e = s
+            .enqueue(Lane::Sync, vec![vec![1u8; body]; reach + 1])
+            .unwrap_err();
         assert!(matches!(e, ShapingError::BulkBeyondReach(n, r) if n == reach + 1 && r == reach));
         assert_eq!(e.label(), crate::observability::LINK_SHAPING_BULK_REFUSED);
         assert_eq!(s.queued(), 40, "nothing of the bulk message was queued");
@@ -4332,7 +5417,7 @@ mod tests {
             rho: 0.5,
             window: Duration::from_secs(600),
         };
-        LinkShaper::new([9u8; 16], a, 16)
+        LinkShaper::new([9u8; 16], a, 16 * 1400)
     }
 
     /// Every ending of a row's wait lands on its own key, and the windowed
@@ -4345,7 +5430,7 @@ mod tests {
         let budget = Duration::from_millis(120);
 
         let s = quiet_shaper();
-        let t = s.enqueue(vec![vec![1; 8], vec![2; 8]]).unwrap();
+        let t = s.enqueue(Lane::Sync, vec![vec![1; 8], vec![2; 8]]).unwrap();
         let out = wait_row_left(&s, t - 1, t, budget, || true).await;
         assert_eq!(out, RowLeft::TimedOut, "nothing emits here");
         assert_eq!(s.queued(), 0, "taken back, so a retry sends it once");
@@ -4356,7 +5441,7 @@ mod tests {
         assert!(!l.contains_key(o::LINK_SHAPING_BODIES_STRANDED));
 
         let s = quiet_shaper();
-        let t = s.enqueue(vec![vec![1; 8], vec![2; 8]]).unwrap();
+        let t = s.enqueue(Lane::Sync, vec![vec![1; 8], vec![2; 8]]).unwrap();
         let out = wait_row_left(&s, t - 1, t, budget, || false).await;
         assert_eq!(out, RowLeft::LinkClosed { stranded: 2 });
         out.book(&m, C::Server);
@@ -4366,8 +5451,8 @@ mod tests {
         assert_eq!(l[o::LINK_SHAPING_BODIES_STRANDED], 2);
 
         let s = quiet_shaper();
-        let t = s.enqueue(vec![vec![1; 8]]).unwrap();
-        s.note_sent(t);
+        let t = s.enqueue(Lane::Sync, vec![vec![1; 8]]).unwrap();
+        s.note_ticket_sent(t);
         let out = wait_row_left(&s, t, t, budget, || true).await;
         assert!(matches!(out, RowLeft::Left(_)));
         out.book(&m, C::Home);
@@ -4502,19 +5587,27 @@ mod tests {
         shaped_links(&t, 1, "g", 10);
         assert_eq!(t.reported_slots(), 7);
         let link = t.get([10u8; 16]).expect("a link");
-        let idle = link.room();
+        let idle = link.queued_in(Lane::Contact);
         t.set_service_tier(T::AudioAndFiles);
         assert_eq!(t.free_slots(), 0);
         assert_eq!(t.reported_slots(), 0);
-        assert_eq!(link.room(), idle - 1, "the zero went out on the link");
+        assert_eq!(
+            link.queued_in(Lane::Contact),
+            idle + 1,
+            "the zero went out on the link"
+        );
         t.set_service_tier(T::ChatAndContacts);
         assert_eq!(t.reported_slots(), 0);
-        assert_eq!(link.room(), idle - 1, "no change, no report");
+        assert_eq!(
+            link.queued_in(Lane::Contact),
+            idle + 1,
+            "no change, no report"
+        );
         t.set_service_tier(T::FullOps);
         assert_eq!(t.free_slots(), 7);
         assert_eq!(
-            link.room(),
-            idle - 2,
+            link.queued_in(Lane::Contact),
+            idle + 2,
             "and the slots went out with the tier"
         );
     }
@@ -4605,16 +5698,24 @@ mod tests {
 
     /// E8: the figures are the policy's arithmetic, §2.4's values at the class
     /// rates and something else at any other rate: a table restated would
-    /// not move. Off has no cost to state.
+    /// not move. Off has no cost to state. CC 5.4.3 rc17: stated at the
+    /// 1,400 B frame (0.5 s at `home`), and the monthly cost on the wire, the
+    /// seal, packet header and proof included.
     #[test]
     fn the_figures_follow_the_policy_not_a_table() {
         let home = ShapingPolicy::for_class(BudgetClass::Home);
         let f = ShapingFigures::of(&home, REFERENCE_FRAME_BYTES).expect("home shapes");
         assert_eq!(f.class, "home");
-        assert!((f.gap_s - 5.81).abs() < 0.01, "{}", f.gap_s);
-        assert!((f.gap_p95_s - 17.4).abs() < 0.1, "{}", f.gap_p95_s);
-        assert!((f.gb_month_link - 7.26).abs() < 0.01, "{}", f.gb_month_link);
-        assert!((f.gb_month_cap - 58.06).abs() < 0.01, "{}", f.gb_month_cap);
+        assert_eq!(f.frame_bytes, SHAPED_FRAME_BYTES);
+        assert!((f.gap_s - 0.5).abs() < 1e-9, "{}", f.gap_s);
+        assert!((f.gap_p95_s - 1.50).abs() < 0.01, "{}", f.gap_p95_s);
+        assert!(
+            (f.wire_overhead - 0.154).abs() < 0.001,
+            "{}",
+            f.wire_overhead
+        );
+        assert!((f.gb_month_link - 8.37).abs() < 0.01, "{}", f.gb_month_link);
+        assert!((f.gb_month_cap - 66.98).abs() < 0.01, "{}", f.gb_month_cap);
         assert!((f.file_1mb_s - 714.3).abs() < 0.1, "{}", f.file_1mb_s);
         assert!((f.file_10mb_s - 7142.9).abs() < 0.1, "{}", f.file_10mb_s);
 
@@ -4625,10 +5726,14 @@ mod tests {
         assert!((g.gap_s - f.gap_s / 2.0).abs() < 1e-9);
         assert!((g.gb_month_cap - f.gb_month_cap * 2.0).abs() < 1e-9);
         assert!((g.file_1mb_s - f.file_1mb_s / 2.0).abs() < 1e-9);
-        let small = ShapingFigures::of(&home, 3_254).unwrap();
+        let small = ShapingFigures::of(&home, 400).unwrap();
         assert!(
-            (small.gap_s - f.gap_s / 5.0).abs() < 0.01,
-            "a fifth at the base frame"
+            (small.gap_s - f.gap_s * 400.0 / 1400.0).abs() < 1e-9,
+            "shorter at the Reticulum base frame"
+        );
+        assert!(
+            small.wire_overhead > f.wire_overhead,
+            "and dearer on the wire"
         );
         assert!(ShapingFigures::of(&ShapingPolicy::default(), 400).is_none());
     }
@@ -4738,7 +5843,7 @@ mod tests {
             .unwrap()
             .expect("shaped");
         assert!(
-            shaper.agreement().bytes_per_s() > p.bytes_per_s + 1,
+            shaper.agreement().bytes_per_s() > p.bytes_per_s,
             "the case itself: {}",
             shaper.agreement().bytes_per_s()
         );
@@ -4760,9 +5865,9 @@ mod tests {
     }
 
     /// A policy change closes a link the new policy cannot carry, never one it
-    /// can. The offer rounds λ: at this frame a 100,000 B/s class link agrees at
-    /// 100,008, and 7,000 at the fleet's frames rounds DOWN, which cannot see
-    /// this. Read as a rate, every device or policy change would close a healthy
+    /// can. The offer rounds λ: at the 1,400 B shaped frame a 100,000 B/s class
+    /// link agrees at 100,000.6 (100,001 rounded), and 7,000 at the fleet's
+    /// frames rounds exactly, which cannot see this. Read as a rate, every device or policy change would close a healthy
     /// link, on every node. Mutations: compare the rates → this fails; keep
     /// every link → the real cut below fails.
     #[test]
@@ -4775,9 +5880,10 @@ mod tests {
             .peer_offer(link, &ShapingOffer::from_policy(&p, 16_384))
             .unwrap()
             .expect("shaped");
+        assert_eq!(shaper.agreement().frame_bytes, SHAPED_FRAME_BYTES);
         assert_eq!(
             shaper.agreement().bytes_per_s(),
-            100_008,
+            100_001,
             "the case itself: the offer rounds up"
         );
 
@@ -4795,8 +5901,8 @@ mod tests {
     }
 
     /// The agreement's frame is not the frame this node quoted at, and the
-    /// rounding differs by frame: this offer rounds up at 16,384 and the same
-    /// policy rounds DOWN at the agreed 1,024. The link is held to the frame its
+    /// rounding differs by frame: this offer rounds up at the 1,400 B shaped
+    /// frame and the same policy rounds DOWN at the agreed 1,024. The link is held to the frame its
     /// offer was made at. Mutation: quote at the agreed frame → this fails.
     #[test]
     fn a_policy_change_quotes_at_the_frame_the_offer_was_made_at() {
@@ -4812,7 +5918,7 @@ mod tests {
             .unwrap()
             .expect("shaped");
         assert_eq!(shaper.agreement().frame_bytes, 1_024);
-        assert_eq!(shaper.agreement().bytes_per_s(), 100_008);
+        assert_eq!(shaper.agreement().bytes_per_s(), 100_001);
         let at_agreed = ShapingOffer::from_policy(&p, 1_024);
         assert!(
             f64::from(at_agreed.rate_milli) / 1000.0 * 1_024.0 < 100_000.0,
@@ -4836,7 +5942,7 @@ mod tests {
                 let ours = ShapingOffer::from_policy(&p, usize::from(frame));
                 for theirs in [ours, peer] {
                     let agreed = agree(&ours, &theirs).expect("both shape");
-                    let shaper = LinkShaper::new([95u8; 16], agreed, 8).quoted_at(frame);
+                    let shaper = LinkShaper::new([95u8; 16], agreed, 8 * 1400).quoted_at(frame);
                     assert!(
                         shaper.carried_by(&ours),
                         "{bytes_per_s} B/s at frame {frame}, agreed at {}",
