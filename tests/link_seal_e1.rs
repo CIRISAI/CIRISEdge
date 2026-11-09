@@ -957,6 +957,309 @@ async fn a_fresh_stranger_fetches_the_key_record_with_the_route_e1() {
     );
 }
 
+/// The API-form PQC commitment (CC 2.6.8) of `bytes`: sha256, lowercase hex.
+fn pqc_commitment_of(bytes: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// `ident`'s real commitment: the hash of its raw ML-DSA-65 public key.
+fn real_pqc_commitment(ident: &Ident) -> String {
+    pqc_commitment_of(
+        &base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &ident.pqc_pub_b64,
+        )
+        .expect("pqc pub b64"),
+    )
+}
+
+/// Hold `commitment` for `key_id` at `node` the way CIRISServer does: the
+/// contact call, with the commitment the code carried (`resolve_contact`'s
+/// answer for a stranger is a stall; the commitment is held either way).
+async fn hold_commitment(node: &Node, key_id: &str, commitment: &str) {
+    let lens = ciris_edge::contact::PersistLens::new(&*node.dir);
+    let _ =
+        ciris_edge::contact::resolve_contact_with_commitment(&lens, key_id, Some(commitment)).await;
+    assert_eq!(
+        ciris_edge::pqc_anchor::pending(key_id).map(|c| c.as_str().to_owned()),
+        Some(commitment.to_owned()),
+        "the contact call held the commitment"
+    );
+}
+
+/// **CIRISEdge#964, CC 5.3.3.5 item 6** — a fresh stranger holding a PQC
+/// commitment for A fetches A's key record with the route: the record's
+/// Ed25519 half is valid (persist's key door would admit it) but its
+/// ML-DSA-65 key does not hash to the commitment. Refused by name BEFORE the
+/// record is admitted; nothing is stored, nothing keys, nothing is delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetched_key_record_that_misses_the_pqc_commitment_is_refused_964() {
+    let t = trio("pqcmiss", false, false, true).await;
+    hold_commitment(
+        &t.c,
+        &t.a.key.key_id,
+        &pqc_commitment_of(b"an ML-DSA-65 key that is not A's"),
+    )
+    .await;
+    match t.c.transport.send(&t.a.key.key_id, b"never-sent-964").await {
+        Err(TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_route_answer_pqc_commitment");
+        }
+        other => panic!("refused by name: {other:?}"),
+    }
+    assert!(
+        t.c.seal("link_seal_refused_route_answer_pqc_commitment") >= 1,
+        "{:?}",
+        t.c.metrics.link_seal()
+    );
+    assert_eq!(t.c.seal("link_seal_initiated"), 0, "nothing was keyed");
+    assert_eq!(t.c.seal("link_seal_pair_route_fetch"), 0);
+    assert!(
+        t.c.dir
+            .lookup_public_key(&t.a.key.key_id)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "the record was refused before it was admitted"
+    );
+    assert!(
+        t.c.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list")
+            .is_empty(),
+        "nothing was stored"
+    );
+    assert!(
+        ciris_edge::pqc_anchor::pending(&t.a.key.key_id).is_some(),
+        "a mismatch keeps the anchor: a retry is refused the same way"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!t.a.received(b"never-sent-964").await);
+    ciris_edge::pqc_anchor::clear(&t.a.key.key_id);
+}
+
+/// **CIRISEdge#964** — the same fresh stranger holding A's REAL commitment
+/// keys normally: the record is admitted, the pair is fetched, the frame is
+/// delivered, and the anchor is cleared (the held record is now the anchor).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetched_key_record_matching_the_pqc_commitment_keys_964() {
+    let t = trio("pqcmatch", false, false, true).await;
+    hold_commitment(&t.c, &t.a.key.key_id, &real_pqc_commitment(&t.a.key)).await;
+    t.c.transport
+        .send(&t.a.key.key_id, b"from-a-committed-stranger")
+        .await
+        .expect("C -> A, the record matched its commitment");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(b"from-a-committed-stranger").await
+        })
+        .await,
+        "A delivered C's frame"
+    );
+    assert!(
+        t.c.dir
+            .lookup_public_key(&t.a.key.key_id)
+            .await
+            .expect("lookup")
+            .is_some(),
+        "C admitted A's key record"
+    );
+    assert!(t.c.seal("link_seal_pair_route_fetch") >= 1);
+    assert_eq!(
+        t.c.seal("link_seal_refused_route_answer_pqc_commitment"),
+        0,
+        "{:?}",
+        t.c.metrics.link_seal()
+    );
+    assert!(
+        ciris_edge::pqc_anchor::pending(&t.a.key.key_id).is_none(),
+        "the matched anchor was cleared"
+    );
+}
+
+/// **CIRISEdge#964** — latest wins: a stranger who was handed a code naming A's
+/// real key with a WRONG commitment is refused, then re-adds A from the right
+/// code. The new commitment replaces the held one, and the next dial keys. A
+/// garbage commitment can't lock first contact to A out for the TTL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_commitment_then_the_right_one_keys_964() {
+    let t = trio("pqclatest", false, false, true).await;
+    hold_commitment(
+        &t.c,
+        &t.a.key.key_id,
+        &pqc_commitment_of(b"a garbage commitment for A's real key"),
+    )
+    .await;
+    match t
+        .c
+        .transport
+        .send(&t.a.key.key_id, b"never-sent-964-latest")
+        .await
+    {
+        Err(TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_route_answer_pqc_commitment");
+        }
+        other => panic!("the wrong commitment is refused by name: {other:?}"),
+    }
+    assert!(t.c.seal("link_seal_refused_route_answer_pqc_commitment") >= 1);
+    hold_commitment(&t.c, &t.a.key.key_id, &real_pqc_commitment(&t.a.key)).await;
+    t.c.transport
+        .send(&t.a.key.key_id, b"from-a-recommitted-stranger")
+        .await
+        .expect("C -> A keys under the replacing commitment");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(b"from-a-recommitted-stranger").await
+        })
+        .await,
+        "A delivered C's frame"
+    );
+    assert!(
+        t.c.dir
+            .lookup_public_key(&t.a.key.key_id)
+            .await
+            .expect("lookup")
+            .is_some(),
+        "C admitted A's key record under the right commitment"
+    );
+    assert!(t.c.seal("link_seal_pair_route_fetch") >= 1);
+    assert!(
+        ciris_edge::pqc_anchor::pending(&t.a.key.key_id).is_none(),
+        "the matched anchor was cleared"
+    );
+}
+
+/// **CIRISEdge#964** — no commitment keys exactly as today: a fresh
+/// stranger resolves A's code that carries none (a v1/v2 NodeCode, every code
+/// in circulation), nothing is held, and the fetched record keys the link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_code_without_a_pqc_commitment_keys_as_today_964() {
+    let t = trio("pqcnone", false, false, true).await;
+    let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode::new(
+        ciris_verify_core::fedcode::FedKind::Node,
+        t.a.key.key_id.clone(),
+        t.a.key.ed_pub_b64(),
+    ))
+    .expect("encode");
+    assert!(
+        !code.starts_with("CIRIS-V3-"),
+        "a code with no commitment: {code}"
+    );
+    let lens = ciris_edge::contact::PersistLens::new(&*t.c.dir);
+    let _ = ciris_edge::contact::resolve_contact_with_commitment(&lens, &code, None).await;
+    let _ = ciris_edge::contact::resolve_contact(&lens, &code).await;
+    assert!(
+        ciris_edge::pqc_anchor::pending(&t.a.key.key_id).is_none(),
+        "no commitment, nothing held"
+    );
+    t.c.transport
+        .send(&t.a.key.key_id, b"from-an-uncommitted-stranger")
+        .await
+        .expect("C -> A keys as before");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(b"from-an-uncommitted-stranger").await
+        })
+        .await,
+        "A delivered C's frame"
+    );
+    assert!(t.c.seal("link_seal_pair_route_fetch") >= 1);
+    assert_eq!(t.c.seal("link_seal_refused_route_answer_pqc_commitment"), 0);
+}
+
+/// **CIRISEdge#964** — a dialler that already HOLDS A's key record (so the
+/// answer carries none) but holds a commitment it misses: the held record is
+/// checked, and the link is refused by name before the route row is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_key_record_that_misses_the_pqc_commitment_is_refused_964() {
+    let t = trio("pqcheld", false, false, false).await;
+    assert!(
+        t.b.dir
+            .lookup_public_key(&t.a.key.key_id)
+            .await
+            .expect("lookup")
+            .is_some(),
+        "B holds A's key record before the dial"
+    );
+    hold_commitment(
+        &t.b,
+        &t.a.key.key_id,
+        &pqc_commitment_of(b"not A's ML-DSA-65 key either"),
+    )
+    .await;
+    match t
+        .b
+        .transport
+        .send(&t.a.key.key_id, b"never-sent-964-held")
+        .await
+    {
+        Err(TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_route_answer_pqc_commitment");
+        }
+        other => panic!("refused by name: {other:?}"),
+    }
+    assert_eq!(t.b.seal("link_seal_initiated"), 0, "nothing was keyed");
+    assert!(
+        t.b.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list")
+            .is_empty(),
+        "the route row was never stored"
+    );
+    ciris_edge::pqc_anchor::clear(&t.a.key.key_id);
+}
+
+/// **CIRISEdge#964** — a dialler holding A's key record AND A's signed route
+/// row (no fetch needed; persist reads the seeded row as A's Rooted pair),
+/// with a commitment the record misses: neither held pair is used, the dial
+/// falls to the route fetch, and that refuses it by name; nothing keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_route_pair_whose_record_misses_the_pqc_commitment_is_not_used_964() {
+    let t = trio("pqcpair", true, false, false).await;
+    hold_commitment(
+        &t.b,
+        &t.a.key.key_id,
+        &pqc_commitment_of(b"still not A's ML-DSA-65 key"),
+    )
+    .await;
+    assert!(
+        t.b.dir
+            .self_signed_transit_pair_for(&t.a.key.key_id)
+            .await
+            .expect("read")
+            .is_none(),
+        "the held row supplies no pair under a commitment its record misses"
+    );
+    let resolver = ciris_edge::transport::transit_kex_peer::PeerTransitResolver::new();
+    assert!(
+        resolver
+            .resolve_authenticated(&*t.b.dir, &t.a.key.key_id)
+            .await
+            .expect("read")
+            .is_none(),
+        "no source (Rooted or the node's own row) supplies a pair"
+    );
+    match t
+        .b
+        .transport
+        .send(&t.a.key.key_id, b"never-sent-964-pair")
+        .await
+    {
+        Err(TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_route_answer_pqc_commitment");
+        }
+        other => panic!("refused by name: {other:?} {:?}", t.b.metrics.link_seal()),
+    }
+    assert_eq!(t.b.seal("link_seal_initiated"), 0, "nothing was keyed");
+    assert_eq!(t.b.seal("link_seal_pair_rooted"), 0);
+    assert_eq!(t.b.seal("link_seal_pair_self_signed_row"), 0);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!t.a.received(b"never-sent-964-pair").await);
+    ciris_edge::pqc_anchor::clear(&t.a.key.key_id);
+}
+
 /// **Route fetch 2** — a responder whose first frames are not a route
 /// answer: the dialler refuses the link by name, keys nothing, stores
 /// nothing.
@@ -2780,16 +3083,20 @@ async fn a_relay_at_the_top_tier_with_every_lever_pulled_still_forwards() {
 /// A dial past its budget leaves no pending link behind it: the peer's proof,
 /// still on its way, finds nothing, so no link establishes with no one left to
 /// key it. The next dial is a clean one.
+///
+/// The budget is zero, spent before the proof can come. It was 1 ms, which
+/// raced a timer against a loopback round trip: on macOS (CI darwin, v44.1.0
+/// tag run) the timer fired late and the proof won, so the send succeeded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dial_past_its_budget_is_closed_and_never_establishes_unkeyed() {
     let t = trio("budget", true, false, false).await;
     let before = t.b.transport.link_planes_for_test().await;
     t.b.transport
-        .set_establish_budget_for_test(Some(Duration::from_millis(1)));
+        .set_establish_budget_for_test(Some(Duration::ZERO));
     let row = marked(b"E1-BUDGET-MARKER-", 512);
     assert!(
         t.b.transport.send(&t.a.key.key_id, &row).await.is_err(),
-        "a 1 ms budget beats the proof"
+        "a spent budget fails the dial"
     );
     // Well past the proof's round trip on loopback.
     tokio::time::sleep(Duration::from_secs(3)).await;

@@ -64,7 +64,7 @@ use ciris_edge::transport::realtime_av::{
     seal_av_inner, seal_av_outer, ChunkLayer, ChunkSeq, Epoch, EpochDek, StreamId, CODEC_OPAQUE,
 };
 use ciris_edge::transport::realtime_av_dispatcher::{
-    AvInboundLink, AvLinkReceiver as _, AvLinkSender as _, AvSubscriberLink,
+    AvDispatcherError, AvInboundLink, AvLinkReceiver as _, AvLinkSender, AvSubscriberLink,
 };
 use ciris_edge::transport::realtime_av_mls::{mint_joiner_key_material, Member};
 use ciris_edge::transport::realtime_av_runtime::{AvPublisher, AvSubscriber};
@@ -233,6 +233,26 @@ where
             return false;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// One frame on an A/V leg, waiting out backpressure. A fresh leg's Channel
+/// is in its first round trip: the opener's transit handshake is its first
+/// message, the window starts at 2 and sends are paced, so a frame right
+/// behind it can be refused `Congested` (leviculum's `Busy` or `PacingDelay`)
+/// until acks come back. On CI darwin (the v44.0.0 tag run) they came after
+/// the test's next send. `Congested` is backpressure, not a failure
+/// (`AvLinkSender::send`); the call path waits it out the same way
+/// (`av_call::send_patiently`).
+async fn send_patiently(sender: &impl AvLinkSender, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match sender.send(bytes).await {
+            Err(AvDispatcherError::Congested) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            other => return other,
+        }
     }
 }
 
@@ -1075,13 +1095,10 @@ async fn a_quiet_av_link_is_reaped_and_a_live_one_is_not_853() {
             .await
             .expect("the quiet link");
     assert_ne!(live.link_id, quiet.link_id);
-    live.sender
-        .send(b"live-first")
+    send_patiently(&live.sender, b"live-first")
         .await
         .expect("live first frame");
-    quiet
-        .sender
-        .send(b"quiet-only")
+    send_patiently(&quiet.sender, b"quiet-only")
         .await
         .expect("quiet's only frame");
 
@@ -1120,7 +1137,9 @@ async fn a_quiet_av_link_is_reaped_and_a_live_one_is_not_853() {
     let mut reaped = 0usize;
     let mut tick = 0u32;
     while tokio::time::Instant::now() < deadline && inbound_at_b(quiet.link_id) {
-        live.sender.send(b"live-frame").await.expect("live frame");
+        send_patiently(&live.sender, b"live-frame")
+            .await
+            .expect("live frame");
         tokio::time::sleep(Duration::from_millis(250)).await;
         tick += 1;
         if tick % 4 == 0 {
@@ -1143,8 +1162,7 @@ async fn a_quiet_av_link_is_reaped_and_a_live_one_is_not_853() {
     );
     let before = received.load(std::sync::atomic::Ordering::Relaxed);
     for _ in 0..4 {
-        live.sender
-            .send(b"after-reap")
+        send_patiently(&live.sender, b"after-reap")
             .await
             .expect("live after reap");
         tokio::time::sleep(Duration::from_millis(100)).await;

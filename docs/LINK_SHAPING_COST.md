@@ -1,15 +1,21 @@
 # Link shaping: defaults and bandwidth cost per class (edge v44)
 
 CC 5.4.3 (rc17), `CLM-link-shaping`, `CLM-shaped-link-bound-refuse`, `CLM-seat-class`. Eric, as steward, ruled the fleet default
-on 2026-11-02; the ruling is final.
+on 2026-11-02; the ruling is final. The shaped frame is 1,400 bytes (CC 5.4.3 rc17, CIRISConstitution a3dd97a;
+edge 44.1.1, CIRISEdge#963): see [The shaped frame](#the-shaped-frame).
 
-| Class | On by default | Rate per link | ρ | W | Per link, per month, each way | At the 8-link cap, per month, each way |
+| Class | On by default | Rate per link | ρ | W | Per link, per month, each way, on the wire | At the 8-link cap, per month, each way, on the wire |
 |---|---|---|---|---|---|---|
-| `server` | **yes** | 7,000 B/s | 0.5 | 600 s | 18.1 GB | 145.2 GB |
-| `home` | opt-in | 2,800 B/s | 0.5 | 600 s | 7.3 GB | 58.1 GB |
-| `phone-wifi` | opt-in | 1,400 B/s | 0.5 | 600 s | 3.6 GB | 29.0 GB |
-| `phone-cellular` | opt-in | 350 B/s | 0.5 | 3,600 s | 0.9 GB | **7.3 GB** |
-| `seat` | seat to seat only | 33,000 B/s | 0.5 | 600 s | 85.5 GB | outside the eight |
+| `server` | **yes** | 7,000 B/s | 0.5 | 600 s | 20.9 GB | 167.4 GB |
+| `home` | opt-in | 2,800 B/s | 0.5 | 600 s | 8.4 GB | 67.0 GB |
+| `phone-wifi` | opt-in | 1,400 B/s | 0.5 | 600 s | 4.2 GB | 33.5 GB |
+| `phone-cellular` | opt-in | 350 B/s | 0.5 | 3,600 s | 1.0 GB | **8.4 GB** |
+| `seat` | seat to seat only | 33,000 B/s | 0.5 | 600 s | 98.7 GB | outside the eight |
+
+The rate is a budget of frame bytes. On the wire each 1,400 B frame also carries the E1 seal (25 B), the
+transport's packet header (107 B) and the proof the receiver returns (83 B): about 15 % on top of the budget,
+against about 1 % at the old 16 KB frame. The columns above include it, as CC 5.4.3 requires of a stated cost
+("which a stated cost includes"). The budget alone is 18.1 / 7.3 / 3.6 / 0.9 / 85.5 GB per link.
 
 The `seat` class runs only between two serve seats proved from the signed roster.
 Its budget sits outside the eight; beside a non-seat a seat runs at the non-seat's
@@ -19,14 +25,15 @@ class.
 
 A shaped link carries real bytes at ρ of its rate: at the `server` class that is
 0.5 × 7,000 B/s = **3.5 KB/s of real bytes per peer**, however many lanes the
-peer has, and one 16 KB frame every 2.3 s on average. What that means for the
+peer has, and one 1,400 B frame every 0.2 s on average. What that means for the
 person at the moment of choosing:
 
 | What | Unshaped | Shaped at the class rate |
 |---|---|---|
-| A row (a post, a message) to a peer | tens of milliseconds | about one frame gap: 2.3 s mean at `server`, 5.8 s `home`, 11.6 s `phone-wifi`, 47 s `phone-cellular` |
-| A reply, or a round of replication | a second | two to three gaps, so 5–7 s at `server` |
-| First contact and catch-up (many rows at once) | a four-node bootstrap in 53 s (measured) | several times slower: rounds p90 35 s, p99 165 s, max 221 s in the same bootstrap (measured, `server`, coalescing on), because the rows queue behind each other at 3.5 KB/s per peer |
+| A small row (a post, a message) to a peer | tens of milliseconds | about one frame gap: 0.2 s mean at `server`, 0.5 s `home`, 1.0 s `phone-wifi`, 4 s `phone-cellular` |
+| A larger row | tens of milliseconds | its bytes over the rate, whatever the frame: a 64 KiB row is 48 frames, about 10 s at `server`, 24 s `home`, 48 s `phone-wifi`, 3 min `phone-cellular` |
+| First contact (a handful of request/answer steps) | about 15 s through a relay (measured on the server rig) | each step waits about a gap more; contact rows go ahead of the link's serve and sync backlog (the contact lane, below) |
+| Catch-up (many rows at once) | a four-node bootstrap in 53 s (measured) | the backlog drains at 3.5 KB/s per peer at `server`; a volume of bytes takes the same time at any frame |
 | Bulk (files, chunks, media) | unchanged | unchanged: bulk never rides a shaped link |
 
 In production only servers shape by default; a person who opts in pays the
@@ -191,16 +198,79 @@ for comparison. It does not conform to rc17.
 Well below ρ, the Poisson timer sets latency, not the budget. The mean
 latency per class is:
 
-| Class | Mean latency |
-|---|---|
-| `server` | about 2.3 s |
-| `home` | about 5.8 s |
-| `phone-wifi` | about 11.6 s |
-| `phone-cellular` | about 47 s |
+| Class | Mean latency | 95th percentile |
+|---|---|---|
+| `server` | about 0.2 s | 0.6 s |
+| `home` | about 0.5 s | 1.5 s |
+| `phone-wifi` | about 1.0 s | 3.0 s |
+| `phone-cellular` | about 4 s | 12 s |
 
 These are the link's own agreed mean, the frame size over the class budget, at the
-16 KB TCP frame (CC 5.4.3 rc17). At the Reticulum base frame they are about a fifth
-of that.
+1,400 B shaped frame (CC 5.4.3 rc17). At the Reticulum base frame (about 400 B)
+they are shorter still. The 16 KB figures (2.3 / 5.8 / 11.6 / 47 s) are superseded.
+
+## The shaped frame
+
+CC 5.4.3 rc17 (CIRISConstitution a3dd97a), shipped in edge 44.1.1 (CIRISEdge#963):
+
+- **One constant.** The shaped frame is 1,400 bytes before the E1 seal, the `SHPF`
+  header included, or the link's channel payload MDU where that is smaller. It is
+  not per class and not negotiated (`link_shaping::SHAPED_FRAME_BYTES`,
+  `shaped_frame`). Seat links get the same frame.
+- **Old peers.** A 44.0 or 44.1 peer still offers its 16,272 B MDU; the agreement
+  takes the smaller frame and re-quotes the byte budget at it, so the link runs at
+  1,400 B at the peer's own byte rate. Nothing on the wire changes shape.
+- **What moves and what does not.** The rate is a byte rate, so the byte budget, the
+  cover volume, what an observer of the link sees and the time a volume of bytes
+  takes to cross are the same at any frame. Only the first byte moves: a row waits
+  for the next frame, now a fraction of a second.
+- **What it costs.** About 15 % more on the wire than the budget (seal, packet header
+  and proof per frame; the cost table above includes it), and a seal per frame: a
+  few tens a second at the eight-link bound.
+- **Fragments.** A payload larger than the frame is fragmented (`CFRG`) and
+  reassembled. An onion packet (15,296 B) spans twelve frames
+  (`an_onion_packet_crosses_a_1400_byte_shaped_link_in_fragments_and_arrives_intact`).
+- **Waits are stated in row bytes, not gaps.** A sender waits for its row to leave at
+  most the Poisson p99 of the largest row (64 KiB, 48 frames at 1,400 B), or 60 s
+  where that is more (`LinkShaper::row_leave_cap`): about 60 s at `server`, 330 s at
+  `phone-cellular`. Sixteen gaps covered a 64 KiB row at the 16 KB frame (five
+  frames) and would time out every such row on cellular at 1,400 B.
+- **The queue is in bytes.** Each lane of a link's queue holds one window's real
+  budget in body bytes, at least one 64 KiB row (`queue_bytes_for`): about 2.1 MB at
+  `server`, 840 KB `home`, 420 KB `phone-wifi`, 630 KB `phone-cellular`. A burst past
+  it is deferred and retried by the sender (`shaping_queue_full`).
+
+## The contact lane
+
+CIRISEdge#962. A shaped link's queue has two lanes. The next real frame takes the
+**contact lane** first, so first contact never waits behind a serve or sync backlog on
+the same link. The wire is unchanged: one Poisson stream of constant frames, real or
+cover.
+
+- **Contact lane** (`Lane::of`, read from the frame's bytes):
+  - a replication frame of any verb on the bootstrap planes and their revocations:
+    `key`, `identity_occurrence`, `transport_destination`, `revocation`,
+    `identity_occurrence_revocation`;
+  - an `attestation` `Deliver` whose every row is a `consent:replication:v1` grant, an
+    owner binding, or a retraction (`withdraws` / `recants`): a contact request, its
+    acceptance, the binding that roots a stranger, and their undoing. Revocation is the
+    privacy-critical direction, so it is never slower than the grant it undoes. A
+    retraction names only the id and type of the row it revokes, not the grant's
+    dimension, so every retraction rides this lane;
+  - a `PublicKeyRegistration` envelope;
+  - the node's own link-up pushes (announce, owner binding, build bundle), the link's
+    capability report and referrals.
+- **Sync lane:** everything else, including an attestation page that mixes those rows
+  with others, chat, and the onion.
+- The route fetch, its answer and the CTKX handshake run before the seal, bare on the
+  link, and never reach a shaper.
+- Each lane is FIFO and numbers its own bodies, so a sender's wait for its row
+  (`ticket_left`) and its retraction on a timeout stay exact across lanes.
+- **No starvation.** While both lanes hold bodies, at least one real frame in every four
+  carries a sync body (`CONTACT_RUN_MAX`; a frame carrying both counts). A peer that
+  induces contact traffic, for example by pulling key rows, takes at most three
+  quarters of the link's real frames. A contact row arriving at a quiet contact lane
+  still takes the next frame.
 
 ## Two planes
 

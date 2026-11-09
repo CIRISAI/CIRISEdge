@@ -2,6 +2,62 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 44.1.1 — 2026-11-09
+
+**The shaped frame is 1,400 bytes** (CIRISEdge#963, CC 5.4.3 rc17 a3dd97a). Every shaped link's
+frame is 1,400 B before the E1 seal, header included, or the channel payload MDU where that is
+smaller (`SHAPED_FRAME_BYTES`, `shaped_frame`). It is one constant: not per class, not negotiated.
+A 44.x peer offering 16,272 agrees at 1,400 because `agree` takes the smaller. The byte rate is
+unchanged, so λ rises about 11×. The mean frame gap is 0.2 s at `server`, 0.5 s at `home`, 1.0 s
+at `phone-wifi` and 4 s at `phone-cellular`, against 2.3 / 5.8 / 11.6 / 47 s before.
+- **Contact time:** first contact relayed through a canonical (seven exchanges, server class)
+  moves from p50 65.6 s to 5.5 s.
+- **ρ:** the real share holds better. At equal load it falls from 0.20 to 0.11, and the worst
+  budget window goes from 0.54–0.67 to 0.50–0.53.
+- **Stated costs:** these now include the transport's per-packet header and proof. That is about
+  15% at this frame, so `server` is 20.9 GB a month per link each way.
+- **Row wait:** sized in bytes. A 64 KiB row may take up to the p99 of its 48 frames, so it now
+  converges on `phone-cellular`.
+- **Queue cap:** one window's real budget in bytes.
+- **Round waits:** cover a reply's frames, and are never shorter than 44.1.0's.
+- **Onion packets:** a packet crosses as 12 fragments and arrives intact
+  (`an_onion_packet_crosses_a_1400_byte_shaped_link_in_fragments_and_arrives_intact`).
+
+**Contact rows leave first** (CIRISEdge#962). A shaped link's queue has two lanes, and the next
+real frame takes contact first.
+- **Contact:** key and identity rows, routes, revocations, consent grants, owner bindings, and
+  every withdrawal or recant.
+- **Sync:** everything else.
+- **No starvation:** while both lanes hold rows, at least one real frame in four carries sync
+  (`CONTACT_RUN_MAX`).
+- **Wire:** unchanged.
+
+**A code's PQC commitment binds the key record a dial fetches** (CIRISEdge#964, CC 5.3.3.5
+item 6). `contact::resolve_contact_with_commitment` and `contact::discover_with_commitment`
+take an optional commitment: 64 lowercase hex, sha256 of the raw ML-DSA-65 key (CC 2.6.8). A v3
+code's own commitment is held as well, and the latest well-formed commitment for a key wins.
+- **Mismatch:** a route-fetched or held key record whose ML-DSA-65 key misses the commitment is
+  refused by name (`link_seal_refused_route_answer_pqc_commitment`,
+  `self_signed_row_pqc_commitment_mismatch`). The check is CIRISVerify's
+  `fedcode::verify_pulled_ml_dsa_65_pubkey`.
+- **No commitment:** behaviour is unchanged. The fail-closed half is the v62 handshake's.
+
+**A direct-link proposal that arrives before its room is held for it.** On every OS, a peer that
+proposed a direct link a moment before the other side's call installed its group was refused by
+policy. It then waited out leviculum's 60 s proposal cooldown with no direct leg. The request from
+a known room peer is now held for up to 4 s while the call comes up (`direct_link_request_held`).
+
+RUSTSEC-2026-0459 (CVE-2026-119375; bundled SQLite before 3.54.0, a crafted `-wal` beside a database
+file can return uninitialized page-cache memory) is ignored in `deny.toml` with its justification.
+It is local only, and edge opens only the node's own store. The fix, `rusqlite` 0.41, is pinned
+through persist, verify and refinery (tracked: CIRISEdge#966).
+
+Test instruments on macOS:
+- the establish-budget witness uses a spent budget, not a 1 ms race;
+- the suspend suite reads the kernel's TCP table there and fails loudly when it cannot (it had
+  read `/proc`, which macOS lacks);
+- a fresh A/V leg's first frames wait out backpressure.
+
 ## 44.1.0 — 2026-11-08
 
 The onion relay's replay set is a bounded hold (CIRISEdge#955, CC 5.3.3.5 E1 rule 9). It holds at

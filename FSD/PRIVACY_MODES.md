@@ -45,7 +45,7 @@ run or never, and it is held until rooms can ride the tier.
 | 9 | Rung 4: "performance drops further" | **True, for everything** | About 13–58 s per packet by class [inf], and everything it publishes goes that way (§4.3). |
 | 10 | Each rung adds privacy | **True, and rung 4 buys it with identity** | Rungs 2 and 3 are about links. Rung 4 gives up announced identity. Nothing on the ladder removes (a) which links exist or (b) that your groups exist (§5.1). |
 | 11 | A straight ladder | **Two more settings cross it** | Announce and relay offering are separate and interact with it (§5.4, §6.5). Turning shaping on at home is what starts handing the node's route to strangers, because free slots are reported only on shaped links. |
-| 12 | The CC's latency figures | **Corrected in rc17** (2ad9675) | The draft found 1.6 / 4 / 8 / 26–32 s were the row delay at a 1,400 B frame; on TCP the MDU is 16,272 B and the measured gap at `server` is 2,325 ms (commit 1eeeb14). rc17 now states the link's agreed mean, about 2.3 / 5.8 / 11.6 / 47 s. `docs/LINK_SHAPING_COST.md` and CIRISClient#272 still carry the old figures (E11, C7). |
+| 12 | The CC's latency figures | **Corrected in rc17** (2ad9675) | The draft found 1.6 / 4 / 8 / 26–32 s were the row delay at a 1,400 B frame; on TCP the MDU is 16,272 B and the measured gap at `server` is 2,325 ms (commit 1eeeb14). rc17 now states the link's agreed mean, about 2.3 / 5.8 / 11.6 / 47 s. `docs/LINK_SHAPING_COST.md` and CIRISClient#272 still carry the old figures (E11, C7). Superseded by rc17 a3dd97a (edge 44.1.1): the shaped frame is one 1,400 B constant, and the gaps are 0.2 / 0.5 / 1.0 / 4 s. |
 | 14 | "Finally if they enable onion routing" | **It cannot be enabled** | CC 5.4.6 item 1 (rc17 ae86ea0): anonymous from first run or never. It is a separate identity chosen before keys exist, irreversible, and held until rooms ride the tier. Rungs 1–3 are the reversible ladder; rung 4 is not on it (§4, §6.10). |
 | 13 | Onion needs "9 conferred relays" | **Stricter than the CC** | CC 5.4.6 item 4: floor is three per layer, and other relays are capped at ⌈2 × conferred⌉ per layer. So the minimum is nine relays of which three are conferred. |
 
@@ -77,7 +77,10 @@ There is also a fourth, unplanned one on phones: a sender waits at most 60 s for
 (`ROW_LEAVE_MAX`, `link_shaping.rs:1529`), then retracts and retries. At the 47 s `phone-cellular` gap,
 about one single-frame row in four needs a retry, a two-frame row usually does, and a 64 KiB row
 (5 frames) almost never leaves in 60 s, so its retries do not converge. On `phone-wifi` a 5-frame row
-leaves in time a bit over half the time. [inf, from `leave_budget`, `link_shaping.rs:1235`.] Must be fixed
+leaves in time a bit over half the time. [inf, from `leave_budget`, `link_shaping.rs:1235`.]
+**Fixed (E7, then CIRISEdge#963 at the 1,400 B frame):** the cap is the largest row's own Poisson p99
+(`LinkShaper::row_leave_cap`, 64 KiB = 48 frames at 1,400 B, about 330 s on `phone-cellular`), stated in row
+bytes rather than gaps; witness `a_64_kib_row_converges_on_phone_cellular_at_the_shaped_frame`. Was: must be fixed
 for rungs 2 and 3 on phones (§7, E7).
 
 ### 2.2 The table
@@ -131,21 +134,22 @@ Two defects stand:
 
 ### 2.4 The numbers per class
 
-Frame 16,272 B (`FSD/TRANSPORT_TIERS_MODEL.md` §1). A link runs at the lower class of its two ends: a
-server talking to a phone on Wi-Fi moves at `phone-wifi`.
+Frame 1,400 B since CC 5.4.3 rc17 (CIRISConstitution a3dd97a; edge 44.1.1, CIRISEdge#963); it was the
+16,272 B TCP MDU (`FSD/TRANSPORT_TIERS_MODEL.md` §1), where the gaps were 2.3 / 5.8 / 11.6 / 47 s. The rate
+is a byte rate, so only the first byte moved: volumes take the same time at either frame. A link runs at the
+lower class of its two ends: a server talking to a phone on Wi-Fi moves at `phone-wifi`.
 
 | | `server` | `home` | `phone-wifi` | `phone-cellular` | Basis |
 |---|---|---|---|---|---|
-| Timer gap: the wait for a row, mean | **2.3 s** (measured 2,325 ms) | 5.8 s | 11.6 s | 47 s | frame ÷ rate, §1 row 12 CC 5.4.3 rc17; a fifth of this at the Reticulum base frame [inf except server] |
-| 95th percentile wait | 7 s | 17 s | 35 s | 2.3 min | Exp, 3 gaps [inf] |
-| A reply, two ends | 5–7 s | 12–17 s | 23–35 s | 1.5–2.3 min | 2–3 gaps [inf] |
+| Timer gap: the wait for a row, mean | **0.2 s** | 0.5 s | 1.0 s | 4 s | frame ÷ rate, CC 5.4.3 rc17; less at the Reticulum base frame |
+| 95th percentile wait | 0.6 s | 1.5 s | 3 s | 12 s | Exp, 3 gaps [inf] |
 | Real bytes moved | 3.5 KB/s | 1.4 KB/s | 700 B/s | 175 B/s | ρ × rate |
-| Window's reach | 129 frames, 2.1 MB in 10 min | 840 KB in 10 min | 420 KB in 10 min | 630 KB in 60 min | `LINK_SHAPING_COST.md` |
-| 64 KiB row | 19 s | 47 s | 94 s | 6 min | sustained |
+| Window's reach | 1,500 frames, 2.1 MB in 10 min | 840 KB in 10 min | 420 KB in 10 min | 630 KB in 60 min | `LINK_SHAPING_COST.md` |
+| 64 KiB row (48 frames) | 10 s | 24 s | 48 s | 3.2 min | every fire real while queued |
 | 1 MB by slow path | **5 min** | 12 min | 24 min | 95 min | sustained; a quiet link's first window is up to twice as fast |
 | 10 MB by slow path | **48 min** | 2 h | 4 h | 16 h | sustained, link up throughout |
-| Cover, one link, month, each way | 18.1 GB | 7.3 GB | 3.6 GB | 0.9 GB | `FLEET_DEFAULTS` |
-| Cover, eight links, month, each way | 145 GB | 58 GB | 29 GB | 7.3 GB | same; both ways is double |
+| Cover, one link, month, each way, on the wire | 20.9 GB | 8.4 GB | 4.2 GB | 1.0 GB | `FLEET_DEFAULTS`: budget × 1.154 (seal, packet header, proof) |
+| Cover, eight links, month, each way, on the wire | 167 GB | 67 GB | 33.5 GB | 8.4 GB | same; both ways is double |
 | Battery | n/a | n/a | not measured | not measured | see below |
 
 Cover is spent "whether or not anything real is sent" (CC 5.4.3). The eight-link figure is the ceiling. A
@@ -202,8 +206,8 @@ The link runs at the lower of two offers, so a node requiring shaping closes the
   fails by name for 120 s. Displacement is #939, the fallback order #935.
 - **Rooms and the eight.** Once scoped links are shaped (E4), a room's direct members may take slots too [inf]. Q16.
 - **The class leaves less room on a phone.** Rung 3 at `phone-cellular` is possible, and it is the extreme
-  case: 175 B/s real toward each peer, up to 7.3 GB a month each way at the cap, 47 s a row, and row
-  retries (§2.1). Lawful, stated, and not recommended; the wizard says so.
+  case: 175 B/s real toward each peer, up to 8.4 GB a month each way at the cap on the wire, 4 s before a
+  row's first byte and about 3 min for a 64 KiB row (§2.1). Lawful, stated, and not recommended; the wizard says so.
 
 ### 3.3 What rung 3 means, normatively
 
@@ -297,15 +301,15 @@ Whether that stands is Eric's, at the hold's lift (§8).
 
 Publishing, three hops with a 2 s mean hold per hop (`mix_mean_delay_ms`), per packet:
 
-| Class, relays at `server` | Gaps | Holds | One packet [inf] |
+| Class, relays at `server` | Frames (12 per crossing at 1,400 B) | Holds | One packet [inf] |
 |---|---|---|---|
-| `server` | 3 × 2.3 s | 6 s | **13 s** (model: 13.8 s, `ONION_TIER_MODEL` §e) |
-| `home` | 5.8 + 2 × 2.3 s | 6 s | **16 s** |
-| `phone-wifi` | 11.6 + 2 × 2.3 s | 6 s | **22 s** |
-| `phone-cellular` | 47 + 2 × 2.3 s | 6 s | **58 s** |
+| `server` | 3 × 12 × 0.2 s | 6 s | **13 s** (model: 13.8 s, `ONION_TIER_MODEL` §e) |
+| `home` | 12 × 0.5 + 2 × 2.4 s | 6 s | **17 s** |
+| `phone-wifi` | 12 × 1.0 + 2 × 2.4 s | 6 s | **23 s** |
+| `phone-cellular` | 12 × 4 + 2 × 2.4 s | 6 s | **59 s** |
 
 A three-packet row adds two gaps at the publisher's class [inf]. Seat relays would shorten the inter-relay gaps. Targeted delivery to a rendezvous is six hops plus a mailbox fetch:
-41 s at `server`, 135 s at `phone-wifi` **[model]**. The packet is 15,296 B, one frame on TCP. **So "performance drops further" is true of everything this node does**, since everything goes through
+41 s at `server`, 135 s at `phone-wifi` **[model]**. The packet is 15,296 B, twelve 1,400 B frames (it was one at the 16 KB frame; the time a packet takes is its bytes over the rate either way). **So "performance drops further" is true of everything this node does**, since everything goes through
 the tier.
 
 ### 4.4 What it does not hide
@@ -505,7 +509,7 @@ The names are proposed for `docs/five-year-old-test.md` and are settled before t
 | **People who didn't choose this** | Yes | Yes, not hidden | **No** |
 | **Connected at once** | No limit here | 8 hidden; others not hidden, or refused for a while | **8** |
 | **Public posts** | Yes | Yes | Yes |
-| **A message arrives in** | Under a second | {gap_s} (5.8 s) with people who also chose this | {gap_s} |
+| **A message arrives in** | Under a second | {gap_s} (0.5 s) with people who also chose this | {gap_s} |
 | **A 1 MB file** | Depends on your connection | Depends on your connection | {file_1mb_s} |
 | **Finding someone new** | §6.4 | §6.4 | §6.4 |
 | **Catching up after a long time away** | 53 s (4 nodes, measured at `server`) | One round up to about 7 min [inf] | Large batches take longer |
@@ -590,7 +594,7 @@ real cost, on the Join screen in the substrate's words, and rung 1's feature lis
 | Preselected rung | 1 | 1 | 1 | 2, gated (§6.11) |
 | Class | `home` | `phone-wifi` | `phone-cellular` | `server` |
 | Shows | §6.3 | Wi-Fi and cellular figures | Same, cellular first | §6.3, server figures |
-| Rung 3, once offered | Yes | Yes, on Wi-Fi | Yes, "a message takes about 47 s, up to 7.3 GB a month each way" | Yes |
+| Rung 3, once offered | Yes | Yes, on Wi-Fi | Yes, "a message waits about 4 s, up to 8.4 GB a month each way" | Yes |
 | Helping others connect | On at rung 2, off at rung 3, if announced | **Not shown**: client-only (§5.4) | **Not shown** | On at rung 2, off at rung 3 |
 
 **A phone pays only while awake.** `enter_background` suspends the transport, and suspend closes every link
@@ -737,7 +741,7 @@ behaviour on every plane and depends on the canonical shaping (§6.11).
 
 | # | Question | Settled |
 |---|---|---|
-| 1 | Timer figures | rc17 (2ad9675): the link's agreed mean, about 2.3 / 5.8 / 11.6 / 47 s at the 16 KB frame. The wizard shows the served value |
+| 1 | Timer figures | rc17 (2ad9675): the link's agreed mean, then about 2.3 / 5.8 / 11.6 / 47 s at the 16 KB frame; rc17 a3dd97a moved the frame to 1,400 B, about 0.2 / 0.5 / 1.0 / 4 s. The wizard shows the served value |
 | 2 | Slow path; small images | A chunk MAY ride a shaped link chunk by chunk when the node has no bulk link, within the row budget, rows first. Small images are by size in the CC, by kind in edge until E5 |
 | 3 | Scoped lanes | Item 4 is normative: at rungs 2 and 3 the derived-address link itself is shaped, and a scoped body MUST NOT move onto the identity link when a direct path exists. Edge gap, E4, next release |
 | 4 | Item 10 | An anonymous peer has no announced identity and is reached only at its rendezvous |

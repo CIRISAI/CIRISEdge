@@ -686,8 +686,85 @@ pub async fn resolve_contact(
     lens: &dyn DirectoryLens,
     raw: &str,
 ) -> Result<ContactResolution, LadderStall> {
-    let candidate = parse_contact_input(raw)?;
+    resolve_contact_with_commitment(lens, raw, None).await
+}
 
+/// [`resolve_contact`], with the PQC commitment the caller decoded from the
+/// code that named this contact (CC 5.3.3.5 item 6, CC 2.6.8; CIRISEdge#964).
+///
+/// `pqc_commitment` is `sha256(raw ML-DSA-65 pubkey)` as 64 lowercase hex —
+/// the presence-tagged last field of a `CIRIS-V3-` code. It is checked before
+/// anything else and a malformed one is [`LadderStall::MalformedCode`]:
+/// rejected, never repaired. A `raw` code that itself carries a commitment
+/// supplies it when `pqc_commitment` is `None`; the two disagreeing is also
+/// `MalformedCode`.
+///
+/// The commitment is then held for the contact's key ([`crate::pqc_anchor`])
+/// so the dial's pre-seal route fetch checks the fetched (or held)
+/// `key:record:v1`'s ML-DSA-65 key against it, with the one rule CIRISServer
+/// also uses (`ciris_verify_core::fedcode::verify_pulled_ml_dsa_65_pubkey`).
+/// A mismatch refuses the link by name
+/// (`link_seal_refused_route_answer_pqc_commitment`) before the record is
+/// admitted or the transit pair is used.
+///
+/// With no commitment (`None`, and a v1/v2 code), this is exactly
+/// [`resolve_contact`]: nothing is held and the dial behaves as before.
+///
+/// # Errors
+/// As [`resolve_contact`], plus [`LadderStall::MalformedCode`] for a malformed
+/// or contradicted commitment.
+pub async fn resolve_contact_with_commitment(
+    lens: &dyn DirectoryLens,
+    raw: &str,
+    pqc_commitment: Option<&str>,
+) -> Result<ContactResolution, LadderStall> {
+    let given = parse_commitment_arg(pqc_commitment)?;
+    let candidate = parse_contact_input(raw)?;
+    let from_code = match candidate
+        .admission
+        .as_ref()
+        .and_then(|a| a.ml_dsa_65_pubkey_sha256.as_deref())
+    {
+        Some(c) => Some(
+            crate::pqc_anchor::PqcCommitment::parse(c).map_err(|detail| {
+                LadderStall::MalformedCode {
+                    detail: format!("the code's {detail}"),
+                }
+            })?,
+        ),
+        None => None,
+    };
+    let commitment = match (given, from_code) {
+        (Some(g), Some(c)) if g != c => {
+            return Err(LadderStall::MalformedCode {
+                detail: "pqc_commitment disagrees with the commitment the code carries".to_owned(),
+            });
+        }
+        (g, c) => g.or(c),
+    };
+    if let Some(c) = commitment {
+        crate::pqc_anchor::anchor(&candidate.key_id, c);
+    }
+    resolve_contact_candidate(lens, candidate).await
+}
+
+/// The API-form commitment argument, parsed: `None` stays `None`, a malformed
+/// one is [`LadderStall::MalformedCode`] (rejected, never repaired).
+fn parse_commitment_arg(
+    pqc_commitment: Option<&str>,
+) -> Result<Option<crate::pqc_anchor::PqcCommitment>, LadderStall> {
+    pqc_commitment
+        .map(|c| {
+            crate::pqc_anchor::PqcCommitment::parse(c)
+                .map_err(|detail| LadderStall::MalformedCode { detail })
+        })
+        .transpose()
+}
+
+async fn resolve_contact_candidate(
+    lens: &dyn DirectoryLens,
+    candidate: ContactCandidate,
+) -> Result<ContactResolution, LadderStall> {
     // A roster is not a person. Refuse BEFORE telling anyone to admit a key:
     // `resolve` treats these as terminal, so an admit-then-retry would end at
     // exactly this answer having registered a key for nothing.
@@ -1191,6 +1268,27 @@ pub async fn discover(
     routes: &dyn RouteLens,
     any_id: &str,
 ) -> Result<Discovered, LadderStall> {
+    discover_with_commitment(lens, routes, any_id, None).await
+}
+
+/// [`discover`], with the PQC commitment the caller decoded from the code
+/// that named `any_id` (CC 5.3.3.5 item 6; CIRISEdge#964). Validated first
+/// (64 lowercase hex, rejected never repaired) and held for `any_id` exactly
+/// as [`resolve_contact_with_commitment`] holds it, so the dial's pre-seal
+/// route fetch checks that key's record against it. `None` is [`discover`].
+///
+/// # Errors
+/// As [`discover`], plus [`LadderStall::MalformedCode`] for a malformed
+/// commitment.
+pub async fn discover_with_commitment(
+    lens: &dyn DirectoryLens,
+    routes: &dyn RouteLens,
+    any_id: &str,
+    pqc_commitment: Option<&str>,
+) -> Result<Discovered, LadderStall> {
+    if let Some(c) = parse_commitment_arg(pqc_commitment)? {
+        crate::pqc_anchor::anchor(any_id, c);
+    }
     // Log the RESOLUTION stall here rather than `?`-ing past it. The stalls
     // that reach this line — an unknown key, a queued body fetch, a missing
     // owner, a non-contactable identity — are the ordinary ones in a
@@ -1972,6 +2070,127 @@ mod tests {
                 );
             }
             other => panic!("a v3 stranger code should be ready to use: {other:?}"),
+        }
+    }
+
+    /// CIRISEdge#964 — a malformed `pqc_commitment` is rejected AT THE API,
+    /// never repaired, and nothing is held for the key: uppercase, wrong
+    /// length, non-hex, surrounding whitespace. Both doors.
+    #[tokio::test]
+    async fn a_malformed_pqc_commitment_is_rejected_at_the_api_964() {
+        let lens = frank();
+        let routes = AllRoutes;
+        let good = "ab".repeat(32);
+        for (n, bad) in [
+            good.to_ascii_uppercase(),
+            good[..62].to_owned(),
+            format!("{good}00"),
+            format!("{}zz", &good[..62]),
+            format!(" {}", &good[..63]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = format!("frank-fed-aaa-964-malformed-{n}");
+            assert!(
+                matches!(
+                    super::resolve_contact_with_commitment(&lens, &key, Some(&bad)).await,
+                    Err(LadderStall::MalformedCode { .. })
+                ),
+                "resolve_contact: {bad:?} must be rejected"
+            );
+            assert!(
+                matches!(
+                    super::discover_with_commitment(&lens, &routes, &key, Some(&bad)).await,
+                    Err(LadderStall::MalformedCode { .. })
+                ),
+                "discover: {bad:?} must be rejected"
+            );
+            assert!(
+                crate::pqc_anchor::pending(&key).is_none(),
+                "a rejected commitment holds nothing"
+            );
+        }
+    }
+
+    /// CIRISEdge#964 — a well-formed commitment is held for the key the
+    /// contact names (that key's record is what the dial checks), and the
+    /// resolution itself is unchanged; `None` holds nothing.
+    #[tokio::test]
+    async fn a_pqc_commitment_is_held_for_the_contacts_key_964() {
+        let lens = frank();
+        let routes = AllRoutes;
+        let c = "0123456789abcdef".repeat(4);
+        let key = "frank-fed-aaa";
+        crate::pqc_anchor::clear(key);
+        let plain = super::resolve_contact(&lens, key).await;
+        assert!(
+            crate::pqc_anchor::pending(key).is_none(),
+            "None holds nothing"
+        );
+        assert_eq!(
+            super::resolve_contact_with_commitment(&lens, key, Some(&c)).await,
+            plain,
+            "the resolution is the same"
+        );
+        assert_eq!(
+            crate::pqc_anchor::pending(key).map(|p| p.as_str().to_owned()),
+            Some(c.clone())
+        );
+        crate::pqc_anchor::clear(key);
+        let found = super::discover_with_commitment(&lens, &routes, key, Some(&c))
+            .await
+            .expect("frank's nodes route");
+        assert_eq!(found.subject.fed_id, key);
+        assert!(crate::pqc_anchor::pending(key).is_some());
+        crate::pqc_anchor::clear(key);
+    }
+
+    /// CIRISEdge#964 — a v3 code's own commitment is held when the caller
+    /// passes none, and a caller's commitment that contradicts the code's is
+    /// refused.
+    #[tokio::test]
+    async fn a_codes_own_commitment_is_held_and_a_contradiction_refused_964() {
+        use base64::Engine as _;
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = 96;
+        pubkey[1] = 4;
+        let key_id = ciris_verify_core::fedcode::derive_key_id("pqc964", &pubkey);
+        let committed = "fe".repeat(32);
+        let code = ciris_verify_core::fedcode::encode(
+            &ciris_verify_core::fedcode::FedCode::new(
+                ciris_verify_core::fedcode::FedKind::User,
+                key_id.clone(),
+                base64::engine::general_purpose::STANDARD.encode(pubkey),
+            )
+            .with_ml_dsa_65_pubkey_sha256(committed.clone()),
+        )
+        .expect("encode");
+        assert!(code.starts_with("CIRIS-V3-"), "{code}");
+        let empty = FakeLens {
+            types: std::collections::HashMap::new(),
+            owners: std::collections::HashMap::new(),
+            nodes: std::collections::HashMap::new(),
+        };
+        assert!(matches!(
+            super::resolve_contact_with_commitment(&empty, &code, Some(&"0e".repeat(32))).await,
+            Err(LadderStall::MalformedCode { .. })
+        ));
+        assert!(crate::pqc_anchor::pending(&key_id).is_none());
+        let _ = super::resolve_contact(&empty, &code).await;
+        assert_eq!(
+            crate::pqc_anchor::pending(&key_id).map(|p| p.as_str().to_owned()),
+            Some(committed)
+        );
+        crate::pqc_anchor::clear(&key_id);
+    }
+
+    struct AllRoutes;
+
+    #[async_trait::async_trait]
+    impl super::RouteLens for AllRoutes {
+        async fn has_destination(&self, _node_key_id: &str) -> bool {
+            true
         }
     }
 

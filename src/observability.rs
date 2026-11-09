@@ -1180,6 +1180,11 @@ pub const LINK_SEAL_REFUSED_ROUTE_ANSWER_SIGNER: &str = "link_seal_refused_route
 /// authenticated admission or the `CLM-seal-authenticated-pair` checks.
 pub const LINK_SEAL_REFUSED_ROUTE_ANSWER_UNVERIFIED: &str =
     "link_seal_refused_route_answer_unverified";
+/// Refused at the dialler (CC 5.3.3.5 item 6, CIRISEdge#964): the dialled
+/// key's record has an ML-DSA-65 key that does not hash to the PQC commitment
+/// held before dialling; the record is not admitted, the pair is not used.
+pub const LINK_SEAL_REFUSED_ROUTE_ANSWER_PQC_COMMITMENT: &str =
+    "link_seal_refused_route_answer_pqc_commitment";
 /// Refused at the dialler: no answer within the route-fetch budget.
 pub const LINK_SEAL_REFUSED_ROUTE_TIMEOUT: &str = "link_seal_refused_route_timeout";
 /// Refused at the dialler: the link closed before an answer (the responder
@@ -1358,6 +1363,10 @@ pub const DIRECT_LINK_REQUEST_ACCEPTED: &str = "direct_link_request_accepted";
 /// A peer's direct-link request, refused: not a room peer, unattributed, or
 /// accepting turned off. Nothing about this node's address was sent.
 pub const DIRECT_LINK_REQUEST_REFUSED: &str = "direct_link_request_refused";
+/// A peer's direct-link request that came before this node shared a room
+/// with it, held for that standing (`direct_path::DIRECT_STANDING_WAIT`)
+/// rather than refused at once. It ends `accepted` or `refused` as well.
+pub const DIRECT_LINK_REQUEST_HELD: &str = "direct_link_request_held";
 /// A link moved onto a punched interface (either side).
 pub const DIRECT_LINK_ESTABLISHED: &str = "direct_link_established";
 /// The peer refused the upgrade.
@@ -1729,6 +1738,7 @@ pub const LINK_SEAL_LABELS: &[&str] = &[
     LINK_SEAL_REFUSED_ROUTE_ANSWER,
     LINK_SEAL_REFUSED_ROUTE_ANSWER_SIGNER,
     LINK_SEAL_REFUSED_ROUTE_ANSWER_UNVERIFIED,
+    LINK_SEAL_REFUSED_ROUTE_ANSWER_PQC_COMMITMENT,
     LINK_SEAL_REFUSED_ROUTE_TIMEOUT,
     LINK_SEAL_REFUSED_ROUTE_CLOSED,
     LINK_SEAL_REFUSED_ROUTE_SEND,
@@ -1810,6 +1820,7 @@ pub const DIRECT_LINK_LABELS: &[&str] = &[
     DIRECT_LINK_SKIPPED_NO_LINK,
     DIRECT_LINK_REQUEST_ACCEPTED,
     DIRECT_LINK_REQUEST_REFUSED,
+    DIRECT_LINK_REQUEST_HELD,
     DIRECT_LINK_ESTABLISHED,
     DIRECT_LINK_FAILED_REJECTED,
     DIRECT_LINK_FAILED_PROBE,
