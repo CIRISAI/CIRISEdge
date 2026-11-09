@@ -50,6 +50,14 @@ use crate::outbound::OutboundHandle;
 pub struct OpsOutboundQueue {
     handle: OutboundQueueHandle,
     executor: Arc<AsyncExecutor>,
+    /// A strong reference to the PyCapsule `handle` was copied out of. The
+    /// capsule's destructor frees `handle.data` (the boxed `BackendDispatch`),
+    /// so the capsule must outlive every op this proxy builds. The raw
+    /// `BackendDispatch` it replaces held `Arc`s to the backend and needed
+    /// none; without this, an outbound dispatcher still running after the
+    /// host dropped its engine built ops on freed memory (a SIGSEGV in
+    /// `persist_outbound_build_op`, found by the pyo3 tier-2 suite).
+    _capsule: Option<pyo3::Py<pyo3::PyAny>>,
 }
 
 impl OpsOutboundQueue {
@@ -60,7 +68,11 @@ impl OpsOutboundQueue {
     /// The capsule's vtable `abi_version` is not the
     /// [`OUTBOUND_QUEUE_ABI_VERSION`] this edge was built against: a skewed
     /// wheel is refused before any op is dispatched through it.
-    pub fn new(handle: OutboundQueueHandle, executor: Arc<AsyncExecutor>) -> Result<Self, String> {
+    pub fn new(
+        handle: OutboundQueueHandle,
+        executor: Arc<AsyncExecutor>,
+        capsule: Option<pyo3::Py<pyo3::PyAny>>,
+    ) -> Result<Self, String> {
         if handle.vtable.abi_version != OUTBOUND_QUEUE_ABI_VERSION {
             return Err(format!(
                 "outbound queue ops proxy: capsule ABI version mismatch (capsule={}, \
@@ -68,7 +80,11 @@ impl OpsOutboundQueue {
                 handle.vtable.abi_version
             ));
         }
-        Ok(Self { handle, executor })
+        Ok(Self {
+            handle,
+            executor,
+            _capsule: capsule,
+        })
     }
 
     /// The C-ABI completion callback persist invokes exactly once, from a
@@ -415,7 +431,7 @@ mod tests {
             data: std::ptr::null_mut(),
             vtable: &SKEWED,
         };
-        let err = OpsOutboundQueue::new(handle, executor)
+        let err = OpsOutboundQueue::new(handle, executor, None)
             .err()
             .expect("a skewed ABI version is refused");
         assert!(err.contains("ABI version mismatch"), "{err}");
@@ -433,7 +449,8 @@ mod tests {
             backend.run_migrations().await.expect("migrate");
             let handle =
                 build_persist_outbound_queue(ciris_persist::BackendDispatch::Sqlite(backend));
-            let q = OpsOutboundQueue::new(handle, Arc::clone(&executor)).expect("abi matches");
+            let q =
+                OpsOutboundQueue::new(handle, Arc::clone(&executor), None).expect("abi matches");
 
             // An unknown row is the typed NotFound / None, as on the backend.
             assert!(q

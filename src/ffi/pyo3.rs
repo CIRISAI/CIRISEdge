@@ -5713,8 +5713,15 @@ fn extract_outbound_queue_ops(
             }
         })?
     };
-    let queue = crate::ffi::outbound_ops::OpsOutboundQueue::new(handle, Arc::clone(executor))
-        .map_err(PyRuntimeError::new_err)?;
+    // Hold the capsule itself: its destructor frees `handle.data`, and the
+    // outbound dispatcher can outlive the host's reference to the engine.
+    let capsule = engine.call_method0("outbound_queue_ops_capsule")?.unbind();
+    let queue = crate::ffi::outbound_ops::OpsOutboundQueue::new(
+        handle,
+        Arc::clone(executor),
+        Some(capsule),
+    )
+    .map_err(PyRuntimeError::new_err)?;
     Ok(Arc::new(queue))
 }
 
