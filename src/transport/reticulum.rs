@@ -16127,26 +16127,38 @@ async fn verify_route_answer(
             dialled: peer.to_owned(),
         });
     }
-    if let Some(row) = &answer.key_record_row {
-        let record_key =
-            ciris_persist::federation::key_plane::key_record_of_row(row).map(|r| r.key_id);
-        if record_key.as_deref() != Some(peer) {
+    // CC 5.3.3.5 item 6 (CIRISEdge#964) — the record is bound to the PQC
+    // commitment the dialler held before dialling, when it holds one: the
+    // carried record BEFORE it is admitted, or the held record when the
+    // dialler said it had one. No commitment, no check (additive; the
+    // fail-closed half waits for the v62 handshake, 2.6.1.8).
+    let anchored = if let Some(row) = &answer.key_record_row {
+        let record = ciris_persist::federation::key_plane::key_record_of_row(row);
+        if record.as_ref().map(|r| r.key_id.as_str()) != Some(peer) {
             return Err(RouteFetchError::SignedByAnotherKey {
-                signer: record_key.unwrap_or_else(|| "<not a key record row>".to_owned()),
+                signer: record.map_or_else(|| "<not a key record row>".to_owned(), |r| r.key_id),
                 subject: subject.to_owned(),
                 dialled: peer.to_owned(),
             });
         }
+        let ml_dsa = record.and_then(|r| r.pubkey_ml_dsa_65_base64);
+        let anchored = pqc_anchor_check(peer, ml_dsa.as_deref())?;
         rooting
             .admit_key_record_row(row)
             .await
             .map_err(RouteFetchError::KeyRecordRefused)?;
-    }
+        anchored
+    } else if crate::pqc_anchor::pending(peer).is_some() {
+        let held = rooting.registered_pubkey_ml_dsa_65_base64(peer).await;
+        pqc_anchor_check(peer, held.as_deref())?
+    } else {
+        false
+    };
     rooting
         .put_signed_transport_destination(&answer.route)
         .await
         .map_err(RouteFetchError::Unverified)?;
-    rooting
+    let pair = rooting
         .self_signed_transit_pair_for(peer)
         .await
         .map_err(RouteFetchError::Unverified)?
@@ -16154,7 +16166,28 @@ async fn verify_route_answer(
             RouteFetchError::Unverified(
                 "the fetched row authenticates no transit pair for the dialled key".to_owned(),
             )
-        })
+        })?;
+    if anchored {
+        crate::pqc_anchor::clear(peer);
+    }
+    Ok(pair)
+}
+
+/// CC 5.3.3.5 item 6 (CIRISEdge#964) — the route fetch's half of the
+/// pre-held commitment check: `Ok(true)` when a commitment is held and
+/// `ml_dsa_65_pubkey_base64` hashes to it, `Ok(false)` when none is held,
+/// and the named refusal on a mismatch.
+fn pqc_anchor_check(
+    peer: &str,
+    ml_dsa_65_pubkey_base64: Option<&str>,
+) -> Result<bool, crate::transport::route_fetch::RouteFetchError> {
+    match crate::pqc_anchor::check_ml_dsa_65(peer, ml_dsa_65_pubkey_base64) {
+        crate::pqc_anchor::Anchor::None => Ok(false),
+        crate::pqc_anchor::Anchor::Matched => Ok(true),
+        crate::pqc_anchor::Anchor::Mismatch(detail) => {
+            Err(crate::transport::route_fetch::RouteFetchError::PqcCommitmentMismatch(detail))
+        }
+    }
 }
 
 /// CC 5.3.3.5 E1 pre-seal route fetch (CLM-pre-seal-route-fetch) — the
