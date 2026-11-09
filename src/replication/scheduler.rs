@@ -368,6 +368,24 @@ pub enum RoundEvent {
     /// Transport / protocol error during the round. The scheduler
     /// logged it; the next interval tick will try fresh.
     Error(String),
+    /// The transport has no route to the peer (CIRISEdge#794): an offline
+    /// client, which the backoff takes over, not a fault of the round.
+    NoRoute(String),
+}
+
+impl RoundEvent {
+    /// The `replication_round_outcomes_total` label this event books.
+    #[must_use]
+    pub fn outcome(&self) -> crate::observability::RoundOutcome {
+        use crate::observability::RoundOutcome;
+        match self {
+            Self::Completed(_) => RoundOutcome::Completed,
+            Self::Refused => RoundOutcome::Refused,
+            Self::TimedOut => RoundOutcome::TimedOut,
+            Self::Error(_) => RoundOutcome::Error,
+            Self::NoRoute(_) => RoundOutcome::NoRoute,
+        }
+    }
 }
 
 /// Periodically drive anti-entropy rounds on a set of Initiator-side
@@ -494,6 +512,97 @@ impl std::fmt::Debug for SchedulerCommand {
 struct CoordControl {
     cancel: watch::Sender<bool>,
     kick: Arc<tokio::sync::Notify>,
+}
+
+/// The planes a peer must hold before it can attribute this node's frames, in
+/// the order they land: a route row is refused until its signer's key is held.
+/// Their frames are admitted unattributed (#402).
+const BOOTSTRAP_ORDER: [EnvelopeKind; 3] = [
+    EnvelopeKind::Key,
+    EnvelopeKind::IdentityOccurrence,
+    EnvelopeKind::TransportDestination,
+];
+
+/// How long a new peer's first Attestation round waits for [`BOOTSTRAP_ORDER`].
+/// Past it the round runs: a plane that cannot land costs what it always did.
+const BOOTSTRAP_HOLD: Duration = Duration::from_secs(5);
+
+/// How long a held round lets a host finish adding a peer's planes, and the
+/// first wait before a plane is asked again. Each wait doubles, so a held plane
+/// is asked at most six times inside [`BOOTSTRAP_HOLD`].
+const BOOTSTRAP_LOOK: Duration = Duration::from_millis(250);
+
+/// How many new peers may be held at once. Past it a new peer's round runs as
+/// it would have: a burst of hot-adds never multiplies rounds. Every round a
+/// hold asks for goes through the round gate like any other.
+const BOOTSTRAP_HOLDS: usize = 8;
+
+/// The running [`BOOTSTRAP_ORDER`] coordinators, for a held Attestation round.
+type BootstrapPlanes = Arc<
+    std::sync::Mutex<
+        HashMap<(String, EnvelopeKind), (Arc<ReplicationCoordinator>, Arc<tokio::sync::Notify>)>,
+    >,
+>;
+
+/// **A new peer's first Attestation round waits until the peer can read it.**
+/// It cannot attribute a frame until it holds this node's route row, and it
+/// drops what it cannot attribute (`SkippedNoSourceKeyId`), which costs a whole
+/// round timeout. Started with the bootstrap planes, that round is lost.
+///
+/// A round's end does not say the peer holds the row: the row may have been
+/// refused for a key still on its way. An empty `Diff` does, on the peer's own
+/// word, so each plane is asked until the peer lacks nothing of it, in order,
+/// since a route refused for its key is out of the `Diff` until the key lands.
+///
+/// Only a peer added while the scheduler runs is held, so a restart's peer list
+/// never is, and at most [`BOOTSTRAP_HOLDS`] at once. A plane is asked again
+/// when its round has ended and the wait has doubled, never on a tick, and a
+/// round that was lost ends the hold: that peer is not answering, and asking
+/// again buys nothing. Bounded by [`BOOTSTRAP_HOLD`]. A
+/// peer with none of these planes has no wait past [`BOOTSTRAP_LOOK`].
+async fn hold_for_bootstrap(
+    coord: &ReplicationCoordinator,
+    planes: &BootstrapPlanes,
+    holds: Option<Arc<tokio::sync::Semaphore>>,
+) {
+    if coord.kind() != EnvelopeKind::Attestation {
+        return;
+    }
+    let Some(_permit) = holds.and_then(|h| h.try_acquire_owned().ok()) else {
+        return;
+    };
+    tokio::time::sleep(BOOTSTRAP_LOOK).await;
+    let deadline = tokio::time::Instant::now() + BOOTSTRAP_HOLD - BOOTSTRAP_LOOK;
+    for kind in BOOTSTRAP_ORDER {
+        let plane = planes.lock().ok().and_then(|p| {
+            p.get(&(coord.peer_key_id().to_owned(), kind))
+                .map(|(c, k)| (Arc::clone(c), Arc::clone(k)))
+        });
+        let Some((plane, kick)) = plane else {
+            continue;
+        };
+        let seen = plane.peer_lacks_nothing();
+        let mut wait = BOOTSTRAP_LOOK;
+        while plane.peer_lacks_nothing() == seen {
+            if plane.last_round_lost() {
+                return;
+            }
+            kick.notify_one();
+            let ended = tokio::time::timeout_at(deadline, plane.round_finished());
+            if ended.await.is_ok() && plane.peer_lacks_nothing() == seen {
+                tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + wait)).await;
+                wait *= 2;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::info!(
+                    waiting_on = ?kind,
+                    "first Attestation round not held past the bound: the peer has not \
+                     confirmed this plane"
+                );
+                return;
+            }
+        }
+    }
 }
 
 /// External handle for mutating a running scheduler's Initiator set.
@@ -853,6 +962,8 @@ impl ReplicationScheduler {
 
         let mesh_config = self.mesh_config.take();
         let metrics = self.metrics.take();
+        let bootstrap = BootstrapPlanes::default();
+        let bootstrap_holds = Arc::new(tokio::sync::Semaphore::new(BOOTSTRAP_HOLDS));
         for coord in self.coordinators.drain(..) {
             note_driven(&self.driven, &coord);
             spawn_coord(
@@ -866,6 +977,8 @@ impl ReplicationScheduler {
                 Arc::clone(&round_gate),
                 Arc::clone(&backoff),
                 metrics.clone(),
+                Arc::clone(&bootstrap),
+                None,
             );
         }
 
@@ -910,6 +1023,8 @@ impl ReplicationScheduler {
                                 Arc::clone(&round_gate),
                                 Arc::clone(&backoff),
                                 metrics.clone(),
+                                Arc::clone(&bootstrap),
+                                Some(Arc::clone(&bootstrap_holds)),
                             );
                         }
                         SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
@@ -920,6 +1035,9 @@ impl ReplicationScheduler {
                                 &peer_key_id,
                                 kind,
                             );
+                            if let Ok(mut planes) = bootstrap.lock() {
+                                planes.remove(&(peer_key_id, kind));
+                            }
                         }
                         SchedulerCommand::RoundNow { peer_key_id } => {
                             round_now_kick(&per_coord, peer_key_id.as_deref());
@@ -973,6 +1091,8 @@ fn spawn_coord(
     round_gate: Arc<RoundGate>,
     backoff: Arc<NoRouteBackoff>,
     metrics: Option<crate::observability::EdgeMetrics>,
+    bootstrap: BootstrapPlanes,
+    bootstrap_holds: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     debug_assert_eq!(
         coord.role(),
@@ -989,6 +1109,14 @@ fn spawn_coord(
             kick: Arc::clone(&kick),
         },
     );
+    if BOOTSTRAP_ORDER.contains(&coord.kind()) {
+        if let Ok(mut planes) = bootstrap.lock() {
+            planes.insert(
+                (coord.peer_key_id().to_owned(), coord.kind()),
+                (Arc::clone(&coord), Arc::clone(&kick)),
+            );
+        }
+    }
     let h = tokio::spawn(async move {
         run_one_coordinator_forever(
             coord,
@@ -1001,6 +1129,8 @@ fn spawn_coord(
             round_gate,
             backoff,
             metrics,
+            bootstrap,
+            bootstrap_holds,
         )
         .await;
     });
@@ -1019,7 +1149,18 @@ async fn run_one_coordinator_forever(
     round_gate: Arc<RoundGate>,
     backoff: Arc<NoRouteBackoff>,
     metrics: Option<crate::observability::EdgeMetrics>,
+    bootstrap: BootstrapPlanes,
+    bootstrap_holds: Option<Arc<tokio::sync::Semaphore>>,
 ) {
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => {
+            if *cancel.borrow() {
+                return;
+            }
+        }
+        () = hold_for_bootstrap(&coord, &bootstrap, bootstrap_holds) => {}
+    }
     let mut interval = tokio::time::interval(cadence);
     // `Burst` is the default; with `MissedTickBehavior::Skip` a
     // long-delayed task wouldn't fire bursts to catch up. We want
@@ -1031,6 +1172,7 @@ async fn run_one_coordinator_forever(
     // rebuilds the interval, so a reader answering "no relief" forever never
     // perturbs the pre-#440 tick stream.
     let mut current_cadence = cadence;
+    let mut walk_stretch_was = 1;
     // CC 5.4.6 — when the re-dial drawn after a failed send is due. Until then
     // a kick does not dial: it would put a refused fleet back on one beat.
     let mut redial_at: Option<tokio::time::Instant> = None;
@@ -1103,19 +1245,36 @@ async fn run_one_coordinator_forever(
                     Some(reader) => reader.relief().await.round_cadence.unwrap_or(cadence),
                     None => cadence,
                 };
+                // FSD CIRIS_MESH §7.7 — the host's walk lever, read here at the
+                // round boundary: this coordinator keeps its own phase, so a
+                // raise and a release both reach the plane spread over one
+                // interval, never as one tick. A kick is not stretched.
+                let stretch = match &metrics {
+                    Some(m) => {
+                        m.telemetry
+                            .levers
+                            .walk_stretch(coord.kind(), coord.peer_key_id())
+                            .await
+                    }
+                    None => 1,
+                };
                 // CC 5.4.3 — on a shaped link the round interval follows the
                 // frame gap (about 7.75 gaps), else ticks queue behind rounds
                 // that each take several gaps.
-                let target = pacing_interval(relieved, coord.pacing_gap());
+                let target = pacing_interval(relieved * stretch, coord.pacing_gap());
                 if target != current_cadence {
-                    tracing::info!(
-                        peer = %peer_id,
-                        kind = %kind_str,
-                        from_secs = current_cadence.as_secs_f64(),
-                        to_secs = target.as_secs_f64(),
-                        "anti-entropy cadence changed (mesh-config relief, CIRISEdge#440, or \
-                         the shaped link's frame gap, CC 5.4.3)"
-                    );
+                    // One line per lever move is the lever's own; a line per
+                    // coordinator would be P × K of them.
+                    if stretch == walk_stretch_was {
+                        tracing::info!(
+                            peer = %peer_id,
+                            kind = %kind_str,
+                            from_secs = current_cadence.as_secs_f64(),
+                            to_secs = target.as_secs_f64(),
+                            "anti-entropy cadence changed (mesh-config relief, CIRISEdge#440, or \
+                             the shaped link's frame gap, CC 5.4.3)"
+                        );
+                    }
                     current_cadence = target;
                     interval = tokio::time::interval_at(
                         tokio::time::Instant::now() + target,
@@ -1123,6 +1282,7 @@ async fn run_one_coordinator_forever(
                     );
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 }
+                walk_stretch_was = stretch;
                 // After the cadence settles, so the draw is on the one in force.
                 if ran == RoundRan::SendFailed {
                     redial_at = Some(draw_redial(&mut interval, current_cadence));
@@ -1233,12 +1393,14 @@ impl GatedRound<'_> {
         // gap: the per-wait timeout is at least the Poisson p99 of one gap
         // (about 4.74 gaps), else every wait on a slow link times out.
         let round_timeout = pacing_timeout(self.round_timeout, self.coord.pacing_gap());
+        let mut ended = RoundEnded::default();
         let class = round_and_report(
             self.coord,
             round_timeout,
             self.event_sink,
             self.peer_id,
             &mut seat,
+            &mut ended,
         )
         .await;
         if let Some(m) = self.metrics {
@@ -1246,6 +1408,8 @@ impl GatedRound<'_> {
         }
         tracing::info!(
             took_ms = started.elapsed().as_millis(),
+            outcome = ended.outcome,
+            error = ended.error.as_deref().unwrap_or(""),
             "anti-entropy round ended"
         );
         let ran = if matches!(class, RoundClass::SendFailed) {
@@ -1278,16 +1442,66 @@ fn round_class_of(e: &RoundError) -> RoundClass {
     }
 }
 
+/// How a round ended, for its `anti-entropy round ended` line: the
+/// `replication_round_outcomes_total` label, and an error's text.
+struct RoundEnded {
+    outcome: &'static str,
+    error: Option<String>,
+}
+
+impl Default for RoundEnded {
+    fn default() -> Self {
+        Self {
+            outcome: "skipped",
+            error: None,
+        }
+    }
+}
+
+impl RoundEnded {
+    /// What `event` says.
+    fn of(event: &RoundEvent) -> Self {
+        let error = match event {
+            RoundEvent::Error(e) | RoundEvent::NoRoute(e) => Some(e.clone()),
+            RoundEvent::Completed(_) | RoundEvent::Refused | RoundEvent::TimedOut => None,
+        };
+        Self {
+            outcome: event.outcome().as_str(),
+            error,
+        }
+    }
+}
+
+/// How often one `(peer, kind)` may say why its rounds fail.
+const ROUND_ERROR_LOG_WINDOW: Duration = Duration::from_secs(300);
+
+fn round_error_log() -> &'static crate::log_throttle::LogThrottle {
+    static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(1, ROUND_ERROR_LOG_WINDOW, 8192))
+}
+
+/// Say why a round failed, at most once per `(peer, kind)` in a window. The
+/// round's span names both.
+fn log_round_error(peer: &str, kind: EnvelopeKind, what: &'static str, error: &str) {
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        round_error_log().check(&format!("{peer}:{kind:?}"))
+    {
+        tracing::info!(suppressed_prev, %error, "{what}");
+    }
+}
+
 /// One anti-entropy round toward this coordinator's peer — the signer-recovery
 /// attempt first, then the ordinary round — and its [`RoundEvent`] to the sink.
 /// Shared by the cadence tick and the [`SchedulerCommand::RoundNow`] kick.
 /// Returns how the round ended, for the no-route backoff (CIRISEdge#794).
+#[allow(clippy::too_many_lines)] // the round's one exit table: every arm is a log and an event
 async fn round_and_report(
     coord: &Arc<ReplicationCoordinator>,
     round_timeout: Duration,
     event_sink: Option<&tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
     peer_id: &str,
     seat: &mut RoundSeat<'_>,
+    ended: &mut RoundEnded,
 ) -> RoundClass {
     // FSD-SIGNER-RECOVERY D3 — a recovery round REPLACES this
     // tick's ordinary round; the two never overlap. It costs one
@@ -1308,9 +1522,15 @@ async fn round_and_report(
             // CIRISEdge#794 — no route: the ordinary round would fail the
             // same way, so it does not run; the backoff takes over.
             if let RoundClass::NoRoute(error) = round_class_of(&e) {
-                tracing::debug!(%error, "signer-recovery round: no route to peer (CIRISEdge#794)");
+                log_round_error(
+                    peer_id,
+                    coord.kind(),
+                    "signer-recovery round: no route to peer (CIRISEdge#794)",
+                    &error,
+                );
+                let event = RoundEvent::NoRoute(format!("transport: {error}"));
+                *ended = RoundEnded::of(&event);
                 if let Some(sink) = event_sink {
-                    let event = RoundEvent::Error(format!("transport: {error}"));
                     let _ = sink.send((peer_id.to_string(), event)).await;
                 }
                 return RoundClass::NoRoute(error);
@@ -1334,6 +1554,7 @@ async fn round_and_report(
             DriveStep::Refused => RoundEvent::Refused,
             DriveStep::SendThenWait(_) => RoundEvent::TimedOut,
         };
+        *ended = RoundEnded::of(&event);
         if let Some(sink) = event_sink {
             let _ = sink.send((peer_id.to_string(), event)).await;
         }
@@ -1348,6 +1569,7 @@ async fn round_and_report(
     // an error of the round: skip quietly, no event, no backoff.
     if matches!(class, RoundClass::Suspended) {
         tracing::debug!("round skipped: transport suspended");
+        coord.note_round_ended(true);
         return class;
     }
     let event = match outcome {
@@ -1376,18 +1598,31 @@ async fn round_and_report(
         // CIRISEdge#794 — no route is logged once per backoff entry and
         // exit by the backoff, never once per round.
         Err(RoundError::Coordinator(e)) if matches!(class, RoundClass::NoRoute(_)) => {
-            tracing::debug!(error = %e, "round: no route to peer (CIRISEdge#794)");
-            RoundEvent::Error(e.to_string())
+            log_round_error(
+                peer_id,
+                coord.kind(),
+                "round: no route to peer (CIRISEdge#794)",
+                &e.to_string(),
+            );
+            RoundEvent::NoRoute(e.to_string())
         }
         Err(RoundError::Coordinator(e)) => {
-            tracing::warn!(error = %e, "coordinator error during round");
+            log_round_error(
+                peer_id,
+                coord.kind(),
+                "coordinator error during round",
+                &e.to_string(),
+            );
             RoundEvent::Error(e.to_string())
         }
         Err(RoundError::InboundClosed) => {
-            tracing::warn!("inbound channel closed; cannot complete round");
-            RoundEvent::Error("inbound channel closed".to_string())
+            let error = "inbound channel closed";
+            log_round_error(peer_id, coord.kind(), "round cannot complete", error);
+            RoundEvent::Error(error.to_string())
         }
     };
+    *ended = RoundEnded::of(&event);
+    coord.note_round_ended(!matches!(event, RoundEvent::Completed(_)));
     if let Some(sink) = event_sink {
         // Sink-closed isn't a fault — the metrics consumer
         // dropped their receiver. Round loops continue.
@@ -1662,6 +1897,23 @@ async fn drive_exchange_to_completion(
 
 #[cfg(test)]
 mod tests {
+    use super::{RoundEnded, RoundEvent};
+
+    /// The round-ended line carries why: canonical-1's 178 `error` outcomes
+    /// left no reason anywhere (error 178, completed 0).
+    #[test]
+    fn a_round_ended_line_names_the_outcome_and_the_error() {
+        let ended = RoundEnded::of(&RoundEvent::Error("transport: no route".to_owned()));
+        assert_eq!(ended.outcome, "error");
+        assert_eq!(ended.error.as_deref(), Some("transport: no route"));
+        let ended = RoundEnded::of(&RoundEvent::NoRoute("transport: offline".to_owned()));
+        assert_eq!(ended.outcome, "no_route");
+        assert_eq!(ended.error.as_deref(), Some("transport: offline"));
+        let ended = RoundEnded::of(&RoundEvent::TimedOut);
+        assert_eq!((ended.outcome, ended.error), ("timed_out", None));
+        assert_eq!(RoundEnded::default().outcome, "skipped");
+    }
+
     use super::*;
     use crate::replication::coordinator::ReplicationCoordinator;
     use crate::replication::protocol::{EnvelopeKind, EnvelopeRef};
@@ -2161,6 +2413,181 @@ mod tests {
             .await
             .expect("shutdown")
             .expect("join");
+    }
+
+    /// What the walk reads of every peer in the lever witnesses.
+    #[derive(Debug)]
+    struct OwedNothing;
+
+    #[async_trait::async_trait]
+    impl crate::load_ladder::PeerObligations for OwedNothing {
+        async fn obligation_of(&self, peer: &str) -> crate::load_ladder::PeerObligation {
+            if peer.starts_with("owed") {
+                crate::load_ladder::PeerObligation::SendSet
+            } else {
+                crate::load_ladder::PeerObligation::Ordinary
+            }
+        }
+    }
+
+    fn idle_coord(peer: &str, kind: EnvelopeKind) -> Arc<ReplicationCoordinator> {
+        let transport: Arc<dyn Transport> = Arc::new(InMemTransport {
+            peer_inbox: HashMap::new(),
+        });
+        let provider: Arc<dyn StateProvider> = Arc::new(StaticProvider {
+            state: LocalState::new(),
+            envelopes: HashMap::new(),
+        });
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
+        Arc::new(ReplicationCoordinator::new(
+            transport,
+            peer,
+            kind,
+            SessionRole::Initiator,
+            provider,
+            applier,
+        ))
+    }
+
+    /// Rounds a peer class ran in a span of seconds.
+    fn rounds_in(log: &[(u64, String)], from: u64, to: u64, class: &str) -> usize {
+        log.iter()
+            .filter(|(s, p)| *s >= from && *s < to && p.starts_with(class))
+            .count()
+    }
+
+    /// The most rounds of one peer class in any one second of a span.
+    fn peak_in(log: &[(u64, String)], from: u64, to: u64, class: &str) -> usize {
+        (from..to)
+            .map(|s| rounds_in(log, s, s + 1, class))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// FSD CIRIS_MESH §7.7, on the production coordinator loop and the paused
+    /// clock: **the walk is what is shed, the rounds a peer is owed are not,
+    /// and neither the pull nor the lease running out is a surge.**
+    ///
+    /// 30 ordinary peers on `Attestation` (the walk), 10 of them on `Key`
+    /// (the first-contact plane), and 10 owed peers on `Attestation`, all on a
+    /// 30 s cadence and spread over it. The lever is pulled to the top once and
+    /// never renewed: a dead host.
+    #[tokio::test(start_paused = true)]
+    async fn the_walk_lever_sheds_the_walk_alone_and_walks_home_with_no_surge() {
+        const CADENCE: u64 = 30;
+        // Baseline: 120 s of an unlevered walk.
+        const PULL: u64 = 180;
+        const SILENT: u64 = PULL + 600;
+        const HOME: u64 = SILENT + 300;
+        let metrics = crate::observability::EdgeMetrics::default();
+        let levers = &metrics.telemetry.levers;
+        levers.install_obligations(Arc::new(OwedNothing));
+        levers.set_steps(Duration::ZERO, crate::load_levers::RELEASE_STEP);
+
+        let mut sched = ReplicationScheduler::new(SchedulerConfig {
+            cadence: Duration::from_secs(CADENCE),
+            round_timeout: Duration::from_millis(80),
+            ..SchedulerConfig::default()
+        })
+        .with_metrics(Some(metrics.clone()));
+        let control = sched.install_control_channel();
+        let (event_tx, mut event_rx) = mpsc::channel::<(String, RoundEvent)>(4096);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let sched_handle =
+            tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
+
+        // Spread over the cadence, as peers that connected over time are.
+        let t0 = tokio::time::Instant::now();
+        let mut peers = Vec::new();
+        for i in 0..30 {
+            peers.push((format!("walk-{i}"), EnvelopeKind::Attestation));
+        }
+        for i in 0..10 {
+            peers.push((format!("key-{i}"), EnvelopeKind::Key));
+            peers.push((format!("owed-{i}"), EnvelopeKind::Attestation));
+        }
+        let gap = Duration::from_secs(CADENCE) / u32::try_from(peers.len()).unwrap();
+        for (peer, kind) in &peers {
+            control
+                .add_initiator(idle_coord(peer, *kind))
+                .await
+                .expect("add");
+            tokio::time::sleep(gap).await;
+        }
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::<(u64, String)>::new()));
+        let sink = Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Some((peer, _)) = event_rx.recv().await {
+                let at = tokio::time::Instant::now().duration_since(t0).as_secs();
+                sink.lock().unwrap().push((at, peer));
+            }
+        });
+
+        let settle = |at: u64| tokio::time::sleep_until(t0 + Duration::from_secs(at));
+        settle(PULL).await;
+        for _ in 0..3 {
+            levers.pull(
+                crate::ShedLever::Walk,
+                crate::load_levers::MAX_LEVEL,
+                crate::load_levers::LEASE_MAX,
+            );
+        }
+        assert_eq!(levers.level(crate::ShedLever::Walk), 3);
+
+        // A kick is not a cadence tick: it still runs at the top step.
+        settle(PULL + 300).await;
+        let before = log.lock().unwrap().len();
+        control.round_now(Some("walk-0")).await.expect("kick");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            log.lock().unwrap()[before..]
+                .iter()
+                .any(|(_, p)| p == "walk-0"),
+            "a kick runs with the walk stretched"
+        );
+
+        settle(HOME + 300).await;
+        assert_eq!(levers.level(crate::ShedLever::Walk), 0, "the lease ran out");
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sched_handle)
+            .await
+            .expect("shutdown")
+            .expect("join");
+
+        let log = log.lock().unwrap().clone();
+        let base = rounds_in(&log, 60, PULL, "walk");
+        let peak = peak_in(&log, 60, PULL, "walk");
+        // Every ordinary coordinator ticks once a cadence: 30 × 4.
+        assert!((100..=140).contains(&base), "baseline {base}");
+
+        // Shed: the top step is ×8. The first 240 s drain the last ticks at
+        // the old cadence, so the span is measured after them.
+        let held = rounds_in(&log, PULL + 240, PULL + 480, "walk");
+        let base_span = base * 2;
+        assert!(
+            held <= base_span / 7,
+            "the walk is shed: {held} rounds against {base_span} over the same span"
+        );
+        // Kept: the plane first contact runs on, and the rounds a peer is owed.
+        for class in ["key", "owed"] {
+            let kept = rounds_in(&log, PULL + 240, PULL + 480, class);
+            let was = rounds_in(&log, 60, PULL, class) * 2;
+            assert!(
+                (was.saturating_sub(2)..=was + 2).contains(&kept),
+                "{class} keeps its cadence: {kept} against {was}"
+            );
+        }
+        // Neither the pull nor the fall is a surge: at no second does the walk
+        // run harder than it did unlevered, all the way home.
+        let fall = peak_in(&log, PULL, HOME + 300, "walk");
+        assert!(
+            fall <= peak + 1,
+            "a surge: {fall} rounds in a second against {peak} unlevered"
+        );
+        // And it got home: the walk runs at its cadence again.
+        let after = rounds_in(&log, HOME + 120, HOME + 240, "walk");
+        assert!((100..=140).contains(&after), "serving again: {after}");
     }
 
     /// CIRISEdge#740 — a kick is bounded. N+1 coordinators are kicked at once

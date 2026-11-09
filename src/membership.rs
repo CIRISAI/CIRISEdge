@@ -347,29 +347,9 @@ pub async fn pending_proposals_for(
     directory: &dyn FederationDirectory,
     invitee_key_id: &str,
 ) -> Result<Vec<PendingProposal>, MembershipError> {
-    use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
     const PAGE: u32 = 512;
     let now = chrono::Utc::now();
-    // persist v56 (#1001): the invitee's replies, both dimensions in one walk.
-    // Replies are attested to the key that signed them (`to`, exactly v55's
-    // `list_attestations_for`). Every reply counts, so the walk runs to the
-    // end. A NotServed page is an Err, never "nothing answered".
-    let mut reply_pages = AttestationQuery::to(invitee_key_id, FOLD_PAGE)
-        .dimension_any_of(&[ACCEPTANCE_DIMENSION, DECLINE_DIMENSION])
-        .pages();
-    let mut replied: std::collections::HashSet<String> = std::collections::HashSet::new();
-    while let Some(page) = reply_pages
-        .next(directory)
-        .await
-        .map_err(|e| MembershipError::from_persist("list replies", &e))?
-    {
-        replied.extend(page.into_iter().filter_map(|r| {
-            r.attestation_envelope
-                .get("references_attestation_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        }));
-    }
+    let replied = replies_of(directory, invitee_key_id).await?;
     let mut out = Vec::new();
     let mut since = None;
     loop {
@@ -381,38 +361,115 @@ pub async fn pending_proposals_for(
         since = page
             .last()
             .map(ciris_persist::federation::types::ServedAttestation::resume_pair);
-        for served in page {
-            let p = served.attestation;
-            if dimension_of(&p) != Some(PROPOSAL_DIMENSION)
-                || p.tier != ciris_persist::federation::types::attestation_tier::FEDERATION
-                || p.subject_key_ids.first().map(String::as_str) != Some(invitee_key_id)
-                || replied.contains(&p.attestation_id)
-            {
-                continue;
-            }
-            let (Some(scope), Some(expires_at)) = (GroupScope::of_row(&p), p.expires_at) else {
-                continue;
-            };
-            if expires_at <= now {
-                continue;
-            }
-            let Some(group_key_id) = group_of(&p, scope) else {
-                continue;
-            };
-            out.push(PendingProposal {
-                role: role_of(&p),
-                scope,
-                group_key_id,
-                expires_at,
-                proposal: p,
-            });
-        }
+        out.extend(
+            page.into_iter()
+                .filter_map(|s| pending_of(s.attestation, invitee_key_id, &replied, now)),
+        );
         if !full {
             break;
         }
     }
     out.sort_by_key(|p| p.proposal.asserted_at);
     Ok(out)
+}
+
+/// The live proposal inviting `invitee_key_id` into `group_key_id`, read by the
+/// group's own index. [`pending_proposals_for`] walks the whole plane, because
+/// nothing indexes a row by its subject; a caller that knows the room has no
+/// reason to, and a host polling a pair room did it twice a second. A store
+/// with no such index walks.
+///
+/// # Errors
+/// A directory read failure.
+pub async fn pending_proposal_in(
+    directory: &dyn FederationDirectory,
+    invitee_key_id: &str,
+    group_key_id: &str,
+) -> Result<Option<PendingProposal>, MembershipError> {
+    use ciris_persist::federation::types::cohort_scope;
+    let read = directory
+        .list_targeted_by_dimension_prefix(
+            &[
+                cohort_scope::FAMILY,
+                cohort_scope::COMMUNITY,
+                cohort_scope::AFFILIATIONS,
+            ],
+            group_key_id,
+            PROPOSAL_DIMENSION,
+        )
+        .await;
+    let rows = match read {
+        Ok(rows) => rows,
+        Err(ciris_persist::federation::Error::Unsupported { .. }) => {
+            return Ok(pending_proposals_for(directory, invitee_key_id)
+                .await?
+                .into_iter()
+                .find(|p| p.group_key_id == group_key_id));
+        }
+        Err(e) => return Err(MembershipError::from_persist("list proposals", &e)),
+    };
+    let replied = replies_of(directory, invitee_key_id).await?;
+    let now = chrono::Utc::now();
+    Ok(rows
+        .into_iter()
+        .filter_map(|p| pending_of(p, invitee_key_id, &replied, now))
+        .find(|p| p.group_key_id == group_key_id))
+}
+
+/// The proposals `invitee_key_id` has answered, both dimensions in one walk.
+/// Replies are attested to the key that signed them (`to`, exactly v55's
+/// `list_attestations_for`). Every reply counts, so the walk runs to the end. A
+/// NotServed page is an Err, never "nothing answered".
+async fn replies_of(
+    directory: &dyn FederationDirectory,
+    invitee_key_id: &str,
+) -> Result<std::collections::HashSet<String>, MembershipError> {
+    use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
+    let mut pages = AttestationQuery::to(invitee_key_id, FOLD_PAGE)
+        .dimension_any_of(&[ACCEPTANCE_DIMENSION, DECLINE_DIMENSION])
+        .pages();
+    let mut replied = std::collections::HashSet::new();
+    while let Some(page) = pages
+        .next(directory)
+        .await
+        .map_err(|e| MembershipError::from_persist("list replies", &e))?
+    {
+        replied.extend(page.into_iter().filter_map(|r| {
+            r.attestation_envelope
+                .get("references_attestation_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }));
+    }
+    Ok(replied)
+}
+
+/// `p` as a live proposal to `invitee_key_id` that is still unanswered.
+fn pending_of(
+    p: Attestation,
+    invitee_key_id: &str,
+    replied: &std::collections::HashSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<PendingProposal> {
+    if dimension_of(&p) != Some(PROPOSAL_DIMENSION)
+        || p.tier != ciris_persist::federation::types::attestation_tier::FEDERATION
+        || p.subject_key_ids.first().map(String::as_str) != Some(invitee_key_id)
+        || replied.contains(&p.attestation_id)
+    {
+        return None;
+    }
+    let (scope, expires_at) = (GroupScope::of_row(&p)?, p.expires_at?);
+    if expires_at <= now {
+        return None;
+    }
+    let group_key_id = group_of(&p, scope)?;
+    Some(PendingProposal {
+        role: role_of(&p),
+        scope,
+        group_key_id,
+        expires_at,
+        proposal: p,
+    })
 }
 
 /// The identities whose proposals a node widens on acceptance, and the

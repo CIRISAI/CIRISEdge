@@ -31,6 +31,10 @@ pub const UNSHAPED_LINK: &str = "onion_unshaped_link";
 pub const PERIOD_MISMATCH: &str = "onion_period_mismatch";
 /// This hop's encapsulation was already seen within two periods.
 pub const REPLAY: &str = "onion_replay";
+/// CIRISEdge#955 — this period's replay set already holds its bound of tags
+/// (`relay::REPLAY_BOUND`); a new packet is refused, no held tag is evicted
+/// (CC 5.3.3.5 E1 rule 9: a hold refuses on overflow by name, never trims).
+pub const REPLAY_SET_FULL: &str = "onion_replay_set_full";
 /// The relay already holds its bound of packets waiting out their delay.
 pub const HOLD_DEFERRED: &str = "onion_hold_deferred";
 /// A packet forwarded onto the next hop's shaped link (an outcome, counted).

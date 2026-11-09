@@ -488,7 +488,8 @@ async fn a_shaped_link_carries_one_frame_size_at_poisson_times_both_ways() {
     }
 }
 
-/// **Witness 2** — one side `off`: the offers resolve to UNSHAPED by
+/// **Witness 2** — a peer older than `CLM-shaping-offered-never-refused` still
+/// answers `off`, and the wire ends cleanly: the offers resolve to UNSHAPED by
 /// agreement and the link runs bare (counted on both ends); a node that
 /// REQUIRES shaped links refuses the same peer by name and the link closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -500,6 +501,7 @@ async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
         explicit_off(),
     )
     .await;
+    lenient.b.transport.answer_off_like_an_old_peer_for_test();
     // A (shaping) dials B (off): A offers, B answers off.
     lenient
         .a
@@ -540,6 +542,7 @@ async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
         explicit_off(),
     )
     .await;
+    strict.b.transport.answer_off_like_an_old_peer_for_test();
     match strict
         .a
         .transport
@@ -613,8 +616,12 @@ async fn rho_and_the_window_move_the_real_share_and_the_delay() {
         );
         let real = t.b.shaping("link_shaping_frames_real") - real0;
         let cover = t.b.shaping("link_shaping_frames_cover") - cover0;
-        let share = real as f64 / (real + cover).max(1) as f64;
         let budget = t.b.transport.shaping_status().links[0].real_frames_per_window;
+        // The share of the slots the link owned, ρ·λ·W being the budget. Not of
+        // the frames it emitted: a timer lagging on a loaded host emits fewer,
+        // which reads as a larger share, and that measures the host and not ρ.
+        let lambda = budget as f64 / (rho * window_s as f64);
+        let share = real as f64 / (lambda * took.as_secs_f64()).max(1.0);
         eprintln!("[{tag}] rho={rho} W={window_s}s burst of 40 took {took:?}; real share {share:.2} ({real} real / {cover} cover), budget {budget} a window");
         (took, share, budget)
     }
@@ -762,17 +769,15 @@ async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_consta
     );
 }
 
-/// **CC 5.4.3 rc16 two planes, the last resort** — B is a NAT'd phone: it
-/// dials A (the only link, shaped), and A cannot dial B. An UNPROMPTED 1 MiB
-/// Deliver from A to B is beyond the shaped link's reach (0.5 × 100 kB/s ×
-/// 10 s = 500 kB), so it needs the bulk plane, and no unshaped link to B can
-/// exist. It must not fail: it rides the shaped link in shaped-budget
-/// fragments, slowly, counted `link_shaping_bulk_on_shaped_fallback`, and the
-/// shaped link stays one frame size throughout (enough frames of it to have
-/// carried the whole megabyte). Mutation: no fallback → the
-/// send fails.
+/// **CC 5.4.3, `CLM-shaped-link-one-hop`** — B is a NAT'd phone: it dials A
+/// (the only link, shaped), and A cannot dial B. An unprompted 1 MiB Deliver
+/// from A to B needs the bulk plane and no unshaped link to B exists. It is
+/// refused by name, and not one fragment of it rides the shaped link: the
+/// frames the link emits stay rows and cover, and B receives nothing. When a
+/// dial works again the send goes on its own unshaped link. Mutation: fall
+/// back onto the shaped link → this fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bulk_to_a_peer_reachable_only_over_its_shaped_link_rides_it_slowly_and_never_fails() {
+async fn a_failed_bulk_dial_is_refused_by_name_and_never_rides_the_shaped_link() {
     let _host = share_host().await;
     let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
     let t = duo("fallback", server.clone(), server).await;
@@ -795,50 +800,28 @@ async fn bulk_to_a_peer_reachable_only_over_its_shaped_link_rides_it_slowly_and_
         t.a.metrics.link_shaping()
     );
     t.a.transport.refuse_outbound_dials_for_test(true);
-    t.a.transport.set_link_wire_tap_for_test(true);
     let deliver = typed_payload("AttestationGossip", b"FB-DELIVER-", 1 << 20);
-    t.a.transport
-        .send(&t.b.key.key_id, &deliver)
-        .await
-        .expect("an unprompted 1 MiB Deliver to a peer A cannot dial completes");
+    let frames_before = t.a.shaping("link_shaping_frames_real");
+    let err =
+        t.a.transport
+            .send(&t.b.key.key_id, &deliver)
+            .await
+            .expect_err("no unshaped link: the send is refused");
     assert!(
-        wait_until(Duration::from_secs(120), || async {
-            t.b.received(&deliver).await
-        })
-        .await,
-        "B received the 1 MiB Deliver over the shaped link: {:?}",
+        err.to_string().contains("link_shaping_bulk_refused"),
+        "by name: {err}"
+    );
+    assert_eq!(t.a.shaping("link_shaping_bulk_refused"), 1);
+    assert_eq!(t.a.transport.refused_dials_for_test(), 1);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !t.b.received(&deliver).await,
+        "nothing of it crossed the shaped link"
+    );
+    assert!(
+        t.a.shaping("link_shaping_frames_real") <= frames_before + 2,
+        "the shaped link carried rows and reports, not a file: {:?}",
         t.a.metrics.link_shaping()
-    );
-    assert_eq!(
-        t.a.shaping("link_shaping_bulk_on_shaped_fallback"),
-        1,
-        "{:?}",
-        t.a.metrics.link_shaping()
-    );
-    assert_eq!(
-        t.a.shaping("link_shaping_bulk_fallback:ok"),
-        1,
-        "v44: it says how it ended"
-    );
-    assert_eq!(t.a.shaping("link_shaping_bulk_fallback:failed"), 0);
-    assert_eq!(t.a.shaping("link_shaping_bulk_refused"), 0);
-    assert_eq!(
-        t.a.transport.refused_dials_for_test(),
-        1,
-        "the first send paid one failed dial"
-    );
-    let wire = t.a.transport.link_wire_tapped_for_test();
-    let link = wire.first().expect("A sent on the link").0;
-    assert!(
-        wire.iter().all(|(l, _)| *l == link),
-        "one link: the shaped one"
-    );
-    let frames = frames_on(&wire, link);
-    let (size, run) = trailing_run(&frames);
-    assert!(
-        frames.iter().all(|f| f.len() == size) && run * size >= 1 << 20,
-        "the shaped link stays one frame size while the bulk crosses: {run} × {size} B, others {:?}",
-        frames.iter().map(Vec::len).filter(|&l| l != size).collect::<Vec<_>>()
     );
 }
 
@@ -906,71 +889,21 @@ async fn a_peer_that_cannot_be_dialled_costs_one_failed_dial_not_one_per_send() 
     t.a.transport.refuse_outbound_dials_for_test(true);
     for marker in [&b"NEG-ONE-"[..], &b"NEG-TWO-"[..]] {
         let deliver = typed_payload("AttestationGossip", marker, 128 * 1024);
-        t.a.transport
-            .send(&t.b.key.key_id, &deliver)
-            .await
-            .expect("a bulk Deliver to a peer A cannot dial completes");
+        let err =
+            t.a.transport
+                .send(&t.b.key.key_id, &deliver)
+                .await
+                .expect_err("a bulk Deliver to a peer A cannot dial is refused");
         assert!(
-            wait_until(Duration::from_secs(60), || async {
-                t.b.received(&deliver).await
-            })
-            .await
+            err.to_string().contains("link_shaping_bulk_refused"),
+            "{err}"
         );
     }
-    assert_eq!(t.a.shaping("link_shaping_bulk_on_shaped_fallback"), 2);
+    assert_eq!(t.a.shaping("link_shaping_bulk_refused"), 2);
     assert_eq!(
         t.a.transport.refused_dials_for_test(),
         1,
         "the second send skipped the dial"
-    );
-}
-
-/// `Delivered` is a transport ack to the durable dispatcher, so a fallback
-/// whose link closes part-way must be an error it retries, never a success.
-/// Mutation: report success once the fragments are queued → this fails.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fallback_that_drops_part_way_is_an_error_the_dispatcher_retries() {
-    let _host = share_host().await;
-    let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
-    let t = duo("dropped", server.clone(), server).await;
-    let row = typed_payload("AttestationGossip", b"DROP-ROW-", 2_000);
-    t.b.transport
-        .send(&t.a.key.key_id, &row)
-        .await
-        .expect("B dials A");
-    assert!(
-        wait_until(Duration::from_secs(30), || async {
-            t.a.received(&row).await
-        })
-        .await
-    );
-    t.a.transport.set_link_wire_tap_for_test(true);
-    t.a.transport.refuse_outbound_dials_for_test(true);
-    let sender = Arc::clone(&t.a.transport);
-    let to = t.b.key.key_id.clone();
-    let deliver = typed_payload("AttestationGossip", b"DROP-DELIVER-", 1 << 20);
-    let send = tokio::spawn(async move { sender.send(&to, &deliver).await });
-    assert!(
-        wait_until(Duration::from_secs(30), || async {
-            t.a.shaping("link_shaping_bulk_on_shaped_fallback") == 1
-                && t.a.shaping("link_shaping_frames_real") >= 3
-        })
-        .await,
-        "the fallback is under way: {:?}",
-        t.a.metrics.link_shaping()
-    );
-    assert!(!send.is_finished(), "the send waits for the last fragment");
-    let link = t.a.transport.link_wire_tapped_for_test()[0].0;
-    t.a.transport.link_teardown(&link).await.expect("teardown");
-    let out = tokio::time::timeout(Duration::from_secs(30), send)
-        .await
-        .expect("the send ends when the link does")
-        .expect("no panic");
-    let err = out.expect_err("a dropped fallback is not Delivered");
-    assert!(
-        err.to_string()
-            .contains("link_shaping_bulk_fallback_interrupted"),
-        "{err}"
     );
 }
 
@@ -1080,7 +1013,7 @@ async fn a_link_over_the_node_cap_is_shaped_at_its_share() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_crosses() {
     let _host = share_host().await;
-    let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, true);
     full.share = ShapedSharePolicy::BoundedWithFloor {
         max_links: 0,
         floor_bytes_per_s: 100_000,
@@ -1153,6 +1086,96 @@ async fn at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_cro
         0,
         "still nothing shaped at A"
     );
+}
+
+/// **`CLM-shaped-link-bound-refuse`, CIRISEdge#952** — eight shaped links do not
+/// stop new connections. A is at its bound and is neither shaped-only nor in
+/// the anonymous tier: B's row link stays up unshaped at BOTH ends, the row
+/// crosses, and the next one rides the same link with no second offer. Two ends
+/// that disagree would close on the first frame of the wrong kind. Mutation:
+/// refuse past the bound regardless → this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_the_bound_a_ninth_shaping_peer_runs_unshaped_and_its_rows_move() {
+    let _host = share_host().await;
+    let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    full.share = ShapedSharePolicy::BoundedWithFloor {
+        max_links: 0,
+        floor_bytes_per_s: 100_000,
+    };
+    let t = duo(
+        "ninth",
+        full,
+        policy(BudgetClass::Server, 100_000, 0.5, 10, false),
+    )
+    .await;
+    let row = typed_payload("AttestationGossip", b"NINTH-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("the ninth link runs");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "the row crossed: {:?}",
+        t.a.metrics.link_shaping()
+    );
+    assert_eq!(t.a.shaping("link_shaping_unshaped:past_bound"), 1);
+    assert_eq!(t.a.shaping("link_shaping_home_elsewhere"), 0);
+    assert_eq!(t.b.shaping("link_shaping_home_elsewhere"), 0);
+    assert_eq!(t.a.transport.shaped_link_count(), 0, "unshaped at A");
+    assert_eq!(t.b.transport.shaped_link_count(), 0, "and at B");
+    let next = typed_payload("AttestationGossip", b"NINTH-NEXT-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &next)
+        .await
+        .expect("the next row rides the same link");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&next).await
+        })
+        .await
+    );
+    assert_eq!(
+        t.a.shaping("link_shaping_unshaped:past_bound"),
+        1,
+        "one link, one answer"
+    );
+}
+
+/// A dialler past its OWN bound offers nothing, so the peer never starts a
+/// shaper alone. Mutation: offer past the bound → the views disagree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn past_its_own_bound_a_dialler_offers_nothing_and_both_ends_agree() {
+    let _host = share_host().await;
+    let mut full = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    full.share = ShapedSharePolicy::BoundedWithFloor {
+        max_links: 0,
+        floor_bytes_per_s: 100_000,
+    };
+    let t = duo(
+        "ownbound",
+        policy(BudgetClass::Server, 100_000, 0.5, 10, false),
+        full,
+    )
+    .await;
+    let row = typed_payload("AttestationGossip", b"OWN-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B, past its bound, still connects");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await
+    );
+    assert_eq!(t.b.shaping("link_shaping_unshaped:past_bound"), 1);
+    assert_eq!(t.b.shaping("link_shaping_offered"), 0);
+    assert_eq!(t.a.shaping("link_shaping_offered"), 0);
+    assert_eq!(t.a.transport.shaped_link_count(), 0);
+    assert_eq!(t.b.transport.shaped_link_count(), 0);
 }
 
 /// A peer whose class is Off is not a shaping peer: at A's bound its row
@@ -1587,10 +1610,13 @@ async fn referral_pair(
     );
     let mut tasks = Vec::new();
     let all = vec![r_record.clone(), w_record.clone(), p_record.clone()];
+    // Referrals close the link only on a node that refuses (CIRISEdge#952).
+    let mut refuser = roomy(1);
+    refuser.require_shaped_links = true;
     let (r, r_port) = start_node(
         tmp.path(),
         r_key,
-        roomy(1),
+        refuser,
         DeviceState::of(DeviceKind::Server),
         all.clone(),
         Vec::new(),
@@ -1845,6 +1871,52 @@ async fn a_phone_that_loses_wifi_stops_being_referred_on_the_next_report() {
     assert_eq!(t.r.shaping("link_shaping_referral_sent"), 0);
 }
 
+/// CC 5.4.6 rc17 `CLM-referred-peer-is-proxy` — **a node that turns on the
+/// Anonymous Tier stops being referred on its next report**: it holds the
+/// anonymous identity alone and proxies nothing, so its free slots go to zero
+/// with the link still up, and a refused peer gets no referral to it. The
+/// opt-in alone does it: the tier need not be available. Mutation: drop the
+/// opt-in from `relay_offering` → W keeps its slots and is referred.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_onion_enabled_node_reports_no_capacity_and_is_never_referred() {
+    let _host = share_host().await;
+    let mut t = referral_pair(
+        "anon",
+        0x7a,
+        DeviceState::of(DeviceKind::Server),
+        None,
+        false,
+    )
+    .await;
+    assert!(t.r.transport.peer_free_slots(&t.w.key.key_id) > Some(0));
+    t.w.transport
+        .onion()
+        .set_policy(ciris_edge::onion::policy::OnionPolicy {
+            enabled: true,
+            ..ciris_edge::onion::policy::OnionPolicy::default()
+        });
+    t.w.transport.onion_refresh();
+    assert!(!t.w.transport.onion().relay_offering());
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.r.transport.peer_free_slots(&t.w.key.key_id) == Some(0)
+        })
+        .await
+    );
+    assert_eq!(t.r.transport.shaped_link_count(), 1, "the link stayed up");
+    let p = refused_peer(&mut t).await;
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            p.shaping("link_shaping_referral_exhausted") == 1
+        })
+        .await,
+        "{:?}",
+        p.metrics.link_shaping()
+    );
+    assert_eq!(t.r.shaping("link_shaping_referral_sent"), 0);
+    assert!(p.transport.homed_on_referrals().is_empty());
+}
+
 /// **A homed node is really used.** Edge registers the node P homed on as a
 /// replication peer on the bootstrap planes by itself: no host adds it, and a
 /// host's later peer set does not drop it. A key record P can have from nowhere
@@ -1983,65 +2055,6 @@ async fn wifi_only_shaping_renegotiates_to_off_on_cellular_and_back() {
     assert_eq!(t.b.transport.shaped_link_count(), 1, "restored");
 }
 
-/// E3 — **a row behind a file is not starved.** A 1 MiB message rides the slow
-/// path, and a row sent after it has begun overtakes it: the file feeds the
-/// queue a few frames at a time. Mutation: feed by the queue's whole room → the
-/// row waits behind the file and arrives after it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_row_behind_a_slow_path_file_overtakes_it() {
-    let _host = share_host().await;
-    let server = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
-    let t = Arc::new(duo("rowsfirst", server.clone(), server).await);
-    let opener = typed_payload("AttestationGossip", b"RF-OPEN-", 2_000);
-    t.b.transport
-        .send(&t.a.key.key_id, &opener)
-        .await
-        .expect("B dials A: the shaped link");
-    assert!(
-        wait_until(Duration::from_secs(30), || async {
-            t.a.received(&opener).await
-        })
-        .await
-    );
-    t.a.transport.refuse_outbound_dials_for_test(true);
-    let file = typed_payload("AttestationGossip", b"RF-FILE-", 1 << 20);
-    let sender = Arc::clone(&t);
-    let body = file.clone();
-    let sending = tokio::spawn(async move {
-        let to = sender.b.key.key_id.clone();
-        sender.a.transport.send(&to, &body).await
-    });
-    assert!(
-        wait_until(Duration::from_secs(30), || async {
-            t.a.shaping("link_shaping_bulk_on_shaped_fallback") == 1
-        })
-        .await,
-        "the file is on the slow path"
-    );
-    let row = typed_payload("AttestationGossip", b"RF-ROW-", 2_000);
-    t.a.transport
-        .send(&t.b.key.key_id, &row)
-        .await
-        .expect("the row is not held behind the file");
-    assert!(
-        wait_until(Duration::from_secs(60), || async {
-            t.b.received(&row).await
-        })
-        .await
-    );
-    assert!(!t.b.received(&file).await, "the row overtook the file");
-    sending
-        .await
-        .expect("no panic")
-        .expect("the file completes");
-    assert!(
-        wait_until(Duration::from_secs(120), || async {
-            t.b.received(&file).await
-        })
-        .await
-    );
-}
-
 /// E10 — **a node that chose not to be listed is never referred.** W is owned,
 /// offers relay and has free slots, and its owner binding is at `self` scope: it
 /// has not announced, so R names nobody. Mutation: drop the binding test → R
@@ -2131,6 +2144,17 @@ struct Star {
 }
 
 async fn star(tag: &str, seed: u8, spokes: usize) -> Star {
+    star_of(tag, seed, spokes, roomy(8)).await
+}
+
+/// [`star`], with a shaped-only hub: the one that refuses (CIRISEdge#952).
+async fn star_shaped_only(tag: &str, seed: u8, spokes: usize) -> Star {
+    let mut hub = roomy(8);
+    hub.require_shaped_links = true;
+    star_of(tag, seed, spokes, hub).await
+}
+
+async fn star_of(tag: &str, seed: u8, spokes: usize, hub: ShapingPolicy) -> Star {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let r_key = Ident::new(&format!("node-r-{tag}"), seed).await;
@@ -2150,7 +2174,7 @@ async fn star(tag: &str, seed: u8, spokes: usize) -> Star {
     let (r, r_port) = start_node(
         tmp.path(),
         r_key,
-        roomy(8),
+        hub,
         DeviceState::of(DeviceKind::Server),
         records.clone(),
         Vec::new(),
@@ -2221,7 +2245,7 @@ async fn shape_to(r: &Node, n: &Node, marker: &[u8]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e15_tier_one_refuses_a_stranger_with_a_referral_and_admits_the_protected() {
     let _host = share_host().await;
-    let t = star("t1", 0x90, 4).await;
+    let t = star_shaped_only("t1", 0x90, 4).await;
     let Star {
         r,
         spokes,
@@ -2295,6 +2319,42 @@ async fn e15_tier_one_refuses_a_stranger_with_a_referral_and_admits_the_protecte
     assert!(!r.received(&row).await, "the refused row stayed off");
 }
 
+/// **Admit-close stops a slot, not a connection** (CIRISEdge#952). At tier 1 a
+/// node that did not opt in to refusing answers a stranger `off`, with its
+/// referrals as a hint, and the link stays up unshaped at both ends: a load
+/// tier is no more a reason to drop a dialler than eight shaped links are.
+/// Mutation: refuse at tier 1 regardless → this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e15_tier_one_keeps_a_strangers_link_unshaped_on_a_node_that_did_not_opt_in() {
+    let _host = share_host().await;
+    let t = star("t1soft", 0xc0, 1).await;
+    let Star {
+        r,
+        spokes,
+        _tmp,
+        _tasks,
+    } = t;
+    let [stranger] = <[Node; 1]>::try_from(spokes).ok().expect("one");
+    read_obligations(&r, &[]);
+    r.transport
+        .set_service_tier(ciris_edge::ServiceTier::AudioAndFiles);
+    let row = typed_payload("AttestationGossip", b"T1SOFT-ROW-", 2_000);
+    stranger
+        .transport
+        .send(&r.key.key_id, &row)
+        .await
+        .expect("the link stands, unshaped");
+    assert!(
+        wait_until(Duration::from_secs(30), || async { r.received(&row).await }).await,
+        "the row crossed: {:?}",
+        r.metrics.link_shaping()
+    );
+    assert_eq!(r.shaping("load_refuse:admit_closed"), 1, "no slot, by name");
+    assert_eq!(r.shaping("link_shaping_home_elsewhere"), 0);
+    assert_eq!(r.transport.shaped_link_count(), 0);
+    assert_eq!(stranger.transport.shaped_link_count(), 0);
+}
+
 /// **Tier 2 on real links.** Two strangers' links close newest first, one step
 /// at a time. The owner's device, a seat and a link R dialled stand, and their
 /// rows cross at the unchanged real budget, cover running at the unchanged
@@ -2320,7 +2380,7 @@ async fn e15_tier_two_closes_strangers_newest_first_and_never_the_protected() {
 /// not a redial. A link gone with nothing counting it panics.
 #[allow(clippy::too_many_lines)] // one tier's whole story, in order
 async fn tier_two_story(tag: &str, seed: u8) -> bool {
-    let t = star(tag, seed, 5).await;
+    let t = star_shaped_only(tag, seed, 5).await;
     let Star {
         r,
         spokes,
@@ -2478,122 +2538,6 @@ async fn tier_two_story(tag: &str, seed: u8) -> bool {
     true
 }
 
-/// **The slow path is bulk** (§6.12): a transfer to a non-owner peer stops at
-/// tier 2 where it stands, a row passes, and tier 1 finishes the same transfer
-/// without restarting it; a new one is told to retry and holds nothing. A file
-/// to the owner's device keeps moving. Mutation: `slow_path_paused` false →
-/// the first half fails; pause the owner's devices too → the second does.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e15_tier_two_pauses_the_slow_path_for_a_non_owner_and_not_for_the_owner() {
-    let _host = share_host().await;
-    let t = star("sp", 0xb0, 2).await;
-    let Star {
-        r,
-        spokes,
-        _tmp,
-        _tasks,
-    } = t;
-    let [seat, device] = <[Node; 2]>::try_from(spokes).ok().expect("two");
-    read_obligations(&r, &[seat.key.key_id.as_str()]);
-    own_nodes(
-        &r,
-        0xbf,
-        &[r.key.key_id.as_str(), device.key.key_id.as_str()],
-    )
-    .await;
-    shape_to(&r, &seat, b"SP-SEAT-").await;
-    shape_to(&r, &device, b"SP-DEVICE-").await;
-    r.transport.refuse_outbound_dials_for_test(true);
-
-    let sender = Arc::clone(&r.transport);
-    let to = seat.key.key_id.clone();
-    let deliver = typed_payload("AttestationGossip", b"SP-DELIVER-", 1 << 20);
-    let wire = deliver.clone();
-    let send = tokio::spawn(async move { sender.send(&to, &wire).await });
-    assert!(
-        wait_until(Duration::from_secs(30), || async {
-            r.shaping("link_shaping_bulk_on_shaped_fallback") == 1
-                && r.shaping("link_shaping_frames_real") >= 8
-        })
-        .await,
-        "under way: {:?}",
-        r.metrics.link_shaping()
-    );
-    r.transport
-        .set_service_tier(ciris_edge::ServiceTier::ChatAndContacts);
-    assert!(
-        wait_until(Duration::from_secs(10), || async {
-            r.shaping("load_shed:bulk") == 1
-        })
-        .await,
-        "{:?}",
-        r.metrics.link_shaping()
-    );
-    // What was queued drains; then only rows and reports move.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let frames = r.shaping("link_shaping_frames_real");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(
-        r.shaping("link_shaping_frames_real") <= frames + 1,
-        "the transfer stopped: {} then {}",
-        frames,
-        r.shaping("link_shaping_frames_real")
-    );
-    assert!(!send.is_finished(), "paused, not failed");
-
-    let row = typed_payload("AttestationGossip", b"SP-ROW-", 2_000);
-    r.transport
-        .send(&seat.key.key_id, &row)
-        .await
-        .expect("the row does not wait for the file");
-    assert!(
-        wait_until(Duration::from_secs(30), || async {
-            seat.received(&row).await
-        })
-        .await
-    );
-
-    let second = typed_payload("AttestationGossip", b"SP-SECOND-", 1 << 20);
-    let err = r
-        .transport
-        .send(&seat.key.key_id, &second)
-        .await
-        .expect_err("a new transfer waits for a retry");
-    assert!(err.to_string().contains("load_shed:bulk"), "{err}");
-
-    // The owner's device: the same size at the same tier.
-    let own = typed_payload("AttestationGossip", b"SP-OWN-", 256 << 10);
-    r.transport
-        .send(&device.key.key_id, &own)
-        .await
-        .expect("a file to the owner's device runs at tier 2");
-    assert!(
-        wait_until(Duration::from_secs(60), || async {
-            device.received(&own).await
-        })
-        .await
-    );
-
-    r.transport
-        .set_service_tier(ciris_edge::ServiceTier::AudioAndFiles);
-    tokio::time::timeout(Duration::from_secs(120), send)
-        .await
-        .expect("the transfer resumes")
-        .expect("no panic")
-        .expect("delivered");
-    assert!(
-        wait_until(Duration::from_secs(60), || async {
-            seat.received(&deliver).await
-        })
-        .await
-    );
-    assert_eq!(
-        r.shaping("link_shaping_bulk_on_shaped_fallback"),
-        2,
-        "one start each: the paused transfer never restarted"
-    );
-}
-
 /// **Through `Edge`, the way the server drives it** (E8, E15): `Edge::build`
 /// wires the read, `set_load_pressure` moves the tier, and `shaping_status`
 /// reads what is true at that moment, the zero slots with a free bound, and
@@ -2601,7 +2545,7 @@ async fn e15_tier_two_pauses_the_slow_path_for_a_non_owner_and_not_for_the_owner
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e8_e15_status_and_shed_through_edge_track_the_load_pressure() {
     let _host = share_host().await;
-    let t = star("edge", 0xc0, 1).await;
+    let t = star_shaped_only("edge", 0xc0, 1).await;
     let Star {
         r,
         spokes,
@@ -2788,7 +2732,8 @@ async fn e8_the_status_tracks_the_bound_the_class_and_the_peers() {
     );
 }
 
-/// E8, the peer side: a peer that answers `off` is on record as not shaping.
+/// E8, the peer side: a peer that answers `off`, an old one now, is on record as
+/// not shaping.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e8_a_peer_that_answers_off_is_on_record_as_not_shaping() {
     let _host = share_host().await;
@@ -2798,6 +2743,7 @@ async fn e8_a_peer_that_answers_off_is_on_record_as_not_shaping() {
         explicit_off(),
     )
     .await;
+    t.b.transport.answer_off_like_an_old_peer_for_test();
     assert_eq!(t.a.transport.peer_shaping(&t.b.key.key_id).shapes, None);
     let row = typed_payload("AttestationGossip", b"OFFPEER-", 2_000);
     t.a.transport

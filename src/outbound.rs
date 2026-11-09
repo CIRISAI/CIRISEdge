@@ -699,7 +699,7 @@ async fn dispatch_one(
                 // The peer's proof did not verify against the key held for it.
                 TransportError::LinkProofRefused { .. } => "link_proof_refused",
             };
-            if let Some(t) = reachability {
+            if let (Some(t), true) = (reachability, counts_against_reachability(&e)) {
                 t.record_attempt(
                     &row.destination_key_id,
                     transport.id(),
@@ -727,6 +727,17 @@ async fn dispatch_one(
             }
         }
     }
+}
+
+/// `CLM-shaped-link-bound-refuse` — whether a failed send says anything about
+/// the peer being reachable. A shaped-only peer at its bound answered, and said
+/// no by choice: it is not dead, and the row retries on its schedule.
+fn counts_against_reachability(e: &TransportError) -> bool {
+    !matches!(
+        e,
+        TransportError::LinkSealRefused { reason, .. }
+            if *reason == crate::observability::LINK_SHAPING_HOME_ELSEWHERE
+    )
 }
 
 /// Per-row transport preference for the durable dispatcher (the
@@ -953,5 +964,31 @@ mod resident_depth_tests {
         );
         let sparse = HashMap::from([(OutboundStatus::AwaitingAck, 1)]);
         assert_eq!(resident_depth(&sparse), 1, "missing statuses are 0");
+    }
+}
+
+#[cfg(test)]
+mod reachability_of_a_refusal {
+    use super::*;
+
+    fn refused(reason: &'static str) -> TransportError {
+        TransportError::LinkSealRefused {
+            peer: "p".to_owned(),
+            reason,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_peers_refusal_by_choice_is_not_a_failed_attempt() {
+        assert!(!counts_against_reachability(&refused(
+            crate::observability::LINK_SHAPING_HOME_ELSEWHERE
+        )));
+        assert!(counts_against_reachability(&refused(
+            "link_seal_refused_no_pair"
+        )));
+        assert!(counts_against_reachability(&TransportError::Timeout(
+            std::time::Duration::from_secs(1)
+        )));
     }
 }

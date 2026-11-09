@@ -92,13 +92,14 @@ pub async fn active_seat_roster<S: std::hash::BuildHasher + Sync>(
 ) -> Result<HashSet<String>, ciris_persist::federation::Error> {
     let mut roster: HashSet<String> = bundle.iter().cloned().collect();
     for spelling in CANONICAL_SPELLINGS {
-        roster.extend(
-            directory
-                .list_keys_by_identity_type(spelling)
-                .await?
-                .into_iter()
-                .map(|r| r.key_id),
-        );
+        match directory.list_keys_by_identity_type(spelling).await {
+            Ok(keys) => roster.extend(keys.into_iter().map(|r| r.key_id)),
+            // A PyO3 host's directory capsule routes this read for the accord
+            // set only. The bundle still stands, and withdrawals below still
+            // apply: a conferral since genesis is what such a host can't see.
+            Err(ciris_persist::federation::Error::Unsupported { .. }) => break,
+            Err(e) => return Err(e),
+        }
     }
     for withdrawn in directory.list_canonical_withdrawals().await? {
         roster.remove(&withdrawn.key_id);
@@ -271,5 +272,31 @@ impl PeerObligations for LivePeerObligations {
             );
             PeerObligation::Unresolved
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::active_seat_roster;
+    use ciris_persist::federation::directory_double::FaultInjectingDirectory;
+    use ciris_persist::federation::FederationDirectory;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    /// A PyO3 host's directory capsule refuses `list_keys_by_identity_type`
+    /// for anything but the accord set. The roster still reads: the bundle's
+    /// seats stand, instead of the whole read failing and no seat ever being
+    /// known.
+    #[tokio::test]
+    async fn a_host_whose_directory_lists_no_roles_still_has_the_bundle_seats() {
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
+        let inner: Arc<dyn FederationDirectory> = backend;
+        let capsule_like: Arc<dyn FederationDirectory> =
+            Arc::new(FaultInjectingDirectory::new(inner).unsupported("list_keys_by_identity_type"));
+        let bundle: HashSet<String> = ["seat-a", "seat-b"].map(str::to_owned).into();
+        let roster = active_seat_roster(&*capsule_like, &bundle)
+            .await
+            .expect("an unsupported role listing is not a failed roster");
+        assert_eq!(roster, bundle);
     }
 }

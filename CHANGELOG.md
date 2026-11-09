@@ -2,7 +2,84 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
-## 44.0.0 — 2026-11-05
+## 44.1.0 — 2026-11-08
+
+The onion relay's replay set is a bounded hold (CIRISEdge#955, CC 5.3.3.5 E1 rule 9). It holds at
+most `REPLAY_BOUND` = 62,134 tags a period: the `seat` rate on the node cap's eight shaped links,
+264,000 B/s, over the 3,600 s period, divided by the 15,296-byte packet. With the last period's tags
+that is under 8.3 MiB. Past the bound a new packet is refused as `onion_replay_set_full`, counted
+like the other onion refusals; no held tag is evicted, and a replay of a held tag is still
+`onion_replay`. The bound is fixed, not a lever. A source witness pins that an onion frame reaches
+`accept_inbound` only on a link that keyed behind `ReceiverOrder::admit`, and `accept_inbound`'s
+`link_shaped` is documented as the transport's own shaping state.
+
+A node that turned on the Anonymous Tier no longer offers relay (CC 5.4.6 rc17,
+`CLM-referred-peer-is-proxy`): `relay_offering` is false while `OnionPolicy::enabled` holds, so it
+reports no free shaped slots and is never referred as a proxy. It still relays onion packets.
+
+The process loads one tokio and one sqlite: on a PyO3 host, edge's calls run inside a runtime edge
+owns, so edge's copy of persist code never reaches a runtime persist's .so built (a linux + postgres
+SIGSEGV), and a source-built edge on Linux binds persist's bundled sqlite (CIRISEdge#50).
+
+The weekly bench mesh's A/V legs ride direct links, as production's do: the harness configures direct
+links with the relay as facilitator, cuts the stream to the leg's budget, paces it, and dials a late
+joiner beside the stream. No leg's assertion changed.
+
+The threat model and README are regenerated for the 44.x line (CIRISEdge#956).
+
+A call in a room whose MLS leaves are persons is joined through their nodes. The server mints room
+keys as the owner, so no node was a leaf and `join_call` refused every node as `NotARoomMember`. A
+call's members are now the room's leaves with each person replaced by the nodes it owns, by
+persist's owner binding (`nodes_owned_by`/`owner_of`, `CallDeps::owners`); the join, inbound links,
+stream key bindings, ALM and the roll all read that set. A node whose owner is not a leaf, or that
+acts for an attendee it is not bound to, is refused; removing a person ends their nodes' part at the
+next epoch. Rooms whose leaves are nodes work as before.
+
+A call's addresses no longer equal its room's. They were derived from the room's own destination
+secret for the same members at the same epoch, so a node that had installed the room's addresses
+refused the call as `address collision … reused exporter_secret?`. A call now derives them from
+`call_destination_secret` (HKDF over the room's destination secret with `ciris-edge:call-destination:v1`
+and the call's group id). Every member of a call must run this release: a call address changed.
+
+
+What moves to a peer (CC 5.2): a row moves when it is requested, or required, and appropriate, never
+because it is federation-tier. Two serve seats keep the commons walk; every other peer starts with
+what is required, and of the walk is offered only what is required or appropriate and live. The rest
+waits on the peer's pull. `SERVE_ADVERTISE_POLICY_HASH` is 14aedf25…; `advertise_awaits_request` is
+new.
+
+Adopts leviculum 0.34.0+ciris.1. The Resource window is `ByMedium`, radio included. Direct-link
+`Glare`, `InterfaceLost`, `HeldTooLong` and `PeerFellBack` have retries and labels, and a frame over
+the Channel limit is named, not a dead link. The load tier leaves forwarding alone and the host gets
+leased shed levers. Every node can shape on a direct link, a shaped link is one direct hop, eight
+shaped links do not stop new connections, and a failed bulk dial refuses by name.
+
+A peer that is neither a seat nor its owner's no longer walks the plane: it reads new rows from the
+tip, and history at one full page a minute. This node's own invitations and their answers are required
+reads. `chat::pair_proposal_for` reads the room's index; `membership::pending_proposal_in` is new.
+A third party's invitation relayed here, of any age, is in the invitee's first offer: the required
+read takes the `membership:proposal:v1` rows naming each of the peer's principals by persist's
+subject read (`list_attestations_naming_by_dimension`, persist 61.0.5 #1225, pinned by rev
+3a9456bf until the tag), newest first from the head each round, at most 256 rows a round, and every
+row still crosses the serve gate. Before, it waited on the history page, up to 52 minutes on 52k rows.
+
+**Server must:** mirror the policy hash; take the `no_route` outcome and `RoundEvent::NoRoute`; set
+`ReplicationRuntimeConfig::recognised_seats` from `Edge::recognised_seats()` on a Rust host; build its
+shaping policy with `ShapingPolicy::for_device`; pull the leased levers (`pull_shed_lever`).
+
+Every step of a late subject Pull gets the late window, so a Deliver behind a late Summary is kept.
+The retired-plane line logs at debug at the hot-add door. Test fixes and the 44.0.0 notes date.
+`anti-entropy round ended` carries `outcome` and `error`; a failing round says why at INFO, once per
+(peer, kind) in five minutes.
+`replication_round_outcomes_total` gains `no_route`. A new peer's first Attestation round waits for
+the peer to confirm the bootstrap planes, at most five seconds, so a contact no longer loses a round
+timeout to attribution.
+A round lost after listing puts the watermark back, at most three times running, so its rows are in
+the next round and not the re-sweep.
+On a PyO3 host a blob serve no longer holds the inbound loop: replication is routed in place, other
+frames run on their own task, and two chunk serves run at once.
+
+## 44.0.0 — 2026-11-06
 
 Long-term support line. Pins persist 61.0.4, verify 22.0.0, leviculum 0.33.0+ciris.1. Coordinated
 cut: a v43.x peer cannot interoperate.

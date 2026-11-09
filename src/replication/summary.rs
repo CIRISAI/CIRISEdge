@@ -332,6 +332,10 @@ pub trait StateProvider: Send + Sync {
         false
     }
 
+    /// The round this provider's listing went into ended, `lost` when it did
+    /// not complete: what was listed has not been delivered.
+    fn round_ended(&self, _kind: EnvelopeKind, _lost: bool) {}
+
     /// Return the byte-exact signed envelope for the given content
     /// hash, or `None` if the envelope isn't in local state. Called
     /// during the Deliver-message construction step.

@@ -509,6 +509,71 @@ impl<F: ciris_persist::federation::FederationDirectory + ?Sized> RoomRoster for 
     }
 }
 
+/// **Who a room's leaves call through** (44.1): the owner binding between a
+/// node and the person it serves, as persist resolves it. A room's MLS leaves
+/// may be nodes (each node is its own leaf) or persons (the server mints room
+/// key material as the owner, so no node is a leaf). A call is carried by
+/// nodes, so each person leaf is expanded to the nodes it is the single live
+/// owner of. Persist builds `nodes_owned_by` from `owner_of`
+/// (`n ∈ nodes_owned_by(P) ⟺ owner_of(n) == P`, an ambiguous owner is
+/// skipped), so a node is a call member only through a verified binding,
+/// never through a claim on the wire.
+#[async_trait::async_trait]
+pub trait CallOwners: Send + Sync {
+    /// The single live owner of `node`, if any (an ambiguous or unreadable
+    /// owner is `None`: fail closed).
+    async fn owner_of(&self, node: &str) -> Option<String>;
+
+    /// Every node `person` is the single live owner of.
+    ///
+    /// # Errors
+    /// The directory could not be read.
+    async fn nodes_owned_by(&self, person: &str) -> Result<Vec<String>, String>;
+}
+
+#[async_trait::async_trait]
+impl<F: ciris_persist::federation::FederationDirectory + ?Sized> CallOwners for F {
+    async fn owner_of(&self, node: &str) -> Option<String> {
+        ciris_persist::federation::admission::owner_of(self, node)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn nodes_owned_by(&self, person: &str) -> Result<Vec<String>, String> {
+        ciris_persist::federation::admission::nodes_owned_by(self, person)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// **The call's members**: the room's leaves, each person leaf replaced by
+/// the nodes it owns (in leaf order, deduplicated). A leaf that owns no node
+/// is a node (or a person with no bound node yet) and stands as itself. Every
+/// membership check of the call reads this set: the join, the inbound link,
+/// a stream key binding's publisher, the ALM roster, the roll's departures.
+async fn call_members(leaves: &[String], owners: &dyn CallOwners) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        let nodes = owners
+            .nodes_owned_by(leaf)
+            .await
+            .map_err(|e| format!("the nodes of {leaf}: {e}"))?;
+        if nodes.is_empty() {
+            if !out.contains(leaf) {
+                out.push(leaf.clone());
+            }
+            continue;
+        }
+        for n in nodes {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ─── the call row (item 6: a call is an attestation of its attendees) ──
 
 /// Who attended a call, as its rows say (`chat::CALL_DIMENSION`).
@@ -694,6 +759,9 @@ pub struct CallDeps {
     pub room_group: CohortGroup,
     /// persist's roster.
     pub roster: Arc<dyn RoomRoster>,
+    /// The owner bindings that carry a person leaf's call on its nodes
+    /// (persist's directory).
+    pub owners: Arc<dyn CallOwners>,
     /// The Reticulum transport.
     pub transport: Arc<ReticulumTransport>,
     /// The addressing lifecycle the transport listens through.
@@ -1112,6 +1180,11 @@ struct Shared {
     in_links: StdMutex<HashMap<[u8; 16], String>>,
     policies: StdMutex<HashMap<String, ReceiverLayerPolicy>>,
     members: StdMutex<Vec<String>>,
+    /// The leaves [`call_members`] last resolved, and what they resolved to:
+    /// a binding re-reads the owner bindings only when the leaves moved.
+    resolved: StdMutex<(Vec<String>, Vec<String>)>,
+    /// The owner bindings a person leaf's nodes are members through.
+    owners: Arc<dyn CallOwners>,
     heard_tx: mpsc::Sender<Heard>,
     events_tx: mpsc::Sender<CallEvent>,
     state: StdMutex<CallState>,
@@ -1315,6 +1388,7 @@ impl Call {
         let CallDeps {
             room_group,
             roster,
+            owners,
             transport,
             lifecycle,
             registrar,
@@ -1334,7 +1408,15 @@ impl Call {
         let attendee = record
             .as_ref()
             .map_or_else(|| own_key_id.to_owned(), |r| r.attendee().to_owned());
-        let members = admit(room, own_key_id, &attendee, &room_group, roster.as_ref()).await?;
+        let (leaves_at_join, members) = admit(
+            room,
+            own_key_id,
+            &attendee,
+            &room_group,
+            roster.as_ref(),
+            owners.as_ref(),
+        )
+        .await?;
         let id = call_id_for_room(room);
         let group_id = call_group_id(id);
         let scope = CohortScope::Cohort {
@@ -1386,7 +1468,9 @@ impl Call {
             backoff: StdMutex::new(HashMap::new()),
             in_links: StdMutex::new(HashMap::new()),
             policies: StdMutex::new(HashMap::new()),
-            members: StdMutex::new(members),
+            members: StdMutex::new(members.clone()),
+            resolved: StdMutex::new((leaves_at_join, members)),
+            owners,
             heard_tx,
             events_tx,
             state: StdMutex::new(CallState::Live),
@@ -1876,26 +1960,59 @@ impl Call {
     }
 }
 
-/// §3.3 — joining is presence, not admission: `own_key_id` must be in the
-/// room's MLS group and on persist's active roster. Returns the group's
-/// members.
+/// §3.3 — joining is presence, not admission: `own_key_id` must be a call
+/// member ([`call_members`]: a leaf of the room's MLS group itself, or a node
+/// whose verified owner is one), the attendee it acts for must be itself or
+/// that owner (a node acts only for its own owner), and the room member it
+/// is in the room as must be on persist's active roster. Returns the room's
+/// leaves and the call's members.
 async fn admit(
     room: &str,
     own_key_id: &str,
     attendee: &str,
     room_group: &CohortGroup,
     roster: &dyn RoomRoster,
-) -> Result<Vec<String>, CallError> {
-    let members = room_group.member_key_ids().await;
+    owners: &dyn CallOwners,
+) -> Result<(Vec<String>, Vec<String>), CallError> {
+    let not_member = |key_id: &str| CallError::NotARoomMember {
+        key_id: key_id.to_owned(),
+        room: room.to_owned(),
+    };
+    let leaves = room_group.member_key_ids().await;
+    let members =
+        call_members(&leaves, owners)
+            .await
+            .map_err(|detail| CallError::RoomGroupUnavailable {
+                room: room.to_owned(),
+                detail,
+            })?;
     if !members.iter().any(|m| m == own_key_id) {
-        return Err(CallError::NotARoomMember {
-            key_id: own_key_id.to_owned(),
-            room: room.to_owned(),
-        });
+        return Err(not_member(own_key_id));
     }
-    // The roster names the ATTENDEE (the room's member), the group the node.
+    let own_leaf = leaves.iter().any(|m| m == own_key_id);
+    // The owner is read only when it is needed, and only persist's binding
+    // answers it: an attendee is never taken at its word.
+    let owner = if own_leaf && attendee == own_key_id {
+        None
+    } else {
+        owners.owner_of(own_key_id).await
+    };
+    if !own_leaf && !owner.as_ref().is_some_and(|o| leaves.contains(o)) {
+        return Err(not_member(own_key_id));
+    }
+    if attendee != own_key_id && owner.as_deref() != Some(attendee) {
+        // The node would act for a person it is not bound to.
+        return Err(not_member(attendee));
+    }
+    // The roster names the room's member: the attendee, or (a node attending
+    // as itself in a room whose leaf is its owner) that owner.
+    let principal = if attendee == own_key_id && !own_leaf {
+        owner.as_deref().unwrap_or(attendee)
+    } else {
+        attendee
+    };
     let active = roster
-        .is_active_member(room, attendee)
+        .is_active_member(room, principal)
         .await
         .map_err(|detail| CallError::RoomGroupUnavailable {
             room: room.to_owned(),
@@ -1903,11 +2020,11 @@ async fn admit(
         })?;
     if !active {
         return Err(CallError::ConsentMissing {
-            key_id: attendee.to_owned(),
+            key_id: principal.to_owned(),
             room: room.to_owned(),
         });
     }
-    Ok(members)
+    Ok((leaves, members))
 }
 
 /// Mint this join's stream (a fresh nonce: a call never reuses a stream) and
@@ -1968,6 +2085,8 @@ fn leg_outcome(leg: LegSend) -> LegOutcome {
     }
 }
 
+/// The call's addressing snapshot: its members at the room's epoch, under
+/// the call's destination secret ([`crate::transport::av_call_key::call_destination_secret`]).
 async fn room_snapshot(
     room_group: &CohortGroup,
     group_id: &str,
@@ -1981,12 +2100,41 @@ async fn room_snapshot(
                 room: group_id.to_owned(),
                 detail: e.to_string(),
             })?;
+    // The call's own secret, never the room's: the room installs its
+    // addresses for the same members at the same epoch.
+    let destination_secret =
+        crate::transport::av_call_key::call_destination_secret(secret.as_bytes(), group_id)
+            .map_err(|e| CallError::Plumbing(format!("call destination secret: {e:?}")))?;
     Ok(ScopeGroupSnapshot {
         group_id: group_id.to_owned(),
         epoch: room_group.epoch().await,
         members: members.to_vec(),
-        destination_secret: *secret.as_bytes(),
+        destination_secret,
     })
+}
+
+/// The call's members at the room's CURRENT leaves (a binding may arrive
+/// before this node's roll): the last resolution while the leaves are
+/// unchanged, a fresh one when they moved. A failed read answers with the
+/// members the call last rolled to.
+async fn current_members(shared: &Shared) -> Vec<String> {
+    let leaves = shared.room_group.member_key_ids().await;
+    {
+        let memo = Shared::lock(&shared.resolved);
+        if memo.0 == leaves {
+            return memo.1.clone();
+        }
+    }
+    match call_members(&leaves, shared.owners.as_ref()).await {
+        Ok(members) => {
+            *Shared::lock(&shared.resolved) = (leaves, members.clone());
+            members
+        }
+        Err(detail) => {
+            tracing::warn!(room = %shared.room, %detail, "call: the members' owner bindings are unreadable");
+            Shared::lock(&shared.members).clone()
+        }
+    }
 }
 
 /// **The roll** (§3.2, A3): when the room's epoch moved, every live stream
@@ -2000,7 +2148,18 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     if room_epoch <= from {
         return Ok(());
     }
-    let members = shared.room_group.member_key_ids().await;
+    // The call's members at the new epoch, re-resolved: a removed person's
+    // nodes leave with them, and an owner binding withdrawn since the last
+    // epoch takes its node out. A read failure leaves the stream where it
+    // was, to roll on the next try.
+    let leaves = shared.room_group.member_key_ids().await;
+    let members = call_members(&leaves, shared.owners.as_ref())
+        .await
+        .map_err(|detail| CallError::RoomGroupUnavailable {
+            room: shared.room.clone(),
+            detail,
+        })?;
+    *Shared::lock(&shared.resolved) = (leaves, members.clone());
     if !members.iter().any(|m| *m == shared.own) {
         *Shared::lock(&shared.state) = CallState::Ended(EndCause::Revoked);
         shared.book_end("revoked");
@@ -2768,7 +2927,7 @@ async fn pump(
 /// (the hybrid check runs once per binding, never per chunk). A relay forwards
 /// a binding it heard first-hand from its publisher to every other leg.
 async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
-    let members = shared.room_group.member_key_ids().await;
+    let members = current_members(shared).await;
     let mut installed = false;
     let binding = match shared
         .auth

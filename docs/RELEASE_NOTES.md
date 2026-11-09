@@ -1,8 +1,129 @@
 # CIRISEdge Release Notes
 
+# v44.1.0 — what moves to a peer
+
+**2026-11-08.** **MINOR** on the LTS line. Pins persist **v61.0.5** (048f0993), CIRISVerify v22.0.0 and
+leviculum **v0.34.0+ciris.1** (cfe450ec). Python requires `ciris-persist>=61.0.5,<62`.
+
+**What server must do:**
+- Mirror `SERVE_ADVERTISE_POLICY_HASH` = `14aedf2590745dbac03b9f1f859085c43ead0ce0c67e46d10321d88257aded09`.
+- Take the `no_route` outcome in `replication_round_outcomes_total`, and handle `RoundEvent::NoRoute`
+  anywhere it matches exhaustively.
+- Set `ReplicationRuntimeConfig::recognised_seats` from `Edge::recognised_seats()` on a Rust host. The
+  PyO3 path sets it. Without it a node reads seats from the directory alone.
+- Build the shaping policy with `ShapingPolicy::for_device`.
+- Pull the leased levers (`pull_shed_lever`, `walk`, `page`, `bulk`). A lever left alone sits at 0.
+
+- **No walk in the read path.** A person-store fixture of 11k rows took 233 s to `keyed` in both
+  directions, and read the store 480 times.
+  - **The 233 s was the walk.** An invitation names its invitee only in `subject_key_ids`, which no
+    index reads, so it reached the peer when the peer's walk reached the tip, a page a round. This
+    node's own proposals, acceptances and declines are now required reads, by author.
+  - **A peer that is neither a seat nor its owner's has no walk.** It starts at the tip, 60 s back so
+    that a row written just before its link came up is a new row, and reads new rows from there.
+    History is one full page a minute (`history_page_every`), and a plane that fits one page reads as
+    before. Every row is still reached: a row older than the margin that no index reads, such as a
+    third party's invitation written while the peer was away, waits at most `rows / 1024` minutes.
+    Past its first round a contact costs one plane read a round, whatever the plane's size.
+  - **What names the reader moves at any age.** The required read takes grants, key grants and roster
+    events on their own pages, so a flood of rows naming a peer cannot push them off, reads a grant's
+    `withdraws` through the grant, and reads the record and roster events of each group the peer is in
+    when that set changes. A third party's `membership:proposal:v1` naming the reader, the one row no
+    `to(...)` read reaches, is read by subject through persist 61.0.5's
+    `list_attestations_naming_by_dimension`, newest first from the head every round within a 256-row
+    budget, so it moves on the first round at any age.
+  - **The 480 reads were mostly a scan.** `membership::pending_proposals_for` walks the plane, and a
+    host polling a pair room called it about 1.6 times a second. `chat::pair_proposal_for` now reads
+    the room's index through `membership::pending_proposal_in`. The inbox still scans: nothing
+    indexes a row by subject (a persist ask).
+- **One tokio and one sqlite per process.** On a PyO3 host edge's calls run inside a runtime edge
+  owns, so edge's copy of persist code never spawns on a runtime persist's `.so` built (a linux +
+  postgres SIGSEGV in every edge-runtime script, CIRISPersist#1231 for the root). A source-built edge
+  on Linux binds persist's bundled sqlite (CIRISEdge#50 class); a release wheel already shares it and
+  the preload is a no-op there.
+- **The onion relay's replay set is a bounded hold** (CIRISEdge#955, CC 5.3.3.5 E1 rule 9): at most
+  62,134 tags a period, under 8.3 MiB with the last period's; past it a packet is refused
+  `onion_replay_set_full`, never evicted. A node that turned on the Anonymous Tier offers no relay
+  and is never referred as a proxy (CC 5.4.6).
+- **The seat roster reads on a PyO3 host.** A directory capsule lists only the accord set, so the roster
+  read used to fail every 30 s; the bundle's seats now stand and withdrawals still apply.
+- **The wire vocabulary is v1.0.2** (CC rc17 db0d051): `WIRE_VOCABULARY_HASH` = `38bd4847…`, with
+  `GoalDeclaration` and `GoalRetirement` retired, as CC 3.1.9.7 already said.
+- **The weekly bench mesh's A/V legs ride direct links,** as production's do. The threat model and README
+  are regenerated for the 44.x line (CIRISEdge#956).
+- **leviculum 0.34.** The Resource window is `WindowPolicy::ByMedium`: `Adaptive` on TCP, UDP, Auto and
+  Local under 1 s round trip, `Current` everywhere else, decided per resource, so a radio hot-plugged
+  later stays `Current` and there is no radio exception. This ends the cliff past about 31 ms.
+  Direct-link `Glare` costs no doubling; `InterfaceLost`, `HeldTooLong` and `PeerFellBack` back off as
+  a failed attempt, with `direct_link_failed_glare`, `_interface_lost` and `_peer_fell_back` new and
+  `HeldTooLong` on `_held`. A send over the Channel limit reads `frame_over_channel_limit` and a
+  shaped frame over it is dropped by name (`link_shaping_frame_too_large`) with the link left up: it
+  used to close the link. Edge's upgrade guard stays, for pre-0.34 peers.
+- **The load tier leaves forwarding alone; the host gets leased levers** (`FSD/CIRIS_MESH.md` §7.7).
+  `ServiceTier::lever`'s `Bulk` → `Pause` and `Lever::Pause` are gone: nothing read them.
+- **Shaping.** Every node can shape on a direct link. A shaped link is one direct hop: a link a
+  forwarder carries is never offered shaping. Eight shaped links do not stop new connections: at the
+  bound a shaped-only or anonymous node refuses by name with referrals, and any other node runs the
+  link unshaped. A failed bulk dial refuses by name and never rides a shaped link.
+
+- **What moves to a peer (CC 5.2, `CLM-moves-requested-required-appropriate`).** A row moves when
+  it is requested, or required, and appropriate, never because it is federation-tier. Until now a
+  single `consent:replication` grant made a peer a mirror: every federation row passing the audience
+  gates was offered, oldest first, so a new contact was offered 11,662 rows (42 MB) and a fresh grant
+  at the tip was not held after five minutes.
+  - **Two seats** on the active roster keep the anti-entropy walk, unchanged.
+  - **Every other peer** starts with the required read, by index and ahead of any walk: the live
+    grants naming it, the rows addressed to it or its person, its own rows, and this node's
+    allegiance rows.
+  - **A contact, or a seat and a node that is not one,** is then offered of the walk only what is
+    required or appropriate and live: the family's own `Global` or capability tier, the accord family,
+    rows `may_receive` gives it as its own, about it or in its cohort, rows of a public group it
+    belongs to, what a stranger is handed, tombstones, a duty's appointments, a root's charter, and the
+    class a grant names, of this node's own rows.
+  - **Nothing else changed.** A person's own nodes are not contacts. The fetch twin and the subject
+    Pull are untouched: a row not offered, a superseded row included, moves on request. The key,
+    occurrence, route and revocation planes are the required set of CC 5.4.6 already and read their
+    own publish sets.
+  - **Pinned:** `SERVE_ADVERTISE_POLICY_HASH` = `14aedf2590745dbac03b9f1f859085c43ead0ce0c67e46d10321d88257aded09` (the Attestation `advertise` cell).
+    **CIRISServer must mirror this pin.** `advertise_awaits_request` counts the rows that wait.
+  - **`session:claim` is placed at its community.** Edge places none. A claim at `federation` is no
+    longer offered to a contact, and the placement is the emitter's to fix.
+- **A late subject Pull keeps its Deliver.** v44.0.0 gave an exchange one late wait, so a Deliver
+  behind a late Summary still got only the caller's wait and was dropped. Each step now gets
+  `PULL_LATE_WINDOW`. The caller's wait, the re-asks and the bound of 16 per peer and plane are
+  unchanged.
+- **A round that fails says why.** `anti-entropy round ended` carries `outcome` and `error`, and the
+  no-route, coordinator and closed-inbound paths log at INFO, at most once per `(peer, kind)` in five
+  minutes. `replication_round_outcomes_total` gains `no_route`: an offline client is no longer booked
+  as `error`. Rounds behave as before.
+- **A new peer's first Attestation round is not lost to attribution.** It left with the bootstrap
+  planes, the peer dropped frames it could not attribute until A's route row landed, and A sat out
+  the round timeout: 11 s of contact on the rig. The round now waits until the peer's empty `Diff`
+  says it lacks nothing on Key, IdentityOccurrence and TransportDestination, asked in that order,
+  for at most five seconds. A round's end was not enough: the peer had refused the route for a key
+  still landing. The round timeout is unchanged. Only a peer added while the scheduler runs is held,
+  so a restart's peer list never is, and at most eight at once; a plane is asked again when its round
+  ends, on a doubling wait, through the round gate.
+- **A blob serve does not hold the inbound loop.** `spawn_background_listeners` awaited dispatch in
+  the loop, so on a PyO3 host one chunk serve, 9.7 s on a real run, held every frame behind it. A
+  replication frame is routed in the loop, in arrival order, so a `(peer, plane)` never reorders.
+  Everything else runs on its own task, as `Edge::run` always did, at most 256 at once, and past that
+  a frame is dropped and counted. Two chunk serves run at once. `edge.blob_chunk_fetch.link` names
+  the link a scoped fetch rides, after the lease.
+- **A lost round's rows are in the next round.** The watermark moved when a round listed, so a round
+  lost after that left its rows behind it until the re-sweep came round. A round that does not
+  complete now puts the watermark back and the next round lists them again, at most three times
+  running, so a peer that always fails cannot pin a walk on one page. The required rows of CC 5.2 are
+  listed every round either way.
+- **The retired-plane line logs at debug at the hot-add door,** which a host's reconcile can reach
+  on every pass. Nothing was scheduled either way.
+- **Tests.** The superseded-binding witness injects a binding newer than the announce it outranks,
+  and C announces on every run. The direct-links transport fixture redraws a port taken before its
+  bind. The 44.0.0 notes carry the tag's date.
+
 # v44.0.0 — the group plane as rows, calls on the ALM mesh, a phone that sleeps
 
-**2026-11-05.** **MAJOR** from v43.4.1, and the **long-term support line** while persist does its
+**2026-11-06.** **MAJOR** from v43.4.1, and the **long-term support line** while persist does its
 refactor (Eric, 2026-11-05). Pins CIRISPersist **v61.0.4** (tag, e7ead8fc), CIRISVerify **v22.0.0**
 (cbcd957) and leviculum **v0.33.0+ciris.1** (a3dc12cd). Python requires `ciris-persist>=61.0.4,<62`,
 which declares `ciris-verify>=22,<23`. Under pyo3 every door call runs inside the wheel, so an older

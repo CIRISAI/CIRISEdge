@@ -27,12 +27,20 @@
 //! would forward for others. It answers from its own ledger only (it never
 //! calls into the node): admit (with per-link byte and packet token buckets
 //! when configured) while the forwarded-link count is within `commit_fraction`
-//! of the measured or configured capacity, refuse beyond it, and refuse every
-//! new link at service tier ≥ 1 (§7.2 Admit-close) except to destinations
-//! exempted as never-shed (L-A3). A background refresh reads
+//! of the measured or configured capacity, and refuse beyond it, except to
+//! destinations exempted as never-shed (L-A3). A background refresh reads
 //! `forwarded_links()` once a second, retires closed links from the ledger and
 //! measures the forwarded rates (the `load_ledger`'s transit entries and the
 //! ladder's `edge:transit_pps` signal).
+//!
+//! **The service tier never closes forwarding** (Eric 2026-11-06, §7.2). A
+//! canonical is the last relay tier: a link it refuses has nowhere else to go,
+//! and the dialler's next try is one more request, so closing on tier turned
+//! one dial into 48 retries and stalled first contact for the ladder's whole
+//! cooldown. Forwarding a link request costs little and everything first
+//! contact does crosses it. What bounds a relay is what bounded it before:
+//! `max_links` and `capacity_pps` when an operator sets them, which are fixed
+//! process bounds and no lever, and leviculum's own link table cap.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
@@ -40,7 +48,6 @@ use std::sync::Mutex;
 use leviculum_core::forward_meter::{ForwardDecision, ForwardRequest, ForwardedLink};
 use leviculum_core::relay_routes::RelayRoute;
 
-use crate::load_ladder::ServiceTier;
 use crate::transport::realtime_av_alm::controller::{JitterSource, SplitMix64};
 
 /// One roster relay a destination was heard through.
@@ -107,8 +114,6 @@ pub struct ForwardAdmissionConfig {
     pub max_links: Option<usize>,
     /// The commitment ceiling against capacity (C2: 0.65).
     pub commit_fraction: f64,
-    /// Close admission to new forwarded links at service tier ≥ 1.
-    pub admit_close_on_tier: bool,
 }
 
 impl Default for ForwardAdmissionConfig {
@@ -119,7 +124,6 @@ impl Default for ForwardAdmissionConfig {
             capacity_pps: None,
             max_links: None,
             commit_fraction: 0.65,
-            admit_close_on_tier: true,
         }
     }
 }
@@ -129,10 +133,8 @@ impl Default for ForwardAdmissionConfig {
 pub struct ForwardCounts {
     /// Links admitted.
     pub admitted: u64,
-    /// Refused: over capacity (`relay_capacity`).
+    /// Refused: over capacity (`load_refuse:capacity`).
     pub refused_capacity: u64,
-    /// Refused: admission closed by the service tier (`load_refuse:admit_closed`).
-    pub refused_closed: u64,
     /// Forwarded links in the ledger now.
     pub live: u64,
 }
@@ -164,7 +166,6 @@ pub struct ForwardLoad {
 
 #[derive(Debug, Default)]
 struct FwdState {
-    tier: ServiceTier,
     live: BTreeMap<[u8; 16], u64>,
     order: u64,
     exempt: HashSet<[u8; 16]>,
@@ -183,7 +184,7 @@ pub struct ForwardAdmission {
 pub const TOP_N: usize = 10;
 
 impl ForwardAdmission {
-    /// A fresh admission at tier 0.
+    /// A fresh admission.
     #[must_use]
     pub fn new(cfg: ForwardAdmissionConfig) -> Self {
         Self {
@@ -196,11 +197,6 @@ impl ForwardAdmission {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// The service tier (Admit-close at ≥ 1).
-    pub fn set_tier(&self, tier: ServiceTier) {
-        self.lock().tier = tier;
     }
 
     /// Never refuse links to `destination` (L-A3: own devices, owner).
@@ -224,7 +220,7 @@ impl ForwardAdmission {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
-    fn link_limit(&self) -> Option<usize> {
+    pub(crate) fn link_limit(&self) -> Option<usize> {
         let by_pps = match (self.cfg.capacity_pps, self.cfg.per_link_packets_per_s) {
             (Some(cap), Some(per)) if per > 0 => {
                 Some((self.cfg.commit_fraction * cap as f64 / f64::from(per)).floor() as usize)
@@ -249,15 +245,9 @@ impl ForwardAdmission {
         if s.live.contains_key(&req.link_id) {
             return admit;
         }
-        if !s.exempt.contains(&req.destination_hash) {
-            if self.cfg.admit_close_on_tier && !s.tier.admits_new_relay_work() {
-                s.counts.refused_closed += 1;
-                return ForwardDecision::Refuse;
-            }
-            if limit.is_some_and(|l| s.live.len() >= l) {
-                s.counts.refused_capacity += 1;
-                return ForwardDecision::Refuse;
-            }
+        if !s.exempt.contains(&req.destination_hash) && limit.is_some_and(|l| s.live.len() >= l) {
+            s.counts.refused_capacity += 1;
+            return ForwardDecision::Refuse;
         }
         s.order += 1;
         let order = s.order;
@@ -359,27 +349,30 @@ mod tests {
         assert!(firsts.values().all(|&n| n >= 60), "{firsts:?}");
     }
 
+    /// The capacity bound is the one refusal left, and an exempt destination
+    /// and a repeat request stay outside it.
     #[test]
-    fn admission_closes_at_tier_one_but_never_for_exempt_destinations() {
-        let a = ForwardAdmission::new(ForwardAdmissionConfig::default());
+    fn capacity_refuses_except_exempt_destinations_and_repeat_requests() {
+        let a = ForwardAdmission::new(ForwardAdmissionConfig {
+            max_links: Some(1),
+            ..ForwardAdmissionConfig::default()
+        });
         assert!(matches!(
             a.decide(&req(1, 1)),
             ForwardDecision::Admit { .. }
         ));
-        a.set_tier(ServiceTier::AudioAndFiles);
         a.exempt_destination([9; 16]);
         assert_eq!(a.decide(&req(2, 2)), ForwardDecision::Refuse);
         assert!(matches!(
             a.decide(&req(3, 9)),
             ForwardDecision::Admit { .. }
         ));
-        // An admitted link is never refused on a repeat request.
         assert!(matches!(
             a.decide(&req(1, 1)),
             ForwardDecision::Admit { .. }
         ));
         let c = a.counts();
-        assert_eq!((c.admitted, c.refused_closed, c.live), (2, 1, 2));
+        assert_eq!((c.admitted, c.refused_capacity, c.live), (2, 1, 2));
     }
 
     #[test]

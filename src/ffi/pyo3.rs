@@ -544,6 +544,33 @@ impl PyEdge {
         Ok(self.inner.set_load_pressure(p).as_u8())
     }
 
+    /// `CLM-shaping-offered-never-refused` — seconds past its last real frame
+    /// that a shaped link a peer asked of this node lives. Raises `ValueError`
+    /// on a value that is no duration.
+    fn set_shaping_asked_idle_ttl(&self, secs: f64) -> PyResult<()> {
+        let ttl = std::time::Duration::try_from_secs_f64(secs)
+            .map_err(|e| PyValueError::new_err(format!("bad_ttl: {e}")))?;
+        self.inner.set_shaping_asked_idle_ttl(ttl);
+        Ok(())
+    }
+
+    /// `FSD/CIRIS_MESH.md` §7.7 — **pull a shed lever**: `"walk"`, `"page"` or
+    /// `"bulk"`, toward `level` (0 to 3) for `lease_secs`, renewed by calling
+    /// again. Returns the level in force. It rises one step per 10 s, falls one
+    /// per 30 s, and falls on its own when the lease runs out. The levers read
+    /// back in `load_ledger_json`. Raises `ValueError` on another spelling.
+    #[allow(clippy::similar_names)] // a lever and its level
+    fn pull_shed_lever(&self, lever: &str, level: u8, lease_secs: f64) -> PyResult<u8> {
+        let l = crate::ShedLever::parse(lever).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "bad_shed_lever: {lever:?} is not walk, page or bulk"
+            ))
+        })?;
+        let lease = std::time::Duration::try_from_secs_f64(lease_secs)
+            .map_err(|e| PyValueError::new_err(format!("bad_lease: {e}")))?;
+        Ok(self.inner.pull_shed_lever(l, level, lease))
+    }
+
     /// `FSD/CIRIS_MESH.md` §7.2 — the service tier this node runs at: 0 full
     /// ops, 1 audio and files, 2 chat and contacts.
     fn service_tier(&self) -> u8 {
@@ -2915,6 +2942,8 @@ impl PyEdge {
         // unless `use_node_identity` split them, and where they differ, using
         // the actor here silently disables a blessed node's directory role.
         config.serve_tier_subject_key_id = Some(self.inner.advertised_key_id());
+        // CC 5.2 — only two seats walk the commons, by the active roster.
+        config.recognised_seats = Some(self.inner.recognised_seats());
         // CIRISEdge#370 — hand the live metrics bag to the runtime so its
         // scheduler event-sink consumer folds each round's outcome into the
         // round-outcome counter surfaced by `metrics_snapshot`. Cheap clone;
@@ -3176,6 +3205,26 @@ fn metrics_bundle_to_pydict<'py>(
     }
     root.set_item("advertise", advertise)?;
     root.set_item("direct_links_active", bundle.direct_links_active)?;
+    // v44.1 — the host's shed levers and what this node forwards for others.
+    for (key, map) in [
+        ("load_lever_level", &bundle.load_lever_level),
+        ("load_lever_lease_seconds", &bundle.load_lever_lease_seconds),
+        ("load_lever_changes_total", &bundle.load_lever_changes_total),
+        ("forward_refusals_total", &bundle.forward_refusals_total),
+    ] {
+        let d = pyo3::types::PyDict::new(py);
+        for (label, n) in map {
+            d.set_item(label.as_str(), *n)?;
+        }
+        root.set_item(key, d)?;
+    }
+    root.set_item("forward_links_live", bundle.forward_links_live)?;
+    root.set_item("forward_admitted_total", bundle.forward_admitted_total)?;
+    root.set_item(
+        "forward_packets_per_second",
+        bundle.forward_packets_per_second,
+    )?;
+    root.set_item("forward_bits_per_second", bundle.forward_bits_per_second)?;
     // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
     // a missing install and a membership refusal are two numbers.
     let route_refusals = pyo3::types::PyDict::new(py);
@@ -5144,9 +5193,13 @@ pub struct PyDurableHandle {
 /// running"` panic.
 ///
 /// What IS safe inside the spawned future:
-/// - Calls to persist's public async API (`Engine::*`, trait methods
-///   on `Arc<dyn FederationDirectory>` / `BackendDispatch`) — those
-///   dispatch into persist's `.so` and use persist's tokio.
+/// - Calls through trait objects persist's `.so` built
+///   (`Arc<dyn FederationDirectory>`) — those dispatch into persist's
+///   `.so` and use persist's tokio.
+/// - NOT the concrete `BackendDispatch` arms: `Arc<PostgresBackend>`'s
+///   methods are monomorphic, so they compile into EDGE's copy of persist
+///   and resolve tokio through edge's copy. See [`EdgeTokioContext`] for
+///   how such a call is kept off persist's runtime internals.
 /// - `std::sync::mpsc` / std primitives (no tokio involvement).
 /// - Pure-CPU work + `.await` points on persist-side futures.
 ///
@@ -5162,6 +5215,59 @@ pub struct PyDurableHandle {
 /// pinpoints the hang point in real time. Set to `0` to disable
 /// the watchdog (plain `rx.recv()`, no timer overhead).
 type BoxedFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+/// The tokio context edge's own code finds while persist's worker polls it.
+///
+/// A future handed to persist's executor is polled on persist's worker, where
+/// edge's copy of tokio has no runtime: its thread-locals are edge's, and
+/// unset. Edge code that reaches tokio there either panics ("no reactor
+/// running") or, worse, takes a fallback that drives a runtime persist built.
+/// Persist v59.1.2's `checkout_bounded` (`store/postgres.rs`) is the live
+/// case: compiled into edge's copy (a `BackendDispatch::Postgres` call),
+/// `Handle::try_current()` asks edge's tokio, fails, and the checkout spawns
+/// its timer on `persist_rt`, a `Handle` persist's `.so` built with ITS
+/// tokio. Edge's tokio code then walks a foreign runtime's task list
+/// (different tokio patch versions, different layouts) and SIGSEGVs every
+/// postgres `init_edge_runtime` in cohabitation.
+///
+/// Every poll of such a future enters this runtime's handle first, so edge's
+/// copy finds a runtime of its own: timers, `tokio::spawn` and the checkout's
+/// inline branch all land on edge's tokio, and edge never touches a `Handle`
+/// persist built. Persist's own code on the same thread is untouched: its
+/// tokio keeps its own thread-locals. One small worker, built on first use.
+fn edge_tokio_handle() -> &'static tokio::runtime::Handle {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("ciris-edge-ctx")
+            .enable_all()
+            .build()
+            .expect("ciris-edge-ctx runtime")
+    })
+    .handle()
+}
+
+/// Polls the wrapped future inside [`edge_tokio_handle`]'s context.
+struct EdgeTokioContext(BoxedFut);
+
+impl std::future::Future for EdgeTokioContext {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        // The guard is scoped to this one poll and dropped before it returns,
+        // never held across an await.
+        let _guard = edge_tokio_handle().enter();
+        self.0.as_mut().poll(cx)
+    }
+}
+
+/// Wraps `fut` for persist's executor: see [`EdgeTokioContext`].
+fn in_edge_tokio(fut: BoxedFut) -> BoxedFut {
+    Box::pin(EdgeTokioContext(fut))
+}
 
 fn run_async<F, T>(executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor, fut: F) -> T
 where
@@ -5186,7 +5292,7 @@ where
     // `Box::into_raw`'d `Box<Pin<Box<dyn Future<Output = ()> + Send +
     // 'static>>>`. Construct that outer Box, lower to *mut TaskOpaque,
     // hand to the vtable.
-    let outer_box: Box<BoxedFut> = Box::new(inner_fut);
+    let outer_box: Box<BoxedFut> = Box::new(in_edge_tokio(inner_fut));
     let task_ptr: *mut ciris_persist::ffi::executor_capsule::TaskOpaque =
         Box::into_raw(outer_box).cast();
     // SAFETY: `executor.data` and `task_ptr` satisfy the safety
@@ -8294,7 +8400,7 @@ pub fn init_edge_runtime(
                     }
                 }
             });
-            let outer_box: Box<BoxedFut> = Box::new(heartbeat_fut);
+            let outer_box: Box<BoxedFut> = Box::new(in_edge_tokio(heartbeat_fut));
             let task_ptr: *mut ciris_persist::ffi::executor_capsule::TaskOpaque =
                 Box::into_raw(outer_box).cast();
             // SAFETY: same contract as `run_async` — `executor.data` and

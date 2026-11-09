@@ -20,8 +20,9 @@
 //! be referred. A referral names any ANNOUNCED node, owned or not, that reports
 //! free shaped slots, and a node reports only while its relay offering is on
 //! ([`crate::onion::policy::relay_offering`]: a phone only on Wi-Fi while
-//! charging). When the offering ends the next report says zero and it drops
-//! out of every peer's ranking.
+//! charging; never a node that turned on the Anonymous Tier, which proxies
+//! nothing, CC 5.4.6 `CLM-referred-peer-is-proxy`). When the offering ends
+//! the next report says zero and it drops out of every peer's ranking.
 //!
 //! **Who is ranked.** Shaped peers report their free slots in the in-band
 //! capability body ([`crate::transport::link_shaping::capability_body`]). Most

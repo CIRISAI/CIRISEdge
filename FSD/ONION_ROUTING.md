@@ -198,7 +198,10 @@ at random among layer 3), with `final`; for targeted delivery slots 3–5 are co
 `route_blob` (§8) and slot 2's routing block names the blob's first hop.
 
 **Replay:** a relay keeps the set of `ct_i` hashes it has decapsulated for the current and previous period;
-a repeat is dropped (`onion_replay`). Fresh encapsulation per packet makes every honest `ct_i` unique.
+a repeat is dropped (`onion_replay`). Fresh encapsulation per packet makes every honest `ct_i` unique. The
+set is a bounded hold (CIRISEdge#955): at most 62,134 tags per period, the `seat` rate on eight shaped links
+times the period over the packet size; past it a new packet is refused (`onion_replay_set_full`) and no held
+tag is evicted.
 
 **Fragmentation:** on a shaped link the 15,200 bytes are CFRG-fragmented to the shaped frame body and
 queued on the link's shaper like any other frame (CC 5.4.6 item 5); the receiving relay reassembles the
@@ -292,7 +295,7 @@ Edge's `ShapingPolicy` is a prerequisite: a relay's links to its layer neighbour
 ## 11. Refusal and error names (edge's own; the two seat names are CC's)
 
 `seat_opted_out`, `seat_without_hop_key` (CC); `onion_unshaped_link`, `onion_hdr_open_failed`,
-`onion_period_mismatch`, `onion_replay`, `onion_next_hop_unroutable`, `onion_hold_deferred`,
+`onion_period_mismatch`, `onion_replay`, `onion_replay_set_full`, `onion_next_hop_unroutable`, `onion_hold_deferred`,
 `onion_no_valid_hop_key` (use-time: the cross-row rule), `onion_tier_unavailable_floor` and
 `onion_tier_unavailable_liveness` (said to the client with the layer sizes and the answering counts), `onion_route_failed` (sender, after retries), `rendezvous_route_stale`
 (a row past `valid_until`), `rendezvous_mailbox_full`, `rendezvous_fetch_unsigned`. Metric families

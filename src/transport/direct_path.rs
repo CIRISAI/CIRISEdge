@@ -439,13 +439,24 @@ pub fn glare_verdict(
 fn retry_base(failure: Failure, attempts: u32) -> DirectRetry {
     match failure {
         Failure::PunchFailed => DirectRetry::After(DIRECT_PUNCH_FAILED_BACKOFF),
+        // The peer's proposal won the tie and is running: nothing failed, so
+        // the next ask costs no doubling (leviculum#96).
+        Failure::Glare => DirectRetry::After(DIRECT_RETRY_BASE),
         // A refusal is retried like a timeout (CIRISEdge#920). Under the
         // default `RoomPeers` a peer refuses until it shares a room with this
         // node, and room setup is exactly when the first sends to it go out:
         // pinning the refusal to the link left a pair room relayed for good.
         // The backoff doubles, so a peer that refuses by policy (`Off`) is
         // asked rarely, not never.
-        Failure::Rejected(_) | Failure::Timeout | Failure::ProbeFailed => {
+        //
+        // A path that was lost, held past its deadline or left by the peer
+        // (leviculum#98) is a failed attempt like any other.
+        Failure::Rejected(_)
+        | Failure::Timeout
+        | Failure::ProbeFailed
+        | Failure::InterfaceLost
+        | Failure::HeldTooLong
+        | Failure::PeerFellBack => {
             let factor = 1u32.checked_shl(attempts.min(16)).unwrap_or(u32::MAX);
             DirectRetry::After(
                 DIRECT_RETRY_BASE
@@ -476,6 +487,10 @@ pub const fn failure_label(failure: Failure) -> &'static str {
         Failure::ProbeFailed => crate::observability::DIRECT_LINK_FAILED_PROBE,
         Failure::Timeout => crate::observability::DIRECT_LINK_FAILED_TIMEOUT,
         Failure::PunchFailed => crate::observability::DIRECT_LINK_FAILED_PUNCH,
+        Failure::Glare => crate::observability::DIRECT_LINK_FAILED_GLARE,
+        Failure::InterfaceLost => crate::observability::DIRECT_LINK_FAILED_INTERFACE_LOST,
+        Failure::HeldTooLong => crate::observability::DIRECT_LINK_FAILED_HELD,
+        Failure::PeerFellBack => crate::observability::DIRECT_LINK_FAILED_PEER_FELL_BACK,
     }
 }
 
@@ -1383,7 +1398,28 @@ mod tests {
     fn a_timeout_later_than_any_session_was_a_hold() {
         let held = Duration::from_secs(175);
         assert!(held_failure(Failure::Timeout, held));
+        assert_eq!(
+            failure_label(Failure::HeldTooLong),
+            crate::observability::DIRECT_LINK_FAILED_HELD,
+            "leviculum's own word for what edge reads off a late Timeout"
+        );
         assert!(held_failure(Failure::Timeout, UPGRADE_GUARD_BOUND));
+        assert_eq!(
+            retry_after(Failure::Glare, 9, 0.0),
+            DirectRetry::After(DIRECT_RETRY_BASE),
+            "a lost tie costs no doubling: the peer's proposal is running"
+        );
+        for failure in [
+            Failure::InterfaceLost,
+            Failure::HeldTooLong,
+            Failure::PeerFellBack,
+        ] {
+            assert_eq!(
+                retry_after(failure, 2, 0.0),
+                retry_after(Failure::Timeout, 2, 0.0),
+                "{failure:?} backs off as a failed attempt"
+            );
+        }
         let just_under = UPGRADE_GUARD_BOUND
             .checked_sub(Duration::from_millis(1))
             .expect("a bound");

@@ -118,6 +118,8 @@
 
 pub mod accord_relay_gate;
 pub mod attestation_bind;
+#[cfg(test)]
+mod bootstrap_order_tests;
 pub mod bridge;
 pub mod convergence;
 pub mod coordinator;

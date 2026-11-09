@@ -475,6 +475,14 @@ pub struct TelemetrySnapshot {
     pub load_host_pressure: u64,
     pub load_pressure_report_age_seconds: f64,
     pub load_tier_changes_total: HashMap<String, u64>,
+    pub load_lever_level: HashMap<String, u64>,
+    pub load_lever_lease_seconds: HashMap<String, u64>,
+    pub load_lever_changes_total: HashMap<String, u64>,
+    pub forward_links_live: u64,
+    pub forward_admitted_total: u64,
+    pub forward_refusals_total: HashMap<String, u64>,
+    pub forward_packets_per_second: u64,
+    pub forward_bits_per_second: u64,
     pub shaping_enabled: u64,
     pub shaping_links: HashMap<String, u64>,
     pub shaping_free_slots: u64,
@@ -554,6 +562,14 @@ pub struct EdgeTelemetry {
     load_host_pressure: AtomicU64,
     pressure_reported_at_ms: AtomicU64,
     load_tier_changes: Mutex<HashMap<String, u64>>,
+    /// The host's shed levers, read by the scheduler, the bridge and the
+    /// puller through this bag.
+    pub levers: crate::load_levers::LoadLevers,
+    forward_links_live: AtomicU64,
+    forward_admitted: AtomicU64,
+    forward_refused_capacity: AtomicU64,
+    forward_pps: AtomicU64,
+    forward_bps: AtomicU64,
     shaping_enabled: AtomicU64,
     shaping_links_counted: AtomicU64,
     shaping_links_seat: AtomicU64,
@@ -600,6 +616,12 @@ impl Default for EdgeTelemetry {
             load_host_pressure: AtomicU64::new(0),
             pressure_reported_at_ms: AtomicU64::new(0),
             load_tier_changes: Mutex::new(HashMap::new()),
+            levers: crate::load_levers::LoadLevers::default(),
+            forward_links_live: AtomicU64::new(0),
+            forward_admitted: AtomicU64::new(0),
+            forward_refused_capacity: AtomicU64::new(0),
+            forward_pps: AtomicU64::new(0),
+            forward_bps: AtomicU64::new(0),
             shaping_enabled: AtomicU64::new(0),
             shaping_links_counted: AtomicU64::new(0),
             shaping_links_seat: AtomicU64::new(0),
@@ -816,6 +838,24 @@ impl EdgeTelemetry {
             .or_insert(0) += 1;
     }
 
+    /// What this node forwards for others, from its one-second reading.
+    #[cfg(feature = "_reticulum-module")]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn set_forward(
+        &self,
+        counts: crate::transport::relay_tier::ForwardCounts,
+        load: &crate::transport::relay_tier::ForwardLoad,
+    ) {
+        self.forward_links_live
+            .store(counts.live, Ordering::Relaxed);
+        self.forward_admitted
+            .store(counts.admitted, Ordering::Relaxed);
+        self.forward_refused_capacity
+            .store(counts.refused_capacity, Ordering::Relaxed);
+        self.forward_pps.store(load.pps as u64, Ordering::Relaxed);
+        self.forward_bps.store(load.bps as u64, Ordering::Relaxed);
+    }
+
     /// What the shaped links look like now.
     pub fn set_shaping(&self, enabled: bool, counted: usize, seat: usize, free_slots: u8) {
         self.shaping_enabled
@@ -953,6 +993,12 @@ impl EdgeTelemetry {
         {
             changes.insert(k.clone(), *v);
         }
+        let levers = self.levers.status();
+        let mut lever_changes: HashMap<String, u64> = crate::load_levers::lever_change_keys()
+            .into_iter()
+            .map(|k| (k, 0))
+            .collect();
+        lever_changes.extend(self.levers.changes());
         let mut apply_refusals: HashMap<String, u64> = REFUSAL_CLASSES
             .iter()
             .map(|c| (format!("{APPLY_REFUSAL_REFUSED_THEN_ADMITTED}:{c}"), 0))
@@ -1036,6 +1082,23 @@ impl EdgeTelemetry {
             load_host_pressure: self.load_host_pressure.load(Ordering::Relaxed),
             load_pressure_report_age_seconds: self.age_seconds(&self.pressure_reported_at_ms),
             load_tier_changes_total: changes,
+            load_lever_level: levers
+                .iter()
+                .map(|l| (l.lever.clone(), u64::from(l.level)))
+                .collect(),
+            load_lever_lease_seconds: levers
+                .iter()
+                .map(|l| (l.lever.clone(), l.lease_ms_left / 1_000))
+                .collect(),
+            load_lever_changes_total: lever_changes,
+            forward_links_live: self.forward_links_live.load(Ordering::Relaxed),
+            forward_admitted_total: self.forward_admitted.load(Ordering::Relaxed),
+            forward_refusals_total: HashMap::from([(
+                crate::observability::FORWARD_REFUSED_CAPACITY.to_string(),
+                self.forward_refused_capacity.load(Ordering::Relaxed),
+            )]),
+            forward_packets_per_second: self.forward_pps.load(Ordering::Relaxed),
+            forward_bits_per_second: self.forward_bps.load(Ordering::Relaxed),
             shaping_enabled: self.shaping_enabled.load(Ordering::Relaxed),
             shaping_links: HashMap::from([
                 (
@@ -1203,6 +1266,8 @@ const fn spec(
 }
 
 const REASON: Option<(&str, LabelValues)> = Some(("reason", LabelValues::Tokens));
+const LEVER_TOKENS: &[&str] = &["walk", "page", "bulk"];
+const FORWARD_REFUSAL_REASONS: &[&str] = &[obs::FORWARD_REFUSED_CAPACITY];
 const KINDS: Option<(&str, LabelValues)> = Some(("kind", LabelValues::EnvelopeKinds));
 
 // A catalogue row's label is an `Option`; this is its closed spelling.
@@ -1228,7 +1293,7 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("transport_bytes_out_total", "ciris.edge.transport.bytes.out", Counter, Bytes, Some(("transport", LabelValues::Tokens)), "Bytes sent, by transport."),
     spec("peer_reachability_ratio", "ciris.edge.peer.reachability", Gauge, Ratio, Some(("peer", LabelValues::PeerKeyed)), "Per-peer send success. Names peers: never public."),
     spec("inbound_dropped_low_trust", "ciris.edge.inbound.dropped_low_trust", Counter, Count, None, "Envelopes dropped by the trust short-circuit."),
-    spec("replication_round_outcomes_total", "ciris.edge.round.outcomes", Counter, Count, closed("outcome", &["completed", "refused", "timed_out", "error"]), "Anti-entropy rounds, by outcome."),
+    spec("replication_round_outcomes_total", "ciris.edge.round.outcomes", Counter, Count, closed("outcome", &["completed", "refused", "timed_out", "error", "no_route"]), "Anti-entropy rounds, by outcome."),
     spec("replication_inbound_backpressure_drops", "ciris.edge.replication.inbound.backpressure_drops", Counter, Count, None, "Frames dropped at a full coordinator inbox."),
     spec("replication_inbound_backpressure_drops_by_role", "ciris.edge.replication.inbound.backpressure_drops_by_role", Counter, Count, Some(("role", LabelValues::Tokens)), "The same, by role."),
     spec("blob_route_refusals", "ciris.edge.blob.route_refusals", Counter, Count, REASON, "Blob holders dropped from a pull, by refusal."),
@@ -1320,6 +1385,14 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("load_host_pressure", "ciris.edge.load.host_pressure", Gauge, Count, None, "The host's last verdict: 0, 1 or 2."),
     spec("load_pressure_report_age_seconds", "ciris.edge.load.pressure_report_age", Gauge, Seconds, None, "Age of the host's last verdict. -1: it never spoke, and tier 0 is not a calm reading."),
     spec("load_tier_changes_total", "ciris.edge.load.tier_changes", Counter, Count, Some(("to:cause", LabelValues::Tokens)), "Tier changes, by where to and who put it there. Every key present at zero."),
+    spec("load_lever_level", "ciris.edge.load.lever.level", Gauge, Count, closed("lever", LEVER_TOKENS), "A host's shed lever: 0 serves in full, 3 is its top step."),
+    spec("load_lever_lease_seconds", "ciris.edge.load.lever.lease", Gauge, Seconds, closed("lever", LEVER_TOKENS), "Whole seconds left on a lever's lease. 0 with a level above 0: the host stopped renewing, and it is walking home."),
+    spec("load_lever_changes_total", "ciris.edge.load.lever.changes", Counter, Count, Some(("lever:cause", LabelValues::Tokens)), "Lever moves, by lever and by `host`, `released` or `lease_expired`. Every key present at zero."),
+    spec("forward_links_live", "ciris.edge.forward.links", Gauge, Count, None, "Links this node forwards for others now."),
+    spec("forward_admitted_total", "ciris.edge.forward.admitted", Counter, Count, None, "Forwarded links admitted."),
+    spec("forward_refusals_total", "ciris.edge.forward.refused", Counter, Count, closed("reason", FORWARD_REFUSAL_REASONS), "Link requests refused at a configured bound. The service tier refuses none."),
+    spec("forward_packets_per_second", "ciris.edge.forward.packets", Gauge, Count, None, "Packets forwarded per second, over the last reading."),
+    spec("forward_bits_per_second", "ciris.edge.forward.bits", Gauge, Count, None, "Bits forwarded per second, over the last reading."),
     spec("shaping_enabled", "ciris.edge.shaping.enabled", Gauge, Count, None, "1 when this node offers shaping. 0 explains a silent `link_shaping` family."),
     spec("shaping_links", "ciris.edge.shaping.links", Gauge, Count, closed("kind", SHAPING_LINK_KINDS), "Shaped links: those that count toward the bound, and seat links."),
     spec("shaping_free_slots", "ciris.edge.shaping.free_slots", Gauge, Count, None, "Slots a new peer could take here."),

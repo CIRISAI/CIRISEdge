@@ -177,6 +177,7 @@ fn build_bridge(
         )
         .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
         .with_consent_subjects(config.consent_subject_key_ids.clone())
+        .with_recognised_seats(config.recognised_seats.clone())
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
         // legs live (leg A ∧ leg B against this node's own trust base), the
         // owner-conferred rung fail-closed pending CIRISPersist#788. Installed
@@ -652,13 +653,7 @@ pub(crate) fn spawn_responder_drive(
 /// dropped here — high-cardinality per-round detail rides the round's
 /// tracing span, not the counter key.
 fn round_outcome_of(event: &RoundEvent) -> crate::observability::RoundOutcome {
-    use crate::observability::RoundOutcome;
-    match event {
-        RoundEvent::Completed(_) => RoundOutcome::Completed,
-        RoundEvent::Refused => RoundOutcome::Refused,
-        RoundEvent::TimedOut => RoundOutcome::TimedOut,
-        RoundEvent::Error(_) => RoundOutcome::Error,
-    }
+    event.outcome()
 }
 
 /// A `(peer_key_id, kind)` pair the runtime should anti-entropy with
@@ -786,6 +781,9 @@ pub struct ReplicationRuntimeConfig {
     /// Empty (the default) falls back to `local_key_id`: correct wherever the
     /// agent and the node are one key.
     pub consent_subject_key_ids: Vec<String>,
+    /// CC 5.2 — the recognised serve seats (`Edge::recognised_seats`), which
+    /// the active roster starts from: only two seats walk the commons.
+    pub recognised_seats: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
     /// CIRISEdge#640 — everything a node needs to OPEN sealed content it did
     /// not seal, wired as ONE value (see [`SealedContentWiring`]): the engine
     /// that projects key-grant wraps into grants for this node's occurrences,
@@ -1450,8 +1448,13 @@ impl ReplicationRuntime {
     ) -> Result<(), ReplicationRuntimeError> {
         let peer_key_id = peer_key_id.into();
         // persist v61 — a retired plane carries nothing; it is never scheduled.
+        // Debug: a host's reconcile can name one on every pass.
         if kind.is_retired_plane() {
-            note_retired_plane_skipped(&peer_key_id, kind);
+            tracing::debug!(
+                peer = %peer_key_id,
+                kind = kind.as_wire_str(),
+                "replication peer on a RETIRED plane not scheduled"
+            );
             return Ok(());
         }
         let key = (peer_key_id.clone(), kind);

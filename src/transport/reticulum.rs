@@ -524,6 +524,24 @@ fn link_channel_mdu(node: &ReticulumNode, link_id: &LinkId) -> usize {
     node.link_mdu(link_id).map_or(0, channel_payload_mdu)
 }
 
+/// CC 5.4.3 `CLM-shaped-link-one-hop` — **whether a forwarder carries `link`**:
+/// it left no punched interface to run on, and the path to `dest` is more than
+/// one hop. No path is not a forwarder: a request with no path is a broadcast,
+/// and a transport node forwards a request only as its designated next hop
+/// (leviculum `handle_link_request`), so a link that established without one
+/// was answered one hop away. leviculum keeps a link's hops and does not
+/// expose them at this pin, so the path stands in for them.
+fn link_is_forwarded(
+    node: &ReticulumNode,
+    link_id: &LinkId,
+    dest: Option<DestinationHash>,
+) -> bool {
+    node.direct_link_interface(link_id).is_none()
+        && dest
+            .and_then(|d| node.hops_to(&d))
+            .is_some_and(|hops| hops > 1)
+}
+
 /// CC 5.4.3 — which links are offered shaping: the identity plane only. An
 /// A/V link is a burst a GPA can see regardless (CC 5.3.3.2) and would pay
 /// seconds of jitter for nothing; a scoped link is one hop of scoped content
@@ -765,11 +783,15 @@ async fn send_fragments_on_channel(
         .await
         {
             Ok(Ok(())) => sent += 1,
-            Ok(Err(_)) => {
+            Ok(Err(e)) => {
                 return FragmentSendOutcome {
                     sent,
                     total,
-                    stalled: Some("link_send_error"),
+                    stalled: Some(if is_over_channel_limit(&e) {
+                        FRAME_OVER_CHANNEL_LIMIT
+                    } else {
+                        "link_send_error"
+                    }),
                 }
             }
             Err(_elapsed) => {
@@ -787,6 +809,26 @@ async fn send_fragments_on_channel(
         stalled: None,
     }
 }
+/// A send refused because the frame is over the Channel's limit (leviculum
+/// 0.34 says so; it used to read `LinkFailed`). The link is alive: its MDU
+/// shrank under a frame cut earlier, on a move to a direct path.
+const FRAME_OVER_CHANNEL_LIMIT: &str = "frame_over_channel_limit";
+
+fn is_over_channel_limit(e: &leviculum_std::error::Error) -> bool {
+    matches!(
+        e,
+        leviculum_std::error::Error::Send(leviculum_core::SendError::TooLarge)
+    )
+}
+
+/// The Resource window policy: `Adaptive` on a fast duplex path, `Current`
+/// everywhere else, decided per resource from the link's interface and round
+/// trip (leviculum#103). `Current` caps the window at the slow tier past about
+/// 31 ms. A radio hot-plugged later (`add_rnode_channel_interface`) reads
+/// `InterfaceKind::Rnode`, so resources on it stay `Current`.
+const RESOURCE_WINDOW_POLICY: leviculum_std::resource_policy::WindowPolicy =
+    leviculum_std::resource_policy::WindowPolicy::ByMedium;
+
 /// Pause between busy-retries on the reverse path.
 const REVERSE_PATH_BUSY_BACKOFF: Duration = Duration::from_millis(500);
 /// CIRISEdge#353b/v13.6.1 — PROGRESS-AWARE reverse-path resource wait.
@@ -2098,8 +2140,8 @@ pub struct ReticulumTransportConfig {
     pub relay_establish_budget: Duration,
     /// ALM stage 2 — a transport node's C2 admission of the links it
     /// forwards for others (leviculum#93). Installed when
-    /// `enable_transport`; the default admits uncapped at tier 0 and closes
-    /// to new forwarded links at service tier ≥ 1 (§7.2 Admit-close).
+    /// `enable_transport`; the default admits every link, uncapped, at every
+    /// service tier (`FSD/CIRIS_MESH.md` §7.2).
     pub forward_admission: crate::transport::relay_tier::ForwardAdmissionConfig,
 }
 
@@ -2556,6 +2598,11 @@ pub struct ReticulumTransport {
     /// [`AnnounceCtx`]. `None` (the default) keeps every pre-#530 construction
     /// site compiling unchanged and leaves intake evictions loud-but-uncounted.
     metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
+    /// Test seam — offer shaping through a forwarder, as a peer older than
+    /// `CLM-shaped-link-one-hop` does.
+    test_offer_forwarded: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — a dial's establish budget in ms, 0 for the real one.
+    test_establish_budget_ms: std::sync::atomic::AtomicU64,
     /// v44 — the node's ladder ([`Transport::attach_load_ladder`]): the node
     /// tick folds edge's own signals and moves the shapers and admission.
     load_ladder: std::sync::OnceLock<Arc<crate::load_ladder::SharedLadder>>,
@@ -2683,11 +2730,9 @@ pub struct ReticulumTransport {
     /// CC 5.4.6 — the Anonymous Tier on this node (dormant unless its
     /// operator opts in and the deal is available; [`crate::onion`]).
     onion: Arc<crate::onion::runtime::OnionRuntime>,
-    /// CC 5.4.3 rc16 two planes — the bulk fallbacks in progress
-    /// ([`Self::bulk_on_shaped`]).
-    bulk_fallbacks: Arc<crate::transport::link_shaping::BulkFallbacks>,
     /// Peers whose bulk dial failed lately, so bulk to a peer reachable only
-    /// over its shaped link goes straight there ([`BULK_DIAL_NEGATIVE_TTL`]).
+    /// over its shaped link is refused by name without another dial for
+    /// [`BULK_DIAL_NEGATIVE_TTL`].
     bulk_dial_failed: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// Peers that refused this node's row link at their bound, or that this
     /// node refused at its own, lately: a row send to one fails by name
@@ -3429,6 +3474,7 @@ impl ReticulumTransport {
             own_key_id: self.occurrence_key_id().to_owned(),
             handshake_override: Arc::clone(&self.handshake_override),
             test_unannounced: Arc::clone(&self.test_unannounced),
+            test_offer_forwarded: Arc::clone(&self.test_offer_forwarded),
             test_refuse_dials: Arc::clone(&self.test_refuse_dials),
             test_refused_dials: Arc::clone(&self.test_refused_dials),
             row_homed_elsewhere: Arc::clone(&self.row_homed_elsewhere),
@@ -3563,6 +3609,17 @@ impl ReticulumTransport {
         let shapers = Arc::new(crate::transport::link_shaping::LinkShapers::new(
             config.shaping.clone(),
         ));
+        // `CLM-shaped-link-bound-refuse` — anonymous mode refuses past the bound.
+        {
+            let onion = Arc::clone(&onion);
+            shapers.set_anonymous_read(move || onion.media_allowed().is_err());
+        }
+        // `CLM-shaping-offered-never-refused` — the class a node answers at
+        // when asked, from the device as it stands.
+        {
+            let onion = Arc::clone(&onion);
+            shapers.set_device_read(move || onion.device());
+        }
         // CC 5.4.3 referrals — free slots are reported from the start, while
         // the relay offering is on (`onion_refresh` follows it from here).
         shapers.enable_capacity_reports();
@@ -3726,7 +3783,8 @@ impl ReticulumTransport {
             // CIRISEdge#805 item 8 — always explicit, so the node never runs on
             // a leviculum default (or a stray config file's keys) edge did not
             // choose.
-            .direct_link(config.direct_links.leviculum_settings());
+            .direct_link(config.direct_links.leviculum_settings())
+            .resource_window_policy(RESOURCE_WINDOW_POLICY);
         tracing::info!(
             proposes = config.direct_links.proposes(),
             proposing = ?config.direct_links.proposing,
@@ -4136,6 +4194,8 @@ impl ReticulumTransport {
             config,
             // CIRISEdge#530 — off by default; attach with `with_metrics`.
             metrics: std::sync::OnceLock::new(),
+            test_offer_forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            test_establish_budget_ms: std::sync::atomic::AtomicU64::new(0),
             load_ladder: std::sync::OnceLock::new(),
             metrics_source: {
                 static NEXT_METRICS_SOURCE: std::sync::atomic::AtomicU64 =
@@ -4175,7 +4235,6 @@ impl ReticulumTransport {
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             test_refuse_dials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             test_refused_dials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            bulk_fallbacks: Arc::new(crate::transport::link_shaping::BulkFallbacks::default()),
             bulk_dial_failed: std::sync::Mutex::new(HashMap::new()),
             row_homed_elsewhere: Arc::new(std::sync::Mutex::new(HashMap::new())),
             homing_tx,
@@ -4661,6 +4720,64 @@ impl ReticulumTransport {
     pub fn drop_next_inbound_link_established_for_test(&self) {
         self.swallow_link_established
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `CLM-shaping-offered-never-refused` — how long past its last real frame
+    /// a link a peer asked of this node lives. The operator's setting.
+    pub fn set_shaping_asked_idle_ttl(&self, ttl: Duration) {
+        self.shapers.set_asked_idle_ttl(ttl);
+    }
+
+    /// Test seam — answer `off` when asked, as a peer older than
+    /// `CLM-shaping-offered-never-refused` does.
+    #[doc(hidden)]
+    pub fn answer_off_like_an_old_peer_for_test(&self) {
+        self.shapers.set_old_peer_for_test(true);
+    }
+
+    /// Test seam — offer shaping through a forwarder, as an older peer does.
+    #[doc(hidden)]
+    pub fn set_offer_forwarded_for_test(&self, on: bool) {
+        self.test_offer_forwarded
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How long a dial may take to establish.
+    fn establish_budget(&self, has_path: bool) -> Duration {
+        match self
+            .test_establish_budget_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 if has_path => LINK_ESTABLISH_TIMEOUT,
+            0 => NO_PATH_ESTABLISH_TIMEOUT,
+            ms => Duration::from_millis(ms),
+        }
+    }
+
+    /// Test seam — a shaped link's agreed frame and bytes/s, `None` unshaped.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn shaped_agreement_for_test(&self, link: [u8; 16]) -> Option<(u16, u32)> {
+        self.shapers.get(link).map(|s| {
+            let a = s.agreement();
+            (a.frame_bytes, a.bytes_per_s())
+        })
+    }
+
+    /// Test seam — the frame a link's Channel carries now.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn link_channel_mdu_for_test(&self, link: [u8; 16]) -> usize {
+        link_channel_mdu(&self.node, &LinkId::new(link))
+    }
+
+    /// Test seam — a dial's establish budget, in place of the real one.
+    #[doc(hidden)]
+    pub fn set_establish_budget_for_test(&self, budget: Option<Duration>) {
+        self.test_establish_budget_ms.store(
+            budget.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// CIRISEdge#853 test seam — close `link` at the node and DROP the
@@ -6827,12 +6944,12 @@ impl ReticulumTransport {
             .clone()
     }
 
-    /// ALM stage 2 (`FSD/CIRIS_MESH.md` §7) — the service tier: forwarded
-    /// links close to new admissions at tier ≥ 1, and so do shaped slots for
-    /// peers this node owes nothing; tier 2 sheds those links and pauses their
-    /// slow path (`FSD/PRIVACY_MODES.md` §6.12). Cover is not shed.
+    /// ALM stage 2 (`FSD/CIRIS_MESH.md` §7) — the service tier: shaped slots
+    /// close to new peers this node owes nothing at tier ≥ 1; tier 2 sheds
+    /// those links and pauses their slow path (`FSD/PRIVACY_MODES.md` §6.12).
+    /// Cover is not shed, and forwarding does not follow the tier: a canonical
+    /// is the last relay tier.
     pub fn set_service_tier(&self, tier: crate::load_ladder::ServiceTier) {
-        self.forward_admission.set_tier(tier);
         self.shapers.set_service_tier(tier);
     }
 
@@ -7766,6 +7883,24 @@ impl ReticulumTransport {
         dest_hash: [u8; 16],
         transport_pubkey64: [u8; 64],
     ) {
+        self.inject_advisory_peer_at_epoch_for_test(
+            destination_key_id,
+            dest_hash,
+            transport_pubkey64,
+            0,
+        )
+        .await;
+    }
+
+    /// As above, at a chosen epoch: the binding an older announce cannot move.
+    #[doc(hidden)]
+    pub async fn inject_advisory_peer_at_epoch_for_test(
+        &self,
+        destination_key_id: &str,
+        dest_hash: [u8; 16],
+        transport_pubkey64: [u8; 64],
+        epoch: u64,
+    ) {
         let x25519: [u8; 32] = transport_pubkey64[..32].try_into().unwrap_or([0u8; 32]);
         let ed25519: [u8; 32] = transport_pubkey64[32..].try_into().unwrap_or([0u8; 32]);
         let transport_identity_hash =
@@ -7778,7 +7913,7 @@ impl ReticulumTransport {
                     dest_hash: DestinationHash::new(dest_hash),
                     transport_ed25519: ed25519,
                 },
-                epoch: 0,
+                epoch,
                 chain: None,
                 provenance: ciris_persist::federation::self_at_login::BindingProvenance::Advisory,
                 transport_identity_hash,
@@ -8261,6 +8396,7 @@ impl ReticulumTransport {
             return Err(refused);
         }
         if !matches!(outcome, Some(Ok(()))) {
+            ctx.abandon_dial(link_id).await;
             return Err(TransportError::Timeout(timeout));
         }
         // CIRISEdge#867 — bind everything below to the link's wire id.
@@ -9575,11 +9711,7 @@ impl ReticulumTransport {
                 );
             }
         }
-        let establish_timeout = if has_path {
-            LINK_ESTABLISH_TIMEOUT
-        } else {
-            NO_PATH_ESTABLISH_TIMEOUT
-        };
+        let establish_timeout = self.establish_budget(has_path);
 
         // ── CIRISEdge#532: REUSE BEFORE DIALING ──────────────────────────────
         // A live, identified link to this dest is a finished handshake. Sending
@@ -9746,119 +9878,6 @@ impl ReticulumTransport {
         .filter(|l| self.shapers.needs_bulk_plane(l.into_bytes(), envelope))
     }
 
-    /// CC 5.4.3 rc16 two planes — the LAST RESORT for a payload that needs
-    /// the bulk plane when no unshaped link to the peer could be had (the dial
-    /// failed: a NAT'd peer reachable only over the link it dialled in, which
-    /// is shaped). With a live shaped link the payload rides it
-    /// ([`Self::bulk_on_shaped`]) and the failed dial is remembered for
-    /// [`BULK_DIAL_NEGATIVE_TTL`]; otherwise the dial's own error stands.
-    async fn bulk_on_shaped_or(
-        &self,
-        destination_key_id: &str,
-        envelope: &[u8],
-        dial_error: TransportError,
-    ) -> Result<TransportSendOutcome, TransportError> {
-        let Some(link) = self
-            .shaped_link_for_bulk(destination_key_id, envelope)
-            .await
-        else {
-            return Err(dial_error);
-        };
-        self.bulk_dial_failed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(destination_key_id.to_owned(), std::time::Instant::now());
-        tracing::info!(
-            destination_key_id,
-            link = ?link,
-            bytes = envelope.len(),
-            dial_error = %dial_error,
-            "no unshaped link can reach this peer; bulk rides its shaped link in shaped-budget \
-             fragments (slow, CC 5.4.3 two-planes last resort)"
-        );
-        self.bulk_on_shaped(destination_key_id, envelope, link)
-            .await
-    }
-
-    /// Send `envelope` over shaped `link` in shaped-budget fragments, paced by
-    /// the shaper like every other frame: slow, counted
-    /// `link_shaping_bulk_on_shaped_fallback`. `Delivered` means every fragment
-    /// left this node, because the durable dispatcher treats it as a transport
-    /// ack; a transfer that stops part-way is an `Io` error the dispatcher
-    /// retries. It runs detached and single-flight
-    /// ([`crate::transport::link_shaping::BulkFallbacks`]).
-    async fn bulk_on_shaped(
-        &self,
-        destination_key_id: &str,
-        envelope: &[u8],
-        link: LinkId,
-    ) -> Result<TransportSendOutcome, TransportError> {
-        use sha2::Digest as _;
-        let digest: [u8; 32] = sha2::Sha256::digest(envelope).into();
-        if self.bulk_fallbacks.recently_finished(&digest) {
-            return Ok(TransportSendOutcome::Delivered);
-        }
-        // `FSD/PRIVACY_MODES.md` §6.12 — the slow path is bulk: at tier 2 a
-        // file to a non-owner peer waits for the dispatcher's retry and holds
-        // nothing here.
-        if self.shapers.slow_path_paused(destination_key_id).await {
-            if let Some(m) = self.metrics.get() {
-                m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_SHED_BULK);
-            }
-            return Err(TransportError::Io(format!(
-                "{}: the slow path to {destination_key_id} is paused at tier 2; the send is \
-                 retried",
-                crate::observability::LINK_SHAPING_LOAD_SHED_BULK
-            )));
-        }
-        let (mut outcome, owner) = self.bulk_fallbacks.join_or_start(digest);
-        if let Some(tx) = owner {
-            let shaper = self.shapers.get(link.into_bytes());
-            let frames = shaper.as_ref().and_then(|s| {
-                let cap = crate::transport::link_shaping::body_capacity(s.agreement().frame_bytes);
-                crate::transport::frame_fragment::fragment(envelope, cap)
-            });
-            let (Some(shaper), Some(frames)) = (shaper, frames) else {
-                self.bulk_fallbacks.finish(&digest, false);
-                return Err(TransportError::Io(format!(
-                    "the shaped link to {destination_key_id} cannot carry a bulk fallback"
-                )));
-            };
-            if let Some(m) = self.metrics.get() {
-                m.inc_link_shaping(crate::observability::LINK_SHAPING_BULK_ON_SHAPED_FALLBACK);
-            }
-            let node = Arc::clone(&self.node);
-            let fallbacks = Arc::clone(&self.bulk_fallbacks);
-            let ledger = self.metrics.get().cloned();
-            let pause = SlowPathPause {
-                shapers: Arc::clone(&self.shapers),
-                peer: destination_key_id.to_owned(),
-                metrics: self.metrics.get().cloned(),
-            };
-            tokio::spawn(async move {
-                let result = run_bulk_fallback(&node, link, &shaper, frames, &pause).await;
-                fallbacks.finish(&digest, result.is_ok());
-                if let Some(m) = ledger {
-                    m.inc_link_shaping(if result.is_ok() {
-                        crate::observability::LINK_SHAPING_BULK_FALLBACK_OK
-                    } else {
-                        crate::observability::LINK_SHAPING_BULK_FALLBACK_FAILED
-                    });
-                }
-                // choke-ok: every waiter may have gone; the record above stands.
-                let _ = tx.send(Some(result));
-            });
-        }
-        let ended = outcome.wait_for(Option::is_some).await;
-        match ended.as_deref() {
-            Ok(Some(Ok(()))) => Ok(TransportSendOutcome::Delivered),
-            Ok(Some(Err(why))) => Err(TransportError::Io(why.clone())),
-            _ => Err(TransportError::Io(
-                "the bulk fallback's task ended without an outcome".to_owned(),
-            )),
-        }
-    }
-
     /// CC 5.4.3 rc16 **two planes** — the reverse-path link for `envelope`
     /// to `destination_key_id`. Bulk never rides a shaped link: when the
     /// freshest identity link is shaped and the payload needs the bulk plane,
@@ -9889,6 +9908,104 @@ impl ReticulumTransport {
         match shaped {
             Some(s) if !self.shapers.needs_bulk_plane(s.into_bytes(), envelope) => Some(s),
             _ => Some(pick),
+        }
+    }
+
+    /// CC 5.4.3 `CLM-shaped-link-one-hop` — the refusal of a row under
+    /// `require_shaped_links` when `link` runs through a forwarder, or has gone
+    /// direct and is not shaped yet. The direct proposal goes FIRST: a refusal that came before it would leave the link
+    /// forwarded for good, and the rung would deadlock. Bulk and shaped links
+    /// are not this refusal's business, and a node that does not require
+    /// shaped links sends the row sealed and unshaped.
+    async fn row_refused_off_direct(
+        &self,
+        destination_key_id: &str,
+        link: LinkId,
+        envelope: &[u8],
+        candidates: &[DialCandidate],
+    ) -> Option<TransportError> {
+        let id = link.into_bytes();
+        if !self.shapers.policy().require_shaped_links
+            || crate::transport::link_shaping::is_bulk_payload(envelope)
+            || self.shapers.is_shaped(id)
+            || self.shapers.is_bulk(id)
+        {
+            return None;
+        }
+        // A punched link that is not shaped yet is the window between
+        // `DirectLinkEstablished` and the shaper: its offer is on the way, and
+        // a row sent now would cross unshaped. It waits like a forwarded one.
+        let punched = self.node.direct_link_interface(&link).is_some();
+        let dest = self.peer_dest(destination_key_id).await;
+        if !punched && !link_is_forwarded(&self.node, &link, dest) {
+            return None;
+        }
+        if !punched {
+            self.propose_direct_to_room_peer(destination_key_id, link, candidates)
+                .await;
+        }
+        if let Some(m) = self.metrics.get() {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_NO_DIRECT_PATH);
+        }
+        Some(TransportError::LinkSealRefused {
+            peer: destination_key_id.to_owned(),
+            reason: crate::observability::LINK_SHAPING_NO_DIRECT_PATH,
+            detail: "this node requires shaped links, a shaped link is one direct hop, and \
+                     this link is not shaped yet; a direct path was proposed or is keying"
+                .to_owned(),
+        })
+    }
+
+    /// The destination this node holds for `peer`.
+    async fn peer_dest(&self, peer: &str) -> Option<DestinationHash> {
+        self.peers.lock().await.get(peer).map(|r| r.peer.dest_hash)
+    }
+
+    /// **A failed bulk dial never falls back onto shaped frames** (CC 5.4.3,
+    /// `CLM-shaped-link-one-hop`). With a live shaped link the payload would
+    /// have to leave, the failure is remembered for
+    /// [`BULK_DIAL_NEGATIVE_TTL`] and refused by name, and the dispatcher's
+    /// schedule retries it; otherwise the dial's own error stands.
+    async fn bulk_dial_refused(
+        &self,
+        destination_key_id: &str,
+        envelope: &[u8],
+        dial_error: TransportError,
+    ) -> TransportError {
+        if self
+            .shaped_link_for_bulk(destination_key_id, envelope)
+            .await
+            .is_none()
+        {
+            return dial_error;
+        }
+        self.bulk_dial_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(destination_key_id.to_owned(), std::time::Instant::now());
+        tracing::info!(
+            destination_key_id,
+            bytes = envelope.len(),
+            dial_error = %dial_error,
+            reason = crate::observability::LINK_SHAPING_BULK_REFUSED,
+            "no unshaped link reaches this peer; bulk never rides a shaped link, so the send \
+             is refused and retried on its schedule (CC 5.4.3)"
+        );
+        self.bulk_refusal(destination_key_id, envelope.len())
+    }
+
+    /// The named refusal of bulk to a peer no unshaped link reaches.
+    fn bulk_refusal(&self, destination_key_id: &str, bytes: usize) -> TransportError {
+        if let Some(m) = self.metrics.get() {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_BULK_REFUSED);
+        }
+        TransportError::LinkSealRefused {
+            peer: destination_key_id.to_owned(),
+            reason: crate::observability::LINK_SHAPING_BULK_REFUSED,
+            detail: format!(
+                "{bytes} bytes need an unshaped link, and none reaches this peer; a shaped \
+                 link never carries bulk (CC 5.4.3), so the send is retried on its schedule"
+            ),
         }
     }
 
@@ -10652,6 +10769,12 @@ impl Transport for ReticulumTransport {
             facilitator = self.direct_paths.config.facilitator.is_some(),
             "direct links: this node's proposing posture"
         );
+        tokio::spawn(run_asked_idle(
+            Arc::downgrade(&self.node),
+            Arc::clone(&self.seals),
+            Arc::clone(&self.shapers),
+            self.metrics.get().cloned(),
+        ));
         tokio::spawn(run_shaped_shed(
             Arc::downgrade(&self.node),
             Arc::clone(&self.seals),
@@ -10667,9 +10790,12 @@ impl Transport for ReticulumTransport {
             let node_w = Arc::downgrade(&self.node);
             let fa = Arc::clone(&self.forward_admission);
             let out = Arc::clone(&self.forward_load);
+            let metrics = self.metrics.get().cloned();
+            let ladder = self.load_ladder.get().cloned();
             tokio::spawn(async move {
                 let t0 = std::time::Instant::now();
                 let mut tick = tokio::time::interval(Duration::from_secs(1));
+                let mut told = 0;
                 loop {
                     tick.tick().await;
                     let Some(node) = node_w.upgrade() else { return };
@@ -10677,6 +10803,11 @@ impl Transport for ReticulumTransport {
                     drop(node);
                     let now = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let load = fa.refresh(&links, now);
+                    let counts = fa.counts();
+                    told = say_forward_refusals(counts, told, ladder.as_deref(), &fa);
+                    if let Some(m) = &metrics {
+                        m.telemetry.set_forward(counts, &load);
+                    }
                     *out.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = load;
                 }
@@ -10779,12 +10910,35 @@ fn mirror_planes(node: &ReticulumNode, metrics: &crate::observability::EdgeMetri
     );
 }
 
+/// `FSD/CIRIS_MESH.md` §7.7 — a forwarded link this node refused is a dial
+/// that failed somewhere else, so every move of the count is said, once, off
+/// the node lock. Returns the count it has told.
+fn say_forward_refusals(
+    counts: crate::transport::relay_tier::ForwardCounts,
+    told: u64,
+    ladder: Option<&crate::load_ladder::SharedLadder>,
+    fa: &crate::transport::relay_tier::ForwardAdmission,
+) -> u64 {
+    let refused = counts.refused_capacity;
+    if refused > told {
+        tracing::info!(
+            delta = refused - told,
+            reason = crate::observability::FORWARD_REFUSED_CAPACITY,
+            tier = ladder.map_or(0, |l| l.tier().as_u8()),
+            cause = "configured_link_bound",
+            live = counts.live,
+            limit = ?fa.link_limit(),
+            "forward admission refused link requests"
+        );
+    }
+    refused
+}
+
 /// What the node tick reads and moves.
 struct NodeTick {
     node: std::sync::Weak<ReticulumNode>,
     seals: Arc<crate::transport::link_seal::LinkSeals>,
     shapers: Arc<crate::transport::link_shaping::LinkShapers>,
-    forward_admission: Arc<crate::transport::relay_tier::ForwardAdmission>,
     forward_load: Arc<std::sync::Mutex<crate::transport::relay_tier::ForwardLoad>>,
     ladder: Option<Arc<crate::load_ladder::SharedLadder>>,
     metrics: Option<crate::observability::EdgeMetrics>,
@@ -10807,7 +10961,6 @@ impl NodeTick {
             ..crate::load_ladder::EdgeLoadSignals::default()
         });
         if tier != self.shapers.service_tier() {
-            self.forward_admission.set_tier(tier);
             self.shapers.set_service_tier(tier);
         }
     }
@@ -10841,6 +10994,8 @@ impl NodeTick {
         };
         if let Some(m) = &self.metrics {
             m.telemetry.beat(LoopName::Ladder);
+            // A lease that ran out is said here, with nothing else reading it.
+            let _ = m.telemetry.levers.status();
             self.publish(m, &node);
         }
         true
@@ -10877,7 +11032,6 @@ impl ReticulumTransport {
             node: Arc::downgrade(&self.node),
             seals: Arc::clone(&self.seals),
             shapers: Arc::clone(&self.shapers),
-            forward_admission: Arc::clone(&self.forward_admission),
             forward_load: Arc::clone(&self.forward_load),
             ladder: self.load_ladder.get().cloned(),
             metrics: self.metrics.get().cloned(),
@@ -11254,10 +11408,27 @@ impl ReticulumTransport {
                     // Rate-limited so rapid link churn can't storm announces.
                     let link_just_established =
                         matches!(event, NodeEvent::LinkEstablished { .. });
+                    // CC 5.4.3 — off the loop, on a task of its own that ends
+                    // with the offer: nothing long-lived holds the node.
+                    let direct_move = match &event {
+                        NodeEvent::DirectLinkEstablished { link_id, .. } => Some((*link_id, true)),
+                        NodeEvent::DirectLinkLost { link_id, .. } => Some((*link_id, false)),
+                        _ => None,
+                    };
                     let label = event_label(&event);
                     let began = std::time::Instant::now();
                     handle_event(event, &ctx).await;
                     observe(label, began);
+                    if let Some((link_id, up)) = direct_move {
+                        let dial = self.dial_ctx();
+                        tokio::spawn(async move {
+                            if up {
+                                dial.shape_after_direct(link_id).await;
+                            } else {
+                                dial.close_shaped_off_direct(link_id).await;
+                            }
+                        });
+                    }
 
                     // `map_or(true, …)` not `is_none_or` — MSRV 1.75 (is_none_or is 1.82).
                     if link_just_established
@@ -11398,6 +11569,18 @@ impl ReticulumTransport {
         }
 
         // CIRISEdge#353 — REVERSE PATH FIRST (see `send_via_reverse_path`).
+        // CC 5.4.3 — under `require_shaped_links` a row never rides a forwarder.
+        if let Some(link) = self
+            .live_link_to(destination_key_id, LinkPlane::Identity)
+            .await
+        {
+            if let Some(refusal) = self
+                .row_refused_off_direct(destination_key_id, link, envelope_bytes, &candidates)
+                .await
+            {
+                return Err(refusal);
+            }
+        }
         // Ordered AFTER the blackhole check so an operator ban still wins.
         if self
             .send_via_reverse_path(destination_key_id, envelope_bytes, None)
@@ -11432,15 +11615,14 @@ impl ReticulumTransport {
                     .to_owned(),
             });
         }
-        if bulk && self.bulk_dial_recently_failed(destination_key_id) {
-            if let Some(link) = self
+        if bulk
+            && self.bulk_dial_recently_failed(destination_key_id)
+            && self
                 .shaped_link_for_bulk(destination_key_id, envelope_bytes)
                 .await
-            {
-                return self
-                    .bulk_on_shaped(destination_key_id, envelope_bytes, link)
-                    .await;
-            }
+                .is_some()
+        {
+            return Err(self.bulk_refusal(destination_key_id, envelope_bytes.len()));
         }
         let lane = self
             .identity_lane(
@@ -11452,9 +11634,9 @@ impl ReticulumTransport {
         let mut claim = match lane {
             Ok(c) => c,
             Err(e) => {
-                return self
-                    .bulk_on_shaped_or(destination_key_id, envelope_bytes, e)
-                    .await
+                return Err(self
+                    .bulk_dial_refused(destination_key_id, envelope_bytes, e)
+                    .await)
             }
         };
         if self
@@ -11468,9 +11650,9 @@ impl ReticulumTransport {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    return self
-                        .bulk_on_shaped_or(destination_key_id, envelope_bytes, e)
-                        .await
+                    return Err(self
+                        .bulk_dial_refused(destination_key_id, envelope_bytes, e)
+                        .await)
                 }
             };
         }
@@ -11491,6 +11673,13 @@ impl ReticulumTransport {
         // a dial publishes it claimed), so there is no unclaimed lane to ship
         // on: the "claim lost, ship anyway" path is gone.
         let link_id = claim.link_id();
+        if let Some(refusal) = self
+            .row_refused_off_direct(destination_key_id, link_id, envelope_bytes, &candidates)
+            .await
+        {
+            claim.release().await;
+            return Err(refusal);
+        }
         // A `Busy` collision here is not the reverse-path retry case, so both
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
@@ -12284,6 +12473,8 @@ async fn lease_pooled_scoped_link(
 /// equal values diverge.
 #[derive(Clone)]
 struct DialCtx {
+    /// Test seam — [`ReticulumTransport::set_offer_forwarded_for_test`].
+    test_offer_forwarded: Arc<std::sync::atomic::AtomicBool>,
     /// CC 5.4.3 rc16 two planes — this context's lane: `false` the row lane
     /// (dials offer shaping per policy; the pool never hands out a bulk
     /// link), `true` the bulk lane (dials offer none and are marked bulk; the
@@ -12690,6 +12881,13 @@ impl DialCtx {
             "link keyed: transit KEX sent as the first frame (CC 5.3.3.5 E1)"
         );
         Ok(())
+    }
+
+    /// Close a dial that did not establish in its budget. `close_link`
+    /// resolves a re-keyed id, is a no-op on a link already gone, and its
+    /// `LinkClosed` lets go of every per-link record.
+    async fn abandon_dial(&self, link_id: LinkId) {
+        let _ = self.node.close_link(&link_id).await;
     }
 
     /// Close a link whose seal was refused: it is marked refused first, so
@@ -13176,6 +13374,11 @@ impl DialCtx {
         }
         let established_ok = matches!(outcome, Some(Ok(())));
         if !established_ok {
+            // A timed-out dial leaves a pending link behind it, and the peer's
+            // proof may still be on its way. Nothing here will key it, so it
+            // is closed: left alone it would establish unkeyed, with the next
+            // dial's frames looking for a seal it never got.
+            self.abandon_dial(link_id).await;
             // CIRISEdge#336 — a no-path target that never established is
             // un-routable, not slow: fail fast with the self-diagnosing error
             // (naming target dest, key_id, and the paths we DO hold — the
@@ -13481,6 +13684,109 @@ impl DialCtx {
         );
     }
 
+    /// A dial's refusal, counted and named.
+    fn shaping_refused(
+        &self,
+        peer: &str,
+        link: [u8; 16],
+        e: &crate::transport::link_shaping::ShapingError,
+    ) -> TransportError {
+        use crate::transport::link_shaping::ShapingError;
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_link_shaping(e.label());
+            if matches!(e, ShapingError::HomeElsewhere) {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_HOME_ELSEWHERE_RECEIVED);
+            }
+        }
+        tracing::warn!(
+            peer = %peer,
+            link = %hex::encode(link),
+            reason = e.label(),
+            "link shaping refused on a dial; the link is closed (CC 5.4.3)"
+        );
+        TransportError::LinkSealRefused {
+            peer: peer.to_owned(),
+            reason: e.label(),
+            detail: e.to_string(),
+        }
+    }
+
+    /// Why this node offers nothing on a link it would otherwise offer on.
+    ///
+    /// CC 5.4.3 `CLM-shaped-link-one-hop`: a shaped link is one direct hop.
+    /// Through a forwarder nothing is offered and the link runs sealed and
+    /// unshaped; it is offered when it goes direct
+    /// ([`Self::shape_after_direct`]). The link stays up either way: under
+    /// `require_shaped_links` the proposal rides it, and only rows wait.
+    ///
+    /// `CLM-shaped-link-bound-refuse`: a dialler past its own bound offers
+    /// nothing, so no shaper starts at the other end alone, and both ends read
+    /// the link as unshaped. A shaped-only node offers, and refuses at the
+    /// answer.
+    async fn offer_withheld(&self, link_id: LinkId, peer: &str) -> Option<&'static str> {
+        let dest = self.dialed_link_dest.lock().await.get(&link_id).copied();
+        if link_is_forwarded(&self.node, &link_id, dest)
+            && !self
+                .test_offer_forwarded
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Some(crate::observability::LINK_SHAPING_FORWARDED);
+        }
+        (self.shapers.at_bound_for(Some(peer)) && !self.shapers.refuses_past_bound())
+            .then_some(crate::observability::LINK_SHAPING_PAST_BOUND)
+    }
+
+    /// CC 5.4.3 — a dialled link moved onto a punched interface: it is one hop
+    /// now, so the first `SHAP` goes out, at the link's MDU. The dialler offers
+    /// and the peer answers, as on any dial; the seal's transition window
+    /// covers frames that cross it.
+    async fn shape_after_direct(&self, link_id: LinkId) {
+        let link = link_id.into_bytes();
+        if self.shapers.is_shaped(link)
+            || self.shapers.has_offered(link)
+            || self.shapers.is_bulk(link)
+        {
+            return;
+        }
+        let Some(dest) = self.dialed_link_dest.lock().await.get(&link_id).copied() else {
+            return;
+        };
+        let peer = self
+            .peers
+            .lock()
+            .await
+            .iter()
+            .find(|(_, p)| p.peer.dest_hash == dest)
+            .map(|(key_id, _)| key_id.clone());
+        let Some(peer) = peer else { return };
+        if let Err(e) = self.offer_shaping(link_id, &peer).await {
+            tracing::info!(
+                peer = %peer,
+                link = %hex::encode(link),
+                error = %e,
+                "a direct link's shaping offer did not land (CC 5.4.3)"
+            );
+        }
+    }
+
+    /// CC 5.4.3 — a shaped link fell off its punched interface and would run
+    /// through a forwarder, so it closes. The next send dials, unshaped, and
+    /// proposes again.
+    async fn close_shaped_off_direct(&self, link_id: LinkId) {
+        if !self.shapers.is_shaped(link_id.into_bytes()) {
+            return;
+        }
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_DIRECT_LOST);
+        }
+        tracing::info!(
+            link = %hex::encode(link_id.into_bytes()),
+            reason = crate::observability::LINK_SHAPING_DIRECT_LOST,
+            "a shaped link lost its direct path and closes: a shaped link is one hop (CC 5.4.3)"
+        );
+        let _ = self.node.close_link(&link_id).await;
+    }
+
     async fn offer_shaping(&self, link_id: LinkId, peer: &str) -> Result<(), TransportError> {
         use crate::transport::link_shaping::{ShapingError, OFFER_ANSWER_BUDGET};
         // CC 5.4.3 / 5.4.6 item 4 — nothing is offered to a peer this node
@@ -13496,6 +13802,18 @@ impl DialCtx {
             .get(&link_id)
             .is_some_and(|p| shaping_applies_to(*p))
         {
+            return Ok(());
+        }
+        if let Some(label) = self.offer_withheld(link_id, peer).await {
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_link_shaping(label);
+            }
+            tracing::debug!(
+                peer = %peer,
+                link = %hex::encode(link_id.into_bytes()),
+                reason = label,
+                "no shaping offer on this link (CC 5.4.3)"
+            );
             return Ok(());
         }
         let link = link_id.into_bytes();
@@ -13522,28 +13840,14 @@ impl DialCtx {
             m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
             m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED_DIALLED);
         }
-        let refuse = |e: ShapingError| {
-            if let Some(m) = self.metrics.as_ref() {
-                m.inc_link_shaping(e.label());
-                if matches!(e, ShapingError::HomeElsewhere) {
-                    m.inc_link_shaping(crate::observability::LINK_SHAPING_HOME_ELSEWHERE_RECEIVED);
-                }
-            }
-            tracing::warn!(
-                peer = %peer,
-                link = %hex::encode(link),
-                reason = e.label(),
-                "link shaping refused on a dial; the link is closed (CC 5.4.3)"
-            );
-            TransportError::LinkSealRefused {
-                peer: peer.to_owned(),
-                reason: e.label(),
-                detail: e.to_string(),
-            }
-        };
         match tokio::time::timeout(OFFER_ANSWER_BUDGET, answer).await {
             Ok(Ok(Ok(shaped))) => {
                 tracing::debug!(peer = %peer, link = %hex::encode(link), shaped, "shaping offer answered");
+                // A peer with no slot may have named others: a hint, and the
+                // link stays up unshaped whatever comes of it.
+                if !shaped {
+                    self.queue_homing(peer, link);
+                }
                 Ok(())
             }
             Ok(Ok(Err(e))) => {
@@ -13556,7 +13860,7 @@ impl DialCtx {
                         .insert(peer.to_owned(), std::time::Instant::now());
                     self.queue_homing(peer, link);
                 }
-                let err = refuse(e);
+                let err = self.shaping_refused(peer, link, &e);
                 self.close_refused(link_id).await;
                 Err(err)
             }
@@ -13566,7 +13870,7 @@ impl DialCtx {
             Err(_elapsed) => {
                 self.shapers.offer_unanswered(link);
                 if self.shapers.policy().require_shaped_links {
-                    let err = refuse(ShapingError::UnshapedPeer);
+                    let err = self.shaping_refused(peer, link, &ShapingError::UnshapedPeer);
                     self.close_refused(link_id).await;
                     return Err(err);
                 }
@@ -16429,8 +16733,12 @@ async fn shaped_inbound(
                 );
                 None
             }
-            Ok(ShapedFrame::Real(body)) => Some(body),
+            Ok(ShapedFrame::Real(body)) => {
+                s.note_real();
+                Some(body)
+            }
             Ok(ShapedFrame::Many(bodies)) => {
+                s.note_real();
                 // Several bodies in one frame: each routes as a frame of its
                 // own, in order. (A Channel-lane frame is never a Resource.)
                 for body in bodies {
@@ -16491,7 +16799,20 @@ async fn answer_shaping_offer(
     // neighbour is offered shaping under any scope and may take any of
     // the eight (CIRISEdge v44, CC 5.4.3, 5.4.6 item 4).
     let peer = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
-    let ours = if shaping_applies_to(plane) {
+    // CC 5.4.3 `CLM-shaped-link-one-hop` — a link a forwarder carries answers
+    // `off`. No path here is no evidence of one: a leaf newly dialled in must
+    // keep its shaped home link.
+    let dest = match peer.as_deref() {
+        Some(p) => ctx.peers.lock().await.get(p).map(|r| r.peer.dest_hash),
+        None => None,
+    };
+    let forwarded = link_is_forwarded(ctx.node, &link_id, dest);
+    if forwarded {
+        if let Some(m) = ctx.metrics {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_FORWARDED);
+        }
+    }
+    let ours = if shaping_applies_to(plane) && !forwarded {
         if ctx.shapers.load_refuses(peer.as_deref(), theirs).await {
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_REFUSED);
@@ -16503,7 +16824,7 @@ async fn answer_shaping_offer(
                 tier = ctx.shapers.service_tier().as_u8(),
                 "a shaped link refused under load, with referrals (FSD/PRIVACY_MODES.md §6.12)"
             );
-            ctx.shapers.refusal_for(link, peer.as_deref())
+            ctx.shapers.past_bound_answer(link, peer.as_deref())
         } else {
             ctx.shapers.offer_for_answer(
                 link,
@@ -16515,7 +16836,21 @@ async fn answer_shaping_offer(
     } else {
         ctx.shapers.offer_off_for(link)
     };
-    if ours.class == crate::transport::link_shaping::BudgetClass::HomeElsewhere {
+    // `CLM-shaped-link-bound-refuse` — no slot for a peer that offers: the
+    // referrals go out either way. A refusal then closes the link; an `off`
+    // leaves it up, unshaped.
+    let no_slot = shaping_applies_to(plane)
+        && !forwarded
+        && theirs.shapes()
+        && !ours.shapes()
+        && ctx.shapers.offers_to(peer.as_deref());
+    let refused = ours.class == crate::transport::link_shaping::BudgetClass::HomeElsewhere;
+    if refused || no_slot {
+        if !refused {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_PAST_BOUND);
+            }
+        }
         let mut frames = referral_frames(ctx, link_id, peer.as_deref()).await;
         frames.push(ours.encode());
         spawn_refusal_send(
@@ -16524,6 +16859,7 @@ async fn answer_shaping_offer(
             Arc::clone(ctx.shapers),
             link_id,
             frames,
+            refused,
         );
     } else {
         let out =
@@ -16578,6 +16914,9 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
             if let Some(m) = ctx.metrics {
                 m.inc_link_shaping(crate::observability::LINK_SHAPING_AGREED);
                 m.inc_link_shaping(crate::observability::agreed_label(shaper.class()));
+                if !ctx.shapers.offers_to(None) {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_ASKED);
+                }
             }
             let a = *shaper.agreement();
             tracing::info!(
@@ -16748,9 +17087,13 @@ fn spawn_refusal_send(
     shapers: Arc<crate::transport::link_shaping::LinkShapers>,
     link_id: LinkId,
     frames: Vec<Vec<u8>>,
+    closes: bool,
 ) {
     tokio::spawn(async move {
         let out = send_fragments_on_channel(&node, &seals, &shapers, &link_id, &frames).await;
+        if !closes {
+            return;
+        }
         if !out.complete() {
             tracing::debug!(
                 link = %hex::encode(link_id.into_bytes()),
@@ -16815,6 +17158,10 @@ async fn shaped_link_to_dest(ctx: &EventCtx<'_>, dest: [u8; 16]) -> Option<LinkI
 async fn handle_onion_frame(ctx: &EventCtx<'_>, link_id: LinkId, data: &[u8]) {
     use crate::onion::relay::RelayAction;
     use crate::onion::tokens;
+    // CIRISEdge#955 — the transport's own shaping state for this link, never
+    // a peer's claim; `accept_inbound` refuses an unshaped link before any
+    // cryptography. The link keyed behind the receiver order
+    // (`ReceiverOrder::admit` in `gate_handshake`) before this frame opened.
     let on_shaped_link = ctx.shapers.is_shaped(link_id.into_bytes());
     let now = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
     let period = crate::transport::onion_layers::period_of(now);
@@ -16967,101 +17314,38 @@ async fn run_shaped_shed(
     }
 }
 
-/// `FSD/PRIVACY_MODES.md` §6.12 — what a running slow-path transfer checks.
-struct SlowPathPause {
+/// How often the links a peer asked for are read against their TTL.
+const ASKED_IDLE_STEP: Duration = Duration::from_secs(15);
+
+/// `CLM-shaping-offered-never-refused` — a node that does not offer shaping
+/// stops paying cover for a peer that asked and went quiet. The close is a
+/// plain one: the asker reads no fault in it and dials again when it has
+/// something to send, so an idle link costs nothing and nothing storms.
+async fn run_asked_idle(
+    node: std::sync::Weak<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
     shapers: Arc<crate::transport::link_shaping::LinkShapers>,
-    peer: String,
     metrics: Option<crate::observability::EdgeMetrics>,
-}
-
-impl SlowPathPause {
-    /// Whether the transfer waits now. `held` remembers one pause's answer, so
-    /// a transfer reads its peer once per pause and counts it once.
-    async fn holds(&self, held: &mut Option<bool>) -> bool {
-        if !self.shapers.service_tier().pauses_bulk() {
-            *held = None;
-            return false;
-        }
-        if let Some(answer) = *held {
-            return answer;
-        }
-        let paused = self.shapers.slow_path_paused(&self.peer).await;
-        if paused {
-            if let Some(m) = self.metrics.as_ref() {
-                m.inc_link_shaping(crate::observability::LINK_SHAPING_LOAD_SHED_BULK);
-            }
-        }
-        *held = Some(paused);
-        paused
-    }
-}
-
-/// CC 5.4.3 rc16 two planes — feed `frames` to `shaper` as its queue allows
-/// and wait until the link has taken the last of them. The bound follows the
-/// message: three times what the link's real budget needs, plus a minute, and
-/// the time a pause holds it does not count. Paused at tier 2 it keeps its
-/// place in the message (§6.12) and resumes at tier ≤ 1; rows pass meanwhile.
-async fn run_bulk_fallback(
-    node: &ReticulumNode,
-    link: LinkId,
-    shaper: &crate::transport::link_shaping::LinkShaper,
-    mut frames: Vec<Vec<u8>>,
-    pause: &SlowPathPause,
-) -> Result<(), String> {
-    const STOPPED: &str = "link_shaping_bulk_fallback_interrupted: the shaped link closed \
-                           part-way; the message is not delivered and the send is retried";
-    let agreement = *shaper.agreement();
-    #[allow(clippy::cast_precision_loss)] // a frame count; a bound, not an amount
-    let budget = frames.len() as f64 / (agreement.rho * shaper.lambda_now()).max(0.001);
-    let mut deadline = tokio::time::Instant::now()
-        + Duration::from_secs_f64(budget * 3.0)
-        + Duration::from_secs(60);
-    let mut held = None;
-    // Rows now sit between this message's frames, so a retraction names this
-    // message's batches and never the range they span.
-    let mut batches: Vec<(u64, u64)> = Vec::new();
-    let retract = |batches: &[(u64, u64)]| {
-        for (lo, hi) in batches {
-            shaper.retract(*lo, *hi);
-        }
-    };
-    let mut ticket = 0;
+) {
+    let mut tick = tokio::time::interval(ASKED_IDLE_STEP);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        if !node.link_is_established(&link) || shaper.is_stopped() {
-            retract(&batches);
-            return Err(STOPPED.to_owned());
-        }
-        if tokio::time::Instant::now() > deadline {
-            retract(&batches);
-            return Err(
-                "link_shaping_bulk_fallback_timeout: the shaped link did not take the \
-                 message within its budget; the send is retried"
-                    .to_owned(),
+        tick.tick().await;
+        let Some(node) = node.upgrade() else { return };
+        for link in shapers.asked_links_idle() {
+            if let Some(m) = metrics.as_ref() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_ASKED_IDLE);
+            }
+            tracing::info!(
+                link = %hex::encode(link),
+                reason = crate::observability::LINK_SHAPING_ASKED_IDLE,
+                "a shaped link this node was asked for closed, idle past its TTL: the peer \
+                 dials again when it has something to send (CC 5.4.3)"
             );
+            seals.refuse(link);
+            shapers.forget(&link);
+            let _ = node.close_link(&LinkId::new(link)).await;
         }
-        let paused = pause.holds(&mut held).await;
-        // E3 — rows first: a few frames at a time, so a row queued now waits
-        // behind those and not behind the file.
-        let room = if paused {
-            deadline += Duration::from_millis(100);
-            0
-        } else {
-            shaper.room().min(frames.len()).min(
-                crate::transport::link_shaping::SLOW_PATH_QUEUED_MAX
-                    .saturating_sub(shaper.queued()),
-            )
-        };
-        if room > 0 {
-            let n = u64::try_from(room).unwrap_or(u64::MAX);
-            ticket = shaper
-                .enqueue_bulk_fallback(frames.drain(..room).collect())
-                .map_err(|e| e.to_string())?;
-            batches.push((ticket + 1 - n, ticket));
-        }
-        if frames.is_empty() && shaper.ticket_left(ticket) {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -17121,6 +17405,22 @@ fn spawn_shaper_task(
                         crate::observability::LINK_SHAPING_FRAMES_COVER
                     });
                 }
+                continue;
+            }
+            if matches!(&sent, Ok(Err(e)) if is_over_channel_limit(e)) {
+                if real {
+                    shaper.note_sent(ticket);
+                }
+                if let Some(m) = metrics.as_ref() {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_FRAME_TOO_LARGE);
+                }
+                tracing::warn!(
+                    link = %hex::encode(link),
+                    real,
+                    bytes = sealed.len(),
+                    "a shaped frame is over the link's Channel limit: dropped, the link is \
+                     alive (CC 5.4.3)"
+                );
                 continue;
             }
             if let Some(m) = metrics.as_ref() {
@@ -21851,6 +22151,38 @@ async fn with_timeout<F: std::future::Future>(dur: Duration, fut: F) -> Option<F
 mod tests {
     use super::*;
 
+    /// A radio keeps `Current`, built in or hot-plugged: `ByMedium` decides per
+    /// resource from the interface, so a node with no radio at build time is
+    /// safe when one arrives. A fast path past the old 31 ms cliff opens up.
+    #[test]
+    fn the_window_policy_is_by_medium_and_a_radio_keeps_current() {
+        use leviculum_core::traits::InterfaceKind;
+        use leviculum_std::resource_policy::WindowPolicy;
+        assert_eq!(RESOURCE_WINDOW_POLICY, WindowPolicy::ByMedium);
+        let on = |kind, rtt| RESOURCE_WINDOW_POLICY.for_path(Some(kind), rtt);
+        assert_eq!(on(InterfaceKind::Rnode, 40), WindowPolicy::Current);
+        assert_eq!(on(InterfaceKind::Tcp, 40), WindowPolicy::Adaptive);
+        assert_eq!(
+            on(InterfaceKind::Tcp, 2_000),
+            WindowPolicy::Current,
+            "a slow round trip is a radio hop behind a fast first hop"
+        );
+    }
+
+    /// A frame over the Channel limit is named. It used to read as a dead link.
+    #[test]
+    fn a_frame_over_the_channel_limit_is_not_a_dead_link() {
+        use crate::transport::link_stall::ChannelLanding;
+        use leviculum_core::SendError;
+        use leviculum_std::error::Error;
+        assert!(is_over_channel_limit(&Error::Send(SendError::TooLarge)));
+        assert!(!is_over_channel_limit(&Error::Send(SendError::LinkFailed)));
+        assert_eq!(
+            ChannelLanding::classify(0, 1, Some(FRAME_OVER_CHANNEL_LIMIT)),
+            ChannelLanding::Refused,
+        );
+    }
+
     /// CIRISEdge#716 — every piece the fragmenter produces for a link must be
     /// accepted by leviculum's Channel on that link. Checked against the
     /// authority itself (`Channel::mdu`), over the base-MTU link MDU the field
@@ -22426,6 +22758,133 @@ mod tests {
             "history: CIRISEdge#425 — un-instrumented inbound exit(s); route through `drop_inbound(...)` \
              or a `tracing::` log, or annotate `// choke-ok: <why it is not a silent drop>`:\n{}",
             violations.join("\n")
+        );
+    }
+
+    /// The lines inside a `#[cfg(test)] mod … { … }`: not call sites.
+    fn test_mod_lines(lines: &[&str]) -> Vec<bool> {
+        let mut v = vec![false; lines.len()];
+        let mut i = 0;
+        while i + 1 < lines.len() {
+            if lines[i] == "#[cfg(test)]" && lines[i + 1].starts_with("mod ") {
+                let end = lines[i + 2..]
+                    .iter()
+                    .position(|l| *l == "}")
+                    .map_or(lines.len(), |p| i + 2 + p);
+                v[i..end].iter_mut().for_each(|b| *b = true);
+                i = end;
+            }
+            i += 1;
+        }
+        v
+    }
+
+    /// CIRISEdge#955 — **an onion frame is read only behind the receiver
+    /// order** (CC 5.3.3.5 E1 rule 9: the receiver rates run before expensive
+    /// work). The onion decapsulation (`accept_inbound`) is reached only from
+    /// an OPENED sealed frame; a frame opens only on a keyed link; a link keys
+    /// only through the keyer; and the one door into the keyer is
+    /// `gate_handshake`, which runs `ReceiverOrder::admit` first. Pinned on the
+    /// source, call site by call site, so a new path to the onion handler, or
+    /// a keyer submit ahead of the admit, fails here.
+    #[test]
+    fn an_onion_frame_is_read_only_behind_the_receiver_order() {
+        let src = include_str!("reticulum.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let in_test_mod = test_mod_lines(&lines);
+        let enclosing = |idx: usize| -> &str {
+            lines[..=idx]
+                .iter()
+                .rev()
+                .find_map(|l| {
+                    l.strip_prefix("async fn ")
+                        .or_else(|| l.strip_prefix("fn "))
+                        .map(|r| r.split('(').next().unwrap_or(r))
+                })
+                .unwrap_or("?")
+        };
+        // Production call sites of `needle`: line index and enclosing fn.
+        let calls = |needle: &str| -> Vec<(usize, &str)> {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(i, l)| {
+                    let t = l.trim_start();
+                    !in_test_mod[*i]
+                        && l.contains(needle)
+                        && !t.starts_with("//")
+                        && !l.starts_with("async fn ")
+                })
+                .map(|(i, _)| (i, enclosing(i)))
+                .collect()
+        };
+        let only_in = |needle: &str, fns: &[&str]| {
+            let sites = calls(needle);
+            assert!(
+                !sites.is_empty(),
+                "characterization pin: no call to {needle}"
+            );
+            for (i, f) in &sites {
+                assert!(
+                    fns.contains(f),
+                    "{needle} called from `{f}` at line {}; only {fns:?} may",
+                    i + 1
+                );
+            }
+            sites
+        };
+        // The onion handler, and the chain up to the opened frame.
+        assert_eq!(
+            only_in("handle_onion_frame(ctx", &["attribute_and_deliver"]).len(),
+            1
+        );
+        only_in("attribute_and_deliver(ctx", &["route_now"]);
+        only_in("route_now(ctx", &["route_opened", "release_held"]);
+        only_in("seals.hold(", &["route_opened"]);
+        for (i, f) in only_in(
+            "route_opened(ctx",
+            &["shaped_inbound", "replay_before_keys", "handle_event"],
+        ) {
+            let opened = match f {
+                "replay_before_keys" => lines[i].contains("Inbound::Open(plain) =>"),
+                "handle_event" => lines[i.saturating_sub(15)..i]
+                    .iter()
+                    .any(|l| l.contains("seal_inbound(")),
+                _ => true,
+            };
+            assert!(
+                opened,
+                "route_opened at line {} is not on an opened frame",
+                i + 1
+            );
+        }
+        for (i, _) in only_in("shaped_inbound(ctx", &["seal_inbound"]) {
+            assert!(
+                lines[i].contains("Inbound::Open(plain) =>"),
+                "line {}",
+                i + 1
+            );
+        }
+        // The one door into the keyer runs the receiver order first.
+        let submits = only_in("keyer.submit(", &["gate_handshake"]);
+        assert_eq!(submits.len(), 1);
+        let (at, _) = submits[0];
+        assert!(
+            lines[at]
+                .trim_start()
+                .starts_with(".and_then(|()| ctx.keyer.submit("),
+            "the keyer runs only once the receiver order admitted: {}",
+            lines[at]
+        );
+        let start = lines[..at]
+            .iter()
+            .rposition(|l| l.starts_with("async fn gate_handshake("))
+            .expect("gate_handshake");
+        assert!(
+            lines[start..at]
+                .iter()
+                .any(|l| l.contains(".admit_handshake(")),
+            "gate_handshake must call the receiver order before the keyer"
         );
     }
 

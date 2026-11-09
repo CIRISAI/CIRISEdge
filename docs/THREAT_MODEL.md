@@ -1,32 +1,79 @@
 # CIRISEdge Threat Model
 
-**Status:** v1.0.0 GA — production-grade. Substrate locked. ~417 tests
-pass against the CEWP-aligned pins (ciris-persist v3.6.3 +
-ciris-verify v4.4.2). Reticulum + HTTPS transports both production-
-grade, byte-equivalent (HTTPS promoted from "fallback" to fully-
-equivalent at v0.13.0 CIRISEdge#23 Track B). Authenticated
-`PeerResolver` cold-start (AV-42, v0.4.0). UniFFI binding surface
-(v0.13.0 CIRISEdge#36 GO). 7-capsule cohabitation handoff with
-`local_signer` for the Reticulum transport identity (v0.16.1 main-line
-cherry-pick of v0.13.1 patch line, CIRISEdge#43) and
-`trust_scoring_capsule` for the dispatch-inbound trust short-circuit
-(v0.20.0 RC1, CIRISEdge#51 / CIRISPersist#129). The v1.0 security
-contract is the seven invariants AV-43 through AV-49 — each is
-mitigated structurally, not by runtime hope. Prior baseline: v0.0
-spec-only scaffold at `3fc4ab0`. Updated each minor release.
+**Line:** **v44.x** (the long-term support line), written against **v44.1.0**
+(`Cargo.toml:3`, base `release/44.1.0` at `1175e65`). Regenerated per release
+line, not per minor; a minor that changes a vector below amends it in place.
+
+**Pins this document describes** (read from `Cargo.toml` and `pyproject.toml`):
+
+| Dependency | Pin | Source |
+|---|---|---|
+| `ciris-persist` | tag `v61.0.4` (61.0.5 expected on this line) | `Cargo.toml:454` |
+| `ciris-keyring` / `ciris-crypto` / `ciris-verify-core` (CIRISVerify) | tag `v22.0.0` | `Cargo.toml:478-488` |
+| `leviculum-core` / `-std` / `-lxmf` | tag `v0.34.0+ciris.1` | `Cargo.toml:952-963` |
+| Python wheel floor | `ciris-persist>=61.0.4,<62` | `pyproject.toml:123` |
+| Constitution text | CC 1.0-rc17 (namespace manifests vendored at rc15, `ace6b74`) | `docs/RELEASE_NOTES.md` (v44.0.0); `src/cc_namespace.rs:31` |
+| Wire vocabulary | `WIRE_VOCABULARY.md` **v1.0.2**, sha256 `38bd4847…` | `src/lib.rs:159-169`; `CIRISConstitution/manifests/WIRE_VOCABULARY.md` |
+
 **Audience:** federation peers integrating against `ciris-edge`, security
-reviewers, downstream substrate consumers (`CIRISLens`, `CIRISAgent`,
-`CIRISRegistry`).
+reviewers, downstream substrate consumers (`CIRISServer`, `CIRISAgent`,
+`CIRISLens`, `CIRISRegistry`).
 **Companion:** [`MISSION.md`](../MISSION.md), [`FSD/CIRIS_EDGE.md`](../FSD/CIRIS_EDGE.md),
-[`FSD/OPEN_QUESTIONS.md`](../FSD/OPEN_QUESTIONS.md).
+[`FSD/CIRIS_EDGE_TRANSPORT.md`](../FSD/CIRIS_EDGE_TRANSPORT.md),
+[`FSD/PRIVACY_MODES.md`](../FSD/PRIVACY_MODES.md),
+[`FSD/ONION_ROUTING.md`](../FSD/ONION_ROUTING.md),
+[`docs/LIGHTNET_DARKNET.md`](LIGHTNET_DARKNET.md).
+**Normative source:** the CIRIS Constitution (CC), above all Part 5
+(transport) and CC 1.13.3 (what the substrate does and does not buy). Where
+this document and the CC disagree, the CC is right and this document is the
+bug. CC 1.13.3.3 is the canonical adversary-class table; §2 below does not
+restate it.
 **Inspired by:** [`CIRISVerify/docs/THREAT_MODEL.md`](https://github.com/CIRISAI/CIRISVerify/blob/main/docs/THREAT_MODEL.md)
-(structural template), [`CIRISProxy/docs/THREAT_MODEL.md`](https://github.com/CIRISAI/CIRISProxy/blob/main/docs/THREAT_MODEL.md)
-(transport-class adjacency), [`CIRISPersist/docs/THREAT_MODEL.md`](https://github.com/CIRISAI/CIRISPersist/blob/main/docs/THREAT_MODEL.md)
+(structural template), [`CIRISPersist/docs/THREAT_MODEL.md`](https://github.com/CIRISAI/CIRISPersist/blob/main/docs/THREAT_MODEL.md)
 (verify-and-persist substrate).
-**Federation primitives addressed:** N1 (cryptographic addressing) and N2
-(multi-medium transport) — the two primitives the federation meta threat
-model (`FEDERATION_THREAT_MODEL.md` §5) lists as unfilled. CIRISEdge is
-the substrate that fills both.
+
+**How to read the sources.** Every claim added or re-checked for 44.x names
+where it comes from: a CC section (`CC 5.4.3`), an FSD or doc, or a
+`file:line` at `1175e65`. Line numbers drift; the symbol named beside them
+is the stable anchor.
+
+**How to read the older text.** §4.1–§4.9 (AV-1 … AV-52 and the
+canonical-peer invariant) are the vectors as first written, each dated by
+the version it names; §1–§3 keep their v1.0 structure. Statements in them
+found untrue at 44.1 have been removed or corrected in place, saying so
+where the correction matters; the rest were not re-derived line by line
+for this regeneration and are dated, not current. **§0, §4.10 and §5–§11
+are the 44.x surface** and govern where an older entry reads otherwise.
+
+---
+
+## 0. The 44.x line at a glance
+
+What changed in the threat surface since the v1.0.0 document, in one place.
+
+- **Every byte on an RNS link is under a hybrid transit seal** (CC 5.3.3.5
+  E1, enforced at once, no advisory mode: `src/transport/link_seal.rs:1-16`).
+  The RNS link layer underneath is classical and is not relied on for
+  post-quantum confidentiality (CC 5.3.3.5 E1 rule 2). AV-53.
+- **Producers sign hybrid.** Ed25519 + ML-DSA-65 is mandatory at admission
+  (CC 5.3.2.4.3.1). The consumer `HybridPolicy` defaults to `Strict`
+  (`src/edge.rs:579`); see §9 R-4 for the fallback setting that remains.
+- **Three meshes, and the shaping rules of CC 5.4.3 rc17**: a shaped row
+  mesh, an unshaped bulk plane, and an unshaped A/V plane. A shaped link is
+  one hop; a node holds at most eight; past eight a link runs unshaped unless
+  the node is shaped-only or Anonymous-Tier; "off" means "does not offer",
+  never "refuses"; a message over 64 KiB never crosses a shaped link. AV-54,
+  AV-55.
+- **What moves to a peer** (CC 5.2): a row moves when requested, or required,
+  and appropriate, never because it is federation-tier. AV-56.
+- **Relay forwarding never closes on the service tier**; the host sheds
+  load through graduated, leased levers that refuse nothing. AV-57.
+- **The Anonymous Tier is wired and dormant** (`src/onion/mod.rs:1-8`):
+  off by default, and unavailable on every node because no layer reaches
+  three relays. Its replay set is bounded by CIRISEdge#955 (landing in
+  44.1). AV-58, AV-59.
+- **The residuals the CC states are stated here** (§9), with the scope of
+  what has been measured and what has not.
 
 ---
 
@@ -36,28 +83,36 @@ the substrate that fills both.
 
 CIRISEdge is the federation transport substrate. It carries cryptographic
 envelopes between sovereign peers across whatever network media exist
-(TCP, LoRa, packet radio, serial, I²P, HTTP fallback). Per MISSION.md §2
-it protects:
+(Reticulum over TCP, UDP, LoRa/RNode and local interfaces; packet radio;
+HTTPS). Per MISSION.md §2 it protects:
 
 - **Wire-edge integrity**: no application code touches a byte that hasn't
-  been verified against `persist.engine.lookup_public_key()`. Verify is a
-  precondition for handler dispatch, not an opt-in.
-- **Cryptographic addressing**: per PoB §3.2, the Reticulum destination
-  is `sha256(public_key)[..16]` — the address IS the identity. No DNS,
-  no certificate authority, no out-of-band binding. Forging an address
-  requires forging the underlying public key.
-- **FFI boundary discipline**: the steward seed lives in `ciris-persist`'s
-  keyring; edge holds the `Engine` handle and calls into persist for
-  every sign / verify operation. The seed bytes never enter edge's
-  process memory. Same discipline persist established in v0.2.2 for
-  `Engine.steward_sign()` (CIRISPersist#10).
+  been attributed to a `Rooted ∧ owns_key` federation identity and
+  verified through persist's directory. Verify is a precondition for
+  handler dispatch, not an opt-in.
+- **Link confidentiality, post-quantum**: every byte on an RNS link rides
+  a hybrid X25519 + ML-KEM-768 transit seal bound to the link and to a
+  pair authenticated to the dialled identity (CC 5.3.3.5 E1; AV-53).
+- **Structural invisibility**: `self` / `family` content emits no holding
+  claim outside its cohort, and group-scoped destinations are never
+  announced (CC 5.2, CC 5.4.6). This buys content-holding confidentiality
+  only (§9 R-C1).
+- **Cryptographic addressing**: the Reticulum destination is a hash of
+  the node's dedicated transport identity, a second keypair distinct
+  from its federation key; the two are bound only by the node's signed
+  route row (AV-42, AV-53). No DNS, no certificate authority.
+- **Signer boundary**: the federation signing seed is held behind the
+  keyring signer (`Arc<dyn HardwareSigner>`); edge's code calls it and
+  never reads the seed. Transport secrets (the RNS identity, the transit
+  KEX seed, per-link keys) are edge's and live in its process, zeroized on
+  drop (`src/transport/transit_kex_custody.rs:1-30`; AV-17).
 - **Verify-via-persist contract**: edge does not maintain its own
   public-key cache or canonicalization implementation. Persist's
   `lookup_public_key()` and `canonicalize_envelope()` are the single
   sources of truth. Re-implementing either in edge is the
   CIRISPersist#7 trap.
 - **Replay protection within a bounded window**: edge maintains a
-  sliding window (5 min in Phase 1 per `OPEN_QUESTIONS.md` OQ-08) of
+  sliding window (5 min default per `OPEN_QUESTIONS.md` OQ-08) of
   recently-seen `(signing_key_id, nonce)` pairs. Beyond the window,
   persist's dedup tuple `(agent_id_hash, trace_id, thought_id,
   event_type, attempt_index, ts)` (CIRISPersist AV-9 closure) catches
@@ -91,25 +146,24 @@ it protects:
   messages to typed handlers; whether the host application *should*
   process a given message under the application's policy is host-code
   responsibility.
-- **TLS termination on HTTP fallback**. The HTTP fallback transport
-  (Phase 1, gated on Reticulum non-availability) uses TLS provided by
-  the deployment-edge proxy (nginx, ALB). Misconfigured TLS is a
-  deployment concern, not edge's.
+- **TLS termination on HTTPS**. The HTTPS transport uses TLS (mTLS or
+  bearer, `docs/HTTPS_DEPLOYMENT.md`) configured by the deployment; the
+  E1 seal is a Reticulum rule and does not cover HTTPS. Misconfigured TLS
+  is a deployment concern, not edge's.
 - **Operator UI surfaces**. Grafana, OAuth, admin console — explicitly
   out of scope per FSD §2. Each peer keeps its own operator-UI HTTP
   stack.
-- **Quantum compromise of Ed25519 *under Ed25519-fallback consumer
-  policy*.** Edge ships hybrid Ed25519 + ML-DSA-65 verify in v0.1.0
-  (OQ-11 closure: hybrid PQC is already in prod across CIRISVerify
-  v1.9.0 + CIRISPersist v0.2.0+). Three consumer policies are
-  selectable per peer: strict-hybrid, soft-hybrid+freshness, and
-  Ed25519-fallback. Quantum residual exists only under Ed25519-fallback;
-  strict-hybrid eliminates it modulo persist's eventual-consistency
-  trust contract for hybrid-pending rows.
-- **Reticulum-rs / Leviculum implementation bugs**. The transport-impl
-  threat model is the upstream crate's; edge wraps the trait.
-  Cross-implementation byte-equivalence is a regression test category
-  (MISSION.md §5).
+- **What the Constitution names as non-goals**: relationship existence,
+  the communication graph, traffic analysis outside a shaped link,
+  unobservability against a global passive adversary, post-compromise
+  security for streams (CC 1.13.3.1). §9 states each.
+- **Post-quantum metadata on the RNS layer**. The RNS link request,
+  announce and path request are classical; the PQ guarantee is carried
+  by the seal, content keys and hybrid signatures above them
+  (CC 5.3.3.5 E1 rules 2-3; §9 R-4).
+- **leviculum implementation bugs**. Edge's RNS is leviculum
+  (`CIRISAI/leviculum` `v0.34.0+ciris.1`); a bug there is edge's
+  exposure, tracked upstream (§9 R-11).
 
 ---
 
@@ -120,24 +174,27 @@ it protects:
 The adversary is assumed to have:
 
 - **Full source-code access** (AGPL-3.0, public).
-- **Ability to mint arbitrary Ed25519 keypairs** and sign bytes.
+- **Ability to mint arbitrary keypairs**, classical or hybrid, and sign
+  bytes; a swarm of fresh keys costs nothing (CC 1.13.3.3).
 - **Network access to all configured transports**: arbitrary bytes to
-  the HTTP endpoint, Reticulum link establishment with arbitrary
-  identities, simulated LoRa / serial / I²P link establishment.
+  the HTTPS endpoint, Reticulum link establishment with arbitrary
+  identities, LoRa / serial link establishment.
 - **Ability to run their own peers** on the federation and request
   federation_keys registration.
 - **Replay capability**: capture any in-transit message and re-send.
-- **Active MITM** on HTTP fallback if TLS is misconfigured at the
-  deployment edge.
+- **Active MITM** on HTTPS if TLS is misconfigured at the deployment
+  edge; on-path position as a Reticulum forwarder.
+- **Record now, decrypt later**: capture of every link today against a
+  future quantum computer (CC 5.3.3.5 E1 rule 2).
 - **Side-channel observation**: response timing, transport-level error
   codes, structured-log output if exposed.
 - **Ability to read public CI artifacts**: every published Cargo
   release, the dep tree, the deny.toml, the Dockerfile.
-- **Compute resources sufficient for classical cryptography** but not
-  for breaking Ed25519 within polynomial time.
+- **Compute resources sufficient for classical cryptography**; quantum
+  compute is assumed eventually, against recorded traffic.
 - **Ability to submit malformed canonical bytes** at any wire entry
   point.
-- **Slow-medium privilege**: on LoRa / serial / I²P, transport-level
+- **Slow-medium privilege**: on LoRa / serial, transport-level
   jitter and asymmetric latency give the adversary additional timing
   observation surface compared to TCP.
 
@@ -145,9 +202,8 @@ The adversary is assumed to have:
 
 The adversary is assumed NOT to have:
 
-- **The ability to break Ed25519** within polynomial time on classical
-  hardware. (PoB §6 acknowledges quantum risk; `signature_pqc` field
-  reserved.)
+- **The ability to break both halves of a hybrid** (Ed25519 and
+  ML-DSA-65; X25519 and ML-KEM-768) at once.
 - **Compromised the federation directory** (`federation_keys` /
   `accord_public_keys` in persist). Edge's verify is gated on this
   directory; if it's owned, the threat model breaks at persist's layer.
@@ -155,8 +211,6 @@ The adversary is assumed NOT to have:
   boundary discipline persist established in v0.2.2.
 - **Compromised the deployment hardware** running edge (process memory
   inspection, debugger attachment, coredump capture).
-- **Quantum compute** capable of breaking Ed25519 today (tracked in §9
-  Residual Risks; PoB §6 hybrid-PQC is Phase 2+).
 - **Broken sha256** to forge cryptographic addresses.
 - **Physical access to LoRa / serial hardware** at the edge deployment
   (transport-physical-layer attacks are out of scope for this crate).
@@ -167,8 +221,8 @@ The adversary is assumed NOT to have:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ Adversary-controlled wire (TCP / LoRa / packet radio / serial /     │
-│ I²P / HTTP fallback)                                                │
+│ Adversary-controlled wire (TCP / UDP / LoRa / packet radio /        │
+│ serial / HTTPS)                                                     │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │ raw bytes
                            ▼
@@ -178,7 +232,7 @@ The adversary is assumed NOT to have:
 │   ┌──────────────────────────────────────────────────────┐          │
 │   │ transport/                                            │          │
 │   │   Trust boundary 1: untrusted bytes enter            │          │
-│   │   Reticulum link state OR HTTPS request body         │          │
+│   │   RNS link: E1 seal first (AV-53) OR HTTPS body      │          │
 │   └─────────────────────────┬────────────────────────────┘          │
 │                             ▼                                        │
 │   ┌──────────────────────────────────────────────────────┐          │
@@ -189,16 +243,16 @@ The adversary is assumed NOT to have:
 │   │   │ - lookup_public_key(signing_key_id)      │       │          │
 │   │   │ - canonicalize_envelope()                │       │          │
 │   │   │ - steward_sign() for outbound            │       │          │
-│   │   │ Seed bytes NEVER cross this boundary     │       │          │
+│   │   │ Signing seed stays behind the signer     │       │          │
 │   │   └──────────────────────────────────────────┘       │          │
-│   │   Ed25519 verify_strict(canonical, sig, pubkey)      │          │
+│   │   attribution + hybrid Ed25519/ML-DSA-65 verify      │          │
 │   └─────────────────────────┬────────────────────────────┘          │
 │                             ▼                                        │
 │   ┌──────────────────────────────────────────────────────┐          │
 │   │ handler/                                              │          │
 │   │   Trust boundary 3: typed dispatch                   │          │
 │   │   No unverified bytes past this line — invariant    │          │
-│   │   asserted by verify_enforcement test category       │          │
+│   │   held by the private dispatch path (AV-9)           │          │
 │   └─────────────────────────┬────────────────────────────┘          │
 └─────────────────────────────┼────────────────────────────────────────┘
                               ▼
@@ -208,23 +262,21 @@ The adversary is assumed NOT to have:
 
 **Explicit non-boundary**: edge's process and persist's `Engine` share
 heap. Persist's `Engine` is constructed in the host process and passed
-to edge by reference. The seed-bytes-don't-cross-FFI invariant is
-maintained by persist's API surface (the seed is held in OS-keyring,
-never returned across the boundary — see CIRISPersist v0.1.3+ AV-25
-closure). Edge tests assert this invariant by heap-scan property tests
-(MISSION.md §4 "Identity boundary").
+to edge by reference. The signing seed is held by the keyring signer and
+never returned across its API; under `SoftwareOnly` custody it is on disk
+and, once loaded, in the same process's memory (§9 R-10). The heap-scan
+property test earlier versions of this document named was never built:
+the invariant is the signer API's, not a test's.
 
 ---
 
 ## 4. Attack Vectors
 
-Thirty-one vectors organized by adversary goal (twenty-four
-pre-Phase-1 vectors AV-1..AV-25; AV-42 added at v0.4.0;
-AV-43..AV-47 added at v0.17.1 — these document architectural surfaces
-that landed across v0.13.0 → v0.17.0; plus the canonical-peer
-invariant documented as a forward-looking threat-modeling anchor for
-the v0.18.0 wire-up of CIRISEdge#46). Each lists the attack, the
-primary mitigation, secondary mitigation, and residual risk.
+Vectors organized by adversary goal: AV-1..AV-25 (pre-Phase-1),
+AV-42 (v0.4.0), AV-43..AV-49 (v0.13 → v1.0), AV-50 and AV-52 (v4.0,
+v5.0), the canonical-peer invariant, and **AV-53..AV-59, the 44.x surface
+(§4.10)**. Each lists the attack, the mitigation and the residual. See
+the note at the top of this document on how the older entries are dated.
 
 ### 4.1 Identity / Forgery — adversary wants their bytes counted
 
@@ -272,9 +324,9 @@ nonce)` pairs seen in the last `replay_window_secs` (5 min default per
 OQ-08, configurable Phase 2). Replayed within window → typed
 `replay_detected` reject → handler is never invoked.
 
-**Secondary**: TLS at the deployment edge (HTTP fallback only)
-prevents in-flight capture; not edge's responsibility. Reticulum's
-native link encryption covers the canonical transport.
+**Secondary**: on Reticulum, the E1 transit seal (AV-53) keeps an
+on-path forwarder from capturing envelope bytes at all; on HTTPS, TLS at
+the deployment edge does.
 
 **Residual**: the LRU is process-local. A replay against a *second*
 edge instance of the same peer (multi-replica deployment) lands once
@@ -320,7 +372,7 @@ AV-4 residual). Edge inherits the same exposure and the same closure
 path — a future change to persist's canonicalizer rolls out via persist
 version pin in edge's `Cargo.toml`.
 
-**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md v1.0.1 §3.3):** for a Tier-2
+**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md §3.3; v1.0.1 when written, unchanged in v1.0.2):** for a Tier-2
 opaque `payload` (`OpaqueRequest` / `OpaqueResponse` / `OpaqueEvent`),
 **edge canonicalizes nothing** — the `payload` is opaque bytes edge
 carries verbatim, so the AV-5 canonicalization-mismatch surface does
@@ -403,7 +455,7 @@ verify under some condition. PR review + the verify_enforcement test
 category catch this; the test passes only if zero unverified
 invocations occur over N>=1M fuzz runs.
 
-**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md v1.0.1 §3.3):** a verified
+**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md §3.3; v1.0.1 when written, unchanged in v1.0.2):** a verified
 Tier-2 `OpaqueRequest` whose `kind: u32` has no registered handler is
 **not** silently dropped. The handler replies
 `OpaqueResponse { kind: <echo>, status: 501, payload: b"unknown kind" }`
@@ -482,14 +534,14 @@ the axum extractor layer (`DefaultBodyLimit::max(8 * 1024 * 1024)`).
 Reticulum: link-frame size limits applied by the transport crate;
 `MAX_BODY_BYTES` enforced after reassembly, before parse.
 
-**Secondary**: deployment-edge proxy on HTTP fallback caps body size
+**Secondary**: deployment-edge proxy on HTTPS caps body size
 upstream of edge.
 
 **Residual**: until the limit is enforced symmetrically across all
 transports, body-size flood is a defense-in-depth gap on novel
 transports. Track at every new-transport PR.
 
-**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md v1.0.1 §3.3):** the
+**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md §3.3; v1.0.1 when written, unchanged in v1.0.2):** the
 `MAX_BODY_BYTES` cap applies to the Tier-2 opaque `payload` on
 `OpaqueRequest` / `OpaqueResponse` / `OpaqueEvent` exactly as it does
 to any Tier-1 body. Edge treats `payload` as opaque bytes and enforces
@@ -523,17 +575,18 @@ PoB §2.1 names.
 **Attack**: Network-adjacent adversary reads in-transit envelope
 bodies on a misconfigured transport.
 
-**Mitigation**: Reticulum provides native link-layer encryption
-(canonical transport). HTTP fallback uses TLS at the deployment-edge
-proxy. Edge does NOT add a third encryption layer (FSD §11
-out-of-scope).
+**Mitigation (44.x)**: on Reticulum, every edge frame rides the E1
+hybrid transit seal over the RNS link's own (classical) encryption, with
+no plaintext edge frame in either direction and no classical-only lane
+(CC 5.3.3.5 E1; `src/transport/link_seal.rs:1-16`; AV-53). Earlier
+versions of this entry said edge adds no encryption layer of its own;
+that stopped being true with the seal. On HTTPS, TLS at the deployment
+edge.
 
-**Residual**: HTTP fallback with no TLS at the deployment edge is a
-deployment misconfiguration that exposes envelope bodies. Edge MAY
-emit a startup warning if HTTP transport is configured without an
-upstream TLS termination indication, but ultimately TLS posture is
-the operator's job. LoRa / serial / I²P: native encryption per
-Reticulum's link layer.
+**Residual**: HTTPS with no TLS at the deployment edge is a deployment
+misconfiguration that exposes envelope bodies. On RNS, link setup and
+the pre-seal route row are visible (the row is public by construction,
+E1 rule 9).
 
 #### AV-16: Side-channel timing on verify
 
@@ -566,19 +619,25 @@ information-theoretic leak.
 capture, `/proc/<pid>/mem` access on Linux) reveals key-seed bytes
 loaded into edge's heap.
 
-**Mitigation**: **Edge does not load seed bytes.** All sign / verify
-operations call into `persist.engine`, which holds the seed in
-OS-keyring (CIRISPersist v0.1.3+ AV-25 closure). The seed bytes never
-cross the FFI boundary into edge's process memory.
+**Mitigation**: **edge's code does not read the federation signing
+seed.** Signing goes through the keyring signer (`Arc<dyn
+HardwareSigner>`, `src/identity.rs`), which never returns the seed.
+Hardware-backed custody keeps it off the host; `SoftwareOnly` custody
+keeps it on disk and in the process once loaded (§9 R-10).
 
-**Test category**: `identity_boundary` test (MISSION.md §4) — property
-test that scans edge's heap during sign and asserts no seed-shaped
-bytes are present.
+**What edge does hold** (44.x): its RNS transport identity, the static
+transit KEX root seed (`src/transport/transit_kex_custody.rs`, zeroized
+on drop, never logged), per-link seal keys, and, when the Anonymous Tier
+runs, its hop secret (`src/onion/hop_key.rs`). A process-memory attacker
+who takes these can impersonate the node's transport and open its links;
+it cannot sign as its federation identity.
 
-**Residual**: a future contributor adds caching that copies seed
-bytes into edge's heap. The test category catches this; the heap
-scan property test passes only if no seed-shaped patterns are found
-across N>=1000 sign operations.
+**Test category**: the `identity_boundary` heap-scan property test this
+entry once named was never built; `tests/key_boundary_scope.rs` tests the
+wire string only.
+
+**Residual**: a future contributor adds caching that copies seed bytes
+into edge's heap. PR review is the only gate.
 
 **v0.16.0 wire-form note (CIRISEdge#38 + D26, FSD-002 §3.4):** the
 canonical wire string for this invariant is now
@@ -648,13 +707,10 @@ Phase 3 productionization.
 
 #### AV-20: I²P endpoint enumeration
 
-**Attack**: Adversary enumerates the federation's I²P endpoints via
-exposed routing.
-
-**Mitigation**: I²P endpoints are public-key hashes (same as Reticulum
-addresses). Enumerating them is enumerating the federation directory,
-which is a public artifact (the directory is distributed by design).
-Not a leak.
+**Not applicable at 44.x**: no I²P transport is built (the module is
+commented out, `src/transport/mod.rs:314`). Reticulum destinations of
+announced nodes are public by design (CC 5.4.6); group-scoped
+destinations are never announced.
 
 ### 4.6 Operational / FFI boundary — adversary wants edge to drift from the discipline
 
@@ -720,21 +776,24 @@ applied to the edge release pipeline). Mitigation is upstream
 (CIRISVerify hardware-backed key storage for release signing); not
 edge's local concern at runtime.
 
-#### AV-25: Reticulum-rs vs Leviculum implementation drift
+#### AV-25: RNS implementation drift (leviculum)
 
-**Attack surface (architectural)**: a malicious or buggy alternative
-Reticulum implementation (Leviculum or future fork) produces
-byte-different envelope encoding from Reticulum-rs, breaking
-cross-implementation interop.
+**Attack surface (architectural)**: edge's Reticulum is leviculum, pinned
+to the `CIRISAI/leviculum` fork (`v0.34.0+ciris.1`, `Cargo.toml:952-963`).
+A divergence from Python RNS, or a bug in the fork, breaks interop or
+loses frames.
 
-**Mitigation**: cross-implementation byte-equivalence regression
-tests (MISSION.md §5). Bridge-trained discipline from lens-steward
-bootstrap (Rust ml-dsa rc.3 ↔ dilithium-py byte-equivalent verify).
-A new Reticulum impl gains an entry in edge's `Transport` enum only
-after byte-equivalence passes.
+**Mitigation**: the fork tracks `teranos/leviculum` upstream
+(`Cargo.toml`, the leviculum pin comment); edge uses leviculum's
+reliability primitives at the pin rather than re-implementing them;
+`tests/leviculum_interface_diversity.rs` covers the interface kinds. E1
+makes Python-RNS interop for edge frames moot: a peer that does not run
+the seal is outside the mesh (CC 5.3.3.5 E1 rule 11).
 
-**Residual**: until a sister Rust Reticulum impl actually ships, this
-is a forward-looking concern. Phase 1 ships with reticulum-rs only.
+**Residual**: a leviculum bug is edge's exposure until fixed upstream.
+Pre-0.34 peers keep edge's upgrade guard (`docs/RELEASE_NOTES.md`
+v44.1.0). The earlier statement that edge ships on reticulum-rs is no
+longer true.
 
 #### AV-42: Spoofed transport-identity ↔ federation-key binding
 
@@ -801,6 +860,14 @@ audit chain). The `epoch` field gives transport-identity rotation a
 monotonic supersede signal; revocation of a stale binding before its
 epoch bumps is a v0.2.x freshness concern.
 
+**44.x note**: the binding is now a verified-only superseding route
+table (`route_supersession_decision`, `src/transport/reticulum.rs`;
+`tests/route_table_e2e.rs`), and the E1 seal resolves a pair only from a Rooted
+binding, the node's own hybrid-signed route row, or a pairing pin, never a
+bare announce (CC 5.3.3.5 E1 rule 3; AV-53). The announce attestation is
+still signed Ed25519 only (`src/transport/reticulum.rs:21274-21280`); see
+§9 R-4.
+
 ### 4.8 Cohabitation / FFI cohab discipline — v0.13.0 → v0.17.0 surfaces
 
 #### AV-43: Federation transport identity 32-byte vs 65-byte hybrid
@@ -846,16 +913,16 @@ pinned, and line ~3007 where the runtime-handle-capsule fallback is
 checked). For v3.1.1-pre engines that don't expose `local_signer_capsule`
 yet, the `LocalSignerCapsuleAttempt::NotPresent` branch falls back to
 the legacy seed-file path (`src/identity.rs::LocalSigner::from_seed_dir`)
-predating persist v2.12.0 / #112; AV-17's heap-scan property test
-covers both paths uniformly because the invariant is "no seed bytes in
-edge's heap during sign", scope-irrespective.
+predating persist v2.12.0 / #112. (That seed-file path is gone at
+44.x; no `from_seed_dir` remains in `src/identity.rs`.)
 
 **Residual**: a future contributor wires Reticulum's transport
 identity through `keyring_signer_capsule` directly (bypassing the
 adapter), or copies the local seed across the FFI rather than holding
 the capsule. PR review catches the first (the type doesn't compile —
 Reticulum's transport-identity constructor expects 32 bytes, not 65);
-the AV-17 heap-scan property test catches the second.
+PR review is the only gate for the second (the AV-17 heap-scan test
+was never built).
 
 #### AV-44: testimonial_witness preservation invariant
 
@@ -922,8 +989,8 @@ without a wire break; future enforcement (a verify-time check that
 binds signatures to a scope) will check the declaration against the
 substrate's scope-keyed signing-key resolution. **AV-17 itself is
 unchanged at v0.16.0 / v0.17.0 — edge's process never holds a seed,
-scope-irrespective** (the heap-scan property test covers the
-process-wide invariant, which holds for every scope). Consumers
+scope-irrespective** (a structural property of the signer API; no
+heap-scan test exists). Consumers
 should treat the `key_boundary_scope` field as a *declared* contract,
 not an *enforced* one, until v0.16.1+ binding enforcement lands.
 Legacy v0.15.x envelopes carrying the bare
@@ -1555,9 +1622,9 @@ hybrid signing tests, and the §19 + §19.7 conformance vector round-
 trip all serve as continuous Constitutional-discipline regression
 guards.
 
-### 4.9 Forward-looking invariants (anchored at v0.17.1 for v0.18.x wire-up)
+### 4.9 Invariants anchored at v0.17.1 (shipped from v0.18.0)
 
-#### Canonical-peer invariant (CIRISEdge#46 — scheduled v0.18.0)
+#### Canonical-peer invariant (CIRISEdge#46 — shipped; `tests/canonical_peer.rs`)
 
 **Attack surface (operational)**: bootstrap peers — the canonical
 CIRIS infrastructure roster (`agents.ciris.ai`, the steward bootstrap
@@ -1623,396 +1690,522 @@ to refuse traffic; they cannot accidentally forget the peers exist.
 A wholly air-gapped deployment (no federation reach by design) is a
 distinct deployment mode, not a canonical-peer concern.
 
+### 4.10 The 44.x surface — transit seal, three meshes, what moves, relay load, the Anonymous Tier
+
+Each vector here was derived for 44.1 from the CC text and the code at
+`1175e65`. The witness column names the test that fails if the mitigation
+stops holding.
+
+#### AV-53 — Reading or redirecting traffic on an RNS link (CC 5.3.3.5 E1)
+
+**Attack**: a forwarder, an on-path observer, or a harvest-now-decrypt-later
+recorder reads frames on an RNS link; or a dialler is steered to an
+adversary's transit pair so the adversary can open what it seals.
+
+**Mitigation**: every byte edge sends over an RNS link is under a hybrid
+(X25519 + ML-KEM-768) transit seal bound to the link's id, run once per link
+as its first frame, covering Channel messages, Resources, requests and
+responses in both directions (CC 5.3.3.5 E1 rules 3-4;
+`src/transport/link_seal.rs:1-16`). There is no advisory mode and no
+classical-only lane: a peer that does not run the seal gets nothing (E1
+rule 11). The dialler resolves a pair **authenticated to the node it means
+to reach** before it dials: a Rooted binding, else the node's own
+hybrid-signed route row, else a pairing pin, never a bare announce (E1
+rule 3; `LinkSeals::resolve_pair`). With none, the pre-seal route fetch asks
+the dialled node for its own signed row and checks signer and subject equal
+the dialled key before storing anything (E1 rules 5-7;
+`src/transport/route_fetch.rs`). A responder delivers nothing upward until
+the handshake completes, refuses a first frame that is neither a handshake
+nor a route request, answers at most one route request per link, and runs
+the per-link, per-sender and node-wide receiver rates before parsing (E1
+rules 8-9; `ReceiverOrder`, `src/transport/link_keying.rs`). Links still
+keying are capped node-wide and the oldest is refused by name, never the
+newest (`AWAITING_LINKS_MAX`, `link_seal.rs` module head). Decapsulation runs
+off the event loop in a bounded pool (CIRISEdge#947).
+
+**Witness**: `tests/link_seal_e1.rs`, `tests/sealed_cut_bundle_e1.rs`,
+`tests/offline_route_e1.rs`.
+
+**Residual**: the handshake authenticates the responder only; the
+initiator's id is a claim, held to the link's attribution on every frame,
+and an unattributed initiator may carry only the first-contact plane
+(`link_seal.rs`, "The claim and the first-contact carve-out"). The RNS layer
+under the seal (link request, announce, path request) is classical (E1
+rule 2); see §9 R-4. The KEM-authenticated handshake of the v62 edition is
+planned, not shipped (CC 5.3.3.5, "The handshake of the v62 edition").
+
+#### AV-54 — Inferring traffic from a shaped link, or defeating shaping (CC 5.4.3 rc17)
+
+**Attack**: an observer of a link infers when and how much real traffic it
+carries; or an adversary arranges for a link that should be shaped to run
+unshaped, through a forwarder, or below its class.
+
+**Mitigation** (CC 5.4.3, "Link shaping" and "A shaped link is one hop"):
+
+- Shaping is a per-link property negotiated after the E1 handshake, under its
+  keys: constant-size sealed frames on a Poisson timer, cover filling what
+  real traffic leaves, at the lower of the two ends' budget classes
+  (`src/transport/link_shaping.rs`, `SHAP` offer).
+- **A shaped link is one direct hop.** A link a forwarder carries is never
+  offered shaping and answers `off`; a shaped link that falls back onto a
+  forwarder closes (`CLM-shaped-link-one-hop`; `link_is_forwarded`,
+  `src/transport/reticulum.rs:534`; commit `79bd7fd`).
+- **Off means not offered.** The setting says only whether a node offers
+  shaping by default. A node with shaping off still gives a shaped link to a
+  peer that asks, at its own device class, and drops it ten minutes after the
+  last real frame, cover not counting (`CLM-shaping-offered-never-refused`;
+  `DEFAULT_ASKED_IDLE_TTL`, `link_shaping.rs:1918`). Fleet defaults: on for
+  `server` (and `seat`↔`seat`), off for `home`, `phone-wifi`,
+  `phone-cellular` (`FLEET_DEFAULTS`, `link_shaping.rs:388`).
+- **The bound.** At most eight shaped links, each at the full rate of its
+  class (`NODE_CAP_LINKS`, `link_shaping.rs:495`); a `seat` link sits outside
+  the eight. Past eight, a node set to shaped-only or to the Anonymous Tier
+  refuses the ninth shaping peer with up to three referrals
+  (`MAX_REFERRALS`, `src/transport/shaping_referral.rs:52`); every other node
+  runs the ninth link **unshaped**. A shaped link is never run below its class
+  (`CLM-shaped-link-bound-refuse`, CIRISEdge#952; `link_shaping.rs:309-333`).
+- **Scoped and A/V links are never shaped**, whatever the policy
+  (`LinkShapers::offer_off_for`, `link_shaping.rs:2978`); A/V is unshaped
+  only (CC 5.4.3 item 4).
+
+**Witness**: `tests/link_shaping_e1.rs`, `tests/direct_links_805.rs`,
+`tests/poisson_emission_e2e.rs`.
+
+**Residual** (stated by the CC, CC 5.4.3 item 5): link setup is observable;
+a node with any unshaped link can be told from one that shapes every link;
+shaping hides timing and volume inside a shaped link, not which links exist;
+an adversary that drops or delays frames is outside the claim, and edge does
+no defensive dropping (`docs/RELEASE_NOTES.md`, v44.0.0 "Known limits";
+`FSD/TRANSPORT_TIERS_MODEL.md` §9.4). The link past the bound is the
+**accepted leak**: an observer learns the node is at its bound
+(`link_shaping.rs:328-333`). Displacement of a lower-class shaped peer is
+not built (CIRISEdge#939): a higher-class newcomer at a full node is
+refused, not given a slot (`link_shaping.rs:318-319`). The ρ/W/byte-budget
+defaults come from a model on the production scheduler over a virtual clock,
+not from a live mesh (CC 5.4.3, "Why these values").
+
+#### AV-55 — Bulk or large content on the shaped plane (CC 5.4.3 rc17, "Two planes")
+
+**Attack**: a large message rides a shaped link, starving the rows that
+share it or exposing its size by the time it holds the link; or a failed bulk
+dial silently falls back onto shaped frames.
+
+**Mitigation**: one constant decides. A message over 64 KiB is bulk whatever
+its type (`SHAPED_ROW_MAX_BYTES`, `link_shaping.rs:462`; `is_bulk_payload`),
+and content/blob chunk bodies and their fetches are bulk by kind
+(`BULK_MESSAGE_TYPES`, `link_shaping.rs:448`). A bulk send to a peer no
+unshaped link reaches is refused by name, `link_shaping_bulk_refused`
+(`src/observability.rs:1273`), and retried on the dispatcher's schedule; the
+fragment fallback that carried bulk on shaped frames was removed (commit
+`cafb90d`).
+
+**Witness**: `the_row_limit_is_one_constant` (`link_shaping.rs:3887`),
+`tests/link_shaping_e1.rs`.
+
+**Residual / not yet as the CC says**: CC 5.4.3 rc17 puts chat and files on a
+shaped link only when one end is shaped-only. At 44.1 a row of 64 KiB or less
+rides whatever shaped link exists between the pair; chat and small-attachment
+routing is 44.2 work (commit `cafb90d`; `FSD/PRIVACY_MODES.md` §2.3). The
+CC's named refusal for a shaped-only node fetching a large file ("This file
+is too large to access over shaped links") is not emitted; the code refuses as
+`link_shaping_bulk_refused`. A NAT'd peer reachable only over the link it
+dialled waits for an unshaped link.
+
+#### AV-56 — A peer becomes a mirror of a corpus it has no business holding (CC 5.2)
+
+**Attack**: a single `consent:replication` grant, or federation tier alone,
+causes a node to offer a peer every federation row it holds, oldest first:
+a privacy over-reach (the peer learns rows nobody asked to move to it) and a
+load lever (11,662 rows / 42 MB to one new contact, `docs/RELEASE_NOTES.md`
+v44.1.0).
+
+**Mitigation**: a row moves when it is **requested, or required, and
+appropriate**, never because it is federation-tier (CC 5.2, "What moves to a
+peer"; `CLM-moves-requested-required-appropriate`). Two seats on the active
+roster keep the anti-entropy walk. Every other peer gets the required read
+first (live grants naming it, rows to it or its person, its own rows, this
+node's allegiance rows), then only what is required or appropriate and live
+(`unasked_offer`, `src/replication/bridge.rs:10911`). A grant moves the
+class it names and nothing else. The served set is pinned by
+`SERVE_ADVERTISE_POLICY_HASH` = `14aedf25…` (`docs/RELEASE_NOTES.md`
+v44.1.0), which CIRISServer must mirror.
+
+**Witness**: `src/replication/bridge/tests/moves_5_2.rs`.
+
+**Residual**: a third party's `membership:proposal:v1` older than the 60 s
+margin waits for the history read (one page a minute) until persist offers a
+read by subject (`docs/RELEASE_NOTES.md` v44.1.0). The fetch twin and the
+subject Pull still move any row on request, a superseded row included, which
+is what CC 5.2 means by "requested". This is a load and over-reach bound,
+not a confidentiality boundary: what a peer may receive at all is still
+decided by the audience gates (CC 5.3.2.4, `may_receive`).
+
+#### AV-57 — Starving first contact by closing a relay (CC 5.4.6; `FSD/CIRIS_MESH.md` §7.2, §7.7)
+
+**Attack**: an adversary (or ordinary load) pushes a canonical into a high
+service tier; if the tier closes forwarding, every NAT'd node that can only
+be reached through it loses first contact, and each refused dial is retried
+(v44.0 turned one refused dial into 48 retries).
+
+**Mitigation**: **the service tier never closes forwarding**
+(`src/transport/relay_tier.rs:36-40`). What bounds a relay is a configured
+link bound and the link table cap, fixed process bounds, plus its C2
+forward admission (`ForwardAdmission`, `relay_tier.rs`). Load is shed through
+the host's levers (`src/load_levers.rs:1-23`): `walk`, `page` and `bulk`
+each move one step at a time (`RAISE_STEP` 10 s, `RELEASE_STEP` 30 s), each
+step halves a cost and none refuses anything, and every pull is a **lease**
+(`LEASE_MAX` 300 s) that walks back to 0 when the host stops renewing.
+Forwarding, subject Pulls, announces and owed rounds are outside every
+lever. Edge implements the gauges and levers; the host decides when to pull
+them.
+
+**Witness**: `tests/relay_roster_752.rs`, `src/load_levers.rs` unit tests.
+
+**Residual**: forwarding remains admitted up to the process bounds, so a
+relay under a forward flood degrades at those bounds rather than by tier.
+`ForwardAdmissionConfig` has no PyO3 kwarg (`docs/RELEASE_NOTES.md` v44.0.0
+"Known limits"), so a Python-only host cannot set it.
+
+#### AV-58 — Onion replay and relay-state exhaustion (CC 5.4.6; CIRISEdge#955)
+
+**Attack**: hop public keys are published, so anyone can mint valid onion
+packets with distinct KEM ciphertexts; replaying one makes a relay forward it
+twice, and minting many grows the relay's replay memory.
+
+**Mitigation**: the relay accepts in a fixed order: the link is shaped, before
+any cryptography (`onion_unshaped_link`); the packet peels under the current
+or previous hop key; its period is this one or the last
+(`onion_period_mismatch`); its encapsulation is new within two periods
+(`onion_replay`); a forward fits the hold bound (`onion_hold_deferred`)
+(`src/onion/relay.rs:6-13`). The replay tag is `SHA3-256("ciris-onion/v1/replay"
+‖ ct)` (`src/onion/packet.rs:111-112`).
+
+**Status at `1175e65`**: the replay set rotates by period but has no
+ceiling (`ReplaySet`, `relay.rs:86-110`). CIRISEdge#955, landing in 44.1,
+bounds it by the admitted rate per period and refuses by name past the bound,
+never evicting silently (CC 5.3.3.5 E1 rule 9: a hold is bounded and refuses
+on overflow by name). Until it lands, the bound is the shaped rate per link
+times the number of shaped links, which the eight-link bound caps. The tier
+is dormant (AV-59), so no production relay holds a replay set today.
+
+#### AV-59 — The Anonymous Tier: what it is at 44.x, and the identity rule (CC 5.4.6)
+
+**Status**: wired and **dormant** (`src/onion/mod.rs:1-8`;
+`FSD/ONION_ROUTING.md`, "v44 status"). It runs only when the operator opts
+in (`OnionPolicy::enabled`, default off) **and** every layer has three relays
+dealt and answering; the canonical bundle seats too few relays, so every node
+answers `onion_tier_not_opted_in` or `onion_tier_unavailable_floor`. The CC
+has not pinned the packet layout, key-derivation label or AEAD (CC 5.4.6,
+"The Anonymous Tier"); edge's `outfox-xwing-v1` codec is a submission
+(`docs/onion_packet_wire.md`). The transit pair stands in for the onion hop
+key until CIRISPersist#1181 (`src/onion/hop_key.rs`). The rendezvous row and
+mailbox (CIRISPersist#1149), the fold reader that builds relay candidates,
+the pseudonym's persist gate, and an over-the-wire RNS loopback are owed
+(`FSD/ONION_ROUTING.md`, "Still owed").
+
+**What holds today**: an onion packet never rides an unshaped link (AV-58);
+a node in the tier starts no call and no stream (`onion_anonymous_no_media`,
+`src/onion/tokens.rs:59`; CC 5.4.3 "Two planes"); layer links are shaped and
+count within the eight (`FSD/ONION_ROUTING.md`).
+
+**The identity rule (CC 5.4.6)**: an anonymous node is a separate, dedicated
+identity with no row linking it to any announced identity of the person; it
+**proxies nothing and relays nothing** under that identity, and a node that
+activated the tier holds that identity alone, because a public route at the
+same address would hand its guard the name behind it. **Not enforced in code
+at 44.1**: `relay_offering` (`src/onion/policy.rs:72-74`) does not read
+`OnionPolicy::enabled`, so an opted-in node whose relay offering is on would
+still report free shaped slots and be named in referrals (a proxy under
+CC 5.4.6). The tier is dormant, so this is latent; it must close before the
+tier can activate. See §9 R-7.
+
+**Residual** (CC 5.4.6 item 8, stated for when the tier runs): a relay can
+count packets to one rendezvous per period; relays do not mix at today's
+load; a phone that sleeps can be narrowed by a room insider together with an
+observer of when it is online. The tier carries no delivery acknowledgement:
+a publisher learns nothing of whether its packet arrived.
+
 ---
 
 ## 5. Mitigation Matrix
 
-| AV | Attack | Severity | Primary Mitigation | Secondary | Status | Fix tracker |
-|---|---|---|---|---|---|---|
-| AV-1 | Forged from attacker key | — | `lookup_public_key` directory gate | N_eff drift detection (RATCHET) | ✓ Mitigated (architectural; persist owns directory) | — |
-| AV-2 | Forged from compromised key | — | Out of scope at write time | Phase 2 peer-replicate audit chain | ⚠ Phase 2 closes | persist FSD §4.5 |
-| AV-3 | Replay within window | P1 | `(signing_key_id, nonce)` LRU, 5-min window | Per-instance + persist AV-9 | ⚠ Phase 1 baseline | impl |
-| AV-4 | Replay outside window | — | Persist AV-9 dedup | TLS at deploy edge | ✓ Mitigated (architectural) | — |
-| AV-5 | Canonicalization mismatch | — | `Engine.canonicalize_envelope` only; no edge re-impl | Cross-impl byte-equivalence test | ✓ Mitigated (CIRISPersist#7 closure) | — |
-| AV-6 | Reticulum destination spoofing | — | Structural (sha256 + Ed25519 collision-resistance) | — | ✓ Mitigated | — |
-| AV-7 | Schema-version downgrade | P1 | Strict allowlist | Per-version payload gates | ⚠ Track at every spec bump | — |
-| AV-8 | Misrouted-message acceptance | P2 | `destination_key_id` check before parse | Metric on misroute rate | ⚠ Track | — |
-| AV-9 | Dispatch on unverified bytes | **P0** | Structural (private dispatch surface) | `verify_enforcement` test category | ⚠ Pre-Phase-1; impl + test must land together | impl |
-| AV-10 | Transport-level flooding | P1 | Per-transport rate caps | Bounded inbound queue, backpressure | ⚠ Phase 1 design | impl |
-| AV-11 | Verify-path saturation | P1 | Cheap `lookup_public_key`; per-source verify-rate cap | Backpressure | ⚠ Phase 1 design | impl |
-| AV-12 | Replay-window mem growth | P2 | Bounded LRU + window expiry | Cost-asymmetric attack | ⚠ Phase 1 design | impl |
-| AV-13 | Body-size flood | P0 | `MAX_BODY_BYTES` (8 MiB) at extractor | Deploy-edge body-size cap | ⚠ Phase 1 design | impl |
-| AV-14 | Parse amplification | P0 | Typed envelope; `MAX_DATA_DEPTH=32` | Bounded queue | ⚠ Phase 1 design | impl |
-| AV-15 | Transport plaintext | P1 | Reticulum link encryption / TLS on HTTP | Startup warning if HTTP w/o TLS indication | ⚠ Phase 1 design | impl |
-| AV-16 | Side-channel timing | P3 | Ed25519 verify_strict (constant-time) | Future: constant-response-time wrapper | ⚠ Track v0.2.x | — |
-| AV-17 | Heap leak of seed bytes | **P0** | FFI boundary discipline (persist owns seed) | `identity_boundary` heap-scan test | ⚠ Pre-Phase-1; test must land with code | impl |
-| AV-18 | Cross-medium replay | — | Transport-agnostic `(key, nonce)` window | Persist AV-9 catch | ✓ Mitigated by design | — |
-| AV-19 | Slow-medium timing-amp | P3 | Per-medium pacing on response path | — | ⚠ Phase 3 hardening | — |
-| AV-20 | I²P endpoint enum | — | Public by design | — | ✓ Not a leak | — |
-| AV-21 | Lookup cache emergence | P3 | PR review + MISSION.md anti-pattern | — | ⚠ Discipline-only | — |
-| AV-22 | Per-peer special-case | P3 | PR review | — | ⚠ Discipline-only | — |
-| AV-23 | Caller canonicalization drift | P3 | PR review + byte-equivalence test | — | ⚠ Discipline + CI | — |
-| AV-24 | Build-manifest forgery | P1 | Hybrid Ed25519 + ML-DSA-65 release sig | AGPL license-lock | ⚠ Same as lens, persist | — |
-| AV-25 | Cross-Reticulum-impl drift | P2 | Byte-equivalence regression test | — | ⚠ Forward-looking (Leviculum) | — |
-| AV-42 | Spoofed transport-identity ↔ federation-key binding | P1 | Two-step root + attestation-verify cold-start path (`root_binding` + announce attestation) | Consumer `HybridPolicy` over the rooted chain | ✓ Mitigated (CIRISEdge#15, v0.4.0) | `tests/reticulum_av42.rs` |
-| AV-43 | 32-byte vs 65-byte hybrid transport identity confusion in cohab | P1 | Step 3.5 dual-capsule extraction in `init_edge_runtime`; `LocalSignerHardwareAdapter` wraps `local_signer_capsule` for the Reticulum transport identity | AV-17 heap-scan property test (both signers cross FFI as opaque `Arc<dyn Trait>`) | ✓ Mitigated (CIRISEdge#43, v0.13.1 patch / v0.16.1 main cherry-pick) | `src/ffi/pyo3.rs::extract_capsule` smoke tests |
-| AV-44 | testimonial_witness silent drop / re-interpretation | P1 | `#[serde(default, skip_serializing_if = "Option::is_none")]`; canonical bytes via `ciris_persist::canonicalize_envelope_for_signing`; edge does not interpret `payload` | Consumer verifies witness against `issuer_key_id` (same discipline as `accord_signatures`) | ✓ Mitigated (v0.16.0 CIRISEdge#37) | `tests/testimonial_witness_round_trip.rs` |
-| AV-45 | key_boundary scope-spoofing (declared ≠ actually-signed-under) | P2 | Wire form only at v0.16.0 / v0.17.0; documented as declared-not-enforced | AV-17 process-wide invariant unchanged (scope-irrespective heap-scan) | ⚠ Deferred enforcement (v0.16.1+ binding scope) | `src/key_boundary.rs` (wire codec only) |
-| AV-46 | Operator opinion confused with federation attestation | P3 | Schema separation: `federation_peer_metadata` sibling table per CIRISPersist#117 (not folded into `federation_keys`); `EdgePeerTrust` doc explicit | Documentation; Accord §I operator-autonomy framing | ✓ Mitigated structurally (v0.15.1) | `tests/peer_mutation_ffi.rs` |
-| AV-47 | UniFFI free-function called pre-init / post-teardown | P1 | `OnceLock<RwLock<Weak<Edge>>>` slot + per-surface `current_edge()?` gate; typed `EdgeBindingsError::{NotInitialized,Unsupported}` | `Weak::upgrade` returns `None` on teardown → flips back to `NotInitialized` | ✓ Mitigated (v0.13.0+ UniFFI scaffolding pattern) | `tests/routing_ffi.rs::uniffi_path_table_unsupported_without_init`, `tests/links_ffi.rs::uniffi_link_list_unsupported_without_init` |
-| AV-48 | High-N low-T signed envelope flood at dispatch_inbound | P1 | `Arc<dyn TrustScoring>` consumer at dispatch_inbound (CIRISPersist#123); drop below `trust_threshold` + emit `EventKind::TrustShortCircuited`; `inbound_dropped_low_trust` counter; default `0.0` bootstrap-permissive | Per-transport rate caps (AV-10); bounded inbound queue (AV-13 family) cover the *volume* axis | ✓ Mitigated (v0.19.6 CIRISEdge#48-B) | `tests/trust_short_circuit.rs` |
-| AV-49 | Multimedia tier transport semantics (takedown fast-path, BlobBody::External, L1-as-CDN-edge opt-in) | P1 | takedown_notice fast-path observability emission (TVEC/GIFCT-CIP/NCMEC); `validate_content_body` short-circuits AV-13 + SHA gate on `kind == "external"` (edge does NOT fetch external bytes); L1-CDN-edge opt-in default OFF; Client + Proxy modes ignore the flag | Publisher's signed ACL on `ExternalRefWithAcl::acl_signature`; consumer's client verifies fetched bytes against `external_sha256_hex`; substrate's ModerationEvent + Slashing path corrective for forged legal_basis | ✓ Mitigated (v0.20.1 CIRISEdge#52) | `tests/multimedia_tier.rs` |
-| Canonical-peer | Operator silently drops canonical CIRIS infra peer | P1 | Bootstrap reseed on every start; `peer_remove(canonical, hard=true)` → typed `CannotRemoveCanonicalPeer`; `EdgePeerInfo.canonical: bool` | Operator trust-state flip preserved across restart (refuse trust without forgetting peer) | ⚠ Scheduled v0.18.0 (CIRISEdge#46) | tests scheduled v0.18.0 acceptance |
+Status is at 44.1 (`1175e65`). "Built" means the mitigation is in the code and
+named; "as written" means the entry's own version is the last time it was
+checked and this regeneration did not re-derive it.
 
-**Pre-Phase-1 P0 must-have bundle**: AV-9 + AV-13 + AV-14 + AV-17 +
-hybrid verify (OQ-11 closure). The first four are the structural
-invariants that, if not in place at Phase 1 v0.1.0, break the
-threat-model claim. Hybrid verify is the v0.1.0 PQC posture: edge
-calls `Engine.verify_hybrid()` on every inbound message whose sender's
-`federation_keys` row carries `pubkey_ml_dsa_65_base64`; consumer
-policy (strict / soft+freshness / fallback) is per-peer config.
-Pre-Phase-1 coordination: persist exposes the verify_hybrid FFI
-surface; the underlying primitive already exists in `ciris-crypto`.
+| AV | Attack | Mitigation at 44.1 | Status | Witness |
+|---|---|---|---|---|
+| AV-1 | Forged from attacker key | Attribution at ingest (`Rooted ∧ owns_key`) before any handler; persist directory gate | Built | `tests/reticulum_av42.rs`, `tests/rooting_chain_walk.rs` |
+| AV-2 | Forged from compromised key | Out of edge's scope; statistical (N_eff drift) and key rotation/revocation | Residual (§9 R-1) | — |
+| AV-3 | Replay within window | `(signing_key_id, nonce)` window, 5 min default (`src/verify.rs:1388-1408`) | Built; process-local | — |
+| AV-4 | Replay outside window | Persist dedup / idempotent admission | As written | — |
+| AV-5 | Canonicalization mismatch | Canonical bytes via persist only | As written | — |
+| AV-6 | RNS destination spoofing | Destination derived from the transport identity; binding to the federation key is AV-42/AV-53 | Built | `tests/reticulum_av42.rs` |
+| AV-7 | Schema-version downgrade | Strict allowlist, typed `unsupported_schema_version` (`src/verify.rs`) | Built | — |
+| AV-8 | Misrouted acceptance | `VerifyError::Misrouted` before body parse (`src/verify.rs:1466`) | Built | — |
+| AV-9 | Dispatch on unverified bytes | Structural (private dispatch path) | Built; the named `verify_enforcement` fuzz category was never built | — |
+| AV-10 | Transport flooding | Receiver order: per-link, per-sender, node-wide rates before parse (CC 5.3.3.5 E1 rule 9) | Built | `tests/link_seal_e1.rs` |
+| AV-11 | Verify-path saturation | Rates as AV-10; keying off the event loop in a bounded pool (#947) | Built | — |
+| AV-12 | Replay-window memory | Bounded window + expiry (`ReplayWindow::new(.., max_replay_entries)`) | Built | — |
+| AV-13 | Body-size flood | `MAX_BODY_BYTES` 8 MiB (`src/transport/frame_fragment.rs:139`; HTTPS `src/transport/http.rs:155`) | Built | — |
+| AV-14 | Parse amplification | Typed envelope; `MAX_DATA_DEPTH` (`src/verify.rs`) | Built | — |
+| AV-15 | Transport plaintext | E1 hybrid transit seal on every RNS link; TLS at the deployment edge for HTTPS | Built (RNS); deployment (HTTPS) | `tests/link_seal_e1.rs` |
+| AV-16 | Verify timing side channel | None beyond constant-time primitives | Residual (key ids are public) | — |
+| AV-17 | Seed bytes in edge's heap | Federation signing seed held behind `Arc<dyn HardwareSigner>`; edge code never reads it. Transport secrets (RNS identity, transit KEX seed, link keys) ARE in process, zeroized on drop | Built; the heap-scan property test was never built | `tests/key_boundary_scope.rs` (wire form only) |
+| AV-18 | Cross-medium replay | Transport-agnostic window | As written | — |
+| AV-19 | Slow-medium timing | None | Residual | — |
+| AV-20 | I²P endpoint enumeration | Not applicable: no I²P transport is built | — | — |
+| AV-21–23 | Discipline drifts | PR review | Discipline-only | — |
+| AV-24 | Build-manifest forgery | Hybrid release signature | As written | — |
+| AV-25 | RNS implementation drift | Edge runs leviculum (CIRISAI fork, `v0.34.0+ciris.1`); Python-RNS interop is leviculum's | Residual (§9 R-11) | `tests/leviculum_interface_diversity.rs` |
+| AV-42 | Transport-identity ↔ federation-key spoof | Authenticated superseding route table; seal binds an authenticated pair (AV-53) | Built | `tests/reticulum_av42.rs`, `tests/route_table_e2e.rs` |
+| AV-43–49 | Cohabitation / FFI / trust short-circuit / multimedia | As in each entry | As written (v0.13–v1.0) | per entry |
+| AV-50, AV-52 | Path independence; constitutional discipline | As in each entry | As written (v4.0, v5.0) | per entry |
+| Canonical-peer | Operator drops a canonical peer | Typed `CannotRemoveCanonicalPeer` (`src/edge.rs`) | Built | `tests/canonical_peer.rs` |
+| AV-53 | Reading/redirecting RNS link traffic | E1 seal, authenticated pair, pre-seal route fetch, receiver order | Built | `tests/link_seal_e1.rs` |
+| AV-54 | Shaped-link inference / defeat | One hop; off = not offered; eight-link bound; scoped and A/V never shaped | Built; displacement (#939) not built | `tests/link_shaping_e1.rs`, `tests/direct_links_805.rs` |
+| AV-55 | Bulk on the shaped plane | 64 KiB row limit; bulk by kind; named refusal, no fallback | Built; rc17 chat/file routing is 44.2 | `tests/link_shaping_e1.rs` |
+| AV-56 | Peer as mirror | Requested / required / appropriate (CC 5.2) | Built | `moves_5_2.rs` |
+| AV-57 | Closing a relay on tier | Tier never closes forwarding; leased graduated levers | Built | `tests/relay_roster_752.rs` |
+| AV-58 | Onion replay / replay memory | Ordered relay acceptance; replay set bounded by #955 | Ordered acceptance built; bound landing in 44.1 | `src/onion/relay.rs` tests |
+| AV-59 | Anonymous Tier identity rule | Tier dormant; no-media built; identity rule not enforced | Dormant; gap (§9 R-7) | — |
 
 ---
 
 ## 6. Security Levels by Deployment Tier
 
-| Tier | Transport | FFI shape | Threat model |
+| Tier | Transport | FFI shape | Notes |
 |---|---|---|---|
-| **Server-class peer** (production lens / agent / registry) | TCP via Reticulum primary; HTTPS fallback | edge ↔ persist via Rust API | Full §4 model applies. TLS at edge required for HTTP fallback. |
-| **Standalone Rust binary** (Phase 2+) | Reticulum primary; HTTPS optional | edge ↔ persist same-process | Same as above; FastAPI / Python shim absent. |
-| **Pi-class sovereign** (Phase 3) | Reticulum over LoRa / serial / TCP | edge ↔ persist embedded | Reduced attack surface (typically not internet-exposed). LoRa AV-19 timing-amp residual. |
-| **Mobile bundled** (Phase 3 stretch) | Reticulum over Bluetooth-LE / TCP-when-online | edge ↔ persist via swift-bridge or jni | Apple/Android sandbox + secure enclave. Threat model dominated by upstream agent's CIRISVerify hardware-attestation tier. |
-| **MCU no_std relay** (Phase 3 stretch) | Reticulum verify-only over serial / packet radio | edge verify-only; no persist | Out of full HTTP-ingest scope; verify-only relay. AV-1 + AV-3 + AV-7 still apply. |
+| **Serve seat / canonical** | Reticulum over TCP; HTTPS | Rust host (CIRISServer links the crate) | Shaping on by default; `seat`↔`seat` links outside the eight (AV-54). Relay is mandatory for a serve node (CC 1.13.3.1 operator guidance). Takes host-pulled levers (AV-57). |
+| **Home / agent node** | Reticulum over TCP / UDP / Auto; HTTPS | PyO3 wheel | Shaping off by default, offered on request (AV-54). |
+| **Phone** | Reticulum over TCP when online | UniFFI (Android floor API 24) | Relays only while charging on an unmetered network (CC 5.4.6). Suspend / resume are host verbs (`Edge::suspend`, `Edge::resume`, `src/edge.rs:5018-5057`). |
+| **Radio** | Reticulum over RNode (LoRa); packet radio (`transport-packet-radio`) | as host | The shaped frame is the link's MDU, ~400 B at the Reticulum base MTU (CC 5.4.3). |
 
-**Critical invariant**: all tiers run the same `verify/` pipeline, the
-same `transport/` trait, the same `Engine` FFI boundary. A finding in
-one tier's implementation is presumed to apply to the same surface in
-others unless explicitly excepted.
+**Critical invariant**: all tiers run the same attribution, seal, shaping and
+serve gates. A finding in one tier's implementation is presumed to apply to
+the same surface in others unless excepted.
 
 ---
 
 ## 7. Security Assumptions
 
-The system depends on these assumptions; if violated, the threat model
-breaks.
+If any of these is violated, the threat model breaks.
 
-1. **Persist's federation directory is sound.** `lookup_public_key`
-   returns truthful answers; the directory is not compromised. Edge's
-   AV-1 closure depends entirely on this.
-2. **Persist's keyring is sound.** The steward seed lives in OS-keyring
-   (CIRISPersist v0.1.3+ AV-25). Edge holds no keys; if persist's
-   keyring is compromised, AV-2 applies — out of edge's scope.
-3. **`Engine.canonicalize_envelope` is byte-deterministic** across host
-   platforms and version bumps. Drift at this layer triggers AV-5.
-4. **Reticulum's cryptographic addressing holds**: sha256 collision-
-   resistance + Ed25519 unforgeability. Both are classical-cryptography
-   assumptions; quantum compromise is tracked in §9 Residual.
-5. **TLS at the deployment edge** for HTTP fallback. Plaintext HTTP
-   exposes envelope bodies (AV-15).
-6. **Clock accuracy** is within ~5 minutes of real time across all
-   peers. Skew degrades AV-3 replay-window mitigation.
-7. **Wire-format spec stability**: peers and edge agree on
-   `EdgeEnvelope` canonicalization (FSD §3.4). Drift between peers is
-   AV-5; drift between edge versions on the same peer is the
-   schema-version-bump review trigger.
-8. **Deployment hardware integrity**: edge's host process is not
-   compromised at root. Process memory inspection, debugger attach,
-   coredump access are out of scope.
-9. **Build-pipeline integrity**: edge's release tarball is signed via
-   the same hybrid (Ed25519 + ML-DSA-65) chain CIRISVerify v1.8
-   defined; the build-signing key is hardware-protected per
-   CIRISVerify's tier. AV-24 closure depends.
-10. **Persist exposes hybrid verify + outbound-queue substrates.**
-    `Engine.verify_hybrid_via_directory()` (per-message hot path)
-    and `Engine.verify_hybrid()` (raw-pubkey form) for inbound;
-    `cirislens.edge_outbound_queue` table + the OQ-09 Engine surface
-    (`enqueue_outbound`, `claim_pending_outbound`, ACK matching,
-    sweeps) for outbound `send_durable()`. **Available in
-    CIRISPersist v0.4.0+ (CIRISPersist#14 + #16 closed 2026-05-03).**
-    Phase 1 pin: `ciris-persist >= 0.4.0`. Persist threat-model
-    closures: AV-39 (verify pipeline), AV-40 (queue disk exhaustion),
-    AV-41 (spoofed in_reply_to ACK matching). Edge MUST NOT call
-    `ciris-crypto` directly — that breaks the verify-via-persist
-    single-source-of-truth (CIRISPersist#7).
-
-Critical: **Assumption 1 is load-bearing.** Edge's entire verify
-guarantee reduces to "lookup_public_key returns truthful answers."
-Persist's federation directory is the federation's single point of
-trust at this layer, and persist's threat model is the upstream
-authority.
+1. **Persist's directory and admission are sound.** Attribution, rooting,
+   key and route admission are persist's doors; edge consults them.
+2. **The signer is sound.** The federation seed lives behind the keyring
+   signer. Its custody class (hardware-backed, or `SoftwareOnly` with the
+   seed on disk) is the deployment's, and a same-host attacker on a
+   `SoftwareOnly` node reads it (§9 R-10).
+3. **Canonical bytes are deterministic** across hosts and versions (AV-5).
+4. **The hybrid primitives hold**: at least one of Ed25519 / ML-DSA-65 for
+   signatures and one of X25519 / ML-KEM-768 for key agreement (CC 5.1,
+   CC 5.3.3.5 E1). SHA-256 / SHA3-256 collision resistance.
+5. **TLS at the deployment edge for HTTPS.** E1 is a Reticulum rule; the
+   HTTPS transport's confidentiality is the deployment's TLS.
+6. **Clocks within ~5 minutes** across peers (AV-3); onion periods assume
+   the same global clock (CC 5.4.6 item 7).
+7. **The wire vocabulary pin matches the CC artifact** (`WIRE_VOCABULARY.md`
+   v1.0.2, `src/lib.rs:169`; test `wire_vocabulary_hash_pinned`).
+8. **The host is not compromised at root** (process memory, debugger,
+   coredump are out of scope).
+9. **The host pulls the levers it is meant to pull.** With no host pulling,
+   every lever sits at 0 and the node serves its whole role
+   (`src/load_levers.rs:3-5`); load policy is the host's, not edge's.
 
 ---
 
 ## 8. Fail-Secure Degradation
 
-All failures degrade to MORE restrictive modes, never less.
+All failures degrade to more restrictive modes, never less.
 
-| Failure | Current behavior (target Phase 1) | Should be |
-|---|---|---|
-| Envelope schema parse failure | Typed `schema_invalid` reject; handler not invoked | ✓ Correct |
-| Unsupported `edge_schema_version` | Typed `unsupported_schema_version` reject | ✓ Correct |
-| Signature verification failure | Typed `signature_mismatch` reject; handler not invoked | ✓ Correct |
-| Unknown signing key | Typed `unknown_key` reject | ✓ Correct |
-| Misrouted message (`destination_key_id` mismatch) | Typed `misrouted` reject; body never parsed | ✓ Correct |
-| Replay within window | Typed `replay_detected` reject | ✓ Correct |
-| Persist `lookup_public_key` errors out | Typed `verify_unavailable` reject; surface as 503-equivalent | ✓ Correct (no fallback acceptance) |
-| Body > `MAX_BODY_BYTES` | Typed `body_too_large` reject; transport-level 413 if HTTP | ✓ Correct |
-| Inbound queue full | 429 + Retry-After (HTTP) / equivalent typed reject | ✓ Correct |
-| Handler returns error | Wire-formatted error response signed and returned to sender | ✓ Correct |
-| Handler panics | Edge-level panic-handler returns typed `handler_panicked`; process stays up | ✓ Correct |
-| Edge process panics (verify path) | Process exits; orchestrator restart; no silent recovery | ✓ Correct |
-| Reticulum link establishment fails | Transport falls back to next configured transport (HTTP if available); per-transport metric records the failure | ⚠ Phase 1 design |
-| Transport encryption negotiation fails | Connection rejected; no plaintext fallback within a single transport | ✓ Correct |
+| Failure | Behaviour at 44.1 |
+|---|---|
+| Envelope schema / version / signature / key failure | Typed reject; no handler invoked |
+| Unattributable inbound frame | Dropped before any serve gate (CC 5.4.6 bootstrap carve-out excepted: Key, IdentityOccurrence, TransportDestination) |
+| Peer does not run the E1 seal | Gets nothing; link refused by name (`SealRefusal`) |
+| No authenticated pair for the dialled node | Pre-seal route fetch; else no dial, never a bare-announce pair |
+| First frame neither handshake nor route request | Link dropped |
+| Keying hold over its bound | Refused by name, never trimmed |
+| Peer cannot meet a shaping offer | Declines the link rather than run half-shaped (CC 5.4.3 item 2) |
+| Ninth shaping peer at a shaped-only / Anonymous-Tier node | Refused with up to three referrals |
+| Bulk with no unshaped link | `link_shaping_bulk_refused`, retried on schedule; never shaped frames |
+| Shaped frame over the Channel limit | Dropped by name (`link_shaping_frame_too_large`), link stays up |
+| Onion packet on an unshaped link | `onion_unshaped_link`, before any cryptography |
+| Tier not opted in / layer under three relays | `onion_tier_not_opted_in` / `onion_tier_unavailable_floor` |
+| Host stops renewing a lever | Lever walks back to 0; node serves its whole role |
+| Handler panics | Typed `handler_panicked`; process stays up |
 
-Critical invariant: **`signature_verified=false` envelopes do not reach
-handlers.** The verify pipeline asserts this true unconditionally;
-unverified bytes never produce a handler invocation. Storing or
-processing unverified envelopes would corrupt the federation's PoB §2.4
-measurement.
+Critical invariant: **unattributed or unverified bytes do not reach handlers.**
 
 ---
 
 ## 9. Residual Risks
 
-Risks edge mitigates but cannot fully eliminate.
+What edge does not defend against at 44.x. The first group is the
+Constitution's own statement of what the substrate does not buy; edge
+inherits it and must not represent otherwise.
 
-1. **Compromised peer signing key** (AV-2). Edge accepts
-   forged-but-correctly-signed envelopes. Closure: agent-side key
-   storage hardening (CIRISVerify), Phase 2 peer-replicate, federation
-   N_eff drift detection (RATCHET).
-2. **Quantum compromise of Ed25519 under Ed25519-fallback policy.**
-   Edge ships hybrid Ed25519 + ML-DSA-65 verify in v0.1.0 (OQ-11
-   closure). Strict-hybrid policy eliminates the residual against
-   hybrid-complete rows; against hybrid-pending rows, the residual is
-   bounded by the consumer's chosen policy (soft-hybrid+freshness or
-   strict-hybrid both give explicit control). Ed25519-fallback retains
-   the residual by design — it's the deployment-tier choice for
-   environments where PQC reach is incomplete (older agents, transport
-   bandwidth caps).
-3. **Cross-implementation drift** when Leviculum or other Reticulum
-   forks emerge. Mitigation is regression test (AV-25); residual is
-   any drift not caught by the test fixture set.
-4. **Persist directory compromise** (Assumption 1). Out of edge's
-   scope; persist's threat model is authoritative.
-5. **Same-host attacker reading persist's keyring file** (CIRISPersist
-   AV-25 residual on `SoftwareSigner` fallback). Closure: hardware-
-   backed keyring (TPM / Secure Enclave / StrongBox) per
-   CIRISPersist's tier classification. Edge inherits whatever tier
-   persist runs at.
-6. **Side-channel timing leakage of directory membership** (AV-16).
-   Low-impact (key ids are public) but trackable; LoRa/serial timing
-   amplification (AV-19) makes the channel slower-but-not-more-leaky.
-7. **All federation peers compromised simultaneously** (PoB §5.1
-   residual). Per Accord NEW-04, no detector is complete. Topological
-   cost-asymmetry over time is the federation-level response.
-8. **DNS bootstrap poisoning for HTTP fallback** (the HTTP transport
-   resolves a hostname; DNS spoof points to attacker). Mitigation:
-   Reticulum is canonical; HTTP fallback is for environments where
-   Reticulum can't run, and those environments inherit DNS as part of
-   their existing trust model. Track at HTTP-transport documentation.
+**Stated by the Constitution (CC 1.13.3.1, CC 5.2 scope note, CC 5.4.3 item 5,
+CC 5.4.6):**
+
+- **R-C1 Relationship existence, communication graph, metadata.** Group
+  existence, rough size and churn are observable; announce and path request
+  expose who is reachable where; cohort scope hides content, not contact
+  (CC 1.13.3.1). Structural invisibility buys content-holding confidentiality
+  only (CC 5.2, Scope).
+- **R-C2 Traffic analysis.** Outside a shaped link, stream existence, group
+  size, churn, bursts and bitrate class leak without decrypting a byte
+  (CC 1.13.3.1). Shaping hides timing and volume inside a shaped link only,
+  never which links exist, and a node with any unshaped link is
+  distinguishable (CC 5.4.3 item 5). Scoped and A/V links are never shaped
+  (AV-54).
+- **R-C3 A global passive adversary at federation scope.** Not defeated by
+  base CEG/RET; the Anonymous Tier is the opt-in answer, and it is dormant
+  (CC 1.13.3.1; AV-59).
+- **R-C4 Post-compromise security for streams.** Forward-only; a compromised
+  current member is not self-healed (CC 1.13.3.1).
+- **R-C5 First contact under a flood.** A swarm of minted keys can fill the
+  node-wide stranger budget; an honest stranger's chance falls to about the
+  budget over the flood's rate, and nothing keeps it up (CC 5.4.6, "What this
+  does not promise").
+- **R-C6 Relays do not mix at today's load; a phone that sleeps** can be
+  narrowed by a room insider with an observer of its online times (CC 5.4.6
+  item 8). Applies when the tier runs.
+- **R-C7 Insiders.** An honest-but-curious member sees in-scope content and
+  co-members; a malicious member can leak what it was entitled to; a
+  compromised substrate node reads every attestation row it holds
+  (CC 1.13.3.3).
+- **R-C8 The growth tax.** Consent-gated replication has not been shown to
+  coexist with mass adoption (CC 8.3.1 R11). AV-56 lowers the per-contact
+  cost; it does not answer the bet.
+
+**Edge's own residuals at 44.1:**
+
+- **R-1 Compromised signing key** (AV-2): the verifier cannot tell a stolen
+  key from its owner.
+- **R-2 Persist directory compromise**: out of edge's scope (§7.1).
+- **R-3 No defensive dropping.** Shaped frames ride the leviculum Channel, so
+  a dropped frame becomes a delay and nothing at the shaping layer detects it
+  (`docs/RELEASE_NOTES.md` v44.0.0 "Known limits").
+- **R-4 Post-quantum metadata.** The RNS link layer (link request, announce,
+  path request) is classical and not relied on for post-quantum
+  confidentiality (CC 5.3.3.5 E1 rule 2); content keys, record signatures and
+  the per-link seal carry the PQ guarantee (E1 rule 3). A recorder of today's
+  links who later breaks X25519 recovers RNS link framing and the
+  unsealed pre-seal route row (a public row, E1 rule 9), and learns which
+  transport identities linked when, not what crossed the seal. Announce
+  app-data's attestation is signed Ed25519 only
+  (`src/transport/reticulum.rs:21274-21280`); E1 rule 3 keeps a bare announce
+  from authenticating a transit pair, so a forged announce can misdirect a
+  path, not open a seal. **Needs a CC or code answer**: the consumer
+  `HybridPolicy::Ed25519Fallback` setting remains selectable
+  (`src/ffi/pyo3.rs:5613`) and accepts an Ed25519-rooted provenance chain on
+  the announce path (`hybrid_policy_accepts`, `reticulum.rs:21265-21272`);
+  the default is `Strict` (`src/edge.rs:579`), and CC 5.3.2.4.3.1 / E1 rule 11
+  admit no classical-only accommodation.
+- **R-5 Deniability.** The link's identification frame is a signature; the
+  KEM-authenticated handshake that removes the transferable proof is the
+  planned v62 edition (CC 5.3.3.5).
+- **R-6 A/V.** A/V across real NATs is unproven; A/V through the canonical
+  is not end to end (one-hop legs) (`docs/RELEASE_NOTES.md` v44.0.0 "Known
+  limits"). The ALM tree reads an epoch roll as total loss and lets a member
+  claim depth 0 (CIRISEdge#945, open).
+- **R-7 The Anonymous Tier is dormant and incomplete.** Packet not pinned by
+  the CC; hop key is a stand-in (CIRISPersist#1181); no rendezvous or mailbox
+  (CIRISPersist#1149); no over-the-wire loopback; **no delivery feedback**
+  (a publisher cannot learn whether a packet arrived); the CC 5.4.6
+  identity rule (an anonymous node proxies and relays nothing) is not
+  enforced by `relay_offering` (AV-59). Replay memory is unbounded at
+  `1175e65` and bounded by CIRISEdge#955 (AV-58). None of this is reachable
+  while the tier is dormant; all of it must close before activation.
+- **R-8 Shaping not yet as rc17 says.** Chat and small attachments ride any
+  shaped link at 44.1 (rc17: only when one end is shaped-only); displacement
+  is not built (#939); the named large-file refusal string is not emitted
+  (AV-54, AV-55).
+- **R-9 Replay window is process-local** (AV-3): a replay against a second
+  instance of the same peer lands once per instance until persist dedups.
+- **R-10 Same-host read of a `SoftwareOnly` seed.** Hardware-backed custody
+  closes it; edge inherits the class the deployment runs.
+- **R-11 leviculum.** Edge's RNS is a fork (`CIRISAI/leviculum`
+  `v0.34.0+ciris.1`); a bug there is edge's exposure. Pre-0.34 peers keep
+  edge's upgrade guard (`docs/RELEASE_NOTES.md` v44.1.0).
+- **R-12 DNS for HTTPS.** The HTTPS transport inherits DNS.
+- **R-13 Timing side channels on verify** (AV-16, AV-19).
+
+### 9.1 What is measured, and what is not
+
+"Measured" here means a test or harness demonstrates it; the scope of each
+measurement is the claim's scope, and nothing larger.
+
+| Claim | Measured by | Scope of the measurement | Not measured |
+|---|---|---|---|
+| Group plane: non-member cannot fetch, relay holds no group address, rotation without frame loss, address retirement | `bench-mesh/` legs (`docs/LIGHTNET_DARKNET.md`) | One host, docker containers: K=1 relay, M ∈ {1, 2, 4}, at most 7 nodes (8 at K=2) (`docs/LIGHTNET_DARKNET.md:155-156`; `bench-mesh/README.md:108-109`). Committed baselines are from v18.6.0–v18.8.0 (2026-08) | Any real NAT, WAN latency, radio, or more than 8 nodes. **The weekly lane (`.github/workflows/bench-mesh.yml`) has not passed since 2026-10-12**: the scheduled runs of 2026-10-19, 10-26 and 11-02 failed, so no acceptance sweep is recorded green on the 44.x line |
+| E1 seal, route fetch, receiver order | `tests/link_seal_e1.rs`, `tests/offline_route_e1.rs` | Loopback leviculum nodes in one process | Python-RNS peers |
+| Shaping: one hop, bound, off-not-offered, bulk refusal | `tests/link_shaping_e1.rs`, `tests/direct_links_805.rs` | Loopback, often at raised test rates | Live-mesh ρ/W behaviour (the CC's defaults are model-derived, CC 5.4.3) |
+| Direct links and first contact across NAT | The cross-NAT harness (`docs/RELEASE_NOTES.md` v44.0.0; `FSD/CIRIS_MESH.md` §1) | Individual runs, not a scheduled gate | A/V across real NATs (R-6) |
+| CC 5.2 moves | `moves_5_2.rs` | Unit, against a fixture store | Fleet-scale offer volume |
+| Relay never closes on tier; levers | `tests/relay_roster_752.rs`, lever unit tests | Loopback / paused clock | A canonical under real forward flood |
+| Onion packet codec | KATs (`src/onion/packet.rs`, `docs/onion_packet_wire.md`) | Codec only | Any onion delivery over a wire |
 
 ---
 
-## 10. Posture Summary
+## 10. Posture Summary (44.x)
 
 ```
-PRE-PHASE-1 P0 MUST-HAVE BUNDLE — must land with v0.1.0
-  ⚠ AV-9   Structural verify-pipeline gating (no unverified bytes past handler boundary)
-  ⚠ AV-13  MAX_BODY_BYTES = 8 MiB at all transport entry points
-  ⚠ AV-14  Typed envelope deserialize + MAX_DATA_DEPTH=32
-  ⚠ AV-17  FFI boundary heap-scan property test
-  ⚠ OQ-11  Hybrid verify via Engine.verify_hybrid_via_directory (CIRISPersist v0.4.0+; #14 closed)
+BUILT AND WITNESSED AT 44.1
+  ✓ AV-53  E1 hybrid transit seal on every RNS link, enforced at once
+  ✓ AV-54  Shaping per CC 5.4.3 rc17: one hop, off = not offered,
+           eight-link bound (refuse only on shaped-only / anonymous),
+           scoped and A/V never shaped
+  ✓ AV-55  64 KiB row limit; bulk refused by name, never on shaped frames
+  ✓ AV-56  CC 5.2 what moves to a peer
+  ✓ AV-57  Tier never closes forwarding; graduated, leased host levers
+  ✓ AV-1/6/42  Attribution and authenticated route binding before any handler
+  ✓ AV-7/8/9/13/14  Strict version, misroute, typed parse, size and depth caps
 
-V0.4.0 SHIPPED (CIRISEdge#15 / CIRISVerify#28 Phase 3)
-  ✓ AV-42  Authenticated transport-identity ↔ federation-key binding
-           (two-step root_binding + announce-attestation verify;
-           replaces v0.3.1 trust-on-first-use on the PeerResolver
-           cold-start path)
+LANDING IN 44.1
+  ⧗ AV-58  Onion replay set bounded by admitted rate × period (#955)
 
-V0.13.0 → V0.17.0 SHIPPED (cohab + UniFFI + wire-compliance surfaces)
-  ✓ AV-43  Federation transport identity 32-byte vs 65-byte hybrid
-           split (Step 3.5 dual-capsule extraction +
-           LocalSignerHardwareAdapter; CIRISEdge#43, v0.13.1 patch /
-           v0.16.1 main cherry-pick)
-  ✓ AV-44  testimonial_witness preservation invariant
-           (Option-wrapped wire field; canonical bytes via persist;
-           CIRISEdge#37, v0.16.0)
-  ✓ AV-46  Schema-level separation of operator opinion from federation
-           attestation (peer-mgmt mutation surface against
-           federation_peer_metadata sibling table; CIRISEdge#26 +
-           CIRISPersist#117, v0.15.1)
-  ✓ AV-47  UniFFI pre-init invariant (every FFI free function gates
-           on current_edge() → typed NotInitialized / Unsupported;
-           CIRISEdge#36 GO, v0.13.0)
+DORMANT (must close before the Anonymous Tier activates)
+  ○ AV-59  Identity rule not enforced; hop key stand-in (persist#1181);
+           rendezvous/mailbox (persist#1149); packet not pinned by the CC;
+           no delivery feedback; no over-the-wire loopback
 
-V0.17.1 DOCUMENTED, ENFORCEMENT SCHEDULED LATER
-  ⚠ AV-45  key_boundary scope-binding enforcement deferred to v0.16.1+
-           (wire form ships at v0.16.0; declared-not-enforced); v0.19.6
-           narrows the residual to "key_boundary_scope-to-signature
-           binding" only — the cohort_scope half is now persist-backed
-           and structurally enforced
-  ⚠ Canonical-peer invariant scheduled v0.18.0 (CIRISEdge#46) —
-           bootstrap reseed + typed CannotRemoveCanonicalPeer +
-           EdgePeerInfo.canonical field
+KNOWN GAPS AGAINST CC rc17
+  ⚠ Chat / small-attachment shaped routing (44.2)
+  ⚠ Shaped-link displacement (#939)
+  ⚠ HybridPolicy::Ed25519Fallback still selectable (§9 R-4)
 
-V0.19.6 SHIPPED (CIRISEdge#48-A completion + #48-B)
-  ✓ AV-48  Trust short-circuit at dispatch_inbound — persist
-           TrustScoring consumer drops verified envelopes whose
-           signing_key_id scores below EdgeConfig::trust_threshold;
-           moderation signal on EventBus; inbound_dropped_low_trust
-           metric (CIRISPersist#123 / CIRISEdge#48-B)
-  ✓ AV-45 partial — cohort_scope source-of-truth moves from
-           in-process registry (v0.19.1 workaround) to persist's
-           federation_peer_metadata.policy_blob.cohort_scope via
-           peer_metadata_for (CIRISPersist#127). Cohort{id}
-           consumer-side check enabled (v0.19.1 deferred arm closes).
-           key_boundary_scope-to-signature binding REMAINS deferred.
-
-V0.20.0 RC1 SHIPPED (CIRISEdge#51 — CEWP infrastructure cut)
-  ✓ AV-48  cohabitation residual CLOSED — pyo3 init now
-           auto-derives Arc<dyn TrustScoring> via persist v3.5.1's
-           Engine::trust_scoring_capsule (7th cohab capsule, name
-           tag ciris_persist::trust_scoring); typed
-           ValueError("trust_scoring_unavailable") falls back to
-           the bootstrap-permissive None posture (CIRISPersist#129)
-  ✓ CEWP L0/L1 tier model — AgentMode extends from listener+queue
-           knobs to the full CEWP vocabulary: disk_budget_bytes
-           (advisory at edge; persist/host enforces) +
-           trust_recursion_depth (threaded into
-           TrustScoring::trust_score replacing v0.19.6's hardcoded
-           0); L0/L1 documented as security boundary in §4.9
-           (recursion depth = blast radius bound; storage budget =
-           capacity-gated admission contract). Operator overrides
-           on init_edge_runtime allow per-deployment tuning. L2+
-           depths deferred to post-v1.0.
-
-V0.20.1 SHIPPED (CIRISEdge#52 — multimedia tier transport, last feature cut)
-  ✓ AV-49  Multimedia tier transport semantics — Contribution
-           subject_kind discriminator (takedown_notice fast-path
-           on TVEC / GIFCT-CIP / NCMEC legal_basis; key_grant
-           point-to-point); BlobBody::External wire shape
-           (validate_content_body skips AV-13 + SHA gates for
-           external bytes — publisher's responsibility per
-           MEDIA_SHARING.md §2.6); L1-as-CDN-edge opt-in default
-           OFF (Client + Proxy modes ignore the flag; full HTTP
-           fetch implementation deferred post-v1.0 — wire shape +
-           dispatch path locked at v0.20.1). Substrate primitives
-           backed by CIRISPersist v3.6.0 (#134 multimedia tier).
-
-V1.0.0 GA SHIPPED — Agent 3.0 / CEWP federation transport tier
-  v1.0 SECURITY CONTRACT = AV-43 through AV-49 (all structurally mitigated):
-    ✓ AV-43  Federation transport identity 32-byte vs 65-byte hybrid
-             split (Step 3.5 dual-capsule extraction +
-             LocalSignerHardwareAdapter; v0.13.1 / v0.16.1 cherry-pick)
-    ✓ AV-44  testimonial_witness preservation invariant
-             (Option-wrapped wire field; canonical bytes via persist;
-             edge propagates verbatim, never interprets)
-    ✓ AV-45  key_boundary {scope} wire form shipped (v0.16.0);
-             cohort_scope source-of-truth persist-backed at v0.19.6
-             via federation_peer_metadata.policy_blob.cohort_scope;
-             key_boundary-scope-to-signature binding deferred to
-             v1.0.x+ (declared-not-enforced at GA — wire surface
-             stable for downstream consumers)
-    ✓ AV-46  Schema-level separation of operator opinion
-             (federation_peer_metadata sibling table) from
-             federation attestation (federation_keys directory) —
-             EdgePeerTrust is operator policy, not attestation
-    ✓ AV-47  UniFFI pre-init invariant — every FFI free function
-             gates on current_edge() and returns typed
-             NotInitialized rather than panicking; Weak::upgrade
-             flips back to NotInitialized on teardown
-    ✓ AV-48  Trust short-circuit at dispatch_inbound (substrate gate
-             stays first; trust drop fires moderation event +
-             inbound_dropped_low_trust counter); cohabitation
-             cohab residual CLOSED via 7th capsule (v0.20.0 RC1)
-    ✓ AV-49  Multimedia tier transport semantics — takedown fast-path
-             observability; BlobBody::External non-fetch contract;
-             L1-as-CDN-edge opt-in OFF by default (v0.20.1)
-  SUBSTRATE LOCKED:
-    ciris-persist v3.6.3 + ciris-verify v4.4.2
-  CROSS-CDYLIB SQLITE UNIFICATION (v0.19.7 closure of CIRISEdge#50):
-    persist v3.5.3 → wheel-tier dynamic libsqlite3 linkage;
-    5 sibling traits (FederationDirectory, OutboundQueue,
-    TrustScoring, BlackholeRules, LocalSigner) structurally
-    protected against cross-cdylib vtable null-slot crashes
-    (persist v3.6.1+ + edge v0.19.7+).
-
-PHASE-1 P1 BUNDLE — must land for production cutover
-  ⚠ AV-3   Replay LRU with 5-min window
-  ⚠ AV-5   Cross-impl byte-equivalence test for canonicalize_envelope
-  ⚠ AV-7   Strict version allowlist
-  ⚠ AV-10  Per-transport rate caps + bounded queue
-  ⚠ AV-11  Cheap lookup_public_key + per-source verify-rate cap
-  ⚠ AV-15  TLS startup warning on HTTP-without-TLS
-  ⚠ AV-24  Hybrid release signature via ciris-build-sign
-
-PHASE-2-CLOSES (architecturally deferred)
-  ⚠ AV-2   Stolen-key forgery (peer-replicate audit chain in persist)
-  ⚠ AV-25  Cross-Reticulum-impl drift (when sister impl emerges)
-
-V0.2.X TRACK (low blast radius)
-  ⚠ AV-8, AV-12, AV-16, AV-21, AV-22, AV-23
-
-PHASE-3 (multi-medium hardening)
-  ⚠ AV-19  Slow-medium timing-amplification (LoRa / serial pacing)
-
-ARCHITECTURALLY MITIGATED (no further action required)
-  ✓ AV-1   Forged from attacker key (lookup_public_key gate)
-  ✓ AV-4   Replay outside window (persist AV-9 catches)
-  ✓ AV-6   Reticulum destination spoofing (structural)
-  ✓ AV-18  Cross-medium replay (transport-agnostic window)
-  ✓ AV-20  I²P endpoint enumeration (public by design)
+UNMEASURED ON THIS LINE
+  ⚠ No green acceptance sweep on 44.x (§9.1)
+  ⚠ A/V across real NATs
 ```
 
-**Bottom line**: edge is a thin verify-and-dispatch substrate. The
-threat-model story reduces to five invariants:
-
-1. No unverified bytes reach handlers (AV-9).
-2. No untyped bytes pass parse (AV-14).
-3. No seed bytes enter edge's heap (AV-17).
-4. No body exceeds the size cap (AV-13).
-5. Hybrid (Ed25519 + ML-DSA-65) verify is the day-1 posture, with
-   consumer policy (strict / soft+freshness / fallback) selecting
-   acceptance against hybrid-pending rows (OQ-11).
-
-If those five hold at v0.1.0, the rest of the threat model is
-architecturally consistent with the federation meta. The pre-Phase-1
-implementation work is exactly: land those five invariants with the
-tests that assert them, then build outward.
-
-Federation-primitive contribution: edge fills the N1 (cryptographic
-addressing) and N2 (multi-medium transport) gaps that
-`FEDERATION_THREAT_MODEL.md` §5 explicitly lists as unfilled.
-Submitting this threat model upstream closes those rows in the
-federation's per-primitive coverage table.
+**Bottom line**: at 44.x edge's contract is that every inbound byte is
+attributed before a handler sees it, every RNS byte rides a hybrid seal,
+shaped links are one hop and never diluted, a peer is offered only what it
+asked for, needs, or is the audience of, and the relay a NAT'd node depends
+on never closes on load. What it does not buy is the CC's list in §9, stated
+there in the CC's own terms. Prior posture blocks (v0.1 → v1.0.0 GA) are in
+this file's git history.
 
 ---
 
 ## 11. Update Cadence
 
-This document is updated:
-- On every minor release: comprehensive review.
-- On every published security advisory affecting deps (reticulum-rs,
-  tokio, axum, serde): addendum in §4 + `cargo audit` re-run.
-- On every wire-format schema-version bump: AV-5 / AV-7 review against
-  the new shape, byte-equivalence test against persist's
-  `canonicalize_envelope`.
-- On every new transport landing in `transport/`: AV-10 / AV-13 / AV-15
-  / AV-19 review for the new medium's specific surface.
-- On every cross-trinity boundary change (CIRISPersist flips the
-  Engine surface, CIRISVerify flips keyring API, CIRISAgent flips
-  trace wire format): trust-boundary review + interaction matrix
-  update.
+This document is regenerated:
 
-Last updated: 2026-05-30 (v1.0.0 GA — Agent 3.0 / CEWP. The v1.0
-security contract is the seven invariants AV-43 through AV-49,
-each structurally mitigated. Substrate locked at ciris-persist
-v3.6.3 + ciris-verify v4.4.2. Posture Summary v1.0.0 GA block
-added with the full enumeration. Prior baselines: 2026-05-29
-v0.20.0 RC1 (CEWP infrastructure cut, AV-48 cohab residual
-closed); 2026-05-29 v0.19.6 (AV-48 mitigated, AV-45 narrowed);
-2026-05-29 v0.17.1 docs-only cut (AV-43/44/45/46/47 added +
-canonical-peer invariant); 2026-05-22 v0.4.0 AV-42 mitigated;
-2026-05-03 v0.0 scaffold.)
+- **Per release line** (44.x, 45.x, …): pins, §0, §4.10, §5, §9 and §10
+  re-derived from the code and the CC, with sources marked.
+- **On a minor that changes a vector**: the vector amended in place, its
+  witness named.
+- **On a CC cut that touches Part 5 or CC 1.13.3**: §9's stated residuals
+  re-read against the new text.
+- **On a pin move** (persist, CIRISVerify, leviculum, `WIRE_VOCABULARY.md`):
+  the pins table and any vector that names the old version.
+- **When an acceptance sweep runs**: §9.1 updated with its scope, date and
+  verdict, including a NOT MEASURED or a red.
+
+Last regenerated: 2026-11-08, for the 44.x line at v44.1.0 (`1175e65`),
+CIRISEdge#956. Previous baseline: 2026-05-30, v1.0.0 GA.

@@ -302,3 +302,191 @@ async fn a_room_keyed_publisher_never_commits() {
         Err(crate::transport::realtime_av_runtime::AvRuntimeError::RoomKeyed { .. })
     ));
 }
+
+// ─── 44.1: a room whose leaves are persons ────────────────────────────
+
+/// An owner-binding door over a fixed `(node, owner)` table (persist's
+/// `owner_of` / `nodes_owned_by`, which agree by construction).
+struct Bound(Vec<(&'static str, &'static str)>);
+
+#[async_trait::async_trait]
+impl CallOwners for Bound {
+    async fn owner_of(&self, node: &str) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(n, _)| *n == node)
+            .map(|(_, o)| (*o).to_owned())
+    }
+    async fn nodes_owned_by(&self, person: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .0
+            .iter()
+            .filter(|(_, o)| *o == person)
+            .map(|(n, _)| (*n).to_owned())
+            .collect())
+    }
+}
+
+/// A roster holding exactly these keys active.
+struct Active(Vec<&'static str>);
+
+#[async_trait::async_trait]
+impl RoomRoster for Active {
+    async fn is_active_member(&self, _room: &str, key_id: &str) -> Result<bool, String> {
+        Ok(self.0.contains(&key_id))
+    }
+}
+
+/// A group whose leaves are `leaves`, founded by the first.
+async fn group_of(tag: &[u8], room: &str, leaves: &[&str]) -> CohortGroup {
+    let g = CohortGroup::create(store(tag), room, leaves[0], 16)
+        .await
+        .unwrap();
+    for leaf in &leaves[1..] {
+        let (_material, kp) = mint_cohort_key_material(leaf).unwrap();
+        // Only the leaf set is read: the commit has no one to fan out to.
+        let _ = g.add_member(leaf, kp).await.unwrap();
+    }
+    g
+}
+
+/// The call's members: each person leaf becomes the nodes it owns, a leaf
+/// that owns none stands as itself, in leaf order, once each.
+#[tokio::test]
+async fn call_members_are_the_leaves_nodes() {
+    let owners = Bound(vec![
+        ("node-a1", "person-a"),
+        ("node-a2", "person-a"),
+        ("node-b", "person-b"),
+    ]);
+    let leaves: Vec<String> = ["person-a", "node-x", "person-b", "person-c"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    assert_eq!(
+        call_members(&leaves, &owners).await.unwrap(),
+        vec!["node-a1", "node-a2", "node-x", "node-b", "person-c"]
+    );
+}
+
+/// The join's admission over both leaf models.
+#[tokio::test]
+async fn admit_takes_a_node_for_its_verified_owner_only() {
+    let room = "room-pl";
+    let owners = Bound(vec![
+        ("node-a", "person-a"),
+        ("node-b", "person-b"),
+        ("node-z", "person-z"),
+    ]);
+    let persons = group_of(b"pl-p", room, &["person-a", "person-b"]).await;
+    let roster = Active(vec!["person-a", "person-b"]);
+    // A node attending as itself is in the room as its owner: the roster is
+    // asked about the person.
+    let (leaves, members) = admit(room, "node-a", "node-a", &persons, &roster, &owners)
+        .await
+        .expect("node-a for person-a");
+    assert_eq!(leaves, vec!["person-a", "person-b"]);
+    assert_eq!(members, vec!["node-a", "node-b"]);
+    // Attending as its owner.
+    admit(room, "node-b", "person-b", &persons, &roster, &owners)
+        .await
+        .expect("node-b as person-b");
+    // Its owner is no leaf.
+    assert!(matches!(
+        admit(room, "node-z", "node-z", &persons, &roster, &owners).await,
+        Err(CallError::NotARoomMember { key_id, .. }) if key_id == "node-z"
+    ));
+    // It acts for a leaf it is not bound to.
+    assert!(matches!(
+        admit(room, "node-z", "person-a", &persons, &roster, &owners).await,
+        Err(CallError::NotARoomMember { key_id, .. }) if key_id == "node-z" || key_id == "person-a"
+    ));
+    assert!(matches!(
+        admit(room, "node-a", "person-b", &persons, &roster, &owners).await,
+        Err(CallError::NotARoomMember { key_id, .. }) if key_id == "person-b"
+    ));
+    // The owner is a leaf but not on the active roster.
+    assert!(matches!(
+        admit(room, "node-a", "node-a", &persons, &Active(vec!["person-b"]), &owners).await,
+        Err(CallError::ConsentMissing { key_id, .. }) if key_id == "person-a"
+    ));
+    // Node leaves: unchanged.
+    let nodes = group_of(b"pl-n", room, &["node-a", "node-b"]).await;
+    let (_, members) = admit(
+        room,
+        "node-a",
+        "node-a",
+        &nodes,
+        &Active(vec!["node-a"]),
+        &owners,
+    )
+    .await
+    .expect("a node leaf");
+    assert_eq!(members, vec!["node-a", "node-b"]);
+    admit(room, "node-b", "person-b", &nodes, &roster, &owners)
+        .await
+        .expect("a node leaf attending as its owner");
+}
+
+/// **44.1** — a room and its call, installed for the same members at the
+/// same epoch in one table, never collide: the call's addresses are derived
+/// from the call's own secret, not the room's (the field refusal was
+/// `address collision on member … (epoch 1) — reused exporter_secret?`).
+#[tokio::test]
+async fn a_call_s_addresses_are_never_its_room_s() {
+    use crate::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
+    let room = "room-addr";
+    let g = group_of(b"addr", room, &["node-a", "node-b"]).await;
+    let table = ScopeAddressTable::new(Arc::new(ScopePrivacyDeriver));
+    // The room, as `ensure_room_addresses` installs it.
+    let room_snap = crate::cohort_addressing::snapshot(&g).await.unwrap();
+    let room_scope = crate::cohort_addressing::scope_for(room);
+    table
+        .install_group(
+            &room_scope,
+            &room_snap.group_id,
+            room_snap.epoch,
+            &room_snap.destination_secret,
+            &room_snap.members,
+        )
+        .expect("the room's addresses");
+    // Its call, for the same members at the same epoch.
+    let call_group = call_group_id(call_id_for_room(room));
+    let call_snap = room_snapshot(&g, &call_group, &room_snap.members)
+        .await
+        .unwrap();
+    assert_eq!(call_snap.epoch, room_snap.epoch);
+    assert_ne!(call_snap.destination_secret, room_snap.destination_secret);
+    let call_scope = CohortScope::Cohort {
+        cohort_id: room.to_owned(),
+    };
+    table
+        .install_group(
+            &call_scope,
+            &call_group,
+            call_snap.epoch,
+            &call_snap.destination_secret,
+            &call_snap.members,
+        )
+        .expect("the call installs beside its room");
+    for m in ["node-a", "node-b"] {
+        let at_room = table
+            .send_address(&room_scope, &room_snap.group_id, m)
+            .unwrap();
+        let at_call = table.send_address(&call_scope, &call_group, m).unwrap();
+        assert_ne!(at_room, at_call, "{m}'s call address is its room address");
+    }
+    // Deterministic, and bound to the call's group id.
+    let again = room_snapshot(&g, &call_group, &room_snap.members)
+        .await
+        .unwrap();
+    assert_eq!(again.destination_secret, call_snap.destination_secret);
+    assert_ne!(
+        crate::transport::av_call_key::call_destination_secret(
+            &room_snap.destination_secret,
+            &call_group_id(call_id_for_room("room-other")),
+        )
+        .unwrap(),
+        call_snap.destination_secret
+    );
+}
