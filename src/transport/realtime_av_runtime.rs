@@ -1362,11 +1362,12 @@ mod leviculum_link {
             )
         }
 
-        /// Count one frame dropped BEFORE it reached this queue (the #393
-        /// gate refused it while the binding was stale): reported with the
-        /// next queued frame like an overflow drop (Codex on #813).
-        pub(crate) fn note_dropped(&mut self) {
-            self.dropped_since_queued = self.dropped_since_queued.saturating_add(1);
+        /// Count `n` frames dropped BEFORE they reached this queue (the #393
+        /// gate refused one while the binding was stale, Codex on #813; or a
+        /// datagram sequence gap, leviculum#102): reported with the next
+        /// queued frame like an overflow drop.
+        pub(crate) fn note_dropped_n(&mut self, n: u64) {
+            self.dropped_since_queued = self.dropped_since_queued.saturating_add(n);
         }
 
         /// Offer one frame. Never awaits.
@@ -1394,13 +1395,34 @@ mod leviculum_link {
     /// timed Channel frames). Zero means untimed: the frame rides the plain
     /// Channel, as for a peer whose leviculum predates v0.33. The call layer
     /// sets it once the peer said it takes timed frames (its C3 `CAPS`).
+    ///
+    /// leviculum#102 — it also carries whether media on the leg rides
+    /// unordered link datagrams ([`Self::set_datagrams`]), set by the call
+    /// layer once the peer's `CAPS` carried `CAP_LINK_DATAGRAMS`. Once set it
+    /// stays set for the leg: every media frame then rides a datagram, so the
+    /// datagram sequence numbers and the hop counter move together and a
+    /// sequence gap at the receiver is exactly the frames lost.
     #[derive(Debug, Default)]
     pub struct MediaTtl {
         audio_ms: std::sync::atomic::AtomicU32,
         video_ms: std::sync::atomic::AtomicU32,
+        datagrams: std::sync::atomic::AtomicBool,
     }
 
     impl MediaTtl {
+        /// leviculum#102 — media on this leg rides unordered link datagrams
+        /// from now on (the peer said it takes them).
+        pub fn set_datagrams(&self) {
+            self.datagrams
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// leviculum#102 — whether media on this leg rides datagrams.
+        #[must_use]
+        pub fn uses_datagrams(&self) -> bool {
+            self.datagrams.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         /// Time media on this leg: codec-opaque chunks (audio) live `audio`,
         /// layered video `video`.
         pub fn set(&self, audio: std::time::Duration, video: std::time::Duration) {
@@ -1556,6 +1578,26 @@ mod leviculum_link {
             crate::transport::reticulum::link_channel_message_limit(&self.node, &self.link_id)
         }
 
+        /// leviculum#102 — the most one datagram on this link carries (its
+        /// plaintext, with room left for the E1 seal), or `None` when
+        /// leviculum no longer holds the link. It follows the link's MDU,
+        /// which on a punched path is the probed one (leviculum#104).
+        #[must_use]
+        pub fn datagram_limit(&self) -> Option<usize> {
+            crate::transport::reticulum::link_datagram_message_limit(&self.node, &self.link_id)
+        }
+
+        /// The most one MEDIA frame on this link carries: the datagram limit
+        /// when the leg rides datagrams, else the Channel limit.
+        #[must_use]
+        pub fn media_limit(&self) -> Option<usize> {
+            if self.media_ttl.uses_datagrams() {
+                self.datagram_limit()
+            } else {
+                self.channel_limit()
+            }
+        }
+
         fn count(&self, label: &'static str) {
             if let Some(m) = self.metrics.as_ref() {
                 m.inc_av_plane(label);
@@ -1591,12 +1633,101 @@ mod leviculum_link {
             self.send_with(bytes, None).await
         }
 
+        /// leviculum#102 — a leg whose peer takes datagrams sends each media
+        /// frame as one ([`Self::send_datagram`]); any other leg sends it on
+        /// the Channel, timed when the peer takes timed frames, and counts
+        /// the fallback.
         async fn send_media(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
-            self.send_with(bytes, self.media_ttl.for_chunk(bytes)).await
+            if self.media_ttl.uses_datagrams() {
+                return self.send_datagram(bytes);
+            }
+            let sent = self.send_with(bytes, self.media_ttl.for_chunk(bytes)).await;
+            if sent.is_ok() {
+                self.count(crate::observability::AV_SENT_DATAGRAM_FALLBACK);
+            }
+            sent
         }
     }
 
     impl LeviculumAvSender {
+        /// leviculum#102 — one media frame as one unordered link datagram,
+        /// sealed on the E1 datagram lane. Never waits: a full action queue
+        /// (`Busy`) or interface (`PacingDelay`) refuses it before leviculum
+        /// numbers it, mapped to [`AvDispatcherError::Congested`] so the
+        /// dispatcher's hop counter stays where it is. Once numbered it is
+        /// never retried: an interface with no room sheds it
+        /// (`DropReason::DatagramShed`, `av_datagram_shed`) and the receiver
+        /// sees the sequence gap.
+        fn send_datagram(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            use leviculum_core::SendError;
+            use leviculum_std::error::Error as LevError;
+
+            let Some(limit) = self.datagram_limit() else {
+                self.count(crate::observability::AV_SEND_LINK_GONE);
+                return Err(AvDispatcherError::LinkGone(format!(
+                    "leviculum link {:?} is no longer held — no link to send a datagram on",
+                    self.link_id
+                )));
+            };
+            if bytes.len() > limit {
+                self.count(crate::observability::AV_SEND_REFUSED_CHUNK_TOO_LARGE);
+                return Err(AvDispatcherError::ChunkTooLarge(ChunkTooLarge {
+                    frame_bytes: bytes.len(),
+                    channel_limit: limit,
+                }));
+            }
+            // CC 5.3.3.5 E1 — sealed under the link's keys, or not sent.
+            let Ok(sealed) = self.seals.seal(
+                self.link_id.into_bytes(),
+                crate::transport::link_seal::Lane::Datagram,
+                bytes,
+            ) else {
+                self.count(crate::observability::AV_SEND_FAILED);
+                if let Some(m) = self.metrics.as_ref() {
+                    m.inc_link_seal(crate::observability::LINK_SEAL_REFUSED_UNSEALED_SEND);
+                }
+                return Err(AvDispatcherError::SendFailed(format!(
+                    "leviculum link {:?} carries no transit keys; nothing is sent in the clear \
+                     (CC 5.3.3.5 E1)",
+                    self.link_id
+                )));
+            };
+            match self
+                .node
+                .link_handle(&self.link_id)
+                .try_send_unordered(&sealed)
+            {
+                Ok(_sequence) => {
+                    self.count(crate::observability::AV_SENT);
+                    self.count(crate::observability::AV_SENT_DATAGRAM);
+                    if let Some(stamps) = self.outbound_liveness.as_deref() {
+                        crate::transport::reticulum::note_outbound_use(stamps, self.link_id);
+                    }
+                    Ok(())
+                }
+                Err(LevError::Send(SendError::Busy | SendError::PacingDelay { .. })) => {
+                    self.count(crate::observability::AV_SEND_CONGESTED);
+                    Err(AvDispatcherError::Congested)
+                }
+                // Refused before it was numbered: the counter stays, as for
+                // the pre-check above (the link's MDU moved since).
+                Err(LevError::Send(SendError::TooLarge)) => {
+                    self.count(crate::observability::AV_SEND_REFUSED_CHUNK_TOO_LARGE);
+                    Err(AvDispatcherError::ChunkTooLarge(ChunkTooLarge {
+                        frame_bytes: bytes.len(),
+                        channel_limit: self.datagram_limit().unwrap_or(0),
+                    }))
+                }
+                Err(e) => {
+                    self.count(crate::observability::AV_SEND_FAILED);
+                    Err(AvDispatcherError::SendFailed(format!(
+                        "leviculum link {:?} datagram send failed: {e}",
+                        self.link_id
+                    )))
+                }
+            }
+        }
+
         /// One Channel message, timed (leviculum#94: retransmitted only until
         /// `ttl`, then an expired marker; dropped by the receiver if late)
         /// or not. Both never wait (#591).
@@ -1775,7 +1906,8 @@ mod leviculum_link {
                 // ignores it by design. Link lifecycle for A/V links is
                 // the caller's concern (it dialed them).
                 let (NodeEvent::LinkDataReceived { link_id, data }
-                | NodeEvent::MessageReceived { link_id, data, .. }) = event
+                | NodeEvent::MessageReceived { link_id, data, .. }
+                | NodeEvent::LinkDatagramReceived { link_id, data, .. }) = event
                 else {
                     continue;
                 };

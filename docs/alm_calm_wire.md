@@ -75,10 +75,17 @@ Field rules (enforced at decode):
   - bit 0: speaks C3 v1;
   - bit 1: this node's leviculum takes timed Channel frames (0xFD00/0xFD01,
     leviculum v0.33+);
-  - bit 2: offers relay.
+  - bit 2: offers relay;
+  - bit 3: this node takes media as unordered link datagrams (leviculum#102,
+    `PacketContext::Datagram`, leviculum v0.34.0+ciris.2) and routes them to
+    its A/V receive path. A sender uses `try_send_unordered` for media only
+    toward a peer that set it; a leviculum without #102 drops a datagram
+    unread and the sender cannot tell, so the bit's absence means "no
+    datagrams" and media stays on the Channel (`try_send_timed`).
 
-  Unknown bits are ignored. This build sends `0b011`, or `0b111` when it relays
-  (`CAPS_THIS_BUILD`, `wire.rs:59`).
+  Unknown bits are ignored, so a build that predates bit 3 reads this
+  build's `CAPS` exactly as before and never sends datagrams. This build sends
+  `0b1011`, or `0b1111` when it relays (`CAPS_THIS_BUILD`, `wire.rs:68`).
 - **SUBSCRIBE** `flags`: bit 0 means the requester can itself forward
   (`forward_capable`). The other bits are ignored.
 - **REFUSE** `reason`:

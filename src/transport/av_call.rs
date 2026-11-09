@@ -1153,7 +1153,12 @@ type Publisher = KeptAvPublisher<Arc<dyn StreamDekRegistrar>>;
 #[derive(Debug, Clone)]
 struct OutLeg {
     link_id: [u8; 16],
+    /// The Channel limit when the leg came up: the budget's fallback once
+    /// leviculum no longer reports the link.
     channel_limit: usize,
+    /// The leg's media settings: timed, and (leviculum#102) whether media
+    /// rides datagrams, which sets the carrier the budget follows.
+    media: Arc<crate::transport::realtime_av_runtime::MediaTtl>,
 }
 
 /// One copy of a frame, on its way to the reorder window.
@@ -1448,6 +1453,7 @@ impl Call {
         let (heard_tx, heard_rx) = mpsc::channel::<Heard>(1024);
         let (frames_tx, frames_rx) = mpsc::channel::<ReceivedFrame>(256);
         let (events_tx, events_rx) = mpsc::channel::<CallEvent>(64);
+        let caps_withheld = transport.av_caps_withheld_for_test();
         let shared = Arc::new(Shared {
             room: room.to_owned(),
             own: own_key_id.to_owned(),
@@ -1490,13 +1496,12 @@ impl Call {
             verifier,
             own_key: StdMutex::new(own_key),
             auth: ChunkAuth::new(room),
-            alm: StdMutex::new(alm::AlmState::new(
-                own_key_id,
-                stream,
-                &members_for_alm,
-                opts.relay,
-                alm_seed,
-            )),
+            alm: StdMutex::new({
+                let mut a =
+                    alm::AlmState::new(own_key_id, stream, &members_for_alm, opts.relay, alm_seed);
+                a.withhold_caps(caps_withheld);
+                a
+            }),
             in_senders: StdMutex::new(HashMap::new()),
             leg_ttl: StdMutex::new(HashMap::new()),
             leg_cong: StdMutex::new(HashMap::new()),
@@ -1571,15 +1576,34 @@ impl Call {
     }
 
     /// The largest frame plaintext every member leg carries (#720), or
-    /// `None` before any leg is up: each leg's Channel limit less the chunk's
+    /// `None` before any leg is up: each leg's media limit less the chunk's
     /// wire overhead and its source signature.
+    ///
+    /// The limit is read from the link NOW, so it follows the link's MDU (on
+    /// a punched path the probed one, leviculum#104) rather than the 500-byte
+    /// base a leg used to be born at: the datagram limit on a leg whose peer
+    /// takes datagrams (leviculum#102), else the Channel limit. A leg only
+    /// ever moves from the Channel to datagrams, whose limit is the larger,
+    /// so a frame sized to an earlier budget still fits.
     #[must_use]
     pub fn chunk_plaintext_budget(&self) -> Option<usize> {
-        Shared::lock(&self.shared.out_legs)
+        let legs: Vec<OutLeg> = Shared::lock(&self.shared.out_legs)
             .values()
+            .cloned()
+            .collect();
+        legs.iter()
             .map(|l| {
-                l.channel_limit
-                    .saturating_sub(AV_CHUNK_WIRE_OVERHEAD + CHUNK_TRAILER_LEN)
+                let limit = self.shared.transport.av_link_limits(&l.link_id).map_or(
+                    l.channel_limit,
+                    |(channel, datagram)| {
+                        if l.media.uses_datagrams() {
+                            datagram
+                        } else {
+                            channel
+                        }
+                    },
+                );
+                limit.saturating_sub(AV_CHUNK_WIRE_OVERHEAD + CHUNK_TRAILER_LEN)
             })
             .min()
     }
@@ -1661,6 +1685,25 @@ impl Call {
     #[must_use]
     pub fn service_tier(&self) -> crate::load_ladder::ServiceTier {
         Shared::lock(&self.shared.alm).tier()
+    }
+
+    /// leviculum#102 — whether this node's media to `member` rides unordered
+    /// datagrams (the member's `CAPS` said it takes them), or `None` when no
+    /// leg to it is up.
+    #[must_use]
+    pub fn leg_uses_datagrams(&self, member: &str) -> Option<bool> {
+        Shared::lock(&self.shared.out_legs)
+            .get(member)
+            .map(|l| l.media.uses_datagrams())
+    }
+
+    /// Test seam — the link of this node's leg to `member`, when one is up.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn leg_link_for_test(&self, member: &str) -> Option<[u8; 16]> {
+        Shared::lock(&self.shared.out_legs)
+            .get(member)
+            .map(|l| l.link_id)
     }
 
     /// The members this node has a leg to.
@@ -2418,11 +2461,19 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         OutLeg {
             link_id,
             channel_limit,
+            media: Arc::clone(&media_ttl),
         },
     );
-    // ALM C5 — media to a peer that takes timed frames rides them.
-    if Shared::lock(&shared.alm).takes_timed(member) {
-        media_ttl.set(alm::AUDIO_TTL, alm::VIDEO_TTL);
+    // ALM C5 — media to a peer that takes timed frames rides them; one that
+    // takes datagrams (leviculum#102) gets them instead.
+    {
+        let a = Shared::lock(&shared.alm);
+        if a.takes_timed(member) {
+            media_ttl.set(alm::AUDIO_TTL, alm::VIDEO_TTL);
+        }
+        if a.takes_datagrams(member) {
+            media_ttl.set_datagrams();
+        }
     }
     Shared::lock(&shared.leg_ttl).insert(member.to_owned(), media_ttl);
     Shared::lock(&shared.leg_cong).remove(member);
@@ -2670,7 +2721,7 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
 /// frames gets its media timed from now on.
 async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: bool) {
     let rtt = leg_rtt_ms(shared, peer);
-    let (out, reply, timed) = {
+    let (out, reply, timed, datagrams) = {
         let mut a = Shared::lock(&shared.alm);
         match decode_c3(bytes, peer) {
             Ok(WireFrame::Caps(c)) => {
@@ -2679,18 +2730,26 @@ async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: b
                     Vec::new(),
                     (first && reply_caps).then(|| a.caps_frame()),
                     first && a.takes_timed(peer),
+                    first && a.takes_datagrams(peer),
                 )
             }
-            Ok(WireFrame::Control(cf)) => (a.on_control(peer, cf, rtt), None, false),
+            Ok(WireFrame::Control(cf)) => (a.on_control(peer, cf, rtt), None, false, false),
             Err(e) => {
                 a.note_malformed(e);
-                (Vec::new(), None, false)
+                (Vec::new(), None, false, false)
             }
         }
     };
-    if timed {
+    if timed || datagrams {
         if let Some(ttl) = Shared::lock(&shared.leg_ttl).get(peer) {
-            ttl.set(alm::AUDIO_TTL, alm::VIDEO_TTL);
+            if timed {
+                ttl.set(alm::AUDIO_TTL, alm::VIDEO_TTL);
+            }
+            // leviculum#102 — the peer said it takes datagrams: this node's
+            // media to it rides them from now on.
+            if datagrams {
+                ttl.set_datagrams();
+            }
         }
     }
     if let Some(caps) = reply {

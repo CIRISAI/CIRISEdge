@@ -50,10 +50,48 @@ fn keyed_pair() -> (LinkSeals, LinkSeals) {
     (a, b)
 }
 
+/// leviculum#102 — datagrams are overtaken and lost on the wire: each opens
+/// in any order, once, and a Channel frame's counter is never theirs.
+#[test]
+fn datagrams_open_out_of_order_once_on_their_own_lane() {
+    let (a, b) = keyed_pair();
+    let frames: Vec<Vec<u8>> = (0u8..6)
+        .map(|i| a.seal(LINK, Lane::Datagram, &[i; 40]).expect("seal"))
+        .collect();
+    // The Channel's counter moves on its own: its window is not the datagrams'.
+    let ch = a.seal(LINK, Lane::Channel, b"chan").expect("seal");
+    for i in [5usize, 0, 3, 1] {
+        match b.open(LINK, Lane::Datagram, &frames[i]) {
+            Inbound::Open(p) => assert_eq!(p, vec![u8::try_from(i).unwrap(); 40]),
+            other => panic!("datagram {i} out of order: {other:?}"),
+        }
+    }
+    assert!(
+        matches!(b.open(LINK, Lane::Datagram, &frames[3]), Inbound::Drop(_)),
+        "a replayed datagram is dropped, the link kept"
+    );
+    assert!(b.is_sealed(LINK), "a replay does not refuse the link");
+    match feed(&b, Lane::Channel, &ch, false) {
+        Inbound::Open(p) => assert_eq!(p, b"chan"),
+        other => panic!("{other:?}"),
+    }
+    // A datagram frame read as another lane does not open: the lane is bound.
+    assert!(matches!(
+        b.open(LINK, Lane::Resource, &frames[2]),
+        Inbound::Refuse(_)
+    ));
+}
+
 #[test]
 fn frames_open_in_both_directions_on_every_lane_e1() {
     let (a, b) = keyed_pair();
-    for lane in [Lane::Channel, Lane::Resource, Lane::Request, Lane::Response] {
+    for lane in [
+        Lane::Channel,
+        Lane::Resource,
+        Lane::Request,
+        Lane::Response,
+        Lane::Datagram,
+    ] {
         let up = a.seal(LINK, lane, b"row bytes up").expect("seal up");
         let bin = if lane.is_msgpack() { 2 } else { 0 };
         assert_eq!(up.len(), b"row bytes up".len() + SEAL_OVERHEAD + bin);

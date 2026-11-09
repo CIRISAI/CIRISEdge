@@ -34,7 +34,12 @@
 //! dialler answers with its own `CAPS` only after hearing one. [`CAP_C3_V1`]
 //! gates every other frame kind; [`CAP_TIMED_FRAMES`] says the peer's
 //! leviculum takes Channel frames with a deadline (0xFD00/0xFD01, leviculum
-//! v0.33+), so media to it may ride `try_send_timed`.
+//! v0.33+), so media to it may ride `try_send_timed`. [`CAP_LINK_DATAGRAMS`]
+//! says the peer's leviculum takes unordered link datagrams and its edge
+//! routes them to the A/V receive path (leviculum#102, v0.34.0+ciris.2), so
+//! media to it may ride `try_send_unordered`. A peer without the bit gets
+//! none: a leviculum without #102 drops a datagram unread and the sender
+//! cannot tell, so the bit's absence means "no datagrams".
 //!
 //! A stream id whose first five bytes read `"CALM" 0x01` is never minted
 //! ([`collides_with_control_frame`]), so a chunk is never taken for a frame.
@@ -54,9 +59,13 @@ pub const CAP_C3_V1: u32 = 1 << 0;
 pub const CAP_TIMED_FRAMES: u32 = 1 << 1;
 /// It offers to relay (a member relay: it forwards streams it receives).
 pub const CAP_RELAY: u32 = 1 << 2;
+/// It takes media as unordered link datagrams (leviculum#102,
+/// v0.34.0+ciris.2): its leviculum decodes `PacketContext::Datagram` and its
+/// edge routes `NodeEvent::LinkDatagramReceived` to the A/V receive path.
+pub const CAP_LINK_DATAGRAMS: u32 = 1 << 3;
 
 /// What this build advertises (relay added per call).
-pub const CAPS_THIS_BUILD: u32 = CAP_C3_V1 | CAP_TIMED_FRAMES;
+pub const CAPS_THIS_BUILD: u32 = CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_LINK_DATAGRAMS;
 
 const KIND_CAPS: u8 = 0x01;
 const KIND_SUBSCRIBE: u8 = 0x02;

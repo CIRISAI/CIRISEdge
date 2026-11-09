@@ -36,7 +36,8 @@ use std::time::{Duration, Instant};
 use crate::load_ladder::ServiceTier;
 use crate::transport::realtime_av::StreamId;
 use crate::transport::realtime_av_alm::controller::wire::{
-    self, encode, encode_caps, CAPS_THIS_BUILD, CAP_C3_V1, CAP_RELAY, CAP_TIMED_FRAMES,
+    self, encode, encode_caps, CAPS_THIS_BUILD, CAP_C3_V1, CAP_LINK_DATAGRAMS, CAP_RELAY,
+    CAP_TIMED_FRAMES,
 };
 use crate::transport::realtime_av_alm::controller::{
     Admission, AdmitDecision, ChunkPos, ControlFrame, ControlMsg, ControllerConfig, DecisionKind,
@@ -181,6 +182,9 @@ pub(super) struct AlmState {
     /// source. `publisher_of` follows it, and a hello cannot override it.
     bound_publisher: BTreeMap<StreamId, String>,
     caps: BTreeMap<String, u32>,
+    /// Test seam — bits this node leaves out of its own `CAPS` (an older
+    /// build's, say). 0 in production.
+    caps_withheld: u32,
     provisional: BTreeMap<String, u64>,
     told_publisher: BTreeSet<StreamId>,
     draining_parent: BTreeMap<StreamId, String>,
@@ -240,6 +244,7 @@ impl AlmState {
             publisher_of: BTreeMap::new(),
             bound_publisher: BTreeMap::new(),
             caps: BTreeMap::new(),
+            caps_withheld: 0,
             provisional: BTreeMap::new(),
             told_publisher: BTreeSet::new(),
             draining_parent: BTreeMap::new(),
@@ -270,7 +275,12 @@ impl AlmState {
 
     /// This node's capability bits.
     pub(super) fn caps_bits(&self) -> u32 {
-        CAPS_THIS_BUILD | if self.relay_capable { CAP_RELAY } else { 0 }
+        (CAPS_THIS_BUILD | if self.relay_capable { CAP_RELAY } else { 0 }) & !self.caps_withheld
+    }
+
+    /// Test seam — leave `bits` out of this node's `CAPS`.
+    pub(super) fn withhold_caps(&mut self, bits: u32) {
+        self.caps_withheld = bits;
     }
 
     /// This node's `CAPS` frame.
@@ -288,6 +298,15 @@ impl AlmState {
         self.caps
             .get(peer)
             .is_some_and(|c| c & CAP_TIMED_FRAMES != 0)
+    }
+
+    /// leviculum#102 — whether `peer` takes media as unordered link
+    /// datagrams. Only a peer whose `CAPS` carried the bit: an older edge (or
+    /// one whose `CAPS` has not arrived) reads as "no".
+    pub(super) fn takes_datagrams(&self, peer: &str) -> bool {
+        self.caps
+            .get(peer)
+            .is_some_and(|c| c & CAP_LINK_DATAGRAMS != 0)
     }
 
     /// The decision log's chained hash (hex).
@@ -1126,6 +1145,37 @@ mod tests {
             }
         }
         out
+    }
+
+    /// leviculum#102 — datagrams only toward a peer whose `CAPS` said so: no
+    /// `CAPS` yet and a pre-#102 build's `CAPS` (bits 0-2 only) both read as
+    /// "no", and the bit changes nothing else a `CAPS` says.
+    #[test]
+    fn datagrams_only_toward_a_peer_whose_caps_say_so() {
+        let mut a = AlmState::new("a", s(1), &roster(), false, 1);
+        assert!(!a.takes_datagrams("b"), "no CAPS heard: no datagrams");
+        a.on_caps("b", CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_RELAY);
+        assert!(
+            !a.takes_datagrams("b"),
+            "an older edge's CAPS: no datagrams"
+        );
+        assert!(a.takes_timed("b") && a.speaks_c3("b"));
+        a.on_caps("c", CAPS_THIS_BUILD);
+        assert!(a.takes_datagrams("c"), "this build's CAPS: datagrams");
+        assert!(a.takes_timed("c") && a.speaks_c3("c"));
+        assert_ne!(
+            CAPS_THIS_BUILD & CAP_LINK_DATAGRAMS,
+            0,
+            "this build says it"
+        );
+        // An older decoder masks only the bits it knows: bit 3 reads as nothing.
+        let old_known = CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_RELAY;
+        assert_eq!(CAP_LINK_DATAGRAMS & old_known, 0, "bit 3 is a fresh bit");
+        assert_eq!(
+            wire::decode(&encode_caps(CAPS_THIS_BUILD | CAP_RELAY), "c"),
+            Ok(WireFrame::Caps(CAPS_THIS_BUILD | CAP_RELAY)),
+            "the CAPS frame is still 10 bytes, one u32"
+        );
     }
 
     /// The C3 admit path between two nodes: B learns A's stream from A's

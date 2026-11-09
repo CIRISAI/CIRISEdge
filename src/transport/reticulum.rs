@@ -595,6 +595,16 @@ pub(crate) fn link_channel_message_limit(node: &ReticulumNode, link_id: &LinkId)
     node.link_mdu(link_id).map(channel_payload_mdu)
 }
 
+/// leviculum#102 — the most plaintext one unordered datagram on a live link
+/// carries: leviculum's `link_datagram_mdu` (the link MDU less the 4-byte
+/// sequence number) less the E1 seal. It follows the link's MDU, so on a
+/// punched path it is the probed one (leviculum#104). `None` when leviculum
+/// no longer holds the link.
+pub(crate) fn link_datagram_message_limit(node: &ReticulumNode, link_id: &LinkId) -> Option<usize> {
+    node.link_datagram_mdu(link_id)
+        .map(|mdu| mdu.saturating_sub(crate::transport::link_seal::SEAL_OVERHEAD))
+}
+
 /// CC 5.3.3.5 E1 pre-seal route fetch test seam — what this node's NEXT
 /// route answer carries instead of its own signed route row.
 #[doc(hidden)]
@@ -3118,6 +3128,12 @@ pub struct ReticulumTransport {
     /// `LinkPlane::Av` link that passes attribution is routed here by the
     /// event loop; nothing else is (`FSD/CIRIS_EDGE_TRANSPORT.md` §3.6).
     av_sink: Arc<crate::transport::av_sink::AvSink>,
+    /// leviculum#102 — what was last folded from leviculum's datagram
+    /// counters into `av_plane` ([`fold_av_datagrams`]).
+    av_datagram_fold: Arc<std::sync::Mutex<AvDatagramFold>>,
+    /// Test seam — the C3 `CAPS` bits calls on this node leave out
+    /// ([`Self::set_av_caps_withheld_for_test`]). 0 in production.
+    av_caps_withheld: std::sync::atomic::AtomicU32,
     /// CIRISEdge#805 — the peer each A/V link THIS node dialled was dialled
     /// to ([`Self::open_av_link`]): the initiator-side attribution basis.
     /// The dial resolved the peer's transport key from its verified route
@@ -4308,6 +4324,8 @@ impl ReticulumTransport {
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
+            av_datagram_fold: Arc::default(),
+            av_caps_withheld: std::sync::atomic::AtomicU32::new(0),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_paths,
             direct_link_retry: std::sync::atomic::AtomicBool::new(direct_link_retry),
@@ -6054,6 +6072,32 @@ impl ReticulumTransport {
         self.seals.set_stranger_handshake_cap(cap);
     }
 
+    /// leviculum#102 test seam — calls joined on this node from now on leave
+    /// `bits` out of their C3 `CAPS` (e.g. `CAP_LINK_DATAGRAMS`: the node
+    /// then reads to its peers as an edge that predates datagrams).
+    #[doc(hidden)]
+    pub fn set_av_caps_withheld_for_test(&self, bits: u32) {
+        self.av_caps_withheld
+            .store(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The C3 `CAPS` bits calls on this node leave out (0 in production).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn av_caps_withheld_for_test(&self) -> u32 {
+        self.av_caps_withheld
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// leviculum#102 test seam — lose the next `n` datagrams that arrive on
+    /// this node before they are opened: what a shed (or a lossy path) looks
+    /// like from here, a sequence number the sender spent and this node never
+    /// sees.
+    #[doc(hidden)]
+    pub fn lose_next_datagrams_for_test(&self, n: u64) {
+        self.av_sink.lose_next_datagrams(n);
+    }
+
     /// v44 LTS test seam — the next decapsulation panics.
     #[doc(hidden)]
     pub fn panic_next_decap_for_test(&self) {
@@ -6934,6 +6978,30 @@ impl ReticulumTransport {
             window: st.window(),
             window_max: st.window_max(),
         })
+    }
+
+    /// leviculum#102 — one A/V link's datagram counters (sent, received,
+    /// refused, replayed, late, shed at the sink), or `None` when leviculum no
+    /// longer holds the link.
+    #[must_use]
+    pub fn av_link_datagram_stats(
+        &self,
+        link: &[u8; 16],
+    ) -> Option<leviculum_core::node::DatagramStats> {
+        self.node.link_datagram_stats(&LinkId::new(*link))
+    }
+
+    /// leviculum#102 / #104 — the most plaintext one message on `link` carries
+    /// now, by carrier: `(channel, datagram)`, each with room left for the E1
+    /// seal. Both follow the link's MDU, the probed one on a punched path.
+    /// `None` when leviculum no longer holds the link.
+    #[must_use]
+    pub fn av_link_limits(&self, link: &[u8; 16]) -> Option<(usize, usize)> {
+        let id = LinkId::new(*link);
+        Some((
+            link_channel_message_limit(&self.node, &id)?,
+            link_datagram_message_limit(&self.node, &id)?,
+        ))
     }
 
     /// ALM stage 2 — timed media frames on `link` that never arrived fresh
@@ -10747,6 +10815,7 @@ impl Transport for ReticulumTransport {
         self.report_signer_id_mismatch();
         if let Some(m) = self.metrics.get() {
             mirror_planes(&self.node, m);
+            fold_av_datagrams(&self.node, &self.av_sink, &self.av_datagram_fold, m);
         }
     }
 
@@ -10930,7 +10999,9 @@ fn event_label(event: &NodeEvent) -> EventLabel {
         NodeEvent::AnnounceReceived { .. } => EventLabel::Announce,
         NodeEvent::LinkEstablished { .. } => EventLabel::LinkEstablished,
         NodeEvent::LinkIdentified { .. } => EventLabel::LinkIdentified,
-        NodeEvent::MessageReceived { .. } | NodeEvent::LinkDataReceived { .. } => EventLabel::Frame,
+        NodeEvent::MessageReceived { .. }
+        | NodeEvent::LinkDataReceived { .. }
+        | NodeEvent::LinkDatagramReceived { .. } => EventLabel::Frame,
         NodeEvent::RequestReceived { .. } => EventLabel::Request,
         NodeEvent::ResourceCompleted { .. } => EventLabel::ResourceCompleted,
         NodeEvent::ResourceTransferStarted { .. } | NodeEvent::ResourceProgress { .. } => {
@@ -10960,6 +11031,81 @@ fn mirror_planes(node: &ReticulumNode, metrics: &crate::observability::EdgeMetri
         [p.control_dropped_total, p.data_dropped_total],
         p.shed_packets_total,
     );
+}
+
+/// leviculum#102 — what [`fold_av_datagrams`] last read: each A/V link's
+/// datagram counters and the node's interface-shed count.
+#[derive(Debug, Default)]
+struct AvDatagramFold {
+    links: HashMap<LinkId, leviculum_core::node::DatagramStats>,
+    interface_shed: u64,
+}
+
+impl AvDatagramFold {
+    /// Fold one reading: `interface_shed` is the node's shed count now,
+    /// `links` each live A/V link's counters now. Returns the `av_plane`
+    /// deltas since the last reading and keeps this one. A link absent from
+    /// `links` is forgotten (closed, or no longer the sink's), so a later link
+    /// reusing nothing starts from zero; a counter that went backwards (it
+    /// never does) folds 0.
+    fn fold(
+        &mut self,
+        interface_shed: u64,
+        links: impl IntoIterator<Item = (LinkId, leviculum_core::node::DatagramStats)>,
+    ) -> [(&'static str, u64); 5] {
+        use crate::observability as obs;
+        let mut out = [
+            (
+                obs::AV_DATAGRAM_SHED,
+                interface_shed.saturating_sub(self.interface_shed),
+            ),
+            (obs::AV_DATAGRAM_LATE, 0),
+            (obs::AV_DATAGRAM_REPLAYED, 0),
+            (obs::AV_DATAGRAM_REFUSED, 0),
+            (obs::AV_DATAGRAM_SHED_SINK, 0),
+        ];
+        self.interface_shed = self.interface_shed.max(interface_shed);
+        let mut next = HashMap::new();
+        for (link_id, now) in links {
+            let was = self.links.get(&link_id).copied().unwrap_or_default();
+            out[1].1 += now.late.saturating_sub(was.late);
+            out[2].1 += now.replayed.saturating_sub(was.replayed);
+            out[3].1 += now.refused.saturating_sub(was.refused);
+            out[4].1 += now.shed.saturating_sub(was.shed);
+            next.insert(link_id, now);
+        }
+        self.links = next;
+        out
+    }
+}
+
+/// leviculum#102 — fold leviculum's datagram counters into `av_plane` as
+/// deltas, so they read as counters like every other `av_plane` label:
+/// `av_datagram_shed` (an interface had no room; node-wide, from the
+/// transport stats), and per A/V link the sink holds `av_datagram_late`,
+/// `av_datagram_replayed`, `av_datagram_refused` and `av_datagram_shed_sink`.
+/// A gauge, never a lever: nothing here changes how anything is sent. A link
+/// closed between two folds loses its last window's deltas (leviculum forgets
+/// its stats with it).
+fn fold_av_datagrams(
+    node: &ReticulumNode,
+    sink: &crate::transport::av_sink::AvSink,
+    fold: &std::sync::Mutex<AvDatagramFold>,
+    metrics: &crate::observability::EdgeMetrics,
+) {
+    let shed = node.transport_stats().drops_datagram_shed();
+    let links: Vec<_> = sink
+        .link_ids()
+        .into_iter()
+        .filter_map(|id| node.link_datagram_stats(&id).map(|st| (id, st)))
+        .collect();
+    let deltas = fold
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .fold(shed, links);
+    for (label, n) in deltas {
+        metrics.add_av_plane(label, n);
+    }
 }
 
 /// `FSD/CIRIS_MESH.md` §7.7 — a forwarded link this node refused is a dial
@@ -10994,6 +11140,8 @@ struct NodeTick {
     forward_load: Arc<std::sync::Mutex<crate::transport::relay_tier::ForwardLoad>>,
     ladder: Option<Arc<crate::load_ladder::SharedLadder>>,
     metrics: Option<crate::observability::EdgeMetrics>,
+    av_sink: Arc<crate::transport::av_sink::AvSink>,
+    av_datagram_fold: Arc<std::sync::Mutex<AvDatagramFold>>,
 }
 
 impl NodeTick {
@@ -11024,6 +11172,7 @@ impl NodeTick {
         t.set_seal_awaiting(links, bytes);
         t.set_seal_held(held);
         mirror_planes(node, m);
+        fold_av_datagrams(node, &self.av_sink, &self.av_datagram_fold, m);
         let policy = self.shapers.policy();
         let seat = self.shapers.links_of(ShapingClass::Seat);
         t.set_shaping(
@@ -11087,6 +11236,8 @@ impl ReticulumTransport {
             forward_load: Arc::clone(&self.forward_load),
             ladder: self.load_ladder.get().cloned(),
             metrics: self.metrics.get().cloned(),
+            av_sink: Arc::clone(&self.av_sink),
+            av_datagram_fold: Arc::clone(&self.av_datagram_fold),
         }
     }
 
@@ -16099,6 +16250,101 @@ async fn route_now(ctx: &EventCtx<'_>, link_id: LinkId, is_resource: bool, data:
     }
 }
 
+/// leviculum#102 — a datagram not delivered: counted under `reason` in
+/// `av_plane` by the caller, and logged here at DEBUG, a few per minute per
+/// reason. A lost or overtaken datagram is routine realtime churn, never a
+/// fault (CIRISEdge#460), and the exact count is the counter.
+fn datagram_drop_debug(link_id: LinkId, reason: &'static str, detail: &str) {
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        av_sink_drop_log().check(reason)
+    {
+        tracing::debug!(
+            link = ?link_id,
+            reason,
+            detail,
+            suppressed_prev,
+            "A/V datagram DROPPED — not delivered (leviculum#102)"
+        );
+    }
+}
+
+/// leviculum#102 — **one unordered datagram on a link.**
+///
+/// Opened on the E1 datagram lane (a refusal closes the link, a replay is
+/// dropped, exactly as on every other lane), then handed to the A/V sink and
+/// nowhere else: edge sends datagrams only as media on A/V legs, so one on any
+/// other link is dropped by name. Its leviculum sequence number places it on
+/// the link: a gap is the frames lost on the way, reported to the consumer's
+/// hop counter like any drop below the sink; one overtaken by a newer
+/// datagram is dropped, because the hop counter is already past it.
+async fn route_datagram(ctx: &EventCtx<'_>, link_id: LinkId, sequence: u32, data: Vec<u8>) {
+    use crate::transport::av_sink::DatagramOrder;
+    let count = |label: &'static str, n: u64| {
+        if let Some(m) = ctx.metrics {
+            m.add_av_plane(label, n);
+        }
+    };
+    if ctx.av_sink.take_datagram_loss() {
+        // choke-ok: test seam only (`lose_next_datagrams_for_test`) — the
+        // datagram is treated as lost on the wire, as a shed one is.
+        return;
+    }
+    let Some(plain) = seal_inbound(
+        ctx,
+        link_id,
+        crate::transport::link_seal::Lane::Datagram,
+        &data,
+    )
+    .await
+    else {
+        // choke-ok: `seal_inbound` counts and names every frame it does not
+        // deliver. A datagram that never opened took no hop counter here, and
+        // the next one's sequence gap reports it.
+        return;
+    };
+    let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
+    if !matches!(plane.route(), InboundPlaneRoute::Av) {
+        count(crate::observability::AV_INBOUND_DATAGRAM_OFF_AV, 1);
+        datagram_drop_debug(
+            link_id,
+            crate::observability::AV_INBOUND_DATAGRAM_OFF_AV,
+            "an unordered datagram on a link that is not an A/V leg; edge sends datagrams \
+             only as A/V media, so it is not routed to replication (leviculum#102)",
+        );
+        return;
+    }
+    match ctx.av_sink.order_datagram(link_id, sequence) {
+        DatagramOrder::Next => {}
+        DatagramOrder::Gap(lost) => count(crate::observability::AV_INBOUND_DATAGRAM_GAP, lost),
+        DatagramOrder::Behind => {
+            count(crate::observability::AV_INBOUND_DATAGRAM_REORDERED, 1);
+            datagram_drop_debug(
+                link_id,
+                crate::observability::AV_INBOUND_DATAGRAM_REORDERED,
+                "an A/V datagram overtaken by a newer one on its link; the hop counter is \
+                 past it, so it is dropped, never opened (leviculum#102)",
+            );
+            return;
+        }
+    }
+    // The responder side waits for the link's identity before anything is
+    // delivered (CC 5.3.3.5 E1). A datagram is not held for it: it is live
+    // media, and the frame is counted on the hop so the next one resyncs.
+    let we_dialled = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
+    if !we_dialled && ctx.node.get_remote_identity(&link_id).is_none() {
+        count(DROP_AV_FRAME_UNATTRIBUTED, 1);
+        datagram_drop_debug(
+            link_id,
+            DROP_AV_FRAME_UNATTRIBUTED,
+            "an A/V datagram on a link whose identity is not proven yet; live media is not \
+             held, dropped and counted on the hop (CC 5.3.3.5 E1, leviculum#102)",
+        );
+        ctx.av_sink.note_dropped_before_sink(link_id);
+        return;
+    }
+    deliver_av_frame(ctx, link_id, dest, Some(plain)).await;
+}
+
 /// CC 5.3.3.5 E1 — record a link a PEER dialled as awaiting its handshake
 /// (once), and start its budget: no complete handshake within
 /// [`HANDSHAKE_BUDGET`](crate::transport::av_transit_handshake::HANDSHAKE_BUDGET)
@@ -16605,6 +16851,7 @@ async fn park_while_keying(event: NodeEvent, ctx: &EventCtx<'_>) -> Option<NodeE
     let (link_id, bytes) = match &event {
         NodeEvent::MessageReceived { link_id, data, .. }
         | NodeEvent::LinkDataReceived { link_id, data }
+        | NodeEvent::LinkDatagramReceived { link_id, data, .. }
         | NodeEvent::RequestReceived { link_id, data, .. }
         | NodeEvent::ResourceCompleted {
             link_id,
@@ -18276,6 +18523,16 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 return;
             };
             route_opened(ctx, link_id, false, data).await;
+        }
+        // leviculum#102 — an unordered datagram: live media from a peer this
+        // node told it takes them (C3 `CAP_LINK_DATAGRAMS`). Sealed on its own
+        // E1 lane, then to the A/V sink only.
+        NodeEvent::LinkDatagramReceived {
+            link_id,
+            sequence,
+            data,
+        } => {
+            route_datagram(ctx, link_id, sequence, data).await;
         }
         NodeEvent::LinkClosed {
             link_id, reason, ..
@@ -22310,6 +22567,55 @@ async fn with_timeout<F: std::future::Future>(dur: Duration, fut: F) -> Option<F
 }
 
 #[cfg(test)]
+mod av_datagram_fold_tests {
+    use super::*;
+    use leviculum_core::node::DatagramStats;
+
+    fn st(late: u64, replayed: u64, refused: u64, shed: u64) -> DatagramStats {
+        DatagramStats {
+            late,
+            replayed,
+            refused,
+            shed,
+            ..DatagramStats::default()
+        }
+    }
+
+    fn get(d: &[(&'static str, u64)], label: &str) -> u64 {
+        d.iter().find(|(l, _)| *l == label).map_or(0, |(_, n)| *n)
+    }
+
+    /// leviculum#102 — every shed datagram is counted exactly once: the fold
+    /// carries leviculum's counters as deltas, so a reading taken twice adds
+    /// nothing and a link that closed is not counted again.
+    #[test]
+    fn a_shed_datagram_is_counted_once() {
+        use crate::observability as obs;
+        let (a, b) = (LinkId::new([1; 16]), LinkId::new([2; 16]));
+        let mut f = AvDatagramFold::default();
+        let d = f.fold(3, [(a, st(1, 0, 0, 2))]);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_SHED), 3);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_LATE), 1);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_SHED_SINK), 2);
+        let d = f.fold(3, [(a, st(1, 0, 0, 2))]);
+        assert!(
+            d.iter().all(|(_, n)| *n == 0),
+            "the same reading folds nothing: {d:?}"
+        );
+        let d = f.fold(7, [(a, st(4, 1, 0, 2)), (b, st(0, 0, 5, 1))]);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_SHED), 4);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_LATE), 3);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_REPLAYED), 1);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_REFUSED), 5);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_SHED_SINK), 1);
+        // `a` closed: forgotten, nothing folded for it, `b` moves alone.
+        let d = f.fold(7, [(b, st(0, 0, 6, 1))]);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_REFUSED), 1);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_LATE), 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -22886,6 +23192,7 @@ mod tests {
             "async fn attribute_and_deliver(",
             "async fn handle_event(",
             "async fn deliver_av_frame(",
+            "async fn route_datagram(",
         ] {
             let start = lines
                 .iter()
@@ -22908,6 +23215,7 @@ mod tests {
                 let lo = idx.saturating_sub(8);
                 let window = lines[lo..=idx].join("\n");
                 let instrumented = window.contains("drop_inbound(")
+                    || window.contains("datagram_drop_debug(")
                     || window.contains("tracing::")
                     || window.contains("choke-ok");
                 if !instrumented {

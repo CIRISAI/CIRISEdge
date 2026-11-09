@@ -968,6 +968,40 @@ pub const AV_FRAME_EXPIRED_LATE: &str = "av_frame_expired_late";
 /// ALM C5 — a media frame older than its class budget dropped from the
 /// inbound queue by age (oldest first) before it was opened.
 pub const AV_FRAME_STALE_DROPPED: &str = "av_frame_stale_dropped";
+
+// ─── leviculum#102 — unordered link datagrams, `av_plane` labels ─────
+
+/// leviculum#102 — a media frame sent as an unordered link datagram
+/// (`LinkHandle::try_send_unordered`) to a peer whose C3 `CAPS` carried
+/// `CAP_LINK_DATAGRAMS`.
+pub const AV_SENT_DATAGRAM: &str = "av_sent_datagram";
+/// leviculum#102 — a media frame sent on the link's Channel (timed or not)
+/// because the peer has not said it takes datagrams: an older edge, a peer
+/// whose `CAPS` has not arrived yet, or a link outside a call.
+pub const AV_SENT_DATAGRAM_FALLBACK: &str = "av_sent_datagram_fallback";
+/// leviculum#102 — datagrams an interface had no room for and shed
+/// (`DropReason::DatagramShed`), never retried. Node-wide, folded from
+/// leviculum's transport stats.
+pub const AV_DATAGRAM_SHED: &str = "av_datagram_shed";
+/// leviculum#102 — datagrams this node received but leviculum shed because
+/// the host's event sink was down to the room it keeps for the Channel.
+pub const AV_DATAGRAM_SHED_SINK: &str = "av_datagram_shed_sink";
+/// leviculum#102 — datagrams that arrived 64 or more behind the newest on
+/// their link (leviculum's replay window): too late to play, not delivered.
+pub const AV_DATAGRAM_LATE: &str = "av_datagram_late";
+/// leviculum#102 — datagrams leviculum's replay window had already seen.
+pub const AV_DATAGRAM_REPLAYED: &str = "av_datagram_replayed";
+/// leviculum#102 — datagrams that did not decrypt for their link.
+pub const AV_DATAGRAM_REFUSED: &str = "av_datagram_refused";
+/// leviculum#102 — sequence numbers a link's datagrams skipped (lost or shed
+/// on the way): reported to the hop counter as frames dropped before the next.
+pub const AV_INBOUND_DATAGRAM_GAP: &str = "av_inbound_datagram_gap";
+/// leviculum#102 — a datagram overtaken by a newer one on its link: the hop
+/// counter is already past it, so it is dropped by name, never opened.
+pub const AV_INBOUND_DATAGRAM_REORDERED: &str = "av_inbound_datagram_reordered";
+/// leviculum#102 — a datagram on a link that is not an A/V link: edge sends
+/// datagrams only on A/V legs, so it is dropped by name.
+pub const AV_INBOUND_DATAGRAM_OFF_AV: &str = "av_inbound_datagram_off_av";
 /// #591 — a chunk a leg refused under backpressure: dropped for that leg,
 /// never queued. `av_send_congested` also counts control-frame retries; this
 /// counts media actually lost to it.
@@ -1882,6 +1916,16 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_FRAME_EXPIRED_MARKED,
     AV_FRAME_EXPIRED_LATE,
     AV_FRAME_STALE_DROPPED,
+    AV_SENT_DATAGRAM,
+    AV_SENT_DATAGRAM_FALLBACK,
+    AV_DATAGRAM_SHED,
+    AV_DATAGRAM_SHED_SINK,
+    AV_DATAGRAM_LATE,
+    AV_DATAGRAM_REPLAYED,
+    AV_DATAGRAM_REFUSED,
+    AV_INBOUND_DATAGRAM_GAP,
+    AV_INBOUND_DATAGRAM_REORDERED,
+    AV_INBOUND_DATAGRAM_OFF_AV,
     AV_CHUNK_DROPPED_CONGESTED,
     AV_LEG_SHED_TO_BASE,
     AV_LEG_RESTORED,
@@ -2864,6 +2908,16 @@ impl EdgeMetrics {
     /// CIRISEdge#805 — count one A/V-plane event by its `AV_*` label.
     pub fn inc_av_plane(&self, label: &'static str) {
         *self.av_plane.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// leviculum#102 — add `n` A/V-plane events under one `AV_*` label (a
+    /// delta folded from leviculum's own counters). Adding 0 is a no-op.
+    pub fn add_av_plane(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            let mut plane = self.av_plane.write();
+            let v = plane.entry(label).or_insert(0);
+            *v = v.saturating_add(n);
+        }
     }
 
     /// CIRISEdge#805 — the A/V-plane ledger by label (tests + the operator
