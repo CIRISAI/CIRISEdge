@@ -1,5 +1,29 @@
 # CIRISEdge Release Notes
 
+# v44.1.1 — the 1,400-byte shaped frame, contact first
+
+**2026-11-09.** **PATCH** on the LTS line. Pins are unchanged from v44.1.0: persist v61.0.5,
+CIRISVerify v22.0.0, leviculum v0.34.0+ciris.1. No wire break. A v44.1.0 peer offering a 16 KB frame
+agrees at 1,400, because the agreement takes the smaller frame.
+
+**What server may do:**
+- Pass a code's PQC commitment through `contact::resolve_contact_with_commitment` and
+  `contact::discover_with_commitment` (CIRISEdge#964). The old calls are unchanged and pass none.
+- Turn canonical shaping back on (`CIRIS_DEVICE_KIND=server`). Shaped first contact is now about
+  5.5 s relayed at `server`, down from 65.6 s.
+- Read the new gauge `direct_link_request_held`.
+
+- **The shaped frame is 1,400 B** (CIRISEdge#963, CC 5.4.3 rc17 a3dd97a; measurements in 6563fd6).
+- **Contact rows leave first** (CIRISEdge#962), with sync guaranteed at least one real frame in four.
+- **A code's PQC commitment binds a fetched key record** (CIRISEdge#964, CC 5.3.3.5 item 6). This is
+  the additive half; refusing with no anchor waits for the v62 handshake.
+- **A direct-link proposal that arrives before its room is held for up to 4 s**, instead of costing
+  60 s with no direct leg.
+- **macOS test instruments corrected:** the establish budget, the suspend suite's TCP table, and A/V
+  backpressure.
+
+See CHANGELOG.md for the detail.
+
 # v44.1.0 — what moves to a peer
 
 **2026-11-08.** **MINOR** on the LTS line. Pins persist **v61.0.5** (048f0993), CIRISVerify v22.0.0 and
