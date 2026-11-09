@@ -268,7 +268,7 @@ pub struct PyEdge {
     /// lifecycle. Replaces the pre-v1.1.8 `runtime: RuntimeHandle`
     /// field that exposed a `tokio::Handle` to consumer-side
     /// dispatch (the cross-tokio aliasing trap).
-    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: Arc<KeptExecutor>,
     /// v2.1.0 (CIRISEdge#85 / CIRISLensCore#43) — the host persist
     /// `Engine` PyObject the agent passed to [`init_edge_runtime`].
     /// Re-exposed via the [`PyEdge::engine`] pymethod so cohabiting
@@ -496,8 +496,10 @@ impl PyEdge {
                 .build()
                 .expect("for_test runtime"),
         );
-        let executor =
-            Arc::new(ciris_persist::ffi::executor_capsule::build_persist_executor(rt_arc));
+        let executor = Arc::new(KeptExecutor::new(
+            ciris_persist::ffi::executor_capsule::build_persist_executor(rt_arc),
+            None,
+        ));
         Self {
             inner,
             executor,
@@ -632,7 +634,9 @@ impl PyEdge {
     }
 
     /// `FSD/PRIVACY_MODES.md` §6.6, §6.10 — the host's device facts changed;
-    /// the class and the relay policy follow, the person's opt-ins kept.
+    /// the class and the relay policy follow, the person's opt-ins kept. An
+    /// opt-in left out (`None`) keeps the current choice; pass `True` or
+    /// `False` to change it.
     /// `device_kind` is `server`, `home` or `phone`. Returns how many shaped
     /// links closed to renegotiate, `None` with no Reticulum transport.
     /// Raises `ValueError` on another kind.
@@ -3777,7 +3781,7 @@ mod parse_envelope_kind_tests {
 #[pyclass(name = "ReplicationHandle", module = "ciris_edge", unsendable)]
 pub struct PyReplicationHandle {
     inner: Arc<tokio::sync::Mutex<Option<crate::replication::ReplicationRuntime>>>,
-    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: Arc<KeptExecutor>,
 }
 
 #[pymethods]
@@ -4170,7 +4174,7 @@ pub struct PyVerifiedFeedSubscription {
     /// CIRISEdge#59 — the executor capsule (cross-cdylib ABI-stable
     /// spawn primitive). Used by `__anext__`'s `run_async` to drive
     /// `broadcast::Receiver::recv()` from sync Python.
-    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: Arc<KeptExecutor>,
 }
 
 #[pymethods]
@@ -4472,7 +4476,7 @@ pub struct PyCall {
     frames:
         Arc<Mutex<Option<tokio::sync::mpsc::Receiver<crate::transport::av_call::ReceivedFrame>>>>,
     events: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<crate::transport::av_call::CallEvent>>>>,
-    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: Arc<KeptExecutor>,
 }
 
 /// A11's verb list: every `Call` verb and its Python twin's name. The parity
@@ -5173,7 +5177,7 @@ pub struct PyDurableHandle {
     /// `send_durable_inline_text` time so the handle's own
     /// `is_acknowledged` / `await_ack` polls go through persist's
     /// runtime via the vtable (CIRISEdge#59).
-    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: Arc<KeptExecutor>,
     /// Shared outbound-queue handle — same `Arc<dyn OutboundHandle>`
     /// the `Edge` holds. Cloning the Arc lets the handle outlive the
     /// `PyEdge` that produced it (Python ownership semantics differ
@@ -5294,6 +5298,46 @@ impl std::future::Future for EdgeTokioContext {
 /// Wraps `fut` for persist's executor: see [`EdgeTokioContext`].
 fn in_edge_tokio(fut: BoxedFut) -> BoxedFut {
     Box::pin(EdgeTokioContext(fut))
+}
+
+/// CIRISEdge#960 — persist's executor, as a bitwise copy of the
+/// `executor_capsule`'s `{ data, vtable }`, with the capsule it was copied out
+/// of. The capsule's destructor drops the runtime `data` names, so every
+/// holder of the copy holds the capsule too: it lives exactly as long as
+/// anything that can spawn through it. `None` only for an executor edge built
+/// itself (tests), whose `data` nothing else frees.
+pub(crate) struct KeptExecutor {
+    executor: ciris_persist::ffi::executor_capsule::AsyncExecutor,
+    _capsule: Option<pyo3::Py<pyo3::PyAny>>,
+}
+
+impl KeptExecutor {
+    pub(crate) fn new(
+        executor: ciris_persist::ffi::executor_capsule::AsyncExecutor,
+        capsule: Option<pyo3::Py<pyo3::PyAny>>,
+    ) -> Self {
+        Self {
+            executor,
+            _capsule: capsule,
+        }
+    }
+
+    /// Another bitwise copy of the executor, for a persist API that takes its
+    /// own `Arc<AsyncExecutor>`. The caller keeps this `KeptExecutor` (an
+    /// `Arc` of it) alive alongside whatever it hands the copy to.
+    pub(crate) fn copy(&self) -> ciris_persist::ffi::executor_capsule::AsyncExecutor {
+        ciris_persist::ffi::executor_capsule::AsyncExecutor {
+            data: self.executor.data,
+            vtable: self.executor.vtable,
+        }
+    }
+}
+
+impl std::ops::Deref for KeptExecutor {
+    type Target = ciris_persist::ffi::executor_capsule::AsyncExecutor;
+    fn deref(&self) -> &Self::Target {
+        &self.executor
+    }
 }
 
 fn run_async<F, T>(executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor, fut: F) -> T
@@ -5682,6 +5726,122 @@ fn extract_canonical_bootstrap_peer(
     })
 }
 
+/// CIRISEdge#960 — persist's executor out of `executor_capsule`, ABI-checked,
+/// held with its capsule ([`KeptExecutor`]).
+fn extract_executor(engine: &Bound<'_, PyAny>) -> PyResult<Arc<KeptExecutor>> {
+    if !engine.hasattr("executor_capsule").unwrap_or(false) {
+        return Err(PyRuntimeError::new_err(
+            "persist v3.13.0+ required for ABI-stable async cohabitation — \
+             your persist version doesn't expose executor_capsule. \
+             Upgrade ciris-persist (Cargo `tag = \"v3.13.0\"`, pyproject \
+             `ciris-persist>=3.13.0,<4`). See CIRISEdge#58 / CIRISPersist#157.",
+        ));
+    }
+    // The executor capsule stores a `*mut AsyncExecutor as usize`
+    // (persist's `build_capsule_with_destructor` passes the
+    // `Box::into_raw`'d pointer cast to usize). Extract as `usize`,
+    // then cast back to `*const AsyncExecutor` and bitwise-copy the
+    // struct fields. The PyCapsule destructor (set by persist) calls
+    // `vtable.drop` at Python GC time; edge only owns a reference
+    // copy of the executor, never the destructor responsibility.
+    #[allow(unsafe_code)]
+    let (executor, executor_capsule): (ciris_persist::ffi::executor_capsule::AsyncExecutor, _) = unsafe {
+        extract_capsule_held::<usize, _, _>(engine, "executor_capsule", |raw_usize| {
+            let ptr = *raw_usize as *const ciris_persist::ffi::executor_capsule::AsyncExecutor;
+            // SAFETY: `raw_usize` is the `Box::into_raw`'d pointer
+            // produced by persist's `build_capsule_with_destructor`.
+            // The Box's allocation is alive for the lifetime of the
+            // PyCapsule (its destructor runs `Box::from_raw` at GC
+            // time), which is rooted in the Python `engine` object
+            // outliving this extraction.
+            let e = &*ptr;
+            ciris_persist::ffi::executor_capsule::AsyncExecutor {
+                data: e.data,
+                vtable: e.vtable,
+            }
+        })?
+    };
+    // ABI version check — refuse mismatched capsule versions cleanly
+    // rather than risk UB on a vtable-layout drift.
+    if executor.vtable.abi_version
+        != ciris_persist::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION
+    {
+        return Err(PyRuntimeError::new_err(format!(
+            "persist executor_capsule ABI version mismatch — capsule v{}, \
+             edge expects v{}; upgrade ciris-persist or pin edge to a \
+             compatible floor",
+            executor.vtable.abi_version,
+            ciris_persist::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION,
+        )));
+    }
+    // CIRISEdge#960 — the copy and its capsule travel together.
+    let executor = Arc::new(KeptExecutor::new(executor, Some(executor_capsule)));
+    Ok(executor)
+}
+
+/// CIRISEdge#960 — the ABI-stable directory proxy out of
+/// `directory_ops_capsule`, wrapped so it holds the directory and executor
+/// capsules its copies point into
+/// ([`crate::ffi::kept_directory::KeptDirectory`]).
+fn extract_directory(
+    engine: &Bound<'_, PyAny>,
+    executor: &Arc<KeptExecutor>,
+) -> PyResult<Arc<dyn ciris_persist::federation::FederationDirectory>> {
+    if !engine.hasattr("directory_ops_capsule").unwrap_or(false) {
+        return Err(PyRuntimeError::new_err(
+            "persist v11.8.2+ required for the ABI-stable directory ops proxy — \
+             your persist version doesn't expose directory_ops_capsule. Upgrade \
+             ciris-persist (Cargo `tag = \"v11.8.2\"`, pyproject \
+             `ciris-persist>=11.8.2,<12`). See CIRISEdge#245 / CIRISPersist#329+#333.",
+        ));
+    }
+    // The `directory_ops_capsule` stores `*mut Directory as usize` (persist's
+    // `build_capsule_with_destructor`, PyCapsule tag
+    // `ciris_persist::directory_ops_v1`) — the same shape as `executor_capsule`.
+    // Extract as `usize`, cast back, bitwise-copy the `{ data, vtable }` fields.
+    // The PyCapsule destructor (set by persist) calls `vtable.drop` at Python GC;
+    // `OpsDirectory` has NO Drop impl, so edge holds only a reference copy — never
+    // the destructor responsibility — exactly like the executor above.
+    #[allow(unsafe_code)]
+    let (directory_handle, directory_capsule): (
+        ciris_persist::ffi::directory_capsule::Directory,
+        _,
+    ) = unsafe {
+        extract_capsule_held::<usize, _, _>(engine, "directory_ops_capsule", |raw_usize| {
+            let ptr = *raw_usize as *const ciris_persist::ffi::directory_capsule::Directory;
+            // SAFETY: `raw_usize` is the `Box::into_raw`'d `*mut Directory`
+            // persist stored; the Box is alive for the PyCapsule's lifetime
+            // (its destructor runs `Box::from_raw` + `vtable.drop` at GC),
+            // rooted in the Python `engine` object outliving this extraction.
+            let d = &*ptr;
+            ciris_persist::ffi::directory_capsule::Directory {
+                data: d.data,
+                vtable: d.vtable,
+            }
+        })?
+    };
+    let directory_proxy: Arc<dyn ciris_persist::federation::FederationDirectory> =
+        ciris_persist::ffi::directory_capsule::build_ops_directory(
+            directory_handle,
+            Arc::new(executor.copy()),
+        )
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "init_edge_runtime: build_ops_directory (directory_ops_capsule) failed: {e}"
+            ))
+        })?;
+    // CIRISEdge#960 — persist's proxy holds bitwise copies of the directory
+    // and executor capsules; the wrapper holds both capsules, and only the
+    // wrapper is handed out.
+    let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> =
+        Arc::new(crate::ffi::kept_directory::KeptDirectory::new(
+            directory_proxy,
+            Arc::clone(executor),
+            directory_capsule,
+        ));
+    Ok(directory_arc)
+}
+
 /// CIRISEdge#960 — extract persist's `outbound_queue_ops_capsule` (tag
 /// `ciris_persist::outbound_queue_ops_v1`, payload `*mut OutboundQueueHandle
 /// as usize`, the same shape as `directory_ops_capsule`) and wrap it in the
@@ -5690,7 +5850,7 @@ fn extract_canonical_bootstrap_peer(
 /// persist set owns `vtable.drop`.
 fn extract_outbound_queue_ops(
     engine: &Bound<'_, PyAny>,
-    executor: &Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: &Arc<KeptExecutor>,
 ) -> PyResult<Arc<dyn OutboundHandle>> {
     use ciris_persist::ffi::outbound_queue_capsule::OutboundQueueHandle;
     if !engine
@@ -5699,17 +5859,17 @@ fn extract_outbound_queue_ops(
     {
         return Err(PyRuntimeError::new_err(
             "ciris_persist.Engine does not expose outbound_queue_ops_capsule; \
-             edge needs ciris-persist>=61.1.0,<61.2 (CIRISEdge#960)",
+             edge needs ciris-persist>=61.1.0 (CIRISEdge#960)",
         ));
     }
     #[allow(unsafe_code)]
-    let handle: OutboundQueueHandle = unsafe {
-        extract_capsule::<usize, _, _>(engine, "outbound_queue_ops_capsule", |raw_usize| {
+    let (handle, capsule): (OutboundQueueHandle, _) = unsafe {
+        extract_capsule_held::<usize, _, _>(engine, "outbound_queue_ops_capsule", |raw_usize| {
             let ptr = *raw_usize as *const OutboundQueueHandle;
             // SAFETY: `raw_usize` is the `Box::into_raw`'d
             // `*mut OutboundQueueHandle` persist's
             // `outbound_queue_capsule::build_capsule_with_destructor` stored;
-            // the Box lives as long as the PyCapsule, which the engine roots.
+            // the Box lives as long as the PyCapsule, which the queue holds.
             let h = &*ptr;
             OutboundQueueHandle {
                 data: h.data,
@@ -5717,9 +5877,9 @@ fn extract_outbound_queue_ops(
             }
         })?
     };
-    // Hold the capsule itself: its destructor frees `handle.data`, and the
-    // outbound dispatcher can outlive the host's reference to the engine.
-    let capsule = engine.call_method0("outbound_queue_ops_capsule")?.unbind();
+    // Hold the capsule this handle was copied out of: its destructor frees
+    // `handle.data`, and the outbound dispatcher can outlive the host's
+    // reference to the engine.
     let queue = crate::ffi::outbound_ops::OpsOutboundQueue::new(
         handle,
         Arc::clone(executor),
@@ -5844,6 +6004,32 @@ where
     T: 'static,
     F: FnOnce(&T) -> R,
 {
+    // SAFETY: forwarded verbatim; see [`extract_capsule_held`].
+    unsafe { extract_capsule_held::<T, R, F>(engine, method, map) }.map(|(r, _capsule)| r)
+}
+
+/// [`extract_capsule`], also handing back the capsule itself.
+///
+/// CIRISEdge#960 — a caller whose `map` copies the capsule's payload out
+/// bitwise (the executor and the directory/queue ops `{ data, vtable }`) MUST
+/// keep the returned capsule for as long as that copy is used: the capsule's
+/// destructor frees what `data` points at. A caller whose `map` clones owned
+/// values (an `Arc`, a `Handle`) holds no pointer into the capsule and may
+/// drop it.
+///
+/// # Safety
+///
+/// As [`extract_capsule`].
+#[allow(unsafe_code)]
+unsafe fn extract_capsule_held<T, R, F>(
+    engine: &Bound<'_, PyAny>,
+    method: &str,
+    map: F,
+) -> PyResult<(R, pyo3::Py<pyo3::PyAny>)>
+where
+    T: 'static,
+    F: FnOnce(&T) -> R,
+{
     let result = engine.call_method0(method).map_err(|e| {
         PyTypeError::new_err(format!(
             "engine doesn't expose {method:?} method (persist 2.7.0+ \
@@ -5889,7 +6075,7 @@ where
     // refused `capsule_version_skew` before anything is dereferenced.
     let ptr = checked_capsule_pointer(&cap, method)?;
     let inner: &T = unsafe { &*(ptr.as_ptr() as *const T) };
-    Ok(map(inner))
+    Ok((map(inner), cap.into_any().unbind()))
 }
 
 /// v0.16.1 cherry-pick (CIRISEdge#43 / CIRISPersist#119) — typed
@@ -7025,52 +7211,7 @@ pub fn init_edge_runtime(
     // .so, spawning onto persist's tokio without any cross-crate
     // dispatch. The hot-path send/recv pymethods consume this instead
     // of the raw `tokio::Handle`. See `run_async`'s docs.
-    if !engine.hasattr("executor_capsule").unwrap_or(false) {
-        return Err(PyRuntimeError::new_err(
-            "persist v3.13.0+ required for ABI-stable async cohabitation — \
-             your persist version doesn't expose executor_capsule. \
-             Upgrade ciris-persist (Cargo `tag = \"v3.13.0\"`, pyproject \
-             `ciris-persist>=3.13.0,<4`). See CIRISEdge#58 / CIRISPersist#157.",
-        ));
-    }
-    // The executor capsule stores a `*mut AsyncExecutor as usize`
-    // (persist's `build_capsule_with_destructor` passes the
-    // `Box::into_raw`'d pointer cast to usize). Extract as `usize`,
-    // then cast back to `*const AsyncExecutor` and bitwise-copy the
-    // struct fields. The PyCapsule destructor (set by persist) calls
-    // `vtable.drop` at Python GC time; edge only owns a reference
-    // copy of the executor, never the destructor responsibility.
-    #[allow(unsafe_code)]
-    let executor: ciris_persist::ffi::executor_capsule::AsyncExecutor = unsafe {
-        extract_capsule::<usize, _, _>(&engine, "executor_capsule", |raw_usize| {
-            let ptr = *raw_usize as *const ciris_persist::ffi::executor_capsule::AsyncExecutor;
-            // SAFETY: `raw_usize` is the `Box::into_raw`'d pointer
-            // produced by persist's `build_capsule_with_destructor`.
-            // The Box's allocation is alive for the lifetime of the
-            // PyCapsule (its destructor runs `Box::from_raw` at GC
-            // time), which is rooted in the Python `engine` object
-            // outliving this extraction.
-            let e = &*ptr;
-            ciris_persist::ffi::executor_capsule::AsyncExecutor {
-                data: e.data,
-                vtable: e.vtable,
-            }
-        })?
-    };
-    // ABI version check — refuse mismatched capsule versions cleanly
-    // rather than risk UB on a vtable-layout drift.
-    if executor.vtable.abi_version
-        != ciris_persist::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION
-    {
-        return Err(PyRuntimeError::new_err(format!(
-            "persist executor_capsule ABI version mismatch — capsule v{}, \
-             edge expects v{}; upgrade ciris-persist or pin edge to a \
-             compatible floor",
-            executor.vtable.abi_version,
-            ciris_persist::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION,
-        )));
-    }
-    let executor = Arc::new(executor);
+    let executor = extract_executor(&engine)?;
 
     // ── v8.1.0 (CIRISEdge#245 / CIRISPersist#329 + #333) — the ABI-stable
     // directory ops proxy REPLACES the raw-`dyn` `federation_directory_capsule`.
@@ -7087,46 +7228,7 @@ pub fn init_edge_runtime(
     // no longer misdispatch. Every method `federation_directory_for_edge`
     // touches is a covered op (the base 24 + the 6 peer-mutation ops of
     // CIRISPersist#333 / v11.8.2: add/remove_peer_record, update_peer_*).
-    if !engine.hasattr("directory_ops_capsule").unwrap_or(false) {
-        return Err(PyRuntimeError::new_err(
-            "persist v11.8.2+ required for the ABI-stable directory ops proxy — \
-             your persist version doesn't expose directory_ops_capsule. Upgrade \
-             ciris-persist (Cargo `tag = \"v11.8.2\"`, pyproject \
-             `ciris-persist>=11.8.2,<12`). See CIRISEdge#245 / CIRISPersist#329+#333.",
-        ));
-    }
-    // The `directory_ops_capsule` stores `*mut Directory as usize` (persist's
-    // `build_capsule_with_destructor`, PyCapsule tag
-    // `ciris_persist::directory_ops_v1`) — the same shape as `executor_capsule`.
-    // Extract as `usize`, cast back, bitwise-copy the `{ data, vtable }` fields.
-    // The PyCapsule destructor (set by persist) calls `vtable.drop` at Python GC;
-    // `OpsDirectory` has NO Drop impl, so edge holds only a reference copy — never
-    // the destructor responsibility — exactly like the executor above.
-    #[allow(unsafe_code)]
-    let directory_handle: ciris_persist::ffi::directory_capsule::Directory = unsafe {
-        extract_capsule::<usize, _, _>(&engine, "directory_ops_capsule", |raw_usize| {
-            let ptr = *raw_usize as *const ciris_persist::ffi::directory_capsule::Directory;
-            // SAFETY: `raw_usize` is the `Box::into_raw`'d `*mut Directory`
-            // persist stored; the Box is alive for the PyCapsule's lifetime
-            // (its destructor runs `Box::from_raw` + `vtable.drop` at GC),
-            // rooted in the Python `engine` object outliving this extraction.
-            let d = &*ptr;
-            ciris_persist::ffi::directory_capsule::Directory {
-                data: d.data,
-                vtable: d.vtable,
-            }
-        })?
-    };
-    let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> =
-        ciris_persist::ffi::directory_capsule::build_ops_directory(
-            directory_handle,
-            Arc::clone(&executor),
-        )
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!(
-                "init_edge_runtime: build_ops_directory (directory_ops_capsule) failed: {e}"
-            ))
-        })?;
+    let directory_arc = extract_directory(&engine, &executor)?;
     #[allow(unsafe_code)]
     let queue_dispatch: BackendDispatch = unsafe {
         extract_capsule::<BackendDispatch, _, _>(
@@ -12154,6 +12256,130 @@ mod pyo3_tier2_tests {
     use crate::transport::{InboundFrame, TransportId, TransportSendOutcome};
 
     use std::sync::OnceLock;
+
+    /// A real persist engine on an in-memory store, for the capsule-lifetime
+    /// witnesses.
+    fn lifetime_engine<'py>(
+        py: Python<'py>,
+        seed: &std::path::Path,
+        n: usize,
+    ) -> Bound<'py, PyAny> {
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("dsn", "sqlite::memory:").expect("kw");
+        kwargs
+            .set_item("signing_key_id", format!("edge-capsule-lifetime-{n}"))
+            .expect("kw");
+        kwargs
+            .set_item("local_key_id", format!("edge-capsule-lifetime-local-{n}"))
+            .expect("kw");
+        kwargs
+            .set_item("local_key_path", seed.to_string_lossy().as_ref())
+            .expect("kw");
+        kwargs.set_item("pqc_sweep_on_init", false).expect("kw");
+        py.import("ciris_persist")
+            .and_then(|m| m.getattr("Engine"))
+            .and_then(|c| c.call((), Some(&kwargs)))
+            .expect("engine")
+    }
+
+    /// **A handle copied out of a capsule outlives the engine that made it.**
+    /// Edge copies `{ data, vtable }` out of the executor, directory-ops and
+    /// queue-ops capsules and hands the copies to tasks that can outlive the
+    /// host's engine. Here the engine is dropped, its slot reset and the
+    /// collector run, so the only references left to the capsules are the
+    /// handles' own; the directory proxy, the queue proxy and the executor
+    /// still answer. Red (SIGSEGV, or a dead runtime) when a handle does not
+    /// hold the capsule its copy points into: d2e5e3c's bug, for each handle.
+    #[test]
+    fn a_capsule_handle_outlives_the_engine_that_made_it() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = tmp.path().join("local.seed");
+        std::fs::write(&seed, [0x51_u8; 32]).expect("seed");
+        let (executor, directory, queue) = Python::attach(|py| {
+            install_ciris_persist_module(py).expect("module");
+            clear_engine_slate(py);
+            let engine = lifetime_engine(py, &seed, 0);
+            let executor = extract_executor(&engine).expect("executor");
+            let directory = extract_directory(&engine, &executor).expect("directory");
+            let queue = extract_outbound_queue_ops(&engine, &executor).expect("queue");
+            drop(engine);
+            clear_engine_slate(py);
+            (executor, directory, queue)
+        });
+        let answered: Result<(bool, bool), String> = run_async(&executor, async move {
+            let none = directory
+                .lookup_public_key("nobody-here")
+                .await
+                .map_err(|e| e.to_string())?
+                .is_none();
+            let empty = queue
+                .outbound_status("no-such-row")
+                .await
+                .map_err(|e| e.to_string())?
+                .is_none();
+            Ok((none, empty))
+        });
+        assert_eq!(answered, Ok((true, true)), "the handles still answer");
+        Python::attach(|_py| drop(executor));
+    }
+
+    /// A Python object's reference count, read while attached.
+    fn refcount(_py: Python<'_>, obj: &pyo3::Py<pyo3::PyAny>) -> isize {
+        #[allow(unsafe_code)]
+        // SAFETY: `obj` is a live reference and the thread is attached.
+        unsafe {
+            pyo3::ffi::Py_REFCNT(obj.as_ptr())
+        }
+    }
+
+    /// **And no longer.** The capsules live exactly as long as a handle that
+    /// can dereference them: after N engines are built, their handles taken
+    /// and everything dropped, nothing but the witness's own reference holds
+    /// any capsule. Red under a process-lifetime keep-alive set (the first
+    /// cut of this fix), which pinned every capsule, and so every engine,
+    /// for ever.
+    #[test]
+    fn a_dropped_handle_releases_its_capsule() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = tmp.path().join("local.seed");
+        std::fs::write(&seed, [0x52_u8; 32]).expect("seed");
+        Python::attach(|py| {
+            install_ciris_persist_module(py).expect("module");
+            for n in 0..4 {
+                clear_engine_slate(py);
+                let engine = lifetime_engine(py, &seed, n);
+                let watched: Vec<pyo3::Py<pyo3::PyAny>> = [
+                    "executor_capsule",
+                    "directory_ops_capsule",
+                    "outbound_queue_ops_capsule",
+                ]
+                .iter()
+                .map(|m| engine.call_method0(*m).expect("capsule").unbind())
+                .collect();
+                let executor = extract_executor(&engine).expect("executor");
+                let directory = extract_directory(&engine, &executor).expect("directory");
+                let queue = extract_outbound_queue_ops(&engine, &executor).expect("queue");
+                let held: Vec<isize> = watched.iter().map(|c| refcount(py, c)).collect();
+                drop((executor, directory, queue));
+                drop(engine);
+                clear_engine_slate(py);
+                for (i, cap) in watched.iter().enumerate() {
+                    assert_eq!(
+                        refcount(py, cap),
+                        1,
+                        "engine {n}, capsule {i}: only the witness holds it once the handles \
+                         and the engine are gone (it held {} with them alive)",
+                        held[i]
+                    );
+                    assert!(held[i] > 1, "the handles did hold it");
+                }
+            }
+        });
+    }
 
     /// CIRISPersist#1242 — **a raw-layout capsule laid out by another persist
     /// build is refused before it is dereferenced.** A capsule carrying the

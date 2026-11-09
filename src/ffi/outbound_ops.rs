@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use ciris_persist::ffi::executor_capsule::{AsyncExecutor, TaskOpaque};
+use ciris_persist::ffi::executor_capsule::TaskOpaque;
 use ciris_persist::ffi::outbound_queue_capsule::{
     OutboundQueueHandle, OutboundQueueOp, OutboundQueueOpResult, OUTBOUND_QUEUE_ABI_VERSION,
 };
@@ -47,9 +47,10 @@ use crate::outbound::OutboundHandle;
 /// `{ data, vtable }` (the PyCapsule destructor owns the drop, exactly as
 /// for the directory and executor capsules) and the executor that spawns
 /// each op onto persist's runtime.
-pub struct OpsOutboundQueue {
+pub(crate) struct OpsOutboundQueue {
     handle: OutboundQueueHandle,
-    executor: Arc<AsyncExecutor>,
+    /// The executor and the capsule it was copied out of (CIRISEdge#960).
+    executor: Arc<crate::ffi::pyo3::KeptExecutor>,
     /// A strong reference to the PyCapsule `handle` was copied out of. The
     /// capsule's destructor frees `handle.data` (the boxed `BackendDispatch`),
     /// so the capsule must outlive every op this proxy builds. The raw
@@ -68,9 +69,9 @@ impl OpsOutboundQueue {
     /// The capsule's vtable `abi_version` is not the
     /// [`OUTBOUND_QUEUE_ABI_VERSION`] this edge was built against: a skewed
     /// wheel is refused before any op is dispatched through it.
-    pub fn new(
+    pub(crate) fn new(
         handle: OutboundQueueHandle,
-        executor: Arc<AsyncExecutor>,
+        executor: Arc<crate::ffi::pyo3::KeptExecutor>,
         capsule: Option<pyo3::Py<pyo3::PyAny>>,
     ) -> Result<Self, String> {
         if handle.vtable.abi_version != OUTBOUND_QUEUE_ABI_VERSION {
@@ -425,8 +426,10 @@ mod tests {
                     .drop,
             };
         let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
-        let executor =
-            Arc::new(ciris_persist::ffi::executor_capsule::build_persist_executor(Arc::clone(&rt)));
+        let executor = Arc::new(crate::ffi::pyo3::KeptExecutor::new(
+            ciris_persist::ffi::executor_capsule::build_persist_executor(Arc::clone(&rt)),
+            None,
+        ));
         let handle = OutboundQueueHandle {
             data: std::ptr::null_mut(),
             vtable: &SKEWED,
@@ -440,8 +443,10 @@ mod tests {
     #[test]
     fn every_op_round_trips_through_the_vtable() {
         let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
-        let executor =
-            Arc::new(ciris_persist::ffi::executor_capsule::build_persist_executor(Arc::clone(&rt)));
+        let executor = Arc::new(crate::ffi::pyo3::KeptExecutor::new(
+            ciris_persist::ffi::executor_capsule::build_persist_executor(Arc::clone(&rt)),
+            None,
+        ));
         rt.block_on(async {
             let backend = ciris_persist::prelude::FederationDirectorySqlite::open(":memory:")
                 .await
