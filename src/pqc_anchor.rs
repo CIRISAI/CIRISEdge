@@ -34,8 +34,14 @@
 //! evicted) and [`ANCHOR_TTL`], and an entry is cleared once a record that
 //! matched it is admitted and its pair used — after that the record is held, and a held record is
 //! itself an anchor (5.3.3.5 item 6 (2)). A mismatch does not clear it: a
-//! retried dial against the same forged record is refused the same way until
-//! the TTL lapses.
+//! retried dial against the same record is refused the same way.
+//!
+//! **Latest wins.** A new, well-formed commitment for a key replaces the held
+//! one. A code naming a real key with a garbage commitment is something
+//! anyone can hand a person; if the first commitment stuck, that code would
+//! lock first contact to the key out for the whole TTL. Under latest-wins the
+//! person re-adds the contact from the right code and the next dial keys. The
+//! garbage commitment's mismatch is still logged and counted.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,6 +164,8 @@ impl AnchorRegistry {
                 reg.remove(&oldest);
             }
         }
+        // Latest wins (see the module doc): the insert replaces any held
+        // commitment, never keeps the first.
         if reg
             .get(key_id)
             .is_some_and(|prev| prev.commitment != commitment)
@@ -165,7 +173,7 @@ impl AnchorRegistry {
             tracing::info!(
                 key_id,
                 "pqc anchor: a new commitment replaces the one held for this key \
-                 (CC 5.3.3.5 item 6)"
+                 (CC 5.3.3.5 item 6; latest wins)"
             );
         }
         reg.insert(
@@ -389,6 +397,24 @@ mod tests {
             reg.check_ml_dsa_65(key, Some(&b64(&[8u8; 1952]))),
             Anchor::None
         );
+    }
+
+    /// CIRISEdge#964 — latest wins: a second, different commitment for the
+    /// same key replaces the first, so a garbage commitment cannot lock a key
+    /// out for the TTL.
+    #[test]
+    fn a_later_commitment_replaces_the_held_one_964() {
+        let reg = AnchorRegistry::new(8, ANCHOR_TTL);
+        let real = [5u8; 1952];
+        reg.anchor("k", commitment_of(b"garbage"));
+        assert!(matches!(
+            reg.check_ml_dsa_65("k", Some(&b64(&real))),
+            Anchor::Mismatch(_)
+        ));
+        reg.anchor("k", commitment_of(&real));
+        assert_eq!(reg.pending("k"), Some(commitment_of(&real)));
+        assert_eq!(reg.check_ml_dsa_65("k", Some(&b64(&real))), Anchor::Matched);
+        assert_eq!(reg.len(), 1);
     }
 
     /// CIRISEdge#964 — the registry is bounded: past the cap the oldest

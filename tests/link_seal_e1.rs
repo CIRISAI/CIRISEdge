@@ -1078,6 +1078,58 @@ async fn a_fetched_key_record_matching_the_pqc_commitment_keys_964() {
     );
 }
 
+/// **CIRISEdge#964** — latest wins: a stranger who was handed a code naming A's
+/// real key with a WRONG commitment is refused, then re-adds A from the right
+/// code. The new commitment replaces the held one, and the next dial keys. A
+/// garbage commitment can't lock first contact to A out for the TTL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_commitment_then_the_right_one_keys_964() {
+    let t = trio("pqclatest", false, false, true).await;
+    hold_commitment(
+        &t.c,
+        &t.a.key.key_id,
+        &pqc_commitment_of(b"a garbage commitment for A's real key"),
+    )
+    .await;
+    match t
+        .c
+        .transport
+        .send(&t.a.key.key_id, b"never-sent-964-latest")
+        .await
+    {
+        Err(TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_route_answer_pqc_commitment");
+        }
+        other => panic!("the wrong commitment is refused by name: {other:?}"),
+    }
+    assert!(t.c.seal("link_seal_refused_route_answer_pqc_commitment") >= 1);
+    hold_commitment(&t.c, &t.a.key.key_id, &real_pqc_commitment(&t.a.key)).await;
+    t.c.transport
+        .send(&t.a.key.key_id, b"from-a-recommitted-stranger")
+        .await
+        .expect("C -> A keys under the replacing commitment");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(b"from-a-recommitted-stranger").await
+        })
+        .await,
+        "A delivered C's frame"
+    );
+    assert!(
+        t.c.dir
+            .lookup_public_key(&t.a.key.key_id)
+            .await
+            .expect("lookup")
+            .is_some(),
+        "C admitted A's key record under the right commitment"
+    );
+    assert!(t.c.seal("link_seal_pair_route_fetch") >= 1);
+    assert!(
+        ciris_edge::pqc_anchor::pending(&t.a.key.key_id).is_none(),
+        "the matched anchor was cleared"
+    );
+}
+
 /// **CIRISEdge#964** — no commitment keys exactly as today: a fresh
 /// stranger resolves A's code that carries none (a v1/v2 NodeCode, every code
 /// in circulation), nothing is held, and the fetched record keys the link.
