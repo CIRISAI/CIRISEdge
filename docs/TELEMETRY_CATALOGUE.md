@@ -171,6 +171,16 @@ renewed in 30 s lapses to normal. The tier does not close forwarding.
 6. `shaping_windows_withheld{class}` rising means the class is under three links
    and the two above are not being published. That is not the same as no traffic.
 
+### Why hasn't a new member seen the room's history?
+
+1. `group_backfill_rows_read_total` rising while `group_backfill_rows_kept_total`
+   stays flat: the join backfill (CIRISEdge#968) is reading history families
+   that hold nothing of the joined groups. Its pace is one page a round per
+   peer under the `page` lever.
+2. `group_backfill_completed_total` counts backfills that reached the end. A
+   kept row is still subject to every serve gate; a withheld one is booked in
+   the advertise round summary like any other.
+
 ### Why hasn't this governance row landed?
 
 1. `decision_row_subscribers`: 0 means nobody is listening, and
@@ -345,6 +355,9 @@ to it, and a 1 is not visible from anywhere else.
 | `alm_c3_peers` | `ciris.edge.alm.c3_peers` | gauge | count | operator-only |
 | `decision_row_unheard_total` | `ciris.edge.decision_row.unheard` | counter | count | operator-only |
 | `decision_row_subscribers` | `ciris.edge.decision_row.subscribers` | gauge | count | operator-only |
+| `group_backfill_rows_read_total` | `ciris.edge.group_backfill.rows_read` | counter | count | operator-only |
+| `group_backfill_rows_kept_total` | `ciris.edge.group_backfill.rows_kept` | counter | count | operator-only |
+| `group_backfill_completed_total` | `ciris.edge.group_backfill.completed` | counter | count | operator-only |
 | `apply_refusals` | `ciris.edge.apply_refusals` | counter | count | operator-only |
 | `loop_last_progress_age_seconds` | `ciris.edge.loop.last_progress_age` | gauge | seconds | operator-only |
 | `node_alive` | `ciris.edge.node.alive` | gauge | count | public-safe |

@@ -499,6 +499,9 @@ pub struct TelemetrySnapshot {
     pub alm_c3_peers: u64,
     pub decision_row_unheard_total: HashMap<String, u64>,
     pub decision_row_subscribers: u64,
+    pub group_backfill_rows_read_total: u64,
+    pub group_backfill_rows_kept_total: u64,
+    pub group_backfill_completed_total: u64,
     pub apply_refusals: HashMap<String, u64>,
     pub loop_last_progress_age_seconds: HashMap<String, f64>,
     pub node_alive: u64,
@@ -588,6 +591,9 @@ pub struct EdgeTelemetry {
     alm_c3_peers: AtomicU64,
     decision_row_unheard: [AtomicU64; DECISION_ROW_KINDS.len()],
     decision_rows: RwLock<Option<DecisionRowSender>>,
+    group_backfill_rows_read: AtomicU64,
+    group_backfill_rows_kept: AtomicU64,
+    group_backfill_completed: AtomicU64,
     moved_to_terminal: AtomicU64,
     refused_then_admitted: Mutex<HashMap<&'static str, u64>>,
     loop_stamps: [AtomicU64; LoopName::COUNT],
@@ -640,6 +646,9 @@ impl Default for EdgeTelemetry {
             alm_c3_peers: AtomicU64::new(0),
             decision_row_unheard: arr(),
             decision_rows: RwLock::new(None),
+            group_backfill_rows_read: AtomicU64::new(0),
+            group_backfill_rows_kept: AtomicU64::new(0),
+            group_backfill_completed: AtomicU64::new(0),
             moved_to_terminal: AtomicU64::new(0),
             refused_then_admitted: Mutex::new(HashMap::new()),
             loop_stamps: arr(),
@@ -857,6 +866,20 @@ impl EdgeTelemetry {
             .store(counts.refused_capacity, Ordering::Relaxed);
         self.forward_pps.store(load.pps as u64, Ordering::Relaxed);
         self.forward_bps.store(load.bps as u64, Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#968 — one page of a late joiner's group-history backfill:
+    /// `read` rows of the history families, `kept` of them placed in a group
+    /// the peer joined, and whether the backfill reached the end.
+    pub fn record_group_backfill_page(&self, read: u64, kept: u64, finished: bool) {
+        self.group_backfill_rows_read
+            .fetch_add(read, Ordering::Relaxed);
+        self.group_backfill_rows_kept
+            .fetch_add(kept, Ordering::Relaxed);
+        if finished {
+            self.group_backfill_completed
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// What the shaped links look like now.
@@ -1146,6 +1169,9 @@ impl EdgeTelemetry {
                 &self.decision_row_unheard,
             ),
             decision_row_subscribers: subscribers as u64,
+            group_backfill_rows_read_total: self.group_backfill_rows_read.load(Ordering::Relaxed),
+            group_backfill_rows_kept_total: self.group_backfill_rows_kept.load(Ordering::Relaxed),
+            group_backfill_completed_total: self.group_backfill_completed.load(Ordering::Relaxed),
             apply_refusals,
             node_alive: u64::from(self.alive()),
             loop_last_progress_age_seconds: LoopName::ALL
@@ -1420,6 +1446,9 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("alm_c3_peers", "ciris.edge.alm.c3_peers", Gauge, Count, None, "Call members that speak C3, across live calls."),
     spec("decision_row_unheard_total", "ciris.edge.decision_row.unheard", Counter, Count, closed("kind", &DECISION_ROW_KINDS), "Decision-row events with no receiver."),
     spec("decision_row_subscribers", "ciris.edge.decision_row.subscribers", Gauge, Count, None, "Receivers of decision-row events now. 0 explains a silent decision-row family."),
+    spec("group_backfill_rows_read_total", "ciris.edge.group_backfill.rows_read", Counter, Count, None, "Rows of the group-history families a join backfill read (CIRISEdge#968). Bounded per round per peer by the `page` lever."),
+    spec("group_backfill_rows_kept_total", "ciris.edge.group_backfill.rows_kept", Counter, Count, None, "Of those, rows placed in a group the peer joined, handed to the gates."),
+    spec("group_backfill_completed_total", "ciris.edge.group_backfill.completed", Counter, Count, None, "Join backfills that read to the end of the history families."),
     spec("apply_refusals", "ciris.edge.apply_refusals", Counter, Count, Some(("state", LabelValues::Tokens)), "`moved_to_terminal` and `refused_then_admitted:<class>`: a refusal's life, not its reason. Every key present at zero."),
     spec("loop_last_progress_age_seconds", "ciris.edge.loop.last_progress_age", Gauge, Seconds, closed("loop", LoopName::TOKENS), "Whole seconds since each loop turned. -1: not running, a parked node included. Stamped on each loop's own cadence, not per event. Not public: a dispatcher busy with a batch turns late."),
     TelemetrySpec { exposure: Exposure::PublicSafe, ..spec("node_alive", "ciris.edge.node.alive", Gauge, Count, None, "1 when the event loop and the ladder both turned within 60 s. A bound this coarse says the node runs and nothing of its traffic: the one field for an unauthenticated route.") },

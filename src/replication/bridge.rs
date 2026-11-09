@@ -1426,6 +1426,12 @@ struct PlaneWatermark {
     lost_rounds: u8,
     /// The groups this peer was last read for ([`SweepCursors::groups_changed`]).
     groups: BTreeSet<String>,
+    /// Whether [`Self::groups`] has been read once: the first read is the
+    /// baseline, and only a group the peer joins after it is backfilled.
+    groups_seen: bool,
+    /// CIRISEdge#968 — the history of the groups this peer joined since it
+    /// was first seen, not yet offered ([`SweepCursors::groups_changed`]).
+    join_backfill: Option<JoinBackfill>,
     /// When a peer that gets no walk may read its next page of history
     /// ([`SweepCursors::history_due`]).
     history_at: Option<Instant>,
@@ -1436,6 +1442,42 @@ struct PlaneWatermark {
 /// The position a head read started from, the plane's beginning included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ListedFrom(Option<ResumeCursor>);
+
+/// CIRISEdge#968 — **a late joiner's catch-up of a group's history.**
+///
+/// A group's history was written before the peer joined, so every round
+/// before the join withheld it, and the peer's watermark passed it. A contact
+/// gets no walk (CC 5.2), only a page of history now and then, so the history
+/// reached it oldest first behind every other family: about 726 s on the
+/// server's late-joiner rig. When a peer's group set grows, the groups it
+/// joined are read here instead, a page a round, from the beginning of the
+/// families a group's history is placed under ([`GROUP_HISTORY_FAMILIES`],
+/// persist 61.1.0's `list_attestations_since_by_prefixes`), keeping the rows
+/// placed in those groups. The rows go out with the required read and cross
+/// the whole gate stack. Bounded: one page of [`GROUP_BACKFILL_PAGE`] rows a
+/// round per peer, under the host's `page` lever; nothing self-paces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JoinBackfill {
+    /// The joined groups whose history is still being read.
+    groups: BTreeSet<String>,
+    /// Where the read resumes, exclusive; `None` is the beginning.
+    since: Option<ciris_persist::federation::types::ServePosition>,
+    /// Bumped each time the backfill restarts, so a page read before a
+    /// restart cannot move the restarted read past rows it has not read.
+    generation: u64,
+}
+
+/// CIRISEdge#968 — the families a group's history is placed under: a thing
+/// said in a room is shared to it by a widening (`supersedes`), a composer
+/// over it is born at the room (`withdraws`, `recants`, `supersedes`), and
+/// what is written at the room directly is a `chat:` or `file:` row. Matched
+/// against persist's family token (`row_type::claim_token`), so a `scores`
+/// row by its dimension and any other row by its type.
+const GROUP_HISTORY_FAMILIES: [&str; 5] = ["chat:", "file:", "recants", "supersedes", "withdraws"];
+
+/// CIRISEdge#968 — the rows of the history families one peer's join backfill
+/// reads a round, before the `page` lever halves it.
+const GROUP_BACKFILL_PAGE: u32 = 256;
 
 /// How many lost rounds in a row get their rows listed again. Past it the
 /// watermark moves as it would have and the re-sweep carries what was passed,
@@ -1798,13 +1840,75 @@ impl SweepCursors {
     }
 
     /// `groups` is the set of groups the peer is in now: is it new here?
+    ///
+    /// CIRISEdge#968 — a group it was not in when last read, after the first
+    /// read, starts (or restarts, from the beginning) the history backfill
+    /// for it ([`JoinBackfill`]); a group it left leaves the backfill.
     fn groups_changed(&mut self, key: &(String, EnvelopeKind), groups: &BTreeSet<String>) -> bool {
         let wm = self.touch(key);
+        let first = !std::mem::replace(&mut wm.groups_seen, true);
         if wm.groups == *groups {
             return false;
         }
+        let joined: BTreeSet<String> = groups.difference(&wm.groups).cloned().collect();
         wm.groups.clone_from(groups);
+        let mut pending = wm
+            .join_backfill
+            .take()
+            .map(|b| (b.groups, b.since, b.generation))
+            .unwrap_or_default();
+        pending.0.retain(|g| groups.contains(g));
+        if !first && !joined.is_empty() {
+            pending.0.extend(joined);
+            pending.1 = None;
+            pending.2 = pending.2.wrapping_add(1);
+        }
+        if !pending.0.is_empty() {
+            wm.join_backfill = Some(JoinBackfill {
+                groups: pending.0.into_iter().take(REQUIRED_GROUPS).collect(),
+                since: pending.1,
+                generation: pending.2,
+            });
+        }
         true
+    }
+
+    /// CIRISEdge#968 — the join backfill in progress for `key`, if any.
+    fn join_backfill(&mut self, key: &(String, EnvelopeKind)) -> Option<JoinBackfill> {
+        self.by_peer_plane
+            .get(key)
+            .and_then(|wm| wm.join_backfill.clone())
+    }
+
+    /// CIRISEdge#968 — a backfill page of `generation` was read: resume after
+    /// `next`, or finish when none remains. A page of an older generation
+    /// moves nothing: the backfill restarted under it. Returns whether the
+    /// backfill finished.
+    fn join_backfill_read(
+        &mut self,
+        key: &(String, EnvelopeKind),
+        generation: u64,
+        next: Option<ciris_persist::federation::types::ServePosition>,
+    ) -> bool {
+        let Some(wm) = self.by_peer_plane.get_mut(key) else {
+            return false;
+        };
+        let Some(backfill) = wm.join_backfill.as_mut() else {
+            return false;
+        };
+        if backfill.generation != generation {
+            return false;
+        }
+        match next {
+            Some(position) => {
+                backfill.since = Some(position);
+                false
+            }
+            None => {
+                wm.join_backfill = None;
+                true
+            }
+        }
     }
 
     /// May a peer with no walk read a page of history now?
@@ -11158,10 +11262,10 @@ impl FederationDirectoryReplicationBridge {
             .sweep_cursors
             .lock()
             .is_ok_and(|mut c| c.groups_changed(key, &groups));
+        let mut rows = self.group_history_backfill(key).await;
         if !changed {
-            return Vec::new();
+            return rows;
         }
-        let mut rows = Vec::new();
         for group in groups.iter().take(REQUIRED_GROUPS) {
             if let Ok(Some(page)) = AttestationQuery::to(group, REQUIRED_READ_PAGE)
                 .dimension(gp::GROUP_ROSTER_DIMENSION)
@@ -11186,6 +11290,71 @@ impl FederationDirectoryReplicationBridge {
             {
                 rows.extend(page.into_iter().take(REQUIRED_READ_PAGE.get() as usize));
             }
+        }
+        rows
+    }
+
+    /// CIRISEdge#968 — **one page of a late joiner's group history**
+    /// ([`JoinBackfill`]): the next [`GROUP_BACKFILL_PAGE`] rows (under the
+    /// host's `page` lever) of the history families, kept where placed in a
+    /// group the peer joined. A read that fails is read again next round from
+    /// where it stood.
+    async fn group_history_backfill(&self, key: &(String, EnvelopeKind)) -> Vec<Attestation> {
+        let Some(backfill) = self
+            .sweep_cursors
+            .lock()
+            .ok()
+            .and_then(|mut c| c.join_backfill(key))
+        else {
+            return Vec::new();
+        };
+        let page = self.metrics.as_ref().map_or(GROUP_BACKFILL_PAGE, |m| {
+            m.telemetry.levers.page_budget(GROUP_BACKFILL_PAGE)
+        });
+        let families: Vec<String> = GROUP_HISTORY_FAMILIES
+            .iter()
+            .map(|f| (*f).to_owned())
+            .collect();
+        let served = match self
+            .directory
+            .list_attestations_since_by_prefixes(backfill.since.clone(), &families, i64::from(page))
+            .await
+        {
+            Ok(served) => served,
+            Err(e) => {
+                tracing::debug!(
+                    peer = %key.0,
+                    error = %e,
+                    "group history backfill: page not served; read again next round"
+                );
+                return Vec::new();
+            }
+        };
+        let read = served.items.len();
+        let rows: Vec<Attestation> = served
+            .items
+            .into_iter()
+            .map(|s| s.attestation)
+            .filter(|a| {
+                ciris_persist::federation::cohort_target_of_envelope(&a.attestation_envelope)
+                    .is_some_and(|g| backfill.groups.contains(g))
+            })
+            .collect();
+        let finished = self
+            .sweep_cursors
+            .lock()
+            .is_ok_and(|mut c| c.join_backfill_read(key, backfill.generation, served.next_cursor));
+        if let Some(m) = self.metrics.as_ref() {
+            m.telemetry
+                .record_group_backfill_page(read as u64, rows.len() as u64, finished);
+        }
+        if finished {
+            tracing::info!(
+                peer = %key.0,
+                groups = backfill.groups.len(),
+                "group history backfill complete: the joined groups' history has been offered \
+                 (CIRISEdge#968)"
+            );
         }
         rows
     }
@@ -28495,6 +28664,9 @@ pub(crate) mod tests {
     // refuse and allow sides, and the live-state witnesses.
     mod moves_5_2;
     mod trace_recipient_consent;
+
+    // CIRISEdge#968 — a late joiner's backfill of its groups' history.
+    mod late_joiner_968;
 
     // CIRISServer native T2 — rows stranded behind the advertise watermark
     // when an advertise input changes, and the round summary's arithmetic.

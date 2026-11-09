@@ -3949,6 +3949,9 @@ impl EdgeMetrics {
             alm_c3_peers: t.alm_c3_peers,
             decision_row_unheard_total: t.decision_row_unheard_total,
             decision_row_subscribers: t.decision_row_subscribers,
+            group_backfill_rows_read_total: t.group_backfill_rows_read_total,
+            group_backfill_rows_kept_total: t.group_backfill_rows_kept_total,
+            group_backfill_completed_total: t.group_backfill_completed_total,
             apply_refusals: t.apply_refusals,
             loop_last_progress_age_seconds: t.loop_last_progress_age_seconds,
             node_alive: t.node_alive,
@@ -4389,6 +4392,12 @@ pub struct EdgeMetricsBundle {
     pub decision_row_unheard_total: HashMap<String, u64>,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub decision_row_subscribers: u64,
+    /// CIRISEdge#968 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub group_backfill_rows_read_total: u64,
+    /// CIRISEdge#968 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub group_backfill_rows_kept_total: u64,
+    /// CIRISEdge#968 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub group_backfill_completed_total: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub apply_refusals: HashMap<String, u64>,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
@@ -4864,6 +4873,18 @@ impl EdgeMetricsBundle {
             ("alm_active_calls", self.alm_active_calls),
             ("alm_c3_peers", self.alm_c3_peers),
             ("decision_row_subscribers", self.decision_row_subscribers),
+            (
+                "group_backfill_rows_read_total",
+                self.group_backfill_rows_read_total,
+            ),
+            (
+                "group_backfill_rows_kept_total",
+                self.group_backfill_rows_kept_total,
+            ),
+            (
+                "group_backfill_completed_total",
+                self.group_backfill_completed_total,
+            ),
             ("node_alive", self.node_alive),
         ] {
             f.counters.insert(name.to_string(), value);
@@ -5034,6 +5055,9 @@ edge_metrics_bundle_fields!(
     alm_c3_peers,
     decision_row_unheard_total,
     decision_row_subscribers,
+    group_backfill_rows_read_total,
+    group_backfill_rows_kept_total,
+    group_backfill_completed_total,
     apply_refusals,
     loop_last_progress_age_seconds,
     node_alive,

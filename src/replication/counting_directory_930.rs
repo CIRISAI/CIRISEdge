@@ -783,6 +783,27 @@ impl FederationDirectory for CountingDirectory {
             .list_attestations_naming_by_dimension(subject_key_id, dimension, cursor, limit)
             .await
     }
+    // persist v61.1.0 (#1163, #1190): defaulted `Unsupported`, overridden by
+    // every backend and the capsule proxy, so delegated.
+    async fn list_attestations_since_by_prefixes(
+        &self,
+        since: Option<types::ServePosition>,
+        family_prefixes: &[String],
+        limit: i64,
+    ) -> Result<types::ServePage<types::ServedAttestation>, Error> {
+        self.hit("list_attestations_since_by_prefixes");
+        self.inner
+            .list_attestations_since_by_prefixes(since, family_prefixes, limit)
+            .await
+    }
+    async fn list_owner_bindings_since(
+        &self,
+        since: Option<types::ServePosition>,
+        limit: i64,
+    ) -> Result<types::ServePage<types::OwnerBindingChange>, Error> {
+        self.hit("list_owner_bindings_since");
+        self.inner.list_owner_bindings_since(since, limit).await
+    }
     async fn list_communities_for_member(
         &self,
         member_identity_key_id: &str,
