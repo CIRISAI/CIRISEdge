@@ -2606,7 +2606,8 @@ pub struct ReticulumTransport {
     /// Test seam — offer shaping through a forwarder, as a peer older than
     /// `CLM-shaped-link-one-hop` does.
     test_offer_forwarded: Arc<std::sync::atomic::AtomicBool>,
-    /// Test seam — a dial's establish budget in ms, 0 for the real one.
+    /// Test seam — a dial's establish budget in ms plus one, 0 for the real
+    /// one (so a zero budget is expressible).
     test_establish_budget_ms: std::sync::atomic::AtomicU64,
     /// v44 — the node's ladder ([`Transport::attach_load_ladder`]): the node
     /// tick folds edge's own signals and moves the shapers and admission.
@@ -4755,7 +4756,7 @@ impl ReticulumTransport {
         {
             0 if has_path => LINK_ESTABLISH_TIMEOUT,
             0 => NO_PATH_ESTABLISH_TIMEOUT,
-            ms => Duration::from_millis(ms),
+            ms => Duration::from_millis(ms - 1),
         }
     }
 
@@ -4777,10 +4778,18 @@ impl ReticulumTransport {
     }
 
     /// Test seam — a dial's establish budget, in place of the real one.
+    /// `Duration::ZERO` is a budget spent before the peer's proof can come:
+    /// the dial goes out and is abandoned without waiting on anything, so no
+    /// clock decides the race.
     #[doc(hidden)]
     pub fn set_establish_budget_for_test(&self, budget: Option<Duration>) {
         self.test_establish_budget_ms.store(
-            budget.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            budget.map_or(0, |d| {
+                u64::try_from(d.as_millis())
+                    .unwrap_or(u64::MAX - 1)
+                    .min(u64::MAX - 1)
+                    + 1
+            }),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -13408,7 +13417,7 @@ impl DialCtx {
             // resolves `Ok(())` on establishment, `Err(LinkClosed)` if the peer
             // refused / the link died first; a timeout means no route or a
             // stalled dial.
-            (link_id, with_timeout(establish_timeout, established).await)
+            (link_id, within_budget(establish_timeout, established).await)
         };
         if let Some(refused) =
             self.link_proof_refused(destination_key_id, &peer.dest_hash, outcome.as_ref())
@@ -14341,7 +14350,7 @@ struct EventCtx<'a> {
     av_dialed_peer: &'a std::sync::Mutex<HashMap<LinkId, String>>,
     /// CIRISEdge#805 item 8 — see the field of the same name on
     /// [`ReticulumTransport`].
-    direct_paths: &'a crate::transport::direct_path::DirectPaths,
+    direct_paths: &'a Arc<crate::transport::direct_path::DirectPaths>,
     /// ALM stage 2 — see the field of the same name on [`ReticulumTransport`].
     alm_links: &'a crate::transport::alm_link::AlmLinkState,
     /// CC 5.3.3.5 E1 — see `ReticulumTransport::seals`. An `Arc` so a link's
@@ -18642,9 +18651,20 @@ async fn direct_link_established(
 /// [`crate::transport::direct_path::accepts_direct`]: accept iff the link's
 /// peer shares a room with this node. An unattributed link is refused.
 ///
+/// A known peer with no standing YET is held, not refused at once: up to
+/// [`crate::transport::direct_path::DIRECT_STANDING_WAIT`], inside leviculum's
+/// own hold, for the room to arrive. Two members never join a call at the same
+/// instant, and the first one's dial proposes to the second before the
+/// second's call is installed; refused there, the pair waited out a retry
+/// backoff of 45 s or more on the relay (CI darwin, v44.0.0 and v44.1.0 tag
+/// runs: refused 20 ms before B's call installed).
+///
 /// The answer is SPAWNED: it hands leviculum an action, and the event loop
 /// must never wait on the action channel it is itself draining.
 async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
+    use crate::transport::direct_path::{
+        accepts_direct, waits_for_standing, DIRECT_STANDING_POLL, DIRECT_STANDING_WAIT,
+    };
     // The peer the link belongs to: one that dialled and identified to us,
     // else one we dialled (by the destination we dialled).
     let mut peer = link_attribution_now(ctx, link_id).await;
@@ -18660,51 +18680,60 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
                 .map(|(key_id, _)| key_id.clone());
         }
     }
-    let shares_room = peer.as_deref().is_some_and(|p| {
-        direct_standing(
-            ctx.scope_addresses.get().map(AsRef::as_ref),
-            ctx.direct_paths,
-            p,
-        )
-    });
-    let accepted = peer.is_some()
-        && crate::transport::direct_path::accepts_direct(
-            ctx.direct_paths.config.accept,
-            shares_room,
-        );
-    // v44 — before the answer goes, so the outcome cannot precede the record:
-    // from here this link may move under a Resource (`direct_path` docs).
-    if accepted {
-        ctx.direct_paths
-            .tracker()
-            .accepted(link_id, std::time::Instant::now());
-    }
     // The initiator's proposal came: nothing left to yield to.
     if let Some(p) = peer.as_deref() {
         ctx.direct_paths.clear_yield(p);
     }
-    if let Some(m) = ctx.metrics {
-        m.inc_direct_link(if accepted {
-            crate::observability::DIRECT_LINK_REQUEST_ACCEPTED
-        } else {
-            crate::observability::DIRECT_LINK_REQUEST_REFUSED
-        });
-    }
-    tracing::info!(
-        link = %hex::encode(link_id.as_bytes()),
-        peer = peer.as_deref().unwrap_or("<unattributed>"),
-        shares_room,
-        accepted,
-        "direct link REQUESTED by a peer (CIRISEdge#805 item 8)"
-    );
-    ctx.direct_paths
-        .emit(crate::transport::direct_path::DirectPathEvent::Requested {
+    let table = ctx.scope_addresses.get().cloned();
+    let direct_paths = Arc::clone(ctx.direct_paths);
+    let metrics = ctx.metrics.cloned();
+    let node = Arc::clone(ctx.av_node);
+    tokio::spawn(async move {
+        let accept = direct_paths.config.accept;
+        let standing = |p: &str| direct_standing(table.as_deref(), &direct_paths, p);
+        let asked = std::time::Instant::now();
+        let mut shares_room = peer.as_deref().is_some_and(standing);
+        if waits_for_standing(accept, peer.is_some(), shares_room) {
+            if let Some(m) = metrics.as_ref() {
+                m.inc_direct_link(crate::observability::DIRECT_LINK_REQUEST_HELD);
+            }
+        }
+        while waits_for_standing(accept, peer.is_some(), shares_room)
+            && asked.elapsed() < DIRECT_STANDING_WAIT
+        {
+            tokio::time::sleep(DIRECT_STANDING_POLL).await;
+            shares_room = peer.as_deref().is_some_and(standing);
+        }
+        let held_ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let accepted = peer.is_some() && accepts_direct(accept, shares_room);
+        // v44 — before the answer goes, so the outcome cannot precede the
+        // record: from here this link may move under a Resource
+        // (`direct_path` docs).
+        if accepted {
+            direct_paths
+                .tracker()
+                .accepted(link_id, std::time::Instant::now());
+        }
+        if let Some(m) = metrics.as_ref() {
+            m.inc_direct_link(if accepted {
+                crate::observability::DIRECT_LINK_REQUEST_ACCEPTED
+            } else {
+                crate::observability::DIRECT_LINK_REQUEST_REFUSED
+            });
+        }
+        tracing::info!(
+            link = %hex::encode(link_id.as_bytes()),
+            peer = peer.as_deref().unwrap_or("<unattributed>"),
+            shares_room,
+            accepted,
+            held_ms,
+            "direct link REQUESTED by a peer (CIRISEdge#805 item 8)"
+        );
+        direct_paths.emit(crate::transport::direct_path::DirectPathEvent::Requested {
             peer,
             link_id: link_id.into_bytes(),
             accepted,
         });
-    let node = Arc::clone(ctx.av_node);
-    tokio::spawn(async move {
         let answer = if accepted {
             node.accept_direct_link(&link_id).await
         } else {
@@ -22249,6 +22278,16 @@ async fn consult_and_prune_blackhole(
 }
 
 // ─── Runtime-agnostic timeout helper ────────────────────────────────
+
+/// A dial's wait on its establishment within `budget`. A zero budget is spent
+/// before anything can answer: the outcome is not polled, so a proof already
+/// in is not taken and no clock decides the race.
+async fn within_budget<F: std::future::Future>(budget: Duration, fut: F) -> Option<F::Output> {
+    if budget.is_zero() {
+        return None;
+    }
+    with_timeout(budget, fut).await
+}
 
 /// Bound `fut` by `dur`, returning `None` on timeout. Runtime-agnostic:
 /// `futures_timer::Delay` carries its OWN timer thread, so this needs NO tokio

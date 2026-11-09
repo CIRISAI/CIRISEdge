@@ -1363,6 +1363,10 @@ pub const DIRECT_LINK_REQUEST_ACCEPTED: &str = "direct_link_request_accepted";
 /// A peer's direct-link request, refused: not a room peer, unattributed, or
 /// accepting turned off. Nothing about this node's address was sent.
 pub const DIRECT_LINK_REQUEST_REFUSED: &str = "direct_link_request_refused";
+/// A peer's direct-link request that came before this node shared a room
+/// with it, held for that standing (`direct_path::DIRECT_STANDING_WAIT`)
+/// rather than refused at once. It ends `accepted` or `refused` as well.
+pub const DIRECT_LINK_REQUEST_HELD: &str = "direct_link_request_held";
 /// A link moved onto a punched interface (either side).
 pub const DIRECT_LINK_ESTABLISHED: &str = "direct_link_established";
 /// The peer refused the upgrade.
@@ -1816,6 +1820,7 @@ pub const DIRECT_LINK_LABELS: &[&str] = &[
     DIRECT_LINK_SKIPPED_NO_LINK,
     DIRECT_LINK_REQUEST_ACCEPTED,
     DIRECT_LINK_REQUEST_REFUSED,
+    DIRECT_LINK_REQUEST_HELD,
     DIRECT_LINK_ESTABLISHED,
     DIRECT_LINK_FAILED_REJECTED,
     DIRECT_LINK_FAILED_PROBE,

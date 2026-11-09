@@ -479,6 +479,27 @@ pub const fn accepts_direct(accept: DirectAccept, shares_room: bool) -> bool {
     }
 }
 
+/// How long a peer's direct-link request from a known peer with no standing
+/// yet is held for that standing to arrive before it is refused: leviculum's
+/// own hold ([`leviculum_core::node::ASK_HOST_TIMEOUT_MS`]) less a second, so
+/// the answer is edge's and not leviculum's timeout. Two members joining one
+/// call never join at the same instant, and the first one's dial proposes to
+/// the second before the second's call is installed.
+pub const DIRECT_STANDING_WAIT: Duration =
+    Duration::from_millis(leviculum_core::node::ASK_HOST_TIMEOUT_MS.saturating_sub(1_000));
+
+/// How often a held request looks again for the peer's standing.
+pub const DIRECT_STANDING_POLL: Duration = Duration::from_millis(50);
+
+/// Whether a request is held for standing rather than answered now: only
+/// under [`DirectAccept::RoomPeers`], only from a peer the link is attributed
+/// to, and only while that peer has no standing. `Off` and `IdentifiedOnly`
+/// do not read standing; an unattributed link can never earn it.
+#[must_use]
+pub const fn waits_for_standing(accept: DirectAccept, peer_known: bool, shares_room: bool) -> bool {
+    matches!(accept, DirectAccept::RoomPeers) && peer_known && !shares_room
+}
+
 /// The `direct_link` metric label of a failure.
 #[must_use]
 pub const fn failure_label(failure: Failure) -> &'static str {
@@ -1210,6 +1231,25 @@ mod tests {
         assert!(!accepts_direct(DirectAccept::RoomPeers, false));
         assert!(!accepts_direct(DirectAccept::Off, true));
         assert!(accepts_direct(DirectAccept::IdentifiedOnly, false));
+    }
+
+    /// Only a known peer with no standing yet, under `RoomPeers`, is held; the
+    /// hold ends inside leviculum's, so the answer is always edge's.
+    #[test]
+    fn only_a_known_peer_without_standing_is_held_for_it() {
+        assert!(waits_for_standing(DirectAccept::RoomPeers, true, false));
+        assert!(!waits_for_standing(DirectAccept::RoomPeers, true, true));
+        assert!(!waits_for_standing(DirectAccept::RoomPeers, false, false));
+        assert!(!waits_for_standing(DirectAccept::Off, true, false));
+        assert!(!waits_for_standing(
+            DirectAccept::IdentifiedOnly,
+            true,
+            false
+        ));
+        assert!(
+            DIRECT_STANDING_WAIT + DIRECT_STANDING_POLL
+                < Duration::from_millis(leviculum_core::node::ASK_HOST_TIMEOUT_MS)
+        );
     }
 
     #[test]
