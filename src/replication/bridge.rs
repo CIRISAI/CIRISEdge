@@ -1899,16 +1899,12 @@ impl SweepCursors {
         if backfill.generation != generation {
             return false;
         }
-        match next {
-            Some(position) => {
-                backfill.since = Some(position);
-                false
-            }
-            None => {
-                wm.join_backfill = None;
-                true
-            }
+        if let Some(position) = next {
+            backfill.since = Some(position);
+            return false;
         }
+        wm.join_backfill = None;
+        true
     }
 
     /// May a peer with no walk read a page of history now?

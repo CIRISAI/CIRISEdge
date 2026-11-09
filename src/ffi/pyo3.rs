@@ -3564,6 +3564,7 @@ fn link_info_to_pydict<'py>(
 /// v44 — the operator's telemetry, one dict entry per bundle field
 /// (`crate::telemetry::TELEMETRY_CATALOGUE`). Closed labels are present at
 /// zero.
+#[allow(clippy::too_many_lines)] // one `set_item` per catalogue field, nothing more
 fn telemetry_into_pydict(
     py: Python<'_>,
     root: &Bound<'_, pyo3::types::PyDict>,
