@@ -234,6 +234,12 @@ pub enum RouteFetchError {
     /// The carried key record was refused at persist's key door.
     #[error("route answer's key record refused: {0}")]
     KeyRecordRefused(String),
+    /// CC 5.3.3.5 item 6 (CIRISEdge#964) — the dialled key's record (carried
+    /// in the answer, or held) has an ML-DSA-65 key that does not hash to the
+    /// PQC commitment the dialler held before dialling. Refused before the
+    /// carried record is admitted or the transit pair is used.
+    #[error("route answer's key record does not match the pre-held PQC commitment: {0}")]
+    PqcCommitmentMismatch(String),
     /// The row did not pass persist's authenticated admission or the
     /// `CLM-seal-authenticated-pair` checks.
     #[error("route answer's row did not authenticate a pair: {0}")]
@@ -264,6 +270,7 @@ impl RouteFetchError {
             Self::Unavailable(_) => o::LINK_SEAL_REFUSED_ROUTE_UNAVAILABLE,
             Self::Answer(_) | Self::AnswerNotARow => o::LINK_SEAL_REFUSED_ROUTE_ANSWER,
             Self::SignedByAnotherKey { .. } => o::LINK_SEAL_REFUSED_ROUTE_ANSWER_SIGNER,
+            Self::PqcCommitmentMismatch(_) => o::LINK_SEAL_REFUSED_ROUTE_ANSWER_PQC_COMMITMENT,
             Self::KeyRecordRefused(_) | Self::Unverified(_) => {
                 o::LINK_SEAL_REFUSED_ROUTE_ANSWER_UNVERIFIED
             }

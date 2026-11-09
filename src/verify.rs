@@ -231,6 +231,14 @@ pub trait RootingDirectory: Send + Sync + 'static {
         None
     }
 
+    /// CC 5.3.3.5 item 6 (CIRISEdge#964) — the ML-DSA-65 half of `key_id`'s
+    /// registered record, standard base64, read to check a held record
+    /// against a pre-held PQC commitment. Default `None` (no directory ⇒ no
+    /// record, which a held commitment refuses).
+    async fn registered_pubkey_ml_dsa_65_base64(&self, _key_id: &str) -> Option<String> {
+        None
+    }
+
     /// CIRISEdge#888 — `key_id`'s registered `identity_type` (persist
     /// `federation_keys`), read only to break a tie between keys bound to one
     /// transport identity: a `node` key is the transport identity, an actor
@@ -664,6 +672,9 @@ pub enum SelfSignedPairRefusal {
     Separation,
     /// Two live self-signed rows carry different pairs.
     Ambiguous,
+    /// CC 5.3.3.5 item 6 (CIRISEdge#964): a PQC commitment is held for the
+    /// key and its registered ML-DSA-65 key does not hash to it.
+    PqcCommitmentMismatch,
 }
 
 impl SelfSignedPairRefusal {
@@ -677,6 +688,7 @@ impl SelfSignedPairRefusal {
             Self::SignatureInvalid => "self_signed_row_signature_invalid",
             Self::Separation => "self_signed_row_pair_not_separated",
             Self::Ambiguous => "self_signed_rows_disagree",
+            Self::PqcCommitmentMismatch => "self_signed_row_pqc_commitment_mismatch",
         }
     }
 }
@@ -713,6 +725,7 @@ pub async fn authenticated_self_signed_transit_pair<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    use crate::pqc_anchor;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use ciris_persist::federation::self_at_login::{check_transit_kex_pair, TransitKexOtherKeys};
     let rows = FederationDirectory::list_signed_transport_destinations_for(dir, key_id)
@@ -726,6 +739,7 @@ where
         );
     };
     let mut found: Option<ciris_persist::federation::self_at_login::TransitKexPair> = None;
+    let mut anchored = false;
     for row in rows.iter().filter(|r| {
         r.transport_destination.transport_kind == "reticulum"
             && r.transport_destination.retired_at.is_none()
@@ -748,6 +762,14 @@ where
             refuse(SelfSignedPairRefusal::FingerprintMismatch);
             continue;
         }
+        // CC 5.3.3.5 item 6 (CIRISEdge#964) — a held commitment binds the
+        // record's ML-DSA-65 half; a record that misses it supplies no pair.
+        let anchor = pqc_anchor::check_ml_dsa_65(key_id, record.pubkey_ml_dsa_65_base64.as_deref());
+        if matches!(anchor, pqc_anchor::Anchor::Mismatch(_)) {
+            refuse(SelfSignedPairRefusal::PqcCommitmentMismatch);
+            continue;
+        }
+        anchored |= anchor == pqc_anchor::Anchor::Matched;
         if ciris_persist::federation::admission::verify_signed_transport_destination(
             dir.as_dyn_directory(),
             row,
@@ -798,6 +820,11 @@ where
             }
         }
     }
+    if anchored && found.is_some() {
+        // The record matched and a pair is used: a held record is now the
+        // anchor (5.3.3.5 item 6 (2)).
+        crate::pqc_anchor::clear(key_id);
+    }
     Ok(found)
 }
 
@@ -846,6 +873,14 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             .ok()
             .flatten()
             .map(|record| record.pubkey_ed25519_base64)
+    }
+
+    async fn registered_pubkey_ml_dsa_65_base64(&self, key_id: &str) -> Option<String> {
+        FederationDirectory::lookup_public_key(self, key_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record.pubkey_ml_dsa_65_base64)
     }
 
     async fn registered_identity_type(&self, key_id: &str) -> Option<String> {

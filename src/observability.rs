@@ -1180,6 +1180,11 @@ pub const LINK_SEAL_REFUSED_ROUTE_ANSWER_SIGNER: &str = "link_seal_refused_route
 /// authenticated admission or the `CLM-seal-authenticated-pair` checks.
 pub const LINK_SEAL_REFUSED_ROUTE_ANSWER_UNVERIFIED: &str =
     "link_seal_refused_route_answer_unverified";
+/// Refused at the dialler (CC 5.3.3.5 item 6, CIRISEdge#964): the dialled
+/// key's record has an ML-DSA-65 key that does not hash to the PQC commitment
+/// held before dialling; the record is not admitted, the pair is not used.
+pub const LINK_SEAL_REFUSED_ROUTE_ANSWER_PQC_COMMITMENT: &str =
+    "link_seal_refused_route_answer_pqc_commitment";
 /// Refused at the dialler: no answer within the route-fetch budget.
 pub const LINK_SEAL_REFUSED_ROUTE_TIMEOUT: &str = "link_seal_refused_route_timeout";
 /// Refused at the dialler: the link closed before an answer (the responder
@@ -1729,6 +1734,7 @@ pub const LINK_SEAL_LABELS: &[&str] = &[
     LINK_SEAL_REFUSED_ROUTE_ANSWER,
     LINK_SEAL_REFUSED_ROUTE_ANSWER_SIGNER,
     LINK_SEAL_REFUSED_ROUTE_ANSWER_UNVERIFIED,
+    LINK_SEAL_REFUSED_ROUTE_ANSWER_PQC_COMMITMENT,
     LINK_SEAL_REFUSED_ROUTE_TIMEOUT,
     LINK_SEAL_REFUSED_ROUTE_CLOSED,
     LINK_SEAL_REFUSED_ROUTE_SEND,

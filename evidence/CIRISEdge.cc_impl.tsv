@@ -37,6 +37,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 5.3.3.5	CLM-transport-edge	CIRISEdge	src/transport/av_transit_handshake.rs#respond	ciris-edge@v44.1.0
 5.3.3.5	CLM-transport-edge	CIRISEdge	src/transport/reticulum.rs#DialCtx::dial_transit_pair	ciris-edge@v44.1.0
 5.3.3.5	CLM-pre-seal-route-fetch	CIRISEdge	src/transport/reticulum.rs#DialCtx::fetch_route_over_link	ciris-edge@v44.1.0
+5.3.3.5	CLM-pre-seal-route-fetch	CIRISEdge	src/transport/reticulum.rs#verify_route_answer	ciris-edge@v44.1.0
 5.3.3.5	CLM-pre-seal-route-fetch	CIRISEdge	src/transport/reticulum.rs#answer_route_request	ciris-edge@v44.1.0
 5.4.3	CLM-link-shaping	CIRISEdge	src/transport/link_shaping.rs#agree	ciris-edge@v44.1.0
 5.4.3	CLM-link-shaping	CIRISEdge	src/transport/link_shaping.rs#LinkShaper::next_emission	ciris-edge@v44.1.0

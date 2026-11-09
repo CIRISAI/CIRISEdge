@@ -127,6 +127,19 @@ impl PeerTransitResolver {
         key_id: &str,
     ) -> Result<Option<(TransitKexPair, PairSource)>, String> {
         if let Some(pair) = self.resolve(dir, key_id).await? {
+            // CC 5.3.3.5 item 6 (CIRISEdge#964) — a PQC commitment held for
+            // this key binds every record a pair is read against, the Rooted
+            // one included: a record that misses it supplies no pair here,
+            // and the dial falls to the route fetch, which refuses it by
+            // name. No commitment held: unchanged.
+            if crate::pqc_anchor::pending(key_id).is_some() {
+                let held = dir.registered_pubkey_ml_dsa_65_base64(key_id).await;
+                match crate::pqc_anchor::check_ml_dsa_65(key_id, held.as_deref()) {
+                    crate::pqc_anchor::Anchor::Mismatch(_) => return Ok(None),
+                    crate::pqc_anchor::Anchor::Matched => crate::pqc_anchor::clear(key_id),
+                    crate::pqc_anchor::Anchor::None => {}
+                }
+            }
             return Ok(Some((pair, PairSource::Rooted)));
         }
         let pair = dir.self_signed_transit_pair_for(key_id).await?;

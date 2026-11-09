@@ -360,6 +360,21 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
     TestEvidence {
         cc: "5.3.3.5",
         clm: "CLM-pre-seal-route-fetch",
+        property: "item 6 (a22e42e), additive half (CIRISEdge#964): a dialler holding a PQC commitment for the dialled key (2.6.8: sha256 of the raw ML-DSA-65 key, 64 lowercase hex, rejected never repaired, taken at the contact call) checks the key record the answer carries, or the one it holds, with verify's verify_pulled_ml_dsa_65_pubkey before the record is admitted or any pair is used; a mismatch is refused by name and keys nothing; a match keys normally; no commitment keys as before (the fail-closed half waits for the v62 handshake, 2.6.1.8)",
+        impl_anchor: "src/transport/reticulum.rs#verify_route_answer",
+        witness: &[
+            "tests/link_seal_e1.rs#a_fetched_key_record_that_misses_the_pqc_commitment_is_refused_964",
+            "tests/link_seal_e1.rs#a_fetched_key_record_matching_the_pqc_commitment_keys_964",
+            "tests/link_seal_e1.rs#a_code_without_a_pqc_commitment_keys_as_today_964",
+            "tests/link_seal_e1.rs#a_held_key_record_that_misses_the_pqc_commitment_is_refused_964",
+            "tests/link_seal_e1.rs#a_held_route_pair_whose_record_misses_the_pqc_commitment_is_not_used_964",
+            "src/contact.rs#a_malformed_pqc_commitment_is_rejected_at_the_api_964",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.3.3.5",
+        clm: "CLM-pre-seal-route-fetch",
         property: "the responder answers a route request only for its own key and only with its own live hybrid-signed route row (the one unsealed frame set besides the handshake); it serves nothing and buffers nothing until the seal completes",
         impl_anchor: "src/transport/reticulum.rs#answer_route_request",
         witness: &[
