@@ -3100,6 +3100,7 @@ fn onion_relay_on(
 /// Mutation: break `frame_fragment::Reassembler` (e.g. drop a fragment's last
 /// byte on reassembly) → no hop opens and the exit stays empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one story: the link, the deal, three crossings, the wire
 async fn an_onion_packet_crosses_a_1400_byte_shaped_link_in_fragments_and_arrives_intact() {
     use ciris_edge::onion::packet::PACKET;
     use ciris_edge::onion::tokens;
@@ -3231,6 +3232,13 @@ async fn an_onion_packet_crosses_a_1400_byte_shaped_link_in_fragments_and_arrive
 /// `FM_SAMPLES` contacts. Prints p50/p90.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measurement, not a gate"]
+#[allow(
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // a measurement: percentiles over a handful of seconds
 async fn measure_contact_round_trips_over_a_real_shaped_pair() {
     let env = |k: &str, d: usize| std::env::var(k).ok().map_or(d, |v| v.parse().expect(k));
     let (cap, rate, k, samples, req, resp) = (

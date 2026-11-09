@@ -9480,7 +9480,7 @@ impl ReticulumTransport {
     async fn send_channel_marked(
         &self,
         link_id: LinkId,
-        lane: crate::transport::link_shaping::Lane,
+        shaper_lane: crate::transport::link_shaping::Lane,
         fragments: &[Vec<u8>],
     ) -> FragmentSendOutcome {
         let _busy = OutboundShipGuard::new(&self.outbound_ship_active, link_id);
@@ -9504,7 +9504,7 @@ impl ReticulumTransport {
                     &self.seals,
                     &self.shapers,
                     &link_id,
-                    lane,
+                    shaper_lane,
                     fragments,
                 )
                 .await
@@ -9519,7 +9519,7 @@ impl ReticulumTransport {
                     &self.seals,
                     &self.shapers,
                     &link_id,
-                    lane,
+                    shaper_lane,
                     &fragments[..landed],
                 )
                 .await;

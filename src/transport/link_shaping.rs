@@ -4713,7 +4713,7 @@ mod tests {
 
     /// One signed attestation row as the replication plane carries it, with
     /// `envelope` as its `attestation_envelope`.
-    fn attestation_row(attestation_type: &str, envelope: serde_json::Value) -> Vec<u8> {
+    fn attestation_row(attestation_type: &str, envelope: &serde_json::Value) -> Vec<u8> {
         serde_json::json!({
             "attestation": {
                 "attestation_id": "a-1",
@@ -4770,19 +4770,19 @@ mod tests {
         }
         let consent = attestation_row(
             "scores",
-            serde_json::json!({
+            &serde_json::json!({
                 "dimension": ciris_persist::federation::consent_peer_set::DIMENSION,
             }),
         );
         let binding = attestation_row(
             ciris_persist::federation::types::attestation_type::DELEGATES_TO,
-            serde_json::json!({
+            &serde_json::json!({
                 "dimension": ciris_persist::federation::types::owner_binding::DIMENSION,
             }),
         );
         let chat = attestation_row(
             "scores",
-            serde_json::json!({"dimension": "chat:message:v1"}),
+            &serde_json::json!({"dimension": "chat:message:v1"}),
         );
         for (kind, rows) in [
             (K::Key, vec![b"{}".to_vec()]),
@@ -4915,14 +4915,9 @@ mod tests {
     fn spawn_emitter(s: &Arc<LinkShaper>) -> tokio::task::JoinHandle<()> {
         let s = Arc::clone(s);
         tokio::spawn(async move {
-            loop {
-                match s.next_emission().await {
-                    Emission::Frame { real, tickets, .. } => {
-                        if real {
-                            s.note_sent(tickets);
-                        }
-                    }
-                    Emission::Stopped => break,
+            while let Emission::Frame { real, tickets, .. } = s.next_emission().await {
+                if real {
+                    s.note_sent(tickets);
                 }
             }
         })
@@ -4948,13 +4943,13 @@ mod tests {
     async fn a_contact_row_leaves_within_a_gap_behind_a_sync_backlog() {
         use crate::replication::protocol::EnvelopeKind as K;
         use crate::replication::wire_frame::{wrap_v3, RoundSide};
-        let o = offer(BudgetClass::Server, 16_272, 7_000, 0.5, 600);
-        let a = agree(&o, &o).expect("agreed");
-        assert_eq!(a.frame_bytes, SHAPED_FRAME_BYTES);
+        let quoted = offer(BudgetClass::Server, 16_272, 7_000, 0.5, 600);
+        let agreed = agree(&quoted, &quoted).expect("agreed");
+        assert_eq!(agreed.frame_bytes, SHAPED_FRAME_BYTES);
         let s = Arc::new(LinkShaper::new_seeded(
             [6u8; 16],
-            a,
-            queue_bytes_for(&a),
+            agreed,
+            queue_bytes_for(&agreed),
             [21u8; 32],
         ));
         let emit = spawn_emitter(&s);
@@ -4963,7 +4958,7 @@ mod tests {
                 K::Attestation,
                 vec![attestation_row(
                     "scores",
-                    serde_json::json!({"dimension": "chat:message:v1", "pad": "x".repeat(700)}),
+                    &serde_json::json!({"dimension": "chat:message:v1", "pad": "x".repeat(700)}),
                 )],
             ),
             RoundSide::Responder,
@@ -5022,20 +5017,23 @@ mod tests {
     /// `ROW_LEAVE_MAX_GAPS`, 64 s here) → every row times out.
     #[tokio::test(start_paused = true)]
     async fn a_64_kib_row_converges_on_phone_cellular_at_the_shaped_frame() {
-        let o = offer(BudgetClass::PhoneCellular, 16_272, 350, 0.5, 3600);
-        let a = agree(&o, &o).expect("agreed");
-        assert_eq!(a.frame_bytes, SHAPED_FRAME_BYTES);
+        let quoted = offer(BudgetClass::PhoneCellular, 16_272, 350, 0.5, 3600);
+        let agreed = agree(&quoted, &quoted).expect("agreed");
+        assert_eq!(agreed.frame_bytes, SHAPED_FRAME_BYTES);
         let row = vec![7u8; SHAPED_ROW_MAX_BYTES];
         for seed in 0..10u8 {
             let s = Arc::new(LinkShaper::new_seeded(
                 [7u8; 16],
-                a,
-                queue_bytes_for(&a),
+                agreed,
+                queue_bytes_for(&agreed),
                 [seed; 32],
             ));
             let emit = spawn_emitter(&s);
             let f = cut(&s, &row);
-            assert_eq!(f.len(), row_frames(SHAPED_ROW_MAX_BYTES, a.frame_bytes));
+            assert_eq!(
+                f.len(),
+                row_frames(SHAPED_ROW_MAX_BYTES, agreed.frame_bytes)
+            );
             assert_eq!(f.len(), 48);
             let n = u64::try_from(f.len()).unwrap();
             let last = s.enqueue(Lane::Sync, f).expect("a row fits the lane");

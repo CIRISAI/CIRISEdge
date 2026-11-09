@@ -22,6 +22,17 @@
 //! * `fm3_contact_latency` — K request/response exchanges over a shaped pair
 //!   (direct) and over two shaped hops (relayed through a canonical).
 #![cfg(feature = "transport-reticulum")]
+// A measurement file, not a gate: its statistics cast counts and seconds
+// between integers and floats far below 2^52, and its sweeps are long.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::multiple_bound_locations,
+    clippy::cloned_instead_of_copied,
+    clippy::too_many_lines
+)]
 
 use std::collections::VecDeque;
 use std::sync::Arc;
