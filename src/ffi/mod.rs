@@ -15,6 +15,11 @@
 #[cfg(feature = "_pyffi")]
 pub mod pyo3;
 
+// CIRISEdge#960 — the outbound queue through persist's
+// `outbound_queue_ops_capsule` (dispatched inside persist's `.so`).
+#[cfg(feature = "_pyffi")]
+pub mod outbound_ops;
+
 // v0.13.0 (CIRISEdge#36 GO) — UniFFI bindings surface (#25 transport
 // mgmt + #26 peer mgmt + #31 identity reads + #28 snapshot reads).
 // `uniffi_types` declares the Rust type definitions the UDL references;

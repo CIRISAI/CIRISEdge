@@ -5665,6 +5665,46 @@ fn extract_canonical_bootstrap_peer(
     })
 }
 
+/// CIRISEdge#960 — extract persist's `outbound_queue_ops_capsule` (tag
+/// `ciris_persist::outbound_queue_ops_v1`, payload `*mut OutboundQueueHandle
+/// as usize`, the same shape as `directory_ops_capsule`) and wrap it in the
+/// ABI-checked [`crate::ffi::outbound_ops::OpsOutboundQueue`]. Edge holds a
+/// bitwise reference copy of `{ data, vtable }`; the PyCapsule destructor
+/// persist set owns `vtable.drop`.
+fn extract_outbound_queue_ops(
+    engine: &Bound<'_, PyAny>,
+    executor: &Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+) -> PyResult<Arc<dyn OutboundHandle>> {
+    use ciris_persist::ffi::outbound_queue_capsule::OutboundQueueHandle;
+    if !engine
+        .hasattr("outbound_queue_ops_capsule")
+        .unwrap_or(false)
+    {
+        return Err(PyRuntimeError::new_err(
+            "ciris_persist.Engine does not expose outbound_queue_ops_capsule; \
+             edge needs ciris-persist>=61.1.0,<61.2 (CIRISEdge#960)",
+        ));
+    }
+    #[allow(unsafe_code)]
+    let handle: OutboundQueueHandle = unsafe {
+        extract_capsule::<usize, _, _>(engine, "outbound_queue_ops_capsule", |raw_usize| {
+            let ptr = *raw_usize as *const OutboundQueueHandle;
+            // SAFETY: `raw_usize` is the `Box::into_raw`'d
+            // `*mut OutboundQueueHandle` persist's
+            // `outbound_queue_capsule::build_capsule_with_destructor` stored;
+            // the Box lives as long as the PyCapsule, which the engine roots.
+            let h = &*ptr;
+            OutboundQueueHandle {
+                data: h.data,
+                vtable: h.vtable,
+            }
+        })?
+    };
+    let queue = crate::ffi::outbound_ops::OpsOutboundQueue::new(handle, Arc::clone(executor))
+        .map_err(PyRuntimeError::new_err)?;
+    Ok(Arc::new(queue))
+}
+
 /// The verifier policy a host may pass. CIRISEdge#957 / CIRISPersist#1233
 /// (CC 5.3.2.4.3.1): hybrid-required is always on and never an operator
 /// toggle, so `"strict"` is the only accepted value. Every other string,
@@ -7184,13 +7224,17 @@ pub fn init_edge_runtime(
                 return Err(e);
             }
         };
-    // One arm under `pyo3-sqlite` (no Postgres backend), two under `pyo3`.
-    #[allow(clippy::infallible_destructuring_match)]
-    let queue: Arc<dyn OutboundHandle> = match queue_dispatch {
-        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
-        BackendDispatch::Postgres(b) => b,
-        BackendDispatch::Sqlite(b) => b,
-    };
+    // CIRISEdge#960 — the outbound queue rides persist's
+    // `outbound_queue_ops_capsule` (a C-ABI vtable, ops dispatched inside
+    // persist's `.so`), never the concrete backend out of `queue_dispatch`:
+    // `enqueue_outbound` / `claim_pending_outbound` and every sweep are
+    // writes, and on the concrete backend they ran edge's compiled copy of
+    // persist's store code against objects the wheel laid out
+    // (CIRISPersist#1231). `queue_dispatch` still serves the verify / rooting
+    // / blackhole / detection views above, which have no persist ops
+    // capsule yet (see the #960 note on those arms).
+    let queue: Arc<dyn OutboundHandle> = extract_outbound_queue_ops(&engine, &executor)?;
+    drop(queue_dispatch);
 
     // ── Step 3: keyring signer parts → edge's hot-path LocalSigner.
     //
