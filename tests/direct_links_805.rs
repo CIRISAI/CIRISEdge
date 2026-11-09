@@ -58,8 +58,8 @@ use ciris_edge::transport::realtime_av::{
     seal_av_inner, ChunkLayer, ChunkSeq, Epoch, EpochDek, InnerSealed, StreamId, CODEC_OPAQUE,
 };
 use ciris_edge::transport::realtime_av_dispatcher::{
-    AvDispatcher, AvDispatcherConfig, AvInboundLink, AvLinkReceiver as _, AvLinkSender as _,
-    AvRole, AvSubscriberLink,
+    AvDispatcher, AvDispatcherConfig, AvDispatcherError, AvInboundLink, AvLinkReceiver as _,
+    AvLinkSender, AvRole, AvSubscriberLink,
 };
 use ciris_edge::transport::realtime_av_mls::{mint_joiner_key_material, Member};
 use ciris_edge::transport::realtime_av_runtime::{AvPublisher, AvRelay, AvSubscriber, LegStreams};
@@ -215,6 +215,26 @@ where
             return false;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// One frame on an A/V leg, waiting out backpressure. A fresh leg's Channel
+/// is in its first round trip: the opener's transit handshake is its first
+/// message, the window starts at 2 and sends are paced, so a frame right
+/// behind it can be refused `Congested` (leviculum's `Busy` or `PacingDelay`)
+/// until acks come back. On CI darwin (the v44.0.0 tag run) they came after
+/// the test's next send. `Congested` is backpressure, not a failure
+/// (`AvLinkSender::send`); the call path waits it out the same way
+/// (`av_call::send_patiently`).
+async fn send_patiently(sender: &impl AvLinkSender, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match sender.send(bytes).await {
+            Err(AvDispatcherError::Congested) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            other => return other,
+        }
     }
 }
 
@@ -1147,7 +1167,9 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
     let arrival = accepted.arrival;
 
     // Frames cross the A/V leg, then still cross with T gone.
-    link.sender.send(b"direct-805-1").await.expect("send 1");
+    send_patiently(&link.sender, b"direct-805-1")
+        .await
+        .expect("send 1");
     let got = tokio::time::timeout(Duration::from_secs(10), arrival.inbound.recv())
         .await
         .expect("frame 1 in time")
@@ -1156,7 +1178,9 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
 
     p.t.stop().await.expect("stop T");
     tokio::time::sleep(Duration::from_millis(500)).await;
-    link.sender.send(b"direct-805-2").await.expect("send 2");
+    send_patiently(&link.sender, b"direct-805-2")
+        .await
+        .expect("send 2");
     let got = tokio::time::timeout(Duration::from_secs(10), arrival.inbound.recv())
         .await
         .expect("frame 2 in time, T gone")
