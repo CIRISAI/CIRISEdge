@@ -47,6 +47,11 @@ proposed a direct link a moment before the other side's call installed its group
 policy. It then waited out leviculum's 60 s proposal cooldown with no direct leg. The request from
 a known room peer is now held for up to 4 s while the call comes up (`direct_link_request_held`).
 
+RUSTSEC-2026-0459 (CVE-2026-119375; bundled SQLite before 3.54.0, a crafted `-wal` beside a database
+file can return uninitialized page-cache memory) is ignored in `deny.toml` with its justification.
+It is local only, and edge opens only the node's own store. The fix, `rusqlite` 0.41, is pinned
+through persist, verify and refinery (tracked: CIRISEdge#966).
+
 Test instruments on macOS:
 - the establish-budget witness uses a spent budget, not a 1 ms race;
 - the suspend suite reads the kernel's TCP table there and fails loudly when it cannot (it had
