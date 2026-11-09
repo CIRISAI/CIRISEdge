@@ -641,8 +641,8 @@ impl PyEdge {
         device_kind,
         unmetered=true,
         charging=true,
-        shaping_opt_in=false,
-        shaping_opt_in_cellular=false,
+        shaping_opt_in=None,
+        shaping_opt_in_cellular=None,
         client_only=false,
         relay_override=None
     ))]
@@ -653,15 +653,19 @@ impl PyEdge {
         device_kind: &str,
         unmetered: bool,
         charging: bool,
-        shaping_opt_in: bool,
-        shaping_opt_in_cellular: bool,
+        shaping_opt_in: Option<bool>,
+        shaping_opt_in_cellular: Option<bool>,
         client_only: bool,
         relay_override: Option<bool>,
     ) -> PyResult<Option<usize>> {
         use crate::transport::link_shaping::{DeviceKind, DeviceState};
         let kind = DeviceKind::parse(device_kind)
             .ok_or_else(|| PyValueError::new_err(format!("bad_device_kind: {device_kind:?}")))?;
-        let device = DeviceState {
+        // An opt-in the call leaves out is the person's standing choice, kept
+        // (tracked: CIRISEdge#969).
+        let current = self.inner.reticulum_transport().map(|t| t.onion().device());
+        let device = DeviceState::reported(
+            current.as_ref(),
             kind,
             unmetered,
             charging,
@@ -669,7 +673,7 @@ impl PyEdge {
             shaping_opt_in_cellular,
             client_only,
             relay_override,
-        };
+        );
         let edge = Arc::clone(&self.inner);
         py.detach(|| self.block_on_transport(async move { edge.set_device_state(device).await }))
     }
@@ -6479,6 +6483,9 @@ fn extract_local_signer(
 ///                                       # default; advisory at edge
 ///     trust_recursion_depth=0,          # Override Server's depth=1
 ///                                       # default to strict
+///     shaping_class="home",
+///     shaping_opt_in=False,         # CC 5.4.3: off shapes layer links
+///                                   # only; True shapes every link
 /// )
 /// ```
 ///
@@ -6563,6 +6570,12 @@ enum LocalInstanceRole {
     direct_link_serve_port = None,
     direct_link_accept = "room_peers",
     direct_link_proposing = "on",
+    // The person's opt-in to shaping every identity link at a `home` /
+    // `phone-wifi` class, and at `phone-cellular` (FLEET_DEFAULTS: on for
+    // `server` only, opt-in elsewhere). Off: such a node shapes layer links
+    // only, whatever `shaping_class` names.
+    shaping_opt_in = false,
+    shaping_opt_in_cellular = false,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -6793,6 +6806,9 @@ pub fn init_edge_runtime(
     direct_link_accept: &str,
     // v44 — `on` (default) or `off`: whether this node proposes direct links.
     direct_link_proposing: &str,
+    // CC 5.4.3 — the person's shaping opt-ins (tracked: CIRISEdge#969).
+    shaping_opt_in: bool,
+    shaping_opt_in_cellular: bool,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -7801,14 +7817,22 @@ pub fn init_edge_runtime(
     ));
     // CC 5.4.3 — link shaping policy.
     if let Some(class) = shaping_class.as_deref() {
-        use crate::transport::link_shaping::{BudgetClass, ShapingPolicy};
+        use crate::transport::link_shaping::BudgetClass;
         let class = BudgetClass::parse(class).ok_or_else(|| {
             PyValueError::new_err(format!(
                 "init_edge_runtime: shaping_class {class:?} is not one of server, home, \
                  phone-wifi, phone-cellular, off"
             ))
         })?;
-        let mut policy = ShapingPolicy::for_class(class);
+        // The class names the device (CC 5.4.6 item 1 relay policy) and the
+        // opt-ins are the person's: `home` / `phone-*` without its opt-in
+        // shapes layer links only, the fleet default (tracked:
+        // CIRISEdge#969).
+        let (device, mut policy) = crate::transport::link_shaping::DeviceState::for_host_class(
+            class,
+            shaping_opt_in,
+            shaping_opt_in_cellular,
+        );
         if let Some(rho) = shaping_rho {
             if !(0.01..=1.0).contains(&rho) {
                 return Err(PyValueError::new_err(
@@ -7824,31 +7848,21 @@ pub fn init_edge_runtime(
             policy.node_cap_bytes_per_s = cap;
         }
         policy.require_shaped_links = require_shaped_links;
-        // The class names the device too (CC 5.4.6 item 1 relay policy).
-        {
-            use crate::transport::link_shaping::{DeviceKind, DeviceState};
-            transport_config.device = match class {
-                BudgetClass::Server | BudgetClass::Seat => DeviceState::of(DeviceKind::Server),
-                BudgetClass::Home => DeviceState::of(DeviceKind::Home),
-                BudgetClass::PhoneWifi => DeviceState::of(DeviceKind::Phone),
-                BudgetClass::PhoneCellular => {
-                    DeviceState::of(DeviceKind::Phone).with_network(false, true)
-                }
-                BudgetClass::Off | BudgetClass::HomeElsewhere => {
-                    DeviceState::of(DeviceKind::platform_default())
-                }
-            };
-        }
+        transport_config.device = device;
         transport_config = transport_config.with_shaping(policy);
     } else {
         // CC 5.4.3 rc16 fleet default (Eric, 2026-11-02, final): shaping is
         // ON by default for `server` only, which a server host names by
-        // passing `shaping_class="server"`. Naming any other class is the
-        // person's opt-in for that class (cellular included). With no class
-        // the node shapes only its onion layer links (none unless its tier
-        // runs), at the platform's class.
+        // passing `shaping_class="server"`. Every other class shapes every
+        // identity link only on the person's opt-in (`shaping_opt_in`,
+        // `shaping_opt_in_cellular`), never by being named. With no class the
+        // node is the platform's device, at its fleet default.
         use crate::transport::link_shaping::{DeviceKind, DeviceState, ShapingPolicy};
-        let device = DeviceState::of(DeviceKind::platform_default());
+        let device = DeviceState {
+            shaping_opt_in,
+            shaping_opt_in_cellular,
+            ..DeviceState::of(DeviceKind::platform_default())
+        };
         let mut policy = ShapingPolicy::for_device(&device);
         policy.require_shaped_links = require_shaped_links;
         transport_config.device = device;
@@ -12649,6 +12663,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )?;
             Ok(edge.signer_key_id())
         });
@@ -12781,6 +12797,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -12952,6 +12970,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )?;
             Ok(())
         });
@@ -13076,6 +13096,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -13360,6 +13382,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )?;
             Ok(edge.signer_key_id())
         });
@@ -13530,6 +13554,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             );
             // Cleanup: drop OUR engine from the singleton so the next real-engine
             // sibling test constructs cleanly (one persist engine per process).
@@ -13670,6 +13696,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )?;
             Ok(edge.signer_key_id())
         });

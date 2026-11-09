@@ -2,6 +2,22 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## Unreleased
+
+### Consumer notes
+
+- **Naming a shaping class is no longer the shaping opt-in (CIRISEdge#969, CC 5.4.3).**
+  `init_edge_runtime(shaping_class="home" | "phone-wifi" | "phone-cellular")` used to shape every
+  identity link while seeding the device with no opt-in, so the policy and the device disagreed.
+  The class now names the device and the policy is its fleet default: layer links only, unless the
+  new kwargs `shaping_opt_in` (`home`, `phone-wifi`) or `shaping_opt_in_cellular`
+  (`phone-cellular`) are `True`. `"server"` is unchanged (every identity link). No current PyO3
+  host passes these classes; one that relied on the class alone must add `shaping_opt_in=True`.
+- **`shaping_set_device_state` keeps an opt-in the call leaves out (CIRISEdge#969).** Its
+  `shaping_opt_in` / `shaping_opt_in_cellular` now default to `None` (keep the current choice);
+  pass `True` or `False` to change one. A call that moved only the class or the network used to
+  clear the person's opt-in. The UniFFI record states both opt-ins explicitly and is unchanged.
+
 ## 44.1.2 — 2026-11-09
 
 **`FountainHoldingClaim` is no longer a wire kind** (CIRISEdge#959, CC wire vocabulary v1.0.3, rc17

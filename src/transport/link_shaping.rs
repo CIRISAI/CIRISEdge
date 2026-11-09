@@ -881,6 +881,76 @@ impl DeviceState {
     }
 }
 
+impl DeviceState {
+    /// **The device a host names by its budget class at init**, seeded with
+    /// the person's opt-ins, and the policy it runs: the fleet default for
+    /// that device ([`ShapingPolicy::for_device`]). Naming `home`,
+    /// `phone-wifi` or `phone-cellular` names the device, not a choice to
+    /// shape every link: without the matching opt-in such a node shapes its
+    /// layer links only ([`FLEET_DEFAULTS`]: on for `server` only, opt-in
+    /// elsewhere). `server`, `seat`, `off` and `home-elsewhere` keep their
+    /// class policy, which no opt-in widens.
+    #[must_use]
+    pub fn for_host_class(
+        class: BudgetClass,
+        shaping_opt_in: bool,
+        shaping_opt_in_cellular: bool,
+    ) -> (Self, ShapingPolicy) {
+        let seeded = |d: Self| Self {
+            shaping_opt_in,
+            shaping_opt_in_cellular,
+            ..d
+        };
+        match class {
+            BudgetClass::Home | BudgetClass::PhoneWifi | BudgetClass::PhoneCellular => {
+                let device = seeded(match class {
+                    BudgetClass::Home => Self::of(DeviceKind::Home),
+                    BudgetClass::PhoneWifi => Self::of(DeviceKind::Phone),
+                    _ => Self::of(DeviceKind::Phone).with_network(false, true),
+                });
+                (device, ShapingPolicy::for_device(&device))
+            }
+            BudgetClass::Server | BudgetClass::Seat => (
+                seeded(Self::of(DeviceKind::Server)),
+                ShapingPolicy::for_class(class),
+            ),
+            BudgetClass::Off | BudgetClass::HomeElsewhere => (
+                seeded(Self::of(DeviceKind::platform_default())),
+                ShapingPolicy::for_class(class),
+            ),
+        }
+    }
+
+    /// **The device a host reports at runtime** (`shaping_set_device_state`):
+    /// the facts it names, and each opt-in it names. An opt-in it leaves out
+    /// (`None`) is the person's standing choice, kept from `current`; a
+    /// report that only moves the class or the network never clears it.
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+    #[must_use]
+    pub fn reported(
+        current: Option<&Self>,
+        kind: DeviceKind,
+        unmetered: bool,
+        charging: bool,
+        shaping_opt_in: Option<bool>,
+        shaping_opt_in_cellular: Option<bool>,
+        client_only: bool,
+        relay_override: Option<bool>,
+    ) -> Self {
+        Self {
+            kind,
+            unmetered,
+            charging,
+            shaping_opt_in: shaping_opt_in
+                .unwrap_or_else(|| current.is_some_and(|c| c.shaping_opt_in)),
+            shaping_opt_in_cellular: shaping_opt_in_cellular
+                .unwrap_or_else(|| current.is_some_and(|c| c.shaping_opt_in_cellular)),
+            client_only,
+            relay_override,
+        }
+    }
+}
+
 impl Default for ShapingPolicy {
     fn default() -> Self {
         Self::for_class(BudgetClass::Off)
@@ -3596,6 +3666,91 @@ impl LinkShapers {
     #[must_use]
     pub fn shaped_links(&self) -> Vec<[u8; 16]> {
         self.links().keys().copied().collect()
+    }
+}
+
+#[cfg(test)]
+mod host_seeding_tests {
+    //! The PyO3 init and `shaping_set_device_state` seed the device from the
+    //! person's opt-ins, never from the class alone.
+    use super::*;
+
+    #[test]
+    fn a_home_class_without_its_opt_in_shapes_layer_links_only() {
+        for class in [
+            BudgetClass::Home,
+            BudgetClass::PhoneWifi,
+            BudgetClass::PhoneCellular,
+        ] {
+            let (device, policy) = DeviceState::for_host_class(class, false, false);
+            assert_eq!(policy.scope, ShapingScope::LayerLinksOnly, "{class:?}");
+            assert_eq!(policy.class, class);
+            assert!(!device.opted_in_here());
+        }
+    }
+
+    #[test]
+    fn a_home_class_with_its_opt_in_shapes_every_identity_link() {
+        let (d, p) = DeviceState::for_host_class(BudgetClass::Home, true, false);
+        assert_eq!(p.scope, ShapingScope::AllIdentityLinks);
+        assert!(d.shaping_opt_in);
+        // A phone on Wi-Fi asks the Wi-Fi opt-in; on cellular, its own.
+        let (_, p) = DeviceState::for_host_class(BudgetClass::PhoneWifi, true, false);
+        assert_eq!(p.scope, ShapingScope::AllIdentityLinks);
+        let (_, p) = DeviceState::for_host_class(BudgetClass::PhoneCellular, true, false);
+        assert_eq!(
+            p.scope,
+            ShapingScope::LayerLinksOnly,
+            "Wi-Fi's opt-in is not cellular's"
+        );
+        let (d, p) = DeviceState::for_host_class(BudgetClass::PhoneCellular, false, true);
+        assert_eq!(p.scope, ShapingScope::AllIdentityLinks);
+        assert_eq!(d.budget_class(), BudgetClass::PhoneCellular);
+    }
+
+    #[test]
+    fn a_server_class_is_on_and_off_stays_off() {
+        let (d, p) = DeviceState::for_host_class(BudgetClass::Server, false, false);
+        assert_eq!(p.scope, ShapingScope::AllIdentityLinks);
+        assert_eq!(d.kind, DeviceKind::Server);
+        let (_, p) = DeviceState::for_host_class(BudgetClass::Off, true, true);
+        assert!(!p.enabled());
+    }
+
+    #[test]
+    fn a_report_that_changes_only_the_class_keeps_the_opt_ins() {
+        let (current, _) = DeviceState::for_host_class(BudgetClass::PhoneWifi, true, true);
+        let moved = DeviceState::reported(
+            Some(&current),
+            DeviceKind::Home,
+            true,
+            true,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(moved.shaping_opt_in && moved.shaping_opt_in_cellular);
+        assert_eq!(
+            ShapingPolicy::for_device(&moved).scope,
+            ShapingScope::AllIdentityLinks
+        );
+        // A named opt-in is the new choice.
+        let cleared = DeviceState::reported(
+            Some(&current),
+            DeviceKind::Home,
+            true,
+            true,
+            Some(false),
+            None,
+            false,
+            None,
+        );
+        assert!(!cleared.shaping_opt_in && cleared.shaping_opt_in_cellular);
+        // With nothing held, an omitted opt-in is off.
+        let fresh =
+            DeviceState::reported(None, DeviceKind::Home, true, true, None, None, false, None);
+        assert!(!fresh.shaping_opt_in && !fresh.shaping_opt_in_cellular);
     }
 }
 
