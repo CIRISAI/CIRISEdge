@@ -2780,16 +2780,20 @@ async fn a_relay_at_the_top_tier_with_every_lever_pulled_still_forwards() {
 /// A dial past its budget leaves no pending link behind it: the peer's proof,
 /// still on its way, finds nothing, so no link establishes with no one left to
 /// key it. The next dial is a clean one.
+///
+/// The budget is zero, spent before the proof can come. It was 1 ms, which
+/// raced a timer against a loopback round trip: on macOS (CI darwin, v44.1.0
+/// tag run) the timer fired late and the proof won, so the send succeeded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dial_past_its_budget_is_closed_and_never_establishes_unkeyed() {
     let t = trio("budget", true, false, false).await;
     let before = t.b.transport.link_planes_for_test().await;
     t.b.transport
-        .set_establish_budget_for_test(Some(Duration::from_millis(1)));
+        .set_establish_budget_for_test(Some(Duration::ZERO));
     let row = marked(b"E1-BUDGET-MARKER-", 512);
     assert!(
         t.b.transport.send(&t.a.key.key_id, &row).await.is_err(),
-        "a 1 ms budget beats the proof"
+        "a spent budget fails the dial"
     );
     // Well past the proof's round trip on loopback.
     tokio::time::sleep(Duration::from_secs(3)).await;
