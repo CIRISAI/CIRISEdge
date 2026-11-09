@@ -1,0 +1,38 @@
+# TEMPORARY (fix/44.1.1-darwin) — runs only the darwin test lane on this
+# branch, with --no-fail-fast so every failing suite reports. Drop before merge.
+name: darwin-probe
+
+on:
+  push:
+    branches: [fix/44.1.1-darwin]
+
+concurrency:
+  group: darwin-probe-${{ github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_NET_RETRY: 10
+
+jobs:
+  darwin:
+    name: darwin-aarch64 probe
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: macos-aarch64
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+        continue-on-error: true
+      - name: cargo test (probe args)
+        shell: bash
+        run: |
+          ARGS="$(cat .github/darwin-probe.args)"
+          echo "probe args: $ARGS"
+          eval cargo test --no-fail-fast --features \"transport-http transport-reticulum\" $ARGS
