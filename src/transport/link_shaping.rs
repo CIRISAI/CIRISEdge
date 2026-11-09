@@ -548,6 +548,16 @@ pub enum Lane {
     Sync,
 }
 
+/// CIRISEdge#962 — the most real frames in a row that carry contact bodies
+/// and no sync body while the sync lane waits: at least one real frame in
+/// every `CONTACT_RUN_MAX + 1` (four) carries a sync body when both lanes
+/// hold some (a coalesced frame carrying both counts). Strict priority would
+/// let a peer starve this link's sync by inducing contact traffic (pulling key
+/// rows this node serves as contact `Deliver`s); this bounds the contact
+/// lane's share at three quarters of the real frames, and leaves a contact
+/// row that arrives at a quiet contact lane its next frame.
+pub const CONTACT_RUN_MAX: u8 = 3;
+
 /// The ticket bit of a [`Lane::Contact`] body. Each lane numbers its bodies on
 /// its own, in its own FIFO order, so a lane's tickets are a contiguous run per
 /// enqueue and a per-lane high-water mark says which have left
@@ -600,10 +610,11 @@ impl Lane {
     ///   [`CONTACT_ENVELOPE_KINDS`] (a `Pull` for a stranger's key, its
     ///   `Deliver`, a `Summary` of the transport-destination plane);
     /// - a replication `Deliver` on the `Attestation` plane every row of which
-    ///   is a `consent:replication:v1` grant or an owner binding (CC 5.4.3
+    ///   is a `consent:replication:v1` grant, an owner binding, or a
+    ///   retraction (`withdraws` / `recants`, which revoke them; CC 5.4.3
     ///   first contact: the request, the acceptance, the binding that roots
-    ///   the stranger). A page that mixes them with other rows is serve, and
-    ///   stays behind;
+    ///   the stranger, and their undoing). A page that mixes them with other
+    ///   rows is serve, and stays behind;
     ///
     /// and everything else is [`Lane::Sync`]. The route fetch, its answer and
     /// the CTKX handshake never reach a shaper: they run before the seal, bare
@@ -687,11 +698,24 @@ fn is_contact_replication_frame(frame: &[u8]) -> bool {
 }
 
 /// Whether one signed attestation row is a `consent:replication:v1` grant
-/// (persist's [`DIMENSION`]) or an owner binding (persist's
-/// [`is_owner_binding_envelope`]): the rows a contact is made of.
+/// (persist's [`DIMENSION`]), an owner binding (persist's
+/// [`is_owner_binding_envelope`]), or a retraction (`withdraws` / `recants`):
+/// the rows a contact is made and unmade of.
+///
+/// A retraction must be at least as fast as the grant it undoes: revocation is
+/// the privacy-critical direction. Persist's consent fold
+/// ([`revocation_fold_target`]) revokes on any `withdraws` / `recants` that
+/// references a grant, and the row names only the referenced id and type
+/// (`withdraws_attestation_envelope`: `references_attestation_id`,
+/// `references_attestation_type`), never the grant's dimension; so the bytes
+/// cannot tell a consent withdrawal from another one, and every retraction
+/// rides the contact lane. `supersedes` replaces rather than revokes and stays
+/// sync. The lane's share bound ([`CONTACT_RUN_MAX`]) keeps this from
+/// starving sync.
 ///
 /// [`DIMENSION`]: ciris_persist::federation::consent_peer_set::DIMENSION
 /// [`is_owner_binding_envelope`]: ciris_persist::federation::admission::is_owner_binding_envelope
+/// [`revocation_fold_target`]: ciris_persist::federation::consent_peer_set::revocation_fold_target
 fn is_contact_attestation(row: &[u8]) -> bool {
     #[derive(serde::Deserialize)]
     struct Row {
@@ -713,7 +737,11 @@ fn is_contact_attestation(row: &[u8]) -> bool {
     let binding = a.attestation_type
         == ciris_persist::federation::types::attestation_type::DELEGATES_TO
         && ciris_persist::federation::admission::is_owner_binding_envelope(&a.attestation_envelope);
-    consent || binding
+    let retraction = {
+        use ciris_persist::federation::types::attestation_type as t;
+        a.attestation_type == t::WITHDRAWS || a.attestation_type == t::RECANTS
+    };
+    consent || binding || retraction
 }
 
 /// The default number of the eight kept for waiting layer neighbours.
@@ -1454,6 +1482,9 @@ struct Lanes {
     /// Bodies ever queued per lane: a body's ticket is its lane's bit and this
     /// count once it is queued.
     accepted: [u64; 2],
+    /// Real frames in a row that carried contact and no sync body while sync
+    /// waited ([`CONTACT_RUN_MAX`]).
+    contact_run: u8,
 }
 
 impl Lanes {
@@ -1951,7 +1982,15 @@ impl LinkShaper {
             let pack = self.coalescing();
             let mut lanes = self.lanes();
             let mut used = 0usize;
-            'lanes: for lane in Lane::ORDER {
+            let sync_waits = !lanes.q[Lane::Sync.index()].is_empty();
+            // The share bound: past CONTACT_RUN_MAX contact-only frames the
+            // sync lane's head goes first.
+            let order = if sync_waits && lanes.contact_run >= CONTACT_RUN_MAX {
+                [Lane::Sync, Lane::Contact]
+            } else {
+                Lane::ORDER
+            };
+            'lanes: for lane in order {
                 while let Some((_, b)) = lanes.q[lane.index()].front() {
                     let need = if pack { 2 + b.len() } else { b.len() };
                     if !bodies.is_empty() && (!pack || used + need > cap) {
@@ -1961,6 +2000,14 @@ impl LinkShaper {
                     bodies.push(lanes.pop(lane).expect("front seen"));
                 }
             }
+            let took_sync = bodies
+                .iter()
+                .any(|(t, _)| Lane::of_ticket(*t) == Lane::Sync);
+            lanes.contact_run = if took_sync || !sync_waits || bodies.is_empty() {
+                0
+            } else {
+                lanes.contact_run.saturating_add(1)
+            };
         }
         let real = !bodies.is_empty();
         let mut tickets = FrameTickets::default();
@@ -4741,10 +4788,13 @@ mod tests {
     /// CIRISEdge#962 — the lane is read from the frame the field produces:
     /// the real `wire_frame` wrappers (v1 and the v3 round frame) and the
     /// edge's envelope order. Bootstrap planes in any verb, a Deliver of
-    /// consent grants or owner bindings, and a key registration are contact;
-    /// an attestation page that mixes in other rows, a Summary of the
-    /// attestation plane, chat, the onion and junk are sync.
+    /// consent grants, owner bindings and their withdrawals and recants, and a
+    /// key registration are contact; an attestation page that mixes in other
+    /// rows, a supersede, a Summary of the attestation plane, chat, the onion
+    /// and junk are sync.
+    /// Mutation: drop the retraction class → a grant's withdrawal reads sync.
     #[test]
+    #[allow(clippy::too_many_lines)] // one table of frames and their lanes
     fn the_lane_is_read_off_the_frame() {
         use crate::messages::MessageType as M;
         use crate::replication::protocol::{
@@ -4784,7 +4834,35 @@ mod tests {
             "scores",
             &serde_json::json!({"dimension": "chat:message:v1"}),
         );
+        // Revocation is the privacy-critical direction: the withdrawal of a
+        // grant (persist's own envelope) and the recant of an owner binding
+        // ride with the rows they undo.
+        let withdraw_grant = attestation_row(
+            ciris_persist::federation::types::attestation_type::WITHDRAWS,
+            &ciris_persist::federation::replication::withdraws_attestation_envelope(
+                "grant-1",
+                ciris_persist::federation::types::attestation_type::SCORES,
+            ),
+        );
+        let recant_binding = attestation_row(
+            ciris_persist::federation::types::attestation_type::RECANTS,
+            &serde_json::json!({
+                "kind": "recants",
+                "references_attestation_id": "binding-1",
+                "references_attestation_type":
+                    ciris_persist::federation::types::attestation_type::DELEGATES_TO,
+            }),
+        );
+        let supersede = attestation_row(
+            ciris_persist::federation::types::attestation_type::SUPERSEDES,
+            &serde_json::json!({"kind": "supersedes", "references_attestation_id": "x"}),
+        );
         for (kind, rows) in [
+            (K::Attestation, vec![withdraw_grant.clone()]),
+            (
+                K::Attestation,
+                vec![recant_binding.clone(), consent.clone()],
+            ),
             (K::Key, vec![b"{}".to_vec()]),
             (K::IdentityOccurrence, vec![b"{}".to_vec()]),
             (K::TransportDestination, vec![b"{}".to_vec()]),
@@ -4815,7 +4893,12 @@ mod tests {
                 "a mixed page",
                 deliver(K::Attestation, vec![consent, chat.clone()]),
             ),
-            ("a chat page", deliver(K::Attestation, vec![chat])),
+            ("a chat page", deliver(K::Attestation, vec![chat.clone()])),
+            (
+                "a withdrawal beside chat",
+                deliver(K::Attestation, vec![withdraw_grant, chat]),
+            ),
+            ("a supersede", deliver(K::Attestation, vec![supersede])),
             ("an empty page", deliver(K::Attestation, Vec::new())),
             ("a family page", deliver(K::Family, vec![b"{}".to_vec()])),
             (
@@ -4934,9 +5017,11 @@ mod tests {
     /// holds 300 sync rows (3 KB attestation pages, three frames each: 900
     /// frames, three minutes of real frames at 0.2 s); then twenty contact
     /// rows (a key `Deliver`, as `Lane::of` reads it off the real wire frame)
-    /// arrive one by one. Each leaves at the next fire or close to it: no
-    /// wait over five gaps, the mean under two (one is the Poisson mean).
-    /// Paused clock, seeded timer.
+    /// arrive one by one, a round trip apart as first contact's steps are.
+    /// Each leaves at the next fire or close to it: no wait over five gaps,
+    /// the mean under two (one is the Poisson mean). Twenty more back to back
+    /// (a sustained contact stream) pay the sync share, one frame in four: no
+    /// wait over twelve gaps, the mean under three. Paused clock, seeded timer.
     /// Mutation: the frame takes the sync lane first (FIFO behind the
     /// backlog) → the first contact row waits about 900 gaps.
     #[tokio::test(start_paused = true)]
@@ -4973,38 +5058,167 @@ mod tests {
         }
         assert!(backlog >= 900, "{backlog} frames of sync backlog");
         let gap = s.frame_gap();
-        let mut waits = Vec::new();
-        for i in 0..20u8 {
-            let key = wrap_v3(
-                &deliver(K::Key, vec![vec![i; 600]]),
-                RoundSide::Responder,
-                5,
+        // Spaced: each contact row comes a round trip after the last, as
+        // first contact's steps do (sync frames run between them). Back to
+        // back: a sustained contact stream, which the share bound
+        // (CONTACT_RUN_MAX) holds to three frames in four.
+        for (spaced, worst_max, mean_max) in [(true, 5.0, 2.0), (false, 12.0, 3.0)] {
+            let mut waits = Vec::new();
+            for i in 0..20u8 {
+                if spaced {
+                    tokio::time::sleep(gap * 3).await;
+                }
+                let key = wrap_v3(
+                    &deliver(K::Key, vec![vec![i; 600]]),
+                    RoundSide::Responder,
+                    5,
+                );
+                let lane = Lane::of(&key);
+                assert_eq!(lane, Lane::Contact);
+                let f = cut(&s, &key);
+                let n = u64::try_from(f.len()).unwrap();
+                let started = tokio::time::Instant::now();
+                let last = s.enqueue(lane, f).expect("queued");
+                let budget = s.leave_budget(usize::try_from(n).unwrap());
+                let out = wait_row_left(&s, last + 1 - n, last, budget, || true).await;
+                assert!(matches!(out, RowLeft::Left(_)), "contact row {i}: {out:?}");
+                waits.push(started.elapsed().as_secs_f64() / gap.as_secs_f64());
+            }
+            assert!(
+                s.queued_in(Lane::Sync) > 0,
+                "the backlog is still there: the contact rows went ahead of it"
             );
-            let lane = Lane::of(&key);
-            assert_eq!(lane, Lane::Contact);
-            let f = cut(&s, &key);
-            let n = u64::try_from(f.len()).unwrap();
-            let started = tokio::time::Instant::now();
-            let last = s.enqueue(lane, f).expect("queued");
-            let budget = s.leave_budget(usize::try_from(n).unwrap());
-            let out = wait_row_left(&s, last + 1 - n, last, budget, || true).await;
-            assert!(matches!(out, RowLeft::Left(_)), "contact row {i}: {out:?}");
-            waits.push(started.elapsed().as_secs_f64() / gap.as_secs_f64());
+            let worst = waits.iter().copied().fold(0.0, f64::max);
+            #[allow(clippy::cast_precision_loss)]
+            let mean = waits.iter().sum::<f64>() / waits.len() as f64;
+            eprintln!("spaced={spaced}: contact waits worst {worst:.2} mean {mean:.2} gaps");
+            assert!(
+                worst <= worst_max,
+                "spaced={spaced}: worst contact wait {worst:.1} gaps: {waits:?}"
+            );
+            assert!(
+                mean <= mean_max,
+                "spaced={spaced}: mean contact wait {mean:.2} gaps: {waits:?}"
+            );
         }
-        assert!(
-            s.queued_in(Lane::Sync) > 0,
-            "the backlog is still there: the contact rows went ahead of it"
-        );
-        let worst = waits.iter().copied().fold(0.0, f64::max);
-        #[allow(clippy::cast_precision_loss)]
-        let mean = waits.iter().sum::<f64>() / waits.len() as f64;
-        assert!(
-            worst <= 5.0,
-            "worst contact wait {worst:.1} gaps: {waits:?}"
-        );
-        assert!(mean <= 2.0, "mean contact wait {mean:.2} gaps: {waits:?}");
         s.stop();
         emit.await.unwrap();
+    }
+
+    /// **CIRISEdge#962 — a contact flood does not starve sync.** Both lanes
+    /// hold 400 single-frame bodies; of the first 200 real frames at least
+    /// one in every four carries a sync body, and sync drains at a quarter of
+    /// the real rate (50 of 200), coalescing on or off. Once the contact
+    /// lane is quiet, a new contact body still takes the very next frame.
+    /// Mutation: drop the share bound (strict priority) → no sync body leaves
+    /// while the flood lasts.
+    #[tokio::test]
+    async fn a_contact_flood_does_not_starve_the_sync_lane() {
+        let agreement = Agreement {
+            lambda: 400.0,
+            frame_bytes: 1400,
+            rho: 1.0,
+            window: Duration::from_secs(60),
+        };
+        for coalesce in [false, true] {
+            let s = LinkShaper::new([8u8; 16], agreement, 4096 * 1400);
+            if coalesce {
+                s.enable_coalescing();
+            }
+            // 700 B bodies: two never share a 1,400 B frame, coalesced or not.
+            for _ in 0..400 {
+                s.enqueue(Lane::Contact, vec![vec![1; 700]]).unwrap();
+                s.enqueue(Lane::Sync, vec![vec![2; 700]]).unwrap();
+            }
+            let mut carried_sync = Vec::new();
+            while carried_sync.len() < 200 {
+                let Emission::Frame { real, tickets, .. } = s.next_emission().await else {
+                    panic!("stopped")
+                };
+                if real {
+                    carried_sync.push(tickets.sync != 0);
+                    s.note_sent(tickets);
+                }
+            }
+            let sync = carried_sync.iter().filter(|c| **c).count();
+            assert!(
+                sync >= 50,
+                "coalesce={coalesce}: {sync} of 200 frames carried sync"
+            );
+            for (i, w) in carried_sync.windows(4).enumerate() {
+                assert!(
+                    w.iter().any(|c| *c),
+                    "coalesce={coalesce}: frames {i}..{} carried no sync",
+                    i + 3
+                );
+            }
+            assert!(
+                s.queued_in(Lane::Contact) > 0,
+                "coalesce={coalesce}: contact still led: the flood outlasted the window"
+            );
+        }
+        // A quiet contact lane: a contact body takes the next frame even
+        // behind a sync backlog.
+        let s = LinkShaper::new([8u8; 16], agreement, 4096 * 1400);
+        s.enqueue(Lane::Sync, vec![vec![2; 680]; 100]).unwrap();
+        for _ in 0..10 {
+            let Emission::Frame { tickets, .. } = s.next_emission().await else {
+                panic!("stopped")
+            };
+            s.note_sent(tickets);
+        }
+        let c = s.enqueue(Lane::Contact, vec![vec![1; 680]]).unwrap();
+        let Emission::Frame { tickets, .. } = s.next_emission().await else {
+            panic!("stopped")
+        };
+        assert_eq!(tickets.contact, c, "the next frame after a sync run");
+    }
+
+    /// **CIRISEdge#963 — round waits at the 1,400 B frame are pinned.** A
+    /// wait covers a 16,272 B reply (one 44.1.0 frame) at the p99 of its
+    /// frames here, so in time it is at or below 44.1.0's wait (4.74 gaps of
+    /// the 16 KB frame) at every class, and never shorter than that reply's
+    /// p99. The round interval sits above the wait and at or below 44.1.0's
+    /// 7.75 gaps. A later frame change that moves the reply's frame count
+    /// fails here instead of silently shortening cellular waits.
+    #[test]
+    fn round_waits_at_the_shaped_frame_are_pinned_against_44_1_0() {
+        use crate::replication::scheduler::{
+            pacing_interval, pacing_timeout, SchedulerConfig, PACING_WAIT_GAPS,
+        };
+        const OLD_FRAME: f64 = 16_272.0;
+        let reply = row_frames(16_272, SHAPED_FRAME_BYTES);
+        assert_eq!(reply, 12);
+        assert!(
+            PACING_WAIT_GAPS >= p99_gaps(reply) - 0.05,
+            "{PACING_WAIT_GAPS} gaps against a reply's p99 of {}",
+            p99_gaps(reply)
+        );
+        let floor = SchedulerConfig::DEFAULT_ROUND_TIMEOUT;
+        for (class, rate, want_s) in [
+            (BudgetClass::Server, 7_000.0, 10.0),
+            (BudgetClass::Home, 2_800.0, 14.2),
+            (BudgetClass::PhoneWifi, 1_400.0, 28.4),
+            (BudgetClass::PhoneCellular, 350.0, 113.6),
+        ] {
+            assert!((f64::from(ShapingPolicy::for_class(class).bytes_per_s) - rate).abs() < 1e-9);
+            let gap = Duration::from_secs_f64(f64::from(SHAPED_FRAME_BYTES) / rate);
+            let old_gap = Duration::from_secs_f64(OLD_FRAME / rate);
+            let wait = pacing_timeout(floor, Some(gap));
+            let old_wait = floor.max(old_gap.mul_f64(4.74));
+            assert!(
+                wait <= old_wait,
+                "{class:?}: {wait:?} > 44.1.0's {old_wait:?}"
+            );
+            assert!(
+                (wait.as_secs_f64() - want_s).abs() < 0.1,
+                "{class:?}: {wait:?}, not {want_s} s"
+            );
+            assert!(wait >= floor.max(gap.mul_f64(p99_gaps(reply) - 0.05)));
+            let interval = pacing_interval(floor, Some(gap));
+            assert!(interval >= wait, "{class:?}");
+            assert!(interval <= floor.max(old_gap.mul_f64(7.75)), "{class:?}");
+        }
     }
 
     /// **CIRISEdge#963 — a 64 KiB row converges on `phone-cellular` at the

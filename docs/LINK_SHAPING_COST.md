@@ -251,9 +251,12 @@ cover.
   - a replication frame of any verb on the bootstrap planes and their revocations:
     `key`, `identity_occurrence`, `transport_destination`, `revocation`,
     `identity_occurrence_revocation`;
-  - an `attestation` `Deliver` whose every row is a `consent:replication:v1` grant or
-    an owner binding (a contact request, its acceptance, the binding that roots a
-    stranger);
+  - an `attestation` `Deliver` whose every row is a `consent:replication:v1` grant, an
+    owner binding, or a retraction (`withdraws` / `recants`): a contact request, its
+    acceptance, the binding that roots a stranger, and their undoing. Revocation is the
+    privacy-critical direction, so it is never slower than the grant it undoes. A
+    retraction names only the id and type of the row it revokes, not the grant's
+    dimension, so every retraction rides this lane;
   - a `PublicKeyRegistration` envelope;
   - the node's own link-up pushes (announce, owner binding, build bundle), the link's
     capability report and referrals.
@@ -263,6 +266,11 @@ cover.
   link, and never reach a shaper.
 - Each lane is FIFO and numbers its own bodies, so a sender's wait for its row
   (`ticket_left`) and its retraction on a timeout stay exact across lanes.
+- **No starvation.** While both lanes hold bodies, at least one real frame in every four
+  carries a sync body (`CONTACT_RUN_MAX`; a frame carrying both counts). A peer that
+  induces contact traffic, for example by pulling key rows, takes at most three
+  quarters of the link's real frames. A contact row arriving at a quiet contact lane
+  still takes the next frame.
 
 ## Two planes
 

@@ -386,13 +386,15 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
     TestEvidence {
         cc: "5.4.3",
         clm: "CLM-link-shaping",
-        property: "on a shaped link every outbound frame leaves through the link's shaper at its Poisson fires under the budget (ρ over W), cover fills the rest; contact rows (first contact, keys, consent grants, owner bindings, link control) take the next real frame ahead of the link's serve and sync backlog, the wire unchanged, with each lane's tickets and retraction exact; a row's wait is bounded by its own Poisson p99 and the largest row's, in row bytes, so a 64 KiB row converges at every class; audio and video never enter the shaper; ρ and W move the real share and the delivery delay",
+        property: "on a shaped link every outbound frame leaves through the link's shaper at its Poisson fires under the budget (ρ over W), cover fills the rest; contact rows (first contact, keys, consent grants, owner bindings, their withdrawals and recants, link control) take the next real frame ahead of the link's serve and sync backlog, the wire unchanged, with each lane's tickets and retraction exact and at least one real frame in four left to sync while both lanes wait; a row's wait is bounded by its own Poisson p99 and the largest row's, in row bytes, so a 64 KiB row converges at every class; audio and video never enter the shaper; ρ and W move the real share and the delivery delay",
         impl_anchor: "src/transport/link_shaping.rs#LinkShaper::next_emission",
         witness: &[
             "tests/link_shaping_e1.rs#rho_and_the_window_move_the_real_share_and_the_delay",
             "src/transport/reticulum.rs#shaping_applies_only_to_identity_links",
             "src/transport/link_shaping.rs#the_shaper_emits_real_under_budget_then_cover_and_stops",
             "src/transport/link_shaping.rs#a_contact_row_leaves_within_a_gap_behind_a_sync_backlog",
+            "src/transport/link_shaping.rs#a_contact_flood_does_not_starve_the_sync_lane",
+            "src/transport/link_shaping.rs#round_waits_at_the_shaped_frame_are_pinned_against_44_1_0",
             "src/transport/link_shaping.rs#tickets_and_retraction_hold_across_the_lanes",
             "src/transport/link_shaping.rs#the_lane_is_read_off_the_frame",
             "src/transport/link_shaping.rs#a_64_kib_row_converges_on_phone_cellular_at_the_shaped_frame",
