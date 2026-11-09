@@ -119,8 +119,14 @@ classifiers = [
 # v61.0.3 (CIRISPersist#1199, #1200) is the same shape: a 61.0.2 wheel goes on
 # binding no room to a chat row's takedown and admitting a moderator's solo
 # removal.
+#
+# v44.1.2: the ceiling is <61.1, not <62. Edge 44.1.x is built against persist
+# 61.0.5, and some capsules (BackendDispatch, TrustScoring, the local signer)
+# reinterpret persist's Rust layout directly with no ABI check. A 61.1.0 wheel
+# adds trait methods, so pairing it with this cdylib could misdispatch a call
+# through a vtable that no ABI constant guards.
 dependencies = [
-    "ciris-persist>=61.0.5,<62",
+    "ciris-persist>=61.0.5,<61.1",
 ]
 dynamic = ["version"]
 

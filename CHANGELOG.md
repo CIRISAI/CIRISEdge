@@ -31,6 +31,11 @@ installs the swarm runtime, and server's shipped wheel never did.
   `https_round_trip_fountain_holding_claim` are retired, since they witnessed only the retired kind.
 - **Evidence:** a supporting `CLM-policy-versioning` (CC 2.6.4) row, `src/verify.rs#VerifyPipeline::verify`.
 
+**The Python persist requirement is `ciris-persist>=61.0.5,<61.1`** (was `<62`). Edge 44.1.x is built
+against persist 61.0.5, and some capsules (`BackendDispatch`, `TrustScoring`, the local signer) read
+persist's Rust layout directly with no ABI check. Persist 61.1.0 adds trait methods, so a pip pairing
+with it could misdispatch. The Rust pin is unchanged.
+
 ## 44.1.1 — 2026-11-09
 
 **The shaped frame is 1,400 bytes** (CIRISEdge#963, CC 5.4.3 rc17 a3dd97a). Every shaped link's

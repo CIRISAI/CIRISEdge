@@ -17,6 +17,8 @@ Its one change retires a kind nothing in production emits, so no deployed peer l
   dispatch, the converged view or a swarm runtime.
 - **The converged view reads converged-to-nothing.** Its only feed was that kind. The readers stay
   as public API.
+- **Python requires `ciris-persist>=61.0.5,<61.1`** (was `<62`). Some capsules read persist's Rust
+  layout with no ABI check, and 61.1.0 adds trait methods, so a pip pairing with it could misdispatch.
 
 See CHANGELOG.md for the detail.
 
