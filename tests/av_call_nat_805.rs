@@ -638,6 +638,49 @@ async fn a_room_call_behind_t_without_a_facilitator_has_no_leg() {
     ));
 }
 
+/// **E4, the other order** — A's dial proposes to B before B's call is
+/// installed, so B is asked while it shares nothing with A. B's host holds the
+/// request for that standing instead of refusing it; B joins, and the link
+/// moves. Refused at once, the pair rode the relay through a retry backoff of
+/// 45 s or more: E4 on CI darwin, the v44.0.0 and v44.1.0 tag runs, where A's
+/// proposal reached B 20 ms before B's call was installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_proposal_that_reaches_a_member_before_its_call_is_held_for_it() {
+    let mut p = pair("e4-order", true).await;
+    let call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A joins");
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            dl(&p.b.metrics, "direct_link_request_held") == 1
+        })
+        .await,
+        "A's proposal reaches B before B's call, and is held: {:?}",
+        p.b.metrics.direct_link()
+    );
+    let call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B joins");
+    let a_up = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match p.a.events.recv().await {
+                Ok(e @ (DirectPathEvent::Established { .. } | DirectPathEvent::Failed { .. })) => {
+                    return e
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("A's events closed"),
+            }
+        }
+    })
+    .await
+    .expect("A's proposal has an outcome");
+    assert!(
+        matches!(&a_up, DirectPathEvent::Established { proposed: true, peer, .. }
+            if peer.as_deref() == Some(p.b.key.key_id.as_str())),
+        "the held request was accepted once B joined: {a_up:?}"
+    );
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_accepted"), 1);
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_refused"), 0);
+    assert_eq!(dl(&p.a.metrics, "direct_link_failed_rejected"), 0);
+    drop((call_a, call_b));
+}
+
 /// `T` with `A` on it long enough that the relay's rate limit blocks A's
 /// re-announces, then `B` joining: A's announce is not coming. A's 1 s interval
 /// reaches the limiter's grace (5) within seconds; on the 300 s default it
