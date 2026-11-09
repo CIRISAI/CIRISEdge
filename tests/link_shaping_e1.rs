@@ -3042,3 +3042,278 @@ async fn a_real_link_moves_the_event_path_telemetry() {
     );
     assert_eq!(s.shaping_free_slots, 0, "admit-close offers no slot");
 }
+
+/// The shaped frame the 1,400 B proposal caps a link at (plaintext, the `SHPF`
+/// header included, before the E1 seal).
+const ONION_TEST_FRAME: usize = 1_400;
+
+/// Both ends of `t` run the Anonymous Tier as relays: a deal of nine stand-in
+/// relays per period (three a layer, every one answering), this node's hop
+/// secret from `seed`, and a mixing delay of a millisecond.
+fn onion_relay_on(
+    n: &Node,
+    seed: u8,
+    deal: &ciris_edge::transport::onion_layers::LayerDeal,
+) -> ciris_edge::onion::packet::HopKey {
+    use ciris_edge::onion::packet::HopSecret;
+    use ciris_edge::onion::relay::OnionRelay;
+    let onion = n.transport.onion();
+    onion.set_policy(ciris_edge::onion::policy::OnionPolicy {
+        enabled: true,
+        mix_mean_delay_ms: 1,
+        ..ciris_edge::onion::policy::OnionPolicy::default()
+    });
+    onion.set_device(DeviceState::of(DeviceKind::Server));
+    onion.install_deal(deal.clone());
+    for layer in &deal.layers {
+        for k in layer {
+            onion.observe(
+                k,
+                ciris_edge::transport::onion_liveness::LivenessEvidence::ShapedLinkUp,
+            );
+        }
+    }
+    let relay = OnionRelay::new(
+        HopSecret::from_xwing_seed(&[seed; 32]).expect("hop secret"),
+        None,
+    );
+    let key = relay.hop_key().clone();
+    onion.set_relay(Some(relay));
+    assert_eq!(onion.tier(), Ok(()), "the tier is active");
+    assert_eq!(onion.relaying(), Ok(()), "and this node relays");
+    key
+}
+
+/// **CC 5.4.3 × 5.4.6 — an onion packet crosses a 1,400 B shaped link in
+/// fragments and arrives intact.** An onion packet is a fixed 15,296 B
+/// (`onion::packet::PACKET`); at the TCP channel payload MDU it rides one
+/// shaped frame body, at a 1,400 B frame it is cut by the `CFRG` fragmenter
+/// into twelve. B publishes over a route A → B → A, so the packet crosses the
+/// capped link three times (B→A, A→B, B→A), each time fragmented at the
+/// sender's shaper, reassembled at the receiver and PEELED there: a single
+/// wrong byte fails the hop's AEAD, and only an intact packet at the last hop
+/// stores the payload. The exit holds exactly the payload B sent.
+/// Mutation: break `frame_fragment::Reassembler` (e.g. drop a fragment's last
+/// byte on reassembly) → no hop opens and the exit stays empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_onion_packet_crosses_a_1400_byte_shaped_link_in_fragments_and_arrives_intact() {
+    use ciris_edge::onion::packet::PACKET;
+    use ciris_edge::onion::tokens;
+    use ciris_edge::transport::frame_fragment::FRAGMENT_HEADER_LEN;
+    use ciris_edge::transport::link_shaping::body_capacity;
+    use ciris_edge::transport::onion_layers::{period_of, LayerDeal};
+    let _host = share_host().await;
+    let fast = policy(BudgetClass::Server, 100_000, 0.5, 10, false);
+    let t = duo("onion1400", fast.clone(), fast).await;
+    t.a.transport
+        .set_shaped_frame_cap_for_test(ONION_TEST_FRAME);
+    t.b.transport
+        .set_shaped_frame_cap_for_test(ONION_TEST_FRAME);
+    t.a.transport.set_link_wire_tap_for_test(true);
+    t.b.transport.set_link_wire_tap_for_test(true);
+    // The link comes up shaped at the capped frame.
+    let hello = marked(b"ONION-LINK-UP-", 600);
+    t.b.transport
+        .send(&t.a.key.key_id, &hello)
+        .await
+        .expect("B -> A");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&hello).await
+        })
+        .await
+    );
+    let link =
+        t.b.transport
+            .link_wire_tapped_for_test()
+            .first()
+            .expect("B dialled")
+            .0;
+    let (frame, _) =
+        t.b.transport
+            .shaped_agreement_for_test(link)
+            .expect("the link is shaped");
+    assert_eq!(
+        usize::from(frame),
+        ONION_TEST_FRAME,
+        "agreed at the capped frame"
+    );
+    // The onion frame (`CONP` ‖ packet) spans many shaped frames here.
+    let onion_frame = 4 + PACKET;
+    let per_fragment = body_capacity(frame) - FRAGMENT_HEADER_LEN;
+    let fragments = onion_frame.div_ceil(per_fragment);
+    assert!(fragments >= 11, "{onion_frame} B spans {fragments} frames");
+
+    let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+    let ids = |p: &str| (0..3).map(|i| format!("{p}{i}")).collect::<Vec<_>>();
+    let deal = LayerDeal {
+        period: period_of(now),
+        layers: [ids("l1-"), ids("l2-"), ids("l3-")],
+        capped: Vec::new(),
+        available: true,
+    };
+    let key_a = onion_relay_on(&t.a, 0xa1, &deal);
+    let key_b = onion_relay_on(&t.b, 0xb1, &deal);
+    // Each hop names the next by the address its sender dials it at.
+    let dest_a =
+        t.b.transport
+            .peer_dest_hash_for_test(&t.a.key.key_id)
+            .await
+            .expect("B resolves A");
+    let dest_b =
+        t.a.transport
+            .peer_dest_hash_for_test(&t.b.key.key_id)
+            .await
+            .expect("A resolves B");
+    // Layer 1 and 3 are A, layer 2 is B: the route is A → B → A.
+    let resolve = move |k: &str| {
+        if k.starts_with("l2-") {
+            Some((dest_b, key_b.clone()))
+        } else {
+            Some((dest_a, key_a.clone()))
+        }
+    };
+    let real_before = t.b.shaping("link_shaping_frames_real");
+    let payload = marked(b"ONION-PAYLOAD-", 1_000);
+    t.b.transport
+        .onion_publish(&payload, &resolve)
+        .await
+        .expect("published on the shaped first hop");
+    let mut exits = Vec::new();
+    let stored = wait_until(Duration::from_secs(60), || {
+        exits.extend(t.a.transport.onion().take_exits());
+        let done = !exits.is_empty();
+        async move { done }
+    })
+    .await;
+    assert!(
+        stored,
+        "the packet reached its exit through three fragmented crossings: A {:?} B {:?}",
+        t.a.transport.onion().counters(),
+        t.b.transport.onion().counters()
+    );
+    assert_eq!(exits, vec![payload], "the exit holds exactly what B sent");
+    let a_counts = t.a.transport.onion().counters();
+    let b_counts = t.b.transport.onion().counters();
+    assert_eq!(b_counts.get(tokens::PUBLISHED), Some(&1), "{b_counts:?}");
+    assert_eq!(
+        a_counts.get(tokens::FORWARDED),
+        Some(&1),
+        "hop 1 (A) opened and forwarded: {a_counts:?}"
+    );
+    assert_eq!(
+        b_counts.get(tokens::FORWARDED),
+        Some(&1),
+        "hop 2 (B) opened and forwarded: {b_counts:?}"
+    );
+    // B sent the packet twice (hops 1 and 3), each time as `fragments` frames.
+    let real = t.b.shaping("link_shaping_frames_real") - real_before;
+    assert!(
+        real >= 2 * fragments as u64,
+        "B's packet crossings took {real} real frames, at least {}",
+        2 * fragments
+    );
+    // And the wire never showed anything but the one sealed frame size.
+    let sealed = ONION_TEST_FRAME + ciris_edge::transport::link_seal::SEAL_OVERHEAD;
+    let b_frames = frames_on(&t.b.transport.link_wire_tapped_for_test(), link);
+    let (b_len, b_run) = trailing_run(&b_frames);
+    assert_eq!(b_len, sealed);
+    assert!(
+        b_run as u64 >= real,
+        "{b_run} constant frames cover the {real} real ones"
+    );
+}
+
+/// **Measurement, not a gate** — contact-like latency over a REAL loopback
+/// shaped pair: `FM_K` request/response exchanges (B asks, A answers), `FM_REQ`
+/// / `FM_RESP` bytes, at `FM_RATE` B/s per link (default 7,000, `server`) and
+/// a frame capped at `FM_CAP` (0 = the link's channel payload MDU),
+/// `FM_SAMPLES` contacts. Prints p50/p90.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, not a gate"]
+async fn measure_contact_round_trips_over_a_real_shaped_pair() {
+    let env = |k: &str, d: usize| std::env::var(k).ok().map_or(d, |v| v.parse().expect(k));
+    let (cap, rate, k, samples, req, resp) = (
+        env("FM_CAP", 0),
+        env("FM_RATE", 7_000),
+        env("FM_K", 7),
+        env("FM_SAMPLES", 5),
+        env("FM_REQ", 400),
+        env("FM_RESP", 400),
+    );
+    let _host = whole_host().await;
+    let p = policy(
+        BudgetClass::Server,
+        u32::try_from(rate).unwrap(),
+        0.5,
+        600,
+        false,
+    );
+    let t = duo(&format!("contact{cap}"), p.clone(), p).await;
+    if cap > 0 {
+        t.a.transport.set_shaped_frame_cap_for_test(cap);
+        t.b.transport.set_shaped_frame_cap_for_test(cap);
+    }
+    t.b.transport.set_link_wire_tap_for_test(true);
+    let hello = marked(b"CONTACT-UP-", 300);
+    t.b.transport
+        .send(&t.a.key.key_id, &hello)
+        .await
+        .expect("up");
+    assert!(
+        wait_until(Duration::from_secs(120), || async {
+            t.a.received(&hello).await
+        })
+        .await
+    );
+    let link =
+        t.b.transport
+            .link_wire_tapped_for_test()
+            .first()
+            .expect("dialled")
+            .0;
+    let (frame, bps) =
+        t.b.transport
+            .shaped_agreement_for_test(link)
+            .expect("shaped");
+    let poll = |n: &Node, row: Vec<u8>| {
+        let seen = Arc::clone(&n.seen);
+        async move {
+            loop {
+                if seen.lock().await.iter().any(|f| f.envelope_bytes == row) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    };
+    let mut v = Vec::new();
+    for s in 0..samples {
+        let start = std::time::Instant::now();
+        for i in 0..k {
+            let q = marked(format!("Q{s}-{i}-").as_bytes(), req);
+            t.b.transport
+                .send(&t.a.key.key_id, &q)
+                .await
+                .expect("request");
+            poll(&t.a, q).await;
+            let r = marked(format!("R{s}-{i}-").as_bytes(), resp);
+            t.a.transport
+                .send(&t.b.key.key_id, &r)
+                .await
+                .expect("response");
+            poll(&t.b, r).await;
+        }
+        v.push(start.elapsed().as_secs_f64());
+        println!("FMREAL sample {s} {:.2}s", v[v.len() - 1]);
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+    println!(
+        "FMREAL frame={frame} bytes_per_s={bps} k={k} req={req} resp={resp} samples={samples} p50={:.2}s p90={:.2}s min={:.2}s max={:.2}s",
+        q(0.5),
+        q(0.9),
+        v[0],
+        v[v.len() - 1]
+    );
+}
