@@ -267,7 +267,7 @@ impl AnchorRegistry {
                     suppressed_prev,
                     "pqc anchor: REFUSED — the record's ML-DSA-65 key does not hash to the \
                      commitment the dialler held before dialling (CC 5.3.3.5 item 6, \
-                     CIRISEdge#964); the record is not admitted and its transit pair is not used"
+                     tracked: CIRISEdge#964); the record is not admitted and its transit pair is not used"
                 );
                 Anchor::Mismatch(detail)
             }
