@@ -859,9 +859,10 @@ pub trait Transport: Send + Sync + 'static {
 
     /// CC 5.4.3 — the mean gap between frames on the shaped link to
     /// `destination_key_id`, when the link is shaped: what a round's waits
-    /// are paced by (FSD/TRANSPORT_TIERS_MODEL.md: a per-wait timeout of about
-    /// 4.74 gaps and a round interval of about 7.75 gaps). `None` on an
-    /// unshaped link or a transport without shaping.
+    /// are paced by (`replication::scheduler::PACING_WAIT_GAPS` and
+    /// `PACING_INTERVAL_GAPS`, after FSD/TRANSPORT_TIERS_MODEL.md, rescaled to
+    /// the 1,400 B frame by CIRISEdge#963). `None` on an unshaped link or a
+    /// transport without shaping.
     fn pacing_gap(&self, destination_key_id: &str) -> Option<std::time::Duration> {
         let _ = destination_key_id;
         None

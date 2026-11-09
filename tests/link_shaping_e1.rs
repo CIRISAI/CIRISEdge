@@ -239,7 +239,8 @@ async fn whole_host() -> tokio::sync::RwLockWriteGuard<'static, ()> {
 }
 
 /// A policy that shapes fast enough to witness on loopback: `bytes_per_s`
-/// at the loopback MDU gives λ of a few frames per second.
+/// over the 1,400 B shaped frame gives λ (100,000 B/s is about 71 frames a
+/// second).
 fn policy(
     class: BudgetClass,
     bytes_per_s: u32,
@@ -569,12 +570,14 @@ async fn a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy() {
 /// between two timings a loaded host decides: the burst takes
 /// `⌈40 / budget⌉` grants, so it spans at least all but its first and last
 /// windows. At ρ = 0.25, since at ρ = 0.5 the budget barely binds and an
-/// unpaced burst clears the same bound.
+/// unpaced burst clears the same bound. Each row is one shaped frame (1,200 B
+/// at the 1,400 B frame) at about 12 frames a second, the λ the witness had
+/// at the 16 KB frame (CIRISEdge#963).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rho_and_the_window_move_the_real_share_and_the_delay() {
     #[allow(clippy::cast_precision_loss)] // frame counts, far below 2^52
     async fn burst_time(tag: &str, rho: f64, window_s: u64) -> (Duration, f64, usize) {
-        let p = policy(BudgetClass::Home, 200_000, rho, window_s, false);
+        let p = policy(BudgetClass::Home, 17_200, rho, window_s, false);
         let t = duo(tag, p.clone(), p).await;
         // Open and shape the link first, then measure the burst alone.
         t.b.transport
@@ -592,7 +595,7 @@ async fn rho_and_the_window_move_the_real_share_and_the_delay() {
         let started = tokio::time::Instant::now();
         let mut rows = Vec::new();
         for i in 0..40u32 {
-            let row = marked(format!("BURST-{tag}-{i:02}-").as_bytes(), 12_000);
+            let row = marked(format!("BURST-{tag}-{i:02}-").as_bytes(), 1_200);
             t.b.transport
                 .send(&t.a.key.key_id, &row)
                 .await
@@ -1307,8 +1310,8 @@ async fn two_proved_seats_shape_at_the_seat_row_and_a_non_seat_gets_the_class() 
     );
     let rates = t.b.transport.shaped_rates_for_test();
     assert!(
-        rates.iter().any(|l| (l - 2.03).abs() < 0.05),
-        "the seat link agreed 33,000 B/s: {rates:?}"
+        rates.iter().any(|l| (l - 23.57).abs() < 0.05),
+        "the seat link agreed 33,000 B/s at the 1,400 B frame: {rates:?}"
     );
 
     // The stream runs at that rate. The rate is bytes over frame, so a small
@@ -1370,8 +1373,8 @@ async fn two_proved_seats_shape_at_the_seat_row_and_a_non_seat_gets_the_class() 
     );
     let rates = u.b.transport.shaped_rates_for_test();
     assert!(
-        rates.iter().all(|l| *l < 1.0),
-        "the normal class: {rates:?}"
+        rates.iter().all(|l| (l - 5.0).abs() < 0.01),
+        "the normal class, 7,000 B/s at the 1,400 B frame: {rates:?}"
     );
 }
 

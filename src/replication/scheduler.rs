@@ -1258,8 +1258,8 @@ async fn run_one_coordinator_forever(
                     None => 1,
                 };
                 // CC 5.4.3 — on a shaped link the round interval follows the
-                // frame gap (about 7.75 gaps), else ticks queue behind rounds
-                // that each take several gaps.
+                // frame gap ([`PACING_INTERVAL_GAPS`]), else ticks queue behind
+                // rounds that each take several gaps.
                 let target = pacing_interval(relieved * stretch, coord.pacing_gap());
                 if target != current_cadence {
                     // One line per lever move is the lever's own; a line per
@@ -1323,10 +1323,18 @@ fn redial_delay(cadence: Duration) -> Duration {
     Duration::from_millis(rand::thread_rng().gen_range(ms / 2..=ms.saturating_mul(3) / 2))
 }
 
-/// The Poisson p99 of one frame wait, in gaps (FSD/TRANSPORT_TIERS_MODEL.md).
-pub const PACING_WAIT_GAPS: f64 = 4.74;
-/// A round interval that lets a request/reply round complete, in gaps.
-pub const PACING_INTERVAL_GAPS: f64 = 7.75;
+/// The per-wait timeout on a shaped link, in gaps. FSD/TRANSPORT_TIERS_MODEL.md
+/// set it at 4.74 gaps, the p99 of a reply that rides one frame, when the frame
+/// was the 16,272 B TCP MDU. CIRISEdge#963 (CC 5.4.3 rc17): at the 1,400 B
+/// frame the same reply is twelve frames, so the wait covers that volume at
+/// the p99: `12 + 4.74 × √12` gaps. In time it is at or below the old wait at
+/// every class (10 s floor at `server`, 14 s `home`, 28 s `phone-wifi`, 114 s
+/// `phone-cellular`, against 11 / 28 / 55 / 223 s), where 4.74 gaps of the
+/// small frame would have timed a 16 KB reply out on every class.
+pub const PACING_WAIT_GAPS: f64 = 28.4;
+/// A round interval that lets a request/reply round complete, in gaps: the
+/// wait and the three gaps the model put on top of it (7.75 − 4.74).
+pub const PACING_INTERVAL_GAPS: f64 = PACING_WAIT_GAPS + 3.01;
 
 /// The per-wait timeout on a link with frame gap `gap`: never below the
 /// configured one, and at least [`PACING_WAIT_GAPS`] gaps.
@@ -1389,8 +1397,9 @@ impl GatedRound<'_> {
         // timed out after its full budget is exactly the one to see.
         let started = std::time::Instant::now();
         // CC 5.4.3 — on a shaped link a wait is paced by the link's frame
-        // gap: the per-wait timeout is at least the Poisson p99 of one gap
-        // (about 4.74 gaps), else every wait on a slow link times out.
+        // gap: the per-wait timeout is at least the Poisson p99 of a reply's
+        // frames ([`PACING_WAIT_GAPS`]), else every wait on a slow link times
+        // out.
         let round_timeout = pacing_timeout(self.round_timeout, self.coord.pacing_gap());
         let mut ended = RoundEnded::default();
         let class = round_and_report(
