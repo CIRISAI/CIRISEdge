@@ -6134,6 +6134,9 @@ async fn route_replication_frame(
     // un-attributed CRPL frame drops (`SkippedNoSourceKeyId`); the trace-serve
     // gate stays strictly `from_rooted_binding`.
     let source: String = if let Some(sid) = frame.source_key_id.as_ref() {
+        // CIRISEdge#968 — a peer this node dropped while unattributed is
+        // asked again the moment one of its frames attributes.
+        registry.note_attributed(sid.as_str());
         sid.as_str().to_string()
     } else {
         if !frame
@@ -6156,6 +6159,15 @@ async fn route_replication_frame(
                     return true;
                 }
             }
+            // CIRISEdge#968 — counted, and the candidate remembered so its
+            // rounds are asked again the moment it attributes.
+            if let Some(m) = metrics {
+                m.inc_transport_inbound_drop(crate::observability::DROP_REPLICATION_UNATTRIBUTED);
+            }
+            let dropped_frames = frame
+                .link_key_id
+                .as_deref()
+                .map_or(0, |k| registry.note_unattributed_drop(k));
             if let ThrottleDecision::Emit { suppressed_prev } =
                 inbound_unroutable_crpl_log().check(frame.transport.0)
             {
@@ -6164,6 +6176,8 @@ async fn route_replication_frame(
                     bytes = frame.envelope_bytes.len(),
                     first_bytes_hex = %first_bytes_hex(&frame.envelope_bytes),
                     route = "SkippedNoSourceKeyId",
+                    candidate = frame.link_key_id.as_deref().unwrap_or("-"),
+                    dropped_frames,
                     suppressed_prev,
                     "inbound CRPL replication frame with source_key_id=None and not a \
                      self-authenticating bootstrap kind — transport could not attribute \

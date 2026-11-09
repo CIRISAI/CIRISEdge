@@ -1194,6 +1194,11 @@ pub const LINK_SEAL_REFUSED_ROUTE_CLOSED: &str = "link_seal_refused_route_closed
 pub const LINK_SEAL_REFUSED_ROUTE_SEND: &str = "link_seal_refused_route_send";
 
 // ─── CIRISEdge#627/#879 — on-link announce (`CANN`) receipt ──────────────
+/// CIRISEdge#968 — `transport_inbound_drops` tag: a CRPL replication frame
+/// dropped because its sender is not attributed here yet (`SkippedNoSourceKeyId`:
+/// not rooted, or no hybrid route row binds its link). A new peer's first
+/// rounds land here until its rooting does.
+pub const DROP_REPLICATION_UNATTRIBUTED: &str = "replication_unattributed";
 /// `transport_inbound_drops` tag: a `CANN` frame on a link with no proven
 /// remote identity (a peer-dialled link before its LINKIDENTIFY, or a dialled
 /// link whose announce names another destination).
@@ -1308,6 +1313,13 @@ pub const ADVERTISE_WATERMARK_EVICTED: &str = "advertise_watermark_evicted";
 pub const ADVERTISE_READ_FAILED: &str = "advertise_read_failed";
 /// A rolling re-sweep cycle still running past its bound.
 pub const ADVERTISE_RESWEEP_CYCLE_OVERDUE: &str = "advertise_resweep_cycle_overdue";
+/// CIRISEdge#968 — a round's Attestation send set came from the memo.
+pub const ADVERTISE_SEND_SET_MEMO_HIT: &str = "advertise_send_set_memo_hit";
+/// CIRISEdge#968 — a round's Attestation send set was read from the store.
+pub const ADVERTISE_SEND_SET_READ: &str = "advertise_send_set_read";
+/// CIRISEdge#968 — a local write (a host kick, `note_local_write`, a released
+/// signer) dropped the send-set memos, so the next round re-reads them.
+pub const ADVERTISE_SEND_SET_INVALIDATED: &str = "advertise_send_set_invalidated";
 /// A request or response that completed on a link a peer dialled before the
 /// event loop had answered its handshake (the two ride different event planes,
 /// so a fast dialler's first frame can overtake its last handshake part), or a
@@ -1906,6 +1918,9 @@ pub const ADVERTISE_LABELS: &[&str] = &[
     ADVERTISE_READ_FAILED,
     ADVERTISE_RESWEEP_CYCLE_COMPLETED,
     ADVERTISE_RESWEEP_CYCLE_OVERDUE,
+    ADVERTISE_SEND_SET_MEMO_HIT,
+    ADVERTISE_SEND_SET_READ,
+    ADVERTISE_SEND_SET_INVALIDATED,
 ];
 /// Every `link_stall` key.
 pub const LINK_STALL_LABELS: &[&str] = &[

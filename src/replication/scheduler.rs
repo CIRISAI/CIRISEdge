@@ -1175,6 +1175,9 @@ async fn run_one_coordinator_forever(
     // CC 5.4.6 — when the re-dial drawn after a failed send is due. Until then
     // a kick does not dial: it would put a refused fleet back on one beat.
     let mut redial_at: Option<tokio::time::Instant> = None;
+    // CIRISEdge#968 — the first-contact retry ladder for a plane the peer has
+    // not yet answered.
+    let mut first_contact = FirstContactRetry::default();
 
     let peer_id = coord.peer_key_id().to_string();
     let kind_str = format!("{:?}", coord.kind());
@@ -1225,21 +1228,53 @@ async fn run_one_coordinator_forever(
                     continue;
                 }
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str, kicked = true);
-                match round.run().instrument(span).await {
-                    RoundRan::Skipped => {}
-                    RoundRan::Ended => interval.reset(),
+                let (ran, line) = round.run().instrument(span.clone()).await;
+                // CIRISEdge#968 — the wait to the next round, for the line.
+                let (next_in, why) = match ran {
+                    RoundRan::Skipped => continue,
                     RoundRan::SendFailed => {
-                        redial_at = Some(draw_redial(&mut interval, current_cadence));
+                        let (delay, hold) = draw_redial(&mut interval, current_cadence);
+                        redial_at = Some(hold);
+                        (delay, NextRound::Redial)
                     }
-                }
+                    RoundRan::Unanswered => match first_contact.unanswered(
+                        peer_answers_elsewhere(&bootstrap, &peer_id, coord.kind(), current_cadence),
+                        current_cadence,
+                    ) {
+                        Some(delay) => {
+                            interval.reset_after(delay);
+                            (delay, NextRound::FirstContactRetry)
+                        }
+                        None => {
+                            interval.reset();
+                            (current_cadence, NextRound::Cadence)
+                        }
+                    },
+                    RoundRan::Completed | RoundRan::Ended => {
+                        if ran == RoundRan::Completed {
+                            first_contact.answered();
+                        }
+                        interval.reset();
+                        (current_cadence, NextRound::Cadence)
+                    }
+                };
+                line.log(&span, next_in, why);
             }
-            _ = interval.tick() => {
+            fired = interval.tick() => {
                 // CIRISEdge#740 — behind the same gate: every coordinator's
                 // first tick fires the moment it is spawned, so a start is a
                 // fan-out too.
                 // CIRISEdge#790 — instrumented, never entered (see the kick arm).
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
-                let ran = round.run().instrument(span).await;
+                let (ran, line) = round.run().instrument(span.clone()).await;
+                // CIRISEdge#968 — the tick that follows, with `Skip`: the next
+                // multiple of the cadence past now.
+                let now = tokio::time::Instant::now();
+                let mut next_due = fired + current_cadence;
+                while next_due <= now {
+                    next_due += current_cadence;
+                }
+                let mut why = NextRound::Cadence;
                 let relieved = match &mesh_config {
                     Some(reader) => reader.relief().await.round_cadence.unwrap_or(cadence),
                     None => cadence,
@@ -1262,6 +1297,7 @@ async fn run_one_coordinator_forever(
                 // rounds that each take several gaps.
                 let target = pacing_interval(relieved * stretch, coord.pacing_gap());
                 if target != current_cadence {
+                    next_due = tokio::time::Instant::now() + target;
                     // One line per lever move is the lever's own; a line per
                     // coordinator would be P × K of them.
                     if stretch == walk_stretch_was {
@@ -1283,8 +1319,32 @@ async fn run_one_coordinator_forever(
                 }
                 walk_stretch_was = stretch;
                 // After the cadence settles, so the draw is on the one in force.
-                if ran == RoundRan::SendFailed {
-                    redial_at = Some(draw_redial(&mut interval, current_cadence));
+                match ran {
+                    RoundRan::SendFailed => {
+                        let (delay, hold) = draw_redial(&mut interval, current_cadence);
+                        redial_at = Some(hold);
+                        next_due = tokio::time::Instant::now() + delay;
+                        why = NextRound::Redial;
+                    }
+                    RoundRan::Unanswered => {
+                        if let Some(delay) = first_contact.unanswered(
+                            peer_answers_elsewhere(&bootstrap, &peer_id, coord.kind(), current_cadence),
+                            current_cadence,
+                        ) {
+                            interval.reset_after(delay);
+                            next_due = tokio::time::Instant::now() + delay;
+                            why = NextRound::FirstContactRetry;
+                        }
+                    }
+                    RoundRan::Completed => first_contact.answered(),
+                    RoundRan::Skipped | RoundRan::Ended => {}
+                }
+                if ran != RoundRan::Skipped {
+                    line.log(
+                        &span,
+                        next_due.saturating_duration_since(tokio::time::Instant::now()),
+                        why,
+                    );
                 }
             }
         }
@@ -1305,11 +1365,17 @@ async fn run_one_coordinator_forever(
 ///
 /// A kick waits out the draw only up to [`KICK_HOLD_MAX`]: the jitter is sized
 /// for the default cadence, and on a long one a host's kick must not sit for half
-/// an hour behind one refused dial. The returned instant is that hold.
-fn draw_redial(interval: &mut tokio::time::Interval, cadence: Duration) -> tokio::time::Instant {
+/// an hour behind one refused dial. Returns the drawn delay and that hold.
+fn draw_redial(
+    interval: &mut tokio::time::Interval,
+    cadence: Duration,
+) -> (Duration, tokio::time::Instant) {
     let delay = redial_delay(cadence);
     interval.reset_after(delay);
-    tokio::time::Instant::now() + delay.min(KICK_HOLD_MAX)
+    (
+        delay,
+        tokio::time::Instant::now() + delay.min(KICK_HOLD_MAX),
+    )
 }
 
 /// The longest a kick waits behind a drawn re-dial: the draw's top at the
@@ -1357,7 +1423,11 @@ pub fn pacing_interval(configured: Duration, gap: Option<Duration>) -> Duration 
 enum RoundRan {
     /// The peer is backed off, or another plane found it unroutable meanwhile.
     Skipped,
-    /// The round ended, whatever the outcome.
+    /// CIRISEdge#968 — the round completed: the peer answered.
+    Completed,
+    /// CIRISEdge#968 — the round timed out with no reply.
+    Unanswered,
+    /// The round ended any other way.
     Ended,
     /// The round's send failed, so the next round is a dial ([`draw_redial`]).
     SendFailed,
@@ -1378,19 +1448,20 @@ struct GatedRound<'a> {
 }
 
 impl GatedRound<'_> {
-    /// Run the round unless the peer is backed off.
-    async fn run(&self) -> RoundRan {
+    /// Run the round unless the peer is backed off. The caller logs the
+    /// returned line once it knows when the next round is due.
+    async fn run(&self) -> (RoundRan, RoundLine) {
         // Decided BEFORE the gate: a backed-off coordinator never holds or
         // queues for a permit.
         let Admission::Run(ticket) = self.backoff.admit(self.peer_id, self.coord.kind()) else {
             tracing::trace!("round skipped — peer is in no-route backoff (CIRISEdge#794)");
-            return RoundRan::Skipped;
+            return (RoundRan::Skipped, RoundLine::default());
         };
         let mut seat = RoundSeat::take(self.round_gate, self.peer_id, self.kind_str).await;
         // Another plane may have found the peer unroutable while this one
         // waited for its permit.
         if ticket.overtaken() {
-            return RoundRan::Skipped;
+            return (RoundRan::Skipped, RoundLine::default());
         }
         // CIRISEdge P0 telemetry — the round's wall time, from holding the
         // permit to its outcome, whatever that outcome is: a round that
@@ -1414,20 +1485,164 @@ impl GatedRound<'_> {
         if let Some(m) = self.metrics {
             m.observe_round_duration(self.coord.kind(), started.elapsed());
         }
-        tracing::info!(
-            took_ms = started.elapsed().as_millis(),
-            outcome = ended.outcome,
-            error = ended.error.as_deref().unwrap_or(""),
-            "anti-entropy round ended"
-        );
         let ran = if matches!(class, RoundClass::SendFailed) {
             RoundRan::SendFailed
+        } else if ended.outcome == crate::observability::RoundOutcome::Completed.as_str() {
+            RoundRan::Completed
+        } else if ended.outcome == crate::observability::RoundOutcome::TimedOut.as_str() {
+            RoundRan::Unanswered
         } else {
             RoundRan::Ended
         };
         ticket.finish(class);
-        ran
+        let line = RoundLine {
+            took_ms: started.elapsed().as_millis(),
+            outcome: ended.outcome,
+            error: ended.error,
+        };
+        (ran, line)
     }
+}
+
+/// The `anti-entropy round ended` line, logged by the coordinator loop once it
+/// knows when the next round is due (CIRISEdge#968: the next tick was not in
+/// any line, so a 40 s gap read as silence).
+#[derive(Default)]
+struct RoundLine {
+    took_ms: u128,
+    outcome: &'static str,
+    error: Option<String>,
+}
+
+impl RoundLine {
+    fn log(&self, span: &tracing::Span, next_in: Duration, why: NextRound) {
+        span.in_scope(|| {
+            tracing::info!(
+                took_ms = self.took_ms,
+                outcome = self.outcome,
+                error = self.error.as_deref().unwrap_or(""),
+                next_round_in_ms = next_in.as_millis(),
+                next_round = why.as_str(),
+                "anti-entropy round ended"
+            );
+        });
+    }
+}
+
+/// CIRISEdge#968 — why the next round is due when it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextRound {
+    /// The ordinary cadence tick.
+    Cadence,
+    /// The re-dial drawn after a failed send (CC 5.4.6).
+    Redial,
+    /// The first-contact retry ladder ([`FirstContactRetry`]).
+    FirstContactRetry,
+}
+
+impl NextRound {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cadence => "cadence",
+            Self::Redial => "redial",
+            Self::FirstContactRetry => "first_contact_retry",
+        }
+    }
+}
+
+/// The first wait of the first-contact retry ladder.
+const FIRST_CONTACT_RETRY_BASE: Duration = Duration::from_secs(4);
+/// How many early retries one plane gets before it falls back to the cadence.
+const FIRST_CONTACT_RETRIES: u32 = 3;
+
+/// **CIRISEdge#968 (wait A) — a plane the peer has never answered is asked
+/// again soon, not a cadence later, while the peer answers this node on its
+/// other planes.**
+///
+/// A responder drops a frame it cannot attribute, with no reply: the frame's
+/// sender is not yet rooted there (the Stage-2 rooting walk runs a few seconds
+/// behind the announce), or its route row has not landed. The bootstrap
+/// planes (Key, IdentityOccurrence, TransportDestination) are admitted
+/// unattributed, so they complete while the Attestation round times out.
+/// Measured on server's docker rig: the canonical rooted a new node 12 s after
+/// dropping its first Attestation round, and nothing asked again until the
+/// next tick, 40 s after the kick: 37 s of a contact's 49.
+///
+/// The retry is graduated, leased and bounded:
+///
+/// - **graduated** — the waits double from [`FIRST_CONTACT_RETRY_BASE`], each
+///   drawn from half to one and a half of its value (a fleet that came up
+///   together does not come back together), and each at most half the
+///   cadence;
+/// - **leased** — only until this coordinator's first completed round on the
+///   plane, and only while another plane's round with the same peer completed
+///   within the cadence. The selective silence is the attribution signature;
+///   a peer that answers nothing is down or overloaded, and gets the cadence;
+/// - **bounded** — at most [`FIRST_CONTACT_RETRIES`] per plane, ever, for a
+///   given coordinator. After that the plane waits for the cadence as before.
+///
+/// Every retry goes through the no-route backoff and the round gate like any
+/// round. The responder's cost of one is a frame dropped at attribution.
+#[derive(Debug, Default)]
+struct FirstContactRetry {
+    /// A round on this plane has completed: the ladder is spent for good.
+    answered: bool,
+    /// Early retries taken so far.
+    taken: u32,
+}
+
+impl FirstContactRetry {
+    fn answered(&mut self) {
+        self.answered = true;
+    }
+
+    /// After an unanswered round: the wait before asking again, or `None`
+    /// for the cadence.
+    fn unanswered(&mut self, peer_answers_elsewhere: bool, cadence: Duration) -> Option<Duration> {
+        let wait = self.next_wait(peer_answers_elsewhere, cadence)?;
+        self.taken += 1;
+        Some(jitter_half(wait))
+    }
+
+    /// The undrawn wait of the next rung, `None` when the ladder does not
+    /// apply.
+    fn next_wait(&self, peer_answers_elsewhere: bool, cadence: Duration) -> Option<Duration> {
+        if self.answered || self.taken >= FIRST_CONTACT_RETRIES || !peer_answers_elsewhere {
+            return None;
+        }
+        Some(
+            FIRST_CONTACT_RETRY_BASE
+                .saturating_mul(1 << self.taken)
+                .min(cadence / 2),
+        )
+    }
+}
+
+/// Uniform over `[d / 2, d * 3 / 2]`, millisecond resolution.
+fn jitter_half(d: Duration) -> Duration {
+    use rand::Rng as _;
+    let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX / 2);
+    Duration::from_millis(rand::thread_rng().gen_range(ms / 2..=ms.saturating_mul(3) / 2))
+}
+
+/// CIRISEdge#968 — has a round on another bootstrap plane with `peer`
+/// completed within `window`? Bootstrap rounds are admitted unattributed, so
+/// one completing while this plane's round goes unanswered is the attribution
+/// signature, not a dead peer.
+fn peer_answers_elsewhere(
+    planes: &BootstrapPlanes,
+    peer: &str,
+    own: EnvelopeKind,
+    window: Duration,
+) -> bool {
+    let Ok(planes) = planes.lock() else {
+        return false;
+    };
+    BOOTSTRAP_ORDER
+        .iter()
+        .filter(|k| **k != own)
+        .filter_map(|k| planes.get(&(peer.to_owned(), *k)))
+        .any(|(c, _)| c.completed_within(window))
 }
 
 /// CIRISEdge#794 — the no-route classification of a round error, typed.

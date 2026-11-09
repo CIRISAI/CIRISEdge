@@ -2416,6 +2416,9 @@ pub struct FederationDirectoryReplicationBridge {
     /// single-flight's witness, as [`Self::owner_reads`] is the owner memo's.
     /// `Relaxed`.
     consent_set_reads: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#968 — how many times a LOCAL write dropped the send-set
+    /// memos ([`Self::invalidate_send_set_memos`]). `Relaxed`.
+    send_set_invalidations: std::sync::atomic::AtomicUsize,
     /// CIRISEdge#817 — how many times `rooted_with` actually walked the trust
     /// root (its memo missed): the per-Deliver memo's witness. `Relaxed`.
     rooted_walks: std::sync::atomic::AtomicUsize,
@@ -2892,6 +2895,7 @@ impl FederationDirectoryReplicationBridge {
             consent_memo: Mutex::new(None),
             consent_flight: SingleFlight::default(),
             consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
+            send_set_invalidations: std::sync::atomic::AtomicUsize::new(0),
             rooted_walks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             read_probe: ReadProbe::default(),
@@ -3241,6 +3245,7 @@ impl FederationDirectoryReplicationBridge {
         written_after: chrono::DateTime<chrono::Utc>,
     ) -> Option<crate::decision_rows::DecisionRowRef> {
         let emitted = self.decision_rows.observe(row, written_after, None);
+        self.invalidate_send_set_memos("note_local_write");
         self.kick_attestation_plane().await;
         emitted
     }
@@ -3286,6 +3291,7 @@ impl FederationDirectoryReplicationBridge {
             }
             cursor = next;
         }
+        self.invalidate_send_set_memos("note_local_writes_since");
         self.kick_attestation_plane().await;
         Ok(out)
     }
@@ -10179,10 +10185,18 @@ impl FederationDirectoryReplicationBridge {
         // unrepresentable.
         let resolved_recipient = match recipient {
             None => None,
-            Some(peer) => match self.resolve_attestation_recipient(peer).await {
-                Some(resolved) => Some(resolved),
-                None => return Vec::new(),
-            },
+            Some(peer) => {
+                // CIRISEdge#968 — once per round, say whether the send set this
+                // round reads is the memo (and how old) or a fresh read: a
+                // stale memo was otherwise inferred from timestamps.
+                let memo_age = self.consent_memo_age();
+                let resolved = self.resolve_attestation_recipient(peer).await;
+                self.note_send_set_source(peer, memo_age, resolved.as_ref());
+                match resolved {
+                    Some(resolved) => Some(resolved),
+                    None => return Vec::new(),
+                }
+            }
         };
         let peer_label = recipient.unwrap_or("<unattributed>");
         // CIRISEdge#531 DEPTH — the per-sweep memos now outlive a single PAGE
@@ -11798,6 +11812,101 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    /// **CIRISEdge#968 (wait B) — a LOCAL write may have changed what moves to
+    /// a peer: drop every memo that decides it.**
+    ///
+    /// The send-set memos (consent [`CONSENT_SEND_SET_MEMO_TTL`], owner and
+    /// announce [`OWNER_BINDING_MEMO_TTL`], the accord relay verdicts) are
+    /// invalidated by EVENTS on the apply path. A row the host writes itself
+    /// never crosses that path, the #858 class: a consent grant, its
+    /// withdrawal, a claim's owner-binding, an announce, a family seat. Measured
+    /// on server's docker rig: a node memoized its send set 56 ms before it
+    /// wrote its consent grant to a new contact; the host's kick then ran a
+    /// round on the stale set, the KeyPackage was withheld as
+    /// `reach=first_contact`, and nothing asked again until the contact's own
+    /// cadence round 35 s later.
+    ///
+    /// Every door a host reports a local write through calls this: a kick
+    /// ([`ReplicationRuntime::round_now`](super::ReplicationRuntime::round_now)
+    /// and its siblings), `note_local_write(s)`, and `release_signer` /
+    /// `release_bound_signer`. A kick names no reason, and it does not need
+    /// one: a kick IS the host saying "I wrote rows the federation should
+    /// see", and the rounds it fires must read the state those rows made.
+    ///
+    /// Bounded: dropping a memo reads nothing. The next consumer pays one
+    /// single-flight send-set read (#817), so a burst of N kicks costs at most
+    /// one read per round the kicks fire, and kicks coalesce per coordinator.
+    /// The TTLs stay as the backstop for what no door reports.
+    pub fn invalidate_send_set_memos(&self, reason: &'static str) {
+        self.owner_flight.invalidate();
+        self.consent_flight.invalidate();
+        let had_consent = self
+            .consent_memo
+            .lock()
+            .is_ok_and(|mut memo| memo.take().is_some());
+        if let Ok(mut cache) = self.owner_cache.lock() {
+            cache.by_node.clear();
+        }
+        if let Ok(mut memo) = self.announce_cache.lock() {
+            memo.clear();
+        }
+        if let Some(gate) = self.accord_relay_gate.as_ref() {
+            gate.invalidate_all();
+        }
+        self.send_set_invalidations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.inc_advertise(crate::observability::ADVERTISE_SEND_SET_INVALIDATED);
+        }
+        tracing::debug!(
+            reason,
+            had_consent_memo = had_consent,
+            "send-set memos dropped by a local write: the next round re-reads consent, \
+             owner-bindings and announce reach (CIRISEdge#968)"
+        );
+    }
+
+    /// CIRISEdge#968 — how many times a local write dropped the send-set memos.
+    #[must_use]
+    pub fn send_set_invalidations(&self) -> usize {
+        self.send_set_invalidations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#968 — one DEBUG line per advertise round: the send set came
+    /// from the memo (`memo_age_ms`) or from a store read, and the reach the
+    /// peer was minted at. Counted under `advertise_send_set_*`.
+    fn note_send_set_source(
+        &self,
+        peer: &str,
+        memo_age: Option<Duration>,
+        resolved: Option<&ResolvedRecipient>,
+    ) {
+        let label = if memo_age.is_some() {
+            crate::observability::ADVERTISE_SEND_SET_MEMO_HIT
+        } else {
+            crate::observability::ADVERTISE_SEND_SET_READ
+        };
+        if let Some(m) = &self.metrics {
+            m.inc_advertise(label);
+        }
+        tracing::debug!(
+            peer = Self::peer_label(peer),
+            source = if memo_age.is_some() { "memo" } else { "read" },
+            memo_age_ms = memo_age.map_or(0, |a| a.as_millis()),
+            reach = resolved.map_or("withheld", |r| r.reach().tag()),
+            "attestation send set for this round (CIRISEdge#968)"
+        );
+    }
+
+    /// CIRISEdge#968 — the consent memo's age, `None` when empty or stale.
+    fn consent_memo_age(&self) -> Option<Duration> {
+        let memo = self.consent_memo.lock().ok()?;
+        let (_, resolved_at) = memo.as_ref()?;
+        let age = resolved_at.elapsed();
+        (age < CONSENT_SEND_SET_MEMO_TTL).then_some(age)
+    }
+
     /// CIRISEdge#682 — how many times the announce walk actually ran (the memo
     /// missed). The witness that one sweep pays for each subject ONCE.
     #[must_use]
@@ -12046,6 +12155,30 @@ impl FederationDirectoryReplicationBridge {
     ///   announce state;
     /// - everything else (`scores`, …) moves nothing, so the highest-volume
     ///   plane pays only a string compare.
+    /// CIRISEdge#968 — `(what, author, subject, id)` for a row a first
+    /// contact waits on: an owner-binding (`owner → node`, persist's
+    /// `is_owner_binding_envelope`) or a chat KeyPackage. `None` for every
+    /// other row, at the cost of a dimension compare.
+    fn contact_arrival(att: &Attestation) -> Option<(&'static str, String, String, String)> {
+        use ciris_persist::federation::types::attestation_type;
+        let what = if att.attestation_type == attestation_type::DELEGATES_TO
+            && ciris_persist::federation::admission::is_owner_binding_envelope(
+                &att.attestation_envelope,
+            ) {
+            "owner-binding"
+        } else if crate::membership::dimension_of(att) == Some(crate::chat::KEY_PACKAGE_DIMENSION) {
+            "KeyPackage"
+        } else {
+            return None;
+        };
+        Some((
+            what,
+            att.attesting_key_id.clone(),
+            att.attested_key_id.clone(),
+            att.attestation_id.to_string(),
+        ))
+    }
+
     fn owner_binding_touched(attestation: &Attestation) -> Option<&str> {
         use ciris_persist::federation::types::attestation_type;
         match attestation.attestation_type.as_str() {
@@ -12316,6 +12449,10 @@ impl FederationDirectoryReplicationBridge {
                 // so the high-volume `scores` plane pays one string compare.
                 let owner_invalidation: Option<String> =
                     Self::owner_binding_touched(&record.attestation).map(ToOwned::to_owned);
+                // CIRISEdge#968 — the two arrivals a first contact waits on,
+                // named when they land (they were visible only through the
+                // host's poller and the generic propagation kick).
+                let arrival = Self::contact_arrival(&record.attestation);
                 // CIRISEdge#606 — what the revocation register needs from this
                 // row, captured before the move. `None` for every row that
                 // neither references a blob nor is a `withdraws`; the row is
@@ -12429,6 +12566,16 @@ impl FederationDirectoryReplicationBridge {
                     }
                     if let Some(node) = owner_invalidation {
                         self.invalidate_owner_memo(&node);
+                    }
+                    if let Some((what, author, subject, id)) = arrival {
+                        tracing::info!(
+                            arrival = what,
+                            author = %author,
+                            subject = %subject,
+                            attestation_id = %id,
+                            from_peer = source_peer.unwrap_or("<unattributed>"),
+                            "{what} admitted (CIRISEdge#968)"
+                        );
                     }
                     if let Some(observation) = revocation_observation {
                         self.observe_revocation(observation).await;
@@ -28340,6 +28487,9 @@ pub(crate) mod tests {
     // CIRISEdge#817 — the sweep-bound witnesses: single-flight memos and the
     // permit around the membership-plane and send-set reads.
     mod sweep_bounds_817;
+
+    // CIRISEdge#968 — a local write reaches the next round's send set.
+    mod contact_waits_968;
 
     // Sharing traces is its own consent, per recipient: the serve gate's
     // refuse and allow sides, and the live-state witnesses.

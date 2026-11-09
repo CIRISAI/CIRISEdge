@@ -126,6 +126,8 @@ pub mod coordinator;
 #[cfg(test)]
 mod counting_directory_930;
 pub mod directory;
+#[cfg(test)]
+mod first_contact_retry_968_tests;
 /// CIRISEdge#552 — hashes known to exist whose bodies this node does not
 /// hold. NEVER holdings; see the module docs for why that distinction is the
 /// whole safety of the design.

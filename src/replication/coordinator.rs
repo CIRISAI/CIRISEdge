@@ -245,6 +245,9 @@ pub struct ReplicationCoordinator {
     /// Rings when an ordinary round ends: a held round asks again on this.
     round_finished: tokio::sync::Notify,
     last_round_lost: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#968 — when an ordinary round last COMPLETED: the evidence the
+    /// scheduler reads that this peer answers this node on this plane.
+    last_completed: std::sync::Mutex<Option<std::time::Instant>>,
     /// CIRISEdge#634 — the role-specific inbox. A responder has a standing
     /// bounded inbox its driver drains continuously; an initiator has a
     /// round inbox that lives exactly as long as the driven round, plus an
@@ -351,6 +354,7 @@ impl ReplicationCoordinator {
             peer_lacks_nothing: std::sync::atomic::AtomicU64::new(0),
             round_finished: tokio::sync::Notify::new(),
             last_round_lost: std::sync::atomic::AtomicBool::new(false),
+            last_completed: std::sync::Mutex::new(None),
             inbox,
             pull_exchanges: std::sync::Mutex::new(HashMap::new()),
             pull_retry_at_secs: AtomicU64::new(0),
@@ -883,7 +887,22 @@ impl ReplicationCoordinator {
     pub(crate) fn note_round_ended(&self, lost: bool) {
         self.provider.round_ended(self.kind, lost);
         self.last_round_lost.store(lost, Ordering::Release);
+        if !lost {
+            if let Ok(mut at) = self.last_completed.lock() {
+                *at = Some(std::time::Instant::now());
+            }
+        }
         self.round_finished.notify_one();
+    }
+
+    /// CIRISEdge#968 — did an ordinary round on this coordinator complete
+    /// within `window`? `false` before the first completes.
+    pub(crate) fn completed_within(&self, window: std::time::Duration) -> bool {
+        self.last_completed
+            .lock()
+            .ok()
+            .and_then(|at| *at)
+            .is_some_and(|at| at.elapsed() <= window)
     }
 
     /// Was the latest ordinary round lost? `false` before the first ends.

@@ -1588,7 +1588,12 @@ impl ReplicationRuntime {
     ///
     /// # Errors
     /// The scheduler has shut down.
+    ///
+    /// CIRISEdge#968 — a kick is the host reporting a local write, so it drops
+    /// the send-set memos first ([`FederationDirectoryReplicationBridge::invalidate_send_set_memos`]):
+    /// the round it fires reads the consent grant it was fired for.
     pub async fn round_now(&self, peer_key_id: &str) -> Result<(), ReplicationRuntimeError> {
+        self.bridge.invalidate_send_set_memos("host_kick");
         self.scheduler_handle.round_now(Some(peer_key_id)).await?;
         Ok(())
     }
@@ -1606,6 +1611,8 @@ impl ReplicationRuntime {
     ///
     /// The scheduler's run loop has exited.
     pub async fn round_now_all(&self) -> Result<(), ReplicationRuntimeError> {
+        // CIRISEdge#968 — see [`Self::round_now`].
+        self.bridge.invalidate_send_set_memos("host_kick");
         self.scheduler_handle.round_now(None).await?;
         Ok(())
     }
@@ -1648,8 +1655,11 @@ impl ReplicationRuntime {
         let mut waiter = self.convergence();
         let mut checks = 0u32;
         let mut kicks = 0u32;
+        // CIRISEdge#968 — once, not per re-kick: the host may have just
+        // written what this sync is for; the re-kicks below wait on the peer.
+        self.bridge.invalidate_send_set_memos("host_sync");
         loop {
-            self.round_now(peer_key_id).await?;
+            self.scheduler_handle.round_now(Some(peer_key_id)).await?;
             kicks += 1;
             let remaining = budget.saturating_sub(start.elapsed());
             if remaining.is_zero() {
@@ -1876,6 +1886,9 @@ impl ReplicationRuntime {
     /// the park, and the rows would wait out their terminal window. See
     /// [`FederationDirectoryReplicationBridge::release_signer`].
     pub fn release_signer(&self, key_id: &str) -> usize {
+        // CIRISEdge#968 — a local key registration or claim: what moves to a
+        // peer may have changed with it.
+        self.bridge.invalidate_send_set_memos("release_signer");
         self.bridge.release_signer(key_id)
     }
 
@@ -1885,6 +1898,10 @@ impl ReplicationRuntime {
     /// claim. See
     /// [`FederationDirectoryReplicationBridge::release_bound_signer`].
     pub fn release_bound_signer(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> usize {
+        // CIRISEdge#968 — the owner-binding a claim wrote moves the owner and
+        // send-set memos; no apply event announces it.
+        self.bridge
+            .invalidate_send_set_memos("release_bound_signer");
         self.bridge.release_bound_signer(kind, envelope_bytes)
     }
 
