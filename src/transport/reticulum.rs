@@ -13373,14 +13373,8 @@ impl DialCtx {
             // the LINK_REQUEST or a resource transfer cannot start. `established`
             // resolves `Ok(())` on establishment, `Err(LinkClosed)` if the peer
             // refused / the link died first; a timeout means no route or a
-            // stalled dial. A zero budget is spent before anything can answer:
-            // the outcome is not polled, so a proof already in is not taken.
-            let outcome = if establish_timeout.is_zero() {
-                None
-            } else {
-                with_timeout(establish_timeout, established).await
-            };
-            (link_id, outcome)
+            // stalled dial.
+            (link_id, within_budget(establish_timeout, established).await)
         };
         if let Some(refused) =
             self.link_proof_refused(destination_key_id, &peer.dest_hash, outcome.as_ref())
@@ -22161,6 +22155,16 @@ async fn consult_and_prune_blackhole(
 }
 
 // ─── Runtime-agnostic timeout helper ────────────────────────────────
+
+/// A dial's wait on its establishment within `budget`. A zero budget is spent
+/// before anything can answer: the outcome is not polled, so a proof already
+/// in is not taken and no clock decides the race.
+async fn within_budget<F: std::future::Future>(budget: Duration, fut: F) -> Option<F::Output> {
+    if budget.is_zero() {
+        return None;
+    }
+    with_timeout(budget, fut).await
+}
 
 /// Bound `fut` by `dur`, returning `None` on timeout. Runtime-agnostic:
 /// `futures_timer::Delay` carries its OWN timer thread, so this needs NO tokio
