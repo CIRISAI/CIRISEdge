@@ -131,7 +131,7 @@ classifiers = [
 # renames the raw-layout capsules with the crate version (CIRISEdge#960), so
 # neither neighbour minor may load beside this cdylib.
 dependencies = [
-    "ciris-persist>=61.1.0,<61.2",
+    "ciris-persist>=61.2.0,<61.3",
 ]
 dynamic = ["version"]
 

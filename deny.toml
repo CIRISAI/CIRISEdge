@@ -192,15 +192,6 @@ ignore = [
     # build-time only, ships in zero production binaries. The drop-in
     # replacement `pastey` requires rav1e upstream to migrate; tracking
     # https://github.com/xiph/rav1e/issues for a paste→pastey swap.
-    # v44.1.1 — RUSTSEC-2026-0459 (CVE-2026-119375), published 2026-11-09:
-    # bundled SQLite < 3.54.0 can return uninitialized page-cache memory when a
-    # database file is opened with a crafted sibling `-wal` of a different page
-    # size. Local only: the process must open a db + wal a less trusted party
-    # wrote; edge and persist open only the node's own store in its private data
-    # dir. The fix is libsqlite3-sys >= 0.39 / rusqlite 0.41, pinned through
-    # ciris-persist, ciris-verify-core and refinery; edge cannot take it alone.
-    # Clears when those pins move (tracked: CIRISEdge#966).
-    "RUSTSEC-2026-0459",  # bundled SQLite WAL page-size uninit read (local)
 ]
 
 [sources]

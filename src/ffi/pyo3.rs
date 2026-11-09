@@ -172,7 +172,7 @@ use std::time::Duration;
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyCapsule, PyCapsuleMethods};
+use pyo3::types::{PyAnyMethods, PyCapsule};
 use pyo3::wrap_pyfunction;
 #[cfg(test)]
 use tokio::runtime::Handle as RuntimeHandle;
@@ -5743,6 +5743,39 @@ fn parse_hybrid_policy(s: &str, _soft_freshness_window_seconds: u64) -> PyResult
     }
 }
 
+/// CIRISPersist#1242 (persist 61.2) — the name edge asks for, per capsule
+/// method. The seven raw-layout capsules carry
+/// `ciris_persist::<capsule>@<persist version>`, read from persist's
+/// `capsule_names` as THIS build compiled it, so a wheel of another persist
+/// version is refused at the name. The ABI-versioned capsules keep their
+/// `_v1` names; their vtables carry their own ABI check.
+fn expected_capsule_name(method: &str) -> Option<&'static std::ffi::CStr> {
+    ciris_persist::ffi::capsule_names::name_for_method(method).or(match method {
+        "executor_capsule" => Some(c"ciris_persist::executor_capsule_v1"),
+        "directory_ops_capsule" => Some(c"ciris_persist::directory_ops_v1"),
+        "outbound_queue_ops_capsule" => Some(c"ciris_persist::outbound_queue_ops_v1"),
+        _ => None,
+    })
+}
+
+/// CIRISPersist#1242 — every capsule edge unwraps goes through here: the
+/// payload pointer when the capsule carries exactly the name this build
+/// expects for `method`, else persist's `TypeError` led by
+/// `capsule_version_skew`. A method edge has no name for is refused the same
+/// way: there is no name it could check.
+fn checked_capsule_pointer(
+    cap: &Bound<'_, PyCapsule>,
+    method: &str,
+) -> PyResult<std::ptr::NonNull<std::ffi::c_void>> {
+    let Some(expected) = expected_capsule_name(method) else {
+        return Err(PyTypeError::new_err(format!(
+            "{}: edge knows no capsule name for engine.{method}()",
+            ciris_persist::ffi::capsule_names::CAPSULE_VERSION_SKEW
+        )));
+    };
+    ciris_persist::ffi::capsule_names::checked_pointer(cap, expected)
+}
+
 /// v0.9.2 (CIRISEdge#22 / CIRISPersist#109) — call a host engine's
 /// `*_capsule` `#[pymethod]`, extract the typed reference from the
 /// returned `PyCapsule`, and hand it to `map` to produce an owned
@@ -5847,13 +5880,10 @@ where
     // the `.pointer_checked()` call. We hold `cap` (the `Bound`) for
     // both, no Python code runs between them, and the capsule's name
     // is set once at construction in persist — no SetName drift.
-    let name = cap
-        .name()
-        .map_err(|e| PyTypeError::new_err(format!("engine.{method}(): capsule name: {e}")))?;
-    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
-    let ptr = cap
-        .pointer_checked(name_cstr)
-        .map_err(|e| PyTypeError::new_err(format!("engine.{method}(): pointer_checked: {e}")))?;
+    // CIRISPersist#1242 (61.2) — ask for the name THIS build compiled, never
+    // the capsule's own: a raw-layout capsule from another persist build is
+    // refused `capsule_version_skew` before anything is dereferenced.
+    let ptr = checked_capsule_pointer(&cap, method)?;
     let inner: &T = unsafe { &*(ptr.as_ptr() as *const T) };
     Ok(map(inner))
 }
@@ -5979,17 +6009,9 @@ fn extract_trust_scoring(
     // pyo3 0.29's `pointer_checked(name)` enforces a name match; pass
     // the capsule's own name through. See `extract_engine_capsule_arc`
     // above for the matching pattern + SAFETY rationale.
-    let name = cap.name().map_err(|e| {
-        TrustScoringCapsuleError::Other(PyTypeError::new_err(format!(
-            "trust_scoring_capsule: capsule name: {e}"
-        )))
-    })?;
-    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
-    let ptr = cap.pointer_checked(name_cstr).map_err(|e| {
-        TrustScoringCapsuleError::Other(PyTypeError::new_err(format!(
-            "trust_scoring_capsule: pointer_checked: {e}"
-        )))
-    })?;
+    // CIRISPersist#1242 — the versioned name this build compiled.
+    let ptr = checked_capsule_pointer(&cap, "trust_scoring_capsule")
+        .map_err(TrustScoringCapsuleError::Other)?;
     let inner: &Arc<dyn ciris_persist::federation::TrustScoring> =
         unsafe { &*(ptr.as_ptr() as *const Arc<dyn ciris_persist::federation::TrustScoring>) };
     Ok(Arc::clone(inner))
@@ -6357,17 +6379,9 @@ fn extract_local_signer(
     // pyo3 0.29's `pointer_checked(name)` enforces a name match; pass
     // the capsule's own name through. See `extract_engine_capsule_arc`
     // above for the matching pattern + SAFETY rationale.
-    let name = cap.name().map_err(|e| {
-        LocalSignerCapsuleError::Other(PyTypeError::new_err(format!(
-            "local_signer_capsule: capsule name: {e}"
-        )))
-    })?;
-    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
-    let ptr = cap.pointer_checked(name_cstr).map_err(|e| {
-        LocalSignerCapsuleError::Other(PyTypeError::new_err(format!(
-            "local_signer_capsule: pointer_checked: {e}"
-        )))
-    })?;
+    // CIRISPersist#1242 — the versioned name this build compiled.
+    let ptr = checked_capsule_pointer(&cap, "local_signer_capsule")
+        .map_err(LocalSignerCapsuleError::Other)?;
     let inner: &Arc<ciris_persist::signing::LocalSigner> =
         unsafe { &*(ptr.as_ptr() as *const Arc<ciris_persist::signing::LocalSigner>) };
     Ok(Arc::clone(inner))
@@ -12126,6 +12140,100 @@ mod pyo3_tier2_tests {
     use crate::transport::{InboundFrame, TransportId, TransportSendOutcome};
 
     use std::sync::OnceLock;
+
+    /// CIRISPersist#1242 — **a raw-layout capsule laid out by another persist
+    /// build is refused before it is dereferenced.** A capsule carrying the
+    /// pre-61.2 unversioned name, or the name of another persist version, is
+    /// a `TypeError` led by `capsule_version_skew`, at the helper and through
+    /// `extract_capsule` and both typed extractors. The name this build
+    /// compiled is accepted. Red under: passing the capsule's own name back
+    /// (`pointer_checked(cap.name())`), the pre-61.2 behaviour.
+    #[cfg(feature = "transport-reticulum")]
+    #[test]
+    fn a_capsule_from_another_persist_build_is_refused_as_version_skew() {
+        use ciris_persist::ffi::capsule_names::{self, CAPSULE_VERSION_SKEW};
+        init_python();
+        Python::attach(|py| {
+            let skewed: [&'static std::ffi::CStr; 3] = [
+                c"ciris_persist::local_signer",
+                c"ciris_persist::local_signer@61.1.0",
+                c"ciris_persist::trust_scoring@99.0.0",
+            ];
+            for name in skewed {
+                let cap = PyCapsule::new_with_value(py, 0_usize, name).expect("capsule");
+                for method in ["local_signer_capsule", "trust_scoring_capsule"] {
+                    let err = checked_capsule_pointer(&cap, method)
+                        .expect_err("a skewed name is refused");
+                    assert!(err.is_instance_of::<PyTypeError>(py), "{err}");
+                    let msg = err.value(py).to_string();
+                    assert!(
+                        msg.starts_with(CAPSULE_VERSION_SKEW),
+                        "{name:?} via {method}: {msg}"
+                    );
+                }
+            }
+            // The same refusal through every extractor that unwraps a capsule.
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                c"class SkewedEngine:\n    def __init__(self, caps):\n        self.caps = caps\n    def local_signer_capsule(self):\n        return self.caps['local_signer']\n    def trust_scoring_capsule(self):\n        return self.caps['trust_scoring']\n    def keyring_signer_capsule(self):\n        return self.caps['keyring_signer']\n",
+                c"skewed_engine.py",
+                c"skewed_engine",
+            )
+            .expect("fake engine module");
+            let caps = pyo3::types::PyDict::new(py);
+            for (key, name) in [
+                ("local_signer", c"ciris_persist::local_signer@61.1.0"),
+                ("trust_scoring", c"ciris_persist::trust_scoring@61.1.0"),
+                ("keyring_signer", c"ciris_persist::keyring_signer@61.1.0"),
+            ] {
+                caps.set_item(
+                    key,
+                    PyCapsule::new_with_value(py, 0_usize, name).expect("capsule"),
+                )
+                .expect("set");
+            }
+            let engine = module
+                .getattr("SkewedEngine")
+                .and_then(|c| c.call1((caps,)))
+                .expect("engine");
+            #[allow(unsafe_code)]
+            let raw = unsafe {
+                extract_capsule::<usize, _, _>(&engine, "keyring_signer_capsule", |v| *v)
+            };
+            let msg = raw.expect_err("refused").value(py).to_string();
+            assert!(msg.starts_with(CAPSULE_VERSION_SKEW), "{msg}");
+            match extract_trust_scoring(&engine) {
+                Err(TrustScoringCapsuleError::Other(e)) => {
+                    let msg = e.value(py).to_string();
+                    assert!(msg.starts_with(CAPSULE_VERSION_SKEW), "{msg}");
+                }
+                other => panic!("trust_scoring: {:?}", other.err().map(|_| "not Other")),
+            }
+            match extract_local_signer(&engine) {
+                Err(LocalSignerCapsuleError::Other(e)) => {
+                    let msg = e.value(py).to_string();
+                    assert!(msg.starts_with(CAPSULE_VERSION_SKEW), "{msg}");
+                }
+                other => panic!("local_signer: {:?}", other.err().map(|_| "not Other")),
+            }
+
+            // The name this build compiled is accepted, for every raw-layout
+            // method and every ABI-versioned one edge reads.
+            for (method, name) in capsule_names::RAW_LAYOUT_CAPSULES {
+                let cap = PyCapsule::new_with_value(py, 7_usize, name).expect("capsule");
+                assert!(checked_capsule_pointer(&cap, method).is_ok(), "{method}");
+            }
+            for method in [
+                "executor_capsule",
+                "directory_ops_capsule",
+                "outbound_queue_ops_capsule",
+            ] {
+                let name = expected_capsule_name(method).expect("known");
+                let cap = PyCapsule::new_with_value(py, 7_usize, name).expect("capsule");
+                assert!(checked_capsule_pointer(&cap, method).is_ok(), "{method}");
+            }
+        });
+    }
 
     /// Initialize the embedded Python interpreter exactly once. Safe
     /// to call from every test; pyo3 0.28's `initialize()` is itself
