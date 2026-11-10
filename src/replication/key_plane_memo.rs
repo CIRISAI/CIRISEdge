@@ -44,6 +44,17 @@
 //! old behaviour was a TTL of zero; the bound is now explicit instead of being
 //! an accident of how often peers asked.
 //!
+//! **The stated bound is two [`MEMO_TTL`]s** (it was one before v45, when the
+//! TTL cleared the memo). With stale-while-revalidate an answer read late in
+//! one epoch can be served through the next, so a write the cursor cannot
+//! see — a purge tombstone above all — may leave a hash offered for up to
+//! 2 × [`MEMO_TTL`] after the write. The cost is bounded and honest: the
+//! peer's Fetch of that hash misses (the row is gone, and admission refuses
+//! it by its tombstone), so the residual is a wasted offer, never a wrong
+//! row. Anything the cursor DOES see (a revocation, a new key row) drops the
+//! answer at once, fresh or stale. Accepted for the v45 LTS (team lead,
+//! 2026-11-09).
+//!
 //! ## v45 (CIRISEdge#971): stale-while-revalidate, a read budget, a listing cache
 //!
 //! Before v45 the TTL cleared the memo and the next listing re-read every
