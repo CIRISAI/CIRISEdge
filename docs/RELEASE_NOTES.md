@@ -10,6 +10,13 @@
   a `TypeError` led by `capsule_version_skew`, before anything is dereferenced. A server that hosts
   edge pins the same persist version; a persist patch release reaches edge through a new edge
   release.
+- **BREAKING: `membership::WidenOutcome` gains `NeedsCosign`.** A widening offered with one voice
+  in a room whose protocol wants more (a `majority` room of two or more) used to come back as an
+  `Err` carrying persist's `roster_consensus_insufficient`; it is now
+  `Ok(WidenOutcome::NeedsCosign { scope, group_key_id, member_key_id, role, proposal_id })`, read
+  from the typed refusal's rule. Every other refusal is still an `Err`. A consumer that matches
+  `WidenOutcome` exhaustively must add the arm. The have/need counts are not on it: edge evaluates
+  no quorum, and they wait on persist (CIRISPersist#1250).
 
 # v44.1.2 — FountainHoldingClaim retired from the wire
 

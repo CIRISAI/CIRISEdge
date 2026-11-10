@@ -1278,3 +1278,135 @@ async fn one_signer_never_withdraws_a_cosigned_row() {
         }
     }
 }
+
+/// alice's room under `majority`, with bob seated (one voice of one), held on
+/// alice's node only. Returns the parties, alice's node and the room.
+async fn majority_room_of_two() -> (Party, Party, Party, Node, String) {
+    let alice = party("alice", 0x11);
+    let bob = party("bob", 0x22);
+    let carol = party("carol", 0x33);
+    let all = [&alice, &bob, &carol];
+    let na = node(&alice, &all, None).await;
+    let room = found_room(&alice, consensus_protocol::MAJORITY, &[&na]).await;
+    consent(&na.dir, &room, &alice, &bob).await;
+    assert!(ciris_edge::community_roster::widen_community(
+        &*na.dir,
+        &room,
+        &bob.person.key_id,
+        None,
+        at(1),
+        &[&alice.person],
+    )
+    .await
+    .expect("bob, one voice of one"));
+    assert_eq!(active(&na.dir, &room).await, sorted(&[&alice, &bob]));
+    (alice, bob, carol, na, room)
+}
+
+/// **v45 — a widening one voice short is `NeedsCosign`, not an error.** In a
+/// `majority` room of two, carol's acceptance is held and alice's widener
+/// offers her one voice: persist refuses it with `roster_consensus_insufficient`,
+/// and edge reports the widening as waiting for cosignatures, read from the
+/// typed refusal's rule. Edge counts nothing. Two voices then seat carol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_widening_one_voice_short_waits_for_cosignatures_v45() {
+    let (alice, bob, carol, na, room) = Box::pin(majority_room_of_two()).await;
+    let proposal = membership::propose(
+        &*na.dir,
+        GroupScope::Community,
+        &room,
+        &carol.person.key_id,
+        None,
+        chrono::Utc::now() + chrono::Duration::days(7),
+        &alice.person,
+    )
+    .await
+    .expect("alice proposes carol");
+    let acceptance = membership::reply(&*na.dir, &proposal.attestation_id, true, &carol.person)
+        .await
+        .expect("carol accepts");
+
+    let widener = MembershipWidener::new(vec![Arc::clone(&alice.person)]);
+    let outcome = membership::widen_on_acceptance(&*na.dir, &acceptance, &widener)
+        .await
+        .expect("one voice short is not an error");
+    match outcome {
+        membership::WidenOutcome::NeedsCosign {
+            scope,
+            group_key_id,
+            member_key_id,
+            role,
+            proposal_id,
+        } => {
+            assert_eq!(scope, GroupScope::Community);
+            assert_eq!(group_key_id, room);
+            assert_eq!(member_key_id, carol.person.key_id);
+            assert_eq!(role, None);
+            assert_eq!(proposal_id, proposal.attestation_id);
+        }
+        other => panic!("expected NeedsCosign, got {other:?}"),
+    }
+    assert!(
+        !active(&na.dir, &room).await.contains(&carol.person.key_id),
+        "nothing was seated"
+    );
+
+    // Two voices of two seat her.
+    assert!(membership::widen_cosigned(
+        &*na.dir,
+        GroupScope::Community,
+        &room,
+        &carol.person.key_id,
+        None,
+        chrono::Utc::now(),
+        &[&alice.person, &bob.person],
+    )
+    .await
+    .expect("alice and bob together are a majority"));
+    assert_eq!(
+        active(&na.dir, &room).await,
+        sorted(&[&alice, &bob, &carol])
+    );
+}
+
+/// **v45 — a declined invitation is still a terminal error.** carol declines;
+/// the decline is no acceptance to widen on, and a widening offered with the
+/// room's full majority is refused by the consent rule, terminal. Only the
+/// short-of-protocol rule is `NeedsCosign`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_declined_invitation_is_still_a_terminal_refusal_v45() {
+    let (alice, bob, carol, na, room) = Box::pin(majority_room_of_two()).await;
+    let proposal = membership::propose(
+        &*na.dir,
+        GroupScope::Community,
+        &room,
+        &carol.person.key_id,
+        None,
+        chrono::Utc::now() + chrono::Duration::days(7),
+        &alice.person,
+    )
+    .await
+    .expect("alice proposes carol");
+    let decline = membership::reply(&*na.dir, &proposal.attestation_id, false, &carol.person)
+        .await
+        .expect("carol declines");
+    let widener = MembershipWidener::new(vec![Arc::clone(&alice.person)]);
+    assert!(matches!(
+        membership::widen_on_acceptance(&*na.dir, &decline, &widener).await,
+        Ok(membership::WidenOutcome::NotAnAcceptance)
+    ));
+    let err = membership::widen_cosigned(
+        &*na.dir,
+        GroupScope::Community,
+        &room,
+        &carol.person.key_id,
+        None,
+        chrono::Utc::now(),
+        &[&alice.person, &bob.person],
+    )
+    .await
+    .expect_err("a declined invitation never seats");
+    assert!(err.rule().is_some(), "refused by a consent rule: {err}");
+    assert!(!err.is_retryable(), "terminal: {err}");
+    assert!(!active(&na.dir, &room).await.contains(&carol.person.key_id));
+}

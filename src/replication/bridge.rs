@@ -13411,6 +13411,19 @@ impl FederationDirectoryReplicationBridge {
                 // bypasses the choke): release what it admits here.
                 self.release_audience(&group_key_id);
             }
+            Ok(crate::membership::WidenOutcome::NeedsCosign {
+                group_key_id,
+                member_key_id,
+                proposal_id,
+                ..
+            }) => tracing::info!(
+                group = %group_key_id,
+                member = %member_key_id,
+                proposal = %proposal_id,
+                acceptance = %row.attestation_id,
+                "membership widening waits for the room's cosignatures: one voice is short of \
+                 its protocol (roster_consensus_insufficient)"
+            ),
             Ok(other) => tracing::debug!(
                 acceptance = %row.attestation_id,
                 outcome = ?other,
