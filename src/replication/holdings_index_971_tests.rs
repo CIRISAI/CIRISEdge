@@ -44,7 +44,7 @@ use super::counting_directory_930::CountingDirectory;
 
 /// A probe spacing no test outlives: "inside the spacing" is then
 /// deterministic, and only a dirt mark makes the feed probe.
-pub(super) const NO_TEST_OUTLIVES: Duration = Duration::from_secs(3600);
+pub(super) const NO_TEST_OUTLIVES: Duration = Duration::from_hours(1);
 use super::holdings_index::Status;
 use super::key_plane_v59_tests::{round, NodeA};
 use super::park_fresh_858_tests::{hold, Ident};
@@ -789,57 +789,18 @@ async fn no_ask_waits_on_the_warm_up_and_none_boots_the_set_before_it_971() {
     }
 }
 
-/// **Every counter this branch adds or relies on is in the exported map, by
-/// name.** The map is `EdgeMetricsBundle::flatten()`, the projection a host
-/// exports whole (CIRISServer's `/v1/federation/metrics` builds its body by
-/// hand from chosen bundle fields and does not carry these families today;
-/// that is the server's to add, and its own test's to prove). Each label is
-/// booked once through the setter production uses, then read back by its
-/// flattened name. A label renamed, dropped from its family, or booked into a
-/// family `flatten` does not project fails here.
-#[test]
-fn every_counter_this_branch_adds_is_exported_by_name_971() {
-    let m = obs::EdgeMetrics::new();
-    let key_plane = [
-        obs::KEY_PLANE_LISTINGS,
-        obs::KEY_PLANE_SWEEPS,
-        obs::KEY_PLANE_SUBJECT_READS,
-        obs::KEY_PLANE_MEMO_HITS,
-        obs::KEY_PLANE_READ_FAILURES,
-        obs::KEY_PLANE_SWEEP_MS,
-        obs::KEY_PLANE_PROBE_READS,
-        obs::KEY_PLANE_PROBE_ROWS,
-        obs::KEY_PLANE_PROBE_FAILURES,
-        obs::KEY_PLANE_INVALIDATED,
-        obs::KEY_PLANE_REBUILDS,
-        obs::KEY_PLANE_REBUILDS_FIRST,
-        obs::KEY_PLANE_REBUILDS_TTL,
-        obs::KEY_PLANE_FORGOTTEN,
-        obs::KEY_PLANE_INBOX_OVERFLOWS,
-        obs::KEY_PLANE_PLANE_DIRT,
-        obs::KEY_PLANE_PROBES_SPACED,
-        obs::KEY_PLANE_FEED_DIRTY_MARKS,
-        obs::KEY_PLANE_LISTING_CACHE_HITS,
-        obs::KEY_PLANE_BUDGET_DEFERRED,
-        obs::KEY_PLANE_STALE_SERVED,
-        obs::KEY_PLANE_REVALIDATED,
-    ];
-    let sites = [
-        obs::SWEEP_PERMIT_HOLDINGS_INDEX,
-        obs::SWEEP_PERMIT_HOLDINGS_ROWS,
-        obs::SWEEP_PERMIT_PLANE_PAGE,
-        obs::SWEEP_PERMIT_ACCORD_EVIDENCE,
-        obs::SWEEP_PERMIT_SUBJECT_PULL,
-        obs::SWEEP_PERMIT_ANNOUNCED_TESTIMONY,
-        obs::SWEEP_PERMIT_KEY_PLANE_SUBJECT,
-        obs::SWEEP_PERMIT_FEED_ATTESTATION,
-        obs::SWEEP_PERMIT_FEED_ROUTE,
-        obs::SWEEP_PERMIT_SEND_SET,
-        obs::SWEEP_PERMIT_ADVERTISE_PAGE,
-        obs::SWEEP_PERMIT_ADVERTISE_REQUIRED,
-        obs::SWEEP_PERMIT_HOLDINGS_WARM,
-        obs::SWEEP_PERMIT_OTHER,
-    ];
+/// The labels this branch adds or relies on, by family.
+struct BranchLabels {
+    key_plane: Vec<&'static str>,
+    sites: Vec<&'static str>,
+    holdings: Vec<&'static str>,
+    gauges: Vec<&'static str>,
+    advertise: Vec<&'static str>,
+}
+
+/// The `holdings_index.*` counters: the index's per-plane families and the
+/// stale-route marks.
+fn holdings_labels() -> Vec<&'static str> {
     let mut holdings: Vec<&'static str> = [
         obs::HOLDINGS_ANSWERS_SET,
         obs::HOLDINGS_ANSWERS_DRAIN,
@@ -870,6 +831,51 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
         obs::STALE_ROUTE_EVICTED,
         obs::STALE_ROUTE_CLEARED,
     ]);
+    holdings
+}
+
+fn branch_labels() -> BranchLabels {
+    let key_plane = vec![
+        obs::KEY_PLANE_LISTINGS,
+        obs::KEY_PLANE_SWEEPS,
+        obs::KEY_PLANE_SUBJECT_READS,
+        obs::KEY_PLANE_MEMO_HITS,
+        obs::KEY_PLANE_READ_FAILURES,
+        obs::KEY_PLANE_SWEEP_MS,
+        obs::KEY_PLANE_PROBE_READS,
+        obs::KEY_PLANE_PROBE_ROWS,
+        obs::KEY_PLANE_PROBE_FAILURES,
+        obs::KEY_PLANE_INVALIDATED,
+        obs::KEY_PLANE_REBUILDS,
+        obs::KEY_PLANE_REBUILDS_FIRST,
+        obs::KEY_PLANE_REBUILDS_TTL,
+        obs::KEY_PLANE_FORGOTTEN,
+        obs::KEY_PLANE_INBOX_OVERFLOWS,
+        obs::KEY_PLANE_PLANE_DIRT,
+        obs::KEY_PLANE_PROBES_SPACED,
+        obs::KEY_PLANE_FEED_DIRTY_MARKS,
+        obs::KEY_PLANE_LISTING_CACHE_HITS,
+        obs::KEY_PLANE_BUDGET_DEFERRED,
+        obs::KEY_PLANE_STALE_SERVED,
+        obs::KEY_PLANE_REVALIDATED,
+    ];
+    let sites = vec![
+        obs::SWEEP_PERMIT_HOLDINGS_INDEX,
+        obs::SWEEP_PERMIT_HOLDINGS_ROWS,
+        obs::SWEEP_PERMIT_PLANE_PAGE,
+        obs::SWEEP_PERMIT_ACCORD_EVIDENCE,
+        obs::SWEEP_PERMIT_SUBJECT_PULL,
+        obs::SWEEP_PERMIT_ANNOUNCED_TESTIMONY,
+        obs::SWEEP_PERMIT_KEY_PLANE_SUBJECT,
+        obs::SWEEP_PERMIT_FEED_ATTESTATION,
+        obs::SWEEP_PERMIT_FEED_ROUTE,
+        obs::SWEEP_PERMIT_SEND_SET,
+        obs::SWEEP_PERMIT_ADVERTISE_PAGE,
+        obs::SWEEP_PERMIT_ADVERTISE_REQUIRED,
+        obs::SWEEP_PERMIT_HOLDINGS_WARM,
+        obs::SWEEP_PERMIT_OTHER,
+    ];
+    let holdings = holdings_labels();
     let mut gauges: Vec<&'static str> = [
         obs::HOLDINGS_GAUGE_SIZE,
         obs::HOLDINGS_GAUGE_STATUS,
@@ -887,26 +893,47 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
     gauges.extend(obs::KEY_PLANE_GAUGE_MEMO_ENTRIES);
     gauges.extend(obs::KEY_PLANE_GAUGE_UNREAD);
     gauges.extend(obs::KEY_PLANE_GAUGE_STALE);
-    let advertise = [
+    let advertise = vec![
         obs::ADVERTISE_SEND_SET_MEMO_HIT,
         obs::ADVERTISE_SEND_SET_READ,
         obs::ADVERTISE_SEND_SET_INVALIDATED,
         obs::ADVERTISE_SEND_SET_DROPPED_LIVE,
         obs::ADVERTISE_SEND_SET_EXPIRED,
     ];
-    for label in key_plane {
+    BranchLabels {
+        key_plane,
+        sites,
+        holdings,
+        gauges,
+        advertise,
+    }
+}
+
+/// **Every counter this branch adds or relies on is in the exported map, by
+/// name.** The map is `EdgeMetricsBundle::flatten()`, the projection a host
+/// exports whole (CIRISServer's `/v1/federation/metrics` builds its body by
+/// hand from chosen bundle fields and does not carry these families today;
+/// that is the server's to add, and its own test's to prove). Each label is
+/// booked once through the setter production uses, then read back by its
+/// flattened name. A label renamed, dropped from its family, or booked into a
+/// family `flatten` does not project fails here.
+#[test]
+fn every_counter_this_branch_adds_is_exported_by_name_971() {
+    let m = obs::EdgeMetrics::new();
+    let l = branch_labels();
+    for &label in &l.key_plane {
         m.add_key_plane_sweep(label, 1);
     }
-    for site in sites {
+    for &site in &l.sites {
         m.inc_sweep_permit(site);
     }
-    for label in &holdings {
+    for label in &l.holdings {
         m.add_holdings_index(label, 1);
     }
-    for label in &gauges {
+    for label in &l.gauges {
         m.set_holdings_index_gauge(label, 7);
     }
-    for label in advertise {
+    for &label in &l.advertise {
         m.inc_advertise(label);
     }
     let flat = m.snapshot().flatten();
@@ -916,28 +943,28 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
             missing.push(name);
         }
     };
-    for label in key_plane {
+    for &label in &l.key_plane {
         let name = format!("key_plane_sweep.{label}");
         expect(name.clone(), flat.counters.get(&name) == Some(&1));
     }
-    for site in sites {
+    for &site in &l.sites {
         let name = format!("sweep_permits.{site}");
         expect(name.clone(), flat.counters.get(&name) == Some(&1));
     }
-    for label in &holdings {
+    for label in &l.holdings {
         let name = format!("holdings_index.{label}");
         expect(name.clone(), flat.counters.get(&name) == Some(&1));
     }
-    for label in &gauges {
+    for label in &l.gauges {
         let name = format!("holdings_index_gauge.{label}");
         let got = flat
             .counters
             .get(&name)
-            .map(|v| *v as f64)
+            .map(|v| f64::from(u32::try_from(*v).unwrap_or(u32::MAX)))
             .or(flat.gauges.get(&name).copied());
         expect(name.clone(), got == Some(7.0));
     }
-    for label in advertise {
+    for &label in &l.advertise {
         let name = format!("advertise.{label}");
         expect(name.clone(), flat.counters.get(&name) == Some(&1));
     }
@@ -946,6 +973,12 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
         "not in the exported map by name: {missing:?}"
     );
 
+    assert_branch_families_are_fixed_labels(&flat, &l);
+}
+
+/// No label in the families this branch writes is id-shaped, and every label
+/// in the three families only this branch writes is a fixed constant.
+fn assert_branch_families_are_fixed_labels(flat: &obs::FlatMetrics, l: &BranchLabels) {
     // The families are read from an UNAUTHENTICATED endpoint (CIRISServer's
     // `/v1/federation/metrics` exports `flatten()` whole and drops any family
     // whose label carries a peer or key id). So no label in the families this
@@ -953,9 +986,9 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
     // only this branch writes is one of the fixed constants above: a later
     // change that formats an id into a label fails here, not on the seat.
     let mut fixed: HashSet<String> = HashSet::new();
-    fixed.extend(sites.iter().map(|s| format!("sweep_permits.{s}")));
-    fixed.extend(holdings.iter().map(|l| format!("holdings_index.{l}")));
-    fixed.extend(gauges.iter().map(|l| format!("holdings_index_gauge.{l}")));
+    fixed.extend(l.sites.iter().map(|s| format!("sweep_permits.{s}")));
+    fixed.extend(l.holdings.iter().map(|l| format!("holdings_index.{l}")));
+    fixed.extend(l.gauges.iter().map(|l| format!("holdings_index_gauge.{l}")));
     let families = [
         "key_plane_sweep.",
         "sweep_permits.",
@@ -986,8 +1019,13 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
         unlisted.is_empty(),
         "labels in this branch's families that are not fixed constants: {unlisted:?}"
     );
-    // The detector itself, on the shapes it must refuse and the ones it must
-    // pass: a key id, a 32-byte hash, a short hex run, a route with a peer.
+}
+
+/// The id-shape detector itself, on the shapes it must refuse and the ones
+/// it must pass: a key id, a 32-byte hash, a short hex run, a route with a
+/// peer.
+#[test]
+fn the_id_shape_detector_refuses_ids_and_passes_labels_971() {
     assert!(label_is_id_shaped(&format!(
         "sweep_permits.{}",
         "ab".repeat(32)

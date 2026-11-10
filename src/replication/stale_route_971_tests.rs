@@ -175,7 +175,7 @@ async fn counted_bridge(
             Arc::new(Vec::new),
             BridgeConfig {
                 feed_probe_spacing: std::time::Duration::ZERO,
-                holdings_audit_every: std::time::Duration::from_secs(3600),
+                holdings_audit_every: std::time::Duration::from_hours(1),
                 ..BridgeConfig::default()
             },
         )

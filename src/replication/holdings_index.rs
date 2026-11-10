@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn an_audit_is_due_after_the_interval() {
-        let every = Duration::from_secs(60);
+        let every = Duration::from_mins(1);
         let index = HoldingsIndex::new(true, every);
         let p = IndexPlane::Attestation;
         let t0 = Instant::now();

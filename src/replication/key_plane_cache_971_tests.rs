@@ -46,7 +46,7 @@ const PLANES: [EnvelopeKind; 4] = [
 
 /// The feed's probe spacing in the witnesses that report each write by a
 /// door (longer than any test: "inside the spacing" is deterministic).
-const NO_TEST_OUTLIVES: Duration = Duration::from_secs(3600);
+const NO_TEST_OUTLIVES: Duration = Duration::from_hours(1);
 
 /// A shared, mutable subject list: the host's set as the witness moves it.
 type Subjects = Arc<Mutex<Vec<String>>>;

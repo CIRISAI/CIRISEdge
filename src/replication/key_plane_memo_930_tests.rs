@@ -46,7 +46,7 @@ const PLANES: [EnvelopeKind; 4] = [
 /// no assertion rests on a clock. A write that bypasses the choke reaches a
 /// listing at once only through a door that marks the feed dirty, which is
 /// how a host reports it (its kick reaches `invalidate_send_set_memos`).
-const NO_TEST_OUTLIVES: std::time::Duration = std::time::Duration::from_secs(3600);
+const NO_TEST_OUTLIVES: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// A bridge over `dir` whose self set and cohort are both `subjects` (so
 /// `Global` = self ∪ cohort carries every subject TWICE, as production's
@@ -639,7 +639,7 @@ async fn a_kick_marks_the_feed_before_its_rounds_ask_971() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let own = subjects.clone();
     let config = ReplicationRuntimeConfig {
-        enable_bundle_bootstrap_peers: false,
+        disable_bundle_bootstrap_peers: true,
         scheduler: SchedulerConfig {
             cadence: Duration::from_hours(1),
             round_timeout: Duration::from_millis(200),

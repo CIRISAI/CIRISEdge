@@ -381,7 +381,7 @@ fn resolve_holdings_index(mut config: BridgeConfig) -> BridgeConfig {
                 keeping_secs = config.holdings_audit_every.as_secs(),
                 "holdings index audit cadence is not a positive whole number of \
                  seconds: IGNORED, keeping the configured value (tracked: \
-                 CIRISEdge#971)"
+                 tracked: CIRISEdge#971)"
             ),
         }
     }
@@ -421,7 +421,7 @@ fn resolve_key_plane_levers(mut config: BridgeConfig) -> BridgeConfig {
                 env = BridgeConfig::KEY_PLANE_READ_BUDGET_ENV,
                 keeping = config.key_plane_read_budget,
                 "key-plane read budget is not a positive whole number: IGNORED, \
-                 keeping the configured value (CIRISEdge#971)"
+                 keeping the configured value (tracked: CIRISEdge#971)"
             ),
         }
     }
@@ -3236,9 +3236,13 @@ mod tests {
     }
 
     /// (4-iv) **The serve-node check is booked under its own caller label**
-    /// (`edge.bundle.seats`), at start and in the re-check, so the seat's
-    /// `snapshot().callers` does not file it under `other`. Mutation: drop the
-    /// `scoped` wrap in `bundle_bootstrap_peers_held`, and the label is `-`.
+    /// (`edge.bundle.seats`), at start and in the re-check, so it is not an
+    /// unscoped read (persist's `unattributed`). persist counts only the
+    /// attestation-row doors today, not `lookup_public_key`, so the label
+    /// reaches `snapshot().callers` only once persist counts that door
+    /// (CIRISPersist#1249); this witness reads the scope edge sets. Mutation:
+    /// drop the `scoped` wrap in `bundle_bootstrap_peers_held`, and the label
+    /// is `-`.
     #[tokio::test]
     async fn the_serve_node_check_names_its_caller_971() {
         use crate::replication::counting_directory_930::CountingDirectory;

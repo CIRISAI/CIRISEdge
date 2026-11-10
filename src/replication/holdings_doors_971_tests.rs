@@ -114,7 +114,7 @@ async fn door_promotion_971() {
 async fn door_holder_claim_971() {
     use ciris_persist::federation::blobs::{BlobBody, BlobStorage as _};
     use ciris_persist::federation::holding_claim::{sign_holding_claim, ClaimScope};
-    use ciris_persist::federation::types::CryptoTier;
+    use ciris_persist::federation::types::cohort_scope::CryptoTier;
     use sha2::Digest as _;
     let dir = store_with(&["door-hold-h", "door-hold-p"], identity_type::NODE).await;
     let h = ts::local_signer("door-hold-h");
@@ -244,7 +244,7 @@ async fn door_group_plane_link_971() {
             .map(|m| FamilyMember {
                 key_id: (*m).to_owned(),
                 joined_at: founded_at,
-                role: "member".to_owned(),
+                role: Some("member".to_owned()),
             })
             .collect(),
         founded_at,
@@ -561,7 +561,7 @@ async fn the_set_tracks_the_index_through_every_door_971() {
             Arc::clone(&b_dir) as Arc<dyn FederationDirectory>,
             b_me.key_id(),
             publish.clone(),
-            quiet.clone(),
+            quiet,
             None,
         );
         let off = bridge_with(
@@ -765,7 +765,7 @@ async fn the_set_tracks_the_index_through_every_door_971() {
                             .map(|m| FamilyMember {
                                 key_id: m.clone(),
                                 joined_at: at,
-                                role: "member".to_owned(),
+                                role: Some("member".to_owned()),
                             })
                             .collect(),
                         founded_at: at,

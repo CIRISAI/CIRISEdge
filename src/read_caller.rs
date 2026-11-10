@@ -162,10 +162,17 @@ fn callers() -> &'static [Option<Caller>; Site::ALL.len()] {
 }
 
 /// Run `fut` with every store read it makes on its task credited to `site`.
-pub(crate) async fn scoped<F: Future>(site: Site, fut: F) -> F::Output {
+///
+/// Not an `async fn`: an `async fn` keeps its argument `fut` in its state
+/// beside the `caller_scope` future `fut` is moved into, so every scope
+/// doubled the size of the future it wrapped, and nested scopes compounded
+/// it (clippy's `large_futures` on the integrated v45 tree). Returning one
+/// of the two futures directly stores `fut` once.
+pub(crate) fn scoped<F: Future>(site: Site, fut: F) -> impl Future<Output = F::Output> {
+    use futures::future::Either;
     match callers()[site.slot()] {
-        Some(caller) => caller_scope(caller, fut).await,
-        None => fut.await,
+        Some(caller) => Either::Left(caller_scope(caller, fut)),
+        None => Either::Right(fut),
     }
 }
 

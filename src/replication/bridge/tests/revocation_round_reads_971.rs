@@ -85,7 +85,7 @@ struct Cost {
     calls: usize,
     pages: usize,
     permits: u64,
-    by_method: std::collections::HashMap<String, usize>,
+    by_method: std::collections::BTreeMap<&'static str, usize>,
 }
 
 struct Seat {

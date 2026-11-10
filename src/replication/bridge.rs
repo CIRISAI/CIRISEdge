@@ -2714,11 +2714,6 @@ pub struct FederationDirectoryReplicationBridge {
     /// CIRISEdge#817 — how many times `rooted_with` actually walked the trust
     /// root (its memo missed): the per-Deliver memo's witness. `Relaxed`.
     rooted_walks: std::sync::atomic::AtomicUsize,
-    /// CIRISEdge#817 — test-only read probe: an injected delay and an
-    /// in-flight high-water mark at the persist reads the sweep permit must
-    /// bound. See [`ReadProbe`].
-    #[cfg(test)]
-    read_probe: ReadProbe,
     /// CIRISEdge#433 — the live metrics handle backing the WITHHOLD LEDGER + the
     /// replication-plane served counter. `None` makes every increment a no-op, so
     /// the (extensive) test constructions below stay untouched; every PRODUCTION
@@ -2926,10 +2921,6 @@ pub struct FederationDirectoryReplicationBridge {
     /// `(subject, MISS_KICK_WINDOW_SECS)`, so a requester polling a subject
     /// nobody holds yet cannot turn the kick into a round storm.
     miss_kicks: Mutex<super::subject_pull::MissKicks>,
-    /// Test clock for the limiters: seconds added to the wall clock, so a
-    /// witness can step past a window without sleeping through it.
-    #[cfg(test)]
-    clock_skew_secs: std::sync::atomic::AtomicU64,
     /// ROLE_MATRIX Axis 3 — this node's own serving tier, cached (sync reads
     /// on the apply loop, async refresh once per TTL). Fail-closed: reads
     /// `None` until first resolution.
@@ -3027,27 +3018,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// permanently dark if the stored route is ever removed. Capacity
     /// [`STALE_ROUTE_MARKS`], front-drop; see there for the numbers.
     stale_routes: RefusalBackoff,
-    /// CIRISEdge#971 — test-only: `false` runs the advertise's gates in the
-    /// pre-v45 order (the audience gate's reach half only at the audience
-    /// gate), the reference the agreement witness compares against.
+    /// Test-only probes and switches (sweep read probe, limiter clock, the
+    /// #971 gate-order and first-contact references, the warm-up event),
+    /// one field so the constructor names them once ([`TestProbes`]).
     #[cfg(test)]
-    early_reach_check: std::sync::atomic::AtomicBool,
-    /// CIRISEdge#971 — test-only: while `Some`, each advertise row's verdicts
-    /// (every withhold booked for it, or `offered`, `awaits_request`,
-    /// `not_advertisable`), by attestation id, for the gate-order
-    /// differential ([`RowVerdicts`]).
-    #[cfg(test)]
-    row_verdicts: Mutex<Option<RowVerdicts>>,
-    /// CIRISEdge#971 — test-only: one permit stored each time
-    /// [`Self::warm_holdings_index`] ends on an enabled index, so a witness
-    /// over a real runtime waits for its background warm-up on the event, not
-    /// on a clock.
-    #[cfg(test)]
-    holdings_warmed: tokio::sync::Notify,
-    /// CIRISEdge#971 — test-only: `false` reads every row a first-contact
-    /// peer authored in the required read (the pre-v45 read).
-    #[cfg(test)]
-    narrow_first_contact_read: std::sync::atomic::AtomicBool,
+    probes: TestProbes,
     /// CIRISEdge#544 — how many wanted hashes the backoff has actually removed
     /// from a round's `want`. The memory's own witness, in the discipline of
     /// [`Self::owner_reads`] and [`Self::sweep_max_page_rows`]: "the retry storm
@@ -3225,6 +3200,49 @@ fn terminal_move_log() -> &'static crate::log_throttle::LogThrottle {
     })
 }
 
+/// The bridge's test-only probes and switches.
+#[cfg(test)]
+struct TestProbes {
+    /// CIRISEdge#817 — test-only read probe: an injected delay and an
+    /// in-flight high-water mark at the persist reads the sweep permit must
+    /// bound. See [`ReadProbe`].
+    read_probe: ReadProbe,
+    /// Test clock for the limiters: seconds added to the wall clock, so a
+    /// witness can step past a window without sleeping through it.
+    clock_skew_secs: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#971 — test-only: `false` runs the advertise's gates in the
+    /// pre-v45 order (the audience gate's reach half only at the audience
+    /// gate), the reference the agreement witness compares against.
+    early_reach_check: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#971 — test-only: while `Some`, each advertise row's verdicts
+    /// (every withhold booked for it, or `offered`, `awaits_request`,
+    /// `not_advertisable`), by attestation id, for the gate-order
+    /// differential ([`RowVerdicts`]).
+    row_verdicts: Mutex<Option<RowVerdicts>>,
+    /// CIRISEdge#971 — test-only: one permit stored each time
+    /// [`FederationDirectoryReplicationBridge::warm_holdings_index`] ends on an
+    /// enabled index, so a witness over a real runtime waits for its
+    /// background warm-up on the event, not on a clock.
+    holdings_warmed: tokio::sync::Notify,
+    /// CIRISEdge#971 — test-only: `false` reads every row a first-contact
+    /// peer authored in the required read (the pre-v45 read).
+    narrow_first_contact_read: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl Default for TestProbes {
+    fn default() -> Self {
+        Self {
+            read_probe: ReadProbe::default(),
+            clock_skew_secs: std::sync::atomic::AtomicU64::new(0),
+            early_reach_check: std::sync::atomic::AtomicBool::new(true),
+            row_verdicts: Mutex::new(None),
+            holdings_warmed: tokio::sync::Notify::new(),
+            narrow_first_contact_read: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+}
+
 impl FederationDirectoryReplicationBridge {
     /// Construct with default [`BridgeConfig`], **v1-only** (no v2
     /// operational-kind admission). For v2 operational admission, use
@@ -3259,8 +3277,6 @@ impl FederationDirectoryReplicationBridge {
             pull_subject_log: std::sync::OnceLock::new(),
             delivery_log: std::sync::OnceLock::new(),
             rooted_walks: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            read_probe: ReadProbe::default(),
             metrics: None,
             convergence: None,
             revocation_observer: None,
@@ -3312,8 +3328,6 @@ impl FederationDirectoryReplicationBridge {
             miss_kicks: Mutex::new(super::subject_pull::WindowLedger::new(
                 super::subject_pull::LEDGER_CAP,
             )),
-            #[cfg(test)]
-            clock_skew_secs: std::sync::atomic::AtomicU64::new(0),
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
             serve_tier_subject: None,
@@ -3337,13 +3351,7 @@ impl FederationDirectoryReplicationBridge {
             refusal_backoff: RefusalBackoff::new(),
             stale_routes: RefusalBackoff::with_capacities(STALE_ROUTE_MARKS, 1),
             #[cfg(test)]
-            early_reach_check: std::sync::atomic::AtomicBool::new(true),
-            #[cfg(test)]
-            row_verdicts: Mutex::new(None),
-            #[cfg(test)]
-            holdings_warmed: tokio::sync::Notify::new(),
-            #[cfg(test)]
-            narrow_first_contact_read: std::sync::atomic::AtomicBool::new(true),
+            probes: TestProbes::default(),
             retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
             rows_parked_on_signer: std::sync::atomic::AtomicUsize::new(0),
             signer_releases: std::sync::atomic::AtomicUsize::new(0),
@@ -5273,45 +5281,12 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             && (kind.is_public_subject_pull() || announced_testimony)
         {
             if let Some(requester) = peer_key_id {
-                cohort_entitled = self.shares_a_trust_root_with(requester).await;
-                if !cohort_entitled {
-                    tracing::debug!(
-                        requester,
-                        subject = %subject_key_id,
-                        "identifier lookup refused: no mutual trust root — two \
-                         nodes with no shared root compose nothing (CC 4)"
-                    );
-                    return SubjectPullAnswer::default();
-                }
-                let budget = if announced_testimony {
-                    LookupBudget::AnnouncedTestimony
-                } else {
-                    LookupBudget::PublicPlane
-                };
-                if let crate::rate_limit::Decision::Deny { reason } =
-                    self.charge_subject_pull(requester, subject_key_id, budget)
+                match self
+                    .admit_third_party_pull(kind, subject_key_id, requester, announced_testimony)
+                    .await
                 {
-                    // THROTTLED. "Not asked again this window" was wrong — the
-                    // limiter suppresses the directory work, not the peer's
-                    // sending, so a rate-limited peer that keeps asking would
-                    // buy one WARN per request. Being loud about a flood is how
-                    // you become its amplifier.
-                    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
-                        lookup_limit_log().check(requester)
-                    {
-                        tracing::warn!(
-                            requester,
-                            subject = %subject_key_id,
-                            kind = ?kind,
-                            reason = reason.as_str(),
-                            suppressed_prev,
-                            "identifier lookup RATE LIMITED — a conferred server \
-                             answering by name is where bulk harvesting is \
-                             possible, one named subject at a time \
-                             (FSD_RATE_LIMIT §5.4)"
-                        );
-                    }
-                    return SubjectPullAnswer::throttled(Self::IDENTIFIER_LOOKUP_WINDOW_SECS);
+                    Ok(()) => cohort_entitled = true,
+                    Err(refused) => return refused,
                 }
             }
             self.refresh_serve_tier().await;
@@ -7891,7 +7866,7 @@ impl FederationDirectoryReplicationBridge {
                 plane = ?read.kind(),
                 "key-plane change probe FAILED: the memo is forgotten and this \
                  listing reads subjects from the store within its budget \
-                 (correct; CIRISEdge#930, #971)"
+                 (correct; tracked: CIRISEdge#930, tracked: CIRISEdge#971)"
             );
             memo.forget();
             return;
@@ -8367,9 +8342,9 @@ impl FederationDirectoryReplicationBridge {
                     tracing::warn!(
                         error = %e,
                         "serve-cursor feed probe FAILED: every key-plane memo answer is \
-                         dropped (each re-reads its subjects, the pre-#930 cost) and the \
+                         dropped (each re-reads its subjects, the pre-tracked: CIRISEdge#930 cost) and the \
                          Attestation holdings index answers from the drain until an audit \
-                         is clean (CIRISEdge#930, CIRISEdge#971)"
+                         is clean (tracked: CIRISEdge#930, tracked: CIRISEdge#971)"
                     );
                     feed.fail();
                     self.holdings_index.mark_suspect(IndexPlane::Attestation);
@@ -8467,7 +8442,7 @@ impl FederationDirectoryReplicationBridge {
                         error = %e,
                         "route serve-cursor feed probe FAILED: the TransportDestination \
                          holdings index answers from the drain until an audit is clean \
-                         (CIRISEdge#971)"
+                         (tracked: CIRISEdge#971)"
                     );
                     self.holdings_index
                         .mark_suspect(IndexPlane::TransportDestination);
@@ -8590,7 +8565,7 @@ impl FederationDirectoryReplicationBridge {
             );
         }
         #[cfg(test)]
-        self.holdings_warmed.notify_one();
+        self.probes.holdings_warmed.notify_one();
     }
 
     /// The warm-up's walk of the Attestation serve log from its head, on its
@@ -8620,7 +8595,7 @@ impl FederationDirectoryReplicationBridge {
                 tracing::warn!(
                     error = %e,
                     "holdings warm-up walk FAILED on the Attestation log: the plane \
-                     boots on its first ask instead (CIRISEdge#971)"
+                     boots on its first ask instead (tracked: CIRISEdge#971)"
                 );
             })?;
             let served = page.len();
@@ -8671,7 +8646,7 @@ impl FederationDirectoryReplicationBridge {
                 tracing::warn!(
                     error = %e,
                     "holdings warm-up walk FAILED on the route log: the plane boots on \
-                     its first ask instead (CIRISEdge#971)"
+                     its first ask instead (tracked: CIRISEdge#971)"
                 );
             })?;
             let served = page.len();
@@ -9250,6 +9225,63 @@ impl FederationDirectoryReplicationBridge {
         mine.iter().any(|r| theirs.contains(r))
     }
 
+    /// CIRISEdge#937 — the admission of a third-party subject Pull (a
+    /// requester that is not the subject, on a public plane or for announced
+    /// testimony): a shared trust root, then one charge against the lookup
+    /// limiter. `Err` is the answer to send instead: empty for no shared
+    /// root, throttled for a spent budget.
+    async fn admit_third_party_pull(
+        &self,
+        kind: EnvelopeKind,
+        subject_key_id: &str,
+        requester: &str,
+        announced_testimony: bool,
+    ) -> Result<(), crate::replication::summary::SubjectPullAnswer> {
+        use crate::replication::summary::SubjectPullAnswer;
+        if !self.shares_a_trust_root_with(requester).await {
+            tracing::debug!(
+                requester,
+                subject = %subject_key_id,
+                "identifier lookup refused: no mutual trust root — two \
+                 nodes with no shared root compose nothing (CC 4)"
+            );
+            return Err(SubjectPullAnswer::default());
+        }
+        let budget = if announced_testimony {
+            LookupBudget::AnnouncedTestimony
+        } else {
+            LookupBudget::PublicPlane
+        };
+        if let crate::rate_limit::Decision::Deny { reason } =
+            self.charge_subject_pull(requester, subject_key_id, budget)
+        {
+            // THROTTLED. "Not asked again this window" was wrong — the
+            // limiter suppresses the directory work, not the peer's
+            // sending, so a rate-limited peer that keeps asking would
+            // buy one WARN per request. Being loud about a flood is how
+            // you become its amplifier.
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                lookup_limit_log().check(requester)
+            {
+                tracing::warn!(
+                    requester,
+                    subject = %subject_key_id,
+                    kind = ?kind,
+                    reason = reason.as_str(),
+                    suppressed_prev,
+                    "identifier lookup RATE LIMITED — a conferred server \
+                     answering by name is where bulk harvesting is \
+                     possible, one named subject at a time \
+                     (FSD_RATE_LIMIT §5.4)"
+                );
+            }
+            return Err(SubjectPullAnswer::throttled(
+                Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
+            ));
+        }
+        Ok(())
+    }
+
     /// CIRISEdge#936 — the limiter verdict for one lookup: a subject Pull is
     /// charged once per `(requester, subject, budget, window)`, however many
     /// kinds it asks on and however often a person's add re-asks it. The
@@ -9319,6 +9351,7 @@ impl FederationDirectoryReplicationBridge {
     fn limiter_now(&self) -> crate::rate_limit::Ts {
         #[cfg(test)]
         let skew = self
+            .probes
             .clock_skew_secs
             .load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
@@ -11364,7 +11397,7 @@ impl FederationDirectoryReplicationBridge {
         self.consent_set_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
-        let _probe = self.read_probe.enter(true).await;
+        let _probe = self.probes.read_probe.enter(true).await;
         // CIRISEdge#609 / CIRISPersist#857 (v44.6.0) — consent is authored by
         // the HUMAN, for THIS machine. A node key holds topology, not consent:
         // the owner's opt-in is the owner's act, so the grant row is keyed by
@@ -12225,6 +12258,7 @@ impl FederationDirectoryReplicationBridge {
             // unreadable audience are left to the audience gate itself.
             #[cfg(test)]
             let early = self
+                .probes
                 .early_reach_check
                 .load(std::sync::atomic::Ordering::SeqCst);
             #[cfg(not(test))]
@@ -12586,26 +12620,15 @@ impl FederationDirectoryReplicationBridge {
         }
         #[cfg(test)]
         let narrow = self
+            .probes
             .narrow_first_contact_read
             .load(std::sync::atomic::Ordering::SeqCst);
         #[cfg(not(test))]
         let narrow = true;
-        if narrow && reach == Some(Reach::FirstContact) {
-            queries.push(
-                AttestationQuery::by(peer, REQUIRED_READ_PAGE).dimension_any_of(&[
-                    GRANT_DIMENSION,
-                    gp::GROUP_ROSTER_DIMENSION,
-                    gp::MEMBERSHIP_WIDENING_DIMENSION,
-                    gp::MEMBERSHIP_REMOVAL_DIMENSION,
-                    gp::MEMBERSHIP_RESIGNATION_DIMENSION,
-                    ciris_persist::federation::membership_acceptance::PROPOSAL_DIMENSION,
-                    ciris_persist::federation::membership_acceptance::ACCEPTANCE_DIMENSION,
-                    ciris_persist::federation::membership_acceptance::DECLINE_DIMENSION,
-                ]),
-            );
-        } else {
-            queries.push(AttestationQuery::by(peer, REQUIRED_READ_PAGE));
-        }
+        queries.push(Self::peer_authored_query(
+            peer,
+            narrow && reach == Some(Reach::FirstContact),
+        ));
         queries.extend(local.iter().map(|key| {
             AttestationQuery::by(key, REQUIRED_READ_PAGE).types(&[attestation_type::DELEGATES_TO])
         }));
@@ -12628,24 +12651,8 @@ impl FederationDirectoryReplicationBridge {
             }
         }
         rows.extend(self.invitations_naming(peer, peer_principals).await);
-        // A grant's `withdraws` is attested to its grantor: it is read through
-        // the grant it retires.
-        let grants: Vec<String> = rows
-            .iter()
-            .filter(|r| {
-                ciris_persist::federation::admission::envelope_dimension(&r.attestation_envelope)
-                    == Some(GRANT_DIMENSION)
-            })
-            .map(|r| r.attestation_id.clone())
-            .collect();
-        match self
-            .directory
-            .list_composers_referencing_any(&grants, None, None)
-            .await
-        {
-            Ok(composers) => rows.extend(composers),
-            Err(e) => tracing::debug!(peer, error = %e, "required read: composers not served"),
-        }
+        let withdrawals = self.grant_withdrawals(peer, &rows).await;
+        rows.extend(withdrawals);
         rows.extend(
             crate::read_caller::scoped(
                 crate::read_caller::Site::AdvertiseGroups,
@@ -12662,6 +12669,62 @@ impl FederationDirectoryReplicationBridge {
                 attestation,
             })
             .collect()
+    }
+
+    /// The required read's withdrawals: a grant's `withdraws` is attested to
+    /// its grantor, so it is read through the grant it retires, for every
+    /// grant among `rows`.
+    async fn grant_withdrawals(&self, peer: &str, rows: &[Attestation]) -> Vec<Attestation> {
+        use ciris_persist::federation::consent_grammar::GRANT_DIMENSION;
+        let grants: Vec<String> = rows
+            .iter()
+            .filter(|r| {
+                ciris_persist::federation::admission::envelope_dimension(&r.attestation_envelope)
+                    == Some(GRANT_DIMENSION)
+            })
+            .map(|r| r.attestation_id.clone())
+            .collect();
+        match self
+            .directory
+            .list_composers_referencing_any(&grants, None, None)
+            .await
+        {
+            Ok(composers) => composers,
+            Err(e) => {
+                tracing::debug!(peer, error = %e, "required read: composers not served");
+                Vec::new()
+            }
+        }
+    }
+
+    /// CIRISEdge#971 — the required read's page of rows the peer itself
+    /// authored. A first-contact peer is asked only for the shapes its reach
+    /// carries (grants, rosters, membership changes, the ceremony): its other
+    /// rows are refused by that reach, so reading them was refusals paid for.
+    /// Every other reach reads the peer's rows whole. `narrow` is a
+    /// first-contact reach (always narrowed outside tests).
+    fn peer_authored_query(
+        peer: &str,
+        narrow: bool,
+    ) -> ciris_persist::federation::attestation_query::AttestationQuery {
+        use ciris_persist::federation::attestation_query::AttestationQuery;
+        use ciris_persist::federation::consent_grammar::GRANT_DIMENSION;
+        use ciris_persist::federation::group_plane as gp;
+        use ciris_persist::federation::membership_acceptance as ma;
+        if narrow {
+            AttestationQuery::by(peer, REQUIRED_READ_PAGE).dimension_any_of(&[
+                GRANT_DIMENSION,
+                gp::GROUP_ROSTER_DIMENSION,
+                gp::MEMBERSHIP_WIDENING_DIMENSION,
+                gp::MEMBERSHIP_REMOVAL_DIMENSION,
+                gp::MEMBERSHIP_RESIGNATION_DIMENSION,
+                ma::PROPOSAL_DIMENSION,
+                ma::ACCEPTANCE_DIMENSION,
+                ma::DECLINE_DIMENSION,
+            ])
+        } else {
+            AttestationQuery::by(peer, REQUIRED_READ_PAGE)
+        }
     }
 
     /// **CC 5.2 — the invitations naming the peer**, whoever wrote them. A
@@ -13299,7 +13362,7 @@ impl FederationDirectoryReplicationBridge {
         self.owner_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
-        let _probe = self.read_probe.enter(false).await;
+        let _probe = self.probes.read_probe.enter(false).await;
         let resolved = ciris_persist::federation::admission::owner_of(
             &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
             node_key_id,
@@ -14872,6 +14935,7 @@ impl FederationDirectoryReplicationBridge {
     /// ([`RowVerdicts`]); [`Self::take_row_verdicts`] ends it.
     pub(crate) fn record_row_verdicts(&self) {
         *self
+            .probes
             .row_verdicts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RowVerdicts::default());
@@ -14882,7 +14946,8 @@ impl FederationDirectoryReplicationBridge {
     pub(crate) fn take_row_verdicts(
         &self,
     ) -> std::collections::BTreeMap<String, Vec<&'static str>> {
-        self.row_verdicts
+        self.probes
+            .row_verdicts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
@@ -14893,6 +14958,7 @@ impl FederationDirectoryReplicationBridge {
     /// The advertise row now being judged (`None` between rows).
     fn note_row(&self, attestation_id: Option<&str>) {
         let mut guard = self
+            .probes
             .row_verdicts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14907,6 +14973,7 @@ impl FederationDirectoryReplicationBridge {
     /// One verdict for the advertise row now being judged.
     fn note_row_verdict(&self, verdict: &'static str) {
         let mut guard = self
+            .probes
             .row_verdicts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14920,14 +14987,16 @@ impl FederationDirectoryReplicationBridge {
     /// CIRISEdge#971 — run the advertise gates in the pre-v45 order (`false`)
     /// or the v45 order (`true`, the default).
     pub(crate) fn set_early_reach_check(&self, on: bool) {
-        self.early_reach_check
+        self.probes
+            .early_reach_check
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// CIRISEdge#971 — read a first-contact peer's own rows in full (`false`,
     /// the pre-v45 read) or only in the shapes its reach can carry (`true`).
     pub(crate) fn set_narrow_first_contact_read(&self, on: bool) {
-        self.narrow_first_contact_read
+        self.probes
+            .narrow_first_contact_read
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -14942,7 +15011,7 @@ impl FederationDirectoryReplicationBridge {
     /// CIRISEdge#971 — wait for the next end of [`Self::warm_holdings_index`]
     /// (a warm-up that already ended left its permit; this takes it).
     pub(crate) async fn holdings_warmed(&self) {
-        self.holdings_warmed.notified().await;
+        self.probes.holdings_warmed.notified().await;
     }
 
     pub(crate) fn holdings_index_status(
@@ -28698,7 +28767,7 @@ pub(crate) mod tests {
                 .collect::<std::collections::BTreeSet<[u8; 32]>>()
         };
         // Selector unset: #671 exactly — the relay's allegiance facts only.
-        let before = served(base()).await;
+        let before = Box::pin(served(base())).await;
         let announced_hash = wire_hash_of(&backend, &announced).await;
         assert!(
             !before.contains(&announced_hash),
@@ -28739,7 +28808,7 @@ pub(crate) mod tests {
                 .with_kind_publish_selector(Some(selector()))
                 .with_metrics(Some(metrics.clone()))
         };
-        let after = served(with()).await;
+        let after = Box::pin(served(with())).await;
         let mut expected = before.clone();
         expected.insert(announced_hash);
         assert_eq!(
@@ -28970,7 +29039,7 @@ pub(crate) mod tests {
             "alice's Pull opens nothing for carol, who did not ask"
         );
         // RAZOR — and it does not outlive the exchange it was made for.
-        bridge.clock_skew_secs.store(
+        bridge.probes.clock_skew_secs.store(
             crate::replication::subject_pull::PULL_OFFER_TTL_SECS,
             std::sync::atomic::Ordering::Relaxed,
         );
@@ -29035,6 +29104,7 @@ pub(crate) mod tests {
         )
         .await;
         bridge
+            .probes
             .clock_skew_secs
             .store(0, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
@@ -29146,6 +29216,7 @@ pub(crate) mod tests {
 
         // The next window kicks again.
         bridge
+            .probes
             .clock_skew_secs
             .store(61, std::sync::atomic::Ordering::Relaxed);
         assert!(pulled_hashes(&bridge, eve, ALICE_NODE).await.is_empty());
@@ -29153,6 +29224,7 @@ pub(crate) mod tests {
 
         // RAZOR — a THROTTLED Pull is not a miss: nothing was looked up.
         bridge
+            .probes
             .clock_skew_secs
             .store(122, std::sync::atomic::Ordering::Relaxed);
         for i in 0..FederationDirectoryReplicationBridge::ANNOUNCED_TESTIMONY_LOOKUPS_PER_WINDOW {
@@ -29214,6 +29286,7 @@ pub(crate) mod tests {
             "catch-up on the public planes is not spent by a person's lookups"
         );
         bridge
+            .probes
             .clock_skew_secs
             .store(61, std::sync::atomic::Ordering::Relaxed);
         let after = answer(EnvelopeKind::Attestation, DAN.to_string()).await;

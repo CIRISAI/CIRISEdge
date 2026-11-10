@@ -4171,6 +4171,13 @@ impl EdgeMetrics {
         // it leaves only through `ShapingWindows`.
         let mut link_shaping = registered(&self.link_shaping, LINK_SHAPING_LABELS);
         link_shaping.remove(LINK_SHAPING_FRAMES_REAL);
+        // Milliseconds and entry counts, far below 2^52.
+        #[allow(clippy::cast_precision_loss)]
+        let holdings_index_gauge = self
+            .holdings_index_gauge()
+            .into_iter()
+            .map(|(k, v)| (k, v as f64))
+            .collect();
         EdgeMetricsBundle {
             envelopes_sent_total: self.envelopes_sent_total.read().clone(),
             envelopes_received_total: self.envelopes_received_total.read().clone(),
@@ -4249,11 +4256,7 @@ impl EdgeMetrics {
             key_plane_sweep: self.key_plane_sweep(),
             sweep_permits: self.sweep_permits(),
             holdings_index: self.holdings_index(),
-            holdings_index_gauge: self
-                .holdings_index_gauge()
-                .into_iter()
-                .map(|(k, v)| (k, v as f64))
-                .collect(),
+            holdings_index_gauge,
             persisted_standing: self.persisted_standing(),
             link_stall: registered(&self.link_stall, LINK_STALL_LABELS),
             direct_link_upgrade_guarded: registered(

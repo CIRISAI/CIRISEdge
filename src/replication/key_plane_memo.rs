@@ -733,6 +733,9 @@ mod tests {
         assert_eq!(m.len(), 0);
     }
 
+    /// One named mutation of a plane memo, at a time.
+    type Mutator = (&'static str, fn(&mut PlaneMemo, Instant));
+
     /// **v45 (CIRISEdge#971) — every mutator moves the generation, so no
     /// cached listing outlives a change to its answers.** One case per
     /// mutator; removing the generation bump from any ONE of insert, apply,
@@ -742,7 +745,7 @@ mod tests {
     fn no_cached_listing_survives_any_mutator_971() {
         let t0 = Instant::now();
         let q = set(&["a", "b"]);
-        let ops: [(&str, fn(&mut PlaneMemo, Instant)); 7] = [
+        let ops: [Mutator; 7] = [
             ("insert overwrites an answer", |m, _| {
                 m.insert("a".into(), vec![r(9)]);
             }),
