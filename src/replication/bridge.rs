@@ -29093,6 +29093,9 @@ pub(crate) mod tests {
     // CIRISEdge#971 — what an idle bootstrap round costs the seat.
     mod idle_round_cost_971;
 
+    // CIRISEdge#971 — the seat's Revocation listing walk per idle round.
+    mod revocation_walk_971;
+
     // Sharing traces is its own consent, per recipient: the serve gate's
     // refuse and allow sides, and the live-state witnesses.
     mod moves_5_2;
