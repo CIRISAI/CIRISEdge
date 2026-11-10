@@ -2609,6 +2609,10 @@ pub(crate) async fn live_announcing_rows(
     Ok(live)
 }
 
+/// CIRISEdge#971 — the test-only delivery record: `(source_peer, kind, bytes)`
+/// per row handed to the applier.
+type DeliveryLog = Mutex<Vec<(String, EnvelopeKind, Vec<u8>)>>;
+
 /// Production-grade [`ReplicationDirectory`] implementation over
 /// persist's `FederationDirectory`.
 pub struct FederationDirectoryReplicationBridge {
@@ -2695,7 +2699,7 @@ pub struct FederationDirectoryReplicationBridge {
     /// CIRISEdge#971 — test-only record of every row delivered here for
     /// apply, as `(source_peer, kind, bytes)`: unset unless a test calls
     /// [`Self::record_deliveries_for_test`].
-    delivery_log: std::sync::OnceLock<Mutex<Vec<(String, EnvelopeKind, Vec<u8>)>>>,
+    delivery_log: std::sync::OnceLock<DeliveryLog>,
     /// CIRISEdge#817 — how many times `rooted_with` actually walked the trust
     /// root (its memo missed): the per-Deliver memo's witness. `Relaxed`.
     rooted_walks: std::sync::atomic::AtomicUsize,
@@ -13729,13 +13733,13 @@ impl FederationDirectoryReplicationBridge {
     /// count it by subject kind when `peer` is a no-consent seat, so a host
     /// doing member lookups against a seat (`answer_other`) is visible.
     pub fn record_pull_answer(&self, peer: &str, subject: &str, throttled: bool) {
+        use crate::observability as o;
         let Some(m) = &self.metrics else {
             return;
         };
         if !self.is_no_consent_seat(peer) {
             return;
         }
-        use crate::observability as o;
         let label = if throttled {
             o::BUNDLE_PULL_ANSWER_THROTTLED
         } else if self.local_key_id.as_deref() == Some(subject) {

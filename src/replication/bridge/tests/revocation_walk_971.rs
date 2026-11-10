@@ -101,15 +101,13 @@ async fn measure(k: usize) {
     eprintln!(
         "971 revocation-walk K={k}: refs={refs} cold_ms={} cold_subject_reads={cold_subject_reads} \
          cold_probe_reads={cold_probes} cold_permits={cold_permits} | warm_median_us={} \
-         warm_max_us={} warm_subject_reads_per_listing={} warm_probe_reads_per_listing={} \
-         warm_permits_per_listing={} | {N_CONCURRENT}_together_ms={} \
+         warm_max_us={} warm_subject_reads={warm_subject_reads}/9_listings \
+         warm_probe_reads={warm_probes}/9_listings warm_permits={warm_permits}/9_listings \
+         | {N_CONCURRENT}_together_ms={} \
          (serial-equivalent {}us each) | memo_ttl_s={}",
         cold.as_millis(),
         warm[warm.len() / 2].as_micros(),
         warm[warm.len() - 1].as_micros(),
-        warm_subject_reads as f64 / 9.0,
-        warm_probes as f64 / 9.0,
-        warm_permits as f64 / 9.0,
         together.as_millis(),
         together.as_micros() / N_CONCURRENT as u128,
         crate::replication::key_plane_memo::MEMO_TTL.as_secs(),
