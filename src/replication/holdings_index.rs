@@ -731,7 +731,6 @@ mod tests {
     fn the_covered_kinds_map_to_their_index() {
         for kind in [
             EnvelopeKind::Attestation,
-            EnvelopeKind::KeyGrant,
             EnvelopeKind::Key,
             EnvelopeKind::Revocation,
             EnvelopeKind::IdentityOccurrence,
@@ -743,6 +742,10 @@ mod tests {
             IndexPlane::of_kind(EnvelopeKind::TransportDestination),
             Some(IndexPlane::TransportDestination)
         );
+        // persist v61 retired the framed KeyGrant plane: its sets travel as
+        // Attestation rows, so the framed kind has no wire index of its own.
+        assert!(EnvelopeKind::KeyGrant.is_retired_plane());
+        assert_eq!(IndexPlane::of_kind(EnvelopeKind::KeyGrant), None);
         assert_eq!(IndexPlane::of_kind(EnvelopeKind::LocationProof), None);
         assert_eq!(
             IndexPlane::of_kind(EnvelopeKind::AccordQuorumEvidence),
