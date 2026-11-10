@@ -333,8 +333,12 @@ mod tests {
 
     /// A burst of N wakes inside the debounce window is ONE sweep, not N
     /// (and not two): the start sweep, then one for the burst; the backstop
-    /// (an hour here) never fires.
-    #[tokio::test]
+    /// (an hour here) never fires. On paused time: each `sleep` below runs
+    /// once the loop is idle and moves only the virtual clock, so "inside the
+    /// debounce window" and "the start pass has run" hold on any box. On the
+    /// real clock a slow start missed the 10 ms wait (1 in 100 on a loaded
+    /// core).
+    #[tokio::test(start_paused = true)]
     async fn a_burst_of_wakes_is_one_sweep() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let sweeps = Arc::new(AtomicUsize::new(0));
