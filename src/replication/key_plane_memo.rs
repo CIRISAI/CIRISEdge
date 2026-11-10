@@ -244,6 +244,21 @@ where
 }
 
 /// One plane's memo: each subject's refs and when the memo was last rebuilt.
+///
+/// # Bound (CIRISEdge#971)
+///
+/// No cap and no eviction, on purpose: an entry is made only for a subject a
+/// listing asked, and a listing asks only the host's sets (the plane's publish
+/// set for `Key` / `IdentityOccurrence`, own ∪ the runtime's peers for the two
+/// Global planes). So `entries` is at most the distinct subjects those sets
+/// held since the last rebuild, which clears it at least every [`MEMO_TTL`]:
+/// bounded by the keys the host publishes (8,211 `key:record` and 5,652
+/// occurrence subjects on canonical-1, 2026-11-09), not by traffic. An empty
+/// answer costs the key-id `String` (24 bytes plus the id's heap bytes) and an
+/// empty `Vec` (24 bytes, no heap), plus the map's slot overhead: about 130
+/// bytes, so about 1 MB per plane at that size; a non-empty answer adds 40
+/// bytes per ref. The size is exported per plane as the
+/// `holdings_index_gauge.key_plane.<plane>.memo_entries` gauge.
 /// v45 (CIRISEdge#971) — the store cursor the answers are current to is no
 /// longer per memo: it is the one [`super::store_feed`] position, shared with
 /// the holdings index, and a memo receives its delta through the feed's inbox.
@@ -327,8 +342,7 @@ impl PlaneMemo {
         self.entries.insert(subject, refs);
     }
 
-    /// Answers held.
-    #[cfg(test)]
+    /// Answers held (the `key_plane.<plane>.memo_entries` gauge).
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }

@@ -880,6 +880,7 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
         obs::HOLDINGS_GAUGE_ENABLED,
         obs::HOLDINGS_GAUGE_STALE_ROUTE_SIZE,
     ]);
+    gauges.extend(obs::KEY_PLANE_GAUGE_MEMO_ENTRIES);
     let advertise = [
         obs::ADVERTISE_SEND_SET_MEMO_HIT,
         obs::ADVERTISE_SEND_SET_READ,
@@ -938,4 +939,84 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
         missing.is_empty(),
         "not in the exported map by name: {missing:?}"
     );
+
+    // The families are read from an UNAUTHENTICATED endpoint (CIRISServer's
+    // `/v1/federation/metrics` exports `flatten()` whole and drops any family
+    // whose label carries a peer or key id). So no label in the families this
+    // branch adds may be id-shaped, and every label in the three families
+    // only this branch writes is one of the fixed constants above: a later
+    // change that formats an id into a label fails here, not on the seat.
+    let mut fixed: HashSet<String> = HashSet::new();
+    fixed.extend(sites.iter().map(|s| format!("sweep_permits.{s}")));
+    fixed.extend(holdings.iter().map(|l| format!("holdings_index.{l}")));
+    fixed.extend(gauges.iter().map(|l| format!("holdings_index_gauge.{l}")));
+    let families = [
+        "key_plane_sweep.",
+        "sweep_permits.",
+        "holdings_index.",
+        "holdings_index_gauge.",
+        "advertise.",
+    ];
+    let branch_only = ["sweep_permits.", "holdings_index.", "holdings_index_gauge."];
+    let names: Vec<&String> = flat.counters.keys().chain(flat.gauges.keys()).collect();
+    let mut id_shaped = Vec::new();
+    let mut unlisted = Vec::new();
+    for name in names {
+        if !families.iter().any(|f| name.starts_with(f)) {
+            continue;
+        }
+        if label_is_id_shaped(name) {
+            id_shaped.push(name.clone());
+        }
+        if branch_only.iter().any(|f| name.starts_with(f)) && !fixed.contains(name) {
+            unlisted.push(name.clone());
+        }
+    }
+    assert!(
+        id_shaped.is_empty(),
+        "id-shaped labels on the unauthenticated export: {id_shaped:?}"
+    );
+    assert!(
+        unlisted.is_empty(),
+        "labels in this branch's families that are not fixed constants: {unlisted:?}"
+    );
+    // The detector itself, on the shapes it must refuse and the ones it must
+    // pass: a key id, a 32-byte hash, a short hex run, a route with a peer.
+    assert!(label_is_id_shaped(&format!(
+        "sweep_permits.{}",
+        "ab".repeat(32)
+    )));
+    assert!(label_is_id_shaped("holdings_index.peer:0123456789abcdef"));
+    assert!(label_is_id_shaped("advertise.Peer-A"));
+    assert!(!label_is_id_shaped(
+        "holdings_index_gauge.key_plane.revocation.memo_entries"
+    ));
+    assert!(!label_is_id_shaped(
+        "holdings_index.attestation.feed_probes"
+    ));
+}
+
+/// Is `name` shaped like it carries an identifier: any character outside
+/// `[a-z0-9_.]` (an id separator, an upper-case or base64 id), or a run of
+/// eight or more hex digits (a key id, a destination or content hash, or a
+/// truncated one). Every fixed label this branch exports passes.
+fn label_is_id_shaped(name: &str) -> bool {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
+    {
+        return true;
+    }
+    let mut run = 0usize;
+    for c in name.chars() {
+        if c.is_ascii_hexdigit() {
+            run += 1;
+            if run >= 8 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
 }

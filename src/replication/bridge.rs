@@ -1331,6 +1331,11 @@ impl SweepGate {
     /// the bridge) degrades to unbounded rather than refusing the sweep —
     /// replication going dark is a strictly worse failure than replication
     /// using more memory, and a closed gate is a shutdown state, not a policy.
+    ///
+    /// CIRISEdge#971 — test-only: every production site names itself through
+    /// [`Self::enter_at`], so `sweep_permits.other` cannot hide a production
+    /// permit taker; a new site that calls this does not compile outside tests.
+    #[cfg(test)]
     async fn enter(&self) -> SweepPermit<'_> {
         self.enter_at(crate::observability::SWEEP_PERMIT_OTHER)
             .await
@@ -7617,9 +7622,14 @@ impl FederationDirectoryReplicationBridge {
                 }
             }
         }
+        let memo_entries = u64::try_from(memo.len()).unwrap_or(u64::MAX);
         drop(memo);
         let elapsed = started.elapsed();
         if let Some(m) = &self.metrics {
+            m.set_holdings_index_gauge(
+                obs::KEY_PLANE_GAUGE_MEMO_ENTRIES[read.index()],
+                memo_entries,
+            );
             m.add_key_plane_sweep(obs::KEY_PLANE_LISTINGS, 1);
             m.add_key_plane_sweep(obs::KEY_PLANE_MEMO_HITS, hits);
             if reads > 0 {

@@ -1658,6 +1658,15 @@ pub const STALE_ROUTE_EVICTED: &str = "stale_route.evicted";
 pub const STALE_ROUTE_CLEARED: &str = "stale_route.cleared";
 /// Gauge: stale-route marks held.
 pub const HOLDINGS_GAUGE_STALE_ROUTE_SIZE: &str = "stale_route.size";
+/// Gauge: answers held in each key-plane memo, by `KeyPlaneRead` slot (key
+/// record, occurrence binding, revocation, occurrence withdrawal). Set after
+/// every listing; bounded by the host's publish sets (see `PlaneMemo`).
+pub const KEY_PLANE_GAUGE_MEMO_ENTRIES: [&str; 4] = [
+    "key_plane.key_record.memo_entries",
+    "key_plane.occurrence_binding.memo_entries",
+    "key_plane.revocation.memo_entries",
+    "key_plane.occurrence_withdrawal.memo_entries",
+];
 /// Gauge: milliseconds from the runtime's warm-up start to this plane's set
 /// being Ready (its walk from the head of the log plus its boot drain), set
 /// once per process. Absent while the plane has not come up through the
