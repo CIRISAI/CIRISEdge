@@ -215,6 +215,9 @@ async fn a_member_holding_the_dek_cannot_forge_the_publishers_chunks() {
         chunk_key: key_b.public(),
         sig_ed25519: Vec::new(),
         sig_ml_dsa_65: Vec::new(),
+        codecs: None,
+        replaces: None,
+        end: None,
     };
     let (ed, pq) = crate::identity::sign_bound_hybrid(&b, &lie.signed_bytes(), "lie")
         .await
@@ -592,6 +595,9 @@ fn binding_parse_enforces_both_signature_lengths() {
         chunk_key: [3u8; 32],
         sig_ed25519: vec![0u8; 64],
         sig_ml_dsa_65: vec![0u8; ML_DSA_65_SIG_LEN],
+        codecs: None,
+        replaces: None,
+        end: None,
     };
     assert!(StreamKeyBinding::from_bytes(&good.to_bytes()).is_ok());
     for len in [1, ML_DSA_65_SIG_LEN - 1, ML_DSA_65_SIG_LEN + 1] {
@@ -608,4 +614,310 @@ fn binding_parse_enforces_both_signature_lengths() {
     let mut bad = good.clone();
     bad.sig_ed25519 = vec![0u8; 63];
     assert!(StreamKeyBinding::from_bytes(&bad.to_bytes()).is_err());
+}
+
+/// A phone's audio-and-video codec map: `{0x04: h264, 0xFF: opus}`.
+fn av_map() -> CodecMap {
+    CodecMap::new([CodecToken::Opus, CodecToken::H264]).expect("a map")
+}
+
+/// A binding with the KAT's inputs and these v2 members, unsigned (the
+/// signatures are not what these witnesses read).
+fn kat_v2(v2: Option<V2Members>) -> StreamKeyBinding {
+    let hex32 = |h: &str| -> [u8; 32] {
+        let v = hex::decode(h).expect("hex");
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&v);
+        a
+    };
+    let (codecs, replaces, end) = match v2 {
+        Some(m) => (Some(m.codecs), m.replaces, m.end),
+        None => (None, None, None),
+    };
+    StreamKeyBinding {
+        room: "room-kat".to_owned(),
+        publisher: "node-kat-a".to_owned(),
+        join_nonce: [0x07; 32],
+        stream: StreamId(hex32(kat::STREAM_ID)),
+        epoch: Epoch(5),
+        chunk_key: hex32(kat::CHUNK_KEY_PUB),
+        sig_ed25519: vec![0u8; 64],
+        sig_ml_dsa_65: vec![0u8; ML_DSA_65_SIG_LEN],
+        codecs,
+        replaces,
+        end,
+    }
+}
+
+fn v2m(codecs: CodecMap) -> Option<V2Members> {
+    Some(V2Members {
+        codecs,
+        replaces: None,
+        end: None,
+    })
+}
+
+/// KAT — the v2 binding's signed bytes (CC 5.3.3.2.1, rc17 as revised): the
+/// v2 domain, version 2, v1's members 2-7, then the codec map (`u8 count`,
+/// then per class sorted `class u8 ‖ u16_be len ‖ ascii token`), `replaces`
+/// (`u8 present ‖ [stream 32]`) and `end` (`u8`: 0 live, 1 left, 2
+/// backgrounded). Same inputs as [`kat_vectors_are_deterministic`], map
+/// `{0x04: h264, 0xFF: opus}`; a second vector replaces stream `aa`x32 and
+/// ends `left`. The v1 signed bytes of the same inputs are unchanged.
+#[test]
+fn binding_v2_signed_bytes_kat() {
+    const V2_SIGNED: &str = "63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0204000468323634ff00046f7075730000";
+    const V2_REPLACES_LEFT: &str = "63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0204000468323634ff00046f70757301aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01";
+    let v2 = kat_v2(v2m(av_map()));
+    assert_eq!(v2.version(), BINDING_VERSION_V2);
+    assert_eq!(hex::encode(v2.signed_bytes()), V2_SIGNED);
+    let full = kat_v2(Some(V2Members {
+        codecs: av_map(),
+        replaces: Some(StreamId([0xaa; 32])),
+        end: Some(SignedEnd::Left),
+    }));
+    assert_eq!(hex::encode(full.signed_bytes()), V2_REPLACES_LEFT);
+    assert_eq!(
+        hex::encode(kat_v2(None).signed_bytes()),
+        kat::BINDING_SIGNED_BYTES,
+        "v1 unchanged"
+    );
+    for b in [v2, full, kat_v2(None)] {
+        let wire = b.to_bytes();
+        assert_eq!(StreamKeyBinding::version_of(&wire), Some(b.version()));
+        assert_eq!(StreamKeyBinding::from_bytes(&wire), Ok(b));
+    }
+}
+
+/// The token table, and the map's own rules: each token under its class,
+/// sorted by class, no class twice; an unregistered token, a token under
+/// another class, an out-of-order or empty map, or a bad `replaces` / `end`
+/// byte is malformed.
+#[test]
+fn the_codec_map_rules() {
+    use crate::transport::realtime_av::{CODEC_AV1_SVC, CODEC_OPAQUE, CODEC_TEMPORAL_LAYERED};
+    let table: Vec<(&str, u8)> = CodecToken::ALL
+        .iter()
+        .map(|t| (t.as_str(), t.class()))
+        .collect();
+    assert_eq!(
+        table,
+        [
+            ("av1", CODEC_AV1_SVC),
+            ("h264", CODEC_TEMPORAL_LAYERED),
+            ("vp8", CODEC_TEMPORAL_LAYERED),
+            ("vp9", CODEC_TEMPORAL_LAYERED),
+            ("opus", CODEC_OPAQUE),
+        ]
+    );
+    for bad in ["opaque", "H264", "", "theora"] {
+        assert_eq!(CodecToken::parse(bad), None, "{bad:?}");
+    }
+    assert_eq!(
+        CodecMap::new([CodecToken::H264, CodecToken::Vp8]),
+        Err(BindingError::Malformed("codec map class twice"))
+    );
+    assert_eq!(
+        CodecMap::new([]),
+        Err(BindingError::Malformed("codec map size"))
+    );
+    assert_eq!(
+        av_map().entries(),
+        [
+            (CODEC_TEMPORAL_LAYERED, CodecToken::H264),
+            (CODEC_OPAQUE, CodecToken::Opus)
+        ],
+        "sorted by class"
+    );
+    let good = kat_v2(v2m(av_map())).to_bytes();
+    // The map starts right after the chunk key: count, then 0x04 h264, then
+    // 0xff opus.
+    let at = good
+        .windows(2)
+        .position(|w| w == [0x02, CODEC_TEMPORAL_LAYERED])
+        .expect("the map");
+    let rewrite = |f: &dyn Fn(&mut Vec<u8>)| {
+        let mut w = good.clone();
+        f(&mut w);
+        StreamKeyBinding::from_bytes(&w)
+    };
+    // h264 under 0xff instead of 0x04 (and the order with it).
+    assert_eq!(
+        rewrite(&|w| w[at + 1] = CODEC_OPAQUE),
+        Err(BindingError::Malformed("codec class"))
+    );
+    // An unregistered token of the same length.
+    let tok = good.windows(4).position(|w| w == b"opus").expect("opus");
+    assert_eq!(
+        rewrite(&|w| w[tok..tok + 4].copy_from_slice(b"flac")),
+        Err(BindingError::Malformed("codec"))
+    );
+    // A count of zero.
+    assert!(rewrite(&|w| w[at] = 0).is_err());
+    // replaces byte 2, end byte 3 (the last two bytes of the v2 members sit
+    // just before the Ed25519 length).
+    let tail = at + 1 + (1 + 2 + 4) + (1 + 2 + 4);
+    assert_eq!(
+        rewrite(&|w| w[tail] = 2),
+        Err(BindingError::Malformed("replaces"))
+    );
+    assert_eq!(
+        rewrite(&|w| w[tail + 1] = 3),
+        Err(BindingError::Malformed("end"))
+    );
+}
+
+/// The life rule on the whole map: a second v2 binding for the same
+/// (stream, epoch), or for a later epoch, naming another map is refused
+/// `av_binding_codec_changed`; the same map in a later epoch, and a v1
+/// binding (no map), are not.
+#[test]
+fn a_stream_keeps_its_codec_map_for_its_life() {
+    let auth = ChunkAuth::new("room-kat");
+    let wire = |b: &StreamKeyBinding| Arc::new(b.to_bytes());
+    let first = kat_v2(v2m(av_map()));
+    auth.install(&first, wire(&first)).expect("first binding");
+    let vp8 = CodecMap::new([CodecToken::Opus, CodecToken::Vp8]).expect("map");
+    let other = kat_v2(v2m(vp8));
+    let refused = auth.install(&other, wire(&other));
+    assert_eq!(
+        refused,
+        Err(BindingError::CodecChanged {
+            held: av_map().to_string(),
+            got: vp8.to_string()
+        })
+    );
+    assert_eq!(
+        refused.unwrap_err().refusal().as_str(),
+        "av_binding_codec_changed"
+    );
+    let audio_only = kat_v2(v2m(CodecMap::new([CodecToken::Opus]).expect("map")));
+    assert!(
+        matches!(
+            auth.install(&audio_only, wire(&audio_only)),
+            Err(BindingError::CodecChanged { .. })
+        ),
+        "dropping a class is a different map"
+    );
+    let mut later = kat_v2(v2m(vp8));
+    later.epoch = Epoch(6);
+    assert!(
+        matches!(
+            auth.install(&later, wire(&later)),
+            Err(BindingError::CodecChanged { .. })
+        ),
+        "in any epoch"
+    );
+    let mut same = kat_v2(v2m(av_map()));
+    same.epoch = Epoch(6);
+    assert_eq!(auth.install(&same, wire(&same)), Ok(()));
+    let v1 = kat_v2(None);
+    assert_eq!(auth.install(&v1, wire(&v1)), Ok(()), "v1 names no codec");
+    assert_eq!(auth.codecs_of(first.stream), Some(av_map()));
+}
+
+/// A relay forwards each held binding's v1 encoding to every new leg and
+/// its v2 encoding only to a peer that takes v2.
+#[test]
+fn a_relay_forwards_v2_only_to_peers_that_take_it() {
+    let auth = ChunkAuth::new("room-kat");
+    let v1 = kat_v2(None);
+    let v2 = kat_v2(v2m(CodecMap::new([CodecToken::Av1]).expect("map")));
+    auth.install(&v1, Arc::new(v1.to_bytes())).expect("v1");
+    auth.install(&v2, Arc::new(v2.to_bytes())).expect("v2");
+    let versions = |ok: bool| -> Vec<Option<u8>> {
+        let mut v: Vec<Option<u8>> = auth
+            .bindings_except("someone-else", ok)
+            .iter()
+            .map(|w| StreamKeyBinding::version_of(w))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(versions(false), [Some(1)]);
+    assert_eq!(versions(true), [Some(1), Some(BINDING_VERSION_V2)]);
+    assert!(
+        auth.bindings_except("node-kat-a", true).is_empty(),
+        "never its own"
+    );
+}
+
+/// The chunk-class rule on a phone's audio-and-video stream (`{0x04: h264,
+/// 0xFF: opus}`), through the real binding path (signed, verified,
+/// installed): its audio (0xFF) and its video (0x04, any temporal layer)
+/// both verify; a chunk of a class the map does not name (0x01) is refused
+/// `av_chunk_class_unlisted`, its signature good. A v1-only stream is not
+/// checked.
+#[tokio::test]
+async fn a_chunk_of_a_class_its_map_does_not_name_is_refused() {
+    use crate::transport::realtime_av::{CODEC_AV1_SVC, CODEC_TEMPORAL_LAYERED};
+    let a = signer(A, 1);
+    let keys = Keys::of(&[&a]).await;
+    let auth = ChunkAuth::new(ROOM);
+    let nonce = [7; 32];
+    let stream = call_stream_id(ROOM, A, &nonce);
+    let key = ChunkSigner::generate(stream, Epoch(3)).unwrap();
+    let b = StreamKeyBinding::sign_v2(
+        &a,
+        ROOM,
+        nonce,
+        stream,
+        Epoch(3),
+        key.public(),
+        v2m(av_map()),
+    )
+    .await
+    .expect("bind");
+    assert!(matches!(
+        auth.accept_binding(&b.to_bytes(), &members(), &keys).await,
+        BindingOutcome::Installed(_)
+    ));
+    let chunk = |seq, codec, temporal| {
+        let inner = seal_av_inner(
+            b"frame",
+            &dek(),
+            stream,
+            Epoch(3),
+            ChunkSeq(seq),
+            codec,
+            ChunkLayer {
+                spatial: 0,
+                temporal,
+                quality: 0,
+            },
+        )
+        .expect("seal");
+        key.sign(&inner).expect("sign")
+    };
+    assert!(auth.check(&chunk(0, CODEC_OPAQUE, 0)).is_ok(), "audio");
+    assert!(
+        auth.check(&chunk(1, CODEC_TEMPORAL_LAYERED, 0)).is_ok(),
+        "video base"
+    );
+    assert!(
+        auth.check(&chunk(2, CODEC_TEMPORAL_LAYERED, 2)).is_ok(),
+        "video t=2"
+    );
+    let refused = auth.check(&chunk(3, CODEC_AV1_SVC, 0)).unwrap_err();
+    assert_eq!(refused, ChunkAuthError::ClassUnlisted);
+    assert_eq!(refused.refusal().as_str(), "av_chunk_class_unlisted");
+    // A v1-only stream names no codecs: every class passes.
+    let nonce1 = [8; 32];
+    let s1 = call_stream_id(ROOM, A, &nonce1);
+    let k1 = ChunkSigner::generate(s1, Epoch(3)).unwrap();
+    assert!(matches!(
+        bind(&auth, &keys, &a, nonce1, 3, k1.public()).await,
+        BindingOutcome::Installed(_)
+    ));
+    let inner = seal_av_inner(
+        b"frame",
+        &dek(),
+        s1,
+        Epoch(3),
+        ChunkSeq(0),
+        CODEC_AV1_SVC,
+        ChunkLayer::BASE,
+    )
+    .expect("seal");
+    assert!(auth.check(&k1.sign(&inner).expect("sign")).is_ok());
 }

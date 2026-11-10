@@ -11,7 +11,7 @@
 //!
 //! CAPS        0x01  caps u32_be
 //! SUBSCRIBE   0x02  stream[32] ‖ role u8 ‖ flags u8 (bit 0: forward-capable,
-//!                   bit 1: layer cap follows; bits 2-7 zero)
+//!                   bit 1: layer cap follows; bits 2-7 ignored)
 //!                   [‖ mode u8 (1: at most) ‖ max_spatial u8 ‖ max_temporal u8
 //!                    ‖ max_quality u8]                     (45.1, the cap)
 //! UNSUBSCRIBE 0x03  stream[32]
@@ -87,9 +87,15 @@ pub const CAP_LINK_DATAGRAMS: u32 = 1 << 3;
 /// without it.
 pub const CAP_LAYER_REQUEST: u32 = 1 << 4;
 
+/// It parses a v2 stream key binding (`ciris-edge:av-stream-key:v2`, the
+/// binding that names the codec). A v1-only peer refuses a v2 binding as
+/// malformed, so a publisher sends v2 only to a peer with this bit (and v1
+/// to every peer).
+pub const CAP_BINDING_V2: u32 = 1 << 5;
+
 /// What this build advertises (relay added per call; `CAP_LAYER_REQUEST`
 /// only behind the host's lever).
-pub const CAPS_THIS_BUILD: u32 = CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_LINK_DATAGRAMS;
+pub const CAPS_THIS_BUILD: u32 = CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_LINK_DATAGRAMS | CAP_BINDING_V2;
 
 const KIND_CAPS: u8 = 0x01;
 const KIND_SUBSCRIBE: u8 = 0x02;
@@ -333,10 +339,9 @@ pub fn decode(frame: &[u8], peer: &str) -> Result<WireFrame, WireError> {
         KIND_SUBSCRIBE => {
             let stream = r.stream()?;
             let role = role_of(r.u8()?).ok_or(WireError::Malformed)?;
+            // Bits 2-7 are ignored (docs/alm_calm_wire.md §3): a later bit is
+            // read as nothing, as a pre-45.1 decoder read bit 1.
             let flags = r.u8()?;
-            if flags & !(SUB_FORWARD_CAPABLE | SUB_LAYER_CAP) != 0 {
-                return Err(WireError::Malformed);
-            }
             let layers = if flags & SUB_LAYER_CAP == 0 {
                 None
             } else {
@@ -655,8 +660,8 @@ mod tests {
     /// KAT — the 45.1 SUBSCRIBE layer cap, byte for byte: stream 07 x 32,
     /// primary, forward-capable, at most (1, 2, 0). Also the frame without
     /// a cap (unchanged from v1, 40 bytes) and the refusals: mode 2 (audio
-    /// only, off), any other mode, an unknown flag bit, a short cap, and a
-    /// trailing byte.
+    /// only, off), any other mode, a short cap, and a trailing byte. An
+    /// unknown flag bit is ignored, as the v1 rule says.
     #[test]
     fn subscribe_layer_cap_kat() {
         let req = |layers| {
@@ -699,7 +704,11 @@ mod tests {
         }
         let mut f = with.clone();
         f[HEADER_LEN + 33] |= 1 << 2;
-        assert_eq!(decode(&f, "x"), Err(WireError::Malformed), "unknown flag");
+        assert_eq!(
+            decode(&f, "x"),
+            decode(&with, "x"),
+            "an unknown flag bit is ignored"
+        );
         assert_eq!(
             decode(&with[..with.len() - 1], "x"),
             Err(WireError::Malformed),

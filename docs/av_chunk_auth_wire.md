@@ -19,7 +19,7 @@ encoded by `unsigned_body` (`:501`) and `to_bytes` (`:569`), and parsed by
 
 | # | Member | Encoding | Bytes |
 |---|---|---|---|
-| 1 | version | `u8`, must be `0x01` (`BINDING_VERSION`, `:135`) | 1 |
+| 1 | version | `u8`: `0x01` (`BINDING_VERSION`), or `0x02` for a v2 binding (§1.8) | 1 |
 | 2 | room | `u16` BE length, then UTF-8 (the community key id) | 2 + n |
 | 3 | publisher | `u16` BE length, then UTF-8 (the publisher's federation key id) | 2 + n |
 | 4 | join_nonce | raw | 32 |
@@ -222,6 +222,100 @@ node's next roll (one 250 ms watch tick, or the next `publish`), the departed
 member's leg is still on the roster. A re-announce in that window would send
 it the current binding, which it already holds as a member of the epoch.
 
+### 1.8 The v2 binding: the codec map, `replaces`, `end` (45.1, CC 5.3.3.2.1 rc17 revised)
+
+The chunk header's `codec_id` carries the layer CLASS only (`0x01` SVC,
+`0x04` temporal-layered, `0xFF` codec-opaque); the stream's binding names the
+codec of each class it uses. One stream per publisher carries its audio and
+video (P5), so a phone's stream is `{0x04: h264, 0xFF: opus}`, an audio-only
+one `{0xFF: opus}`. A v2 binding is the v1 binding with member 1 `version =
+0x02` and, after member 7 (`chunk_key`):
+
+| # | Member | Encoding | Bytes |
+|---|---|---|---|
+| 7a | codecs | `u8 count` (1..=8), then per class, sorted by class, no class twice: `class u8 ‖ u16_be len ‖ ASCII token` | 1 + Σ(3 + len) |
+| 7b | replaces | `u8 present` (0 or 1), then, when 1, the publisher's earlier `stream_id` this one replaces in place | 1 or 33 |
+| 7c | end | `u8`: 0 live; 1 the attendee left; 2 its app went to the background | 1 |
+
+Members 1–7c are the v2 unsigned body. The signing bytes use their own
+domain tag:
+
+```
+signed_bytes_v2 = "ciris-edge:av-stream-key:v2"   (27 bytes ASCII)
+                ‖ unsigned_body_v2                (members 1–7c as encoded)
+```
+
+The hybrid signature is made as in §1.2 over `signed_bytes_v2`.
+
+| Token | Class |
+|---|---|
+| `av1` | `0x01` (SVC) |
+| `h264` | `0x04` (temporal-layered) |
+| `vp8` | `0x04` |
+| `vp9` | `0x04` |
+| `opus` | `0xFF` (codec-opaque) |
+
+The token table is CC's to register. Each is malformed
+(`av_binding_malformed`):
+- an unregistered token (`opaque` included);
+- a token under a class that is not its own;
+- a map that is empty, has more than 8 entries, is out of class order, or
+  names a class twice;
+- a `present` byte other than 0 or 1;
+- an `end` byte above 2.
+
+Rules:
+- **The chunk-class rule.** On a stream whose v2 binding named a map, a chunk
+  whose `codec_id` class has no entry is refused `av_chunk_class_unlisted`
+  after its signature verifies (`ChunkAuth::check_timed`). A v1-only stream
+  is not checked.
+- **The map is fixed for the stream's life.** A receiver keeps the map of a
+  stream's first v2 binding. A later v2 binding for the same stream naming
+  another map, in the same or any later epoch, is refused
+  `av_binding_codec_changed`. Dropping or adding a class is another map.
+  Changing codec is `Call::replace_stream`: a new join nonce, so a new
+  stream, whose v2 binding says `replaces: <old stream>`.
+- **`replaces` and `end` count only as signed.** A receiver learns that a new
+  stream replaces an old one, or that a stream ended and why, only from these
+  verified members. No unsigned control frame announces either, so a relay
+  cannot take a tile down. A second stream of a publisher with no `replaces`
+  (a screen share, say) stays a separate stream.
+- **v1 and v2 side by side.** A v1-only receiver refuses version 2 as
+  malformed. So a publisher whose host declared its codecs
+  (`CallOptions.codecs`) signs both a v1 and a v2 binding for each epoch:
+  - It sends v1 on every leg.
+  - It sends v2 additionally to each peer whose C3 `CAPS` carry bit 5
+    (`CAP_BINDING_V2`): at the epoch roll, at the reannounce, and on that
+    peer's first `CAPS`.
+  - Both encodings bind the same chunk key, and a receiver holds both.
+  - A member relay forwards the v1 encoding to every leg and the v2 one only
+    to the legs with bit 5 (`bindings_except(_, v2_ok)`). So a v1 peer behind
+    a v2 relay still binds (`a_v1_peer_behind_a_v2_relay_still_binds_and_hears`).
+- A v1 binding names no codec and never changes a stream's map.
+
+KAT (`binding_v2_signed_bytes_kat`), with the inputs of §5. First, the map
+`{0x04: h264, 0xFF: opus}`, no `replaces`, `end` 0:
+
+```
+63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174
+000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707
+070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d8
+00000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e3
+9f2d0204000468323634ff00046f7075730000
+```
+
+Second, the same map, `replaces` stream `aa`×32, `end` 1 (left):
+
+```
+…9f2d0204000468323634ff00046f70757301aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+aaaaaaaaaaaaaaaaaaaaaaaa01
+```
+
+Everything up to `9f2d` is identical to the first vector. Both are the v1
+signed bytes of the same inputs with the v2 domain, version `02`, and the
+v2 members appended; the v1 signed bytes themselves are unchanged. The v2
+signatures' KAT values are pinned at the first build of this branch.
+
 ## 2. The 72-byte trailer (v2: source timestamp + signature)
 
 > **CHANGED in ALM stage 2 (edge v44.0.0) — FLAG FOR THE CC (5.3.3.2.3).**
@@ -336,9 +430,11 @@ forwarder runs none of this and emits none of them. Each refusal:
 | `av_binding_stream_not_derived` | stream id ≠ `call_stream_id(room, publisher, nonce)` | `av_call_binding_refused` |
 | `av_binding_signature_unverified` | hybrid signature not `HybridVerified` | `av_call_binding_refused` |
 | `av_binding_stale_epoch` | epoch older than the two held for the stream | `av_call_binding_refused` |
+| `av_binding_codec_changed` | a v2 binding naming another codec map than its stream is bound to (§1.8) | `av_call_binding_refused` |
 | `av_chunk_unbound` | no verified binding for the chunk's `(stream, epoch)`; this covers an unknown stream, and an epoch whose key was dropped two rolls ago | `av_call_frame_unbound` |
 | `av_chunk_trailer_missing` | inner unit shorter than 72 bytes | `av_call_frame_forged` |
 | `av_chunk_trailer_invalid` | trailer does not verify under the bound key | `av_call_frame_forged` |
+| `av_chunk_class_unlisted` | the stream's v2 codec map names no codec for the chunk's class (§1.8) | `av_call_frame_unbound` |
 
 A successfully installed binding counts `av_call_binding_installed`.
 
@@ -408,8 +504,11 @@ no A/V outer seal and no hop counter; the E1 link seal covers it.
 
 ```
 frame = "CALM" ‖ 0x01 ‖ kind ‖ body
-CAPS 0x01: caps u32_be (bit 0 C3 v1, bit 1 timed Channel frames, bit 2 offers relay)
-SUBSCRIBE 0x02: stream[32] ‖ role u8 (0 primary, 1 standby) ‖ flags u8 (bit 0 forward-capable)
+CAPS 0x01: caps u32_be (bit 0 C3 v1, bit 1 timed Channel frames, bit 2 offers relay,
+           bit 3 link datagrams, bit 4 layer cap on SUBSCRIBE (lever, default off),
+           bit 5 parses v2 bindings)
+SUBSCRIBE 0x02: stream[32] ‖ role u8 (0 primary, 1 standby) ‖ flags u8 (bit 0 forward-capable,
+           bit 1 layer cap follows) [‖ mode u8 = 1 ‖ max_spatial ‖ max_temporal ‖ max_quality]
 UNSUBSCRIBE 0x03: stream[32]
 ADMIT 0x04: stream[32] ‖ role u8
 REFUSE 0x05: stream[32] ‖ reason u8 ‖ retry_after_ms u32_be

@@ -729,6 +729,67 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
     );
 }
 
+/// **A v1 peer behind a v2 relay still binds** (45.1, binding v2): B names
+/// its codecs (`{0xFF: opus}`), so it signs a v1 and a v2 binding per epoch.
+/// A relays and parses v2; C does not (its `CAPS` lack `CAP_BINDING_V2`) and
+/// reaches B only through A. C must get B's v1 binding from A, bind, and hear
+/// B; A holds B's v2 map, C never sees one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_v1_peer_behind_a_v2_relay_still_binds_and_hears() {
+    use ciris_edge::transport::av_chunk_auth::{CodecMap, CodecToken};
+    use ciris_edge::transport::realtime_av_alm::controller::wire::CAP_BINDING_V2;
+    let _call = one_call().await;
+    let tag = "alm2-v1-behind-v2";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2)], None).await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    c.transport.set_av_caps_withheld_for_test(CAP_BINDING_V2);
+    let opus = CodecMap::new([CodecToken::Opus]).expect("map");
+    let ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(
+        b,
+        &groups[1],
+        tag,
+        CallOptions {
+            codecs: Some(opus),
+            ..CallOptions::default()
+        },
+        None,
+    )
+    .await;
+    let mut cc = join_loaded(c, &groups[2], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 2).await;
+    wait_legs(&cb, 1).await;
+    wait_legs(&cc, 1).await;
+    assert_eq!(cc.legs(), vec![a.key.key_id.clone()], "C reaches only A");
+    let mut rx = cc.frames().expect("C's frames");
+    let mut heard = false;
+    for seq in 0..400u64 {
+        cb.publish(Frame::opaque(body("b", seq)))
+            .await
+            .expect("B publishes");
+        while let Ok(f) = rx.try_recv() {
+            heard |= f.publisher == b.key.key_id;
+        }
+        if heard {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        heard,
+        "C never heard B through A: C auth {:?}; C parents {:?}; A log {:?}",
+        cc.chunk_auth_counts(),
+        cc.alm_parents(),
+        ca.alm_log()
+    );
+    assert_eq!(
+        ca.stream_codecs(cb.stream()),
+        Some(opus),
+        "A holds B's v2 map"
+    );
+    assert_eq!(cc.stream_codecs(cb.stream()), None, "C was sent v1 only");
+}
+
 /// **Per-leg stats** (45.1): every leg a call reports names what carries it
 /// and its MDU, so a gate can tell a punched UDP leg from a TCP one from a
 /// relayed one. On loopback TCP every leg is `Interface`, with a link MDU,

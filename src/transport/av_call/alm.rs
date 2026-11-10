@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 use crate::load_ladder::ServiceTier;
 use crate::transport::realtime_av::StreamId;
 use crate::transport::realtime_av_alm::controller::wire::{
-    self, encode, encode_caps, CAPS_THIS_BUILD, CAP_C3_V1, CAP_LAYER_REQUEST, CAP_LINK_DATAGRAMS,
-    CAP_RELAY, CAP_TIMED_FRAMES,
+    self, encode, encode_caps, CAPS_THIS_BUILD, CAP_BINDING_V2, CAP_C3_V1, CAP_LAYER_REQUEST,
+    CAP_LINK_DATAGRAMS, CAP_RELAY, CAP_TIMED_FRAMES,
 };
 use crate::transport::realtime_av_alm::controller::{
     Admission, AdmitDecision, ChunkPos, ControlFrame, ControlMsg, ControllerConfig, DecisionKind,
@@ -328,6 +328,11 @@ impl AlmState {
         self.caps
             .get(peer)
             .is_some_and(|c| c & CAP_TIMED_FRAMES != 0)
+    }
+
+    /// Whether `peer` parses a v2 stream key binding (`CAP_BINDING_V2`).
+    pub(super) fn takes_binding_v2(&self, peer: &str) -> bool {
+        self.caps.get(peer).is_some_and(|c| c & CAP_BINDING_V2 != 0)
     }
 
     /// leviculum#102 — whether `peer` takes media as unordered link

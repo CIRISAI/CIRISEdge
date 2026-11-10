@@ -718,13 +718,22 @@ impl PyEdge {
     /// `RuntimeError` on plumbing (no Reticulum transport, no room groups...).
     /// Every message starts with the refusal's token.
     #[cfg(feature = "_reticulum-module")]
-    #[pyo3(signature = (room, keep="unkept", relay=false))]
-    fn join_call(&self, py: Python<'_>, room: &str, keep: &str, relay: bool) -> PyResult<PyCall> {
+    #[pyo3(signature = (room, keep="unkept", relay=false, codecs=None))]
+    fn join_call(
+        &self,
+        py: Python<'_>,
+        room: &str,
+        keep: &str,
+        relay: bool,
+        codecs: Option<Vec<String>>,
+    ) -> PyResult<PyCall> {
         let room = call_room_arg(room)?;
         let keep = call_keep_arg(keep)?;
+        let codecs = codecs.map(|c| call_codecs_arg(&c)).transpose()?;
         let opts = crate::transport::av_call::CallOptions {
             keep,
             relay,
+            codecs,
             ..crate::transport::av_call::CallOptions::default()
         };
         let edge = Arc::clone(&self.inner);
@@ -4403,6 +4412,27 @@ fn call_err_to_py(e: &crate::transport::av_call::CallError) -> PyErr {
         | E::AnonymousMode => PyValueError::new_err(msg),
         _ => PyRuntimeError::new_err(msg),
     }
+}
+
+/// `join_call(codecs=[...])`: the stream's codec tokens, e.g. `["h264",
+/// "opus"]`. Each token implies its layer class (CC 5.3.3.2.1), so a list
+/// names the map without a key that could disagree with it; two tokens of
+/// one class, or an unregistered token, raise `ValueError`.
+#[cfg(feature = "_reticulum-module")]
+fn call_codecs_arg(tokens: &[String]) -> PyResult<crate::transport::av_chunk_auth::CodecMap> {
+    use crate::transport::av_chunk_auth::{CodecMap, CodecToken};
+    let parsed = tokens
+        .iter()
+        .map(|t| {
+            CodecToken::parse(t).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "codec_unregistered: {t:?} is not a registered codec token \
+                     (av1, h264, vp8, vp9, opus)"
+                ))
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    CodecMap::new(parsed).map_err(|e| PyValueError::new_err(format!("codec_map_invalid: {e}")))
 }
 
 /// A [`CallEvent`](crate::transport::av_call::CallEvent) as a Python dict:

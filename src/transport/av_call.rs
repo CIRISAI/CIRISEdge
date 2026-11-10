@@ -173,6 +173,12 @@ pub struct CallOptions {
     pub relay: bool,
     /// The layer cap every member's leg starts at.
     pub default_policy: ReceiverLayerPolicy,
+    /// The codecs this node's stream carries, one per layer class, for its v2
+    /// stream key binding (CC 5.3.3.2.1: the binding names them, fixed for
+    /// the stream's life; `{0x04: h264, 0xFF: opus}` for a phone's audio and
+    /// video). A chunk of a class the map does not name is refused by every
+    /// receiver. `None`: v1 bindings only, which name no codec.
+    pub codecs: Option<crate::transport::av_chunk_auth::CodecMap>,
 }
 
 impl Default for CallOptions {
@@ -181,6 +187,7 @@ impl Default for CallOptions {
             keep: AvKeep::Unkept,
             relay: false,
             default_policy: ReceiverLayerPolicy::UNCAPPED,
+            codecs: None,
         }
     }
 }
@@ -1305,10 +1312,14 @@ struct Shared {
     test_fail_c3: AtomicU64,
 }
 
-/// This stream's chunk key at one epoch and its binding's encoding.
+/// This stream's chunk key at one epoch and its binding's encodings.
 struct OwnChunkKey {
     signer: ChunkSigner,
+    /// The v1 binding (every peer).
     wire: Arc<Vec<u8>>,
+    /// The v2 binding naming the codec, when the host declared one (only to
+    /// peers with `CAP_BINDING_V2`).
+    wire_v2: Option<Arc<Vec<u8>>>,
 }
 
 /// Mint this stream's chunk key for `epoch` and bind it.
@@ -1318,15 +1329,38 @@ async fn mint_own_key(
     join_nonce: [u8; 32],
     stream: StreamId,
     epoch: Epoch,
+    codecs: Option<crate::transport::av_chunk_auth::CodecMap>,
 ) -> Result<OwnChunkKey, CallError> {
     let key =
         ChunkSigner::generate(stream, epoch).map_err(|e| CallError::Plumbing(e.to_string()))?;
     let binding = StreamKeyBinding::sign(signer, room, join_nonce, stream, epoch, key.public())
         .await
         .map_err(|e| CallError::Plumbing(e.to_string()))?;
+    let wire_v2 = match codecs {
+        Some(codecs) => Some(Arc::new(
+            StreamKeyBinding::sign_v2(
+                signer,
+                room,
+                join_nonce,
+                stream,
+                epoch,
+                key.public(),
+                Some(crate::transport::av_chunk_auth::V2Members {
+                    codecs,
+                    replaces: None,
+                    end: None,
+                }),
+            )
+            .await
+            .map_err(|e| CallError::Plumbing(e.to_string()))?
+            .to_bytes(),
+        )),
+        None => None,
+    };
     Ok(OwnChunkKey {
         signer: key,
         wire: Arc::new(binding.to_bytes()),
+        wire_v2,
     })
 }
 
@@ -1479,7 +1513,7 @@ impl Call {
         };
         let (stream, join_nonce, epoch, publisher, keep) =
             start_stream(room, own_key_id, &room_group, opts.keep, registrar, events).await?;
-        let own_key = mint_own_key(&signer, room, join_nonce, stream, epoch).await?;
+        let own_key = mint_own_key(&signer, room, join_nonce, stream, epoch, opts.codecs).await?;
 
         // Addresses: the call's group, from the room's destination secret at
         // the room's epoch, for the room's members.
@@ -1658,6 +1692,16 @@ impl Call {
                 limit.saturating_sub(AV_CHUNK_WIRE_OVERHEAD + CHUNK_TRAILER_LEN)
             })
             .min()
+    }
+
+    /// The codec map `stream`'s verified v2 binding named on this node, or
+    /// `None` when only v1 bindings (or none) came.
+    #[must_use]
+    pub fn stream_codecs(
+        &self,
+        stream: StreamId,
+    ) -> Option<crate::transport::av_chunk_auth::CodecMap> {
+        self.shared.auth.codecs_of(stream)
     }
 
     /// What the chunk source authentication counted on this node: chunks
@@ -2333,6 +2377,7 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
         shared.join_nonce,
         shared.stream,
         to,
+        shared.opts.codecs,
     )
     .await?;
     let keep = publisher
@@ -2340,6 +2385,7 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
         .await
         .map_err(|e| CallError::Plumbing(e.to_string()))?;
     let wire = Arc::clone(&own_key.wire);
+    let wire_v2 = own_key.wire_v2.clone();
     *Shared::lock(&shared.own_key) = own_key;
     // Departed members: no more of this stream for them.
     let before: Vec<String> = Shared::lock(&shared.members).clone();
@@ -2356,11 +2402,25 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     for m in &left {
         publisher.remove_subscriber(m);
     }
-    // Every remaining leg learns the new key before the epoch's first chunk.
+    // Every remaining leg learns the new key before the epoch's first chunk
+    // (and a leg that takes v2, the binding that names the codec).
     publisher
         .dispatcher_mut()
         .send_control_report(&[], &|limit| StreamKeyBinding::parts(&wire, limit))
         .await;
+    if let Some(v2) = &wire_v2 {
+        let not_v2 = {
+            let legs = publisher.dispatcher_mut().subscriber_ids();
+            let a = Shared::lock(&shared.alm);
+            legs.into_iter()
+                .filter(|l| !a.takes_binding_v2(l))
+                .collect::<Vec<_>>()
+        };
+        publisher
+            .dispatcher_mut()
+            .send_control_report(&not_v2, &|limit| StreamKeyBinding::parts(v2, limit))
+            .await;
+    }
     drop(publisher);
     Shared::lock(&shared.members).clone_from(&members);
     Shared::lock(&shared.alm).set_members(&members);
@@ -2527,9 +2587,11 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         // the leg joining the roster: the stream's current binding (and, for a
         // relay, every binding it holds but the member's own), then the leg.
         let mut publisher = shared.publisher.lock().await;
+        // v1 only: the member's CAPS (whether it takes v2) have not come
+        // yet. Its v2 bindings follow its CAPS (`send_v2_bindings_to`).
         let mut wires = vec![Arc::clone(&Shared::lock(&shared.own_key).wire)];
         if shared.opts.relay {
-            wires.extend(shared.auth.bindings_except(member));
+            wires.extend(shared.auth.bindings_except(member, false));
         }
         for wire in &wires {
             let parts = StreamKeyBinding::parts(wire, Some(channel_limit));
@@ -2840,7 +2902,7 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
 /// frames gets its media timed from now on.
 async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: bool) {
     let rtt = leg_rtt_ms(shared, peer);
-    let (out, reply, timed, datagrams) = {
+    let (out, reply, timed, datagrams, binding_v2) = {
         let mut a = Shared::lock(&shared.alm);
         match decode_c3(bytes, peer) {
             Ok(WireFrame::Caps(c)) => {
@@ -2851,15 +2913,22 @@ async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: b
                         .then(|| a.caps_frame(shared.transport.av_datagrams_enabled())),
                     first && a.takes_timed(peer),
                     first && a.takes_datagrams(peer) && shared.transport.av_datagrams_enabled(),
+                    first && a.takes_binding_v2(peer),
                 )
             }
-            Ok(WireFrame::Control(cf)) => (a.on_control(peer, cf, rtt), None, false, false),
+            Ok(WireFrame::Control(cf)) => (a.on_control(peer, cf, rtt), None, false, false, false),
             Err(e) => {
                 a.note_malformed(e);
-                (Vec::new(), None, false, false)
+                (Vec::new(), None, false, false, false)
             }
         }
     };
+    // The peer parses v2 bindings: it gets the ones that name the codec.
+    if binding_v2 {
+        let s = Arc::clone(shared);
+        let p = peer.to_owned();
+        tokio::spawn(async move { send_v2_bindings_to(&s, &p).await });
+    }
     if timed || datagrams {
         if let Some(ttl) = Shared::lock(&shared.leg_ttl).get(peer) {
             if timed {
@@ -3143,7 +3212,11 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
     // claiming depth 0 is checked against.
     Shared::lock(&shared.alm).note_bound_publisher(binding.stream, &binding.publisher);
     if shared.opts.relay && (installed || binding.publisher == peer) {
-        let except = vec![peer.to_owned(), binding.publisher.clone()];
+        let mut except = vec![peer.to_owned(), binding.publisher.clone()];
+        // A v2 binding goes only to the legs that take v2.
+        if binding.version() == crate::transport::av_chunk_auth::BINDING_VERSION_V2 {
+            except.extend(legs_without_binding_v2(shared).await);
+        }
         let wire = Arc::new(wire.to_vec());
         if installed {
             // Before the chunks it keys, which this pump forwards next.
@@ -3207,8 +3280,66 @@ async fn send_binding_paced(
 /// Re-send this stream's current binding on every leg (a receiver whose
 /// inbound queue dropped a part gets it again).
 async fn reannounce(shared: &Arc<Shared>) {
-    let wire = Arc::clone(&Shared::lock(&shared.own_key).wire);
+    let (wire, wire_v2) = {
+        let k = Shared::lock(&shared.own_key);
+        (Arc::clone(&k.wire), k.wire_v2.clone())
+    };
     send_binding_paced(shared, &wire, &[], Some(REANNOUNCE_PART_GAP)).await;
+    if let Some(v2) = wire_v2 {
+        let not_v2 = legs_without_binding_v2(shared).await;
+        send_binding_paced(shared, &v2, &not_v2, Some(REANNOUNCE_PART_GAP)).await;
+    }
+}
+
+/// The legs whose peer has not said it parses a v2 binding.
+async fn legs_without_binding_v2(shared: &Arc<Shared>) -> Vec<String> {
+    let legs = shared
+        .publisher
+        .lock()
+        .await
+        .dispatcher_mut()
+        .subscriber_ids();
+    let a = Shared::lock(&shared.alm);
+    legs.into_iter()
+        .filter(|l| !a.takes_binding_v2(l))
+        .collect()
+}
+
+/// `peer` just said it parses v2 bindings: send it this stream's v2 binding
+/// and, as a relay, every held v2 binding but its own (it had v1 only).
+async fn send_v2_bindings_to(shared: &Arc<Shared>, peer: &str) {
+    let mut wires: Vec<Arc<Vec<u8>>> = Shared::lock(&shared.own_key)
+        .wire_v2
+        .clone()
+        .into_iter()
+        .collect();
+    if shared.opts.relay {
+        wires.extend(
+            shared
+                .auth
+                .bindings_except(peer, true)
+                .into_iter()
+                .filter(|w| {
+                    StreamKeyBinding::version_of(w)
+                        == Some(crate::transport::av_chunk_auth::BINDING_VERSION_V2)
+                }),
+        );
+    }
+    if wires.is_empty() {
+        return;
+    }
+    let others: Vec<String> = shared
+        .publisher
+        .lock()
+        .await
+        .dispatcher_mut()
+        .subscriber_ids()
+        .into_iter()
+        .filter(|l| l != peer)
+        .collect();
+    for w in &wires {
+        send_binding_paced(shared, w, &others, None).await;
+    }
 }
 
 /// What [`forward`] needs to know about one chunk.
