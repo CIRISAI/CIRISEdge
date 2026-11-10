@@ -2285,6 +2285,9 @@ enum IdentityRowReach {
     /// Announced (a live owner-binding at `cohort_scope: federation`), or
     /// unowned — a node that is its own trust subject has no owner to announce
     /// it and serves its rows as it always has (the canonical, a bare server).
+    /// For an announced OWNED node's route this is wider than CC 5.4.6, which
+    /// serves an owned node's route to nobody through a forwarder; tracked in
+    /// CIRISEdge#972 (see [`FederationDirectoryReplicationBridge::identity_row_reach`]).
     Everyone,
     /// Owned and NOT announced: only the owner's own nodes
     /// (`nodes_owned_by(owner)`, which includes the node itself).
@@ -12409,6 +12412,22 @@ impl FederationDirectoryReplicationBridge {
     /// identity rows are lightnet — served to every peer, as before. An
     /// unannounced one is darknet: reachable by its person's own nodes, never
     /// listed, so its rows go only to `nodes_owned_by(owner)`.
+    ///
+    /// The ROUTE half of [`IdentityRowReach::Everyone`] is wider than CC 5.4.6:
+    /// the text says a forwarder serves an owned node's route to nobody, and
+    /// this serves an announced owned node's `TransportDestination` to any
+    /// peer. That is shipped behaviour, not the text. The route is not secret:
+    /// an announced node's destination is public on the mesh. What the
+    /// withhold adds is that a route comes from its owner, one asker at a
+    /// time, where a forwarder that serves routes can be read as a list; and
+    /// that a node whose owner turned relay off would be in no referral, where
+    /// a forwarder that serves routes still lists it. Tracked in CIRISEdge#972,
+    /// which must not ship without the sealed request and acceptance carrying
+    /// the route (CIRISEdge#922); ruled not gating for the v45 LTS
+    /// (2026-11-09), so this is a comment, not a change.
+    ///
+    /// An identity with no owner resolves `Unowned` here and is served to
+    /// everyone; re-read this before the anonymous tier ships.
     ///
     /// Decided from persist state alone, never from a host flag, and memoized
     /// under [`OWNER_BINDING_MEMO_TTL`] so a sweep over N peers pays for each
@@ -23926,11 +23945,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// v44 (CC rc15 5.4.6 "First contact through a forwarder"; CIRISPersist#1165
-    /// superseded) — the consent-gated-routes rule is RETIRED: a forwarder never
-    /// holds the contact grant, so it cannot gate a route on one. A relay
-    /// serves an announced node's route to a stranger as it did before the
-    /// rule (the sealed request/acceptance carrying the route is CIRISEdge#922).
+    /// v44 (CIRISPersist#1165 superseded) — pins SHIPPED behaviour that is
+    /// WIDER than CC 5.4.6. Only the consent gate was retired: a forwarder never
+    /// holds the contact grant, so it cannot gate a route on one. The text does
+    /// not let a forwarder serve an owned node's route to a stranger ("a
+    /// forwarder serves an owned node's route to nobody"); this relay still
+    /// does, for an announced node. The withhold is tracked in CIRISEdge#972 and
+    /// must not ship without the sealed request and acceptance carrying the
+    /// route (CIRISEdge#922). Until then this test pins what ships, not what
+    /// the text asks.
     #[tokio::test]
     async fn a_relayed_route_reaches_a_stranger_with_no_consent_gate() {
         use sha2::{Digest as _, Sha256};
