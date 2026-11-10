@@ -56,7 +56,9 @@ use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{AvKeepTarget, StreamDekRegistrar};
 use ciris_edge::transport::realtime_av::{ChunkLayer, ReceiverLayerPolicy, CODEC_AV1_SVC};
 use ciris_edge::transport::realtime_av_alm::controller::wire::encode;
-use ciris_edge::transport::realtime_av_alm::controller::{ControlMsg, DecisionKind, Offer};
+use ciris_edge::transport::realtime_av_alm::controller::{
+    ControlMsg, DecisionKind, Offer, Role, SubscribeRequest,
+};
 use ciris_edge::transport::reticulum::{
     ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
 };
@@ -729,7 +731,8 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
 
 /// **C3 admit / refuse**: A's own stream admits B (C2 over C3); C, a relay
 /// at service tier 1 (the host said `Warning`), refuses B's subscription
-/// for A's stream by name, `load_refuse:admit_closed`.
+/// for A's stream by name, `load_refuse:admit_closed`. A closed relay offers
+/// no room (45.1), so no selector picks it: B is made to ask.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn c3_admits_and_a_closed_relay_refuses_by_name() {
     let _call = one_call().await;
@@ -777,6 +780,27 @@ async fn c3_admits_and_a_closed_relay_refuses_by_name() {
         av(&a.metrics, "alm_c3_send_failed")
     );
 
+    // C forwards A's stream only once it has a parent for it.
+    assert!(
+        wait_until(Duration::from_mins(1), || async {
+            primary_for(&cc, ca.stream()).is_some()
+        })
+        .await,
+        "C hears A: {:?}",
+        cc.alm_parents()
+    );
+    cb.send_c3_for_test(
+        &c.key.key_id,
+        encode(
+            ca.stream(),
+            &ControlMsg::Subscribe(SubscribeRequest {
+                subscriber: b.key.key_id.clone(),
+                role: Role::Standby,
+                forward_capable: false,
+            }),
+        ),
+    )
+    .await;
     let refused = wait_until(Duration::from_mins(1), || async {
         cc.alm_counts()
             .refused

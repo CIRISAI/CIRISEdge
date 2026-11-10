@@ -19,7 +19,8 @@
 //!   rate, standby = audio rate), not static config.
 //!
 //! A measured ceiling is an estimate of a moment, not a property of the
-//! uplink: one that stands [`CEILING_STALE_MS`] with no congested window is
+//! uplink: one that stands [`CEILING_STALE_MS`] with no sustained (two
+//! windows running) congestion is
 //! forgotten and growth goes back to the probe allowance
 //! (`docs/AV_ALM_DESIGN.md` §5.1, "a ceiling gone stale"). Nothing else could
 //! lift it: it rises only on a window that sent more than it, and a forwarder
@@ -477,9 +478,29 @@ impl<P: PeerRef> Admission<P> {
             (None, false) if self.advertised_bps.is_some() => f64::INFINITY,
             (None, false) => self.floor_bps,
         };
-        // The node's other streams share the MEASURED uplink, so they come
-        // off the hard limit; the probe gate is this admission's own growth.
-        let hard = hard - self.external_committed as f64;
+        // The node's other streams share the uplink, so they come off the
+        // hard limit. They come off a relay's probe gate too: `floor_bps` is
+        // what the WHOLE uplink demonstrated (every admission folds the one
+        // shared egress window), so "floor + one step" is the uplink's
+        // allowance, not each admission's. Without this every relayed stream
+        // took floor + a step of its own, and a relay-on N=4 room committed
+        // its full mesh plus a full-rate standby per other stream, unmeasured,
+        // the second media started (CIRISEdge avmesh4n, 2026-11-10). The
+        // publisher's own stream keeps its allowance whole: it is the one
+        // path nothing can replace, and relays yield to it.
+        //
+        // Only what the floor demonstrated comes off: the node's commitments
+        // the uplink is not yet sending (a stream that has not started, priced
+        // at the floor rate) are no measurement either way, and taking them
+        // off would leave a relay no step at all. So the uplink's growth is
+        // `max(floor, committed elsewhere) + one step`, shared by its relays.
+        let ext = self.external_committed as f64;
+        let hard = hard - ext;
+        let probe = if self.is_root {
+            probe
+        } else {
+            probe - self.floor_bps.min(ext)
+        };
         (hard.min(probe) - self.cfg.reserve_bps as f64).max(0.0)
     }
 
@@ -520,11 +541,20 @@ impl<P: PeerRef> Admission<P> {
         clippy::cast_precision_loss
     )]
     pub fn offer(&self) -> Offer<P> {
-        let headroom = (self.limit_bps() - self.committed_bps() as f64).max(0.0);
+        // Admit-close refuses every request that grows a commitment, so a
+        // closed forwarder has no room to offer: advertising it only draws
+        // `load_refuse:admit_closed` refusals, each backing its asker off
+        // (47 of them on one node in a 90 s N=4 call, avmesh4n m0).
+        let open = !self.admit_closed;
+        let headroom = if open {
+            (self.limit_bps() - self.committed_bps() as f64).max(0.0)
+        } else {
+            0.0
+        };
         let can_preempt = self
             .depth
             .is_some_and(|d| d.saturating_add(2) <= self.cfg.max_depth);
-        let forwarder_headroom = if can_preempt && self.cfg.admission_enabled {
+        let forwarder_headroom = if open && can_preempt && self.cfg.admission_enabled {
             let held_by_forwarders: u64 = self
                 .ledger
                 .values()
@@ -750,13 +780,21 @@ impl<P: PeerRef> Admission<P> {
         log: &mut DecisionLog,
     ) -> Vec<P> {
         self.expire_drains(now_ms);
-        if w.congested {
+        // What keeps a ceiling current is what learned it: congestion that
+        // holds two windows running (or an uplink that sent nothing at all).
+        // A lone congested window (one `Busy`, one late ack) teaches nothing,
+        // so it does not keep a ceiling from going stale either. On v44.1.1
+        // eleven such blips in the 60 s after a cap lifted kept the cap's
+        // ceiling standing, and the members it had shed never got room back
+        // (avmesh4, m0).
+        if w.congested && w.sent_bps <= 0.0 {
             self.last_congested_ms = now_ms;
         }
         if w.congested && w.sent_bps > 0.0 {
             self.clean_streak = 0;
             self.congested_streak += 1;
             if self.congested_streak >= 2 {
+                self.last_congested_ms = now_ms;
                 let c = match self.ceiling_bps {
                     None => w.sent_bps,
                     Some(c) => 0.5f64.mul_add(w.sent_bps - c, c),
@@ -1117,6 +1155,118 @@ mod tests {
             assert_eq!(a.ceiling_bps(), None, "never longer than the cap");
             at += 1_000;
         }
+    }
+
+    /// The relay-on N=4 field run (avmesh4n m0, 2026-11-10): one uplink,
+    /// four admissions (its own stream and a relay per other stream). The
+    /// full mesh ran clean; the relays then each took the uplink's whole
+    /// demonstrated floor plus a probe step of their own, a standby at full
+    /// rate per other member (opaque media is all "audio"), and two windows
+    /// later the uplink was congested and shedding. The probe gate is the
+    /// uplink's: floor + one step, less what the node already committed.
+    /// Mutation (v44.1.1): the relay admits floor (3) + step (1) = 4 standbys.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn an_unmeasured_uplink_is_probed_once_not_per_admission() {
+        let cfg = ControllerConfig::interactive();
+        let s = cfg.stream_bps;
+        let mut own = Admission::publisher(0u32, cfg.clone(), None);
+        roster(&mut own);
+        own.set_probe_streams(3);
+        let mut relay = Admission::relay(0u32, cfg.clone(), None);
+        roster(&mut relay);
+        relay.set_upstream(Some(1), vec![9], true, 10);
+        // Opaque media: a standby is sent everything, so it costs a stream.
+        relay.set_role_costs(s, s);
+        let mut rng = SplitMix64(1);
+        let mut log = DecisionLog::new(64);
+        for c in 1..=3u32 {
+            assert!(
+                matches!(
+                    own.request(0, &req(c, Role::Primary), &mut rng, &mut log),
+                    AdmitDecision::Admit { .. }
+                ),
+                "the premise: a room of four is a full mesh on the probe"
+            );
+        }
+        // The full mesh runs clean; both admissions fold the same window.
+        let sent = own.committed_bps() as f64;
+        for t in 1..=2u64 {
+            let _ = own.on_egress_window(t * 1_000, &window(sent, false), &mut log);
+            relay.set_external_committed(own.committed_bps());
+            let _ = relay.on_egress_window(t * 1_000, &window(sent, false), &mut log);
+        }
+        relay.set_external_committed(own.committed_bps());
+        let admitted = (4..=8u32)
+            .filter(|&c| {
+                matches!(
+                    relay.request(3_000, &req(c, Role::Standby), &mut rng, &mut log),
+                    AdmitDecision::Admit { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            admitted, 1,
+            "floor 3 + one step − own 3 = one standby, not four"
+        );
+        assert!(own.committed_bps() + relay.committed_bps() <= 4 * s);
+        assert_eq!(own.ledger().len(), 3, "the publisher's own children stand");
+    }
+
+    /// A closed forwarder (service tier ≥ 1) refuses every request that would
+    /// grow a commitment, so its offer shows no room; it still forwards what
+    /// it holds. Mutation (v44.1.1): the offer advertises the probe's room and
+    /// every member that reads it is refused `load_refuse:admit_closed`.
+    #[test]
+    fn an_admit_closed_relay_offers_no_room() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::relay(9u32, cfg.clone(), None);
+        roster(&mut a);
+        a.set_upstream(Some(1), vec![0], true, 10);
+        assert!(
+            a.offer().headroom_bps >= cfg.stream_bps,
+            "the premise: an open relay offers its trial slot"
+        );
+        a.set_admit_closed(true);
+        let o = a.offer();
+        assert_eq!((o.headroom_bps, o.forwarder_headroom_bps), (0, 0));
+        assert!(o.forwarding, "closed to growth, not to what it carries");
+        a.set_admit_closed(false);
+        assert!(a.offer().headroom_bps >= cfg.stream_bps, "reopened");
+    }
+
+    /// One congested window is not a ceiling (two running are), so a lone
+    /// one does not keep a ceiling from going stale. avmesh4 (C): eleven
+    /// congested sends in the 60 s after the cap lifted kept m0's cap
+    /// ceiling standing, and m1 and m3 never got room back. Mutation
+    /// (v44.1.1): every congested window re-arms the staleness, and a blip
+    /// every 5 s keeps the ceiling forever.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn lone_congested_windows_do_not_keep_a_ceiling() {
+        let (mut a, mut log, cfg) = publisher_of_two();
+        let bps = cfg.stream_bps as f64;
+        let _ = a.on_egress_window(1_000, &window(bps, true), &mut log);
+        let _ = a.on_egress_window(2_000, &window(bps, true), &mut log);
+        assert!(a.ceiling_bps().is_some(), "the premise: a ceiling learned");
+        let mut at = 2_000;
+        while at < 2_000 + CEILING_STALE_MS {
+            at += 1_000;
+            let blip = (at / 1_000) % 5 == 0;
+            let _ = a.on_egress_window(at, &window(bps / 2.0, blip), &mut log);
+        }
+        assert_eq!(
+            a.ceiling_bps(),
+            None,
+            "stale on time: nothing congested two windows running"
+        );
+        // Sustained congestion still keeps it (the twice-as-long test is the
+        // same rule from the other side).
+        let _ = a.on_egress_window(at + 1_000, &window(bps, true), &mut log);
+        let _ = a.on_egress_window(at + 2_000, &window(bps, true), &mut log);
+        let half = at + 2_000 + CEILING_STALE_MS / 2;
+        let _ = a.on_egress_window(half, &window(0.0, false), &mut log);
+        assert!(a.ceiling_bps().is_some());
     }
 
     #[test]
