@@ -179,6 +179,8 @@ pub mod session;
 #[cfg(test)]
 mod sim;
 pub(crate) mod single_flight;
+#[cfg(test)]
+mod stale_route_971_tests;
 pub mod storage_contention;
 /// CIRISEdge#971 — one drain of the serve cursor for the holdings index and
 /// the four key-plane memos.

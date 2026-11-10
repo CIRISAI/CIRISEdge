@@ -47,6 +47,12 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   `advertise_send_set_expired` (a round found it past the TTL). `key_plane_sweep` gains the memo
   rebuild causes `key_plane_rebuilds_first`, `key_plane_rebuilds_ttl`, `key_plane_forgotten`,
   plus `key_plane_inbox_overflows` and `key_plane_plane_dirt`.
+- **A route older than the one held is fetched once per terminal window, not every round
+  (CIRISEdge#971).** The stale arm of the route apply still reports `Duplicate`, and now also marks
+  the bytes in a memory of their own (4,096 marks, front-drop, terminal schedule 30 min doubling to
+  6 h), which `remember_outcome` does not clear. The round's `want` drops a marked hash; a newer
+  route is a new hash and is wanted as before. On the canonical, 10,710 of 24,949 routes served in
+  one process lifetime were these.
 - **Naming a shaping class is no longer the shaping opt-in (CIRISEdge#969, CC 5.4.3).**
   `init_edge_runtime(shaping_class="home" | "phone-wifi" | "phone-cellular")` used to shape every
   identity link while seeding the device with no opt-in, so the policy and the device disagreed.

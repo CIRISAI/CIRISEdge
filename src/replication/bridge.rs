@@ -1183,6 +1183,29 @@ impl Default for BridgeConfig {
     }
 }
 
+// ─── CIRISEdge#971 — stale-route marks ──────────────────────────────
+
+/// CIRISEdge#971 — capacity of the stale-route marks
+/// (`FederationDirectoryReplicationBridge::stale_routes`), front-drop.
+///
+/// The numbers: the canonical served 24,949 routes in one ~64-minute process
+/// lifetime, 10,710 of them stale duplicates (~2.8 a second). A stale hash is
+/// one peer's older version of one route, so the DISTINCT count is bounded by
+/// how many routes have been superseded while some peer still holds the old
+/// one, which on an 18,313-route store is far below the duplicate count (each
+/// distinct hash was re-offered every round). With every distinct stale hash
+/// marked, each costs one fetch per terminal window (30 min, doubling to 6 h)
+/// instead of one per round: ~2.8/s falls to under a few hundred an hour while
+/// the marks fit. If more than 4,096 distinct stale hashes circulate, the
+/// oldest marks are evicted first and each eviction costs exactly one re-fetch
+/// (the old behaviour for that hash, once), never a wrong answer. Each mark is
+/// one map entry and one ring slot (~100 bytes), so the cap bounds the memory
+/// at ~400 KiB against a hash space a peer can grow.
+pub(crate) const STALE_ROUTE_MARKS: usize = 4096;
+
+/// The class a stale-route mark records.
+const STALE_ROUTE_CLASS: &str = "stale_route";
+
 // ─── CIRISEdge#971 — the holdings index's answer ─────────────────────
 
 /// How a holdings ask is to be answered
@@ -2916,6 +2939,20 @@ pub struct FederationDirectoryReplicationBridge {
     /// same verdict once per peer and keep paying for it once per peer, which is
     /// the amplification the issue measured.
     refusal_backoff: RefusalBackoff,
+    /// CIRISEdge#971 — the STALE-ROUTE marks: a replicated route older than the
+    /// one this node holds for the same `(occurrence_key_id, transport_kind)`.
+    /// Its own memory, apart from [`Self::refusal_backoff`], because the stale
+    /// arm reports [`ApplyOutcome::Duplicate`] (the row is not admitted, and
+    /// it is not a refusal anyone should see as one) and every `Duplicate`
+    /// CLEARS that memory in [`Self::remember_outcome`]. A mark here is never
+    /// touched by that, so it survives by construction, not by call order.
+    ///
+    /// Terminal schedule ([`RetryDisposition::Terminal`]: 30 min doubling to
+    /// 6 h): the stored route can only move forward, so re-offering the same
+    /// older bytes cannot change the verdict, and the cap keeps it from being
+    /// permanently dark if the stored route is ever removed. Capacity
+    /// [`STALE_ROUTE_MARKS`], front-drop; see there for the numbers.
+    stale_routes: RefusalBackoff,
     /// CIRISEdge#544 — how many wanted hashes the backoff has actually removed
     /// from a round's `want`. The memory's own witness, in the discipline of
     /// [`Self::owner_reads`] and [`Self::sweep_max_page_rows`]: "the retry storm
@@ -3199,6 +3236,7 @@ impl FederationDirectoryReplicationBridge {
             // this node just refused, not a policy, so there is no configuration
             // in which asking flat-out is the right answer.
             refusal_backoff: RefusalBackoff::new(),
+            stale_routes: RefusalBackoff::with_capacities(STALE_ROUTE_MARKS, 1),
             retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
             rows_parked_on_signer: std::sync::atomic::AtomicUsize::new(0),
             signer_releases: std::sync::atomic::AtomicUsize::new(0),
@@ -5356,9 +5394,14 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     }
 
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
+        let now = Instant::now();
         let hit = self
             .refusal_backoff
-            .suppressed_at(kind, envelope_hash, Instant::now());
+            .suppressed_at(kind, envelope_hash, now)
+            // CIRISEdge#971 — a route older than the one held is not asked for
+            // again inside its window (see `stale_routes`).
+            || (kind == EnvelopeKind::TransportDestination
+                && self.stale_routes.suppressed_at(kind, envelope_hash, now));
         if hit {
             self.retry_suppressions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6903,6 +6946,12 @@ impl FederationDirectoryReplicationBridge {
         let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
         match outcome.retry_disposition() {
             None => {
+                // CIRISEdge#971 — an ADMIT of bytes once marked stale (the held
+                // route was removed, so the older one is current again) ends
+                // the mark. A Duplicate never does: the stale arm is one.
+                if outcome.is_admitted() {
+                    self.stale_routes.clear(kind, &hash);
+                }
                 let forgotten = self.refusal_backoff.take(kind, &hash);
                 if let (Some(row), ApplyOutcome::Admitted, Some(m)) =
                     (forgotten, outcome, self.metrics.as_ref())
@@ -8177,6 +8226,26 @@ impl FederationDirectoryReplicationBridge {
     pub(crate) fn mark_feed_dirty(&self) {
         self.feed_dirt.mark();
         self.book_key_plane(crate::observability::KEY_PLANE_FEED_DIRTY_MARKS, 1);
+    }
+
+    /// CIRISEdge#971 — mark replicated route bytes stale: a newer route for
+    /// the same record is held, so these bytes are not wanted again inside
+    /// the terminal window ([`Self::stale_routes`]).
+    fn mark_stale_route(&self, bytes: &[u8]) {
+        use sha2::{Digest as _, Sha256};
+        let hash: [u8; 32] = Sha256::digest(bytes).into();
+        let recorded = self.stale_routes.record_tracked_at(
+            EnvelopeKind::TransportDestination,
+            hash,
+            RetryDisposition::Terminal,
+            Some(STALE_ROUTE_CLASS),
+            Instant::now(),
+        );
+        tracing::debug!(
+            envelope_hash = %hex::encode(&hash[..8]),
+            window_secs = recorded.window.as_secs(),
+            "stale route marked: not wanted again inside its window (CIRISEdge#971)"
+        );
     }
 
     /// CIRISEdge#971 — the write-through: an apply that ADMITTED a row on a
@@ -13948,6 +14017,15 @@ impl FederationDirectoryReplicationBridge {
                                  (epoch, asserted_at) — not applied; counted as Duplicate, \
                                  see the mapping doc (CIRISEdge#338)"
                             );
+                            // CIRISEdge#971 — and MARKED, so the next round does
+                            // not want these bytes again. Without the mark the
+                            // hash is never held (persist keeps only the newer
+                            // route's hash), so it came back into `want` every
+                            // round from every peer still holding the old route:
+                            // 10,710 of 24,949 routes served on the canonical in
+                            // one process lifetime were these. The mark is keyed
+                            // exactly as the want is (`sha256(bytes)`).
+                            self.mark_stale_route(bytes);
                             ApplyOutcome::Duplicate
                         }
                         _ => {
