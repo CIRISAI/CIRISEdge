@@ -128,6 +128,11 @@ mod counting_directory_930;
 pub mod directory;
 #[cfg(test)]
 mod first_contact_retry_968_tests;
+/// CIRISEdge#971 — the receive diff's holdings, kept as a set equal to
+/// persist's content-hash index.
+pub(crate) mod holdings_index;
+#[cfg(test)]
+mod holdings_index_971_tests;
 /// CIRISEdge#552 — hashes known to exist whose bodies this node does not
 /// hold. NEVER holdings; see the module docs for why that distinction is the
 /// whole safety of the design.
@@ -175,6 +180,9 @@ pub mod session;
 mod sim;
 pub(crate) mod single_flight;
 pub mod storage_contention;
+/// CIRISEdge#971 — one drain of the serve cursor for the holdings index and
+/// the four key-plane memos.
+pub(crate) mod store_feed;
 pub(crate) mod subject_pull;
 #[cfg(test)]
 mod subject_pull_apply_tests;

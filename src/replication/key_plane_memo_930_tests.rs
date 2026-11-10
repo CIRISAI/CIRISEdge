@@ -41,6 +41,13 @@ const PLANES: [EnvelopeKind; 4] = [
     EnvelopeKind::IdentityOccurrenceRevocation,
 ];
 
+/// v45 (CIRISEdge#971) — the feed's probe spacing every bridge here runs
+/// with: longer than any test, so "inside the spacing" is deterministic and
+/// no assertion rests on a clock. A write that bypasses the choke reaches a
+/// listing at once only through a door that marks the feed dirty, which is
+/// how a host reports it (its kick reaches `invalidate_send_set_memos`).
+const NO_TEST_OUTLIVES: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// A bridge over `dir` whose self set and cohort are both `subjects` (so
 /// `Global` = self ∪ cohort carries every subject TWICE, as production's
 /// concatenation can).
@@ -55,7 +62,10 @@ fn bridge_over(
         FederationDirectoryReplicationBridge::with_config(
             dir,
             Arc::new(move || cohort.clone()),
-            BridgeConfig::default(),
+            BridgeConfig {
+                feed_probe_spacing: NO_TEST_OUTLIVES,
+                ..BridgeConfig::default()
+            },
         )
         .with_self_provider(Some(Arc::new(move || own.clone())))
         .with_metrics(metrics),
@@ -259,8 +269,11 @@ async fn a_replicated_revocation_is_in_the_next_listing_930() {
 
 /// **Invalidation by LOCAL writes** (the doors that bypass the choke): a
 /// revocation authored through `put_revocation`, a `withdraws` and a carrier
-/// written straight into the directory. After each, the next listing of its
-/// plane equals the oracle and carries the new row.
+/// written straight into the directory. After each, and the host's report of
+/// it (the door its kick reaches, v45 CIRISEdge#971), the next listing of its
+/// plane equals the oracle and carries the new row. The first write is also
+/// listed BEFORE its report: inside the probe spacing the listing is the
+/// memo's (the stated staleness bound, a key-plane offer one round late).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_local_write_is_in_the_next_listing_930() {
     let a = NodeA::build("loc930", 0x31).await;
@@ -295,6 +308,13 @@ async fn a_local_write_is_in_the_next_listing_930() {
         .put_revocation(SignedRevocation { revocation })
         .await
         .expect("local revocation");
+    let unreported = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(
+        unreported.len(),
+        1,
+        "inside the spacing an unreported write is not probed for (CIRISEdge#971)"
+    );
+    bridge.invalidate_send_set_memos("host_kick");
     let rev = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
     assert_eq!(rev.len(), 2, "E's new revocation is offered");
     assert_eq!(
@@ -304,6 +324,7 @@ async fn a_local_write_is_in_the_next_listing_930() {
 
     // 2. P's `withdraws` of its occurrence of N, written into the directory.
     a.withdraw_occurrence().await;
+    bridge.invalidate_send_set_memos("host_kick");
     let occ = bridge
         .list_envelope_refs(EnvelopeKind::IdentityOccurrenceRevocation)
         .await;
@@ -315,6 +336,7 @@ async fn a_local_write_is_in_the_next_listing_930() {
 
     // 3. A carrier revoking N's occurrence K, written into the directory.
     a.carrier_revoking_node_occurrence(a.k.key_id()).await;
+    bridge.invalidate_send_set_memos("host_kick");
     let occ = bridge
         .list_envelope_refs(EnvelopeKind::IdentityOccurrenceRevocation)
         .await;
@@ -341,10 +363,11 @@ fn subject_reads(dir: &CountingDirectory) -> usize {
 
 /// **Cost.** Under a counting directory: the first round fills each Global
 /// plane (reads scale with |Global|); eight more peers' rounds between two
-/// writes add ONLY the change probe — one `list_attestations_since` per
-/// listing, no subject read — whatever |Global| is; a `withdraws` then
-/// costs the re-read of the one subject it names, not a sweep; and eight
-/// peers arriving together on a fresh bridge share one fill.
+/// writes read NOTHING (v45, CIRISEdge#971: no subject read, and inside the
+/// probe spacing no change probe either; before v45, one probe per listing),
+/// whatever |Global| is; a reported `withdraws` then costs one probe and the
+/// re-read of the one subject it names, not a sweep; and eight peers
+/// arriving together on a fresh bridge share one fill.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // two widths, a write, and the concurrent fill
 async fn n_peer_rounds_between_writes_cost_one_sweep_930() {
@@ -388,8 +411,9 @@ async fn n_peer_rounds_between_writes_cost_one_sweep_930() {
         );
         assert_eq!(
             counting.count("list_attestations_since"),
-            16,
-            "|Global| {width}: one change probe per listing"
+            0,
+            "|Global| {width}: an idle round probes nothing inside the spacing \
+             (CIRISEdge#971; it was one probe per listing)"
         );
         steady.push(counting.total());
         let ledger = metrics.key_plane_sweep();
@@ -410,6 +434,7 @@ async fn n_peer_rounds_between_writes_cost_one_sweep_930() {
         // it changes.
         if width == subjects.len() {
             a.withdraw_occurrence().await;
+            bridge.invalidate_send_set_memos("host_kick");
             counting.reset();
             let reads_before = metrics
                 .key_plane_sweep()

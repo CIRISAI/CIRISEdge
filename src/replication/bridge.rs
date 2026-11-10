@@ -980,6 +980,22 @@ pub struct BridgeConfig {
     /// CC 5.2 — how often a peer that gets no walk reads a full page of history
     /// ([`Self::DEFAULT_HISTORY_PAGE_EVERY`]).
     pub history_page_every: Duration,
+    /// CIRISEdge#971 — the lever for the holdings index
+    /// ([`super::holdings_index`]): `true` (the default) answers the receive
+    /// diff of the Attestation and TransportDestination indexes from a set
+    /// kept equal to persist's `signed_wire_index`; `false` drains the index
+    /// on every Summary, the pre-v45 behaviour. Env
+    /// [`Self::HOLDINGS_INDEX_ENV`].
+    pub holdings_index: bool,
+    /// CIRISEdge#971 — how often the holdings index is reconciled to a full
+    /// drain of persist's index ([`Self::DEFAULT_HOLDINGS_AUDIT_EVERY`]). Env
+    /// [`Self::HOLDINGS_AUDIT_EVERY_ENV`].
+    pub holdings_audit_every: Duration,
+    /// CIRISEdge#971 — the minimum spacing between two probes of one serve
+    /// cursor when no door has marked the feed dirty
+    /// ([`super::store_feed::FEED_PROBE_SPACING`]). `Duration::ZERO` probes
+    /// on every sequential ask (the pre-spacing behaviour).
+    pub feed_probe_spacing: Duration,
 }
 
 impl BridgeConfig {
@@ -1114,6 +1130,42 @@ impl BridgeConfig {
     /// unparseable value is IGNORED with a WARN rather than fail-closing to
     /// zero permits — a typo must not deadlock replication.
     pub const ADVERTISE_SWEEP_PERMITS_ENV: &'static str = "CIRIS_EDGE_ADVERTISE_SWEEP_PERMITS";
+
+    /// CIRISEdge#971 — default for [`Self::holdings_audit_every`]: one minute,
+    /// about one index page a second at the production size (a hundredth of
+    /// the per-Summary drain it replaces), until persist's per-kind generation
+    /// counter lets an audit be skipped when nothing moved.
+    pub const DEFAULT_HOLDINGS_AUDIT_EVERY: Duration = super::holdings_index::DEFAULT_AUDIT_EVERY;
+
+    /// CIRISEdge#971 — process-level override for [`Self::holdings_index`],
+    /// read once at runtime assembly: `0`, `off` or `false` turns the index
+    /// off. Any other value leaves the configured lever alone.
+    pub const HOLDINGS_INDEX_ENV: &'static str = super::holdings_index::ENABLED_ENV;
+
+    /// CIRISEdge#971 — process-level override for
+    /// [`Self::holdings_audit_every`], whole seconds, read once at runtime
+    /// assembly. Zero or unparseable is ignored with a WARN.
+    pub const HOLDINGS_AUDIT_EVERY_ENV: &'static str = super::holdings_index::AUDIT_EVERY_ENV;
+}
+
+impl BridgeConfig {
+    /// The default lever: on. Under `cfg(test)` only, the same env that turns
+    /// it off at runtime assembly ([`Self::HOLDINGS_INDEX_ENV`]) also turns off
+    /// the default, so every replication suite can be run against the
+    /// production fallback (`CIRIS_EDGE_HOLDINGS_INDEX=0 cargo test ...`)
+    /// without editing a test. A test that names the lever keeps its value.
+    fn default_holdings_index() -> bool {
+        #[cfg(test)]
+        if let Ok(raw) = std::env::var(Self::HOLDINGS_INDEX_ENV) {
+            if matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false"
+            ) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl Default for BridgeConfig {
@@ -1124,8 +1176,28 @@ impl Default for BridgeConfig {
             sweep_page_rows: Self::DEFAULT_SWEEP_PAGE_ROWS,
             tip_margin: Self::DEFAULT_TIP_MARGIN,
             history_page_every: Self::DEFAULT_HISTORY_PAGE_EVERY,
+            holdings_index: Self::default_holdings_index(),
+            holdings_audit_every: Self::DEFAULT_HOLDINGS_AUDIT_EVERY,
+            feed_probe_spacing: super::store_feed::FEED_PROBE_SPACING,
         }
     }
+}
+
+// ─── CIRISEdge#971 — the holdings index's answer ─────────────────────
+
+/// How a holdings ask is to be answered
+/// (`FederationDirectoryReplicationBridge::holdings_from_index`).
+#[derive(Debug)]
+enum HoldingsAnswer {
+    /// The lever is off or the kind has no covered index: the pre-v45 drain.
+    Uncovered,
+    /// This ask ran the plane's boot or audit drain and the index read
+    /// failed: the row path, exactly where the pre-v45 drain fell to it.
+    IndexUnreadable,
+    /// This ask ran the plane's boot or audit drain; its refs are the answer.
+    Drained(Vec<EnvelopeRef>),
+    /// Answer from the set (which may still refuse if it is not Ready).
+    Set(super::holdings_index::IndexPlane),
 }
 
 // ─── CIRISEdge#531 — the advertise-sweep width bound ─────────────────
@@ -1237,6 +1309,16 @@ impl SweepGate {
     /// replication going dark is a strictly worse failure than replication
     /// using more memory, and a closed gate is a shutdown state, not a policy.
     async fn enter(&self) -> SweepPermit<'_> {
+        self.enter_at(crate::observability::SWEEP_PERMIT_OTHER)
+            .await
+    }
+
+    /// CIRISEdge#971 — [`Self::enter`], counted under the call site that took
+    /// it (`sweep_permits.<site>`), so a seat's permit rate names its cause.
+    async fn enter_at(&self, site: &'static str) -> SweepPermit<'_> {
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_sweep_permit(site);
+        }
         let permit = match self.sem.as_ref() {
             None => None,
             Some(sem) => {
@@ -2671,6 +2753,19 @@ pub struct FederationDirectoryReplicationBridge {
     /// subject and invalidated by the store's admission cursor (see
     /// [`super::key_plane_memo`]).
     key_plane_memos: super::key_plane_memo::KeyPlaneMemos,
+    /// CIRISEdge#971 — the receive diff's holdings as a set
+    /// ([`super::holdings_index`]), fed by [`Self::store_feed`], the
+    /// write-through in [`Self::apply_envelope_bytes`], and the audit.
+    holdings_index: super::holdings_index::HoldingsIndex,
+    /// CIRISEdge#971 — the ONE position on the serve cursors, shared by the
+    /// holdings index and the four key-plane memos ([`super::store_feed`]).
+    /// Lock order: a key-plane memo, then this; never the reverse.
+    store_feed: tokio::sync::Mutex<super::store_feed::FeedState>,
+    /// CIRISEdge#971 — the feed's dirt generation, bumped by every door edge
+    /// sees a write through ([`Self::mark_feed_dirty`]); lock-free.
+    feed_dirt: super::store_feed::FeedDirt,
+    /// CIRISEdge#971 — [`BridgeConfig::feed_probe_spacing`].
+    feed_probe_spacing: Duration,
     /// CIRISEdge#531 DEPTH — the per-`(peer, plane)` advertise watermarks. See
     /// [`SweepCursors`] / [`PlaneWatermark`]. On the bridge for the same reason
     /// [`Self::sweep_gate`] is: the ONE production bridge is shared by every
@@ -3055,6 +3150,13 @@ impl FederationDirectoryReplicationBridge {
             first_contact_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             key_plane_memos: super::key_plane_memo::KeyPlaneMemos::default(),
+            holdings_index: super::holdings_index::HoldingsIndex::new(
+                config.holdings_index,
+                config.holdings_audit_every,
+            ),
+            store_feed: tokio::sync::Mutex::new(super::store_feed::FeedState::default()),
+            feed_dirt: super::store_feed::FeedDirt::default(),
+            feed_probe_spacing: config.feed_probe_spacing,
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
             lookup_limiter: Self::lookup_budget(
                 Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
@@ -3334,6 +3436,12 @@ impl FederationDirectoryReplicationBridge {
         self.sweep_gate.metrics.clone_from(&metrics);
         if let Some(m) = &metrics {
             self.decision_rows.attach_telemetry(&m.telemetry);
+            // CIRISEdge#971 — the lever's position is a gauge from the start,
+            // so a scrape of a node with the index off says so.
+            m.set_holdings_index_gauge(
+                crate::observability::HOLDINGS_GAUGE_ENABLED,
+                u64::from(self.holdings_index.enabled()),
+            );
         }
         self.metrics = metrics;
         self
@@ -4064,7 +4172,10 @@ impl FederationDirectoryReplicationBridge {
             let mut since: Option<ResumeCursor> = None;
             for page in 0..MAX_FULL_DRAIN_PAGES {
                 let (served, last) = {
-                    let _permit = self.sweep_gate.enter().await;
+                    let _permit = self
+                        .sweep_gate
+                        .enter_at(crate::observability::SWEEP_PERMIT_PLANE_PAGE)
+                        .await;
                     let rows = match read(since.clone(), budget).await {
                         Ok(rows) => rows,
                         Err(error) => {
@@ -4134,7 +4245,10 @@ impl FederationDirectoryReplicationBridge {
         };
         let head = self.sweep_head(&key);
         let (served, last) = {
-            let _permit = self.sweep_gate.enter().await;
+            let _permit = self
+                .sweep_gate
+                .enter_at(crate::observability::SWEEP_PERMIT_PLANE_PAGE)
+                .await;
             let rows = match read(head.clone(), budget).await {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -4153,7 +4267,10 @@ impl FederationDirectoryReplicationBridge {
         };
         if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
             let (b_served, b_last) = {
-                let _permit = self.sweep_gate.enter().await;
+                let _permit = self
+                    .sweep_gate
+                    .enter_at(crate::observability::SWEEP_PERMIT_PLANE_PAGE)
+                    .await;
                 let rows = match read(plan.since.clone(), plan.budget).await {
                     Ok(rows) => rows,
                     Err(e) => {
@@ -4727,30 +4844,46 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // Refreshing HERE rather than inside `retention()` keeps the sync
         // readers sync: this is the async call that already precedes them.
         self.refresh_serve_tier().await;
-        // CIRISEdge#547 / CIRISPersist#780 — READ THE INDEX, NOT THE ROWS.
-        //
-        // Everything below is correct and was killing production. `holdings`
-        // must be COMPLETE (a partial view leaves held rows in `want` forever,
-        // CIRISEdge#416), so #531 made these arms paged — which bounded MEMORY
-        // and deliberately not I/O. The result: every round, every plane,
-        // re-reading the whole corpus from disk in 1024-row chunks to recompute
-        // hashes. On the canonical (1.3 GB corpus, 808 MB page cache for the
-        // whole box) that is 35–118 MB/s continuous, every fault taken while
-        // holding persist's single connection mutex, so every other DB task
-        // parked behind it. The node went unreachable after ~22 h, `restarts=0`,
-        // no panic, with the health endpoint inside the same convoy.
-        //
-        // persist already had these hashes: `signed_wire_index`, PRIMARY KEY
-        // `(kind, content_hash)`, maintained by the same hooks that admit rows.
-        // v38.7.0 exposes it. This is index-only — ~50k hashes ≈ 1.6 MB against
-        // 1.3 GB of rows — and still COMPLETE across pages, so the convergence
-        // invariant is untouched. Bounded I/O, not bounded reach.
-        if let Some(index_kind) = kind.persist_index_kind() {
-            if let Some(refs) = self.holdings_from_wire_index(index_kind).await {
-                return refs;
-            }
+        // CIRISEdge#971 — the holdings index answers when it can; otherwise
+        // (lever off, not booted, suspect, a kind it does not cover) the
+        // drain below, which is also what boots and audits it.
+        match self.holdings_from_index(kind).await {
+            HoldingsAnswer::Set(plane) => match self.holdings_index.refs(plane) {
+                Ok(refs) => {
+                    self.note_holdings_answer(plane, true);
+                    return refs;
+                }
+                Err(not_ready) => self.note_holdings_fallback(plane, not_ready),
+            },
+            HoldingsAnswer::Drained(refs) => return refs,
+            HoldingsAnswer::IndexUnreadable => return self.list_holdings_from_rows(kind).await,
+            HoldingsAnswer::Uncovered => {}
         }
-        self.list_holdings_from_rows(kind).await
+        self.list_holdings_drain(kind).await
+    }
+
+    /// CIRISEdge#971 — the receive diff, answered from the holdings index
+    /// under one read lock: no per-Summary `Vec` of holdings and no per-Summary
+    /// set is built on this path ([`super::summary::diff_refs_against`]).
+    /// Falls back to [`super::summary::diff_refs`] over the drain exactly where
+    /// [`Self::list_holdings`] does.
+    async fn holdings_want(&self, kind: EnvelopeKind, remote: &[EnvelopeRef]) -> Vec<[u8; 32]> {
+        self.refresh_serve_tier().await;
+        match self.holdings_from_index(kind).await {
+            HoldingsAnswer::Set(plane) => match self.holdings_index.want(plane, remote) {
+                Ok(want) => {
+                    self.note_holdings_answer(plane, true);
+                    return want;
+                }
+                Err(not_ready) => self.note_holdings_fallback(plane, not_ready),
+            },
+            HoldingsAnswer::Drained(refs) => return super::summary::diff_refs(&refs, remote),
+            HoldingsAnswer::IndexUnreadable => {
+                return super::summary::diff_refs(&self.list_holdings_from_rows(kind).await, remote)
+            }
+            HoldingsAnswer::Uncovered => {}
+        }
+        super::summary::diff_refs(&self.list_holdings_drain(kind).await, remote)
     }
 
     /// CIRISEdge#474 — serve an accord-quorum-evidence cursor pull. The plane has
@@ -4801,7 +4934,10 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // it were never served — the plane would silently stop converging,
         // which is strictly worse than the memory. The responder-side watermark
         // is what turns "truncated" into "continued next round".
-        let _permit = self.sweep_gate.enter().await;
+        let _permit = self
+            .sweep_gate
+            .enter_at(crate::observability::SWEEP_PERMIT_ACCORD_EVIDENCE)
+            .await;
         let budget = self.sweep_page_budget().await;
         // The wire `since` is a FLOOR the requester declared ("I hold
         // everything up to here"), never a position we may fall behind: pair it
@@ -5048,7 +5184,10 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 // high-degree subject is not small. Taken INSIDE the entitled
                 // arm so the fail-closed refusal below never queues behind a
                 // sweep — refusing costs nothing and must stay instant.
-                let _permit = self.sweep_gate.enter().await;
+                let _permit = self
+                    .sweep_gate
+                    .enter_at(crate::observability::SWEEP_PERMIT_SUBJECT_PULL)
+                    .await;
                 self.subject_holdings_inner(kind, subject_key_id, peer_key_id)
                     .await
             }
@@ -5056,7 +5195,10 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             //    plane, from a conferred server: the subject's announced
             //    testimony only, each ref one the fetch twin would serve.
             Some(p) if announced_testimony && cohort_entitled => {
-                let _permit = self.sweep_gate.enter().await;
+                let _permit = self
+                    .sweep_gate
+                    .enter_at(crate::observability::SWEEP_PERMIT_ANNOUNCED_TESTIMONY)
+                    .await;
                 self.announced_testimony_holdings(subject_key_id, p).await
             }
             other => {
@@ -5184,6 +5326,14 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 }
             }
         }
+        // CIRISEdge#971 — before anything else can ask: the row this node just
+        // admitted is in the holdings index before the next peer's Summary,
+        // and the shared feed probes on its next ask (the key-plane memos see
+        // the row's dirt at once, not after the probe spacing).
+        if matches!(outcome, ApplyOutcome::Admitted) {
+            self.mark_feed_dirty();
+        }
+        self.holdings_write_through(kind, envelope_bytes, &outcome);
         self.remember_outcome(kind, envelope_bytes, &outcome);
         self.park_or_release(kind, envelope_bytes, &outcome, source_peer)
             .await;
@@ -7336,7 +7486,10 @@ impl FederationDirectoryReplicationBridge {
             reads += 1;
             let found = {
                 // CIRISEdge#531 — the width permit, per member read.
-                let _permit = self.sweep_gate.enter().await;
+                let _permit = self
+                    .sweep_gate
+                    .enter_at(crate::observability::SWEEP_PERMIT_KEY_PLANE_SUBJECT)
+                    .await;
                 read.read(&*self.directory, &subject).await
             };
             match found {
@@ -7387,63 +7540,58 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#930 — bring `read`'s memo current with the store: rebuild it
-    /// when it is due ([`super::key_plane_memo::MEMO_TTL`]), else drain the
-    /// admission cursor from where it stopped and drop every answer a new
-    /// row can change ([`super::key_plane_memo::dirt_of`]). The cursor is
-    /// persist's, so a LOCAL write (an authoring door, the claim path) moves
-    /// it exactly as a replicated apply does. A probe the store did not serve
-    /// forgets the memo: no answer is vouched for by a read that failed.
+    /// when it is due ([`super::key_plane_memo::MEMO_TTL`]), then bring the
+    /// shared serve-cursor feed current ([`Self::catch_up_attestation_feed`])
+    /// and drop every answer a row drained since this memo last listed can
+    /// change ([`super::key_plane_memo::dirt_of`]). The cursor is persist's,
+    /// so a LOCAL write (an authoring door, the claim path) moves it exactly as
+    /// a replicated apply does. v45 (CIRISEdge#971): the cursor is shared with
+    /// the other three memos and the holdings index, so one peer's round over
+    /// the four key planes drains the delta once, not four times; the rows
+    /// drained while this memo was not listing wait in its inbox. A feed the
+    /// store did not serve forgets the memo: no answer is vouched for by a
+    /// read that failed.
     async fn refresh_key_plane_memo(
         &self,
         read: KeyPlaneRead,
         memo: &mut super::key_plane_memo::PlaneMemo,
     ) {
-        use super::key_plane_memo::{dirt_of, Dirt, PROBE_PAGE};
+        use super::key_plane_memo::{dirt_of, Dirt};
         use crate::observability as obs;
-        let book = |label: &'static str, n: u64| {
-            if let Some(m) = &self.metrics {
-                m.add_key_plane_sweep(label, n);
-            }
-        };
         let now = Instant::now();
-        if memo.needs_rebuild(now) {
-            // Every answer goes, and the cursor restarts a lag before now; the
-            // drain below then carries it to the end of the log BEFORE any
-            // subject is read (its dirt lands on an empty memo), so a row
-            // committed after this point is past the cursor and the next probe
-            // sees it.
-            memo.rebuild(now, chrono::Utc::now());
-            book(obs::KEY_PLANE_REBUILDS, 1);
+        if let Some(cause) = memo.rebuild_cause(now) {
+            // Every answer goes. The feed drain below runs before any subject
+            // is read, so a row committed after this point is past the shared
+            // cursor and the next listing sees it.
+            memo.rebuild(now);
+            self.book_key_plane(obs::KEY_PLANE_REBUILDS, 1);
+            use super::key_plane_memo::RebuildCause;
+            self.book_key_plane(
+                match cause {
+                    RebuildCause::First => obs::KEY_PLANE_REBUILDS_FIRST,
+                    RebuildCause::Ttl => obs::KEY_PLANE_REBUILDS_TTL,
+                    RebuildCause::Forgotten => obs::KEY_PLANE_FORGOTTEN,
+                },
+                1,
+            );
         }
-        let (mut rows_seen, mut dropped) = (0u64, 0u64);
-        loop {
-            book(obs::KEY_PLANE_PROBE_READS, 1);
-            let read_page = {
-                // CIRISEdge#531 — a bulk page read: one width permit per page.
-                let _permit = self.sweep_gate.enter().await;
-                self.directory
-                    .list_attestations_since(memo.cursor(), PROBE_PAGE)
-                    .await
-            };
-            let page = match read_page {
-                Ok(page) => page,
-                Err(e) => {
-                    tracing::warn!(
-                        plane = ?read.kind(),
-                        error = %e,
-                        "key-plane change probe FAILED: the memo is forgotten and this \
-                         listing reads every subject from the store (correct, at the \
-                         pre-history: CIRISEdge#930 cost)"
-                    );
-                    memo.forget();
-                    book(obs::KEY_PLANE_PROBE_FAILURES, 1);
-                    return;
-                }
-            };
-            let served = page.len();
-            for served_row in &page {
-                rows_seen += 1;
-                let dirt = match dirt_of(read, &*self.directory, &served_row.attestation).await {
+        let Ok(pending) = self.catch_up_attestation_feed(now, Some(read)).await else {
+            tracing::warn!(
+                plane = ?read.kind(),
+                "key-plane change probe FAILED: the memo is forgotten and this \
+                 listing reads every subject from the store (correct, at the \
+                 pre-history: CIRISEdge#930 cost)"
+            );
+            memo.forget();
+            return;
+        };
+        let mut dropped = 0u64;
+        if pending.overflowed {
+            self.book_key_plane(obs::KEY_PLANE_INBOX_OVERFLOWS, 1);
+            dropped += u64::try_from(memo.apply(&Dirt::Plane)).unwrap_or(u64::MAX);
+        } else {
+            for row in &pending.rows {
+                let dirt = match dirt_of(read, &*self.directory, row).await {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::debug!(
@@ -7455,17 +7603,13 @@ impl FederationDirectoryReplicationBridge {
                         Dirt::Plane
                     }
                 };
+                if dirt == Dirt::Plane {
+                    self.book_key_plane(obs::KEY_PLANE_PLANE_DIRT, 1);
+                }
                 dropped += u64::try_from(memo.apply(&dirt)).unwrap_or(u64::MAX);
             }
-            if let Some(last) = page.last() {
-                memo.advance(last.resume_pair());
-            }
-            if served < usize::try_from(PROBE_PAGE).unwrap_or(usize::MAX) {
-                break;
-            }
         }
-        book(obs::KEY_PLANE_PROBE_ROWS, rows_seen);
-        book(obs::KEY_PLANE_INVALIDATED, dropped);
+        self.book_key_plane(obs::KEY_PLANE_INVALIDATED, dropped);
     }
 
     /// CIRISEdge#682 — the announce-gated advertise of the two identity planes.
@@ -7678,6 +7822,470 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    /// The pre-v45 holdings read, unchanged: persist's content-hash index when
+    /// the kind has one, else the rows. Every holdings ask took this before
+    /// CIRISEdge#971; it is now the boot drain, the audit, and the fallback.
+    async fn list_holdings_drain(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        // CIRISEdge#547 / CIRISPersist#780 — READ THE INDEX, NOT THE ROWS.
+        //
+        // Everything below is correct and was killing production. `holdings`
+        // must be COMPLETE (a partial view leaves held rows in `want` forever,
+        // CIRISEdge#416), so #531 made these arms paged — which bounded MEMORY
+        // and deliberately not I/O. The result: every round, every plane,
+        // re-reading the whole corpus from disk in 1024-row chunks to recompute
+        // hashes. On the canonical (1.3 GB corpus, 808 MB page cache for the
+        // whole box) that is 35–118 MB/s continuous, every fault taken while
+        // holding persist's single connection mutex, so every other DB task
+        // parked behind it. The node went unreachable after ~22 h, `restarts=0`,
+        // no panic, with the health endpoint inside the same convoy.
+        //
+        // persist already had these hashes: `signed_wire_index`, PRIMARY KEY
+        // `(kind, content_hash)`, maintained by the same hooks that admit rows.
+        // v38.7.0 exposes it. This is index-only — ~50k hashes ≈ 1.6 MB against
+        // 1.3 GB of rows — and still COMPLETE across pages, so the convergence
+        // invariant is untouched. Bounded I/O, not bounded reach.
+        if let Some(index_kind) = kind.persist_index_kind() {
+            if let Some(refs) = self.holdings_from_wire_index(index_kind).await {
+                return refs;
+            }
+        }
+        self.list_holdings_from_rows(kind).await
+    }
+
+    /// CIRISEdge#971 — bring the holdings index current for `kind` and say how
+    /// the ask is to be answered:
+    ///
+    /// - [`HoldingsAnswer::Uncovered`]: the lever is off or the kind has no
+    ///   covered index; take the drain.
+    /// - [`HoldingsAnswer::Drained`]: this ask owed the index a boot or audit
+    ///   drain, ran it, and the drain IS the answer (the pre-v45 read).
+    /// - [`HoldingsAnswer::Set`]: answer from the set, which may still refuse
+    ///   if it is not Ready (another caller's boot is running, or it is
+    ///   suspect); the caller then takes the drain.
+    ///
+    /// The cursor feed is brought current first (coalesced, see
+    /// [`super::store_feed`]), so a write committed before this ask by a door
+    /// edge's apply never saw is in the set before it answers.
+    async fn holdings_from_index(&self, kind: EnvelopeKind) -> HoldingsAnswer {
+        use super::holdings_index::IndexPlane;
+        if !self.holdings_index.enabled() {
+            return HoldingsAnswer::Uncovered;
+        }
+        let Some(plane) = IndexPlane::of_kind(kind) else {
+            return HoldingsAnswer::Uncovered;
+        };
+        let asked_at = Instant::now();
+        match plane {
+            IndexPlane::Attestation => {
+                // A failure marks the plane suspect inside; the ask then takes
+                // the drain below, which is also the recovery.
+                let _ = self.catch_up_attestation_feed(asked_at, None).await;
+            }
+            IndexPlane::TransportDestination => {
+                let _ = self.catch_up_route_feed(asked_at).await;
+            }
+        }
+        if self.holdings_index.drain_due(plane, asked_at) {
+            if let Ok(_single) = self.holdings_index.maintenance(plane).try_lock() {
+                // Re-checked under the single-flight: a drain that finished
+                // between the check and the lock has already done this one's
+                // work.
+                if self.holdings_index.drain_due(plane, Instant::now()) {
+                    if let Some(refs) = self.holdings_maintenance_drain(plane).await {
+                        self.note_holdings_answer(plane, false);
+                        return HoldingsAnswer::Drained(refs);
+                    }
+                    // The index read failed: the row path, as before #971.
+                    return HoldingsAnswer::IndexUnreadable;
+                }
+            }
+        }
+        HoldingsAnswer::Set(plane)
+    }
+
+    /// CIRISEdge#971 — one boot or audit drain of `plane`'s persist index,
+    /// reconciled into the set with the journal of every feed that ran
+    /// meanwhile. Returns the drained refs (the answer of the ask that ran
+    /// it), or `None` when the index read failed (the plane then stays unable
+    /// to answer, and the caller takes the row path).
+    async fn holdings_maintenance_drain(
+        &self,
+        plane: super::holdings_index::IndexPlane,
+    ) -> Option<Vec<EnvelopeRef>> {
+        use super::holdings_index::Status;
+        use crate::observability as obs;
+        let slot = plane.slot();
+        let booting = matches!(
+            self.holdings_index.status(plane),
+            Status::Unbooted | Status::Booting
+        );
+        let started = Instant::now();
+        self.holdings_index.begin_drain(plane);
+        let Some(refs) = self.holdings_from_wire_index(plane.index_kind()).await else {
+            self.holdings_index.abort_drain(plane);
+            self.book_holdings(obs::HOLDINGS_DRAIN_FAILURES[slot], 1);
+            self.gauge_holdings(plane);
+            return None;
+        };
+        let drained: HashSet<[u8; 32]> = refs.iter().map(|r| r.envelope_hash).collect();
+        let (drift, ready) = self
+            .holdings_index
+            .finish_drain(plane, drained, Instant::now());
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.book_holdings(obs::HOLDINGS_DRAIN_MS[slot], ms);
+        if let Some(m) = &self.metrics {
+            m.set_holdings_index_gauge(obs::HOLDINGS_GAUGE_LAST_DRAIN_MS[slot], ms);
+        }
+        if booting {
+            self.book_holdings(obs::HOLDINGS_BOOTS[slot], 1);
+            tracing::info!(
+                plane = plane.label(),
+                hashes = refs.len(),
+                elapsed_ms = ms,
+                "holdings index booted from persist's content-hash index: the receive \
+                 diff of this plane is answered from memory from now on (CIRISEdge#971)"
+            );
+        } else {
+            self.book_holdings(obs::HOLDINGS_AUDITS[slot], 1);
+            self.book_holdings(
+                obs::HOLDINGS_DRIFT_MISSING[slot],
+                u64::try_from(drift.missing).unwrap_or(u64::MAX),
+            );
+            self.book_holdings(
+                obs::HOLDINGS_DRIFT_EXTRA[slot],
+                u64::try_from(drift.extra).unwrap_or(u64::MAX),
+            );
+            if !ready {
+                self.book_holdings(obs::HOLDINGS_SUSPECT_AUDITS[slot], 1);
+            }
+            if drift.total() > 0 {
+                tracing::warn!(
+                    plane = plane.label(),
+                    missing = drift.missing,
+                    extra = drift.extra,
+                    tolerance = super::holdings_index::drift_tolerance(refs.len()),
+                    suspect = !ready,
+                    "holdings index audit REPAIRED drift from persist's content-hash index: \
+                     `missing` re-fetches held rows (waste), `extra` would have hidden a \
+                     row a peer offers (wrong). A suspect plane answers from the drain \
+                     until an audit is clean (tracked: CIRISEdge#971)"
+                );
+            }
+        }
+        self.gauge_holdings(plane);
+        Some(refs)
+    }
+
+    /// CIRISEdge#971 — bring the Attestation serve-cursor feed current, and
+    /// take `take`'s key-plane inbox. Shared by the holdings index (every row's
+    /// hash, inserted here) and the four CIRISEdge#930 memos (their rows,
+    /// queued). `Err` when the store did not serve a page: every memo inbox
+    /// is then overflowed and the Attestation holdings plane suspect.
+    async fn catch_up_attestation_feed(
+        &self,
+        asked_at: Instant,
+        take: Option<KeyPlaneRead>,
+    ) -> Result<super::store_feed::Pending, ()> {
+        use super::holdings_index::{IndexPlane, Record};
+        use super::key_plane_memo::PROBE_PAGE;
+        use super::store_feed::Covered;
+        use crate::observability as obs;
+        let slot = IndexPlane::Attestation.slot();
+        let mut feed = self.store_feed.lock().await;
+        let generation = self.feed_dirt.generation();
+        match feed.attestations.covers(
+            asked_at,
+            Instant::now(),
+            generation,
+            self.feed_probe_spacing,
+        ) {
+            Some(Covered::Coalesced) => {
+                self.book_holdings(obs::HOLDINGS_FEED_COALESCED[slot], 1);
+                return Ok(take.map(|r| feed.take(r)).unwrap_or_default());
+            }
+            Some(Covered::Spaced) => {
+                self.book_key_plane(obs::KEY_PLANE_PROBES_SPACED, 1);
+                return Ok(take.map(|r| feed.take(r)).unwrap_or_default());
+            }
+            None => {}
+        }
+        let started = Instant::now();
+        let indexing = self.holdings_index.enabled();
+        let (mut rows_seen, mut inserted) = (0u64, 0u64);
+        loop {
+            self.book_key_plane(obs::KEY_PLANE_PROBE_READS, 1);
+            self.book_holdings(obs::HOLDINGS_FEED_PROBES[slot], 1);
+            let cursor = feed.attestations.cursor(chrono::Utc::now(), indexing);
+            let read_page = {
+                // CIRISEdge#531 — a bulk page read: one width permit per page.
+                let _permit = self
+                    .sweep_gate
+                    .enter_at(crate::observability::SWEEP_PERMIT_FEED_ATTESTATION)
+                    .await;
+                self.directory
+                    .list_attestations_since(cursor, PROBE_PAGE)
+                    .await
+            };
+            let page = match read_page {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "serve-cursor feed probe FAILED: every key-plane memo answer is \
+                         dropped (each re-reads its subjects, the pre-#930 cost) and the \
+                         Attestation holdings index answers from the drain until an audit \
+                         is clean (CIRISEdge#930, CIRISEdge#971)"
+                    );
+                    feed.fail();
+                    self.holdings_index.mark_suspect(IndexPlane::Attestation);
+                    self.book_key_plane(obs::KEY_PLANE_PROBE_FAILURES, 1);
+                    self.book_holdings(obs::HOLDINGS_FEED_FAILURES[slot], 1);
+                    self.gauge_holdings(IndexPlane::Attestation);
+                    return Err(());
+                }
+            };
+            let served = page.len();
+            for served_row in &page {
+                rows_seen += 1;
+                feed.distribute(&served_row.attestation);
+                if indexing {
+                    // The hash persist's index holds for this row: the same
+                    // `sha256(to_vec(attestation))` `reload_record_bytes`
+                    // hashes. An unserializable row is skipped (the set lacks
+                    // it: the safe direction).
+                    if let Some((hash, _)) = content_hash_of(&served_row.attestation) {
+                        let record = Record::attestation(&served_row.attestation.attestation_id);
+                        if self
+                            .holdings_index
+                            .upsert(IndexPlane::Attestation, Some(record), hash)
+                        {
+                            inserted += 1;
+                        }
+                    }
+                }
+            }
+            if let Some(last) = page.last() {
+                feed.attestations.advance(last.resume_pair());
+            }
+            if served < usize::try_from(PROBE_PAGE).unwrap_or(usize::MAX) {
+                break;
+            }
+        }
+        feed.attestations.completed(started, generation);
+        self.book_key_plane(obs::KEY_PLANE_PROBE_ROWS, rows_seen);
+        self.book_holdings(obs::HOLDINGS_FEED_INSERTS[slot], inserted);
+        if indexing {
+            self.gauge_holdings(IndexPlane::Attestation);
+        }
+        Ok(take.map(|r| feed.take(r)).unwrap_or_default())
+    }
+
+    /// CIRISEdge#971 — bring the route serve-cursor feed current for the
+    /// TransportDestination holdings plane (its only consumer). Each route is
+    /// keyed by `(occurrence_key_id, transport_kind)`, so a superseding route
+    /// replaces the hash of the one it superseded, as persist's index does.
+    async fn catch_up_route_feed(&self, asked_at: Instant) -> Result<(), ()> {
+        use super::holdings_index::{IndexPlane, Record};
+        use super::key_plane_memo::PROBE_PAGE;
+        use super::store_feed::Covered;
+        use crate::observability as obs;
+        let slot = IndexPlane::TransportDestination.slot();
+        let mut feed = self.store_feed.lock().await;
+        let generation = self.feed_dirt.generation();
+        match feed.routes.covers(
+            asked_at,
+            Instant::now(),
+            generation,
+            self.feed_probe_spacing,
+        ) {
+            Some(Covered::Coalesced) => {
+                self.book_holdings(obs::HOLDINGS_FEED_COALESCED[slot], 1);
+                return Ok(());
+            }
+            Some(Covered::Spaced) => {
+                self.book_key_plane(obs::KEY_PLANE_PROBES_SPACED, 1);
+                return Ok(());
+            }
+            None => {}
+        }
+        let started = Instant::now();
+        let mut inserted = 0u64;
+        loop {
+            self.book_holdings(obs::HOLDINGS_FEED_PROBES[slot], 1);
+            // From the head of the log: the route feed exists only for the
+            // index, and a walk from the head keys every route held before
+            // boot (store_feed module docs).
+            let cursor = feed.routes.cursor(chrono::Utc::now(), true);
+            let read_page = {
+                let _permit = self
+                    .sweep_gate
+                    .enter_at(crate::observability::SWEEP_PERMIT_FEED_ROUTE)
+                    .await;
+                self.directory
+                    .list_signed_transport_destinations_since(cursor, PROBE_PAGE)
+                    .await
+            };
+            let page = match read_page {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "route serve-cursor feed probe FAILED: the TransportDestination \
+                         holdings index answers from the drain until an audit is clean \
+                         (CIRISEdge#971)"
+                    );
+                    self.holdings_index
+                        .mark_suspect(IndexPlane::TransportDestination);
+                    self.book_holdings(obs::HOLDINGS_FEED_FAILURES[slot], 1);
+                    self.gauge_holdings(IndexPlane::TransportDestination);
+                    return Err(());
+                }
+            };
+            let served = page.len();
+            for row in &page {
+                // `sha256(to_vec(SignedTransportDestination))`: the inner
+                // signed record, never the served wrapper (its `admitted_at` is
+                // node-local), as `reload_record_bytes` hashes it.
+                if let Some((hash, _)) = content_hash_of(&row.destination) {
+                    let td = &row.destination.transport_destination;
+                    let record = Record::route(&td.occurrence_key_id, &td.transport_kind);
+                    if self.holdings_index.upsert(
+                        IndexPlane::TransportDestination,
+                        Some(record),
+                        hash,
+                    ) {
+                        inserted += 1;
+                    }
+                }
+            }
+            if let Some(last) = page.last() {
+                feed.routes.advance(last.resume_pair());
+            }
+            if served < usize::try_from(PROBE_PAGE).unwrap_or(usize::MAX) {
+                break;
+            }
+        }
+        feed.routes.completed(started, generation);
+        self.book_holdings(obs::HOLDINGS_FEED_INSERTS[slot], inserted);
+        self.gauge_holdings(IndexPlane::TransportDestination);
+        Ok(())
+    }
+
+    /// CIRISEdge#971 — a door edge sees saw a write: the next ask of either
+    /// serve cursor probes instead of waiting out the spacing
+    /// ([`super::store_feed`] module docs).
+    pub(crate) fn mark_feed_dirty(&self) {
+        self.feed_dirt.mark();
+        self.book_key_plane(crate::observability::KEY_PLANE_FEED_DIRTY_MARKS, 1);
+    }
+
+    /// CIRISEdge#971 — the write-through: an apply that ADMITTED a row on a
+    /// covered plane inserts its hash at once (replacing the record's earlier
+    /// hash); a `Duplicate` of a hash the set said it lacked is counted, the
+    /// free "missing" signal. Refusals and duplicates insert nothing: a
+    /// duplicate can be a stale version the index does not hold (a superseded
+    /// route), and the set must not gain a hash the index lacks.
+    fn holdings_write_through(
+        &self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+        outcome: &ApplyOutcome,
+    ) {
+        use super::holdings_index::{record_of_envelope, IndexPlane};
+        use crate::observability as obs;
+        use sha2::{Digest as _, Sha256};
+        if !self.holdings_index.enabled() {
+            return;
+        }
+        let Some(plane) = IndexPlane::of_kind(kind) else {
+            return;
+        };
+        let slot = plane.slot();
+        match outcome {
+            ApplyOutcome::Admitted => {
+                let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+                let record = record_of_envelope(plane, envelope_bytes);
+                if self.holdings_index.upsert(plane, record, hash) {
+                    self.book_holdings(obs::HOLDINGS_WRITE_THROUGH[slot], 1);
+                }
+            }
+            ApplyOutcome::Duplicate => {
+                let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+                if self.holdings_index.holds(plane, &hash) == Some(false) {
+                    self.book_holdings(obs::HOLDINGS_DUPLICATE_UNHELD[slot], 1);
+                }
+            }
+            ApplyOutcome::Refused { .. } | ApplyOutcome::Deserialize(_) => {}
+        }
+    }
+
+    /// CIRISEdge#971 — one ask answered from the set (`from_set`) or a drain.
+    fn note_holdings_answer(&self, plane: super::holdings_index::IndexPlane, from_set: bool) {
+        use crate::observability as obs;
+        let slot = plane.slot();
+        if from_set {
+            self.book_holdings(obs::HOLDINGS_ANSWERS_SET[slot], 1);
+        } else {
+            self.book_holdings(obs::HOLDINGS_ANSWERS_DRAIN[slot], 1);
+        }
+        if let Some(m) = &self.metrics {
+            m.set_holdings_index_gauge(
+                obs::HOLDINGS_GAUGE_SOURCE[slot],
+                if from_set { 1 } else { 2 },
+            );
+        }
+    }
+
+    /// CIRISEdge#971 — the set could not answer; the caller takes the drain.
+    fn note_holdings_fallback(
+        &self,
+        plane: super::holdings_index::IndexPlane,
+        why: super::holdings_index::NotReady,
+    ) {
+        use super::holdings_index::NotReady;
+        use crate::observability as obs;
+        let slot = plane.slot();
+        match why {
+            NotReady::Unbooted => self.book_holdings(obs::HOLDINGS_FALLBACK_UNBOOTED[slot], 1),
+            NotReady::Suspect => self.book_holdings(obs::HOLDINGS_FALLBACK_SUSPECT[slot], 1),
+            NotReady::Disabled => {}
+        }
+        self.note_holdings_answer(plane, false);
+    }
+
+    /// CIRISEdge#971 — the plane's gauges, now.
+    fn gauge_holdings(&self, plane: super::holdings_index::IndexPlane) {
+        use crate::observability as obs;
+        let Some(m) = &self.metrics else {
+            return;
+        };
+        let slot = plane.slot();
+        m.set_holdings_index_gauge(
+            obs::HOLDINGS_GAUGE_SIZE[slot],
+            u64::try_from(self.holdings_index.size(plane)).unwrap_or(u64::MAX),
+        );
+        m.set_holdings_index_gauge(
+            obs::HOLDINGS_GAUGE_STATUS[slot],
+            self.holdings_index.status(plane).gauge(),
+        );
+        m.set_holdings_index_gauge(
+            obs::HOLDINGS_GAUGE_ENABLED,
+            u64::from(self.holdings_index.enabled()),
+        );
+    }
+
+    fn book_holdings(&self, label: &'static str, n: u64) {
+        if let Some(m) = &self.metrics {
+            m.add_holdings_index(label, n);
+        }
+    }
+
+    fn book_key_plane(&self, label: &'static str, n: u64) {
+        if let Some(m) = &self.metrics {
+            m.add_key_plane_sweep(label, n);
+        }
+    }
+
     /// CIRISEdge#547 / CIRISPersist#780 — the holdings set read from persist's
     /// content-hash index instead of re-derived from every row.
     ///
@@ -7708,7 +8316,10 @@ impl FederationDirectoryReplicationBridge {
             // `a_multi_page_drain_takes_one_permit_per_page`, which saw this
             // path return correct data while taking ZERO permits.
             let read = {
-                let _permit = self.sweep_gate.enter().await;
+                let _permit = self
+                    .sweep_gate
+                    .enter_at(crate::observability::SWEEP_PERMIT_HOLDINGS_INDEX)
+                    .await;
                 self.directory
                     .list_wire_hashes_since(index_kind, after.as_deref(), budget)
                     .await
@@ -10017,7 +10628,20 @@ impl FederationDirectoryReplicationBridge {
                     if let Some(hit) = self.fresh_consent_memo() {
                         return (Some(hit), None);
                     }
-                    let _permit = self.sweep_gate.enter().await;
+                    // CIRISEdge#971 — the cause split of a send-set read: a
+                    // memo that is present but past its TTL is counted here;
+                    // one a door dropped while live is counted where it was
+                    // dropped (`invalidate_send_set_memos`); an empty memo
+                    // with neither is a first read.
+                    if self.consent_memo_expired() {
+                        if let Some(m) = &self.metrics {
+                            m.inc_advertise(crate::observability::ADVERTISE_SEND_SET_EXPIRED);
+                        }
+                    }
+                    let _permit = self
+                        .sweep_gate
+                        .enter_at(crate::observability::SWEEP_PERMIT_SEND_SET)
+                        .await;
                     let set = self.read_peer_set(local).await;
                     (set, Some(Instant::now()))
                 },
@@ -10062,6 +10686,14 @@ impl FederationDirectoryReplicationBridge {
         let memo = self.consent_memo.lock().ok()?;
         let (set, resolved_at) = memo.as_ref()?;
         (resolved_at.elapsed() < CONSENT_SEND_SET_MEMO_TTL).then(|| set.clone())
+    }
+
+    /// CIRISEdge#971 — is the consent memo present but past its TTL?
+    fn consent_memo_expired(&self) -> bool {
+        self.consent_memo.lock().is_ok_and(|memo| {
+            memo.as_ref()
+                .is_some_and(|(_, at)| at.elapsed() >= CONSENT_SEND_SET_MEMO_TTL)
+        })
     }
 
     /// One read of the consent send-set from persist: the body of a
@@ -10261,7 +10893,10 @@ impl FederationDirectoryReplicationBridge {
                 // CIRISEdge#531 — one permit per PAGE, released between pages,
                 // so a many-page drain does not hold the FIFO-fair gate for the
                 // whole plane and queue every other coordinator behind it.
-                let _permit = self.sweep_gate.enter().await;
+                let _permit = self
+                    .sweep_gate
+                    .enter_at(crate::observability::SWEEP_PERMIT_HOLDINGS_ROWS)
+                    .await;
                 let attestations = self
                     .directory
                     .list_attestations_since(since.clone(), budget)
@@ -10766,7 +11401,10 @@ impl FederationDirectoryReplicationBridge {
         refs: &mut Vec<EnvelopeRef>,
         seen: &mut HashSet<[u8; 32]>,
     ) -> Result<(usize, Option<ResumeCursor>, PageCounts), SweepReadError> {
-        let _permit = self.sweep_gate.enter().await;
+        let _permit = self
+            .sweep_gate
+            .enter_at(crate::observability::SWEEP_PERMIT_ADVERTISE_PAGE)
+            .await;
         let attestations = self
             .directory
             .list_attestations_since(since.clone(), budget)
@@ -11163,7 +11801,10 @@ impl FederationDirectoryReplicationBridge {
         use ciris_persist::federation::group_plane as gp;
         use ciris_persist::federation::types::attestation_type;
         let peer = key.0.as_str();
-        let _permit = self.sweep_gate.enter().await;
+        let _permit = self
+            .sweep_gate
+            .enter_at(crate::observability::SWEEP_PERMIT_ADVERTISE_REQUIRED)
+            .await;
         let mut rows: Vec<Attestation> = Vec::new();
         let mut local: Vec<String> = Vec::new();
         if let Some(key) = self.local_key_id.as_deref() {
@@ -12091,10 +12732,17 @@ impl FederationDirectoryReplicationBridge {
     pub fn invalidate_send_set_memos(&self, reason: &'static str) {
         self.owner_flight.invalidate();
         self.consent_flight.invalidate();
-        let had_consent = self
+        let taken = self
             .consent_memo
             .lock()
-            .is_ok_and(|mut memo| memo.take().is_some());
+            .ok()
+            .and_then(|mut memo| memo.take());
+        let had_consent = taken.is_some();
+        // CIRISEdge#971 — a LIVE memo dropped is a send-set read this door
+        // caused (the cause split the seat's permit rate needs: kick vs TTL).
+        let dropped_live = taken
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < CONSENT_SEND_SET_MEMO_TTL);
         if let Ok(mut cache) = self.owner_cache.lock() {
             cache.by_node.clear();
         }
@@ -12108,7 +12756,15 @@ impl FederationDirectoryReplicationBridge {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(m) = &self.metrics {
             m.inc_advertise(crate::observability::ADVERTISE_SEND_SET_INVALIDATED);
+            if dropped_live {
+                m.inc_advertise(crate::observability::ADVERTISE_SEND_SET_DROPPED_LIVE);
+            }
         }
+        // CIRISEdge#971 — every door that reports a local write reaches here
+        // (a kick, `note_local_write(s)`, a released signer): the shared
+        // serve-cursor feed probes on its next ask instead of waiting out its
+        // spacing ([`super::store_feed::FEED_PROBE_SPACING`]).
+        self.mark_feed_dirty();
         tracing::debug!(
             reason,
             had_consent_memo = had_consent,
@@ -13391,6 +14047,26 @@ fn content_hash_of<T: serde::Serialize>(value: &T) -> Option<([u8; 32], Vec<u8>)
     let bytes = serde_json::to_vec(value).ok()?;
     let hash: [u8; 32] = Sha256::digest(&bytes).into();
     Some((hash, bytes))
+}
+
+/// CIRISEdge#971 — the holdings index's set for `kind`'s plane, read without
+/// feeding, booting or auditing it: `None` when it may not answer.
+#[cfg(test)]
+impl FederationDirectoryReplicationBridge {
+    pub(crate) fn holdings_index_set(&self, kind: EnvelopeKind) -> Option<HashSet<[u8; 32]>> {
+        let plane = super::holdings_index::IndexPlane::of_kind(kind)?;
+        self.holdings_index
+            .refs(plane)
+            .ok()
+            .map(|refs| refs.into_iter().map(|r| r.envelope_hash).collect())
+    }
+
+    pub(crate) fn holdings_index_status(
+        &self,
+        kind: EnvelopeKind,
+    ) -> Option<super::holdings_index::Status> {
+        super::holdings_index::IndexPlane::of_kind(kind).map(|p| self.holdings_index.status(p))
+    }
 }
 
 /// CIRISEdge#531 DEPTH — the test-side spelling of the production advertise
@@ -28317,6 +28993,29 @@ pub(crate) mod tests {
             (backend, bridge)
         }
 
+        /// [`paged_bridge`] with the holdings index OFF (CIRISEdge#971): for
+        /// the witnesses that count the pre-v45 drain's own reads and permits,
+        /// which the index's cursor probe would otherwise add to.
+        fn paged_drain_bridge(
+            cohort: &[String],
+            page: u32,
+        ) -> (Arc<SqliteBackend>, FederationDirectoryReplicationBridge) {
+            let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
+            let dir: Arc<dyn FederationDirectory> = backend.clone();
+            let cohort_clone = cohort.to_vec();
+            let cohort_cb: CohortProvider = Arc::new(move || cohort_clone.clone());
+            let bridge = FederationDirectoryReplicationBridge::with_config(
+                dir,
+                cohort_cb,
+                BridgeConfig {
+                    sweep_page_rows: page,
+                    holdings_index: false,
+                    ..BridgeConfig::default()
+                },
+            );
+            (backend, bridge)
+        }
+
         /// Seed a key record and a signed route for each id.
         ///
         /// persist v59.0.0 — the paged `SelfOwn` plane these witnesses drive is
@@ -29021,7 +29720,7 @@ pub(crate) mod tests {
         #[tokio::test]
         async fn a_multi_page_drain_takes_one_permit_per_page() {
             let ids: Vec<String> = (0..7).map(|i| format!("key-{i}")).collect();
-            let (backend, bridge) = paged_bridge(&ids, 2);
+            let (backend, bridge) = paged_drain_bridge(&ids, 2);
             seed_keys(&backend, &ids).await;
 
             let before = bridge.sweep_permits_taken();

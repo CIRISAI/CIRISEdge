@@ -263,6 +263,7 @@ fn with_release_kick(
 /// not be able to change the node's memory posture, in either direction.
 fn resolve_sweep_permits(mut config: BridgeConfig) -> BridgeConfig {
     config = resolve_sweep_page_rows(config);
+    config = resolve_holdings_index(config);
     let Ok(raw) = std::env::var(BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV) else {
         return config;
     };
@@ -335,6 +336,53 @@ fn resolve_sweep_page_rows(mut config: BridgeConfig) -> BridgeConfig {
             "sweep page size override is not a u32 — IGNORED, keeping the \
              configured value (history: CIRISEdge#531)"
         ),
+    }
+    config
+}
+
+/// CIRISEdge#971 — apply the holdings-index lever
+/// ([`BridgeConfig::HOLDINGS_INDEX_ENV`]) and audit cadence
+/// ([`BridgeConfig::HOLDINGS_AUDIT_EVERY_ENV`]) overrides. Same contract as
+/// [`resolve_sweep_page_rows`]: missing leaves the configured value; a value
+/// that does not parse WARNS and leaves it too. The lever only turns OFF
+/// from the environment (`0`, `off`, `false`): the server pulls it on a box
+/// where the index misbehaves, without a release.
+fn resolve_holdings_index(mut config: BridgeConfig) -> BridgeConfig {
+    if let Ok(raw) = std::env::var(BridgeConfig::HOLDINGS_INDEX_ENV) {
+        let off = matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        );
+        if off {
+            tracing::info!(
+                env = BridgeConfig::HOLDINGS_INDEX_ENV,
+                "holdings index turned OFF from the environment: every Summary \
+                 drains persist's content-hash index, the pre-v45 behaviour \
+                 (CIRISEdge#971)"
+            );
+            config.holdings_index = false;
+        }
+    }
+    if let Ok(raw) = std::env::var(BridgeConfig::HOLDINGS_AUDIT_EVERY_ENV) {
+        match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => {
+                tracing::info!(
+                    secs,
+                    env = BridgeConfig::HOLDINGS_AUDIT_EVERY_ENV,
+                    "holdings index audit cadence overridden from the environment \
+                     (CIRISEdge#971)"
+                );
+                config.holdings_audit_every = std::time::Duration::from_secs(secs);
+            }
+            _ => tracing::warn!(
+                raw = %raw,
+                env = BridgeConfig::HOLDINGS_AUDIT_EVERY_ENV,
+                keeping_secs = config.holdings_audit_every.as_secs(),
+                "holdings index audit cadence is not a positive whole number of \
+                 seconds: IGNORED, keeping the configured value (tracked: \
+                 CIRISEdge#971)"
+            ),
+        }
     }
     config
 }

@@ -27,6 +27,14 @@ use ciris_persist::federation::*;
 pub(crate) struct CountingDirectory {
     inner: Arc<dyn FederationDirectory>,
     counts: Arc<Mutex<BTreeMap<&'static str, usize>>>,
+    /// CIRISEdge#971 — content hashes `list_wire_hashes_since` leaves out, as
+    /// if persist's index had dropped them (a purge). Only for a corpus inside
+    /// one page: a filtered page reads short and ends the drain.
+    hidden_wire_hashes: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// CIRISEdge#971 — while set, `list_attestations_since` and
+    /// `list_signed_transport_destinations_since` fail (a probe the store did
+    /// not serve).
+    fail_cursor_reads: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CountingDirectory {
@@ -34,7 +42,29 @@ impl CountingDirectory {
         Self {
             inner,
             counts: Arc::new(Mutex::new(BTreeMap::new())),
+            hidden_wire_hashes: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            fail_cursor_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// CIRISEdge#971 — leave `content_hash` (lowercase hex) out of every
+    /// later `list_wire_hashes_since` page.
+    pub(crate) fn hide_wire_hash(&self, content_hash: &str) {
+        self.hidden_wire_hashes
+            .lock()
+            .expect("hidden")
+            .insert(content_hash.to_owned());
+    }
+
+    /// CIRISEdge#971 — make the serve-cursor reads fail (`true`) or serve.
+    pub(crate) fn fail_cursor_reads(&self, fail: bool) {
+        self.fail_cursor_reads
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn cursor_reads_fail(&self) -> bool {
+        self.fail_cursor_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn hit(&self, method: &'static str) {
@@ -766,6 +796,9 @@ impl FederationDirectory for CountingDirectory {
         limit: u32,
     ) -> Result<Vec<ServedAttestation>, Error> {
         self.hit("list_attestations_since");
+        if self.cursor_reads_fail() {
+            return Err(Error::Backend("injected: cursor read failed".into()));
+        }
         self.inner.list_attestations_since(since, limit).await
     }
     // persist v61.0.5 (#1225): defaulted `Unsupported`, overridden by every
@@ -1070,6 +1103,9 @@ impl FederationDirectory for CountingDirectory {
         limit: u32,
     ) -> Result<Vec<ServedTransportDestination>, Error> {
         self.hit("list_signed_transport_destinations_since");
+        if self.cursor_reads_fail() {
+            return Err(Error::Backend("injected: cursor read failed".into()));
+        }
         self.inner
             .list_signed_transport_destinations_since(since, limit)
             .await
@@ -1092,9 +1128,12 @@ impl FederationDirectory for CountingDirectory {
         limit: u32,
     ) -> Result<Vec<String>, Error> {
         self.hit("list_wire_hashes_since");
-        self.inner
+        let page = self
+            .inner
             .list_wire_hashes_since(kind, after_content_hash, limit)
-            .await
+            .await?;
+        let hidden = self.hidden_wire_hashes.lock().expect("hidden").clone();
+        Ok(page.into_iter().filter(|h| !hidden.contains(h)).collect())
     }
     async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error> {
         self.hit("lookup_community");

@@ -22,9 +22,12 @@
 //! worse than the CPU. So invalidation is driven by THE STORE, not by edge's
 //! apply path: every listing first drains persist's admission cursor
 //! (`list_attestations_since`, the `(admitted_at, attestation_id)` serve
-//! position, monotonic per CIRISPersist#668) from where the memo last
-//! stopped, and every key-plane-relevant row in that delta drops the answers
-//! it can change ([`dirt_of`]). The cursor sees every write that lands a
+//! position, monotonic per CIRISPersist#668) from where it last stopped,
+//! and every key-plane-relevant row in that delta drops the answers it can
+//! change ([`dirt_of`]). v45 (CIRISEdge#971): that position is ONE, shared by
+//! the four memos and the holdings index ([`super::store_feed`]); a memo
+//! receives the rows drained while it was not listing through the feed's
+//! inbox, so the guarantee per listing is unchanged. The cursor sees every write that lands a
 //! federation-tier row, whichever door it came through: a replicated apply,
 //! the local authoring doors (`put_revocation`, `put_identity_occurrence`,
 //! the claim path's `put_public_key`), a promotion (which re-stamps the
@@ -60,9 +63,10 @@ use super::protocol::{EnvelopeKind, EnvelopeRef};
 /// cursor says (see the module docs for what the cursor cannot see).
 pub(crate) const MEMO_TTL: Duration = Duration::from_mins(10);
 
-/// How far before "now" a rebuilt memo's cursor starts. The rebuild drains
-/// the cursor to the end of the log before it reads any subject, so the lag
-/// only bounds that first drain (a wall clock that stepped is absorbed by
+/// How far before "now" the shared feed's first cursor starts
+/// ([`super::store_feed::Position::cursor`]). The first listing drains the
+/// cursor to the end of the log before it reads any subject, so the lag only
+/// bounds that first drain (a wall clock that stepped is absorbed by
 /// persist's monotonic position allocator, CIRISPersist#668). On sqlite every
 /// write allocates its position and commits under the one connection, so a
 /// row committed after the drain is always past the cursor; a postgres tie
@@ -239,47 +243,62 @@ where
     })
 }
 
-/// One plane's memo: each subject's refs, the store cursor the answers are
-/// current to, and when the memo was last rebuilt.
+/// One plane's memo: each subject's refs and when the memo was last rebuilt.
+/// v45 (CIRISEdge#971) — the store cursor the answers are current to is no
+/// longer per memo: it is the one [`super::store_feed`] position, shared with
+/// the holdings index, and a memo receives its delta through the feed's inbox.
 #[derive(Debug, Default)]
 pub(crate) struct PlaneMemo {
     entries: HashMap<String, Vec<EnvelopeRef>>,
-    cursor: Option<ResumeCursor>,
     built_at: Option<Instant>,
+    /// Set by [`Self::forget`], so the next rebuild is counted under its cause.
+    forgotten: bool,
+}
+
+/// Why a memo is rebuilt (CIRISEdge#971: the seat's rebuild counter by cause).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RebuildCause {
+    /// Never built.
+    First,
+    /// Past [`MEMO_TTL`].
+    Ttl,
+    /// Forgotten after a failed probe.
+    Forgotten,
 }
 
 impl PlaneMemo {
     /// Is the memo due a rebuild (never built, or past [`MEMO_TTL`])?
     pub(crate) fn needs_rebuild(&self, now: Instant) -> bool {
-        self.built_at
-            .is_none_or(|built| now.saturating_duration_since(built) >= MEMO_TTL)
+        self.rebuild_cause(now).is_some()
     }
 
-    /// Drop every answer and restart the cursor [`CURSOR_LAG`] before `wall`.
-    pub(crate) fn rebuild(&mut self, now: Instant, wall: chrono::DateTime<chrono::Utc>) {
+    /// Why the memo is due a rebuild, if it is.
+    pub(crate) fn rebuild_cause(&self, now: Instant) -> Option<RebuildCause> {
+        match self.built_at {
+            None if self.forgotten => Some(RebuildCause::Forgotten),
+            None => Some(RebuildCause::First),
+            Some(built) if now.saturating_duration_since(built) >= MEMO_TTL => {
+                Some(RebuildCause::Ttl)
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// Drop every answer. The shared feed position is already current (the
+    /// listing drains it before reading any subject), so a rebuild no longer
+    /// restarts a cursor of its own.
+    pub(crate) fn rebuild(&mut self, now: Instant) {
         self.entries.clear();
-        let lag =
-            chrono::Duration::from_std(CURSOR_LAG).unwrap_or_else(|_| chrono::Duration::zero());
-        self.cursor = Some((wall - lag, String::new()));
         self.built_at = Some(now);
+        self.forgotten = false;
     }
 
     /// Forget everything, so the next listing rebuilds (a probe that could
     /// not read the store cannot vouch for any answer).
     pub(crate) fn forget(&mut self) {
         self.entries.clear();
-        self.cursor = None;
         self.built_at = None;
-    }
-
-    /// The cursor the next probe resumes from.
-    pub(crate) fn cursor(&self) -> Option<ResumeCursor> {
-        self.cursor.clone()
-    }
-
-    /// The probe consumed through `cursor`.
-    pub(crate) fn advance(&mut self, cursor: ResumeCursor) {
-        self.cursor = Some(cursor);
+        self.forgotten = true;
     }
 
     /// Apply one row's [`Dirt`]; returns how many answers were dropped.
@@ -347,7 +366,7 @@ mod tests {
         let mut m = PlaneMemo::default();
         let t0 = Instant::now();
         assert!(m.needs_rebuild(t0));
-        m.rebuild(t0, chrono::Utc::now());
+        m.rebuild(t0);
         let just_before = (t0 + MEMO_TTL)
             .checked_sub(Duration::from_secs(1))
             .expect("after t0");

@@ -6,6 +6,47 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
 
 ### Consumer notes
 
+- **The receive diff no longer drains persist's content-hash index per Summary (CIRISEdge#971).**
+  The Attestation index (six session planes: Attestation, KeyGrant, Key, Revocation,
+  IdentityOccurrence, IdentityOccurrenceRevocation) and the TransportDestination index are kept as
+  in-memory sets equal to `signed_wire_index`: seeded by one boot drain, fed by a write-through on
+  every admitted apply and by persist's serve cursors (`list_attestations_since`, shared with the
+  CIRISEdge#930 key-plane memos, and `list_signed_transport_destinations_since`), and reconciled to
+  a full drain every 60 s. Before the boot drain completes, while a cursor probe fails, or after an
+  audit finds more drift than max(16, size/1000), a plane answers from the drain as before.
+  `ReplicationDirectory::holdings_want` and `StateProvider::local_want` are new defaulted trait
+  methods; an implementor that does not override them gets the old diff over `list_holdings`.
+  - **Lever:** `BridgeConfig::holdings_index` (default `true`), env `CIRIS_EDGE_HOLDINGS_INDEX=0`
+    (or `off`, `false`) to turn it off. Audit cadence `BridgeConfig::holdings_audit_every`, env
+    `CIRIS_EDGE_HOLDINGS_AUDIT_SECS`.
+  - **Gauges:** `holdings_index.<plane>.{answers_set, answers_drain, fallback_unbooted,
+    fallback_suspect, boots, audits, drain_failures, drain_ms, drift_missing, drift_extra,
+    suspect_audits, write_through, feed_inserts, duplicate_unheld, feed_probes, feed_coalesced,
+    feed_failures}` and `holdings_index_gauge.<plane>.{size, status, source, last_drain_ms}` plus
+    `holdings_index_gauge.enabled`, with `<plane>` one of `attestation`, `transport_destination`.
+  - **Key-plane ledger:** `key_plane_sweep.key_plane_probe_reads` now counts the shared cursor
+    probe, which a holdings ask also runs, and the memos no longer each keep a cursor.
+  - **An idle round reads nothing.** Sequential asks of a cursor are spaced: a clean feed probed
+    less than 5 s ago (`BridgeConfig::feed_probe_spacing`, `Duration::ZERO` restores a probe per
+    ask) is not probed again unless a door edge sees marked it dirty: an admitted apply, a host
+    kick, `note_local_write(s)` or a released signer. A host write that reaches none of those is
+    seen within the spacing (a `Duplicate`, or a key-plane offer one round late). Counted under
+    `key_plane_sweep.{key_plane_probes_spaced, key_plane_feed_dirty_marks}`. This changes the
+    CIRISEdge#930 guarantee: a store write that bypasses every edge door is in the next listing
+    only once the spacing has passed.
+  - **Both cursors start at the head of the log** while the index is on, so every record is known
+    by its key and a rewrite of one held before boot (a PQC completion, a re-seal, a route
+    supersession) replaces its hash at once. One full walk of the served log at the first ask
+    (on the canonical about 86 Attestation pages and 37 route pages of 500 rows).
+- **Where the seat's sweep permits and send-set reads go (CIRISEdge#971).** New family
+  `sweep_permits.<site>` (`holdings_index`, `holdings_rows`, `plane_page`, `accord_evidence`,
+  `subject_pull`, `announced_testimony`, `key_plane_subject`, `feed_attestation`, `feed_route`,
+  `send_set`, `advertise_page`, `advertise_required`, `other`) splits
+  `sweep_permit_wait_seconds.count` by the call site that took the permit. `advertise` gains
+  `advertise_send_set_dropped_live` (a door dropped a consent memo still inside its 10 s TTL) and
+  `advertise_send_set_expired` (a round found it past the TTL). `key_plane_sweep` gains the memo
+  rebuild causes `key_plane_rebuilds_first`, `key_plane_rebuilds_ttl`, `key_plane_forgotten`,
+  plus `key_plane_inbox_overflows` and `key_plane_plane_dirt`.
 - **Naming a shaping class is no longer the shaping opt-in (CIRISEdge#969, CC 5.4.3).**
   `init_edge_runtime(shaping_class="home" | "phone-wifi" | "phone-cellular")` used to shape every
   identity link while seeding the device with no opt-in, so the policy and the device disagreed.

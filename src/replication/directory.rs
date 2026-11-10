@@ -103,6 +103,14 @@ pub trait ReplicationDirectory: Send + Sync {
         self.list_envelope_refs(kind).await
     }
 
+    /// CIRISEdge#971 — the receive diff against [`Self::list_holdings`]:
+    /// which of `remote`'s hashes this node does not hold for `kind`. The
+    /// default is the diff over the listing; the bridge answers it from its
+    /// holdings index without listing.
+    async fn holdings_want(&self, kind: EnvelopeKind, remote: &[EnvelopeRef]) -> Vec<[u8; 32]> {
+        super::summary::diff_refs(&self.list_holdings(kind).await, remote)
+    }
+
     /// CIRISEdge#462 — the RECEIVE-axis SERVE reader: the refs held for `kind`
     /// where `subject_key_id` is the data-subject (records ABOUT it) or, on the
     /// Attestation plane, the sender (records BY it — authorship recovery).
@@ -371,6 +379,13 @@ impl StateProvider for DirectoryStateAdapter {
     /// ([`Self::local_refs`]) and delivery (`fetch_envelope_bytes_for_peer`).
     async fn local_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         self.inner.list_holdings(kind).await
+    }
+
+    /// CIRISEdge#971 — FORWARD the diff, so the bridge's holdings index
+    /// answers it. Taking the trait default here would list the holdings and
+    /// diff them, which is the per-Summary drain the index exists to retire.
+    async fn local_want(&self, kind: EnvelopeKind, remote: &[EnvelopeRef]) -> Vec<[u8; 32]> {
+        self.inner.holdings_want(kind, remote).await
     }
 
     /// CIRISEdge#544 — forward the want-suppression question to the directory,
