@@ -2,9 +2,40 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
-## Unreleased
+## 45.0.0 — 2026-11-10
+
+**MAJOR.** Pins: persist v61.2.2 (712575df; CIRISPersist#1246 SQLite mmap and cache_size), CIRISVerify
+v22.2.0 (rusqlite 0.41.1 / libsqlite3-sys 0.39.1, RUSTSEC-2026-0459 cleared), leviculum
+v0.34.0+ciris.2 (#102 A/V media on unordered datagrams, #104 probed MTU). MSRV 1.92; toolchain 1.97.0.
 
 ### Consumer notes
+
+- **BREAKING: the Python persist requirement is exact, `ciris-persist==61.2.2`.** Every raw-layout
+  capsule is named for the persist build that laid it out (`ciris_persist::<capsule>@61.2.2`,
+  CIRISPersist#1242), and edge asks for the name its own build compiled
+  (`capsule_names::checked_pointer`), so any other wheel is refused at `init_edge_runtime` with a
+  `TypeError` led by `capsule_version_skew`. A server pins the same version.
+- **BREAKING: hybrid-required is the only verifier policy (CIRISEdge#957, CIRISPersist#1233, CC
+  5.3.2.4.3.1).** `init_edge_runtime(hybrid_policy=...)` accepts `"strict"` only; anything else
+  raises `ValueError("verify_policy_violation: ...")`. `EdgeBuilder::build` and
+  `ReticulumTransport::new` refuse a non-`Strict` policy. New `VerifyError::PolicyViolation`, metric
+  class `verify_policy_violation`.
+- **BREAKING: `membership::WidenOutcome` gains `NeedsCosign`.** A widening one voice short of the
+  room's protocol (persist's `roster_consensus_insufficient`) is
+  `Ok(WidenOutcome::NeedsCosign { scope, group_key_id, member_key_id, role, proposal_id })`, no
+  longer an `Err`. An exhaustive match adds the arm. The have/need counts wait on persist
+  (CIRISPersist#1250).
+- **`Edge::arm_room_groups` (CIRISEdge#970).** An Edge built with no room groups (every
+  `init_edge_runtime` host) takes them once on the running Edge; a second arm, or an arm on an Edge
+  the builder gave groups, is refused with `EdgeError::Config`. Calls on agent-hosted nodes were
+  refused `Plumbing("join_call needs the room groups ...")` before.
+- **A late joiner is offered its groups' history (CIRISEdge#968).** Gauges
+  `group_backfill_rows_read_total`, `group_backfill_rows_kept_total`,
+  `group_backfill_completed_total`; one page a round per peer under the `page` lever.
+- **The outbound queue rides `outbound_queue_ops_capsule` (CIRISEdge#960),** and every handle copied
+  out of a capsule holds that capsule for as long as it is used.
+- **`set_av_datagrams_enabled(bool)` (leviculum#102):** node-wide, default on; gauge
+  `av_datagrams_enabled`.
 
 - **The receive diff no longer drains persist's content-hash index per Summary (CIRISEdge#971).**
   The Attestation index (six session planes: Attestation, KeyGrant, Key, Revocation,
@@ -97,8 +128,6 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   `shaping_opt_in` / `shaping_opt_in_cellular` now default to `None` (keep the current choice);
   pass `True` or `False` to change one. A call that moved only the class or the network used to
   clear the person's opt-in. The UniFFI record states both opt-ins explicitly and is unchanged.
-
-### 45.0.0
 
 - **Behaviour change: the bundle's serve nodes are bootstrap peers by
   default** (CIRISEdge#971, #881; Eric's ruling). From v43.2.0 to v44.1.2

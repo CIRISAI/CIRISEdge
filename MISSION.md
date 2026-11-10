@@ -8,8 +8,8 @@
 
 **Version**: 2.0
 **Status**: written at v1.0.0 (Agent 3.0 / CEWP GA, 2026-05-30); the
-shipped line is **v44.x** (v44.1.0: persist v61.0.4, CIRISVerify v22.0.0,
-leviculum v0.34.0+ciris.1, CC 1.0-rc17, wire vocabulary v1.0.3 since v44.1.2). §11 is the
+shipped line is **v45.x** (v45.0.0: persist v61.2.2, CIRISVerify v22.2.0,
+leviculum v0.34.0+ciris.2, CC 1.0-rc17, wire vocabulary v1.0.3 since v44.1.2). §11 is the
 v1.0 record; the current threat surface is `docs/THREAT_MODEL.md`.
 **Date**: 2026-05-30 (status line 2026-11-08)
 
