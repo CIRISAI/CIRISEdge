@@ -519,8 +519,9 @@ async fn assert_tracks(
 /// holder claim, a PQC completion, a re-seal, a group-plane founding, a
 /// consent role, the projection purge, a purge execution, and an AUDIT as an
 /// op of its own. After every op [`assert_tracks`] holds against a second
-/// bridge with the index off (the oracle); after every audit the set equals
-/// the index exactly. The seed and step are in every failure message.
+/// bridge with the index off (the oracle), and the four key-plane listings
+/// equal that bridge's with its listing cache off ([`assert_key_planes_equal`]);
+/// after every audit the set equals the index exactly. The seed and step are in every failure message.
 /// Spacing zero and an audit cadence of an hour, so every add is caught by a
 /// feed and only the audit op repairs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -569,6 +570,7 @@ async fn the_set_tracks_the_index_through_every_door_971() {
             publish,
             BridgeConfig {
                 holdings_index: false,
+                key_plane_listing_cache: false,
                 ..quiet
             },
             None,
@@ -818,12 +820,38 @@ async fn the_set_tracks_the_index_through_every_door_971() {
                 }
             }
             assert_tracks(&on, &off, &*b_dir, &w.removed, &label).await;
+            assert_key_planes_equal(&on, &off, &label).await;
         }
     }
     eprintln!(
         "the_set_tracks_the_index_through_every_door_971: {SEEDS} seeds x {OPS} ops in {:?}",
         started.elapsed()
     );
+}
+
+/// CIRISEdge#971 — the key-plane listing cache rides the same differential:
+/// `on` lists with the cache, `off` (the oracle bridge) without it, over the
+/// same store after the same op, and the four listings are equal as sets.
+async fn assert_key_planes_equal(
+    on: &FederationDirectoryReplicationBridge,
+    off: &FederationDirectoryReplicationBridge,
+    step: &str,
+) {
+    for kind in [
+        EnvelopeKind::Key,
+        EnvelopeKind::IdentityOccurrence,
+        EnvelopeKind::Revocation,
+        EnvelopeKind::IdentityOccurrenceRevocation,
+    ] {
+        let set = |refs: Vec<EnvelopeRef>| {
+            refs.into_iter()
+                .map(|r| (r.envelope_hash, r.seq))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let got_on = set(on.list_envelope_refs(kind).await);
+        let got_off = set(off.list_envelope_refs(kind).await);
+        assert_eq!(got_on, got_off, "{step} {kind:?}: the listing cache");
+    }
 }
 
 /// A purge execution tombstoning `id` (persist I1547's shape).

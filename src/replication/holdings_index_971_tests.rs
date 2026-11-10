@@ -819,6 +819,10 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
         obs::KEY_PLANE_PLANE_DIRT,
         obs::KEY_PLANE_PROBES_SPACED,
         obs::KEY_PLANE_FEED_DIRTY_MARKS,
+        obs::KEY_PLANE_LISTING_CACHE_HITS,
+        obs::KEY_PLANE_BUDGET_DEFERRED,
+        obs::KEY_PLANE_STALE_SERVED,
+        obs::KEY_PLANE_REVALIDATED,
     ];
     let sites = [
         obs::SWEEP_PERMIT_HOLDINGS_INDEX,
@@ -881,6 +885,8 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
         obs::HOLDINGS_GAUGE_STALE_ROUTE_SIZE,
     ]);
     gauges.extend(obs::KEY_PLANE_GAUGE_MEMO_ENTRIES);
+    gauges.extend(obs::KEY_PLANE_GAUGE_UNREAD);
+    gauges.extend(obs::KEY_PLANE_GAUGE_STALE);
     let advertise = [
         obs::ADVERTISE_SEND_SET_MEMO_HIT,
         obs::ADVERTISE_SEND_SET_READ,

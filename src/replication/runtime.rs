@@ -264,6 +264,7 @@ fn with_release_kick(
 fn resolve_sweep_permits(mut config: BridgeConfig) -> BridgeConfig {
     config = resolve_sweep_page_rows(config);
     config = resolve_holdings_index(config);
+    config = resolve_key_plane_levers(config);
     let Ok(raw) = std::env::var(BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV) else {
         return config;
     };
@@ -381,6 +382,46 @@ fn resolve_holdings_index(mut config: BridgeConfig) -> BridgeConfig {
                 "holdings index audit cadence is not a positive whole number of \
                  seconds: IGNORED, keeping the configured value (tracked: \
                  CIRISEdge#971)"
+            ),
+        }
+    }
+    config
+}
+
+/// CIRISEdge#971 — apply the key-plane listing-cache lever
+/// ([`BridgeConfig::KEY_PLANE_LISTING_CACHE_ENV`], only turns OFF) and the
+/// per-listing read budget ([`BridgeConfig::KEY_PLANE_READ_BUDGET_ENV`], a
+/// positive whole number). Same contract as [`resolve_holdings_index`].
+fn resolve_key_plane_levers(mut config: BridgeConfig) -> BridgeConfig {
+    if let Ok(raw) = std::env::var(BridgeConfig::KEY_PLANE_LISTING_CACHE_ENV) {
+        if matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        ) {
+            tracing::info!(
+                env = BridgeConfig::KEY_PLANE_LISTING_CACHE_ENV,
+                "key-plane listing cache turned OFF from the environment: every \
+                 listing walks its plane's memo, the pre-v45 behaviour (CIRISEdge#971)"
+            );
+            config.key_plane_listing_cache = false;
+        }
+    }
+    if let Ok(raw) = std::env::var(BridgeConfig::KEY_PLANE_READ_BUDGET_ENV) {
+        match raw.trim().parse::<usize>() {
+            Ok(budget) if budget > 0 => {
+                tracing::info!(
+                    budget,
+                    env = BridgeConfig::KEY_PLANE_READ_BUDGET_ENV,
+                    "key-plane read budget overridden from the environment (CIRISEdge#971)"
+                );
+                config.key_plane_read_budget = budget;
+            }
+            _ => tracing::warn!(
+                raw = %raw,
+                env = BridgeConfig::KEY_PLANE_READ_BUDGET_ENV,
+                keeping = config.key_plane_read_budget,
+                "key-plane read budget is not a positive whole number: IGNORED, \
+                 keeping the configured value (CIRISEdge#971)"
             ),
         }
     }

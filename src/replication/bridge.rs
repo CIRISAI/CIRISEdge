@@ -996,6 +996,18 @@ pub struct BridgeConfig {
     /// ([`super::store_feed::FEED_PROBE_SPACING`]). `Duration::ZERO` probes
     /// on every sequential ask (the pre-spacing behaviour).
     pub feed_probe_spacing: Duration,
+    /// CIRISEdge#971 — keep each key-plane listing whose every subject was
+    /// answered fresh, and serve it again for an equal subject set while the
+    /// plane's memo has not changed ([`super::key_plane_memo`]). `false`
+    /// walks the memo on every listing, the pre-v45 behaviour. Env
+    /// [`Self::KEY_PLANE_LISTING_CACHE_ENV`].
+    pub key_plane_listing_cache: bool,
+    /// CIRISEdge#971 — how many key-plane subjects one listing reads from the
+    /// store, all causes together, the host's own keys outside it
+    /// ([`super::key_plane_memo::KEY_PLANE_READ_BUDGET`]). `usize::MAX` reads
+    /// every subject a listing lacks, the pre-v45 behaviour. Env
+    /// [`Self::KEY_PLANE_READ_BUDGET_ENV`].
+    pub key_plane_read_budget: usize,
 }
 
 impl BridgeConfig {
@@ -1146,6 +1158,16 @@ impl BridgeConfig {
     /// [`Self::holdings_audit_every`], whole seconds, read once at runtime
     /// assembly. Zero or unparseable is ignored with a WARN.
     pub const HOLDINGS_AUDIT_EVERY_ENV: &'static str = super::holdings_index::AUDIT_EVERY_ENV;
+
+    /// CIRISEdge#971 — process-level override for
+    /// [`Self::key_plane_listing_cache`], read once at runtime assembly: `0`,
+    /// `off` or `false` turns the listing cache off.
+    pub const KEY_PLANE_LISTING_CACHE_ENV: &'static str = "CIRIS_EDGE_KEY_PLANE_LISTING_CACHE";
+
+    /// CIRISEdge#971 — process-level override for
+    /// [`Self::key_plane_read_budget`], a positive whole number, read once at
+    /// runtime assembly. Zero or unparseable is ignored with a WARN.
+    pub const KEY_PLANE_READ_BUDGET_ENV: &'static str = "CIRIS_EDGE_KEY_PLANE_READ_BUDGET";
 }
 
 impl BridgeConfig {
@@ -1157,6 +1179,22 @@ impl BridgeConfig {
     fn default_holdings_index() -> bool {
         #[cfg(test)]
         if let Ok(raw) = std::env::var(Self::HOLDINGS_INDEX_ENV) {
+            if matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false"
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The listing-cache default: on. Under `cfg(test)` only, the env that
+    /// turns it off at runtime assembly also turns off the default, so every
+    /// replication suite can be run cache-off without editing a test.
+    fn default_key_plane_listing_cache() -> bool {
+        #[cfg(test)]
+        if let Ok(raw) = std::env::var(Self::KEY_PLANE_LISTING_CACHE_ENV) {
             if matches!(
                 raw.trim().to_ascii_lowercase().as_str(),
                 "0" | "off" | "false"
@@ -1179,6 +1217,8 @@ impl Default for BridgeConfig {
             holdings_index: Self::default_holdings_index(),
             holdings_audit_every: Self::DEFAULT_HOLDINGS_AUDIT_EVERY,
             feed_probe_spacing: super::store_feed::FEED_PROBE_SPACING,
+            key_plane_listing_cache: Self::default_key_plane_listing_cache(),
+            key_plane_read_budget: super::key_plane_memo::KEY_PLANE_READ_BUDGET,
         }
     }
 }
@@ -2803,6 +2843,11 @@ pub struct FederationDirectoryReplicationBridge {
     feed_dirt: super::store_feed::FeedDirt,
     /// CIRISEdge#971 — [`BridgeConfig::feed_probe_spacing`].
     feed_probe_spacing: Duration,
+    /// CIRISEdge#971 — [`BridgeConfig::key_plane_listing_cache`].
+    key_plane_listing_cache: bool,
+    /// CIRISEdge#971 — [`BridgeConfig::key_plane_read_budget`]; atomic only so
+    /// a witness can move it between two listings.
+    key_plane_read_budget: std::sync::atomic::AtomicUsize,
     /// CIRISEdge#531 DEPTH — the per-`(peer, plane)` advertise watermarks. See
     /// [`SweepCursors`] / [`PlaneWatermark`]. On the bridge for the same reason
     /// [`Self::sweep_gate`] is: the ONE production bridge is shared by every
@@ -3217,6 +3262,10 @@ impl FederationDirectoryReplicationBridge {
             store_feed: tokio::sync::Mutex::new(super::store_feed::FeedState::default()),
             feed_dirt: super::store_feed::FeedDirt::default(),
             feed_probe_spacing: config.feed_probe_spacing,
+            key_plane_listing_cache: config.key_plane_listing_cache,
+            key_plane_read_budget: std::sync::atomic::AtomicUsize::new(
+                config.key_plane_read_budget,
+            ),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
             lookup_limiter: Self::lookup_budget(
                 Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
@@ -7554,42 +7603,129 @@ impl FederationDirectoryReplicationBridge {
     /// the plane's per-subject memo ([`super::key_plane_memo`]).
     ///
     /// First the memo is brought current with the store
-    /// ([`Self::refresh_key_plane_memo`]); then each subject the memo has no
-    /// answer for is read exactly as the pre-#930 loop read it (one width
-    /// permit per subject read, a failure warned and NOT memoized, so it is
-    /// retried on the next listing), and memoized. The result is the deduped
-    /// union of the subjects' refs: the same set the per-subject loop built.
+    /// ([`Self::refresh_key_plane_memo`]: the feed's dirt, then the TTL
+    /// epoch). v45 (CIRISEdge#971): a listing every subject of which was
+    /// answered fresh at the memo's current generation, for an equal subject
+    /// set, is served whole from the plane's listing cache, no walk. Otherwise
+    /// each subject is classified: a fresh answer is served; a subject with
+    /// no answer is read (one width permit per subject read, a failure
+    /// warned and NOT memoized, so it is retried on the next listing); a
+    /// stale answer (the epoch before) is re-read, and served as it is only
+    /// when the read budget is spent. Reads of absent subjects come first,
+    /// then revalidations; together they spend at most
+    /// [`BridgeConfig::key_plane_read_budget`], the host's own keys outside
+    /// it. A subject left unread is ABSENT from the result: the next listing
+    /// reads it. The result is the deduped union of the answered subjects'
+    /// refs; with nothing deferred, the set the per-subject loop built.
     ///
     /// The plane's lock is held for the whole listing, so N peers' rounds
-    /// arriving together cost one fill, not N. Each listing books its store
-    /// reads and wall time ([`crate::observability::KEY_PLANE_SUBJECT_READS`]
-    /// and siblings), and a listing that read the store says so in the log
-    /// with its plane, read count and elapsed time — the next storm names
-    /// itself.
-    async fn key_plane_listing<I>(&self, read: KeyPlaneRead, subjects: I) -> Vec<EnvelopeRef>
-    where
-        I: IntoIterator<Item = String>,
-    {
+    /// arriving together cost one fill, not N; the budget bounds how long
+    /// one fill holds it. Each listing books its store reads and wall time
+    /// ([`crate::observability::KEY_PLANE_SUBJECT_READS`] and siblings) and
+    /// sets the plane's memo, unread and stale gauges, and a listing that
+    /// read the store says so in the log with its plane, read count and
+    /// elapsed time — the next storm names itself.
+    #[allow(clippy::too_many_lines)] // one listing: cache, classify, budgeted reads, ledger
+    async fn key_plane_listing(
+        &self,
+        read: KeyPlaneRead,
+        subjects: HashSet<String>,
+    ) -> Vec<EnvelopeRef> {
+        use super::key_plane_memo::Lookup;
         use crate::observability as obs;
         let started = Instant::now();
         let mut memo = self.key_plane_memos.plane(read).lock().await;
         self.refresh_key_plane_memo(read, &mut memo).await;
+        if self.key_plane_listing_cache {
+            if let Some(refs) = memo.cached_listing(&subjects) {
+                let memo_entries = u64::try_from(memo.len()).unwrap_or(u64::MAX);
+                drop(memo);
+                if let Some(m) = &self.metrics {
+                    m.set_holdings_index_gauge(
+                        obs::KEY_PLANE_GAUGE_MEMO_ENTRIES[read.index()],
+                        memo_entries,
+                    );
+                    m.set_holdings_index_gauge(obs::KEY_PLANE_GAUGE_UNREAD[read.index()], 0);
+                    m.set_holdings_index_gauge(obs::KEY_PLANE_GAUGE_STALE[read.index()], 0);
+                    m.add_key_plane_sweep(obs::KEY_PLANE_LISTINGS, 1);
+                    m.add_key_plane_sweep(obs::KEY_PLANE_LISTING_CACHE_HITS, 1);
+                    m.add_key_plane_sweep(
+                        obs::KEY_PLANE_MEMO_HITS,
+                        u64::try_from(subjects.len()).unwrap_or(u64::MAX),
+                    );
+                }
+                return refs;
+            }
+        }
         let mut refs: Vec<EnvelopeRef> = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        let mut asked: HashSet<String> = HashSet::new();
-        let (mut hits, mut reads, mut failed) = (0u64, 0u64, 0u64);
-        for subject in subjects {
-            if !asked.insert(subject.clone()) {
-                continue;
+        // Classify first, so the budget goes to absent subjects before it
+        // goes to revalidating stale ones.
+        let mut absent: Vec<&String> = Vec::new();
+        let mut stale: Vec<&String> = Vec::new();
+        let mut hits = 0u64;
+        for subject in &subjects {
+            match memo.lookup(subject) {
+                Lookup::Fresh(cached) => {
+                    hits += 1;
+                    refs.extend(
+                        cached
+                            .iter()
+                            .filter(|r| seen.insert(r.envelope_hash))
+                            .cloned(),
+                    );
+                }
+                Lookup::Stale(_) => stale.push(subject),
+                Lookup::Missing => absent.push(subject),
             }
-            if let Some(cached) = memo.get(&subject) {
-                hits += 1;
-                refs.extend(
-                    cached
-                        .iter()
-                        .filter(|r| seen.insert(r.envelope_hash))
-                        .cloned(),
-                );
+        }
+        let mut budget = self
+            .key_plane_read_budget
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // The host's own keys are read whatever the budget; the set is only
+        // asked for when the budget could run out.
+        let own: HashSet<String> = if absent.len() + stale.len() > budget {
+            self.self_provider
+                .as_ref()
+                .map(|p| p())
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let (mut reads, mut failed, mut unread, mut stale_served, mut revalidated) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
+        for (subject, was_stale) in absent
+            .into_iter()
+            .map(|s| (s, false))
+            .chain(stale.into_iter().map(|s| (s, true)))
+        {
+            let in_budget = own.contains(subject.as_str()) || {
+                if budget > 0 {
+                    budget -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !in_budget {
+                if was_stale {
+                    // Served as it stands: no delta row has dropped it (dirt
+                    // is applied before the epoch turns), so only what the
+                    // cursor cannot see can have changed it.
+                    if let Lookup::Stale(cached) = memo.lookup(subject) {
+                        stale_served += 1;
+                        refs.extend(
+                            cached
+                                .iter()
+                                .filter(|r| seen.insert(r.envelope_hash))
+                                .cloned(),
+                        );
+                    }
+                } else {
+                    unread += 1;
+                }
                 continue;
             }
             reads += 1;
@@ -7601,12 +7737,15 @@ impl FederationDirectoryReplicationBridge {
                     .await;
                 crate::read_caller::scoped(
                     crate::read_caller::Site::KeyPlane,
-                    read.read(&*self.directory, &subject),
+                    read.read(&*self.directory, subject),
                 )
                 .await
             };
             match found {
                 Ok(rows) => {
+                    if was_stale {
+                        revalidated += 1;
+                    }
                     let subject_refs = self.key_plane_refs(rows, read.site());
                     refs.extend(
                         subject_refs
@@ -7614,13 +7753,21 @@ impl FederationDirectoryReplicationBridge {
                             .filter(|r| seen.insert(r.envelope_hash))
                             .cloned(),
                     );
-                    memo.insert(subject, subject_refs);
+                    memo.insert(subject.clone(), subject_refs);
                 }
                 Err(e) => {
                     failed += 1;
-                    Self::key_plane_read_failed(read.kind(), &subject, &e);
+                    // A read that failed vouches for nothing: a stale answer
+                    // is not served on it either.
+                    memo.remove(subject);
+                    Self::key_plane_read_failed(read.kind(), subject, &e);
                 }
             }
+        }
+        let asked = subjects.len();
+        let complete = unread == 0 && failed == 0 && stale_served == 0;
+        if self.key_plane_listing_cache && complete {
+            memo.store_listing(subjects, refs.clone());
         }
         let memo_entries = u64::try_from(memo.len()).unwrap_or(u64::MAX);
         drop(memo);
@@ -7630,8 +7777,13 @@ impl FederationDirectoryReplicationBridge {
                 obs::KEY_PLANE_GAUGE_MEMO_ENTRIES[read.index()],
                 memo_entries,
             );
+            m.set_holdings_index_gauge(obs::KEY_PLANE_GAUGE_UNREAD[read.index()], unread);
+            m.set_holdings_index_gauge(obs::KEY_PLANE_GAUGE_STALE[read.index()], stale_served);
             m.add_key_plane_sweep(obs::KEY_PLANE_LISTINGS, 1);
             m.add_key_plane_sweep(obs::KEY_PLANE_MEMO_HITS, hits);
+            m.add_key_plane_sweep(obs::KEY_PLANE_BUDGET_DEFERRED, unread);
+            m.add_key_plane_sweep(obs::KEY_PLANE_STALE_SERVED, stale_served);
+            m.add_key_plane_sweep(obs::KEY_PLANE_REVALIDATED, revalidated);
             if reads > 0 {
                 m.add_key_plane_sweep(obs::KEY_PLANE_SWEEPS, 1);
                 m.add_key_plane_sweep(obs::KEY_PLANE_SUBJECT_READS, reads);
@@ -7642,63 +7794,71 @@ impl FederationDirectoryReplicationBridge {
                 );
             }
         }
-        if reads > 0 {
+        if reads > 0 || unread > 0 {
             tracing::debug!(
                 plane = ?read.kind(),
-                subjects = asked.len(),
+                subjects = asked,
                 subject_reads = reads,
                 memo_hits = hits,
+                revalidated,
+                stale_served,
+                unread,
                 failed,
                 refs = refs.len(),
                 elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                "key-plane sweep read the store (CIRISEdge#930)"
+                "key-plane sweep read the store (CIRISEdge#930, budget CIRISEdge#971)"
             );
         }
         refs
     }
 
-    /// CIRISEdge#930 — bring `read`'s memo current with the store: rebuild it
-    /// when it is due ([`super::key_plane_memo::MEMO_TTL`]), then bring the
-    /// shared serve-cursor feed current ([`Self::catch_up_attestation_feed`])
-    /// and drop every answer a row drained since this memo last listed can
-    /// change ([`super::key_plane_memo::dirt_of`]). The cursor is persist's,
-    /// so a LOCAL write (an authoring door, the claim path) moves it exactly as
-    /// a replicated apply does. v45 (CIRISEdge#971): the cursor is shared with
-    /// the other three memos and the holdings index, so one peer's round over
-    /// the four key planes drains the delta once, not four times; the rows
-    /// drained while this memo was not listing wait in its inbox. A feed the
-    /// store did not serve forgets the memo: no answer is vouched for by a
-    /// read that failed.
+    /// CIRISEdge#971 — test-only: move the key-plane read budget between two
+    /// listings.
+    #[cfg(test)]
+    pub(crate) fn set_key_plane_read_budget(&self, budget: usize) {
+        self.key_plane_read_budget
+            .store(budget, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#971 — test-only: `read`'s memo was built or revalidated `by`
+    /// earlier than it was, so its TTL path runs on the next listing, at an
+    /// explicit instant and with no sleep.
+    #[cfg(test)]
+    pub(crate) async fn age_key_plane_memo(&self, read: KeyPlaneRead, by: Duration) {
+        self.key_plane_memos.plane(read).lock().await.age(by);
+    }
+
+    /// CIRISEdge#930 — bring `read`'s memo current with the store. v45
+    /// (CIRISEdge#971) order: FIRST bring the shared serve-cursor feed
+    /// current ([`Self::catch_up_attestation_feed`]) and drop every answer a
+    /// row drained since this memo last listed can change
+    /// ([`super::key_plane_memo::dirt_of`]); THEN, when it is due, rebuild the
+    /// memo (never built, or forgotten) or, past
+    /// [`super::key_plane_memo::MEMO_TTL`], open a new epoch so the answers
+    /// left are served stale while they are re-read. Dirt first means the TTL
+    /// path never holds an answer a row the cursor has seen could change: a
+    /// stale answer is wrong only by what the cursor cannot see. The cursor is
+    /// persist's, so a LOCAL write (an authoring door, the claim path) moves
+    /// it exactly as a replicated apply does. The cursor is shared with the
+    /// other three memos and the holdings index, so one peer's round over the
+    /// four key planes drains the delta once, not four times; the rows drained
+    /// while this memo was not listing wait in its inbox. A feed the store did
+    /// not serve forgets the memo: no answer is vouched for by a read that
+    /// failed.
     async fn refresh_key_plane_memo(
         &self,
         read: KeyPlaneRead,
         memo: &mut super::key_plane_memo::PlaneMemo,
     ) {
-        use super::key_plane_memo::{dirt_of, Dirt};
+        use super::key_plane_memo::{dirt_of, Dirt, RebuildCause};
         use crate::observability as obs;
         let now = Instant::now();
-        if let Some(cause) = memo.rebuild_cause(now) {
-            // Every answer goes. The feed drain below runs before any subject
-            // is read, so a row committed after this point is past the shared
-            // cursor and the next listing sees it.
-            memo.rebuild(now);
-            self.book_key_plane(obs::KEY_PLANE_REBUILDS, 1);
-            use super::key_plane_memo::RebuildCause;
-            self.book_key_plane(
-                match cause {
-                    RebuildCause::First => obs::KEY_PLANE_REBUILDS_FIRST,
-                    RebuildCause::Ttl => obs::KEY_PLANE_REBUILDS_TTL,
-                    RebuildCause::Forgotten => obs::KEY_PLANE_FORGOTTEN,
-                },
-                1,
-            );
-        }
         let Ok(pending) = self.catch_up_attestation_feed(now, Some(read)).await else {
             tracing::warn!(
                 plane = ?read.kind(),
                 "key-plane change probe FAILED: the memo is forgotten and this \
-                 listing reads every subject from the store (correct, at the \
-                 pre-history: CIRISEdge#930 cost)"
+                 listing reads subjects from the store within its budget \
+                 (correct; CIRISEdge#930, #971)"
             );
             memo.forget();
             return;
@@ -7728,6 +7888,25 @@ impl FederationDirectoryReplicationBridge {
             }
         }
         self.book_key_plane(obs::KEY_PLANE_INVALIDATED, dropped);
+        if let Some(cause) = memo.rebuild_cause(now) {
+            match cause {
+                // Nothing to vouch for: every answer goes. The drain above ran
+                // before any subject is read, so a row committed after it is
+                // past the shared cursor and the next listing sees it.
+                RebuildCause::First | RebuildCause::Forgotten => memo.rebuild(now),
+                // Stale-while-revalidate (CIRISEdge#971).
+                RebuildCause::Ttl => memo.revalidate(now),
+            }
+            self.book_key_plane(obs::KEY_PLANE_REBUILDS, 1);
+            self.book_key_plane(
+                match cause {
+                    RebuildCause::First => obs::KEY_PLANE_REBUILDS_FIRST,
+                    RebuildCause::Ttl => obs::KEY_PLANE_REBUILDS_TTL,
+                    RebuildCause::Forgotten => obs::KEY_PLANE_FORGOTTEN,
+                },
+                1,
+            );
+        }
     }
 
     /// CIRISEdge#682 — the announce-gated advertise of the two identity planes.
@@ -12835,7 +13014,9 @@ impl FederationDirectoryReplicationBridge {
         // the per-subject memo, the store read only for subjects it lacks.
         self.key_plane_listing(
             KeyPlaneRead::Revocation,
-            self.subjects_for_projection(Projection::Global),
+            self.subjects_for_projection(Projection::Global)
+                .into_iter()
+                .collect(),
         )
         .await
     }
@@ -12852,7 +13033,9 @@ impl FederationDirectoryReplicationBridge {
         // loop, once per Global subject per peer round.
         self.key_plane_listing(
             KeyPlaneRead::OccurrenceWithdrawal,
-            self.subjects_for_projection(Projection::Global),
+            self.subjects_for_projection(Projection::Global)
+                .into_iter()
+                .collect(),
         )
         .await
     }

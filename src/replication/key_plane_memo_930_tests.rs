@@ -76,7 +76,7 @@ fn bridge_over(
 /// the plane's set (duplicates included, as the old loop walked them), each
 /// read with its per-subject read, then hashed and deduped as
 /// `key_plane_refs` does. A failed read contributes nothing.
-async fn oracle(
+pub(super) async fn oracle(
     kind: EnvelopeKind,
     dir: &dyn FederationDirectory,
     subjects: &[String],
@@ -116,7 +116,7 @@ async fn oracle(
         .collect()
 }
 
-fn as_set(refs: &[EnvelopeRef]) -> BTreeSet<(Vec<u8>, u64)> {
+pub(super) fn as_set(refs: &[EnvelopeRef]) -> BTreeSet<(Vec<u8>, u64)> {
     let set: BTreeSet<_> = refs
         .iter()
         .map(|r| (r.envelope_hash.to_vec(), r.seq))

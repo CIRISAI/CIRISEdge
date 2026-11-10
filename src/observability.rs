@@ -1513,6 +1513,18 @@ pub const KEY_PLANE_PROBES_SPACED: &str = "key_plane_probes_spaced";
 /// CIRISEdge#971 — doors that marked the shared feed dirty (an admitted
 /// apply, a host kick, `note_local_write(s)`, a released signer).
 pub const KEY_PLANE_FEED_DIRTY_MARKS: &str = "key_plane_feed_dirty_marks";
+/// CIRISEdge#971 — listings served whole from the plane's listing cache (no
+/// walk of the memo: the memo's generation had not moved and the subject set
+/// was equal).
+pub const KEY_PLANE_LISTING_CACHE_HITS: &str = "key_plane_listing_cache_hits";
+/// CIRISEdge#971 — subjects a listing left unread because its read budget was
+/// spent (absent from that listing, read by a later one).
+pub const KEY_PLANE_BUDGET_DEFERRED: &str = "key_plane_budget_deferred";
+/// CIRISEdge#971 — stale answers served because the read budget was spent
+/// before their revalidation read (stale-while-revalidate).
+pub const KEY_PLANE_STALE_SERVED: &str = "key_plane_stale_served";
+/// CIRISEdge#971 — stale answers re-read (their revalidation).
+pub const KEY_PLANE_REVALIDATED: &str = "key_plane_revalidated";
 
 // ─── CIRISEdge#971 — `EdgeMetrics::sweep_permits` labels ────────────────
 //
@@ -1666,6 +1678,23 @@ pub const KEY_PLANE_GAUGE_MEMO_ENTRIES: [&str; 4] = [
     "key_plane.occurrence_binding.memo_entries",
     "key_plane.revocation.memo_entries",
     "key_plane.occurrence_withdrawal.memo_entries",
+];
+/// Gauge: subjects the last listing of each key plane left UNREAD because its
+/// read budget was spent (absent from that listing), by `KeyPlaneRead` slot.
+/// Non-zero for more than a few listings in a row is a stall.
+pub const KEY_PLANE_GAUGE_UNREAD: [&str; 4] = [
+    "key_plane.key_record.unread",
+    "key_plane.occurrence_binding.unread",
+    "key_plane.revocation.unread",
+    "key_plane.occurrence_withdrawal.unread",
+];
+/// Gauge: stale answers the last listing of each key plane served while they
+/// wait for their revalidation read, by `KeyPlaneRead` slot.
+pub const KEY_PLANE_GAUGE_STALE: [&str; 4] = [
+    "key_plane.key_record.stale",
+    "key_plane.occurrence_binding.stale",
+    "key_plane.revocation.stale",
+    "key_plane.occurrence_withdrawal.stale",
 ];
 /// Gauge: milliseconds from the runtime's warm-up start to this plane's set
 /// being Ready (its walk from the head of the log plus its boot drain), set

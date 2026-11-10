@@ -141,6 +141,8 @@ mod holdings_index_971_tests;
 /// hold. NEVER holdings; see the module docs for why that distinction is the
 /// whole safety of the design.
 pub mod key_grant_emitter;
+#[cfg(test)]
+mod key_plane_cache_971_tests;
 /// CIRISEdge#930 — the key-plane listings, memoized per subject on the
 /// store's admission cursor.
 pub(crate) mod key_plane_memo;
