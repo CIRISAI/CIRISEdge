@@ -7027,6 +7027,9 @@ impl ReticulumTransport {
             pacing_rejections: st.pacing_rejections(),
             window: st.window(),
             window_max: st.window_max(),
+            tx_ring: st.tx_ring_size(),
+            last_sent_seq: st.last_sent_sequence(),
+            oldest_unacked_seq: st.oldest_unacked_sequence(),
         })
     }
 

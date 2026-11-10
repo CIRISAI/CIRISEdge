@@ -343,6 +343,21 @@ impl<R: StreamDekRegistrar> KeptAvPublisher<R> {
         Ok(self.register_current().await)
     }
 
+    /// 45.1 — [`AvPublisher::replace_room_stream`], registering the new
+    /// stream's current epoch when kept (a new stream is a new keep target).
+    ///
+    /// # Errors
+    /// The publisher is not room-keyed.
+    pub async fn replace_room_stream(
+        &mut self,
+        stream: crate::transport::realtime_av::StreamId,
+        dek: crate::transport::realtime_av::EpochDek,
+    ) -> Result<KeepOutcome, AvRuntimeError> {
+        self.inner.replace_room_stream(stream, dek)?;
+        self.registered.clear();
+        Ok(self.register_current().await)
+    }
+
     /// CIRISEdge#805 item 5 — the publisher's dispatcher (per-leg fan-out,
     /// layer policy, roster).
     // Its one caller is the room call (`av_call`), a Reticulum-gated module.

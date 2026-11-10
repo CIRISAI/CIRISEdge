@@ -508,3 +508,214 @@ fn temporal_layer_zero_is_the_base_for_standby_and_shed() {
     }
     assert!(is_base_or_audio(CODEC_OPAQUE, ChunkLayer::BASE));
 }
+
+/// A binding as `Attendance` reads it: only its verified fields matter
+/// (`publisher`, `stream`, `replaces`, `end`).
+fn attendance_binding(
+    publisher: &str,
+    stream: u8,
+    replaces: Option<u8>,
+    end: Option<crate::transport::av_chunk_auth::SignedEnd>,
+) -> StreamKeyBinding {
+    StreamKeyBinding {
+        room: "room".to_owned(),
+        publisher: publisher.to_owned(),
+        join_nonce: [stream; 32],
+        stream: StreamId([stream; 32]),
+        epoch: Epoch(1),
+        chunk_key: [0; 32],
+        sig_ed25519: Vec::new(),
+        sig_ml_dsa_65: Vec::new(),
+        codecs: None,
+        replaces: replaces.map(|r| StreamId([r; 32])),
+        end,
+        final_seq: end.map(|_| 0),
+    }
+}
+
+/// 45.1 — a signed end's verdict waits [`END_VERDICT_AFTER`] (the longest
+/// reorder window) after it lands: not due a moment before, due at it, once.
+#[test]
+fn a_signed_end_waits_the_reorder_window_for_its_verdict() {
+    use crate::transport::av_chunk_auth::SignedEnd;
+    assert_eq!(END_VERDICT_AFTER, REORDER_WINDOW_MAX);
+    let mut a = Attendance::default();
+    let t = Instant::now();
+    let end = attendance_binding("bob", 1, None, Some(SignedEnd::Left));
+    a.defer_end(&end, t);
+    assert!(
+        a.due_ends(t + END_VERDICT_AFTER - Duration::from_millis(1))
+            .is_empty(),
+        "a tail chunk may still be in the window"
+    );
+    let due = a.due_ends(t + END_VERDICT_AFTER);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].stream, end.stream);
+    assert!(a.due_ends(t + END_VERDICT_AFTER * 4).is_empty(), "once");
+}
+
+/// 45.1 — a signed end is `AttendeeLeft` with its cause (and whether its tail
+/// arrived), once per (attendee, stream); `Removed` and `Lost` fire once too,
+/// and never after a signed end.
+#[test]
+fn a_signed_end_is_attendee_left_with_its_cause_once() {
+    use crate::transport::av_chunk_auth::SignedEnd;
+    let mut a = Attendance::default();
+    let s1 = StreamId([1; 32]);
+    assert!(a
+        .on_bound(
+            "me",
+            &attendance_binding("bob", 1, None, None),
+            None,
+            true,
+            false
+        )
+        .is_empty());
+    assert_eq!(a.streams.get("bob"), Some(&s1));
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("bob", 1, None, Some(SignedEnd::Backgrounded)),
+        None,
+        true,
+        true,
+    );
+    assert_eq!(
+        ev,
+        [CallEvent::AttendeeLeft {
+            key_id: "bob".into(),
+            stream: s1,
+            cause: LeaveCause::Backgrounded,
+            truncated: true,
+        }]
+    );
+    assert!(a.streams.get("bob").is_none());
+    assert!(
+        a.left("bob", s1, LeaveCause::Lost, true, false).is_none(),
+        "once"
+    );
+    // Removed, once.
+    let s2 = StreamId([2; 32]);
+    let _ = a.on_bound(
+        "me",
+        &attendance_binding("carol", 2, None, None),
+        None,
+        true,
+        false,
+    );
+    assert_eq!(
+        a.left("carol", s2, LeaveCause::Removed, true, false),
+        Some(CallEvent::AttendeeLeft {
+            key_id: "carol".into(),
+            stream: s2,
+            cause: LeaveCause::Removed,
+            truncated: false,
+        })
+    );
+    assert!(a
+        .left("carol", s2, LeaveCause::Removed, true, false)
+        .is_none());
+    // Own bindings say nothing.
+    assert!(a
+        .on_bound(
+            "me",
+            &attendance_binding("me", 3, None, Some(SignedEnd::Left)),
+            None,
+            true,
+            false
+        )
+        .is_empty());
+}
+
+/// CC: `end = 0` is not proof of presence. A stream this node never heard a
+/// chunk of (a late joiner handed an old binding of a stream since gone) is
+/// no attendee: neither its end nor its loss nor its removal is an
+/// `AttendeeLeft`, and it stays ended (it never fires later).
+#[test]
+fn a_binding_alone_is_no_presence() {
+    use crate::transport::av_chunk_auth::SignedEnd;
+    let mut a = Attendance::default();
+    let s = StreamId([4; 32]);
+    let _ = a.on_bound(
+        "me",
+        &attendance_binding("dave", 4, None, None),
+        None,
+        false,
+        false,
+    );
+    assert!(a.left("dave", s, LeaveCause::Lost, false, false).is_none());
+    assert!(
+        a.left("dave", s, LeaveCause::Removed, true, false)
+            .is_none(),
+        "ended"
+    );
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("erin", 5, None, Some(SignedEnd::Left)),
+        None,
+        false,
+        false,
+    );
+    assert!(ev.is_empty(), "a signed end of a stream never heard");
+}
+
+/// 45.1 — a signed `replaces` of the same publisher's stream is
+/// `StreamReplaced` and no leave; the old stream can then never leave. A
+/// `replaces` naming a stream another publisher's binding named is no
+/// replacement; a second stream with no `replaces` ends nothing.
+#[test]
+fn a_replacement_is_not_a_leave() {
+    let mut a = Attendance::default();
+    let _ = a.on_bound(
+        "me",
+        &attendance_binding("bob", 1, None, None),
+        None,
+        true,
+        false,
+    );
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("bob", 2, Some(1), None),
+        Some("bob"),
+        true,
+        false,
+    );
+    assert_eq!(
+        ev,
+        [CallEvent::StreamReplaced {
+            publisher: "bob".into(),
+            old: StreamId([1; 32]),
+            new: StreamId([2; 32]),
+        }]
+    );
+    assert_eq!(a.streams.get("bob"), Some(&StreamId([2; 32])));
+    assert!(
+        a.left("bob", StreamId([1; 32]), LeaveCause::Lost, true, false)
+            .is_none(),
+        "the replaced stream never leaves"
+    );
+    let _ = a.on_bound(
+        "me",
+        &attendance_binding("carol", 5, None, None),
+        None,
+        true,
+        false,
+    );
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("mallory", 6, Some(5), None),
+        Some("carol"),
+        true,
+        false,
+    );
+    assert!(ev.is_empty());
+    assert!(!a.ended.contains(&("carol".to_owned(), StreamId([5; 32]))));
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("carol", 7, None, None),
+        None,
+        true,
+        false,
+    );
+    assert!(ev.is_empty());
+    assert!(!a.ended.contains(&("carol".to_owned(), StreamId([5; 32]))));
+}

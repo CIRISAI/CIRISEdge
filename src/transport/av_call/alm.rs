@@ -957,6 +957,68 @@ impl AlmState {
         self.own_stream
     }
 
+    /// The publisher a verified binding names for `stream`, if any.
+    pub(super) fn bound_publisher_of(&self, stream: StreamId) -> Option<&str> {
+        self.bound_publisher.get(&stream).map(String::as_str)
+    }
+
+    /// When `stream`'s chunks last arrived on any path (call ms), if ever.
+    pub(super) fn stream_last_activity_ms(&self, stream: StreamId) -> Option<u64> {
+        self.sels
+            .get(&stream)
+            .and_then(ParentSelector::last_activity_ms)
+    }
+
+    /// 45.1 — `Call::replace_stream`, publisher side: this node's stream is
+    /// now `stream`. The children of the old stream hold the same commitment
+    /// on the new one (one uplink, the same members), and every C3 member is
+    /// provisional again, so the new stream reaches each at once while its
+    /// selector learns the new stream id and asks.
+    pub(super) fn replace_own_stream(&mut self, stream: StreamId) {
+        self.own_stream = stream;
+        let now = self.now_ms();
+        let c3: Vec<String> = self
+            .caps
+            .iter()
+            .filter(|(p, c)| *c & CAP_C3_V1 != 0 && self.members.contains(p))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in c3 {
+            self.provisional.insert(p, now);
+        }
+        let moved: Vec<(String, crate::transport::realtime_av::ReceiverLayerPolicy)> = self
+            .layer_caps
+            .iter()
+            .filter(|((s, _), _)| *s != stream)
+            .map(|((_, c), cap)| (c.clone(), *cap))
+            .collect();
+        self.layer_caps.retain(|(s, _), _| *s == stream);
+        for (child, cap) in moved {
+            self.layer_caps.insert((stream, child), cap);
+        }
+    }
+
+    /// 45.1 — a publisher's signed `replaces`: `old` is gone in favour of
+    /// `new`. Forget `old` (its selector, relay admission and meters); a layer
+    /// cap this node asked for `old` carries over to `new`.
+    pub(super) fn forget_replaced_stream(&mut self, old: StreamId, new: StreamId) {
+        self.sels.remove(&old);
+        self.relays.remove(&old);
+        self.rates.remove(&old);
+        self.forwarded_seen.remove(&old);
+        self.min_offset.remove(&old);
+        self.last_primary.remove(&old);
+        self.told_publisher.remove(&old);
+        self.draining_parent.remove(&old);
+        self.failing_over.remove(&old);
+        self.epochs.remove(&old);
+        self.video_unavailable.remove(&old);
+        self.layer_caps.retain(|(s, _), _| *s != old);
+        if let Some(cap) = self.wanted_layers.remove(&old) {
+            self.wanted_layers.insert(new, cap);
+        }
+    }
+
     /// 45.1 — ask this node's parents for `stream` for at most `cap` (`None`:
     /// everything). Kept, and carried on every SUBSCRIBE this node sends a
     /// parent that takes a cap; the current primary gets a re-SUBSCRIBE now

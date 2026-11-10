@@ -144,6 +144,9 @@ pub struct CallOptions {
     pub keep: AvKeep,
     pub relay: bool,                       // this node relays for others (AvSpine::open relay_node)
     pub default_policy: ReceiverLayerPolicy,
+    /// 45.1 — the stream's codec map, one token per layer class (`{0x04: h264, 0xFF: opus}`),
+    /// named by its v2 binding and fixed for the stream's life (docs/av_chunk_auth_wire.md §1.8).
+    pub codecs: Option<CodecMap>,
 }
 
 impl Call {
@@ -163,8 +166,18 @@ impl Call {
     /// Hang up: final terminator and final in-band STH; for an ad-hoc call, the forward-only
     /// withdraw (§7).
     pub async fn leave(self) -> Result<CallSummary, CallError>;
+    /// 45.1 — `leave` saying why (`Left` | `Backgrounded`): the publisher's signed end of its
+    /// stream (a v2 binding with `end`) goes to every leg that parses v2, then the legs close.
+    pub async fn leave_with(self, why: SignedEnd) -> Result<CallSummary, CallError>;
+    /// 45.1 — replace this node's stream in place (a codec change): a fresh join nonce and
+    /// stream, bound first and switched to once every leg's Channel proved the binding delivered
+    /// (make-before-break; REPLACE_SWITCH_CEILING is only a safety net), whose v2
+    /// binding says `replaces: <old>`, signed. No leave, no rejoin.
+    pub async fn replace_stream(&mut self, codecs: Option<CodecMap>) -> Result<StreamId, CallError>;
     pub fn state(&self) -> CallState;                              // Live | Degraded(StrandedEpoch) | Ended(EndCause)
-    /// Typed call events (§5, §8): `KeepRefused`, `EpochRolled`, `MemberJoined/Left`, `Stranded`.
+    /// Typed call events (§5, §8): `KeepRefused`, `EpochRolled`, `MemberJoined/Left`, `Stranded`,
+    /// and (45.1) `AttendeeLeft { key_id, stream, cause: Left | Backgrounded | Removed | Lost }`
+    /// once per (attendee, stream) and `StreamReplaced { publisher, old, new }`.
     pub fn events(&mut self) -> CallEventStream;                   // impl Stream<Item = CallEvent>
 }
 
@@ -397,6 +410,28 @@ refused frame).
 5. This API (item 5) and the signalling rows (item 6), behind those.
 
 ## 12. Changelog
+
+- 2026-11-10 — 45.1: attendance and in-place replacement.
+  - `CallEvent::AttendeeLeft { key_id, stream, cause }` fires once per (attendee, stream):
+    - `Left` / `Backgrounded` come only from the attendee's signed end of its stream (a v2
+      binding with `end`, `leave_with`), never from an unsigned frame. The per-epoch terminator
+      is not on this base, so the end marker rides the v2 binding body.
+    - `Removed` comes from the room's MLS group dropping the key, at the roll.
+    - `Lost`: no leg to the attendee and its stream silent for `ATTENDEE_LOST_AFTER` (5 s, the
+      depth-0 `Down` bound), with no signed end. A v1-only peer, which cannot parse the end
+      marker, sees a leaver as `Lost`.
+  - `Call::replace_stream` mints a new stream within the same membership. It binds it with a
+    signed `replaces`, keeps the old stream publishing until every leg's Channel proves the
+    binding delivered (its tx ring empty; a ceiling counted `replace_switch_unconfirmed` is the
+    safety net), then switches. A leave closes each leg on the same proof of its signed end
+    (`end_flush_unconfirmed` at the ceiling). The map and the replacement are a CC reading (rc17)
+    of 5.3.3.2.1–.3, pending text.
+    The dispatcher, and so every leg's `link_seq`, carries on untouched.
+  - Receivers emit `CallEvent::StreamReplaced` from the verified `replaces` only, with no
+    `AttendeeLeft`.
+  - A second stream without `replaces` ends nothing.
+  - PyO3: `join_call(codecs=[...])`, `Call.leave(cause="left"|"backgrounded")`,
+    `Call.replace_stream(codecs=None)`, events `attendee_left` / `stream_replaced`.
 
 - 2026-10-12 — first draft (CIRISEdge#805 items 5–6).
 - 2026-10-12 — persist's P1–P5 answers: an author ADOPTS its own live ciphertext (unkept: no DEK

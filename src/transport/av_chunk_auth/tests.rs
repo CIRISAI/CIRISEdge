@@ -218,6 +218,7 @@ async fn a_member_holding_the_dek_cannot_forge_the_publishers_chunks() {
         codecs: None,
         replaces: None,
         end: None,
+        final_seq: None,
     };
     let (ed, pq) = crate::identity::sign_bound_hybrid(&b, &lie.signed_bytes(), "lie")
         .await
@@ -598,6 +599,7 @@ fn binding_parse_enforces_both_signature_lengths() {
         codecs: None,
         replaces: None,
         end: None,
+        final_seq: None,
     };
     assert!(StreamKeyBinding::from_bytes(&good.to_bytes()).is_ok());
     for len in [1, ML_DSA_65_SIG_LEN - 1, ML_DSA_65_SIG_LEN + 1] {
@@ -630,9 +632,9 @@ fn kat_v2(v2: Option<V2Members>) -> StreamKeyBinding {
         a.copy_from_slice(&v);
         a
     };
-    let (codecs, replaces, end) = match v2 {
-        Some(m) => (Some(m.codecs), m.replaces, m.end),
-        None => (None, None, None),
+    let (codecs, replaces, end, final_seq) = match v2 {
+        Some(m) => (m.codecs, m.replaces, m.end, m.final_seq),
+        None => (None, None, None, None),
     };
     StreamKeyBinding {
         room: "room-kat".to_owned(),
@@ -646,35 +648,39 @@ fn kat_v2(v2: Option<V2Members>) -> StreamKeyBinding {
         codecs,
         replaces,
         end,
+        final_seq,
     }
 }
 
 fn v2m(codecs: CodecMap) -> Option<V2Members> {
     Some(V2Members {
-        codecs,
+        codecs: Some(codecs),
         replaces: None,
         end: None,
+        final_seq: None,
     })
 }
 
-/// KAT — the v2 binding's signed bytes (CC 5.3.3.2.1, rc17 as revised): the
-/// v2 domain, version 2, v1's members 2-7, then the codec map (`u8 count`,
-/// then per class sorted `class u8 ‖ u16_be len ‖ ascii token`), `replaces`
-/// (`u8 present ‖ [stream 32]`) and `end` (`u8`: 0 live, 1 left, 2
-/// backgrounded). Same inputs as [`kat_vectors_are_deterministic`], map
-/// `{0x04: h264, 0xFF: opus}`; a second vector replaces stream `aa`x32 and
-/// ends `left`. The v1 signed bytes of the same inputs are unchanged.
+/// KAT — the v2 binding's signed bytes (CC reading (rc17) of 5.3.3.2.1–.3,
+/// pending text): the v2 domain, version 2, v1's members 2-7, then the codec
+/// map (`u8 count`, then per class sorted `class u8 ‖ u16_be len ‖ ascii
+/// token`), `replaces` (`u8 present ‖ [stream 32]`), `end` (`u8`: 0 live, 1
+/// left, 2 backgrounded) and, with an end, `final_seq u64_be`. Same inputs as
+/// [`kat_vectors_are_deterministic`], map `{0x04: h264, 0xFF: opus}`; a
+/// second vector replaces stream `aa`x32, ends `left`, final_seq 42. The v1
+/// signed bytes of the same inputs are unchanged.
 #[test]
 fn binding_v2_signed_bytes_kat() {
     const V2_SIGNED: &str = "63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0204000468323634ff00046f7075730000";
-    const V2_REPLACES_LEFT: &str = "63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0204000468323634ff00046f70757301aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01";
+    const V2_REPLACES_LEFT: &str = "63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0204000468323634ff00046f70757301aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01000000000000002a";
     let v2 = kat_v2(v2m(av_map()));
     assert_eq!(v2.version(), BINDING_VERSION_V2);
     assert_eq!(hex::encode(v2.signed_bytes()), V2_SIGNED);
     let full = kat_v2(Some(V2Members {
-        codecs: av_map(),
+        codecs: Some(av_map()),
         replaces: Some(StreamId([0xaa; 32])),
         end: Some(SignedEnd::Left),
+        final_seq: Some(42),
     }));
     assert_eq!(hex::encode(full.signed_bytes()), V2_REPLACES_LEFT);
     assert_eq!(
@@ -722,11 +728,12 @@ fn the_codec_map_rules() {
         Err(BindingError::Malformed("codec map size"))
     );
     assert_eq!(
-        av_map().entries(),
-        [
-            (CODEC_TEMPORAL_LAYERED, CodecToken::H264),
-            (CODEC_OPAQUE, CodecToken::Opus)
-        ],
+        av_map()
+            .entries()
+            .iter()
+            .map(|(c, t)| (*c, t.as_str()))
+            .collect::<Vec<_>>(),
+        [(CODEC_TEMPORAL_LAYERED, "h264"), (CODEC_OPAQUE, "opus")],
         "sorted by class"
     );
     let good = kat_v2(v2m(av_map())).to_bytes();
@@ -746,14 +753,32 @@ fn the_codec_map_rules() {
         rewrite(&|w| w[at + 1] = CODEC_OPAQUE),
         Err(BindingError::Malformed("codec class"))
     );
-    // An unregistered token of the same length.
+    // An unregistered token binds (an undecodable class here), and a token
+    // that is not printable ASCII is malformed.
     let tok = good.windows(4).position(|w| w == b"opus").expect("opus");
+    let unknown = rewrite(&|w| w[tok..tok + 4].copy_from_slice(b"flac")).expect("binds");
     assert_eq!(
-        rewrite(&|w| w[tok..tok + 4].copy_from_slice(b"flac")),
-        Err(BindingError::Malformed("codec"))
+        unknown.codecs.map(|m| m.class_codec(CODEC_OPAQUE)),
+        Some(ClassCodec::Undecodable)
     );
-    // A count of zero.
+    assert_eq!(
+        rewrite(&|w| w[tok] = 0x07),
+        Err(BindingError::Malformed("codec token"))
+    );
+    // A count of zero with nothing else to say (no replaces, end 0).
     assert!(rewrite(&|w| w[at] = 0).is_err());
+    // An end statement of a stream that declared no codecs: an empty map.
+    let end_only = kat_v2(Some(V2Members {
+        codecs: None,
+        replaces: None,
+        end: Some(SignedEnd::Backgrounded),
+        final_seq: Some(7),
+    }));
+    assert_eq!(end_only.version(), BINDING_VERSION_V2);
+    assert_eq!(
+        StreamKeyBinding::from_bytes(&end_only.to_bytes()),
+        Ok(end_only)
+    );
     // replaces byte 2, end byte 3 (the last two bytes of the v2 members sit
     // just before the Ed25519 length).
     let tail = at + 1 + (1 + 2 + 4) + (1 + 2 + 4);
@@ -920,4 +945,224 @@ async fn a_chunk_of_a_class_its_map_does_not_name_is_refused() {
     )
     .expect("seal");
     assert!(auth.check(&k1.sign(&inner).expect("sign")).is_ok());
+}
+
+/// CC reading (rc17), pending text: a map naming a codec this build does not
+/// know binds; that class is undecodable here (its chunks dropped and
+/// counted) and the stream's other classes play. `{0x04: <unknown>, 0xFF:
+/// opus}`: audio plays, the 0x04 chunks are dropped.
+#[tokio::test]
+async fn an_unknown_codec_binds_as_an_undecodable_class() {
+    use crate::transport::realtime_av::CODEC_TEMPORAL_LAYERED;
+    let a = signer(A, 1);
+    let keys = Keys::of(&[&a]).await;
+    let auth = ChunkAuth::new(ROOM);
+    let nonce = [9; 32];
+    let stream = call_stream_id(ROOM, A, &nonce);
+    let key = ChunkSigner::generate(stream, Epoch(3)).unwrap();
+    let map = CodecMap::with_entries([
+        (CODEC_TEMPORAL_LAYERED, Token::new("h266-2031").unwrap()),
+        (CODEC_OPAQUE, Token::from(CodecToken::Opus)),
+    ])
+    .expect("an unknown token under its class is a map");
+    let b = StreamKeyBinding::sign_v2(&a, ROOM, nonce, stream, Epoch(3), key.public(), v2m(map))
+        .await
+        .expect("bind");
+    assert!(matches!(
+        auth.accept_binding(&b.to_bytes(), &members(), &keys).await,
+        BindingOutcome::Installed(_)
+    ));
+    let chunk = |seq, codec| {
+        let inner = seal_av_inner(
+            b"frame",
+            &dek(),
+            stream,
+            Epoch(3),
+            ChunkSeq(seq),
+            codec,
+            ChunkLayer::BASE,
+        )
+        .expect("seal");
+        key.sign(&inner).expect("sign")
+    };
+    assert!(auth.check(&chunk(0, CODEC_OPAQUE)).is_ok(), "audio plays");
+    assert_eq!(
+        auth.check(&chunk(1, CODEC_TEMPORAL_LAYERED)).unwrap_err(),
+        ChunkAuthError::ClassUndecodable
+    );
+    assert!(auth.check(&chunk(2, CODEC_OPAQUE)).is_ok());
+    assert_eq!(auth.counts().undecodable, 1, "counted");
+    // A registered token under another class is still malformed.
+    assert_eq!(
+        CodecMap::with_entries([(CODEC_TEMPORAL_LAYERED, Token::from(CodecToken::Opus))]),
+        Err(BindingError::Malformed("codec class"))
+    );
+    // A token longer than 32 bytes is malformed.
+    assert_eq!(
+        Token::new(&"x".repeat(MAX_TOKEN_LEN + 1)),
+        Err(BindingError::Malformed("codec token"))
+    );
+}
+
+/// A stream `nonce` of A's at epoch 3, its key, and a binding of it
+/// (unsigned: these witnesses install directly, as an accepted binding is).
+fn ending_stream(
+    nonce: u8,
+    end: Option<(SignedEnd, u64)>,
+) -> (StreamId, ChunkSigner, StreamKeyBinding) {
+    let n = [nonce; 32];
+    let stream = call_stream_id(ROOM, A, &n);
+    let key = ChunkSigner::generate(stream, Epoch(3)).unwrap();
+    let b = binding_for(stream, n, key.public(), end);
+    (stream, key, b)
+}
+
+fn binding_for(
+    stream: StreamId,
+    nonce: [u8; 32],
+    key: [u8; 32],
+    end: Option<(SignedEnd, u64)>,
+) -> StreamKeyBinding {
+    StreamKeyBinding {
+        room: ROOM.to_owned(),
+        publisher: A.to_owned(),
+        join_nonce: nonce,
+        stream,
+        epoch: Epoch(3),
+        chunk_key: key,
+        sig_ed25519: vec![0u8; 64],
+        sig_ml_dsa_65: vec![0u8; ML_DSA_65_SIG_LEN],
+        codecs: None,
+        replaces: None,
+        end: end.map(|(e, _)| e),
+        final_seq: end.map(|(_, f)| f),
+    }
+}
+
+fn signed_chunk(key: &ChunkSigner, stream: StreamId, seq: u64) -> InnerSealed {
+    key.sign(&seal(stream, 3, seq, b"frame")).expect("sign")
+}
+
+/// CC: `end` is final. After a verified end, a replayed `end = 0` binding of
+/// the stream (in any epoch) is refused `av_binding_stream_ended`; a chunk
+/// past the signed `final_seq` is refused `av_chunk_past_end`, never played;
+/// chunks up to it still verify.
+#[test]
+fn a_signed_end_is_final_and_nothing_past_it_plays() {
+    let auth = ChunkAuth::new(ROOM);
+    let (stream, key, live) = ending_stream(21, None);
+    auth.install(&live, Arc::new(live.to_bytes()))
+        .expect("live");
+    for seq in 0..=4 {
+        assert!(auth.check(&signed_chunk(&key, stream, seq)).is_ok());
+    }
+    let end = binding_for(stream, [21; 32], key.public(), Some((SignedEnd::Left, 4)));
+    auth.install(&end, Arc::new(end.to_bytes()))
+        .expect("the end");
+    assert!(!auth.settle_end(stream), "the tail arrived");
+    assert!(!auth.truncated(stream));
+    assert_eq!(auth.counts().truncated, 0);
+    let mut replay = binding_for(stream, [21; 32], key.public(), None);
+    for epoch in [3, 4] {
+        replay.epoch = Epoch(epoch);
+        let refused = auth.install(&replay, Arc::new(replay.to_bytes()));
+        assert_eq!(refused, Err(BindingError::StreamEnded), "epoch {epoch}");
+        assert_eq!(
+            refused.unwrap_err().refusal().as_str(),
+            "av_binding_stream_ended"
+        );
+    }
+    assert!(
+        auth.check(&signed_chunk(&key, stream, 4)).is_ok(),
+        "up to final_seq"
+    );
+    let past = auth.check(&signed_chunk(&key, stream, 5)).unwrap_err();
+    assert_eq!(past, ChunkAuthError::PastEnd);
+    assert_eq!(past.refusal().as_str(), "av_chunk_past_end");
+    assert_eq!(auth.counts().past_end, 1);
+}
+
+/// CC: a relay that drops the tail before a signed leave is caught: the end
+/// names `final_seq` 9, this receiver verified up to 5 and nothing more came
+/// before the verdict, and it reports the truncation, counted once.
+#[test]
+fn a_dropped_tail_before_a_signed_end_is_reported() {
+    let auth = ChunkAuth::new(ROOM);
+    let (stream, key, live) = ending_stream(22, None);
+    auth.install(&live, Arc::new(live.to_bytes()))
+        .expect("live");
+    for seq in 0..=5 {
+        assert!(auth.check(&signed_chunk(&key, stream, seq)).is_ok());
+    }
+    let end = binding_for(
+        stream,
+        [22; 32],
+        key.public(),
+        Some((SignedEnd::Backgrounded, 9)),
+    );
+    auth.install(&end, Arc::new(end.to_bytes()))
+        .expect("the end");
+    assert!(!auth.truncated(stream), "no verdict before it is settled");
+    assert!(auth.settle_end(stream));
+    assert!(auth.truncated(stream));
+    assert!(auth.settle_end(stream), "the verdict holds");
+    assert_eq!(auth.counts().truncated, 1, "counted once");
+}
+
+/// 45.1 — the tail may land after the end: the end names `final_seq` 9, this
+/// receiver had verified up to 5 when it landed, and 6..=9 arrive after it
+/// (inside the reorder window, before the verdict). They verify and play,
+/// and the verdict is no truncation. A chunk past 9 still is refused.
+#[test]
+fn a_tail_that_lands_after_its_signed_end_is_no_truncation() {
+    let auth = ChunkAuth::new(ROOM);
+    let (stream, key, live) = ending_stream(25, None);
+    auth.install(&live, Arc::new(live.to_bytes()))
+        .expect("live");
+    for seq in 0..=5 {
+        assert!(auth.check(&signed_chunk(&key, stream, seq)).is_ok());
+    }
+    let end = binding_for(stream, [25; 32], key.public(), Some((SignedEnd::Left, 9)));
+    auth.install(&end, Arc::new(end.to_bytes()))
+        .expect("the end");
+    for seq in [7, 6, 9, 8] {
+        assert!(
+            auth.check(&signed_chunk(&key, stream, seq)).is_ok(),
+            "tail chunk {seq} after the end"
+        );
+    }
+    assert_eq!(
+        auth.check(&signed_chunk(&key, stream, 10)).unwrap_err(),
+        ChunkAuthError::PastEnd
+    );
+    assert!(!auth.settle_end(stream));
+    assert!(!auth.truncated(stream));
+    assert_eq!(auth.counts().truncated, 0);
+}
+
+/// CC: an old signed leave replayed after a rejoin does nothing to the new
+/// stream (a rejoin mints a new nonce, so a new stream id): the old end is
+/// refused (it is final) and the new stream stays bound and plays.
+#[test]
+fn an_old_leave_replayed_after_a_rejoin_does_nothing_to_the_new_stream() {
+    let auth = ChunkAuth::new(ROOM);
+    let (old, old_key, live) = ending_stream(23, None);
+    auth.install(&live, Arc::new(live.to_bytes()))
+        .expect("live");
+    let end = binding_for(old, [23; 32], old_key.public(), Some((SignedEnd::Left, 0)));
+    auth.install(&end, Arc::new(end.to_bytes())).expect("left");
+    let (new, new_key, rejoin) = ending_stream(24, None);
+    assert_ne!(old, new);
+    auth.install(&rejoin, Arc::new(rejoin.to_bytes()))
+        .expect("rejoined");
+    assert_eq!(
+        auth.install(&end, Arc::new(end.to_bytes())),
+        Err(BindingError::StreamEnded),
+        "the replay"
+    );
+    assert!(auth.bound(new, Epoch(3)).is_some());
+    for seq in 0..3 {
+        assert!(auth.check(&signed_chunk(&new_key, new, seq)).is_ok());
+    }
+    assert!(!auth.truncated(new));
 }

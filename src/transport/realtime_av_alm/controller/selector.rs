@@ -300,6 +300,13 @@ impl<P: PeerRef> ParentSelector<P> {
         }
     }
 
+    /// When a chunk of the stream last arrived on any path (call ms), if
+    /// ever: what `AttendeeLeft { Lost }` reads as the stream's silence.
+    #[must_use]
+    pub fn last_activity_ms(&self) -> Option<u64> {
+        self.last_activity_ms
+    }
+
     /// The primary parent.
     #[must_use]
     pub fn primary(&self) -> Option<&P> {

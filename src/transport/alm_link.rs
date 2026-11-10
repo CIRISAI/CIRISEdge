@@ -27,6 +27,15 @@ pub struct AvLinkStats {
     pub window: usize,
     /// The Channel window's ceiling.
     pub window_max: usize,
+    /// Channel messages sent and not yet proved delivered (the tx ring).
+    pub tx_ring: usize,
+    /// The newest Channel message's sequence, `None` before the link has a
+    /// Channel (leviculum +ciris.3). Read after a send it is at or after
+    /// that send's: the watermark a leave and a replacement wait on (45.1).
+    pub last_sent_seq: Option<u16>,
+    /// The oldest Channel message still awaiting its delivery proof, `None`
+    /// when every message sent was proved (leviculum +ciris.3).
+    pub oldest_unacked_seq: Option<u16>,
 }
 
 impl AvLinkStats {
@@ -38,6 +47,20 @@ impl AvLinkStats {
             (Some(s), Some(m)) => (s - m as f64).max(0.0),
             _ => 0.0,
         }
+    }
+
+    /// 45.1 — whether the Channel message sent as `seq`, and every one sent
+    /// before it, was proved delivered: nothing is outstanding, or the
+    /// oldest outstanding was sent after `seq` (16-bit serial order; the
+    /// ring never holds more than the window, far below 2^15). The ring is
+    /// send-ordered (leviculum +ciris.3), so later traffic still in flight
+    /// does not hide the proof.
+    #[must_use]
+    pub fn delivered_through(&self, seq: u16) -> bool {
+        self.oldest_unacked_seq.is_none_or(|oldest| {
+            let d = oldest.wrapping_sub(seq);
+            d != 0 && d < 0x8000
+        })
     }
 }
 
@@ -192,5 +215,24 @@ mod tests {
         };
         assert!((st.queue_delay_ms() - 90.0).abs() < 1e-9);
         assert!(AvLinkStats::default().queue_delay_ms().abs() < 1e-9);
+    }
+
+    /// 45.1 — a send is proved once the oldest outstanding message is a
+    /// later one, whatever is still in flight behind it, across the 2^16
+    /// wrap.
+    #[test]
+    fn a_send_is_delivered_once_the_oldest_outstanding_is_later() {
+        let at = |oldest: Option<u16>| AvLinkStats {
+            oldest_unacked_seq: oldest,
+            tx_ring: usize::from(oldest.is_some()) * 30,
+            ..AvLinkStats::default()
+        };
+        assert!(at(None).delivered_through(7), "nothing outstanding");
+        assert!(!at(Some(7)).delivered_through(7), "it is the oldest");
+        assert!(!at(Some(6)).delivered_through(7), "an earlier one is out");
+        assert!(at(Some(8)).delivered_through(7), "media behind it is out");
+        assert!(at(Some(0)).delivered_through(0xFFFF), "across the wrap");
+        assert!(at(Some(3)).delivered_through(0xFFFE));
+        assert!(!at(Some(0xFFFF)).delivered_through(0));
     }
 }

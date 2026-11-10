@@ -50,7 +50,7 @@ use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
 use ciris_edge::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
 use ciris_edge::transport::av_call::{
-    Call, CallDeps, CallOptions, Frame, ReceivedFrame, RoomRoster, REANNOUNCE_PART_GAP,
+    Call, CallDeps, CallEvent, CallOptions, Frame, ReceivedFrame, RoomRoster, REANNOUNCE_PART_GAP,
 };
 use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{AvKeepTarget, StreamDekRegistrar};
@@ -788,6 +788,427 @@ async fn a_v1_peer_behind_a_v2_relay_still_binds_and_hears() {
         "A holds B's v2 map"
     );
     assert_eq!(cc.stream_codecs(cb.stream()), None, "C was sent v1 only");
+}
+
+/// The first event on `rx` that `pick` takes, within `budget`.
+async fn next_event<T>(
+    rx: &mut tokio::sync::mpsc::Receiver<CallEvent>,
+    budget: Duration,
+    mut pick: impl FnMut(&CallEvent) -> Option<T>,
+) -> Option<T> {
+    tokio::time::timeout(budget, async {
+        while let Some(e) = rx.recv().await {
+            if let Some(t) = pick(&e) {
+                return Some(t);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// **Attendance** (45.1): B leaves `backgrounded`, signed, and A reads
+/// `AttendeeLeft { B, Backgrounded }` with B's stream; C is killed (every
+/// leg to it closed, its stream silent, no signed end) and A reads it
+/// `Lost`, and not before `ATTENDEE_LOST_AFTER`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_signed_leave_says_why_and_a_killed_node_is_lost_after_the_bound() {
+    use ciris_edge::transport::av_call::{LeaveCause, ATTENDEE_LOST_AFTER};
+    use ciris_edge::transport::av_chunk_auth::SignedEnd;
+    let _call = one_call().await;
+    let tag = "alm2-attendance";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    let mut cc = join_loaded(c, &groups[2], tag, CallOptions::default(), None).await;
+    for x in [&ca, &cb, &cc] {
+        wait_legs(x, 2).await;
+        wait_bound(x, 2).await;
+    }
+    let mut events = ca.events().expect("A's events");
+    for seq in 0..10u64 {
+        for (who, x) in [("b", &mut cb), ("c", &mut cc)] {
+            x.publish(Frame::opaque(body(who, seq)))
+                .await
+                .expect("publish");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let b_stream = cb.stream();
+    let c_stream = cc.stream();
+    let _ = cb
+        .leave_with(SignedEnd::Backgrounded)
+        .await
+        .expect("B leaves");
+    let left = next_event(&mut events, Duration::from_secs(30), |e| match e {
+        CallEvent::AttendeeLeft {
+            key_id,
+            stream,
+            cause,
+            ..
+        } if *key_id == b.key.key_id => Some((*stream, *cause)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        left,
+        Some((b_stream, LeaveCause::Backgrounded)),
+        "a signed leave says why"
+    );
+    // Kill C: every leg to it closed, nothing more from it.
+    cc.close_leg_for_test(&a.key.key_id).await;
+    ca.close_leg_for_test(&c.key.key_id).await;
+    drop(cc);
+    let killed = tokio::time::Instant::now();
+    let mut seq = 100u64;
+    let lost = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            // A keeps publishing, so its own leg to C is found gone.
+            let _ = ca.publish(Frame::opaque(body("a", seq))).await;
+            seq += 1;
+            while let Ok(e) = events.try_recv() {
+                if let CallEvent::AttendeeLeft {
+                    key_id,
+                    stream,
+                    cause,
+                    ..
+                } = e
+                {
+                    if key_id == c.key.key_id {
+                        return (stream, cause, killed.elapsed());
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("A reads C as left");
+    assert_eq!((lost.0, lost.1), (c_stream, LeaveCause::Lost));
+    assert!(
+        lost.2 >= ATTENDEE_LOST_AFTER,
+        "Lost only after the bound: {:?}",
+        lost.2
+    );
+    assert_eq!(
+        av(&b.metrics, "end_flush_unconfirmed"),
+        0,
+        "B's leave closed every leg on its Channel's proof, not the ceiling"
+    );
+}
+
+/// **Removed** (45.1): the room's MLS group drops C's key; A's call rolls
+/// and reads `AttendeeLeft { C, Removed }`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_removed_member_is_attendee_left_removed() {
+    use ciris_edge::transport::av_call::LeaveCause;
+    let _call = one_call().await;
+    let tag = "alm2-removed";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let _cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    let mut cc = join_loaded(c, &groups[2], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 2).await;
+    wait_bound(&ca, 2).await;
+    let c_stream = cc.stream();
+    let mut events = ca.events().expect("A's events");
+    // C attends: A hears its chunks (a binding alone is no presence).
+    let mut frames = ca.frames().expect("A's frames");
+    let mut heard_c = false;
+    for seq in 0..200u64 {
+        cc.publish(Frame::opaque(body("c", seq)))
+            .await
+            .expect("C publishes");
+        while let Ok(f) = frames.try_recv() {
+            heard_c |= f.publisher == c.key.key_id;
+        }
+        if heard_c {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(heard_c, "A hears C before the removal");
+    let rm = groups[0]
+        .remove_member(&c.key.key_id)
+        .await
+        .expect("remove C");
+    let _ = groups[1]
+        .apply_remote_commit(rm.commit())
+        .await
+        .expect("B applies");
+    let mut got = None;
+    for seq in 0..200u64 {
+        let _ = ca.publish(Frame::opaque(body("a", seq))).await;
+        while let Ok(e) = events.try_recv() {
+            if let CallEvent::AttendeeLeft {
+                key_id,
+                stream,
+                cause,
+                ..
+            } = e
+            {
+                if key_id == c.key.key_id {
+                    got = Some((stream, cause));
+                }
+            }
+        }
+        if got.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(got, Some((c_stream, LeaveCause::Removed)));
+}
+
+/// **Replace in place** (45.1): B replaces its stream mid-call while it keeps
+/// publishing. A reads `StreamReplaced { B, old, new }` and no
+/// `AttendeeLeft` for B, and hears every one of B's frames, old stream and
+/// new, across the swap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_replaced_stream_carries_on_with_no_leave() {
+    let _call = one_call().await;
+    let tag = "alm2-replace";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    wait_bound(&ca, 1).await;
+    let mut events = ca.events().expect("A's events");
+    let mut frames = ca.frames().expect("A's frames");
+    let old = cb.stream();
+    let mut sent = Vec::new();
+    for seq in 0..200u64 {
+        if seq == 80 {
+            let new = cb.replace_stream(None).await.expect("replace");
+            assert_ne!(new, old);
+        }
+        let f = body("b", seq);
+        cb.publish(Frame::opaque(f.clone())).await.expect("publish");
+        sent.push(f);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let new = cb.stream();
+    assert_ne!(new, old, "B publishes the new stream");
+    let mut heard = std::collections::BTreeSet::new();
+    let _ = tokio::time::timeout(Duration::from_secs(20), async {
+        while heard.len() < sent.len() {
+            match frames.recv().await {
+                Some(f) if f.publisher == b.key.key_id => {
+                    heard.insert(f.bytes);
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    })
+    .await;
+    let missing: Vec<usize> = sent
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !heard.contains(*f))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "frames missing across the swap: {missing:?}"
+    );
+    let mut replaced = None;
+    let mut left = false;
+    while let Ok(e) = events.try_recv() {
+        match e {
+            CallEvent::StreamReplaced {
+                publisher,
+                old: o,
+                new: n,
+            } if publisher == b.key.key_id => replaced = Some((o, n)),
+            CallEvent::AttendeeLeft { key_id, .. } if key_id == b.key.key_id => left = true,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        replaced,
+        Some((old, new)),
+        "StreamReplaced, from B's signed binding"
+    );
+    assert!(!left, "a replacement is not a leave");
+    assert_eq!(
+        av(&b.metrics, "replace_switch_unconfirmed"),
+        0,
+        "B switched on its legs' delivery proof, not the ceiling"
+    );
+}
+
+/// 30 Hz video, each frame several chunks back to back: what keeps a leg's
+/// Channel busy while a leave or a replacement waits on its proof (45.1).
+const VIDEO_TICK: Duration = Duration::from_millis(33);
+const CHUNKS_PER_VIDEO_FRAME: u64 = 6;
+
+/// One 30 Hz video frame's chunks from `call`, send errors ignored (a busy
+/// window is the point, not a failure).
+async fn video_frame(call: &mut Call, who: &str, frame: u64) {
+    for k in 0..CHUNKS_PER_VIDEO_FRAME {
+        let _ = call
+            .publish(Frame::opaque(body(who, frame * CHUNKS_PER_VIDEO_FRAME + k)))
+            .await;
+    }
+}
+
+/// **A replacement under video is proved per message** (45.1): B replaces its
+/// stream while it keeps sending 30 Hz video (six chunks a frame), so B's leg
+/// to A always has media in flight. The switch waits on the new bindings'
+/// own delivery proof (their Channel sequence), not an empty tx ring, so it
+/// never falls to the ceiling: `replace_switch_unconfirmed` stays 0, and A
+/// reads `StreamReplaced` and no leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_replacement_under_video_is_proved_by_its_own_delivery() {
+    let _call = one_call().await;
+    let tag = "alm2-replace-video";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    wait_bound(&ca, 1).await;
+    let mut events = ca.events().expect("A's events");
+    let old = cb.stream();
+    for frame in 0..120u64 {
+        if frame == 30 {
+            let new = cb.replace_stream(None).await.expect("replace");
+            assert_ne!(new, old);
+        }
+        video_frame(&mut cb, "b", frame).await;
+        tokio::time::sleep(VIDEO_TICK).await;
+    }
+    let new = cb.stream();
+    assert_ne!(new, old, "B publishes the new stream");
+    let replaced = next_event(&mut events, Duration::from_secs(10), |e| match e {
+        CallEvent::StreamReplaced {
+            publisher,
+            old: o,
+            new: n,
+        } if *publisher == b.key.key_id => Some((*o, *n)),
+        CallEvent::AttendeeLeft { key_id, .. } if *key_id == b.key.key_id => {
+            panic!("a replacement is not a leave")
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(replaced, Some((old, new)));
+    assert_eq!(
+        av(&b.metrics, "replace_switch_unconfirmed"),
+        0,
+        "the switch waited on the bindings' own proof, with video in flight"
+    );
+}
+
+/// **A relay's leave under forwarded video is proved per message** (45.1): A
+/// relays B's 30 Hz video to C (B and C share no leg), and A leaves while B
+/// keeps sending, so A's leg to C always has forwarded media in flight. Each
+/// leg closes on the signed end's own delivery proof, never the ceiling:
+/// `end_flush_unconfirmed` stays 0, and C reads `AttendeeLeft { A, Left }`.
+// a, b, c, t: the nodes as the roster witness names them.
+#[allow(clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_relay_leaving_under_forwarded_video_proves_its_end_per_message() {
+    use ciris_edge::transport::av_call::LeaveCause;
+    use ciris_edge::transport::av_chunk_auth::SignedEnd;
+    let _call = one_call().await;
+    let tag = "alm2-leave-video";
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        4,
+        3,
+        &[(0, 1), (0, 2), (0, 3), (1, 3), (2, 3)],
+        Some(3),
+    )
+    .await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let mut ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    let mut cc = join_loaded(c, &groups[2], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 2).await;
+    wait_legs(&cb, 1).await;
+    wait_legs(&cc, 1).await;
+    let b_stream = cb.stream();
+    assert!(
+        wait_until(Duration::from_secs(90), || async {
+            primary_for(&cc, b_stream).as_deref() == Some(a.key.key_id.as_str())
+        })
+        .await,
+        "C hears B through A: {:?}; A's log {:?}",
+        cc.alm_parents(),
+        ca.alm_log()
+    );
+    let mut events = cc.events().expect("C's events");
+    // A attends (C hears its chunks: a binding alone is no presence).
+    let mut frames = cc.frames().expect("C's frames");
+    let mut heard_a = false;
+    for seq in 0..200u64 {
+        ca.publish(Frame::opaque(body("a", seq)))
+            .await
+            .expect("A publishes");
+        while let Ok(f) = frames.try_recv() {
+            heard_a |= f.publisher == a.key.key_id;
+        }
+        if heard_a {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(heard_a, "C hears A before it leaves");
+    // B's video runs until told to stop, through A to C.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let video = {
+        let stop = Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut frame = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                video_frame(&mut cb, "b", frame).await;
+                frame += 1;
+                tokio::time::sleep(VIDEO_TICK).await;
+            }
+            cb
+        })
+    };
+    let forwarded_before = ca.alm_counts().forwarded;
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            ca.alm_counts().forwarded >= forwarded_before + 60
+        })
+        .await,
+        "A forwards B's video to C: {} forwarded",
+        ca.alm_counts().forwarded - forwarded_before
+    );
+    let _ = ca.leave_with(SignedEnd::Left).await.expect("A leaves");
+    let left = next_event(&mut events, Duration::from_secs(30), |e| match e {
+        CallEvent::AttendeeLeft {
+            key_id,
+            cause,
+            truncated,
+            ..
+        } if *key_id == a.key.key_id => Some((*cause, *truncated)),
+        _ => None,
+    })
+    .await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _cb = video.await.expect("B's video task");
+    assert_eq!(
+        left,
+        Some((LeaveCause::Left, false)),
+        "a signed leave, whole"
+    );
+    assert_eq!(
+        av(&a.metrics, "end_flush_unconfirmed"),
+        0,
+        "every leg closed on the end's own proof, with video in flight"
+    );
 }
 
 /// **Per-leg stats** (45.1): every leg a call reports names what carries it

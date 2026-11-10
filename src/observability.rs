@@ -1015,6 +1015,15 @@ pub const AV_CHUNK_DROPPED_CONGESTED: &str = "av_chunk_dropped_congested";
 pub const AV_LEG_SHED_TO_BASE: &str = "av_leg_shed_to_base";
 /// ALM C5 — a leg restored from the base layer after clean sends.
 pub const AV_LEG_RESTORED: &str = "av_leg_restored";
+/// 45.1 — a leg whose Channel did not prove the signed end delivered before
+/// the leave's ceiling ([`crate::transport::av_call::END_FLUSH_CEILING`]): it
+/// closed anyway.
+pub const AV_CALL_END_FLUSH_UNCONFIRMED: &str = "end_flush_unconfirmed";
+/// 45.1 — a leg whose Channel did not prove the replacement's binding
+/// delivered before the switch's ceiling: the switch went anyway.
+pub const AV_CALL_REPLACE_SWITCH_UNCONFIRMED: &str = "replace_switch_unconfirmed";
+/// 45.1 — a signed end whose `final_seq` this node never received up to.
+pub const AV_CALL_STREAM_TRUNCATED: &str = "av_call_stream_truncated";
 /// ALM C3 — a control frame sent / received / refused as malformed.
 pub const ALM_C3_SENT: &str = "alm_c3_sent";
 /// ALM C3 — a control frame that could not be sent to its member.
@@ -2161,6 +2170,9 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_CHUNK_DROPPED_CONGESTED,
     AV_LEG_SHED_TO_BASE,
     AV_LEG_RESTORED,
+    AV_CALL_END_FLUSH_UNCONFIRMED,
+    AV_CALL_REPLACE_SWITCH_UNCONFIRMED,
+    AV_CALL_STREAM_TRUNCATED,
     ALM_C3_SENT,
     ALM_C3_SEND_FAILED,
     ALM_C3_RESENT,

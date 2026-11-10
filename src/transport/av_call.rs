@@ -84,7 +84,8 @@
 //!   the chunks that a receiver can tell apart from a chunk mid-stream, which
 //!   this cut does not define;
 //! - the epoch's terminator (`seal_av_terminator`, #846 part 2): it does not
-//!   exist on this base.
+//!   exist on this base. A leaver's signed end rides the v2 stream key
+//!   binding instead (`end`, 45.1; [`Call::leave_with`]).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -378,6 +379,209 @@ pub enum CallEvent {
         /// `0`, `1` or `2`.
         tier: u8,
     },
+    /// 45.1 — an attendee's stream left the call: once per (attendee,
+    /// stream). `Left` and `Backgrounded` come only from the attendee's own
+    /// signed end of its stream; `Removed` from the room's MLS group dropping
+    /// its key; `Lost` from every leg to it gone and its stream silent past
+    /// [`ATTENDEE_LOST_AFTER`] with no signed end seen. A replacement
+    /// ([`CallEvent::StreamReplaced`]) is not a leave.
+    AttendeeLeft {
+        /// The attendee.
+        key_id: String,
+        /// Its stream that ended.
+        stream: StreamId,
+        /// Why.
+        cause: LeaveCause,
+        /// Its signed end named a `final_seq` this node never received up
+        /// to: the tail was dropped on the way (counted
+        /// `av_call_stream_truncated`).
+        truncated: bool,
+    },
+    /// 45.1 — `publisher` replaced its stream in place (`Call::replace_stream`
+    /// there): `new` carries on what `old` was, with no leave. Only from the
+    /// publisher's signed `replaces` on `new`'s binding.
+    StreamReplaced {
+        /// The publisher.
+        publisher: String,
+        /// Its stream that ended.
+        old: StreamId,
+        /// The stream in its place.
+        new: StreamId,
+    },
+}
+
+/// Why an attendee left ([`CallEvent::AttendeeLeft`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LeaveCause {
+    /// It said so, signed: it left the call.
+    Left,
+    /// It said so, signed: its app went to the background.
+    Backgrounded,
+    /// Its key left the room's MLS group.
+    Removed,
+    /// Every leg to it went away and its stream went silent past
+    /// [`ATTENDEE_LOST_AFTER`], with no signed end.
+    Lost,
+}
+
+impl LeaveCause {
+    /// The stable token: `left`, `backgrounded`, `removed`, `lost`.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Backgrounded => "backgrounded",
+            Self::Removed => "removed",
+            Self::Lost => "lost",
+        }
+    }
+}
+
+impl From<crate::transport::av_chunk_auth::SignedEnd> for LeaveCause {
+    fn from(e: crate::transport::av_chunk_auth::SignedEnd) -> Self {
+        match e {
+            crate::transport::av_chunk_auth::SignedEnd::Left => Self::Left,
+            crate::transport::av_chunk_auth::SignedEnd::Backgrounded => Self::Backgrounded,
+        }
+    }
+}
+
+/// How long an attendee with no leg and a silent stream waits before it is
+/// `Lost`: the depth-0 parent `Down` bound (`down_silence_ms`, 5 s).
+pub const ATTENDEE_LOST_AFTER: Duration = Duration::from_secs(5);
+
+/// The safety net on a replacement's make-before-break: the switch waits for
+/// every leg's Channel to prove the new stream's binding delivered (that
+/// message itself, by its sequence, with media still in flight behind it;
+/// a datagram leg's Channel included), and goes at
+/// this ceiling only for a leg that never does (counted
+/// `replace_switch_unconfirmed`).
+pub const REPLACE_SWITCH_CEILING: Duration = Duration::from_secs(3);
+
+/// The safety net on a leave: each leg closes once its Channel proved the
+/// signed end delivered, and at this ceiling only when it never does (counted
+/// `end_flush_unconfirmed`).
+pub const END_FLUSH_CEILING: Duration = Duration::from_secs(2);
+
+/// How often a delivery wait reads the legs' Channel stats.
+const DELIVERY_POLL: Duration = Duration::from_millis(10);
+
+/// The call's view of who attends with which stream (45.1).
+#[derive(Debug, Default)]
+struct Attendance {
+    /// Each attendee's current stream, from its verified bindings.
+    streams: HashMap<String, StreamId>,
+    /// `(attendee, stream)` pairs that have ended (left or replaced): each
+    /// fires once.
+    ended: std::collections::HashSet<(String, StreamId)>,
+    /// Since when no leg to the attendee has been up.
+    unlinked_since: HashMap<String, Instant>,
+    /// Signed ends verified but not yet settled, with when each landed: the
+    /// truncation verdict waits [`END_VERDICT_AFTER`] for tail chunks still
+    /// in flight.
+    ending: Vec<(StreamKeyBinding, Instant)>,
+}
+
+/// 45.1 — how long after a signed end lands its truncation verdict waits:
+/// the longest reorder window, so a tail chunk up to `final_seq` that the
+/// window would still have played is not reported missing.
+pub const END_VERDICT_AFTER: Duration = REORDER_WINDOW_MAX;
+
+impl Attendance {
+    /// One installed (so verified) binding's word on attendance, from its
+    /// signed fields only:
+    /// - a signed `end`: the attendee left, for that cause;
+    /// - a signed `replaces` of a stream the same publisher's verified
+    ///   binding named (`old_publisher`): the old stream replaced in place,
+    ///   with no leave;
+    /// - anything else: the attendee's current stream (a second concurrent
+    ///   stream without `replaces` ends nothing).
+    ///
+    /// This node's own bindings (`own`) say nothing here.
+    /// `present`: this node verified a chunk of `b.stream` (a binding alone is
+    /// no presence); `truncated`: its signed end's tail never fully arrived.
+    fn on_bound(
+        &mut self,
+        own: &str,
+        b: &StreamKeyBinding,
+        old_publisher: Option<&str>,
+        present: bool,
+        truncated: bool,
+    ) -> Vec<CallEvent> {
+        if b.publisher == own {
+            return Vec::new();
+        }
+        if let Some(end) = b.end {
+            return self
+                .left(&b.publisher, b.stream, end.into(), present, truncated)
+                .into_iter()
+                .collect();
+        }
+        if let Some(old) = b.replaces.filter(|old| *old != b.stream) {
+            if old_publisher == Some(b.publisher.as_str()) {
+                self.streams.insert(b.publisher.clone(), b.stream);
+                if self.ended.insert((b.publisher.clone(), old)) {
+                    return vec![CallEvent::StreamReplaced {
+                        publisher: b.publisher.clone(),
+                        old,
+                        new: b.stream,
+                    }];
+                }
+                return Vec::new();
+            }
+        }
+        if !self.ended.contains(&(b.publisher.clone(), b.stream)) {
+            self.streams.insert(b.publisher.clone(), b.stream);
+        }
+        Vec::new()
+    }
+
+    /// Hold `b`'s signed end until its verdict is due ([`Self::due_ends`]).
+    fn defer_end(&mut self, b: &StreamKeyBinding, now: Instant) {
+        self.ending.push((b.clone(), now));
+    }
+
+    /// The held ends whose verdict is due at `now`, oldest first.
+    fn due_ends(&mut self, now: Instant) -> Vec<StreamKeyBinding> {
+        let (due, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ending)
+            .into_iter()
+            .partition(|(_, at)| now.duration_since(*at) >= END_VERDICT_AFTER);
+        self.ending = wait;
+        due.into_iter().map(|(b, _)| b).collect()
+    }
+
+    /// `key_id`'s `stream` left for `cause`: the event the first time only,
+    /// and only for a stream this node heard (`present`): an attendee is one
+    /// whose chunks arrived, never one a binding alone names. A stream never
+    /// heard is still marked ended, so it never fires later.
+    fn left(
+        &mut self,
+        key_id: &str,
+        stream: StreamId,
+        cause: LeaveCause,
+        present: bool,
+        truncated: bool,
+    ) -> Option<CallEvent> {
+        let first = self.ended.insert((key_id.to_owned(), stream));
+        if self.streams.get(key_id) == Some(&stream) {
+            self.streams.remove(key_id);
+            self.unlinked_since.remove(key_id);
+        }
+        (first && present).then(|| CallEvent::AttendeeLeft {
+            key_id: key_id.to_owned(),
+            stream,
+            cause,
+            truncated,
+        })
+    }
+}
+
+/// A replacement minted and bound, waiting for its bindings' delivery.
+struct PendingReplace {
+    own_key: OwnChunkKey,
+    dek: crate::transport::realtime_av::EpochDek,
+    /// Every leg proved the bindings delivered (or the ceiling passed).
+    ready: Arc<AtomicBool>,
 }
 
 /// Why a call verb was refused (§8).
@@ -1229,7 +1433,6 @@ struct Shared {
     own: String,
     scope: CohortScope,
     group_id: String,
-    stream: StreamId,
     opts: CallOptions,
     room_group: CohortGroup,
     transport: Arc<ReticulumTransport>,
@@ -1276,15 +1479,18 @@ struct Shared {
     /// The one `RecordRefused` has fired.
     record_refused: AtomicBool,
     id: CallId,
-    /// The nonce this join's stream id was derived from (its binding names it).
-    join_nonce: [u8; 32],
     /// The federation signer that binds this stream's chunk keys.
     signer: Arc<crate::identity::LocalSigner>,
     /// Verifies other publishers' bindings.
     verifier: Arc<dyn StreamKeyVerifier>,
-    /// This stream's chunk key for the publisher's current epoch, and its
-    /// binding. Replaced only under the publisher lock, at the roll.
+    /// This node's stream, its chunk key for the publisher's current epoch,
+    /// and its bindings. Replaced only under the publisher lock, at the roll
+    /// and at `Call::replace_stream`.
     own_key: StdMutex<OwnChunkKey>,
+    /// 45.1 — who attends with which stream; what `AttendeeLeft` fires from.
+    attendance: StdMutex<Attendance>,
+    /// 45.1 — a `replace_stream` waiting for its bindings' delivery.
+    pending_replace: StdMutex<Option<PendingReplace>>,
     /// The other streams' bound chunk keys.
     auth: ChunkAuth,
     /// ALM stage 2 — the call's controller state (C1–C7 over C3).
@@ -1312,17 +1518,29 @@ struct Shared {
     test_fail_c3: AtomicU64,
 }
 
-/// This stream's chunk key at one epoch and its binding's encodings.
+/// This node's stream (it changes only at `Call::replace_stream`), its chunk
+/// key at one epoch, and its binding's encodings.
 struct OwnChunkKey {
     signer: ChunkSigner,
     /// The v1 binding (every peer).
     wire: Arc<Vec<u8>>,
-    /// The v2 binding naming the codec, when the host declared one (only to
-    /// peers with `CAP_BINDING_V2`).
+    /// The v2 binding (codec map, `replaces`), when the host declared codecs
+    /// or the stream replaced another (only to peers with `CAP_BINDING_V2`).
     wire_v2: Option<Arc<Vec<u8>>>,
+    /// The stream.
+    stream: StreamId,
+    /// The nonce the stream id was derived from (its binding names it).
+    join_nonce: [u8; 32],
+    /// The stream this one replaced in place, if any: every epoch's v2
+    /// binding says so, signed.
+    replaces: Option<StreamId>,
+    /// The stream's codec map (fixed for its life).
+    codecs: Option<crate::transport::av_chunk_auth::CodecMap>,
 }
 
-/// Mint this stream's chunk key for `epoch` and bind it.
+/// Mint this stream's chunk key for `epoch` and bind it: a v1 binding, and a
+/// v2 one when there is a codec map or a replacement to state.
+#[allow(clippy::too_many_arguments)]
 async fn mint_own_key(
     signer: &crate::identity::LocalSigner,
     room: &str,
@@ -1330,14 +1548,15 @@ async fn mint_own_key(
     stream: StreamId,
     epoch: Epoch,
     codecs: Option<crate::transport::av_chunk_auth::CodecMap>,
+    replaces: Option<StreamId>,
 ) -> Result<OwnChunkKey, CallError> {
     let key =
         ChunkSigner::generate(stream, epoch).map_err(|e| CallError::Plumbing(e.to_string()))?;
     let binding = StreamKeyBinding::sign(signer, room, join_nonce, stream, epoch, key.public())
         .await
         .map_err(|e| CallError::Plumbing(e.to_string()))?;
-    let wire_v2 = match codecs {
-        Some(codecs) => Some(Arc::new(
+    let wire_v2 = if codecs.is_some() || replaces.is_some() {
+        Some(Arc::new(
             StreamKeyBinding::sign_v2(
                 signer,
                 room,
@@ -1347,26 +1566,83 @@ async fn mint_own_key(
                 key.public(),
                 Some(crate::transport::av_chunk_auth::V2Members {
                     codecs,
-                    replaces: None,
+                    replaces,
                     end: None,
+                    final_seq: None,
                 }),
             )
             .await
             .map_err(|e| CallError::Plumbing(e.to_string()))?
             .to_bytes(),
-        )),
-        None => None,
+        ))
+    } else {
+        None
     };
     Ok(OwnChunkKey {
         signer: key,
         wire: Arc::new(binding.to_bytes()),
         wire_v2,
+        stream,
+        join_nonce,
+        replaces,
+        codecs,
     })
+}
+
+/// The publisher's signed end of its stream at the current epoch, under the
+/// current chunk key (45.1): a v2 binding with `end` set, the one thing a
+/// receiver turns into `AttendeeLeft { Left | Backgrounded }`.
+async fn sign_end(
+    shared: &Shared,
+    end: crate::transport::av_chunk_auth::SignedEnd,
+) -> Result<Arc<Vec<u8>>, CallError> {
+    // The last chunk_seq this epoch sealed: 5.3.3.1's terminator's job.
+    let final_seq = shared
+        .publisher
+        .lock()
+        .await
+        .next_chunk_seq()
+        .0
+        .checked_sub(1)
+        .unwrap_or(crate::transport::av_chunk_auth::FINAL_SEQ_NONE);
+    let (stream, join_nonce, key, epoch, replaces, codecs) = {
+        let k = Shared::lock(&shared.own_key);
+        (
+            k.stream,
+            k.join_nonce,
+            k.signer.public(),
+            k.signer.epoch(),
+            k.replaces,
+            k.codecs,
+        )
+    };
+    let b = StreamKeyBinding::sign_v2(
+        &shared.signer,
+        &shared.room,
+        join_nonce,
+        stream,
+        epoch,
+        key,
+        Some(crate::transport::av_chunk_auth::V2Members {
+            codecs,
+            replaces,
+            end: Some(end),
+            final_seq: Some(final_seq),
+        }),
+    )
+    .await
+    .map_err(|e| CallError::Plumbing(e.to_string()))?;
+    Ok(Arc::new(b.to_bytes()))
 }
 
 impl Shared {
     fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
         m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// This node's stream now.
+    fn stream(&self) -> StreamId {
+        Self::lock(&self.own_key).stream
     }
 
     fn emit(&self, event: CallEvent) {
@@ -1443,7 +1719,7 @@ impl std::fmt::Debug for Call {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Call")
             .field("room", &self.shared.room)
-            .field("stream", &self.shared.stream)
+            .field("stream", &self.shared.stream())
             .finish_non_exhaustive()
     }
 }
@@ -1513,7 +1789,8 @@ impl Call {
         };
         let (stream, join_nonce, epoch, publisher, keep) =
             start_stream(room, own_key_id, &room_group, opts.keep, registrar, events).await?;
-        let own_key = mint_own_key(&signer, room, join_nonce, stream, epoch, opts.codecs).await?;
+        let own_key =
+            mint_own_key(&signer, room, join_nonce, stream, epoch, opts.codecs, None).await?;
 
         // Addresses: the call's group, from the room's destination secret at
         // the room's epoch, for the room's members.
@@ -1544,7 +1821,6 @@ impl Call {
             own: own_key_id.to_owned(),
             scope,
             group_id,
-            stream,
             opts,
             room_group: room_group.clone(),
             transport,
@@ -1576,10 +1852,11 @@ impl Call {
             attendees_known: StdMutex::new(std::collections::BTreeSet::new()),
             record_refused: AtomicBool::new(false),
             id,
-            join_nonce,
             signer,
             verifier,
             own_key: StdMutex::new(own_key),
+            attendance: StdMutex::new(Attendance::default()),
+            pending_replace: StdMutex::new(None),
             auth: ChunkAuth::new(room),
             alm: StdMutex::new({
                 let mut a =
@@ -1653,7 +1930,7 @@ impl Call {
     /// This node's stream.
     #[must_use]
     pub fn stream(&self) -> StreamId {
-        self.shared.stream
+        self.shared.stream()
     }
 
     /// The call's epoch: the room's, as this stream last rolled to it.
@@ -1879,6 +2156,7 @@ impl Call {
             return Err(CallError::CallEnded(cause));
         }
         roll_if_moved(&self.shared).await?;
+        apply_pending_replace(&self.shared, false).await?;
         if let CallState::Ended(cause) = self.state() {
             return Err(CallError::CallEnded(cause));
         }
@@ -2108,14 +2386,153 @@ impl Call {
         *Shared::lock(&self.counts)
     }
 
-    /// **Hang up** (§7: an in-room hang-up writes nothing): close this
-    /// node's legs, stop listening at the call's addresses, end.
+    /// 45.1 — **replace this node's stream in place** (a codec change, say):
+    /// a fresh join nonce and stream within the same membership, bound first
+    /// and switched to once every leg's Channel proved them delivered
+    /// (ceiling [`REPLACE_SWITCH_CEILING`]; make-before-break: the old
+    /// stream carries on meanwhile), then the old one stops. Its v2 binding
+    /// says `replaces: <old>` under the publisher's signature, the only way a
+    /// receiver learns it ([`CallEvent::StreamReplaced`], no leave). `codecs`
+    /// is the new stream's map (`None`: the old one's). The four-newest-
+    /// streams rule bounds it at receivers. Returns the new stream.
+    ///
+    /// # Errors
+    /// [`CallError::CallEnded`]; [`CallError::RoomGroupUnavailable`] when the
+    /// new stream's DEK cannot be derived; [`CallError::Plumbing`].
+    pub async fn replace_stream(
+        &mut self,
+        codecs: Option<crate::transport::av_chunk_auth::CodecMap>,
+    ) -> Result<StreamId, CallError> {
+        if let CallState::Ended(cause) = self.state() {
+            return Err(CallError::CallEnded(cause));
+        }
+        let shared = Arc::clone(&self.shared);
+        // One replacement at a time: a second one first lands the first.
+        apply_pending_replace(&shared, true).await?;
+        let mut publisher = shared.publisher.lock().await;
+        let epoch = publisher.epoch();
+        let (old, codecs) = {
+            let k = Shared::lock(&shared.own_key);
+            (k.stream, codecs.or(k.codecs))
+        };
+        let (join_nonce, stream) = fresh_stream(&shared.room, &shared.own)?;
+        let dek = stream_epoch_dek(&shared.room_group, stream, epoch)
+            .await
+            .map_err(|e| CallError::RoomGroupUnavailable {
+                room: shared.room.clone(),
+                detail: e.to_string(),
+            })?;
+        let own_key = mint_own_key(
+            &shared.signer,
+            &shared.room,
+            join_nonce,
+            stream,
+            epoch,
+            codecs,
+            Some(old),
+        )
+        .await?;
+        // Make: every leg learns the new stream's key (v1), and every leg that
+        // parses v2 its `replaces`, before its first chunk.
+        let wire = Arc::clone(&own_key.wire);
+        let wire_v2 = own_key.wire_v2.clone();
+        publisher
+            .dispatcher_mut()
+            .send_control_report(&[], &|limit| StreamKeyBinding::parts(&wire, limit))
+            .await;
+        if let Some(v2) = &wire_v2 {
+            let not_v2 = {
+                let legs = publisher.dispatcher_mut().subscriber_ids();
+                let a = Shared::lock(&shared.alm);
+                legs.into_iter()
+                    .filter(|l| !a.takes_binding_v2(l))
+                    .collect::<Vec<_>>()
+            };
+            publisher
+                .dispatcher_mut()
+                .send_control_report(&not_v2, &|limit| StreamKeyBinding::parts(v2, limit))
+                .await;
+        }
+        drop(publisher);
+        // Break, once every leg's Channel proved the bindings delivered (the
+        // old stream publishing meanwhile): publish and the watch tick
+        // switch when `ready` is set.
+        let ready = Arc::new(AtomicBool::new(false));
+        *Shared::lock(&shared.pending_replace) = Some(PendingReplace {
+            own_key,
+            dek,
+            ready: Arc::clone(&ready),
+        });
+        let legs: Vec<[u8; 16]> = Shared::lock(&shared.out_legs)
+            .values()
+            .map(|l| l.link_id)
+            .collect();
+        let marks = channel_marks(&shared, &legs);
+        let s = Arc::clone(&shared);
+        tokio::spawn(async move {
+            let unconfirmed = await_delivered(&s, &marks, REPLACE_SWITCH_CEILING).await;
+            for _ in 0..unconfirmed {
+                s.count(crate::observability::AV_CALL_REPLACE_SWITCH_UNCONFIRMED);
+            }
+            ready.store(true, Ordering::Release);
+            let _ = apply_pending_replace(&s, false).await;
+        });
+        Ok(stream)
+    }
+
+    /// **Hang up** (§7: an in-room hang-up writes nothing): the signed end of this
+    /// node's stream (`Left`, see [`Self::leave_with`]), then close its legs,
+    /// stop listening at the call's addresses, end.
     ///
     /// # Errors
     /// [`CallError::CallEnded`] when it already ended.
-    pub async fn leave(mut self) -> Result<CallSummary, CallError> {
+    pub async fn leave(self) -> Result<CallSummary, CallError> {
+        self.leave_with(crate::transport::av_chunk_auth::SignedEnd::Left)
+            .await
+    }
+
+    /// 45.1 — [`Self::leave`], saying why: the publisher's signed end of its
+    /// stream (a v2 binding with `end`, the one thing a receiver turns into
+    /// [`CallEvent::AttendeeLeft`] `Left` / `Backgrounded`) goes to every leg
+    /// whose peer parses v2 bindings, then the legs close. A peer that does
+    /// not parse v2 sees the attendee `Lost` once [`ATTENDEE_LOST_AFTER`]
+    /// passes.
+    ///
+    /// # Errors
+    /// As [`Self::leave`].
+    pub async fn leave_with(
+        mut self,
+        why: crate::transport::av_chunk_auth::SignedEnd,
+    ) -> Result<CallSummary, CallError> {
         if let CallState::Ended(cause) = self.state() {
             return Err(CallError::CallEnded(cause));
+        }
+        match sign_end(&self.shared, why).await {
+            Ok(wire) => {
+                let not_v2 = legs_without_binding_v2(&self.shared).await;
+                send_binding_paced(&self.shared, &wire, &not_v2, None).await;
+                // Close once each leg's Channel proved the end delivered (a
+                // datagram leg's too: the end rides its Channel).
+                let legs: Vec<[u8; 16]> = {
+                    let not_v2: std::collections::HashSet<&String> = not_v2.iter().collect();
+                    Shared::lock(&self.shared.out_legs)
+                        .iter()
+                        .filter(|(m, _)| !not_v2.contains(m))
+                        .map(|(_, l)| l.link_id)
+                        .collect()
+                };
+                let marks = channel_marks(&self.shared, &legs);
+                let unconfirmed = await_delivered(&self.shared, &marks, END_FLUSH_CEILING).await;
+                for _ in 0..unconfirmed {
+                    self.shared
+                        .count(crate::observability::AV_CALL_END_FLUSH_UNCONFIRMED);
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "call: the signed end of this stream could not be made; peers will read \
+                 the attendee as lost"
+            ),
         }
         *Shared::lock(&self.shared.state) = CallState::Ended(EndCause::HungUp);
         self.shared.ended.store(true, Ordering::Relaxed);
@@ -2147,7 +2564,7 @@ impl Call {
         );
         Ok(CallSummary {
             id: self.id,
-            stream: self.shared.stream,
+            stream: self.shared.stream(),
             epochs: Shared::lock(&self.shared.epochs).clone(),
             frames_published: self.shared.published.load(Ordering::Relaxed),
             frames_received: counts.released,
@@ -2340,6 +2757,11 @@ async fn current_members(shared: &Shared) -> Vec<String> {
 /// members are dialled.
 async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     let room_epoch = shared.room_group.epoch().await;
+    // A replacement waiting out its overlap was minted at the epoch about to
+    // end: switch to it first, so the roll rolls the new stream.
+    if room_epoch > shared.publisher.lock().await.epoch().0 {
+        apply_pending_replace(shared, true).await?;
+    }
     let mut publisher = shared.publisher.lock().await;
     let from = publisher.epoch().0;
     if room_epoch <= from {
@@ -2363,7 +2785,11 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
         return Err(CallError::CallEnded(EndCause::Revoked));
     }
     let to = Epoch(room_epoch);
-    let dek = stream_epoch_dek(&shared.room_group, shared.stream, to)
+    let (stream, join_nonce, replaces, codecs) = {
+        let k = Shared::lock(&shared.own_key);
+        (k.stream, k.join_nonce, k.replaces, k.codecs)
+    };
+    let dek = stream_epoch_dek(&shared.room_group, stream, to)
         .await
         .map_err(|e| CallError::RoomGroupUnavailable {
             room: shared.room.clone(),
@@ -2374,10 +2800,11 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     let own_key = mint_own_key(
         &shared.signer,
         &shared.room,
-        shared.join_nonce,
-        shared.stream,
+        join_nonce,
+        stream,
         to,
-        shared.opts.codecs,
+        codecs,
+        replaces,
     )
     .await?;
     let keep = publisher
@@ -2432,6 +2859,11 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
         to: room_epoch,
     });
     for m in left {
+        // 45.1 — its key left the room's MLS group: its stream left the call.
+        let stream = Shared::lock(&shared.attendance).streams.get(&m).copied();
+        if let Some(stream) = stream {
+            attendee_left(shared, &m, stream, LeaveCause::Removed);
+        }
         shared.emit(CallEvent::MemberLeft { key_id: m });
     }
     for m in joined {
@@ -2567,7 +2999,7 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         return false;
     };
     // The stream hello: the link's first message after the transit KEX.
-    let hello = encode_hello(shared.stream);
+    let hello = encode_hello(shared.stream());
     let deadline = tokio::time::Instant::now() + HELLO_BUDGET;
     if let Err(e) = send_patiently(&link.sender, &hello, deadline).await {
         tracing::debug!(peer = %member, error = %e, "call leg: hello not sent");
@@ -3211,6 +3643,9 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
     // The one signed statement of who publishes a stream: what an OFFER
     // claiming depth 0 is checked against.
     Shared::lock(&shared.alm).note_bound_publisher(binding.stream, &binding.publisher);
+    if installed {
+        on_bound(shared, &binding);
+    }
     if shared.opts.relay && (installed || binding.publisher == peer) {
         let mut except = vec![peer.to_owned(), binding.publisher.clone()];
         // A v2 binding goes only to the legs that take v2.
@@ -3288,6 +3723,49 @@ async fn reannounce(shared: &Arc<Shared>) {
     if let Some(v2) = wire_v2 {
         let not_v2 = legs_without_binding_v2(shared).await;
         send_binding_paced(shared, &v2, &not_v2, Some(REANNOUNCE_PART_GAP)).await;
+    }
+}
+
+/// 45.1 — each of `links`' Channel watermark now: its newest message's
+/// sequence. Taken right after a message went out on them, it is at or
+/// after that message's own (media sent since only makes the wait a little
+/// longer, never short). A link with no Channel carried nothing to prove
+/// and has no mark; a link leviculum no longer holds is gone.
+fn channel_marks(shared: &Arc<Shared>, links: &[[u8; 16]]) -> Vec<([u8; 16], u16)> {
+    links
+        .iter()
+        .filter_map(|l| {
+            let seq = shared.transport.av_link_stats(l)?.last_sent_seq?;
+            Some((*l, seq))
+        })
+        .collect()
+}
+
+/// 45.1 — wait until each marked link's Channel proved delivered the
+/// message at its mark and everything before it
+/// ([`AvLinkStats::delivered_through`], a per-message proof that later
+/// traffic in flight does not hide), or `ceiling` passes. Returns how many
+/// never did. A link leviculum no longer holds is gone, not unconfirmed.
+///
+/// [`AvLinkStats::delivered_through`]: crate::transport::alm_link::AvLinkStats::delivered_through
+async fn await_delivered(
+    shared: &Arc<Shared>,
+    marks: &[([u8; 16], u16)],
+    ceiling: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + ceiling;
+    let mut pending: Vec<([u8; 16], u16)> = marks.to_vec();
+    loop {
+        pending.retain(|(l, seq)| {
+            shared
+                .transport
+                .av_link_stats(l)
+                .is_some_and(|st| !st.delivered_through(*seq))
+        });
+        if pending.is_empty() || tokio::time::Instant::now() >= deadline {
+            return pending.len();
+        }
+        tokio::time::sleep(DELIVERY_POLL).await;
     }
 }
 
@@ -3520,7 +3998,164 @@ async fn watch_loop(shared: Arc<Shared>) {
             return;
         }
         reconcile_legs(&shared);
+        let _ = apply_pending_replace(&shared, false).await;
         alm_tick(&shared, &mut sent_expired).await;
+        settle_ends(&shared);
+        check_lost(&shared);
+    }
+}
+
+/// A fresh join nonce and the stream id it derives, drawn again on the
+/// (2^-40) chance its first bytes read as a binding part or a C3 frame.
+fn fresh_stream(room: &str, own_key_id: &str) -> Result<([u8; 32], StreamId), CallError> {
+    let mut join_nonce = [0u8; 32];
+    loop {
+        ciris_crypto::random::fill(&mut join_nonce)
+            .map_err(|e| CallError::Plumbing(format!("join nonce: {e}")))?;
+        let stream = call_stream_id(room, own_key_id, &join_nonce);
+        if !collides_with_binding_part(stream) && !collides_with_control_frame(stream) {
+            return Ok((join_nonce, stream));
+        }
+    }
+}
+
+/// 45.1 — switch to a minted replacement once its overlap passed (or at
+/// once, `force`): the publisher publishes the new stream from its next
+/// chunk, and the old one stops.
+async fn apply_pending_replace(shared: &Arc<Shared>, force: bool) -> Result<(), CallError> {
+    let due = Shared::lock(&shared.pending_replace)
+        .as_ref()
+        .is_some_and(|p| force || p.ready.load(Ordering::Acquire));
+    if !due {
+        return Ok(());
+    }
+    let mut publisher = shared.publisher.lock().await;
+    let Some(p) = Shared::lock(&shared.pending_replace).take() else {
+        return Ok(());
+    };
+    let new = p.own_key.stream;
+    let keep = publisher
+        .replace_room_stream(new, p.dek)
+        .await
+        .map_err(|e| CallError::Plumbing(e.to_string()))?;
+    let old = std::mem::replace(&mut *Shared::lock(&shared.own_key), p.own_key).stream;
+    Shared::lock(&shared.alm).replace_own_stream(new);
+    drop(publisher);
+    tracing::info!(
+        old = %crate::transport::realtime_av::stream_label(old),
+        new = %crate::transport::realtime_av::stream_label(new),
+        "CALL STREAM REPLACED: this node now publishes the new stream (45.1)"
+    );
+    if let KeepOutcome::Refused(r) = keep {
+        shared.emit(CallEvent::KeepRefused {
+            epoch: r.epoch,
+            reason: r.kind,
+        });
+    }
+    Ok(())
+}
+
+/// 45.1 — one installed binding's word on attendance (see
+/// [`Attendance::on_bound`]), its events emitted. Another attendee's signed
+/// end waits for its verdict ([`settle_ends`]).
+fn on_bound(shared: &Arc<Shared>, b: &StreamKeyBinding) {
+    if b.end.is_some() && b.publisher != shared.own {
+        Shared::lock(&shared.attendance).defer_end(b, Instant::now());
+        return;
+    }
+    let old_publisher = b.replaces.and_then(|old| {
+        Shared::lock(&shared.alm)
+            .bound_publisher_of(old)
+            .map(str::to_owned)
+    });
+    let present = shared.auth.heard(b.stream);
+    let truncated = b.end.is_some() && settle_truncation(shared, b.stream);
+    let events = Shared::lock(&shared.attendance).on_bound(
+        &shared.own,
+        b,
+        old_publisher.as_deref(),
+        present,
+        truncated,
+    );
+    for e in events {
+        if let CallEvent::StreamReplaced { old, new, .. } = &e {
+            Shared::lock(&shared.alm).forget_replaced_stream(*old, *new);
+        }
+        tracing::info!(event = ?e, "call: attendance (45.1)");
+        shared.emit(e);
+    }
+}
+
+/// 45.1 — the truncation verdict on `stream`'s signed end, counted.
+fn settle_truncation(shared: &Arc<Shared>, stream: StreamId) -> bool {
+    let truncated = shared.auth.settle_end(stream);
+    if truncated {
+        shared.count(crate::observability::AV_CALL_STREAM_TRUNCATED);
+    }
+    truncated
+}
+
+/// 45.1 — every held signed end whose verdict is due: the attendee left,
+/// truncated only if a chunk up to its `final_seq` is still missing once
+/// [`END_VERDICT_AFTER`] passed (presence too is read then, so a stream
+/// whose first chunks came in that window still counts as heard).
+fn settle_ends(shared: &Arc<Shared>) {
+    let due = Shared::lock(&shared.attendance).due_ends(Instant::now());
+    for b in due {
+        let present = shared.auth.heard(b.stream);
+        let truncated = settle_truncation(shared, b.stream);
+        let events =
+            Shared::lock(&shared.attendance).on_bound(&shared.own, &b, None, present, truncated);
+        for e in events {
+            tracing::info!(event = ?e, "call: attendance (45.1)");
+            shared.emit(e);
+        }
+    }
+}
+
+/// 45.1 — `key_id`'s `stream` left the call for `cause`: once.
+fn attendee_left(shared: &Arc<Shared>, key_id: &str, stream: StreamId, cause: LeaveCause) {
+    let present = shared.auth.heard(stream);
+    let e = Shared::lock(&shared.attendance).left(key_id, stream, cause, present, false);
+    if let Some(e) = e {
+        tracing::info!(event = ?e, "call: attendance (45.1)");
+        shared.emit(e);
+    }
+}
+
+/// 45.1 — `Lost`: an attendee with no leg up (neither this node's leg to it
+/// nor its link to this node) for [`ATTENDEE_LOST_AFTER`], whose stream has
+/// been silent on every path that long, and no signed end seen.
+fn check_lost(shared: &Arc<Shared>) {
+    let now = Instant::now();
+    let attendees: Vec<(String, StreamId)> = Shared::lock(&shared.attendance)
+        .streams
+        .iter()
+        .map(|(k, s)| (k.clone(), *s))
+        .collect();
+    let bound_ms = u64::try_from(ATTENDEE_LOST_AFTER.as_millis()).unwrap_or(u64::MAX);
+    for (key, stream) in attendees {
+        let linked = Shared::lock(&shared.out_legs).contains_key(&key)
+            || Shared::lock(&shared.in_links).values().any(|p| *p == key);
+        let since = {
+            let mut a = Shared::lock(&shared.attendance);
+            if linked {
+                a.unlinked_since.remove(&key);
+                continue;
+            }
+            *a.unlinked_since.entry(key.clone()).or_insert(now)
+        };
+        if now.duration_since(since) < ATTENDEE_LOST_AFTER {
+            continue;
+        }
+        let silent = {
+            let a = Shared::lock(&shared.alm);
+            a.stream_last_activity_ms(stream)
+                .is_none_or(|t| a.now_ms().saturating_sub(t) >= bound_ms)
+        };
+        if silent {
+            attendee_left(shared, &key, stream, LeaveCause::Lost);
+        }
     }
 }
 

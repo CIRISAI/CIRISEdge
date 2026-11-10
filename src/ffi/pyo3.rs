@@ -4489,6 +4489,28 @@ fn call_event_to_pydict<'py>(
             d.set_item("kind", "load_tier")?;
             d.set_item("tier", *tier)?;
         }
+        V::AttendeeLeft {
+            key_id,
+            stream,
+            cause,
+            truncated,
+        } => {
+            d.set_item("kind", "attendee_left")?;
+            d.set_item("key_id", key_id)?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
+            d.set_item("cause", cause.token())?;
+            d.set_item("truncated", *truncated)?;
+        }
+        V::StreamReplaced {
+            publisher,
+            old,
+            new,
+        } => {
+            d.set_item("kind", "stream_replaced")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("old_stream_id", pyo3::types::PyBytes::new(py, &old.0))?;
+            d.set_item("new_stream_id", pyo3::types::PyBytes::new(py, &new.0))?;
+        }
     }
     Ok(d)
 }
@@ -4613,9 +4635,24 @@ impl PyCall {
         self.room.clone()
     }
 
-    /// This node's stream id (32 bytes).
-    fn stream_id(&self) -> [u8; 32] {
-        self.stream_id
+    /// This node's stream id (32 bytes): the one it joined with, or the
+    /// latest `replace_stream` gave it.
+    fn stream_id(&self, py: Python<'_>) -> [u8; 32] {
+        self.with_call(py, |c| Box::pin(async move { Ok(c.stream().0) }))
+            .unwrap_or(self.stream_id)
+    }
+
+    /// 45.1 — replace this node's stream in place (a codec change): a new
+    /// stream, bound and switched to make-before-break, whose signed binding
+    /// says it replaces the old (receivers get `stream_replaced`, no leave).
+    /// `codecs` is the new map as tokens (`None`: the old one's). Returns the
+    /// new stream id.
+    #[pyo3(signature = (codecs=None))]
+    fn replace_stream(&self, py: Python<'_>, codecs: Option<Vec<String>>) -> PyResult<[u8; 32]> {
+        let codecs = codecs.map(|c| call_codecs_arg(&c)).transpose()?;
+        self.with_call(py, move |c| {
+            Box::pin(async move { Ok(c.replace_stream(codecs).await?.0) })
+        })
     }
 
     /// The call's epoch (the room's MLS epoch).
@@ -4794,9 +4831,21 @@ impl PyCall {
         })
     }
 
-    /// Hang up (an in-room hang-up writes nothing). Returns the summary
-    /// dict; a second `leave()` raises `call_ended`.
-    fn leave(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// Hang up (an in-room hang-up writes nothing). `cause` is `"left"`
+    /// (default) or `"backgrounded"`: the signed end peers turn into
+    /// `attendee_left`. Returns the summary dict; a second `leave()` raises
+    /// `call_ended`.
+    #[pyo3(signature = (cause="left"))]
+    fn leave(&self, py: Python<'_>, cause: &str) -> PyResult<Py<PyAny>> {
+        let why = match cause {
+            "left" => crate::transport::av_chunk_auth::SignedEnd::Left,
+            "backgrounded" => crate::transport::av_chunk_auth::SignedEnd::Backgrounded,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "leave_cause_unknown: {other:?} (left, backgrounded)"
+                )))
+            }
+        };
         let call = Arc::clone(&self.call);
         let left = py.detach(|| {
             run_async(&self.executor, async move {
@@ -4805,7 +4854,7 @@ impl PyCall {
                         crate::transport::av_call::EndCause::HungUp,
                     ));
                 };
-                c.leave().await
+                c.leave_with(why).await
             })
         });
         let s = left.map_err(|e| call_err_to_py(&e))?;
