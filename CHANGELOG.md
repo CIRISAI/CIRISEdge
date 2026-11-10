@@ -36,6 +36,14 @@ v0.34.0+ciris.2 (#102 A/V media on unordered datagrams, #104 probed MTU). MSRV 1
   out of a capsule holds that capsule for as long as it is used.
 - **`set_av_datagrams_enabled(bool)` (leviculum#102):** node-wide, default on; gauge
   `av_datagrams_enabled`.
+- **A host that writes to the store behind edge must follow the write with a kick
+  (`round_now`/`round_now_all`) or `note_local_write(s)`, or its rows reach peers up to 5 s later;
+  use `note_local_write(s)` where decision-row events matter (CIRISEdge#971).** Such a write is
+  listed on the key planes only once the serve-cursor feed's last probe is `FEED_PROBE_SPACING`
+  (5 s) old; before v45 it was on the next listing. For a withdrawal or a revocation that is up to
+  5 s more before a peer is offered it. 5 s is the worst case, a TTL revalidation included. A kick
+  or `note_local_write(s)` marks the feed dirty (`invalidate_send_set_memos`), so the next listing
+  carries the row as before.
 
 - **The receive diff no longer drains persist's content-hash index per Summary (CIRISEdge#971).**
   The Attestation index (six session planes: Attestation, KeyGrant, Key, Revocation,

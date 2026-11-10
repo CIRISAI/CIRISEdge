@@ -28,6 +28,10 @@ MSRV 1.92.
   `BridgeConfig::holdings_index` (env `CIRIS_EDGE_HOLDINGS_INDEX=0`), `holdings_audit_every`,
   `feed_probe_spacing`. Gauges: the `holdings_index.*`, `holdings_index_gauge.*`,
   `sweep_permits.<site>`, `bundle_pull.*` and `replication_reach` families.
+- **A host that writes to the store behind edge must follow the write with a kick
+  (`round_now`/`round_now_all`) or `note_local_write(s)`, or its rows reach peers up to 5 s
+  later; use `note_local_write(s)` where decision-row events matter** (CIRISEdge#971, the feed's
+  probe spacing).
 - **A late joiner gets its groups' history** (CIRISEdge#968), and the #968 contact waits A and B
   are gone (a local write reaches the next round; a dropped first round is asked again soon).
 - **A named shaping class is the device, not the opt-in** (CIRISEdge#969): `home` / `phone-*`

@@ -500,6 +500,19 @@ async fn n_peer_rounds_between_writes_cost_one_sweep_930() {
 /// 3. a second unreported write, inside the new spacing, is not carried until
 ///    a door marks the feed dirty, and then at once.
 ///
+/// **The bound this states: [`super::store_feed::FEED_PROBE_SPACING`] (5 s),
+/// worst case.** Before v45 such a write was on the next listing; now it is on
+/// the first listing that begins once the last drain is a full spacing old,
+/// and that drain began no later than the write was committed (a drain that
+/// began after the commit reads it), so the delay is at most the spacing. A
+/// TTL revalidation does not widen it: `refresh_key_plane_memo` applies the
+/// feed's rows as dirt BEFORE the epoch turns, a stale answer is dropped by
+/// dirt exactly as a fresh one is, and a subject re-read reads the store as it
+/// is. For a withdrawal or a revocation that is up to 5 s more before a peer
+/// is offered it. A host closes the window by reporting the write
+/// (`note_local_write(s)`, or a kick: [`a_kick_marks_the_feed_before_its_rounds_ask_971`]
+/// witnesses `round_now_all` alone), step 3's mark.
+///
 /// The instants are set by ageing the feed's last drain, never by sleeping.
 /// Mutants: the spacing ignored (step 1 lists the row), the dirt mark ignored
 /// (step 3's last listing does not).
