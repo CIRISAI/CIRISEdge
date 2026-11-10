@@ -21,9 +21,8 @@
 //! - **audit, both directions** — a hash the index lost is wanted again after
 //!   the audit (`drift_extra`), and a hash no feed saw is added by it
 //!   (`drift_missing`);
-//! - **differential** — over random sequences through every door the fixture
-//!   drives, local and replicated, the set and the want equal the index's at
-//!   every step, with no audit;
+//! - **differential** — in `holdings_doors_971_tests`, over every door of
+//!   the door table (`super::holdings_index` module docs);
 //! - **fallback** (condition d) — while the cursor probe fails, every ask
 //!   answers from the drain; once it recovers, from the set;
 //! - **convergence** — two nodes converge on every covered plane, and a second
@@ -45,7 +44,7 @@ use super::counting_directory_930::CountingDirectory;
 
 /// A probe spacing no test outlives: "inside the spacing" is then
 /// deterministic, and only a dirt mark makes the feed probe.
-const NO_TEST_OUTLIVES: Duration = Duration::from_secs(3600);
+pub(super) const NO_TEST_OUTLIVES: Duration = Duration::from_secs(3600);
 use super::holdings_index::Status;
 use super::key_plane_v59_tests::{round, NodeA};
 use super::park_fresh_858_tests::{hold, Ident};
@@ -56,7 +55,7 @@ use crate::replication::{
 };
 
 /// The covered session planes, one per persist index plus every key plane.
-const COVERED: [EnvelopeKind; 6] = [
+pub(super) const COVERED: [EnvelopeKind; 6] = [
     EnvelopeKind::Attestation,
     EnvelopeKind::Key,
     EnvelopeKind::IdentityOccurrence,
@@ -65,7 +64,7 @@ const COVERED: [EnvelopeKind; 6] = [
     EnvelopeKind::TransportDestination,
 ];
 
-fn bridge_with(
+pub(super) fn bridge_with(
     dir: Arc<dyn FederationDirectory>,
     me: &str,
     publish: Vec<String>,
@@ -94,7 +93,7 @@ fn subjects(a: &NodeA) -> Vec<String> {
 
 /// A full drain of persist's index for `kind`, read straight from the store:
 /// the reference every witness compares the set against.
-async fn index_drain(dir: &dyn FederationDirectory, kind: &str) -> HashSet<[u8; 32]> {
+pub(super) async fn index_drain(dir: &dyn FederationDirectory, kind: &str) -> HashSet<[u8; 32]> {
     let mut out = HashSet::new();
     let mut after: Option<String> = None;
     loop {
@@ -113,7 +112,7 @@ async fn index_drain(dir: &dyn FederationDirectory, kind: &str) -> HashSet<[u8; 
     }
 }
 
-fn refs_of(hashes: &HashSet<[u8; 32]>) -> Vec<EnvelopeRef> {
+pub(super) fn refs_of(hashes: &HashSet<[u8; 32]>) -> Vec<EnvelopeRef> {
     hashes
         .iter()
         .map(|h| EnvelopeRef {
@@ -123,14 +122,14 @@ fn refs_of(hashes: &HashSet<[u8; 32]>) -> Vec<EnvelopeRef> {
         .collect()
 }
 
-fn counter(metrics: &obs::EdgeMetrics, label: &str) -> u64 {
+pub(super) fn counter(metrics: &obs::EdgeMetrics, label: &str) -> u64 {
     metrics.holdings_index().get(label).copied().unwrap_or(0)
 }
 
 /// A route for `node` at `epoch`, hybrid-signed by the node (the shape of the
 /// v59 fixture's route, with a destination that changes with the epoch so a
 /// supersession changes the bytes).
-async fn route_at(
+pub(super) async fn route_at(
     node: &Ident,
     epoch: u64,
 ) -> ciris_persist::federation::self_at_login::SignedTransportDestination {
@@ -172,7 +171,7 @@ async fn route_at(
 
 /// P binds `node` to itself through `put_attestation` (a federation-tier
 /// owner binding, the authoring door every producer row takes).
-async fn bind(dir: &SqliteBackend, owner: &Ident, node: &Ident) {
+pub(super) async fn bind(dir: &SqliteBackend, owner: &Ident, node: &Ident) {
     let row = crate::replication::attestation_bind::owner_binding_attestation(
         owner.key_id(),
         node.key_id(),
@@ -187,7 +186,7 @@ async fn bind(dir: &SqliteBackend, owner: &Ident, node: &Ident) {
 }
 
 /// Ask the diff for every covered plane, once.
-async fn ask_all(bridge: &FederationDirectoryReplicationBridge) {
+pub(super) async fn ask_all(bridge: &FederationDirectoryReplicationBridge) {
     for kind in COVERED {
         let _ = bridge.holdings_want(kind, &[]).await;
     }
@@ -655,7 +654,7 @@ async fn concurrent_diffs_never_see_a_partial_set_971() {
 }
 
 /// splitmix64: the differential's deterministic op stream (no `rand` dep).
-fn splitmix(state: &mut u64) -> u64 {
+pub(super) fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -664,7 +663,7 @@ fn splitmix(state: &mut u64) -> u64 {
 }
 
 /// The set, and the want over `offered`, equal the index's on both planes.
-async fn assert_index_equal(
+pub(super) async fn assert_index_equal(
     bridge: &FederationDirectoryReplicationBridge,
     dir: &dyn FederationDirectory,
     offered_extra: &[[u8; 32]],
@@ -697,130 +696,246 @@ async fn assert_index_equal(
     }
 }
 
-/// **Differential.** Over three seeded random sequences, each step one door:
-/// a key admitted locally, an owner binding through `put_attestation`, a
-/// route or its supersession, or rows authored at a peer and replicated in
-/// through the choke on every covered plane (a key, a binding, a route, a
-/// route supersession, a `withdraws`, a carrier). After EVERY step the set
-/// equals a full drain of the index on both planes and the want over the
-/// index's hashes plus foreign ones equals the index's diff, with no audit
-/// (cadence an hour) and spacing zero, so every door is caught by a feed and
-/// never by a repair. Mutation targets (each must turn this red): the
-/// write-through's upsert, the Attestation feed's upsert, the route feed's
-/// upsert, the head-start cursor (a pre-boot record rewritten keeps its old
-/// hash).
+/// **Warm-up (condition 4).** The walk from the head of the log runs in the
+/// background, never inside a peer's ask. With the warm-up's head reads held
+/// at a gate, a Summary on each covered plane is answered at once, from the
+/// pre-v45 drain (counted `fallback_unbooted`), and does NOT boot the set
+/// itself (no `boots` until the warm-up does it). Once the gate opens the
+/// warm-up boots both planes, `ready_after_ms` is set, and the next ask is
+/// answered from the set. Mutants: the walk run inline in the ask (the ask
+/// waits at the gate and the timeout fires), `begin_warm` removed (the ask
+/// boots the set: `boots` moves before the gate opens).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::too_many_lines)] // one op table
-async fn the_set_tracks_the_index_through_random_door_sequences_971() {
-    for (run, base) in [(0u64, 0x10u8), (1, 0x50), (2, 0x90)] {
-        let a = NodeA::build(&format!("diff971a{run}"), base).await;
-        let b_dir = super::park_fresh_858_tests::substrate().await;
-        for id in [&a.p, &a.n, &a.k] {
-            hold(&b_dir, id).await;
-        }
-        let b_me = Ident::mint(&format!("node-b-diff971-{run}"), "node", base + 3).await;
-        hold(&b_dir, &b_me).await;
-        let bridge_a = bridge_with(
-            Arc::clone(&a.dir) as Arc<dyn FederationDirectory>,
-            a.n.key_id(),
-            subjects(&a),
-            BridgeConfig::default(),
-            None,
-        );
-        let mut b_publish = vec![b_me.key_id().to_owned()];
-        b_publish.extend(subjects(&a));
-        let bridge_b = bridge_with(
-            Arc::clone(&b_dir) as Arc<dyn FederationDirectory>,
-            b_me.key_id(),
-            b_publish,
-            BridgeConfig {
-                feed_probe_spacing: Duration::ZERO,
-                holdings_audit_every: NO_TEST_OUTLIVES,
-                sweep_page_rows: 3,
-                ..BridgeConfig::default()
-            },
-            None,
-        );
-        // Boot B's set on what it holds, then take A's rows once.
-        ask_all(&bridge_b).await;
-        for kind in COVERED {
-            round(kind, &bridge_a, a.n.key_id(), &bridge_b, b_me.key_id()).await;
-        }
-        let foreign = [[0xeeu8; 32], [0xefu8; 32]];
-        assert_index_equal(&bridge_b, &*b_dir, &foreign, &format!("run {run} boot")).await;
-
-        let mut rng = 0x5eed_0000_u64 + run;
-        let mut next_seed = base + 4;
-        let mut local: Vec<Ident> = Vec::new();
-        let mut bound: Vec<bool> = Vec::new();
-        let mut epoch = 10u64;
-        let mut withdrew = false;
-        for step in 0..10 {
-            let op = splitmix(&mut rng) % 5;
-            let label = format!("run {run} step {step} op {op}");
-            match op {
-                // A key admitted at B through the key door.
-                0 => {
-                    let m = Ident::mint(&format!("node-m-diff971-{run}-{step}"), "node", next_seed)
-                        .await;
-                    next_seed += 1;
-                    hold(&b_dir, &m).await;
-                    local.push(m);
-                    bound.push(false);
-                }
-                // An owner binding at B through `put_attestation`.
-                1 => {
-                    if let Some(i) = bound.iter().position(|b| !b) {
-                        bind(&b_dir, &a.p, &local[i]).await;
-                        bound[i] = true;
-                    }
-                }
-                // A route at B, or its supersession.
-                2 => {
-                    if let Some(m) = local
-                        .get(usize::try_from(splitmix(&mut rng)).unwrap_or(0) % local.len().max(1))
-                    {
-                        epoch += 1;
-                        b_dir
-                            .put_signed_transport_destination(&route_at(m, epoch).await)
-                            .await
-                            .expect("route at B");
-                    }
-                }
-                // Rows authored at A, replicated in through the choke.
-                3 => {
-                    let x = Ident::mint(&format!("node-x-diff971-{run}-{step}"), "node", next_seed)
-                        .await;
-                    next_seed += 1;
-                    hold(&a.dir, &x).await;
-                    bind(&a.dir, &a.p, &x).await;
-                    epoch += 1;
-                    a.dir
-                        .put_signed_transport_destination(&route_at(&x, epoch).await)
-                        .await
-                        .expect("route at A");
-                    epoch += 1;
-                    a.dir
-                        .put_signed_transport_destination(&route_at(&a.n, epoch).await)
-                        .await
-                        .expect("A supersedes N's route");
-                    for kind in COVERED {
-                        round(kind, &bridge_a, a.n.key_id(), &bridge_b, b_me.key_id()).await;
-                    }
-                }
-                // A `withdraws` and a carrier at A, replicated in.
-                _ => {
-                    if !withdrew {
-                        a.withdraw_occurrence().await;
-                        a.carrier_revoking_node_occurrence(a.k.key_id()).await;
-                        withdrew = true;
-                        for kind in COVERED {
-                            round(kind, &bridge_a, a.n.key_id(), &bridge_b, b_me.key_id()).await;
-                        }
-                    }
-                }
-            }
-            assert_index_equal(&bridge_b, &*b_dir, &foreign, &label).await;
-        }
+async fn no_ask_waits_on_the_warm_up_and_none_boots_the_set_before_it_971() {
+    /// An ask that does not wait returns long before this; an event bound.
+    const ANSWERED_WITHIN: Duration = Duration::from_secs(30);
+    let a = NodeA::build("warm971", 0xd1).await;
+    let counting = Arc::new(CountingDirectory::new(
+        Arc::clone(&a.dir) as Arc<dyn FederationDirectory>
+    ));
+    let metrics = obs::EdgeMetrics::new();
+    let bridge = bridge_with(
+        Arc::clone(&counting) as Arc<dyn FederationDirectory>,
+        a.n.key_id(),
+        subjects(&a),
+        BridgeConfig::default(),
+        Some(metrics.clone()),
+    );
+    counting.close_head_reads();
+    let warm = {
+        let bridge = Arc::clone(&bridge);
+        tokio::spawn(async move { bridge.warm_holdings_index().await })
+    };
+    counting.a_head_read_is_held().await;
+    for kind in COVERED {
+        let held = index_drain(
+            &*a.dir,
+            super::holdings_index::IndexPlane::of_kind(kind)
+                .expect("covered")
+                .index_kind(),
+        )
+        .await;
+        let mut offered = refs_of(&held);
+        offered.push(EnvelopeRef {
+            envelope_hash: [0xee; 32],
+            seq: 0,
+        });
+        let want = tokio::time::timeout(ANSWERED_WITHIN, bridge.holdings_want(kind, &offered))
+            .await
+            .unwrap_or_else(|_| panic!("{kind:?}: an ask waited on the warm-up"));
+        assert_eq!(want, vec![[0xee; 32]], "{kind:?}: the drain's answer");
     }
+    for slot in 0..2 {
+        assert_eq!(
+            counter(&metrics, obs::HOLDINGS_BOOTS[slot]),
+            0,
+            "no ask booted the set while the warm-up runs"
+        );
+        assert!(counter(&metrics, obs::HOLDINGS_FALLBACK_UNBOOTED[slot]) >= 1);
+    }
+    counting.open_head_reads();
+    warm.await.expect("the warm-up ends");
+    for slot in 0..2 {
+        assert_eq!(
+            counter(&metrics, obs::HOLDINGS_BOOTS[slot]),
+            1,
+            "the warm-up booted it"
+        );
+        assert!(
+            metrics
+                .holdings_index_gauge()
+                .contains_key(obs::HOLDINGS_GAUGE_READY_AFTER_MS[slot]),
+            "ready_after_ms is set"
+        );
+    }
+    for kind in [
+        EnvelopeKind::Attestation,
+        EnvelopeKind::TransportDestination,
+    ] {
+        assert_eq!(bridge.holdings_index_status(kind), Some(Status::Ready));
+        let before = counter(
+            &metrics,
+            obs::HOLDINGS_ANSWERS_SET[usize::from(kind == EnvelopeKind::TransportDestination)],
+        );
+        let _ = bridge.holdings_want(kind, &[]).await;
+        assert_eq!(
+            counter(
+                &metrics,
+                obs::HOLDINGS_ANSWERS_SET[usize::from(kind == EnvelopeKind::TransportDestination,)]
+            ),
+            before + 1,
+            "{kind:?}: answered from the set once warm"
+        );
+    }
+}
+
+/// **Every counter this branch adds or relies on is in the exported map, by
+/// name.** The map is `EdgeMetricsBundle::flatten()`, the projection a host
+/// exports whole (CIRISServer's `/v1/federation/metrics` builds its body by
+/// hand from chosen bundle fields and does not carry these families today;
+/// that is the server's to add, and its own test's to prove). Each label is
+/// booked once through the setter production uses, then read back by its
+/// flattened name. A label renamed, dropped from its family, or booked into a
+/// family `flatten` does not project fails here.
+#[test]
+fn every_counter_this_branch_adds_is_exported_by_name_971() {
+    let m = obs::EdgeMetrics::new();
+    let key_plane = [
+        obs::KEY_PLANE_LISTINGS,
+        obs::KEY_PLANE_SWEEPS,
+        obs::KEY_PLANE_SUBJECT_READS,
+        obs::KEY_PLANE_MEMO_HITS,
+        obs::KEY_PLANE_READ_FAILURES,
+        obs::KEY_PLANE_SWEEP_MS,
+        obs::KEY_PLANE_PROBE_READS,
+        obs::KEY_PLANE_PROBE_ROWS,
+        obs::KEY_PLANE_PROBE_FAILURES,
+        obs::KEY_PLANE_INVALIDATED,
+        obs::KEY_PLANE_REBUILDS,
+        obs::KEY_PLANE_REBUILDS_FIRST,
+        obs::KEY_PLANE_REBUILDS_TTL,
+        obs::KEY_PLANE_FORGOTTEN,
+        obs::KEY_PLANE_INBOX_OVERFLOWS,
+        obs::KEY_PLANE_PLANE_DIRT,
+        obs::KEY_PLANE_PROBES_SPACED,
+        obs::KEY_PLANE_FEED_DIRTY_MARKS,
+    ];
+    let sites = [
+        obs::SWEEP_PERMIT_HOLDINGS_INDEX,
+        obs::SWEEP_PERMIT_HOLDINGS_ROWS,
+        obs::SWEEP_PERMIT_PLANE_PAGE,
+        obs::SWEEP_PERMIT_ACCORD_EVIDENCE,
+        obs::SWEEP_PERMIT_SUBJECT_PULL,
+        obs::SWEEP_PERMIT_ANNOUNCED_TESTIMONY,
+        obs::SWEEP_PERMIT_KEY_PLANE_SUBJECT,
+        obs::SWEEP_PERMIT_FEED_ATTESTATION,
+        obs::SWEEP_PERMIT_FEED_ROUTE,
+        obs::SWEEP_PERMIT_SEND_SET,
+        obs::SWEEP_PERMIT_ADVERTISE_PAGE,
+        obs::SWEEP_PERMIT_ADVERTISE_REQUIRED,
+        obs::SWEEP_PERMIT_HOLDINGS_WARM,
+        obs::SWEEP_PERMIT_OTHER,
+    ];
+    let mut holdings: Vec<&'static str> = [
+        obs::HOLDINGS_ANSWERS_SET,
+        obs::HOLDINGS_ANSWERS_DRAIN,
+        obs::HOLDINGS_FALLBACK_UNBOOTED,
+        obs::HOLDINGS_FALLBACK_SUSPECT,
+        obs::HOLDINGS_BOOTS,
+        obs::HOLDINGS_AUDITS,
+        obs::HOLDINGS_DRAIN_FAILURES,
+        obs::HOLDINGS_DRAIN_MS,
+        obs::HOLDINGS_DRIFT_MISSING,
+        obs::HOLDINGS_DRIFT_EXTRA,
+        obs::HOLDINGS_SUSPECT_AUDITS,
+        obs::HOLDINGS_WRITE_THROUGH,
+        obs::HOLDINGS_FEED_INSERTS,
+        obs::HOLDINGS_DUPLICATE_UNHELD,
+        obs::HOLDINGS_FEED_PROBES,
+        obs::HOLDINGS_FEED_COALESCED,
+        obs::HOLDINGS_FEED_FAILURES,
+        obs::HOLDINGS_WARM_ROWS,
+        obs::HOLDINGS_WARM_FAILURES,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    holdings.extend([
+        obs::STALE_ROUTE_MARKED,
+        obs::STALE_ROUTE_SUPPRESSED,
+        obs::STALE_ROUTE_EVICTED,
+        obs::STALE_ROUTE_CLEARED,
+    ]);
+    let mut gauges: Vec<&'static str> = [
+        obs::HOLDINGS_GAUGE_SIZE,
+        obs::HOLDINGS_GAUGE_STATUS,
+        obs::HOLDINGS_GAUGE_SOURCE,
+        obs::HOLDINGS_GAUGE_LAST_DRAIN_MS,
+        obs::HOLDINGS_GAUGE_READY_AFTER_MS,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    gauges.extend([
+        obs::HOLDINGS_GAUGE_ENABLED,
+        obs::HOLDINGS_GAUGE_STALE_ROUTE_SIZE,
+    ]);
+    let advertise = [
+        obs::ADVERTISE_SEND_SET_MEMO_HIT,
+        obs::ADVERTISE_SEND_SET_READ,
+        obs::ADVERTISE_SEND_SET_INVALIDATED,
+        obs::ADVERTISE_SEND_SET_DROPPED_LIVE,
+        obs::ADVERTISE_SEND_SET_EXPIRED,
+    ];
+    for label in key_plane {
+        m.add_key_plane_sweep(label, 1);
+    }
+    for site in sites {
+        m.inc_sweep_permit(site);
+    }
+    for label in &holdings {
+        m.add_holdings_index(label, 1);
+    }
+    for label in &gauges {
+        m.set_holdings_index_gauge(label, 7);
+    }
+    for label in advertise {
+        m.inc_advertise(label);
+    }
+    let flat = m.snapshot().flatten();
+    let mut missing = Vec::new();
+    let mut expect = |name: String, present: bool| {
+        if !present {
+            missing.push(name);
+        }
+    };
+    for label in key_plane {
+        let name = format!("key_plane_sweep.{label}");
+        expect(name.clone(), flat.counters.get(&name) == Some(&1));
+    }
+    for site in sites {
+        let name = format!("sweep_permits.{site}");
+        expect(name.clone(), flat.counters.get(&name) == Some(&1));
+    }
+    for label in &holdings {
+        let name = format!("holdings_index.{label}");
+        expect(name.clone(), flat.counters.get(&name) == Some(&1));
+    }
+    for label in &gauges {
+        let name = format!("holdings_index_gauge.{label}");
+        let got = flat
+            .counters
+            .get(&name)
+            .map(|v| *v as f64)
+            .or(flat.gauges.get(&name).copied());
+        expect(name.clone(), got == Some(7.0));
+    }
+    for label in advertise {
+        let name = format!("advertise.{label}");
+        expect(name.clone(), flat.counters.get(&name) == Some(&1));
+    }
+    assert!(
+        missing.is_empty(),
+        "not in the exported map by name: {missing:?}"
+    );
 }

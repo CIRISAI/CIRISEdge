@@ -1984,6 +1984,13 @@ impl ReplicationRuntime {
             Arc::clone(&convergence),
             key_grant_wake.clone(),
         );
+        // CIRISEdge#971 — the holdings index warms in the background (its walk
+        // of the served log and its boot drain), never inline in a peer's ask:
+        // a round before it is Ready takes the pre-v45 drain.
+        {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move { bridge.warm_holdings_index().await });
+        }
 
         // CIRISEdge#727 — the registry carries the owner-binding rung's
         // receiver gate (see [`registry_for`]).

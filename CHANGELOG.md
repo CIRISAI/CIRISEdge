@@ -34,10 +34,12 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
     `key_plane_sweep.{key_plane_probes_spaced, key_plane_feed_dirty_marks}`. This changes the
     CIRISEdge#930 guarantee: a store write that bypasses every edge door is in the next listing
     only once the spacing has passed.
-  - **Both cursors start at the head of the log** while the index is on, so every record is known
-    by its key and a rewrite of one held before boot (a PQC completion, a re-seal, a route
-    supersession) replaces its hash at once. One full walk of the served log at the first ask
-    (on the canonical about 86 Attestation pages and 37 route pages of 500 rows).
+  - **The index warms in the background.** `ReplicationRuntime::start` spawns the warm-up: it
+    places both serve cursors, walks each plane's served log from its head on its own cursor
+    (on the canonical about 86 Attestation pages and 37 route pages of 500 rows), then runs the
+    boot drain. Until a plane is Ready its asks take the pre-v45 drain; no round waits on the
+    walk. New: `holdings_index.<plane>.{warm_rows, warm_failures}`,
+    `holdings_index_gauge.<plane>.ready_after_ms`, `sweep_permits.holdings_warm`.
 - **Where the seat's sweep permits and send-set reads go (CIRISEdge#971).** New family
   `sweep_permits.<site>` (`holdings_index`, `holdings_rows`, `plane_page`, `accord_evidence`,
   `subject_pull`, `announced_testimony`, `key_plane_subject`, `feed_attestation`, `feed_route`,
@@ -53,6 +55,10 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   6 h), which `remember_outcome` does not clear. The round's `want` drops a marked hash; a newer
   route is a new hash and is wanted as before. On the canonical, 10,710 of 24,949 routes served in
   one process lifetime were these.
+  Counted on their own, not in `retry_suppressions`: `holdings_index.stale_route.{marked,
+  suppressed, evicted, cleared}` and the gauge `holdings_index_gauge.stale_route.size`. Every mark
+  is dropped when an audit finds a route hash gone from the index (`cleared`); no persist door
+  removes a route's index entry today, so this is a backstop.
 - **Behaviour change: a row refused by several gates is booked under the first one
   (CIRISEdge#971).** The Attestation advertise now asks the audience gate's reach half (from
   memory) before the gates that read the store: author quarantine, the accord relay, the serve

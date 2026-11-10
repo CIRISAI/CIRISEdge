@@ -55,14 +55,15 @@
 //!
 //! # Where a cursor starts
 //!
-//! With the holdings index on, both cursors start at the head of the log
-//! (`None`), so the first drain walks every served row once and the set knows
-//! every record by its key (an attestation's `attestation_id`, a route's
-//! `(occurrence_key_id, transport_kind)`). A rewrite of a record held before
-//! boot (a PQC completion, a re-seal, a superseding route) then replaces its
-//! hash at once instead of leaving the old one until an audit. With the index
-//! off, the Attestation cursor starts [`CURSOR_LAG`] before now, as #930's
-//! memos always did.
+//! Both cursors start [`CURSOR_LAG`] before they are placed, as #930's memos
+//! always did: at the runtime's start
+//! (`FederationDirectoryReplicationBridge::warm_holdings_index` places them
+//! before anything else runs), else at the first ask. The walk from the head
+//! of the log that keys every record held before boot is NOT this feed's: it
+//! runs on its own cursor in the background warm-up, so no round ever waits
+//! behind it (on the canonical about 86 Attestation pages and 37 route pages
+//! of 500). The warm-up places these cursors before it walks, so every row is
+//! seen by the walk, by the feed, or by both.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -144,25 +145,23 @@ pub(crate) enum Covered {
 }
 
 impl Position {
-    /// The cursor to drain from. A first drain starts at the head of the log
-    /// when `from_head` (the holdings index is on: every record is keyed, see
-    /// the module docs), else [`CURSOR_LAG`] before `wall` (the CIRISEdge#930
-    /// rule: the drain carries it to the end of the log before any consumer
-    /// answers from it).
-    pub(crate) fn cursor(
-        &mut self,
-        wall: chrono::DateTime<chrono::Utc>,
-        from_head: bool,
-    ) -> Option<ResumeCursor> {
+    /// The cursor to drain from: placed [`CURSOR_LAG`] before `wall` if it
+    /// was never placed (the CIRISEdge#930 rule: the drain carries it to the
+    /// end of the log before any consumer answers from it).
+    pub(crate) fn cursor(&mut self, wall: chrono::DateTime<chrono::Utc>) -> Option<ResumeCursor> {
+        self.place(wall);
+        self.cursor.clone()
+    }
+
+    /// Place the cursor [`CURSOR_LAG`] before `wall` unless it is placed
+    /// already. The warm-up calls this before its walk.
+    pub(crate) fn place(&mut self, wall: chrono::DateTime<chrono::Utc>) {
         if !self.placed {
             self.placed = true;
-            if !from_head {
-                let lag = chrono::Duration::from_std(CURSOR_LAG)
-                    .unwrap_or_else(|_| chrono::Duration::zero());
-                self.cursor = Some((wall - lag, String::new()));
-            }
+            let lag =
+                chrono::Duration::from_std(CURSOR_LAG).unwrap_or_else(|_| chrono::Duration::zero());
+            self.cursor = Some((wall - lag, String::new()));
         }
-        self.cursor.clone()
     }
 
     pub(crate) fn advance(&mut self, cursor: ResumeCursor) {
@@ -186,6 +185,13 @@ impl Position {
         }
         let inside = now.saturating_duration_since(started) < spacing;
         (inside && self.clean_through == Some(generation)).then_some(Covered::Spaced)
+    }
+
+    /// Test-only: the last drain began `by` earlier (an explicit instant
+    /// past, or inside, the spacing).
+    #[cfg(test)]
+    pub(crate) fn age(&mut self, by: Duration) {
+        self.last_started = self.last_started.and_then(|s| s.checked_sub(by));
     }
 
     /// A drain that started at `started`, when the dirt generation was
@@ -290,10 +296,10 @@ mod tests {
     }
 
     #[test]
-    fn the_first_cursor_starts_a_lag_before_now_with_the_index_off() {
+    fn the_first_cursor_starts_a_lag_before_now() {
         let mut p = Position::default();
         let wall = chrono::Utc::now();
-        let (at, id) = p.cursor(wall, false).expect("seeded");
+        let (at, id) = p.cursor(wall).expect("seeded");
         assert!(id.is_empty());
         assert_eq!(
             wall - at,
@@ -302,15 +308,17 @@ mod tests {
     }
 
     #[test]
-    fn the_first_cursor_starts_at_the_head_with_the_index_on() {
+    fn a_placed_cursor_is_not_placed_again() {
         let mut p = Position::default();
+        let first = chrono::Utc::now();
+        p.place(first);
+        let later = first + chrono::Duration::hours(1);
+        let (at, _) = p.cursor(later).expect("placed");
         assert_eq!(
-            p.cursor(chrono::Utc::now(), true),
-            None,
-            "the head of the log"
+            first - at,
+            chrono::Duration::from_std(CURSOR_LAG).expect("fits"),
+            "the warm-up's placement stands"
         );
-        p.advance((chrono::Utc::now(), "a".into()));
-        assert!(p.cursor(chrono::Utc::now(), true).is_some(), "placed once");
     }
 
     #[test]

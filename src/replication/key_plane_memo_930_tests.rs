@@ -490,3 +490,205 @@ async fn n_peer_rounds_between_writes_cost_one_sweep_930() {
         "{ledger:?}"
     );
 }
+
+/// **v45 (CIRISEdge#971) — the unreported write, at explicit instants.** A
+/// write no edge door reports (the host writing to persist directly, the
+/// CIRISEdge#858 shape) is the production case the probe spacing bounds:
+///
+/// 1. inside the spacing a listing does NOT carry it (the last drain vouches);
+/// 2. once the last drain began a full spacing ago, the next listing does;
+/// 3. a second unreported write, inside the new spacing, is not carried until
+///    a door marks the feed dirty, and then at once.
+///
+/// The instants are set by ageing the feed's last drain, never by sleeping.
+/// Mutants: the spacing ignored (step 1 lists the row), the dirt mark ignored
+/// (step 3's last listing does not).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreported_write_waits_out_the_spacing_and_a_mark_ends_the_wait_971() {
+    let a = NodeA::build("unrep971", 0x35).await;
+    let e = Ident::mint("held-unrep971", "node", 0x3c).await;
+    let f = Ident::mint("held2-unrep971", "node", 0x3d).await;
+    hold(&a.dir, &e).await;
+    hold(&a.dir, &f).await;
+    let subjects: Vec<String> = [&a.p, &a.n, &a.k, &e, &f]
+        .into_iter()
+        .map(|id| id.key_id().to_owned())
+        .collect();
+    let dir: Arc<dyn FederationDirectory> = Arc::clone(&a.dir) as _;
+    let bridge = bridge_over(Arc::clone(&dir), &subjects, None);
+    let before = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(before.len(), 1, "K's revocation only");
+
+    // A revocation of E, written with no door told.
+    let revocation = self_revocation(&a.dir, &e).await;
+    a.dir
+        .put_revocation(SignedRevocation { revocation })
+        .await
+        .expect("local revocation");
+
+    // 1. Inside the spacing.
+    let inside = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(
+        inside.len(),
+        1,
+        "inside the spacing an unreported write is not listed"
+    );
+
+    // 2. The last drain began a full spacing ago.
+    bridge.age_feed(NO_TEST_OUTLIVES).await;
+    let after = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(
+        after.len(),
+        2,
+        "past the spacing the unreported write is listed"
+    );
+    assert_eq!(
+        as_set(&after),
+        oracle(EnvelopeKind::Revocation, &*dir, &subjects).await
+    );
+
+    // 3. A second unreported write, inside the spacing the probe above began.
+    let revocation = self_revocation(&a.dir, &f).await;
+    a.dir
+        .put_revocation(SignedRevocation { revocation })
+        .await
+        .expect("local revocation");
+    let inside = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(
+        inside.len(),
+        2,
+        "inside the new spacing it is not listed yet"
+    );
+    bridge.mark_feed_dirty();
+    let marked = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(marked.len(), 3, "a dirt mark lists it at once");
+    assert_eq!(
+        as_set(&marked),
+        oracle(EnvelopeKind::Revocation, &*dir, &subjects).await
+    );
+}
+
+/// A transport that answers nothing and hands every Revocation Summary it is
+/// asked to send to the witness.
+struct SummaryTap {
+    summaries: tokio::sync::mpsc::UnboundedSender<Vec<EnvelopeRef>>,
+}
+
+#[async_trait::async_trait]
+impl crate::transport::Transport for SummaryTap {
+    fn id(&self) -> crate::transport::TransportId {
+        crate::transport::TransportId::HTTP
+    }
+    async fn send(
+        &self,
+        _destination_key_id: &str,
+        bytes: &[u8],
+    ) -> Result<crate::transport::TransportSendOutcome, crate::transport::TransportError> {
+        use super::protocol::ReplicationMessage;
+        let msg = match super::wire_frame::try_unwrap_framed(bytes) {
+            Ok(Some(framed)) => Some(framed.msg),
+            _ => ReplicationMessage::from_bytes(bytes).ok(),
+        };
+        if let Some(ReplicationMessage::Summary(s)) = msg {
+            if s.kind == EnvelopeKind::Revocation {
+                let _ = self.summaries.send(s.refs);
+            }
+        }
+        Ok(crate::transport::TransportSendOutcome::Delivered)
+    }
+    async fn listen(
+        &self,
+        _sink: tokio::sync::mpsc::Sender<crate::transport::InboundFrame>,
+    ) -> Result<(), crate::transport::TransportError> {
+        Ok(())
+    }
+}
+
+/// **v45 (CIRISEdge#971) — a kick marks the feed dirty BEFORE the rounds it
+/// fires ask.** The server reports every write with a kick of all peers
+/// (`compose::kick_replication`, seventeen modules) and never with
+/// `note_local_write`, so the kick is the production door. A running runtime,
+/// one initiator peer on the Revocation plane, the probe spacing an hour: the
+/// first round lists the store; the host writes a revocation and kicks; the
+/// FIRST round the kick fires offers it, with no wait on the spacing (an hour)
+/// or the memo TTL (ten minutes). With `mark_feed_dirty` removed from
+/// `invalidate_send_set_memos`, or called after the scheduler's kick, the
+/// kicked round's Summary lacks the row and this fails.
+///
+/// No sleep: each step waits on the next Summary the runtime sends. The peer
+/// answers no plane, so the first-contact ladder never applies (it needs a
+/// plane answered elsewhere) and no round runs between the two but the
+/// kicked one (cadence an hour).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kick_marks_the_feed_before_its_rounds_ask_971() {
+    use crate::replication::runtime::{ReplicationRuntime, ReplicationRuntimeConfig};
+    use crate::replication::scheduler::SchedulerConfig;
+    use std::time::Duration;
+    const PEER: &str = "kick971-peer";
+    /// The bound on one Summary's arrival; an event wait, not a sleep.
+    const ARRIVES_WITHIN: Duration = Duration::from_secs(30);
+
+    let a = NodeA::build("kick971", 0x37).await;
+    let e = Ident::mint("held-kick971", "node", 0x3e).await;
+    hold(&a.dir, &e).await;
+    let subjects: Vec<String> = [&a.p, &a.n, &a.k, &e]
+        .into_iter()
+        .map(|id| id.key_id().to_owned())
+        .collect();
+    let dir: Arc<dyn FederationDirectory> = Arc::clone(&a.dir) as _;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let own = subjects.clone();
+    let config = ReplicationRuntimeConfig {
+        enable_bundle_bootstrap_peers: false,
+        scheduler: SchedulerConfig {
+            cadence: Duration::from_hours(1),
+            round_timeout: Duration::from_millis(200),
+            ..SchedulerConfig::default()
+        },
+        bridge: BridgeConfig {
+            feed_probe_spacing: NO_TEST_OUTLIVES,
+            ..BridgeConfig::default()
+        },
+        ..ReplicationRuntimeConfig::default()
+    };
+    let mut rt = ReplicationRuntime::start(
+        Arc::clone(&dir),
+        Arc::new(SummaryTap { summaries: tx }),
+        vec![crate::replication::ReplicationPeer {
+            peer_key_id: PEER.to_string(),
+            kind: EnvelopeKind::Revocation,
+        }],
+        config,
+        Some(Arc::new(move || own.clone())),
+    )
+    .await;
+
+    // The first cadence tick fires at spawn: its listing fills the memo and
+    // drains the feed.
+    let first = tokio::time::timeout(ARRIVES_WITHIN, rx.recv())
+        .await
+        .expect("the first round's Summary")
+        .expect("open");
+    assert_eq!(first.len(), 1, "K's revocation only");
+
+    // The host writes, then kicks every peer (its only report).
+    let revocation = self_revocation(&a.dir, &e).await;
+    a.dir
+        .put_revocation(SignedRevocation { revocation })
+        .await
+        .expect("local revocation");
+    rt.round_now_all().await.expect("kick all");
+
+    let kicked = tokio::time::timeout(ARRIVES_WITHIN, rx.recv())
+        .await
+        .expect("the kicked round's Summary")
+        .expect("open");
+    assert_eq!(
+        kicked.len(),
+        2,
+        "the first kicked round offers the row the kick reported"
+    );
+    let want = oracle(EnvelopeKind::Revocation, &*dir, &subjects).await;
+    assert_eq!(as_set(&kicked), want);
+    rt.shutdown().await;
+}

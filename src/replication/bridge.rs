@@ -5428,13 +5428,18 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
 
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
         let now = Instant::now();
-        let hit = self
-            .refusal_backoff
-            .suppressed_at(kind, envelope_hash, now)
-            // CIRISEdge#971 — a route older than the one held is not asked for
-            // again inside its window (see `stale_routes`).
-            || (kind == EnvelopeKind::TransportDestination
-                && self.stale_routes.suppressed_at(kind, envelope_hash, now));
+        // CIRISEdge#971 — a route older than the one held is not asked for
+        // again inside its window (see `stale_routes`). Counted on its own
+        // (`holdings_index.stale_route.suppressed`), apart from the refusal
+        // memory's `retry_suppressions`, so a working mark is never read as
+        // a route wrongly withheld.
+        if kind == EnvelopeKind::TransportDestination
+            && self.stale_routes.suppressed_at(kind, envelope_hash, now)
+        {
+            self.book_holdings(crate::observability::STALE_ROUTE_SUPPRESSED, 1);
+            return true;
+        }
+        let hit = self.refusal_backoff.suppressed_at(kind, envelope_hash, now);
         if hit {
             self.retry_suppressions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6988,9 +6993,17 @@ impl FederationDirectoryReplicationBridge {
         let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
         match outcome.retry_disposition() {
             None => {
-                // CIRISEdge#971 — an ADMIT of bytes once marked stale (the held
-                // route was removed, so the older one is current again) ends
-                // the mark. A Duplicate never does: the stale arm is one.
+                // CIRISEdge#971 — an ADMIT of bytes once marked stale ends the
+                // mark (a peer pushed them anyway, past the want, and the store
+                // took them). A Duplicate never does: the stale arm is one. This
+                // is NOT what frees a mark when the held newer route goes: no
+                // persist door removes a route's index entry (every index
+                // delete is `kind = 'Attestation'`), and the one route ROW
+                // delete, `remove_transport_destination`, is called only by
+                // persist's `sweep_agent_routes`, for agent-typed keys whose
+                // routes the route door refuses anyway; neither edge nor
+                // CIRISServer calls it. The backstop for a route leaving the
+                // index by any other way is `drop_stale_marks_on_route_removal`.
                 if outcome.is_admitted() {
                     self.stale_routes.clear(kind, &hash);
                 }
@@ -8041,6 +8054,9 @@ impl FederationDirectoryReplicationBridge {
                  diff of this plane is answered from memory from now on (CIRISEdge#971)"
             );
         } else {
+            if plane == super::holdings_index::IndexPlane::TransportDestination && drift.extra > 0 {
+                self.drop_stale_marks_on_route_removal();
+            }
             self.book_holdings(obs::HOLDINGS_AUDITS[slot], 1);
             self.book_holdings(
                 obs::HOLDINGS_DRIFT_MISSING[slot],
@@ -8110,7 +8126,7 @@ impl FederationDirectoryReplicationBridge {
         loop {
             self.book_key_plane(obs::KEY_PLANE_PROBE_READS, 1);
             self.book_holdings(obs::HOLDINGS_FEED_PROBES[slot], 1);
-            let cursor = feed.attestations.cursor(chrono::Utc::now(), indexing);
+            let cursor = feed.attestations.cursor(chrono::Utc::now());
             let read_page = {
                 // CIRISEdge#531 — a bulk page read: one width permit per page.
                 let _permit = self
@@ -8209,10 +8225,7 @@ impl FederationDirectoryReplicationBridge {
         let mut inserted = 0u64;
         loop {
             self.book_holdings(obs::HOLDINGS_FEED_PROBES[slot], 1);
-            // From the head of the log: the route feed exists only for the
-            // index, and a walk from the head keys every route held before
-            // boot (store_feed module docs).
-            let cursor = feed.routes.cursor(chrono::Utc::now(), true);
+            let cursor = feed.routes.cursor(chrono::Utc::now());
             let read_page = {
                 let _permit = self
                     .sweep_gate
@@ -8271,7 +8284,209 @@ impl FederationDirectoryReplicationBridge {
         Ok(())
     }
 
-    /// CIRISEdge#971 — a door edge sees saw a write: the next ask of either
+    /// CIRISEdge#971 — the holdings index's WARM-UP, spawned by the runtime at
+    /// start ([`super::ReplicationRuntime::start`]), never run inline in a
+    /// peer's ask: a seat that just rolled must not hold its first rounds
+    /// behind a walk of the whole served log.
+    ///
+    /// 1. Both serve cursors are placed now ([`super::store_feed::Position::place`]),
+    ///    so every row committed from here on is seen by the shared feed.
+    /// 2. Both planes go Booting: an ask meanwhile takes the pre-v45 drain
+    ///    (answered as before, at the old cost) and does not boot the set.
+    /// 3. Each plane's log is walked from the head on the warm-up's OWN cursor
+    ///    (one sweep permit per page), keying every record held before boot
+    ///    (`attestation_id`; `(occurrence_key_id, transport_kind)`), so a
+    ///    later rewrite of one (a PQC completion, a re-seal, a superseding
+    ///    route) replaces its hash at once. The walk and the feed overlap on
+    ///    the rows of the last [`super::key_plane_memo::CURSOR_LAG`]; both
+    ///    upsert the same record to the same hash. A record rewritten while
+    ///    the walk is on its page can be upserted with its older hash after
+    ///    the feed upserted the newer one: the set then lacks a hash the
+    ///    index holds (a `Duplicate` once, the safe direction) until the boot
+    ///    drain just below reconciles it.
+    /// 4. The plane's boot drain runs under its single-flight and the plane is
+    ///    Ready; the gauge `holdings_index_gauge.<plane>.ready_after_ms` says
+    ///    when.
+    ///
+    /// A walk page or the boot drain the store does not serve leaves the plane
+    /// Unbooted (counted `warm_failures`), so its next ask boots it inline as
+    /// a bridge with no warm-up does. With the lever off this does nothing.
+    pub(crate) async fn warm_holdings_index(&self) {
+        use super::holdings_index::{IndexPlane, Status};
+        use crate::observability as obs;
+        if !self.holdings_index.enabled() {
+            return;
+        }
+        let started = Instant::now();
+        {
+            let mut feed = self.store_feed.lock().await;
+            let wall = chrono::Utc::now();
+            feed.attestations.place(wall);
+            feed.routes.place(wall);
+        }
+        let planes = [IndexPlane::Attestation, IndexPlane::TransportDestination];
+        for plane in planes {
+            self.holdings_index.begin_warm(plane);
+            self.gauge_holdings(plane);
+        }
+        for plane in planes {
+            let slot = plane.slot();
+            let walk_started = Instant::now();
+            let walked = match plane {
+                IndexPlane::Attestation => self.warm_walk_attestations().await,
+                IndexPlane::TransportDestination => self.warm_walk_routes().await,
+            };
+            let Ok(rows) = walked else {
+                self.book_holdings(obs::HOLDINGS_WARM_FAILURES[slot], 1);
+                self.holdings_index.abort_warm(plane);
+                self.gauge_holdings(plane);
+                continue;
+            };
+            let walk_ms = u64::try_from(walk_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let _single = self.holdings_index.maintenance(plane).lock().await;
+            if self.holdings_index.status(plane) != Status::Booting {
+                // Booted before the warm-up reached it (an ask on a bridge
+                // whose warm-up started late): nothing left to do.
+                continue;
+            }
+            if self.holdings_maintenance_drain(plane).await.is_none() {
+                self.book_holdings(obs::HOLDINGS_WARM_FAILURES[slot], 1);
+                continue;
+            }
+            let ready_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if let Some(m) = &self.metrics {
+                m.set_holdings_index_gauge(obs::HOLDINGS_GAUGE_READY_AFTER_MS[slot], ready_ms);
+            }
+            tracing::info!(
+                plane = plane.label(),
+                walked_rows = rows,
+                walk_ms,
+                ready_after_ms = ready_ms,
+                "holdings index warmed: the walk from the head of the log and the boot \
+                 drain are done; this plane's receive diff is answered from memory \
+                 (CIRISEdge#971)"
+            );
+        }
+    }
+
+    /// The warm-up's walk of the Attestation serve log from its head, on its
+    /// own cursor: every served row's record and hash upserted. Returns the
+    /// rows read, `Err` on a page the store did not serve.
+    async fn warm_walk_attestations(&self) -> Result<u64, ()> {
+        use super::holdings_index::{IndexPlane, Record};
+        use super::key_plane_memo::PROBE_PAGE;
+        use crate::observability as obs;
+        let slot = IndexPlane::Attestation.slot();
+        let mut cursor: Option<super::key_plane_memo::ResumeCursor> = None;
+        let mut rows = 0u64;
+        loop {
+            let read = {
+                let _permit = self
+                    .sweep_gate
+                    .enter_at(obs::SWEEP_PERMIT_HOLDINGS_WARM)
+                    .await;
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::Feed,
+                    self.directory
+                        .list_attestations_since(cursor.clone(), PROBE_PAGE),
+                )
+                .await
+            };
+            let page = read.map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "holdings warm-up walk FAILED on the Attestation log: the plane \
+                     boots on its first ask instead (CIRISEdge#971)"
+                );
+            })?;
+            let served = page.len();
+            rows += u64::try_from(served).unwrap_or(u64::MAX);
+            self.book_holdings(
+                obs::HOLDINGS_WARM_ROWS[slot],
+                u64::try_from(served).unwrap_or(u64::MAX),
+            );
+            for row in &page {
+                if let Some((hash, _)) = content_hash_of(&row.attestation) {
+                    let record = Record::attestation(&row.attestation.attestation_id);
+                    self.holdings_index
+                        .upsert(IndexPlane::Attestation, Some(record), hash);
+                }
+            }
+            if let Some(last) = page.last() {
+                cursor = Some(last.resume_pair());
+            }
+            if served < usize::try_from(PROBE_PAGE).unwrap_or(usize::MAX) {
+                return Ok(rows);
+            }
+        }
+    }
+
+    /// The warm-up's walk of the route serve log from its head, as
+    /// [`Self::warm_walk_attestations`].
+    async fn warm_walk_routes(&self) -> Result<u64, ()> {
+        use super::holdings_index::{IndexPlane, Record};
+        use super::key_plane_memo::PROBE_PAGE;
+        use crate::observability as obs;
+        let slot = IndexPlane::TransportDestination.slot();
+        let mut cursor: Option<super::key_plane_memo::ResumeCursor> = None;
+        let mut rows = 0u64;
+        loop {
+            let read = {
+                let _permit = self
+                    .sweep_gate
+                    .enter_at(obs::SWEEP_PERMIT_HOLDINGS_WARM)
+                    .await;
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::Feed,
+                    self.directory
+                        .list_signed_transport_destinations_since(cursor.clone(), PROBE_PAGE),
+                )
+                .await
+            };
+            let page = read.map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "holdings warm-up walk FAILED on the route log: the plane boots on \
+                     its first ask instead (CIRISEdge#971)"
+                );
+            })?;
+            let served = page.len();
+            rows += u64::try_from(served).unwrap_or(u64::MAX);
+            self.book_holdings(
+                obs::HOLDINGS_WARM_ROWS[slot],
+                u64::try_from(served).unwrap_or(u64::MAX),
+            );
+            for row in &page {
+                if let Some((hash, _)) = content_hash_of(&row.destination) {
+                    let td = &row.destination.transport_destination;
+                    let record = Record::route(&td.occurrence_key_id, &td.transport_kind);
+                    self.holdings_index.upsert(
+                        IndexPlane::TransportDestination,
+                        Some(record),
+                        hash,
+                    );
+                }
+            }
+            if let Some(last) = page.last() {
+                cursor = Some(last.resume_pair());
+            }
+            if served < usize::try_from(PROBE_PAGE).unwrap_or(usize::MAX) {
+                return Ok(rows);
+            }
+        }
+    }
+
+    /// CIRISEdge#971 — test-only: both serve cursors' last drains began `by`
+    /// earlier than they did, so a witness stands past the spacing at an
+    /// explicit instant, with no sleep.
+    #[cfg(test)]
+    pub(crate) async fn age_feed(&self, by: Duration) {
+        let mut feed = self.store_feed.lock().await;
+        feed.attestations.age(by);
+        feed.routes.age(by);
+    }
+
+    /// CIRISEdge#971 — one of edge's doors saw a write: the next ask of either
     /// serve cursor probes instead of waiting out the spacing
     /// ([`super::store_feed`] module docs).
     pub(crate) fn mark_feed_dirty(&self) {
@@ -8282,21 +8497,57 @@ impl FederationDirectoryReplicationBridge {
     /// CIRISEdge#971 — mark replicated route bytes stale: a newer route for
     /// the same record is held, so these bytes are not wanted again inside
     /// the terminal window ([`Self::stale_routes`]).
-    fn mark_stale_route(&self, bytes: &[u8]) {
+    pub(super) fn mark_stale_route(&self, bytes: &[u8]) {
+        use crate::observability as obs;
         use sha2::{Digest as _, Sha256};
         let hash: [u8; 32] = Sha256::digest(bytes).into();
+        let kind = EnvelopeKind::TransportDestination;
+        let fresh = !self.stale_routes.contains(kind, &hash);
+        let full = self.stale_routes.len() >= STALE_ROUTE_MARKS;
         let recorded = self.stale_routes.record_tracked_at(
-            EnvelopeKind::TransportDestination,
+            kind,
             hash,
             RetryDisposition::Terminal,
             Some(STALE_ROUTE_CLASS),
             Instant::now(),
         );
+        self.book_holdings(obs::STALE_ROUTE_MARKED, 1);
+        if fresh && full {
+            // Front-drop: the oldest mark went to make room (one re-fetch of
+            // that hash, once).
+            self.book_holdings(obs::STALE_ROUTE_EVICTED, 1);
+        }
+        self.gauge_stale_routes();
         tracing::debug!(
             envelope_hash = %hex::encode(&hash[..8]),
             window_secs = recorded.window.as_secs(),
             "stale route marked: not wanted again inside its window (CIRISEdge#971)"
         );
+    }
+
+    /// CIRISEdge#971 — the stale-route marks' size gauge.
+    fn gauge_stale_routes(&self) {
+        if let Some(m) = &self.metrics {
+            m.set_holdings_index_gauge(
+                crate::observability::HOLDINGS_GAUGE_STALE_ROUTE_SIZE,
+                u64::try_from(self.stale_routes.len()).unwrap_or(u64::MAX),
+            );
+        }
+    }
+
+    /// CIRISEdge#971 — a TransportDestination LEFT the holdings index (an
+    /// audit found the set holding a route hash the index no longer does: a
+    /// purge or an erasure). A held newer route that is gone can make an
+    /// older one current again, and the older bytes are never fetched while
+    /// marked (so their admit can never end the mark), so every mark goes.
+    /// Rare and cheap: each dropped mark costs at most one re-fetch.
+    fn drop_stale_marks_on_route_removal(&self) {
+        let dropped = self.stale_routes.clear_all();
+        self.book_holdings(
+            crate::observability::STALE_ROUTE_CLEARED,
+            u64::try_from(dropped).unwrap_or(u64::MAX),
+        );
+        self.gauge_stale_routes();
     }
 
     /// CIRISEdge#971 — the write-through: an apply that ADMITTED a row on a
@@ -14376,6 +14627,14 @@ impl FederationDirectoryReplicationBridge {
     pub(crate) fn set_narrow_first_contact_read(&self, on: bool) {
         self.narrow_first_contact_read
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// CIRISEdge#971 — the next ask on either plane runs its audit.
+    pub(crate) fn holdings_audit_due_now(&self) {
+        use super::holdings_index::IndexPlane;
+        for plane in [IndexPlane::Attestation, IndexPlane::TransportDestination] {
+            self.holdings_index.audit_due_now(plane);
+        }
     }
 
     pub(crate) fn holdings_index_status(

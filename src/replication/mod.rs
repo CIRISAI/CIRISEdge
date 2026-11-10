@@ -130,6 +130,8 @@ pub mod directory;
 mod first_contact_retry_968_tests;
 #[cfg(test)]
 mod gate_order_971_tests;
+#[cfg(test)]
+mod holdings_doors_971_tests;
 /// CIRISEdge#971 — the receive diff's holdings, kept as a set equal to
 /// persist's content-hash index.
 pub(crate) mod holdings_index;

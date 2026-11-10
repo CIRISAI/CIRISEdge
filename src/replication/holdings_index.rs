@@ -22,9 +22,15 @@
 //!
 //! # Three feeds and an audit
 //!
-//! 1. **Boot drain.** The first holdings ask for a plane drains the index
-//!    exactly as before (the answer it returns IS that drain), and seeds the
-//!    set from it. Until that drain completes, every ask is the old drain.
+//! 1. **Warm-up and boot drain.** At runtime start a background task
+//!    (`FederationDirectoryReplicationBridge::warm_holdings_index`, spawned by
+//!    `ReplicationRuntime::start`) walks each plane's served log from its
+//!    head, keying every record, then drains the index once and seeds the
+//!    set from it. Until then every ask is the old drain, at the old cost, and
+//!    no ask waits on the walk. A bridge with no warm-up (or whose warm-up
+//!    failed) boots on its first holdings ask instead: that drain is the
+//!    ask's answer, as before. `holdings_index_gauge.<plane>.ready_after_ms`
+//!    says when a plane came up.
 //! 2. **Write-through.** Every `Admitted` apply inserts the applied envelope's
 //!    hash at once, so a row this node just admitted is in the set before the
 //!    next peer's Summary arrives, not one probe later. Duplicates and
@@ -74,12 +80,18 @@
 //! rc6 `key_grant:content:*` set, persist `registry::RETIRED_CARRIER_STEMS`)
 //! and nothing else. So the one class the cursor and the index disagree on is
 //! **held rows of a retired carrier type**, written before v55. persist
-//! refuses those types at every door (`registry.rs`, "refuses at EVERY door"),
-//! so after boot no door can add one; the boot drain seeds the ones the index
-//! already holds, and the cursor never names them, so the set keeps exactly
-//! the index's entries for them. The predicate is therefore equal for every
-//! row a door can write after boot, and the retired class is carried by the
-//! drain-seeded entries unchanged. `holdings_index_971_tests` witnesses the
+//! refuses those types at every door that WRITES a row (`registry.rs`,
+//! "refuses at EVERY door"), so after boot no door can add one; the boot drain
+//! seeds the ones the index already holds, and the cursor never names them.
+//! Two doors can REWRITE one, because neither checks the row type: a PQC
+//! completion (`attach_attestation_pqc_signature` → `store_pqc_completion`)
+//! and a re-seal (`store_planned_reseal`). Each re-stamps the row and
+//! re-indexes it under a new hash the cursor filters out, so the set keeps the
+//! old hash and lacks the new one until the next audit (at most
+//! [`DEFAULT_AUDIT_EVERY`]): a `Duplicate` once if a peer offers the new hash
+//! (counted `duplicate_unheld`), then two hashes of drift the audit repairs.
+//! Witness: `a_retired_carrier_row_rewritten_is_repaired_by_the_audit_971`.
+//! For every other row the predicate is equal. `holdings_index_971_tests` witnesses the
 //! equality by a differential run (index vs drain, at every step of a random
 //! sequence over every door edge can drive).
 //!
@@ -87,20 +99,59 @@
 //! returns, the same bytes `reload_record_bytes` hashes (persist's lockstep
 //! fact, `wire_index` module docs), proved by test per envelope kind.
 //!
+//! # The door table
+//!
+//! Every persist v61.2.0 site that writes `signed_wire_index`
+//! (`store/sqlite.rs`; the postgres backend has a twin of each), the feed that
+//! carries it into the set, and its witness. A persist bump that adds a door
+//! is checked against this list: grep persist for `index_stored_record(`,
+//! `sqlite_upsert_wire_index(` and `DELETE FROM signed_wire_index`.
+//!
+//! | persist door (sqlite.rs line of the index write) | edge reaches it as | feed | witness |
+//! |---|---|---|---|
+//! | `store_planned_attestation` (15856) | `put_attestation`, the replicated apply, every emitted row incl. KeyGrant | write-through, cursor | `the_set_equals_a_full_drain_through_every_door_971`, the differential |
+//! | `store_planned_key_record` → `index_stored_key_row` (2777) | the key door | cursor | `the_set_equals_a_full_drain_through_every_door_971` |
+//! | `index_occurrence_row` → `index_plane_row` (2790) | the occurrence door | cursor | `the_set_equals_a_full_drain_through_every_door_971` |
+//! | `store_planned_revocation` → `index_plane_row` (2790) | `put_revocation` | cursor | `the_set_equals_a_full_drain_through_every_door_971` |
+//! | `store_planned_signed_destination` (25339) | the route door, a supersession | route cursor | `the_set_equals_a_full_drain_through_every_door_971` |
+//! | `enter_mesh` (7590) | a promotion | cursor (re-stamped) | `door_promotion_971` |
+//! | `index_holder_claim` (2834) from `store_planned_blob`, `store_holding_claim` | `put_blob_signing`, `put_holding_claim` | cursor | `door_holder_claim_971` |
+//! | `index_holder_claim` (2834) from `store_planned_announcement` | none: reachable only from persist's own tests | cursor | none possible from edge |
+//! | `store_pqc_completion` (15008) | `attach_attestation_pqc_signature` | cursor (re-stamped) | `door_pqc_completion_971`; retired class above |
+//! | `store_planned_reseal` (15562) | `reseal_attestation_v31` | cursor (re-stamped) | `door_reseal_971` |
+//! | `link_group_plane_row` → `index_plane_row` (23199) | `put_family`, `put_community`, `supersede_group_row` | cursor | `door_group_plane_link_971` |
+//! | `store_planned_consent_role` → `index_stored_key_row` (26501) | `set_consent_role` | none needed: the key row's bytes omit the role, the hash is unchanged | `door_consent_role_971` |
+//! | `rebuild_signed_wire_index` (7418) | runtime start (`rebuild_signed_wire_index_fail_soft`), host FFI | none: the warm-up's boot drain runs after it; a runtime rebuild by a host is repaired by the audit (CIRISServer does none) | audit witnesses |
+//! | `store_planned_location_proof(_withdrawal)` (26271, 26329) | not a covered index (`LocationProof`) | n/a | n/a |
+//! | REMOVE `sqlite_upsert_wire_index`'s replaced-hash delete (14789) | every upsert of a known record | mirrored by replacement by record | the differential, `door_pqc_completion_971` |
+//! | REMOVE `purge_attestation_projections` (4829) | `purge_attestation_projections`, `reap_expired_attestations` | none: audit | `removes_converge_at_the_audit_971` |
+//! | REMOVE `store_purge_execution` (24255) | `purge_put_execution` | none: audit | `removes_converge_at_the_audit_971` |
+//! | REMOVE `sqlite_erase_cited_rows` (18210) | trace erasure (`delete_traces_for_agent*`) | none: audit | none yet: the rows it erases are local tier (no entry) unless crossed first, and persist has no crossed-then-erased fixture |
+//!
+//! `rehome_legacy_key_plane` (22995) writes key-plane rows with no index
+//! call; the startup rebuild above indexes them before the warm-up drains.
+//!
+//! **Removes are skipped on purpose.** Between audits the set keeps a removed
+//! hash, so a peer offering it is not asked for it. That is the right want, not
+//! a lag to fix: a purged row is refused at admission by its tombstone, and an
+//! erasure requires that this node NOT re-acquire the row. Do not "fix" the
+//! audit to re-want them.
+//!
 //! # Replacement by record
 //!
 //! The index holds ONE current hash per record (`sqlite_upsert_wire_index`
 //! drops a record's earlier hashes), and so does the set: a new hash for a
-//! known record removes the old one. Both cursors start at the head of the
-//! log while the index is on ([`super::store_feed`]), so every record the
-//! store serves is known by its key before the boot drain reconciles:
+//! known record removes the old one. The warm-up walks the served log from
+//! its head before the boot drain, so every record the store serves is known
+//! by its key when the set first answers:
 //! `attestation_id` on the Attestation plane, `(occurrence_key_id,
 //! transport_kind)` on the route plane. A PQC completion or a re-seal (both
 //! re-stamp the serve position, persist `store_pqc_completion`,
 //! `store_planned_reseal`) or a superseding route therefore replaces its
 //! hash on the next probe, including for a record held before boot. Only
 //! drain-seeded entries the cursor never serves (the retired class above) are
-//! known by hash alone, and nothing rewrites them. The route entry also keeps
+//! known by hash alone; a rewrite of one is the audit's (see the predicate
+//! section above). The route entry also keeps
 //! the route's subject: the stranger view (CC 5.4.6, CIRISEdge#972) can later
 //! filter by owner binding without a second read. Serving is not changed here.
 //!
@@ -459,6 +510,37 @@ impl HoldingsIndex {
                 .last_reconcile
                 .is_none_or(|at| now.saturating_duration_since(at) >= self.audit_every),
         })
+    }
+
+    /// The runtime's warm-up has begun for `plane`: an Unbooted plane is
+    /// Booting from now on, so an ask meanwhile takes the old drain and does
+    /// not boot the set itself (the warm-up's boot drain will). A plane that
+    /// has booted already is left as it is.
+    pub(crate) fn begin_warm(&self, plane: IndexPlane) {
+        if let Ok(mut s) = self.plane(plane).write() {
+            if s.status == Status::Unbooted {
+                s.status = Status::Booting;
+            }
+        }
+    }
+
+    /// The warm-up could not finish `plane`: a plane it left Booting with no
+    /// drain running is Unbooted again, so the next ask boots it inline.
+    pub(crate) fn abort_warm(&self, plane: IndexPlane) {
+        if let Ok(mut s) = self.plane(plane).write() {
+            if s.status == Status::Booting && s.journal.is_none() {
+                s.status = Status::Unbooted;
+            }
+        }
+    }
+
+    /// Test-only: the next ask on `plane` runs its audit (as if
+    /// `audit_every` had passed since the last reconcile).
+    #[cfg(test)]
+    pub(crate) fn audit_due_now(&self, plane: IndexPlane) {
+        if let Ok(mut s) = self.plane(plane).write() {
+            s.last_reconcile = None;
+        }
     }
 
     /// Open a drain's journal. A plane that has never booted is Booting until

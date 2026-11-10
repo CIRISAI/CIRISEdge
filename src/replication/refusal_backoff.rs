@@ -844,6 +844,23 @@ impl RefusalBackoff {
         held
     }
 
+    /// CIRISEdge#971 — is `(kind, envelope_hash)` remembered at all (window
+    /// elapsed or not)?
+    #[must_use]
+    pub fn contains(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
+        self.lock().entries.contains_key(&(kind, *envelope_hash))
+    }
+
+    /// CIRISEdge#971 — forget every row; returns how many were remembered.
+    pub fn clear_all(&self) -> usize {
+        let mut st = self.lock();
+        let keys: Vec<_> = st.entries.keys().copied().collect();
+        for key in &keys {
+            st.remove(key);
+        }
+        keys.len()
+    }
+
     /// How many rows are currently remembered, both classes. The memory's own
     /// witness — a bound nobody can observe is the kind that silently stops
     /// holding.

@@ -1544,6 +1544,8 @@ pub const SWEEP_PERMIT_SEND_SET: &str = "send_set";
 pub const SWEEP_PERMIT_ADVERTISE_PAGE: &str = "advertise_page";
 /// The advertise's required read.
 pub const SWEEP_PERMIT_ADVERTISE_REQUIRED: &str = "advertise_required";
+/// The holdings index's warm-up walk from the head of the log (one page).
+pub const SWEEP_PERMIT_HOLDINGS_WARM: &str = "holdings_warm";
 /// Any acquire that names no site (tests).
 pub const SWEEP_PERMIT_OTHER: &str = "other";
 
@@ -1645,6 +1647,34 @@ pub const HOLDINGS_GAUGE_LAST_DRAIN_MS: [&str; 2] = [
 ];
 /// Gauge: 1 when the lever is on.
 pub const HOLDINGS_GAUGE_ENABLED: &str = "enabled";
+/// CIRISEdge#971 — stale-route marks set (a replicated route older than the
+/// one held, `holdings_index.stale_route.marked`).
+pub const STALE_ROUTE_MARKED: &str = "stale_route.marked";
+/// Wants a stale-route mark dropped (the older bytes not asked for again).
+pub const STALE_ROUTE_SUPPRESSED: &str = "stale_route.suppressed";
+/// Marks evicted, front-drop, to make room past the cap.
+pub const STALE_ROUTE_EVICTED: &str = "stale_route.evicted";
+/// Marks dropped because a route left the index (an audit's `extra`).
+pub const STALE_ROUTE_CLEARED: &str = "stale_route.cleared";
+/// Gauge: stale-route marks held.
+pub const HOLDINGS_GAUGE_STALE_ROUTE_SIZE: &str = "stale_route.size";
+/// Gauge: milliseconds from the runtime's warm-up start to this plane's set
+/// being Ready (its walk from the head of the log plus its boot drain), set
+/// once per process. Absent while the plane has not come up through the
+/// warm-up.
+pub const HOLDINGS_GAUGE_READY_AFTER_MS: [&str; 2] = [
+    "attestation.ready_after_ms",
+    "transport_destination.ready_after_ms",
+];
+/// Rows the warm-up's walk from the head of the log read, per plane.
+pub const HOLDINGS_WARM_ROWS: [&str; 2] =
+    ["attestation.warm_rows", "transport_destination.warm_rows"];
+/// Warm-up walk pages the store did not serve (the plane then boots inline,
+/// on its first ask, as without a warm-up).
+pub const HOLDINGS_WARM_FAILURES: [&str; 2] = [
+    "attestation.warm_failures",
+    "transport_destination.warm_failures",
+];
 
 // ─── v44 LTS — `EdgeMetrics::persisted_standing` labels ─────────────────
 //

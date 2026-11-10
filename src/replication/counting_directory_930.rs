@@ -35,6 +35,12 @@ pub(crate) struct CountingDirectory {
     /// `list_signed_transport_destinations_since` fail (a probe the store did
     /// not serve).
     fail_cursor_reads: Arc<std::sync::atomic::AtomicBool>,
+    /// CIRISEdge#971 — while closed, a serve-cursor read FROM THE HEAD of the
+    /// log (`since: None`, the warm-up's walk) waits here; reads from a
+    /// placed cursor pass. `head_waiting` is notified when one arrives.
+    head_gate: Arc<tokio::sync::Semaphore>,
+    head_gated: Arc<std::sync::atomic::AtomicBool>,
+    head_waiting: Arc<tokio::sync::Notify>,
 }
 
 impl CountingDirectory {
@@ -44,6 +50,36 @@ impl CountingDirectory {
             counts: Arc::new(Mutex::new(BTreeMap::new())),
             hidden_wire_hashes: Arc::new(Mutex::new(std::collections::HashSet::new())),
             fail_cursor_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            head_gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            head_gated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            head_waiting: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// CIRISEdge#971 — hold every later read from the head of a serve log
+    /// until [`Self::open_head_reads`].
+    pub(crate) fn close_head_reads(&self) {
+        self.head_gated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Release every held head read, and every later one.
+    pub(crate) fn open_head_reads(&self) {
+        self.head_gated
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.head_gate
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    }
+
+    /// Wait until a head read is held at the gate.
+    pub(crate) async fn a_head_read_is_held(&self) {
+        self.head_waiting.notified().await;
+    }
+
+    async fn pass_head_gate(&self, from_head: bool) {
+        if from_head && self.head_gated.load(std::sync::atomic::Ordering::SeqCst) {
+            self.head_waiting.notify_one();
+            let _ = self.head_gate.acquire().await.map(|p| p.forget());
         }
     }
 
@@ -799,6 +835,7 @@ impl FederationDirectory for CountingDirectory {
         if self.cursor_reads_fail() {
             return Err(Error::Backend("injected: cursor read failed".into()));
         }
+        self.pass_head_gate(since.is_none()).await;
         self.inner.list_attestations_since(since, limit).await
     }
     // persist v61.0.5 (#1225): defaulted `Unsupported`, overridden by every
@@ -1106,6 +1143,7 @@ impl FederationDirectory for CountingDirectory {
         if self.cursor_reads_fail() {
             return Err(Error::Backend("injected: cursor read failed".into()));
         }
+        self.pass_head_gate(since.is_none()).await;
         self.inner
             .list_signed_transport_destinations_since(since, limit)
             .await
