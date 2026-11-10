@@ -1032,8 +1032,14 @@ pub const BUNDLE_OWNER_PLANES: [EnvelopeKind; 3] = [
 
 /// CIRISEdge#971 (d) — the bootstrap plane a device keeps an ordinary round on
 /// with a bundle seat: key-level revocations have no subject index
-/// (`is_subject_pullable` is false), and the seat's offer there is
-/// `Projection::Global` (its own set and its cohort), small, not the corpus.
+/// (`is_subject_pullable` is false). The seat's offer there is
+/// `Projection::Global` (its own set and its cohort), so the BYTES on the
+/// wire are small, not the corpus. The seat-side walk is not: each responder
+/// round builds the Global subject set and walks it per key
+/// (bridge.rs `list_revocation_rows` → `key_plane_listing`), O(every key the
+/// seat holds) even when the offer is empty. The #930 memo removes the
+/// per-subject store read, not the walk. That cost is measured in the #971
+/// idle-cost witness and belongs to the read-fix branch (withhold-rate).
 pub const BUNDLE_ROUND_PLANES: [EnvelopeKind; 1] = [EnvelopeKind::Revocation];
 
 /// **CIRISEdge#971 (d) — how often a device asks each bundle seat for the
