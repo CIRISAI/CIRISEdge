@@ -406,3 +406,83 @@ async fn an_idle_bundle_pull_costs_the_seat_971() {
     );
     rt.shutdown().await;
 }
+
+/// **CIRISEdge#971 — a fresh bound peer is offered the keys on its first Key
+/// round.** The size fit above saw a bound peer's first Key listing come back
+/// empty (0 of 10). Here the seat's offered keys are hybrid-signed records
+/// (`minted_key_record`, what a real registration stores), and a peer that
+/// has never had a round is listed by the bound (`Some(peer)`) path the
+/// responder takes. Its first listing must offer every one of them, and must
+/// equal the unbound view: the Key arm ignores the #531 sweep window
+/// (`list_envelope_refs_inner`: `Key => list_key_record_rows(None)`), so no
+/// watermark can hold rows back. For contrast, the fixture records
+/// (`fixture_key_record`: fake signature) are listed the same way and
+/// printed, which is what the size fit saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_bound_peer_is_offered_the_keys_on_its_first_key_round_971() {
+    const N: usize = 10;
+    let (backend, bridge) = make_bridge(&[]);
+    let mut keys = Vec::new();
+    for i in 0..N {
+        let record = minted_key_record(
+            &format!("announced-971-bound-{i:02}"),
+            identity_type::NODE,
+            0x40 + u8::try_from(i).expect("small"),
+        )
+        .await;
+        keys.push(record.key_id.clone());
+        backend
+            .put_public_key(SignedKeyRecord { record })
+            .await
+            .expect("hold a signed key record");
+    }
+    let fixture: Vec<String> = (0..N)
+        .map(|i| format!("fixture-971-bound-{i:02}"))
+        .collect();
+    let pairs: Vec<(&str, &str)> = fixture
+        .iter()
+        .map(|k| (k.as_str(), identity_type::NODE))
+        .collect();
+    register_fixture_keys(&backend, &pairs).await;
+    let offer: Vec<String> = keys.iter().chain(&fixture).cloned().collect();
+    let bridge = bridge
+        .with_local_key_id(Some(SEAT.to_owned()))
+        .with_self_provider(Some(Arc::new(move || offer.clone())));
+    let bound = bridge
+        .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("device-971-fresh"))
+        .await;
+    let unbound = bridge
+        .list_envelope_refs_for_peer(EnvelopeKind::Key, None)
+        .await;
+    let fixture_only = {
+        let (b2, br2) = make_bridge(&[]);
+        register_fixture_keys(&b2, &pairs).await;
+        let f = fixture.clone();
+        br2.with_self_provider(Some(Arc::new(move || f.clone())))
+            .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("device-971-fresh"))
+            .await
+            .len()
+    };
+    eprintln!(
+        "971 bound-key first round: signed_keys={N} fixture_keys={N} bound_refs={} \
+         unbound_refs={} fixture_only_bound_refs={fixture_only}",
+        bound.len(),
+        unbound.len()
+    );
+    let set = |v: &[EnvelopeRef]| {
+        v.iter()
+            .map(|r| r.envelope_hash)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert!(
+        bound.len() >= N,
+        "a fresh bound peer's first Key listing offers every signed key record the seat \
+         publishes: {} of {N}",
+        bound.len()
+    );
+    assert_eq!(
+        set(&bound),
+        set(&unbound),
+        "the bound and unbound Key views are the same set (no watermark on Key)"
+    );
+}
