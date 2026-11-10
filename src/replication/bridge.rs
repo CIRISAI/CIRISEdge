@@ -2967,6 +2967,10 @@ pub struct FederationDirectoryReplicationBridge {
     /// gate), the reference the agreement witness compares against.
     #[cfg(test)]
     early_reach_check: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#971 — test-only: `false` reads every row a first-contact
+    /// peer authored in the required read (the pre-v45 read).
+    #[cfg(test)]
+    narrow_first_contact_read: std::sync::atomic::AtomicBool,
     /// CIRISEdge#544 — how many wanted hashes the backoff has actually removed
     /// from a round's `want`. The memory's own witness, in the discipline of
     /// [`Self::owner_reads`] and [`Self::sweep_max_page_rows`]: "the retry storm
@@ -3253,6 +3257,8 @@ impl FederationDirectoryReplicationBridge {
             stale_routes: RefusalBackoff::with_capacities(STALE_ROUTE_MARKS, 1),
             #[cfg(test)]
             early_reach_check: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            narrow_first_contact_read: std::sync::atomic::AtomicBool::new(true),
             retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
             rows_parked_on_signer: std::sync::atomic::AtomicUsize::new(0),
             signer_releases: std::sync::atomic::AtomicUsize::new(0),
@@ -11265,7 +11271,11 @@ impl FederationDirectoryReplicationBridge {
         let mut listed = 0;
         let mut counts = PageCounts::default();
         if ctx.moves != UnaskedOffer::Commons {
-            let required = self.required_rows(&key, &ctx.peer_principals).await;
+            let reach = ctx
+                .resolved_recipient
+                .as_ref()
+                .map(ResolvedRecipient::reach);
+            let required = self.required_rows(&key, &ctx.peer_principals, reach).await;
             if let Ok(required) = self
                 .offer_rows(
                     required, None, &mut ctx, peer_label, None, &mut refs, &mut seen,
@@ -11963,10 +11973,22 @@ impl FederationDirectoryReplicationBridge {
     /// allegiance rows. Every row still crosses the whole gate stack. Each read
     /// is one page, newest first (the invitations a budget of pages); what is
     /// past it is the walk's. A failed read is the walk's as well.
+    ///
+    /// CIRISEdge#971 — for a FIRST-CONTACT peer the peer's own rows are read
+    /// only in the shapes that reach can carry when the peer wrote them: a
+    /// consent grant ([`Self::consent_grant_names`]), a group-plane row
+    /// (persist's resolver decides those before any reach) and a membership
+    /// ceremony row ([`Self::first_contact_membership_serves`]). Every other
+    /// row the peer authored is refused by the first-contact reach (it is not
+    /// this node's allegiance fact), so reading a page of them each round was
+    /// the refusals the canonical booked at ~2,000 a minute, each paying its
+    /// gates first. The walk still reaches them for any reach that can carry
+    /// them; the offer is unchanged (the agreement witness).
     async fn required_rows(
         &self,
         key: &(String, EnvelopeKind),
         peer_principals: &HashSet<String>,
+        reach: Option<Reach>,
     ) -> Vec<ciris_persist::federation::ServedAttestation> {
         use ciris_persist::federation::attestation_query::AttestationQuery;
         use ciris_persist::federation::consent_grammar::GRANT_DIMENSION;
@@ -12016,7 +12038,28 @@ impl FederationDirectoryReplicationBridge {
                 ]),
             );
         }
-        queries.push(AttestationQuery::by(peer, REQUIRED_READ_PAGE));
+        #[cfg(test)]
+        let narrow = self
+            .narrow_first_contact_read
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let narrow = true;
+        if narrow && reach == Some(Reach::FirstContact) {
+            queries.push(
+                AttestationQuery::by(peer, REQUIRED_READ_PAGE).dimension_any_of(&[
+                    GRANT_DIMENSION,
+                    gp::GROUP_ROSTER_DIMENSION,
+                    gp::MEMBERSHIP_WIDENING_DIMENSION,
+                    gp::MEMBERSHIP_REMOVAL_DIMENSION,
+                    gp::MEMBERSHIP_RESIGNATION_DIMENSION,
+                    ciris_persist::federation::membership_acceptance::PROPOSAL_DIMENSION,
+                    ciris_persist::federation::membership_acceptance::ACCEPTANCE_DIMENSION,
+                    ciris_persist::federation::membership_acceptance::DECLINE_DIMENSION,
+                ]),
+            );
+        } else {
+            queries.push(AttestationQuery::by(peer, REQUIRED_READ_PAGE));
+        }
         queries.extend(local.iter().map(|key| {
             AttestationQuery::by(key, REQUIRED_READ_PAGE).types(&[attestation_type::DELEGATES_TO])
         }));
@@ -14248,6 +14291,13 @@ impl FederationDirectoryReplicationBridge {
     /// or the v45 order (`true`, the default).
     pub(crate) fn set_early_reach_check(&self, on: bool) {
         self.early_reach_check
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// CIRISEdge#971 — read a first-contact peer's own rows in full (`false`,
+    /// the pre-v45 read) or only in the shapes its reach can carry (`true`).
+    pub(crate) fn set_narrow_first_contact_read(&self, on: bool) {
+        self.narrow_first_contact_read
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 

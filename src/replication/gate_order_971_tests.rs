@@ -182,3 +182,55 @@ async fn a_first_contact_peer_costs_no_gate_reads_971() {
         new.count("execute_attestation_query")
     );
 }
+
+/// **CIRISEdge#971 commit 4 — the narrowed required read offers the same.**
+/// For every peer, the offer with a first-contact peer's own rows read only in
+/// the shapes its reach can carry equals the offer with all of them read, and
+/// the first-contact peer that authored rows here is refused fewer of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_narrowed_first_contact_read_offers_the_same_971() {
+    use crate::observability::{EdgeMetrics, WithholdReason};
+    let f = fixture("narrow971", 0x41).await;
+    let dir = Arc::clone(&f.a.dir) as Arc<dyn FederationDirectory>;
+    let peers = [
+        f.consented.key_id().to_owned(),
+        f.a.n.key_id().to_owned(),
+        f.a.k.key_id().to_owned(),
+        f.a.p.key_id().to_owned(),
+        "node-never-seen-narrow971".to_owned(),
+    ];
+    for peer in &peers {
+        let mut offers = Vec::new();
+        let mut refused = Vec::new();
+        for narrow in [false, true] {
+            let metrics = EdgeMetrics::new();
+            let b = bridge_over(Arc::clone(&dir), f.local.key_id(), true)
+                .with_metrics(Some(metrics.clone()));
+            b.set_narrow_first_contact_read(narrow);
+            offers.push(offer(&b, peer).await);
+            refused.push(metrics.withholds(WithholdReason::RecipientNotInSendSet));
+        }
+        assert_eq!(
+            offers[1], offers[0],
+            "peer {peer}: the narrowed read offers the same"
+        );
+        assert!(refused[1] <= refused[0], "peer {peer}: never more refusals");
+    }
+    // N authored its key-plane rows and the carrier here: the full read paid a
+    // refusal for each, the narrowed one does not read them.
+    let mut refused = Vec::new();
+    for narrow in [false, true] {
+        let metrics = EdgeMetrics::new();
+        let b = bridge_over(Arc::clone(&dir), f.local.key_id(), true)
+            .with_metrics(Some(metrics.clone()));
+        b.set_narrow_first_contact_read(narrow);
+        let _ = offer(&b, f.a.n.key_id()).await;
+        refused.push(metrics.withholds(WithholdReason::RecipientNotInSendSet));
+    }
+    assert!(
+        refused[1] < refused[0],
+        "the first-contact author is refused fewer rows (full {}, narrowed {})",
+        refused[0],
+        refused[1]
+    );
+}

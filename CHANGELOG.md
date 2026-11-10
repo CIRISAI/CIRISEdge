@@ -64,6 +64,11 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   in one Policy class for CIRISServer's operator surface. For a first-contact peer the advertise
   now reads no consent grant and no quarantine marker for refused rows, and the peer's owner
   (`owner_of`) is read once per round instead of once per consent-grant row.
+- **A first-contact peer's own rows are read only in the shapes its reach can carry
+  (CIRISEdge#971).** The required read used to take a page of every row the peer authored; for a
+  first-contact peer it now takes only its consent grants, group-plane rows and membership ceremony
+  rows, the only peer-authored shapes that reach admits. The offer is unchanged; the refused rows
+  are no longer read.
 - **Naming a shaping class is no longer the shaping opt-in (CIRISEdge#969, CC 5.4.3).**
   `init_edge_runtime(shaping_class="home" | "phone-wifi" | "phone-cellular")` used to shape every
   identity link while seeding the device with no opt-in, so the policy and the device disagreed.
