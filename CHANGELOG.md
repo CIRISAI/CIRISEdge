@@ -20,6 +20,24 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
 
 ### 45.0.0
 
+- **The bundle's serve nodes are bootstrap peers only when this runtime's
+  directory holds their key record** (CIRISEdge#971, #881).
+  `enable_bundle_bootstrap_peers` keeps its opt-in sense and its `false`
+  default. With it set, a baked serve node joins only if this node's own
+  directory holds its key record. Only persist's Engine boot seed writes those
+  records, and it skips them under a test trust root, so tests, harnesses and
+  scratch directories add none. A serve node whose record lands after start
+  joins at the next `set_peers` (latched: zero reads once held). A node that
+  opens no replication round to anyone says so at start, naming each skipped
+  serve node and why (WARN, `tracked: CIRISEdge#971`). From v43.2.0 to v44.1.2
+  no host set the flag, so an unclaimed device rounded with nobody.
+- **No automated path names a third party to a seat the node has no consent
+  relationship with** (CIRISEdge#971, CC 5.4.6). Signer recovery toward a
+  bundle seat the host does not name asks only for a signer of a row that
+  seat delivered, or for the seat's own key. A key a person is waiting on
+  (#904) and an unrouted repair name stay queued for a consent peer. The
+  rule is read at the moment of asking, so it follows the host's peer set
+  (`names_only_required_subjects`).
 - **Replication sends to a peer no rule can reach are refused before any path
   seek** (CIRISEdge#971). With no live link, no path and no authenticated
   transit pair, CC 5.3.3.5 E1 forbids the dial, so the 3 s seek and its path

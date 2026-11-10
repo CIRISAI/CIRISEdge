@@ -744,17 +744,29 @@ pub struct ReplicationRuntimeConfig {
     /// cannot evaluate its own trust. The server supplies the same
     /// `node_key_id` it already threads into consent-peer resolution.
     pub local_key_id: Option<String>,
-    /// CIRISEdge#881 — add the baked bundle's seated serve nodes as initiator
-    /// peers on the bootstrap planes, so an unclaimed node (no consent-derived
-    /// peers) rounds with the canonicals the bundle seeds, on the planes that
+    /// CIRISEdge#881 — the baked bundle's seated serve nodes round with this
+    /// node as initiator peers on the bootstrap planes
+    /// ([`BOOTSTRAP_ROUND_PLANES`]), so an unclaimed node (no consent-derived
+    /// peers) rounds with the canonicals the bundle seeds, on planes that
     /// already have everyone-reach for announced nodes (#682) and admit
-    /// unattributed receipt (#402), and receives its owner's announced route
-    /// row with no host-side Pull. **Opt-in** (`false` by default): the host
-    /// sets it for device nodes; a runtime built for tests or for a node that
-    /// deliberately runs outside the production mesh then never rounds
-    /// against a production canonical it cannot reach (the v43.2 PR run
-    /// showed every integration runtime doing so). Never applied under a
-    /// test trust root (`test_trust_root_override_active`) either way.
+    /// unattributed receipt (#402): its route row (its transit pair) reaches
+    /// the seat, and its owner's announced route row reaches it, with no
+    /// host-side Pull.
+    ///
+    /// **Opt-in** (`false` by default): the host sets it for device nodes. No
+    /// host has (CIRISEdge#971): from v43.2.0 to v44.1.2 an unclaimed device
+    /// that consent named to no seat opened no round to anyone, and the seat
+    /// held it Advisory and pairless for good; such a node now says so at
+    /// start.
+    ///
+    /// What keeps a runtime that is not on the production mesh (tests,
+    /// harnesses, a node over a scratch directory) from rounding with a
+    /// production canonical, with the flag set, is that a serve node is added only when
+    /// THIS runtime's directory holds its key record
+    /// ([`bundle_bootstrap_peers_held`]), and only persist's Engine boot seed
+    /// writes those records, which it skips under a test trust root. A bare
+    /// directory never holds them. Never applied under a test trust root
+    /// (`test_trust_root_override_active`) either way.
     pub enable_bundle_bootstrap_peers: bool,
     /// CIRISEdge#541/#552 — the subject whose SERVING TIER is resolved.
     ///
@@ -888,6 +900,110 @@ fn note_retired_plane_skipped(peer_key_id: &str, kind: EnvelopeKind) {
     );
 }
 
+/// Why a bundle serve node is not one of this runtime's bootstrap peers
+/// (CIRISEdge#971), named on the start-up line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleSkip {
+    /// The host did not opt in (`enable_bundle_bootstrap_peers` is false).
+    OptedOut,
+    /// A test trust root is active (persist skips the bundle under it too).
+    TestTrustRoot,
+    /// This runtime's directory holds no key record for it: the bundle was
+    /// never seeded here, so no round with it could be dialled.
+    NotInDirectory,
+    /// It is this node.
+    IsSelf,
+    /// The directory read failed; skipped this start, never fatal.
+    ReadFailed,
+}
+
+impl BundleSkip {
+    /// A stable token for the start-up line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OptedOut => "bundle_path_off",
+            Self::TestTrustRoot => "test_trust_root",
+            Self::NotInDirectory => "not_in_directory",
+            Self::IsSelf => "self",
+            Self::ReadFailed => "read_failed",
+        }
+    }
+}
+
+/// **CIRISEdge#971 — the bundle's serve nodes this runtime may round with**,
+/// and why each other one is skipped. A serve node becomes a bootstrap peer
+/// (on every [`BOOTSTRAP_ROUND_PLANES`] plane, [`bundle_bootstrap_peers`])
+/// only when no test trust root is active, the host has not opted out, it is
+/// not this node, and `directory` holds its key record. A read error skips
+/// that node and says so; it never fails the caller. [`ReplicationRuntime::start`]
+/// calls this with the baked ids and `test_trust_root_override_active()`.
+pub async fn bundle_bootstrap_peers_held(
+    serve_nodes: &[String],
+    directory: &dyn FederationDirectory,
+    local: Option<&str>,
+    disabled: bool,
+    test_trust_root: bool,
+) -> (Vec<ReplicationPeer>, Vec<(String, BundleSkip)>) {
+    let mut held = Vec::new();
+    let mut skipped = Vec::new();
+    for id in serve_nodes {
+        if test_trust_root {
+            skipped.push((id.clone(), BundleSkip::TestTrustRoot));
+            continue;
+        }
+        if disabled {
+            skipped.push((id.clone(), BundleSkip::OptedOut));
+            continue;
+        }
+        if Some(id.as_str()) == local {
+            skipped.push((id.clone(), BundleSkip::IsSelf));
+            continue;
+        }
+        match directory.lookup_public_key(id).await {
+            Ok(Some(_)) => held.push(id.clone()),
+            Ok(None) => skipped.push((id.clone(), BundleSkip::NotInDirectory)),
+            Err(e) => {
+                tracing::warn!(
+                    serve_node = %id,
+                    error = %e,
+                    "bundle serve node skipped as a bootstrap peer: its key record could not \
+                     be read; this start rounds without it (tracked: CIRISEdge#971)"
+                );
+                skipped.push((id.clone(), BundleSkip::ReadFailed));
+            }
+        }
+    }
+    (bundle_bootstrap_peers(&held, local), skipped)
+}
+
+/// **CIRISEdge#971 — the late-arrival re-check, latched.** Of `skipped`, only
+/// the serve nodes skipped for want of a record (`NotInDirectory`) or for a
+/// read that failed (`ReadFailed`) are read again; an opt-out, a test trust
+/// root and self never change for a runtime's life and are never re-read. A
+/// serve node found now is returned as peers; one held is never in `skipped`
+/// again, so once every serve node is held or fixed-skipped this reads
+/// NOTHING. A held serve node stays held for the runtime's life, as the
+/// start-time check holds it.
+pub async fn recheck_bundle_peers(
+    skipped: &[(String, BundleSkip)],
+    directory: &dyn FederationDirectory,
+    local: Option<&str>,
+) -> (Vec<ReplicationPeer>, Vec<(String, BundleSkip)>) {
+    let (pending, fixed): (Vec<_>, Vec<_>) = skipped
+        .iter()
+        .cloned()
+        .partition(|(_, why)| matches!(why, BundleSkip::NotInDirectory | BundleSkip::ReadFailed));
+    if pending.is_empty() {
+        return (Vec::new(), fixed);
+    }
+    let ids: Vec<String> = pending.into_iter().map(|(id, _)| id).collect();
+    let (added, mut still) =
+        bundle_bootstrap_peers_held(&ids, directory, local, false, false).await;
+    still.extend(fixed);
+    (added, still)
+}
+
 /// CIRISEdge#881 — the initiator peers the bundle's seated serve nodes
 /// (`serve_nodes`, the baked canonical ids) add: each on every
 /// [`BOOTSTRAP_ROUND_PLANES`] plane, never this node itself.
@@ -905,6 +1021,34 @@ pub fn bundle_bootstrap_peers(serve_nodes: &[String], local: Option<&str>) -> Ve
                 })
         })
         .collect()
+}
+
+/// The peer key ids in `peers`.
+fn peer_keys(peers: &[ReplicationPeer]) -> HashSet<String> {
+    peers.iter().map(|p| p.peer_key_id.clone()).collect()
+}
+
+/// The distinct peer key ids in `peers`.
+fn distinct_peers(peers: &[ReplicationPeer]) -> u64 {
+    let ids: HashSet<&str> = peers.iter().map(|p| p.peer_key_id.as_str()).collect();
+    u64::try_from(ids.len()).unwrap_or(u64::MAX)
+}
+
+/// CIRISEdge#971 — set the `initiator_peers` gauge: distinct peers by source.
+fn note_initiator_peers(
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    host: u64,
+    bundle: &[ReplicationPeer],
+    homed: u64,
+) {
+    use crate::observability::{
+        INITIATOR_PEERS_BUNDLE, INITIATOR_PEERS_HOMED, INITIATOR_PEERS_HOST,
+    };
+    if let Some(m) = metrics {
+        m.set_initiator_peers(INITIATOR_PEERS_HOST, host);
+        m.set_initiator_peers(INITIATOR_PEERS_BUNDLE, distinct_peers(bundle));
+        m.set_initiator_peers(INITIATOR_PEERS_HOMED, homed);
+    }
 }
 
 /// CIRISEdge#881 — `peers` plus every `extra` not already in it, order kept.
@@ -1084,9 +1228,16 @@ pub struct ReplicationRuntime {
     current_initiators: Arc<Mutex<HashSet<(String, EnvelopeKind)>>>,
     /// CIRISEdge#881 — the bundle-seeded bootstrap peers merged into every
     /// peer set this runtime is given (`start`, `set_peers`).
-    bundle_peers: Vec<ReplicationPeer>,
+    /// CIRISEdge#971 — grows only: a serve node whose record lands after
+    /// start joins at the next `set_peers` ([`recheck_bundle_peers`]).
+    bundle_peers: std::sync::Mutex<Vec<ReplicationPeer>>,
+    /// CIRISEdge#971 — the directory the bundle re-check reads.
+    bundle_directory: Arc<dyn FederationDirectory>,
     /// CC 5.4.3 referrals — the nodes homed on, merged the same way.
     homed_peers: Arc<Mutex<Vec<ReplicationPeer>>>,
+    /// CIRISEdge#971 — each bundle serve node not taken as a bootstrap peer,
+    /// with why ([`Self::bundle_skipped`]).
+    bundle_skipped: std::sync::Mutex<Vec<(String, BundleSkip)>>,
     /// CIRISEdge#927 — whether this node's Initiator rounds proactively deliver
     /// their publish set (set iff `start` got a `self_provider`). Applied to
     /// every Initiator coordinator this runtime builds, including hot-adds.
@@ -1167,17 +1318,43 @@ impl ReplicationRuntime {
         // common path.
         // CIRISEdge#881 — the bundle's seated serve nodes round with this node
         // on the bootstrap planes whether or not consent names any peer.
-        let bundle_peers = if !config.enable_bundle_bootstrap_peers
-            || crate::edge::test_trust_root_override_active()
-        {
-            Vec::new()
-        } else {
-            bundle_bootstrap_peers(
-                &crate::edge::baked_canonical_genesis_ids(),
-                config.local_key_id.as_deref(),
-            )
-        };
+        let serve_nodes = crate::edge::baked_canonical_genesis_ids();
+        let bundle_directory = Arc::clone(&directory);
+        let (bundle_peers, bundle_skipped) = bundle_bootstrap_peers_held(
+            &serve_nodes,
+            &*directory,
+            config.local_key_id.as_deref(),
+            !config.enable_bundle_bootstrap_peers,
+            crate::edge::test_trust_root_override_active(),
+        )
+        .await;
+        let host_peers = distinct_peers(&peers);
+        let host_keys: HashSet<String> = peer_keys(&peers);
         let peers = without_retired_planes(merge_peers(peers, &bundle_peers));
+        note_initiator_peers(config.metrics.as_ref(), host_peers, &bundle_peers, 0);
+        if peers.is_empty() {
+            // CIRISEdge#971 — a node with nobody to round with is silent
+            // about it otherwise: from v43.2.0 to v44.1.2 every unclaimed
+            // device was this node, and nothing said so.
+            tracing::warn!(
+                skipped = ?bundle_skipped
+                    .iter()
+                    .map(|(id, why)| format!("{id}:{}", why.as_str()))
+                    .collect::<Vec<_>>(),
+                "this node will open NO replication round to any seat or peer: no consent \
+                 peer names one and every bundle serve node was skipped (named with why). It \
+                 is served only by rounds others open to it, until consent names a peer \
+                 (tracked: CIRISEdge#971)"
+            );
+        } else {
+            for (id, why) in &bundle_skipped {
+                tracing::debug!(
+                    serve_node = %id,
+                    reason = why.as_str(),
+                    "bundle serve node not a bootstrap peer (CIRISEdge#971)"
+                );
+            }
+        }
         if !bundle_peers.is_empty() {
             tracing::info!(
                 serve_nodes = bundle_peers.len() / BOOTSTRAP_ROUND_PLANES.len(),
@@ -1237,6 +1414,10 @@ impl ReplicationRuntime {
             Arc::clone(&convergence),
             key_grant_wake.clone(),
         );
+        // CIRISEdge#971 — the host's consent peers and the bundle seats, for
+        // the no-consent seat rule (`names_only_required_subjects`).
+        bridge.set_consent_peers(host_keys.iter().cloned());
+        bridge.set_bundle_seats(peer_keys(&bundle_peers));
 
         // CIRISEdge#727 — the registry carries the owner-binding rung's
         // receiver gate (see [`registry_for`]).
@@ -1386,7 +1567,9 @@ impl ReplicationRuntime {
             config,
             scheduler_handle,
             current_initiators,
-            bundle_peers,
+            bundle_peers: std::sync::Mutex::new(bundle_peers),
+            bundle_skipped: std::sync::Mutex::new(bundle_skipped),
+            bundle_directory,
             homed_peers,
             proactive_publish,
             mesh_config,
@@ -1805,9 +1988,22 @@ impl ReplicationRuntime {
         &self,
         desired: Vec<ReplicationPeer>,
     ) -> Result<(), ReplicationRuntimeError> {
+        let host = distinct_peers(&desired);
+        let homed = self.homed_peers.lock().await.clone();
+        let bundle = self.recheck_bundle().await;
+        // CIRISEdge#971 — read live at each signer-recovery take: a seat the
+        // host names leaves the no-consent set, one it drops re-enters it.
+        self.bridge.set_consent_peers(peer_keys(&desired));
+        self.bridge.set_bundle_seats(peer_keys(&bundle));
+        note_initiator_peers(
+            self.config.metrics.as_ref(),
+            host,
+            &bundle,
+            distinct_peers(&homed),
+        );
         // CIRISEdge#881 — the bundle's bootstrap peers ride every peer set.
-        let desired = merge_peers(desired, &self.bundle_peers);
-        let desired = merge_peers(desired, &self.homed_peers.lock().await);
+        let desired = merge_peers(desired, &bundle);
+        let desired = merge_peers(desired, &homed);
         let desired_set: HashSet<(String, EnvelopeKind)> = desired
             .iter()
             .map(|p| (p.peer_key_id.clone(), p.kind))
@@ -1944,6 +2140,67 @@ impl ReplicationRuntime {
             .await
     }
 
+    /// CIRISEdge#971 — the bundle serve nodes this runtime rounds with on the
+    /// bootstrap planes, and those it skipped with why.
+    #[must_use]
+    pub fn bundle_peers(&self) -> (Vec<ReplicationPeer>, Vec<(String, BundleSkip)>) {
+        (
+            self.bundle_peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            self.bundle_skipped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+    }
+
+    /// CIRISEdge#971 test seam — stand in for the baked bundle: the serve
+    /// nodes this runtime has skipped, as `start` would have recorded them.
+    #[cfg(test)]
+    pub(crate) fn seed_bundle_skipped_for_test(&self, skipped: Vec<(String, BundleSkip)>) {
+        *self
+            .bundle_skipped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = skipped;
+    }
+
+    /// CIRISEdge#971 — the bundle's serve nodes as they stand now: re-check
+    /// the ones not yet held ([`recheck_bundle_peers`]) and take any that
+    /// landed. Zero reads once every serve node is held or fixed-skipped.
+    async fn recheck_bundle(&self) -> Vec<ReplicationPeer> {
+        let skipped = self
+            .bundle_skipped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let (added, still) = recheck_bundle_peers(
+            &skipped,
+            &*self.bundle_directory,
+            self.config.local_key_id.as_deref(),
+        )
+        .await;
+        if !added.is_empty() {
+            tracing::info!(
+                serve_nodes = distinct_peers(&added),
+                planes = ?BOOTSTRAP_ROUND_PLANES,
+                "a bundle serve node's record landed after start: it is a bootstrap peer from \
+                 now on (CIRISEdge#971)"
+            );
+        }
+        *self
+            .bundle_skipped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = still;
+        let mut peers = self
+            .bundle_peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        peers.extend(added);
+        peers.clone()
+    }
+
     /// The runtime's bridge. Useful for telemetry or tests that
     /// want to inspect cache state.
     pub fn bridge(&self) -> Arc<FederationDirectoryReplicationBridge> {
@@ -2075,6 +2332,227 @@ mod tests {
         ) -> Result<(), TransportError> {
             unimplemented!("runtime tests don't drive listen")
         }
+    }
+
+    // ── CIRISEdge#971 — the bundle path, on by default, behind ONE rule ──
+
+    /// A directory that holds a key record for each of `held`.
+    async fn directory_holding(held: &[&str]) -> Arc<dyn FederationDirectory> {
+        use ciris_persist::federation::types::identity_type;
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
+        let keys: Vec<(&str, &str)> = held.iter().map(|k| (*k, identity_type::NODE)).collect();
+        crate::replication::bridge::tests::register_fixture_keys(&backend, &keys).await;
+        backend
+    }
+
+    fn planes_of(peers: &[ReplicationPeer], who: &str) -> Vec<EnvelopeKind> {
+        let mut kinds: Vec<EnvelopeKind> = peers
+            .iter()
+            .filter(|p| p.peer_key_id == who)
+            .map(|p| p.kind)
+            .collect();
+        kinds.sort_by_key(|k| k.as_wire_str());
+        kinds
+    }
+
+    /// (a) A serve node this runtime's directory holds is a bootstrap peer on
+    /// the bootstrap planes and nothing else; one it does not hold is skipped
+    /// by name. Mutation: drop the directory check, `seat-b` is a peer.
+    #[tokio::test]
+    async fn a_held_serve_node_is_a_bootstrap_peer_on_the_bootstrap_planes_only_971() {
+        let dir = directory_holding(&["seat-a"]).await;
+        let ids = vec!["seat-a".to_owned(), "seat-b".to_owned()];
+        let (peers, skipped) =
+            bundle_bootstrap_peers_held(&ids, &*dir, Some("device"), false, false).await;
+        let mut want = BOOTSTRAP_ROUND_PLANES.to_vec();
+        want.sort_by_key(|k| k.as_wire_str());
+        assert_eq!(planes_of(&peers, "seat-a"), want);
+        assert!(
+            planes_of(&peers, "seat-b").is_empty(),
+            "not held: not a peer"
+        );
+        assert_eq!(
+            skipped,
+            vec![("seat-b".to_owned(), BundleSkip::NotInDirectory)]
+        );
+    }
+
+    /// (b) Under a test trust root no serve node is a peer, held or not.
+    #[tokio::test]
+    async fn under_a_test_trust_root_no_serve_node_is_a_peer_971() {
+        let dir = directory_holding(&["seat-a"]).await;
+        let ids = vec!["seat-a".to_owned()];
+        let (peers, skipped) =
+            bundle_bootstrap_peers_held(&ids, &*dir, Some("device"), false, true).await;
+        assert!(peers.is_empty());
+        assert_eq!(
+            skipped,
+            vec![("seat-a".to_owned(), BundleSkip::TestTrustRoot)]
+        );
+    }
+
+    /// (c) The bundle path not enabled: no serve node is a peer.
+    #[tokio::test]
+    async fn the_opt_out_takes_no_serve_node_971() {
+        let dir = directory_holding(&["seat-a"]).await;
+        let ids = vec!["seat-a".to_owned()];
+        let (peers, skipped) =
+            bundle_bootstrap_peers_held(&ids, &*dir, Some("device"), true, false).await;
+        assert!(peers.is_empty());
+        assert_eq!(skipped, vec![("seat-a".to_owned(), BundleSkip::OptedOut)]);
+    }
+
+    /// (d) A serve node does not round with itself, though it holds its own
+    /// record; the other seats it holds are its peers.
+    #[tokio::test]
+    async fn a_serve_node_does_not_add_itself_971() {
+        let dir = directory_holding(&["seat-a", "seat-b"]).await;
+        let ids = vec!["seat-a".to_owned(), "seat-b".to_owned()];
+        let (peers, skipped) =
+            bundle_bootstrap_peers_held(&ids, &*dir, Some("seat-a"), false, false).await;
+        assert!(planes_of(&peers, "seat-a").is_empty());
+        assert_eq!(
+            planes_of(&peers, "seat-b").len(),
+            BOOTSTRAP_ROUND_PLANES.len()
+        );
+        assert_eq!(skipped, vec![("seat-a".to_owned(), BundleSkip::IsSelf)]);
+    }
+
+    /// (4-i) **A record that lands after start.** The serve node joins the
+    /// peer set at the next `set_peers`, on all five bootstrap planes, and its
+    /// coordinators start. Mutation: drop the re-check from `set_peers`, and it
+    /// never joins.
+    #[tokio::test]
+    async fn a_serve_node_recorded_after_start_joins_at_the_next_set_peers_971() {
+        use ciris_persist::federation::types::identity_type;
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
+        let directory: Arc<dyn FederationDirectory> = backend.clone();
+        let mut rt = ReplicationRuntime::start(
+            directory,
+            Arc::new(NoopTransport),
+            Vec::new(),
+            ReplicationRuntimeConfig {
+                local_key_id: Some("device-971-late".to_owned()),
+                enable_bundle_bootstrap_peers: true,
+                ..ReplicationRuntimeConfig::default()
+            },
+            None,
+        )
+        .await;
+        rt.seed_bundle_skipped_for_test(vec![("seat-late".to_owned(), BundleSkip::NotInDirectory)]);
+        rt.set_peers(Vec::new()).await.expect("set_peers");
+        assert!(rt.bundle_peers().0.is_empty(), "no record yet: not a peer");
+        crate::replication::bridge::tests::register_fixture_keys(
+            &backend,
+            &[("seat-late", identity_type::NODE)],
+        )
+        .await;
+        rt.set_peers(Vec::new()).await.expect("set_peers");
+        let (peers, skipped) = rt.bundle_peers();
+        assert_eq!(
+            planes_of(&peers, "seat-late").len(),
+            BOOTSTRAP_ROUND_PLANES.len()
+        );
+        assert!(skipped.is_empty(), "held now: {skipped:?}");
+        let active = rt.current_initiators.lock().await.clone();
+        for kind in BOOTSTRAP_ROUND_PLANES {
+            assert!(
+                active.contains(&("seat-late".to_owned(), kind)),
+                "{kind:?} rounds with the late serve node"
+            );
+        }
+        rt.shutdown().await;
+    }
+
+    /// (4-ii) **The latch.** Once every serve node is held (or skipped for a
+    /// reason that never changes), the re-check reads NOTHING. Mutation:
+    /// re-read fixed skips too, and the counts are non-zero.
+    #[tokio::test]
+    async fn the_recheck_reads_nothing_once_every_serve_node_is_held_971() {
+        use crate::replication::counting_directory_930::CountingDirectory;
+        let held = directory_holding(&["seat-a"]).await;
+        let counting = CountingDirectory::new(held);
+        let (peers, still) = recheck_bundle_peers(
+            &[("seat-a".to_owned(), BundleSkip::NotInDirectory)],
+            &counting,
+            Some("device"),
+        )
+        .await;
+        assert_eq!(
+            planes_of(&peers, "seat-a").len(),
+            BOOTSTRAP_ROUND_PLANES.len()
+        );
+        assert!(still.is_empty());
+        assert_eq!(counting.total(), 1, "one read to find it");
+        counting.reset();
+        let fixed = vec![
+            ("seat-b".to_owned(), BundleSkip::OptedOut),
+            ("seat-c".to_owned(), BundleSkip::IsSelf),
+            ("seat-d".to_owned(), BundleSkip::TestTrustRoot),
+        ];
+        let (peers, still) = recheck_bundle_peers(&fixed, &counting, Some("device")).await;
+        assert!(peers.is_empty());
+        assert_eq!(still, fixed);
+        assert_eq!(counting.total(), 0, "steady state: zero reads");
+    }
+
+    /// (4-iii) **The opt-out wins after a late arrival.** Mutation: let the
+    /// re-check read opted-out serve nodes, and the peer appears.
+    #[tokio::test]
+    async fn the_opt_out_still_wins_after_a_late_arrival_971() {
+        let dir = directory_holding(&["seat-a"]).await;
+        let (peers, still) = recheck_bundle_peers(
+            &[("seat-a".to_owned(), BundleSkip::OptedOut)],
+            &*dir,
+            Some("device"),
+        )
+        .await;
+        assert!(peers.is_empty());
+        assert_eq!(still, vec![("seat-a".to_owned(), BundleSkip::OptedOut)]);
+    }
+
+    /// (e) **The v43.2 leak guard, through `start` itself.** A runtime with
+    /// the bundle path on over a bare directory, with the REAL baked
+    /// serve ids, rounds with none of them: the directory never ran persist's
+    /// Engine seed, so it holds no serve node's record. Mutation: drop the
+    /// directory check in `bundle_bootstrap_peers_held`, and this runtime
+    /// takes the production canonical as a peer.
+    #[tokio::test]
+    async fn a_default_runtime_over_a_bare_directory_rounds_with_no_production_seat_971() {
+        let baked = crate::edge::baked_canonical_genesis_ids();
+        assert!(!baked.is_empty(), "the pinned bundle names a serve node");
+        let directory = Arc::new(ciris_persist::store::test_backend::test_backend());
+        let directory: Arc<dyn FederationDirectory> = directory;
+        let mut rt = ReplicationRuntime::start(
+            directory,
+            Arc::new(NoopTransport),
+            Vec::new(),
+            ReplicationRuntimeConfig {
+                local_key_id: Some("device-971".to_owned()),
+                enable_bundle_bootstrap_peers: true,
+                ..ReplicationRuntimeConfig::default()
+            },
+            None,
+        )
+        .await;
+        let (peers, skipped) = rt.bundle_peers();
+        assert!(peers.is_empty(), "no production seat: {peers:?}");
+        let expected = if crate::edge::test_trust_root_override_active() {
+            BundleSkip::TestTrustRoot
+        } else {
+            BundleSkip::NotInDirectory
+        };
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|(id, why)| (id.clone(), *why))
+                .collect::<Vec<_>>(),
+            baked
+                .iter()
+                .map(|id| (id.clone(), expected))
+                .collect::<Vec<_>>()
+        );
+        rt.shutdown().await;
     }
 
     /// Captured `(destination_key_id, bytes)` sends.

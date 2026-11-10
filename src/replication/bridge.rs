@@ -2756,6 +2756,17 @@ pub struct FederationDirectoryReplicationBridge {
     /// Bounded and held apart from `missing_signers`, so repair traffic cannot
     /// evict it.
     requested_signers: Mutex<std::collections::BTreeSet<String>>,
+    /// CIRISEdge#971 — the bundle's serve nodes this node holds
+    /// ([`Self::set_bundle_seats`]). One the host does not name
+    /// (`consent_peers`) is reached with no consent relationship, and no
+    /// automated path names a third party to it
+    /// ([`Self::names_only_required_subjects`], CC 5.4.6).
+    bundle_seats: Mutex<HashSet<String>>,
+    /// CIRISEdge#971 — the peers the host named ([`Self::set_consent_peers`]).
+    consent_peers: Mutex<HashSet<String>>,
+    /// CIRISEdge#971 (d) — this node's owner as last resolved
+    /// ([`Self::note_local_owner`]).
+    local_owner: Mutex<Option<String>>,
     /// Source accounting for `missing_signers`, maintained incrementally.
     ///
     /// FOURTH appearance of the O(cap)-per-rejection class: this map rebuilt a
@@ -3046,6 +3057,9 @@ impl FederationDirectoryReplicationBridge {
             recognised_seats: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             requested_signers: Mutex::new(std::collections::BTreeSet::new()),
+            bundle_seats: Mutex::default(),
+            consent_peers: Mutex::default(),
+            local_owner: Mutex::default(),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             released_asks: Mutex::default(),
             sweep_cursors: Mutex::new(SweepCursors::default()),
@@ -3181,6 +3195,19 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn tracked_missing_signers(&self) -> usize {
         self.missing_signers.lock().map_or(0, |m| m.len())
+    }
+
+    /// CIRISEdge#971 — `name` is still queued for signer recovery, as a name
+    /// a person is waiting on (#904) or a repair name (diagnostics + tests).
+    #[must_use]
+    pub fn signer_queued(&self, name: &str) -> bool {
+        self.requested_signers
+            .lock()
+            .is_ok_and(|r| r.contains(name))
+            || self
+                .missing_signers
+                .lock()
+                .is_ok_and(|m| m.contains_key(name))
     }
 
     /// ROLE_MATRIX Axis 3 — install the serve-tier resolver (builder).
@@ -4454,6 +4481,13 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     }
 
     fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
+        // CIRISEdge#971 — toward a no-consent bundle seat, only the names
+        // `names_only_required_subjects` allows: never a person's pasted key
+        // (#904) nor an unrouted repair name. They stay queued for a consent
+        // peer's round.
+        if self.is_no_consent_seat(peer_key_id) {
+            return self.take_missing_signer_for_seat(peer_key_id);
+        }
         // CIRISEdge#904 — a name a person is waiting on goes first, to
         // whichever peer's round comes next; it also leaves the repair queue
         // if it was there, so it is not asked twice.
@@ -12031,6 +12065,130 @@ impl FederationDirectoryReplicationBridge {
         );
     }
 
+    /// CIRISEdge#971 — the bundle's serve nodes this node holds (its
+    /// `start` and every re-check). With [`Self::set_consent_peers`] it
+    /// decides [`Self::is_no_consent_seat`]. Replaces the set.
+    pub fn set_bundle_seats(&self, seats: impl IntoIterator<Item = String>) {
+        if let Ok(mut held) = self.bundle_seats.lock() {
+            *held = seats.into_iter().collect();
+        }
+    }
+
+    /// CIRISEdge#971 — the peers the host named (`start`, every `set_peers`):
+    /// its consent peers. Replaces the set.
+    pub fn set_consent_peers(&self, peers: impl IntoIterator<Item = String>) {
+        if let Ok(mut held) = self.consent_peers.lock() {
+            *held = peers.into_iter().collect();
+        }
+    }
+
+    /// CIRISEdge#971 — `peer` is a bundle seat the host does not name: this
+    /// node reaches it with no consent relationship. Read from both sets at
+    /// the moment of asking, so a seat the host names leaves it and a consent
+    /// peer the host drops while it stays a bundle seat enters it.
+    #[must_use]
+    pub fn is_no_consent_seat(&self, peer: &str) -> bool {
+        self.bundle_seats
+            .lock()
+            .is_ok_and(|seats| seats.contains(peer))
+            && !self
+                .consent_peers
+                .lock()
+                .is_ok_and(|peers| peers.contains(peer))
+    }
+
+    /// CIRISEdge#971 — **the one rule for any name an automated path places
+    /// in a frame toward `peer`** (CC 5.4.6: no per-resolution directory
+    /// query to a seat). Toward a consent peer, any. Toward a no-consent seat,
+    /// only the seat's own key, this node's own, this node's owner's, or a
+    /// name the seat itself routed (`routed_by`: it delivered the row that
+    /// needs it, so asking tells it nothing it did not hand us).
+    ///
+    /// **Every automated site that puts a key id in a frame toward a peer**
+    /// (read 2026-11-09; a new site goes on this list and uses this rule):
+    /// - signer recovery, `take_missing_signer_for` → `send_recovery_pull`
+    ///   (coordinator.rs): filtered here;
+    /// - `kick_on_miss`: rounds only toward the missed subject or its owned
+    ///   nodes the scheduler drives (`drives_peer`), never a third party; the
+    ///   round's own recovery Pull is filtered above;
+    /// - `take_released_rows_for` and the known-hash Fetch: row hashes back to
+    ///   the peer that advertised them, no key id;
+    /// - bundle-seat Pulls (runtime.rs `BundlePull`): subjects are this node,
+    ///   the seat and the owner only;
+    /// - host-chosen lookups (`pull_subject_testimony`, the homed forwarder):
+    ///   a request, gated by the seat's limiter, not refused here; visible as
+    ///   `bundle_pull{answer_other}`.
+    #[must_use]
+    pub fn names_only_required_subjects(
+        &self,
+        peer: &str,
+        subject: &str,
+        routed_by: Option<&str>,
+    ) -> bool {
+        if !self.is_no_consent_seat(peer) {
+            return true;
+        }
+        subject == peer
+            || routed_by == Some(peer)
+            || self.local_key_id.as_deref() == Some(subject)
+            || self
+                .local_owner
+                .lock()
+                .is_ok_and(|o| o.as_deref() == Some(subject))
+    }
+
+    /// CIRISEdge#971 — signer recovery toward a no-consent bundle seat: the
+    /// first queued name [`Self::names_only_required_subjects`] allows, by
+    /// the source that queued it. A name a person is waiting on is queued
+    /// unrouted, so it never qualifies unless it is the seat's own key or
+    /// ours. Locks: `missing_signers`, released, then `requested_signers`
+    /// (never both at once).
+    fn take_missing_signer_for_seat(&self, seat: &str) -> Option<String> {
+        let pick = {
+            let mut pending = self.missing_signers.lock().ok()?;
+            let pick = pending
+                .iter()
+                .find(|(name, src)| self.names_only_required_subjects(seat, name, src.as_deref()))
+                .map(|(name, _)| name.clone());
+            if let Some(name) = &pick {
+                if let Some(src) = pending.remove(name) {
+                    if let Ok(mut sources) = self.missing_signer_sources.lock() {
+                        sources.forget(src.as_deref());
+                    }
+                }
+            }
+            pick
+        };
+        let requested_own = || {
+            self.requested_signers.lock().ok().and_then(|mut r| {
+                let n = r
+                    .iter()
+                    .find(|n| self.names_only_required_subjects(seat, n, None))
+                    .cloned()?;
+                r.remove(&n);
+                Some(n)
+            })
+        };
+        match pick {
+            Some(name) => {
+                if let Ok(mut requested) = self.requested_signers.lock() {
+                    requested.remove(&name);
+                }
+                Some(name)
+            }
+            None => requested_own(),
+        }
+    }
+
+    /// CIRISEdge#971 (d) — this node's owner as last resolved (the bundle
+    /// Pull's timer cycle notes it): an allowed subject toward a seat, and the
+    /// `answer_owner` class of the `bundle_pull` gauge.
+    pub fn note_local_owner(&self, owner: Option<String>) {
+        if let Ok(mut held) = self.local_owner.lock() {
+            *held = owner;
+        }
+    }
+
     /// CIRISEdge#968 — how many times a local write dropped the send-set memos.
     #[must_use]
     pub fn send_set_invalidations(&self) -> usize {
@@ -18552,6 +18710,134 @@ pub(crate) mod tests {
             asked += 1;
         }
         assert_eq!(asked, REQUESTED_SIGNER_CAP + 1, "none is dropped");
+    }
+
+    /// CIRISEdge#971 — signer recovery never names a third party to a
+    /// no-consent bundle seat. With the bundle path on by default, every round
+    /// toward the seat would otherwise carry, as its recovery Pull, the key a
+    /// person pasted (#904) or any unrouted repair name: a member's key id
+    /// handed to a seat with no consent relationship, one per round (CC 5.4.6:
+    /// no per-resolution directory query).
+    ///
+    /// The seat gets only a name it routed itself (it delivered the row) or
+    /// its own key; everything else stays queued and goes to a consent peer.
+    /// The rule is read live: the host naming the seat lifts it, and dropping
+    /// it again (while it stays a bundle seat) restores it. Mutation: drop the
+    /// `is_no_consent_seat` branch in `take_missing_signer_for`, and the
+    /// second assertion fails (the seat is handed `asked-member`).
+    #[tokio::test]
+    async fn a_bundle_seat_is_never_asked_for_a_third_partys_key_971() {
+        let (_backend, bridge) = test_fixtures::make_bridge(&[]);
+        bridge.set_bundle_seats(["seat".to_owned()]);
+        bridge.request_signer(EnvelopeKind::Key, "asked-member");
+        bridge.note_missing_signer(EnvelopeKind::Attestation, "unrouted-member", None);
+        bridge.note_missing_signer(
+            EnvelopeKind::Attestation,
+            "routed-by-friend",
+            Some("friend"),
+        );
+        bridge.note_missing_signer(EnvelopeKind::Revocation, "routed-by-seat", Some("seat"));
+
+        assert_eq!(
+            bridge.take_missing_signer_for("seat").as_deref(),
+            Some("routed-by-seat"),
+            "the seat is asked only for the signer of a row it delivered"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("seat"),
+            None,
+            "nothing else is named to the seat: not the asked key, not an unrouted or \
+             another peer's name"
+        );
+        assert!(bridge.names_only_required_subjects("seat", "seat", None));
+        assert!(!bridge.names_only_required_subjects("seat", "member", None));
+        // A consent peer still gets them, the asked one first.
+        assert_eq!(
+            bridge.take_missing_signer_for("friend").as_deref(),
+            Some("asked-member")
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("friend").as_deref(),
+            Some("routed-by-friend")
+        );
+
+        // Transition 1: the host names the seat (a consent peer now): the rule
+        // lifts at once, with no re-registration.
+        bridge.set_consent_peers(["seat".to_owned()]);
+        assert_eq!(
+            bridge.take_missing_signer_for("seat").as_deref(),
+            Some("unrouted-member")
+        );
+        // Transition 2: the host drops it; it is still a bundle seat, so the
+        // rule is back.
+        bridge.set_consent_peers(Vec::<String>::new());
+        bridge.request_signer(EnvelopeKind::Key, "asked-later");
+        assert_eq!(bridge.take_missing_signer_for("seat"), None);
+        assert_eq!(
+            bridge.take_missing_signer_for("friend").as_deref(),
+            Some("asked-later")
+        );
+    }
+
+    /// CIRISEdge#971 — `routed_by` is the authenticated peer that delivered
+    /// the row, never anything the row says. A recovery name's source is the
+    /// `source_peer` the coordinator hands its session (`Some(peer_key_id)`,
+    /// coordinator.rs, the peer the frame was routed to by its transport
+    /// attribution, replication/mod.rs `routing_source`). The session passes
+    /// it to `note_missing_signer` (session.rs, transient refusal), and the
+    /// bridge's park records it (`park_on_absent_key`). The row is read only
+    /// for its signer (`missing_signer_of`). So a row from peer P that names
+    /// the seat in every field it has is queued under P, and the seat may not
+    /// be asked for its signer. The one field that can name the seat is the
+    /// signer itself, and a seat may always be asked for its own key.
+    /// Mutation: take `routed_by` from the row (a `source`/`delivered_by`
+    /// field), and the seat is handed the member's name.
+    #[tokio::test]
+    async fn a_row_cannot_route_its_signer_to_a_seat_971() {
+        use crate::replication::session::{Session, SessionRole};
+        struct TransientRefuser;
+        #[async_trait::async_trait]
+        impl crate::replication::summary::StateApplier for TransientRefuser {
+            async fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _p: Option<&str>,
+            ) -> crate::replication::summary::ApplyOutcome {
+                crate::replication::summary::ApplyOutcome::refused("signer not registered")
+            }
+        }
+        let (_backend, bridge) = test_fixtures::make_bridge(&[]);
+        bridge.set_bundle_seats(["seat".to_owned()]);
+        let bridge: Arc<dyn ReplicationDirectory> = Arc::new(bridge);
+        let provider =
+            crate::replication::directory::DirectoryStateAdapter::new(Arc::clone(&bridge))
+                .with_peer("peer-p");
+        // Every field a forger could think of names the seat; the signer is a
+        // member the seat has no business being asked about.
+        let row = br#"{"attesting_key_id":"member-m","source":"seat","source_peer":"seat",
+            "delivered_by":"seat","relayed_by":"seat","peer":"seat"}"#
+            .to_vec();
+        let deliver = crate::replication::protocol::ReplicationMessage::Deliver(
+            crate::replication::protocol::DeliverMessage {
+                kind: EnvelopeKind::Attestation,
+                envelopes: vec![row],
+            },
+        );
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let _ = responder
+            .on_message(deliver, &provider, &TransientRefuser, Some("peer-p"))
+            .await;
+        assert_eq!(
+            bridge.take_missing_signer_for("seat"),
+            None,
+            "a row's own fields never make the seat its source"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("peer-p").as_deref(),
+            Some("member-m"),
+            "the name is queued under the peer that delivered it"
+        );
     }
 
     /// CIRISEdge#552 — a third-party signer IS queued (a conferred server will
@@ -28655,6 +28941,9 @@ pub(crate) mod tests {
 
     // CIRISEdge#968 — a local write reaches the next round's send set.
     mod contact_waits_968;
+
+    // CIRISEdge#971 — what an idle bootstrap round costs the seat.
+    mod idle_round_cost_971;
 
     // Sharing traces is its own consent, per recipient: the serve gate's
     // refuse and allow sides, and the live-state witnesses.
