@@ -510,6 +510,7 @@ mod tests {
                 subscriber: "someone-else".into(),
                 role: Role::Primary,
                 forward_capable: false,
+                layers: None,
             }),
         );
         let Ok(WireFrame::Control(f)) = decode(&bytes, "the-link-peer") else {
@@ -580,6 +581,7 @@ mod tests {
                     subscriber: peer.into(),
                     role: Role::Standby,
                     forward_capable: true,
+                    layers: None,
                 })),
             ),
             (

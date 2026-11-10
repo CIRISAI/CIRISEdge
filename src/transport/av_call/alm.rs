@@ -1104,11 +1104,6 @@ impl AlmState {
             .collect()
     }
 
-    /// This node's own stream.
-    pub(super) fn own_stream(&self) -> StreamId {
-        self.own_stream
-    }
-
     /// The publisher a verified binding names for `stream`, if any.
     pub(super) fn bound_publisher_of(&self, stream: StreamId) -> Option<&str> {
         self.bound_publisher.get(&stream).map(String::as_str)

@@ -1314,9 +1314,13 @@ async fn framed_chunk_kats_with_the_shipping_trailer() {
     const PUBLISHER: &str = "node-kat-a";
     const KAT_ROOM: &str = "room-kat";
     const KAT_SOURCE_MS: u64 = 1_790_000_000_000;
-    // Pinned from the first green run (v45); "PIN" fails with the values.
-    const FRAMED_ONE: &str = "PIN";
-    const FRAMED_THREE: [&str; 3] = ["PIN", "PIN", "PIN"];
+    // Pinned at the first build (v45, 2026-11-10).
+    const FRAMED_ONE: &str = "d8d54687ba82260445e5779cb0d4c1dff96382336f1d28026cf9e6946fb16ada50000001a0c4506c00a8f74015bacba932e255c6ff1b9bdccf720264e0fc93deb184f8c11fbaacc7fd21847a676675c25403661a43509730ae6d67820293286b152ebfa726af1fba0d";
+    const FRAMED_THREE: [&str; 3] = [
+        "ffc67f3a37f3911ddb75235c9db05fc24b1dae11e9514d22b45cf1b8a0658957881f000001a0c4506c003f146f4d305166790528c1c031979411cce1d7a8c26e858b4b3c56120b1518fe667ca40b3783607032d2ed80407bbe4a48bdb9e1798240325d42af150f10bf01",
+        "b73c07787e6333f9d5038668001641edb4e140acd777b81a4d75e8f9f1e860eb4713000001a0c4506c00bd8e35ea296ef437be59f21153907532c65974b284804a2ad26a50e4a89ede66857167cbe287ac0034d774177d5ec654de6382adb7d377a80c153333d4e36105",
+        "022f40b36032476ff4db9efb1f03ce81c1da56a54f6a7b658a50c1bc5cbd8cf3f172000001a0c4506c00e4ba491b4c36e5dfb49b6a9e445bfc982127edea23d1a4600cc6e3f9b0045decaf58025577bb527cd2730c2181db071f99692402be92431cdbee2647b355a709",
+    ];
     let publisher = signer(PUBLISHER, 1);
     let keys = Keys::of(&[&publisher]).await;
     let nonce = [0x07; 32];

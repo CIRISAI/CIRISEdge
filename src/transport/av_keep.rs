@@ -607,6 +607,13 @@ impl<R: StreamDekRegistrar> KeptAvPublisher<R> {
     pub fn epoch(&self) -> Epoch {
         self.inner.epoch()
     }
+
+    /// The next chunk's epoch-local `chunk_seq` (v45: a signed end's
+    /// `final_seq` is this minus one; a frame's run must fit below 2³²).
+    #[must_use]
+    pub fn next_chunk_seq(&self) -> crate::transport::realtime_av::ChunkSeq {
+        self.inner.next_chunk_seq()
+    }
 }
 
 #[cfg(test)]

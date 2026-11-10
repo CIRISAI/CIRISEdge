@@ -843,8 +843,13 @@ impl<P: PeerRef> Admission<P> {
         } else {
             self.clean_streak += 1;
             if let Some(c) = self.ceiling_bps {
-                if w.sent_bps > c {
-                    self.ceiling_bps = Some(w.sent_bps);
+                // A clean window that carried more than the ceiling shows the
+                // uplink carries at least that: committable at the meter's
+                // margin, like a verdict (one margin per measurement, §5.1),
+                // never the raw rate.
+                let carried = w.sent_bps * MEASURED_MARGIN;
+                if carried > c {
+                    self.ceiling_bps = Some(carried);
                 }
                 // Additive increase (Eric, 2026-11-10): a clean window in
                 // which someone is waiting (a capacity refusal since the

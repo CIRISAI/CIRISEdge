@@ -496,18 +496,38 @@ impl EgressMeter {
         clippy::cast_sign_loss
     )]
     fn verdict(&self) -> Option<f64> {
-        if self.span.len() < UPLINK_MIN_WINDOWS {
+        // Once the span holds UPLINK_MIN_WINDOWS windows, the longest
+        // trailing run of it (at least UPLINK_REFUSAL_WINDOWS windows) that
+        // shows a real bottleneck: an overload that began mid-span is read
+        // from when it began, not diluted by the clean windows before it
+        // (t2: a 5 % overload must not wait 30 s for the whole span's share),
+        // while a stall (refusals in one or two windows) still never makes
+        // one.
+        let n = self.span.len();
+        if n < UPLINK_MIN_WINDOWS {
             return None;
         }
+        (0..=n - UPLINK_REFUSAL_WINDOWS).find_map(|start| self.verdict_of(start))
+    }
+
+    /// The verdict over the span's windows from `start` on, if they show the
+    /// uplink as the bottleneck.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn verdict_of(&self, start: usize) -> Option<f64> {
+        let run = || self.span.iter().skip(start);
         let (mut sent_f, mut refused_f, mut sent_b, mut deliv_b) = (0u64, 0u64, 0u64, 0u64);
-        for w in &self.span {
+        for w in run() {
             sent_f += w.sent_frames;
             refused_f += w.refused_frames;
             sent_b += w.sent_bytes;
             deliv_b += w.delivered_bytes;
         }
         let offered = sent_f + refused_f;
-        let refusal_windows = self.span.iter().filter(|w| w.refused_frames > 0).count();
+        let refusal_windows = run().filter(|w| w.refused_frames > 0).count();
         if offered == 0
             || (refused_f as f64) < UPLINK_REFUSED_SHARE * offered as f64
             || refusal_windows < UPLINK_REFUSAL_WINDOWS
@@ -515,16 +535,14 @@ impl EgressMeter {
             return None;
         }
         // Delivered bytes carry the link's own framing; commitments are
-        // priced in what the call layer sends. One ratio per span converts.
+        // priced in what the call layer sends. One ratio per run converts.
         let to_sent_units = if deliv_b > 0 {
             sent_b as f64 / deliv_b as f64
         } else {
             1.0
         };
         let secs = self.window_ms as f64 / 1_000.0;
-        let mut rates: Vec<f64> = self
-            .span
-            .iter()
+        let mut rates: Vec<f64> = run()
             .filter(|w| w.refused_frames > 0)
             .map(|w| w.delivered_bytes as f64 * 8.0 / secs * to_sent_units)
             .collect();

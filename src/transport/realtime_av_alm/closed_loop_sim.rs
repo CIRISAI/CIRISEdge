@@ -177,6 +177,10 @@ struct Node {
     alive: bool,
     blackhole: bool,
     uplink_free_at: f64,
+    /// Accepted bytes still in the serializer: `(departs at ms, bytes)`,
+    /// credited delivered when they depart, never when accepted (a full
+    /// queue must not read as more than the link carries, §5.1).
+    in_flight: std::collections::VecDeque<(f64, u64)>,
     egress: EgressMeter,
     adm: Option<Admission<u32>>,
     sel: Option<ParentSelector<u32>>,
@@ -470,6 +474,7 @@ impl Sim {
             alive: true,
             blackhole: false,
             uplink_free_at: 0.0,
+            in_flight: std::collections::VecDeque::new(),
             egress: EgressMeter::new(cfg.meter_window_ms, cfg.congestion_queue_ms),
             adm,
             sel,
@@ -678,9 +683,9 @@ impl Sim {
         let depart = start + bytes as f64 * 8_000.0 / rate;
         node.uplink_free_at = depart;
         node.egress.on_sent(at, bytes, q);
-        // The serializer delivers whatever it accepted (§5.1's numerator; the
-        // path's own loss is the child's to read).
-        node.egress.on_delivered(at, bytes);
+        // The serializer delivers whatever it accepted, as it departs
+        // (§5.1's numerator; the path's own loss is the child's to read).
+        node.in_flight.push_back((depart, bytes));
         self.note_leg(from, to, false);
         let hop = self.next_hop(from, to);
         let jitter_draw = self.net.unit();
@@ -909,6 +914,12 @@ impl Sim {
                 Self::sync_upstream(adm, sel);
             }
             let mut shed = Vec::new();
+            let tf = t as f64;
+            while node.in_flight.front().is_some_and(|(d, _)| *d <= tf) {
+                if let Some((_, bytes)) = node.in_flight.pop_front() {
+                    node.egress.on_delivered(t, bytes);
+                }
+            }
             if let Some(adm) = node.adm.as_mut() {
                 if let Some(w) = node.egress.roll(t) {
                     shed = adm.on_egress_window(t, &w, &mut self.log);
