@@ -326,10 +326,42 @@ async fn start_runtime_with(
     publish: Vec<String>,
     bundle: bool,
 ) -> Arc<ReplicationRuntime> {
-    let runtime = Arc::new(
+    let runtime = build_runtime(node, &transport, peers, cadence, publish, bundle).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(1024);
+    let t = Arc::clone(&transport);
+    let (err_tx, err_rx) = tokio::sync::oneshot::channel::<String>();
+    tokio::spawn(async move {
+        if let Err(e) = t.listen(tx).await {
+            let _ = err_tx.send(e.to_string());
+        }
+    });
+    // A transport listens once. A second `listen` returns at once with an
+    // error, and a runtime behind it would never see a frame: fail loudly.
+    if let Ok(Ok(e)) = tokio::time::timeout(Duration::from_millis(300), err_rx).await {
+        panic!("{}: the transport's listen failed: {e}", node.key.key_id);
+    }
+    let router = InboundRouter::new(runtime.registry());
+    tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            let _ = router.try_route(&frame).await;
+        }
+    });
+    runtime
+}
+
+/// The runtime alone, its transport's inbound left to the caller.
+async fn build_runtime(
+    node: &Node,
+    transport: &Arc<ReticulumTransport>,
+    peers: Vec<ReplicationPeer>,
+    cadence: Duration,
+    publish: Vec<String>,
+    bundle: bool,
+) -> Arc<ReplicationRuntime> {
+    Arc::new(
         ReplicationRuntime::start(
             Arc::clone(&node.dir) as Arc<dyn FederationDirectory>,
-            Arc::clone(&transport) as Arc<dyn Transport>,
+            Arc::clone(transport) as Arc<dyn Transport>,
             peers,
             ReplicationRuntimeConfig {
                 disable_bundle_bootstrap_peers: !bundle,
@@ -345,19 +377,7 @@ async fn start_runtime_with(
             Some(self_publish_set(publish)),
         )
         .await,
-    );
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(1024);
-    let t = Arc::clone(&transport);
-    tokio::spawn(async move {
-        let _ = t.listen(tx).await;
-    });
-    let router = InboundRouter::new(runtime.registry());
-    tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            let _ = router.try_route(&frame).await;
-        }
-    });
-    runtime
+    )
 }
 
 /// CC 5.3.3.5 E1 — `to` holds `from`'s signed route (its transit pair), as
@@ -776,9 +796,15 @@ async fn an_unclaimed_client_without_bootstrap_rounds_is_never_rooted_at_the_sea
         "no round the seat started toward the clients completes: {}",
         m.canonical.all_outcomes()
     );
+    // A client the seat holds no path to is refused before any dial
+    // (`no_route`); one whose announce gave the seat a path is dialled, the
+    // dial fails (the NAT seam here), and the round is booked `error`, the
+    // #336 has_path=true classification #971 does not change. Either way the
+    // round fails, which is the stranding this pins.
     assert!(
-        m.canonical.outcomes(RoundOutcome::NoRoute) >= planes,
-        "each client's first round on every plane ends no_route: {}",
+        m.canonical.outcomes(RoundOutcome::NoRoute) + m.canonical.outcomes(RoundOutcome::Error)
+            >= planes,
+        "each client's first round on every plane fails (no_route or a refused dial): {}",
         m.canonical.all_outcomes()
     );
     assert_eq!(
@@ -844,8 +870,14 @@ struct Roster {
     /// rounds with the seat: pairless at the seat.
     quiet: Node,
     quiet_transport: Arc<ReticulumTransport>,
+    /// Where the quiet transport's ONE listener hands its inbound frames:
+    /// nowhere until a test installs a runtime's router (T4). A transport
+    /// listens once, so a later runtime cannot call `listen` again.
+    quiet_inbound: QuietInbound,
     _tmp: tempfile::TempDir,
 }
+
+type QuietInbound = Arc<tokio::sync::Mutex<Option<Arc<InboundRouter>>>>;
 
 async fn roster(tag: u8) -> Roster {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -888,13 +920,22 @@ async fn roster(tag: u8) -> Roster {
         (cfg, quiet.auth())
     })
     .await;
+    let quiet_inbound: QuietInbound = Arc::default();
     {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(1024);
         let t = Arc::clone(&quiet_transport);
         tokio::spawn(async move {
             let _ = t.listen(tx).await;
         });
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let slot = Arc::clone(&quiet_inbound);
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let router = slot.lock().await.clone();
+                if let Some(router) = router {
+                    let _ = router.try_route(&frame).await;
+                }
+            }
+        });
     }
     // The field's 8: announced once (a binding at the seat, Advisory, at a
     // destination the seat holds no path to), never linked, no pair.
@@ -912,20 +953,44 @@ async fn roster(tag: u8) -> Roster {
         ghost,
         quiet,
         quiet_transport,
+        quiet_inbound,
         _tmp: tmp,
     }
 }
 
+/// What the seat's first rounds toward one peer came to.
+struct FirstRounds {
+    completed: u64,
+    no_route: u64,
+    error: u64,
+    /// Planes whose first tick found the peer already in #794's shared
+    /// no-route backoff (set by a sibling plane's refusal) and was skipped:
+    /// no outcome is booked for a skipped tick, here as on v44.
+    skipped: u64,
+    /// From `set_peers` until the first outcome was booked.
+    to_first: Duration,
+    /// Attestation advertise sweeps run.
+    swept: u64,
+}
+
 /// The seat's FIRST rounds toward `peer` on every plane, as the reconciler
 /// starts them: `set_peers` with `peer` added (each new coordinator's first
-/// tick fires at once). Returns (completed, no_route, wall time until every
-/// plane ended, Attestation sweeps run). `already` are the peers set before.
-async fn first_rounds(r: &Roster, already: &[&str], peer: &str) -> (u64, u64, Duration, u64) {
-    let (done0, none0, sweeps0) = (
-        r.canonical.outcomes(RoundOutcome::Completed),
-        r.canonical.outcomes(RoundOutcome::NoRoute),
+/// tick fires at once). Waits until every plane booked an outcome, or, once
+/// the peer is in the no-route backoff, a further second for any plane still
+/// starting. `already` are the peers set before.
+async fn first_rounds(r: &Roster, already: &[&str], peer: &str) -> FirstRounds {
+    let count = |o| r.canonical.outcomes(o);
+    let (done0, none0, err0, sweeps0) = (
+        count(RoundOutcome::Completed),
+        count(RoundOutcome::NoRoute),
+        count(RoundOutcome::Error),
         sweeps(&r.canonical),
     );
+    let booked = || {
+        (count(RoundOutcome::Completed) - done0)
+            + (count(RoundOutcome::NoRoute) - none0)
+            + (count(RoundOutcome::Error) - err0)
+    };
     let mut keys: Vec<&str> = already.to_vec();
     keys.push(peer);
     let started = tokio::time::Instant::now();
@@ -934,18 +999,43 @@ async fn first_rounds(r: &Roster, already: &[&str], peer: &str) -> (u64, u64, Du
         .await
         .expect("the canonical's initiators");
     let want = u64::try_from(KINDS.len()).unwrap();
-    let _ = wait_until(ROUND_TIMEOUT + Duration::from_secs(5), || async {
-        let done = r.canonical.outcomes(RoundOutcome::Completed) - done0;
-        let none = r.canonical.outcomes(RoundOutcome::NoRoute) - none0;
-        done + none >= want
-    })
-    .await;
-    (
-        r.canonical.outcomes(RoundOutcome::Completed) - done0,
-        r.canonical.outcomes(RoundOutcome::NoRoute) - none0,
-        started.elapsed(),
-        sweeps(&r.canonical) - sweeps0,
-    )
+    let deadline = started + ROUND_TIMEOUT + Duration::from_secs(5);
+    let mut to_first = None;
+    let mut backed_off_at = None;
+    while tokio::time::Instant::now() < deadline {
+        let n = booked();
+        if n > 0 && to_first.is_none() {
+            to_first = Some(started.elapsed());
+        }
+        if n >= want {
+            break;
+        }
+        let in_backoff = r
+            .rt_canonical
+            .no_route_backoff()
+            .iter()
+            .any(|e| e.peer_key_id == peer);
+        if in_backoff {
+            let at = *backed_off_at.get_or_insert_with(tokio::time::Instant::now);
+            if at.elapsed() >= Duration::from_secs(1) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (completed, no_route, error) = (
+        count(RoundOutcome::Completed) - done0,
+        count(RoundOutcome::NoRoute) - none0,
+        count(RoundOutcome::Error) - err0,
+    );
+    FirstRounds {
+        completed,
+        no_route,
+        error,
+        skipped: want.saturating_sub(completed + no_route + error),
+        to_first: to_first.unwrap_or_else(|| started.elapsed()),
+        swept: sweeps(&r.canonical) - sweeps0,
+    }
 }
 
 /// **T3, the field's RED.** Two roster entries that never link in: a ghost
@@ -981,32 +1071,52 @@ async fn rounds_toward_undialable_roster_entries_cost_nothing_971() {
     ] {
         let dials0 = r.t_canonical.refused_dials_for_test();
         let reach0 = r.canonical.metrics.replication_reach();
-        let (done, none, took, swept) = first_rounds(&r, &already, &peer).await;
+        let f = first_rounds(&r, &already, &peer).await;
+        let (done, none, swept) = (f.completed, f.no_route, f.swept);
         let dials = r.t_canonical.refused_dials_for_test() - dials0;
         let reach = r.canonical.metrics.replication_reach();
         let delta = |label: &str| {
             reach.get(label).copied().unwrap_or(0) - reach0.get(label).copied().unwrap_or(0)
         };
         eprintln!(
-            "971 T3 {name}: completed={done} no_route={none} took={took:?} sweeps={swept} all={}",
+            "971 T3 {name}: completed={done} no_route={none} error={} skipped={} \
+             to_first={:?} sweeps={swept} all={}",
+            f.error,
+            f.skipped,
+            f.to_first,
             r.canonical.all_outcomes()
         );
         assert_eq!(done, 0, "{name}: nothing can complete");
-        assert_eq!(
-            none,
-            u64::try_from(KINDS.len()).unwrap(),
-            "{name}: every plane's round is booked no_route, as on 0.5.245"
-        );
         assert!(
-            took < Duration::from_secs(1),
-            "{name}: the round must not wait out a path seek toward a peer E1 never dials \
-             (took {took:?})"
+            f.to_first < Duration::from_secs(1),
+            "{name}: the first round ends at once; nothing waits out a path seek (took {:?})",
+            f.to_first
         );
         // The ghost has no link, no path and no pair: no rule lets the seat
         // dial it, so nothing may be spent on it. The quiet node has a path,
         // which E1's pre-seal route fetch (CLM-pre-seal-route-fetch,
         // reticulum.rs `dial_transit_pair`) may dial: its round stays a round.
         if name == "ghost" {
+            // The first refusal is instant (D2), so it puts the ghost into
+            // #794's one per-peer backoff before every plane's first tick has
+            // run: a later plane's tick is skipped, booking nothing, as every
+            // later tick toward an unroutable peer already was on v44. On v44
+            // the 3 s seek let all four start first. So: each plane is either
+            // booked no_route or skipped by the backoff, and none dials.
+            assert!(none >= 1, "ghost: the first round is booked no_route");
+            assert_eq!(
+                none + f.skipped,
+                u64::try_from(KINDS.len()).unwrap(),
+                "ghost: every plane is booked no_route or skipped by the backoff ({} errors)",
+                f.error
+            );
+            assert!(
+                r.rt_canonical
+                    .no_route_backoff()
+                    .iter()
+                    .any(|e| e.peer_key_id == peer),
+                "ghost: the peer is in the no-route backoff"
+            );
             assert_eq!(
                 swept, 0,
                 "ghost: no advertise sweep for a round no rule can carry"
@@ -1014,8 +1124,8 @@ async fn rounds_toward_undialable_roster_entries_cost_nothing_971() {
             assert_eq!(dials, 0, "ghost: never dialled");
             assert_eq!(
                 delta("round_skipped_undialable"),
-                u64::try_from(KINDS.len()).unwrap(),
-                "ghost: every plane's round skipped at the start, and counted"
+                none,
+                "ghost: every round that started was skipped at the start, and counted"
             );
             assert_eq!(delta("path_request_sent"), 0, "ghost: no path request");
         } else {
@@ -1026,6 +1136,13 @@ async fn rounds_toward_undialable_roster_entries_cost_nothing_971() {
             assert!(
                 dials > 0,
                 "quiet: the dial is attempted (route fetch first)"
+            );
+            // A pathed dial the seam refuses is booked `error` (#336's
+            // has_path=true classification, unchanged by #971).
+            assert_eq!(
+                none + f.error + f.skipped,
+                u64::try_from(KINDS.len()).unwrap(),
+                "quiet: every plane's round fails or is skipped by the backoff"
             );
             assert_eq!(
                 delta("round_skipped_undialable") + delta("skipped_undialable"),
@@ -1052,8 +1169,11 @@ async fn an_undialable_entry_that_comes_alive_is_carried_on_its_link_971() {
     init_tracing();
     let r = roster(6).await;
     let quiet = r.quiet.key.key_id.clone();
-    let (_, none, _, _) = first_rounds(&r, &[], &quiet).await;
-    assert!(none > 0, "undialable before it comes alive");
+    let f = first_rounds(&r, &[], &quiet).await;
+    assert!(
+        f.completed == 0 && f.no_route + f.error > 0,
+        "unreachable before it comes alive"
+    );
     seed_route(&r.canonical, &r.quiet).await;
     wait_for_own_route(&r.quiet, Duration::from_secs(150)).await;
     let peers = ciris_edge::replication::runtime::BOOTSTRAP_ROUND_PLANES
@@ -1063,13 +1183,19 @@ async fn an_undialable_entry_that_comes_alive_is_carried_on_its_link_971() {
             kind,
         })
         .collect();
-    let _rt_quiet = start_runtime(
+    // The quiet transport is already listening (`roster`): its runtime takes
+    // the frames through the roster's slot rather than a second `listen`.
+    let publish = vec![r.quiet.key.key_id.clone(), r.quiet.owner.key_id.clone()];
+    let rt_quiet = build_runtime(
         &r.quiet,
-        Arc::clone(&r.quiet_transport),
+        &r.quiet_transport,
         peers,
         Duration::from_secs(3),
+        publish,
+        false,
     )
     .await;
+    *r.quiet_inbound.lock().await = Some(Arc::new(InboundRouter::new(rt_quiet.registry())));
     assert!(
         wait_until(Duration::from_mins(2), || async {
             r.canonical.holds_route_of(&quiet).await
@@ -1574,6 +1700,39 @@ async fn a_device_reaches_the_seat_and_its_owner_by_pull_alone_971() {
 async fn bundle_pull_coordinators_survive_a_reconcile_tick_971() {
     init_tracing();
     let m = bundle_mesh(14, 4, true).await;
+    // Bare: the IOR leg waits for attribution, so only Key, IO and TD have a
+    // Pull coordinator yet.
+    m.rt_device.bundle_pull_now().await;
+    m.rt_device.set_peers(Vec::new()).await.expect("reconcile");
+    for kind in ciris_edge::replication::runtime::BUNDLE_PULL_PLANES {
+        if kind == EnvelopeKind::IdentityOccurrenceRevocation {
+            continue;
+        }
+        assert!(
+            m.rt_device
+                .registry()
+                .get_initiator(&m.seat.key.key_id, kind)
+                .await
+                .is_some(),
+            "bare, {kind:?}: the Pull coordinator is still routed after the reconcile"
+        );
+    }
+    // Attributed: all four.
+    rooted(&m).await;
+    assert!(
+        wait_until(Duration::from_mins(2), || {
+            let rt = Arc::clone(&m.rt_device);
+            let seat = m.seat.key.key_id.clone();
+            async move {
+                rt.registry()
+                    .get_initiator(&seat, EnvelopeKind::Revocation)
+                    .await
+                    .is_some()
+            }
+        })
+        .await,
+        "attributed"
+    );
     m.rt_device.bundle_pull_now().await;
     m.rt_device.set_peers(Vec::new()).await.expect("reconcile");
     for kind in ciris_edge::replication::runtime::BUNDLE_PULL_PLANES {
@@ -1583,7 +1742,7 @@ async fn bundle_pull_coordinators_survive_a_reconcile_tick_971() {
                 .get_initiator(&m.seat.key.key_id, kind)
                 .await
                 .is_some(),
-            "{kind:?}: the Pull coordinator is still routed after the reconcile"
+            "attributed, {kind:?}: the Pull coordinator is still routed after the reconcile"
         );
     }
     let sent = m.rt_device.bundle_pulls_sent();

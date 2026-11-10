@@ -89,8 +89,12 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   transit pair, CC 5.3.3.5 E1 forbids the dial, so the 3 s seek and its path
   request broadcast could only end "never dialled". The send is refused at
   once, and the round toward that peer is not started, before its advertise
-  sweep. Both are booked `no_route` as before, so outcome counts stay
-  comparable; only the duration drops.
+  sweep. Both are booked `no_route` as before; only the duration drops. One
+  count differs, on a peer's FIRST rounds only: the first refusal is now
+  instant, so it puts the peer into its shared no-route backoff (#794) before
+  every plane's first tick has run. A plane whose first tick lands after it
+  is skipped and books no outcome, as every later tick toward an unroutable
+  peer already was. Steady-state counts are unchanged.
 - **New gauges.** `replication_reach{carried_on_inbound_link, dialled,
   skipped_undialable, round_skipped_undialable, path_seek_found,
   path_seek_not_found, path_request_sent}`,
