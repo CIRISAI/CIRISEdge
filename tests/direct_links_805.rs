@@ -20,8 +20,9 @@
 //!   cross with `T` stopped. The identity link's Channel limit drops to
 //!   1400-MTU size on the move (leviculum lowers the MTU and never raises it);
 //!   the event carries both limits, which item 5's `BudgetChanged` reads. The
-//!   A/V leg itself is born on the punched interface at the base MTU 500
-//!   (Channel 425).
+//!   A/V leg itself is born on the punched interface at the path MTU the
+//!   interface probed (leviculum#104; 1400 on loopback, Channel 1321), where
+//!   before #104 it was the base MTU 500 (Channel 425).
 //! - **W3** (`a_refused_upgrade_leaves_the_dial_as_it_was`): B with accepting
 //!   turned `Off` (the operator override). The proposal fails `Rejected`, the
 //!   dial behaves exactly as with no proposal, and a second dial does NOT
@@ -1135,14 +1136,22 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
         "the move lowered the limit: {before} -> {after}"
     );
     let av_limit = link.sender.channel_limit().expect("the A/V link is held");
-    // The A/V leg is BORN on the punched interface, which signals no hardware
-    // MTU, so it negotiates the base 500: Channel 425 (link MDU 431 less the
-    // 6-byte envelope), 400 of it plaintext under the CC 5.3.3.5 E1 seal.
-    assert_eq!(av_limit, 400, "the A/V leg runs at the base MTU");
+    // leviculum#104 — the A/V leg is BORN on the punched interface, which now
+    // probes the path (1400, then 1280) and signals the largest step acked;
+    // loopback acks 1400. So the leg runs at the probed MTU, as the moved
+    // identity link does: Channel 1321, 1296 of it plaintext under the CC
+    // 5.3.3.5 E1 seal. Before #104 it negotiated the base 500 (400 sealed).
+    assert_eq!(
+        av_limit, 1296,
+        "the A/V leg runs at the probed 1400-byte MTU"
+    );
+    // leviculum#102 — a datagram on it carries the link MDU less its 4-byte
+    // sequence number, less the seal: two bytes more than a Channel message.
+    assert_eq!(link.sender.datagram_limit(), Some(1298));
 
     // CIRISEdge#805 / CC 5.3.3.5 E1 — the link's transit KEX handshake rode
-    // this base-MTU leg as its first Channel messages (about 1.2 KB at 400 B
-    // each), and B answered it: both ends hold the link's keys, by role.
+    // this leg as its first Channel messages, and B answered it: both ends
+    // hold the link's keys, by role.
     let arrival = tokio::time::timeout(Duration::from_secs(20), arrivals.recv())
         .await
         .expect("B's consumer gets the link")
@@ -3127,6 +3136,15 @@ async fn a_wedged_punched_link_with_no_call_is_still_reaped() {
     let DirectPathEvent::Established { link_id, .. } = up else {
         unreachable!()
     };
+    // B moves on its own Established, not on A's: since leviculum#104 each
+    // end probes the punched path's MTU before its interface attaches, so B
+    // can attach a few ms after A has. Reading B's interface on A's event
+    // raced that (2 runs in 8).
+    next_event(&mut p.b.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("B moves too");
     assert!(p.b.transport.direct_link_interface(link_id).is_some());
 
     p.b.transport.note_inbound_transfer_for_test(link_id, true);

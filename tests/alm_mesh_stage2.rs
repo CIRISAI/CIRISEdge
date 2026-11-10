@@ -817,7 +817,9 @@ async fn c3_admits_and_a_closed_relay_refuses_by_name() {
 /// **Stale frames (C5)**: B's consumer stalls 1.5 s while A publishes; the
 /// media that waited past 800 ms is dropped by age before it is opened, the
 /// hop counter skips past it, and the frames after the stall open and
-/// arrive. Media between C3 peers rides timed Channel frames.
+/// arrive. Media between peers whose CAPS say they take datagrams rides
+/// unordered datagrams (leviculum#102); timed Channel frames are the fallback
+/// toward an older peer (`av_call_nat_805`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn stale_media_is_dropped_by_age_and_the_hop_recovers() {
     let _call = one_call().await;
@@ -874,8 +876,9 @@ async fn stale_media_is_dropped_by_age_and_the_hop_recovers() {
     let stale = cb.alm_counts().stale_dropped;
     let after: usize = (60..90).filter(|s| got.contains(&body("a", *s))).count();
     eprintln!(
-        "[ALM2] stale: dropped_by_age={stale} delivered={} after_stall={after}/30 timed_sent={} unopened={}",
+        "[ALM2] stale: dropped_by_age={stale} delivered={} after_stall={after}/30 datagrams_sent={} timed_sent={} unopened={}",
         got.len(),
+        av(&a.metrics, "av_sent_datagram"),
         av(&a.metrics, "av_sent_timed"),
         av(&b.metrics, "av_call_frame_unopened")
     );
@@ -884,9 +887,11 @@ async fn stale_media_is_dropped_by_age_and_the_hop_recovers() {
         after, 30,
         "the hop recovered: every post-stall frame opened"
     );
+    // The 30 post-stall frames arrived, so at least 30 left as datagrams.
     assert!(
-        av(&a.metrics, "av_sent_timed") > 0,
-        "media rides timed frames"
+        av(&a.metrics, "av_sent_datagram") >= 30 && av(&a.metrics, "av_sent_timed") == 0,
+        "media rode datagrams, none a timed Channel frame (leviculum#102): {:?}",
+        a.metrics.av_plane()
     );
     assert_eq!(
         av(&b.metrics, "av_call_frame_unopened"),

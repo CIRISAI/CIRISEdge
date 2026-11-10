@@ -636,16 +636,6 @@ async fn a_room_call_behind_t_runs_over_a_punched_interface() {
             "{who}'s leg to the other member comes up"
         );
     }
-    // CC 5.3.3.5 E1 — the legs ride sealed links: each end keyed what it
-    // dialled and answered what it was dialled.
-    for (side, who) in [(&p.a, "A"), (&p.b, "B")] {
-        let seal = side.metrics.link_seal();
-        assert!(
-            seal.get("link_seal_initiated").copied().unwrap_or(0) >= 1
-                && seal.get("link_seal_accepted").copied().unwrap_or(0) >= 1,
-            "{who} keyed its leg and answered the other's: {seal:?}"
-        );
-    }
     // leviculum#102 — both ends run this build, so once each has heard the
     // other's CAPS its media to it rides unordered datagrams.
     for (call, other, who) in [(&call_a, &p.b, "A"), (&call_b, &p.a, "B")] {
@@ -655,6 +645,21 @@ async fn a_room_call_behind_t_runs_over_a_punched_interface() {
             })
             .await,
             "{who}'s leg rides datagrams once the other's CAPS arrive"
+        );
+    }
+    // CC 5.3.3.5 E1 — the legs ride sealed links: each end keyed what it
+    // dialled and answered what it was dialled. Read after the CAPS: a leg is
+    // up once its DIALLER has keyed it, while the responder keys off the event
+    // path (CIRISEdge#947) and only then speaks, so the other's CAPS on a leg
+    // is what proves the responder answered it. (Read right after the legs
+    // came up, the responder's count raced its keying: 1 run in 6 once the
+    // handshake fit one 1400-MTU message, leviculum#104.)
+    for (side, who) in [(&p.a, "A"), (&p.b, "B")] {
+        let seal = side.metrics.link_seal();
+        assert!(
+            seal.get("link_seal_initiated").copied().unwrap_or(0) >= 1
+                && seal.get("link_seal_accepted").copied().unwrap_or(0) >= 1,
+            "{who} keyed its leg and answered the other's: {seal:?}"
         );
     }
     // leviculum#104 — the leg is born on the punched interface, which probed
@@ -753,6 +758,7 @@ async fn a_member_on_an_older_build_gets_its_media_on_the_channel() {
         av(&p.b.metrics, "av_sent_datagram"),
         av(&p.b.metrics, "av_sent_datagram_fallback"),
     );
+    let a_timed = av(&p.a.metrics, "av_sent_timed");
     cross(&mut call_a, "A", &p.a.key.key_id, 0..10, &mut b_frames).await;
     cross(&mut call_b, "B", &p.b.key.key_id, 0..10, &mut a_frames).await;
     assert_eq!(
@@ -763,6 +769,11 @@ async fn a_member_on_an_older_build_gets_its_media_on_the_channel() {
         (0, 10),
         "A sent B no datagram and counted each Channel frame as a fallback: {:?}",
         p.a.metrics.av_plane()
+    );
+    assert_eq!(
+        av(&p.a.metrics, "av_sent_timed") - a_timed,
+        10,
+        "the fallback is the timed Channel frame (B's CAPS still say it takes them)"
     );
     assert_eq!(
         (
