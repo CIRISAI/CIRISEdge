@@ -3017,6 +3017,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// gate), the reference the agreement witness compares against.
     #[cfg(test)]
     early_reach_check: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#971 — test-only: one permit stored each time
+    /// [`Self::warm_holdings_index`] ends on an enabled index, so a witness
+    /// over a real runtime waits for its background warm-up on the event, not
+    /// on a clock.
+    #[cfg(test)]
+    holdings_warmed: tokio::sync::Notify,
     /// CIRISEdge#971 — test-only: `false` reads every row a first-contact
     /// peer authored in the required read (the pre-v45 read).
     #[cfg(test)]
@@ -3311,6 +3317,8 @@ impl FederationDirectoryReplicationBridge {
             stale_routes: RefusalBackoff::with_capacities(STALE_ROUTE_MARKS, 1),
             #[cfg(test)]
             early_reach_check: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            holdings_warmed: tokio::sync::Notify::new(),
             #[cfg(test)]
             narrow_first_contact_read: std::sync::atomic::AtomicBool::new(true),
             retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
@@ -8556,6 +8564,8 @@ impl FederationDirectoryReplicationBridge {
                  (CIRISEdge#971)"
             );
         }
+        #[cfg(test)]
+        self.holdings_warmed.notify_one();
     }
 
     /// The warm-up's walk of the Attestation serve log from its head, on its
@@ -14828,6 +14838,12 @@ impl FederationDirectoryReplicationBridge {
         for plane in [IndexPlane::Attestation, IndexPlane::TransportDestination] {
             self.holdings_index.audit_due_now(plane);
         }
+    }
+
+    /// CIRISEdge#971 — wait for the next end of [`Self::warm_holdings_index`]
+    /// (a warm-up that already ended left its permit; this takes it).
+    pub(crate) async fn holdings_warmed(&self) {
+        self.holdings_warmed.notified().await;
     }
 
     pub(crate) fn holdings_index_status(
@@ -30600,6 +30616,10 @@ pub(crate) mod tests {
 
     // CIRISEdge#971 — the seat's Revocation listing walk per idle round.
     mod revocation_walk_971;
+
+    // CIRISEdge#971 — the release claim: with the holdings index a bundle
+    // Revocation round reads nothing; without it, it drains the whole index.
+    mod revocation_round_reads_971;
 
     // Sharing traces is its own consent, per recipient: the serve gate's
     // refuse and allow sides, and the live-state witnesses.

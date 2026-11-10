@@ -21,6 +21,11 @@
 //! the cold fill. Figures are printed (`971 revocation-walk`); the assertions
 //! pin only that a warm listing reads no subject from the store.
 //!
+//! The v45 per-listing read budget (`KEY_PLANE_READ_BUDGET`) spreads a cold
+//! fill over many listings. This measures the walk and the lock with the
+//! budget LIFTED, so the cold fill is still one listing; that the default
+//! budget bounds the first listing is asserted at the end on its own bridge.
+//!
 //! `cargo test --lib revocation_walk_971 -- --nocapture --test-threads=1`
 use super::*;
 
@@ -45,6 +50,7 @@ async fn measure(k: usize) {
     let (_backend, bridge) = test_fixtures::make_bridge(&cohort);
     let metrics = crate::observability::EdgeMetrics::new();
     let bridge = Arc::new(bridge.with_metrics(Some(metrics.clone())));
+    bridge.set_key_plane_read_budget(usize::MAX);
     let list = |b: Arc<FederationDirectoryReplicationBridge>| async move {
         let t = std::time::Instant::now();
         let refs = b
@@ -114,6 +120,21 @@ async fn measure(k: usize) {
         "the cold fill reads every subject once"
     );
     assert_eq!(warm_subject_reads, 0, "a warm listing reads no subject");
+
+    // The default budget: a cold seat's first listing reads at most the
+    // budget, never all K at once.
+    let (_backend, budgeted) = test_fixtures::make_bridge(&cohort);
+    let budgeted_metrics = crate::observability::EdgeMetrics::new();
+    let budgeted = Arc::new(budgeted.with_metrics(Some(budgeted_metrics.clone())));
+    let _ = budgeted
+        .list_envelope_refs_for_peer(EnvelopeKind::Revocation, Some(PEER))
+        .await;
+    assert_eq!(
+        sweep(&budgeted_metrics, obs::KEY_PLANE_SUBJECT_READS),
+        u64::try_from(k.min(crate::replication::key_plane_memo::KEY_PLANE_READ_BUDGET))
+            .expect("budget"),
+        "a cold listing reads at most the per-listing budget"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
