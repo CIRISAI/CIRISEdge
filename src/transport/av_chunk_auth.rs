@@ -414,10 +414,14 @@ pub const FINAL_SEQ_NONE: u64 = u64::MAX;
 /// this verified field, never from an unsigned control frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignedEnd {
-    /// The attendee left the call.
+    /// The attendee left the call (on its last stream: a leave).
     Left,
-    /// The attendee's app went to the background.
+    /// The attendee's app went to the background (on its last stream: a
+    /// leave).
     Backgrounded,
+    /// 45.1 (CC reading, rc18) — this stream ended, and nothing more: no
+    /// leave, whatever streams the member has left (a share stopped).
+    Ended,
 }
 
 impl SignedEnd {
@@ -425,6 +429,7 @@ impl SignedEnd {
         match self {
             Self::Left => 1,
             Self::Backgrounded => 2,
+            Self::Ended => 3,
         }
     }
 
@@ -433,10 +438,33 @@ impl SignedEnd {
             0 => Ok(None),
             1 => Ok(Some(Self::Left)),
             2 => Ok(Some(Self::Backgrounded)),
+            3 => Ok(Some(Self::Ended)),
             _ => Err(BindingError::Malformed("end")),
         }
     }
+
+    /// Whether this end says the member left (1, 2), not only the stream (3).
+    #[must_use]
+    pub const fn is_leave(self) -> bool {
+        !matches!(self, Self::Ended)
+    }
 }
+
+/// 45.1 (CC reading, rc18) — the v2 `kind` member: what the stream is to a
+/// receiver's layout. It gates nothing (admission, keys, sealing, the
+/// trailer, shedding, keeping). A v1 binding reads as media; an unknown
+/// value under v2 renders as media and is never refused.
+pub const STREAM_KIND_MEDIA: u8 = 0;
+/// A share (a desktop or window), `Call::add_stream`.
+pub const STREAM_KIND_SHARE: u8 = 1;
+
+/// 45.1 (CC reading, rc18) — the v2 `framing` member: 0, one media frame per
+/// chunk and no marker; 1, every chunk whose `codec_id` is not `0xFF`
+/// carries the 4-byte fragment marker ([`crate::transport::av_frame`]). A
+/// v1 binding reads as 0. Fixed per (stream, epoch).
+pub const FRAMING_NONE: u8 = 0;
+/// See [`FRAMING_NONE`].
+pub const FRAMING_FRAGMENTS: u8 = 1;
 
 /// The tag that starts every binding part: `"CSKB" ‖ version ‖ id[8] ‖ index ‖
 /// count ‖ payload`.
@@ -758,6 +786,11 @@ pub struct StreamKeyBinding {
     /// epoch ([`FINAL_SEQ_NONE`]: none), in place of 5.3.3.1's terminator. A
     /// relay cannot drop the tail unseen, and nothing past it plays.
     pub final_seq: Option<u64>,
+    /// v2: the stream's kind ([`STREAM_KIND_MEDIA`], [`STREAM_KIND_SHARE`],
+    /// or a value this build does not know, read as media).
+    pub kind: u8,
+    /// v2: the stream's framing ([`FRAMING_NONE`] or [`FRAMING_FRAGMENTS`]).
+    pub framing: u8,
 }
 
 /// Why a binding was refused.
@@ -865,6 +898,10 @@ pub struct V2Members {
     pub end: Option<SignedEnd>,
     /// With `end`: the last `chunk_seq` sealed in the epoch.
     pub final_seq: Option<u64>,
+    /// The stream's kind ([`STREAM_KIND_MEDIA`] by default).
+    pub kind: u8,
+    /// The stream's framing ([`FRAMING_NONE`] by default).
+    pub framing: u8,
 }
 
 impl StreamKeyBinding {
@@ -896,6 +933,8 @@ impl StreamKeyBinding {
             if self.end.is_some() {
                 out.extend_from_slice(&self.final_seq.unwrap_or(FINAL_SEQ_NONE).to_be_bytes());
             }
+            out.push(self.kind);
+            out.push(self.framing);
         }
         out
     }
@@ -903,7 +942,12 @@ impl StreamKeyBinding {
     /// The encoding version: 2 when the binding names a codec, else 1.
     #[must_use]
     pub const fn version(&self) -> u8 {
-        if self.codecs.is_some() || self.replaces.is_some() || self.end.is_some() {
+        if self.codecs.is_some()
+            || self.replaces.is_some()
+            || self.end.is_some()
+            || self.kind != STREAM_KIND_MEDIA
+            || self.framing != FRAMING_NONE
+        {
             BINDING_VERSION_V2
         } else {
             BINDING_VERSION
@@ -960,14 +1004,16 @@ impl StreamKeyBinding {
         chunk_key: [u8; 32],
         v2: Option<V2Members>,
     ) -> Result<Self, ChunkKeyError> {
-        let (codecs, replaces, end, final_seq) = match v2 {
+        let (codecs, replaces, end, final_seq, kind, framing) = match v2 {
             Some(m) => (
                 m.codecs,
                 m.replaces,
                 m.end,
                 m.final_seq.filter(|_| m.end.is_some()),
+                m.kind,
+                m.framing,
             ),
-            None => (None, None, None, None),
+            None => (None, None, None, None, STREAM_KIND_MEDIA, FRAMING_NONE),
         };
         if call_stream_id(room, &signer.key_id, &join_nonce) != stream {
             return Err(ChunkKeyError::Binding(format!(
@@ -988,6 +1034,8 @@ impl StreamKeyBinding {
             replaces,
             end,
             final_seq: final_seq.or_else(|| end.map(|_| FINAL_SEQ_NONE)),
+            kind,
+            framing,
         };
         let (ed_b64, pq_b64) =
             crate::identity::sign_bound_hybrid(signer, &b.signed_bytes(), "stream key binding")
@@ -1032,7 +1080,7 @@ impl StreamKeyBinding {
         let stream = StreamId(r.array::<32>()?);
         let epoch = Epoch(u64::from_be_bytes(r.array::<8>()?));
         let chunk_key = r.array::<32>()?;
-        let (codecs, replaces, end, final_seq) = if version == BINDING_VERSION_V2 {
+        let (codecs, replaces, end, final_seq, kind, framing) = if version == BINDING_VERSION_V2 {
             let codecs = CodecMap::decode(&mut r)?;
             let replaces = match r.array::<1>()?[0] {
                 0 => None,
@@ -1044,14 +1092,26 @@ impl StreamKeyBinding {
                 Some(_) => Some(u64::from_be_bytes(r.array::<8>()?)),
                 None => None,
             };
-            // A v2 binding says something v1 cannot: a map, a replacement or
-            // an end.
-            if codecs.is_none() && replaces.is_none() && end.is_none() {
+            // 7e kind: any value (an unknown one renders as media); 7f
+            // framing: the chunk layout, so only a known one.
+            let kind = r.array::<1>()?[0];
+            let framing = r.array::<1>()?[0];
+            if framing > FRAMING_FRAGMENTS {
+                return Err(BindingError::Malformed("framing"));
+            }
+            // A v2 binding says something v1 cannot: a map, a replacement,
+            // an end, a kind or a framing.
+            if codecs.is_none()
+                && replaces.is_none()
+                && end.is_none()
+                && kind == STREAM_KIND_MEDIA
+                && framing == FRAMING_NONE
+            {
                 return Err(BindingError::Malformed("codec map size"));
             }
-            (codecs, replaces, end, final_seq)
+            (codecs, replaces, end, final_seq, kind, framing)
         } else {
-            (None, None, None, None)
+            (None, None, None, None, STREAM_KIND_MEDIA, FRAMING_NONE)
         };
         let n = r.len16()?;
         let sig_ed25519 = r.take(n)?.to_vec();
@@ -1077,6 +1137,8 @@ impl StreamKeyBinding {
             replaces,
             end,
             final_seq,
+            kind,
+            framing,
         })
     }
 
@@ -1336,6 +1398,9 @@ pub struct Bound {
     /// Its v2 encoding (it names the codec), to forward to peers that take
     /// v2.
     pub wire_v2: Option<Arc<Vec<u8>>>,
+    /// 45.1 — the epoch's framing, from its v2 binding ([`FRAMING_NONE`]
+    /// while only a v1 one came).
+    pub framing: u8,
 }
 
 /// Why a chunk was refused.
@@ -1423,6 +1488,10 @@ struct Held {
     ended_order: VecDeque<StreamId>,
     /// Ended streams whose tail never fully arrived.
     truncated: std::collections::HashSet<StreamId>,
+    /// 45.1 — streams a verified `replaces` named (still bound for their
+    /// overlap): the first a publisher's newest-streams bound evicts, oldest
+    /// first, so a live stream is never pushed out by replacements.
+    retired: std::collections::HashSet<StreamId>,
     /// The highest verified `chunk_seq` per `(stream, epoch)`.
     highest: HashMap<(StreamId, u64), u64>,
 }
@@ -1596,12 +1665,13 @@ impl ChunkAuth {
         let v2 = binding.version() == BINDING_VERSION_V2;
         // The v1 and v2 encodings of one (stream, epoch) bind the same key:
         // keep both, to forward each to the peers that take it.
-        let (mut wire_v1, mut wire_v2) = match held.bound.get(&(stream, epoch)) {
-            Some(b) if b.key == binding.chunk_key => (b.wire.clone(), b.wire_v2.clone()),
-            _ => (None, None),
+        let (mut wire_v1, mut wire_v2, mut framing) = match held.bound.get(&(stream, epoch)) {
+            Some(b) if b.key == binding.chunk_key => (b.wire.clone(), b.wire_v2.clone(), b.framing),
+            _ => (None, None, FRAMING_NONE),
         };
         if v2 {
             wire_v2 = Some(wire);
+            framing = binding.framing;
         } else {
             wire_v1 = Some(wire);
         }
@@ -1612,6 +1682,7 @@ impl ChunkAuth {
                 key: binding.chunk_key,
                 wire: wire_v1,
                 wire_v2,
+                framing,
             },
         );
         // The two newest epochs of the stream.
@@ -1627,19 +1698,36 @@ impl ChunkAuth {
         // The publisher's newest streams. An ended stream leaves the list (it
         // is bound only until its verdict, `settle_end`), so ending a share
         // never pushes out the camera.
+        // A replacement retires the stream it names (the same publisher's).
+        if let Some(old) = binding.replaces.filter(|o| *o != stream) {
+            if held
+                .streams
+                .get(&publisher)
+                .is_some_and(|l| l.contains(&old))
+            {
+                held.retired.insert(old);
+            }
+        }
         let evicted = {
-            let list = held.streams.entry(publisher).or_default();
+            let Held {
+                streams, retired, ..
+            } = &mut *held;
+            let list = streams.entry(publisher).or_default();
             list.retain(|s| *s != stream);
             if binding.end.is_none() {
                 list.push_back(stream);
             }
             if list.len() > MAX_STREAMS_PER_PUBLISHER {
-                list.pop_front()
+                // The oldest retired stream goes first; a live one only when
+                // none is retired.
+                let at = list.iter().position(|s| retired.contains(s)).unwrap_or(0);
+                list.remove(at)
             } else {
                 None
             }
         };
         if let Some(old) = evicted {
+            held.retired.remove(&old);
             held.bound.retain(|(s, _), _| *s != old);
             held.codecs.remove(&old);
             held.highest.retain(|(s, _), _| *s != old);
@@ -1706,6 +1794,18 @@ impl ChunkAuth {
                 b.wire.clone().into_iter().chain(v2)
             })
             .collect()
+    }
+
+    /// 45.1 — `(stream, epoch)`'s framing as its v2 binding signed it
+    /// ([`FRAMING_NONE`] for a v1-only or unbound one). Read when a chunk is
+    /// released to the frame layer, past the reorder window, so a v2 binding
+    /// that followed its v1 twin is in hand.
+    #[must_use]
+    pub fn framing_of(&self, stream: StreamId, epoch: Epoch) -> u8 {
+        self.held()
+            .bound
+            .get(&(stream, epoch.0))
+            .map_or(FRAMING_NONE, |b| b.framing)
     }
 
     /// Whether this receiver ever verified a chunk of `stream`: its presence,

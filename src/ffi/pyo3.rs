@@ -4505,6 +4505,20 @@ fn call_event_to_pydict<'py>(
             d.set_item("cause", cause.token())?;
             d.set_item("truncated", *truncated)?;
         }
+        V::StreamAdded {
+            publisher,
+            stream,
+            kind,
+        } => {
+            d.set_item("kind", "stream_added")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
+            d.set_item("stream_kind", *kind)?;
+            d.set_item(
+                "share",
+                *kind == crate::transport::av_chunk_auth::STREAM_KIND_SHARE,
+            )?;
+        }
         V::StreamEnded {
             publisher,
             stream,
@@ -4724,22 +4738,13 @@ impl PyCall {
     }
 
     /// 45.1 — end one share (`add_stream`'s stream) and only it, signed
-    /// (`cause`: `"left"` or `"backgrounded"`); the camera and the call
-    /// carry on. The primary ends only with `leave()` (`unknown_stream`).
-    #[pyo3(signature = (stream_id, cause="left"))]
-    fn end_stream(&self, py: Python<'_>, stream_id: [u8; 32], cause: &str) -> PyResult<()> {
-        let why = match cause {
-            "left" => crate::transport::av_chunk_auth::SignedEnd::Left,
-            "backgrounded" => crate::transport::av_chunk_auth::SignedEnd::Backgrounded,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "leave_cause_unknown: {other:?} (left, backgrounded)"
-                )))
-            }
-        };
+    /// `end = 3` ("this stream ended", never a leave); the camera and the
+    /// call carry on. The primary ends only with `leave()`
+    /// (`unknown_stream`).
+    fn end_stream(&self, py: Python<'_>, stream_id: [u8; 32]) -> PyResult<()> {
         let stream = crate::transport::realtime_av::StreamId(stream_id);
         self.with_call(py, move |c| {
-            Box::pin(async move { c.end_stream(stream, why).await })
+            Box::pin(async move { c.end_stream(stream).await })
         })
     }
 

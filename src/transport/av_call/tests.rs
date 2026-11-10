@@ -530,7 +530,18 @@ fn attendance_binding(
         replaces: replaces.map(|r| StreamId([r; 32])),
         end,
         final_seq: end.map(|_| 0),
+        kind: 0,
+        framing: 0,
     }
+}
+
+/// The `StreamAdded` a first binding of `publisher`'s stream `[s; 32]` is.
+fn added(publisher: &str, s: u8) -> Vec<CallEvent> {
+    vec![CallEvent::StreamAdded {
+        publisher: publisher.to_owned(),
+        stream: StreamId([s; 32]),
+        kind: 0,
+    }]
 }
 
 /// 45.1 — a signed end's verdict waits [`END_VERDICT_AFTER`] (the longest
@@ -562,15 +573,17 @@ fn a_signed_end_is_attendee_left_with_its_cause_once() {
     use crate::transport::av_chunk_auth::SignedEnd;
     let mut a = Attendance::default();
     let s1 = StreamId([1; 32]);
-    assert!(a
-        .on_bound(
+    assert_eq!(
+        a.on_bound(
             "me",
             &attendance_binding("bob", 1, None, None),
             None,
             true,
             false
-        )
-        .is_empty());
+        ),
+        added("bob", 1),
+        "a first binding is StreamAdded, never presence"
+    );
     assert_eq!(a.streams.get("bob"), Some(&vec![s1]));
     let ev = a.on_bound(
         "me",
@@ -676,12 +689,16 @@ fn a_share_is_a_second_stream_and_its_end_is_no_leave() {
             true,
             false,
         );
-        assert!(ev.is_empty(), "a share is no replacement and no leave");
+        assert_eq!(
+            ev,
+            added("bob", s),
+            "a share is no replacement and no leave"
+        );
     }
     assert_eq!(a.streams.get("bob"), Some(&vec![cam, share]));
     let ev = a.on_bound(
         "me",
-        &attendance_binding("bob", 7, None, Some(SignedEnd::Left)),
+        &attendance_binding("bob", 7, None, Some(SignedEnd::Ended)),
         None,
         true,
         false,
@@ -691,7 +708,7 @@ fn a_share_is_a_second_stream_and_its_end_is_no_leave() {
         [CallEvent::StreamEnded {
             publisher: "bob".into(),
             stream: share,
-            cause: LeaveCause::Left,
+            cause: LeaveCause::Ended,
             truncated: false,
         }]
     );
@@ -764,6 +781,80 @@ fn a_share_is_a_second_stream_and_its_end_is_no_leave() {
         .left("dan", StreamId([9; 32]), LeaveCause::Left, false, false)
         .is_none());
     assert_eq!(a.streams.get("dan"), Some(&vec![StreamId([3; 32])]));
+    // CC (rc18): `end = 3` on the LAST stream is still no leave (presence is
+    // reachability): StreamEnded, and erin still attends until lost.
+    let _ = a.on_bound(
+        "me",
+        &attendance_binding("erin", 4, None, None),
+        None,
+        true,
+        false,
+    );
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("erin", 4, None, Some(SignedEnd::Ended)),
+        None,
+        true,
+        false,
+    );
+    assert_eq!(
+        ev,
+        [CallEvent::StreamEnded {
+            publisher: "erin".into(),
+            stream: StreamId([4; 32]),
+            cause: LeaveCause::Ended,
+            truncated: false,
+        }]
+    );
+    assert_eq!(a.streams.get("erin"), Some(&Vec::new()), "still attending");
+    assert_eq!(
+        a.leave_all("erin", LeaveCause::Lost, |_| false),
+        Some(CallEvent::AttendeeLeft {
+            key_id: "erin".into(),
+            stream: StreamId([4; 32]),
+            cause: LeaveCause::Lost,
+            truncated: false,
+        }),
+        "lost later: one AttendeeLeft naming its last stream"
+    );
+    // A leave value on a non-final stream is that stream's end only.
+    for s in [10, 11] {
+        let _ = a.on_bound(
+            "me",
+            &attendance_binding("finn", s, None, None),
+            None,
+            true,
+            false,
+        );
+    }
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("finn", 11, None, Some(SignedEnd::Left)),
+        None,
+        true,
+        false,
+    );
+    assert!(matches!(
+        ev.as_slice(),
+        [CallEvent::StreamEnded {
+            cause: LeaveCause::Left,
+            ..
+        }]
+    ));
+    assert!(matches!(
+        a.on_bound(
+            "me",
+            &attendance_binding("finn", 10, None, Some(SignedEnd::Left)),
+            None,
+            true,
+            false
+        )
+        .as_slice(),
+        [CallEvent::AttendeeLeft {
+            cause: LeaveCause::Left,
+            ..
+        }]
+    ));
 }
 
 /// 45.1 — a signed `replaces` of the same publisher's stream is
@@ -815,7 +906,11 @@ fn a_replacement_is_not_a_leave() {
         true,
         false,
     );
-    assert!(ev.is_empty());
+    assert_eq!(
+        ev,
+        added("mallory", 6),
+        "no replacement of another's stream"
+    );
     assert!(!a.ended.contains(&("carol".to_owned(), StreamId([5; 32]))));
     let ev = a.on_bound(
         "me",
@@ -824,6 +919,6 @@ fn a_replacement_is_not_a_leave() {
         true,
         false,
     );
-    assert!(ev.is_empty());
+    assert_eq!(ev, added("carol", 7));
     assert!(!a.ended.contains(&("carol".to_owned(), StreamId([5; 32]))));
 }

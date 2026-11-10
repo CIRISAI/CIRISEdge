@@ -219,6 +219,8 @@ async fn a_member_holding_the_dek_cannot_forge_the_publishers_chunks() {
         replaces: None,
         end: None,
         final_seq: None,
+        kind: 0,
+        framing: 0,
     };
     let (ed, pq) = crate::identity::sign_bound_hybrid(&b, &lie.signed_bytes(), "lie")
         .await
@@ -600,6 +602,8 @@ fn binding_parse_enforces_both_signature_lengths() {
         replaces: None,
         end: None,
         final_seq: None,
+        kind: 0,
+        framing: 0,
     };
     assert!(StreamKeyBinding::from_bytes(&good.to_bytes()).is_ok());
     for len in [1, ML_DSA_65_SIG_LEN - 1, ML_DSA_65_SIG_LEN + 1] {
@@ -632,9 +636,9 @@ fn kat_v2(v2: Option<V2Members>) -> StreamKeyBinding {
         a.copy_from_slice(&v);
         a
     };
-    let (codecs, replaces, end, final_seq) = match v2 {
-        Some(m) => (m.codecs, m.replaces, m.end, m.final_seq),
-        None => (None, None, None, None),
+    let (codecs, replaces, end, final_seq, kind, framing) = match v2 {
+        Some(m) => (m.codecs, m.replaces, m.end, m.final_seq, m.kind, m.framing),
+        None => (None, None, None, None, 0, 0),
     };
     StreamKeyBinding {
         room: "room-kat".to_owned(),
@@ -649,6 +653,8 @@ fn kat_v2(v2: Option<V2Members>) -> StreamKeyBinding {
         replaces,
         end,
         final_seq,
+        kind,
+        framing,
     }
 }
 
@@ -658,6 +664,8 @@ fn v2m(codecs: CodecMap) -> Option<V2Members> {
         replaces: None,
         end: None,
         final_seq: None,
+        kind: 0,
+        framing: 0,
     })
 }
 
@@ -665,14 +673,17 @@ fn v2m(codecs: CodecMap) -> Option<V2Members> {
 /// pending text): the v2 domain, version 2, v1's members 2-7, then the codec
 /// map (`u8 count`, then per class sorted `class u8 ‖ u16_be len ‖ ascii
 /// token`), `replaces` (`u8 present ‖ [stream 32]`), `end` (`u8`: 0 live, 1
-/// left, 2 backgrounded) and, with an end, `final_seq u64_be`. Same inputs as
+/// left, 2 backgrounded, 3 this stream ended) and, with an end, `final_seq
+/// u64_be`, then (45.1, CC reading rc18) `kind u8` and `framing u8`. Same inputs as
 /// [`kat_vectors_are_deterministic`], map `{0x04: h264, 0xFF: opus}`; a
 /// second vector replaces stream `aa`x32, ends `left`, final_seq 42. The v1
 /// signed bytes of the same inputs are unchanged.
 #[test]
 fn binding_v2_signed_bytes_kat() {
-    const V2_SIGNED: &str = "63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0204000468323634ff00046f7075730000";
-    const V2_REPLACES_LEFT: &str = "63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0204000468323634ff00046f70757301aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01000000000000002a";
+    const V2_SIGNED: &str = "63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0204000468323634ff00046f70757300000000";
+    const V2_REPLACES_LEFT: &str = "63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0204000468323634ff00046f70757301aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01000000000000002a0000";
+    // A share (kind 1), framed (framing 1), ended with `end = 3`, final_seq 9.
+    const V2_SHARE_FRAMED_ENDED: &str = "63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d800000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0204000468323634ff00046f707573000300000000000000090101";
     let v2 = kat_v2(v2m(av_map()));
     assert_eq!(v2.version(), BINDING_VERSION_V2);
     assert_eq!(hex::encode(v2.signed_bytes()), V2_SIGNED);
@@ -681,14 +692,25 @@ fn binding_v2_signed_bytes_kat() {
         replaces: Some(StreamId([0xaa; 32])),
         end: Some(SignedEnd::Left),
         final_seq: Some(42),
+        kind: 0,
+        framing: 0,
     }));
     assert_eq!(hex::encode(full.signed_bytes()), V2_REPLACES_LEFT);
+    let share = kat_v2(Some(V2Members {
+        codecs: Some(av_map()),
+        replaces: None,
+        end: Some(SignedEnd::Ended),
+        final_seq: Some(9),
+        kind: STREAM_KIND_SHARE,
+        framing: FRAMING_FRAGMENTS,
+    }));
+    assert_eq!(hex::encode(share.signed_bytes()), V2_SHARE_FRAMED_ENDED);
     assert_eq!(
         hex::encode(kat_v2(None).signed_bytes()),
         kat::BINDING_SIGNED_BYTES,
         "v1 unchanged"
     );
-    for b in [v2, full, kat_v2(None)] {
+    for b in [v2, full, share, kat_v2(None)] {
         let wire = b.to_bytes();
         assert_eq!(StreamKeyBinding::version_of(&wire), Some(b.version()));
         assert_eq!(StreamKeyBinding::from_bytes(&wire), Ok(b));
@@ -773,6 +795,8 @@ fn the_codec_map_rules() {
         replaces: None,
         end: Some(SignedEnd::Backgrounded),
         final_seq: Some(7),
+        kind: 0,
+        framing: 0,
     }));
     assert_eq!(end_only.version(), BINDING_VERSION_V2);
     assert_eq!(
@@ -787,8 +811,30 @@ fn the_codec_map_rules() {
         Err(BindingError::Malformed("replaces"))
     );
     assert_eq!(
-        rewrite(&|w| w[tail + 1] = 3),
+        rewrite(&|w| w[tail + 1] = 4),
         Err(BindingError::Malformed("end"))
+    );
+    // 7e kind: any value binds (an unknown one renders as media); 7f framing:
+    // only 0 or 1.
+    let unknown_kind = rewrite(&|w| w[tail + 2] = 9).expect("an unknown kind binds");
+    assert_eq!(unknown_kind.kind, 9);
+    assert_eq!(
+        rewrite(&|w| w[tail + 3] = 2),
+        Err(BindingError::Malformed("framing"))
+    );
+    // A v2 binding that says only "share" is still v2.
+    let kind_only = kat_v2(Some(V2Members {
+        codecs: None,
+        replaces: None,
+        end: None,
+        final_seq: None,
+        kind: STREAM_KIND_SHARE,
+        framing: FRAMING_NONE,
+    }));
+    assert_eq!(kind_only.version(), BINDING_VERSION_V2);
+    assert_eq!(
+        StreamKeyBinding::from_bytes(&kind_only.to_bytes()),
+        Ok(kind_only)
     );
 }
 
@@ -1036,6 +1082,8 @@ fn binding_for(
         replaces: None,
         end: end.map(|(e, _)| e),
         final_seq: end.map(|(_, f)| f),
+        kind: 0,
+        framing: 0,
     }
 }
 
@@ -1084,6 +1132,40 @@ fn a_signed_end_is_final_and_nothing_past_it_plays() {
     assert_eq!(auth.counts().truncated, 0);
     assert!(auth.bound(stream, Epoch(3)).is_none(), "nothing more plays");
     assert!(auth.heard(stream));
+}
+
+/// 45.1 (CC rc18: "check the eviction order never drops a live stream") — a
+/// camera and a share, then the camera replaced four times in a row: each
+/// replacement retires the stream it names, and the four-newest bound
+/// evicts retired streams first, so the share (live, the oldest install)
+/// and the newest camera always bind.
+#[test]
+fn replacements_never_evict_a_live_share() {
+    let auth = ChunkAuth::new(ROOM);
+    let (cam, cam_key, b) = ending_stream(60, None);
+    auth.install(&b, Arc::new(b.to_bytes())).expect("camera");
+    let (share, share_key, b) = ending_stream(61, None);
+    auth.install(&b, Arc::new(b.to_bytes())).expect("share");
+    let mut prev = cam;
+    let mut newest = (cam, cam_key);
+    for n in 62..=66u8 {
+        let (s, key, mut b) = ending_stream(n, None);
+        b.replaces = Some(prev);
+        auth.install(&b, Arc::new(b.to_bytes()))
+            .expect("replacement");
+        prev = s;
+        newest = (s, key);
+        assert!(
+            auth.check(&signed_chunk(&share_key, share, u64::from(n)))
+                .is_ok(),
+            "the share still binds after replacement {n}"
+        );
+    }
+    assert!(auth.check(&signed_chunk(&newest.1, newest.0, 0)).is_ok());
+    assert!(
+        auth.bound(cam, Epoch(3)).is_none(),
+        "the first camera, long replaced, is gone"
+    );
 }
 
 /// 45.1 — an ended stream leaves the publisher's newest-streams list, so a

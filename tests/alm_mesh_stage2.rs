@@ -1230,14 +1230,16 @@ fn drain_from(
 }
 
 /// **A share beside the camera** (45.1, `Call::add_stream`): B publishes its
-/// camera and a screen share at once; A hears both, each as its own stream.
-/// B ends the share alone: A reads `StreamEnded { B, share }`, never
-/// `AttendeeLeft` or `StreamReplaced` for B, and keeps hearing B's camera.
+/// camera and a screen share at once; A reads `StreamAdded` for each with its
+/// signed kind (media, share) and hears both, each as its own stream. B ends
+/// the share alone (`end = 3`): A reads `StreamEnded { B, share, ended }`,
+/// never `AttendeeLeft` or `StreamReplaced` for B, and keeps hearing B's
+/// camera.
 /// The share's end is proved per leg (`end_flush_unconfirmed` 0).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
     use ciris_edge::transport::av_call::LeaveCause;
-    use ciris_edge::transport::av_chunk_auth::SignedEnd;
+    use ciris_edge::transport::av_chunk_auth::{STREAM_KIND_MEDIA, STREAM_KIND_SHARE};
     let _call = one_call().await;
     let tag = "alm2-share";
     let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
@@ -1254,6 +1256,23 @@ async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
     assert_ne!(share, cam);
     assert_eq!(cb.streams().await, vec![cam, share]);
     wait_bound(&ca, 2).await;
+    // A reads each stream's signed kind as its first binding installs.
+    let mut kinds = std::collections::BTreeMap::new();
+    while kinds.len() < 2 {
+        let got = next_event(&mut events, Duration::from_secs(10), |e| match e {
+            CallEvent::StreamAdded {
+                publisher,
+                stream,
+                kind,
+            } if *publisher == b.key.key_id => Some((*stream, *kind)),
+            _ => None,
+        })
+        .await
+        .expect("StreamAdded for each of B's streams");
+        kinds.insert(got.0, got.1);
+    }
+    assert_eq!(kinds.get(&cam), Some(&STREAM_KIND_MEDIA));
+    assert_eq!(kinds.get(&share), Some(&STREAM_KIND_SHARE));
     let mut heard = Heard::new();
     let bk = b.key.key_id.clone();
     let drain = |frames: &mut tokio::sync::mpsc::Receiver<_>, heard: &mut Heard| {
@@ -1282,9 +1301,7 @@ async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
         heard.get(&cam).map_or(0, |h| h.len()),
         heard.get(&share).map_or(0, |h| h.len())
     );
-    cb.end_stream(share, SignedEnd::Left)
-        .await
-        .expect("B stops sharing");
+    cb.end_stream(share).await.expect("B stops sharing");
     assert_eq!(cb.streams().await, vec![cam], "the camera carries on");
     assert!(
         cb.publish_on(share, Frame::opaque(body("share", 99)))
@@ -1308,7 +1325,7 @@ async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
         _ => None,
     })
     .await;
-    assert_eq!(ended, Some((share, LeaveCause::Left)));
+    assert_eq!(ended, Some((share, LeaveCause::Ended)), "end = 3, no leave");
     // The camera is untouched: its frames keep coming.
     let before = heard.get(&cam).map_or(0, |h| h.len());
     for seq in 60..100u64 {

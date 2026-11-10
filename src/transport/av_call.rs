@@ -397,10 +397,24 @@ pub enum CallEvent {
         /// `av_call_stream_truncated`).
         truncated: bool,
     },
+    /// 45.1 — `publisher`'s stream's first verified binding installed: its
+    /// keys are in hand and its `kind` (CC reading, rc18: 0 media, 1 share;
+    /// an unknown value renders as media) says how to lay it out. Not
+    /// presence: an attendee is one whose chunks arrive. A replacement's new
+    /// stream is [`CallEvent::StreamReplaced`] instead.
+    StreamAdded {
+        /// The publisher.
+        publisher: String,
+        /// The stream.
+        stream: StreamId,
+        /// Its signed kind (`0` for a v1 binding).
+        kind: u8,
+    },
     /// 45.1 — one of `publisher`'s streams ended, signed, while it attends
-    /// with another (a share stopped beside the camera, `Call::end_stream`
-    /// there): the stream's tile goes, the attendee stays. Its last stream's
-    /// end is [`CallEvent::AttendeeLeft`] instead.
+    /// with another, or with `end = 3` ("this stream ended", a share stopped
+    /// with `Call::end_stream`) on any of its streams: the stream's tile
+    /// goes, the attendee stays. A leave (`end` 1 or 2) on its last stream
+    /// is [`CallEvent::AttendeeLeft`] instead.
     StreamEnded {
         /// The publisher.
         publisher: String,
@@ -436,10 +450,13 @@ pub enum LeaveCause {
     /// Every leg to it went away and its stream went silent past
     /// [`ATTENDEE_LOST_AFTER`], with no signed end.
     Lost,
+    /// 45.1 — its signed `end = 3`: this stream ended and nothing more (a
+    /// share stopped). Only ever on [`CallEvent::StreamEnded`].
+    Ended,
 }
 
 impl LeaveCause {
-    /// The stable token: `left`, `backgrounded`, `removed`, `lost`.
+    /// The stable token: `left`, `backgrounded`, `removed`, `lost`, `ended`.
     #[must_use]
     pub const fn token(self) -> &'static str {
         match self {
@@ -447,6 +464,7 @@ impl LeaveCause {
             Self::Backgrounded => "backgrounded",
             Self::Removed => "removed",
             Self::Lost => "lost",
+            Self::Ended => "ended",
         }
     }
 }
@@ -456,6 +474,7 @@ impl From<crate::transport::av_chunk_auth::SignedEnd> for LeaveCause {
         match e {
             crate::transport::av_chunk_auth::SignedEnd::Left => Self::Left,
             crate::transport::av_chunk_auth::SignedEnd::Backgrounded => Self::Backgrounded,
+            crate::transport::av_chunk_auth::SignedEnd::Ended => Self::Ended,
         }
     }
 }
@@ -489,6 +508,10 @@ struct Attendance {
     /// Attendees this node verified a chunk of on a stream that has since
     /// ended: presence carried to the attendee's last stream's end.
     heard: std::collections::HashSet<String>,
+    /// 45.1 — an attendee whose every stream ended with `end = 3` (still
+    /// attending, by reachability): the last of them, for its eventual
+    /// `AttendeeLeft`.
+    last_ended: HashMap<String, StreamId>,
     /// `(attendee, stream)` pairs that have ended (left or replaced): each
     /// fires once.
     ended: std::collections::HashSet<(String, StreamId)>,
@@ -557,6 +580,12 @@ impl Attendance {
             let live = self.streams.entry(b.publisher.clone()).or_default();
             if !live.contains(&b.stream) {
                 live.push(b.stream);
+                self.last_ended.remove(&b.publisher);
+                return vec![CallEvent::StreamAdded {
+                    publisher: b.publisher.clone(),
+                    stream: b.stream,
+                    kind: b.kind,
+                }];
             }
         }
         Vec::new()
@@ -597,12 +626,7 @@ impl Attendance {
         let mut last = true;
         if let Some(live) = self.streams.get_mut(key_id) {
             live.retain(|s| *s != stream);
-            if live.is_empty() {
-                self.streams.remove(key_id);
-                self.unlinked_since.remove(key_id);
-            } else {
-                last = false;
-            }
+            last = live.is_empty();
         }
         if !first {
             return None;
@@ -610,16 +634,27 @@ impl Attendance {
         if present {
             self.heard.insert(key_id.to_owned());
         }
-        if !last {
-            return present.then(|| CallEvent::StreamEnded {
-                publisher: key_id.to_owned(),
+        // CC (rc18 reading): 1 and 2 are a leave only on the member's last
+        // stream; `end = 3` is the stream's end and never a leave, even on
+        // the last one: presence is reachability, never "no streams", so the
+        // member stays (with no live stream) until it leaves, is lost or is
+        // removed.
+        if last && cause != LeaveCause::Ended {
+            self.streams.remove(key_id);
+            self.unlinked_since.remove(key_id);
+            self.last_ended.remove(key_id);
+            return self.heard.remove(key_id).then(|| CallEvent::AttendeeLeft {
+                key_id: key_id.to_owned(),
                 stream,
                 cause,
                 truncated,
             });
         }
-        self.heard.remove(key_id).then(|| CallEvent::AttendeeLeft {
-            key_id: key_id.to_owned(),
+        if last {
+            self.last_ended.insert(key_id.to_owned(), stream);
+        }
+        present.then(|| CallEvent::StreamEnded {
+            publisher: key_id.to_owned(),
             stream,
             cause,
             truncated,
@@ -636,8 +671,9 @@ impl Attendance {
         cause: LeaveCause,
         present: impl Fn(StreamId) -> bool,
     ) -> Option<CallEvent> {
-        let live = self.streams.remove(key_id).unwrap_or_default();
+        let live = self.streams.remove(key_id)?;
         self.unlinked_since.remove(key_id);
+        let last_ended = self.last_ended.remove(key_id);
         let mut oldest = None;
         for s in live {
             if self.ended.insert((key_id.to_owned(), s)) {
@@ -647,7 +683,9 @@ impl Attendance {
                 oldest.get_or_insert(s);
             }
         }
-        let stream = oldest?;
+        // A member whose streams all ended (`end = 3`) still attends: its
+        // loss or removal names the last of them.
+        let stream = oldest.or(last_ended)?;
         self.heard.remove(key_id).then(|| CallEvent::AttendeeLeft {
             key_id: key_id.to_owned(),
             stream,
@@ -1648,6 +1686,10 @@ struct OwnChunkKey {
     replaces: Option<StreamId>,
     /// The stream's codec map (fixed for its life).
     codecs: Option<crate::transport::av_chunk_auth::CodecMap>,
+    /// 45.1 — its signed kind (0 media, 1 share).
+    kind: u8,
+    /// 45.1 — its signed framing (from the codec map, [`framing_for`]).
+    framing: u8,
 }
 
 /// Mint this stream's chunk key for `epoch` and bind it: a v1 binding, and a
@@ -1661,13 +1703,18 @@ async fn mint_own_key(
     epoch: Epoch,
     codecs: Option<crate::transport::av_chunk_auth::CodecMap>,
     replaces: Option<StreamId>,
+    kind: u8,
 ) -> Result<OwnChunkKey, CallError> {
+    let framing = framing_for(codecs);
     let key =
         ChunkSigner::generate(stream, epoch).map_err(|e| CallError::Plumbing(e.to_string()))?;
     let binding = StreamKeyBinding::sign(signer, room, join_nonce, stream, epoch, key.public())
         .await
         .map_err(|e| CallError::Plumbing(e.to_string()))?;
-    let wire_v2 = if codecs.is_some() || replaces.is_some() {
+    let wire_v2 = if codecs.is_some()
+        || replaces.is_some()
+        || kind != crate::transport::av_chunk_auth::STREAM_KIND_MEDIA
+    {
         Some(Arc::new(
             StreamKeyBinding::sign_v2(
                 signer,
@@ -1681,6 +1728,8 @@ async fn mint_own_key(
                     replaces,
                     end: None,
                     final_seq: None,
+                    kind,
+                    framing,
                 }),
             )
             .await
@@ -1698,7 +1747,29 @@ async fn mint_own_key(
         join_nonce,
         replaces,
         codecs,
+        kind,
+        framing,
     })
+}
+
+/// 45.1 (CC reading, rc18) — a stream's framing from its codec map: framed
+/// ([`FRAMING_FRAGMENTS`]) when it names a class other than audio (`0xFF`),
+/// so its video is split to the call's budget; an audio-only or map-less
+/// stream is not.
+///
+/// [`FRAMING_FRAGMENTS`]: crate::transport::av_chunk_auth::FRAMING_FRAGMENTS
+fn framing_for(codecs: Option<crate::transport::av_chunk_auth::CodecMap>) -> u8 {
+    use crate::transport::av_chunk_auth::{FRAMING_FRAGMENTS, FRAMING_NONE};
+    match codecs {
+        Some(m)
+            if m.entries()
+                .iter()
+                .any(|(class, _)| *class != crate::transport::realtime_av::CODEC_OPAQUE) =>
+        {
+            FRAMING_FRAGMENTS
+        }
+        _ => FRAMING_NONE,
+    }
 }
 
 /// The publisher's signed end of its stream at the current epoch, under the
@@ -1731,6 +1802,8 @@ struct EndFields {
     epoch: Epoch,
     replaces: Option<StreamId>,
     codecs: Option<crate::transport::av_chunk_auth::CodecMap>,
+    kind: u8,
+    framing: u8,
 }
 
 impl EndFields {
@@ -1742,6 +1815,8 @@ impl EndFields {
             epoch: k.signer.epoch(),
             replaces: k.replaces,
             codecs: k.codecs,
+            kind: k.kind,
+            framing: k.framing,
         }
     }
 }
@@ -1775,6 +1850,8 @@ async fn sign_end_fields(
             replaces: f.replaces,
             end: Some(end),
             final_seq: Some(final_seq),
+            kind: f.kind,
+            framing: f.framing,
         }),
     )
     .await
@@ -1938,8 +2015,17 @@ impl Call {
         let share_events = events.clone();
         let (stream, join_nonce, epoch, publisher, keep) =
             start_stream(room, own_key_id, &room_group, opts.keep, registrar, events).await?;
-        let own_key =
-            mint_own_key(&signer, room, join_nonce, stream, epoch, opts.codecs, None).await?;
+        let own_key = mint_own_key(
+            &signer,
+            room,
+            join_nonce,
+            stream,
+            epoch,
+            opts.codecs,
+            None,
+            crate::transport::av_chunk_auth::STREAM_KIND_MEDIA,
+        )
+        .await?;
 
         // Addresses: the call's group, from the room's destination secret at
         // the room's epoch, for the room's members.
@@ -2568,6 +2654,7 @@ impl Call {
             epoch,
             codecs,
             None,
+            crate::transport::av_chunk_auth::STREAM_KIND_SHARE,
         )
         .await?;
         send_bindings_on(shared, &mut publisher, &key.wire, key.wire_v2.as_ref()).await;
@@ -2670,7 +2757,8 @@ impl Call {
     }
 
     /// 45.1 — **end one share** ([`Self::add_stream`]) and only it: its
-    /// signed end (a v2 binding with `end` and `final_seq`) goes to every leg
+    /// signed end (a v2 binding with `end = 3`, "this stream ended", never a
+    /// leave, and `final_seq`) goes to every leg
     /// that parses v2, and the share stops. The camera and the call carry on;
     /// a receiver reads [`CallEvent::StreamEnded`], never `AttendeeLeft`,
     /// while the member has another stream. The primary ends only with the
@@ -2680,11 +2768,8 @@ impl Call {
     /// # Errors
     /// [`CallError::CallEnded`]; [`CallError::UnknownStream`] for the primary
     /// or a stream this node does not publish; [`CallError::Plumbing`].
-    pub async fn end_stream(
-        &self,
-        stream: StreamId,
-        why: crate::transport::av_chunk_auth::SignedEnd,
-    ) -> Result<(), CallError> {
+    pub async fn end_stream(&self, stream: StreamId) -> Result<(), CallError> {
+        let why = crate::transport::av_chunk_auth::SignedEnd::Ended;
         if let CallState::Ended(cause) = self.state() {
             return Err(CallError::CallEnded(cause));
         }
@@ -2781,6 +2866,7 @@ impl Call {
             epoch,
             codecs,
             Some(old),
+            crate::transport::av_chunk_auth::STREAM_KIND_MEDIA,
         )
         .await?;
         // Make: every leg learns the new stream's key (v1), and every leg that
@@ -2858,8 +2944,9 @@ impl Call {
         if let CallState::Ended(cause) = self.state() {
             return Err(CallError::CallEnded(cause));
         }
-        // 45.1 — each share ends first, then the primary: a receiver reads the
-        // shares as `StreamEnded` and the last stream as `AttendeeLeft`.
+        // 45.1 — each share ends first (`end = 3`), then the primary with the
+        // leave's own value: a receiver reads the shares as `StreamEnded` and
+        // the last stream as `AttendeeLeft`.
         let mut share_ends = Vec::new();
         let shares = std::mem::take(&mut *self.shared.shares.lock().await);
         for (stream, share) in shares {
@@ -2869,7 +2956,8 @@ impl Call {
                 .0
                 .checked_sub(1)
                 .unwrap_or(crate::transport::av_chunk_auth::FINAL_SEQ_NONE);
-            match sign_end_of(&self.shared, &share.key, final_seq, why).await {
+            let ended = crate::transport::av_chunk_auth::SignedEnd::Ended;
+            match sign_end_of(&self.shared, &share.key, final_seq, ended).await {
                 Ok(w) => share_ends.push(w),
                 Err(e) => tracing::warn!(
                     stream = %crate::transport::realtime_av::stream_label(stream),
@@ -3113,6 +3201,7 @@ async fn roll_share(
         to,
         share.key.codecs,
         None,
+        share.key.kind,
     )
     .await?;
     let keep = share
@@ -3297,6 +3386,7 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
         to,
         codecs,
         replaces,
+        crate::transport::av_chunk_auth::STREAM_KIND_MEDIA,
     )
     .await?;
     let keep = publisher
