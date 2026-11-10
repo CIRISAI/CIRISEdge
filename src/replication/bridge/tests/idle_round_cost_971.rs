@@ -257,27 +257,27 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
     }
 }
 
-/// The seat's complete Key-plane offer (the unbound, `Full` view: every
-/// offered key record at once), as encoded for the wire, at `n` offered key
+/// The seat's Key-plane Summary as encoded for the wire, at `n` offered key
 /// records: (refs, frame bytes before the seal, fragments at the TCP MDU,
-/// fragments at the base 500 B link MTU). A bound peer's listing is
-/// watermark-paged (CIRISEdge#531) and returned 0 of 10 on its first call in
-/// this fixture, so it cannot fit the size line.
+/// fragments at the base 500 B link MTU).
 async fn key_summary_at(n: usize) -> (usize, usize, usize, usize) {
-    let keys: Vec<String> = (0..n).map(|i| format!("announced-971-{i:05}")).collect();
-    let (backend, bridge) = make_bridge(&[]);
-    let pairs: Vec<(&str, &str)> = keys
-        .iter()
-        .map(|k| (k.as_str(), identity_type::NODE))
+    // The frame's size is a function of its refs alone, so the refs are
+    // built directly: one per offered key record, a distinct content hash
+    // and a realistic `asserted_at` seq. (The listing's own correctness on a
+    // first round is `a_fresh_bound_peer_is_offered_the_keys_on_its_first_key_round_971`.)
+    use sha2::Digest as _;
+    let base = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    let refs: Vec<EnvelopeRef> = (0..n)
+        .map(|i| {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            h[8..16].copy_from_slice(&0x971u64.to_be_bytes());
+            EnvelopeRef {
+                envelope_hash: sha2::Sha256::digest(h).into(),
+                seq: base + i as u64,
+            }
+        })
         .collect();
-    register_fixture_keys(&backend, &pairs).await;
-    let offer = keys.clone();
-    let bridge = bridge
-        .with_local_key_id(Some(SEAT.to_owned()))
-        .with_self_provider(Some(Arc::new(move || offer.clone())));
-    let refs = bridge
-        .list_envelope_refs_for_peer(EnvelopeKind::Key, None)
-        .await;
     let frame = wire_frame::wrap_v3(
         &ReplicationMessage::Summary(SummaryMessage {
             status: None,
