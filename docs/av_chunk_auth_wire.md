@@ -322,6 +322,18 @@ Rules:
   verified members. No unsigned control frame announces either, so a relay
   cannot take a tile down. A second stream of a publisher with no `replaces`
   (a screen share, say) stays a separate stream.
+- **A share is a second own stream** (45.1, `Call::add_stream`; CC reading
+  (rc17), pending text). It has its own join nonce, stream id, epoch DEK,
+  chunk key, v1/v2 bindings and codec map, and its chunks ride the
+  publisher's existing legs. ALM gives it its own parent-0 admission, so its
+  children and shedding are apart from the camera's. Its signed end
+  (`Call::end_stream`) is `CallEvent::StreamEnded` at a receiver while the
+  publisher has another live stream; only the last stream's end is
+  `AttendeeLeft`, and a `Lost` or `Removed` member is one `AttendeeLeft`
+  naming its oldest stream. A publisher holds at most `MAX_OWN_STREAMS` (3)
+  at once, one place under the receiver's four newest. An ended stream
+  leaves that list at once and its keys go at its verdict, so ending shares
+  never pushes the camera out.
 - **A binding is no presence.** An `end = 0` binding alone makes nobody an
   attendee: an `AttendeeLeft` fires only for a stream this receiver verified
   a chunk of (`ChunkAuth::heard`). Attendance otherwise comes from the

@@ -1059,9 +1059,6 @@ fn a_signed_end_is_final_and_nothing_past_it_plays() {
     let end = binding_for(stream, [21; 32], key.public(), Some((SignedEnd::Left, 4)));
     auth.install(&end, Arc::new(end.to_bytes()))
         .expect("the end");
-    assert!(!auth.settle_end(stream), "the tail arrived");
-    assert!(!auth.truncated(stream));
-    assert_eq!(auth.counts().truncated, 0);
     let mut replay = binding_for(stream, [21; 32], key.public(), None);
     for epoch in [3, 4] {
         replay.epoch = Epoch(epoch);
@@ -1080,6 +1077,37 @@ fn a_signed_end_is_final_and_nothing_past_it_plays() {
     assert_eq!(past, ChunkAuthError::PastEnd);
     assert_eq!(past.refusal().as_str(), "av_chunk_past_end");
     assert_eq!(auth.counts().past_end, 1);
+    // The verdict: the tail arrived. Past it the stream's keys go, and its
+    // presence stays.
+    assert!(!auth.settle_end(stream), "the tail arrived");
+    assert!(!auth.truncated(stream));
+    assert_eq!(auth.counts().truncated, 0);
+    assert!(auth.bound(stream, Epoch(3)).is_none(), "nothing more plays");
+    assert!(auth.heard(stream));
+}
+
+/// 45.1 — an ended stream leaves the publisher's newest-streams list, so a
+/// member that adds and ends shares never pushes its camera out of the
+/// four-newest bound at a receiver.
+#[test]
+fn ended_shares_never_evict_the_camera() {
+    let auth = ChunkAuth::new(ROOM);
+    let (cam, cam_key, cam_b) = ending_stream(40, None);
+    auth.install(&cam_b, Arc::new(cam_b.to_bytes()))
+        .expect("camera");
+    for n in 41..=46u8 {
+        let (share, key, b) = ending_stream(n, None);
+        auth.install(&b, Arc::new(b.to_bytes())).expect("share");
+        assert!(auth.check(&signed_chunk(&key, share, 0)).is_ok());
+        let end = binding_for(share, [n; 32], key.public(), Some((SignedEnd::Left, 0)));
+        auth.install(&end, Arc::new(end.to_bytes()))
+            .expect("share ends");
+        assert!(!auth.settle_end(share));
+    }
+    assert!(
+        auth.check(&signed_chunk(&cam_key, cam, 0)).is_ok(),
+        "six shares added and ended, the camera still binds"
+    );
 }
 
 /// CC: a relay that drops the tail before a signed leave is caught: the end

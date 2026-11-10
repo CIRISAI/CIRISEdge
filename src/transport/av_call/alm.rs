@@ -174,6 +174,10 @@ pub(super) struct AlmState {
     log: DecisionLog,
     own_stream: StreamId,
     own: Admission<String>,
+    /// 45.1 — this node's other own streams (a screen share beside the
+    /// camera, `Call::add_stream`): each its own parent-0 admission and
+    /// measured rate, so a share's children and shedding are its own.
+    shares: BTreeMap<StreamId, (Admission<String>, Rate)>,
     relay_capable: bool,
     relays: BTreeMap<StreamId, Admission<String>>,
     sels: BTreeMap<StreamId, ParentSelector<String>>,
@@ -189,7 +193,9 @@ pub(super) struct AlmState {
     /// (advertises `CAP_LAYER_REQUEST`, applies a child's cap, sends its
     /// own). The host's lever; off by default until CC's 5.3.3.2.4 correction.
     layer_requests: bool,
-    provisional: BTreeMap<String, u64>,
+    /// C3 members not yet subscribed to one of this node's own streams,
+    /// with since when: `(own stream, member)`.
+    provisional: BTreeMap<(StreamId, String), u64>,
     told_publisher: BTreeSet<StreamId>,
     draining_parent: BTreeMap<StreamId, String>,
     last_primary: BTreeMap<StreamId, Option<String>>,
@@ -248,6 +254,7 @@ impl AlmState {
             log: DecisionLog::new(64),
             own_stream,
             own,
+            shares: BTreeMap::new(),
             relay_capable,
             relays: BTreeMap::new(),
             sels: BTreeMap::new(),
@@ -392,6 +399,9 @@ impl AlmState {
     pub(super) fn set_members(&mut self, members: &[String]) {
         self.members = members.to_vec();
         self.own.set_members(members.iter().cloned());
+        for (a, _) in self.shares.values_mut() {
+            a.set_members(members.iter().cloned());
+        }
         for a in self.relays.values_mut() {
             a.set_members(members.iter().cloned());
         }
@@ -399,7 +409,7 @@ impl AlmState {
             s.set_members(members.iter().cloned());
         }
         self.caps.retain(|p, _| members.contains(p));
-        self.provisional.retain(|p, _| members.contains(p));
+        self.provisional.retain(|(_, p), _| members.contains(p));
     }
 
     /// The service tier (§7.2): Admit-close on relays at ≥ 1, A-shed (LIFO,
@@ -455,10 +465,13 @@ impl AlmState {
         self.layer_caps.retain(|(_, c), _| c != peer);
         let p = peer.to_owned();
         self.own.release(&p);
+        for (a, _) in self.shares.values_mut() {
+            a.release(&p);
+        }
         for a in self.relays.values_mut() {
             a.release(&p);
         }
-        self.provisional.remove(peer);
+        self.provisional.retain(|(_, c), _| c != peer);
     }
 
     /// The service tier now.
@@ -471,8 +484,14 @@ impl AlmState {
         let first = self.caps.insert(peer.to_owned(), caps).is_none();
         if first && caps & CAP_C3_V1 != 0 && self.members.iter().any(|m| m == peer) {
             let now = self.now_ms();
-            if self.own.role_of(&peer.to_owned()).is_none() {
-                self.provisional.insert(peer.to_owned(), now);
+            let p = peer.to_owned();
+            let unheld: Vec<StreamId> = self
+                .own_admissions()
+                .filter(|(_, a)| a.role_of(&p).is_none())
+                .map(|(s, _)| s)
+                .collect();
+            for s in unheld {
+                self.provisional.insert((s, p.clone()), now);
             }
             self.label(crate::observability::ALM_C3_PEER_CAPABLE);
         }
@@ -483,7 +502,7 @@ impl AlmState {
     /// hello is unsigned, so this is a first guess: a binding overrides it
     /// and it never overrides a binding.
     pub(super) fn note_publisher(&mut self, stream: StreamId, publisher: &str) {
-        if stream == self.own_stream || publisher == self.me {
+        if self.is_own(stream) || publisher == self.me {
             return;
         }
         if !self.bound_publisher.contains_key(&stream) {
@@ -495,7 +514,7 @@ impl AlmState {
     /// A verified binding names `publisher` for `stream`. A stream id is
     /// derived from its publisher, so this cannot change once known.
     pub(super) fn note_bound_publisher(&mut self, stream: StreamId, publisher: &str) {
-        if stream == self.own_stream {
+        if self.is_own(stream) {
             return;
         }
         self.bound_publisher.insert(stream, publisher.to_owned());
@@ -562,36 +581,141 @@ impl AlmState {
         self.egress.on_delivered(now, bytes);
     }
 
-    /// This node published `bytes` of its own stream.
+    /// This node published `bytes` of its own (primary) stream.
+    #[cfg(test)]
     pub(super) fn on_own_published(&mut self, bytes: u64, base_or_audio: bool) {
         self.own_rate.add(bytes, base_or_audio);
     }
 
-    /// The members this node's own chunk must NOT go to, among `legs`: C3
-    /// peers that hold no commitment (and are past the provisional window),
-    /// and standby children for a chunk above the base layer.
+    /// 45.1 — this node published `bytes` of its own `stream` (the primary
+    /// or a share).
+    pub(super) fn on_own_published_on(
+        &mut self,
+        stream: StreamId,
+        bytes: u64,
+        base_or_audio: bool,
+    ) {
+        if stream == self.own_stream {
+            self.own_rate.add(bytes, base_or_audio);
+        } else if let Some((_, r)) = self.shares.get_mut(&stream) {
+            r.add(bytes, base_or_audio);
+        }
+    }
+
+    /// The members this node's own (primary) chunk must NOT go to, among
+    /// `legs`: C3 peers that hold no commitment (and are past the
+    /// provisional window), and standby children for a chunk above the base
+    /// layer.
+    #[cfg(test)]
     pub(super) fn own_exclude(&self, legs: &[String], base_or_audio: bool) -> Vec<String> {
+        self.own_exclude_on(self.own_stream, legs, base_or_audio)
+    }
+
+    /// 45.1 — [`Self::own_exclude`] for one of this node's own streams, by
+    /// that stream's own admission. A stream this node does not publish
+    /// excludes every C3 leg.
+    pub(super) fn own_exclude_on(
+        &self,
+        stream: StreamId,
+        legs: &[String],
+        base_or_audio: bool,
+    ) -> Vec<String> {
         let now = self.now_ms();
+        let adm = self.own_admission(stream);
         legs.iter()
             .filter(|p| {
                 if !self.speaks_c3(p) {
                     return false;
                 }
-                match self.own.role_of(p) {
+                let Some(adm) = adm else {
+                    return true;
+                };
+                match adm.role_of(p) {
                     Some(Role::Primary) => false,
                     Some(Role::Standby) => !base_or_audio,
                     None => {
                         let fresh = self
                             .provisional
-                            .get(*p)
+                            .get(&(stream, (*p).clone()))
                             .is_some_and(|t| now.saturating_sub(*t) < PROVISIONAL_MS);
-                        let draining = self.own.is_draining(p);
+                        let draining = adm.is_draining(p);
                         !(fresh || draining)
                     }
                 }
             })
             .cloned()
             .collect()
+    }
+
+    /// 45.1 — whether `stream` is one of this node's own (the primary or a
+    /// share).
+    pub(super) fn is_own(&self, stream: StreamId) -> bool {
+        stream == self.own_stream || self.shares.contains_key(&stream)
+    }
+
+    /// The admission of this node's own `stream`, if it publishes it.
+    fn own_admission(&self, stream: StreamId) -> Option<&Admission<String>> {
+        if stream == self.own_stream {
+            Some(&self.own)
+        } else {
+            self.shares.get(&stream).map(|(a, _)| a)
+        }
+    }
+
+    fn own_admission_mut(&mut self, stream: StreamId) -> Option<&mut Admission<String>> {
+        if stream == self.own_stream {
+            Some(&mut self.own)
+        } else {
+            self.shares.get_mut(&stream).map(|(a, _)| a)
+        }
+    }
+
+    /// Every own stream's admission, the primary first.
+    fn own_admissions(&self) -> impl Iterator<Item = (StreamId, &Admission<String>)> {
+        std::iter::once((self.own_stream, &self.own))
+            .chain(self.shares.iter().map(|(s, (a, _))| (*s, a)))
+    }
+
+    /// 45.1 — `Call::add_stream`: this node now also publishes `stream`, a
+    /// parent-0 admission of its own on the same uplink (its commitments
+    /// count against every other admission's room, and theirs against its).
+    /// Every C3 member is provisional on it, so its first chunks reach each
+    /// while that member's selector learns of it.
+    pub(super) fn add_own_stream(&mut self, stream: StreamId) {
+        if self.is_own(stream) {
+            return;
+        }
+        let mut a = Admission::publisher(self.me.clone(), self.cfg.clone(), None);
+        a.set_members(self.members.iter().cloned());
+        let fanout =
+            (self.members.len().saturating_sub(1) as u64).clamp(1, PUBLISHER_INITIAL_FANOUT);
+        a.set_probe_streams(fanout);
+        self.shares.insert(stream, (a, Rate::default()));
+        let now = self.now_ms();
+        let c3: Vec<String> = self
+            .caps
+            .iter()
+            .filter(|(p, c)| *c & CAP_C3_V1 != 0 && self.members.contains(p))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in c3 {
+            self.provisional.insert((stream, p), now);
+        }
+    }
+
+    /// 45.1 — `Call::end_stream`: this node no longer publishes `stream` (a
+    /// share). Its admission, children's layer caps and provisional marks
+    /// go; the primary is untouched.
+    pub(super) fn remove_own_stream(&mut self, stream: StreamId) {
+        if self.shares.remove(&stream).is_some() {
+            self.provisional.retain(|(s, _), _| *s != stream);
+            self.layer_caps.retain(|(s, _), _| *s != stream);
+        }
+    }
+
+    /// 45.1 — this node's own streams besides the primary.
+    pub(super) fn share_streams(&self) -> Vec<StreamId> {
+        self.shares.keys().copied().collect()
     }
 
     /// Whether this node forwards `stream`'s chunk `(epoch, seq)` heard from
@@ -666,7 +790,7 @@ impl AlmState {
         base_or_audio: bool,
         hop_lost: u64,
     ) {
-        if stream == self.own_stream {
+        if self.is_own(stream) {
             return;
         }
         let now = self.now_ms();
@@ -715,18 +839,20 @@ impl AlmState {
         }
     }
 
-    fn external_for(&self, stream: Option<StreamId>) -> u64 {
-        let own = if stream.is_none() {
-            0
-        } else {
-            self.own.committed_bps()
-        };
-        own + self
-            .relays
-            .iter()
-            .filter(|(s, _)| Some(**s) != stream)
+    /// What every admission on this uplink but `stream`'s commits (bits/s):
+    /// every own stream's (the primary and each share) and every relayed
+    /// stream's.
+    fn external_except(&self, stream: StreamId) -> u64 {
+        self.own_admissions()
+            .filter(|(s, _)| *s != stream)
             .map(|(_, a)| a.committed_bps())
             .sum::<u64>()
+            + self
+                .relays
+                .iter()
+                .filter(|(s, _)| **s != stream)
+                .map(|(_, a)| a.committed_bps())
+                .sum::<u64>()
     }
 
     /// The SUBSCRIBE this node sends `parent` for `stream` in `role`: with
@@ -800,14 +926,19 @@ impl AlmState {
         let mut out = Vec::new();
         match f.msg {
             ControlMsg::Subscribe(req) => {
-                let (decision, preempted) = if stream == self.own_stream {
-                    self.provisional.remove(peer);
-                    let ext = self.external_for(None);
-                    self.own.set_external_committed(ext);
-                    let d = self.own.request(now, &req, &mut self.rng, &mut self.log);
-                    (d, self.own.take_preempted())
+                let (decision, preempted) = if self.is_own(stream) {
+                    self.provisional.remove(&(stream, peer.to_owned()));
+                    let ext = self.external_except(stream);
+                    let (mut rng, mut log) = (self.rng.clone(), std::mem::take(&mut self.log));
+                    let a = self.own_admission_mut(stream).expect("own");
+                    a.set_external_committed(ext);
+                    let d = a.request(now, &req, &mut rng, &mut log);
+                    let pre = a.take_preempted();
+                    self.rng = rng;
+                    self.log = log;
+                    (d, pre)
                 } else if self.relays.contains_key(&stream) {
-                    let ext = self.external_for(Some(stream));
+                    let ext = self.external_except(stream);
                     let a = self.relays.get_mut(&stream).expect("present");
                     a.set_external_committed(ext);
                     let d = a.request(now, &req, &mut self.rng, &mut self.log);
@@ -827,7 +958,7 @@ impl AlmState {
                 // parents.
                 if matches!(decision, AdmitDecision::Admit { .. })
                     && self.layer_requests
-                    && (stream == self.own_stream || self.relays.contains_key(&stream))
+                    && (self.is_own(stream) || self.relays.contains_key(&stream))
                 {
                     let key = (stream, peer.to_owned());
                     match req.layers {
@@ -871,9 +1002,11 @@ impl AlmState {
             ControlMsg::Unsubscribe { .. } => {
                 self.layer_caps.remove(&(stream, peer.to_owned()));
                 let p = peer.to_owned();
-                if stream == self.own_stream {
-                    self.provisional.remove(peer);
-                    self.own.release(&p);
+                if self.is_own(stream) {
+                    self.provisional.remove(&(stream, p.clone()));
+                    if let Some(a) = self.own_admission_mut(stream) {
+                        a.release(&p);
+                    }
                 } else if let Some(a) = self.relays.get_mut(&stream) {
                     a.release(&p);
                 }
@@ -897,7 +1030,7 @@ impl AlmState {
                 self.sync_upstream(stream);
             }
             ControlMsg::Offer(o) => {
-                if stream == self.own_stream || !self.members.iter().any(|m| m == peer) {
+                if self.is_own(stream) || !self.members.iter().any(|m| m == peer) {
                     return out;
                 }
                 if o.depth == 0 {
@@ -983,8 +1116,10 @@ impl AlmState {
             .filter(|(p, c)| *c & CAP_C3_V1 != 0 && self.members.contains(p))
             .map(|(p, _)| p.clone())
             .collect();
+        self.provisional
+            .retain(|(s, _), _| *s == stream || self.shares.contains_key(s));
         for p in c3 {
-            self.provisional.insert(p, now);
+            self.provisional.insert((stream, p), now);
         }
         let moved: Vec<(String, crate::transport::realtime_av::ReceiverLayerPolicy)> = self
             .layer_caps
@@ -1087,6 +1222,12 @@ impl AlmState {
             let (full, audio) = self.own_rate.costs();
             self.own.set_role_costs(full, audio);
         }
+        for (a, r) in self.shares.values_mut() {
+            if r.roll(now) {
+                let (full, audio) = r.costs();
+                a.set_role_costs(full, audio);
+            }
+        }
         // Every relayed stream is priced at its measured rate (the floor
         // until media flows), on the same footing as this node's own.
         for (s, a) in &mut self.relays {
@@ -1102,17 +1243,27 @@ impl AlmState {
             let streams: Vec<StreamId> = self.relays.keys().copied().collect();
             let mut shed: Vec<(StreamId, String)> = Vec::new();
             for s in streams {
-                let ext = self.external_for(Some(s));
+                let ext = self.external_except(s);
                 let a = self.relays.get_mut(&s).expect("present");
                 a.set_external_committed(ext);
                 for p in a.on_egress_window(now, &w, &mut self.log) {
                     shed.push((s, p));
                 }
             }
-            let ext = self.external_for(None);
+            let ext = self.external_except(self.own_stream);
             self.own.set_external_committed(ext);
             for p in self.own.on_egress_window(now, &w, &mut self.log) {
                 shed.push((self.own_stream, p));
+            }
+            // 45.1 — each share sheds by its own commitments.
+            let shares: Vec<StreamId> = self.shares.keys().copied().collect();
+            for s in shares {
+                let ext = self.external_except(s);
+                let (a, _) = self.shares.get_mut(&s).expect("present");
+                a.set_external_committed(ext);
+                for p in a.on_egress_window(now, &w, &mut self.log) {
+                    shed.push((s, p));
+                }
             }
             for (s, p) in shed {
                 self.counts.shed += 1;
@@ -1224,6 +1375,16 @@ impl AlmState {
             own_offer.forwarder_headroom_bps =
                 self.nominal(own_offer.forwarder_headroom_bps, &self.own_rate);
             let own_frame = encode(self.own_stream, &ControlMsg::Offer(own_offer));
+            let share_frames: Vec<Vec<u8>> = self
+                .shares
+                .iter()
+                .map(|(s, (a, r))| {
+                    let mut o = a.offer();
+                    o.headroom_bps = self.nominal(o.headroom_bps, r);
+                    o.forwarder_headroom_bps = self.nominal(o.forwarder_headroom_bps, r);
+                    encode(*s, &ControlMsg::Offer(o))
+                })
+                .collect();
             let relay_offers: Vec<(StreamId, Vec<String>, Vec<u8>)> = self
                 .relays
                 .iter()
@@ -1248,6 +1409,12 @@ impl AlmState {
                     to: peer.clone(),
                     frame: own_frame.clone(),
                 });
+                for f in &share_frames {
+                    out.push(Outgoing {
+                        to: peer.clone(),
+                        frame: f.clone(),
+                    });
+                }
                 for (_, skip, f) in &relay_offers {
                     if !skip.contains(peer) {
                         out.push(Outgoing {
@@ -1277,11 +1444,20 @@ impl AlmState {
 
     /// Who holds a commitment on this node's own stream, by role.
     pub(super) fn own_children(&self) -> Vec<(String, Role)> {
-        self.own
-            .ledger()
-            .iter()
-            .map(|(p, c)| (p.clone(), c.role))
-            .collect()
+        self.own_children_of(self.own_stream)
+    }
+
+    /// 45.1 — who holds a commitment on this node's own `stream` (the
+    /// primary or a share), by role.
+    pub(super) fn own_children_of(&self, stream: StreamId) -> Vec<(String, Role)> {
+        self.own_admission(stream)
+            .map(|a| {
+                a.ledger()
+                    .iter()
+                    .map(|(p, c)| (p.clone(), c.role))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Who this node forwards `stream` to, by role.
@@ -1295,7 +1471,7 @@ impl AlmState {
     /// Commitments, own and relayed (bits/s): the `load_ledger`'s A/V rows.
     pub(super) fn committed(&self) -> (u64, u64) {
         (
-            self.own.committed_bps(),
+            self.own_admissions().map(|(_, a)| a.committed_bps()).sum(),
             self.relays.values().map(Admission::committed_bps).sum(),
         )
     }
@@ -1306,7 +1482,7 @@ impl AlmState {
     pub(super) fn relay_commit_ratio(&self) -> f64 {
         self.relays
             .values()
-            .chain(std::iter::once(&self.own))
+            .chain(self.own_admissions().map(|(_, a)| a))
             .filter_map(|a| {
                 a.ceiling_bps()
                     .filter(|c| *c > 0.0)
@@ -1415,11 +1591,85 @@ mod tests {
         let _ = deliver(&mut b, "a", &decisions);
         assert_eq!(b.parents()[0].primary.as_deref(), Some("a"));
         // C never chose: once the provisional window passes it is excluded.
-        a.provisional.insert("c".into(), 0);
+        a.provisional.insert((a.own_stream, "c".into()), 0);
         a.t0 = Instant::now()
             .checked_sub(Duration::from_millis(PROVISIONAL_MS + 1))
             .expect("the clock is past the window");
         assert_eq!(a.own_exclude(&legs, false), vec!["c".to_owned()]);
+    }
+
+    /// 45.1 — a share is a parent-0 admission of its own: B subscribes to
+    /// A's share alone and is A's share child, not its camera child; the
+    /// camera's send set is untouched, each stream is offered, and ending
+    /// the share leaves the camera's admission and children as they were.
+    #[test]
+    fn a_share_is_its_own_admission_beside_the_camera() {
+        let (cam, share) = (s(1), s(7));
+        let mut a = AlmState::new("a", cam, &roster(), false, 1);
+        a.on_caps("b", CAPS_THIS_BUILD);
+        a.on_caps("c", CAPS_THIS_BUILD);
+        a.add_own_stream(share);
+        assert!(a.is_own(share) && a.is_own(cam));
+        assert_eq!(a.share_streams(), vec![share]);
+        let legs = vec!["b".to_owned(), "c".to_owned()];
+        assert!(
+            a.own_exclude_on(share, &legs, false).is_empty(),
+            "every C3 member is provisional on a new share"
+        );
+        let offers = a.tick(&legs);
+        let offered: BTreeSet<StreamId> = offers
+            .iter()
+            .filter_map(|o| match decode(&o.frame, "a") {
+                Ok(WireFrame::Control(cf)) if matches!(cf.msg, ControlMsg::Offer(_)) => {
+                    Some(cf.stream)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offered, [cam, share].into_iter().collect(), "both offered");
+        let sub = ControlFrame {
+            stream: share,
+            msg: ControlMsg::Subscribe(SubscribeRequest {
+                subscriber: "b".into(),
+                role: Role::Primary,
+                forward_capable: false,
+                layers: None,
+            }),
+        };
+        let out = a.on_control("b", sub, 10.0);
+        let WireFrame::Control(cf) = decode(&out[0].frame, "a").unwrap() else {
+            panic!()
+        };
+        assert!(matches!(
+            cf.msg,
+            ControlMsg::Decision(AdmitDecision::Admit { .. })
+        ));
+        assert!(a
+            .own_children_of(share)
+            .iter()
+            .any(|(p, r)| p == "b" && *r == Role::Primary));
+        assert!(
+            a.own_children().is_empty(),
+            "the camera's children are its own"
+        );
+        // Past the window: C never chose either stream, B only the share.
+        a.t0 = Instant::now()
+            .checked_sub(Duration::from_millis(PROVISIONAL_MS + 1))
+            .expect("the clock is past the window");
+        assert_eq!(a.own_exclude_on(share, &legs, false), vec!["c".to_owned()]);
+        assert_eq!(
+            a.own_exclude_on(cam, &legs, false),
+            legs,
+            "nobody took the camera"
+        );
+        a.remove_own_stream(share);
+        assert!(!a.is_own(share) && a.is_own(cam));
+        assert!(a.own_children_of(share).is_empty());
+        assert_eq!(
+            a.own_exclude_on(share, &legs, false),
+            legs,
+            "an ended share goes to nobody C3"
+        );
     }
 
     /// A refusal names its token; a subscribe to a stream this node does not

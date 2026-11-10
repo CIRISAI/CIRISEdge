@@ -1624,11 +1624,15 @@ impl ChunkAuth {
                 held.highest.remove(&(stream, *e));
             }
         }
-        // The publisher's newest streams.
+        // The publisher's newest streams. An ended stream leaves the list (it
+        // is bound only until its verdict, `settle_end`), so ending a share
+        // never pushes out the camera.
         let evicted = {
             let list = held.streams.entry(publisher).or_default();
             list.retain(|s| *s != stream);
-            list.push_back(stream);
+            if binding.end.is_none() {
+                list.push_back(stream);
+            }
             if list.len() > MAX_STREAMS_PER_PUBLISHER {
                 list.pop_front()
             } else {
@@ -1651,6 +1655,7 @@ impl ChunkAuth {
                 if let Some(old) = held.ended_order.pop_front() {
                     held.ended.remove(&old);
                     held.truncated.remove(&old);
+                    held.highest.retain(|(s, _), _| *s != old);
                 }
             }
         }
@@ -1674,6 +1679,10 @@ impl ChunkAuth {
         if short && held.truncated.insert(stream) {
             self.truncated.fetch_add(1, Ordering::Relaxed);
         }
+        // Past the verdict nothing of it plays: its keys go. Its highest seq
+        // stays (presence) until the ended set forgets it.
+        held.bound.retain(|(s, _), _| *s != stream);
+        held.codecs.remove(&stream);
         short
     }
 

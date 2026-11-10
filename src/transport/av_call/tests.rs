@@ -571,7 +571,7 @@ fn a_signed_end_is_attendee_left_with_its_cause_once() {
             false
         )
         .is_empty());
-    assert_eq!(a.streams.get("bob"), Some(&s1));
+    assert_eq!(a.streams.get("bob"), Some(&vec![s1]));
     let ev = a.on_bound(
         "me",
         &attendance_binding("bob", 1, None, Some(SignedEnd::Backgrounded)),
@@ -658,6 +658,114 @@ fn a_binding_alone_is_no_presence() {
     assert!(ev.is_empty(), "a signed end of a stream never heard");
 }
 
+/// 45.1 — a share is a second stream with no `replaces`: binding it ends
+/// nothing and replaces nothing. Its signed end is `StreamEnded` (the camera
+/// stays live, no leave); the camera's end, now the last stream, is
+/// `AttendeeLeft`. Lost or removed with both live: one `AttendeeLeft`,
+/// naming the oldest (the camera).
+#[test]
+fn a_share_is_a_second_stream_and_its_end_is_no_leave() {
+    use crate::transport::av_chunk_auth::SignedEnd;
+    let mut a = Attendance::default();
+    let (cam, share) = (StreamId([1; 32]), StreamId([7; 32]));
+    for s in [1, 7] {
+        let ev = a.on_bound(
+            "me",
+            &attendance_binding("bob", s, None, None),
+            None,
+            true,
+            false,
+        );
+        assert!(ev.is_empty(), "a share is no replacement and no leave");
+    }
+    assert_eq!(a.streams.get("bob"), Some(&vec![cam, share]));
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("bob", 7, None, Some(SignedEnd::Left)),
+        None,
+        true,
+        false,
+    );
+    assert_eq!(
+        ev,
+        [CallEvent::StreamEnded {
+            publisher: "bob".into(),
+            stream: share,
+            cause: LeaveCause::Left,
+            truncated: false,
+        }]
+    );
+    assert_eq!(
+        a.streams.get("bob"),
+        Some(&vec![cam]),
+        "the camera is untouched"
+    );
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("bob", 1, None, Some(SignedEnd::Backgrounded)),
+        None,
+        true,
+        false,
+    );
+    assert_eq!(
+        ev,
+        [CallEvent::AttendeeLeft {
+            key_id: "bob".into(),
+            stream: cam,
+            cause: LeaveCause::Backgrounded,
+            truncated: false,
+        }]
+    );
+    // Carol: camera heard, share never heard; lost with both live.
+    let (c_cam, c_share) = (StreamId([2; 32]), StreamId([8; 32]));
+    for s in [2, 8] {
+        let _ = a.on_bound(
+            "me",
+            &attendance_binding("carol", s, None, None),
+            None,
+            true,
+            false,
+        );
+    }
+    let ev = a.leave_all("carol", LeaveCause::Lost, |s| s == c_cam);
+    assert_eq!(
+        ev,
+        Some(CallEvent::AttendeeLeft {
+            key_id: "carol".into(),
+            stream: c_cam,
+            cause: LeaveCause::Lost,
+            truncated: false,
+        })
+    );
+    assert!(a
+        .leave_all("carol", LeaveCause::Removed, |_| true)
+        .is_none());
+    assert!(
+        a.left("carol", c_share, LeaveCause::Left, true, false)
+            .is_none(),
+        "once"
+    );
+    // A share never heard ends with no event; the attendee stays.
+    let _ = a.on_bound(
+        "me",
+        &attendance_binding("dan", 3, None, None),
+        None,
+        true,
+        false,
+    );
+    let _ = a.on_bound(
+        "me",
+        &attendance_binding("dan", 9, None, None),
+        None,
+        false,
+        false,
+    );
+    assert!(a
+        .left("dan", StreamId([9; 32]), LeaveCause::Left, false, false)
+        .is_none());
+    assert_eq!(a.streams.get("dan"), Some(&vec![StreamId([3; 32])]));
+}
+
 /// 45.1 — a signed `replaces` of the same publisher's stream is
 /// `StreamReplaced` and no leave; the old stream can then never leave. A
 /// `replaces` naming a stream another publisher's binding named is no
@@ -687,7 +795,7 @@ fn a_replacement_is_not_a_leave() {
             new: StreamId([2; 32]),
         }]
     );
-    assert_eq!(a.streams.get("bob"), Some(&StreamId([2; 32])));
+    assert_eq!(a.streams.get("bob"), Some(&vec![StreamId([2; 32])]));
     assert!(
         a.left("bob", StreamId([1; 32]), LeaveCause::Lost, true, false)
             .is_none(),

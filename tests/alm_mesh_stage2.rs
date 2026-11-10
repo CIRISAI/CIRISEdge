@@ -1211,6 +1211,133 @@ async fn a_relay_leaving_under_forwarded_video_proves_its_end_per_message() {
     );
 }
 
+/// What one receiver heard, per stream.
+type Heard = std::collections::BTreeMap<
+    ciris_edge::transport::realtime_av::StreamId,
+    std::collections::BTreeSet<Vec<u8>>,
+>;
+/// Take every frame `publisher` sent off `frames` into `heard`.
+fn drain_from(
+    frames: &mut tokio::sync::mpsc::Receiver<ciris_edge::transport::av_call::ReceivedFrame>,
+    heard: &mut Heard,
+    publisher: &str,
+) {
+    while let Ok(f) = frames.try_recv() {
+        if f.publisher == publisher {
+            heard.entry(f.stream).or_default().insert(f.bytes);
+        }
+    }
+}
+
+/// **A share beside the camera** (45.1, `Call::add_stream`): B publishes its
+/// camera and a screen share at once; A hears both, each as its own stream.
+/// B ends the share alone: A reads `StreamEnded { B, share }`, never
+/// `AttendeeLeft` or `StreamReplaced` for B, and keeps hearing B's camera.
+/// The share's end is proved per leg (`end_flush_unconfirmed` 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
+    use ciris_edge::transport::av_call::LeaveCause;
+    use ciris_edge::transport::av_chunk_auth::SignedEnd;
+    let _call = one_call().await;
+    let tag = "alm2-share";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    wait_bound(&ca, 1).await;
+    let mut events = ca.events().expect("A's events");
+    let mut frames = ca.frames().expect("A's frames");
+    let cam = cb.stream();
+    let share = cb.add_stream(None).await.expect("B shares its screen");
+    assert_ne!(share, cam);
+    assert_eq!(cb.streams().await, vec![cam, share]);
+    wait_bound(&ca, 2).await;
+    let mut heard = Heard::new();
+    let bk = b.key.key_id.clone();
+    let drain = |frames: &mut tokio::sync::mpsc::Receiver<_>, heard: &mut Heard| {
+        drain_from(frames, heard, &bk);
+    };
+    for seq in 0..60u64 {
+        cb.publish(Frame::opaque(body("cam", seq)))
+            .await
+            .expect("camera");
+        cb.publish_on(share, Frame::opaque(body("share", seq)))
+            .await
+            .expect("share");
+        drain(&mut frames, &mut heard);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let both = wait_until(Duration::from_secs(20), || {
+        drain(&mut frames, &mut heard);
+        let n = |s| heard.get(&s).map_or(0, std::collections::BTreeSet::len);
+        let ok = n(cam) >= 50 && n(share) >= 50;
+        async move { ok }
+    })
+    .await;
+    assert!(
+        both,
+        "A hears both streams: camera {}, share {}",
+        heard.get(&cam).map_or(0, |h| h.len()),
+        heard.get(&share).map_or(0, |h| h.len())
+    );
+    cb.end_stream(share, SignedEnd::Left)
+        .await
+        .expect("B stops sharing");
+    assert_eq!(cb.streams().await, vec![cam], "the camera carries on");
+    assert!(
+        cb.publish_on(share, Frame::opaque(body("share", 99)))
+            .await
+            .is_err(),
+        "an ended share takes no more frames"
+    );
+    let ended = next_event(&mut events, Duration::from_secs(10), |e| match e {
+        CallEvent::StreamEnded {
+            publisher,
+            stream,
+            cause,
+            ..
+        } if *publisher == b.key.key_id => Some((*stream, *cause)),
+        CallEvent::AttendeeLeft { key_id, .. } if *key_id == b.key.key_id => {
+            panic!("ending a share is not a leave")
+        }
+        CallEvent::StreamReplaced { publisher, .. } if *publisher == b.key.key_id => {
+            panic!("a share is not a replacement")
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(ended, Some((share, LeaveCause::Left)));
+    // The camera is untouched: its frames keep coming.
+    let before = heard.get(&cam).map_or(0, |h| h.len());
+    for seq in 60..100u64 {
+        cb.publish(Frame::opaque(body("cam", seq)))
+            .await
+            .expect("camera after the share");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let more = wait_until(Duration::from_secs(10), || {
+        drain(&mut frames, &mut heard);
+        let ok = heard.get(&cam).map_or(0, |h| h.len()) >= before + 30;
+        async move { ok }
+    })
+    .await;
+    assert!(more, "B's camera carries on after the share ends");
+    while let Ok(e) = events.try_recv() {
+        match e {
+            CallEvent::AttendeeLeft { key_id, .. } if key_id == b.key.key_id => {
+                panic!("no leave for B")
+            }
+            CallEvent::StreamReplaced { publisher, .. } if publisher == b.key.key_id => {
+                panic!("no replacement for B")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(av(&b.metrics, "end_flush_unconfirmed"), 0);
+}
+
 /// **Per-leg stats** (45.1): every leg a call reports names what carries it
 /// and its MDU, so a gate can tell a punched UDP leg from a TCP one from a
 /// relayed one. On loopback TCP every leg is `Interface`, with a link MDU,

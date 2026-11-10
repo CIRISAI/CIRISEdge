@@ -4395,6 +4395,8 @@ fn call_err_token(e: &crate::transport::av_call::CallError) -> &'static str {
         E::ActorIsNotTheSubject { .. } => "actor_is_not_the_subject",
         E::Plumbing(_) => "plumbing",
         E::AnonymousMode => crate::onion::tokens::ANONYMOUS_NO_MEDIA,
+        E::UnknownStream(_) => "unknown_stream",
+        E::TooManyStreams(_) => "too_many_streams",
     }
 }
 
@@ -4409,7 +4411,9 @@ fn call_err_to_py(e: &crate::transport::av_call::CallError) -> PyErr {
         | E::ConsentMissing { .. }
         | E::FrameTooLarge { .. }
         | E::ActorIsNotTheSubject { .. }
-        | E::AnonymousMode => PyValueError::new_err(msg),
+        | E::AnonymousMode
+        | E::UnknownStream(_)
+        | E::TooManyStreams(_) => PyValueError::new_err(msg),
         _ => PyRuntimeError::new_err(msg),
     }
 }
@@ -4501,6 +4505,18 @@ fn call_event_to_pydict<'py>(
             d.set_item("cause", cause.token())?;
             d.set_item("truncated", *truncated)?;
         }
+        V::StreamEnded {
+            publisher,
+            stream,
+            cause,
+            truncated,
+        } => {
+            d.set_item("kind", "stream_ended")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
+            d.set_item("cause", cause.token())?;
+            d.set_item("truncated", *truncated)?;
+        }
         V::StreamReplaced {
             publisher,
             old,
@@ -4585,6 +4601,10 @@ pub const PY_CALL_VERBS: &[&str] = &[
     "attendance",
     "state",
     "leave",
+    "add_stream",
+    "publish_on",
+    "end_stream",
+    "streams",
 ];
 
 #[cfg(feature = "_reticulum-module")]
@@ -4652,6 +4672,82 @@ impl PyCall {
         let codecs = codecs.map(|c| call_codecs_arg(&c)).transpose()?;
         self.with_call(py, move |c| {
             Box::pin(async move { Ok(c.replace_stream(codecs).await?.0) })
+        })
+    }
+
+    /// 45.1 — publish a second stream beside the camera (a desktop or
+    /// window share): its own stream id, bindings and codec map (`codecs` as
+    /// tokens; `None`: none). Receivers bind it as a separate stream, never
+    /// a replacement; its end is `stream_ended`, never `attendee_left`.
+    /// Returns its stream id. At most three own streams at once
+    /// (`too_many_streams`).
+    #[pyo3(signature = (codecs=None))]
+    fn add_stream(&self, py: Python<'_>, codecs: Option<Vec<String>>) -> PyResult<[u8; 32]> {
+        let codecs = codecs.map(|c| call_codecs_arg(&c)).transpose()?;
+        self.with_call(py, move |c| {
+            Box::pin(async move { Ok(c.add_stream(codecs).await?.0) })
+        })
+    }
+
+    /// 45.1 — `publish` on one of this node's streams (`stream_id()` or one
+    /// `add_stream` gave): the same dict. A stream this node does not
+    /// publish raises `unknown_stream`.
+    #[pyo3(signature = (stream_id, frame, codec_id=PY_CODEC_OPAQUE, layer=(0, 0, 0)))]
+    fn publish_on(
+        &self,
+        py: Python<'_>,
+        stream_id: [u8; 32],
+        frame: Vec<u8>,
+        codec_id: u8,
+        layer: (u8, u8, u8),
+    ) -> PyResult<Py<PyAny>> {
+        let frame = crate::transport::av_call::Frame {
+            codec_id,
+            layer: chunk_layer_from_tuple(layer),
+            bytes: frame,
+        };
+        let stream = crate::transport::realtime_av::StreamId(stream_id);
+        let report = self.with_call(py, move |c| {
+            Box::pin(async move { c.publish_on(stream, frame).await })
+        })?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("epoch", report.epoch.0)?;
+        d.set_item("chunk_seq", report.chunk_seq.0)?;
+        d.set_item("delivered", report.delivered())?;
+        let legs: Vec<(String, String)> = report
+            .legs
+            .iter()
+            .map(|(m, o)| (m.clone(), format!("{o:?}")))
+            .collect();
+        d.set_item("legs", legs)?;
+        Ok(d.unbind().into_any())
+    }
+
+    /// 45.1 — end one share (`add_stream`'s stream) and only it, signed
+    /// (`cause`: `"left"` or `"backgrounded"`); the camera and the call
+    /// carry on. The primary ends only with `leave()` (`unknown_stream`).
+    #[pyo3(signature = (stream_id, cause="left"))]
+    fn end_stream(&self, py: Python<'_>, stream_id: [u8; 32], cause: &str) -> PyResult<()> {
+        let why = match cause {
+            "left" => crate::transport::av_chunk_auth::SignedEnd::Left,
+            "backgrounded" => crate::transport::av_chunk_auth::SignedEnd::Backgrounded,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "leave_cause_unknown: {other:?} (left, backgrounded)"
+                )))
+            }
+        };
+        let stream = crate::transport::realtime_av::StreamId(stream_id);
+        self.with_call(py, move |c| {
+            Box::pin(async move { c.end_stream(stream, why).await })
+        })
+    }
+
+    /// 45.1 — every stream this node publishes in the call, the primary
+    /// first.
+    fn streams(&self, py: Python<'_>) -> PyResult<Vec<[u8; 32]>> {
+        self.with_call(py, |c| {
+            Box::pin(async move { Ok(c.streams().await.into_iter().map(|s| s.0).collect()) })
         })
     }
 
