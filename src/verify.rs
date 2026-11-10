@@ -1350,7 +1350,7 @@ pub fn retired_wire_kind_drops() -> u64 {
 fn drop_retired_wire_kind(kind: &'static str) {
     RETIRED_WIRE_KIND_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let throttle = RETIRED_WIRE_KIND_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(60), 8)
+        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_mins(1), 8)
     });
     if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } = throttle.check(kind) {
         tracing::warn!(

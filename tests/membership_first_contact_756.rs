@@ -680,7 +680,7 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
 
     // Control: the three are talking — each stranger holds A's owner-binding
     // and A holds theirs (#671 allegiance facts).
-    let talking = drive_until(&all, Duration::from_secs(240), || async {
+    let talking = drive_until(&all, Duration::from_mins(4), || async {
         b.holds(&a.binding_id()).await
             && c.holds(&a.binding_id()).await
             && a.holds(&b.binding_id()).await
@@ -710,7 +710,7 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
     )
     .await
     .expect("P proposes K");
-    let invited = drive_until(&all, Duration::from_secs(240), || async {
+    let invited = drive_until(&all, Duration::from_mins(4), || async {
         b.holds(&proposal.attestation_id).await
     })
     .await;
@@ -743,7 +743,7 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
         .await
         .expect("K accepts on B")
         .attestation_id;
-    let joined = drive_until(&all, Duration::from_secs(240), || async {
+    let joined = drive_until(&all, Duration::from_mins(4), || async {
         a.holds(&acceptance).await && a.roster(scope, &group).await.contains(&b.owner.key_id)
     })
     .await;
@@ -781,7 +781,7 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
     )
     .await;
     let later_row = group_row(scope, &group, &a.owner.signer(), &a.dir).await;
-    let member_path = drive_until(&all, Duration::from_secs(240), || async {
+    let member_path = drive_until(&all, Duration::from_mins(4), || async {
         b.roster(scope, &group).await.contains(&b.owner.key_id) && b.holds(&later_row).await
     })
     .await;

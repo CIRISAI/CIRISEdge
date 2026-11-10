@@ -1437,13 +1437,16 @@ mod tests {
                 self.base_to_b += 1;
                 withheld |= self
                     .withhold_base_b
-                    .is_some_and(|n| self.base_to_b % n == 0);
+                    .is_some_and(|n| self.base_to_b.is_multiple_of(n));
             }
             let filtered = self.a_caps_b && !base_or_audio;
             if !excluded.contains(&legs[0]) && !withheld && !filtered && self.a_to_b_up {
                 self.nodes[A].on_sent("b", CHUNK);
                 self.hop_to_b += 1;
-                if self.wire_lose_b.is_some_and(|n| self.hop_to_b % n == 0) {
+                if self
+                    .wire_lose_b
+                    .is_some_and(|n| self.hop_to_b.is_multiple_of(n))
+                {
                     self.hop_gap_b += 1;
                 } else {
                     let lost = std::mem::take(&mut self.hop_gap_b);
@@ -1476,7 +1479,7 @@ mod tests {
                     self.chunk(false);
                 }
                 self.ticks += 1;
-                if self.ticks % 5 == 0 {
+                if self.ticks.is_multiple_of(5) {
                     self.tick();
                     each_tick(self);
                 }
@@ -1493,7 +1496,7 @@ mod tests {
                 self.nodes[A].on_sent("b", 1);
                 self.nodes[A].on_dropped(CHUNK);
                 self.ticks += 1;
-                if self.ticks % 5 == 0 {
+                if self.ticks.is_multiple_of(5) {
                     self.tick();
                 }
             }

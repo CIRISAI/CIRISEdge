@@ -201,7 +201,7 @@ impl Default for LxmfServeLimits {
             max_destinations: 1024,
             max_messages_per_response: 64,
             max_response_bytes: propagation_limit_bytes,
-            retention: Duration::from_secs(7 * 24 * 60 * 60),
+            retention: Duration::from_hours(168),
             stamp_cost: 8,
         }
     }

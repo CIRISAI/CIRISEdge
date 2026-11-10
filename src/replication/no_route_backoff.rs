@@ -60,7 +60,7 @@ pub const NO_ROUTE_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
 /// the low end of the 15–30 min band: with full jitter such a peer is
 /// re-probed every 7.5 min on average, at one round per peer instead of one
 /// per plane per tick.
-pub const DEFAULT_NO_ROUTE_BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
+pub const DEFAULT_NO_ROUTE_BACKOFF_CAP: Duration = Duration::from_mins(15);
 
 /// A cap under this is raised to it.
 const MIN_NO_ROUTE_BACKOFF_CAP: Duration = Duration::from_secs(1);
@@ -468,7 +468,7 @@ mod tests {
     /// the draws actually spread (not pinned to either end).
     #[test]
     fn full_jitter_draws_within_window_and_doubling_is_capped_794() {
-        let cap = Duration::from_secs(15 * 60);
+        let cap = Duration::from_mins(15);
         let mut window = NO_ROUTE_BACKOFF_INITIAL;
         let mut windows = vec![window];
         for _ in 0..10 {

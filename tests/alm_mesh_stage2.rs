@@ -265,7 +265,7 @@ async fn node(
         Arc::clone(&table),
         Arc::clone(&transport) as Arc<dyn ScopedDestinationSink>,
         key.key_id.clone(),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
     ));
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(256);
     let listener = Arc::clone(&transport);
@@ -385,7 +385,7 @@ async fn topo(
             }
         }
     }
-    let known = wait_until(Duration::from_secs(120), || async {
+    let known = wait_until(Duration::from_mins(2), || async {
         for a in &nodes {
             for b in &nodes {
                 if a.key.key_id != b.key.key_id && !a.transport.seek_peer(&b.key.key_id).await {
@@ -448,7 +448,7 @@ fn body(who: &str, seq: u64) -> Vec<u8> {
 /// How long a witness may look for media that ran undisturbed. A host can be
 /// starved for a while, and a stretch needs a ceiling learned in that spell to
 /// go stale; it cannot be starved for good, so running out is a failure.
-const QUIET_BUDGET: Duration = Duration::from_secs(300);
+const QUIET_BUDGET: Duration = Duration::from_mins(5);
 
 /// Everything on `nodes` that says media really went missing or a commitment
 /// really moved: what a stretch must not contain for its meters to mean what
@@ -748,7 +748,7 @@ async fn c3_admits_and_a_closed_relay_refuses_by_name() {
     wait_legs(&cb, 2).await;
     wait_legs(&cc, 2).await;
 
-    let admitted = wait_until(Duration::from_secs(60), || async {
+    let admitted = wait_until(Duration::from_mins(1), || async {
         ca.alm_own_children().iter().any(|(p, r)| {
             *p == b.key.key_id
                 && *r == ciris_edge::transport::realtime_av_alm::controller::Role::Primary
@@ -777,7 +777,7 @@ async fn c3_admits_and_a_closed_relay_refuses_by_name() {
         av(&a.metrics, "alm_c3_send_failed")
     );
 
-    let refused = wait_until(Duration::from_secs(60), || async {
+    let refused = wait_until(Duration::from_mins(1), || async {
         cc.alm_counts()
             .refused
             .get("load_refuse:admit_closed")
@@ -950,7 +950,7 @@ async fn a_refused_admit_is_resent_not_withdrawn() {
     let ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
     ca.fail_next_c3_for_test(u64::MAX);
     let cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
-    let recorded = wait_until(Duration::from_secs(60), || async {
+    let recorded = wait_until(Duration::from_mins(1), || async {
         primary_for(&cb, ca.stream()).as_deref() == Some(a.key.key_id.as_str())
     })
     .await;
@@ -1161,7 +1161,7 @@ async fn layered_until_standby(
 fn layered(who: &str, k: u64) -> Frame {
     Frame {
         codec_id: CODEC_AV1_SVC,
-        layer: if k % 2 == 0 {
+        layer: if k.is_multiple_of(2) {
             ChunkLayer::BASE
         } else {
             ChunkLayer {

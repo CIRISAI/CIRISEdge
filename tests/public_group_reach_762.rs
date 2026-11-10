@@ -632,14 +632,14 @@ async fn a_public_group_resolves_on_a_non_member_762() {
     ];
 
     // Control: the two are talking (the #671 allegiance facts cross).
-    let talking = drive_until(&all, Duration::from_secs(240), || async {
+    let talking = drive_until(&all, Duration::from_mins(4), || async {
         x.holds(&a.binding_id()).await && a.holds(&x.binding_id()).await
     })
     .await;
     assert!(talking, "control: the allegiance facts cross first contact");
 
     // X, a non-member, receives each public record.
-    let received = drive_until(&all, Duration::from_secs(240), || async {
+    let received = drive_until(&all, Duration::from_mins(4), || async {
         for (scope, group) in &public {
             if !holds_record(&x, *scope, group).await {
                 return false;

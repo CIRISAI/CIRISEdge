@@ -309,7 +309,7 @@ async fn side(
             ReplicationRuntimeConfig {
                 scheduler: SchedulerConfig {
                     // Rounds are driven by the test (`round_now_all`).
-                    cadence: Duration::from_secs(3600),
+                    cadence: Duration::from_hours(1),
                     round_timeout: Duration::from_secs(15),
                     ..SchedulerConfig::default()
                 },
@@ -433,7 +433,7 @@ async fn pair(tag: &str) -> Pair {
     let a = side(key_a, a_dir, transport_a, metrics_a, &peer_of_a, addr_a).await;
     let b = side(key_b, b_dir, transport_b, metrics_b, &peer_of_b, addr_b).await;
 
-    let known = wait_until(Duration::from_secs(60), || async {
+    let known = wait_until(Duration::from_mins(1), || async {
         a.transport.knows_peer(&b.key.key_id).await && b.transport.knows_peer(&a.key.key_id).await
     })
     .await;
@@ -611,7 +611,7 @@ async fn identity_plane_rows_admit_while_a_scoped_link_is_live_728() {
         .send(&p.b.key.key_id, &frame)
         .await
         .expect("A -> B identity-plane Deliver");
-    let landed = wait_until(Duration::from_secs(60), || async {
+    let landed = wait_until(Duration::from_mins(1), || async {
         holds_all(&p.b.dir, &ids).await
     })
     .await;
@@ -638,7 +638,7 @@ async fn identity_plane_rows_admit_while_a_scoped_link_is_live_728() {
     // through the scheduler. v44: that round is read off the runtime's own
     // events, so an open wake clock closes on it.
     p.a.metrics.telemetry.note_woken();
-    let sweeps = drive_a_until(&p, Duration::from_secs(60), || async {
+    let sweeps = drive_a_until(&p, Duration::from_mins(1), || async {
         completed_rounds(&p.a.metrics) >= 1
     })
     .await;
@@ -699,7 +699,7 @@ async fn an_identity_send_dials_rather_than_borrowing_the_scoped_link_728() {
         .send(&p.b.key.key_id, &frame)
         .await
         .expect("A -> B identity-plane Deliver");
-    let landed = wait_until(Duration::from_secs(60), || async {
+    let landed = wait_until(Duration::from_mins(1), || async {
         holds_all(&p.b.dir, &ids).await
     })
     .await;
@@ -753,7 +753,7 @@ async fn a_scoped_body_rides_the_derived_link_not_the_identity_link_728() {
         .await
         .expect("A -> B identity-plane Deliver");
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             holds_all(&p.b.dir, &ids).await
         })
         .await,

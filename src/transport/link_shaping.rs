@@ -2378,7 +2378,7 @@ pub const PEER_SHAPING_FACTS_MAX: usize = 4096;
 /// retracts the bodies and reports a retryable timeout: bounded so a
 /// saturated link (a window's budget spent) does not hold a dispatcher or a
 /// round gate for the whole window.
-pub const ROW_LEAVE_MAX: Duration = Duration::from_secs(60);
+pub const ROW_LEAVE_MAX: Duration = Duration::from_mins(1);
 
 /// The margin a leave budget allows on top of its Poisson p99.
 pub const ROW_LEAVE_MARGIN: Duration = Duration::from_secs(5);
@@ -2410,7 +2410,7 @@ pub fn row_frames(bytes: usize, frame_bytes: u16) -> usize {
 
 /// `CLM-shaping-offered-never-refused` — how long past its last real frame a
 /// node that does not offer shaping keeps a link a peer asked it for.
-pub const DEFAULT_ASKED_IDLE_TTL: Duration = Duration::from_secs(600);
+pub const DEFAULT_ASKED_IDLE_TTL: Duration = Duration::from_mins(10);
 
 /// What reads a node's device state.
 struct DeviceRead(Box<dyn Fn() -> DeviceState + Send + Sync>);
@@ -3653,7 +3653,7 @@ impl LinkShapers {
         }
         let cap = body_capacity(shaper.agreement().frame_bytes);
         crate::transport::frame_fragment::fragment(envelope, cap)
-            .map_or(true, |f| f.len() > shaper.reach_frames_now())
+            .is_none_or(|f| f.len() > shaper.reach_frames_now())
     }
 
     /// Shaped links now.
@@ -3811,7 +3811,7 @@ mod tests {
         assert_eq!(ab.frame_bytes, 400);
         assert!((ab.lambda - 3.5).abs() < 1e-6, "{}", ab.lambda);
         assert!((ab.rho - 0.5).abs() < 1e-9);
-        assert_eq!(ab.window, Duration::from_secs(600));
+        assert_eq!(ab.window, Duration::from_mins(10));
         assert!(agree(&a, &ShapingOffer::off()).is_none());
         assert!(agree(&ShapingOffer::off(), &b).is_none());
     }
@@ -3954,7 +3954,7 @@ mod tests {
         let _ = t.offer_for_answer(link, 400, Some("asker"), &peer);
         let shaper = t.peer_offer(link, &peer).unwrap().expect("shaped");
         let ttl = t.asked_idle_ttl();
-        assert_eq!(ttl, Duration::from_secs(600), "the rule's ten minutes");
+        assert_eq!(ttl, Duration::from_mins(10), "the rule's ten minutes");
 
         tokio::time::advance(ttl.saturating_sub(Duration::from_secs(1))).await;
         assert!(t.asked_links_idle().is_empty(), "inside the TTL");
@@ -3990,7 +3990,7 @@ mod tests {
             shaper.next_emission().await,
             Emission::Frame { real: true, .. }
         ));
-        assert!(shaper.idle_for() < Duration::from_secs(60));
+        assert!(shaper.idle_for() < Duration::from_mins(1));
     }
 
     /// The close is spread over a tenth of the TTL, by link: a fleet's links do
@@ -4026,7 +4026,7 @@ mod tests {
         let on = LinkShapers::new(ShapingPolicy::fleet_default(BudgetClass::Server));
         let _ = on.offer_for_answer([1u8; 16], 400, Some("p"), &peer);
         on.peer_offer([1u8; 16], &peer).unwrap().expect("shaped");
-        tokio::time::advance(Duration::from_secs(86_400)).await;
+        tokio::time::advance(Duration::from_hours(24)).await;
         assert!(on.asked_links_idle().is_empty());
 
         let off = off_at(DeviceKind::Home);
@@ -5273,7 +5273,7 @@ mod tests {
             lambda: 400.0,
             frame_bytes: 1400,
             rho: 1.0,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         for coalesce in [false, true] {
             let s = LinkShaper::new([8u8; 16], agreement, 4096 * 1400);
@@ -5570,7 +5570,7 @@ mod tests {
             lambda: 0.1,
             frame_bytes: 1400,
             rho: 0.5,
-            window: Duration::from_secs(600),
+            window: Duration::from_mins(10),
         };
         LinkShaper::new([9u8; 16], a, 16 * 1400)
     }

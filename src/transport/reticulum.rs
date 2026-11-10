@@ -312,12 +312,12 @@ fn effective_control_channel_capacity(
 
 /// How long [`Transport::send`] waits for a resource transfer to
 /// complete after the link is up.
-const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// CC 5.4.3 rc16 two planes — how long a failed bulk dial stands for its peer
 /// while the peer holds a shaped link: a NAT'd phone does not pay a dial
 /// before each fallback, and a peer that becomes dialable is tried again soon.
-const BULK_DIAL_NEGATIVE_TTL: Duration = Duration::from_secs(120);
+const BULK_DIAL_NEGATIVE_TTL: Duration = Duration::from_mins(2);
 
 /// leviculum#52 — the dwell an operator should leave between
 /// `ifac_activate_next` and `ifac_seal_rotation` when they have no better
@@ -1159,7 +1159,7 @@ static ANNOUNCE_INTAKE_EVICT_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
 /// exact count lives on the metrics counter, which is never throttled.
 fn announce_intake_evict_log() -> &'static crate::log_throttle::LogThrottle {
     ANNOUNCE_INTAKE_EVICT_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 1))
 }
 
 /// Point 1 — peer-admitted (INFO). Keyed on `provenance` (2 values), so the
@@ -1167,14 +1167,14 @@ fn announce_intake_evict_log() -> &'static crate::log_throttle::LogThrottle {
 /// capped. A tiny key map suffices.
 fn peer_admitted_log() -> &'static crate::log_throttle::LogThrottle {
     PEER_ADMITTED_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_secs(60), 8))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_mins(1), 8))
 }
 
 /// Point 2 — link-attribution miss (WARN). Keyed on the link-proven identity
 /// hash (attacker-chosen), so the key map is capped as the DoS backstop.
 fn link_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
     LINK_ATTRIBUTION_MISS_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1024))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 1024))
 }
 
 static CONTROL_PLANE_OVERFLOW_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1191,7 +1191,7 @@ static CONTROL_PLANE_OVERFLOW_LOG: std::sync::OnceLock<crate::log_throttle::LogT
 /// first 6 per minute log loudly, the rest collapse to a suppressed count.
 fn control_plane_overflow_log() -> &'static crate::log_throttle::LogThrottle {
     CONTROL_PLANE_OVERFLOW_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(6, Duration::from_secs(60), 1))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(6, Duration::from_mins(1), 1))
 }
 
 static INITIATOR_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1205,7 +1205,7 @@ static INITIATOR_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::
 /// of work — the #414/#416/#932/#423/#424 silent-refusal class.
 fn initiator_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
     INITIATOR_ATTRIBUTION_MISS_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 256))
 }
 
 /// CIRISEdge#337 — route supersession decisions (verified-only refusal + belt
@@ -1216,7 +1216,7 @@ fn initiator_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle
 /// first few per window loudly then summarizes.
 fn route_supersession_log() -> &'static crate::log_throttle::LogThrottle {
     ROUTE_SUPERSESSION_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_secs(60), 4))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_mins(1), 4))
 }
 
 static REVERSE_PATH_FALLBACK_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1229,7 +1229,7 @@ static NAT_TOPOLOGY_DIAGNOSIS_LOG: std::sync::OnceLock<crate::log_throttle::LogT
 /// bounded by the admit gate, capped map as backstop).
 fn reverse_path_fallback_log() -> &'static crate::log_throttle::LogThrottle {
     REVERSE_PATH_FALLBACK_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 256))
 }
 
 static UPGRADE_GUARD_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1247,7 +1247,7 @@ fn note_upgrade_guarded(
         m.inc_direct_link_upgrade_guarded(label);
     }
     let throttle = UPGRADE_GUARD_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 16));
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 16));
     if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } = throttle.check(label) {
         tracing::info!(
             guarded = label,
@@ -1272,12 +1272,12 @@ static NO_ROUTE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 
 fn no_route_log() -> &'static crate::log_throttle::LogThrottle {
     NO_ROUTE_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_secs(600), 1024))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_mins(10), 1024))
 }
 
 fn inbound_drop_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_DROP_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 64))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_mins(1), 64))
 }
 
 /// CIRISEdge#425 structural-2 — the ONE blessed way for the listen loop to NOT
@@ -1314,7 +1314,7 @@ static OVERSIZED_FRAME_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThr
 /// line, never an interrogation. Bounded like the reverse-path fallback log.
 fn oversized_frame_drop_log() -> &'static crate::log_throttle::LogThrottle {
     OVERSIZED_FRAME_DROP_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 256))
 }
 
 static OWN_BUNDLE_PUSH_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1327,7 +1327,7 @@ static OWN_BUNDLE_PUSH_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle
 /// contact, which would otherwise read as an unexplained Advisory plateau.
 fn own_bundle_push_log() -> &'static crate::log_throttle::LogThrottle {
     OWN_BUNDLE_PUSH_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 8))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_mins(1), 8))
 }
 
 static PEER_BUNDLE_ARRIVAL_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1339,7 +1339,7 @@ static PEER_BUNDLE_ARRIVAL_LOG: std::sync::OnceLock<crate::log_throttle::LogThro
 /// stored/verified one (the #423 apply-loud discipline).
 fn peer_bundle_arrival_log() -> &'static crate::log_throttle::LogThrottle {
     PEER_BUNDLE_ARRIVAL_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 32))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_mins(1), 32))
 }
 
 static NON_CIRIS_ANNOUNCE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1353,7 +1353,7 @@ static NON_CIRIS_ANNOUNCE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrot
 /// fixed discriminant (this is not a per-peer condition — it's "not us").
 fn non_ciris_announce_log() -> &'static crate::log_throttle::LogThrottle {
     NON_CIRIS_ANNOUNCE_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(60), 4))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_mins(1), 4))
 }
 
 /// CIRISEdge#353 ask 2 — the NAT'd/initiator-only topology diagnosis. Before
@@ -1362,7 +1362,7 @@ fn non_ciris_announce_log() -> &'static crate::log_throttle::LogThrottle {
 /// One diagnosis per peer per window, then a suppressed-count.
 fn nat_topology_diagnosis_log() -> &'static crate::log_throttle::LogThrottle {
     NAT_TOPOLOGY_DIAGNOSIS_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(300), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_mins(5), 256))
 }
 
 /// CIRISEdge#353 ask 2 — emit the topology diagnosis (throttled). Fired when a
@@ -2171,7 +2171,7 @@ impl ReticulumTransportConfig {
             federation_visible: true,
             bootstrap_peers: Vec::new(),
             identity_path,
-            announce_interval: Duration::from_secs(300),
+            announce_interval: Duration::from_mins(5),
             local_key_id: local_key_id.into(),
             transport_identity_storage_key: None,
             local_epoch: 0,
@@ -6854,7 +6854,7 @@ impl ReticulumTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .by_link
             .get(&link)
-            .map_or(true, |d| *d == LinkDirection::Outbound);
+            .is_none_or(|d| *d == LinkDirection::Outbound);
         let since = self.direct_paths.yield_since(destination_key_id);
         match crate::transport::direct_path::glare_verdict(initiator, since, now) {
             crate::transport::direct_path::GlareVerdict::Yield => {
@@ -11676,7 +11676,7 @@ impl ReticulumTransport {
                     if link_just_established
                         && !unannounced()
                         && last_event_announce
-                            .map_or(true, |t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
+                            .is_none_or(|t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
                     {
                         last_event_announce = Some(std::time::Instant::now());
                         let began = std::time::Instant::now();
@@ -12338,7 +12338,7 @@ fn note_starved_pool_close(reason: leviculum_core::link::LinkCloseReason, link_i
         _ => return,
     };
     if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } = STARVED_POOL_CLOSE_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 8))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 8))
         .check(tag)
     {
         tracing::warn!(
@@ -15780,7 +15780,7 @@ static AV_SINK_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 /// (CIRISEdge#460). The exact count is the `av_plane` counter, never throttled.
 fn av_sink_drop_log() -> &'static crate::log_throttle::LogThrottle {
     AV_SINK_DROP_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 256))
 }
 
 /// CIRISEdge#805 item 4 — **one inbound frame on an A/V link.**
@@ -16126,7 +16126,7 @@ static LINK_ATTRIBUTION_SHARED_LOG: std::sync::OnceLock<crate::log_throttle::Log
     std::sync::OnceLock::new();
 fn link_attribution_shared_log() -> &'static crate::log_throttle::LogThrottle {
     LINK_ATTRIBUTION_SHARED_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_secs(600), 1024))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_mins(10), 1024))
 }
 
 /// CIRISEdge#888 — the rule among [`identified_candidates`], pure so it is a
@@ -24995,7 +24995,7 @@ mod tests {
         #[test]
         fn above_ceiling_clamps_down_to_max() {
             assert_eq!(
-                effective_link_keepalive_secs(Some(Duration::from_secs(86_400))),
+                effective_link_keepalive_secs(Some(Duration::from_hours(24))),
                 Some(LINK_KEEPALIVE_MAX_SECS),
             );
         }
@@ -25845,7 +25845,7 @@ mod tests {
             "default must be None so keystore lookups keep using local_key_id"
         );
         assert!(cfg.bootstrap_peers.is_empty());
-        assert_eq!(cfg.announce_interval, Duration::from_secs(300));
+        assert_eq!(cfg.announce_interval, Duration::from_mins(5));
     }
 
     // CIRISEdge#168 (v5.0) — Transport-node mode (§24 NAT-traversal).
@@ -25966,14 +25966,8 @@ mod scope_native_addressing_tests {
             (link819(5), ago(30)),
         ]);
         let busy = |id: &LinkId| *id == link819(1);
-        let victims = select_pool_victims(
-            &pool,
-            busy,
-            &mut used,
-            now,
-            Some(Duration::from_secs(120)),
-            2,
-        );
+        let victims =
+            select_pool_victims(&pool, busy, &mut used, now, Some(Duration::from_mins(2)), 2);
         let why = |n: u8| {
             victims
                 .iter()
@@ -26009,7 +26003,7 @@ mod scope_native_addressing_tests {
         let last_used = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let lane = link819(9);
         let handed_out = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(300))
+            .checked_sub(Duration::from_mins(5))
             .expect("monotonic clock");
         last_used.lock().unwrap().insert(lane, handed_out);
         let lease = ScopedLinkLease::claim(lane, &leased).stamping(&last_used);
@@ -26097,7 +26091,7 @@ mod scope_native_addressing_tests {
     /// second, so the reap is never early.
     #[test]
     fn inbound_idle_clock_starts_at_establishment_and_restarts_on_a_frame_853() {
-        let bound = Duration::from_secs(120);
+        let bound = Duration::from_mins(2);
         let est = 1_000;
         // No frame: 120 s after the end of the establishing second.
         assert!(!inbound_link_idle_expired(
@@ -27024,7 +27018,7 @@ impl crate::scope_lifecycle::ScopedDestinationSink for ReticulumTransport {
 /// Well over a replication round and its cadence's jitter, so a lane a peer's
 /// next round will want is still there; far under leviculum's ~13 min stale
 /// reap, which an initiator's own keepalives never let fire.
-pub const DEFAULT_LINK_POOL_IDLE_BOUND: Duration = Duration::from_secs(120);
+pub const DEFAULT_LINK_POOL_IDLE_BOUND: Duration = Duration::from_mins(2);
 
 /// CIRISEdge#819 — the most IDLE lanes a pool keeps per destination. Busy
 /// lanes are not counted and never closed, so a burst still dials as many

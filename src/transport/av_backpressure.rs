@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 
 /// Backoff ceiling, matching leviculum's circuit-breaker cooldown ceiling
 /// so producer trickle and acceptor probe land at the same cadence.
-pub const TRICKLE_INTERVAL: Duration = Duration::from_secs(300);
+pub const TRICKLE_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Reticulum's `max(rtt*2.5, 0.025)` floor — the smallest unit of backoff
 /// regardless of how fast the link looks.

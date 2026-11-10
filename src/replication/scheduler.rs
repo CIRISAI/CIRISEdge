@@ -272,7 +272,7 @@ impl RoundGate {
 /// The outer bound on one send of a round. A cold dial is at most 30 s and a
 /// live transfer at most 120 s on the dial path, so this only ends a send the
 /// transport itself never would: a live, progressing transfer is not severed.
-pub const ROUND_SEND_TIMEOUT: Duration = Duration::from_secs(180);
+pub const ROUND_SEND_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// The bound on one send on a link whose sender lets a row wait up to
 /// `row_bound` to leave ([`crate::transport::Transport::pacing_row_bound`],
@@ -1696,7 +1696,7 @@ impl RoundEnded {
 }
 
 /// How often one `(peer, kind)` may say why its rounds fail.
-const ROUND_ERROR_LOG_WINDOW: Duration = Duration::from_secs(300);
+const ROUND_ERROR_LOG_WINDOW: Duration = Duration::from_mins(5);
 
 fn round_error_log() -> &'static crate::log_throttle::LogThrottle {
     static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
@@ -1906,7 +1906,7 @@ fn round_now_kick(
 ) {
     let mut kicked = 0usize;
     for ((peer, _kind), c) in per_coord {
-        if peer_key_id.map_or(true, |p| p == peer) {
+        if peer_key_id.is_none_or(|p| p == peer) {
             c.kick.notify_one();
             kicked += 1;
         }
@@ -2558,7 +2558,7 @@ mod tests {
     #[tokio::test]
     async fn propagate_kicks_every_other_peer_on_the_plane_and_nobody_else() {
         let mut sched = ReplicationScheduler::new(SchedulerConfig {
-            cadence: Duration::from_secs(3600),
+            cadence: Duration::from_hours(1),
             round_timeout: Duration::from_millis(80),
             ..SchedulerConfig::default()
         });
@@ -2847,7 +2847,7 @@ mod tests {
         }
 
         let mut sched = ReplicationScheduler::new(SchedulerConfig {
-            cadence: Duration::from_secs(3600),
+            cadence: Duration::from_hours(1),
             round_timeout: Duration::from_millis(200),
             max_concurrent_rounds: N,
         });
@@ -3170,7 +3170,7 @@ mod tests {
         let relieved_reader = Arc::new(MeshConfigReader::fixed_for_test(
             Arc::clone(&dir),
             MeshConfigRelief {
-                round_cadence: Some(Duration::from_secs(3600)),
+                round_cadence: Some(Duration::from_hours(1)),
                 ..MeshConfigRelief::NONE
             },
         ));
@@ -3468,7 +3468,7 @@ mod tests {
     fn a_send_on_a_shaped_link_is_bounded_by_its_row_bound() {
         assert_eq!(pacing_send_timeout(None), ROUND_SEND_TIMEOUT);
         assert_eq!(
-            pacing_send_timeout(Some(Duration::from_secs(60))),
+            pacing_send_timeout(Some(Duration::from_mins(1))),
             ROUND_SEND_TIMEOUT
         );
         let cellular_row = Duration::from_secs(328);

@@ -333,7 +333,7 @@ async fn node_on(
         Arc::clone(&table),
         Arc::clone(&transport) as Arc<dyn ScopedDestinationSink>,
         key.key_id.clone(),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
     ));
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(256);
     let listener = Arc::clone(&transport);
@@ -841,7 +841,7 @@ async fn three_member_call(tag: &str) -> bool {
             .any(|p| p.stream == stream && p.standby.as_deref() == Some(c.key.key_id.as_str()))
     };
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             standby_on_c(&call_b, call_a.stream()) && standby_on_c(&call_a, call_b.stream())
         })
         .await,
@@ -1154,7 +1154,7 @@ async fn a_member_cannot_forge_another_members_stream_through_a_relay() {
     }
     // ALM stage 2: C relays A's stream to B once B took it as standby (C3).
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             call_b.alm_parents().iter().any(|p| {
                 p.stream == call_a.stream() && p.standby.as_deref() == Some(c.key.key_id.as_str())
             })

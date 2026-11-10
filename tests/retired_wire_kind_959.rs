@@ -298,7 +298,7 @@ async fn a_received_fountain_holding_claim_is_dropped_by_name_959() {
     // A short warm-up so an armed, empty view answers `Converged` (zero)
     // rather than `Warming` within the test.
     edge.converged_claim_view()
-        .align_to_converger(Duration::from_secs(600), Duration::from_millis(5));
+        .align_to_converger(Duration::from_mins(10), Duration::from_millis(5));
 
     let claim = the_claim(&peer_key_id);
     let envelope_bytes = signed_envelope_bytes(&peer_signer, edge.signer_key_id(), &claim).await;

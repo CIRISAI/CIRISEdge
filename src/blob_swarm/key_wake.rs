@@ -210,7 +210,7 @@ impl KeyWaits {
         let mut woke = 0;
         for p in inner.parked.values_mut() {
             if let Awaiting::Epoch(e) = p.awaiting {
-                if e.map_or(true, |e| e == epoch) {
+                if e.is_none_or(|e| e == epoch) {
                     p.woken = true;
                     woke += 1;
                 }

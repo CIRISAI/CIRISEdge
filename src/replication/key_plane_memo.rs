@@ -58,7 +58,7 @@ use super::protocol::{EnvelopeKind, EnvelopeRef};
 
 /// Every memoized answer is re-read at least this often, whatever the
 /// cursor says (see the module docs for what the cursor cannot see).
-pub(crate) const MEMO_TTL: Duration = Duration::from_secs(600);
+pub(crate) const MEMO_TTL: Duration = Duration::from_mins(10);
 
 /// How far before "now" a rebuilt memo's cursor starts. The rebuild drains
 /// the cursor to the end of the log before it reads any subject, so the lag
@@ -67,7 +67,7 @@ pub(crate) const MEMO_TTL: Duration = Duration::from_secs(600);
 /// write allocates its position and commits under the one connection, so a
 /// row committed after the drain is always past the cursor; a postgres tie
 /// between concurrent writers is the [`MEMO_TTL`] residual.
-pub(crate) const CURSOR_LAG: Duration = Duration::from_secs(60);
+pub(crate) const CURSOR_LAG: Duration = Duration::from_mins(1);
 
 /// The change probe's page: rows of the delta read per statement.
 pub(crate) const PROBE_PAGE: u32 = 500;
@@ -251,9 +251,8 @@ pub(crate) struct PlaneMemo {
 impl PlaneMemo {
     /// Is the memo due a rebuild (never built, or past [`MEMO_TTL`])?
     pub(crate) fn needs_rebuild(&self, now: Instant) -> bool {
-        self.built_at.map_or(true, |built| {
-            now.saturating_duration_since(built) >= MEMO_TTL
-        })
+        self.built_at
+            .is_none_or(|built| now.saturating_duration_since(built) >= MEMO_TTL)
     }
 
     /// Drop every answer and restart the cursor [`CURSOR_LAG`] before `wall`.

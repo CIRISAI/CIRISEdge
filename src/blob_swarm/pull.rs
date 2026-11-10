@@ -314,7 +314,7 @@ pub(crate) fn hold_back(
 /// [`PullConfig::durability_interval`]): well inside the 24 h re-file horizon
 /// ([`CUSTODY_REFRESH`](super::durability::CUSTODY_REFRESH)), and often
 /// enough that a device that lost a copy is repaired within the hour.
-pub const DEFAULT_DURABILITY_INTERVAL: Duration = Duration::from_secs(15 * 60);
+pub const DEFAULT_DURABILITY_INTERVAL: Duration = Duration::from_mins(15);
 
 /// CIRISEdge#739 — the default `K` (see [`PullConfig::dag_chunks_in_flight`]).
 pub const DEFAULT_DAG_CHUNKS_IN_FLIGHT: usize = 8;
@@ -1646,7 +1646,7 @@ where
                 } => {
                     durability_ticks += 1;
                     let every = self.edge.metrics().telemetry.levers.durability_every();
-                    if sweep_task.is_none() && durability_ticks % every == 0 {
+                    if sweep_task.is_none() && durability_ticks.is_multiple_of(every) {
                         let me = Arc::clone(&self);
                         sweep_task = Some(tokio::spawn(async move { me.durability_sweep().await }));
                     }

@@ -493,7 +493,7 @@ fn spawn_scheduler_task(
                 if report.admitted > 0 {
                     let due = last_propagate
                         .get(&report.kind)
-                        .map_or(true, |at| at.elapsed() >= PROPAGATE_DEBOUNCE);
+                        .is_none_or(|at| at.elapsed() >= PROPAGATE_DEBOUNCE);
                     if due {
                         last_propagate.insert(report.kind, std::time::Instant::now());
                         if handle.propagate(&peer, report.kind).await.is_err() {
@@ -2453,7 +2453,7 @@ mod tests {
             let config = ReplicationRuntimeConfig {
                 enable_bundle_bootstrap_peers: false,
                 scheduler: SchedulerConfig {
-                    cadence: std::time::Duration::from_secs(3600),
+                    cadence: std::time::Duration::from_hours(1),
                     round_timeout: std::time::Duration::from_secs(5),
                     ..SchedulerConfig::default()
                 },

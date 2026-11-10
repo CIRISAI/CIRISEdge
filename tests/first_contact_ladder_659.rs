@@ -701,7 +701,7 @@ async fn a_self_signed_owned_peer_under_a_shared_root_is_attributed_and_served()
 
     // DELIVERY (Attributed): B's allegiance rows land on A — the frames the old
     // gate dropped for five days.
-    let delivered = drive_until(&[&rt_b, &rt_a], Duration::from_secs(180), || async {
+    let delivered = drive_until(&[&rt_b, &rt_a], Duration::from_mins(3), || async {
         a.holds(&b_accepts).await && a.holds(&format!("owner-binding-{}", b.key.key_id)).await
     })
     .await;
@@ -719,7 +719,7 @@ async fn a_self_signed_owned_peer_under_a_shared_root_is_attributed_and_served()
     // FIRST CONTACT (rung R2): A's allegiance facts land on B although A never
     // consented to B — before CIRISEdge#671 the send-set gate withheld A's whole
     // plane here and B could never read A as Rooted (CIRISServer#632).
-    let served = drive_until(&[&rt_b, &rt_a], Duration::from_secs(180), || async {
+    let served = drive_until(&[&rt_b, &rt_a], Duration::from_mins(3), || async {
         b.holds(&a_accepts).await && b.holds(&format!("owner-binding-{}", a.key.key_id)).await
     })
     .await;
@@ -731,7 +731,7 @@ async fn a_self_signed_owned_peer_under_a_shared_root_is_attributed_and_served()
 
     // RUNG R4, B → A: B consented to A and now reads A as Rooted, so what B holds
     // about ANOTHER (Q's charter) is served to A.
-    let b_serves = drive_until(&[&rt_b, &rt_a], Duration::from_secs(180), || async {
+    let b_serves = drive_until(&[&rt_b, &rt_a], Duration::from_mins(3), || async {
         a.holds(&charter_q).await
     })
     .await;
@@ -805,7 +805,7 @@ async fn under_different_roots_a_peer_delivers_but_is_served_nothing_until_the_r
     exchange_routes(&a, &b).await;
 
     // Attributed: B's rows land on A regardless of roots.
-    let delivered = drive_until(&[&rt_b, &rt_a], Duration::from_secs(180), || async {
+    let delivered = drive_until(&[&rt_b, &rt_a], Duration::from_mins(3), || async {
         a.holds(&b_accepts_q).await
     })
     .await;
@@ -817,7 +817,7 @@ async fn under_different_roots_a_peer_delivers_but_is_served_nothing_until_the_r
     // Attributed also means A's OWN allegiance facts cross to B (B needs them to
     // judge A) — the self-authored exemption — while a row A holds ABOUT ANOTHER
     // (R's charter) does not: across a bounded window of rounds it never lands.
-    let self_facts = drive_until(&[&rt_b, &rt_a], Duration::from_secs(120), || async {
+    let self_facts = drive_until(&[&rt_b, &rt_a], Duration::from_mins(2), || async {
         b.holds(&a_accepts_r).await
     })
     .await;
@@ -842,7 +842,7 @@ async fn under_different_roots_a_peer_delivers_but_is_served_nothing_until_the_r
 
     // The roots meet: B's owner also accepts R. Same rows, same peer — now served.
     let b_accepts_r = b.accept(&root_r).await;
-    let arrived = drive_until(&[&rt_b, &rt_a], Duration::from_secs(180), || async {
+    let arrived = drive_until(&[&rt_b, &rt_a], Duration::from_mins(3), || async {
         a.holds(&b_accepts_r).await && b.holds(&charter_r).await
     })
     .await;

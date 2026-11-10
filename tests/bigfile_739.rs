@@ -697,7 +697,7 @@ async fn member(
             inner: ciris_edge::blob_swarm::PersistBlobChunkSource::new(node.store.engine().clone()),
             scope: self_scope(&owner),
         }))
-        .scope_native_addressing(Duration::from_secs(300))
+        .scope_native_addressing(Duration::from_mins(5))
         .config(EdgeConfig {
             hybrid_policy: HybridPolicy::Strict,
             ..EdgeConfig::default()
@@ -808,7 +808,7 @@ async fn ceiling(total: u64, lanes: usize, tmp: &Path, tag: &str) -> f64 {
         let _ = la.listen(tx_a).await;
     });
     let drain_a = tokio::spawn(async move { while rx_a.recv().await.is_some() {} });
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while !(rt_a.knows_peer(&b.me).await && rt_b.knows_peer(&a.me).await) {
         assert!(
             Instant::now() < deadline,
@@ -835,7 +835,7 @@ async fn ceiling(total: u64, lanes: usize, tmp: &Path, tag: &str) -> f64 {
         s.await.expect("sender");
     }
     let want = frames as u64 * CEILING_FRAME as u64;
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_mins(2);
     while received.load(Ordering::Relaxed) < want {
         assert!(
             Instant::now() < deadline,
@@ -1193,8 +1193,8 @@ async fn pull_once(
     .await;
     carry_route(&a.node, &b.node).await;
     carry_route(&b.node, &a.node).await;
-    wait_direct(&b, a, Duration::from_secs(60)).await;
-    wait_direct(a, &b, Duration::from_secs(60)).await;
+    wait_direct(&b, a, Duration::from_mins(1)).await;
+    wait_direct(a, &b, Duration::from_mins(1)).await;
     let key_plane = cross_to(&b.node, p).await;
     eprintln!(
         "[{tag}] key plane crossed in {:.2}s ({} sets)",
@@ -1325,7 +1325,7 @@ const STALL: Duration = Duration::from_secs(5 + 30 + 30 + 30);
 /// its resume): only a pull that crawls without ever pausing for `STALL`
 /// reaches it. It is not the witness's clock; the step's own timeout is
 /// sized above two of these (`.github/workflows/ci.yml`).
-const BACKSTOP: Duration = Duration::from_secs(20 * 60);
+const BACKSTOP: Duration = Duration::from_mins(20);
 
 /// How a watched stretch of a pull ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -1577,8 +1577,8 @@ async fn resume_once(
     let b = member(node_b, tmp.join("b-resume.id"), Some(a.port), members).await;
     carry_route(&a.node, &b.node).await;
     carry_route(&b.node, &a.node).await;
-    wait_direct(&b, a, Duration::from_secs(60)).await;
-    wait_direct(a, &b, Duration::from_secs(60)).await;
+    wait_direct(&b, a, Duration::from_mins(1)).await;
+    wait_direct(a, &b, Duration::from_mins(1)).await;
     cross_to(&b.node, p).await;
 
     let puller = puller_for(&b, k, DEFAULT_BATCH);
@@ -1638,8 +1638,8 @@ async fn resume_once(
     let b = member(node_b, tmp.join("b-resume.id"), Some(a.port), members).await;
     carry_route(&a.node, &b.node).await;
     carry_route(&b.node, &a.node).await;
-    wait_direct(&b, a, Duration::from_secs(60)).await;
-    wait_direct(a, &b, Duration::from_secs(60)).await;
+    wait_direct(&b, a, Duration::from_mins(1)).await;
+    wait_direct(a, &b, Duration::from_mins(1)).await;
     cross_to(&b.node, p).await;
     let puller = puller_for(&b, k, DEFAULT_BATCH);
     // THE FALLBACK WITNESS: A tears down the arrival link of the resumed
@@ -2066,7 +2066,7 @@ async fn run(
         reports.push(r);
     }
     for r in &reports {
-        if best.map_or(true, |b| r.elapsed < b.elapsed) {
+        if best.is_none_or(|b| r.elapsed < b.elapsed) {
             best = Some(r);
         }
     }

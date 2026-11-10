@@ -94,7 +94,7 @@ fn disposition(outcome: &ApplyOutcome) -> RetryDisposition {
 /// A point past every transient window: a row still suppressed here is on
 /// the terminal schedule (a park or a terminal refusal), not the ladder.
 fn past_transient_ladder() -> Instant {
-    Instant::now() + TRANSIENT_CAP + Duration::from_secs(60)
+    Instant::now() + TRANSIENT_CAP + Duration::from_mins(1)
 }
 
 /// (1) A co-signer this node has not met. persist names it
@@ -534,13 +534,13 @@ async fn a_never_bound_signer_settles_on_the_terminal_schedule_after_two_offers(
         backoff.suppressed_at(
             TD,
             &h,
-            t2 + TERMINAL_BASE.saturating_sub(Duration::from_secs(60))
+            t2 + TERMINAL_BASE.saturating_sub(Duration::from_mins(1))
         ),
         "refusal 2: on the TERMINAL schedule — a never-bound signer is not re-asked on \
          the transient ladder (CIRISEdge#858)"
     );
     assert!(
-        !backoff.suppressed_at(TD, &h, t2 + TERMINAL_BASE + Duration::from_secs(60)),
+        !backoff.suppressed_at(TD, &h, t2 + TERMINAL_BASE + Duration::from_mins(1)),
         "refusal 2: the terminal window is bounded, never infinite"
     );
     assert_eq!(

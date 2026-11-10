@@ -48,7 +48,7 @@ fn one_scope(lambda: f64, scope_key: [u8; 32]) -> EmissionSchedulerConfig {
         ScopeConfig {
             lambda,
             target_real_per_window: 1000,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
             scope_key,
         },
     );

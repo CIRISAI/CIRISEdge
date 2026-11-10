@@ -274,7 +274,7 @@ impl KeyState {
         }
         let window = policy.quota_for(self.class).window_secs;
         let refilled = now.saturating_sub(self.last_spend_at) >= window;
-        let backoff_done = policy.backoff.map_or(true, |b| {
+        let backoff_done = policy.backoff.is_none_or(|b| {
             now.saturating_sub(self.last_denial_at) >= b.window_secs(self.consecutive_denials)
         });
         // Deliberately NOT gated on `suppressed`. An earlier version required

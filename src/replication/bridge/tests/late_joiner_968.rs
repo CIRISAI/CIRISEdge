@@ -29,7 +29,7 @@ fn bridge(dir: Arc<dyn FederationDirectory>) -> FederationDirectoryReplicationBr
         BridgeConfig {
             sweep_page_rows: PAGE,
             tip_margin: Duration::ZERO,
-            history_page_every: Duration::from_secs(3_600),
+            history_page_every: Duration::from_hours(1),
             ..BridgeConfig::default()
         },
     )

@@ -597,7 +597,7 @@ impl Sim {
 
     /// Whether `seq` is base-or-audio.
     fn essential(&self, seq: u64) -> bool {
-        seq % self.layer_period.max(1) == 0
+        seq.is_multiple_of(self.layer_period.max(1))
     }
 
     fn chunk_bytes(&self, seq: u64, full: bool) -> u64 {
@@ -651,7 +651,7 @@ impl Sim {
             if let Some((f, t, n)) = self.withhold_base.filter(|w| (w.0, w.1) == (from, to)) {
                 let sent = self.base_sent.entry((f, t)).or_insert(0);
                 *sent += 1;
-                if *sent % n == 0 {
+                if (*sent).is_multiple_of(n) {
                     return;
                 }
             }
@@ -1070,13 +1070,13 @@ impl Sim {
                 }
             }
         }
-        if t % OFFER_MS == 0 {
+        if t.is_multiple_of(OFFER_MS) {
             self.offers(t);
         }
-        if t % CONTROL_MS == 0 {
+        if t.is_multiple_of(CONTROL_MS) {
             self.control(t);
         }
-        if t % SAMPLE_MS == 0 {
+        if t.is_multiple_of(SAMPLE_MS) {
             self.sample(t);
         }
         self.now += CHUNK_MS;
@@ -1349,7 +1349,7 @@ mod scenarios {
     /// room still fits after its biggest relay dies); 20 is not.
     fn t1_world_n(seed: u64, cfg: ControllerConfig, leaves: usize) -> Sim {
         let mut others: Vec<NodeSpec> = T1_RELAYS.iter().map(|&s| NodeSpec::relay(s)).collect();
-        others.extend(std::iter::repeat(NodeSpec::leaf()).take(leaves));
+        others.extend(std::iter::repeat_n(NodeSpec::leaf(), leaves));
         Sim::new(
             seed,
             cfg,
@@ -1461,7 +1461,7 @@ mod scenarios {
     /// standby)`, for the first leaf that holds both.
     fn layered_world(seed: u64) -> (Sim, u32, u32, u32) {
         let mut others = vec![NodeSpec::relay(4.0), NodeSpec::relay(4.0)];
-        others.extend(std::iter::repeat(NodeSpec::leaf()).take(3));
+        others.extend(std::iter::repeat_n(NodeSpec::leaf(), 3));
         let mut sim = Sim::new(
             seed,
             ControllerConfig::interactive(),
@@ -1646,7 +1646,7 @@ mod scenarios {
                 NodeSpec::relay(8.0),
                 NodeSpec::relay(8.0),
             ];
-            others.extend(std::iter::repeat(NodeSpec::leaf()).take(T1_LEAVES));
+            others.extend(std::iter::repeat_n(NodeSpec::leaf(), T1_LEAVES));
             let mut sim = Sim::new(
                 seed,
                 ControllerConfig::interactive(),
@@ -1835,7 +1835,7 @@ mod scenarios {
                 forwarder: true,
                 member: false,
             });
-            others.extend(std::iter::repeat(NodeSpec::leaf()).take(T1_LEAVES));
+            others.extend(std::iter::repeat_n(NodeSpec::leaf(), T1_LEAVES));
             let cfg = if mutant {
                 ControllerConfig::interactive().herding_mutant()
             } else {
@@ -1891,7 +1891,7 @@ mod scenarios {
                 NodeSpec::relay(8.0),
                 NodeSpec::relay(8.0),
             ];
-            others.extend(std::iter::repeat(NodeSpec::leaf()).take(T1_LEAVES));
+            others.extend(std::iter::repeat_n(NodeSpec::leaf(), T1_LEAVES));
             let mut sim = Sim::new(
                 seed,
                 ControllerConfig::interactive(),
@@ -2151,7 +2151,7 @@ mod scenarios {
     fn t5_burst_loss_tree_holds() {
         for (seed, loss) in [(1u64, 0.05), (2, 0.10), (3, 0.20)] {
             let mut others: Vec<NodeSpec> = T1_RELAYS.iter().map(|&s| NodeSpec::relay(s)).collect();
-            others.extend(std::iter::repeat(NodeSpec::leaf()).take(T1_LEAVES));
+            others.extend(std::iter::repeat_n(NodeSpec::leaf(), T1_LEAVES));
             let ge = GeSpec {
                 avg_loss: loss,
                 mean_burst: 5.0,
@@ -2311,7 +2311,7 @@ mod scenarios {
                 let settled = sim.alive(id)
                     && up_since
                         .get(&id)
-                        .map_or(true, |&t| sim.now - t >= 30 * SECOND);
+                        .is_none_or(|&t| sim.now - t >= 30 * SECOND);
                 if settled {
                     let fresh = (sim.now / CHUNK_MS).saturating_sub(30);
                     let ok = sim.primary_of(id).is_some()
@@ -2382,7 +2382,7 @@ mod scenarios {
     fn multihop(seed: u64, leaves: usize, end: u64) -> (Sim, Metrics) {
         let relays = (leaves / 16).max(4);
         let mut others: Vec<NodeSpec> = (0..relays).map(|_| NodeSpec::relay(60.0)).collect();
-        others.extend(std::iter::repeat(NodeSpec::leaf()).take(leaves));
+        others.extend(std::iter::repeat_n(NodeSpec::leaf(), leaves));
         let mut sim = Sim::new(
             seed,
             ControllerConfig::interactive(),
@@ -2476,7 +2476,7 @@ mod scenarios {
         let mut others: Vec<NodeSpec> = (0..relays)
             .map(|_| NodeSpec::relay(relay_streams))
             .collect();
-        others.extend(std::iter::repeat(NodeSpec::leaf()).take(leaves));
+        others.extend(std::iter::repeat_n(NodeSpec::leaf(), leaves));
         let mut sim = Sim::new(
             seed,
             ControllerConfig::interactive(),
@@ -2544,7 +2544,7 @@ mod scenarios {
         let mut others: Vec<NodeSpec> = (0..32)
             .map(|i| NodeSpec::relay(20.0 + f64::from(i % 4) * 10.0))
             .collect();
-        others.extend(std::iter::repeat(NodeSpec::leaf()).take(500));
+        others.extend(std::iter::repeat_n(NodeSpec::leaf(), 500));
         let mut sim = Sim::new(
             9,
             ControllerConfig::interactive(),
@@ -2615,7 +2615,7 @@ mod mesh_scenarios {
         canon_streams: f64,
     ) -> World {
         let mut others: Vec<NodeSpec> = relay_caps.iter().map(|&c| NodeSpec::relay(c)).collect();
-        others.extend(std::iter::repeat(NodeSpec::leaf()).take(leaves));
+        others.extend(std::iter::repeat_n(NodeSpec::leaf(), leaves));
         others.push(NodeSpec::leaf());
         let far_end = (relay_caps.len() as f64 * 1.7).max(4.0);
         let mut sim = Sim::new(

@@ -1034,7 +1034,7 @@ fn compute_core(
                 // this child wasn't already a child of this parent.
                 let is_new_subscriber = child_of
                     .get(&parent)
-                    .map_or(true, |c| !c.contains(child_peer_id));
+                    .is_none_or(|c| !c.contains(child_peer_id));
                 if is_new_subscriber {
                     *parent_total_occupancy.entry(parent.clone()).or_insert(0) += 1;
                 }

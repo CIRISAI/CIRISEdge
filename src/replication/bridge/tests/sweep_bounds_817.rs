@@ -194,7 +194,7 @@ async fn send_set_reads_are_bounded_by_the_sweep_permits_817() {
         let bridge = &bridge;
         async move { bridge.resolve_attestation_recipient(p.as_str()).await }
     });
-    tokio::time::timeout(StdDuration::from_secs(60), futures::future::join_all(work))
+    tokio::time::timeout(StdDuration::from_mins(1), futures::future::join_all(work))
         .await
         .expect("no sweep deadlocks on the permit");
     assert_eq!(

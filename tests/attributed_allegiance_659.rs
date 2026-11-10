@@ -894,7 +894,7 @@ async fn two_attributed_people_root_each_other_through_their_own_allegiance_fact
 
     // THE ALLEGIANCE FACTS CROSS BOTH WAYS to a peer that is Attributed and not
     // yet Rooted: each pulls the other's owner-binding and acceptance.
-    let rooted_facts = drive_until(&[&rt_a, &rt_b], Duration::from_secs(240), || async {
+    let rooted_facts = drive_until(&[&rt_a, &rt_b], Duration::from_mins(4), || async {
         a.holds(&b_binding).await
             && a.holds(&b_accepts).await
             && b.holds(&a_binding).await
@@ -912,7 +912,7 @@ async fn two_attributed_people_root_each_other_through_their_own_allegiance_fact
 
     // ROOTED BOTH WAYS, measured by what Rooted unlocks: each side now serves
     // the other the row it holds ABOUT ANOTHER.
-    let served = drive_until(&[&rt_a, &rt_b], Duration::from_secs(180), || async {
+    let served = drive_until(&[&rt_a, &rt_b], Duration::from_mins(3), || async {
         a.holds(&charter_q).await && b.holds(&charter_s).await
     })
     .await;
@@ -994,7 +994,7 @@ async fn two_devices_of_one_owner_root_each_other_through_the_owners_acceptance_
 
     // Each device's owner-binding crosses to the other: with the owner's
     // acceptance already held locally, that is all Rooted needs.
-    let bound = drive_until(&[&rt_1, &rt_2], Duration::from_secs(240), || async {
+    let bound = drive_until(&[&rt_1, &rt_2], Duration::from_mins(4), || async {
         d1.holds(&d2_binding).await && d2.holds(&d1_binding).await
     })
     .await;
@@ -1008,7 +1008,7 @@ async fn two_devices_of_one_owner_root_each_other_through_the_owners_acceptance_
     );
 
     // Rooted both ways, measured by what it unlocks.
-    let served = drive_until(&[&rt_1, &rt_2], Duration::from_secs(180), || async {
+    let served = drive_until(&[&rt_1, &rt_2], Duration::from_mins(3), || async {
         d1.holds(&charter_q).await && d2.holds(&charter_s).await
     })
     .await;
@@ -1162,7 +1162,7 @@ async fn two_persons_nodes_root_through_a_mutual_peer_that_relays_their_signed_r
 
     // THE RELAY: K hands each the other's signed row, so each resolves the
     // other's transit pair from a source authenticated to it.
-    let relayed = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_secs(240), || async {
+    let relayed = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_mins(4), || async {
         holds_signed_route_of(&a, &b).await && holds_signed_route_of(&b, &a).await
     })
     .await;
@@ -1193,7 +1193,7 @@ async fn two_persons_nodes_root_through_a_mutual_peer_that_relays_their_signed_r
     }
 
     // Now the pair seals and the allegiance facts cross both ways.
-    let rooted_facts = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_secs(240), || async {
+    let rooted_facts = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_mins(4), || async {
         a.holds(&b_binding).await
             && a.holds(&b_accepts).await
             && b.holds(&a_binding).await
@@ -1209,7 +1209,7 @@ async fn two_persons_nodes_root_through_a_mutual_peer_that_relays_their_signed_r
     );
 
     // ROOTED BOTH WAYS: a row about another flows in each direction.
-    let served = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_secs(180), || async {
+    let served = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_mins(3), || async {
         a.holds(&charter_q).await && b.holds(&charter_s).await
     })
     .await;

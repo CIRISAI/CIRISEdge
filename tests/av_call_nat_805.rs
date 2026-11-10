@@ -326,7 +326,7 @@ async fn side_every(
         Arc::clone(&table),
         Arc::clone(&transport) as Arc<dyn ScopedDestinationSink>,
         key.key_id.clone(),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
     ));
     let events = transport.subscribe_direct_path_events();
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(256);
@@ -421,7 +421,7 @@ async fn pair(tag: &str, facilitated: bool) -> Pair {
     // a loaded box, and by then T's rate limit (grace 5, A announcing every
     // 5 s) has stopped relaying A for an hour. The node that joined late never
     // heard it. A path request is what T still answers.
-    let known = wait_until(Duration::from_secs(60), || async {
+    let known = wait_until(Duration::from_mins(1), || async {
         a.transport.seek_peer(&b.key.key_id).await && b.transport.seek_peer(&a.key.key_id).await
     })
     .await;
@@ -591,7 +591,7 @@ async fn a_room_call_behind_t_runs_over_a_punched_interface() {
     let mut b_frames = call_b.frames().expect("B's frames");
 
     // A's leg to B proposed on the identity link; both ends moved.
-    let a_up = tokio::time::timeout(Duration::from_secs(60), async {
+    let a_up = tokio::time::timeout(Duration::from_mins(1), async {
         loop {
             match p.a.events.recv().await {
                 Ok(e @ DirectPathEvent::Established { .. }) => return e,
@@ -632,7 +632,7 @@ async fn a_room_call_behind_t_runs_over_a_punched_interface() {
     // Every leg of the call comes up over it, both ways.
     for (call, who) in [(&call_a, "A"), (&call_b, "B")] {
         assert!(
-            wait_until(Duration::from_secs(60), || async { call.legs().len() == 1 }).await,
+            wait_until(Duration::from_mins(1), || async { call.legs().len() == 1 }).await,
             "{who}'s leg to the other member comes up"
         );
     }
@@ -724,7 +724,7 @@ async fn a_room_call_behind_t_runs_over_a_punched_interface() {
 async fn legs_settled(p: &Pair, call_a: &Call, call_b: &Call) {
     for (call, who) in [(call_a, "A"), (call_b, "B")] {
         assert!(
-            wait_until(Duration::from_secs(60), || async { call.legs().len() == 1 }).await,
+            wait_until(Duration::from_mins(1), || async { call.legs().len() == 1 }).await,
             "{who}'s leg to the other member comes up"
         );
     }

@@ -346,7 +346,7 @@ async fn duo(tag: &str, policy_a: ShapingPolicy, policy_b: ShapingPolicy) -> Duo
     let a = nodes.pop().expect("a");
     seed_route(&a, &b).await;
     seed_route(&b, &a).await;
-    let known = wait_until(Duration::from_secs(60), || async {
+    let known = wait_until(Duration::from_mins(1), || async {
         b.transport.knows_peer(&a.key.key_id).await && a.transport.knows_peer(&b.key.key_id).await
     })
     .await;
@@ -602,7 +602,7 @@ async fn rho_and_the_window_move_the_real_share_and_the_delay() {
                 .expect("queued on the shaped link");
             rows.push(row);
         }
-        let all = wait_until(Duration::from_secs(120), || async {
+        let all = wait_until(Duration::from_mins(2), || async {
             for r in &rows {
                 if !t.a.received(r).await {
                     return false;
@@ -736,7 +736,7 @@ async fn bulk_rides_an_unshaped_link_of_its_own_and_the_shaped_link_stays_consta
         .await
         .expect("a content body A -> B completes");
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             let mut all = t.a.received(&blob).await && t.b.received(&body).await;
             for c in &dag {
                 all = all && t.a.received(c).await;
@@ -841,7 +841,7 @@ async fn assert_shaped_stream_constant(n: &Node) -> ([u8; 16], Vec<([u8; 16], Ve
         .expect("B dialled")
         .0;
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             let w = n.transport.link_wire_tapped_for_test();
             trailing_run(&frames_on(&w, shaped)).1 >= 10
         })
@@ -944,7 +944,7 @@ async fn a_512_kib_deliver_takes_the_bulk_link_and_a_4_kib_deliver_stays_shaped(
         .await
         .expect("512 KiB");
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             t.a.received(&big).await
         })
         .await
@@ -987,7 +987,7 @@ async fn a_link_over_the_node_cap_is_shaped_at_its_share() {
         .await
         .expect("A -> B");
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             t.b.received(&row).await
         })
         .await
@@ -1079,7 +1079,7 @@ async fn at_the_bound_a_shaping_peers_row_link_is_refused_and_its_bulk_still_cro
         .await
         .expect("bulk rides an unshaped link of its own");
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             t.a.received(&blob).await
         })
         .await
@@ -1531,7 +1531,7 @@ async fn start_node(
                 Vec::new(),
                 ReplicationRuntimeConfig {
                     scheduler: SchedulerConfig {
-                        cadence: Duration::from_secs(3600),
+                        cadence: Duration::from_hours(1),
                         round_timeout: Duration::from_secs(15),
                         ..SchedulerConfig::default()
                     },
@@ -1655,7 +1655,7 @@ async fn referral_pair(
             .expect("W's own binding");
     }
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             w.transport.knows_peer(&r.key.key_id).await
                 && r.transport.knows_peer(&w.key.key_id).await
         })
@@ -1708,7 +1708,7 @@ async fn refused_peer(t: &mut Referral) -> Node {
     seed_route(&p, &t.r).await;
     seed_route(&t.r, &p).await;
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             p.transport.knows_peer(&t.r.key.key_id).await
         })
         .await
@@ -1812,7 +1812,7 @@ async fn a_refused_peer_homes_on_a_referral_and_its_contact_completes_there() {
         .await
         .expect("the refuser's bulk link");
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             t.r.received(&blob).await
         })
         .await
@@ -1968,7 +1968,7 @@ async fn a_homed_node_is_a_replication_peer_on_the_bootstrap_planes() {
         .await
         .expect("a host's peer set");
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             let _ = runtime.round_now_all().await;
             tokio::time::sleep(Duration::from_millis(750)).await;
             held().await
@@ -2010,7 +2010,7 @@ async fn wifi_only_shaping_renegotiates_to_off_on_cellular_and_back() {
         .await
         .expect("a shaped row");
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             t.a.received(&on_wifi).await
         })
         .await
@@ -2207,7 +2207,7 @@ async fn star_of(tag: &str, seed: u8, spokes: usize, hub: ShapingPolicy) -> Star
         seed_route(&r, &n).await;
         seed_route(&n, &r).await;
         assert!(
-            wait_until(Duration::from_secs(60), || async {
+            wait_until(Duration::from_mins(1), || async {
                 n.transport.knows_peer(&r.key.key_id).await
                     && r.transport.knows_peer(&n.key.key_id).await
             })
@@ -3181,7 +3181,7 @@ async fn an_onion_packet_crosses_a_1400_byte_shaped_link_in_fragments_and_arrive
         .await
         .expect("published on the shaped first hop");
     let mut exits = Vec::new();
-    let stored = wait_until(Duration::from_secs(60), || {
+    let stored = wait_until(Duration::from_mins(1), || {
         exits.extend(t.a.transport.onion().take_exits());
         let done = !exits.is_empty();
         async move { done }
@@ -3269,7 +3269,7 @@ async fn measure_contact_round_trips_over_a_real_shaped_pair() {
         .await
         .expect("up");
     assert!(
-        wait_until(Duration::from_secs(120), || async {
+        wait_until(Duration::from_mins(2), || async {
             t.a.received(&hello).await
         })
         .await

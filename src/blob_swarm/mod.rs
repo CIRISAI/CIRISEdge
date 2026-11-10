@@ -1871,7 +1871,7 @@ mod tests {
         assert_eq!(p.error_strikes, 0, "a timeout is never an error strike");
         // An answer ends the silence; a second stall starts a fresh one.
         p.record_answer();
-        let later = sent + Duration::from_secs(120);
+        let later = sent + Duration::from_mins(2);
         p.record_timeout(later, later + t, t, cfg.ewma_alpha, cfg.silence_limit());
         assert!(!p.demoted);
     }

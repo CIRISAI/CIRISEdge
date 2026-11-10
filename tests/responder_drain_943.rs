@@ -328,7 +328,7 @@ async fn nodes() -> Nodes {
             Vec::new(),
             ReplicationRuntimeConfig {
                 scheduler: SchedulerConfig {
-                    cadence: Duration::from_secs(3600),
+                    cadence: Duration::from_hours(1),
                     ..SchedulerConfig::default()
                 },
                 local_key_id: Some(a_id.key_id.clone()),
@@ -384,7 +384,7 @@ impl Nodes {
         assert_eq!(frames.len(), 2, "Summary, then the proactive Deliver");
         // A's announce may still be on its way: the route is what the wait is
         // for, and a frame that could not leave has not opened anything.
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         for f in &frames {
             while let Err(e) = self.b.send(&self.a_key, f).await {
                 assert!(Instant::now() < deadline, "B -> A: {e}");
@@ -415,12 +415,12 @@ impl Nodes {
 /// **The witness on the wire.**
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dead_reverse_path_does_not_hold_the_deliver_behind_the_reply_943() {
-    let n = tokio::time::timeout(Duration::from_secs(120), nodes())
+    let n = tokio::time::timeout(Duration::from_mins(2), nodes())
         .await
         .expect("the pair comes up");
 
     // A healthy round first: B reaches A's responder and hears back.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let round = loop {
         let round = n.open(b"row-healthy").await;
         let hit = tokio::time::timeout(Duration::from_secs(5), async {

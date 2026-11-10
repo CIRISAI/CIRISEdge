@@ -249,7 +249,7 @@ fn a_histogram_lands_each_value_in_its_le_bucket() {
     let h = AtomicHistogram::default();
     h.observe(EVENT_HANDLER_BUCKETS, Duration::from_micros(50));
     h.observe(EVENT_HANDLER_BUCKETS, Duration::from_millis(5));
-    h.observe(EVENT_HANDLER_BUCKETS, Duration::from_secs(60));
+    h.observe(EVENT_HANDLER_BUCKETS, Duration::from_mins(1));
     let s = h.snapshot(EVENT_HANDLER_BUCKETS);
     assert_eq!(s.count, 3);
     assert_eq!(s.cumulative[0], 1, "<= 100 us");
@@ -411,11 +411,9 @@ fn a_tier_change_is_booked_with_who_put_it_there() {
 fn a_pulled_lever_is_a_gauge_and_a_counter() {
     let m = crate::observability::EdgeMetrics::default();
     let w = Witness::of(&m);
-    m.telemetry.levers.pull(
-        crate::ShedLever::Bulk,
-        1,
-        std::time::Duration::from_secs(60),
-    );
+    m.telemetry
+        .levers
+        .pull(crate::ShedLever::Bulk, 1, std::time::Duration::from_mins(1));
     w.rose("load_lever_level.bulk");
     w.rose("load_lever_lease_seconds.bulk");
     w.rose("load_lever_changes_total.bulk:host");

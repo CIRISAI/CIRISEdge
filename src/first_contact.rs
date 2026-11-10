@@ -926,7 +926,7 @@ impl DirectoryOwnerBinding {
                     && r.attested_key_id == self.local_key_id
                     && is_owner_binding_envelope(&r.attestation_envelope)
                     && !retired.contains(r.attestation_id.as_str())
-                    && !r.expires_at.is_some_and(|exp| exp <= now)
+                    && r.expires_at.is_none_or(|exp| exp > now)
             })
             .max_by_key(|r| r.asserted_at)
             .cloned()

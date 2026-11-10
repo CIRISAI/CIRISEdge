@@ -54,7 +54,7 @@ pub const PQC_COMMITMENT_HEX_LEN: usize = 64;
 /// How long a commitment waits for the dial that uses it. A contact is often
 /// added well before its first message; an hour covers that without keeping
 /// a stale anchor indefinitely.
-pub const ANCHOR_TTL: Duration = Duration::from_secs(60 * 60);
+pub const ANCHOR_TTL: Duration = Duration::from_hours(1);
 
 /// Most commitments held at once. Each is set by a person adding a contact,
 /// so the cap is a backstop, not a working limit.
@@ -286,7 +286,7 @@ static MISMATCHES: AtomicU64 = AtomicU64::new(0);
 /// same record is counted, not re-logged.
 fn mismatch_log() -> &'static crate::log_throttle::LogThrottle {
     static LOG: OnceLock<crate::log_throttle::LogThrottle> = OnceLock::new();
-    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_secs(60), 256))
+    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_mins(1), 256))
 }
 
 /// Hold `commitment` for `key_id` until a record matches it or [`ANCHOR_TTL`]

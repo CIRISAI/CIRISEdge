@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn first_n_emit_then_suppress_within_window() {
-        let t = LogThrottle::new(3, Duration::from_secs(60), 16);
+        let t = LogThrottle::new(3, Duration::from_mins(1), 16);
         let t0 = Instant::now();
         // First 3 within budget.
         for _ in 0..3 {
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn window_roll_surfaces_suppressed_count() {
-        let t = LogThrottle::new(1, Duration::from_secs(60), 16);
+        let t = LogThrottle::new(1, Duration::from_mins(1), 16);
         let t0 = Instant::now();
         assert_eq!(
             t.check_at("k", t0),
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn key_map_is_bounded_under_churn() {
         // max_keys = 4; cycle 1000 distinct keys → map never exceeds the cap.
-        let t = LogThrottle::new(1, Duration::from_secs(60), 4);
+        let t = LogThrottle::new(1, Duration::from_mins(1), 4);
         let t0 = Instant::now();
         for i in 0..1000 {
             let _ = t.check_at(&format!("attacker-key-{i}"), t0);
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn independent_keys_have_independent_budgets() {
-        let t = LogThrottle::new(1, Duration::from_secs(60), 16);
+        let t = LogThrottle::new(1, Duration::from_mins(1), 16);
         let t0 = Instant::now();
         assert_eq!(
             t.check_at("a", t0),

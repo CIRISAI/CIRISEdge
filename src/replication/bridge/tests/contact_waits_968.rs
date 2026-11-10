@@ -105,7 +105,7 @@ async fn every_host_local_write_door_drops_the_send_set_memos_968() {
     let config = ReplicationRuntimeConfig {
         enable_bundle_bootstrap_peers: false,
         scheduler: SchedulerConfig {
-            cadence: Duration::from_secs(3600),
+            cadence: Duration::from_hours(1),
             round_timeout: Duration::from_millis(200),
             ..SchedulerConfig::default()
         },

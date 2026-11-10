@@ -347,7 +347,7 @@ mod tests {
             cancel_rx,
             KeyGrantEmitterConfig {
                 debounce: Duration::from_millis(250),
-                backstop: Duration::from_secs(3600),
+                backstop: Duration::from_hours(1),
             },
             move |pass| {
                 let (s, d) = (Arc::clone(&s), Arc::clone(&d));

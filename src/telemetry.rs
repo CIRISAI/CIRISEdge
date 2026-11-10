@@ -237,7 +237,7 @@ pub const EVENT_LOOP_SLOW: Duration = Duration::from_millis(250);
 
 /// `ciris.edge.node.alive` — the event loop and the ladder turned this
 /// recently. Well past a slow handler, so traffic cannot move it.
-pub const NODE_ALIVE_BOUND: Duration = Duration::from_secs(60);
+pub const NODE_ALIVE_BOUND: Duration = Duration::from_mins(1);
 
 /// Fewest links a shaping class holds before its window is published.
 pub const SHAPING_CLASS_FLOOR: usize = 3;
@@ -1189,7 +1189,7 @@ impl EdgeTelemetry {
 
 fn slow_log() -> &'static crate::log_throttle::LogThrottle {
     static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
-    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(4, Duration::from_secs(60), 64))
+    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(4, Duration::from_mins(1), 64))
 }
 
 /// The class token of a refusal edge could not classify.

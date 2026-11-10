@@ -1446,7 +1446,7 @@ mod leviculum_link {
             use std::sync::atomic::Ordering::Relaxed;
             let audio = wire
                 .get(48)
-                .map_or(true, |c| *c == crate::transport::realtime_av::CODEC_OPAQUE);
+                .is_none_or(|c| *c == crate::transport::realtime_av::CODEC_OPAQUE);
             let ms = if audio {
                 self.audio_ms.load(Relaxed)
             } else {

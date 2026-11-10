@@ -79,7 +79,7 @@ pub(crate) struct ChunkWaits {
 /// The longest an answer is treated as in flight. The reply path's own
 /// bounds end a send well inside this (the 45 s reverse-path cap plus the
 /// dial fallback); this only reclaims an entry whose guard never ran.
-pub(crate) const SERVE_IN_FLIGHT_MAX: Duration = Duration::from_secs(120);
+pub(crate) const SERVE_IN_FLIGHT_MAX: Duration = Duration::from_mins(2);
 
 /// How many chunk serves run at once. Each is a Resource on the wire, and
 /// parallel Resources multiply the window's rate.

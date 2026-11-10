@@ -146,14 +146,14 @@ pub const TRANSIENT_BASE: Duration = Duration::from_secs(20);
 /// state that is actively replicating, and worst-case added convergence latency
 /// is this value. 5 minutes turns the flat-out 120 asks/hour into at most 12
 /// while keeping a stalled cohort roster's recovery inside a coffee break.
-pub const TRANSIENT_CAP: Duration = Duration::from_secs(300);
+pub const TRANSIENT_CAP: Duration = Duration::from_mins(5);
 /// First terminal window. On the #544 measurement this alone is the fix: 55
 /// re-offers in 30 minutes becomes 1.
-pub const TERMINAL_BASE: Duration = Duration::from_secs(1800);
+pub const TERMINAL_BASE: Duration = Duration::from_mins(30);
 /// Terminal ceiling — the "never permanently dark" bound. A row whose verdict
 /// genuinely moves (the conflicting local row is pruned) is re-asked within 6
 /// hours with no operator action and no knowledge that this memory exists.
-pub const TERMINAL_CAP: Duration = Duration::from_secs(21_600);
+pub const TERMINAL_CAP: Duration = Duration::from_hours(6);
 /// Front-drop cap on the memory's ORDINARY rows (the #544 windows). Sized
 /// like [`crate::log_throttle`]'s key cap and leviculum's live-link ring:
 /// large enough that a real mesh's genuinely stuck rows all fit, small enough

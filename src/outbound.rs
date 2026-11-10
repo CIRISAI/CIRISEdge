@@ -417,7 +417,7 @@ impl Default for DispatcherConfig {
             claim_duration_seconds: 30,
             idle_poll_interval: Duration::from_millis(500),
             initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(3600),
+            max_backoff: Duration::from_hours(1),
         }
     }
 }
@@ -773,7 +773,7 @@ fn preferred_transport_index(
             if medium.attempts > 0 {
                 let ratio = medium.ratio();
                 // (`map_or`, not 1.82's `is_none_or` — MSRV is 1.75.)
-                if ratio > 0.0 && best.map_or(true, |(_, b)| ratio > b) {
+                if ratio > 0.0 && best.is_none_or(|(_, b)| ratio > b) {
                     best = Some((idx, ratio));
                 }
             }
@@ -804,7 +804,7 @@ pub async fn run_sweeps_beating(
     };
     beat();
     let mut tick_ack = tokio::time::interval(Duration::from_secs(30));
-    let mut tick_ttl = tokio::time::interval(Duration::from_secs(60));
+    let mut tick_ttl = tokio::time::interval(Duration::from_mins(1));
     let mut tick_claim = tokio::time::interval(Duration::from_secs(30));
 
     loop {

@@ -186,10 +186,10 @@ async fn pair_ticking(tag: &str, inbound_bound: Duration, fast_tick: bool) -> Pa
         a.set_link_pool_policy(BOUND, 4);
         a.set_inbound_link_idle_bound(inbound_bound);
     } else {
-        a.set_link_pool_policy(Duration::from_secs(600), 4);
-        a.set_inbound_link_idle_bound(Duration::from_secs(600));
+        a.set_link_pool_policy(Duration::from_mins(10), 4);
+        a.set_inbound_link_idle_bound(Duration::from_mins(10));
     }
-    b.set_link_pool_policy(Duration::from_secs(600), 4);
+    b.set_link_pool_policy(Duration::from_mins(10), 4);
     prime_v7_peer_pair(&a, &key_a.key_id, &b, &key_b.key_id).await;
     let (tx_a, rx_a) = mpsc::channel::<InboundFrame>(256);
     let (tx_b, _rx_b) = mpsc::channel::<InboundFrame>(256);
@@ -220,7 +220,7 @@ async fn pair_ticking(tag: &str, inbound_bound: Duration, fast_tick: bool) -> Pa
 }
 
 async fn recv_one(rx: &mut mpsc::Receiver<InboundFrame>, what: &str) -> InboundFrame {
-    tokio::time::timeout(Duration::from_secs(60), rx.recv())
+    tokio::time::timeout(Duration::from_mins(1), rx.recv())
         .await
         .unwrap_or_else(|_| panic!("{what}: timed out"))
         .unwrap_or_else(|| panic!("{what}: sink closed"))

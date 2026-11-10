@@ -235,7 +235,7 @@ const UNATTRIBUTED_CAP: usize = 1024;
 
 /// CIRISEdge#968 — how long a remembered unattributed peer is kept. Rooting
 /// lands in seconds; a peer that never roots is forgotten.
-const UNATTRIBUTED_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const UNATTRIBUTED_TTL: std::time::Duration = std::time::Duration::from_mins(10);
 
 impl ReplicationRegistry {
     /// An empty registry with no factory and no known local key.

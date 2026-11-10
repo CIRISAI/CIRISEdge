@@ -490,11 +490,11 @@ impl Session {
                 .iter()
                 .filter(|r| !peer_has.contains(&r.envelope_hash))
                 .filter(|r| {
-                    self.proactive_sent.get(&r.envelope_hash).map_or(
-                        true,
-                        // `map_or(true, …)` not `is_none_or` — MSRV 1.75.
-                        |sent| self.round_counter.saturating_sub(*sent) >= PROACTIVE_REFRESH_ROUNDS,
-                    )
+                    self.proactive_sent
+                        .get(&r.envelope_hash)
+                        .is_none_or(|sent| {
+                            self.round_counter.saturating_sub(*sent) >= PROACTIVE_REFRESH_ROUNDS
+                        })
                 })
                 .collect();
             candidates.sort_by_key(|r| r.seq);

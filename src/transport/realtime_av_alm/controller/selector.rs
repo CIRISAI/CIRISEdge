@@ -435,9 +435,9 @@ impl<P: PeerRef> ParentSelector<P> {
     /// meter is per path, so duplicates across paths are counted per path).
     pub fn on_chunk(&mut self, now_ms: u64, from: &P, chunk: PathChunk) {
         // The stream is active (on some path), whoever delivered it.
-        let resumed = self.last_activity_ms.map_or(true, |a| {
-            now_ms.saturating_sub(a) > self.cfg.suspect_silence_ms
-        });
+        let resumed = self
+            .last_activity_ms
+            .is_none_or(|a| now_ms.saturating_sub(a) > self.cfg.suspect_silence_ms);
         if resumed {
             self.activity_since_ms = now_ms;
         }
@@ -976,7 +976,7 @@ impl<P: PeerRef> ParentSelector<P> {
                     .unwrap_or(c.subscribed_at)
                     .max(c.subscribed_at);
                 let depth = c.offer.as_ref().map_or(0, |o| u64::from(o.depth.min(4)));
-                if idle_aware && !activity.is_some_and(|a| a > last) {
+                if idle_aware && activity.is_none_or(|a| a <= last) {
                     // Nothing newer arrived on any path: the stream is idle,
                     // not this parent dead.
                     return 0;
@@ -1107,7 +1107,7 @@ impl<P: PeerRef> ParentSelector<P> {
                 || !c.eligible;
             let allowed = self
                 .last_failover_ms
-                .map_or(true, |t| now_ms >= t + self.cfg.failover_min_interval_ms);
+                .is_none_or(|t| now_ms >= t + self.cfg.failover_min_interval_ms);
             if bad && allowed {
                 use crate::telemetry::FailoverCause;
                 let cause = if depth_bad {
@@ -1292,7 +1292,7 @@ impl<P: PeerRef> ParentSelector<P> {
                 && c.no_room_offers >= STANDBY_NO_ROOM_OFFERS
                 && self
                     .last_standby_rotation_ms
-                    .map_or(true, |t| now_ms >= t + self.cfg.min_dwell_ms)
+                    .is_none_or(|t| now_ms >= t + self.cfg.min_dwell_ms)
             {
                 // It could no longer take over: rotate it, but only to a
                 // candidate that has room (audio only, cheap to move).
@@ -1379,7 +1379,7 @@ mod tests {
                 }
             }
             seq += 5;
-            if t % 1_000 == 0 {
+            if t.is_multiple_of(1_000) {
                 for &(p, room, rtt) in offers {
                     s.on_offer(t, offer(p, room, cfg), rtt, &mut log);
                 }

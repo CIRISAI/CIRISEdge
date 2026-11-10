@@ -340,7 +340,7 @@ mod tests {
             Arc::clone(&table),
             Arc::new(Sink::default()),
             own,
-            Duration::from_secs(300),
+            Duration::from_mins(5),
         );
         (life, table)
     }
@@ -427,7 +427,7 @@ mod tests {
         assert!(table
             .accepts_inbound(second.own_address.as_bytes())
             .is_some());
-        life.seal_due(t0 + Duration::from_secs(300));
+        life.seal_due(t0 + Duration::from_mins(5));
         assert!(table
             .accepts_inbound(first.own_address.as_bytes())
             .is_none());

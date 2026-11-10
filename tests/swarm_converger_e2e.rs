@@ -121,7 +121,7 @@ fn diversity_aware_low_rtt_peer_ejects_high_rtt_peer_keeps() {
 
     // The floor sits between alice and dave; dave uniquely contributes
     // diversity, alice is in the clustered low-RTT bucket.
-    let floor = (alice_score + dave_score) / 2.0;
+    let floor = f64::midpoint(alice_score, dave_score);
     assert!(
         alice_score < floor && floor < dave_score,
         "floor={floor} must split alice={alice_score} and dave={dave_score}"
@@ -296,8 +296,8 @@ async fn runtime_round_trip_with_published_claim_via_register_observed_claim() {
     let alice_cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
     let rt = FountainSwarmRuntime::start(
         SwarmRuntimeConfig {
-            publish_cadence: Duration::from_secs(60),
-            observe_cadence: Duration::from_secs(60),
+            publish_cadence: Duration::from_mins(1),
+            observe_cadence: Duration::from_mins(1),
             ..Default::default()
         },
         alice_holdings,

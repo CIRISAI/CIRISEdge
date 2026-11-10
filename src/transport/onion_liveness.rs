@@ -27,7 +27,7 @@ use super::onion_layers::{LayerDeal, LAYERS, LAYER_FLOOR};
 /// tier to be available on this node (CC 5.4.6 item 4, "≥ 3 answering").
 pub const MIN_ANSWERING: usize = LAYER_FLOOR;
 /// Default evidence window: one rendezvous period.
-pub const DEFAULT_LIVENESS_WINDOW: Duration = Duration::from_secs(3600);
+pub const DEFAULT_LIVENESS_WINDOW: Duration = Duration::from_hours(1);
 
 /// What proved a relay answers. Each is an event this node already observes
 /// on its own links; none is a wire-supplied claim.
@@ -201,14 +201,14 @@ mod tests {
         assert!(deal.available);
         let now = Instant::now();
         let mut fold = LivenessFold::new();
-        let a = fold.availability_at(&deal, now, Duration::from_secs(600));
+        let a = fold.availability_at(&deal, now, Duration::from_mins(10));
         assert!(!a.available);
         assert_eq!(a.reason, Some("onion_tier_unavailable_liveness"));
         assert!(a.floor_holds);
         for l in deal.layers.iter().flatten() {
             fold.observe_at(l, LivenessEvidence::ShapedLinkUp, now);
         }
-        let a = fold.availability_at(&deal, now, Duration::from_secs(600));
+        let a = fold.availability_at(&deal, now, Duration::from_mins(10));
         assert!(a.available, "{a:?}");
         assert!(a.layers.iter().all(|l| l.dealt == 3 && l.answering == 3));
         // One relay in layer 0 goes quiet past the window: liveness fails there.
@@ -221,7 +221,7 @@ mod tests {
             let at = if *l == quiet { stale } else { now };
             fold2.observe_at(l, LivenessEvidence::ShapedLinkUp, at);
         }
-        let a = fold2.availability_at(&deal, now, Duration::from_secs(600));
+        let a = fold2.availability_at(&deal, now, Duration::from_mins(10));
         assert!(!a.available);
         assert_eq!(a.layers[0].answering, 2);
         assert_eq!(a.reason, Some("onion_tier_unavailable_liveness"));
@@ -237,7 +237,7 @@ mod tests {
         for l in deal.layers.iter().flatten() {
             fold.observe_at(l, LivenessEvidence::RouteAnswered, now);
         }
-        let a = fold.availability_at(&deal, now, Duration::from_secs(600));
+        let a = fold.availability_at(&deal, now, Duration::from_mins(10));
         assert!(!a.available);
         assert_eq!(a.reason, Some("onion_tier_unavailable_floor"));
     }
@@ -261,19 +261,19 @@ mod tests {
         }
         assert!(
             fold_a
-                .availability_at(&d1, now, Duration::from_secs(60))
+                .availability_at(&d1, now, Duration::from_mins(1))
                 .available
         );
         assert!(
             !fold_b
-                .availability_at(&d2, now, Duration::from_secs(60))
+                .availability_at(&d2, now, Duration::from_mins(1))
                 .available
         );
-        fold_a.prune(now + Duration::from_secs(120), Duration::from_secs(60));
+        fold_a.prune(now + Duration::from_mins(2), Duration::from_mins(1));
         assert!(fold_a.is_empty());
         let dbg = format!(
             "{:?}",
-            fold_b.availability_at(&d2, now, Duration::from_secs(60))
+            fold_b.availability_at(&d2, now, Duration::from_mins(1))
         );
         assert!(
             !dbg.contains("seat0") && !dbg.contains("n0"),

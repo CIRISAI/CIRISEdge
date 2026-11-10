@@ -278,7 +278,7 @@ async fn identified_link_from_an_advisory_key_owning_peer_is_attributed_659() {
         .await
         .expect("send B -> A");
 
-    let frame = tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
+    let frame = tokio::time::timeout(Duration::from_mins(1), rx_a.recv())
         .await
         .expect("frame must arrive within 60s")
         .expect("inbound channel open");
@@ -410,7 +410,7 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
         .send(key_a.key_id.as_str(), b"round-open-from-the-phone")
         .await
         .expect("B -> A send (the phone's outbound leg) must deliver");
-    let inbound_at_a = tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
+    let inbound_at_a = tokio::time::timeout(Duration::from_mins(1), rx_a.recv())
         .await
         .expect("A must receive B's frame within 60s")
         .expect("A inbound channel open");
@@ -440,7 +440,7 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
 
     // Leg 3 — attribution at B (initiator side): the reply must carry
     // source_key_id=A, else the replication registry drops it.
-    let reply_at_b = tokio::time::timeout(Duration::from_secs(60), rx_b.recv())
+    let reply_at_b = tokio::time::timeout(Duration::from_mins(1), rx_b.recv())
         .await
         .expect("B must receive A's reply within 60s")
         .expect("B inbound channel open");
@@ -550,7 +550,7 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
         .send(key_a.key_id.as_str(), b"round-open")
         .await
         .expect("B -> A");
-    tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
+    tokio::time::timeout(Duration::from_mins(1), rx_a.recv())
         .await
         .expect("A receives B within 60s")
         .expect("A channel open");
@@ -566,7 +566,7 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
              undialable outbound dial (CIRISEdge#353 residual)",
         );
 
-    let reply = tokio::time::timeout(Duration::from_secs(60), rx_b.recv())
+    let reply = tokio::time::timeout(Duration::from_mins(1), rx_b.recv())
         .await
         .expect("B receives the retried reply within 60s")
         .expect("B channel open");

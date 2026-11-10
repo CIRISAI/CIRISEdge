@@ -244,7 +244,7 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
     println!("[loopback] send outcome: {outcome:?}");
 
     // The envelope must arrive on A's inbound sink, byte-exact.
-    let frame = tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
+    let frame = tokio::time::timeout(Duration::from_mins(1), rx_a.recv())
         .await
         .expect("timed out waiting for inbound frame on A")
         .expect("A inbound channel closed");

@@ -953,7 +953,7 @@ impl AvDispatcher {
             let now = std::time::Instant::now();
             if state
                 .last_media
-                .map_or(true, |t| now.duration_since(t) > MEDIA_IDLE)
+                .is_none_or(|t| now.duration_since(t) > MEDIA_IDLE)
             {
                 let until = now + MEDIA_RAMP;
                 state.settle_until = Some(state.settle_until.map_or(until, |u| u.max(until)));

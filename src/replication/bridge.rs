@@ -902,7 +902,7 @@ static SERVE_GATE_WITHHELD_LOG: std::sync::OnceLock<crate::log_throttle::LogThro
 /// a persistently-dark plane is exactly the failure you must not go quiet about.
 fn serve_gate_withheld_log() -> &'static crate::log_throttle::LogThrottle {
     SERVE_GATE_WITHHELD_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(300), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_mins(5), 256))
 }
 
 /// CIRISEdge#425 — a single-shape plane: deserialize `$ty`, admit via `$put`, and
@@ -986,14 +986,14 @@ impl BridgeConfig {
     /// A peer with no walk starts this far behind now, so a row written in the
     /// seconds before its link came up is a new row. Older is history's: the
     /// rolling read below reaches every row, within `rows / page` of these.
-    pub const DEFAULT_TIP_MARGIN: Duration = Duration::from_secs(60);
+    pub const DEFAULT_TIP_MARGIN: Duration = Duration::from_mins(1);
 
     /// A peer with no walk reads one full page of history this often: what
     /// its required read and new rows do not carry, such as a third party's
     /// invitation past the subject read's budget, or the rows of a room it has
     /// just joined. Slow on purpose: this is not anti-entropy. 1024 rows a minute
     /// walks 11k rows in 11 minutes.
-    pub const DEFAULT_HISTORY_PAGE_EVERY: Duration = Duration::from_secs(60);
+    pub const DEFAULT_HISTORY_PAGE_EVERY: Duration = Duration::from_mins(1);
 
     /// Default for [`Self::operational_page_limit`].
     pub const DEFAULT_OPERATIONAL_PAGE_LIMIT: u32 = u32::MAX;
@@ -1524,7 +1524,7 @@ struct ResweepCycle {
 const MAX_SKIPPED_ROWS_REMEMBERED: usize = 4096;
 
 /// A re-sweep cycle running longer than this is said at WARN, once.
-const RESWEEP_CYCLE_BOUND: Duration = Duration::from_secs(15 * 60);
+const RESWEEP_CYCLE_BOUND: Duration = Duration::from_mins(15);
 
 /// The Attestation advertise's memory of what it skipped and of its re-sweep
 /// cycles. Diagnostic: nothing here decides what is offered.
@@ -1593,12 +1593,12 @@ struct PageCounts {
 
 fn advertise_summary_log() -> &'static crate::log_throttle::LogThrottle {
     static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
-    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(120), 1024))
+    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_mins(2), 1024))
 }
 
 fn resweep_cycle_log() -> &'static crate::log_throttle::LogThrottle {
     static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
-    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(600), 1024))
+    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_mins(10), 1024))
 }
 
 /// A short, stable spelling of a resume position for a log line.
@@ -1909,7 +1909,7 @@ impl SweepCursors {
 
     /// May a peer with no walk read a page of history now?
     fn history_due(&mut self, key: &(String, EnvelopeKind), now: Instant) -> bool {
-        !self.touch(key).history_at.is_some_and(|at| now < at)
+        self.touch(key).history_at.is_none_or(|at| now >= at)
     }
 
     /// A page of history was read. A short one was all of it, and a plane that
@@ -2338,7 +2338,7 @@ enum QuarantineConsult {
 fn lookup_limit_log() -> &'static crate::log_throttle::LogThrottle {
     static T: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(60), 1024)
+        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_mins(1), 1024)
     })
 }
 
@@ -2962,7 +2962,7 @@ impl std::fmt::Debug for BridgeEngine {
 fn terminal_move_log() -> &'static crate::log_throttle::LogThrottle {
     static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
     LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(4, std::time::Duration::from_secs(300), 64)
+        crate::log_throttle::LogThrottle::new(4, std::time::Duration::from_mins(5), 64)
     })
 }
 
@@ -7488,7 +7488,7 @@ impl FederationDirectoryReplicationBridge {
             },
             ciris_persist::federation::ServedTransportDestination::resume_pair,
             |row| {
-                subjects.map_or(true, |s| {
+                subjects.is_none_or(|s| {
                     s.contains(&row.destination.transport_destination.occurrence_key_id)
                         || Self::relayable_signed_route(&row.destination)
                 })
@@ -8716,14 +8716,14 @@ impl FederationDirectoryReplicationBridge {
             .await?;
         Ok(grants
             .into_iter()
-            .filter(|grant| grant.expires_at.map_or(true, |at| at > now))
+            .filter(|grant| grant.expires_at.is_none_or(|at| at > now))
             .filter_map(|grant| {
                 let policy =
                     consent_grammar::parse_grant_payload(&grant.attestation_envelope).ok()?;
                 (policy.direction == consent_grammar::Direction::Egress
                     && policy.principle.propagates()
                     && policy.kinds.iter().any(|k| k == "Attestation")
-                    && policy.valid_until.map_or(true, |at| at > now))
+                    && policy.valid_until.is_none_or(|at| at > now))
                 .then_some(TraceGrant {
                     subject_key_ids: grant.subject_key_ids,
                     attestation_prefixes: policy.attestation_prefixes,
@@ -14688,7 +14688,7 @@ pub(crate) mod tests {
         // have re-asked ~12 times by now.
         let much_later = Instant::now()
             + crate::replication::refusal_backoff::TRANSIENT_CAP
-            + std::time::Duration::from_secs(60);
+            + std::time::Duration::from_mins(1);
         assert!(
             bridge
                 .refusal_backoff
@@ -14938,7 +14938,7 @@ pub(crate) mod tests {
             "parked on its room"
         );
         assert!(
-            backoff.suppressed_at(kind, &hash, Instant::now() + Duration::from_secs(60)),
+            backoff.suppressed_at(kind, &hash, Instant::now() + Duration::from_mins(1)),
             "quiet while the room has not admitted this node"
         );
 
@@ -28108,7 +28108,7 @@ pub(crate) mod tests {
             }
             let levers = &metrics.telemetry.levers;
             levers.set_steps(Duration::ZERO, Duration::ZERO);
-            levers.pull(crate::ShedLever::Page, 1, Duration::from_secs(60));
+            levers.pull(crate::ShedLever::Page, 1, Duration::from_mins(1));
             let refs = bridge.list_envelope_refs(EnvelopeKind::Attestation).await;
             assert_eq!(refs.len(), 100, "every row is still read");
             assert_eq!(bridge.max_sweep_page_rows(), 32, "½ of the 64 page");
@@ -28159,7 +28159,7 @@ pub(crate) mod tests {
                                 // ORDER BY (pos, id), strictly greater than the PAIR.
                                 Ok(corpus
                                     .into_iter()
-                                    .filter(|(c, _)| since.as_ref().map_or(true, |sc| c > sc))
+                                    .filter(|(c, _)| since.as_ref().is_none_or(|sc| c > sc))
                                     .take(limit as usize)
                                     .collect::<Vec<_>>())
                             }
@@ -28211,7 +28211,7 @@ pub(crate) mod tests {
                                     }
                                     Ok(corpus
                                         .into_iter()
-                                        .filter(|(c, _)| since.as_ref().map_or(true, |sc| c > sc))
+                                        .filter(|(c, _)| since.as_ref().is_none_or(|sc| c > sc))
                                         .take(limit as usize)
                                         .collect::<Vec<_>>())
                                 }
@@ -29134,7 +29134,7 @@ mod sweep_width_tests {
             }));
         }
 
-        tokio::time::timeout(StdDuration::from_secs(60), async {
+        tokio::time::timeout(StdDuration::from_mins(1), async {
             for h in handles {
                 h.await.expect("plane task joined");
             }
@@ -29212,7 +29212,7 @@ mod sweep_width_tests {
                     let _ = bridge.list_envelope_refs(kind).await;
                 }));
             }
-            tokio::time::timeout(StdDuration::from_secs(60), async {
+            tokio::time::timeout(StdDuration::from_mins(1), async {
                 for h in handles {
                     h.await.expect("sweep task joined");
                 }

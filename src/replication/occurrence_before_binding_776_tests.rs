@@ -416,7 +416,7 @@ async fn the_release_kicks_a_re_ask_of_the_peer_that_offered_the_row_776() {
                 }],
                 ReplicationRuntimeConfig {
                     scheduler: SchedulerConfig {
-                        cadence: Duration::from_secs(3600),
+                        cadence: Duration::from_hours(1),
                         round_timeout: Duration::from_secs(5),
                         ..SchedulerConfig::default()
                     },
@@ -557,7 +557,7 @@ async fn a_row_released_behind_the_watermark_is_fetched_at_once_776() {
                 }],
                 ReplicationRuntimeConfig {
                     scheduler: SchedulerConfig {
-                        cadence: Duration::from_secs(3600),
+                        cadence: Duration::from_hours(1),
                         round_timeout: Duration::from_secs(5),
                         ..SchedulerConfig::default()
                     },
@@ -691,7 +691,7 @@ async fn a_refusal_whose_signer_is_bound_parks_terminally_and_no_duplicate_relea
     let backoff = bridge.refusal_backoff_for_test();
     let past_transient_cap = Instant::now()
         + crate::replication::refusal_backoff::TRANSIENT_CAP
-        + Duration::from_secs(60);
+        + Duration::from_mins(1);
     assert!(
         backoff.suppressed_at(EnvelopeKind::IdentityOccurrence, &hash, past_transient_cap),
         "quiet on the TERMINAL schedule from the first refusal"

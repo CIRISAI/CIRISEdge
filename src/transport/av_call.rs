@@ -1908,10 +1908,8 @@ impl Call {
     /// path that really died: nothing re-dials it.
     #[doc(hidden)]
     pub async fn close_leg_for_test(&self, member: &str) {
-        Shared::lock(&self.shared.dialling).insert(
-            member.to_owned(),
-            Instant::now() + Duration::from_secs(3600),
-        );
+        Shared::lock(&self.shared.dialling)
+            .insert(member.to_owned(), Instant::now() + Duration::from_hours(1));
         let link = Shared::lock(&self.shared.out_legs)
             .get(member)
             .map(|l| l.link_id);
@@ -2349,7 +2347,7 @@ fn reconcile_legs(shared: &Arc<Shared>) {
             if dialling.get(&m).is_some_and(|until| *until > now) {
                 continue;
             }
-            dialling.insert(m.clone(), now + Duration::from_secs(3600));
+            dialling.insert(m.clone(), now + Duration::from_hours(1));
         }
         let s = Arc::clone(shared);
         tokio::spawn(async move {
@@ -3256,10 +3254,10 @@ async fn watch_loop(shared: Arc<Shared>) {
             return;
         }
         n = n.wrapping_add(1);
-        if n % ATTENDANCE_EVERY_TICKS == 0 {
+        if n.is_multiple_of(ATTENDANCE_EVERY_TICKS) {
             announce_attendees(&shared).await;
         }
-        if n % reannounce_ticks() == 0 {
+        if n.is_multiple_of(reannounce_ticks()) {
             let s = Arc::clone(&shared);
             tokio::spawn(async move { reannounce(&s).await });
         }

@@ -2111,10 +2111,7 @@ pub fn first_contact_sender(bytes: &[u8]) -> Option<FirstContactSender> {
 /// introducing) another key.
 pub fn admit_unattributed_frame(claimed: &str, bytes: &[u8]) -> Result<(), SealRefusal> {
     let sender = first_contact_sender(bytes).ok_or(SealRefusal::FirstContactOnly)?;
-    let record_matches = sender
-        .record_key_id
-        .as_deref()
-        .map_or(true, |k| k == claimed);
+    let record_matches = sender.record_key_id.as_deref().is_none_or(|k| k == claimed);
     if sender.signer == claimed && record_matches {
         Ok(())
     } else {

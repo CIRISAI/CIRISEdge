@@ -91,7 +91,7 @@ use super::swarm_rarity::FountainHoldingClaim;
 /// judges liveness from [`ConvergedView::newest_claim_age_ms`], so
 /// claims must survive long enough to *look* stale. Pruning aggressively
 /// would hide a quiet mesh instead of reporting one.
-pub const DEFAULT_CONVERGED_CLAIM_TTL: Duration = Duration::from_secs(600);
+pub const DEFAULT_CONVERGED_CLAIM_TTL: Duration = Duration::from_mins(10);
 
 /// Default warm-up window — how long the plane must have been armed
 /// before an *empty* set is reported as evidence rather than as unknown.
@@ -101,7 +101,7 @@ pub const DEFAULT_CONVERGED_CLAIM_TTL: Duration = Duration::from_secs(600);
 /// tolerates a single missed tick without the reader claiming an empty
 /// mesh. A *non*-empty set is reported immediately — positive evidence
 /// needs no warm-up.
-pub const DEFAULT_CONVERGENCE_WARMUP: Duration = Duration::from_secs(120);
+pub const DEFAULT_CONVERGENCE_WARMUP: Duration = Duration::from_mins(2);
 
 /// Cap on distinct `(content_id, peer_id)` claims tracked at once.
 ///
@@ -600,7 +600,7 @@ mod tests {
     /// underflow and `Instant`'s epoch is boot/process start, so a bare
     /// `Instant::now() - 10_000s` would flake on a freshly booted runner.
     fn far_future_now() -> Instant {
-        Instant::now() + Duration::from_secs(86_400)
+        Instant::now() + Duration::from_hours(24)
     }
 
     fn armed_view(ttl: Duration, warmup: Duration) -> ConvergedClaimView {
@@ -626,7 +626,7 @@ mod tests {
 
     #[test]
     fn armed_but_warming_with_nothing_observed_is_unknown_not_zero() {
-        let view = armed_view(DEFAULT_CONVERGED_CLAIM_TTL, Duration::from_secs(120));
+        let view = armed_view(DEFAULT_CONVERGED_CLAIM_TTL, Duration::from_mins(2));
         match view.read() {
             ConvergenceReading::Unavailable(ConvergenceUnavailable::Warming {
                 window_ms, ..
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn positive_evidence_is_reported_even_while_warming() {
         // A long warm-up window that has NOT elapsed...
-        let view = armed_view(DEFAULT_CONVERGED_CLAIM_TTL, Duration::from_secs(3600));
+        let view = armed_view(DEFAULT_CONVERGED_CLAIM_TTL, Duration::from_hours(1));
         view.observe(&field_claim("peer-a", "content-1", &[1, 2, 3]));
         // ...must not suppress an answer we positively have.
         let reading = view.read();
@@ -723,13 +723,13 @@ mod tests {
 
     #[test]
     fn ages_bracket_the_observed_set() {
-        let view = armed_view(Duration::from_secs(600), Duration::ZERO);
+        let view = armed_view(Duration::from_mins(10), Duration::ZERO);
         let now = far_future_now();
         // A cohort that has been publishing for a while: one peer heard
         // from 5 minutes ago, one 10 seconds ago.
         view.observe_at(
             &field_claim("peer-old", "content-1", &[1]),
-            now.checked_sub(Duration::from_secs(300))
+            now.checked_sub(Duration::from_mins(5))
                 .expect("test instant"),
         );
         view.observe_at(
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn a_quiet_cohort_reads_as_stale_then_empties() {
-        let view = armed_view(Duration::from_secs(600), Duration::ZERO);
+        let view = armed_view(Duration::from_mins(10), Duration::ZERO);
         let now = far_future_now();
         view.observe_at(
             &field_claim("peer-a", "content-1", &[1]),
@@ -789,13 +789,13 @@ mod tests {
 
     #[test]
     fn saturation_still_accepts_freshness_for_tracked_pairs() {
-        let mut view = ConvergedClaimView::with_horizons(Duration::from_secs(600), Duration::ZERO);
+        let mut view = ConvergedClaimView::with_horizons(Duration::from_mins(10), Duration::ZERO);
         view.max_tracked = 1;
         view.arm();
         let now = far_future_now();
         view.observe_at(
             &field_claim("peer-a", "content-1", &[1]),
-            now.checked_sub(Duration::from_secs(300))
+            now.checked_sub(Duration::from_mins(5))
                 .expect("test instant"),
         );
         view.observe(&field_claim("peer-b", "content-2", &[1])); // refused
@@ -877,10 +877,8 @@ mod tests {
 
     #[test]
     fn rearming_does_not_reset_the_observation_window() {
-        let view = ConvergedClaimView::with_horizons(
-            DEFAULT_CONVERGED_CLAIM_TTL,
-            Duration::from_secs(120),
-        );
+        let view =
+            ConvergedClaimView::with_horizons(DEFAULT_CONVERGED_CLAIM_TTL, Duration::from_mins(2));
         view.arm();
         let first = view
             .state
@@ -937,7 +935,7 @@ mod tests {
                     .expect("test instant"),
             },
         ];
-        let v = fold_observations(obs, now, Duration::from_secs(600), Duration::ZERO, 0);
+        let v = fold_observations(obs, now, Duration::from_mins(10), Duration::ZERO, 0);
         assert_eq!(v.peers_converged, 1, "the expired peer must not be counted");
         assert_eq!(v.symbols_claimed, 3);
     }

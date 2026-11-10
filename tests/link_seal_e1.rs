@@ -336,7 +336,7 @@ async fn trio_on(
         }
     }
     seed_route(&b, &a).await;
-    let known = wait_until(Duration::from_secs(60), || async {
+    let known = wait_until(Duration::from_mins(1), || async {
         b.transport.knows_peer(&a.key.key_id).await
             && c.transport.knows_peer(&a.key.key_id).await
             && a.transport.knows_peer(&b.key.key_id).await
@@ -2506,7 +2506,7 @@ async fn a_stranger_flood_leaves_traffic_moving_and_first_contact_working_947() 
     }))
     .expect("json");
     let mut attempts = 0;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     while std::time::Instant::now() < deadline && !t.a.received(&request).await {
         attempts += 1;
         let _ = t.c.transport.send(&t.a.key.key_id, &request).await;
@@ -3027,7 +3027,7 @@ async fn dial_until_judged(
     frame: &[u8],
     judged: impl Fn() -> bool,
 ) -> impl std::fmt::Debug {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
     loop {
         let sent = t.c.transport.send(&t.b.key.key_id, frame).await;
         let done = wait_until(Duration::from_secs(10), || async { judged() }).await;
@@ -3047,7 +3047,7 @@ async fn a_relay_at_the_top_tier_with_every_lever_pulled_still_forwards() {
     seed_route(&t.b, &t.c).await;
     seed_route(&t.c, &t.b).await;
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             t.c.transport.seek_peer(&t.b.key.key_id).await
                 && t.b.transport.seek_peer(&t.c.key.key_id).await
         })
@@ -3060,7 +3060,7 @@ async fn a_relay_at_the_top_tier_with_every_lever_pulled_still_forwards() {
     levers.set_steps(Duration::ZERO, Duration::from_secs(30));
     for lever in ciris_edge::ShedLever::ALL {
         for _ in 0..3 {
-            levers.pull(lever, 3, Duration::from_secs(300));
+            levers.pull(lever, 3, Duration::from_mins(5));
         }
     }
     let row = marked(b"E1-FORWARD-MARKER-", 512);
@@ -3126,7 +3126,7 @@ async fn bound_peer_after_a_restart(tag: &str, seated: bool) {
     seed_route(&t.b, &t.c).await;
     seed_route(&t.c, &t.b).await;
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             // Asked, not awaited: a relay under load holds announces (#945).
             t.c.transport.seek_peer(&t.b.key.key_id).await
                 && t.b.transport.seek_peer(&t.c.key.key_id).await
@@ -3179,7 +3179,7 @@ async fn a_superseded_binding_gives_no_standing_after_a_restart() {
     seed_route(&t.b, &t.c).await;
     seed_route(&t.c, &t.b).await;
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             // Asked, not awaited: a relay under load holds announces (#945).
             t.c.transport.seek_peer(&t.b.key.key_id).await
                 && t.b.transport.seek_peer(&t.c.key.key_id).await

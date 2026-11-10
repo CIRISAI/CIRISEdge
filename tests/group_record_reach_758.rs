@@ -640,7 +640,7 @@ async fn a_group_record_reaches_only_members_and_live_invitees_758() {
 
     // Control: the four are talking (each spoke holds A's owner-binding and
     // A holds theirs, the #671 allegiance facts), then more rounds on top.
-    let talking = drive_until(&all, Duration::from_secs(240), || async {
+    let talking = drive_until(&all, Duration::from_mins(4), || async {
         b.holds(&a.binding_id()).await
             && c.holds(&a.binding_id()).await
             && d.holds(&a.binding_id()).await
@@ -695,7 +695,7 @@ async fn a_group_record_reaches_only_members_and_live_invitees_758() {
             );
         }
     }
-    let invited = drive_until(&all, Duration::from_secs(240), || async {
+    let invited = drive_until(&all, Duration::from_mins(4), || async {
         for n in [c, d] {
             for (scope, group) in groups {
                 if !holds_record(n, scope, group).await {
@@ -741,7 +741,7 @@ async fn a_group_record_reaches_only_members_and_live_invitees_758() {
             .await
             .expect("L accepts on D");
     }
-    let joined = drive_until(&all, Duration::from_secs(240), || async {
+    let joined = drive_until(&all, Duration::from_mins(4), || async {
         for (scope, group) in groups {
             if !a.roster(scope, group).await.contains(&d.owner.key_id)
                 || !d.roster(scope, group).await.contains(&d.owner.key_id)
@@ -782,7 +782,7 @@ async fn a_group_record_reaches_only_members_and_live_invitees_758() {
     .expect("P opens the pair room with K");
     let room = opened.room.clone();
     let room_proposal = opened.proposal.expect("the room proposes K").attestation_id;
-    let paired = drive_until(&all, Duration::from_secs(240), || async {
+    let paired = drive_until(&all, Duration::from_mins(4), || async {
         holds_record(c, GroupScope::Community, &room).await && c.holds(&room_proposal).await
     })
     .await;

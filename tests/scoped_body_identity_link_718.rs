@@ -580,7 +580,7 @@ async fn spawn_member(node: Node, rt: Arc<ReticulumTransport>, arming: Arming) -
         // as real explicit-hash destinations (announce-suppressed).
         builder = builder
             .blob_chunk_source(source())
-            .scope_native_addressing(Duration::from_secs(300));
+            .scope_native_addressing(Duration::from_mins(5));
     }
     let edge = Arc::new(builder.build().expect("build edge"));
     let (stop, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -591,10 +591,10 @@ async fn spawn_member(node: Node, rt: Arc<ReticulumTransport>, arming: Arming) -
     tokio::time::sleep(Duration::from_millis(50)).await;
     if arming == Arming::AfterRun {
         assert!(edge.scope_lifecycle().is_none(), "nothing armed at build");
-        edge.arm_fold_host(source(), Some(Duration::from_secs(300)))
+        edge.arm_fold_host(source(), Some(Duration::from_mins(5)))
             .expect("arm the running Edge");
         assert!(
-            edge.arm_fold_host(source(), Some(Duration::from_secs(300)))
+            edge.arm_fold_host(source(), Some(Duration::from_mins(5)))
                 .is_err(),
             "arming is set-once"
         );
@@ -1025,8 +1025,8 @@ async fn assert_relay_directory_is_blind(m: &Mesh) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_running_edge_armed_late_serves_and_pulls_the_room_body() {
     let m = mesh_armed("late", true, Arming::AfterRun).await;
-    wait_for_path(&m.b, &m.a, true, Duration::from_secs(60)).await;
-    wait_for_path(&m.a, &m.b, true, Duration::from_secs(60)).await;
+    wait_for_path(&m.b, &m.a, true, Duration::from_mins(1)).await;
+    wait_for_path(&m.a, &m.b, true, Duration::from_mins(1)).await;
     let chat = b"a message for the room, from an Edge armed after run".to_vec();
     let (chat_row, chat_sha, chat_ptr) = author_body(&m, &chat, "chat body").await;
     let p = puller(&m);
@@ -1045,8 +1045,8 @@ async fn a_running_edge_armed_late_serves_and_pulls_the_room_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forwarded_room_body_rides_the_identity_plane_link_718() {
     let m = mesh("fwd", false).await;
-    wait_for_path(&m.b, &m.a, false, Duration::from_secs(60)).await;
-    wait_for_path(&m.a, &m.b, false, Duration::from_secs(60)).await;
+    wait_for_path(&m.b, &m.a, false, Duration::from_mins(1)).await;
+    wait_for_path(&m.a, &m.b, false, Duration::from_mins(1)).await;
     let derived = derived_addresses(&m);
 
     let chat = b"a message for the room, through the canonical".to_vec();
@@ -1106,8 +1106,8 @@ async fn forwarded_room_body_rides_the_identity_plane_link_718() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_direct_link_keeps_the_body_on_the_derived_address_718() {
     let m = mesh("direct", true).await;
-    wait_for_path(&m.b, &m.a, true, Duration::from_secs(60)).await;
-    wait_for_path(&m.a, &m.b, true, Duration::from_secs(60)).await;
+    wait_for_path(&m.b, &m.a, true, Duration::from_mins(1)).await;
+    wait_for_path(&m.a, &m.b, true, Duration::from_mins(1)).await;
     let derived = derived_addresses(&m);
 
     let file = attachment();
@@ -1156,8 +1156,8 @@ async fn a_direct_link_keeps_the_body_on_the_derived_address_718() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_forged_discriminator_is_refused_by_name_718() {
     let m = mesh("forge", false).await;
-    wait_for_path(&m.b, &m.a, false, Duration::from_secs(60)).await;
-    wait_for_path(&m.a, &m.b, false, Duration::from_secs(60)).await;
+    wait_for_path(&m.b, &m.a, false, Duration::from_mins(1)).await;
+    wait_for_path(&m.a, &m.b, false, Duration::from_mins(1)).await;
 
     let file = attachment();
     let (_row, sha, _ptr) = author_body(&m, &file, "attachment").await;
@@ -1192,7 +1192,7 @@ async fn a_forged_discriminator_is_refused_by_name_718() {
             .expect("the identity-plane send itself succeeds; the refusal is A's");
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
     loop {
         let refusals = m.a.edge.metrics().snapshot().blob_serve_refusals;
         let unheld = refusals
@@ -1276,7 +1276,7 @@ async fn a_split_home_arms_its_lifecycle_for_the_node_not_the_actor() {
                 group_id: ROOM.to_owned(),
             },
         }),
-        Some(Duration::from_secs(300)),
+        Some(Duration::from_mins(5)),
     )
     .expect("arm the split home");
     let life = edge.scope_lifecycle().expect("armed");

@@ -278,7 +278,7 @@ impl ReplicationCoordinator {
     /// only stops a signed answer being dropped for arriving after its round.
     /// On a canonical behind on its listings, Key answers reached a node after
     /// their exchanges had closed, and were dropped, for minutes on end.
-    pub const PULL_LATE_WINDOW: Duration = Duration::from_secs(120);
+    pub const PULL_LATE_WINDOW: Duration = Duration::from_mins(2);
 
     /// Exchanges past their wait kept listening per `(peer, kind)`; the oldest
     /// makes way. An asker's re-ask opens one about every 10 s, so this holds a

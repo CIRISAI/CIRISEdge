@@ -292,7 +292,7 @@ async fn a_silent_peer_gets_the_cadence_and_no_early_retries_968() {
 async fn a_peer_that_never_roots_costs_three_early_retries_then_the_cadence_968() {
     let c = run_node(
         Peer::NeverRoots,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_secs(400),
     )
     .await;

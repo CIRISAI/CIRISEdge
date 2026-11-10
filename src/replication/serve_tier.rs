@@ -257,7 +257,7 @@ impl CachedServeTier {
     /// A revoked conferral therefore bites within a minute on serving
     /// decisions; retention of already-held bodies is unaffected by design
     /// (dropping bodies on a tier downgrade would be data loss, not policy).
-    pub const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    pub const TTL: std::time::Duration = std::time::Duration::from_mins(1);
 
     #[must_use]
     pub fn new() -> Self {

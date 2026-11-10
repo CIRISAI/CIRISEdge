@@ -389,7 +389,7 @@ async fn side_cfg_auth(
         Arc::clone(&table),
         Arc::clone(&transport) as Arc<dyn ScopedDestinationSink>,
         key.key_id.clone(),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
     ));
     let events = transport.subscribe_direct_path_events();
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(256);
@@ -560,7 +560,7 @@ async fn trio_shaped(
     // Each asks for the other: T's announce rate limit stops relaying a node
     // after its grace (about 30 s at 5 s), so a node that starts later on a
     // loaded box would wait for an announce that is not coming.
-    let known = wait_until(Duration::from_secs(60), || async {
+    let known = wait_until(Duration::from_mins(1), || async {
         a.transport.seek_peer(&b.key.key_id).await && b.transport.seek_peer(&a.key.key_id).await
     })
     .await;
@@ -2196,7 +2196,7 @@ async fn one_occurrence_key_id_keys_a_hop_under_use_node_identity() {
         "R's pair resolves under its node id"
     );
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             a.transport.seek_peer(&r_id).await && r.transport.seek_peer(&a_id).await
         })
         .await,
@@ -2962,7 +2962,7 @@ async fn one_side_moves_the_other_sends(
         "the side behind moves once the COMPLETE lands, a frame in flight or not: {up:?}"
     );
     assert!(behind.transport.direct_link_interface(link).is_some());
-    let (sent, took) = tokio::time::timeout(Duration::from_secs(60), in_flight)
+    let (sent, took) = tokio::time::timeout(Duration::from_mins(1), in_flight)
         .await
         .expect("the send ends")
         .expect("the send task");
@@ -3158,7 +3158,7 @@ async fn a_wedged_punched_link_with_no_call_is_still_reaped() {
         p.b.transport.direct_link_interface(link_id).is_some(),
         "a transfer inside its stall window holds the link"
     );
-    let reaped = wait_until(Duration::from_secs(60), || async {
+    let reaped = wait_until(Duration::from_mins(1), || async {
         p.b.transport.reap_idle_inbound_links().await;
         p.b.transport.direct_link_interface(link_id).is_none()
     })

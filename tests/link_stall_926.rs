@@ -182,7 +182,7 @@ async fn pair(tag: &str) -> Pair {
     b.send(&key_a.key_id, b"round-open-926")
         .await
         .expect("B -> A");
-    tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
+    tokio::time::timeout(Duration::from_mins(1), rx_a.recv())
         .await
         .expect("A receives B within 60s")
         .expect("A channel open");
@@ -233,7 +233,7 @@ fn payload(len: usize, salt: u8) -> Vec<u8> {
 }
 
 async fn expect_frame(rx: &mut mpsc::Receiver<InboundFrame>, want: &[u8], what: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let frame = tokio::time::timeout(left, rx.recv())
