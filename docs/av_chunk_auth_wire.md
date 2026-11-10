@@ -441,9 +441,10 @@ sealed chunk is ever split (5.3.3.2.3).
   being sent (a standby's base-only, its own cap, `request_layers`, SVC). A
   receiver counts a gap as lost frames of that (class, layer)
   (`Call::frames_lost_by_layer`) only when both ends of the gap arrived in
-  one receive view (the call bumps the view on its own layer request and on
-  a parent's shed or decision); the first frame of a layer starts its
-  count. A base-layer `(0,0,0)` gap means freeze until the next keyframe. Audio
+  one receive view of that stream (the call bumps a stream's view only on
+  its own layer request for it and on a parent's shed or decision on it, so
+  a loss on a layer it is steadily getting is always counted); the first
+  frame of a layer starts its count. A base-layer `(0,0,0)` gap means freeze until the next keyframe. Audio
   (`0xFF`) chunks never carry it. A receiver picks the layout from the
   signed `codec_id` (verified with the trailer before the inner seal opens),
   never from length. Edge frames a stream whose codec map names a non-`0xFF`

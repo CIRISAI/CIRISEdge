@@ -1366,6 +1366,31 @@ fn video(tag: u64, len: usize) -> Frame {
     }
 }
 
+/// How long a stream's receive view must stay unchanged to count as
+/// settled: two offer rounds.
+const VIEW_SETTLE_WINDOW: Duration = Duration::from_secs(2);
+
+/// Wait until `stream`'s receive view at `call` holds still for
+/// [`VIEW_SETTLE_WINDOW`] (its selector and admission settled: no Decision
+/// or Shed on it); returns the view.
+async fn wait_view_settled(
+    call: &Call,
+    stream: ciris_edge::transport::realtime_av::StreamId,
+) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let v = call.layer_view(stream);
+        tokio::time::sleep(VIEW_SETTLE_WINDOW).await;
+        if call.layer_view(stream) == v {
+            return v;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stream's view never settled"
+        );
+    }
+}
+
 /// **Framed video, unmarked audio** (v45, CC reading rc18): B joins with
 /// `{h264, opus}`, so its binding signs `framing = 1`. It publishes a 30 KB
 /// keyframe, then 3 KB P-frames at 30 Hz with Opus frames between them. The
@@ -1465,7 +1490,11 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     );
     assert!(ca.frames_lost_by_layer().is_empty(), "nothing lost yet");
 
-    // Loss: every 7th chunk to A withheld.
+    // Loss: every 7th chunk to A withheld, once B's stream is settled at A
+    // (no Decision or Shed on it for a window), so every lost base frame is
+    // on a layer A is steadily getting.
+    let b_stream = cb.stream();
+    let view = wait_view_settled(&ca, b_stream).await;
     cb.withhold_from_for_test(&a.key.key_id, 7);
     let mut lossy = Vec::new();
     for n in 100..130u64 {
@@ -1491,16 +1520,17 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     .await;
     let dropped = av(&a.metrics, "av_frame_incomplete");
     let lost = ca.frames_lost_by_layer();
-    let base = lost
-        .get(&(CODEC_TEMPORAL_LAYERED, (0, 0, 0)))
-        .copied()
-        .unwrap_or(0);
-    // Each dropped base frame is a frame_seq gap on layer (0,0,0); a gap
-    // that straddles a receive-view change (a parent's decision) is not
-    // booked, so the count is at most the drops, and some are.
-    assert!(
-        base > 0 && base <= dropped,
-        "dropped base frames show as frame_seq gaps: {lost:?}, dropped {dropped}"
+    assert_eq!(
+        ca.layer_view(b_stream),
+        view,
+        "no Decision or Shed on B's stream during the lossy phase"
+    );
+    assert_eq!(
+        lost.get(&(CODEC_TEMPORAL_LAYERED, (0, 0, 0)))
+            .copied()
+            .unwrap_or(0),
+        dropped,
+        "each dropped base frame is exactly one frame_seq gap on (0,0,0): {lost:?}"
     );
     assert!(
         lost.keys().all(|(class, _)| *class != CODEC_OPAQUE),

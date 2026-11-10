@@ -564,13 +564,13 @@ fn layers_a_receiver_is_not_sent_are_no_loss_and_a_lost_base_frame_is() {
     }
     assert!(rs.lost_by_layer().is_empty(), "base-only: no false loss");
     // Layer 1 admitted (view 1): its frames 10, 11 (it was not sent 0..9).
-    rs.set_view(1);
+    rs.set_view(S, 1);
     for k in [10, 11] {
         let f = video_frame(&mut seq, 1, L1, k);
         push_all(&mut rs, f);
     }
     // Capped again (view 2), then lifted (view 3): layer-1 frame 20 next.
-    rs.set_view(3);
+    rs.set_view(S, 3);
     let f = video_frame(&mut seq, 1, L1, 20);
     push_all(&mut rs, f);
     assert!(
@@ -639,4 +639,22 @@ fn a_reassembled_frame_carries_its_first_fragments_seq_and_source_ts() {
     assert_eq!(f.chunk_seq, ChunkSeq(100));
     assert_eq!(f.source_ts_ms, 1_790_000_000_000);
     assert_eq!(f.frame_seq, Some(7));
+}
+
+/// A view change on ANOTHER stream hides nothing here: a base frame lost on
+/// a stream this node is steadily getting is counted whatever happens to
+/// other streams' views.
+#[test]
+fn another_streams_view_change_hides_no_loss() {
+    let mut rs = Reassemblers::default();
+    let mut seq = 0;
+    let f = video_frame(&mut seq, 1, L0, 0);
+    push_all(&mut rs, f);
+    rs.set_view(StreamId([99; 32]), 7);
+    let f = video_frame(&mut seq, 1, L0, 2);
+    push_all(&mut rs, f);
+    assert_eq!(
+        rs.lost_by_layer(),
+        [((CODEC_AV1_SVC, (0, 0, 0)), 1)].into_iter().collect()
+    );
 }

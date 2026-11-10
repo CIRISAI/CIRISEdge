@@ -1676,10 +1676,12 @@ struct Shared {
     /// v45 — frames lost per codec class at this receiver (gaps in
     /// `frame_seq`), as the reorder loop's reassembly last counted them.
     frames_lost: Arc<StdMutex<BTreeMap<(u8, (u8, u8, u8)), u64>>>,
-    /// v45 — the receive view: bumped whenever what this node is sent may
-    /// change (its own layer request, a parent's shed or decision), so a
-    /// layer it was not being sent for a while is never booked as lost.
-    layer_view: AtomicU64,
+    /// v45 — each stream's receive view: bumped only when what this node is
+    /// sent of THAT stream may change (its own request_layers for it, a C3
+    /// Shed or Decision on it), so a layer it was not being sent for a while
+    /// is never booked as lost, and a loss on a layer it was steadily
+    /// getting always is.
+    layer_views: StdMutex<HashMap<StreamId, u64>>,
     /// v45 — the camera (primary) stream ended while a share went on
     /// (`Call::end_stream_as`): it takes no more frames, and its bindings
     /// are no longer announced.
@@ -2143,7 +2145,7 @@ impl Call {
             pending_replace: StdMutex::new(None),
             frame_seqs: StdMutex::new(HashMap::new()),
             frames_lost: Arc::new(StdMutex::new(BTreeMap::new())),
-            layer_view: AtomicU64::new(0),
+            layer_views: StdMutex::new(HashMap::new()),
             primary_ended: AtomicBool::new(false),
             shares: Mutex::new(BTreeMap::new()),
             registrar: share_registrar,
@@ -2403,7 +2405,7 @@ impl Call {
     /// audio-only cap (it would go below the base cell, CC 5.3.3.2.4).
     /// Returns whether a SUBSCRIBE went out now.
     pub async fn request_layers(&self, stream: StreamId, cap: Option<ReceiverLayerPolicy>) -> bool {
-        self.shared.layer_view.fetch_add(1, Ordering::AcqRel);
+        bump_layer_view(&self.shared, stream);
         let out = Shared::lock(&self.shared.alm).request_layers(stream, cap);
         let sent = !out.is_empty();
         send_alm(&self.shared, out).await;
@@ -2648,6 +2650,15 @@ impl Call {
     #[must_use]
     pub fn state(&self) -> CallState {
         Shared::lock(&self.shared.state).clone()
+    }
+
+    /// v45 — `stream`'s receive view: how many times what this node is sent
+    /// of it may have changed (its own layer requests, parents' sheds and
+    /// decisions on it). Steady while the stream's selector and admission
+    /// are settled.
+    #[must_use]
+    pub fn layer_view(&self, stream: StreamId) -> u64 {
+        layer_view_of(&self.shared, stream)
     }
 
     /// v45 (Eric 2026-11-10) — frames this node never handed out, per (codec
@@ -4177,14 +4188,15 @@ async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: b
                 )
             }
             Ok(WireFrame::Control(cf)) => {
-                // What this node is sent may change: a new receive view, so a
-                // layer it stops (or starts) being sent is never a loss.
+                // What this node is sent of that stream may change: a new
+                // receive view for it, so a layer it stops (or starts) being
+                // sent is never a loss.
                 if matches!(
                     cf.msg,
                     crate::transport::realtime_av_alm::controller::ControlMsg::Shed { .. }
                         | crate::transport::realtime_av_alm::controller::ControlMsg::Decision(_)
                 ) {
-                    shared.layer_view.fetch_add(1, Ordering::AcqRel);
+                    bump_layer_view(shared, cf.stream);
                 }
                 (a.on_control(peer, cf, rtt), None, false, false, false)
             }
@@ -4764,6 +4776,19 @@ async fn forward(
     }
 }
 
+/// v45 — what this node is sent of `stream` may change: a new receive view.
+fn bump_layer_view(shared: &Shared, stream: StreamId) {
+    *Shared::lock(&shared.layer_views).entry(stream).or_insert(0) += 1;
+}
+
+/// v45 — `stream`'s receive view now.
+fn layer_view_of(shared: &Shared, stream: StreamId) -> u64 {
+    Shared::lock(&shared.layer_views)
+        .get(&stream)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// v45 — how long a released chunk waits for its stream's v2 binding (its
 /// framing) before it is dropped: the longest reorder window.
 pub const FRAMING_HOLD: Duration = REORDER_WINDOW_MAX;
@@ -4855,8 +4880,8 @@ async fn reorder_loop(
             dropped += 1;
             shared.count(frame::FrameRefusal::FramingUnknown.token());
         }
-        frames_of.set_view(shared.layer_view.load(Ordering::Acquire));
         for (f, framing) in ready {
+            frames_of.set_view(f.stream, layer_view_of(&shared, f.stream));
             let out = frames_of.push(f, framing);
             for r in out.refused {
                 dropped += 1;

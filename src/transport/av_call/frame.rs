@@ -346,11 +346,12 @@ pub struct Reassemblers {
     /// `frame_seq` (Eric 2026-11-10). A base-layer gap is the one that means
     /// "freeze until the next keyframe".
     lost: std::collections::BTreeMap<(u8, (u8, u8, u8)), u64>,
-    /// The receive view: bumped by the call whenever what this node is sent
-    /// may change (its own layer request, a parent's shed or decision). A
-    /// gap is counted only between two frames of one view: a layer this node
-    /// was not being sent for a while is no loss.
-    view: u64,
+    /// Each stream's receive view: bumped by the call whenever what this
+    /// node is sent OF THAT STREAM may change (its own layer request for it,
+    /// a parent's shed or decision on it). A gap is counted only between two
+    /// frames of one view: a layer this node was not being sent for a while
+    /// is no loss, and a loss on a layer it was steadily getting always is.
+    views: std::collections::HashMap<StreamId, u64>,
 }
 
 /// The most (stream, layer) slots one stream holds at once: past it, the
@@ -416,9 +417,9 @@ impl Reassemblers {
         out
     }
 
-    /// The call's receive view now (see the field).
-    pub fn set_view(&mut self, view: u64) {
-        self.view = view;
+    /// `stream`'s receive view now (see the field).
+    pub fn set_view(&mut self, stream: StreamId, view: u64) {
+        self.views.insert(stream, view);
     }
 
     /// A frame handed out: a gap since its (stream, class, layer)'s last one
@@ -432,7 +433,7 @@ impl Reassemblers {
             return;
         };
         let key = (f.stream, f.codec_id, f.layer);
-        let view = self.view;
+        let view = self.views.get(&f.stream).copied().unwrap_or(0);
         match self.last_frame.get(&key).copied() {
             Some((last, v)) => {
                 let d = k.wrapping_sub(last);
@@ -526,6 +527,7 @@ impl Reassemblers {
     /// dropped incomplete.
     pub fn forget(&mut self, stream: StreamId) -> Vec<FrameRefusal> {
         self.last_frame.retain(|(s, _, _), _| *s != stream);
+        self.views.remove(&stream);
         let keys: Vec<(StreamId, ChunkLayer)> = self
             .slots
             .keys()
