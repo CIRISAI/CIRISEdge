@@ -123,10 +123,35 @@ fn permits(m: &crate::observability::EdgeMetrics) -> u64 {
         .count
 }
 
+/// The seat's store. In memory by default; on disk, in a fresh temporary
+/// directory, when `CIRIS_EDGE_IDLE_COST_DISK=1`, so a `--release` run prices
+/// the per-page and per-hash terms against a file as production does. The
+/// directory lives as long as the returned guard.
+async fn idle_store() -> (Arc<SqliteBackend>, Option<tempfile::TempDir>) {
+    use ciris_persist::store::backend::Backend as _;
+    if std::env::var("CIRIS_EDGE_IDLE_COST_DISK").is_ok_and(|v| v == "1") {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("seat-971.db");
+        let backend = ciris_persist::prelude::FederationDirectorySqlite::open(
+            path.to_str().expect("utf-8 path"),
+        )
+        .await
+        .expect("open the on-disk store");
+        backend.run_migrations().await.expect("migrate");
+        eprintln!("971 idle store: on disk at {}", path.display());
+        (backend, Some(dir))
+    } else {
+        (
+            Arc::new(ciris_persist::store::test_backend::test_backend()),
+            None,
+        )
+    }
+}
+
 /// One idle round per bootstrap plane against a seat whose store holds `n`
 /// attestation rows. Returns `(kind, index_pages, permits, wall)` per plane.
 async fn idle_rounds_at(n: usize) -> Vec<(EnvelopeKind, usize, u64, Duration)> {
-    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
+    let (backend, _disk) = idle_store().await;
     register_fixture_keys(
         &backend,
         &[(SEAT, identity_type::NODE), (DEVICE, identity_type::NODE)],
