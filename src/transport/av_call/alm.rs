@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 use crate::load_ladder::ServiceTier;
 use crate::transport::realtime_av::StreamId;
 use crate::transport::realtime_av_alm::controller::wire::{
-    self, encode, encode_caps, CAPS_THIS_BUILD, CAP_C3_V1, CAP_LINK_DATAGRAMS, CAP_RELAY,
-    CAP_TIMED_FRAMES,
+    self, encode, encode_caps, CAPS_THIS_BUILD, CAP_C3_V1, CAP_LAYER_REQUEST, CAP_LINK_DATAGRAMS,
+    CAP_RELAY, CAP_TIMED_FRAMES,
 };
 use crate::transport::realtime_av_alm::controller::{
     Admission, AdmitDecision, ChunkPos, ControlFrame, ControlMsg, ControllerConfig, DecisionKind,
@@ -185,6 +185,10 @@ pub(super) struct AlmState {
     /// Test seam — bits this node leaves out of its own `CAPS` (an older
     /// build's, say). 0 in production.
     caps_withheld: u32,
+    /// 45.1 — whether this node takes part in SUBSCRIBE layer caps
+    /// (advertises `CAP_LAYER_REQUEST`, applies a child's cap, sends its
+    /// own). The host's lever; off by default until CC's 5.3.3.2.4 correction.
+    layer_requests: bool,
     provisional: BTreeMap<String, u64>,
     told_publisher: BTreeSet<StreamId>,
     draining_parent: BTreeMap<StreamId, String>,
@@ -210,6 +214,12 @@ pub(super) struct AlmState {
     /// The newest room epoch seen on each stream.
     epochs: BTreeMap<StreamId, u64>,
     video_unavailable: BTreeSet<StreamId>,
+    /// 45.1 — the layer cap each child's SUBSCRIBE asked this node, as its
+    /// parent, for: `(stream, child)`. Absent: everything.
+    layer_caps: BTreeMap<(StreamId, String), crate::transport::realtime_av::ReceiverLayerPolicy>,
+    /// 45.1 — the cap this node asks its parents for, per stream: carried on
+    /// every SUBSCRIBE it sends a parent that takes one.
+    wanted_layers: BTreeMap<StreamId, crate::transport::realtime_av::ReceiverLayerPolicy>,
     pub(super) events: Vec<super::CallEvent>,
 }
 
@@ -245,6 +255,7 @@ impl AlmState {
             bound_publisher: BTreeMap::new(),
             caps: BTreeMap::new(),
             caps_withheld: 0,
+            layer_requests: false,
             provisional: BTreeMap::new(),
             told_publisher: BTreeSet::new(),
             draining_parent: BTreeMap::new(),
@@ -264,6 +275,8 @@ impl AlmState {
             booked: BTreeMap::new(),
             epochs: BTreeMap::new(),
             video_unavailable: BTreeSet::new(),
+            layer_caps: BTreeMap::new(),
+            wanted_layers: BTreeMap::new(),
             events: Vec::new(),
         }
     }
@@ -275,12 +288,23 @@ impl AlmState {
 
     /// This node's capability bits.
     pub(super) fn caps_bits(&self) -> u32 {
-        (CAPS_THIS_BUILD | if self.relay_capable { CAP_RELAY } else { 0 }) & !self.caps_withheld
+        let layers = if self.layer_requests {
+            CAP_LAYER_REQUEST
+        } else {
+            0
+        };
+        (CAPS_THIS_BUILD | layers | if self.relay_capable { CAP_RELAY } else { 0 })
+            & !self.caps_withheld
     }
 
     /// Test seam — leave `bits` out of this node's `CAPS`.
     pub(super) fn withhold_caps(&mut self, bits: u32) {
         self.caps_withheld = bits;
+    }
+
+    /// 45.1 — the host's layer-cap lever (off by default).
+    pub(super) fn set_layer_requests(&mut self, on: bool) {
+        self.layer_requests = on;
     }
 
     /// This node's `CAPS` frame. `offer_datagrams` false (the host's
@@ -423,6 +447,7 @@ impl AlmState {
     /// This node's leg to `peer` is gone: it can no longer send it anything,
     /// so `peer` holds no commitment here.
     pub(super) fn on_child_link_down(&mut self, peer: &str) {
+        self.layer_caps.retain(|(_, c), _| c != peer);
         let p = peer.to_owned();
         self.own.release(&p);
         for a in self.relays.values_mut() {
@@ -699,23 +724,34 @@ impl AlmState {
             .sum::<u64>()
     }
 
+    /// The SUBSCRIBE this node sends `parent` for `stream` in `role`: with
+    /// this node's layer cap for the stream when the parent takes one.
+    fn subscribe_frame(&self, stream: StreamId, parent: &str, role: Role) -> Vec<u8> {
+        let layers = if self.takes_layer_requests(parent) {
+            self.wanted_layers.get(&stream).copied()
+        } else {
+            None
+        };
+        encode(
+            stream,
+            &ControlMsg::Subscribe(SubscribeRequest {
+                subscriber: self.me.clone(),
+                role,
+                forward_capable: self.relay_capable,
+                layers,
+            }),
+        )
+    }
+
     fn action_frames(
         &mut self,
         stream: StreamId,
         acts: Vec<SelectorAction<String>>,
     ) -> Vec<Outgoing> {
-        let fc = self.relay_capable;
         acts.into_iter()
             .map(|a| match a {
                 SelectorAction::Subscribe { parent, role } => Outgoing {
-                    frame: encode(
-                        stream,
-                        &ControlMsg::Subscribe(SubscribeRequest {
-                            subscriber: self.me.clone(),
-                            role,
-                            forward_capable: fc,
-                        }),
-                    ),
+                    frame: self.subscribe_frame(stream, &parent, role),
                     to: parent,
                 },
                 SelectorAction::Unsubscribe { parent } => Outgoing {
@@ -781,6 +817,23 @@ impl AlmState {
                         Vec::new(),
                     )
                 };
+                // 45.1 — an admitted SUBSCRIBE carries the child's layer cap
+                // (or, without one, withdraws it), for a stream this node
+                // parents.
+                if matches!(decision, AdmitDecision::Admit { .. })
+                    && self.layer_requests
+                    && (stream == self.own_stream || self.relays.contains_key(&stream))
+                {
+                    let key = (stream, peer.to_owned());
+                    match req.layers {
+                        Some(cap) => {
+                            self.layer_caps.insert(key, cap);
+                        }
+                        None => {
+                            self.layer_caps.remove(&key);
+                        }
+                    }
+                }
                 match &decision {
                     AdmitDecision::Admit { .. } => {
                         self.counts.admitted += 1;
@@ -811,6 +864,7 @@ impl AlmState {
                 }
             }
             ControlMsg::Unsubscribe { .. } => {
+                self.layer_caps.remove(&(stream, peer.to_owned()));
                 let p = peer.to_owned();
                 if stream == self.own_stream {
                     self.provisional.remove(peer);
@@ -864,6 +918,76 @@ impl AlmState {
             }
         }
         out
+    }
+
+    /// 45.1 — of `legs`, the children whose SUBSCRIBE layer cap for `stream`
+    /// does not admit a chunk of `codec_id` at `layer`: this node sends them
+    /// nothing of it. Every other child is untouched.
+    pub(super) fn layer_exclude(
+        &self,
+        stream: StreamId,
+        legs: &[String],
+        codec_id: u8,
+        layer: crate::transport::realtime_av::ChunkLayer,
+    ) -> Vec<String> {
+        if self.layer_caps.is_empty() {
+            return Vec::new();
+        }
+        legs.iter()
+            .filter(|l| {
+                self.layer_caps
+                    .get(&(stream, (*l).clone()))
+                    .is_some_and(|cap| {
+                        !crate::transport::realtime_av_alm::controller::layer_cap_admits(
+                            *cap, codec_id, layer,
+                        )
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// This node's own stream.
+    pub(super) fn own_stream(&self) -> StreamId {
+        self.own_stream
+    }
+
+    /// 45.1 — ask this node's parents for `stream` for at most `cap` (`None`:
+    /// everything). Kept, and carried on every SUBSCRIBE this node sends a
+    /// parent that takes a cap; the current primary gets a re-SUBSCRIBE now
+    /// (CC 5.3.3.4: the ask rides the tree), when it takes one.
+    pub(super) fn request_layers(
+        &mut self,
+        stream: StreamId,
+        cap: Option<crate::transport::realtime_av::ReceiverLayerPolicy>,
+    ) -> Vec<Outgoing> {
+        match cap {
+            Some(c) => {
+                self.wanted_layers.insert(stream, c);
+            }
+            None => {
+                self.wanted_layers.remove(&stream);
+            }
+        }
+        let parent = self.sels.get(&stream).and_then(|s| s.primary().cloned());
+        parent
+            .filter(|p| self.takes_layer_requests(p))
+            .map(|p| Outgoing {
+                frame: self.subscribe_frame(stream, &p, Role::Primary),
+                to: p,
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Whether `peer` said it takes a SUBSCRIBE layer cap (and this node's
+    /// lever is on).
+    pub(super) fn takes_layer_requests(&self, peer: &str) -> bool {
+        self.layer_requests
+            && self
+                .caps
+                .get(peer)
+                .is_some_and(|c| c & CAP_LAYER_REQUEST != 0)
     }
 
     /// Scale an admission's headroom (measured bits/s of the stream it
@@ -1135,6 +1259,7 @@ impl AlmState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::realtime_av::ReceiverLayerPolicy;
     use crate::transport::realtime_av_alm::controller::wire::{decode, WireFrame};
     use crate::transport::realtime_av_alm::controller::PeerState;
 
@@ -1241,6 +1366,7 @@ mod tests {
                 subscriber: "b".into(),
                 role: Role::Primary,
                 forward_capable: false,
+                layers: None,
             }),
         };
         let out = a.on_control("b", f, 10.0);
@@ -1280,6 +1406,7 @@ mod tests {
                     subscriber: p.into(),
                     role: Role::Standby,
                     forward_capable: false,
+                    layers: None,
                 },
                 &mut rng,
                 &mut log,
@@ -2022,6 +2149,208 @@ mod tests {
         let log = m.nodes[B].log_tail();
         assert!(m.nodes[B].log_count(DecisionKind::Switch) > 0, "{log}");
         assert!(m.b_parents().parent_changes > 0, "{log}");
+    }
+
+    /// A SUBSCRIBE for `stream` in `role` to `to`, carrying `cap`.
+    fn subscribe_with(
+        stream: StreamId,
+        to: &str,
+        role: Role,
+        cap: Option<ReceiverLayerPolicy>,
+    ) -> Outgoing {
+        Outgoing {
+            to: to.to_owned(),
+            frame: encode(
+                stream,
+                &ControlMsg::Subscribe(SubscribeRequest {
+                    subscriber: String::new(),
+                    role,
+                    forward_capable: false,
+                    layers: cap,
+                }),
+            ),
+        }
+    }
+
+    /// 45.1 — a receiver's layer cap rides its SUBSCRIBE to its parent and
+    /// caps what the parent sends that child alone: A (the publisher) drops
+    /// B's copies above (0, 0, 0) and sends C everything; a relay (C)
+    /// applies a cap for a stream it forwards the same way; audio passes
+    /// every cap; a node that does not parent the stream keeps nothing; and a
+    /// re-SUBSCRIBE without a cap withdraws it.
+    #[test]
+    fn a_subscribe_layer_cap_caps_that_child_alone() {
+        use crate::transport::realtime_av::{ChunkLayer, CODEC_AV1_SVC, CODEC_OPAQUE};
+        let mut m = settled(1);
+        let sa = m.sa;
+        // The host turned the lever on everywhere (off by default).
+        for (i, n) in m.nodes.iter_mut().enumerate() {
+            n.set_layer_requests(true);
+            for (j, peer) in NAMES.iter().enumerate() {
+                if i != j {
+                    let c = n.caps[*peer] | CAP_LAYER_REQUEST;
+                    n.caps.insert((*peer).to_owned(), c);
+                }
+            }
+        }
+        let base = ChunkLayer::BASE;
+        let upper = ChunkLayer {
+            spatial: 1,
+            temporal: 0,
+            quality: 0,
+        };
+        let kids = vec!["b".to_owned(), "c".to_owned()];
+        assert!(
+            m.nodes[A]
+                .layer_exclude(sa, &kids, CODEC_AV1_SVC, upper)
+                .is_empty(),
+            "the premise: nobody asked"
+        );
+        // B asks its parent (A) for the base layer only: a re-SUBSCRIBE.
+        let out = m.nodes[B].request_layers(sa, Some(ReceiverLayerPolicy::BLINKING_DOT));
+        assert_eq!(
+            out.iter().map(|o| o.to.as_str()).collect::<Vec<_>>(),
+            ["a"],
+            "one hop, to the primary"
+        );
+        assert!(
+            matches!(
+                decode(&out[0].frame, "b"),
+                Ok(WireFrame::Control(ControlFrame {
+                    msg: ControlMsg::Subscribe(SubscribeRequest {
+                        role: Role::Primary,
+                        layers: Some(ReceiverLayerPolicy::BLINKING_DOT),
+                        ..
+                    }),
+                    ..
+                }))
+            ),
+            "the cap rides the tree's own SUBSCRIBE"
+        );
+        m.route(out.into_iter().map(|o| (B, o)).collect());
+        assert_eq!(m.b_parents().primary.as_deref(), Some("a"), "B stays on A");
+        let a = &m.nodes[A];
+        assert_eq!(a.layer_exclude(sa, &kids, CODEC_AV1_SVC, upper), ["b"]);
+        assert!(a.layer_exclude(sa, &kids, CODEC_AV1_SVC, base).is_empty());
+        assert!(
+            a.layer_exclude(sa, &kids, CODEC_OPAQUE, base).is_empty(),
+            "audio passes"
+        );
+        // A relay applies it for a stream it forwards (B's standby there:
+        // the re-SUBSCRIBE keeps B's role).
+        assert!(
+            m.nodes[C].relays.contains_key(&sa),
+            "the premise: C forwards A"
+        );
+        let cap = ReceiverLayerPolicy {
+            max_spatial: 0,
+            max_temporal: 1,
+            max_quality: 0,
+        };
+        let _ = deliver(
+            &mut m.nodes[C],
+            "b",
+            &[subscribe_with(sa, "c", Role::Standby, Some(cap))],
+        );
+        let legs = vec!["a".to_owned(), "b".to_owned()];
+        let t2 = ChunkLayer {
+            spatial: 0,
+            temporal: 2,
+            quality: 0,
+        };
+        assert_eq!(
+            m.nodes[C].layer_exclude(sa, &legs, CODEC_AV1_SVC, t2),
+            ["b"]
+        );
+        assert!(m.nodes[C]
+            .layer_exclude(sa, &legs, CODEC_AV1_SVC, base)
+            .is_empty());
+        // Not a parent of the stream: kept nowhere.
+        let other = s(9);
+        let _ = deliver(
+            &mut m.nodes[A],
+            "b",
+            &[subscribe_with(other, "a", Role::Primary, Some(cap))],
+        );
+        assert!(m.nodes[A]
+            .layer_exclude(other, &kids, CODEC_AV1_SVC, t2)
+            .is_empty());
+        // Withdrawn: everything again.
+        let out = m.nodes[B].request_layers(sa, None);
+        m.route(out.into_iter().map(|o| (B, o)).collect());
+        assert!(m.nodes[A]
+            .layer_exclude(sa, &kids, CODEC_AV1_SVC, upper)
+            .is_empty());
+    }
+
+    /// 45.1 — off by default: no node advertises the bit, puts a cap on a
+    /// SUBSCRIBE or applies one. On, a parent whose `CAPS` lack the bit never
+    /// gets a cap; the cap waits, and rides the next SUBSCRIBE to a parent
+    /// that takes it.
+    #[test]
+    fn a_layer_cap_waits_for_a_parent_that_takes_it() {
+        use crate::transport::realtime_av::{ChunkLayer, CODEC_AV1_SVC};
+        let mut m = settled(1);
+        let sa = m.sa;
+        assert_eq!(
+            m.nodes[A].caps_bits() & CAP_LAYER_REQUEST,
+            0,
+            "off by default"
+        );
+        let cap = ReceiverLayerPolicy::BLINKING_DOT;
+        assert!(
+            m.nodes[B].request_layers(sa, Some(cap)).is_empty(),
+            "the lever is off"
+        );
+        let _ = deliver(
+            &mut m.nodes[A],
+            "b",
+            &[subscribe_with(sa, "a", Role::Primary, Some(cap))],
+        );
+        let b = vec!["b".to_owned()];
+        let upper = ChunkLayer {
+            spatial: 1,
+            temporal: 0,
+            quality: 0,
+        };
+        assert!(
+            m.nodes[A]
+                .layer_exclude(sa, &b, CODEC_AV1_SVC, upper)
+                .is_empty(),
+            "an off node applies nothing"
+        );
+        m.nodes[B].set_layer_requests(true);
+        m.nodes[B]
+            .caps
+            .insert("a".into(), CAP_C3_V1 | CAP_TIMED_FRAMES);
+        assert!(
+            m.nodes[B].request_layers(sa, Some(cap)).is_empty(),
+            "A did not say it takes them"
+        );
+        assert_eq!(m.nodes[B].wanted_layers.get(&sa), Some(&cap), "kept");
+        // A parent that takes it gets it on the next SUBSCRIBE.
+        m.nodes[B]
+            .caps
+            .insert("c".into(), CAPS_THIS_BUILD | CAP_LAYER_REQUEST);
+        let f = m.nodes[B].subscribe_frame(sa, "c", Role::Standby);
+        assert!(matches!(
+            decode(&f, "b"),
+            Ok(WireFrame::Control(ControlFrame {
+                msg: ControlMsg::Subscribe(SubscribeRequest {
+                    layers: Some(_),
+                    ..
+                }),
+                ..
+            }))
+        ));
+        let f = m.nodes[B].subscribe_frame(sa, "a", Role::Primary);
+        assert!(matches!(
+            decode(&f, "b"),
+            Ok(WireFrame::Control(ControlFrame {
+                msg: ControlMsg::Subscribe(SubscribeRequest { layers: None, .. }),
+                ..
+            }))
+        ));
     }
 
     /// The relay-on N=4 room of the server's av_mesh runs, on the production

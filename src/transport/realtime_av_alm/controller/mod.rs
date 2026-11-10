@@ -393,6 +393,11 @@ pub struct SubscribeRequest<P> {
     /// Whether the requester can itself forward (it may use the forwarder
     /// reserve).
     pub forward_capable: bool,
+    /// 45.1 — the most of this stream the requester takes from this parent
+    /// (CC 5.3.3.4: a relay forwards only the layers asked for, on the tree):
+    /// `None` is everything. Carried only to a parent whose `CAPS` carry
+    /// [`wire::CAP_LAYER_REQUEST`]; a re-SUBSCRIBE changes or withdraws it.
+    pub layers: Option<crate::transport::realtime_av::ReceiverLayerPolicy>,
 }
 
 /// Why an admission refused.
@@ -542,6 +547,18 @@ impl ShedReason {
             _ => None,
         }
     }
+}
+
+/// Whether a chunk of `codec_id` at `layer` passes a child's layer cap
+/// (45.1, carried on its SUBSCRIBE): codec-opaque chunks pass every cap, and
+/// a layered chunk passes when every axis is within it.
+#[must_use]
+pub fn layer_cap_admits(
+    cap: crate::transport::realtime_av::ReceiverLayerPolicy,
+    codec_id: u8,
+    layer: crate::transport::realtime_av::ChunkLayer,
+) -> bool {
+    codec_id == crate::transport::realtime_av::CODEC_OPAQUE || cap.admits(layer)
 }
 
 /// The control vocabulary C3 will frame. One frame = one stream + one

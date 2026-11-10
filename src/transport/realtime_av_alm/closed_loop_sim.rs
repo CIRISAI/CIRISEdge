@@ -782,6 +782,7 @@ impl Sim {
                         subscriber: n,
                         role,
                         forward_capable: fc,
+                        layers: None,
                     }),
                 ),
                 SelectorAction::Unsubscribe { parent } => {

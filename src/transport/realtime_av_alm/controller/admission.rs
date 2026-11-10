@@ -935,6 +935,7 @@ mod tests {
             subscriber: s,
             role,
             forward_capable: false,
+            layers: None,
         }
     }
 
@@ -1430,6 +1431,7 @@ mod tests {
             subscriber: 9,
             role: Role::Primary,
             forward_capable: true,
+            layers: None,
         };
         assert!(matches!(
             a.request(1, &fwd, &mut rng, &mut log),
@@ -1442,6 +1444,7 @@ mod tests {
             subscriber: 8,
             role: Role::Primary,
             forward_capable: true,
+            layers: None,
         };
         assert!(matches!(
             a.request(2, &fwd2, &mut rng, &mut log),
@@ -1470,6 +1473,7 @@ mod tests {
             subscriber: 7,
             role: Role::Primary,
             forward_capable: true,
+            layers: None,
         };
         assert!(matches!(
             a.request(0, &fwd, &mut rng, &mut log),

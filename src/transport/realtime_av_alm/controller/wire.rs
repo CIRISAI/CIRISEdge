@@ -10,7 +10,10 @@
 //! frame = "CALM" ‖ version(1) ‖ kind(1) ‖ body
 //!
 //! CAPS        0x01  caps u32_be
-//! SUBSCRIBE   0x02  stream[32] ‖ role u8 ‖ flags u8 (bit 0: forward-capable)
+//! SUBSCRIBE   0x02  stream[32] ‖ role u8 ‖ flags u8 (bit 0: forward-capable,
+//!                   bit 1: layer cap follows; bits 2-7 zero)
+//!                   [‖ mode u8 (1: at most) ‖ max_spatial u8 ‖ max_temporal u8
+//!                    ‖ max_quality u8]                     (45.1, the cap)
 //! UNSUBSCRIBE 0x03  stream[32]
 //! ADMIT       0x04  stream[32] ‖ role u8
 //! REFUSE      0x05  stream[32] ‖ reason u8 ‖ retry_after_ms u32_be
@@ -20,6 +23,19 @@
 //!                   ‖ upstream_latency_ms u32_be
 //!                   ‖ n u8 ‖ n × (len u16_be ‖ utf8 key id)   (ancestry, root first)
 //! ```
+//!
+//! **The SUBSCRIBE layer cap** (45.1; CC reads it as conformant in direction,
+//! a correction to 5.3.3.2.4's carriage sentence pending): a receiver asks
+//! its parent on the tree for at most `(spatial, temporal, quality)` of a
+//! stream (CC 5.3.3.4: a relay forwards only the layers asked for). Mode 1
+//! (the three maxima, a `ReceiverLayerPolicy`) is the only mode: mode 2 (audio
+//! only) would go below the base cell 5.3.3.2.4 makes the minimum and waits
+//! on the presence floor, so it, like every other mode, is malformed. A
+//! re-SUBSCRIBE changes the cap or (bit 1 clear) withdraws it. It is sent
+//! only to a peer whose `CAPS` carry [`CAP_LAYER_REQUEST`], which a node
+//! advertises only when its host turned the lever on (off by default until
+//! the CC correction lands); a peer without it never sees the extra bytes,
+//! which a pre-45.1 decoder would refuse as trailing.
 //!
 //! `role`: 0 primary, 1 standby. Reason codes: [`RefuseReason::code`],
 //! [`ShedReason::code`]. Who SENT a frame is never in it: the link names its
@@ -45,6 +61,7 @@
 //! ([`collides_with_control_frame`]), so a chunk is never taken for a frame.
 
 use super::{AdmitDecision, ControlMsg, Offer, RefuseReason, Role, ShedReason, SubscribeRequest};
+use crate::transport::realtime_av::ReceiverLayerPolicy;
 use crate::transport::realtime_av::StreamId;
 
 /// The tag every C3 frame opens with.
@@ -64,7 +81,14 @@ pub const CAP_RELAY: u32 = 1 << 2;
 /// edge routes `NodeEvent::LinkDatagramReceived` to the A/V receive path.
 pub const CAP_LINK_DATAGRAMS: u32 = 1 << 3;
 
-/// What this build advertises (relay added per call).
+/// It takes a layer cap on `SUBSCRIBE` (45.1) and applies it. OFF by
+/// default until CC's 5.3.3.2.4 correction lands: only a node whose host
+/// turned the lever on advertises it, and nobody sends a cap to a peer
+/// without it.
+pub const CAP_LAYER_REQUEST: u32 = 1 << 4;
+
+/// What this build advertises (relay added per call; `CAP_LAYER_REQUEST`
+/// only behind the host's lever).
 pub const CAPS_THIS_BUILD: u32 = CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_LINK_DATAGRAMS;
 
 const KIND_CAPS: u8 = 0x01;
@@ -74,6 +98,13 @@ const KIND_ADMIT: u8 = 0x04;
 const KIND_REFUSE: u8 = 0x05;
 const KIND_SHED: u8 = 0x06;
 const KIND_OFFER: u8 = 0x07;
+
+/// `SUBSCRIBE` flags: the requester can forward.
+const SUB_FORWARD_CAPABLE: u8 = 1 << 0;
+/// `SUBSCRIBE` flags: a layer cap follows.
+const SUB_LAYER_CAP: u8 = 1 << 1;
+/// The one layer-cap mode: at most these three maxima.
+const LAYER_CAP_AT_MOST: u8 = 1;
 
 /// Most ancestry entries an offer may carry.
 pub const MAX_ANCESTRY: usize = 8;
@@ -171,10 +202,26 @@ pub fn encode_caps(caps: u32) -> Vec<u8> {
 pub fn encode(stream: StreamId, msg: &ControlMsg<String>) -> Vec<u8> {
     match msg {
         ControlMsg::Subscribe(r) => {
-            let mut v = header(KIND_SUBSCRIBE, 34);
+            let mut v = header(KIND_SUBSCRIBE, 38);
             v.extend_from_slice(&stream.0);
             v.push(role_code(r.role));
-            v.push(u8::from(r.forward_capable));
+            let fc = if r.forward_capable {
+                SUB_FORWARD_CAPABLE
+            } else {
+                0
+            };
+            match r.layers {
+                Some(p) => {
+                    v.push(fc | SUB_LAYER_CAP);
+                    v.extend_from_slice(&[
+                        LAYER_CAP_AT_MOST,
+                        p.max_spatial,
+                        p.max_temporal,
+                        p.max_quality,
+                    ]);
+                }
+                None => v.push(fc),
+            }
             v
         }
         ControlMsg::Unsubscribe { .. } => {
@@ -287,12 +334,28 @@ pub fn decode(frame: &[u8], peer: &str) -> Result<WireFrame, WireError> {
             let stream = r.stream()?;
             let role = role_of(r.u8()?).ok_or(WireError::Malformed)?;
             let flags = r.u8()?;
+            if flags & !(SUB_FORWARD_CAPABLE | SUB_LAYER_CAP) != 0 {
+                return Err(WireError::Malformed);
+            }
+            let layers = if flags & SUB_LAYER_CAP == 0 {
+                None
+            } else {
+                if r.u8()? != LAYER_CAP_AT_MOST {
+                    return Err(WireError::Malformed);
+                }
+                Some(ReceiverLayerPolicy {
+                    max_spatial: r.u8()?,
+                    max_temporal: r.u8()?,
+                    max_quality: r.u8()?,
+                })
+            };
             WireFrame::Control(super::ControlFrame {
                 stream,
                 msg: ControlMsg::Subscribe(SubscribeRequest {
                     subscriber: peer.to_owned(),
                     role,
-                    forward_capable: flags & 1 == 1,
+                    forward_capable: flags & SUB_FORWARD_CAPABLE != 0,
+                    layers,
                 }),
             })
         }
@@ -394,6 +457,7 @@ mod tests {
             subscriber: "peer-a".into(),
             role: Role::Standby,
             forward_capable: true,
+            layers: None,
         }));
         rt(ControlMsg::Unsubscribe {
             subscriber: "peer-a".into(),
@@ -416,6 +480,16 @@ mod tests {
             forwarder_headroom_bps: 4_000_000,
             upstream_latency_ms: 77,
             forwarding: true,
+        }));
+        rt(ControlMsg::Subscribe(SubscribeRequest {
+            subscriber: "peer-a".into(),
+            role: Role::Primary,
+            forward_capable: false,
+            layers: Some(ReceiverLayerPolicy {
+                max_spatial: 1,
+                max_temporal: 2,
+                max_quality: 0,
+            }),
         }));
         assert_eq!(
             decode(&encode_caps(CAPS_THIS_BUILD | CAP_RELAY), "x"),
@@ -576,5 +650,63 @@ mod tests {
                 other => panic!("{name}: {other:?}"),
             }
         }
+    }
+
+    /// KAT — the 45.1 SUBSCRIBE layer cap, byte for byte: stream 07 x 32,
+    /// primary, forward-capable, at most (1, 2, 0). Also the frame without
+    /// a cap (unchanged from v1, 40 bytes) and the refusals: mode 2 (audio
+    /// only, off), any other mode, an unknown flag bit, a short cap, and a
+    /// trailing byte.
+    #[test]
+    fn subscribe_layer_cap_kat() {
+        let req = |layers| {
+            ControlMsg::Subscribe(SubscribeRequest {
+                subscriber: "x".to_owned(),
+                role: Role::Primary,
+                forward_capable: true,
+                layers,
+            })
+        };
+        let cap = ReceiverLayerPolicy {
+            max_spatial: 1,
+            max_temporal: 2,
+            max_quality: 0,
+        };
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let with = encode(s(), &req(Some(cap)));
+        assert_eq!(
+            hex(&with),
+            format!("43414c4d0102{}0003{}", "07".repeat(32), "01010200")
+        );
+        assert_eq!(with.len(), HEADER_LEN + 32 + 2 + 4);
+        let without = encode(s(), &req(None));
+        assert_eq!(
+            hex(&without),
+            format!("43414c4d0102{}0001", "07".repeat(32))
+        );
+        assert_eq!(
+            decode(&with, "x"),
+            Ok(WireFrame::Control(super::super::ControlFrame {
+                stream: s(),
+                msg: req(Some(cap)),
+            }))
+        );
+        let cap_at = HEADER_LEN + 32 + 2;
+        for mode in [0u8, 2, 3, 0xff] {
+            let mut f = with.clone();
+            f[cap_at] = mode;
+            assert_eq!(decode(&f, "x"), Err(WireError::Malformed), "mode {mode}");
+        }
+        let mut f = with.clone();
+        f[HEADER_LEN + 33] |= 1 << 2;
+        assert_eq!(decode(&f, "x"), Err(WireError::Malformed), "unknown flag");
+        assert_eq!(
+            decode(&with[..with.len() - 1], "x"),
+            Err(WireError::Malformed),
+            "short cap"
+        );
+        let mut f = with;
+        f.push(0);
+        assert_eq!(decode(&f, "x"), Err(WireError::Malformed), "trailing byte");
     }
 }

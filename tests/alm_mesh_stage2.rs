@@ -838,6 +838,7 @@ async fn c3_admits_and_a_closed_relay_refuses_by_name() {
                 subscriber: b.key.key_id.clone(),
                 role: Role::Standby,
                 forward_capable: false,
+                layers: None,
             }),
         ),
     )

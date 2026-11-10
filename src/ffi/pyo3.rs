@@ -555,6 +555,12 @@ impl PyEdge {
         self.inner.set_av_datagrams_enabled(enabled);
     }
 
+    /// 45.1 — the A/V layer-request lever (`Call.request_layers`). Default
+    /// off until CC corrects 5.3.3.2.4. Calls joined from now on follow it.
+    fn set_av_layer_requests_enabled(&self, enabled: bool) {
+        self.inner.set_av_layer_requests_enabled(enabled);
+    }
+
     /// `CLM-shaping-offered-never-refused` — seconds past its last real frame
     /// that a shaped link a peer asked of this node lives. Raises `ValueError`
     /// on a value that is no duration.
@@ -4598,6 +4604,30 @@ impl PyCall {
     /// The members this node has a leg to, sorted.
     fn legs(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         self.with_call(py, |c| Box::pin(async move { Ok(c.legs()) }))
+    }
+
+    /// 45.1 — ask this node's parents for the stream `stream_id` for at most
+    /// `layers` = `(spatial, temporal, quality)`; `None` withdraws. The cap
+    /// rides the SUBSCRIBE to a parent that takes one (the host's lever,
+    /// off by default). Returns whether a SUBSCRIBE went out now.
+    #[pyo3(signature = (stream_id, layers=None))]
+    fn request_layers(
+        &self,
+        py: Python<'_>,
+        stream_id: [u8; 32],
+        layers: Option<(u8, u8, u8)>,
+    ) -> PyResult<bool> {
+        let cap = layers.map(
+            |(s, t, q)| crate::transport::realtime_av::ReceiverLayerPolicy {
+                max_spatial: s,
+                max_temporal: t,
+                max_quality: q,
+            },
+        );
+        let stream = crate::transport::realtime_av::StreamId(stream_id);
+        self.with_call(py, move |c| {
+            Box::pin(async move { Ok(c.request_layers(stream, cap).await) })
+        })
     }
 
     /// Per-leg stats, sorted by member: `[{"member", "path"

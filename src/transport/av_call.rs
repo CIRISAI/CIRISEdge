@@ -1504,6 +1504,7 @@ impl Call {
         let (frames_tx, frames_rx) = mpsc::channel::<ReceivedFrame>(256);
         let (events_tx, events_rx) = mpsc::channel::<CallEvent>(64);
         let caps_withheld = transport.av_caps_withheld_for_test();
+        let layer_requests = transport.av_layer_requests_enabled();
         let shared = Arc::new(Shared {
             room: room.to_owned(),
             own: own_key_id.to_owned(),
@@ -1550,6 +1551,7 @@ impl Call {
                 let mut a =
                     alm::AlmState::new(own_key_id, stream, &members_for_alm, opts.relay, alm_seed);
                 a.withhold_caps(caps_withheld);
+                a.set_layer_requests(layer_requests);
                 a
             }),
             in_senders: StdMutex::new(HashMap::new()),
@@ -1774,6 +1776,22 @@ impl Call {
         v
     }
 
+    /// 45.1 — ask this node's parents for `stream` (the publisher, or the
+    /// member relay this node hears it through) for at most `cap`
+    /// (`(spatial, temporal, quality)` maxima; `None` withdraws). The cap
+    /// rides the tree's own SUBSCRIBE (CC 5.3.3.4): the current primary gets
+    /// a re-SUBSCRIBE now, and every later SUBSCRIBE carries it, only to a
+    /// parent whose `CAPS` say it takes one (the host's lever, off by
+    /// default). Codec-opaque (audio) chunks pass every cap; there is no
+    /// audio-only cap (it would go below the base cell, CC 5.3.3.2.4).
+    /// Returns whether a SUBSCRIBE went out now.
+    pub async fn request_layers(&self, stream: StreamId, cap: Option<ReceiverLayerPolicy>) -> bool {
+        let out = Shared::lock(&self.shared.alm).request_layers(stream, cap);
+        let sent = !out.is_empty();
+        send_alm(&self.shared, out).await;
+        sent
+    }
+
     /// leviculum#102 — whether this node's media to `member` rides unordered
     /// datagrams (the member's `CAPS` said it takes them), or `None` when no
     /// leg to it is up.
@@ -1861,6 +1879,13 @@ impl Call {
             } else {
                 exclude.extend(alm.own_exclude(&legs_now, base_or_audio));
             }
+            // 45.1 — a child that asked for less gets less.
+            exclude.extend(alm.layer_exclude(
+                alm.own_stream(),
+                &legs_now,
+                frame.codec_id,
+                frame.layer,
+            ));
         }
         let report = publisher
             .dispatcher_mut()
@@ -3221,6 +3246,10 @@ async fn forward(
             job.base_or_audio,
         ) {
             targets.extend(legs.iter().filter(|l| !ex.contains(l)).cloned());
+            // 45.1 — a child that asked for less gets less.
+            for l in alm.layer_exclude(job.stream, &legs, inner.codec_id(), inner.layer()) {
+                targets.remove(&l);
+            }
         }
         if shared.opts.relay && job.stream == job.link_stream && job.publisher == from {
             targets.extend(
