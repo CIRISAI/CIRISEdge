@@ -545,7 +545,7 @@ fn added(publisher: &str, s: u8) -> Vec<CallEvent> {
     }]
 }
 
-/// 45.1 — a signed end's verdict waits [`END_VERDICT_AFTER`] (the longest
+/// v45 — a signed end's verdict waits [`END_VERDICT_AFTER`] (the longest
 /// reorder window) after it lands: not due a moment before, due at it, once.
 #[test]
 fn a_signed_end_waits_the_reorder_window_for_its_verdict() {
@@ -566,7 +566,7 @@ fn a_signed_end_waits_the_reorder_window_for_its_verdict() {
     assert!(a.due_ends(t + END_VERDICT_AFTER * 4).is_empty(), "once");
 }
 
-/// 45.1 — a signed end is `AttendeeLeft` with its cause (and whether its tail
+/// v45 — a signed end is `AttendeeLeft` with its cause (and whether its tail
 /// arrived), once per (attendee, stream); `Removed` and `Lost` fire once too,
 /// and never after a signed end.
 #[test]
@@ -672,7 +672,7 @@ fn a_binding_alone_is_no_presence() {
     assert!(ev.is_empty(), "a signed end of a stream never heard");
 }
 
-/// 45.1 — a share is a second stream with no `replaces`: binding it ends
+/// v45 — a share is a second stream with no `replaces`: binding it ends
 /// nothing and replaces nothing. Its signed end is `StreamEnded` (the camera
 /// stays live, no leave); the camera's end, now the last stream, is
 /// `AttendeeLeft`. Lost or removed with both live: one `AttendeeLeft`,
@@ -858,7 +858,7 @@ fn a_share_is_a_second_stream_and_its_end_is_no_leave() {
     ));
 }
 
-/// 45.1 (CC review of desktop sharing) — a phone sharing its screen
+/// v45 (CC review of desktop sharing) — a phone sharing its screen
 /// backgrounds its camera: `end = 2` on the camera while the same member's
 /// share is live is `StreamEnded { camera, backgrounded }`, never
 /// `AttendeeLeft`; the share stays live. When the share then ends with the
@@ -914,7 +914,7 @@ fn a_backgrounded_camera_beside_a_live_share_is_no_leave() {
     ));
 }
 
-/// 45.1 — a signed `replaces` of the same publisher's stream is
+/// v45 — a signed `replaces` of the same publisher's stream is
 /// `StreamReplaced` and no leave; the old stream can then never leave. A
 /// `replaces` naming a stream another publisher's binding named is no
 /// replacement; a second stream with no `replaces` ends nothing.

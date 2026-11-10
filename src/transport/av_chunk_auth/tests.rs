@@ -678,7 +678,7 @@ fn v2m(codecs: CodecMap) -> Option<V2Members> {
 /// map (`u8 count`, then per class sorted `class u8 ‖ u16_be len ‖ ascii
 /// token`), `replaces` (`u8 present ‖ [stream 32]`), `end` (`u8`: 0 live, 1
 /// left, 2 backgrounded, 3 this stream ended) and, with an end, `final_seq
-/// u64_be`, then (45.1, CC reading rc18) `kind u8` and `framing u8`. Same inputs as
+/// u64_be`, then (v45, CC reading rc18) `kind u8` and `framing u8`. Same inputs as
 /// [`kat_vectors_are_deterministic`], map `{0x04: h264, 0xFF: opus}`; a
 /// second vector replaces stream `aa`x32, ends `left`, final_seq 42. The v1
 /// signed bytes of the same inputs are unchanged.
@@ -792,8 +792,8 @@ fn the_codec_map_rules() {
     // A count of zero with the entries still there: they read as the next
     // members, which do not parse.
     assert!(rewrite(&|w| w[at] = 0).is_err());
-    // 45.1 — a v2 binding with no map, no replacement, no end, kind 0 and
-    // framing 0 binds: it states "framing 0" (every 45.1 stream signs one).
+    // v45 — a v2 binding with no map, no replacement, no end, kind 0 and
+    // framing 0 binds: it states "framing 0" (every v45 stream signs one).
     let plain = kat_v2(Some(V2Members {
         codecs: None,
         replaces: None,
@@ -1150,7 +1150,7 @@ fn a_signed_end_is_final_and_nothing_past_it_plays() {
     assert!(auth.heard(stream));
 }
 
-/// 45.1 (CC rc18: "check the eviction order never drops a live stream") — a
+/// v45 (CC rc18: "check the eviction order never drops a live stream") — a
 /// camera and a share, then the camera replaced four times in a row: each
 /// replacement retires the stream it names, and the four-newest bound
 /// evicts retired streams first, so the share (live, the oldest install)
@@ -1184,7 +1184,7 @@ fn replacements_never_evict_a_live_share() {
     );
 }
 
-/// 45.1 — an ended stream leaves the publisher's newest-streams list, so a
+/// v45 — an ended stream leaves the publisher's newest-streams list, so a
 /// member that adds and ends shares never pushes its camera out of the
 /// four-newest bound at a receiver.
 #[test]
@@ -1235,7 +1235,7 @@ fn a_dropped_tail_before_a_signed_end_is_reported() {
     assert_eq!(auth.counts().truncated, 1, "counted once");
 }
 
-/// 45.1 — the tail may land after the end: the end names `final_seq` 9, this
+/// v45 — the tail may land after the end: the end names `final_seq` 9, this
 /// receiver had verified up to 5 when it landed, and 6..=9 arrive after it
 /// (inside the reorder window, before the verdict). They verify and play,
 /// and the verdict is no truncation. A chunk past 9 still is refused.
@@ -1293,7 +1293,7 @@ fn an_old_leave_replayed_after_a_rejoin_does_nothing_to_the_new_stream() {
     assert!(!auth.truncated(new));
 }
 
-/// **KAT — framed chunks with the shipping trailer** (45.1, CC reading rc18;
+/// **KAT — framed chunks with the shipping trailer** (v45, CC reading rc18;
 /// for CIRISVerify and CC 5.3.3.2.3): the KAT inputs of
 /// [`kat_vectors_are_deterministic`] (stream, epoch 5, chunk key seed `0c`,
 /// DEK `42`, source 1790000000000 ms), codec `0x04`, layer (0,0,0).
@@ -1311,7 +1311,7 @@ async fn framed_chunk_kats_with_the_shipping_trailer() {
     const PUBLISHER: &str = "node-kat-a";
     const KAT_ROOM: &str = "room-kat";
     const KAT_SOURCE_MS: u64 = 1_790_000_000_000;
-    // Pinned from the first green run (45.1); "PIN" fails with the values.
+    // Pinned from the first green run (v45); "PIN" fails with the values.
     const FRAMED_ONE: &str = "PIN";
     const FRAMED_THREE: [&str; 3] = ["PIN", "PIN", "PIN"];
     let publisher = signer(PUBLISHER, 1);

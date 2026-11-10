@@ -3137,7 +3137,7 @@ pub struct ReticulumTransport {
     /// leviculum#102 — the host's A/V datagram lever
     /// ([`Self::set_av_datagrams_enabled`]). Default on.
     av_datagrams_enabled: Arc<std::sync::atomic::AtomicBool>,
-    /// 45.1 — the host's lever for SUBSCRIBE layer caps
+    /// v45 — the host's lever for SUBSCRIBE layer caps
     /// ([`Self::set_av_layer_requests_enabled`]). Default OFF until CC rules.
     av_layer_requests: std::sync::atomic::AtomicBool,
     /// CIRISEdge#805 — the peer each A/V link THIS node dialled was dialled
@@ -6107,7 +6107,7 @@ impl ReticulumTransport {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 45.1 — calls joined on this node from now on take part in SUBSCRIBE
+    /// v45 — calls joined on this node from now on take part in SUBSCRIBE
     /// layer caps (advertise the bit, apply a child's cap, send their own).
     /// Default OFF until CC's correction of 5.3.3.2.4's carriage sentence.
     pub fn set_av_layer_requests_enabled(&self, enabled: bool) {

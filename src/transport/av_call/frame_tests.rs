@@ -1,4 +1,4 @@
-//! 45.1 — frame fragmentation witnesses (CC reading, rc18).
+//! v45 — frame fragmentation witnesses (CC reading, rc18).
 
 use super::*;
 use crate::transport::av_chunk_auth::{FRAMING_FRAGMENTS, FRAMING_NONE};

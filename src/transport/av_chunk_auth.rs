@@ -411,7 +411,7 @@ impl std::fmt::Display for CodecMap {
 pub const FINAL_SEQ_NONE: u64 = u64::MAX;
 
 /// What a v2 binding's `end` member says: the publisher's own signed word
-/// that its stream ends, and why (45.1). A receiver acts on a leave only from
+/// that its stream ends, and why (v45). A receiver acts on a leave only from
 /// this verified field, never from an unsigned control frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignedEnd {
@@ -420,7 +420,7 @@ pub enum SignedEnd {
     /// The attendee's app went to the background (on its last stream: a
     /// leave).
     Backgrounded,
-    /// 45.1 (CC reading, rc18) — this stream ended, and nothing more: no
+    /// v45 (CC reading, rc18) — this stream ended, and nothing more: no
     /// leave, whatever streams the member has left (a share stopped).
     Ended,
 }
@@ -451,7 +451,7 @@ impl SignedEnd {
     }
 }
 
-/// 45.1 (CC reading, rc18) — the v2 `kind` member: what the stream is to a
+/// v45 (CC reading, rc18) — the v2 `kind` member: what the stream is to a
 /// receiver's layout. It gates nothing (admission, keys, sealing, the
 /// trailer, shedding, keeping). A v1 binding reads as media; an unknown
 /// value under v2 renders as media and is never refused.
@@ -459,7 +459,7 @@ pub const STREAM_KIND_MEDIA: u8 = 0;
 /// A share (a desktop or window), `Call::add_stream`.
 pub const STREAM_KIND_SHARE: u8 = 1;
 
-/// 45.1 (CC reading, rc18) — the v2 `framing` member: 0, one media frame per
+/// v45 (CC reading, rc18) — the v2 `framing` member: 0, one media frame per
 /// chunk and no marker; 1, every chunk whose `codec_id` is not `0xFF`
 /// carries the 4-byte fragment marker (`av_call::frame`). A
 /// v1 binding reads as 0. Fixed per (stream, epoch).
@@ -792,8 +792,8 @@ pub struct StreamKeyBinding {
     pub kind: u8,
     /// v2: the stream's framing ([`FRAMING_NONE`] or [`FRAMING_FRAGMENTS`]).
     pub framing: u8,
-    /// 45.1 — encoded as v2 even when every v2 member is its default (a
-    /// 45.1 publisher signs a v2 binding for every stream, so its framing,
+    /// v45 — encoded as v2 even when every v2 member is its default (a
+    /// v45 publisher signs a v2 binding for every stream, so its framing,
     /// 0 included, is stated). Set by [`Self::sign_v2`] with members and by
     /// parsing a v2 encoding.
     pub explicit_v2: bool,
@@ -1108,9 +1108,9 @@ impl StreamKeyBinding {
             if framing > FRAMING_FRAGMENTS {
                 return Err(BindingError::Malformed("framing"));
             }
-            // 45.1 — a v2 binding always states its kind and framing, so one
+            // v45 — a v2 binding always states its kind and framing, so one
             // with no map, no replacement and no end still says something:
-            // "framing 0". A 45.1 publisher signs one for every stream, so a
+            // "framing 0". A v45 publisher signs one for every stream, so a
             // v2 receiver knows a stream's framing before parsing a chunk.
             (codecs, replaces, end, final_seq, kind, framing)
         } else {
@@ -1402,7 +1402,7 @@ pub struct Bound {
     /// Its v2 encoding (it names the codec), to forward to peers that take
     /// v2.
     pub wire_v2: Option<Arc<Vec<u8>>>,
-    /// 45.1 — the epoch's framing, from its v2 binding ([`FRAMING_NONE`]
+    /// v45 — the epoch's framing, from its v2 binding ([`FRAMING_NONE`]
     /// while only a v1 one came).
     pub framing: u8,
 }
@@ -1466,12 +1466,12 @@ pub struct ChunkAuthCounts {
     /// Bindings refused.
     pub bindings_refused: u64,
     /// Chunks dropped: their class's codec is one this receiver does not
-    /// know (45.1).
+    /// know (v45).
     pub undecodable: u64,
-    /// Chunks refused: past their stream's signed `final_seq` (45.1).
+    /// Chunks refused: past their stream's signed `final_seq` (v45).
     pub past_end: u64,
     /// Signed ends whose `final_seq` this receiver never received up to:
-    /// a tail dropped on the way (45.1).
+    /// a tail dropped on the way (v45).
     pub truncated: u64,
 }
 
@@ -1492,7 +1492,7 @@ struct Held {
     ended_order: VecDeque<StreamId>,
     /// Ended streams whose tail never fully arrived.
     truncated: std::collections::HashSet<StreamId>,
-    /// 45.1 — streams a verified `replaces` named (still bound for their
+    /// v45 — streams a verified `replaces` named (still bound for their
     /// overlap): the first a publisher's newest-streams bound evicts, oldest
     /// first, so a live stream is never pushed out by replacements.
     retired: std::collections::HashSet<StreamId>,
@@ -1754,7 +1754,7 @@ impl ChunkAuth {
         Ok(())
     }
 
-    /// 45.1 — the truncation verdict on `stream`'s signed end, taken once
+    /// v45 — the truncation verdict on `stream`'s signed end, taken once
     /// the reorder window after the end has passed (the caller's clock):
     /// `true` when this receiver never verified a chunk up to the end's
     /// `final_seq` (a dropped tail). Only chunks at or below `final_seq`
@@ -1800,7 +1800,7 @@ impl ChunkAuth {
             .collect()
     }
 
-    /// 45.1 — `(stream, epoch)`'s framing when its v2 binding is installed;
+    /// v45 — `(stream, epoch)`'s framing when its v2 binding is installed;
     /// `None` while only its v1 binding is (or none).
     #[must_use]
     pub fn v2_framing(&self, stream: StreamId, epoch: Epoch) -> Option<u8> {
@@ -1811,7 +1811,7 @@ impl ChunkAuth {
             .map(|b| b.framing)
     }
 
-    /// 45.1 — whether any epoch of `stream` is bound here.
+    /// v45 — whether any epoch of `stream` is bound here.
     #[must_use]
     pub fn is_bound(&self, stream: StreamId) -> bool {
         self.held().bound.keys().any(|(s, _)| *s == stream)

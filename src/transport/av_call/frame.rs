@@ -1,4 +1,4 @@
-//! 45.1 (CC reading, rc18) — **frame fragmentation**: a media frame larger
+//! v45 (CC reading, rc18) — **frame fragmentation**: a media frame larger
 //! than one chunk is split BEFORE the seal into fragments, each a whole
 //! chunk (its own `chunk_seq`, inner and outer seal, source signature), and
 //! reassembled by the receiver after the reorder window. The clear header,
@@ -470,7 +470,7 @@ pub enum FramingState {
     Pending,
 }
 
-/// 45.1 (CC rc18: a receiver never parses a framed chunk as unframed) —
+/// v45 (CC rc18: a receiver never parses a framed chunk as unframed) —
 /// non-audio chunks whose framing is [`FramingState::Pending`] wait here,
 /// in order per `(stream, epoch)`, until the v2 binding installs (then they
 /// go on with its framing) or the hold passes (then they are dropped and

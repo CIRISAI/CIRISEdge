@@ -31,7 +31,7 @@ pub struct AvLinkStats {
     pub tx_ring: usize,
     /// The newest Channel message's sequence, `None` before the link has a
     /// Channel (leviculum +ciris.3). Read after a send it is at or after
-    /// that send's: the watermark a leave and a replacement wait on (45.1).
+    /// that send's: the watermark a leave and a replacement wait on (v45).
     pub last_sent_seq: Option<u16>,
     /// The oldest Channel message still awaiting its delivery proof, `None`
     /// when every message sent was proved (leviculum +ciris.3).
@@ -49,7 +49,7 @@ impl AvLinkStats {
         }
     }
 
-    /// 45.1 — whether the Channel message sent as `seq`, and every one sent
+    /// v45 — whether the Channel message sent as `seq`, and every one sent
     /// before it, was proved delivered: nothing is outstanding, or the
     /// oldest outstanding was sent after `seq` (16-bit serial order; the
     /// ring never holds more than the window, far below 2^15). The ring is
@@ -217,7 +217,7 @@ mod tests {
         assert!(AvLinkStats::default().queue_delay_ms().abs() < 1e-9);
     }
 
-    /// 45.1 — a send is proved once the oldest outstanding message is a
+    /// v45 — a send is proved once the oldest outstanding message is a
     /// later one, whatever is still in flight behind it, across the 2^16
     /// wrap.
     #[test]

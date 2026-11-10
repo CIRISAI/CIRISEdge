@@ -222,7 +222,7 @@ node's next roll (one 250 ms watch tick, or the next `publish`), the departed
 member's leg is still on the roster. A re-announce in that window would send
 it the current binding, which it already holds as a member of the epoch.
 
-### 1.8 The v2 binding: the codec map, `replaces`, `end`, `final_seq` (45.1)
+### 1.8 The v2 binding: the codec map, `replaces`, `end`, `final_seq` (v45)
 
 **Status: a CC reading (rc17) of 5.3.3.2.1–.3, pending text.** The per-class
 codec map and the in-place stream replacement are not yet CC text; they
@@ -249,7 +249,7 @@ members after member 7 (`chunk_key`):
 
 `count` 0 (no map) is allowed: a v2 binding always states its `kind` and
 `framing`, so one with no map, no replacement and no end still says
-"framing 0". A 45.1 publisher signs a v2 binding for every stream (flag for
+"framing 0". A v45 publisher signs a v2 binding for every stream (flag for
 the CC: this lifts rc17's "an empty map only with `end` or `replaces`"), so
 a v2 receiver learns every stream's framing from a signed binding. A v1
 binding reads as `kind` 0 and `framing` 0.
@@ -346,7 +346,7 @@ Rules:
   verified members. No unsigned control frame announces either, so a relay
   cannot take a tile down. A second stream of a publisher with no `replaces`
   (a screen share, say) stays a separate stream.
-- **A share is a second own stream** (45.1, `Call::add_stream`; CC reading
+- **A share is a second own stream** (v45, `Call::add_stream`; CC reading
   (rc17), pending text). It has its own join nonce, stream id, epoch DEK,
   chunk key, v1/v2 bindings and codec map, and its chunks ride the
   publisher's existing legs. ALM gives it its own parent-0 admission, so its
@@ -404,7 +404,7 @@ Vector 2 is the same map, `replaces` stream `aa`×32, `end` 1 (left),
 aaaaaaaaaaaaaaaaaaaaaaaa01000000000000002a0000
 ```
 
-Vector 3 (45.1, rc18) is the same map, no `replaces`, `end` 3 (this stream
+Vector 3 (v45, rc18) is the same map, no `replaces`, `end` 3 (this stream
 ended), `final_seq` 9, `kind` 1 (share), `framing` 1:
 
 ```
@@ -416,7 +416,7 @@ Both are the v1 signed bytes of the same inputs with the v2 domain, version
 unchanged. The v2 signatures' KAT values are pinned at the first build of
 this branch.
 
-### 1.9 Frame fragmentation (45.1, CC reading rc18, pending text)
+### 1.9 Frame fragmentation (v45, CC reading rc18, pending text)
 
 A frame larger than one chunk is split BEFORE the seal: every fragment is a
 whole chunk with its own `chunk_seq`, inner and outer seal and trailer. The

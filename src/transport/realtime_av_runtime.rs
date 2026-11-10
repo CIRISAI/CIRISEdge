@@ -336,7 +336,7 @@ impl AvPublisher {
         Ok(())
     }
 
-    /// 45.1 — `Call::replace_stream`: this publisher now publishes `stream`
+    /// v45 — `Call::replace_stream`: this publisher now publishes `stream`
     /// (a fresh join nonce's) at the same epoch under `stream`'s DEK, its
     /// chunk counter back to 0. The dispatcher, and so every leg's outer
     /// `link_seq`, carries on untouched: the inner nonce is new because the
@@ -358,7 +358,7 @@ impl AvPublisher {
             to = %stream_tag(stream),
             room = %community_key_id,
             epoch = self.epoch.0,
-            "AV publisher REPLACE: a new stream in place of the old (45.1), chunk_seq back to 0"
+            "AV publisher REPLACE: a new stream in place of the old (v45), chunk_seq back to 0"
         );
         self.stream_id = stream;
         self.dek = dek;

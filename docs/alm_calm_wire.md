@@ -83,11 +83,11 @@ Field rules (enforced at decode):
     unread and the sender cannot tell, so the bit's absence means "no
     datagrams" and media stays on the Channel (`try_send_timed`).
 
-  - bit 4 (45.1): this node takes a layer cap on `SUBSCRIBE` and applies it.
+  - bit 4 (v45): this node takes a layer cap on `SUBSCRIBE` and applies it.
     Advertised only when the host turned the lever on
     (`set_av_layer_requests_enabled`, default OFF until CC's correction of
     5.3.3.2.4's carriage sentence lands). No cap is sent to a peer without it.
-  - bit 5 (45.1): this node parses a v2 stream key binding (the one that
+  - bit 5 (v45): this node parses a v2 stream key binding (the one that
     names the codec, `docs/av_chunk_auth_wire.md` §1.8). A publisher sends v2
     only to a peer with it, and v1 to every peer.
 
@@ -96,7 +96,7 @@ Field rules (enforced at decode):
   build sends `0b10_1011`, or `0b10_1111` when it relays, plus bit 4 behind
   the lever (`CAPS_THIS_BUILD`, `wire.rs`).
 - **SUBSCRIBE** `flags`: bit 0 means the requester can itself forward
-  (`forward_capable`). Bit 1 (45.1) means a layer cap follows: `mode u8`,
+  (`forward_capable`). Bit 1 (v45) means a layer cap follows: `mode u8`,
   which must be 1 ("at most"; any other value, mode 2 "audio only" included,
   is malformed: audio only would go below the base cell 5.3.3.2.4 makes the
   minimum, and waits on the presence floor), then `max_spatial`,
@@ -104,7 +104,7 @@ Field rules (enforced at decode):
   that child of that stream only the chunks the cap admits; codec-opaque
   chunks pass every cap. A re-`SUBSCRIBE` changes the cap; one without bit 1
   withdraws it. The cap is sent only to a peer whose `CAPS` carry bit 4 (a
-  pre-45.1 decoder would refuse the four extra bytes as trailing). The other
+  pre-v45 decoder would refuse the four extra bytes as trailing). The other
   bits are ignored.
 - **REFUSE** `reason`:
   - the code is `RefuseReason::code` (`controller/mod.rs:450`); unknown codes
@@ -343,7 +343,7 @@ OFFER       (73 B) 43414c4d 01 07 000102030405060708090a0b0c0d0e0f10111213141516
                    01 01 00000000001e8480 00000000002dc6c0 0000002a 01 000a 6e6f64652d6b61742d61
 ```
 
-**SUBSCRIBE with a layer cap** (45.1, `subscribe_layer_cap_kat`): stream
+**SUBSCRIBE with a layer cap** (v45, `subscribe_layer_cap_kat`): stream
 `07`×32, primary, forward-capable, at most (1, 2, 0):
 
 ```

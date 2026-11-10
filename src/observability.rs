@@ -1015,35 +1015,35 @@ pub const AV_CHUNK_DROPPED_CONGESTED: &str = "av_chunk_dropped_congested";
 pub const AV_LEG_SHED_TO_BASE: &str = "av_leg_shed_to_base";
 /// ALM C5 — a leg restored from the base layer after clean sends.
 pub const AV_LEG_RESTORED: &str = "av_leg_restored";
-/// 45.1 — a leg whose Channel did not prove the signed end delivered before
+/// v45 — a leg whose Channel did not prove the signed end delivered before
 /// the leave's ceiling ([`crate::transport::av_call::END_FLUSH_CEILING`]): it
 /// closed anyway.
 pub const AV_CALL_END_FLUSH_UNCONFIRMED: &str = "end_flush_unconfirmed";
-/// 45.1 — a leg whose Channel did not prove the replacement's binding
+/// v45 — a leg whose Channel did not prove the replacement's binding
 /// delivered before the switch's ceiling: the switch went anyway.
 pub const AV_CALL_REPLACE_SWITCH_UNCONFIRMED: &str = "replace_switch_unconfirmed";
-/// 45.1 — a signed end whose `final_seq` this node never received up to.
+/// v45 — a signed end whose `final_seq` this node never received up to.
 pub const AV_CALL_STREAM_TRUNCATED: &str = "av_call_stream_truncated";
-/// 45.1 — a framed stream's chunk shorter than the fragment marker
+/// v45 — a framed stream's chunk shorter than the fragment marker
 /// (receiver-only, like every `av_frame_*`: a relay never opens the inner
 /// seal).
 pub const AV_FRAME_MARKER_SHORT: &str = "av_frame_marker_short";
-/// 45.1 — a fragment marker whose count is 0 or over 256.
+/// v45 — a fragment marker whose count is 0 or over 256.
 pub const AV_FRAME_COUNT_INVALID: &str = "av_frame_count_invalid";
-/// 45.1 — a fragment marker whose index is at or past its count.
+/// v45 — a fragment marker whose index is at or past its count.
 pub const AV_FRAME_INDEX_INVALID: &str = "av_frame_index_invalid";
-/// 45.1 — a fragment whose count differs from its frame's.
+/// v45 — a fragment whose count differs from its frame's.
 pub const AV_FRAME_COUNT_MISMATCH: &str = "av_frame_count_mismatch";
-/// 45.1 — a fragment whose codec_id or layer differs from its frame's.
+/// v45 — a fragment whose codec_id or layer differs from its frame's.
 pub const AV_FRAME_LAYER_MISMATCH: &str = "av_frame_layer_mismatch";
-/// 45.1 — a fragment run that would cross the epoch.
+/// v45 — a fragment run that would cross the epoch.
 pub const AV_FRAME_CROSSES_EPOCH: &str = "av_frame_crosses_epoch";
-/// 45.1 — a frame missing a fragment the reorder window gave up on: dropped
+/// v45 — a frame missing a fragment the reorder window gave up on: dropped
 /// whole, once.
 pub const AV_FRAME_INCOMPLETE: &str = "av_frame_incomplete";
-/// 45.1 — a frame whose fragments pass 1 MiB: dropped whole.
+/// v45 — a frame whose fragments pass 1 MiB: dropped whole.
 pub const AV_FRAME_TOO_LARGE: &str = "av_frame_too_large";
-/// 45.1 — a framed stream's chunk whose v2 binding (its framing) never came
+/// v45 — a framed stream's chunk whose v2 binding (its framing) never came
 /// within the hold: dropped, never parsed as unframed.
 pub const AV_FRAME_FRAMING_UNKNOWN: &str = "av_frame_framing_unknown";
 /// ALM C3 — a control frame sent / received / refused as malformed.

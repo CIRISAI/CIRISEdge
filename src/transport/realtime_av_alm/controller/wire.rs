@@ -13,7 +13,7 @@
 //! SUBSCRIBE   0x02  stream[32] ‖ role u8 ‖ flags u8 (bit 0: forward-capable,
 //!                   bit 1: layer cap follows; bits 2-7 ignored)
 //!                   [‖ mode u8 (1: at most) ‖ max_spatial u8 ‖ max_temporal u8
-//!                    ‖ max_quality u8]                     (45.1, the cap)
+//!                    ‖ max_quality u8]                     (v45, the cap)
 //! UNSUBSCRIBE 0x03  stream[32]
 //! ADMIT       0x04  stream[32] ‖ role u8
 //! REFUSE      0x05  stream[32] ‖ reason u8 ‖ retry_after_ms u32_be
@@ -24,7 +24,7 @@
 //!                   ‖ n u8 ‖ n × (len u16_be ‖ utf8 key id)   (ancestry, root first)
 //! ```
 //!
-//! **The SUBSCRIBE layer cap** (45.1; CC reads it as conformant in direction,
+//! **The SUBSCRIBE layer cap** (v45; CC reads it as conformant in direction,
 //! a correction to 5.3.3.2.4's carriage sentence pending): a receiver asks
 //! its parent on the tree for at most `(spatial, temporal, quality)` of a
 //! stream (CC 5.3.3.4: a relay forwards only the layers asked for). Mode 1
@@ -35,7 +35,7 @@
 //! only to a peer whose `CAPS` carry [`CAP_LAYER_REQUEST`], which a node
 //! advertises only when its host turned the lever on (off by default until
 //! the CC correction lands); a peer without it never sees the extra bytes,
-//! which a pre-45.1 decoder would refuse as trailing.
+//! which a pre-v45 decoder would refuse as trailing.
 //!
 //! `role`: 0 primary, 1 standby. Reason codes: [`RefuseReason::code`],
 //! [`ShedReason::code`]. Who SENT a frame is never in it: the link names its
@@ -81,7 +81,7 @@ pub const CAP_RELAY: u32 = 1 << 2;
 /// edge routes `NodeEvent::LinkDatagramReceived` to the A/V receive path.
 pub const CAP_LINK_DATAGRAMS: u32 = 1 << 3;
 
-/// It takes a layer cap on `SUBSCRIBE` (45.1) and applies it. OFF by
+/// It takes a layer cap on `SUBSCRIBE` (v45) and applies it. OFF by
 /// default until CC's 5.3.3.2.4 correction lands: only a node whose host
 /// turned the lever on advertises it, and nobody sends a cap to a peer
 /// without it.
@@ -340,7 +340,7 @@ pub fn decode(frame: &[u8], peer: &str) -> Result<WireFrame, WireError> {
             let stream = r.stream()?;
             let role = role_of(r.u8()?).ok_or(WireError::Malformed)?;
             // Bits 2-7 are ignored (docs/alm_calm_wire.md §3): a later bit is
-            // read as nothing, as a pre-45.1 decoder read bit 1.
+            // read as nothing, as a pre-v45 decoder read bit 1.
             let flags = r.u8()?;
             let layers = if flags & SUB_LAYER_CAP == 0 {
                 None
@@ -657,7 +657,7 @@ mod tests {
         }
     }
 
-    /// KAT — the 45.1 SUBSCRIBE layer cap, byte for byte: stream 07 x 32,
+    /// KAT — the v45 SUBSCRIBE layer cap, byte for byte: stream 07 x 32,
     /// primary, forward-capable, at most (1, 2, 0). Also the frame without
     /// a cap (unchanged from v1, 40 bytes) and the refusals: mode 2 (audio
     /// only, off), any other mode, a short cap, and a trailing byte. An

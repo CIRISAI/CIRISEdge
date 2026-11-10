@@ -174,7 +174,7 @@ pub(super) struct AlmState {
     log: DecisionLog,
     own_stream: StreamId,
     own: Admission<String>,
-    /// 45.1 — this node's other own streams (a screen share beside the
+    /// v45 — this node's other own streams (a screen share beside the
     /// camera, `Call::add_stream`): each its own parent-0 admission and
     /// measured rate, so a share's children and shedding are its own.
     shares: BTreeMap<StreamId, (Admission<String>, Rate)>,
@@ -189,7 +189,7 @@ pub(super) struct AlmState {
     /// Test seam — bits this node leaves out of its own `CAPS` (an older
     /// build's, say). 0 in production.
     caps_withheld: u32,
-    /// 45.1 — whether this node takes part in SUBSCRIBE layer caps
+    /// v45 — whether this node takes part in SUBSCRIBE layer caps
     /// (advertises `CAP_LAYER_REQUEST`, applies a child's cap, sends its
     /// own). The host's lever; off by default until CC's 5.3.3.2.4 correction.
     layer_requests: bool,
@@ -220,10 +220,10 @@ pub(super) struct AlmState {
     /// The newest room epoch seen on each stream.
     epochs: BTreeMap<StreamId, u64>,
     video_unavailable: BTreeSet<StreamId>,
-    /// 45.1 — the layer cap each child's SUBSCRIBE asked this node, as its
+    /// v45 — the layer cap each child's SUBSCRIBE asked this node, as its
     /// parent, for: `(stream, child)`. Absent: everything.
     layer_caps: BTreeMap<(StreamId, String), crate::transport::realtime_av::ReceiverLayerPolicy>,
-    /// 45.1 — the cap this node asks its parents for, per stream: carried on
+    /// v45 — the cap this node asks its parents for, per stream: carried on
     /// every SUBSCRIBE it sends a parent that takes one.
     wanted_layers: BTreeMap<StreamId, crate::transport::realtime_av::ReceiverLayerPolicy>,
     pub(super) events: Vec<super::CallEvent>,
@@ -309,7 +309,7 @@ impl AlmState {
         self.caps_withheld = bits;
     }
 
-    /// 45.1 — the host's layer-cap lever (off by default).
+    /// v45 — the host's layer-cap lever (off by default).
     pub(super) fn set_layer_requests(&mut self, on: bool) {
         self.layer_requests = on;
     }
@@ -342,20 +342,20 @@ impl AlmState {
         self.caps.get(peer).is_some_and(|c| c & CAP_BINDING_V2 != 0)
     }
 
-    /// 45.1 — whether `peer`'s `CAPS` came and lack `CAP_BINDING_V2`: an
+    /// v45 — whether `peer`'s `CAPS` came and lack `CAP_BINDING_V2`: an
     /// older build that never signs a v2 binding (so none is in flight).
     pub(super) fn known_without_binding_v2(&self, peer: &str) -> bool {
         self.caps.get(peer).is_some_and(|c| c & CAP_BINDING_V2 == 0)
     }
 
-    /// 45.1 — whether this node sends `peer` v2 bindings: `peer` takes them
+    /// v45 — whether this node sends `peer` v2 bindings: `peer` takes them
     /// and this node advertises taking them too (a node that does not, a v44
     /// build or the test seam's, signs and sends v1 only).
     pub(super) fn sends_binding_v2_to(&self, peer: &str) -> bool {
         self.advertises_binding_v2() && self.takes_binding_v2(peer)
     }
 
-    /// 45.1 — whether this node advertises `CAP_BINDING_V2` (it takes v2
+    /// v45 — whether this node advertises `CAP_BINDING_V2` (it takes v2
     /// bindings, so a framed stream's v2 is sent to it).
     pub(super) fn advertises_binding_v2(&self) -> bool {
         self.caps_bits() & CAP_BINDING_V2 != 0
@@ -606,7 +606,7 @@ impl AlmState {
         self.own_rate.add(bytes, base_or_audio);
     }
 
-    /// 45.1 — this node published `bytes` of its own `stream` (the primary
+    /// v45 — this node published `bytes` of its own `stream` (the primary
     /// or a share).
     pub(super) fn on_own_published_on(
         &mut self,
@@ -630,7 +630,7 @@ impl AlmState {
         self.own_exclude_on(self.own_stream, legs, base_or_audio)
     }
 
-    /// 45.1 — [`Self::own_exclude`] for one of this node's own streams, by
+    /// v45 — [`Self::own_exclude`] for one of this node's own streams, by
     /// that stream's own admission. A stream this node does not publish
     /// excludes every C3 leg.
     pub(super) fn own_exclude_on(
@@ -666,7 +666,7 @@ impl AlmState {
             .collect()
     }
 
-    /// 45.1 — whether `stream` is one of this node's own (the primary or a
+    /// v45 — whether `stream` is one of this node's own (the primary or a
     /// share).
     pub(super) fn is_own(&self, stream: StreamId) -> bool {
         stream == self.own_stream || self.shares.contains_key(&stream)
@@ -695,7 +695,7 @@ impl AlmState {
             .chain(self.shares.iter().map(|(s, (a, _))| (*s, a)))
     }
 
-    /// 45.1 — `Call::add_stream`: this node now also publishes `stream`, a
+    /// v45 — `Call::add_stream`: this node now also publishes `stream`, a
     /// parent-0 admission of its own on the same uplink (its commitments
     /// count against every other admission's room, and theirs against its).
     /// Every C3 member is provisional on it, so its first chunks reach each
@@ -722,7 +722,7 @@ impl AlmState {
         }
     }
 
-    /// 45.1 — `Call::end_stream`: this node no longer publishes `stream` (a
+    /// v45 — `Call::end_stream`: this node no longer publishes `stream` (a
     /// share). Its admission, children's layer caps and provisional marks
     /// go; the primary is untouched.
     pub(super) fn remove_own_stream(&mut self, stream: StreamId) {
@@ -732,7 +732,7 @@ impl AlmState {
         }
     }
 
-    /// 45.1 — this node's own streams besides the primary.
+    /// v45 — this node's own streams besides the primary.
     pub(super) fn share_streams(&self) -> Vec<StreamId> {
         self.shares.keys().copied().collect()
     }
@@ -972,7 +972,7 @@ impl AlmState {
                         Vec::new(),
                     )
                 };
-                // 45.1 — an admitted SUBSCRIBE carries the child's layer cap
+                // v45 — an admitted SUBSCRIBE carries the child's layer cap
                 // (or, without one, withdraws it), for a stream this node
                 // parents.
                 if matches!(decision, AdmitDecision::Admit { .. })
@@ -1077,7 +1077,7 @@ impl AlmState {
         out
     }
 
-    /// 45.1 — of `legs`, the children whose SUBSCRIBE layer cap for `stream`
+    /// v45 — of `legs`, the children whose SUBSCRIBE layer cap for `stream`
     /// does not admit a chunk of `codec_id` at `layer`: this node sends them
     /// nothing of it. Every other child is untouched.
     pub(super) fn layer_exclude(
@@ -1121,7 +1121,7 @@ impl AlmState {
             .and_then(ParentSelector::last_activity_ms)
     }
 
-    /// 45.1 — `Call::replace_stream`, publisher side: this node's stream is
+    /// v45 — `Call::replace_stream`, publisher side: this node's stream is
     /// now `stream`. The children of the old stream hold the same commitment
     /// on the new one (one uplink, the same members), and every C3 member is
     /// provisional again, so the new stream reaches each at once while its
@@ -1152,7 +1152,7 @@ impl AlmState {
         }
     }
 
-    /// 45.1 — a publisher's signed `replaces`: `old` is gone in favour of
+    /// v45 — a publisher's signed `replaces`: `old` is gone in favour of
     /// `new`. Forget `old` (its selector, relay admission and meters); a layer
     /// cap this node asked for `old` carries over to `new`.
     pub(super) fn forget_replaced_stream(&mut self, old: StreamId, new: StreamId) {
@@ -1173,7 +1173,7 @@ impl AlmState {
         }
     }
 
-    /// 45.1 — ask this node's parents for `stream` for at most `cap` (`None`:
+    /// v45 — ask this node's parents for `stream` for at most `cap` (`None`:
     /// everything). Kept, and carried on every SUBSCRIBE this node sends a
     /// parent that takes a cap; the current primary gets a re-SUBSCRIBE now
     /// (CC 5.3.3.4: the ask rides the tree), when it takes one.
@@ -1274,7 +1274,7 @@ impl AlmState {
             for p in self.own.on_egress_window(now, &w, &mut self.log) {
                 shed.push((self.own_stream, p));
             }
-            // 45.1 — each share sheds by its own commitments.
+            // v45 — each share sheds by its own commitments.
             let shares: Vec<StreamId> = self.shares.keys().copied().collect();
             for s in shares {
                 let ext = self.external_except(s);
@@ -1466,7 +1466,7 @@ impl AlmState {
         self.own_children_of(self.own_stream)
     }
 
-    /// 45.1 — who holds a commitment on this node's own `stream` (the
+    /// v45 — who holds a commitment on this node's own `stream` (the
     /// primary or a share), by role.
     pub(super) fn own_children_of(&self, stream: StreamId) -> Vec<(String, Role)> {
         self.own_admission(stream)
@@ -1617,7 +1617,7 @@ mod tests {
         assert_eq!(a.own_exclude(&legs, false), vec!["c".to_owned()]);
     }
 
-    /// 45.1 — a share is a parent-0 admission of its own: B subscribes to
+    /// v45 — a share is a parent-0 admission of its own: B subscribes to
     /// A's share alone and is A's share child, not its camera child; the
     /// camera's send set is untouched, each stream is offered, and ending
     /// the share leaves the camera's admission and children as they were.
@@ -2508,7 +2508,7 @@ mod tests {
         }
     }
 
-    /// 45.1 — a receiver's layer cap rides its SUBSCRIBE to its parent and
+    /// v45 — a receiver's layer cap rides its SUBSCRIBE to its parent and
     /// caps what the parent sends that child alone: A (the publisher) drops
     /// B's copies above (0, 0, 0) and sends C everything; a relay (C)
     /// applies a cap for a stream it forwards the same way; audio passes
@@ -2619,7 +2619,7 @@ mod tests {
             .is_empty());
     }
 
-    /// 45.1 — off by default: no node advertises the bit, puts a cap on a
+    /// v45 — off by default: no node advertises the bit, puts a cap on a
     /// SUBSCRIBE or applies one. On, a parent whose `CAPS` lack the bit never
     /// gets a cap; the cap waits, and rides the next SUBSCRIBE to a parent
     /// that takes it.

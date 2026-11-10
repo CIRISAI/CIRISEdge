@@ -729,7 +729,7 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
     );
 }
 
-/// **A v1 peer behind a v2 relay still binds** (45.1, binding v2): B names
+/// **A v1 peer behind a v2 relay still binds** (v45, binding v2): B names
 /// its codecs (`{0xFF: opus}`), so it signs a v1 and a v2 binding per epoch.
 /// A relays and parses v2; C does not (its `CAPS` lack `CAP_BINDING_V2`) and
 /// reaches B only through A. C must get B's v1 binding from A, bind, and hear
@@ -809,7 +809,7 @@ async fn next_event<T>(
     .flatten()
 }
 
-/// **Attendance** (45.1): B leaves `backgrounded`, signed, and A reads
+/// **Attendance** (v45): B leaves `backgrounded`, signed, and A reads
 /// `AttendeeLeft { B, Backgrounded }` with B's stream; C is killed (every
 /// leg to it closed, its stream silent, no signed end) and A reads it
 /// `Lost`, and not before `ATTENDEE_LOST_AFTER`.
@@ -900,7 +900,7 @@ async fn a_signed_leave_says_why_and_a_killed_node_is_lost_after_the_bound() {
     );
 }
 
-/// **Removed** (45.1): the room's MLS group drops C's key; A's call rolls
+/// **Removed** (v45): the room's MLS group drops C's key; A's call rolls
 /// and reads `AttendeeLeft { C, Removed }`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_removed_member_is_attendee_left_removed() {
@@ -964,7 +964,7 @@ async fn a_removed_member_is_attendee_left_removed() {
     assert_eq!(got, Some((c_stream, LeaveCause::Removed)));
 }
 
-/// **Replace in place** (45.1): B replaces its stream mid-call while it keeps
+/// **Replace in place** (v45): B replaces its stream mid-call while it keeps
 /// publishing. A reads `StreamReplaced { B, old, new }` and no
 /// `AttendeeLeft` for B, and hears every one of B's frames, old stream and
 /// new, across the swap.
@@ -1045,7 +1045,7 @@ async fn a_replaced_stream_carries_on_with_no_leave() {
 }
 
 /// 30 Hz video, each frame several chunks back to back: what keeps a leg's
-/// Channel busy while a leave or a replacement waits on its proof (45.1).
+/// Channel busy while a leave or a replacement waits on its proof (v45).
 const VIDEO_TICK: Duration = Duration::from_millis(33);
 const CHUNKS_PER_VIDEO_FRAME: u64 = 6;
 
@@ -1059,7 +1059,7 @@ async fn video_frame(call: &mut Call, who: &str, frame: u64) {
     }
 }
 
-/// **A replacement under video is proved per message** (45.1): B replaces its
+/// **A replacement under video is proved per message** (v45): B replaces its
 /// stream while it keeps sending 30 Hz video (six chunks a frame), so B's leg
 /// to A always has media in flight. The switch waits on the new bindings'
 /// own delivery proof (their Channel sequence), not an empty tx ring, so it
@@ -1108,7 +1108,7 @@ async fn a_replacement_under_video_is_proved_by_its_own_delivery() {
     );
 }
 
-/// **A relay's leave under forwarded video is proved per message** (45.1): A
+/// **A relay's leave under forwarded video is proved per message** (v45): A
 /// relays B's 30 Hz video to C (B and C share no leg), and A leaves while B
 /// keeps sending, so A's leg to C always has forwarded media in flight. Each
 /// leg closes on the signed end's own delivery proof, never the ceiling:
@@ -1229,7 +1229,7 @@ fn drain_from(
     }
 }
 
-/// **A share beside the camera** (45.1, `Call::add_stream`): B publishes its
+/// **A share beside the camera** (v45, `Call::add_stream`): B publishes its
 /// camera and a screen share at once; A reads `StreamAdded` for each with its
 /// signed kind (media, share) and hears both, each as its own stream. B ends
 /// the share alone (`end = 3`): A reads `StreamEnded { B, share, ended }`,
@@ -1366,7 +1366,7 @@ fn video(tag: u64, len: usize) -> Frame {
     }
 }
 
-/// **Framed video, unmarked audio** (45.1, CC reading rc18): B joins with
+/// **Framed video, unmarked audio** (v45, CC reading rc18): B joins with
 /// `{h264, opus}`, so its binding signs `framing = 1`. It publishes a 30 KB
 /// keyframe, then 3 KB P-frames at 30 Hz with Opus frames between them. The
 /// keyframe and every P-frame larger than one chunk go as several fragments;
@@ -1471,7 +1471,7 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     );
 }
 
-/// **A backgrounded camera beside a live share** (45.1, CC review of
+/// **A backgrounded camera beside a live share** (v45, CC review of
 /// desktop sharing): B shares its screen, then backgrounds its camera
 /// (`end = 2` on the camera stream). A reads `StreamEnded { camera,
 /// backgrounded }`, never `AttendeeLeft`, and B's share keeps arriving.
@@ -1564,7 +1564,7 @@ async fn video_frames(
     got
 }
 
-/// **Framed video through a relay** (45.1): A relays B's framed stream
+/// **Framed video through a relay** (v45): A relays B's framed stream
 /// (`{h264, opus}`) to C (B and C share no leg). Every fragment is a whole
 /// chunk A forwards unchanged (it never opens the inner seal), so C rebuilds
 /// each frame byte-identical. Then A's leg to C loses every 7th forwarded
@@ -1656,7 +1656,7 @@ async fn framed_video_through_a_relay_arrives_whole_or_counted() {
     );
 }
 
-/// **A mixed call** (45.1, CC's run-green witness for the framing hold): C
+/// **A mixed call** (v45, CC's run-green witness for the framing hold): C
 /// behaves as v44 (no `CAPS` bit 5, v1 bindings only) and reaches B only
 /// through the relay A, so B never hears C's own `CAPS`. B plays C's audio;
 /// C's video is held for a v2 binding that never comes, then dropped and
@@ -1737,7 +1737,7 @@ async fn a_v44_publisher_behind_a_relay_plays_audio_and_its_video_is_held_then_d
     assert!(more, "C's stream stands at B after the drops");
 }
 
-/// **Per-leg stats** (45.1): every leg a call reports names what carries it
+/// **Per-leg stats** (v45): every leg a call reports names what carries it
 /// and its MDU, so a gate can tell a punched UDP leg from a TCP one from a
 /// relayed one. On loopback TCP every leg is `Interface`, with a link MDU,
 /// a Channel limit and a frame budget above zero. (A leg's carrier may move
@@ -1781,7 +1781,7 @@ async fn every_leg_reports_its_path_and_mdu() {
 /// **C3 admit / refuse**: A's own stream admits B (C2 over C3); C, a relay
 /// at service tier 1 (the host said `Warning`), refuses B's subscription
 /// for A's stream by name, `load_refuse:admit_closed`. A closed relay offers
-/// no room (45.1), so no selector picks it: B is made to ask.
+/// no room (v45), so no selector picks it: B is made to ask.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn c3_admits_and_a_closed_relay_refuses_by_name() {
     let _call = one_call().await;

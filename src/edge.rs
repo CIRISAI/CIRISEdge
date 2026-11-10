@@ -2354,7 +2354,7 @@ impl Edge {
         let _ = enabled;
     }
 
-    /// 45.1 — **the A/V layer-request lever**: whether calls joined from now
+    /// v45 — **the A/V layer-request lever**: whether calls joined from now
     /// on take part in SUBSCRIBE layer caps (`Call::request_layers`): they
     /// advertise `CAP_LAYER_REQUEST`, apply a child's cap, and send their
     /// own. Default OFF until CC corrects 5.3.3.2.4. No-op without

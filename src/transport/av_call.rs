@@ -85,7 +85,7 @@
 //!   this cut does not define;
 //! - the epoch's terminator (`seal_av_terminator`, #846 part 2): it does not
 //!   exist on this base. A leaver's signed end rides the v2 stream key
-//!   binding instead (`end`, 45.1; [`Call::leave_with`]).
+//!   binding instead (`end`, v45; [`Call::leave_with`]).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -266,7 +266,7 @@ pub struct PublishReport {
     /// One outcome per member leg (for a fragmented frame, the leg's first
     /// failure, or `Delivered` when every fragment went).
     pub legs: Vec<(String, LegOutcome)>,
-    /// 45.1 — how many chunks the frame took (1 unless a framed stream
+    /// v45 — how many chunks the frame took (1 unless a framed stream
     /// split it; `chunk_seq` is the first).
     pub fragments: u16,
 }
@@ -385,7 +385,7 @@ pub enum CallEvent {
         /// `0`, `1` or `2`.
         tier: u8,
     },
-    /// 45.1 — an attendee's stream left the call: once per (attendee,
+    /// v45 — an attendee's stream left the call: once per (attendee,
     /// stream). `Left` and `Backgrounded` come only from the attendee's own
     /// signed end of its stream; `Removed` from the room's MLS group dropping
     /// its key; `Lost` from every leg to it gone and its stream silent past
@@ -403,7 +403,7 @@ pub enum CallEvent {
         /// `av_call_stream_truncated`).
         truncated: bool,
     },
-    /// 45.1 — `publisher`'s stream's first verified binding installed: its
+    /// v45 — `publisher`'s stream's first verified binding installed: its
     /// keys are in hand and its `kind` (CC reading, rc18: 0 media, 1 share;
     /// an unknown value renders as media) says how to lay it out. Not
     /// presence: an attendee is one whose chunks arrive. A replacement's new
@@ -416,7 +416,7 @@ pub enum CallEvent {
         /// Its signed kind (`0` for a v1 binding).
         kind: u8,
     },
-    /// 45.1 — one of `publisher`'s streams ended, signed, while it attends
+    /// v45 — one of `publisher`'s streams ended, signed, while it attends
     /// with another, or with `end = 3` ("this stream ended", a share stopped
     /// with `Call::end_stream`) on any of its streams: the stream's tile
     /// goes, the attendee stays. A leave (`end` 1 or 2) on its last stream
@@ -431,7 +431,7 @@ pub enum CallEvent {
         /// As [`CallEvent::AttendeeLeft`]'s.
         truncated: bool,
     },
-    /// 45.1 — `publisher` replaced its stream in place (`Call::replace_stream`
+    /// v45 — `publisher` replaced its stream in place (`Call::replace_stream`
     /// there): `new` carries on what `old` was, with no leave. Only from the
     /// publisher's signed `replaces` on `new`'s binding.
     StreamReplaced {
@@ -456,7 +456,7 @@ pub enum LeaveCause {
     /// Every leg to it went away and its stream went silent past
     /// [`ATTENDEE_LOST_AFTER`], with no signed end.
     Lost,
-    /// 45.1 — its signed `end = 3`: this stream ended and nothing more (a
+    /// v45 — its signed `end = 3`: this stream ended and nothing more (a
     /// share stopped). Only ever on [`CallEvent::StreamEnded`].
     Ended,
 }
@@ -505,16 +505,16 @@ pub const END_FLUSH_CEILING: Duration = Duration::from_secs(2);
 /// How often a delivery wait reads the legs' Channel stats.
 const DELIVERY_POLL: Duration = Duration::from_millis(10);
 
-/// The call's view of who attends with which stream (45.1).
+/// The call's view of who attends with which stream (v45).
 #[derive(Debug, Default)]
 struct Attendance {
     /// Each attendee's live streams, oldest first, from its verified
-    /// bindings (45.1: a camera and its shares).
+    /// bindings (v45: a camera and its shares).
     streams: HashMap<String, Vec<StreamId>>,
     /// Attendees this node verified a chunk of on a stream that has since
     /// ended: presence carried to the attendee's last stream's end.
     heard: std::collections::HashSet<String>,
-    /// 45.1 — an attendee whose every stream ended with `end = 3` (still
+    /// v45 — an attendee whose every stream ended with `end = 3` (still
     /// attending, by reachability): the last of them, for its eventual
     /// `AttendeeLeft`.
     last_ended: HashMap<String, StreamId>,
@@ -529,7 +529,7 @@ struct Attendance {
     ending: Vec<(StreamKeyBinding, Instant)>,
 }
 
-/// 45.1 — how long after a signed end lands its truncation verdict waits:
+/// v45 — how long after a signed end lands its truncation verdict waits:
 /// the longest reorder window, so a tail chunk up to `final_seq` that the
 /// window would still have played is not reported missing.
 pub const END_VERDICT_AFTER: Duration = REORDER_WINDOW_MAX;
@@ -667,7 +667,7 @@ impl Attendance {
         })
     }
 
-    /// 45.1 — every live stream of `key_id` ended at once, for `cause`
+    /// v45 — every live stream of `key_id` ended at once, for `cause`
     /// (`Lost`, `Removed`: no signed end): one [`CallEvent::AttendeeLeft`],
     /// naming its oldest stream (the camera, as a rule), if this node heard
     /// it on any (`present` per stream) and something was still live.
@@ -783,15 +783,15 @@ pub enum CallError {
     /// starts and joins no call and no stream. Refused before anything starts.
     #[error("this node is in anonymous mode: no call and no stream (onion_anonymous_no_media)")]
     AnonymousMode,
-    /// 45.1 — the stream named is not one this node publishes in the call
+    /// v45 — the stream named is not one this node publishes in the call
     /// (never added, or already ended).
     #[error("stream {0} is not one this node publishes in the call")]
     UnknownStream(String),
-    /// 45.1 — one more own stream would pass the room's per-publisher bound
+    /// v45 — one more own stream would pass the room's per-publisher bound
     /// ([`MAX_OWN_STREAMS`]): end one first.
     #[error("this node already publishes {0} streams in the call, the most it may")]
     TooManyStreams(usize),
-    /// 45.1 — the frame's run of chunks would pass the epoch's 2³²
+    /// v45 — the frame's run of chunks would pass the epoch's 2³²
     /// `chunk_seq` ceiling: refused before any seal; the epoch rolls first.
     #[error("{fragments} chunks from chunk_seq {next} pass the epoch's 2^32 ceiling; the epoch must roll first")]
     ChunkSeqExhausted {
@@ -802,13 +802,13 @@ pub enum CallError {
     },
 }
 
-/// 45.1 — the most streams one node publishes in a call at once: the camera
+/// v45 — the most streams one node publishes in a call at once: the camera
 /// and up to two shares. A receiver holds a publisher's four newest bound
 /// streams ([`crate::transport::av_chunk_auth`]); one place is kept for a
 /// replacement's overlap (the old stream stays bound until its tail plays).
 pub const MAX_OWN_STREAMS: usize = 3;
 
-/// 45.1 — one of this node's other own streams (`Call::add_stream`): its own
+/// v45 — one of this node's other own streams (`Call::add_stream`): its own
 /// sealing session (stream id, epoch DEK, chunk counter, kept like the
 /// primary) and chunk key with its bindings. Its chunks ride the primary
 /// publisher's legs, so it has no legs of its own.
@@ -1220,11 +1220,11 @@ pub struct ReorderCounts {
     pub duplicates: u64,
     /// Copies that arrived after their slot was released or skipped.
     pub late: u64,
-    /// 45.1 — frames of a framed stream dropped whole (a fragment the window
+    /// v45 — frames of a framed stream dropped whole (a fragment the window
     /// gave up on, a marker refused, a framing that never became known):
     /// never handed out partial or unframed.
     pub frames_dropped: u64,
-    /// 45.1 — frames being reassembled now (at most one per stream).
+    /// v45 — frames being reassembled now (at most one per stream).
     pub frames_open: u64,
 }
 
@@ -1653,15 +1653,15 @@ struct Shared {
     /// and its bindings. Replaced only under the publisher lock, at the roll
     /// and at `Call::replace_stream`.
     own_key: StdMutex<OwnChunkKey>,
-    /// 45.1 — who attends with which stream; what `AttendeeLeft` fires from.
+    /// v45 — who attends with which stream; what `AttendeeLeft` fires from.
     attendance: StdMutex<Attendance>,
-    /// 45.1 — a `replace_stream` waiting for its bindings' delivery.
+    /// v45 — a `replace_stream` waiting for its bindings' delivery.
     pending_replace: StdMutex<Option<PendingReplace>>,
-    /// 45.1 — the camera (primary) stream ended while a share went on
+    /// v45 — the camera (primary) stream ended while a share went on
     /// (`Call::end_stream_as`): it takes no more frames, and its bindings
     /// are no longer announced.
     primary_ended: AtomicBool,
-    /// 45.1 — this node's other own streams (`Call::add_stream`), by stream.
+    /// v45 — this node's other own streams (`Call::add_stream`), by stream.
     /// Lock order: the primary publisher first, then this; never the other
     /// way.
     shares: Mutex<BTreeMap<StreamId, ShareStream>>,
@@ -1714,9 +1714,9 @@ struct OwnChunkKey {
     replaces: Option<StreamId>,
     /// The stream's codec map (fixed for its life).
     codecs: Option<crate::transport::av_chunk_auth::CodecMap>,
-    /// 45.1 — its signed kind (0 media, 1 share).
+    /// v45 — its signed kind (0 media, 1 share).
     kind: u8,
-    /// 45.1 — its signed framing (from the codec map, [`framing_for`]).
+    /// v45 — its signed framing (from the codec map, [`framing_for`]).
     framing: u8,
 }
 
@@ -1739,7 +1739,7 @@ async fn mint_own_key(
     let binding = StreamKeyBinding::sign(signer, room, join_nonce, stream, epoch, key.public())
         .await
         .map_err(|e| CallError::Plumbing(e.to_string()))?;
-    // 45.1 — every stream signs a v2 binding (its framing, even 0), so a v2
+    // v45 — every stream signs a v2 binding (its framing, even 0), so a v2
     // receiver never has to guess a chunk's layout.
     let wire_v2 = {
         Some(Arc::new(
@@ -1777,7 +1777,7 @@ async fn mint_own_key(
     })
 }
 
-/// 45.1 (CC reading, rc18) — a stream's framing from its codec map: framed
+/// v45 (CC reading, rc18) — a stream's framing from its codec map: framed
 /// ([`FRAMING_FRAGMENTS`]) when it names a class other than audio (`0xFF`),
 /// so its video is split to the call's budget; an audio-only or map-less
 /// stream is not.
@@ -1798,7 +1798,7 @@ fn framing_for(codecs: Option<crate::transport::av_chunk_auth::CodecMap>) -> u8 
 }
 
 /// The publisher's signed end of its stream at the current epoch, under the
-/// current chunk key (45.1): a v2 binding with `end` set, the one thing a
+/// current chunk key (v45): a v2 binding with `end` set, the one thing a
 /// receiver turns into `AttendeeLeft { Left | Backgrounded }`.
 async fn sign_end(
     shared: &Shared,
@@ -1846,7 +1846,7 @@ impl EndFields {
     }
 }
 
-/// 45.1 — the signed end of the stream `k` binds (a share's), its tail at
+/// v45 — the signed end of the stream `k` binds (a share's), its tail at
 /// `final_seq`.
 async fn sign_end_of(
     shared: &Shared,
@@ -2367,7 +2367,7 @@ impl Call {
         v
     }
 
-    /// 45.1 — ask this node's parents for `stream` (the publisher, or the
+    /// v45 — ask this node's parents for `stream` (the publisher, or the
     /// member relay this node hears it through) for at most `cap`
     /// (`(spatial, temporal, quality)` maxima; `None` withdraws). The cap
     /// rides the tree's own SUBSCRIBE (CC 5.3.3.4): the current primary gets
@@ -2627,7 +2627,7 @@ impl Call {
         *Shared::lock(&self.counts)
     }
 
-    /// 45.1 — **publish a second stream** beside the camera (a desktop or
+    /// v45 — **publish a second stream** beside the camera (a desktop or
     /// window share; CC reading (rc17): a share is a second stream with no
     /// `replaces`). It has its own join nonce and stream id, its own sealing
     /// session (epoch DEK, chunk counter), chunk key and v1/v2 bindings, and
@@ -2706,7 +2706,7 @@ impl Call {
         Shared::lock(&shared.alm).add_own_stream(stream);
         tracing::info!(
             stream = %crate::transport::realtime_av::stream_label(stream),
-            "CALL STREAM ADDED: this node publishes a second stream (45.1)"
+            "CALL STREAM ADDED: this node publishes a second stream (v45)"
         );
         if let KeepOutcome::Refused(r) = keep {
             shared.emit(CallEvent::KeepRefused {
@@ -2717,7 +2717,7 @@ impl Call {
         Ok(stream)
     }
 
-    /// 45.1 — [`Self::publish`] on one of this node's own streams: the
+    /// v45 — [`Self::publish`] on one of this node's own streams: the
     /// primary (`self.stream()`, the same as `publish`) or a share
     /// ([`Self::add_stream`]).
     ///
@@ -2781,7 +2781,7 @@ impl Call {
         })
     }
 
-    /// 45.1 — **end one share** ([`Self::add_stream`]) and only it: its
+    /// v45 — **end one share** ([`Self::add_stream`]) and only it: its
     /// signed end (a v2 binding with `end = 3`, "this stream ended", never a
     /// leave, and `final_seq`) goes to every leg
     /// that parses v2, and the share stops. The camera and the call carry on;
@@ -2798,7 +2798,7 @@ impl Call {
             .await
     }
 
-    /// 45.1 — [`Self::end_stream`] saying `why`. For a share, any value. For
+    /// v45 — [`Self::end_stream`] saying `why`. For a share, any value. For
     /// the camera (the primary), only while a share is live: a phone sharing
     /// its screen backgrounds its camera (`Backgrounded`, `end = 2`), which a
     /// receiver reads as [`CallEvent::StreamEnded`] for the camera while the
@@ -2863,12 +2863,12 @@ impl Call {
             stream = %crate::transport::realtime_av::stream_label(stream),
             ?why,
             unconfirmed,
-            "CALL STREAM ENDED: one own stream stopped, the call carries on (45.1)"
+            "CALL STREAM ENDED: one own stream stopped, the call carries on (v45)"
         );
         Ok(())
     }
 
-    /// 45.1 — every stream this node publishes in the call: the primary
+    /// v45 — every stream this node publishes in the call: the primary
     /// first, then the shares.
     pub async fn streams(&self) -> Vec<StreamId> {
         let mut out = vec![self.shared.stream()];
@@ -2876,7 +2876,7 @@ impl Call {
         out
     }
 
-    /// 45.1 — **replace this node's stream in place** (a codec change, say):
+    /// v45 — **replace this node's stream in place** (a codec change, say):
     /// a fresh join nonce and stream within the same membership, bound first
     /// and switched to once every leg's Channel proved them delivered
     /// (ceiling [`REPLACE_SWITCH_CEILING`]; make-before-break: the old
@@ -2967,7 +2967,7 @@ impl Call {
             .await
     }
 
-    /// 45.1 — [`Self::leave`], saying why: the publisher's signed end of its
+    /// v45 — [`Self::leave`], saying why: the publisher's signed end of its
     /// stream (a v2 binding with `end`, the one thing a receiver turns into
     /// [`CallEvent::AttendeeLeft`] `Left` / `Backgrounded`) goes to every leg
     /// whose peer parses v2 bindings, then the legs close. A peer that does
@@ -2983,7 +2983,7 @@ impl Call {
         if let CallState::Ended(cause) = self.state() {
             return Err(CallError::CallEnded(cause));
         }
-        // 45.1 — each share ends first (`end = 3`), then the primary with the
+        // v45 — each share ends first (`end = 3`), then the primary with the
         // leave's own value: a receiver reads the shares as `StreamEnded` and
         // the last stream as `AttendeeLeft`.
         let mut share_ends = Vec::new();
@@ -3203,7 +3203,7 @@ async fn start_stream(
     Ok((stream, join_nonce, epoch, publisher, outcome))
 }
 
-/// 45.1 — `wire` (v1) on every leg of `publisher`, and `wire_v2` on every
+/// v45 — `wire` (v1) on every leg of `publisher`, and `wire_v2` on every
 /// leg whose peer parses v2.
 async fn send_bindings_on(
     shared: &Arc<Shared>,
@@ -3233,7 +3233,7 @@ async fn send_bindings_on(
         .await;
 }
 
-/// 45.1 — roll one share to epoch `to`: its new DEK and chunk key, bound on
+/// v45 — roll one share to epoch `to`: its new DEK and chunk key, bound on
 /// every leg of the primary `publisher` (whose lock the caller holds)
 /// before the share's first chunk of `to`. A failure leaves it where it was.
 async fn roll_share(
@@ -3276,7 +3276,7 @@ async fn roll_share(
     Ok(keep)
 }
 
-/// 45.1 — the plaintexts `frame` is sealed as: itself, on an unframed
+/// v45 — the plaintexts `frame` is sealed as: itself, on an unframed
 /// stream or for audio (`0xFF`), within `budget`; otherwise its marked
 /// fragments ([`frame::split`]) of at most `budget` bytes each. Refused
 /// before anything is sealed when it does not fit.
@@ -3298,7 +3298,7 @@ fn frame_pieces(frame: &Frame, framing: u8, budget: usize) -> Result<Vec<Vec<u8>
     })
 }
 
-/// 45.1 — seal and sign every piece of one frame, consecutive `chunk_seq`s
+/// v45 — seal and sign every piece of one frame, consecutive `chunk_seq`s
 /// in the publisher's current epoch (the caller holds the lock the roll
 /// takes, so a frame never straddles an epoch). A run that would pass the
 /// epoch's 2³² `chunk_seq` ceiling is refused before the first seal: the
@@ -3331,7 +3331,7 @@ fn seal_pieces(
         .collect()
 }
 
-/// 45.1 — send one frame's sealed pieces in order. A leg that fails one
+/// v45 — send one frame's sealed pieces in order. A leg that fails one
 /// fragment (congested, too large, gone) gets none of the rest: a partial
 /// frame is worth nothing. Each leg's outcome is its first failure, or
 /// `Delivered`. `withhold`: the test seam's `(member, every)`.
@@ -3380,7 +3380,7 @@ async fn send_pieces(
 }
 
 /// One own chunk, sealed and signed, out on the primary publisher's legs
-/// (45.1: the primary's or a share's; a share has no legs of its own). ALM:
+/// (v45: the primary's or a share's; a share has no legs of its own). ALM:
 /// `stream` goes only to the members that hold a commitment on it (a
 /// standby: base/audio only), to C3 members still choosing, and to every
 /// pre-C3 peer as before; at service tier 2 this node's own call is audio
@@ -3404,7 +3404,7 @@ async fn send_own_chunk(
         } else {
             exclude.extend(alm.own_exclude_on(stream, &legs_now, base_or_audio));
         }
-        // 45.1 — a child that asked for less gets less.
+        // v45 — a child that asked for less gets less.
         exclude.extend(alm.layer_exclude(stream, &legs_now, codec_id, layer));
     }
     let report = publisher
@@ -3576,7 +3576,7 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     if !shared.primary_ended.load(Ordering::Acquire) {
         send_bindings_on(shared, &mut publisher, &wire, wire_v2.as_ref()).await;
     }
-    // 45.1 — every share rolls with the primary, bound on every leg before
+    // v45 — every share rolls with the primary, bound on every leg before
     // its first chunk of the epoch. One that fails here rolls at its next
     // publish.
     let mut share_keeps = Vec::new();
@@ -3612,7 +3612,7 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
         to: room_epoch,
     });
     for m in left {
-        // 45.1 — its key left the room's MLS group: its streams left the call.
+        // v45 — its key left the room's MLS group: its streams left the call.
         attendee_left(shared, &m, LeaveCause::Removed);
         shared.emit(CallEvent::MemberLeft { key_id: m });
     }
@@ -3775,7 +3775,7 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
             .filter(|_| !shared.primary_ended.load(Ordering::Acquire))
             .into_iter()
             .collect();
-        // 45.1 — and every share's.
+        // v45 — and every share's.
         wires.extend(
             shared
                 .shares
@@ -4481,7 +4481,7 @@ async fn reannounce(shared: &Arc<Shared>) {
         let k = Shared::lock(&shared.own_key);
         (Arc::clone(&k.wire), k.wire_v2.clone())
     };
-    // 45.1 — and every share's (the shares lock is let go before any send);
+    // v45 — and every share's (the shares lock is let go before any send);
     // an ended camera's no more.
     let camera_live = !shared.primary_ended.load(Ordering::Acquire);
     let mut v1: Vec<Arc<Vec<u8>>> = Some(wire).filter(|_| camera_live).into_iter().collect();
@@ -4505,7 +4505,7 @@ async fn reannounce(shared: &Arc<Shared>) {
     }
 }
 
-/// 45.1 — each of `links`' Channel watermark now: its newest message's
+/// v45 — each of `links`' Channel watermark now: its newest message's
 /// sequence. Taken right after a message went out on them, it is at or
 /// after that message's own (media sent since only makes the wait a little
 /// longer, never short). A link with no Channel carried nothing to prove
@@ -4520,7 +4520,7 @@ fn channel_marks(shared: &Arc<Shared>, links: &[[u8; 16]]) -> Vec<([u8; 16], u16
         .collect()
 }
 
-/// 45.1 — wait until each marked link's Channel proved delivered the
+/// v45 — wait until each marked link's Channel proved delivered the
 /// message at its mark and everything before it
 /// ([`AvLinkStats::delivered_through`], a per-message proof that later
 /// traffic in flight does not hide), or `ceiling` passes. Returns how many
@@ -4643,7 +4643,7 @@ async fn forward(
             job.base_or_audio,
         ) {
             targets.extend(legs.iter().filter(|l| !ex.contains(l)).cloned());
-            // 45.1 — a child that asked for less gets less.
+            // v45 — a child that asked for less gets less.
             for l in alm.layer_exclude(job.stream, &legs, inner.codec_id(), inner.layer()) {
                 targets.remove(&l);
             }
@@ -4685,11 +4685,11 @@ async fn forward(
     }
 }
 
-/// 45.1 — how long a released chunk waits for its stream's v2 binding (its
+/// v45 — how long a released chunk waits for its stream's v2 binding (its
 /// framing) before it is dropped: the longest reorder window.
 pub const FRAMING_HOLD: Duration = REORDER_WINDOW_MAX;
 
-/// 45.1 (CC rc18) — what this receiver knows of `(stream, epoch)`'s framing:
+/// v45 (CC rc18) — what this receiver knows of `(stream, epoch)`'s framing:
 /// its v2 binding's when installed. With only v1 held it is unframed only
 /// when no v2 can be coming, decided from facts this node authenticates
 /// itself (CC's condition): its own capability (it does not advertise
@@ -4723,7 +4723,7 @@ async fn reorder_loop(
     counts: Arc<StdMutex<ReorderCounts>>,
 ) {
     let mut window = ReorderWindow::new();
-    // 45.1 — a framed stream's fragments become whole frames here, past the
+    // v45 — a framed stream's fragments become whole frames here, past the
     // window (a missing fragment is a missing chunk: the window waited for
     // it by chunk_seq first).
     let mut frames_of = frame::Reassemblers::default();
@@ -4894,7 +4894,7 @@ fn fresh_stream(room: &str, own_key_id: &str) -> Result<([u8; 32], StreamId), Ca
     }
 }
 
-/// 45.1 — switch to a minted replacement once its overlap passed (or at
+/// v45 — switch to a minted replacement once its overlap passed (or at
 /// once, `force`): the publisher publishes the new stream from its next
 /// chunk, and the old one stops.
 async fn apply_pending_replace(shared: &Arc<Shared>, force: bool) -> Result<(), CallError> {
@@ -4919,7 +4919,7 @@ async fn apply_pending_replace(shared: &Arc<Shared>, force: bool) -> Result<(), 
     tracing::info!(
         old = %crate::transport::realtime_av::stream_label(old),
         new = %crate::transport::realtime_av::stream_label(new),
-        "CALL STREAM REPLACED: this node now publishes the new stream (45.1)"
+        "CALL STREAM REPLACED: this node now publishes the new stream (v45)"
     );
     if let KeepOutcome::Refused(r) = keep {
         shared.emit(CallEvent::KeepRefused {
@@ -4930,7 +4930,7 @@ async fn apply_pending_replace(shared: &Arc<Shared>, force: bool) -> Result<(), 
     Ok(())
 }
 
-/// 45.1 — one installed binding's word on attendance (see
+/// v45 — one installed binding's word on attendance (see
 /// [`Attendance::on_bound`]), its events emitted. Another attendee's signed
 /// end waits for its verdict ([`settle_ends`]).
 fn on_bound(shared: &Arc<Shared>, b: &StreamKeyBinding) {
@@ -4956,12 +4956,12 @@ fn on_bound(shared: &Arc<Shared>, b: &StreamKeyBinding) {
         if let CallEvent::StreamReplaced { old, new, .. } = &e {
             Shared::lock(&shared.alm).forget_replaced_stream(*old, *new);
         }
-        tracing::info!(event = ?e, "call: attendance (45.1)");
+        tracing::info!(event = ?e, "call: attendance (v45)");
         shared.emit(e);
     }
 }
 
-/// 45.1 — the truncation verdict on `stream`'s signed end, counted.
+/// v45 — the truncation verdict on `stream`'s signed end, counted.
 fn settle_truncation(shared: &Arc<Shared>, stream: StreamId) -> bool {
     let truncated = shared.auth.settle_end(stream);
     if truncated {
@@ -4970,7 +4970,7 @@ fn settle_truncation(shared: &Arc<Shared>, stream: StreamId) -> bool {
     truncated
 }
 
-/// 45.1 — every held signed end whose verdict is due: the attendee left,
+/// v45 — every held signed end whose verdict is due: the attendee left,
 /// truncated only if a chunk up to its `final_seq` is still missing once
 /// [`END_VERDICT_AFTER`] passed (presence too is read then, so a stream
 /// whose first chunks came in that window still counts as heard).
@@ -4982,22 +4982,22 @@ fn settle_ends(shared: &Arc<Shared>) {
         let events =
             Shared::lock(&shared.attendance).on_bound(&shared.own, &b, None, present, truncated);
         for e in events {
-            tracing::info!(event = ?e, "call: attendance (45.1)");
+            tracing::info!(event = ?e, "call: attendance (v45)");
             shared.emit(e);
         }
     }
 }
 
-/// 45.1 — every stream of `key_id` left the call for `cause`: once.
+/// v45 — every stream of `key_id` left the call for `cause`: once.
 fn attendee_left(shared: &Arc<Shared>, key_id: &str, cause: LeaveCause) {
     let e = Shared::lock(&shared.attendance).leave_all(key_id, cause, |s| shared.auth.heard(s));
     if let Some(e) = e {
-        tracing::info!(event = ?e, "call: attendance (45.1)");
+        tracing::info!(event = ?e, "call: attendance (v45)");
         shared.emit(e);
     }
 }
 
-/// 45.1 — `Lost`: an attendee with no leg up (neither this node's leg to it
+/// v45 — `Lost`: an attendee with no leg up (neither this node's leg to it
 /// nor its link to this node) for [`ATTENDEE_LOST_AFTER`], whose streams
 /// have all been silent on every path that long, and no signed end seen.
 fn check_lost(shared: &Arc<Shared>) {

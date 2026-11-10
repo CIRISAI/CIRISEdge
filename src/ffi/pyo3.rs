@@ -555,7 +555,7 @@ impl PyEdge {
         self.inner.set_av_datagrams_enabled(enabled);
     }
 
-    /// 45.1 — the A/V layer-request lever (`Call.request_layers`). Default
+    /// v45 — the A/V layer-request lever (`Call.request_layers`). Default
     /// off until CC corrects 5.3.3.2.4. Calls joined from now on follow it.
     fn set_av_layer_requests_enabled(&self, enabled: bool) {
         self.inner.set_av_layer_requests_enabled(enabled);
@@ -4677,7 +4677,7 @@ impl PyCall {
             .unwrap_or(self.stream_id)
     }
 
-    /// 45.1 — replace this node's stream in place (a codec change): a new
+    /// v45 — replace this node's stream in place (a codec change): a new
     /// stream, bound and switched to make-before-break, whose signed binding
     /// says it replaces the old (receivers get `stream_replaced`, no leave).
     /// `codecs` is the new map as tokens (`None`: the old one's). Returns the
@@ -4690,7 +4690,7 @@ impl PyCall {
         })
     }
 
-    /// 45.1 — publish a second stream beside the camera (a desktop or
+    /// v45 — publish a second stream beside the camera (a desktop or
     /// window share): its own stream id, bindings and codec map (`codecs` as
     /// tokens; `None`: none). Receivers bind it as a separate stream, never
     /// a replacement; its end is `stream_ended`, never `attendee_left`.
@@ -4704,7 +4704,7 @@ impl PyCall {
         })
     }
 
-    /// 45.1 — `publish` on one of this node's streams (`stream_id()` or one
+    /// v45 — `publish` on one of this node's streams (`stream_id()` or one
     /// `add_stream` gave): the same dict. A stream this node does not
     /// publish raises `unknown_stream`.
     #[pyo3(signature = (stream_id, frame, codec_id=PY_CODEC_OPAQUE, layer=(0, 0, 0)))]
@@ -4739,7 +4739,7 @@ impl PyCall {
         Ok(d.unbind().into_any())
     }
 
-    /// 45.1 — end one own stream and only it, signed. `cause` `None` (the
+    /// v45 — end one own stream and only it, signed. `cause` `None` (the
     /// default) signs `end = 3` ("this stream ended", never a leave): a
     /// share stops. `"backgrounded"` or `"left"` sign 2 or 1, which a
     /// receiver takes as a leave only on the member's last stream: a phone
@@ -4766,7 +4766,7 @@ impl PyCall {
         })
     }
 
-    /// 45.1 — every stream this node publishes in the call, the primary
+    /// v45 — every stream this node publishes in the call, the primary
     /// first.
     fn streams(&self, py: Python<'_>) -> PyResult<Vec<[u8; 32]>> {
         self.with_call(py, |c| {
@@ -4792,7 +4792,7 @@ impl PyCall {
         self.with_call(py, |c| Box::pin(async move { Ok(c.legs()) }))
     }
 
-    /// 45.1 — ask this node's parents for the stream `stream_id` for at most
+    /// v45 — ask this node's parents for the stream `stream_id` for at most
     /// `layers` = `(spatial, temporal, quality)`; `None` withdraws. The cap
     /// rides the SUBSCRIBE to a parent that takes one (the host's lever,
     /// off by default). Returns whether a SUBSCRIBE went out now.

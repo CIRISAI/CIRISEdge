@@ -358,11 +358,11 @@ config, `ControllerConfig::transport_relay()`, with the same structure as `::int
   `measured_sustainable`.
 - **C2 Admission (at the relay).**
   `usable = min(0.65 · advertised, measured) − committed − reserve`: one margin per measurement
-  (§5.1, v45.1). An advertised claim takes `commit_fraction = 0.65`; `measured` already carries the
+  (§5.1, v45.0.0). An advertised claim takes `commit_fraction = 0.65`; `measured` already carries the
   meter's 0.75 margin, and nothing is stacked on it. There is one trial slot while unmeasured, and the most recent
   admittee is shed first (LIFO) on sustained over-commit.
 
-  `measured` is the uplink meter's verdict (`docs/AV_ALM_DESIGN.md` §5.1; v45.1): over a trailing
+  `measured` is the uplink meter's verdict (`docs/AV_ALM_DESIGN.md` §5.1; v45.0.0): over a trailing
   30 s span, the uplink is the bottleneck only when at least 5 % of the frames offered across ALL its
   legs were refused, in at least 3 windows of the span (and the span holds at least 5); then
   `measured` is the p10 delivery rate (leviculum `bytes_delivered`, a datagram leg counting what it

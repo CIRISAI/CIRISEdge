@@ -393,7 +393,7 @@ pub struct SubscribeRequest<P> {
     /// Whether the requester can itself forward (it may use the forwarder
     /// reserve).
     pub forward_capable: bool,
-    /// 45.1 — the most of this stream the requester takes from this parent
+    /// v45 — the most of this stream the requester takes from this parent
     /// (CC 5.3.3.4: a relay forwards only the layers asked for, on the tree):
     /// `None` is everything. Carried only to a parent whose `CAPS` carry
     /// [`wire::CAP_LAYER_REQUEST`]; a re-SUBSCRIBE changes or withdraws it.
@@ -550,7 +550,7 @@ impl ShedReason {
 }
 
 /// Whether a chunk of `codec_id` at `layer` passes a child's layer cap
-/// (45.1, carried on its SUBSCRIBE): codec-opaque chunks pass every cap, and
+/// (v45, carried on its SUBSCRIBE): codec-opaque chunks pass every cap, and
 /// a layered chunk passes when every axis is within it.
 #[must_use]
 pub fn layer_cap_admits(

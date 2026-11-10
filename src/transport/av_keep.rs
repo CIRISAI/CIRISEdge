@@ -343,7 +343,7 @@ impl<R: StreamDekRegistrar> KeptAvPublisher<R> {
         Ok(self.register_current().await)
     }
 
-    /// 45.1 — [`AvPublisher::replace_room_stream`], registering the new
+    /// v45 — [`AvPublisher::replace_room_stream`], registering the new
     /// stream's current epoch when kept (a new stream is a new keep target).
     ///
     /// # Errors
