@@ -342,6 +342,25 @@ impl AlmState {
         self.caps.get(peer).is_some_and(|c| c & CAP_BINDING_V2 != 0)
     }
 
+    /// 45.1 — whether `peer`'s `CAPS` came and lack `CAP_BINDING_V2`: an
+    /// older build that never signs a v2 binding (so none is in flight).
+    pub(super) fn known_without_binding_v2(&self, peer: &str) -> bool {
+        self.caps.get(peer).is_some_and(|c| c & CAP_BINDING_V2 == 0)
+    }
+
+    /// 45.1 — whether this node sends `peer` v2 bindings: `peer` takes them
+    /// and this node advertises taking them too (a node that does not, a v44
+    /// build or the test seam's, signs and sends v1 only).
+    pub(super) fn sends_binding_v2_to(&self, peer: &str) -> bool {
+        self.advertises_binding_v2() && self.takes_binding_v2(peer)
+    }
+
+    /// 45.1 — whether this node advertises `CAP_BINDING_V2` (it takes v2
+    /// bindings, so a framed stream's v2 is sent to it).
+    pub(super) fn advertises_binding_v2(&self) -> bool {
+        self.caps_bits() & CAP_BINDING_V2 != 0
+    }
+
     /// leviculum#102 — whether `peer` takes media as unordered link
     /// datagrams. Only a peer whose `CAPS` carried the bit: an older edge (or
     /// one whose `CAPS` has not arrived) reads as "no".

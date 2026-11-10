@@ -144,23 +144,26 @@ pub const BINDING_VERSION_V2: u8 = 2;
 /// names the codec of each class, in a [`CodecMap`] fixed for the stream's
 /// life (a codec change is `Call::replace_stream`: a new join nonce, a new
 /// stream).
+///
+/// A token names the whole payload format, codec and bitstream framing (CC
+/// reading, rc18): what one chunk's (or one reassembled frame's) plaintext
+/// is. Three are registered; any other spelling binds as an undecodable
+/// class (the unknown-token rule), never malformed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CodecToken {
-    /// AV1, under `0x01` (SVC).
+    /// AV1 under `0x01` (SVC): one temporal unit's low-overhead-format OBUs
+    /// for one layer.
     Av1,
-    /// H.264, under `0x04` (temporal-layered, one spatial layer).
+    /// H.264 under `0x04` (temporal-layered, one spatial layer): one Annex B
+    /// access unit.
     H264,
-    /// VP8, under `0x04`.
-    Vp8,
-    /// VP9, under `0x04`.
-    Vp9,
-    /// Opus (audio), under `0xFF` (codec-opaque).
+    /// Opus (audio) under `0xFF` (codec-opaque): one Opus packet (RFC 6716).
     Opus,
 }
 
 impl CodecToken {
     /// Every registered token.
-    pub const ALL: [Self; 5] = [Self::Av1, Self::H264, Self::Vp8, Self::Vp9, Self::Opus];
+    pub const ALL: [Self; 3] = [Self::Av1, Self::H264, Self::Opus];
 
     /// The token's wire spelling.
     #[must_use]
@@ -168,8 +171,6 @@ impl CodecToken {
         match self {
             Self::Av1 => "av1",
             Self::H264 => "h264",
-            Self::Vp8 => "vp8",
-            Self::Vp9 => "vp9",
             Self::Opus => "opus",
         }
     }
@@ -187,7 +188,7 @@ impl CodecToken {
         use crate::transport::realtime_av::{CODEC_AV1_SVC, CODEC_OPAQUE, CODEC_TEMPORAL_LAYERED};
         match self {
             Self::Av1 => CODEC_AV1_SVC,
-            Self::H264 | Self::Vp8 | Self::Vp9 => CODEC_TEMPORAL_LAYERED,
+            Self::H264 => CODEC_TEMPORAL_LAYERED,
             Self::Opus => CODEC_OPAQUE,
         }
     }
@@ -791,6 +792,11 @@ pub struct StreamKeyBinding {
     pub kind: u8,
     /// v2: the stream's framing ([`FRAMING_NONE`] or [`FRAMING_FRAGMENTS`]).
     pub framing: u8,
+    /// 45.1 — encoded as v2 even when every v2 member is its default (a
+    /// 45.1 publisher signs a v2 binding for every stream, so its framing,
+    /// 0 included, is stated). Set by [`Self::sign_v2`] with members and by
+    /// parsing a v2 encoding.
+    pub explicit_v2: bool,
 }
 
 /// Why a binding was refused.
@@ -942,7 +948,8 @@ impl StreamKeyBinding {
     /// The encoding version: 2 when the binding names a codec, else 1.
     #[must_use]
     pub const fn version(&self) -> u8 {
-        if self.codecs.is_some()
+        if self.explicit_v2
+            || self.codecs.is_some()
             || self.replaces.is_some()
             || self.end.is_some()
             || self.kind != STREAM_KIND_MEDIA
@@ -1004,6 +1011,7 @@ impl StreamKeyBinding {
         chunk_key: [u8; 32],
         v2: Option<V2Members>,
     ) -> Result<Self, ChunkKeyError> {
+        let explicit_v2 = v2.is_some();
         let (codecs, replaces, end, final_seq, kind, framing) = match v2 {
             Some(m) => (
                 m.codecs,
@@ -1036,6 +1044,7 @@ impl StreamKeyBinding {
             final_seq: final_seq.or_else(|| end.map(|_| FINAL_SEQ_NONE)),
             kind,
             framing,
+            explicit_v2,
         };
         let (ed_b64, pq_b64) =
             crate::identity::sign_bound_hybrid(signer, &b.signed_bytes(), "stream key binding")
@@ -1099,16 +1108,10 @@ impl StreamKeyBinding {
             if framing > FRAMING_FRAGMENTS {
                 return Err(BindingError::Malformed("framing"));
             }
-            // A v2 binding says something v1 cannot: a map, a replacement,
-            // an end, a kind or a framing.
-            if codecs.is_none()
-                && replaces.is_none()
-                && end.is_none()
-                && kind == STREAM_KIND_MEDIA
-                && framing == FRAMING_NONE
-            {
-                return Err(BindingError::Malformed("codec map size"));
-            }
+            // 45.1 — a v2 binding always states its kind and framing, so one
+            // with no map, no replacement and no end still says something:
+            // "framing 0". A 45.1 publisher signs one for every stream, so a
+            // v2 receiver knows a stream's framing before parsing a chunk.
             (codecs, replaces, end, final_seq, kind, framing)
         } else {
             (None, None, None, None, STREAM_KIND_MEDIA, FRAMING_NONE)
@@ -1139,6 +1142,7 @@ impl StreamKeyBinding {
             final_seq,
             kind,
             framing,
+            explicit_v2: version == BINDING_VERSION_V2,
         })
     }
 
@@ -1796,22 +1800,21 @@ impl ChunkAuth {
             .collect()
     }
 
+    /// 45.1 — `(stream, epoch)`'s framing when its v2 binding is installed;
+    /// `None` while only its v1 binding is (or none).
+    #[must_use]
+    pub fn v2_framing(&self, stream: StreamId, epoch: Epoch) -> Option<u8> {
+        self.held()
+            .bound
+            .get(&(stream, epoch.0))
+            .filter(|b| b.wire_v2.is_some())
+            .map(|b| b.framing)
+    }
+
     /// 45.1 — whether any epoch of `stream` is bound here.
     #[must_use]
     pub fn is_bound(&self, stream: StreamId) -> bool {
         self.held().bound.keys().any(|(s, _)| *s == stream)
-    }
-
-    /// 45.1 — `(stream, epoch)`'s framing as its v2 binding signed it
-    /// ([`FRAMING_NONE`] for a v1-only or unbound one). Read when a chunk is
-    /// released to the frame layer, past the reorder window, so a v2 binding
-    /// that followed its v1 twin is in hand.
-    #[must_use]
-    pub fn framing_of(&self, stream: StreamId, epoch: Epoch) -> u8 {
-        self.held()
-            .bound
-            .get(&(stream, epoch.0))
-            .map_or(FRAMING_NONE, |b| b.framing)
     }
 
     /// Whether this receiver ever verified a chunk of `stream`: its presence,

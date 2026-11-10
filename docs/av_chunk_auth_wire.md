@@ -247,9 +247,11 @@ members after member 7 (`chunk_key`):
 | 7e | kind | `u8`: 0 media, 1 share (CC reading rc18). Any value parses; an unknown one renders as media. Gates nothing: not admission, keys, sealing, the trailer, shedding or keeping | 1 |
 | 7f | framing | `u8`: 0 one frame per chunk, no marker; 1 every chunk whose `codec_id` is not `0xFF` starts with the fragment marker (§1.9). Any other value is malformed. Fixed per (stream, epoch) | 1 |
 
-`count` 0 (no map) is allowed only when `replaces`, `end`, `kind` or
-`framing` says something: an end, a replacement or a share of a stream that
-declared no codecs. A v2 binding with none of them is malformed. A v1
+`count` 0 (no map) is allowed: a v2 binding always states its `kind` and
+`framing`, so one with no map, no replacement and no end still says
+"framing 0". A 45.1 publisher signs a v2 binding for every stream (flag for
+the CC: this lifts rc17's "an empty map only with `end` or `replaces`"), so
+a v2 receiver learns every stream's framing from a signed binding. A v1
 binding reads as `kind` 0 and `framing` 0.
 
 Offsets: members 7a–7f follow `chunk_key` in order, so with `L` = the end of
@@ -277,22 +279,28 @@ The hybrid signature is made as in §1.2 over `signed_bytes_v2`.
 
 Registered tokens:
 
-| Token | Class |
-|---|---|
-| `av1` | `0x01` (SVC) |
-| `h264` | `0x04` (temporal-layered) |
-| `vp8` | `0x04` |
-| `vp9` | `0x04` |
-| `opus` | `0xFF` (codec-opaque) |
+A token names the whole payload format: the codec and its bitstream
+framing, so two implementations that agree on the token agree on the bytes
+(CC reading, rc18). The payload is one chunk's plaintext, or one reassembled
+frame's on a framed stream (§1.9).
 
-The token table is CC's to register.
+| Token | Class | Payload (one frame) |
+|---|---|---|
+| `av1` | `0x01` (SVC) | one temporal unit's OBUs for one layer, in AV1's low-overhead bitstream format |
+| `h264` | `0x04` (temporal-layered) | one access unit in Annex B byte-stream format (ITU-T H.264 Annex B) |
+| `opus` | `0xFF` (codec-opaque) | one Opus packet (RFC 6716), no container |
+
+Only these three are registered. Any other spelling (`vp8` and `vp9`
+included) binds under the unknown-token rule: the class is undecodable and
+its chunks are dropped `av_chunk_class_undecodable`; the binding is not
+malformed. The token table is CC's to register.
 
 Parse rules. These are refused as `av_binding_malformed`:
 - a registered token under a class that is not its own;
 - a token of 0 or more than 32 bytes, or one that is not printable ASCII;
 - a map with more than 8 entries, out of class order, or with a class twice;
 - a `present` byte other than 0 or 1;
-- an `end` byte above 2.
+- an `end` byte above 3, or a `framing` byte above 1.
 
 An **unregistered** token binds: on this receiver its class is undecodable,
 so a codec registered later never takes the audio away from an older client.
@@ -431,9 +439,34 @@ sealed chunk is ever split (5.3.3.2.3).
   the last fragment's `chunk_seq`.
 - **Budget.** Fragments are cut to the call's `chunk_plaintext_budget` (the
   minimum over its legs, §3), so an MTU-500 member still gets video; each
-  fragment carries `budget − 4` media bytes. At most 256 fragments: a larger
-  frame is refused before sealing (`frame_too_large`, budget `256 × (budget −
-  4)`). An unframed stream keeps the one-chunk refusal.
+  fragment carries `budget − 4` media bytes. At most 4096 fragments
+  (`frag_count` stays a `u16`) and at most 1 MiB reassembled, whichever
+  binds first: a larger frame is refused before sealing (`frame_too_large`,
+  budget `min(4096 × (budget − 4), 1 MiB)`). At MTU 500 that is 983,040 B
+  (4096 × 240); at MTU 1400 the 1 MiB cap binds (4096 × 1,136 would be
+  4,653,056 B). A 1080p desktop keyframe fits at both. An unframed stream
+  keeps the one-chunk refusal.
+- **The binding comes first; a framed chunk is never parsed unframed.** A
+  publisher (and a member relay) sends a stream's v2 binding before its v1
+  on every leg whose peer advertises `CAP_BINDING_V2`, at every roll,
+  replacement, share and re-announce. A leg's first binding (before its
+  CAPS) is v1, and on a datagram leg a chunk can overtake the Channel, so
+  the receiver also guards: a non-audio chunk released while only its
+  `(stream, epoch)`'s v1 binding is held waits, in order, until the v2
+  binding installs (then it goes on with the signed framing) or the hold
+  passes (`REORDER_WINDOW_MAX`, then it is dropped `av_frame_framing_unknown`).
+  It goes on as unframed at once only when no v2 can be coming: the receiver
+  does not advertise bit 5, or the publisher's own CAPS lack it.
+- **Receiver bounds.** Each (stream, layer) holds at most one open frame
+  (a new frame's first fragment on that layer closes the old,
+  `av_frame_incomplete`): for `av1` one frame is one layer of a temporal
+  unit, and on a datagram leg layer 1's first fragments may come before
+  layer 0's last, so a per-stream slot would drop the base layer. A stream
+  holds at most 16 layer slots; past that, the slot with the oldest open
+  frame closes. A frame whose fragments pass 1 MiB is dropped
+  `av_frame_too_large`. A fragment that continues another layer's open
+  frame by `chunk_seq` drops that frame `av_frame_layer_mismatch`.
+  `ReorderCounts` carries `frames_open` and `frames_dropped`.
 - **Sending.** A leg that fails one fragment (congested, too large, gone)
   gets none of the rest of that frame: a partial frame is worth nothing.
 - **Receiving.** The reorder window orders and dedupes per chunk as before.
@@ -454,6 +487,8 @@ sealed chunk is ever split (5.3.3.2.3).
 | `av_frame_layer_mismatch` | a fragment's `codec_id` or layer differs from its frame's |
 | `av_frame_crosses_epoch` | a fragment's epoch differs from its frame's |
 | `av_frame_incomplete` | a fragment the reorder window gave up on; the frame dropped whole, once |
+| `av_frame_too_large` | a frame whose fragments pass 1 MiB |
+| `av_frame_framing_unknown` | a non-audio chunk held for its stream's v2 binding past the hold; never parsed unframed |
 
 KATs (`framed_chunk_kats_with_the_shipping_trailer`), with the inputs of §5,
 codec `0x04`, layer (0,0,0): a whole frame `kat-frame` in one framed chunk
@@ -548,10 +583,10 @@ max plaintext after    = channel_limit − 84 − 72 = channel_limit − 156    
 
 `link_mdu` is leviculum's `floor((mtu − 1 − 19 − 48) / 16) × 16 − 1`.
 
-| Link MTU | link MDU | Channel limit | Max plaintext before | after | Fragment media (after − 4) | Largest framed frame (× 256) | Binding parts (KAT size) |
+| Link MTU | link MDU | Channel limit | Max plaintext before | after | Fragment media (after − 4) | Largest framed frame | Binding parts (KAT size) |
 |---|---|---|---|---|---|---|---|
-| 500 (base) | 431 | 400 | 316 | 244 | 240 | 61,440 B | 10 × ≤400 B |
-| 1400 (punched direct, `direct_path.rs:666`) | 1327 | 1296 | 1212 | 1140 | 1,136 | 290,816 B | 3 × ≤1296 B |
+| 500 (base) | 431 | 400 | 316 | 244 | 240 | 983,040 B (4096 × 240) | 10 × ≤400 B |
+| 1400 (punched direct, `direct_path.rs:666`) | 1327 | 1296 | 1212 | 1140 | 1,136 | 1,048,576 B (the 1 MiB cap) | 3 × ≤1296 B |
 
 The call refuses a frame over the budget before sealing it. A smaller MTU
 shrinks every number in the row.

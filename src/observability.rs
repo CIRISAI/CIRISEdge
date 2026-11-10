@@ -1041,6 +1041,11 @@ pub const AV_FRAME_CROSSES_EPOCH: &str = "av_frame_crosses_epoch";
 /// 45.1 — a frame missing a fragment the reorder window gave up on: dropped
 /// whole, once.
 pub const AV_FRAME_INCOMPLETE: &str = "av_frame_incomplete";
+/// 45.1 — a frame whose fragments pass 1 MiB: dropped whole.
+pub const AV_FRAME_TOO_LARGE: &str = "av_frame_too_large";
+/// 45.1 — a framed stream's chunk whose v2 binding (its framing) never came
+/// within the hold: dropped, never parsed as unframed.
+pub const AV_FRAME_FRAMING_UNKNOWN: &str = "av_frame_framing_unknown";
 /// ALM C3 — a control frame sent / received / refused as malformed.
 pub const ALM_C3_SENT: &str = "alm_c3_sent";
 /// ALM C3 — a control frame that could not be sent to its member.
@@ -2197,6 +2202,8 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_FRAME_LAYER_MISMATCH,
     AV_FRAME_CROSSES_EPOCH,
     AV_FRAME_INCOMPLETE,
+    AV_FRAME_TOO_LARGE,
+    AV_FRAME_FRAMING_UNKNOWN,
     ALM_C3_SENT,
     ALM_C3_SEND_FAILED,
     ALM_C3_RESENT,

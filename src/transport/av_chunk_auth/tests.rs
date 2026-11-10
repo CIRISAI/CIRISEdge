@@ -221,6 +221,7 @@ async fn a_member_holding_the_dek_cannot_forge_the_publishers_chunks() {
         final_seq: None,
         kind: 0,
         framing: 0,
+        explicit_v2: false,
     };
     let (ed, pq) = crate::identity::sign_bound_hybrid(&b, &lie.signed_bytes(), "lie")
         .await
@@ -604,6 +605,7 @@ fn binding_parse_enforces_both_signature_lengths() {
         final_seq: None,
         kind: 0,
         framing: 0,
+        explicit_v2: false,
     };
     assert!(StreamKeyBinding::from_bytes(&good.to_bytes()).is_ok());
     for len in [1, ML_DSA_65_SIG_LEN - 1, ML_DSA_65_SIG_LEN + 1] {
@@ -636,6 +638,7 @@ fn kat_v2(v2: Option<V2Members>) -> StreamKeyBinding {
         a.copy_from_slice(&v);
         a
     };
+    let explicit_v2 = v2.is_some();
     let (codecs, replaces, end, final_seq, kind, framing) = match v2 {
         Some(m) => (m.codecs, m.replaces, m.end, m.final_seq, m.kind, m.framing),
         None => (None, None, None, None, 0, 0),
@@ -655,6 +658,7 @@ fn kat_v2(v2: Option<V2Members>) -> StreamKeyBinding {
         final_seq,
         kind,
         framing,
+        explicit_v2,
     }
 }
 
@@ -733,16 +737,14 @@ fn the_codec_map_rules() {
         [
             ("av1", CODEC_AV1_SVC),
             ("h264", CODEC_TEMPORAL_LAYERED),
-            ("vp8", CODEC_TEMPORAL_LAYERED),
-            ("vp9", CODEC_TEMPORAL_LAYERED),
             ("opus", CODEC_OPAQUE),
         ]
     );
-    for bad in ["opaque", "H264", "", "theora"] {
+    for bad in ["opaque", "H264", "", "theora", "vp8", "vp9"] {
         assert_eq!(CodecToken::parse(bad), None, "{bad:?}");
     }
     assert_eq!(
-        CodecMap::new([CodecToken::H264, CodecToken::Vp8]),
+        CodecMap::new([CodecToken::H264, CodecToken::H264]),
         Err(BindingError::Malformed("codec map class twice"))
     );
     assert_eq!(
@@ -787,8 +789,21 @@ fn the_codec_map_rules() {
         rewrite(&|w| w[tok] = 0x07),
         Err(BindingError::Malformed("codec token"))
     );
-    // A count of zero with nothing else to say (no replaces, end 0).
+    // A count of zero with the entries still there: they read as the next
+    // members, which do not parse.
     assert!(rewrite(&|w| w[at] = 0).is_err());
+    // 45.1 — a v2 binding with no map, no replacement, no end, kind 0 and
+    // framing 0 binds: it states "framing 0" (every 45.1 stream signs one).
+    let plain = kat_v2(Some(V2Members {
+        codecs: None,
+        replaces: None,
+        end: None,
+        final_seq: None,
+        kind: STREAM_KIND_MEDIA,
+        framing: FRAMING_NONE,
+    }));
+    assert_eq!(plain.version(), BINDING_VERSION_V2);
+    assert_eq!(StreamKeyBinding::from_bytes(&plain.to_bytes()), Ok(plain));
     // An end statement of a stream that declared no codecs: an empty map.
     let end_only = kat_v2(Some(V2Members {
         codecs: None,
@@ -848,7 +863,7 @@ fn a_stream_keeps_its_codec_map_for_its_life() {
     let wire = |b: &StreamKeyBinding| Arc::new(b.to_bytes());
     let first = kat_v2(v2m(av_map()));
     auth.install(&first, wire(&first)).expect("first binding");
-    let vp8 = CodecMap::new([CodecToken::Opus, CodecToken::Vp8]).expect("map");
+    let vp8 = CodecMap::new([CodecToken::Opus, CodecToken::Av1]).expect("map");
     let other = kat_v2(v2m(vp8));
     let refused = auth.install(&other, wire(&other));
     assert_eq!(
@@ -1084,6 +1099,7 @@ fn binding_for(
         final_seq: end.map(|(_, f)| f),
         kind: 0,
         framing: 0,
+        explicit_v2: false,
     }
 }
 

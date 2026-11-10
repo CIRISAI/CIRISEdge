@@ -28,9 +28,15 @@ use super::{ChunkLayer, Epoch, ReceivedFrame, StreamId};
 /// The marker's length: `frag_index u16_be ‖ frag_count u16_be`.
 pub const FRAGMENT_MARKER_LEN: usize = 4;
 
-/// The most fragments one frame takes. A frame needing more is refused
-/// before anything is sealed.
-pub const MAX_FRAME_FRAGMENTS: usize = 256;
+/// The most fragments one frame takes (CC reading, rc18: `frag_count` ≤
+/// 4096, still a `u16`). A frame needing more is refused before anything is
+/// sealed.
+pub const MAX_FRAME_FRAGMENTS: usize = 4096;
+
+/// The largest reassembled frame (1 MiB): a larger one is refused before
+/// sealing, and a receiver drops a frame whose fragments pass it. A 1080p
+/// desktop keyframe fits at every MTU.
+pub const MAX_FRAME_BYTES: usize = 1 << 20;
 
 /// The marker for fragment `index` of `count`.
 #[must_use]
@@ -42,10 +48,14 @@ pub fn marker(index: u16, count: u16) -> [u8; FRAGMENT_MARKER_LEN] {
 
 /// Split `frame` into marked fragment plaintexts of at most `budget` bytes
 /// each (the call's `chunk_plaintext_budget`, the marker included). `None`
-/// when `budget` leaves no room past the marker, or the frame needs more
-/// than [`MAX_FRAME_FRAGMENTS`]. An empty frame is one fragment.
+/// when `budget` leaves no room past the marker, the frame is over
+/// [`MAX_FRAME_BYTES`], or it needs more than [`MAX_FRAME_FRAGMENTS`]. An
+/// empty frame is one fragment.
 #[must_use]
 pub fn split(frame: &[u8], budget: usize) -> Option<Vec<Vec<u8>>> {
+    if frame.len() > MAX_FRAME_BYTES {
+        return None;
+    }
     let per = budget.checked_sub(FRAGMENT_MARKER_LEN).filter(|p| *p > 0)?;
     let count = frame.len().div_ceil(per).max(1);
     if count > MAX_FRAME_FRAGMENTS {
@@ -65,10 +75,11 @@ pub fn split(frame: &[u8], budget: usize) -> Option<Vec<Vec<u8>>> {
 }
 
 /// The largest frame a framed stream takes at `budget`:
-/// [`MAX_FRAME_FRAGMENTS`] × (`budget` − the marker).
+/// [`MAX_FRAME_FRAGMENTS`] × (`budget` − the marker), capped at
+/// [`MAX_FRAME_BYTES`].
 #[must_use]
 pub fn max_frame_len(budget: usize) -> usize {
-    budget.saturating_sub(FRAGMENT_MARKER_LEN) * MAX_FRAME_FRAGMENTS
+    (budget.saturating_sub(FRAGMENT_MARKER_LEN) * MAX_FRAME_FRAGMENTS).min(MAX_FRAME_BYTES)
 }
 
 /// Why a released chunk of a framed stream did not become (part of) a
@@ -91,6 +102,13 @@ pub enum FrameRefusal {
     /// A frame missing a fragment the reorder window gave up on: dropped
     /// whole (counted once per frame).
     Incomplete,
+    /// A frame whose fragments pass [`MAX_FRAME_BYTES`].
+    TooLarge,
+    /// A framed stream's non-audio chunk whose framing never became known: it
+    /// was released while only the stream's v1 binding was held, and its v2
+    /// binding did not follow within the hold. Dropped, never parsed as
+    /// unframed.
+    FramingUnknown,
 }
 
 impl FrameRefusal {
@@ -107,11 +125,13 @@ impl FrameRefusal {
             Self::LayerMismatch => o::AV_FRAME_LAYER_MISMATCH,
             Self::CrossesEpoch => o::AV_FRAME_CROSSES_EPOCH,
             Self::Incomplete => o::AV_FRAME_INCOMPLETE,
+            Self::TooLarge => o::AV_FRAME_TOO_LARGE,
+            Self::FramingUnknown => o::AV_FRAME_FRAMING_UNKNOWN,
         }
     }
 
     /// Every token, for the metric registry.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::MarkerShort,
         Self::CountInvalid,
         Self::IndexInvalid,
@@ -119,6 +139,8 @@ impl FrameRefusal {
         Self::LayerMismatch,
         Self::CrossesEpoch,
         Self::Incomplete,
+        Self::TooLarge,
+        Self::FramingUnknown,
     ];
 }
 
@@ -134,8 +156,9 @@ struct Partial {
     bytes: Vec<u8>,
 }
 
-/// One stream's reassembly, fed the stream's framed chunks in the reorder
-/// window's release order (`chunk_seq` ascending, gaps already given up).
+/// One (stream, layer)'s reassembly, fed that layer's framed chunks in the
+/// reorder window's release order (`chunk_seq` ascending, gaps already given
+/// up). One frame is open at most.
 #[derive(Default)]
 pub struct Reassembler {
     partial: Option<Partial>,
@@ -234,6 +257,13 @@ impl Reassembler {
             self.orphan_once(&mut out, chunk.epoch, frame_start);
             return out;
         };
+        if p.bytes.len() + chunk.bytes.len() - FRAGMENT_MARKER_LEN > MAX_FRAME_BYTES {
+            let start = p.first_seq;
+            self.partial = None;
+            self.orphan = Some((chunk.epoch, start));
+            out.refused.push(FrameRefusal::TooLarge);
+            return out;
+        }
         p.bytes
             .extend_from_slice(&chunk.bytes[FRAGMENT_MARKER_LEN..]);
         p.next += 1;
@@ -275,16 +305,25 @@ pub fn parse(plaintext: &[u8]) -> Option<(u16, u16)> {
     ))
 }
 
-/// The per-stream reassemblers of one call, keyed by stream.
+/// The reassemblers of one call, one per (stream, layer).
 #[derive(Default)]
 pub struct Reassemblers {
-    streams: std::collections::HashMap<StreamId, Reassembler>,
+    /// One reassembler per (stream, layer): for `av1` one frame is one layer
+    /// of a temporal unit, and on a datagram leg layer 1's first fragments
+    /// may come before layer 0's last, so a per-stream slot would drop the
+    /// base layer (CC rc18).
+    slots: std::collections::HashMap<(StreamId, ChunkLayer), Reassembler>,
 }
+
+/// The most (stream, layer) slots one stream holds at once: past it, the
+/// slot with the oldest open frame is closed (that frame dropped,
+/// `av_frame_incomplete`). An SVC stream has far fewer layers.
+pub const MAX_LAYER_SLOTS_PER_STREAM: usize = 16;
 
 impl Reassemblers {
     /// Take one released chunk: an unframed stream's (`framing` 0) or an
     /// audio (`0xFF`) chunk passes through as a frame; a framed stream's
-    /// other chunks go through the stream's reassembler.
+    /// other chunks go through its (stream, layer) reassembler.
     pub fn push(&mut self, chunk: ReceivedFrame, framing: u8) -> Reassembled {
         if framing != crate::transport::av_chunk_auth::FRAMING_FRAGMENTS
             || chunk.codec_id == crate::transport::realtime_av::CODEC_OPAQUE
@@ -294,24 +333,239 @@ impl Reassemblers {
                 refused: Vec::new(),
             };
         }
-        self.streams.entry(chunk.stream).or_default().push(chunk)
+        let key = (chunk.stream, chunk.layer);
+        let mut early = Vec::new();
+        // A later fragment that continues another layer's open frame of the
+        // same stream: the frame changed layer mid-run.
+        if let Some((index, _)) = parse(&chunk.bytes).filter(|(i, _)| *i > 0) {
+            let seq = chunk.chunk_seq.0;
+            let own_open = self.slots.get(&key).is_some_and(|r| r.partial.is_some());
+            if !own_open {
+                let other = self.slots.iter().find_map(|(k, r)| {
+                    (k.0 == chunk.stream && k.1 != chunk.layer)
+                        .then_some(r.partial.as_ref())
+                        .flatten()
+                        .filter(|p| {
+                            p.epoch == chunk.epoch
+                                && p.first_seq + u64::from(index) == seq
+                                && p.next == index
+                        })
+                        .map(|_| *k)
+                });
+                if let Some(k) = other {
+                    if let Some(r) = self.slots.get_mut(&k) {
+                        r.partial = None;
+                        r.orphan = None;
+                    }
+                    let slot = self.slots.entry(key).or_default();
+                    slot.orphan = seq.checked_sub(u64::from(index)).map(|f| (chunk.epoch, f));
+                    return Reassembled {
+                        frame: None,
+                        refused: vec![FrameRefusal::LayerMismatch],
+                    };
+                }
+            }
+        }
+        if !self.slots.contains_key(&key) {
+            early.extend(self.make_room(chunk.stream));
+        }
+        let mut out = self.slots.entry(key).or_default().push(chunk);
+        early.append(&mut out.refused);
+        out.refused = early;
+        out
+    }
+
+    /// Keep a new slot within [`MAX_LAYER_SLOTS_PER_STREAM`] for `stream`:
+    /// drop an idle slot, else close the one with the oldest open frame.
+    fn make_room(&mut self, stream: StreamId) -> Vec<FrameRefusal> {
+        let keys: Vec<(StreamId, ChunkLayer)> = self
+            .slots
+            .keys()
+            .filter(|k| k.0 == stream)
+            .copied()
+            .collect();
+        if keys.len() < MAX_LAYER_SLOTS_PER_STREAM {
+            return Vec::new();
+        }
+        if let Some(idle) = keys
+            .iter()
+            .find(|k| self.slots.get(k).is_some_and(|r| r.partial.is_none()))
+        {
+            self.slots.remove(idle);
+            return Vec::new();
+        }
+        let oldest = keys.into_iter().min_by_key(|k| {
+            self.slots
+                .get(k)
+                .and_then(|r| r.partial.as_ref())
+                .map_or((u64::MAX, u64::MAX), |p| (p.epoch.0, p.first_seq))
+        });
+        let mut out = Reassembled::default();
+        if let Some(k) = oldest {
+            if let Some(mut r) = self.slots.remove(&k) {
+                r.abandon(&mut out);
+            }
+        }
+        out.refused
     }
 
     /// Keep only the streams `live` says are still bound; the rest (ended,
-    /// replaced, evicted) are forgotten, an open frame dropped incomplete.
+    /// replaced, evicted) are forgotten, open frames dropped incomplete.
     pub fn retain(&mut self, live: impl Fn(StreamId) -> bool) -> Vec<FrameRefusal> {
-        let gone: Vec<StreamId> = self.streams.keys().copied().filter(|s| !live(*s)).collect();
+        let mut gone: Vec<StreamId> = self
+            .slots
+            .keys()
+            .map(|k| k.0)
+            .filter(|s| !live(*s))
+            .collect();
+        gone.sort_unstable();
+        gone.dedup();
         gone.into_iter().flat_map(|s| self.forget(s)).collect()
     }
 
-    /// Forget `stream` (it ended or was replaced); an open frame is dropped
-    /// incomplete.
+    /// How many frames are open across every stream: the receiver's
+    /// reassembly gauge.
+    #[must_use]
+    pub fn open(&self) -> usize {
+        self.slots.values().filter(|r| r.partial.is_some()).count()
+    }
+
+    /// How many frames `stream` has open (at most one per layer).
+    #[must_use]
+    pub fn open_for(&self, stream: StreamId) -> usize {
+        self.slots
+            .iter()
+            .filter(|(k, r)| k.0 == stream && r.partial.is_some())
+            .count()
+    }
+
+    /// Forget `stream` (it ended or was replaced); its open frames are
+    /// dropped incomplete.
     pub fn forget(&mut self, stream: StreamId) -> Vec<FrameRefusal> {
+        let keys: Vec<(StreamId, ChunkLayer)> = self
+            .slots
+            .keys()
+            .filter(|k| k.0 == stream)
+            .copied()
+            .collect();
         let mut out = Reassembled::default();
-        if let Some(mut r) = self.streams.remove(&stream) {
-            r.abandon(&mut out);
+        for k in keys {
+            if let Some(mut r) = self.slots.remove(&k) {
+                r.abandon(&mut out);
+            }
         }
         out.refused
+    }
+}
+
+/// What a receiver knows of a released chunk's framing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramingState {
+    /// Known: the `(stream, epoch)`'s v2 binding signed this framing, or the
+    /// stream is known never to carry one (its publisher does not take v2,
+    /// or this receiver does not).
+    Known(u8),
+    /// Only the v1 binding is held and a v2 one may still be in flight: the
+    /// chunk waits (bounded) and is never parsed as unframed.
+    Pending,
+}
+
+/// 45.1 (CC rc18: a receiver never parses a framed chunk as unframed) —
+/// non-audio chunks whose framing is [`FramingState::Pending`] wait here,
+/// in order per `(stream, epoch)`, until the v2 binding installs (then they
+/// go on with its framing) or the hold passes (then they are dropped and
+/// counted [`FrameRefusal::FramingUnknown`]). Audio (`0xFF`) never carries
+/// the marker and never waits.
+#[derive(Default)]
+pub struct FramingGate {
+    held: std::collections::BTreeMap<
+        (StreamId, u64),
+        std::collections::VecDeque<(std::time::Instant, ReceivedFrame)>,
+    >,
+}
+
+impl FramingGate {
+    /// Take one released chunk in `state`; what goes on now, each with its
+    /// framing.
+    pub fn admit(
+        &mut self,
+        chunk: ReceivedFrame,
+        state: FramingState,
+        now: std::time::Instant,
+    ) -> Vec<(ReceivedFrame, u8)> {
+        if chunk.codec_id == crate::transport::realtime_av::CODEC_OPAQUE {
+            return vec![(chunk, crate::transport::av_chunk_auth::FRAMING_NONE)];
+        }
+        let key = (chunk.stream, chunk.epoch.0);
+        match state {
+            FramingState::Known(f) => {
+                let mut out = self.flush(key, f);
+                out.push((chunk, f));
+                out
+            }
+            FramingState::Pending => {
+                self.held.entry(key).or_default().push_back((now, chunk));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Re-read every held `(stream, epoch)`: a known framing releases its
+    /// chunks in order; a chunk held `hold` or longer is dropped. Returns
+    /// what goes on, and how many were dropped.
+    pub fn tick(
+        &mut self,
+        now: std::time::Instant,
+        hold: std::time::Duration,
+        state: impl Fn(&ReceivedFrame) -> FramingState,
+    ) -> (Vec<(ReceivedFrame, u8)>, u64) {
+        let keys: Vec<(StreamId, u64)> = self.held.keys().copied().collect();
+        let mut out = Vec::new();
+        let mut dropped = 0;
+        for key in keys {
+            let Some(st) = self
+                .held
+                .get(&key)
+                .and_then(|q| q.front())
+                .map(|(_, c)| state(c))
+            else {
+                continue;
+            };
+            match st {
+                FramingState::Known(f) => out.extend(self.flush(key, f)),
+                FramingState::Pending => {
+                    if let Some(q) = self.held.get_mut(&key) {
+                        while q
+                            .front()
+                            .is_some_and(|(t, _)| now.saturating_duration_since(*t) >= hold)
+                        {
+                            q.pop_front();
+                            dropped += 1;
+                        }
+                        if q.is_empty() {
+                            self.held.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+        (out, dropped)
+    }
+
+    /// When the oldest held chunk's hold runs out, if any is held.
+    #[must_use]
+    pub fn next_deadline(&self, hold: std::time::Duration) -> Option<std::time::Instant> {
+        self.held
+            .values()
+            .filter_map(|q| q.front().map(|(t, _)| *t + hold))
+            .min()
+    }
+
+    fn flush(&mut self, key: (StreamId, u64), framing: u8) -> Vec<(ReceivedFrame, u8)> {
+        self.held
+            .remove(&key)
+            .map(|q| q.into_iter().map(|(_, c)| (c, framing)).collect())
+            .unwrap_or_default()
     }
 }
 

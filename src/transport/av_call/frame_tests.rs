@@ -77,8 +77,11 @@ fn the_marker_is_index_then_count_and_a_whole_frame_is_zero_of_one() {
 }
 
 /// A 40 KB keyframe at a ~1,100 B budget is ⌈40000 / (b − 4)⌉ fragments,
-/// each at most the budget, the marker counting; 256 is the cap, and one
-/// byte past `max_frame_len` is refused before anything is sealed.
+/// each at most the budget, the marker counting. The caps (CC reading
+/// rc18): 4096 fragments and 1 MiB, whichever binds first; one byte past
+/// `max_frame_len` is refused before anything is sealed. At MTU 500 (budget
+/// 244) the fragment cap binds at 983,040 B; at MTU 1400 (budget 1,140) the
+/// 1 MiB cap does.
 #[test]
 fn a_keyframe_splits_to_the_budget_and_the_cap_is_256() {
     let budget = 1_100;
@@ -98,15 +101,29 @@ fn a_keyframe_splits_to_the_budget_and_the_cap_is_256() {
             ))
         );
     }
-    let max = max_frame_len(budget);
-    assert_eq!(max, 256 * (budget - 4));
+    assert_eq!(max_frame_len(244), 4096 * 240, "MTU 500: the fragment cap");
+    assert_eq!(max_frame_len(244), 983_040);
     assert_eq!(
-        split(&frame_bytes(max, 1), budget).expect("fits").len(),
-        256
+        max_frame_len(1_140),
+        MAX_FRAME_BYTES,
+        "MTU 1400: the 1 MiB cap"
+    );
+    let small = 244;
+    let max = max_frame_len(small);
+    assert_eq!(
+        split(&frame_bytes(max, 1), small).expect("fits").len(),
+        4096
     );
     assert!(
+        split(&frame_bytes(max + 1, 1), small).is_none(),
+        "4097 fragments"
+    );
+    let max = max_frame_len(budget);
+    assert_eq!(max, MAX_FRAME_BYTES);
+    assert!(split(&frame_bytes(max, 1), budget).is_some());
+    assert!(
         split(&frame_bytes(max + 1, 1), budget).is_none(),
-        "257 fragments"
+        "over 1 MiB"
     );
     assert!(
         split(b"x", FRAGMENT_MARKER_LEN).is_none(),
@@ -194,8 +211,12 @@ fn each_malformed_marker_is_refused_by_name() {
         ["av_frame_count_invalid"]
     );
     assert_eq!(
-        refuse(vec![with(0, marker(0, 257), L0, 1)]),
+        refuse(vec![with(0, marker(0, 4097), L0, 1)]),
         ["av_frame_count_invalid"]
+    );
+    assert!(
+        refuse(vec![with(0, marker(0, 4096), L0, 1)]).is_empty(),
+        "4096 is legal"
     );
     assert_eq!(
         refuse(vec![with(0, marker(3, 3), L0, 1)]),
@@ -285,4 +306,171 @@ fn forgetting_a_stream_mid_frame_drops_the_open_frame() {
     }
     assert_eq!(rs.forget(S), [FrameRefusal::Incomplete]);
     assert!(rs.forget(S).is_empty());
+}
+
+/// A frame whose fragments pass 1 MiB is dropped `av_frame_too_large`; a
+/// (stream, layer) holds one open frame at most, and the gauge says so.
+#[test]
+fn a_frame_past_one_mib_is_dropped_and_one_frame_is_open_per_stream() {
+    let mut r = Reassembler::default();
+    let big = vec![0u8; 600_000];
+    let first = chunk(
+        1,
+        0,
+        CODEC_TEMPORAL_LAYERED,
+        L0,
+        [&marker(0, 3)[..], &big].concat(),
+    );
+    let second = chunk(
+        1,
+        1,
+        CODEC_TEMPORAL_LAYERED,
+        L0,
+        [&marker(1, 3)[..], &big].concat(),
+    );
+    assert!(r.push(first).refused.is_empty());
+    assert_eq!(r.push(second).refused, [FrameRefusal::TooLarge]);
+    let mut rs = Reassemblers::default();
+    for c in fragments(&frame_bytes(3_000, 2), 1_000, 1, 0, L0)
+        .into_iter()
+        .take(2)
+    {
+        let _ = rs.push(c, FRAMING_FRAGMENTS);
+    }
+    assert_eq!(rs.open(), 1, "one open frame for the layer");
+    assert_eq!(rs.open_for(S), 1);
+    let next = fragments(&frame_bytes(3_000, 3), 1_000, 1, 10, L0);
+    let out = rs.push(next[0].clone(), FRAMING_FRAGMENTS);
+    assert_eq!(
+        out.refused,
+        [FrameRefusal::Incomplete],
+        "a new frame closes the old"
+    );
+    assert_eq!(rs.open(), 1, "still one");
+}
+
+/// CC rc18 — the framing race closed: v1 is held, then a framed stream's
+/// chunks are released, then its v2 binding arrives late. No chunk goes on
+/// as unframed while the framing is unknown; once v2 is in, the held chunks
+/// go on in order with its framing and the frames come out whole. Audio
+/// never waits. A v2 that never comes drops the held chunks past the hold,
+/// counted, and still nothing is parsed unframed.
+#[test]
+fn v1_then_chunks_then_late_v2_never_parses_a_framed_chunk_unframed() {
+    use std::time::{Duration, Instant};
+    let hold = Duration::from_millis(400);
+    let t = Instant::now();
+    let mut gate = FramingGate::default();
+    let mut rs = Reassemblers::default();
+    let frame = frame_bytes(2_500, 8);
+    let parts = fragments(&frame, 1_000, 1, 0, L0);
+    let opus = chunk(1, 99, CODEC_OPAQUE, L0, b"opus".to_vec());
+    // Only v1 held: every video chunk waits; audio goes on.
+    let mut out = Vec::new();
+    for c in parts.clone() {
+        out.extend(gate.admit(c, FramingState::Pending, t));
+    }
+    let audio = gate.admit(opus.clone(), FramingState::Pending, t);
+    assert_eq!(audio, vec![(opus, FRAMING_NONE)], "audio never waits");
+    assert!(
+        out.is_empty(),
+        "nothing parsed while the framing is unknown"
+    );
+    let (none, dropped) = gate.tick(t + hold / 2, hold, |_| FramingState::Pending);
+    assert!(none.is_empty() && dropped == 0, "still within the hold");
+    // v2 lands (framing 1): the held chunks go on in order, framed.
+    let (late, dropped) = gate.tick(t + hold / 2, hold, |_| {
+        FramingState::Known(FRAMING_FRAGMENTS)
+    });
+    assert_eq!(dropped, 0);
+    assert_eq!(late.len(), parts.len());
+    let mut frames = Vec::new();
+    for (c, f) in late {
+        assert_eq!(f, FRAMING_FRAGMENTS);
+        frames.extend(rs.push(c, f).frame);
+    }
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].bytes, frame, "whole once v2 arrived");
+    // A v2 that never comes: dropped past the hold, counted, never unframed.
+    let mut gate = FramingGate::default();
+    for c in parts.clone() {
+        assert!(gate.admit(c, FramingState::Pending, t).is_empty());
+    }
+    assert_eq!(gate.next_deadline(hold), Some(t + hold));
+    let (none, dropped) = gate.tick(t + hold, hold, |_| FramingState::Pending);
+    assert!(none.is_empty());
+    assert_eq!(dropped, u64::try_from(parts.len()).unwrap());
+    assert_eq!(gate.next_deadline(hold), None);
+    // A later chunk with a known framing releases the held ones first.
+    let mut gate = FramingGate::default();
+    let _ = gate.admit(parts[0].clone(), FramingState::Pending, t);
+    let out = gate.admit(parts[1].clone(), FramingState::Known(FRAMING_FRAGMENTS), t);
+    let seqs: Vec<u64> = out.iter().map(|(c, _)| c.chunk_seq.0).collect();
+    assert_eq!(seqs, [0, 1], "in order");
+}
+
+/// CC rc18 — one open frame per (stream, layer), not per stream: for `av1`
+/// one frame is one layer of a temporal unit, and on a datagram leg layer
+/// 1's first fragments may come before layer 0's last. Layer-0 and layer-1
+/// fragments interleaved across the frame boundary: both frames whole,
+/// neither dropped; the gauge counts both open meanwhile.
+#[test]
+fn interleaved_layers_each_keep_their_open_frame() {
+    let mut rs = Reassemblers::default();
+    let base = frame_bytes(2_500, 1);
+    let enh = frame_bytes(2_200, 2);
+    let l0 = fragments(&base, 1_000, 1, 0, L0);
+    let n0 = u64::try_from(l0.len()).unwrap();
+    let l1 = fragments(&enh, 1_000, 1, n0, L1);
+    assert_eq!((l0.len(), l1.len()), (3, 3));
+    // L0[0], L0[1], L1[0], L1[1], L0[2], L1[2].
+    let order = [
+        l0[0].clone(),
+        l0[1].clone(),
+        l1[0].clone(),
+        l1[1].clone(),
+        l0[2].clone(),
+        l1[2].clone(),
+    ];
+    let mut frames = Vec::new();
+    for (i, c) in order.into_iter().enumerate() {
+        let out = rs.push(c, FRAMING_FRAGMENTS);
+        assert!(out.refused.is_empty(), "chunk {i}: {:?}", out.refused);
+        if i == 3 {
+            assert_eq!(rs.open_for(S), 2, "a frame open on each layer");
+        }
+        frames.extend(out.frame);
+    }
+    let got: Vec<(ChunkLayer, Vec<u8>)> = frames.into_iter().map(|f| (f.layer, f.bytes)).collect();
+    assert_eq!(got, vec![(L0, base), (L1, enh)], "both whole");
+    assert_eq!(rs.open(), 0);
+}
+
+/// A stream's layer slots are bounded: past the bound, a new layer closes
+/// the slot with the oldest open frame, counted.
+#[test]
+fn layer_slots_per_stream_are_bounded() {
+    let mut rs = Reassemblers::default();
+    let mut refused = Vec::new();
+    for q in 0..=u8::try_from(MAX_LAYER_SLOTS_PER_STREAM).unwrap() {
+        let layer = ChunkLayer {
+            spatial: 0,
+            temporal: 0,
+            quality: q,
+        };
+        let c = chunk(
+            1,
+            u64::from(q) * 10,
+            CODEC_TEMPORAL_LAYERED,
+            layer,
+            [&marker(0, 2)[..], b"x"].concat(),
+        );
+        refused.extend(rs.push(c, FRAMING_FRAGMENTS).refused);
+    }
+    assert_eq!(
+        refused,
+        [FrameRefusal::Incomplete],
+        "the oldest open frame, once"
+    );
+    assert_eq!(rs.open_for(S), MAX_LAYER_SLOTS_PER_STREAM);
 }

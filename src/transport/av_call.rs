@@ -1221,8 +1221,11 @@ pub struct ReorderCounts {
     /// Copies that arrived after their slot was released or skipped.
     pub late: u64,
     /// 45.1 — frames of a framed stream dropped whole (a fragment the window
-    /// gave up on, or a marker refused): never handed out partial.
+    /// gave up on, a marker refused, a framing that never became known):
+    /// never handed out partial or unframed.
     pub frames_dropped: u64,
+    /// 45.1 — frames being reassembled now (at most one per stream).
+    pub frames_open: u64,
 }
 
 /// One stream's window.
@@ -1630,6 +1633,9 @@ struct Shared {
     /// Test seam: withhold every `n`th own chunk (`chunk_seq % n == 0`) from
     /// the named member's leg (simulated loss on the direct leg).
     test_withhold: StdMutex<Option<(String, u64)>>,
+    /// Test seam: withhold every `n`th FORWARDED chunk (`chunk_seq % n ==
+    /// 0`) from the named child's leg (loss on a relay's downstream leg).
+    test_withhold_forward: StdMutex<Option<(String, u64)>>,
     /// The call-row door, if any.
     record: Option<Arc<dyn CallRecord>>,
     /// The key this node attends as.
@@ -1651,6 +1657,10 @@ struct Shared {
     attendance: StdMutex<Attendance>,
     /// 45.1 — a `replace_stream` waiting for its bindings' delivery.
     pending_replace: StdMutex<Option<PendingReplace>>,
+    /// 45.1 — the camera (primary) stream ended while a share went on
+    /// (`Call::end_stream_as`): it takes no more frames, and its bindings
+    /// are no longer announced.
+    primary_ended: AtomicBool,
     /// 45.1 — this node's other own streams (`Call::add_stream`), by stream.
     /// Lock order: the primary publisher first, then this; never the other
     /// way.
@@ -1729,10 +1739,9 @@ async fn mint_own_key(
     let binding = StreamKeyBinding::sign(signer, room, join_nonce, stream, epoch, key.public())
         .await
         .map_err(|e| CallError::Plumbing(e.to_string()))?;
-    let wire_v2 = if codecs.is_some()
-        || replaces.is_some()
-        || kind != crate::transport::av_chunk_auth::STREAM_KIND_MEDIA
-    {
+    // 45.1 — every stream signs a v2 binding (its framing, even 0), so a v2
+    // receiver never has to guess a chunk's layout.
+    let wire_v2 = {
         Some(Arc::new(
             StreamKeyBinding::sign_v2(
                 signer,
@@ -1754,8 +1763,6 @@ async fn mint_own_key(
             .map_err(|e| CallError::Plumbing(e.to_string()))?
             .to_bytes(),
         ))
-    } else {
-        None
     };
     Ok(OwnChunkKey {
         signer: key,
@@ -2100,6 +2107,7 @@ impl Call {
             metrics,
             test_relay_delay_ms: AtomicU64::new(0),
             test_withhold: StdMutex::new(None),
+            test_withhold_forward: StdMutex::new(None),
             record,
             attendee,
             attendees_known: StdMutex::new(std::collections::BTreeSet::new()),
@@ -2110,6 +2118,7 @@ impl Call {
             own_key: StdMutex::new(own_key),
             attendance: StdMutex::new(Attendance::default()),
             pending_replace: StdMutex::new(None),
+            primary_ended: AtomicBool::new(false),
             shares: Mutex::new(BTreeMap::new()),
             registrar: share_registrar,
             av_events: share_events,
@@ -2421,6 +2430,11 @@ impl Call {
         if let CallState::Ended(cause) = self.state() {
             return Err(CallError::CallEnded(cause));
         }
+        if self.shared.primary_ended.load(Ordering::Acquire) {
+            return Err(CallError::UnknownStream(hex::encode(
+                self.shared.stream().0,
+            )));
+        }
         let budget = self.chunk_plaintext_budget().ok_or(CallError::NoBudget)?;
         let mut publisher = self.shared.publisher.lock().await;
         let (stream, framing) = {
@@ -2556,6 +2570,13 @@ impl Call {
     #[doc(hidden)]
     pub fn withhold_from_for_test(&self, member: &str, every: u64) {
         *Shared::lock(&self.shared.test_withhold) = Some((member.to_owned(), every));
+    }
+
+    /// Test seam: withhold every `every`th chunk this node FORWARDS from
+    /// `member`'s leg (`0` stops it).
+    #[doc(hidden)]
+    pub fn withhold_forward_for_test(&self, member: &str, every: u64) {
+        *Shared::lock(&self.shared.test_withhold_forward) = Some((member.to_owned(), every));
     }
 
     /// Test seam: close this node's leg to `member` and leave it down, as a
@@ -2773,11 +2794,40 @@ impl Call {
     /// [`CallError::CallEnded`]; [`CallError::UnknownStream`] for the primary
     /// or a stream this node does not publish; [`CallError::Plumbing`].
     pub async fn end_stream(&self, stream: StreamId) -> Result<(), CallError> {
-        let why = crate::transport::av_chunk_auth::SignedEnd::Ended;
+        self.end_stream_as(stream, crate::transport::av_chunk_auth::SignedEnd::Ended)
+            .await
+    }
+
+    /// 45.1 — [`Self::end_stream`] saying `why`. For a share, any value. For
+    /// the camera (the primary), only while a share is live: a phone sharing
+    /// its screen backgrounds its camera (`Backgrounded`, `end = 2`), which a
+    /// receiver reads as [`CallEvent::StreamEnded`] for the camera while the
+    /// share plays on (a leave value counts as a leave only on a member's
+    /// last stream). The camera then takes no more frames ([`Self::publish`]
+    /// is [`CallError::UnknownStream`]); the call ends with [`Self::leave`].
+    ///
+    /// # Errors
+    /// As [`Self::end_stream`]; [`CallError::UnknownStream`] for the camera
+    /// with no share live, or already ended.
+    pub async fn end_stream_as(
+        &self,
+        stream: StreamId,
+        why: crate::transport::av_chunk_auth::SignedEnd,
+    ) -> Result<(), CallError> {
         if let CallState::Ended(cause) = self.state() {
             return Err(CallError::CallEnded(cause));
         }
-        let wire = {
+        let wire = if stream == self.shared.stream() {
+            let live_share = !self.shared.shares.lock().await.is_empty();
+            if !live_share || self.shared.primary_ended.load(Ordering::Acquire) {
+                return Err(CallError::UnknownStream(hex::encode(stream.0)));
+            }
+            // Under the publisher lock (sign_end takes it for final_seq), no
+            // camera chunk follows the end.
+            let wire = sign_end(&self.shared, why).await?;
+            self.shared.primary_ended.store(true, Ordering::Release);
+            wire
+        } else {
             let mut shares = self.shared.shares.lock().await;
             let share = shares
                 .get(&stream)
@@ -2790,9 +2840,9 @@ impl Call {
                 .unwrap_or(crate::transport::av_chunk_auth::FINAL_SEQ_NONE);
             let wire = sign_end_of(&self.shared, &share.key, final_seq, why).await?;
             shares.remove(&stream);
+            Shared::lock(&self.shared.alm).remove_own_stream(stream);
             wire
         };
-        Shared::lock(&self.shared.alm).remove_own_stream(stream);
         let not_v2 = legs_without_binding_v2(&self.shared).await;
         send_binding_paced(&self.shared, &wire, &not_v2, None).await;
         let legs: Vec<[u8; 16]> = {
@@ -2813,7 +2863,7 @@ impl Call {
             stream = %crate::transport::realtime_av::stream_label(stream),
             ?why,
             unconfirmed,
-            "CALL STREAM ENDED: a share stopped, the call carries on (45.1)"
+            "CALL STREAM ENDED: one own stream stopped, the call carries on (45.1)"
         );
         Ok(())
     }
@@ -2873,27 +2923,12 @@ impl Call {
             crate::transport::av_chunk_auth::STREAM_KIND_MEDIA,
         )
         .await?;
-        // Make: every leg learns the new stream's key (v1), and every leg that
-        // parses v2 its `replaces`, before its first chunk.
+        // Make: every leg that parses v2 learns the new stream's `replaces`
+        // and framing first, then every leg its key (v1), before its first
+        // chunk.
         let wire = Arc::clone(&own_key.wire);
         let wire_v2 = own_key.wire_v2.clone();
-        publisher
-            .dispatcher_mut()
-            .send_control_report(&[], &|limit| StreamKeyBinding::parts(&wire, limit))
-            .await;
-        if let Some(v2) = &wire_v2 {
-            let not_v2 = {
-                let legs = publisher.dispatcher_mut().subscriber_ids();
-                let a = Shared::lock(&shared.alm);
-                legs.into_iter()
-                    .filter(|l| !a.takes_binding_v2(l))
-                    .collect::<Vec<_>>()
-            };
-            publisher
-                .dispatcher_mut()
-                .send_control_report(&not_v2, &|limit| StreamKeyBinding::parts(v2, limit))
-                .await;
-        }
+        send_bindings_on(&shared, &mut publisher, &wire, wire_v2.as_ref()).await;
         drop(publisher);
         // Break, once every leg's Channel proved the bindings delivered (the
         // old stream publishing meanwhile): publish and the watch tick
@@ -2953,6 +2988,9 @@ impl Call {
         // the last stream as `AttendeeLeft`.
         let mut share_ends = Vec::new();
         let shares = std::mem::take(&mut *self.shared.shares.lock().await);
+        // With the camera already ended, the last share carries the leave.
+        let camera_ended = self.shared.primary_ended.load(Ordering::Acquire);
+        let last = shares.keys().next_back().copied();
         for (stream, share) in shares {
             let final_seq = share
                 .publisher
@@ -2960,7 +2998,11 @@ impl Call {
                 .0
                 .checked_sub(1)
                 .unwrap_or(crate::transport::av_chunk_auth::FINAL_SEQ_NONE);
-            let ended = crate::transport::av_chunk_auth::SignedEnd::Ended;
+            let ended = if camera_ended && Some(stream) == last {
+                why
+            } else {
+                crate::transport::av_chunk_auth::SignedEnd::Ended
+            };
             match sign_end_of(&self.shared, &share.key, final_seq, ended).await {
                 Ok(w) => share_ends.push(w),
                 Err(e) => tracing::warn!(
@@ -2970,13 +3012,20 @@ impl Call {
                 ),
             }
         }
-        match sign_end(&self.shared, why).await {
+        let primary_end = if self.shared.primary_ended.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(sign_end(&self.shared, why).await)
+        };
+        match primary_end.unwrap_or_else(|| Ok(Arc::new(Vec::new()))) {
             Ok(wire) => {
                 let not_v2 = legs_without_binding_v2(&self.shared).await;
                 for w in &share_ends {
                     send_binding_paced(&self.shared, w, &not_v2, None).await;
                 }
-                send_binding_paced(&self.shared, &wire, &not_v2, None).await;
+                if !wire.is_empty() {
+                    send_binding_paced(&self.shared, &wire, &not_v2, None).await;
+                }
                 // Close once each leg's Channel proved the end delivered (a
                 // datagram leg's too: the end rides its Channel).
                 let legs: Vec<[u8; 16]> = {
@@ -3162,16 +3211,15 @@ async fn send_bindings_on(
     wire: &Arc<Vec<u8>>,
     wire_v2: Option<&Arc<Vec<u8>>>,
 ) {
-    publisher
-        .dispatcher_mut()
-        .send_control_report(&[], &|limit| StreamKeyBinding::parts(wire, limit))
-        .await;
+    // CC rc18 — v2 FIRST on every leg that takes it, so its framing is in
+    // hand before the epoch's first chunk; then v1 on every leg (a v2 relay
+    // keeps it for its v1 children).
     if let Some(v2) = wire_v2 {
         let not_v2 = {
             let legs = publisher.dispatcher_mut().subscriber_ids();
             let a = Shared::lock(&shared.alm);
             legs.into_iter()
-                .filter(|l| !a.takes_binding_v2(l))
+                .filter(|l| !a.sends_binding_v2_to(l))
                 .collect::<Vec<_>>()
         };
         publisher
@@ -3179,6 +3227,10 @@ async fn send_bindings_on(
             .send_control_report(&not_v2, &|limit| StreamKeyBinding::parts(v2, limit))
             .await;
     }
+    publisher
+        .dispatcher_mut()
+        .send_control_report(&[], &|limit| StreamKeyBinding::parts(wire, limit))
+        .await;
 }
 
 /// 45.1 — roll one share to epoch `to`: its new DEK and chunk key, bound on
@@ -3518,24 +3570,11 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     for m in &left {
         publisher.remove_subscriber(m);
     }
-    // Every remaining leg learns the new key before the epoch's first chunk
-    // (and a leg that takes v2, the binding that names the codec).
-    publisher
-        .dispatcher_mut()
-        .send_control_report(&[], &|limit| StreamKeyBinding::parts(&wire, limit))
-        .await;
-    if let Some(v2) = &wire_v2 {
-        let not_v2 = {
-            let legs = publisher.dispatcher_mut().subscriber_ids();
-            let a = Shared::lock(&shared.alm);
-            legs.into_iter()
-                .filter(|l| !a.takes_binding_v2(l))
-                .collect::<Vec<_>>()
-        };
-        publisher
-            .dispatcher_mut()
-            .send_control_report(&not_v2, &|limit| StreamKeyBinding::parts(v2, limit))
-            .await;
+    // Every remaining leg learns the new key before the epoch's first chunk:
+    // the v2 binding (codec, framing) first to a leg that takes it, then v1.
+    // An ended camera's keys are not announced.
+    if !shared.primary_ended.load(Ordering::Acquire) {
+        send_bindings_on(shared, &mut publisher, &wire, wire_v2.as_ref()).await;
     }
     // 45.1 — every share rolls with the primary, bound on every leg before
     // its first chunk of the epoch. One that fails here rolls at its next
@@ -3732,7 +3771,10 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         let mut publisher = shared.publisher.lock().await;
         // v1 only: the member's CAPS (whether it takes v2) have not come
         // yet. Its v2 bindings follow its CAPS (`send_v2_bindings_to`).
-        let mut wires = vec![Arc::clone(&Shared::lock(&shared.own_key).wire)];
+        let mut wires: Vec<Arc<Vec<u8>>> = Some(Arc::clone(&Shared::lock(&shared.own_key).wire))
+            .filter(|_| !shared.primary_ended.load(Ordering::Acquire))
+            .into_iter()
+            .collect();
         // 45.1 — and every share's.
         wires.extend(
             shared
@@ -4065,7 +4107,7 @@ async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: b
                         .then(|| a.caps_frame(shared.transport.av_datagrams_enabled())),
                     first && a.takes_timed(peer),
                     first && a.takes_datagrams(peer) && shared.transport.av_datagrams_enabled(),
-                    first && a.takes_binding_v2(peer),
+                    first && a.sends_binding_v2_to(peer),
                 )
             }
             Ok(WireFrame::Control(cf)) => (a.on_control(peer, cf, rtt), None, false, false, false),
@@ -4439,9 +4481,11 @@ async fn reannounce(shared: &Arc<Shared>) {
         let k = Shared::lock(&shared.own_key);
         (Arc::clone(&k.wire), k.wire_v2.clone())
     };
-    // 45.1 — and every share's (the shares lock is let go before any send).
-    let mut v1 = vec![wire];
-    let mut v2: Vec<Arc<Vec<u8>>> = wire_v2.into_iter().collect();
+    // 45.1 — and every share's (the shares lock is let go before any send);
+    // an ended camera's no more.
+    let camera_live = !shared.primary_ended.load(Ordering::Acquire);
+    let mut v1: Vec<Arc<Vec<u8>>> = Some(wire).filter(|_| camera_live).into_iter().collect();
+    let mut v2: Vec<Arc<Vec<u8>>> = wire_v2.filter(|_| camera_live).into_iter().collect();
     {
         let shares = shared.shares.lock().await;
         for share in shares.values() {
@@ -4449,14 +4493,15 @@ async fn reannounce(shared: &Arc<Shared>) {
             v2.extend(share.key.wire_v2.clone());
         }
     }
-    for w in &v1 {
-        send_binding_paced(shared, w, &[], Some(REANNOUNCE_PART_GAP)).await;
-    }
+    // v2 first (CC rc18), then v1.
     if !v2.is_empty() {
         let not_v2 = legs_without_binding_v2(shared).await;
         for w in &v2 {
             send_binding_paced(shared, w, &not_v2, Some(REANNOUNCE_PART_GAP)).await;
         }
+    }
+    for w in &v1 {
+        send_binding_paced(shared, w, &[], Some(REANNOUNCE_PART_GAP)).await;
     }
 }
 
@@ -4513,7 +4558,7 @@ async fn legs_without_binding_v2(shared: &Arc<Shared>) -> Vec<String> {
         .subscriber_ids();
     let a = Shared::lock(&shared.alm);
     legs.into_iter()
-        .filter(|l| !a.takes_binding_v2(l))
+        .filter(|l| !a.sends_binding_v2_to(l))
         .collect()
 }
 
@@ -4523,6 +4568,7 @@ async fn send_v2_bindings_to(shared: &Arc<Shared>, peer: &str) {
     let mut wires: Vec<Arc<Vec<u8>>> = Shared::lock(&shared.own_key)
         .wire_v2
         .clone()
+        .filter(|_| !shared.primary_ended.load(Ordering::Acquire))
         .into_iter()
         .collect();
     wires.extend(
@@ -4610,6 +4656,12 @@ async fn forward(
             );
         }
     }
+    if let Some((peer, n)) = Shared::lock(&shared.test_withhold_forward).as_ref() {
+        let seq = inner.chunk_seq().0;
+        if *n > 0 && seq >= 2 * n && seq % n == 0 {
+            targets.remove(peer);
+        }
+    }
     if targets.is_empty() {
         return;
     }
@@ -4633,6 +4685,37 @@ async fn forward(
     }
 }
 
+/// 45.1 — how long a released chunk waits for its stream's v2 binding (its
+/// framing) before it is dropped: the longest reorder window.
+pub const FRAMING_HOLD: Duration = REORDER_WINDOW_MAX;
+
+/// 45.1 (CC rc18) — what this receiver knows of `(stream, epoch)`'s framing:
+/// its v2 binding's when installed. With only v1 held it is unframed only
+/// when no v2 can be coming, decided from facts this node authenticates
+/// itself (CC's condition): its own capability (it does not advertise
+/// `CAP_BINDING_V2`, so none is sent to it), or `CAPS` that arrived on this
+/// node's own link whose far end is the publisher, link-attributed under E1
+/// (`alm.caps` is keyed by the link's peer, never by a relay's word), and
+/// lack the bit. Otherwise the chunk waits. A drop here is the receiver's
+/// alone: counted, never sent to the publisher, never a reason to evict the
+/// stream (its binding and audio stand).
+fn framing_state_of(
+    shared: &Shared,
+    stream: StreamId,
+    epoch: Epoch,
+    publisher: &str,
+) -> frame::FramingState {
+    if let Some(f) = shared.auth.v2_framing(stream, epoch) {
+        return frame::FramingState::Known(f);
+    }
+    let a = Shared::lock(&shared.alm);
+    if !a.advertises_binding_v2() || a.known_without_binding_v2(publisher) {
+        frame::FramingState::Known(crate::transport::av_chunk_auth::FRAMING_NONE)
+    } else {
+        frame::FramingState::Pending
+    }
+}
+
 async fn reorder_loop(
     shared: Arc<Shared>,
     mut heard: mpsc::Receiver<Heard>,
@@ -4645,8 +4728,17 @@ async fn reorder_loop(
     // it by chunk_seq first).
     let mut frames_of = frame::Reassemblers::default();
     let mut sweep = 0u64;
+    // CC rc18 — a chunk released while only its stream's v1 binding is held,
+    // and a v2 one may follow, waits (bounded) and is never parsed unframed.
+    let mut gate = frame::FramingGate::default();
+    let framing_state =
+        |f: &ReceivedFrame| framing_state_of(&shared, f.stream, f.epoch, &f.publisher);
     loop {
-        let released = match window.next_deadline() {
+        let next = match (window.next_deadline(), gate.next_deadline(FRAMING_HOLD)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let released = match next {
             Some(deadline) => {
                 tokio::select! {
                     h = heard.recv() => match h {
@@ -4672,8 +4764,19 @@ async fn reorder_loop(
                 shared.count(r.token());
             }
         }
+        let now = Instant::now();
+        let mut ready = Vec::new();
         for f in released {
-            let framing = shared.auth.framing_of(f.stream, f.epoch);
+            let st = framing_state(&f);
+            ready.extend(gate.admit(f, st, now));
+        }
+        let (late, unknown) = gate.tick(now, FRAMING_HOLD, framing_state);
+        ready.extend(late);
+        for _ in 0..unknown {
+            dropped += 1;
+            shared.count(frame::FrameRefusal::FramingUnknown.token());
+        }
+        for (f, framing) in ready {
             let out = frames_of.push(f, framing);
             for r in out.refused {
                 dropped += 1;
@@ -4688,6 +4791,7 @@ async fn reorder_loop(
             let before = c.frames_dropped;
             *c = window.counts();
             c.frames_dropped = before + dropped;
+            c.frames_open = u64::try_from(frames_of.open()).unwrap_or(u64::MAX);
         }
         for f in whole {
             if frames.send(f).await.is_err() {

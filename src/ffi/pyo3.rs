@@ -4432,7 +4432,7 @@ fn call_codecs_arg(tokens: &[String]) -> PyResult<crate::transport::av_chunk_aut
             CodecToken::parse(t).ok_or_else(|| {
                 PyValueError::new_err(format!(
                     "codec_unregistered: {t:?} is not a registered codec token \
-                     (av1, h264, vp8, vp9, opus)"
+                     (av1, h264, opus)"
                 ))
             })
         })
@@ -4739,14 +4739,30 @@ impl PyCall {
         Ok(d.unbind().into_any())
     }
 
-    /// 45.1 — end one share (`add_stream`'s stream) and only it, signed
-    /// `end = 3` ("this stream ended", never a leave); the camera and the
-    /// call carry on. The primary ends only with `leave()`
-    /// (`unknown_stream`).
-    fn end_stream(&self, py: Python<'_>, stream_id: [u8; 32]) -> PyResult<()> {
+    /// 45.1 — end one own stream and only it, signed. `cause` `None` (the
+    /// default) signs `end = 3` ("this stream ended", never a leave): a
+    /// share stops. `"backgrounded"` or `"left"` sign 2 or 1, which a
+    /// receiver takes as a leave only on the member's last stream: a phone
+    /// sharing its screen backgrounds its camera with
+    /// `end_stream(stream_id(), "backgrounded")` while the share plays on.
+    /// The camera ends this way only while a share is live
+    /// (`unknown_stream`); the call ends with `leave()`.
+    #[pyo3(signature = (stream_id, cause=None))]
+    fn end_stream(&self, py: Python<'_>, stream_id: [u8; 32], cause: Option<&str>) -> PyResult<()> {
+        use crate::transport::av_chunk_auth::SignedEnd;
+        let why = match cause {
+            None | Some("ended") => SignedEnd::Ended,
+            Some("left") => SignedEnd::Left,
+            Some("backgrounded") => SignedEnd::Backgrounded,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "end_cause_unknown: {other:?} (ended, left, backgrounded)"
+                )))
+            }
+        };
         let stream = crate::transport::realtime_av::StreamId(stream_id);
         self.with_call(py, move |c| {
-            Box::pin(async move { c.end_stream(stream).await })
+            Box::pin(async move { c.end_stream_as(stream, why).await })
         })
     }
 

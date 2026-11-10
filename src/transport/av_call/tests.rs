@@ -532,6 +532,7 @@ fn attendance_binding(
         final_seq: end.map(|_| 0),
         kind: 0,
         framing: 0,
+        explicit_v2: false,
     }
 }
 
@@ -852,6 +853,62 @@ fn a_share_is_a_second_stream_and_its_end_is_no_leave() {
         .as_slice(),
         [CallEvent::AttendeeLeft {
             cause: LeaveCause::Left,
+            ..
+        }]
+    ));
+}
+
+/// 45.1 (CC review of desktop sharing) — a phone sharing its screen
+/// backgrounds its camera: `end = 2` on the camera while the same member's
+/// share is live is `StreamEnded { camera, backgrounded }`, never
+/// `AttendeeLeft`; the share stays live. When the share then ends with the
+/// leave (the member hangs up), that last stream's end is `AttendeeLeft`.
+#[test]
+fn a_backgrounded_camera_beside_a_live_share_is_no_leave() {
+    use crate::transport::av_chunk_auth::SignedEnd;
+    let mut a = Attendance::default();
+    let (cam, share) = (StreamId([20; 32]), StreamId([21; 32]));
+    for s in [20, 21] {
+        let _ = a.on_bound(
+            "me",
+            &attendance_binding("pat", s, None, None),
+            None,
+            true,
+            false,
+        );
+    }
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("pat", 20, None, Some(SignedEnd::Backgrounded)),
+        None,
+        true,
+        false,
+    );
+    assert_eq!(
+        ev,
+        [CallEvent::StreamEnded {
+            publisher: "pat".into(),
+            stream: cam,
+            cause: LeaveCause::Backgrounded,
+            truncated: false,
+        }]
+    );
+    assert_eq!(
+        a.streams.get("pat"),
+        Some(&vec![share]),
+        "the share plays on"
+    );
+    let ev = a.on_bound(
+        "me",
+        &attendance_binding("pat", 21, None, Some(SignedEnd::Backgrounded)),
+        None,
+        true,
+        false,
+    );
+    assert!(matches!(
+        ev.as_slice(),
+        [CallEvent::AttendeeLeft {
+            cause: LeaveCause::Backgrounded,
             ..
         }]
     ));

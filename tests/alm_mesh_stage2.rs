@@ -1471,6 +1471,272 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     );
 }
 
+/// **A backgrounded camera beside a live share** (45.1, CC review of
+/// desktop sharing): B shares its screen, then backgrounds its camera
+/// (`end = 2` on the camera stream). A reads `StreamEnded { camera,
+/// backgrounded }`, never `AttendeeLeft`, and B's share keeps arriving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_backgrounded_camera_beside_a_live_share_plays_the_share_on() {
+    use ciris_edge::transport::av_call::LeaveCause;
+    use ciris_edge::transport::av_chunk_auth::SignedEnd;
+    let _call = one_call().await;
+    let tag = "alm2-share-bg";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    wait_bound(&ca, 1).await;
+    let mut events = ca.events().expect("A's events");
+    let mut frames = ca.frames().expect("A's frames");
+    let cam = cb.stream();
+    let share = cb.add_stream(None).await.expect("B shares");
+    wait_bound(&ca, 2).await;
+    for seq in 0..20u64 {
+        cb.publish(Frame::opaque(body("cam", seq)))
+            .await
+            .expect("camera");
+        cb.publish_on(share, Frame::opaque(body("share", seq)))
+            .await
+            .expect("share");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    cb.end_stream_as(cam, SignedEnd::Backgrounded)
+        .await
+        .expect("B backgrounds its camera");
+    assert!(
+        cb.publish(Frame::opaque(body("cam", 99))).await.is_err(),
+        "the camera takes no more frames"
+    );
+    let ended = next_event(&mut events, Duration::from_secs(10), |e| match e {
+        CallEvent::StreamEnded {
+            publisher,
+            stream,
+            cause,
+            ..
+        } if *publisher == b.key.key_id => Some((*stream, *cause)),
+        CallEvent::AttendeeLeft { key_id, .. } if *key_id == b.key.key_id => {
+            panic!("a backgrounded camera beside a live share is no leave")
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(ended, Some((cam, LeaveCause::Backgrounded)));
+    let mut heard = Heard::new();
+    drain_from(&mut frames, &mut heard, &b.key.key_id);
+    let before = heard.get(&share).map_or(0, std::collections::BTreeSet::len);
+    for seq in 100..140u64 {
+        cb.publish_on(share, Frame::opaque(body("share", seq)))
+            .await
+            .expect("the share after the camera");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let bk = b.key.key_id.clone();
+    let more = wait_until(Duration::from_secs(10), || {
+        drain_from(&mut frames, &mut heard, &bk);
+        let ok = heard.get(&share).map_or(0, std::collections::BTreeSet::len) >= before + 30;
+        async move { ok }
+    })
+    .await;
+    assert!(more, "the share keeps arriving");
+    while let Ok(e) = events.try_recv() {
+        if let CallEvent::AttendeeLeft { key_id, .. } = e {
+            assert_ne!(key_id, b.key.key_id, "no leave for B");
+        }
+    }
+}
+
+/// Every video frame `frames` hands out within `secs`.
+async fn video_frames(
+    frames: &mut tokio::sync::mpsc::Receiver<ReceivedFrame>,
+    secs: u64,
+) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(secs), async {
+        while let Some(f) = frames.recv().await {
+            if f.codec_id == ciris_edge::transport::realtime_av::CODEC_TEMPORAL_LAYERED {
+                got.push(f.bytes);
+            }
+        }
+    })
+    .await;
+    got
+}
+
+/// **Framed video through a relay** (45.1): A relays B's framed stream
+/// (`{h264, opus}`) to C (B and C share no leg). Every fragment is a whole
+/// chunk A forwards unchanged (it never opens the inner seal), so C rebuilds
+/// each frame byte-identical. Then A's leg to C loses every 7th forwarded
+/// chunk: C gets each frame whole or counts it dropped
+/// (`av_frame_incomplete`), never partial. (A relay cannot drop the rest of
+/// a frame after one fragment fails: the marker is sealed. C's reassembly
+/// drops the torn frame instead.)
+// a, b, c: the nodes as the roster witness names them.
+#[allow(clippy::many_single_char_names, clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn framed_video_through_a_relay_arrives_whole_or_counted() {
+    use ciris_edge::transport::av_chunk_auth::{CodecMap, CodecToken};
+    let _call = one_call().await;
+    let tag = "alm2-framed-relay";
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        4,
+        3,
+        &[(0, 1), (0, 2), (0, 3), (1, 3), (2, 3)],
+        Some(3),
+    )
+    .await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let phone = CallOptions {
+        codecs: Some(CodecMap::new([CodecToken::Opus, CodecToken::H264]).expect("map")),
+        ..CallOptions::default()
+    };
+    let ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, phone, None).await;
+    let mut cc = join_loaded(c, &groups[2], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 2).await;
+    wait_legs(&cb, 1).await;
+    wait_legs(&cc, 1).await;
+    let b_stream = cb.stream();
+    assert!(
+        wait_until(Duration::from_secs(90), || async {
+            primary_for(&cc, b_stream).as_deref() == Some(a.key.key_id.as_str())
+        })
+        .await,
+        "C hears B through A: {:?}",
+        cc.alm_parents()
+    );
+    let mut frames = cc.frames().expect("C's frames");
+    let forwarded_before = ca.alm_counts().forwarded;
+    let mut sent = vec![video(0, 20_000).bytes];
+    let key = cb.publish(video(0, 20_000)).await.expect("keyframe");
+    assert!(key.fragments > 1, "the keyframe is fragmented");
+    for n in 1..=20u64 {
+        let f = video(n, 3_000);
+        sent.push(f.bytes.clone());
+        cb.publish(f).await.expect("P-frame");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let got = video_frames(&mut frames, 10).await;
+    assert_eq!(got, sent, "every frame whole through the relay");
+    assert!(ca.alm_counts().forwarded - forwarded_before >= u64::from(key.fragments));
+    assert_eq!(av(&c.metrics, "av_frame_incomplete"), 0);
+
+    // Loss on the relay's leg to C.
+    ca.withhold_forward_for_test(&c.key.key_id, 7);
+    let mut lossy = Vec::new();
+    for n in 100..130u64 {
+        let f = video(n, 3_000);
+        lossy.push(f.bytes.clone());
+        cb.publish(f).await.expect("P-frame");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    ca.withhold_forward_for_test(&c.key.key_id, 0);
+    let clean: Vec<Vec<u8>> = (200..203u64).map(|n| video(n, 3_000).bytes).collect();
+    for n in 200..203u64 {
+        cb.publish(video(n, 3_000)).await.expect("P-frame");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let mut after = video_frames(&mut frames, 6).await;
+    assert!(
+        after.iter().all(|f| lossy.contains(f) || clean.contains(f)),
+        "nothing partial is handed out"
+    );
+    after.retain(|f| lossy.contains(f));
+    let dropped = av(&c.metrics, "av_frame_incomplete");
+    assert!(
+        dropped > 0,
+        "a fragment lost on the relay's leg drops its frame"
+    );
+    assert_eq!(
+        after.len() + usize::try_from(dropped).unwrap(),
+        lossy.len(),
+        "each frame whole or counted dropped, once"
+    );
+}
+
+/// **A mixed call** (45.1, CC's run-green witness for the framing hold): C
+/// behaves as v44 (no `CAPS` bit 5, v1 bindings only) and reaches B only
+/// through the relay A, so B never hears C's own `CAPS`. B plays C's audio;
+/// C's video is held for a v2 binding that never comes, then dropped and
+/// counted `av_frame_framing_unknown`, never parsed unframed. Nothing is
+/// refused (no binding refusal at B) and nothing is evicted: C's audio keeps
+/// playing after the drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_v44_publisher_behind_a_relay_plays_audio_and_its_video_is_held_then_dropped() {
+    use ciris_edge::transport::realtime_av::CODEC_OPAQUE;
+    use ciris_edge::transport::realtime_av_alm::controller::wire::CAP_BINDING_V2;
+    let _call = one_call().await;
+    let tag = "alm2-mixed";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2)], None).await;
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    c.transport.set_av_caps_withheld_for_test(CAP_BINDING_V2);
+    let ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, CallOptions::default(), None).await;
+    let mut cc = join_loaded(c, &groups[2], tag, CallOptions::default(), None).await;
+    wait_legs(&ca, 2).await;
+    wait_legs(&cb, 1).await;
+    wait_legs(&cc, 1).await;
+    assert_eq!(cb.legs(), vec![a.key.key_id.clone()], "B reaches only A");
+    let mut rx = cb.frames().expect("B's frames");
+    let mut audio = 0usize;
+    let mut video = 0usize;
+    for seq in 0..400u64 {
+        cc.publish(Frame::opaque(body("c-audio", seq)))
+            .await
+            .expect("audio");
+        let _ = cc
+            .publish(Frame {
+                codec_id: CODEC_AV1_SVC,
+                layer: ChunkLayer::BASE,
+                bytes: body("c-video", seq),
+            })
+            .await;
+        while let Ok(f) = rx.try_recv() {
+            if f.publisher == c.key.key_id {
+                if f.codec_id == CODEC_OPAQUE {
+                    audio += 1;
+                } else {
+                    video += 1;
+                }
+            }
+        }
+        if audio >= 50 && av(&b.metrics, "av_frame_framing_unknown") >= 20 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(audio >= 50, "C's audio plays at B: {audio}");
+    assert_eq!(video, 0, "C's video is never handed out unframed");
+    let dropped = av(&b.metrics, "av_frame_framing_unknown");
+    assert!(dropped >= 20, "held, then dropped and counted: {dropped}");
+    assert_eq!(
+        cb.chunk_auth_counts().bindings_refused,
+        0,
+        "nothing refused: C's v1 binding stands"
+    );
+    // Not evicted: C's audio still plays after the drops.
+    let before = audio;
+    for seq in 1_000..1_040u64 {
+        cc.publish(Frame::opaque(body("c-audio", seq)))
+            .await
+            .expect("audio");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let more = wait_until(Duration::from_secs(10), || {
+        while let Ok(f) = rx.try_recv() {
+            if f.publisher == c.key.key_id && f.codec_id == CODEC_OPAQUE {
+                audio += 1;
+            }
+        }
+        let ok = audio >= before + 30;
+        async move { ok }
+    })
+    .await;
+    assert!(more, "C's stream stands at B after the drops");
+}
+
 /// **Per-leg stats** (45.1): every leg a call reports names what carries it
 /// and its MDU, so a gate can tell a punched UDP leg from a TCP one from a
 /// relayed one. On loopback TCP every leg is `Interface`, with a link MDU,
