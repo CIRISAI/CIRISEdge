@@ -862,7 +862,12 @@ impl DirectoryOwnerBinding {
         use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
         use ciris_persist::federation::types::attestation_type;
 
-        let owner = match owner_of(self.directory.as_ref(), &self.local_key_id).await {
+        let owner = match crate::read_caller::scoped(
+            crate::read_caller::Site::FirstContact,
+            owner_of(self.directory.as_ref(), &self.local_key_id),
+        )
+        .await
+        {
             Ok(Some(o)) => o,
             Ok(None) => return None,
             Err(e) => {

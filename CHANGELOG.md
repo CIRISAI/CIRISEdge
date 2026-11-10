@@ -69,6 +69,15 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   first-contact peer it now takes only its consent grants, group-plane rows and membership ceremony
   rows, the only peer-authored shapes that reach admits. The offer is unchanged; the refused rows
   are no longer read.
+- **Every edge store read names its caller (CIRISEdge#971, CIRISPersist#1235).** 24 call sites run
+  under a persist caller scope (`edge.advertise.{required, groups, history, unasked, gate}`,
+  `edge.gate.{quarantine, capability, owner_of_peer}`, `edge.fetch.gate`, `edge.pull.serveable`,
+  `edge.subject_pull`, `edge.key_plane`, `edge.feed`, `edge.identity_plane`, `edge.holdings`,
+  `edge.send_set`, `edge.owner_binding`, `edge.apply`, `edge.transport.attribution`,
+  `edge.first_contact`, `edge.membership`, `edge.chat`, `edge.av_call`, `edge.blob.durability`),
+  so persist's `observe::snapshot().callers` splits the read rate by site. The innermost scope
+  wins. These are 24 of persist's 32 caller labels; a host that adds more than 8 of its own sees
+  the rest under `other`.
 - **Naming a shaping class is no longer the shaping opt-in (CIRISEdge#969, CC 5.4.3).**
   `init_edge_runtime(shaping_class="home" | "phone-wifi" | "phone-cellular")` used to shape every
   identity link while seeding the device with no opt-in, so the policy and the device disagreed.

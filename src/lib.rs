@@ -129,6 +129,8 @@ pub mod observability;
 pub mod outbound;
 pub mod pqc_anchor;
 pub mod reachability;
+/// CIRISEdge#971 — persist caller scopes: who each store read is made for.
+pub(crate) mod read_caller;
 // CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files.
 pub mod receipts;
 pub mod replication;

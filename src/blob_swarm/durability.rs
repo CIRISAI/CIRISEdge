@@ -222,7 +222,12 @@ impl PassCustody {
                 .dimension(CUSTODY_ACK_DIMENSION)
                 .types(&[ty::SCORES])
                 .pages();
-            while let Some(page) = reports.next(directory).await? {
+            while let Some(page) = crate::read_caller::scoped(
+                crate::read_caller::Site::BlobDurability,
+                reports.next(directory),
+            )
+            .await?
+            {
                 rows.extend(page);
             }
             // `retired_ids` applies a retraction only when its composer is in
@@ -232,7 +237,12 @@ impl PassCustody {
             let mut composers = AttestationQuery::by(device, FOLD_PAGE)
                 .types(&[ty::SUPERSEDES, ty::WITHDRAWS, ty::RECANTS])
                 .pages();
-            while let Some(page) = composers.next(directory).await? {
+            while let Some(page) = crate::read_caller::scoped(
+                crate::read_caller::Site::BlobDurability,
+                composers.next(directory),
+            )
+            .await?
+            {
                 rows.extend(page);
             }
             self.folds += 1;

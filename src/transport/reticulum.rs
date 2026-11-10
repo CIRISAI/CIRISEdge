@@ -15609,7 +15609,13 @@ async fn attribute_and_deliver(
     }
     let link_key_id = candidate_key_id.clone();
     let source_key_id = match candidate_key_id {
-        Some(key_id) => gate_attribution(ctx, link_id, key_id).await,
+        Some(key_id) => {
+            crate::read_caller::scoped(
+                crate::read_caller::Site::TransportAttribution,
+                gate_attribution(ctx, link_id, key_id),
+            )
+            .await
+        }
         // NO candidate key_id at all — the frame is dropped unattributed. This is
         // NOT a silent drop: the specific cause (`NoDest` / `DestUnmatched`) was
         // ALREADY logged loudly + throttled by the `resolve_link_attribution` arm
@@ -15942,7 +15948,13 @@ async fn deliver_av_frame(
         // CIRISEdge#621's rule holds on this plane too: a link's source is
         // never this node.
         Some(key_id) if key_id == ctx.local_key_id => None,
-        Some(key_id) => gate_attribution(ctx, link_id, key_id).await,
+        Some(key_id) => {
+            crate::read_caller::scoped(
+                crate::read_caller::Site::TransportAttribution,
+                gate_attribution(ctx, link_id, key_id),
+            )
+            .await
+        }
         None => None,
     };
     let Some(peer) = gated else {

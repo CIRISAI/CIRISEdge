@@ -429,10 +429,10 @@ async fn replies_of(
         .dimension_any_of(&[ACCEPTANCE_DIMENSION, DECLINE_DIMENSION])
         .pages();
     let mut replied = std::collections::HashSet::new();
-    while let Some(page) = pages
-        .next(directory)
-        .await
-        .map_err(|e| MembershipError::from_persist("list replies", &e))?
+    while let Some(page) =
+        crate::read_caller::scoped(crate::read_caller::Site::Membership, pages.next(directory))
+            .await
+            .map_err(|e| MembershipError::from_persist("list replies", &e))?
     {
         replied.extend(page.into_iter().filter_map(|r| {
             r.attestation_envelope

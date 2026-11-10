@@ -4854,7 +4854,11 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             // own nodes. An unbound peer (`None`) proves no ownership and is
             // treated as a stranger.
             (EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination, peer) => {
-                self.list_identity_plane_for_peer(kind, peer, window).await
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::IdentityPlane,
+                    self.list_identity_plane_for_peer(kind, peer, window),
+                )
+                .await
             }
             _ => self.list_envelope_refs_unbounded(kind, window).await,
         }
@@ -5248,8 +5252,11 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     .sweep_gate
                     .enter_at(crate::observability::SWEEP_PERMIT_SUBJECT_PULL)
                     .await;
-                self.subject_holdings_inner(kind, subject_key_id, peer_key_id)
-                    .await
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::SubjectPull,
+                    self.subject_holdings_inner(kind, subject_key_id, peer_key_id),
+                )
+                .await
             }
             // 4. CIRISEdge#907 — a stranger to the subject, on the Attestation
             //    plane, from a conferred server: the subject's announced
@@ -5347,7 +5354,11 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // `Refused` leaving this choke is counted per envelope kind (the #425
         // choke already logs it; now it is also a metrics-scrape fact). The
         // typed Key-plane token axis books inside `apply_key`.
-        let outcome = self.dispatch_apply(kind, envelope_bytes, source_peer).await;
+        let outcome = crate::read_caller::scoped(
+            crate::read_caller::Site::Apply,
+            self.dispatch_apply(kind, envelope_bytes, source_peer),
+        )
+        .await;
         // CIRISEdge#457 — the receive plane now books EVERY outcome at this
         // choke, not just refusals: an accepted apply (Admitted = new state)
         // and a duplicate (already held) are counted distinctly, so "applied
@@ -5453,8 +5464,11 @@ impl FederationDirectoryReplicationBridge {
                     offers.contains(&(peer.to_owned(), *envelope_hash), self.limiter_now())
                 })
             });
-        self.serve_fetch_gated(kind, envelope_hash, peer_key_id, memos)
-            .await
+        crate::read_caller::scoped(
+            crate::read_caller::Site::FetchGate,
+            self.serve_fetch_gated(kind, envelope_hash, peer_key_id, memos),
+        )
+        .await
     }
 
     /// Every serve gate of the direct-fetch twin, with the peer-scoped memos in
@@ -6451,15 +6465,17 @@ impl FederationDirectoryReplicationBridge {
             };
             let mut memos = ServeMemos::default();
             memos.audience.subject_pull = true;
-            if self
-                .serve_fetch_gated(
+            if crate::read_caller::scoped(
+                crate::read_caller::Site::FetchGate,
+                self.serve_fetch_gated(
                     EnvelopeKind::Attestation,
                     &hash,
                     Some(requester),
                     &mut memos,
-                )
-                .await
-                .is_some()
+                ),
+            )
+            .await
+            .is_some()
             {
                 if let Ok(mut offers) = self.pull_offers.lock() {
                     let now = self.limiter_now();
@@ -6664,9 +6680,11 @@ impl FederationDirectoryReplicationBridge {
                     let seq = Self::ms_seq(att.asserted_at);
                     match content_hash_of(&att) {
                         Some((hash, _)) => {
-                            if self
-                                .pull_ref_is_serveable(&att, subject_key_id, &mut memos)
-                                .await
+                            if crate::read_caller::scoped(
+                                crate::read_caller::Site::PullServeable,
+                                self.pull_ref_is_serveable(&att, subject_key_id, &mut memos),
+                            )
+                            .await
                             {
                                 push(hash, seq);
                             }
@@ -6700,9 +6718,11 @@ impl FederationDirectoryReplicationBridge {
                     let seq = Self::ms_seq(att.asserted_at);
                     match content_hash_of(&att) {
                         Some((hash, _)) => {
-                            if self
-                                .pull_ref_is_serveable(&att, subject_key_id, &mut memos)
-                                .await
+                            if crate::read_caller::scoped(
+                                crate::read_caller::Site::PullServeable,
+                                self.pull_ref_is_serveable(&att, subject_key_id, &mut memos),
+                            )
+                            .await
                             {
                                 push(hash, seq);
                             }
@@ -7561,7 +7581,11 @@ impl FederationDirectoryReplicationBridge {
                     .sweep_gate
                     .enter_at(crate::observability::SWEEP_PERMIT_KEY_PLANE_SUBJECT)
                     .await;
-                read.read(&*self.directory, &subject).await
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::KeyPlane,
+                    read.read(&*self.directory, &subject),
+                )
+                .await
             };
             match found {
                 Ok(rows) => {
@@ -8093,9 +8117,11 @@ impl FederationDirectoryReplicationBridge {
                     .sweep_gate
                     .enter_at(crate::observability::SWEEP_PERMIT_FEED_ATTESTATION)
                     .await;
-                self.directory
-                    .list_attestations_since(cursor, PROBE_PAGE)
-                    .await
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::Feed,
+                    self.directory.list_attestations_since(cursor, PROBE_PAGE),
+                )
+                .await
             };
             let page = match read_page {
                 Ok(page) => page,
@@ -8192,9 +8218,12 @@ impl FederationDirectoryReplicationBridge {
                     .sweep_gate
                     .enter_at(crate::observability::SWEEP_PERMIT_FEED_ROUTE)
                     .await;
-                self.directory
-                    .list_signed_transport_destinations_since(cursor, PROBE_PAGE)
-                    .await
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::Feed,
+                    self.directory
+                        .list_signed_transport_destinations_since(cursor, PROBE_PAGE),
+                )
+                .await
             };
             let page = match read_page {
                 Ok(page) => page,
@@ -8411,9 +8440,12 @@ impl FederationDirectoryReplicationBridge {
                     .sweep_gate
                     .enter_at(crate::observability::SWEEP_PERMIT_HOLDINGS_INDEX)
                     .await;
-                self.directory
-                    .list_wire_hashes_since(index_kind, after.as_deref(), budget)
-                    .await
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::Holdings,
+                    self.directory
+                        .list_wire_hashes_since(index_kind, after.as_deref(), budget),
+                )
+                .await
             };
             let page = match read {
                 Ok(p) => p,
@@ -9222,16 +9254,17 @@ impl FederationDirectoryReplicationBridge {
             return false;
         };
         if !grant_cache.contains_key(owner) {
-            let policies = self
-                .directory
-                .list_live_consent_grants_by(owner)
-                .await
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|grant| {
-                    consent_grammar::parse_grant_payload(&grant.attestation_envelope).ok()
-                })
-                .collect();
+            let policies = crate::read_caller::scoped(
+                crate::read_caller::Site::GateCapability,
+                self.directory.list_live_consent_grants_by(owner),
+            )
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|grant| {
+                consent_grammar::parse_grant_payload(&grant.attestation_envelope).ok()
+            })
+            .collect();
             grant_cache.insert(owner.to_string(), policies);
         }
         // Collect required capabilities WITHOUT holding the cache borrow across
@@ -9254,9 +9287,12 @@ impl FederationDirectoryReplicationBridge {
             })
             .collect();
         for capability in required {
-            if !has_accord_conferred_role(&*self.directory, peer, &capability)
-                .await
-                .unwrap_or(false)
+            if !crate::read_caller::scoped(
+                crate::read_caller::Site::GateCapability,
+                has_accord_conferred_role(&*self.directory, peer, &capability),
+            )
+            .await
+            .unwrap_or(false)
             {
                 tracing::debug!(
                     peer_key_id = peer,
@@ -9569,10 +9605,13 @@ impl FederationDirectoryReplicationBridge {
         let consult = if let Some(c) = memo.get(author) {
             *c
         } else {
-            let c = match ciris_persist::federation::quarantine::is_withheld(
-                &*self.directory,
-                author,
-                chrono::Utc::now(),
+            let c = match crate::read_caller::scoped(
+                crate::read_caller::Site::GateQuarantine,
+                ciris_persist::federation::quarantine::is_withheld(
+                    &*self.directory,
+                    author,
+                    chrono::Utc::now(),
+                ),
             )
             .await
             {
@@ -9890,10 +9929,13 @@ impl FederationDirectoryReplicationBridge {
         // CIRISEdge#971 — read once per round context instead of once per
         // consent-grant row; the round's memo dies with the round.
         if !memo.peer_owner.contains_key(peer) {
-            let owner = ciris_persist::federation::admission::owner_of(&*self.directory, peer)
-                .await
-                .ok()
-                .flatten();
+            let owner = crate::read_caller::scoped(
+                crate::read_caller::Site::GateOwnerOfPeer,
+                ciris_persist::federation::admission::owner_of(&*self.directory, peer),
+            )
+            .await
+            .ok()
+            .flatten();
             memo.peer_owner.insert(peer.to_owned(), owner);
         }
         memo.peer_owner
@@ -10783,7 +10825,11 @@ impl FederationDirectoryReplicationBridge {
                         .sweep_gate
                         .enter_at(crate::observability::SWEEP_PERMIT_SEND_SET)
                         .await;
-                    let set = self.read_peer_set(local).await;
+                    let set = crate::read_caller::scoped(
+                        crate::read_caller::Site::SendSet,
+                        self.read_peer_set(local),
+                    )
+                    .await;
                     (set, Some(Instant::now()))
                 },
                 |(set, at)| {
@@ -11275,12 +11321,18 @@ impl FederationDirectoryReplicationBridge {
                 .resolved_recipient
                 .as_ref()
                 .map(ResolvedRecipient::reach);
-            let required = self.required_rows(&key, &ctx.peer_principals, reach).await;
-            if let Ok(required) = self
-                .offer_rows(
+            let required = crate::read_caller::scoped(
+                crate::read_caller::Site::AdvertiseRequired,
+                self.required_rows(&key, &ctx.peer_principals, reach),
+            )
+            .await;
+            if let Ok(required) = crate::read_caller::scoped(
+                crate::read_caller::Site::AdvertiseGate,
+                self.offer_rows(
                     required, None, &mut ctx, peer_label, None, &mut refs, &mut seen,
-                )
-                .await
+                ),
+            )
+            .await
             {
                 listed = required.0;
                 counts = required.2;
@@ -11550,14 +11602,19 @@ impl FederationDirectoryReplicationBridge {
             .sweep_gate
             .enter_at(crate::observability::SWEEP_PERMIT_ADVERTISE_PAGE)
             .await;
-        let attestations = self
-            .directory
-            .list_attestations_since(since.clone(), budget)
-            .await
-            .map_err(|e| SweepReadError(e.to_string()))?;
+        let attestations = crate::read_caller::scoped(
+            crate::read_caller::Site::AdvertiseHistory,
+            self.directory
+                .list_attestations_since(since.clone(), budget),
+        )
+        .await
+        .map_err(|e| SweepReadError(e.to_string()))?;
         self.record_page(attestations.len());
-        self.offer_rows(attestations, since, ctx, peer_label, mark_key, refs, seen)
-            .await
+        crate::read_caller::scoped(
+            crate::read_caller::Site::AdvertiseGate,
+            self.offer_rows(attestations, since, ctx, peer_label, mark_key, refs, seen),
+        )
+        .await
     }
 
     /// Run the full per-record gate stack over `attestations`, appending into
@@ -11830,9 +11887,11 @@ impl FederationDirectoryReplicationBridge {
             // above; that is not a reason to offer it unasked. The peer can
             // still ask: the fetch twin and the subject Pull do not read this.
             if ctx.moves == UnaskedOffer::RequiredOrAppropriate {
-                let moves = self
-                    .moves_unasked(&canonical_json, &att.attestation, peer_label, ctx)
-                    .await;
+                let moves = crate::read_caller::scoped(
+                    crate::read_caller::Site::AdvertiseUnasked,
+                    self.moves_unasked(&canonical_json, &att.attestation, peer_label, ctx),
+                )
+                .await;
                 if !moves {
                     counts.awaits_request += 1;
                     if let Some(m) = &self.metrics {
@@ -12100,7 +12159,13 @@ impl FederationDirectoryReplicationBridge {
             Ok(composers) => rows.extend(composers),
             Err(e) => tracing::debug!(peer, error = %e, "required read: composers not served"),
         }
-        rows.extend(self.required_group_rows(key, peer_principals).await);
+        rows.extend(
+            crate::read_caller::scoped(
+                crate::read_caller::Site::AdvertiseGroups,
+                self.required_group_rows(key, peer_principals),
+            )
+            .await,
+        );
         self.record_page(rows.len());
         let mut seen = HashSet::new();
         rows.retain(|r| seen.insert(r.attestation_id.clone()));
@@ -12705,7 +12770,11 @@ impl FederationDirectoryReplicationBridge {
                     if let Some(hit) = self.fresh_owner(node_key_id) {
                         return (hit, None);
                     }
-                    self.read_owner_of(node_key_id).await
+                    crate::read_caller::scoped(
+                        crate::read_caller::Site::OwnerBinding,
+                        self.read_owner_of(node_key_id),
+                    )
+                    .await
                 },
                 |(lookup, at)| {
                     let Some(at) = at else { return };
@@ -13322,11 +13391,19 @@ impl FederationDirectoryReplicationBridge {
             // owner, so no announce axis. The canonical and bare servers.
             OwnerLookup::Unowned => IdentityRowReach::Everyone,
             OwnerLookup::Unresolved => IdentityRowReach::Unresolved,
-            OwnerLookup::Owner(owner) => match self.node_is_announced(&owner, subject).await {
+            OwnerLookup::Owner(owner) => match crate::read_caller::scoped(
+                crate::read_caller::Site::OwnerBinding,
+                self.node_is_announced(&owner, subject),
+            )
+            .await
+            {
                 Ok(true) => IdentityRowReach::Everyone,
-                Ok(false) => match ciris_persist::federation::admission::nodes_owned_by(
-                    &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
-                    &owner,
+                Ok(false) => match crate::read_caller::scoped(
+                    crate::read_caller::Site::OwnerBinding,
+                    ciris_persist::federation::admission::nodes_owned_by(
+                        &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
+                        &owner,
+                    ),
                 )
                 .await
                 {
