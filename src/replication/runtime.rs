@@ -1054,7 +1054,7 @@ pub const BUNDLE_ROUND_PLANES: [EnvelopeKind; 1] = [EnvelopeKind::Revocation];
 /// (`round_now`) the self and seat legs, each [`BUNDLE_PULL_MIN_SPACING`]
 /// apart. Each device draws its timer from half to one and a half of this
 /// ([`bundle_pull_delay`]).
-pub const BUNDLE_PULL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+pub const BUNDLE_PULL_INTERVAL: std::time::Duration = std::time::Duration::from_mins(10);
 
 /// CIRISEdge#971 (d) — kicked cycles are at least this far apart, so a burst
 /// of local writes costs one cycle, not one per write; also the spacing of the
@@ -3193,7 +3193,7 @@ mod tests {
             let min = draws.iter().min().copied().unwrap_or_default();
             let max = draws.iter().max().copied().unwrap_or_default();
             assert!(
-                max - min >= base / 2,
+                max.saturating_sub(min) >= base / 2,
                 "step {step}: spread {min:?}..{max:?}"
             );
             // No tenth of the window holds more than a quarter of the fleet.
@@ -3201,7 +3201,7 @@ mod tests {
             let mut counts = std::collections::HashMap::new();
             for d in &draws {
                 *counts
-                    .entry((*d - base / 2).as_millis() / bucket)
+                    .entry(d.saturating_sub(base / 2).as_millis() / bucket)
                     .or_insert(0u32) += 1;
             }
             assert!(counts.values().all(|c| *c <= 64), "step {step}: {counts:?}");
@@ -3213,7 +3213,10 @@ mod tests {
         // the gaps.
         let min = at.iter().min().copied().unwrap_or_default();
         let max = at.iter().max().copied().unwrap_or_default();
-        assert!(max - min >= BUNDLE_PULL_INTERVAL / 2, "{min:?}..{max:?}");
+        assert!(
+            max.saturating_sub(min) >= BUNDLE_PULL_INTERVAL / 2,
+            "{min:?}..{max:?}"
+        );
         // The production draws are the same function.
         let d = bundle_pull_delay();
         assert!(d >= BUNDLE_PULL_INTERVAL / 2 && d <= BUNDLE_PULL_INTERVAL * 3 / 2);
