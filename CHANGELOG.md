@@ -53,6 +53,17 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   6 h), which `remember_outcome` does not clear. The round's `want` drops a marked hash; a newer
   route is a new hash and is wanted as before. On the canonical, 10,710 of 24,949 routes served in
   one process lifetime were these.
+- **Behaviour change: a row refused by several gates is booked under the first one
+  (CIRISEdge#971).** The Attestation advertise now asks the audience gate's reach half (from
+  memory) before the gates that read the store: author quarantine, the accord relay, the serve
+  capability and the producer's recipient capability. The offered set is unchanged (a row the
+  reach refuses was refused at the audience gate anyway). What moves: a row both a reach and an
+  earlier gate refuse is booked `recipient_not_in_send_set` where it used to be booked
+  `quarantined_author`, `serve_capability_missing`, `serve_capability_not_rooted` or a relay
+  reason, and the quarantine WARN is no longer emitted for rows the reach refuses. All of these sit
+  in one Policy class for CIRISServer's operator surface. For a first-contact peer the advertise
+  now reads no consent grant and no quarantine marker for refused rows, and the peer's owner
+  (`owner_of`) is read once per round instead of once per consent-grant row.
 - **Naming a shaping class is no longer the shaping opt-in (CIRISEdge#969, CC 5.4.3).**
   `init_edge_runtime(shaping_class="home" | "phone-wifi" | "phone-cellular")` used to shape every
   identity link while seeding the device with no opt-in, so the policy and the device disagreed.

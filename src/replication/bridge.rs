@@ -2240,6 +2240,15 @@ struct AudienceMemo {
     /// every row field it reads ([`MayReceiveKey`]), so rows that differ only
     /// in body share one resolver walk.
     may_receive: HashMap<MayReceiveKey, ciris_persist::federation::replication_audience::Verdict>,
+    /// CIRISEdge#971 — persist's `owner_of(peer)` for one sweep (or one
+    /// Deliver), read by [`FederationDirectoryReplicationBridge::consent_grant_names`]
+    /// at most once per peer instead of once per consent-grant row. Scoped to
+    /// the memo on purpose: the answer never outlives the round, so an
+    /// owner-binding that lands is seen by the next round, which is the reason
+    /// this read never went through the bridge's longer-lived owner memo.
+    /// `None` (absent key) = not read yet; `Some(None)` = read, no owner (or the
+    /// read failed: fail-closed, as the uncached read was).
+    peer_owner: HashMap<String, Option<String>>,
 }
 
 /// **CIRISEdge#817 — the direct-fetch twin's peer-scoped memos, for one
@@ -2953,6 +2962,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// permanently dark if the stored route is ever removed. Capacity
     /// [`STALE_ROUTE_MARKS`], front-drop; see there for the numbers.
     stale_routes: RefusalBackoff,
+    /// CIRISEdge#971 — test-only: `false` runs the advertise's gates in the
+    /// pre-v45 order (the audience gate's reach half only at the audience
+    /// gate), the reference the agreement witness compares against.
+    #[cfg(test)]
+    early_reach_check: std::sync::atomic::AtomicBool,
     /// CIRISEdge#544 — how many wanted hashes the backoff has actually removed
     /// from a round's `want`. The memory's own witness, in the discipline of
     /// [`Self::owner_reads`] and [`Self::sweep_max_page_rows`]: "the retry storm
@@ -3237,6 +3251,8 @@ impl FederationDirectoryReplicationBridge {
             // in which asking flat-out is the right answer.
             refusal_backoff: RefusalBackoff::new(),
             stale_routes: RefusalBackoff::with_capacities(STALE_ROUTE_MARKS, 1),
+            #[cfg(test)]
+            early_reach_check: std::sync::atomic::AtomicBool::new(true),
             retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
             rows_parked_on_signer: std::sync::atomic::AtomicUsize::new(0),
             signer_releases: std::sync::atomic::AtomicUsize::new(0),
@@ -9845,7 +9861,12 @@ impl FederationDirectoryReplicationBridge {
     /// acceptance) addressed to that peer: it crosses first contact to it,
     /// whatever this relay's own send set says. Persist's `may_receive` still
     /// decides the row after this.
-    async fn consent_grant_names(&self, row: &serde_json::Value, peer: &str) -> bool {
+    async fn consent_grant_names(
+        &self,
+        row: &serde_json::Value,
+        peer: &str,
+        memo: &mut AudienceMemo,
+    ) -> bool {
         use ciris_persist::federation::consent_grammar::GRANT_DIMENSION;
         if Self::row_dimension(row) != GRANT_DIMENSION {
             return false;
@@ -9858,13 +9879,21 @@ impl FederationDirectoryReplicationBridge {
         if subjects.contains(&peer) {
             return true;
         }
-        // Read directly, not through the owner memo: this runs only on
-        // consent-grant rows, and an answer cached here before the peer's
+        // Not through the owner memo: an answer cached there before the peer's
         // owner-binding lands would outlive it in every other owner read.
-        matches!(
-            ciris_persist::federation::admission::owner_of(&*self.directory, peer).await,
-            Ok(Some(owner)) if subjects.contains(&owner.as_str())
-        )
+        // CIRISEdge#971 — read once per round context instead of once per
+        // consent-grant row; the round's memo dies with the round.
+        if !memo.peer_owner.contains_key(peer) {
+            let owner = ciris_persist::federation::admission::owner_of(&*self.directory, peer)
+                .await
+                .ok()
+                .flatten();
+            memo.peer_owner.insert(peer.to_owned(), owner);
+        }
+        memo.peer_owner
+            .get(peer)
+            .and_then(Option::as_deref)
+            .is_some_and(|owner| subjects.contains(&owner))
     }
 
     async fn attestation_is_relayed_announce(
@@ -10043,7 +10072,7 @@ impl FederationDirectoryReplicationBridge {
         if reach == Reach::FirstContact
             && !self.attestation_is_allegiance_fact(row, memo).await
             && !self.attestation_is_relayed_announce(row, memo).await
-            && !self.consent_grant_names(row, peer).await
+            && !self.consent_grant_names(row, peer, memo).await
         {
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
@@ -10069,6 +10098,52 @@ impl FederationDirectoryReplicationBridge {
             return true;
         }
         false
+    }
+
+    /// CIRISEdge#971 — the REACH half of [`Self::audience_withholds`], on its
+    /// own: `None` when the reach refuses the row (booked here, under
+    /// `RecipientNotInSendSet`), else `Some(first_contact_membership)` for the
+    /// Rooted floor that follows.
+    ///
+    /// CIRISEdge#756 (`FSD/FIRST_CONTACT.md` §2.4, I22) — the membership
+    /// ceremony addressed to the peer's own person crosses first contact: the
+    /// invitation naming it and the invitee's answer to its proposal. Decided
+    /// once here, it replaces the reach half (the reach admits no group-target
+    /// row and the #671 narrowing admits only allegiance facts) and the Rooted
+    /// floor (both rows are first-party to the peer).
+    ///
+    /// The advertise runs this BEFORE the gates that read the store (author
+    /// quarantine, the accord relay, the serve capability, the producer's
+    /// recipient capability): for a first-contact peer almost every row is
+    /// refused here from memory, and a row refused here would have been
+    /// refused at the audience gate anyway, so the offered set is unchanged.
+    /// A row several gates refuse is booked under the first one; that moves
+    /// some rows' booked reason to `recipient_not_in_send_set` (CHANGELOG).
+    /// A group-plane row is not put to it (persist's resolver decides those
+    /// alone, before any reach).
+    #[allow(clippy::too_many_arguments)] // the audience gate's own inputs
+    async fn audience_reach_half(
+        &self,
+        audience: &ciris_persist::federation::Audience,
+        row: &serde_json::Value,
+        att: &Attestation,
+        peer: &str,
+        reach: Reach,
+        memo: &mut AudienceMemo,
+        site: &str,
+    ) -> Option<bool> {
+        let first_contact_membership = reach == Reach::FirstContact
+            && self
+                .first_contact_membership_serves(audience, att, peer, memo)
+                .await;
+        if !first_contact_membership
+            && self
+                .reach_withholds(reach, audience, row, peer, memo, site)
+                .await
+        {
+            return None;
+        }
+        Some(first_contact_membership)
     }
 
     /// The walks are persist's — `admission_identity_for_writer` (the ONE
@@ -10144,23 +10219,14 @@ impl FederationDirectoryReplicationBridge {
             );
             return true;
         }
-        // CIRISEdge#756 (`FSD/FIRST_CONTACT.md` §2.4, I22) — the membership
-        // ceremony addressed to the peer's own person crosses first contact:
-        // the invitation naming it and the invitee's answer to its proposal.
-        // Decided once here, it replaces the reach half (the reach admits no
-        // group-target row and the #671 narrowing admits only allegiance facts)
-        // and the Rooted floor below (both rows are first-party to the peer).
-        let first_contact_membership = reach == Reach::FirstContact
-            && self
-                .first_contact_membership_serves(&audience, att, peer, memo)
-                .await;
-        if !first_contact_membership
-            && self
-                .reach_withholds(reach, &audience, row, peer, memo, site)
-                .await
-        {
+        // CIRISEdge#756 / CIRISEdge#971 — the reach half, shared with the
+        // advertise's early check ([`Self::audience_reach_half`]).
+        let Some(first_contact_membership) = self
+            .audience_reach_half(&audience, row, att, peer, reach, memo, site)
+            .await
+        else {
             return true;
-        }
+        };
         // persist v53 S1 (CIRISPersist#963, CIRISEdge#761) — THE ROW HALF is
         // persist's one audience resolver, `may_receive(peer, row)`: origin,
         // refers-to, an owner's grant for another node goes no further, the
@@ -11601,6 +11667,43 @@ impl FederationDirectoryReplicationBridge {
                 }
                 continue;
             }
+            // CIRISEdge#971 — the audience gate's REACH half, from memory,
+            // before every gate below that reads the store. For a first-contact
+            // peer the reach refuses nearly every row (only this node's
+            // allegiance facts and a few named shapes cross), and before this
+            // each of those rows first paid the author-quarantine read and the
+            // producer's consent-grant read only to be refused here anyway. A row
+            // refused here is refused at the audience gate below in the old
+            // order, so the offered set is unchanged; a row several gates refuse
+            // is booked under the first (CHANGELOG). A group-plane row and an
+            // unreadable audience are left to the audience gate itself.
+            #[cfg(test)]
+            let early = self
+                .early_reach_check
+                .load(std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let early = true;
+            if let Some(peer) = ctx.resolved_recipient.as_ref().filter(|_| early) {
+                if !ciris_persist::federation::group_plane::is_group_plane_row(&att.attestation) {
+                    if let Ok(audience) = Self::audience_of_view(&canonical_json) {
+                        if self
+                            .audience_reach_half(
+                                &audience,
+                                &canonical_json,
+                                &att.attestation,
+                                peer.as_str(),
+                                peer.reach(),
+                                &mut ctx.audience,
+                                "advertise",
+                            )
+                            .await
+                            .is_none()
+                        {
+                            continue;
+                        }
+                    }
+                }
+            }
             // CIRISEdge#440 ask 3 — quarantined-author rows are withheld from
             // the offer (retained locally; markers themselves always pass).
             if self
@@ -12213,7 +12316,9 @@ impl FederationDirectoryReplicationBridge {
             || self
                 .attestation_is_relayed_announce(view, &mut ctx.audience)
                 .await
-            || self.consent_grant_names(view, peer).await
+            || self
+                .consent_grant_names(view, peer, &mut ctx.audience)
+                .await
         {
             return true;
         }
@@ -14137,6 +14242,13 @@ impl FederationDirectoryReplicationBridge {
             .refs(plane)
             .ok()
             .map(|refs| refs.into_iter().map(|r| r.envelope_hash).collect())
+    }
+
+    /// CIRISEdge#971 — run the advertise gates in the pre-v45 order (`false`)
+    /// or the v45 order (`true`, the default).
+    pub(crate) fn set_early_reach_check(&self, on: bool) {
+        self.early_reach_check
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn holdings_index_status(
