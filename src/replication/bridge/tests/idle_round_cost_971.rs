@@ -260,6 +260,7 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
 /// The seat's Key-plane Summary as encoded for the wire, at `n` offered key
 /// records: (refs, frame bytes before the seal, fragments at the TCP MDU,
 /// fragments at the base 500 B link MTU).
+#[cfg(feature = "transport-reticulum")]
 async fn key_summary_at(n: usize) -> (usize, usize, usize, usize) {
     // The frame's size is a function of its refs alone, so the refs are
     // built directly: one per offered key record, a distinct content hash
@@ -299,6 +300,8 @@ async fn key_summary_at(n: usize) -> (usize, usize, usize, usize) {
 /// per ref as encoded). The seal adds `SEAL_OVERHEAD` per sealed frame on top
 /// (`link_seal.rs`, 25 B: version, counter, tag). Printed for the sheet;
 /// pinned only to be linear and to be the size the sheet uses.
+// The seal overhead it reports lives in the Reticulum transport.
+#[cfg(feature = "transport-reticulum")]
 #[tokio::test]
 #[allow(clippy::cast_precision_loss)] // ref counts and byte sizes, far below 2^52
 async fn the_idle_key_summary_is_linear_in_its_refs_971() {
