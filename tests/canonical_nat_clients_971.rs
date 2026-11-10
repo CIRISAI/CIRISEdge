@@ -468,7 +468,7 @@ async fn mesh(tag: u8, n: u8, lose_first_establish: bool) -> Mesh {
         &canonical,
         Arc::clone(&t_canonical),
         Vec::new(),
-        Duration::from_secs(3600),
+        Duration::from_hours(1),
     )
     .await;
     wait_for_own_route(&canonical, Duration::from_secs(150)).await;
@@ -502,7 +502,7 @@ async fn mesh(tag: u8, n: u8, lose_first_establish: bool) -> Mesh {
             let first = client.key.key_id.clone();
             let t = Arc::clone(&t_canonical);
             assert!(
-                wait_until(Duration::from_secs(120), || {
+                wait_until(Duration::from_mins(2), || {
                     let (t, first) = (Arc::clone(&t), first.clone());
                     async move { !t.reverse_links_for_test(&first).await.is_empty() }
                 })
@@ -574,7 +574,7 @@ async fn the_canonicals_rounds_to_linked_nat_clients_ride_their_links_971() {
     init_tracing();
     let m = mesh(1, 3, false).await;
     assert!(
-        wait_until(Duration::from_secs(120), || rows_crossed(&m)).await,
+        wait_until(Duration::from_mins(2), || rows_crossed(&m)).await,
         "the clients' own rounds carry both sides' rows"
     );
     for c in &m.clients {
@@ -616,7 +616,7 @@ async fn a_client_link_whose_establishment_was_lost_carries_the_canonicals_round
     init_tracing();
     let m = mesh(2, 2, true).await;
     assert!(
-        wait_until(Duration::from_secs(120), || rows_crossed(&m)).await,
+        wait_until(Duration::from_mins(2), || rows_crossed(&m)).await,
         "the clients' own rounds carry both sides' rows, the lost establishment included"
     );
     let first = &m.clients[0];
@@ -696,7 +696,7 @@ async fn unclaimed_mesh(tag: u8, n: u8, bootstrap_rounds: bool) -> Mesh {
         &canonical,
         Arc::clone(&t_canonical),
         Vec::new(),
-        Duration::from_secs(3600),
+        Duration::from_hours(1),
     )
     .await;
     wait_for_own_route(&canonical, Duration::from_secs(150)).await;
@@ -799,7 +799,7 @@ async fn bootstrap_rounds_root_the_client_and_the_seats_round_rides_its_link_971
     for c in &m.clients {
         let key = c.key.key_id.clone();
         assert!(
-            wait_until(Duration::from_secs(120), || {
+            wait_until(Duration::from_mins(2), || {
                 let key = key.clone();
                 let can = &m.canonical;
                 async move { can.holds_route_of(&key).await }
@@ -874,7 +874,7 @@ async fn roster(tag: u8) -> Roster {
         &canonical,
         Arc::clone(&t_canonical),
         Vec::new(),
-        Duration::from_secs(3600),
+        Duration::from_hours(1),
     )
     .await;
     wait_for_own_route(&canonical, Duration::from_secs(150)).await;
@@ -963,7 +963,7 @@ async fn rounds_toward_undialable_roster_entries_cost_nothing_971() {
     let quiet = r.quiet.key.key_id.clone();
     let quiet_dest = r.quiet_transport.local_named_dest_hash();
     assert!(
-        wait_until(Duration::from_secs(60), || {
+        wait_until(Duration::from_mins(1), || {
             let t = Arc::clone(&r.t_canonical);
             async move {
                 t.path_table_rows_for_test()
@@ -1071,7 +1071,7 @@ async fn an_undialable_entry_that_comes_alive_is_carried_on_its_link_971() {
     )
     .await;
     assert!(
-        wait_until(Duration::from_secs(120), || async {
+        wait_until(Duration::from_mins(2), || async {
             r.canonical.holds_route_of(&quiet).await
         })
         .await,
@@ -1081,7 +1081,7 @@ async fn an_undialable_entry_that_comes_alive_is_carried_on_its_link_971() {
     // seat's rounds (#794); they must complete on its link, unasked.
     let done0 = r.canonical.outcomes(RoundOutcome::Completed);
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             r.canonical.outcomes(RoundOutcome::Completed) > done0
                 && r.quiet.holds(&r.canonical.binding).await
         })
@@ -1128,7 +1128,7 @@ async fn what_the_seat_serves_an_unclaimed_device_per_plane_971() {
     }
     let key = c.key.key_id.clone();
     assert!(
-        wait_until(Duration::from_secs(120), || {
+        wait_until(Duration::from_mins(2), || {
             let key = key.clone();
             let can = &m.canonical;
             async move { can.holds_route_of(&key).await }
@@ -1210,7 +1210,7 @@ async fn bundle_mesh(tag: u8, k: usize, bundle: bool) -> BundleMesh {
         &seat,
         Arc::clone(&t_seat),
         Vec::new(),
-        Duration::from_secs(3600),
+        Duration::from_hours(1),
         publish,
         false,
     )
@@ -1343,7 +1343,7 @@ fn seat_bytes(m: &BundleMesh) -> usize {
 async fn rooted(m: &BundleMesh) {
     let key = m.device.key.key_id.clone();
     assert!(
-        wait_until(Duration::from_secs(120), || {
+        wait_until(Duration::from_mins(2), || {
             let key = key.clone();
             let seat = &m.seat;
             async move { seat.holds_route_of(&key).await }
@@ -1429,6 +1429,65 @@ async fn a_bundle_seat_is_asked_by_pull_and_its_idle_cost_does_not_grow_with_k_9
     );
 }
 
+/// (d)-2 stage 3 — claim the device: the owner signs the binding on the
+/// device (as the claim writes it locally), and both sides hold the owner's
+/// key. A second node of the same owner has its occurrence at the seat only
+/// (its key is known to both, as an announced owned node's is): the owner
+/// Pull on the occurrence plane is the path that delivers it. Its ROUTE is
+/// not in (d): an owned node's route comes from its owner (CC
+/// CLM-route-handed-by-owner, CIRISEdge#972). Returns (owner, sibling).
+async fn claim_with_an_owned_sibling(m: &BundleMesh) -> (Ident, Ident) {
+    let owner = Ident::new("person-971d-owner", 0xb3).await;
+    m.device
+        .dir
+        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: owner.record("user").await,
+        })
+        .await
+        .expect("the owner's key at claim");
+    put(
+        &m.device.dir,
+        owner_binding_attestation(
+            &owner.key_id,
+            &m.device.key.key_id,
+            chrono::Utc::now(),
+            &owner.signer(),
+        )
+        .await
+        .expect("owner binding"),
+    )
+    .await;
+    m.seat
+        .dir
+        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: owner.record("user").await,
+        })
+        .await
+        .expect("the owner's key at the seat");
+    let sibling = Ident::new("ciris-client-971d-sibling", 0xb4).await;
+    for dir in [&m.seat.dir, &m.device.dir] {
+        dir.put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: sibling.record("node").await,
+        })
+        .await
+        .expect("the sibling's key");
+    }
+    m.seat
+        .dir
+        .put_identity_occurrence(
+            common::node_signed_occurrence(
+                &owner.key_id,
+                &sibling.key_id,
+                &sibling.signer(),
+                ciris_persist::federation::types::device_class::PHONE,
+            )
+            .await,
+        )
+        .await
+        .expect("the sibling's occurrence at the seat");
+    (owner, sibling)
+}
+
 /// (d)-2 **Completeness from a bare directory through claim.** Unclaimed, the
 /// device reaches "the seat holds its key and route and can reach it on its
 /// link" by Pulls alone; claimed, its owner's key arrives by the owner Pull.
@@ -1462,7 +1521,7 @@ async fn a_device_reaches_the_seat_and_its_owner_by_pull_alone_971() {
         "the seat holds the device's key"
     );
     assert!(
-        wait_until(Duration::from_secs(60), || {
+        wait_until(Duration::from_mins(1), || {
             let t = Arc::clone(&m.t_seat);
             let k = m.device.key.key_id.clone();
             async move { !t.reverse_links_for_test(&k).await.is_empty() }
@@ -1470,61 +1529,8 @@ async fn a_device_reaches_the_seat_and_its_owner_by_pull_alone_971() {
         .await,
         "the seat can reach the device on the device's own link"
     );
-    // Stage 3, claimed. The owner signs the binding on the device (as the claim writes
-    // it locally), and the seat holds the owner's announced occurrence.
-    let owner = Ident::new("person-971d-owner", 0xb3).await;
-    m.device
-        .dir
-        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
-            record: owner.record("user").await,
-        })
-        .await
-        .expect("the owner's key at claim");
-    put(
-        &m.device.dir,
-        owner_binding_attestation(
-            &owner.key_id,
-            &m.device.key.key_id,
-            chrono::Utc::now(),
-            &owner.signer(),
-        )
-        .await
-        .expect("owner binding"),
-    )
-    .await;
-    m.seat
-        .dir
-        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
-            record: owner.record("user").await,
-        })
-        .await
-        .expect("the owner's key at the seat");
-    // A second node of the same owner: its occurrence is at the seat only
-    // (its key is known to both, as an announced owned node's is). The owner
-    // Pull on the occurrence plane is the path that delivers it. Its ROUTE is
-    // not in (d): an owned node's route comes from its owner (CC CLM-route-
-    // handed-by-owner, CIRISEdge#972).
-    let sibling = Ident::new("ciris-client-971d-sibling", 0xb4).await;
-    for dir in [&m.seat.dir, &m.device.dir] {
-        dir.put_public_key(ciris_persist::prelude::SignedKeyRecord {
-            record: sibling.record("node").await,
-        })
-        .await
-        .expect("the sibling's key");
-    }
-    m.seat
-        .dir
-        .put_identity_occurrence(
-            common::node_signed_occurrence(
-                &owner.key_id,
-                &sibling.key_id,
-                &sibling.signer(),
-                ciris_persist::federation::types::device_class::PHONE,
-            )
-            .await,
-        )
-        .await
-        .expect("the sibling's occurrence at the seat");
+    // Stage 3, claimed.
+    let (owner, sibling) = claim_with_an_owned_sibling(&m).await;
     let owner_pulls = |n: &Node| {
         n.metrics
             .bundle_pull()
@@ -1539,7 +1545,7 @@ async fn a_device_reaches_the_seat_and_its_owner_by_pull_alone_971() {
         "a claimed device's timer cycle asks about its owner"
     );
     assert!(
-        wait_until(Duration::from_secs(60), || {
+        wait_until(Duration::from_mins(1), || {
             let dir = Arc::clone(&m.device.dir);
             let (sib, own) = (sibling.key_id.clone(), owner.key_id.clone());
             async move {
@@ -1659,13 +1665,15 @@ async fn with_the_bundle_path_off_the_device_sends_the_seat_nothing_971() {
 /// cycle, or let any kick pull the owner, and a count below moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writes_and_kicks_never_spend_the_seats_lookup_budget_971() {
+    // N writes on the route plane, each after the last one's answer.
+    const N: u64 = 4;
     init_tracing();
     let m = bundle_mesh(17, 4, true).await;
     rooted(&m).await;
     // Attributed (the loop's own cycle saw it, and so settled: its next timer
     // is at least I/2 out), so no background cycle runs in the counts below.
     assert!(
-        wait_until(Duration::from_secs(120), || {
+        wait_until(Duration::from_mins(2), || {
             let rt = Arc::clone(&m.rt_device);
             let seat = m.seat.key.key_id.clone();
             async move {
@@ -1708,8 +1716,6 @@ async fn writes_and_kicks_never_spend_the_seats_lookup_budget_971() {
     };
     let planes = ciris_edge::replication::runtime::BUNDLE_PULL_PLANES;
     let on = |rt: &ReplicationRuntime| planes.map(|k| rt.bundle_pulls_sent_on(k));
-    // N writes on the route plane, each after the last one's answer.
-    const N: u64 = 4;
     let (owner0, self0, seat0, by0) = (
         read("pull_owner"),
         read("pull_self"),
@@ -1795,7 +1801,7 @@ async fn the_seats_round_starts_once_it_holds_our_key_and_route_971() {
     );
     rooted(&m).await;
     assert!(
-        wait_until(Duration::from_secs(120), || {
+        wait_until(Duration::from_mins(2), || {
             let rt = Arc::clone(&m.rt_device);
             let seat = m.seat.key.key_id.clone();
             async move {
@@ -1842,7 +1848,7 @@ async fn the_seat_is_never_asked_about_a_member_971() {
     let m = bundle_mesh(20, 4, true).await;
     rooted(&m).await;
     assert!(
-        wait_until(Duration::from_secs(120), || {
+        wait_until(Duration::from_mins(2), || {
             let rt = Arc::clone(&m.rt_device);
             let seat = m.seat.key.key_id.clone();
             async move {
@@ -1875,7 +1881,7 @@ async fn the_seat_is_never_asked_about_a_member_971() {
         .await
         .expect("the host names the seat");
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             seat_was_asked_about(&m, asked) && seat_was_asked_about(&m, unrouted)
         })
         .await,
