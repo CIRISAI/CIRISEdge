@@ -2251,6 +2251,17 @@ struct TraceConsentMemo {
     peer_owner: Option<Option<String>>,
 }
 
+/// CIRISEdge#971 — test-only: the advertise's verdicts per row, for the
+/// gate-order differential. A row judged with nothing booked has an empty
+/// list (a silent skip, e.g. a serve-capability refusal after the first in a
+/// sweep, which is booked once per sweep).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RowVerdicts {
+    current: Option<String>,
+    rows: std::collections::BTreeMap<String, Vec<&'static str>>,
+}
+
 /// CC 5.2 / CIRISConstitution#23 (v19.0.0) — what the AUDIENCE gate resolves,
 /// once per sweep: persist v53's `may_receive` verdict per row shape
 /// (CIRISEdge#761; membership, and the membership ceremony's carriage, are
@@ -3021,6 +3032,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// gate), the reference the agreement witness compares against.
     #[cfg(test)]
     early_reach_check: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#971 — test-only: while `Some`, each advertise row's verdicts
+    /// (every withhold booked for it, or `offered`, `awaits_request`,
+    /// `not_advertisable`), by attestation id, for the gate-order
+    /// differential ([`RowVerdicts`]).
+    #[cfg(test)]
+    row_verdicts: Mutex<Option<RowVerdicts>>,
     /// CIRISEdge#971 — test-only: one permit stored each time
     /// [`Self::warm_holdings_index`] ends on an enabled index, so a witness
     /// over a real runtime waits for its background warm-up on the event, not
@@ -3321,6 +3338,8 @@ impl FederationDirectoryReplicationBridge {
             stale_routes: RefusalBackoff::with_capacities(STALE_ROUTE_MARKS, 1),
             #[cfg(test)]
             early_reach_check: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            row_verdicts: Mutex::new(None),
             #[cfg(test)]
             holdings_warmed: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -4469,6 +4488,8 @@ impl FederationDirectoryReplicationBridge {
         if let Some(m) = self.metrics.as_ref() {
             m.inc_withhold(reason, peer, detail);
         }
+        #[cfg(test)]
+        self.note_row_verdict(reason.as_str());
         if let Ok(mut open) = self.round_withholds.lock() {
             if let Some(tally) = open.get_mut(peer) {
                 *tally.entry(reason.as_str()).or_insert(0) += 1;
@@ -12105,6 +12126,8 @@ impl FederationDirectoryReplicationBridge {
                 counts.duplicate += 1;
                 continue;
             }
+            #[cfg(test)]
+            self.note_row(Some(&att.attestation.attestation_id));
             // CIRISEdge#531, SECOND HALF — the gates below read exactly FOUR
             // strings, and this used to hand them a full `serde_json::to_value`
             // of the whole row: ~19 fields serialised AND a deep clone of the
@@ -12139,6 +12162,8 @@ impl FederationDirectoryReplicationBridge {
                 // position marked for the rewind an input change triggers
                 // (`check_advertise_inputs`).
                 counts.not_advertisable += 1;
+                #[cfg(test)]
+                self.note_row_verdict("not_advertisable");
                 let reason = Self::not_advertisable_reason(&canonical_json);
                 tracing::debug!(
                     peer = %mark_key.map_or(peer_label, |k| k.0.as_str()),
@@ -12348,6 +12373,8 @@ impl FederationDirectoryReplicationBridge {
                 .await;
                 if !moves {
                     counts.awaits_request += 1;
+                    #[cfg(test)]
+                    self.note_row_verdict("awaits_request");
                     if let Some(m) = &self.metrics {
                         m.inc_advertise(crate::observability::ADVERTISE_AWAITS_REQUEST);
                     }
@@ -12361,6 +12388,8 @@ impl FederationDirectoryReplicationBridge {
                     .is_some_and(|r| r.contains(&att.attestation.attestation_id))
                 {
                     counts.awaits_request += 1;
+                    #[cfg(test)]
+                    self.note_row_verdict("awaits_request");
                     if let Some(m) = &self.metrics {
                         m.inc_advertise(crate::observability::ADVERTISE_AWAITS_REQUEST);
                     }
@@ -12390,6 +12419,8 @@ impl FederationDirectoryReplicationBridge {
                 },
             });
             counts.offered += 1;
+            #[cfg(test)]
+            self.note_row_verdict("offered");
             if let Some(k) = mark_key {
                 let skipped = self.advertise_ledger.lock().ok().and_then(|mut l| {
                     let s = l.take_skipped(&k.0, &att.attestation.attestation_id);
@@ -12416,6 +12447,8 @@ impl FederationDirectoryReplicationBridge {
                 }
             }
         }
+        #[cfg(test)]
+        self.note_row(None);
         Ok((served, last, counts))
     }
 
@@ -14833,6 +14866,55 @@ impl FederationDirectoryReplicationBridge {
             .refs(plane)
             .ok()
             .map(|refs| refs.into_iter().map(|r| r.envelope_hash).collect())
+    }
+
+    /// CIRISEdge#971 — start recording each advertise row's verdicts
+    /// ([`RowVerdicts`]); [`Self::take_row_verdicts`] ends it.
+    pub(crate) fn record_row_verdicts(&self) {
+        *self
+            .row_verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RowVerdicts::default());
+    }
+
+    /// CIRISEdge#971 — the verdicts recorded since
+    /// [`Self::record_row_verdicts`], by attestation id, and stop recording.
+    pub(crate) fn take_row_verdicts(
+        &self,
+    ) -> std::collections::BTreeMap<String, Vec<&'static str>> {
+        self.row_verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .map(|v| v.rows)
+            .unwrap_or_default()
+    }
+
+    /// The advertise row now being judged (`None` between rows).
+    fn note_row(&self, attestation_id: Option<&str>) {
+        let mut guard = self
+            .row_verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(v) = guard.as_mut() {
+            v.current = attestation_id.map(str::to_owned);
+            if let Some(id) = attestation_id {
+                v.rows.entry(id.to_owned()).or_default();
+            }
+        }
+    }
+
+    /// One verdict for the advertise row now being judged.
+    fn note_row_verdict(&self, verdict: &'static str) {
+        let mut guard = self
+            .row_verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(v) = guard.as_mut() {
+            if let Some(id) = v.current.clone() {
+                v.rows.entry(id).or_default().push(verdict);
+            }
+        }
     }
 
     /// CIRISEdge#971 — run the advertise gates in the pre-v45 order (`false`)
@@ -30637,6 +30719,10 @@ pub(crate) mod tests {
     // CIRISEdge#971 — the release claim: with the holdings index a bundle
     // Revocation round reads nothing; without it, it drains the whole index.
     mod revocation_round_reads_971;
+
+    // CIRISEdge#971 — the random-store differentials for the gate reorder and
+    // the narrowed first-contact read, and a caller label reaching persist.
+    mod gate_differential_971;
 
     // Sharing traces is its own consent, per recipient: the serve gate's
     // refuse and allow sides, and the live-state witnesses.
