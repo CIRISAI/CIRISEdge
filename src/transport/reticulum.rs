@@ -7018,7 +7018,9 @@ impl ReticulumTransport {
         &self,
         link: &[u8; 16],
     ) -> Option<crate::transport::alm_link::AvLinkStats> {
-        let st = self.node.link_stats(&LinkId::new(*link))?;
+        let id = LinkId::new(*link);
+        let st = self.node.link_stats(&id)?;
+        let seq = self.node.link_seq_stats(&id);
         Some(crate::transport::alm_link::AvLinkStats {
             bytes_delivered: st.bytes_delivered(),
             srtt_ms: st.srtt_ms(),
@@ -7028,8 +7030,8 @@ impl ReticulumTransport {
             window: st.window(),
             window_max: st.window_max(),
             tx_ring: st.tx_ring_size(),
-            last_sent_seq: st.last_sent_sequence(),
-            oldest_unacked_seq: st.oldest_unacked_sequence(),
+            last_sent_seq: seq.map(|q| q.last_sent_sequence()),
+            oldest_unacked_seq: seq.and_then(|q| q.oldest_unacked_sequence()),
         })
     }
 
