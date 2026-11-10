@@ -398,6 +398,15 @@ struct SpanWindow {
 ///
 /// No queue-delay threshold and no per-leg bit enters the verdict: a slow
 /// leg is C5's (that leg sheds to its base layer) and its child's own C1's.
+///
+/// **Limit: datagram legs.** A leg whose media rides leviculum#102 datagrams
+/// has no delivery proof (`bytes_delivered` counts Channel envelopes and
+/// resources only), so it reports what it accepted as delivered, and on such
+/// an uplink only refusals (`PacingDelay`) can reach a verdict. A loss past
+/// the sender (the path, the peer's sink) is invisible here, so this meter
+/// can neither learn nor lower a ceiling from it; growth stays gated by the
+/// probe allowance, and the child's own C1 still sees the loss and moves. A
+/// receiver-side delivery report would close it (CIRISEdge#975).
 #[derive(Debug, Clone)]
 pub struct EgressMeter {
     window_ms: u64,

@@ -1,7 +1,7 @@
 //! C2 — admission, for the publisher ("parent 0") and every relay alike.
 //!
 //! ```text
-//!   usable = commit_fraction · min(advertised, measured) − committed − reserve
+//!   usable = min(commit_fraction · advertised, measured) − committed − reserve
 //! ```
 //!
 //! - **advertised** is the forwarder's own claim (operator cap / signed ad);
@@ -15,8 +15,10 @@
 //!   instead: the demonstrated clean floor plus an allowance that starts at
 //!   ONE stream (the cold-start trial slot, so an unmeasured relay is not
 //!   zero) and doubles after each clean window in which it was used.
-//! - **commit_fraction** (0.65) applies to the min, so neither an honest
-//!   claim nor a measurement is ever committed past 65 %.
+//! - **One margin per measurement** (§5.1): `commit_fraction` (0.65) applies
+//!   to an advertised claim; a measurement already carries the meter's
+//!   [`MEASURED_MARGIN`] (0.75 of the p10 it demonstrated), so the limit is
+//!   `min(0.65 · advertised, measured)`.
 //! - **committed** is a live ledger keyed by subscriber (primary = stream
 //!   rate, standby = audio rate), not static config.
 //!
@@ -28,6 +30,11 @@
 //! lift it: it rises only on a window that sent more than it, and a forwarder
 //! that was shed down to its ceiling, and offers no room, sends less. A
 //! forwarder flagged for over-claiming keeps its ceiling.
+//!
+//! A clean window in which someone is waiting (a capacity refusal since the
+//! last step) raises a measured ceiling by one stream of committable room:
+//! additive increase. The ask is the probe; the next verdict takes it back if
+//! the uplink really is full.
 //!
 //! A publisher's ceiling is never read below one stream. Every relay can be
 //! replaced by another path; the publisher cannot, so with no child its
@@ -164,6 +171,13 @@ struct Drain {
     role: Role,
     until_ms: u64,
 }
+
+/// The margin on a measured capacity (`docs/AV_ALM_DESIGN.md` §5.1, §6
+/// "give grace, stay safe"): the uplink meter commits 0.75 of the p10 rate it
+/// demonstrated, and admission adds no `commit_fraction` on top. An
+/// advertised claim, which nothing demonstrated, still takes
+/// `commit_fraction` (0.65).
+pub const MEASURED_MARGIN: f64 = super::path_meter::UPLINK_SAFETY_MARGIN;
 
 /// How long a measured ceiling stands with no congested window before it is
 /// stale. Each ceiling learned again waits twice as long, up to
@@ -434,27 +448,44 @@ impl<P: PeerRef> Admission<P> {
         self.ceiling_bps
     }
 
-    /// The hard limit: `commit_fraction · min(advertised, measured) − reserve`.
+    /// The hard limit: `min(commit_fraction · advertised, measured) − reserve`.
     /// Shedding is against this limit only (the probe gate limits growth,
     /// never takes back what was admitted).
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn hard_limit_bps(&self) -> f64 {
-        let adv = self.advertised_bps.map_or(f64::INFINITY, |a| a as f64);
-        (self.fraction() * adv.min(self.measured_bps())
-            - self.cfg.reserve_bps as f64
-            - self.external_committed as f64)
+        (self.committable_bps() - self.cfg.reserve_bps as f64 - self.external_committed as f64)
             .max(0.0)
     }
 
-    /// What the uplink measured. A publisher's is never read below one
-    /// stream (see the module docs): it is the one path nothing can replace.
+    /// What may be committed before the reserve and the node's other
+    /// streams: `min(commit_fraction · advertised, measured)`. One margin per
+    /// measurement (`docs/AV_ALM_DESIGN.md` §5.1): a claim takes
+    /// `commit_fraction`, a measurement already carries
+    /// [`MEASURED_MARGIN`] from the uplink meter, and stacking both would
+    /// commit about 0.49 of what the uplink demonstrably carries.
+    #[allow(clippy::cast_precision_loss)]
+    fn committable_bps(&self) -> f64 {
+        let adv = self
+            .advertised_bps
+            .map_or(f64::INFINITY, |a| self.fraction() * a as f64);
+        adv.min(self.measured_bps())
+    }
+
+    /// What the uplink measured, as committable (the meter's margin is in
+    /// it; a class policy's fraction, the canonical's 5 %, still applies). A
+    /// publisher's is never read below one stream (see the module docs): it
+    /// is the one path nothing can replace.
     #[allow(clippy::cast_precision_loss)]
     fn measured_bps(&self) -> f64 {
-        match self.ceiling_bps {
-            None => f64::INFINITY,
-            Some(c) if self.is_root => c.max(self.cfg.stream_bps as f64 / self.fraction()),
-            Some(c) => c,
+        let Some(c) = self.ceiling_bps else {
+            return f64::INFINITY;
+        };
+        let m = self.class.fraction.map_or(c, |f| f * c);
+        if self.is_root {
+            m.max(self.cfg.stream_bps as f64)
+        } else {
+            m
         }
     }
 
@@ -467,8 +498,7 @@ impl<P: PeerRef> Admission<P> {
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn limit_bps(&self) -> f64 {
-        let adv = self.advertised_bps.map_or(f64::INFINITY, |a| a as f64);
-        let hard = self.fraction() * adv.min(self.measured_bps());
+        let hard = self.committable_bps();
         let probe = match (self.ceiling_bps, self.class.trial_slot) {
             (Some(_), _) => f64::INFINITY,
             (None, true) => self.floor_bps + self.probe_bps,
@@ -816,6 +846,29 @@ impl<P: PeerRef> Admission<P> {
                 if w.sent_bps > c {
                     self.ceiling_bps = Some(w.sent_bps);
                 }
+                // Additive increase (Eric, 2026-11-10): a clean window in
+                // which someone is waiting (a capacity refusal since the
+                // last step) raises a measured ceiling by one stream of
+                // committable room. The ask is the probe; the next verdict,
+                // if the uplink really is full, takes it back. Without it a
+                // shed member waited out the staleness (60-120 s) with the
+                // uplink clean the whole time (avmesh4, after the cap lifted).
+                if self.demand && !self.over_claim_flagged {
+                    self.demand = false;
+                    // From what the hard limit reads now (a publisher's
+                    // one-stream floor included), so a step is one stream.
+                    let per = self.class.fraction.unwrap_or(1.0);
+                    let c = (self.measured_bps() + self.cfg.stream_bps as f64) / per;
+                    self.ceiling_bps = Some(c);
+                    log.record(
+                        now_ms,
+                        &self.me,
+                        DecisionKind::Ceiling,
+                        None,
+                        c as i64,
+                        "demand",
+                    );
+                }
                 // Not for a forwarder caught over-claiming: that measurement
                 // is what disproved its word, and it stays disproved.
                 if !self.over_claim_flagged
@@ -976,8 +1029,8 @@ mod tests {
         let shed = a.on_egress_window(1000, &w, &mut log);
         assert_eq!(
             shed,
-            vec![9, 8, 7, 6, 5, 4, 3, 2],
-            "LIFO down to 0.65 × 4 → 2"
+            vec![9, 8, 7, 6, 5, 4],
+            "LIFO down to what was measured (4), not 0.65 of the claim"
         );
         assert_eq!(log.count(DecisionKind::OverClaim), 1);
         let _ = &mut rng;
@@ -1264,6 +1317,102 @@ mod tests {
         let half = at + 1_000 + CEILING_STALE_MS / 2;
         let _ = a.on_egress_window(half, &window(0.0, false), &mut log);
         assert!(a.ceiling_bps().is_some());
+    }
+
+    /// A measured ceiling rises one stream per clean window in which
+    /// someone is waiting. Mutation (v45.0.0): the refused member waits for
+    /// the ceiling to go stale (60 s here), clean windows and all.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_waiting_member_raises_a_clean_ceiling_one_stream_a_window() {
+        let (mut a, mut log, cfg) = publisher_of_two();
+        let mut rng = SplitMix64(1);
+        let bps = cfg.stream_bps as f64;
+        // A verdict at one stream sheds the second child.
+        assert_eq!(
+            a.on_egress_window(1_000, &window(bps, true), &mut log),
+            vec![2]
+        );
+        assert!(
+            matches!(
+                a.request(1_500, &req(2, Role::Primary), &mut rng, &mut log),
+                AdmitDecision::Refuse {
+                    reason: RefuseReason::Capacity,
+                    ..
+                }
+            ),
+            "the premise: no room under the verdict"
+        );
+        let _ = a.on_egress_window(2_000, &window(bps, false), &mut log);
+        assert!(
+            matches!(
+                a.request(2_500, &req(2, Role::Primary), &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ),
+            "one clean window with a member waiting is one more stream"
+        );
+        assert!(
+            matches!(
+                a.request(2_600, &req(3, Role::Primary), &mut rng, &mut log),
+                AdmitDecision::Refuse { .. }
+            ),
+            "one, not more: the next waits for the next clean window"
+        );
+        let _ = a.on_egress_window(3_000, &window(2.0 * bps, false), &mut log);
+        assert!(matches!(
+            a.request(3_500, &req(3, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+        // Nobody waiting: a clean window adds nothing.
+        let c = a.ceiling_bps();
+        let _ = a.on_egress_window(4_000, &window(bps, false), &mut log);
+        assert_eq!(a.ceiling_bps(), c);
+    }
+
+    /// One margin per measurement (§5.1): an uplink whose backpressured
+    /// windows delivered 4 streams commits 0.75 × 4 = 3, not a further
+    /// 0.65 of that (about 1.95). The real pipeline: meter, then admission.
+    /// Mutation: `commit_fraction` stacked on the meter's margin sheds the
+    /// publisher to one child.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_measured_uplink_commits_three_quarters_of_its_p10() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::publisher(0u32, cfg.clone(), None);
+        roster(&mut a);
+        a.set_probe_streams(6);
+        let mut rng = SplitMix64(1);
+        let mut log = DecisionLog::new(64);
+        for c in 1..=6u32 {
+            assert!(matches!(
+                a.request(0, &req(c, Role::Primary), &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ));
+        }
+        // Offered 6 streams, 4 delivered and the rest refused, every second.
+        let frame = 100u64;
+        let per_stream_frames = cfg.stream_bps / 8 / frame;
+        let mut meter = super::super::EgressMeter::new(1_000, 150);
+        let mut verdict = None;
+        for t in 0..super::super::path_meter::UPLINK_MIN_WINDOWS as u64 {
+            for _ in 0..4 * per_stream_frames {
+                meter.on_sent(t * 1_000, frame, 0.0);
+            }
+            for _ in 0..2 * per_stream_frames {
+                meter.on_dropped(t * 1_000, frame);
+            }
+            meter.on_delivered(t * 1_000, 4 * per_stream_frames * frame);
+            let w = meter.roll(t * 1_000 + 1_000).expect("a window");
+            if w.congested {
+                verdict = Some(w);
+            }
+        }
+        let w = verdict.expect("a capped uplink reaches a verdict");
+        let four = (4 * per_stream_frames * frame * 8) as f64;
+        assert!((w.capacity_bps.expect("its capacity") - MEASURED_MARGIN * four).abs() < 1.0);
+        let shed = a.on_egress_window(10_000, &w, &mut log);
+        assert_eq!(shed, vec![6, 5, 4], "0.75 x 4 streams = 3 stay");
+        assert_eq!(a.ledger().len(), 3);
     }
 
     #[test]

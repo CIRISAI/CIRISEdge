@@ -3301,8 +3301,8 @@ async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], Leg
         let stats = shared.transport.av_link_stats(link);
         let expired = shared.transport.av_link_expired(link).sender;
         let delivered = stats.map_or(0, |st| st.bytes_delivered);
-        let now = LegCounters { expired, delivered };
-        let before = sent_expired.insert(*link, now).unwrap_or(now);
+        let read = LegCounters { expired, delivered };
+        let before = sent_expired.insert(*link, read).unwrap_or(read);
         let mut a = Shared::lock(&shared.alm);
         if let Some(st) = stats {
             a.set_leg_queue_ms(peer, st.queue_delay_ms());

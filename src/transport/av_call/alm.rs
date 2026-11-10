@@ -2139,7 +2139,7 @@ mod tests {
                     // The stalled peer acks late: the link backs up and, now
                     // and then, refuses a frame (one per stalled second).
                     self.nodes[from].set_leg_queue_ms(NAMES[to], 400.0);
-                    if seq % 30 == 0 {
+                    if seq.is_multiple_of(30) {
                         self.nodes[from].on_dropped(CHUNK);
                         return;
                     }

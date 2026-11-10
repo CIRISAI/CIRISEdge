@@ -357,8 +357,9 @@ config, `ControllerConfig::transport_relay()`, with the same structure as `::int
   `last_inbound_ms`. Outputs are delivered bps, loss with a burst flag, `min_rtt`, stability and
   `measured_sustainable`.
 - **C2 Admission (at the relay).**
-  `usable = min(advertised, measured) − committed − reserve`, with commitments never above
-  `commit_fraction = 0.65` of measured. There is one trial slot while unmeasured, and the most recent
+  `usable = min(0.65 · advertised, measured) − committed − reserve`: one margin per measurement
+  (§5.1, v45.1). An advertised claim takes `commit_fraction = 0.65`; `measured` already carries the
+  meter's 0.75 margin, and nothing is stacked on it. There is one trial slot while unmeasured, and the most recent
   admittee is shed first (LIFO) on sustained over-commit.
 
   `measured` is the uplink meter's verdict (`docs/AV_ALM_DESIGN.md` §5.1; v45.1): over a trailing
@@ -369,8 +370,10 @@ config, `ControllerConfig::transport_relay()`, with the same structure as `::int
   refused) are no ceiling sample, and no queue-delay threshold or single leg decides: a stalled or
   slow receiver is C5's and its child's own C1's. Each verdict replaces `measured`, up or down. A
   ceiling with no verdict for 60 s is stale and forgotten, and growth returns to the probe
-  allowance; one learned again stands 120 s. A publisher's `measured` is never read below one
-  stream. *Why:* a forwarder shed down to its ceiling sends less and offers no room, so a clean
+  allowance; one learned again stands 120 s. A clean window in which someone is waiting (a capacity
+  refusal since the last step) raises `measured` by one stream of committable room (additive
+  increase, Eric 2026-11-10): the ask is the probe, and the next verdict takes it back if the uplink
+  really is full. A publisher's `measured` is never read below one stream. *Why:* a forwarder shed down to its ceiling sends less and offers no room, so a clean
   window cannot lift it. A publisher is the one path nothing replaces: with no child, its stream reaches
   nobody and no relay has anything to offer. An advertised cap and the uplink's other streams still
   bind, and a forwarder flagged for over-claiming keeps its ceiling.
