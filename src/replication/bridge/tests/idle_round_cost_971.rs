@@ -63,6 +63,33 @@ impl Transport for Arc<Bytes> {
     }
 }
 
+/// Seed one `scores` row by the seat about itself, waiting out persist's
+/// per-peer admission burst (`RateLimited { PeerBurst }`, v61.2.2) instead of
+/// failing: the store has to span more than one index page, which is more
+/// rows than one burst admits.
+async fn seed_paced(backend: &SqliteBackend, id: &str, envelope: serde_json::Value) {
+    for _ in 0..600 {
+        match try_seed_scoped_attestation(
+            backend,
+            id,
+            SEAT,
+            SEAT,
+            "scores",
+            "federation",
+            envelope.clone(),
+        )
+        .await
+        {
+            Ok(()) => return,
+            Err(e) if e.contains("RateLimited") => {
+                tokio::time::sleep(Duration::from_millis(1_050)).await;
+            }
+            Err(e) => panic!("seed {id}: {e}"),
+        }
+    }
+    panic!("seed {id}: still rate limited after 600 waits");
+}
+
 fn permits(m: &crate::observability::EdgeMetrics) -> u64 {
     m.sweep_permit_wait_seconds
         .read()
@@ -88,7 +115,7 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
             "dimension": "idle:row:v1",
             "payload": { "n": i },
         });
-        seed_raw_attestation(&backend, &id, SEAT, SEAT, "scores", envelope).await;
+        seed_paced(&backend, &id, envelope).await;
     }
     let counting = CountingDirectory::new(backend.clone());
     let directory: Arc<dyn FederationDirectory> = Arc::new(counting.clone());
@@ -178,9 +205,12 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
     rt.shutdown().await;
 }
 
-/// The seat's Key-plane Summary to a stranger, as encoded for the wire, at
-/// `n` offered key records: (refs, frame bytes before the seal, fragments at
-/// the TCP MDU, fragments at the base 500 B link MTU).
+/// The seat's complete Key-plane offer (the unbound, `Full` view: every
+/// offered key record at once), as encoded for the wire, at `n` offered key
+/// records: (refs, frame bytes before the seal, fragments at the TCP MDU,
+/// fragments at the base 500 B link MTU). A bound peer's listing is
+/// watermark-paged (CIRISEdge#531) and returned 0 of 10 on its first call in
+/// this fixture, so it cannot fit the size line.
 async fn key_summary_at(n: usize) -> (usize, usize, usize, usize) {
     let keys: Vec<String> = (0..n).map(|i| format!("announced-971-{i:05}")).collect();
     let (backend, bridge) = make_bridge(&[]);
@@ -194,7 +224,7 @@ async fn key_summary_at(n: usize) -> (usize, usize, usize, usize) {
         .with_local_key_id(Some(SEAT.to_owned()))
         .with_self_provider(Some(Arc::new(move || offer.clone())));
     let refs = bridge
-        .list_envelope_refs_for_peer(EnvelopeKind::Key, Some(DEVICE))
+        .list_envelope_refs_for_peer(EnvelopeKind::Key, None)
         .await;
     let frame = wire_frame::wrap_v3(
         &ReplicationMessage::Summary(SummaryMessage {
@@ -260,7 +290,7 @@ async fn an_idle_bundle_pull_costs_the_seat_971() {
             "dimension": "idle:row:v1",
             "payload": { "n": i },
         });
-        seed_raw_attestation(&backend, &id, SEAT, SEAT, "scores", envelope).await;
+        seed_paced(&backend, &id, envelope).await;
     }
     let counting = CountingDirectory::new(backend.clone());
     let directory: Arc<dyn FederationDirectory> = Arc::new(counting.clone());
