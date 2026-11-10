@@ -64,7 +64,10 @@ impl Transport for Arc<Bytes> {
 }
 
 fn permits(m: &crate::observability::EdgeMetrics) -> u64 {
-    m.sweep_permit_wait_seconds.read().count
+    m.sweep_permit_wait_seconds
+        .read()
+        .snapshot(crate::observability::SWEEP_PERMIT_WAIT_BUCKETS_SECONDS)
+        .count
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

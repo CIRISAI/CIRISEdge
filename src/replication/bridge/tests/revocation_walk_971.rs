@@ -33,7 +33,10 @@ fn sweep(m: &crate::observability::EdgeMetrics, label: &str) -> u64 {
 }
 
 fn permits(m: &crate::observability::EdgeMetrics) -> u64 {
-    m.sweep_permit_wait_seconds.read().count
+    m.sweep_permit_wait_seconds
+        .read()
+        .snapshot(crate::observability::SWEEP_PERMIT_WAIT_BUCKETS_SECONDS)
+        .count
 }
 
 async fn measure(k: usize) {
