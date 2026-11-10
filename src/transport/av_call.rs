@@ -2591,6 +2591,11 @@ fn note_leg_outcomes(
     report: &[(String, LegSend)],
     wire_len: u64,
 ) {
+    // leviculum#102 — a datagram carries no delivery proof: what such a leg
+    // accepted is all the uplink meter can know it delivered.
+    // Lock order: `leg_ttl`, then `alm`, then `leg_cong` (nothing takes
+    // `leg_ttl` while holding `alm`).
+    let ttl = Shared::lock(&shared.leg_ttl);
     let mut alm = Shared::lock(&shared.alm);
     let mut cong = Shared::lock(&shared.leg_cong);
     for (peer, leg) in report {
@@ -2598,6 +2603,9 @@ fn note_leg_outcomes(
         match leg {
             LegSend::Sent => {
                 alm.on_sent(peer, wire_len);
+                if ttl.get(peer).is_some_and(|t| t.uses_datagrams()) {
+                    alm.on_delivered(wire_len);
+                }
                 e.0 = 0;
                 e.1 = e.1.saturating_add(1);
                 if e.2 && e.1 >= LEG_RESTORE_AFTER {
@@ -3249,7 +3257,7 @@ async fn announce_attendees(shared: &Arc<Shared>) {
 async fn watch_loop(shared: Arc<Shared>) {
     let mut tick = tokio::time::interval(WATCH_TICK);
     let mut n: u64 = 0;
-    let mut sent_expired: HashMap<[u8; 16], u64> = HashMap::new();
+    let mut sent_expired: HashMap<[u8; 16], LegCounters> = HashMap::new();
     loop {
         tick.tick().await;
         if shared.ended.load(Ordering::Relaxed) {
@@ -3276,7 +3284,15 @@ async fn watch_loop(shared: Arc<Shared>) {
 /// count as drops), apply the service tier, run every selector and
 /// admission (C2/C4/C6, the decision log), send the C3 frames they produced,
 /// and report this call's load signals to the ladder.
-async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], u64>) {
+/// One leg's cumulative leviculum counters as the last watch tick read them:
+/// timed frames expired unconfirmed, and bytes the link proved delivered.
+#[derive(Debug, Clone, Copy)]
+struct LegCounters {
+    expired: u64,
+    delivered: u64,
+}
+
+async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], LegCounters>) {
     let legs: Vec<(String, [u8; 16])> = Shared::lock(&shared.out_legs)
         .iter()
         .map(|(p, l)| (p.clone(), l.link_id))
@@ -3284,12 +3300,18 @@ async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], u64
     for (peer, link) in &legs {
         let stats = shared.transport.av_link_stats(link);
         let expired = shared.transport.av_link_expired(link).sender;
-        let before = sent_expired.insert(*link, expired).unwrap_or(expired);
+        let delivered = stats.map_or(0, |st| st.bytes_delivered);
+        let now = LegCounters { expired, delivered };
+        let before = sent_expired.insert(*link, now).unwrap_or(now);
         let mut a = Shared::lock(&shared.alm);
         if let Some(st) = stats {
             a.set_leg_queue_ms(peer, st.queue_delay_ms());
         }
-        for _ in before..expired {
+        // §5.1: what the link proved delivered is the uplink meter's rate.
+        // A datagram leg proves nothing; its sends count as they leave
+        // (`note_leg_outcomes`).
+        a.on_delivered(delivered.saturating_sub(before.delivered));
+        for _ in before.expired..expired {
             // An expired frame never reached the peer: a drop on this uplink.
             a.on_dropped(1_000);
         }

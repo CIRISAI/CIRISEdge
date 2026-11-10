@@ -525,6 +525,13 @@ impl AlmState {
         self.egress.on_dropped(now, bytes);
     }
 
+    /// C1, sender side: `bytes` the uplink's links proved delivered
+    /// (`docs/AV_ALM_DESIGN.md` §5.1).
+    pub(super) fn on_delivered(&mut self, bytes: u64) {
+        let now = self.now_ms();
+        self.egress.on_delivered(now, bytes);
+    }
+
     /// This node published `bytes` of its own stream.
     pub(super) fn on_own_published(&mut self, bytes: u64, base_or_audio: bool) {
         self.own_rate.add(bytes, base_or_audio);
@@ -2015,5 +2022,329 @@ mod tests {
         let log = m.nodes[B].log_tail();
         assert!(m.nodes[B].log_count(DecisionKind::Switch) > 0, "{log}");
         assert!(m.b_parents().parent_changes > 0, "{log}");
+    }
+
+    /// The relay-on N=4 room of the server's av_mesh runs, on the production
+    /// [`AlmState`] with an injected clock: every member publishes 30 Hz of
+    /// opaque (all-"audio") chunks and offers relay; C3 frames are routed at
+    /// once; each node's uplink is a per-second byte budget (a rate cap), and
+    /// a stalled receiver delays delivery without limiting any rate.
+    mod mesh4 {
+        use super::*;
+        use std::collections::{BTreeMap, HashSet};
+
+        const N: usize = 4;
+        const NAMES: [&str; N] = ["a", "b", "c", "d"];
+        const CHUNK: u64 = 300;
+        const STEP_MS: u64 = 33;
+        /// One stream, as a rate: 30 chunks/s of `CHUNK` bytes.
+        const STREAM_BYTES_PER_S: u64 = 30 * CHUNK;
+
+        /// A delivery held back by a stalled receiver: released at `at`.
+        struct Held {
+            at: u64,
+            from: usize,
+            to: usize,
+            stream: usize,
+            seq: u64,
+            source_ms: u64,
+        }
+
+        pub(super) struct World {
+            nodes: Vec<AlmState>,
+            streams: [StreamId; N],
+            now: u64,
+            steps: u64,
+            seq: [u64; N],
+            /// Per node: bytes/s its uplink carries (`None`: unlimited).
+            pub(super) cap: [Option<u64>; N],
+            window_start: u64,
+            window_bytes: [u64; N],
+            /// A receiver whose deliveries (and acks) are held back until the
+            /// end of each stall, `(node, from_ms, to_ms)`, repeating.
+            pub(super) stall: Option<(usize, Vec<(u64, u64)>)>,
+            held: Vec<Held>,
+            /// What each member heard of each stream: `(rx, stream) -> seqs`.
+            heard: BTreeMap<(usize, usize), HashSet<u64>>,
+            /// Each stream's chunks by when they were published.
+            published: Vec<Vec<(u64, u64)>>,
+        }
+
+        impl World {
+            pub(super) fn new() -> Self {
+                let roster: Vec<String> = NAMES.iter().map(|n| (*n).to_owned()).collect();
+                let streams = [s(1), s(2), s(3), s(4)];
+                let mut nodes: Vec<AlmState> = (0..N)
+                    .map(|i| AlmState::new(NAMES[i], streams[i], &roster, true, i as u64 + 1))
+                    .collect();
+                for (i, n) in nodes.iter_mut().enumerate() {
+                    for (j, peer) in NAMES.iter().enumerate() {
+                        if i != j {
+                            n.on_caps(peer, CAPS_THIS_BUILD | CAP_RELAY);
+                            n.note_publisher(streams[j], peer);
+                            n.note_bound_publisher(streams[j], peer);
+                        }
+                    }
+                }
+                Self {
+                    nodes,
+                    streams,
+                    now: 0,
+                    steps: 0,
+                    seq: [0; N],
+                    cap: [None; N],
+                    window_start: 0,
+                    window_bytes: [0; N],
+                    stall: None,
+                    held: Vec::new(),
+                    heard: BTreeMap::new(),
+                    published: vec![Vec::new(); N],
+                }
+            }
+
+            fn legs(i: usize) -> Vec<String> {
+                (0..N)
+                    .filter(|j| *j != i)
+                    .map(|j| NAMES[j].to_owned())
+                    .collect()
+            }
+
+            fn idx(name: &str) -> usize {
+                NAMES.iter().position(|n| *n == name).expect("a member")
+            }
+
+            fn stalled(&self, rx: usize) -> Option<u64> {
+                let (node, spans) = self.stall.as_ref()?;
+                if *node != rx {
+                    return None;
+                }
+                spans
+                    .iter()
+                    .find(|(from, to)| self.now >= *from && self.now < *to)
+                    .map(|(_, to)| *to)
+            }
+
+            /// `from` puts one chunk of stream `stream` on its leg to `to`:
+            /// within its uplink's budget it is accepted, and delivered now or,
+            /// to a stalled receiver, when the stall ends.
+            fn send(&mut self, from: usize, to: usize, stream: usize, seq: u64, source_ms: u64) {
+                if let Some(cap) = self.cap[from] {
+                    if self.window_bytes[from] + CHUNK > cap {
+                        self.nodes[from].on_dropped(CHUNK);
+                        return;
+                    }
+                }
+                self.window_bytes[from] += CHUNK;
+                if let Some(until) = self.stalled(to) {
+                    // The stalled peer acks late: the link backs up and, now
+                    // and then, refuses a frame (one per stalled second).
+                    self.nodes[from].set_leg_queue_ms(NAMES[to], 400.0);
+                    if seq % 30 == 0 {
+                        self.nodes[from].on_dropped(CHUNK);
+                        return;
+                    }
+                    self.nodes[from].on_sent(NAMES[to], CHUNK);
+                    self.held.push(Held {
+                        at: until,
+                        from,
+                        to,
+                        stream,
+                        seq,
+                        source_ms,
+                    });
+                    return;
+                }
+                self.nodes[from].set_leg_queue_ms(NAMES[to], 0.0);
+                self.nodes[from].on_sent(NAMES[to], CHUNK);
+                self.nodes[from].on_delivered(CHUNK);
+                self.arrive(from, to, stream, seq, source_ms);
+            }
+
+            fn arrive(&mut self, from: usize, to: usize, stream: usize, seq: u64, source_ms: u64) {
+                let st = self.streams[stream];
+                self.nodes[to].on_chunk(st, NAMES[from], 1, seq, CHUNK, source_ms, true, 0);
+                if self.heard.entry((to, stream)).or_default().insert(seq) {
+                    // First copy: forward it where this node is a parent.
+                    let legs = Self::legs(to);
+                    let skip = self.nodes[to].forward_exclude(
+                        st,
+                        1,
+                        seq,
+                        NAMES[from],
+                        NAMES[stream],
+                        &legs,
+                        true,
+                    );
+                    if let Some(skip) = skip {
+                        for l in legs.iter().filter(|l| !skip.contains(l)) {
+                            let k = Self::idx(l);
+                            self.send(to, k, stream, seq, source_ms);
+                        }
+                    }
+                }
+            }
+
+            fn release_held(&mut self) {
+                let now = self.now;
+                let (due, rest): (Vec<Held>, Vec<Held>) = std::mem::take(&mut self.held)
+                    .into_iter()
+                    .partition(|h| h.at <= now);
+                self.held = rest;
+                for h in due {
+                    self.nodes[h.from].on_delivered(CHUNK);
+                    self.arrive(h.from, h.to, h.stream, h.seq, h.source_ms);
+                }
+            }
+
+            fn route(&mut self, mut q: VecDeque<(usize, Outgoing)>) {
+                while let Some((from, o)) = q.pop_front() {
+                    let to = Self::idx(&o.to);
+                    match decode(&o.frame, NAMES[from]).expect("decodes") {
+                        WireFrame::Caps(c) => {
+                            self.nodes[to].on_caps(NAMES[from], c);
+                        }
+                        WireFrame::Control(cf) => {
+                            for r in self.nodes[to].on_control(NAMES[from], cf, 20.0) {
+                                q.push_back((to, r));
+                            }
+                        }
+                    }
+                }
+            }
+
+            fn tick(&mut self) {
+                let mut q = VecDeque::new();
+                for i in 0..N {
+                    let _ = self.nodes[i].set_tier(ServiceTier::FullOps);
+                    for o in self.nodes[i].tick(&Self::legs(i)) {
+                        q.push_back((i, o));
+                    }
+                }
+                self.route(q);
+            }
+
+            fn step(&mut self) {
+                self.now += STEP_MS;
+                self.steps += 1;
+                for n in &mut self.nodes {
+                    n.t0 =
+                        n.t0.checked_sub(Duration::from_millis(STEP_MS))
+                            .expect("the clock is past the shift");
+                }
+                if self.now >= self.window_start + 1_000 {
+                    self.window_start = self.now;
+                    self.window_bytes = [0; N];
+                }
+                self.release_held();
+                let at = crate::transport::av_chunk_auth::unix_ms_now();
+                for i in 0..N {
+                    let seq = self.seq[i];
+                    self.seq[i] += 1;
+                    self.published[i].push((self.now, seq));
+                    let legs = Self::legs(i);
+                    let excluded = self.nodes[i].own_exclude(&legs, true);
+                    self.nodes[i].on_own_published(CHUNK, true);
+                    for l in legs.iter().filter(|l| !excluded.contains(l)) {
+                        let k = Self::idx(l);
+                        self.send(i, k, i, seq, at);
+                    }
+                }
+                if self.steps.is_multiple_of(5) {
+                    self.tick();
+                }
+            }
+
+            pub(super) fn run_until(&mut self, ms: u64) {
+                while self.now < ms {
+                    self.step();
+                }
+            }
+
+            /// Share of `stream`'s chunks published in `[from, to)` that
+            /// every other member heard (the worst member).
+            #[allow(clippy::cast_precision_loss)]
+            pub(super) fn worst_heard(&self, stream: usize, from: u64, to: u64) -> f64 {
+                let owed: Vec<u64> = self.published[stream]
+                    .iter()
+                    .filter(|(t, _)| *t >= from && *t < to)
+                    .map(|(_, s)| *s)
+                    .collect();
+                (0..N)
+                    .filter(|rx| *rx != stream)
+                    .map(|rx| {
+                        let got = self.heard.get(&(rx, stream));
+                        let n = owed
+                            .iter()
+                            .filter(|s| got.is_some_and(|g| g.contains(s)))
+                            .count();
+                        n as f64 / owed.len().max(1) as f64
+                    })
+                    .fold(1.0, f64::min)
+            }
+
+            pub(super) fn sheds(&self) -> u64 {
+                self.nodes.iter().map(|n| n.counts.shed).sum()
+            }
+
+            pub(super) fn shed_by(&self, i: usize) -> u64 {
+                self.nodes[i].counts.shed
+            }
+
+            pub(super) fn tail(&self) -> String {
+                self.nodes
+                    .iter()
+                    .map(|n| format!("--- {} ---\n{}", n.me, n.log_tail()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+
+        /// A stall is not a cap: one member's acks stop for 1.5 s every 10 s
+        /// (a busy host), with its links backing up past the old 150 ms bar
+        /// and refusing a frame a second while it lasts, and no uplink has
+        /// any rate limit. Nobody sheds and everyone hears everything. The
+        /// avmesh4n/avmesh4rel shape. Mutation (v45.0.0 meter): the backed-up
+        /// legs made every sender's uplink "congested", each learned its send
+        /// rate as a ceiling, and shed.
+        #[test]
+        fn n4_a_stall_sheds_nobody() {
+            let mut w = World::new();
+            let spans = (2..6u64)
+                .map(|k| (k * 10_000, k * 10_000 + 1_500))
+                .collect();
+            w.stall = Some((3, spans));
+            w.run_until(60_000);
+            assert_eq!(w.sheds(), 0, "a stall shed someone\n{}", w.tail());
+            for st in 0..N {
+                // A refused frame is a lost frame: the stall costs its few.
+                let h = w.worst_heard(st, 10_000, 58_000);
+                assert!(h >= 0.99, "stream {st} heard {h}\n{}", w.tail());
+            }
+        }
+
+        /// A real cap sheds, and recovers once lifted: `a`'s uplink carries
+        /// two and a half streams from 20 s to 50 s (it owes three). `a`
+        /// sheds; within the bound after the lift every member hears `a`'s
+        /// stream whole again. Mutation (v45.0.0): the ceiling stood until
+        /// stale (60-240 s), nobody asked, and the shed members stayed shed.
+        #[test]
+        fn n4_a_rate_cap_sheds_and_recovers_within_the_bound() {
+            /// Lift to whole again, at most.
+            const BOUND_MS: u64 = 20_000;
+            let mut w = World::new();
+            w.run_until(20_000);
+            assert_eq!(w.shed_by(0), 0, "the premise: no shed before the cap");
+            w.cap[0] = Some(STREAM_BYTES_PER_S * 5 / 2);
+            w.run_until(50_000);
+            assert!(w.shed_by(0) > 0, "a real cap sheds\n{}", w.tail());
+            w.cap[0] = None;
+            w.run_until(50_000 + BOUND_MS + 20_000);
+            let h = w.worst_heard(0, 50_000 + BOUND_MS, 50_000 + BOUND_MS + 18_000);
+            assert!(
+                h >= 0.999,
+                "a's stream heard {h} from {BOUND_MS} ms after the lift\n{}",
+                w.tail()
+            );
+        }
     }
 }

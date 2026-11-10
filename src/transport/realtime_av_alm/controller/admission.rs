@@ -6,10 +6,12 @@
 //!
 //! - **advertised** is the forwarder's own claim (operator cap / signed ad);
 //!   absent = unbounded.
-//! - **measured** is the uplink ceiling learned from congested egress windows
-//!   ([`super::EgressWindow`]): a window with drops or queue delay over the
-//!   threshold measured what the uplink really carries. Until the first such
-//!   window it is unknown, and growth is gated by a **probe allowance**
+//! - **measured** is the uplink's demonstrated capacity from the uplink
+//!   meter's verdict ([`super::EgressMeter`], `docs/AV_ALM_DESIGN.md` §5.1):
+//!   the p10 delivery rate of the backpressured windows of a 30 s span in
+//!   which the uplink, not a leg or a moment, was the bottleneck, with a 0.75
+//!   margin. Each verdict replaces it, up or down. Until the first verdict it
+//!   is unknown, and growth is gated by a **probe allowance**
 //!   instead: the demonstrated clean floor plus an allowance that starts at
 //!   ONE stream (the cold-start trial slot, so an unmeasured relay is not
 //!   zero) and doubles after each clean window in which it was used.
@@ -19,8 +21,8 @@
 //!   rate, standby = audio rate), not static config.
 //!
 //! A measured ceiling is an estimate of a moment, not a property of the
-//! uplink: one that stands [`CEILING_STALE_MS`] with no sustained (two
-//! windows running) congestion is
+//! uplink: one that stands [`CEILING_STALE_MS`] with no congested verdict from
+//! the uplink meter is
 //! forgotten and growth goes back to the probe allowance
 //! (`docs/AV_ALM_DESIGN.md` §5.1, "a ceiling gone stale"). Nothing else could
 //! lift it: it rises only on a window that sent more than it, and a forwarder
@@ -167,9 +169,9 @@ struct Drain {
 /// stale. Each ceiling learned again waits twice as long, up to
 /// [`CEILING_STALE_MAX_MS`], so a really limited uplink costs its subscribers
 /// a move rarely, not every half minute (react fast, recover slowly).
-pub const CEILING_STALE_MS: u64 = 30_000;
+pub const CEILING_STALE_MS: u64 = 60_000;
 /// The longest a ceiling stands before it is stale.
-pub const CEILING_STALE_MAX_MS: u64 = 240_000;
+pub const CEILING_STALE_MAX_MS: u64 = 120_000;
 
 /// C2 admission for one forwarder and one stream.
 // Independent state flags (root, upstream health, probe demand, over-claim
@@ -187,7 +189,6 @@ pub struct Admission<P: PeerRef> {
     floor_bps: f64,
     probe_bps: f64,
     clean_streak: u32,
-    congested_streak: u32,
     demand: bool,
     preempted: Vec<P>,
     over_claim_flagged: bool,
@@ -247,7 +248,6 @@ impl<P: PeerRef> Admission<P> {
             floor_bps: 0.0,
             probe_bps: probe,
             clean_streak: 0,
-            congested_streak: 0,
             demand: false,
             preempted: Vec::new(),
             over_claim_flagged: false,
@@ -780,50 +780,37 @@ impl<P: PeerRef> Admission<P> {
         log: &mut DecisionLog,
     ) -> Vec<P> {
         self.expire_drains(now_ms);
-        // What keeps a ceiling current is what learned it: congestion that
-        // holds two windows running (or an uplink that sent nothing at all).
-        // A lone congested window (one `Busy`, one late ack) teaches nothing,
-        // so it does not keep a ceiling from going stale either. On v44.1.1
-        // eleven such blips in the 60 s after a cap lifted kept the cap's
-        // ceiling standing, and the members it had shed never got room back
-        // (avmesh4, m0).
-        if w.congested && w.sent_bps <= 0.0 {
-            self.last_congested_ms = now_ms;
-        }
-        if w.congested && w.sent_bps > 0.0 {
+        // §5.1: the uplink meter's verdict IS the measurement. A window it
+        // calls congested carries the span's demonstrated capacity, which
+        // replaces the ceiling whether it is higher or lower: nothing here
+        // ratchets, and a lone refusal or one slow leg never makes a verdict
+        // (`EgressMeter`). It also keeps the ceiling from going stale.
+        if let Some(c) = w.capacity_bps.filter(|_| w.congested) {
             self.clean_streak = 0;
-            self.congested_streak += 1;
-            if self.congested_streak >= 2 {
-                self.last_congested_ms = now_ms;
-                let c = match self.ceiling_bps {
-                    None => w.sent_bps,
-                    Some(c) => 0.5f64.mul_add(w.sent_bps - c, c),
-                };
-                self.ceiling_bps = Some(c);
-                log.record(
-                    now_ms,
-                    &self.me,
-                    DecisionKind::Ceiling,
-                    None,
-                    c as i64,
-                    "congested",
-                );
-                if let Some(adv) = self.advertised_bps {
-                    if !self.over_claim_flagged && adv as f64 > self.cfg.over_claim_ratio * c {
-                        self.over_claim_flagged = true;
-                        log.record(
-                            now_ms,
-                            &self.me,
-                            DecisionKind::OverClaim,
-                            None,
-                            (adv as f64 / c * 100.0) as i64,
-                            "advertised/measured %",
-                        );
-                    }
+            self.last_congested_ms = now_ms;
+            self.ceiling_bps = Some(c);
+            log.record(
+                now_ms,
+                &self.me,
+                DecisionKind::Ceiling,
+                None,
+                c as i64,
+                "congested",
+            );
+            if let Some(adv) = self.advertised_bps {
+                if !self.over_claim_flagged && adv as f64 > self.cfg.over_claim_ratio * c {
+                    self.over_claim_flagged = true;
+                    log.record(
+                        now_ms,
+                        &self.me,
+                        DecisionKind::OverClaim,
+                        None,
+                        (adv as f64 / c * 100.0) as i64,
+                        "advertised/measured %",
+                    );
                 }
             }
-        } else if !w.congested {
-            self.congested_streak = 0;
+        } else {
             self.clean_streak += 1;
             if let Some(c) = self.ceiling_bps {
                 if w.sent_bps > c {
@@ -944,9 +931,11 @@ mod tests {
                 t * 1000,
                 &EgressWindow {
                     sent_bps: sent,
+                    delivered_bps: sent,
                     dropped_bytes: 0,
                     max_queue_ms: 0.0,
                     congested: false,
+                    capacity_bps: None,
                 },
                 &mut log,
             );
@@ -974,16 +963,16 @@ mod tests {
         }
         #[allow(clippy::cast_precision_loss)]
         let real = (4 * cfg.stream_bps) as f64;
+        // The meter's verdict carries the capacity (its span already holds
+        // the evidence: one verdict is a ceiling).
         let w = EgressWindow {
             sent_bps: real,
+            delivered_bps: real,
             dropped_bytes: 10,
             max_queue_ms: 500.0,
             congested: true,
+            capacity_bps: Some(real),
         };
-        assert!(
-            a.on_egress_window(0, &w, &mut log).is_empty(),
-            "one window is not a ceiling"
-        );
         let shed = a.on_egress_window(1000, &w, &mut log);
         assert_eq!(
             shed,
@@ -994,12 +983,16 @@ mod tests {
         let _ = &mut rng;
     }
 
+    /// A window as the uplink meter closes it: `congested` is its verdict,
+    /// with `sent_bps` the capacity it demonstrated.
     fn window(sent_bps: f64, congested: bool) -> EgressWindow {
         EgressWindow {
             sent_bps,
+            delivered_bps: sent_bps,
             dropped_bytes: u64::from(congested) * 1_000,
             max_queue_ms: if congested { 500.0 } else { 0.0 },
             congested,
+            capacity_bps: congested.then_some(sent_bps),
         }
     }
 
@@ -1028,11 +1021,11 @@ mod tests {
     fn a_publisher_keeps_one_stream_under_any_ceiling() {
         let (mut a, mut log, cfg) = publisher_of_two();
         let tiny = cfg.stream_bps as f64 / 50.0;
-        assert!(a
-            .on_egress_window(1_000, &window(tiny, true), &mut log)
-            .is_empty());
-        let shed = a.on_egress_window(2_000, &window(tiny, true), &mut log);
+        let shed = a.on_egress_window(1_000, &window(tiny, true), &mut log);
         assert_eq!(shed, vec![2], "LIFO, and only down to one");
+        assert!(a
+            .on_egress_window(2_000, &window(tiny, true), &mut log)
+            .is_empty());
         assert_eq!(a.ledger().len(), 1, "the oldest child stays");
 
         let mut rng = SplitMix64(1);
@@ -1073,9 +1066,8 @@ mod tests {
             AdmitDecision::Admit { .. }
         ));
         let tiny = cfg.stream_bps as f64 / 50.0;
-        let _ = a.on_egress_window(1_000, &window(tiny, true), &mut log);
         assert_eq!(
-            a.on_egress_window(2_000, &window(tiny, true), &mut log),
+            a.on_egress_window(1_000, &window(tiny, true), &mut log),
             vec![1]
         );
     }
@@ -1133,7 +1125,8 @@ mod tests {
         let bps = cfg.stream_bps as f64;
         let clean = window(0.0, false);
         let mut at = 1_000;
-        for stands in [CEILING_STALE_MS, 2 * CEILING_STALE_MS, 4 * CEILING_STALE_MS] {
+        // §5.1: 60 s, then 120 s, and never longer.
+        for stands in [CEILING_STALE_MS, 2 * CEILING_STALE_MS, CEILING_STALE_MAX_MS] {
             let _ = a.on_egress_window(at, &window(bps, true), &mut log);
             at += 1_000;
             let _ = a.on_egress_window(at, &window(bps, true), &mut log);
@@ -1247,24 +1240,28 @@ mod tests {
         let (mut a, mut log, cfg) = publisher_of_two();
         let bps = cfg.stream_bps as f64;
         let _ = a.on_egress_window(1_000, &window(bps, true), &mut log);
-        let _ = a.on_egress_window(2_000, &window(bps, true), &mut log);
         assert!(a.ceiling_bps().is_some(), "the premise: a ceiling learned");
-        let mut at = 2_000;
-        while at < 2_000 + CEILING_STALE_MS {
+        // The real pipeline: 90 frames/s, one refused every 5 s (a lone
+        // `Busy`). The uplink meter never calls that a verdict, so the
+        // ceiling goes stale on time.
+        let mut meter = super::super::EgressMeter::new(1_000, 150);
+        let mut at = 1_000;
+        while at < 1_000 + CEILING_STALE_MS {
+            for _ in 0..90 {
+                meter.on_sent(at, 300, 400.0);
+            }
+            meter.on_delivered(at, 90 * 300);
+            if (at / 1_000) % 5 == 0 {
+                meter.on_dropped(at, 300);
+            }
             at += 1_000;
-            let blip = (at / 1_000) % 5 == 0;
-            let _ = a.on_egress_window(at, &window(bps / 2.0, blip), &mut log);
+            let w = meter.roll(at).expect("a window");
+            let _ = a.on_egress_window(at, &w, &mut log);
         }
-        assert_eq!(
-            a.ceiling_bps(),
-            None,
-            "stale on time: nothing congested two windows running"
-        );
-        // Sustained congestion still keeps it (the twice-as-long test is the
-        // same rule from the other side).
+        assert_eq!(a.ceiling_bps(), None, "stale on time: no blip is a verdict");
+        // A verdict still keeps it.
         let _ = a.on_egress_window(at + 1_000, &window(bps, true), &mut log);
-        let _ = a.on_egress_window(at + 2_000, &window(bps, true), &mut log);
-        let half = at + 2_000 + CEILING_STALE_MS / 2;
+        let half = at + 1_000 + CEILING_STALE_MS / 2;
         let _ = a.on_egress_window(half, &window(0.0, false), &mut log);
         assert!(a.ceiling_bps().is_some());
     }

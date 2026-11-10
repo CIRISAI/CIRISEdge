@@ -676,6 +676,9 @@ impl Sim {
         let depart = start + bytes as f64 * 8_000.0 / rate;
         node.uplink_free_at = depart;
         node.egress.on_sent(at, bytes, q);
+        // The serializer delivers whatever it accepted (§5.1's numerator; the
+        // path's own loss is the child's to read).
+        node.egress.on_delivered(at, bytes);
         self.note_leg(from, to, false);
         let hop = self.next_hop(from, to);
         let jitter_draw = self.net.unit();

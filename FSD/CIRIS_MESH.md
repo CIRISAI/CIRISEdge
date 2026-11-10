@@ -361,11 +361,17 @@ config, `ControllerConfig::transport_relay()`, with the same structure as `::int
   `commit_fraction = 0.65` of measured. There is one trial slot while unmeasured, and the most recent
   admittee is shed first (LIFO) on sustained over-commit.
 
-  `measured` recovers. A ceiling with no congested window for 30 s is stale and forgotten, and growth
-  returns to the probe allowance; each ceiling learned again stands twice as long, up to 240 s. A
-  publisher's `measured` is never read below one stream. *Why:* a ceiling rises only on a window that
-  sent more than it, and a forwarder shed down to it sends less and offers no room, so nothing else
-  could lift it. A publisher is the one path nothing replaces: with no child, its stream reaches
+  `measured` is the uplink meter's verdict (`docs/AV_ALM_DESIGN.md` §5.1; v45.1): over a trailing
+  30 s span, the uplink is the bottleneck only when at least 5 % of the frames offered across ALL its
+  legs were refused, in at least 3 windows of the span (and the span holds at least 5); then
+  `measured` is the p10 delivery rate (leviculum `bytes_delivered`, a datagram leg counting what it
+  accepted) of the span's backpressured windows, in sent units, × 0.75. App-limited windows (nothing
+  refused) are no ceiling sample, and no queue-delay threshold or single leg decides: a stalled or
+  slow receiver is C5's and its child's own C1's. Each verdict replaces `measured`, up or down. A
+  ceiling with no verdict for 60 s is stale and forgotten, and growth returns to the probe
+  allowance; one learned again stands 120 s. A publisher's `measured` is never read below one
+  stream. *Why:* a forwarder shed down to its ceiling sends less and offers no room, so a clean
+  window cannot lift it. A publisher is the one path nothing replaces: with no child, its stream reaches
   nobody and no relay has anything to offer. An advertised cap and the uplink's other streams still
   bind, and a forwarder flagged for over-claiming keeps its ceiling.
 
