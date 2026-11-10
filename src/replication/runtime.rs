@@ -1052,7 +1052,15 @@ pub async fn bundle_bootstrap_peers_held(
             skipped.push((id.clone(), BundleSkip::IsSelf));
             continue;
         }
-        match directory.lookup_public_key(id).await {
+        // CIRISEdge#971 — booked under its own caller label, not `other`:
+        // the seat and every device make this read at start, and again in
+        // each re-check until every serve node is held or fixed-skipped.
+        let record = crate::read_caller::scoped(
+            crate::read_caller::Site::BundleSeats,
+            directory.lookup_public_key(id),
+        )
+        .await;
+        match record {
             Ok(Some(_)) => held.push(id.clone()),
             Ok(None) => skipped.push((id.clone(), BundleSkip::NotInDirectory)),
             Err(e) => {
@@ -3225,6 +3233,29 @@ mod tests {
         assert!(peers.is_empty());
         assert_eq!(still, fixed);
         assert_eq!(counting.total(), 0, "steady state: zero reads");
+    }
+
+    /// (4-iv) **The serve-node check is booked under its own caller label**
+    /// (`edge.bundle.seats`), at start and in the re-check, so the seat's
+    /// `snapshot().callers` does not file it under `other`. Mutation: drop the
+    /// `scoped` wrap in `bundle_bootstrap_peers_held`, and the label is `-`.
+    #[tokio::test]
+    async fn the_serve_node_check_names_its_caller_971() {
+        use crate::replication::counting_directory_930::CountingDirectory;
+        let held = directory_holding(&["seat-a"]).await;
+        let counting = CountingDirectory::new(held);
+        let ids = vec!["seat-a".to_owned(), "seat-b".to_owned()];
+        let (_peers, skipped) =
+            bundle_bootstrap_peers_held(&ids, &counting, Some("device"), false, false).await;
+        let _ = recheck_bundle_peers(&skipped, &counting, Some("device")).await;
+        assert_eq!(
+            counting.count("lookup_public_key"),
+            3,
+            "two at start, one re-check"
+        );
+        let want: std::collections::BTreeSet<String> =
+            [crate::read_caller::Site::BundleSeats.label().to_owned()].into();
+        assert_eq!(counting.callers_of("lookup_public_key"), want);
     }
 
     /// (4-iii) **The opt-out wins after a late arrival.** Mutation: let the

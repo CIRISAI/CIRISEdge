@@ -27,6 +27,9 @@ use ciris_persist::federation::*;
 pub(crate) struct CountingDirectory {
     inner: Arc<dyn FederationDirectory>,
     counts: Arc<Mutex<BTreeMap<&'static str, usize>>>,
+    /// CIRISEdge#971 — the persist caller label in force at each call, by
+    /// method (`-` for none), so a witness can see a read's booking.
+    callers: Arc<Mutex<BTreeMap<&'static str, std::collections::BTreeSet<String>>>>,
     /// CIRISEdge#971 — content hashes `list_wire_hashes_since` leaves out, as
     /// if persist's index had dropped them (a purge). Only for a corpus inside
     /// one page: a filtered page reads short and ends the drain.
@@ -48,6 +51,7 @@ impl CountingDirectory {
         Self {
             inner,
             counts: Arc::new(Mutex::new(BTreeMap::new())),
+            callers: Arc::new(Mutex::new(BTreeMap::new())),
             hidden_wire_hashes: Arc::new(Mutex::new(std::collections::HashSet::new())),
             fail_cursor_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             head_gate: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -110,6 +114,24 @@ impl CountingDirectory {
             .expect("counts")
             .entry(method)
             .or_insert(0) += 1;
+        let caller = ciris_persist::observe::current_caller()
+            .map_or_else(|| "-".to_owned(), ciris_persist::observe::Caller::label);
+        self.callers
+            .lock()
+            .expect("callers")
+            .entry(method)
+            .or_default()
+            .insert(caller);
+    }
+
+    /// CIRISEdge#971 — the caller labels `method` was called under so far.
+    pub(crate) fn callers_of(&self, method: &str) -> std::collections::BTreeSet<String> {
+        self.callers
+            .lock()
+            .expect("callers")
+            .get(method)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Every count so far.
@@ -135,6 +157,7 @@ impl CountingDirectory {
     /// Forget the counts.
     pub(crate) fn reset(&self) {
         self.counts.lock().expect("counts").clear();
+        self.callers.lock().expect("callers").clear();
     }
 }
 

@@ -1002,6 +1002,20 @@ fn every_counter_this_branch_adds_is_exported_by_name_971() {
     ));
 }
 
+/// CIRISEdge#971 — every persist caller label edge names (`read_caller`,
+/// including the bundle-seat and round-carriable sites) passes the same
+/// id-shape rule as the exported families: a label is fixed, never an id. The
+/// host may export `snapshot().callers` beside `flatten()`.
+#[test]
+fn no_caller_label_is_id_shaped_971() {
+    let shaped: Vec<&str> = crate::read_caller::Site::ALL
+        .iter()
+        .map(|s| s.label())
+        .filter(|l| label_is_id_shaped(l))
+        .collect();
+    assert!(shaped.is_empty(), "id-shaped caller labels: {shaped:?}");
+}
+
 /// Is `name` shaped like it carries an identifier: any character outside
 /// `[a-z0-9_.]` (an id separator, an upper-case or base64 id), or a run of
 /// eight or more hex digits (a key id, a destination or content hash, or a

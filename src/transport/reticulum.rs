@@ -10014,18 +10014,29 @@ impl ReticulumTransport {
         if candidates.iter().any(|c| self.node.has_path(&c.dest_hash)) {
             return false;
         }
-        matches!(
+        // CIRISEdge#971 — the pair read runs before every round toward a peer
+        // with no live link or path; it is booked under its own caller label,
+        // not `other`.
+        let pair = crate::read_caller::scoped(
+            crate::read_caller::Site::RoundCarriable,
             self.seals
-                .resolve_pair(self.rooting.as_deref(), destination_key_id, None)
-                .await,
+                .resolve_pair(self.rooting.as_deref(), destination_key_id, None),
+        )
+        .await;
+        matches!(
+            pair,
             Err(crate::transport::av_transit_handshake::AvHandshakeError::NoTransitPair { .. })
         )
     }
 
     /// [`Self::undialable_now`] over this peer's own dial candidates: the
-    /// round-start hint.
+    /// round-start hint. Its candidate read is booked with the pair read.
     async fn undialable(&self, destination_key_id: &str) -> bool {
-        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let candidates = crate::read_caller::scoped(
+            crate::read_caller::Site::RoundCarriable,
+            self.resolve_dial_candidates(destination_key_id),
+        )
+        .await;
         self.undialable_now(destination_key_id, &candidates).await
     }
 

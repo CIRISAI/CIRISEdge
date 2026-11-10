@@ -77,11 +77,17 @@ pub(crate) enum Site {
     AvCall,
     /// The blob durability check.
     BlobDurability,
+    /// The bundle serve nodes' key-record check (`bundle_bootstrap_peers_held`,
+    /// at start and in the late-arrival re-check).
+    BundleSeats,
+    /// The transport's round-start reach check (`round_carriable`,
+    /// `undialable_now`).
+    RoundCarriable,
 }
 
 impl Site {
     /// Every site, in label order (the slot table's order).
-    pub(crate) const ALL: [Self; 24] = [
+    pub(crate) const ALL: [Self; 26] = [
         Self::AdvertiseRequired,
         Self::AdvertiseGroups,
         Self::AdvertiseHistory,
@@ -106,6 +112,8 @@ impl Site {
         Self::Chat,
         Self::AvCall,
         Self::BlobDurability,
+        Self::BundleSeats,
+        Self::RoundCarriable,
     ];
 
     /// The label persist counts this site's reads under.
@@ -136,6 +144,8 @@ impl Site {
             Self::Chat => "edge.chat",
             Self::AvCall => "edge.av_call",
             Self::BlobDurability => "edge.blob.durability",
+            Self::BundleSeats => "edge.bundle.seats",
+            Self::RoundCarriable => "edge.transport.carriable",
         }
     }
 
@@ -146,8 +156,8 @@ impl Site {
 
 /// The interned callers, made once (making one takes persist's short intern
 /// lock; reading under one takes none).
-fn callers() -> &'static [Option<Caller>; 24] {
-    static CALLERS: OnceLock<[Option<Caller>; 24]> = OnceLock::new();
+fn callers() -> &'static [Option<Caller>; Site::ALL.len()] {
+    static CALLERS: OnceLock<[Option<Caller>; Site::ALL.len()]> = OnceLock::new();
     CALLERS.get_or_init(|| Site::ALL.map(|site| Caller::new(site.label()).ok()))
 }
 
