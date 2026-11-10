@@ -4600,6 +4600,26 @@ impl PyCall {
         self.with_call(py, |c| Box::pin(async move { Ok(c.legs()) }))
     }
 
+    /// Per-leg stats, sorted by member: `[{"member", "path"
+    /// ("direct_udp" | "interface" | "relayed" | "gone"), "link_mdu",
+    /// "channel_limit", "media_limit", "frame_budget", "datagrams"}, ...]`.
+    fn leg_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let legs = self.with_call(py, |c| Box::pin(async move { Ok(c.leg_info()) }))?;
+        let out = pyo3::types::PyList::empty(py);
+        for l in legs {
+            let d = pyo3::types::PyDict::new(py);
+            d.set_item("member", l.member)?;
+            d.set_item("path", l.path.token())?;
+            d.set_item("link_mdu", l.link_mdu)?;
+            d.set_item("channel_limit", l.channel_limit)?;
+            d.set_item("media_limit", l.media_limit)?;
+            d.set_item("frame_budget", l.frame_budget)?;
+            d.set_item("datagrams", l.datagrams)?;
+            out.append(d)?;
+        }
+        Ok(out.into_any().unbind())
+    }
+
     /// ALM C7 — the decision log: `{"hash", "records", "tail"}`. The tail
     /// names peers, so it belongs to the owner's own session and never to a
     /// metric. The chained hash and the count are safe to log.

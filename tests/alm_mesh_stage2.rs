@@ -729,6 +729,47 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
     );
 }
 
+/// **Per-leg stats** (45.1): every leg a call reports names what carries it
+/// and its MDU, so a gate can tell a punched UDP leg from a TCP one from a
+/// relayed one. On loopback TCP every leg is `Interface`, with a link MDU,
+/// a Channel limit and a frame budget above zero. (A leg's carrier may move
+/// to datagrams when its peer's CAPS lands, so no two reads are compared.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn every_leg_reports_its_path_and_mdu() {
+    let _call = one_call().await;
+    let tag = "alm2-leginfo";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let calls = [
+        join_loaded(&nodes[0], &groups[0], tag, CallOptions::default(), None).await,
+        join_loaded(&nodes[1], &groups[1], tag, CallOptions::default(), None).await,
+        join_loaded(&nodes[2], &groups[2], tag, relay_opts(), None).await,
+    ];
+    for c in &calls {
+        wait_legs(c, 2).await;
+        let info = c.leg_info();
+        assert_eq!(
+            info.iter().map(|l| l.member.clone()).collect::<Vec<_>>(),
+            c.legs(),
+            "one entry per leg"
+        );
+        for l in &info {
+            assert_eq!(
+                l.path,
+                ciris_edge::transport::av_call::LegPath::Interface,
+                "a loopback TCP leg: {l:?}"
+            );
+            assert!(
+                l.link_mdu > 0 && l.channel_limit > 0 && l.media_limit > 0 && l.frame_budget > 0,
+                "{l:?}"
+            );
+            assert!(
+                l.frame_budget < l.media_limit && l.media_limit <= l.link_mdu,
+                "{l:?}"
+            );
+        }
+    }
+}
+
 /// **C3 admit / refuse**: A's own stream admits B (C2 over C3); C, a relay
 /// at service tier 1 (the host said `Warning`), refuses B's subscription
 /// for A's stream by name, `load_refuse:admit_closed`. A closed relay offers

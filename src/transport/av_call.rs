@@ -1152,6 +1152,54 @@ impl CallRouter {
 type Publisher = KeptAvPublisher<Arc<dyn StreamDekRegistrar>>;
 
 /// A leg this node dialled to a member, carrying its stream.
+/// What carries one leg's link ([`Call::leg_info`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegPath {
+    /// A punched direct UDP path (CIRISEdge#805 item 8, leviculum#70).
+    DirectUdp,
+    /// The one-hop interface the link rides (TCP or another), no forwarder.
+    Interface,
+    /// A forwarder carries it: a member relay or the canonical (no punched
+    /// interface, more than one hop).
+    Relayed,
+    /// leviculum no longer holds the link.
+    Gone,
+}
+
+impl LegPath {
+    /// The stable token: `direct_udp`, `interface`, `relayed`, `gone`.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::DirectUdp => "direct_udp",
+            Self::Interface => "interface",
+            Self::Relayed => "relayed",
+            Self::Gone => "gone",
+        }
+    }
+}
+
+/// One leg as [`Call::leg_info`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegInfo {
+    /// The member the leg goes to.
+    pub member: String,
+    /// What carries it.
+    pub path: LegPath,
+    /// The link's MDU (bytes).
+    pub link_mdu: usize,
+    /// The most plaintext one Channel message carries (bytes).
+    pub channel_limit: usize,
+    /// The most plaintext one media message carries on this leg: the
+    /// datagram limit on a datagram leg, else the Channel limit.
+    pub media_limit: usize,
+    /// The largest frame plaintext this leg carries (the media limit less a
+    /// chunk's wire overhead and its source signature).
+    pub frame_budget: usize,
+    /// Whether media rides datagrams on it (leviculum#102).
+    pub datagrams: bool,
+}
+
 #[derive(Debug, Clone)]
 struct OutLeg {
     link_id: [u8; 16],
@@ -1687,6 +1735,43 @@ impl Call {
     #[must_use]
     pub fn service_tier(&self) -> crate::load_ladder::ServiceTier {
         Shared::lock(&self.shared.alm).tier()
+    }
+
+    /// Every leg this node has, with what carries it (a punched direct UDP
+    /// path, a forwarder, or the one-hop interface it rides), its link MDU,
+    /// its media limit (the datagram limit on a datagram leg, else the
+    /// Channel limit) and the frame budget that limit implies. Sorted by
+    /// member. A leg whose link leviculum no longer holds reads
+    /// [`LegPath::Gone`] with zeros.
+    #[must_use]
+    pub fn leg_info(&self) -> Vec<LegInfo> {
+        let legs: Vec<(String, OutLeg)> = Shared::lock(&self.shared.out_legs)
+            .iter()
+            .map(|(m, l)| (m.clone(), l.clone()))
+            .collect();
+        let mut v: Vec<LegInfo> = legs
+            .into_iter()
+            .map(|(member, l)| {
+                let datagrams = l.media.uses_datagrams();
+                let path = self.shared.transport.av_link_path(&l.link_id);
+                let limits = self.shared.transport.av_link_limits(&l.link_id);
+                let (path, link_mdu) = path.unwrap_or((LegPath::Gone, 0));
+                let (channel_limit, media_limit) =
+                    limits.map_or((0, 0), |(c, d)| (c, if datagrams { d } else { c }));
+                LegInfo {
+                    member,
+                    path,
+                    link_mdu,
+                    channel_limit,
+                    media_limit,
+                    frame_budget: media_limit
+                        .saturating_sub(AV_CHUNK_WIRE_OVERHEAD + CHUNK_TRAILER_LEN),
+                    datagrams,
+                }
+            })
+            .collect();
+        v.sort_by(|a, b| a.member.cmp(&b.member));
+        v
     }
 
     /// leviculum#102 — whether this node's media to `member` rides unordered

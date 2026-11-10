@@ -7022,6 +7022,28 @@ impl ReticulumTransport {
         self.node.link_datagram_stats(&LinkId::new(*link))
     }
 
+    /// What carries `link` and its MDU, for a call's per-leg stats: a punched
+    /// direct UDP path, a forwarder (a relay or the canonical: no punched
+    /// interface and more than one hop), or the one-hop interface it rides
+    /// (TCP or another). `None` when leviculum no longer holds the link.
+    #[must_use]
+    pub fn av_link_path(
+        &self,
+        link: &[u8; 16],
+    ) -> Option<(crate::transport::av_call::LegPath, usize)> {
+        use crate::transport::av_call::LegPath;
+        let id = LinkId::new(*link);
+        let mdu = self.node.link_mdu(&id)?;
+        let path = if self.node.direct_link_interface(&id).is_some() {
+            LegPath::DirectUdp
+        } else if link_is_forwarded(&self.node, &id, self.node.link_destination(&id)) {
+            LegPath::Relayed
+        } else {
+            LegPath::Interface
+        };
+        Some((path, mdu))
+    }
+
     /// leviculum#102 / #104 — the most plaintext one message on `link` carries
     /// now, by carrier: `(channel, datagram)`, each with room left for the E1
     /// seal. Both follow the link's MDU, the probed one on a punched path.
