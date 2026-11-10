@@ -231,3 +231,104 @@ async fn the_idle_key_summary_is_linear_in_its_refs_971() {
     assert!(t2 > 1, "the larger offer spans more than one TCP fragment");
     assert!(b > 0.0);
 }
+
+/// **CIRISEdge#971 (d) — what an idle bundle-seat Pull costs the seat.** The
+/// device's cycle asks, per Pull plane, about itself and about the seat. Each
+/// is routed to the seat's real responder over a counting directory; the
+/// figures are printed (`971 idle pull`) for the sheet. Pinned: no index page
+/// (a Pull reads by subject, never the holdings index) on any plane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_bundle_pull_costs_the_seat_971() {
+    use crate::replication::protocol::PullMessage;
+    use crate::replication::runtime::BUNDLE_PULL_PLANES;
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
+    register_fixture_keys(
+        &backend,
+        &[(SEAT, identity_type::NODE), (DEVICE, identity_type::NODE)],
+    )
+    .await;
+    for i in 0..ATTESTATIONS {
+        let id = format!("idle-pull-971-{i:05}");
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": SEAT,
+            "attested_key_id": SEAT,
+            "attestation_type": "scores",
+            "dimension": "idle:row:v1",
+            "payload": { "n": i },
+        });
+        seed_raw_attestation(&backend, &id, SEAT, SEAT, "scores", envelope).await;
+    }
+    let counting = CountingDirectory::new(backend.clone());
+    let directory: Arc<dyn FederationDirectory> = Arc::new(counting.clone());
+    let wire = Arc::new(Bytes::default());
+    let metrics = crate::observability::EdgeMetrics::new();
+    let mut rt = ReplicationRuntime::start(
+        directory,
+        Arc::new(Arc::clone(&wire)),
+        Vec::new(),
+        ReplicationRuntimeConfig {
+            enable_bundle_bootstrap_peers: false,
+            local_key_id: Some(SEAT.to_owned()),
+            metrics: Some(metrics.clone()),
+            ..ReplicationRuntimeConfig::default()
+        },
+        Some(crate::replication::runtime::self_publish_set([SEAT])),
+    )
+    .await;
+    let registry = rt.registry();
+    let mut total = (0usize, 0usize, 0u64, 0usize);
+    for (round, kind) in (100u64..).zip(BUNDLE_PULL_PLANES) {
+        for subject in [DEVICE, SEAT] {
+            counting.reset();
+            let (p0, b0, f0) = (
+                permits(&metrics),
+                wire.sent.load(std::sync::atomic::Ordering::Relaxed),
+                wire.frames.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            let pull = ReplicationMessage::Pull(PullMessage {
+                kind,
+                subject_key_id: subject.to_owned(),
+            });
+            registry
+                .route_inbound_bytes(
+                    DEVICE,
+                    &wire_frame::wrap_v3(&pull, RoundSide::Initiator, round),
+                )
+                .await
+                .expect("route the device's Pull");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while wire.frames.load(std::sync::atomic::Ordering::Relaxed) == f0
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let counts = counting.counts();
+            let pages = counts.get("list_wire_hashes_since").copied().unwrap_or(0);
+            let (reads, permits_now, bytes) = (
+                counting.total(),
+                permits(&metrics) - p0,
+                wire.sent.load(std::sync::atomic::Ordering::Relaxed) - b0,
+            );
+            eprintln!(
+                "971 idle pull {kind:?} subject={subject}: directory_calls={reads} \
+                 index_pages={pages} permits={permits_now} reply_bytes={bytes} by_method={counts:?}"
+            );
+            assert_eq!(
+                pages, 0,
+                "{kind:?}/{subject}: a Pull never drains the holdings index"
+            );
+            total.0 += reads;
+            total.1 += pages;
+            total.2 += permits_now;
+            total.3 += bytes;
+        }
+    }
+    eprintln!(
+        "971 idle pull ALL (one device, one cycle, self + seat subjects): directory_calls={} \
+         index_pages={} permits={} reply_bytes={}",
+        total.0, total.1, total.2, total.3
+    );
+    rt.shutdown().await;
+}

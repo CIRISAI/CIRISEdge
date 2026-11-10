@@ -31,6 +31,45 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   opens no replication round to anyone says so at start, naming each skipped
   serve node and why (WARN, `tracked: CIRISEdge#971`). From v43.2.0 to v44.1.2
   no host set the flag, so an unclaimed device rounded with nobody.
+- **Bundle-seat mode: the required set by subject Pull, never a whole-plane
+  diff** (CIRISEdge#971, CC 5.2). Toward a bundle seat the host does not name
+  as a consent peer, a device runs no Summary round on Key,
+  IdentityOccurrence, TransportDestination or IdentityOccurrenceRevocation.
+  Instead it asks by subject Pull, at most every 30 s:
+  - At first contact, at once, then every 15 to 45 s (30 s, jittered per
+    device), up to six times, until the seat holds its key and route: about
+    itself (offering only the rows of its own the seat's answer lacks) and
+    about the seat. If six tries pass without that, the timer below takes
+    over, counted as `first_contact_gave_up`, with one WARN per process.
+  - On a timer drawn per device from 5 to 15 min (`BUNDLE_PULL_INTERVAL`
+    10 min, jittered): the same, plus about its owner once claimed, on Key,
+    IdentityOccurrence and IdentityOccurrenceRevocation. The owner Pull is
+    the only lookup the seat charges.
+  - On a host kick (`round_now`, `round_now_all`): about itself and the
+    seat.
+  - On a local write of its own on one of those four planes: about itself,
+    on that plane only.
+
+  The seat never builds its whole offer for the device (about 2,690
+  announced keys on canonical-1; about 0.7 GB/day per phone on Key alone as
+  a 30 s diff). The IdentityOccurrenceRevocation legs and the Revocation
+  round wait until the seat holds the device's key and route: before that,
+  the seat drops frames of those kinds from a sender it cannot attribute.
+  Key-level Revocation then keeps an ordinary round, a small
+  `Projection::Global` offer. A v44 seat serves all of it: the self and seat
+  subjects are uncharged, and the device's own rows ride an unsolicited
+  Deliver (a v44 seat admits one on IdentityOccurrenceRevocation with a
+  WARN). An owned node's route is not asked of a seat (CC
+  CLM-route-handed-by-owner, CIRISEdge#972). The Pull coordinators are never
+  scheduled, so `set_peers` does not remove them.
+- **Behaviour change for a host that opted in on v43.2.0 to v44.1.2**
+  (`enable_bundle_bootstrap_peers: true`). Such a host got five-plane
+  Summary rounds every 30 s toward each bundle seat. It now gets the subject
+  Pulls above and one Revocation round, which starts only after the seat holds
+  its key and route. A host that counted those rounds' outcomes per plane
+  now sees one plane per seat.
+  `round_now` toward a bundle seat it does not name also runs that seat's
+  self and seat Pulls.
 - **No automated path names a third party to a seat the node has no consent
   relationship with** (CIRISEdge#971, CC 5.4.6). Signer recovery toward a
   bundle seat the host does not name asks only for a signer of a row that
@@ -47,8 +86,15 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   comparable; only the duration drops.
 - **New gauges.** `replication_reach{carried_on_inbound_link, dialled,
   skipped_undialable, round_skipped_undialable, path_seek_found,
-  path_seek_not_found, path_request_sent}` and
-  `initiator_peers{host, bundle, homed}`.
+  path_seek_not_found, path_request_sent}`,
+  `initiator_peers{host, bundle, homed}`, and
+  `bundle_pull{cycle_first_contact, cycle_timer, cycle_kick, cycle_write,
+  first_contact_gave_up,
+  pull_self, pull_seat, pull_owner, held_back, answer_self, answer_seat,
+  answer_owner, answer_other, answer_throttled}`. The answer counters cover
+  no-consent seats only. A non-zero `answer_other` means the host itself is
+  looking people up at a seat (`pull_subject_testimony`); bundle-seat mode
+  never does.
 
 ## 44.1.2 — 2026-11-09
 

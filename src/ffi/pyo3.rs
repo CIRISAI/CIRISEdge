@@ -3223,6 +3223,7 @@ fn metrics_bundle_to_pydict<'py>(
     root.set_item("advertise", advertise)?;
     for (name, family) in [
         ("replication_reach", &bundle.replication_reach),
+        ("bundle_pull", &bundle.bundle_pull),
         ("initiator_peers", &bundle.initiator_peers),
     ] {
         let d = pyo3::types::PyDict::new(py);

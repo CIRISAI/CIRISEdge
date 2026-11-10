@@ -320,6 +320,10 @@ pub trait StateProvider: Send + Sync {
         None
     }
 
+    /// CIRISEdge#971 (d) — a subject Pull to `peer` about `subject` was
+    /// answered (`throttled`: with a throttle). Telemetry only.
+    fn note_pull_answer(&self, _peer_key_id: &str, _subject_key_id: &str, _throttled: bool) {}
+
     /// CIRISEdge#776 — rows released from this peer on this plane, taken once.
     /// A release can only re-open a row's offer, and past one page a peer names
     /// a row once per re-sweep, so the round the release kicks fetches them by

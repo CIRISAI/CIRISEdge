@@ -1004,21 +1004,67 @@ pub async fn recheck_bundle_peers(
     (added, still)
 }
 
-/// CIRISEdge#881 — the initiator peers the bundle's seated serve nodes
-/// (`serve_nodes`, the baked canonical ids) add: each on every
-/// [`BOOTSTRAP_ROUND_PLANES`] plane, never this node itself.
+/// **CIRISEdge#971 (d) — the planes a device asks a bundle seat by subject
+/// Pull**, never by a Summary: the four public bootstrap planes a subject Pull
+/// answers (`is_subject_pullable`). A Summary there would make the seat build
+/// its whole offer (every announced device's key and occurrence, about 2,690
+/// refs measured on canonical-1) every cadence; CC 5.2 has a seat offer a
+/// person's node only what is required, and an automatic diff is not a request.
+pub const BUNDLE_PULL_PLANES: [EnvelopeKind; 4] = [
+    EnvelopeKind::Key,
+    EnvelopeKind::IdentityOccurrence,
+    EnvelopeKind::TransportDestination,
+    EnvelopeKind::IdentityOccurrenceRevocation,
+];
+
+/// CIRISEdge#971 (d) — the planes a device asks a bundle seat about its owner
+/// on: not the route plane, whose rows are keyed by node (an owner subject
+/// returns nothing there by construction), and an owned node's route comes
+/// from its owner, not a seat (CC CLM-route-handed-by-owner, CIRISEdge#972).
+pub const BUNDLE_OWNER_PLANES: [EnvelopeKind; 3] = [
+    EnvelopeKind::Key,
+    EnvelopeKind::IdentityOccurrence,
+    EnvelopeKind::IdentityOccurrenceRevocation,
+];
+
+/// CIRISEdge#971 (d) — the bootstrap plane a device keeps an ordinary round on
+/// with a bundle seat: key-level revocations have no subject index
+/// (`is_subject_pullable` is false), and the seat's offer there is
+/// `Projection::Global` (its own set and its cohort), small, not the corpus.
+pub const BUNDLE_ROUND_PLANES: [EnvelopeKind; 1] = [EnvelopeKind::Revocation];
+
+/// **CIRISEdge#971 (d) — how often a device asks each bundle seat for the
+/// required set by subject Pull.** Not the 30 s cadence: the owner subject is a
+/// third-party lookup the seat charges against the device's per-requester
+/// budget (60 per minute, 600 per hour, 2,000 per day; bridge.rs
+/// `IDENTIFIER_LOOKUPS_*`), which the person's own contact lookups share. One
+/// owner charge per 10 min is 144 a day, 7% of it. The device's own rows and
+/// the seat's are answered uncharged (the subject and own-record arms). Only
+/// the timer asks about the owner: a local write on a Pull plane runs the
+/// self-subject offering Pull on that plane alone, and a host kick
+/// (`round_now`) the self and seat legs, each [`BUNDLE_PULL_MIN_SPACING`]
+/// apart. Each device draws its timer from half to one and a half of this
+/// ([`bundle_pull_delay`]).
+pub const BUNDLE_PULL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// CIRISEdge#971 (d) — kicked cycles are at least this far apart, so a burst
+/// of local writes costs one cycle, not one per write; also the spacing of the
+/// first-contact cycles.
+pub const BUNDLE_PULL_MIN_SPACING: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// CIRISEdge#881 / #971 — the scheduled initiator peers the bundle's seated
+/// serve nodes add: each on [`BUNDLE_ROUND_PLANES`], never this node itself.
+/// The other bootstrap planes ride [`BUNDLE_PULL_PLANES`]'s subject Pulls.
 #[must_use]
 pub fn bundle_bootstrap_peers(serve_nodes: &[String], local: Option<&str>) -> Vec<ReplicationPeer> {
     serve_nodes
         .iter()
         .filter(|id| Some(id.as_str()) != local)
         .flat_map(|id| {
-            BOOTSTRAP_ROUND_PLANES
-                .iter()
-                .map(move |kind| ReplicationPeer {
-                    peer_key_id: id.clone(),
-                    kind: *kind,
-                })
+            BUNDLE_ROUND_PLANES.iter().map(move |kind| ReplicationPeer {
+                peer_key_id: id.clone(),
+                kind: *kind,
+            })
         })
         .collect()
 }
@@ -1130,6 +1176,466 @@ impl HomedPeers {
 
 /// CC 5.4.3 referrals — register each node the transport homes on. A
 /// transport with no such events spawns nothing.
+/// **CIRISEdge#971 (d) — bundle-seat mode: the required set by subject Pull.**
+///
+/// Toward a bundle seat this node has no consent relationship with (a seat the
+/// host's peer set does not name), the four [`BUNDLE_PULL_PLANES`] carry no
+/// Summary round. Each cycle asks, per plane, by subject Pull:
+///
+/// - about THIS node, offering: the seat answers with what it holds about us,
+///   and only our own rows it lacks are Delivered
+///   ([`ReplicationCoordinator::pull_exchange_offering`]). In sync, nothing
+///   goes up;
+/// - about the SEAT: we fetch what of the seat's own rows we lack;
+/// - about our OWNER, once claimed: the owner's key and occurrences.
+///
+/// The seat never builds its offer for us. A v44 seat serves all of it: the
+/// subject and own-record arms answer without a trust root or a charge, the
+/// owner Pull is one charge per cycle, and our Deliver is an unsolicited
+/// Deliver a seat admits on a bootstrap plane. [`BUNDLE_ROUND_PLANES`] keep an
+/// ordinary round. The Pull coordinators are registered for their replies but
+/// never scheduled, so `set_peers` (which converges only scheduled
+/// initiators) cannot remove them.
+struct BundlePull {
+    transport: Arc<dyn Transport>,
+    registry: Arc<ReplicationRegistry>,
+    bridge: Arc<FederationDirectoryReplicationBridge>,
+    applier: Arc<dyn StateApplier>,
+    scheduler_handle: SchedulerHandle,
+    current_initiators: Arc<Mutex<HashSet<(String, EnvelopeKind)>>>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+    proactive_publish: bool,
+    local: Option<String>,
+    round_timeout: std::time::Duration,
+    /// The bundle seats this node holds.
+    seats: std::sync::Mutex<Vec<String>>,
+    /// The peers the host named (`start`, `set_peers`): a seat named here is
+    /// a consent peer and rounds as one, untouched.
+    host: std::sync::Mutex<HashSet<String>>,
+    /// Seats that hold our own key AND route (the offering Key and TD Pulls'
+    /// answers listed them), so they attribute our frames. Only these get the
+    /// IOR legs and the [`BUNDLE_ROUND_PLANES`] round: before attribution a
+    /// seat drops those frames (`routing_source` admits an unattributed frame
+    /// on `is_bootstrap()` kinds only, replication/mod.rs; IOR and Revocation
+    /// are not among them).
+    attributed: std::sync::Mutex<HashSet<String>>,
+    /// Kicks not yet run.
+    pending: std::sync::Mutex<PendingKicks>,
+    kick: tokio::sync::Notify,
+    /// Pulls sent, for the witnesses: all, and by [`BUNDLE_PULL_PLANES`] slot.
+    pulls: std::sync::atomic::AtomicU64,
+    pulls_on: [std::sync::atomic::AtomicU64; 4],
+}
+
+/// CIRISEdge#971 (d) — the kicks a [`BundlePull`] has not yet run, merged.
+#[derive(Debug, Default)]
+struct PendingKicks {
+    /// The seat set changed: first contact again.
+    contact: bool,
+    /// The host asked for a round now (`round_now`, `round_now_all`).
+    host: bool,
+    /// Pull planes this node wrote a row of its own on.
+    wrote: Vec<EnvelopeKind>,
+}
+
+/// Why a [`BundlePull`] cycle runs, and so which legs it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CycleCause {
+    /// A seat new to this runtime, or one not yet holding our key and route:
+    /// this node's and the seat's legs, so each can seal to and address the
+    /// other.
+    FirstContact,
+    /// The jittered timer: every leg, the owner's included (the only charged
+    /// one).
+    Timer,
+    /// A host kick: this node's and the seat's legs, never the owner's.
+    HostKick,
+    /// A local write: the self-subject offering Pull on these planes only.
+    Wrote(Vec<EnvelopeKind>),
+}
+
+/// CIRISEdge#971 (d) — how many quick first-contact cycles a seat gets before
+/// it waits for the timer: [`BUNDLE_PULL_MIN_SPACING`] apart.
+const BUNDLE_FIRST_CONTACT_TRIES: u32 = 6;
+
+impl BundlePull {
+    fn note(&self, label: &'static str) {
+        if let Some(m) = &self.metrics {
+            m.inc_bundle_pull(label);
+        }
+    }
+
+    fn targets(&self) -> Vec<String> {
+        let host = self
+            .host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        self.seats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|s| !host.contains(*s))
+            .cloned()
+            .collect()
+    }
+
+    fn set_seats(&self, seats: Vec<String>) {
+        self.bridge.set_bundle_seats(seats.iter().cloned());
+        *self
+            .seats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = seats;
+    }
+
+    fn set_host(&self, host: HashSet<String>) {
+        *self
+            .host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = host;
+    }
+
+    fn kick_with(&self, f: impl FnOnce(&mut PendingKicks)) {
+        f(&mut self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner));
+        self.kick.notify_one();
+    }
+
+    fn kick_contact(&self) {
+        self.kick_with(|p| p.contact = true);
+    }
+
+    fn kick_host(&self) {
+        self.kick_with(|p| p.host = true);
+    }
+
+    /// A row of this node's own landed on `kind`: a Pull plane asks the seat
+    /// about us on it; any other plane is not this path's.
+    fn kick_wrote(&self, kind: EnvelopeKind) {
+        if !BUNDLE_PULL_PLANES.contains(&kind) {
+            return;
+        }
+        self.kick_with(|p| {
+            if !p.wrote.contains(&kind) {
+                p.wrote.push(kind);
+            }
+        });
+    }
+
+    fn take_pending(&self) -> PendingKicks {
+        std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    fn is_attributed(&self, seat: &str) -> bool {
+        self.attributed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(seat)
+    }
+
+    /// The [`BUNDLE_ROUND_PLANES`] peers of the attributed seats: what
+    /// `set_peers` merges (an unattributed seat's round would only drop).
+    fn round_peers(&self) -> Vec<ReplicationPeer> {
+        let ready: Vec<String> = self
+            .targets()
+            .into_iter()
+            .filter(|s| self.is_attributed(s))
+            .collect();
+        bundle_bootstrap_peers(&ready, self.local.as_deref())
+    }
+
+    /// The coordinator a Pull to `seat` on `kind` rides: whatever the registry
+    /// already routes that pair's replies to, else a fresh unscheduled one.
+    async fn coordinator(&self, seat: &str, kind: EnvelopeKind) -> Arc<ReplicationCoordinator> {
+        if let Some(c) = self.registry.get_initiator(seat, kind).await {
+            return c;
+        }
+        let c = build_peer_coordinator(
+            &self.transport,
+            &self.bridge,
+            &self.applier,
+            self.proactive_publish,
+            seat,
+            kind,
+            SessionRole::Initiator,
+        );
+        self.registry
+            .register(seat.to_owned(), kind, Arc::clone(&c))
+            .await;
+        c
+    }
+
+    /// A seat now holds our key and route: from here on it gets the IOR legs
+    /// and its [`BUNDLE_ROUND_PLANES`] round (scheduled like any initiator).
+    async fn note_attributed(&self, seat: &str) {
+        let first = self
+            .attributed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(seat.to_owned());
+        if !first {
+            return;
+        }
+        tracing::info!(
+            seat,
+            "bundle seat holds this node's key and route: its revocation round starts \
+             (CIRISEdge#971)"
+        );
+        for p in bundle_bootstrap_peers(&[seat.to_owned()], self.local.as_deref()) {
+            let key = (p.peer_key_id.clone(), p.kind);
+            if !self.current_initiators.lock().await.insert(key) {
+                continue;
+            }
+            let coord = build_peer_coordinator(
+                &self.transport,
+                &self.bridge,
+                &self.applier,
+                self.proactive_publish,
+                &p.peer_key_id,
+                p.kind,
+                SessionRole::Initiator,
+            );
+            self.registry
+                .register(p.peer_key_id.clone(), p.kind, Arc::clone(&coord))
+                .await;
+            let _ = self.scheduler_handle.add_initiator(coord).await;
+        }
+    }
+
+    /// One Pull leg; counted, never fatal.
+    async fn leg(
+        &self,
+        coord: &Arc<ReplicationCoordinator>,
+        slot: usize,
+        subject: &str,
+        offer: bool,
+        label: &'static str,
+    ) {
+        self.pulls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pulls_on[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.note(label);
+        match coord
+            .pull_exchange_offering(subject, self.round_timeout, offer)
+            .await
+        {
+            Ok(crate::replication::coordinator::PullDispatched::Throttled { .. }) => {
+                self.note(crate::observability::BUNDLE_PULL_HELD_BACK);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!(
+                kind = ?coord.kind(),
+                subject,
+                error = %e,
+                "bundle-seat Pull not sent; the next cycle asks again (CIRISEdge#971)"
+            ),
+        }
+    }
+
+    /// One cycle; its cause picks the legs (see [`CycleCause`]). Returns
+    /// whether every target seat holds our key and route.
+    async fn cycle(&self, cause: &CycleCause) -> bool {
+        let Some(local) = self.local.clone() else {
+            return true;
+        };
+        let targets = self.targets();
+        if targets.is_empty() {
+            return true;
+        }
+        self.note(match cause {
+            CycleCause::FirstContact => crate::observability::BUNDLE_PULL_CYCLE_FIRST_CONTACT,
+            CycleCause::Timer => crate::observability::BUNDLE_PULL_CYCLE_TIMER,
+            CycleCause::HostKick => crate::observability::BUNDLE_PULL_CYCLE_KICK,
+            CycleCause::Wrote(_) => crate::observability::BUNDLE_PULL_CYCLE_WRITE,
+        });
+        let owner = if *cause == CycleCause::Timer {
+            let owner = self.bridge.owner_of_node(&local).await;
+            self.bridge.note_local_owner(owner.clone());
+            owner
+        } else {
+            None
+        };
+        let mut all = true;
+        for seat in targets {
+            let attributed = self.is_attributed(&seat);
+            for (slot, kind) in BUNDLE_PULL_PLANES.into_iter().enumerate() {
+                // IOR is not a bootstrap kind: before the seat attributes us
+                // its frames drop there, so the leg waits.
+                if kind == EnvelopeKind::IdentityOccurrenceRevocation && !attributed {
+                    continue;
+                }
+                if let CycleCause::Wrote(planes) = cause {
+                    if !planes.contains(&kind) {
+                        continue;
+                    }
+                }
+                let coord = self.coordinator(&seat, kind).await;
+                self.leg(
+                    &coord,
+                    slot,
+                    &local,
+                    true,
+                    crate::observability::BUNDLE_PULL_SELF,
+                )
+                .await;
+                if matches!(cause, CycleCause::Wrote(_)) {
+                    continue;
+                }
+                self.leg(
+                    &coord,
+                    slot,
+                    &seat,
+                    false,
+                    crate::observability::BUNDLE_PULL_SEAT,
+                )
+                .await;
+                if let Some(o) = owner.as_deref() {
+                    if BUNDLE_OWNER_PLANES.contains(&kind) {
+                        self.leg(
+                            &coord,
+                            slot,
+                            o,
+                            false,
+                            crate::observability::BUNDLE_PULL_OWNER,
+                        )
+                        .await;
+                    }
+                }
+            }
+            // The offering Key and TD Pulls of an EARLIER cycle may have shown
+            // the seat holds our key and route.
+            if !attributed {
+                let key = self.coordinator(&seat, EnvelopeKind::Key).await;
+                let td = self
+                    .coordinator(&seat, EnvelopeKind::TransportDestination)
+                    .await;
+                if key.peer_holds_offered() && td.peer_holds_offered() {
+                    self.note_attributed(&seat).await;
+                } else {
+                    all = false;
+                }
+            }
+        }
+        all
+    }
+}
+
+/// CIRISEdge#971 (d) — the next timer cycle: [`BUNDLE_PULL_INTERVAL`] drawn
+/// from half to one and a half of itself, per device, so a fleet re-linked in
+/// one second by a seat restart does not stay in phase. The ordinary round
+/// tick carries no jitter to reuse (scheduler.rs); this is the shape of its
+/// one draw, `redial_delay` after a failed dial.
+fn bundle_pull_delay() -> std::time::Duration {
+    jittered(BUNDLE_PULL_INTERVAL, &mut rand::thread_rng())
+}
+
+/// CIRISEdge#971 (d) — the next first-contact retry:
+/// [`BUNDLE_PULL_MIN_SPACING`] drawn the same way, so a fleet that a seat
+/// restart re-links in one second does not retry in step for three minutes.
+fn first_contact_delay() -> std::time::Duration {
+    jittered(BUNDLE_PULL_MIN_SPACING, &mut rand::thread_rng())
+}
+
+/// `base` drawn uniformly from half to one and a half of itself.
+fn jittered(base: std::time::Duration, rng: &mut impl rand::Rng) -> std::time::Duration {
+    let ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX / 2);
+    std::time::Duration::from_millis(rng.gen_range(ms / 2..=ms.saturating_mul(3) / 2))
+}
+
+/// CIRISEdge#971 (d) — one WARN per process when first contact gives up.
+static FIRST_CONTACT_GAVE_UP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// CIRISEdge#971 (d) — first contact ran out of quick tries with a seat that
+/// still does not hold our key and route: from here the ordinary jittered
+/// timer asks, counted, and one WARN per process says so.
+fn note_first_contact_gave_up(pull: &BundlePull) {
+    pull.note(crate::observability::BUNDLE_PULL_FIRST_CONTACT_GAVE_UP);
+    if !FIRST_CONTACT_GAVE_UP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            tries = BUNDLE_FIRST_CONTACT_TRIES,
+            "a bundle seat does not yet hold this node's key and route after the quick \
+             first-contact tries; it is asked on the ordinary 5-15 min timer from now on, \
+             and its revocation round waits until it does (tracked: CIRISEdge#971)"
+        );
+    }
+}
+
+/// CIRISEdge#971 (d) — run [`BundlePull`]'s cycles. First contact at once and
+/// then every [`first_contact_delay`] (30 s, jittered) until every seat holds
+/// our key and route, at most [`BUNDLE_FIRST_CONTACT_TRIES`]; then the
+/// jittered timer ([`note_first_contact_gave_up`] if the tries ran out). A
+/// kick runs no sooner than [`BUNDLE_PULL_MIN_SPACING`] after the last cycle;
+/// kicks that land meanwhile merge into one cycle.
+fn spawn_bundle_pull(pull: Arc<BundlePull>, cancel_rx: &watch::Receiver<bool>) {
+    let mut cancel = cancel_rx.clone();
+    tokio::spawn(async move {
+        let mut tries = 0u32;
+        let mut settled = false;
+        let mut last: Option<tokio::time::Instant> = None;
+        let mut next = tokio::time::Instant::now();
+        loop {
+            let timer = tokio::select! {
+                res = cancel.changed() => {
+                    if res.is_err() || *cancel.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                () = tokio::time::sleep_until(next) => true,
+                () = pull.kick.notified() => false,
+            };
+            if !timer {
+                if let Some(l) = last {
+                    tokio::time::sleep_until(l + BUNDLE_PULL_MIN_SPACING).await;
+                }
+            }
+            let kicks = pull.take_pending();
+            if kicks.contact {
+                settled = false;
+                tries = 0;
+            }
+            let cause = if timer || kicks.contact {
+                if settled {
+                    CycleCause::Timer
+                } else {
+                    CycleCause::FirstContact
+                }
+            } else if kicks.host {
+                CycleCause::HostKick
+            } else if !kicks.wrote.is_empty() {
+                CycleCause::Wrote(kicks.wrote)
+            } else {
+                continue;
+            };
+            let now = tokio::time::Instant::now();
+            last = Some(now);
+            let all_attributed = pull.cycle(&cause).await;
+            if matches!(cause, CycleCause::FirstContact | CycleCause::Timer) {
+                tries = tries.saturating_add(1);
+                if !settled && all_attributed {
+                    settled = true;
+                } else if !settled && tries >= BUNDLE_FIRST_CONTACT_TRIES {
+                    settled = true;
+                    note_first_contact_gave_up(&pull);
+                }
+                next = if settled {
+                    now + bundle_pull_delay()
+                } else {
+                    now + first_contact_delay()
+                };
+            }
+        }
+    });
+}
+
 fn spawn_homed_forwarder(homed: HomedPeers, cancel_rx: &watch::Receiver<bool>) {
     use tokio::sync::broadcast::error::RecvError;
     let Some(mut events) = homed.transport.subscribe_homed() else {
@@ -1233,6 +1739,8 @@ pub struct ReplicationRuntime {
     bundle_peers: std::sync::Mutex<Vec<ReplicationPeer>>,
     /// CIRISEdge#971 — the directory the bundle re-check reads.
     bundle_directory: Arc<dyn FederationDirectory>,
+    /// CIRISEdge#971 (d) — bundle-seat mode.
+    bundle_pull: Arc<BundlePull>,
     /// CC 5.4.3 referrals — the nodes homed on, merged the same way.
     homed_peers: Arc<Mutex<Vec<ReplicationPeer>>>,
     /// CIRISEdge#971 — each bundle serve node not taken as a bootstrap peer,
@@ -1330,9 +1838,12 @@ impl ReplicationRuntime {
         .await;
         let host_peers = distinct_peers(&peers);
         let host_keys: HashSet<String> = peer_keys(&peers);
-        let peers = without_retired_planes(merge_peers(peers, &bundle_peers));
+        // CIRISEdge#971 (d) — the bundle seats' revocation round starts once a
+        // seat holds our route (`BundlePull::note_attributed`); their other
+        // planes are subject Pulls.
+        let peers = without_retired_planes(peers);
         note_initiator_peers(config.metrics.as_ref(), host_peers, &bundle_peers, 0);
-        if peers.is_empty() {
+        if peers.is_empty() && bundle_peers.is_empty() {
             // CIRISEdge#971 — a node with nobody to round with is silent
             // about it otherwise: from v43.2.0 to v44.1.2 every unclaimed
             // device was this node, and nothing said so.
@@ -1357,10 +1868,12 @@ impl ReplicationRuntime {
         }
         if !bundle_peers.is_empty() {
             tracing::info!(
-                serve_nodes = bundle_peers.len() / BOOTSTRAP_ROUND_PLANES.len(),
-                planes = ?BOOTSTRAP_ROUND_PLANES,
-                "replication rounds with the bundle's seated serve nodes on the bootstrap \
-                 planes, consent or not (CIRISEdge#881)"
+                serve_nodes = bundle_peers.len() / BUNDLE_ROUND_PLANES.len(),
+                planes = ?BUNDLE_ROUND_PLANES,
+                pull_planes = ?BUNDLE_PULL_PLANES,
+                "the bundle's seated serve nodes are asked by subject Pull, consent or not; \
+                 their revocation round starts once a seat holds this node's route \
+                 (CIRISEdge#881, CIRISEdge#971)"
             );
         }
         let cohort_snapshot: Vec<String> = peers.iter().map(|p| p.peer_key_id.clone()).collect();
@@ -1414,10 +1927,6 @@ impl ReplicationRuntime {
             Arc::clone(&convergence),
             key_grant_wake.clone(),
         );
-        // CIRISEdge#971 — the host's consent peers and the bundle seats, for
-        // the no-consent seat rule (`names_only_required_subjects`).
-        bridge.set_consent_peers(host_keys.iter().cloned());
-        bridge.set_bundle_seats(peer_keys(&bundle_peers));
 
         // CIRISEdge#727 — the registry carries the owner-binding rung's
         // receiver gate (see [`registry_for`]).
@@ -1548,6 +2057,31 @@ impl ReplicationRuntime {
             },
             &cancel_rx,
         );
+        // CIRISEdge#971 — the host's consent peers, for the no-consent seat
+        // rule (`names_only_required_subjects`).
+        bridge.set_consent_peers(host_keys.iter().cloned());
+        // CIRISEdge#971 (d) — the bundle seats' required set, by subject Pull.
+        let bundle_pull = Arc::new(BundlePull {
+            transport: Arc::clone(&transport),
+            registry: Arc::clone(&registry),
+            bridge: Arc::clone(&bridge),
+            applier: Arc::clone(&shared_applier),
+            scheduler_handle: scheduler_handle.clone(),
+            current_initiators: Arc::clone(&current_initiators),
+            metrics: config.metrics.clone(),
+            proactive_publish,
+            local: config.local_key_id.clone(),
+            round_timeout: config.scheduler.round_timeout,
+            seats: std::sync::Mutex::new(Vec::new()),
+            host: std::sync::Mutex::new(host_keys),
+            attributed: std::sync::Mutex::new(HashSet::new()),
+            pending: std::sync::Mutex::default(),
+            kick: tokio::sync::Notify::new(),
+            pulls: std::sync::atomic::AtomicU64::new(0),
+            pulls_on: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        });
+        bundle_pull.set_seats(peer_keys(&bundle_peers).into_iter().collect());
+        spawn_bundle_pull(Arc::clone(&bundle_pull), &cancel_rx);
         // CIRISEdge#370/#636 — see [`spawn_scheduler_task`] for the event sink.
         let scheduler_task = spawn_scheduler_task(scheduler, &scheduler_handle, cancel_rx, &config);
 
@@ -1570,6 +2104,7 @@ impl ReplicationRuntime {
             bundle_peers: std::sync::Mutex::new(bundle_peers),
             bundle_skipped: std::sync::Mutex::new(bundle_skipped),
             bundle_directory,
+            bundle_pull,
             homed_peers,
             proactive_publish,
             mesh_config,
@@ -1777,6 +2312,7 @@ impl ReplicationRuntime {
     /// the round it fires reads the consent grant it was fired for.
     pub async fn round_now(&self, peer_key_id: &str) -> Result<(), ReplicationRuntimeError> {
         self.bridge.invalidate_send_set_memos("host_kick");
+        self.bundle_pull.kick_host();
         self.scheduler_handle.round_now(Some(peer_key_id)).await?;
         Ok(())
     }
@@ -1796,6 +2332,7 @@ impl ReplicationRuntime {
     pub async fn round_now_all(&self) -> Result<(), ReplicationRuntimeError> {
         // CIRISEdge#968 — see [`Self::round_now`].
         self.bridge.invalidate_send_set_memos("host_kick");
+        self.bundle_pull.kick_host();
         self.scheduler_handle.round_now(None).await?;
         Ok(())
     }
@@ -1991,18 +2528,26 @@ impl ReplicationRuntime {
         let host = distinct_peers(&desired);
         let homed = self.homed_peers.lock().await.clone();
         let bundle = self.recheck_bundle().await;
-        // CIRISEdge#971 — read live at each signer-recovery take: a seat the
-        // host names leaves the no-consent set, one it drops re-enters it.
+        // CIRISEdge#971 (d) — the host's peers round as consent peers; the
+        // other bundle seats are asked by Pull. A seat new to the set is asked
+        // now.
+        let before = self.bundle_pull.targets();
         self.bridge.set_consent_peers(peer_keys(&desired));
-        self.bridge.set_bundle_seats(peer_keys(&bundle));
+        self.bundle_pull.set_host(peer_keys(&desired));
+        self.bundle_pull
+            .set_seats(peer_keys(&bundle).into_iter().collect());
+        if self.bundle_pull.targets() != before {
+            self.bundle_pull.kick_contact();
+        }
         note_initiator_peers(
             self.config.metrics.as_ref(),
             host,
             &bundle,
             distinct_peers(&homed),
         );
-        // CIRISEdge#881 — the bundle's bootstrap peers ride every peer set.
-        let desired = merge_peers(desired, &bundle);
+        // CIRISEdge#881 / #971 (d) — the bundle seats that hold our route keep
+        // their revocation round across every peer set.
+        let desired = merge_peers(desired, &self.bundle_pull.round_peers());
         let desired = merge_peers(desired, &homed);
         let desired_set: HashSet<(String, EnvelopeKind)> = desired
             .iter()
@@ -2098,6 +2643,7 @@ impl ReplicationRuntime {
         // send-set memos; no apply event announces it.
         self.bridge
             .invalidate_send_set_memos("release_bound_signer");
+        self.bundle_pull.kick_wrote(kind);
         self.bridge.release_bound_signer(kind, envelope_bytes)
     }
 
@@ -2121,6 +2667,8 @@ impl ReplicationRuntime {
         row: &ciris_persist::federation::Attestation,
         written_after: chrono::DateTime<chrono::Utc>,
     ) -> Option<crate::decision_rows::DecisionRowRef> {
+        // CIRISEdge#971 (d) — an Attestation-plane row: no bundle Pull plane
+        // moved, so no bundle-seat cycle.
         self.bridge.note_local_write(row, written_after).await
     }
 
@@ -2135,6 +2683,7 @@ impl ReplicationRuntime {
         &self,
         written_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<crate::decision_rows::DecisionRowRef>, ciris_persist::federation::Error> {
+        // CIRISEdge#971 (d) — Attestation-plane rows only, as above.
         self.bridge
             .note_local_writes_since(written_after, None)
             .await
@@ -2154,6 +2703,91 @@ impl ReplicationRuntime {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
         )
+    }
+
+    /// CIRISEdge#971 (d) — subject Pulls sent to bundle seats so far.
+    #[must_use]
+    pub fn bundle_pulls_sent(&self) -> u64 {
+        self.bundle_pull
+            .pulls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#971 (d) — subject Pulls sent to bundle seats on `kind` so
+    /// far (0 for a plane not in [`BUNDLE_PULL_PLANES`]).
+    #[must_use]
+    pub fn bundle_pulls_sent_on(&self, kind: EnvelopeKind) -> u64 {
+        BUNDLE_PULL_PLANES
+            .iter()
+            .position(|k| *k == kind)
+            .map_or(0, |slot| {
+                self.bundle_pull.pulls_on[slot].load(std::sync::atomic::Ordering::Relaxed)
+            })
+    }
+
+    /// CIRISEdge#971 — the scheduled initiator pairs, sorted: what produces
+    /// this node's round frames.
+    #[doc(hidden)]
+    pub async fn initiator_set_for_test(&self) -> Vec<(String, EnvelopeKind)> {
+        let mut v: Vec<_> = self
+            .current_initiators
+            .lock()
+            .await
+            .iter()
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| (&a.0, a.1.as_wire_str()).cmp(&(&b.0, b.1.as_wire_str())));
+        v
+    }
+
+    /// CIRISEdge#971 (d) — run one timer cycle now, without its spacing.
+    pub async fn bundle_pull_now(&self) {
+        let _ = self.bundle_pull.cycle(&CycleCause::Timer).await;
+    }
+
+    /// CIRISEdge#971 (d) — a host kick's cycle, now, without its spacing.
+    #[doc(hidden)]
+    pub async fn bundle_pull_host_kick_now_for_test(&self) {
+        let _ = self.bundle_pull.cycle(&CycleCause::HostKick).await;
+    }
+
+    /// CIRISEdge#971 (d) — a local write's cycle on `kind`, now, without its
+    /// spacing.
+    #[doc(hidden)]
+    pub async fn bundle_pull_wrote_now_for_test(&self, kind: EnvelopeKind) {
+        let _ = self.bundle_pull.cycle(&CycleCause::Wrote(vec![kind])).await;
+    }
+
+    /// CIRISEdge#971 test seam — treat `seat` as a bundle serve node this
+    /// runtime holds, as `start` would for a baked one: its
+    /// [`BUNDLE_ROUND_PLANES`] round, and Pulls on [`BUNDLE_PULL_PLANES`]
+    /// unless the host names it. Honours the opt-out.
+    ///
+    /// # Errors
+    /// The scheduler has shut down.
+    #[doc(hidden)]
+    pub async fn adopt_bundle_seat_for_test(
+        &self,
+        seat: &str,
+    ) -> Result<(), ReplicationRuntimeError> {
+        if !self.config.enable_bundle_bootstrap_peers {
+            return Ok(());
+        }
+        let added = bundle_bootstrap_peers(&[seat.to_owned()], self.config.local_key_id.as_deref());
+        if added.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut peers = self
+                .bundle_peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            peers.extend(added.iter().cloned());
+            self.bundle_pull
+                .set_seats(peer_keys(&peers).into_iter().collect());
+        }
+        self.bundle_pull.kick_contact();
+        Ok(())
     }
 
     /// CIRISEdge#971 test seam — stand in for the baked bundle: the serve
@@ -2184,7 +2818,7 @@ impl ReplicationRuntime {
         if !added.is_empty() {
             tracing::info!(
                 serve_nodes = distinct_peers(&added),
-                planes = ?BOOTSTRAP_ROUND_PLANES,
+                planes = ?BUNDLE_ROUND_PLANES,
                 "a bundle serve node's record landed after start: it is a bootstrap peer from \
                  now on (CIRISEdge#971)"
             );
@@ -2241,18 +2875,16 @@ mod tests {
     /// bootstrap planes only, never this node itself, never twice.
     #[test]
     fn bundle_serve_nodes_round_on_the_bootstrap_planes_only() {
-        use super::{bundle_bootstrap_peers, merge_peers, ReplicationPeer, BOOTSTRAP_ROUND_PLANES};
+        use super::{bundle_bootstrap_peers, merge_peers, ReplicationPeer, BUNDLE_ROUND_PLANES};
         let serve = vec![
             "canon-a".to_string(),
             "me".to_string(),
             "canon-b".to_string(),
         ];
         let extra = bundle_bootstrap_peers(&serve, Some("me"));
-        assert_eq!(extra.len(), 2 * BOOTSTRAP_ROUND_PLANES.len());
+        assert_eq!(extra.len(), 2 * BUNDLE_ROUND_PLANES.len());
         assert!(extra.iter().all(|p| p.peer_key_id != "me"));
-        assert!(extra
-            .iter()
-            .all(|p| BOOTSTRAP_ROUND_PLANES.contains(&p.kind)));
+        assert!(extra.iter().all(|p| BUNDLE_ROUND_PLANES.contains(&p.kind)));
         assert!(
             !extra
                 .iter()
@@ -2364,7 +2996,7 @@ mod tests {
         let ids = vec!["seat-a".to_owned(), "seat-b".to_owned()];
         let (peers, skipped) =
             bundle_bootstrap_peers_held(&ids, &*dir, Some("device"), false, false).await;
-        let mut want = BOOTSTRAP_ROUND_PLANES.to_vec();
+        let mut want = BUNDLE_ROUND_PLANES.to_vec();
         want.sort_by_key(|k| k.as_wire_str());
         assert_eq!(planes_of(&peers, "seat-a"), want);
         assert!(
@@ -2411,17 +3043,14 @@ mod tests {
         let (peers, skipped) =
             bundle_bootstrap_peers_held(&ids, &*dir, Some("seat-a"), false, false).await;
         assert!(planes_of(&peers, "seat-a").is_empty());
-        assert_eq!(
-            planes_of(&peers, "seat-b").len(),
-            BOOTSTRAP_ROUND_PLANES.len()
-        );
+        assert_eq!(planes_of(&peers, "seat-b").len(), BUNDLE_ROUND_PLANES.len());
         assert_eq!(skipped, vec![("seat-a".to_owned(), BundleSkip::IsSelf)]);
     }
 
-    /// (4-i) **A record that lands after start.** The serve node joins the
-    /// peer set at the next `set_peers`, on all five bootstrap planes, and its
-    /// coordinators start. Mutation: drop the re-check from `set_peers`, and it
-    /// never joins.
+    /// (4-i) **A record that lands after start.** The serve node joins at the
+    /// next `set_peers`: a bundle Pull target from then on, its revocation
+    /// round held until it holds our route (never, over a no-op transport).
+    /// Mutation: drop the re-check from `set_peers`, and it never joins.
     #[tokio::test]
     async fn a_serve_node_recorded_after_start_joins_at_the_next_set_peers_971() {
         use ciris_persist::federation::types::identity_type;
@@ -2451,14 +3080,15 @@ mod tests {
         let (peers, skipped) = rt.bundle_peers();
         assert_eq!(
             planes_of(&peers, "seat-late").len(),
-            BOOTSTRAP_ROUND_PLANES.len()
+            BUNDLE_ROUND_PLANES.len()
         );
         assert!(skipped.is_empty(), "held now: {skipped:?}");
+        assert_eq!(rt.bundle_pull.targets(), vec!["seat-late".to_owned()]);
         let active = rt.current_initiators.lock().await.clone();
-        for kind in BOOTSTRAP_ROUND_PLANES {
+        for kind in BUNDLE_ROUND_PLANES {
             assert!(
-                active.contains(&("seat-late".to_owned(), kind)),
-                "{kind:?} rounds with the late serve node"
+                !active.contains(&("seat-late".to_owned(), kind)),
+                "{kind:?}: no round before the seat holds our route"
             );
         }
         rt.shutdown().await;
@@ -2478,10 +3108,7 @@ mod tests {
             Some("device"),
         )
         .await;
-        assert_eq!(
-            planes_of(&peers, "seat-a").len(),
-            BOOTSTRAP_ROUND_PLANES.len()
-        );
+        assert_eq!(planes_of(&peers, "seat-a").len(), BUNDLE_ROUND_PLANES.len());
         assert!(still.is_empty());
         assert_eq!(counting.total(), 1, "one read to find it");
         counting.reset();
@@ -2509,6 +3136,81 @@ mod tests {
         .await;
         assert!(peers.is_empty());
         assert_eq!(still, vec![("seat-a".to_owned(), BundleSkip::OptedOut)]);
+    }
+
+    /// (d) **The bundle-Pull cadence fits the seat's limiter, v44 and v45
+    /// alike** (the limiter is unchanged since #936/#937): the one charged
+    /// subject (the owner) costs one charge per cycle, a tenth or less of the
+    /// daily and hourly ceilings, leaving the rest for the person's own contact
+    /// lookups; the self and seat subjects are uncharged. Mutation: set the
+    /// interval to the 30 s cadence, and the daily budget is overrun.
+    #[test]
+    fn the_bundle_pull_cadence_fits_the_seats_lookup_budget_971() {
+        use crate::replication::bridge::FederationDirectoryReplicationBridge as B;
+        let per_day = 86_400 / BUNDLE_PULL_INTERVAL.as_secs();
+        let per_hour = 3_600 / BUNDLE_PULL_INTERVAL.as_secs();
+        assert!(
+            per_day * 10 <= u64::from(B::IDENTIFIER_LOOKUPS_PER_DAY),
+            "{per_day}/day"
+        );
+        assert!(
+            per_hour * 10 <= u64::from(B::IDENTIFIER_LOOKUPS_PER_HOUR),
+            "{per_hour}/h"
+        );
+        assert!(BUNDLE_PULL_MIN_SPACING.as_secs() >= B::IDENTIFIER_LOOKUP_WINDOW_SECS / 2);
+    }
+
+    /// (B) **Per-device jitter, retries included.** 256 devices re-linked in
+    /// the same instant by a seat restart, each with its own seeded draw (one
+    /// process, no mesh): every first-contact retry and the first timer cycle
+    /// fall inside half to one and a half of their base, and at each step the
+    /// fleet is spread, not in step. Mutation: return either base unjittered,
+    /// and that step's spread is zero.
+    #[test]
+    fn devices_linked_together_spread_their_retries_and_second_cycle_971() {
+        use rand::SeedableRng as _;
+        let mut devices: Vec<rand::rngs::StdRng> =
+            (0..256u64).map(rand::rngs::StdRng::seed_from_u64).collect();
+        let mut at: Vec<std::time::Duration> = vec![std::time::Duration::ZERO; devices.len()];
+        let steps = (0..BUNDLE_FIRST_CONTACT_TRIES - 1)
+            .map(|_| BUNDLE_PULL_MIN_SPACING)
+            .chain(std::iter::once(BUNDLE_PULL_INTERVAL));
+        for (step, base) in steps.enumerate() {
+            let draws: Vec<std::time::Duration> =
+                devices.iter_mut().map(|r| jittered(base, r)).collect();
+            assert!(
+                draws.iter().all(|d| *d >= base / 2 && *d <= base * 3 / 2),
+                "step {step}: in [B/2, 3B/2]"
+            );
+            let min = draws.iter().min().copied().unwrap_or_default();
+            let max = draws.iter().max().copied().unwrap_or_default();
+            assert!(
+                max - min >= base / 2,
+                "step {step}: spread {min:?}..{max:?}"
+            );
+            // No tenth of the window holds more than a quarter of the fleet.
+            let bucket = (base / 10).as_millis().max(1);
+            let mut counts = std::collections::HashMap::new();
+            for d in &draws {
+                *counts
+                    .entry((*d - base / 2).as_millis() / bucket)
+                    .or_insert(0u32) += 1;
+            }
+            assert!(counts.values().all(|c| *c <= 64), "step {step}: {counts:?}");
+            for (t, d) in at.iter_mut().zip(&draws) {
+                *t += *d;
+            }
+        }
+        // The instants each device's cycles land at are spread too, not only
+        // the gaps.
+        let min = at.iter().min().copied().unwrap_or_default();
+        let max = at.iter().max().copied().unwrap_or_default();
+        assert!(max - min >= BUNDLE_PULL_INTERVAL / 2, "{min:?}..{max:?}");
+        // The production draws are the same function.
+        let d = bundle_pull_delay();
+        assert!(d >= BUNDLE_PULL_INTERVAL / 2 && d <= BUNDLE_PULL_INTERVAL * 3 / 2);
+        let d = first_contact_delay();
+        assert!(d >= BUNDLE_PULL_MIN_SPACING / 2 && d <= BUNDLE_PULL_MIN_SPACING * 3 / 2);
     }
 
     /// (e) **The v43.2 leak guard, through `start` itself.** A runtime with

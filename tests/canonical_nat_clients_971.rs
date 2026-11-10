@@ -313,13 +313,26 @@ async fn start_runtime(
     peers: Vec<ReplicationPeer>,
     cadence: Duration,
 ) -> Arc<ReplicationRuntime> {
+    let publish = vec![node.key.key_id.clone(), node.owner.key_id.clone()];
+    start_runtime_with(node, transport, peers, cadence, publish, false).await
+}
+
+/// [`start_runtime`] with the self-publish set and the bundle path chosen.
+async fn start_runtime_with(
+    node: &Node,
+    transport: Arc<ReticulumTransport>,
+    peers: Vec<ReplicationPeer>,
+    cadence: Duration,
+    publish: Vec<String>,
+    bundle: bool,
+) -> Arc<ReplicationRuntime> {
     let runtime = Arc::new(
         ReplicationRuntime::start(
             Arc::clone(&node.dir) as Arc<dyn FederationDirectory>,
             Arc::clone(&transport) as Arc<dyn Transport>,
             peers,
             ReplicationRuntimeConfig {
-                enable_bundle_bootstrap_peers: false,
+                enable_bundle_bootstrap_peers: bundle,
                 scheduler: SchedulerConfig {
                     cadence,
                     round_timeout: ROUND_TIMEOUT,
@@ -329,10 +342,7 @@ async fn start_runtime(
                 metrics: Some(node.metrics.clone()),
                 ..Default::default()
             },
-            Some(self_publish_set([
-                node.key.key_id.as_str(),
-                node.owner.key_id.as_str(),
-            ])),
+            Some(self_publish_set(publish)),
         )
         .await,
     );
@@ -1150,4 +1160,727 @@ async fn what_the_seat_serves_an_unclaimed_device_per_plane_971() {
         first_applied.values().sum::<u64>() > 0,
         "the seat serves the device something on its bootstrap rounds"
     );
+}
+
+// ── CIRISEdge#971 (d) — bundle-seat mode: the required set by subject Pull ──
+
+/// A seat whose Key offer to a stranger is `k` announced keys (its
+/// self-publish set; on canonical-1 the relay selector's 2,690), and one
+/// unclaimed device that holds the seat as a BUNDLE seat (not a consent peer).
+struct BundleMesh {
+    seat: Node,
+    device: Node,
+    t_seat: Arc<ReticulumTransport>,
+    rt_seat: Arc<ReplicationRuntime>,
+    rt_device: Arc<ReplicationRuntime>,
+    _tmp: tempfile::TempDir,
+}
+
+async fn bundle_mesh(tag: u8, k: usize, bundle: bool) -> BundleMesh {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let seat_key = Ident::new(&format!("seat-971d-{tag}"), 0xa0 ^ tag).await;
+    let seat_owner = Ident::new(&format!("steward-971d-{tag}"), 0xa1 ^ tag).await;
+    let dev_key = Ident::new(&format!("ciris-client-971d-{tag}"), 0xa2 ^ tag).await;
+    let mut announced = Vec::new();
+    let mut records = vec![dev_key.record("node").await];
+    for i in 0..k {
+        let seed = 0x10u8.wrapping_add(u8::try_from(i % 0x90).expect("< 0x90")) ^ tag;
+        let a = Ident::new(&format!("announced-971d-{tag}-{i}"), seed).await;
+        records.push(a.record("node").await);
+        announced.push(a.key_id.clone());
+    }
+    let seat_record = seat_key.record("node").await;
+    let seat = Node::new(seat_key, seat_owner, records).await;
+    let device = Node::unclaimed(dev_key, vec![seat_record]).await;
+    let base = tmp.path().to_path_buf();
+    let (t_seat, addr) = build_reticulum_with_retry(|| async {
+        let mut cfg =
+            ReticulumTransportConfig::new(base.join("seat/transport.id"), &seat.key.key_id);
+        cfg.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        cfg.announce_interval = Duration::from_secs(5);
+        (cfg, seat.auth())
+    })
+    .await;
+    t_seat.refuse_outbound_dials_for_test(true);
+    t_seat.set_link_wire_tap_for_test(true);
+    let port = addr.port();
+    let mut publish = vec![seat.key.key_id.clone(), seat.owner.key_id.clone()];
+    publish.extend(announced);
+    let rt_seat = start_runtime_with(
+        &seat,
+        Arc::clone(&t_seat),
+        Vec::new(),
+        Duration::from_secs(3600),
+        publish,
+        false,
+    )
+    .await;
+    // The seat side of the filter's witness: every subject the device Pulls.
+    rt_seat.bridge().record_pull_subjects_for_test();
+    wait_for_own_route(&seat, Duration::from_secs(150)).await;
+    let (t_dev, _) = build_reticulum_with_retry(|| async {
+        let mut cfg =
+            ReticulumTransportConfig::new(base.join("device/transport.id"), &device.key.key_id);
+        cfg.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        cfg.bootstrap_peers = vec![format!("127.0.0.1:{port}").parse().unwrap()];
+        cfg.announce_interval = Duration::from_secs(5);
+        (cfg, device.auth())
+    })
+    .await;
+    wait_for_own_route(&device, Duration::from_secs(150)).await;
+    seed_route(&seat, &device).await;
+    let rt_device = start_runtime_with(
+        &device,
+        t_dev,
+        Vec::new(),
+        Duration::from_secs(3),
+        vec![device.key.key_id.clone()],
+        bundle,
+    )
+    .await;
+    // The baked bundle names the seat; a test directory never ran persist's
+    // seed, so the seam stands in for it (the bundle path itself is
+    // witnessed in runtime.rs (a)-(e)).
+    // The device side: every row the seat delivers it.
+    rt_device.bridge().record_deliveries_for_test();
+    rt_device
+        .adopt_bundle_seat_for_test(&seat.key.key_id)
+        .await
+        .expect("adopt the bundle seat");
+    BundleMesh {
+        seat,
+        device,
+        t_seat,
+        rt_seat,
+        rt_device,
+        _tmp: tmp,
+    }
+}
+
+/// CIRISEdge#971 — the seat-side property: every subject the device has
+/// Pulled from the seat is one `allowed` names (the device, the seat, the
+/// device's owner, or a name the seat itself delivered). Fails naming the
+/// leaked subject.
+fn assert_seat_was_asked_only_about(m: &BundleMesh, allowed: &[&str], stage: &str) {
+    let seen = m
+        .rt_seat
+        .bridge()
+        .pull_subjects_from_for_test(&m.device.key.key_id);
+    for (kind, subject) in &seen {
+        assert!(
+            allowed.contains(&subject.as_str()),
+            "{stage}: the device named {subject} to the seat in a {kind:?} Pull; allowed \
+             only {allowed:?}"
+        );
+    }
+}
+
+/// Every `*key_id` string anywhere in a JSON row (its signer and subjects).
+fn key_ids_in(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if let (true, Some(s)) = (k.ends_with("key_id"), v.as_str()) {
+                    out.push(s.to_owned());
+                }
+                key_ids_in(v, out);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|v| key_ids_in(v, out)),
+        _ => {}
+    }
+}
+
+/// CIRISEdge#971 — the device-side bound that keeps "names the seat routed"
+/// small: every row a no-consent seat delivered the device names the device,
+/// the seat or the owner as its signer or subject, or is a key-level
+/// Revocation (the `Projection::Global` offer). A room row here would make the
+/// routed-name allowance a member-naming Pull. Fails naming the row's kind
+/// and the key ids it carries.
+fn assert_device_got_only_required_rows(m: &BundleMesh, allowed: &[&str], stage: &str) {
+    let rows = m
+        .rt_device
+        .bridge()
+        .deliveries_from_for_test(&m.seat.key.key_id);
+    for (kind, bytes) in &rows {
+        if *kind == EnvelopeKind::Revocation {
+            continue;
+        }
+        let mut ids = Vec::new();
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            key_ids_in(&v, &mut ids);
+        }
+        assert!(
+            ids.iter().any(|id| allowed.contains(&id.as_str())),
+            "{stage}: the seat delivered a {kind:?} row naming {ids:?}; allowed only rows \
+             about {allowed:?}"
+        );
+    }
+}
+
+fn seat_was_asked_about(m: &BundleMesh, subject: &str) -> bool {
+    m.rt_seat
+        .bridge()
+        .pull_subjects_from_for_test(&m.device.key.key_id)
+        .iter()
+        .any(|(_, s)| s == subject)
+}
+
+fn seat_bytes(m: &BundleMesh) -> usize {
+    tapped_bytes(&m.t_seat)
+}
+
+/// The device's first contact through the bundle Pulls: the seat holds the
+/// device's key and route, and its round on the round plane rides the
+/// device's link.
+async fn rooted(m: &BundleMesh) {
+    let key = m.device.key.key_id.clone();
+    assert!(
+        wait_until(Duration::from_secs(120), || {
+            let key = key.clone();
+            let seat = &m.seat;
+            async move { seat.holds_route_of(&key).await }
+        })
+        .await,
+        "the device's own route reaches the seat by its offering Pull, not a Summary"
+    );
+}
+
+/// (d)-1 **No Summary, and idle bytes independent of K.** At two offer sizes
+/// the seat never builds its per-peer offer for the device on the four Pull
+/// planes, and an idle cycle (in sync) costs the seat the same bytes, under a
+/// constant bound. Mutation: let `BundlePull` skip nothing (schedule the four
+/// planes as rounds), and `offers_built_for` is non-zero and the idle bytes
+/// grow with K.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_seat_is_asked_by_pull_and_its_idle_cost_does_not_grow_with_k_971() {
+    init_tracing();
+    let mut idle = Vec::new();
+    for (tag, k) in [(11u8, 4usize), (12u8, 120usize)] {
+        let m = bundle_mesh(tag, k, true).await;
+        let built0 = m.rt_seat.bridge().offers_built_on_bundle_planes();
+        rooted(&m).await;
+        // Settle, then one idle cycle in sync.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let delivered = |m: &BundleMesh| {
+            let (rt, seat) = (Arc::clone(&m.rt_device), m.seat.key.key_id.clone());
+            async move {
+                let mut n = 0;
+                for kind in ciris_edge::replication::runtime::BUNDLE_PULL_PLANES {
+                    if let Some(c) = rt.registry().get_initiator(&seat, kind).await {
+                        n += c.offers_delivered();
+                    }
+                }
+                n
+            }
+        };
+        let up0 = delivered(&m).await;
+        let before = seat_bytes(&m);
+        m.rt_device.bundle_pull_now().await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let cost = seat_bytes(&m) - before;
+        let up = delivered(&m).await - up0;
+        // The seat's only peer is this device, so the delta is the device's.
+        let built = m.rt_seat.bridge().offers_built_on_bundle_planes() - built0;
+        eprintln!(
+            "971 (d) K={k}: idle_cycle_sealed_bytes={cost} offers_built={built} delivers_up={up}"
+        );
+        assert_eq!(
+            built, 0,
+            "K={k}: the seat never builds its whole offer for the device"
+        );
+        assert_eq!(up, 0, "K={k}: an in-sync cycle sends no Deliver up");
+        // The round plane's offer is the revocations of keys in the seat's
+        // self set and cohort (`Projection::Global`), not the corpus: none here,
+        // whatever K is.
+        {
+            use ciris_edge::replication::ReplicationDirectory as _;
+            let revs = m
+                .rt_seat
+                .bridge()
+                .list_envelope_refs_for_peer(
+                    EnvelopeKind::Revocation,
+                    Some(m.device.key.key_id.as_str()),
+                )
+                .await;
+            assert!(
+                revs.is_empty(),
+                "K={k}: the Revocation offer holds only revocations that exist"
+            );
+        }
+        idle.push(cost);
+    }
+    // One idle cycle: 4 planes x 2 subjects x (a Pull up, a small Summary
+    // down), plus the round plane's small exchange: a constant, not K.
+    for c in &idle {
+        assert!(*c < 64 * 1024, "an idle cycle stays under 64 KiB: {idle:?}");
+    }
+    let spread = idle[0].abs_diff(idle[1]);
+    assert!(
+        spread < 8 * 1024,
+        "idle cost does not grow with K (4 vs 120 announced keys): {idle:?}"
+    );
+}
+
+/// (d)-2 **Completeness from a bare directory through claim.** Unclaimed, the
+/// device reaches "the seat holds its key and route and can reach it on its
+/// link" by Pulls alone; claimed, its owner's key arrives by the owner Pull.
+/// Nothing rides a whole-plane Summary (the seat's offer counter stays 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_reaches_the_seat_and_its_owner_by_pull_alone_971() {
+    use ciris_persist::federation::FederationDirectory as _;
+    init_tracing();
+    let m = bundle_mesh(13, 4, true).await;
+    let built0 = m.rt_seat.bridge().offers_built_on_bundle_planes();
+    // Stage 1, bare: the seat holds nothing of the device yet.
+    assert!(
+        !m.seat.holds_route_of(&m.device.key.key_id).await,
+        "bare: no route of the device at the seat"
+    );
+    let (dev, seat_id) = (m.device.key.key_id.clone(), m.seat.key.key_id.clone());
+    assert_seat_was_asked_only_about(&m, &[&dev, &seat_id], "bare");
+    assert_device_got_only_required_rows(&m, &[&dev, &seat_id], "bare");
+    // Stage 2, rooted.
+    rooted(&m).await;
+    assert_seat_was_asked_only_about(&m, &[&dev, &seat_id], "rooted");
+    assert_device_got_only_required_rows(&m, &[&dev, &seat_id], "rooted");
+    assert!(
+        m.seat
+            .dir
+            .lookup_public_key(&m.device.key.key_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
+        "the seat holds the device's key"
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            let t = Arc::clone(&m.t_seat);
+            let k = m.device.key.key_id.clone();
+            async move { !t.reverse_links_for_test(&k).await.is_empty() }
+        })
+        .await,
+        "the seat can reach the device on the device's own link"
+    );
+    // Stage 3, claimed. The owner signs the binding on the device (as the claim writes
+    // it locally), and the seat holds the owner's announced occurrence.
+    let owner = Ident::new("person-971d-owner", 0xb3).await;
+    m.device
+        .dir
+        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: owner.record("user").await,
+        })
+        .await
+        .expect("the owner's key at claim");
+    put(
+        &m.device.dir,
+        owner_binding_attestation(
+            &owner.key_id,
+            &m.device.key.key_id,
+            chrono::Utc::now(),
+            &owner.signer(),
+        )
+        .await
+        .expect("owner binding"),
+    )
+    .await;
+    m.seat
+        .dir
+        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: owner.record("user").await,
+        })
+        .await
+        .expect("the owner's key at the seat");
+    // A second node of the same owner: its occurrence is at the seat only
+    // (its key is known to both, as an announced owned node's is). The owner
+    // Pull on the occurrence plane is the path that delivers it. Its ROUTE is
+    // not in (d): an owned node's route comes from its owner (CC CLM-route-
+    // handed-by-owner, CIRISEdge#972).
+    let sibling = Ident::new("ciris-client-971d-sibling", 0xb4).await;
+    for dir in [&m.seat.dir, &m.device.dir] {
+        dir.put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: sibling.record("node").await,
+        })
+        .await
+        .expect("the sibling's key");
+    }
+    m.seat
+        .dir
+        .put_identity_occurrence(
+            common::node_signed_occurrence(
+                &owner.key_id,
+                &sibling.key_id,
+                &sibling.signer(),
+                ciris_persist::federation::types::device_class::PHONE,
+            )
+            .await,
+        )
+        .await
+        .expect("the sibling's occurrence at the seat");
+    let owner_pulls = |n: &Node| {
+        n.metrics
+            .bundle_pull()
+            .get("pull_owner")
+            .copied()
+            .unwrap_or(0)
+    };
+    let before = owner_pulls(&m.device);
+    m.rt_device.bundle_pull_now().await;
+    assert!(
+        owner_pulls(&m.device) > before,
+        "a claimed device's timer cycle asks about its owner"
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            let dir = Arc::clone(&m.device.dir);
+            let (sib, own) = (sibling.key_id.clone(), owner.key_id.clone());
+            async move {
+                dir.list_identity_occurrences_for(&own)
+                    .await
+                    .is_ok_and(|v| v.iter().any(|o| o.occurrence_key_id == sib))
+            }
+        })
+        .await,
+        "the owner Pull delivers a second owned node's occurrence"
+    );
+    assert_seat_was_asked_only_about(&m, &[&dev, &seat_id, &owner.key_id], "claimed");
+    assert_device_got_only_required_rows(&m, &[&dev, &seat_id, &owner.key_id], "claimed");
+    assert_eq!(
+        m.rt_seat.bridge().offers_built_on_bundle_planes() - built0,
+        0,
+        "nothing rode a whole-plane Summary"
+    );
+}
+
+/// (d)-3 **The Pull coordinators survive a reconcile.** `set_peers` converges
+/// scheduled initiators only; the bundle Pull coordinators are registered for
+/// their replies and never scheduled. Mutation: schedule them through
+/// `register_initiator_peer`, and the empty `set_peers` removes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bundle_pull_coordinators_survive_a_reconcile_tick_971() {
+    init_tracing();
+    let m = bundle_mesh(14, 4, true).await;
+    m.rt_device.bundle_pull_now().await;
+    m.rt_device.set_peers(Vec::new()).await.expect("reconcile");
+    for kind in ciris_edge::replication::runtime::BUNDLE_PULL_PLANES {
+        assert!(
+            m.rt_device
+                .registry()
+                .get_initiator(&m.seat.key.key_id, kind)
+                .await
+                .is_some(),
+            "{kind:?}: the Pull coordinator is still routed after the reconcile"
+        );
+    }
+    let sent = m.rt_device.bundle_pulls_sent();
+    m.rt_device.bundle_pull_now().await;
+    assert!(m.rt_device.bundle_pulls_sent() > sent, "and it still pulls");
+}
+
+/// (d)-4 **Isolation: a seat the host names is a consent peer, untouched.**
+/// Once the host's peer set names the seat, no bundle Pull is sent to it and
+/// its planes are the host's ordinary rounds. Mutation: drop the host filter
+/// in `BundlePull::targets`, and Pulls go to a consent peer too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_the_host_names_rounds_as_a_consent_peer_971() {
+    init_tracing();
+    let m = bundle_mesh(15, 4, true).await;
+    m.rt_device
+        .set_peers(peers_for(&[m.seat.key.key_id.as_str()]))
+        .await
+        .expect("the host names the seat");
+    let sent = m.rt_device.bundle_pulls_sent();
+    m.rt_device.bundle_pull_now().await;
+    assert_eq!(
+        m.rt_device.bundle_pulls_sent(),
+        sent,
+        "no bundle Pull to a consent peer"
+    );
+    // The frames toward a consent peer come from the scheduled initiators
+    // alone: with bundle mode on they are exactly the set bundle mode off
+    // schedules for the same host peers.
+    let off = bundle_mesh(19, 4, false).await;
+    off.rt_device
+        .set_peers(peers_for(&[off.seat.key.key_id.as_str()]))
+        .await
+        .expect("the host names the seat");
+    let rename = |v: Vec<(String, EnvelopeKind)>, from: &str| {
+        v.into_iter()
+            .map(|(p, k)| (if p == from { "SEAT".to_owned() } else { p }, k))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rename(
+            m.rt_device.initiator_set_for_test().await,
+            &m.seat.key.key_id
+        ),
+        rename(
+            off.rt_device.initiator_set_for_test().await,
+            &off.seat.key.key_id
+        ),
+        "bundle mode adds nothing to a consent peer's rounds"
+    );
+}
+
+/// (d)-5 **The opt-out covers (d): the device sends the seat nothing.**
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_the_bundle_path_off_the_device_sends_the_seat_nothing_971() {
+    init_tracing();
+    let m = bundle_mesh(16, 4, false).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    m.rt_device.bundle_pull_now().await;
+    assert_eq!(m.rt_device.bundle_pulls_sent(), 0, "no Pull");
+    assert!(
+        m.t_seat
+            .reverse_links_for_test(&m.device.key.key_id)
+            .await
+            .is_empty(),
+        "no link from the device"
+    );
+    assert_eq!(
+        seat_bytes(&m),
+        0,
+        "nothing on the seat's links from the device"
+    );
+}
+
+/// (d)-6 **A write asks only about itself, on its plane; only the timer asks
+/// about the owner.** N local writes on one Pull plane send N self-subject
+/// Pulls on that plane and nothing else; host kicks send this node's and the
+/// seat's legs and never the owner's. Mutation: let a write run the whole
+/// cycle, or let any kick pull the owner, and a count below moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_and_kicks_never_spend_the_seats_lookup_budget_971() {
+    init_tracing();
+    let m = bundle_mesh(17, 4, true).await;
+    rooted(&m).await;
+    // Attributed (the loop's own cycle saw it, and so settled: its next timer
+    // is at least I/2 out), so no background cycle runs in the counts below.
+    assert!(
+        wait_until(Duration::from_secs(120), || {
+            let rt = Arc::clone(&m.rt_device);
+            let seat = m.seat.key.key_id.clone();
+            async move {
+                rt.registry()
+                    .get_initiator(&seat, EnvelopeKind::Revocation)
+                    .await
+                    .is_some()
+            }
+        })
+        .await,
+        "attributed"
+    );
+    let owner = Ident::new("person-971d-kick-owner", 0xb5).await;
+    m.device
+        .dir
+        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: owner.record("user").await,
+        })
+        .await
+        .expect("the owner's key");
+    put(
+        &m.device.dir,
+        owner_binding_attestation(
+            &owner.key_id,
+            &m.device.key.key_id,
+            chrono::Utc::now(),
+            &owner.signer(),
+        )
+        .await
+        .expect("owner binding"),
+    )
+    .await;
+    let read = |label: &str| {
+        m.device
+            .metrics
+            .bundle_pull()
+            .get(label)
+            .copied()
+            .unwrap_or(0)
+    };
+    let planes = ciris_edge::replication::runtime::BUNDLE_PULL_PLANES;
+    let on = |rt: &ReplicationRuntime| planes.map(|k| rt.bundle_pulls_sent_on(k));
+    // N writes on the route plane, each after the last one's answer.
+    const N: u64 = 4;
+    let (owner0, self0, seat0, by0) = (
+        read("pull_owner"),
+        read("pull_self"),
+        read("pull_seat"),
+        on(&m.rt_device),
+    );
+    for _ in 0..N {
+        m.rt_device
+            .bundle_pull_wrote_now_for_test(EnvelopeKind::TransportDestination)
+            .await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+    }
+    let by = on(&m.rt_device);
+    for (i, k) in planes.iter().enumerate() {
+        let want = if *k == EnvelopeKind::TransportDestination {
+            N
+        } else {
+            0
+        };
+        assert_eq!(by[i] - by0[i], want, "{k:?}: Pulls after {N} route writes");
+    }
+    assert_eq!(read("pull_self") - self0, N, "self-subject only");
+    assert_eq!(read("pull_seat"), seat0, "no seat leg on a write");
+    assert_eq!(read("pull_owner"), owner0, "no owner leg on a write");
+    // Host kicks: self and seat, never the owner.
+    for _ in 0..3 {
+        m.rt_device.bundle_pull_host_kick_now_for_test().await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+    }
+    assert!(read("pull_seat") > seat0, "a host kick asks about the seat");
+    assert_eq!(read("pull_owner"), owner0, "no kick asked about the owner");
+    // The real kick path coalesces: a burst of `round_now` is one cycle.
+    let kick0 = read("cycle_kick");
+    for _ in 0..5 {
+        let _ = m.rt_device.round_now(&m.seat.key.key_id).await;
+    }
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    assert_eq!(read("cycle_kick") - kick0, 1, "five kicks, one cycle");
+    assert_eq!(read("pull_owner"), owner0, "and still no owner leg");
+    // The timer's cycle is the one that asks about the owner: once per
+    // owner plane.
+    m.rt_device.bundle_pull_now().await;
+    assert_eq!(
+        read("pull_owner") - owner0,
+        3,
+        "Key, occurrence, occurrence-revocation"
+    );
+}
+
+/// (d)-7 **Bare stage: nothing a seat would drop is sent.** Until the seat
+/// holds this node's key and route, an unattributed frame on a
+/// non-bootstrap kind drops there (`routing_source`, replication/mod.rs), so
+/// neither an IOR Pull nor the Revocation round is started; once the
+/// offering Key and TD Pulls show both held, both start, and a reconcile keeps
+/// them. Mutation: drop the `attributed` gate on the IOR leg, or register the
+/// Revocation initiator at adopt, and a bare-stage assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_seats_round_starts_once_it_holds_our_key_and_route_971() {
+    init_tracing();
+    let m = bundle_mesh(18, 4, true).await;
+    // Bare: one cycle before anything reached the seat.
+    m.rt_device.bundle_pull_now().await;
+    assert_eq!(
+        m.rt_device
+            .bundle_pulls_sent_on(EnvelopeKind::IdentityOccurrenceRevocation),
+        0,
+        "bare: no occurrence-revocation Pull"
+    );
+    assert!(
+        m.rt_device
+            .registry()
+            .get_initiator(&m.seat.key.key_id, EnvelopeKind::Revocation)
+            .await
+            .is_none(),
+        "bare: no revocation round"
+    );
+    rooted(&m).await;
+    assert!(
+        wait_until(Duration::from_secs(120), || {
+            let rt = Arc::clone(&m.rt_device);
+            let seat = m.seat.key.key_id.clone();
+            async move {
+                rt.registry()
+                    .get_initiator(&seat, EnvelopeKind::Revocation)
+                    .await
+                    .is_some()
+            }
+        })
+        .await,
+        "the revocation round starts by first-contact cycles, 30 s apart"
+    );
+    m.rt_device.bundle_pull_now().await;
+    assert!(
+        m.rt_device
+            .bundle_pulls_sent_on(EnvelopeKind::IdentityOccurrenceRevocation)
+            > 0,
+        "attributed: the occurrence-revocation leg runs"
+    );
+    m.rt_device.set_peers(Vec::new()).await.expect("reconcile");
+    assert!(
+        m.rt_device
+            .registry()
+            .get_initiator(&m.seat.key.key_id, EnvelopeKind::Revocation)
+            .await
+            .is_some(),
+        "a reconcile keeps an attributed seat's round"
+    );
+}
+
+/// (d)-8 **The seat is never asked about a member, read at the seat.** A key
+/// a person is waiting on (#904) and an unrouted repair name sit queued on
+/// the device while its revocation round toward the attributed seat runs
+/// every 3 s. The seat records the subject of every Pull it answers; it never
+/// sees either name. Transition 1: the host names the seat (a consent peer
+/// now) and the seat's rounds take both. Transition 2: the host drops it
+/// while it stays a bundle seat; two new names stay unasked. Mutation: make
+/// `names_only_required_subjects` return true, and stage A fails naming the
+/// leaked subject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_seat_is_never_asked_about_a_member_971() {
+    use ciris_edge::replication::ReplicationDirectory as _;
+    init_tracing();
+    let m = bundle_mesh(20, 4, true).await;
+    rooted(&m).await;
+    assert!(
+        wait_until(Duration::from_secs(120), || {
+            let rt = Arc::clone(&m.rt_device);
+            let seat = m.seat.key.key_id.clone();
+            async move {
+                rt.registry()
+                    .get_initiator(&seat, EnvelopeKind::Revocation)
+                    .await
+                    .is_some()
+            }
+        })
+        .await,
+        "attributed: the seat's revocation round runs"
+    );
+    let (dev, seat_id) = (m.device.key.key_id.clone(), m.seat.key.key_id.clone());
+    let bridge = m.rt_device.bridge();
+    let (asked, unrouted) = (
+        "ciris-client-971d-member-asked",
+        "ciris-client-971d-member-unrouted",
+    );
+    bridge.request_signer(EnvelopeKind::Key, asked);
+    bridge.note_missing_signer(EnvelopeKind::Attestation, unrouted, None);
+    // Stage A: no consent, ten rounds.
+    let outcomes0 = m.device.all_outcomes();
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_ne!(m.device.all_outcomes(), outcomes0, "rounds ran meanwhile");
+    assert_seat_was_asked_only_about(&m, &[&dev, &seat_id], "no consent");
+    assert_device_got_only_required_rows(&m, &[&dev, &seat_id], "no consent");
+    // Transition 1: the host names the seat; its rounds may take both.
+    m.rt_device
+        .set_peers(peers_for(&[seat_id.as_str()]))
+        .await
+        .expect("the host names the seat");
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            seat_was_asked_about(&m, asked) && seat_was_asked_about(&m, unrouted)
+        })
+        .await,
+        "a consent peer's rounds take both names"
+    );
+    // Transition 2: the host drops it; it is still a bundle seat.
+    m.rt_device.set_peers(Vec::new()).await.expect("drop it");
+    let (asked2, unrouted2) = (
+        "ciris-client-971d-member-asked-2",
+        "ciris-client-971d-member-unrouted-2",
+    );
+    bridge.request_signer(EnvelopeKind::Key, asked2);
+    bridge.note_missing_signer(EnvelopeKind::Attestation, unrouted2, None);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    for name in [asked2, unrouted2] {
+        assert!(
+            !seat_was_asked_about(&m, name),
+            "dropped as a consent peer, the seat is not asked about {name}"
+        );
+        assert!(bridge.signer_queued(name), "{name} stays queued");
+    }
 }

@@ -2519,6 +2519,21 @@ pub struct FederationDirectoryReplicationBridge {
     /// CIRISEdge#968 — how many times a LOCAL write dropped the send-set
     /// memos ([`Self::invalidate_send_set_memos`]). `Relaxed`.
     send_set_invalidations: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#971 — how many times a per-peer offer (the advertise a
+    /// Summary carries) was built on the four planes a bundle seat answers by
+    /// subject Pull, for any peer. One unlabelled counter, so the serve path
+    /// holds no per-peer state for it; a witness reads its delta over a run
+    /// in which the device is the seat's only peer. `Relaxed`.
+    offers_built: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#971 — test-only record of every subject Pull answered here,
+    /// as `(requester, kind, subject)`: unset (and never read) unless a test
+    /// calls [`Self::record_pull_subjects_for_test`], so production holds
+    /// nothing.
+    pull_subject_log: std::sync::OnceLock<Mutex<Vec<(String, EnvelopeKind, String)>>>,
+    /// CIRISEdge#971 — test-only record of every row delivered here for
+    /// apply, as `(source_peer, kind, bytes)`: unset unless a test calls
+    /// [`Self::record_deliveries_for_test`].
+    delivery_log: std::sync::OnceLock<Mutex<Vec<(String, EnvelopeKind, Vec<u8>)>>>,
     /// CIRISEdge#817 — how many times `rooted_with` actually walked the trust
     /// root (its memo missed): the per-Deliver memo's witness. `Relaxed`.
     rooted_walks: std::sync::atomic::AtomicUsize,
@@ -3007,6 +3022,9 @@ impl FederationDirectoryReplicationBridge {
             consent_flight: SingleFlight::default(),
             consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
             send_set_invalidations: std::sync::atomic::AtomicUsize::new(0),
+            offers_built: std::sync::atomic::AtomicU64::new(0),
+            pull_subject_log: std::sync::OnceLock::new(),
+            delivery_log: std::sync::OnceLock::new(),
             rooted_walks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             read_probe: ReadProbe::default(),
@@ -4470,6 +4488,10 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
     }
 
+    fn note_pull_answer(&self, peer_key_id: &str, subject_key_id: &str, throttled: bool) {
+        self.record_pull_answer(peer_key_id, subject_key_id, throttled);
+    }
+
     fn take_released_rows_for(&self, peer_key_id: &str, kind: EnvelopeKind) -> Vec<[u8; 32]> {
         self.released_asks.lock().map_or_else(
             |_| Vec::new(),
@@ -4622,6 +4644,9 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         kind: EnvelopeKind,
         peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
+        if peer_key_id.is_some() {
+            self.note_offer_built(kind);
+        }
         // ROLE_MATRIX Axis 3 — THE once-per-round production path.
         // `DirectoryStateAdapter::local_refs` calls THIS, not the peer-blind
         // `list_envelope_refs` (that one is diagnostics and tests). Refreshing
@@ -4896,6 +4921,15 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         peer_key_id: Option<&str>,
     ) -> crate::replication::summary::SubjectPullAnswer {
         use crate::replication::summary::SubjectPullAnswer;
+        if let Some(log) = self.pull_subject_log.get() {
+            if let Ok(mut log) = log.lock() {
+                log.push((
+                    peer_key_id.unwrap_or("-").to_owned(),
+                    kind,
+                    subject_key_id.to_owned(),
+                ));
+            }
+        }
         // Authorize BEFORE resolving. The subject and own-record arms need no
         // tier at all, and an unattributed requester needs nothing but a
         // refusal — so neither may reach the trust-graph walk. `CachedServeTier`
@@ -5079,6 +5113,15 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         envelope_bytes: &[u8],
         source_peer: Option<&str>,
     ) -> ApplyOutcome {
+        if let Some(log) = self.delivery_log.get() {
+            if let Ok(mut log) = log.lock() {
+                log.push((
+                    source_peer.unwrap_or("-").to_owned(),
+                    kind,
+                    envelope_bytes.to_vec(),
+                ));
+            }
+        }
         // CIRISEdge#426 — the authenticated sender now REACHES the apply layer (it
         // was dropped upstream, which made the consent plane send-only). The actual
         // per-peer write enforcement lives in persist v22's put-gates + AV-76
@@ -12065,6 +12108,73 @@ impl FederationDirectoryReplicationBridge {
         );
     }
 
+    /// CIRISEdge#971 — count one per-peer offer built on a bundle-Pull plane.
+    fn note_offer_built(&self, kind: EnvelopeKind) {
+        if !matches!(
+            kind,
+            EnvelopeKind::Key
+                | EnvelopeKind::IdentityOccurrence
+                | EnvelopeKind::TransportDestination
+                | EnvelopeKind::IdentityOccurrenceRevocation
+        ) {
+            return;
+        }
+        self.offers_built
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#971 — the per-peer offers built on the four bundle-Pull
+    /// planes so far, for every peer together.
+    #[must_use]
+    pub fn offers_built_on_bundle_planes(&self) -> u64 {
+        self.offers_built.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#971 test seam — from now on, record the subject of every
+    /// subject Pull this node answers (the session's `on_pull` and a recovery
+    /// round's Pull both land in `subject_pull_answer`).
+    #[doc(hidden)]
+    pub fn record_pull_subjects_for_test(&self) {
+        let _ = self.pull_subject_log.set(Mutex::new(Vec::new()));
+    }
+
+    /// CIRISEdge#971 test seam — from now on, record every row delivered to
+    /// this node for apply, with the peer that delivered it.
+    #[doc(hidden)]
+    pub fn record_deliveries_for_test(&self) {
+        let _ = self.delivery_log.set(Mutex::new(Vec::new()));
+    }
+
+    /// CIRISEdge#971 test seam — the rows `source` has delivered here since
+    /// [`Self::record_deliveries_for_test`], as `(kind, bytes)`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn deliveries_from_for_test(&self, source: &str) -> Vec<(EnvelopeKind, Vec<u8>)> {
+        self.delivery_log
+            .get()
+            .and_then(|l| l.lock().ok().map(|l| l.clone()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(s, _, _)| s == source)
+            .map(|(_, k, b)| (k, b))
+            .collect()
+    }
+
+    /// CIRISEdge#971 test seam — the subjects `requester` has Pulled from
+    /// this node since [`Self::record_pull_subjects_for_test`], in order.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pull_subjects_from_for_test(&self, requester: &str) -> Vec<(EnvelopeKind, String)> {
+        self.pull_subject_log
+            .get()
+            .and_then(|l| l.lock().ok().map(|l| l.clone()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(r, _, _)| r == requester)
+            .map(|(_, k, s)| (k, s))
+            .collect()
+    }
+
     /// CIRISEdge#971 — the bundle's serve nodes this node holds (its
     /// `start` and every re-check). With [`Self::set_consent_peers`] it
     /// decides [`Self::is_no_consent_seat`]. Replaces the set.
@@ -12186,6 +12296,44 @@ impl FederationDirectoryReplicationBridge {
     pub fn note_local_owner(&self, owner: Option<String>) {
         if let Ok(mut held) = self.local_owner.lock() {
             *held = owner;
+        }
+    }
+
+    /// CIRISEdge#971 (d) — a subject Pull's answer came back from `peer`:
+    /// count it by subject kind when `peer` is a no-consent seat, so a host
+    /// doing member lookups against a seat (`answer_other`) is visible.
+    pub fn record_pull_answer(&self, peer: &str, subject: &str, throttled: bool) {
+        let Some(m) = &self.metrics else {
+            return;
+        };
+        if !self.is_no_consent_seat(peer) {
+            return;
+        }
+        use crate::observability as o;
+        let label = if throttled {
+            o::BUNDLE_PULL_ANSWER_THROTTLED
+        } else if self.local_key_id.as_deref() == Some(subject) {
+            o::BUNDLE_PULL_ANSWER_SELF
+        } else if subject == peer {
+            o::BUNDLE_PULL_ANSWER_SEAT
+        } else if self
+            .local_owner
+            .lock()
+            .is_ok_and(|o| o.as_deref() == Some(subject))
+        {
+            o::BUNDLE_PULL_ANSWER_OWNER
+        } else {
+            o::BUNDLE_PULL_ANSWER_OTHER
+        };
+        m.inc_bundle_pull(label);
+    }
+
+    /// CIRISEdge#971 (d) — the single live owner of `node`, if it has one
+    /// (the #523 memo; an unresolved answer is `None`).
+    pub(crate) async fn owner_of_node(&self, node: &str) -> Option<String> {
+        match self.owner_of_cached(node).await {
+            OwnerLookup::Owner(owner) => Some(owner),
+            _ => None,
         }
     }
 

@@ -1992,6 +1992,56 @@ pub const INITIATOR_PEERS_HOST: &str = "host";
 pub const INITIATOR_PEERS_BUNDLE: &str = "bundle";
 /// CIRISEdge#971 — initiator peers this node homed on after a refusal (CC 5.4.3).
 pub const INITIATOR_PEERS_HOMED: &str = "homed";
+/// CIRISEdge#971 (d) — a bundle-seat Pull cycle a seat's first contact ran.
+pub const BUNDLE_PULL_CYCLE_FIRST_CONTACT: &str = "cycle_first_contact";
+/// CIRISEdge#971 (d) — a bundle-seat Pull cycle the jittered timer ran.
+pub const BUNDLE_PULL_CYCLE_TIMER: &str = "cycle_timer";
+/// CIRISEdge#971 (d) — a bundle-seat Pull cycle a host kick (`round_now`)
+/// ran: this node's and the seat's legs, never the owner's.
+pub const BUNDLE_PULL_CYCLE_KICK: &str = "cycle_kick";
+/// CIRISEdge#971 (d) — a bundle-seat Pull cycle a local write on a Pull plane
+/// ran: the self-subject offering Pull on that plane only.
+pub const BUNDLE_PULL_CYCLE_WRITE: &str = "cycle_write";
+/// CIRISEdge#971 (d) — first contact ran out of quick tries with a seat that
+/// does not yet hold our key and route; the ordinary timer asks from then on.
+pub const BUNDLE_PULL_FIRST_CONTACT_GAVE_UP: &str = "first_contact_gave_up";
+/// CIRISEdge#971 (d) — a Pull of this node's own rows (uncharged at the seat).
+pub const BUNDLE_PULL_SELF: &str = "pull_self";
+/// CIRISEdge#971 (d) — a Pull of the seat's own rows (uncharged at the seat).
+pub const BUNDLE_PULL_SEAT: &str = "pull_seat";
+/// CIRISEdge#971 (d) — a Pull of this node's owner's rows (one charged lookup).
+pub const BUNDLE_PULL_OWNER: &str = "pull_owner";
+/// CIRISEdge#971 (d) — a Pull not sent: the seat's throttle hint still runs.
+pub const BUNDLE_PULL_HELD_BACK: &str = "held_back";
+/// CIRISEdge#971 (d) — a no-consent seat answered a Pull about this node.
+pub const BUNDLE_PULL_ANSWER_SELF: &str = "answer_self";
+/// CIRISEdge#971 (d) — a no-consent seat answered a Pull about itself.
+pub const BUNDLE_PULL_ANSWER_SEAT: &str = "answer_seat";
+/// CIRISEdge#971 (d) — a no-consent seat answered a Pull about our owner.
+pub const BUNDLE_PULL_ANSWER_OWNER: &str = "answer_owner";
+/// CIRISEdge#971 (d) — a no-consent seat answered a Pull about anyone else:
+/// only a host's own lookup (`pull_subject_testimony`) asks one; (d) never
+/// does. Non-zero means the host is looking people up at a seat.
+pub const BUNDLE_PULL_ANSWER_OTHER: &str = "answer_other";
+/// CIRISEdge#971 (d) — a no-consent seat answered a Pull with a throttle.
+pub const BUNDLE_PULL_ANSWER_THROTTLED: &str = "answer_throttled";
+/// Every `bundle_pull` key.
+pub const BUNDLE_PULL_LABELS: &[&str] = &[
+    BUNDLE_PULL_CYCLE_FIRST_CONTACT,
+    BUNDLE_PULL_CYCLE_TIMER,
+    BUNDLE_PULL_CYCLE_KICK,
+    BUNDLE_PULL_CYCLE_WRITE,
+    BUNDLE_PULL_FIRST_CONTACT_GAVE_UP,
+    BUNDLE_PULL_SELF,
+    BUNDLE_PULL_SEAT,
+    BUNDLE_PULL_OWNER,
+    BUNDLE_PULL_HELD_BACK,
+    BUNDLE_PULL_ANSWER_SELF,
+    BUNDLE_PULL_ANSWER_SEAT,
+    BUNDLE_PULL_ANSWER_OWNER,
+    BUNDLE_PULL_ANSWER_OTHER,
+    BUNDLE_PULL_ANSWER_THROTTLED,
+];
 /// Every `initiator_peers` key.
 pub const INITIATOR_PEERS_LABELS: &[&str] = &[
     INITIATOR_PEERS_HOST,
@@ -2277,6 +2327,9 @@ pub struct EdgeMetrics {
     /// CIRISEdge#971 — how replication frames reached their peer, and what
     /// the path seeks a dial raised cost, by label (`REPLICATION_REACH_*`).
     pub replication_reach: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 (d) — bundle-seat Pull cycles by cause and Pulls by
+    /// subject (`BUNDLE_PULL_*`).
+    pub bundle_pull: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#971 — the distinct peers this node opens replication rounds
     /// toward, by where they came from (`INITIATOR_PEERS_*`). A gauge: set,
     /// not counted. All zero on a device with nobody to round with.
@@ -3020,6 +3073,17 @@ impl EdgeMetrics {
     /// CIRISEdge#971 — count one `replication_reach` event.
     pub fn inc_replication_reach(&self, label: &'static str) {
         *self.replication_reach.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#971 (d) — count one `bundle_pull` event.
+    pub fn inc_bundle_pull(&self, label: &'static str) {
+        *self.bundle_pull.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#971 (d) — the `bundle_pull` ledger by label.
+    #[must_use]
+    pub fn bundle_pull(&self) -> HashMap<String, u64> {
+        owned_keys(&self.bundle_pull)
     }
 
     /// CIRISEdge#971 — the `replication_reach` ledger by label.
@@ -3908,6 +3972,7 @@ impl EdgeMetrics {
             ),
             advertise: registered(&self.advertise, ADVERTISE_LABELS),
             replication_reach: registered(&self.replication_reach, REPLICATION_REACH_LABELS),
+            bundle_pull: registered(&self.bundle_pull, BUNDLE_PULL_LABELS),
             initiator_peers: registered(&self.initiator_peers, INITIATOR_PEERS_LABELS),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
@@ -4256,6 +4321,8 @@ pub struct EdgeMetricsBundle {
     pub advertise: HashMap<String, u64>,
     /// CIRISEdge#971 — `replication_reach.<label>`.
     pub replication_reach: HashMap<String, u64>,
+    /// CIRISEdge#971 (d) — `bundle_pull.<label>`.
+    pub bundle_pull: HashMap<String, u64>,
     /// CIRISEdge#971 — `initiator_peers.<source>`, a gauge.
     pub initiator_peers: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
@@ -4709,6 +4776,7 @@ impl EdgeMetricsBundle {
         );
         f.family("advertise", &self.advertise);
         f.family("replication_reach", &self.replication_reach);
+        f.family("bundle_pull", &self.bundle_pull);
         f.family("initiator_peers", &self.initiator_peers);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
@@ -5045,6 +5113,7 @@ edge_metrics_bundle_fields!(
     direct_link_upgrade_guarded,
     advertise,
     replication_reach,
+    bundle_pull,
     initiator_peers,
     direct_links_active,
     replication_routed_to_responder_total,
