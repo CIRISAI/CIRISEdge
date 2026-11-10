@@ -368,8 +368,12 @@ async fn a_stale_plane_is_revalidated_within_the_budget_971() {
         &a.dir,
         shared(own),
         shared(cohort),
+        // The witness is of the cache's revalidation, so it names the lever:
+        // the cache-off gate leg (`CIRIS_EDGE_KEY_PLANE_LISTING_CACHE=0`) must
+        // not turn off what this test measures.
         BridgeConfig {
             feed_probe_spacing: NO_TEST_OUTLIVES,
+            key_plane_listing_cache: true,
             ..BridgeConfig::default()
         },
         Some(metrics.clone()),

@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use ciris_persist::federation::FederationDirectory;
 
+use super::holdings_index_971_tests::index_on;
 use super::park_fresh_858_tests::{hold, substrate, Ident};
 use super::summary::ApplyOutcome;
 use crate::replication::{
@@ -106,7 +107,7 @@ async fn a_stale_route_is_fetched_once_not_every_round_971() {
     let bridge = Arc::new(FederationDirectoryReplicationBridge::with_config(
         Arc::clone(&dir) as Arc<dyn FederationDirectory>,
         Arc::new(Vec::new),
-        BridgeConfig::default(),
+        index_on(),
     ));
     let (old_bytes, old_ref) = wire(&e1);
 
@@ -176,7 +177,7 @@ async fn counted_bridge(
             BridgeConfig {
                 feed_probe_spacing: std::time::Duration::ZERO,
                 holdings_audit_every: std::time::Duration::from_hours(1),
-                ..BridgeConfig::default()
+                ..index_on()
             },
         )
         .with_metrics(Some(metrics.clone())),

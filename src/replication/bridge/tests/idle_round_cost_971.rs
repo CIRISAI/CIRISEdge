@@ -73,8 +73,19 @@ const ROWS_PER_ATTESTER: usize = 500;
 /// admission burst. A `RateLimited` refusal still waits out its hint once
 /// more rather than failing; any other refusal panics.
 async fn seed_store(backend: &SqliteBackend, prefix: &str, n: usize) {
+    seed_store_about(backend, SEAT, prefix, n).await;
+}
+
+/// [`seed_store`] about any `subject` (the Revocation-round witness seeds its
+/// own seat the same way).
+pub(super) async fn seed_store_about(
+    backend: &SqliteBackend,
+    subject: &str,
+    prefix: &str,
+    n: usize,
+) {
     let attesters: Vec<String> = (0..n.div_ceil(ROWS_PER_ATTESTER))
-        .map(|j| format!("{SEAT}-w{j:02}"))
+        .map(|j| format!("{subject}-w{j:02}"))
         .collect();
     let pairs: Vec<(&str, &str)> = attesters
         .iter()
@@ -87,7 +98,7 @@ async fn seed_store(backend: &SqliteBackend, prefix: &str, n: usize) {
         let envelope = serde_json::json!({
             "id": id,
             "attesting_key_id": attester,
-            "attested_key_id": SEAT,
+            "attested_key_id": subject,
             "attestation_type": "scores",
             "dimension": "idle:row:v1",
             "payload": { "n": i },
@@ -98,7 +109,7 @@ async fn seed_store(backend: &SqliteBackend, prefix: &str, n: usize) {
                 backend,
                 &id,
                 attester,
-                SEAT,
+                subject,
                 "scores",
                 "federation",
                 envelope.clone(),
@@ -175,6 +186,13 @@ async fn idle_rounds_at(n: usize) -> Vec<(EnvelopeKind, usize, u64, Duration)> {
         Some(crate::replication::runtime::self_publish_set([SEAT])),
     )
     .await;
+    // As in the bundle Pull below: the holdings index warms in the background
+    // and its walk reads index pages, so a round measured while it runs books
+    // the walk's pages to that round. Wait it out so each figure (and the fit)
+    // is the round's own cost. With the index off this returns at once.
+    tokio::time::timeout(Duration::from_secs(30), rt.bridge().holdings_warmed())
+        .await
+        .expect("the holdings index warms");
     let registry = rt.registry();
     let mut rows = Vec::new();
     for (round, kind) in (1u64..).zip(BOOTSTRAP_ROUND_PLANES) {
@@ -378,6 +396,12 @@ async fn an_idle_bundle_pull_costs_the_seat_971() {
         Some(crate::replication::runtime::self_publish_set([SEAT])),
     )
     .await;
+    // The holdings index warms in the background, and its walk reads index
+    // pages: a figure taken while it runs books those pages to whichever Pull
+    // is in flight. The cost pinned here is the idle one, after the warm-up.
+    tokio::time::timeout(Duration::from_secs(30), rt.bridge().holdings_warmed())
+        .await
+        .expect("the holdings index warms");
     let registry = rt.registry();
     let mut total = (0usize, 0usize, 0u64, 0usize);
     for (round, kind) in (100u64..).zip(BUNDLE_PULL_PLANES) {
@@ -421,6 +445,19 @@ async fn an_idle_bundle_pull_costs_the_seat_971() {
                 pages, 0,
                 "{kind:?}/{subject}: a Pull never drains the holdings index"
             );
+            // Nor does it read either serve-cursor feed: with the warm-up
+            // done, a read here would be the Pull path's own, O(delta) per
+            // device Pull (CIRISEdge#971).
+            for feed in [
+                "list_attestations_since",
+                "list_signed_transport_destinations_since",
+            ] {
+                assert_eq!(
+                    counts.get(feed).copied().unwrap_or(0),
+                    0,
+                    "{kind:?}/{subject}: a Pull reads no serve-cursor feed ({feed})"
+                );
+            }
             total.0 += reads;
             total.1 += pages;
             total.2 += permits_now;

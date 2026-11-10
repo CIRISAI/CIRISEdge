@@ -8507,11 +8507,14 @@ impl FederationDirectoryReplicationBridge {
     ///
     /// A walk page or the boot drain the store does not serve leaves the plane
     /// Unbooted (counted `warm_failures`), so its next ask boots it inline as
-    /// a bridge with no warm-up does. With the lever off this does nothing.
+    /// a bridge with no warm-up does. With the lever off this does nothing
+    /// and ends at once (a test waiting on its end is released, not hung).
     pub(crate) async fn warm_holdings_index(&self) {
         use super::holdings_index::{IndexPlane, Status};
         use crate::observability as obs;
         if !self.holdings_index.enabled() {
+            #[cfg(test)]
+            self.probes.holdings_warmed.notify_one();
             return;
         }
         let started = Instant::now();

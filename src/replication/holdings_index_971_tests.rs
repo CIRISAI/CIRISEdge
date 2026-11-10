@@ -64,6 +64,20 @@ pub(super) const COVERED: [EnvelopeKind; 6] = [
     EnvelopeKind::TransportDestination,
 ];
 
+/// The config every index witness starts from: the default with the
+/// holdings index named ON. These tests witness the index itself, so the
+/// lever's environment override (`CIRIS_EDGE_HOLDINGS_INDEX=0`, which reaches
+/// only `BridgeConfig::default()`) must not turn it off under them: the gate's
+/// lever-off leg runs them with the index they name, and witnesses the off
+/// path through every other test and through the explicit
+/// `holdings_index: false` halves.
+pub(super) fn index_on() -> BridgeConfig {
+    BridgeConfig {
+        holdings_index: true,
+        ..BridgeConfig::default()
+    }
+}
+
 pub(super) fn bridge_with(
     dir: Arc<dyn FederationDirectory>,
     me: &str,
@@ -210,7 +224,7 @@ async fn the_set_equals_a_full_drain_through_every_door_971() {
         BridgeConfig {
             sweep_page_rows: 2,
             feed_probe_spacing: NO_TEST_OUTLIVES,
-            ..BridgeConfig::default()
+            ..index_on()
         },
         Some(metrics.clone()),
     );
@@ -297,14 +311,14 @@ async fn a_written_through_hash_is_the_index_hash_971() {
         Arc::clone(&a.dir) as Arc<dyn FederationDirectory>,
         a.n.key_id(),
         subjects(&a),
-        BridgeConfig::default(),
+        index_on(),
         None,
     );
     let bridge_b = bridge_with(
         Arc::clone(&b_dir) as Arc<dyn FederationDirectory>,
         b_me.key_id(),
         vec![b_me.key_id().to_owned()],
-        BridgeConfig::default(),
+        index_on(),
         Some(metrics.clone()),
     );
     for kind in COVERED {
@@ -343,7 +357,7 @@ async fn idle_summaries_drain_the_index_zero_times_971() {
         subjects(&a),
         BridgeConfig {
             feed_probe_spacing: NO_TEST_OUTLIVES,
-            ..BridgeConfig::default()
+            ..index_on()
         },
         None,
     );
@@ -384,7 +398,7 @@ async fn a_direct_store_write_is_not_wanted_971() {
         subjects(&a),
         BridgeConfig {
             feed_probe_spacing: NO_TEST_OUTLIVES,
-            ..BridgeConfig::default()
+            ..index_on()
         },
         None,
     );
@@ -394,7 +408,7 @@ async fn a_direct_store_write_is_not_wanted_971() {
         subjects(&a),
         BridgeConfig {
             feed_probe_spacing: Duration::ZERO,
-            ..BridgeConfig::default()
+            ..index_on()
         },
         None,
     );
@@ -444,7 +458,7 @@ async fn an_audit_adds_a_hash_no_feed_saw_971() {
         BridgeConfig {
             feed_probe_spacing: NO_TEST_OUTLIVES,
             holdings_audit_every: Duration::ZERO,
-            ..BridgeConfig::default()
+            ..index_on()
         },
         Some(metrics.clone()),
     );
@@ -487,7 +501,7 @@ async fn an_audit_removes_a_hash_the_index_lost_971() {
         subjects(&a),
         BridgeConfig {
             holdings_audit_every: Duration::ZERO,
-            ..BridgeConfig::default()
+            ..index_on()
         },
         Some(metrics.clone()),
     );
@@ -528,7 +542,7 @@ async fn a_failed_probe_answers_from_the_drain_until_it_recovers_971() {
         // Spacing zero: every ask probes, so every ask meets the failure.
         BridgeConfig {
             feed_probe_spacing: Duration::ZERO,
-            ..BridgeConfig::default()
+            ..index_on()
         },
         Some(metrics.clone()),
     );
@@ -577,14 +591,14 @@ async fn two_nodes_converge_and_stay_converged_971() {
         Arc::clone(&a.dir) as Arc<dyn FederationDirectory>,
         a.n.key_id(),
         subjects(&a),
-        BridgeConfig::default(),
+        index_on(),
         None,
     );
     let bridge_b = bridge_with(
         Arc::clone(&b_dir) as Arc<dyn FederationDirectory>,
         b_me.key_id(),
         vec![b_me.key_id().to_owned()],
-        BridgeConfig::default(),
+        index_on(),
         Some(metrics.clone()),
     );
     for kind in COVERED {
@@ -622,7 +636,7 @@ async fn concurrent_diffs_never_see_a_partial_set_971() {
         BridgeConfig {
             sweep_page_rows: 2,
             holdings_audit_every: Duration::ZERO,
-            ..BridgeConfig::default()
+            ..index_on()
         },
         None,
     );
@@ -718,7 +732,7 @@ async fn no_ask_waits_on_the_warm_up_and_none_boots_the_set_before_it_971() {
         Arc::clone(&counting) as Arc<dyn FederationDirectory>,
         a.n.key_id(),
         subjects(&a),
-        BridgeConfig::default(),
+        index_on(),
         Some(metrics.clone()),
     );
     counting.close_head_reads();
@@ -726,7 +740,9 @@ async fn no_ask_waits_on_the_warm_up_and_none_boots_the_set_before_it_971() {
         let bridge = Arc::clone(&bridge);
         tokio::spawn(async move { bridge.warm_holdings_index().await })
     };
-    counting.a_head_read_is_held().await;
+    tokio::time::timeout(ANSWERED_WITHIN, counting.a_head_read_is_held())
+        .await
+        .expect("the warm-up reaches its first head read");
     for kind in COVERED {
         let held = index_drain(
             &*a.dir,
@@ -754,7 +770,10 @@ async fn no_ask_waits_on_the_warm_up_and_none_boots_the_set_before_it_971() {
         assert!(counter(&metrics, obs::HOLDINGS_FALLBACK_UNBOOTED[slot]) >= 1);
     }
     counting.open_head_reads();
-    warm.await.expect("the warm-up ends");
+    tokio::time::timeout(ANSWERED_WITHIN, warm)
+        .await
+        .expect("the warm-up ends once its head reads are released")
+        .expect("the warm-up task");
     for slot in 0..2 {
         assert_eq!(
             counter(&metrics, obs::HOLDINGS_BOOTS[slot]),

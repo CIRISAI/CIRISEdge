@@ -21,7 +21,7 @@ use ciris_persist::federation::{FederationDirectory, SignedAttestation};
 use ciris_persist::store::sqlite::SqliteBackend;
 
 use super::holdings_index_971_tests::{
-    assert_index_equal, bridge_with, counter, index_drain, refs_of, NO_TEST_OUTLIVES,
+    assert_index_equal, bridge_with, counter, index_drain, index_on, refs_of, NO_TEST_OUTLIVES,
 };
 use super::park_fresh_858_tests::substrate;
 use crate::observability as obs;
@@ -45,7 +45,7 @@ async fn warmed(
         BridgeConfig {
             feed_probe_spacing: Duration::ZERO,
             holdings_audit_every: NO_TEST_OUTLIVES,
-            ..BridgeConfig::default()
+            ..index_on()
         },
         metrics,
     );
@@ -548,14 +548,14 @@ async fn the_set_tracks_the_index_through_every_door_971() {
                 a.n.key_id().to_owned(),
                 a.k.key_id().to_owned(),
             ],
-            BridgeConfig::default(),
+            index_on(),
             None,
         );
         let publish = vec![b_me.key_id().to_owned(), a.n.key_id().to_owned()];
         let quiet = BridgeConfig {
             feed_probe_spacing: Duration::ZERO,
             holdings_audit_every: NO_TEST_OUTLIVES,
-            ..BridgeConfig::default()
+            ..index_on()
         };
         let on = bridge_with(
             Arc::clone(&b_dir) as Arc<dyn FederationDirectory>,

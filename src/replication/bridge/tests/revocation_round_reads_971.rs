@@ -103,18 +103,10 @@ async fn seat(holdings_index: bool) -> Seat {
         &[(SEAT, identity_type::NODE), (DEVICE, identity_type::NODE)],
     )
     .await;
-    for i in 0..ATTESTATIONS {
-        let id = format!("revround-971-{i:05}");
-        let envelope = serde_json::json!({
-            "id": id,
-            "attesting_key_id": SEAT,
-            "attested_key_id": SEAT,
-            "attestation_type": "scores",
-            "dimension": "idle:row:v1",
-            "payload": { "n": i },
-        });
-        seed_raw_attestation(&backend, &id, SEAT, SEAT, "scores", envelope).await;
-    }
+    // Spread over attesters under persist's per-peer admission burst, as the
+    // idle-cost witness does (one attester's 1,100 rows trip `PeerBurst`).
+    super::idle_round_cost_971::seed_store_about(&backend, SEAT, "revround-971", ATTESTATIONS)
+        .await;
     let counting = CountingDirectory::new(backend.clone());
     let directory: Arc<dyn FederationDirectory> = Arc::new(counting.clone());
     let wire = Arc::new(Sent::default());
@@ -210,21 +202,33 @@ async fn a_bundle_revocation_round_reads_nothing_with_the_index_and_drains_witho
     );
 
     // Index on: the first round fills the key-plane memo and listing cache;
-    // the second is the steady state a device pays every cadence.
-    let mut on = seat(true).await;
-    let _fill = round(&on, 10).await;
-    let idle = round(&on, 11).await;
-    eprintln!(
-        "971 revocation round, index ON: calls={} pages={} permits={} by_method={:?}",
-        idle.calls, idle.pages, idle.permits, idle.by_method
-    );
-    assert_eq!(
-        (idle.calls, idle.permits),
-        (0, 0),
-        "an idle Revocation round reads nothing and takes no permit: {:?}",
-        idle.by_method
-    );
-    on.rt.shutdown().await;
+    // the second is the steady state a device pays every cadence. The runtime
+    // applies the environment lever over its config (`resolve_holdings_index`),
+    // so under `CIRIS_EDGE_HOLDINGS_INDEX=0` (the gate's lever-off leg) this
+    // half cannot have the index it witnesses and is skipped, said so; the
+    // index-off half below runs in every leg.
+    if BridgeConfig::default().holdings_index {
+        let mut on = seat(true).await;
+        let _fill = round(&on, 10).await;
+        let idle = round(&on, 11).await;
+        eprintln!(
+            "971 revocation round, index ON: calls={} pages={} permits={} by_method={:?}",
+            idle.calls, idle.pages, idle.permits, idle.by_method
+        );
+        assert_eq!(
+            (idle.calls, idle.permits),
+            (0, 0),
+            "an idle Revocation round reads nothing and takes no permit: {:?}",
+            idle.by_method
+        );
+        on.rt.shutdown().await;
+    } else {
+        eprintln!(
+            "971 revocation round, index ON half SKIPPED: {}=0 turns the runtime's index \
+             off, so the zero-reads claim is not measurable in this leg",
+            BridgeConfig::HOLDINGS_INDEX_ENV
+        );
+    }
 
     // Index off: the pre-v45 receive diff drains the whole index each round.
     let mut off = seat(false).await;
