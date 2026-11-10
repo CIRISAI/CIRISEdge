@@ -1292,11 +1292,14 @@ fn key_ids_in(v: &serde_json::Value, out: &mut Vec<String>) {
 }
 
 /// CIRISEdge#971 — the device-side bound that keeps "names the seat routed"
-/// small: every row a no-consent seat delivered the device names the device,
-/// the seat or the owner as its signer or subject, or is a key-level
-/// Revocation (the `Projection::Global` offer). A room row here would make the
-/// routed-name allowance a member-naming Pull. Fails naming the row's kind
-/// and the key ids it carries.
+/// small: EVERY key id a row from a no-consent seat carries (signer, subject,
+/// identity, occurrence, any `*key_id` at any depth) is the device, the seat
+/// or the owner. The one named exception is a key-level Revocation row (the
+/// `Projection::Global` offer). A row naming the device in one field and a
+/// member in another must fail: a room row here would make the routed-name
+/// allowance a member-naming Pull. No other exception is granted in advance;
+/// a legitimate row that fails is reported by kind and ids and decided by
+/// name. Fails naming the row's kind, the ids outside the set, and all its ids.
 fn assert_device_got_only_required_rows(m: &BundleMesh, allowed: &[&str], stage: &str) {
     let rows = m
         .rt_device
@@ -1310,10 +1313,14 @@ fn assert_device_got_only_required_rows(m: &BundleMesh, allowed: &[&str], stage:
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
             key_ids_in(&v, &mut ids);
         }
+        let outside: Vec<&String> = ids
+            .iter()
+            .filter(|id| !allowed.contains(&id.as_str()))
+            .collect();
         assert!(
-            ids.iter().any(|id| allowed.contains(&id.as_str())),
-            "{stage}: the seat delivered a {kind:?} row naming {ids:?}; allowed only rows \
-             about {allowed:?}"
+            !ids.is_empty() && outside.is_empty(),
+            "{stage}: the seat delivered a {kind:?} row carrying {outside:?} outside \
+             {allowed:?} (all ids: {ids:?})"
         );
     }
 }
