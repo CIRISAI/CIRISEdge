@@ -427,12 +427,20 @@ sealed chunk is ever split (5.3.3.2.3).
   `framing = 1`, every chunk whose `codec_id` is not `0xFF` starts its
   plaintext with `frag_index u16_be ‖ frag_count u16_be ‖ frame_seq u32_be`
   (8 bytes), a whole frame included (`0000 0001 ‖ frame_seq`), so the layout
-  never depends on size. `frame_seq` counts the stream's frames per codec
-  class from 0, every fragment of a frame carrying the same value (Eric,
-  2026-11-10): one stream shares one `chunk_seq` across audio and video, so
-  only `frame_seq` tells a lost video frame from lost audio. A receiver
-  counts a gap in it as lost frames of that class
-  (`Call::frames_lost_by_class`); the first frame it sees starts the count. Audio
+  never depends on size. `frame_seq` counts the stream's frames per (codec
+  class, layer) from 0 for the stream's whole life, every fragment of a
+  frame carrying the same value (Eric, 2026-11-10). It does NOT restart at
+  an epoch roll (unlike `chunk_seq`), so a frame lost across a roll is
+  still a gap; a frame's fragments stay within one epoch; a replaced stream
+  starts again at 0. One stream shares one `chunk_seq` across audio and
+  video, so only `frame_seq` tells a lost video frame from lost audio, and
+  per layer it tells a lost frame from one of a layer the receiver is not
+  being sent (a standby's base-only, its own cap, `request_layers`, SVC). A
+  receiver counts a gap as lost frames of that (class, layer)
+  (`Call::frames_lost_by_layer`) only when both ends of the gap arrived in
+  one receive view (the call bumps the view on its own layer request and on
+  a parent's shed or decision); the first frame of a layer starts its
+  count. A base-layer `(0,0,0)` gap means freeze until the next keyframe. Audio
   (`0xFF`) chunks never carry it. A receiver picks the layout from the
   signed `codec_id` (verified with the trailer before the inner seal opens),
   never from length. Edge frames a stream whose codec map names a non-`0xFF`

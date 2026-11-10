@@ -4622,7 +4622,7 @@ pub const PY_CALL_VERBS: &[&str] = &[
     "publish_on",
     "end_stream",
     "streams",
-    "frames_lost_by_class",
+    "frames_lost_by_layer",
 ];
 
 #[cfg(feature = "_reticulum-module")]
@@ -4777,15 +4777,17 @@ impl PyCall {
         })
     }
 
-    /// v45 — frames this node never got, per codec class
-    /// (`{class: count}`): gaps in the framed streams' `frame_seq`. Audio is
-    /// concealed by time and not counted.
-    fn frames_lost_by_class(
+    /// v45 — frames this node never got, per (codec class, layer)
+    /// (`{(class, (s, t, q)): count}`): gaps in the framed streams'
+    /// `frame_seq` on layers it was being sent. A `(0, 0, 0)` entry is a
+    /// freeze until the next keyframe. Audio is concealed by time and not
+    /// counted.
+    fn frames_lost_by_layer(
         &self,
         py: Python<'_>,
-    ) -> PyResult<std::collections::BTreeMap<u8, u64>> {
+    ) -> PyResult<std::collections::BTreeMap<(u8, (u8, u8, u8)), u64>> {
         self.with_call(py, |c| {
-            Box::pin(async move { Ok(c.frames_lost_by_class()) })
+            Box::pin(async move { Ok(c.frames_lost_by_layer()) })
         })
     }
 

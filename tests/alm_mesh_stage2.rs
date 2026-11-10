@@ -1463,7 +1463,7 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
         video_meta.windows(2).all(|w| w[0].1 <= w[1].1),
         "source timestamps in order"
     );
-    assert!(ca.frames_lost_by_class().is_empty(), "nothing lost yet");
+    assert!(ca.frames_lost_by_layer().is_empty(), "nothing lost yet");
 
     // Loss: every 7th chunk to A withheld.
     cb.withhold_from_for_test(&a.key.key_id, 7);
@@ -1490,14 +1490,20 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     })
     .await;
     let dropped = av(&a.metrics, "av_frame_incomplete");
-    let lost = ca.frames_lost_by_class();
-    assert_eq!(
-        lost.get(&CODEC_TEMPORAL_LAYERED).copied().unwrap_or(0),
-        dropped,
-        "each dropped video frame is a frame_seq gap: {lost:?}"
+    let lost = ca.frames_lost_by_layer();
+    let base = lost
+        .get(&(CODEC_TEMPORAL_LAYERED, (0, 0, 0)))
+        .copied()
+        .unwrap_or(0);
+    // Each dropped base frame is a frame_seq gap on layer (0,0,0); a gap
+    // that straddles a receive-view change (a parent's decision) is not
+    // booked, so the count is at most the drops, and some are.
+    assert!(
+        base > 0 && base <= dropped,
+        "dropped base frames show as frame_seq gaps: {lost:?}, dropped {dropped}"
     );
     assert!(
-        !lost.contains_key(&CODEC_OPAQUE),
+        lost.keys().all(|(class, _)| *class != CODEC_OPAQUE),
         "audio is never counted here"
     );
     assert!(dropped > 0, "a withheld fragment drops its frame, counted");

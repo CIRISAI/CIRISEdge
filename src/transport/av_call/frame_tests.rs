@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::transport::av_chunk_auth::{FRAMING_FRAGMENTS, FRAMING_NONE};
-use crate::transport::realtime_av::{ChunkSeq, CODEC_OPAQUE, CODEC_TEMPORAL_LAYERED};
+use crate::transport::realtime_av::{
+    ChunkSeq, CODEC_AV1_SVC, CODEC_OPAQUE, CODEC_TEMPORAL_LAYERED,
+};
 
 const S: StreamId = StreamId([5; 32]);
 
@@ -521,9 +523,96 @@ fn a_lost_video_frame_is_a_frame_seq_gap_and_audio_is_unaffected() {
         "audio carries no frame_seq"
     );
     assert_eq!(
-        rs.lost_by_class(),
-        [(CODEC_TEMPORAL_LAYERED, 1)].into_iter().collect(),
-        "one video frame lost, no audio"
+        rs.lost_by_layer(),
+        [((CODEC_TEMPORAL_LAYERED, (0, 0, 0)), 1)]
+            .into_iter()
+            .collect(),
+        "one base video frame lost, under layer (0,0,0); no audio"
+    );
+}
+
+/// The frame's video at `layer` with its marker `frame_seq`.
+fn video_frame(seq: &mut u64, epoch: u64, layer: ChunkLayer, k: u32) -> Vec<ReceivedFrame> {
+    let out: Vec<ReceivedFrame> = split(&frame_bytes(600, 4), 1_000, k)
+        .expect("fits")
+        .into_iter()
+        .map(|p| chunk(epoch, *seq, CODEC_AV1_SVC, layer, p))
+        .collect();
+    *seq += u64::try_from(out.len()).unwrap();
+    out
+}
+
+fn push_all(rs: &mut Reassemblers, frames: Vec<ReceivedFrame>) {
+    for c in frames {
+        assert!(rs.push(c, FRAMING_FRAGMENTS).refused.is_empty());
+    }
+}
+
+/// `frame_seq` runs per (stream, class, layer) for the stream's life, so an
+/// SVC stream capped to its base (layer 1 never sent) books no loss, and a
+/// cap that lifts mid-stream (a new receive view) books none for the frames
+/// it was not sent; a lost base frame is counted under (0,0,0).
+#[test]
+fn layers_a_receiver_is_not_sent_are_no_loss_and_a_lost_base_frame_is() {
+    let mut rs = Reassemblers::default();
+    let mut seq = 0;
+    // Capped to base: layer-0 frames 0..4 only (the publisher counted
+    // layer 1 too, on its own counter).
+    for k in 0..4 {
+        let f = video_frame(&mut seq, 1, L0, k);
+        push_all(&mut rs, f);
+    }
+    assert!(rs.lost_by_layer().is_empty(), "base-only: no false loss");
+    // Layer 1 admitted (view 1): its frames 10, 11 (it was not sent 0..9).
+    rs.set_view(1);
+    for k in [10, 11] {
+        let f = video_frame(&mut seq, 1, L1, k);
+        push_all(&mut rs, f);
+    }
+    // Capped again (view 2), then lifted (view 3): layer-1 frame 20 next.
+    rs.set_view(3);
+    let f = video_frame(&mut seq, 1, L1, 20);
+    push_all(&mut rs, f);
+    assert!(
+        rs.lost_by_layer().is_empty(),
+        "frames of a layer this node was not being sent are no loss"
+    );
+    // Base frame 4 falls across the view change (not counted); within view
+    // 3, frame 6 is lost between 5 and 7.
+    let f = video_frame(&mut seq, 1, L0, 5);
+    push_all(&mut rs, f);
+    let f = video_frame(&mut seq, 1, L0, 7);
+    push_all(&mut rs, f);
+    assert_eq!(
+        rs.lost_by_layer(),
+        [((CODEC_AV1_SVC, (0, 0, 0)), 1)].into_iter().collect(),
+        "base frame 6 lost"
+    );
+}
+
+/// `frame_seq` does not restart at an epoch roll (chunk_seq does): frames 0,
+/// 1 in epoch 1 and 2, 3 in epoch 2 are no gap; frame 5 in epoch 3 after 3
+/// is one frame lost across the roll.
+#[test]
+fn frame_seq_carries_across_an_epoch_roll_with_no_false_gap() {
+    let mut rs = Reassemblers::default();
+    let mut frames = Vec::new();
+    for (epoch, k, start) in [(1, 0, 0), (1, 1, 1), (2, 2, 0), (2, 3, 1)] {
+        let mut seq = start;
+        for c in video_frame(&mut seq, epoch, L0, k) {
+            frames.extend(rs.push(c, FRAMING_FRAGMENTS).frame);
+        }
+    }
+    assert_eq!(frames.len(), 4);
+    assert!(rs.lost_by_layer().is_empty(), "the roll is no gap");
+    let mut seq = 0;
+    for c in video_frame(&mut seq, 3, L0, 5) {
+        let _ = rs.push(c, FRAMING_FRAGMENTS);
+    }
+    assert_eq!(
+        rs.lost_by_layer(),
+        [((CODEC_AV1_SVC, (0, 0, 0)), 1)].into_iter().collect(),
+        "frame 4, lost across the roll, is counted"
     );
 }
 

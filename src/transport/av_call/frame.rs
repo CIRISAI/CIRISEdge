@@ -10,9 +10,11 @@
 //! `codec_id` is not `0xFF` starts its plaintext with the marker
 //! `frag_index u16_be ‖ frag_count u16_be ‖ frame_seq u32_be` (a whole frame
 //! is `0 ‖ 1 ‖ k`, so the layout never depends on size). `frame_seq` counts
-//! the stream's frames per codec class from 0 (Eric 2026-11-10): one stream
-//! shares one `chunk_seq` across audio and video, so only it tells a lost
-//! video frame from lost audio. Audio (`0xFF`) chunks never carry it. A
+//! the stream's frames per (codec class, layer) from 0 for the stream's whole
+//! life, across epoch rolls (Eric 2026-11-10): one stream shares one
+//! `chunk_seq` across audio and video and restarts it each epoch, so only
+//! `frame_seq` tells a lost video frame (of a layer the receiver was being
+//! sent) from lost audio or a layer it was never sent. Audio (`0xFF`) chunks never carry it. A
 //! receiver picks the layout from the signed `codec_id` (verified with the
 //! trailer before the inner seal opens), never from length.
 //!
@@ -336,11 +338,18 @@ pub struct Reassemblers {
     /// may come before layer 0's last, so a per-stream slot would drop the
     /// base layer (CC rc18).
     slots: std::collections::HashMap<(StreamId, ChunkLayer), Reassembler>,
-    /// The newest `frame_seq` handed out per (stream, codec class).
-    last_frame: std::collections::HashMap<(StreamId, u8), u32>,
-    /// Frames never handed out, per codec class: gaps in `frame_seq`
-    /// (Eric 2026-11-10: a lost video frame, told from lost audio).
-    lost_by_class: std::collections::BTreeMap<u8, u64>,
+    /// The newest `frame_seq` handed out per (stream, codec class, layer),
+    /// with the receive view it came in.
+    last_frame: std::collections::HashMap<(StreamId, u8, ChunkLayer), (u32, u64)>,
+    /// Frames never handed out, per (codec class, layer): gaps in
+    /// `frame_seq` (Eric 2026-11-10). A base-layer gap is the one that means
+    /// "freeze until the next keyframe".
+    lost: std::collections::BTreeMap<(u8, (u8, u8, u8)), u64>,
+    /// The receive view: bumped by the call whenever what this node is sent
+    /// may change (its own layer request, a parent's shed or decision). A
+    /// gap is counted only between two frames of one view: a layer this node
+    /// was not being sent for a while is no loss.
+    view: u64,
 }
 
 /// The most (stream, layer) slots one stream holds at once: past it, the
@@ -406,34 +415,46 @@ impl Reassemblers {
         out
     }
 
-    /// A frame handed out: a gap since the class's last one is that many
-    /// frames lost. The first frame a receiver sees starts its count (a
-    /// joiner's missed prefix is no loss); an older one changes nothing.
+    /// The call's receive view now (see the field).
+    pub fn set_view(&mut self, view: u64) {
+        self.view = view;
+    }
+
+    /// A frame handed out: a gap since its (stream, class, layer)'s last one
+    /// is that many frames of that layer lost, counted only when both ends
+    /// of the gap came in one receive view. The first frame of a layer (a
+    /// joiner's missed prefix, a layer newly admitted) starts its count; an
+    /// older one changes nothing. `frame_seq` runs for the stream's life, so
+    /// an epoch roll is no gap.
     fn note_frame_seq(&mut self, f: &ReceivedFrame) {
         let Some(k) = f.frame_seq else {
             return;
         };
-        let key = (f.stream, f.codec_id);
+        let key = (f.stream, f.codec_id, f.layer);
+        let view = self.view;
         match self.last_frame.get(&key).copied() {
-            None => {
-                self.last_frame.insert(key, k);
-            }
-            Some(last) => {
+            Some((last, v)) => {
                 let d = k.wrapping_sub(last);
-                if d != 0 && d < 0x8000_0000 {
-                    if d > 1 {
-                        *self.lost_by_class.entry(f.codec_id).or_insert(0) += u64::from(d - 1);
-                    }
-                    self.last_frame.insert(key, k);
+                if d == 0 || d >= 0x8000_0000 {
+                    return;
                 }
+                if d > 1 && v == view {
+                    let layer = (f.layer.spatial, f.layer.temporal, f.layer.quality);
+                    *self.lost.entry((f.codec_id, layer)).or_insert(0) += u64::from(d - 1);
+                }
+                self.last_frame.insert(key, (k, view));
+            }
+            None => {
+                self.last_frame.insert(key, (k, view));
             }
         }
     }
 
-    /// Frames lost per codec class so far (gaps in `frame_seq`).
+    /// Frames lost so far per (codec class, layer `(s, t, q)`): gaps in
+    /// `frame_seq` on layers this node was being sent.
     #[must_use]
-    pub fn lost_by_class(&self) -> std::collections::BTreeMap<u8, u64> {
-        self.lost_by_class.clone()
+    pub fn lost_by_layer(&self) -> std::collections::BTreeMap<(u8, (u8, u8, u8)), u64> {
+        self.lost.clone()
     }
 
     /// Keep a new slot within [`MAX_LAYER_SLOTS_PER_STREAM`] for `stream`:
@@ -503,7 +524,7 @@ impl Reassemblers {
     /// Forget `stream` (it ended or was replaced); its open frames are
     /// dropped incomplete.
     pub fn forget(&mut self, stream: StreamId) -> Vec<FrameRefusal> {
-        self.last_frame.retain(|(s, _), _| *s != stream);
+        self.last_frame.retain(|(s, _, _), _| *s != stream);
         let keys: Vec<(StreamId, ChunkLayer)> = self
             .slots
             .keys()

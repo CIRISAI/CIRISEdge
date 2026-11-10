@@ -1669,11 +1669,17 @@ struct Shared {
     /// v45 — a `replace_stream` waiting for its bindings' delivery.
     pending_replace: StdMutex<Option<PendingReplace>>,
     /// v45 (Eric 2026-11-10) — the next `frame_seq` per (own stream, codec
-    /// class) of a framed stream, from 0; taken only once a frame sealed.
-    frame_seqs: StdMutex<HashMap<(StreamId, u8), u32>>,
+    /// class, layer) of a framed stream, from 0 for the stream's life (an
+    /// epoch roll does not restart it; a replacement is a new stream, from
+    /// 0); taken only once a frame sealed.
+    frame_seqs: StdMutex<HashMap<(StreamId, u8, ChunkLayer), u32>>,
     /// v45 — frames lost per codec class at this receiver (gaps in
     /// `frame_seq`), as the reorder loop's reassembly last counted them.
-    frames_lost: Arc<StdMutex<BTreeMap<u8, u64>>>,
+    frames_lost: Arc<StdMutex<BTreeMap<(u8, (u8, u8, u8)), u64>>>,
+    /// v45 — the receive view: bumped whenever what this node is sent may
+    /// change (its own layer request, a parent's shed or decision), so a
+    /// layer it was not being sent for a while is never booked as lost.
+    layer_view: AtomicU64,
     /// v45 — the camera (primary) stream ended while a share went on
     /// (`Call::end_stream_as`): it takes no more frames, and its bindings
     /// are no longer announced.
@@ -2137,6 +2143,7 @@ impl Call {
             pending_replace: StdMutex::new(None),
             frame_seqs: StdMutex::new(HashMap::new()),
             frames_lost: Arc::new(StdMutex::new(BTreeMap::new())),
+            layer_view: AtomicU64::new(0),
             primary_ended: AtomicBool::new(false),
             shares: Mutex::new(BTreeMap::new()),
             registrar: share_registrar,
@@ -2396,6 +2403,7 @@ impl Call {
     /// audio-only cap (it would go below the base cell, CC 5.3.3.2.4).
     /// Returns whether a SUBSCRIBE went out now.
     pub async fn request_layers(&self, stream: StreamId, cap: Option<ReceiverLayerPolicy>) -> bool {
+        self.shared.layer_view.fetch_add(1, Ordering::AcqRel);
         let out = Shared::lock(&self.shared.alm).request_layers(stream, cap);
         let sent = !out.is_empty();
         send_alm(&self.shared, out).await;
@@ -2460,7 +2468,7 @@ impl Call {
             let k = Shared::lock(&self.shared.own_key);
             (k.stream, k.framing)
         };
-        let fseq = next_frame_seq(&self.shared, stream, frame.codec_id);
+        let fseq = next_frame_seq(&self.shared, stream, &frame);
         let pieces = frame_pieces(&frame, framing, budget, fseq)?;
         // The source signature, under this epoch's chunk key (swapped only
         // under this same lock, at the roll).
@@ -2642,11 +2650,13 @@ impl Call {
         Shared::lock(&self.shared.state).clone()
     }
 
-    /// v45 (Eric 2026-11-10) — frames this node never handed out, per codec
-    /// class (`0x01`, `0x04`, ...): gaps in the framed streams' `frame_seq`.
-    /// Audio (`0xFF`) is concealed by time and never counted here.
+    /// v45 (Eric 2026-11-10) — frames this node never handed out, per (codec
+    /// class, layer `(s, t, q)`): gaps in the framed streams' `frame_seq` on
+    /// layers this node was being sent at both ends of the gap. A base-layer
+    /// entry (`(0, 0, 0)`) is a freeze until the next keyframe. Audio (`0xFF`)
+    /// is concealed by time and never counted here.
     #[must_use]
-    pub fn frames_lost_by_class(&self) -> BTreeMap<u8, u64> {
+    pub fn frames_lost_by_layer(&self) -> BTreeMap<(u8, (u8, u8, u8)), u64> {
         Shared::lock(&self.shared.frames_lost).clone()
     }
 
@@ -2786,7 +2796,7 @@ impl Call {
                     });
                 }
             }
-            let fseq = next_frame_seq(&self.shared, stream, frame.codec_id);
+            let fseq = next_frame_seq(&self.shared, stream, &frame);
             let pieces = frame_pieces(&frame, share.key.framing, budget, fseq)?;
             let sealed = seal_pieces(&mut share.publisher, &share.key.signer, &frame, &pieces)?;
             took_frame_seq(&self.shared, stream, &frame, share.key.framing, fseq);
@@ -3307,11 +3317,11 @@ async fn roll_share(
     Ok(keep)
 }
 
-/// v45 — the `frame_seq` the next framed frame of `stream`'s codec class
-/// takes (from 0). The caller holds the lock that seals the stream.
-fn next_frame_seq(shared: &Shared, stream: StreamId, codec_id: u8) -> u32 {
+/// v45 — the `frame_seq` the next framed frame of `stream`'s (codec class,
+/// layer) takes (from 0). The caller holds the lock that seals the stream.
+fn next_frame_seq(shared: &Shared, stream: StreamId, frame: &Frame) -> u32 {
     Shared::lock(&shared.frame_seqs)
-        .get(&(stream, codec_id))
+        .get(&(stream, frame.codec_id, frame.layer))
         .copied()
         .unwrap_or(0)
 }
@@ -3322,7 +3332,8 @@ fn took_frame_seq(shared: &Shared, stream: StreamId, frame: &Frame, framing: u8,
     if framing == crate::transport::av_chunk_auth::FRAMING_FRAGMENTS
         && frame.codec_id != crate::transport::realtime_av::CODEC_OPAQUE
     {
-        Shared::lock(&shared.frame_seqs).insert((stream, frame.codec_id), fseq.wrapping_add(1));
+        Shared::lock(&shared.frame_seqs)
+            .insert((stream, frame.codec_id, frame.layer), fseq.wrapping_add(1));
     }
 }
 
@@ -4165,7 +4176,18 @@ async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: b
                     first && a.sends_binding_v2_to(peer),
                 )
             }
-            Ok(WireFrame::Control(cf)) => (a.on_control(peer, cf, rtt), None, false, false, false),
+            Ok(WireFrame::Control(cf)) => {
+                // What this node is sent may change: a new receive view, so a
+                // layer it stops (or starts) being sent is never a loss.
+                if matches!(
+                    cf.msg,
+                    crate::transport::realtime_av_alm::controller::ControlMsg::Shed { .. }
+                        | crate::transport::realtime_av_alm::controller::ControlMsg::Decision(_)
+                ) {
+                    shared.layer_view.fetch_add(1, Ordering::AcqRel);
+                }
+                (a.on_control(peer, cf, rtt), None, false, false, false)
+            }
             Err(e) => {
                 a.note_malformed(e);
                 (Vec::new(), None, false, false, false)
@@ -4833,6 +4855,7 @@ async fn reorder_loop(
             dropped += 1;
             shared.count(frame::FrameRefusal::FramingUnknown.token());
         }
+        frames_of.set_view(shared.layer_view.load(Ordering::Acquire));
         for (f, framing) in ready {
             let out = frames_of.push(f, framing);
             for r in out.refused {
@@ -4850,7 +4873,7 @@ async fn reorder_loop(
             c.frames_dropped = before + dropped;
             c.frames_open = u64::try_from(frames_of.open()).unwrap_or(u64::MAX);
             drop(c);
-            *Shared::lock(&shared.frames_lost) = frames_of.lost_by_class();
+            *Shared::lock(&shared.frames_lost) = frames_of.lost_by_layer();
         }
         for f in whole {
             if frames.send(f).await.is_err() {
