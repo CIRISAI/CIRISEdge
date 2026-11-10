@@ -9642,6 +9642,7 @@ fn assemble_tier_meta_v3(
 const PY_CODEC_AV1_SVC: u8 = crate::transport::realtime_av::CODEC_AV1_SVC;
 const PY_CODEC_JPEG_XS: u8 = crate::transport::realtime_av::CODEC_JPEG_XS;
 const PY_CODEC_MDC: u8 = crate::transport::realtime_av::CODEC_MDC;
+const PY_CODEC_TEMPORAL_LAYERED: u8 = crate::transport::realtime_av::CODEC_TEMPORAL_LAYERED;
 const PY_CODEC_OPAQUE: u8 = crate::transport::realtime_av::CODEC_OPAQUE;
 /// CIRISEdge#129 — MLS X-Wing ciphersuite code point. Mirrors
 /// `MlsSession::ciphersuite_id()`. Exposed as a constant so
@@ -11398,6 +11399,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CODEC_AV1_SVC", PY_CODEC_AV1_SVC)?;
     m.add("CODEC_JPEG_XS", PY_CODEC_JPEG_XS)?;
     m.add("CODEC_MDC", PY_CODEC_MDC)?;
+    m.add("CODEC_TEMPORAL_LAYERED", PY_CODEC_TEMPORAL_LAYERED)?;
     m.add("CODEC_OPAQUE", PY_CODEC_OPAQUE)?;
     // MLS ciphersuite code point (CIRISEdge#129) — used by
     // CIRISConformance to attest that the cohabiting wheel's MLS
@@ -11798,6 +11800,10 @@ mod tests {
         assert_eq!(PY_CODEC_AV1_SVC, realtime_av::CODEC_AV1_SVC);
         assert_eq!(PY_CODEC_JPEG_XS, realtime_av::CODEC_JPEG_XS);
         assert_eq!(PY_CODEC_MDC, realtime_av::CODEC_MDC);
+        assert_eq!(
+            PY_CODEC_TEMPORAL_LAYERED,
+            realtime_av::CODEC_TEMPORAL_LAYERED
+        );
         assert_eq!(PY_CODEC_OPAQUE, realtime_av::CODEC_OPAQUE);
     }
 

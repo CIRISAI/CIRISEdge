@@ -188,6 +188,16 @@ pub const CODEC_JPEG_XS: u8 = 0x02;
 /// HNDL fragment-loss-resilient research track.
 pub const CODEC_MDC: u8 = 0x03;
 
+/// Temporal-layered, one spatial layer (CC 5.3.3.2.1, rc17): H.264, VP8,
+/// VP9 and the like. The id carries the LAYER semantics only, never the
+/// codec, which the stream's binding names. A chunk of this class is
+/// `ChunkLayer { 0, t, 0 }`: spatial and quality are always 0 (which
+/// [`seal_av_inner`] enforces), `t = 0` is the base and every higher `t` an
+/// enhancement, so prefix reconstruction stays monotonic and the base cell
+/// `(0, 0, 0)` is what a standby, a shed leg and the blinking dot carry, as
+/// for every other class.
+pub const CODEC_TEMPORAL_LAYERED: u8 = 0x04;
+
 /// Codec-opaque — v3.7.0 wire compatibility marker. A chunk with
 /// `codec_id == CODEC_OPAQUE` carries no scalable-coding semantics; its
 /// `layer` MUST be `ChunkLayer { 0, 0, 0 }` (CC 5.3.3.2.1), which
@@ -443,6 +453,10 @@ pub enum RealtimeAvError {
     /// CC 5.3.3.2.1 — an opaque chunk has no layers.
     #[error("CODEC_OPAQUE requires layer {{0,0,0}}, got {0:?}")]
     OpaqueWithLayer(ChunkLayer),
+    /// CC 5.3.3.2.1 — a temporal-layered chunk has one spatial layer and no
+    /// quality layers: `{0, t, 0}`.
+    #[error("CODEC_TEMPORAL_LAYERED requires layer {{0,t,0}}, got {0:?}")]
+    TemporalLayeredOffAxis(ChunkLayer),
     #[error("outer AEAD failed: {0:?}")]
     OuterAead(ciris_crypto::CryptoError),
     #[error("sealed wire too short: got {got} bytes, need at least {need}")]
@@ -596,9 +610,12 @@ pub fn seal_av_inner(
     codec_id: u8,
     layer: ChunkLayer,
 ) -> Result<InnerSealed, RealtimeAvError> {
-    // CC 5.3.3.2.1: `0xFF` has no layers.
+    // CC 5.3.3.2.1: `0xFF` has no layers; `0x04` has the temporal axis only.
     if codec_id == CODEC_OPAQUE && layer != ChunkLayer::BASE {
         return Err(RealtimeAvError::OpaqueWithLayer(layer));
+    }
+    if codec_id == CODEC_TEMPORAL_LAYERED && (layer.spatial != 0 || layer.quality != 0) {
+        return Err(RealtimeAvError::TemporalLayeredOffAxis(layer));
     }
     epoch_counter(chunk_seq)?;
     let inner_nonce = derive_inner_nonce(stream_id, epoch, chunk_seq);
@@ -1080,6 +1097,91 @@ mod tests {
         ));
         assert!(seal(CODEC_OPAQUE, ChunkLayer::BASE).is_ok());
         assert!(seal(CODEC_AV1_SVC, enhanced).is_ok());
+    }
+
+    /// CC 5.3.3.2.1 (rc17) — `0x04` is `{0, t, 0}`: a spatial or quality
+    /// layer is refused at the seal, every temporal layer seals, and `t = 0`
+    /// is the base cell every receiver's floor admits.
+    #[test]
+    fn a_temporal_layered_chunk_is_temporal_only() {
+        let seal = |layer| {
+            seal_av_inner(
+                b"frame",
+                &dummy_dek(),
+                dummy_stream(),
+                Epoch(1),
+                ChunkSeq(1),
+                CODEC_TEMPORAL_LAYERED,
+                layer,
+            )
+        };
+        for (s, q) in [(1u8, 0u8), (0, 1), (2, 3)] {
+            let off = ChunkLayer {
+                spatial: s,
+                temporal: 0,
+                quality: q,
+            };
+            assert!(
+                matches!(seal(off), Err(RealtimeAvError::TemporalLayeredOffAxis(l)) if l == off),
+                "{off:?}"
+            );
+        }
+        for t in 0..=3u8 {
+            let l = ChunkLayer {
+                spatial: 0,
+                temporal: t,
+                quality: 0,
+            };
+            assert!(seal(l).is_ok(), "{l:?}");
+            assert_eq!(ReceiverLayerPolicy::BLINKING_DOT.admits(l), t == 0, "{l:?}");
+        }
+    }
+
+    /// Every receiver opens `0xFF`, `0x01` and `0x04` chunks alike: the codec
+    /// byte and the layer are clear metadata a receiver reads, never a gate
+    /// on the open.
+    #[test]
+    fn every_registered_codec_class_opens() {
+        let transit = dummy_transit();
+        for (codec, layer) in [
+            (CODEC_OPAQUE, ChunkLayer::BASE),
+            (
+                CODEC_AV1_SVC,
+                ChunkLayer {
+                    spatial: 1,
+                    temporal: 2,
+                    quality: 1,
+                },
+            ),
+            (
+                CODEC_TEMPORAL_LAYERED,
+                ChunkLayer {
+                    spatial: 0,
+                    temporal: 2,
+                    quality: 0,
+                },
+            ),
+        ] {
+            let sealed = seal_av_chunk(
+                b"frame",
+                &transit,
+                b"link",
+                1,
+                &dummy_dek(),
+                dummy_stream(),
+                Epoch(1),
+                ChunkSeq(1),
+                codec,
+                layer,
+            )
+            .expect("seals");
+            let back = SealedAvChunk::from_bytes(&sealed.to_bytes()).expect("parses");
+            assert_eq!((back.codec_id, back.layer), (codec, layer));
+            assert_eq!(
+                open_av_chunk(&back, &transit, b"link", 1, &dummy_dek()).expect("opens"),
+                b"frame"
+            );
+        }
     }
 
     fn dummy_transit() -> [u8; 32] {

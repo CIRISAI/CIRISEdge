@@ -490,3 +490,21 @@ async fn a_call_s_addresses_are_never_its_room_s() {
         call_snap.destination_secret
     );
 }
+
+/// CC 5.3.3.2.1 (rc17) — for `0x04` (temporal-layered) `t = 0` is the base:
+/// what a standby child, a shed leg and a tier-2 own call carry, as `(0, 0,
+/// 0)` is for every layered class and every chunk is for codec-opaque.
+#[test]
+fn temporal_layer_zero_is_the_base_for_standby_and_shed() {
+    use crate::transport::realtime_av::{ChunkLayer, CODEC_TEMPORAL_LAYERED};
+    let t = |temporal| ChunkLayer {
+        spatial: 0,
+        temporal,
+        quality: 0,
+    };
+    assert!(is_base_or_audio(CODEC_TEMPORAL_LAYERED, t(0)));
+    for e in 1..=3 {
+        assert!(!is_base_or_audio(CODEC_TEMPORAL_LAYERED, t(e)), "t={e}");
+    }
+    assert!(is_base_or_audio(CODEC_OPAQUE, ChunkLayer::BASE));
+}
