@@ -1298,9 +1298,10 @@ fn an_old_leave_replayed_after_a_rejoin_does_nothing_to_the_new_stream() {
 /// [`kat_vectors_are_deterministic`] (stream, epoch 5, chunk key seed `0c`,
 /// DEK `42`, source 1790000000000 ms), codec `0x04`, layer (0,0,0).
 /// Vector 1: a whole frame `kat-frame` in one framed chunk, chunk_seq 0, its
-/// plaintext the marker `00000001` ‖ the frame. Vector 2: the 30-byte frame
-/// `kat-frag-frame-012345678901234` at a 14-byte budget, three fragments
-/// (chunk_seq 1, 2, 3; markers `00000003`, `00010003`, `00020003`), each a
+/// plaintext the marker `0000 0001 00000000` (frame_seq 0) ‖ the frame.
+/// Vector 2: the 30-byte frame `kat-frag-frame-012345678901234` at an
+/// 18-byte budget, three fragments (chunk_seq 1, 2, 3; markers `0000 0003`,
+/// `0001 0003`, `0002 0003`, each `‖ 00000001`, frame_seq 1), each a
 /// whole sealed, signed chunk. Each value is the chunk's inner ciphertext ‖
 /// trailer, hex. All four verify under the bound key, open, and reassemble
 /// to their frames.
@@ -1342,10 +1343,10 @@ async fn framed_chunk_kats_with_the_shipping_trailer() {
         .unwrap();
         key.sign_at(&inner, KAT_SOURCE_MS).unwrap()
     };
-    let one = split(b"kat-frame", 1_000).expect("fits");
+    let one = split(b"kat-frame", 1_000, 0).expect("fits");
     assert_eq!(one.len(), 1);
-    assert_eq!(&one[0][..4], &[0, 0, 0, 1]);
-    let three = split(b"kat-frag-frame-012345678901234", 14).expect("fits");
+    assert_eq!(&one[0][..8], &[0, 0, 0, 1, 0, 0, 0, 0]);
+    let three = split(b"kat-frag-frame-012345678901234", 18, 1).expect("fits");
     assert_eq!(three.len(), 3);
     let sealed: Vec<_> = std::iter::once((0u64, &one[0]))
         .chain((1u64..).zip(three.iter()))
@@ -1375,6 +1376,8 @@ async fn framed_chunk_kats_with_the_shipping_trailer() {
             codec_id: CODEC_TEMPORAL_LAYERED,
             layer: ChunkLayer::BASE,
             bytes: plain,
+            frame_seq: None,
+            source_ts_ms: 1_790_000_000_000,
         });
         assert!(out.refused.is_empty());
         frames.extend(out.frame.map(|f| f.bytes));

@@ -20,6 +20,8 @@ fn frame(stream: StreamId, epoch: u64, seq: u64) -> ReceivedFrame {
         codec_id: CODEC_OPAQUE,
         layer: ChunkLayer::BASE,
         bytes: format!("{epoch}:{seq}").into_bytes(),
+        frame_seq: None,
+        source_ts_ms: 0,
     }
 }
 

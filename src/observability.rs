@@ -1038,6 +1038,8 @@ pub const AV_FRAME_COUNT_MISMATCH: &str = "av_frame_count_mismatch";
 pub const AV_FRAME_LAYER_MISMATCH: &str = "av_frame_layer_mismatch";
 /// v45 — a fragment run that would cross the epoch.
 pub const AV_FRAME_CROSSES_EPOCH: &str = "av_frame_crosses_epoch";
+/// v45 — a fragment whose `frame_seq` differs from its frame's.
+pub const AV_FRAME_SEQ_MISMATCH: &str = "av_frame_seq_mismatch";
 /// v45 — a frame missing a fragment the reorder window gave up on: dropped
 /// whole, once.
 pub const AV_FRAME_INCOMPLETE: &str = "av_frame_incomplete";
@@ -2201,6 +2203,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_FRAME_COUNT_MISMATCH,
     AV_FRAME_LAYER_MISMATCH,
     AV_FRAME_CROSSES_EPOCH,
+    AV_FRAME_SEQ_MISMATCH,
     AV_FRAME_INCOMPLETE,
     AV_FRAME_TOO_LARGE,
     AV_FRAME_FRAMING_UNKNOWN,

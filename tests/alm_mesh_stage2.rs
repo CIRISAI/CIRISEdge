@@ -1396,10 +1396,20 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     let budget = cb.chunk_plaintext_budget().expect("a leg is up");
     let mut sent_video = Vec::new();
     let mut sent_audio = Vec::new();
+    let unix_ms = || {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis(),
+        )
+        .expect("ms")
+    };
+    let t0 = unix_ms();
     let key = cb.publish(video(0, 30_000)).await.expect("keyframe");
     assert_eq!(
         usize::from(key.fragments),
-        30_000usize.div_ceil(budget - 4),
+        30_000usize.div_ceil(budget - 8),
         "the keyframe is cut to the budget ({budget} B)"
     );
     sent_video.push(video(0, 30_000).bytes);
@@ -1412,14 +1422,19 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
         cb.publish(Frame::opaque(opus)).await.expect("audio");
         tokio::time::sleep(Duration::from_millis(33)).await;
     }
+    let t1 = unix_ms();
     let mut got_video = Vec::new();
     let mut got_audio = Vec::new();
+    let mut video_meta = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(20), async {
         while got_video.len() < sent_video.len() || got_audio.len() < sent_audio.len() {
             match frames.recv().await {
                 Some(f) if f.publisher == b.key.key_id => match f.codec_id {
                     CODEC_OPAQUE => got_audio.push(f.bytes),
-                    CODEC_TEMPORAL_LAYERED => got_video.push(f.bytes),
+                    CODEC_TEMPORAL_LAYERED => {
+                        video_meta.push((f.frame_seq, f.source_ts_ms));
+                        got_video.push(f.bytes);
+                    }
                     _ => {}
                 },
                 Some(_) => {}
@@ -1431,6 +1446,24 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     assert_eq!(got_video, sent_video, "every video frame whole, in order");
     assert_eq!(got_audio, sent_audio, "every audio frame as sent, unmarked");
     assert_eq!(av(&a.metrics, "av_frame_incomplete"), 0);
+    // Eric 2026-11-10: each video frame carries its class's frame_seq (0, 1,
+    // ... in order) and the publisher's signed source timestamp.
+    let seqs: Vec<Option<u32>> = video_meta.iter().map(|(s, _)| *s).collect();
+    let want: Vec<Option<u32>> = (0..u32::try_from(sent_video.len()).unwrap())
+        .map(Some)
+        .collect();
+    assert_eq!(seqs, want, "frame_seq counts the video frames from 0");
+    for (_, ts) in &video_meta {
+        assert!(
+            (t0..=t1).contains(ts),
+            "source_ts {ts} within the send window {t0}..={t1}"
+        );
+    }
+    assert!(
+        video_meta.windows(2).all(|w| w[0].1 <= w[1].1),
+        "source timestamps in order"
+    );
+    assert!(ca.frames_lost_by_class().is_empty(), "nothing lost yet");
 
     // Loss: every 7th chunk to A withheld.
     cb.withhold_from_for_test(&a.key.key_id, 7);
@@ -1457,6 +1490,16 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     })
     .await;
     let dropped = av(&a.metrics, "av_frame_incomplete");
+    let lost = ca.frames_lost_by_class();
+    assert_eq!(
+        lost.get(&CODEC_TEMPORAL_LAYERED).copied().unwrap_or(0),
+        dropped,
+        "each dropped video frame is a frame_seq gap: {lost:?}"
+    );
+    assert!(
+        !lost.contains_key(&CODEC_OPAQUE),
+        "audio is never counted here"
+    );
     assert!(dropped > 0, "a withheld fragment drops its frame, counted");
     let clean: Vec<Vec<u8>> = (200..203u64).map(|n| video(n, 3_000).bytes).collect();
     assert!(

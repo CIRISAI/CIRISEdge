@@ -235,8 +235,19 @@ pub struct ReceivedFrame {
     pub codec_id: u8,
     /// Its layer.
     pub layer: ChunkLayer,
-    /// The plaintext.
+    /// The plaintext (a framed stream's video: the whole reassembled frame,
+    /// the fragment markers removed).
     pub bytes: Vec<u8>,
+    /// v45 (Eric 2026-11-10) — on a framed stream, the frame's per-class
+    /// counter from its marker (`frame_seq`, from 0 per (stream, codec
+    /// class)): a gap is a lost frame of that class. `None` for audio and
+    /// for an unframed stream.
+    pub frame_seq: Option<u32>,
+    /// v45 — the publisher's source timestamp (UNIX ms) its chunk trailer
+    /// signs, verified with it: the lip-sync clock. A reassembled frame
+    /// carries its first fragment's, as it carries its first fragment's
+    /// `chunk_seq`.
+    pub source_ts_ms: u64,
 }
 
 /// What one publish did on one member's leg.
@@ -1657,6 +1668,12 @@ struct Shared {
     attendance: StdMutex<Attendance>,
     /// v45 — a `replace_stream` waiting for its bindings' delivery.
     pending_replace: StdMutex<Option<PendingReplace>>,
+    /// v45 (Eric 2026-11-10) — the next `frame_seq` per (own stream, codec
+    /// class) of a framed stream, from 0; taken only once a frame sealed.
+    frame_seqs: StdMutex<HashMap<(StreamId, u8), u32>>,
+    /// v45 — frames lost per codec class at this receiver (gaps in
+    /// `frame_seq`), as the reorder loop's reassembly last counted them.
+    frames_lost: Arc<StdMutex<BTreeMap<u8, u64>>>,
     /// v45 — the camera (primary) stream ended while a share went on
     /// (`Call::end_stream_as`): it takes no more frames, and its bindings
     /// are no longer announced.
@@ -2118,6 +2135,8 @@ impl Call {
             own_key: StdMutex::new(own_key),
             attendance: StdMutex::new(Attendance::default()),
             pending_replace: StdMutex::new(None),
+            frame_seqs: StdMutex::new(HashMap::new()),
+            frames_lost: Arc::new(StdMutex::new(BTreeMap::new())),
             primary_ended: AtomicBool::new(false),
             shares: Mutex::new(BTreeMap::new()),
             registrar: share_registrar,
@@ -2441,13 +2460,15 @@ impl Call {
             let k = Shared::lock(&self.shared.own_key);
             (k.stream, k.framing)
         };
-        let pieces = frame_pieces(&frame, framing, budget)?;
+        let fseq = next_frame_seq(&self.shared, stream, frame.codec_id);
+        let pieces = frame_pieces(&frame, framing, budget, fseq)?;
         // The source signature, under this epoch's chunk key (swapped only
         // under this same lock, at the roll).
         let sealed = {
             let k = Shared::lock(&self.shared.own_key);
             seal_pieces(&mut publisher, &k.signer, &frame, &pieces)?
         };
+        took_frame_seq(&self.shared, stream, &frame, framing, fseq);
         let epoch = publisher.epoch();
         let chunk_seq = sealed[0].0;
         let withhold = Shared::lock(&self.shared.test_withhold).clone();
@@ -2621,6 +2642,14 @@ impl Call {
         Shared::lock(&self.shared.state).clone()
     }
 
+    /// v45 (Eric 2026-11-10) — frames this node never handed out, per codec
+    /// class (`0x01`, `0x04`, ...): gaps in the framed streams' `frame_seq`.
+    /// Audio (`0xFF`) is concealed by time and never counted here.
+    #[must_use]
+    pub fn frames_lost_by_class(&self) -> BTreeMap<u8, u64> {
+        Shared::lock(&self.shared.frames_lost).clone()
+    }
+
     /// The reorder window's counters so far.
     #[must_use]
     pub fn reorder_counts(&self) -> ReorderCounts {
@@ -2757,8 +2786,10 @@ impl Call {
                     });
                 }
             }
-            let pieces = frame_pieces(&frame, share.key.framing, budget)?;
+            let fseq = next_frame_seq(&self.shared, stream, frame.codec_id);
+            let pieces = frame_pieces(&frame, share.key.framing, budget, fseq)?;
             let sealed = seal_pieces(&mut share.publisher, &share.key.signer, &frame, &pieces)?;
+            took_frame_seq(&self.shared, stream, &frame, share.key.framing, fseq);
             (pieces, sealed, share.publisher.epoch())
         };
         let chunk_seq = sealed[0].0;
@@ -3276,11 +3307,35 @@ async fn roll_share(
     Ok(keep)
 }
 
+/// v45 — the `frame_seq` the next framed frame of `stream`'s codec class
+/// takes (from 0). The caller holds the lock that seals the stream.
+fn next_frame_seq(shared: &Shared, stream: StreamId, codec_id: u8) -> u32 {
+    Shared::lock(&shared.frame_seqs)
+        .get(&(stream, codec_id))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// v45 — a framed frame sealed with `fseq`: the class's next is one more
+/// (audio and unframed frames carry none).
+fn took_frame_seq(shared: &Shared, stream: StreamId, frame: &Frame, framing: u8, fseq: u32) {
+    if framing == crate::transport::av_chunk_auth::FRAMING_FRAGMENTS
+        && frame.codec_id != crate::transport::realtime_av::CODEC_OPAQUE
+    {
+        Shared::lock(&shared.frame_seqs).insert((stream, frame.codec_id), fseq.wrapping_add(1));
+    }
+}
+
 /// v45 — the plaintexts `frame` is sealed as: itself, on an unframed
 /// stream or for audio (`0xFF`), within `budget`; otherwise its marked
 /// fragments ([`frame::split`]) of at most `budget` bytes each. Refused
 /// before anything is sealed when it does not fit.
-fn frame_pieces(frame: &Frame, framing: u8, budget: usize) -> Result<Vec<Vec<u8>>, CallError> {
+fn frame_pieces(
+    frame: &Frame,
+    framing: u8,
+    budget: usize,
+    frame_seq: u32,
+) -> Result<Vec<Vec<u8>>, CallError> {
     let framed = framing == crate::transport::av_chunk_auth::FRAMING_FRAGMENTS
         && frame.codec_id != crate::transport::realtime_av::CODEC_OPAQUE;
     if !framed {
@@ -3292,7 +3347,7 @@ fn frame_pieces(frame: &Frame, framing: u8, budget: usize) -> Result<Vec<Vec<u8>
         }
         return Ok(vec![frame.bytes.clone()]);
     }
-    frame::split(&frame.bytes, budget).ok_or(CallError::FrameTooLarge {
+    frame::split(&frame.bytes, budget, frame_seq).ok_or(CallError::FrameTooLarge {
         bytes: frame.bytes.len(),
         budget: frame::max_frame_len(budget),
     })
@@ -4356,6 +4411,8 @@ async fn pump(
                 codec_id: inner.codec_id(),
                 layer: inner.layer(),
                 bytes,
+                frame_seq: None,
+                source_ts_ms: source_ms,
             },
             at,
         };
@@ -4792,6 +4849,8 @@ async fn reorder_loop(
             *c = window.counts();
             c.frames_dropped = before + dropped;
             c.frames_open = u64::try_from(frames_of.open()).unwrap_or(u64::MAX);
+            drop(c);
+            *Shared::lock(&shared.frames_lost) = frames_of.lost_by_class();
         }
         for f in whole {
             if frames.send(f).await.is_err() {

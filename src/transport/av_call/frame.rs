@@ -8,8 +8,11 @@
 //!
 //! On a stream whose v2 binding signs `framing = 1`, every chunk whose
 //! `codec_id` is not `0xFF` starts its plaintext with the marker
-//! `frag_index u16_be ‖ frag_count u16_be` (a whole frame is `0 ‖ 1`, so the
-//! layout never depends on size). Audio (`0xFF`) chunks never carry it. A
+//! `frag_index u16_be ‖ frag_count u16_be ‖ frame_seq u32_be` (a whole frame
+//! is `0 ‖ 1 ‖ k`, so the layout never depends on size). `frame_seq` counts
+//! the stream's frames per codec class from 0 (Eric 2026-11-10): one stream
+//! shares one `chunk_seq` across audio and video, so only it tells a lost
+//! video frame from lost audio. Audio (`0xFF`) chunks never carry it. A
 //! receiver picks the layout from the signed `codec_id` (verified with the
 //! trailer before the inner seal opens), never from length.
 //!
@@ -25,8 +28,9 @@
 
 use super::{ChunkLayer, Epoch, ReceivedFrame, StreamId};
 
-/// The marker's length: `frag_index u16_be ‖ frag_count u16_be`.
-pub const FRAGMENT_MARKER_LEN: usize = 4;
+/// The marker's length: `frag_index u16_be ‖ frag_count u16_be ‖ frame_seq
+/// u32_be`.
+pub const FRAGMENT_MARKER_LEN: usize = 8;
 
 /// The most fragments one frame takes (CC reading, rc18: `frag_count` ≤
 /// 4096, still a `u16`). A frame needing more is refused before anything is
@@ -38,12 +42,14 @@ pub const MAX_FRAME_FRAGMENTS: usize = 4096;
 /// desktop keyframe fits at every MTU.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
 
-/// The marker for fragment `index` of `count`.
+/// The marker for fragment `index` of `count` of the class's frame
+/// `frame_seq`.
 #[must_use]
-pub fn marker(index: u16, count: u16) -> [u8; FRAGMENT_MARKER_LEN] {
+pub fn marker(index: u16, count: u16, frame_seq: u32) -> [u8; FRAGMENT_MARKER_LEN] {
     let i = index.to_be_bytes();
     let c = count.to_be_bytes();
-    [i[0], i[1], c[0], c[1]]
+    let f = frame_seq.to_be_bytes();
+    [i[0], i[1], c[0], c[1], f[0], f[1], f[2], f[3]]
 }
 
 /// Split `frame` into marked fragment plaintexts of at most `budget` bytes
@@ -52,7 +58,7 @@ pub fn marker(index: u16, count: u16) -> [u8; FRAGMENT_MARKER_LEN] {
 /// [`MAX_FRAME_BYTES`], or it needs more than [`MAX_FRAME_FRAGMENTS`]. An
 /// empty frame is one fragment.
 #[must_use]
-pub fn split(frame: &[u8], budget: usize) -> Option<Vec<Vec<u8>>> {
+pub fn split(frame: &[u8], budget: usize, frame_seq: u32) -> Option<Vec<Vec<u8>>> {
     if frame.len() > MAX_FRAME_BYTES {
         return None;
     }
@@ -67,7 +73,7 @@ pub fn split(frame: &[u8], budget: usize) -> Option<Vec<Vec<u8>>> {
         let lo = i * per;
         let hi = (lo + per).min(frame.len());
         let mut p = Vec::with_capacity(FRAGMENT_MARKER_LEN + hi - lo);
-        p.extend_from_slice(&marker(u16::try_from(i).ok()?, count16));
+        p.extend_from_slice(&marker(u16::try_from(i).ok()?, count16, frame_seq));
         p.extend_from_slice(&frame[lo..hi]);
         out.push(p);
     }
@@ -99,6 +105,8 @@ pub enum FrameRefusal {
     /// A fragment's epoch differs from its frame's: the run would cross the
     /// epoch.
     CrossesEpoch,
+    /// A fragment's `frame_seq` differs from its frame's.
+    FrameSeqMismatch,
     /// A frame missing a fragment the reorder window gave up on: dropped
     /// whole (counted once per frame).
     Incomplete,
@@ -124,6 +132,7 @@ impl FrameRefusal {
             Self::CountMismatch => o::AV_FRAME_COUNT_MISMATCH,
             Self::LayerMismatch => o::AV_FRAME_LAYER_MISMATCH,
             Self::CrossesEpoch => o::AV_FRAME_CROSSES_EPOCH,
+            Self::FrameSeqMismatch => o::AV_FRAME_SEQ_MISMATCH,
             Self::Incomplete => o::AV_FRAME_INCOMPLETE,
             Self::TooLarge => o::AV_FRAME_TOO_LARGE,
             Self::FramingUnknown => o::AV_FRAME_FRAMING_UNKNOWN,
@@ -131,13 +140,14 @@ impl FrameRefusal {
     }
 
     /// Every token, for the metric registry.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::MarkerShort,
         Self::CountInvalid,
         Self::IndexInvalid,
         Self::CountMismatch,
         Self::LayerMismatch,
         Self::CrossesEpoch,
+        Self::FrameSeqMismatch,
         Self::Incomplete,
         Self::TooLarge,
         Self::FramingUnknown,
@@ -148,6 +158,7 @@ impl FrameRefusal {
 struct Partial {
     epoch: Epoch,
     first_seq: u64,
+    frame_seq: u32,
     count: u16,
     next: u16,
     codec_id: u8,
@@ -181,7 +192,7 @@ impl Reassembler {
     /// caller passes audio through).
     pub fn push(&mut self, chunk: ReceivedFrame) -> Reassembled {
         let mut out = Reassembled::default();
-        let Some((index, count)) = parse(&chunk.bytes) else {
+        let Some((index, count, frame_seq)) = parse(&chunk.bytes) else {
             self.abandon(&mut out);
             out.refused.push(FrameRefusal::MarkerShort);
             return out;
@@ -224,6 +235,11 @@ impl Reassembler {
                 out.refused.push(FrameRefusal::CountMismatch);
                 self.orphan = frame_start.map(|f| (chunk.epoch, f));
                 return out;
+            } else if frame_seq != p.frame_seq {
+                self.partial = None;
+                out.refused.push(FrameRefusal::FrameSeqMismatch);
+                self.orphan = frame_start.map(|f| (chunk.epoch, f));
+                return out;
             } else if chunk.codec_id != p.codec_id || chunk.layer != p.layer {
                 self.partial = None;
                 out.refused.push(FrameRefusal::LayerMismatch);
@@ -237,6 +253,7 @@ impl Reassembler {
             if count == 1 {
                 out.frame = Some(ReceivedFrame {
                     bytes: payload,
+                    frame_seq: Some(frame_seq),
                     ..chunk
                 });
                 return out;
@@ -244,6 +261,7 @@ impl Reassembler {
             self.partial = Some(Partial {
                 epoch: chunk.epoch,
                 first_seq: seq,
+                frame_seq,
                 count,
                 next: 1,
                 codec_id: chunk.codec_id,
@@ -269,8 +287,11 @@ impl Reassembler {
         p.next += 1;
         if p.next == p.count {
             let p = self.partial.take().expect("open");
+            // The frame is its first fragment's: its `chunk_seq`, epoch,
+            // layer and signed source timestamp.
             out.frame = Some(ReceivedFrame {
                 bytes: p.bytes,
+                frame_seq: Some(p.frame_seq),
                 ..p.head
             });
         }
@@ -295,13 +316,15 @@ impl Reassembler {
     }
 }
 
-/// The marker of a framed chunk's plaintext: `(frag_index, frag_count)`.
+/// The marker of a framed chunk's plaintext: `(frag_index, frag_count,
+/// frame_seq)`.
 #[must_use]
-pub fn parse(plaintext: &[u8]) -> Option<(u16, u16)> {
+pub fn parse(plaintext: &[u8]) -> Option<(u16, u16, u32)> {
     let m = plaintext.get(..FRAGMENT_MARKER_LEN)?;
     Some((
         u16::from_be_bytes([m[0], m[1]]),
         u16::from_be_bytes([m[2], m[3]]),
+        u32::from_be_bytes([m[4], m[5], m[6], m[7]]),
     ))
 }
 
@@ -313,6 +336,11 @@ pub struct Reassemblers {
     /// may come before layer 0's last, so a per-stream slot would drop the
     /// base layer (CC rc18).
     slots: std::collections::HashMap<(StreamId, ChunkLayer), Reassembler>,
+    /// The newest `frame_seq` handed out per (stream, codec class).
+    last_frame: std::collections::HashMap<(StreamId, u8), u32>,
+    /// Frames never handed out, per codec class: gaps in `frame_seq`
+    /// (Eric 2026-11-10: a lost video frame, told from lost audio).
+    lost_by_class: std::collections::BTreeMap<u8, u64>,
 }
 
 /// The most (stream, layer) slots one stream holds at once: past it, the
@@ -337,7 +365,7 @@ impl Reassemblers {
         let mut early = Vec::new();
         // A later fragment that continues another layer's open frame of the
         // same stream: the frame changed layer mid-run.
-        if let Some((index, _)) = parse(&chunk.bytes).filter(|(i, _)| *i > 0) {
+        if let Some((index, _, _)) = parse(&chunk.bytes).filter(|(i, _, _)| *i > 0) {
             let seq = chunk.chunk_seq.0;
             let own_open = self.slots.get(&key).is_some_and(|r| r.partial.is_some());
             if !own_open {
@@ -372,7 +400,40 @@ impl Reassemblers {
         let mut out = self.slots.entry(key).or_default().push(chunk);
         early.append(&mut out.refused);
         out.refused = early;
+        if let Some(f) = &out.frame {
+            self.note_frame_seq(f);
+        }
         out
+    }
+
+    /// A frame handed out: a gap since the class's last one is that many
+    /// frames lost. The first frame a receiver sees starts its count (a
+    /// joiner's missed prefix is no loss); an older one changes nothing.
+    fn note_frame_seq(&mut self, f: &ReceivedFrame) {
+        let Some(k) = f.frame_seq else {
+            return;
+        };
+        let key = (f.stream, f.codec_id);
+        match self.last_frame.get(&key).copied() {
+            None => {
+                self.last_frame.insert(key, k);
+            }
+            Some(last) => {
+                let d = k.wrapping_sub(last);
+                if d != 0 && d < 0x8000_0000 {
+                    if d > 1 {
+                        *self.lost_by_class.entry(f.codec_id).or_insert(0) += u64::from(d - 1);
+                    }
+                    self.last_frame.insert(key, k);
+                }
+            }
+        }
+    }
+
+    /// Frames lost per codec class so far (gaps in `frame_seq`).
+    #[must_use]
+    pub fn lost_by_class(&self) -> std::collections::BTreeMap<u8, u64> {
+        self.lost_by_class.clone()
     }
 
     /// Keep a new slot within [`MAX_LAYER_SLOTS_PER_STREAM`] for `stream`:
@@ -442,6 +503,7 @@ impl Reassemblers {
     /// Forget `stream` (it ended or was replaced); its open frames are
     /// dropped incomplete.
     pub fn forget(&mut self, stream: StreamId) -> Vec<FrameRefusal> {
+        self.last_frame.retain(|(s, _), _| *s != stream);
         let keys: Vec<(StreamId, ChunkLayer)> = self
             .slots
             .keys()

@@ -15,6 +15,8 @@ fn chunk(epoch: u64, seq: u64, codec_id: u8, layer: ChunkLayer, bytes: Vec<u8>) 
         codec_id,
         layer,
         bytes,
+        frame_seq: None,
+        source_ts_ms: 0,
     }
 }
 
@@ -44,7 +46,7 @@ fn fragments(
     seq: u64,
     layer: ChunkLayer,
 ) -> Vec<ReceivedFrame> {
-    split(frame, budget)
+    split(frame, budget, 0)
         .expect("fits")
         .into_iter()
         .enumerate()
@@ -64,15 +66,15 @@ fn fragments(
 /// plaintext; a whole frame is `0 ‖ 1`, so the layout never depends on size.
 #[test]
 fn the_marker_is_index_then_count_and_a_whole_frame_is_zero_of_one() {
-    assert_eq!(marker(0, 1), [0, 0, 0, 1]);
-    assert_eq!(marker(3, 256), [0, 3, 1, 0]);
-    assert_eq!(parse(&[0, 7, 0, 9, 0xaa]), Some((7, 9)));
-    assert_eq!(parse(&[0, 7, 0]), None);
-    let one = split(b"tiny", 1_000).expect("fits");
-    assert_eq!(one, vec![[&marker(0, 1)[..], b"tiny"].concat()]);
+    assert_eq!(marker(0, 1, 0), [0, 0, 0, 1, 0, 0, 0, 0]);
+    assert_eq!(marker(3, 256, 0x0102_0304), [0, 3, 1, 0, 1, 2, 3, 4]);
+    assert_eq!(parse(&[0, 7, 0, 9, 0, 0, 0, 5, 0xaa]), Some((7, 9, 5)));
+    assert_eq!(parse(&[0, 7, 0, 9, 0, 0, 0]), None, "shorter than 8");
+    let one = split(b"tiny", 1_000, 0).expect("fits");
+    assert_eq!(one, vec![[&marker(0, 1, 0)[..], b"tiny"].concat()]);
     assert_eq!(
-        split(b"", 1_000).expect("fits"),
-        vec![marker(0, 1).to_vec()]
+        split(b"", 1_000, 0).expect("fits"),
+        vec![marker(0, 1, 0).to_vec()]
     );
 }
 
@@ -80,13 +82,13 @@ fn the_marker_is_index_then_count_and_a_whole_frame_is_zero_of_one() {
 /// each at most the budget, the marker counting. The caps (CC reading
 /// rc18): 4096 fragments and 1 MiB, whichever binds first; one byte past
 /// `max_frame_len` is refused before anything is sealed. At MTU 500 (budget
-/// 244) the fragment cap binds at 983,040 B; at MTU 1400 (budget 1,140) the
-/// 1 MiB cap does.
+/// 244, 236 media bytes a fragment) the fragment cap binds at 966,656 B; at
+/// MTU 1400 (budget 1,140) the 1 MiB cap does.
 #[test]
 fn a_keyframe_splits_to_the_budget_and_the_cap_is_256() {
     let budget = 1_100;
     let frame = frame_bytes(40_000, 3);
-    let parts = split(&frame, budget).expect("fits");
+    let parts = split(&frame, budget, 0).expect("fits");
     assert_eq!(
         parts.len(),
         40_000usize.div_ceil(budget - FRAGMENT_MARKER_LEN)
@@ -97,12 +99,13 @@ fn a_keyframe_splits_to_the_budget_and_the_cap_is_256() {
             parse(p),
             Some((
                 u16::try_from(i).unwrap(),
-                u16::try_from(parts.len()).unwrap()
+                u16::try_from(parts.len()).unwrap(),
+                0
             ))
         );
     }
-    assert_eq!(max_frame_len(244), 4096 * 240, "MTU 500: the fragment cap");
-    assert_eq!(max_frame_len(244), 983_040);
+    assert_eq!(max_frame_len(244), 4096 * 236, "MTU 500: the fragment cap");
+    assert_eq!(max_frame_len(244), 966_656);
     assert_eq!(
         max_frame_len(1_140),
         MAX_FRAME_BYTES,
@@ -111,22 +114,22 @@ fn a_keyframe_splits_to_the_budget_and_the_cap_is_256() {
     let small = 244;
     let max = max_frame_len(small);
     assert_eq!(
-        split(&frame_bytes(max, 1), small).expect("fits").len(),
+        split(&frame_bytes(max, 1), small, 0).expect("fits").len(),
         4096
     );
     assert!(
-        split(&frame_bytes(max + 1, 1), small).is_none(),
+        split(&frame_bytes(max + 1, 1), small, 0).is_none(),
         "4097 fragments"
     );
     let max = max_frame_len(budget);
     assert_eq!(max, MAX_FRAME_BYTES);
-    assert!(split(&frame_bytes(max, 1), budget).is_some());
+    assert!(split(&frame_bytes(max, 1), budget, 0).is_some());
     assert!(
-        split(&frame_bytes(max + 1, 1), budget).is_none(),
+        split(&frame_bytes(max + 1, 1), budget, 0).is_none(),
         "over 1 MiB"
     );
     assert!(
-        split(b"x", FRAGMENT_MARKER_LEN).is_none(),
+        split(b"x", FRAGMENT_MARKER_LEN, 0).is_none(),
         "no room past the marker"
     );
 }
@@ -203,49 +206,56 @@ fn each_malformed_marker_is_refused_by_name() {
             .collect()
     };
     let v = CODEC_TEMPORAL_LAYERED;
-    let with = |seq: u64, m: [u8; 4], layer: ChunkLayer, epoch: u64| {
+    let with = |seq: u64, m: [u8; 8], layer: ChunkLayer, epoch: u64| {
         chunk(epoch, seq, v, layer, [&m[..], b"x"].concat())
     };
     assert_eq!(
-        refuse(vec![with(0, marker(0, 0), L0, 1)]),
+        refuse(vec![with(0, marker(0, 0, 0), L0, 1)]),
         ["av_frame_count_invalid"]
     );
     assert_eq!(
-        refuse(vec![with(0, marker(0, 4097), L0, 1)]),
+        refuse(vec![with(0, marker(0, 4097, 0), L0, 1)]),
         ["av_frame_count_invalid"]
     );
     assert!(
-        refuse(vec![with(0, marker(0, 4096), L0, 1)]).is_empty(),
+        refuse(vec![with(0, marker(0, 4096, 0), L0, 1)]).is_empty(),
         "4096 is legal"
     );
     assert_eq!(
-        refuse(vec![with(0, marker(3, 3), L0, 1)]),
+        refuse(vec![with(0, marker(3, 3, 0), L0, 1)]),
         ["av_frame_index_invalid"]
     );
     assert_eq!(
         refuse(vec![
-            with(0, marker(0, 3), L0, 1),
-            with(1, marker(1, 4), L0, 1)
+            with(0, marker(0, 3, 0), L0, 1),
+            with(1, marker(1, 4, 0), L0, 1)
         ]),
         ["av_frame_count_mismatch"]
     );
     assert_eq!(
         refuse(vec![
-            with(0, marker(0, 2), L0, 1),
-            with(1, marker(1, 2), L1, 1)
+            with(0, marker(0, 2, 0), L0, 1),
+            with(1, marker(1, 2, 0), L1, 1)
         ]),
         ["av_frame_layer_mismatch"]
     );
     assert_eq!(
         refuse(vec![
-            with(0, marker(0, 2), L0, 1),
-            with(1, marker(1, 2), L0, 2)
+            with(0, marker(0, 2, 0), L0, 1),
+            with(1, marker(1, 2, 0), L0, 2)
         ]),
         ["av_frame_crosses_epoch"]
     );
     assert_eq!(
         refuse(vec![chunk(1, 0, v, L0, vec![0, 0, 0])]),
         ["av_frame_marker_short"]
+    );
+    assert_eq!(
+        refuse(vec![
+            with(0, marker(0, 2, 4), L0, 1),
+            with(1, marker(1, 2, 5), L0, 1)
+        ]),
+        ["av_frame_seq_mismatch"]
     );
     for t in FrameRefusal::ALL {
         assert!(t.token().starts_with("av_frame_"));
@@ -319,14 +329,14 @@ fn a_frame_past_one_mib_is_dropped_and_one_frame_is_open_per_stream() {
         0,
         CODEC_TEMPORAL_LAYERED,
         L0,
-        [&marker(0, 3)[..], &big].concat(),
+        [&marker(0, 3, 0)[..], &big].concat(),
     );
     let second = chunk(
         1,
         1,
         CODEC_TEMPORAL_LAYERED,
         L0,
-        [&marker(1, 3)[..], &big].concat(),
+        [&marker(1, 3, 0)[..], &big].concat(),
     );
     assert!(r.push(first).refused.is_empty());
     assert_eq!(r.push(second).refused, [FrameRefusal::TooLarge]);
@@ -463,7 +473,7 @@ fn layer_slots_per_stream_are_bounded() {
             u64::from(q) * 10,
             CODEC_TEMPORAL_LAYERED,
             layer,
-            [&marker(0, 2)[..], b"x"].concat(),
+            [&marker(0, 2, 0)[..], b"x"].concat(),
         );
         refused.extend(rs.push(c, FRAMING_FRAGMENTS).refused);
     }
@@ -473,4 +483,71 @@ fn layer_slots_per_stream_are_bounded() {
         "the oldest open frame, once"
     );
     assert_eq!(rs.open_for(S), MAX_LAYER_SLOTS_PER_STREAM);
+}
+
+/// Eric 2026-11-10 — one stream shares one chunk_seq across audio and
+/// video, so the marker's per-class `frame_seq` is what tells a lost video
+/// frame from lost audio: video frames 0, 1, 3 handed out (2 never came) is
+/// one 0x04 frame lost; the audio between them, unmarked, is counted
+/// nothing. The first frame a receiver sees starts the count.
+#[test]
+fn a_lost_video_frame_is_a_frame_seq_gap_and_audio_is_unaffected() {
+    let mut rs = Reassemblers::default();
+    let mut seq = 40;
+    let mut got = Vec::new();
+    for k in [0u32, 1, 3] {
+        let a = chunk(1, seq, CODEC_OPAQUE, L0, b"opus".to_vec());
+        seq += 1;
+        got.extend(rs.push(a, FRAMING_FRAGMENTS).frame);
+        for p in split(&frame_bytes(1_500, 3), 1_000, k).expect("fits") {
+            let out = rs.push(
+                chunk(1, seq, CODEC_TEMPORAL_LAYERED, L0, p),
+                FRAMING_FRAGMENTS,
+            );
+            seq += 1;
+            got.extend(out.frame);
+        }
+    }
+    let video: Vec<Option<u32>> = got
+        .iter()
+        .filter(|f| f.codec_id == CODEC_TEMPORAL_LAYERED)
+        .map(|f| f.frame_seq)
+        .collect();
+    assert_eq!(video, [Some(0), Some(1), Some(3)]);
+    assert!(
+        got.iter()
+            .filter(|f| f.codec_id == CODEC_OPAQUE)
+            .all(|f| f.frame_seq.is_none()),
+        "audio carries no frame_seq"
+    );
+    assert_eq!(
+        rs.lost_by_class(),
+        [(CODEC_TEMPORAL_LAYERED, 1)].into_iter().collect(),
+        "one video frame lost, no audio"
+    );
+}
+
+/// The reassembled frame is its first fragment's: chunk_seq, epoch, layer
+/// and the signed source timestamp (each fragment's trailer signs its own;
+/// the first one's is the frame's).
+#[test]
+fn a_reassembled_frame_carries_its_first_fragments_seq_and_source_ts() {
+    let mut rs = Reassemblers::default();
+    let parts = split(&frame_bytes(2_500, 6), 1_000, 7).expect("fits");
+    let mut out = None;
+    for (i, p) in parts.into_iter().enumerate() {
+        let mut c = chunk(
+            2,
+            100 + u64::try_from(i).unwrap(),
+            CODEC_TEMPORAL_LAYERED,
+            L0,
+            p,
+        );
+        c.source_ts_ms = 1_790_000_000_000 + u64::try_from(i).unwrap();
+        out = rs.push(c, FRAMING_FRAGMENTS).frame.or(out);
+    }
+    let f = out.expect("whole");
+    assert_eq!(f.chunk_seq, ChunkSeq(100));
+    assert_eq!(f.source_ts_ms, 1_790_000_000_000);
+    assert_eq!(f.frame_seq, Some(7));
 }

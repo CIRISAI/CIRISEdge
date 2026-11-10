@@ -4564,6 +4564,8 @@ fn call_frame_to_pydict<'py>(
         (f.layer.spatial, f.layer.temporal, f.layer.quality),
     )?;
     d.set_item("bytes", pyo3::types::PyBytes::new(py, &f.bytes))?;
+    d.set_item("frame_seq", f.frame_seq)?;
+    d.set_item("source_ts_ms", f.source_ts_ms)?;
     Ok(d)
 }
 
@@ -4620,6 +4622,7 @@ pub const PY_CALL_VERBS: &[&str] = &[
     "publish_on",
     "end_stream",
     "streams",
+    "frames_lost_by_class",
 ];
 
 #[cfg(feature = "_reticulum-module")]
@@ -4771,6 +4774,18 @@ impl PyCall {
     fn streams(&self, py: Python<'_>) -> PyResult<Vec<[u8; 32]>> {
         self.with_call(py, |c| {
             Box::pin(async move { Ok(c.streams().await.into_iter().map(|s| s.0).collect()) })
+        })
+    }
+
+    /// v45 — frames this node never got, per codec class
+    /// (`{class: count}`): gaps in the framed streams' `frame_seq`. Audio is
+    /// concealed by time and not counted.
+    fn frames_lost_by_class(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<std::collections::BTreeMap<u8, u64>> {
+        self.with_call(py, |c| {
+            Box::pin(async move { Ok(c.frames_lost_by_class()) })
         })
     }
 

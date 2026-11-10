@@ -461,7 +461,7 @@ pub const STREAM_KIND_SHARE: u8 = 1;
 
 /// v45 (CC reading, rc18) — the v2 `framing` member: 0, one media frame per
 /// chunk and no marker; 1, every chunk whose `codec_id` is not `0xFF`
-/// carries the 4-byte fragment marker (`av_call::frame`). A
+/// carries the 8-byte fragment marker (`av_call::frame`). A
 /// v1 binding reads as 0. Fixed per (stream, epoch).
 pub const FRAMING_NONE: u8 = 0;
 /// See [`FRAMING_NONE`].

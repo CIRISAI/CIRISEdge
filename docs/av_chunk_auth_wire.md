@@ -425,8 +425,14 @@ sealed chunk is ever split (5.3.3.2.3).
 
 - **Which chunks carry the marker.** On a stream whose binding signs
   `framing = 1`, every chunk whose `codec_id` is not `0xFF` starts its
-  plaintext with `frag_index u16_be ‖ frag_count u16_be` (4 bytes), a whole
-  frame included (`0000 0001`), so the layout never depends on size. Audio
+  plaintext with `frag_index u16_be ‖ frag_count u16_be ‖ frame_seq u32_be`
+  (8 bytes), a whole frame included (`0000 0001 ‖ frame_seq`), so the layout
+  never depends on size. `frame_seq` counts the stream's frames per codec
+  class from 0, every fragment of a frame carrying the same value (Eric,
+  2026-11-10): one stream shares one `chunk_seq` across audio and video, so
+  only `frame_seq` tells a lost video frame from lost audio. A receiver
+  counts a gap in it as lost frames of that class
+  (`Call::frames_lost_by_class`); the first frame it sees starts the count. Audio
   (`0xFF`) chunks never carry it. A receiver picks the layout from the
   signed `codec_id` (verified with the trailer before the inner seal opens),
   never from length. Edge frames a stream whose codec map names a non-`0xFF`
@@ -439,12 +445,12 @@ sealed chunk is ever split (5.3.3.2.3).
   the last fragment's `chunk_seq`.
 - **Budget.** Fragments are cut to the call's `chunk_plaintext_budget` (the
   minimum over its legs, §3), so an MTU-500 member still gets video; each
-  fragment carries `budget − 4` media bytes. At most 4096 fragments
+  fragment carries `budget − 8` media bytes. At most 4096 fragments
   (`frag_count` stays a `u16`) and at most 1 MiB reassembled, whichever
   binds first: a larger frame is refused before sealing (`frame_too_large`,
-  budget `min(4096 × (budget − 4), 1 MiB)`). At MTU 500 that is 983,040 B
-  (4096 × 240); at MTU 1400 the 1 MiB cap binds (4096 × 1,136 would be
-  4,653,056 B). A 1080p desktop keyframe fits at both. An unframed stream
+  budget `min(4096 × (budget − 8), 1 MiB)`). At MTU 500 that is 966,656 B
+  (4096 × 236); at MTU 1400 the 1 MiB cap binds (4096 × 1,132 would be
+  4,636,672 B). A 1080p desktop keyframe fits at both. An unframed stream
   keeps the one-chunk refusal.
 - **The binding comes first; a framed chunk is never parsed unframed.** A
   publisher (and a member relay) sends a stream's v2 binding before its v1
@@ -467,6 +473,12 @@ sealed chunk is ever split (5.3.3.2.3).
   `av_frame_too_large`. A fragment that continues another layer's open
   frame by `chunk_seq` drops that frame `av_frame_layer_mismatch`.
   `ReorderCounts` carries `frames_open` and `frames_dropped`.
+- **What a receiver hands out.** One `ReceivedFrame` per whole frame, the
+  markers removed. It carries its FIRST fragment's `chunk_seq`, epoch,
+  codec and layer, the marker's `frame_seq`, and `source_ts_ms`: the first
+  fragment's trailer-signed publisher timestamp (UNIX ms, verified with the
+  trailer; no wire change), the lip-sync clock. Audio and unframed chunks
+  carry `frame_seq = None` and their own `source_ts_ms`.
 - **Sending.** A leg that fails one fragment (congested, too large, gone)
   gets none of the rest of that frame: a partial frame is worth nothing.
 - **Receiving.** The reorder window orders and dedupes per chunk as before.
@@ -486,15 +498,17 @@ sealed chunk is ever split (5.3.3.2.3).
 | `av_frame_count_mismatch` | a fragment's `frag_count` differs from its frame's |
 | `av_frame_layer_mismatch` | a fragment's `codec_id` or layer differs from its frame's |
 | `av_frame_crosses_epoch` | a fragment's epoch differs from its frame's |
+| `av_frame_seq_mismatch` | a fragment's `frame_seq` differs from its frame's |
 | `av_frame_incomplete` | a fragment the reorder window gave up on; the frame dropped whole, once |
 | `av_frame_too_large` | a frame whose fragments pass 1 MiB |
 | `av_frame_framing_unknown` | a non-audio chunk held for its stream's v2 binding past the hold; never parsed unframed |
 
 KATs (`framed_chunk_kats_with_the_shipping_trailer`), with the inputs of §5,
 codec `0x04`, layer (0,0,0): a whole frame `kat-frame` in one framed chunk
-(chunk_seq 0), and the 30-byte frame `kat-frag-frame-012345678901234` at a
-14-byte budget in three fragments (chunk_seq 1–3, markers `00000003`,
-`00010003`, `00020003`). Each value is the chunk's inner ciphertext ‖ trailer;
+(chunk_seq 0, marker `0000 0001 00000000`), and the 30-byte frame
+`kat-frag-frame-012345678901234` at an 18-byte budget in three fragments
+(chunk_seq 1–3, markers `0000 0003`, `0001 0003`, `0002 0003`, each ‖
+`00000001`: frame_seq 1). Each value is the chunk's inner ciphertext ‖ trailer;
 they are pinned at the first build of this branch.
 
 ## 2. The 72-byte trailer (v2: source timestamp + signature)
@@ -583,10 +597,10 @@ max plaintext after    = channel_limit − 84 − 72 = channel_limit − 156    
 
 `link_mdu` is leviculum's `floor((mtu − 1 − 19 − 48) / 16) × 16 − 1`.
 
-| Link MTU | link MDU | Channel limit | Max plaintext before | after | Fragment media (after − 4) | Largest framed frame | Binding parts (KAT size) |
+| Link MTU | link MDU | Channel limit | Max plaintext before | after | Fragment media (after − 8) | Largest framed frame | Binding parts (KAT size) |
 |---|---|---|---|---|---|---|---|
-| 500 (base) | 431 | 400 | 316 | 244 | 240 | 983,040 B (4096 × 240) | 10 × ≤400 B |
-| 1400 (punched direct, `direct_path.rs:666`) | 1327 | 1296 | 1212 | 1140 | 1,136 | 1,048,576 B (the 1 MiB cap) | 3 × ≤1296 B |
+| 500 (base) | 431 | 400 | 316 | 244 | 236 | 966,656 B (4096 × 236) | 10 × ≤400 B |
+| 1400 (punched direct, `direct_path.rs:666`) | 1327 | 1296 | 1212 | 1140 | 1,132 | 1,048,576 B (the 1 MiB cap) | 3 × ≤1296 B |
 
 The call refuses a frame over the budget before sealing it. A smaller MTU
 shrinks every number in the row.
