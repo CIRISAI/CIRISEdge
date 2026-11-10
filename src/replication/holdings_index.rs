@@ -131,6 +131,14 @@
 //! `rehome_legacy_key_plane` (22995) writes key-plane rows with no index
 //! call; the startup rebuild above indexes them before the warm-up drains.
 //!
+//! **What this table cannot prove on its own.** It was written by reading
+//! persist's source at one pin; a writer persist adds later fails no edge
+//! test. CIRISPersist#1249 asks persist to export its federation-tier writer
+//! list (or run a source-scan test) so this table can be checked against it
+//! at every pin. The `sqlite_erase_cited_rows` row above has no witness until
+//! persist has a crossed-then-erased fixture; #1249 also asks whether erasure
+//! has a path other than `purge_put_execution`.
+//!
 //! **Removes are skipped on purpose.** Between audits the set keeps a removed
 //! hash, so a peer offering it is not asked for it. That is the right want, not
 //! a lag to fix: a purged row is refused at admission by its tombstone, and an
