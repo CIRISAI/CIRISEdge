@@ -28,8 +28,9 @@ pub(crate) struct CountingDirectory {
     inner: Arc<dyn FederationDirectory>,
     counts: Arc<Mutex<BTreeMap<&'static str, usize>>>,
     /// CIRISEdge#971 — the persist caller label in force at each call, by
-    /// method (`-` for none), so a witness can see a read's booking.
-    callers: Arc<Mutex<BTreeMap<&'static str, std::collections::BTreeSet<String>>>>,
+    /// method (`-` for none), with how many calls each label made, so a
+    /// witness can see a read's booking and count one site's reads.
+    callers: Arc<Mutex<BTreeMap<&'static str, BTreeMap<String, usize>>>>,
     /// CIRISEdge#971 — content hashes `list_wire_hashes_since` leaves out, as
     /// if persist's index had dropped them (a purge). Only for a corpus inside
     /// one page: a filtered page reads short and ends the drain.
@@ -116,12 +117,14 @@ impl CountingDirectory {
             .or_insert(0) += 1;
         let caller = ciris_persist::observe::current_caller()
             .map_or_else(|| "-".to_owned(), ciris_persist::observe::Caller::label);
-        self.callers
+        *self
+            .callers
             .lock()
             .expect("callers")
             .entry(method)
             .or_default()
-            .insert(caller);
+            .entry(caller)
+            .or_insert(0) += 1;
     }
 
     /// CIRISEdge#971 — the caller labels `method` was called under so far.
@@ -130,8 +133,19 @@ impl CountingDirectory {
             .lock()
             .expect("callers")
             .get(method)
-            .cloned()
+            .map(|by| by.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// CIRISEdge#971 — calls to `method` made under the caller label `label`.
+    pub(crate) fn count_under(&self, method: &str, label: &str) -> usize {
+        self.callers
+            .lock()
+            .expect("callers")
+            .get(method)
+            .and_then(|by| by.get(label))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Every count so far.
@@ -481,6 +495,34 @@ impl FederationDirectory for CountingDirectory {
     ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
         self.hit("lookup_shared_instance_lease");
         self.inner.lookup_shared_instance_lease(instance_name).await
+    }
+    // The route plane's writes are forwarded: without them the trait's
+    // default refuses every route apply through a counted bridge, and a
+    // witness of the route arm reads a backend refusal as its outcome.
+    async fn put_signed_transport_destination(
+        &self,
+        signed: &self_at_login::SignedTransportDestination,
+    ) -> Result<self_at_login::TransportDestinationApplyOutcome, Error> {
+        self.hit("put_signed_transport_destination");
+        self.inner.put_signed_transport_destination(signed).await
+    }
+    async fn put_transport_destination(
+        &self,
+        destination: &self_at_login::TransportDestination,
+    ) -> Result<(), Error> {
+        self.hit("put_transport_destination");
+        self.inner.put_transport_destination(destination).await
+    }
+    async fn remove_transport_destination(
+        &self,
+        occurrence_key_id: &str,
+        transport_kind: &str,
+        destination: &str,
+    ) -> Result<bool, Error> {
+        self.hit("remove_transport_destination");
+        self.inner
+            .remove_transport_destination(occurrence_key_id, transport_kind, destination)
+            .await
     }
     async fn list_signed_transport_destinations_for(
         &self,

@@ -87,12 +87,21 @@ fn bridge_over(
     local: &str,
     early: bool,
 ) -> FederationDirectoryReplicationBridge {
+    bridge_with(dir, local, early, BridgeConfig::default())
+}
+
+fn bridge_with(
+    dir: Arc<dyn FederationDirectory>,
+    local: &str,
+    early: bool,
+    config: BridgeConfig,
+) -> FederationDirectoryReplicationBridge {
     let me = vec![local.to_owned()];
     let cohort = me.clone();
     let b = FederationDirectoryReplicationBridge::with_config(
         dir,
         Arc::new(move || cohort.clone()),
-        BridgeConfig::default(),
+        config,
     )
     .with_local_key_id(Some(local.to_owned()))
     .with_self_provider(Some(Arc::new(move || me.clone())));
@@ -166,12 +175,22 @@ async fn a_first_contact_peer_costs_no_gate_reads_971() {
         old.counts(),
         new.counts()
     );
+    // Counted under the gate's own caller label: the required read's egress
+    // grants (`live_egress_grants_by_principals` for this node's key and its
+    // owner, under `edge.advertise.required`) are the same method, read once
+    // per listing in both orders and for no row.
+    let gate = crate::read_caller::Site::GateCapability.label();
+    eprintln!(
+        "list_live_consent_grants_by callers: old {:?}, v45 {:?}",
+        old.callers_of("list_live_consent_grants_by"),
+        new.callers_of("list_live_consent_grants_by")
+    );
     assert!(
-        old.count("list_live_consent_grants_by") > 0,
+        old.count_under("list_live_consent_grants_by", gate) > 0,
         "the fixture exercises the producer's consent-grant gate in the old order"
     );
     assert_eq!(
-        new.count("list_live_consent_grants_by"),
+        new.count_under("list_live_consent_grants_by", gate),
         0,
         "no consent-grant read for rows the reach refuses"
     );
@@ -187,10 +206,31 @@ async fn a_first_contact_peer_costs_no_gate_reads_971() {
 /// For every peer, the offer with a first-contact peer's own rows read only in
 /// the shapes its reach can carry equals the offer with all of them read, and
 /// the first-contact peer that authored rows here is refused fewer of them.
+/// The fixture zeroes `tip_margin` so its fresh rows sit behind the tip, the
+/// case the narrowing exists for; production's 1 min tip margin is unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_narrowed_first_contact_read_offers_the_same_971() {
     use crate::observability::{EdgeMetrics, WithholdReason};
     let f = fixture("narrow971", 0x41).await;
+    // The shared fixture's rows authored by N are all about N (two `scores`
+    // rows with N as their subject), so the to-N page reads them in both arms
+    // and the narrowing has nothing to remove. A row N authored about another
+    // node, outside the first-contact shapes, is what the narrowing stops
+    // reading: N's owner binding of K.
+    let about_k = crate::replication::attestation_bind::owner_binding_attestation(
+        f.a.n.key_id(),
+        f.a.k.key_id(),
+        chrono::Utc::now(),
+        &f.a.n.signer(),
+    )
+    .await
+    .expect("N's binding of K");
+    f.a.dir
+        .put_attestation(SignedAttestation {
+            attestation: about_k,
+        })
+        .await
+        .expect("admit N's binding of K");
     let dir = Arc::clone(&f.a.dir) as Arc<dyn FederationDirectory>;
     let peers = [
         f.consented.key_id().to_owned(),
@@ -217,11 +257,20 @@ async fn the_narrowed_first_contact_read_offers_the_same_971() {
         assert!(refused[1] <= refused[0], "peer {peer}: never more refusals");
     }
     // N authored its key-plane rows and the carrier here: the full read paid a
-    // refusal for each, the narrowed one does not read them.
+    // refusal for each, the narrowed one does not read them. A peer with no
+    // walk reads new rows from `tip_margin` behind now, so with the default
+    // margin the fixture's rows, written seconds ago, are on the head page in
+    // both arms and the required read's narrowing is hidden. Zero margin puts
+    // them behind the tip, as on a seat where they are older than a minute:
+    // the case the narrowing is for, read every round by the required read.
     let mut refused = Vec::new();
     for narrow in [false, true] {
         let metrics = EdgeMetrics::new();
-        let b = bridge_over(Arc::clone(&dir), f.local.key_id(), true)
+        let config = BridgeConfig {
+            tip_margin: std::time::Duration::ZERO,
+            ..BridgeConfig::default()
+        };
+        let b = bridge_with(Arc::clone(&dir), f.local.key_id(), true, config)
             .with_metrics(Some(metrics.clone()));
         b.set_narrow_first_contact_read(narrow);
         let _ = offer(&b, f.a.n.key_id()).await;
