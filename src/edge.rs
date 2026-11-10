@@ -1498,9 +1498,12 @@ pub struct Edge {
     #[cfg(feature = "_reticulum-module")]
     scope_lifecycle: std::sync::OnceLock<Arc<crate::scope_lifecycle::ScopeLifecycle>>,
     /// CIRISEdge#805 item 5 — the node's room MLS groups, for
-    /// [`Edge::join_call`]. Set via [`EdgeBuilder::room_groups`].
+    /// [`Edge::join_call`]. Set once: at build ([`EdgeBuilder::room_groups`]),
+    /// or by [`Edge::arm_room_groups`] on an Edge another layer built.
+    /// `join_call` reads the cell per call, so groups armed on a running Edge
+    /// serve the next join.
     #[cfg(feature = "_reticulum-module")]
-    room_groups: Option<Arc<crate::mls::CohortGroups>>,
+    room_groups: std::sync::OnceLock<Arc<crate::mls::CohortGroups>>,
     /// CIRISEdge#805 item 5 — the keep door a call's stream registers through
     /// (never reached while kept streams wait on CIRISPersist#1067).
     #[cfg(feature = "_reticulum-module")]
@@ -4695,6 +4698,27 @@ impl Edge {
         Ok(())
     }
 
+    /// **Arm the room MLS groups on a running Edge**, for [`Self::join_call`].
+    ///
+    /// For a host that reuses an Edge another layer built rather than
+    /// building its own (CIRISServer's agent-embedded node reuses the Edge
+    /// the pyo3 `init_edge_runtime` built, which sets no room groups): without
+    /// it every `join_call` there is refused `CallError::Plumbing` naming the
+    /// room groups. [`EdgeBuilder::room_groups`] still seeds them at build.
+    ///
+    /// Safe on a running Edge: `join_call` reads the cell per call. Set once —
+    /// refused, with nothing changed, if the groups are already set (at build
+    /// or by an earlier arm).
+    ///
+    /// # Errors
+    /// [`EdgeError::Config`] when the room groups are already set.
+    #[cfg(feature = "_reticulum-module")]
+    pub fn arm_room_groups(&self, groups: Arc<crate::mls::CohortGroups>) -> Result<(), EdgeError> {
+        self.room_groups.set(groups).map_err(|_| {
+            EdgeError::Config("arm_room_groups: the room groups are already set".into())
+        })
+    }
+
     /// CIRISEdge#805 item 5 — **join `room`'s call** (`FSD/AV_CALL_API.md`
     /// §4): start this node's stream; an in-room call needs no ring (§7).
     /// Needs the Reticulum transport, the scope lifecycle, the room groups
@@ -4749,7 +4773,7 @@ impl Edge {
             .ok_or_else(|| missing("a scope lifecycle"))?;
         let groups = self
             .room_groups
-            .as_ref()
+            .get()
             .ok_or_else(|| missing("the room groups (EdgeBuilder::room_groups)"))?;
         let directory = self
             .federation_directory
@@ -9281,7 +9305,10 @@ impl EdgeBuilder {
                 None => std::sync::OnceLock::new(),
             },
             #[cfg(feature = "_reticulum-module")]
-            room_groups: self.room_groups,
+            room_groups: match self.room_groups {
+                Some(groups) => std::sync::OnceLock::from(groups),
+                None => std::sync::OnceLock::new(),
+            },
             #[cfg(feature = "_reticulum-module")]
             stream_dek_registrar: self.stream_dek_registrar,
             federation_directory: self.federation_directory,
@@ -12181,6 +12208,59 @@ mod scope_native_install_tests {
         EdgeBuilder::from_keyring_seed_dir(key_id, seeds, dir.join("edge.sqlite"))
             .await
             .expect("builder")
+    }
+
+    fn groups(tag: &[u8], key_id: &str) -> Arc<crate::mls::CohortGroups> {
+        Arc::new(crate::mls::CohortGroups::new(
+            crate::mls::ScopeStateProvider::new(Arc::new(
+                ciris_persist::encrypted_kv::XChaChaKvStore::open_in_memory(tag)
+                    .expect("in-memory scope state"),
+            )),
+            key_id,
+        ))
+    }
+
+    /// The room groups arm once on a running Edge built without them (the
+    /// agent-embedded host's Edge), and never over a set.
+    #[tokio::test]
+    async fn room_groups_arm_once_on_an_edge_built_without_them() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let edge = builder(tmp.path(), "edge-rg-late")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .build()
+            .expect("build");
+        assert!(edge.room_groups.get().is_none(), "nothing set at build");
+        edge.arm_room_groups(groups(b"rg-1", "edge-rg-late"))
+            .expect("the first arm takes");
+        assert!(edge.room_groups.get().is_some(), "armed");
+        let Err(EdgeError::Config(msg)) = edge.arm_room_groups(groups(b"rg-2", "edge-rg-late"))
+        else {
+            panic!("a second arm is refused");
+        };
+        assert!(msg.contains("already set"), "{msg}");
+    }
+
+    /// An Edge whose builder set the room groups refuses an arm: the
+    /// builder's groups stay.
+    #[tokio::test]
+    async fn room_groups_set_at_build_refuse_an_arm() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let built = groups(b"rg-b", "edge-rg-built");
+        let edge = builder(tmp.path(), "edge-rg-built")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .room_groups(Arc::clone(&built))
+            .build()
+            .expect("build");
+        assert!(matches!(
+            edge.arm_room_groups(groups(b"rg-x", "edge-rg-built")),
+            Err(EdgeError::Config(_))
+        ));
+        assert!(
+            Arc::ptr_eq(edge.room_groups.get().expect("set"), &built),
+            "the builder's groups are the ones held"
+        );
     }
 
     #[tokio::test]

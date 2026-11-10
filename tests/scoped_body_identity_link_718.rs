@@ -542,6 +542,9 @@ struct Mesh {
     a: Member,
     b: Member,
     c: Relay,
+    /// Each member's MLS scope state (A's, B's): what a host's
+    /// `CohortGroups` opens the room's group from.
+    stores: [ScopeStateProvider; 2],
     _tmp: tempfile::TempDir,
 }
 
@@ -699,7 +702,8 @@ async fn mesh_armed(tag: &str, direct_ab: bool, arming: Arming) -> Mesh {
             XChaChaKvStore::open_in_memory(tag).expect("in-memory scope state"),
         ))
     };
-    let group_a = CohortGroup::create(store_for(b"718-a"), ROOM, &node_a.me, 16)
+    let stores = [store_for(b"718-a"), store_for(b"718-b")];
+    let group_a = CohortGroup::create(stores[0].clone(), ROOM, &node_a.me, 16)
         .await
         .expect("A creates the room's group");
     let (material_b, kp_b) = mint_cohort_key_material(&node_b.me).expect("B's key material");
@@ -708,7 +712,7 @@ async fn mesh_armed(tag: &str, direct_ab: bool, arming: Arming) -> Mesh {
         .await
         .expect("A adds B");
     let group_b = CohortGroup::join(
-        store_for(b"718-b"),
+        stores[1].clone(),
         ROOM,
         material_b,
         add.welcome().expect("welcome"),
@@ -752,6 +756,7 @@ async fn mesh_armed(tag: &str, direct_ab: bool, arming: Arming) -> Mesh {
             rt: rt_c,
             _listen: listen_c,
         },
+        stores,
         _tmp: tmp,
     }
 }
@@ -1036,6 +1041,121 @@ async fn a_running_edge_armed_late_serves_and_pulls_the_room_body() {
         "A refused nothing: {:?}",
         m.a.edge.metrics().snapshot().blob_serve_refusals
     );
+}
+
+/// The owner's signer of `node`, over the seed `node()` registered it from.
+fn owner_signer(node: &Node, seed: u8) -> Arc<ciris_edge::identity::LocalSigner> {
+    let hw: Arc<dyn HardwareSigner> = Arc::new(
+        Ed25519SoftwareSigner::from_bytes(&[seed; 32], &format!("{}-engine", node.identity))
+            .expect("the owner's ed half"),
+    );
+    let pqc: Arc<dyn PqcSigner> = Arc::new(
+        MlDsa65SoftwareSigner::from_seed_bytes(
+            &[seed ^ 0x55; 32],
+            format!("{}-pqc", node.identity),
+        )
+        .expect("the owner's pqc half"),
+    );
+    Arc::new(ciris_edge::identity::LocalSigner::new(
+        node.identity.clone(),
+        hw,
+        Some(pqc),
+    ))
+}
+
+/// **Room groups armed on a running Edge** — the agent-embedded host's call
+/// path. The Edge is built with no room groups (as the pyo3
+/// `init_edge_runtime` builds it) and its fold host is armed after `run`.
+/// `join_call` then refuses by name, naming the room groups; once
+/// `Edge::arm_room_groups` sets them on the running Edge, both members join
+/// the room's call through the host API and A's frame reaches B. A second
+/// arm is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_running_edge_armed_late_joins_its_rooms_call() {
+    use ciris_edge::mls::CohortGroups;
+    use ciris_edge::transport::av_call::{CallError, CallOptions, Frame};
+    let m = mesh_armed("call", true, Arming::AfterRun).await;
+    wait_for_path(&m.b, &m.a, true, Duration::from_mins(1)).await;
+    wait_for_path(&m.a, &m.b, true, Duration::from_mins(1)).await;
+    match m.a.edge.join_call(ROOM, CallOptions::default()).await {
+        Err(CallError::Plumbing(why)) if why.contains("room groups") => {}
+        Err(e) => panic!("unarmed: the room groups are named: {e:?}"),
+        Ok(_) => panic!("unarmed: refused"),
+    }
+    for (member, store) in [(&m.a, &m.stores[0]), (&m.b, &m.stores[1])] {
+        member
+            .edge
+            .arm_room_groups(Arc::new(CohortGroups::new(
+                store.clone(),
+                member.node.me.clone(),
+            )))
+            .expect("arm the running Edge");
+        assert!(
+            member
+                .edge
+                .arm_room_groups(Arc::new(CohortGroups::new(
+                    store.clone(),
+                    member.node.me.clone()
+                )))
+                .is_err(),
+            "arming is set-once"
+        );
+    }
+    // Each node attends for its owner, the room's member (the server's
+    // `join_call_as`): the roster names people, the MLS leaves name nodes.
+    let mut ca =
+        m.a.edge
+            .join_call_as(
+                ROOM,
+                CallOptions::default(),
+                Some(owner_signer(&m.a.node, 0x11)),
+            )
+            .await
+            .expect("A joins once armed");
+    let mut cb =
+        m.b.edge
+            .join_call_as(
+                ROOM,
+                CallOptions::default(),
+                Some(owner_signer(&m.b.node, 0x22)),
+            )
+            .await
+            .expect("B joins once armed");
+    let mut b_frames = cb.frames().expect("B's frames");
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
+    while ca.legs().is_empty() || cb.legs().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both legs come up: A {:?}, B {:?}",
+            ca.legs(),
+            cb.legs()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let body = b"a frame from an Edge armed after run".to_vec();
+    let mut delivered = false;
+    for _ in 0..50 {
+        if ca
+            .publish(Frame::opaque(body.clone()))
+            .await
+            .expect("publish")
+            .delivered()
+            == 1
+        {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(delivered, "A's frame left on its leg");
+    let f = tokio::time::timeout(Duration::from_secs(20), b_frames.recv())
+        .await
+        .expect("A's frame reaches B in time")
+        .expect("frames open");
+    assert_eq!(f.bytes, body);
+    assert_eq!(f.publisher, m.a.node.me);
+    ca.leave().await.expect("A leaves");
+    cb.leave().await.expect("B leaves");
 }
 
 /// **The positive.** A and B each dial C, never each other. The chat body and
