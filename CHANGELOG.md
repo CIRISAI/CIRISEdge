@@ -20,17 +20,24 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
 
 ### 45.0.0
 
-- **The bundle's serve nodes are bootstrap peers only when this runtime's
-  directory holds their key record** (CIRISEdge#971, #881).
-  `enable_bundle_bootstrap_peers` keeps its opt-in sense and its `false`
-  default. With it set, a baked serve node joins only if this node's own
+- **Behaviour change: the bundle's serve nodes are bootstrap peers by
+  default** (CIRISEdge#971, #881; Eric's ruling). From v43.2.0 to v44.1.2
+  `ReplicationRuntimeConfig::enable_bundle_bootstrap_peers` was opt-in and no
+  host set it, so an unclaimed device that consent named to no seat rounded
+  with nobody, and the seat held it Advisory and pairless for good. It is
+  replaced by `disable_bundle_bootstrap_peers` (opt-out). Every v45 node that
+  takes the default asks each baked serve node its directory holds for the
+  required set by subject Pull (bundle-seat mode, below). Once that seat holds
+  the node's key and route, the node also keeps an ordinary Revocation round
+  with it. A serve node joins only if this node's own
   directory holds its key record. Only persist's Engine boot seed writes those
   records, and it skips them under a test trust root, so tests, harnesses and
-  scratch directories add none. A serve node whose record lands after start
-  joins at the next `set_peers` (latched: zero reads once held). A node that
-  opens no replication round to anyone says so at start, naming each skipped
-  serve node and why (WARN, `tracked: CIRISEdge#971`). From v43.2.0 to v44.1.2
-  no host set the flag, so an unclaimed device rounded with nobody.
+  scratch directories add none. A record that lands after start joins at the
+  next `set_peers` (latched: zero reads once held). The pyo3
+  `start_replication(bundle_bootstrap_peers=…)` kwarg keeps its name and now
+  defaults to `True`. A host opts out with `disable_bundle_bootstrap_peers:
+  true`. A node that opens no replication round to anyone says so at start,
+  naming each skipped serve node and why (WARN, `tracked: CIRISEdge#971`).
 - **Bundle-seat mode: the required set by subject Pull, never a whole-plane
   diff** (CIRISEdge#971, CC 5.2). Toward a bundle seat the host does not name
   as a consent peer, a device runs no Summary round on Key,

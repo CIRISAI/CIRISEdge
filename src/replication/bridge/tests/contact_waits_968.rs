@@ -103,7 +103,7 @@ async fn every_host_local_write_door_drops_the_send_set_memos_968() {
     let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let directory: Arc<dyn FederationDirectory> = backend;
     let config = ReplicationRuntimeConfig {
-        enable_bundle_bootstrap_peers: false,
+        disable_bundle_bootstrap_peers: true,
         scheduler: SchedulerConfig {
             cadence: Duration::from_hours(1),
             round_timeout: Duration::from_millis(200),

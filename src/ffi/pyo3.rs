@@ -2884,7 +2884,7 @@ impl PyEdge {
     ///   transport was registered at init.
     /// - `ValueError("unknown EnvelopeKind: {token}")` if a kind
     ///   string in `peers` doesn't match the 10 wire tokens.
-    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None, publish_sets_by_kind = None, bundle_bootstrap_peers = false))]
+    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None, publish_sets_by_kind = None, bundle_bootstrap_peers = true))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments, one per knob
     fn start_replication(
         &self,
@@ -2916,8 +2916,9 @@ impl PyEdge {
         // third party's anchored key while withholding that party's
         // occurrences and routes. `None` = unchanged behaviour.
         publish_sets_by_kind: Option<std::collections::HashMap<String, Vec<String>>>,
-        // CIRISEdge#881 — opt the bundle's seated serve nodes in as bootstrap-plane
-        // initiator peers (an unclaimed device; see `enable_bundle_bootstrap_peers`).
+        // CIRISEdge#881 — the bundle's seated serve nodes as bootstrap-plane peers,
+        // asked by subject Pull (#971). On by default since v45; `False` opts out.
+        // See `disable_bundle_bootstrap_peers`.
         bundle_bootstrap_peers: bool,
     ) -> PyResult<PyReplicationHandle> {
         let directory = self
@@ -2953,7 +2954,7 @@ impl PyEdge {
         // inert through the shipped host path — the same silent-default failure
         // as the mode above, in the same function.
         config.local_key_id = Some(self.inner.signer_key_id().to_string());
-        config.enable_bundle_bootstrap_peers = bundle_bootstrap_peers;
+        config.disable_bundle_bootstrap_peers = !bundle_bootstrap_peers;
         // CIRISEdge#541 — and the TIER subject separately: the conferral is
         // granted against the identity peers know this node as. These coincide
         // unless `use_node_identity` split them, and where they differ, using

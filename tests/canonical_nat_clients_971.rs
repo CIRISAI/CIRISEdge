@@ -332,7 +332,7 @@ async fn start_runtime_with(
             Arc::clone(&transport) as Arc<dyn Transport>,
             peers,
             ReplicationRuntimeConfig {
-                enable_bundle_bootstrap_peers: bundle,
+                disable_bundle_bootstrap_peers: !bundle,
                 scheduler: SchedulerConfig {
                     cadence,
                     round_timeout: ROUND_TIMEOUT,
@@ -647,7 +647,7 @@ async fn a_client_link_whose_establishment_was_lost_carries_the_canonicals_round
 /// holds initiators for them, as its reconciler gives it.
 ///
 /// `bootstrap_rounds`: the client rounds with the canonical on
-/// [`BOOTSTRAP_ROUND_PLANES`] — exactly the peers `enable_bundle_bootstrap_peers` (#881)
+/// [`BOOTSTRAP_ROUND_PLANES`] — exactly the peers the #881 bundle path (on by default)
 /// (#881) adds for a bundle serve node (`bundle_bootstrap_peers`,
 /// runtime.rs:895). Off is what CIRISServer 0.5.246 composes (compose.rs:5177
 /// never sets the flag): such a client has no initiator toward the seat.

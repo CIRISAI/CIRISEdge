@@ -753,21 +753,24 @@ pub struct ReplicationRuntimeConfig {
     /// the seat, and its owner's announced route row reaches it, with no
     /// host-side Pull.
     ///
-    /// **Opt-in** (`false` by default): the host sets it for device nodes. No
-    /// host has (CIRISEdge#971): from v43.2.0 to v44.1.2 an unclaimed device
-    /// that consent named to no seat opened no round to anyone, and the seat
-    /// held it Advisory and pairless for good; such a node now says so at
-    /// start.
+    /// **On by default since edge v45** (CIRISEdge#971, Eric's ruling). It
+    /// shipped opt-in in v43.2.0 and no host ever set it: from v43.2.0 to
+    /// v44.1.2 an unclaimed device that consent named to no seat opened no
+    /// round to anyone, and the seat held it Advisory and pairless for good.
+    /// `true` opts a node out (pyo3: `start_replication(bundle_bootstrap_peers=False)`).
+    /// On, a device asks each bundle seat for the required set by subject
+    /// Pull ([`BUNDLE_PULL_PLANES`], bundle-seat mode), never a whole-plane
+    /// diff, and keeps an ordinary round on [`BUNDLE_ROUND_PLANES`] only.
     ///
     /// What keeps a runtime that is not on the production mesh (tests,
     /// harnesses, a node over a scratch directory) from rounding with a
-    /// production canonical, with the flag set, is that a serve node is added only when
+    /// production canonical is NOT this flag: a serve node is added only when
     /// THIS runtime's directory holds its key record
     /// ([`bundle_bootstrap_peers_held`]), and only persist's Engine boot seed
     /// writes those records, which it skips under a test trust root. A bare
     /// directory never holds them. Never applied under a test trust root
     /// (`test_trust_root_override_active`) either way.
-    pub enable_bundle_bootstrap_peers: bool,
+    pub disable_bundle_bootstrap_peers: bool,
     /// CIRISEdge#541/#552 — the subject whose SERVING TIER is resolved.
     ///
     /// Distinct from `local_key_id` on purpose. `local_key_id` is the truster
@@ -904,7 +907,7 @@ fn note_retired_plane_skipped(peer_key_id: &str, kind: EnvelopeKind) {
 /// (CIRISEdge#971), named on the start-up line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BundleSkip {
-    /// The host did not opt in (`enable_bundle_bootstrap_peers` is false).
+    /// The host opted out (`disable_bundle_bootstrap_peers`).
     OptedOut,
     /// A test trust root is active (persist skips the bundle under it too).
     TestTrustRoot,
@@ -922,7 +925,7 @@ impl BundleSkip {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::OptedOut => "bundle_path_off",
+            Self::OptedOut => "opted_out",
             Self::TestTrustRoot => "test_trust_root",
             Self::NotInDirectory => "not_in_directory",
             Self::IsSelf => "self",
@@ -1832,7 +1835,7 @@ impl ReplicationRuntime {
             &serve_nodes,
             &*directory,
             config.local_key_id.as_deref(),
-            !config.enable_bundle_bootstrap_peers,
+            config.disable_bundle_bootstrap_peers,
             crate::edge::test_trust_root_override_active(),
         )
         .await;
@@ -2770,7 +2773,7 @@ impl ReplicationRuntime {
         &self,
         seat: &str,
     ) -> Result<(), ReplicationRuntimeError> {
-        if !self.config.enable_bundle_bootstrap_peers {
+        if self.config.disable_bundle_bootstrap_peers {
             return Ok(());
         }
         let added = bundle_bootstrap_peers(&[seat.to_owned()], self.config.local_key_id.as_deref());
@@ -2866,7 +2869,7 @@ mod tests {
     /// bundle's canonicals are opt-in and stay out of them.
     fn unit_config() -> ReplicationRuntimeConfig {
         ReplicationRuntimeConfig {
-            enable_bundle_bootstrap_peers: false,
+            disable_bundle_bootstrap_peers: true,
             ..ReplicationRuntimeConfig::default()
         }
     }
@@ -3023,7 +3026,7 @@ mod tests {
         );
     }
 
-    /// (c) The bundle path not enabled: no serve node is a peer.
+    /// (c) The host's opt-out: no serve node is a peer.
     #[tokio::test]
     async fn the_opt_out_takes_no_serve_node_971() {
         let dir = directory_holding(&["seat-a"]).await;
@@ -3062,7 +3065,6 @@ mod tests {
             Vec::new(),
             ReplicationRuntimeConfig {
                 local_key_id: Some("device-971-late".to_owned()),
-                enable_bundle_bootstrap_peers: true,
                 ..ReplicationRuntimeConfig::default()
             },
             None,
@@ -3213,8 +3215,8 @@ mod tests {
         assert!(d >= BUNDLE_PULL_MIN_SPACING / 2 && d <= BUNDLE_PULL_MIN_SPACING * 3 / 2);
     }
 
-    /// (e) **The v43.2 leak guard, through `start` itself.** A runtime with
-    /// the bundle path on over a bare directory, with the REAL baked
+    /// (e) **The v43.2 leak guard, through `start` itself.** A DEFAULT-config
+    /// runtime (the bundle path on) over a bare directory, with the REAL baked
     /// serve ids, rounds with none of them: the directory never ran persist's
     /// Engine seed, so it holds no serve node's record. Mutation: drop the
     /// directory check in `bundle_bootstrap_peers_held`, and this runtime
@@ -3231,7 +3233,6 @@ mod tests {
             Vec::new(),
             ReplicationRuntimeConfig {
                 local_key_id: Some("device-971".to_owned()),
-                enable_bundle_bootstrap_peers: true,
                 ..ReplicationRuntimeConfig::default()
             },
             None,
@@ -3631,7 +3632,7 @@ mod tests {
             });
             let metrics = EdgeMetrics::new();
             let config = ReplicationRuntimeConfig {
-                enable_bundle_bootstrap_peers: false,
+                disable_bundle_bootstrap_peers: true,
                 scheduler: SchedulerConfig {
                     cadence: std::time::Duration::from_hours(1),
                     round_timeout: std::time::Duration::from_secs(5),

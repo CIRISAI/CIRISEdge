@@ -96,7 +96,7 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
         Arc::new(Arc::clone(&wire)),
         Vec::new(),
         ReplicationRuntimeConfig {
-            enable_bundle_bootstrap_peers: false,
+            disable_bundle_bootstrap_peers: true,
             local_key_id: Some(SEAT.to_owned()),
             metrics: Some(metrics.clone()),
             ..ReplicationRuntimeConfig::default()
@@ -268,7 +268,7 @@ async fn an_idle_bundle_pull_costs_the_seat_971() {
         Arc::new(Arc::clone(&wire)),
         Vec::new(),
         ReplicationRuntimeConfig {
-            enable_bundle_bootstrap_peers: false,
+            disable_bundle_bootstrap_peers: true,
             local_key_id: Some(SEAT.to_owned()),
             metrics: Some(metrics.clone()),
             ..ReplicationRuntimeConfig::default()

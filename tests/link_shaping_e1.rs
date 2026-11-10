@@ -1537,7 +1537,7 @@ async fn start_node(
                     },
                     local_key_id: Some(key.key_id.clone()),
                     metrics: Some(metrics.clone()),
-                    enable_bundle_bootstrap_peers: false,
+                    disable_bundle_bootstrap_peers: true,
                     ..Default::default()
                 },
                 Some(self_publish_set(publish)),
