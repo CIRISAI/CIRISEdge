@@ -689,10 +689,30 @@ async fn a_room_call_behind_t_runs_over_a_punched_interface() {
         .expect("frames open");
     assert_eq!(f.bytes.len(), budget, "a {budget}-byte frame arrives whole");
 
+    // The host's lever off: legs that come up from now on stay on the
+    // Channel, but this leg keeps its datagrams (one-way per leg).
+    p.a.transport.set_av_datagrams_enabled(false);
+    assert_eq!(
+        p.a.metrics.snapshot().av_datagrams_enabled,
+        0,
+        "the gauge reads it"
+    );
+    assert_eq!(
+        call_a.leg_uses_datagrams(&p.b.key.key_id),
+        Some(true),
+        "an existing leg keeps datagrams"
+    );
+
     // T gone: the call never needed it.
     p.t.stop().await.expect("stop T");
     tokio::time::sleep(Duration::from_millis(500)).await;
+    let sent = av(&p.a.metrics, "av_sent_datagram");
     cross(&mut call_a, "A", &p.a.key.key_id, 10..15, &mut b_frames).await;
+    assert_eq!(
+        av(&p.a.metrics, "av_sent_datagram") - sent,
+        5,
+        "the existing leg still sends datagrams with the lever off"
+    );
     cross(&mut call_b, "B", &p.b.key.key_id, 10..15, &mut a_frames).await;
 
     call_a.leave().await.expect("A leaves");
@@ -784,6 +804,47 @@ async fn a_member_on_an_older_build_gets_its_media_on_the_channel() {
         "B's frames to A rode datagrams: {:?}",
         p.b.metrics.av_plane()
     );
+    call_a.leave().await.expect("A leaves");
+    call_b.leave().await.expect("B leaves");
+}
+
+/// leviculum#102 **the host's lever** — B's host turned datagrams off before
+/// its call: B's CAPS leave the bit out (so A's media to B stays on the
+/// Channel) and B sends none on its own new leg either, although A's CAPS
+/// carry the bit. The gauge reads 0 on B and 1 on A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn the_datagram_lever_off_keeps_new_legs_on_the_channel() {
+    let p = pair("e4-lever", true).await;
+    assert_eq!(p.b.metrics.snapshot().av_datagrams_enabled, 1, "default on");
+    p.b.transport.set_av_datagrams_enabled(false);
+    assert_eq!(p.b.metrics.snapshot().av_datagrams_enabled, 0);
+    assert_eq!(p.a.metrics.snapshot().av_datagrams_enabled, 1);
+    let mut call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A joins");
+    let mut call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B joins");
+    let mut a_frames = call_a.frames().expect("A's frames");
+    let mut b_frames = call_b.frames().expect("B's frames");
+    legs_settled(&p, &call_a, &call_b).await;
+    assert_eq!(call_a.leg_uses_datagrams(&p.b.key.key_id), Some(false));
+    assert_eq!(call_b.leg_uses_datagrams(&p.a.key.key_id), Some(false));
+    let before = [&p.a, &p.b].map(|s| {
+        (
+            av(&s.metrics, "av_sent_datagram"),
+            av(&s.metrics, "av_sent_datagram_fallback"),
+        )
+    });
+    cross(&mut call_a, "A", &p.a.key.key_id, 0..10, &mut b_frames).await;
+    cross(&mut call_b, "B", &p.b.key.key_id, 0..10, &mut a_frames).await;
+    for (side, (dg, fb), who) in [(&p.a, before[0], "A"), (&p.b, before[1], "B")] {
+        assert_eq!(
+            (
+                av(&side.metrics, "av_sent_datagram") - dg,
+                av(&side.metrics, "av_sent_datagram_fallback") - fb
+            ),
+            (0, 10),
+            "{who}'s media rode the Channel: {:?}",
+            side.metrics.av_plane()
+        );
+    }
     call_a.leave().await.expect("A leaves");
     call_b.leave().await.expect("B leaves");
 }

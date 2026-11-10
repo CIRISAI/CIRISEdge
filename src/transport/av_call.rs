@@ -2471,7 +2471,8 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         if a.takes_timed(member) {
             media_ttl.set(alm::AUDIO_TTL, alm::VIDEO_TTL);
         }
-        if a.takes_datagrams(member) {
+        // The host's lever (`set_av_datagrams_enabled`) gates a NEW leg only.
+        if a.takes_datagrams(member) && shared.transport.av_datagrams_enabled() {
             media_ttl.set_datagrams();
         }
     }
@@ -2556,7 +2557,7 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
     let caps = {
         let mut alm = Shared::lock(&shared.alm);
         alm.note_publisher(own_stream, &peer);
-        alm.caps_frame()
+        alm.caps_frame(shared.transport.av_datagrams_enabled())
     };
     Shared::lock(&shared.in_senders).insert(peer.clone(), Arc::clone(&sender));
     let deadline = tokio::time::Instant::now() + HELLO_BUDGET;
@@ -2728,9 +2729,10 @@ async fn handle_c3(shared: &Arc<Shared>, peer: &str, bytes: &[u8], reply_caps: b
                 let first = a.on_caps(peer, c);
                 (
                     Vec::new(),
-                    (first && reply_caps).then(|| a.caps_frame()),
+                    (first && reply_caps)
+                        .then(|| a.caps_frame(shared.transport.av_datagrams_enabled())),
                     first && a.takes_timed(peer),
-                    first && a.takes_datagrams(peer),
+                    first && a.takes_datagrams(peer) && shared.transport.av_datagrams_enabled(),
                 )
             }
             Ok(WireFrame::Control(cf)) => (a.on_control(peer, cf, rtt), None, false, false),

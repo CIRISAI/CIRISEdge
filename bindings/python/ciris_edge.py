@@ -478,6 +478,8 @@ def _uniffi_check_contract_api_version(lib):
         raise InternalError("UniFFI contract version mismatch: try cleaning and rebuilding your project")
 
 def _uniffi_check_api_checksums(lib):
+    if lib.uniffi_ciris_edge_checksum_func_av_datagrams_set_enabled() != 31336:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_crate_version() != 15809:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_current_ratchet_id() != 40339:
@@ -849,6 +851,11 @@ _UniffiLib.ffi_ciris_edge_rust_future_free_void.argtypes = (
     ctypes.c_uint64,
 )
 _UniffiLib.ffi_ciris_edge_rust_future_free_void.restype = None
+_UniffiLib.uniffi_ciris_edge_fn_func_av_datagrams_set_enabled.argtypes = (
+    ctypes.c_int8,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_ciris_edge_fn_func_av_datagrams_set_enabled.restype = None
 _UniffiLib.uniffi_ciris_edge_fn_func_crate_version.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -1118,6 +1125,9 @@ _UniffiLib.uniffi_ciris_edge_fn_func_transport_stats.restype = _UniffiRustBuffer
 _UniffiLib.ffi_ciris_edge_uniffi_contract_version.argtypes = (
 )
 _UniffiLib.ffi_ciris_edge_uniffi_contract_version.restype = ctypes.c_uint32
+_UniffiLib.uniffi_ciris_edge_checksum_func_av_datagrams_set_enabled.argtypes = (
+)
+_UniffiLib.uniffi_ciris_edge_checksum_func_av_datagrams_set_enabled.restype = ctypes.c_uint16
 _UniffiLib.uniffi_ciris_edge_checksum_func_crate_version.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_crate_version.restype = ctypes.c_uint16
@@ -3958,6 +3968,20 @@ class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):
     @staticmethod
     def write(value, buf):
         buf.write_u8(value)
+def av_datagrams_set_enabled(enabled: bool) -> None:
+    
+    _UniffiFfiConverterBoolean.check_lower(enabled)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterBoolean.lower(enabled),
+    )
+    _uniffi_lift_return = lambda val: None
+    _uniffi_error_converter = _UniffiFfiConverterTypeEdgeBindingsError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_ciris_edge_fn_func_av_datagrams_set_enabled,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 def crate_version() -> str:
     _uniffi_lowered_args = (
     )
@@ -4736,6 +4760,7 @@ __all__ = [
     "EdgeTransportSpec",
     "EdgeTransportStats",
     "EdgeTunnelInfo",
+    "av_datagrams_set_enabled",
     "crate_version",
     "current_ratchet_id",
     "identity_hash",

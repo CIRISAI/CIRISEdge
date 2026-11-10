@@ -330,6 +330,7 @@ to it, and a 1 is not visible from anywhere else.
 | `forward_packets_per_second` | `ciris.edge.forward.packets` | gauge | count | operator-only |
 | `forward_bits_per_second` | `ciris.edge.forward.bits` | gauge | count | operator-only |
 | `shaping_enabled` | `ciris.edge.shaping.enabled` | gauge | count | operator-only |
+| `av_datagrams_enabled` | `ciris.edge.av.datagrams.enabled` | gauge | count | operator-only |
 | `shaping_links` | `ciris.edge.shaping.links` | gauge | count | operator-only |
 | `shaping_free_slots` | `ciris.edge.shaping.free_slots` | gauge | count | operator-only |
 | `shaping_seat_roster_age_seconds` | `ciris.edge.shaping.seat_roster.age` | gauge | seconds | operator-only |

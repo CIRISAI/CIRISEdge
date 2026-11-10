@@ -531,7 +531,8 @@ pub use ffi::uniffi_impl_routing::{
 };
 #[cfg(feature = "ffi-uniffi")]
 pub use ffi::uniffi_impl_shaping::{
-    onion_set_enabled, onion_status, shaping_class_table, shaping_set_device_state, shaping_status,
+    av_datagrams_set_enabled, onion_set_enabled, onion_status, shaping_class_table,
+    shaping_set_device_state, shaping_status,
 };
 
 // The included scaffolding emits ~30 `#[unsafe(no_mangle)]` FFI shim

@@ -2333,6 +2333,21 @@ impl Edge {
         tier
     }
 
+    /// leviculum#102 — **the A/V datagram lever**: whether new A/V legs may
+    /// carry media as unordered link datagrams. Default on. Off, a leg that
+    /// comes up from now on neither advertises `CAP_LINK_DATAGRAMS` in its C3
+    /// `CAPS` nor sends datagrams, so its media rides the Channel
+    /// (`try_send_timed`); a leg already on datagrams keeps them (the switch
+    /// is one-way per leg). Edge never moves it on its own; the gauge is
+    /// `av_datagrams_enabled`. No-op without the Reticulum transport.
+    pub fn set_av_datagrams_enabled(&self, enabled: bool) {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            t.set_av_datagrams_enabled(enabled);
+        }
+        let _ = enabled;
+    }
+
     /// `CLM-shaping-offered-never-refused` — how long past its last real frame
     /// a shaped link a peer asked of this node lives, when this node does not
     /// offer shaping by default. Default ten minutes.

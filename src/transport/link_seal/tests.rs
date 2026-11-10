@@ -82,6 +82,34 @@ fn datagrams_open_out_of_order_once_on_their_own_lane() {
     ));
 }
 
+/// leviculum#102 — the lane is bound into the AEAD (nonce byte 0 and AAD byte
+/// 1): a Datagram-lane frame offered to the Channel's open fails to
+/// authenticate, and a Channel frame offered to the Datagram open does too,
+/// even at a counter the other lane's window has never seen. Each refusal
+/// closes the link, as any frame that fails to open does.
+#[test]
+fn a_frame_never_opens_on_the_other_of_channel_and_datagram() {
+    for (sent_on, offered_to) in [
+        (Lane::Datagram, Lane::Channel),
+        (Lane::Channel, Lane::Datagram),
+    ] {
+        let (a, b) = keyed_pair();
+        // Counter 0 on its own lane: the other lane's window is still empty,
+        // so only the lane binding can refuse it.
+        let frame = a.seal(LINK, sent_on, b"media or row").expect("seal");
+        let out = if offered_to == Lane::Channel {
+            feed(&b, Lane::Channel, &frame, false)
+        } else {
+            b.open(LINK, Lane::Datagram, &frame)
+        };
+        assert!(
+            matches!(out, Inbound::Refuse(SealRefusal::OpenFailed)),
+            "a {sent_on:?} frame offered to {offered_to:?} must fail to open: {out:?}"
+        );
+        assert!(!b.is_sealed(LINK), "the refusal closes the link");
+    }
+}
+
 #[test]
 fn frames_open_in_both_directions_on_every_lane_e1() {
     let (a, b) = keyed_pair();

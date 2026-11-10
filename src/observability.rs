@@ -3929,6 +3929,7 @@ impl EdgeMetrics {
             forward_packets_per_second: t.forward_packets_per_second,
             forward_bits_per_second: t.forward_bits_per_second,
             shaping_enabled: t.shaping_enabled,
+            av_datagrams_enabled: t.av_datagrams_enabled,
             shaping_links: t.shaping_links,
             shaping_free_slots: t.shaping_free_slots,
             shaping_seat_roster_age_seconds: t.shaping_seat_roster_age_seconds,
@@ -4353,6 +4354,8 @@ pub struct EdgeMetricsBundle {
     pub forward_bits_per_second: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub shaping_enabled: u64,
+    /// leviculum#102 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub av_datagrams_enabled: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub shaping_links: HashMap<String, u64>,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
@@ -4849,6 +4852,7 @@ impl EdgeMetricsBundle {
             ),
             ("forward_bits_per_second", self.forward_bits_per_second),
             ("shaping_enabled", self.shaping_enabled),
+            ("av_datagrams_enabled", self.av_datagrams_enabled),
             ("shaping_free_slots", self.shaping_free_slots),
             ("leviculum_shed_packets", self.leviculum_shed_packets),
             ("direct_link_proposing", self.direct_link_proposing),
@@ -5010,6 +5014,7 @@ edge_metrics_bundle_fields!(
     forward_packets_per_second,
     forward_bits_per_second,
     shaping_enabled,
+    av_datagrams_enabled,
     shaping_links,
     shaping_free_slots,
     shaping_seat_roster_age_seconds,

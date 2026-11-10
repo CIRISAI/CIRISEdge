@@ -283,9 +283,15 @@ impl AlmState {
         self.caps_withheld = bits;
     }
 
-    /// This node's `CAPS` frame.
-    pub(super) fn caps_frame(&self) -> Vec<u8> {
-        encode_caps(self.caps_bits())
+    /// This node's `CAPS` frame. `offer_datagrams` false (the host's
+    /// `set_av_datagrams_enabled(false)`) leaves `CAP_LINK_DATAGRAMS` out.
+    pub(super) fn caps_frame(&self, offer_datagrams: bool) -> Vec<u8> {
+        let off = if offer_datagrams {
+            0
+        } else {
+            CAP_LINK_DATAGRAMS
+        };
+        encode_caps(self.caps_bits() & !off)
     }
 
     /// Whether `peer` said it speaks C3.

@@ -264,6 +264,11 @@ namespace ciris_edge {
 
     [Throws=EdgeBindingsError]
     EdgeOnionStatus onion_status();
+
+    // leviculum#102 — the A/V datagram lever: whether new A/V legs may carry
+    // media as unordered link datagrams. Default on; edge never moves it.
+    [Throws=EdgeBindingsError]
+    void av_datagrams_set_enabled(boolean enabled);
 };
 
 // ─── Error type ─────────────────────────────────────────────────────

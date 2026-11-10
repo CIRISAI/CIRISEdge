@@ -484,6 +484,7 @@ pub struct TelemetrySnapshot {
     pub forward_packets_per_second: u64,
     pub forward_bits_per_second: u64,
     pub shaping_enabled: u64,
+    pub av_datagrams_enabled: u64,
     pub shaping_links: HashMap<String, u64>,
     pub shaping_free_slots: u64,
     pub shaping_seat_roster_age_seconds: f64,
@@ -571,6 +572,7 @@ pub struct EdgeTelemetry {
     forward_pps: AtomicU64,
     forward_bps: AtomicU64,
     shaping_enabled: AtomicU64,
+    av_datagrams_enabled: AtomicU64,
     shaping_links_counted: AtomicU64,
     shaping_links_seat: AtomicU64,
     shaping_free_slots: AtomicU64,
@@ -623,6 +625,7 @@ impl Default for EdgeTelemetry {
             forward_pps: AtomicU64::new(0),
             forward_bps: AtomicU64::new(0),
             shaping_enabled: AtomicU64::new(0),
+            av_datagrams_enabled: AtomicU64::new(1),
             shaping_links_counted: AtomicU64::new(0),
             shaping_links_seat: AtomicU64::new(0),
             shaping_free_slots: AtomicU64::new(0),
@@ -868,6 +871,13 @@ impl EdgeTelemetry {
             .store(u64::from(free_slots), Ordering::Relaxed);
     }
 
+    /// leviculum#102 — whether new A/V legs may use unordered datagrams (the
+    /// host's `set_av_datagrams_enabled` lever).
+    pub fn set_av_datagrams_enabled(&self, enabled: bool) {
+        self.av_datagrams_enabled
+            .store(u64::from(enabled), Ordering::Relaxed);
+    }
+
     /// The seat roster was read just now.
     pub fn note_seat_roster_read(&self) {
         self.seat_roster_read_at_ms
@@ -1100,6 +1110,7 @@ impl EdgeTelemetry {
             forward_packets_per_second: self.forward_pps.load(Ordering::Relaxed),
             forward_bits_per_second: self.forward_bps.load(Ordering::Relaxed),
             shaping_enabled: self.shaping_enabled.load(Ordering::Relaxed),
+            av_datagrams_enabled: self.av_datagrams_enabled.load(Ordering::Relaxed),
             shaping_links: HashMap::from([
                 (
                     "counted".to_string(),
@@ -1394,6 +1405,7 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("forward_packets_per_second", "ciris.edge.forward.packets", Gauge, Count, None, "Packets forwarded per second, over the last reading."),
     spec("forward_bits_per_second", "ciris.edge.forward.bits", Gauge, Count, None, "Bits forwarded per second, over the last reading."),
     spec("shaping_enabled", "ciris.edge.shaping.enabled", Gauge, Count, None, "1 when this node offers shaping. 0 explains a silent `link_shaping` family."),
+    spec("av_datagrams_enabled", "ciris.edge.av.datagrams.enabled", Gauge, Count, None, "1 when new A/V legs may carry media as unordered link datagrams (leviculum#102; the host's `set_av_datagrams_enabled` lever, default on). 0 explains `av_sent_datagram_fallback` on legs whose peer takes datagrams."),
     spec("shaping_links", "ciris.edge.shaping.links", Gauge, Count, closed("kind", SHAPING_LINK_KINDS), "Shaped links: those that count toward the bound, and seat links."),
     spec("shaping_free_slots", "ciris.edge.shaping.free_slots", Gauge, Count, None, "Slots a new peer could take here."),
     spec("shaping_seat_roster_age_seconds", "ciris.edge.shaping.seat_roster.age", Gauge, Seconds, None, "Age of the last roster read that worked. -1: none has."),

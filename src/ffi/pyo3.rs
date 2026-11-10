@@ -544,6 +544,15 @@ impl PyEdge {
         Ok(self.inner.set_load_pressure(p).as_u8())
     }
 
+    /// leviculum#102 — **the A/V datagram lever**: whether new A/V legs may
+    /// carry media as unordered link datagrams. Default on. Off, a new leg
+    /// neither advertises datagrams in its C3 `CAPS` nor sends them; a leg
+    /// already on datagrams keeps them. Edge never moves it on its own; the
+    /// gauge is `av_datagrams_enabled`.
+    fn set_av_datagrams_enabled(&self, enabled: bool) {
+        self.inner.set_av_datagrams_enabled(enabled);
+    }
+
     /// `CLM-shaping-offered-never-refused` — seconds past its last real frame
     /// that a shaped link a peer asked of this node lives. Raises `ValueError`
     /// on a value that is no duration.
@@ -3629,6 +3638,7 @@ fn telemetry_into_pydict(
         ("load_tier", b.load_tier),
         ("load_host_pressure", b.load_host_pressure),
         ("shaping_enabled", b.shaping_enabled),
+        ("av_datagrams_enabled", b.av_datagrams_enabled),
         ("shaping_free_slots", b.shaping_free_slots),
         ("leviculum_shed_packets", b.leviculum_shed_packets),
         ("direct_link_proposing", b.direct_link_proposing),

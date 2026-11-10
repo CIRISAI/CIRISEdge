@@ -3134,6 +3134,9 @@ pub struct ReticulumTransport {
     /// Test seam — the C3 `CAPS` bits calls on this node leave out
     /// ([`Self::set_av_caps_withheld_for_test`]). 0 in production.
     av_caps_withheld: std::sync::atomic::AtomicU32,
+    /// leviculum#102 — the host's A/V datagram lever
+    /// ([`Self::set_av_datagrams_enabled`]). Default on.
+    av_datagrams_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// CIRISEdge#805 — the peer each A/V link THIS node dialled was dialled
     /// to ([`Self::open_av_link`]): the initiator-side attribution basis.
     /// The dial resolved the peer's transport key from its verified route
@@ -4326,6 +4329,7 @@ impl ReticulumTransport {
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
             av_datagram_fold: Arc::default(),
             av_caps_withheld: std::sync::atomic::AtomicU32::new(0),
+            av_datagrams_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_paths,
             direct_link_retry: std::sync::atomic::AtomicBool::new(direct_link_retry),
@@ -6070,6 +6074,29 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub fn set_stranger_handshake_cap_for_test(&self, cap: u32) {
         self.seals.set_stranger_handshake_cap(cap);
+    }
+
+    /// leviculum#102 — **the A/V datagram lever**, the host's to pull: whether
+    /// A/V legs that come up from now on may carry media as unordered link
+    /// datagrams. Default on. Off, a new leg neither advertises
+    /// `CAP_LINK_DATAGRAMS` in its C3 `CAPS` nor switches its media to
+    /// datagrams; a leg already on datagrams keeps them (one-way per leg).
+    /// Edge never moves it on its own. Read back as the
+    /// `av_datagrams_enabled` gauge.
+    pub fn set_av_datagrams_enabled(&self, enabled: bool) {
+        self.av_datagrams_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        if let Some(m) = self.metrics.get() {
+            m.telemetry.set_av_datagrams_enabled(enabled);
+        }
+    }
+
+    /// leviculum#102 — the A/V datagram lever's position
+    /// ([`Self::set_av_datagrams_enabled`]).
+    #[must_use]
+    pub fn av_datagrams_enabled(&self) -> bool {
+        self.av_datagrams_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// leviculum#102 test seam — calls joined on this node from now on leave
@@ -10816,6 +10843,8 @@ impl Transport for ReticulumTransport {
         if let Some(m) = self.metrics.get() {
             mirror_planes(&self.node, m);
             fold_av_datagrams(&self.node, &self.av_sink, &self.av_datagram_fold, m);
+            m.telemetry
+                .set_av_datagrams_enabled(self.av_datagrams_enabled());
         }
     }
 
@@ -11142,6 +11171,7 @@ struct NodeTick {
     metrics: Option<crate::observability::EdgeMetrics>,
     av_sink: Arc<crate::transport::av_sink::AvSink>,
     av_datagram_fold: Arc<std::sync::Mutex<AvDatagramFold>>,
+    av_datagrams_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NodeTick {
@@ -11173,6 +11203,10 @@ impl NodeTick {
         t.set_seal_held(held);
         mirror_planes(node, m);
         fold_av_datagrams(node, &self.av_sink, &self.av_datagram_fold, m);
+        t.set_av_datagrams_enabled(
+            self.av_datagrams_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         let policy = self.shapers.policy();
         let seat = self.shapers.links_of(ShapingClass::Seat);
         t.set_shaping(
@@ -11238,6 +11272,7 @@ impl ReticulumTransport {
             metrics: self.metrics.get().cloned(),
             av_sink: Arc::clone(&self.av_sink),
             av_datagram_fold: Arc::clone(&self.av_datagram_fold),
+            av_datagrams_enabled: Arc::clone(&self.av_datagrams_enabled),
         }
     }
 
