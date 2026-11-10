@@ -1046,7 +1046,7 @@ async fn a_running_edge_armed_late_serves_and_pulls_the_room_body() {
 /// The owner's signer of `node`, over the seed `node()` registered it from.
 fn owner_signer(node: &Node, seed: u8) -> Arc<ciris_edge::identity::LocalSigner> {
     let hw: Arc<dyn HardwareSigner> = Arc::new(
-        Ed25519SoftwareSigner::from_bytes(&[seed; 32], &format!("{}-engine", node.identity))
+        Ed25519SoftwareSigner::from_bytes(&[seed; 32], format!("{}-engine", node.identity))
             .expect("the owner's ed half"),
     );
     let pqc: Arc<dyn PqcSigner> = Arc::new(
