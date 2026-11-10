@@ -114,9 +114,13 @@ v0.34.0+ciris.2 (#102 A/V media on unordered datagrams, #104 probed MTU). MSRV 1
   `edge.first_contact`, `edge.membership`, `edge.chat`, `edge.av_call`, `edge.blob.durability`,
   and for the bundle-seat reads #971 adds, `edge.bundle.seats` (the serve nodes' key-record check)
   and `edge.transport.carriable` (the round-start transit-pair read)), so persist's
-  `observe::snapshot().callers` splits the read rate by site. The innermost scope wins. These are
-  26 of persist's 32 caller labels; a host that adds more than 6 of its own sees the rest under
-  `other`.
+  `observe::snapshot().callers` splits the read rate by site. The innermost scope wins. A label
+  counts only where persist books the door: today persist counts the attestation-row doors and
+  not `lookup_public_key`, so `edge.bundle.seats` does not appear in `snapshot().callers` yet
+  (asked on CIRISPersist#1249), and whether the transit-pair read behind
+  `edge.transport.carriable` passes a counted door is untraced. A read outside every scope books
+  as persist's `unattributed`. These are 26 of persist's 32 caller labels; a host that adds more
+  than 6 of its own sees the rest under `other`.
 - **Naming a shaping class is no longer the shaping opt-in (CIRISEdge#969, CC 5.4.3).**
   `init_edge_runtime(shaping_class="home" | "phone-wifi" | "phone-cellular")` used to shape every
   identity link while seeding the device with no opt-in, so the policy and the device disagreed.
