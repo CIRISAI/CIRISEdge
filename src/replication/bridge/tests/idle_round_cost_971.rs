@@ -63,31 +63,57 @@ impl Transport for Arc<Bytes> {
     }
 }
 
-/// Seed one `scores` row by the seat about itself, waiting out persist's
-/// per-peer admission burst (`RateLimited { PeerBurst }`, v61.2.2) instead of
-/// failing: the store has to span more than one index page, which is more
-/// rows than one burst admits.
-async fn seed_paced(backend: &SqliteBackend, id: &str, envelope: serde_json::Value) {
-    for _ in 0..600 {
-        match try_seed_scoped_attestation(
-            backend,
-            id,
-            SEAT,
-            SEAT,
-            "scores",
-            "federation",
-            envelope.clone(),
-        )
-        .await
-        {
-            Ok(()) => return,
-            Err(e) if e.contains("RateLimited") => {
-                tokio::time::sleep(Duration::from_millis(1_050)).await;
+/// Rows one attester seeds: under persist v61.2.2's per-peer burst (600 rows
+/// a window), so no seed waits on the limiter.
+const ROWS_PER_ATTESTER: usize = 500;
+
+/// Seed `n` `scores` rows about the seat, `ROWS_PER_ATTESTER` per attester
+/// (each a registered NODE key signed by its fixture signer), so the
+/// attestation index spans `n / 1024` pages without tripping the per-peer
+/// admission burst. A `RateLimited` refusal still waits out its hint once
+/// more rather than failing; any other refusal panics.
+async fn seed_store(backend: &SqliteBackend, prefix: &str, n: usize) {
+    let attesters: Vec<String> = (0..n.div_ceil(ROWS_PER_ATTESTER))
+        .map(|j| format!("{SEAT}-w{j:02}"))
+        .collect();
+    let pairs: Vec<(&str, &str)> = attesters
+        .iter()
+        .map(|a| (a.as_str(), identity_type::NODE))
+        .collect();
+    register_fixture_keys(backend, &pairs).await;
+    for i in 0..n {
+        let attester = &attesters[i / ROWS_PER_ATTESTER];
+        let id = format!("{prefix}-{i:05}");
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": attester,
+            "attested_key_id": SEAT,
+            "attestation_type": "scores",
+            "dimension": "idle:row:v1",
+            "payload": { "n": i },
+        });
+        let mut tries = 0;
+        loop {
+            match try_seed_scoped_attestation(
+                backend,
+                &id,
+                attester,
+                SEAT,
+                "scores",
+                "federation",
+                envelope.clone(),
+            )
+            .await
+            {
+                Ok(()) => break,
+                Err(e) if e.contains("RateLimited") && tries < 120 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(1_050)).await;
+                }
+                Err(e) => panic!("seed {id}: {e}"),
             }
-            Err(e) => panic!("seed {id}: {e}"),
         }
     }
-    panic!("seed {id}: still rate limited after 600 waits");
 }
 
 fn permits(m: &crate::observability::EdgeMetrics) -> u64 {
@@ -97,26 +123,16 @@ fn permits(m: &crate::observability::EdgeMetrics) -> u64 {
         .count
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_idle_bootstrap_round_costs_the_seat_971() {
+/// One idle round per bootstrap plane against a seat whose store holds `n`
+/// attestation rows. Returns `(kind, index_pages, permits, wall)` per plane.
+async fn idle_rounds_at(n: usize) -> Vec<(EnvelopeKind, usize, u64, Duration)> {
     let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     register_fixture_keys(
         &backend,
         &[(SEAT, identity_type::NODE), (DEVICE, identity_type::NODE)],
     )
     .await;
-    for i in 0..ATTESTATIONS {
-        let id = format!("idle-971-{i:05}");
-        let envelope = serde_json::json!({
-            "id": id,
-            "attesting_key_id": SEAT,
-            "attested_key_id": SEAT,
-            "attestation_type": "scores",
-            "dimension": "idle:row:v1",
-            "payload": { "n": i },
-        });
-        seed_paced(&backend, &id, envelope).await;
-    }
+    seed_store(&backend, "idle-971", n).await;
     let counting = CountingDirectory::new(backend.clone());
     let directory: Arc<dyn FederationDirectory> = Arc::new(counting.clone());
     let wire = Arc::new(Bytes::default());
@@ -152,6 +168,7 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
                 refs: Vec::new(),
             });
             let bytes = wire_frame::wrap_v3(&summary, RoundSide::Initiator, round * 10 + pass);
+            let t0 = std::time::Instant::now();
             registry
                 .route_inbound_bytes(DEVICE, &bytes)
                 .await
@@ -161,8 +178,10 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
             while wire.frames.load(std::sync::atomic::Ordering::Relaxed) == f0
                 && tokio::time::Instant::now() < deadline
             {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
+            // Summary in → the responder's reply on the wire (1 ms poll).
+            let wall = t0.elapsed();
             tokio::time::sleep(Duration::from_millis(200)).await;
             if pass == 1 {
                 let counts = counting.counts();
@@ -173,12 +192,13 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
                     permits(&metrics) - p0,
                     wire.sent.load(std::sync::atomic::Ordering::Relaxed) - b0,
                     counts,
+                    wall,
                 ));
             }
         }
     }
     let mut total = (0usize, 0usize, 0u64, 0usize);
-    for (kind, reads, pages, permits, bytes, counts) in &rows {
+    for (kind, reads, pages, permits, bytes, counts, wall) in &rows {
         // A sweep permit is taken per index page (`holdings_from_wire_index`)
         // and per other sweep read (the advertise pages, a consent-set read on
         // a memo miss): `permits - index_pages` is everything that is not the
@@ -186,7 +206,8 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
         let other = permits.saturating_sub(u64::try_from(*pages).unwrap_or(0));
         eprintln!(
             "971 idle {kind:?}: directory_calls={reads} index_pages={pages} permits={permits} \
-             permits_not_holdings={other} reply_bytes={bytes} by_method={counts:?}"
+             permits_not_holdings={other} reply_bytes={bytes} wall_us={} by_method={counts:?}",
+            wall.as_micros()
         );
         total.0 += reads;
         total.1 += pages;
@@ -195,7 +216,7 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
     }
     eprintln!(
         "971 idle ALL FIVE PLANES (one device, one cadence): directory_calls={} \
-         index_pages={} permits={} reply_bytes={} (store: {ATTESTATIONS} attestation rows)",
+         index_pages={} permits={} reply_bytes={} (store: {n} attestation rows)",
         total.0, total.1, total.2, total.3
     );
     assert!(
@@ -203,6 +224,37 @@ async fn an_idle_bootstrap_round_costs_the_seat_971() {
         "every plane's idle Summary is answered"
     );
     rt.shutdown().await;
+    rows.into_iter()
+        .map(|(kind, _, pages, permits, _, _, wall)| (kind, pages, permits, wall))
+        .collect()
+}
+
+/// **The idle round's seat cost, and its slope per index page and per
+/// decoded hash.** Two store sizes (1,100 and 3,100 rows: 2 and 4 index pages
+/// of 1,024), one idle round per plane at each. The fit is per plane:
+/// `us_per_page = Δwall / Δpages`, `us_per_hash = Δwall / Δrows`. A plane
+/// whose pages do not move with the store does not drain the attestation
+/// index. Printed (`971 idle fit`) for the twin's CPU-per-page term.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::cast_precision_loss)] // microseconds and page counts
+async fn an_idle_bootstrap_round_costs_the_seat_971() {
+    const SMALL: usize = 1_100;
+    const LARGE: usize = 3_100;
+    let small = idle_rounds_at(SMALL).await;
+    let large = idle_rounds_at(LARGE).await;
+    for ((kind, p1, q1, w1), (_, p2, q2, w2)) in small.iter().zip(&large) {
+        let dp = p2.saturating_sub(*p1);
+        let dw = w2.as_micros() as f64 - w1.as_micros() as f64;
+        let per_page = if dp > 0 { dw / dp as f64 } else { f64::NAN };
+        let per_hash = dw / (LARGE - SMALL) as f64;
+        eprintln!(
+            "971 idle fit {kind:?}: pages {p1}->{p2} permits {q1}->{q2} wall_us {}->{} \
+             us_per_page={per_page:.1} us_per_hash={per_hash:.3} drains_index={}",
+            w1.as_micros(),
+            w2.as_micros(),
+            dp > 0
+        );
+    }
 }
 
 /// The seat's complete Key-plane offer (the unbound, `Full` view: every
@@ -280,18 +332,7 @@ async fn an_idle_bundle_pull_costs_the_seat_971() {
         &[(SEAT, identity_type::NODE), (DEVICE, identity_type::NODE)],
     )
     .await;
-    for i in 0..ATTESTATIONS {
-        let id = format!("idle-pull-971-{i:05}");
-        let envelope = serde_json::json!({
-            "id": id,
-            "attesting_key_id": SEAT,
-            "attested_key_id": SEAT,
-            "attestation_type": "scores",
-            "dimension": "idle:row:v1",
-            "payload": { "n": i },
-        });
-        seed_paced(&backend, &id, envelope).await;
-    }
+    seed_store(&backend, "idle-pull-971", ATTESTATIONS).await;
     let counting = CountingDirectory::new(backend.clone());
     let directory: Arc<dyn FederationDirectory> = Arc::new(counting.clone());
     let wire = Arc::new(Bytes::default());
