@@ -90,7 +90,9 @@ use tracing::Instrument;
 use tokio::sync::{mpsc, watch};
 
 use super::coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};
-use super::no_route_backoff::{Admission, NoRouteBackoff, NoRouteBackoffEntry, RoundClass};
+use super::no_route_backoff::{
+    Admission, NoRouteBackoff, NoRouteBackoffEntry, RoundClass, RoundTicket,
+};
 use super::protocol::EnvelopeKind;
 use super::session::SessionRole;
 use crate::transport::TransportError;
@@ -1457,6 +1459,14 @@ impl GatedRound<'_> {
             tracing::trace!("round skipped — peer is in no-route backoff (CIRISEdge#794)");
             return (RoundRan::Skipped, RoundLine::default());
         };
+        // CIRISEdge#971 — the ONE round-start choke, every plane and both
+        // arms: a round the transport cannot carry (no live link, no path, no
+        // transit pair: CC 5.3.3.5 E1) is not started. No permit, no sweep, no
+        // seek. It ends `no_route` exactly as its send would have, so the
+        // outcome counter and #794's backoff see the same thing as before.
+        if !self.coord.round_carriable().await {
+            return self.not_carriable(ticket).await;
+        }
         let mut seat = RoundSeat::take(self.round_gate, self.peer_id, self.kind_str).await;
         // Another plane may have found the peer unroutable while this one
         // waited for its permit.
@@ -1501,6 +1511,41 @@ impl GatedRound<'_> {
             error: ended.error,
         };
         (ran, line)
+    }
+}
+
+impl GatedRound<'_> {
+    /// CIRISEdge#971 — book a round the transport cannot carry as the
+    /// `no_route` its send would have ended in, without running it.
+    async fn not_carriable(&self, ticket: RoundTicket<'_>) -> (RoundRan, RoundLine) {
+        let error = format!(
+            "transport: no rule reaches {} now: no live link, no path, no transit pair \
+             (CC 5.3.3.5 E1; CIRISEdge#971)",
+            self.peer_id
+        );
+        if let Some(m) = self.metrics {
+            m.inc_replication_reach(crate::observability::REPLICATION_REACH_ROUND_SKIPPED);
+        }
+        log_round_error(
+            self.peer_id,
+            self.coord.kind(),
+            "round not started: the peer cannot be reached (CIRISEdge#971)",
+            &error,
+        );
+        self.coord.note_round_ended(true);
+        let event = RoundEvent::NoRoute(error.clone());
+        if let Some(sink) = self.event_sink {
+            let _ = sink.send((self.peer_id.to_string(), event)).await;
+        }
+        ticket.finish(RoundClass::NoRoute(error.clone()));
+        (
+            RoundRan::Ended,
+            RoundLine {
+                took_ms: 0,
+                outcome: crate::observability::RoundOutcome::NoRoute.as_str(),
+                error: Some(error),
+            },
+        )
     }
 }
 

@@ -9476,14 +9476,24 @@ impl ReticulumTransport {
         if dests.is_empty() || known() {
             return !dests.is_empty();
         }
-        let until = ask_for_paths(&self.node, &self.path_seeks, dests).await;
+        let (until, asked) = ask_for_paths(&self.node, &self.path_seeks, dests).await;
+        for _ in 0..asked {
+            self.note_reach(crate::observability::REPLICATION_REACH_PATH_REQUEST_SENT);
+        }
         while std::time::Instant::now() < until {
             if known() {
+                self.note_reach(crate::observability::REPLICATION_REACH_PATH_SEEK_FOUND);
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        known()
+        let found = known();
+        self.note_reach(if found {
+            crate::observability::REPLICATION_REACH_PATH_SEEK_FOUND
+        } else {
+            crate::observability::REPLICATION_REACH_PATH_SEEK_NOT_FOUND
+        });
+        found
     }
 
     /// [`Self::seek_peer`] for a dial that has nothing else to go on: a call or
@@ -9975,6 +9985,54 @@ impl ReticulumTransport {
     async fn live_link_to(&self, destination_key_id: &str, plane: LinkPlane) -> Option<LinkId> {
         self.live_link_to_where(destination_key_id, plane, |_| true)
             .await
+    }
+
+    /// **CIRISEdge#971 — the ONE answer to "can no rule reach this peer
+    /// now?"**, for a replication send and for the round that would make it
+    /// ([`Transport::round_carriable`]). `true` only when all three hold:
+    ///
+    /// 1. no live attributed identity-plane link to it ([`Self::live_link_to`],
+    ///    the reverse path's own lookup, CIRISEdge#353), so nothing the peer
+    ///    opened can carry the frame;
+    /// 2. no dial candidate this node holds a path to, so no dial can leave
+    ///    (a pathed one with no pair is still dialled: E1's pre-seal route
+    ///    fetch, `dial_transit_pair`);
+    /// 3. no transit pair authenticated to it (persist's resolver, the same
+    ///    one `dial_transit_pair` asks), so CC 5.3.3.5 E1 forbids the dial even
+    ///    if a seek found a path: it would end "never dialled", after the seek.
+    ///
+    /// A pair read that ERRORS is not "no pair": the answer is `false` and the
+    /// send runs as before. Nothing here is counted or changed.
+    async fn undialable_now(&self, destination_key_id: &str, candidates: &[DialCandidate]) -> bool {
+        if self
+            .live_link_to(destination_key_id, LinkPlane::Identity)
+            .await
+            .is_some()
+        {
+            return false;
+        }
+        if candidates.iter().any(|c| self.node.has_path(&c.dest_hash)) {
+            return false;
+        }
+        matches!(
+            self.seals
+                .resolve_pair(self.rooting.as_deref(), destination_key_id, None)
+                .await,
+            Err(crate::transport::av_transit_handshake::AvHandshakeError::NoTransitPair { .. })
+        )
+    }
+
+    /// [`Self::undialable_now`] over this peer's own dial candidates: the
+    /// round-start hint.
+    async fn undialable(&self, destination_key_id: &str) -> bool {
+        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        self.undialable_now(destination_key_id, &candidates).await
+    }
+
+    fn note_reach(&self, label: &'static str) {
+        if let Some(m) = self.metrics.get() {
+            m.inc_replication_reach(label);
+        }
     }
 
     /// Whether `peer`'s row link was refused at a bound within
@@ -10808,6 +10866,10 @@ impl ReticulumTransport {
 // attributes the lint to the impl, so the allow lives here (v13.6.1).
 #[allow(clippy::too_many_lines)]
 impl Transport for ReticulumTransport {
+    async fn round_carriable(&self, destination_key_id: &str) -> bool {
+        !self.undialable(destination_key_id).await
+    }
+
     fn pacing_gap(&self, destination_key_id: &str) -> Option<Duration> {
         self.shapers.gap_to_peer(destination_key_id)
     }
@@ -11740,6 +11802,39 @@ impl ReticulumTransport {
         // reverse-path attempt. See `resolve_dial_candidates` /
         // `select_dial_candidate` for the holistic-fix rationale.
         let mut candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let replication = is_replication_frame(envelope_bytes);
+        // CIRISEdge#971 — a replication frame toward a peer no rule can reach
+        // (no live link, no path, no pair: CC 5.3.3.5 E1) is refused here,
+        // before the 3 s path seek and its broadcast, which could only end in
+        // "never dialled". Booked `no_route` as before (#794's backoff takes
+        // it); the peer's own rounds, or its link when it opens one, carry it.
+        if replication && self.undialable_now(destination_key_id, &candidates).await {
+            self.note_reach(crate::observability::REPLICATION_REACH_SKIPPED_UNDIALABLE);
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                no_route_log().check(destination_key_id)
+            {
+                tracing::info!(
+                    destination_key_id,
+                    suppressed_prev,
+                    "replication/send: no live link, no path and no authenticated transit pair \
+                     for this peer, so no rule can reach it (CC 5.3.3.5 E1); refused without a \
+                     path seek. Its own rounds, or a link it opens, carry it (tracked: \
+                     CIRISEdge#971)"
+                );
+            }
+            self.persisted_standing.note_unaddressed(destination_key_id);
+            return Err(match candidates.first() {
+                Some(c) => TransportError::NoRouteToPeer {
+                    key_id: destination_key_id.to_owned(),
+                    target_dest: hex::encode(c.dest_hash.into_bytes()),
+                    has_path: false,
+                    paths: "<not sought: undialable (CIRISEdge#971)>".to_owned(),
+                },
+                None => TransportError::NoDialCandidate {
+                    key_id: destination_key_id.to_owned(),
+                },
+            });
+        }
         if candidates.is_empty() && self.seek_peer(destination_key_id).await {
             candidates = self.resolve_dial_candidates(destination_key_id).await;
         }
@@ -11828,6 +11923,9 @@ impl ReticulumTransport {
             .send_via_reverse_path(destination_key_id, envelope_bytes, None)
             .await
         {
+            if replication {
+                self.note_reach(crate::observability::REPLICATION_REACH_CARRIED_ON_INBOUND_LINK);
+            }
             // CIRISEdge#920 — the peer's own link to us is the identity link
             // between the two nodes too: a room peer that only ever replies
             // must still bring it direct.
@@ -11865,6 +11963,9 @@ impl ReticulumTransport {
                 .is_some()
         {
             return Err(self.bulk_refusal(destination_key_id, envelope_bytes.len()));
+        }
+        if replication {
+            self.note_reach(crate::observability::REPLICATION_REACH_DIALLED);
         }
         let lane = self
             .identity_lane(
@@ -19393,12 +19494,13 @@ fn is_replication_frame(envelope: &[u8]) -> bool {
 type PathSeeks = Arc<std::sync::Mutex<HashMap<DestinationHash, std::time::Instant>>>;
 
 /// Raise the path requests `dests` are due. Returns when the answers can
-/// stop being waited for: an ask still in flight counts, an old one does not.
+/// stop being waited for (an ask still in flight counts, an old one does
+/// not), and how many requests were raised now (CIRISEdge#971's gauge).
 async fn ask_for_paths(
     node: &ReticulumNode,
     seeks: &PathSeeks,
     dests: &[DestinationHash],
-) -> std::time::Instant {
+) -> (std::time::Instant, usize) {
     let now = std::time::Instant::now();
     let mut ask: Vec<DestinationHash> = Vec::new();
     let mut until = now;
@@ -19430,7 +19532,7 @@ async fn ask_for_paths(
             tracing::debug!(error = %e, "path request not sent");
         }
     }
-    until
+    (until, ask.len())
 }
 
 /// The late joiner's ask (#945), for a peer the no-route backoff has stopped
@@ -19452,7 +19554,7 @@ async fn ask_through_landed_routes(
             .and_then(|b| <[u8; 16]>::try_from(b).ok());
         if let Some(hash) = hash {
             tracing::debug!(peer = %key, "a wanted peer's route landed; asking for its path");
-            ask_for_paths(&node, &seeks, &[DestinationHash::new(hash)]).await;
+            let _ = ask_for_paths(&node, &seeks, &[DestinationHash::new(hash)]).await;
         }
     }
 }

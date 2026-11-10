@@ -3221,6 +3221,16 @@ fn metrics_bundle_to_pydict<'py>(
         advertise.set_item(label.as_str(), *n)?;
     }
     root.set_item("advertise", advertise)?;
+    for (name, family) in [
+        ("replication_reach", &bundle.replication_reach),
+        ("initiator_peers", &bundle.initiator_peers),
+    ] {
+        let d = pyo3::types::PyDict::new(py);
+        for (label, n) in family {
+            d.set_item(label.as_str(), *n)?;
+        }
+        root.set_item(name, d)?;
+    }
     root.set_item("direct_links_active", bundle.direct_links_active)?;
     // v44.1 — the host's shed levers and what this node forwards for others.
     for (key, map) in [

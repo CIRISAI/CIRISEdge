@@ -1957,6 +1957,47 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_LOOP_DETECTED,
     ALM_OVER_CLAIM,
 ];
+/// CIRISEdge#971 — a replication frame rode a link the peer opened (the
+/// reverse path, CIRISEdge#353): the seat's offer on a NAT'd member's own link.
+pub const REPLICATION_REACH_CARRIED_ON_INBOUND_LINK: &str = "carried_on_inbound_link";
+/// CIRISEdge#971 — a replication frame took the dial path (no live link).
+pub const REPLICATION_REACH_DIALLED: &str = "dialled";
+/// CIRISEdge#971 — a replication send refused before any seek or dial: no
+/// live link, no path and no authenticated transit pair, so CC 5.3.3.5 E1
+/// lets no dial reach the peer. Booked as `no_route`, as before.
+pub const REPLICATION_REACH_SKIPPED_UNDIALABLE: &str = "skipped_undialable";
+/// CIRISEdge#971 — a round not started, before its advertise sweep, toward a
+/// peer the transport cannot carry it to (the same predicate as above).
+pub const REPLICATION_REACH_ROUND_SKIPPED: &str = "round_skipped_undialable";
+/// CIRISEdge#971 — a path seek a dial raised found a path.
+pub const REPLICATION_REACH_PATH_SEEK_FOUND: &str = "path_seek_found";
+/// CIRISEdge#971 — a path seek a dial raised waited out its budget, pathless.
+pub const REPLICATION_REACH_PATH_SEEK_NOT_FOUND: &str = "path_seek_not_found";
+/// CIRISEdge#971 — a path request broadcast (one per destination per
+/// `PATH_SEEK_MIN_INTERVAL`).
+pub const REPLICATION_REACH_PATH_REQUEST_SENT: &str = "path_request_sent";
+/// Every `replication_reach` key.
+pub const REPLICATION_REACH_LABELS: &[&str] = &[
+    REPLICATION_REACH_CARRIED_ON_INBOUND_LINK,
+    REPLICATION_REACH_DIALLED,
+    REPLICATION_REACH_SKIPPED_UNDIALABLE,
+    REPLICATION_REACH_ROUND_SKIPPED,
+    REPLICATION_REACH_PATH_SEEK_FOUND,
+    REPLICATION_REACH_PATH_SEEK_NOT_FOUND,
+    REPLICATION_REACH_PATH_REQUEST_SENT,
+];
+/// CIRISEdge#971 — initiator peers the host named (consent peers, `set_peers`).
+pub const INITIATOR_PEERS_HOST: &str = "host";
+/// CIRISEdge#971 — initiator peers from the bundle's seated serve nodes (#881).
+pub const INITIATOR_PEERS_BUNDLE: &str = "bundle";
+/// CIRISEdge#971 — initiator peers this node homed on after a refusal (CC 5.4.3).
+pub const INITIATOR_PEERS_HOMED: &str = "homed";
+/// Every `initiator_peers` key.
+pub const INITIATOR_PEERS_LABELS: &[&str] = &[
+    INITIATOR_PEERS_HOST,
+    INITIATOR_PEERS_BUNDLE,
+    INITIATOR_PEERS_HOMED,
+];
 /// Every `advertise` key.
 pub const ADVERTISE_LABELS: &[&str] = &[
     ADVERTISE_NOT_ADVERTISABLE,
@@ -2233,6 +2274,13 @@ pub struct EdgeMetrics {
     /// re-offered after being skipped, watermark rewinds on an advertise
     /// input change, and re-sweep cycles completed / overdue.
     pub advertise: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 — how replication frames reached their peer, and what
+    /// the path seeks a dial raised cost, by label (`REPLICATION_REACH_*`).
+    pub replication_reach: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 — the distinct peers this node opens replication rounds
+    /// toward, by where they came from (`INITIATOR_PEERS_*`). A gauge: set,
+    /// not counted. All zero on a device with nobody to round with.
+    pub initiator_peers: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — direct links (leviculum#70) by label
     /// (`DIRECT_LINK_*` constants in this module): proposals made, skipped
     /// and refused, and each outcome. Every `direct_link_failed_*` label is a
@@ -2967,6 +3015,28 @@ impl EdgeMetrics {
     /// Count one advertise event by its `ADVERTISE_*` label.
     pub fn inc_advertise(&self, label: &'static str) {
         *self.advertise.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#971 — count one `replication_reach` event.
+    pub fn inc_replication_reach(&self, label: &'static str) {
+        *self.replication_reach.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#971 — the `replication_reach` ledger by label.
+    #[must_use]
+    pub fn replication_reach(&self) -> HashMap<String, u64> {
+        owned_keys(&self.replication_reach)
+    }
+
+    /// CIRISEdge#971 — set the `initiator_peers` gauge for `source`.
+    pub fn set_initiator_peers(&self, source: &'static str, peers: u64) {
+        self.initiator_peers.write().insert(source, peers);
+    }
+
+    /// CIRISEdge#971 — the `initiator_peers` gauge by source.
+    #[must_use]
+    pub fn initiator_peers(&self) -> HashMap<String, u64> {
+        owned_keys(&self.initiator_peers)
     }
 
     /// The advertise ledger by label (tests + the operator readback).
@@ -3837,6 +3907,8 @@ impl EdgeMetrics {
                 UPGRADE_GUARDED_LABELS,
             ),
             advertise: registered(&self.advertise, ADVERTISE_LABELS),
+            replication_reach: registered(&self.replication_reach, REPLICATION_REACH_LABELS),
+            initiator_peers: registered(&self.initiator_peers, INITIATOR_PEERS_LABELS),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
@@ -4182,6 +4254,10 @@ pub struct EdgeMetricsBundle {
     pub direct_link_upgrade_guarded: HashMap<String, u64>,
     /// `advertise.<label>`: the advertise sweep's ledger.
     pub advertise: HashMap<String, u64>,
+    /// CIRISEdge#971 — `replication_reach.<label>`.
+    pub replication_reach: HashMap<String, u64>,
+    /// CIRISEdge#971 — `initiator_peers.<source>`, a gauge.
+    pub initiator_peers: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
     pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
@@ -4632,6 +4708,8 @@ impl EdgeMetricsBundle {
             &self.direct_link_upgrade_guarded,
         );
         f.family("advertise", &self.advertise);
+        f.family("replication_reach", &self.replication_reach);
+        f.family("initiator_peers", &self.initiator_peers);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
             "direct_links_active".to_string(),
@@ -4966,6 +5044,8 @@ edge_metrics_bundle_fields!(
     link_stall,
     direct_link_upgrade_guarded,
     advertise,
+    replication_reach,
+    initiator_peers,
     direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,

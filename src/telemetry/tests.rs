@@ -203,6 +203,14 @@ fn every_label_constant_is_in_its_family_list() {
         ("LINK_STALL_", LINK_STALL_LABELS),
         ("UPGRADE_GUARDED_", UPGRADE_GUARDED_LABELS),
         ("ADVERTISE_", crate::observability::ADVERTISE_LABELS),
+        (
+            "REPLICATION_REACH_",
+            crate::observability::REPLICATION_REACH_LABELS,
+        ),
+        (
+            "INITIATOR_PEERS_",
+            crate::observability::INITIATOR_PEERS_LABELS,
+        ),
         ("PEER_BINDING_", PEER_BINDING_LABELS),
     ] {
         for value in constants(prefix) {

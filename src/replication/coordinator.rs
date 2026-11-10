@@ -934,6 +934,12 @@ impl ReplicationCoordinator {
         self.transport.pacing_gap(&self.peer_key_id)
     }
 
+    /// CIRISEdge#971 — could a round to this peer be carried now
+    /// ([`Transport::round_carriable`])? Asked once at round start.
+    pub(crate) async fn round_carriable(&self) -> bool {
+        self.transport.round_carriable(&self.peer_key_id).await
+    }
+
     /// CIRISEdge#963 — the longest the shaped link to this peer lets one row
     /// wait to leave ([`Transport::pacing_row_bound`]): the scheduler's outer
     /// bound on a send exceeds it.

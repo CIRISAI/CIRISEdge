@@ -18,6 +18,20 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   pass `True` or `False` to change one. A call that moved only the class or the network used to
   clear the person's opt-in. The UniFFI record states both opt-ins explicitly and is unchanged.
 
+### 45.0.0
+
+- **Replication sends to a peer no rule can reach are refused before any path
+  seek** (CIRISEdge#971). With no live link, no path and no authenticated
+  transit pair, CC 5.3.3.5 E1 forbids the dial, so the 3 s seek and its path
+  request broadcast could only end "never dialled". The send is refused at
+  once, and the round toward that peer is not started, before its advertise
+  sweep. Both are booked `no_route` as before, so outcome counts stay
+  comparable; only the duration drops.
+- **New gauges.** `replication_reach{carried_on_inbound_link, dialled,
+  skipped_undialable, round_skipped_undialable, path_seek_found,
+  path_seek_not_found, path_request_sent}` and
+  `initiator_peers{host, bundle, homed}`.
+
 ## 44.1.2 — 2026-11-09
 
 **`FountainHoldingClaim` is no longer a wire kind** (CIRISEdge#959, CC wire vocabulary v1.0.3, rc17
