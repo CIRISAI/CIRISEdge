@@ -1,5 +1,16 @@
 # CIRISEdge Release Notes
 
+# v45.0.0 (unreleased)
+
+**Consumer notes:**
+- **The Python requirement is exact: `ciris-persist==61.2.2`.** Since persist 61.2
+  (CIRISPersist#1242) every raw-layout capsule is named for the persist build that laid it out
+  (`ciris_persist::<capsule>@61.2.2`), and edge loads only the capsule its own build of persist
+  compiled. Any other wheel, an older or a newer patch alike, is refused at `init_edge_runtime` with
+  a `TypeError` led by `capsule_version_skew`, before anything is dereferenced. A server that hosts
+  edge pins the same persist version; a persist patch release reaches edge through a new edge
+  release.
+
 # v44.1.2 — FountainHoldingClaim retired from the wire
 
 **2026-11-09.** **PATCH** on the LTS line. Pins are unchanged from v44.1.1: persist v61.0.5,
