@@ -1750,8 +1750,15 @@ async fn writes_and_kicks_never_spend_the_seats_lookup_budget_971() {
     assert_eq!(read("cycle_kick") - kick0, 1, "five kicks, one cycle");
     assert_eq!(read("pull_owner"), owner0, "and still no owner leg");
     // The timer's cycle is the one that asks about the owner: once per
-    // owner plane.
+    // owner plane. The seat's limiter charges per (requester, subject,
+    // budget, 60 s window), so the three should cost one charge.
+    let charges0 = m.rt_seat.bridge().subject_pull_charges_made();
     m.rt_device.bundle_pull_now().await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    eprintln!(
+        "971 (d)-6 owner-pull limiter: owner_pulls=3 seat_charges={}",
+        m.rt_seat.bridge().subject_pull_charges_made() - charges0
+    );
     assert_eq!(
         read("pull_owner") - owner0,
         3,

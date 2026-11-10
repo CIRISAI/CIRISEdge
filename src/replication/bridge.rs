@@ -2718,6 +2718,9 @@ pub struct FederationDirectoryReplicationBridge {
     /// lookup, so 12 lookups a minute throttled the 13th (the ce5 harness,
     /// 16:39:17).
     subject_pull_charges: Mutex<super::subject_pull::SubjectPullCharges>,
+    /// CIRISEdge#971 — fresh limiter charges `charge_subject_pull` made (a
+    /// `(requester, subject, budget, window)` not charged before). `Relaxed`.
+    subject_pull_charges_made: std::sync::atomic::AtomicU64,
     /// CC 5.4.6 — `(requester, hash)` of each row a subject Pull listed on the
     /// widened reach: the `Deliver` answering that Pull has no Pull in hand,
     /// and a listing its own fetch twin refuses is #429's
@@ -3061,6 +3064,7 @@ impl FederationDirectoryReplicationBridge {
                 Self::ANNOUNCED_TESTIMONY_LOOKUPS_PER_DAY,
             ),
             subject_pull_charges: Mutex::default(),
+            subject_pull_charges_made: std::sync::atomic::AtomicU64::new(0),
             pull_offers: Mutex::new(super::subject_pull::WindowLedger::new(
                 super::subject_pull::LEDGER_CAP,
             )),
@@ -8072,6 +8076,8 @@ impl FederationDirectoryReplicationBridge {
         let allowed = !matches!(verdict, Decision::Deny { .. });
         let expires = now + Self::IDENTIFIER_LOOKUP_WINDOW_SECS;
         charges.record(requester, subject, budget, allowed, expires, now);
+        self.subject_pull_charges_made
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         verdict
     }
 
@@ -12136,6 +12142,14 @@ impl FederationDirectoryReplicationBridge {
     #[doc(hidden)]
     pub fn record_pull_subjects_for_test(&self) {
         let _ = self.pull_subject_log.set(Mutex::new(Vec::new()));
+    }
+
+    /// CIRISEdge#971 — fresh identifier-lookup charges this node has made
+    /// (one per `(requester, subject, budget, window)`).
+    #[must_use]
+    pub fn subject_pull_charges_made(&self) -> u64 {
+        self.subject_pull_charges_made
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// CIRISEdge#971 test seam — from now on, record every row delivered to
