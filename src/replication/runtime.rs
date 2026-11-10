@@ -3004,10 +3004,12 @@ mod tests {
                 .any(|p| p.kind == super::EnvelopeKind::Attestation),
             "no content plane"
         );
+        // The host names canon-a on the plane the bundle also adds (since
+        // #971 (d), Revocation only), so the merge must keep that pair once.
         let host = vec![
             ReplicationPeer {
                 peer_key_id: "canon-a".into(),
-                kind: super::EnvelopeKind::Key,
+                kind: BUNDLE_ROUND_PLANES[0],
             },
             ReplicationPeer {
                 peer_key_id: "friend".into(),
@@ -3018,7 +3020,8 @@ mod tests {
         assert_eq!(
             merged.len(),
             host.len() + extra.len() - 1,
-            "the duplicate (canon-a, Key) once"
+            "the duplicate (canon-a, {:?}) once",
+            BUNDLE_ROUND_PLANES[0]
         );
         assert_eq!(merged[0].peer_key_id, "canon-a", "host order kept");
         assert_eq!(merged[1].peer_key_id, "friend");
