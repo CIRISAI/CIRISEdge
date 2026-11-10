@@ -1355,6 +1355,122 @@ async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
     assert_eq!(av(&b.metrics, "end_flush_unconfirmed"), 0);
 }
 
+/// A video frame of `len` bytes, its first 8 bytes naming it.
+fn video(tag: u64, len: usize) -> Frame {
+    let mut bytes = tag.to_be_bytes().to_vec();
+    bytes.extend((0..len.saturating_sub(8)).map(|i| u8::try_from(i % 251).unwrap()));
+    Frame {
+        codec_id: ciris_edge::transport::realtime_av::CODEC_TEMPORAL_LAYERED,
+        layer: ChunkLayer::BASE,
+        bytes,
+    }
+}
+
+/// **Framed video, unmarked audio** (45.1, CC reading rc18): B joins with
+/// `{h264, opus}`, so its binding signs `framing = 1`. It publishes a 30 KB
+/// keyframe, then 3 KB P-frames at 30 Hz with Opus frames between them. The
+/// keyframe and every P-frame larger than one chunk go as several fragments;
+/// A hands each video frame out whole and byte-identical, and every audio
+/// frame as sent (audio never carries the marker). Then A's leg withholds
+/// every 7th chunk: each video frame missing a fragment is dropped whole and
+/// counted `av_frame_incomplete`, and nothing partial is ever handed out.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn framed_video_arrives_whole_and_audio_unmarked() {
+    use ciris_edge::transport::av_chunk_auth::{CodecMap, CodecToken};
+    use ciris_edge::transport::realtime_av::{CODEC_OPAQUE, CODEC_TEMPORAL_LAYERED};
+    let _call = one_call().await;
+    let tag = "alm2-framed";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let phone = CallOptions {
+        codecs: Some(CodecMap::new([CodecToken::Opus, CodecToken::H264]).expect("map")),
+        ..CallOptions::default()
+    };
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, phone, None).await;
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    wait_bound(&ca, 1).await;
+    let mut frames = ca.frames().expect("A's frames");
+    let budget = cb.chunk_plaintext_budget().expect("a leg is up");
+    let mut sent_video = Vec::new();
+    let mut sent_audio = Vec::new();
+    let key = cb.publish(video(0, 30_000)).await.expect("keyframe");
+    assert_eq!(
+        usize::from(key.fragments),
+        30_000usize.div_ceil(budget - 4),
+        "the keyframe is cut to the budget ({budget} B)"
+    );
+    sent_video.push(video(0, 30_000).bytes);
+    for n in 1..=30u64 {
+        let f = video(n, 3_000);
+        sent_video.push(f.bytes.clone());
+        cb.publish(f).await.expect("P-frame");
+        let opus = body("opus", n);
+        sent_audio.push(opus.clone());
+        cb.publish(Frame::opaque(opus)).await.expect("audio");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let mut got_video = Vec::new();
+    let mut got_audio = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(20), async {
+        while got_video.len() < sent_video.len() || got_audio.len() < sent_audio.len() {
+            match frames.recv().await {
+                Some(f) if f.publisher == b.key.key_id => match f.codec_id {
+                    CODEC_OPAQUE => got_audio.push(f.bytes),
+                    CODEC_TEMPORAL_LAYERED => got_video.push(f.bytes),
+                    _ => {}
+                },
+                Some(_) => {}
+                None => break,
+            }
+        }
+    })
+    .await;
+    assert_eq!(got_video, sent_video, "every video frame whole, in order");
+    assert_eq!(got_audio, sent_audio, "every audio frame as sent, unmarked");
+    assert_eq!(av(&a.metrics, "av_frame_incomplete"), 0);
+
+    // Loss: every 7th chunk to A withheld.
+    cb.withhold_from_for_test(&a.key.key_id, 7);
+    let mut lossy = Vec::new();
+    for n in 100..130u64 {
+        let f = video(n, 3_000);
+        lossy.push(f.bytes.clone());
+        cb.publish(f).await.expect("P-frame");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    // Loss ends; three clean frames close the last lossy frame's run.
+    cb.withhold_from_for_test(&a.key.key_id, 0);
+    for n in 200..203u64 {
+        cb.publish(video(n, 3_000)).await.expect("P-frame");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let mut after = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(f) = frames.recv().await {
+            if f.publisher == b.key.key_id && f.codec_id == CODEC_TEMPORAL_LAYERED {
+                after.push(f.bytes);
+            }
+        }
+    })
+    .await;
+    let dropped = av(&a.metrics, "av_frame_incomplete");
+    assert!(dropped > 0, "a withheld fragment drops its frame, counted");
+    let clean: Vec<Vec<u8>> = (200..203u64).map(|n| video(n, 3_000).bytes).collect();
+    assert!(
+        after.iter().all(|f| lossy.contains(f) || clean.contains(f)),
+        "nothing partial is handed out"
+    );
+    after.retain(|f| lossy.contains(f));
+    assert_eq!(
+        after.len() + usize::try_from(dropped).unwrap(),
+        lossy.len(),
+        "each frame either whole or counted dropped, once"
+    );
+}
+
 /// **Per-leg stats** (45.1): every leg a call reports names what carries it
 /// and its MDU, so a gate can tell a punched UDP leg from a TCP one from a
 /// relayed one. On loopback TCP every leg is `Interface`, with a link MDU,

@@ -1024,6 +1024,23 @@ pub const AV_CALL_END_FLUSH_UNCONFIRMED: &str = "end_flush_unconfirmed";
 pub const AV_CALL_REPLACE_SWITCH_UNCONFIRMED: &str = "replace_switch_unconfirmed";
 /// 45.1 — a signed end whose `final_seq` this node never received up to.
 pub const AV_CALL_STREAM_TRUNCATED: &str = "av_call_stream_truncated";
+/// 45.1 — a framed stream's chunk shorter than the fragment marker
+/// (receiver-only, like every `av_frame_*`: a relay never opens the inner
+/// seal).
+pub const AV_FRAME_MARKER_SHORT: &str = "av_frame_marker_short";
+/// 45.1 — a fragment marker whose count is 0 or over 256.
+pub const AV_FRAME_COUNT_INVALID: &str = "av_frame_count_invalid";
+/// 45.1 — a fragment marker whose index is at or past its count.
+pub const AV_FRAME_INDEX_INVALID: &str = "av_frame_index_invalid";
+/// 45.1 — a fragment whose count differs from its frame's.
+pub const AV_FRAME_COUNT_MISMATCH: &str = "av_frame_count_mismatch";
+/// 45.1 — a fragment whose codec_id or layer differs from its frame's.
+pub const AV_FRAME_LAYER_MISMATCH: &str = "av_frame_layer_mismatch";
+/// 45.1 — a fragment run that would cross the epoch.
+pub const AV_FRAME_CROSSES_EPOCH: &str = "av_frame_crosses_epoch";
+/// 45.1 — a frame missing a fragment the reorder window gave up on: dropped
+/// whole, once.
+pub const AV_FRAME_INCOMPLETE: &str = "av_frame_incomplete";
 /// ALM C3 — a control frame sent / received / refused as malformed.
 pub const ALM_C3_SENT: &str = "alm_c3_sent";
 /// ALM C3 — a control frame that could not be sent to its member.
@@ -2173,6 +2190,13 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_CALL_END_FLUSH_UNCONFIRMED,
     AV_CALL_REPLACE_SWITCH_UNCONFIRMED,
     AV_CALL_STREAM_TRUNCATED,
+    AV_FRAME_MARKER_SHORT,
+    AV_FRAME_COUNT_INVALID,
+    AV_FRAME_INDEX_INVALID,
+    AV_FRAME_COUNT_MISMATCH,
+    AV_FRAME_LAYER_MISMATCH,
+    AV_FRAME_CROSSES_EPOCH,
+    AV_FRAME_INCOMPLETE,
     ALM_C3_SENT,
     ALM_C3_SEND_FAILED,
     ALM_C3_RESENT,

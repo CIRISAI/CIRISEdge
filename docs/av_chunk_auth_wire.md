@@ -242,19 +242,35 @@ members after member 7 (`chunk_key`):
 |---|---|---|---|
 | 7a | codecs | `u8 count` (0..=8), then per class, sorted by class, no class twice: `class u8 ‖ u16_be len ‖ token` (1..=32 bytes of printable ASCII) | 1 + Σ(3 + len) |
 | 7b | replaces | `u8 present` (0 or 1), then, when 1, the publisher's earlier `stream_id` this one replaces in place | 1 or 33 |
-| 7c | end | `u8`: 0 live; 1 left; 2 left, backgrounded | 1 |
-| 7d | final_seq | only when `end` ≠ 0: `u64` BE, the last `chunk_seq` the publisher sealed in this epoch (`u64::MAX`: none) | 0 or 8 |
+| 7c | end | `u8`: 0 live; 1 left; 2 left, backgrounded; 3 this stream ended, not a leave (CC reading rc18) | 1 |
+| 7d | final_seq | only when `end` ≠ 0: `u64` BE, the last `chunk_seq` the publisher sealed in this epoch (`u64::MAX`: none); for a framed stream, the last fragment's | 0 or 8 |
+| 7e | kind | `u8`: 0 media, 1 share (CC reading rc18). Any value parses; an unknown one renders as media. Gates nothing: not admission, keys, sealing, the trailer, shedding or keeping | 1 |
+| 7f | framing | `u8`: 0 one frame per chunk, no marker; 1 every chunk whose `codec_id` is not `0xFF` starts with the fragment marker (§1.9). Any other value is malformed. Fixed per (stream, epoch) | 1 |
 
-`count` 0 (no map) is allowed only when `replaces` or `end` is set: an end or
-a replacement of a stream that declared no codecs. A v2 binding with none of
-the three is malformed.
+`count` 0 (no map) is allowed only when `replaces`, `end`, `kind` or
+`framing` says something: an end, a replacement or a share of a stream that
+declared no codecs. A v2 binding with none of them is malformed. A v1
+binding reads as `kind` 0 and `framing` 0.
 
-Members 1–7d are the v2 unsigned body. The signing bytes use their own
+Offsets: members 7a–7f follow `chunk_key` in order, so with `L` = the end of
+member 7 and `m` = the map's length (1 + Σ(3 + len)), `replaces` is at `L +
+m`, `end` at `L + m + r` (`r` = 1 or 33), `final_seq` at `L + m + r + 1` when
+`end` ≠ 0, then `kind` and `framing` (at `L + m + r + 1 + f` and one past it,
+`f` = 0 or 8).
+
+`end` is per stream. 1 and 2 say the member left, and a receiver takes them
+as a leave only on the member's last live stream; on another stream they end
+that stream only. 3 ends the stream and is never a leave, even on the last
+one: presence is reachability, never "no streams" (the member attends with
+no live stream until it leaves, is lost or is removed). A share ends with 3;
+a hang-up ends each share with 3, then the camera with 1 or 2.
+
+Members 1–7f are the v2 unsigned body. The signing bytes use their own
 domain tag:
 
 ```
 signed_bytes_v2 = "ciris-edge:av-stream-key:v2"   (27 bytes ASCII)
-                ‖ unsigned_body_v2                (members 1–7d as encoded)
+                ‖ unsigned_body_v2                (members 1–7f as encoded)
 ```
 
 The hybrid signature is made as in §1.2 over `signed_bytes_v2`.
@@ -369,7 +385,7 @@ map `{0x04: h264, 0xFF: opus}`, no `replaces`, `end` 0:
 000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707
 070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d8
 00000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e3
-9f2d0204000468323634ff00046f7075730000
+9f2d0204000468323634ff00046f70757300000000
 ```
 
 Vector 2 is the same map, `replaces` stream `aa`×32, `end` 1 (left),
@@ -377,13 +393,74 @@ Vector 2 is the same map, `replaces` stream `aa`×32, `end` 1 (left),
 
 ```
 …9f2d0204000468323634ff00046f70757301aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-aaaaaaaaaaaaaaaaaaaaaaaa01000000000000002a
+aaaaaaaaaaaaaaaaaaaaaaaa01000000000000002a0000
+```
+
+Vector 3 (45.1, rc18) is the same map, no `replaces`, `end` 3 (this stream
+ended), `final_seq` 9, `kind` 1 (share), `framing` 1:
+
+```
+…9f2d0204000468323634ff00046f707573000300000000000000090101
 ```
 
 Both are the v1 signed bytes of the same inputs with the v2 domain, version
 `02`, and the v2 members appended; the v1 signed bytes themselves are
 unchanged. The v2 signatures' KAT values are pinned at the first build of
 this branch.
+
+### 1.9 Frame fragmentation (45.1, CC reading rc18, pending text)
+
+A frame larger than one chunk is split BEFORE the seal: every fragment is a
+whole chunk with its own `chunk_seq`, inner and outer seal and trailer. The
+clear header, relays, the DAG and the 5.3.3.4 pull see chunks only, and no
+sealed chunk is ever split (5.3.3.2.3).
+
+- **Which chunks carry the marker.** On a stream whose binding signs
+  `framing = 1`, every chunk whose `codec_id` is not `0xFF` starts its
+  plaintext with `frag_index u16_be ‖ frag_count u16_be` (4 bytes), a whole
+  frame included (`0000 0001`), so the layout never depends on size. Audio
+  (`0xFF`) chunks never carry it. A receiver picks the layout from the
+  signed `codec_id` (verified with the trailer before the inner seal opens),
+  never from length. Edge frames a stream whose codec map names a non-`0xFF`
+  class; an audio-only or map-less stream is published with `framing = 0`.
+- **The run.** A frame's fragments take consecutive `chunk_seq`s in one
+  epoch, all with the frame's `codec_id` and layer: the publisher seals them
+  under the lock the roll takes, so a frame never straddles an epoch. A run
+  that would pass the epoch's 2³² `chunk_seq` ceiling is refused before the
+  first seal (`chunk_seq_exhausted`): the epoch rolls first. `final_seq` is
+  the last fragment's `chunk_seq`.
+- **Budget.** Fragments are cut to the call's `chunk_plaintext_budget` (the
+  minimum over its legs, §3), so an MTU-500 member still gets video; each
+  fragment carries `budget − 4` media bytes. At most 256 fragments: a larger
+  frame is refused before sealing (`frame_too_large`, budget `256 × (budget −
+  4)`). An unframed stream keeps the one-chunk refusal.
+- **Sending.** A leg that fails one fragment (congested, too large, gone)
+  gets none of the rest of that frame: a partial frame is worth nothing.
+- **Receiving.** The reorder window orders and dedupes per chunk as before.
+  A missing fragment is a missing chunk: the window, and the pulls inside it,
+  wait for it by `chunk_seq`; only once the window gives it up is the frame
+  dropped whole, counted, never handed out partial. The window's jitter
+  estimate is the gap between two legs' copies of the same chunk, so
+  back-to-back fragments do not shrink it.
+- **Refusals, receiver-only** (a relay never opens the inner seal, so it
+  never sees a marker). Each is an `av_plane` counter and drops the frame:
+
+| Token | Meaning |
+|---|---|
+| `av_frame_marker_short` | a framed chunk's plaintext is shorter than the marker |
+| `av_frame_count_invalid` | `frag_count` is 0 or over 256 |
+| `av_frame_index_invalid` | `frag_index` ≥ `frag_count` |
+| `av_frame_count_mismatch` | a fragment's `frag_count` differs from its frame's |
+| `av_frame_layer_mismatch` | a fragment's `codec_id` or layer differs from its frame's |
+| `av_frame_crosses_epoch` | a fragment's epoch differs from its frame's |
+| `av_frame_incomplete` | a fragment the reorder window gave up on; the frame dropped whole, once |
+
+KATs (`framed_chunk_kats_with_the_shipping_trailer`), with the inputs of §5,
+codec `0x04`, layer (0,0,0): a whole frame `kat-frame` in one framed chunk
+(chunk_seq 0), and the 30-byte frame `kat-frag-frame-012345678901234` at a
+14-byte budget in three fragments (chunk_seq 1–3, markers `00000003`,
+`00010003`, `00020003`). Each value is the chunk's inner ciphertext ‖ trailer;
+they are pinned at the first build of this branch.
 
 ## 2. The 72-byte trailer (v2: source timestamp + signature)
 
@@ -471,10 +548,10 @@ max plaintext after    = channel_limit − 84 − 72 = channel_limit − 156    
 
 `link_mdu` is leviculum's `floor((mtu − 1 − 19 − 48) / 16) × 16 − 1`.
 
-| Link MTU | link MDU | Channel limit | Max plaintext before | after | Binding parts (KAT size) |
-|---|---|---|---|---|---|
-| 500 (base) | 431 | 400 | 316 | 244 | 10 × ≤400 B |
-| 1400 (punched direct, `direct_path.rs:666`) | 1327 | 1296 | 1212 | 1140 | 3 × ≤1296 B |
+| Link MTU | link MDU | Channel limit | Max plaintext before | after | Fragment media (after − 4) | Largest framed frame (× 256) | Binding parts (KAT size) |
+|---|---|---|---|---|---|---|---|
+| 500 (base) | 431 | 400 | 316 | 244 | 240 | 61,440 B | 10 × ≤400 B |
+| 1400 (punched direct, `direct_path.rs:666`) | 1327 | 1296 | 1212 | 1140 | 1,136 | 290,816 B | 3 × ≤1296 B |
 
 The call refuses a frame over the budget before sealing it. A smaller MTU
 shrinks every number in the row.

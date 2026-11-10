@@ -4397,6 +4397,7 @@ fn call_err_token(e: &crate::transport::av_call::CallError) -> &'static str {
         E::AnonymousMode => crate::onion::tokens::ANONYMOUS_NO_MEDIA,
         E::UnknownStream(_) => "unknown_stream",
         E::TooManyStreams(_) => "too_many_streams",
+        E::ChunkSeqExhausted { .. } => "chunk_seq_exhausted",
     }
 }
 
@@ -4728,6 +4729,7 @@ impl PyCall {
         d.set_item("epoch", report.epoch.0)?;
         d.set_item("chunk_seq", report.chunk_seq.0)?;
         d.set_item("delivered", report.delivered())?;
+        d.set_item("fragments", report.fragments)?;
         let legs: Vec<(String, String)> = report
             .legs
             .iter()
@@ -4853,6 +4855,7 @@ impl PyCall {
         d.set_item("epoch", report.epoch.0)?;
         d.set_item("chunk_seq", report.chunk_seq.0)?;
         d.set_item("delivered", report.delivered())?;
+        d.set_item("fragments", report.fragments)?;
         let legs: Vec<(String, String)> = report
             .legs
             .iter()

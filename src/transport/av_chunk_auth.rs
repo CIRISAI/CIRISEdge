@@ -460,7 +460,7 @@ pub const STREAM_KIND_SHARE: u8 = 1;
 
 /// 45.1 (CC reading, rc18) — the v2 `framing` member: 0, one media frame per
 /// chunk and no marker; 1, every chunk whose `codec_id` is not `0xFF`
-/// carries the 4-byte fragment marker ([`crate::transport::av_frame`]). A
+/// carries the 4-byte fragment marker (`av_call::frame`). A
 /// v1 binding reads as 0. Fixed per (stream, epoch).
 pub const FRAMING_NONE: u8 = 0;
 /// See [`FRAMING_NONE`].
@@ -1794,6 +1794,12 @@ impl ChunkAuth {
                 b.wire.clone().into_iter().chain(v2)
             })
             .collect()
+    }
+
+    /// 45.1 — whether any epoch of `stream` is bound here.
+    #[must_use]
+    pub fn is_bound(&self, stream: StreamId) -> bool {
+        self.held().bound.keys().any(|(s, _)| *s == stream)
     }
 
     /// 45.1 — `(stream, epoch)`'s framing as its v2 binding signed it

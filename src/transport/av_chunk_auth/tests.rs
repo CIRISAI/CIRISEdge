@@ -1276,3 +1276,98 @@ fn an_old_leave_replayed_after_a_rejoin_does_nothing_to_the_new_stream() {
     }
     assert!(!auth.truncated(new));
 }
+
+/// **KAT — framed chunks with the shipping trailer** (45.1, CC reading rc18;
+/// for CIRISVerify and CC 5.3.3.2.3): the KAT inputs of
+/// [`kat_vectors_are_deterministic`] (stream, epoch 5, chunk key seed `0c`,
+/// DEK `42`, source 1790000000000 ms), codec `0x04`, layer (0,0,0).
+/// Vector 1: a whole frame `kat-frame` in one framed chunk, chunk_seq 0, its
+/// plaintext the marker `00000001` ‖ the frame. Vector 2: the 30-byte frame
+/// `kat-frag-frame-012345678901234` at a 14-byte budget, three fragments
+/// (chunk_seq 1, 2, 3; markers `00000003`, `00010003`, `00020003`), each a
+/// whole sealed, signed chunk. Each value is the chunk's inner ciphertext ‖
+/// trailer, hex. All four verify under the bound key, open, and reassemble
+/// to their frames.
+#[tokio::test]
+async fn framed_chunk_kats_with_the_shipping_trailer() {
+    use crate::transport::av_call::frame::{split, Reassembler};
+    use crate::transport::realtime_av::CODEC_TEMPORAL_LAYERED;
+    const PUBLISHER: &str = "node-kat-a";
+    const KAT_ROOM: &str = "room-kat";
+    const KAT_SOURCE_MS: u64 = 1_790_000_000_000;
+    // Pinned from the first green run (45.1); "PIN" fails with the values.
+    const FRAMED_ONE: &str = "PIN";
+    const FRAMED_THREE: [&str; 3] = ["PIN", "PIN", "PIN"];
+    let publisher = signer(PUBLISHER, 1);
+    let keys = Keys::of(&[&publisher]).await;
+    let nonce = [0x07; 32];
+    let epoch = Epoch(5);
+    let stream = call_stream_id(KAT_ROOM, PUBLISHER, &nonce);
+    let key = ChunkSigner::from_seed(stream, epoch, [0x0c; 32]);
+    let binding = StreamKeyBinding::sign(&publisher, KAT_ROOM, nonce, stream, epoch, key.public())
+        .await
+        .unwrap();
+    let auth = ChunkAuth::new(KAT_ROOM);
+    assert!(matches!(
+        auth.accept_binding(&binding.to_bytes(), &[PUBLISHER.to_owned()], &keys)
+            .await,
+        BindingOutcome::Installed(_)
+    ));
+    let seal = |seq: u64, plaintext: &[u8]| {
+        let inner = seal_av_inner(
+            plaintext,
+            &dek(),
+            stream,
+            epoch,
+            ChunkSeq(seq),
+            CODEC_TEMPORAL_LAYERED,
+            ChunkLayer::BASE,
+        )
+        .unwrap();
+        key.sign_at(&inner, KAT_SOURCE_MS).unwrap()
+    };
+    let one = split(b"kat-frame", 1_000).expect("fits");
+    assert_eq!(one.len(), 1);
+    assert_eq!(&one[0][..4], &[0, 0, 0, 1]);
+    let three = split(b"kat-frag-frame-012345678901234", 14).expect("fits");
+    assert_eq!(three.len(), 3);
+    let sealed: Vec<_> = std::iter::once((0u64, &one[0]))
+        .chain((1u64..).zip(three.iter()))
+        .map(|(seq, p)| seal(seq, p))
+        .collect();
+    let got: Vec<String> = sealed
+        .iter()
+        .map(|c| hex::encode(c.inner_ciphertext()))
+        .collect();
+    for (i, g) in got.iter().enumerate() {
+        println!("KAT FRAMED chunk_seq {i} = {g}");
+    }
+    let want: Vec<&str> = std::iter::once(FRAMED_ONE).chain(FRAMED_THREE).collect();
+    assert!(!want.contains(&"PIN"), "pin the framed KATs: {got:?}");
+    assert_eq!(got, want);
+    let mut r = Reassembler::default();
+    let mut frames = Vec::new();
+    for (i, c) in sealed.iter().enumerate() {
+        let (who, opened) = auth.check(c).expect("verified");
+        assert_eq!(&*who, PUBLISHER);
+        let plain = open_av_inner(&opened, &dek()).unwrap();
+        let out = r.push(crate::transport::av_call::ReceivedFrame {
+            publisher: PUBLISHER.into(),
+            stream,
+            epoch,
+            chunk_seq: ChunkSeq(u64::try_from(i).unwrap()),
+            codec_id: CODEC_TEMPORAL_LAYERED,
+            layer: ChunkLayer::BASE,
+            bytes: plain,
+        });
+        assert!(out.refused.is_empty());
+        frames.extend(out.frame.map(|f| f.bytes));
+    }
+    assert_eq!(
+        frames,
+        vec![
+            b"kat-frame".to_vec(),
+            b"kat-frag-frame-012345678901234".to_vec()
+        ]
+    );
+}

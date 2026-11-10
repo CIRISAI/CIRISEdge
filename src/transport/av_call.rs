@@ -122,6 +122,8 @@ use crate::transport::reticulum::ReticulumTransport;
 
 #[path = "av_call/alm.rs"]
 mod alm;
+#[path = "av_call/frame.rs"]
+pub mod frame;
 pub use alm::{AlmCounts, AlmParents};
 
 /// ALM C5 — media older than this in the inbound queue is dropped by age
@@ -261,8 +263,12 @@ pub struct PublishReport {
     pub epoch: Epoch,
     /// Its sequence number.
     pub chunk_seq: ChunkSeq,
-    /// One outcome per member leg.
+    /// One outcome per member leg (for a fragmented frame, the leg's first
+    /// failure, or `Delivered` when every fragment went).
     pub legs: Vec<(String, LegOutcome)>,
+    /// 45.1 — how many chunks the frame took (1 unless a framed stream
+    /// split it; `chunk_seq` is the first).
+    pub fragments: u16,
 }
 
 impl PublishReport {
@@ -785,6 +791,15 @@ pub enum CallError {
     /// ([`MAX_OWN_STREAMS`]): end one first.
     #[error("this node already publishes {0} streams in the call, the most it may")]
     TooManyStreams(usize),
+    /// 45.1 — the frame's run of chunks would pass the epoch's 2³²
+    /// `chunk_seq` ceiling: refused before any seal; the epoch rolls first.
+    #[error("{fragments} chunks from chunk_seq {next} pass the epoch's 2^32 ceiling; the epoch must roll first")]
+    ChunkSeqExhausted {
+        /// The epoch's next `chunk_seq`.
+        next: u64,
+        /// The chunks the frame needs.
+        fragments: usize,
+    },
 }
 
 /// 45.1 — the most streams one node publishes in a call at once: the camera
@@ -1205,6 +1220,9 @@ pub struct ReorderCounts {
     pub duplicates: u64,
     /// Copies that arrived after their slot was released or skipped.
     pub late: u64,
+    /// 45.1 — frames of a framed stream dropped whole (a fragment the window
+    /// gave up on, or a marker refused): never handed out partial.
+    pub frames_dropped: u64,
 }
 
 /// One stream's window.
@@ -2138,7 +2156,12 @@ impl Call {
         let counts = Arc::new(StdMutex::new(ReorderCounts::default()));
         let tasks = vec![
             tokio::spawn(accept_loop(Arc::clone(&shared), arrivals)),
-            tokio::spawn(reorder_loop(heard_rx, frames_tx, Arc::clone(&counts))),
+            tokio::spawn(reorder_loop(
+                Arc::clone(&shared),
+                heard_rx,
+                frames_tx,
+                Arc::clone(&counts),
+            )),
             tokio::spawn(watch_loop(Arc::clone(&shared))),
         ];
         reconcile_legs(&shared);
@@ -2399,38 +2422,29 @@ impl Call {
             return Err(CallError::CallEnded(cause));
         }
         let budget = self.chunk_plaintext_budget().ok_or(CallError::NoBudget)?;
-        if frame.bytes.len() > budget {
-            return Err(CallError::FrameTooLarge {
-                bytes: frame.bytes.len(),
-                budget,
-            });
-        }
         let mut publisher = self.shared.publisher.lock().await;
-        let (chunk_seq, inner) = publisher
-            .seal_next(&frame.bytes, frame.codec_id, frame.layer)
-            .map_err(|e| CallError::Plumbing(e.to_string()))?;
-        let epoch = publisher.epoch();
+        let (stream, framing) = {
+            let k = Shared::lock(&self.shared.own_key);
+            (k.stream, k.framing)
+        };
+        let pieces = frame_pieces(&frame, framing, budget)?;
         // The source signature, under this epoch's chunk key (swapped only
         // under this same lock, at the roll).
-        let inner = Shared::lock(&self.shared.own_key)
-            .signer
-            .sign(&inner)
-            .map_err(|e| CallError::Plumbing(e.to_string()))?;
-        let exclude: Vec<String> = Shared::lock(&self.shared.test_withhold)
-            .as_ref()
-            // Only once the window has measured a gap (two rounds in): before
-            // that it runs on its prior, which this seam is not testing.
-            .filter(|(_, n)| *n > 0 && chunk_seq.0 >= 2 * n && chunk_seq.0 % n == 0)
-            .map(|(peer, _)| vec![peer.clone()])
-            .unwrap_or_default();
-        let stream = Shared::lock(&self.shared.own_key).stream;
-        let legs = send_own_chunk(
+        let sealed = {
+            let k = Shared::lock(&self.shared.own_key);
+            seal_pieces(&mut publisher, &k.signer, &frame, &pieces)?
+        };
+        let epoch = publisher.epoch();
+        let chunk_seq = sealed[0].0;
+        let withhold = Shared::lock(&self.shared.test_withhold).clone();
+        let legs = send_pieces(
             &self.shared,
             &mut publisher,
             stream,
-            &inner,
             &frame,
-            exclude,
+            &pieces,
+            &sealed,
+            withhold.as_ref(),
         )
         .await?;
         drop(publisher);
@@ -2438,6 +2452,7 @@ impl Call {
             epoch,
             chunk_seq,
             legs,
+            fragments: u16::try_from(sealed.len()).unwrap_or(u16::MAX),
         })
     }
 
@@ -2701,17 +2716,11 @@ impl Call {
         }
         roll_if_moved(&self.shared).await?;
         let budget = self.chunk_plaintext_budget().ok_or(CallError::NoBudget)?;
-        if frame.bytes.len() > budget {
-            return Err(CallError::FrameTooLarge {
-                bytes: frame.bytes.len(),
-                budget,
-            });
-        }
         // Lock order: the primary, then the shares. Sealed and signed under
         // the shares lock (a roll swaps a share's epoch and key together
         // under it), sent under the primary's.
         let mut publisher = self.shared.publisher.lock().await;
-        let (chunk_seq, epoch, inner) = {
+        let (pieces, sealed, epoch) = {
             let mut shares = self.shared.shares.lock().await;
             let share = shares
                 .get_mut(&stream)
@@ -2727,25 +2736,19 @@ impl Call {
                     });
                 }
             }
-            let (chunk_seq, inner) = share
-                .publisher
-                .seal_next(&frame.bytes, frame.codec_id, frame.layer)
-                .map_err(|e| CallError::Plumbing(e.to_string()))?;
-            let epoch = share.publisher.epoch();
-            let inner = share
-                .key
-                .signer
-                .sign(&inner)
-                .map_err(|e| CallError::Plumbing(e.to_string()))?;
-            (chunk_seq, epoch, inner)
+            let pieces = frame_pieces(&frame, share.key.framing, budget)?;
+            let sealed = seal_pieces(&mut share.publisher, &share.key.signer, &frame, &pieces)?;
+            (pieces, sealed, share.publisher.epoch())
         };
-        let legs = send_own_chunk(
+        let chunk_seq = sealed[0].0;
+        let legs = send_pieces(
             &self.shared,
             &mut publisher,
             stream,
-            &inner,
             &frame,
-            Vec::new(),
+            &pieces,
+            &sealed,
+            None,
         )
         .await?;
         drop(publisher);
@@ -2753,6 +2756,7 @@ impl Call {
             epoch,
             chunk_seq,
             legs,
+            fragments: u16::try_from(sealed.len()).unwrap_or(u16::MAX),
         })
     }
 
@@ -3220,6 +3224,109 @@ async fn roll_share(
     Ok(keep)
 }
 
+/// 45.1 — the plaintexts `frame` is sealed as: itself, on an unframed
+/// stream or for audio (`0xFF`), within `budget`; otherwise its marked
+/// fragments ([`frame::split`]) of at most `budget` bytes each. Refused
+/// before anything is sealed when it does not fit.
+fn frame_pieces(frame: &Frame, framing: u8, budget: usize) -> Result<Vec<Vec<u8>>, CallError> {
+    let framed = framing == crate::transport::av_chunk_auth::FRAMING_FRAGMENTS
+        && frame.codec_id != crate::transport::realtime_av::CODEC_OPAQUE;
+    if !framed {
+        if frame.bytes.len() > budget {
+            return Err(CallError::FrameTooLarge {
+                bytes: frame.bytes.len(),
+                budget,
+            });
+        }
+        return Ok(vec![frame.bytes.clone()]);
+    }
+    frame::split(&frame.bytes, budget).ok_or(CallError::FrameTooLarge {
+        bytes: frame.bytes.len(),
+        budget: frame::max_frame_len(budget),
+    })
+}
+
+/// 45.1 — seal and sign every piece of one frame, consecutive `chunk_seq`s
+/// in the publisher's current epoch (the caller holds the lock the roll
+/// takes, so a frame never straddles an epoch). A run that would pass the
+/// epoch's 2³² `chunk_seq` ceiling is refused before the first seal: the
+/// epoch rolls first.
+fn seal_pieces(
+    publisher: &mut Publisher,
+    signer: &ChunkSigner,
+    frame: &Frame,
+    pieces: &[Vec<u8>],
+) -> Result<Vec<(ChunkSeq, crate::transport::realtime_av::InnerSealed)>, CallError> {
+    let next = publisher.next_chunk_seq().0;
+    let run = u64::try_from(pieces.len()).unwrap_or(u64::MAX);
+    if next.saturating_add(run) > u64::from(u32::MAX) + 1 {
+        return Err(CallError::ChunkSeqExhausted {
+            next,
+            fragments: pieces.len(),
+        });
+    }
+    pieces
+        .iter()
+        .map(|p| {
+            let (seq, inner) = publisher
+                .seal_next(p, frame.codec_id, frame.layer)
+                .map_err(|e| CallError::Plumbing(e.to_string()))?;
+            let inner = signer
+                .sign(&inner)
+                .map_err(|e| CallError::Plumbing(e.to_string()))?;
+            Ok((seq, inner))
+        })
+        .collect()
+}
+
+/// 45.1 — send one frame's sealed pieces in order. A leg that fails one
+/// fragment (congested, too large, gone) gets none of the rest: a partial
+/// frame is worth nothing. Each leg's outcome is its first failure, or
+/// `Delivered`. `withhold`: the test seam's `(member, every)`.
+async fn send_pieces(
+    shared: &Arc<Shared>,
+    publisher: &mut Publisher,
+    stream: StreamId,
+    frame: &Frame,
+    pieces: &[Vec<u8>],
+    sealed: &[(ChunkSeq, crate::transport::realtime_av::InnerSealed)],
+    withhold: Option<&(String, u64)>,
+) -> Result<Vec<(String, LegOutcome)>, CallError> {
+    let mut outcome: BTreeMap<String, LegOutcome> = BTreeMap::new();
+    for (piece, (seq, inner)) in pieces.iter().zip(sealed) {
+        let mut exclude: Vec<String> = outcome
+            .iter()
+            .filter(|(_, o)| **o != LegOutcome::Delivered)
+            .map(|(p, _)| p.clone())
+            .collect();
+        // Only once the window has measured a gap (two rounds in): before
+        // that it runs on its prior, which this seam is not testing.
+        if let Some((peer, n)) = withhold {
+            if *n > 0 && seq.0 >= 2 * n && seq.0 % n == 0 {
+                exclude.push(peer.clone());
+            }
+        }
+        let legs = send_own_chunk(
+            shared,
+            publisher,
+            stream,
+            inner,
+            (piece.len(), frame.codec_id, frame.layer),
+            exclude,
+        )
+        .await?;
+        for (peer, o) in legs {
+            match outcome.get(&peer) {
+                Some(prev) if *prev != LegOutcome::Delivered => {}
+                _ => {
+                    outcome.insert(peer, o);
+                }
+            }
+        }
+    }
+    Ok(outcome.into_iter().collect())
+}
+
 /// One own chunk, sealed and signed, out on the primary publisher's legs
 /// (45.1: the primary's or a share's; a share has no legs of its own). ALM:
 /// `stream` goes only to the members that hold a commitment on it (a
@@ -3231,11 +3338,11 @@ async fn send_own_chunk(
     publisher: &mut Publisher,
     stream: StreamId,
     inner: &crate::transport::realtime_av::InnerSealed,
-    frame: &Frame,
+    (plaintext_len, codec_id, layer): (usize, u8, ChunkLayer),
     mut exclude: Vec<String>,
 ) -> Result<Vec<(String, LegOutcome)>, CallError> {
-    let base_or_audio = is_base_or_audio(frame.codec_id, frame.layer);
-    let wire_len = u64::try_from(frame.bytes.len() + AV_CHUNK_WIRE_OVERHEAD + CHUNK_TRAILER_LEN)
+    let base_or_audio = is_base_or_audio(codec_id, layer);
+    let wire_len = u64::try_from(plaintext_len + AV_CHUNK_WIRE_OVERHEAD + CHUNK_TRAILER_LEN)
         .unwrap_or(u64::MAX);
     let legs_now = publisher.dispatcher_mut().subscriber_ids();
     {
@@ -3246,7 +3353,7 @@ async fn send_own_chunk(
             exclude.extend(alm.own_exclude_on(stream, &legs_now, base_or_audio));
         }
         // 45.1 — a child that asked for less gets less.
-        exclude.extend(alm.layer_exclude(stream, &legs_now, frame.codec_id, frame.layer));
+        exclude.extend(alm.layer_exclude(stream, &legs_now, codec_id, layer));
     }
     let report = publisher
         .dispatcher_mut()
@@ -4527,11 +4634,17 @@ async fn forward(
 }
 
 async fn reorder_loop(
+    shared: Arc<Shared>,
     mut heard: mpsc::Receiver<Heard>,
     frames: mpsc::Sender<ReceivedFrame>,
     counts: Arc<StdMutex<ReorderCounts>>,
 ) {
     let mut window = ReorderWindow::new();
+    // 45.1 — a framed stream's fragments become whole frames here, past the
+    // window (a missing fragment is a missing chunk: the window waited for
+    // it by chunk_seq first).
+    let mut frames_of = frame::Reassemblers::default();
+    let mut sweep = 0u64;
     loop {
         let released = match window.next_deadline() {
             Some(deadline) => {
@@ -4550,10 +4663,33 @@ async fn reorder_loop(
                 None => return,
             },
         };
-        *counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = window.counts();
+        let mut whole = Vec::with_capacity(released.len());
+        let mut dropped = 0u64;
+        sweep = sweep.wrapping_add(1);
+        if sweep.is_multiple_of(256) {
+            for r in frames_of.retain(|st| shared.auth.is_bound(st)) {
+                dropped += 1;
+                shared.count(r.token());
+            }
+        }
         for f in released {
+            let framing = shared.auth.framing_of(f.stream, f.epoch);
+            let out = frames_of.push(f, framing);
+            for r in out.refused {
+                dropped += 1;
+                shared.count(r.token());
+            }
+            whole.extend(out.frame);
+        }
+        {
+            let mut c = counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = c.frames_dropped;
+            *c = window.counts();
+            c.frames_dropped = before + dropped;
+        }
+        for f in whole {
             if frames.send(f).await.is_err() {
                 return;
             }
