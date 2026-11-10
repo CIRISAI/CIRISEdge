@@ -428,7 +428,10 @@ sealed chunk is ever split (5.3.3.2.3).
   plaintext with `frag_index u16_be ‖ frag_count u16_be ‖ frame_seq u32_be`
   (8 bytes), a whole frame included (`0000 0001 ‖ frame_seq`), so the layout
   never depends on size. `frame_seq` counts the stream's frames per (codec
-  class, layer) from 0 for the stream's whole life, every fragment of a
+  class, layer) from 0 for the stream's whole life, where the layer is the
+  whole `ChunkLayer` triple of the chunk's clear codec block (`spatial`,
+  `temporal`, `quality`): the key is (stream, class, spatial, temporal,
+  quality), the same three bytes a relay's layer filter reads, every fragment of a
   frame carrying the same value (Eric, 2026-11-10). It does NOT restart at
   an epoch roll (unlike `chunk_seq`), so a frame lost across a roll is
   still a gap; a frame's fragments stay within one epoch; a replaced stream

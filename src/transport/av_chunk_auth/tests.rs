@@ -1302,7 +1302,9 @@ fn an_old_leave_replayed_after_a_rejoin_does_nothing_to_the_new_stream() {
 /// Vector 2: the 30-byte frame `kat-frag-frame-012345678901234` at an
 /// 18-byte budget, three fragments (chunk_seq 1, 2, 3; markers `0000 0003`,
 /// `0001 0003`, `0002 0003`, each `‖ 00000001`, frame_seq 1), each a
-/// whole sealed, signed chunk. Each value is the chunk's inner ciphertext ‖
+/// whole sealed, signed chunk. frame_seq is keyed on (stream, class,
+/// spatial, temporal, quality), the codec block's whole layer triple: here
+/// (0x04, 0, 0, 0). Each value is the chunk's inner ciphertext ‖
 /// trailer, hex. All four verify under the bound key, open, and reassemble
 /// to their frames.
 #[tokio::test]

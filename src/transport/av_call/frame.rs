@@ -11,7 +11,8 @@
 //! `frag_index u16_be ‖ frag_count u16_be ‖ frame_seq u32_be` (a whole frame
 //! is `0 ‖ 1 ‖ k`, so the layout never depends on size). `frame_seq` counts
 //! the stream's frames per (codec class, layer) from 0 for the stream's whole
-//! life, across epoch rolls (Eric 2026-11-10): one stream shares one
+//! life (the layer being the whole `ChunkLayer` triple, spatial, temporal and
+//! quality, the bytes a relay's layer filter reads), across epoch rolls (Eric 2026-11-10): one stream shares one
 //! `chunk_seq` across audio and video and restarts it each epoch, so only
 //! `frame_seq` tells a lost video frame (of a layer the receiver was being
 //! sent) from lost audio or a layer it was never sent. Audio (`0xFF`) chunks never carry it. A
