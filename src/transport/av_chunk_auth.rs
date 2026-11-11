@@ -1800,6 +1800,20 @@ impl ChunkAuth {
             .collect()
     }
 
+    /// The publishers whose bindings are held, sorted, each once.
+    #[must_use]
+    pub fn publishers(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .held()
+            .bound
+            .values()
+            .map(|b| b.publisher.to_string())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// v45 — `(stream, epoch)`'s framing when its v2 binding is installed;
     /// `None` while only its v1 binding is (or none).
     #[must_use]

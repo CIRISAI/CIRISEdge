@@ -2646,6 +2646,14 @@ impl Call {
         a
     }
 
+    /// The publishers whose stream key bindings this call holds, sorted. A
+    /// witness reads it to say whose bindings were installed, where the
+    /// install counter says only how many encodings were.
+    #[must_use]
+    pub fn bound_publishers_for_test(&self) -> Vec<String> {
+        self.shared.auth.publishers()
+    }
+
     /// Where the call stands.
     #[must_use]
     pub fn state(&self) -> CallState {

@@ -1657,17 +1657,30 @@ async fn a_room_of_person_leaves_is_called_through_their_nodes() {
     while let Ok(f) = frames_b.try_recv() {
         seen_b.push(f);
     }
-    for (seen, call) in [(&seen_a, &call_a), (&seen_b, &call_b)] {
+    for (seen, call, other) in [
+        (&seen_a, &call_a, &b.key.key_id),
+        (&seen_b, &call_b, &a.key.key_id),
+    ] {
         assert!(
             seen.iter().all(|f| f.publisher != c.key.key_id),
             "a node not bound to a leaf was heard"
         );
         assert!(!call.legs().contains(&c.key.key_id), "a leg to C");
+        // Whose bindings are held: the other member's, and nothing of C's.
         assert_eq!(
-            call.chunk_auth_counts().bindings_installed,
-            1,
-            "only the other member's binding: {:?}",
+            call.bound_publishers_for_test(),
+            vec![other.clone()],
+            "only the other member's bindings: {:?}",
             call.chunk_auth_counts()
+        );
+        // And how many: that member's one stream in its two encodings (v2,
+        // sent first to a node that takes it, then v1). A third would be a
+        // binding nobody in this call signed.
+        let counts = call.chunk_auth_counts();
+        assert_eq!(
+            (counts.bindings_installed, counts.bindings_refused),
+            (2, 0),
+            "the other member's v2 and v1 bindings, no other: {counts:?}"
         );
     }
     assert_eq!(call_a.state(), CallState::Live);
