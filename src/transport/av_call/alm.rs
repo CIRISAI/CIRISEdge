@@ -733,6 +733,7 @@ impl AlmState {
     }
 
     /// v45 — this node's own streams besides the primary.
+    #[cfg(test)]
     pub(super) fn share_streams(&self) -> Vec<StreamId> {
         self.shares.keys().copied().collect()
     }
@@ -917,6 +918,26 @@ impl AlmState {
             .collect()
     }
 
+    /// A relay admission for a stream this node receives (it has chosen a
+    /// parent for it), when it offers relay. Made on the tick after the
+    /// parent is chosen, and by a SUBSCRIBE that lands before that tick, so
+    /// the ledger answers the request and names its own refusal.
+    fn ensure_relay(&mut self, s: StreamId) {
+        if !self.relay_capable || self.relays.contains_key(&s) {
+            return;
+        }
+        if !self.sels.get(&s).is_some_and(|sel| sel.primary().is_some()) {
+            return;
+        }
+        let mut a = Admission::relay(self.me.clone(), self.cfg.clone(), None);
+        let (full, audio) = self.rates.get(&s).cloned().unwrap_or_default().costs();
+        a.set_role_costs(full, audio);
+        a.set_members(self.members.iter().cloned());
+        a.set_admit_closed(!self.tier.admits_new_relay_work());
+        self.relays.insert(s, a);
+        self.sync_upstream(s);
+    }
+
     fn sync_upstream(&mut self, stream: StreamId) {
         let view = self
             .sels
@@ -945,6 +966,9 @@ impl AlmState {
         let mut out = Vec::new();
         match f.msg {
             ControlMsg::Subscribe(req) => {
+                if !self.is_own(stream) {
+                    self.ensure_relay(stream);
+                }
                 let (decision, preempted) = if self.is_own(stream) {
                     self.provisional.remove(&(stream, peer.to_owned()));
                     let ext = self.external_except(stream);
@@ -1316,17 +1340,7 @@ impl AlmState {
             let sel = &self.sels[&s];
             let primary = sel.primary().cloned();
             let standby = sel.standby().cloned();
-            // A relay admission for every stream this node receives, when it
-            // offers relay.
-            if self.relay_capable && primary.is_some() && !self.relays.contains_key(&s) {
-                let mut a = Admission::relay(self.me.clone(), self.cfg.clone(), None);
-                let (full, audio) = self.rates.get(&s).cloned().unwrap_or_default().costs();
-                a.set_role_costs(full, audio);
-                a.set_members(self.members.iter().cloned());
-                a.set_admit_closed(!self.tier.admits_new_relay_work());
-                self.relays.insert(s, a);
-                self.sync_upstream(s);
-            }
+            self.ensure_relay(s);
             if self.last_primary.get(&s) != Some(&primary) {
                 if self.last_primary.get(&s).is_some_and(Option::is_some) {
                     self.label(crate::observability::ALM_PARENT_CHANGE);
