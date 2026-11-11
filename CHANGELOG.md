@@ -84,6 +84,41 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   (#904) and an unrouted repair name stay queued for a consent peer. The
   rule is read at the moment of asking, so it follows the host's peer set
   (`names_only_required_subjects`).
+- **Behaviour change: a node with no owner-binding here that is another
+  identity's occurrence is no longer listed to strangers** (CIRISEdge#971,
+  CC 5.4.6 "never listed"). Until now the #682 reach gate read "no owner
+  held" as "its own trust subject" and served the node's
+  `IdentityOccurrence` and `TransportDestination` rows to every peer. That
+  also covered a person's device whose owner-binding was released, had
+  lapsed, or had never reached the holder. Now:
+  - No other identity holds the key as its occurrence (a canonical, a bare
+    server): every peer, as before.
+  - The key is not node-type (a split-home agent key, a user key): every
+    peer, as before.
+  - A node held as the occurrence of an identity `X`: only the node itself,
+    `X`, `nodes_owned_by(X)` and `X`'s active occurrences. Anyone else is
+    booked the new withhold token `identity_row_occurrence_unowned`. A read
+    error fails closed to the node itself (`identity_row_announce_unresolved`).
+
+  The rule holds on the advertise, the direct-fetch twin and the subject
+  Pull. `Key` rows are not gated. At canonical-1 (2026-11-10) 384 node keys
+  match, all `ciris-node-bootstrap-*` under test-alias owners; no real home
+  is among them. Cost: one occurrence read per unowned subject per 30 s
+  memo, and one key-record read when the subject is another identity's
+  occurrence.
+
+  Two departures from the letter of CC 5.4.6, recorded in the code
+  (`bridge.rs::unowned_reach`): the active-occurrence clause (the text names
+  a live owner-binding; an occurrence the identity signed is served so a
+  device whose binding has not arrived still reaches its own person), and
+  agent-type keys stay open (CIRISEdge#897: closing them cuts the content
+  keys a roster wraps per occurrence).
+- **The public `InboundRouter` re-asks a peer whose reply it dropped
+  unattributed** (CIRISEdge#971, #968). `InboundRouter::try_route` now makes
+  the same `note_unattributed_drop` / `note_attributed` pair as the Edge's
+  own router, so a host that routes frames itself gets the round again as
+  soon as the peer attributes. The first round still runs to its 15 s
+  timeout (CIRISEdge#977).
 - **Replication sends to a peer no rule can reach are refused before any path
   seek** (CIRISEdge#971). With no live link, no path and no authenticated
   transit pair, CC 5.3.3.5 E1 forbids the dial, so the 3 s seek and its path

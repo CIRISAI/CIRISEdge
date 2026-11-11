@@ -10,6 +10,25 @@
   a `TypeError` led by `capsule_version_skew`, before anything is dereferenced. A server that hosts
   edge pins the same persist version; a persist patch release reaches edge through a new edge
   release.
+- **A node that is someone's occurrence and has no owner-binding at the holder is no longer
+  listed to strangers** (CIRISEdge#971, CC 5.4.6). Its `IdentityOccurrence` and
+  `TransportDestination` rows reach the node itself, the identity it is an active occurrence of,
+  that identity's owned nodes and that identity's other active occurrences. Anyone else is booked
+  the new withhold token `identity_row_occurrence_unowned`. Agent and user keys are not narrowed
+  (CIRISEdge#897). A host that reads the withhold ledger by token must add this one. A node whose
+  route should be public needs its owner's announce (`POST /v1/federation/announce`).
+- **A host that drives its own `InboundRouter`** now gets the #968 re-ask: a round whose reply was
+  dropped unattributed runs again when the peer attributes.
+
+**Known limits:**
+- A round started before a peer's replies can be attributed still waits out its 15 s timeout, once
+  per new device (CIRISEdge#977).
+- A row released at a node that only responds on that plane is asked for again only when the
+  offering peer next lists it (CIRISEdge#978).
+- A device's owner Pull to a bundle seat delivers a sibling node's occurrence only once the seat
+  holds the device's root acceptance and the device holds the owner's binding of that sibling. Both
+  are Attestation-plane rows the bundle Pulls do not carry; they arrive by the consent path
+  (CIRISEdge#979).
 
 # v44.1.2 — FountainHoldingClaim retired from the wire
 
