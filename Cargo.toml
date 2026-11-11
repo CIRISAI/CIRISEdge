@@ -962,8 +962,12 @@ tempfile       = { version = "3", optional = true }
 # propose), `NodeEvent::{RelayRouteLearned, ChannelMessageExpired}` and
 # `Error::NoRouteViaRelay` (logged only for now), and the +572-commit upstream
 # sync.
-leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.2", version = "0.34", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.2", version = "0.34", optional = true }
+# v0.34.0+ciris.3 (52826cd2) — `LinkHandle::try_send_seq` returns a Channel
+# send's sequence and `ReticulumNode::link_seq_stats` (`LinkSeqStats`,
+# `delivered_through`) proves it delivered. Additive: `LinkStats`, the wire
+# and the `send_on_link` error mapping are unchanged.
+leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.3", version = "0.34", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.3", version = "0.34", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -973,7 +977,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.2", version = "0.34", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.3", version = "0.34", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
