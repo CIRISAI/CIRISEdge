@@ -83,7 +83,26 @@ def sync_methods(gen, persist: Path) -> set[str]:
     return out
 
 
-def render(gen, methods, sync: set[str]) -> str:
+def test_anchor_methods(persist: Path) -> set[str]:
+    """Trait methods persist compiles only under `cfg(any(test, feature =
+    "test-anchor"))` (CIRISPersist#1001). A lib build without the feature has
+    no such method, so the wrapper's override carries
+    `cfg(feature = "test-anchor")`: edge's feature turns persist's on. Without
+    it the Android and iOS PyO3 lanes, which build the lib alone, fail with
+    E0407."""
+    import re
+
+    text = (persist / "src" / "federation" / "mod.rs").read_text()
+    return set(
+        re.findall(
+            r'#\[cfg\(any\(test,\s*feature\s*=\s*"test-anchor"\)\)\]\s*'
+            r"(?:async\s+)?fn\s+([a-z0-9_]+)\s*\(",
+            text,
+        )
+    )
+
+
+def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> str:
     L = []
     A = L.append
     A("//! CIRISEdge#960 — **a directory proxy that holds its capsules.**")
@@ -146,6 +165,9 @@ def render(gen, methods, sync: set[str]) -> str:
             A("        self")
             A("    }")
             continue
+        if name in anchored:
+            A("    // persist compiles this method only under `test` or `test-anchor`.")
+            A('    #[cfg(feature = "test-anchor")]')
         if name in sync:
             A(f"    fn {name}({arglist}) -> {ret} {{")
             A(f"        self.inner.{name}({call})")
@@ -173,10 +195,19 @@ def pinned_persist_src() -> Path:
     """The ciris-persist source cargo resolved for this workspace's lock."""
     import json
 
-    out = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--offline"],
-        cwd=ROOT, capture_output=True, text=True, check=True,
-    ).stdout
+    # Offline first: the answer is in the lockfile and the local checkout, and
+    # a developer box may have no network. A CI runner that fetched only its
+    # own target's crates cannot resolve the full graph offline (cargo
+    # metadata exits 101 there), so the second try may use the network.
+    base = ["cargo", "metadata", "--format-version", "1", "--locked"]
+    run = None
+    for extra in (["--offline"], []):
+        run = subprocess.run(base + extra, cwd=ROOT, capture_output=True, text=True)
+        if run.returncode == 0:
+            break
+    if run.returncode != 0:
+        sys.exit(f"cargo metadata failed ({run.returncode}):\n{run.stderr[-2000:]}")
+    out = run.stdout
     pkgs = [p for p in json.loads(out)["packages"] if p["name"] == "ciris-persist"]
     if len(pkgs) != 1:
         sys.exit(f"expected one ciris-persist package in the graph, found {len(pkgs)}")
@@ -194,7 +225,14 @@ def main() -> None:
         a.persist_src = pinned_persist_src()
     gen = load_persist_generator(a.persist_src)
     methods = methods_of(gen, a.persist_src)
-    text = rustfmt(render(gen, methods, sync_methods(gen, a.persist_src)))
+    text = rustfmt(
+        render(
+            gen,
+            methods,
+            sync_methods(gen, a.persist_src),
+            test_anchor_methods(a.persist_src),
+        )
+    )
     if a.check:
         if (OUT.read_text() if OUT.exists() else "") != text:
             sys.exit(f"STALE: {OUT.relative_to(ROOT)} ({len(methods)} methods); regenerate")
