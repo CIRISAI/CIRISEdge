@@ -1333,4 +1333,64 @@ mod tests {
         registry.note_attributed("peer-968");
         assert!(commands.try_recv().is_err(), "once per episode");
     }
+
+    /// **CIRISEdge#971 item 5 — the public router keeps the same #968 pair as
+    /// `Edge`'s own ingest.** A host that routes through
+    /// [`InboundRouter`](crate::replication::InboundRouter) dropped a new
+    /// peer's Attestation reply unattributed and never asked again: the seat's
+    /// round timed out and waited a whole cadence (an hour, on the witness's
+    /// roster). The frames here are the two the field produces: the dropped
+    /// reply (no `source_key_id`, the link's key as the candidate) and the
+    /// peer's next frame once it attributes. With either call removed from
+    /// `try_route`, no `RoundNow` is queued and this fails.
+    #[tokio::test]
+    async fn the_public_router_kicks_a_dropped_peer_when_it_attributes_971() {
+        use crate::replication::scheduler::{SchedulerCommand, SchedulerHandle};
+        use crate::replication::{InboundRouter, RouteDisposition};
+        use crate::transport::{InboundFrame, SourceKeyId, TransportId};
+        let (handle, mut commands) = SchedulerHandle::test_pair(&["peer-971"]);
+        let registry = Arc::new(ReplicationRegistry::new());
+        registry.install_no_route_backoff(&handle);
+        let router = InboundRouter::new(Arc::clone(&registry));
+        let frame = |kind, attributed: bool| InboundFrame {
+            envelope_bytes: crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
+                SummaryMessage {
+                    status: None,
+                    kind,
+                    refs: vec![],
+                },
+            )),
+            transport: TransportId::RETICULUM_RS,
+            received_at: chrono::Utc::now(),
+            source_key_id: attributed.then(|| SourceKeyId::transport_authenticated("peer-971")),
+            link_key_id: Some("peer-971".to_owned()),
+            arrival_scope: None,
+            reply_path: None,
+        };
+
+        // A bootstrap frame rides the carve-out: routed, nothing remembered.
+        let _ = router.try_route(&frame(EnvelopeKind::Key, false)).await;
+        let _ = router.try_route(&frame(EnvelopeKind::Key, true)).await;
+        assert!(commands.try_recv().is_err(), "nothing was dropped: no kick");
+
+        assert!(
+            matches!(
+                router
+                    .try_route(&frame(EnvelopeKind::Attestation, false))
+                    .await,
+                RouteDisposition::Unattributed
+            ),
+            "an unattributed Attestation frame is dropped"
+        );
+        let _ = router.try_route(&frame(EnvelopeKind::Key, true)).await;
+        match commands.try_recv() {
+            Ok(SchedulerCommand::RoundNow { peer_key_id }) => {
+                assert_eq!(peer_key_id.as_deref(), Some("peer-971"));
+            }
+            Ok(_) => panic!("expected a RoundNow for the peer, got another command"),
+            Err(e) => panic!("expected a RoundNow for the peer, got {e:?}"),
+        }
+        let _ = router.try_route(&frame(EnvelopeKind::Key, true)).await;
+        assert!(commands.try_recv().is_err(), "once per episode");
+    }
 }

@@ -285,6 +285,15 @@ impl InboundRouter {
             Ok(None) => return RouteDisposition::NotReplication,
             Err(e) => return RouteDisposition::Failed(format!("malformed CRPL frame: {e}")),
         }
+        // CIRISEdge#968 — the same pair `Edge`'s own ingest keeps
+        // (`edge.rs::route_replication_frame`): a peer this node dropped
+        // while it could not attribute it is asked again the moment one of
+        // its frames attributes. Without it here a host on this router left
+        // a round that was dropped unattributed to its next cadence tick
+        // (CIRISEdge#971 item 5: an hour, on a seat's roster).
+        if let Some(sid) = frame.source_key_id.as_ref() {
+            self.registry.note_attributed(sid.as_str());
+        }
         let Some(peer) = routing_source(frame) else {
             // CIRISEdge#727 — the owner-binding rung (`FSD/FIRST_CONTACT.md`
             // §2.1.1): an un-attributed push of an owner-binding signed by
@@ -297,6 +306,9 @@ impl InboundRouter {
                 {
                     return RouteDisposition::Routed;
                 }
+            }
+            if let Some(candidate) = frame.link_key_id.as_deref() {
+                self.registry.note_unattributed_drop(candidate);
             }
             return RouteDisposition::Unattributed;
         };
