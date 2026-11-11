@@ -740,7 +740,16 @@ async fn a_v1_peer_behind_a_v2_relay_still_binds_and_hears() {
     use ciris_edge::transport::realtime_av_alm::controller::wire::CAP_BINDING_V2;
     let _call = one_call().await;
     let tag = "alm2-v1-behind-v2";
-    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2)], None).await;
+    // 0 = A, 1 = B, 2 = C (the room); 3 = T (canonical: transport on, no
+    // member), so B and C learn each other with no leg between them.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        4,
+        3,
+        &[(0, 1), (0, 2), (0, 3), (1, 3), (2, 3)],
+        Some(3),
+    )
+    .await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
     c.transport.set_av_caps_withheld_for_test(CAP_BINDING_V2);
     let opus = CodecMap::new([CodecToken::Opus]).expect("map");
@@ -1366,6 +1375,54 @@ fn video(tag: u64, len: usize) -> Frame {
     }
 }
 
+/// What a failed media witness prints for one end of the call: its A/V
+/// counters, binding and reorder counts, and its ALM counts and parents.
+fn call_diag(who: &str, call: &Call, node: &Node) -> String {
+    let mut plane: Vec<(String, u64)> = node.metrics.av_plane().into_iter().collect();
+    plane.sort();
+    format!(
+        "{who}: av {plane:?}; auth {:?}; reorder {:?}; alm {:?}; parents {:?}; lost {:?}",
+        call.chunk_auth_counts(),
+        call.reorder_counts(),
+        call.alm_counts(),
+        call.alm_parents(),
+        call.frames_lost_by_layer(),
+    )
+}
+
+/// One Ed25519 sign and one strict verify in this build, in microseconds
+/// (the best of 20): what a publisher pays per chunk, and a receiver.
+fn chunk_sig_cost_us() -> (u128, u128) {
+    use ciris_crypto::{ClassicalSigner as _, Ed25519Signer, Ed25519Verifier};
+    let key = Ed25519Signer::random().expect("key");
+    let public = key.verifying_key().to_bytes();
+    let msg = [7u8; 300];
+    let (mut sign, mut verify) = (u128::MAX, u128::MAX);
+    for _ in 0..20 {
+        let t = std::time::Instant::now();
+        let sig = key.sign(&msg).expect("sign");
+        sign = sign.min(t.elapsed().as_micros());
+        let t = std::time::Instant::now();
+        assert!(Ed25519Verifier::new()
+            .verify_strict(&public, &msg, &sig)
+            .expect("verify"));
+        verify = verify.min(t.elapsed().as_micros());
+    }
+    (sign, verify)
+}
+
+/// The first eight bytes of each frame: the tag [`video`] writes.
+fn tags(frames: &[Vec<u8>]) -> Vec<u64> {
+    frames
+        .iter()
+        .map(|f| {
+            f.get(..8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map_or(u64::MAX, u64::from_be_bytes)
+        })
+        .collect()
+}
+
 /// How long a stream's receive view must stay unchanged to count as
 /// settled: two offer rounds.
 const VIEW_SETTLE_WINDOW: Duration = Duration::from_secs(2);
@@ -1468,7 +1525,19 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
         }
     })
     .await;
-    assert_eq!(got_video, sent_video, "every video frame whole, in order");
+    assert!(
+        got_video == sent_video,
+        "every video frame whole, in order: got tags {:?} of {}; A holds B's map {:?}; \
+         published in {} ms; sign/verify {:?} us; B's legs {:?}\n{}\n{}",
+        tags(&got_video),
+        sent_video.len(),
+        ca.stream_codecs(cb.stream()),
+        t1 - t0,
+        chunk_sig_cost_us(),
+        cb.leg_info(),
+        call_diag("A", &ca, a),
+        call_diag("B", &cb, b),
+    );
     assert_eq!(got_audio, sent_audio, "every audio frame as sent, unmarked");
     assert_eq!(av(&a.metrics, "av_frame_incomplete"), 0);
     // Eric 2026-11-10: each video frame carries its class's frame_seq (0, 1,
@@ -1698,7 +1767,17 @@ async fn framed_video_through_a_relay_arrives_whole_or_counted() {
         tokio::time::sleep(Duration::from_millis(33)).await;
     }
     let got = video_frames(&mut frames, 10).await;
-    assert_eq!(got, sent, "every frame whole through the relay");
+    assert!(
+        got == sent,
+        "every frame whole through the relay: got tags {:?} of {}; C holds B's map {:?}, A {:?}\n{}\n{}\n{}",
+        tags(&got),
+        sent.len(),
+        cc.stream_codecs(b_stream),
+        ca.stream_codecs(b_stream),
+        call_diag("C", &cc, c),
+        call_diag("A", &ca, a),
+        call_diag("B", &cb, b),
+    );
     assert!(ca.alm_counts().forwarded - forwarded_before >= u64::from(key.fragments));
     assert_eq!(av(&c.metrics, "av_frame_incomplete"), 0);
 
@@ -1748,7 +1827,16 @@ async fn a_v44_publisher_behind_a_relay_plays_audio_and_its_video_is_held_then_d
     use ciris_edge::transport::realtime_av_alm::controller::wire::CAP_BINDING_V2;
     let _call = one_call().await;
     let tag = "alm2-mixed";
-    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2)], None).await;
+    // 0 = A, 1 = B, 2 = C (the room); 3 = T (canonical: transport on, no
+    // member), so B and C learn each other with no leg between them.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        4,
+        3,
+        &[(0, 1), (0, 2), (0, 3), (1, 3), (2, 3)],
+        Some(3),
+    )
+    .await;
     let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
     c.transport.set_av_caps_withheld_for_test(CAP_BINDING_V2);
     let ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
