@@ -11,6 +11,37 @@ and its delivery proof). MSRV 1.92; toolchain 1.97.0.
 
 ### Consumer notes
 
+- **Room calls carry video (the call series; AV_ALM_DESIGN).**
+  - Frames larger than one chunk (keyframes, P-frames) are split before sealing and reassembled
+    whole by receivers: at most 4096 fragments and 1 MiB per frame, reassembled per (stream,
+    layer); a partial frame is never handed out. `Call::publish` no longer refuses ordinary video
+    frames; a frame over 1 MiB, or over the budget on an unframed stream, still raises
+    `frame_too_large`.
+  - A host declares its codecs at join (`codecs=["h264","opus"]`); the registered tokens are `av1`,
+    `h264` and `opus`.
+  - Screen sharing is a second stream: `add_stream(codecs)` returns its `stream_id`,
+    `publish_on(stream_id, ...)` sends on it and `end_stream(stream_id)` ends it (signing end = 3,
+    never a leave). A sharing phone can background its camera with
+    `end_stream(stream_id(), "backgrounded")`. At most 3 own streams at once.
+  - **BREAKING for hosts that map call events by kind:** new `stream_added` (`stream_kind` 0 media,
+    1 share), `stream_ended` (cause `ended` / `left` / `backgrounded`) and `stream_replaced`;
+    `attendee_left` now fires only on a member's last stream with a leave, or on lost / removed.
+  - New on `Call`: `leave(cause=)`, `replace_stream(codecs=)`, `leg_info()` (path, MDU and frame
+    budget per leg); `request_layers(stream, (s, t, q))` exists behind a lever that is off by
+    default.
+  - The ALM relay controller measures its uplink from delivered bytes (AV_ALM_DESIGN §5.1) and
+    raises a learned ceiling by one stream per clean window, so relay-on rooms no longer
+    over-commit at media start.
+  - Wire: every stream signs a v2 key binding (codec map, kind, framing, replaces, end 0-3,
+    final_seq); v1 is still sent for older peers. A v44 publisher's video reached only through a
+    relay is held, then dropped, at v45 receivers (counted `av_frame_framing_unknown`); its audio
+    plays.
+- **leviculum v0.34.0+ciris.3:** `LinkHandle::try_send_seq` (and `NodeCore::send_on_link_seq`)
+  returns the Channel sequence a message went out under, and the new `LinkSeqStats` (via
+  `ReticulumNode::link_seq_stats`: `last_sent_sequence`, `oldest_unacked_sequence`,
+  `delivered_through(seq)`) proves that message and everything before it were delivered; edge uses
+  it for the leave / replace / end_stream bindings. `LinkStats` is unchanged, there is no wire
+  change, and the `send_on_link` error mapping is unchanged.
 - **BREAKING: the Python persist requirement is exact, `ciris-persist==61.2.2`.** Every raw-layout
   capsule is named for the persist build that laid it out (`ciris_persist::<capsule>@61.2.2`,
   CIRISPersist#1242), and edge asks for the name its own build compiled
