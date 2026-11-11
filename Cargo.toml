@@ -1709,6 +1709,22 @@ debug = "full"
 strip = "none"
 incremental = false
 
+# Debug builds check one Ed25519 source signature per media chunk
+# (`av_chunk_auth::check_timed`), and a strict verify at opt-level 0 costs
+# about 4.8 ms (measured 2026-11-10, tests/alm_mesh_stage2.rs
+# `chunk_sig_cost_us`). A receiver then clears about 200 chunks a second,
+# where one 1 Mbit/s video stream at the 246 B frame budget of a 431 B link
+# sends about 470: the room-call witnesses measured the build, not the call.
+# These three crates carry that cost. Release profiles are not touched.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
 # Multi-container mesh harness (bench-mesh/). ONE edge occurrence per
 # process: its own federation seed, its own leviculum transport identity,
 # its own on-disk sealed KV, its own persist directory handle. Roles are
