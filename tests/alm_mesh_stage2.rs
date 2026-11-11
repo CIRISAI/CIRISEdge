@@ -522,6 +522,8 @@ async fn wait_bound(call: &Call, n: u64) {
     );
 }
 
+// The options are moved into the call.
+#[allow(clippy::large_types_passed_by_value)]
 async fn join_loaded(
     node: &Node,
     group: &CohortGroup,
@@ -873,7 +875,7 @@ async fn a_signed_leave_says_why_and_a_killed_node_is_lost_after_the_bound() {
     drop(cc);
     let killed = tokio::time::Instant::now();
     let mut seq = 100u64;
-    let lost = tokio::time::timeout(Duration::from_secs(60), async {
+    let lost = tokio::time::timeout(Duration::from_mins(1), async {
         loop {
             // A keeps publishing, so its own leg to C is found gone.
             let _ = ca.publish(Frame::opaque(body("a", seq))).await;
@@ -1246,6 +1248,7 @@ fn drain_from(
 /// camera.
 /// The share's end is proved per leg (`end_flush_unconfirmed` 0).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)] // one story, told in order
 async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
     use ciris_edge::transport::av_call::LeaveCause;
     use ciris_edge::transport::av_chunk_auth::{STREAM_KIND_MEDIA, STREAM_KIND_SHARE};
@@ -1307,8 +1310,8 @@ async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
     assert!(
         both,
         "A hears both streams: camera {}, share {}",
-        heard.get(&cam).map_or(0, |h| h.len()),
-        heard.get(&share).map_or(0, |h| h.len())
+        heard.get(&cam).map_or(0, std::collections::BTreeSet::len),
+        heard.get(&share).map_or(0, std::collections::BTreeSet::len)
     );
     cb.end_stream(share).await.expect("B stops sharing");
     assert_eq!(cb.streams().await, vec![cam], "the camera carries on");
@@ -1336,7 +1339,7 @@ async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
     .await;
     assert_eq!(ended, Some((share, LeaveCause::Ended)), "end = 3, no leave");
     // The camera is untouched: its frames keep coming.
-    let before = heard.get(&cam).map_or(0, |h| h.len());
+    let before = heard.get(&cam).map_or(0, std::collections::BTreeSet::len);
     for seq in 60..100u64 {
         cb.publish(Frame::opaque(body("cam", seq)))
             .await
@@ -1345,7 +1348,7 @@ async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
     }
     let more = wait_until(Duration::from_secs(10), || {
         drain(&mut frames, &mut heard);
-        let ok = heard.get(&cam).map_or(0, |h| h.len()) >= before + 30;
+        let ok = heard.get(&cam).map_or(0, std::collections::BTreeSet::len) >= before + 30;
         async move { ok }
     })
     .await;
@@ -1434,7 +1437,7 @@ async fn wait_view_settled(
     call: &Call,
     stream: ciris_edge::transport::realtime_av::StreamId,
 ) -> u64 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
     loop {
         let v = call.layer_view(stream);
         tokio::time::sleep(VIEW_SETTLE_WINDOW).await;

@@ -1536,6 +1536,9 @@ impl CallRouter {
 
 type Publisher = KeptAvPublisher<Arc<dyn StreamDekRegistrar>>;
 
+/// Frames a receiver never got, per (codec class, layer `(s, t, q)`).
+pub type FramesLost = BTreeMap<(u8, (u8, u8, u8)), u64>;
+
 /// A leg this node dialled to a member, carrying its stream.
 /// What carries one leg's link ([`Call::leg_info`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1675,7 +1678,7 @@ struct Shared {
     frame_seqs: StdMutex<HashMap<(StreamId, u8, ChunkLayer), u32>>,
     /// v45 — frames lost per codec class at this receiver (gaps in
     /// `frame_seq`), as the reorder loop's reassembly last counted them.
-    frames_lost: Arc<StdMutex<BTreeMap<(u8, (u8, u8, u8)), u64>>>,
+    frames_lost: Arc<StdMutex<FramesLost>>,
     /// v45 — each stream's receive view: bumped only when what this node is
     /// sent of THAT stream may change (its own request_layers for it, a C3
     /// Shed or Decision on it), so a layer it was not being sent for a while
@@ -1747,7 +1750,8 @@ struct OwnChunkKey {
 
 /// Mint this stream's chunk key for `epoch` and bind it: a v1 binding, and a
 /// v2 one when there is a codec map or a replacement to state.
-#[allow(clippy::too_many_arguments)]
+// The map is `Copy` and is kept in the key by value.
+#[allow(clippy::too_many_arguments, clippy::large_types_passed_by_value)]
 async fn mint_own_key(
     signer: &crate::identity::LocalSigner,
     room: &str,
@@ -1758,7 +1762,7 @@ async fn mint_own_key(
     replaces: Option<StreamId>,
     kind: u8,
 ) -> Result<OwnChunkKey, CallError> {
-    let framing = framing_for(codecs);
+    let framing = framing_for(codecs.as_ref());
     let key =
         ChunkSigner::generate(stream, epoch).map_err(|e| CallError::Plumbing(e.to_string()))?;
     let binding = StreamKeyBinding::sign(signer, room, join_nonce, stream, epoch, key.public())
@@ -1808,7 +1812,7 @@ async fn mint_own_key(
 /// stream is not.
 ///
 /// [`FRAMING_FRAGMENTS`]: crate::transport::av_chunk_auth::FRAMING_FRAGMENTS
-fn framing_for(codecs: Option<crate::transport::av_chunk_auth::CodecMap>) -> u8 {
+fn framing_for(codecs: Option<&crate::transport::av_chunk_auth::CodecMap>) -> u8 {
     use crate::transport::av_chunk_auth::{FRAMING_FRAGMENTS, FRAMING_NONE};
     match codecs {
         Some(m)
@@ -1838,9 +1842,10 @@ async fn sign_end(
         .0
         .checked_sub(1)
         .unwrap_or(crate::transport::av_chunk_auth::FINAL_SEQ_NONE);
-    let k = Shared::lock(&shared.own_key);
-    let fields = EndFields::of(&k);
-    drop(k);
+    // The key's guard ends with this statement: a guard named across the
+    // await below would make the future not `Send` (the Python binding
+    // runs it on the executor).
+    let fields = EndFields::of(&Shared::lock(&shared.own_key));
     sign_end_fields(shared, fields, final_seq, end).await
 }
 
@@ -2675,7 +2680,7 @@ impl Call {
     /// entry (`(0, 0, 0)`) is a freeze until the next keyframe. Audio (`0xFF`)
     /// is concealed by time and never counted here.
     #[must_use]
-    pub fn frames_lost_by_layer(&self) -> BTreeMap<(u8, (u8, u8, u8)), u64> {
+    pub fn frames_lost_by_layer(&self) -> FramesLost {
         Shared::lock(&self.shared.frames_lost).clone()
     }
 
@@ -2712,8 +2717,8 @@ impl Call {
         // Lock order: the primary publisher, then the shares. Under both, no
         // roll lands between the binding and the share's first chunk.
         let mut publisher = shared.publisher.lock().await;
-        let mut shares = shared.shares.lock().await;
-        let own = 1 + shares.len();
+        let mut live_shares = shared.shares.lock().await;
+        let own = 1 + live_shares.len();
         if own >= MAX_OWN_STREAMS {
             return Err(CallError::TooManyStreams(own));
         }
@@ -2752,14 +2757,14 @@ impl Call {
         )
         .await?;
         send_bindings_on(shared, &mut publisher, &key.wire, key.wire_v2.as_ref()).await;
-        shares.insert(
+        live_shares.insert(
             stream,
             ShareStream {
                 publisher: share,
                 key,
             },
         );
-        drop(shares);
+        drop(live_shares);
         drop(publisher);
         Shared::lock(&shared.alm).add_own_stream(stream);
         tracing::info!(
@@ -3036,6 +3041,7 @@ impl Call {
     ///
     /// # Errors
     /// As [`Self::leave`].
+    #[allow(clippy::too_many_lines)] // the leave's steps, in order, in one place
     pub async fn leave_with(
         mut self,
         why: crate::transport::av_chunk_auth::SignedEnd,
@@ -3580,6 +3586,7 @@ async fn current_members(shared: &Shared) -> Vec<String> {
 /// rolls (a new DEK, `chunk_seq` 0, through the keep layer), the call's
 /// addresses follow the room, departed members' legs close and joined
 /// members are dialled.
+#[allow(clippy::too_many_lines)] // one roll, every live stream, in one place
 async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     let room_epoch = shared.room_group.epoch().await;
     // A replacement waiting out its overlap was minted at the epoch about to
@@ -3666,8 +3673,8 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     // publish.
     let mut share_keeps = Vec::new();
     {
-        let mut shares = shared.shares.lock().await;
-        for share in shares.values_mut() {
+        let mut live_shares = shared.shares.lock().await;
+        for share in live_shares.values_mut() {
             match roll_share(shared, &mut publisher, share, to).await {
                 Ok(keep) => share_keeps.push(keep),
                 Err(e) => tracing::warn!(
@@ -3867,7 +3874,7 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
             let k = Shared::lock(&shared.own_key);
             (Arc::clone(&k.wire), k.wire_v2.clone())
         };
-        let mut v1: Vec<Arc<Vec<u8>>> = Some(own_v1).filter(|_| camera_live).into_iter().collect();
+        let mut v1: Vec<Arc<Vec<u8>>> = camera_live.then_some(own_v1).into_iter().collect();
         let mut v2: Vec<Arc<Vec<u8>>> = own_v2
             .filter(|_| camera_live && v2_ok)
             .into_iter()
@@ -4601,11 +4608,11 @@ async fn reannounce(shared: &Arc<Shared>) {
     // v45 — and every share's (the shares lock is let go before any send);
     // an ended camera's no more.
     let camera_live = !shared.primary_ended.load(Ordering::Acquire);
-    let mut v1: Vec<Arc<Vec<u8>>> = Some(wire).filter(|_| camera_live).into_iter().collect();
+    let mut v1: Vec<Arc<Vec<u8>>> = camera_live.then_some(wire).into_iter().collect();
     let mut v2: Vec<Arc<Vec<u8>>> = wire_v2.filter(|_| camera_live).into_iter().collect();
     {
-        let shares = shared.shares.lock().await;
-        for share in shares.values() {
+        let live_shares = shared.shares.lock().await;
+        for share in live_shares.values() {
             v1.push(Arc::clone(&share.key.wire));
             v2.extend(share.key.wire_v2.clone());
         }
@@ -4775,7 +4782,7 @@ async fn forward(
     }
     if let Some((peer, n)) = Shared::lock(&shared.test_withhold_forward).as_ref() {
         let seq = inner.chunk_seq().0;
-        if *n > 0 && seq >= 2 * n && seq % n == 0 {
+        if *n > 0 && seq >= 2 * n && seq.is_multiple_of(*n) {
             targets.remove(peer);
         }
     }

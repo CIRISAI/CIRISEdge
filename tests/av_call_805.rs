@@ -591,6 +591,8 @@ fn room_of(tag: &str) -> String {
     format!("room-call-{tag}")
 }
 
+// The options are moved into the call (here and in the two helpers below).
+#[allow(clippy::large_types_passed_by_value)]
 async fn join(
     node: &Node,
     group: &CohortGroup,
@@ -601,6 +603,7 @@ async fn join(
     join_recorded(node, group, tag, opts, registrar, None).await
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 async fn join_recorded(
     node: &Node,
     group: &CohortGroup,
@@ -623,7 +626,7 @@ async fn join_recorded(
 }
 
 /// [`join_recorded`] with a chosen roster and owner-binding door.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::large_types_passed_by_value)]
 async fn join_with(
     node: &Node,
     group: &CohortGroup,

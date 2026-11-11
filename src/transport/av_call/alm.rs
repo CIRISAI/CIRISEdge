@@ -926,7 +926,7 @@ impl AlmState {
         if !self.relay_capable || self.relays.contains_key(&s) {
             return;
         }
-        if !self.sels.get(&s).is_some_and(|sel| sel.primary().is_some()) {
+        if self.sels.get(&s).is_none_or(|sel| sel.primary().is_none()) {
             return;
         }
         let mut a = Admission::relay(self.me.clone(), self.cfg.clone(), None);

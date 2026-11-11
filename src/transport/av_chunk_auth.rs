@@ -217,7 +217,7 @@ impl Token {
     /// [`MAX_TOKEN_LEN`], or not printable ASCII.
     pub fn new(s: &str) -> Result<Self, BindingError> {
         let b = s.as_bytes();
-        if b.is_empty() || b.len() > MAX_TOKEN_LEN || !b.iter().all(|c| c.is_ascii_graphic()) {
+        if b.is_empty() || b.len() > MAX_TOKEN_LEN || !b.iter().all(u8::is_ascii_graphic) {
             return Err(BindingError::Malformed("codec token"));
         }
         let mut bytes = [0u8; MAX_TOKEN_LEN];
@@ -1625,6 +1625,7 @@ impl ChunkAuth {
     ///
     /// # Errors
     /// [`BindingError::Stale`] for an epoch older than the two held.
+    #[allow(clippy::too_many_lines)] // the install's rules, in order, in one place
     pub(crate) fn install(
         &self,
         binding: &StreamKeyBinding,

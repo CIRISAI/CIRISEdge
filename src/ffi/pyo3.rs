@@ -4782,6 +4782,7 @@ impl PyCall {
     /// `frame_seq` on layers it was being sent. A `(0, 0, 0)` entry is a
     /// freeze until the next keyframe. Audio is concealed by time and not
     /// counted.
+    #[allow(clippy::type_complexity)] // the dict's shape is what Python callers read
     fn frames_lost_by_layer(
         &self,
         py: Python<'_>,
@@ -14554,21 +14555,24 @@ mod pyo3_tier2_tests {
                 assert!(e.is_instance_of::<PyValueError>(py), "{token}: {e}");
                 assert!(e.to_string().contains(token), "{token}: {e}");
             };
-            value_err(py_edge.join_call(py, "", "unkept", false), "invalid_room");
             value_err(
-                py_edge.join_call(py, "chat:room:v1:a\0b", "unkept", false),
+                py_edge.join_call(py, "", "unkept", false, None),
                 "invalid_room",
             );
             value_err(
-                py_edge.join_call(py, &"r".repeat(513), "unkept", false),
+                py_edge.join_call(py, "chat:room:v1:a\0b", "unkept", false, None),
                 "invalid_room",
             );
             value_err(
-                py_edge.join_call(py, "chat:room:v1:a", "recorded", false),
+                py_edge.join_call(py, &"r".repeat(513), "unkept", false, None),
+                "invalid_room",
+            );
+            value_err(
+                py_edge.join_call(py, "chat:room:v1:a", "recorded", false, None),
                 "invalid_keep",
             );
             // Valid arguments reach the call API, which names what is missing.
-            let Err(e) = py_edge.join_call(py, "chat:room:v1:a", "unkept", false) else {
+            let Err(e) = py_edge.join_call(py, "chat:room:v1:a", "unkept", false, None) else {
                 panic!("a node with no Reticulum transport cannot join a call")
             };
             assert!(e.is_instance_of::<PyRuntimeError>(py), "{e}");

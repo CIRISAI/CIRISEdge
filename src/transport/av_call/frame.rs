@@ -227,10 +227,10 @@ impl Reassembler {
                 // one, or the same past the hole) has lost its start.
                 let same = frame_start == Some(p.first_seq);
                 self.abandon(&mut out);
-                if !same {
-                    self.orphan_once(&mut out, chunk.epoch, frame_start);
-                } else {
+                if same {
                     self.orphan = frame_start.map(|f| (chunk.epoch, f));
+                } else {
+                    self.orphan_once(&mut out, chunk.epoch, frame_start);
                 }
                 return out;
             } else if count != p.count {

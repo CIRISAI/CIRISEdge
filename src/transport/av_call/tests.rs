@@ -558,7 +558,7 @@ fn a_signed_end_waits_the_reorder_window_for_its_verdict() {
     let end = attendance_binding("bob", 1, None, Some(SignedEnd::Left));
     a.defer_end(&end, t);
     assert!(
-        a.due_ends(t + END_VERDICT_AFTER - Duration::from_millis(1))
+        a.due_ends(t + END_VERDICT_AFTER.saturating_sub(Duration::from_millis(1)))
             .is_empty(),
         "a tail chunk may still be in the window"
     );
@@ -604,7 +604,7 @@ fn a_signed_end_is_attendee_left_with_its_cause_once() {
             truncated: true,
         }]
     );
-    assert!(a.streams.get("bob").is_none());
+    assert!(!a.streams.contains_key("bob"));
     assert!(
         a.left("bob", s1, LeaveCause::Lost, true, false).is_none(),
         "once"
@@ -680,6 +680,7 @@ fn a_binding_alone_is_no_presence() {
 /// `AttendeeLeft`. Lost or removed with both live: one `AttendeeLeft`,
 /// naming the oldest (the camera).
 #[test]
+#[allow(clippy::too_many_lines)] // one story, told in order
 fn a_share_is_a_second_stream_and_its_end_is_no_leave() {
     use crate::transport::av_chunk_auth::SignedEnd;
     let mut a = Attendance::default();

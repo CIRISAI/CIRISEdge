@@ -662,6 +662,8 @@ fn kat_v2(v2: Option<V2Members>) -> StreamKeyBinding {
     }
 }
 
+// Shaped to `kat_v2`'s and `sign_v2`'s parameter, which take the members as an option.
+#[allow(clippy::unnecessary_wraps, clippy::large_types_passed_by_value)]
 fn v2m(codecs: CodecMap) -> Option<V2Members> {
     Some(V2Members {
         codecs: Some(codecs),
@@ -726,6 +728,7 @@ fn binding_v2_signed_bytes_kat() {
 /// another class, an out-of-order or empty map, or a bad `replaces` / `end`
 /// byte is malformed.
 #[test]
+#[allow(clippy::too_many_lines)] // every rule of the map, one after another
 fn the_codec_map_rules() {
     use crate::transport::realtime_av::{CODEC_AV1_SVC, CODEC_OPAQUE, CODEC_TEMPORAL_LAYERED};
     let table: Vec<(&str, u8)> = CodecToken::ALL

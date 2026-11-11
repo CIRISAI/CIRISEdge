@@ -328,6 +328,7 @@ impl R<'_> {
 ///
 /// # Errors
 /// [`WireError`].
+#[allow(clippy::too_many_lines)] // one arm per frame kind, in wire order, in one place
 pub fn decode(frame: &[u8], peer: &str) -> Result<WireFrame, WireError> {
     if !is_control_frame(frame) {
         return Err(WireError::NotControl);
@@ -679,7 +680,7 @@ mod tests {
             max_temporal: 2,
             max_quality: 0,
         };
-        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let hex = |b: &[u8]| hex::encode(b);
         let with = encode(s(), &req(Some(cap)));
         assert_eq!(
             hex(&with),
