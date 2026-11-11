@@ -494,6 +494,10 @@ impl FederationDirectory for KeptDirectory {
             .list_attestation_log(subject_key_id, cursor, limit)
             .await
     }
+    // ciris-persist 61.2.2 compiles these two trait methods only under
+    // `test` or its `test-anchor` feature (CIRISPersist#1001); a lib build
+    // without either (the Android/iOS PyO3 lanes) has no such method.
+    #[cfg(feature = "test-anchor")]
     async fn list_attestations_by(
         &self,
         attesting_key_id: &str,
@@ -519,6 +523,10 @@ impl FederationDirectory for KeptDirectory {
             .list_attestations_citing_by_dimension(dimension, evidence_ref)
             .await
     }
+    // ciris-persist 61.2.2 compiles these two trait methods only under
+    // `test` or its `test-anchor` feature (CIRISPersist#1001); a lib build
+    // without either (the Android/iOS PyO3 lanes) has no such method.
+    #[cfg(feature = "test-anchor")]
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,
