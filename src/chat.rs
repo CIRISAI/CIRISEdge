@@ -542,10 +542,10 @@ async fn live_proposal_by(
     let mut proposals = AttestationQuery::by(proposer_key_id, PROPOSAL_PAGE)
         .dimension(crate::membership::PROPOSAL_DIMENSION)
         .pages();
-    while let Some(page) = proposals
-        .next(directory)
-        .await
-        .map_err(|e| format!("list proposals by {proposer_key_id}: {e}"))?
+    while let Some(page) =
+        crate::read_caller::scoped(crate::read_caller::Site::Chat, proposals.next(directory))
+            .await
+            .map_err(|e| format!("list proposals by {proposer_key_id}: {e}"))?
     {
         live.extend(page.into_iter().filter(|p| live_here(p)));
     }
@@ -555,10 +555,10 @@ async fn live_proposal_by(
     let mut replies = AttestationQuery::to(invitee, FOLD_PAGE)
         .dimension(crate::membership::DECLINE_DIMENSION)
         .pages();
-    while let Some(page) = replies
-        .next(directory)
-        .await
-        .map_err(|e| format!("list replies of {invitee}: {e}"))?
+    while let Some(page) =
+        crate::read_caller::scoped(crate::read_caller::Site::Chat, replies.next(directory))
+            .await
+            .map_err(|e| format!("list replies of {invitee}: {e}"))?
     {
         declined.extend(page.into_iter().filter_map(|r| {
             r.attestation_envelope
@@ -1591,20 +1591,20 @@ pub async fn rows_in_room(
             .dimension(dimension)
             .types(&[ty::SCORES, ty::SUPERSEDES])
             .pages();
-        while let Some(page) = in_dimension
-            .next(directory)
-            .await
-            .map_err(|e| format!("rows by {who} in {dimension}: {e}"))?
+        while let Some(page) =
+            crate::read_caller::scoped(crate::read_caller::Site::Chat, in_dimension.next(directory))
+                .await
+                .map_err(|e| format!("rows by {who} in {dimension}: {e}"))?
         {
             rows.extend(page);
         }
         let mut composers = AttestationQuery::by(who, FOLD_PAGE)
             .types(&[ty::WITHDRAWS, ty::RECANTS])
             .pages();
-        while let Some(page) = composers
-            .next(directory)
-            .await
-            .map_err(|e| format!("composers by {who}: {e}"))?
+        while let Some(page) =
+            crate::read_caller::scoped(crate::read_caller::Site::Chat, composers.next(directory))
+                .await
+                .map_err(|e| format!("composers by {who}: {e}"))?
         {
             rows.extend(page);
         }

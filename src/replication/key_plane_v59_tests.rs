@@ -698,7 +698,16 @@ async fn an_occurrence_withdraws_reaches_a_stranger_holding_the_occurrence_v59()
         "precondition: B holds P's occurrence of N"
     );
 
-    a.withdraw_occurrence().await;
+    // Both rows below are written into A's store behind its bridge. v45
+    // (CIRISEdge#971): a write no door reports reaches a key-plane listing up
+    // to the feed's probe spacing late (`store_feed::FEED_PROBE_SPACING`), so
+    // the test proves BOTH paths: the withdraws is reported through the host's
+    // door (`note_local_write`, the reported path: listed on the next round),
+    // and the carrier below is not reported at all (the unreported path: listed
+    // once the spacing has passed).
+    let written_after = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let withdraws = a.withdraw_occurrence().await;
+    let _ = a_bridge.note_local_write(&withdraws, written_after).await;
     round(
         EnvelopeKind::IdentityOccurrenceRevocation,
         &a_bridge,
@@ -723,6 +732,12 @@ async fn an_occurrence_withdraws_reaches_a_stranger_holding_the_occurrence_v59()
     // and the stranger B receives and applies it.
     // (The revoked occurrence key is K, a held key: the projection FKs onto it.)
     let carrier = a.carrier_revoking_node_occurrence(a.k.key_id()).await;
+    // The unreported path: no door is told. The last feed drain began a full
+    // spacing ago (set explicitly, never by sleeping), so this round's listing
+    // probes the store and carries the carrier: the unreported write converges.
+    a_bridge
+        .age_feed(super::store_feed::FEED_PROBE_SPACING)
+        .await;
     round(
         EnvelopeKind::IdentityOccurrenceRevocation,
         &a_bridge,

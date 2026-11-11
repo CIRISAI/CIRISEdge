@@ -10014,18 +10014,29 @@ impl ReticulumTransport {
         if candidates.iter().any(|c| self.node.has_path(&c.dest_hash)) {
             return false;
         }
-        matches!(
+        // CIRISEdge#971 — the pair read runs before every round toward a peer
+        // with no live link or path; it is booked under its own caller label,
+        // not `other`.
+        let pair = crate::read_caller::scoped(
+            crate::read_caller::Site::RoundCarriable,
             self.seals
-                .resolve_pair(self.rooting.as_deref(), destination_key_id, None)
-                .await,
+                .resolve_pair(self.rooting.as_deref(), destination_key_id, None),
+        )
+        .await;
+        matches!(
+            pair,
             Err(crate::transport::av_transit_handshake::AvHandshakeError::NoTransitPair { .. })
         )
     }
 
     /// [`Self::undialable_now`] over this peer's own dial candidates: the
-    /// round-start hint.
+    /// round-start hint. Its candidate read is booked with the pair read.
     async fn undialable(&self, destination_key_id: &str) -> bool {
-        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let candidates = crate::read_caller::scoped(
+            crate::read_caller::Site::RoundCarriable,
+            self.resolve_dial_candidates(destination_key_id),
+        )
+        .await;
         self.undialable_now(destination_key_id, &candidates).await
     }
 
@@ -15609,7 +15620,13 @@ async fn attribute_and_deliver(
     }
     let link_key_id = candidate_key_id.clone();
     let source_key_id = match candidate_key_id {
-        Some(key_id) => gate_attribution(ctx, link_id, key_id).await,
+        Some(key_id) => {
+            crate::read_caller::scoped(
+                crate::read_caller::Site::TransportAttribution,
+                gate_attribution(ctx, link_id, key_id),
+            )
+            .await
+        }
         // NO candidate key_id at all — the frame is dropped unattributed. This is
         // NOT a silent drop: the specific cause (`NoDest` / `DestUnmatched`) was
         // ALREADY logged loudly + throttled by the `resolve_link_attribution` arm
@@ -15942,7 +15959,13 @@ async fn deliver_av_frame(
         // CIRISEdge#621's rule holds on this plane too: a link's source is
         // never this node.
         Some(key_id) if key_id == ctx.local_key_id => None,
-        Some(key_id) => gate_attribution(ctx, link_id, key_id).await,
+        Some(key_id) => {
+            crate::read_caller::scoped(
+                crate::read_caller::Site::TransportAttribution,
+                gate_attribution(ctx, link_id, key_id),
+            )
+            .await
+        }
         None => None,
     };
     let Some(peer) = gated else {
@@ -27660,5 +27683,122 @@ mod wire_link_id_tests {
             Some(LinkPlane::Identity)
         ));
         assert!(!planes.lock().await.contains_key(&connect_id));
+    }
+}
+
+/// CIRISEdge#971 — the round-start reach check's store reads run under the
+/// `edge.transport.carriable` caller label, so the seat's persist callers do
+/// not file them as unattributed.
+#[cfg(test)]
+mod round_carriable_caller_971 {
+    use super::*;
+
+    /// A rooting directory with no transit pair for anyone, recording the
+    /// persist caller label in force at each pair read.
+    #[derive(Default)]
+    struct RecordingRooting {
+        labels: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingRooting {
+        fn note(&self) {
+            let label = ciris_persist::observe::current_caller()
+                .map_or_else(|| "-".to_owned(), ciris_persist::observe::Caller::label);
+            self.labels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(label);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RootingDirectory for RecordingRooting {
+        async fn root_binding(&self, key_id: &str, _claimed: &str) -> RootingVerdict {
+            RootingVerdict::Rejected {
+                rejection: RootingRejection::UnknownKeyId {
+                    key_id: key_id.to_owned(),
+                },
+            }
+        }
+        async fn provenance_chain(
+            &self,
+            key_id: &str,
+        ) -> Result<ProvenanceChain, RootingRejection> {
+            Err(RootingRejection::UnknownKeyId {
+                key_id: key_id.to_owned(),
+            })
+        }
+        async fn transit_kex_pair_for(
+            &self,
+            _key_id: &str,
+        ) -> Result<Option<TransitKexPair>, String> {
+            self.note();
+            Ok(None)
+        }
+        async fn self_signed_transit_pair_for(
+            &self,
+            _key_id: &str,
+        ) -> Result<Option<TransitKexPair>, String> {
+            self.note();
+            Ok(None)
+        }
+    }
+
+    fn test_signer(key_id: &str) -> Arc<LocalSigner> {
+        let mut ed_seed = [0u8; 32];
+        for (i, b) in ed_seed.iter_mut().enumerate() {
+            *b = u8::try_from(i % 251).expect("in range") ^ 0x71;
+        }
+        let mut pqc_seed = ed_seed;
+        pqc_seed[0] ^= 0x55;
+        let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+            ciris_keyring::Ed25519SoftwareSigner::from_bytes(&ed_seed, key_id).expect("ed25519"),
+        );
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                &pqc_seed,
+                format!("{key_id}-pqc"),
+            )
+            .expect("ml_dsa_65"),
+        );
+        Arc::new(LocalSigner::new(key_id, classical, Some(pqc)))
+    }
+
+    /// A peer with no live link, no path and no transit pair is not
+    /// carriable, and every pair read that decided it ran under
+    /// `edge.transport.carriable`. Mutation: drop the `scoped` wrap in
+    /// `undialable_now`, and the recorded label is `-`.
+    #[tokio::test]
+    async fn the_round_start_pair_read_names_its_caller_971() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = ReticulumTransportConfig::new(dir.path().join("t.id"), "edge-carriable");
+        config.listen_addr = "127.0.0.1:0".parse().expect("addr");
+        let rooting = Arc::new(RecordingRooting::default());
+        let transport = ReticulumTransport::new(
+            config,
+            ReticulumAuth {
+                signer: Some(test_signer("edge-carriable")),
+                rooting: Some(Arc::clone(&rooting) as Arc<dyn RootingDirectory>),
+                ..ReticulumAuth::default()
+            },
+        )
+        .await
+        .expect("transport");
+        assert!(
+            !Transport::round_carriable(&transport, "peer-with-no-pair-971").await,
+            "no link, no path, no pair: the round is not carriable"
+        );
+        let labels = rooting
+            .labels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(!labels.is_empty(), "the pair was read");
+        assert!(
+            labels
+                .iter()
+                .all(|l| l == crate::read_caller::Site::RoundCarriable.label()),
+            "every pair read ran under the carriable label: {labels:?}"
+        );
     }
 }

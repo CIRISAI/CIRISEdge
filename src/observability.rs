@@ -1370,6 +1370,13 @@ pub const ADVERTISE_SEND_SET_READ: &str = "advertise_send_set_read";
 /// CIRISEdge#968 — a local write (a host kick, `note_local_write`, a released
 /// signer) dropped the send-set memos, so the next round re-reads them.
 pub const ADVERTISE_SEND_SET_INVALIDATED: &str = "advertise_send_set_invalidated";
+/// CIRISEdge#971 — a door dropped a consent send-set memo that was still
+/// LIVE (inside its TTL): the next round's send set pays a read it would
+/// otherwise have answered from memory. The cause split of the #968 drops.
+pub const ADVERTISE_SEND_SET_DROPPED_LIVE: &str = "advertise_send_set_dropped_live";
+/// CIRISEdge#971 — a round found the consent memo present but past
+/// its TTL (the other cause of a send-set read).
+pub const ADVERTISE_SEND_SET_EXPIRED: &str = "advertise_send_set_expired";
 /// A request or response that completed on a link a peer dialled before the
 /// event loop had answered its handshake (the two ride different event planes,
 /// so a fast dialler's first frame can overtake its last handshake part), or a
@@ -1497,6 +1504,226 @@ pub const KEY_PLANE_PROBE_FAILURES: &str = "key_plane_probe_failures";
 pub const KEY_PLANE_INVALIDATED: &str = "key_plane_invalidated";
 /// Memo rebuilds (first use, the TTL, or after a failed probe).
 pub const KEY_PLANE_REBUILDS: &str = "key_plane_rebuilds";
+/// CIRISEdge#971 — rebuilds by cause: the memo's first build.
+pub const KEY_PLANE_REBUILDS_FIRST: &str = "key_plane_rebuilds_first";
+/// CIRISEdge#971 — rebuilds by cause: the key-plane memo TTL expired.
+pub const KEY_PLANE_REBUILDS_TTL: &str = "key_plane_rebuilds_ttl";
+/// CIRISEdge#971 — a memo forgotten because the shared feed's probe failed
+/// (its next listing reads every subject).
+pub const KEY_PLANE_FORGOTTEN: &str = "key_plane_forgotten";
+/// CIRISEdge#971 — a memo's inbox overflowed (more key-plane rows landed
+/// between two of its listings than the inbox holds): the whole plane dropped.
+pub const KEY_PLANE_INBOX_OVERFLOWS: &str = "key_plane_inbox_overflows";
+/// CIRISEdge#971 — a delta row that drops a whole plane (a `key:revocation:v1`
+/// on the Revocation plane, an occurrence-revocation carrier, an unresolvable
+/// `withdraws` target).
+pub const KEY_PLANE_PLANE_DIRT: &str = "key_plane_plane_dirt";
+/// CIRISEdge#971 — feed asks answered without a store read because the last
+/// probe was inside the spacing and no door had marked the feed dirty.
+pub const KEY_PLANE_PROBES_SPACED: &str = "key_plane_probes_spaced";
+/// CIRISEdge#971 — doors that marked the shared feed dirty (an admitted
+/// apply, a host kick, `note_local_write(s)`, a released signer).
+pub const KEY_PLANE_FEED_DIRTY_MARKS: &str = "key_plane_feed_dirty_marks";
+/// CIRISEdge#971 — listings served whole from the plane's listing cache (no
+/// walk of the memo: the memo's generation had not moved and the subject set
+/// was equal).
+pub const KEY_PLANE_LISTING_CACHE_HITS: &str = "key_plane_listing_cache_hits";
+/// CIRISEdge#971 — subjects a listing left unread because its read budget was
+/// spent (absent from that listing, read by a later one).
+pub const KEY_PLANE_BUDGET_DEFERRED: &str = "key_plane_budget_deferred";
+/// CIRISEdge#971 — stale answers served because the read budget was spent
+/// before their revalidation read (stale-while-revalidate).
+pub const KEY_PLANE_STALE_SERVED: &str = "key_plane_stale_served";
+/// CIRISEdge#971 — stale answers re-read (their revalidation).
+pub const KEY_PLANE_REVALIDATED: &str = "key_plane_revalidated";
+
+// ─── CIRISEdge#971 — `EdgeMetrics::sweep_permits` labels ────────────────
+//
+// Every sweep-gate acquire, by the call site that took it. The gate's own
+// `sweep_permit_wait_seconds.count` is the total; this is its split, so a
+// seat's permit rate names its cause.
+
+/// The holdings drain of persist's content-hash index (one per page).
+pub const SWEEP_PERMIT_HOLDINGS_INDEX: &str = "holdings_index";
+/// The holdings ROW drain (`list_attestation_holdings`, the fallback).
+pub const SWEEP_PERMIT_HOLDINGS_ROWS: &str = "holdings_rows";
+/// A since-cursor page of a non-attestation plane (`sweep_paged`).
+pub const SWEEP_PERMIT_PLANE_PAGE: &str = "plane_page";
+/// An accord-evidence cursor page.
+pub const SWEEP_PERMIT_ACCORD_EVIDENCE: &str = "accord_evidence";
+/// A subject Pull answer.
+pub const SWEEP_PERMIT_SUBJECT_PULL: &str = "subject_pull";
+/// An announced-testimony subject Pull answer.
+pub const SWEEP_PERMIT_ANNOUNCED_TESTIMONY: &str = "announced_testimony";
+/// One key-plane subject read (a memo miss).
+pub const SWEEP_PERMIT_KEY_PLANE_SUBJECT: &str = "key_plane_subject";
+/// A page of the shared Attestation serve-cursor feed.
+pub const SWEEP_PERMIT_FEED_ATTESTATION: &str = "feed_attestation";
+/// A page of the route serve-cursor feed.
+pub const SWEEP_PERMIT_FEED_ROUTE: &str = "feed_route";
+/// The consent send-set read (a consent-memo miss).
+pub const SWEEP_PERMIT_SEND_SET: &str = "send_set";
+/// An advertise page of the Attestation serve cursor.
+pub const SWEEP_PERMIT_ADVERTISE_PAGE: &str = "advertise_page";
+/// The advertise's required read.
+pub const SWEEP_PERMIT_ADVERTISE_REQUIRED: &str = "advertise_required";
+/// The holdings index's warm-up walk from the head of the log (one page).
+pub const SWEEP_PERMIT_HOLDINGS_WARM: &str = "holdings_warm";
+/// Any acquire that names no site (tests).
+pub const SWEEP_PERMIT_OTHER: &str = "other";
+
+// ─── CIRISEdge#971 — `EdgeMetrics::holdings_index` labels ───────────────
+//
+// The receive diff of the Attestation and TransportDestination content-hash
+// indexes answered from a set kept equal to persist's `signed_wire_index`
+// (`replication::holdings_index`). Per-plane labels are `[attestation,
+// transport_destination]` pairs, indexed by the plane. Counters live in
+// `holdings_index`, gauges in `holdings_index_gauge`.
+
+/// Diffs answered from the set.
+pub const HOLDINGS_ANSWERS_SET: [&str; 2] = [
+    "attestation.answers_set",
+    "transport_destination.answers_set",
+];
+/// Asks answered by draining the index (boot, audit, fallback).
+pub const HOLDINGS_ANSWERS_DRAIN: [&str; 2] = [
+    "attestation.answers_drain",
+    "transport_destination.answers_drain",
+];
+/// Asks that fell back to the drain because the set was not booted.
+pub const HOLDINGS_FALLBACK_UNBOOTED: [&str; 2] = [
+    "attestation.fallback_unbooted",
+    "transport_destination.fallback_unbooted",
+];
+/// Asks that fell back to the drain because the set was suspect.
+pub const HOLDINGS_FALLBACK_SUSPECT: [&str; 2] = [
+    "attestation.fallback_suspect",
+    "transport_destination.fallback_suspect",
+];
+/// Boot drains completed.
+pub const HOLDINGS_BOOTS: [&str; 2] = ["attestation.boots", "transport_destination.boots"];
+/// Audit drains completed.
+pub const HOLDINGS_AUDITS: [&str; 2] = ["attestation.audits", "transport_destination.audits"];
+/// Boot or audit drains the store did not serve.
+pub const HOLDINGS_DRAIN_FAILURES: [&str; 2] = [
+    "attestation.drain_failures",
+    "transport_destination.drain_failures",
+];
+/// Wall milliseconds spent in boot and audit drains.
+pub const HOLDINGS_DRAIN_MS: [&str; 2] = ["attestation.drain_ms", "transport_destination.drain_ms"];
+/// Hashes the index held that the set did not, found by an audit.
+pub const HOLDINGS_DRIFT_MISSING: [&str; 2] = [
+    "attestation.drift_missing",
+    "transport_destination.drift_missing",
+];
+/// Hashes the set held that the index did not, found by an audit.
+pub const HOLDINGS_DRIFT_EXTRA: [&str; 2] = [
+    "attestation.drift_extra",
+    "transport_destination.drift_extra",
+];
+/// Audits whose drift exceeded the tolerance (the plane went suspect).
+pub const HOLDINGS_SUSPECT_AUDITS: [&str; 2] = [
+    "attestation.suspect_audits",
+    "transport_destination.suspect_audits",
+];
+/// Hashes inserted by the write-through on an admitted apply.
+pub const HOLDINGS_WRITE_THROUGH: [&str; 2] = [
+    "attestation.write_through",
+    "transport_destination.write_through",
+];
+/// Hashes new to the set inserted by a cursor delta.
+pub const HOLDINGS_FEED_INSERTS: [&str; 2] = [
+    "attestation.feed_inserts",
+    "transport_destination.feed_inserts",
+];
+/// A `Duplicate` apply of a hash the set said it lacked: the free "missing"
+/// signal (the row was fetched although the store held it).
+pub const HOLDINGS_DUPLICATE_UNHELD: [&str; 2] = [
+    "attestation.duplicate_unheld",
+    "transport_destination.duplicate_unheld",
+];
+/// Feed drains (one per serve-cursor catch-up that read the store).
+pub const HOLDINGS_FEED_PROBES: [&str; 2] = [
+    "attestation.feed_probes",
+    "transport_destination.feed_probes",
+];
+/// Feed asks satisfied by a drain another caller had just run.
+pub const HOLDINGS_FEED_COALESCED: [&str; 2] = [
+    "attestation.feed_coalesced",
+    "transport_destination.feed_coalesced",
+];
+/// Feed drains the store did not serve (the planes went suspect).
+pub const HOLDINGS_FEED_FAILURES: [&str; 2] = [
+    "attestation.feed_failures",
+    "transport_destination.feed_failures",
+];
+/// Gauge: hashes in the set.
+pub const HOLDINGS_GAUGE_SIZE: [&str; 2] = ["attestation.size", "transport_destination.size"];
+/// Gauge: 0 unbooted, 1 booting, 2 ready, 3 suspect.
+pub const HOLDINGS_GAUGE_STATUS: [&str; 2] = ["attestation.status", "transport_destination.status"];
+/// Gauge: where the last answer came from, 1 the set, 2 a drain.
+pub const HOLDINGS_GAUGE_SOURCE: [&str; 2] = ["attestation.source", "transport_destination.source"];
+/// Gauge: the last audit's wall milliseconds.
+pub const HOLDINGS_GAUGE_LAST_DRAIN_MS: [&str; 2] = [
+    "attestation.last_drain_ms",
+    "transport_destination.last_drain_ms",
+];
+/// Gauge: 1 when the lever is on.
+pub const HOLDINGS_GAUGE_ENABLED: &str = "enabled";
+/// CIRISEdge#971 — stale-route marks set (a replicated route older than the
+/// one held, `holdings_index.stale_route.marked`).
+pub const STALE_ROUTE_MARKED: &str = "stale_route.marked";
+/// Wants a stale-route mark dropped (the older bytes not asked for again).
+pub const STALE_ROUTE_SUPPRESSED: &str = "stale_route.suppressed";
+/// Marks evicted, front-drop, to make room past the cap.
+pub const STALE_ROUTE_EVICTED: &str = "stale_route.evicted";
+/// Marks dropped because a route left the index (an audit's `extra`).
+pub const STALE_ROUTE_CLEARED: &str = "stale_route.cleared";
+/// Gauge: stale-route marks held.
+pub const HOLDINGS_GAUGE_STALE_ROUTE_SIZE: &str = "stale_route.size";
+/// Gauge: answers held in each key-plane memo, by `KeyPlaneRead` slot (key
+/// record, occurrence binding, revocation, occurrence withdrawal). Set after
+/// every listing; bounded by the host's publish sets (see `PlaneMemo`).
+pub const KEY_PLANE_GAUGE_MEMO_ENTRIES: [&str; 4] = [
+    "key_plane.key_record.memo_entries",
+    "key_plane.occurrence_binding.memo_entries",
+    "key_plane.revocation.memo_entries",
+    "key_plane.occurrence_withdrawal.memo_entries",
+];
+/// Gauge: subjects the last listing of each key plane left UNREAD because its
+/// read budget was spent (absent from that listing), by `KeyPlaneRead` slot.
+/// Non-zero for more than a few listings in a row is a stall.
+pub const KEY_PLANE_GAUGE_UNREAD: [&str; 4] = [
+    "key_plane.key_record.unread",
+    "key_plane.occurrence_binding.unread",
+    "key_plane.revocation.unread",
+    "key_plane.occurrence_withdrawal.unread",
+];
+/// Gauge: stale answers the last listing of each key plane served while they
+/// wait for their revalidation read, by `KeyPlaneRead` slot.
+pub const KEY_PLANE_GAUGE_STALE: [&str; 4] = [
+    "key_plane.key_record.stale",
+    "key_plane.occurrence_binding.stale",
+    "key_plane.revocation.stale",
+    "key_plane.occurrence_withdrawal.stale",
+];
+/// Gauge: milliseconds from the runtime's warm-up start to this plane's set
+/// being Ready (its walk from the head of the log plus its boot drain), set
+/// once per process. Absent while the plane has not come up through the
+/// warm-up.
+pub const HOLDINGS_GAUGE_READY_AFTER_MS: [&str; 2] = [
+    "attestation.ready_after_ms",
+    "transport_destination.ready_after_ms",
+];
+/// Rows the warm-up's walk from the head of the log read, per plane.
+pub const HOLDINGS_WARM_ROWS: [&str; 2] =
+    ["attestation.warm_rows", "transport_destination.warm_rows"];
+/// Warm-up walk pages the store did not serve (the plane then boots inline,
+/// on its first ask, as without a warm-up).
+pub const HOLDINGS_WARM_FAILURES: [&str; 2] = [
+    "attestation.warm_failures",
+    "transport_destination.warm_failures",
+];
 
 // ─── v44 LTS — `EdgeMetrics::persisted_standing` labels ─────────────────
 //
@@ -2072,6 +2299,8 @@ pub const ADVERTISE_LABELS: &[&str] = &[
     ADVERTISE_SEND_SET_MEMO_HIT,
     ADVERTISE_SEND_SET_READ,
     ADVERTISE_SEND_SET_INVALIDATED,
+    ADVERTISE_SEND_SET_DROPPED_LIVE,
+    ADVERTISE_SEND_SET_EXPIRED,
 ];
 /// Every `link_stall` key.
 pub const LINK_STALL_LABELS: &[&str] = &[
@@ -2359,6 +2588,13 @@ pub struct EdgeMetrics {
     /// subject reads, memo hits, change-probe reads and rows, invalidations,
     /// rebuilds and the wall time spent reading.
     pub key_plane_sweep: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 — sweep-gate acquires by call site (`SWEEP_PERMIT_*`).
+    pub sweep_permits: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 — the holdings index's counters, by `HOLDINGS_*` label.
+    pub holdings_index: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 — the holdings index's gauges, by `HOLDINGS_GAUGE_*`
+    /// label: set size, status, source of the last answer, last drain time.
+    pub holdings_index_gauge: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// v44 LTS — the persisted-standing refresh by label
     /// (`PERSISTED_STANDING_*` constants in this module): passes, their wall
     /// time, ticks skipped, passes cut, sweeps and rows walked.
@@ -3208,10 +3444,57 @@ impl EdgeMetrics {
         }
     }
 
+    /// CIRISEdge#971 — one sweep-gate acquire at `site` (`SWEEP_PERMIT_*`).
+    pub fn inc_sweep_permit(&self, site: &'static str) {
+        *self.sweep_permits.write().entry(site).or_insert(0) += 1;
+    }
+
+    /// Sweep-gate acquires by site (tests + the operator readback).
+    #[must_use]
+    pub fn sweep_permits(&self) -> HashMap<String, u64> {
+        self.sweep_permits
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
     /// The key-plane listing ledger by label (tests + the operator readback).
     #[must_use]
     pub fn key_plane_sweep(&self) -> HashMap<String, u64> {
         self.key_plane_sweep
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#971 — add `n` to a `HOLDINGS_*` counter label.
+    pub fn add_holdings_index(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.holdings_index.write().entry(label).or_insert(0) += n;
+        }
+    }
+
+    /// CIRISEdge#971 — set a `HOLDINGS_GAUGE_*` label.
+    pub fn set_holdings_index_gauge(&self, label: &'static str, v: u64) {
+        self.holdings_index_gauge.write().insert(label, v);
+    }
+
+    /// The holdings index's counters by label (tests + the operator readback).
+    #[must_use]
+    pub fn holdings_index(&self) -> HashMap<String, u64> {
+        self.holdings_index
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// The holdings index's gauges by label.
+    #[must_use]
+    pub fn holdings_index_gauge(&self) -> HashMap<String, u64> {
+        self.holdings_index_gauge
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -3899,6 +4182,13 @@ impl EdgeMetrics {
         // it leaves only through `ShapingWindows`.
         let mut link_shaping = registered(&self.link_shaping, LINK_SHAPING_LABELS);
         link_shaping.remove(LINK_SHAPING_FRAMES_REAL);
+        // Milliseconds and entry counts, far below 2^52.
+        #[allow(clippy::cast_precision_loss)]
+        let holdings_index_gauge = self
+            .holdings_index_gauge()
+            .into_iter()
+            .map(|(k, v)| (k, v as f64))
+            .collect();
         EdgeMetricsBundle {
             envelopes_sent_total: self.envelopes_sent_total.read().clone(),
             envelopes_received_total: self.envelopes_received_total.read().clone(),
@@ -3975,6 +4265,9 @@ impl EdgeMetrics {
             direct_link: registered(&self.direct_link, DIRECT_LINK_LABELS),
             peer_binding: registered(&self.peer_binding, PEER_BINDING_LABELS),
             key_plane_sweep: self.key_plane_sweep(),
+            sweep_permits: self.sweep_permits(),
+            holdings_index: self.holdings_index(),
+            holdings_index_gauge,
             persisted_standing: self.persisted_standing(),
             link_stall: registered(&self.link_stall, LINK_STALL_LABELS),
             direct_link_upgrade_guarded: registered(
@@ -4322,6 +4615,12 @@ pub struct EdgeMetricsBundle {
     pub peer_binding: HashMap<String, u64>,
     /// CIRISEdge#930 — the key-plane listings' cost by `KEY_PLANE_*` label.
     pub key_plane_sweep: HashMap<String, u64>,
+    /// CIRISEdge#971 — sweep-gate acquires by `SWEEP_PERMIT_*` site.
+    pub sweep_permits: HashMap<String, u64>,
+    /// CIRISEdge#971 — the holdings index's counters by `HOLDINGS_*` label.
+    pub holdings_index: HashMap<String, u64>,
+    /// CIRISEdge#971 — the holdings index's gauges by `HOLDINGS_GAUGE_*` label.
+    pub holdings_index_gauge: HashMap<String, f64>,
     /// v44 LTS — the persisted-standing refresh by `PERSISTED_STANDING_*` label.
     pub persisted_standing: HashMap<String, u64>,
     /// CIRISEdge#926 — the link stall guard by `LINK_STALL_*` label.
@@ -4776,6 +5075,12 @@ impl EdgeMetricsBundle {
         f.family("peer_binding", &self.peer_binding);
         // CIRISEdge#930 — the key-plane listings, `key_plane_sweep.<label>`.
         f.family("key_plane_sweep", &self.key_plane_sweep);
+        // CIRISEdge#971 — sweep-gate acquires, `sweep_permits.<site>`.
+        f.family("sweep_permits", &self.sweep_permits);
+        // CIRISEdge#971 — the holdings index, `holdings_index.<label>` and
+        // the gauges `holdings_index_gauge.<label>`.
+        f.family("holdings_index", &self.holdings_index);
+        f.gauge_family("holdings_index_gauge", &self.holdings_index_gauge);
         // v44 LTS — the persisted-standing refresh, `persisted_standing.<label>`.
         f.family("persisted_standing", &self.persisted_standing);
         // CIRISEdge#926 — the link stall guard, `link_stall.<label>`.
@@ -5119,6 +5424,9 @@ edge_metrics_bundle_fields!(
     direct_link,
     peer_binding,
     key_plane_sweep,
+    sweep_permits,
+    holdings_index,
+    holdings_index_gauge,
     persisted_standing,
     link_stall,
     direct_link_upgrade_guarded,

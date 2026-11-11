@@ -262,10 +262,16 @@ to it, and a 1 is not visible from anywhere else.
 | `direct_link` | `ciris.edge.direct_link` | counter | count | operator-only |
 | `peer_binding` | `ciris.edge.peer_binding` | counter | count | operator-only |
 | `key_plane_sweep` | `ciris.edge.key_plane.sweep` | counter | count | operator-only |
+| `sweep_permits` | `ciris.edge.sweep_permits` | counter | count | operator-only |
+| `holdings_index` | `ciris.edge.holdings_index` | counter | count | operator-only |
+| `holdings_index_gauge` | `ciris.edge.holdings_index.gauge` | gauge | count | operator-only |
 | `persisted_standing` | `ciris.edge.persisted_standing` | counter | count | operator-only |
 | `link_stall` | `ciris.edge.link_stall` | counter | count | operator-only |
 | `direct_link_upgrade_guarded` | `ciris.edge.direct_link.upgrade_guarded` | counter | count | operator-only |
 | `advertise` | `ciris.edge.advertise` | counter | count | operator-only |
+| `replication_reach` | `ciris.edge.replication.reach` | counter | count | operator-only |
+| `bundle_pull` | `ciris.edge.replication.bundle_pull` | counter | count | operator-only |
+| `initiator_peers` | `ciris.edge.replication.initiator_peers` | gauge | count | operator-only |
 | `direct_links_active` | `ciris.edge.direct_links.active` | gauge | count | operator-only |
 | `replication_routed_to_responder_total` | `ciris.edge.replication.routed.responder` | counter | count | operator-only |
 | `replication_routed_to_initiator_total` | `ciris.edge.replication.routed.initiator` | counter | count | operator-only |

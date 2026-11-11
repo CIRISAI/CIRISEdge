@@ -704,10 +704,12 @@ impl CallRecord for PersistCallRecord {
             let mut pages = AttestationQuery::by(who, FOLD_PAGE)
                 .types(&[ty::WITHDRAWS, ty::RECANTS])
                 .pages();
-            while let Some(page) = pages
-                .next(self.directory.as_ref())
-                .await
-                .map_err(|e| format!("withdrawals by {who}: {e}"))?
+            while let Some(page) = crate::read_caller::scoped(
+                crate::read_caller::Site::AvCall,
+                pages.next(self.directory.as_ref()),
+            )
+            .await
+            .map_err(|e| format!("withdrawals by {who}: {e}"))?
             {
                 withdrawn.extend(page.into_iter().filter_map(|a| {
                     a.attestation_envelope

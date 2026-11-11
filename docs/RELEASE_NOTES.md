@@ -1,15 +1,44 @@
 # CIRISEdge Release Notes
 
-# v45.0.0 (unreleased)
+# v45.0.0 — the fewest store reads, a late joiner's history, and exact pins
 
-**Consumer notes:**
-- **The Python requirement is exact: `ciris-persist==61.2.2`.** Since persist 61.2
-  (CIRISPersist#1242) every raw-layout capsule is named for the persist build that laid it out
-  (`ciris_persist::<capsule>@61.2.2`), and edge loads only the capsule its own build of persist
-  compiled. Any other wheel, an older or a newer patch alike, is refused at `init_edge_runtime` with
-  a `TypeError` led by `capsule_version_skew`, before anything is dereferenced. A server that hosts
-  edge pins the same persist version; a persist patch release reaches edge through a new edge
-  release.
+**2026-11-10.** **MAJOR.** Pins: persist v61.2.2 (exact, Python too), CIRISVerify v22.2.0
+(rusqlite 0.41.1 / libsqlite3-sys 0.39.1, RUSTSEC-2026-0459 cleared), leviculum v0.34.0+ciris.2.
+MSRV 1.92.
+
+**Consumer notes** (detail in CHANGELOG.md):
+- **BREAKING: exact persist pin, `ciris-persist==61.2.2`.** Edge loads only the persist capsule it
+  was built against (capsules are named `@<persist version>` since CIRISPersist#1242); any other
+  wheel is refused at `init_edge_runtime` with `capsule_version_skew`. A server pins the same
+  version.
+- **BREAKING: `hybrid_policy` accepts `"strict"` only** (CIRISEdge#957); anything else is
+  `verify_policy_violation`.
+- **BREAKING: `membership::WidenOutcome::NeedsCosign`.** A widening one voice short of the room's
+  protocol is this outcome, not an `Err`; an exhaustive match adds the arm. Counts wait on
+  CIRISPersist#1250.
+- **BREAKING: the bundle path is on by default (#881, CIRISEdge#971).**
+  `enable_bundle_bootstrap_peers` is gone; opt out with `disable_bundle_bootstrap_peers: true`. A
+  default node asks each held bundle seat for its required set by subject Pull, never a whole-plane
+  diff.
+- **`Edge::arm_room_groups` (CIRISEdge#970)** arms room groups once on a running Edge, so calls work
+  on agent-hosted nodes.
+- **The fewest store reads (CIRISEdge#971).** An idle round reads nothing: the receive diff answers
+  from an in-memory holdings index, key-plane listings are cached under a per-listing read budget,
+  and every edge store read names its caller (CIRISPersist#1235). Levers:
+  `BridgeConfig::holdings_index` (env `CIRIS_EDGE_HOLDINGS_INDEX=0`), `holdings_audit_every`,
+  `feed_probe_spacing`. Gauges: the `holdings_index.*`, `holdings_index_gauge.*`,
+  `sweep_permits.<site>`, `bundle_pull.*` and `replication_reach` families.
+- **A host that writes to the store behind edge must follow the write with a kick
+  (`round_now`/`round_now_all`) or `note_local_write(s)`, or its rows reach peers up to 5 s
+  later; use `note_local_write(s)` where decision-row events matter** (CIRISEdge#971, the feed's
+  probe spacing).
+- **A late joiner gets its groups' history** (CIRISEdge#968), and the #968 contact waits A and B
+  are gone (a local write reaches the next round; a dropped first round is asked again soon).
+- **A named shaping class is the device, not the opt-in** (CIRISEdge#969): `home` / `phone-*`
+  shape layer links only unless `shaping_opt_in` (or `shaping_opt_in_cellular`) is `True`;
+  `shaping_set_device_state` keeps an opt-in the call leaves out.
+- **A/V media rides unordered datagrams** (leviculum#102), with the node-wide lever
+  `set_av_datagrams_enabled` (default on, gauge `av_datagrams_enabled`).
 - **A node that is someone's occurrence and has no owner-binding at the holder is no longer
   listed to strangers** (CIRISEdge#971, CC 5.4.6). Its `IdentityOccurrence` and
   `TransportDestination` rows reach the node itself, the identity it is an active occurrence of,

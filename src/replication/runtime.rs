@@ -263,6 +263,8 @@ fn with_release_kick(
 /// not be able to change the node's memory posture, in either direction.
 fn resolve_sweep_permits(mut config: BridgeConfig) -> BridgeConfig {
     config = resolve_sweep_page_rows(config);
+    config = resolve_holdings_index(config);
+    config = resolve_key_plane_levers(config);
     let Ok(raw) = std::env::var(BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV) else {
         return config;
     };
@@ -335,6 +337,93 @@ fn resolve_sweep_page_rows(mut config: BridgeConfig) -> BridgeConfig {
             "sweep page size override is not a u32 — IGNORED, keeping the \
              configured value (history: CIRISEdge#531)"
         ),
+    }
+    config
+}
+
+/// CIRISEdge#971 — apply the holdings-index lever
+/// ([`BridgeConfig::HOLDINGS_INDEX_ENV`]) and audit cadence
+/// ([`BridgeConfig::HOLDINGS_AUDIT_EVERY_ENV`]) overrides. Same contract as
+/// [`resolve_sweep_page_rows`]: missing leaves the configured value; a value
+/// that does not parse WARNS and leaves it too. The lever only turns OFF
+/// from the environment (`0`, `off`, `false`): the server pulls it on a box
+/// where the index misbehaves, without a release.
+fn resolve_holdings_index(mut config: BridgeConfig) -> BridgeConfig {
+    if let Ok(raw) = std::env::var(BridgeConfig::HOLDINGS_INDEX_ENV) {
+        let off = matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        );
+        if off {
+            tracing::info!(
+                env = BridgeConfig::HOLDINGS_INDEX_ENV,
+                "holdings index turned OFF from the environment: every Summary \
+                 drains persist's content-hash index, the pre-v45 behaviour \
+                 (CIRISEdge#971)"
+            );
+            config.holdings_index = false;
+        }
+    }
+    if let Ok(raw) = std::env::var(BridgeConfig::HOLDINGS_AUDIT_EVERY_ENV) {
+        match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => {
+                tracing::info!(
+                    secs,
+                    env = BridgeConfig::HOLDINGS_AUDIT_EVERY_ENV,
+                    "holdings index audit cadence overridden from the environment \
+                     (CIRISEdge#971)"
+                );
+                config.holdings_audit_every = std::time::Duration::from_secs(secs);
+            }
+            _ => tracing::warn!(
+                raw = %raw,
+                env = BridgeConfig::HOLDINGS_AUDIT_EVERY_ENV,
+                keeping_secs = config.holdings_audit_every.as_secs(),
+                "holdings index audit cadence is not a positive whole number of \
+                 seconds: IGNORED, keeping the configured value (tracked: \
+                 tracked: CIRISEdge#971)"
+            ),
+        }
+    }
+    config
+}
+
+/// CIRISEdge#971 — apply the key-plane listing-cache lever
+/// ([`BridgeConfig::KEY_PLANE_LISTING_CACHE_ENV`], only turns OFF) and the
+/// per-listing read budget ([`BridgeConfig::KEY_PLANE_READ_BUDGET_ENV`], a
+/// positive whole number). Same contract as [`resolve_holdings_index`].
+fn resolve_key_plane_levers(mut config: BridgeConfig) -> BridgeConfig {
+    if let Ok(raw) = std::env::var(BridgeConfig::KEY_PLANE_LISTING_CACHE_ENV) {
+        if matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        ) {
+            tracing::info!(
+                env = BridgeConfig::KEY_PLANE_LISTING_CACHE_ENV,
+                "key-plane listing cache turned OFF from the environment: every \
+                 listing walks its plane's memo, the pre-v45 behaviour (CIRISEdge#971)"
+            );
+            config.key_plane_listing_cache = false;
+        }
+    }
+    if let Ok(raw) = std::env::var(BridgeConfig::KEY_PLANE_READ_BUDGET_ENV) {
+        match raw.trim().parse::<usize>() {
+            Ok(budget) if budget > 0 => {
+                tracing::info!(
+                    budget,
+                    env = BridgeConfig::KEY_PLANE_READ_BUDGET_ENV,
+                    "key-plane read budget overridden from the environment (CIRISEdge#971)"
+                );
+                config.key_plane_read_budget = budget;
+            }
+            _ => tracing::warn!(
+                raw = %raw,
+                env = BridgeConfig::KEY_PLANE_READ_BUDGET_ENV,
+                keeping = config.key_plane_read_budget,
+                "key-plane read budget is not a positive whole number: IGNORED, \
+                 keeping the configured value (tracked: CIRISEdge#971)"
+            ),
+        }
     }
     config
 }
@@ -963,7 +1052,15 @@ pub async fn bundle_bootstrap_peers_held(
             skipped.push((id.clone(), BundleSkip::IsSelf));
             continue;
         }
-        match directory.lookup_public_key(id).await {
+        // CIRISEdge#971 — booked under its own caller label, not `other`:
+        // the seat and every device make this read at start, and again in
+        // each re-check until every serve node is held or fixed-skipped.
+        let record = crate::read_caller::scoped(
+            crate::read_caller::Site::BundleSeats,
+            directory.lookup_public_key(id),
+        )
+        .await;
+        match record {
             Ok(Some(_)) => held.push(id.clone()),
             Ok(None) => skipped.push((id.clone(), BundleSkip::NotInDirectory)),
             Err(e) => {
@@ -1936,6 +2033,13 @@ impl ReplicationRuntime {
             Arc::clone(&convergence),
             key_grant_wake.clone(),
         );
+        // CIRISEdge#971 — the holdings index warms in the background (its walk
+        // of the served log and its boot drain), never inline in a peer's ask:
+        // a round before it is Ready takes the pre-v45 drain.
+        {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move { bridge.warm_holdings_index().await });
+        }
 
         // CIRISEdge#727 — the registry carries the owner-binding rung's
         // receiver gate (see [`registry_for`]).
@@ -3132,6 +3236,33 @@ mod tests {
         assert!(peers.is_empty());
         assert_eq!(still, fixed);
         assert_eq!(counting.total(), 0, "steady state: zero reads");
+    }
+
+    /// (4-iv) **The serve-node check is booked under its own caller label**
+    /// (`edge.bundle.seats`), at start and in the re-check, so it is not an
+    /// unscoped read (persist's `unattributed`). persist counts only the
+    /// attestation-row doors today, not `lookup_public_key`, so the label
+    /// reaches `snapshot().callers` only once persist counts that door
+    /// (CIRISPersist#1249); this witness reads the scope edge sets. Mutation:
+    /// drop the `scoped` wrap in `bundle_bootstrap_peers_held`, and the label
+    /// is `-`.
+    #[tokio::test]
+    async fn the_serve_node_check_names_its_caller_971() {
+        use crate::replication::counting_directory_930::CountingDirectory;
+        let held = directory_holding(&["seat-a"]).await;
+        let counting = CountingDirectory::new(held);
+        let ids = vec!["seat-a".to_owned(), "seat-b".to_owned()];
+        let (_peers, skipped) =
+            bundle_bootstrap_peers_held(&ids, &counting, Some("device"), false, false).await;
+        let _ = recheck_bundle_peers(&skipped, &counting, Some("device")).await;
+        assert_eq!(
+            counting.count("lookup_public_key"),
+            3,
+            "two at start, one re-check"
+        );
+        let want: std::collections::BTreeSet<String> =
+            [crate::read_caller::Site::BundleSeats.label().to_owned()].into();
+        assert_eq!(counting.callers_of("lookup_public_key"), want);
     }
 
     /// (4-iii) **The opt-out wins after a late arrival.** Mutation: let the

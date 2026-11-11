@@ -2,10 +2,133 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
-## Unreleased
+## 45.0.0 — 2026-11-10
+
+**MAJOR.** Pins: persist v61.2.2 (712575df; CIRISPersist#1246 SQLite mmap and cache_size), CIRISVerify
+v22.2.0 (rusqlite 0.41.1 / libsqlite3-sys 0.39.1, RUSTSEC-2026-0459 cleared), leviculum
+v0.34.0+ciris.2 (#102 A/V media on unordered datagrams, #104 probed MTU). MSRV 1.92; toolchain 1.97.0.
 
 ### Consumer notes
 
+- **BREAKING: the Python persist requirement is exact, `ciris-persist==61.2.2`.** Every raw-layout
+  capsule is named for the persist build that laid it out (`ciris_persist::<capsule>@61.2.2`,
+  CIRISPersist#1242), and edge asks for the name its own build compiled
+  (`capsule_names::checked_pointer`), so any other wheel is refused at `init_edge_runtime` with a
+  `TypeError` led by `capsule_version_skew`. A server pins the same version.
+- **BREAKING: hybrid-required is the only verifier policy (CIRISEdge#957, CIRISPersist#1233, CC
+  5.3.2.4.3.1).** `init_edge_runtime(hybrid_policy=...)` accepts `"strict"` only; anything else
+  raises `ValueError("verify_policy_violation: ...")`. `EdgeBuilder::build` and
+  `ReticulumTransport::new` refuse a non-`Strict` policy. New `VerifyError::PolicyViolation`, metric
+  class `verify_policy_violation`.
+- **BREAKING: `membership::WidenOutcome` gains `NeedsCosign`.** A widening one voice short of the
+  room's protocol (persist's `roster_consensus_insufficient`) is
+  `Ok(WidenOutcome::NeedsCosign { scope, group_key_id, member_key_id, role, proposal_id })`, no
+  longer an `Err`. An exhaustive match adds the arm. The have/need counts wait on persist
+  (CIRISPersist#1250).
+- **`Edge::arm_room_groups` (CIRISEdge#970).** An Edge built with no room groups (every
+  `init_edge_runtime` host) takes them once on the running Edge; a second arm, or an arm on an Edge
+  the builder gave groups, is refused with `EdgeError::Config`. Calls on agent-hosted nodes were
+  refused `Plumbing("join_call needs the room groups ...")` before.
+- **A late joiner is offered its groups' history (CIRISEdge#968).** Gauges
+  `group_backfill_rows_read_total`, `group_backfill_rows_kept_total`,
+  `group_backfill_completed_total`; one page a round per peer under the `page` lever.
+- **The outbound queue rides `outbound_queue_ops_capsule` (CIRISEdge#960),** and every handle copied
+  out of a capsule holds that capsule for as long as it is used.
+- **`set_av_datagrams_enabled(bool)` (leviculum#102):** node-wide, default on; gauge
+  `av_datagrams_enabled`.
+- **A host that writes to the store behind edge must follow the write with a kick
+  (`round_now`/`round_now_all`) or `note_local_write(s)`, or its rows reach peers up to 5 s later;
+  use `note_local_write(s)` where decision-row events matter (CIRISEdge#971).** Such a write is
+  listed on the key planes only once the serve-cursor feed's last probe is `FEED_PROBE_SPACING`
+  (5 s) old; before v45 it was on the next listing. For a withdrawal or a revocation that is up to
+  5 s more before a peer is offered it. 5 s is the worst case, a TTL revalidation included. A kick
+  or `note_local_write(s)` marks the feed dirty (`invalidate_send_set_memos`), so the next listing
+  carries the row as before.
+
+- **The receive diff no longer drains persist's content-hash index per Summary (CIRISEdge#971).**
+  The Attestation index (six session planes: Attestation, KeyGrant, Key, Revocation,
+  IdentityOccurrence, IdentityOccurrenceRevocation) and the TransportDestination index are kept as
+  in-memory sets equal to `signed_wire_index`: seeded by one boot drain, fed by a write-through on
+  every admitted apply and by persist's serve cursors (`list_attestations_since`, shared with the
+  CIRISEdge#930 key-plane memos, and `list_signed_transport_destinations_since`), and reconciled to
+  a full drain every 60 s. Before the boot drain completes, while a cursor probe fails, or after an
+  audit finds more drift than max(16, size/1000), a plane answers from the drain as before.
+  `ReplicationDirectory::holdings_want` and `StateProvider::local_want` are new defaulted trait
+  methods; an implementor that does not override them gets the old diff over `list_holdings`.
+  - **Lever:** `BridgeConfig::holdings_index` (default `true`), env `CIRIS_EDGE_HOLDINGS_INDEX=0`
+    (or `off`, `false`) to turn it off. Audit cadence `BridgeConfig::holdings_audit_every`, env
+    `CIRIS_EDGE_HOLDINGS_AUDIT_SECS`.
+  - **Gauges:** `holdings_index.<plane>.{answers_set, answers_drain, fallback_unbooted,
+    fallback_suspect, boots, audits, drain_failures, drain_ms, drift_missing, drift_extra,
+    suspect_audits, write_through, feed_inserts, duplicate_unheld, feed_probes, feed_coalesced,
+    feed_failures}` and `holdings_index_gauge.<plane>.{size, status, source, last_drain_ms}` plus
+    `holdings_index_gauge.enabled`, with `<plane>` one of `attestation`, `transport_destination`.
+  - **Key-plane ledger:** `key_plane_sweep.key_plane_probe_reads` now counts the shared cursor
+    probe, which a holdings ask also runs, and the memos no longer each keep a cursor.
+  - **An idle round reads nothing.** Sequential asks of a cursor are spaced: a clean feed probed
+    less than 5 s ago (`BridgeConfig::feed_probe_spacing`, `Duration::ZERO` restores a probe per
+    ask) is not probed again unless a door edge sees marked it dirty: an admitted apply, a host
+    kick, `note_local_write(s)` or a released signer. A host write that reaches none of those is
+    seen within the spacing (a `Duplicate`, or a key-plane offer one round late). Counted under
+    `key_plane_sweep.{key_plane_probes_spaced, key_plane_feed_dirty_marks}`. This changes the
+    CIRISEdge#930 guarantee: a store write that bypasses every edge door is in the next listing
+    only once the spacing has passed.
+  - **The index warms in the background.** `ReplicationRuntime::start` spawns the warm-up: it
+    places both serve cursors, walks each plane's served log from its head on its own cursor
+    (on the canonical about 86 Attestation pages and 37 route pages of 500 rows), then runs the
+    boot drain. Until a plane is Ready its asks take the pre-v45 drain; no round waits on the
+    walk. New: `holdings_index.<plane>.{warm_rows, warm_failures}`,
+    `holdings_index_gauge.<plane>.ready_after_ms`, `sweep_permits.holdings_warm`.
+- **Where the seat's sweep permits and send-set reads go (CIRISEdge#971).** New family
+  `sweep_permits.<site>` (`holdings_index`, `holdings_rows`, `plane_page`, `accord_evidence`,
+  `subject_pull`, `announced_testimony`, `key_plane_subject`, `feed_attestation`, `feed_route`,
+  `send_set`, `advertise_page`, `advertise_required`, `other`) splits
+  `sweep_permit_wait_seconds.count` by the call site that took the permit. `advertise` gains
+  `advertise_send_set_dropped_live` (a door dropped a consent memo still inside its 10 s TTL) and
+  `advertise_send_set_expired` (a round found it past the TTL). `key_plane_sweep` gains the memo
+  rebuild causes `key_plane_rebuilds_first`, `key_plane_rebuilds_ttl`, `key_plane_forgotten`,
+  plus `key_plane_inbox_overflows` and `key_plane_plane_dirt`.
+- **A route older than the one held is fetched once per terminal window, not every round
+  (CIRISEdge#971).** The stale arm of the route apply still reports `Duplicate`, and now also marks
+  the bytes in a memory of their own (4,096 marks, front-drop, terminal schedule 30 min doubling to
+  6 h), which `remember_outcome` does not clear. The round's `want` drops a marked hash; a newer
+  route is a new hash and is wanted as before. On the canonical, 10,710 of 24,949 routes served in
+  one process lifetime were these.
+  Counted on their own, not in `retry_suppressions`: `holdings_index.stale_route.{marked,
+  suppressed, evicted, cleared}` and the gauge `holdings_index_gauge.stale_route.size`. Every mark
+  is dropped when an audit finds a route hash gone from the index (`cleared`); no persist door
+  removes a route's index entry today, so this is a backstop.
+- **Behaviour change: a row refused by several gates is booked under the first one
+  (CIRISEdge#971).** The Attestation advertise now asks the audience gate's reach half (from
+  memory) before the gates that read the store: author quarantine, the accord relay, the serve
+  capability and the producer's recipient capability. The offered set is unchanged (a row the
+  reach refuses was refused at the audience gate anyway). What moves: a row both a reach and an
+  earlier gate refuse is booked `recipient_not_in_send_set` where it used to be booked
+  `quarantined_author`, `serve_capability_missing`, `serve_capability_not_rooted` or a relay
+  reason, and the quarantine WARN is no longer emitted for rows the reach refuses. All of these sit
+  in one Policy class for CIRISServer's operator surface. For a first-contact peer the advertise
+  now reads no consent grant and no quarantine marker for refused rows, and the peer's owner
+  (`owner_of`) is read once per round instead of once per consent-grant row.
+- **A first-contact peer's own rows are read only in the shapes its reach can carry
+  (CIRISEdge#971).** The required read used to take a page of every row the peer authored; for a
+  first-contact peer it now takes only its consent grants, group-plane rows and membership ceremony
+  rows, the only peer-authored shapes that reach admits. The offer is unchanged; the refused rows
+  are no longer read.
+- **Every edge store read names its caller (CIRISEdge#971, CIRISPersist#1235).** 26 call sites run
+  under a persist caller scope (`edge.advertise.{required, groups, history, unasked, gate}`,
+  `edge.gate.{quarantine, capability, owner_of_peer}`, `edge.fetch.gate`, `edge.pull.serveable`,
+  `edge.subject_pull`, `edge.key_plane`, `edge.feed`, `edge.identity_plane`, `edge.holdings`,
+  `edge.send_set`, `edge.owner_binding`, `edge.apply`, `edge.transport.attribution`,
+  `edge.first_contact`, `edge.membership`, `edge.chat`, `edge.av_call`, `edge.blob.durability`,
+  and for the bundle-seat reads #971 adds, `edge.bundle.seats` (the serve nodes' key-record check)
+  and `edge.transport.carriable` (the round-start transit-pair read)), so persist's
+  `observe::snapshot().callers` splits the read rate by site. The innermost scope wins. A label
+  counts only where persist books the door: today persist counts the attestation-row doors and
+  not `lookup_public_key`, so `edge.bundle.seats` does not appear in `snapshot().callers` yet
+  (asked on CIRISPersist#1249), and whether the transit-pair read behind
+  `edge.transport.carriable` passes a counted door is untraced. A read outside every scope books
+  as persist's `unattributed`. These are 26 of persist's 32 caller labels; a host that adds more
+  than 6 of its own sees the rest under `other`.
 - **Naming a shaping class is no longer the shaping opt-in (CIRISEdge#969, CC 5.4.3).**
   `init_edge_runtime(shaping_class="home" | "phone-wifi" | "phone-cellular")` used to shape every
   identity link while seeding the device with no opt-in, so the policy and the device disagreed.
@@ -17,8 +140,6 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
   `shaping_opt_in` / `shaping_opt_in_cellular` now default to `None` (keep the current choice);
   pass `True` or `False` to change one. A call that moved only the class or the network used to
   clear the person's opt-in. The UniFFI record states both opt-ins explicitly and is unchanged.
-
-### 45.0.0
 
 - **Behaviour change: the bundle's serve nodes are bootstrap peers by
   default** (CIRISEdge#971, #881; Eric's ruling). From v43.2.0 to v44.1.2

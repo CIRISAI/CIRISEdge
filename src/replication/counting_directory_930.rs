@@ -27,6 +27,24 @@ use ciris_persist::federation::*;
 pub(crate) struct CountingDirectory {
     inner: Arc<dyn FederationDirectory>,
     counts: Arc<Mutex<BTreeMap<&'static str, usize>>>,
+    /// CIRISEdge#971 — the persist caller label in force at each call, by
+    /// method (`-` for none), with how many calls each label made, so a
+    /// witness can see a read's booking and count one site's reads.
+    callers: Arc<Mutex<BTreeMap<&'static str, BTreeMap<String, usize>>>>,
+    /// CIRISEdge#971 — content hashes `list_wire_hashes_since` leaves out, as
+    /// if persist's index had dropped them (a purge). Only for a corpus inside
+    /// one page: a filtered page reads short and ends the drain.
+    hidden_wire_hashes: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// CIRISEdge#971 — while set, `list_attestations_since` and
+    /// `list_signed_transport_destinations_since` fail (a probe the store did
+    /// not serve).
+    fail_cursor_reads: Arc<std::sync::atomic::AtomicBool>,
+    /// CIRISEdge#971 — while closed, a serve-cursor read FROM THE HEAD of the
+    /// log (`since: None`, the warm-up's walk) waits here; reads from a
+    /// placed cursor pass. `head_waiting` is notified when one arrives.
+    head_gate: Arc<tokio::sync::Semaphore>,
+    head_gated: Arc<std::sync::atomic::AtomicBool>,
+    head_waiting: Arc<tokio::sync::Notify>,
 }
 
 impl CountingDirectory {
@@ -34,7 +52,60 @@ impl CountingDirectory {
         Self {
             inner,
             counts: Arc::new(Mutex::new(BTreeMap::new())),
+            callers: Arc::new(Mutex::new(BTreeMap::new())),
+            hidden_wire_hashes: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            fail_cursor_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            head_gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            head_gated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            head_waiting: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// CIRISEdge#971 — hold every later read from the head of a serve log
+    /// until [`Self::open_head_reads`].
+    pub(crate) fn close_head_reads(&self) {
+        self.head_gated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Release every held head read, and every later one.
+    pub(crate) fn open_head_reads(&self) {
+        self.head_gated
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.head_gate
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    }
+
+    /// Wait until a head read is held at the gate.
+    pub(crate) async fn a_head_read_is_held(&self) {
+        self.head_waiting.notified().await;
+    }
+
+    async fn pass_head_gate(&self, from_head: bool) {
+        if from_head && self.head_gated.load(std::sync::atomic::Ordering::SeqCst) {
+            self.head_waiting.notify_one();
+            let _ = self.head_gate.acquire().await.map(|p| p.forget());
+        }
+    }
+
+    /// CIRISEdge#971 — leave `content_hash` (lowercase hex) out of every
+    /// later `list_wire_hashes_since` page.
+    pub(crate) fn hide_wire_hash(&self, content_hash: &str) {
+        self.hidden_wire_hashes
+            .lock()
+            .expect("hidden")
+            .insert(content_hash.to_owned());
+    }
+
+    /// CIRISEdge#971 — make the serve-cursor reads fail (`true`) or serve.
+    pub(crate) fn fail_cursor_reads(&self, fail: bool) {
+        self.fail_cursor_reads
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn cursor_reads_fail(&self) -> bool {
+        self.fail_cursor_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn hit(&self, method: &'static str) {
@@ -44,6 +115,37 @@ impl CountingDirectory {
             .expect("counts")
             .entry(method)
             .or_insert(0) += 1;
+        let caller = ciris_persist::observe::current_caller()
+            .map_or_else(|| "-".to_owned(), ciris_persist::observe::Caller::label);
+        *self
+            .callers
+            .lock()
+            .expect("callers")
+            .entry(method)
+            .or_default()
+            .entry(caller)
+            .or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#971 — the caller labels `method` was called under so far.
+    pub(crate) fn callers_of(&self, method: &str) -> std::collections::BTreeSet<String> {
+        self.callers
+            .lock()
+            .expect("callers")
+            .get(method)
+            .map(|by| by.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// CIRISEdge#971 — calls to `method` made under the caller label `label`.
+    pub(crate) fn count_under(&self, method: &str, label: &str) -> usize {
+        self.callers
+            .lock()
+            .expect("callers")
+            .get(method)
+            .and_then(|by| by.get(label))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Every count so far.
@@ -69,6 +171,7 @@ impl CountingDirectory {
     /// Forget the counts.
     pub(crate) fn reset(&self) {
         self.counts.lock().expect("counts").clear();
+        self.callers.lock().expect("callers").clear();
     }
 }
 
@@ -392,6 +495,34 @@ impl FederationDirectory for CountingDirectory {
     ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
         self.hit("lookup_shared_instance_lease");
         self.inner.lookup_shared_instance_lease(instance_name).await
+    }
+    // The route plane's writes are forwarded: without them the trait's
+    // default refuses every route apply through a counted bridge, and a
+    // witness of the route arm reads a backend refusal as its outcome.
+    async fn put_signed_transport_destination(
+        &self,
+        signed: &self_at_login::SignedTransportDestination,
+    ) -> Result<self_at_login::TransportDestinationApplyOutcome, Error> {
+        self.hit("put_signed_transport_destination");
+        self.inner.put_signed_transport_destination(signed).await
+    }
+    async fn put_transport_destination(
+        &self,
+        destination: &self_at_login::TransportDestination,
+    ) -> Result<(), Error> {
+        self.hit("put_transport_destination");
+        self.inner.put_transport_destination(destination).await
+    }
+    async fn remove_transport_destination(
+        &self,
+        occurrence_key_id: &str,
+        transport_kind: &str,
+        destination: &str,
+    ) -> Result<bool, Error> {
+        self.hit("remove_transport_destination");
+        self.inner
+            .remove_transport_destination(occurrence_key_id, transport_kind, destination)
+            .await
     }
     async fn list_signed_transport_destinations_for(
         &self,
@@ -766,6 +897,10 @@ impl FederationDirectory for CountingDirectory {
         limit: u32,
     ) -> Result<Vec<ServedAttestation>, Error> {
         self.hit("list_attestations_since");
+        if self.cursor_reads_fail() {
+            return Err(Error::Backend("injected: cursor read failed".into()));
+        }
+        self.pass_head_gate(since.is_none()).await;
         self.inner.list_attestations_since(since, limit).await
     }
     // persist v61.0.5 (#1225): defaulted `Unsupported`, overridden by every
@@ -1070,6 +1205,10 @@ impl FederationDirectory for CountingDirectory {
         limit: u32,
     ) -> Result<Vec<ServedTransportDestination>, Error> {
         self.hit("list_signed_transport_destinations_since");
+        if self.cursor_reads_fail() {
+            return Err(Error::Backend("injected: cursor read failed".into()));
+        }
+        self.pass_head_gate(since.is_none()).await;
         self.inner
             .list_signed_transport_destinations_since(since, limit)
             .await
@@ -1092,9 +1231,12 @@ impl FederationDirectory for CountingDirectory {
         limit: u32,
     ) -> Result<Vec<String>, Error> {
         self.hit("list_wire_hashes_since");
-        self.inner
+        let page = self
+            .inner
             .list_wire_hashes_since(kind, after_content_hash, limit)
-            .await
+            .await?;
+        let hidden = self.hidden_wire_hashes.lock().expect("hidden").clone();
+        Ok(page.into_iter().filter(|h| !hidden.contains(h)).collect())
     }
     async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error> {
         self.hit("lookup_community");

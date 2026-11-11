@@ -3200,6 +3200,23 @@ fn metrics_bundle_to_pydict<'py>(
         key_plane_sweep.set_item(label.as_str(), *n)?;
     }
     root.set_item("key_plane_sweep", key_plane_sweep)?;
+    // CIRISEdge#971 — sweep-gate acquires by call site.
+    let sweep_permits = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.sweep_permits {
+        sweep_permits.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("sweep_permits", sweep_permits)?;
+    // CIRISEdge#971 — the holdings index's counters and gauges.
+    let holdings_index = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.holdings_index {
+        holdings_index.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("holdings_index", holdings_index)?;
+    let holdings_index_gauge = pyo3::types::PyDict::new(py);
+    for (label, v) in &bundle.holdings_index_gauge {
+        holdings_index_gauge.set_item(label.as_str(), *v)?;
+    }
+    root.set_item("holdings_index_gauge", holdings_index_gauge)?;
     // v44 LTS — the persisted-standing refresh.
     let persisted_standing = pyo3::types::PyDict::new(py);
     for (label, n) in &bundle.persisted_standing {

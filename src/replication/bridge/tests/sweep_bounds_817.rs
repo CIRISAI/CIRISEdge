@@ -38,6 +38,7 @@ fn bridge_with_permits(
     )
     .with_local_key_id(Some("node-a".to_owned()));
     bridge
+        .probes
         .read_probe
         .delay_ms
         .store(PROBE_DELAY_MS, Ordering::SeqCst);
@@ -202,13 +203,17 @@ async fn send_set_reads_are_bounded_by_the_sweep_permits_817() {
         1,
         "the eight recipients shared one send-set read"
     );
-    let max = bridge.read_probe.max_in_flight.load(Ordering::SeqCst);
+    let max = bridge
+        .probes
+        .read_probe
+        .max_in_flight
+        .load(Ordering::SeqCst);
     assert!(
         max <= 2,
         "with 2 permits and 8 concurrent peers at most 2 membership-plane / send-set \
          reads are in flight at once; saw {max}"
     );
-    assert_eq!(bridge.read_probe.in_flight.load(Ordering::SeqCst), 0);
+    assert_eq!(bridge.probes.read_probe.in_flight.load(Ordering::SeqCst), 0);
 }
 
 /// **Item 2 — no deadlock at one permit.** The send-set read now takes a
@@ -219,7 +224,7 @@ async fn send_set_reads_are_bounded_by_the_sweep_permits_817() {
 async fn the_send_set_permit_does_not_re_enter_the_gate_817() {
     let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let bridge = bridge_with_permits(&backend, &[], 1);
-    bridge.read_probe.delay_ms.store(0, Ordering::SeqCst);
+    bridge.probes.read_probe.delay_ms.store(0, Ordering::SeqCst);
     let peers: Vec<String> = (0..4).map(|i| format!("node-peer-{i}")).collect();
     tokio::time::timeout(
         StdDuration::from_secs(30),

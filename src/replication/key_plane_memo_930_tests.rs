@@ -41,6 +41,13 @@ const PLANES: [EnvelopeKind; 4] = [
     EnvelopeKind::IdentityOccurrenceRevocation,
 ];
 
+/// v45 (CIRISEdge#971) — the feed's probe spacing every bridge here runs
+/// with: longer than any test, so "inside the spacing" is deterministic and
+/// no assertion rests on a clock. A write that bypasses the choke reaches a
+/// listing at once only through a door that marks the feed dirty, which is
+/// how a host reports it (its kick reaches `invalidate_send_set_memos`).
+const NO_TEST_OUTLIVES: std::time::Duration = std::time::Duration::from_hours(1);
+
 /// A bridge over `dir` whose self set and cohort are both `subjects` (so
 /// `Global` = self ∪ cohort carries every subject TWICE, as production's
 /// concatenation can).
@@ -55,7 +62,10 @@ fn bridge_over(
         FederationDirectoryReplicationBridge::with_config(
             dir,
             Arc::new(move || cohort.clone()),
-            BridgeConfig::default(),
+            BridgeConfig {
+                feed_probe_spacing: NO_TEST_OUTLIVES,
+                ..BridgeConfig::default()
+            },
         )
         .with_self_provider(Some(Arc::new(move || own.clone())))
         .with_metrics(metrics),
@@ -66,7 +76,7 @@ fn bridge_over(
 /// the plane's set (duplicates included, as the old loop walked them), each
 /// read with its per-subject read, then hashed and deduped as
 /// `key_plane_refs` does. A failed read contributes nothing.
-async fn oracle(
+pub(super) async fn oracle(
     kind: EnvelopeKind,
     dir: &dyn FederationDirectory,
     subjects: &[String],
@@ -106,7 +116,7 @@ async fn oracle(
         .collect()
 }
 
-fn as_set(refs: &[EnvelopeRef]) -> BTreeSet<(Vec<u8>, u64)> {
+pub(super) fn as_set(refs: &[EnvelopeRef]) -> BTreeSet<(Vec<u8>, u64)> {
     let set: BTreeSet<_> = refs
         .iter()
         .map(|r| (r.envelope_hash.to_vec(), r.seq))
@@ -259,8 +269,11 @@ async fn a_replicated_revocation_is_in_the_next_listing_930() {
 
 /// **Invalidation by LOCAL writes** (the doors that bypass the choke): a
 /// revocation authored through `put_revocation`, a `withdraws` and a carrier
-/// written straight into the directory. After each, the next listing of its
-/// plane equals the oracle and carries the new row.
+/// written straight into the directory. After each, and the host's report of
+/// it (the door its kick reaches, v45 CIRISEdge#971), the next listing of its
+/// plane equals the oracle and carries the new row. The first write is also
+/// listed BEFORE its report: inside the probe spacing the listing is the
+/// memo's (the stated staleness bound, a key-plane offer one round late).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_local_write_is_in_the_next_listing_930() {
     let a = NodeA::build("loc930", 0x31).await;
@@ -295,6 +308,13 @@ async fn a_local_write_is_in_the_next_listing_930() {
         .put_revocation(SignedRevocation { revocation })
         .await
         .expect("local revocation");
+    let unreported = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(
+        unreported.len(),
+        1,
+        "inside the spacing an unreported write is not probed for (CIRISEdge#971)"
+    );
+    bridge.invalidate_send_set_memos("host_kick");
     let rev = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
     assert_eq!(rev.len(), 2, "E's new revocation is offered");
     assert_eq!(
@@ -304,6 +324,7 @@ async fn a_local_write_is_in_the_next_listing_930() {
 
     // 2. P's `withdraws` of its occurrence of N, written into the directory.
     a.withdraw_occurrence().await;
+    bridge.invalidate_send_set_memos("host_kick");
     let occ = bridge
         .list_envelope_refs(EnvelopeKind::IdentityOccurrenceRevocation)
         .await;
@@ -315,6 +336,7 @@ async fn a_local_write_is_in_the_next_listing_930() {
 
     // 3. A carrier revoking N's occurrence K, written into the directory.
     a.carrier_revoking_node_occurrence(a.k.key_id()).await;
+    bridge.invalidate_send_set_memos("host_kick");
     let occ = bridge
         .list_envelope_refs(EnvelopeKind::IdentityOccurrenceRevocation)
         .await;
@@ -341,10 +363,11 @@ fn subject_reads(dir: &CountingDirectory) -> usize {
 
 /// **Cost.** Under a counting directory: the first round fills each Global
 /// plane (reads scale with |Global|); eight more peers' rounds between two
-/// writes add ONLY the change probe — one `list_attestations_since` per
-/// listing, no subject read — whatever |Global| is; a `withdraws` then
-/// costs the re-read of the one subject it names, not a sweep; and eight
-/// peers arriving together on a fresh bridge share one fill.
+/// writes read NOTHING (v45, CIRISEdge#971: no subject read, and inside the
+/// probe spacing no change probe either; before v45, one probe per listing),
+/// whatever |Global| is; a reported `withdraws` then costs one probe and the
+/// re-read of the one subject it names, not a sweep; and eight peers
+/// arriving together on a fresh bridge share one fill.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // two widths, a write, and the concurrent fill
 async fn n_peer_rounds_between_writes_cost_one_sweep_930() {
@@ -388,8 +411,9 @@ async fn n_peer_rounds_between_writes_cost_one_sweep_930() {
         );
         assert_eq!(
             counting.count("list_attestations_since"),
-            16,
-            "|Global| {width}: one change probe per listing"
+            0,
+            "|Global| {width}: an idle round probes nothing inside the spacing \
+             (CIRISEdge#971; it was one probe per listing)"
         );
         steady.push(counting.total());
         let ledger = metrics.key_plane_sweep();
@@ -410,6 +434,7 @@ async fn n_peer_rounds_between_writes_cost_one_sweep_930() {
         // it changes.
         if width == subjects.len() {
             a.withdraw_occurrence().await;
+            bridge.invalidate_send_set_memos("host_kick");
             counting.reset();
             let reads_before = metrics
                 .key_plane_sweep()
@@ -464,4 +489,219 @@ async fn n_peer_rounds_between_writes_cost_one_sweep_930() {
         Some(u64::try_from(subjects.len()).expect("small")),
         "{ledger:?}"
     );
+}
+
+/// **v45 (CIRISEdge#971) — the unreported write, at explicit instants.** A
+/// write no edge door reports (the host writing to persist directly, the
+/// CIRISEdge#858 shape) is the production case the probe spacing bounds:
+///
+/// 1. inside the spacing a listing does NOT carry it (the last drain vouches);
+/// 2. once the last drain began a full spacing ago, the next listing does;
+/// 3. a second unreported write, inside the new spacing, is not carried until
+///    a door marks the feed dirty, and then at once.
+///
+/// **The bound this states: [`super::store_feed::FEED_PROBE_SPACING`] (5 s),
+/// worst case.** Before v45 such a write was on the next listing; now it is on
+/// the first listing that begins once the last drain is a full spacing old,
+/// and that drain began no later than the write was committed (a drain that
+/// began after the commit reads it), so the delay is at most the spacing. A
+/// TTL revalidation does not widen it: `refresh_key_plane_memo` applies the
+/// feed's rows as dirt BEFORE the epoch turns, a stale answer is dropped by
+/// dirt exactly as a fresh one is, and a subject re-read reads the store as it
+/// is. For a withdrawal or a revocation that is up to 5 s more before a peer
+/// is offered it. A host closes the window by reporting the write
+/// (`note_local_write(s)`, or a kick: [`a_kick_marks_the_feed_before_its_rounds_ask_971`]
+/// witnesses `round_now_all` alone), step 3's mark.
+///
+/// The instants are set by ageing the feed's last drain, never by sleeping.
+/// Mutants: the spacing ignored (step 1 lists the row), the dirt mark ignored
+/// (step 3's last listing does not).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreported_write_waits_out_the_spacing_and_a_mark_ends_the_wait_971() {
+    let a = NodeA::build("unrep971", 0x35).await;
+    let e = Ident::mint("held-unrep971", "node", 0x3c).await;
+    let f = Ident::mint("held2-unrep971", "node", 0x3d).await;
+    hold(&a.dir, &e).await;
+    hold(&a.dir, &f).await;
+    let subjects: Vec<String> = [&a.p, &a.n, &a.k, &e, &f]
+        .into_iter()
+        .map(|id| id.key_id().to_owned())
+        .collect();
+    let dir: Arc<dyn FederationDirectory> = Arc::clone(&a.dir) as _;
+    let bridge = bridge_over(Arc::clone(&dir), &subjects, None);
+    let before = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(before.len(), 1, "K's revocation only");
+
+    // A revocation of E, written with no door told.
+    let revocation = self_revocation(&a.dir, &e).await;
+    a.dir
+        .put_revocation(SignedRevocation { revocation })
+        .await
+        .expect("local revocation");
+
+    // 1. Inside the spacing.
+    let inside = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(
+        inside.len(),
+        1,
+        "inside the spacing an unreported write is not listed"
+    );
+
+    // 2. The last drain began a full spacing ago.
+    bridge.age_feed(NO_TEST_OUTLIVES).await;
+    let after = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(
+        after.len(),
+        2,
+        "past the spacing the unreported write is listed"
+    );
+    assert_eq!(
+        as_set(&after),
+        oracle(EnvelopeKind::Revocation, &*dir, &subjects).await
+    );
+
+    // 3. A second unreported write, inside the spacing the probe above began.
+    let revocation = self_revocation(&a.dir, &f).await;
+    a.dir
+        .put_revocation(SignedRevocation { revocation })
+        .await
+        .expect("local revocation");
+    let inside = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(
+        inside.len(),
+        2,
+        "inside the new spacing it is not listed yet"
+    );
+    bridge.mark_feed_dirty();
+    let marked = bridge.list_envelope_refs(EnvelopeKind::Revocation).await;
+    assert_eq!(marked.len(), 3, "a dirt mark lists it at once");
+    assert_eq!(
+        as_set(&marked),
+        oracle(EnvelopeKind::Revocation, &*dir, &subjects).await
+    );
+}
+
+/// A transport that answers nothing and hands every Revocation Summary it is
+/// asked to send to the witness.
+struct SummaryTap {
+    summaries: tokio::sync::mpsc::UnboundedSender<Vec<EnvelopeRef>>,
+}
+
+#[async_trait::async_trait]
+impl crate::transport::Transport for SummaryTap {
+    fn id(&self) -> crate::transport::TransportId {
+        crate::transport::TransportId::HTTP
+    }
+    async fn send(
+        &self,
+        _destination_key_id: &str,
+        bytes: &[u8],
+    ) -> Result<crate::transport::TransportSendOutcome, crate::transport::TransportError> {
+        use super::protocol::ReplicationMessage;
+        let msg = match super::wire_frame::try_unwrap_framed(bytes) {
+            Ok(Some(framed)) => Some(framed.msg),
+            _ => ReplicationMessage::from_bytes(bytes).ok(),
+        };
+        if let Some(ReplicationMessage::Summary(s)) = msg {
+            if s.kind == EnvelopeKind::Revocation {
+                let _ = self.summaries.send(s.refs);
+            }
+        }
+        Ok(crate::transport::TransportSendOutcome::Delivered)
+    }
+    async fn listen(
+        &self,
+        _sink: tokio::sync::mpsc::Sender<crate::transport::InboundFrame>,
+    ) -> Result<(), crate::transport::TransportError> {
+        Ok(())
+    }
+}
+
+/// **v45 (CIRISEdge#971) — a kick marks the feed dirty BEFORE the rounds it
+/// fires ask.** The server reports every write with a kick of all peers
+/// (`compose::kick_replication`, seventeen modules) and never with
+/// `note_local_write`, so the kick is the production door. A running runtime,
+/// one initiator peer on the Revocation plane, the probe spacing an hour: the
+/// first round lists the store; the host writes a revocation and kicks; the
+/// FIRST round the kick fires offers it, with no wait on the spacing (an hour)
+/// or the memo TTL (ten minutes). With `mark_feed_dirty` removed from
+/// `invalidate_send_set_memos`, or called after the scheduler's kick, the
+/// kicked round's Summary lacks the row and this fails.
+///
+/// No sleep: each step waits on the next Summary the runtime sends. The peer
+/// answers no plane, so the first-contact ladder never applies (it needs a
+/// plane answered elsewhere) and no round runs between the two but the
+/// kicked one (cadence an hour).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kick_marks_the_feed_before_its_rounds_ask_971() {
+    use crate::replication::runtime::{ReplicationRuntime, ReplicationRuntimeConfig};
+    use crate::replication::scheduler::SchedulerConfig;
+    use std::time::Duration;
+    const PEER: &str = "kick971-peer";
+    /// The bound on one Summary's arrival; an event wait, not a sleep.
+    const ARRIVES_WITHIN: Duration = Duration::from_secs(30);
+
+    let a = NodeA::build("kick971", 0x37).await;
+    let e = Ident::mint("held-kick971", "node", 0x3e).await;
+    hold(&a.dir, &e).await;
+    let subjects: Vec<String> = [&a.p, &a.n, &a.k, &e]
+        .into_iter()
+        .map(|id| id.key_id().to_owned())
+        .collect();
+    let dir: Arc<dyn FederationDirectory> = Arc::clone(&a.dir) as _;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let own = subjects.clone();
+    let config = ReplicationRuntimeConfig {
+        disable_bundle_bootstrap_peers: true,
+        scheduler: SchedulerConfig {
+            cadence: Duration::from_hours(1),
+            round_timeout: Duration::from_millis(200),
+            ..SchedulerConfig::default()
+        },
+        bridge: BridgeConfig {
+            feed_probe_spacing: NO_TEST_OUTLIVES,
+            ..BridgeConfig::default()
+        },
+        ..ReplicationRuntimeConfig::default()
+    };
+    let mut rt = ReplicationRuntime::start(
+        Arc::clone(&dir),
+        Arc::new(SummaryTap { summaries: tx }),
+        vec![crate::replication::ReplicationPeer {
+            peer_key_id: PEER.to_string(),
+            kind: EnvelopeKind::Revocation,
+        }],
+        config,
+        Some(Arc::new(move || own.clone())),
+    )
+    .await;
+
+    // The first cadence tick fires at spawn: its listing fills the memo and
+    // drains the feed.
+    let first = tokio::time::timeout(ARRIVES_WITHIN, rx.recv())
+        .await
+        .expect("the first round's Summary")
+        .expect("open");
+    assert_eq!(first.len(), 1, "K's revocation only");
+
+    // The host writes, then kicks every peer (its only report).
+    let revocation = self_revocation(&a.dir, &e).await;
+    a.dir
+        .put_revocation(SignedRevocation { revocation })
+        .await
+        .expect("local revocation");
+    rt.round_now_all().await.expect("kick all");
+
+    let kicked = tokio::time::timeout(ARRIVES_WITHIN, rx.recv())
+        .await
+        .expect("the kicked round's Summary")
+        .expect("open");
+    assert_eq!(
+        kicked.len(),
+        2,
+        "the first kicked round offers the row the kick reported"
+    );
+    let want = oracle(EnvelopeKind::Revocation, &*dir, &subjects).await;
+    assert_eq!(as_set(&kicked), want);
+    rt.shutdown().await;
 }
