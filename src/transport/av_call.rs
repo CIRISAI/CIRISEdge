@@ -3846,24 +3846,42 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         // the leg joining the roster: the stream's current binding (and, for a
         // relay, every binding it holds but the member's own), then the leg.
         let mut publisher = shared.publisher.lock().await;
-        // v1 only: the member's CAPS (whether it takes v2) have not come
-        // yet. Its v2 bindings follow its CAPS (`send_v2_bindings_to`).
-        let mut wires: Vec<Arc<Vec<u8>>> = Some(Arc::clone(&Shared::lock(&shared.own_key).wire))
-            .filter(|_| !shared.primary_ended.load(Ordering::Acquire))
+        // Whether the member's CAPS already came, on the link it dialled
+        // first, and say it takes v2. Then its v2 bindings go here, ahead of
+        // the v1 ones (CC rc18: v2 first), so the framing is known when the
+        // first chunk lands. Read under the publisher lock: CAPS that land
+        // after this read send the v2 bindings themselves
+        // (`send_v2_bindings_to`, which waits for this lock and then finds
+        // the leg).
+        let v2_ok = Shared::lock(&shared.alm).sends_binding_v2_to(member);
+        let camera_live = !shared.primary_ended.load(Ordering::Acquire);
+        let (own_v1, own_v2) = {
+            let k = Shared::lock(&shared.own_key);
+            (Arc::clone(&k.wire), k.wire_v2.clone())
+        };
+        let mut v1: Vec<Arc<Vec<u8>>> = Some(own_v1).filter(|_| camera_live).into_iter().collect();
+        let mut v2: Vec<Arc<Vec<u8>>> = own_v2
+            .filter(|_| camera_live && v2_ok)
             .into_iter()
             .collect();
         // v45 — and every share's.
-        wires.extend(
-            shared
-                .shares
-                .lock()
-                .await
-                .values()
-                .map(|s| Arc::clone(&s.key.wire)),
-        );
-        if shared.opts.relay {
-            wires.extend(shared.auth.bindings_except(member, false));
+        for share in shared.shares.lock().await.values() {
+            v1.push(Arc::clone(&share.key.wire));
+            v2.extend(share.key.wire_v2.clone().filter(|_| v2_ok));
         }
+        if shared.opts.relay {
+            for w in shared.auth.bindings_except(member, v2_ok) {
+                if StreamKeyBinding::version_of(&w)
+                    == Some(crate::transport::av_chunk_auth::BINDING_VERSION_V2)
+                {
+                    v2.push(w);
+                } else {
+                    v1.push(w);
+                }
+            }
+        }
+        let mut wires = v2;
+        wires.append(&mut v1);
         for wire in &wires {
             let parts = StreamKeyBinding::parts(wire, Some(channel_limit));
             if parts.is_empty() {
