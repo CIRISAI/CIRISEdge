@@ -42,11 +42,24 @@ const ATTESTATIONS: usize = 1_100;
 /// An event bound: the seat answers long before this, or the test fails.
 const ANSWERED_WITHIN: Duration = Duration::from_secs(30);
 
-/// Signals every frame the seat sends.
+/// Signals every frame the seat sends, and records the rounds whose Diff it
+/// has sent.
+///
+/// A responder answers a Summary with TWO frames, its own Summary and then
+/// its Diff (`Session::on_summary`), and the Diff is the one built from the
+/// holdings ask. Waiting for "a frame" let round N+1 wake on round N's Diff
+/// and read its counters while its own drain was one page in (seen on CI:
+/// `pages=1` of 2). The event a round waits on is its own Diff.
 #[derive(Default)]
 struct Sent {
-    frames: std::sync::atomic::AtomicUsize,
+    diffs: std::sync::Mutex<std::collections::BTreeSet<u64>>,
     sent: tokio::sync::Notify,
+}
+
+impl Sent {
+    fn diff_sent(&self, round: u64) -> bool {
+        self.diffs.lock().expect("diffs").contains(&round)
+    }
 }
 
 #[async_trait::async_trait]
@@ -57,10 +70,15 @@ impl Transport for Arc<Sent> {
     async fn send(
         &self,
         _destination_key_id: &str,
-        _envelope_bytes: &[u8],
+        envelope_bytes: &[u8],
     ) -> Result<TransportSendOutcome, TransportError> {
-        self.frames
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(Some(wire_frame::Framed {
+            msg: ReplicationMessage::Diff(_),
+            meta: Some(meta),
+        })) = wire_frame::try_unwrap_framed(envelope_bytes)
+        {
+            self.diffs.lock().expect("diffs").insert(meta.round);
+        }
         self.sent.notify_one();
         Ok(TransportSendOutcome::Delivered)
     }
@@ -160,7 +178,6 @@ async fn round(s: &Seat, round_id: u64) -> Cost {
     let kind = BUNDLE_ROUND_PLANES[0];
     s.counting.reset();
     let p0 = permits(&s.metrics);
-    let f0 = s.wire.frames.load(std::sync::atomic::Ordering::SeqCst);
     let summary = ReplicationMessage::Summary(SummaryMessage {
         status: None,
         kind,
@@ -174,12 +191,12 @@ async fn round(s: &Seat, round_id: u64) -> Cost {
         .await
         .expect("route the device's Summary");
     tokio::time::timeout(ANSWERED_WITHIN, async {
-        while s.wire.frames.load(std::sync::atomic::Ordering::SeqCst) == f0 {
+        while !s.wire.diff_sent(round_id) {
             s.wire.sent.notified().await;
         }
     })
     .await
-    .expect("the seat answers the device's Revocation Summary");
+    .expect("the seat sends this round's Diff");
     let by_method = s.counting.counts();
     Cost {
         calls: s.counting.total(),

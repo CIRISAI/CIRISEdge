@@ -695,6 +695,9 @@ fn counted_loss(nodes: &[Node], calls: &[&Call]) -> u64 {
                 "av_frame_expired_sender",
                 "av_frame_expired_late",
                 "av_frame_stale_dropped",
+                // A chunk of an epoch this node can no longer (or not yet)
+                // derive: dropped and counted, never handed out.
+                "av_call_frame_no_key",
                 "alm_shed",
             ]
             .iter()
@@ -1029,6 +1032,19 @@ async fn removed_member_call(tag: &str, leaves: Leaves) -> bool {
         assert!(
             counted_loss(&nodes, &[&call_b, &call_c]) > 0,
             "C lost the pre-roll stream with nothing counting it"
+        );
+        return false;
+    }
+    // B hears the pre-roll stream BEFORE the room rolls. A stream's DEK is
+    // derivable only at the room's current epoch (`KeyRing::dek`), and the
+    // previous epoch's is kept only once a chunk has been opened under it. A
+    // loaded B that applied the commit with A's five chunks still queued in
+    // its pump could no longer derive their key and dropped all five
+    // (`av_call_frame_no_key`), which CI saw as "15 wanted, 10 heard".
+    if !collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 5).await {
+        assert!(
+            counted_loss(&nodes, &[&call_b, &call_c]) > 0,
+            "B lost the pre-roll stream with nothing counting it"
         );
         return false;
     }

@@ -37,6 +37,26 @@ const ATTESTATIONS: usize = 1_100;
 struct Bytes {
     sent: std::sync::atomic::AtomicUsize,
     frames: std::sync::atomic::AtomicUsize,
+    /// Rounds whose Diff the responder has sent. A Summary is answered with
+    /// two frames (Summary, then the Diff built from the holdings ask), so a
+    /// Summary round is over at its Diff, not at "a frame"
+    /// (`revocation_round_reads_971` has the CI failure this caused).
+    diffs: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+}
+
+impl Bytes {
+    /// Whether the responder's Diff for `round` went out by `deadline`.
+    async fn diff_sent_by(&self, round: u64, deadline: tokio::time::Instant) -> bool {
+        loop {
+            if self.diffs.lock().expect("diffs").contains(&round) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -53,6 +73,13 @@ impl Transport for Arc<Bytes> {
             .fetch_add(envelope_bytes.len(), std::sync::atomic::Ordering::Relaxed);
         self.frames
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(Some(wire_frame::Framed {
+            msg: ReplicationMessage::Diff(_),
+            meta: Some(meta),
+        })) = wire_frame::try_unwrap_framed(envelope_bytes)
+        {
+            self.diffs.lock().expect("diffs").insert(meta.round);
+        }
         Ok(TransportSendOutcome::Delivered)
     }
     async fn listen(
@@ -200,17 +227,17 @@ async fn idle_rounds_at(n: usize) -> Vec<(EnvelopeKind, usize, u64, Duration)> {
         // what it memoizes; the second is the steady-state idle round.
         for pass in 0..2 {
             counting.reset();
-            let (p0, b0, f0) = (
+            let (p0, b0) = (
                 permits(&metrics),
                 wire.sent.load(std::sync::atomic::Ordering::Relaxed),
-                wire.frames.load(std::sync::atomic::Ordering::Relaxed),
             );
+            let round_id = round * 10 + pass;
             let summary = ReplicationMessage::Summary(SummaryMessage {
                 status: None,
                 kind,
                 refs: Vec::new(),
             });
-            let bytes = wire_frame::wrap_v3(&summary, RoundSide::Initiator, round * 10 + pass);
+            let bytes = wire_frame::wrap_v3(&summary, RoundSide::Initiator, round_id);
             let t0 = std::time::Instant::now();
             registry
                 .route_inbound_bytes(DEVICE, &bytes)
@@ -218,11 +245,10 @@ async fn idle_rounds_at(n: usize) -> Vec<(EnvelopeKind, usize, u64, Duration)> {
                 .expect("route the device's Summary");
             // The responder answers on its own task: wait for its reply.
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            while wire.frames.load(std::sync::atomic::Ordering::Relaxed) == f0
-                && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+            assert!(
+                wire.diff_sent_by(round_id, deadline).await,
+                "the responder sent this round's Diff"
+            );
             // Summary in → the responder's reply on the wire (1 ms poll).
             let wall = t0.elapsed();
             tokio::time::sleep(Duration::from_millis(200)).await;
