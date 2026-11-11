@@ -555,6 +555,12 @@ impl PyEdge {
         self.inner.set_av_datagrams_enabled(enabled);
     }
 
+    /// v45 — the A/V layer-request lever (`Call.request_layers`). Default
+    /// off until CC corrects 5.3.3.2.4. Calls joined from now on follow it.
+    fn set_av_layer_requests_enabled(&self, enabled: bool) {
+        self.inner.set_av_layer_requests_enabled(enabled);
+    }
+
     /// `CLM-shaping-offered-never-refused` — seconds past its last real frame
     /// that a shaped link a peer asked of this node lives. Raises `ValueError`
     /// on a value that is no duration.
@@ -712,13 +718,22 @@ impl PyEdge {
     /// `RuntimeError` on plumbing (no Reticulum transport, no room groups...).
     /// Every message starts with the refusal's token.
     #[cfg(feature = "_reticulum-module")]
-    #[pyo3(signature = (room, keep="unkept", relay=false))]
-    fn join_call(&self, py: Python<'_>, room: &str, keep: &str, relay: bool) -> PyResult<PyCall> {
+    #[pyo3(signature = (room, keep="unkept", relay=false, codecs=None))]
+    fn join_call(
+        &self,
+        py: Python<'_>,
+        room: &str,
+        keep: &str,
+        relay: bool,
+        codecs: Option<Vec<String>>,
+    ) -> PyResult<PyCall> {
         let room = call_room_arg(room)?;
         let keep = call_keep_arg(keep)?;
+        let codecs = codecs.map(|c| call_codecs_arg(&c)).transpose()?;
         let opts = crate::transport::av_call::CallOptions {
             keep,
             relay,
+            codecs,
             ..crate::transport::av_call::CallOptions::default()
         };
         let edge = Arc::clone(&self.inner);
@@ -4380,6 +4395,9 @@ fn call_err_token(e: &crate::transport::av_call::CallError) -> &'static str {
         E::ActorIsNotTheSubject { .. } => "actor_is_not_the_subject",
         E::Plumbing(_) => "plumbing",
         E::AnonymousMode => crate::onion::tokens::ANONYMOUS_NO_MEDIA,
+        E::UnknownStream(_) => "unknown_stream",
+        E::TooManyStreams(_) => "too_many_streams",
+        E::ChunkSeqExhausted { .. } => "chunk_seq_exhausted",
     }
 }
 
@@ -4394,9 +4412,32 @@ fn call_err_to_py(e: &crate::transport::av_call::CallError) -> PyErr {
         | E::ConsentMissing { .. }
         | E::FrameTooLarge { .. }
         | E::ActorIsNotTheSubject { .. }
-        | E::AnonymousMode => PyValueError::new_err(msg),
+        | E::AnonymousMode
+        | E::UnknownStream(_)
+        | E::TooManyStreams(_) => PyValueError::new_err(msg),
         _ => PyRuntimeError::new_err(msg),
     }
+}
+
+/// `join_call(codecs=[...])`: the stream's codec tokens, e.g. `["h264",
+/// "opus"]`. Each token implies its layer class (CC 5.3.3.2.1), so a list
+/// names the map without a key that could disagree with it; two tokens of
+/// one class, or an unregistered token, raise `ValueError`.
+#[cfg(feature = "_reticulum-module")]
+fn call_codecs_arg(tokens: &[String]) -> PyResult<crate::transport::av_chunk_auth::CodecMap> {
+    use crate::transport::av_chunk_auth::{CodecMap, CodecToken};
+    let parsed = tokens
+        .iter()
+        .map(|t| {
+            CodecToken::parse(t).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "codec_unregistered: {t:?} is not a registered codec token \
+                     (av1, h264, opus)"
+                ))
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    CodecMap::new(parsed).map_err(|e| PyValueError::new_err(format!("codec_map_invalid: {e}")))
 }
 
 /// A [`CallEvent`](crate::transport::av_call::CallEvent) as a Python dict:
@@ -4453,6 +4494,54 @@ fn call_event_to_pydict<'py>(
             d.set_item("kind", "load_tier")?;
             d.set_item("tier", *tier)?;
         }
+        V::AttendeeLeft {
+            key_id,
+            stream,
+            cause,
+            truncated,
+        } => {
+            d.set_item("kind", "attendee_left")?;
+            d.set_item("key_id", key_id)?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
+            d.set_item("cause", cause.token())?;
+            d.set_item("truncated", *truncated)?;
+        }
+        V::StreamAdded {
+            publisher,
+            stream,
+            kind,
+        } => {
+            d.set_item("kind", "stream_added")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
+            d.set_item("stream_kind", *kind)?;
+            d.set_item(
+                "share",
+                *kind == crate::transport::av_chunk_auth::STREAM_KIND_SHARE,
+            )?;
+        }
+        V::StreamEnded {
+            publisher,
+            stream,
+            cause,
+            truncated,
+        } => {
+            d.set_item("kind", "stream_ended")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
+            d.set_item("cause", cause.token())?;
+            d.set_item("truncated", *truncated)?;
+        }
+        V::StreamReplaced {
+            publisher,
+            old,
+            new,
+        } => {
+            d.set_item("kind", "stream_replaced")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("old_stream_id", pyo3::types::PyBytes::new(py, &old.0))?;
+            d.set_item("new_stream_id", pyo3::types::PyBytes::new(py, &new.0))?;
+        }
     }
     Ok(d)
 }
@@ -4475,6 +4564,8 @@ fn call_frame_to_pydict<'py>(
         (f.layer.spatial, f.layer.temporal, f.layer.quality),
     )?;
     d.set_item("bytes", pyo3::types::PyBytes::new(py, &f.bytes))?;
+    d.set_item("frame_seq", f.frame_seq)?;
+    d.set_item("source_ts_ms", f.source_ts_ms)?;
     Ok(d)
 }
 
@@ -4527,6 +4618,11 @@ pub const PY_CALL_VERBS: &[&str] = &[
     "attendance",
     "state",
     "leave",
+    "add_stream",
+    "publish_on",
+    "end_stream",
+    "streams",
+    "frames_lost_by_layer",
 ];
 
 #[cfg(feature = "_reticulum-module")]
@@ -4577,9 +4673,123 @@ impl PyCall {
         self.room.clone()
     }
 
-    /// This node's stream id (32 bytes).
-    fn stream_id(&self) -> [u8; 32] {
-        self.stream_id
+    /// This node's stream id (32 bytes): the one it joined with, or the
+    /// latest `replace_stream` gave it.
+    fn stream_id(&self, py: Python<'_>) -> [u8; 32] {
+        self.with_call(py, |c| Box::pin(async move { Ok(c.stream().0) }))
+            .unwrap_or(self.stream_id)
+    }
+
+    /// v45 — replace this node's stream in place (a codec change): a new
+    /// stream, bound and switched to make-before-break, whose signed binding
+    /// says it replaces the old (receivers get `stream_replaced`, no leave).
+    /// `codecs` is the new map as tokens (`None`: the old one's). Returns the
+    /// new stream id.
+    #[pyo3(signature = (codecs=None))]
+    fn replace_stream(&self, py: Python<'_>, codecs: Option<Vec<String>>) -> PyResult<[u8; 32]> {
+        let codecs = codecs.map(|c| call_codecs_arg(&c)).transpose()?;
+        self.with_call(py, move |c| {
+            Box::pin(async move { Ok(c.replace_stream(codecs).await?.0) })
+        })
+    }
+
+    /// v45 — publish a second stream beside the camera (a desktop or
+    /// window share): its own stream id, bindings and codec map (`codecs` as
+    /// tokens; `None`: none). Receivers bind it as a separate stream, never
+    /// a replacement; its end is `stream_ended`, never `attendee_left`.
+    /// Returns its stream id. At most three own streams at once
+    /// (`too_many_streams`).
+    #[pyo3(signature = (codecs=None))]
+    fn add_stream(&self, py: Python<'_>, codecs: Option<Vec<String>>) -> PyResult<[u8; 32]> {
+        let codecs = codecs.map(|c| call_codecs_arg(&c)).transpose()?;
+        self.with_call(py, move |c| {
+            Box::pin(async move { Ok(c.add_stream(codecs).await?.0) })
+        })
+    }
+
+    /// v45 — `publish` on one of this node's streams (`stream_id()` or one
+    /// `add_stream` gave): the same dict. A stream this node does not
+    /// publish raises `unknown_stream`.
+    #[pyo3(signature = (stream_id, frame, codec_id=PY_CODEC_OPAQUE, layer=(0, 0, 0)))]
+    fn publish_on(
+        &self,
+        py: Python<'_>,
+        stream_id: [u8; 32],
+        frame: Vec<u8>,
+        codec_id: u8,
+        layer: (u8, u8, u8),
+    ) -> PyResult<Py<PyAny>> {
+        let frame = crate::transport::av_call::Frame {
+            codec_id,
+            layer: chunk_layer_from_tuple(layer),
+            bytes: frame,
+        };
+        let stream = crate::transport::realtime_av::StreamId(stream_id);
+        let report = self.with_call(py, move |c| {
+            Box::pin(async move { c.publish_on(stream, frame).await })
+        })?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("epoch", report.epoch.0)?;
+        d.set_item("chunk_seq", report.chunk_seq.0)?;
+        d.set_item("delivered", report.delivered())?;
+        d.set_item("fragments", report.fragments)?;
+        let legs: Vec<(String, String)> = report
+            .legs
+            .iter()
+            .map(|(m, o)| (m.clone(), format!("{o:?}")))
+            .collect();
+        d.set_item("legs", legs)?;
+        Ok(d.unbind().into_any())
+    }
+
+    /// v45 — end one own stream and only it, signed. `cause` `None` (the
+    /// default) signs `end = 3` ("this stream ended", never a leave): a
+    /// share stops. `"backgrounded"` or `"left"` sign 2 or 1, which a
+    /// receiver takes as a leave only on the member's last stream: a phone
+    /// sharing its screen backgrounds its camera with
+    /// `end_stream(stream_id(), "backgrounded")` while the share plays on.
+    /// The camera ends this way only while a share is live
+    /// (`unknown_stream`); the call ends with `leave()`.
+    #[pyo3(signature = (stream_id, cause=None))]
+    fn end_stream(&self, py: Python<'_>, stream_id: [u8; 32], cause: Option<&str>) -> PyResult<()> {
+        use crate::transport::av_chunk_auth::SignedEnd;
+        let why = match cause {
+            None | Some("ended") => SignedEnd::Ended,
+            Some("left") => SignedEnd::Left,
+            Some("backgrounded") => SignedEnd::Backgrounded,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "end_cause_unknown: {other:?} (ended, left, backgrounded)"
+                )))
+            }
+        };
+        let stream = crate::transport::realtime_av::StreamId(stream_id);
+        self.with_call(py, move |c| {
+            Box::pin(async move { c.end_stream_as(stream, why).await })
+        })
+    }
+
+    /// v45 — every stream this node publishes in the call, the primary
+    /// first.
+    fn streams(&self, py: Python<'_>) -> PyResult<Vec<[u8; 32]>> {
+        self.with_call(py, |c| {
+            Box::pin(async move { Ok(c.streams().await.into_iter().map(|s| s.0).collect()) })
+        })
+    }
+
+    /// v45 — frames this node never got, per (codec class, layer)
+    /// (`{(class, (s, t, q)): count}`): gaps in the framed streams'
+    /// `frame_seq` on layers it was being sent. A `(0, 0, 0)` entry is a
+    /// freeze until the next keyframe. Audio is concealed by time and not
+    /// counted.
+    #[allow(clippy::type_complexity)] // the dict's shape is what Python callers read
+    fn frames_lost_by_layer(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<std::collections::BTreeMap<(u8, (u8, u8, u8)), u64>> {
+        self.with_call(py, |c| {
+            Box::pin(async move { Ok(c.frames_lost_by_layer()) })
+        })
     }
 
     /// The call's epoch (the room's MLS epoch).
@@ -4598,6 +4808,50 @@ impl PyCall {
     /// The members this node has a leg to, sorted.
     fn legs(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         self.with_call(py, |c| Box::pin(async move { Ok(c.legs()) }))
+    }
+
+    /// v45 — ask this node's parents for the stream `stream_id` for at most
+    /// `layers` = `(spatial, temporal, quality)`; `None` withdraws. The cap
+    /// rides the SUBSCRIBE to a parent that takes one (the host's lever,
+    /// off by default). Returns whether a SUBSCRIBE went out now.
+    #[pyo3(signature = (stream_id, layers=None))]
+    fn request_layers(
+        &self,
+        py: Python<'_>,
+        stream_id: [u8; 32],
+        layers: Option<(u8, u8, u8)>,
+    ) -> PyResult<bool> {
+        let cap = layers.map(
+            |(s, t, q)| crate::transport::realtime_av::ReceiverLayerPolicy {
+                max_spatial: s,
+                max_temporal: t,
+                max_quality: q,
+            },
+        );
+        let stream = crate::transport::realtime_av::StreamId(stream_id);
+        self.with_call(py, move |c| {
+            Box::pin(async move { Ok(c.request_layers(stream, cap).await) })
+        })
+    }
+
+    /// Per-leg stats, sorted by member: `[{"member", "path"
+    /// ("direct_udp" | "interface" | "relayed" | "gone"), "link_mdu",
+    /// "channel_limit", "media_limit", "frame_budget", "datagrams"}, ...]`.
+    fn leg_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let legs = self.with_call(py, |c| Box::pin(async move { Ok(c.leg_info()) }))?;
+        let out = pyo3::types::PyList::empty(py);
+        for l in legs {
+            let d = pyo3::types::PyDict::new(py);
+            d.set_item("member", l.member)?;
+            d.set_item("path", l.path.token())?;
+            d.set_item("link_mdu", l.link_mdu)?;
+            d.set_item("channel_limit", l.channel_limit)?;
+            d.set_item("media_limit", l.media_limit)?;
+            d.set_item("frame_budget", l.frame_budget)?;
+            d.set_item("datagrams", l.datagrams)?;
+            out.append(d)?;
+        }
+        Ok(out.into_any().unbind())
     }
 
     /// ALM C7 — the decision log: `{"hash", "records", "tail"}`. The tail
@@ -4635,6 +4889,7 @@ impl PyCall {
         d.set_item("epoch", report.epoch.0)?;
         d.set_item("chunk_seq", report.chunk_seq.0)?;
         d.set_item("delivered", report.delivered())?;
+        d.set_item("fragments", report.fragments)?;
         let legs: Vec<(String, String)> = report
             .legs
             .iter()
@@ -4714,9 +4969,21 @@ impl PyCall {
         })
     }
 
-    /// Hang up (an in-room hang-up writes nothing). Returns the summary
-    /// dict; a second `leave()` raises `call_ended`.
-    fn leave(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// Hang up (an in-room hang-up writes nothing). `cause` is `"left"`
+    /// (default) or `"backgrounded"`: the signed end peers turn into
+    /// `attendee_left`. Returns the summary dict; a second `leave()` raises
+    /// `call_ended`.
+    #[pyo3(signature = (cause="left"))]
+    fn leave(&self, py: Python<'_>, cause: &str) -> PyResult<Py<PyAny>> {
+        let why = match cause {
+            "left" => crate::transport::av_chunk_auth::SignedEnd::Left,
+            "backgrounded" => crate::transport::av_chunk_auth::SignedEnd::Backgrounded,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "leave_cause_unknown: {other:?} (left, backgrounded)"
+                )))
+            }
+        };
         let call = Arc::clone(&self.call);
         let left = py.detach(|| {
             run_async(&self.executor, async move {
@@ -4725,7 +4992,7 @@ impl PyCall {
                         crate::transport::av_call::EndCause::HungUp,
                     ));
                 };
-                c.leave().await
+                c.leave_with(why).await
             })
         });
         let s = left.map_err(|e| call_err_to_py(&e))?;
@@ -9592,6 +9859,7 @@ fn assemble_tier_meta_v3(
 const PY_CODEC_AV1_SVC: u8 = crate::transport::realtime_av::CODEC_AV1_SVC;
 const PY_CODEC_JPEG_XS: u8 = crate::transport::realtime_av::CODEC_JPEG_XS;
 const PY_CODEC_MDC: u8 = crate::transport::realtime_av::CODEC_MDC;
+const PY_CODEC_TEMPORAL_LAYERED: u8 = crate::transport::realtime_av::CODEC_TEMPORAL_LAYERED;
 const PY_CODEC_OPAQUE: u8 = crate::transport::realtime_av::CODEC_OPAQUE;
 /// CIRISEdge#129 — MLS X-Wing ciphersuite code point. Mirrors
 /// `MlsSession::ciphersuite_id()`. Exposed as a constant so
@@ -11348,6 +11616,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CODEC_AV1_SVC", PY_CODEC_AV1_SVC)?;
     m.add("CODEC_JPEG_XS", PY_CODEC_JPEG_XS)?;
     m.add("CODEC_MDC", PY_CODEC_MDC)?;
+    m.add("CODEC_TEMPORAL_LAYERED", PY_CODEC_TEMPORAL_LAYERED)?;
     m.add("CODEC_OPAQUE", PY_CODEC_OPAQUE)?;
     // MLS ciphersuite code point (CIRISEdge#129) — used by
     // CIRISConformance to attest that the cohabiting wheel's MLS
@@ -11748,6 +12017,10 @@ mod tests {
         assert_eq!(PY_CODEC_AV1_SVC, realtime_av::CODEC_AV1_SVC);
         assert_eq!(PY_CODEC_JPEG_XS, realtime_av::CODEC_JPEG_XS);
         assert_eq!(PY_CODEC_MDC, realtime_av::CODEC_MDC);
+        assert_eq!(
+            PY_CODEC_TEMPORAL_LAYERED,
+            realtime_av::CODEC_TEMPORAL_LAYERED
+        );
         assert_eq!(PY_CODEC_OPAQUE, realtime_av::CODEC_OPAQUE);
     }
 
@@ -14282,21 +14555,24 @@ mod pyo3_tier2_tests {
                 assert!(e.is_instance_of::<PyValueError>(py), "{token}: {e}");
                 assert!(e.to_string().contains(token), "{token}: {e}");
             };
-            value_err(py_edge.join_call(py, "", "unkept", false), "invalid_room");
             value_err(
-                py_edge.join_call(py, "chat:room:v1:a\0b", "unkept", false),
+                py_edge.join_call(py, "", "unkept", false, None),
                 "invalid_room",
             );
             value_err(
-                py_edge.join_call(py, &"r".repeat(513), "unkept", false),
+                py_edge.join_call(py, "chat:room:v1:a\0b", "unkept", false, None),
                 "invalid_room",
             );
             value_err(
-                py_edge.join_call(py, "chat:room:v1:a", "recorded", false),
+                py_edge.join_call(py, &"r".repeat(513), "unkept", false, None),
+                "invalid_room",
+            );
+            value_err(
+                py_edge.join_call(py, "chat:room:v1:a", "recorded", false, None),
                 "invalid_keep",
             );
             // Valid arguments reach the call API, which names what is missing.
-            let Err(e) = py_edge.join_call(py, "chat:room:v1:a", "unkept", false) else {
+            let Err(e) = py_edge.join_call(py, "chat:room:v1:a", "unkept", false, None) else {
                 panic!("a node with no Reticulum transport cannot join a call")
             };
             assert!(e.is_instance_of::<PyRuntimeError>(py), "{e}");

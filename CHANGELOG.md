@@ -6,7 +6,8 @@ Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.m
 
 **MAJOR.** Pins: persist v61.2.2 (712575df; CIRISPersist#1246 SQLite mmap and cache_size), CIRISVerify
 v22.2.0 (rusqlite 0.41.1 / libsqlite3-sys 0.39.1, RUSTSEC-2026-0459 cleared), leviculum
-v0.34.0+ciris.2 (#102 A/V media on unordered datagrams, #104 probed MTU). MSRV 1.92; toolchain 1.97.0.
+v0.34.0+ciris.3 (#102 A/V media on unordered datagrams, #104 probed MTU, a Channel send's sequence
+and its delivery proof). MSRV 1.92; toolchain 1.97.0.
 
 ### Consumer notes
 

@@ -3137,6 +3137,9 @@ pub struct ReticulumTransport {
     /// leviculum#102 — the host's A/V datagram lever
     /// ([`Self::set_av_datagrams_enabled`]). Default on.
     av_datagrams_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// v45 — the host's lever for SUBSCRIBE layer caps
+    /// ([`Self::set_av_layer_requests_enabled`]). Default OFF until CC rules.
+    av_layer_requests: std::sync::atomic::AtomicBool,
     /// CIRISEdge#805 — the peer each A/V link THIS node dialled was dialled
     /// to ([`Self::open_av_link`]): the initiator-side attribution basis.
     /// The dial resolved the peer's transport key from its verified route
@@ -4334,6 +4337,7 @@ impl ReticulumTransport {
             av_datagram_fold: Arc::default(),
             av_caps_withheld: std::sync::atomic::AtomicU32::new(0),
             av_datagrams_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            av_layer_requests: std::sync::atomic::AtomicBool::new(false),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_paths,
             direct_link_retry: std::sync::atomic::AtomicBool::new(direct_link_retry),
@@ -6103,6 +6107,21 @@ impl ReticulumTransport {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// v45 — calls joined on this node from now on take part in SUBSCRIBE
+    /// layer caps (advertise the bit, apply a child's cap, send their own).
+    /// Default OFF until CC's correction of 5.3.3.2.4's carriage sentence.
+    pub fn set_av_layer_requests_enabled(&self, enabled: bool) {
+        self.av_layer_requests
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The layer-cap lever's position.
+    #[must_use]
+    pub fn av_layer_requests_enabled(&self) -> bool {
+        self.av_layer_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// leviculum#102 test seam — calls joined on this node from now on leave
     /// `bits` out of their C3 `CAPS` (e.g. `CAP_LINK_DATAGRAMS`: the node
     /// then reads to its peers as an edge that predates datagrams).
@@ -6999,7 +7018,9 @@ impl ReticulumTransport {
         &self,
         link: &[u8; 16],
     ) -> Option<crate::transport::alm_link::AvLinkStats> {
-        let st = self.node.link_stats(&LinkId::new(*link))?;
+        let id = LinkId::new(*link);
+        let st = self.node.link_stats(&id)?;
+        let seq = self.node.link_seq_stats(&id);
         Some(crate::transport::alm_link::AvLinkStats {
             bytes_delivered: st.bytes_delivered(),
             srtt_ms: st.srtt_ms(),
@@ -7008,6 +7029,9 @@ impl ReticulumTransport {
             pacing_rejections: st.pacing_rejections(),
             window: st.window(),
             window_max: st.window_max(),
+            tx_ring: st.tx_ring_size(),
+            last_sent_seq: seq.map(|q| q.last_sent_sequence()),
+            oldest_unacked_seq: seq.and_then(|q| q.oldest_unacked_sequence()),
         })
     }
 
@@ -7020,6 +7044,28 @@ impl ReticulumTransport {
         link: &[u8; 16],
     ) -> Option<leviculum_core::node::DatagramStats> {
         self.node.link_datagram_stats(&LinkId::new(*link))
+    }
+
+    /// What carries `link` and its MDU, for a call's per-leg stats: a punched
+    /// direct UDP path, a forwarder (a relay or the canonical: no punched
+    /// interface and more than one hop), or the one-hop interface it rides
+    /// (TCP or another). `None` when leviculum no longer holds the link.
+    #[must_use]
+    pub fn av_link_path(
+        &self,
+        link: &[u8; 16],
+    ) -> Option<(crate::transport::av_call::LegPath, usize)> {
+        use crate::transport::av_call::LegPath;
+        let id = LinkId::new(*link);
+        let mdu = self.node.link_mdu(&id)?;
+        let path = if self.node.direct_link_interface(&id).is_some() {
+            LegPath::DirectUdp
+        } else if link_is_forwarded(&self.node, &id, self.node.link_destination(&id)) {
+            LegPath::Relayed
+        } else {
+            LegPath::Interface
+        };
+        Some((path, mdu))
     }
 
     /// leviculum#102 / #104 — the most plaintext one message on `link` carries

@@ -195,24 +195,43 @@ impl Ident {
 }
 
 /// `T`: a bare leviculum transport node with a TCP server and a facilitator.
-async fn transport_node(tcp_port: u16, facilitator_port: u16) -> ReticulumNode {
-    transport_node_ingress(tcp_port, facilitator_port, false).await
+async fn transport_node() -> (ReticulumNode, u16, u16) {
+    transport_node_ingress(false).await
 }
 
-async fn transport_node_ingress(
-    tcp_port: u16,
-    facilitator_port: u16,
-    ingress: bool,
-) -> ReticulumNode {
-    transport_node_limited(tcp_port, facilitator_port, ingress, None).await
+async fn transport_node_ingress(ingress: bool) -> (ReticulumNode, u16, u16) {
+    transport_node_limited(ingress, None).await
 }
 
+/// `T` on ports of its own, with the TCP and facilitator ports it bound.
+///
+/// A port [`free_port`] named can be taken before the bind, by anything on
+/// the host (another test's outbound connection draws from the same range),
+/// so an address in use is a redraw, as in `direct_links_805`.
 async fn transport_node_limited(
+    ingress: bool,
+    announce_rate_target: Option<u32>,
+) -> (ReticulumNode, u16, u16) {
+    let mut left = 8;
+    loop {
+        let (t_port, f_port) = (free_port(), free_udp_port());
+        match try_transport_node(t_port, f_port, ingress, announce_rate_target).await {
+            Ok(node) => return (node, t_port, f_port),
+            Err(e) if left > 0 => {
+                left -= 1;
+                tracing::debug!("T's ports were taken, redrawing: {e}");
+            }
+            Err(e) => panic!("start T: {e}"),
+        }
+    }
+}
+
+async fn try_transport_node(
     tcp_port: u16,
     facilitator_port: u16,
     ingress: bool,
     announce_rate_target: Option<u32>,
-) -> ReticulumNode {
+) -> Result<ReticulumNode, String> {
     let storage = tempfile::tempdir().expect("tempdir");
     // Node-wide: the one setting that reaches the connections a listener spawns.
     let mut builder = ReticulumNodeBuilder::new();
@@ -240,10 +259,10 @@ async fn transport_node_limited(
         .await
         .expect("build T");
     std::mem::forget(storage);
-    node.start().await.expect("start T");
+    node.start().await.map_err(|e| format!("{e:?}"))?;
     let mut rx = node.take_event_receiver().expect("T's events");
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    node
+    Ok(node)
 }
 
 /// One edge node: a TCP client of `T` only.
@@ -381,9 +400,7 @@ struct Pair {
 async fn pair(tag: &str, facilitated: bool) -> Pair {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let t_port = free_port();
-    let f_port = free_udp_port();
-    let t = transport_node(t_port, f_port).await;
+    let (t, t_port, f_port) = transport_node().await;
     let a_direct = DirectLinksConfig {
         facilitator: facilitated.then(|| format!("127.0.0.1:{f_port}")),
         ..DirectLinksConfig::default()
@@ -1024,8 +1041,7 @@ const LIMITER_ARMED: Duration = Duration::from_secs(12);
 async fn late_join(tag: &str) -> LateJoin {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (t_port, f_port) = (free_port(), free_udp_port());
-    let t = transport_node(t_port, f_port).await;
+    let (t, t_port, _) = transport_node().await;
     let key_a = Ident::new(&format!("node-a-{tag}"), 0x3a).await;
     let key_b = Ident::new(&format!("node-b-{tag}"), 0x3b).await;
     let records = vec![key_a.record().await, key_b.record().await];
@@ -1188,11 +1204,10 @@ async fn late_joiner_measure() {
     let ingress = env_secs("LATE_INGRESS", 0) == 1;
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (t_port, f_port) = (free_port(), free_udp_port());
     let target = u32::try_from(env_secs("LATE_TARGET", 0))
         .ok()
         .filter(|t| *t > 0);
-    let t = transport_node_limited(t_port, f_port, ingress, target).await;
+    let (t, t_port, _) = transport_node_limited(ingress, target).await;
     let key_a = Ident::new("node-a-late", 0x3a).await;
     let key_b = Ident::new("node-b-late", 0x3b).await;
     let (id_a, id_b) = (key_a.key_id.clone(), key_b.key_id.clone());
@@ -1257,8 +1272,7 @@ async fn fresh_interface_burst_measure() {
     let (n, budget) = (env_secs("BURST_N", 12), env_secs("BURST_BUDGET", 150));
     let ingress = env_secs("BURST_INGRESS", 1) == 1;
     init_tracing();
-    let (t_port, f_port) = (free_port(), free_udp_port());
-    let t = transport_node_ingress(t_port, f_port, ingress).await;
+    let (t, t_port, _) = transport_node_ingress(ingress).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{t_port}").parse().unwrap();
     let client = || async {
         let storage = tempfile::tempdir().expect("tempdir");

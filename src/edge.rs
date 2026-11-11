@@ -2354,6 +2354,19 @@ impl Edge {
         let _ = enabled;
     }
 
+    /// v45 — **the A/V layer-request lever**: whether calls joined from now
+    /// on take part in SUBSCRIBE layer caps (`Call::request_layers`): they
+    /// advertise `CAP_LAYER_REQUEST`, apply a child's cap, and send their
+    /// own. Default OFF until CC corrects 5.3.3.2.4. No-op without
+    /// the Reticulum transport.
+    pub fn set_av_layer_requests_enabled(&self, enabled: bool) {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            t.set_av_layer_requests_enabled(enabled);
+        }
+        let _ = enabled;
+    }
+
     /// `CLM-shaping-offered-never-refused` — how long past its last real frame
     /// a shaped link a peer asked of this node lives, when this node does not
     /// offer shaping by default. Default ten minutes.

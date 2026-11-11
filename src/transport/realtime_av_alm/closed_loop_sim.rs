@@ -38,6 +38,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
+use super::controller::admission::MEASURED_MARGIN;
 use super::controller::{
     Admission, ChunkPos, ClassPolicy, ControlMsg, ControllerConfig, DecisionKind, DecisionLog,
     EgressMeter, JitterSource, ParentSelector, PathChunk, PeerState, Role, SelectorAction,
@@ -176,6 +177,10 @@ struct Node {
     alive: bool,
     blackhole: bool,
     uplink_free_at: f64,
+    /// Accepted bytes still in the serializer: `(departs at ms, bytes)`,
+    /// credited delivered when they depart, never when accepted (a full
+    /// queue must not read as more than the link carries, §5.1).
+    in_flight: std::collections::VecDeque<(f64, u64)>,
     egress: EgressMeter,
     adm: Option<Admission<u32>>,
     sel: Option<ParentSelector<u32>>,
@@ -215,7 +220,8 @@ pub struct Sim {
     pub arq_tries: u32,
     full_bytes: u64,
     audio_bytes: u64,
-    /// (t, node, committed bps, 0.65 × real uplink bps)
+    /// (t, node, committed bps, 0.75 × real uplink bps: one margin per
+    /// measurement, §5.1)
     pub overcap: Vec<(u64, u32, f64, f64)>,
     /// Worst committed / real-uplink ratio seen per forwarder.
     pub worst_load: BTreeMap<u32, f64>,
@@ -468,6 +474,7 @@ impl Sim {
             alive: true,
             blackhole: false,
             uplink_free_at: 0.0,
+            in_flight: std::collections::VecDeque::new(),
             egress: EgressMeter::new(cfg.meter_window_ms, cfg.congestion_queue_ms),
             adm,
             sel,
@@ -676,6 +683,9 @@ impl Sim {
         let depart = start + bytes as f64 * 8_000.0 / rate;
         node.uplink_free_at = depart;
         node.egress.on_sent(at, bytes, q);
+        // The serializer delivers whatever it accepted, as it departs
+        // (§5.1's numerator; the path's own loss is the child's to read).
+        node.in_flight.push_back((depart, bytes));
         self.note_leg(from, to, false);
         let hop = self.next_hop(from, to);
         let jitter_draw = self.net.unit();
@@ -777,6 +787,7 @@ impl Sim {
                         subscriber: n,
                         role,
                         forward_capable: fc,
+                        layers: None,
                     }),
                 ),
                 SelectorAction::Unsubscribe { parent } => {
@@ -903,6 +914,12 @@ impl Sim {
                 Self::sync_upstream(adm, sel);
             }
             let mut shed = Vec::new();
+            let tf = t as f64;
+            while node.in_flight.front().is_some_and(|(d, _)| *d <= tf) {
+                if let Some((_, bytes)) = node.in_flight.pop_front() {
+                    node.egress.on_delivered(t, bytes);
+                }
+            }
             if let Some(adm) = node.adm.as_mut() {
                 if let Some(w) = node.egress.roll(t) {
                     shed = adm.on_egress_window(t, &w, &mut self.log);
@@ -1025,7 +1042,7 @@ impl Sim {
                 let w = self.worst_load.entry(i as u32).or_insert(0.0);
                 if t >= self.overcap_from {
                     *w = w.max(load / real);
-                    let cap = self.cfg.commit_fraction * real;
+                    let cap = MEASURED_MARGIN * real;
                     if load > cap + 1.0 {
                         self.overcap.push((t, i as u32, load, cap));
                     }
@@ -1188,7 +1205,7 @@ pub struct Metrics {
     pub flips: u64,
     /// Node with the most flips.
     pub worst_flipper: Option<u32>,
-    /// Over-cap samples (committed > 0.65 × real uplink).
+    /// Over-cap samples (committed > 0.75 × real uplink).
     pub overcap_samples: usize,
     /// Worst committed / real-uplink.
     pub worst_load: f64,
@@ -1658,7 +1675,7 @@ mod scenarios {
             sim.layer_period = LAYER_PERIOD;
             sim.c5 = true;
             sim.run_until(T1_END);
-            let cap = sim.cfg.commit_fraction * streams * sim.cfg.stream_bps as f64;
+            let cap = MEASURED_MARGIN * streams * sim.cfg.stream_bps as f64;
             eprintln!(
                 "[ALM-CTRL] L6 seed={seed} ceiling={:?} committed={} refused={:?} legs_shed={} \
                  overclaims={}",
@@ -1676,7 +1693,7 @@ mod scenarios {
             );
             assert!(
                 (sim.committed(liar) as f64) <= cap + 1.0,
-                "liar committed {} > 0.65 × measured{}",
+                "liar committed {} > 0.75 × measured{}",
                 sim.committed(liar),
                 sim.report(Some(liar), "")
             );
@@ -1917,7 +1934,7 @@ mod scenarios {
                 sim.report(Some(liar), "herd onto liar")
             );
             sim.run_until(T1_END);
-            let cap = sim.cfg.commit_fraction * 12.0 * sim.cfg.stream_bps as f64;
+            let cap = MEASURED_MARGIN * 12.0 * sim.cfg.stream_bps as f64;
             let detected = sim.log.count(DecisionKind::OverClaim);
             assert!(
                 detected >= 1,
@@ -1937,7 +1954,7 @@ mod scenarios {
             );
             assert!(
                 (sim.committed(liar) as f64) <= cap + 1.0,
-                "liar committed {} > 0.65 × measured{}",
+                "liar committed {} > 0.75 × measured{}",
                 sim.committed(liar),
                 sim.report(Some(liar), "")
             );
@@ -1958,7 +1975,7 @@ mod scenarios {
                 last_over.saturating_sub(first_over)
             );
             // Honest outcome: a liar cannot make capacity appear. What fits is
-            // 0.65 × (4 + 12 + 8 + 8) = 20.8 streams for 23 subscribers.
+            // at most 0.75 × (4 + 12 + 8 + 8) = 24 streams for 23 subscribers.
             assert!(
                 m.served >= 15,
                 "{}",

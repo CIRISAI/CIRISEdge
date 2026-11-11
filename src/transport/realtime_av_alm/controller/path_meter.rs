@@ -8,10 +8,12 @@
 //! `meter_window_ms`; a closed window folds into EWMAs.
 //!
 //! [`EgressMeter`] sits on the SENDING side of a forwarder's uplink and turns
-//! sent/dropped bytes and queue-delay samples into [`EgressWindow`]s, the
-//! input admission ([`super::admission`]) learns its capacity ceiling from.
-//! In production its inputs are `LinkCounters` diffs per link (sent bytes,
-//! Busy/PacingDelay rejections) and `LegOutcome::Congested` streaks.
+//! the whole uplink's accepted, refused and delivered traffic into
+//! [`EgressWindow`]s carrying the uplink-level verdict of
+//! `docs/AV_ALM_DESIGN.md` §5.1, the input admission ([`super::admission`])
+//! learns its capacity ceiling from. In production its inputs are every
+//! leg's sends and `Busy`/`PacingDelay`/expiry refusals, and each link's
+//! `bytes_delivered` deltas (leviculum#35).
 //!
 //! Silence is NOT loss here: a path that delivers nothing has no gaps.
 //! Silence is the peer-state machine's input ([`super::peer_state`]).
@@ -326,55 +328,135 @@ impl PathMeter {
 /// One closed egress window of a forwarder's uplink.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EgressWindow {
-    /// Bits/s actually sent.
+    /// Bits/s the uplink accepted.
     pub sent_bps: f64,
-    /// Bytes refused by the uplink (queue full / Busy).
+    /// Bits/s the uplink's links confirmed delivered (leviculum#35
+    /// `bytes_delivered` deltas; a leg with no delivery proof, a datagram
+    /// leg, counts what it accepted).
+    pub delivered_bps: f64,
+    /// Bytes refused by the uplink (queue full / Busy / expired unconfirmed).
     pub dropped_bytes: u64,
-    /// Worst queue delay sampled (ms).
+    /// Worst queue delay sampled (ms). Telemetry only: a slow leg's queue is
+    /// that leg's, not the uplink's.
     pub max_queue_ms: f64,
-    /// Whether the window counts as congested (drops, or queue delay at or
-    /// above the congestion threshold). A congested window's `sent_bps` is a
-    /// measurement of the uplink's real capacity.
+    /// The meter's verdict over its trailing span: the UPLINK is the
+    /// bottleneck (`docs/AV_ALM_DESIGN.md` §5.1). See [`EgressMeter`].
     pub congested: bool,
+    /// What the uplink demonstrably carries when [`Self::congested`]: the p10
+    /// delivery rate of the span's backpressured windows, in the units
+    /// commitments are priced in, times [`UPLINK_SAFETY_MARGIN`]. `None` when
+    /// not congested.
+    pub capacity_bps: Option<f64>,
 }
 
-/// C1 send-side meter for a forwarder's uplink.
+/// The span (ms) the uplink verdict and its p10 are taken over (§5.1).
+pub const UPLINK_SPAN_MS: u64 = 30_000;
+/// Windows the span must hold before any verdict: a call's first seconds
+/// (KEX, binding parts, a join burst) are no measurement.
+pub const UPLINK_MIN_WINDOWS: usize = 5;
+/// Share of the span's offered frames the uplink refused, at or above which
+/// the uplink (not a moment, not one leg) is the bottleneck. A stalled
+/// receiver or a busy host refuses a frame or two while it catches up; a
+/// rate cap refuses its excess every window.
+pub const UPLINK_REFUSED_SHARE: f64 = 0.05;
+/// Distinct windows of the span with a refusal: one burst is not a cap.
+pub const UPLINK_REFUSAL_WINDOWS: usize = 3;
+/// The percentile of the backpressured windows' delivery rate (§5.1: "sign
+/// the rate I virtually always meet").
+pub const UPLINK_PERCENTILE: f64 = 10.0;
+/// The margin on the demonstrated rate (§5.1, §6 "give grace, stay safe").
+pub const UPLINK_SAFETY_MARGIN: f64 = 0.75;
+
+/// One closed window as the span keeps it.
+#[derive(Debug, Clone, Copy, Default)]
+struct SpanWindow {
+    sent_bytes: u64,
+    delivered_bytes: u64,
+    sent_frames: u64,
+    refused_frames: u64,
+}
+
+/// C1 send-side meter for a forwarder's uplink: the aggregate across every
+/// leg, the uplink-level verdict of `docs/AV_ALM_DESIGN.md` §5.1.
+///
+/// - **Inputs** per window: bytes and frames accepted ([`Self::on_sent`]),
+///   frames refused or expired ([`Self::on_dropped`]), and bytes the links
+///   confirmed delivered ([`Self::on_delivered`]).
+/// - **App-limited windows are excluded**: a window in which nothing was
+///   refused sent everything the app had, so its rate is a floor, never a
+///   ceiling sample.
+/// - **The verdict is the span's**, not a window's or a leg's: over the
+///   trailing [`UPLINK_SPAN_MS`], at least [`UPLINK_REFUSED_SHARE`] of the
+///   offered frames refused, in at least [`UPLINK_REFUSAL_WINDOWS`] windows,
+///   with [`UPLINK_MIN_WINDOWS`] in the span. A stall (a busy host, a peer
+///   slow to ack) delays delivery and refuses little; a cap refuses its
+///   excess every window.
+/// - **The capacity is the p10** of the backpressured windows' delivery rate,
+///   rescaled to accepted (plaintext) units by the span's accepted/delivered
+///   ratio, times [`UPLINK_SAFETY_MARGIN`]. It is recomputed every window,
+///   so it rises with the uplink as well as falls.
+///
+/// No queue-delay threshold and no per-leg bit enters the verdict: a slow
+/// leg is C5's (that leg sheds to its base layer) and its child's own C1's.
+///
+/// **Limit: datagram legs.** A leg whose media rides leviculum#102 datagrams
+/// has no delivery proof (`bytes_delivered` counts Channel envelopes and
+/// resources only), so it reports what it accepted as delivered, and on such
+/// an uplink only refusals (`PacingDelay`) can reach a verdict. A loss past
+/// the sender (the path, the peer's sink) is invisible here, so this meter
+/// can neither learn nor lower a ceiling from it; growth stays gated by the
+/// probe allowance, and the child's own C1 still sees the loss and moves. A
+/// receiver-side delivery report would close it (CIRISEdge#975).
 #[derive(Debug, Clone)]
 pub struct EgressMeter {
     window_ms: u64,
-    congestion_queue_ms: f64,
     window_start: Option<u64>,
-    sent: u64,
-    dropped: u64,
+    cur: SpanWindow,
     max_queue: f64,
+    dropped_bytes: u64,
+    span: std::collections::VecDeque<SpanWindow>,
 }
 
 impl EgressMeter {
-    /// A meter with the given window and congestion threshold.
+    /// A meter with the given window. `_congestion_queue_ms` is kept for the
+    /// config's shape; queue delay no longer decides a verdict.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
-    pub fn new(window_ms: u64, congestion_queue_ms: u64) -> Self {
+    pub fn new(window_ms: u64, _congestion_queue_ms: u64) -> Self {
         Self {
             window_ms: window_ms.max(1),
-            congestion_queue_ms: congestion_queue_ms as f64,
             window_start: None,
-            sent: 0,
-            dropped: 0,
+            cur: SpanWindow::default(),
             max_queue: 0.0,
+            dropped_bytes: 0,
+            span: std::collections::VecDeque::new(),
         }
+    }
+
+    fn span_windows(&self) -> usize {
+        usize::try_from(UPLINK_SPAN_MS / self.window_ms)
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
 
     /// Bytes accepted onto the uplink; `queue_ms` is the queue delay they saw.
     pub fn on_sent(&mut self, now_ms: u64, bytes: u64, queue_ms: f64) {
         self.window_start.get_or_insert(now_ms);
-        self.sent += bytes;
+        self.cur.sent_bytes += bytes;
+        self.cur.sent_frames += 1;
         self.max_queue = self.max_queue.max(queue_ms);
     }
 
-    /// Bytes the uplink refused.
+    /// A frame of `bytes` the uplink refused (or that expired unconfirmed).
     pub fn on_dropped(&mut self, now_ms: u64, bytes: u64) {
         self.window_start.get_or_insert(now_ms);
-        self.dropped += bytes;
+        self.dropped_bytes += bytes;
+        self.cur.refused_frames += 1;
+    }
+
+    /// Bytes the uplink's links confirmed delivered since the last call.
+    pub fn on_delivered(&mut self, now_ms: u64, bytes: u64) {
+        self.window_start.get_or_insert(now_ms);
+        self.cur.delivered_bytes += bytes;
     }
 
     /// Close the current window if it ended. Empty-window gaps are skipped.
@@ -384,18 +466,92 @@ impl EgressMeter {
         if now_ms < start + self.window_ms {
             return None;
         }
+        let secs = self.window_ms as f64 / 1_000.0;
+        let closed = std::mem::take(&mut self.cur);
+        self.span.push_back(closed);
+        while self.span.len() > self.span_windows() {
+            self.span.pop_front();
+        }
+        let capacity_bps = self.verdict();
         let w = EgressWindow {
-            sent_bps: self.sent as f64 * 8.0 * 1000.0 / self.window_ms as f64,
-            dropped_bytes: self.dropped,
+            sent_bps: closed.sent_bytes as f64 * 8.0 / secs,
+            delivered_bps: closed.delivered_bytes as f64 * 8.0 / secs,
+            dropped_bytes: self.dropped_bytes,
             max_queue_ms: self.max_queue,
-            congested: self.dropped > 0 || self.max_queue >= self.congestion_queue_ms,
+            congested: capacity_bps.is_some(),
+            capacity_bps,
         };
-        self.sent = 0;
-        self.dropped = 0;
+        self.dropped_bytes = 0;
         self.max_queue = 0.0;
         let elapsed = now_ms - start;
         self.window_start = Some(start + (elapsed / self.window_ms) * self.window_ms);
         Some(w)
+    }
+
+    /// The span's verdict: the uplink's demonstrated capacity when it is the
+    /// bottleneck, `None` otherwise.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn verdict(&self) -> Option<f64> {
+        // Once the span holds UPLINK_MIN_WINDOWS windows, the longest
+        // trailing run of it (at least UPLINK_REFUSAL_WINDOWS windows) that
+        // shows a real bottleneck: an overload that began mid-span is read
+        // from when it began, not diluted by the clean windows before it
+        // (t2: a 5 % overload must not wait 30 s for the whole span's share),
+        // while a stall (refusals in one or two windows) still never makes
+        // one.
+        let n = self.span.len();
+        if n < UPLINK_MIN_WINDOWS {
+            return None;
+        }
+        (0..=n - UPLINK_REFUSAL_WINDOWS).find_map(|start| self.verdict_of(start))
+    }
+
+    /// The verdict over the span's windows from `start` on, if they show the
+    /// uplink as the bottleneck.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn verdict_of(&self, start: usize) -> Option<f64> {
+        let run = || self.span.iter().skip(start);
+        let (mut sent_f, mut refused_f, mut sent_b, mut deliv_b) = (0u64, 0u64, 0u64, 0u64);
+        for w in run() {
+            sent_f += w.sent_frames;
+            refused_f += w.refused_frames;
+            sent_b += w.sent_bytes;
+            deliv_b += w.delivered_bytes;
+        }
+        let offered = sent_f + refused_f;
+        let refusal_windows = run().filter(|w| w.refused_frames > 0).count();
+        if offered == 0
+            || (refused_f as f64) < UPLINK_REFUSED_SHARE * offered as f64
+            || refusal_windows < UPLINK_REFUSAL_WINDOWS
+        {
+            return None;
+        }
+        // Delivered bytes carry the link's own framing; commitments are
+        // priced in what the call layer sends. One ratio per run converts.
+        let to_sent_units = if deliv_b > 0 {
+            sent_b as f64 / deliv_b as f64
+        } else {
+            1.0
+        };
+        let secs = self.window_ms as f64 / 1_000.0;
+        let mut rates: Vec<f64> = run()
+            .filter(|w| w.refused_frames > 0)
+            .map(|w| w.delivered_bytes as f64 * 8.0 / secs * to_sent_units)
+            .collect();
+        rates.sort_by(f64::total_cmp);
+        // Nearest rank: at small n the p10 is the minimum (claims less, never
+        // more, as observability drops).
+        let rank = ((UPLINK_PERCENTILE / 100.0) * rates.len() as f64).ceil() as usize;
+        let p10 = rates[rank.clamp(1, rates.len()) - 1];
+        Some(UPLINK_SAFETY_MARGIN * p10)
     }
 }
 
@@ -596,16 +752,165 @@ mod tests {
         assert!((m.snapshot().burst - 1.0).abs() < 1e-9);
     }
 
+    /// One uplink second: `frames` sent of `bytes` each, `refused` of them
+    /// refused, and `delivered` bytes confirmed.
+    fn second(
+        e: &mut EgressMeter,
+        t: u64,
+        frames: u64,
+        bytes: u64,
+        refused: u64,
+        delivered: u64,
+    ) -> EgressWindow {
+        for _ in 0..frames {
+            e.on_sent(t, bytes, 0.0);
+        }
+        for _ in 0..refused {
+            e.on_dropped(t, bytes);
+        }
+        e.on_delivered(t, delivered);
+        e.roll(t + 1_000).expect("a window")
+    }
+
     #[test]
-    fn egress_flags_congestion() {
+    fn egress_reports_its_rates() {
         let mut e = EgressMeter::new(1_000, 100);
-        e.on_sent(0, 125_000, 20.0);
-        let w = e.roll(1_000).expect("window");
+        let w = second(&mut e, 0, 100, 1_250, 0, 1_250 * 100);
         assert!(!w.congested);
         assert!((w.sent_bps - 1_000_000.0).abs() < 1e-6);
-        e.on_sent(1_000, 10, 150.0);
-        assert!(e.roll(2_000).expect("window").congested);
-        e.on_dropped(2_000, 10);
-        assert!(e.roll(3_000).expect("window").congested);
+        assert!((w.delivered_bps - 1_000_000.0).abs() < 1e-6);
+        assert_eq!(w.capacity_bps, None);
+    }
+
+    /// The avmesh4rel shape, at the meter (release build, quiet box, no rate
+    /// limit anywhere): every window's queue delay over the old 150 ms bar
+    /// and a frame refused now and then while a slow peer catches up. Only
+    /// the inputs the v45.0.0 meter had, so this reads red on it. Mutation
+    /// (v45.0.0): a refusal or a 150 ms queue made the window congested, and
+    /// two such made a ceiling: m0 learned 647808 → 464440 bps in 5 s.
+    #[test]
+    fn a_stall_is_not_a_ceiling() {
+        let mut e = EgressMeter::new(1_000, 150);
+        for t in 0..60u64 {
+            // 90 frames/s; seconds 10-12 of every 20 one refusal each.
+            for _ in 0..90 {
+                e.on_sent(t * 1_000, 300, 400.0);
+            }
+            if (10..=12).contains(&(t % 20)) {
+                e.on_dropped(t * 1_000, 300);
+            }
+            let w = e.roll(t * 1_000 + 1_000).expect("a window");
+            assert!(!w.congested, "second {t}: a stall is no capacity verdict");
+        }
+    }
+
+    /// The avmesh4rel regression (release build, quiet box, every ALM
+    /// decision kept): v45.0.0's m0 learned ceilings 647808, 601024, 611040,
+    /// 547696, 464440 bps one second apart (07:25:27-31), went stale at
+    /// 07:26:01 and learned 451200 at 07:26:04. Its rule was c1 = s1, then
+    /// c(n) = c(n-1) + (s(n) - c(n-1))/2, so the windows sent 647808, 554240,
+    /// 621056, 484352, 381184 and 451200 bps. Every one was flagged by queue
+    /// delay (m0 refused 6 frames in the whole run). Fed here with the WORST
+    /// member's whole-run refusals (m3, 43) all inside those six seconds and
+    /// the backed-up queue in every window, the meter learns no ceiling.
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn the_avmesh4rel_trace_learns_no_ceiling() {
+        const FRAME: u64 = 300;
+        let trace = [647_808u64, 554_240, 621_056, 484_352, 381_184, 451_200];
+        let mut e = EgressMeter::new(1_000, 150);
+        let mut refusals = 43u64;
+        let mut t = 0u64;
+        // The 30 s span holds the run's first seconds too, clean.
+        for _ in 0..20 {
+            let w = second(&mut e, t, 270, FRAME, 0, 270 * FRAME);
+            assert!(!w.congested);
+            t += 1_000;
+        }
+        for (i, bps) in trace.iter().enumerate() {
+            let frames = bps / 8 / FRAME;
+            let refused = if i + 1 == trace.len() { refusals } else { 8 };
+            refusals -= refused;
+            for _ in 0..frames {
+                e.on_sent(t, FRAME, 400.0);
+            }
+            for _ in 0..refused {
+                e.on_dropped(t, FRAME);
+            }
+            e.on_delivered(t, frames * FRAME);
+            let w = e.roll(t + 1_000).expect("a window");
+            assert!(!w.congested, "trace second {i} ({bps} bps): no ceiling");
+            assert_eq!(w.capacity_bps, None);
+            t += 1_000;
+        }
+        assert_eq!(refusals, 0, "all 43 were fed");
+    }
+
+    /// A real cap: 9 streams offered into 5, every window refusing the excess.
+    /// The verdict comes once the span holds its windows, at what the uplink
+    /// delivered, with the margin.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_rate_cap_is_a_ceiling_at_its_delivered_rate() {
+        let mut e = EgressMeter::new(1_000, 150);
+        let mut first = None;
+        for t in 0..10u64 {
+            let w = second(&mut e, t * 1_000, 50, 300, 40, 50 * 300);
+            if w.congested && first.is_none() {
+                first = Some(t);
+                let cap = w
+                    .capacity_bps
+                    .expect("a congested window carries its capacity");
+                let delivered = 50.0 * 300.0 * 8.0;
+                assert!(
+                    (cap - UPLINK_SAFETY_MARGIN * delivered).abs() < 1e-6,
+                    "{cap}"
+                );
+            }
+        }
+        assert_eq!(
+            first,
+            Some(UPLINK_MIN_WINDOWS as u64 - 1),
+            "after the span's minimum"
+        );
+    }
+
+    /// The ceiling follows the uplink up as well as down: once the cap
+    /// loosens, the backpressured windows deliver more and the p10 rises as
+    /// the tighter windows leave the span.
+    #[test]
+    fn the_capacity_rises_with_the_uplink() {
+        let mut e = EgressMeter::new(1_000, 150);
+        let mut last = 0.0;
+        for t in 0..10u64 {
+            last = second(&mut e, t * 1_000, 50, 300, 40, 50 * 300)
+                .capacity_bps
+                .unwrap_or(last);
+        }
+        let tight = last;
+        for t in 10..45u64 {
+            last = second(&mut e, t * 1_000, 70, 300, 20, 70 * 300)
+                .capacity_bps
+                .unwrap_or(last);
+        }
+        assert!(last > tight * 1.3, "{tight} -> {last}");
+    }
+
+    /// Delivered bytes carry the link's framing: the capacity is reported in
+    /// the units the call layer sends (and prices commitments) in.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn the_capacity_is_in_sent_units() {
+        let mut e = EgressMeter::new(1_000, 150);
+        let mut w = None;
+        for t in 0..UPLINK_MIN_WINDOWS as u64 {
+            // Every delivered byte reads 1.25 on the link.
+            w = Some(second(&mut e, t * 1_000, 50, 300, 40, 50 * 375));
+        }
+        let cap = w.and_then(|w| w.capacity_bps).expect("a verdict");
+        assert!(
+            (cap - UPLINK_SAFETY_MARGIN * 50.0 * 300.0 * 8.0).abs() < 1e-6,
+            "{cap}"
+        );
     }
 }

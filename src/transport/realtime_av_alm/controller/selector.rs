@@ -196,6 +196,8 @@ pub struct ParentSelector<P: PeerRef> {
     parent_changes: u64,
     tiers: BTreeMap<P, Tier>,
     next_r3_probe_ms: u64,
+    /// Since when this node has had no primary (member-tier R3).
+    parentless_since_ms: Option<u64>,
     last_activity_ms: Option<u64>,
     /// When the stream last went from idle to active: silence on a path is
     /// never counted from before it (see `idle_aware_silence`).
@@ -228,6 +230,7 @@ impl<P: PeerRef> ParentSelector<P> {
             parent_changes: 0,
             tiers: BTreeMap::new(),
             next_r3_probe_ms: 0,
+            parentless_since_ms: None,
             last_activity_ms: None,
             activity_since_ms: 0,
             last_full_ms: None,
@@ -295,6 +298,13 @@ impl<P: PeerRef> ParentSelector<P> {
         if let Some(c) = self.cands.get_mut(p) {
             c.eligible = eligible;
         }
+    }
+
+    /// When a chunk of the stream last arrived on any path (call ms), if
+    /// ever: what `AttendeeLeft { Lost }` reads as the stream's silence.
+    #[must_use]
+    pub fn last_activity_ms(&self) -> Option<u64> {
+        self.last_activity_ms
     }
 
     /// The primary parent.
@@ -851,7 +861,8 @@ impl<P: PeerRef> ParentSelector<P> {
     /// flap at the base dwell.
     /// R3's probe target: the best-scoring member-tier candidate that is
     /// viable in every way but advertised room.
-    fn best_member_ignoring_room(&self, now_ms: u64) -> Option<P> {
+    /// `direct_only`: the stream's publisher alone (a depth-0 offer).
+    fn best_member_ignoring_room(&self, now_ms: u64, direct_only: bool) -> Option<P> {
         self.cands
             .iter()
             .filter(|(p, c)| {
@@ -868,6 +879,10 @@ impl<P: PeerRef> ParentSelector<P> {
                             && o.depth.saturating_add(1) <= self.cfg.max_depth
                     })
                     && !matches!(c.health.state(), PeerState::Suspected | PeerState::Down)
+                    && (!direct_only
+                        || c.offer
+                            .as_ref()
+                            .is_some_and(|o| o.depth == 0 && o.ancestry.is_empty()))
             })
             .map(|(p, c)| (p.clone(), self.score(c)))
             .max_by(|a, b| a.1.total_cmp(&b.1))
@@ -1142,6 +1157,11 @@ impl<P: PeerRef> ParentSelector<P> {
         }
 
         // 4. Acquire a primary: the warm standby first.
+        if self.primary.is_some() {
+            self.parentless_since_ms = None;
+        } else {
+            self.parentless_since_ms.get_or_insert(now_ms);
+        }
         let pending_primary = self.cands.values().any(|c| {
             matches!(
                 c.link,
@@ -1185,7 +1205,7 @@ impl<P: PeerRef> ParentSelector<P> {
                 // refuses is that demand.
                 let base = self.cfg.backoff_base_ms * 4;
                 self.next_r3_probe_ms = now_ms + self.cfg.backoff_ms(base, 2, rng);
-                if let Some(p) = self.best_member_ignoring_room(now_ms) {
+                if let Some(p) = self.best_member_ignoring_room(now_ms, false) {
                     out.push(self.request(now_ms, &p, Role::Primary, "R3 probe", log));
                 }
             } else if self.standby.is_none()
@@ -1194,13 +1214,34 @@ impl<P: PeerRef> ParentSelector<P> {
             {
                 // §6.5: no member can serve the full stream. Take audio on the
                 // canonical tier, and keep probing the member tier for the
-                // primary (R3). Without a canonical candidate this is a no-op:
-                // a member-only world waits for room, as stage 1 did.
+                // primary (R3). Without a canonical candidate, see below.
                 if let Some(s) = self
                     .pick(Role::Standby, now_ms, false, rng)
                     .filter(|s| self.cands[s].tier == Tier::Canonical)
                 {
                     out.push(self.request(now_ms, &s, Role::Standby, "audio fallback", log));
+                }
+            } else if !self.cands.values().any(|c| c.tier == Tier::Canonical)
+                && self
+                    .parentless_since_ms
+                    .is_some_and(|t| now_ms.saturating_sub(t) >= self.cfg.down_silence_ms)
+                && now_ms >= self.next_r3_probe_ms
+            {
+                // R3 in a member-only world: a node that has had no parent for
+                // `down_silence_ms`, with nobody advertising room, ASKS the
+                // stream's publisher anyway, on the same jittered backoff.
+                // The publisher is the one node that always holds the stream,
+                // and its refusal is the demand its admission grows on. It
+                // used to wait for room in silence: shed by its publisher
+                // under a cap, nobody asked, the publisher's offer showed no
+                // room until its ceiling went stale, and nothing grew (avmesh4,
+                // m1 and m3 for the 60 s after the cap lifted). Only the
+                // publisher, and only after the wait, so an ordinary failover
+                // (which finds room) and the relays never see these asks.
+                let base = self.cfg.backoff_base_ms * 4;
+                self.next_r3_probe_ms = now_ms + self.cfg.backoff_ms(base, 2, rng);
+                if let Some(p) = self.best_member_ignoring_room(now_ms, true) {
+                    out.push(self.request(now_ms, &p, Role::Primary, "R3 probe", log));
                 }
             }
         }
@@ -1283,7 +1324,7 @@ impl<P: PeerRef> ParentSelector<P> {
                     // is released then (`on_decision`).
                     let base = self.cfg.backoff_base_ms * 4;
                     self.next_r3_probe_ms = now_ms + self.cfg.backoff_ms(base, 2, rng);
-                    if let Some(n) = self.best_member_ignoring_room(now_ms) {
+                    if let Some(n) = self.best_member_ignoring_room(now_ms, false) {
                         out.push(self.request(now_ms, &n, Role::Standby, "R3 probe", log));
                     }
                 }
@@ -1716,5 +1757,31 @@ mod tests {
         assert!(matches!(s.primary(), Some(&2 | &3)));
         assert_ne!(s.standby(), Some(&9), "{acts:?}");
         assert!(!s.video_unavailable());
+    }
+
+    /// A member with no parent and no candidate advertising room still asks
+    /// (R3 on the member tier), on its jittered backoff. avmesh4 (C): shed by
+    /// m0 under a cap, m1 and m3 never asked m0 again in the 60 s after the
+    /// cap lifted (m0 refused nothing on its own stream), because m0's offer
+    /// showed no room. Mutation (v44.1.1): a member-only world waits for
+    /// room in silence, and no subscribe to the publisher is ever sent.
+    #[test]
+    fn a_member_with_no_parent_asks_the_publisher_without_room() {
+        let cfg = ControllerConfig::interactive();
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2, 3]);
+        // The publisher (2) offers no room, and no relay offers at all.
+        let acts = drive(&mut s, &cfg, 0, 20_000, &[(2, 0, 20.0)]);
+        assert!(
+            acts.iter().any(|a| matches!(
+                a,
+                SelectorAction::Subscribe {
+                    parent: 2,
+                    role: Role::Primary
+                }
+            )),
+            "{acts:?}"
+        );
+        assert_eq!(s.primary(), Some(&2), "admitted: the ask was the demand");
     }
 }

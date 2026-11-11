@@ -962,8 +962,12 @@ tempfile       = { version = "3", optional = true }
 # propose), `NodeEvent::{RelayRouteLearned, ChannelMessageExpired}` and
 # `Error::NoRouteViaRelay` (logged only for now), and the +572-commit upstream
 # sync.
-leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.2", version = "0.34", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.2", version = "0.34", optional = true }
+# v0.34.0+ciris.3 (52826cd2) — `LinkHandle::try_send_seq` returns a Channel
+# send's sequence and `ReticulumNode::link_seq_stats` (`LinkSeqStats`,
+# `delivered_through`) proves it delivered. Additive: `LinkStats`, the wire
+# and the `send_on_link` error mapping are unchanged.
+leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.3", version = "0.34", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.3", version = "0.34", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -973,7 +977,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.2", version = "0.34", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.34.0+ciris.3", version = "0.34", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
@@ -1704,6 +1708,22 @@ inherits = "release"
 debug = "full"
 strip = "none"
 incremental = false
+
+# Debug builds check one Ed25519 source signature per media chunk
+# (`av_chunk_auth::check_timed`), and a strict verify at opt-level 0 costs
+# about 4.8 ms (measured 2026-11-10, tests/alm_mesh_stage2.rs
+# `chunk_sig_cost_us`). A receiver then clears about 200 chunks a second,
+# where one 1 Mbit/s video stream at the 246 B frame budget of a 431 B link
+# sends about 470: the room-call witnesses measured the build, not the call.
+# These three crates carry that cost. Release profiles are not touched.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
 
 # Multi-container mesh harness (bench-mesh/). ONE edge occurrence per
 # process: its own federation seed, its own leviculum transport identity,

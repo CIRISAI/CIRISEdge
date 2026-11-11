@@ -19,7 +19,7 @@ encoded by `unsigned_body` (`:501`) and `to_bytes` (`:569`), and parsed by
 
 | # | Member | Encoding | Bytes |
 |---|---|---|---|
-| 1 | version | `u8`, must be `0x01` (`BINDING_VERSION`, `:135`) | 1 |
+| 1 | version | `u8`: `0x01` (`BINDING_VERSION`), or `0x02` for a v2 binding (§1.8) | 1 |
 | 2 | room | `u16` BE length, then UTF-8 (the community key id) | 2 + n |
 | 3 | publisher | `u16` BE length, then UTF-8 (the publisher's federation key id) | 2 + n |
 | 4 | join_nonce | raw | 32 |
@@ -222,6 +222,307 @@ node's next roll (one 250 ms watch tick, or the next `publish`), the departed
 member's leg is still on the roster. A re-announce in that window would send
 it the current binding, which it already holds as a member of the epoch.
 
+### 1.8 The v2 binding: the codec map, `replaces`, `end`, `final_seq` (v45)
+
+**Status: a CC reading (rc17) of 5.3.3.2.1–.3, pending text.** The per-class
+codec map and the in-place stream replacement are not yet CC text; they
+become text once this layout and its vectors exist. Class `0x04` is rc17
+text.
+
+The chunk header's `codec_id` carries the layer CLASS only (`0x01` SVC,
+`0x04` temporal-layered, `0xFF` codec-opaque); the stream's binding names the
+codec of each class it uses. One stream per publisher carries its audio and
+video (P5): a phone's stream is `{0x04: h264, 0xFF: opus}`, an audio-only one
+`{0xFF: opus}`.
+
+A v2 binding is the v1 binding with member 1 `version = 0x02` and these
+members after member 7 (`chunk_key`):
+
+| # | Member | Encoding | Bytes |
+|---|---|---|---|
+| 7a | codecs | `u8 count` (0..=8), then per class, sorted by class, no class twice: `class u8 ‖ u16_be len ‖ token` (1..=32 bytes of printable ASCII) | 1 + Σ(3 + len) |
+| 7b | replaces | `u8 present` (0 or 1), then, when 1, the publisher's earlier `stream_id` this one replaces in place | 1 or 33 |
+| 7c | end | `u8`: 0 live; 1 left; 2 left, backgrounded; 3 this stream ended, not a leave (CC reading rc18) | 1 |
+| 7d | final_seq | only when `end` ≠ 0: `u64` BE, the last `chunk_seq` the publisher sealed in this epoch (`u64::MAX`: none); for a framed stream, the last fragment's | 0 or 8 |
+| 7e | kind | `u8`: 0 media, 1 share (CC reading rc18). Any value parses; an unknown one renders as media. Gates nothing: not admission, keys, sealing, the trailer, shedding or keeping | 1 |
+| 7f | framing | `u8`: 0 one frame per chunk, no marker; 1 every chunk whose `codec_id` is not `0xFF` starts with the fragment marker (§1.9). Any other value is malformed. Fixed per (stream, epoch) | 1 |
+
+`count` 0 (no map) is allowed: a v2 binding always states its `kind` and
+`framing`, so one with no map, no replacement and no end still says
+"framing 0". A v45 publisher signs a v2 binding for every stream (flag for
+the CC: this lifts rc17's "an empty map only with `end` or `replaces`"), so
+a v2 receiver learns every stream's framing from a signed binding. A v1
+binding reads as `kind` 0 and `framing` 0.
+
+Offsets: members 7a–7f follow `chunk_key` in order, so with `L` = the end of
+member 7 and `m` = the map's length (1 + Σ(3 + len)), `replaces` is at `L +
+m`, `end` at `L + m + r` (`r` = 1 or 33), `final_seq` at `L + m + r + 1` when
+`end` ≠ 0, then `kind` and `framing` (at `L + m + r + 1 + f` and one past it,
+`f` = 0 or 8).
+
+`end` is per stream. 1 and 2 say the member left, and a receiver takes them
+as a leave only on the member's last live stream; on another stream they end
+that stream only. 3 ends the stream and is never a leave, even on the last
+one: presence is reachability, never "no streams" (the member attends with
+no live stream until it leaves, is lost or is removed). A share ends with 3;
+a hang-up ends each share with 3, then the camera with 1 or 2.
+
+Members 1–7f are the v2 unsigned body. The signing bytes use their own
+domain tag:
+
+```
+signed_bytes_v2 = "ciris-edge:av-stream-key:v2"   (27 bytes ASCII)
+                ‖ unsigned_body_v2                (members 1–7f as encoded)
+```
+
+The hybrid signature is made as in §1.2 over `signed_bytes_v2`.
+
+Registered tokens:
+
+A token names the whole payload format: the codec and its bitstream
+framing, so two implementations that agree on the token agree on the bytes
+(CC reading, rc18). The payload is one chunk's plaintext, or one reassembled
+frame's on a framed stream (§1.9).
+
+| Token | Class | Payload (one frame) |
+|---|---|---|
+| `av1` | `0x01` (SVC) | one temporal unit's OBUs for one layer, in AV1's low-overhead bitstream format |
+| `h264` | `0x04` (temporal-layered) | one access unit in Annex B byte-stream format (ITU-T H.264 Annex B) |
+| `opus` | `0xFF` (codec-opaque) | one Opus packet (RFC 6716), no container |
+
+Only these three are registered. Any other spelling (`vp8` and `vp9`
+included) binds under the unknown-token rule: the class is undecodable and
+its chunks are dropped `av_chunk_class_undecodable`; the binding is not
+malformed. The token table is CC's to register.
+
+Parse rules. These are refused as `av_binding_malformed`:
+- a registered token under a class that is not its own;
+- a token of 0 or more than 32 bytes, or one that is not printable ASCII;
+- a map with more than 8 entries, out of class order, or with a class twice;
+- a `present` byte other than 0 or 1;
+- an `end` byte above 3, or a `framing` byte above 1.
+
+An **unregistered** token binds: on this receiver its class is undecodable,
+so a codec registered later never takes the audio away from an older client.
+
+Rules:
+- **Chunk class.** On a stream whose v2 binding named a map, a chunk's
+  `codec_id` class is checked after its signature verifies
+  (`ChunkAuth::check_timed`):
+  - no entry for the class: refused `av_chunk_class_unlisted`;
+  - an unregistered token: dropped here, `av_chunk_class_undecodable`,
+    counted `undecodable`. The binding stands and the other classes play.
+
+  A v1-only stream is not checked. v44 sends video as `0x01` under a v1
+  binding, so a v2 receiver checking it would break v44↔v45 video.
+- **The map is fixed for the stream's life.** A later v2 binding for the same
+  stream naming another map, in the same or any later epoch, is refused
+  `av_binding_codec_changed`. Dropping or adding a class is another map.
+  Changing codec is `Call::replace_stream`: a new join nonce, so a new
+  stream, whose v2 binding says `replaces: <old stream>`.
+- **`end` is final.** `end = 1` and `end = 2` are both final leaves.
+  - Once a receiver verified either for a stream, it takes no further binding
+    for that stream, `end = 0` included: `av_binding_stream_ended`, refused
+    before any hybrid verification.
+  - A return is a new stream. No signed binding means "backgrounded and
+    still present": on background a client leaves and reports
+    `backgrounded`.
+  - The ended streams are remembered apart from the bound ones (256). A
+    replayed old end can neither evict a live stream nor end a new one.
+- **`final_seq` closes the tail**, standing in for 5.3.3.1's terminator.
+  - A chunk whose `chunk_seq` is above a verified `final_seq` for its
+    `(stream, epoch)` is refused `av_chunk_past_end` and never played.
+  - The verdict waits the longest reorder window (`END_VERDICT_AFTER` =
+    `REORDER_WINDOW_MAX`, 400 ms) after the end lands, read at the next
+    watch tick, because tail chunks up to `final_seq` may still be in flight
+    behind it. Those still verify and play. The `AttendeeLeft` for the end
+    is emitted then, not when the end lands.
+  - A receiver that still has not verified up to `final_seq` by then reports
+    the tail as truncated: the `truncated` counter (once per stream),
+    `av_call_stream_truncated`, and the `truncated` field of
+    `CallEvent::AttendeeLeft`. Chunks past `final_seq` never count.
+- **`replaces` and `end` count only as signed.** A receiver learns that a new
+  stream replaces an old one, or that a stream ended and why, only from these
+  verified members. No unsigned control frame announces either, so a relay
+  cannot take a tile down. A second stream of a publisher with no `replaces`
+  (a screen share, say) stays a separate stream.
+- **A share is a second own stream** (v45, `Call::add_stream`; CC reading
+  (rc17), pending text). It has its own join nonce, stream id, epoch DEK,
+  chunk key, v1/v2 bindings and codec map, and its chunks ride the
+  publisher's existing legs. ALM gives it its own parent-0 admission, so its
+  children and shedding are apart from the camera's. Its signed end
+  (`Call::end_stream`) is `CallEvent::StreamEnded` at a receiver while the
+  publisher has another live stream; only the last stream's end is
+  `AttendeeLeft`, and a `Lost` or `Removed` member is one `AttendeeLeft`
+  naming its oldest stream. A publisher holds at most `MAX_OWN_STREAMS` (3)
+  at once, one place under the receiver's four newest. An ended stream
+  leaves that list at once and its keys go at its verdict, so ending shares
+  never pushes the camera out.
+- **A binding is no presence.** An `end = 0` binding alone makes nobody an
+  attendee: an `AttendeeLeft` fires only for a stream this receiver verified
+  a chunk of (`ChunkAuth::heard`). Attendance otherwise comes from the
+  `chat:call:v1` row (`AttendeeJoined`, `attendees()`) and live chunks.
+- **v1 and v2 side by side.** A v1-only receiver refuses version 2 as
+  malformed. So a publisher that names codecs, replaces a stream, or ends one
+  signs a v1 binding for each epoch, and a v2 binding when it has v2 members.
+  - It sends v1 on every leg.
+  - It sends v2 additionally to each peer whose C3 `CAPS` carry bit 5
+    (`CAP_BINDING_V2`): at the epoch roll, at the reannounce, and on that
+    peer's first `CAPS`.
+  - Both encodings bind the same chunk key, and a receiver holds both.
+  - A member relay forwards the v1 encoding to every leg and the v2 one only
+    to the legs with bit 5. So a v1 peer behind a v2 relay still binds
+    (`a_v1_peer_behind_a_v2_relay_still_binds_and_hears`).
+  - A v1-only peer cannot read a signed end and sees the leaver as `Lost`.
+- **Delivery, not timers.** A leave closes each leg once that leg's Channel
+  proved the signed end delivered. A replacement switches to the new stream
+  once every leg's Channel proved the new bindings delivered. The proof is
+  per message: right after the send, edge reads each leg's newest Channel
+  sequence, and waits until the oldest message still unproved on that leg
+  was sent after it (`AvLinkStats::delivered_through`, leviculum
+  +ciris.3). Media sent meanwhile keeps the tx ring busy but does not hide
+  the proof. A datagram leg's binding rides its Channel too. The ceilings
+  (2 s and 3 s) are safety nets, counted `end_flush_unconfirmed` and
+  `replace_switch_unconfirmed`.
+
+KAT (`binding_v2_signed_bytes_kat`), with the inputs of §5. Vector 1 is the
+map `{0x04: h264, 0xFF: opus}`, no `replaces`, `end` 0:
+
+```
+63697269732d656467653a61762d73747265616d2d6b65793a7632020008726f6f6d2d6b6174
+000a6e6f64652d6b61742d610707070707070707070707070707070707070707070707070707
+070707070707c7adfc999afbc7643b24eab3b57ca66540315d345e52bbb33cfa1d5dfb9c18d8
+00000000000000050b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e3
+9f2d0204000468323634ff00046f70757300000000
+```
+
+Vector 2 is the same map, `replaces` stream `aa`×32, `end` 1 (left),
+`final_seq` 42. Everything up to `9f2d` is identical to vector 1:
+
+```
+…9f2d0204000468323634ff00046f70757301aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+aaaaaaaaaaaaaaaaaaaaaaaa01000000000000002a0000
+```
+
+Vector 3 (v45, rc18) is the same map, no `replaces`, `end` 3 (this stream
+ended), `final_seq` 9, `kind` 1 (share), `framing` 1:
+
+```
+…9f2d0204000468323634ff00046f707573000300000000000000090101
+```
+
+Both are the v1 signed bytes of the same inputs with the v2 domain, version
+`02`, and the v2 members appended; the v1 signed bytes themselves are
+unchanged. The v2 signatures' KAT values are pinned at the first build of
+this branch.
+
+### 1.9 Frame fragmentation (v45, CC reading rc18, pending text)
+
+A frame larger than one chunk is split BEFORE the seal: every fragment is a
+whole chunk with its own `chunk_seq`, inner and outer seal and trailer. The
+clear header, relays, the DAG and the 5.3.3.4 pull see chunks only, and no
+sealed chunk is ever split (5.3.3.2.3).
+
+- **Which chunks carry the marker.** On a stream whose binding signs
+  `framing = 1`, every chunk whose `codec_id` is not `0xFF` starts its
+  plaintext with `frag_index u16_be ‖ frag_count u16_be ‖ frame_seq u32_be`
+  (8 bytes), a whole frame included (`0000 0001 ‖ frame_seq`), so the layout
+  never depends on size. `frame_seq` counts the stream's frames per (codec
+  class, layer) from 0 for the stream's whole life, where the layer is the
+  whole `ChunkLayer` triple of the chunk's clear codec block (`spatial`,
+  `temporal`, `quality`): the key is (stream, class, spatial, temporal,
+  quality), the same three bytes a relay's layer filter reads, every fragment of a
+  frame carrying the same value (Eric, 2026-11-10). It does NOT restart at
+  an epoch roll (unlike `chunk_seq`), so a frame lost across a roll is
+  still a gap; a frame's fragments stay within one epoch; a replaced stream
+  starts again at 0. One stream shares one `chunk_seq` across audio and
+  video, so only `frame_seq` tells a lost video frame from lost audio, and
+  per layer it tells a lost frame from one of a layer the receiver is not
+  being sent (a standby's base-only, its own cap, `request_layers`, SVC). A
+  receiver counts a gap as lost frames of that (class, layer)
+  (`Call::frames_lost_by_layer`) only when both ends of the gap arrived in
+  one receive view of that stream (the call bumps a stream's view only on
+  its own layer request for it and on a parent's shed or decision on it, so
+  a loss on a layer it is steadily getting is always counted); the first
+  frame of a layer starts its count. A base-layer `(0,0,0)` gap means freeze until the next keyframe. Audio
+  (`0xFF`) chunks never carry it. A receiver picks the layout from the
+  signed `codec_id` (verified with the trailer before the inner seal opens),
+  never from length. Edge frames a stream whose codec map names a non-`0xFF`
+  class; an audio-only or map-less stream is published with `framing = 0`.
+- **The run.** A frame's fragments take consecutive `chunk_seq`s in one
+  epoch, all with the frame's `codec_id` and layer: the publisher seals them
+  under the lock the roll takes, so a frame never straddles an epoch. A run
+  that would pass the epoch's 2³² `chunk_seq` ceiling is refused before the
+  first seal (`chunk_seq_exhausted`): the epoch rolls first. `final_seq` is
+  the last fragment's `chunk_seq`.
+- **Budget.** Fragments are cut to the call's `chunk_plaintext_budget` (the
+  minimum over its legs, §3), so an MTU-500 member still gets video; each
+  fragment carries `budget − 8` media bytes. At most 4096 fragments
+  (`frag_count` stays a `u16`) and at most 1 MiB reassembled, whichever
+  binds first: a larger frame is refused before sealing (`frame_too_large`,
+  budget `min(4096 × (budget − 8), 1 MiB)`). At MTU 500 that is 966,656 B
+  (4096 × 236); at MTU 1400 the 1 MiB cap binds (4096 × 1,132 would be
+  4,636,672 B). A 1080p desktop keyframe fits at both. An unframed stream
+  keeps the one-chunk refusal.
+- **The binding comes first; a framed chunk is never parsed unframed.** A
+  publisher (and a member relay) sends a stream's v2 binding before its v1
+  on every leg whose peer advertises `CAP_BINDING_V2`, at every roll,
+  replacement, share and re-announce. A leg's first binding (before its
+  CAPS) is v1, and on a datagram leg a chunk can overtake the Channel, so
+  the receiver also guards: a non-audio chunk released while only its
+  `(stream, epoch)`'s v1 binding is held waits, in order, until the v2
+  binding installs (then it goes on with the signed framing) or the hold
+  passes (`REORDER_WINDOW_MAX`, then it is dropped `av_frame_framing_unknown`).
+  It goes on as unframed at once only when no v2 can be coming: the receiver
+  does not advertise bit 5, or the publisher's own CAPS lack it.
+- **Receiver bounds.** Each (stream, layer) holds at most one open frame
+  (a new frame's first fragment on that layer closes the old,
+  `av_frame_incomplete`): for `av1` one frame is one layer of a temporal
+  unit, and on a datagram leg layer 1's first fragments may come before
+  layer 0's last, so a per-stream slot would drop the base layer. A stream
+  holds at most 16 layer slots; past that, the slot with the oldest open
+  frame closes. A frame whose fragments pass 1 MiB is dropped
+  `av_frame_too_large`. A fragment that continues another layer's open
+  frame by `chunk_seq` drops that frame `av_frame_layer_mismatch`.
+  `ReorderCounts` carries `frames_open` and `frames_dropped`.
+- **What a receiver hands out.** One `ReceivedFrame` per whole frame, the
+  markers removed. It carries its FIRST fragment's `chunk_seq`, epoch,
+  codec and layer, the marker's `frame_seq`, and `source_ts_ms`: the first
+  fragment's trailer-signed publisher timestamp (UNIX ms, verified with the
+  trailer; no wire change), the lip-sync clock. Audio and unframed chunks
+  carry `frame_seq = None` and their own `source_ts_ms`.
+- **Sending.** A leg that fails one fragment (congested, too large, gone)
+  gets none of the rest of that frame: a partial frame is worth nothing.
+- **Receiving.** The reorder window orders and dedupes per chunk as before.
+  A missing fragment is a missing chunk: the window, and the pulls inside it,
+  wait for it by `chunk_seq`; only once the window gives it up is the frame
+  dropped whole, counted, never handed out partial. The window's jitter
+  estimate is the gap between two legs' copies of the same chunk, so
+  back-to-back fragments do not shrink it.
+- **Refusals, receiver-only** (a relay never opens the inner seal, so it
+  never sees a marker). Each is an `av_plane` counter and drops the frame:
+
+| Token | Meaning |
+|---|---|
+| `av_frame_marker_short` | a framed chunk's plaintext is shorter than the marker |
+| `av_frame_count_invalid` | `frag_count` is 0 or over 256 |
+| `av_frame_index_invalid` | `frag_index` ≥ `frag_count` |
+| `av_frame_count_mismatch` | a fragment's `frag_count` differs from its frame's |
+| `av_frame_layer_mismatch` | a fragment's `codec_id` or layer differs from its frame's |
+| `av_frame_crosses_epoch` | a fragment's epoch differs from its frame's |
+| `av_frame_seq_mismatch` | a fragment's `frame_seq` differs from its frame's |
+| `av_frame_incomplete` | a fragment the reorder window gave up on; the frame dropped whole, once |
+| `av_frame_too_large` | a frame whose fragments pass 1 MiB |
+| `av_frame_framing_unknown` | a non-audio chunk held for its stream's v2 binding past the hold; never parsed unframed |
+
+KATs (`framed_chunk_kats_with_the_shipping_trailer`), with the inputs of §5,
+codec `0x04`, layer (0,0,0): a whole frame `kat-frame` in one framed chunk
+(chunk_seq 0, marker `0000 0001 00000000`), and the 30-byte frame
+`kat-frag-frame-012345678901234` at an 18-byte budget in three fragments
+(chunk_seq 1–3, markers `0000 0003`, `0001 0003`, `0002 0003`, each ‖
+`00000001`: frame_seq 1). Each value is the chunk's inner ciphertext ‖ trailer;
+they are pinned at the first build of this branch.
+
 ## 2. The 72-byte trailer (v2: source timestamp + signature)
 
 > **CHANGED in ALM stage 2 (edge v44.0.0) — FLAG FOR THE CC (5.3.3.2.3).**
@@ -308,10 +609,10 @@ max plaintext after    = channel_limit − 84 − 72 = channel_limit − 156    
 
 `link_mdu` is leviculum's `floor((mtu − 1 − 19 − 48) / 16) × 16 − 1`.
 
-| Link MTU | link MDU | Channel limit | Max plaintext before | after | Binding parts (KAT size) |
-|---|---|---|---|---|---|
-| 500 (base) | 431 | 400 | 316 | 244 | 10 × ≤400 B |
-| 1400 (punched direct, `direct_path.rs:666`) | 1327 | 1296 | 1212 | 1140 | 3 × ≤1296 B |
+| Link MTU | link MDU | Channel limit | Max plaintext before | after | Fragment media (after − 8) | Largest framed frame | Binding parts (KAT size) |
+|---|---|---|---|---|---|---|---|
+| 500 (base) | 431 | 400 | 316 | 244 | 236 | 966,656 B (4096 × 236) | 10 × ≤400 B |
+| 1400 (punched direct, `direct_path.rs:666`) | 1327 | 1296 | 1212 | 1140 | 1,132 | 1,048,576 B (the 1 MiB cap) | 3 × ≤1296 B |
 
 The call refuses a frame over the budget before sealing it. A smaller MTU
 shrinks every number in the row.
@@ -336,9 +637,14 @@ forwarder runs none of this and emits none of them. Each refusal:
 | `av_binding_stream_not_derived` | stream id ≠ `call_stream_id(room, publisher, nonce)` | `av_call_binding_refused` |
 | `av_binding_signature_unverified` | hybrid signature not `HybridVerified` | `av_call_binding_refused` |
 | `av_binding_stale_epoch` | epoch older than the two held for the stream | `av_call_binding_refused` |
+| `av_binding_codec_changed` | a v2 binding naming another codec map than its stream is bound to (§1.8) | `av_call_binding_refused` |
 | `av_chunk_unbound` | no verified binding for the chunk's `(stream, epoch)`; this covers an unknown stream, and an epoch whose key was dropped two rolls ago | `av_call_frame_unbound` |
 | `av_chunk_trailer_missing` | inner unit shorter than 72 bytes | `av_call_frame_forged` |
 | `av_chunk_trailer_invalid` | trailer does not verify under the bound key | `av_call_frame_forged` |
+| `av_binding_stream_ended` | a binding for a stream whose signed end was already verified (§1.8) | `av_call_binding_refused` |
+| `av_chunk_class_unlisted` | the stream's v2 codec map names no codec for the chunk's class (§1.8) | `av_call_frame_unbound` |
+| `av_chunk_class_undecodable` | the map's codec for the chunk's class is unregistered here; dropped, the binding standing (§1.8) | `av_call_frame_unbound` |
+| `av_chunk_past_end` | the chunk's `chunk_seq` is above its stream's signed `final_seq` (§1.8) | `av_call_frame_unbound` |
 
 A successfully installed binding counts `av_call_binding_installed`.
 
@@ -408,8 +714,11 @@ no A/V outer seal and no hop counter; the E1 link seal covers it.
 
 ```
 frame = "CALM" ‖ 0x01 ‖ kind ‖ body
-CAPS 0x01: caps u32_be (bit 0 C3 v1, bit 1 timed Channel frames, bit 2 offers relay)
-SUBSCRIBE 0x02: stream[32] ‖ role u8 (0 primary, 1 standby) ‖ flags u8 (bit 0 forward-capable)
+CAPS 0x01: caps u32_be (bit 0 C3 v1, bit 1 timed Channel frames, bit 2 offers relay,
+           bit 3 link datagrams, bit 4 layer cap on SUBSCRIBE (lever, default off),
+           bit 5 parses v2 bindings)
+SUBSCRIBE 0x02: stream[32] ‖ role u8 (0 primary, 1 standby) ‖ flags u8 (bit 0 forward-capable,
+           bit 1 layer cap follows) [‖ mode u8 = 1 ‖ max_spatial ‖ max_temporal ‖ max_quality]
 UNSUBSCRIBE 0x03: stream[32]
 ADMIT 0x04: stream[32] ‖ role u8
 REFUSE 0x05: stream[32] ‖ reason u8 ‖ retry_after_ms u32_be

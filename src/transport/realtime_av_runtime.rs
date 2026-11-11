@@ -336,6 +336,36 @@ impl AvPublisher {
         Ok(())
     }
 
+    /// v45 — `Call::replace_stream`: this publisher now publishes `stream`
+    /// (a fresh join nonce's) at the same epoch under `stream`'s DEK, its
+    /// chunk counter back to 0. The dispatcher, and so every leg's outer
+    /// `link_seq`, carries on untouched: the inner nonce is new because the
+    /// stream id is, and no leg's transit keystream restarts. Room-keyed
+    /// publishers only.
+    ///
+    /// # Errors
+    /// [`AvRuntimeError::NotRoomKeyed`] for a session-keyed publisher.
+    pub fn replace_room_stream(
+        &mut self,
+        stream: StreamId,
+        dek: EpochDek,
+    ) -> Result<(), AvRuntimeError> {
+        let AvKeySource::Room { community_key_id } = &self.key_source else {
+            return Err(AvRuntimeError::NotRoomKeyed);
+        };
+        tracing::info!(
+            from = %stream_tag(self.stream_id),
+            to = %stream_tag(stream),
+            room = %community_key_id,
+            epoch = self.epoch.0,
+            "AV publisher REPLACE: a new stream in place of the old (v45), chunk_seq back to 0"
+        );
+        self.stream_id = stream;
+        self.dek = dek;
+        self.next_chunk_seq = 0;
+        Ok(())
+    }
+
     /// CIRISEdge#805 item 5 — the next chunk's epoch-local sequence number.
     #[must_use]
     pub fn next_chunk_seq(&self) -> ChunkSeq {
