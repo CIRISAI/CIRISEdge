@@ -3,7 +3,7 @@
 # v45.0.0 — the fewest store reads, a late joiner's history, and exact pins
 
 **2026-11-10.** **MAJOR.** Pins: persist v61.2.2 (exact, Python too), CIRISVerify v22.2.0
-(rusqlite 0.41.1 / libsqlite3-sys 0.39.1, RUSTSEC-2026-0459 cleared), leviculum v0.34.0+ciris.2.
+(rusqlite 0.41.1 / libsqlite3-sys 0.39.1, RUSTSEC-2026-0459 cleared), leviculum v0.34.0+ciris.3.
 MSRV 1.92.
 
 **Consumer notes** (detail in CHANGELOG.md):
