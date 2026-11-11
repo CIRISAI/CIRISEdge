@@ -30,7 +30,9 @@ mod common;
 
 use ciris_edge::identity::{sign_bound_hybrid, LocalSigner};
 use ciris_edge::observability::RoundOutcome;
-use ciris_edge::replication::attestation_bind::owner_binding_attestation;
+use ciris_edge::replication::attestation_bind::{
+    bind_attestation_envelope, owner_binding_attestation, AttestationColumns,
+};
 use ciris_edge::replication::{
     self_publish_set, EnvelopeKind, InboundRouter, ReplicationPeer, ReplicationRuntime,
     ReplicationRuntimeConfig, SchedulerConfig,
@@ -833,8 +835,14 @@ async fn bootstrap_rounds_root_the_client_and_the_seats_round_rides_its_link_971
             .await,
             "the client's bootstrap rounds carry its route row to the seat"
         );
+        // The seat holds the row before the client has read the seat's
+        // reply, so the client books its round a moment after the wait above
+        // returns. The bound is one round's own reply timeout.
         assert!(
-            c.outcomes(RoundOutcome::Completed) > 0,
+            wait_until(Duration::from_secs(15), || async {
+                c.outcomes(RoundOutcome::Completed) > 0
+            })
+            .await,
             "the client's own rounds complete: {}",
             c.all_outcomes()
         );
@@ -1555,13 +1563,89 @@ async fn a_bundle_seat_is_asked_by_pull_and_its_idle_cost_does_not_grow_with_k_9
     );
 }
 
+/// A labelled acceptance edge `node → root` (`trust:accepts:v1`, persist
+/// #973), as a node's seed writes one toward a key root. Signed by the node.
+async fn accepts_root(node: &Ident, root: &Ident) -> Attestation {
+    let asserted_at = chrono::Utc::now();
+    let attestation_id = {
+        let mut h = sha2::Sha256::new();
+        h.update(b"accepts");
+        h.update(node.key_id.as_bytes());
+        h.update(root.key_id.as_bytes());
+        format!("accepts-{}", &hex::encode(h.finalize())[..24])
+    };
+    let subjects = vec![root.key_id.clone()];
+    let mut envelope = serde_json::json!({
+        "id": attestation_id,
+        "attesting_key_id": node.key_id,
+        "attested_key_id": root.key_id,
+        "attestation_type": "delegates_to",
+        "scope": ["infra:attest", "infra:serve"],
+        "dimension": ciris_persist::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+    });
+    bind_attestation_envelope(
+        &mut envelope,
+        asserted_at,
+        &AttestationColumns {
+            attestation_id: &attestation_id,
+            attesting_key_id: &node.key_id,
+            attestation_type: "delegates_to",
+            attested_key_id: &root.key_id,
+            subject_key_ids: &subjects,
+            cohort_scope: "federation",
+            weight: None,
+        },
+    );
+    let asserted_at =
+        ciris_edge::replication::attestation_bind::truncate_to_substrate_resolution(asserted_at);
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
+    let digest = sha2::Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) = sign_bound_hybrid(&node.signer(), &canonical, "accepts")
+        .await
+        .expect("hybrid sign");
+    Attestation {
+        attestation_id,
+        attesting_key_id: node.key_id.clone(),
+        attested_key_id: root.key_id.clone(),
+        attestation_type: "delegates_to".to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: node.key_id.clone(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: "federation".to_owned(),
+        tier: "federation".to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    }
+}
+
 /// (d)-2 stage 3 — claim the device: the owner signs the binding on the
 /// device (as the claim writes it locally), and both sides hold the owner's
-/// key. A second node of the same owner has its occurrence at the seat only
-/// (its key is known to both, as an announced owned node's is): the owner
-/// Pull on the occurrence plane is the path that delivers it. Its ROUTE is
-/// not in (d): an owned node's route comes from its owner (CC
-/// CLM-route-handed-by-owner, CIRISEdge#972). Returns (owner, sibling).
+/// key. A second node of the same owner is ANNOUNCED at the seat (the owner's
+/// federation-scope binding, then its occurrence; its key is known to both):
+/// the owner Pull on the occurrence plane is the path that delivers it.
+///
+/// Two rows the delivery needs do not travel on the (d) planes, and are
+/// seeded here as another path leaves them (CIRISEdge#979): the seat answers
+/// a third-party lookup only under a mutual trust root, so the seat holds its
+/// own and the device's acceptance of one root; and the device admits a
+/// sibling's node-signed occurrence only with the owner's binding of that
+/// sibling, so the device holds it.
+///
+/// An unannounced sibling is not in (d): the seat serves its occurrence only
+/// to the owner's own set (`identity_row_occurrence_unowned`), and this
+/// device's claim is not held at the seat. Its ROUTE is not in (d) either: an
+/// owned node's route comes from its owner (CC CLM-route-handed-by-owner,
+/// CIRISEdge#972). Returns (owner, sibling).
 async fn claim_with_an_owned_sibling(m: &BundleMesh) -> (Ident, Ident) {
     let owner = Ident::new("person-971d-owner", 0xb3).await;
     m.device
@@ -1571,18 +1655,21 @@ async fn claim_with_an_owned_sibling(m: &BundleMesh) -> (Ident, Ident) {
         })
         .await
         .expect("the owner's key at claim");
-    put(
-        &m.device.dir,
-        owner_binding_attestation(
-            &owner.key_id,
-            &m.device.key.key_id,
-            chrono::Utc::now(),
-            &owner.signer(),
-        )
-        .await
-        .expect("owner binding"),
+    // The claim is a write behind the bridge, so the host notes it, as the
+    // release notes tell a host to: the device's own "unowned" answer is
+    // memoized for 30 s, and without the note the next timer cycle would
+    // still read it and ask about no owner.
+    let written_after = chrono::Utc::now();
+    let claim = owner_binding_attestation(
+        &owner.key_id,
+        &m.device.key.key_id,
+        chrono::Utc::now(),
+        &owner.signer(),
     )
-    .await;
+    .await
+    .expect("owner binding");
+    put(&m.device.dir, claim.clone()).await;
+    let _ = m.rt_device.note_local_write(&claim, written_after).await;
     m.seat
         .dir
         .put_public_key(ciris_persist::prelude::SignedKeyRecord {
@@ -1590,13 +1677,33 @@ async fn claim_with_an_owned_sibling(m: &BundleMesh) -> (Ident, Ident) {
         })
         .await
         .expect("the owner's key at the seat");
+    // The mutual root (CIRISEdge#979): both acceptances, held at the seat.
+    let root = Ident::new("root-971d", 0xb5).await;
+    m.seat
+        .dir
+        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: root.record("user").await,
+        })
+        .await
+        .expect("the root's key at the seat");
+    put(&m.seat.dir, accepts_root(&m.seat.key, &root).await).await;
+    put(&m.seat.dir, accepts_root(&m.device.key, &root).await).await;
     let sibling = Ident::new("ciris-client-971d-sibling", 0xb4).await;
+    let sibling_binding = owner_binding_attestation(
+        &owner.key_id,
+        &sibling.key_id,
+        chrono::Utc::now(),
+        &owner.signer(),
+    )
+    .await
+    .expect("the sibling's announced owner binding");
     for dir in [&m.seat.dir, &m.device.dir] {
         dir.put_public_key(ciris_persist::prelude::SignedKeyRecord {
             record: sibling.record("node").await,
         })
         .await
         .expect("the sibling's key");
+        put(dir, sibling_binding.clone()).await;
     }
     m.seat
         .dir
@@ -1612,6 +1719,44 @@ async fn claim_with_an_owned_sibling(m: &BundleMesh) -> (Ident, Ident) {
         .await
         .expect("the sibling's occurrence at the seat");
     (owner, sibling)
+}
+
+/// What each side held when the owner Pull delivered nothing: the seat's rows
+/// for the owner, both withhold ledgers, what the seat was asked and what the
+/// device was handed.
+async fn report_undelivered(m: &BundleMesh, owner: &str) {
+    use ciris_persist::federation::FederationDirectory as _;
+    let at_seat = m.seat.dir.list_identity_occurrences_for(owner).await;
+    eprintln!(
+        "971 DIAG seat occurrences for owner: {:?}",
+        at_seat.map(|v| v
+            .iter()
+            .map(|o| o.occurrence_key_id.clone())
+            .collect::<Vec<_>>())
+    );
+    eprintln!(
+        "971 DIAG seat withholds {:?}",
+        m.seat.metrics.snapshot().withholds_by_reason
+    );
+    eprintln!(
+        "971 DIAG device withholds {:?}",
+        m.device.metrics.snapshot().withholds_by_reason
+    );
+    eprintln!(
+        "971 DIAG seat was asked {:?}",
+        m.rt_seat
+            .bridge()
+            .pull_subjects_from_for_test(&m.device.key.key_id)
+    );
+    eprintln!(
+        "971 DIAG device got kinds {:?}",
+        m.rt_device
+            .bridge()
+            .deliveries_from_for_test(&m.seat.key.key_id)
+            .iter()
+            .map(|(k, b)| (*k, b.len()))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// (d)-2 **Completeness from a bare directory through claim.** Unclaimed, the
@@ -1670,21 +1815,27 @@ async fn a_device_reaches_the_seat_and_its_owner_by_pull_alone_971() {
         owner_pulls(&m.device) > before,
         "a claimed device's timer cycle asks about its owner"
     );
+    let delivered = wait_until(Duration::from_mins(1), || {
+        let dir = Arc::clone(&m.device.dir);
+        let (sib, own) = (sibling.key_id.clone(), owner.key_id.clone());
+        async move {
+            dir.list_identity_occurrences_for(&own)
+                .await
+                .is_ok_and(|v| v.iter().any(|o| o.occurrence_key_id == sib))
+        }
+    })
+    .await;
+    if !delivered {
+        report_undelivered(&m, &owner.key_id).await;
+    }
     assert!(
-        wait_until(Duration::from_mins(1), || {
-            let dir = Arc::clone(&m.device.dir);
-            let (sib, own) = (sibling.key_id.clone(), owner.key_id.clone());
-            async move {
-                dir.list_identity_occurrences_for(&own)
-                    .await
-                    .is_ok_and(|v| v.iter().any(|o| o.occurrence_key_id == sib))
-            }
-        })
-        .await,
+        delivered,
         "the owner Pull delivers a second owned node's occurrence"
     );
-    assert_seat_was_asked_only_about(&m, &[&dev, &seat_id, &owner.key_id], "claimed");
-    assert_device_got_only_required_rows(&m, &[&dev, &seat_id, &owner.key_id], "claimed");
+    // The sibling is a name the seat delivered, in its owner's occurrence row.
+    let claimed: [&str; 4] = [&dev, &seat_id, &owner.key_id, &sibling.key_id];
+    assert_seat_was_asked_only_about(&m, &claimed, "claimed");
+    assert_device_got_only_required_rows(&m, &claimed, "claimed");
     assert_eq!(
         m.rt_seat.bridge().offers_built_on_bundle_planes() - built0,
         0,

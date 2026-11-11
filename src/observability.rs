@@ -613,6 +613,16 @@ pub enum WithholdReason {
     /// Distinct from [`Self::IdentityRowNodeNotAnnounced`] so an operator is
     /// sent to the directory, not to the announce wizard.
     IdentityRowAnnounceUnresolved,
+    /// CIRISEdge#971 (CC 5.4.6) — an `IdentityOccurrence` or
+    /// `TransportDestination` row about a node that has NO live owner-binding
+    /// held here and is held as the occurrence of another identity: a
+    /// person's device whose binding was released, lapsed, or has not reached
+    /// this holder (an unannounced node, seen from a seat). Served to that
+    /// identity's own nodes and active occurrences only. Distinct from
+    /// [`Self::IdentityRowNodeNotAnnounced`] (an owner is known and chose not
+    /// to announce) so an operator whose node stopped being listed is sent to
+    /// the owner-binding, not to the announce wizard.
+    IdentityRowOccurrenceUnowned,
     /// CIRISEdge#758 (CC 5.4.6) — a `Family` / `Community` RECORD asked for (on
     /// the advertise or the direct-fetch twin) by a peer whose person
     /// (`owner_of(peer)`, the peer itself when unowned) is neither a live
@@ -685,6 +695,7 @@ impl WithholdReason {
             Self::LxmfRetentionExpired => "lxmf_retention_expired",
             Self::IdentityRowNodeNotAnnounced => "identity_row_node_not_announced",
             Self::IdentityRowAnnounceUnresolved => "identity_row_announce_unresolved",
+            Self::IdentityRowOccurrenceUnowned => "identity_row_occurrence_unowned",
             Self::GroupRecordNotMemberOrInvitee => "group_record_not_member_or_invitee",
         }
     }

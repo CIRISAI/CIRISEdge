@@ -2289,6 +2289,17 @@ enum IdentityRowReach {
     /// Owned and NOT announced: only the owner's own nodes
     /// (`nodes_owned_by(owner)`, which includes the node itself).
     OwnersNodes(HashSet<String>),
+    /// CIRISEdge#971 — no live owner-binding is held for the NODE, yet it is
+    /// held as the occurrence of some other identity: a person's device whose
+    /// binding was released, lapsed, or never reached this holder (an
+    /// unannounced node's `self`-scoped binding never travels; its occurrence
+    /// row does). It is not its own trust subject, and nothing held here says
+    /// its person announced it, so its rows reach that person's own set only
+    /// (CC 5.4.6 "never listed"): the nodes the person owns and the person's
+    /// active occurrences, the same reach an owned unannounced node has.
+    /// Empty when the node is an active occurrence of nobody (the node itself
+    /// only). A resolved answer (memoized), unlike [`Self::Unresolved`].
+    OccurrenceUnowned(Arc<HashSet<String>>),
     /// The owner or the announce state could not be read. Fail-closed: only
     /// the node itself.
     Unresolved,
@@ -2309,6 +2320,8 @@ impl IdentityRowReach {
             Self::Everyone => None,
             Self::OwnersNodes(nodes) => (!peer.is_some_and(|p| nodes.contains(p)))
                 .then_some(WithholdReason::IdentityRowNodeNotAnnounced),
+            Self::OccurrenceUnowned(own) => (!peer.is_some_and(|p| own.contains(p)))
+                .then_some(WithholdReason::IdentityRowOccurrenceUnowned),
             Self::Unresolved => Some(WithholdReason::IdentityRowAnnounceUnresolved),
         }
     }
@@ -2623,6 +2636,13 @@ pub struct FederationDirectoryReplicationBridge {
     /// owner-binding `supersedes` widening that IS an announce. See
     /// [`Self::identity_row_reach`].
     announce_cache: Mutex<HashMap<String, (Instant, IdentityRowReach)>>,
+    /// CIRISEdge#971 — per IDENTITY, its own set (the nodes it owns and its
+    /// active occurrences), shared by every unowned node held as its
+    /// occurrence ([`IdentityRowReach::OccurrenceUnowned`]). Without it a
+    /// person with N such nodes costs N reads of an N-row set per memo period.
+    /// Same TTL as the announce memo, dropped wherever that memo is dropped
+    /// and on every admitted occurrence.
+    own_set_cache: Mutex<OwnSetMemo>,
     /// CIRISEdge#682 — how many times the announce memo MISSED and the walk
     /// (`owner_of` + the owner's rows + `nodes_owned_by`) ran. The memo's own
     /// witness, as [`Self::owner_reads`] is for the owner memo. `Relaxed`.
@@ -2946,6 +2966,10 @@ const SEND_SET_MEMBERSHIP_CAP: usize = 4096;
 /// of which are time-driven, so a TTL is the only thing that can observe them.
 const OWNER_BINDING_MEMO_TTL: Duration = Duration::from_secs(30);
 
+/// CIRISEdge#971 — an identity's own set (its owned nodes and its active
+/// occurrences), by identity, with the instant it was read.
+type OwnSetMemo = HashMap<String, (Instant, Arc<HashSet<String>>)>;
+
 /// CIRISPersist#848 / CIRISEdge#601 — a `ciris_persist::Engine` the bridge
 /// routes `key_grant:*` rows to.
 ///
@@ -3047,6 +3071,7 @@ impl FederationDirectoryReplicationBridge {
             owner_cache: Mutex::new(OwnerCache::default()),
             owner_flight: SingleFlight::default(),
             announce_cache: Mutex::new(HashMap::new()),
+            own_set_cache: Mutex::new(HashMap::new()),
             announce_reads: std::sync::atomic::AtomicUsize::new(0),
             kind_publish_selector: None,
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -5622,6 +5647,7 @@ impl FederationDirectoryReplicationBridge {
         let signed_by = crate::replication::missing_signer::missing_signer_of(kind, envelope_bytes);
         let mut released = 0;
         if let Some(bound) = &bound {
+            self.forget_reach(bound);
             released += self.release_and_kick(bound, ReleaseCause::Host);
         }
         if let Some(signed_by) = signed_by.filter(|s| Some(s) != bound.as_ref()) {
@@ -5804,6 +5830,7 @@ impl FederationDirectoryReplicationBridge {
             None => {
                 if outcome.is_admitted() {
                     if let Some(signer) = newly_bound_signer_of(kind, envelope_bytes) {
+                        self.forget_reach(&signer);
                         self.release_and_kick(&signer, ReleaseCause::SignerBound);
                     }
                     // persist v61 S2 (#1148) — an admitted row that can change
@@ -11952,6 +11979,9 @@ impl FederationDirectoryReplicationBridge {
         if let Ok(mut memo) = self.announce_cache.lock() {
             memo.clear();
         }
+        if let Ok(mut memo) = self.own_set_cache.lock() {
+            memo.clear();
+        }
     }
 
     /// persist v61 (CIRISPersist#991) — the apply-side hook the framed Family
@@ -12062,6 +12092,9 @@ impl FederationDirectoryReplicationBridge {
         if let Ok(mut memo) = self.announce_cache.lock() {
             memo.clear();
         }
+        if let Ok(mut memo) = self.own_set_cache.lock() {
+            memo.clear();
+        }
     }
 
     /// **CIRISEdge#968 (wait B) — a LOCAL write may have changed what moves to
@@ -12100,6 +12133,9 @@ impl FederationDirectoryReplicationBridge {
             cache.by_node.clear();
         }
         if let Ok(mut memo) = self.announce_cache.lock() {
+            memo.clear();
+        }
+        if let Ok(mut memo) = self.own_set_cache.lock() {
             memo.clear();
         }
         if let Some(gate) = self.accord_relay_gate.as_ref() {
@@ -12430,9 +12466,11 @@ impl FederationDirectoryReplicationBridge {
         self.announce_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let reach = match self.owner_of_cached(subject).await {
-            // Its own trust subject (FIRST_CONTACT §3's degenerate point): no
-            // owner, so no announce axis. The canonical and bare servers.
-            OwnerLookup::Unowned => IdentityRowReach::Everyone,
+            // No live owner-binding held. Its own trust subject (FIRST_CONTACT
+            // §3's degenerate point, a bare server) has no announce axis and
+            // serves everyone; a node held as another identity's occurrence
+            // does not (CIRISEdge#971).
+            OwnerLookup::Unowned => self.unowned_reach(subject).await,
             OwnerLookup::Unresolved => IdentityRowReach::Unresolved,
             OwnerLookup::Owner(owner) => match self.node_is_announced(&owner, subject).await {
                 Ok(true) => IdentityRowReach::Everyone,
@@ -12566,6 +12604,156 @@ impl FederationDirectoryReplicationBridge {
             ),
         );
         true
+    }
+
+    /// CIRISEdge#971 — the reach of a key with NO live owner-binding held.
+    ///
+    /// Before #971 this was always `Everyone`, on the reading that an unowned
+    /// node is its own trust subject. A person's device is unowned here too:
+    /// once its binding is released or lapses, and at every holder that has
+    /// its occurrence and not its binding (an unannounced node's binding is
+    /// `self`-scoped and never leaves the person's nodes, while persist keeps
+    /// and serves the `identity:occurrence:v1` row). Such a node read as
+    /// "unowned", and a device its person never announced was handed to any
+    /// entitled stranger who Pulled the person.
+    ///
+    /// The rule, in the order it reads:
+    ///
+    /// 1. Held as the occurrence of no OTHER identity: its own trust subject
+    ///    (the canonical, a bare server, a long-lived agent). `Everyone`.
+    /// 2. Not a NODE key (its own `identity_type`, fixed at mint; persist's
+    ///    `node_bearing_of` reads the same field): an actor occurrence, e.g. a
+    ///    split-home agent anchored as its person's occurrence by the login
+    ///    ceremony and never owner-bound by design. Announce is per NODE (CC
+    ///    5.4.6), and co-members wrap content keys to these rows, so the axis
+    ///    does not apply. `Everyone`, as before. A key whose record is not
+    ///    held is judged a node (fail-closed).
+    /// 3. A node: `OccurrenceUnowned` with every identity it is an ACTIVE
+    ///    occurrence of, and that identity's own set ([`Self::own_set_of`]).
+    ///    An occurrence that was revoked confers nothing, so a fully released
+    ///    node reaches itself only.
+    ///
+    /// Two recorded departures from the letter of CC 5.4.6 (read at rc19;
+    /// CLM-serve-dependency-closure, CIRISEdge#897):
+    ///
+    /// - The own set counts an identity-signed ACTIVE occurrence, where CC 3.2
+    ///   resolves `self` through owner-bindings alone. A holder outside the
+    ///   person's nodes never holds a `self`-scoped binding, so by the letter
+    ///   it could hand an unannounced node to announced siblings only, and a
+    ///   person whose devices are all unannounced could not learn one from
+    ///   another through a seat. It reaches no key the identity has not signed
+    ///   as its own. The gap: this holder cannot see a `self` binding
+    ///   withdrawn while the occurrence stays live.
+    /// - Step 2 leaves an agent key open, where 5.4.6 gates an agent "no
+    ///   differently from any device of a person's". Closing it withholds the
+    ///   rows co-members wrap content keys to until a group-scoped binding
+    ///   (CC 3.2) is what carries them; that is a cut of its own.
+    ///
+    /// A read persist does not serve is `Unresolved` (fail-closed, never
+    /// memoized).
+    async fn unowned_reach(&self, subject: &str) -> IdentityRowReach {
+        use ciris_persist::federation::identity_type;
+        let unresolved = |what: &str, e: &ciris_persist::federation::Error| {
+            tracing::debug!(
+                subject,
+                error = %e,
+                "{what} unresolved for an unowned key: its identity rows are served to \
+                 itself only (CIRISEdge#971 fail-closed)"
+            );
+            IdentityRowReach::Unresolved
+        };
+        let bound = match self
+            .directory
+            .list_identity_occurrences_by_occurrence_key(subject)
+            .await
+        {
+            Ok(bound) => bound,
+            Err(e) => return unresolved("occurrence bindings", &e),
+        };
+        let identities: std::collections::BTreeSet<&str> = bound
+            .iter()
+            .map(|o| o.identity_key_id.as_str())
+            .filter(|i| *i != subject)
+            .collect();
+        if identities.is_empty() {
+            return IdentityRowReach::Everyone;
+        }
+        match self.directory.lookup_public_key(subject).await {
+            Ok(Some(rec))
+                if !identity_type::set_contains(&rec.identity_type, identity_type::NODE) =>
+            {
+                return IdentityRowReach::Everyone;
+            }
+            Ok(_) => {}
+            Err(e) => return unresolved("key record", &e),
+        }
+        let mut reach = HashSet::new();
+        for identity in identities {
+            match self.own_set_of(identity).await {
+                // Only an identity the node is an ACTIVE occurrence of.
+                Ok(own) if own.contains(subject) => {
+                    reach.insert(identity.to_owned());
+                    reach.extend(own.iter().cloned());
+                }
+                Ok(_) => {}
+                Err(e) => return unresolved("the identity's own set", &e),
+            }
+        }
+        IdentityRowReach::OccurrenceUnowned(Arc::new(reach))
+    }
+
+    /// CIRISEdge#971 — an identity's own set: the nodes it owns
+    /// (`nodes_owned_by`) and its active occurrences
+    /// (`list_identity_occurrences_active`), the two halves persist's own
+    /// `self` gate reads. Memoized per identity under
+    /// [`OWNER_BINDING_MEMO_TTL`]; an error is never memoized.
+    async fn own_set_of(
+        &self,
+        identity: &str,
+    ) -> Result<Arc<HashSet<String>>, ciris_persist::federation::Error> {
+        if let Ok(memo) = self.own_set_cache.lock() {
+            if let Some((at, own)) = memo.get(identity) {
+                if at.elapsed() < OWNER_BINDING_MEMO_TTL {
+                    return Ok(Arc::clone(own));
+                }
+            }
+        }
+        let mut own: HashSet<String> = ciris_persist::federation::admission::nodes_owned_by(
+            &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
+            identity,
+        )
+        .await?
+        .into_iter()
+        .collect();
+        own.extend(
+            self.directory
+                .list_identity_occurrences_active(identity)
+                .await?
+                .into_iter()
+                .map(|o| o.occurrence_key_id),
+        );
+        let own = Arc::new(own);
+        if let Ok(mut memo) = self.own_set_cache.lock() {
+            memo.insert(identity.to_owned(), (Instant::now(), Arc::clone(&own)));
+        }
+        Ok(own)
+    }
+
+    /// CIRISEdge#971 — an occurrence binding `key_id` was just admitted (or
+    /// written by the host): the reach memoized for that key predates it, and
+    /// so does the own set of whichever identity it names. Without this a key
+    /// memoized as nobody's occurrence stays served to everyone for up to
+    /// [`OWNER_BINDING_MEMO_TTL`] after the row that says otherwise landed.
+    /// The other subjects' memoized reaches keep the set they were built
+    /// with until the TTL: a new sibling is withheld from them a little
+    /// longer, never served early.
+    fn forget_reach(&self, key_id: &str) {
+        if let Ok(mut memo) = self.announce_cache.lock() {
+            memo.remove(key_id);
+        }
+        if let Ok(mut memo) = self.own_set_cache.lock() {
+            memo.clear();
+        }
     }
 
     /// CIRISEdge#682 — the subject-Pull decision for one identity row about
@@ -24232,6 +24420,398 @@ pub(crate) mod tests {
         );
     }
 
+    /// CIRISEdge#971 — a row signed by a minted identity, in persist's own
+    /// envelope discipline (columns bound before signing, hybrid bound
+    /// signature), at the `cohort_scope` asked for, put through the ordinary
+    /// door.
+    #[allow(clippy::too_many_arguments)] // the attestation's columns, by name
+    async fn put_signed_row_971(
+        dir: &SqliteBackend,
+        signer: &crate::replication::park_fresh_858_tests::Ident,
+        id: &str,
+        attestation_type: &str,
+        attested: &str,
+        scope: &str,
+        mut envelope: serde_json::Value,
+    ) {
+        use crate::replication::attestation_bind::{bind_attestation_envelope, AttestationColumns};
+        use sha2::Digest as _;
+        let at = crate::replication::attestation_bind::truncate_to_substrate_resolution(Utc::now());
+        let subjects = vec![attested.to_owned()];
+        bind_attestation_envelope(
+            &mut envelope,
+            at,
+            &AttestationColumns {
+                attestation_id: id,
+                attesting_key_id: signer.key_id(),
+                attestation_type,
+                attested_key_id: attested,
+                subject_key_ids: &subjects,
+                cohort_scope: scope,
+                weight: None,
+            },
+        );
+        let canonical =
+            ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canonicalize");
+        let digest = sha2::Sha256::digest(&canonical);
+        let (classical, pqc) =
+            crate::identity::sign_bound_hybrid(&signer.signer(), &canonical, "row")
+                .await
+                .expect("hybrid sign");
+        let attestation = Attestation {
+            attestation_id: id.to_owned(),
+            attesting_key_id: signer.key_id().to_owned(),
+            attested_key_id: attested.to_owned(),
+            attestation_type: attestation_type.to_owned(),
+            weight: None,
+            asserted_at: at,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: hex::encode(digest),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: signer.key_id().to_owned(),
+            scrub_timestamp: at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: subjects,
+            withdraws_admission_rule: None,
+            additional_scrubs: Vec::new(),
+            cohort_scope: scope.to_owned(),
+            tier: "federation".to_owned(),
+            promoted_at: None,
+        };
+        dir.put_attestation(SignedAttestation { attestation })
+            .await
+            .unwrap_or_else(|e| panic!("put {attestation_type} {id}: {e:?}"));
+    }
+
+    /// CIRISEdge#971 — the owner `p` binds `node` at `scope` (`federation` =
+    /// announced, `self` = not), and attests its occurrence of `node`. Returns
+    /// the binding's id.
+    async fn own_node_971(
+        dir: &SqliteBackend,
+        p: &crate::replication::park_fresh_858_tests::Ident,
+        node: &str,
+        scope: &str,
+    ) -> String {
+        let id = format!("owner-binding-{node}");
+        let envelope =
+            ciris_persist::federation::self_at_login::owner_binding_delegates_to_envelope(
+                node,
+                &["infra:network_presence".to_string()],
+            );
+        put_signed_row_971(dir, p, &id, "delegates_to", node, scope, envelope).await;
+        dir.put_identity_occurrence(
+            crate::replication::park_fresh_858_tests::occurrence(p.key_id(), node, p).await,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{node}'s occurrence: {e:?}"));
+        id
+    }
+
+    /// The occurrence-row hashes about `person` whose occurrence is `node`.
+    async fn occurrence_hashes_971(dir: &SqliteBackend, person: &str, node: &str) -> Vec<[u8; 32]> {
+        key_plane_rows::occurrence_rows_about(dir, person)
+            .await
+            .expect("occurrence rows")
+            .iter()
+            .filter(|r| key_plane_rows::occurrence_key_of(r).as_deref() == Some(node))
+            .filter_map(|r| content_hash_of(r).map(|(h, _)| h))
+            .collect()
+    }
+
+    fn listed_971(refs: &[EnvelopeRef], hashes: &[[u8; 32]]) -> bool {
+        hashes
+            .iter()
+            .any(|h| refs.iter().any(|r| &r.envelope_hash == h))
+    }
+
+    /// **CIRISEdge#971 / CC 5.4.6 — a self-only sibling's occurrence never
+    /// reaches a stranger who Pulls the owner.** The person P owns an
+    /// announced node (binding at `federation`), an unannounced one (binding
+    /// at `self`) and the asking device D. The seat answers an
+    /// IdentityOccurrence Pull with subject P through `subject_holdings_inner`,
+    /// whose per-row gate (`identity_row_pull_withholds`, the #682 reach)
+    /// decides. The entitlement in front of it (a shared trust root, the
+    /// limiter) is a separate gate: this is what an ENTITLED stranger meets.
+    /// - A stranger is handed the announced node's occurrence and never the
+    ///   self-only one's.
+    /// - P's own device is handed both (CC 5.4.6: reachable by the person's
+    ///   own nodes).
+    /// Mutation: drop the per-row check in the IdentityOccurrence arm, and
+    /// the stranger is handed the self-only node.
+    #[tokio::test]
+    async fn a_self_only_siblings_occurrence_never_reaches_a_stranger_pulling_the_owner_971() {
+        use crate::replication::park_fresh_858_tests::{hold, substrate, Ident};
+        let dir = substrate().await;
+        let p = Ident::mint("person-bob-971", "user", 0x31).await;
+        let lit = Ident::mint("node-pub-971", "node", 0x32).await;
+        let dark = Ident::mint("node-dark-971", "node", 0x33).await;
+        let dev = Ident::mint("node-dev-971", "node", 0x34).await;
+        let stranger = Ident::mint("node-stranger-971", "node", 0x35).await;
+        let seat = Ident::mint("seat-971-dark", "node", 0x36).await;
+        for id in [&p, &lit, &dark, &dev, &stranger, &seat] {
+            hold(&dir, id).await;
+        }
+        own_node_971(&dir, &p, lit.key_id(), "federation").await;
+        own_node_971(&dir, &p, dark.key_id(), "self").await;
+        own_node_971(&dir, &p, dev.key_id(), "federation").await;
+        let (lit_h, dark_h) = (
+            occurrence_hashes_971(&dir, p.key_id(), lit.key_id()).await,
+            occurrence_hashes_971(&dir, p.key_id(), dark.key_id()).await,
+        );
+        assert!(
+            !lit_h.is_empty() && !dark_h.is_empty(),
+            "the fixture holds both siblings' occurrence rows: pub={} dark={}",
+            lit_h.len(),
+            dark_h.len()
+        );
+        let bridge = bridge_over(&dir, &[]).with_local_key_id(Some(seat.key_id().to_owned()));
+        let to_stranger = bridge
+            .subject_holdings_inner(
+                EnvelopeKind::IdentityOccurrence,
+                p.key_id(),
+                Some(stranger.key_id()),
+            )
+            .await;
+        assert!(
+            listed_971(&to_stranger, &lit_h),
+            "control: the stranger is handed the announced sibling ({} refs)",
+            to_stranger.len()
+        );
+        assert!(
+            !listed_971(&to_stranger, &dark_h),
+            "a stranger Pulling the owner is NEVER handed a self-only sibling's occurrence"
+        );
+        let to_own = bridge
+            .subject_holdings_inner(
+                EnvelopeKind::IdentityOccurrence,
+                p.key_id(),
+                Some(dev.key_id()),
+            )
+            .await;
+        assert!(
+            listed_971(&to_own, &lit_h) && listed_971(&to_own, &dark_h),
+            "the owner's own device is handed both ({} refs)",
+            to_own.len()
+        );
+    }
+
+    /// **CIRISEdge#971 / CC 5.4.6 — a RELEASED self-only node's occurrence
+    /// still never reaches a stranger.** P owns the never-announced node N
+    /// (binding at `self`), and N's occurrence of P is held. P then releases
+    /// N (`withdraws` on the binding). If the occurrence row outlives the
+    /// release, `owner_of(N)` no longer resolves P, and the reach gate
+    /// (`identity_row_reach`) must not fall through to `Unowned → Everyone`:
+    /// that would make a device the person never announced listable to
+    /// anyone who Pulls the person. Prints whether persist folds the
+    /// occurrence away on release (then nothing is listable by construction)
+    /// and the reach the gate resolves.
+    #[tokio::test]
+    async fn a_released_self_only_nodes_occurrence_never_reaches_a_stranger_971() {
+        use crate::replication::park_fresh_858_tests::{hold, substrate, Ident};
+        let dir = substrate().await;
+        let p = Ident::mint("person-bob-971r", "user", 0x41).await;
+        let dark = Ident::mint("node-dark-971r", "node", 0x42).await;
+        let stranger = Ident::mint("node-stranger-971r", "node", 0x43).await;
+        let seat = Ident::mint("seat-971-rel", "node", 0x44).await;
+        for id in [&p, &dark, &stranger, &seat] {
+            hold(&dir, id).await;
+        }
+        let binding = own_node_971(&dir, &p, dark.key_id(), "self").await;
+        let before = occurrence_hashes_971(&dir, p.key_id(), dark.key_id()).await;
+        assert!(!before.is_empty(), "the fixture holds the occurrence row");
+        // P releases N.
+        let release = format!("release-{}", dark.key_id());
+        put_signed_row_971(
+            &dir,
+            &p,
+            &release,
+            "withdraws",
+            // persist folds a binding's `withdraws` from the rows attested TO
+            // the node (`live_delegation_granter_instants`).
+            dark.key_id(),
+            "self",
+            serde_json::json!({
+                "references_attestation_id": binding,
+                "withdrawal_reason": "test: the owner releases the node",
+            }),
+        )
+        .await;
+        let after = occurrence_hashes_971(&dir, p.key_id(), dark.key_id()).await;
+        let owned = ciris_persist::federation::admission::nodes_owned_by(
+            &*dir as &dyn ciris_persist::federation::FederationDirectory,
+            p.key_id(),
+        )
+        .await
+        .expect("nodes_owned_by");
+        eprintln!("971 released self-only node: nodes_owned_by(P) after release={owned:?}");
+        assert!(
+            !owned.iter().any(|n| n == dark.key_id()),
+            "the release took effect: P no longer owns N ({owned:?})"
+        );
+        let bridge = bridge_over(&dir, &[]).with_local_key_id(Some(seat.key_id().to_owned()));
+        let reach = bridge.identity_row_reach(dark.key_id()).await;
+        eprintln!(
+            "971 released self-only node: occurrence_rows before={} after={} reach={reach:?}",
+            before.len(),
+            after.len()
+        );
+        let to_stranger = bridge
+            .subject_holdings_inner(
+                EnvelopeKind::IdentityOccurrence,
+                p.key_id(),
+                Some(stranger.key_id()),
+            )
+            .await;
+        assert!(
+            !listed_971(&to_stranger, &before),
+            "a released, never-announced node's occurrence is NOT handed to a stranger \
+             (rows after release={}, reach={reach:?})",
+            after.len()
+        );
+        let IdentityRowReach::OccurrenceUnowned(own) = &reach else {
+            panic!("a node held as another identity's occurrence, with no live owner: {reach:?}");
+        };
+        assert!(
+            own.contains(dark.key_id())
+                && own.contains(p.key_id())
+                && !own.contains(stranger.key_id())
+                && own.len() == 2,
+            "P owns no node now and N is its one active occurrence: {own:?}"
+        );
+        // Control: a node bound under no other identity is still its own
+        // trust subject and is served to everyone (the bare-server case).
+        assert_eq!(
+            bridge.identity_row_reach(seat.key_id()).await,
+            IdentityRowReach::Everyone,
+            "an unowned node that is nobody's occurrence keeps the open reach"
+        );
+        // The node is never refused its own rows.
+        let to_itself = bridge
+            .subject_holdings_inner(
+                EnvelopeKind::IdentityOccurrence,
+                p.key_id(),
+                Some(dark.key_id()),
+            )
+            .await;
+        assert!(
+            listed_971(&to_itself, &before),
+            "the released node itself is still handed its own occurrence"
+        );
+    }
+
+    /// **CIRISEdge#971 — the seat's view of an unannounced node, and of a
+    /// split-home agent.** The seat holds P's occurrence rows and never P's
+    /// `self`-scoped bindings (they do not leave P's nodes), so at the seat an
+    /// unannounced node resolves no owner. Production count at the seat on
+    /// 2026-11-10: 384 node keys in this state, 1,512 agent keys anchored as a
+    /// person's occurrence and never owner-bound by design.
+    /// - The unannounced node `dark` is handed to P's own set (the node P
+    ///   announced, P's agent) and never to a stranger.
+    /// - The agent is no node: the announce axis does not apply, and a
+    ///   stranger is still handed its occurrence (co-members wrap to it).
+    /// - A key memoized as nobody's occurrence is re-read when its occurrence
+    ///   lands; the 30 s memo does not keep it open.
+    /// Mutation: return `Everyone` from `unowned_reach` for a node, and the
+    /// stranger is handed `dark`; drop the `identity_type` read, and the
+    /// stranger loses the agent.
+    #[tokio::test]
+    async fn an_unowned_occurrence_reaches_its_persons_own_set_and_an_agent_stays_open_971() {
+        use crate::replication::park_fresh_858_tests::{
+            hold, occurrence, occurrence_row_bytes, substrate, Ident,
+        };
+        let dir = substrate().await;
+        let p = Ident::mint("person-cy-971", "user", 0x51).await;
+        let home = Ident::mint("node-home-971", "node", 0x52).await;
+        let dark = Ident::mint("node-unann-971", "node", 0x53).await;
+        let agent = Ident::mint("agent-cy-971", "agent", 0x54).await;
+        let late = Ident::mint("node-late-971", "node", 0x55).await;
+        let stranger = Ident::mint("node-stranger-971u", "node", 0x56).await;
+        let seat = Ident::mint("seat-971-unann", "node", 0x57).await;
+        for id in [&p, &home, &dark, &agent, &late, &stranger, &seat] {
+            hold(&dir, id).await;
+        }
+        own_node_971(&dir, &p, home.key_id(), "federation").await;
+        // The seat's view: the occurrence, never the binding.
+        for key in [dark.key_id(), agent.key_id()] {
+            dir.put_identity_occurrence(occurrence(p.key_id(), key, &p).await)
+                .await
+                .unwrap_or_else(|e| panic!("{key}'s occurrence: {e:?}"));
+        }
+        let (home_h, dark_h, agent_h) = (
+            occurrence_hashes_971(&dir, p.key_id(), home.key_id()).await,
+            occurrence_hashes_971(&dir, p.key_id(), dark.key_id()).await,
+            occurrence_hashes_971(&dir, p.key_id(), agent.key_id()).await,
+        );
+        assert!(
+            !home_h.is_empty() && !dark_h.is_empty() && !agent_h.is_empty(),
+            "the fixture holds all three occurrence rows"
+        );
+        let bridge = bridge_over(&dir, &[]).with_local_key_id(Some(seat.key_id().to_owned()));
+
+        let reach = bridge.identity_row_reach(dark.key_id()).await;
+        let IdentityRowReach::OccurrenceUnowned(own) = &reach else {
+            panic!("an unannounced node at the seat: {reach:?}");
+        };
+        for mine in [home.key_id(), dark.key_id(), agent.key_id()] {
+            assert!(own.contains(mine), "{mine} is in P's own set: {own:?}");
+        }
+        assert!(!own.contains(stranger.key_id()), "{own:?}");
+        assert_eq!(
+            bridge.identity_row_reach(agent.key_id()).await,
+            IdentityRowReach::Everyone,
+            "an agent key is no node: the announce axis does not apply to it"
+        );
+
+        let to_stranger = bridge
+            .subject_holdings_inner(
+                EnvelopeKind::IdentityOccurrence,
+                p.key_id(),
+                Some(stranger.key_id()),
+            )
+            .await;
+        assert!(
+            listed_971(&to_stranger, &home_h) && listed_971(&to_stranger, &agent_h),
+            "a stranger is handed the announced node and the agent ({} refs)",
+            to_stranger.len()
+        );
+        assert!(
+            !listed_971(&to_stranger, &dark_h),
+            "a stranger is NEVER handed the unannounced node"
+        );
+        for mine in [home.key_id(), agent.key_id(), dark.key_id(), p.key_id()] {
+            let to_mine = bridge
+                .subject_holdings_inner(EnvelopeKind::IdentityOccurrence, p.key_id(), Some(mine))
+                .await;
+            assert!(
+                listed_971(&to_mine, &dark_h),
+                "{mine} is P's own and is handed the unannounced node"
+            );
+        }
+
+        // The memo: `late` is nobody's occurrence, then its occurrence lands.
+        assert_eq!(
+            bridge.identity_row_reach(late.key_id()).await,
+            IdentityRowReach::Everyone
+        );
+        let occ = occurrence(p.key_id(), late.key_id(), &p).await;
+        let bytes = occurrence_row_bytes(&occ);
+        dir.put_identity_occurrence(occ)
+            .await
+            .expect("late's occurrence");
+        bridge.release_bound_signer(EnvelopeKind::IdentityOccurrence, &bytes);
+        let reach = bridge.identity_row_reach(late.key_id()).await;
+        let IdentityRowReach::OccurrenceUnowned(own) = &reach else {
+            panic!("the memoized `Everyone` outlived the occurrence that ended it: {reach:?}");
+        };
+        assert!(
+            own.contains(late.key_id()) && own.contains(home.key_id()),
+            "the own set was re-read with the new occurrence in it: {own:?}"
+        );
+    }
+
     /// The reach table itself: the node always gets its own rows; unowned is
     /// everyone; unannounced is the owner's nodes; unresolved is nobody else.
     #[test]
@@ -24256,6 +24836,34 @@ pub(crate) mod tests {
         );
         assert_eq!(
             IdentityRowReach::Unresolved.withholds("n1", Some("n1")),
+            None,
+            "a node is never refused its own rows"
+        );
+        // CIRISEdge#971 — another identity's occurrence with no owner held.
+        let own = |keys: &[&str]| {
+            IdentityRowReach::OccurrenceUnowned(Arc::new(
+                keys.iter().map(|k| (*k).to_string()).collect(),
+            ))
+        };
+        assert_eq!(
+            own(&[]).withholds("n1", Some("n2")),
+            Some(WithholdReason::IdentityRowOccurrenceUnowned)
+        );
+        assert_eq!(
+            own(&["n2"]).withholds("n1", None),
+            Some(WithholdReason::IdentityRowOccurrenceUnowned)
+        );
+        assert_eq!(
+            own(&["n2"]).withholds("n1", Some("x")),
+            Some(WithholdReason::IdentityRowOccurrenceUnowned)
+        );
+        assert_eq!(
+            own(&["n2"]).withholds("n1", Some("n2")),
+            None,
+            "the person's own set is served"
+        );
+        assert_eq!(
+            own(&[]).withholds("n1", Some("n1")),
             None,
             "a node is never refused its own rows"
         );

@@ -220,6 +220,22 @@ impl NodeA {
         for id in [&p, &n, &k] {
             hold(&dir, id).await;
         }
+        // CIRISEdge#971 — P ANNOUNCES N. A node held as a person's occurrence
+        // with no owner-binding is handed to that person's own set only, and
+        // these witnesses are about what a stranger is served.
+        let binding = crate::replication::attestation_bind::owner_binding_attestation(
+            p.key_id(),
+            n.key_id(),
+            chrono::Utc::now(),
+            &p.signer(),
+        )
+        .await
+        .expect("build P's binding of N");
+        dir.put_attestation_authored(ciris_persist::federation::SignedAttestation {
+            attestation: binding,
+        })
+        .await
+        .expect("A admits P's binding of N");
         dir.put_identity_occurrence(occurrence(p.key_id(), n.key_id(), &p).await)
             .await
             .expect("A authors P's occurrence of N");
