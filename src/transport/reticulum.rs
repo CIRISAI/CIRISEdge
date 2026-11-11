@@ -256,6 +256,32 @@ fn effective_link_keepalive_secs(configured: Option<Duration>) -> Option<u64> {
 /// leviculum's 256 default).
 pub const CONTROL_CHANNEL_CAPACITY_ENV: &str = "CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY";
 
+/// v45 — the data-plane event channel this node runs: leviculum's own
+/// default is 128, and leviculum sheds an arriving link datagram while
+/// three quarters of it are queued unread (it keeps the last quarter for
+/// Channel messages). A 30 KB keyframe is 127 datagrams sent back to back at
+/// the base MTU, so a receiver whose event loop is busy for a few ms (a phone,
+/// a loaded box) lost its tail at 96 (the v45.0.0 gate's
+/// `framed_video_arrives_whole_and_audio_unmarked`, `av_datagram_shed_sink`
+/// 8; witness `a_keyframe_reaches_a_loaded_receiver_whole`). At 1024 a burst
+/// has 768 slots. Headroom used only while the loop is behind: each slot
+/// is one queued event, at most one link MTU of data.
+pub const DATA_CHANNEL_CAPACITY: usize = 1024;
+
+/// The env var that overrides [`DATA_CHANNEL_CAPACITY`] (clamped like the
+/// control channel's).
+pub const DATA_CHANNEL_CAPACITY_ENV: &str = "CIRIS_EDGE_RETICULUM_DATA_CHANNEL_CAPACITY";
+
+/// [`DATA_CHANNEL_CAPACITY`], or the env override `env_raw` (clamped into
+/// the control channel's bounds; one that does not parse is ignored). Pure.
+fn effective_data_channel_capacity(env_raw: Option<&str>) -> usize {
+    env_raw
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map_or(DATA_CHANNEL_CAPACITY, |c| {
+            c.clamp(CONTROL_CHANNEL_CAPACITY_MIN, CONTROL_CHANNEL_CAPACITY_MAX)
+        })
+}
+
 /// Lower clamp for [`effective_control_channel_capacity`]. Below leviculum's
 /// own 256 default is already a foot-gun; 16 exists only so a deliberate
 /// test rig can force saturation, and 0 would panic tokio's `mpsc::channel`.
@@ -3888,6 +3914,16 @@ impl ReticulumTransport {
                 );
             }
         }
+        // v45 — the data plane's headroom for a media burst
+        // ([`DATA_CHANNEL_CAPACITY`]).
+        let data_capacity = effective_data_channel_capacity(
+            std::env::var(DATA_CHANNEL_CAPACITY_ENV).ok().as_deref(),
+        );
+        builder = builder.data_channel_capacity(data_capacity);
+        tracing::info!(
+            capacity = data_capacity,
+            "reticulum data-plane event channel capacity (a keyframe burst fits)"
+        );
         let mut share_instance_local: Option<String> = None;
         let mut connect_instance_local: Option<String> = None;
         if config.interfaces.is_empty() {
@@ -6146,6 +6182,15 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub fn lose_next_datagrams_for_test(&self, n: u64) {
         self.av_sink.lose_next_datagrams(n);
+    }
+
+    /// Test seam — this node's event loop takes `delay` before it handles
+    /// each arriving datagram: a receiver under load, made deliberate so a
+    /// witness never depends on what else runs on the box. `Duration::ZERO`
+    /// ends it.
+    #[doc(hidden)]
+    pub fn set_datagram_handling_delay_for_test(&self, delay: Duration) {
+        self.av_sink.set_datagram_handling_delay(delay);
     }
 
     /// v44 LTS test seam — the next decapsulation panics.
@@ -11778,6 +11823,11 @@ impl ReticulumTransport {
                     };
                     let label = event_label(&event);
                     let began = std::time::Instant::now();
+                    if matches!(event, NodeEvent::LinkDatagramReceived { .. }) {
+                        if let Some(delay) = self.av_sink.datagram_handling_delay() {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
                     handle_event(event, &ctx).await;
                     observe(label, began);
                     if let Some((link_id, up)) = direct_move {
@@ -25187,6 +25237,26 @@ mod tests {
     /// nothing at all.
     mod control_channel_capacity {
         use super::*;
+
+        /// v45 — the data plane runs at 1024 unless the env var says
+        /// otherwise (clamped; garbage ignored), and 1024 leaves a 30 KB
+        /// keyframe's 127 datagrams room under leviculum's shed line.
+        #[test]
+        fn the_data_plane_holds_a_keyframe_burst() {
+            assert_eq!(effective_data_channel_capacity(None), DATA_CHANNEL_CAPACITY);
+            assert_eq!(effective_data_channel_capacity(Some(" 4096\n")), 4096);
+            assert_eq!(
+                effective_data_channel_capacity(Some("1")),
+                CONTROL_CHANNEL_CAPACITY_MIN
+            );
+            assert_eq!(
+                effective_data_channel_capacity(Some("lots")),
+                DATA_CHANNEL_CAPACITY
+            );
+            let shed_line = DATA_CHANNEL_CAPACITY
+                - leviculum_core::node::datagram_sink_reserve_for(DATA_CHANNEL_CAPACITY);
+            assert!(shed_line >= 4 * 127, "{shed_line}");
+        }
 
         /// Config wins over env, and passes through when in band.
         #[test]

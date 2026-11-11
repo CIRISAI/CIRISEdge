@@ -1622,6 +1622,86 @@ async fn framed_video_arrives_whole_and_audio_unmarked() {
     );
 }
 
+/// The receiver's event loop handles one arriving datagram per
+/// [`LOADED_RECEIVER_DELAY`], deliberately: what a phone, or this box under
+/// another build, does. The v45.0.0 gate saw this once by accident
+/// (`framed_video_arrives_whole_and_audio_unmarked`, `av_datagram_shed_sink`
+/// 8 right after the keyframe), so the witness makes the load itself and
+/// never depends on what else runs.
+const LOADED_RECEIVER_DELAY: Duration = Duration::from_millis(2);
+
+/// **A keyframe reaches a loaded receiver whole** (v45). B publishes a
+/// 30 KB keyframe: about 127 datagrams at the loopback budget, sent back to
+/// back. A's event loop takes [`LOADED_RECEIVER_DELAY`] per datagram, so it
+/// drains leviculum's data plane at about 500 datagrams/s while the burst
+/// lands in a few ms. At leviculum's default data plane (128 events, a
+/// datagram shed while 96 are queued) the burst's tail is shed at A's sink
+/// (`av_datagram_shed_sink`) and the keyframe is lost whole, and v45.0.0 has
+/// no repair. Edge's data plane (`DATA_CHANNEL_CAPACITY`, 1024) holds the
+/// burst: nothing is shed, and the keyframe and the P-frames behind it
+/// arrive whole and in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_keyframe_reaches_a_loaded_receiver_whole() {
+    use ciris_edge::transport::av_chunk_auth::{CodecMap, CodecToken};
+    let _call = one_call().await;
+    let tag = "alm2-loaded";
+    let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let phone = CallOptions {
+        codecs: Some(CodecMap::new([CodecToken::Opus, CodecToken::H264]).expect("map")),
+        ..CallOptions::default()
+    };
+    let mut ca = join_loaded(a, &groups[0], tag, CallOptions::default(), None).await;
+    let mut cb = join_loaded(b, &groups[1], tag, phone, None).await;
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    wait_bound(&ca, 1).await;
+    let mut frames = ca.frames().expect("A's frames");
+    a.transport.refresh_metrics();
+    let shed_before = av(&a.metrics, "av_datagram_shed_sink");
+    a.transport
+        .set_datagram_handling_delay_for_test(LOADED_RECEIVER_DELAY);
+    let mut sent = vec![video(0, 30_000).bytes];
+    let key = cb.publish(video(0, 30_000)).await.expect("keyframe");
+    assert!(
+        key.fragments > 100,
+        "a keyframe of more than 100 datagrams: {}",
+        key.fragments
+    );
+    // P-frames of 1 KB (5 datagrams) at 30 Hz: 150 datagrams/s, well under
+    // what A drains, so only the keyframe's burst can overrun it.
+    for n in 1..=10u64 {
+        sent.push(video(n, 1_000).bytes);
+        cb.publish(video(n, 1_000)).await.expect("P-frame");
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        while got.len() < sent.len() {
+            match frames.recv().await {
+                Some(f) if f.publisher == b.key.key_id => got.push(f.bytes),
+                Some(_) => {}
+                None => break,
+            }
+        }
+    })
+    .await;
+    a.transport
+        .set_datagram_handling_delay_for_test(Duration::ZERO);
+    a.transport.refresh_metrics();
+    let shed = av(&a.metrics, "av_datagram_shed_sink") - shed_before;
+    assert!(
+        got == sent && shed == 0,
+        "every frame whole, in order, nothing shed at A's sink: got tags {:?} of {}; \
+         shed {shed}; B's legs {:?}\n{}\n{}",
+        tags(&got),
+        sent.len(),
+        cb.leg_info(),
+        call_diag("A", &ca, a),
+        call_diag("B", &cb, b),
+    );
+}
+
 /// **A backgrounded camera beside a live share** (v45, CC review of
 /// desktop sharing): B shares its screen, then backgrounds its camera
 /// (`end = 2` on the camera stream). A reads `StreamEnded { camera,

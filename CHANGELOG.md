@@ -36,6 +36,16 @@ and its delivery proof). MSRV 1.92; toolchain 1.97.0.
     final_seq); v1 is still sent for older peers. A v44 publisher's video reached only through a
     relay is held, then dropped, at v45 receivers (counted `av_frame_framing_unknown`); its audio
     plays.
+- **A keyframe burst no longer overruns a busy receiver.** leviculum's data-plane event channel
+  defaulted to 128 events and sheds an arriving link datagram while 96 are queued unread; a 30 KB
+  keyframe is 127 datagrams sent back to back, so a receiver whose event loop was busy for a few
+  milliseconds lost the burst's tail (`av_datagram_shed_sink`) and, with no repair in v45, the
+  whole keyframe. Edge now runs the channel at 1024 (`DATA_CHANNEL_CAPACITY`), 768 slots before a
+  datagram is shed. Env `CIRIS_EDGE_RETICULUM_DATA_CHANNEL_CAPACITY` overrides it, clamped like the
+  control channel's; the value is logged at start. Witness
+  `a_keyframe_reaches_a_loaded_receiver_whole` (the receiver's loop slowed to 2 ms per datagram):
+  at 128 it sheds 32 and loses the keyframe, at 1024 nothing is shed. A receiver slower than that
+  for longer still sheds; publisher pacing and resend are 45.1.
 - **leviculum v0.34.0+ciris.3:** `LinkHandle::try_send_seq` (and `NodeCore::send_on_link_seq`)
   returns the Channel sequence a message went out under, and the new `LinkSeqStats` (via
   `ReticulumNode::link_seq_stats`: `last_sent_sequence`, `oldest_unacked_sequence`,

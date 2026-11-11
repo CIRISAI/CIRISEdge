@@ -193,6 +193,10 @@ pub struct AvSink {
     /// Test seam — datagrams still to lose on arrival, as the wire would
     /// (leviculum#102). 0 in production.
     lose_datagrams: std::sync::atomic::AtomicU64,
+    /// Test seam — microseconds the event loop spends before it handles each
+    /// arriving datagram: a receiver whose event loop is loaded (another
+    /// build on the box, a slow phone). 0 in production.
+    datagram_handling_delay_us: std::sync::atomic::AtomicU64,
     arrivals_tx: mpsc::Sender<AvArrival>,
     arrivals_rx: Mutex<Option<mpsc::Receiver<AvArrival>>>,
 }
@@ -261,6 +265,7 @@ impl AvSink {
         Self {
             links: Mutex::new(SinkLinks::default()),
             lose_datagrams: std::sync::atomic::AtomicU64::new(0),
+            datagram_handling_delay_us: std::sync::atomic::AtomicU64::new(0),
             arrivals_tx,
             arrivals_rx: Mutex::new(Some(arrivals_rx)),
         }
@@ -375,6 +380,27 @@ impl AvSink {
     pub(crate) fn lose_next_datagrams(&self, n: u64) {
         self.lose_datagrams
             .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test seam — the event loop takes `delay` before it handles each
+    /// arriving datagram, so it drains leviculum's data plane slower than a
+    /// loopback link fills it (`Duration::ZERO` ends it).
+    pub(crate) fn set_datagram_handling_delay(&self, delay: std::time::Duration) {
+        self.datagram_handling_delay_us.store(
+            u64::try_from(delay.as_micros()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Test seam — the delay [`Self::set_datagram_handling_delay`] set, if any.
+    pub(crate) fn datagram_handling_delay(&self) -> Option<std::time::Duration> {
+        match self
+            .datagram_handling_delay_us
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            us => Some(std::time::Duration::from_micros(us)),
+        }
     }
 
     /// Test seam — whether to lose this arriving datagram ([`Self::lose_next_datagrams`]).
