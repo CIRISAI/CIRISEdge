@@ -215,7 +215,12 @@ async fn the_set_equals_a_full_drain_through_every_door_971() {
     let a = NodeA::build("mem971", 0x51).await; // key, occurrence, revocation, route doors
     a.withdraw_occurrence().await; // replicated-attestation door
     a.carrier_revoking_node_occurrence(a.k.key_id()).await; // the carrier
-    bind(&a.dir, &a.p, &a.n).await; // put_attestation
+
+    // `NodeA::build` announces N itself (#971), so the pre-boot
+    // `put_attestation` write is P's binding of a second node.
+    let q = Ident::mint("node-q-mem971", "node", 0x59).await;
+    hold(&a.dir, &q).await;
+    bind(&a.dir, &a.p, &q).await; // put_attestation
     let metrics = obs::EdgeMetrics::new();
     let bridge = bridge_with(
         Arc::clone(&a.dir) as Arc<dyn FederationDirectory>,
@@ -296,10 +301,9 @@ async fn the_set_equals_a_full_drain_through_every_door_971() {
 /// persist indexed for the row, for every kind delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_written_through_hash_is_the_index_hash_971() {
-    let a = NodeA::build("lock971a", 0x61).await;
+    let a = NodeA::build("lock971a", 0x61).await; // P's binding of N included
     a.withdraw_occurrence().await;
     a.carrier_revoking_node_occurrence(a.k.key_id()).await;
-    bind(&a.dir, &a.p, &a.n).await;
     let b_dir = super::park_fresh_858_tests::substrate().await;
     for id in [&a.p, &a.n, &a.k] {
         hold(&b_dir, id).await;
@@ -392,6 +396,10 @@ async fn idle_summaries_drain_the_index_zero_times_971() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_direct_store_write_is_not_wanted_971() {
     let a = NodeA::build("local971", 0x81).await;
+    // The node the direct write binds: held before the boot, so the write
+    // below adds the binding and nothing else.
+    let m = Ident::mint("node-m-local971", "node", 0x88).await;
+    hold(&a.dir, &m).await;
     let spaced = bridge_with(
         Arc::clone(&a.dir) as Arc<dyn FederationDirectory>,
         a.n.key_id(),
@@ -415,7 +423,7 @@ async fn a_direct_store_write_is_not_wanted_971() {
     ask_all(&spaced).await;
     ask_all(&unspaced).await;
     let before = index_drain(&*a.dir, "Attestation").await;
-    bind(&a.dir, &a.p, &a.n).await;
+    bind(&a.dir, &a.p, &m).await;
     let after = index_drain(&*a.dir, "Attestation").await;
     let new: Vec<EnvelopeRef> = refs_of(&after.difference(&before).copied().collect());
     assert!(!new.is_empty(), "the binding is indexed");
@@ -450,6 +458,9 @@ async fn a_direct_store_write_is_not_wanted_971() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_audit_adds_a_hash_no_feed_saw_971() {
     let a = NodeA::build("miss971", 0x8b).await;
+    // The node the unreported write binds: held before the boot.
+    let m = Ident::mint("node-m-miss971", "node", 0x92).await;
+    hold(&a.dir, &m).await;
     let metrics = obs::EdgeMetrics::new();
     let bridge = bridge_with(
         Arc::clone(&a.dir) as Arc<dyn FederationDirectory>,
@@ -464,7 +475,7 @@ async fn an_audit_adds_a_hash_no_feed_saw_971() {
     );
     ask_all(&bridge).await;
     let before = index_drain(&*a.dir, "Attestation").await;
-    bind(&a.dir, &a.p, &a.n).await;
+    bind(&a.dir, &a.p, &m).await;
     let after = index_drain(&*a.dir, "Attestation").await;
     let new: Vec<[u8; 32]> = after.difference(&before).copied().collect();
     assert_eq!(new.len(), 1, "one new binding");
@@ -575,7 +586,7 @@ async fn a_failed_probe_answers_from_the_drain_until_it_recovers_971() {
 }
 
 /// **Convergence.** Two nodes converge on every covered plane over the set,
-/// and a second round admits nothing: no held row is wanted again.
+/// and a round after that admits nothing: no held row is wanted again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_nodes_converge_and_stay_converged_971() {
     let a = NodeA::build("conv971", 0xb1).await;
@@ -601,18 +612,94 @@ async fn two_nodes_converge_and_stay_converged_971() {
         index_on(),
         Some(metrics.clone()),
     );
-    for kind in COVERED {
-        round(kind, &bridge_a, a.n.key_id(), &bridge_b, b_me.key_id()).await;
+    // A reads a stranger its new rows from a tip one minute back
+    // (`BridgeConfig::tip_margin`) and its history a page at a time from the
+    // round after. P's binding of N is the one Attestation row B is served,
+    // and N's occurrence is withdrawn, so P is not N's principal and the
+    // required read does not carry it: it crosses in the first round while it
+    // is younger than the margin and in the second when this test ran slower
+    // than that (a loaded full run takes over a minute to get here). Two
+    // rounds converge at either age.
+    for _ in 0..2 {
+        for kind in COVERED {
+            round(kind, &bridge_a, a.n.key_id(), &bridge_b, b_me.key_id()).await;
+        }
     }
     let admitted = metrics.snapshot();
+    assert_eq!(
+        admitted
+            .replication_applied_total
+            .get(&EnvelopeKind::Attestation)
+            .copied(),
+        Some(1),
+        "two rounds brought B the one Attestation row it is served"
+    );
     for kind in COVERED {
         round(kind, &bridge_a, a.n.key_id(), &bridge_b, b_me.key_id()).await;
     }
     let again = metrics.snapshot();
     assert_eq!(
         admitted.replication_applied_total, again.replication_applied_total,
-        "the second round applied nothing"
+        "a round after convergence applied nothing"
     );
+    assert_eq!(
+        counter(&metrics, obs::HOLDINGS_DUPLICATE_UNHELD[0])
+            + counter(&metrics, obs::HOLDINGS_DUPLICATE_UNHELD[1]),
+        0,
+        "and fetched nothing the store already held"
+    );
+}
+
+/// **A row older than the tip crosses with the history page.** The same two
+/// nodes with A's tip margin at zero, so P's binding of N is behind the tip
+/// whatever the clock: the first round offers B nothing on the Attestation
+/// plane, the second (the history page) brings the row, and a third applies
+/// nothing. This is the schedule a loaded run puts the convergence witness on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_behind_the_tip_crosses_with_the_history_page_971() {
+    let a = NodeA::build("tip971", 0xd4).await;
+    a.withdraw_occurrence().await;
+    let b_dir = super::park_fresh_858_tests::substrate().await;
+    for id in [&a.p, &a.n, &a.k] {
+        hold(&b_dir, id).await;
+    }
+    let b_me = Ident::mint("node-b-tip971", "node", 0xd8).await;
+    hold(&b_dir, &b_me).await;
+    let metrics = obs::EdgeMetrics::new();
+    let bridge_a = bridge_with(
+        Arc::clone(&a.dir) as Arc<dyn FederationDirectory>,
+        a.n.key_id(),
+        subjects(&a),
+        BridgeConfig {
+            tip_margin: Duration::ZERO,
+            ..index_on()
+        },
+        None,
+    );
+    let bridge_b = bridge_with(
+        Arc::clone(&b_dir) as Arc<dyn FederationDirectory>,
+        b_me.key_id(),
+        vec![b_me.key_id().to_owned()],
+        index_on(),
+        Some(metrics.clone()),
+    );
+    let applied = |m: &obs::EdgeMetrics| {
+        m.snapshot()
+            .replication_applied_total
+            .get(&EnvelopeKind::Attestation)
+            .copied()
+            .unwrap_or(0)
+    };
+    for (round_no, want) in [(1, 0), (2, 1), (3, 1)] {
+        for kind in COVERED {
+            round(kind, &bridge_a, a.n.key_id(), &bridge_b, b_me.key_id()).await;
+        }
+        assert_eq!(
+            applied(&metrics),
+            want,
+            "round {round_no}: Attestation rows B applied so far"
+        );
+    }
     assert_eq!(
         counter(&metrics, obs::HOLDINGS_DUPLICATE_UNHELD[0])
             + counter(&metrics, obs::HOLDINGS_DUPLICATE_UNHELD[1]),
@@ -626,9 +713,8 @@ async fn two_nodes_converge_and_stay_converged_971() {
 /// no ask ever saw a partial set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_diffs_never_see_a_partial_set_971() {
-    let a = NodeA::build("conc971", 0xc1).await;
+    let a = NodeA::build("conc971", 0xc1).await; // P's binding of N included
     a.withdraw_occurrence().await;
-    bind(&a.dir, &a.p, &a.n).await;
     let bridge = bridge_with(
         Arc::clone(&a.dir) as Arc<dyn FederationDirectory>,
         a.n.key_id(),

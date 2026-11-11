@@ -48,20 +48,19 @@ async fn fixture(tag: &str, seed: u8) -> Fixture {
     let consented = Ident::mint(&format!("node-m-{tag}"), "node", seed.wrapping_add(9)).await;
     hold(&a.dir, &local).await;
     hold(&a.dir, &consented).await;
-    for node in [&a.n, &local] {
-        let row = crate::replication::attestation_bind::owner_binding_attestation(
-            a.p.key_id(),
-            node.key_id(),
-            chrono::Utc::now(),
-            &a.p.signer(),
-        )
+    // `NodeA::build` announces N itself; this adds P's binding of L.
+    let row = crate::replication::attestation_bind::owner_binding_attestation(
+        a.p.key_id(),
+        local.key_id(),
+        chrono::Utc::now(),
+        &a.p.signer(),
+    )
+    .await
+    .expect("binding");
+    a.dir
+        .put_attestation(SignedAttestation { attestation: row })
         .await
-        .expect("binding");
-        a.dir
-            .put_attestation(SignedAttestation { attestation: row })
-            .await
-            .expect("admit binding");
-    }
+        .expect("admit binding");
     let grant = crate::replication::attestation_bind::replication_consent_attestation(
         local.key_id(),
         consented.key_id(),
