@@ -67,7 +67,7 @@ pub async fn open_federation_sqlite(
         readers,
         env = READERS_ENV,
         "opening the SQLite store with no reader pool on this platform \
-         (CIRISPersist#1261: untested on iOS); set the env var to override"
+         (history: CIRISPersist#1261, fixed at 61.2.3 and not yet run on iOS); set the env var to override"
     );
     let backend =
         SqliteBackend::open_with_readers(path.to_string_lossy().into_owned(), readers).await?;
