@@ -412,6 +412,21 @@ jobs:
           rustup default stable
           cargo --version
           cargo build --help >/dev/null
+      - name: cargo test --no-run (build the test binaries)
+        # The build has its own step and its own budget. Before v45.0.2 it
+        # shared the test step's 30 minutes: a cold build took 21 of them, the
+        # first attempt always timed out, and a later attempt passed only
+        # while the tests alone fit in 30. At v45 they take about 43 minutes
+        # on this runner (debug/darwin-open run 43165462094: 64 minutes cold,
+        # build included), so v45.0.1's tag run timed out three times and
+        # published nothing.
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          retry_wait_seconds: 60
+          shell: bash
+          command: cargo test --no-run --features "transport-http transport-reticulum"
       - name: cargo test (transport-http + transport-reticulum)
         # transport-reticulum on darwin too — Leviculum's macOS path is
         # load-bearing (edge ships darwin wheels; the teranos fork base
@@ -422,8 +437,11 @@ jobs:
         # at least as often as Linux.
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 30
-          max_attempts: 3
+          # Tests only (the step above built them): about 43 minutes at v45.
+          # Two attempts, because a red test must not be retried into green
+          # more than once; the retry is for the runner, not for the suite.
+          timeout_minutes: 75
+          max_attempts: 2
           retry_wait_seconds: 60
           shell: bash
           command: cargo test --features "transport-http transport-reticulum"

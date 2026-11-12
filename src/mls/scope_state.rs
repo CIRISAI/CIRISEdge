@@ -631,8 +631,7 @@ mod tests {
         use ciris_persist::encrypted_kv::MlsStateCustodyKind;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("mls-state.kv");
-        // Through edge's own door: on macOS a raw persist open fails at 61.2.2
-        // (CIRISPersist#1261); the door opens with no reader pool there.
+        // Through edge's own door (CIRISPersist#1261: no reader pool on iOS).
         let backend = crate::store_open::open_federation_sqlite(dir.path().join("persist.db"))
             .await
             .expect("open substrate");
