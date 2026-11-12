@@ -2,6 +2,29 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.0.1 — 2026-11-11
+
+**PATCH.** Pins unchanged (persist v61.2.2, CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3). v45.0.0
+is tagged (a54c6a2) but has no release: its macOS lane failed, and the release job needs it. A host
+that consumes edge by tag may stay on v45.0.0 if it applies the same default itself (CIRISServer
+does); this version is the first v45 with release assets.
+
+### Consumer notes
+
+- **On macOS and iOS a file-backed store opens with no reader pool unless the operator set
+  `CIRIS_PERSIST_SQLITE_READERS` (CIRISPersist#1261).** At persist 61.2.2 a file-backed
+  `SqliteBackend::open` fails on macOS with `sqlite open readers: unable to open database file`.
+  On a macos-15 runner `CIRIS_PERSIST_SQLITE_READERS=0` clears it; the memory-map knob, the temp
+  directory and the open-file limit do not; persist 61.0.5 opened the same stores. The cause is
+  not established. `EdgeBuilder::from_keyring_seed_dir` (the one place edge opens its own store)
+  now goes through `store_open::open_federation_sqlite`: on an Apple target with the env var
+  unset it opens with zero readers, so reads use the writer connection, the model persist ran
+  before the pool. The cost is concurrency only. One WARN at open names the env var. An
+  operator's value wins; every other platform, and every in-memory store, is unchanged. A host
+  that opens the store itself and hands edge a capsule must apply the same default itself. iOS
+  is presumed affected and has not been tested. To be removed when the persist pin carries the
+  fix.
+
 ## 45.0.0 — 2026-11-10
 
 **MAJOR.** Pins: persist v61.2.2 (712575df; CIRISPersist#1246 SQLite mmap and cache_size), CIRISVerify

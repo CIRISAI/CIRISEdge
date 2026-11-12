@@ -170,11 +170,9 @@ async fn idle_store() -> (Arc<SqliteBackend>, Option<tempfile::TempDir>) {
     if std::env::var("CIRIS_EDGE_IDLE_COST_DISK").is_ok_and(|v| v == "1") {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("seat-971.db");
-        let backend = ciris_persist::prelude::FederationDirectorySqlite::open(
-            path.to_str().expect("utf-8 path"),
-        )
-        .await
-        .expect("open the on-disk store");
+        let backend = crate::store_open::open_federation_sqlite(&path)
+            .await
+            .expect("open the on-disk store");
         backend.run_migrations().await.expect("migrate");
         eprintln!("971 idle store: on disk at {}", path.display());
         (backend, Some(dir))

@@ -8692,7 +8692,7 @@ impl EdgeBuilder {
         // db_path-opens-its-own-pool path here.
         let signer = LocalSigner::from_keyring_seed_dir(key_id, seed_dir).await?;
 
-        let directory = ciris_persist::prelude::FederationDirectorySqlite::open(&db_path)
+        let directory = crate::store_open::open_federation_sqlite(&db_path)
             .await
             .map_err(|e| EdgeError::Persist(format!("FederationDirectorySqlite::open: {e}")))?;
         // CIRISPersist#988 — this node's key, the attester of its acts (see

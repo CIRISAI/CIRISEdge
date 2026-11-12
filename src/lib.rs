@@ -77,6 +77,10 @@ pub mod rate_limit;
 #[cfg(test)]
 mod role_matrix_gauntlet;
 pub mod runtime_budget;
+/// Opening a file-backed persist store (the Apple reader-pool default,
+/// CIRISPersist#1261).
+#[doc(hidden)]
+pub mod store_open;
 /// v44 — the operator's telemetry: the catalogue, lock-free histograms and
 /// gauges, and shaping's windowed ledger (`docs/TELEMETRY_CATALOGUE.md`).
 pub mod telemetry;

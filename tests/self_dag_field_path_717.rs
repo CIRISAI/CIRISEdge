@@ -63,7 +63,7 @@ use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner
 use ciris_persist::federation::blobs::BlobStorage as _;
 use ciris_persist::federation::key_grant::SignedKeyGrantRow;
 use ciris_persist::federation::{Attestation, FederationDirectory, SignedAttestation};
-use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
+use ciris_persist::prelude::{KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
 use ciris_persist::store::sqlite::SqliteBackend;
 use common::build_reticulum_with_retry;
@@ -205,7 +205,7 @@ async fn device(
     device: &Ident,
     class: &str,
 ) -> Node {
-    let dir = FederationDirectorySqlite::open(db)
+    let dir = ciris_edge::store_open::open_federation_sqlite(db)
         .await
         .expect("open substrate");
     dir.run_migrations().await.expect("migrate");
