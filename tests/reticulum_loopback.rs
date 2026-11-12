@@ -141,7 +141,7 @@ async fn auth_for(
         signer: Some(signer_for(key, base).await),
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -244,7 +244,7 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
     println!("[loopback] send outcome: {outcome:?}");
 
     // The envelope must arrive on A's inbound sink, byte-exact.
-    let frame = tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
+    let frame = tokio::time::timeout(Duration::from_mins(1), rx_a.recv())
         .await
         .expect("timed out waiting for inbound frame on A")
         .expect("A inbound channel closed");
@@ -358,7 +358,7 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
             .transport(transport_a.clone() as Arc<dyn Transport>)
             .reticulum_transport(transport_a.clone())
             .config(EdgeConfig {
-                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                hybrid_policy: HybridPolicy::Strict,
                 cohort_scope_enforcement: ciris_edge::CohortScopeEnforcement::Off,
                 ..EdgeConfig::default()
             })
@@ -373,7 +373,7 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
             .transport(transport_b.clone() as Arc<dyn Transport>)
             .reticulum_transport(transport_b.clone())
             .config(EdgeConfig {
-                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                hybrid_policy: HybridPolicy::Strict,
                 cohort_scope_enforcement: ciris_edge::CohortScopeEnforcement::Off,
                 ..EdgeConfig::default()
             })

@@ -103,6 +103,14 @@ pub trait ReplicationDirectory: Send + Sync {
         self.list_envelope_refs(kind).await
     }
 
+    /// CIRISEdge#971 — the receive diff against [`Self::list_holdings`]:
+    /// which of `remote`'s hashes this node does not hold for `kind`. The
+    /// default is the diff over the listing; the bridge answers it from its
+    /// holdings index without listing.
+    async fn holdings_want(&self, kind: EnvelopeKind, remote: &[EnvelopeRef]) -> Vec<[u8; 32]> {
+        super::summary::diff_refs(&self.list_holdings(kind).await, remote)
+    }
+
     /// CIRISEdge#462 — the RECEIVE-axis SERVE reader: the refs held for `kind`
     /// where `subject_key_id` is the data-subject (records ABOUT it) or, on the
     /// Attestation plane, the sender (records BY it — authorship recovery).
@@ -268,6 +276,12 @@ pub trait ReplicationDirectory: Send + Sync {
         None
     }
 
+    /// CIRISEdge#971 (d) — see [`StateProvider::note_pull_answer`].
+    ///
+    /// [`StateProvider::note_pull_answer`]:
+    ///     super::summary::StateProvider::note_pull_answer
+    fn note_pull_answer(&self, _peer_key_id: &str, _subject_key_id: &str, _throttled: bool) {}
+
     /// See [`StateProvider::take_released_rows_for`].
     ///
     /// [`StateProvider::take_released_rows_for`]:
@@ -367,6 +381,13 @@ impl StateProvider for DirectoryStateAdapter {
         self.inner.list_holdings(kind).await
     }
 
+    /// CIRISEdge#971 — FORWARD the diff, so the bridge's holdings index
+    /// answers it. Taking the trait default here would list the holdings and
+    /// diff them, which is the per-Summary drain the index exists to retire.
+    async fn local_want(&self, kind: EnvelopeKind, remote: &[EnvelopeRef]) -> Vec<[u8; 32]> {
+        self.inner.holdings_want(kind, remote).await
+    }
+
     /// CIRISEdge#544 — forward the want-suppression question to the directory,
     /// which is the ONE shared bridge every per-peer provider sits on. Sync by
     /// contract: a map probe, never I/O. Node-wide by construction — peer A's
@@ -405,6 +426,11 @@ impl StateProvider for DirectoryStateAdapter {
 
     fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
         self.inner.take_missing_signer_for(peer_key_id)
+    }
+
+    fn note_pull_answer(&self, peer_key_id: &str, subject_key_id: &str, throttled: bool) {
+        self.inner
+            .note_pull_answer(peer_key_id, subject_key_id, throttled);
     }
 
     fn take_released_rows_for(&self, peer_key_id: &str, kind: EnvelopeKind) -> Vec<[u8; 32]> {

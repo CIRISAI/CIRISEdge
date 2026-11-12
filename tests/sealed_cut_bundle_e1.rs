@@ -369,7 +369,7 @@ fn auth(signer: Arc<LocalSigner>, dir: &Arc<SqliteBackend>) -> ReticulumAuth {
         signer: Some(signer),
         rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -645,7 +645,7 @@ async fn two_hops(seed_canonical_row: bool) {
     // `O` published its route to the canonical (the row its transport emits,
     // through the canonical's ordinary door): the canonical holds it.
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             !o_hop.own_routes().await.is_empty() && !c_hop.own_routes().await.is_empty()
         })
         .await,

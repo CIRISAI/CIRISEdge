@@ -81,7 +81,7 @@ const WORKER_THREADS: usize = 4;
 const KINDS: usize = 8;
 const PEERS: usize = 5;
 /// The hard wall-clock bound the test thread holds on the whole scenario.
-const HARD_TIMEOUT: Duration = Duration::from_secs(240);
+const HARD_TIMEOUT: Duration = Duration::from_mins(4);
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -191,7 +191,7 @@ fn auth(signer: Arc<LocalSigner>, dir: &Arc<SqliteBackend>) -> ReticulumAuth {
         signer: Some(signer),
         rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -280,7 +280,7 @@ async fn node(
 ) -> Arc<ReplicationRuntime> {
     let scheduler = SchedulerConfig {
         // Rounds after the start-up tick are driven by the test.
-        cadence: Duration::from_secs(3600),
+        cadence: Duration::from_hours(1),
         round_timeout: Duration::from_secs(5),
         ..SchedulerConfig::default()
     };
@@ -664,7 +664,7 @@ async fn a_dead_peer_cannot_starve_a_live_one_of_rounds() {
         vec![plane(&dead), plane(&live)],
         Arc::default(),
         SchedulerConfig {
-            cadence: Duration::from_secs(3600),
+            cadence: Duration::from_hours(1),
             round_timeout: ROUND_TIMEOUT,
             max_concurrent_rounds: 1,
         },

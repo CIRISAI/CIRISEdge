@@ -175,12 +175,17 @@ jobs:
         # reset by peer)` mid-`cargo metadata` — a transient crates.io
         # CDN edge condition. CARGO_NET_RETRY=10 covers in-process
         # retries; this catches sustained pockets where cargo's budget
-        # exhausts. 45-min timeout matches the slowest pyo3-full
-        # --tests run; 3 attempts with 60s wait between is the same
+        # exhausts. 3 attempts with 60s wait between is the same
         # shape used on android-ndk + build-ios + ios-pyo3 + benches.
+        #
+        # v45.0.0 — 75 minutes per attempt. On PR #980 a warm pyo3-full
+        # --tests run took 40 minutes and the cold first attempt was cut
+        # off at 45 with no test failed, so the lane spent a whole
+        # attempt on its own budget. This bounds the CI step, not any
+        # test's deadline.
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 45
+          timeout_minutes: 75
           max_attempts: 3
           retry_wait_seconds: 60
           shell: bash

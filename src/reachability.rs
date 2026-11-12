@@ -278,15 +278,15 @@ impl AttemptRingBuffer {
             attempts = attempts.saturating_add(1);
             if entry.outcome.is_success() {
                 successes = successes.saturating_add(1);
-                if last_success_at.map_or(true, |prev| entry.at > prev) {
+                if last_success_at.is_none_or(|prev| entry.at > prev) {
                     last_success_at = Some(entry.at);
                 }
             }
-            if last_attempt_at.map_or(true, |prev| entry.at > prev) {
+            if last_attempt_at.is_none_or(|prev| entry.at > prev) {
                 last_attempt_at = Some(entry.at);
             }
             if let Some(cls) = entry.outcome.error_class() {
-                if last_error_at.map_or(true, |prev| entry.at > prev) {
+                if last_error_at.is_none_or(|prev| entry.at > prev) {
                     last_error_at = Some(entry.at);
                     last_error_class = Some(cls);
                 }

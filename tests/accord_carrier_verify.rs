@@ -363,7 +363,7 @@ async fn build_edge(
     // hybrid-pending envelopes. Same pattern as
     // `tests/content_fetch.rs::test_edge_config`.
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     };
     Edge::builder()

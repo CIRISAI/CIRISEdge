@@ -2751,7 +2751,7 @@ async fn holding_claims_of(node: &Node, scope: Option<&str>) -> Vec<Vec<u8>> {
                 &a.attestation.attestation_envelope,
             ) == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
         })
-        .filter(|a| scope.map_or(true, |s| a.attestation.cohort_scope == s))
+        .filter(|a| scope.is_none_or(|s| a.attestation.cohort_scope == s))
         .map(|a| serde_json::to_vec(&a.attestation).expect("wire"))
         .collect()
 }
@@ -4019,7 +4019,7 @@ async fn a_community_pull_resolves_through_the_rooms_group_and_stops_at_the_scop
                 Arc::clone(&table),
                 sink,
                 own,
-                std::time::Duration::from_secs(300),
+                std::time::Duration::from_mins(5),
             )),
             table,
         )

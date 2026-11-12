@@ -373,7 +373,7 @@ fn auth_for(node: &Node) -> ReticulumAuth {
         signer: Some(Arc::clone(&node.signer)),
         rooting: Some(Arc::clone(&node.dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -474,9 +474,9 @@ async fn member(
                 ),
                 dir: node.dir.clone(),
             }))
-            .scope_native_addressing(Duration::from_secs(300))
+            .scope_native_addressing(Duration::from_mins(5))
             .config(EdgeConfig {
-                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                hybrid_policy: HybridPolicy::Strict,
                 ..EdgeConfig::default()
             })
             .build()
@@ -1398,10 +1398,10 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
     install_family_room(&p1, &q1, &roster.nodes).await;
     arm_puller(&mut q1);
 
-    wait_for_path(&q1.rt, &p1.node.me, true, Duration::from_secs(60)).await;
-    wait_for_path(&p1.rt, &q1.node.me, true, Duration::from_secs(60)).await;
-    wait_for_path(&n.rt, &p1.node.me, true, Duration::from_secs(60)).await;
-    wait_for_path(&p1.rt, &n.node.me, true, Duration::from_secs(60)).await;
+    wait_for_path(&q1.rt, &p1.node.me, true, Duration::from_mins(1)).await;
+    wait_for_path(&p1.rt, &q1.node.me, true, Duration::from_mins(1)).await;
+    wait_for_path(&n.rt, &p1.node.me, true, Duration::from_mins(1)).await;
+    wait_for_path(&p1.rt, &n.node.me, true, Duration::from_mins(1)).await;
 
     // ── P1 publishes both files in the family room.
     let inline = publish(&p1, &p, INLINE_LEN, 0x0736, "note.bin").await;
@@ -1492,7 +1492,7 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
 
     // ── Q1 reads both, byte-identical, through the real pull.
     wait_read_back(&p1, &q1, &inline, "inline file", Duration::from_secs(90)).await;
-    wait_read_back(&p1, &q1, &dag, "DAG file", Duration::from_secs(120)).await;
+    wait_read_back(&p1, &q1, &dag, "DAG file", Duration::from_mins(2)).await;
     let sources = q1.edge.metrics().snapshot().blob_pull_sources;
     assert!(
         sources.get("family:author_nodes").copied().unwrap_or(0) >= 2,
@@ -1706,8 +1706,8 @@ async fn family_files_cross_through_a_non_member_forwarder_that_learns_nothing_7
     install_family_room(&p1, &q1, &roster.nodes).await;
     arm_puller(&mut q1);
 
-    wait_for_path(&q1.rt, &p1.node.me, false, Duration::from_secs(60)).await;
-    wait_for_path(&p1.rt, &q1.node.me, false, Duration::from_secs(60)).await;
+    wait_for_path(&q1.rt, &p1.node.me, false, Duration::from_mins(1)).await;
+    wait_for_path(&p1.rt, &q1.node.me, false, Duration::from_mins(1)).await;
 
     let inline = publish(&p1, &p, INLINE_LEN, 0x2736, "note.bin").await;
     let dag = publish(&p1, &p, DAG_LEN, 0x3736, "video.bin").await;
@@ -1723,7 +1723,7 @@ async fn family_files_cross_through_a_non_member_forwarder_that_learns_nothing_7
         );
     }
     wait_read_back(&p1, &q1, &inline, "inline file", Duration::from_secs(150)).await;
-    wait_read_back(&p1, &q1, &dag, "DAG file", Duration::from_secs(240)).await;
+    wait_read_back(&p1, &q1, &dag, "DAG file", Duration::from_mins(4)).await;
     let (f_fwd_after, f_bytes_after) = f.rt.relay_observation_for_test();
 
     // The carrier: the identity-plane link, discriminated inside (#718).

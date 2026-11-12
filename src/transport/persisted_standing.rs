@@ -63,16 +63,16 @@ pub(super) const PASS_BOUND: Duration = Duration::from_secs(20);
 
 /// How often the whole list is walked. As the key-plane memos' TTL
 /// ([`crate::replication`]'s `MEMO_TTL`), for the same reason.
-pub(super) const SWEEP_EVERY: Duration = Duration::from_secs(600);
+pub(super) const SWEEP_EVERY: Duration = Duration::from_mins(10);
 
 /// How long a row that proved nothing is left out of a sweep. Longer than
 /// [`SWEEP_EVERY`], or the memo would never save a walk. A change naming the
 /// key ends it at once; this bounds what no change names, a link upstream in a
 /// chain.
-pub(crate) const UNPROVEN_TTL: Duration = Duration::from_secs(1_800);
+pub(crate) const UNPROVEN_TTL: Duration = Duration::from_mins(30);
 
 /// A table this long without a change read is forgotten.
-pub(super) const STALE_AFTER: Duration = Duration::from_secs(600);
+pub(super) const STALE_AFTER: Duration = Duration::from_mins(10);
 
 /// Rows per statement of the change read.
 pub(super) const CHANGE_PAGE: u32 = 256;
@@ -83,7 +83,7 @@ const MAX_PENDING: usize = 4_096;
 
 /// The cursors start this far back, as the key-plane memos' do: a row committed
 /// while the first list is being read is past them.
-const CURSOR_LAG: Duration = Duration::from_secs(60);
+const CURSOR_LAG: Duration = Duration::from_mins(1);
 
 /// A binding persist holds for a proven transport identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +134,7 @@ impl Walk {
             && (self.sweep_now
                 || self
                     .swept_at
-                    .map_or(true, |at| now.saturating_duration_since(at) >= SWEEP_EVERY))
+                    .is_none_or(|at| now.saturating_duration_since(at) >= SWEEP_EVERY))
     }
 }
 
@@ -733,7 +733,7 @@ mod tests {
         keys
     }
 
-    const POLICY: HybridPolicy = HybridPolicy::Ed25519Fallback;
+    const POLICY: HybridPolicy = HybridPolicy::Strict;
 
     /// `span` of ordinary 30 s ticks: the change read stays fresh throughout.
     async fn ticks(refresh: &Arc<StandingRefresh>, dir: &Arc<Rows>, span: Duration) {

@@ -282,7 +282,7 @@ async fn unroutable_peer_costs_the_backoff_schedule_across_every_kind_and_kick_7
         snap[0].failed_probes, 4,
         "probes at 30/90/210/450 s: {snap:?}"
     );
-    assert_eq!(snap[0].current_delay, Duration::from_secs(480), "{snap:?}");
+    assert_eq!(snap[0].current_delay, Duration::from_mins(8), "{snap:?}");
     rig.stop().await;
 }
 
@@ -584,11 +584,11 @@ fn the_cap_is_set_by_builder_and_handle_not_by_config_794() {
         handle.no_route_backoff_cap(),
         super::DEFAULT_NO_ROUTE_BACKOFF_CAP
     );
-    let mut sched = sched.with_no_route_backoff_cap(Duration::from_secs(20 * 60));
+    let mut sched = sched.with_no_route_backoff_cap(Duration::from_mins(20));
     let handle = sched.install_control_channel();
-    assert_eq!(handle.no_route_backoff_cap(), Duration::from_secs(20 * 60));
-    handle.set_no_route_backoff_cap(Duration::from_secs(25 * 60));
-    assert_eq!(handle.no_route_backoff_cap(), Duration::from_secs(25 * 60));
+    assert_eq!(handle.no_route_backoff_cap(), Duration::from_mins(20));
+    handle.set_no_route_backoff_cap(Duration::from_mins(25));
+    assert_eq!(handle.no_route_backoff_cap(), Duration::from_mins(25));
 }
 
 /// A removed peer's backoff goes with its last coordinator.

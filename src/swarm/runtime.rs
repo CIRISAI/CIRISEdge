@@ -149,7 +149,7 @@ pub const DEFAULT_EVICTION_GRACE_PCT: u8 = 15;
 /// on every converger tick. Bound by the substrate's expectation
 /// that claims are republished at `publish_cadence`; the TTL
 /// should comfortably exceed two publish intervals.
-pub const DEFAULT_OBSERVED_CLAIM_TTL: Duration = Duration::from_secs(600);
+pub const DEFAULT_OBSERVED_CLAIM_TTL: Duration = Duration::from_mins(10);
 
 /// A claim a peer published, as observed by this runtime. The runtime
 /// keeps one per `(content_id, peer_id)` — a later observation from
@@ -211,7 +211,7 @@ pub struct SwarmRuntimeConfig {
 impl Default for SwarmRuntimeConfig {
     fn default() -> Self {
         Self {
-            publish_cadence: Duration::from_secs(60),
+            publish_cadence: Duration::from_mins(1),
             observe_cadence: Duration::from_secs(30),
             target_holders: DEFAULT_TARGET_HOLDERS,
             min_viable: DEFAULT_MIN_VIABLE,
@@ -582,7 +582,7 @@ fn median_diversity(scores: &BTreeMap<String, Option<f64>>) -> Option<f64> {
     if present.len() % 2 == 1 {
         Some(present[mid])
     } else {
-        Some((present[mid - 1] + present[mid]) / 2.0)
+        Some(f64::midpoint(present[mid - 1], present[mid]))
     }
 }
 
@@ -1647,7 +1647,7 @@ static SWARM_CONFIG_PLANE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrot
 
 fn swarm_config_plane_log() -> &'static crate::log_throttle::LogThrottle {
     SWARM_CONFIG_PLANE_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(300), 8))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(5), 8))
 }
 
 fn current_unix_ms() -> i64 {
@@ -1807,8 +1807,8 @@ mod tests {
         let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let rt = FountainSwarmRuntime::start(
             SwarmRuntimeConfig {
-                publish_cadence: Duration::from_secs(60),
-                observe_cadence: Duration::from_secs(60),
+                publish_cadence: Duration::from_mins(1),
+                observe_cadence: Duration::from_mins(1),
                 ..Default::default()
             },
             holdings,
@@ -2523,8 +2523,8 @@ mod tests {
         let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let mut rt = FountainSwarmRuntime::start_with_options(
             SwarmRuntimeConfig {
-                publish_cadence: Duration::from_secs(60),
-                observe_cadence: Duration::from_secs(60),
+                publish_cadence: Duration::from_mins(1),
+                observe_cadence: Duration::from_mins(1),
                 ..Default::default()
             },
             holdings,

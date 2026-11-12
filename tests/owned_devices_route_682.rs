@@ -409,7 +409,7 @@ async fn pair_with(tag: &str, scope: &str, d2: D2Starts) -> Pair {
         signer: Some(key.signer()),
         rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         // CIRISEdge#727 — the production wiring: a node pushes its own
         // owner-binding on every link it dials.
         own_owner_binding: Some(Arc::new(DirectoryOwnerBinding::new(
@@ -525,7 +525,7 @@ async fn device(
                     // (a mid-round responder treats extra envelopes as unasked
                     // and refuses them — the #426 hole closure, not a drop
                     // under test here).
-                    cadence: Duration::from_secs(3600),
+                    cadence: Duration::from_hours(1),
                     round_timeout: Duration::from_secs(15),
                     ..SchedulerConfig::default()
                 },
@@ -655,7 +655,7 @@ fn init_tracing() {
 
 /// Returns the number of round sweeps until both routes crossed.
 async fn routes_cross_and_a_resource_row_admits(p: &Pair, label: &str) -> usize {
-    let crossed = drive_until(p, Duration::from_secs(120), || async {
+    let crossed = drive_until(p, Duration::from_mins(2), || async {
         p.d2.holds_route_for(&p.d1.key).await && p.d1.holds_route_for(&p.d2.key).await
     })
     .await;
@@ -698,7 +698,7 @@ async fn routes_cross_and_a_resource_row_admits(p: &Pair, label: &str) -> usize 
         .send(&p.d2.key.key_id, &frame)
         .await
         .expect("D1 -> D2 Resource");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
     let landed = loop {
         let mut all = true;
         for id in &ids {
@@ -1099,7 +1099,7 @@ async fn a_node_pushes_its_binding_only_on_a_link_it_dialed_727() {
                 signer: Some(s.signer()),
                 rooting: Some(Arc::clone(&dir_s) as Arc<dyn RootingDirectory>),
                 resolver: None,
-                hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+                hybrid_policy: ciris_edge::HybridPolicy::Strict,
                 own_owner_binding: Some(Arc::new(DirectoryOwnerBinding::new(
                     Arc::clone(&dir_s) as Arc<dyn FederationDirectory>,
                     s.key_id.clone(),
@@ -1121,7 +1121,7 @@ async fn a_node_pushes_its_binding_only_on_a_link_it_dialed_727() {
     let stranger = device(Arc::clone(&s), dir_s, ts, ms, &s, &p.d1.key).await;
 
     // Drive all three; the pair converges, the stranger keeps dialing D1.
-    let crossed = drive_until(&p, Duration::from_secs(120), || async {
+    let crossed = drive_until(&p, Duration::from_mins(2), || async {
         let _ = stranger.runtime.round_now_all().await;
         p.d2.holds_route_for(&p.d1.key).await && p.d1.holds_route_for(&p.d2.key).await
     })
@@ -1187,7 +1187,7 @@ async fn a_wiped_device_reconverges_by_dialling_its_sibling_727() {
             .await,
         "precondition: the wiped device holds no binding about itself"
     );
-    let crossed = drive_until(&p, Duration::from_secs(120), || async {
+    let crossed = drive_until(&p, Duration::from_mins(2), || async {
         p.d2.holds_route_for(&p.d1.key).await
             && p.d1.holds_route_for(&p.d2.key).await
             && p.d2

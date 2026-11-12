@@ -146,7 +146,7 @@ async fn running_node(label: &str, state_dir: &Path) -> Running {
                     signer: Some(signer),
                     rooting: Some(Arc::clone(&dir) as Arc<dyn RootingDirectory>),
                     resolver: None,
-                    hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+                    hybrid_policy: ciris_edge::HybridPolicy::Strict,
                     ..ReticulumAuth::default()
                 },
             )

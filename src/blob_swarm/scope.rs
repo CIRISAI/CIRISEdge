@@ -1518,7 +1518,7 @@ mod tests {
                 Arc::clone(&table),
                 Arc::new(Listen::default()),
                 own,
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             );
             (life, table)
         }

@@ -175,7 +175,7 @@ use ciris_persist::store::sqlite::SqliteBackend;
 /// reported as a red leg with a number rather than eating the budget the chat
 /// legs below still need.
 fn budget_owner_binding(barrier: Duration) -> Duration {
-    barrier.min(Duration::from_secs(120))
+    barrier.min(Duration::from_mins(2))
 }
 
 /// One measured or attempted leg of the harness.
@@ -2713,7 +2713,7 @@ async fn stand_up(
         signer: Some(signer),
         rooting: Some(Arc::clone(&directory) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         // CIRISEdge#727 — this node's own owner-binding rides every link it
         // dials (the owner-binding rung). A harness node is unowned unless
         // its fixture claims it, in which case the source finds the row.
@@ -2793,7 +2793,7 @@ async fn stand_up(
                 dir: Arc::clone(&directory),
             }))
             .config(ciris_edge::EdgeConfig {
-                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                hybrid_policy: HybridPolicy::Strict,
                 ..ciris_edge::EdgeConfig::default()
             })
             .build()
@@ -6223,7 +6223,7 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
                 // count bounds the wait when both arrive; the deadline
                 // bounds it when a probe is lost in transit.
                 let mut answered = 0u8;
-                let until = Instant::now() + Duration::from_secs(60);
+                let until = Instant::now() + Duration::from_mins(1);
                 while answered < 2 && Instant::now() < until {
                     if let Ok((_s, Control::AddressProbe { address_hex, nonce })) = occ
                         .mailbox

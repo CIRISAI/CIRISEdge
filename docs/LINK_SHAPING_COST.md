@@ -63,10 +63,13 @@ toward it.
   battery on top of the data above.
 - **Where clients read the table.** The mobile surface exposes it as
   `shaping_class_table()`, the UniFFI function for the client to show at the
-  moment of choosing. PyO3 hosts read it through `shaping_class`:
-  - `"server"` gives the server default.
-  - Any other class is the person's opt-in for that class.
-  - No class shapes the layer links only.
+  moment of choosing. PyO3 hosts name the device with `shaping_class` and the
+  person's choice with `shaping_opt_in` / `shaping_opt_in_cellular`:
+  - `"server"` gives the server default (every identity link).
+  - `"home"`, `"phone-wifi"` or `"phone-cellular"` shapes the layer links only,
+    unless the matching opt-in is set. Naming the class is not the opt-in.
+  - No class is the platform's device at its fleet default.
+  - `shaping_set_device_state` keeps an opt-in the call leaves out.
 
 ## The bound: shape with shaped peers if possible, otherwise refuse
 

@@ -204,7 +204,7 @@ async fn directory_with(records: Vec<KeyRecord>) -> Arc<SqliteBackend> {
 
 fn test_edge_config() -> EdgeConfig {
     EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     }
 }

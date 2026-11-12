@@ -58,7 +58,7 @@ only; `role_code`, `wire.rs:136`). Any other role byte is malformed.
 | Kind | Code | Body | Total length |
 |---|---|---|---|
 | `CAPS` | `0x01` | `caps u32` | 10 |
-| `SUBSCRIBE` | `0x02` | `stream[32] ‖ role u8 ‖ flags u8` | 40 |
+| `SUBSCRIBE` | `0x02` | `stream[32] ‖ role u8 ‖ flags u8 [‖ mode u8 ‖ max_spatial u8 ‖ max_temporal u8 ‖ max_quality u8]` | 40, or 44 with a layer cap |
 | `UNSUBSCRIBE` | `0x03` | `stream[32]` | 38 |
 | `ADMIT` | `0x04` | `stream[32] ‖ role u8` | 39 |
 | `REFUSE` | `0x05` | `stream[32] ‖ reason u8 ‖ retry_after_ms u32` | 43 |
@@ -75,12 +75,37 @@ Field rules (enforced at decode):
   - bit 0: speaks C3 v1;
   - bit 1: this node's leviculum takes timed Channel frames (0xFD00/0xFD01,
     leviculum v0.33+);
-  - bit 2: offers relay.
+  - bit 2: offers relay;
+  - bit 3: this node takes media as unordered link datagrams (leviculum#102,
+    `PacketContext::Datagram`, leviculum v0.34.0+ciris.2) and routes them to
+    its A/V receive path. A sender uses `try_send_unordered` for media only
+    toward a peer that set it; a leviculum without #102 drops a datagram
+    unread and the sender cannot tell, so the bit's absence means "no
+    datagrams" and media stays on the Channel (`try_send_timed`).
 
-  Unknown bits are ignored. This build sends `0b011`, or `0b111` when it relays
-  (`CAPS_THIS_BUILD`, `wire.rs:59`).
+  - bit 4 (v45): this node takes a layer cap on `SUBSCRIBE` and applies it.
+    Advertised only when the host turned the lever on
+    (`set_av_layer_requests_enabled`, default OFF until CC's correction of
+    5.3.3.2.4's carriage sentence lands). No cap is sent to a peer without it.
+  - bit 5 (v45): this node parses a v2 stream key binding (the one that
+    names the codec, `docs/av_chunk_auth_wire.md` §1.8). A publisher sends v2
+    only to a peer with it, and v1 to every peer.
+
+  Unknown bits are ignored, so a build that predates a bit reads this
+  build's `CAPS` exactly as before and never uses what the bit offers. This
+  build sends `0b10_1011`, or `0b10_1111` when it relays, plus bit 4 behind
+  the lever (`CAPS_THIS_BUILD`, `wire.rs`).
 - **SUBSCRIBE** `flags`: bit 0 means the requester can itself forward
-  (`forward_capable`). The other bits are ignored.
+  (`forward_capable`). Bit 1 (v45) means a layer cap follows: `mode u8`,
+  which must be 1 ("at most"; any other value, mode 2 "audio only" included,
+  is malformed: audio only would go below the base cell 5.3.3.2.4 makes the
+  minimum, and waits on the presence floor), then `max_spatial`,
+  `max_temporal`, `max_quality` (a `ReceiverLayerPolicy`). The parent sends
+  that child of that stream only the chunks the cap admits; codec-opaque
+  chunks pass every cap. A re-`SUBSCRIBE` changes the cap; one without bit 1
+  withdraws it. The cap is sent only to a peer whose `CAPS` carry bit 4 (a
+  pre-v45 decoder would refuse the four extra bytes as trailing). The other
+  bits are ignored.
 - **REFUSE** `reason`:
   - the code is `RefuseReason::code` (`controller/mod.rs:450`); unknown codes
     are malformed (§6);
@@ -317,6 +342,17 @@ SHED        (39 B) 43414c4d 01 06 000102030405060708090a0b0c0d0e0f10111213141516
 OFFER       (73 B) 43414c4d 01 07 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
                    01 01 00000000001e8480 00000000002dc6c0 0000002a 01 000a 6e6f64652d6b61742d61
 ```
+
+**SUBSCRIBE with a layer cap** (v45, `subscribe_layer_cap_kat`): stream
+`07`×32, primary, forward-capable, at most (1, 2, 0):
+
+```
+SUBSCRIBE+cap (44 B) 43414c4d 01 02 0707070707070707070707070707070707070707070707070707070707070707 00 03 01 01 02 00
+SUBSCRIBE     (40 B) 43414c4d 01 02 0707070707070707070707070707070707070707070707070707070707070707 00 01
+```
+
+Refused as malformed: the cap's mode byte 0, 2, 3 or 0xff; a cap one byte
+short; a trailing byte. A flag bit above bit 1 is ignored.
 
 The v2 chunk trailer's KAT (the signed source timestamp) is in
 `docs/av_chunk_auth_wire.md` §5, from `kat_vectors_are_deterministic`.

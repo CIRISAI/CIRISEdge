@@ -571,7 +571,7 @@ async fn a_fresh_node_parks_round_one_and_escalates_what_cannot_move_858() {
         3,
         "O4 and O5 are malformed rows: terminal, not parked"
     );
-    let past_transient_cap = Instant::now() + TRANSIENT_CAP + Duration::from_secs(60);
+    let past_transient_cap = Instant::now() + TRANSIENT_CAP + Duration::from_mins(1);
     for (name, i) in [("O4", 3), ("O5", 4)] {
         assert!(
             backoff.suppressed_at(KIND, &h[i], past_transient_cap),
@@ -582,7 +582,7 @@ async fn a_fresh_node_parks_round_one_and_escalates_what_cannot_move_858() {
     // (b) O3 again (a push, as the canonical's proactive publish does): its
     // signer is held and does not act for P here — terminal from attempt 2.
     push(&bridge, std::slice::from_ref(&w.rows[2])).await;
-    let past_transient_cap = Instant::now() + TRANSIENT_CAP + Duration::from_secs(60);
+    let past_transient_cap = Instant::now() + TRANSIENT_CAP + Duration::from_mins(1);
     assert!(
         backoff.suppressed_at(KIND, &h[2], past_transient_cap),
         "O3's second refusal must put it on the TERMINAL schedule: on the transient \

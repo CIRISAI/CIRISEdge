@@ -68,7 +68,7 @@ async fn auth_for(
         signer: Some(signer_for(key, base).await),
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -204,7 +204,7 @@ async fn a_burst_closes_nothing_on_release_and_the_bound_retires_it_853() {
     }
     let mut got = 0;
     while got < BURST {
-        tokio::time::timeout(Duration::from_secs(60), p.rx_a.recv())
+        tokio::time::timeout(Duration::from_mins(1), p.rx_a.recv())
             .await
             .expect("A receives the burst")
             .expect("A's sink open");
@@ -275,7 +275,7 @@ async fn a_burst_closes_nothing_on_release_and_the_bound_retires_it_853() {
 /// again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancelled_send_gives_its_lane_back_853() {
-    let mut p = pair_with("cancel", Duration::from_secs(600)).await;
+    let mut p = pair_with("cancel", Duration::from_mins(10)).await;
     let dest = p.a_key.clone();
     // The pool is per destination; wait for A's announce to heal B's primed
     // route, so the big send looks for its lane in the same pool.
@@ -333,7 +333,7 @@ async fn a_cancelled_send_gives_its_lane_back_853() {
 /// under load, the burst witness's intermittent failure).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dialled_lane_is_published_claimed_853() {
-    let mut p = pair_with("publish", Duration::from_secs(600)).await;
+    let mut p = pair_with("publish", Duration::from_mins(10)).await;
     let dest = p.a_key.clone();
     let named = p.a.local_named_dest_hash();
     let healed = wait_for(Duration::from_secs(30), || async {
@@ -385,7 +385,7 @@ async fn a_busy_lane_is_never_reaped_819() {
     let mut p = pair("busy").await;
     let dest = p.a_key.clone();
     p.b.send(&dest, b"one lane").await.expect("send B -> A");
-    tokio::time::timeout(Duration::from_secs(60), p.rx_a.recv())
+    tokio::time::timeout(Duration::from_mins(1), p.rx_a.recv())
         .await
         .expect("A receives")
         .expect("A's sink open");
@@ -418,7 +418,7 @@ async fn a_busy_lane_is_never_reaped_819() {
 }
 
 async fn recv_one(rx: &mut mpsc::Receiver<InboundFrame>, what: &str) -> InboundFrame {
-    tokio::time::timeout(Duration::from_secs(60), rx.recv())
+    tokio::time::timeout(Duration::from_mins(1), rx.recv())
         .await
         .unwrap_or_else(|_| panic!("{what}: timed out"))
         .unwrap_or_else(|| panic!("{what}: sink closed"))
@@ -436,7 +436,7 @@ async fn recv_one(rx: &mut mpsc::Receiver<InboundFrame>, what: &str) -> InboundF
 async fn a_lane_handed_out_is_not_trimmed_before_its_sender_claims_it_819() {
     let mut p = pair("handout").await;
     // A long bound: only the cap is under test.
-    p.b.set_link_pool_policy(Duration::from_secs(600), 2);
+    p.b.set_link_pool_policy(Duration::from_mins(10), 2);
     let dest = p.a_key.clone();
     // The pool is per DESTINATION. A's first announce heals B's primed route
     // to A's announced destination, and lanes dialed either side of that heal
@@ -467,7 +467,7 @@ async fn a_lane_handed_out_is_not_trimmed_before_its_sender_claims_it_819() {
             .await
             .expect("a send takes an idle lane");
     let other = *lanes.iter().find(|l| **l != taken).expect("the other lane");
-    p.b.set_link_pool_policy(Duration::from_secs(600), 1);
+    p.b.set_link_pool_policy(Duration::from_mins(10), 1);
     // Another transfer ends on the other lane: the release applies the cap.
     p.b.release_link_for_test(other).await;
 

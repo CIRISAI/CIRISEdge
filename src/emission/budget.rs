@@ -229,7 +229,7 @@ mod tests {
     fn under_budget_path() {
         let m = BudgetMeter::new();
         let s = ScopeKey::community("alpha".into());
-        m.configure(s.clone(), 10, Duration::from_secs(60));
+        m.configure(s.clone(), 10, Duration::from_mins(1));
         let state = m.query(&s);
         assert!(matches!(
             state,
@@ -254,7 +254,7 @@ mod tests {
     fn over_budget_after_target_real_emissions() {
         let m = BudgetMeter::new();
         let s = ScopeKey::self_scope();
-        m.configure(s.clone(), 3, Duration::from_secs(60));
+        m.configure(s.clone(), 3, Duration::from_mins(1));
         for _ in 0..3 {
             m.record_real(&s);
         }
@@ -285,7 +285,7 @@ mod tests {
     fn snapshot_reports_counts() {
         let m = BudgetMeter::new();
         let s = ScopeKey::community("c".into());
-        m.configure(s.clone(), 5, Duration::from_secs(60));
+        m.configure(s.clone(), 5, Duration::from_mins(1));
         m.record_real(&s);
         m.record_real(&s);
         m.record_cover(&s);

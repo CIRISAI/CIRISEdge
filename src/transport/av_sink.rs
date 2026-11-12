@@ -190,6 +190,13 @@ pub const AV_PENDING_ARRIVAL_LINKS_MAX: usize = 1024;
 /// The transport's A/V sink. See the module docs.
 pub struct AvSink {
     links: Mutex<SinkLinks>,
+    /// Test seam — datagrams still to lose on arrival, as the wire would
+    /// (leviculum#102). 0 in production.
+    lose_datagrams: std::sync::atomic::AtomicU64,
+    /// Test seam — microseconds the event loop spends before it handles each
+    /// arriving datagram: a receiver whose event loop is loaded (another
+    /// build on the box, a slow phone). 0 in production.
+    datagram_handling_delay_us: std::sync::atomic::AtomicU64,
     arrivals_tx: mpsc::Sender<AvArrival>,
     arrivals_rx: Mutex<Option<mpsc::Receiver<AvArrival>>>,
 }
@@ -203,6 +210,45 @@ struct SinkLinks {
     /// Peer-opened links not yet handed over, and how many of their frames
     /// were dropped because the arrivals queue was full.
     dropped_before_arrival: HashMap<LinkId, u64>,
+    /// leviculum#102 — the newest datagram sequence number seen per A/V link.
+    datagram_highest: HashMap<LinkId, u32>,
+}
+
+/// leviculum#102 — where a datagram's sequence number puts it on its link
+/// ([`AvSink::order_datagram`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatagramOrder {
+    /// The next one (or the link's first): deliver it.
+    Next,
+    /// This many sequence numbers were skipped before it (lost or shed on
+    /// the way): reported to the hop counter, then deliver it.
+    Gap(u64),
+    /// At or behind the newest already seen: the hop counter is past it.
+    Behind,
+}
+
+/// Largest forward jump in a datagram sequence read as loss rather than as a
+/// stale datagram from before a wrap (RFC 1982 serial arithmetic: half the
+/// `u32` space).
+const DATAGRAM_SERIAL_HALF: u32 = 1 << 31;
+
+impl SinkLinks {
+    /// `n` frames of `link_id` lost before the sink: reported with the link's
+    /// next queued frame, or carried to its first when it has no consumer yet.
+    fn note_dropped(&mut self, link_id: LinkId, n: u64) {
+        if let Some(queue) = self.queues.get_mut(&link_id) {
+            queue.note_dropped_n(n);
+            return;
+        }
+        let tracked = self.dropped_before_arrival.len();
+        match self.dropped_before_arrival.get_mut(&link_id) {
+            Some(d) => *d = d.saturating_add(n),
+            None if tracked < AV_PENDING_ARRIVAL_LINKS_MAX => {
+                self.dropped_before_arrival.insert(link_id, n);
+            }
+            None => {}
+        }
+    }
 }
 
 impl Default for AvSink {
@@ -218,6 +264,8 @@ impl AvSink {
         let (arrivals_tx, arrivals_rx) = mpsc::channel(AV_ARRIVALS_DEPTH);
         Self {
             links: Mutex::new(SinkLinks::default()),
+            lose_datagrams: std::sync::atomic::AtomicU64::new(0),
+            datagram_handling_delay_us: std::sync::atomic::AtomicU64::new(0),
             arrivals_tx,
             arrivals_rx: Mutex::new(Some(arrivals_rx)),
         }
@@ -321,22 +369,89 @@ impl AvSink {
     /// consumer yet carries it to its first frame, as an arrivals-full drop
     /// does. Never awaits.
     pub(crate) fn note_dropped_before_sink(&self, link_id: LinkId) {
+        self.links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .note_dropped(link_id, 1);
+    }
+
+    /// Test seam — lose the next `n` datagrams that arrive, as a shed or a
+    /// lossy path would: numbered by the sender, never seen here.
+    pub(crate) fn lose_next_datagrams(&self, n: u64) {
+        self.lose_datagrams
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test seam — the event loop takes `delay` before it handles each
+    /// arriving datagram, so it drains leviculum's data plane slower than a
+    /// loopback link fills it (`Duration::ZERO` ends it).
+    pub(crate) fn set_datagram_handling_delay(&self, delay: std::time::Duration) {
+        self.datagram_handling_delay_us.store(
+            u64::try_from(delay.as_micros()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Test seam — the delay [`Self::set_datagram_handling_delay`] set, if any.
+    pub(crate) fn datagram_handling_delay(&self) -> Option<std::time::Duration> {
+        match self
+            .datagram_handling_delay_us
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            us => Some(std::time::Duration::from_micros(us)),
+        }
+    }
+
+    /// Test seam — whether to lose this arriving datagram ([`Self::lose_next_datagrams`]).
+    pub(crate) fn take_datagram_loss(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.lose_datagrams
+            .fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
+    /// leviculum#102 — place one datagram on its link by its sequence number,
+    /// and report a gap before it to the link's hop counter.
+    ///
+    /// Every media frame on a datagram leg rides a datagram and every
+    /// datagram is a media frame (`MediaTtl::set_datagrams` is one-way), so
+    /// the sender's hop counter and leviculum's sequence advance together: a
+    /// gap of `n` is exactly `n` frames the consumer will never see, counted
+    /// like a drop below the sink ([`Self::note_dropped_before_sink`]). A
+    /// datagram at or behind the newest is [`DatagramOrder::Behind`]: its hop
+    /// counter is already spent, so it could never open. Never awaits.
+    pub(crate) fn order_datagram(&self, link_id: LinkId, sequence: u32) -> DatagramOrder {
         let mut links = self
             .links
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(queue) = links.queues.get_mut(&link_id) {
-            queue.note_dropped();
-            return;
-        }
-        let tracked = links.dropped_before_arrival.len();
-        match links.dropped_before_arrival.get_mut(&link_id) {
-            Some(n) => *n = n.saturating_add(1),
-            None if tracked < AV_PENDING_ARRIVAL_LINKS_MAX => {
-                links.dropped_before_arrival.insert(link_id, 1);
+        let order = match links.datagram_highest.get(&link_id).copied() {
+            None => DatagramOrder::Next,
+            Some(highest) => {
+                let ahead = sequence.wrapping_sub(highest);
+                if ahead == 0 || ahead >= DATAGRAM_SERIAL_HALF {
+                    DatagramOrder::Behind
+                } else if ahead == 1 {
+                    DatagramOrder::Next
+                } else {
+                    DatagramOrder::Gap(u64::from(ahead - 1))
+                }
             }
-            None => {}
+        };
+        if order == DatagramOrder::Behind {
+            return order;
         }
+        // Bounded by the links that could be sending, as the arrival map is.
+        if links.datagram_highest.contains_key(&link_id)
+            || links.datagram_highest.len() < AV_PENDING_ARRIVAL_LINKS_MAX
+        {
+            links.datagram_highest.insert(link_id, sequence);
+        }
+        if let DatagramOrder::Gap(lost) = order {
+            links.note_dropped(link_id, lost);
+        }
+        order
     }
 
     /// Forget a closed link: its consumer's receiver then reports the link
@@ -348,6 +463,19 @@ impl AvSink {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         links.queues.remove(link_id);
         links.dropped_before_arrival.remove(link_id);
+        links.datagram_highest.remove(link_id);
+    }
+
+    /// leviculum#102 — the A/V links the sink routes for (claimed or
+    /// arrived): the links whose datagram counters the transport folds.
+    pub(crate) fn link_ids(&self) -> Vec<LinkId> {
+        self.links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queues
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Links the sink currently routes for (tests + diagnostics).
@@ -368,6 +496,55 @@ mod tests {
 
     fn link(n: u8) -> LinkId {
         LinkId::new([n; 16])
+    }
+
+    /// leviculum#102 — a datagram's sequence number places it: the next one
+    /// passes, a gap reaches the hop counter with the next queued frame, one
+    /// overtaken is behind, and the serial arithmetic holds across the wrap.
+    #[tokio::test]
+    async fn datagram_sequence_gaps_reach_the_hop_and_stale_ones_are_behind() {
+        let sink = AvSink::new();
+        let rx = sink.claim(link(7));
+        let deliver = |b: u8| {
+            assert_eq!(
+                sink.deliver(link(7), Some(vec![b]), |_| unreachable!("claimed")),
+                AvDelivery::Queued
+            );
+        };
+        assert_eq!(sink.order_datagram(link(7), 10), DatagramOrder::Next);
+        deliver(10);
+        assert_eq!(sink.order_datagram(link(7), 11), DatagramOrder::Next);
+        deliver(11);
+        // 12, 13 and 14 lost on the wire.
+        assert_eq!(sink.order_datagram(link(7), 15), DatagramOrder::Gap(3));
+        deliver(15);
+        // 13 arrives late: behind, and it moves nothing.
+        assert_eq!(sink.order_datagram(link(7), 13), DatagramOrder::Behind);
+        assert_eq!(sink.order_datagram(link(7), 15), DatagramOrder::Behind);
+        assert_eq!(sink.order_datagram(link(7), 16), DatagramOrder::Next);
+        deliver(16);
+        let got: Vec<(u8, u64)> = {
+            let mut v = Vec::new();
+            for _ in 0..4 {
+                let f = rx.recv_frame().await.expect("frame");
+                v.push((f.bytes[0], f.dropped_before));
+            }
+            v
+        };
+        assert_eq!(got, vec![(10, 0), (11, 0), (15, 3), (16, 0)]);
+        // Across the u32 wrap.
+        assert_eq!(
+            sink.order_datagram(link(8), u32::MAX - 1),
+            DatagramOrder::Next
+        );
+        assert_eq!(sink.order_datagram(link(8), 1), DatagramOrder::Gap(2));
+        assert_eq!(
+            sink.order_datagram(link(8), u32::MAX),
+            DatagramOrder::Behind
+        );
+        // A closed link starts over.
+        sink.forget(&link(8));
+        assert_eq!(sink.order_datagram(link(8), 0), DatagramOrder::Next);
     }
 
     #[tokio::test]

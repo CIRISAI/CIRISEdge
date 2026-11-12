@@ -167,7 +167,7 @@ impl KnownHashes {
                 // 1.82 and this crate's MSRV is 1.75.
                 dominant
                     .as_deref()
-                    .map_or(true, |d| v.last_advertised_by == d)
+                    .is_none_or(|d| v.last_advertised_by == d)
             })
             .map(|(k, v)| (v.last_advertised_unix, *k))
             .collect();

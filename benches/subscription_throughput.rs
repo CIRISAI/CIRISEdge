@@ -76,7 +76,7 @@ async fn build_edge() -> (Arc<Edge>, tempfile::TempDir) {
     .await;
     let signer = bench_local_signer(&me, &tmp).await;
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     };
     let edge = Edge::builder()

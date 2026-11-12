@@ -936,10 +936,17 @@ fn check_scoped_body_identity_link() -> Result<(), String> {
 fn check_namespace_realtime() -> Result<(), String> {
     use crate::transport::realtime_av::{
         open_av_chunk, seal_av_chunk, ChunkLayer, ChunkSeq, Epoch, EpochDek, SealedAvChunk,
-        StreamId, CODEC_AV1_SVC, CODEC_JPEG_XS, CODEC_MDC, CODEC_OPAQUE,
+        StreamId, CODEC_AV1_SVC, CODEC_JPEG_XS, CODEC_MDC, CODEC_OPAQUE, CODEC_TEMPORAL_LAYERED,
     };
 
-    if [CODEC_AV1_SVC, CODEC_JPEG_XS, CODEC_MDC, CODEC_OPAQUE] != [0x01, 0x02, 0x03, 0xFF] {
+    if [
+        CODEC_AV1_SVC,
+        CODEC_JPEG_XS,
+        CODEC_MDC,
+        CODEC_TEMPORAL_LAYERED,
+        CODEC_OPAQUE,
+    ] != [0x01, 0x02, 0x03, 0x04, 0xFF]
+    {
         return Err("codec_id bytes differ from the ratified table".into());
     }
     let dek = EpochDek::from_bytes([0x5A; 32]);

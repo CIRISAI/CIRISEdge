@@ -256,6 +256,32 @@ fn effective_link_keepalive_secs(configured: Option<Duration>) -> Option<u64> {
 /// leviculum's 256 default).
 pub const CONTROL_CHANNEL_CAPACITY_ENV: &str = "CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY";
 
+/// v45 — the data-plane event channel this node runs: leviculum's own
+/// default is 128, and leviculum sheds an arriving link datagram while
+/// three quarters of it are queued unread (it keeps the last quarter for
+/// Channel messages). A 30 KB keyframe is 127 datagrams sent back to back at
+/// the base MTU, so a receiver whose event loop is busy for a few ms (a phone,
+/// a loaded box) lost its tail at 96 (the v45.0.0 gate's
+/// `framed_video_arrives_whole_and_audio_unmarked`, `av_datagram_shed_sink`
+/// 8; witness `a_keyframe_reaches_a_loaded_receiver_whole`). At 1024 a burst
+/// has 768 slots. Headroom used only while the loop is behind: each slot
+/// is one queued event, at most one link MTU of data.
+pub const DATA_CHANNEL_CAPACITY: usize = 1024;
+
+/// The env var that overrides [`DATA_CHANNEL_CAPACITY`] (clamped like the
+/// control channel's).
+pub const DATA_CHANNEL_CAPACITY_ENV: &str = "CIRIS_EDGE_RETICULUM_DATA_CHANNEL_CAPACITY";
+
+/// [`DATA_CHANNEL_CAPACITY`], or the env override `env_raw` (clamped into
+/// the control channel's bounds; one that does not parse is ignored). Pure.
+fn effective_data_channel_capacity(env_raw: Option<&str>) -> usize {
+    env_raw
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map_or(DATA_CHANNEL_CAPACITY, |c| {
+            c.clamp(CONTROL_CHANNEL_CAPACITY_MIN, CONTROL_CHANNEL_CAPACITY_MAX)
+        })
+}
+
 /// Lower clamp for [`effective_control_channel_capacity`]. Below leviculum's
 /// own 256 default is already a foot-gun; 16 exists only so a deliberate
 /// test rig can force saturation, and 0 would panic tokio's `mpsc::channel`.
@@ -312,12 +338,12 @@ fn effective_control_channel_capacity(
 
 /// How long [`Transport::send`] waits for a resource transfer to
 /// complete after the link is up.
-const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// CC 5.4.3 rc16 two planes — how long a failed bulk dial stands for its peer
 /// while the peer holds a shaped link: a NAT'd phone does not pay a dial
 /// before each fallback, and a peer that becomes dialable is tried again soon.
-const BULK_DIAL_NEGATIVE_TTL: Duration = Duration::from_secs(120);
+const BULK_DIAL_NEGATIVE_TTL: Duration = Duration::from_mins(2);
 
 /// leviculum#52 — the dwell an operator should leave between
 /// `ifac_activate_next` and `ifac_seal_rotation` when they have no better
@@ -593,6 +619,16 @@ fn send_mdu(
 /// another about the margin. `None` when leviculum no longer holds the link.
 pub(crate) fn link_channel_message_limit(node: &ReticulumNode, link_id: &LinkId) -> Option<usize> {
     node.link_mdu(link_id).map(channel_payload_mdu)
+}
+
+/// leviculum#102 — the most plaintext one unordered datagram on a live link
+/// carries: leviculum's `link_datagram_mdu` (the link MDU less the 4-byte
+/// sequence number) less the E1 seal. It follows the link's MDU, so on a
+/// punched path it is the probed one (leviculum#104). `None` when leviculum
+/// no longer holds the link.
+pub(crate) fn link_datagram_message_limit(node: &ReticulumNode, link_id: &LinkId) -> Option<usize> {
+    node.link_datagram_mdu(link_id)
+        .map(|mdu| mdu.saturating_sub(crate::transport::link_seal::SEAL_OVERHEAD))
 }
 
 /// CC 5.3.3.5 E1 pre-seal route fetch test seam — what this node's NEXT
@@ -1149,7 +1185,7 @@ static ANNOUNCE_INTAKE_EVICT_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
 /// exact count lives on the metrics counter, which is never throttled.
 fn announce_intake_evict_log() -> &'static crate::log_throttle::LogThrottle {
     ANNOUNCE_INTAKE_EVICT_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 1))
 }
 
 /// Point 1 — peer-admitted (INFO). Keyed on `provenance` (2 values), so the
@@ -1157,14 +1193,14 @@ fn announce_intake_evict_log() -> &'static crate::log_throttle::LogThrottle {
 /// capped. A tiny key map suffices.
 fn peer_admitted_log() -> &'static crate::log_throttle::LogThrottle {
     PEER_ADMITTED_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_secs(60), 8))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_mins(1), 8))
 }
 
 /// Point 2 — link-attribution miss (WARN). Keyed on the link-proven identity
 /// hash (attacker-chosen), so the key map is capped as the DoS backstop.
 fn link_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
     LINK_ATTRIBUTION_MISS_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1024))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 1024))
 }
 
 static CONTROL_PLANE_OVERFLOW_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1181,7 +1217,7 @@ static CONTROL_PLANE_OVERFLOW_LOG: std::sync::OnceLock<crate::log_throttle::LogT
 /// first 6 per minute log loudly, the rest collapse to a suppressed count.
 fn control_plane_overflow_log() -> &'static crate::log_throttle::LogThrottle {
     CONTROL_PLANE_OVERFLOW_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(6, Duration::from_secs(60), 1))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(6, Duration::from_mins(1), 1))
 }
 
 static INITIATOR_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1195,7 +1231,7 @@ static INITIATOR_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::
 /// of work — the #414/#416/#932/#423/#424 silent-refusal class.
 fn initiator_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
     INITIATOR_ATTRIBUTION_MISS_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 256))
 }
 
 /// CIRISEdge#337 — route supersession decisions (verified-only refusal + belt
@@ -1206,7 +1242,7 @@ fn initiator_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle
 /// first few per window loudly then summarizes.
 fn route_supersession_log() -> &'static crate::log_throttle::LogThrottle {
     ROUTE_SUPERSESSION_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_secs(60), 4))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_mins(1), 4))
 }
 
 static REVERSE_PATH_FALLBACK_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1219,7 +1255,7 @@ static NAT_TOPOLOGY_DIAGNOSIS_LOG: std::sync::OnceLock<crate::log_throttle::LogT
 /// bounded by the admit gate, capped map as backstop).
 fn reverse_path_fallback_log() -> &'static crate::log_throttle::LogThrottle {
     REVERSE_PATH_FALLBACK_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 256))
 }
 
 static UPGRADE_GUARD_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1237,7 +1273,7 @@ fn note_upgrade_guarded(
         m.inc_direct_link_upgrade_guarded(label);
     }
     let throttle = UPGRADE_GUARD_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 16));
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 16));
     if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } = throttle.check(label) {
         tracing::info!(
             guarded = label,
@@ -1262,12 +1298,12 @@ static NO_ROUTE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 
 fn no_route_log() -> &'static crate::log_throttle::LogThrottle {
     NO_ROUTE_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_secs(600), 1024))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_mins(10), 1024))
 }
 
 fn inbound_drop_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_DROP_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 64))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_mins(1), 64))
 }
 
 /// CIRISEdge#425 structural-2 — the ONE blessed way for the listen loop to NOT
@@ -1304,7 +1340,7 @@ static OVERSIZED_FRAME_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThr
 /// line, never an interrogation. Bounded like the reverse-path fallback log.
 fn oversized_frame_drop_log() -> &'static crate::log_throttle::LogThrottle {
     OVERSIZED_FRAME_DROP_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 256))
 }
 
 static OWN_BUNDLE_PUSH_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1317,7 +1353,7 @@ static OWN_BUNDLE_PUSH_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle
 /// contact, which would otherwise read as an unexplained Advisory plateau.
 fn own_bundle_push_log() -> &'static crate::log_throttle::LogThrottle {
     OWN_BUNDLE_PUSH_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 8))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_mins(1), 8))
 }
 
 static PEER_BUNDLE_ARRIVAL_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1329,7 +1365,7 @@ static PEER_BUNDLE_ARRIVAL_LOG: std::sync::OnceLock<crate::log_throttle::LogThro
 /// stored/verified one (the #423 apply-loud discipline).
 fn peer_bundle_arrival_log() -> &'static crate::log_throttle::LogThrottle {
     PEER_BUNDLE_ARRIVAL_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 32))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_mins(1), 32))
 }
 
 static NON_CIRIS_ANNOUNCE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1343,7 +1379,7 @@ static NON_CIRIS_ANNOUNCE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrot
 /// fixed discriminant (this is not a per-peer condition — it's "not us").
 fn non_ciris_announce_log() -> &'static crate::log_throttle::LogThrottle {
     NON_CIRIS_ANNOUNCE_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(60), 4))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_mins(1), 4))
 }
 
 /// CIRISEdge#353 ask 2 — the NAT'd/initiator-only topology diagnosis. Before
@@ -1352,7 +1388,7 @@ fn non_ciris_announce_log() -> &'static crate::log_throttle::LogThrottle {
 /// One diagnosis per peer per window, then a suppressed-count.
 fn nat_topology_diagnosis_log() -> &'static crate::log_throttle::LogThrottle {
     NAT_TOPOLOGY_DIAGNOSIS_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(300), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_mins(5), 256))
 }
 
 /// CIRISEdge#353 ask 2 — emit the topology diagnosis (throttled). Fired when a
@@ -2161,7 +2197,7 @@ impl ReticulumTransportConfig {
             federation_visible: true,
             bootstrap_peers: Vec::new(),
             identity_path,
-            announce_interval: Duration::from_secs(300),
+            announce_interval: Duration::from_mins(5),
             local_key_id: local_key_id.into(),
             transport_identity_storage_key: None,
             local_epoch: 0,
@@ -3118,6 +3154,18 @@ pub struct ReticulumTransport {
     /// `LinkPlane::Av` link that passes attribution is routed here by the
     /// event loop; nothing else is (`FSD/CIRIS_EDGE_TRANSPORT.md` §3.6).
     av_sink: Arc<crate::transport::av_sink::AvSink>,
+    /// leviculum#102 — what was last folded from leviculum's datagram
+    /// counters into `av_plane` ([`fold_av_datagrams`]).
+    av_datagram_fold: Arc<std::sync::Mutex<AvDatagramFold>>,
+    /// Test seam — the C3 `CAPS` bits calls on this node leave out
+    /// ([`Self::set_av_caps_withheld_for_test`]). 0 in production.
+    av_caps_withheld: std::sync::atomic::AtomicU32,
+    /// leviculum#102 — the host's A/V datagram lever
+    /// ([`Self::set_av_datagrams_enabled`]). Default on.
+    av_datagrams_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// v45 — the host's lever for SUBSCRIBE layer caps
+    /// ([`Self::set_av_layer_requests_enabled`]). Default OFF until CC rules.
+    av_layer_requests: std::sync::atomic::AtomicBool,
     /// CIRISEdge#805 — the peer each A/V link THIS node dialled was dialled
     /// to ([`Self::open_av_link`]): the initiator-side attribution basis.
     /// The dial resolved the peer's transport key from its verified route
@@ -3550,6 +3598,10 @@ impl ReticulumTransport {
             own_build_bundle,
             own_owner_binding,
         } = auth;
+        // CIRISEdge#957 / CIRISPersist#1233 (CC 5.3.2.4.3.1): the announce and
+        // store-heal rooting judge every chain hybrid-required; a transport is
+        // never built with another policy.
+        crate::verify::require_strict_policy(hybrid_policy).map_err(TransportError::Config)?;
 
         // v3.1.0 (CIRISEdge#99) — when the host wired a
         // `TransportIdentityKeystore`, load/adopt/generate via the
@@ -3862,6 +3914,16 @@ impl ReticulumTransport {
                 );
             }
         }
+        // v45 — the data plane's headroom for a media burst
+        // ([`DATA_CHANNEL_CAPACITY`]).
+        let data_capacity = effective_data_channel_capacity(
+            std::env::var(DATA_CHANNEL_CAPACITY_ENV).ok().as_deref(),
+        );
+        builder = builder.data_channel_capacity(data_capacity);
+        tracing::info!(
+            capacity = data_capacity,
+            "reticulum data-plane event channel capacity (a keyframe burst fits)"
+        );
         let mut share_instance_local: Option<String> = None;
         let mut connect_instance_local: Option<String> = None;
         if config.interfaces.is_empty() {
@@ -4308,6 +4370,10 @@ impl ReticulumTransport {
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
+            av_datagram_fold: Arc::default(),
+            av_caps_withheld: std::sync::atomic::AtomicU32::new(0),
+            av_datagrams_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            av_layer_requests: std::sync::atomic::AtomicBool::new(false),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_paths,
             direct_link_retry: std::sync::atomic::AtomicBool::new(direct_link_retry),
@@ -6054,6 +6120,79 @@ impl ReticulumTransport {
         self.seals.set_stranger_handshake_cap(cap);
     }
 
+    /// leviculum#102 — **the A/V datagram lever**, the host's to pull: whether
+    /// A/V legs that come up from now on may carry media as unordered link
+    /// datagrams. Default on. Off, a new leg neither advertises
+    /// `CAP_LINK_DATAGRAMS` in its C3 `CAPS` nor switches its media to
+    /// datagrams; a leg already on datagrams keeps them (one-way per leg).
+    /// Edge never moves it on its own. Read back as the
+    /// `av_datagrams_enabled` gauge.
+    pub fn set_av_datagrams_enabled(&self, enabled: bool) {
+        self.av_datagrams_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        if let Some(m) = self.metrics.get() {
+            m.telemetry.set_av_datagrams_enabled(enabled);
+        }
+    }
+
+    /// leviculum#102 — the A/V datagram lever's position
+    /// ([`Self::set_av_datagrams_enabled`]).
+    #[must_use]
+    pub fn av_datagrams_enabled(&self) -> bool {
+        self.av_datagrams_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// v45 — calls joined on this node from now on take part in SUBSCRIBE
+    /// layer caps (advertise the bit, apply a child's cap, send their own).
+    /// Default OFF until CC's correction of 5.3.3.2.4's carriage sentence.
+    pub fn set_av_layer_requests_enabled(&self, enabled: bool) {
+        self.av_layer_requests
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The layer-cap lever's position.
+    #[must_use]
+    pub fn av_layer_requests_enabled(&self) -> bool {
+        self.av_layer_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// leviculum#102 test seam — calls joined on this node from now on leave
+    /// `bits` out of their C3 `CAPS` (e.g. `CAP_LINK_DATAGRAMS`: the node
+    /// then reads to its peers as an edge that predates datagrams).
+    #[doc(hidden)]
+    pub fn set_av_caps_withheld_for_test(&self, bits: u32) {
+        self.av_caps_withheld
+            .store(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The C3 `CAPS` bits calls on this node leave out (0 in production).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn av_caps_withheld_for_test(&self) -> u32 {
+        self.av_caps_withheld
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// leviculum#102 test seam — lose the next `n` datagrams that arrive on
+    /// this node before they are opened: what a shed (or a lossy path) looks
+    /// like from here, a sequence number the sender spent and this node never
+    /// sees.
+    #[doc(hidden)]
+    pub fn lose_next_datagrams_for_test(&self, n: u64) {
+        self.av_sink.lose_next_datagrams(n);
+    }
+
+    /// Test seam — this node's event loop takes `delay` before it handles
+    /// each arriving datagram: a receiver under load, made deliberate so a
+    /// witness never depends on what else runs on the box. `Duration::ZERO`
+    /// ends it.
+    #[doc(hidden)]
+    pub fn set_datagram_handling_delay_for_test(&self, delay: Duration) {
+        self.av_sink.set_datagram_handling_delay(delay);
+    }
+
     /// v44 LTS test seam — the next decapsulation panics.
     #[doc(hidden)]
     pub fn panic_next_decap_for_test(&self) {
@@ -6779,7 +6918,7 @@ impl ReticulumTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .by_link
             .get(&link)
-            .map_or(true, |d| *d == LinkDirection::Outbound);
+            .is_none_or(|d| *d == LinkDirection::Outbound);
         let since = self.direct_paths.yield_since(destination_key_id);
         match crate::transport::direct_path::glare_verdict(initiator, since, now) {
             crate::transport::direct_path::GlareVerdict::Yield => {
@@ -6924,7 +7063,9 @@ impl ReticulumTransport {
         &self,
         link: &[u8; 16],
     ) -> Option<crate::transport::alm_link::AvLinkStats> {
-        let st = self.node.link_stats(&LinkId::new(*link))?;
+        let id = LinkId::new(*link);
+        let st = self.node.link_stats(&id)?;
+        let seq = self.node.link_seq_stats(&id);
         Some(crate::transport::alm_link::AvLinkStats {
             bytes_delivered: st.bytes_delivered(),
             srtt_ms: st.srtt_ms(),
@@ -6933,7 +7074,56 @@ impl ReticulumTransport {
             pacing_rejections: st.pacing_rejections(),
             window: st.window(),
             window_max: st.window_max(),
+            tx_ring: st.tx_ring_size(),
+            last_sent_seq: seq.map(|q| q.last_sent_sequence()),
+            oldest_unacked_seq: seq.and_then(|q| q.oldest_unacked_sequence()),
         })
+    }
+
+    /// leviculum#102 — one A/V link's datagram counters (sent, received,
+    /// refused, replayed, late, shed at the sink), or `None` when leviculum no
+    /// longer holds the link.
+    #[must_use]
+    pub fn av_link_datagram_stats(
+        &self,
+        link: &[u8; 16],
+    ) -> Option<leviculum_core::node::DatagramStats> {
+        self.node.link_datagram_stats(&LinkId::new(*link))
+    }
+
+    /// What carries `link` and its MDU, for a call's per-leg stats: a punched
+    /// direct UDP path, a forwarder (a relay or the canonical: no punched
+    /// interface and more than one hop), or the one-hop interface it rides
+    /// (TCP or another). `None` when leviculum no longer holds the link.
+    #[must_use]
+    pub fn av_link_path(
+        &self,
+        link: &[u8; 16],
+    ) -> Option<(crate::transport::av_call::LegPath, usize)> {
+        use crate::transport::av_call::LegPath;
+        let id = LinkId::new(*link);
+        let mdu = self.node.link_mdu(&id)?;
+        let path = if self.node.direct_link_interface(&id).is_some() {
+            LegPath::DirectUdp
+        } else if link_is_forwarded(&self.node, &id, self.node.link_destination(&id)) {
+            LegPath::Relayed
+        } else {
+            LegPath::Interface
+        };
+        Some((path, mdu))
+    }
+
+    /// leviculum#102 / #104 — the most plaintext one message on `link` carries
+    /// now, by carrier: `(channel, datagram)`, each with room left for the E1
+    /// seal. Both follow the link's MDU, the probed one on a punched path.
+    /// `None` when leviculum no longer holds the link.
+    #[must_use]
+    pub fn av_link_limits(&self, link: &[u8; 16]) -> Option<(usize, usize)> {
+        let id = LinkId::new(*link);
+        Some((
+            link_channel_message_limit(&self.node, &id)?,
+            link_datagram_message_limit(&self.node, &id)?,
+        ))
     }
 
     /// ALM stage 2 — timed media frames on `link` that never arrived fresh
@@ -9377,14 +9567,24 @@ impl ReticulumTransport {
         if dests.is_empty() || known() {
             return !dests.is_empty();
         }
-        let until = ask_for_paths(&self.node, &self.path_seeks, dests).await;
+        let (until, asked) = ask_for_paths(&self.node, &self.path_seeks, dests).await;
+        for _ in 0..asked {
+            self.note_reach(crate::observability::REPLICATION_REACH_PATH_REQUEST_SENT);
+        }
         while std::time::Instant::now() < until {
             if known() {
+                self.note_reach(crate::observability::REPLICATION_REACH_PATH_SEEK_FOUND);
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        known()
+        let found = known();
+        self.note_reach(if found {
+            crate::observability::REPLICATION_REACH_PATH_SEEK_FOUND
+        } else {
+            crate::observability::REPLICATION_REACH_PATH_SEEK_NOT_FOUND
+        });
+        found
     }
 
     /// [`Self::seek_peer`] for a dial that has nothing else to go on: a call or
@@ -9876,6 +10076,65 @@ impl ReticulumTransport {
     async fn live_link_to(&self, destination_key_id: &str, plane: LinkPlane) -> Option<LinkId> {
         self.live_link_to_where(destination_key_id, plane, |_| true)
             .await
+    }
+
+    /// **CIRISEdge#971 — the ONE answer to "can no rule reach this peer
+    /// now?"**, for a replication send and for the round that would make it
+    /// ([`Transport::round_carriable`]). `true` only when all three hold:
+    ///
+    /// 1. no live attributed identity-plane link to it ([`Self::live_link_to`],
+    ///    the reverse path's own lookup, CIRISEdge#353), so nothing the peer
+    ///    opened can carry the frame;
+    /// 2. no dial candidate this node holds a path to, so no dial can leave
+    ///    (a pathed one with no pair is still dialled: E1's pre-seal route
+    ///    fetch, `dial_transit_pair`);
+    /// 3. no transit pair authenticated to it (persist's resolver, the same
+    ///    one `dial_transit_pair` asks), so CC 5.3.3.5 E1 forbids the dial even
+    ///    if a seek found a path: it would end "never dialled", after the seek.
+    ///
+    /// A pair read that ERRORS is not "no pair": the answer is `false` and the
+    /// send runs as before. Nothing here is counted or changed.
+    async fn undialable_now(&self, destination_key_id: &str, candidates: &[DialCandidate]) -> bool {
+        if self
+            .live_link_to(destination_key_id, LinkPlane::Identity)
+            .await
+            .is_some()
+        {
+            return false;
+        }
+        if candidates.iter().any(|c| self.node.has_path(&c.dest_hash)) {
+            return false;
+        }
+        // CIRISEdge#971 — the pair read runs before every round toward a peer
+        // with no live link or path; it is booked under its own caller label,
+        // not `other`.
+        let pair = crate::read_caller::scoped(
+            crate::read_caller::Site::RoundCarriable,
+            self.seals
+                .resolve_pair(self.rooting.as_deref(), destination_key_id, None),
+        )
+        .await;
+        matches!(
+            pair,
+            Err(crate::transport::av_transit_handshake::AvHandshakeError::NoTransitPair { .. })
+        )
+    }
+
+    /// [`Self::undialable_now`] over this peer's own dial candidates: the
+    /// round-start hint. Its candidate read is booked with the pair read.
+    async fn undialable(&self, destination_key_id: &str) -> bool {
+        let candidates = crate::read_caller::scoped(
+            crate::read_caller::Site::RoundCarriable,
+            self.resolve_dial_candidates(destination_key_id),
+        )
+        .await;
+        self.undialable_now(destination_key_id, &candidates).await
+    }
+
+    fn note_reach(&self, label: &'static str) {
+        if let Some(m) = self.metrics.get() {
+            m.inc_replication_reach(label);
+        }
     }
 
     /// Whether `peer`'s row link was refused at a bound within
@@ -10709,6 +10968,10 @@ impl ReticulumTransport {
 // attributes the lint to the impl, so the allow lives here (v13.6.1).
 #[allow(clippy::too_many_lines)]
 impl Transport for ReticulumTransport {
+    async fn round_carriable(&self, destination_key_id: &str) -> bool {
+        !self.undialable(destination_key_id).await
+    }
+
     fn pacing_gap(&self, destination_key_id: &str) -> Option<Duration> {
         self.shapers.gap_to_peer(destination_key_id)
     }
@@ -10747,6 +11010,9 @@ impl Transport for ReticulumTransport {
         self.report_signer_id_mismatch();
         if let Some(m) = self.metrics.get() {
             mirror_planes(&self.node, m);
+            fold_av_datagrams(&self.node, &self.av_sink, &self.av_datagram_fold, m);
+            m.telemetry
+                .set_av_datagrams_enabled(self.av_datagrams_enabled());
         }
     }
 
@@ -10930,7 +11196,9 @@ fn event_label(event: &NodeEvent) -> EventLabel {
         NodeEvent::AnnounceReceived { .. } => EventLabel::Announce,
         NodeEvent::LinkEstablished { .. } => EventLabel::LinkEstablished,
         NodeEvent::LinkIdentified { .. } => EventLabel::LinkIdentified,
-        NodeEvent::MessageReceived { .. } | NodeEvent::LinkDataReceived { .. } => EventLabel::Frame,
+        NodeEvent::MessageReceived { .. }
+        | NodeEvent::LinkDataReceived { .. }
+        | NodeEvent::LinkDatagramReceived { .. } => EventLabel::Frame,
         NodeEvent::RequestReceived { .. } => EventLabel::Request,
         NodeEvent::ResourceCompleted { .. } => EventLabel::ResourceCompleted,
         NodeEvent::ResourceTransferStarted { .. } | NodeEvent::ResourceProgress { .. } => {
@@ -10960,6 +11228,81 @@ fn mirror_planes(node: &ReticulumNode, metrics: &crate::observability::EdgeMetri
         [p.control_dropped_total, p.data_dropped_total],
         p.shed_packets_total,
     );
+}
+
+/// leviculum#102 — what [`fold_av_datagrams`] last read: each A/V link's
+/// datagram counters and the node's interface-shed count.
+#[derive(Debug, Default)]
+struct AvDatagramFold {
+    links: HashMap<LinkId, leviculum_core::node::DatagramStats>,
+    interface_shed: u64,
+}
+
+impl AvDatagramFold {
+    /// Fold one reading: `interface_shed` is the node's shed count now,
+    /// `links` each live A/V link's counters now. Returns the `av_plane`
+    /// deltas since the last reading and keeps this one. A link absent from
+    /// `links` is forgotten (closed, or no longer the sink's), so a later link
+    /// reusing nothing starts from zero; a counter that went backwards (it
+    /// never does) folds 0.
+    fn fold(
+        &mut self,
+        interface_shed: u64,
+        links: impl IntoIterator<Item = (LinkId, leviculum_core::node::DatagramStats)>,
+    ) -> [(&'static str, u64); 5] {
+        use crate::observability as obs;
+        let mut out = [
+            (
+                obs::AV_DATAGRAM_SHED,
+                interface_shed.saturating_sub(self.interface_shed),
+            ),
+            (obs::AV_DATAGRAM_LATE, 0),
+            (obs::AV_DATAGRAM_REPLAYED, 0),
+            (obs::AV_DATAGRAM_REFUSED, 0),
+            (obs::AV_DATAGRAM_SHED_SINK, 0),
+        ];
+        self.interface_shed = self.interface_shed.max(interface_shed);
+        let mut next = HashMap::new();
+        for (link_id, now) in links {
+            let was = self.links.get(&link_id).copied().unwrap_or_default();
+            out[1].1 += now.late.saturating_sub(was.late);
+            out[2].1 += now.replayed.saturating_sub(was.replayed);
+            out[3].1 += now.refused.saturating_sub(was.refused);
+            out[4].1 += now.shed.saturating_sub(was.shed);
+            next.insert(link_id, now);
+        }
+        self.links = next;
+        out
+    }
+}
+
+/// leviculum#102 — fold leviculum's datagram counters into `av_plane` as
+/// deltas, so they read as counters like every other `av_plane` label:
+/// `av_datagram_shed` (an interface had no room; node-wide, from the
+/// transport stats), and per A/V link the sink holds `av_datagram_late`,
+/// `av_datagram_replayed`, `av_datagram_refused` and `av_datagram_shed_sink`.
+/// A gauge, never a lever: nothing here changes how anything is sent. A link
+/// closed between two folds loses its last window's deltas (leviculum forgets
+/// its stats with it).
+fn fold_av_datagrams(
+    node: &ReticulumNode,
+    sink: &crate::transport::av_sink::AvSink,
+    fold: &std::sync::Mutex<AvDatagramFold>,
+    metrics: &crate::observability::EdgeMetrics,
+) {
+    let shed = node.transport_stats().drops_datagram_shed();
+    let links: Vec<_> = sink
+        .link_ids()
+        .into_iter()
+        .filter_map(|id| node.link_datagram_stats(&id).map(|st| (id, st)))
+        .collect();
+    let deltas = fold
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .fold(shed, links);
+    for (label, n) in deltas {
+        metrics.add_av_plane(label, n);
+    }
 }
 
 /// `FSD/CIRIS_MESH.md` §7.7 — a forwarded link this node refused is a dial
@@ -10994,6 +11337,9 @@ struct NodeTick {
     forward_load: Arc<std::sync::Mutex<crate::transport::relay_tier::ForwardLoad>>,
     ladder: Option<Arc<crate::load_ladder::SharedLadder>>,
     metrics: Option<crate::observability::EdgeMetrics>,
+    av_sink: Arc<crate::transport::av_sink::AvSink>,
+    av_datagram_fold: Arc<std::sync::Mutex<AvDatagramFold>>,
+    av_datagrams_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NodeTick {
@@ -11024,6 +11370,11 @@ impl NodeTick {
         t.set_seal_awaiting(links, bytes);
         t.set_seal_held(held);
         mirror_planes(node, m);
+        fold_av_datagrams(node, &self.av_sink, &self.av_datagram_fold, m);
+        t.set_av_datagrams_enabled(
+            self.av_datagrams_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         let policy = self.shapers.policy();
         let seat = self.shapers.links_of(ShapingClass::Seat);
         t.set_shaping(
@@ -11087,6 +11438,9 @@ impl ReticulumTransport {
             forward_load: Arc::clone(&self.forward_load),
             ladder: self.load_ladder.get().cloned(),
             metrics: self.metrics.get().cloned(),
+            av_sink: Arc::clone(&self.av_sink),
+            av_datagram_fold: Arc::clone(&self.av_datagram_fold),
+            av_datagrams_enabled: Arc::clone(&self.av_datagrams_enabled),
         }
     }
 
@@ -11469,6 +11823,11 @@ impl ReticulumTransport {
                     };
                     let label = event_label(&event);
                     let began = std::time::Instant::now();
+                    if matches!(event, NodeEvent::LinkDatagramReceived { .. }) {
+                        if let Some(delay) = self.av_sink.datagram_handling_delay() {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
                     handle_event(event, &ctx).await;
                     observe(label, began);
                     if let Some((link_id, up)) = direct_move {
@@ -11486,7 +11845,7 @@ impl ReticulumTransport {
                     if link_just_established
                         && !unannounced()
                         && last_event_announce
-                            .map_or(true, |t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
+                            .is_none_or(|t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
                     {
                         last_event_announce = Some(std::time::Instant::now());
                         let began = std::time::Instant::now();
@@ -11550,6 +11909,39 @@ impl ReticulumTransport {
         // reverse-path attempt. See `resolve_dial_candidates` /
         // `select_dial_candidate` for the holistic-fix rationale.
         let mut candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let replication = is_replication_frame(envelope_bytes);
+        // CIRISEdge#971 — a replication frame toward a peer no rule can reach
+        // (no live link, no path, no pair: CC 5.3.3.5 E1) is refused here,
+        // before the 3 s path seek and its broadcast, which could only end in
+        // "never dialled". Booked `no_route` as before (#794's backoff takes
+        // it); the peer's own rounds, or its link when it opens one, carry it.
+        if replication && self.undialable_now(destination_key_id, &candidates).await {
+            self.note_reach(crate::observability::REPLICATION_REACH_SKIPPED_UNDIALABLE);
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                no_route_log().check(destination_key_id)
+            {
+                tracing::info!(
+                    destination_key_id,
+                    suppressed_prev,
+                    "replication/send: no live link, no path and no authenticated transit pair \
+                     for this peer, so no rule can reach it (CC 5.3.3.5 E1); refused without a \
+                     path seek. Its own rounds, or a link it opens, carry it (tracked: \
+                     CIRISEdge#971)"
+                );
+            }
+            self.persisted_standing.note_unaddressed(destination_key_id);
+            return Err(match candidates.first() {
+                Some(c) => TransportError::NoRouteToPeer {
+                    key_id: destination_key_id.to_owned(),
+                    target_dest: hex::encode(c.dest_hash.into_bytes()),
+                    has_path: false,
+                    paths: "<not sought: undialable (CIRISEdge#971)>".to_owned(),
+                },
+                None => TransportError::NoDialCandidate {
+                    key_id: destination_key_id.to_owned(),
+                },
+            });
+        }
         if candidates.is_empty() && self.seek_peer(destination_key_id).await {
             candidates = self.resolve_dial_candidates(destination_key_id).await;
         }
@@ -11638,6 +12030,9 @@ impl ReticulumTransport {
             .send_via_reverse_path(destination_key_id, envelope_bytes, None)
             .await
         {
+            if replication {
+                self.note_reach(crate::observability::REPLICATION_REACH_CARRIED_ON_INBOUND_LINK);
+            }
             // CIRISEdge#920 — the peer's own link to us is the identity link
             // between the two nodes too: a room peer that only ever replies
             // must still bring it direct.
@@ -11675,6 +12070,9 @@ impl ReticulumTransport {
                 .is_some()
         {
             return Err(self.bulk_refusal(destination_key_id, envelope_bytes.len()));
+        }
+        if replication {
+            self.note_reach(crate::observability::REPLICATION_REACH_DIALLED);
         }
         let lane = self
             .identity_lane(
@@ -12148,7 +12546,7 @@ fn note_starved_pool_close(reason: leviculum_core::link::LinkCloseReason, link_i
         _ => return,
     };
     if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } = STARVED_POOL_CLOSE_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 8))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 8))
         .check(tag)
     {
         tracing::warn!(
@@ -15318,7 +15716,13 @@ async fn attribute_and_deliver(
     }
     let link_key_id = candidate_key_id.clone();
     let source_key_id = match candidate_key_id {
-        Some(key_id) => gate_attribution(ctx, link_id, key_id).await,
+        Some(key_id) => {
+            crate::read_caller::scoped(
+                crate::read_caller::Site::TransportAttribution,
+                gate_attribution(ctx, link_id, key_id),
+            )
+            .await
+        }
         // NO candidate key_id at all — the frame is dropped unattributed. This is
         // NOT a silent drop: the specific cause (`NoDest` / `DestUnmatched`) was
         // ALREADY logged loudly + throttled by the `resolve_link_attribution` arm
@@ -15590,7 +15994,7 @@ static AV_SINK_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 /// (CIRISEdge#460). The exact count is the `av_plane` counter, never throttled.
 fn av_sink_drop_log() -> &'static crate::log_throttle::LogThrottle {
     AV_SINK_DROP_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_mins(1), 256))
 }
 
 /// CIRISEdge#805 item 4 — **one inbound frame on an A/V link.**
@@ -15651,7 +16055,13 @@ async fn deliver_av_frame(
         // CIRISEdge#621's rule holds on this plane too: a link's source is
         // never this node.
         Some(key_id) if key_id == ctx.local_key_id => None,
-        Some(key_id) => gate_attribution(ctx, link_id, key_id).await,
+        Some(key_id) => {
+            crate::read_caller::scoped(
+                crate::read_caller::Site::TransportAttribution,
+                gate_attribution(ctx, link_id, key_id),
+            )
+            .await
+        }
         None => None,
     };
     let Some(peer) = gated else {
@@ -15936,7 +16346,7 @@ static LINK_ATTRIBUTION_SHARED_LOG: std::sync::OnceLock<crate::log_throttle::Log
     std::sync::OnceLock::new();
 fn link_attribution_shared_log() -> &'static crate::log_throttle::LogThrottle {
     LINK_ATTRIBUTION_SHARED_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_secs(600), 1024))
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_mins(10), 1024))
 }
 
 /// CIRISEdge#888 — the rule among [`identified_candidates`], pure so it is a
@@ -16097,6 +16507,101 @@ async fn route_now(ctx: &EventCtx<'_>, link_id: LinkId, is_resource: bool, data:
             );
         }
     }
+}
+
+/// leviculum#102 — a datagram not delivered: counted under `reason` in
+/// `av_plane` by the caller, and logged here at DEBUG, a few per minute per
+/// reason. A lost or overtaken datagram is routine realtime churn, never a
+/// fault (CIRISEdge#460), and the exact count is the counter.
+fn datagram_drop_debug(link_id: LinkId, reason: &'static str, detail: &str) {
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        av_sink_drop_log().check(reason)
+    {
+        tracing::debug!(
+            link = ?link_id,
+            reason,
+            detail,
+            suppressed_prev,
+            "A/V datagram DROPPED — not delivered (leviculum#102)"
+        );
+    }
+}
+
+/// leviculum#102 — **one unordered datagram on a link.**
+///
+/// Opened on the E1 datagram lane (a refusal closes the link, a replay is
+/// dropped, exactly as on every other lane), then handed to the A/V sink and
+/// nowhere else: edge sends datagrams only as media on A/V legs, so one on any
+/// other link is dropped by name. Its leviculum sequence number places it on
+/// the link: a gap is the frames lost on the way, reported to the consumer's
+/// hop counter like any drop below the sink; one overtaken by a newer
+/// datagram is dropped, because the hop counter is already past it.
+async fn route_datagram(ctx: &EventCtx<'_>, link_id: LinkId, sequence: u32, data: Vec<u8>) {
+    use crate::transport::av_sink::DatagramOrder;
+    let count = |label: &'static str, n: u64| {
+        if let Some(m) = ctx.metrics {
+            m.add_av_plane(label, n);
+        }
+    };
+    if ctx.av_sink.take_datagram_loss() {
+        // choke-ok: test seam only (`lose_next_datagrams_for_test`) — the
+        // datagram is treated as lost on the wire, as a shed one is.
+        return;
+    }
+    let Some(plain) = seal_inbound(
+        ctx,
+        link_id,
+        crate::transport::link_seal::Lane::Datagram,
+        &data,
+    )
+    .await
+    else {
+        // choke-ok: `seal_inbound` counts and names every frame it does not
+        // deliver. A datagram that never opened took no hop counter here, and
+        // the next one's sequence gap reports it.
+        return;
+    };
+    let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
+    if !matches!(plane.route(), InboundPlaneRoute::Av) {
+        count(crate::observability::AV_INBOUND_DATAGRAM_OFF_AV, 1);
+        datagram_drop_debug(
+            link_id,
+            crate::observability::AV_INBOUND_DATAGRAM_OFF_AV,
+            "an unordered datagram on a link that is not an A/V leg; edge sends datagrams \
+             only as A/V media, so it is not routed to replication (leviculum#102)",
+        );
+        return;
+    }
+    match ctx.av_sink.order_datagram(link_id, sequence) {
+        DatagramOrder::Next => {}
+        DatagramOrder::Gap(lost) => count(crate::observability::AV_INBOUND_DATAGRAM_GAP, lost),
+        DatagramOrder::Behind => {
+            count(crate::observability::AV_INBOUND_DATAGRAM_REORDERED, 1);
+            datagram_drop_debug(
+                link_id,
+                crate::observability::AV_INBOUND_DATAGRAM_REORDERED,
+                "an A/V datagram overtaken by a newer one on its link; the hop counter is \
+                 past it, so it is dropped, never opened (leviculum#102)",
+            );
+            return;
+        }
+    }
+    // The responder side waits for the link's identity before anything is
+    // delivered (CC 5.3.3.5 E1). A datagram is not held for it: it is live
+    // media, and the frame is counted on the hop so the next one resyncs.
+    let we_dialled = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
+    if !we_dialled && ctx.node.get_remote_identity(&link_id).is_none() {
+        count(DROP_AV_FRAME_UNATTRIBUTED, 1);
+        datagram_drop_debug(
+            link_id,
+            DROP_AV_FRAME_UNATTRIBUTED,
+            "an A/V datagram on a link whose identity is not proven yet; live media is not \
+             held, dropped and counted on the hop (CC 5.3.3.5 E1, leviculum#102)",
+        );
+        ctx.av_sink.note_dropped_before_sink(link_id);
+        return;
+    }
+    deliver_av_frame(ctx, link_id, dest, Some(plain)).await;
 }
 
 /// CC 5.3.3.5 E1 — record a link a PEER dialled as awaiting its handshake
@@ -16605,6 +17110,7 @@ async fn park_while_keying(event: NodeEvent, ctx: &EventCtx<'_>) -> Option<NodeE
     let (link_id, bytes) = match &event {
         NodeEvent::MessageReceived { link_id, data, .. }
         | NodeEvent::LinkDataReceived { link_id, data }
+        | NodeEvent::LinkDatagramReceived { link_id, data, .. }
         | NodeEvent::RequestReceived { link_id, data, .. }
         | NodeEvent::ResourceCompleted {
             link_id,
@@ -18277,6 +18783,16 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             };
             route_opened(ctx, link_id, false, data).await;
         }
+        // leviculum#102 — an unordered datagram: live media from a peer this
+        // node told it takes them (C3 `CAP_LINK_DATAGRAMS`). Sealed on its own
+        // E1 lane, then to the A/V sink only.
+        NodeEvent::LinkDatagramReceived {
+            link_id,
+            sequence,
+            data,
+        } => {
+            route_datagram(ctx, link_id, sequence, data).await;
+        }
         NodeEvent::LinkClosed {
             link_id, reason, ..
         } => {
@@ -19097,12 +19613,13 @@ fn is_replication_frame(envelope: &[u8]) -> bool {
 type PathSeeks = Arc<std::sync::Mutex<HashMap<DestinationHash, std::time::Instant>>>;
 
 /// Raise the path requests `dests` are due. Returns when the answers can
-/// stop being waited for: an ask still in flight counts, an old one does not.
+/// stop being waited for (an ask still in flight counts, an old one does
+/// not), and how many requests were raised now (CIRISEdge#971's gauge).
 async fn ask_for_paths(
     node: &ReticulumNode,
     seeks: &PathSeeks,
     dests: &[DestinationHash],
-) -> std::time::Instant {
+) -> (std::time::Instant, usize) {
     let now = std::time::Instant::now();
     let mut ask: Vec<DestinationHash> = Vec::new();
     let mut until = now;
@@ -19134,7 +19651,7 @@ async fn ask_for_paths(
             tracing::debug!(error = %e, "path request not sent");
         }
     }
-    until
+    (until, ask.len())
 }
 
 /// The late joiner's ask (#945), for a peer the no-route backoff has stopped
@@ -19156,7 +19673,7 @@ async fn ask_through_landed_routes(
             .and_then(|b| <[u8; 16]>::try_from(b).ok());
         if let Some(hash) = hash {
             tracing::debug!(peer = %key, "a wanted peer's route landed; asking for its path");
-            ask_for_paths(&node, &seeks, &[DestinationHash::new(hash)]).await;
+            let _ = ask_for_paths(&node, &seeks, &[DestinationHash::new(hash)]).await;
         }
     }
 }
@@ -21405,27 +21922,24 @@ fn attestation_self_verifies(
     true
 }
 
-/// Whether `policy` accepts a rooted provenance `chain` (CIRISEdge#15
-/// step 4).
+/// Whether a rooted provenance `chain` is acceptable (CIRISEdge#15 step 4):
+/// every [`ProvenanceLink`] must be hybrid-complete, so a link with
+/// `pubkey_ml_dsa_65_base64 == None` or `scrub_signature_pqc == None` (a
+/// hybrid-pending row) refuses the chain.
 ///
-/// - `Strict` — every [`ProvenanceLink`] must be hybrid-complete:
-///   reject if any link has `pubkey_ml_dsa_65_base64 == None` or
-///   `scrub_signature_pqc == None` (a hybrid-pending row).
-/// - `Ed25519Fallback` — accept the `Confirmed` verdict as-is; the
-///   Ed25519-rooted chain is sufficient.
-/// - `SoftFreshness { window }` — the freshness window is a per-row
-///   age input the announce path does not carry, so this collapses
-///   to "accept the rooted chain", consistent with `verify.rs`'s
-///   documented `row_age = None` treatment of `SoftFreshness`.
+/// CIRISEdge#957 (CC 5.3.2.4.3.1, CIRISPersist#1233): hybrid-required is the
+/// only verifier posture, so `policy` no longer selects anything. The
+/// retired `Ed25519Fallback` / `SoftFreshness` arms accepted a hybrid-pending
+/// chain; every variant now asks the same check. The transport constructor
+/// already refuses a non-`Strict` policy, so this is the second wall, not the
+/// first.
 ///
 /// [`ProvenanceLink`]: crate::verify::ProvenanceLink
-fn hybrid_policy_accepts(policy: HybridPolicy, chain: &ProvenanceChain) -> bool {
-    match policy {
-        HybridPolicy::Strict => chain.chain.iter().all(|link| {
-            link.pubkey_ml_dsa_65_base64.is_some() && link.scrub_signature_pqc.is_some()
-        }),
-        HybridPolicy::Ed25519Fallback | HybridPolicy::SoftFreshness { .. } => true,
-    }
+fn hybrid_policy_accepts(_policy: HybridPolicy, chain: &ProvenanceChain) -> bool {
+    chain
+        .chain
+        .iter()
+        .all(|link| link.pubkey_ml_dsa_65_base64.is_some() && link.scrub_signature_pqc.is_some())
 }
 
 /// Build edge's own announce attestation app-data — the CIRISEdge#15
@@ -22310,6 +22824,55 @@ async fn with_timeout<F: std::future::Future>(dur: Duration, fut: F) -> Option<F
 }
 
 #[cfg(test)]
+mod av_datagram_fold_tests {
+    use super::*;
+    use leviculum_core::node::DatagramStats;
+
+    fn st(late: u64, replayed: u64, refused: u64, shed: u64) -> DatagramStats {
+        DatagramStats {
+            late,
+            replayed,
+            refused,
+            shed,
+            ..DatagramStats::default()
+        }
+    }
+
+    fn get(d: &[(&'static str, u64)], label: &str) -> u64 {
+        d.iter().find(|(l, _)| *l == label).map_or(0, |(_, n)| *n)
+    }
+
+    /// leviculum#102 — every shed datagram is counted exactly once: the fold
+    /// carries leviculum's counters as deltas, so a reading taken twice adds
+    /// nothing and a link that closed is not counted again.
+    #[test]
+    fn a_shed_datagram_is_counted_once() {
+        use crate::observability as obs;
+        let (a, b) = (LinkId::new([1; 16]), LinkId::new([2; 16]));
+        let mut f = AvDatagramFold::default();
+        let d = f.fold(3, [(a, st(1, 0, 0, 2))]);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_SHED), 3);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_LATE), 1);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_SHED_SINK), 2);
+        let d = f.fold(3, [(a, st(1, 0, 0, 2))]);
+        assert!(
+            d.iter().all(|(_, n)| *n == 0),
+            "the same reading folds nothing: {d:?}"
+        );
+        let d = f.fold(7, [(a, st(4, 1, 0, 2)), (b, st(0, 0, 5, 1))]);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_SHED), 4);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_LATE), 3);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_REPLAYED), 1);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_REFUSED), 5);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_SHED_SINK), 1);
+        // `a` closed: forgotten, nothing folded for it, `b` moves alone.
+        let d = f.fold(7, [(b, st(0, 0, 6, 1))]);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_REFUSED), 1);
+        assert_eq!(get(&d, obs::AV_DATAGRAM_LATE), 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -22886,6 +23449,7 @@ mod tests {
             "async fn attribute_and_deliver(",
             "async fn handle_event(",
             "async fn deliver_av_frame(",
+            "async fn route_datagram(",
         ] {
             let start = lines
                 .iter()
@@ -22908,6 +23472,7 @@ mod tests {
                 let lo = idx.saturating_sub(8);
                 let window = lines[lo..=idx].join("\n");
                 let instrumented = window.contains("drop_inbound(")
+                    || window.contains("datagram_drop_debug(")
                     || window.contains("tracing::")
                     || window.contains("choke-ok");
                 if !instrumented {
@@ -24651,7 +25216,7 @@ mod tests {
         #[test]
         fn above_ceiling_clamps_down_to_max() {
             assert_eq!(
-                effective_link_keepalive_secs(Some(Duration::from_secs(86_400))),
+                effective_link_keepalive_secs(Some(Duration::from_hours(24))),
                 Some(LINK_KEEPALIVE_MAX_SECS),
             );
         }
@@ -24672,6 +25237,26 @@ mod tests {
     /// nothing at all.
     mod control_channel_capacity {
         use super::*;
+
+        /// v45 — the data plane runs at 1024 unless the env var says
+        /// otherwise (clamped; garbage ignored), and 1024 leaves a 30 KB
+        /// keyframe's 127 datagrams room under leviculum's shed line.
+        #[test]
+        fn the_data_plane_holds_a_keyframe_burst() {
+            assert_eq!(effective_data_channel_capacity(None), DATA_CHANNEL_CAPACITY);
+            assert_eq!(effective_data_channel_capacity(Some(" 4096\n")), 4096);
+            assert_eq!(
+                effective_data_channel_capacity(Some("1")),
+                CONTROL_CHANNEL_CAPACITY_MIN
+            );
+            assert_eq!(
+                effective_data_channel_capacity(Some("lots")),
+                DATA_CHANNEL_CAPACITY
+            );
+            let shed_line = DATA_CHANNEL_CAPACITY
+                - leviculum_core::node::datagram_sink_reserve_for(DATA_CHANNEL_CAPACITY);
+            assert!(shed_line >= 4 * 127, "{shed_line}");
+        }
 
         /// Config wins over env, and passes through when in band.
         #[test]
@@ -25501,7 +26086,7 @@ mod tests {
             "default must be None so keystore lookups keep using local_key_id"
         );
         assert!(cfg.bootstrap_peers.is_empty());
-        assert_eq!(cfg.announce_interval, Duration::from_secs(300));
+        assert_eq!(cfg.announce_interval, Duration::from_mins(5));
     }
 
     // CIRISEdge#168 (v5.0) — Transport-node mode (§24 NAT-traversal).
@@ -25622,14 +26207,8 @@ mod scope_native_addressing_tests {
             (link819(5), ago(30)),
         ]);
         let busy = |id: &LinkId| *id == link819(1);
-        let victims = select_pool_victims(
-            &pool,
-            busy,
-            &mut used,
-            now,
-            Some(Duration::from_secs(120)),
-            2,
-        );
+        let victims =
+            select_pool_victims(&pool, busy, &mut used, now, Some(Duration::from_mins(2)), 2);
         let why = |n: u8| {
             victims
                 .iter()
@@ -25665,7 +26244,7 @@ mod scope_native_addressing_tests {
         let last_used = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let lane = link819(9);
         let handed_out = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(300))
+            .checked_sub(Duration::from_mins(5))
             .expect("monotonic clock");
         last_used.lock().unwrap().insert(lane, handed_out);
         let lease = ScopedLinkLease::claim(lane, &leased).stamping(&last_used);
@@ -25753,7 +26332,7 @@ mod scope_native_addressing_tests {
     /// second, so the reap is never early.
     #[test]
     fn inbound_idle_clock_starts_at_establishment_and_restarts_on_a_frame_853() {
-        let bound = Duration::from_secs(120);
+        let bound = Duration::from_mins(2);
         let est = 1_000;
         // No frame: 120 s after the end of the establishing second.
         assert!(!inbound_link_idle_expired(
@@ -26680,7 +27259,7 @@ impl crate::scope_lifecycle::ScopedDestinationSink for ReticulumTransport {
 /// Well over a replication round and its cadence's jitter, so a lane a peer's
 /// next round will want is still there; far under leviculum's ~13 min stale
 /// reap, which an initiator's own keepalives never let fire.
-pub const DEFAULT_LINK_POOL_IDLE_BOUND: Duration = Duration::from_secs(120);
+pub const DEFAULT_LINK_POOL_IDLE_BOUND: Duration = Duration::from_mins(2);
 
 /// CIRISEdge#819 — the most IDLE lanes a pool keeps per destination. Busy
 /// lanes are not counted and never closed, so a burst still dials as many
@@ -27220,5 +27799,122 @@ mod wire_link_id_tests {
             Some(LinkPlane::Identity)
         ));
         assert!(!planes.lock().await.contains_key(&connect_id));
+    }
+}
+
+/// CIRISEdge#971 — the round-start reach check's store reads run under the
+/// `edge.transport.carriable` caller label, so the seat's persist callers do
+/// not file them as unattributed.
+#[cfg(test)]
+mod round_carriable_caller_971 {
+    use super::*;
+
+    /// A rooting directory with no transit pair for anyone, recording the
+    /// persist caller label in force at each pair read.
+    #[derive(Default)]
+    struct RecordingRooting {
+        labels: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingRooting {
+        fn note(&self) {
+            let label = ciris_persist::observe::current_caller()
+                .map_or_else(|| "-".to_owned(), ciris_persist::observe::Caller::label);
+            self.labels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(label);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RootingDirectory for RecordingRooting {
+        async fn root_binding(&self, key_id: &str, _claimed: &str) -> RootingVerdict {
+            RootingVerdict::Rejected {
+                rejection: RootingRejection::UnknownKeyId {
+                    key_id: key_id.to_owned(),
+                },
+            }
+        }
+        async fn provenance_chain(
+            &self,
+            key_id: &str,
+        ) -> Result<ProvenanceChain, RootingRejection> {
+            Err(RootingRejection::UnknownKeyId {
+                key_id: key_id.to_owned(),
+            })
+        }
+        async fn transit_kex_pair_for(
+            &self,
+            _key_id: &str,
+        ) -> Result<Option<TransitKexPair>, String> {
+            self.note();
+            Ok(None)
+        }
+        async fn self_signed_transit_pair_for(
+            &self,
+            _key_id: &str,
+        ) -> Result<Option<TransitKexPair>, String> {
+            self.note();
+            Ok(None)
+        }
+    }
+
+    fn test_signer(key_id: &str) -> Arc<LocalSigner> {
+        let mut ed_seed = [0u8; 32];
+        for (i, b) in ed_seed.iter_mut().enumerate() {
+            *b = u8::try_from(i % 251).expect("in range") ^ 0x71;
+        }
+        let mut pqc_seed = ed_seed;
+        pqc_seed[0] ^= 0x55;
+        let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+            ciris_keyring::Ed25519SoftwareSigner::from_bytes(&ed_seed, key_id).expect("ed25519"),
+        );
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                &pqc_seed,
+                format!("{key_id}-pqc"),
+            )
+            .expect("ml_dsa_65"),
+        );
+        Arc::new(LocalSigner::new(key_id, classical, Some(pqc)))
+    }
+
+    /// A peer with no live link, no path and no transit pair is not
+    /// carriable, and every pair read that decided it ran under
+    /// `edge.transport.carriable`. Mutation: drop the `scoped` wrap in
+    /// `undialable_now`, and the recorded label is `-`.
+    #[tokio::test]
+    async fn the_round_start_pair_read_names_its_caller_971() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = ReticulumTransportConfig::new(dir.path().join("t.id"), "edge-carriable");
+        config.listen_addr = "127.0.0.1:0".parse().expect("addr");
+        let rooting = Arc::new(RecordingRooting::default());
+        let transport = ReticulumTransport::new(
+            config,
+            ReticulumAuth {
+                signer: Some(test_signer("edge-carriable")),
+                rooting: Some(Arc::clone(&rooting) as Arc<dyn RootingDirectory>),
+                ..ReticulumAuth::default()
+            },
+        )
+        .await
+        .expect("transport");
+        assert!(
+            !Transport::round_carriable(&transport, "peer-with-no-pair-971").await,
+            "no link, no path, no pair: the round is not carriable"
+        );
+        let labels = rooting
+            .labels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(!labels.is_empty(), "the pair was read");
+        assert!(
+            labels
+                .iter()
+                .all(|l| l == crate::read_caller::Site::RoundCarriable.label()),
+            "every pair read ran under the carriable label: {labels:?}"
+        );
     }
 }

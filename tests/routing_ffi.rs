@@ -84,7 +84,7 @@ async fn auth_with(
         signer: Some(signer_for(key, base).await),
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         transport_binding_enforcement:
             ciris_edge::transport::attestation::TransportBindingEnforcement::Advisory,
         bundle_save_gate: ciris_edge::bundle_gate::BundleSaveGateMode::Off,
@@ -837,7 +837,7 @@ async fn auth_pinned_backend(
         signer: Some(signer_for(key, base).await),
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         transport_binding_enforcement:
             ciris_edge::transport::attestation::TransportBindingEnforcement::Advisory,
         bundle_save_gate: ciris_edge::bundle_gate::BundleSaveGateMode::Off,

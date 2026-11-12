@@ -68,7 +68,7 @@ async fn auth_for(
         signer: Some(signer_for(key, base).await),
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -155,7 +155,7 @@ async fn reverse_pair(tag: &str) -> ReversePair {
         .send(key_a.key_id.as_str(), b"round-open-716")
         .await
         .expect("B -> A");
-    tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
+    tokio::time::timeout(Duration::from_mins(1), rx_a.recv())
         .await
         .expect("A receives B within 60s")
         .expect("A channel open");
@@ -177,7 +177,7 @@ fn payload(len: usize) -> Vec<u8> {
 }
 
 async fn expect_frame(rx: &mut mpsc::Receiver<InboundFrame>, want: &[u8], what: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let frame = tokio::time::timeout(left, rx.recv())

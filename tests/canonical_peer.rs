@@ -187,7 +187,7 @@ async fn build_edge_with_canonical(
     }
     backend.set_node_key_id(me.key_id.clone());
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     };
     Edge::builder()

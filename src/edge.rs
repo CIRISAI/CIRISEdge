@@ -285,7 +285,10 @@ pub struct CanonicalBootstrapPeer {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct EdgeConfig {
-    /// Consumer-side hybrid PQC acceptance policy (OQ-11).
+    /// Consumer-side hybrid PQC acceptance policy (OQ-11). Only
+    /// [`HybridPolicy::Strict`] is accepted (CIRISEdge#957, CC 5.3.2.4.3.1):
+    /// [`EdgeBuilder::build`] refuses any other with `verify_policy_violation`.
+    /// The field stays until persist v62 removes the argument.
     pub hybrid_policy: HybridPolicy,
     /// Replay-window width (AV-3, OQ-08). Default 5 minutes.
     pub replay_window_seconds: u64,
@@ -1495,9 +1498,12 @@ pub struct Edge {
     #[cfg(feature = "_reticulum-module")]
     scope_lifecycle: std::sync::OnceLock<Arc<crate::scope_lifecycle::ScopeLifecycle>>,
     /// CIRISEdge#805 item 5 — the node's room MLS groups, for
-    /// [`Edge::join_call`]. Set via [`EdgeBuilder::room_groups`].
+    /// [`Edge::join_call`]. Set once: at build ([`EdgeBuilder::room_groups`]),
+    /// or by [`Edge::arm_room_groups`] on an Edge another layer built.
+    /// `join_call` reads the cell per call, so groups armed on a running Edge
+    /// serve the next join.
     #[cfg(feature = "_reticulum-module")]
-    room_groups: Option<Arc<crate::mls::CohortGroups>>,
+    room_groups: std::sync::OnceLock<Arc<crate::mls::CohortGroups>>,
     /// CIRISEdge#805 item 5 — the keep door a call's stream registers through
     /// (never reached while kept streams wait on CIRISPersist#1067).
     #[cfg(feature = "_reticulum-module")]
@@ -2331,6 +2337,34 @@ impl Edge {
         let tier = self.load_ladder.set_host_pressure(pressure);
         self.apply_service_tier(tier);
         tier
+    }
+
+    /// leviculum#102 — **the A/V datagram lever**: whether new A/V legs may
+    /// carry media as unordered link datagrams. Default on. Off, a leg that
+    /// comes up from now on neither advertises `CAP_LINK_DATAGRAMS` in its C3
+    /// `CAPS` nor sends datagrams, so its media rides the Channel
+    /// (`try_send_timed`); a leg already on datagrams keeps them (the switch
+    /// is one-way per leg). Edge never moves it on its own; the gauge is
+    /// `av_datagrams_enabled`. No-op without the Reticulum transport.
+    pub fn set_av_datagrams_enabled(&self, enabled: bool) {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            t.set_av_datagrams_enabled(enabled);
+        }
+        let _ = enabled;
+    }
+
+    /// v45 — **the A/V layer-request lever**: whether calls joined from now
+    /// on take part in SUBSCRIBE layer caps (`Call::request_layers`): they
+    /// advertise `CAP_LAYER_REQUEST`, apply a child's cap, and send their
+    /// own. Default OFF until CC corrects 5.3.3.2.4. No-op without
+    /// the Reticulum transport.
+    pub fn set_av_layer_requests_enabled(&self, enabled: bool) {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            t.set_av_layer_requests_enabled(enabled);
+        }
+        let _ = enabled;
     }
 
     /// `CLM-shaping-offered-never-refused` — how long past its last real frame
@@ -4677,6 +4711,27 @@ impl Edge {
         Ok(())
     }
 
+    /// **Arm the room MLS groups on a running Edge**, for [`Self::join_call`].
+    ///
+    /// For a host that reuses an Edge another layer built rather than
+    /// building its own (CIRISServer's agent-embedded node reuses the Edge
+    /// the pyo3 `init_edge_runtime` built, which sets no room groups): without
+    /// it every `join_call` there is refused `CallError::Plumbing` naming the
+    /// room groups. [`EdgeBuilder::room_groups`] still seeds them at build.
+    ///
+    /// Safe on a running Edge: `join_call` reads the cell per call. Set once —
+    /// refused, with nothing changed, if the groups are already set (at build
+    /// or by an earlier arm).
+    ///
+    /// # Errors
+    /// [`EdgeError::Config`] when the room groups are already set.
+    #[cfg(feature = "_reticulum-module")]
+    pub fn arm_room_groups(&self, groups: Arc<crate::mls::CohortGroups>) -> Result<(), EdgeError> {
+        self.room_groups.set(groups).map_err(|_| {
+            EdgeError::Config("arm_room_groups: the room groups are already set".into())
+        })
+    }
+
     /// CIRISEdge#805 item 5 — **join `room`'s call** (`FSD/AV_CALL_API.md`
     /// §4): start this node's stream; an in-room call needs no ring (§7).
     /// Needs the Reticulum transport, the scope lifecycle, the room groups
@@ -4731,7 +4786,7 @@ impl Edge {
             .ok_or_else(|| missing("a scope lifecycle"))?;
         let groups = self
             .room_groups
-            .as_ref()
+            .get()
             .ok_or_else(|| missing("the room groups (EdgeBuilder::room_groups)"))?;
         let directory = self
             .federation_directory
@@ -5972,7 +6027,7 @@ static INBOUND_VERIFY_REJECT_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
 /// `source_key_id`). Keyed on transport id (a handful of values).
 fn inbound_unroutable_crpl_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_UNROUTABLE_CRPL_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_mins(1), 16)
     })
 }
 
@@ -5986,7 +6041,7 @@ static BLOB_SCOPE_WITHHELD_LOG: std::sync::OnceLock<crate::log_throttle::LogThro
 
 fn blob_scope_withheld_log() -> &'static crate::log_throttle::LogThrottle {
     BLOB_SCOPE_WITHHELD_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(300), 16)
+        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_mins(5), 16)
     })
 }
 
@@ -5997,7 +6052,7 @@ static CHUNK_REPLY_FALLBACK_LOG: std::sync::OnceLock<crate::log_throttle::LogThr
 /// took the durable queue instead. One label.
 fn chunk_reply_fallback_log() -> &'static crate::log_throttle::LogThrottle {
     CHUNK_REPLY_FALLBACK_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(1, std::time::Duration::from_secs(60), 4)
+        crate::log_throttle::LogThrottle::new(1, std::time::Duration::from_mins(1), 4)
     })
 }
 
@@ -6005,7 +6060,7 @@ fn chunk_reply_fallback_log() -> &'static crate::log_throttle::LogThrottle {
 /// the verify-error class (a small closed set).
 fn inbound_verify_reject_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_VERIFY_REJECT_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 32)
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_mins(1), 32)
     })
 }
 
@@ -6016,7 +6071,7 @@ static FIRST_CONTACT_REFUSAL_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
     std::sync::OnceLock::new();
 fn first_contact_refusal_log() -> &'static crate::log_throttle::LogThrottle {
     FIRST_CONTACT_REFUSAL_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_mins(1), 16)
     })
 }
 
@@ -6042,7 +6097,7 @@ static INBOUND_BOOTSTRAP_CARVEOUT_LOG: std::sync::OnceLock<crate::log_throttle::
 /// the true magnitude, the WARN just needs to name the peer + kind without flooding.
 fn inbound_backpressure_drop_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_BACKPRESSURE_DROP_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 256)
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_mins(1), 256)
     })
 }
 
@@ -6055,7 +6110,7 @@ static INBOUND_REPLY_DROPPED_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
 /// of a slow peer, so the WARN is throttled and the counter carries the count.
 fn inbound_reply_dropped_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_REPLY_DROPPED_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 256)
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_mins(1), 256)
     })
 }
 
@@ -6063,7 +6118,7 @@ fn inbound_reply_dropped_log() -> &'static crate::log_throttle::LogThrottle {
 /// of values). Makes the previously-invisible hop VISIBLE at `ciris_edge=debug`.
 fn inbound_ingest_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_INGEST_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(8, std::time::Duration::from_secs(60), 16)
+        crate::log_throttle::LogThrottle::new(8, std::time::Duration::from_mins(1), 16)
     })
 }
 
@@ -6071,7 +6126,7 @@ fn inbound_ingest_log() -> &'static crate::log_throttle::LogThrottle {
 /// that was silent). Keyed on peer key_id (attacker-influenceable ⇒ capped map).
 fn inbound_routed_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_ROUTED_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(8, std::time::Duration::from_secs(60), 256)
+        crate::log_throttle::LogThrottle::new(8, std::time::Duration::from_mins(1), 256)
     })
 }
 
@@ -6081,7 +6136,7 @@ fn inbound_routed_log() -> &'static crate::log_throttle::LogThrottle {
 /// peer's multi-frame round doesn't flood; verification still gates at admission.
 fn inbound_bootstrap_carveout_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_BOOTSTRAP_CARVEOUT_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_mins(1), 16)
     })
 }
 
@@ -6134,6 +6189,9 @@ async fn route_replication_frame(
     // un-attributed CRPL frame drops (`SkippedNoSourceKeyId`); the trace-serve
     // gate stays strictly `from_rooted_binding`.
     let source: String = if let Some(sid) = frame.source_key_id.as_ref() {
+        // CIRISEdge#968 — a peer this node dropped while unattributed is
+        // asked again the moment one of its frames attributes.
+        registry.note_attributed(sid.as_str());
         sid.as_str().to_string()
     } else {
         if !frame
@@ -6156,6 +6214,15 @@ async fn route_replication_frame(
                     return true;
                 }
             }
+            // CIRISEdge#968 — counted, and the candidate remembered so its
+            // rounds are asked again the moment it attributes.
+            if let Some(m) = metrics {
+                m.inc_transport_inbound_drop(crate::observability::DROP_REPLICATION_UNATTRIBUTED);
+            }
+            let dropped_frames = frame
+                .link_key_id
+                .as_deref()
+                .map_or(0, |k| registry.note_unattributed_drop(k));
             if let ThrottleDecision::Emit { suppressed_prev } =
                 inbound_unroutable_crpl_log().check(frame.transport.0)
             {
@@ -6164,6 +6231,8 @@ async fn route_replication_frame(
                     bytes = frame.envelope_bytes.len(),
                     first_bytes_hex = %first_bytes_hex(&frame.envelope_bytes),
                     route = "SkippedNoSourceKeyId",
+                    candidate = frame.link_key_id.as_deref().unwrap_or("-"),
+                    dropped_frames,
                     suppressed_prev,
                     "inbound CRPL replication frame with source_key_id=None and not a \
                      self-authenticating bootstrap kind — transport could not attribute \
@@ -8988,6 +9057,12 @@ impl EdgeBuilder {
         if self.transports.is_empty() {
             return Err(EdgeError::Config("no transport configured".into()));
         }
+        // CIRISEdge#957 / CIRISPersist#1233 (CC 5.3.2.4.3.1): hybrid-required
+        // is the only verifier policy. Persist refuses any other at its verify
+        // doors; refusing it here too means an edge never builds with a policy
+        // that would refuse every inbound envelope at verify time.
+        crate::verify::require_strict_policy(self.config.hybrid_policy)
+            .map_err(EdgeError::Config)?;
 
         // A split home is addressed at the node it advertises and signs as
         // the actor: both are this node (AV-8).
@@ -9243,7 +9318,10 @@ impl EdgeBuilder {
                 None => std::sync::OnceLock::new(),
             },
             #[cfg(feature = "_reticulum-module")]
-            room_groups: self.room_groups,
+            room_groups: match self.room_groups {
+                Some(groups) => std::sync::OnceLock::from(groups),
+                None => std::sync::OnceLock::new(),
+            },
             #[cfg(feature = "_reticulum-module")]
             stream_dek_registrar: self.stream_dek_registrar,
             federation_directory: self.federation_directory,
@@ -12145,6 +12223,59 @@ mod scope_native_install_tests {
             .expect("builder")
     }
 
+    fn groups(tag: &[u8], key_id: &str) -> Arc<crate::mls::CohortGroups> {
+        Arc::new(crate::mls::CohortGroups::new(
+            crate::mls::ScopeStateProvider::new(Arc::new(
+                ciris_persist::encrypted_kv::XChaChaKvStore::open_in_memory(tag)
+                    .expect("in-memory scope state"),
+            )),
+            key_id,
+        ))
+    }
+
+    /// The room groups arm once on a running Edge built without them (the
+    /// agent-embedded host's Edge), and never over a set.
+    #[tokio::test]
+    async fn room_groups_arm_once_on_an_edge_built_without_them() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let edge = builder(tmp.path(), "edge-rg-late")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .build()
+            .expect("build");
+        assert!(edge.room_groups.get().is_none(), "nothing set at build");
+        edge.arm_room_groups(groups(b"rg-1", "edge-rg-late"))
+            .expect("the first arm takes");
+        assert!(edge.room_groups.get().is_some(), "armed");
+        let Err(EdgeError::Config(msg)) = edge.arm_room_groups(groups(b"rg-2", "edge-rg-late"))
+        else {
+            panic!("a second arm is refused");
+        };
+        assert!(msg.contains("already set"), "{msg}");
+    }
+
+    /// An Edge whose builder set the room groups refuses an arm: the
+    /// builder's groups stay.
+    #[tokio::test]
+    async fn room_groups_set_at_build_refuse_an_arm() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let built = groups(b"rg-b", "edge-rg-built");
+        let edge = builder(tmp.path(), "edge-rg-built")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .room_groups(Arc::clone(&built))
+            .build()
+            .expect("build");
+        assert!(matches!(
+            edge.arm_room_groups(groups(b"rg-x", "edge-rg-built")),
+            Err(EdgeError::Config(_))
+        ));
+        assert!(
+            Arc::ptr_eq(edge.room_groups.get().expect("set"), &built),
+            "the builder's groups are the ones held"
+        );
+    }
+
     #[tokio::test]
     async fn off_by_default_leaves_every_scope_native_path_declining() {
         // The pre-#499 posture, and the one an existing deployment inherits
@@ -12181,7 +12312,7 @@ mod scope_native_install_tests {
         let Err(err) = builder(tmp.path(), "edge-no-transport")
             .await
             .transport(Arc::new(crate::transport::NullTransport))
-            .scope_native_addressing(Duration::from_secs(300))
+            .scope_native_addressing(Duration::from_mins(5))
             .build()
         else {
             panic!("arming without a Reticulum transport must be refused");

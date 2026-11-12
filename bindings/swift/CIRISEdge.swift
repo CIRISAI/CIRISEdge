@@ -3475,6 +3475,12 @@ fileprivate struct FfiConverterDictionaryStringData: FfiConverterRustBuffer {
         return dict
     }
 }
+public func avDatagramsSetEnabled(enabled: Bool)throws   {try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_av_datagrams_set_enabled(
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
 public func crateVersion()throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
     uniffi_ciris_edge_fn_func_crate_version($0
@@ -3848,6 +3854,9 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_ciris_edge_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_av_datagrams_set_enabled() != 31336) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_crate_version() != 15809) {
         return InitializationResult.apiChecksumMismatch

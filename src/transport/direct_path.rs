@@ -158,7 +158,7 @@ pub const UPGRADE_GUARD_BOUND: Duration = Duration::from_millis(
 /// How long a record of an upgrade outlives its guard, so a hold that ended
 /// late is still named. Past it the record goes, on the next upgrade: a link
 /// that closes mid-session reports no outcome.
-const UPGRADE_RECORD_TTL: Duration = Duration::from_secs(10 * 60);
+const UPGRADE_RECORD_TTL: Duration = Duration::from_mins(10);
 
 /// The first retry after a proposal that timed out, failed its probe, or lost
 /// its direct path: leviculum's own per-link proposal cooldown
@@ -167,7 +167,7 @@ pub const DIRECT_RETRY_BASE: Duration =
     Duration::from_millis(leviculum_core::node::PROPOSAL_COOLDOWN_MS);
 
 /// The longest a retryable failure backs off (the base doubles per attempt).
-pub const DIRECT_RETRY_CAP: Duration = Duration::from_secs(30 * 60);
+pub const DIRECT_RETRY_CAP: Duration = Duration::from_mins(30);
 
 /// v44 — every retry is jittered by up to this fraction either way, so two
 /// peers that failed together never retry in lockstep (the CI baseline's
@@ -187,7 +187,7 @@ pub const GLARE_WAIT: Duration = Duration::from_secs(30);
 /// A punch that failed means a NAT that maps per destination (symmetric NAT,
 /// common on cellular). It does not change between calls, so the peer is not
 /// asked again for an hour; a network change shows up as a new link anyway.
-pub const DIRECT_PUNCH_FAILED_BACKOFF: Duration = Duration::from_secs(60 * 60);
+pub const DIRECT_PUNCH_FAILED_BACKOFF: Duration = Duration::from_hours(1);
 
 /// [`direct_leg_stalled`]: this many consecutive `Congested` refusals on a
 /// direct A/V leg mean its path is gone, not busy.

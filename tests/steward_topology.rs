@@ -257,7 +257,7 @@ async fn build_edge_with_signer(
     // Strict (the default) would reject every test row as
     // hybrid-pending.
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     };
     let mut b = Edge::builder()

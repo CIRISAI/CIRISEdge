@@ -85,7 +85,7 @@ const _: () = assert!(
 /// How many packets a relay holds waiting out their delay (FSD §6).
 pub const DEFAULT_HOLD_BOUND: usize = 256;
 /// The longest delay a relay honours; a longer one is clamped.
-pub const MAX_HOLD_DELAY: Duration = Duration::from_secs(60);
+pub const MAX_HOLD_DELAY: Duration = Duration::from_mins(1);
 
 /// What the relay does with a packet it accepted.
 #[derive(Debug)]

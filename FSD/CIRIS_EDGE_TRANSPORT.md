@@ -1141,7 +1141,12 @@ An unannounced node's rows go only to `nodes_owned_by(owner)`; anyone else is bo
 or the announce state cannot be read — fail-closed to the node itself). The gate is
 keyed on the ROW's occurrence key, so it covers a relayed row as well as our own,
 and it holds on all three serve axes: the per-peer advertise, the direct-fetch twin
-and the subject Pull. An unowned node is its own trust subject and serves as before.
+and the subject Pull. An unowned node that no other identity holds as its occurrence
+is its own trust subject and serves as before. An unowned node that IS held as the
+occurrence of another identity (a person's device with no live owner-binding at this
+holder) is served to that identity, its owned nodes and its active occurrences only;
+anyone else is booked `identity_row_occurrence_unowned` (CIRISEdge#971). A key that
+is not node-type (a split-home agent key, a user key) is not narrowed (CIRISEdge#897).
 Decided from persist state, memoized per sweep (the owner memo's TTL and
 invalidation events, plus the widening). `FSD/FIRST_CONTACT.md` §2.1 is how it
 composes with the bootstrap kinds. `Key` is not gated: a key record discloses no

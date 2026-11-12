@@ -76,7 +76,7 @@ use crate::observability as obs;
 /// no-progress window (~6 s), so this bound only bites a genuinely pathological
 /// send. The abandoned send is safe: its awaits (resource wait, dial) are
 /// cancellation-tolerant.
-pub(super) const RESPONDER_REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const RESPONDER_REPLY_SEND_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Replies waiting behind the one on the wire. The inbox's capacity, so a burst
 /// the inbox could absorb when replies were sent inline (a contact lookup is up
@@ -192,7 +192,7 @@ static LANE_LOG: OnceLock<LogThrottle> = OnceLock::new();
 
 /// A peer picks how often this fires, so it is throttled; the counter is not.
 fn lane_log() -> &'static LogThrottle {
-    LANE_LOG.get_or_init(|| LogThrottle::new(8, Duration::from_secs(60), 256))
+    LANE_LOG.get_or_init(|| LogThrottle::new(8, Duration::from_mins(1), 256))
 }
 
 fn count(coord: &ReplicationCoordinator, outcome: &'static str) {

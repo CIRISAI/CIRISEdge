@@ -559,7 +559,7 @@ impl Node {
             signer: Some(self.key.signer()),
             rooting: Some(Arc::clone(&self.dir) as Arc<dyn RootingDirectory>),
             resolver: None,
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             ..ReticulumAuth::default()
         }
     }
@@ -898,7 +898,7 @@ async fn a_stranger_lists_a_relays_published_device_under_its_owner_752() {
     init_tracing();
     let f = fixture(0x00, true).await;
     let r = &f.roster;
-    let listed = drive_until(&[&f.rt_x, &f.rt_c], Duration::from_secs(240), || async {
+    let listed = drive_until(&[&f.rt_x, &f.rt_c], Duration::from_mins(4), || async {
         f.x.holds_key(&r.d).await
             && f.x.holds_key(&r.o).await
             && f.x.holds(&r.announced).await
@@ -956,11 +956,11 @@ async fn a_relay_at_the_top_tier_with_every_lever_pulled_serves_first_contact() 
     levers.set_steps(Duration::ZERO, Duration::from_secs(30));
     for lever in ciris_edge::ShedLever::ALL {
         for _ in 0..3 {
-            levers.pull(lever, 3, Duration::from_secs(300));
+            levers.pull(lever, 3, Duration::from_mins(5));
         }
     }
     let r = &f.roster;
-    let listed = drive_until(&[&f.rt_x, &f.rt_c], Duration::from_secs(240), || async {
+    let listed = drive_until(&[&f.rt_x, &f.rt_c], Duration::from_mins(4), || async {
         f.x.holds_key(&r.d).await
             && f.x.holds_key(&r.o).await
             && f.x.holds(&r.announced).await
@@ -980,7 +980,7 @@ async fn without_a_selector_nothing_about_others_reaches_the_stranger_752() {
     let f = fixture(0x10, false).await;
     let r = &f.roster;
     let own = format!("owner-binding-{}", f.c.key.key_id);
-    let talking = drive_until(&[&f.rt_x, &f.rt_c], Duration::from_secs(240), || async {
+    let talking = drive_until(&[&f.rt_x, &f.rt_c], Duration::from_mins(4), || async {
         f.x.holds(&own).await
     })
     .await;

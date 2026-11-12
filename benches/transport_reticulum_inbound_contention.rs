@@ -146,7 +146,7 @@ async fn auth_for(
         signer: Some(signer_for(key, base).await),
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }

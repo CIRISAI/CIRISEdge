@@ -113,7 +113,7 @@ use crate::scope_addressing::{MemberAddress, ScopeAddressError, ScopeAddressTabl
 /// Not a tuning knob so much as a statement about the slowest peer a
 /// deployment is willing to keep: seal earlier and a straggler that has
 /// not re-keyed is cut off; seal later and a retired address stays live.
-pub const DEFAULT_CONVERGENCE_WINDOW: Duration = Duration::from_secs(300);
+pub const DEFAULT_CONVERGENCE_WINDOW: Duration = Duration::from_mins(5);
 
 /// Where the lifecycle installs and retires listening destinations.
 ///
@@ -885,7 +885,7 @@ mod tests {
             Arc::clone(&table),
             Arc::clone(&sink) as Arc<dyn ScopedDestinationSink>,
             "node-self",
-            Duration::from_secs(300),
+            Duration::from_mins(5),
         );
         (life, table, sink)
     }
@@ -1018,7 +1018,7 @@ mod tests {
             .accepts_inbound(first.own_address.as_bytes())
             .is_some());
 
-        let done = life.seal_due(t0 + Duration::from_secs(300));
+        let done = life.seal_due(t0 + Duration::from_mins(5));
         assert_eq!(
             done,
             SealOutcome {
@@ -1046,7 +1046,7 @@ mod tests {
         assert_eq!(life.pending_seals(), 0);
         // Idempotent.
         assert_eq!(
-            life.seal_due(t0 + Duration::from_secs(600)),
+            life.seal_due(t0 + Duration::from_mins(10)),
             SealOutcome::default(),
         );
     }
@@ -1066,7 +1066,7 @@ mod tests {
         life.epoch_advanced(&scope(), "g", 2, &[9u8; 32], &["node-self"], t0)
             .unwrap();
 
-        let out = life.seal_due(t0 + Duration::from_secs(300));
+        let out = life.seal_due(t0 + Duration::from_mins(5));
         assert_eq!(
             out,
             SealOutcome {

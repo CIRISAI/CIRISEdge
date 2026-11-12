@@ -358,7 +358,7 @@ async fn runtime(node: &Node) -> ReplicationRuntime {
             // start, before anything is dirty) cannot be what emits within
             // this file's 20 s budget, so a pass witnesses the WAKE.
             scheduler: SchedulerConfig {
-                cadence: Duration::from_secs(3600),
+                cadence: Duration::from_hours(1),
                 round_timeout: Duration::from_secs(5),
                 ..SchedulerConfig::default()
             },
@@ -631,7 +631,7 @@ async fn a_room_row_refused_not_in_audience_lands_right_after_the_room_record_11
         backoff.suppressed_at(
             EnvelopeKind::Attestation,
             &hash,
-            Instant::now() + Duration::from_secs(60)
+            Instant::now() + Duration::from_mins(1)
         ),
         "quiet while B is outside the room"
     );

@@ -490,11 +490,11 @@ impl Session {
                 .iter()
                 .filter(|r| !peer_has.contains(&r.envelope_hash))
                 .filter(|r| {
-                    self.proactive_sent.get(&r.envelope_hash).map_or(
-                        true,
-                        // `map_or(true, …)` not `is_none_or` — MSRV 1.75.
-                        |sent| self.round_counter.saturating_sub(*sent) >= PROACTIVE_REFRESH_ROUNDS,
-                    )
+                    self.proactive_sent
+                        .get(&r.envelope_hash)
+                        .is_none_or(|sent| {
+                            self.round_counter.saturating_sub(*sent) >= PROACTIVE_REFRESH_ROUNDS
+                        })
                 })
                 .collect();
             candidates.sort_by_key(|r| r.seq);
@@ -807,8 +807,10 @@ impl Session {
         // responder with no consent to send to the initiator saw an empty offer,
         // so `want` became "everything" or the round went dark. `local_holdings`
         // is the node's peer-blind own-state; the offer + delivery stay send-gated.
-        let local = provider.local_holdings(self.kind).await;
-        let mut want = diff_refs(&local, &remote.refs);
+        //
+        // CIRISEdge#971 — asked as the diff, not as the holdings: a provider
+        // that keeps its holdings as a set answers without materialising them.
+        let mut want = provider.local_want(self.kind, &remote.refs).await;
         // CIRISEdge#544 — the re-offer loop is RECEIVER-PULLED, and this is where
         // the pull is decided. `want` is memoryless: a refused row is never
         // stored, so it is absent from `local_holdings`, so it comes straight

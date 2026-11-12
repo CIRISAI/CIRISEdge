@@ -45,7 +45,7 @@ fn generous() -> LxmfServeLimits {
         max_destinations: 4096,
         max_messages_per_response: 4096,
         max_response_bytes: 1 << 20,
-        retention: Duration::from_secs(3600),
+        retention: Duration::from_hours(1),
         // 0 keeps the fixtures fast; the stamp bound has its own test that
         // runs at a real non-zero cost.
         stamp_cost: 0,
@@ -607,14 +607,14 @@ fn max_response_bytes_admits_exactly_one_full_budget_and_reports_the_rest() {
 #[test]
 fn retention_evicts_exactly_at_the_window_and_reports_it() {
     let mut limits = generous();
-    limits.retention = Duration::from_secs(60);
+    limits.retention = Duration::from_mins(1);
     let n = node(&[A], limits);
     let t0 = Instant::now();
     admitted(&n.serve_upload(&upload(A, 0xF1), t0));
 
     // One nanosecond short of the window: still held, nothing reported.
     let just_under = n.sweep(
-        (t0 + Duration::from_secs(60))
+        (t0 + Duration::from_mins(1))
             .checked_sub(Duration::from_nanos(1))
             .expect("one nanosecond before the window"),
     );
@@ -622,7 +622,7 @@ fn retention_evicts_exactly_at_the_window_and_reports_it() {
     assert_eq!(n.pending_for(&A), 1);
 
     // Exactly at the window: evicted, and loudly.
-    let at = n.sweep(t0 + Duration::from_secs(60));
+    let at = n.sweep(t0 + Duration::from_mins(1));
     assert_eq!(at.len(), 1);
     assert_eq!(at[0].reason, WithholdReason::LxmfRetentionExpired);
     assert_eq!(at[0].destination, Some(A));
@@ -636,7 +636,7 @@ fn retention_evicts_exactly_at_the_window_and_reports_it() {
 #[test]
 fn an_expired_message_is_never_served() {
     let mut limits = generous();
-    limits.retention = Duration::from_secs(60);
+    limits.retention = Duration::from_mins(1);
     let n = node(&[A], limits);
     let t0 = Instant::now();
     let (id, _) = admitted(&n.serve_upload(&upload(A, 0xF2), t0));
@@ -647,7 +647,7 @@ fn an_expired_message_is_never_served() {
         1
     );
 
-    let later = t0 + Duration::from_secs(60);
+    let later = t0 + Duration::from_mins(1);
     let got = n.serve_get(Some(A), &get_request(vec![id]), later);
     assert!(downloaded(&got).is_empty(), "expired mail is not served");
     assert!(

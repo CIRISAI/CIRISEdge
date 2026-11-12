@@ -822,6 +822,19 @@ pub trait Transport: Send + Sync + 'static {
         None
     }
 
+    /// **CIRISEdge#971 — could a round toward `destination_key_id` be carried
+    /// now?** The scheduler asks this once at a round's start, before the
+    /// round's advertise sweep, and does not start a round the transport says
+    /// it cannot carry (booking it `no_route`, as the send would have). `false`
+    /// only when no rule could reach the peer: a transport that cannot tell
+    /// answers `true`, the default, and every round runs as before. It must
+    /// agree with what `send` would do: a "no" where the send would have
+    /// succeeded is a refusal that files no bug.
+    async fn round_carriable(&self, destination_key_id: &str) -> bool {
+        let _ = destination_key_id;
+        true
+    }
+
     /// CIRISEdge#809 — hand the transport the Edge's metrics bag, so the
     /// counters a transport increments from inside its event loop
     /// (packet drops, announce-intake evictions, links before binding, …)

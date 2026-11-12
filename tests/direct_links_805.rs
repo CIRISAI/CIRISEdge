@@ -20,8 +20,9 @@
 //!   cross with `T` stopped. The identity link's Channel limit drops to
 //!   1400-MTU size on the move (leviculum lowers the MTU and never raises it);
 //!   the event carries both limits, which item 5's `BudgetChanged` reads. The
-//!   A/V leg itself is born on the punched interface at the base MTU 500
-//!   (Channel 425).
+//!   A/V leg itself is born on the punched interface at the path MTU the
+//!   interface probed (leviculum#104; 1400 on loopback, Channel 1321), where
+//!   before #104 it was the base MTU 500 (Channel 425).
 //! - **W3** (`a_refused_upgrade_leaves_the_dial_as_it_was`): B with accepting
 //!   turned `Off` (the operator override). The proposal fails `Rejected`, the
 //!   dial behaves exactly as with no proposal, and a second dial does NOT
@@ -195,7 +196,7 @@ fn auth(signer: Arc<LocalSigner>, dir: &Arc<SqliteBackend>) -> ReticulumAuth {
         signer: Some(signer),
         rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         blackhole_rules: Some(Arc::clone(dir) as Arc<dyn ciris_persist::federation::BlackholeRules>),
         ..ReticulumAuth::default()
     }
@@ -374,7 +375,7 @@ async fn side_cfg_auth(
         .signer(key.signer())
         .transport(Arc::clone(&transport) as Arc<dyn ciris_edge::transport::Transport>)
         .config(ciris_edge::EdgeConfig {
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             ..ciris_edge::EdgeConfig::default()
         })
         .build()
@@ -388,7 +389,7 @@ async fn side_cfg_auth(
         Arc::clone(&table),
         Arc::clone(&transport) as Arc<dyn ScopedDestinationSink>,
         key.key_id.clone(),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
     ));
     let events = transport.subscribe_direct_path_events();
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(256);
@@ -559,7 +560,7 @@ async fn trio_shaped(
     // Each asks for the other: T's announce rate limit stops relaying a node
     // after its grace (about 30 s at 5 s), so a node that starts later on a
     // loaded box would wait for an announce that is not coming.
-    let known = wait_until(Duration::from_secs(60), || async {
+    let known = wait_until(Duration::from_mins(1), || async {
         a.transport.seek_peer(&b.key.key_id).await && b.transport.seek_peer(&a.key.key_id).await
     })
     .await;
@@ -1135,14 +1136,22 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
         "the move lowered the limit: {before} -> {after}"
     );
     let av_limit = link.sender.channel_limit().expect("the A/V link is held");
-    // The A/V leg is BORN on the punched interface, which signals no hardware
-    // MTU, so it negotiates the base 500: Channel 425 (link MDU 431 less the
-    // 6-byte envelope), 400 of it plaintext under the CC 5.3.3.5 E1 seal.
-    assert_eq!(av_limit, 400, "the A/V leg runs at the base MTU");
+    // leviculum#104 — the A/V leg is BORN on the punched interface, which now
+    // probes the path (1400, then 1280) and signals the largest step acked;
+    // loopback acks 1400. So the leg runs at the probed MTU, as the moved
+    // identity link does: Channel 1321, 1296 of it plaintext under the CC
+    // 5.3.3.5 E1 seal. Before #104 it negotiated the base 500 (400 sealed).
+    assert_eq!(
+        av_limit, 1296,
+        "the A/V leg runs at the probed 1400-byte MTU"
+    );
+    // leviculum#102 — a datagram on it carries the link MDU less its 4-byte
+    // sequence number, less the seal: two bytes more than a Channel message.
+    assert_eq!(link.sender.datagram_limit(), Some(1298));
 
     // CIRISEdge#805 / CC 5.3.3.5 E1 — the link's transit KEX handshake rode
-    // this base-MTU leg as its first Channel messages (about 1.2 KB at 400 B
-    // each), and B answered it: both ends hold the link's keys, by role.
+    // this leg as its first Channel messages, and B answered it: both ends
+    // hold the link's keys, by role.
     let arrival = tokio::time::timeout(Duration::from_secs(20), arrivals.recv())
         .await
         .expect("B's consumer gets the link")
@@ -2187,7 +2196,7 @@ async fn one_occurrence_key_id_keys_a_hop_under_use_node_identity() {
         "R's pair resolves under its node id"
     );
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             a.transport.seek_peer(&r_id).await && r.transport.seek_peer(&a_id).await
         })
         .await,
@@ -2953,7 +2962,7 @@ async fn one_side_moves_the_other_sends(
         "the side behind moves once the COMPLETE lands, a frame in flight or not: {up:?}"
     );
     assert!(behind.transport.direct_link_interface(link).is_some());
-    let (sent, took) = tokio::time::timeout(Duration::from_secs(60), in_flight)
+    let (sent, took) = tokio::time::timeout(Duration::from_mins(1), in_flight)
         .await
         .expect("the send ends")
         .expect("the send task");
@@ -3127,6 +3136,15 @@ async fn a_wedged_punched_link_with_no_call_is_still_reaped() {
     let DirectPathEvent::Established { link_id, .. } = up else {
         unreachable!()
     };
+    // B moves on its own Established, not on A's: since leviculum#104 each
+    // end probes the punched path's MTU before its interface attaches, so B
+    // can attach a few ms after A has. Reading B's interface on A's event
+    // raced that (2 runs in 8).
+    next_event(&mut p.b.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("B moves too");
     assert!(p.b.transport.direct_link_interface(link_id).is_some());
 
     p.b.transport.note_inbound_transfer_for_test(link_id, true);
@@ -3140,7 +3158,7 @@ async fn a_wedged_punched_link_with_no_call_is_still_reaped() {
         p.b.transport.direct_link_interface(link_id).is_some(),
         "a transfer inside its stall window holds the link"
     );
-    let reaped = wait_until(Duration::from_secs(60), || async {
+    let reaped = wait_until(Duration::from_mins(1), || async {
         p.b.transport.reap_idle_inbound_links().await;
         p.b.transport.direct_link_interface(link_id).is_none()
     })

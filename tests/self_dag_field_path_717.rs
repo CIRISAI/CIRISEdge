@@ -371,7 +371,7 @@ fn auth_for(node: &Node) -> ReticulumAuth {
         signer: Some(Arc::clone(&node.signer)),
         rooting: Some(Arc::clone(&node.dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -474,9 +474,9 @@ async fn member(
             inner: ciris_edge::blob_swarm::PersistBlobChunkSource::new(node.store.engine().clone()),
             dir: node.dir.clone(),
         }))
-        .scope_native_addressing(Duration::from_secs(300))
+        .scope_native_addressing(Duration::from_mins(5))
         .config(EdgeConfig {
-            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            hybrid_policy: HybridPolicy::Strict,
             ..EdgeConfig::default()
         })
         .build()
@@ -629,8 +629,8 @@ async fn a_self_files_chunks_arrive_on_the_owners_other_device_through_the_real_
     let b = member(node_b, tmp.path().join("b.id"), Some(a.port), &members).await;
     carry_route(&a.node, &b.node).await;
     carry_route(&b.node, &a.node).await;
-    wait_direct(&b, &a, Duration::from_secs(60)).await;
-    wait_direct(&a, &b, Duration::from_secs(60)).await;
+    wait_direct(&b, &a, Duration::from_mins(1)).await;
+    wait_direct(&a, &b, Duration::from_mins(1)).await;
 
     // ── A: the person authors, the node co-signs (#675), as the server does.
     let plain = content(FILE_LEN, 0x0717);

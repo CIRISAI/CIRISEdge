@@ -91,7 +91,7 @@ async fn start(
             scheduler: SchedulerConfig {
                 // The cadence is the wait under test: an hour, so a row that
                 // needs a tick to apply cannot make the bound.
-                cadence: Duration::from_secs(3600),
+                cadence: Duration::from_hours(1),
                 round_timeout: Duration::from_secs(5),
                 ..SchedulerConfig::default()
             },

@@ -243,6 +243,11 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_AV_DATAGRAMS_SET_ENABLED
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_AV_DATAGRAMS_SET_ENABLED
+void uniffi_ciris_edge_fn_func_av_datagrams_set_enabled(int8_t enabled, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_CRATE_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_CRATE_VERSION
 RustBuffer uniffi_ciris_edge_fn_func_crate_version(RustCallStatus *_Nonnull out_status
@@ -793,6 +798,12 @@ void ffi_ciris_edge_rust_future_free_void(uint64_t handle
 #ifndef UNIFFI_FFIDEF_FFI_CIRIS_EDGE_RUST_FUTURE_COMPLETE_VOID
 #define UNIFFI_FFIDEF_FFI_CIRIS_EDGE_RUST_FUTURE_COMPLETE_VOID
 void ffi_ciris_edge_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_AV_DATAGRAMS_SET_ENABLED
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_AV_DATAGRAMS_SET_ENABLED
+uint16_t uniffi_ciris_edge_checksum_func_av_datagrams_set_enabled(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_CRATE_VERSION

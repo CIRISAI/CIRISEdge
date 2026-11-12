@@ -168,7 +168,7 @@ impl Transport for NopTransport {
 
 fn config_strict() -> EdgeConfig {
     EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         cohort_scope_enforcement: CohortScopeEnforcement::Strict,
         ..EdgeConfig::default()
     }

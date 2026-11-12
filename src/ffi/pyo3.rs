@@ -172,7 +172,7 @@ use std::time::Duration;
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyCapsule, PyCapsuleMethods};
+use pyo3::types::{PyAnyMethods, PyCapsule};
 use pyo3::wrap_pyfunction;
 #[cfg(test)]
 use tokio::runtime::Handle as RuntimeHandle;
@@ -268,7 +268,7 @@ pub struct PyEdge {
     /// lifecycle. Replaces the pre-v1.1.8 `runtime: RuntimeHandle`
     /// field that exposed a `tokio::Handle` to consumer-side
     /// dispatch (the cross-tokio aliasing trap).
-    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: Arc<KeptExecutor>,
     /// v2.1.0 (CIRISEdge#85 / CIRISLensCore#43) — the host persist
     /// `Engine` PyObject the agent passed to [`init_edge_runtime`].
     /// Re-exposed via the [`PyEdge::engine`] pymethod so cohabiting
@@ -496,8 +496,10 @@ impl PyEdge {
                 .build()
                 .expect("for_test runtime"),
         );
-        let executor =
-            Arc::new(ciris_persist::ffi::executor_capsule::build_persist_executor(rt_arc));
+        let executor = Arc::new(KeptExecutor::new(
+            ciris_persist::ffi::executor_capsule::build_persist_executor(rt_arc),
+            None,
+        ));
         Self {
             inner,
             executor,
@@ -542,6 +544,21 @@ impl PyEdge {
             ))
         })?;
         Ok(self.inner.set_load_pressure(p).as_u8())
+    }
+
+    /// leviculum#102 — **the A/V datagram lever**: whether new A/V legs may
+    /// carry media as unordered link datagrams. Default on. Off, a new leg
+    /// neither advertises datagrams in its C3 `CAPS` nor sends them; a leg
+    /// already on datagrams keeps them. Edge never moves it on its own; the
+    /// gauge is `av_datagrams_enabled`.
+    fn set_av_datagrams_enabled(&self, enabled: bool) {
+        self.inner.set_av_datagrams_enabled(enabled);
+    }
+
+    /// v45 — the A/V layer-request lever (`Call.request_layers`). Default
+    /// off until CC corrects 5.3.3.2.4. Calls joined from now on follow it.
+    fn set_av_layer_requests_enabled(&self, enabled: bool) {
+        self.inner.set_av_layer_requests_enabled(enabled);
     }
 
     /// `CLM-shaping-offered-never-refused` — seconds past its last real frame
@@ -623,7 +640,9 @@ impl PyEdge {
     }
 
     /// `FSD/PRIVACY_MODES.md` §6.6, §6.10 — the host's device facts changed;
-    /// the class and the relay policy follow, the person's opt-ins kept.
+    /// the class and the relay policy follow, the person's opt-ins kept. An
+    /// opt-in left out (`None`) keeps the current choice; pass `True` or
+    /// `False` to change it.
     /// `device_kind` is `server`, `home` or `phone`. Returns how many shaped
     /// links closed to renegotiate, `None` with no Reticulum transport.
     /// Raises `ValueError` on another kind.
@@ -632,8 +651,8 @@ impl PyEdge {
         device_kind,
         unmetered=true,
         charging=true,
-        shaping_opt_in=false,
-        shaping_opt_in_cellular=false,
+        shaping_opt_in=None,
+        shaping_opt_in_cellular=None,
         client_only=false,
         relay_override=None
     ))]
@@ -644,15 +663,19 @@ impl PyEdge {
         device_kind: &str,
         unmetered: bool,
         charging: bool,
-        shaping_opt_in: bool,
-        shaping_opt_in_cellular: bool,
+        shaping_opt_in: Option<bool>,
+        shaping_opt_in_cellular: Option<bool>,
         client_only: bool,
         relay_override: Option<bool>,
     ) -> PyResult<Option<usize>> {
         use crate::transport::link_shaping::{DeviceKind, DeviceState};
         let kind = DeviceKind::parse(device_kind)
             .ok_or_else(|| PyValueError::new_err(format!("bad_device_kind: {device_kind:?}")))?;
-        let device = DeviceState {
+        // An opt-in the call leaves out is the person's standing choice, kept
+        // (tracked: CIRISEdge#969).
+        let current = self.inner.reticulum_transport().map(|t| t.onion().device());
+        let device = DeviceState::reported(
+            current.as_ref(),
             kind,
             unmetered,
             charging,
@@ -660,7 +683,7 @@ impl PyEdge {
             shaping_opt_in_cellular,
             client_only,
             relay_override,
-        };
+        );
         let edge = Arc::clone(&self.inner);
         py.detach(|| self.block_on_transport(async move { edge.set_device_state(device).await }))
     }
@@ -695,13 +718,22 @@ impl PyEdge {
     /// `RuntimeError` on plumbing (no Reticulum transport, no room groups...).
     /// Every message starts with the refusal's token.
     #[cfg(feature = "_reticulum-module")]
-    #[pyo3(signature = (room, keep="unkept", relay=false))]
-    fn join_call(&self, py: Python<'_>, room: &str, keep: &str, relay: bool) -> PyResult<PyCall> {
+    #[pyo3(signature = (room, keep="unkept", relay=false, codecs=None))]
+    fn join_call(
+        &self,
+        py: Python<'_>,
+        room: &str,
+        keep: &str,
+        relay: bool,
+        codecs: Option<Vec<String>>,
+    ) -> PyResult<PyCall> {
         let room = call_room_arg(room)?;
         let keep = call_keep_arg(keep)?;
+        let codecs = codecs.map(|c| call_codecs_arg(&c)).transpose()?;
         let opts = crate::transport::av_call::CallOptions {
             keep,
             relay,
+            codecs,
             ..crate::transport::av_call::CallOptions::default()
         };
         let edge = Arc::clone(&self.inner);
@@ -2867,7 +2899,7 @@ impl PyEdge {
     ///   transport was registered at init.
     /// - `ValueError("unknown EnvelopeKind: {token}")` if a kind
     ///   string in `peers` doesn't match the 10 wire tokens.
-    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None, publish_sets_by_kind = None, bundle_bootstrap_peers = false))]
+    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None, publish_sets_by_kind = None, bundle_bootstrap_peers = true))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments, one per knob
     fn start_replication(
         &self,
@@ -2899,8 +2931,9 @@ impl PyEdge {
         // third party's anchored key while withholding that party's
         // occurrences and routes. `None` = unchanged behaviour.
         publish_sets_by_kind: Option<std::collections::HashMap<String, Vec<String>>>,
-        // CIRISEdge#881 — opt the bundle's seated serve nodes in as bootstrap-plane
-        // initiator peers (an unclaimed device; see `enable_bundle_bootstrap_peers`).
+        // CIRISEdge#881 — the bundle's seated serve nodes as bootstrap-plane peers,
+        // asked by subject Pull (#971). On by default since v45; `False` opts out.
+        // See `disable_bundle_bootstrap_peers`.
         bundle_bootstrap_peers: bool,
     ) -> PyResult<PyReplicationHandle> {
         let directory = self
@@ -2936,7 +2969,7 @@ impl PyEdge {
         // inert through the shipped host path — the same silent-default failure
         // as the mode above, in the same function.
         config.local_key_id = Some(self.inner.signer_key_id().to_string());
-        config.enable_bundle_bootstrap_peers = bundle_bootstrap_peers;
+        config.disable_bundle_bootstrap_peers = !bundle_bootstrap_peers;
         // CIRISEdge#541 — and the TIER subject separately: the conferral is
         // granted against the identity peers know this node as. These coincide
         // unless `use_node_identity` split them, and where they differ, using
@@ -3182,6 +3215,23 @@ fn metrics_bundle_to_pydict<'py>(
         key_plane_sweep.set_item(label.as_str(), *n)?;
     }
     root.set_item("key_plane_sweep", key_plane_sweep)?;
+    // CIRISEdge#971 — sweep-gate acquires by call site.
+    let sweep_permits = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.sweep_permits {
+        sweep_permits.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("sweep_permits", sweep_permits)?;
+    // CIRISEdge#971 — the holdings index's counters and gauges.
+    let holdings_index = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.holdings_index {
+        holdings_index.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("holdings_index", holdings_index)?;
+    let holdings_index_gauge = pyo3::types::PyDict::new(py);
+    for (label, v) in &bundle.holdings_index_gauge {
+        holdings_index_gauge.set_item(label.as_str(), *v)?;
+    }
+    root.set_item("holdings_index_gauge", holdings_index_gauge)?;
     // v44 LTS — the persisted-standing refresh.
     let persisted_standing = pyo3::types::PyDict::new(py);
     for (label, n) in &bundle.persisted_standing {
@@ -3204,6 +3254,17 @@ fn metrics_bundle_to_pydict<'py>(
         advertise.set_item(label.as_str(), *n)?;
     }
     root.set_item("advertise", advertise)?;
+    for (name, family) in [
+        ("replication_reach", &bundle.replication_reach),
+        ("bundle_pull", &bundle.bundle_pull),
+        ("initiator_peers", &bundle.initiator_peers),
+    ] {
+        let d = pyo3::types::PyDict::new(py);
+        for (label, n) in family {
+            d.set_item(label.as_str(), *n)?;
+        }
+        root.set_item(name, d)?;
+    }
     root.set_item("direct_links_active", bundle.direct_links_active)?;
     // v44.1 — the host's shed levers and what this node forwards for others.
     for (key, map) in [
@@ -3555,6 +3616,7 @@ fn link_info_to_pydict<'py>(
 /// v44 — the operator's telemetry, one dict entry per bundle field
 /// (`crate::telemetry::TELEMETRY_CATALOGUE`). Closed labels are present at
 /// zero.
+#[allow(clippy::too_many_lines)] // one `set_item` per catalogue field, nothing more
 fn telemetry_into_pydict(
     py: Python<'_>,
     root: &Bound<'_, pyo3::types::PyDict>,
@@ -3629,12 +3691,25 @@ fn telemetry_into_pydict(
         ("load_tier", b.load_tier),
         ("load_host_pressure", b.load_host_pressure),
         ("shaping_enabled", b.shaping_enabled),
+        ("av_datagrams_enabled", b.av_datagrams_enabled),
         ("shaping_free_slots", b.shaping_free_slots),
         ("leviculum_shed_packets", b.leviculum_shed_packets),
         ("direct_link_proposing", b.direct_link_proposing),
         ("alm_active_calls", b.alm_active_calls),
         ("alm_c3_peers", b.alm_c3_peers),
         ("decision_row_subscribers", b.decision_row_subscribers),
+        (
+            "group_backfill_rows_read_total",
+            b.group_backfill_rows_read_total,
+        ),
+        (
+            "group_backfill_rows_kept_total",
+            b.group_backfill_rows_kept_total,
+        ),
+        (
+            "group_backfill_completed_total",
+            b.group_backfill_completed_total,
+        ),
         ("node_alive", b.node_alive),
     ] {
         root.set_item(name, value)?;
@@ -3750,7 +3825,7 @@ mod parse_envelope_kind_tests {
 #[pyclass(name = "ReplicationHandle", module = "ciris_edge", unsendable)]
 pub struct PyReplicationHandle {
     inner: Arc<tokio::sync::Mutex<Option<crate::replication::ReplicationRuntime>>>,
-    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: Arc<KeptExecutor>,
 }
 
 #[pymethods]
@@ -4143,7 +4218,7 @@ pub struct PyVerifiedFeedSubscription {
     /// CIRISEdge#59 — the executor capsule (cross-cdylib ABI-stable
     /// spawn primitive). Used by `__anext__`'s `run_async` to drive
     /// `broadcast::Receiver::recv()` from sync Python.
-    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: Arc<KeptExecutor>,
 }
 
 #[pymethods]
@@ -4320,6 +4395,9 @@ fn call_err_token(e: &crate::transport::av_call::CallError) -> &'static str {
         E::ActorIsNotTheSubject { .. } => "actor_is_not_the_subject",
         E::Plumbing(_) => "plumbing",
         E::AnonymousMode => crate::onion::tokens::ANONYMOUS_NO_MEDIA,
+        E::UnknownStream(_) => "unknown_stream",
+        E::TooManyStreams(_) => "too_many_streams",
+        E::ChunkSeqExhausted { .. } => "chunk_seq_exhausted",
     }
 }
 
@@ -4334,9 +4412,32 @@ fn call_err_to_py(e: &crate::transport::av_call::CallError) -> PyErr {
         | E::ConsentMissing { .. }
         | E::FrameTooLarge { .. }
         | E::ActorIsNotTheSubject { .. }
-        | E::AnonymousMode => PyValueError::new_err(msg),
+        | E::AnonymousMode
+        | E::UnknownStream(_)
+        | E::TooManyStreams(_) => PyValueError::new_err(msg),
         _ => PyRuntimeError::new_err(msg),
     }
+}
+
+/// `join_call(codecs=[...])`: the stream's codec tokens, e.g. `["h264",
+/// "opus"]`. Each token implies its layer class (CC 5.3.3.2.1), so a list
+/// names the map without a key that could disagree with it; two tokens of
+/// one class, or an unregistered token, raise `ValueError`.
+#[cfg(feature = "_reticulum-module")]
+fn call_codecs_arg(tokens: &[String]) -> PyResult<crate::transport::av_chunk_auth::CodecMap> {
+    use crate::transport::av_chunk_auth::{CodecMap, CodecToken};
+    let parsed = tokens
+        .iter()
+        .map(|t| {
+            CodecToken::parse(t).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "codec_unregistered: {t:?} is not a registered codec token \
+                     (av1, h264, opus)"
+                ))
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    CodecMap::new(parsed).map_err(|e| PyValueError::new_err(format!("codec_map_invalid: {e}")))
 }
 
 /// A [`CallEvent`](crate::transport::av_call::CallEvent) as a Python dict:
@@ -4393,6 +4494,54 @@ fn call_event_to_pydict<'py>(
             d.set_item("kind", "load_tier")?;
             d.set_item("tier", *tier)?;
         }
+        V::AttendeeLeft {
+            key_id,
+            stream,
+            cause,
+            truncated,
+        } => {
+            d.set_item("kind", "attendee_left")?;
+            d.set_item("key_id", key_id)?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
+            d.set_item("cause", cause.token())?;
+            d.set_item("truncated", *truncated)?;
+        }
+        V::StreamAdded {
+            publisher,
+            stream,
+            kind,
+        } => {
+            d.set_item("kind", "stream_added")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
+            d.set_item("stream_kind", *kind)?;
+            d.set_item(
+                "share",
+                *kind == crate::transport::av_chunk_auth::STREAM_KIND_SHARE,
+            )?;
+        }
+        V::StreamEnded {
+            publisher,
+            stream,
+            cause,
+            truncated,
+        } => {
+            d.set_item("kind", "stream_ended")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("stream_id", pyo3::types::PyBytes::new(py, &stream.0))?;
+            d.set_item("cause", cause.token())?;
+            d.set_item("truncated", *truncated)?;
+        }
+        V::StreamReplaced {
+            publisher,
+            old,
+            new,
+        } => {
+            d.set_item("kind", "stream_replaced")?;
+            d.set_item("publisher", publisher)?;
+            d.set_item("old_stream_id", pyo3::types::PyBytes::new(py, &old.0))?;
+            d.set_item("new_stream_id", pyo3::types::PyBytes::new(py, &new.0))?;
+        }
     }
     Ok(d)
 }
@@ -4415,6 +4564,8 @@ fn call_frame_to_pydict<'py>(
         (f.layer.spatial, f.layer.temporal, f.layer.quality),
     )?;
     d.set_item("bytes", pyo3::types::PyBytes::new(py, &f.bytes))?;
+    d.set_item("frame_seq", f.frame_seq)?;
+    d.set_item("source_ts_ms", f.source_ts_ms)?;
     Ok(d)
 }
 
@@ -4445,7 +4596,7 @@ pub struct PyCall {
     frames:
         Arc<Mutex<Option<tokio::sync::mpsc::Receiver<crate::transport::av_call::ReceivedFrame>>>>,
     events: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<crate::transport::av_call::CallEvent>>>>,
-    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: Arc<KeptExecutor>,
 }
 
 /// A11's verb list: every `Call` verb and its Python twin's name. The parity
@@ -4467,6 +4618,11 @@ pub const PY_CALL_VERBS: &[&str] = &[
     "attendance",
     "state",
     "leave",
+    "add_stream",
+    "publish_on",
+    "end_stream",
+    "streams",
+    "frames_lost_by_layer",
 ];
 
 #[cfg(feature = "_reticulum-module")]
@@ -4517,9 +4673,123 @@ impl PyCall {
         self.room.clone()
     }
 
-    /// This node's stream id (32 bytes).
-    fn stream_id(&self) -> [u8; 32] {
-        self.stream_id
+    /// This node's stream id (32 bytes): the one it joined with, or the
+    /// latest `replace_stream` gave it.
+    fn stream_id(&self, py: Python<'_>) -> [u8; 32] {
+        self.with_call(py, |c| Box::pin(async move { Ok(c.stream().0) }))
+            .unwrap_or(self.stream_id)
+    }
+
+    /// v45 — replace this node's stream in place (a codec change): a new
+    /// stream, bound and switched to make-before-break, whose signed binding
+    /// says it replaces the old (receivers get `stream_replaced`, no leave).
+    /// `codecs` is the new map as tokens (`None`: the old one's). Returns the
+    /// new stream id.
+    #[pyo3(signature = (codecs=None))]
+    fn replace_stream(&self, py: Python<'_>, codecs: Option<Vec<String>>) -> PyResult<[u8; 32]> {
+        let codecs = codecs.map(|c| call_codecs_arg(&c)).transpose()?;
+        self.with_call(py, move |c| {
+            Box::pin(async move { Ok(c.replace_stream(codecs).await?.0) })
+        })
+    }
+
+    /// v45 — publish a second stream beside the camera (a desktop or
+    /// window share): its own stream id, bindings and codec map (`codecs` as
+    /// tokens; `None`: none). Receivers bind it as a separate stream, never
+    /// a replacement; its end is `stream_ended`, never `attendee_left`.
+    /// Returns its stream id. At most three own streams at once
+    /// (`too_many_streams`).
+    #[pyo3(signature = (codecs=None))]
+    fn add_stream(&self, py: Python<'_>, codecs: Option<Vec<String>>) -> PyResult<[u8; 32]> {
+        let codecs = codecs.map(|c| call_codecs_arg(&c)).transpose()?;
+        self.with_call(py, move |c| {
+            Box::pin(async move { Ok(c.add_stream(codecs).await?.0) })
+        })
+    }
+
+    /// v45 — `publish` on one of this node's streams (`stream_id()` or one
+    /// `add_stream` gave): the same dict. A stream this node does not
+    /// publish raises `unknown_stream`.
+    #[pyo3(signature = (stream_id, frame, codec_id=PY_CODEC_OPAQUE, layer=(0, 0, 0)))]
+    fn publish_on(
+        &self,
+        py: Python<'_>,
+        stream_id: [u8; 32],
+        frame: Vec<u8>,
+        codec_id: u8,
+        layer: (u8, u8, u8),
+    ) -> PyResult<Py<PyAny>> {
+        let frame = crate::transport::av_call::Frame {
+            codec_id,
+            layer: chunk_layer_from_tuple(layer),
+            bytes: frame,
+        };
+        let stream = crate::transport::realtime_av::StreamId(stream_id);
+        let report = self.with_call(py, move |c| {
+            Box::pin(async move { c.publish_on(stream, frame).await })
+        })?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("epoch", report.epoch.0)?;
+        d.set_item("chunk_seq", report.chunk_seq.0)?;
+        d.set_item("delivered", report.delivered())?;
+        d.set_item("fragments", report.fragments)?;
+        let legs: Vec<(String, String)> = report
+            .legs
+            .iter()
+            .map(|(m, o)| (m.clone(), format!("{o:?}")))
+            .collect();
+        d.set_item("legs", legs)?;
+        Ok(d.unbind().into_any())
+    }
+
+    /// v45 — end one own stream and only it, signed. `cause` `None` (the
+    /// default) signs `end = 3` ("this stream ended", never a leave): a
+    /// share stops. `"backgrounded"` or `"left"` sign 2 or 1, which a
+    /// receiver takes as a leave only on the member's last stream: a phone
+    /// sharing its screen backgrounds its camera with
+    /// `end_stream(stream_id(), "backgrounded")` while the share plays on.
+    /// The camera ends this way only while a share is live
+    /// (`unknown_stream`); the call ends with `leave()`.
+    #[pyo3(signature = (stream_id, cause=None))]
+    fn end_stream(&self, py: Python<'_>, stream_id: [u8; 32], cause: Option<&str>) -> PyResult<()> {
+        use crate::transport::av_chunk_auth::SignedEnd;
+        let why = match cause {
+            None | Some("ended") => SignedEnd::Ended,
+            Some("left") => SignedEnd::Left,
+            Some("backgrounded") => SignedEnd::Backgrounded,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "end_cause_unknown: {other:?} (ended, left, backgrounded)"
+                )))
+            }
+        };
+        let stream = crate::transport::realtime_av::StreamId(stream_id);
+        self.with_call(py, move |c| {
+            Box::pin(async move { c.end_stream_as(stream, why).await })
+        })
+    }
+
+    /// v45 — every stream this node publishes in the call, the primary
+    /// first.
+    fn streams(&self, py: Python<'_>) -> PyResult<Vec<[u8; 32]>> {
+        self.with_call(py, |c| {
+            Box::pin(async move { Ok(c.streams().await.into_iter().map(|s| s.0).collect()) })
+        })
+    }
+
+    /// v45 — frames this node never got, per (codec class, layer)
+    /// (`{(class, (s, t, q)): count}`): gaps in the framed streams'
+    /// `frame_seq` on layers it was being sent. A `(0, 0, 0)` entry is a
+    /// freeze until the next keyframe. Audio is concealed by time and not
+    /// counted.
+    #[allow(clippy::type_complexity)] // the dict's shape is what Python callers read
+    fn frames_lost_by_layer(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<std::collections::BTreeMap<(u8, (u8, u8, u8)), u64>> {
+        self.with_call(py, |c| {
+            Box::pin(async move { Ok(c.frames_lost_by_layer()) })
+        })
     }
 
     /// The call's epoch (the room's MLS epoch).
@@ -4538,6 +4808,50 @@ impl PyCall {
     /// The members this node has a leg to, sorted.
     fn legs(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         self.with_call(py, |c| Box::pin(async move { Ok(c.legs()) }))
+    }
+
+    /// v45 — ask this node's parents for the stream `stream_id` for at most
+    /// `layers` = `(spatial, temporal, quality)`; `None` withdraws. The cap
+    /// rides the SUBSCRIBE to a parent that takes one (the host's lever,
+    /// off by default). Returns whether a SUBSCRIBE went out now.
+    #[pyo3(signature = (stream_id, layers=None))]
+    fn request_layers(
+        &self,
+        py: Python<'_>,
+        stream_id: [u8; 32],
+        layers: Option<(u8, u8, u8)>,
+    ) -> PyResult<bool> {
+        let cap = layers.map(
+            |(s, t, q)| crate::transport::realtime_av::ReceiverLayerPolicy {
+                max_spatial: s,
+                max_temporal: t,
+                max_quality: q,
+            },
+        );
+        let stream = crate::transport::realtime_av::StreamId(stream_id);
+        self.with_call(py, move |c| {
+            Box::pin(async move { Ok(c.request_layers(stream, cap).await) })
+        })
+    }
+
+    /// Per-leg stats, sorted by member: `[{"member", "path"
+    /// ("direct_udp" | "interface" | "relayed" | "gone"), "link_mdu",
+    /// "channel_limit", "media_limit", "frame_budget", "datagrams"}, ...]`.
+    fn leg_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let legs = self.with_call(py, |c| Box::pin(async move { Ok(c.leg_info()) }))?;
+        let out = pyo3::types::PyList::empty(py);
+        for l in legs {
+            let d = pyo3::types::PyDict::new(py);
+            d.set_item("member", l.member)?;
+            d.set_item("path", l.path.token())?;
+            d.set_item("link_mdu", l.link_mdu)?;
+            d.set_item("channel_limit", l.channel_limit)?;
+            d.set_item("media_limit", l.media_limit)?;
+            d.set_item("frame_budget", l.frame_budget)?;
+            d.set_item("datagrams", l.datagrams)?;
+            out.append(d)?;
+        }
+        Ok(out.into_any().unbind())
     }
 
     /// ALM C7 — the decision log: `{"hash", "records", "tail"}`. The tail
@@ -4575,6 +4889,7 @@ impl PyCall {
         d.set_item("epoch", report.epoch.0)?;
         d.set_item("chunk_seq", report.chunk_seq.0)?;
         d.set_item("delivered", report.delivered())?;
+        d.set_item("fragments", report.fragments)?;
         let legs: Vec<(String, String)> = report
             .legs
             .iter()
@@ -4654,9 +4969,21 @@ impl PyCall {
         })
     }
 
-    /// Hang up (an in-room hang-up writes nothing). Returns the summary
-    /// dict; a second `leave()` raises `call_ended`.
-    fn leave(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// Hang up (an in-room hang-up writes nothing). `cause` is `"left"`
+    /// (default) or `"backgrounded"`: the signed end peers turn into
+    /// `attendee_left`. Returns the summary dict; a second `leave()` raises
+    /// `call_ended`.
+    #[pyo3(signature = (cause="left"))]
+    fn leave(&self, py: Python<'_>, cause: &str) -> PyResult<Py<PyAny>> {
+        let why = match cause {
+            "left" => crate::transport::av_chunk_auth::SignedEnd::Left,
+            "backgrounded" => crate::transport::av_chunk_auth::SignedEnd::Backgrounded,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "leave_cause_unknown: {other:?} (left, backgrounded)"
+                )))
+            }
+        };
         let call = Arc::clone(&self.call);
         let left = py.detach(|| {
             run_async(&self.executor, async move {
@@ -4665,7 +4992,7 @@ impl PyCall {
                         crate::transport::av_call::EndCause::HungUp,
                     ));
                 };
-                c.leave().await
+                c.leave_with(why).await
             })
         });
         let s = left.map_err(|e| call_err_to_py(&e))?;
@@ -5146,7 +5473,7 @@ pub struct PyDurableHandle {
     /// `send_durable_inline_text` time so the handle's own
     /// `is_acknowledged` / `await_ack` polls go through persist's
     /// runtime via the vtable (CIRISEdge#59).
-    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    executor: Arc<KeptExecutor>,
     /// Shared outbound-queue handle — same `Arc<dyn OutboundHandle>`
     /// the `Edge` holds. Cloning the Arc lets the handle outlive the
     /// `PyEdge` that produced it (Python ownership semantics differ
@@ -5267,6 +5594,46 @@ impl std::future::Future for EdgeTokioContext {
 /// Wraps `fut` for persist's executor: see [`EdgeTokioContext`].
 fn in_edge_tokio(fut: BoxedFut) -> BoxedFut {
     Box::pin(EdgeTokioContext(fut))
+}
+
+/// CIRISEdge#960 — persist's executor, as a bitwise copy of the
+/// `executor_capsule`'s `{ data, vtable }`, with the capsule it was copied out
+/// of. The capsule's destructor drops the runtime `data` names, so every
+/// holder of the copy holds the capsule too: it lives exactly as long as
+/// anything that can spawn through it. `None` only for an executor edge built
+/// itself (tests), whose `data` nothing else frees.
+pub(crate) struct KeptExecutor {
+    executor: ciris_persist::ffi::executor_capsule::AsyncExecutor,
+    _capsule: Option<pyo3::Py<pyo3::PyAny>>,
+}
+
+impl KeptExecutor {
+    pub(crate) fn new(
+        executor: ciris_persist::ffi::executor_capsule::AsyncExecutor,
+        capsule: Option<pyo3::Py<pyo3::PyAny>>,
+    ) -> Self {
+        Self {
+            executor,
+            _capsule: capsule,
+        }
+    }
+
+    /// Another bitwise copy of the executor, for a persist API that takes its
+    /// own `Arc<AsyncExecutor>`. The caller keeps this `KeptExecutor` (an
+    /// `Arc` of it) alive alongside whatever it hands the copy to.
+    pub(crate) fn copy(&self) -> ciris_persist::ffi::executor_capsule::AsyncExecutor {
+        ciris_persist::ffi::executor_capsule::AsyncExecutor {
+            data: self.executor.data,
+            vtable: self.executor.vtable,
+        }
+    }
+}
+
+impl std::ops::Deref for KeptExecutor {
+    type Target = ciris_persist::ffi::executor_capsule::AsyncExecutor;
+    fn deref(&self) -> &Self::Target {
+        &self.executor
+    }
 }
 
 fn run_async<F, T>(executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor, fut: F) -> T
@@ -5655,24 +6022,218 @@ fn extract_canonical_bootstrap_peer(
     })
 }
 
-/// `HybridPolicy` discriminants; kept as `&str` rather than a
-/// `#[pyclass]` to keep the surface minimal — the policy choice is
-/// a single switch the host configures once.
-///
-/// The `soft` variant takes a window in seconds via the
-/// `soft_freshness_window_seconds` kwarg on the constructor.
-fn parse_hybrid_policy(s: &str, soft_freshness_window_seconds: u64) -> PyResult<HybridPolicy> {
+/// CIRISEdge#960 — persist's executor out of `executor_capsule`, ABI-checked,
+/// held with its capsule ([`KeptExecutor`]).
+fn extract_executor(engine: &Bound<'_, PyAny>) -> PyResult<Arc<KeptExecutor>> {
+    if !engine.hasattr("executor_capsule").unwrap_or(false) {
+        return Err(PyRuntimeError::new_err(
+            "persist v3.13.0+ required for ABI-stable async cohabitation — \
+             your persist version doesn't expose executor_capsule. \
+             Upgrade ciris-persist (Cargo `tag = \"v3.13.0\"`, pyproject \
+             `ciris-persist>=3.13.0,<4`). See CIRISEdge#58 / CIRISPersist#157.",
+        ));
+    }
+    // The executor capsule stores a `*mut AsyncExecutor as usize`
+    // (persist's `build_capsule_with_destructor` passes the
+    // `Box::into_raw`'d pointer cast to usize). Extract as `usize`,
+    // then cast back to `*const AsyncExecutor` and bitwise-copy the
+    // struct fields. The PyCapsule destructor (set by persist) calls
+    // `vtable.drop` at Python GC time; edge only owns a reference
+    // copy of the executor, never the destructor responsibility.
+    #[allow(unsafe_code)]
+    let (executor, executor_capsule): (ciris_persist::ffi::executor_capsule::AsyncExecutor, _) = unsafe {
+        extract_capsule_held::<usize, _, _>(engine, "executor_capsule", |raw_usize| {
+            let ptr = *raw_usize as *const ciris_persist::ffi::executor_capsule::AsyncExecutor;
+            // SAFETY: `raw_usize` is the `Box::into_raw`'d pointer
+            // produced by persist's `build_capsule_with_destructor`.
+            // The Box's allocation is alive for the lifetime of the
+            // PyCapsule (its destructor runs `Box::from_raw` at GC
+            // time), which is rooted in the Python `engine` object
+            // outliving this extraction.
+            let e = &*ptr;
+            ciris_persist::ffi::executor_capsule::AsyncExecutor {
+                data: e.data,
+                vtable: e.vtable,
+            }
+        })?
+    };
+    // ABI version check — refuse mismatched capsule versions cleanly
+    // rather than risk UB on a vtable-layout drift.
+    if executor.vtable.abi_version
+        != ciris_persist::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION
+    {
+        return Err(PyRuntimeError::new_err(format!(
+            "persist executor_capsule ABI version mismatch — capsule v{}, \
+             edge expects v{}; upgrade ciris-persist or pin edge to a \
+             compatible floor",
+            executor.vtable.abi_version,
+            ciris_persist::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION,
+        )));
+    }
+    // CIRISEdge#960 — the copy and its capsule travel together.
+    let executor = Arc::new(KeptExecutor::new(executor, Some(executor_capsule)));
+    Ok(executor)
+}
+
+/// CIRISEdge#960 — the ABI-stable directory proxy out of
+/// `directory_ops_capsule`, wrapped so it holds the directory and executor
+/// capsules its copies point into
+/// ([`crate::ffi::kept_directory::KeptDirectory`]).
+fn extract_directory(
+    engine: &Bound<'_, PyAny>,
+    executor: &Arc<KeptExecutor>,
+) -> PyResult<Arc<dyn ciris_persist::federation::FederationDirectory>> {
+    if !engine.hasattr("directory_ops_capsule").unwrap_or(false) {
+        return Err(PyRuntimeError::new_err(
+            "persist v11.8.2+ required for the ABI-stable directory ops proxy — \
+             your persist version doesn't expose directory_ops_capsule. Upgrade \
+             ciris-persist (Cargo `tag = \"v11.8.2\"`, pyproject \
+             `ciris-persist>=11.8.2,<12`). See CIRISEdge#245 / CIRISPersist#329+#333.",
+        ));
+    }
+    // The `directory_ops_capsule` stores `*mut Directory as usize` (persist's
+    // `build_capsule_with_destructor`, PyCapsule tag
+    // `ciris_persist::directory_ops_v1`) — the same shape as `executor_capsule`.
+    // Extract as `usize`, cast back, bitwise-copy the `{ data, vtable }` fields.
+    // The PyCapsule destructor (set by persist) calls `vtable.drop` at Python GC;
+    // `OpsDirectory` has NO Drop impl, so edge holds only a reference copy — never
+    // the destructor responsibility — exactly like the executor above.
+    #[allow(unsafe_code)]
+    let (directory_handle, directory_capsule): (
+        ciris_persist::ffi::directory_capsule::Directory,
+        _,
+    ) = unsafe {
+        extract_capsule_held::<usize, _, _>(engine, "directory_ops_capsule", |raw_usize| {
+            let ptr = *raw_usize as *const ciris_persist::ffi::directory_capsule::Directory;
+            // SAFETY: `raw_usize` is the `Box::into_raw`'d `*mut Directory`
+            // persist stored; the Box is alive for the PyCapsule's lifetime
+            // (its destructor runs `Box::from_raw` + `vtable.drop` at GC),
+            // rooted in the Python `engine` object outliving this extraction.
+            let d = &*ptr;
+            ciris_persist::ffi::directory_capsule::Directory {
+                data: d.data,
+                vtable: d.vtable,
+            }
+        })?
+    };
+    let directory_proxy: Arc<dyn ciris_persist::federation::FederationDirectory> =
+        ciris_persist::ffi::directory_capsule::build_ops_directory(
+            directory_handle,
+            Arc::new(executor.copy()),
+        )
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "init_edge_runtime: build_ops_directory (directory_ops_capsule) failed: {e}"
+            ))
+        })?;
+    // CIRISEdge#960 — persist's proxy holds bitwise copies of the directory
+    // and executor capsules; the wrapper holds both capsules, and only the
+    // wrapper is handed out.
+    let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> =
+        Arc::new(crate::ffi::kept_directory::KeptDirectory::new(
+            directory_proxy,
+            Arc::clone(executor),
+            directory_capsule,
+        ));
+    Ok(directory_arc)
+}
+
+/// CIRISEdge#960 — extract persist's `outbound_queue_ops_capsule` (tag
+/// `ciris_persist::outbound_queue_ops_v1`, payload `*mut OutboundQueueHandle
+/// as usize`, the same shape as `directory_ops_capsule`) and wrap it in the
+/// ABI-checked [`crate::ffi::outbound_ops::OpsOutboundQueue`]. Edge holds a
+/// bitwise reference copy of `{ data, vtable }`; the PyCapsule destructor
+/// persist set owns `vtable.drop`.
+fn extract_outbound_queue_ops(
+    engine: &Bound<'_, PyAny>,
+    executor: &Arc<KeptExecutor>,
+) -> PyResult<Arc<dyn OutboundHandle>> {
+    use ciris_persist::ffi::outbound_queue_capsule::OutboundQueueHandle;
+    if !engine
+        .hasattr("outbound_queue_ops_capsule")
+        .unwrap_or(false)
+    {
+        return Err(PyRuntimeError::new_err(
+            "ciris_persist.Engine does not expose outbound_queue_ops_capsule; \
+             edge needs ciris-persist>=61.1.0 (CIRISEdge#960)",
+        ));
+    }
+    #[allow(unsafe_code)]
+    let (handle, capsule): (OutboundQueueHandle, _) = unsafe {
+        extract_capsule_held::<usize, _, _>(engine, "outbound_queue_ops_capsule", |raw_usize| {
+            let ptr = *raw_usize as *const OutboundQueueHandle;
+            // SAFETY: `raw_usize` is the `Box::into_raw`'d
+            // `*mut OutboundQueueHandle` persist's
+            // `outbound_queue_capsule::build_capsule_with_destructor` stored;
+            // the Box lives as long as the PyCapsule, which the queue holds.
+            let h = &*ptr;
+            OutboundQueueHandle {
+                data: h.data,
+                vtable: h.vtable,
+            }
+        })?
+    };
+    // Hold the capsule this handle was copied out of: its destructor frees
+    // `handle.data`, and the outbound dispatcher can outlive the host's
+    // reference to the engine.
+    let queue = crate::ffi::outbound_ops::OpsOutboundQueue::new(
+        handle,
+        Arc::clone(executor),
+        Some(capsule),
+    )
+    .map_err(PyRuntimeError::new_err)?;
+    Ok(Arc::new(queue))
+}
+
+/// The verifier policy a host may pass. CIRISEdge#957 / CIRISPersist#1233
+/// (CC 5.3.2.4.3.1): hybrid-required is always on and never an operator
+/// toggle, so `"strict"` is the only accepted value. Every other string,
+/// including the retired `"soft"` and `"ed25519_fallback"`, is refused with
+/// `ValueError("verify_policy_violation: ...")`, the token persist's
+/// `Engine.verify_hybrid` raises for the same input. The kwarg and
+/// `soft_freshness_window_seconds` stay (ignored) until persist v62 removes
+/// the argument, so an existing call that passes `"strict"` is unchanged.
+fn parse_hybrid_policy(s: &str, _soft_freshness_window_seconds: u64) -> PyResult<HybridPolicy> {
     match s {
         "strict" | "Strict" => Ok(HybridPolicy::Strict),
-        "soft" | "SoftFreshness" | "soft_freshness" => Ok(HybridPolicy::SoftFreshness {
-            window: Duration::from_secs(soft_freshness_window_seconds),
-        }),
-        "ed25519_fallback" | "Ed25519Fallback" | "fallback" => Ok(HybridPolicy::Ed25519Fallback),
         other => Err(PyValueError::new_err(format!(
-            "unknown hybrid_policy {other:?}; expected one of \
-             \"strict\" / \"soft\" / \"ed25519_fallback\""
+            "verify_policy_violation: hybrid_policy {other:?} refused; \"strict\" is the \
+             only verifier policy (CC 5.3.2.4.3.1, CIRISEdge#957)"
         ))),
     }
+}
+
+/// CIRISPersist#1242 (persist 61.2) — the name edge asks for, per capsule
+/// method. The seven raw-layout capsules carry
+/// `ciris_persist::<capsule>@<persist version>`, read from persist's
+/// `capsule_names` as THIS build compiled it, so a wheel of another persist
+/// version is refused at the name. The ABI-versioned capsules keep their
+/// `_v1` names; their vtables carry their own ABI check.
+fn expected_capsule_name(method: &str) -> Option<&'static std::ffi::CStr> {
+    ciris_persist::ffi::capsule_names::name_for_method(method).or(match method {
+        "executor_capsule" => Some(c"ciris_persist::executor_capsule_v1"),
+        "directory_ops_capsule" => Some(c"ciris_persist::directory_ops_v1"),
+        "outbound_queue_ops_capsule" => Some(c"ciris_persist::outbound_queue_ops_v1"),
+        _ => None,
+    })
+}
+
+/// CIRISPersist#1242 — every capsule edge unwraps goes through here: the
+/// payload pointer when the capsule carries exactly the name this build
+/// expects for `method`, else persist's `TypeError` led by
+/// `capsule_version_skew`. A method edge has no name for is refused the same
+/// way: there is no name it could check.
+fn checked_capsule_pointer(
+    cap: &Bound<'_, PyCapsule>,
+    method: &str,
+) -> PyResult<std::ptr::NonNull<std::ffi::c_void>> {
+    let Some(expected) = expected_capsule_name(method) else {
+        return Err(PyTypeError::new_err(format!(
+            "{}: edge knows no capsule name for engine.{method}()",
+            ciris_persist::ffi::capsule_names::CAPSULE_VERSION_SKEW
+        )));
+    };
+    ciris_persist::ffi::capsule_names::checked_pointer(cap, expected)
 }
 
 /// v0.9.2 (CIRISEdge#22 / CIRISPersist#109) — call a host engine's
@@ -5739,6 +6300,32 @@ where
     T: 'static,
     F: FnOnce(&T) -> R,
 {
+    // SAFETY: forwarded verbatim; see [`extract_capsule_held`].
+    unsafe { extract_capsule_held::<T, R, F>(engine, method, map) }.map(|(r, _capsule)| r)
+}
+
+/// [`extract_capsule`], also handing back the capsule itself.
+///
+/// CIRISEdge#960 — a caller whose `map` copies the capsule's payload out
+/// bitwise (the executor and the directory/queue ops `{ data, vtable }`) MUST
+/// keep the returned capsule for as long as that copy is used: the capsule's
+/// destructor frees what `data` points at. A caller whose `map` clones owned
+/// values (an `Arc`, a `Handle`) holds no pointer into the capsule and may
+/// drop it.
+///
+/// # Safety
+///
+/// As [`extract_capsule`].
+#[allow(unsafe_code)]
+unsafe fn extract_capsule_held<T, R, F>(
+    engine: &Bound<'_, PyAny>,
+    method: &str,
+    map: F,
+) -> PyResult<(R, pyo3::Py<pyo3::PyAny>)>
+where
+    T: 'static,
+    F: FnOnce(&T) -> R,
+{
     let result = engine.call_method0(method).map_err(|e| {
         PyTypeError::new_err(format!(
             "engine doesn't expose {method:?} method (persist 2.7.0+ \
@@ -5779,15 +6366,12 @@ where
     // the `.pointer_checked()` call. We hold `cap` (the `Bound`) for
     // both, no Python code runs between them, and the capsule's name
     // is set once at construction in persist — no SetName drift.
-    let name = cap
-        .name()
-        .map_err(|e| PyTypeError::new_err(format!("engine.{method}(): capsule name: {e}")))?;
-    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
-    let ptr = cap
-        .pointer_checked(name_cstr)
-        .map_err(|e| PyTypeError::new_err(format!("engine.{method}(): pointer_checked: {e}")))?;
+    // CIRISPersist#1242 (61.2) — ask for the name THIS build compiled, never
+    // the capsule's own: a raw-layout capsule from another persist build is
+    // refused `capsule_version_skew` before anything is dereferenced.
+    let ptr = checked_capsule_pointer(&cap, method)?;
     let inner: &T = unsafe { &*(ptr.as_ptr() as *const T) };
-    Ok(map(inner))
+    Ok((map(inner), cap.into_any().unbind()))
 }
 
 /// v0.16.1 cherry-pick (CIRISEdge#43 / CIRISPersist#119) — typed
@@ -5911,17 +6495,9 @@ fn extract_trust_scoring(
     // pyo3 0.29's `pointer_checked(name)` enforces a name match; pass
     // the capsule's own name through. See `extract_engine_capsule_arc`
     // above for the matching pattern + SAFETY rationale.
-    let name = cap.name().map_err(|e| {
-        TrustScoringCapsuleError::Other(PyTypeError::new_err(format!(
-            "trust_scoring_capsule: capsule name: {e}"
-        )))
-    })?;
-    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
-    let ptr = cap.pointer_checked(name_cstr).map_err(|e| {
-        TrustScoringCapsuleError::Other(PyTypeError::new_err(format!(
-            "trust_scoring_capsule: pointer_checked: {e}"
-        )))
-    })?;
+    // CIRISPersist#1242 — the versioned name this build compiled.
+    let ptr = checked_capsule_pointer(&cap, "trust_scoring_capsule")
+        .map_err(TrustScoringCapsuleError::Other)?;
     let inner: &Arc<dyn ciris_persist::federation::TrustScoring> =
         unsafe { &*(ptr.as_ptr() as *const Arc<dyn ciris_persist::federation::TrustScoring>) };
     Ok(Arc::clone(inner))
@@ -6289,17 +6865,9 @@ fn extract_local_signer(
     // pyo3 0.29's `pointer_checked(name)` enforces a name match; pass
     // the capsule's own name through. See `extract_engine_capsule_arc`
     // above for the matching pattern + SAFETY rationale.
-    let name = cap.name().map_err(|e| {
-        LocalSignerCapsuleError::Other(PyTypeError::new_err(format!(
-            "local_signer_capsule: capsule name: {e}"
-        )))
-    })?;
-    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
-    let ptr = cap.pointer_checked(name_cstr).map_err(|e| {
-        LocalSignerCapsuleError::Other(PyTypeError::new_err(format!(
-            "local_signer_capsule: pointer_checked: {e}"
-        )))
-    })?;
+    // CIRISPersist#1242 — the versioned name this build compiled.
+    let ptr = checked_capsule_pointer(&cap, "local_signer_capsule")
+        .map_err(LocalSignerCapsuleError::Other)?;
     let inner: &Arc<ciris_persist::signing::LocalSigner> =
         unsafe { &*(ptr.as_ptr() as *const Arc<ciris_persist::signing::LocalSigner>) };
     Ok(Arc::clone(inner))
@@ -6397,6 +6965,9 @@ fn extract_local_signer(
 ///                                       # default; advisory at edge
 ///     trust_recursion_depth=0,          # Override Server's depth=1
 ///                                       # default to strict
+///     shaping_class="home",
+///     shaping_opt_in=False,         # CC 5.4.3: off shapes layer links
+///                                   # only; True shapes every link
 /// )
 /// ```
 ///
@@ -6481,6 +7052,12 @@ enum LocalInstanceRole {
     direct_link_serve_port = None,
     direct_link_accept = "room_peers",
     direct_link_proposing = "on",
+    // The person's opt-in to shaping every identity link at a `home` /
+    // `phone-wifi` class, and at `phone-cellular` (FLEET_DEFAULTS: on for
+    // `server` only, opt-in elsewhere). Off: such a node shapes layer links
+    // only, whatever `shaping_class` names.
+    shaping_opt_in = false,
+    shaping_opt_in_cellular = false,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -6711,6 +7288,9 @@ pub fn init_edge_runtime(
     direct_link_accept: &str,
     // v44 — `on` (default) or `off`: whether this node proposes direct links.
     direct_link_proposing: &str,
+    // CC 5.4.3 — the person's shaping opt-ins (tracked: CIRISEdge#969).
+    shaping_opt_in: bool,
+    shaping_opt_in_cellular: bool,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -6927,52 +7507,7 @@ pub fn init_edge_runtime(
     // .so, spawning onto persist's tokio without any cross-crate
     // dispatch. The hot-path send/recv pymethods consume this instead
     // of the raw `tokio::Handle`. See `run_async`'s docs.
-    if !engine.hasattr("executor_capsule").unwrap_or(false) {
-        return Err(PyRuntimeError::new_err(
-            "persist v3.13.0+ required for ABI-stable async cohabitation — \
-             your persist version doesn't expose executor_capsule. \
-             Upgrade ciris-persist (Cargo `tag = \"v3.13.0\"`, pyproject \
-             `ciris-persist>=3.13.0,<4`). See CIRISEdge#58 / CIRISPersist#157.",
-        ));
-    }
-    // The executor capsule stores a `*mut AsyncExecutor as usize`
-    // (persist's `build_capsule_with_destructor` passes the
-    // `Box::into_raw`'d pointer cast to usize). Extract as `usize`,
-    // then cast back to `*const AsyncExecutor` and bitwise-copy the
-    // struct fields. The PyCapsule destructor (set by persist) calls
-    // `vtable.drop` at Python GC time; edge only owns a reference
-    // copy of the executor, never the destructor responsibility.
-    #[allow(unsafe_code)]
-    let executor: ciris_persist::ffi::executor_capsule::AsyncExecutor = unsafe {
-        extract_capsule::<usize, _, _>(&engine, "executor_capsule", |raw_usize| {
-            let ptr = *raw_usize as *const ciris_persist::ffi::executor_capsule::AsyncExecutor;
-            // SAFETY: `raw_usize` is the `Box::into_raw`'d pointer
-            // produced by persist's `build_capsule_with_destructor`.
-            // The Box's allocation is alive for the lifetime of the
-            // PyCapsule (its destructor runs `Box::from_raw` at GC
-            // time), which is rooted in the Python `engine` object
-            // outliving this extraction.
-            let e = &*ptr;
-            ciris_persist::ffi::executor_capsule::AsyncExecutor {
-                data: e.data,
-                vtable: e.vtable,
-            }
-        })?
-    };
-    // ABI version check — refuse mismatched capsule versions cleanly
-    // rather than risk UB on a vtable-layout drift.
-    if executor.vtable.abi_version
-        != ciris_persist::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION
-    {
-        return Err(PyRuntimeError::new_err(format!(
-            "persist executor_capsule ABI version mismatch — capsule v{}, \
-             edge expects v{}; upgrade ciris-persist or pin edge to a \
-             compatible floor",
-            executor.vtable.abi_version,
-            ciris_persist::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION,
-        )));
-    }
-    let executor = Arc::new(executor);
+    let executor = extract_executor(&engine)?;
 
     // ── v8.1.0 (CIRISEdge#245 / CIRISPersist#329 + #333) — the ABI-stable
     // directory ops proxy REPLACES the raw-`dyn` `federation_directory_capsule`.
@@ -6989,46 +7524,7 @@ pub fn init_edge_runtime(
     // no longer misdispatch. Every method `federation_directory_for_edge`
     // touches is a covered op (the base 24 + the 6 peer-mutation ops of
     // CIRISPersist#333 / v11.8.2: add/remove_peer_record, update_peer_*).
-    if !engine.hasattr("directory_ops_capsule").unwrap_or(false) {
-        return Err(PyRuntimeError::new_err(
-            "persist v11.8.2+ required for the ABI-stable directory ops proxy — \
-             your persist version doesn't expose directory_ops_capsule. Upgrade \
-             ciris-persist (Cargo `tag = \"v11.8.2\"`, pyproject \
-             `ciris-persist>=11.8.2,<12`). See CIRISEdge#245 / CIRISPersist#329+#333.",
-        ));
-    }
-    // The `directory_ops_capsule` stores `*mut Directory as usize` (persist's
-    // `build_capsule_with_destructor`, PyCapsule tag
-    // `ciris_persist::directory_ops_v1`) — the same shape as `executor_capsule`.
-    // Extract as `usize`, cast back, bitwise-copy the `{ data, vtable }` fields.
-    // The PyCapsule destructor (set by persist) calls `vtable.drop` at Python GC;
-    // `OpsDirectory` has NO Drop impl, so edge holds only a reference copy — never
-    // the destructor responsibility — exactly like the executor above.
-    #[allow(unsafe_code)]
-    let directory_handle: ciris_persist::ffi::directory_capsule::Directory = unsafe {
-        extract_capsule::<usize, _, _>(&engine, "directory_ops_capsule", |raw_usize| {
-            let ptr = *raw_usize as *const ciris_persist::ffi::directory_capsule::Directory;
-            // SAFETY: `raw_usize` is the `Box::into_raw`'d `*mut Directory`
-            // persist stored; the Box is alive for the PyCapsule's lifetime
-            // (its destructor runs `Box::from_raw` + `vtable.drop` at GC),
-            // rooted in the Python `engine` object outliving this extraction.
-            let d = &*ptr;
-            ciris_persist::ffi::directory_capsule::Directory {
-                data: d.data,
-                vtable: d.vtable,
-            }
-        })?
-    };
-    let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> =
-        ciris_persist::ffi::directory_capsule::build_ops_directory(
-            directory_handle,
-            Arc::clone(&executor),
-        )
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!(
-                "init_edge_runtime: build_ops_directory (directory_ops_capsule) failed: {e}"
-            ))
-        })?;
+    let directory_arc = extract_directory(&engine, &executor)?;
     #[allow(unsafe_code)]
     let queue_dispatch: BackendDispatch = unsafe {
         extract_capsule::<BackendDispatch, _, _>(
@@ -7176,13 +7672,17 @@ pub fn init_edge_runtime(
                 return Err(e);
             }
         };
-    // One arm under `pyo3-sqlite` (no Postgres backend), two under `pyo3`.
-    #[allow(clippy::infallible_destructuring_match)]
-    let queue: Arc<dyn OutboundHandle> = match queue_dispatch {
-        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
-        BackendDispatch::Postgres(b) => b,
-        BackendDispatch::Sqlite(b) => b,
-    };
+    // CIRISEdge#960 — the outbound queue rides persist's
+    // `outbound_queue_ops_capsule` (a C-ABI vtable, ops dispatched inside
+    // persist's `.so`), never the concrete backend out of `queue_dispatch`:
+    // `enqueue_outbound` / `claim_pending_outbound` and every sweep are
+    // writes, and on the concrete backend they ran edge's compiled copy of
+    // persist's store code against objects the wheel laid out
+    // (CIRISPersist#1231). `queue_dispatch` still serves the verify / rooting
+    // / blackhole / detection views above, which have no persist ops
+    // capsule yet (see the #960 note on those arms).
+    let queue: Arc<dyn OutboundHandle> = extract_outbound_queue_ops(&engine, &executor)?;
+    drop(queue_dispatch);
 
     // ── Step 3: keyring signer parts → edge's hot-path LocalSigner.
     //
@@ -7715,14 +8215,22 @@ pub fn init_edge_runtime(
     ));
     // CC 5.4.3 — link shaping policy.
     if let Some(class) = shaping_class.as_deref() {
-        use crate::transport::link_shaping::{BudgetClass, ShapingPolicy};
+        use crate::transport::link_shaping::BudgetClass;
         let class = BudgetClass::parse(class).ok_or_else(|| {
             PyValueError::new_err(format!(
                 "init_edge_runtime: shaping_class {class:?} is not one of server, home, \
                  phone-wifi, phone-cellular, off"
             ))
         })?;
-        let mut policy = ShapingPolicy::for_class(class);
+        // The class names the device (CC 5.4.6 item 1 relay policy) and the
+        // opt-ins are the person's: `home` / `phone-*` without its opt-in
+        // shapes layer links only, the fleet default (tracked:
+        // CIRISEdge#969).
+        let (device, mut policy) = crate::transport::link_shaping::DeviceState::for_host_class(
+            class,
+            shaping_opt_in,
+            shaping_opt_in_cellular,
+        );
         if let Some(rho) = shaping_rho {
             if !(0.01..=1.0).contains(&rho) {
                 return Err(PyValueError::new_err(
@@ -7738,31 +8246,21 @@ pub fn init_edge_runtime(
             policy.node_cap_bytes_per_s = cap;
         }
         policy.require_shaped_links = require_shaped_links;
-        // The class names the device too (CC 5.4.6 item 1 relay policy).
-        {
-            use crate::transport::link_shaping::{DeviceKind, DeviceState};
-            transport_config.device = match class {
-                BudgetClass::Server | BudgetClass::Seat => DeviceState::of(DeviceKind::Server),
-                BudgetClass::Home => DeviceState::of(DeviceKind::Home),
-                BudgetClass::PhoneWifi => DeviceState::of(DeviceKind::Phone),
-                BudgetClass::PhoneCellular => {
-                    DeviceState::of(DeviceKind::Phone).with_network(false, true)
-                }
-                BudgetClass::Off | BudgetClass::HomeElsewhere => {
-                    DeviceState::of(DeviceKind::platform_default())
-                }
-            };
-        }
+        transport_config.device = device;
         transport_config = transport_config.with_shaping(policy);
     } else {
         // CC 5.4.3 rc16 fleet default (Eric, 2026-11-02, final): shaping is
         // ON by default for `server` only, which a server host names by
-        // passing `shaping_class="server"`. Naming any other class is the
-        // person's opt-in for that class (cellular included). With no class
-        // the node shapes only its onion layer links (none unless its tier
-        // runs), at the platform's class.
+        // passing `shaping_class="server"`. Every other class shapes every
+        // identity link only on the person's opt-in (`shaping_opt_in`,
+        // `shaping_opt_in_cellular`), never by being named. With no class the
+        // node is the platform's device, at its fleet default.
         use crate::transport::link_shaping::{DeviceKind, DeviceState, ShapingPolicy};
-        let device = DeviceState::of(DeviceKind::platform_default());
+        let device = DeviceState {
+            shaping_opt_in,
+            shaping_opt_in_cellular,
+            ..DeviceState::of(DeviceKind::platform_default())
+        };
         let mut policy = ShapingPolicy::for_device(&device);
         policy.require_shaped_links = require_shaped_links;
         transport_config.device = device;
@@ -9361,6 +9859,7 @@ fn assemble_tier_meta_v3(
 const PY_CODEC_AV1_SVC: u8 = crate::transport::realtime_av::CODEC_AV1_SVC;
 const PY_CODEC_JPEG_XS: u8 = crate::transport::realtime_av::CODEC_JPEG_XS;
 const PY_CODEC_MDC: u8 = crate::transport::realtime_av::CODEC_MDC;
+const PY_CODEC_TEMPORAL_LAYERED: u8 = crate::transport::realtime_av::CODEC_TEMPORAL_LAYERED;
 const PY_CODEC_OPAQUE: u8 = crate::transport::realtime_av::CODEC_OPAQUE;
 /// CIRISEdge#129 — MLS X-Wing ciphersuite code point. Mirrors
 /// `MlsSession::ciphersuite_id()`. Exposed as a constant so
@@ -11117,6 +11616,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CODEC_AV1_SVC", PY_CODEC_AV1_SVC)?;
     m.add("CODEC_JPEG_XS", PY_CODEC_JPEG_XS)?;
     m.add("CODEC_MDC", PY_CODEC_MDC)?;
+    m.add("CODEC_TEMPORAL_LAYERED", PY_CODEC_TEMPORAL_LAYERED)?;
     m.add("CODEC_OPAQUE", PY_CODEC_OPAQUE)?;
     // MLS ciphersuite code point (CIRISEdge#129) — used by
     // CIRISConformance to attest that the cohabiting wheel's MLS
@@ -11517,6 +12017,10 @@ mod tests {
         assert_eq!(PY_CODEC_AV1_SVC, realtime_av::CODEC_AV1_SVC);
         assert_eq!(PY_CODEC_JPEG_XS, realtime_av::CODEC_JPEG_XS);
         assert_eq!(PY_CODEC_MDC, realtime_av::CODEC_MDC);
+        assert_eq!(
+            PY_CODEC_TEMPORAL_LAYERED,
+            realtime_av::CODEC_TEMPORAL_LAYERED
+        );
         assert_eq!(PY_CODEC_OPAQUE, realtime_av::CODEC_OPAQUE);
     }
 
@@ -12055,6 +12559,224 @@ mod pyo3_tier2_tests {
 
     use std::sync::OnceLock;
 
+    /// A real persist engine on an in-memory store, for the capsule-lifetime
+    /// witnesses.
+    fn lifetime_engine<'py>(
+        py: Python<'py>,
+        seed: &std::path::Path,
+        n: usize,
+    ) -> Bound<'py, PyAny> {
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("dsn", "sqlite::memory:").expect("kw");
+        kwargs
+            .set_item("signing_key_id", format!("edge-capsule-lifetime-{n}"))
+            .expect("kw");
+        kwargs
+            .set_item("local_key_id", format!("edge-capsule-lifetime-local-{n}"))
+            .expect("kw");
+        kwargs
+            .set_item("local_key_path", seed.to_string_lossy().as_ref())
+            .expect("kw");
+        kwargs.set_item("pqc_sweep_on_init", false).expect("kw");
+        py.import("ciris_persist")
+            .and_then(|m| m.getattr("Engine"))
+            .and_then(|c| c.call((), Some(&kwargs)))
+            .expect("engine")
+    }
+
+    /// **A handle copied out of a capsule outlives the engine that made it.**
+    /// Edge copies `{ data, vtable }` out of the executor, directory-ops and
+    /// queue-ops capsules and hands the copies to tasks that can outlive the
+    /// host's engine. Here the engine is dropped, its slot reset and the
+    /// collector run, so the only references left to the capsules are the
+    /// handles' own; the directory proxy, the queue proxy and the executor
+    /// still answer. Red (SIGSEGV, or a dead runtime) when a handle does not
+    /// hold the capsule its copy points into: d2e5e3c's bug, for each handle.
+    #[test]
+    fn a_capsule_handle_outlives_the_engine_that_made_it() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = tmp.path().join("local.seed");
+        std::fs::write(&seed, [0x51_u8; 32]).expect("seed");
+        let (executor, directory, queue) = Python::attach(|py| {
+            install_ciris_persist_module(py).expect("module");
+            clear_engine_slate(py);
+            let engine = lifetime_engine(py, &seed, 0);
+            let executor = extract_executor(&engine).expect("executor");
+            let directory = extract_directory(&engine, &executor).expect("directory");
+            let queue = extract_outbound_queue_ops(&engine, &executor).expect("queue");
+            drop(engine);
+            clear_engine_slate(py);
+            (executor, directory, queue)
+        });
+        let answered: Result<(bool, bool), String> = run_async(&executor, async move {
+            let none = directory
+                .lookup_public_key("nobody-here")
+                .await
+                .map_err(|e| e.to_string())?
+                .is_none();
+            let empty = queue
+                .outbound_status("no-such-row")
+                .await
+                .map_err(|e| e.to_string())?
+                .is_none();
+            Ok((none, empty))
+        });
+        assert_eq!(answered, Ok((true, true)), "the handles still answer");
+        Python::attach(|_py| drop(executor));
+    }
+
+    /// A Python object's reference count, read while attached.
+    fn refcount(_py: Python<'_>, obj: &pyo3::Py<pyo3::PyAny>) -> isize {
+        #[allow(unsafe_code)]
+        // SAFETY: `obj` is a live reference and the thread is attached.
+        unsafe {
+            pyo3::ffi::Py_REFCNT(obj.as_ptr())
+        }
+    }
+
+    /// **And no longer.** The capsules live exactly as long as a handle that
+    /// can dereference them: after N engines are built, their handles taken
+    /// and everything dropped, nothing but the witness's own reference holds
+    /// any capsule. Red under a process-lifetime keep-alive set (the first
+    /// cut of this fix), which pinned every capsule, and so every engine,
+    /// for ever.
+    #[test]
+    fn a_dropped_handle_releases_its_capsule() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = tmp.path().join("local.seed");
+        std::fs::write(&seed, [0x52_u8; 32]).expect("seed");
+        Python::attach(|py| {
+            install_ciris_persist_module(py).expect("module");
+            for n in 0..4 {
+                clear_engine_slate(py);
+                let engine = lifetime_engine(py, &seed, n);
+                let watched: Vec<pyo3::Py<pyo3::PyAny>> = [
+                    "executor_capsule",
+                    "directory_ops_capsule",
+                    "outbound_queue_ops_capsule",
+                ]
+                .iter()
+                .map(|m| engine.call_method0(*m).expect("capsule").unbind())
+                .collect();
+                let executor = extract_executor(&engine).expect("executor");
+                let directory = extract_directory(&engine, &executor).expect("directory");
+                let queue = extract_outbound_queue_ops(&engine, &executor).expect("queue");
+                let held: Vec<isize> = watched.iter().map(|c| refcount(py, c)).collect();
+                drop((executor, directory, queue));
+                drop(engine);
+                clear_engine_slate(py);
+                for (i, cap) in watched.iter().enumerate() {
+                    assert_eq!(
+                        refcount(py, cap),
+                        1,
+                        "engine {n}, capsule {i}: only the witness holds it once the handles \
+                         and the engine are gone (it held {} with them alive)",
+                        held[i]
+                    );
+                    assert!(held[i] > 1, "the handles did hold it");
+                }
+            }
+        });
+    }
+
+    /// CIRISPersist#1242 — **a raw-layout capsule laid out by another persist
+    /// build is refused before it is dereferenced.** A capsule carrying the
+    /// pre-61.2 unversioned name, or the name of another persist version, is
+    /// a `TypeError` led by `capsule_version_skew`, at the helper and through
+    /// `extract_capsule` and both typed extractors. The name this build
+    /// compiled is accepted. Red under: passing the capsule's own name back
+    /// (`pointer_checked(cap.name())`), the pre-61.2 behaviour.
+    #[cfg(feature = "transport-reticulum")]
+    #[test]
+    fn a_capsule_from_another_persist_build_is_refused_as_version_skew() {
+        use ciris_persist::ffi::capsule_names::{self, CAPSULE_VERSION_SKEW};
+        init_python();
+        Python::attach(|py| {
+            let skewed: [&'static std::ffi::CStr; 3] = [
+                c"ciris_persist::local_signer",
+                c"ciris_persist::local_signer@61.1.0",
+                c"ciris_persist::trust_scoring@99.0.0",
+            ];
+            for name in skewed {
+                let cap = PyCapsule::new_with_value(py, 0_usize, name).expect("capsule");
+                for method in ["local_signer_capsule", "trust_scoring_capsule"] {
+                    let err = checked_capsule_pointer(&cap, method)
+                        .expect_err("a skewed name is refused");
+                    assert!(err.is_instance_of::<PyTypeError>(py), "{err}");
+                    let msg = err.value(py).to_string();
+                    assert!(
+                        msg.starts_with(CAPSULE_VERSION_SKEW),
+                        "{name:?} via {method}: {msg}"
+                    );
+                }
+            }
+            // The same refusal through every extractor that unwraps a capsule.
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                c"class SkewedEngine:\n    def __init__(self, caps):\n        self.caps = caps\n    def local_signer_capsule(self):\n        return self.caps['local_signer']\n    def trust_scoring_capsule(self):\n        return self.caps['trust_scoring']\n    def keyring_signer_capsule(self):\n        return self.caps['keyring_signer']\n",
+                c"skewed_engine.py",
+                c"skewed_engine",
+            )
+            .expect("fake engine module");
+            let caps = pyo3::types::PyDict::new(py);
+            for (key, name) in [
+                ("local_signer", c"ciris_persist::local_signer@61.1.0"),
+                ("trust_scoring", c"ciris_persist::trust_scoring@61.1.0"),
+                ("keyring_signer", c"ciris_persist::keyring_signer@61.1.0"),
+            ] {
+                caps.set_item(
+                    key,
+                    PyCapsule::new_with_value(py, 0_usize, name).expect("capsule"),
+                )
+                .expect("set");
+            }
+            let engine = module
+                .getattr("SkewedEngine")
+                .and_then(|c| c.call1((caps,)))
+                .expect("engine");
+            #[allow(unsafe_code)]
+            let raw = unsafe {
+                extract_capsule::<usize, _, _>(&engine, "keyring_signer_capsule", |v| *v)
+            };
+            let msg = raw.expect_err("refused").value(py).to_string();
+            assert!(msg.starts_with(CAPSULE_VERSION_SKEW), "{msg}");
+            match extract_trust_scoring(&engine) {
+                Err(TrustScoringCapsuleError::Other(e)) => {
+                    let msg = e.value(py).to_string();
+                    assert!(msg.starts_with(CAPSULE_VERSION_SKEW), "{msg}");
+                }
+                other => panic!("trust_scoring: {:?}", other.err().map(|_| "not Other")),
+            }
+            match extract_local_signer(&engine) {
+                Err(LocalSignerCapsuleError::Other(e)) => {
+                    let msg = e.value(py).to_string();
+                    assert!(msg.starts_with(CAPSULE_VERSION_SKEW), "{msg}");
+                }
+                other => panic!("local_signer: {:?}", other.err().map(|_| "not Other")),
+            }
+
+            // The name this build compiled is accepted, for every raw-layout
+            // method and every ABI-versioned one edge reads.
+            for (method, name) in capsule_names::RAW_LAYOUT_CAPSULES {
+                let cap = PyCapsule::new_with_value(py, 7_usize, name).expect("capsule");
+                assert!(checked_capsule_pointer(&cap, method).is_ok(), "{method}");
+            }
+            for method in [
+                "executor_capsule",
+                "directory_ops_capsule",
+                "outbound_queue_ops_capsule",
+            ] {
+                let name = expected_capsule_name(method).expect("known");
+                let cap = PyCapsule::new_with_value(py, 7_usize, name).expect("capsule");
+                assert!(checked_capsule_pointer(&cap, method).is_ok(), "{method}");
+            }
+        });
+    }
+
     /// Initialize the embedded Python interpreter exactly once. Safe
     /// to call from every test; pyo3 0.28's `initialize()` is itself
     /// idempotent but the `OnceLock` makes the test-suite-wide
@@ -12469,6 +13191,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )?;
             Ok(edge.signer_key_id())
         });
@@ -12601,6 +13325,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -12772,6 +13498,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )?;
             Ok(())
         });
@@ -12896,6 +13624,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -13180,6 +13910,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )?;
             Ok(edge.signer_key_id())
         });
@@ -13350,6 +14082,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             );
             // Cleanup: drop OUR engine from the singleton so the next real-engine
             // sibling test constructs cleanly (one persist engine per process).
@@ -13490,6 +14224,8 @@ mod pyo3_tier2_tests {
                 None,         // direct_link_serve_port
                 "room_peers", // direct_link_accept
                 "on",         // direct_link_proposing (v44 default)
+                false,        // shaping_opt_in
+                false,        // shaping_opt_in_cellular
             )?;
             Ok(edge.signer_key_id())
         });
@@ -13819,21 +14555,24 @@ mod pyo3_tier2_tests {
                 assert!(e.is_instance_of::<PyValueError>(py), "{token}: {e}");
                 assert!(e.to_string().contains(token), "{token}: {e}");
             };
-            value_err(py_edge.join_call(py, "", "unkept", false), "invalid_room");
             value_err(
-                py_edge.join_call(py, "chat:room:v1:a\0b", "unkept", false),
+                py_edge.join_call(py, "", "unkept", false, None),
                 "invalid_room",
             );
             value_err(
-                py_edge.join_call(py, &"r".repeat(513), "unkept", false),
+                py_edge.join_call(py, "chat:room:v1:a\0b", "unkept", false, None),
                 "invalid_room",
             );
             value_err(
-                py_edge.join_call(py, "chat:room:v1:a", "recorded", false),
+                py_edge.join_call(py, &"r".repeat(513), "unkept", false, None),
+                "invalid_room",
+            );
+            value_err(
+                py_edge.join_call(py, "chat:room:v1:a", "recorded", false, None),
                 "invalid_keep",
             );
             // Valid arguments reach the call API, which names what is missing.
-            let Err(e) = py_edge.join_call(py, "chat:room:v1:a", "unkept", false) else {
+            let Err(e) = py_edge.join_call(py, "chat:room:v1:a", "unkept", false, None) else {
                 panic!("a node with no Reticulum transport cannot join a call")
             };
             assert!(e.is_instance_of::<PyRuntimeError>(py), "{e}");

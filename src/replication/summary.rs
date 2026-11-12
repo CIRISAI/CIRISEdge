@@ -228,6 +228,16 @@ pub trait StateProvider: Send + Sync {
         self.local_refs(kind).await
     }
 
+    /// CIRISEdge#971 — the receive diff itself: which of `remote`'s hashes
+    /// this node does not hold for `kind`. Defaults to
+    /// [`diff_refs`]`(local_holdings, remote)`, which is exactly what
+    /// `Session::on_summary` computed before. A provider that keeps its
+    /// holdings as a set (the bridge's holdings index) answers it without
+    /// materialising the holdings at all.
+    async fn local_want(&self, kind: EnvelopeKind, remote: &[EnvelopeRef]) -> Vec<[u8; 32]> {
+        diff_refs(&self.local_holdings(kind).await, remote)
+    }
+
     /// CIRISEdge#544 — should the round's `want` DROP this hash?
     ///
     /// The receive axis' third question, after "what do I offer" and "what do I
@@ -319,6 +329,10 @@ pub trait StateProvider: Send + Sync {
     fn take_missing_signer_for(&self, _peer_key_id: &str) -> Option<String> {
         None
     }
+
+    /// CIRISEdge#971 (d) — a subject Pull to `peer` about `subject` was
+    /// answered (`throttled`: with a throttle). Telemetry only.
+    fn note_pull_answer(&self, _peer_key_id: &str, _subject_key_id: &str, _throttled: bool) {}
 
     /// CIRISEdge#776 — rows released from this peer on this plane, taken once.
     /// A release can only re-open a row's offer, and past one page a peer names
@@ -669,6 +683,20 @@ pub fn diff_refs(local: &[EnvelopeRef], remote: &[EnvelopeRef]) -> Vec<[u8; 32]>
     remote
         .iter()
         .filter(|r| !local_set.contains(&r.envelope_hash))
+        .map(|r| r.envelope_hash)
+        .collect()
+}
+
+/// CIRISEdge#971 — [`diff_refs`] against a set the caller already holds:
+/// no per-call collection of the local side is built. Order follows `remote`,
+/// as [`diff_refs`] does.
+pub fn diff_refs_against<S: std::hash::BuildHasher>(
+    local: &std::collections::HashSet<[u8; 32], S>,
+    remote: &[EnvelopeRef],
+) -> Vec<[u8; 32]> {
+    remote
+        .iter()
+        .filter(|r| !local.contains(&r.envelope_hash))
         .map(|r| r.envelope_hash)
         .collect()
 }

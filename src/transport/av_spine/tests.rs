@@ -22,7 +22,7 @@ use crate::transport::realtime_av::{open_av_chunk, EpochDek, SealedAvChunk};
 use crate::transport::realtime_av_mls::mint_joiner_key_material;
 use crate::transport::realtime_av_session::AvSession;
 
-const CONVERGENCE: Duration = Duration::from_secs(300);
+const CONVERGENCE: Duration = Duration::from_mins(5);
 
 // ─── fixtures ───────────────────────────────────────────────────────
 

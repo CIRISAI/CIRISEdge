@@ -111,7 +111,7 @@ async fn build_edge(
 
 fn lenient_config() -> EdgeConfig {
     EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     }
 }

@@ -126,10 +126,23 @@ pub mod coordinator;
 #[cfg(test)]
 mod counting_directory_930;
 pub mod directory;
+#[cfg(test)]
+mod first_contact_retry_968_tests;
+#[cfg(test)]
+mod gate_order_971_tests;
+#[cfg(test)]
+mod holdings_doors_971_tests;
+/// CIRISEdge#971 — the receive diff's holdings, kept as a set equal to
+/// persist's content-hash index.
+pub(crate) mod holdings_index;
+#[cfg(test)]
+mod holdings_index_971_tests;
 /// CIRISEdge#552 — hashes known to exist whose bodies this node does not
 /// hold. NEVER holdings; see the module docs for why that distinction is the
 /// whole safety of the design.
 pub mod key_grant_emitter;
+#[cfg(test)]
+mod key_plane_cache_971_tests;
 /// CIRISEdge#930 — the key-plane listings, memoized per subject on the
 /// store's admission cursor.
 pub(crate) mod key_plane_memo;
@@ -172,7 +185,12 @@ pub mod session;
 #[cfg(test)]
 mod sim;
 pub(crate) mod single_flight;
+#[cfg(test)]
+mod stale_route_971_tests;
 pub mod storage_contention;
+/// CIRISEdge#971 — one drain of the serve cursor for the holdings index and
+/// the four key-plane memos.
+pub(crate) mod store_feed;
 pub(crate) mod subject_pull;
 #[cfg(test)]
 mod subject_pull_apply_tests;
@@ -283,6 +301,15 @@ impl InboundRouter {
             Ok(None) => return RouteDisposition::NotReplication,
             Err(e) => return RouteDisposition::Failed(format!("malformed CRPL frame: {e}")),
         }
+        // CIRISEdge#968 — the same pair `Edge`'s own ingest keeps
+        // (`edge.rs::route_replication_frame`): a peer this node dropped
+        // while it could not attribute it is asked again the moment one of
+        // its frames attributes. Without it here a host on this router left
+        // a round that was dropped unattributed to its next cadence tick
+        // (CIRISEdge#971 item 5: an hour, on a seat's roster).
+        if let Some(sid) = frame.source_key_id.as_ref() {
+            self.registry.note_attributed(sid.as_str());
+        }
         let Some(peer) = routing_source(frame) else {
             // CIRISEdge#727 — the owner-binding rung (`FSD/FIRST_CONTACT.md`
             // §2.1.1): an un-attributed push of an owner-binding signed by
@@ -295,6 +322,9 @@ impl InboundRouter {
                 {
                     return RouteDisposition::Routed;
                 }
+            }
+            if let Some(candidate) = frame.link_key_id.as_deref() {
+                self.registry.note_unattributed_drop(candidate);
             }
             return RouteDisposition::Unattributed;
         };

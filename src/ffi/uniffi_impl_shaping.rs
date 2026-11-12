@@ -123,6 +123,23 @@ pub fn onion_set_enabled(enabled: bool) -> Result<(), crate::EdgeBindingsError> 
     }
 }
 
+/// leviculum#102 — the host's A/V datagram lever
+/// ([`crate::Edge::set_av_datagrams_enabled`]): whether new A/V legs may carry
+/// media as unordered link datagrams. Default on; a leg already on datagrams
+/// keeps them. Edge never moves it on its own.
+pub fn av_datagrams_set_enabled(enabled: bool) -> Result<(), crate::EdgeBindingsError> {
+    #[cfg(feature = "_reticulum-module")]
+    {
+        transport()?.set_av_datagrams_enabled(enabled);
+        Ok(())
+    }
+    #[cfg(not(feature = "_reticulum-module"))]
+    {
+        let _ = enabled;
+        Err(crate::EdgeBindingsError::Unsupported)
+    }
+}
+
 /// The Anonymous Tier on this node, counts only.
 pub fn onion_status() -> Result<crate::EdgeOnionStatus, crate::EdgeBindingsError> {
     #[cfg(feature = "_reticulum-module")]

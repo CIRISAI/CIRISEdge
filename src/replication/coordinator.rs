@@ -53,7 +53,7 @@ use super::protocol::{
     EnvelopeKind, FetchMessage, ProtocolError, PullMessage, ReplicationMessage, SummaryMessage,
     SummaryStatus,
 };
-use super::session::{ReplicationOutcome, Session, SessionRole};
+use super::session::{ReplicationOutcome, Session, SessionRole, MAX_DELIVER_ENVELOPE_BYTES};
 use super::summary::{StalenessSignal, StateApplier, StateProvider};
 use super::wire_frame::{RoundMeta, RoundSide};
 
@@ -245,6 +245,9 @@ pub struct ReplicationCoordinator {
     /// Rings when an ordinary round ends: a held round asks again on this.
     round_finished: tokio::sync::Notify,
     last_round_lost: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#968 — when an ordinary round last COMPLETED: the evidence the
+    /// scheduler reads that this peer answers this node on this plane.
+    last_completed: std::sync::Mutex<Option<std::time::Instant>>,
     /// CIRISEdge#634 — the role-specific inbox. A responder has a standing
     /// bounded inbox its driver drains continuously; an initiator has a
     /// round inbox that lives exactly as long as the driven round, plus an
@@ -256,6 +259,14 @@ pub struct ReplicationCoordinator {
     /// CIRISEdge#937 — unix seconds until which this peer asked not to be
     /// Pulled on this plane; 0 = no hint held.
     pull_retry_at_secs: AtomicU64,
+    /// CIRISEdge#971 (d) — an offering Pull's answer listed every row this
+    /// node would serve the peer about the subject (and there was one): the
+    /// peer holds them. On the TD plane with this node as subject, the seat
+    /// holds our route and attributes our frames.
+    peer_holds_offered: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#971 (d) — Deliver frames an offering Pull sent up (the peer
+    /// lacked some of our own rows). Zero across an in-sync cycle.
+    offers_delivered: AtomicU64,
 }
 
 impl ReplicationCoordinator {
@@ -275,7 +286,7 @@ impl ReplicationCoordinator {
     /// only stops a signed answer being dropped for arriving after its round.
     /// On a canonical behind on its listings, Key answers reached a node after
     /// their exchanges had closed, and were dropped, for minutes on end.
-    pub const PULL_LATE_WINDOW: Duration = Duration::from_secs(120);
+    pub const PULL_LATE_WINDOW: Duration = Duration::from_mins(2);
 
     /// Exchanges past their wait kept listening per `(peer, kind)`; the oldest
     /// makes way. An asker's re-ask opens one about every 10 s, so this holds a
@@ -351,9 +362,12 @@ impl ReplicationCoordinator {
             peer_lacks_nothing: std::sync::atomic::AtomicU64::new(0),
             round_finished: tokio::sync::Notify::new(),
             last_round_lost: std::sync::atomic::AtomicBool::new(false),
+            last_completed: std::sync::Mutex::new(None),
             inbox,
             pull_exchanges: std::sync::Mutex::new(HashMap::new()),
             pull_retry_at_secs: AtomicU64::new(0),
+            peer_holds_offered: std::sync::atomic::AtomicBool::new(false),
+            offers_delivered: AtomicU64::new(0),
             driver_phase: std::sync::atomic::AtomicU8::new(DriverPhase::Idle as u8),
             driver_phase_since_ms: AtomicU64::new(0),
         }
@@ -883,7 +897,22 @@ impl ReplicationCoordinator {
     pub(crate) fn note_round_ended(&self, lost: bool) {
         self.provider.round_ended(self.kind, lost);
         self.last_round_lost.store(lost, Ordering::Release);
+        if !lost {
+            if let Ok(mut at) = self.last_completed.lock() {
+                *at = Some(std::time::Instant::now());
+            }
+        }
         self.round_finished.notify_one();
+    }
+
+    /// CIRISEdge#968 — did an ordinary round on this coordinator complete
+    /// within `window`? `false` before the first completes.
+    pub(crate) fn completed_within(&self, window: std::time::Duration) -> bool {
+        self.last_completed
+            .lock()
+            .ok()
+            .and_then(|at| *at)
+            .is_some_and(|at| at.elapsed() <= window)
     }
 
     /// Was the latest ordinary round lost? `false` before the first ends.
@@ -913,6 +942,12 @@ impl ReplicationCoordinator {
     /// waits and interval by it.
     pub(crate) fn pacing_gap(&self) -> Option<std::time::Duration> {
         self.transport.pacing_gap(&self.peer_key_id)
+    }
+
+    /// CIRISEdge#971 — could a round to this peer be carried now
+    /// ([`Transport::round_carriable`])? Asked once at round start.
+    pub(crate) async fn round_carriable(&self) -> bool {
+        self.transport.round_carriable(&self.peer_key_id).await
     }
 
     /// CIRISEdge#963 — the longest the shaped link to this peer lets one row
@@ -1140,6 +1175,28 @@ impl ReplicationCoordinator {
         subject_key_id: &str,
         reply_timeout: Duration,
     ) -> Result<PullDispatched, CoordinatorError> {
+        self.pull_exchange_offering(subject_key_id, reply_timeout, false)
+            .await
+    }
+
+    /// **CIRISEdge#971 (d) — a subject Pull that also OFFERS.** As
+    /// [`Self::pull_exchange`]; with `offer_own`, when the peer's answer
+    /// arrives, every row this node would serve it about `subject_key_id`
+    /// ([`StateProvider::subject_refs`]) that the answer does not list is
+    /// Delivered, bounded at [`MAX_DELIVER_ENVELOPE_BYTES`] per answer. The
+    /// device asks about ITSELF this way: the seat learns its key, occurrence
+    /// and route, and neither side ever sends a Summary of a whole plane. An
+    /// in-sync answer sends nothing back.
+    ///
+    /// The Deliver rides the Pull's round and reaches the peer's responder as
+    /// an unsolicited Deliver, which a v44 seat admits on a bootstrap plane
+    /// (session.rs, CIRISEdge#426/#927).
+    pub async fn pull_exchange_offering(
+        self: &Arc<Self>,
+        subject_key_id: &str,
+        reply_timeout: Duration,
+        offer_own: bool,
+    ) -> Result<PullDispatched, CoordinatorError> {
         if let Some(retry_after_secs) = self.pull_retry_after_secs() {
             tracing::debug!(
                 peer = %self.peer_key_id,
@@ -1191,12 +1248,27 @@ impl ReplicationCoordinator {
             kind = ?self.kind,
             subject = %subject_key_id,
         );
+        let offer = offer_own.then(|| subject_key_id.to_owned());
+        let subject = subject_key_id.to_owned();
         tokio::spawn(
             Arc::clone(self)
-                .drive_pull_exchange(session, round, inbox, reply_timeout)
+                .drive_pull_exchange(session, round, inbox, reply_timeout, subject, offer)
                 .instrument(span),
         );
         Ok(PullDispatched::Sent)
+    }
+
+    /// CIRISEdge#971 (d) — whether an offering Pull's answer has shown the
+    /// peer holding every row this node offers about the subject.
+    #[must_use]
+    pub fn peer_holds_offered(&self) -> bool {
+        self.peer_holds_offered.load(Ordering::Acquire)
+    }
+
+    /// CIRISEdge#971 (d) — Deliver frames offering Pulls have sent this peer.
+    #[must_use]
+    pub fn offers_delivered(&self) -> u64 {
+        self.offers_delivered.load(Ordering::Relaxed)
     }
 
     /// Seconds left on this peer's throttle hint for this plane (#937), if any.
@@ -1257,9 +1329,11 @@ impl ReplicationCoordinator {
         round: u64,
         inbox: mpsc::Receiver<ReplicationMessage>,
         reply_timeout: Duration,
+        subject: String,
+        offer: Option<String>,
     ) {
         match self
-            .step_pull_exchange(session, round, inbox, reply_timeout)
+            .step_pull_exchange(session, round, inbox, reply_timeout, &subject, offer)
             .await
         {
             Ok(Some(report)) => tracing::info!(
@@ -1283,7 +1357,10 @@ impl ReplicationCoordinator {
         round: u64,
         mut inbox: mpsc::Receiver<ReplicationMessage>,
         reply_timeout: Duration,
+        subject: &str,
+        mut offer: Option<String>,
     ) -> Result<Option<RoundReport>, &'static str> {
+        let mut answered = false;
         loop {
             // Each step gets the window: what came late may be a Summary, with
             // the Deliver behind it on the same slow path.
@@ -1309,6 +1386,18 @@ impl ReplicationCoordinator {
                 }) => Some(*retry_after_secs),
                 _ => None,
             };
+            if !answered && matches!(msg, ReplicationMessage::Summary(_)) {
+                answered = true;
+                self.provider
+                    .note_pull_answer(&self.peer_key_id, subject, throttled.is_some());
+            }
+            // CIRISEdge#971 (d) — the answer about ourselves says what the peer
+            // lacks of our own rows; Deliver exactly those, once.
+            if throttled.is_none() {
+                if let (ReplicationMessage::Summary(answer), Some(subject)) = (&msg, offer.take()) {
+                    self.offer_missing(&subject, &answer.refs, round).await?;
+                }
+            }
             let outcome = session
                 .on_message(
                     msg,
@@ -1344,6 +1433,59 @@ impl ReplicationCoordinator {
                 DriveStep::Refused => return Err("an unexpected message"),
             }
         }
+    }
+
+    /// CIRISEdge#971 (d) — Deliver the rows about `subject` this node would
+    /// serve the peer and `held` (the peer's answer) does not list. Nothing
+    /// is sent when the peer holds them all.
+    async fn offer_missing(
+        &self,
+        subject: &str,
+        held: &[super::protocol::EnvelopeRef],
+        round: u64,
+    ) -> Result<(), &'static str> {
+        let held: std::collections::HashSet<[u8; 32]> =
+            held.iter().map(|r| r.envelope_hash).collect();
+        let own = self.provider.subject_refs(self.kind, subject).await;
+        let mut envelopes: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0usize;
+        for r in own.iter().filter(|r| !held.contains(&r.envelope_hash)) {
+            let Some(body) = self
+                .provider
+                .fetch_envelope(self.kind, &r.envelope_hash)
+                .await
+            else {
+                continue;
+            };
+            if bytes + body.len() > MAX_DELIVER_ENVELOPE_BYTES && !envelopes.is_empty() {
+                break;
+            }
+            bytes += body.len();
+            envelopes.push(body);
+        }
+        if envelopes.is_empty() {
+            if !own.is_empty() {
+                self.peer_holds_offered.store(true, Ordering::Release);
+            }
+            return Ok(());
+        }
+        tracing::debug!(
+            peer = %self.peer_key_id,
+            kind = ?self.kind,
+            subject,
+            rows = envelopes.len(),
+            bytes,
+            "subject Pull answer lacked our own rows; delivering them (CIRISEdge#971)"
+        );
+        let deliver = ReplicationMessage::Deliver(super::protocol::DeliverMessage {
+            kind: self.kind,
+            envelopes,
+        });
+        self.send_on_round(&deliver, round)
+            .await
+            .map_err(|_| "our own rows could not be offered")?;
+        self.offers_delivered.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The `Pull` of a recovery round ([`Self::send_recovery_pull`]): one

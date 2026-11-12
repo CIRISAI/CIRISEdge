@@ -388,7 +388,7 @@ impl PausableTasks {
             let stopped = p
                 .running
                 .as_ref()
-                .map_or(true, tokio::task::AbortHandle::is_finished);
+                .is_none_or(tokio::task::AbortHandle::is_finished);
             if stopped {
                 p.running = Some((p.spawn)().abort_handle());
             }
@@ -418,7 +418,7 @@ mod tests {
             let lc = Arc::clone(&lc);
             tokio::spawn(async move {
                 lc.guard(async {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    tokio::time::sleep(Duration::from_hours(1)).await;
                     Ok::<_, TransportError>(())
                 })
                 .await
@@ -455,7 +455,7 @@ mod tests {
         let _first = tasks.register(move || {
             s.fetch_add(1, Ordering::AcqRel);
             tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+                tokio::time::sleep(Duration::from_hours(1)).await;
             })
         });
         assert_eq!(tasks.running(), 1);

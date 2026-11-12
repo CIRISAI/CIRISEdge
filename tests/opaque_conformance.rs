@@ -233,7 +233,7 @@ mod loopback {
             signer: Some(signer_for(key, base).await),
             rooting: Some(dir as Arc<dyn RootingDirectory>),
             resolver: None,
-            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            hybrid_policy: HybridPolicy::Strict,
             ..ReticulumAuth::default()
         }
     }
@@ -301,7 +301,7 @@ mod loopback {
                 .transport(ta.clone() as Arc<dyn Transport>)
                 .reticulum_transport(ta)
                 .config(EdgeConfig {
-                    hybrid_policy: HybridPolicy::Ed25519Fallback,
+                    hybrid_policy: HybridPolicy::Strict,
                     cohort_scope_enforcement: CohortScopeEnforcement::Off,
                     ..EdgeConfig::default()
                 })
@@ -316,7 +316,7 @@ mod loopback {
                 .transport(tb.clone() as Arc<dyn Transport>)
                 .reticulum_transport(tb)
                 .config(EdgeConfig {
-                    hybrid_policy: HybridPolicy::Ed25519Fallback,
+                    hybrid_policy: HybridPolicy::Strict,
                     cohort_scope_enforcement: CohortScopeEnforcement::Off,
                     ..EdgeConfig::default()
                 })
@@ -452,7 +452,7 @@ mod loopback {
         let signer_b = signer_for(&b, &base).await;
 
         let cfg = || EdgeConfig {
-            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            hybrid_policy: HybridPolicy::Strict,
             cohort_scope_enforcement: CohortScopeEnforcement::Off,
             ..EdgeConfig::default()
         };
@@ -597,7 +597,7 @@ mod loopback {
         let signer_b = signer_for(&b, &base).await;
 
         let cfg = || EdgeConfig {
-            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            hybrid_policy: HybridPolicy::Strict,
             cohort_scope_enforcement: CohortScopeEnforcement::Off,
             ..EdgeConfig::default()
         };

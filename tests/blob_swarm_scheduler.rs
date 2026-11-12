@@ -162,7 +162,7 @@ async fn build_edge(tmp: &tempfile::TempDir, me: &FedKey, holders: &[&FedKey]) -
     let queue = directory.clone();
     let signer = me.local_signer(tmp.path()).await;
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     };
     let edge = Edge::builder()

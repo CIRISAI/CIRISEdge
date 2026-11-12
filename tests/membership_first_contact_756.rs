@@ -280,7 +280,7 @@ impl Node {
             signer: Some(self.key.signer()),
             rooting: Some(Arc::clone(&self.dir) as Arc<dyn RootingDirectory>),
             resolver: None,
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             ..ReticulumAuth::default()
         }
     }
@@ -680,7 +680,7 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
 
     // Control: the three are talking — each stranger holds A's owner-binding
     // and A holds theirs (#671 allegiance facts).
-    let talking = drive_until(&all, Duration::from_secs(240), || async {
+    let talking = drive_until(&all, Duration::from_mins(4), || async {
         b.holds(&a.binding_id()).await
             && c.holds(&a.binding_id()).await
             && a.holds(&b.binding_id()).await
@@ -710,7 +710,7 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
     )
     .await
     .expect("P proposes K");
-    let invited = drive_until(&all, Duration::from_secs(240), || async {
+    let invited = drive_until(&all, Duration::from_mins(4), || async {
         b.holds(&proposal.attestation_id).await
     })
     .await;
@@ -743,7 +743,7 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
         .await
         .expect("K accepts on B")
         .attestation_id;
-    let joined = drive_until(&all, Duration::from_secs(240), || async {
+    let joined = drive_until(&all, Duration::from_mins(4), || async {
         a.holds(&acceptance).await && a.roster(scope, &group).await.contains(&b.owner.key_id)
     })
     .await;
@@ -759,10 +759,11 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
         joined,
         "the reply comes back to the proposer's node and A widens K in (I22)"
     );
-    assert!(
-        !b.holds(&to_z).await,
-        "a proposal to a third person never reached B while it was a stranger"
-    );
+    // CIRISEdge#968 — no post-join `to_z` check here. B's person is a member
+    // now, and a family-target proposal reaching a member's node is persist's
+    // `may_receive` to decide (CC 5.2). The old clause passed only while A's
+    // send-set memo was stale for 10 s after the widening. The stranger
+    // period is checked above, before the acceptance.
 
     // 3. K is a member; A consents to B and a later G row reaches B on the
     //    ordinary member path (consent reach + the group's audience).
@@ -780,7 +781,7 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
     )
     .await;
     let later_row = group_row(scope, &group, &a.owner.signer(), &a.dir).await;
-    let member_path = drive_until(&all, Duration::from_secs(240), || async {
+    let member_path = drive_until(&all, Duration::from_mins(4), || async {
         b.roster(scope, &group).await.contains(&b.owner.key_id) && b.holds(&later_row).await
     })
     .await;

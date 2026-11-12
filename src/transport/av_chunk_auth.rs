@@ -128,11 +128,344 @@ pub const ML_DSA_65_SIG_LEN: usize = 3309;
 /// source timestamp to the signed bytes; a `v1` trailer does not verify.
 const CHUNK_SIG_DOMAIN: &[u8] = b"ciris-edge:av-chunk-sig:v2";
 
-/// The domain tag of a binding's hybrid signature.
+/// The domain tag of a v1 binding's hybrid signature.
 const BINDING_DOMAIN: &[u8] = b"ciris-edge:av-stream-key:v1";
+/// The domain tag of a v2 binding's hybrid signature (it names the codec).
+const BINDING_DOMAIN_V2: &[u8] = b"ciris-edge:av-stream-key:v2";
 
-/// The binding's encoding version.
+/// The v1 binding's encoding version (no codec).
 const BINDING_VERSION: u8 = 1;
+/// The v2 binding's encoding version: v1's fields, then a signed codec token.
+pub const BINDING_VERSION_V2: u8 = 2;
+
+/// A registered codec token a v2 binding names (the token table is a CC
+/// reading (rc17) of 5.3.3.2.1–.3, pending text). The chunk header's
+/// `codec_id` carries only the LAYER class (0x04 is rc17 text); the binding
+/// names the codec of each class, in a [`CodecMap`] fixed for the stream's
+/// life (a codec change is `Call::replace_stream`: a new join nonce, a new
+/// stream).
+///
+/// A token names the whole payload format, codec and bitstream framing (CC
+/// reading, rc18): what one chunk's (or one reassembled frame's) plaintext
+/// is. Three are registered; any other spelling binds as an undecodable
+/// class (the unknown-token rule), never malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CodecToken {
+    /// AV1 under `0x01` (SVC): one temporal unit's low-overhead-format OBUs
+    /// for one layer.
+    Av1,
+    /// H.264 under `0x04` (temporal-layered, one spatial layer): one Annex B
+    /// access unit.
+    H264,
+    /// Opus (audio) under `0xFF` (codec-opaque): one Opus packet (RFC 6716).
+    Opus,
+}
+
+impl CodecToken {
+    /// Every registered token.
+    pub const ALL: [Self; 3] = [Self::Av1, Self::H264, Self::Opus];
+
+    /// The token's wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Av1 => "av1",
+            Self::H264 => "h264",
+            Self::Opus => "opus",
+        }
+    }
+
+    /// The token for a wire spelling; `None` for anything unregistered
+    /// (`opaque` is not a token).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.as_str() == s)
+    }
+
+    /// The layer class (`realtime_av::CODEC_*`) the codec rides under.
+    #[must_use]
+    pub const fn class(self) -> u8 {
+        use crate::transport::realtime_av::{CODEC_AV1_SVC, CODEC_OPAQUE, CODEC_TEMPORAL_LAYERED};
+        match self {
+            Self::Av1 => CODEC_AV1_SVC,
+            Self::H264 => CODEC_TEMPORAL_LAYERED,
+            Self::Opus => CODEC_OPAQUE,
+        }
+    }
+}
+
+/// The most classes a v2 binding's codec map may name.
+pub const MAX_CODEC_CLASSES: usize = 8;
+
+/// The longest codec token a v2 binding may carry (bytes, ASCII).
+pub const MAX_TOKEN_LEN: usize = 32;
+
+/// One codec token as a v2 binding carries it: printable ASCII, 1 to
+/// [`MAX_TOKEN_LEN`] bytes. A token this build does not know is kept as
+/// written (it names a codec registered after this build).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Token {
+    bytes: [u8; MAX_TOKEN_LEN],
+    len: u8,
+}
+
+impl Token {
+    /// The token spelled `s`.
+    ///
+    /// # Errors
+    /// [`BindingError::Malformed`] when `s` is empty, longer than
+    /// [`MAX_TOKEN_LEN`], or not printable ASCII.
+    pub fn new(s: &str) -> Result<Self, BindingError> {
+        let b = s.as_bytes();
+        if b.is_empty() || b.len() > MAX_TOKEN_LEN || !b.iter().all(u8::is_ascii_graphic) {
+            return Err(BindingError::Malformed("codec token"));
+        }
+        let mut bytes = [0u8; MAX_TOKEN_LEN];
+        bytes[..b.len()].copy_from_slice(b);
+        Ok(Self {
+            bytes,
+            len: u8::try_from(b.len()).unwrap_or(0),
+        })
+    }
+
+    /// Its spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Printable ASCII by construction.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
+    }
+
+    /// The registered token it spells, if this build knows it.
+    #[must_use]
+    pub fn known(&self) -> Option<CodecToken> {
+        CodecToken::parse(self.as_str())
+    }
+}
+
+impl From<CodecToken> for Token {
+    fn from(t: CodecToken) -> Self {
+        Self::new(t.as_str()).unwrap_or(Self {
+            bytes: [0; MAX_TOKEN_LEN],
+            len: 0,
+        })
+    }
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
+/// What a codec map says of one layer class on this receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassCodec {
+    /// The map names no codec for the class: its chunks are refused.
+    Absent,
+    /// A registered codec this build decodes.
+    Known(CodecToken),
+    /// A token this build does not know: the binding stands, and this
+    /// receiver drops the class's chunks locally (counted).
+    Undecodable,
+}
+
+/// A v2 binding's codec map (CC reading (rc17) of 5.3.3.2.1–.3, pending
+/// text): one token per layer class the stream uses, sorted by class, no class
+/// twice. A registered token must sit under its own class; an unregistered one
+/// binds as an undecodable class here, so a codec registered later never
+/// takes the audio away from an older receiver. `{0x04: h264, 0xFF: opus}`
+/// is a phone's audio-and-video stream, `{0xFF: opus}` an audio-only one. A
+/// chunk whose class has no entry is refused. Fixed for the stream's life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CodecMap {
+    items: [(u8, Token); MAX_CODEC_CLASSES],
+    len: u8,
+}
+
+impl CodecMap {
+    /// The map of registered `tokens`, each under its class.
+    ///
+    /// # Errors
+    /// [`BindingError::Malformed`] when it is empty, longer than
+    /// [`MAX_CODEC_CLASSES`], or names a class twice.
+    pub fn new(tokens: impl IntoIterator<Item = CodecToken>) -> Result<Self, BindingError> {
+        Self::with_entries(tokens.into_iter().map(|t| (t.class(), Token::from(t))))
+    }
+
+    /// The map of raw `(class, token)` entries, as a binding carries them:
+    /// an unregistered token is kept as undecodable; a registered one must
+    /// sit under its own class.
+    ///
+    /// # Errors
+    /// [`BindingError::Malformed`]: the map is empty, longer than
+    /// [`MAX_CODEC_CLASSES`], or names a class twice, or a registered token
+    /// sits under another class.
+    pub fn with_entries(
+        entries: impl IntoIterator<Item = (u8, Token)>,
+    ) -> Result<Self, BindingError> {
+        let mut v: Vec<(u8, Token)> = entries.into_iter().collect();
+        v.sort_by_key(|(c, _)| *c);
+        if v.is_empty() || v.len() > MAX_CODEC_CLASSES {
+            return Err(BindingError::Malformed("codec map size"));
+        }
+        if v.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Err(BindingError::Malformed("codec map class twice"));
+        }
+        if v.iter()
+            .any(|(c, t)| t.known().is_some_and(|k| k.class() != *c))
+        {
+            return Err(BindingError::Malformed("codec class"));
+        }
+        Ok(Self::from_sorted(&v))
+    }
+
+    fn from_sorted(v: &[(u8, Token)]) -> Self {
+        let filler = Token {
+            bytes: [0; MAX_TOKEN_LEN],
+            len: 0,
+        };
+        let mut items = [(0u8, filler); MAX_CODEC_CLASSES];
+        items[..v.len()].copy_from_slice(v);
+        Self {
+            items,
+            len: u8::try_from(v.len()).unwrap_or(0),
+        }
+    }
+
+    /// The entries, sorted by class.
+    #[must_use]
+    pub fn entries(&self) -> &[(u8, Token)] {
+        &self.items[..usize::from(self.len)]
+    }
+
+    /// What the map says of `class` on this receiver.
+    #[must_use]
+    pub fn class_codec(&self, class: u8) -> ClassCodec {
+        match self.entries().iter().find(|(c, _)| *c == class) {
+            None => ClassCodec::Absent,
+            Some((_, t)) => t.known().map_or(ClassCodec::Undecodable, ClassCodec::Known),
+        }
+    }
+
+    /// The registered codec `class` rides under, if the map names one this
+    /// build knows.
+    #[must_use]
+    pub fn token_for(&self, class: u8) -> Option<CodecToken> {
+        match self.class_codec(class) {
+            ClassCodec::Known(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(self.len);
+        for (class, token) in self.entries() {
+            out.push(*class);
+            put_str(out, token.as_str());
+        }
+    }
+
+    /// `None` for an empty map (`count` 0).
+    fn decode(r: &mut Reader<'_>) -> Result<Option<Self>, BindingError> {
+        let n = usize::from(r.array::<1>()?[0]);
+        if n == 0 {
+            return Ok(None);
+        }
+        if n > MAX_CODEC_CLASSES {
+            return Err(BindingError::Malformed("codec map size"));
+        }
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            let class = r.array::<1>()?[0];
+            let len = r.len16()?;
+            if len == 0 || len > MAX_TOKEN_LEN {
+                return Err(BindingError::Malformed("codec token"));
+            }
+            let raw = std::str::from_utf8(r.take(len)?)
+                .map_err(|_| BindingError::Malformed("codec token"))?;
+            let token = Token::new(raw)?;
+            if token.known().is_some_and(|k| k.class() != class) {
+                return Err(BindingError::Malformed("codec class"));
+            }
+            if v.last().is_some_and(|(c, _): &(u8, Token)| *c >= class) {
+                return Err(BindingError::Malformed("codec map order"));
+            }
+            v.push((class, token));
+        }
+        Ok(Some(Self::from_sorted(&v)))
+    }
+}
+
+impl std::fmt::Display for CodecMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts: Vec<String> = self
+            .entries()
+            .iter()
+            .map(|(c, t)| format!("{c:#04x}:{}", t.as_str()))
+            .collect();
+        write!(f, "{{{}}}", parts.join(","))
+    }
+}
+
+/// `final_seq` when the publisher sealed no chunk in the epoch.
+pub const FINAL_SEQ_NONE: u64 = u64::MAX;
+
+/// What a v2 binding's `end` member says: the publisher's own signed word
+/// that its stream ends, and why (v45). A receiver acts on a leave only from
+/// this verified field, never from an unsigned control frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SignedEnd {
+    /// The attendee left the call (on its last stream: a leave).
+    Left,
+    /// The attendee's app went to the background (on its last stream: a
+    /// leave).
+    Backgrounded,
+    /// v45 (CC reading, rc18) — this stream ended, and nothing more: no
+    /// leave, whatever streams the member has left (a share stopped).
+    Ended,
+}
+
+impl SignedEnd {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Left => 1,
+            Self::Backgrounded => 2,
+            Self::Ended => 3,
+        }
+    }
+
+    fn from_code(c: u8) -> Result<Option<Self>, BindingError> {
+        match c {
+            0 => Ok(None),
+            1 => Ok(Some(Self::Left)),
+            2 => Ok(Some(Self::Backgrounded)),
+            3 => Ok(Some(Self::Ended)),
+            _ => Err(BindingError::Malformed("end")),
+        }
+    }
+
+    /// Whether this end says the member left (1, 2), not only the stream (3).
+    #[must_use]
+    pub const fn is_leave(self) -> bool {
+        !matches!(self, Self::Ended)
+    }
+}
+
+/// v45 (CC reading, rc18) — the v2 `kind` member: what the stream is to a
+/// receiver's layout. It gates nothing (admission, keys, sealing, the
+/// trailer, shedding, keeping). A v1 binding reads as media; an unknown
+/// value under v2 renders as media and is never refused.
+pub const STREAM_KIND_MEDIA: u8 = 0;
+/// A share (a desktop or window), `Call::add_stream`.
+pub const STREAM_KIND_SHARE: u8 = 1;
+
+/// v45 (CC reading, rc18) — the v2 `framing` member: 0, one media frame per
+/// chunk and no marker; 1, every chunk whose `codec_id` is not `0xFF`
+/// carries the 8-byte fragment marker (`av_call::frame`). A
+/// v1 binding reads as 0. Fixed per (stream, epoch).
+pub const FRAMING_NONE: u8 = 0;
+/// See [`FRAMING_NONE`].
+pub const FRAMING_FRAGMENTS: u8 = 1;
 
 /// The tag that starts every binding part: `"CSKB" ‖ version ‖ id[8] ‖ index ‖
 /// count ‖ payload`.
@@ -150,6 +483,8 @@ const MAX_PENDING: usize = 4;
 const MAX_ID_LEN: usize = 1024;
 /// Bound streams a receiver holds per publisher (a rejoin is a new stream).
 const MAX_STREAMS_PER_PUBLISHER: usize = 4;
+/// Ended streams a receiver remembers (their signed end is final).
+const ENDED_REMEMBERED: usize = 256;
 /// Binding ids a receiver remembers as verified, so a re-sent binding costs a
 /// hash, not a hybrid verification.
 const SEEN_IDS: usize = 128;
@@ -228,17 +563,28 @@ pub enum AvAuthRefusal {
     BindingSignatureUnverified,
     /// A binding for an epoch older than the two the receiver holds.
     BindingStaleEpoch,
+    /// A v2 binding naming another codec than its stream is bound to.
+    BindingCodecChanged,
+    /// A binding for a stream whose signed end was already verified.
+    BindingStreamEnded,
     /// A chunk too short to carry its 64-byte trailer.
     ChunkTrailerMissing,
     /// A chunk whose trailer does not verify under the bound key.
     ChunkTrailerInvalid,
     /// A chunk for a `(stream, epoch)` with no verified binding.
     ChunkUnbound,
+    /// A chunk whose layer class the stream's v2 codec map does not name.
+    ChunkClassUnlisted,
+    /// A chunk of a class whose codec this receiver does not know (dropped
+    /// here, the binding standing).
+    ChunkClassUndecodable,
+    /// A chunk whose `chunk_seq` is past its stream's signed `final_seq`.
+    ChunkPastEnd,
 }
 
 impl AvAuthRefusal {
     /// Every token, in declaration order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 15] = [
         Self::BindingPartMalformed,
         Self::BindingMalformed,
         Self::BindingOtherRoom,
@@ -246,9 +592,14 @@ impl AvAuthRefusal {
         Self::BindingStreamNotDerived,
         Self::BindingSignatureUnverified,
         Self::BindingStaleEpoch,
+        Self::BindingCodecChanged,
+        Self::BindingStreamEnded,
         Self::ChunkTrailerMissing,
         Self::ChunkTrailerInvalid,
         Self::ChunkUnbound,
+        Self::ChunkClassUnlisted,
+        Self::ChunkClassUndecodable,
+        Self::ChunkPastEnd,
     ];
 
     /// The token's stable spelling.
@@ -262,9 +613,14 @@ impl AvAuthRefusal {
             Self::BindingStreamNotDerived => "av_binding_stream_not_derived",
             Self::BindingSignatureUnverified => "av_binding_signature_unverified",
             Self::BindingStaleEpoch => "av_binding_stale_epoch",
+            Self::BindingCodecChanged => "av_binding_codec_changed",
+            Self::BindingStreamEnded => "av_binding_stream_ended",
             Self::ChunkTrailerMissing => "av_chunk_trailer_missing",
             Self::ChunkTrailerInvalid => "av_chunk_trailer_invalid",
             Self::ChunkUnbound => "av_chunk_unbound",
+            Self::ChunkClassUnlisted => "av_chunk_class_unlisted",
+            Self::ChunkClassUndecodable => "av_chunk_class_undecodable",
+            Self::ChunkPastEnd => "av_chunk_past_end",
         }
     }
 }
@@ -416,6 +772,31 @@ pub struct StreamKeyBinding {
     pub sig_ed25519: Vec<u8>,
     /// The ML-DSA-65 half (over the signed bytes ‖ the Ed25519 signature).
     pub sig_ml_dsa_65: Vec<u8>,
+    /// The stream's codec map: `Some` makes this a v2 binding (signed under
+    /// the v2 domain), `None` a v1 one, which names no codec (and carries
+    /// neither `replaces` nor `end`).
+    pub codecs: Option<CodecMap>,
+    /// v2: the publisher's earlier stream this one replaces in place
+    /// (`Call::replace_stream`). Only this signed field says so.
+    pub replaces: Option<StreamId>,
+    /// v2: the publisher's signed word that the stream ends, and why. Final:
+    /// once a receiver has verified it, it takes no further binding for the
+    /// stream (a return is a new stream).
+    pub end: Option<SignedEnd>,
+    /// v2, with `end`: the last `chunk_seq` the publisher sealed in this
+    /// epoch ([`FINAL_SEQ_NONE`]: none), in place of 5.3.3.1's terminator. A
+    /// relay cannot drop the tail unseen, and nothing past it plays.
+    pub final_seq: Option<u64>,
+    /// v2: the stream's kind ([`STREAM_KIND_MEDIA`], [`STREAM_KIND_SHARE`],
+    /// or a value this build does not know, read as media).
+    pub kind: u8,
+    /// v2: the stream's framing ([`FRAMING_NONE`] or [`FRAMING_FRAGMENTS`]).
+    pub framing: u8,
+    /// v45 — encoded as v2 even when every v2 member is its default (a
+    /// v45 publisher signs a v2 binding for every stream, so its framing,
+    /// 0 included, is stated). Set by [`Self::sign_v2`] with members and by
+    /// parsing a v2 encoding.
+    pub explicit_v2: bool,
 }
 
 /// Why a binding was refused.
@@ -439,6 +820,19 @@ pub enum BindingError {
     /// Older than the epochs this receiver holds for the stream.
     #[error("binding for epoch {0} is older than the stream's held epochs")]
     Stale(u64),
+    /// A v2 binding naming another codec than the one already bound to its
+    /// stream: one codec per stream for its life.
+    /// A binding for a stream whose signed end this receiver verified: the
+    /// end is final.
+    #[error("the stream ended (a signed end was verified); a return is a new stream")]
+    StreamEnded,
+    #[error("the stream is bound to codecs {held}, not {got}")]
+    CodecChanged {
+        /// The codec map the stream is bound to.
+        held: String,
+        /// The codec map this binding names.
+        got: String,
+    },
 }
 
 impl BindingError {
@@ -452,6 +846,8 @@ impl BindingError {
             Self::NotThePublishersStream(_) => AvAuthRefusal::BindingStreamNotDerived,
             Self::Signature(_) => AvAuthRefusal::BindingSignatureUnverified,
             Self::Stale(_) => AvAuthRefusal::BindingStaleEpoch,
+            Self::CodecChanged { .. } => AvAuthRefusal::BindingCodecChanged,
+            Self::StreamEnded => AvAuthRefusal::BindingStreamEnded,
         }
     }
 }
@@ -496,25 +892,90 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// The members a v2 binding adds to v1's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2Members {
+    /// The stream's codec map (`None`: a stream that declared none; allowed
+    /// only with `replaces` or `end`).
+    pub codecs: Option<CodecMap>,
+    /// The publisher's earlier stream this one replaces in place.
+    pub replaces: Option<StreamId>,
+    /// The publisher's signed word that the stream ends.
+    pub end: Option<SignedEnd>,
+    /// With `end`: the last `chunk_seq` sealed in the epoch.
+    pub final_seq: Option<u64>,
+    /// The stream's kind ([`STREAM_KIND_MEDIA`] by default).
+    pub kind: u8,
+    /// The stream's framing ([`FRAMING_NONE`] by default).
+    pub framing: u8,
+}
+
 impl StreamKeyBinding {
     /// The bytes before the signatures (the encoding's first half).
     fn unsigned_body(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 4 + self.room.len() + self.publisher.len() + 104);
-        out.push(BINDING_VERSION);
+        let mut out = Vec::with_capacity(1 + 4 + self.room.len() + self.publisher.len() + 112);
+        out.push(self.version());
         put_str(&mut out, &self.room);
         put_str(&mut out, &self.publisher);
         out.extend_from_slice(&self.join_nonce);
         out.extend_from_slice(&self.stream.0);
         out.extend_from_slice(&self.epoch.0.to_be_bytes());
         out.extend_from_slice(&self.chunk_key);
+        if self.version() == BINDING_VERSION_V2 {
+            match &self.codecs {
+                Some(codecs) => codecs.encode(&mut out),
+                // An end statement (or a replacement) of a stream that
+                // declared no codecs: an empty map.
+                None => out.push(0),
+            }
+            match self.replaces {
+                Some(old) => {
+                    out.push(1);
+                    out.extend_from_slice(&old.0);
+                }
+                None => out.push(0),
+            }
+            out.push(self.end.map_or(0, SignedEnd::code));
+            if self.end.is_some() {
+                out.extend_from_slice(&self.final_seq.unwrap_or(FINAL_SEQ_NONE).to_be_bytes());
+            }
+            out.push(self.kind);
+            out.push(self.framing);
+        }
         out
+    }
+
+    /// The encoding version: 2 when the binding names a codec, else 1.
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        if self.explicit_v2
+            || self.codecs.is_some()
+            || self.replaces.is_some()
+            || self.end.is_some()
+            || self.kind != STREAM_KIND_MEDIA
+            || self.framing != FRAMING_NONE
+        {
+            BINDING_VERSION_V2
+        } else {
+            BINDING_VERSION
+        }
+    }
+
+    /// The version of an encoded binding (its first byte), without parsing.
+    #[must_use]
+    pub fn version_of(wire: &[u8]) -> Option<u8> {
+        wire.first().copied()
     }
 
     /// The bytes the publisher's hybrid signature covers: a domain tag, then
     /// the unsigned body.
     #[must_use]
     pub fn signed_bytes(&self) -> Vec<u8> {
-        let mut out = BINDING_DOMAIN.to_vec();
+        let mut out = if self.version() == BINDING_VERSION_V2 {
+            BINDING_DOMAIN_V2.to_vec()
+        } else {
+            BINDING_DOMAIN.to_vec()
+        };
         out.extend_from_slice(&self.unsigned_body());
         out
     }
@@ -533,6 +994,35 @@ impl StreamKeyBinding {
         epoch: Epoch,
         chunk_key: [u8; 32],
     ) -> Result<Self, ChunkKeyError> {
+        Self::sign_v2(signer, room, join_nonce, stream, epoch, chunk_key, None).await
+    }
+
+    /// [`Self::sign`] with the v2 members (`Some`: a v2 binding naming the
+    /// codec map, and `replaces` / `end` when set).
+    ///
+    /// # Errors
+    /// As [`Self::sign`].
+    pub async fn sign_v2(
+        signer: &LocalSigner,
+        room: &str,
+        join_nonce: [u8; 32],
+        stream: StreamId,
+        epoch: Epoch,
+        chunk_key: [u8; 32],
+        v2: Option<V2Members>,
+    ) -> Result<Self, ChunkKeyError> {
+        let explicit_v2 = v2.is_some();
+        let (codecs, replaces, end, final_seq, kind, framing) = match v2 {
+            Some(m) => (
+                m.codecs,
+                m.replaces,
+                m.end,
+                m.final_seq.filter(|_| m.end.is_some()),
+                m.kind,
+                m.framing,
+            ),
+            None => (None, None, None, None, STREAM_KIND_MEDIA, FRAMING_NONE),
+        };
         if call_stream_id(room, &signer.key_id, &join_nonce) != stream {
             return Err(ChunkKeyError::Binding(format!(
                 "stream is not {}'s in room {room}",
@@ -548,6 +1038,13 @@ impl StreamKeyBinding {
             chunk_key,
             sig_ed25519: Vec::new(),
             sig_ml_dsa_65: Vec::new(),
+            codecs,
+            replaces,
+            end,
+            final_seq: final_seq.or_else(|| end.map(|_| FINAL_SEQ_NONE)),
+            kind,
+            framing,
+            explicit_v2,
         };
         let (ed_b64, pq_b64) =
             crate::identity::sign_bound_hybrid(signer, &b.signed_bytes(), "stream key binding")
@@ -582,7 +1079,8 @@ impl StreamKeyBinding {
             return Err(BindingError::Malformed("too long"));
         }
         let mut r = Reader(b);
-        if r.array::<1>()?[0] != BINDING_VERSION {
+        let version = r.array::<1>()?[0];
+        if version != BINDING_VERSION && version != BINDING_VERSION_V2 {
             return Err(BindingError::Malformed("version"));
         }
         let room = r.string()?;
@@ -591,6 +1089,33 @@ impl StreamKeyBinding {
         let stream = StreamId(r.array::<32>()?);
         let epoch = Epoch(u64::from_be_bytes(r.array::<8>()?));
         let chunk_key = r.array::<32>()?;
+        let (codecs, replaces, end, final_seq, kind, framing) = if version == BINDING_VERSION_V2 {
+            let codecs = CodecMap::decode(&mut r)?;
+            let replaces = match r.array::<1>()?[0] {
+                0 => None,
+                1 => Some(StreamId(r.array::<32>()?)),
+                _ => return Err(BindingError::Malformed("replaces")),
+            };
+            let end = SignedEnd::from_code(r.array::<1>()?[0])?;
+            let final_seq = match end {
+                Some(_) => Some(u64::from_be_bytes(r.array::<8>()?)),
+                None => None,
+            };
+            // 7e kind: any value (an unknown one renders as media); 7f
+            // framing: the chunk layout, so only a known one.
+            let kind = r.array::<1>()?[0];
+            let framing = r.array::<1>()?[0];
+            if framing > FRAMING_FRAGMENTS {
+                return Err(BindingError::Malformed("framing"));
+            }
+            // v45 — a v2 binding always states its kind and framing, so one
+            // with no map, no replacement and no end still says something:
+            // "framing 0". A v45 publisher signs one for every stream, so a
+            // v2 receiver knows a stream's framing before parsing a chunk.
+            (codecs, replaces, end, final_seq, kind, framing)
+        } else {
+            (None, None, None, None, STREAM_KIND_MEDIA, FRAMING_NONE)
+        };
         let n = r.len16()?;
         let sig_ed25519 = r.take(n)?.to_vec();
         let n = r.len16()?;
@@ -611,6 +1136,13 @@ impl StreamKeyBinding {
             chunk_key,
             sig_ed25519,
             sig_ml_dsa_65,
+            codecs,
+            replaces,
+            end,
+            final_seq,
+            kind,
+            framing,
+            explicit_v2: version == BINDING_VERSION_V2,
         })
     }
 
@@ -865,8 +1397,14 @@ pub struct Bound {
     pub publisher: Arc<str>,
     /// Its chunk key for the epoch.
     pub key: [u8; 32],
-    /// The binding's encoding, to forward.
-    pub wire: Arc<Vec<u8>>,
+    /// The binding's v1 encoding, to forward (`None` when only a v2 one came).
+    pub wire: Option<Arc<Vec<u8>>>,
+    /// Its v2 encoding (it names the codec), to forward to peers that take
+    /// v2.
+    pub wire_v2: Option<Arc<Vec<u8>>>,
+    /// v45 — the epoch's framing, from its v2 binding ([`FRAMING_NONE`]
+    /// while only a v1 one came).
+    pub framing: u8,
 }
 
 /// Why a chunk was refused.
@@ -881,6 +1419,16 @@ pub enum ChunkAuthError {
     /// The trailer does not verify under the stream's bound key.
     #[error("chunk signature does not verify under the stream's bound key")]
     TrailerInvalid,
+    /// The stream's v2 binding names no codec for the chunk's layer class.
+    #[error("the stream's codec map has no entry for the chunk's class")]
+    ClassUnlisted,
+    /// The stream's map names a codec for the class this receiver does not
+    /// know: dropped here, the binding standing.
+    #[error("the stream's codec for the chunk's class is not one this receiver decodes")]
+    ClassUndecodable,
+    /// The chunk's `chunk_seq` is past its stream's signed `final_seq`.
+    #[error("the chunk is past its stream's signed end")]
+    PastEnd,
 }
 
 impl ChunkAuthError {
@@ -891,6 +1439,9 @@ impl ChunkAuthError {
             Self::Unbound => AvAuthRefusal::ChunkUnbound,
             Self::TrailerMissing => AvAuthRefusal::ChunkTrailerMissing,
             Self::TrailerInvalid => AvAuthRefusal::ChunkTrailerInvalid,
+            Self::ClassUnlisted => AvAuthRefusal::ChunkClassUnlisted,
+            Self::ClassUndecodable => AvAuthRefusal::ChunkClassUndecodable,
+            Self::PastEnd => AvAuthRefusal::ChunkPastEnd,
         }
     }
 
@@ -914,6 +1465,14 @@ pub struct ChunkAuthCounts {
     pub bindings_installed: u64,
     /// Bindings refused.
     pub bindings_refused: u64,
+    /// Chunks dropped: their class's codec is one this receiver does not
+    /// know (v45).
+    pub undecodable: u64,
+    /// Chunks refused: past their stream's signed `final_seq` (v45).
+    pub past_end: u64,
+    /// Signed ends whose `final_seq` this receiver never received up to:
+    /// a tail dropped on the way (v45).
+    pub truncated: u64,
 }
 
 #[derive(Default)]
@@ -923,6 +1482,22 @@ struct Held {
     streams: HashMap<Arc<str>, VecDeque<StreamId>>,
     /// Binding ids already verified and installed.
     seen: VecDeque<[u8; 8]>,
+    /// The codec each stream's v2 bindings named: one per stream for its
+    /// life.
+    codecs: HashMap<StreamId, CodecMap>,
+    /// Streams whose signed end was verified: `(epoch, final_seq)`. Kept
+    /// apart from the bound streams (and bounded on its own), so a replayed
+    /// old end can neither evict a live stream nor end a new one.
+    ended: HashMap<StreamId, (u64, u64)>,
+    ended_order: VecDeque<StreamId>,
+    /// Ended streams whose tail never fully arrived.
+    truncated: std::collections::HashSet<StreamId>,
+    /// v45 — streams a verified `replaces` named (still bound for their
+    /// overlap): the first a publisher's newest-streams bound evicts, oldest
+    /// first, so a live stream is never pushed out by replacements.
+    retired: std::collections::HashSet<StreamId>,
+    /// The highest verified `chunk_seq` per `(stream, epoch)`.
+    highest: HashMap<(StreamId, u64), u64>,
 }
 
 /// What a completed binding came to.
@@ -947,6 +1522,9 @@ pub struct ChunkAuth {
     unbound: AtomicU64,
     installed: AtomicU64,
     refused: AtomicU64,
+    undecodable: AtomicU64,
+    past_end: AtomicU64,
+    truncated: AtomicU64,
 }
 
 impl ChunkAuth {
@@ -961,6 +1539,9 @@ impl ChunkAuth {
             unbound: AtomicU64::new(0),
             installed: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            undecodable: AtomicU64::new(0),
+            past_end: AtomicU64::new(0),
+            truncated: AtomicU64::new(0),
         }
     }
 
@@ -979,6 +1560,9 @@ impl ChunkAuth {
             unbound: self.unbound.load(Ordering::Relaxed),
             bindings_installed: self.installed.load(Ordering::Relaxed),
             bindings_refused: self.refused.load(Ordering::Relaxed),
+            undecodable: self.undecodable.load(Ordering::Relaxed),
+            past_end: self.past_end.load(Ordering::Relaxed),
+            truncated: self.truncated.load(Ordering::Relaxed),
         }
     }
 
@@ -998,6 +1582,11 @@ impl ChunkAuth {
         };
         if self.held().seen.contains(&id) {
             return BindingOutcome::Known(binding);
+        }
+        // A signed end is final: a later binding for the stream costs no
+        // hybrid verification and changes nothing.
+        if self.held().ended.contains_key(&binding.stream) {
+            return self.refuse(BindingError::StreamEnded);
         }
         if let Err(e) = binding.check_shape(&self.room, members) {
             return self.refuse(e);
@@ -1036,6 +1625,7 @@ impl ChunkAuth {
     ///
     /// # Errors
     /// [`BindingError::Stale`] for an epoch older than the two held.
+    #[allow(clippy::too_many_lines)] // the install's rules, in order, in one place
     pub(crate) fn install(
         &self,
         binding: &StreamKeyBinding,
@@ -1044,6 +1634,10 @@ impl ChunkAuth {
         let mut held = self.held();
         let stream = binding.stream;
         let epoch = binding.epoch.0;
+        // A signed end is final: no further binding for the stream.
+        if held.ended.contains_key(&stream) {
+            return Err(BindingError::StreamEnded);
+        }
         let mut epochs: Vec<u64> = held
             .bound
             .keys()
@@ -1054,13 +1648,46 @@ impl ChunkAuth {
         if epochs.len() >= 2 && epoch < epochs[epochs.len() - 2] {
             return Err(BindingError::Stale(epoch));
         }
+        // One codec map per stream for its life (CC reading (rc17), pending
+        // text): a v2 binding naming another map than the stream's is
+        // refused, in any epoch. A codec change is a new join nonce, hence a
+        // new stream.
+        if let Some(got) = &binding.codecs {
+            match held.codecs.get(&stream) {
+                Some(held_map) if held_map != got => {
+                    return Err(BindingError::CodecChanged {
+                        held: held_map.to_string(),
+                        got: got.to_string(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    held.codecs.insert(stream, *got);
+                }
+            }
+        }
         let publisher: Arc<str> = Arc::from(binding.publisher.as_str());
+        let v2 = binding.version() == BINDING_VERSION_V2;
+        // The v1 and v2 encodings of one (stream, epoch) bind the same key:
+        // keep both, to forward each to the peers that take it.
+        let (mut wire_v1, mut wire_v2, mut framing) = match held.bound.get(&(stream, epoch)) {
+            Some(b) if b.key == binding.chunk_key => (b.wire.clone(), b.wire_v2.clone(), b.framing),
+            _ => (None, None, FRAMING_NONE),
+        };
+        if v2 {
+            wire_v2 = Some(wire);
+            framing = binding.framing;
+        } else {
+            wire_v1 = Some(wire);
+        }
         held.bound.insert(
             (stream, epoch),
             Bound {
                 publisher: Arc::clone(&publisher),
                 key: binding.chunk_key,
-                wire,
+                wire: wire_v1,
+                wire_v2,
+                framing,
             },
         );
         // The two newest epochs of the stream.
@@ -1070,23 +1697,86 @@ impl ChunkAuth {
         if epochs.len() > 2 {
             for e in &epochs[..epochs.len() - 2] {
                 held.bound.remove(&(stream, *e));
+                held.highest.remove(&(stream, *e));
             }
         }
-        // The publisher's newest streams.
+        // The publisher's newest streams. An ended stream leaves the list (it
+        // is bound only until its verdict, `settle_end`), so ending a share
+        // never pushes out the camera.
+        // A replacement retires the stream it names (the same publisher's).
+        if let Some(old) = binding.replaces.filter(|o| *o != stream) {
+            if held
+                .streams
+                .get(&publisher)
+                .is_some_and(|l| l.contains(&old))
+            {
+                held.retired.insert(old);
+            }
+        }
         let evicted = {
-            let list = held.streams.entry(publisher).or_default();
+            let Held {
+                streams, retired, ..
+            } = &mut *held;
+            let list = streams.entry(publisher).or_default();
             list.retain(|s| *s != stream);
-            list.push_back(stream);
+            if binding.end.is_none() {
+                list.push_back(stream);
+            }
             if list.len() > MAX_STREAMS_PER_PUBLISHER {
-                list.pop_front()
+                // The oldest retired stream goes first; a live one only when
+                // none is retired.
+                let at = list.iter().position(|s| retired.contains(s)).unwrap_or(0);
+                list.remove(at)
             } else {
                 None
             }
         };
         if let Some(old) = evicted {
+            held.retired.remove(&old);
             held.bound.retain(|(s, _), _| *s != old);
+            held.codecs.remove(&old);
+            held.highest.retain(|(s, _), _| *s != old);
+        }
+        // The signed end. Whether its tail arrived is settled later
+        // ([`Self::settle_end`]): chunks up to `final_seq` still in flight
+        // when the end lands are not a truncation.
+        if binding.end.is_some() {
+            let final_seq = binding.final_seq.unwrap_or(FINAL_SEQ_NONE);
+            held.ended.insert(stream, (epoch, final_seq));
+            held.ended_order.push_back(stream);
+            while held.ended_order.len() > ENDED_REMEMBERED {
+                if let Some(old) = held.ended_order.pop_front() {
+                    held.ended.remove(&old);
+                    held.truncated.remove(&old);
+                    held.highest.retain(|(s, _), _| *s != old);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// v45 — the truncation verdict on `stream`'s signed end, taken once
+    /// the reorder window after the end has passed (the caller's clock):
+    /// `true` when this receiver never verified a chunk up to the end's
+    /// `final_seq` (a dropped tail). Only chunks at or below `final_seq`
+    /// count: one past it is refused and never recorded. Counted once per
+    /// stream; `false` for a stream with no verified end, or an end that
+    /// names no tail (`final_seq` none).
+    pub fn settle_end(&self, stream: StreamId) -> bool {
+        let mut held = self.held();
+        let Some((epoch, final_seq)) = held.ended.get(&stream).copied() else {
+            return false;
+        };
+        let got = held.highest.get(&(stream, epoch)).copied();
+        let short = final_seq != FINAL_SEQ_NONE && got.is_none_or(|h| h < final_seq);
+        if short && held.truncated.insert(stream) {
+            self.truncated.fetch_add(1, Ordering::Relaxed);
+        }
+        // Past the verdict nothing of it plays: its keys go. Its highest seq
+        // stays (presence) until the ended set forgets it.
+        held.bound.retain(|(s, _), _| *s != stream);
+        held.codecs.remove(&stream);
+        short
     }
 
     /// The bound key for `(stream, epoch)`, if any.
@@ -1096,15 +1786,71 @@ impl ChunkAuth {
     }
 
     /// Every held binding whose publisher is not `except`, to send on a new
-    /// leg (a relay's).
+    /// leg (a relay's): each v1 encoding, and each v2 one too when the peer
+    /// takes v2 (`v2_ok`).
     #[must_use]
-    pub fn bindings_except(&self, except: &str) -> Vec<Arc<Vec<u8>>> {
+    pub fn bindings_except(&self, except: &str, v2_ok: bool) -> Vec<Arc<Vec<u8>>> {
         self.held()
             .bound
             .values()
             .filter(|b| &*b.publisher != except)
-            .map(|b| Arc::clone(&b.wire))
+            .flat_map(|b| {
+                let v2 = b.wire_v2.clone().filter(|_| v2_ok);
+                b.wire.clone().into_iter().chain(v2)
+            })
             .collect()
+    }
+
+    /// The publishers whose bindings are held, sorted, each once.
+    #[must_use]
+    pub fn publishers(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .held()
+            .bound
+            .values()
+            .map(|b| b.publisher.to_string())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// v45 — `(stream, epoch)`'s framing when its v2 binding is installed;
+    /// `None` while only its v1 binding is (or none).
+    #[must_use]
+    pub fn v2_framing(&self, stream: StreamId, epoch: Epoch) -> Option<u8> {
+        self.held()
+            .bound
+            .get(&(stream, epoch.0))
+            .filter(|b| b.wire_v2.is_some())
+            .map(|b| b.framing)
+    }
+
+    /// v45 — whether any epoch of `stream` is bound here.
+    #[must_use]
+    pub fn is_bound(&self, stream: StreamId) -> bool {
+        self.held().bound.keys().any(|(s, _)| *s == stream)
+    }
+
+    /// Whether this receiver ever verified a chunk of `stream`: its presence,
+    /// which a binding alone never proves (an old `end = 0` binding of a
+    /// stream that has since gone is no attendee).
+    #[must_use]
+    pub fn heard(&self, stream: StreamId) -> bool {
+        self.held().highest.keys().any(|(s, _)| *s == stream)
+    }
+
+    /// Whether `stream`'s signed end named a `final_seq` this receiver never
+    /// received up to (a dropped tail).
+    #[must_use]
+    pub fn truncated(&self, stream: StreamId) -> bool {
+        self.held().truncated.contains(&stream)
+    }
+
+    /// The codec map `stream`'s v2 bindings named, if any came.
+    #[must_use]
+    pub fn codecs_of(&self, stream: StreamId) -> Option<CodecMap> {
+        self.held().codecs.get(&stream).copied()
     }
 
     /// **The per-chunk check**: the chunk's signature (its last
@@ -1149,6 +1895,39 @@ impl ChunkAuth {
         if !ok {
             self.forged.fetch_add(1, Ordering::Relaxed);
             return Err(ChunkAuthError::TrailerInvalid);
+        }
+        {
+            let mut held = self.held();
+            let stream = inner.stream_id();
+            // CC reading (rc17) of 5.3.3.2.1, pending text: a stream that
+            // named its codecs carries only those classes; a class whose
+            // codec this build does not know is dropped here. A v1-only
+            // stream (no map) is not checked: v44 sends video as 0x01 under
+            // v1.
+            if let Some(map) = held.codecs.get(&stream) {
+                match map.class_codec(inner.codec_id()) {
+                    ClassCodec::Absent => {
+                        self.unbound.fetch_add(1, Ordering::Relaxed);
+                        return Err(ChunkAuthError::ClassUnlisted);
+                    }
+                    ClassCodec::Undecodable => {
+                        self.undecodable.fetch_add(1, Ordering::Relaxed);
+                        return Err(ChunkAuthError::ClassUndecodable);
+                    }
+                    ClassCodec::Known(_) => {}
+                }
+            }
+            // Nothing past a signed end plays.
+            let epoch = inner.epoch().0;
+            let seq = inner.chunk_seq().0;
+            if let Some((e, final_seq)) = held.ended.get(&stream).copied() {
+                if e == epoch && (final_seq == FINAL_SEQ_NONE || seq > final_seq) {
+                    self.past_end.fetch_add(1, Ordering::Relaxed);
+                    return Err(ChunkAuthError::PastEnd);
+                }
+            }
+            let h = held.highest.entry((stream, epoch)).or_insert(seq);
+            *h = (*h).max(seq);
         }
         self.verified.fetch_add(1, Ordering::Relaxed);
         Ok((

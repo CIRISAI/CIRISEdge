@@ -93,7 +93,9 @@ for two of the three kinds:
 
 | `n` is… | `IdentityOccurrence` / `TransportDestination` about `n` go to | Ledger |
 |---|---|---|
-| unowned (its own trust subject: the canonical, a bare server) | every peer, as before | — |
+| unowned, and no other identity holds `n` as its occurrence (its own trust subject: the canonical, a bare server) | every peer, as before | — |
+| unowned, held as another identity's occurrence, and **not node-type** (a split-home agent key, a user key) | every peer, as before (a recorded departure, CIRISEdge#897) | — |
+| unowned **node** held as the occurrence of an identity `X` (a person's device whose owner-binding is released, lapsed, or never reached this holder) | `n` itself, `X`, `nodes_owned_by(X)` and `X`'s active occurrences, for each `X` that lists `n` as an active occurrence | `identity_row_occurrence_unowned` |
 | owned and **announced** | every peer, as before | — |
 | owned and **not announced** | `n` itself and `nodes_owned_by(owner_of(n))` — never a stranger, never an unbound requester | `identity_row_node_not_announced` |
 | owner or announce state unreadable (`AmbiguousNodeOwner`, a read error) | `n` itself only (fail-closed) | `identity_row_announce_unresolved` |

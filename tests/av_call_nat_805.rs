@@ -195,24 +195,43 @@ impl Ident {
 }
 
 /// `T`: a bare leviculum transport node with a TCP server and a facilitator.
-async fn transport_node(tcp_port: u16, facilitator_port: u16) -> ReticulumNode {
-    transport_node_ingress(tcp_port, facilitator_port, false).await
+async fn transport_node() -> (ReticulumNode, u16, u16) {
+    transport_node_ingress(false).await
 }
 
-async fn transport_node_ingress(
-    tcp_port: u16,
-    facilitator_port: u16,
-    ingress: bool,
-) -> ReticulumNode {
-    transport_node_limited(tcp_port, facilitator_port, ingress, None).await
+async fn transport_node_ingress(ingress: bool) -> (ReticulumNode, u16, u16) {
+    transport_node_limited(ingress, None).await
 }
 
+/// `T` on ports of its own, with the TCP and facilitator ports it bound.
+///
+/// A port [`free_port`] named can be taken before the bind, by anything on
+/// the host (another test's outbound connection draws from the same range),
+/// so an address in use is a redraw, as in `direct_links_805`.
 async fn transport_node_limited(
+    ingress: bool,
+    announce_rate_target: Option<u32>,
+) -> (ReticulumNode, u16, u16) {
+    let mut left = 8;
+    loop {
+        let (t_port, f_port) = (free_port(), free_udp_port());
+        match try_transport_node(t_port, f_port, ingress, announce_rate_target).await {
+            Ok(node) => return (node, t_port, f_port),
+            Err(e) if left > 0 => {
+                left -= 1;
+                tracing::debug!("T's ports were taken, redrawing: {e}");
+            }
+            Err(e) => panic!("start T: {e}"),
+        }
+    }
+}
+
+async fn try_transport_node(
     tcp_port: u16,
     facilitator_port: u16,
     ingress: bool,
     announce_rate_target: Option<u32>,
-) -> ReticulumNode {
+) -> Result<ReticulumNode, String> {
     let storage = tempfile::tempdir().expect("tempdir");
     // Node-wide: the one setting that reaches the connections a listener spawns.
     let mut builder = ReticulumNodeBuilder::new();
@@ -240,10 +259,10 @@ async fn transport_node_limited(
         .await
         .expect("build T");
     std::mem::forget(storage);
-    node.start().await.expect("start T");
+    node.start().await.map_err(|e| format!("{e:?}"))?;
     let mut rx = node.take_event_receiver().expect("T's events");
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    node
+    Ok(node)
 }
 
 /// One edge node: a TCP client of `T` only.
@@ -287,7 +306,7 @@ async fn side_every(
             signer: Some(key.signer()),
             rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
             resolver: None,
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             blackhole_rules: Some(
                 Arc::clone(dir) as Arc<dyn ciris_persist::federation::BlackholeRules>
             ),
@@ -312,7 +331,7 @@ async fn side_every(
         .signer(key.signer())
         .transport(Arc::clone(&transport) as Arc<dyn ciris_edge::transport::Transport>)
         .config(ciris_edge::EdgeConfig {
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             ..ciris_edge::EdgeConfig::default()
         })
         .build()
@@ -326,7 +345,7 @@ async fn side_every(
         Arc::clone(&table),
         Arc::clone(&transport) as Arc<dyn ScopedDestinationSink>,
         key.key_id.clone(),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
     ));
     let events = transport.subscribe_direct_path_events();
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(256);
@@ -381,9 +400,7 @@ struct Pair {
 async fn pair(tag: &str, facilitated: bool) -> Pair {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let t_port = free_port();
-    let f_port = free_udp_port();
-    let t = transport_node(t_port, f_port).await;
+    let (t, t_port, f_port) = transport_node().await;
     let a_direct = DirectLinksConfig {
         facilitator: facilitated.then(|| format!("127.0.0.1:{f_port}")),
         ..DirectLinksConfig::default()
@@ -421,7 +438,7 @@ async fn pair(tag: &str, facilitated: bool) -> Pair {
     // a loaded box, and by then T's rate limit (grace 5, A announcing every
     // 5 s) has stopped relaying A for an hour. The node that joined late never
     // heard it. A path request is what T still answers.
-    let known = wait_until(Duration::from_secs(60), || async {
+    let known = wait_until(Duration::from_mins(1), || async {
         a.transport.seek_peer(&b.key.key_id).await && b.transport.seek_peer(&a.key.key_id).await
     })
     .await;
@@ -477,6 +494,56 @@ async fn join(side: &Side, group: &CohortGroup, room: &str) -> Result<Call, Call
 
 fn dl(m: &EdgeMetrics, label: &str) -> u64 {
     m.direct_link().get(label).copied().unwrap_or(0)
+}
+
+fn av(m: &EdgeMetrics, label: &str) -> u64 {
+    m.av_plane().get(label).copied().unwrap_or(0)
+}
+
+/// The link MDU leviculum gives a link at `mtu` (`compute_link_mdu`, after
+/// Python's `Link.update_mdu`).
+fn link_mdu_at(mtu: usize) -> usize {
+    use leviculum_core::constants::{
+        AES_BLOCK_SIZE, HEADER_MINSIZE, IFAC_MIN_SIZE, TOKEN_OVERHEAD,
+    };
+    ((mtu - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD) / AES_BLOCK_SIZE) * AES_BLOCK_SIZE - 1
+}
+
+/// leviculum#104 — `from`'s leg to `to` runs at the probed path MTU of the
+/// punched loopback path (its 1400 step), and the call's budget is that leg's
+/// media limit NOW: the datagram limit when the leg rides datagrams, else the
+/// Channel's, less the chunk's wire overhead and source signature. Returns
+/// the budget.
+fn assert_budget_follows_the_leg(call: &Call, from: &Side, to: &Side, datagrams: bool) -> usize {
+    use ciris_edge::transport::av_chunk_auth::CHUNK_TRAILER_LEN;
+    use ciris_edge::transport::link_seal::SEAL_OVERHEAD;
+    use ciris_edge::transport::realtime_av::AV_CHUNK_WIRE_OVERHEAD;
+    let leg = call
+        .leg_link_for_test(&to.key.key_id)
+        .expect("the leg is up");
+    let (channel, datagram) = from
+        .transport
+        .av_link_limits(&leg)
+        .expect("leviculum holds the leg");
+    let mdu = link_mdu_at(1400);
+    assert_eq!(
+        datagram + SEAL_OVERHEAD + 4,
+        mdu,
+        "the leg runs at the probed 1400-byte MTU (leviculum#104), not the base 500"
+    );
+    assert_eq!(
+        channel + SEAL_OVERHEAD + leviculum_core::constants::CHANNEL_ENVELOPE_HEADER_SIZE,
+        mdu
+    );
+    let budget = call.chunk_plaintext_budget().expect("a budget");
+    let limit = if datagrams { datagram } else { channel };
+    assert_eq!(
+        budget,
+        limit - AV_CHUNK_WIRE_OVERHEAD - CHUNK_TRAILER_LEN,
+        "the budget follows the leg's {} limit",
+        if datagrams { "datagram" } else { "Channel" }
+    );
+    budget
 }
 
 fn body(who: &str, seq: u64) -> Vec<u8> {
@@ -541,7 +608,7 @@ async fn a_room_call_behind_t_runs_over_a_punched_interface() {
     let mut b_frames = call_b.frames().expect("B's frames");
 
     // A's leg to B proposed on the identity link; both ends moved.
-    let a_up = tokio::time::timeout(Duration::from_secs(60), async {
+    let a_up = tokio::time::timeout(Duration::from_mins(1), async {
         loop {
             match p.a.events.recv().await {
                 Ok(e @ DirectPathEvent::Established { .. }) => return e,
@@ -582,12 +649,28 @@ async fn a_room_call_behind_t_runs_over_a_punched_interface() {
     // Every leg of the call comes up over it, both ways.
     for (call, who) in [(&call_a, "A"), (&call_b, "B")] {
         assert!(
-            wait_until(Duration::from_secs(60), || async { call.legs().len() == 1 }).await,
+            wait_until(Duration::from_mins(1), || async { call.legs().len() == 1 }).await,
             "{who}'s leg to the other member comes up"
         );
     }
+    // leviculum#102 — both ends run this build, so once each has heard the
+    // other's CAPS its media to it rides unordered datagrams.
+    for (call, other, who) in [(&call_a, &p.b, "A"), (&call_b, &p.a, "B")] {
+        assert!(
+            wait_until(Duration::from_secs(20), || async {
+                call.leg_uses_datagrams(&other.key.key_id) == Some(true)
+            })
+            .await,
+            "{who}'s leg rides datagrams once the other's CAPS arrive"
+        );
+    }
     // CC 5.3.3.5 E1 — the legs ride sealed links: each end keyed what it
-    // dialled and answered what it was dialled.
+    // dialled and answered what it was dialled. Read after the CAPS: a leg is
+    // up once its DIALLER has keyed it, while the responder keys off the event
+    // path (CIRISEdge#947) and only then speaks, so the other's CAPS on a leg
+    // is what proves the responder answered it. (Read right after the legs
+    // came up, the responder's count raced its keying: 1 run in 6 once the
+    // handshake fit one 1400-MTU message, leviculum#104.)
     for (side, who) in [(&p.a, "A"), (&p.b, "B")] {
         let seal = side.metrics.link_seal();
         assert!(
@@ -596,20 +679,279 @@ async fn a_room_call_behind_t_runs_over_a_punched_interface() {
             "{who} keyed its leg and answered the other's: {seal:?}"
         );
     }
-    // The A/V leg is born on the punched interface at the base MTU (Channel
-    // 425 less the 25-byte seal), so the call's budget is that leg's.
-    let budget = call_a.chunk_plaintext_budget().expect("A's budget");
-    assert!(budget > 0 && budget <= 400, "base-MTU budget: {budget}");
+    // leviculum#104 — the leg is born on the punched interface, which probed
+    // the path's MTU (loopback carries the 1400 step), not the base 500, and
+    // the call's budget follows that leg's datagram limit.
+    let budget = assert_budget_follows_the_leg(&call_a, &p.a, &p.b, true);
+    assert!(budget > 400, "past the base-MTU 400: {budget}");
 
+    let sent = av(&p.a.metrics, "av_sent_datagram");
     cross(&mut call_a, "A", &p.a.key.key_id, 0..10, &mut b_frames).await;
     cross(&mut call_b, "B", &p.b.key.key_id, 0..10, &mut a_frames).await;
+    assert_eq!(
+        av(&p.a.metrics, "av_sent_datagram") - sent,
+        10,
+        "each of A's frames left as one datagram: {:?}",
+        p.a.metrics.av_plane()
+    );
+    // A full-budget frame rides one datagram too.
+    let at = call_a
+        .publish(Frame::opaque(vec![0x5a; budget]))
+        .await
+        .expect("the budget fits");
+    assert_eq!(at.delivered(), 1, "a full-budget frame: {:?}", at.legs);
+    let f = tokio::time::timeout(Duration::from_secs(20), b_frames.recv())
+        .await
+        .expect("the full frame in time")
+        .expect("frames open");
+    assert_eq!(f.bytes.len(), budget, "a {budget}-byte frame arrives whole");
+
+    // The host's lever off: legs that come up from now on stay on the
+    // Channel, but this leg keeps its datagrams (one-way per leg).
+    p.a.transport.set_av_datagrams_enabled(false);
+    assert_eq!(
+        p.a.metrics.snapshot().av_datagrams_enabled,
+        0,
+        "the gauge reads it"
+    );
+    assert_eq!(
+        call_a.leg_uses_datagrams(&p.b.key.key_id),
+        Some(true),
+        "an existing leg keeps datagrams"
+    );
 
     // T gone: the call never needed it.
     p.t.stop().await.expect("stop T");
     tokio::time::sleep(Duration::from_millis(500)).await;
+    let sent = av(&p.a.metrics, "av_sent_datagram");
     cross(&mut call_a, "A", &p.a.key.key_id, 10..15, &mut b_frames).await;
+    assert_eq!(
+        av(&p.a.metrics, "av_sent_datagram") - sent,
+        5,
+        "the existing leg still sends datagrams with the lever off"
+    );
     cross(&mut call_b, "B", &p.b.key.key_id, 10..15, &mut a_frames).await;
 
+    call_a.leave().await.expect("A leaves");
+    call_b.leave().await.expect("B leaves");
+}
+
+/// Both members' legs are up and keyed, and each has heard the other's
+/// C3 `CAPS` (so each leg's carrier is settled).
+async fn legs_settled(p: &Pair, call_a: &Call, call_b: &Call) {
+    for (call, who) in [(call_a, "A"), (call_b, "B")] {
+        assert!(
+            wait_until(Duration::from_mins(1), || async { call.legs().len() == 1 }).await,
+            "{who}'s leg to the other member comes up"
+        );
+    }
+    for (call, other, who) in [(call_a, &p.b, "A"), (call_b, &p.a, "B")] {
+        assert!(
+            wait_until(Duration::from_secs(20), || async {
+                call.alm_c3_peers().contains(&other.key.key_id)
+            })
+            .await,
+            "{who} heard the other's CAPS"
+        );
+    }
+}
+
+/// leviculum#102 **fallback** — B runs a build that predates datagrams (its
+/// CAPS leave out `CAP_LINK_DATAGRAMS`). A's media to B stays on the Channel,
+/// every frame counted as a fallback and none sent as a datagram, and the
+/// budget follows the Channel; B's media to A, whose CAPS carry the bit, rides
+/// datagrams. Frames cross both ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_member_on_an_older_build_gets_its_media_on_the_channel() {
+    use ciris_edge::transport::realtime_av_alm::controller::wire::CAP_LINK_DATAGRAMS;
+    let p = pair("e4-old", true).await;
+    p.b.transport
+        .set_av_caps_withheld_for_test(CAP_LINK_DATAGRAMS);
+    let mut call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A joins");
+    let mut call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B joins");
+    let mut a_frames = call_a.frames().expect("A's frames");
+    let mut b_frames = call_b.frames().expect("B's frames");
+    legs_settled(&p, &call_a, &call_b).await;
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            call_b.leg_uses_datagrams(&p.a.key.key_id) == Some(true)
+        })
+        .await,
+        "B's leg to A, whose CAPS carry the bit, rides datagrams"
+    );
+    assert_eq!(
+        call_a.leg_uses_datagrams(&p.b.key.key_id),
+        Some(false),
+        "A's leg to B, whose CAPS leave the bit out, does not"
+    );
+    assert_budget_follows_the_leg(&call_a, &p.a, &p.b, false);
+    assert_budget_follows_the_leg(&call_b, &p.b, &p.a, true);
+
+    let (a_dg, a_fb) = (
+        av(&p.a.metrics, "av_sent_datagram"),
+        av(&p.a.metrics, "av_sent_datagram_fallback"),
+    );
+    let (b_dg, b_fb) = (
+        av(&p.b.metrics, "av_sent_datagram"),
+        av(&p.b.metrics, "av_sent_datagram_fallback"),
+    );
+    let a_timed = av(&p.a.metrics, "av_sent_timed");
+    cross(&mut call_a, "A", &p.a.key.key_id, 0..10, &mut b_frames).await;
+    cross(&mut call_b, "B", &p.b.key.key_id, 0..10, &mut a_frames).await;
+    assert_eq!(
+        (
+            av(&p.a.metrics, "av_sent_datagram") - a_dg,
+            av(&p.a.metrics, "av_sent_datagram_fallback") - a_fb
+        ),
+        (0, 10),
+        "A sent B no datagram and counted each Channel frame as a fallback: {:?}",
+        p.a.metrics.av_plane()
+    );
+    assert_eq!(
+        av(&p.a.metrics, "av_sent_timed") - a_timed,
+        10,
+        "the fallback is the timed Channel frame (B's CAPS still say it takes them)"
+    );
+    assert_eq!(
+        (
+            av(&p.b.metrics, "av_sent_datagram") - b_dg,
+            av(&p.b.metrics, "av_sent_datagram_fallback") - b_fb
+        ),
+        (10, 0),
+        "B's frames to A rode datagrams: {:?}",
+        p.b.metrics.av_plane()
+    );
+    call_a.leave().await.expect("A leaves");
+    call_b.leave().await.expect("B leaves");
+}
+
+/// leviculum#102 **the host's lever** — B's host turned datagrams off before
+/// its call: B's CAPS leave the bit out (so A's media to B stays on the
+/// Channel) and B sends none on its own new leg either, although A's CAPS
+/// carry the bit. The gauge reads 0 on B and 1 on A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn the_datagram_lever_off_keeps_new_legs_on_the_channel() {
+    let p = pair("e4-lever", true).await;
+    assert_eq!(p.b.metrics.snapshot().av_datagrams_enabled, 1, "default on");
+    p.b.transport.set_av_datagrams_enabled(false);
+    assert_eq!(p.b.metrics.snapshot().av_datagrams_enabled, 0);
+    assert_eq!(p.a.metrics.snapshot().av_datagrams_enabled, 1);
+    let mut call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A joins");
+    let mut call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B joins");
+    let mut a_frames = call_a.frames().expect("A's frames");
+    let mut b_frames = call_b.frames().expect("B's frames");
+    legs_settled(&p, &call_a, &call_b).await;
+    assert_eq!(call_a.leg_uses_datagrams(&p.b.key.key_id), Some(false));
+    assert_eq!(call_b.leg_uses_datagrams(&p.a.key.key_id), Some(false));
+    let before = [&p.a, &p.b].map(|s| {
+        (
+            av(&s.metrics, "av_sent_datagram"),
+            av(&s.metrics, "av_sent_datagram_fallback"),
+        )
+    });
+    cross(&mut call_a, "A", &p.a.key.key_id, 0..10, &mut b_frames).await;
+    cross(&mut call_b, "B", &p.b.key.key_id, 0..10, &mut a_frames).await;
+    for (side, (dg, fb), who) in [(&p.a, before[0], "A"), (&p.b, before[1], "B")] {
+        assert_eq!(
+            (
+                av(&side.metrics, "av_sent_datagram") - dg,
+                av(&side.metrics, "av_sent_datagram_fallback") - fb
+            ),
+            (0, 10),
+            "{who}'s media rode the Channel: {:?}",
+            side.metrics.av_plane()
+        );
+    }
+    call_a.leave().await.expect("A leaves");
+    call_b.leave().await.expect("B leaves");
+}
+
+/// leviculum#102 — a datagram the sender numbered and this node never saw (a
+/// shed, or a lossy path) is never sent again, and the hop resyncs past it.
+/// B loses more of A's datagrams than the hop counter's resync slack covers,
+/// so only the sequence gap reported to the hop lets B open the next frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_lost_datagram_is_never_resent_and_the_hop_resyncs_past_it() {
+    use ciris_edge::transport::realtime_av_dispatcher::HOP_COUNTER_RESYNC_SLACK;
+    let lost = HOP_COUNTER_RESYNC_SLACK + 4;
+    let p = pair("e4-loss", true).await;
+    let mut call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A joins");
+    let mut call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B joins");
+    let mut b_frames = call_b.frames().expect("B's frames");
+    legs_settled(&p, &call_a, &call_b).await;
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            call_a.leg_uses_datagrams(&p.b.key.key_id) == Some(true)
+        })
+        .await,
+        "A's leg to B rides datagrams"
+    );
+    // The hop has a newest datagram to measure the gap from.
+    cross(&mut call_a, "A", &p.a.key.key_id, 0..5, &mut b_frames).await;
+
+    let sent = av(&p.a.metrics, "av_sent_datagram");
+    p.b.transport.lose_next_datagrams_for_test(lost);
+    let total = lost + 10;
+    for seq in 5..5 + total {
+        let mut delivered = false;
+        for _ in 0..50 {
+            let r = call_a
+                .publish(Frame::opaque(body("A", seq)))
+                .await
+                .expect("publish");
+            if r.delivered() == 1 {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(delivered, "A's frame {seq} left on its one leg");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut got = Vec::new();
+    while got.len() < 10 {
+        let f = tokio::time::timeout_at(deadline, b_frames.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the frames past the gap open at B: got {}; B {:?}",
+                    got.len(),
+                    p.b.metrics.av_plane()
+                )
+            })
+            .expect("frames open");
+        got.push(f.bytes);
+    }
+    let want: Vec<Vec<u8>> = (5 + lost..5 + total).map(|s| body("A", s)).collect();
+    assert_eq!(
+        got, want,
+        "the frames past the gap, byte-identical and in order"
+    );
+    assert_eq!(
+        av(&p.a.metrics, "av_sent_datagram") - sent,
+        total,
+        "A sent each frame once and never again"
+    );
+    assert_eq!(
+        av(&p.b.metrics, "av_inbound_datagram_gap"),
+        lost,
+        "B reported the gap to the hop: {:?}",
+        p.b.metrics.av_plane()
+    );
+    let leg = call_a.leg_link_for_test(&p.b.key.key_id).expect("A's leg");
+    let at_b =
+        p.b.transport
+            .av_link_datagram_stats(&leg)
+            .expect("B holds A's leg");
+    assert_eq!(at_b.replayed, 0, "nothing was sent twice: {at_b:?}");
+    // The lost frames never come back.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), b_frames.recv())
+            .await
+            .is_err(),
+        "no lost frame arrives later"
+    );
     call_a.leave().await.expect("A leaves");
     call_b.leave().await.expect("B leaves");
 }
@@ -699,8 +1041,7 @@ const LIMITER_ARMED: Duration = Duration::from_secs(12);
 async fn late_join(tag: &str) -> LateJoin {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (t_port, f_port) = (free_port(), free_udp_port());
-    let t = transport_node(t_port, f_port).await;
+    let (t, t_port, _) = transport_node().await;
     let key_a = Ident::new(&format!("node-a-{tag}"), 0x3a).await;
     let key_b = Ident::new(&format!("node-b-{tag}"), 0x3b).await;
     let records = vec![key_a.record().await, key_b.record().await];
@@ -863,11 +1204,10 @@ async fn late_joiner_measure() {
     let ingress = env_secs("LATE_INGRESS", 0) == 1;
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (t_port, f_port) = (free_port(), free_udp_port());
     let target = u32::try_from(env_secs("LATE_TARGET", 0))
         .ok()
         .filter(|t| *t > 0);
-    let t = transport_node_limited(t_port, f_port, ingress, target).await;
+    let (t, t_port, _) = transport_node_limited(ingress, target).await;
     let key_a = Ident::new("node-a-late", 0x3a).await;
     let key_b = Ident::new("node-b-late", 0x3b).await;
     let (id_a, id_b) = (key_a.key_id.clone(), key_b.key_id.clone());
@@ -932,8 +1272,7 @@ async fn fresh_interface_burst_measure() {
     let (n, budget) = (env_secs("BURST_N", 12), env_secs("BURST_BUDGET", 150));
     let ingress = env_secs("BURST_INGRESS", 1) == 1;
     init_tracing();
-    let (t_port, f_port) = (free_port(), free_udp_port());
-    let t = transport_node_ingress(t_port, f_port, ingress).await;
+    let (t, t_port, _) = transport_node_ingress(ingress).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{t_port}").parse().unwrap();
     let client = || async {
         let storage = tempfile::tempdir().expect("tempdir");

@@ -211,7 +211,7 @@ fn auth(signer: Arc<LocalSigner>, dir: &Arc<SqliteBackend>) -> ReticulumAuth {
         signer: Some(signer),
         rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         // The operator deny-list (persist V052), so the A/V dial's blackhole
         // rule is exercised against a real store.
         blackhole_rules: Some(Arc::clone(dir) as Arc<dyn ciris_persist::federation::BlackholeRules>),
@@ -297,7 +297,7 @@ async fn side(
         Arc::clone(&table),
         Arc::clone(&transport) as Arc<dyn ScopedDestinationSink>,
         key.key_id.clone(),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
     ));
     let runtime = Arc::new(
         ReplicationRuntime::start(
@@ -309,7 +309,7 @@ async fn side(
             }],
             ReplicationRuntimeConfig {
                 scheduler: SchedulerConfig {
-                    cadence: Duration::from_secs(3600),
+                    cadence: Duration::from_hours(1),
                     round_timeout: Duration::from_secs(15),
                     ..SchedulerConfig::default()
                 },
@@ -367,7 +367,7 @@ fn build_edge(
         .signer(key.signer())
         .transport(Arc::clone(transport) as Arc<dyn Transport>)
         .config(ciris_edge::EdgeConfig {
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             ..ciris_edge::EdgeConfig::default()
         })
         .build()
@@ -462,7 +462,7 @@ async fn pair(tag: &str) -> Pair {
     let a = side(key_a, a_dir, transport_a, metrics_a, &peer_of_a).await;
     let b = side(key_b, b_dir, transport_b, metrics_b, &peer_of_b).await;
 
-    let known = wait_until(Duration::from_secs(60), || async {
+    let known = wait_until(Duration::from_mins(1), || async {
         a.transport.knows_peer(&b.key.key_id).await && b.transport.knows_peer(&a.key.key_id).await
     })
     .await;
@@ -942,14 +942,14 @@ async fn av_chunks_ride_the_replicating_node_805() {
     // Replication completed unaffected.
     replication.await.expect("replication task");
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             holds_all(&p.b.dir, &ids).await
         })
         .await,
         "B admits A's identity-plane rows while the call runs"
     );
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             if completed_rounds(&p.a.metrics) >= 1 {
                 return true;
             }
@@ -1142,7 +1142,7 @@ async fn a_quiet_av_link_is_reaped_and_a_live_one_is_not_853() {
             .expect("live frame");
         tokio::time::sleep(Duration::from_millis(250)).await;
         tick += 1;
-        if tick % 4 == 0 {
+        if tick.is_multiple_of(4) {
             reaped += p.b.transport.reap_idle_inbound_links().await;
         }
     }

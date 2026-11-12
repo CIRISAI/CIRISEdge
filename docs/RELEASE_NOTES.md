@@ -1,5 +1,96 @@
 # CIRISEdge Release Notes
 
+# v45.0.0 — video in room calls, the fewest store reads, a late joiner's history, exact pins
+
+**2026-11-10.** **MAJOR.** Pins: persist v61.2.2 (exact, Python too), CIRISVerify v22.2.0
+(rusqlite 0.41.1 / libsqlite3-sys 0.39.1, RUSTSEC-2026-0459 cleared), leviculum v0.34.0+ciris.3.
+MSRV 1.92.
+
+**Consumer notes** (detail in CHANGELOG.md):
+- **BREAKING: exact persist pin, `ciris-persist==61.2.2`.** Edge loads only the persist capsule it
+  was built against (capsules are named `@<persist version>` since CIRISPersist#1242); any other
+  wheel is refused at `init_edge_runtime` with `capsule_version_skew`. A server pins the same
+  version.
+- **BREAKING: `hybrid_policy` accepts `"strict"` only** (CIRISEdge#957); anything else is
+  `verify_policy_violation`.
+- **BREAKING: `membership::WidenOutcome::NeedsCosign`.** A widening one voice short of the room's
+  protocol is this outcome, not an `Err`; an exhaustive match adds the arm. Counts wait on
+  CIRISPersist#1250.
+- **BREAKING: the bundle path is on by default (#881, CIRISEdge#971).**
+  `enable_bundle_bootstrap_peers` is gone; opt out with `disable_bundle_bootstrap_peers: true`. A
+  default node asks each held bundle seat for its required set by subject Pull, never a whole-plane
+  diff.
+- **`Edge::arm_room_groups` (CIRISEdge#970)** arms room groups once on a running Edge, so calls work
+  on agent-hosted nodes.
+- **The fewest store reads (CIRISEdge#971).** An idle round reads nothing: the receive diff answers
+  from an in-memory holdings index, key-plane listings are cached under a per-listing read budget,
+  and every edge store read names its caller (CIRISPersist#1235). Levers:
+  `BridgeConfig::holdings_index` (env `CIRIS_EDGE_HOLDINGS_INDEX=0`), `holdings_audit_every`,
+  `feed_probe_spacing`. Gauges: the `holdings_index.*`, `holdings_index_gauge.*`,
+  `sweep_permits.<site>`, `bundle_pull.*` and `replication_reach` families.
+- **A host that writes to the store behind edge must follow the write with a kick
+  (`round_now`/`round_now_all`) or `note_local_write(s)`, or its rows reach peers up to 5 s
+  later; use `note_local_write(s)` where decision-row events matter** (CIRISEdge#971, the feed's
+  probe spacing).
+- **A late joiner gets its groups' history** (CIRISEdge#968), and the #968 contact waits A and B
+  are gone (a local write reaches the next round; a dropped first round is asked again soon).
+- **A named shaping class is the device, not the opt-in** (CIRISEdge#969): `home` / `phone-*`
+  shape layer links only unless `shaping_opt_in` (or `shaping_opt_in_cellular`) is `True`;
+  `shaping_set_device_state` keeps an opt-in the call leaves out.
+- **A/V media rides unordered datagrams** (leviculum#102), with the node-wide lever
+  `set_av_datagrams_enabled` (default on, gauge `av_datagrams_enabled`).
+- **A node that is someone's occurrence and has no owner-binding at the holder is no longer
+  listed to strangers** (CIRISEdge#971, CC 5.4.6). Its `IdentityOccurrence` and
+  `TransportDestination` rows reach the node itself, the identity it is an active occurrence of,
+  that identity's owned nodes and that identity's other active occurrences. Anyone else is booked
+  the new withhold token `identity_row_occurrence_unowned`. Agent and user keys are not narrowed
+  (CIRISEdge#897). A host that reads the withhold ledger by token must add this one. A node whose
+  route should be public needs its owner's announce (`POST /v1/federation/announce`).
+- **A host that drives its own `InboundRouter`** now gets the #968 re-ask: a round whose reply was
+  dropped unattributed runs again when the peer attributes.
+
+- **Room calls carry video (the call series; AV_ALM_DESIGN).**
+  - Frames larger than one chunk (keyframes, P-frames) are split before sealing and reassembled
+    whole by receivers: at most 4096 fragments and 1 MiB per frame, reassembled per (stream,
+    layer); a partial frame is never handed out. `Call::publish` no longer refuses ordinary video
+    frames; a frame over 1 MiB, or over the budget on an unframed stream, still raises
+    `frame_too_large`.
+  - A host declares its codecs at join (`codecs=["h264","opus"]`); the registered tokens are `av1`,
+    `h264` and `opus`.
+  - Screen sharing is a second stream: `add_stream(codecs)` returns its `stream_id`,
+    `publish_on(stream_id, ...)` sends on it and `end_stream(stream_id)` ends it (signing end = 3,
+    never a leave). A sharing phone can background its camera with
+    `end_stream(stream_id(), "backgrounded")`. At most 3 own streams at once.
+  - **BREAKING for hosts that map call events by kind:** new `stream_added` (`stream_kind` 0 media,
+    1 share), `stream_ended` (cause `ended` / `left` / `backgrounded`) and `stream_replaced`;
+    `attendee_left` now fires only on a member's last stream with a leave, or on lost / removed.
+  - New on `Call`: `leave(cause=)`, `replace_stream(codecs=)`, `leg_info()` (path, MDU and frame
+    budget per leg); `request_layers(stream, (s, t, q))` exists behind a lever that is off by
+    default.
+  - The ALM relay controller measures its uplink from delivered bytes (AV_ALM_DESIGN §5.1) and
+    raises a learned ceiling by one stream per clean window, so relay-on rooms no longer
+    over-commit at media start.
+  - Wire: every stream signs a v2 key binding (codec map, kind, framing, replaces, end 0-3,
+    final_seq); v1 is still sent for older peers. A v44 publisher's video reached only through a
+    relay is held, then dropped, at v45 receivers (counted `av_frame_framing_unknown`); its audio
+    plays.
+- **leviculum v0.34.0+ciris.3:** `LinkHandle::try_send_seq` (and `NodeCore::send_on_link_seq`)
+  returns the Channel sequence a message went out under, and the new `LinkSeqStats` (via
+  `ReticulumNode::link_seq_stats`: `last_sent_sequence`, `oldest_unacked_sequence`,
+  `delivered_through(seq)`) proves that message and everything before it were delivered; edge uses
+  it for the leave / replace / end_stream bindings. `LinkStats` is unchanged, there is no wire
+  change, and the `send_on_link` error mapping is unchanged.
+
+**Known limits:**
+- A round started before a peer's replies can be attributed still waits out its 15 s timeout, once
+  per new device (CIRISEdge#977).
+- A row released at a node that only responds on that plane is asked for again only when the
+  offering peer next lists it (CIRISEdge#978).
+- A device's owner Pull to a bundle seat delivers a sibling node's occurrence only once the seat
+  holds the device's root acceptance and the device holds the owner's binding of that sibling. Both
+  are Attestation-plane rows the bundle Pulls do not carry; they arrive by the consent path
+  (CIRISEdge#979).
+
 # v44.1.2 — FountainHoldingClaim retired from the wire
 
 **2026-11-09.** **PATCH** on the LTS line. Pins are unchanged from v44.1.1: persist v61.0.5,

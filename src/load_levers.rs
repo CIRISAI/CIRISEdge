@@ -43,7 +43,7 @@ pub const RAISE_STEP: Duration = Duration::from_secs(10);
 /// every coordinator takes one interval at each step on the way down.
 pub const RELEASE_STEP: Duration = Duration::from_secs(30);
 /// The longest lease a pull can hold. A host renews; it never sets and leaves.
-pub const LEASE_MAX: Duration = Duration::from_secs(300);
+pub const LEASE_MAX: Duration = Duration::from_mins(5);
 /// The smallest Attestation page the `page` lever leaves: fewer rows than this
 /// would cost more rounds than it saved.
 pub const PAGE_FLOOR: u32 = 32;
@@ -434,7 +434,7 @@ mod tests {
         let levers = LoadLevers::default();
         levers.set_steps(Duration::ZERO, Duration::ZERO);
         for _ in 0..8 {
-            levers.pull(ShedLever::Bulk, 200, Duration::from_secs(86_400));
+            levers.pull(ShedLever::Bulk, 200, Duration::from_hours(24));
         }
         assert_eq!(levers.level(ShedLever::Bulk), MAX_LEVEL);
         let s = levers.status();
@@ -527,8 +527,8 @@ mod tests {
     fn every_move_is_said_with_its_cause() {
         let levers = LoadLevers::default();
         levers.set_steps(Duration::ZERO, Duration::ZERO);
-        levers.pull(ShedLever::Walk, 1, Duration::from_secs(60));
-        levers.pull(ShedLever::Walk, 0, Duration::from_secs(60));
+        levers.pull(ShedLever::Walk, 1, Duration::from_mins(1));
+        levers.pull(ShedLever::Walk, 0, Duration::from_mins(1));
         assert_eq!(levers.level(ShedLever::Walk), 0);
         let c = levers.changes();
         assert_eq!(c.get("walk:host"), Some(&1));

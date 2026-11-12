@@ -294,7 +294,7 @@ async fn node_on(
             signer: Some(key.signer()),
             rooting: Some(Arc::clone(&dir) as Arc<dyn RootingDirectory>),
             resolver: None,
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             blackhole_rules: Some(
                 Arc::clone(&dir) as Arc<dyn ciris_persist::federation::BlackholeRules>
             ),
@@ -319,7 +319,7 @@ async fn node_on(
         .signer(key.signer())
         .transport(Arc::clone(&transport) as Arc<dyn ciris_edge::transport::Transport>)
         .config(ciris_edge::EdgeConfig {
-            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            hybrid_policy: ciris_edge::HybridPolicy::Strict,
             ..ciris_edge::EdgeConfig::default()
         })
         .build()
@@ -333,7 +333,7 @@ async fn node_on(
         Arc::clone(&table),
         Arc::clone(&transport) as Arc<dyn ScopedDestinationSink>,
         key.key_id.clone(),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
     ));
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(256);
     let listener = Arc::clone(&transport);
@@ -591,6 +591,8 @@ fn room_of(tag: &str) -> String {
     format!("room-call-{tag}")
 }
 
+// The options are moved into the call (here and in the two helpers below).
+#[allow(clippy::large_types_passed_by_value)]
 async fn join(
     node: &Node,
     group: &CohortGroup,
@@ -601,6 +603,7 @@ async fn join(
     join_recorded(node, group, tag, opts, registrar, None).await
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 async fn join_recorded(
     node: &Node,
     group: &CohortGroup,
@@ -623,7 +626,7 @@ async fn join_recorded(
 }
 
 /// [`join_recorded`] with a chosen roster and owner-binding door.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::large_types_passed_by_value)]
 async fn join_with(
     node: &Node,
     group: &CohortGroup,
@@ -692,6 +695,9 @@ fn counted_loss(nodes: &[Node], calls: &[&Call]) -> u64 {
                 "av_frame_expired_sender",
                 "av_frame_expired_late",
                 "av_frame_stale_dropped",
+                // A chunk of an epoch this node can no longer (or not yet)
+                // derive: dropped and counted, never handed out.
+                "av_call_frame_no_key",
                 "alm_shed",
             ]
             .iter()
@@ -841,7 +847,7 @@ async fn three_member_call(tag: &str) -> bool {
             .any(|p| p.stream == stream && p.standby.as_deref() == Some(c.key.key_id.as_str()))
     };
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             standby_on_c(&call_b, call_a.stream()) && standby_on_c(&call_a, call_b.stream())
         })
         .await,
@@ -1029,6 +1035,19 @@ async fn removed_member_call(tag: &str, leaves: Leaves) -> bool {
         );
         return false;
     }
+    // B hears the pre-roll stream BEFORE the room rolls. A stream's DEK is
+    // derivable only at the room's current epoch (`KeyRing::dek`), and the
+    // previous epoch's is kept only once a chunk has been opened under it. A
+    // loaded B that applied the commit with A's five chunks still queued in
+    // its pump could no longer derive their key and dropped all five
+    // (`av_call_frame_no_key`), which CI saw as "15 wanted, 10 heard".
+    if !collect_from(&mut frames_b, &mut seen_b, &a.key.key_id, 5).await {
+        assert!(
+            counted_loss(&nodes, &[&call_b, &call_c]) > 0,
+            "B lost the pre-roll stream with nothing counting it"
+        );
+        return false;
+    }
     let pre_epoch = call_a.epoch().await;
 
     // The room removes C (A commits, B applies; C's state is left behind).
@@ -1154,7 +1173,7 @@ async fn a_member_cannot_forge_another_members_stream_through_a_relay() {
     }
     // ALM stage 2: C relays A's stream to B once B took it as standby (C3).
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             call_b.alm_parents().iter().any(|p| {
                 p.stream == call_a.stream() && p.standby.as_deref() == Some(c.key.key_id.as_str())
             })
@@ -1657,17 +1676,30 @@ async fn a_room_of_person_leaves_is_called_through_their_nodes() {
     while let Ok(f) = frames_b.try_recv() {
         seen_b.push(f);
     }
-    for (seen, call) in [(&seen_a, &call_a), (&seen_b, &call_b)] {
+    for (seen, call, other) in [
+        (&seen_a, &call_a, &b.key.key_id),
+        (&seen_b, &call_b, &a.key.key_id),
+    ] {
         assert!(
             seen.iter().all(|f| f.publisher != c.key.key_id),
             "a node not bound to a leaf was heard"
         );
         assert!(!call.legs().contains(&c.key.key_id), "a leg to C");
+        // Whose bindings are held: the other member's, and nothing of C's.
         assert_eq!(
-            call.chunk_auth_counts().bindings_installed,
-            1,
-            "only the other member's binding: {:?}",
+            call.bound_publishers_for_test(),
+            vec![other.clone()],
+            "only the other member's bindings: {:?}",
             call.chunk_auth_counts()
+        );
+        // And how many: that member's one stream in its two encodings (v2,
+        // sent first to a node that takes it, then v1). A third would be a
+        // binding nobody in this call signed.
+        let counts = call.chunk_auth_counts();
+        assert_eq!(
+            (counts.bindings_installed, counts.bindings_refused),
+            (2, 0),
+            "the other member's v2 and v1 bindings, no other: {counts:?}"
         );
     }
     assert_eq!(call_a.state(), CallState::Live);

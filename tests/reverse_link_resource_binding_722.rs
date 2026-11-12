@@ -182,7 +182,7 @@ fn auth(signer: Arc<LocalSigner>, dir: &Arc<SqliteBackend>) -> ReticulumAuth {
         signer: Some(signer),
         rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -309,7 +309,7 @@ async fn pair(tag: &str, seed_route_at_b: bool) -> Pair {
             }],
             ReplicationRuntimeConfig {
                 scheduler: SchedulerConfig {
-                    cadence: Duration::from_secs(3600),
+                    cadence: Duration::from_hours(1),
                     round_timeout: Duration::from_secs(15),
                     ..SchedulerConfig::default()
                 },
@@ -353,7 +353,7 @@ async fn pair(tag: &str, seed_route_at_b: bool) -> Pair {
     ];
 
     // Both peers learn each other from the ANNOUNCE (Advisory, owns_key).
-    let known = wait_until(Duration::from_secs(60), || async {
+    let known = wait_until(Duration::from_mins(1), || async {
         transport_b.knows_peer(&key_a.key_id).await && transport_a.knows_peer(&key_b.key_id).await
     })
     .await;
@@ -367,7 +367,7 @@ async fn pair(tag: &str, seed_route_at_b: bool) -> Pair {
             .send(&key_a.key_id, b"round-open-722")
             .await
             .expect("B -> A");
-        tokio::time::timeout(Duration::from_secs(60), a_first.notified())
+        tokio::time::timeout(Duration::from_mins(1), a_first.notified())
             .await
             .expect("A receives B's round-open within 60s");
     }
@@ -542,7 +542,7 @@ async fn resource_and_channel_rows_on_a_reverse_link_both_admit_722() {
     p.a.send(&p.key_b.key_id, &frame_channel)
         .await
         .expect("A -> B over the reverse-path link (Channel fragments)");
-    let landed = wait_until(Duration::from_secs(60), || async {
+    let landed = wait_until(Duration::from_mins(1), || async {
         holds(&p.b_dir, &id_channel).await
     })
     .await;

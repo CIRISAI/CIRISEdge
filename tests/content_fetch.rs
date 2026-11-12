@@ -163,7 +163,7 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
 /// PQC policy.
 fn test_edge_config() -> EdgeConfig {
     EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     }
 }

@@ -28,7 +28,7 @@ fn page_bridge(backend: &Arc<SqliteBackend>) -> FederationDirectoryReplicationBr
         cohort,
         BridgeConfig {
             sweep_page_rows: PAGE,
-            tip_margin: Duration::from_secs(3_600),
+            tip_margin: Duration::from_hours(1),
             ..BridgeConfig::default()
         },
     )
@@ -742,7 +742,7 @@ async fn a_row_written_before_the_peer_connects_arrives() {
         "no `to` index holds it"
     );
     history(&backend).await;
-    let (counting, bridge) = counted_bridge(&backend, Duration::from_secs(3_600));
+    let (counting, bridge) = counted_bridge(&backend, Duration::from_hours(1));
 
     let hash = hash_of(&backend, &invitation.attestation_id).await;
     let first = offer(&bridge, CONTACT).await;
@@ -764,7 +764,7 @@ async fn a_contacts_round_costs_a_bounded_count_of_store_reads() {
     let backend = fixture().await;
     history(&backend).await;
     grant(&backend, CONTACT, &["trace:"]).await;
-    let (counting, bridge) = counted_bridge(&backend, Duration::from_secs(3_600));
+    let (counting, bridge) = counted_bridge(&backend, Duration::from_hours(1));
     for _ in 0..2 {
         offer(&bridge, CONTACT).await;
     }
@@ -914,7 +914,7 @@ async fn a_new_members_roster_moves_on_the_first_round() {
         .expect("read")
         .and_then(|page| page.into_iter().next())
         .expect("the record is a row");
-    let (counting, bridge) = counted_bridge(&backend, Duration::from_secs(3_600));
+    let (counting, bridge) = counted_bridge(&backend, Duration::from_hours(1));
 
     let hash = hash_of(&backend, &roster.attestation_id).await;
     assert!(

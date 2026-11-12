@@ -171,7 +171,7 @@ async fn build_edge(
 ) -> Edge {
     let signer = me.local_signer(tmp.path()).await;
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         ..EdgeConfig::default()
     };
     Edge::builder()

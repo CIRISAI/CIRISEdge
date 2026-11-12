@@ -85,7 +85,7 @@ async fn build_fixture() -> Fixture {
     // Bump max_body_bytes so the larger envelopes (64 KiB raw bytes
     // → ~190 KiB JSON) survive verify-pipeline step 1.
     let config = EdgeConfig {
-        hybrid_policy: HybridPolicy::Ed25519Fallback,
+        hybrid_policy: HybridPolicy::Strict,
         max_body_bytes: 64 * 1024 * 1024, // 64 MiB ceiling for the bench
         ..EdgeConfig::default()
     };

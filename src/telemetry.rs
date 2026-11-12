@@ -237,7 +237,7 @@ pub const EVENT_LOOP_SLOW: Duration = Duration::from_millis(250);
 
 /// `ciris.edge.node.alive` — the event loop and the ladder turned this
 /// recently. Well past a slow handler, so traffic cannot move it.
-pub const NODE_ALIVE_BOUND: Duration = Duration::from_secs(60);
+pub const NODE_ALIVE_BOUND: Duration = Duration::from_mins(1);
 
 /// Fewest links a shaping class holds before its window is published.
 pub const SHAPING_CLASS_FLOOR: usize = 3;
@@ -484,6 +484,7 @@ pub struct TelemetrySnapshot {
     pub forward_packets_per_second: u64,
     pub forward_bits_per_second: u64,
     pub shaping_enabled: u64,
+    pub av_datagrams_enabled: u64,
     pub shaping_links: HashMap<String, u64>,
     pub shaping_free_slots: u64,
     pub shaping_seat_roster_age_seconds: f64,
@@ -498,6 +499,9 @@ pub struct TelemetrySnapshot {
     pub alm_c3_peers: u64,
     pub decision_row_unheard_total: HashMap<String, u64>,
     pub decision_row_subscribers: u64,
+    pub group_backfill_rows_read_total: u64,
+    pub group_backfill_rows_kept_total: u64,
+    pub group_backfill_completed_total: u64,
     pub apply_refusals: HashMap<String, u64>,
     pub loop_last_progress_age_seconds: HashMap<String, f64>,
     pub node_alive: u64,
@@ -571,6 +575,7 @@ pub struct EdgeTelemetry {
     forward_pps: AtomicU64,
     forward_bps: AtomicU64,
     shaping_enabled: AtomicU64,
+    av_datagrams_enabled: AtomicU64,
     shaping_links_counted: AtomicU64,
     shaping_links_seat: AtomicU64,
     shaping_free_slots: AtomicU64,
@@ -586,6 +591,9 @@ pub struct EdgeTelemetry {
     alm_c3_peers: AtomicU64,
     decision_row_unheard: [AtomicU64; DECISION_ROW_KINDS.len()],
     decision_rows: RwLock<Option<DecisionRowSender>>,
+    group_backfill_rows_read: AtomicU64,
+    group_backfill_rows_kept: AtomicU64,
+    group_backfill_completed: AtomicU64,
     moved_to_terminal: AtomicU64,
     refused_then_admitted: Mutex<HashMap<&'static str, u64>>,
     loop_stamps: [AtomicU64; LoopName::COUNT],
@@ -623,6 +631,7 @@ impl Default for EdgeTelemetry {
             forward_pps: AtomicU64::new(0),
             forward_bps: AtomicU64::new(0),
             shaping_enabled: AtomicU64::new(0),
+            av_datagrams_enabled: AtomicU64::new(1),
             shaping_links_counted: AtomicU64::new(0),
             shaping_links_seat: AtomicU64::new(0),
             shaping_free_slots: AtomicU64::new(0),
@@ -637,6 +646,9 @@ impl Default for EdgeTelemetry {
             alm_c3_peers: AtomicU64::new(0),
             decision_row_unheard: arr(),
             decision_rows: RwLock::new(None),
+            group_backfill_rows_read: AtomicU64::new(0),
+            group_backfill_rows_kept: AtomicU64::new(0),
+            group_backfill_completed: AtomicU64::new(0),
             moved_to_terminal: AtomicU64::new(0),
             refused_then_admitted: Mutex::new(HashMap::new()),
             loop_stamps: arr(),
@@ -856,6 +868,20 @@ impl EdgeTelemetry {
         self.forward_bps.store(load.bps as u64, Ordering::Relaxed);
     }
 
+    /// CIRISEdge#968 — one page of a late joiner's group-history backfill:
+    /// `read` rows of the history families, `kept` of them placed in a group
+    /// the peer joined, and whether the backfill reached the end.
+    pub fn record_group_backfill_page(&self, read: u64, kept: u64, finished: bool) {
+        self.group_backfill_rows_read
+            .fetch_add(read, Ordering::Relaxed);
+        self.group_backfill_rows_kept
+            .fetch_add(kept, Ordering::Relaxed);
+        if finished {
+            self.group_backfill_completed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// What the shaped links look like now.
     pub fn set_shaping(&self, enabled: bool, counted: usize, seat: usize, free_slots: u8) {
         self.shaping_enabled
@@ -866,6 +892,13 @@ impl EdgeTelemetry {
             .store(seat as u64, Ordering::Relaxed);
         self.shaping_free_slots
             .store(u64::from(free_slots), Ordering::Relaxed);
+    }
+
+    /// leviculum#102 — whether new A/V legs may use unordered datagrams (the
+    /// host's `set_av_datagrams_enabled` lever).
+    pub fn set_av_datagrams_enabled(&self, enabled: bool) {
+        self.av_datagrams_enabled
+            .store(u64::from(enabled), Ordering::Relaxed);
     }
 
     /// The seat roster was read just now.
@@ -1100,6 +1133,7 @@ impl EdgeTelemetry {
             forward_packets_per_second: self.forward_pps.load(Ordering::Relaxed),
             forward_bits_per_second: self.forward_bps.load(Ordering::Relaxed),
             shaping_enabled: self.shaping_enabled.load(Ordering::Relaxed),
+            av_datagrams_enabled: self.av_datagrams_enabled.load(Ordering::Relaxed),
             shaping_links: HashMap::from([
                 (
                     "counted".to_string(),
@@ -1135,6 +1169,9 @@ impl EdgeTelemetry {
                 &self.decision_row_unheard,
             ),
             decision_row_subscribers: subscribers as u64,
+            group_backfill_rows_read_total: self.group_backfill_rows_read.load(Ordering::Relaxed),
+            group_backfill_rows_kept_total: self.group_backfill_rows_kept.load(Ordering::Relaxed),
+            group_backfill_completed_total: self.group_backfill_completed.load(Ordering::Relaxed),
             apply_refusals,
             node_alive: u64::from(self.alive()),
             loop_last_progress_age_seconds: LoopName::ALL
@@ -1152,7 +1189,7 @@ impl EdgeTelemetry {
 
 fn slow_log() -> &'static crate::log_throttle::LogThrottle {
     static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
-    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(4, Duration::from_secs(60), 64))
+    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(4, Duration::from_mins(1), 64))
 }
 
 /// The class token of a refusal edge could not classify.
@@ -1315,10 +1352,16 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("direct_link", "ciris.edge.direct_link", Counter, Count, closed("reason", obs::DIRECT_LINK_LABELS), "Direct-link attempts and outcomes."),
     spec("peer_binding", "ciris.edge.peer_binding", Counter, Count, closed("reason", obs::PEER_BINDING_LABELS), "Peer binding outcomes."),
     spec("key_plane_sweep", "ciris.edge.key_plane.sweep", Counter, Count, REASON, "Key-plane sweep counts."),
+    spec("sweep_permits", "ciris.edge.sweep_permits", Counter, Count, REASON, "Sweep-gate acquires by the call site that took one (holdings index pages, feed pages, key-plane subject reads, the send-set read, advertise pages, subject Pulls)."),
+    spec("holdings_index", "ciris.edge.holdings_index", Counter, Count, REASON, "Holdings index: answers from the set or a drain, fallbacks, boots, audits, drift both ways, write-throughs, feed probes."),
+    spec("holdings_index_gauge", "ciris.edge.holdings_index.gauge", Gauge, Count, REASON, "Holdings index gauges: set size, status (0 unbooted, 1 booting, 2 ready, 3 suspect), source of the last answer (1 set, 2 drain), last drain milliseconds."),
     spec("persisted_standing", "ciris.edge.persisted_standing", Counter, Count, REASON, "Persisted-standing refresh: passes, pass milliseconds, ticks skipped, passes cut, sweeps and rows walked."),
     spec("link_stall", "ciris.edge.link_stall", Counter, Count, closed("reason", obs::LINK_STALL_LABELS), "Stalled-link guard outcomes."),
     spec("direct_link_upgrade_guarded", "ciris.edge.direct_link.upgrade_guarded", Counter, Count, closed("reason", obs::UPGRADE_GUARDED_LABELS), "Resources kept off a link with an upgrade in flight. `upgrade_guarded_ship` growing steadily means sends keep arriving on links mid-upgrade and waiting; `direct_link_failed_held` in `direct_link` is the wedge this guards, on a peer or a retry the guard cannot see."),
     spec("advertise", "ciris.edge.advertise", Counter, Count, closed("reason", obs::ADVERTISE_LABELS), "The advertise sweep. `advertise_watermark_evicted` growing steadily means the cursor map is thrashing; `advertise_read_failed` is a page whose read failed, with its cursor held."),
+    spec("replication_reach", "ciris.edge.replication.reach", Counter, Count, closed("reason", obs::REPLICATION_REACH_LABELS), "How replication frames reached their peer (on a link the peer opened, or dialled), sends and rounds refused before any seek toward a peer E1 never dials, and the path seeks and requests a dial raised (CIRISEdge#971)."),
+    spec("bundle_pull", "ciris.edge.replication.bundle_pull", Counter, Count, closed("reason", obs::BUNDLE_PULL_LABELS), "Bundle-seat Pull cycles by cause (first contact, timer, host kick, local write), the Pulls they sent by subject (self, seat, owner), Pulls held back by a throttle hint, and answers from no-consent seats by subject kind (self, seat, owner, other) and throttled (CIRISEdge#971 (d))."),
+    spec("initiator_peers", "ciris.edge.replication.initiator_peers", Gauge, Count, closed("source", obs::INITIATOR_PEERS_LABELS), "Distinct peers this node opens replication rounds toward, by source: host (consent), bundle (#881), homed. All zero: this node rounds with nobody (CIRISEdge#971)."),
     spec("direct_links_active", "ciris.edge.direct_links.active", Gauge, Count, None, "Links on a punched interface now."),
     spec("replication_routed_to_responder_total", "ciris.edge.replication.routed.responder", Counter, Count, None, "Frames routed to a responder."),
     spec("replication_routed_to_initiator_total", "ciris.edge.replication.routed.initiator", Counter, Count, None, "Frames routed to an initiator."),
@@ -1394,6 +1437,7 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("forward_packets_per_second", "ciris.edge.forward.packets", Gauge, Count, None, "Packets forwarded per second, over the last reading."),
     spec("forward_bits_per_second", "ciris.edge.forward.bits", Gauge, Count, None, "Bits forwarded per second, over the last reading."),
     spec("shaping_enabled", "ciris.edge.shaping.enabled", Gauge, Count, None, "1 when this node offers shaping. 0 explains a silent `link_shaping` family."),
+    spec("av_datagrams_enabled", "ciris.edge.av.datagrams.enabled", Gauge, Count, None, "1 when new A/V legs may carry media as unordered link datagrams (leviculum#102; the host's `set_av_datagrams_enabled` lever, default on). 0 explains `av_sent_datagram_fallback` on legs whose peer takes datagrams."),
     spec("shaping_links", "ciris.edge.shaping.links", Gauge, Count, closed("kind", SHAPING_LINK_KINDS), "Shaped links: those that count toward the bound, and seat links."),
     spec("shaping_free_slots", "ciris.edge.shaping.free_slots", Gauge, Count, None, "Slots a new peer could take here."),
     spec("shaping_seat_roster_age_seconds", "ciris.edge.shaping.seat_roster.age", Gauge, Seconds, None, "Age of the last roster read that worked. -1: none has."),
@@ -1408,6 +1452,9 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("alm_c3_peers", "ciris.edge.alm.c3_peers", Gauge, Count, None, "Call members that speak C3, across live calls."),
     spec("decision_row_unheard_total", "ciris.edge.decision_row.unheard", Counter, Count, closed("kind", &DECISION_ROW_KINDS), "Decision-row events with no receiver."),
     spec("decision_row_subscribers", "ciris.edge.decision_row.subscribers", Gauge, Count, None, "Receivers of decision-row events now. 0 explains a silent decision-row family."),
+    spec("group_backfill_rows_read_total", "ciris.edge.group_backfill.rows_read", Counter, Count, None, "Rows of the group-history families a join backfill read (CIRISEdge#968). Bounded per round per peer by the `page` lever."),
+    spec("group_backfill_rows_kept_total", "ciris.edge.group_backfill.rows_kept", Counter, Count, None, "Of those, rows placed in a group the peer joined, handed to the gates."),
+    spec("group_backfill_completed_total", "ciris.edge.group_backfill.completed", Counter, Count, None, "Join backfills that read to the end of the history families."),
     spec("apply_refusals", "ciris.edge.apply_refusals", Counter, Count, Some(("state", LabelValues::Tokens)), "`moved_to_terminal` and `refused_then_admitted:<class>`: a refusal's life, not its reason. Every key present at zero."),
     spec("loop_last_progress_age_seconds", "ciris.edge.loop.last_progress_age", Gauge, Seconds, closed("loop", LoopName::TOKENS), "Whole seconds since each loop turned. -1: not running, a parked node included. Stamped on each loop's own cadence, not per event. Not public: a dispatcher busy with a batch turns late."),
     TelemetrySpec { exposure: Exposure::PublicSafe, ..spec("node_alive", "ciris.edge.node.alive", Gauge, Count, None, "1 when the event loop and the ladder both turned within 60 s. A bound this coarse says the node runs and nothing of its traffic: the one field for an unauthenticated route.") },

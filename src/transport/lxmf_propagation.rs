@@ -530,7 +530,7 @@ mod tests {
     // consumers would accept it. Content is opaque to the node.
     fn unstamped(dest_byte: u8, cipher_byte: u8, cipher_len: usize) -> Vec<u8> {
         let mut v = vec![dest_byte; 16];
-        v.extend(std::iter::repeat(cipher_byte).take(cipher_len));
+        v.extend(std::iter::repeat_n(cipher_byte, cipher_len));
         v
     }
 

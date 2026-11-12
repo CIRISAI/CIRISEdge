@@ -429,10 +429,10 @@ async fn replies_of(
         .dimension_any_of(&[ACCEPTANCE_DIMENSION, DECLINE_DIMENSION])
         .pages();
     let mut replied = std::collections::HashSet::new();
-    while let Some(page) = pages
-        .next(directory)
-        .await
-        .map_err(|e| MembershipError::from_persist("list replies", &e))?
+    while let Some(page) =
+        crate::read_caller::scoped(crate::read_caller::Site::Membership, pages.next(directory))
+            .await
+            .map_err(|e| MembershipError::from_persist("list replies", &e))?
     {
         replied.extend(page.into_iter().filter_map(|r| {
             r.attestation_envelope
@@ -546,12 +546,35 @@ pub enum WidenOutcome {
     NotAnAcceptance,
     /// The proposal was issued by someone none of the authorities acts for.
     NotOurs,
+    /// The widening is held back by the room's protocol: persist refused the
+    /// one voice offered with the rule `roster_consensus_insufficient`
+    /// (`ROSTER_CONSENSUS_INSUFFICIENT`), as it does in a `majority` room of
+    /// two or more. Not a refusal of the member: the roster widens once enough
+    /// of the room cosigns the same widening ([`widen_cosigned`]). Edge
+    /// evaluates no quorum (CIRISConstitution#198 §5), so the counts a host
+    /// would show ("have 1, need 2") wait on persist carrying them on the
+    /// typed refusal (tracked: CIRISPersist#1250).
+    NeedsCosign {
+        /// Family or community.
+        scope: GroupScope,
+        /// The group.
+        group_key_id: String,
+        /// The member the widening would seat.
+        member_key_id: String,
+        /// The offered role.
+        role: Option<String>,
+        /// The proposal the acceptance answered.
+        proposal_id: String,
+    },
 }
 
 /// **Step 3: widen on a held acceptance.** When `reply` is an acceptance of a
 /// proposal held here that one of `widener`'s identities issued (compared as
 /// identities, so a proposal a device signed for its person counts), sign the
 /// roster widening naming the invitee at the offered role, now, and put it.
+///
+/// A widening the room's protocol holds back for more voices is
+/// [`WidenOutcome::NeedsCosign`], not an error.
 ///
 /// # Errors
 /// The proposal is not held here (`membership_proposal_unresolved`,
@@ -607,16 +630,35 @@ pub async fn widen_on_acceptance(
         .cloned()
         .ok_or_else(|| MembershipError::NotAProposal(proposal_id.to_owned()))?;
     let role = role_of(&proposal);
-    let added = widen(
+    let added = match widen_cosigned_typed(
         directory,
         scope,
         &group,
         &member,
         role.as_deref(),
         chrono::Utc::now(),
-        authority,
+        &[authority],
     )
-    .await?;
+    .await
+    {
+        Ok(added) => added,
+        // The protocol wants more voices than the one offered: read from the
+        // typed refusal's rule, never its message. Every other refusal stays
+        // an error.
+        Err(WidenRefusal::Door(
+            _,
+            ciris_persist::federation::Error::RosterAuthorityUnauthorized { rule, .. },
+        )) if rule == ciris_persist::federation::ROSTER_CONSENSUS_INSUFFICIENT => {
+            return Ok(WidenOutcome::NeedsCosign {
+                scope,
+                group_key_id: group,
+                member_key_id: member,
+                role,
+                proposal_id: proposal_id.to_owned(),
+            });
+        }
+        Err(e) => return Err(e.into_membership()),
+    };
     Ok(if added {
         WidenOutcome::Widened {
             scope,
@@ -680,10 +722,57 @@ pub async fn widen_cosigned(
     at: chrono::DateTime<chrono::Utc>,
     pens: &[&crate::identity::LocalSigner],
 ) -> Result<bool, MembershipError> {
+    widen_cosigned_typed(
+        directory,
+        scope,
+        group_key_id,
+        member_key_id,
+        role,
+        at,
+        pens,
+    )
+    .await
+    .map_err(WidenRefusal::into_membership)
+}
+
+/// A widening refused, with the roster door's own error kept typed until the
+/// caller has read it ([`widen_on_acceptance`] reads its rule).
+enum WidenRefusal {
+    /// The roster door's refusal, as persist raised it.
+    Door(&'static str, ciris_persist::federation::Error),
+    /// Anything else, already a [`MembershipError`].
+    Edge(MembershipError),
+}
+
+impl From<MembershipError> for WidenRefusal {
+    fn from(e: MembershipError) -> Self {
+        Self::Edge(e)
+    }
+}
+
+impl WidenRefusal {
+    fn into_membership(self) -> MembershipError {
+        match self {
+            Self::Door(what, e) => MembershipError::from_persist(what, &e),
+            Self::Edge(e) => e,
+        }
+    }
+}
+
+/// [`widen_cosigned`], the door's refusal kept typed.
+async fn widen_cosigned_typed(
+    directory: &dyn FederationDirectory,
+    scope: GroupScope,
+    group_key_id: &str,
+    member_key_id: &str,
+    role: Option<&str>,
+    at: chrono::DateTime<chrono::Utc>,
+    pens: &[&crate::identity::LocalSigner],
+) -> Result<bool, WidenRefusal> {
     if pens.is_empty() {
-        return Err(MembershipError::Other(
-            "a widening needs at least one signature".into(),
-        ));
+        return Err(
+            MembershipError::Other("a widening needs at least one signature".into()).into(),
+        );
     }
     match scope {
         // An affiliation widens through the community roster: the same
@@ -707,7 +796,8 @@ pub async fn widen_cosigned(
                 return Err(MembershipError::Other(format!(
                     "room {group_key_id} is not on this directory: a widening names a roster \
                      that must exist to be folded"
-                )));
+                ))
+                .into());
             }
             let member = ciris_persist::federation::types::CommunityMember {
                 key_id: w.member_key_id.clone(),
@@ -728,7 +818,7 @@ pub async fn widen_cosigned(
             directory
                 .add_community_member(group_key_id, member, &spec)
                 .await
-                .map_err(|e| MembershipError::from_persist("widen community", &e))
+                .map_err(|e| WidenRefusal::Door("widen community", e))
         }
         GroupScope::Family => {
             widen_family_cosigned(directory, group_key_id, member_key_id, role, at, pens).await
@@ -745,7 +835,7 @@ async fn widen_family_cosigned(
     role: Option<&str>,
     at: chrono::DateTime<chrono::Utc>,
     pens: &[&crate::identity::LocalSigner],
-) -> Result<bool, MembershipError> {
+) -> Result<bool, WidenRefusal> {
     use crate::replication::attestation_bind::truncate_to_substrate_resolution;
     let already = directory
         .active_family_members(group_key_id)
@@ -793,7 +883,7 @@ async fn widen_family_cosigned(
         )
         .await
         .map(|()| true)
-        .map_err(|e| MembershipError::from_persist("widen family", &e))
+        .map_err(|e| WidenRefusal::Door("widen family", e))
 }
 
 /// The row's `dimension`, if any.

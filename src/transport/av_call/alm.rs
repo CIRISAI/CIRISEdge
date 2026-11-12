@@ -36,7 +36,8 @@ use std::time::{Duration, Instant};
 use crate::load_ladder::ServiceTier;
 use crate::transport::realtime_av::StreamId;
 use crate::transport::realtime_av_alm::controller::wire::{
-    self, encode, encode_caps, CAPS_THIS_BUILD, CAP_C3_V1, CAP_RELAY, CAP_TIMED_FRAMES,
+    self, encode, encode_caps, CAPS_THIS_BUILD, CAP_BINDING_V2, CAP_C3_V1, CAP_LAYER_REQUEST,
+    CAP_LINK_DATAGRAMS, CAP_RELAY, CAP_TIMED_FRAMES,
 };
 use crate::transport::realtime_av_alm::controller::{
     Admission, AdmitDecision, ChunkPos, ControlFrame, ControlMsg, ControllerConfig, DecisionKind,
@@ -173,6 +174,10 @@ pub(super) struct AlmState {
     log: DecisionLog,
     own_stream: StreamId,
     own: Admission<String>,
+    /// v45 — this node's other own streams (a screen share beside the
+    /// camera, `Call::add_stream`): each its own parent-0 admission and
+    /// measured rate, so a share's children and shedding are its own.
+    shares: BTreeMap<StreamId, (Admission<String>, Rate)>,
     relay_capable: bool,
     relays: BTreeMap<StreamId, Admission<String>>,
     sels: BTreeMap<StreamId, ParentSelector<String>>,
@@ -181,7 +186,16 @@ pub(super) struct AlmState {
     /// source. `publisher_of` follows it, and a hello cannot override it.
     bound_publisher: BTreeMap<StreamId, String>,
     caps: BTreeMap<String, u32>,
-    provisional: BTreeMap<String, u64>,
+    /// Test seam — bits this node leaves out of its own `CAPS` (an older
+    /// build's, say). 0 in production.
+    caps_withheld: u32,
+    /// v45 — whether this node takes part in SUBSCRIBE layer caps
+    /// (advertises `CAP_LAYER_REQUEST`, applies a child's cap, sends its
+    /// own). The host's lever; off by default until CC's 5.3.3.2.4 correction.
+    layer_requests: bool,
+    /// C3 members not yet subscribed to one of this node's own streams,
+    /// with since when: `(own stream, member)`.
+    provisional: BTreeMap<(StreamId, String), u64>,
     told_publisher: BTreeSet<StreamId>,
     draining_parent: BTreeMap<StreamId, String>,
     last_primary: BTreeMap<StreamId, Option<String>>,
@@ -206,6 +220,12 @@ pub(super) struct AlmState {
     /// The newest room epoch seen on each stream.
     epochs: BTreeMap<StreamId, u64>,
     video_unavailable: BTreeSet<StreamId>,
+    /// v45 — the layer cap each child's SUBSCRIBE asked this node, as its
+    /// parent, for: `(stream, child)`. Absent: everything.
+    layer_caps: BTreeMap<(StreamId, String), crate::transport::realtime_av::ReceiverLayerPolicy>,
+    /// v45 — the cap this node asks its parents for, per stream: carried on
+    /// every SUBSCRIBE it sends a parent that takes one.
+    wanted_layers: BTreeMap<StreamId, crate::transport::realtime_av::ReceiverLayerPolicy>,
     pub(super) events: Vec<super::CallEvent>,
 }
 
@@ -234,12 +254,15 @@ impl AlmState {
             log: DecisionLog::new(64),
             own_stream,
             own,
+            shares: BTreeMap::new(),
             relay_capable,
             relays: BTreeMap::new(),
             sels: BTreeMap::new(),
             publisher_of: BTreeMap::new(),
             bound_publisher: BTreeMap::new(),
             caps: BTreeMap::new(),
+            caps_withheld: 0,
+            layer_requests: false,
             provisional: BTreeMap::new(),
             told_publisher: BTreeSet::new(),
             draining_parent: BTreeMap::new(),
@@ -259,6 +282,8 @@ impl AlmState {
             booked: BTreeMap::new(),
             epochs: BTreeMap::new(),
             video_unavailable: BTreeSet::new(),
+            layer_caps: BTreeMap::new(),
+            wanted_layers: BTreeMap::new(),
             events: Vec::new(),
         }
     }
@@ -270,12 +295,34 @@ impl AlmState {
 
     /// This node's capability bits.
     pub(super) fn caps_bits(&self) -> u32 {
-        CAPS_THIS_BUILD | if self.relay_capable { CAP_RELAY } else { 0 }
+        let layers = if self.layer_requests {
+            CAP_LAYER_REQUEST
+        } else {
+            0
+        };
+        (CAPS_THIS_BUILD | layers | if self.relay_capable { CAP_RELAY } else { 0 })
+            & !self.caps_withheld
     }
 
-    /// This node's `CAPS` frame.
-    pub(super) fn caps_frame(&self) -> Vec<u8> {
-        encode_caps(self.caps_bits())
+    /// Test seam — leave `bits` out of this node's `CAPS`.
+    pub(super) fn withhold_caps(&mut self, bits: u32) {
+        self.caps_withheld = bits;
+    }
+
+    /// v45 — the host's layer-cap lever (off by default).
+    pub(super) fn set_layer_requests(&mut self, on: bool) {
+        self.layer_requests = on;
+    }
+
+    /// This node's `CAPS` frame. `offer_datagrams` false (the host's
+    /// `set_av_datagrams_enabled(false)`) leaves `CAP_LINK_DATAGRAMS` out.
+    pub(super) fn caps_frame(&self, offer_datagrams: bool) -> Vec<u8> {
+        let off = if offer_datagrams {
+            0
+        } else {
+            CAP_LINK_DATAGRAMS
+        };
+        encode_caps(self.caps_bits() & !off)
     }
 
     /// Whether `peer` said it speaks C3.
@@ -288,6 +335,39 @@ impl AlmState {
         self.caps
             .get(peer)
             .is_some_and(|c| c & CAP_TIMED_FRAMES != 0)
+    }
+
+    /// Whether `peer` parses a v2 stream key binding (`CAP_BINDING_V2`).
+    pub(super) fn takes_binding_v2(&self, peer: &str) -> bool {
+        self.caps.get(peer).is_some_and(|c| c & CAP_BINDING_V2 != 0)
+    }
+
+    /// v45 — whether `peer`'s `CAPS` came and lack `CAP_BINDING_V2`: an
+    /// older build that never signs a v2 binding (so none is in flight).
+    pub(super) fn known_without_binding_v2(&self, peer: &str) -> bool {
+        self.caps.get(peer).is_some_and(|c| c & CAP_BINDING_V2 == 0)
+    }
+
+    /// v45 — whether this node sends `peer` v2 bindings: `peer` takes them
+    /// and this node advertises taking them too (a node that does not, a v44
+    /// build or the test seam's, signs and sends v1 only).
+    pub(super) fn sends_binding_v2_to(&self, peer: &str) -> bool {
+        self.advertises_binding_v2() && self.takes_binding_v2(peer)
+    }
+
+    /// v45 — whether this node advertises `CAP_BINDING_V2` (it takes v2
+    /// bindings, so a framed stream's v2 is sent to it).
+    pub(super) fn advertises_binding_v2(&self) -> bool {
+        self.caps_bits() & CAP_BINDING_V2 != 0
+    }
+
+    /// leviculum#102 — whether `peer` takes media as unordered link
+    /// datagrams. Only a peer whose `CAPS` carried the bit: an older edge (or
+    /// one whose `CAPS` has not arrived) reads as "no".
+    pub(super) fn takes_datagrams(&self, peer: &str) -> bool {
+        self.caps
+            .get(peer)
+            .is_some_and(|c| c & CAP_LINK_DATAGRAMS != 0)
     }
 
     /// The decision log's chained hash (hex).
@@ -338,6 +418,9 @@ impl AlmState {
     pub(super) fn set_members(&mut self, members: &[String]) {
         self.members = members.to_vec();
         self.own.set_members(members.iter().cloned());
+        for (a, _) in self.shares.values_mut() {
+            a.set_members(members.iter().cloned());
+        }
         for a in self.relays.values_mut() {
             a.set_members(members.iter().cloned());
         }
@@ -345,7 +428,7 @@ impl AlmState {
             s.set_members(members.iter().cloned());
         }
         self.caps.retain(|p, _| members.contains(p));
-        self.provisional.retain(|p, _| members.contains(p));
+        self.provisional.retain(|(_, p), _| members.contains(p));
     }
 
     /// The service tier (§7.2): Admit-close on relays at ≥ 1, A-shed (LIFO,
@@ -398,12 +481,16 @@ impl AlmState {
     /// This node's leg to `peer` is gone: it can no longer send it anything,
     /// so `peer` holds no commitment here.
     pub(super) fn on_child_link_down(&mut self, peer: &str) {
+        self.layer_caps.retain(|(_, c), _| c != peer);
         let p = peer.to_owned();
         self.own.release(&p);
+        for (a, _) in self.shares.values_mut() {
+            a.release(&p);
+        }
         for a in self.relays.values_mut() {
             a.release(&p);
         }
-        self.provisional.remove(peer);
+        self.provisional.retain(|(_, c), _| c != peer);
     }
 
     /// The service tier now.
@@ -416,8 +503,14 @@ impl AlmState {
         let first = self.caps.insert(peer.to_owned(), caps).is_none();
         if first && caps & CAP_C3_V1 != 0 && self.members.iter().any(|m| m == peer) {
             let now = self.now_ms();
-            if self.own.role_of(&peer.to_owned()).is_none() {
-                self.provisional.insert(peer.to_owned(), now);
+            let p = peer.to_owned();
+            let unheld: Vec<StreamId> = self
+                .own_admissions()
+                .filter(|(_, a)| a.role_of(&p).is_none())
+                .map(|(s, _)| s)
+                .collect();
+            for s in unheld {
+                self.provisional.insert((s, p.clone()), now);
             }
             self.label(crate::observability::ALM_C3_PEER_CAPABLE);
         }
@@ -428,7 +521,7 @@ impl AlmState {
     /// hello is unsigned, so this is a first guess: a binding overrides it
     /// and it never overrides a binding.
     pub(super) fn note_publisher(&mut self, stream: StreamId, publisher: &str) {
-        if stream == self.own_stream || publisher == self.me {
+        if self.is_own(stream) || publisher == self.me {
             return;
         }
         if !self.bound_publisher.contains_key(&stream) {
@@ -440,7 +533,7 @@ impl AlmState {
     /// A verified binding names `publisher` for `stream`. A stream id is
     /// derived from its publisher, so this cannot change once known.
     pub(super) fn note_bound_publisher(&mut self, stream: StreamId, publisher: &str) {
-        if stream == self.own_stream {
+        if self.is_own(stream) {
             return;
         }
         self.bound_publisher.insert(stream, publisher.to_owned());
@@ -500,36 +593,149 @@ impl AlmState {
         self.egress.on_dropped(now, bytes);
     }
 
-    /// This node published `bytes` of its own stream.
+    /// C1, sender side: `bytes` the uplink's links proved delivered
+    /// (`docs/AV_ALM_DESIGN.md` §5.1).
+    pub(super) fn on_delivered(&mut self, bytes: u64) {
+        let now = self.now_ms();
+        self.egress.on_delivered(now, bytes);
+    }
+
+    /// This node published `bytes` of its own (primary) stream.
+    #[cfg(test)]
     pub(super) fn on_own_published(&mut self, bytes: u64, base_or_audio: bool) {
         self.own_rate.add(bytes, base_or_audio);
     }
 
-    /// The members this node's own chunk must NOT go to, among `legs`: C3
-    /// peers that hold no commitment (and are past the provisional window),
-    /// and standby children for a chunk above the base layer.
+    /// v45 — this node published `bytes` of its own `stream` (the primary
+    /// or a share).
+    pub(super) fn on_own_published_on(
+        &mut self,
+        stream: StreamId,
+        bytes: u64,
+        base_or_audio: bool,
+    ) {
+        if stream == self.own_stream {
+            self.own_rate.add(bytes, base_or_audio);
+        } else if let Some((_, r)) = self.shares.get_mut(&stream) {
+            r.add(bytes, base_or_audio);
+        }
+    }
+
+    /// The members this node's own (primary) chunk must NOT go to, among
+    /// `legs`: C3 peers that hold no commitment (and are past the
+    /// provisional window), and standby children for a chunk above the base
+    /// layer.
+    #[cfg(test)]
     pub(super) fn own_exclude(&self, legs: &[String], base_or_audio: bool) -> Vec<String> {
+        self.own_exclude_on(self.own_stream, legs, base_or_audio)
+    }
+
+    /// v45 — [`Self::own_exclude`] for one of this node's own streams, by
+    /// that stream's own admission. A stream this node does not publish
+    /// excludes every C3 leg.
+    pub(super) fn own_exclude_on(
+        &self,
+        stream: StreamId,
+        legs: &[String],
+        base_or_audio: bool,
+    ) -> Vec<String> {
         let now = self.now_ms();
+        let adm = self.own_admission(stream);
         legs.iter()
             .filter(|p| {
                 if !self.speaks_c3(p) {
                     return false;
                 }
-                match self.own.role_of(p) {
+                let Some(adm) = adm else {
+                    return true;
+                };
+                match adm.role_of(p) {
                     Some(Role::Primary) => false,
                     Some(Role::Standby) => !base_or_audio,
                     None => {
                         let fresh = self
                             .provisional
-                            .get(*p)
+                            .get(&(stream, (*p).clone()))
                             .is_some_and(|t| now.saturating_sub(*t) < PROVISIONAL_MS);
-                        let draining = self.own.is_draining(p);
+                        let draining = adm.is_draining(p);
                         !(fresh || draining)
                     }
                 }
             })
             .cloned()
             .collect()
+    }
+
+    /// v45 — whether `stream` is one of this node's own (the primary or a
+    /// share).
+    pub(super) fn is_own(&self, stream: StreamId) -> bool {
+        stream == self.own_stream || self.shares.contains_key(&stream)
+    }
+
+    /// The admission of this node's own `stream`, if it publishes it.
+    fn own_admission(&self, stream: StreamId) -> Option<&Admission<String>> {
+        if stream == self.own_stream {
+            Some(&self.own)
+        } else {
+            self.shares.get(&stream).map(|(a, _)| a)
+        }
+    }
+
+    fn own_admission_mut(&mut self, stream: StreamId) -> Option<&mut Admission<String>> {
+        if stream == self.own_stream {
+            Some(&mut self.own)
+        } else {
+            self.shares.get_mut(&stream).map(|(a, _)| a)
+        }
+    }
+
+    /// Every own stream's admission, the primary first.
+    fn own_admissions(&self) -> impl Iterator<Item = (StreamId, &Admission<String>)> {
+        std::iter::once((self.own_stream, &self.own))
+            .chain(self.shares.iter().map(|(s, (a, _))| (*s, a)))
+    }
+
+    /// v45 — `Call::add_stream`: this node now also publishes `stream`, a
+    /// parent-0 admission of its own on the same uplink (its commitments
+    /// count against every other admission's room, and theirs against its).
+    /// Every C3 member is provisional on it, so its first chunks reach each
+    /// while that member's selector learns of it.
+    pub(super) fn add_own_stream(&mut self, stream: StreamId) {
+        if self.is_own(stream) {
+            return;
+        }
+        let mut a = Admission::publisher(self.me.clone(), self.cfg.clone(), None);
+        a.set_members(self.members.iter().cloned());
+        let fanout =
+            (self.members.len().saturating_sub(1) as u64).clamp(1, PUBLISHER_INITIAL_FANOUT);
+        a.set_probe_streams(fanout);
+        self.shares.insert(stream, (a, Rate::default()));
+        let now = self.now_ms();
+        let c3: Vec<String> = self
+            .caps
+            .iter()
+            .filter(|(p, c)| *c & CAP_C3_V1 != 0 && self.members.contains(p))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in c3 {
+            self.provisional.insert((stream, p), now);
+        }
+    }
+
+    /// v45 — `Call::end_stream`: this node no longer publishes `stream` (a
+    /// share). Its admission, children's layer caps and provisional marks
+    /// go; the primary is untouched.
+    pub(super) fn remove_own_stream(&mut self, stream: StreamId) {
+        if self.shares.remove(&stream).is_some() {
+            self.provisional.retain(|(s, _), _| *s != stream);
+            self.layer_caps.retain(|(s, _), _| *s != stream);
+        }
+    }
+
+    /// v45 — this node's own streams besides the primary.
+    #[cfg(test)]
+    pub(super) fn share_streams(&self) -> Vec<StreamId> {
+        self.shares.keys().copied().collect()
     }
 
     /// Whether this node forwards `stream`'s chunk `(epoch, seq)` heard from
@@ -604,7 +810,7 @@ impl AlmState {
         base_or_audio: bool,
         hop_lost: u64,
     ) {
-        if stream == self.own_stream {
+        if self.is_own(stream) {
             return;
         }
         let now = self.now_ms();
@@ -653,18 +859,39 @@ impl AlmState {
         }
     }
 
-    fn external_for(&self, stream: Option<StreamId>) -> u64 {
-        let own = if stream.is_none() {
-            0
-        } else {
-            self.own.committed_bps()
-        };
-        own + self
-            .relays
-            .iter()
-            .filter(|(s, _)| Some(**s) != stream)
+    /// What every admission on this uplink but `stream`'s commits (bits/s):
+    /// every own stream's (the primary and each share) and every relayed
+    /// stream's.
+    fn external_except(&self, stream: StreamId) -> u64 {
+        self.own_admissions()
+            .filter(|(s, _)| *s != stream)
             .map(|(_, a)| a.committed_bps())
             .sum::<u64>()
+            + self
+                .relays
+                .iter()
+                .filter(|(s, _)| **s != stream)
+                .map(|(_, a)| a.committed_bps())
+                .sum::<u64>()
+    }
+
+    /// The SUBSCRIBE this node sends `parent` for `stream` in `role`: with
+    /// this node's layer cap for the stream when the parent takes one.
+    fn subscribe_frame(&self, stream: StreamId, parent: &str, role: Role) -> Vec<u8> {
+        let layers = if self.takes_layer_requests(parent) {
+            self.wanted_layers.get(&stream).copied()
+        } else {
+            None
+        };
+        encode(
+            stream,
+            &ControlMsg::Subscribe(SubscribeRequest {
+                subscriber: self.me.clone(),
+                role,
+                forward_capable: self.relay_capable,
+                layers,
+            }),
+        )
     }
 
     fn action_frames(
@@ -672,18 +899,10 @@ impl AlmState {
         stream: StreamId,
         acts: Vec<SelectorAction<String>>,
     ) -> Vec<Outgoing> {
-        let fc = self.relay_capable;
         acts.into_iter()
             .map(|a| match a {
                 SelectorAction::Subscribe { parent, role } => Outgoing {
-                    frame: encode(
-                        stream,
-                        &ControlMsg::Subscribe(SubscribeRequest {
-                            subscriber: self.me.clone(),
-                            role,
-                            forward_capable: fc,
-                        }),
-                    ),
+                    frame: self.subscribe_frame(stream, &parent, role),
                     to: parent,
                 },
                 SelectorAction::Unsubscribe { parent } => Outgoing {
@@ -697,6 +916,26 @@ impl AlmState {
                 },
             })
             .collect()
+    }
+
+    /// A relay admission for a stream this node receives (it has chosen a
+    /// parent for it), when it offers relay. Made on the tick after the
+    /// parent is chosen, and by a SUBSCRIBE that lands before that tick, so
+    /// the ledger answers the request and names its own refusal.
+    fn ensure_relay(&mut self, s: StreamId) {
+        if !self.relay_capable || self.relays.contains_key(&s) {
+            return;
+        }
+        if self.sels.get(&s).is_none_or(|sel| sel.primary().is_none()) {
+            return;
+        }
+        let mut a = Admission::relay(self.me.clone(), self.cfg.clone(), None);
+        let (full, audio) = self.rates.get(&s).cloned().unwrap_or_default().costs();
+        a.set_role_costs(full, audio);
+        a.set_members(self.members.iter().cloned());
+        a.set_admit_closed(!self.tier.admits_new_relay_work());
+        self.relays.insert(s, a);
+        self.sync_upstream(s);
     }
 
     fn sync_upstream(&mut self, stream: StreamId) {
@@ -727,14 +966,22 @@ impl AlmState {
         let mut out = Vec::new();
         match f.msg {
             ControlMsg::Subscribe(req) => {
-                let (decision, preempted) = if stream == self.own_stream {
-                    self.provisional.remove(peer);
-                    let ext = self.external_for(None);
-                    self.own.set_external_committed(ext);
-                    let d = self.own.request(now, &req, &mut self.rng, &mut self.log);
-                    (d, self.own.take_preempted())
+                if !self.is_own(stream) {
+                    self.ensure_relay(stream);
+                }
+                let (decision, preempted) = if self.is_own(stream) {
+                    self.provisional.remove(&(stream, peer.to_owned()));
+                    let ext = self.external_except(stream);
+                    let (mut rng, mut log) = (self.rng.clone(), std::mem::take(&mut self.log));
+                    let a = self.own_admission_mut(stream).expect("own");
+                    a.set_external_committed(ext);
+                    let d = a.request(now, &req, &mut rng, &mut log);
+                    let pre = a.take_preempted();
+                    self.rng = rng;
+                    self.log = log;
+                    (d, pre)
                 } else if self.relays.contains_key(&stream) {
-                    let ext = self.external_for(Some(stream));
+                    let ext = self.external_except(stream);
                     let a = self.relays.get_mut(&stream).expect("present");
                     a.set_external_committed(ext);
                     let d = a.request(now, &req, &mut self.rng, &mut self.log);
@@ -749,6 +996,23 @@ impl AlmState {
                         Vec::new(),
                     )
                 };
+                // v45 — an admitted SUBSCRIBE carries the child's layer cap
+                // (or, without one, withdraws it), for a stream this node
+                // parents.
+                if matches!(decision, AdmitDecision::Admit { .. })
+                    && self.layer_requests
+                    && (self.is_own(stream) || self.relays.contains_key(&stream))
+                {
+                    let key = (stream, peer.to_owned());
+                    match req.layers {
+                        Some(cap) => {
+                            self.layer_caps.insert(key, cap);
+                        }
+                        None => {
+                            self.layer_caps.remove(&key);
+                        }
+                    }
+                }
                 match &decision {
                     AdmitDecision::Admit { .. } => {
                         self.counts.admitted += 1;
@@ -779,10 +1043,13 @@ impl AlmState {
                 }
             }
             ControlMsg::Unsubscribe { .. } => {
+                self.layer_caps.remove(&(stream, peer.to_owned()));
                 let p = peer.to_owned();
-                if stream == self.own_stream {
-                    self.provisional.remove(peer);
-                    self.own.release(&p);
+                if self.is_own(stream) {
+                    self.provisional.remove(&(stream, p.clone()));
+                    if let Some(a) = self.own_admission_mut(stream) {
+                        a.release(&p);
+                    }
                 } else if let Some(a) = self.relays.get_mut(&stream) {
                     a.release(&p);
                 }
@@ -806,7 +1073,7 @@ impl AlmState {
                 self.sync_upstream(stream);
             }
             ControlMsg::Offer(o) => {
-                if stream == self.own_stream || !self.members.iter().any(|m| m == peer) {
+                if self.is_own(stream) || !self.members.iter().any(|m| m == peer) {
                     return out;
                 }
                 if o.depth == 0 {
@@ -832,6 +1099,135 @@ impl AlmState {
             }
         }
         out
+    }
+
+    /// v45 — of `legs`, the children whose SUBSCRIBE layer cap for `stream`
+    /// does not admit a chunk of `codec_id` at `layer`: this node sends them
+    /// nothing of it. Every other child is untouched.
+    pub(super) fn layer_exclude(
+        &self,
+        stream: StreamId,
+        legs: &[String],
+        codec_id: u8,
+        layer: crate::transport::realtime_av::ChunkLayer,
+    ) -> Vec<String> {
+        if self.layer_caps.is_empty() {
+            return Vec::new();
+        }
+        legs.iter()
+            .filter(|l| {
+                self.layer_caps
+                    .get(&(stream, (*l).clone()))
+                    .is_some_and(|cap| {
+                        !crate::transport::realtime_av_alm::controller::layer_cap_admits(
+                            *cap, codec_id, layer,
+                        )
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The publisher a verified binding names for `stream`, if any.
+    pub(super) fn bound_publisher_of(&self, stream: StreamId) -> Option<&str> {
+        self.bound_publisher.get(&stream).map(String::as_str)
+    }
+
+    /// When `stream`'s chunks last arrived on any path (call ms), if ever.
+    pub(super) fn stream_last_activity_ms(&self, stream: StreamId) -> Option<u64> {
+        self.sels
+            .get(&stream)
+            .and_then(ParentSelector::last_activity_ms)
+    }
+
+    /// v45 — `Call::replace_stream`, publisher side: this node's stream is
+    /// now `stream`. The children of the old stream hold the same commitment
+    /// on the new one (one uplink, the same members), and every C3 member is
+    /// provisional again, so the new stream reaches each at once while its
+    /// selector learns the new stream id and asks.
+    pub(super) fn replace_own_stream(&mut self, stream: StreamId) {
+        self.own_stream = stream;
+        let now = self.now_ms();
+        let c3: Vec<String> = self
+            .caps
+            .iter()
+            .filter(|(p, c)| *c & CAP_C3_V1 != 0 && self.members.contains(p))
+            .map(|(p, _)| p.clone())
+            .collect();
+        self.provisional
+            .retain(|(s, _), _| *s == stream || self.shares.contains_key(s));
+        for p in c3 {
+            self.provisional.insert((stream, p), now);
+        }
+        let moved: Vec<(String, crate::transport::realtime_av::ReceiverLayerPolicy)> = self
+            .layer_caps
+            .iter()
+            .filter(|((s, _), _)| *s != stream)
+            .map(|((_, c), cap)| (c.clone(), *cap))
+            .collect();
+        self.layer_caps.retain(|(s, _), _| *s == stream);
+        for (child, cap) in moved {
+            self.layer_caps.insert((stream, child), cap);
+        }
+    }
+
+    /// v45 — a publisher's signed `replaces`: `old` is gone in favour of
+    /// `new`. Forget `old` (its selector, relay admission and meters); a layer
+    /// cap this node asked for `old` carries over to `new`.
+    pub(super) fn forget_replaced_stream(&mut self, old: StreamId, new: StreamId) {
+        self.sels.remove(&old);
+        self.relays.remove(&old);
+        self.rates.remove(&old);
+        self.forwarded_seen.remove(&old);
+        self.min_offset.remove(&old);
+        self.last_primary.remove(&old);
+        self.told_publisher.remove(&old);
+        self.draining_parent.remove(&old);
+        self.failing_over.remove(&old);
+        self.epochs.remove(&old);
+        self.video_unavailable.remove(&old);
+        self.layer_caps.retain(|(s, _), _| *s != old);
+        if let Some(cap) = self.wanted_layers.remove(&old) {
+            self.wanted_layers.insert(new, cap);
+        }
+    }
+
+    /// v45 — ask this node's parents for `stream` for at most `cap` (`None`:
+    /// everything). Kept, and carried on every SUBSCRIBE this node sends a
+    /// parent that takes a cap; the current primary gets a re-SUBSCRIBE now
+    /// (CC 5.3.3.4: the ask rides the tree), when it takes one.
+    pub(super) fn request_layers(
+        &mut self,
+        stream: StreamId,
+        cap: Option<crate::transport::realtime_av::ReceiverLayerPolicy>,
+    ) -> Vec<Outgoing> {
+        match cap {
+            Some(c) => {
+                self.wanted_layers.insert(stream, c);
+            }
+            None => {
+                self.wanted_layers.remove(&stream);
+            }
+        }
+        let parent = self.sels.get(&stream).and_then(|s| s.primary().cloned());
+        parent
+            .filter(|p| self.takes_layer_requests(p))
+            .map(|p| Outgoing {
+                frame: self.subscribe_frame(stream, &p, Role::Primary),
+                to: p,
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Whether `peer` said it takes a SUBSCRIBE layer cap (and this node's
+    /// lever is on).
+    pub(super) fn takes_layer_requests(&self, peer: &str) -> bool {
+        self.layer_requests
+            && self
+                .caps
+                .get(peer)
+                .is_some_and(|c| c & CAP_LAYER_REQUEST != 0)
     }
 
     /// Scale an admission's headroom (measured bits/s of the stream it
@@ -864,6 +1260,12 @@ impl AlmState {
             let (full, audio) = self.own_rate.costs();
             self.own.set_role_costs(full, audio);
         }
+        for (a, r) in self.shares.values_mut() {
+            if r.roll(now) {
+                let (full, audio) = r.costs();
+                a.set_role_costs(full, audio);
+            }
+        }
         // Every relayed stream is priced at its measured rate (the floor
         // until media flows), on the same footing as this node's own.
         for (s, a) in &mut self.relays {
@@ -879,17 +1281,27 @@ impl AlmState {
             let streams: Vec<StreamId> = self.relays.keys().copied().collect();
             let mut shed: Vec<(StreamId, String)> = Vec::new();
             for s in streams {
-                let ext = self.external_for(Some(s));
+                let ext = self.external_except(s);
                 let a = self.relays.get_mut(&s).expect("present");
                 a.set_external_committed(ext);
                 for p in a.on_egress_window(now, &w, &mut self.log) {
                     shed.push((s, p));
                 }
             }
-            let ext = self.external_for(None);
+            let ext = self.external_except(self.own_stream);
             self.own.set_external_committed(ext);
             for p in self.own.on_egress_window(now, &w, &mut self.log) {
                 shed.push((self.own_stream, p));
+            }
+            // v45 — each share sheds by its own commitments.
+            let shares: Vec<StreamId> = self.shares.keys().copied().collect();
+            for s in shares {
+                let ext = self.external_except(s);
+                let (a, _) = self.shares.get_mut(&s).expect("present");
+                a.set_external_committed(ext);
+                for p in a.on_egress_window(now, &w, &mut self.log) {
+                    shed.push((s, p));
+                }
             }
             for (s, p) in shed {
                 self.counts.shed += 1;
@@ -928,17 +1340,7 @@ impl AlmState {
             let sel = &self.sels[&s];
             let primary = sel.primary().cloned();
             let standby = sel.standby().cloned();
-            // A relay admission for every stream this node receives, when it
-            // offers relay.
-            if self.relay_capable && primary.is_some() && !self.relays.contains_key(&s) {
-                let mut a = Admission::relay(self.me.clone(), self.cfg.clone(), None);
-                let (full, audio) = self.rates.get(&s).cloned().unwrap_or_default().costs();
-                a.set_role_costs(full, audio);
-                a.set_members(self.members.iter().cloned());
-                a.set_admit_closed(!self.tier.admits_new_relay_work());
-                self.relays.insert(s, a);
-                self.sync_upstream(s);
-            }
+            self.ensure_relay(s);
             if self.last_primary.get(&s) != Some(&primary) {
                 if self.last_primary.get(&s).is_some_and(Option::is_some) {
                     self.label(crate::observability::ALM_PARENT_CHANGE);
@@ -1001,6 +1403,16 @@ impl AlmState {
             own_offer.forwarder_headroom_bps =
                 self.nominal(own_offer.forwarder_headroom_bps, &self.own_rate);
             let own_frame = encode(self.own_stream, &ControlMsg::Offer(own_offer));
+            let share_frames: Vec<Vec<u8>> = self
+                .shares
+                .iter()
+                .map(|(s, (a, r))| {
+                    let mut o = a.offer();
+                    o.headroom_bps = self.nominal(o.headroom_bps, r);
+                    o.forwarder_headroom_bps = self.nominal(o.forwarder_headroom_bps, r);
+                    encode(*s, &ControlMsg::Offer(o))
+                })
+                .collect();
             let relay_offers: Vec<(StreamId, Vec<String>, Vec<u8>)> = self
                 .relays
                 .iter()
@@ -1025,6 +1437,12 @@ impl AlmState {
                     to: peer.clone(),
                     frame: own_frame.clone(),
                 });
+                for f in &share_frames {
+                    out.push(Outgoing {
+                        to: peer.clone(),
+                        frame: f.clone(),
+                    });
+                }
                 for (_, skip, f) in &relay_offers {
                     if !skip.contains(peer) {
                         out.push(Outgoing {
@@ -1054,11 +1472,20 @@ impl AlmState {
 
     /// Who holds a commitment on this node's own stream, by role.
     pub(super) fn own_children(&self) -> Vec<(String, Role)> {
-        self.own
-            .ledger()
-            .iter()
-            .map(|(p, c)| (p.clone(), c.role))
-            .collect()
+        self.own_children_of(self.own_stream)
+    }
+
+    /// v45 — who holds a commitment on this node's own `stream` (the
+    /// primary or a share), by role.
+    pub(super) fn own_children_of(&self, stream: StreamId) -> Vec<(String, Role)> {
+        self.own_admission(stream)
+            .map(|a| {
+                a.ledger()
+                    .iter()
+                    .map(|(p, c)| (p.clone(), c.role))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Who this node forwards `stream` to, by role.
@@ -1072,7 +1499,7 @@ impl AlmState {
     /// Commitments, own and relayed (bits/s): the `load_ledger`'s A/V rows.
     pub(super) fn committed(&self) -> (u64, u64) {
         (
-            self.own.committed_bps(),
+            self.own_admissions().map(|(_, a)| a.committed_bps()).sum(),
             self.relays.values().map(Admission::committed_bps).sum(),
         )
     }
@@ -1083,7 +1510,7 @@ impl AlmState {
     pub(super) fn relay_commit_ratio(&self) -> f64 {
         self.relays
             .values()
-            .chain(std::iter::once(&self.own))
+            .chain(self.own_admissions().map(|(_, a)| a))
             .filter_map(|a| {
                 a.ceiling_bps()
                     .filter(|c| *c > 0.0)
@@ -1103,6 +1530,7 @@ impl AlmState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::realtime_av::ReceiverLayerPolicy;
     use crate::transport::realtime_av_alm::controller::wire::{decode, WireFrame};
     use crate::transport::realtime_av_alm::controller::PeerState;
 
@@ -1126,6 +1554,37 @@ mod tests {
             }
         }
         out
+    }
+
+    /// leviculum#102 — datagrams only toward a peer whose `CAPS` said so: no
+    /// `CAPS` yet and a pre-#102 build's `CAPS` (bits 0-2 only) both read as
+    /// "no", and the bit changes nothing else a `CAPS` says.
+    #[test]
+    fn datagrams_only_toward_a_peer_whose_caps_say_so() {
+        let mut a = AlmState::new("a", s(1), &roster(), false, 1);
+        assert!(!a.takes_datagrams("b"), "no CAPS heard: no datagrams");
+        a.on_caps("b", CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_RELAY);
+        assert!(
+            !a.takes_datagrams("b"),
+            "an older edge's CAPS: no datagrams"
+        );
+        assert!(a.takes_timed("b") && a.speaks_c3("b"));
+        a.on_caps("c", CAPS_THIS_BUILD);
+        assert!(a.takes_datagrams("c"), "this build's CAPS: datagrams");
+        assert!(a.takes_timed("c") && a.speaks_c3("c"));
+        assert_ne!(
+            CAPS_THIS_BUILD & CAP_LINK_DATAGRAMS,
+            0,
+            "this build says it"
+        );
+        // An older decoder masks only the bits it knows: bit 3 reads as nothing.
+        let old_known = CAP_C3_V1 | CAP_TIMED_FRAMES | CAP_RELAY;
+        assert_eq!(CAP_LINK_DATAGRAMS & old_known, 0, "bit 3 is a fresh bit");
+        assert_eq!(
+            wire::decode(&encode_caps(CAPS_THIS_BUILD | CAP_RELAY), "c"),
+            Ok(WireFrame::Caps(CAPS_THIS_BUILD | CAP_RELAY)),
+            "the CAPS frame is still 10 bytes, one u32"
+        );
     }
 
     /// The C3 admit path between two nodes: B learns A's stream from A's
@@ -1160,11 +1619,85 @@ mod tests {
         let _ = deliver(&mut b, "a", &decisions);
         assert_eq!(b.parents()[0].primary.as_deref(), Some("a"));
         // C never chose: once the provisional window passes it is excluded.
-        a.provisional.insert("c".into(), 0);
+        a.provisional.insert((a.own_stream, "c".into()), 0);
         a.t0 = Instant::now()
             .checked_sub(Duration::from_millis(PROVISIONAL_MS + 1))
             .expect("the clock is past the window");
         assert_eq!(a.own_exclude(&legs, false), vec!["c".to_owned()]);
+    }
+
+    /// v45 — a share is a parent-0 admission of its own: B subscribes to
+    /// A's share alone and is A's share child, not its camera child; the
+    /// camera's send set is untouched, each stream is offered, and ending
+    /// the share leaves the camera's admission and children as they were.
+    #[test]
+    fn a_share_is_its_own_admission_beside_the_camera() {
+        let (cam, share) = (s(1), s(7));
+        let mut a = AlmState::new("a", cam, &roster(), false, 1);
+        a.on_caps("b", CAPS_THIS_BUILD);
+        a.on_caps("c", CAPS_THIS_BUILD);
+        a.add_own_stream(share);
+        assert!(a.is_own(share) && a.is_own(cam));
+        assert_eq!(a.share_streams(), vec![share]);
+        let legs = vec!["b".to_owned(), "c".to_owned()];
+        assert!(
+            a.own_exclude_on(share, &legs, false).is_empty(),
+            "every C3 member is provisional on a new share"
+        );
+        let offers = a.tick(&legs);
+        let offered: BTreeSet<StreamId> = offers
+            .iter()
+            .filter_map(|o| match decode(&o.frame, "a") {
+                Ok(WireFrame::Control(cf)) if matches!(cf.msg, ControlMsg::Offer(_)) => {
+                    Some(cf.stream)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offered, [cam, share].into_iter().collect(), "both offered");
+        let sub = ControlFrame {
+            stream: share,
+            msg: ControlMsg::Subscribe(SubscribeRequest {
+                subscriber: "b".into(),
+                role: Role::Primary,
+                forward_capable: false,
+                layers: None,
+            }),
+        };
+        let out = a.on_control("b", sub, 10.0);
+        let WireFrame::Control(cf) = decode(&out[0].frame, "a").unwrap() else {
+            panic!()
+        };
+        assert!(matches!(
+            cf.msg,
+            ControlMsg::Decision(AdmitDecision::Admit { .. })
+        ));
+        assert!(a
+            .own_children_of(share)
+            .iter()
+            .any(|(p, r)| p == "b" && *r == Role::Primary));
+        assert!(
+            a.own_children().is_empty(),
+            "the camera's children are its own"
+        );
+        // Past the window: C never chose either stream, B only the share.
+        a.t0 = Instant::now()
+            .checked_sub(Duration::from_millis(PROVISIONAL_MS + 1))
+            .expect("the clock is past the window");
+        assert_eq!(a.own_exclude_on(share, &legs, false), vec!["c".to_owned()]);
+        assert_eq!(
+            a.own_exclude_on(cam, &legs, false),
+            legs,
+            "nobody took the camera"
+        );
+        a.remove_own_stream(share);
+        assert!(!a.is_own(share) && a.is_own(cam));
+        assert!(a.own_children_of(share).is_empty());
+        assert_eq!(
+            a.own_exclude_on(share, &legs, false),
+            legs,
+            "an ended share goes to nobody C3"
+        );
     }
 
     /// A refusal names its token; a subscribe to a stream this node does not
@@ -1178,6 +1711,7 @@ mod tests {
                 subscriber: "b".into(),
                 role: Role::Primary,
                 forward_capable: false,
+                layers: None,
             }),
         };
         let out = a.on_control("b", f, 10.0);
@@ -1217,6 +1751,7 @@ mod tests {
                     subscriber: p.into(),
                     role: Role::Standby,
                     forward_capable: false,
+                    layers: None,
                 },
                 &mut rng,
                 &mut log,
@@ -1381,13 +1916,16 @@ mod tests {
                 self.base_to_b += 1;
                 withheld |= self
                     .withhold_base_b
-                    .is_some_and(|n| self.base_to_b % n == 0);
+                    .is_some_and(|n| self.base_to_b.is_multiple_of(n));
             }
             let filtered = self.a_caps_b && !base_or_audio;
             if !excluded.contains(&legs[0]) && !withheld && !filtered && self.a_to_b_up {
                 self.nodes[A].on_sent("b", CHUNK);
                 self.hop_to_b += 1;
-                if self.wire_lose_b.is_some_and(|n| self.hop_to_b % n == 0) {
+                if self
+                    .wire_lose_b
+                    .is_some_and(|n| self.hop_to_b.is_multiple_of(n))
+                {
                     self.hop_gap_b += 1;
                 } else {
                     let lost = std::mem::take(&mut self.hop_gap_b);
@@ -1420,7 +1958,7 @@ mod tests {
                     self.chunk(false);
                 }
                 self.ticks += 1;
-                if self.ticks % 5 == 0 {
+                if self.ticks.is_multiple_of(5) {
                     self.tick();
                     each_tick(self);
                 }
@@ -1437,7 +1975,7 @@ mod tests {
                 self.nodes[A].on_sent("b", 1);
                 self.nodes[A].on_dropped(CHUNK);
                 self.ticks += 1;
-                if self.ticks % 5 == 0 {
+                if self.ticks.is_multiple_of(5) {
                     self.tick();
                 }
             }
@@ -1956,5 +2494,531 @@ mod tests {
         let log = m.nodes[B].log_tail();
         assert!(m.nodes[B].log_count(DecisionKind::Switch) > 0, "{log}");
         assert!(m.b_parents().parent_changes > 0, "{log}");
+    }
+
+    /// A SUBSCRIBE for `stream` in `role` to `to`, carrying `cap`.
+    fn subscribe_with(
+        stream: StreamId,
+        to: &str,
+        role: Role,
+        cap: Option<ReceiverLayerPolicy>,
+    ) -> Outgoing {
+        Outgoing {
+            to: to.to_owned(),
+            frame: encode(
+                stream,
+                &ControlMsg::Subscribe(SubscribeRequest {
+                    subscriber: String::new(),
+                    role,
+                    forward_capable: false,
+                    layers: cap,
+                }),
+            ),
+        }
+    }
+
+    /// v45 — a receiver's layer cap rides its SUBSCRIBE to its parent and
+    /// caps what the parent sends that child alone: A (the publisher) drops
+    /// B's copies above (0, 0, 0) and sends C everything; a relay (C)
+    /// applies a cap for a stream it forwards the same way; audio passes
+    /// every cap; a node that does not parent the stream keeps nothing; and a
+    /// re-SUBSCRIBE without a cap withdraws it.
+    #[test]
+    fn a_subscribe_layer_cap_caps_that_child_alone() {
+        use crate::transport::realtime_av::{ChunkLayer, CODEC_AV1_SVC, CODEC_OPAQUE};
+        let mut m = settled(1);
+        let sa = m.sa;
+        // The host turned the lever on everywhere (off by default).
+        for (i, n) in m.nodes.iter_mut().enumerate() {
+            n.set_layer_requests(true);
+            for (j, peer) in NAMES.iter().enumerate() {
+                if i != j {
+                    let c = n.caps[*peer] | CAP_LAYER_REQUEST;
+                    n.caps.insert((*peer).to_owned(), c);
+                }
+            }
+        }
+        let base = ChunkLayer::BASE;
+        let upper = ChunkLayer {
+            spatial: 1,
+            temporal: 0,
+            quality: 0,
+        };
+        let kids = vec!["b".to_owned(), "c".to_owned()];
+        assert!(
+            m.nodes[A]
+                .layer_exclude(sa, &kids, CODEC_AV1_SVC, upper)
+                .is_empty(),
+            "the premise: nobody asked"
+        );
+        // B asks its parent (A) for the base layer only: a re-SUBSCRIBE.
+        let out = m.nodes[B].request_layers(sa, Some(ReceiverLayerPolicy::BLINKING_DOT));
+        assert_eq!(
+            out.iter().map(|o| o.to.as_str()).collect::<Vec<_>>(),
+            ["a"],
+            "one hop, to the primary"
+        );
+        assert!(
+            matches!(
+                decode(&out[0].frame, "b"),
+                Ok(WireFrame::Control(ControlFrame {
+                    msg: ControlMsg::Subscribe(SubscribeRequest {
+                        role: Role::Primary,
+                        layers: Some(ReceiverLayerPolicy::BLINKING_DOT),
+                        ..
+                    }),
+                    ..
+                }))
+            ),
+            "the cap rides the tree's own SUBSCRIBE"
+        );
+        m.route(out.into_iter().map(|o| (B, o)).collect());
+        assert_eq!(m.b_parents().primary.as_deref(), Some("a"), "B stays on A");
+        let a = &m.nodes[A];
+        assert_eq!(a.layer_exclude(sa, &kids, CODEC_AV1_SVC, upper), ["b"]);
+        assert!(a.layer_exclude(sa, &kids, CODEC_AV1_SVC, base).is_empty());
+        assert!(
+            a.layer_exclude(sa, &kids, CODEC_OPAQUE, base).is_empty(),
+            "audio passes"
+        );
+        // A relay applies it for a stream it forwards (B's standby there:
+        // the re-SUBSCRIBE keeps B's role).
+        assert!(
+            m.nodes[C].relays.contains_key(&sa),
+            "the premise: C forwards A"
+        );
+        let cap = ReceiverLayerPolicy {
+            max_spatial: 0,
+            max_temporal: 1,
+            max_quality: 0,
+        };
+        let _ = deliver(
+            &mut m.nodes[C],
+            "b",
+            &[subscribe_with(sa, "c", Role::Standby, Some(cap))],
+        );
+        let legs = vec!["a".to_owned(), "b".to_owned()];
+        let t2 = ChunkLayer {
+            spatial: 0,
+            temporal: 2,
+            quality: 0,
+        };
+        assert_eq!(
+            m.nodes[C].layer_exclude(sa, &legs, CODEC_AV1_SVC, t2),
+            ["b"]
+        );
+        assert!(m.nodes[C]
+            .layer_exclude(sa, &legs, CODEC_AV1_SVC, base)
+            .is_empty());
+        // Not a parent of the stream: kept nowhere.
+        let other = s(9);
+        let _ = deliver(
+            &mut m.nodes[A],
+            "b",
+            &[subscribe_with(other, "a", Role::Primary, Some(cap))],
+        );
+        assert!(m.nodes[A]
+            .layer_exclude(other, &kids, CODEC_AV1_SVC, t2)
+            .is_empty());
+        // Withdrawn: everything again.
+        let out = m.nodes[B].request_layers(sa, None);
+        m.route(out.into_iter().map(|o| (B, o)).collect());
+        assert!(m.nodes[A]
+            .layer_exclude(sa, &kids, CODEC_AV1_SVC, upper)
+            .is_empty());
+    }
+
+    /// v45 — off by default: no node advertises the bit, puts a cap on a
+    /// SUBSCRIBE or applies one. On, a parent whose `CAPS` lack the bit never
+    /// gets a cap; the cap waits, and rides the next SUBSCRIBE to a parent
+    /// that takes it.
+    #[test]
+    fn a_layer_cap_waits_for_a_parent_that_takes_it() {
+        use crate::transport::realtime_av::{ChunkLayer, CODEC_AV1_SVC};
+        let mut m = settled(1);
+        let sa = m.sa;
+        assert_eq!(
+            m.nodes[A].caps_bits() & CAP_LAYER_REQUEST,
+            0,
+            "off by default"
+        );
+        let cap = ReceiverLayerPolicy::BLINKING_DOT;
+        assert!(
+            m.nodes[B].request_layers(sa, Some(cap)).is_empty(),
+            "the lever is off"
+        );
+        let _ = deliver(
+            &mut m.nodes[A],
+            "b",
+            &[subscribe_with(sa, "a", Role::Primary, Some(cap))],
+        );
+        let b = vec!["b".to_owned()];
+        let upper = ChunkLayer {
+            spatial: 1,
+            temporal: 0,
+            quality: 0,
+        };
+        assert!(
+            m.nodes[A]
+                .layer_exclude(sa, &b, CODEC_AV1_SVC, upper)
+                .is_empty(),
+            "an off node applies nothing"
+        );
+        m.nodes[B].set_layer_requests(true);
+        m.nodes[B]
+            .caps
+            .insert("a".into(), CAP_C3_V1 | CAP_TIMED_FRAMES);
+        assert!(
+            m.nodes[B].request_layers(sa, Some(cap)).is_empty(),
+            "A did not say it takes them"
+        );
+        assert_eq!(m.nodes[B].wanted_layers.get(&sa), Some(&cap), "kept");
+        // A parent that takes it gets it on the next SUBSCRIBE.
+        m.nodes[B]
+            .caps
+            .insert("c".into(), CAPS_THIS_BUILD | CAP_LAYER_REQUEST);
+        let f = m.nodes[B].subscribe_frame(sa, "c", Role::Standby);
+        assert!(matches!(
+            decode(&f, "b"),
+            Ok(WireFrame::Control(ControlFrame {
+                msg: ControlMsg::Subscribe(SubscribeRequest {
+                    layers: Some(_),
+                    ..
+                }),
+                ..
+            }))
+        ));
+        let f = m.nodes[B].subscribe_frame(sa, "a", Role::Primary);
+        assert!(matches!(
+            decode(&f, "b"),
+            Ok(WireFrame::Control(ControlFrame {
+                msg: ControlMsg::Subscribe(SubscribeRequest { layers: None, .. }),
+                ..
+            }))
+        ));
+    }
+
+    /// The relay-on N=4 room of the server's av_mesh runs, on the production
+    /// [`AlmState`] with an injected clock: every member publishes 30 Hz of
+    /// opaque (all-"audio") chunks and offers relay; C3 frames are routed at
+    /// once; each node's uplink is a per-second byte budget (a rate cap), and
+    /// a stalled receiver delays delivery without limiting any rate.
+    mod mesh4 {
+        use super::*;
+        use std::collections::{BTreeMap, HashSet};
+
+        const N: usize = 4;
+        const NAMES: [&str; N] = ["a", "b", "c", "d"];
+        const CHUNK: u64 = 300;
+        const STEP_MS: u64 = 33;
+        /// One stream, as a rate: 30 chunks/s of `CHUNK` bytes.
+        const STREAM_BYTES_PER_S: u64 = 30 * CHUNK;
+
+        /// A delivery held back by a stalled receiver: released at `at`.
+        struct Held {
+            at: u64,
+            from: usize,
+            to: usize,
+            stream: usize,
+            seq: u64,
+            source_ms: u64,
+        }
+
+        pub(super) struct World {
+            nodes: Vec<AlmState>,
+            streams: [StreamId; N],
+            now: u64,
+            steps: u64,
+            seq: [u64; N],
+            /// Per node: bytes/s its uplink carries (`None`: unlimited).
+            pub(super) cap: [Option<u64>; N],
+            window_start: u64,
+            window_bytes: [u64; N],
+            /// A receiver whose deliveries (and acks) are held back until the
+            /// end of each stall, `(node, from_ms, to_ms)`, repeating.
+            pub(super) stall: Option<(usize, Vec<(u64, u64)>)>,
+            held: Vec<Held>,
+            /// What each member heard of each stream: `(rx, stream) -> seqs`.
+            heard: BTreeMap<(usize, usize), HashSet<u64>>,
+            /// Each stream's chunks by when they were published.
+            published: Vec<Vec<(u64, u64)>>,
+        }
+
+        impl World {
+            pub(super) fn new() -> Self {
+                let roster: Vec<String> = NAMES.iter().map(|n| (*n).to_owned()).collect();
+                let streams = [s(1), s(2), s(3), s(4)];
+                let mut nodes: Vec<AlmState> = (0..N)
+                    .map(|i| AlmState::new(NAMES[i], streams[i], &roster, true, i as u64 + 1))
+                    .collect();
+                for (i, n) in nodes.iter_mut().enumerate() {
+                    for (j, peer) in NAMES.iter().enumerate() {
+                        if i != j {
+                            n.on_caps(peer, CAPS_THIS_BUILD | CAP_RELAY);
+                            n.note_publisher(streams[j], peer);
+                            n.note_bound_publisher(streams[j], peer);
+                        }
+                    }
+                }
+                Self {
+                    nodes,
+                    streams,
+                    now: 0,
+                    steps: 0,
+                    seq: [0; N],
+                    cap: [None; N],
+                    window_start: 0,
+                    window_bytes: [0; N],
+                    stall: None,
+                    held: Vec::new(),
+                    heard: BTreeMap::new(),
+                    published: vec![Vec::new(); N],
+                }
+            }
+
+            fn legs(i: usize) -> Vec<String> {
+                (0..N)
+                    .filter(|j| *j != i)
+                    .map(|j| NAMES[j].to_owned())
+                    .collect()
+            }
+
+            fn idx(name: &str) -> usize {
+                NAMES.iter().position(|n| *n == name).expect("a member")
+            }
+
+            fn stalled(&self, rx: usize) -> Option<u64> {
+                let (node, spans) = self.stall.as_ref()?;
+                if *node != rx {
+                    return None;
+                }
+                spans
+                    .iter()
+                    .find(|(from, to)| self.now >= *from && self.now < *to)
+                    .map(|(_, to)| *to)
+            }
+
+            /// `from` puts one chunk of stream `stream` on its leg to `to`:
+            /// within its uplink's budget it is accepted, and delivered now or,
+            /// to a stalled receiver, when the stall ends.
+            fn send(&mut self, from: usize, to: usize, stream: usize, seq: u64, source_ms: u64) {
+                if let Some(cap) = self.cap[from] {
+                    if self.window_bytes[from] + CHUNK > cap {
+                        self.nodes[from].on_dropped(CHUNK);
+                        return;
+                    }
+                }
+                self.window_bytes[from] += CHUNK;
+                if let Some(until) = self.stalled(to) {
+                    // The stalled peer acks late: the link backs up and, now
+                    // and then, refuses a frame (one per stalled second).
+                    self.nodes[from].set_leg_queue_ms(NAMES[to], 400.0);
+                    if seq.is_multiple_of(30) {
+                        self.nodes[from].on_dropped(CHUNK);
+                        return;
+                    }
+                    self.nodes[from].on_sent(NAMES[to], CHUNK);
+                    self.held.push(Held {
+                        at: until,
+                        from,
+                        to,
+                        stream,
+                        seq,
+                        source_ms,
+                    });
+                    return;
+                }
+                self.nodes[from].set_leg_queue_ms(NAMES[to], 0.0);
+                self.nodes[from].on_sent(NAMES[to], CHUNK);
+                self.nodes[from].on_delivered(CHUNK);
+                self.arrive(from, to, stream, seq, source_ms);
+            }
+
+            fn arrive(&mut self, from: usize, to: usize, stream: usize, seq: u64, source_ms: u64) {
+                let st = self.streams[stream];
+                self.nodes[to].on_chunk(st, NAMES[from], 1, seq, CHUNK, source_ms, true, 0);
+                if self.heard.entry((to, stream)).or_default().insert(seq) {
+                    // First copy: forward it where this node is a parent.
+                    let legs = Self::legs(to);
+                    let skip = self.nodes[to].forward_exclude(
+                        st,
+                        1,
+                        seq,
+                        NAMES[from],
+                        NAMES[stream],
+                        &legs,
+                        true,
+                    );
+                    if let Some(skip) = skip {
+                        for l in legs.iter().filter(|l| !skip.contains(l)) {
+                            let k = Self::idx(l);
+                            self.send(to, k, stream, seq, source_ms);
+                        }
+                    }
+                }
+            }
+
+            fn release_held(&mut self) {
+                let now = self.now;
+                let (due, rest): (Vec<Held>, Vec<Held>) = std::mem::take(&mut self.held)
+                    .into_iter()
+                    .partition(|h| h.at <= now);
+                self.held = rest;
+                for h in due {
+                    self.nodes[h.from].on_delivered(CHUNK);
+                    self.arrive(h.from, h.to, h.stream, h.seq, h.source_ms);
+                }
+            }
+
+            fn route(&mut self, mut q: VecDeque<(usize, Outgoing)>) {
+                while let Some((from, o)) = q.pop_front() {
+                    let to = Self::idx(&o.to);
+                    match decode(&o.frame, NAMES[from]).expect("decodes") {
+                        WireFrame::Caps(c) => {
+                            self.nodes[to].on_caps(NAMES[from], c);
+                        }
+                        WireFrame::Control(cf) => {
+                            for r in self.nodes[to].on_control(NAMES[from], cf, 20.0) {
+                                q.push_back((to, r));
+                            }
+                        }
+                    }
+                }
+            }
+
+            fn tick(&mut self) {
+                let mut q = VecDeque::new();
+                for i in 0..N {
+                    let _ = self.nodes[i].set_tier(ServiceTier::FullOps);
+                    for o in self.nodes[i].tick(&Self::legs(i)) {
+                        q.push_back((i, o));
+                    }
+                }
+                self.route(q);
+            }
+
+            fn step(&mut self) {
+                self.now += STEP_MS;
+                self.steps += 1;
+                for n in &mut self.nodes {
+                    n.t0 =
+                        n.t0.checked_sub(Duration::from_millis(STEP_MS))
+                            .expect("the clock is past the shift");
+                }
+                if self.now >= self.window_start + 1_000 {
+                    self.window_start = self.now;
+                    self.window_bytes = [0; N];
+                }
+                self.release_held();
+                let at = crate::transport::av_chunk_auth::unix_ms_now();
+                for i in 0..N {
+                    let seq = self.seq[i];
+                    self.seq[i] += 1;
+                    self.published[i].push((self.now, seq));
+                    let legs = Self::legs(i);
+                    let excluded = self.nodes[i].own_exclude(&legs, true);
+                    self.nodes[i].on_own_published(CHUNK, true);
+                    for l in legs.iter().filter(|l| !excluded.contains(l)) {
+                        let k = Self::idx(l);
+                        self.send(i, k, i, seq, at);
+                    }
+                }
+                if self.steps.is_multiple_of(5) {
+                    self.tick();
+                }
+            }
+
+            pub(super) fn run_until(&mut self, ms: u64) {
+                while self.now < ms {
+                    self.step();
+                }
+            }
+
+            /// Share of `stream`'s chunks published in `[from, to)` that
+            /// every other member heard (the worst member).
+            #[allow(clippy::cast_precision_loss)]
+            pub(super) fn worst_heard(&self, stream: usize, from: u64, to: u64) -> f64 {
+                let owed: Vec<u64> = self.published[stream]
+                    .iter()
+                    .filter(|(t, _)| *t >= from && *t < to)
+                    .map(|(_, s)| *s)
+                    .collect();
+                (0..N)
+                    .filter(|rx| *rx != stream)
+                    .map(|rx| {
+                        let got = self.heard.get(&(rx, stream));
+                        let n = owed
+                            .iter()
+                            .filter(|s| got.is_some_and(|g| g.contains(s)))
+                            .count();
+                        n as f64 / owed.len().max(1) as f64
+                    })
+                    .fold(1.0, f64::min)
+            }
+
+            pub(super) fn sheds(&self) -> u64 {
+                self.nodes.iter().map(|n| n.counts.shed).sum()
+            }
+
+            pub(super) fn shed_by(&self, i: usize) -> u64 {
+                self.nodes[i].counts.shed
+            }
+
+            pub(super) fn tail(&self) -> String {
+                self.nodes
+                    .iter()
+                    .map(|n| format!("--- {} ---\n{}", n.me, n.log_tail()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+
+        /// A stall is not a cap: one member's acks stop for 1.5 s every 10 s
+        /// (a busy host), with its links backing up past the old 150 ms bar
+        /// and refusing a frame a second while it lasts, and no uplink has
+        /// any rate limit. Nobody sheds and everyone hears everything. The
+        /// avmesh4n/avmesh4rel shape. Mutation (v45.0.0 meter): the backed-up
+        /// legs made every sender's uplink "congested", each learned its send
+        /// rate as a ceiling, and shed.
+        #[test]
+        fn n4_a_stall_sheds_nobody() {
+            let mut w = World::new();
+            let spans = (2..6u64)
+                .map(|k| (k * 10_000, k * 10_000 + 1_500))
+                .collect();
+            w.stall = Some((3, spans));
+            w.run_until(60_000);
+            assert_eq!(w.sheds(), 0, "a stall shed someone\n{}", w.tail());
+            for st in 0..N {
+                // A refused frame is a lost frame: the stall costs its few.
+                let h = w.worst_heard(st, 10_000, 58_000);
+                assert!(h >= 0.99, "stream {st} heard {h}\n{}", w.tail());
+            }
+        }
+
+        /// A real cap sheds, and recovers once lifted: `a`'s uplink carries
+        /// two and a half streams from 20 s to 50 s (it owes three). `a`
+        /// sheds; within the bound after the lift every member hears `a`'s
+        /// stream whole again. Mutation (v45.0.0): the ceiling stood until
+        /// stale (60-240 s), nobody asked, and the shed members stayed shed.
+        #[test]
+        fn n4_a_rate_cap_sheds_and_recovers_within_the_bound() {
+            /// Lift to whole again, at most.
+            const BOUND_MS: u64 = 20_000;
+            let mut w = World::new();
+            w.run_until(20_000);
+            assert_eq!(w.shed_by(0), 0, "the premise: no shed before the cap");
+            w.cap[0] = Some(STREAM_BYTES_PER_S * 5 / 2);
+            w.run_until(50_000);
+            assert!(w.shed_by(0) > 0, "a real cap sheds\n{}", w.tail());
+            w.cap[0] = None;
+            w.run_until(50_000 + BOUND_MS + 20_000);
+            let h = w.worst_heard(0, 50_000 + BOUND_MS, 50_000 + BOUND_MS + 18_000);
+            assert!(
+                h >= 0.999,
+                "a's stream heard {h} from {BOUND_MS} ms after the lift\n{}",
+                w.tail()
+            );
+        }
     }
 }

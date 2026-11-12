@@ -580,7 +580,7 @@ mod tests {
         }
 
         let relief = reader_over(&backend).await.relief().await;
-        assert_eq!(relief.round_cadence, Some(Duration::from_secs(300)));
+        assert_eq!(relief.round_cadence, Some(Duration::from_mins(5)));
         assert_eq!(relief.page_limit, Some(100));
         assert!(!relief.trace_replication_paused);
         assert!(!relief.av_streams_paused);
@@ -722,7 +722,7 @@ mod tests {
         seed_subscription(&backend, "node-local", "root-1").await;
         let dir: Arc<dyn FederationDirectory> = Arc::clone(&backend) as _;
         let cached = MeshConfigReader::new(dir, "node-local".to_string(), baseline())
-            .with_ttl(Duration::from_secs(3600));
+            .with_ttl(Duration::from_hours(1));
         assert_eq!(cached.relief().await, MeshConfigRelief::NONE);
         backend
             .put_attestation(SignedAttestation {

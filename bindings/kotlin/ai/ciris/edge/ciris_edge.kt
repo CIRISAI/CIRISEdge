@@ -635,6 +635,8 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
+    external fun uniffi_ciris_edge_checksum_func_av_datagrams_set_enabled(
+    ): Short
     external fun uniffi_ciris_edge_checksum_func_crate_version(
     ): Short
     external fun uniffi_ciris_edge_checksum_func_current_ratchet_id(
@@ -756,7 +758,9 @@ internal object UniffiLib {
         Native.register(UniffiLib::class.java, findLibraryName(componentName = "ciris_edge"))
         
     }
-    external fun uniffi_ciris_edge_fn_func_crate_version(uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_ciris_edge_fn_func_av_datagrams_set_enabled(`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_crate_version(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_current_ratchet_id(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -983,6 +987,9 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_ciris_edge_checksum_func_av_datagrams_set_enabled() != 31336.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ciris_edge_checksum_func_crate_version() != 15809.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -3987,6 +3994,16 @@ public object FfiConverterMapStringByteArray: FfiConverterRustBuffer<Map<kotlin.
         }
     }
 }
+    @Throws(EdgeBindingsException::class) fun `avDatagramsSetEnabled`(`enabled`: kotlin.Boolean)
+        = 
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_av_datagrams_set_enabled(
+    
+        FfiConverterBoolean.lower(`enabled`),_status)
+}
+    
+    
+
     @Throws(EdgeBindingsException::class) fun `crateVersion`(): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCallWithError(EdgeBindingsException) { _status ->

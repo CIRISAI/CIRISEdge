@@ -235,7 +235,14 @@ pub enum Lane {
     Request = 3,
     /// A link response's data.
     Response = 4,
+    /// An unordered link datagram (leviculum#102, `LinkHandle::try_send_unordered`):
+    /// live media to a peer that said it takes them. Datagrams are lost and
+    /// overtaken freely, which the per-lane window already allows.
+    Datagram = 5,
 }
+
+/// How many lanes a link carries (each its own counter and window).
+const LANES: usize = 5;
 
 impl Lane {
     const fn index(self) -> usize {
@@ -553,8 +560,8 @@ pub struct SealedLink {
     transit: LinkTransit,
     seal_key: Zeroizing<[u8; 32]>,
     open_key: Zeroizing<[u8; 32]>,
-    next: [AtomicU64; 4],
-    windows: Mutex<[ReplayWindow; 4]>,
+    next: [AtomicU64; LANES],
+    windows: Mutex<[ReplayWindow; LANES]>,
     /// The handshake's claimed initiator, on a link this node RESPONDED on.
     claimed_initiator: Option<String>,
     /// CC 3.2 (f) — keyed from a pairing-pinned pair: this link carries the
@@ -605,7 +612,7 @@ impl SealedLink {
             open_key: derive_seal_key(&transit.open_key(), &link_id),
             transit,
             next: Default::default(),
-            windows: Mutex::new([ReplayWindow::default(); 4]),
+            windows: Mutex::new([ReplayWindow::default(); LANES]),
             claimed_initiator,
             pinned: std::sync::atomic::AtomicBool::new(false),
         }
@@ -2104,10 +2111,7 @@ pub fn first_contact_sender(bytes: &[u8]) -> Option<FirstContactSender> {
 /// introducing) another key.
 pub fn admit_unattributed_frame(claimed: &str, bytes: &[u8]) -> Result<(), SealRefusal> {
     let sender = first_contact_sender(bytes).ok_or(SealRefusal::FirstContactOnly)?;
-    let record_matches = sender
-        .record_key_id
-        .as_deref()
-        .map_or(true, |k| k == claimed);
+    let record_matches = sender.record_key_id.as_deref().is_none_or(|k| k == claimed);
     if sender.signer == claimed && record_matches {
         Ok(())
     } else {

@@ -143,7 +143,7 @@ fn auth(signer: Arc<LocalSigner>, dir: &Arc<SqliteBackend>) -> ReticulumAuth {
         signer: Some(signer),
         rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
         resolver: None,
-        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        hybrid_policy: ciris_edge::HybridPolicy::Strict,
         ..ReticulumAuth::default()
     }
 }
@@ -392,7 +392,7 @@ async fn pair(tag: &str) -> Pair {
             }],
             ReplicationRuntimeConfig {
                 scheduler: SchedulerConfig {
-                    cadence: Duration::from_secs(3600),
+                    cadence: Duration::from_hours(1),
                     round_timeout: Duration::from_secs(15),
                     ..SchedulerConfig::default()
                 },
@@ -432,7 +432,7 @@ async fn pair(tag: &str) -> Pair {
         }),
     ];
     // Route heal: each learns the other from its announce.
-    let known = wait_until(Duration::from_secs(60), || async {
+    let known = wait_until(Duration::from_mins(1), || async {
         b.knows_peer(&key_a.key_id).await && a.knows_peer(&key_b.key_id).await
     })
     .await;
@@ -499,7 +499,7 @@ impl Pair {
             .send(&self.key_b.key_id, &deliver_frame(&att))
             .await
             .expect("A -> B over B's link");
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             self.b_dir
                 .list_attestations_since(None, 1024)
                 .await

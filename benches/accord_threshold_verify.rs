@@ -133,7 +133,7 @@ mod imp {
         let directory = build_in_memory_backend(rows).await;
         let edge_signer = bench_local_signer(&me, &tmp).await;
         let config = EdgeConfig {
-            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            hybrid_policy: HybridPolicy::Strict,
             ..EdgeConfig::default()
         };
         let edge = Edge::builder()

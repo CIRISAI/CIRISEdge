@@ -93,6 +93,9 @@ pub enum VerifyErrorClass {
     UnknownKey,
     SignatureMismatch,
     PqcPendingStrictReject,
+    /// CIRISEdge#957 / CIRISPersist#1233 — a verifier policy other than
+    /// `Strict` reached persist's verify door.
+    PolicyViolation,
     CanonicalizationFailed,
     VerifyUnavailable,
     ContentIntegrity,
@@ -112,6 +115,7 @@ impl VerifyErrorClass {
             Self::UnknownKey => "unknown_key",
             Self::SignatureMismatch => "signature_mismatch",
             Self::PqcPendingStrictReject => "pqc_pending_strict_reject",
+            Self::PolicyViolation => "verify_policy_violation",
             Self::CanonicalizationFailed => "canonicalization_failed",
             Self::VerifyUnavailable => "verify_unavailable",
             Self::ContentIntegrity => "content_integrity",
@@ -133,6 +137,7 @@ impl VerifyErrorClass {
             V::UnknownKey(_) => Self::UnknownKey,
             V::SignatureMismatch(_) => Self::SignatureMismatch,
             V::PqcPendingStrictReject => Self::PqcPendingStrictReject,
+            V::PolicyViolation(_) => Self::PolicyViolation,
             V::CanonicalizationFailed(_) => Self::CanonicalizationFailed,
             V::VerifyUnavailable(_) => Self::VerifyUnavailable,
             V::ContentIntegrity { .. } => Self::ContentIntegrity,
@@ -608,6 +613,16 @@ pub enum WithholdReason {
     /// Distinct from [`Self::IdentityRowNodeNotAnnounced`] so an operator is
     /// sent to the directory, not to the announce wizard.
     IdentityRowAnnounceUnresolved,
+    /// CIRISEdge#971 (CC 5.4.6) — an `IdentityOccurrence` or
+    /// `TransportDestination` row about a node that has NO live owner-binding
+    /// held here and is held as the occurrence of another identity: a
+    /// person's device whose binding was released, lapsed, or has not reached
+    /// this holder (an unannounced node, seen from a seat). Served to that
+    /// identity's own nodes and active occurrences only. Distinct from
+    /// [`Self::IdentityRowNodeNotAnnounced`] (an owner is known and chose not
+    /// to announce) so an operator whose node stopped being listed is sent to
+    /// the owner-binding, not to the announce wizard.
+    IdentityRowOccurrenceUnowned,
     /// CIRISEdge#758 (CC 5.4.6) — a `Family` / `Community` RECORD asked for (on
     /// the advertise or the direct-fetch twin) by a peer whose person
     /// (`owner_of(peer)`, the peer itself when unowned) is neither a live
@@ -680,6 +695,7 @@ impl WithholdReason {
             Self::LxmfRetentionExpired => "lxmf_retention_expired",
             Self::IdentityRowNodeNotAnnounced => "identity_row_node_not_announced",
             Self::IdentityRowAnnounceUnresolved => "identity_row_announce_unresolved",
+            Self::IdentityRowOccurrenceUnowned => "identity_row_occurrence_unowned",
             Self::GroupRecordNotMemberOrInvitee => "group_record_not_member_or_invitee",
         }
     }
@@ -968,6 +984,40 @@ pub const AV_FRAME_EXPIRED_LATE: &str = "av_frame_expired_late";
 /// ALM C5 — a media frame older than its class budget dropped from the
 /// inbound queue by age (oldest first) before it was opened.
 pub const AV_FRAME_STALE_DROPPED: &str = "av_frame_stale_dropped";
+
+// ─── leviculum#102 — unordered link datagrams, `av_plane` labels ─────
+
+/// leviculum#102 — a media frame sent as an unordered link datagram
+/// (`LinkHandle::try_send_unordered`) to a peer whose C3 `CAPS` carried
+/// `CAP_LINK_DATAGRAMS`.
+pub const AV_SENT_DATAGRAM: &str = "av_sent_datagram";
+/// leviculum#102 — a media frame sent on the link's Channel (timed or not)
+/// because the peer has not said it takes datagrams: an older edge, a peer
+/// whose `CAPS` has not arrived yet, or a link outside a call.
+pub const AV_SENT_DATAGRAM_FALLBACK: &str = "av_sent_datagram_fallback";
+/// leviculum#102 — datagrams an interface had no room for and shed
+/// (`DropReason::DatagramShed`), never retried. Node-wide, folded from
+/// leviculum's transport stats.
+pub const AV_DATAGRAM_SHED: &str = "av_datagram_shed";
+/// leviculum#102 — datagrams this node received but leviculum shed because
+/// the host's event sink was down to the room it keeps for the Channel.
+pub const AV_DATAGRAM_SHED_SINK: &str = "av_datagram_shed_sink";
+/// leviculum#102 — datagrams that arrived 64 or more behind the newest on
+/// their link (leviculum's replay window): too late to play, not delivered.
+pub const AV_DATAGRAM_LATE: &str = "av_datagram_late";
+/// leviculum#102 — datagrams leviculum's replay window had already seen.
+pub const AV_DATAGRAM_REPLAYED: &str = "av_datagram_replayed";
+/// leviculum#102 — datagrams that did not decrypt for their link.
+pub const AV_DATAGRAM_REFUSED: &str = "av_datagram_refused";
+/// leviculum#102 — sequence numbers a link's datagrams skipped (lost or shed
+/// on the way): reported to the hop counter as frames dropped before the next.
+pub const AV_INBOUND_DATAGRAM_GAP: &str = "av_inbound_datagram_gap";
+/// leviculum#102 — a datagram overtaken by a newer one on its link: the hop
+/// counter is already past it, so it is dropped by name, never opened.
+pub const AV_INBOUND_DATAGRAM_REORDERED: &str = "av_inbound_datagram_reordered";
+/// leviculum#102 — a datagram on a link that is not an A/V link: edge sends
+/// datagrams only on A/V legs, so it is dropped by name.
+pub const AV_INBOUND_DATAGRAM_OFF_AV: &str = "av_inbound_datagram_off_av";
 /// #591 — a chunk a leg refused under backpressure: dropped for that leg,
 /// never queued. `av_send_congested` also counts control-frame retries; this
 /// counts media actually lost to it.
@@ -976,6 +1026,39 @@ pub const AV_CHUNK_DROPPED_CONGESTED: &str = "av_chunk_dropped_congested";
 pub const AV_LEG_SHED_TO_BASE: &str = "av_leg_shed_to_base";
 /// ALM C5 — a leg restored from the base layer after clean sends.
 pub const AV_LEG_RESTORED: &str = "av_leg_restored";
+/// v45 — a leg whose Channel did not prove the signed end delivered before
+/// the leave's ceiling ([`crate::transport::av_call::END_FLUSH_CEILING`]): it
+/// closed anyway.
+pub const AV_CALL_END_FLUSH_UNCONFIRMED: &str = "end_flush_unconfirmed";
+/// v45 — a leg whose Channel did not prove the replacement's binding
+/// delivered before the switch's ceiling: the switch went anyway.
+pub const AV_CALL_REPLACE_SWITCH_UNCONFIRMED: &str = "replace_switch_unconfirmed";
+/// v45 — a signed end whose `final_seq` this node never received up to.
+pub const AV_CALL_STREAM_TRUNCATED: &str = "av_call_stream_truncated";
+/// v45 — a framed stream's chunk shorter than the fragment marker
+/// (receiver-only, like every `av_frame_*`: a relay never opens the inner
+/// seal).
+pub const AV_FRAME_MARKER_SHORT: &str = "av_frame_marker_short";
+/// v45 — a fragment marker whose count is 0 or over 256.
+pub const AV_FRAME_COUNT_INVALID: &str = "av_frame_count_invalid";
+/// v45 — a fragment marker whose index is at or past its count.
+pub const AV_FRAME_INDEX_INVALID: &str = "av_frame_index_invalid";
+/// v45 — a fragment whose count differs from its frame's.
+pub const AV_FRAME_COUNT_MISMATCH: &str = "av_frame_count_mismatch";
+/// v45 — a fragment whose codec_id or layer differs from its frame's.
+pub const AV_FRAME_LAYER_MISMATCH: &str = "av_frame_layer_mismatch";
+/// v45 — a fragment run that would cross the epoch.
+pub const AV_FRAME_CROSSES_EPOCH: &str = "av_frame_crosses_epoch";
+/// v45 — a fragment whose `frame_seq` differs from its frame's.
+pub const AV_FRAME_SEQ_MISMATCH: &str = "av_frame_seq_mismatch";
+/// v45 — a frame missing a fragment the reorder window gave up on: dropped
+/// whole, once.
+pub const AV_FRAME_INCOMPLETE: &str = "av_frame_incomplete";
+/// v45 — a frame whose fragments pass 1 MiB: dropped whole.
+pub const AV_FRAME_TOO_LARGE: &str = "av_frame_too_large";
+/// v45 — a framed stream's chunk whose v2 binding (its framing) never came
+/// within the hold: dropped, never parsed as unframed.
+pub const AV_FRAME_FRAMING_UNKNOWN: &str = "av_frame_framing_unknown";
 /// ALM C3 — a control frame sent / received / refused as malformed.
 pub const ALM_C3_SENT: &str = "alm_c3_sent";
 /// ALM C3 — a control frame that could not be sent to its member.
@@ -1194,6 +1277,11 @@ pub const LINK_SEAL_REFUSED_ROUTE_CLOSED: &str = "link_seal_refused_route_closed
 pub const LINK_SEAL_REFUSED_ROUTE_SEND: &str = "link_seal_refused_route_send";
 
 // ─── CIRISEdge#627/#879 — on-link announce (`CANN`) receipt ──────────────
+/// CIRISEdge#968 — `transport_inbound_drops` tag: a CRPL replication frame
+/// dropped because its sender is not attributed here yet (`SkippedNoSourceKeyId`:
+/// not rooted, or no hybrid route row binds its link). A new peer's first
+/// rounds land here until its rooting does.
+pub const DROP_REPLICATION_UNATTRIBUTED: &str = "replication_unattributed";
 /// `transport_inbound_drops` tag: a `CANN` frame on a link with no proven
 /// remote identity (a peer-dialled link before its LINKIDENTIFY, or a dialled
 /// link whose announce names another destination).
@@ -1308,6 +1396,20 @@ pub const ADVERTISE_WATERMARK_EVICTED: &str = "advertise_watermark_evicted";
 pub const ADVERTISE_READ_FAILED: &str = "advertise_read_failed";
 /// A rolling re-sweep cycle still running past its bound.
 pub const ADVERTISE_RESWEEP_CYCLE_OVERDUE: &str = "advertise_resweep_cycle_overdue";
+/// CIRISEdge#968 — a round's Attestation send set came from the memo.
+pub const ADVERTISE_SEND_SET_MEMO_HIT: &str = "advertise_send_set_memo_hit";
+/// CIRISEdge#968 — a round's Attestation send set was read from the store.
+pub const ADVERTISE_SEND_SET_READ: &str = "advertise_send_set_read";
+/// CIRISEdge#968 — a local write (a host kick, `note_local_write`, a released
+/// signer) dropped the send-set memos, so the next round re-reads them.
+pub const ADVERTISE_SEND_SET_INVALIDATED: &str = "advertise_send_set_invalidated";
+/// CIRISEdge#971 — a door dropped a consent send-set memo that was still
+/// LIVE (inside its TTL): the next round's send set pays a read it would
+/// otherwise have answered from memory. The cause split of the #968 drops.
+pub const ADVERTISE_SEND_SET_DROPPED_LIVE: &str = "advertise_send_set_dropped_live";
+/// CIRISEdge#971 — a round found the consent memo present but past
+/// its TTL (the other cause of a send-set read).
+pub const ADVERTISE_SEND_SET_EXPIRED: &str = "advertise_send_set_expired";
 /// A request or response that completed on a link a peer dialled before the
 /// event loop had answered its handshake (the two ride different event planes,
 /// so a fast dialler's first frame can overtake its last handshake part), or a
@@ -1435,6 +1537,226 @@ pub const KEY_PLANE_PROBE_FAILURES: &str = "key_plane_probe_failures";
 pub const KEY_PLANE_INVALIDATED: &str = "key_plane_invalidated";
 /// Memo rebuilds (first use, the TTL, or after a failed probe).
 pub const KEY_PLANE_REBUILDS: &str = "key_plane_rebuilds";
+/// CIRISEdge#971 — rebuilds by cause: the memo's first build.
+pub const KEY_PLANE_REBUILDS_FIRST: &str = "key_plane_rebuilds_first";
+/// CIRISEdge#971 — rebuilds by cause: the key-plane memo TTL expired.
+pub const KEY_PLANE_REBUILDS_TTL: &str = "key_plane_rebuilds_ttl";
+/// CIRISEdge#971 — a memo forgotten because the shared feed's probe failed
+/// (its next listing reads every subject).
+pub const KEY_PLANE_FORGOTTEN: &str = "key_plane_forgotten";
+/// CIRISEdge#971 — a memo's inbox overflowed (more key-plane rows landed
+/// between two of its listings than the inbox holds): the whole plane dropped.
+pub const KEY_PLANE_INBOX_OVERFLOWS: &str = "key_plane_inbox_overflows";
+/// CIRISEdge#971 — a delta row that drops a whole plane (a `key:revocation:v1`
+/// on the Revocation plane, an occurrence-revocation carrier, an unresolvable
+/// `withdraws` target).
+pub const KEY_PLANE_PLANE_DIRT: &str = "key_plane_plane_dirt";
+/// CIRISEdge#971 — feed asks answered without a store read because the last
+/// probe was inside the spacing and no door had marked the feed dirty.
+pub const KEY_PLANE_PROBES_SPACED: &str = "key_plane_probes_spaced";
+/// CIRISEdge#971 — doors that marked the shared feed dirty (an admitted
+/// apply, a host kick, `note_local_write(s)`, a released signer).
+pub const KEY_PLANE_FEED_DIRTY_MARKS: &str = "key_plane_feed_dirty_marks";
+/// CIRISEdge#971 — listings served whole from the plane's listing cache (no
+/// walk of the memo: the memo's generation had not moved and the subject set
+/// was equal).
+pub const KEY_PLANE_LISTING_CACHE_HITS: &str = "key_plane_listing_cache_hits";
+/// CIRISEdge#971 — subjects a listing left unread because its read budget was
+/// spent (absent from that listing, read by a later one).
+pub const KEY_PLANE_BUDGET_DEFERRED: &str = "key_plane_budget_deferred";
+/// CIRISEdge#971 — stale answers served because the read budget was spent
+/// before their revalidation read (stale-while-revalidate).
+pub const KEY_PLANE_STALE_SERVED: &str = "key_plane_stale_served";
+/// CIRISEdge#971 — stale answers re-read (their revalidation).
+pub const KEY_PLANE_REVALIDATED: &str = "key_plane_revalidated";
+
+// ─── CIRISEdge#971 — `EdgeMetrics::sweep_permits` labels ────────────────
+//
+// Every sweep-gate acquire, by the call site that took it. The gate's own
+// `sweep_permit_wait_seconds.count` is the total; this is its split, so a
+// seat's permit rate names its cause.
+
+/// The holdings drain of persist's content-hash index (one per page).
+pub const SWEEP_PERMIT_HOLDINGS_INDEX: &str = "holdings_index";
+/// The holdings ROW drain (`list_attestation_holdings`, the fallback).
+pub const SWEEP_PERMIT_HOLDINGS_ROWS: &str = "holdings_rows";
+/// A since-cursor page of a non-attestation plane (`sweep_paged`).
+pub const SWEEP_PERMIT_PLANE_PAGE: &str = "plane_page";
+/// An accord-evidence cursor page.
+pub const SWEEP_PERMIT_ACCORD_EVIDENCE: &str = "accord_evidence";
+/// A subject Pull answer.
+pub const SWEEP_PERMIT_SUBJECT_PULL: &str = "subject_pull";
+/// An announced-testimony subject Pull answer.
+pub const SWEEP_PERMIT_ANNOUNCED_TESTIMONY: &str = "announced_testimony";
+/// One key-plane subject read (a memo miss).
+pub const SWEEP_PERMIT_KEY_PLANE_SUBJECT: &str = "key_plane_subject";
+/// A page of the shared Attestation serve-cursor feed.
+pub const SWEEP_PERMIT_FEED_ATTESTATION: &str = "feed_attestation";
+/// A page of the route serve-cursor feed.
+pub const SWEEP_PERMIT_FEED_ROUTE: &str = "feed_route";
+/// The consent send-set read (a consent-memo miss).
+pub const SWEEP_PERMIT_SEND_SET: &str = "send_set";
+/// An advertise page of the Attestation serve cursor.
+pub const SWEEP_PERMIT_ADVERTISE_PAGE: &str = "advertise_page";
+/// The advertise's required read.
+pub const SWEEP_PERMIT_ADVERTISE_REQUIRED: &str = "advertise_required";
+/// The holdings index's warm-up walk from the head of the log (one page).
+pub const SWEEP_PERMIT_HOLDINGS_WARM: &str = "holdings_warm";
+/// Any acquire that names no site (tests).
+pub const SWEEP_PERMIT_OTHER: &str = "other";
+
+// ─── CIRISEdge#971 — `EdgeMetrics::holdings_index` labels ───────────────
+//
+// The receive diff of the Attestation and TransportDestination content-hash
+// indexes answered from a set kept equal to persist's `signed_wire_index`
+// (`replication::holdings_index`). Per-plane labels are `[attestation,
+// transport_destination]` pairs, indexed by the plane. Counters live in
+// `holdings_index`, gauges in `holdings_index_gauge`.
+
+/// Diffs answered from the set.
+pub const HOLDINGS_ANSWERS_SET: [&str; 2] = [
+    "attestation.answers_set",
+    "transport_destination.answers_set",
+];
+/// Asks answered by draining the index (boot, audit, fallback).
+pub const HOLDINGS_ANSWERS_DRAIN: [&str; 2] = [
+    "attestation.answers_drain",
+    "transport_destination.answers_drain",
+];
+/// Asks that fell back to the drain because the set was not booted.
+pub const HOLDINGS_FALLBACK_UNBOOTED: [&str; 2] = [
+    "attestation.fallback_unbooted",
+    "transport_destination.fallback_unbooted",
+];
+/// Asks that fell back to the drain because the set was suspect.
+pub const HOLDINGS_FALLBACK_SUSPECT: [&str; 2] = [
+    "attestation.fallback_suspect",
+    "transport_destination.fallback_suspect",
+];
+/// Boot drains completed.
+pub const HOLDINGS_BOOTS: [&str; 2] = ["attestation.boots", "transport_destination.boots"];
+/// Audit drains completed.
+pub const HOLDINGS_AUDITS: [&str; 2] = ["attestation.audits", "transport_destination.audits"];
+/// Boot or audit drains the store did not serve.
+pub const HOLDINGS_DRAIN_FAILURES: [&str; 2] = [
+    "attestation.drain_failures",
+    "transport_destination.drain_failures",
+];
+/// Wall milliseconds spent in boot and audit drains.
+pub const HOLDINGS_DRAIN_MS: [&str; 2] = ["attestation.drain_ms", "transport_destination.drain_ms"];
+/// Hashes the index held that the set did not, found by an audit.
+pub const HOLDINGS_DRIFT_MISSING: [&str; 2] = [
+    "attestation.drift_missing",
+    "transport_destination.drift_missing",
+];
+/// Hashes the set held that the index did not, found by an audit.
+pub const HOLDINGS_DRIFT_EXTRA: [&str; 2] = [
+    "attestation.drift_extra",
+    "transport_destination.drift_extra",
+];
+/// Audits whose drift exceeded the tolerance (the plane went suspect).
+pub const HOLDINGS_SUSPECT_AUDITS: [&str; 2] = [
+    "attestation.suspect_audits",
+    "transport_destination.suspect_audits",
+];
+/// Hashes inserted by the write-through on an admitted apply.
+pub const HOLDINGS_WRITE_THROUGH: [&str; 2] = [
+    "attestation.write_through",
+    "transport_destination.write_through",
+];
+/// Hashes new to the set inserted by a cursor delta.
+pub const HOLDINGS_FEED_INSERTS: [&str; 2] = [
+    "attestation.feed_inserts",
+    "transport_destination.feed_inserts",
+];
+/// A `Duplicate` apply of a hash the set said it lacked: the free "missing"
+/// signal (the row was fetched although the store held it).
+pub const HOLDINGS_DUPLICATE_UNHELD: [&str; 2] = [
+    "attestation.duplicate_unheld",
+    "transport_destination.duplicate_unheld",
+];
+/// Feed drains (one per serve-cursor catch-up that read the store).
+pub const HOLDINGS_FEED_PROBES: [&str; 2] = [
+    "attestation.feed_probes",
+    "transport_destination.feed_probes",
+];
+/// Feed asks satisfied by a drain another caller had just run.
+pub const HOLDINGS_FEED_COALESCED: [&str; 2] = [
+    "attestation.feed_coalesced",
+    "transport_destination.feed_coalesced",
+];
+/// Feed drains the store did not serve (the planes went suspect).
+pub const HOLDINGS_FEED_FAILURES: [&str; 2] = [
+    "attestation.feed_failures",
+    "transport_destination.feed_failures",
+];
+/// Gauge: hashes in the set.
+pub const HOLDINGS_GAUGE_SIZE: [&str; 2] = ["attestation.size", "transport_destination.size"];
+/// Gauge: 0 unbooted, 1 booting, 2 ready, 3 suspect.
+pub const HOLDINGS_GAUGE_STATUS: [&str; 2] = ["attestation.status", "transport_destination.status"];
+/// Gauge: where the last answer came from, 1 the set, 2 a drain.
+pub const HOLDINGS_GAUGE_SOURCE: [&str; 2] = ["attestation.source", "transport_destination.source"];
+/// Gauge: the last audit's wall milliseconds.
+pub const HOLDINGS_GAUGE_LAST_DRAIN_MS: [&str; 2] = [
+    "attestation.last_drain_ms",
+    "transport_destination.last_drain_ms",
+];
+/// Gauge: 1 when the lever is on.
+pub const HOLDINGS_GAUGE_ENABLED: &str = "enabled";
+/// CIRISEdge#971 — stale-route marks set (a replicated route older than the
+/// one held, `holdings_index.stale_route.marked`).
+pub const STALE_ROUTE_MARKED: &str = "stale_route.marked";
+/// Wants a stale-route mark dropped (the older bytes not asked for again).
+pub const STALE_ROUTE_SUPPRESSED: &str = "stale_route.suppressed";
+/// Marks evicted, front-drop, to make room past the cap.
+pub const STALE_ROUTE_EVICTED: &str = "stale_route.evicted";
+/// Marks dropped because a route left the index (an audit's `extra`).
+pub const STALE_ROUTE_CLEARED: &str = "stale_route.cleared";
+/// Gauge: stale-route marks held.
+pub const HOLDINGS_GAUGE_STALE_ROUTE_SIZE: &str = "stale_route.size";
+/// Gauge: answers held in each key-plane memo, by `KeyPlaneRead` slot (key
+/// record, occurrence binding, revocation, occurrence withdrawal). Set after
+/// every listing; bounded by the host's publish sets (see `PlaneMemo`).
+pub const KEY_PLANE_GAUGE_MEMO_ENTRIES: [&str; 4] = [
+    "key_plane.key_record.memo_entries",
+    "key_plane.occurrence_binding.memo_entries",
+    "key_plane.revocation.memo_entries",
+    "key_plane.occurrence_withdrawal.memo_entries",
+];
+/// Gauge: subjects the last listing of each key plane left UNREAD because its
+/// read budget was spent (absent from that listing), by `KeyPlaneRead` slot.
+/// Non-zero for more than a few listings in a row is a stall.
+pub const KEY_PLANE_GAUGE_UNREAD: [&str; 4] = [
+    "key_plane.key_record.unread",
+    "key_plane.occurrence_binding.unread",
+    "key_plane.revocation.unread",
+    "key_plane.occurrence_withdrawal.unread",
+];
+/// Gauge: stale answers the last listing of each key plane served while they
+/// wait for their revalidation read, by `KeyPlaneRead` slot.
+pub const KEY_PLANE_GAUGE_STALE: [&str; 4] = [
+    "key_plane.key_record.stale",
+    "key_plane.occurrence_binding.stale",
+    "key_plane.revocation.stale",
+    "key_plane.occurrence_withdrawal.stale",
+];
+/// Gauge: milliseconds from the runtime's warm-up start to this plane's set
+/// being Ready (its walk from the head of the log plus its boot drain), set
+/// once per process. Absent while the plane has not come up through the
+/// warm-up.
+pub const HOLDINGS_GAUGE_READY_AFTER_MS: [&str; 2] = [
+    "attestation.ready_after_ms",
+    "transport_destination.ready_after_ms",
+];
+/// Rows the warm-up's walk from the head of the log read, per plane.
+pub const HOLDINGS_WARM_ROWS: [&str; 2] =
+    ["attestation.warm_rows", "transport_destination.warm_rows"];
+/// Warm-up walk pages the store did not serve (the plane then boots inline,
+/// on its first ask, as without a warm-up).
+pub const HOLDINGS_WARM_FAILURES: [&str; 2] = [
+    "attestation.warm_failures",
+    "transport_destination.warm_failures",
+];
 
 // ─── v44 LTS — `EdgeMetrics::persisted_standing` labels ─────────────────
 //
@@ -1870,9 +2192,32 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_FRAME_EXPIRED_MARKED,
     AV_FRAME_EXPIRED_LATE,
     AV_FRAME_STALE_DROPPED,
+    AV_SENT_DATAGRAM,
+    AV_SENT_DATAGRAM_FALLBACK,
+    AV_DATAGRAM_SHED,
+    AV_DATAGRAM_SHED_SINK,
+    AV_DATAGRAM_LATE,
+    AV_DATAGRAM_REPLAYED,
+    AV_DATAGRAM_REFUSED,
+    AV_INBOUND_DATAGRAM_GAP,
+    AV_INBOUND_DATAGRAM_REORDERED,
+    AV_INBOUND_DATAGRAM_OFF_AV,
     AV_CHUNK_DROPPED_CONGESTED,
     AV_LEG_SHED_TO_BASE,
     AV_LEG_RESTORED,
+    AV_CALL_END_FLUSH_UNCONFIRMED,
+    AV_CALL_REPLACE_SWITCH_UNCONFIRMED,
+    AV_CALL_STREAM_TRUNCATED,
+    AV_FRAME_MARKER_SHORT,
+    AV_FRAME_COUNT_INVALID,
+    AV_FRAME_INDEX_INVALID,
+    AV_FRAME_COUNT_MISMATCH,
+    AV_FRAME_LAYER_MISMATCH,
+    AV_FRAME_CROSSES_EPOCH,
+    AV_FRAME_SEQ_MISMATCH,
+    AV_FRAME_INCOMPLETE,
+    AV_FRAME_TOO_LARGE,
+    AV_FRAME_FRAMING_UNKNOWN,
     ALM_C3_SENT,
     ALM_C3_SEND_FAILED,
     ALM_C3_RESENT,
@@ -1896,6 +2241,97 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_LOOP_DETECTED,
     ALM_OVER_CLAIM,
 ];
+/// CIRISEdge#971 — a replication frame rode a link the peer opened (the
+/// reverse path, CIRISEdge#353): the seat's offer on a NAT'd member's own link.
+pub const REPLICATION_REACH_CARRIED_ON_INBOUND_LINK: &str = "carried_on_inbound_link";
+/// CIRISEdge#971 — a replication frame took the dial path (no live link).
+pub const REPLICATION_REACH_DIALLED: &str = "dialled";
+/// CIRISEdge#971 — a replication send refused before any seek or dial: no
+/// live link, no path and no authenticated transit pair, so CC 5.3.3.5 E1
+/// lets no dial reach the peer. Booked as `no_route`, as before.
+pub const REPLICATION_REACH_SKIPPED_UNDIALABLE: &str = "skipped_undialable";
+/// CIRISEdge#971 — a round not started, before its advertise sweep, toward a
+/// peer the transport cannot carry it to (the same predicate as above).
+pub const REPLICATION_REACH_ROUND_SKIPPED: &str = "round_skipped_undialable";
+/// CIRISEdge#971 — a path seek a dial raised found a path.
+pub const REPLICATION_REACH_PATH_SEEK_FOUND: &str = "path_seek_found";
+/// CIRISEdge#971 — a path seek a dial raised waited out its budget, pathless.
+pub const REPLICATION_REACH_PATH_SEEK_NOT_FOUND: &str = "path_seek_not_found";
+/// CIRISEdge#971 — a path request broadcast (one per destination per
+/// `PATH_SEEK_MIN_INTERVAL`).
+pub const REPLICATION_REACH_PATH_REQUEST_SENT: &str = "path_request_sent";
+/// Every `replication_reach` key.
+pub const REPLICATION_REACH_LABELS: &[&str] = &[
+    REPLICATION_REACH_CARRIED_ON_INBOUND_LINK,
+    REPLICATION_REACH_DIALLED,
+    REPLICATION_REACH_SKIPPED_UNDIALABLE,
+    REPLICATION_REACH_ROUND_SKIPPED,
+    REPLICATION_REACH_PATH_SEEK_FOUND,
+    REPLICATION_REACH_PATH_SEEK_NOT_FOUND,
+    REPLICATION_REACH_PATH_REQUEST_SENT,
+];
+/// CIRISEdge#971 — initiator peers the host named (consent peers, `set_peers`).
+pub const INITIATOR_PEERS_HOST: &str = "host";
+/// CIRISEdge#971 — initiator peers from the bundle's seated serve nodes (#881).
+pub const INITIATOR_PEERS_BUNDLE: &str = "bundle";
+/// CIRISEdge#971 — initiator peers this node homed on after a refusal (CC 5.4.3).
+pub const INITIATOR_PEERS_HOMED: &str = "homed";
+/// CIRISEdge#971 (d) — a bundle-seat Pull cycle a seat's first contact ran.
+pub const BUNDLE_PULL_CYCLE_FIRST_CONTACT: &str = "cycle_first_contact";
+/// CIRISEdge#971 (d) — a bundle-seat Pull cycle the jittered timer ran.
+pub const BUNDLE_PULL_CYCLE_TIMER: &str = "cycle_timer";
+/// CIRISEdge#971 (d) — a bundle-seat Pull cycle a host kick (`round_now`)
+/// ran: this node's and the seat's legs, never the owner's.
+pub const BUNDLE_PULL_CYCLE_KICK: &str = "cycle_kick";
+/// CIRISEdge#971 (d) — a bundle-seat Pull cycle a local write on a Pull plane
+/// ran: the self-subject offering Pull on that plane only.
+pub const BUNDLE_PULL_CYCLE_WRITE: &str = "cycle_write";
+/// CIRISEdge#971 (d) — first contact ran out of quick tries with a seat that
+/// does not yet hold our key and route; the ordinary timer asks from then on.
+pub const BUNDLE_PULL_FIRST_CONTACT_GAVE_UP: &str = "first_contact_gave_up";
+/// CIRISEdge#971 (d) — a Pull of this node's own rows (uncharged at the seat).
+pub const BUNDLE_PULL_SELF: &str = "pull_self";
+/// CIRISEdge#971 (d) — a Pull of the seat's own rows (uncharged at the seat).
+pub const BUNDLE_PULL_SEAT: &str = "pull_seat";
+/// CIRISEdge#971 (d) — a Pull of this node's owner's rows (one charged lookup).
+pub const BUNDLE_PULL_OWNER: &str = "pull_owner";
+/// CIRISEdge#971 (d) — a Pull not sent: the seat's throttle hint still runs.
+pub const BUNDLE_PULL_HELD_BACK: &str = "held_back";
+/// CIRISEdge#971 (d) — a no-consent seat answered a Pull about this node.
+pub const BUNDLE_PULL_ANSWER_SELF: &str = "answer_self";
+/// CIRISEdge#971 (d) — a no-consent seat answered a Pull about itself.
+pub const BUNDLE_PULL_ANSWER_SEAT: &str = "answer_seat";
+/// CIRISEdge#971 (d) — a no-consent seat answered a Pull about our owner.
+pub const BUNDLE_PULL_ANSWER_OWNER: &str = "answer_owner";
+/// CIRISEdge#971 (d) — a no-consent seat answered a Pull about anyone else:
+/// only a host's own lookup (`pull_subject_testimony`) asks one; (d) never
+/// does. Non-zero means the host is looking people up at a seat.
+pub const BUNDLE_PULL_ANSWER_OTHER: &str = "answer_other";
+/// CIRISEdge#971 (d) — a no-consent seat answered a Pull with a throttle.
+pub const BUNDLE_PULL_ANSWER_THROTTLED: &str = "answer_throttled";
+/// Every `bundle_pull` key.
+pub const BUNDLE_PULL_LABELS: &[&str] = &[
+    BUNDLE_PULL_CYCLE_FIRST_CONTACT,
+    BUNDLE_PULL_CYCLE_TIMER,
+    BUNDLE_PULL_CYCLE_KICK,
+    BUNDLE_PULL_CYCLE_WRITE,
+    BUNDLE_PULL_FIRST_CONTACT_GAVE_UP,
+    BUNDLE_PULL_SELF,
+    BUNDLE_PULL_SEAT,
+    BUNDLE_PULL_OWNER,
+    BUNDLE_PULL_HELD_BACK,
+    BUNDLE_PULL_ANSWER_SELF,
+    BUNDLE_PULL_ANSWER_SEAT,
+    BUNDLE_PULL_ANSWER_OWNER,
+    BUNDLE_PULL_ANSWER_OTHER,
+    BUNDLE_PULL_ANSWER_THROTTLED,
+];
+/// Every `initiator_peers` key.
+pub const INITIATOR_PEERS_LABELS: &[&str] = &[
+    INITIATOR_PEERS_HOST,
+    INITIATOR_PEERS_BUNDLE,
+    INITIATOR_PEERS_HOMED,
+];
 /// Every `advertise` key.
 pub const ADVERTISE_LABELS: &[&str] = &[
     ADVERTISE_NOT_ADVERTISABLE,
@@ -1906,6 +2342,11 @@ pub const ADVERTISE_LABELS: &[&str] = &[
     ADVERTISE_READ_FAILED,
     ADVERTISE_RESWEEP_CYCLE_COMPLETED,
     ADVERTISE_RESWEEP_CYCLE_OVERDUE,
+    ADVERTISE_SEND_SET_MEMO_HIT,
+    ADVERTISE_SEND_SET_READ,
+    ADVERTISE_SEND_SET_INVALIDATED,
+    ADVERTISE_SEND_SET_DROPPED_LIVE,
+    ADVERTISE_SEND_SET_EXPIRED,
 ];
 /// Every `link_stall` key.
 pub const LINK_STALL_LABELS: &[&str] = &[
@@ -2169,6 +2610,16 @@ pub struct EdgeMetrics {
     /// re-offered after being skipped, watermark rewinds on an advertise
     /// input change, and re-sweep cycles completed / overdue.
     pub advertise: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 — how replication frames reached their peer, and what
+    /// the path seeks a dial raised cost, by label (`REPLICATION_REACH_*`).
+    pub replication_reach: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 (d) — bundle-seat Pull cycles by cause and Pulls by
+    /// subject (`BUNDLE_PULL_*`).
+    pub bundle_pull: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 — the distinct peers this node opens replication rounds
+    /// toward, by where they came from (`INITIATOR_PEERS_*`). A gauge: set,
+    /// not counted. All zero on a device with nobody to round with.
+    pub initiator_peers: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — direct links (leviculum#70) by label
     /// (`DIRECT_LINK_*` constants in this module): proposals made, skipped
     /// and refused, and each outcome. Every `direct_link_failed_*` label is a
@@ -2183,6 +2634,13 @@ pub struct EdgeMetrics {
     /// subject reads, memo hits, change-probe reads and rows, invalidations,
     /// rebuilds and the wall time spent reading.
     pub key_plane_sweep: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 — sweep-gate acquires by call site (`SWEEP_PERMIT_*`).
+    pub sweep_permits: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 — the holdings index's counters, by `HOLDINGS_*` label.
+    pub holdings_index: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#971 — the holdings index's gauges, by `HOLDINGS_GAUGE_*`
+    /// label: set size, status, source of the last answer, last drain time.
+    pub holdings_index_gauge: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// v44 LTS — the persisted-standing refresh by label
     /// (`PERSISTED_STANDING_*` constants in this module): passes, their wall
     /// time, ticks skipped, passes cut, sweeps and rows walked.
@@ -2851,6 +3309,16 @@ impl EdgeMetrics {
         *self.av_plane.write().entry(label).or_insert(0) += 1;
     }
 
+    /// leviculum#102 — add `n` A/V-plane events under one `AV_*` label (a
+    /// delta folded from leviculum's own counters). Adding 0 is a no-op.
+    pub fn add_av_plane(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            let mut plane = self.av_plane.write();
+            let v = plane.entry(label).or_insert(0);
+            *v = v.saturating_add(n);
+        }
+    }
+
     /// CIRISEdge#805 — the A/V-plane ledger by label (tests + the operator
     /// readback).
     #[must_use]
@@ -2893,6 +3361,39 @@ impl EdgeMetrics {
     /// Count one advertise event by its `ADVERTISE_*` label.
     pub fn inc_advertise(&self, label: &'static str) {
         *self.advertise.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#971 — count one `replication_reach` event.
+    pub fn inc_replication_reach(&self, label: &'static str) {
+        *self.replication_reach.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#971 (d) — count one `bundle_pull` event.
+    pub fn inc_bundle_pull(&self, label: &'static str) {
+        *self.bundle_pull.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#971 (d) — the `bundle_pull` ledger by label.
+    #[must_use]
+    pub fn bundle_pull(&self) -> HashMap<String, u64> {
+        owned_keys(&self.bundle_pull)
+    }
+
+    /// CIRISEdge#971 — the `replication_reach` ledger by label.
+    #[must_use]
+    pub fn replication_reach(&self) -> HashMap<String, u64> {
+        owned_keys(&self.replication_reach)
+    }
+
+    /// CIRISEdge#971 — set the `initiator_peers` gauge for `source`.
+    pub fn set_initiator_peers(&self, source: &'static str, peers: u64) {
+        self.initiator_peers.write().insert(source, peers);
+    }
+
+    /// CIRISEdge#971 — the `initiator_peers` gauge by source.
+    #[must_use]
+    pub fn initiator_peers(&self) -> HashMap<String, u64> {
+        owned_keys(&self.initiator_peers)
     }
 
     /// The advertise ledger by label (tests + the operator readback).
@@ -2989,10 +3490,57 @@ impl EdgeMetrics {
         }
     }
 
+    /// CIRISEdge#971 — one sweep-gate acquire at `site` (`SWEEP_PERMIT_*`).
+    pub fn inc_sweep_permit(&self, site: &'static str) {
+        *self.sweep_permits.write().entry(site).or_insert(0) += 1;
+    }
+
+    /// Sweep-gate acquires by site (tests + the operator readback).
+    #[must_use]
+    pub fn sweep_permits(&self) -> HashMap<String, u64> {
+        self.sweep_permits
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
     /// The key-plane listing ledger by label (tests + the operator readback).
     #[must_use]
     pub fn key_plane_sweep(&self) -> HashMap<String, u64> {
         self.key_plane_sweep
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#971 — add `n` to a `HOLDINGS_*` counter label.
+    pub fn add_holdings_index(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.holdings_index.write().entry(label).or_insert(0) += n;
+        }
+    }
+
+    /// CIRISEdge#971 — set a `HOLDINGS_GAUGE_*` label.
+    pub fn set_holdings_index_gauge(&self, label: &'static str, v: u64) {
+        self.holdings_index_gauge.write().insert(label, v);
+    }
+
+    /// The holdings index's counters by label (tests + the operator readback).
+    #[must_use]
+    pub fn holdings_index(&self) -> HashMap<String, u64> {
+        self.holdings_index
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// The holdings index's gauges by label.
+    #[must_use]
+    pub fn holdings_index_gauge(&self) -> HashMap<String, u64> {
+        self.holdings_index_gauge
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -3680,6 +4228,13 @@ impl EdgeMetrics {
         // it leaves only through `ShapingWindows`.
         let mut link_shaping = registered(&self.link_shaping, LINK_SHAPING_LABELS);
         link_shaping.remove(LINK_SHAPING_FRAMES_REAL);
+        // Milliseconds and entry counts, far below 2^52.
+        #[allow(clippy::cast_precision_loss)]
+        let holdings_index_gauge = self
+            .holdings_index_gauge()
+            .into_iter()
+            .map(|(k, v)| (k, v as f64))
+            .collect();
         EdgeMetricsBundle {
             envelopes_sent_total: self.envelopes_sent_total.read().clone(),
             envelopes_received_total: self.envelopes_received_total.read().clone(),
@@ -3756,6 +4311,9 @@ impl EdgeMetrics {
             direct_link: registered(&self.direct_link, DIRECT_LINK_LABELS),
             peer_binding: registered(&self.peer_binding, PEER_BINDING_LABELS),
             key_plane_sweep: self.key_plane_sweep(),
+            sweep_permits: self.sweep_permits(),
+            holdings_index: self.holdings_index(),
+            holdings_index_gauge,
             persisted_standing: self.persisted_standing(),
             link_stall: registered(&self.link_stall, LINK_STALL_LABELS),
             direct_link_upgrade_guarded: registered(
@@ -3763,6 +4321,9 @@ impl EdgeMetrics {
                 UPGRADE_GUARDED_LABELS,
             ),
             advertise: registered(&self.advertise, ADVERTISE_LABELS),
+            replication_reach: registered(&self.replication_reach, REPLICATION_REACH_LABELS),
+            bundle_pull: registered(&self.bundle_pull, BUNDLE_PULL_LABELS),
+            initiator_peers: registered(&self.initiator_peers, INITIATOR_PEERS_LABELS),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
@@ -3860,6 +4421,7 @@ impl EdgeMetrics {
             forward_packets_per_second: t.forward_packets_per_second,
             forward_bits_per_second: t.forward_bits_per_second,
             shaping_enabled: t.shaping_enabled,
+            av_datagrams_enabled: t.av_datagrams_enabled,
             shaping_links: t.shaping_links,
             shaping_free_slots: t.shaping_free_slots,
             shaping_seat_roster_age_seconds: t.shaping_seat_roster_age_seconds,
@@ -3874,6 +4436,9 @@ impl EdgeMetrics {
             alm_c3_peers: t.alm_c3_peers,
             decision_row_unheard_total: t.decision_row_unheard_total,
             decision_row_subscribers: t.decision_row_subscribers,
+            group_backfill_rows_read_total: t.group_backfill_rows_read_total,
+            group_backfill_rows_kept_total: t.group_backfill_rows_kept_total,
+            group_backfill_completed_total: t.group_backfill_completed_total,
             apply_refusals: t.apply_refusals,
             loop_last_progress_age_seconds: t.loop_last_progress_age_seconds,
             node_alive: t.node_alive,
@@ -4096,6 +4661,12 @@ pub struct EdgeMetricsBundle {
     pub peer_binding: HashMap<String, u64>,
     /// CIRISEdge#930 — the key-plane listings' cost by `KEY_PLANE_*` label.
     pub key_plane_sweep: HashMap<String, u64>,
+    /// CIRISEdge#971 — sweep-gate acquires by `SWEEP_PERMIT_*` site.
+    pub sweep_permits: HashMap<String, u64>,
+    /// CIRISEdge#971 — the holdings index's counters by `HOLDINGS_*` label.
+    pub holdings_index: HashMap<String, u64>,
+    /// CIRISEdge#971 — the holdings index's gauges by `HOLDINGS_GAUGE_*` label.
+    pub holdings_index_gauge: HashMap<String, f64>,
     /// v44 LTS — the persisted-standing refresh by `PERSISTED_STANDING_*` label.
     pub persisted_standing: HashMap<String, u64>,
     /// CIRISEdge#926 — the link stall guard by `LINK_STALL_*` label.
@@ -4104,6 +4675,12 @@ pub struct EdgeMetricsBundle {
     pub direct_link_upgrade_guarded: HashMap<String, u64>,
     /// `advertise.<label>`: the advertise sweep's ledger.
     pub advertise: HashMap<String, u64>,
+    /// CIRISEdge#971 — `replication_reach.<label>`.
+    pub replication_reach: HashMap<String, u64>,
+    /// CIRISEdge#971 (d) — `bundle_pull.<label>`.
+    pub bundle_pull: HashMap<String, u64>,
+    /// CIRISEdge#971 — `initiator_peers.<source>`, a gauge.
+    pub initiator_peers: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
     pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
@@ -4284,6 +4861,8 @@ pub struct EdgeMetricsBundle {
     pub forward_bits_per_second: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub shaping_enabled: u64,
+    /// leviculum#102 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub av_datagrams_enabled: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub shaping_links: HashMap<String, u64>,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
@@ -4312,6 +4891,12 @@ pub struct EdgeMetricsBundle {
     pub decision_row_unheard_total: HashMap<String, u64>,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub decision_row_subscribers: u64,
+    /// CIRISEdge#968 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub group_backfill_rows_read_total: u64,
+    /// CIRISEdge#968 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub group_backfill_rows_kept_total: u64,
+    /// CIRISEdge#968 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
+    pub group_backfill_completed_total: u64,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub apply_refusals: HashMap<String, u64>,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
@@ -4536,6 +5121,12 @@ impl EdgeMetricsBundle {
         f.family("peer_binding", &self.peer_binding);
         // CIRISEdge#930 — the key-plane listings, `key_plane_sweep.<label>`.
         f.family("key_plane_sweep", &self.key_plane_sweep);
+        // CIRISEdge#971 — sweep-gate acquires, `sweep_permits.<site>`.
+        f.family("sweep_permits", &self.sweep_permits);
+        // CIRISEdge#971 — the holdings index, `holdings_index.<label>` and
+        // the gauges `holdings_index_gauge.<label>`.
+        f.family("holdings_index", &self.holdings_index);
+        f.gauge_family("holdings_index_gauge", &self.holdings_index_gauge);
         // v44 LTS — the persisted-standing refresh, `persisted_standing.<label>`.
         f.family("persisted_standing", &self.persisted_standing);
         // CIRISEdge#926 — the link stall guard, `link_stall.<label>`.
@@ -4546,6 +5137,9 @@ impl EdgeMetricsBundle {
             &self.direct_link_upgrade_guarded,
         );
         f.family("advertise", &self.advertise);
+        f.family("replication_reach", &self.replication_reach);
+        f.family("bundle_pull", &self.bundle_pull);
+        f.family("initiator_peers", &self.initiator_peers);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
             "direct_links_active".to_string(),
@@ -4780,12 +5374,25 @@ impl EdgeMetricsBundle {
             ),
             ("forward_bits_per_second", self.forward_bits_per_second),
             ("shaping_enabled", self.shaping_enabled),
+            ("av_datagrams_enabled", self.av_datagrams_enabled),
             ("shaping_free_slots", self.shaping_free_slots),
             ("leviculum_shed_packets", self.leviculum_shed_packets),
             ("direct_link_proposing", self.direct_link_proposing),
             ("alm_active_calls", self.alm_active_calls),
             ("alm_c3_peers", self.alm_c3_peers),
             ("decision_row_subscribers", self.decision_row_subscribers),
+            (
+                "group_backfill_rows_read_total",
+                self.group_backfill_rows_read_total,
+            ),
+            (
+                "group_backfill_rows_kept_total",
+                self.group_backfill_rows_kept_total,
+            ),
+            (
+                "group_backfill_completed_total",
+                self.group_backfill_completed_total,
+            ),
             ("node_alive", self.node_alive),
         ] {
             f.counters.insert(name.to_string(), value);
@@ -4863,10 +5470,16 @@ edge_metrics_bundle_fields!(
     direct_link,
     peer_binding,
     key_plane_sweep,
+    sweep_permits,
+    holdings_index,
+    holdings_index_gauge,
     persisted_standing,
     link_stall,
     direct_link_upgrade_guarded,
     advertise,
+    replication_reach,
+    bundle_pull,
+    initiator_peers,
     direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,
@@ -4941,6 +5554,7 @@ edge_metrics_bundle_fields!(
     forward_packets_per_second,
     forward_bits_per_second,
     shaping_enabled,
+    av_datagrams_enabled,
     shaping_links,
     shaping_free_slots,
     shaping_seat_roster_age_seconds,
@@ -4955,6 +5569,9 @@ edge_metrics_bundle_fields!(
     alm_c3_peers,
     decision_row_unheard_total,
     decision_row_subscribers,
+    group_backfill_rows_read_total,
+    group_backfill_rows_kept_total,
+    group_backfill_completed_total,
     apply_refusals,
     loop_last_progress_age_seconds,
     node_alive,
