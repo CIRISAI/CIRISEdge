@@ -39,7 +39,7 @@ use ciris_edge::files::{FileError, FileRow, FileStreamWrite, FileWrite, Publishe
 use ciris_edge::group_content::PersistGroupContentStore;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::FederationDirectory as _;
-use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
+use ciris_persist::prelude::{KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
 use ciris_persist::store::sqlite::SqliteBackend;
 use sha2::{Digest as _, Sha256};
@@ -215,7 +215,7 @@ async fn build_node_with(
     signer: &Ident,
     class: &str,
 ) -> Node {
-    let dir = FederationDirectorySqlite::open(path)
+    let dir = ciris_edge::store_open::open_federation_sqlite(path)
         .await
         .expect("open substrate");
     dir.run_migrations().await.expect("migrate");

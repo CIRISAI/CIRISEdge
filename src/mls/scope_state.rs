@@ -629,15 +629,13 @@ mod tests {
     #[tokio::test]
     async fn a_tpm_less_host_opens_the_store_on_disk_as_software() {
         use ciris_persist::encrypted_kv::MlsStateCustodyKind;
-        use ciris_persist::store::backend::Backend as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("mls-state.kv");
-        let backend = ciris_persist::prelude::FederationDirectorySqlite::open(
-            dir.path().join("persist.db").to_string_lossy().to_string(),
-        )
-        .await
-        .expect("open substrate");
-        backend.run_migrations().await.expect("migrate");
+        // Through edge's own door: on macOS a raw persist open fails at 61.2.2
+        // (CIRISPersist#1261); the door opens with no reader pool there.
+        let backend = crate::store_open::open_federation_sqlite(dir.path().join("persist.db"))
+            .await
+            .expect("open substrate");
         let mut ed = ciris_keyring::Ed25519SoftwareSigner::new("mls-state-test");
         ed.import_key(&[9u8; 32]).expect("import test key");
         let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(ed);
