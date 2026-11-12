@@ -3085,8 +3085,12 @@ async fn a_call_on_a_punched_interface_outlives_the_inbound_idle_bound() {
     let started = tokio::time::Instant::now();
     let mut frames = 0u32;
     while started.elapsed() < BOUND * 3 {
-        leg.sender
-            .send(format!("media-{frames}").as_bytes())
+        // Patiently: the leg is fresh, and its first frames can be refused
+        // `Congested` until the Channel's first acks come back (on CI darwin
+        // frame 1 was, 120 ms after the leg opened). What is pinned here is
+        // that frames keep crossing past the bound, which the receive below
+        // asserts for every frame.
+        send_patiently(&leg.sender, format!("media-{frames}").as_bytes())
             .await
             .unwrap_or_else(|e| panic!("frame {frames} sends: {e:?}"));
         tokio::time::timeout(Duration::from_secs(10), accepted.arrival.inbound.recv())

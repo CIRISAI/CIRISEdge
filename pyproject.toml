@@ -126,13 +126,13 @@ classifiers = [
 # adds trait methods, so pairing it with this cdylib could misdispatch a call
 # through a vtable that no ABI constant guards.
 #
-# Persist v61.2.2 adopt: an EXACT pin. Since 61.2 (CIRISPersist#1242) every
+# Persist v61.2.3 adopt: an EXACT pin. Since 61.2 (CIRISPersist#1242) every
 # raw-layout capsule is named `ciris_persist::<capsule>@<crate version>`, and
 # edge asks for the name its own build of persist compiled, so a wheel of any
-# other version (61.2.0, 61.2.1, 61.2.3 alike) is refused at init with
+# other version (61.2.0, 61.2.1, 61.2.2 alike) is refused at init with
 # `capsule_version_skew`. A range here would only admit wheels that cannot load.
 dependencies = [
-    "ciris-persist==61.2.2",
+    "ciris-persist==61.2.3",
 ]
 dynamic = ["version"]
 

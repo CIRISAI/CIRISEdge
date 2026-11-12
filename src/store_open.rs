@@ -1,5 +1,5 @@
-//! Opening a file-backed persist store, with the reader pool off on Apple
-//! targets until persist fixes it.
+//! Opening a file-backed persist store, with the reader pool off on iOS
+//! until a file-backed store has been opened there.
 //!
 //! **Why (CIRISPersist#1261).** At persist 61.2.2 a file-backed
 //! `SqliteBackend::open` fails on macOS with `sqlite open readers: unable to
@@ -7,18 +7,25 @@
 //! reader pool's open returns `SQLITE_CANTOPEN`. Found by edge v45.0.0's macOS
 //! lane; on a macos-15 runner `CIRIS_PERSIST_SQLITE_READERS=0` clears it, the
 //! memory-map knob and the temp directory do not, and the open-file limit was
-//! not the cause. Persist 61.0.5 opened the same stores. iOS links the same
-//! system SQLite and is presumed affected; nobody has opened a file-backed
-//! 61.2.x store there.
+//! not the cause. Persist 61.0.5 opened the same stores.
 //!
-//! **What this does.** On macOS and iOS, when the operator has not set
+//! Persist found the cause and fixed it in 61.2.3: Apple's system SQLite
+//! will not let a read-only connection create the `-wal`/`-shm` files, and
+//! since CIRISPersist#1246 a reader's first access happens inside the pool's
+//! open. Edge pins 61.2.3, its macOS lane opens file-backed stores with the
+//! pool on, and macOS is no longer in this module's scope. iOS links the same
+//! system SQLite, and nobody has opened a file-backed 61.2.3 store there, so
+//! the default stays on iOS until someone has.
+//!
+//! **What this does.** On iOS, when the operator has not set
 //! `CIRIS_PERSIST_SQLITE_READERS`, a file-backed store is opened with no reader
 //! pool: reads fall back to the writer connection, off the runtime, which is
 //! the model persist ran before the pool existed. The cost is concurrency
 //! only. An operator's own setting wins, every other platform is untouched,
 //! and an in-memory store never had a pool.
 //!
-//! Remove this module when the persist pin carries the fix.
+//! Remove this module when a file-backed 61.2.3 store has opened on iOS
+//! with the pool on.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,11 +37,11 @@ use ciris_persist::store::Backend as _;
 const READERS_ENV: &str = ciris_persist::store::sqlite_conn_model::READERS_ENV;
 
 /// Whether this build is for a platform where the reader pool is off by default.
-const APPLE: bool = cfg!(any(target_os = "macos", target_os = "ios"));
+const POOL_OFF_PLATFORM: bool = cfg!(target_os = "ios");
 
 /// The reader count to force, or `None` to leave persist's default.
 ///
-/// Pure: `apple` is the platform, `operator` the value of
+/// Pure: `apple` is whether the platform is in scope (iOS), `operator` the value of
 /// `CIRIS_PERSIST_SQLITE_READERS` if set, `in_memory` whether the path names an
 /// in-memory database.
 fn forced_readers(apple: bool, operator: Option<&str>, in_memory: bool) -> Option<usize> {
@@ -53,14 +60,14 @@ pub async fn open_federation_sqlite(
     let path = db_path.as_ref();
     let in_memory = path == Path::new(":memory:");
     let operator = std::env::var(READERS_ENV).ok();
-    let Some(readers) = forced_readers(APPLE, operator.as_deref(), in_memory) else {
+    let Some(readers) = forced_readers(POOL_OFF_PLATFORM, operator.as_deref(), in_memory) else {
         return ciris_persist::prelude::FederationDirectorySqlite::open(path).await;
     };
     tracing::warn!(
         readers,
         env = READERS_ENV,
         "opening the SQLite store with no reader pool on this platform \
-         (tracked: CIRISPersist#1261); set the env var to override"
+         (history: CIRISPersist#1261, fixed at 61.2.3 and not yet run on iOS); set the env var to override"
     );
     let backend =
         SqliteBackend::open_with_readers(path.to_string_lossy().into_owned(), readers).await?;
@@ -72,7 +79,7 @@ pub async fn open_federation_sqlite(
 mod tests {
     use super::*;
 
-    /// The pool is forced off only on an Apple target, only for a file, and
+    /// The pool is forced off only on a platform in scope, only for a file, and
     /// only when the operator said nothing.
     #[test]
     fn the_reader_pool_is_off_only_on_apple_for_a_file_with_no_operator_setting() {
@@ -97,7 +104,8 @@ mod tests {
     }
 
     /// A file-backed store opens through this door on the host platform and
-    /// is usable: on macOS this is the open that failed at persist 61.2.2.
+    /// is usable: on macOS this is the open that failed at persist 61.2.2, and
+    /// since 61.2.3 it runs there with the reader pool on.
     #[tokio::test]
     async fn a_file_backed_store_opens_and_reopens() {
         let dir = tempfile::tempdir().expect("tempdir");

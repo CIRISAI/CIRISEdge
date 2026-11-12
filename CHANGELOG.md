@@ -2,6 +2,29 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.0.2 — 2026-11-12
+
+**PATCH.** Pins: persist **v61.2.3** (9873c0f4), CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3.
+v45.0.0 and v45.0.1 are tagged and have no release assets; this is the first v45 that does.
+
+### Consumer notes
+
+- **BREAKING for Python hosts: the persist requirement is `ciris-persist==61.2.3`.** Capsules are
+  named for the persist build (`ciris_persist::<capsule>@61.2.3`); a 61.2.2 wheel is refused at
+  `init_edge_runtime` with `capsule_version_skew`.
+- **macOS opens a file-backed store with the reader pool on again (CIRISPersist#1261).** Persist
+  found the cause: Apple's system SQLite will not let a read-only connection create the
+  `-wal`/`-shm` files, and since CIRISPersist#1246 a reader's first access happens inside the
+  pool's open. 61.2.3 fixes it. v45.0.1's zero-reader default is removed on macOS. It stays on
+  iOS, where nobody has opened a file-backed 61.2.3 store; `CIRIS_PERSIST_SQLITE_READERS` still
+  overrides it.
+
+### Why v45.0.1 has no assets
+
+Its macOS test lane hit the step's 30 minute limit three times. The step built and tested inside
+one budget; at v45 the tests alone take about 43 minutes on that runner. The build now has its own
+step and the test step has 75 minutes. No test deadline changed.
+
 ## 45.0.1 — 2026-11-11
 
 **PATCH.** Pins unchanged (persist v61.2.2, CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3). v45.0.0

@@ -100,6 +100,18 @@ ignore = [
     "RUSTSEC-2026-0490",  # zone-file lexer 4096-char token panic (zone-file text only)
     "RUSTSEC-2026-0491",  # header-count Vec::with_capacity amplification on DNS decode;
                           # no DNS message is decoded anywhere in the tree
+    # v45.0.2 — five hickory DNSSEC advisories published 2026-11-12 (patched
+    # only in hickory-net >= 0.26.2; no patched 0.25.x). Unreachable twice
+    # over: the tree enables no dnssec-* feature on hickory-proto or
+    # hickory-resolver (cargo metadata: __https, __tls, https-ring, tls-ring,
+    # tokio, webpki-roots, system-config, std), so no DNSSEC validation code
+    # is compiled in; and, as above, no source in edge, persist v61.2.3 or
+    # verify v22.2.0 calls the resolver. Clears with CIRISVerify#335/#336.
+    "RUSTSEC-2026-0504",  # inverted NSEC3 comparison in DNSSEC validation
+    "RUSTSEC-2026-0505",  # NSEC3 owner names not checked against the zone
+    "RUSTSEC-2026-0511",  # NXDOMAIN accepted for a proven empty non-terminal
+    "RUSTSEC-2026-0512",  # an unrelated signed RRset accepted as the answer
+    "RUSTSEC-2026-0514",  # lookup returned records that failed DNSSEC validation
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained
     "RUSTSEC-2026-0098",  # rustls-webpki URI-name constraint (no URI SAN validation here)
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard-DNS constraint (no name-constraint certs)
