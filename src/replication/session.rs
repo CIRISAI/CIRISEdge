@@ -120,7 +120,11 @@ pub enum ReplicationOutcome {
     Applied {
         kind: EnvelopeKind,
         admitted: usize,
+        /// Every delivered envelope not admitted: refusals AND duplicates
+        /// (the meaning hosts have parsed since #425; kept for one release).
         refused: usize,
+        /// Of `refused`, the envelopes this node already held.
+        duplicate: usize,
         staleness: StalenessSignal,
     },
     /// CIRISEdge#634 §5.1 — the initiator's `Deliver_R` was already applied
@@ -130,7 +134,10 @@ pub enum ReplicationOutcome {
         msgs: Vec<ReplicationMessage>,
         kind: EnvelopeKind,
         admitted: usize,
+        /// As [`Self::Applied`]'s `refused`.
         refused: usize,
+        /// As [`Self::Applied`]'s `duplicate`.
+        duplicate: usize,
         staleness: StalenessSignal,
     },
     /// The peer sent a message this session refuses — in practice a message
@@ -278,6 +285,7 @@ pub struct Session {
 struct HeldReport {
     admitted: usize,
     refused: usize,
+    duplicate: usize,
     staleness: StalenessSignal,
 }
 
@@ -1033,6 +1041,7 @@ impl Session {
                     kind: self.kind,
                     admitted: held.admitted,
                     refused: held.refused,
+                    duplicate: held.duplicate,
                     staleness: held.staleness,
                 };
             }
@@ -1183,6 +1192,10 @@ impl Session {
         }
         let mut admitted = 0usize;
         let mut refused = 0usize;
+        // A row this node already held. Also counted in `refused` for one more
+        // release (the legacy meaning hosts parse); `refused - duplicate` is
+        // what was actually refused.
+        let mut duplicate = 0usize;
         // CIRISEdge#425 — THE single apply choke point. Every delivered envelope's
         // outcome is counted AND, when it is not `Admitted`, logged with its reason
         // right here. Because `apply_envelope` now yields a `#[must_use]`
@@ -1236,6 +1249,7 @@ impl Session {
                 // WARN-ing every duplicate would drown the genuine refusals.
                 ApplyOutcome::Duplicate => {
                     refused += 1;
+                    duplicate += 1;
                     tracing::debug!(
                         kind = ?self.kind,
                         "delivered envelope was a duplicate the node already held (CIRISEdge#425)"
@@ -1383,6 +1397,7 @@ impl Session {
         if let Some(prior) = self.held_report.take() {
             admitted += prior.admitted;
             refused += prior.refused;
+            duplicate += prior.duplicate;
         }
         // Compute staleness from what we asked for vs what we admitted.
         // This is provider-storage-agnostic (the production wiring will
@@ -1409,6 +1424,7 @@ impl Session {
             self.held_report = Some(HeldReport {
                 admitted,
                 refused,
+                duplicate,
                 staleness,
             });
             tracing::debug!(
@@ -1428,6 +1444,7 @@ impl Session {
             self.held_report = Some(HeldReport {
                 admitted,
                 refused,
+                duplicate,
                 staleness,
             });
             tracing::debug!(
@@ -1445,6 +1462,7 @@ impl Session {
             kind: self.kind,
             admitted,
             refused,
+            duplicate,
             staleness,
         }
     }
@@ -2682,6 +2700,68 @@ mod tests {
             } => {
                 assert_eq!(admitted, 0, "nothing admitted");
                 assert_eq!(refused, 3, "every refused envelope is counted, not dropped");
+            }
+            o => panic!("expected Applied, got {o:?}"),
+        }
+    }
+
+    /// Seat load 2026-11-13 (P1) — a duplicate is counted apart from a
+    /// refusal. The responder's completion line printed `refused: N` with
+    /// duplicates folded in, and on the canonical they outnumbered real
+    /// refusals about twenty to one, so the line read as a refusal storm.
+    /// `refused` keeps its legacy meaning for one release (hosts parse it);
+    /// `duplicate` and the report's `rejected` say what happened.
+    #[tokio::test]
+    async fn a_duplicate_is_counted_apart_from_a_refusal() {
+        struct MixedApplier;
+        #[async_trait::async_trait]
+        impl StateApplier for MixedApplier {
+            async fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                b: &[u8],
+                _source_peer: Option<&str>,
+            ) -> ApplyOutcome {
+                match b {
+                    b"new" => ApplyOutcome::Admitted,
+                    b"held" => ApplyOutcome::Duplicate,
+                    _ => ApplyOutcome::refused("gate refused this row"),
+                }
+            }
+        }
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let deliver = DeliverMessage {
+            kind: EnvelopeKind::Attestation,
+            envelopes: vec![
+                b"new".to_vec(),
+                b"held".to_vec(),
+                b"held".to_vec(),
+                b"bad".to_vec(),
+            ],
+        };
+        match responder
+            .on_deliver(&deliver, &BodiesProvider, &MixedApplier, Some("peer-x"))
+            .await
+        {
+            ReplicationOutcome::Applied {
+                kind,
+                admitted,
+                refused,
+                duplicate,
+                staleness,
+            } => {
+                assert_eq!(admitted, 1);
+                assert_eq!(duplicate, 2, "each held row is a duplicate");
+                assert_eq!(refused, 3, "legacy `refused` still folds duplicates in");
+                let report = super::super::coordinator::RoundReport::applied(
+                    kind, admitted, refused, duplicate, staleness,
+                );
+                assert_eq!(report.rejected, 1, "only the gate's refusal is rejected");
+                let line = format!("{report:?}");
+                assert!(
+                    line.contains("refused: 3, duplicate: 2, rejected: 1"),
+                    "the completion line names all three: {line}"
+                );
             }
             o => panic!("expected Applied, got {o:?}"),
         }

@@ -122,17 +122,55 @@ enum RoleInbox {
 
 /// What an anti-entropy round produced. Surfaced to the application's
 /// metrics + τ_partial signal pipelines.
+///
+/// `?report` is printed on the responder's completion line
+/// (`responder served an anti-entropy round to completion`), so the field
+/// ORDER is part of what a host's log scripts see: `admitted`, `refused`
+/// (legacy: refusals and duplicates), then `duplicate` and `rejected`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundReport {
     pub kind: EnvelopeKind,
     /// How many envelopes the [`StateApplier`] admitted (changed local
     /// state).
     pub admitted: usize,
-    /// How many envelopes were delivered but refused (duplicates,
-    /// signature-validation failures, anti-rollback collisions).
+    /// Every delivered envelope that was not admitted: refusals AND
+    /// duplicates. This is the meaning `refused: N` has had in the
+    /// responder's completion line since CIRISEdge#425, and hosts parse it;
+    /// it keeps that meaning for this release and becomes `rejected`'s in
+    /// the next. Read [`Self::rejected`] and [`Self::duplicate`] instead.
     pub refused: usize,
+    /// Envelopes this node already held (persist: `Unchanged`,
+    /// `Deduplicated`, `AlreadyPresentIdentical`). Routine non-progress, not
+    /// a refusal: on the production canonical they outnumbered refusals
+    /// about twenty to one, and counting them as refused hid that.
+    pub duplicate: usize,
+    /// Envelopes a gate refused, or that did not deserialize:
+    /// `refused - duplicate`.
+    pub rejected: usize,
     /// The bounded-staleness signal at round close.
     pub staleness: StalenessSignal,
+}
+
+impl RoundReport {
+    /// A report for applied envelopes: `refused` counts refusals and
+    /// duplicates together (its legacy meaning), `duplicate` the latter.
+    #[must_use]
+    pub fn applied(
+        kind: EnvelopeKind,
+        admitted: usize,
+        refused: usize,
+        duplicate: usize,
+        staleness: StalenessSignal,
+    ) -> Self {
+        RoundReport {
+            kind,
+            admitted,
+            refused,
+            duplicate,
+            rejected: refused.saturating_sub(duplicate),
+            staleness,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -969,6 +1007,8 @@ impl ReplicationCoordinator {
                     kind,
                     admitted: 0,
                     refused: 0,
+                    duplicate: 0,
+                    rejected: 0,
                     staleness: StalenessSignal::InSync,
                 },
             ),
@@ -976,13 +1016,11 @@ impl ReplicationCoordinator {
                 kind,
                 admitted,
                 refused,
+                duplicate,
                 staleness,
-            } => DriveStep::Complete(RoundReport {
-                kind,
-                admitted,
-                refused,
-                staleness,
-            }),
+            } => DriveStep::Complete(RoundReport::applied(
+                kind, admitted, refused, duplicate, staleness,
+            )),
             // (An unproduced `RoundComplete` variant used to be mapped here to a
             // Complete report with `staleness: Unknown` — dead code that would
             // have DISGUISED unknown staleness as a cleanly completed round had
@@ -993,15 +1031,11 @@ impl ReplicationCoordinator {
                 kind,
                 admitted,
                 refused,
+                duplicate,
                 staleness,
             } => DriveStep::SendThenComplete(
                 msgs,
-                RoundReport {
-                    kind,
-                    admitted,
-                    refused,
-                    staleness,
-                },
+                RoundReport::applied(kind, admitted, refused, duplicate, staleness),
             ),
             ReplicationOutcome::UnexpectedMessage => DriveStep::Refused,
         }
@@ -1339,6 +1373,8 @@ impl ReplicationCoordinator {
             Ok(Some(report)) => tracing::info!(
                 admitted = report.admitted,
                 refused = report.refused,
+                duplicate = report.duplicate,
+                rejected = report.rejected,
                 "subject Pull answered and applied"
             ),
             Ok(None) => tracing::info!("subject Pull throttled by the peer"),
@@ -2490,6 +2526,8 @@ mod tests {
             kind: EnvelopeKind::Revocation,
             admitted: 5,
             refused: 1,
+            duplicate: 0,
+            rejected: 1,
             staleness: StalenessSignal::BoundedBy { missing: 2 },
         };
         assert_eq!(report.kind, EnvelopeKind::Revocation);
