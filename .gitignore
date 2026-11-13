@@ -35,3 +35,7 @@ coverage/
 
 # per-agent cargo target dirs (a shared CARGO_TARGET_DIR across worktrees is unsafe)
 target-*/
+
+# Compiled Python (py_compile, interpreter caches): never tracked.
+__pycache__/
+*.pyc
