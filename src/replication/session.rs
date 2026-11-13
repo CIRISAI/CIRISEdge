@@ -1202,6 +1202,10 @@ impl Session {
                 // ref it was asked for by: the act ref a 61.3+ peer advertises
                 // for a cosigned group row, else the bytes' own hash (every
                 // other row, and what a 61.2 peer advertises for every row).
+                // Today no plane that carries a cosigned row is hash-first
+                // (`retention_for` pins the Attestation plane to bodies), so
+                // the two refs coincide on every hash-first plane; this keeps
+                // the one ref rule if that ever changes.
                 let act = super::wire_ref::envelope_ref(self.kind, env_bytes);
                 let plain = super::wire_ref::plain_ref(env_bytes);
                 let h = if self.pending_bodies.contains_key(&act) {

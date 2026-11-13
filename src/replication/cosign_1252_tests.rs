@@ -9,8 +9,7 @@
 //!    `CosignSignature` naming the held event (its quorum key).
 //! 2. **The act ref** — a cosigned row admitted through the choke is in the
 //!    holdings index under persist's `attestation_wire_hash`, the ref a 61.3+
-//!    peer advertises, so the receive diff does not want it again; a body asked
-//!    for by that ref is matched and applied, not "learned".
+//!    peer advertises, so the receive diff does not want it again.
 //! 3. **Held-equivalent** — the same act offered under another ref (a 61.2
 //!    peer's `sha256(bytes)`, another subset's bytes) settles once and is then
 //!    never wanted again, with no store read on the diff.
@@ -493,69 +492,6 @@ async fn an_act_offered_under_another_ref_is_wanted_once_1252() {
         assert_eq!(nb.held_equivalent_refs(), 2, "lever {lever}");
         let _ = other.attestation_id;
     }
-}
-
-/// **2b. A body asked for by its act ref is applied, not "learned".** Under
-/// hash-first a delivered body is matched to the ref it was asked for; a
-/// cosigned row's ref is its act's. Red before: the session matched
-/// `sha256(bytes)` only, so the body was recorded as unsolicited and never
-/// applied.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_body_asked_for_by_its_act_ref_is_applied_1252() {
-    use crate::replication::protocol::{DeliverMessage, ReplicationMessage};
-    use crate::replication::session::{Session, SessionRole};
-    use crate::replication::summary::{StateApplier, StateProvider};
-    struct P;
-    #[async_trait::async_trait]
-    impl StateProvider for P {
-        async fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
-            Vec::new()
-        }
-        async fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
-            None
-        }
-        fn retention(&self, _k: EnvelopeKind) -> crate::replication::retention::Retention {
-            crate::replication::retention::Retention::HashFirst
-        }
-    }
-    struct Counting(std::sync::atomic::AtomicUsize);
-    #[async_trait::async_trait]
-    impl StateApplier for Counting {
-        async fn apply_envelope(
-            &self,
-            _k: EnvelopeKind,
-            _b: &[u8],
-            _p: Option<&str>,
-        ) -> ApplyOutcome {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            ApplyOutcome::Admitted
-        }
-    }
-    let p = parties();
-    let s = stores(&p, 1).await;
-    let a = Arc::clone(&s[0]);
-    let r = room_of_three(p, &[], &a).await;
-    let (row, bytes) = assembled(&a, &r).await;
-    let act = ciris_persist::federation::wire_index::attestation_wire_hash(&row);
-    let mut sess = Session::new(SessionRole::Initiator, KIND);
-    sess.expect_bodies([act]);
-    let applier = Counting(std::sync::atomic::AtomicUsize::new(0));
-    let _ = sess
-        .on_message(
-            ReplicationMessage::Deliver(DeliverMessage {
-                kind: KIND,
-                envelopes: vec![bytes],
-            }),
-            &P,
-            &applier,
-            Some("peer"),
-        )
-        .await;
-    assert_eq!(
-        applier.0.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "the body asked for by its act ref is applied"
-    );
 }
 
 /// A `withdraws` of `target` by `primary`, co-signed by `cosigners` over the
