@@ -994,7 +994,29 @@ impl Session {
         if diff.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
-        let (envelopes, dropped) = self.pack_bounded_deliver(&diff.want, provider).await;
+        // Seat load 2026-11-13 (P4) — the bytes pushed THIS round are already
+        // on their way. The responder computed its Diff from its Summary,
+        // before it applied the push that rode beside our Summary, so it asks
+        // for exactly what we just pushed; answering it delivered every
+        // pushed row twice (the second a `Duplicate` at the responder) on a
+        // fresh node's first round. If the push frame was lost, the
+        // responder's next Diff asks again, and that round's answer serves it
+        // (a hash pushed in an earlier round is not filtered here).
+        let pushed_this_round = |h: &[u8; 32]| {
+            self.role == SessionRole::Initiator
+                && self.proactive_publish
+                && self.proactive_sent.get(h) == Some(&self.round_counter)
+        };
+        let want: Vec<[u8; 32]> = if diff.want.iter().any(pushed_this_round) {
+            diff.want
+                .iter()
+                .filter(|h| !pushed_this_round(h))
+                .copied()
+                .collect()
+        } else {
+            diff.want.clone()
+        };
+        let (envelopes, dropped) = self.pack_bounded_deliver(&want, provider).await;
         // CIRISEdge#429 — an advertised want we cannot serve must NEVER be inferred
         // from a short byte count. Say so, per-miss and in aggregate. NOT fatal: the
         // round still ships what it could, and the remainder re-diffs next round —
@@ -2189,6 +2211,58 @@ mod tests {
         let mut plain = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
         match plain.start_round(&provider).await {
             ReplicationOutcome::Send(msgs) => assert_eq!(msgs.len(), 1, "Summary only"),
+            o => panic!("expected Send, got {o:?}"),
+        }
+    }
+
+    /// Seat load 2026-11-13 (P4) — **a fresh node's first round applies each
+    /// pushed row once.** The initiator pushes its rows beside its Summary;
+    /// the responder's Diff, computed before the push is applied, asks for all
+    /// of them; answering that Diff delivered them a second time, every one a
+    /// `Duplicate` at the responder. The answer now leaves out what this
+    /// round pushed, and a later round's Diff is answered in full.
+    ///
+    /// Mutation that turns it red: drop the `pushed_this_round` filter in
+    /// `on_diff`.
+    #[tokio::test]
+    async fn a_fresh_nodes_first_round_applies_each_pushed_row_once() {
+        let provider = provider_with(&[
+            (EnvelopeKind::Key, h(1), b"k1".to_vec(), 1),
+            (EnvelopeKind::Key, h(2), b"k2".to_vec(), 2),
+        ]);
+        let mut init =
+            Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
+        let msgs = match init.start_round(&provider).await {
+            ReplicationOutcome::Send(msgs) => msgs,
+            o => panic!("expected Send, got {o:?}"),
+        };
+        assert!(matches!(&msgs[1], ReplicationMessage::Deliver(d) if d.envelopes.len() == 2));
+        // The responder lacks both, so its Diff asks for both.
+        let diff = DiffMessage {
+            kind: EnvelopeKind::Key,
+            want: vec![h(1), h(2)],
+        };
+        match init.on_diff(&diff, &provider, Some("seat")).await {
+            ReplicationOutcome::Send(out) => match &out[0] {
+                ReplicationMessage::Deliver(d) => assert!(
+                    d.envelopes.is_empty(),
+                    "the pushed rows are not delivered again: {:?}",
+                    d.envelopes
+                ),
+                o => panic!("expected a Deliver, got {o:?}"),
+            },
+            o => panic!("expected Send, got {o:?}"),
+        }
+        // The next round's Diff for the same hashes (the push was lost) is
+        // answered in full: the push is not re-sent inside the refresh window,
+        // so the answer is the only way they travel.
+        init.reset();
+        let _ = init.start_round(&provider).await;
+        match init.on_diff(&diff, &provider, Some("seat")).await {
+            ReplicationOutcome::Send(out) => match &out[0] {
+                ReplicationMessage::Deliver(d) => assert_eq!(d.envelopes.len(), 2),
+                o => panic!("expected a Deliver, got {o:?}"),
+            },
             o => panic!("expected Send, got {o:?}"),
         }
     }
