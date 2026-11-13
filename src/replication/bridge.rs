@@ -31699,6 +31699,10 @@ pub(crate) mod tests {
     // CIRISEdge#971 — what an idle bootstrap round costs the seat.
     mod idle_round_cost_971;
 
+    // Seat load 2026-11-13 (S0) — in one binary, each edge read is credited
+    // to its site's label in persist's per-caller counters.
+    mod caller_attribution_seat_load;
+
     // CIRISEdge#971 — the seat's Revocation listing walk per idle round.
     mod revocation_walk_971;
 

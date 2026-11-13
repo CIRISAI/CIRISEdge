@@ -1196,47 +1196,47 @@ impl ReplicationCoordinator {
                 .first_seen
                 .get_or_insert_with(std::time::Instant::now);
         }
-        let Some(m) = &self.metrics else {
+        let Some(metrics) = &self.metrics else {
             return;
         };
         let initiator = matches!(self.inbox, RoleInbox::Initiator { .. });
-        let n = |x: usize| u64::try_from(x).unwrap_or(u64::MAX);
+        let count = |x: usize| u64::try_from(x).unwrap_or(u64::MAX);
         match msg {
-            ReplicationMessage::Deliver(d) => {
-                let bytes = n(d.envelopes.iter().map(Vec::len).sum());
-                let rows = n(d.envelopes.len());
-                let (r, b) = match (out, initiator) {
+            ReplicationMessage::Deliver(deliver) => {
+                let bytes = count(deliver.envelopes.iter().map(Vec::len).sum());
+                let rows = count(deliver.envelopes.len());
+                let (rows_label, bytes_label) = match (out, initiator) {
                     (true, true) => ("push_rows_out", "push_bytes_out"),
                     (true, false) => ("deliver_rows_out", "deliver_bytes_out"),
                     (false, _) => ("deliver_rows_in", "deliver_bytes_in"),
                 };
-                m.add_replication_io(d.kind, r, rows);
-                m.add_replication_io(d.kind, b, bytes);
+                metrics.add_replication_io(deliver.kind, rows_label, rows);
+                metrics.add_replication_io(deliver.kind, bytes_label, bytes);
             }
-            ReplicationMessage::Summary(s) => m.add_replication_io(
-                s.kind,
+            ReplicationMessage::Summary(summary) => metrics.add_replication_io(
+                summary.kind,
                 if out {
                     "summary_refs_out"
                 } else {
                     "summary_refs_in"
                 },
-                n(s.refs.len()),
+                count(summary.refs.len()),
             ),
-            ReplicationMessage::Diff(d) => m.add_replication_io(
-                d.kind,
+            ReplicationMessage::Diff(diff) => metrics.add_replication_io(
+                diff.kind,
                 if out { "diff_want_out" } else { "diff_want_in" },
-                n(d.want.len()),
+                count(diff.want.len()),
             ),
-            ReplicationMessage::Fetch(f) => m.add_replication_io(
-                f.kind,
+            ReplicationMessage::Fetch(fetch) => metrics.add_replication_io(
+                fetch.kind,
                 if out { "diff_want_out" } else { "diff_want_in" },
-                n(f.want.len()),
+                count(fetch.want.len()),
             ),
-            ReplicationMessage::Pull(p) => {
-                m.add_replication_io(p.kind, if out { "pull_out" } else { "pull_in" }, 1);
+            ReplicationMessage::Pull(pull) => {
+                metrics.add_replication_io(pull.kind, if out { "pull_out" } else { "pull_in" }, 1);
             }
-            ReplicationMessage::CursorPull(p) => {
-                m.add_replication_io(p.kind, if out { "pull_out" } else { "pull_in" }, 1);
+            ReplicationMessage::CursorPull(pull) => {
+                metrics.add_replication_io(pull.kind, if out { "pull_out" } else { "pull_in" }, 1);
             }
         }
     }
