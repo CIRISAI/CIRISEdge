@@ -8933,6 +8933,16 @@ impl FederationDirectoryReplicationBridge {
         Some(ApplyOutcome::Duplicate)
     }
 
+    /// Seat load 2026-11-13 (S0) — add `n` to `advertise.rows.<class>.<outcome>`.
+    fn book_advertise_row(&self, class: &str, outcome: &str, n: u64) {
+        if let (Some(m), Some(label)) = (
+            self.metrics.as_ref(),
+            crate::observability::advertise_row_label(class, outcome),
+        ) {
+            m.add_advertise(label, n);
+        }
+    }
+
     fn forget_held_equivalents(&self) {
         // Seat load 2026-11-13 (P2) — a held hash LEFT persist's index (a
         // purge, an erasure, a superseding row removed). A ref remembered as
@@ -10839,6 +10849,9 @@ impl FederationDirectoryReplicationBridge {
         // rows (own nodes) or `family` rows (family members' nodes) and for
         // nothing wider; the row half below still runs on what passes.
         if !reach.admits(audience) {
+            if site == "advertise" {
+                self.book_advertise_row(reach.tag(), "withheld_reach", 1);
+            }
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
@@ -10880,6 +10893,9 @@ impl FederationDirectoryReplicationBridge {
             && !self.attestation_is_relayed_announce(row, memo).await
             && !self.consent_grant_names(row, peer, memo).await
         {
+            if site == "advertise" {
+                self.book_advertise_row(reach.tag(), "withheld_first_contact", 1);
+            }
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
@@ -11047,6 +11063,9 @@ impl FederationDirectoryReplicationBridge {
         // through the same resolver, before either is a member.
         let served = self.may_receive_cached(att, peer, memo).await.allowed();
         if !served {
+            if site == "advertise" {
+                self.book_advertise_row(reach.tag(), "withheld_row", 1);
+            }
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
@@ -12064,6 +12083,15 @@ impl FederationDirectoryReplicationBridge {
                 .map(ResolvedRecipient::reach)
                 == Some(Reach::FirstContact)
                 && ctx.moves != UnaskedOffer::Commons;
+        // Seat load 2026-11-13 (S0) — the class the round's row counters are
+        // booked under: `commons` between two seats, else the peer's reach.
+        let class = if ctx.moves == UnaskedOffer::Commons {
+            "commons"
+        } else {
+            ctx.resolved_recipient
+                .as_ref()
+                .map_or("none", |r| r.reach().tag())
+        };
         let mut first_at_tip = false;
         if no_walk {
             let margin = chrono::Duration::from_std(self.config.tip_margin).unwrap_or_default();
@@ -12093,6 +12121,11 @@ impl FederationDirectoryReplicationBridge {
             .await
             {
                 listed = required.0;
+                self.book_advertise_row(
+                    class,
+                    "listed_required",
+                    u64::try_from(required.0).unwrap_or(u64::MAX),
+                );
                 counts = required.2;
             }
         }
@@ -12121,6 +12154,11 @@ impl FederationDirectoryReplicationBridge {
             }
         };
         listed += served;
+        self.book_advertise_row(
+            class,
+            "listed_head",
+            u64::try_from(served).unwrap_or(u64::MAX),
+        );
         counts.merge(head_counts);
         let mut resweep: Option<(Option<ResumeCursor>, usize, bool)> = None;
         let plan = self
@@ -12153,6 +12191,11 @@ impl FederationDirectoryReplicationBridge {
                     }
                     self.resweep_cycle_step(&key, wrapped);
                     listed += b_served;
+                    self.book_advertise_row(
+                        class,
+                        "listed_history",
+                        u64::try_from(b_served).unwrap_or(u64::MAX),
+                    );
                     counts.merge(b_counts);
                     resweep = Some((plan.since, b_served, wrapped));
                 }
@@ -12180,6 +12223,15 @@ impl FederationDirectoryReplicationBridge {
         let unbooked = (withheld as u64).saturating_sub(booked);
         if unbooked > 0 {
             withheld_by_reason.insert("unbooked", unbooked);
+        }
+        for (outcome, n) in [
+            ("not_advertisable", counts.not_advertisable),
+            ("withheld", withheld),
+            ("duplicate", counts.duplicate),
+            ("awaits_request", counts.awaits_request),
+            ("offered", counts.offered),
+        ] {
+            self.book_advertise_row(class, outcome, u64::try_from(n).unwrap_or(u64::MAX));
         }
         let summary = AdvertiseRoundSummary {
             peer: key.0.clone(),

@@ -1675,6 +1675,120 @@ pub const HOLDINGS_DUPLICATE_UNHELD: [&str; 2] = [
     "attestation.duplicate_unheld",
     "transport_destination.duplicate_unheld",
 ];
+/// Seat load 2026-11-13 (S0) — the advertise's rows as counters, by the
+/// peer's class (its send-set reach, or `commons` between two seats) and
+/// what became of each row: `advertise.rows.<class>.<outcome>`. Added once
+/// per round (`listed_*`, `not_advertisable`, `withheld`, `duplicate`,
+/// `awaits_request`, `offered`) and once per withheld row for the two arms
+/// that book `recipient_not_in_send_set` (`withheld_reach`: the send-set
+/// reach does not carry the row's scope; `withheld_first_contact`: a
+/// first-contact peer and a row that is none of the shapes that reach
+/// carries; `withheld_row`: persist's per-row audience resolver refused it).
+/// The
+/// throttled advertise log line carried these only as a sample.
+pub const ADVERTISE_ROW_CLASSES: [&str; 6] = [
+    "consent",
+    "self_collective",
+    "family",
+    "first_contact",
+    "commons",
+    "none",
+];
+/// The outcomes of [`ADVERTISE_ROW_LABELS`], in its column order.
+pub const ADVERTISE_ROW_OUTCOMES: [&str; 11] = [
+    "listed_required",
+    "listed_head",
+    "listed_history",
+    "not_advertisable",
+    "withheld",
+    "withheld_reach",
+    "withheld_first_contact",
+    "withheld_row",
+    "duplicate",
+    "awaits_request",
+    "offered",
+];
+/// `advertise.rows.<class>.<outcome>`, class-major ([`advertise_row_label`]).
+pub const ADVERTISE_ROW_LABELS: [&str; 66] = [
+    "rows.consent.listed_required",
+    "rows.consent.listed_head",
+    "rows.consent.listed_history",
+    "rows.consent.not_advertisable",
+    "rows.consent.withheld",
+    "rows.consent.withheld_reach",
+    "rows.consent.withheld_first_contact",
+    "rows.consent.withheld_row",
+    "rows.consent.duplicate",
+    "rows.consent.awaits_request",
+    "rows.consent.offered",
+    "rows.self_collective.listed_required",
+    "rows.self_collective.listed_head",
+    "rows.self_collective.listed_history",
+    "rows.self_collective.not_advertisable",
+    "rows.self_collective.withheld",
+    "rows.self_collective.withheld_reach",
+    "rows.self_collective.withheld_first_contact",
+    "rows.self_collective.withheld_row",
+    "rows.self_collective.duplicate",
+    "rows.self_collective.awaits_request",
+    "rows.self_collective.offered",
+    "rows.family.listed_required",
+    "rows.family.listed_head",
+    "rows.family.listed_history",
+    "rows.family.not_advertisable",
+    "rows.family.withheld",
+    "rows.family.withheld_reach",
+    "rows.family.withheld_first_contact",
+    "rows.family.withheld_row",
+    "rows.family.duplicate",
+    "rows.family.awaits_request",
+    "rows.family.offered",
+    "rows.first_contact.listed_required",
+    "rows.first_contact.listed_head",
+    "rows.first_contact.listed_history",
+    "rows.first_contact.not_advertisable",
+    "rows.first_contact.withheld",
+    "rows.first_contact.withheld_reach",
+    "rows.first_contact.withheld_first_contact",
+    "rows.first_contact.withheld_row",
+    "rows.first_contact.duplicate",
+    "rows.first_contact.awaits_request",
+    "rows.first_contact.offered",
+    "rows.commons.listed_required",
+    "rows.commons.listed_head",
+    "rows.commons.listed_history",
+    "rows.commons.not_advertisable",
+    "rows.commons.withheld",
+    "rows.commons.withheld_reach",
+    "rows.commons.withheld_first_contact",
+    "rows.commons.withheld_row",
+    "rows.commons.duplicate",
+    "rows.commons.awaits_request",
+    "rows.commons.offered",
+    "rows.none.listed_required",
+    "rows.none.listed_head",
+    "rows.none.listed_history",
+    "rows.none.not_advertisable",
+    "rows.none.withheld",
+    "rows.none.withheld_reach",
+    "rows.none.withheld_first_contact",
+    "rows.none.withheld_row",
+    "rows.none.duplicate",
+    "rows.none.awaits_request",
+    "rows.none.offered",
+];
+
+/// The `advertise.rows.<class>.<outcome>` label; `None` for a name outside
+/// [`ADVERTISE_ROW_CLASSES`] × [`ADVERTISE_ROW_OUTCOMES`].
+#[must_use]
+pub fn advertise_row_label(class: &str, outcome: &str) -> Option<&'static str> {
+    let c = ADVERTISE_ROW_CLASSES.iter().position(|x| *x == class)?;
+    let o = ADVERTISE_ROW_OUTCOMES.iter().position(|x| *x == outcome)?;
+    ADVERTISE_ROW_LABELS
+        .get(c * ADVERTISE_ROW_OUTCOMES.len() + o)
+        .copied()
+}
+
 /// Seat load 2026-11-13 (P3) — a delivered envelope whose exact bytes the
 /// Ready set holds, answered `Duplicate` without calling persist.
 pub const HOLDINGS_DUPLICATE_FROM_INDEX: [&str; 2] = [
@@ -1881,8 +1995,46 @@ pub const RESPONDER_ROUND_REPLY_SHED: &str = "reply_shed";
 pub const RESPONDER_ROUND_REPLY_SHED_NODE: &str = "reply_shed_node";
 /// CIRISEdge#943 — a reply outlived its round in the lane and was not sent.
 pub const RESPONDER_ROUND_REPLY_EXPIRED: &str = "reply_expired";
+/// Seat load 2026-11-13 (S0) — `responder_rounds_total` outcome: a responder
+/// round was opened by this inbound message type. Counted on the first frame of
+/// a round (a new round id; for a legacy frame with no round id, a message that
+/// only opens a round). `summary` is a whole-plane anti-entropy round, `pull` a
+/// subject Pull, `cursor_pull` the accord cursor plane, `fetch` a by-hash ask,
+/// `deliver` a bare push with no Summary before it.
+pub const RESPONDER_ROUND_OPENED_SUMMARY: &str = "opened_summary";
+/// See [`RESPONDER_ROUND_OPENED_SUMMARY`].
+pub const RESPONDER_ROUND_OPENED_PULL: &str = "opened_pull";
+/// See [`RESPONDER_ROUND_OPENED_SUMMARY`].
+pub const RESPONDER_ROUND_OPENED_CURSOR_PULL: &str = "opened_cursor_pull";
+/// See [`RESPONDER_ROUND_OPENED_SUMMARY`].
+pub const RESPONDER_ROUND_OPENED_FETCH: &str = "opened_fetch";
+/// See [`RESPONDER_ROUND_OPENED_SUMMARY`].
+pub const RESPONDER_ROUND_OPENED_DELIVER: &str = "opened_deliver";
+/// See [`RESPONDER_ROUND_OPENED_SUMMARY`]: a round whose first frame was a
+/// Diff (its Summary was lost or overtaken).
+pub const RESPONDER_ROUND_OPENED_DIFF: &str = "opened_diff";
+/// Seat load 2026-11-13 (S0) — `replication_io` labels. `*_rows` are
+/// envelopes carried by a `Deliver` (`deliver`: answering a Diff or a Fetch;
+/// `push`: an initiator's proactive Deliver beside its Summary), `*_bytes`
+/// their envelope bytes (the JSON frame around them is not counted),
+/// `summary_refs` and `diff_want` the hashes a Summary lists and a Diff asks
+/// for. `_in` is what this node received, `_out` what it sent.
+pub const REPLICATION_IO_LABELS: [&str; 12] = [
+    "deliver_rows_out",
+    "deliver_bytes_out",
+    "deliver_rows_in",
+    "deliver_bytes_in",
+    "push_rows_out",
+    "push_bytes_out",
+    "summary_refs_out",
+    "summary_refs_in",
+    "diff_want_out",
+    "diff_want_in",
+    "pull_out",
+    "pull_in",
+];
 /// Every `responder_rounds_total` outcome token.
-pub const RESPONDER_ROUND_OUTCOMES: [&str; 8] = [
+pub const RESPONDER_ROUND_OUTCOMES: [&str; 14] = [
     RESPONDER_ROUND_STARTED,
     RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL,
     RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL,
@@ -1891,6 +2043,12 @@ pub const RESPONDER_ROUND_OUTCOMES: [&str; 8] = [
     RESPONDER_ROUND_REPLY_SHED,
     RESPONDER_ROUND_REPLY_SHED_NODE,
     RESPONDER_ROUND_REPLY_EXPIRED,
+    RESPONDER_ROUND_OPENED_SUMMARY,
+    RESPONDER_ROUND_OPENED_PULL,
+    RESPONDER_ROUND_OPENED_CURSOR_PULL,
+    RESPONDER_ROUND_OPENED_FETCH,
+    RESPONDER_ROUND_OPENED_DELIVER,
+    RESPONDER_ROUND_OPENED_DIFF,
 ];
 
 /// CIRISEdge#853 — `responder_link_up_seconds` stage: the dialer's link-borne
@@ -2357,6 +2515,72 @@ pub const ADVERTISE_LABELS: &[&str] = &[
     ADVERTISE_SEND_SET_INVALIDATED,
     ADVERTISE_SEND_SET_DROPPED_LIVE,
     ADVERTISE_SEND_SET_EXPIRED,
+    "rows.consent.listed_required",
+    "rows.consent.listed_head",
+    "rows.consent.listed_history",
+    "rows.consent.not_advertisable",
+    "rows.consent.withheld",
+    "rows.consent.withheld_reach",
+    "rows.consent.withheld_first_contact",
+    "rows.consent.withheld_row",
+    "rows.consent.duplicate",
+    "rows.consent.awaits_request",
+    "rows.consent.offered",
+    "rows.self_collective.listed_required",
+    "rows.self_collective.listed_head",
+    "rows.self_collective.listed_history",
+    "rows.self_collective.not_advertisable",
+    "rows.self_collective.withheld",
+    "rows.self_collective.withheld_reach",
+    "rows.self_collective.withheld_first_contact",
+    "rows.self_collective.withheld_row",
+    "rows.self_collective.duplicate",
+    "rows.self_collective.awaits_request",
+    "rows.self_collective.offered",
+    "rows.family.listed_required",
+    "rows.family.listed_head",
+    "rows.family.listed_history",
+    "rows.family.not_advertisable",
+    "rows.family.withheld",
+    "rows.family.withheld_reach",
+    "rows.family.withheld_first_contact",
+    "rows.family.withheld_row",
+    "rows.family.duplicate",
+    "rows.family.awaits_request",
+    "rows.family.offered",
+    "rows.first_contact.listed_required",
+    "rows.first_contact.listed_head",
+    "rows.first_contact.listed_history",
+    "rows.first_contact.not_advertisable",
+    "rows.first_contact.withheld",
+    "rows.first_contact.withheld_reach",
+    "rows.first_contact.withheld_first_contact",
+    "rows.first_contact.withheld_row",
+    "rows.first_contact.duplicate",
+    "rows.first_contact.awaits_request",
+    "rows.first_contact.offered",
+    "rows.commons.listed_required",
+    "rows.commons.listed_head",
+    "rows.commons.listed_history",
+    "rows.commons.not_advertisable",
+    "rows.commons.withheld",
+    "rows.commons.withheld_reach",
+    "rows.commons.withheld_first_contact",
+    "rows.commons.withheld_row",
+    "rows.commons.duplicate",
+    "rows.commons.awaits_request",
+    "rows.commons.offered",
+    "rows.none.listed_required",
+    "rows.none.listed_head",
+    "rows.none.listed_history",
+    "rows.none.not_advertisable",
+    "rows.none.withheld",
+    "rows.none.withheld_reach",
+    "rows.none.withheld_first_contact",
+    "rows.none.withheld_row",
+    "rows.none.duplicate",
+    "rows.none.awaits_request",
+    "rows.none.offered",
 ];
 /// Every `link_stall` key.
 pub const LINK_STALL_LABELS: &[&str] = &[
@@ -3001,6 +3225,11 @@ pub struct EdgeMetrics {
     /// the outcome one of [`RESPONDER_ROUND_OUTCOMES`]. Lets the canonical tell
     /// a link that served a round and closed from one opened and closed empty.
     pub responder_rounds_total: Arc<RwLock<HashMap<(EnvelopeKind, &'static str), u64>>>,
+    /// Seat load 2026-11-13 (S0) — replication rows and envelope bytes moved,
+    /// by `(kind, label)` with the label one of [`REPLICATION_IO_LABELS`]. The
+    /// transport byte counters exclude replication frames; this is what the
+    /// replication plane itself carried, per plane and direction.
+    pub replication_io: Arc<RwLock<HashMap<(EnvelopeKind, &'static str), u64>>>,
     /// CIRISEdge#853 — responder link-up latency by stage (one of the
     /// `LINK_UP_STAGE_*` tokens): from `LinkEstablished` on a link a peer
     /// dialled to the end of that stage's intake. Buckets:
@@ -3371,6 +3600,14 @@ impl EdgeMetrics {
     /// Count one advertise event by its `ADVERTISE_*` label.
     pub fn inc_advertise(&self, label: &'static str) {
         *self.advertise.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// Seat load 2026-11-13 (S0) — add `n` to one `advertise` label (a
+    /// round's row totals are booked once, not per row). Zero adds nothing.
+    pub fn add_advertise(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.advertise.write().entry(label).or_insert(0) += n;
+        }
     }
 
     /// CIRISEdge#971 — count one `replication_reach` event.
@@ -4085,6 +4322,27 @@ impl EdgeMetrics {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Seat load 2026-11-13 (S0) — add `n` to `replication_io` `(kind, label)`.
+    pub fn add_replication_io(&self, kind: EnvelopeKind, label: &'static str, n: u64) {
+        if n > 0 {
+            *self
+                .replication_io
+                .write()
+                .entry((kind, label))
+                .or_insert(0) += n;
+        }
+    }
+
+    /// Seat load 2026-11-13 (S0) — `replication_io`, keyed `<kind>:<label>`.
+    #[must_use]
+    pub fn replication_io(&self) -> HashMap<String, u64> {
+        self.replication_io
+            .read()
+            .iter()
+            .map(|((kind, label), n)| (format!("{}:{label}", kind.as_wire_str()), *n))
+            .collect()
+    }
+
     /// CIRISEdge#853 — count one responder round lifecycle `outcome` (one of
     /// [`RESPONDER_ROUND_OUTCOMES`]) for `kind`.
     pub fn inc_responder_round(&self, kind: EnvelopeKind, outcome: &'static str) {
@@ -4398,6 +4656,7 @@ impl EdgeMetrics {
                 .read()
                 .snapshot(SWEEP_PERMIT_WAIT_BUCKETS_SECONDS),
             responder_rounds_total: self.responder_rounds_total(),
+            replication_io: self.replication_io(),
             responder_link_up_seconds: self.responder_link_up_seconds(),
             responder_link_up_total: self.responder_link_up_total(),
             recovered_links_total: self.recovered_links_total(),
@@ -4803,6 +5062,9 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#853 — responder round lifecycle, keyed `<kind>:<outcome>`
     /// (outcomes: [`RESPONDER_ROUND_OUTCOMES`]).
     pub responder_rounds_total: HashMap<String, u64>,
+    /// Seat load 2026-11-13 (S0) — replication rows and bytes moved, keyed
+    /// `<kind>:<label>` (labels: [`REPLICATION_IO_LABELS`]).
+    pub replication_io: HashMap<String, u64>,
     /// CIRISEdge#853 — responder link-up latency by stage
     /// (`bundle_gate` / `announce_intake` / `owner_binding`).
     pub responder_link_up_seconds: HashMap<String, HistogramSnapshot>,
@@ -5265,6 +5527,7 @@ impl EdgeMetricsBundle {
         );
         // CIRISEdge#853 — the responder's round lifecycle and link-up.
         f.family("responder_rounds_total", &self.responder_rounds_total);
+        f.family("replication_io", &self.replication_io);
         let mut link_ups = 0u64;
         for (stage, h) in &self.responder_link_up_seconds {
             link_ups = link_ups.saturating_add(h.count);
@@ -5531,6 +5794,7 @@ edge_metrics_bundle_fields!(
     replication_round_duration_seconds,
     sweep_permit_wait_seconds,
     responder_rounds_total,
+    replication_io,
     responder_link_up_seconds,
     responder_link_up_total,
     recovered_links_total,

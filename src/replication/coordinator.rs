@@ -480,6 +480,7 @@ impl ReplicationCoordinator {
         msg: ReplicationMessage,
         meta: Option<RoundMeta>,
     ) -> Result<(), CoordinatorError> {
+        self.book_io(&msg, false);
         match &self.inbox {
             RoleInbox::Responder { inbound_tx, .. } => inbound_tx
                 .try_send(Inbound {
@@ -540,6 +541,7 @@ impl ReplicationCoordinator {
     ///
     /// [`ReplyRefusal`] — see its variants.
     pub fn deliver_reply(&self, msg: ReplicationMessage, round: u64) -> Result<(), ReplyRefusal> {
+        self.book_io(&msg, false);
         let RoleInbox::Initiator {
             current_round,
             round_tx,
@@ -1078,6 +1080,59 @@ impl ReplicationCoordinator {
         if let (Some(metrics), ReplicationMessage::Deliver(deliver)) = (&self.metrics, msg) {
             for _ in &deliver.envelopes {
                 metrics.inc_replication_served(deliver.kind);
+            }
+        }
+        self.book_io(msg, true);
+    }
+
+    /// Seat load 2026-11-13 (S0) — `replication_io`: the rows and envelope
+    /// bytes a message carried, the hashes a Summary listed and a Diff asked
+    /// for, and Pulls. Sent messages are booked once their send returned;
+    /// received ones as they are handed to the round. An initiator's Deliver
+    /// is booked `push_*` (its proactive push and its answer to the
+    /// responder's Diff); a responder's is `deliver_*`.
+    fn book_io(&self, msg: &ReplicationMessage, out: bool) {
+        let Some(m) = &self.metrics else {
+            return;
+        };
+        let initiator = matches!(self.inbox, RoleInbox::Initiator { .. });
+        let n = |x: usize| u64::try_from(x).unwrap_or(u64::MAX);
+        match msg {
+            ReplicationMessage::Deliver(d) => {
+                let bytes = n(d.envelopes.iter().map(Vec::len).sum());
+                let rows = n(d.envelopes.len());
+                let (r, b) = match (out, initiator) {
+                    (true, true) => ("push_rows_out", "push_bytes_out"),
+                    (true, false) => ("deliver_rows_out", "deliver_bytes_out"),
+                    (false, _) => ("deliver_rows_in", "deliver_bytes_in"),
+                };
+                m.add_replication_io(d.kind, r, rows);
+                m.add_replication_io(d.kind, b, bytes);
+            }
+            ReplicationMessage::Summary(s) => m.add_replication_io(
+                s.kind,
+                if out {
+                    "summary_refs_out"
+                } else {
+                    "summary_refs_in"
+                },
+                n(s.refs.len()),
+            ),
+            ReplicationMessage::Diff(d) => m.add_replication_io(
+                d.kind,
+                if out { "diff_want_out" } else { "diff_want_in" },
+                n(d.want.len()),
+            ),
+            ReplicationMessage::Fetch(f) => m.add_replication_io(
+                f.kind,
+                if out { "diff_want_out" } else { "diff_want_in" },
+                n(f.want.len()),
+            ),
+            ReplicationMessage::Pull(p) => {
+                m.add_replication_io(p.kind, if out { "pull_out" } else { "pull_in" }, 1);
+            }
+            ReplicationMessage::CursorPull(p) => {
+                m.add_replication_io(p.kind, if out { "pull_out" } else { "pull_in" }, 1);
             }
         }
     }
@@ -2607,6 +2662,88 @@ mod tests {
         assert_eq!(served(), 0, "the send failed: nothing was served");
         coord_to("bob").send_message(&deliver).await.expect("sent");
         assert_eq!(served(), 2, "one per envelope that left");
+    }
+
+    /// Seat load 2026-11-13 (S0) — **`replication_io` counts what a plane
+    /// carried, by direction.** An initiator's Deliver is a push out; a
+    /// responder's is a deliver out; a Deliver handed to a responder is a
+    /// deliver in; a Summary and a Diff count their hashes. A failed send
+    /// counts nothing.
+    ///
+    /// Mutation that turns it red: drop `book_io` from `book_served` or from
+    /// `deliver_inbound_framed`.
+    #[tokio::test]
+    async fn replication_io_counts_rows_bytes_and_hashes_by_direction_seat_load() {
+        let metrics = crate::observability::EdgeMetrics::default();
+        let (alice_t, _bob_t) = alice_bob_transports();
+        let alice_t = Arc::new(alice_t);
+        let coord = |peer: &str, role: SessionRole| {
+            ReplicationCoordinator::new(
+                Arc::clone(&alice_t) as Arc<dyn Transport>,
+                peer,
+                EnvelopeKind::Key,
+                role,
+                Arc::new(StaticProvider {
+                    state: LocalState::new(),
+                    envelopes: HashMap::new(),
+                }),
+                RecordingApplier::with(HashMap::new(), std::collections::HashSet::new()),
+            )
+            .with_metrics(Some(metrics.clone()))
+        };
+        let deliver = ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::Key,
+            envelopes: vec![b"one".to_vec(), b"three".to_vec()],
+        });
+        let io = |label: &str| {
+            metrics
+                .replication_io()
+                .get(&format!("key:{label}"))
+                .copied()
+                .unwrap_or(0)
+        };
+        assert!(coord("nobody_home", SessionRole::Initiator)
+            .send_message(&deliver)
+            .await
+            .is_err());
+        assert_eq!(io("push_rows_out"), 0, "a failed send carried nothing");
+        coord("bob", SessionRole::Initiator)
+            .send_message(&deliver)
+            .await
+            .expect("sent");
+        assert_eq!((io("push_rows_out"), io("push_bytes_out")), (2, 8));
+        let responder = coord("bob", SessionRole::Responder);
+        responder.send_message(&deliver).await.expect("sent");
+        assert_eq!((io("deliver_rows_out"), io("deliver_bytes_out")), (2, 8));
+        responder
+            .deliver_inbound_framed(deliver.clone(), None)
+            .expect("queued");
+        assert_eq!((io("deliver_rows_in"), io("deliver_bytes_in")), (2, 8));
+        responder
+            .deliver_inbound_framed(
+                ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
+                    kind: EnvelopeKind::Key,
+                    refs: vec![
+                        EnvelopeRef {
+                            envelope_hash: h(1),
+                            seq: 1,
+                        },
+                        EnvelopeRef {
+                            envelope_hash: h(2),
+                            seq: 2,
+                        },
+                    ],
+                }),
+                None,
+            )
+            .expect("queued");
+        assert_eq!(io("summary_refs_in"), 2);
+        assert!(metrics
+            .snapshot()
+            .flatten()
+            .counters
+            .contains_key("replication_io"));
     }
 
     /// `drive_round_step(None)` from an Initiator yields a Summary

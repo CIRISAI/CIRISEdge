@@ -3550,6 +3550,11 @@ fn metrics_bundle_to_pydict<'py>(
         responder_rounds.set_item(key.as_str(), *n)?;
     }
     root.set_item("responder_rounds_total", responder_rounds)?;
+    let replication_io = pyo3::types::PyDict::new(py);
+    for (key, n) in &bundle.replication_io {
+        replication_io.set_item(key.as_str(), *n)?;
+    }
+    root.set_item("replication_io", replication_io)?;
     let link_up = pyo3::types::PyDict::new(py);
     for (stage, h) in &bundle.responder_link_up_seconds {
         link_up.set_item(stage.as_str(), histogram_to_pydict(py, h)?)?;
