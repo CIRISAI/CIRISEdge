@@ -1457,6 +1457,7 @@ impl GatedRound<'_> {
         // queues for a permit.
         let Admission::Run(ticket) = self.backoff.admit(self.peer_id, self.coord.kind()) else {
             tracing::trace!("round skipped — peer is in no-route backoff (CIRISEdge#794)");
+            self.book_initiator("skipped_backoff");
             return (RoundRan::Skipped, RoundLine::default());
         };
         // CIRISEdge#971 — the ONE round-start choke, every plane and both
@@ -1465,12 +1466,14 @@ impl GatedRound<'_> {
         // seek. It ends `no_route` exactly as its send would have, so the
         // outcome counter and #794's backoff see the same thing as before.
         if !self.coord.round_carriable().await {
+            self.book_initiator("not_carriable");
             return self.not_carriable(ticket).await;
         }
         let mut seat = RoundSeat::take(self.round_gate, self.peer_id, self.kind_str).await;
         // Another plane may have found the peer unroutable while this one
         // waited for its permit.
         if ticket.overtaken() {
+            self.book_initiator("skipped_backoff");
             return (RoundRan::Skipped, RoundLine::default());
         }
         // CIRISEdge P0 telemetry — the round's wall time, from holding the
@@ -1504,6 +1507,13 @@ impl GatedRound<'_> {
         } else {
             RoundRan::Ended
         };
+        self.book_initiator(match ran {
+            RoundRan::Completed if ended.exchanged => "exchanged",
+            RoundRan::Completed => "nothing_exchanged",
+            RoundRan::Unanswered => "timed_out",
+            RoundRan::SendFailed => "send_failed",
+            _ => "ended",
+        });
         ticket.finish(class);
         let line = RoundLine {
             took_ms: started.elapsed().as_millis(),
@@ -1515,6 +1525,13 @@ impl GatedRound<'_> {
 }
 
 impl GatedRound<'_> {
+    /// Seat load 2026-11-13 (S0) — `peer_activity.initiator.<class>.<outcome>`.
+    fn book_initiator(&self, outcome: &str) {
+        if let Some(m) = self.metrics {
+            m.inc_initiator_round(self.peer_id, outcome);
+        }
+    }
+
     /// CIRISEdge#971 — book a round the transport cannot carry as the
     /// `no_route` its send would have ended in, without running it.
     async fn not_carriable(&self, ticket: RoundTicket<'_>) -> (RoundRan, RoundLine) {
@@ -1715,6 +1732,9 @@ fn round_class_of(e: &RoundError) -> RoundClass {
 struct RoundEnded {
     outcome: &'static str,
     error: Option<String>,
+    /// Seat load 2026-11-13 (S0) — a completed round that admitted,
+    /// refused or duplicated anything here.
+    exchanged: bool,
 }
 
 impl Default for RoundEnded {
@@ -1722,6 +1742,7 @@ impl Default for RoundEnded {
         Self {
             outcome: "skipped",
             error: None,
+            exchanged: false,
         }
     }
 }
@@ -1733,9 +1754,11 @@ impl RoundEnded {
             RoundEvent::Error(e) | RoundEvent::NoRoute(e) => Some(e.clone()),
             RoundEvent::Completed(_) | RoundEvent::Refused | RoundEvent::TimedOut => None,
         };
+        let exchanged = matches!(event, RoundEvent::Completed(r) if r.admitted + r.refused > 0);
         Self {
             outcome: event.outcome().as_str(),
             error,
+            exchanged,
         }
     }
 }
@@ -1823,6 +1846,9 @@ async fn round_and_report(
             DriveStep::SendThenWait(_) => RoundEvent::TimedOut,
         };
         *ended = RoundEnded::of(&event);
+        if let RoundEvent::Completed(report) = &event {
+            coord.note_round_complete(report);
+        }
         if let Some(sink) = event_sink {
             let _ = sink.send((peer_id.to_string(), event)).await;
         }
@@ -1890,6 +1916,9 @@ async fn round_and_report(
         }
     };
     *ended = RoundEnded::of(&event);
+    if let RoundEvent::Completed(report) = &event {
+        coord.note_round_complete(report);
+    }
     coord.note_round_ended(!matches!(event, RoundEvent::Completed(_)));
     if let Some(sink) = event_sink {
         // Sink-closed isn't a fault — the metrics consumer

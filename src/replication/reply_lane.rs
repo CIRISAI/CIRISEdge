@@ -353,6 +353,7 @@ async fn send(coord: &ReplicationCoordinator, state: &LaneState, job: &ReplyJob)
     }
     if let Some(Finish { report, began }) = &job.finishes {
         count(coord, obs::RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL);
+        coord.note_round_complete(report);
         tracing::info!(
             peer = %peer, ?kind, ?report,
             link = %coord.last_inbound_link_hex(),

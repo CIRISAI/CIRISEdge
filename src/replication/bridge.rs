@@ -11383,6 +11383,11 @@ impl FederationDirectoryReplicationBridge {
         membership: &'static str,
         set: &ResolvedPeerSet,
     ) {
+        // Seat load 2026-11-13 (S0) — the class this peer's activity is
+        // counted under (`peer_activity`), every resolve.
+        if let Some(m) = &self.metrics {
+            m.set_peer_class(peer, membership);
+        }
         let previous = {
             let Ok(mut seen) = self.send_set_membership.lock() else {
                 return;

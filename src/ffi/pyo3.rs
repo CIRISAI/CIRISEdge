@@ -3555,6 +3555,16 @@ fn metrics_bundle_to_pydict<'py>(
         replication_io.set_item(key.as_str(), *n)?;
     }
     root.set_item("replication_io", replication_io)?;
+    for (name, family) in [
+        ("peer_activity", &bundle.peer_activity),
+        ("persist_reads", &bundle.persist_reads),
+    ] {
+        let d = pyo3::types::PyDict::new(py);
+        for (label, n) in family {
+            d.set_item(label.as_str(), *n)?;
+        }
+        root.set_item(name, d)?;
+    }
     let link_up = pyo3::types::PyDict::new(py);
     for (stage, h) in &bundle.responder_link_up_seconds {
         link_up.set_item(stage.as_str(), histogram_to_pydict(py, h)?)?;

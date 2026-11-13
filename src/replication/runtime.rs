@@ -721,6 +721,7 @@ pub(crate) fn spawn_responder_drive(
                 Ok(DriveStep::Complete(report)) => {
                     round_began = None;
                     count(obs::RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL);
+                    coord.note_round_complete(&report);
                     tracing::info!(
                         peer = %peer, ?kind, ?report,
                         link = %coord.last_inbound_link_hex(),
