@@ -124,6 +124,8 @@ pub mod bridge;
 pub mod convergence;
 pub mod coordinator;
 #[cfg(test)]
+mod cosign_1252_tests;
+#[cfg(test)]
 mod counting_directory_930;
 pub mod directory;
 #[cfg(test)]
@@ -198,6 +200,7 @@ pub mod summary;
 #[cfg(test)]
 mod typed_refusal_858_tests;
 pub mod wire_frame;
+pub mod wire_ref;
 
 /// What [`InboundRouter::try_route`] did with a frame.
 ///

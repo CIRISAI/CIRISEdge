@@ -45,11 +45,21 @@ pub enum DecisionRowKind {
     /// `consent:replication:` — a contact grant (a contact request when it
     /// names this node's person and is not reciprocated: the server's fold).
     ContactRequest,
+    /// `cosign:pending:` — a widening or removal HELD for cosignatures (persist
+    /// 61.3.0, CIRISPersist#1252; CC 3.3.4, CC 3.1.3 `cosign:{state}`): the
+    /// event its primary signed, short of its room's protocol. A decision the
+    /// group's members may answer by cosigning. Its `attestation_id` is the
+    /// quorum key; `scope_id` is the group.
+    CosignPending,
+    /// `cosign:signature:` — one member's cosignature on a held event, by
+    /// itself. `proposal_id` names the held event (its quorum key), so the
+    /// host refreshes that decision's tally.
+    CosignSignature,
 }
 
 impl DecisionRowKind {
     /// Every kind with the prefixes it maps (the documented list).
-    pub const PREFIXES: [(Self, &'static [&'static str]); 7] = [
+    pub const PREFIXES: [(Self, &'static [&'static str]); 9] = [
         (Self::MembershipProposal, &["membership:proposal:"]),
         (
             Self::MembershipReply,
@@ -68,6 +78,8 @@ impl DecisionRowKind {
         (Self::ModerationAction, &["moderation:"]),
         (Self::AccordHalt, &["accord:invoke:"]),
         (Self::ContactRequest, &["consent:replication:"]),
+        (Self::CosignPending, &["cosign:pending:"]),
+        (Self::CosignSignature, &["cosign:signature:"]),
     ];
 
     /// The stable token (the serde spelling).
@@ -81,6 +93,8 @@ impl DecisionRowKind {
             Self::ModerationAction => "moderation_action",
             Self::AccordHalt => "accord_halt",
             Self::ContactRequest => "contact_request",
+            Self::CosignPending => "cosign_pending",
+            Self::CosignSignature => "cosign_signature",
         }
     }
 
@@ -210,16 +224,35 @@ impl DecisionRowRef {
     #[must_use]
     pub fn of_row(row: &Attestation, cursor: DecisionCursor) -> Option<Self> {
         let kind = DecisionRowKind::of_row(row)?;
-        let scope_id = ["community_key_id", "family_key_id"]
-            .iter()
-            .find_map(|k| env_str(row, k))
-            .map(str::to_owned);
+        // A cosign row carries its event (and so its group) inside its own
+        // member, not at the envelope's top: persist reads it back.
+        let cosign = matches!(
+            kind,
+            DecisionRowKind::CosignPending | DecisionRowKind::CosignSignature
+        )
+        .then(|| {
+            ciris_persist::federation::cosign::read_row(row)
+                .ok()
+                .flatten()
+        })
+        .flatten();
+        let scope_id = match &cosign {
+            Some(read) => Some(read.event.group_key_id().to_owned()),
+            None => ["community_key_id", "family_key_id"]
+                .iter()
+                .find_map(|k| env_str(row, k))
+                .map(str::to_owned),
+        };
         let proposal_id = match kind {
-            DecisionRowKind::MembershipReply => env_str(row, "references_attestation_id"),
-            DecisionRowKind::Objection => env_str(row, "objects_to_attestation_id"),
+            DecisionRowKind::MembershipReply => {
+                env_str(row, "references_attestation_id").map(str::to_owned)
+            }
+            DecisionRowKind::Objection => {
+                env_str(row, "objects_to_attestation_id").map(str::to_owned)
+            }
+            DecisionRowKind::CosignSignature => cosign.as_ref().map(|r| r.quorum_key.clone()),
             _ => None,
-        }
-        .map(str::to_owned);
+        };
         Some(Self {
             attestation_id: row.attestation_id.clone(),
             kind,

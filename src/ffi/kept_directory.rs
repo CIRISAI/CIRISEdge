@@ -24,6 +24,8 @@ use ciris_persist::federation::*;
 pub(crate) struct KeptDirectory {
     inner: Arc<dyn FederationDirectory>,
     fixed: KeptSyncReads,
+    /// `node_key_id` once it is a real key (see `node_key_id` below).
+    node_key: std::sync::OnceLock<String>,
     _executor: Arc<crate::ffi::pyo3::KeptExecutor>,
     _capsule: pyo3::Py<pyo3::PyAny>,
 }
@@ -31,7 +33,6 @@ pub(crate) struct KeptDirectory {
 /// The proxy's sync reads, read once (see [`KeptDirectory`]).
 pub(crate) struct KeptSyncReads {
     pub(crate) hardware_attestation_policy: std::sync::Arc<HardwareAttestationPolicy>,
-    pub(crate) node_key_id: Option<String>,
     pub(crate) withdraws_delegation_depth: usize,
 }
 
@@ -43,15 +44,18 @@ impl KeptDirectory {
     ) -> Self {
         let fixed = KeptSyncReads {
             hardware_attestation_policy: inner.hardware_attestation_policy(),
-            node_key_id: inner.node_key_id(),
             withdraws_delegation_depth: inner.withdraws_delegation_depth(),
         };
-        Self {
+        let kept = Self {
             inner,
             fixed,
+            node_key: std::sync::OnceLock::new(),
             _executor: executor,
             _capsule: capsule,
-        }
+        };
+        // Latch the key now if the host already registered it.
+        let _ = FederationDirectory::node_key_id(&kept);
+        kept
     }
 }
 
@@ -1214,7 +1218,21 @@ impl FederationDirectory for KeptDirectory {
             .await
     }
     fn node_key_id(&self) -> Option<String> {
-        self.fixed.node_key_id.clone()
+        // A real key never changes once set (it is the Engine's own
+        // signer-derived key), so it is latched; None, and the proxy's
+        // timeout sentinel, are never latched: re-read until the host
+        // registers (CIRISPersist#1269). The re-read blocks this thread
+        // for one round trip, only in that first-run window.
+        if let Some(k) = self.node_key.get() {
+            return Some(k.clone());
+        }
+        let read = self.inner.node_key_id();
+        match read.as_deref() {
+            Some(k) if k != ciris_persist::ffi::directory_capsule::NODE_KEY_ID_UNAVAILABLE => {
+                Some(self.node_key.get_or_init(|| k.to_owned()).clone())
+            }
+            _ => read,
+        }
     }
     async fn note_cosign_alias(
         &self,

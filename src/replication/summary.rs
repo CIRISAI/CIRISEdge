@@ -509,6 +509,12 @@ pub enum AwaitedSigner {
     /// The row is indexed on the held signer (the #776 index), and the binding
     /// or occurrence that makes it act for the identity releases it.
     ActsFor(String),
+    /// persist 61.3.0 (CIRISPersist#1252) — a `withdraws` whose TARGET this
+    /// node does not hold yet, nor any alias of it
+    /// (`Error::WithdrawsTargetUnheld`): the #858 ordering gap. The row parks
+    /// on the target's `attestation_id`, and the target's (or its alias's)
+    /// arrival releases it.
+    Row(String),
 }
 
 impl ApplyOutcome {
@@ -560,6 +566,19 @@ impl ApplyOutcome {
             reason: reason.into(),
             retry: RetryDisposition::Transient,
             awaits_signer: Some(AwaitedSigner::ActsFor(signer.into())),
+            class: None,
+        }
+    }
+
+    /// persist 61.3.0 (CIRISPersist#1252) — a TRANSIENT `Refused` for a
+    /// `withdraws` whose target `attestation_id` this node does not hold yet
+    /// (`Error::WithdrawsTargetUnheld`). Parked on the target and released when
+    /// it (or an alias of it) lands.
+    pub fn refused_awaiting_row(reason: impl Into<String>, target: impl Into<String>) -> Self {
+        ApplyOutcome::Refused {
+            reason: reason.into(),
+            retry: RetryDisposition::Transient,
+            awaits_signer: Some(AwaitedSigner::Row(target.into())),
             class: None,
         }
     }
@@ -620,6 +639,19 @@ impl ApplyOutcome {
                 awaits_signer: Some(AwaitedSigner::ActsFor(signer)),
                 ..
             } => Some(signer),
+            _ => None,
+        }
+    }
+
+    /// persist 61.3.0 (CIRISPersist#1252) — the row (`attestation_id`) a
+    /// refused `withdraws` waits on, if persist said one.
+    #[must_use]
+    pub fn awaits_row(&self) -> Option<&str> {
+        match self {
+            ApplyOutcome::Refused {
+                awaits_signer: Some(AwaitedSigner::Row(target)),
+                ..
+            } => Some(target),
             _ => None,
         }
     }

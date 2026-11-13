@@ -44,9 +44,16 @@ OUT = ROOT / "src" / "ffi" / "kept_directory.rs"
 # construction (see the generated `KeptDirectory` docs), with their types.
 SYNC_READS = [
     ("hardware_attestation_policy", "std::sync::Arc<HardwareAttestationPolicy>"),
-    ("node_key_id", "Option<String>"),
     ("withdraws_delegation_depth", "usize"),
 ]
+
+# `node_key_id` is NOT stable from construction: a fresh node's backend has no
+# key until the host's first-run `register_self_federation_key` (persist
+# engine.rs:3221), and persist reads None as "no audience check" (fail-open,
+# CIRISPersist#1269). It is answered by a latch that holds only a real key and
+# re-reads through the proxy while it holds none. Every route persist sets it
+# by sets the Engine's own signer-derived key, so a Some never changes.
+LATCHED_SYNC = {"node_key_id"}
 
 # Sync methods the ops proxy answers without crossing the capsule (it returns
 # itself, a reference, or the trait default): delegated live.
@@ -150,6 +157,8 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
     A("pub(crate) struct KeptDirectory {")
     A("    inner: Arc<dyn FederationDirectory>,")
     A("    fixed: KeptSyncReads,")
+    A("    /// `node_key_id` once it is a real key (see `node_key_id` below).")
+    A("    node_key: std::sync::OnceLock<String>,")
     A("    _executor: Arc<crate::ffi::pyo3::KeptExecutor>,")
     A("    _capsule: pyo3::Py<pyo3::PyAny>,")
     A("}")
@@ -170,7 +179,10 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
     for name, _ty in SYNC_READS:
         A(f"            {name}: inner.{name}(),")
     A("        };")
-    A("        Self { inner, fixed, _executor: executor, _capsule: capsule }")
+    A("        let kept = Self { inner, fixed, node_key: std::sync::OnceLock::new(), _executor: executor, _capsule: capsule };")
+    A("        // Latch the key now if the host already registered it.")
+    A("        let _ = FederationDirectory::node_key_id(&kept);")
+    A("        kept")
     A("    }")
     A("}")
     A("")
@@ -206,6 +218,25 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
         if name in anchored:
             A("    // persist compiles this method only under `test` or `test-anchor`.")
             A('    #[cfg(feature = "test-anchor")]')
+        if name in LATCHED_SYNC:
+            A(f"    fn {name}({arglist}) -> {ret} {{")
+            A("        // A real key never changes once set (it is the Engine's own")
+            A("        // signer-derived key), so it is latched; None, and the proxy's")
+            A("        // timeout sentinel, are never latched: re-read until the host")
+            A("        // registers (CIRISPersist#1269). The re-read blocks this thread")
+            A("        // for one round trip, only in that first-run window.")
+            A("        if let Some(k) = self.node_key.get() {")
+            A("            return Some(k.clone());")
+            A("        }")
+            A("        let read = self.inner.node_key_id();")
+            A("        match read.as_deref() {")
+            A("            Some(k) if k != ciris_persist::ffi::directory_capsule::NODE_KEY_ID_UNAVAILABLE => {")
+            A("                Some(self.node_key.get_or_init(|| k.to_owned()).clone())")
+            A("            }")
+            A("            _ => read,")
+            A("        }")
+            A("    }")
+            continue
         if name in sync and name not in PURE_SYNC:
             A(f"    fn {name}({arglist}) -> {ret} {{")
             A(f"        self.fixed.{name}.clone()")
@@ -269,7 +300,7 @@ def main() -> None:
     gen = load_persist_generator(a.persist_src)
     methods = methods_of(gen, a.persist_src)
     sync = sync_methods(gen, a.persist_src)
-    known = {name for name, _ in SYNC_READS} | PURE_SYNC
+    known = {name for name, _ in SYNC_READS} | PURE_SYNC | LATCHED_SYNC
     if sync != known:
         # A new sync method would be delegated live: a blocking round trip on
         # whatever thread calls it. Decide how it is answered, then list it.

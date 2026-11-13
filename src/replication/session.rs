@@ -1198,13 +1198,22 @@ impl Session {
             // unrequested ones past the gate.
             let mut requested_hash: Option<[u8; 32]> = None;
             if hash_first_active {
-                use sha2::{Digest as _, Sha256};
-                let h: [u8; 32] = Sha256::digest(env_bytes).into();
+                // persist 61.3.0 (CIRISPersist#1252) — a body is matched to the
+                // ref it was asked for by: the act ref a 61.3+ peer advertises
+                // for a cosigned group row, else the bytes' own hash (every
+                // other row, and what a 61.2 peer advertises for every row).
+                let act = super::wire_ref::envelope_ref(self.kind, env_bytes);
+                let plain = super::wire_ref::plain_ref(env_bytes);
+                let h = if self.pending_bodies.contains_key(&act) {
+                    act
+                } else {
+                    plain
+                };
                 if self.pending_bodies.remove(&h).is_some() {
                     // Remember it: a TRANSIENT refusal below must put it back.
                     requested_hash = Some(h);
                 } else {
-                    provider.note_known_hashes(self.kind, &[h], source_peer);
+                    provider.note_known_hashes(self.kind, &[act], source_peer);
                     tracing::debug!(
                         kind = ?self.kind,
                         peer = ?source_peer,
@@ -1300,6 +1309,10 @@ impl Session {
                     let (signer, key_missing) = match awaits_signer {
                         Some(AwaitedSigner::Key(s)) => (Some(s.clone()), true),
                         Some(AwaitedSigner::ActsFor(s)) => (Some(s.clone()), false),
+                        // persist 61.3.0 (#1252) — a `withdraws` waiting on its
+                        // target row: no key is missing; the throttle keys on
+                        // the row it waits for.
+                        Some(AwaitedSigner::Row(target)) => (Some(format!("row:{target}")), false),
                         None => (
                             crate::replication::missing_signer::missing_signer_of(
                                 self.kind, env_bytes,

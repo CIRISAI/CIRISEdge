@@ -12637,6 +12637,68 @@ mod pyo3_tier2_tests {
         Python::attach(|_py| drop(executor));
     }
 
+    /// **CIRISPersist#1269 — the kept directory never latches an absent node
+    /// key.** A fresh node's backend has no node key until the host's first-run
+    /// `register_self_federation_key` sets it (persist engine.rs:3221, through
+    /// `set_backend_node_key_id` → the backend's `set_node_key_id`), and persist
+    /// reads None as "no audience check". Edge's kept directory is built at
+    /// `init_edge_runtime`, which a host may call before it registers. Here it
+    /// is built over persist's real ops proxy on a store with no key, the key is
+    /// then set exactly as registration sets it, and the kept directory's next
+    /// read returns it. Red with a construction-time snapshot of `node_key_id`.
+    #[test]
+    fn the_kept_directory_reads_a_node_key_registered_after_it_was_built_1269() {
+        use ciris_persist::federation::FederationDirectory as _;
+        init_python();
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime"),
+        );
+        let backend = Arc::new(rt.block_on(async {
+            let b = ciris_persist::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .expect("store");
+            ciris_persist::prelude::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        }));
+        assert_eq!(backend.node_key_id(), None, "precondition: a fresh store");
+        let executor = Arc::new(KeptExecutor::new(
+            ciris_persist::ffi::executor_capsule::build_persist_executor(Arc::clone(&rt)),
+            None,
+        ));
+        let directory = ciris_persist::ffi::directory_capsule::build_persist_directory(Arc::clone(
+            &backend,
+        )
+            as Arc<dyn ciris_persist::federation::FederationDirectory>);
+        let proxy = ciris_persist::ffi::directory_capsule::build_ops_directory(
+            directory,
+            Arc::new(executor.copy()),
+        )
+        .expect("proxy");
+        let kept = Python::attach(|py| {
+            crate::ffi::kept_directory::KeptDirectory::new(proxy, Arc::clone(&executor), py.None())
+        });
+        assert_eq!(kept.node_key_id(), None, "no key yet, and none latched");
+        backend.set_node_key_id("node-1269");
+        assert_eq!(
+            kept.node_key_id().as_deref(),
+            Some("node-1269"),
+            "the registration is seen, never a latched None"
+        );
+        assert_eq!(
+            kept.node_key_id().as_deref(),
+            Some("node-1269"),
+            "latched now"
+        );
+        drop(kept);
+        drop(executor);
+    }
+
     /// A Python object's reference count, read while attached.
     fn refcount(_py: Python<'_>, obj: &pyo3::Py<pyo3::PyAny>) -> isize {
         #[allow(unsafe_code)]
