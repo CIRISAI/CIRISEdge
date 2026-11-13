@@ -658,7 +658,7 @@ impl Default for EdgeTelemetry {
 
 /// The `kind` tokens of `ciris.edge.decision_row.unheard`, in
 /// [`DecisionRowKind`](crate::decision_rows::DecisionRowKind)'s order.
-pub const DECISION_ROW_KINDS: [&str; 7] = [
+pub const DECISION_ROW_KINDS: [&str; 9] = [
     "membership_proposal",
     "membership_reply",
     "objection",
@@ -666,6 +666,10 @@ pub const DECISION_ROW_KINDS: [&str; 7] = [
     "moderation_action",
     "accord_halt",
     "contact_request",
+    // persist 61.3.0 (CIRISPersist#1252): a held widening/removal and one
+    // member's cosignature on it.
+    "cosign_pending",
+    "cosign_signature",
 ];
 
 fn kind_slot(kind: EnvelopeKind) -> usize {
