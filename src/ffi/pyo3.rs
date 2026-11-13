@@ -7587,12 +7587,21 @@ pub fn init_edge_runtime(
     let federation_directory_for_edge: Arc<dyn ciris_persist::federation::FederationDirectory> =
         directory_arc;
 
-    let (verify_dir, rooting_dir): (Arc<dyn VerifyDirectory>, Arc<dyn RootingDirectory>) =
-        match &queue_dispatch {
-            #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
-            BackendDispatch::Postgres(b) => (b.clone(), b.clone()),
-            BackendDispatch::Sqlite(b) => (b.clone(), b.clone()),
-        };
+    let rooting_dir: Arc<dyn RootingDirectory> = match &queue_dispatch {
+        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
+        BackendDispatch::Postgres(b) => b.clone(),
+        BackendDispatch::Sqlite(b) => b.clone(),
+    };
+    // Every inbound signature check, the accord-holder read, and the HTTPS
+    // mTLS / bearer key lookup run inside persist's `.so` through the ops
+    // proxy, never on edge's compiled copy of the backend: the two binaries
+    // each carry a `parking_lot_core`, and a waiter parked by one is never
+    // woken by an unlock from the other (the first `dispatch_inbound_bytes`
+    // hung forever on the SQLite writer). See
+    // [`crate::verify::PersistSideVerifyDirectory`].
+    let verify_dir: Arc<dyn VerifyDirectory> = Arc::new(
+        crate::verify::PersistSideVerifyDirectory::new(Arc::clone(&federation_directory_for_edge)),
+    );
     // v0.16.1 (CIRISEdge#33 durable flip / CIRISPersist#120) — derive
     // `Arc<dyn BlackholeRules>` from the same `BackendDispatch` arm.
     // Sibling trait to `FederationDirectory`; both backends impl it.

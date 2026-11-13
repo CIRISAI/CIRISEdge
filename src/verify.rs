@@ -94,8 +94,11 @@ pub trait VerifyDirectory: Send + Sync + 'static {
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<[u8; 32]>, VerifyError>;
 }
 
+// `?Sized` so `dyn FederationDirectory` (persist's `directory_ops_capsule`
+// proxy) is a `VerifyDirectory` too: [`PersistSideVerifyDirectory`] routes
+// through it.
 #[async_trait]
-impl<F: FederationDirectory + Send + Sync + 'static> VerifyDirectory for F {
+impl<F: FederationDirectory + Send + Sync + ?Sized + 'static> VerifyDirectory for F {
     async fn verify_hybrid_via_directory(
         &self,
         canonical_bytes: &[u8],
@@ -187,6 +190,72 @@ pub struct AccordHolderKey {
     pub key_id: String,
     pub pubkey_ed25519: [u8; 32],
     pub identity_ref: String,
+}
+
+/// The verify view an edge cohabiting with the `ciris_persist` wheel holds:
+/// every signature check, key lookup and accord-holder read runs inside
+/// persist's `.so`.
+///
+/// Edge statically links its own copy of persist, so a concrete
+/// `Arc<SqliteBackend>` lifted out of a capsule runs EDGE's compiled copy of
+/// persist's store code against a backend the wheel built. That code takes
+/// the backend's `parking_lot::Mutex` (the SQLite writer, the read pool) with
+/// EDGE's `parking_lot_core`, whose waiter queue is a per-binary static. The
+/// wheel takes the same mutex with ITS copy. A thread that parks on contention
+/// parks in its own binary's queue, and an unlock from the other binary looks
+/// in the other queue, finds no waiter, and clears the parked bit: the mutex is
+/// free and the parked thread never wakes. The first
+/// `dispatch_inbound_bytes` after `init_edge_runtime` hung forever that way
+/// (its key lookup parked in edge's queue while persist's own work held the
+/// writer).
+///
+/// `ops` is persist's `directory_ops_capsule` proxy: each call is serialized,
+/// executed by persist's `.so` on persist's runtime, and answered, so the lock
+/// is only ever taken by one copy of `parking_lot`. The three reads this trait
+/// makes (`lookup_public_key`, and `list_keys_by_identity_type` for the
+/// accord-holder set) are covered ops.
+pub struct PersistSideVerifyDirectory {
+    ops: Arc<dyn FederationDirectory>,
+}
+
+impl PersistSideVerifyDirectory {
+    /// `ops`: persist's ops proxy (`directory_ops_capsule`).
+    #[must_use]
+    pub fn new(ops: Arc<dyn FederationDirectory>) -> Self {
+        Self { ops }
+    }
+}
+
+#[async_trait]
+impl VerifyDirectory for PersistSideVerifyDirectory {
+    async fn verify_hybrid_via_directory(
+        &self,
+        canonical_bytes: &[u8],
+        signing_key_id: &str,
+        ed25519_sig_b64: &str,
+        ml_dsa_65_sig_b64: Option<&str>,
+        policy: HybridPolicy,
+        row_age: Option<StdDuration>,
+    ) -> Result<VerifyOutcome, HybridVerifyError> {
+        VerifyDirectory::verify_hybrid_via_directory(
+            &*self.ops,
+            canonical_bytes,
+            signing_key_id,
+            ed25519_sig_b64,
+            ml_dsa_65_sig_b64,
+            policy,
+            row_age,
+        )
+        .await
+    }
+
+    async fn list_accord_holders(&self) -> Result<Vec<AccordHolderKey>, VerifyError> {
+        VerifyDirectory::list_accord_holders(&*self.ops).await
+    }
+
+    async fn lookup_public_key(&self, key_id: &str) -> Result<Option<[u8; 32]>, VerifyError> {
+        VerifyDirectory::lookup_public_key(&*self.ops, key_id).await
+    }
 }
 
 /// Adapter trait that erases `FederationDirectory`'s generics for the
@@ -1747,5 +1816,42 @@ mod tests {
         assert!(!w.check_and_record("k", [1u8; 16]));
         // [3] is still within capacity window — replay rejects.
         assert!(w.check_and_record("k", [3u8; 16]));
+    }
+
+    /// The cohabiting verify view answers from the directory it was given (in
+    /// production persist's ops proxy) for all three reads, with nothing of
+    /// its own in between.
+    #[tokio::test]
+    async fn persist_side_verify_directory_reads_through_the_directory_it_wraps() {
+        let store = ciris_persist::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .expect("in-memory store");
+        ciris_persist::prelude::Backend::run_migrations(&store)
+            .await
+            .expect("migrate");
+        let store = Arc::new(store);
+        let view = PersistSideVerifyDirectory::new(store);
+        assert_eq!(
+            view.lookup_public_key("absent-key").await.expect("lookup"),
+            None
+        );
+        assert!(view
+            .list_accord_holders()
+            .await
+            .expect("accord holders")
+            .is_empty());
+        assert!(
+            view.verify_hybrid_via_directory(
+                b"bytes",
+                "absent-key",
+                "AAAA",
+                Some("AAAA"),
+                HybridPolicy::Strict,
+                None,
+            )
+            .await
+            .is_err(),
+            "an unknown key does not verify"
+        );
     }
 }
