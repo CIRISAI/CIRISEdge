@@ -45,6 +45,10 @@ pub(crate) struct CountingDirectory {
     head_gate: Arc<tokio::sync::Semaphore>,
     head_gated: Arc<std::sync::atomic::AtomicBool>,
     head_waiting: Arc<tokio::sync::Notify>,
+    /// CIRISEdge#988 — while set, the next read of each blocking sync method
+    /// answers the ops proxy's fail-closed timeout fallback once (the
+    /// refuse-all policy, depth 0, the unavailable node-key sentinel).
+    sync_fallback_once: Arc<Mutex<std::collections::HashSet<&'static str>>>,
 }
 
 impl CountingDirectory {
@@ -58,6 +62,7 @@ impl CountingDirectory {
             head_gate: Arc::new(tokio::sync::Semaphore::new(0)),
             head_gated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             head_waiting: Arc::new(tokio::sync::Notify::new()),
+            sync_fallback_once: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -101,6 +106,24 @@ impl CountingDirectory {
     pub(crate) fn fail_cursor_reads(&self, fail: bool) {
         self.fail_cursor_reads
             .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// CIRISEdge#988 — the next read of each blocking sync method answers the
+    /// proxy's timeout fallback, once.
+    pub(crate) fn time_out_sync_reads_once(&self) {
+        let mut s = self.sync_fallback_once.lock().expect("fallback");
+        s.extend([
+            "node_key_id",
+            "hardware_attestation_policy",
+            "withdraws_delegation_depth",
+        ]);
+    }
+
+    fn sync_falls_back(&self, method: &'static str) -> bool {
+        self.sync_fallback_once
+            .lock()
+            .expect("fallback")
+            .remove(method)
     }
 
     fn cursor_reads_fail(&self) -> bool {
@@ -658,6 +681,29 @@ impl FederationDirectory for CountingDirectory {
     ) -> Result<accord_carriage::AccordEvidenceAdmission, Error> {
         self.hit("apply_replicated_accord_evidence");
         self.inner.apply_replicated_accord_evidence(evidence).await
+    }
+    fn node_key_id(&self) -> Option<String> {
+        self.hit("node_key_id");
+        if self.sync_falls_back("node_key_id") {
+            return Some(ciris_persist::ffi::directory_capsule::NODE_KEY_ID_UNAVAILABLE.to_owned());
+        }
+        self.inner.node_key_id()
+    }
+    fn hardware_attestation_policy(&self) -> Arc<HardwareAttestationPolicy> {
+        self.hit("hardware_attestation_policy");
+        if self.sync_falls_back("hardware_attestation_policy") {
+            return Arc::new(
+                ciris_persist::ffi::directory_capsule::refuse_all_hardware_attestation_policy(),
+            );
+        }
+        self.inner.hardware_attestation_policy()
+    }
+    fn withdraws_delegation_depth(&self) -> usize {
+        self.hit("withdraws_delegation_depth");
+        if self.sync_falls_back("withdraws_delegation_depth") {
+            return 0;
+        }
+        self.inner.withdraws_delegation_depth()
     }
     fn as_dyn_directory(&self) -> &dyn FederationDirectory {
         self

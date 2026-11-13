@@ -126,7 +126,7 @@ pub mod coordinator;
 #[cfg(test)]
 mod cosign_1252_tests;
 #[cfg(test)]
-mod counting_directory_930;
+pub(crate) mod counting_directory_930;
 pub mod directory;
 #[cfg(test)]
 mod first_contact_retry_968_tests;

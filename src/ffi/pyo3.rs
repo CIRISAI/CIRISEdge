@@ -12699,6 +12699,67 @@ mod pyo3_tier2_tests {
         drop(executor);
     }
 
+    /// **CIRISEdge#988 — a sync read that timed out is not kept.** Through the
+    /// ops proxy each blocking sync read answers a fail-closed fallback after
+    /// 30 s (the unavailable node-key sentinel, the refuse-all policy, depth 0).
+    /// The kept directory's first read (at construction) gets the fallback;
+    /// the next read gets the host's real values. Red when a latch keeps the
+    /// fallback: a slow first round trip would refuse all evidence until a
+    /// restart.
+    #[test]
+    fn a_sync_read_that_timed_out_is_read_again_988() {
+        use ciris_persist::federation::FederationDirectory as _;
+        init_python();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let backend = Arc::new(rt.block_on(async {
+            let b = ciris_persist::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .expect("store");
+            ciris_persist::prelude::Backend::run_migrations(&b)
+                .await
+                .expect("migrate");
+            b
+        }));
+        backend.set_node_key_id("node-988");
+        let counting = crate::replication::counting_directory_930::CountingDirectory::new(
+            Arc::clone(&backend) as Arc<dyn ciris_persist::federation::FederationDirectory>,
+        );
+        counting.time_out_sync_reads_once();
+        let executor = Arc::new(KeptExecutor::new(
+            ciris_persist::ffi::executor_capsule::build_persist_executor(Arc::new(rt)),
+            None,
+        ));
+        let kept = Python::attach(|py| {
+            crate::ffi::kept_directory::KeptDirectory::new(
+                Arc::new(counting),
+                Arc::clone(&executor),
+                py.None(),
+            )
+        });
+        assert_eq!(kept.node_key_id().as_deref(), Some("node-988"));
+        assert_eq!(
+            *kept.hardware_attestation_policy(),
+            *backend.hardware_attestation_policy(),
+            "the host's policy, not the refuse-all fallback"
+        );
+        assert_ne!(
+            *kept.hardware_attestation_policy(),
+            ciris_persist::ffi::directory_capsule::refuse_all_hardware_attestation_policy(),
+            "precondition: the host's policy is not the fallback"
+        );
+        assert_eq!(
+            kept.withdraws_delegation_depth(),
+            backend.withdraws_delegation_depth()
+        );
+        assert_ne!(backend.withdraws_delegation_depth(), 0, "precondition");
+        drop(kept);
+        drop(executor);
+    }
+
     /// A Python object's reference count, read while attached.
     fn refcount(_py: Python<'_>, obj: &pyo3::Py<pyo3::PyAny>) -> isize {
         #[allow(unsafe_code)]

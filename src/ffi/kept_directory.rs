@@ -14,26 +14,19 @@ use ciris_persist::federation::*;
 /// into. Dropping the last clone releases the capsules; nothing else holds
 /// them on edge's behalf.
 ///
-/// The trait's SYNC reads are answered from `fixed`, read once in [`Self::new`].
-/// Through the proxy each sync read blocks its caller for a round trip on
-/// persist's runtime (fails closed after 30 s), and persist's code compiled
-/// into edge calls them from async bodies, i.e. on runtime workers. The values
-/// are fixed for the process once the host built its Engine (the node key is
-/// set at construction), so `new`, called once at `init_edge_runtime` on the
-/// host's thread, is the only place a sync read crosses the capsule.
+/// The trait's blocking SYNC reads are answered by latches (see the
+/// generator's `LATCHED_SYNC`): a value read through the proxy is kept for
+/// the process, except the proxy's fail-closed fallback (and an absent node
+/// key), which is never kept, so the next use reads again. Each latch is
+/// tried once in [`Self::new`] (init, the host's thread), so in the steady
+/// state no runtime worker blocks on a sync read.
 pub(crate) struct KeptDirectory {
     inner: Arc<dyn FederationDirectory>,
-    fixed: KeptSyncReads,
-    /// `node_key_id` once it is a real key (see `node_key_id` below).
-    node_key: std::sync::OnceLock<String>,
+    node_key_id: std::sync::OnceLock<String>,
+    hardware_attestation_policy: std::sync::OnceLock<std::sync::Arc<HardwareAttestationPolicy>>,
+    withdraws_delegation_depth: std::sync::OnceLock<usize>,
     _executor: Arc<crate::ffi::pyo3::KeptExecutor>,
     _capsule: pyo3::Py<pyo3::PyAny>,
-}
-
-/// The proxy's sync reads, read once (see [`KeptDirectory`]).
-pub(crate) struct KeptSyncReads {
-    pub(crate) hardware_attestation_policy: std::sync::Arc<HardwareAttestationPolicy>,
-    pub(crate) withdraws_delegation_depth: usize,
 }
 
 impl KeptDirectory {
@@ -42,19 +35,17 @@ impl KeptDirectory {
         executor: Arc<crate::ffi::pyo3::KeptExecutor>,
         capsule: pyo3::Py<pyo3::PyAny>,
     ) -> Self {
-        let fixed = KeptSyncReads {
-            hardware_attestation_policy: inner.hardware_attestation_policy(),
-            withdraws_delegation_depth: inner.withdraws_delegation_depth(),
-        };
         let kept = Self {
             inner,
-            fixed,
-            node_key: std::sync::OnceLock::new(),
+            node_key_id: std::sync::OnceLock::new(),
+            hardware_attestation_policy: std::sync::OnceLock::new(),
+            withdraws_delegation_depth: std::sync::OnceLock::new(),
             _executor: executor,
             _capsule: capsule,
         };
-        // Latch the key now if the host already registered it.
         let _ = FederationDirectory::node_key_id(&kept);
+        let _ = FederationDirectory::hardware_attestation_policy(&kept);
+        let _ = FederationDirectory::withdraws_delegation_depth(&kept);
         kept
     }
 }
@@ -460,7 +451,22 @@ impl FederationDirectory for KeptDirectory {
         self.inner.groups_of(cohort, member_key_id).await
     }
     fn hardware_attestation_policy(&self) -> std::sync::Arc<HardwareAttestationPolicy> {
-        self.fixed.hardware_attestation_policy.clone()
+        // Kept once read; the proxy's fail-closed fallback is never kept, so
+        // a slow first round trip does not stick for the process.
+        if let Some(k) = self.hardware_attestation_policy.get() {
+            return std::sync::Arc::clone(k);
+        }
+        let v = self.inner.hardware_attestation_policy();
+        match (*v
+            != ciris_persist::ffi::directory_capsule::refuse_all_hardware_attestation_policy())
+        .then(|| std::sync::Arc::clone(&v))
+        {
+            Some(keep) => {
+                let k = self.hardware_attestation_policy.get_or_init(|| keep);
+                std::sync::Arc::clone(k)
+            }
+            None => v,
+        }
     }
     async fn heartbeat_shared_instance(
         &self,
@@ -1218,20 +1224,25 @@ impl FederationDirectory for KeptDirectory {
             .await
     }
     fn node_key_id(&self) -> Option<String> {
-        // A real key never changes once set (it is the Engine's own
-        // signer-derived key), so it is latched; None, and the proxy's
-        // timeout sentinel, are never latched: re-read until the host
-        // registers (CIRISPersist#1269). The re-read blocks this thread
-        // for one round trip, only in that first-run window.
-        if let Some(k) = self.node_key.get() {
+        // Kept once read; the proxy's fail-closed fallback is never kept, so
+        // a slow first round trip does not stick for the process.
+        // The value only moves None -> Some(k), and k is the Engine's own
+        // signer-derived key on every route persist sets it by, so a kept
+        // Some never goes stale; None is never kept (CIRISPersist#1269).
+        if let Some(k) = self.node_key_id.get() {
             return Some(k.clone());
         }
-        let read = self.inner.node_key_id();
-        match read.as_deref() {
-            Some(k) if k != ciris_persist::ffi::directory_capsule::NODE_KEY_ID_UNAVAILABLE => {
-                Some(self.node_key.get_or_init(|| k.to_owned()).clone())
+        let v = self.inner.node_key_id();
+        match v
+            .as_deref()
+            .filter(|k| *k != ciris_persist::ffi::directory_capsule::NODE_KEY_ID_UNAVAILABLE)
+            .map(str::to_owned)
+        {
+            Some(keep) => {
+                let k = self.node_key_id.get_or_init(|| keep);
+                Some(k.clone())
             }
-            _ => read,
+            None => v,
         }
     }
     async fn note_cosign_alias(
@@ -1911,6 +1922,18 @@ impl FederationDirectory for KeptDirectory {
         self.inner.withdraws_admission_depth(attestation_id).await
     }
     fn withdraws_delegation_depth(&self) -> usize {
-        self.fixed.withdraws_delegation_depth.clone()
+        // Kept once read; the proxy's fail-closed fallback is never kept, so
+        // a slow first round trip does not stick for the process.
+        if let Some(k) = self.withdraws_delegation_depth.get() {
+            return *k;
+        }
+        let v = self.inner.withdraws_delegation_depth();
+        match (v != 0).then_some(v) {
+            Some(keep) => {
+                let k = self.withdraws_delegation_depth.get_or_init(|| keep);
+                *k
+            }
+            None => v,
+        }
     }
 }

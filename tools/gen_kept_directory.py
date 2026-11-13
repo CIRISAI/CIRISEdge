@@ -40,20 +40,48 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "src" / "ffi" / "kept_directory.rs"
 
 
-# CIRISEdge#988 — the trait's sync methods, answered from values read once at
-# construction (see the generated `KeptDirectory` docs), with their types.
-SYNC_READS = [
-    ("hardware_attestation_policy", "std::sync::Arc<HardwareAttestationPolicy>"),
-    ("withdraws_delegation_depth", "usize"),
+# CIRISEdge#988 — the trait's BLOCKING sync methods. Through persist's ops
+# proxy each is a round trip on persist's runtime that blocks its caller (and
+# answers a fail-closed fallback after 30 s), and persist's code compiled into
+# edge calls them from async bodies, i.e. on runtime workers. Each is answered
+# by a latch: a value read through the proxy is kept for the process, EXCEPT
+# the proxy's fail-closed fallback (and, for the node key, None), which is
+# never kept: the next use reads again, failing closed meanwhile.
+#
+# (name, value type, latch type, `is_kept(&value)` expression, latch→value)
+#  - node_key_id: the value only moves None → Some(k), and k is the Engine's
+#    own signer-derived key on every route persist sets it by (registration,
+#    engine.rs:3221; the lazy fills :1458/:8351), so a kept Some never goes
+#    stale; None (a first-run node before registration, which persist reads
+#    as "no audience check", CIRISPersist#1269) and the timeout sentinel are
+#    never kept.
+#  - hardware_attestation_policy / withdraws_delegation_depth: set only on a
+#    concrete backend before the host builds its Engine (no Engine or Python
+#    setter), so stable for the process; the timeout fallbacks (the
+#    refuse-all policy, depth 0) are never kept.
+LATCHED_SYNC = [
+    (
+        "node_key_id",
+        "Option<String>",
+        "String",
+        "v.as_deref().filter(|k| *k != ciris_persist::ffi::directory_capsule::NODE_KEY_ID_UNAVAILABLE).map(str::to_owned)",
+        "Some(k.clone())",
+    ),
+    (
+        "hardware_attestation_policy",
+        "std::sync::Arc<HardwareAttestationPolicy>",
+        "std::sync::Arc<HardwareAttestationPolicy>",
+        "(*v != ciris_persist::ffi::directory_capsule::refuse_all_hardware_attestation_policy()).then(|| std::sync::Arc::clone(&v))",
+        "std::sync::Arc::clone(k)",
+    ),
+    (
+        "withdraws_delegation_depth",
+        "usize",
+        "usize",
+        "(v != 0).then_some(v)",
+        "*k",
+    ),
 ]
-
-# `node_key_id` is NOT stable from construction: a fresh node's backend has no
-# key until the host's first-run `register_self_federation_key` (persist
-# engine.rs:3221), and persist reads None as "no audience check" (fail-open,
-# CIRISPersist#1269). It is answered by a latch that holds only a real key and
-# re-reads through the proxy while it holds none. Every route persist sets it
-# by sets the Engine's own signer-derived key, so a Some never changes.
-LATCHED_SYNC = {"node_key_id"}
 
 # Sync methods the ops proxy answers without crossing the capsule (it returns
 # itself, a reference, or the trait default): delegated live.
@@ -147,26 +175,18 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
     A("/// into. Dropping the last clone releases the capsules; nothing else holds")
     A("/// them on edge's behalf.")
     A("///")
-    A("/// The trait's SYNC reads are answered from `fixed`, read once in [`Self::new`].")
-    A("/// Through the proxy each sync read blocks its caller for a round trip on")
-    A("/// persist's runtime (fails closed after 30 s), and persist's code compiled")
-    A("/// into edge calls them from async bodies, i.e. on runtime workers. The values")
-    A("/// are fixed for the process once the host built its Engine (the node key is")
-    A("/// set at construction), so `new`, called once at `init_edge_runtime` on the")
-    A("/// host's thread, is the only place a sync read crosses the capsule.")
+    A("/// The trait's blocking SYNC reads are answered by latches (see the")
+    A("/// generator's `LATCHED_SYNC`): a value read through the proxy is kept for")
+    A("/// the process, except the proxy's fail-closed fallback (and an absent node")
+    A("/// key), which is never kept, so the next use reads again. Each latch is")
+    A("/// tried once in [`Self::new`] (init, the host's thread), so in the steady")
+    A("/// state no runtime worker blocks on a sync read.")
     A("pub(crate) struct KeptDirectory {")
     A("    inner: Arc<dyn FederationDirectory>,")
-    A("    fixed: KeptSyncReads,")
-    A("    /// `node_key_id` once it is a real key (see `node_key_id` below).")
-    A("    node_key: std::sync::OnceLock<String>,")
+    for name, _ty, latch, _k, _v in LATCHED_SYNC:
+        A(f"    {name}: std::sync::OnceLock<{latch}>,")
     A("    _executor: Arc<crate::ffi::pyo3::KeptExecutor>,")
     A("    _capsule: pyo3::Py<pyo3::PyAny>,")
-    A("}")
-    A("")
-    A("/// The proxy's sync reads, read once (see [`KeptDirectory`]).")
-    A("pub(crate) struct KeptSyncReads {")
-    for name, ty in SYNC_READS:
-        A(f"    pub(crate) {name}: {ty},")
     A("}")
     A("")
     A("impl KeptDirectory {")
@@ -175,13 +195,15 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
     A("        executor: Arc<crate::ffi::pyo3::KeptExecutor>,")
     A("        capsule: pyo3::Py<pyo3::PyAny>,")
     A("    ) -> Self {")
-    A("        let fixed = KeptSyncReads {")
-    for name, _ty in SYNC_READS:
-        A(f"            {name}: inner.{name}(),")
+    A("        let kept = Self {")
+    A("            inner,")
+    for name, *_ in LATCHED_SYNC:
+        A(f"            {name}: std::sync::OnceLock::new(),")
+    A("            _executor: executor,")
+    A("            _capsule: capsule,")
     A("        };")
-    A("        let kept = Self { inner, fixed, node_key: std::sync::OnceLock::new(), _executor: executor, _capsule: capsule };")
-    A("        // Latch the key now if the host already registered it.")
-    A("        let _ = FederationDirectory::node_key_id(&kept);")
+    for name, *_ in LATCHED_SYNC:
+        A(f"        let _ = FederationDirectory::{name}(&kept);")
     A("        kept")
     A("    }")
     A("}")
@@ -218,28 +240,24 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
         if name in anchored:
             A("    // persist compiles this method only under `test` or `test-anchor`.")
             A('    #[cfg(feature = "test-anchor")]')
-        if name in LATCHED_SYNC:
+        latched = {l[0]: l for l in LATCHED_SYNC}
+        if name in latched:
+            _n, _ty, _latch, kept_expr, value_of = latched[name]
             A(f"    fn {name}({arglist}) -> {ret} {{")
-            A("        // A real key never changes once set (it is the Engine's own")
-            A("        // signer-derived key), so it is latched; None, and the proxy's")
-            A("        // timeout sentinel, are never latched: re-read until the host")
-            A("        // registers (CIRISPersist#1269). The re-read blocks this thread")
-            A("        // for one round trip, only in that first-run window.")
-            A("        if let Some(k) = self.node_key.get() {")
-            A("            return Some(k.clone());")
+            A("        // Kept once read; the proxy's fail-closed fallback is never kept, so")
+            A("        // a slow first round trip does not stick for the process.")
+            if name == "node_key_id":
+                A("        // The value only moves None -> Some(k), and k is the Engine's own")
+                A("        // signer-derived key on every route persist sets it by, so a kept")
+                A("        // Some never goes stale; None is never kept (CIRISPersist#1269).")
+            A(f"        if let Some(k) = self.{name}.get() {{")
+            A(f"            return {value_of};")
             A("        }")
-            A("        let read = self.inner.node_key_id();")
-            A("        match read.as_deref() {")
-            A("            Some(k) if k != ciris_persist::ffi::directory_capsule::NODE_KEY_ID_UNAVAILABLE => {")
-            A("                Some(self.node_key.get_or_init(|| k.to_owned()).clone())")
-            A("            }")
-            A("            _ => read,")
+            A(f"        let v = self.inner.{name}({call});")
+            A(f"        match {kept_expr} {{")
+            A(f"            Some(keep) => {{ let k = self.{name}.get_or_init(|| keep); {value_of} }}")
+            A("            None => v,")
             A("        }")
-            A("    }")
-            continue
-        if name in sync and name not in PURE_SYNC:
-            A(f"    fn {name}({arglist}) -> {ret} {{")
-            A(f"        self.fixed.{name}.clone()")
             A("    }")
             continue
         if name in sync:
@@ -300,11 +318,11 @@ def main() -> None:
     gen = load_persist_generator(a.persist_src)
     methods = methods_of(gen, a.persist_src)
     sync = sync_methods(gen, a.persist_src)
-    known = {name for name, _ in SYNC_READS} | PURE_SYNC | LATCHED_SYNC
+    known = {l[0] for l in LATCHED_SYNC} | PURE_SYNC
     if sync != known:
         # A new sync method would be delegated live: a blocking round trip on
         # whatever thread calls it. Decide how it is answered, then list it.
-        sys.exit(f"the trait's sync methods changed: {sorted(sync)} != SYNC_READS + PURE_SYNC {sorted(known)}")
+        sys.exit(f"the trait's sync methods changed: {sorted(sync)} != LATCHED_SYNC + PURE_SYNC {sorted(known)}")
     text = rustfmt(
         render(
             gen,
