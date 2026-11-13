@@ -1712,6 +1712,10 @@ pub const STALE_ROUTE_SUPPRESSED: &str = "stale_route.suppressed";
 pub const STALE_ROUTE_EVICTED: &str = "stale_route.evicted";
 /// Marks dropped because a route left the index (an audit's `extra`).
 pub const STALE_ROUTE_CLEARED: &str = "stale_route.cleared";
+/// Seat load 2026-11-13 (P2) — refs remembered as held (a `Duplicate` of a
+/// ref the holdings set lacked, or persist's `HeldEquivalent`) forgotten
+/// because an audit found a held hash gone from persist's index.
+pub const HELD_EQUIVALENT_FORGOTTEN: &str = "held_equivalent.forgotten";
 /// Gauge: stale-route marks held.
 pub const HOLDINGS_GAUGE_STALE_ROUTE_SIZE: &str = "stale_route.size";
 /// Gauge: answers held in each key-plane memo, by `KeyPlaneRead` slot (key

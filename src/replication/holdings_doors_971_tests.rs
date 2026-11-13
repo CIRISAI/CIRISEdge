@@ -427,6 +427,83 @@ async fn a_retired_carrier_row_rewritten_is_repaired_by_the_audit_971() {
     assert_index_equal(&bridge, &*dir, &[], "retired class, after the audit").await;
 }
 
+/// Seat load 2026-11-13 (P2) — **a `Duplicate` of a ref the set lacks is
+/// not wanted again.** The same rewritten row as the retired-carrier case: a
+/// peer offers the new hash, the seat wants it, persist answers `Duplicate`.
+/// Before P2 nothing stopped the next round wanting it again (a `Duplicate`
+/// clears the refusal backoff), so the row crossed the wire once a round
+/// until the audit. After the apply the ref is remembered as held; an audit
+/// that finds a held hash gone forgets it.
+///
+/// Mutation that turns it red: drop the `held_equivalent.note` calls in
+/// `holdings_write_through`'s `Duplicate` arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_duplicate_of_an_unheld_ref_is_not_wanted_again_seat_load() {
+    let dir = store_with(&["dup-p2-o"], identity_type::USER).await;
+    ts::register_hybrid_key_as(&*dir, "dup-p2-n", "dup-p2-n", identity_type::NODE).await;
+    let (id, pqc) = pqc_pending_binding(&dir, "dup-p2-o", "dup-p2-n").await;
+    dir.test_seam_set_attestation_type(&id, "holds_bytes:v1", None)
+        .await
+        .expect("retire the row's type");
+    let metrics = obs::EdgeMetrics::new();
+    let bridge = warmed(&dir, "dup-p2-n", Some(metrics.clone())).await;
+    let before = index_drain(&*dir, "Attestation").await;
+    dir.attach_attestation_pqc_signature(&id, &pqc)
+        .await
+        .expect("the completion is not refused by type");
+    let after = index_drain(&*dir, "Attestation").await;
+    let new: Vec<[u8; 32]> = after.difference(&before).copied().collect();
+    assert_eq!(new.len(), 1, "one new hash for the rewritten row");
+    let offered = vec![EnvelopeRef {
+        envelope_hash: new[0],
+        seq: 0,
+    }];
+    assert_eq!(
+        bridge
+            .holdings_want(EnvelopeKind::Attestation, &offered)
+            .await,
+        vec![new[0]],
+        "wanted once: the set lacks the rewritten hash"
+    );
+    let row = dir.get_attestation(&id).await.expect("read").expect("held");
+    let bytes = serde_json::to_vec(&row).expect("encode");
+    let outcome = bridge
+        .apply_envelope_bytes(EnvelopeKind::Attestation, &bytes, Some("dup-p2-peer"))
+        .await;
+    assert!(
+        matches!(outcome, crate::replication::ApplyOutcome::Duplicate),
+        "persist settles it as held: {outcome:?}"
+    );
+    assert!(
+        bridge
+            .holdings_want(EnvelopeKind::Attestation, &offered)
+            .await
+            .is_empty(),
+        "after the Duplicate the ref is held, so the next round does not want it"
+    );
+    assert!(bridge.held_equivalent_refs() >= 1);
+
+    // The audit repairs the index (the old hash is gone: drift_extra 1) and
+    // forgets every remembered ref; the new hash is in the index now, so it
+    // is still not wanted.
+    bridge.holdings_audit_due_now();
+    let _ = bridge.holdings_want(EnvelopeKind::Attestation, &[]).await;
+    assert_eq!(counter(&metrics, obs::HOLDINGS_DRIFT_EXTRA[0]), 1);
+    assert_eq!(
+        bridge.held_equivalent_refs(),
+        0,
+        "an audit with extra forgets them"
+    );
+    assert!(counter(&metrics, obs::HELD_EQUIVALENT_FORGOTTEN) >= 1);
+    assert!(
+        bridge
+            .holdings_want(EnvelopeKind::Attestation, &offered)
+            .await
+            .is_empty(),
+        "held by the index now"
+    );
+}
+
 /// Seeds of the differential.
 const SEEDS: u64 = 32;
 /// Operations per seed.

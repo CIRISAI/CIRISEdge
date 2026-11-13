@@ -112,6 +112,17 @@ impl HeldEquivalentRefs {
         self.inner.lock().is_ok_and(|g| g.set.contains(r))
     }
 
+    /// Forget every remembered ref; returns how many there were.
+    pub fn clear_all(&self) -> usize {
+        let Ok(mut g) = self.inner.lock() else {
+            return 0;
+        };
+        let n = g.set.len();
+        g.set.clear();
+        g.order.clear();
+        n
+    }
+
     /// `want` without the refs remembered as held.
     #[must_use]
     pub fn filter_want(&self, want: Vec<[u8; 32]>) -> Vec<[u8; 32]> {

@@ -935,6 +935,7 @@ fn holdings_labels() -> Vec<&'static str> {
         obs::STALE_ROUTE_SUPPRESSED,
         obs::STALE_ROUTE_EVICTED,
         obs::STALE_ROUTE_CLEARED,
+        obs::HELD_EQUIVALENT_FORGOTTEN,
     ]);
     holdings
 }

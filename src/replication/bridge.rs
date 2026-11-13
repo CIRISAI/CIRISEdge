@@ -8396,6 +8396,9 @@ impl FederationDirectoryReplicationBridge {
             if plane == super::holdings_index::IndexPlane::TransportDestination && drift.extra > 0 {
                 self.drop_stale_marks_on_route_removal();
             }
+            if drift.extra > 0 {
+                self.forget_held_equivalents();
+            }
             self.book_holdings(obs::HOLDINGS_AUDITS[slot], 1);
             self.book_holdings(
                 obs::HOLDINGS_DRIFT_MISSING[slot],
@@ -8885,6 +8888,19 @@ impl FederationDirectoryReplicationBridge {
     /// older one current again, and the older bytes are never fetched while
     /// marked (so their admit can never end the mark), so every mark goes.
     /// Rare and cheap: each dropped mark costs at most one re-fetch.
+    fn forget_held_equivalents(&self) {
+        // Seat load 2026-11-13 (P2) — a held hash LEFT persist's index (a
+        // purge, an erasure, a superseding row removed). A ref remembered as
+        // held because persist answered `Duplicate` may stand for that row,
+        // and it could now be the one this node should hold again, so every
+        // remembered ref goes. Each costs at most one more fetch.
+        let dropped = self.held_equivalent.clear_all();
+        self.book_holdings(
+            crate::observability::HELD_EQUIVALENT_FORGOTTEN,
+            u64::try_from(dropped).unwrap_or(u64::MAX),
+        );
+    }
+
     fn drop_stale_marks_on_route_removal(&self) {
         let dropped = self.stale_routes.clear_all();
         self.book_holdings(
@@ -8951,6 +8967,27 @@ impl FederationDirectoryReplicationBridge {
                 let hash = super::wire_ref::envelope_ref(kind, envelope_bytes);
                 if self.holdings_index.holds(plane, &hash) == Some(false) {
                     self.book_holdings(obs::HOLDINGS_DUPLICATE_UNHELD[slot], 1);
+                    // Seat load 2026-11-13 (P2) — persist said it holds what
+                    // these bytes carry, under a ref this set lacks (a
+                    // decoration variant, a superseded version, a rewritten
+                    // row the audit has not reached). Remember the offered
+                    // refs as held, as the HeldEquivalent piece does, or the
+                    // receive diff wants them again every round: a
+                    // `Duplicate` clears the refusal backoff, so nothing else
+                    // stops that ask. A superseding version is never a
+                    // Duplicate (it is admitted under its own hash), so this
+                    // hides nothing; an audit that finds the index LOST a
+                    // hash forgets them all (`forget_held_equivalents`).
+                    //
+                    // Not on the route plane: a route Duplicate the set lacks
+                    // is the stale arm, which keeps its own marks on the
+                    // terminal schedule (`stale_routes`), re-asked when its
+                    // window ends and cleared when the held route leaves.
+                    if plane == IndexPlane::Attestation {
+                        self.held_equivalent.note(hash);
+                        self.held_equivalent
+                            .note(super::wire_ref::plain_ref(envelope_bytes));
+                    }
                 }
             }
             ApplyOutcome::Refused { .. } | ApplyOutcome::Deserialize(_) => {}
