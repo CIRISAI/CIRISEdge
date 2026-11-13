@@ -120,7 +120,11 @@ pub enum ReplicationOutcome {
     Applied {
         kind: EnvelopeKind,
         admitted: usize,
+        /// Every delivered envelope not admitted: refusals AND duplicates
+        /// (the meaning hosts have parsed since #425; kept for one release).
         refused: usize,
+        /// Of `refused`, the envelopes this node already held.
+        duplicate: usize,
         staleness: StalenessSignal,
     },
     /// CIRISEdge#634 §5.1 — the initiator's `Deliver_R` was already applied
@@ -130,7 +134,10 @@ pub enum ReplicationOutcome {
         msgs: Vec<ReplicationMessage>,
         kind: EnvelopeKind,
         admitted: usize,
+        /// As [`Self::Applied`]'s `refused`.
         refused: usize,
+        /// As [`Self::Applied`]'s `duplicate`.
+        duplicate: usize,
         staleness: StalenessSignal,
     },
     /// The peer sent a message this session refuses — in practice a message
@@ -278,6 +285,7 @@ pub struct Session {
 struct HeldReport {
     admitted: usize,
     refused: usize,
+    duplicate: usize,
     staleness: StalenessSignal,
 }
 
@@ -986,7 +994,29 @@ impl Session {
         if diff.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
-        let (envelopes, dropped) = self.pack_bounded_deliver(&diff.want, provider).await;
+        // Seat load 2026-11-13 (P4) — the bytes pushed THIS round are already
+        // on their way. The responder computed its Diff from its Summary,
+        // before it applied the push that rode beside our Summary, so it asks
+        // for exactly what we just pushed; answering it delivered every
+        // pushed row twice (the second a `Duplicate` at the responder) on a
+        // fresh node's first round. If the push frame was lost, the
+        // responder's next Diff asks again, and that round's answer serves it
+        // (a hash pushed in an earlier round is not filtered here).
+        let pushed_this_round = |h: &[u8; 32]| {
+            self.role == SessionRole::Initiator
+                && self.proactive_publish
+                && self.proactive_sent.get(h) == Some(&self.round_counter)
+        };
+        let want: Vec<[u8; 32]> = if diff.want.iter().any(pushed_this_round) {
+            diff.want
+                .iter()
+                .filter(|h| !pushed_this_round(h))
+                .copied()
+                .collect()
+        } else {
+            diff.want.clone()
+        };
+        let (envelopes, dropped) = self.pack_bounded_deliver(&want, provider).await;
         // CIRISEdge#429 — an advertised want we cannot serve must NEVER be inferred
         // from a short byte count. Say so, per-miss and in aggregate. NOT fatal: the
         // round still ships what it could, and the remainder re-diffs next round —
@@ -1033,6 +1063,7 @@ impl Session {
                     kind: self.kind,
                     admitted: held.admitted,
                     refused: held.refused,
+                    duplicate: held.duplicate,
                     staleness: held.staleness,
                 };
             }
@@ -1183,6 +1214,10 @@ impl Session {
         }
         let mut admitted = 0usize;
         let mut refused = 0usize;
+        // A row this node already held. Also counted in `refused` for one more
+        // release (the legacy meaning hosts parse); `refused - duplicate` is
+        // what was actually refused.
+        let mut duplicate = 0usize;
         // CIRISEdge#425 — THE single apply choke point. Every delivered envelope's
         // outcome is counted AND, when it is not `Admitted`, logged with its reason
         // right here. Because `apply_envelope` now yields a `#[must_use]`
@@ -1236,6 +1271,7 @@ impl Session {
                 // WARN-ing every duplicate would drown the genuine refusals.
                 ApplyOutcome::Duplicate => {
                     refused += 1;
+                    duplicate += 1;
                     tracing::debug!(
                         kind = ?self.kind,
                         "delivered envelope was a duplicate the node already held (CIRISEdge#425)"
@@ -1383,6 +1419,7 @@ impl Session {
         if let Some(prior) = self.held_report.take() {
             admitted += prior.admitted;
             refused += prior.refused;
+            duplicate += prior.duplicate;
         }
         // Compute staleness from what we asked for vs what we admitted.
         // This is provider-storage-agnostic (the production wiring will
@@ -1409,6 +1446,7 @@ impl Session {
             self.held_report = Some(HeldReport {
                 admitted,
                 refused,
+                duplicate,
                 staleness,
             });
             tracing::debug!(
@@ -1428,6 +1466,7 @@ impl Session {
             self.held_report = Some(HeldReport {
                 admitted,
                 refused,
+                duplicate,
                 staleness,
             });
             tracing::debug!(
@@ -1445,6 +1484,7 @@ impl Session {
             kind: self.kind,
             admitted,
             refused,
+            duplicate,
             staleness,
         }
     }
@@ -2175,6 +2215,58 @@ mod tests {
         }
     }
 
+    /// Seat load 2026-11-13 (P4) — **a fresh node's first round applies each
+    /// pushed row once.** The initiator pushes its rows beside its Summary;
+    /// the responder's Diff, computed before the push is applied, asks for all
+    /// of them; answering that Diff delivered them a second time, every one a
+    /// `Duplicate` at the responder. The answer now leaves out what this
+    /// round pushed, and a later round's Diff is answered in full.
+    ///
+    /// Mutation that turns it red: drop the `pushed_this_round` filter in
+    /// `on_diff`.
+    #[tokio::test]
+    async fn a_fresh_nodes_first_round_applies_each_pushed_row_once() {
+        let provider = provider_with(&[
+            (EnvelopeKind::Key, h(1), b"k1".to_vec(), 1),
+            (EnvelopeKind::Key, h(2), b"k2".to_vec(), 2),
+        ]);
+        let mut init =
+            Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
+        let msgs = match init.start_round(&provider).await {
+            ReplicationOutcome::Send(msgs) => msgs,
+            o => panic!("expected Send, got {o:?}"),
+        };
+        assert!(matches!(&msgs[1], ReplicationMessage::Deliver(d) if d.envelopes.len() == 2));
+        // The responder lacks both, so its Diff asks for both.
+        let diff = DiffMessage {
+            kind: EnvelopeKind::Key,
+            want: vec![h(1), h(2)],
+        };
+        match init.on_diff(&diff, &provider, Some("seat")).await {
+            ReplicationOutcome::Send(out) => match &out[0] {
+                ReplicationMessage::Deliver(d) => assert!(
+                    d.envelopes.is_empty(),
+                    "the pushed rows are not delivered again: {:?}",
+                    d.envelopes
+                ),
+                o => panic!("expected a Deliver, got {o:?}"),
+            },
+            o => panic!("expected Send, got {o:?}"),
+        }
+        // The next round's Diff for the same hashes (the push was lost) is
+        // answered in full: the push is not re-sent inside the refresh window,
+        // so the answer is the only way they travel.
+        init.reset();
+        let _ = init.start_round(&provider).await;
+        match init.on_diff(&diff, &provider, Some("seat")).await {
+            ReplicationOutcome::Send(out) => match &out[0] {
+                ReplicationMessage::Deliver(d) => assert_eq!(d.envelopes.len(), 2),
+                o => panic!("expected a Deliver, got {o:?}"),
+            },
+            o => panic!("expected Send, got {o:?}"),
+        }
+    }
+
     // ── CIRISEdge#380 — delta-aware bounded proactive push + initiator-final ──
 
     /// The peer's last reverse-path Summary is the delta basis: refs it
@@ -2682,6 +2774,68 @@ mod tests {
             } => {
                 assert_eq!(admitted, 0, "nothing admitted");
                 assert_eq!(refused, 3, "every refused envelope is counted, not dropped");
+            }
+            o => panic!("expected Applied, got {o:?}"),
+        }
+    }
+
+    /// Seat load 2026-11-13 (P1) — a duplicate is counted apart from a
+    /// refusal. The responder's completion line printed `refused: N` with
+    /// duplicates folded in, and on the canonical they outnumbered real
+    /// refusals about twenty to one, so the line read as a refusal storm.
+    /// `refused` keeps its legacy meaning for one release (hosts parse it);
+    /// `duplicate` and the report's `rejected` say what happened.
+    #[tokio::test]
+    async fn a_duplicate_is_counted_apart_from_a_refusal() {
+        struct MixedApplier;
+        #[async_trait::async_trait]
+        impl StateApplier for MixedApplier {
+            async fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                b: &[u8],
+                _source_peer: Option<&str>,
+            ) -> ApplyOutcome {
+                match b {
+                    b"new" => ApplyOutcome::Admitted,
+                    b"held" => ApplyOutcome::Duplicate,
+                    _ => ApplyOutcome::refused("gate refused this row"),
+                }
+            }
+        }
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let deliver = DeliverMessage {
+            kind: EnvelopeKind::Attestation,
+            envelopes: vec![
+                b"new".to_vec(),
+                b"held".to_vec(),
+                b"held".to_vec(),
+                b"bad".to_vec(),
+            ],
+        };
+        match responder
+            .on_deliver(&deliver, &BodiesProvider, &MixedApplier, Some("peer-x"))
+            .await
+        {
+            ReplicationOutcome::Applied {
+                kind,
+                admitted,
+                refused,
+                duplicate,
+                staleness,
+            } => {
+                assert_eq!(admitted, 1);
+                assert_eq!(duplicate, 2, "each held row is a duplicate");
+                assert_eq!(refused, 3, "legacy `refused` still folds duplicates in");
+                let report = super::super::coordinator::RoundReport::applied(
+                    kind, admitted, refused, duplicate, staleness,
+                );
+                assert_eq!(report.rejected, 1, "only the gate's refusal is rejected");
+                let line = format!("{report:?}");
+                assert!(
+                    line.contains("refused: 3, duplicate: 2, rejected: 1"),
+                    "the completion line names all three: {line}"
+                );
             }
             o => panic!("expected Applied, got {o:?}"),
         }

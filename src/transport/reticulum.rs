@@ -12620,6 +12620,10 @@ fn forget_link_direction(
     if let (Some(d), Some(m)) = (dir, metrics) {
         m.add_link_closed(d == LinkDirection::Inbound, cause, 1);
     }
+    // Seat load 2026-11-13 (S0) — link down, by the class it came up under.
+    if let Some(m) = metrics {
+        m.note_link_closed_class(link_id.into_bytes(), cause);
+    }
     publish_link_directions(metrics, source, &dirs);
     dir
 }
@@ -18355,6 +18359,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // prior O(N·M) quadratic-log blowup. The stored side of the compare
             // is separately visible at admit (point 1).
             if let Some((key_id, branch)) = &matched {
+                // Seat load 2026-11-13 (S0) — link up, by the peer's class.
+                if let Some(m) = ctx.metrics {
+                    m.note_link_identified(link_id.into_bytes(), key_id);
+                }
                 tracing::debug!(
                     link = ?link_id,
                     key_id = %key_id,

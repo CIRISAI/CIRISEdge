@@ -921,6 +921,7 @@ fn holdings_labels() -> Vec<&'static str> {
         obs::HOLDINGS_WRITE_THROUGH,
         obs::HOLDINGS_FEED_INSERTS,
         obs::HOLDINGS_DUPLICATE_UNHELD,
+        obs::HOLDINGS_DUPLICATE_FROM_INDEX,
         obs::HOLDINGS_FEED_PROBES,
         obs::HOLDINGS_FEED_COALESCED,
         obs::HOLDINGS_FEED_FAILURES,
@@ -935,6 +936,7 @@ fn holdings_labels() -> Vec<&'static str> {
         obs::STALE_ROUTE_SUPPRESSED,
         obs::STALE_ROUTE_EVICTED,
         obs::STALE_ROUTE_CLEARED,
+        obs::HELD_EQUIVALENT_FORGOTTEN,
     ]);
     holdings
 }

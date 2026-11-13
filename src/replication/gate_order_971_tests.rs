@@ -282,3 +282,80 @@ async fn the_narrowed_first_contact_read_offers_the_same_971() {
         refused[1]
     );
 }
+
+/// Seat load 2026-11-13 (S0) — **the advertise's rows are counters, by the
+/// peer's class and by the arm that withheld them.** A first-contact peer
+/// (N: no grant names it) and a consent peer (M: L's grant names it) each get
+/// one round; the counters add up the way the log line does
+/// (`listed = not_advertisable + withheld + duplicate + awaits_request +
+/// offered`), and the first-contact narrowing books its withholds under its
+/// own arm, not the per-row audience arm.
+///
+/// Mutation that turns it red: drop the `book_advertise_row` call in
+/// `reach_withholds`' first-contact branch (or book it as `withheld_row`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_advertise_rows_are_counted_by_class_and_arm_seat_load() {
+    use crate::observability::{advertise_row_label, EdgeMetrics};
+    let f = fixture("rows-s0", 0x51).await;
+    let dir = Arc::clone(&f.a.dir) as Arc<dyn FederationDirectory>;
+    let get = |m: &EdgeMetrics, class: &str, outcome: &str| -> u64 {
+        let label = advertise_row_label(class, outcome).expect("a registered label");
+        m.snapshot().advertise.get(label).copied().unwrap_or(0)
+    };
+    for (peer, class) in [
+        (f.a.n.key_id().to_owned(), "first_contact"),
+        (f.consented.key_id().to_owned(), "consent"),
+    ] {
+        let metrics = EdgeMetrics::new();
+        let config = BridgeConfig {
+            tip_margin: std::time::Duration::ZERO,
+            ..BridgeConfig::default()
+        };
+        let b = bridge_with(Arc::clone(&dir), f.local.key_id(), true, config)
+            .with_metrics(Some(metrics.clone()));
+        let offered = offer(&b, &peer).await;
+        let listed = ["listed_required", "listed_head", "listed_history"]
+            .iter()
+            .map(|o| get(&metrics, class, o))
+            .sum::<u64>();
+        let accounted = [
+            "not_advertisable",
+            "withheld",
+            "duplicate",
+            "awaits_request",
+            "offered",
+        ]
+        .iter()
+        .map(|o| get(&metrics, class, o))
+        .sum::<u64>();
+        assert!(listed > 0, "{class}: the round listed rows");
+        assert_eq!(
+            listed, accounted,
+            "{class}: every listed row is accounted for"
+        );
+        assert_eq!(
+            get(&metrics, class, "offered"),
+            u64::try_from(offered.len()).expect("fits"),
+            "{class}: `offered` is what the Summary carries"
+        );
+        let arms = ["withheld_reach", "withheld_first_contact", "withheld_row"]
+            .iter()
+            .map(|o| get(&metrics, class, o))
+            .sum::<u64>();
+        assert!(
+            arms <= get(&metrics, class, "withheld"),
+            "{class}: the arms are a part of `withheld`"
+        );
+        if class == "first_contact" {
+            assert!(
+                get(&metrics, class, "withheld_first_contact") > 0,
+                "the first-contact narrowing books under its own arm"
+            );
+            assert_eq!(get(&metrics, class, "withheld_row"), 0);
+        }
+    }
+    // Every row label is registered, so a scrape shows it at zero.
+    for label in crate::observability::ADVERTISE_ROW_LABELS {
+        assert!(crate::observability::ADVERTISE_LABELS.contains(&label));
+    }
+}

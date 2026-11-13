@@ -680,10 +680,27 @@ pub(crate) fn spawn_responder_drive(
                 lane.shed(&coord, what);
                 continue;
             }
+            // Seat load 2026-11-13 (S0) — what opened this round: a
+            // whole-plane Summary, a subject Pull, a fetch by hash, a bare
+            // push. The first frame of a round is one with a new round id, or
+            // (a legacy frame with no id) the first since the last round
+            // ended.
+            let incoming_round = inbound.meta.map_or(0, |m| m.round);
+            if round_began.is_none() || (incoming_round != 0 && incoming_round != timed_round) {
+                use super::protocol::ReplicationMessage as M;
+                count(match &inbound.msg {
+                    M::Summary(_) => obs::RESPONDER_ROUND_OPENED_SUMMARY,
+                    M::Pull(_) => obs::RESPONDER_ROUND_OPENED_PULL,
+                    M::CursorPull(_) => obs::RESPONDER_ROUND_OPENED_CURSOR_PULL,
+                    M::Fetch(_) => obs::RESPONDER_ROUND_OPENED_FETCH,
+                    M::Deliver(_) => obs::RESPONDER_ROUND_OPENED_DELIVER,
+                    M::Diff(_) => obs::RESPONDER_ROUND_OPENED_DIFF,
+                });
+            }
             let began = responder_round_clock(
                 &mut round_began,
                 &mut timed_round,
-                inbound.meta.map_or(0, |m| m.round),
+                incoming_round,
                 std::time::Instant::now(),
             );
             coord.set_driver_phase(DriverPhase::Stepping);
@@ -704,6 +721,7 @@ pub(crate) fn spawn_responder_drive(
                 Ok(DriveStep::Complete(report)) => {
                     round_began = None;
                     count(obs::RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL);
+                    coord.note_round_complete(&report);
                     tracing::info!(
                         peer = %peer, ?kind, ?report,
                         link = %coord.last_inbound_link_hex(),

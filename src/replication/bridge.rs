@@ -5470,11 +5470,22 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // `Refused` leaving this choke is counted per envelope kind (the #425
         // choke already logs it; now it is also a metrics-scrape fact). The
         // typed Key-plane token axis books inside `apply_key`.
-        let outcome = crate::read_caller::scoped(
-            crate::read_caller::Site::Apply,
-            self.dispatch_apply(kind, envelope_bytes, source_peer),
-        )
-        .await;
+        // Seat load 2026-11-13 (P3) — bytes this node holds EXACTLY are a
+        // `Duplicate` persist would answer after a parse, a row read and a
+        // plan; the Ready holdings index answers it from memory. Long-lived
+        // peers re-push every row the seat holds but does not offer them back
+        // (their push filter reads the seat's send-gated Summary), and they
+        // will not be upgraded on our schedule, so the seat answers here.
+        let outcome = match self.duplicate_from_index(kind, envelope_bytes) {
+            Some(held) => held,
+            None => {
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::Apply,
+                    self.dispatch_apply(kind, envelope_bytes, source_peer),
+                )
+                .await
+            }
+        };
         // CIRISEdge#457 — the receive plane now books EVERY outcome at this
         // choke, not just refusals: an accepted apply (Admitted = new state)
         // and a duplicate (already held) are counted distinctly, so "applied
@@ -8396,6 +8407,9 @@ impl FederationDirectoryReplicationBridge {
             if plane == super::holdings_index::IndexPlane::TransportDestination && drift.extra > 0 {
                 self.drop_stale_marks_on_route_removal();
             }
+            if drift.extra > 0 {
+                self.forget_held_equivalents();
+            }
             self.book_holdings(obs::HOLDINGS_AUDITS[slot], 1);
             self.book_holdings(
                 obs::HOLDINGS_DRIFT_MISSING[slot],
@@ -8885,6 +8899,63 @@ impl FederationDirectoryReplicationBridge {
     /// older one current again, and the older bytes are never fetched while
     /// marked (so their admit can never end the mark), so every mark goes.
     /// Rare and cheap: each dropped mark costs at most one re-fetch.
+    /// Seat load 2026-11-13 (P3) — `Some(Duplicate)` iff the holdings index
+    /// is Ready for `kind`'s plane and holds `sha256(envelope_bytes)` itself.
+    ///
+    /// Only the bytes' own hash counts. The index keys each held row on
+    /// persist's content hash of the bytes persist serves for it, so a match
+    /// means these are those bytes, and persist's apply of byte-identical bytes
+    /// is `Unchanged` / the stale-route arm: `Duplicate` on every plane the
+    /// index covers. An act ref (a cosigned row's) is NOT used: bytes that
+    /// carry the same act under another ref are persist's to settle
+    /// (`HeldEquivalent`). Unbooted, Suspect or disabled: `None`, persist
+    /// answers. The window this trusts is the index's own: a row purged since
+    /// the last audit is answered held for at most one audit period, and a
+    /// purged row with a tombstone would be refused by persist anyway.
+    fn duplicate_from_index(
+        &self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+    ) -> Option<ApplyOutcome> {
+        use super::holdings_index::IndexPlane;
+        if !self.holdings_index.enabled() {
+            return None;
+        }
+        let plane = IndexPlane::of_kind(kind)?;
+        let hash = super::wire_ref::plain_ref(envelope_bytes);
+        if self.holdings_index.holds(plane, &hash) != Some(true) {
+            return None;
+        }
+        self.book_holdings(
+            crate::observability::HOLDINGS_DUPLICATE_FROM_INDEX[plane.slot()],
+            1,
+        );
+        Some(ApplyOutcome::Duplicate)
+    }
+
+    /// Seat load 2026-11-13 (S0) — add `n` to `advertise.rows.<class>.<outcome>`.
+    fn book_advertise_row(&self, class: &str, outcome: &str, n: u64) {
+        if let (Some(m), Some(label)) = (
+            self.metrics.as_ref(),
+            crate::observability::advertise_row_label(class, outcome),
+        ) {
+            m.add_advertise(label, n);
+        }
+    }
+
+    fn forget_held_equivalents(&self) {
+        // Seat load 2026-11-13 (P2) — a held hash LEFT persist's index (a
+        // purge, an erasure, a superseding row removed). A ref remembered as
+        // held because persist answered `Duplicate` may stand for that row,
+        // and it could now be the one this node should hold again, so every
+        // remembered ref goes. Each costs at most one more fetch.
+        let dropped = self.held_equivalent.clear_all();
+        self.book_holdings(
+            crate::observability::HELD_EQUIVALENT_FORGOTTEN,
+            u64::try_from(dropped).unwrap_or(u64::MAX),
+        );
+    }
+
     fn drop_stale_marks_on_route_removal(&self) {
         let dropped = self.stale_routes.clear_all();
         self.book_holdings(
@@ -8951,6 +9022,27 @@ impl FederationDirectoryReplicationBridge {
                 let hash = super::wire_ref::envelope_ref(kind, envelope_bytes);
                 if self.holdings_index.holds(plane, &hash) == Some(false) {
                     self.book_holdings(obs::HOLDINGS_DUPLICATE_UNHELD[slot], 1);
+                    // Seat load 2026-11-13 (P2) — persist said it holds what
+                    // these bytes carry, under a ref this set lacks (a
+                    // decoration variant, a superseded version, a rewritten
+                    // row the audit has not reached). Remember the offered
+                    // refs as held, as the HeldEquivalent piece does, or the
+                    // receive diff wants them again every round: a
+                    // `Duplicate` clears the refusal backoff, so nothing else
+                    // stops that ask. A superseding version is never a
+                    // Duplicate (it is admitted under its own hash), so this
+                    // hides nothing; an audit that finds the index LOST a
+                    // hash forgets them all (`forget_held_equivalents`).
+                    //
+                    // Not on the route plane: a route Duplicate the set lacks
+                    // is the stale arm, which keeps its own marks on the
+                    // terminal schedule (`stale_routes`), re-asked when its
+                    // window ends and cleared when the held route leaves.
+                    if plane == IndexPlane::Attestation {
+                        self.held_equivalent.note(hash);
+                        self.held_equivalent
+                            .note(super::wire_ref::plain_ref(envelope_bytes));
+                    }
                 }
             }
             ApplyOutcome::Refused { .. } | ApplyOutcome::Deserialize(_) => {}
@@ -10757,6 +10849,9 @@ impl FederationDirectoryReplicationBridge {
         // rows (own nodes) or `family` rows (family members' nodes) and for
         // nothing wider; the row half below still runs on what passes.
         if !reach.admits(audience) {
+            if site == "advertise" {
+                self.book_advertise_row(reach.tag(), "withheld_reach", 1);
+            }
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
@@ -10798,6 +10893,9 @@ impl FederationDirectoryReplicationBridge {
             && !self.attestation_is_relayed_announce(row, memo).await
             && !self.consent_grant_names(row, peer, memo).await
         {
+            if site == "advertise" {
+                self.book_advertise_row(reach.tag(), "withheld_first_contact", 1);
+            }
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
@@ -10965,6 +11063,9 @@ impl FederationDirectoryReplicationBridge {
         // through the same resolver, before either is a member.
         let served = self.may_receive_cached(att, peer, memo).await.allowed();
         if !served {
+            if site == "advertise" {
+                self.book_advertise_row(reach.tag(), "withheld_row", 1);
+            }
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
@@ -11282,6 +11383,11 @@ impl FederationDirectoryReplicationBridge {
         membership: &'static str,
         set: &ResolvedPeerSet,
     ) {
+        // Seat load 2026-11-13 (S0) — the class this peer's activity is
+        // counted under (`peer_activity`), every resolve.
+        if let Some(m) = &self.metrics {
+            m.set_peer_class(peer, membership);
+        }
         let previous = {
             let Ok(mut seen) = self.send_set_membership.lock() else {
                 return;
@@ -11982,6 +12088,15 @@ impl FederationDirectoryReplicationBridge {
                 .map(ResolvedRecipient::reach)
                 == Some(Reach::FirstContact)
                 && ctx.moves != UnaskedOffer::Commons;
+        // Seat load 2026-11-13 (S0) — the class the round's row counters are
+        // booked under: `commons` between two seats, else the peer's reach.
+        let class = if ctx.moves == UnaskedOffer::Commons {
+            "commons"
+        } else {
+            ctx.resolved_recipient
+                .as_ref()
+                .map_or("none", |r| r.reach().tag())
+        };
         let mut first_at_tip = false;
         if no_walk {
             let margin = chrono::Duration::from_std(self.config.tip_margin).unwrap_or_default();
@@ -12011,6 +12126,11 @@ impl FederationDirectoryReplicationBridge {
             .await
             {
                 listed = required.0;
+                self.book_advertise_row(
+                    class,
+                    "listed_required",
+                    u64::try_from(required.0).unwrap_or(u64::MAX),
+                );
                 counts = required.2;
             }
         }
@@ -12039,6 +12159,11 @@ impl FederationDirectoryReplicationBridge {
             }
         };
         listed += served;
+        self.book_advertise_row(
+            class,
+            "listed_head",
+            u64::try_from(served).unwrap_or(u64::MAX),
+        );
         counts.merge(head_counts);
         let mut resweep: Option<(Option<ResumeCursor>, usize, bool)> = None;
         let plan = self
@@ -12071,6 +12196,11 @@ impl FederationDirectoryReplicationBridge {
                     }
                     self.resweep_cycle_step(&key, wrapped);
                     listed += b_served;
+                    self.book_advertise_row(
+                        class,
+                        "listed_history",
+                        u64::try_from(b_served).unwrap_or(u64::MAX),
+                    );
                     counts.merge(b_counts);
                     resweep = Some((plan.since, b_served, wrapped));
                 }
@@ -12098,6 +12228,15 @@ impl FederationDirectoryReplicationBridge {
         let unbooked = (withheld as u64).saturating_sub(booked);
         if unbooked > 0 {
             withheld_by_reason.insert("unbooked", unbooked);
+        }
+        for (outcome, n) in [
+            ("not_advertisable", counts.not_advertisable),
+            ("withheld", withheld),
+            ("duplicate", counts.duplicate),
+            ("awaits_request", counts.awaits_request),
+            ("offered", counts.offered),
+        ] {
+            self.book_advertise_row(class, outcome, u64::try_from(n).unwrap_or(u64::MAX));
         }
         let summary = AdvertiseRoundSummary {
             peer: key.0.clone(),
@@ -31559,6 +31698,10 @@ pub(crate) mod tests {
 
     // CIRISEdge#971 — what an idle bootstrap round costs the seat.
     mod idle_round_cost_971;
+
+    // Seat load 2026-11-13 (S0) — in one binary, each edge read is credited
+    // to its site's label in persist's per-caller counters.
+    mod caller_attribution_seat_load;
 
     // CIRISEdge#971 — the seat's Revocation listing walk per idle round.
     mod revocation_walk_971;
