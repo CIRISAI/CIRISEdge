@@ -306,17 +306,80 @@ def pinned_persist_src() -> Path:
     return Path(pkgs[0]["manifest_path"]).parent
 
 
+def impl_blocks(trait: str):
+    """Every `impl ... <trait> for <Type>` block in src/ and tests/, as
+    (path, type, set of method names defined at the block's top level)."""
+    import re
+
+    out = []
+    for path in sorted(list((ROOT / "src").rglob("*.rs")) + list((ROOT / "tests").rglob("*.rs"))):
+        text = path.read_text()
+        for m in re.finditer(
+            r"impl(?:<[^>]*>)?\s+(?:[A-Za-z_:]+::)?" + trait + r"\s+for\s+([A-Za-z_0-9]+)\s*\{",
+            text,
+        ):
+            i, depth = m.end(), 1
+            body_start = i
+            while depth and i < len(text):
+                c = text[i]
+                depth += (c == "{") - (c == "}")
+                i += 1
+            body = text[body_start : i - 1]
+            # Methods at the block's own depth only.
+            d, names, j = 0, set(), 0
+            for fm in re.finditer(r"[{}]|\b(?:async\s+)?fn\s+([a-z0-9_]+)\s*[<(]", body):
+                tok = fm.group(0)
+                if tok == "{":
+                    d += 1
+                elif tok == "}":
+                    d -= 1
+                elif d == 0:
+                    names.add(fm.group(1))
+            out.append((path.relative_to(ROOT), m.group(1), names))
+    return out
+
+
+def check_doubles(methods) -> int:
+    """CIRISEdge#988 — every implementor of persist's `FederationDirectory` in
+    this tree defines EVERY trait method, so no caller can reach a trait
+    default body through it: a default answers `Unsupported` (or a
+    plausible empty) where the store would answer, and a witness over the
+    double then tests the default. Fails naming each double and the methods
+    it lacks."""
+    want = {name for name, _args, _ret in methods}
+    bad = 0
+    blocks = impl_blocks("FederationDirectory")
+    for path, ty, names in blocks:
+        missing = sorted(want - names)
+        extra = sorted(names - want)
+        if missing:
+            bad += 1
+            print(f"MISSING: {path} impl FederationDirectory for {ty} lacks {len(missing)}: {', '.join(missing)}")
+        if extra:
+            bad += 1
+            print(f"EXTRA: {path} impl FederationDirectory for {ty} defines non-trait methods: {', '.join(extra)}")
+        if not missing and not extra:
+            print(f"OK {path} {ty}: {len(names)}/{len(want)}")
+    if not blocks:
+        print("no FederationDirectory implementor found: the scan is broken")
+        return 1
+    return bad
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--persist-src", type=Path)
     src.add_argument("--from-cargo-metadata", action="store_true")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--check-doubles", action="store_true")
     a = ap.parse_args()
     if a.from_cargo_metadata:
         a.persist_src = pinned_persist_src()
     gen = load_persist_generator(a.persist_src)
     methods = methods_of(gen, a.persist_src)
+    if a.check_doubles:
+        sys.exit(1 if check_doubles(methods) else 0)
     sync = sync_methods(gen, a.persist_src)
     known = {l[0] for l in LATCHED_SYNC} | PURE_SYNC
     if sync != known:
