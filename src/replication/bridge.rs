@@ -722,7 +722,7 @@ pub(crate) fn is_not_in_audience_refusal(outcome: &ApplyOutcome) -> bool {
 }
 
 /// The park key of a group's audience.
-fn audience_group_key(group_key_id: &str) -> String {
+pub(super) fn audience_group_key(group_key_id: &str) -> String {
     format!("audience:group:{group_key_id}")
 }
 
@@ -746,6 +746,12 @@ fn group_of_row(row: &Attestation) -> Option<String> {
     if let Ok(Some(signed)) = ciris_persist::federation::group_plane::group_signed_of_row(row) {
         return Some(signed.group_key_id().to_owned());
     }
+    // persist 61.3.0 (CIRISPersist#1252) — a `cosign:*` row carries its event
+    // (and so its group) inside its own member: a row refused `not_in_audience`
+    // waits on that group, and the group's membership rows release it.
+    if let Ok(Some(read)) = ciris_persist::federation::cosign::read_row(row) {
+        return Some(read.event.group_key_id().to_owned());
+    }
     ["community_key_id", "family_key_id"].iter().find_map(|m| {
         row.attestation_envelope
             .get(*m)
@@ -757,7 +763,7 @@ fn group_of_row(row: &Attestation) -> Option<String> {
 /// persist v61 S2 (#1148) — what a row refused `not_in_audience` waits on, most
 /// specific first: the group it is placed at, then its attester's owner axis.
 /// The park takes the first.
-fn audience_gate_keys(bytes: &[u8]) -> Vec<String> {
+pub(super) fn audience_gate_keys(bytes: &[u8]) -> Vec<String> {
     let Some(row) = row_of_wire(bytes) else {
         return Vec::new();
     };

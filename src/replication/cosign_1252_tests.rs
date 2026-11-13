@@ -380,6 +380,16 @@ async fn cosign_rows_are_decision_rows_on_their_room_1252() {
         Some(pending.attestation_id.as_str()),
         "a cosignature names the held event by its quorum key"
     );
+    // Refused `not_in_audience` (a node not yet seated), each waits on its
+    // room, so the room's membership rows release it.
+    for row in [&pending, &signature] {
+        let bytes = serde_json::to_vec(row).expect("wire");
+        assert_eq!(
+            super::bridge::audience_gate_keys(&bytes).first(),
+            Some(&super::bridge::audience_group_key(&r.room)),
+            "a cosign row is parked on its room"
+        );
+    }
 }
 
 /// **2. A cosigned row is held under its act ref.** Admitted through the
