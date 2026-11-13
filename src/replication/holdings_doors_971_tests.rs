@@ -504,6 +504,76 @@ async fn a_duplicate_of_an_unheld_ref_is_not_wanted_again_seat_load() {
     );
 }
 
+/// Seat load 2026-11-13 (P3) — **a peer re-pushing a held row costs no
+/// persist call.** The seat holds the binding; a peer pushes its exact bytes
+/// again. The Ready index holds `sha256(bytes)`, so the apply answers
+/// `Duplicate` from memory: no directory method is called at all.
+///
+/// Mutation that turns it red: remove the `duplicate_from_index` arm in
+/// `apply_envelope_bytes` (persist is called and answers `Duplicate`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_pushed_held_row_costs_no_persist_call_seat_load() {
+    use super::counting_directory_930::CountingDirectory;
+    let dir = store_with(&["dup-p3-o"], identity_type::USER).await;
+    ts::register_hybrid_key_as(&*dir, "dup-p3-n", "dup-p3-n", identity_type::NODE).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let row = ts::owner_binding_attestation(&id, "dup-p3-o", "dup-p3-n");
+    dir.put_attestation(SignedAttestation { attestation: row })
+        .await
+        .expect("admit the binding");
+    let held = dir.get_attestation(&id).await.expect("read").expect("held");
+    let bytes = serde_json::to_vec(&held).expect("encode");
+    let hash = crate::replication::wire_ref::plain_ref(&bytes);
+    assert!(
+        index_drain(&*dir, "Attestation").await.contains(&hash),
+        "fixture: the held row's bytes hash to its index entry"
+    );
+    let counting = CountingDirectory::new(Arc::clone(&dir) as Arc<dyn FederationDirectory>);
+    let metrics = obs::EdgeMetrics::new();
+    let bridge = bridge_with(
+        Arc::new(counting.clone()) as Arc<dyn FederationDirectory>,
+        "dup-p3-n",
+        vec!["dup-p3-n".to_owned()],
+        BridgeConfig {
+            feed_probe_spacing: Duration::ZERO,
+            holdings_audit_every: NO_TEST_OUTLIVES,
+            ..index_on()
+        },
+        Some(metrics.clone()),
+    );
+    bridge.warm_holdings_index().await;
+    counting.reset();
+    let outcome = bridge
+        .apply_envelope_bytes(EnvelopeKind::Attestation, &bytes, Some("dup-p3-peer"))
+        .await;
+    assert!(
+        matches!(outcome, crate::replication::ApplyOutcome::Duplicate),
+        "held bytes are a Duplicate: {outcome:?}"
+    );
+    assert_eq!(
+        counting.counts(),
+        std::collections::BTreeMap::new(),
+        "answered from the Ready index: no persist call"
+    );
+    assert_eq!(counter(&metrics, obs::HOLDINGS_DUPLICATE_FROM_INDEX[0]), 1);
+
+    // Bytes the index does NOT hold under their own hash still go to persist
+    // (here: a re-encoding of the same row with a field order persist never
+    // serves, so its hash differs).
+    let mut other: serde_json::Value = serde_json::to_value(&held).expect("value");
+    other["weight"] = serde_json::json!(held.weight);
+    let reencoded = serde_json::to_vec_pretty(&other).expect("encode");
+    assert_ne!(crate::replication::wire_ref::plain_ref(&reencoded), hash);
+    counting.reset();
+    let _ = bridge
+        .apply_envelope_bytes(EnvelopeKind::Attestation, &reencoded, Some("dup-p3-peer"))
+        .await;
+    assert!(
+        counting.total() > 0,
+        "an unheld hash is persist's to answer"
+    );
+}
+
 /// Seeds of the differential.
 const SEEDS: u64 = 32;
 /// Operations per seed.

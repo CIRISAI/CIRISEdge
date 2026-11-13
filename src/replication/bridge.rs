@@ -5470,11 +5470,22 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // `Refused` leaving this choke is counted per envelope kind (the #425
         // choke already logs it; now it is also a metrics-scrape fact). The
         // typed Key-plane token axis books inside `apply_key`.
-        let outcome = crate::read_caller::scoped(
-            crate::read_caller::Site::Apply,
-            self.dispatch_apply(kind, envelope_bytes, source_peer),
-        )
-        .await;
+        // Seat load 2026-11-13 (P3) — bytes this node holds EXACTLY are a
+        // `Duplicate` persist would answer after a parse, a row read and a
+        // plan; the Ready holdings index answers it from memory. Long-lived
+        // peers re-push every row the seat holds but does not offer them back
+        // (their push filter reads the seat's send-gated Summary), and they
+        // will not be upgraded on our schedule, so the seat answers here.
+        let outcome = match self.duplicate_from_index(kind, envelope_bytes) {
+            Some(held) => held,
+            None => {
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::Apply,
+                    self.dispatch_apply(kind, envelope_bytes, source_peer),
+                )
+                .await
+            }
+        };
         // CIRISEdge#457 — the receive plane now books EVERY outcome at this
         // choke, not just refusals: an accepted apply (Admitted = new state)
         // and a duplicate (already held) are counted distinctly, so "applied
@@ -8888,6 +8899,40 @@ impl FederationDirectoryReplicationBridge {
     /// older one current again, and the older bytes are never fetched while
     /// marked (so their admit can never end the mark), so every mark goes.
     /// Rare and cheap: each dropped mark costs at most one re-fetch.
+    /// Seat load 2026-11-13 (P3) — `Some(Duplicate)` iff the holdings index
+    /// is Ready for `kind`'s plane and holds `sha256(envelope_bytes)` itself.
+    ///
+    /// Only the bytes' own hash counts. The index keys each held row on
+    /// persist's content hash of the bytes persist serves for it, so a match
+    /// means these are those bytes, and persist's apply of byte-identical bytes
+    /// is `Unchanged` / the stale-route arm: `Duplicate` on every plane the
+    /// index covers. An act ref (a cosigned row's) is NOT used: bytes that
+    /// carry the same act under another ref are persist's to settle
+    /// (`HeldEquivalent`). Unbooted, Suspect or disabled: `None`, persist
+    /// answers. The window this trusts is the index's own: a row purged since
+    /// the last audit is answered held for at most one audit period, and a
+    /// purged row with a tombstone would be refused by persist anyway.
+    fn duplicate_from_index(
+        &self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+    ) -> Option<ApplyOutcome> {
+        use super::holdings_index::IndexPlane;
+        if !self.holdings_index.enabled() {
+            return None;
+        }
+        let plane = IndexPlane::of_kind(kind)?;
+        let hash = super::wire_ref::plain_ref(envelope_bytes);
+        if self.holdings_index.holds(plane, &hash) != Some(true) {
+            return None;
+        }
+        self.book_holdings(
+            crate::observability::HOLDINGS_DUPLICATE_FROM_INDEX[plane.slot()],
+            1,
+        );
+        Some(ApplyOutcome::Duplicate)
+    }
+
     fn forget_held_equivalents(&self) {
         // Seat load 2026-11-13 (P2) — a held hash LEFT persist's index (a
         // purge, an erasure, a superseding row removed). A ref remembered as

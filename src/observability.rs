@@ -1675,6 +1675,12 @@ pub const HOLDINGS_DUPLICATE_UNHELD: [&str; 2] = [
     "attestation.duplicate_unheld",
     "transport_destination.duplicate_unheld",
 ];
+/// Seat load 2026-11-13 (P3) — a delivered envelope whose exact bytes the
+/// Ready set holds, answered `Duplicate` without calling persist.
+pub const HOLDINGS_DUPLICATE_FROM_INDEX: [&str; 2] = [
+    "attestation.duplicate_from_index",
+    "transport_destination.duplicate_from_index",
+];
 /// Feed drains (one per serve-cursor catch-up that read the store).
 pub const HOLDINGS_FEED_PROBES: [&str; 2] = [
     "attestation.feed_probes",
