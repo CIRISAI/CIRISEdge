@@ -109,7 +109,9 @@ impl CountingDirectory {
     }
 
     /// CIRISEdge#988 — the next read of each blocking sync method answers the
-    /// proxy's timeout fallback, once.
+    /// proxy's timeout fallback, once. Its one caller is the binding's
+    /// latch witness, so it exists only where the binding does.
+    #[cfg(feature = "pyo3")]
     pub(crate) fn time_out_sync_reads_once(&self) {
         let mut s = self.sync_fallback_once.lock().expect("fallback");
         s.extend([
