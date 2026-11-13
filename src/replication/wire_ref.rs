@@ -77,10 +77,14 @@ pub const HELD_EQUIVALENT_CAPACITY: usize = 16_384;
 /// receive diff. Bounded; never advertised.
 #[derive(Debug, Default)]
 pub struct HeldEquivalentRefs {
-    inner: std::sync::Mutex<(
-        std::collections::HashSet<[u8; 32]>,
-        std::collections::VecDeque<[u8; 32]>,
-    )>,
+    inner: std::sync::Mutex<HeldRefs>,
+}
+
+/// The remembered refs, and the order to forget them in.
+#[derive(Debug, Default)]
+struct HeldRefs {
+    set: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
 }
 
 impl HeldEquivalentRefs {
@@ -89,7 +93,7 @@ impl HeldEquivalentRefs {
         let Ok(mut g) = self.inner.lock() else {
             return false;
         };
-        let (set, order) = &mut *g;
+        let HeldRefs { set, order } = &mut *g;
         if !set.insert(r) {
             return false;
         }
@@ -105,7 +109,7 @@ impl HeldEquivalentRefs {
     /// Is `r` remembered as held?
     #[must_use]
     pub fn contains(&self, r: &[u8; 32]) -> bool {
-        self.inner.lock().is_ok_and(|g| g.0.contains(r))
+        self.inner.lock().is_ok_and(|g| g.set.contains(r))
     }
 
     /// `want` without the refs remembered as held.
@@ -114,16 +118,16 @@ impl HeldEquivalentRefs {
         let Ok(g) = self.inner.lock() else {
             return want;
         };
-        if g.0.is_empty() {
+        if g.set.is_empty() {
             return want;
         }
-        want.into_iter().filter(|h| !g.0.contains(h)).collect()
+        want.into_iter().filter(|h| !g.set.contains(h)).collect()
     }
 
     /// How many refs are remembered.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().map_or(0, |g| g.0.len())
+        self.inner.lock().map_or(0, |g| g.set.len())
     }
 
     /// Whether none is.

@@ -871,18 +871,19 @@ fn attestation_outcome_to_apply(
     };
     match outcome {
         O::Inserted => (ApplyOutcome::Admitted, None),
+        // persist 61.3.0 (#1252): `HeldEquivalent` is the same verdict as a
+        // re-offer, ON PURPOSE: this node holds the same ACT under another row
+        // (an assembled widening/removal with another sufficient subset of
+        // cosignatures, other randomised ML-DSA bytes, or the same signer's
+        // other `cosign:*` signature), nothing was written and no refusal is
+        // booked. The one thing that differs, remembering the offered ref as
+        // held, the caller does before mapping (`note_if_held_equivalent`).
         O::Unchanged
         | O::Deduplicated
+        | O::HeldEquivalent
         | O::Refused {
             reason: R::AlreadyPresentIdentical,
         } => (ApplyOutcome::Duplicate, None),
-        // persist 61.3.0 (#1252): this node holds the same ACT under another
-        // row (an assembled widening/removal with another sufficient subset of
-        // cosignatures, other randomised ML-DSA bytes, or the same signer's
-        // other `cosign:*` signature). Settled: nothing was written and no
-        // refusal is booked, so the offer is a duplicate for the choke. The
-        // offered ref is recorded as held by the holdings note (the caller).
-        O::HeldEquivalent => (ApplyOutcome::Duplicate, None),
         O::Refused { reason } => {
             let retry = attestation_refusal_retry(reason);
             (
@@ -8904,7 +8905,7 @@ impl FederationDirectoryReplicationBridge {
     /// offered bytes' ref as held, so the receive diff does not want it again.
     fn note_if_held_equivalent(
         &self,
-        outcome: &ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome,
+        outcome: ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome,
         bytes: &[u8],
     ) {
         use ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome as O;
@@ -14648,13 +14649,13 @@ impl FederationDirectoryReplicationBridge {
                     // projection is a union keyed by the row's identity, so a
                     // re-offer projects nothing new; for the sweep's
                     // accounting the row did not change.
+                    // persist 61.3.0 (#1252): `HeldEquivalent` (the same act held
+                    // under another row) is a re-offer here too, on purpose: a
+                    // key-grant row is not a cosignable group row, and persist
+                    // defines the outcome as held, nothing written.
                     ReplicatedAttestationOutcome::Unchanged
-                    | ReplicatedAttestationOutcome::Deduplicated => ApplyOutcome::Duplicate,
-                    // persist 61.3.0 (#1252): the same act is held under another
-                    // row; settled like a re-offer (a key-grant row is not a
-                    // cosignable group row, so this arm is the trait's
-                    // completeness, read as persist defines it: held).
-                    ReplicatedAttestationOutcome::HeldEquivalent => ApplyOutcome::Duplicate,
+                    | ReplicatedAttestationOutcome::Deduplicated
+                    | ReplicatedAttestationOutcome::HeldEquivalent => ApplyOutcome::Duplicate,
                     // The row was refused at the attestation plane. Say so with
                     // persist's reason.
                     // persist v61 — with persist's retry disposition, as the
@@ -14897,7 +14898,7 @@ impl FederationDirectoryReplicationBridge {
                 let (outcome, refusal_token) = match source_peer {
                     Some(peer) => match self.directory.put_attestation_synced(record, peer).await {
                         Ok(o) => {
-                            self.note_if_held_equivalent(&o, bytes);
+                            self.note_if_held_equivalent(o, bytes);
                             attestation_outcome_to_apply(o, &content_hash)
                         }
                         // persist v38.2.0 (CIRISEdge#522) — the door classes (AV-45
@@ -14907,7 +14908,7 @@ impl FederationDirectoryReplicationBridge {
                     },
                     None => match self.directory.apply_replicated_attestation(record).await {
                         Ok(o) => {
-                            self.note_if_held_equivalent(&o, bytes);
+                            self.note_if_held_equivalent(o, bytes);
                             attestation_outcome_to_apply(o, &content_hash)
                         }
                         Err(e) => (self.refuse("Attestation", &content_hash, &e), None),
@@ -32188,12 +32189,12 @@ fn row_wait_key(attestation_id: &str) -> String {
 /// The `attestation_id` of an Attestation-index row's wire bytes, if they are
 /// one.
 fn attestation_id_of(kind: EnvelopeKind, envelope_bytes: &[u8]) -> Option<String> {
-    if kind.persist_index_kind() != Some("Attestation") {
-        return None;
-    }
     #[derive(serde::Deserialize)]
     struct Id {
         attestation_id: String,
+    }
+    if kind.persist_index_kind() != Some("Attestation") {
+        return None;
     }
     serde_json::from_slice::<Id>(envelope_bytes)
         .ok()

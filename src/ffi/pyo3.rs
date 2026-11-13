@@ -122,11 +122,10 @@
 //! Persist v3.2.0 (CIRISPersist#120) ships the sibling `BlackholeRules`
 //! trait (`blackhole_list` / `_upsert` / `_remove` / `_record_hit` /
 //! `_prune_expired`) + V052 `cirislens.blackhole_rules` table; v0.16.1
-//! consumes it. The `Arc<dyn BlackholeRules>` is derived from the same
-//! `BackendDispatch` arm `outbound_queue_capsule` already produces —
-//! no new capsule needed. Operator-set rules survive process restarts;
-//! the hot-path send check + `record_hit` increment route through the
-//! same backend pool the rest of edge already uses.
+//! consumes it. Since CIRISEdge#988 the `Arc<dyn BlackholeRules>` is
+//! served by persist's blackhole directory ops (CIRISPersist#1244), so
+//! every read and `record_hit` runs inside persist's library. Operator-set
+//! rules survive process restarts.
 //!
 //! # Unsafe carve-out
 //!
@@ -6302,15 +6301,8 @@ fn checked_capsule_pointer(
 ///    a `PyCapsule` whose wrapped type is exactly `T`. The valid
 ///    `(method, T)` pairs are pinned by `ciris-persist`'s
 ///    `src/ffi/pyo3.rs` v2.7.0+ / v2.8.0+ docblocks:
-///    - `"federation_directory_capsule"` wraps
-///      `Arc<dyn ciris_persist::federation::FederationDirectory>` (v2.7.0)
-///    - `"outbound_queue_capsule"` wraps
-///      `ciris_persist::BackendDispatch` (v2.7.0)
 ///    - `"keyring_signer_capsule"` wraps
 ///      `ciris_persist::signing::KeyringSignerHandle` (v2.7.0)
-///    - `"runtime_handle_capsule"` wraps
-///      `tokio::runtime::Handle` (v2.8.0 — CIRISPersist#111
-///      cross-cdylib statics fix)
 ///    - `"local_signer_capsule"` wraps
 ///      `std::sync::Arc<ciris_persist::signing::LocalSigner>`
 ///      (v3.1.1 — CIRISPersist#119; the 32-byte Ed25519 transport-
@@ -6934,14 +6926,11 @@ fn extract_local_signer(
 ///
 /// # Substrate composition
 ///
-/// - Calls `engine.federation_directory_capsule()` → extracts
-///   `Arc<dyn FederationDirectory>` → coerces to
-///   `Arc<dyn VerifyDirectory>` via the blanket impl in
-///   `crate::verify`.
-/// - Calls `engine.outbound_queue_capsule()` → extracts
-///   [`BackendDispatch`] → matches the variant → wraps as both
-///   `Arc<dyn RootingDirectory>` and `Arc<dyn OutboundHandle>` via
-///   the blanket impls in `crate::verify` and `crate::outbound`.
+/// - Builds the store views from persist's `directory_ops_capsule`
+///   (verify, rooting, blackhole, edge-detection) and the outbound
+///   queue from `outbound_queue_ops_capsule`; every store call runs
+///   inside persist's library, never on a concrete backend edge lifted
+///   out of a capsule (CIRISEdge#988).
 /// - Calls `engine.keyring_signer_capsule()` → extracts
 ///   `KeyringSignerHandle` (`Arc<dyn HardwareSigner>` +
 ///   `Option<Arc<dyn PqcSigner>>` + `key_id`) and wraps them in edge's
@@ -6965,9 +6954,8 @@ fn extract_local_signer(
 ///   will fail at `ReticulumTransport::new` with the v0.13.0
 ///   65-byte-pubkey error shape (the diagnostic the operator needs
 ///   to see).
-/// - v0.16.1 (CIRISEdge#33 durability flip): derives
-///   `Arc<dyn BlackholeRules>` from the already-extracted
-///   `BackendDispatch` and threads it into [`ReticulumAuth`] so the
+/// - v0.16.1 (CIRISEdge#33 durability flip): threads the ops-backed
+///   `Arc<dyn BlackholeRules>` into [`ReticulumAuth`] so the
 ///   transport's operator deny-list is persisted via the V052
 ///   `cirislens.blackhole_rules` table.
 /// - Builds a [`ReticulumTransport`] with [`ReticulumAuth`] wiring
@@ -7479,16 +7467,13 @@ pub fn init_edge_runtime(
     // tag + crate-pin floor (>=2.8.0) is what enforces the wrapped-type
     // invariant; see [`extract_capsule`] for the full safety argument.
     //
-    // SAFETY (all four call sites — three substrate handles here +
-    // `runtime_handle_capsule` in Step 5): `T` arguments below match
-    // exactly the wrapped types persist's `*_capsule` `#[pymethod]`s
-    // produce (`src/ffi/pyo3.rs` lines ~13955-14075 in the persist
-    // tree):
-    //   - federation_directory_capsule wraps Arc<dyn FederationDirectory>  (v2.7.0)
-    //   - outbound_queue_capsule       wraps BackendDispatch               (v2.7.0)
-    //   - keyring_signer_capsule       wraps KeyringSignerHandle           (v2.7.0)
-    //   - runtime_handle_capsule       wraps tokio::runtime::Handle        (v2.8.0)
-    // The crate-level `#[deny(unsafe_code)]` is the default lint
+    // SAFETY: the one `extract_capsule` call left here is
+    // `keyring_signer_capsule`, whose `T` is exactly the
+    // `KeyringSignerHandle` persist's `#[pymethod]` wraps. The store
+    // capsules (`directory_ops_capsule`, `outbound_queue_ops_capsule`) are
+    // C-ABI vtables read by persist's own builders, and
+    // `runtime_handle_capsule` is checked for presence only, never
+    // unwrapped (CIRISEdge#988). The crate-level `#[deny(unsafe_code)]` is the default lint
     // (relaxed from `forbid` in v0.9.2 specifically for these calls);
     // each call site below explicitly opts in via `#[allow(unsafe_code)]`.
     //
@@ -7554,7 +7539,6 @@ pub fn init_edge_runtime(
     let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> =
         kept_directory.clone();
     #[allow(unsafe_code)]
-    #[allow(unsafe_code)]
     let signer_handle: ciris_persist::signing::KeyringSignerHandle = unsafe {
         extract_capsule::<ciris_persist::signing::KeyringSignerHandle, _, _>(
             &engine,
@@ -7570,27 +7554,16 @@ pub fn init_edge_runtime(
         )?
     };
 
-    // ── Step 2: directory + BackendDispatch → edge adapter Arcs.
+    // ── Step 2: the ops-proxy directory → edge's store views.
     //
-    // edge's `VerifyDirectory` / `RootingDirectory` traits have blanket
-    // impls over `F: FederationDirectory + Send + Sync + 'static`
-    // (`crate::verify`), but those blanket impls bind `F: Sized` and
-    // therefore do NOT apply to `dyn FederationDirectory`. We need a
-    // concrete sized type. `BackendDispatch`'s arms each carry the
-    // concrete `Arc<PostgresBackend>` / `Arc<SqliteBackend>` — both
-    // implement `FederationDirectory` AND `OutboundQueue`, so we can
-    // lift them to all three trait objects edge holds.
-    //
-    // v8.1.0 (CIRISEdge#245) — `directory_arc` is now the ops-proxy
-    // `Arc<dyn FederationDirectory>` from `build_ops_directory` (every call
-    // dispatches inside persist's `.so`), NOT the raw-`dyn`
-    // federation_directory_capsule. `verify_dir` / `rooting_dir` /
-    // `blackhole_rules` / `derived_schema` below still lift the CONCRETE
-    // `Arc<{Sqlite,Postgres}Backend>` out of the `outbound_queue_capsule`
-    // `BackendDispatch` — those edge blanket impls bind `F: Sized` so they
-    // need a concrete type, and that path is a monomorphized concrete call
-    // (NOT the raw-`dyn` vtable-index misdispatch #245/#320 targets), so it
-    // stays as-is.
+    // CIRISEdge#988 — every store view edge holds is carved from persist's
+    // directory-ops proxy, so each call runs inside persist's `.so`. Edge
+    // never lifts a concrete `Arc<{Sqlite,Postgres}Backend>` out of a
+    // capsule: running its own compiled copy of persist's store code on
+    // the wheel's backend loses `parking_lot` wakeups across the two
+    // binaries (a silent permanent hang).
+    // `tests/no_concrete_persist_in_binding.rs` holds the binding to zero
+    // concrete references.
     debug_assert!(
         Arc::strong_count(&directory_arc) >= 1,
         "build_ops_directory produced a live Arc",
@@ -7598,13 +7571,9 @@ pub fn init_edge_runtime(
     // v0.15.1 (CIRISEdge#26 mutation surface) — retain the
     // `Arc<dyn FederationDirectory>` for the UniFFI peer-mutation
     // entry points (`peer_add` / `peer_remove` /
-    // `peer_set_{alias,trust,notes,policy}`). These need the concrete
+    // `peer_set_{alias,trust,notes,policy}`). These need the
     // FederationDirectory trait object — distinct from `verify_dir`
-    // (which is an `Arc<dyn VerifyDirectory>` adapter). Both ultimately
-    // reach the same backend (the ops proxy and the `outbound_queue_capsule`
-    // BackendDispatch are both carved from the engine's one backend), but
-    // the trait-object identities differ because edge holds two separate
-    // `dyn`-trait views.
+    // (an `Arc<dyn VerifyDirectory>` adapter over the same proxy).
     let federation_directory_for_edge: Arc<dyn ciris_persist::federation::FederationDirectory> =
         directory_arc;
 
@@ -7622,21 +7591,14 @@ pub fn init_edge_runtime(
     let verify_dir: Arc<dyn VerifyDirectory> = Arc::new(
         crate::verify::PersistSideVerifyDirectory::new(Arc::clone(&federation_directory_for_edge)),
     );
-    // v0.16.1 (CIRISEdge#33 durable flip / CIRISPersist#120) — derive
-    // `Arc<dyn BlackholeRules>` from the same `BackendDispatch` arm.
-    // Sibling trait to `FederationDirectory`; both backends impl it.
-    // No new capsule needed — the existing `outbound_queue_capsule`
-    // surface gives us everything (the V052 `cirislens.blackhole_rules`
-    // table lives in the same DB as the outbound queue).
+    // v0.16.1 (CIRISEdge#33 durable flip / CIRISPersist#120) —
+    // `Arc<dyn BlackholeRules>`, served by persist's blackhole ops
+    // (CIRISPersist#1244) through `crate::ffi::kept_views::KeptOpsViews`.
     let blackhole_rules: Arc<dyn ciris_persist::federation::BlackholeRules> = ops_views.clone();
     // v0.17.0 (CIRISEdge#39 emit_verdict flip / CIRISPersist#118) —
-    // derive `Arc<dyn EdgeDetectionAdmission>` (the edge-side
-    // object-safe wrapper over persist's `DerivedSchema`) from the
-    // same `BackendDispatch` arm. Both `SqliteBackend` and
-    // `PostgresBackend` impl `DerivedSchema`, and the blanket
-    // [`EdgeDetectionAdmission for T: DerivedSchema`] impl in
-    // `crate::detector` lifts them to the trait object the
-    // `ProbePatternObserver` consumes for `put_edge_detection_event`.
+    // `Arc<dyn EdgeDetectionAdmission>` for the `ProbePatternObserver`'s
+    // `put_edge_detection_event`, served by persist's detection-event op
+    // through the same `KeptOpsViews`.
     let derived_schema: Arc<dyn crate::detector::EdgeDetectionAdmission> = ops_views;
     // v0.20.0 RC1 (CIRISEdge#51 / CIRISPersist#129) — close the
     // v0.19.6 cohabitation-deferral residual. Persist v3.5.1 shipped
@@ -7694,13 +7656,10 @@ pub fn init_edge_runtime(
         };
     // CIRISEdge#960 — the outbound queue rides persist's
     // `outbound_queue_ops_capsule` (a C-ABI vtable, ops dispatched inside
-    // persist's `.so`), never the concrete backend out of `queue_dispatch`:
-    // `enqueue_outbound` / `claim_pending_outbound` and every sweep are
-    // writes, and on the concrete backend they ran edge's compiled copy of
-    // persist's store code against objects the wheel laid out
-    // (CIRISPersist#1231). `queue_dispatch` still serves the verify / rooting
-    // / blackhole / detection views above, which have no persist ops
-    // capsule yet (see the #960 note on those arms).
+    // persist's `.so`), never a concrete backend: `enqueue_outbound` /
+    // `claim_pending_outbound` and every sweep are writes, and on a concrete
+    // backend they ran edge's compiled copy of persist's store code against
+    // objects the wheel laid out (CIRISPersist#1231).
     let queue: Arc<dyn OutboundHandle> = extract_outbound_queue_ops(&engine, &executor)?;
 
     // ── Step 3: keyring signer parts → edge's hot-path LocalSigner.

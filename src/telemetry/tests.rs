@@ -481,3 +481,24 @@ fn the_operators_page_lists_every_field_as_the_catalogue_does() {
         assert!(line.ends_with(&format!("| {exposure} |")), "{line}");
     }
 }
+
+/// Every decision-row kind is counted under its own token. Before the
+/// cosign kinds joined the token list, an unheard `cosign_pending` row
+/// fell back to slot 0 and was counted as a membership proposal.
+#[test]
+fn each_unheard_decision_row_is_counted_under_its_own_kind() {
+    for (kind, _) in crate::decision_rows::DecisionRowKind::PREFIXES {
+        let t = EdgeTelemetry::default();
+        t.note_decision_row_unheard(kind);
+        let unheard = t.snapshot().decision_row_unheard_total;
+        for (token, n) in &unheard {
+            let want = u64::from(token == kind.as_str());
+            assert_eq!(*n, want, "{} counted under {token}", kind.as_str());
+        }
+        assert!(
+            unheard.contains_key(kind.as_str()),
+            "{} has no slot",
+            kind.as_str()
+        );
+    }
+}

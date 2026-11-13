@@ -220,7 +220,7 @@ struct Room {
     bob: Party,
     carol: Party,
     dave: Party,
-    room: String,
+    id: String,
     event: RosterEvent,
 }
 
@@ -313,7 +313,7 @@ async fn room_of_three(
         bob,
         carol,
         dave,
-        room,
+        id: room,
         event,
     }
 }
@@ -335,7 +335,7 @@ async fn assembled_by(dir: &SqliteBackend, r: &Room, by: &[&Party]) -> (Attestat
         assemble(dir, &r.event, voices).await.expect("assemble"),
         "two of three seat dave"
     );
-    room_rows(dir, &r.room)
+    room_rows(dir, &r.id)
         .await
         .into_iter()
         .find(|(row, _)| {
@@ -356,10 +356,10 @@ async fn assembled_by(dir: &SqliteBackend, r: &Room, by: &[&Party]) -> (Attestat
 async fn cosign_rows_are_decision_rows_on_their_room_1252() {
     use ciris_persist::federation::cosign;
     use ciris_persist::federation::group_plane::group_signed_of_row;
-    let p = parties();
-    let s = stores(&p, 1).await;
-    let a = Arc::clone(&s[0]);
-    let r = room_of_three(p, &[], &a).await;
+    let people = parties();
+    let dirs = stores(&people, 1).await;
+    let a = Arc::clone(&dirs[0]);
+    let r = room_of_three(people, &[], &a).await;
     let (row, _) = assembled(&a, &r).await;
     let signed = group_signed_of_row(&row)
         .expect("a group row")
@@ -368,15 +368,15 @@ async fn cosign_rows_are_decision_rows_on_their_room_1252() {
     let cos = signed.cosignatures();
     let signature = cosign::signature_row(&signed, &cos[0]).expect("signature row");
     let at = DecisionCursor::at_or_before(chrono::Utc::now());
-    let p = DecisionRowRef::of_row(&pending, at.clone()).expect("a decision row");
-    assert_eq!(p.kind, DecisionRowKind::CosignPending);
-    assert_eq!(p.scope_id.as_deref(), Some(r.room.as_str()));
-    assert_eq!(p.kind.as_str(), "cosign_pending");
-    let s = DecisionRowRef::of_row(&signature, at).expect("a decision row");
-    assert_eq!(s.kind, DecisionRowKind::CosignSignature);
-    assert_eq!(s.scope_id.as_deref(), Some(r.room.as_str()));
+    let held = DecisionRowRef::of_row(&pending, at.clone()).expect("a decision row");
+    assert_eq!(held.kind, DecisionRowKind::CosignPending);
+    assert_eq!(held.scope_id.as_deref(), Some(r.id.as_str()));
+    assert_eq!(held.kind.as_str(), "cosign_pending");
+    let voice = DecisionRowRef::of_row(&signature, at).expect("a decision row");
+    assert_eq!(voice.kind, DecisionRowKind::CosignSignature);
+    assert_eq!(voice.scope_id.as_deref(), Some(r.id.as_str()));
     assert_eq!(
-        s.proposal_id.as_deref(),
+        voice.proposal_id.as_deref(),
         Some(pending.attestation_id.as_str()),
         "a cosignature names the held event by its quorum key"
     );
@@ -386,7 +386,7 @@ async fn cosign_rows_are_decision_rows_on_their_room_1252() {
         let bytes = serde_json::to_vec(row).expect("wire");
         assert_eq!(
             super::bridge::audience_gate_keys(&bytes).first(),
-            Some(&super::bridge::audience_group_key(&r.room)),
+            Some(&super::bridge::audience_group_key(&r.id)),
             "a cosign row is parked on its room"
         );
     }
@@ -399,10 +399,10 @@ async fn cosign_rows_are_decision_rows_on_their_room_1252() {
 /// ref stayed wanted every round.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cosigned_row_is_held_under_its_act_ref_1252() {
-    let p = parties();
-    let s = stores(&p, 2).await;
-    let (a, b) = (Arc::clone(&s[0]), Arc::clone(&s[1]));
-    let r = room_of_three(p, &[&b], &a).await;
+    let people = parties();
+    let dirs = stores(&people, 2).await;
+    let (a, b) = (Arc::clone(&dirs[0]), Arc::clone(&dirs[1]));
+    let r = room_of_three(people, &[&b], &a).await;
     let (row, bytes) = assembled(&a, &r).await;
     let act = ciris_persist::federation::wire_index::attestation_wire_hash(&row);
     assert_ne!(act, plain_ref(&bytes), "precondition: a cosigned row");
@@ -438,10 +438,14 @@ async fn a_cosigned_row_is_held_under_its_act_ref_1252() {
 /// diff, lever on and off. Red before: both stayed wanted every round.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_act_offered_under_another_ref_is_wanted_once_1252() {
-    let p = parties();
-    let s = stores(&p, 3).await;
-    let (a, b, c) = (Arc::clone(&s[0]), Arc::clone(&s[1]), Arc::clone(&s[2]));
-    let r = room_of_three(p, &[&b, &c], &a).await;
+    let people = parties();
+    let dirs = stores(&people, 3).await;
+    let (a, b, c) = (
+        Arc::clone(&dirs[0]),
+        Arc::clone(&dirs[1]),
+        Arc::clone(&dirs[2]),
+    );
+    let r = room_of_three(people, &[&b, &c], &a).await;
     let (_, held_bytes) = assembled(&a, &r).await;
     let (other, other_bytes) = assembled_by(&c, &r, &[&r.bob, &r.alice]).await;
     assert_ne!(other_bytes, held_bytes, "precondition: another assembly");
@@ -617,10 +621,10 @@ async fn cosigned_withdraws(
 /// transient (no park, no release), re-asked on the short ladder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_withdraws_waits_for_its_target_and_lands_after_it_1252() {
-    let p = parties();
-    let s = stores(&p, 2).await;
-    let (a, b) = (Arc::clone(&s[0]), Arc::clone(&s[1]));
-    let r = room_of_three(p, &[&b], &a).await;
+    let people = parties();
+    let dirs = stores(&people, 2).await;
+    let (a, b) = (Arc::clone(&dirs[0]), Arc::clone(&dirs[1]));
+    let r = room_of_three(people, &[&b], &a).await;
     let (row, bytes) = assembled(&a, &r).await;
     // Seated, dave makes the room four: a majority retraction is three voices.
     let w = cosigned_withdraws(&r.bob.person, &[&r.carol.person, &r.alice.person], &row).await;
