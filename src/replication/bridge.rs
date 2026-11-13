@@ -870,6 +870,13 @@ fn attestation_outcome_to_apply(
         | O::Refused {
             reason: R::AlreadyPresentIdentical,
         } => (ApplyOutcome::Duplicate, None),
+        // persist 61.3.0 (#1252): this node holds the same ACT under another
+        // row (an assembled widening/removal with another sufficient subset of
+        // cosignatures, other randomised ML-DSA bytes, or the same signer's
+        // other `cosign:*` signature). Settled: nothing was written and no
+        // refusal is booked, so the offer is a duplicate for the choke. The
+        // offered ref is recorded as held by the holdings note (the caller).
+        O::HeldEquivalent => (ApplyOutcome::Duplicate, None),
         O::Refused { reason } => {
             let retry = attestation_refusal_retry(reason);
             (
@@ -14513,6 +14520,11 @@ impl FederationDirectoryReplicationBridge {
                     // accounting the row did not change.
                     ReplicatedAttestationOutcome::Unchanged
                     | ReplicatedAttestationOutcome::Deduplicated => ApplyOutcome::Duplicate,
+                    // persist 61.3.0 (#1252): the same act is held under another
+                    // row; settled like a re-offer (a key-grant row is not a
+                    // cosignable group row, so this arm is the trait's
+                    // completeness, read as persist defines it: held).
+                    ReplicatedAttestationOutcome::HeldEquivalent => ApplyOutcome::Duplicate,
                     // The row was refused at the attestation plane. Say so with
                     // persist's reason.
                     // persist v61 — with persist's retry disposition, as the
@@ -16947,7 +16959,7 @@ pub(crate) mod tests {
             attestation_outcome_to_apply(O::Inserted, "h"),
             (ApplyOutcome::Admitted, None)
         );
-        for o in [O::Unchanged, O::Deduplicated] {
+        for o in [O::Unchanged, O::Deduplicated, O::HeldEquivalent] {
             assert_eq!(
                 attestation_outcome_to_apply(o, "h"),
                 (ApplyOutcome::Duplicate, None),
@@ -17181,6 +17193,8 @@ pub(crate) mod tests {
                 group_key_id: "room".to_owned(),
                 offered_authority_key_id: "mo".to_owned(),
                 rule: ciris_persist::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+                // persist 61.4.0 (#1250): the door's count; absent here.
+                shortfall: None,
             },
         )
         .expect("a typed refusal");

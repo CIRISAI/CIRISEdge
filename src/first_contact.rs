@@ -364,9 +364,12 @@ impl AdmissionDoors {
                 Ok(AttestationOutcome::Inserted) => {
                     crate::replication::summary::ApplyOutcome::Admitted
                 }
-                Ok(AttestationOutcome::Unchanged | AttestationOutcome::Deduplicated) => {
-                    crate::replication::summary::ApplyOutcome::Duplicate
-                }
+                // persist 61.3.0 (#1252): `HeldEquivalent` is held, not refused.
+                Ok(
+                    AttestationOutcome::Unchanged
+                    | AttestationOutcome::Deduplicated
+                    | AttestationOutcome::HeldEquivalent,
+                ) => crate::replication::summary::ApplyOutcome::Duplicate,
                 Ok(other) => {
                     crate::replication::summary::ApplyOutcome::refused(format!("{other:?}"))
                 }
@@ -407,7 +410,11 @@ impl AdmissionDoors {
             .await
         {
             Ok(AttestationOutcome::Inserted) => Ok(true),
-            Ok(AttestationOutcome::Unchanged | AttestationOutcome::Deduplicated) => Ok(false),
+            Ok(
+                AttestationOutcome::Unchanged
+                | AttestationOutcome::Deduplicated
+                | AttestationOutcome::HeldEquivalent,
+            ) => Ok(false),
             Ok(other) => Err(format!("{other:?}")),
             Err(e) => Err(e.to_string()),
         }

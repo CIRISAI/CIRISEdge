@@ -178,8 +178,6 @@ use pyo3::wrap_pyfunction;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::Mutex;
 
-use ciris_persist::BackendDispatch;
-
 use crate::edge::Edge;
 use crate::handler::{DurableOutcome, DurableStatus};
 use crate::identity::LocalSigner;
@@ -5575,6 +5573,25 @@ fn edge_tokio_handle() -> &'static tokio::runtime::Handle {
     .handle()
 }
 
+/// Whether the persist that built `executor` is a different binary from the
+/// copy of persist edge links: the two standalone wheels (CIRISEdge#988),
+/// where a store object the wheel built must never be run by edge's own
+/// compiled copy of persist's code, only reached through an ops capsule.
+///
+/// Persist's executor capsule points at `PERSIST_EXECUTOR_VTABLE`, a non-generic
+/// `static`, and a static has exactly one address per binary. The address is
+/// equal only when the capsule came from the very copy of persist edge was
+/// linked with (one binary: tests, or a host that links both crates); any
+/// other address is another binary's copy.
+fn persist_is_a_separate_binary(
+    executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor,
+) -> bool {
+    !std::ptr::eq(
+        executor.vtable,
+        &raw const ciris_persist::ffi::executor_capsule::PERSIST_EXECUTOR_VTABLE,
+    )
+}
+
 /// Polls the wrapped future inside [`edge_tokio_handle`]'s context.
 struct EdgeTokioContext(BoxedFut);
 
@@ -6079,10 +6096,27 @@ fn extract_executor(engine: &Bound<'_, PyAny>) -> PyResult<Arc<KeptExecutor>> {
 /// `directory_ops_capsule`, wrapped so it holds the directory and executor
 /// capsules its copies point into
 /// ([`crate::ffi::kept_directory::KeptDirectory`]).
+#[cfg(test)]
 fn extract_directory(
     engine: &Bound<'_, PyAny>,
     executor: &Arc<KeptExecutor>,
 ) -> PyResult<Arc<dyn ciris_persist::federation::FederationDirectory>> {
+    extract_directory_views(engine, executor).map(|(directory, _views)| {
+        let directory: Arc<dyn ciris_persist::federation::FederationDirectory> = directory;
+        directory
+    })
+}
+
+/// [`extract_directory`], also handing back the blackhole and edge-detection
+/// views over the same ops proxy (CIRISEdge#988 / CIRISPersist#1244). Both
+/// share the proxy, so every store call runs inside persist's library.
+fn extract_directory_views(
+    engine: &Bound<'_, PyAny>,
+    executor: &Arc<KeptExecutor>,
+) -> PyResult<(
+    Arc<crate::ffi::kept_directory::KeptDirectory>,
+    Arc<crate::ffi::kept_views::KeptOpsViews>,
+)> {
     if !engine.hasattr("directory_ops_capsule").unwrap_or(false) {
         return Err(PyRuntimeError::new_err(
             "persist v11.8.2+ required for the ABI-stable directory ops proxy — \
@@ -6116,26 +6150,31 @@ fn extract_directory(
             }
         })?
     };
-    let directory_proxy: Arc<dyn ciris_persist::federation::FederationDirectory> =
-        ciris_persist::ffi::directory_capsule::build_ops_directory(
+    let ops: Arc<ciris_persist::ffi::directory_capsule::OpsDirectory> =
+        ciris_persist::ffi::directory_capsule::build_ops_directory_proxy(
             directory_handle,
             Arc::new(executor.copy()),
         )
         .map_err(|e| {
             PyRuntimeError::new_err(format!(
-                "init_edge_runtime: build_ops_directory (directory_ops_capsule) failed: {e}"
+                "init_edge_runtime: build_ops_directory_proxy (directory_ops_capsule) failed: {e}"
             ))
         })?;
+    let directory_proxy: Arc<dyn ciris_persist::federation::FederationDirectory> = ops.clone();
     // CIRISEdge#960 — persist's proxy holds bitwise copies of the directory
-    // and executor capsules; the wrapper holds both capsules, and only the
-    // wrapper is handed out.
-    let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> =
-        Arc::new(crate::ffi::kept_directory::KeptDirectory::new(
-            directory_proxy,
-            Arc::clone(executor),
-            directory_capsule,
-        ));
-    Ok(directory_arc)
+    // and executor capsules; each wrapper holds both capsules, and only the
+    // wrappers are handed out.
+    let views = Arc::new(crate::ffi::kept_views::KeptOpsViews::new(
+        ops,
+        Arc::clone(executor),
+        directory_capsule.clone_ref(engine.py()),
+    ));
+    let directory_arc = Arc::new(crate::ffi::kept_directory::KeptDirectory::new(
+        directory_proxy,
+        Arc::clone(executor),
+        directory_capsule,
+    ));
+    Ok((directory_arc, views))
 }
 
 /// CIRISEdge#960 — extract persist's `outbound_queue_ops_capsule` (tag
@@ -7488,6 +7527,13 @@ pub fn init_edge_runtime(
     // dispatch. The hot-path send/recv pymethods consume this instead
     // of the raw `tokio::Handle`. See `run_async`'s docs.
     let executor = extract_executor(&engine)?;
+    // CIRISEdge#988 — say once which shape this process has. In a two-wheel
+    // process every store view below rides persist's ops capsules; nothing
+    // else is sound there.
+    tracing::info!(
+        separate_persist_binary = persist_is_a_separate_binary(&executor),
+        "init_edge_runtime: persist store views run inside persist's library (directory ops)"
+    );
 
     // ── v8.1.0 (CIRISEdge#245 / CIRISPersist#329 + #333) — the ABI-stable
     // directory ops proxy REPLACES the raw-`dyn` `federation_directory_capsule`.
@@ -7504,15 +7550,10 @@ pub fn init_edge_runtime(
     // no longer misdispatch. Every method `federation_directory_for_edge`
     // touches is a covered op (the base 24 + the 6 peer-mutation ops of
     // CIRISPersist#333 / v11.8.2: add/remove_peer_record, update_peer_*).
-    let directory_arc = extract_directory(&engine, &executor)?;
+    let (kept_directory, ops_views) = extract_directory_views(&engine, &executor)?;
+    let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> =
+        kept_directory.clone();
     #[allow(unsafe_code)]
-    let queue_dispatch: BackendDispatch = unsafe {
-        extract_capsule::<BackendDispatch, _, _>(
-            &engine,
-            "outbound_queue_capsule",
-            BackendDispatch::clone,
-        )?
-    };
     #[allow(unsafe_code)]
     let signer_handle: ciris_persist::signing::KeyringSignerHandle = unsafe {
         extract_capsule::<ciris_persist::signing::KeyringSignerHandle, _, _>(
@@ -7567,11 +7608,10 @@ pub fn init_edge_runtime(
     let federation_directory_for_edge: Arc<dyn ciris_persist::federation::FederationDirectory> =
         directory_arc;
 
-    let rooting_dir: Arc<dyn RootingDirectory> = match &queue_dispatch {
-        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
-        BackendDispatch::Postgres(b) => b.clone(),
-        BackendDispatch::Sqlite(b) => b.clone(),
-    };
+    // CIRISEdge#988 — rooting, blackhole and edge-detection run inside
+    // persist's library through the ops proxy (CIRISPersist#1227 / #1244),
+    // never on edge's compiled copy of the backend.
+    let rooting_dir: Arc<dyn RootingDirectory> = kept_directory;
     // Every inbound signature check, the accord-holder read, and the HTTPS
     // mTLS / bearer key lookup run inside persist's `.so` through the ops
     // proxy, never on edge's compiled copy of the backend: the two binaries
@@ -7588,12 +7628,7 @@ pub fn init_edge_runtime(
     // No new capsule needed — the existing `outbound_queue_capsule`
     // surface gives us everything (the V052 `cirislens.blackhole_rules`
     // table lives in the same DB as the outbound queue).
-    let blackhole_rules: Arc<dyn ciris_persist::federation::BlackholeRules> = match &queue_dispatch
-    {
-        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
-        BackendDispatch::Postgres(b) => b.clone(),
-        BackendDispatch::Sqlite(b) => b.clone(),
-    };
+    let blackhole_rules: Arc<dyn ciris_persist::federation::BlackholeRules> = ops_views.clone();
     // v0.17.0 (CIRISEdge#39 emit_verdict flip / CIRISPersist#118) —
     // derive `Arc<dyn EdgeDetectionAdmission>` (the edge-side
     // object-safe wrapper over persist's `DerivedSchema`) from the
@@ -7602,11 +7637,7 @@ pub fn init_edge_runtime(
     // [`EdgeDetectionAdmission for T: DerivedSchema`] impl in
     // `crate::detector` lifts them to the trait object the
     // `ProbePatternObserver` consumes for `put_edge_detection_event`.
-    let derived_schema: Arc<dyn crate::detector::EdgeDetectionAdmission> = match &queue_dispatch {
-        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
-        BackendDispatch::Postgres(b) => b.clone(),
-        BackendDispatch::Sqlite(b) => b.clone(),
-    };
+    let derived_schema: Arc<dyn crate::detector::EdgeDetectionAdmission> = ops_views;
     // v0.20.0 RC1 (CIRISEdge#51 / CIRISPersist#129) — close the
     // v0.19.6 cohabitation-deferral residual. Persist v3.5.1 shipped
     // the 7th cohabitation capsule (`trust_scoring_capsule()`), and
@@ -7671,7 +7702,6 @@ pub fn init_edge_runtime(
     // / blackhole / detection views above, which have no persist ops
     // capsule yet (see the #960 note on those arms).
     let queue: Arc<dyn OutboundHandle> = extract_outbound_queue_ops(&engine, &executor)?;
-    drop(queue_dispatch);
 
     // ── Step 3: keyring signer parts → edge's hot-path LocalSigner.
     //

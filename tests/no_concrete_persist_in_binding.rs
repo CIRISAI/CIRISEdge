@@ -3,7 +3,7 @@
 //!
 //! In a two-wheel process (`ciris_persist` + `ciris_edge` installed side by
 //! side) each `.so` statically links its own `parking_lot_core` and its own
-//! tokio (1.54 in persist 61.2.3, 1.53 in edge 45.0). A concrete
+//! tokio (1.54 in persist 61.4.0, 1.53 in edge). A concrete
 //! `Arc<SqliteBackend>` lifted out of a capsule runs EDGE's compiled copy of
 //! persist's store code against the wheel's object: its `parking_lot` mutexes
 //! lose wakeups across the two waiter queues (the v45.0.0 / v45.0.2
@@ -14,8 +14,8 @@
 //! Two rules, over non-test code:
 //!
 //! 1. The binding (`src/ffi/`) names no concrete backend and unwraps no
-//!    raw-layout store or runtime capsule, apart from the RESIDUAL counted
-//!    below.
+//!    raw-layout store or runtime capsule: every store view rides persist's
+//!    ops capsules (CIRISEdge#988, persist 61.4.0).
 //! 2. Elsewhere, only the modules that serve single-binary hosts (they take a
 //!    Rust `ciris_persist::Engine` or `BackendDispatch` the host built in its
 //!    own binary, which the binding never holds) may name one. A new module
@@ -32,13 +32,6 @@ const RAW_STORE_CAPSULES: [&str; 4] = [
     "\"federation_directory_capsule\"",
     "extract_capsule::<tokio::runtime::Handle",
 ];
-
-/// The binding's remaining concrete references, all in `init_edge_runtime`:
-/// the `use`, the `outbound_queue_capsule` unwrap, and the three views lifted
-/// from it (`rooting_dir`, `blackhole_rules`, `derived_schema`) whose methods
-/// have no persist ops yet (CIRISPersist#1227 / #1244). v45.0.3 does not ship
-/// until this is zero; lowering it here is part of that change.
-const BINDING_RESIDUAL: usize = 11;
 
 /// Single-binary host modules (rule 2).
 const HOST_MODULES: [&str; 6] = [
@@ -156,12 +149,11 @@ fn edge_reaches_persist_owned_store_objects_only_through_ops_capsules() {
          if it serves only hosts that link persist themselves:\n{}",
         stray.join("\n")
     );
-    assert_eq!(
-        binding_hits.len(),
-        BINDING_RESIDUAL,
-        "the binding's concrete / raw-capsule references changed. A NEW one is the \
-         two-wheel lost-wakeup defect again: route it through an ops capsule. If one was \
-         REMOVED, lower BINDING_RESIDUAL to match:\n{}",
+    assert!(
+        binding_hits.is_empty(),
+        "the binding reaches a concrete persist backend or unwraps a raw-layout store or \
+         runtime capsule. In a two-wheel process that is the lost-wakeup defect \
+         (history: CIRISEdge#988): route it through an ops capsule:\n{}",
         binding_hits.join("\n")
     );
 }

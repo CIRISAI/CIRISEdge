@@ -1048,7 +1048,14 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         )
         .await
         {
-            Ok(Outcome::Inserted | Outcome::Unchanged | Outcome::Deduplicated) => Ok(()),
+            // persist 61.3.0 (#1252): `HeldEquivalent` is held (the same act
+            // under another row), not a refusal.
+            Ok(
+                Outcome::Inserted
+                | Outcome::Unchanged
+                | Outcome::Deduplicated
+                | Outcome::HeldEquivalent,
+            ) => Ok(()),
             Ok(other) => Err(format!("{other:?}")),
             Err(e) => Err(e.to_string()),
         }

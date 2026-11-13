@@ -13,10 +13,26 @@ use ciris_persist::federation::*;
 /// `inner` (persist's directory-ops proxy) and the capsules its copies point
 /// into. Dropping the last clone releases the capsules; nothing else holds
 /// them on edge's behalf.
+///
+/// The trait's SYNC reads are answered from `fixed`, read once in [`Self::new`].
+/// Through the proxy each sync read blocks its caller for a round trip on
+/// persist's runtime (fails closed after 30 s), and persist's code compiled
+/// into edge calls them from async bodies, i.e. on runtime workers. The values
+/// are fixed for the process once the host built its Engine (the node key is
+/// set at construction), so `new`, called once at `init_edge_runtime` on the
+/// host's thread, is the only place a sync read crosses the capsule.
 pub(crate) struct KeptDirectory {
     inner: Arc<dyn FederationDirectory>,
+    fixed: KeptSyncReads,
     _executor: Arc<crate::ffi::pyo3::KeptExecutor>,
     _capsule: pyo3::Py<pyo3::PyAny>,
+}
+
+/// The proxy's sync reads, read once (see [`KeptDirectory`]).
+pub(crate) struct KeptSyncReads {
+    pub(crate) hardware_attestation_policy: std::sync::Arc<HardwareAttestationPolicy>,
+    pub(crate) node_key_id: Option<String>,
+    pub(crate) withdraws_delegation_depth: usize,
 }
 
 impl KeptDirectory {
@@ -25,15 +41,21 @@ impl KeptDirectory {
         executor: Arc<crate::ffi::pyo3::KeptExecutor>,
         capsule: pyo3::Py<pyo3::PyAny>,
     ) -> Self {
+        let fixed = KeptSyncReads {
+            hardware_attestation_policy: inner.hardware_attestation_policy(),
+            node_key_id: inner.node_key_id(),
+            withdraws_delegation_depth: inner.withdraws_delegation_depth(),
+        };
         Self {
             inner,
+            fixed,
             _executor: executor,
             _capsule: capsule,
         }
     }
 }
 
-// 250 delegations, generated.
+// 262 delegations, generated.
 #[async_trait::async_trait]
 impl FederationDirectory for KeptDirectory {
     async fn active_community_key_ids_for(
@@ -235,6 +257,17 @@ impl FederationDirectory for KeptDirectory {
             .attestations_binding_content(content_sha256)
             .await
     }
+    async fn attestations_binding_content_with_placements(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.inner
+            .attestations_binding_content_with_placements(content_sha256)
+            .await
+    }
+    fn blackhole_rules_surface(&self) -> Option<&dyn BlackholeRules> {
+        self.inner.blackhole_rules_surface()
+    }
     async fn build_membership_change_envelope(
         &self,
         cohort: cohort::Cohort,
@@ -293,6 +326,15 @@ impl FederationDirectory for KeptDirectory {
     ) -> Result<ciris_persist::witness::WitnessReconcileAction, Error> {
         self.inner.compare_stored_witnesses(peer_ids).await
     }
+    async fn cosign_alias(&self, attestation_id: &str) -> Result<Option<(String, String)>, Error> {
+        self.inner.cosign_alias(attestation_id).await
+    }
+    async fn cosign_receipt(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Option<cosign::CosignReceipt>, Error> {
+        self.inner.cosign_receipt(quorum_key).await
+    }
     async fn dag_manifests_of_chunk(
         &self,
         chunk_sha256: &[u8; 32],
@@ -304,6 +346,12 @@ impl FederationDirectory for KeptDirectory {
     }
     async fn delete_legacy_goal(&self, goal_id: &str) -> Result<(), Error> {
         self.inner.delete_legacy_goal(goal_id).await
+    }
+    async fn drop_cosign_rows(&self, quorum_key: &str) -> Result<u64, Error> {
+        self.inner.drop_cosign_rows(quorum_key).await
+    }
+    fn edge_detection_surface(&self) -> Option<&dyn ciris_persist::derived::EdgeDetectionSink> {
+        self.inner.edge_detection_surface()
     }
     async fn enter_mesh(
         &self,
@@ -408,7 +456,7 @@ impl FederationDirectory for KeptDirectory {
         self.inner.groups_of(cohort, member_key_id).await
     }
     fn hardware_attestation_policy(&self) -> std::sync::Arc<HardwareAttestationPolicy> {
-        self.inner.hardware_attestation_policy()
+        self.fixed.hardware_attestation_policy.clone()
     }
     async fn heartbeat_shared_instance(
         &self,
@@ -658,6 +706,15 @@ impl FederationDirectory for KeptDirectory {
     ) -> Result<Vec<Attestation>, Error> {
         self.inner.list_consent_revocations(since).await
     }
+    async fn list_cosign_aliases(&self, quorum_key: &str) -> Result<Vec<(String, String)>, Error> {
+        self.inner.list_cosign_aliases(quorum_key).await
+    }
+    async fn list_cosign_signatures(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        self.inner.list_cosign_signatures(quorum_key).await
+    }
     async fn list_derived_hex(
         &self,
         original_sha256_hex: &str,
@@ -851,6 +908,9 @@ impl FederationDirectory for KeptDirectory {
         subject_key_id: &str,
     ) -> Result<Vec<LocationProof>, Error> {
         self.inner.list_location_proofs_for(subject_key_id).await
+    }
+    async fn list_open_cosign_receipts(&self) -> Result<Vec<cosign::CosignReceipt>, Error> {
+        self.inner.list_open_cosign_receipts().await
     }
     async fn list_open_self_roster_proposals(
         &self,
@@ -1154,7 +1214,17 @@ impl FederationDirectory for KeptDirectory {
             .await
     }
     fn node_key_id(&self) -> Option<String> {
-        self.inner.node_key_id()
+        self.fixed.node_key_id.clone()
+    }
+    async fn note_cosign_alias(
+        &self,
+        alias_attestation_id: &str,
+        quorum_key: &str,
+        held_attestation_id: &str,
+    ) -> Result<(), Error> {
+        self.inner
+            .note_cosign_alias(alias_attestation_id, quorum_key, held_attestation_id)
+            .await
     }
     async fn note_self_roster_proposal(
         &self,
@@ -1426,6 +1496,12 @@ impl FederationDirectory for KeptDirectory {
             )
             .await
     }
+    async fn read_group_plane_object(
+        &self,
+        link: &group_plane::GroupRowLink,
+    ) -> Result<Option<(group_plane::GroupSigned, Option<String>)>, Error> {
+        self.inner.read_group_plane_object(link).await
+    }
     async fn reap_expired_attestations(
         &self,
         now: chrono::DateTime<chrono::Utc>,
@@ -1629,6 +1705,16 @@ impl FederationDirectory for KeptDirectory {
     ) -> Result<(), Error> {
         self.inner.set_consent_role(key_id, consent_role).await
     }
+    async fn settle_cosign_receipt(
+        &self,
+        quorum_key: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        self.inner
+            .settle_cosign_receipt(quorum_key, outcome, settled_at)
+            .await
+    }
     async fn settle_self_roster_proposal(
         &self,
         proposal_id: &str,
@@ -1807,6 +1893,6 @@ impl FederationDirectory for KeptDirectory {
         self.inner.withdraws_admission_depth(attestation_id).await
     }
     fn withdraws_delegation_depth(&self) -> usize {
-        self.inner.withdraws_delegation_depth()
+        self.fixed.withdraws_delegation_depth.clone()
     }
 }

@@ -40,6 +40,25 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "src" / "ffi" / "kept_directory.rs"
 
 
+# CIRISEdge#988 — the trait's sync methods, answered from values read once at
+# construction (see the generated `KeptDirectory` docs), with their types.
+SYNC_READS = [
+    ("hardware_attestation_policy", "std::sync::Arc<HardwareAttestationPolicy>"),
+    ("node_key_id", "Option<String>"),
+    ("withdraws_delegation_depth", "usize"),
+]
+
+# Sync methods the ops proxy answers without crossing the capsule (it returns
+# itself, a reference, or the trait default): delegated live.
+PURE_SYNC = {
+    "as_dyn_directory",
+    "blackhole_rules_surface",
+    "edge_detection_surface",
+    "peer_quota_observation",
+    "trust_root_standing_cache",
+}
+
+
 def load_persist_generator(persist: Path):
     script = persist / "scripts" / "gen_directory_double.py"
     spec = importlib.util.spec_from_file_location("persist_gen", script)
@@ -120,10 +139,25 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
     A("/// `inner` (persist's directory-ops proxy) and the capsules its copies point")
     A("/// into. Dropping the last clone releases the capsules; nothing else holds")
     A("/// them on edge's behalf.")
+    A("///")
+    A("/// The trait's SYNC reads are answered from `fixed`, read once in [`Self::new`].")
+    A("/// Through the proxy each sync read blocks its caller for a round trip on")
+    A("/// persist's runtime (fails closed after 30 s), and persist's code compiled")
+    A("/// into edge calls them from async bodies, i.e. on runtime workers. The values")
+    A("/// are fixed for the process once the host built its Engine (the node key is")
+    A("/// set at construction), so `new`, called once at `init_edge_runtime` on the")
+    A("/// host's thread, is the only place a sync read crosses the capsule.")
     A("pub(crate) struct KeptDirectory {")
     A("    inner: Arc<dyn FederationDirectory>,")
+    A("    fixed: KeptSyncReads,")
     A("    _executor: Arc<crate::ffi::pyo3::KeptExecutor>,")
     A("    _capsule: pyo3::Py<pyo3::PyAny>,")
+    A("}")
+    A("")
+    A("/// The proxy's sync reads, read once (see [`KeptDirectory`]).")
+    A("pub(crate) struct KeptSyncReads {")
+    for name, ty in SYNC_READS:
+        A(f"    pub(crate) {name}: {ty},")
     A("}")
     A("")
     A("impl KeptDirectory {")
@@ -132,7 +166,11 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
     A("        executor: Arc<crate::ffi::pyo3::KeptExecutor>,")
     A("        capsule: pyo3::Py<pyo3::PyAny>,")
     A("    ) -> Self {")
-    A("        Self { inner, _executor: executor, _capsule: capsule }")
+    A("        let fixed = KeptSyncReads {")
+    for name, _ty in SYNC_READS:
+        A(f"            {name}: inner.{name}(),")
+    A("        };")
+    A("        Self { inner, fixed, _executor: executor, _capsule: capsule }")
     A("    }")
     A("}")
     A("")
@@ -168,6 +206,11 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
         if name in anchored:
             A("    // persist compiles this method only under `test` or `test-anchor`.")
             A('    #[cfg(feature = "test-anchor")]')
+        if name in sync and name not in PURE_SYNC:
+            A(f"    fn {name}({arglist}) -> {ret} {{")
+            A(f"        self.fixed.{name}.clone()")
+            A("    }")
+            continue
         if name in sync:
             A(f"    fn {name}({arglist}) -> {ret} {{")
             A(f"        self.inner.{name}({call})")
@@ -225,11 +268,17 @@ def main() -> None:
         a.persist_src = pinned_persist_src()
     gen = load_persist_generator(a.persist_src)
     methods = methods_of(gen, a.persist_src)
+    sync = sync_methods(gen, a.persist_src)
+    known = {name for name, _ in SYNC_READS} | PURE_SYNC
+    if sync != known:
+        # A new sync method would be delegated live: a blocking round trip on
+        # whatever thread calls it. Decide how it is answered, then list it.
+        sys.exit(f"the trait's sync methods changed: {sorted(sync)} != SYNC_READS + PURE_SYNC {sorted(known)}")
     text = rustfmt(
         render(
             gen,
             methods,
-            sync_methods(gen, a.persist_src),
+            sync,
             test_anchor_methods(a.persist_src),
         )
     )
