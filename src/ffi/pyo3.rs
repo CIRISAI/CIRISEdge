@@ -7472,31 +7472,11 @@ pub fn init_edge_runtime(
              same-extension-module mode (CIRISEdge#22 / CIRISPersist#111).",
         ));
     }
-    #[allow(unsafe_code)]
-    let runtime: tokio::runtime::Handle = unsafe {
-        extract_capsule::<tokio::runtime::Handle, _, _>(
-            &engine,
-            "runtime_handle_capsule",
-            tokio::runtime::Handle::clone,
-        )?
-    };
-    // Make the persist runtime current on this thread for the rest of
-    // the init body. `enter()` returns a guard that restores the
-    // previous runtime context (or absence thereof) on Drop. The
-    // explicit `block_on` in Step 5 below DOES NOT require `enter()`
-    // to schedule, but entering ensures any future refactor introducing
-    // an intermediate `.await` (e.g. registering a transport handler
-    // task) immediately has a current runtime and does not regress to
-    // a "no reactor running" panic.
-    // CIRISPersist#320 — do NOT `runtime.enter()` here. `runtime` is
-    // persist's `tokio::runtime::Handle` from `runtime_handle_capsule`;
-    // `Handle::enter()` is edge's tokio operating on a foreign (persist-
-    // built) Handle, which sets edge's runtime-context thread-local to
-    // persist's runtime for the whole init body — a cross-cdylib tokio
-    // aliasing hazard (CIRISPersist#156/#157). All async below now goes
-    // through `run_async` (the ABI-stable executor vtable, dispatched
-    // inside persist's `.so`), so no current-runtime context is needed
-    // and entering one is actively harmful.
+    // The capsule is checked for presence only and never unwrapped: it is a
+    // raw `tokio::runtime::Handle` laid out by the wheel's tokio (1.54 at
+    // persist 61.2.3) while edge compiles against its own (1.53), so even a
+    // `Handle::clone` here would refcount a foreign layout. Nothing needs it:
+    // every async step goes through the executor capsule below.
 
     // v1.1.8 (CIRISEdge#58 / CIRISEdge#59 / CIRISPersist#157) — the
     // ABI-stable executor capsule. Pre-v3.13.0 persist exposes only
@@ -9179,15 +9159,6 @@ pub fn init_edge_runtime(
     #[cfg(feature = "ffi-uniffi")]
     crate::ffi::uniffi_impl::install_edge_handle(&edge_arc);
 
-    // Suppress unused-binding warning for `runtime` (persist's raw
-    // `tokio::runtime::Handle` from `runtime_handle_capsule`). As of
-    // CIRISPersist#320 it is no longer used at all: the init-body
-    // `runtime.enter()` guard and every `runtime.block_on(...)` were
-    // replaced by `run_async` on the ABI-stable executor vtable (raw
-    // cross-cdylib `Handle::block_on` deadlocks in release builds).
-    // Edge's own async runs on `transport_runtime` (built below). We
-    // keep extracting the capsule as the persist-version-floor probe.
-    let _ = runtime;
     // v2.1.0 (CIRISEdge#85 / CIRISLensCore#43) — retain a strong
     // reference to the host engine PyObject so [`PyEdge::engine`] can
     // hand it to cohabiting cdylibs. `Bound::unbind()` converts the
