@@ -455,8 +455,11 @@ async fn an_act_offered_under_another_ref_is_wanted_once_1252() {
             holdings_index: lever,
             ..crate::replication::BridgeConfig::default()
         };
-        let nb = bridge_with(
+        let counting = Arc::new(super::counting_directory_930::CountingDirectory::new(
             Arc::clone(&b) as Arc<dyn FederationDirectory>,
+        ));
+        let nb = bridge_with(
+            Arc::clone(&counting) as Arc<dyn FederationDirectory>,
             &r.bob.node.key_id,
             vec![r.bob.node.key_id.clone()],
             config,
@@ -493,10 +496,25 @@ async fn an_act_offered_under_another_ref_is_wanted_once_1252() {
                 "lever {lever}: the act is held"
             );
         }
+        // Bring the holdings feed current once, then the idle rounds.
+        let _ = nb.holdings_want(KIND, &offered).await;
+        counting.reset();
         for round in 0..3 {
             assert!(
                 nb.holdings_want(KIND, &offered).await.is_empty(),
                 "lever {lever}, round {round}: neither old ref is wanted again"
+            );
+        }
+        if lever {
+            // With the index on, an idle diff against the old-hash peer reads
+            // nothing (inside the feed's probe spacing): the old refs are
+            // answered from memory, never re-drained.
+            assert_eq!(
+                counting.count("list_wire_hashes_since")
+                    + counting.count("list_attestations_since"),
+                0,
+                "lever on: an idle mixed-version diff reads no store page: {:?}",
+                counting.counts()
             );
         }
         assert_eq!(nb.held_equivalent_refs(), 2, "lever {lever}");

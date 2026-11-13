@@ -16,6 +16,17 @@ each loading the `ciris_persist` and `ciris_edge` wheels side by side:
 - each node sends opaque events to the other (the send path reads the
   blackhole rules) for `CONTEND_SECS`.
 
+The two nodes do not root EACH OTHER (self-registered agent keys have no
+provenance chain to a steward bootstrap, and the wheel carries no test
+anchor): each announce of the peer runs the rooting reads and refuses. Each
+node does root the baked canonical, which drives the rooting WRITES
+(`PutSignedTransportDestination`, `RecordAnnouncedPeer`,
+`PutTransportDestination`) and the unfolded route reads through the proxy,
+and a send to a rooted peer leases a link whose first step reads the
+blackhole rules (`BlackholeList`). With `CIRIS_PERSIST_TRACE=1` and
+`SCENARIO_LOG_DIR` set, each node's stderr (persist's op trace) is kept so
+the ops can be counted.
+
 A node that hangs never prints its report: the parent's timeout reports it.
 A node exits 3 if its persist reader stops progressing for 3 s while it is
 otherwise alive (the other direction of the lost wakeup).
@@ -27,7 +38,6 @@ in its report rather than claiming coverage.
 
     python3 tools/scenarios/cohab_reticulum_two_node.py            # parent
 """
-import base64
 import ctypes
 import ctypes.util
 import json
@@ -110,6 +120,14 @@ def node(role: str, shared: str, my_port: int, peer_port: int) -> int:
         announce_interval_seconds=1,
     )
 
+    # The rooted map is keyed by the node identity a peer announces, which is
+    # the edge's signer, not the agent key registered above: publish ours,
+    # read the peer's.
+    with open(os.path.join(shared, f"{role}.signer.tmp"), "w") as f:
+        f.write(edge.signer_key_id())
+    os.replace(os.path.join(shared, f"{role}.signer.tmp"), os.path.join(shared, f"{role}.signer"))
+    peer_signer = wait_for(os.path.join(shared, f"{other}.signer"), time.monotonic() + 30)
+
     stop = threading.Event()
     reads = [0]
 
@@ -129,12 +147,15 @@ def node(role: str, shared: str, my_port: int, peer_port: int) -> int:
     stalled = 0
     while time.monotonic() - t0 < secs:
         rooted = edge.rooted_peers()
-        rooted_seen = rooted_seen or peer["kid"] in rooted
-        try:
-            edge.send_opaque_event(peer["kid"], 7, b"two-wheel")
-            sends += 1
-        except Exception:
-            send_errors += 1
+        rooted_seen = rooted_seen or peer_signer in rooted
+        # The peer's agent key, and every rooted peer: a send to a rooted peer
+        # leases a link, whose first step reads the blackhole rules.
+        for to in [peer["kid"], *rooted]:
+            try:
+                edge.send_opaque_event(to, 7, b"two-wheel")
+                sends += 1
+            except Exception:
+                send_errors += 1
         time.sleep(0.05)
         now = time.monotonic()
         if now - last_check >= 1.0:
@@ -153,7 +174,8 @@ def node(role: str, shared: str, my_port: int, peer_port: int) -> int:
         "sends": sends,
         "send_errors": send_errors,
         "peer_rooted": rooted_seen,
-        "rooted_peers": len(edge.rooted_peers()),
+        "rooted_peers": sorted(edge.rooted_peers()),
+        "peer_signer": peer_signer,
         "detection_writer": "not reachable from the binding (probe observer off)",
     }))
     sys.stdout.flush()
@@ -183,6 +205,10 @@ def parent() -> int:
             p.communicate()
             rc = 124
             continue
+        log_dir = os.environ.get("SCENARIO_LOG_DIR")
+        if log_dir:
+            with open(os.path.join(log_dir, f"{role}.err"), "w") as f:
+                f.write(err)
         line = (out.strip().splitlines() or ["{}"])[-1]
         try:
             results[role] = json.loads(line)
