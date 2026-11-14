@@ -1346,6 +1346,12 @@ struct SweepGate {
     /// ([`EdgeMetrics::sweep_permit_wait_seconds`](crate::observability::EdgeMetrics::sweep_permit_wait_seconds)).
     /// Installed by [`ReplicationBridge::with_metrics`]; `None` records nothing.
     metrics: Option<crate::observability::EdgeMetrics>,
+    /// CIRISEdge#998 — debug builds: which task holds a permit, and from which
+    /// site. A task that asks for a second permit while holding one is the
+    /// deadlock class (two such tasks hold the whole width and wait for each
+    /// other): `cfg(test)` panics naming both sites, other debug builds log it.
+    #[cfg(debug_assertions)]
+    holders: std::sync::Mutex<HashMap<tokio::task::Id, (usize, &'static str)>>,
 }
 
 impl SweepGate {
@@ -1375,6 +1381,8 @@ impl SweepGate {
             max_in_flight: std::sync::atomic::AtomicUsize::new(0),
             entries: std::sync::atomic::AtomicUsize::new(0),
             metrics: None,
+            #[cfg(debug_assertions)]
+            holders: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1398,6 +1406,10 @@ impl SweepGate {
     /// CIRISEdge#971 — [`Self::enter`], counted under the call site that took
     /// it (`sweep_permits.<site>`), so a seat's permit rate names its cause.
     async fn enter_at(&self, site: &'static str) -> SweepPermit<'_> {
+        #[cfg(debug_assertions)]
+        let task = tokio::task::try_id();
+        #[cfg(debug_assertions)]
+        self.check_not_holding(task, site);
         if let Some(m) = self.metrics.as_ref() {
             m.inc_sweep_permit(site);
         }
@@ -1424,9 +1436,52 @@ impl SweepGate {
             .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
         self.entries
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(debug_assertions)]
+        if let Some(id) = task {
+            let mut holders = self
+                .holders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = holders.entry(id).or_insert((0, site));
+            slot.0 += 1;
+        }
         SweepPermit {
             gate: self,
             _permit: permit,
+            #[cfg(debug_assertions)]
+            task,
+        }
+    }
+
+    /// CIRISEdge#998 — the re-entry guard (debug builds). Only a spawned task
+    /// has an id (`try_id`), which is every production caller: the drivers,
+    /// the scheduler, the puller.
+    #[cfg(debug_assertions)]
+    fn check_not_holding(&self, task: Option<tokio::task::Id>, site: &'static str) {
+        let Some(id) = task else {
+            return;
+        };
+        let held = self
+            .holders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .copied();
+        if let Some((count, held_at)) = held.filter(|(count, _)| *count > 0) {
+            #[cfg(test)]
+            panic!(
+                "CIRISEdge#998: a task holding {count} sweep permit(s) (taken at {held_at}) \
+                 asked for another at {site}; the gate is not re-entrant, and two such tasks \
+                 hold the whole width waiting on each other"
+            );
+            #[cfg(not(test))]
+            tracing::error!(
+                held_at,
+                count,
+                site,
+                "CIRISEdge#998: a task holding a sweep permit asked for another; the gate is \
+                 not re-entrant (a deadlock when every permit is held this way)"
+            );
         }
     }
 }
@@ -1445,6 +1500,9 @@ impl SweepGate {
 struct SweepPermit<'a> {
     gate: &'a SweepGate,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// CIRISEdge#998 — the task the permit was taken by (debug builds).
+    #[cfg(debug_assertions)]
+    task: Option<tokio::task::Id>,
 }
 
 impl Drop for SweepPermit<'_> {
@@ -1452,6 +1510,20 @@ impl Drop for SweepPermit<'_> {
         self.gate
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(debug_assertions)]
+        if let Some(id) = self.task {
+            let mut holders = self
+                .gate
+                .holders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(slot) = holders.get_mut(&id) {
+                slot.0 = slot.0.saturating_sub(1);
+                if slot.0 == 0 {
+                    holders.remove(&id);
+                }
+            }
+        }
     }
 }
 
@@ -5391,11 +5463,11 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             // 4. CIRISEdge#907 — a stranger to the subject, on the Attestation
             //    plane, from a conferred server: the subject's announced
             //    testimony only, each ref one the fetch twin would serve.
+            //    CIRISEdge#998 — the permit is taken INSIDE, around the store
+            //    read only: held across the per-row fetch gate it reached
+            //    `resolved_peer_set`, which takes a second permit on an expired
+            //    consent memo, and the gate is not re-entrant.
             Some(p) if announced_testimony && cohort_entitled => {
-                let _permit = self
-                    .sweep_gate
-                    .enter_at(crate::observability::SWEEP_PERMIT_ANNOUNCED_TESTIMONY)
-                    .await;
                 self.announced_testimony_holdings(subject_key_id, p).await
             }
             other => {
@@ -6641,19 +6713,28 @@ impl FederationDirectoryReplicationBridge {
         use ciris_persist::federation::types::{attestation_type, cohort_scope};
         const ACCEPTANCE_DIMENSION: &str = "trust:accepts:v1";
         let mut authored: Vec<Attestation> = Vec::new();
-        let mut pages = ciris_persist::federation::attestation_query::AttestationQuery::by(
-            subject_key_id,
-            ciris_persist::federation::attestation_query::FOLD_PAGE,
-        )
-        .pages();
-        while let Some(page) = match pages.next(&*self.directory).await {
-            Ok(page) => page,
-            Err(e) => {
-                Self::subject_read_not_served(subject_key_id, "announced-testimony", &e);
-                return Vec::new();
+        {
+            // CIRISEdge#531 — the width permit, around the store read ONLY.
+            // CIRISEdge#998 — released before the per-row fetch gate below,
+            // which resolves the send set and may take a permit of its own.
+            let _permit = self
+                .sweep_gate
+                .enter_at(crate::observability::SWEEP_PERMIT_ANNOUNCED_TESTIMONY)
+                .await;
+            let mut pages = ciris_persist::federation::attestation_query::AttestationQuery::by(
+                subject_key_id,
+                ciris_persist::federation::attestation_query::FOLD_PAGE,
+            )
+            .pages();
+            while let Some(page) = match pages.next(&*self.directory).await {
+                Ok(page) => page,
+                Err(e) => {
+                    Self::subject_read_not_served(subject_key_id, "announced-testimony", &e);
+                    return Vec::new();
+                }
+            } {
+                authored.extend(page);
             }
-        } {
-            authored.extend(page);
         }
         let mut refs = Vec::new();
         for att in authored {
@@ -32375,6 +32456,43 @@ mod sweep_width_tests {
             bridge.max_sweeps_in_flight() <= 1,
             "never more than the configured permit count materialised at once"
         );
+    }
+
+    /// CIRISEdge#998 — the re-entry guard: a task that holds a sweep permit and
+    /// asks for another is stopped by name (debug builds; a panic under test),
+    /// before it can join a second such task in holding the whole width. Two
+    /// permits here, so the second acquire would succeed: only the guard fails
+    /// it. Red with the guard removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_holding_a_sweep_permit_cannot_ask_for_another_998() {
+        let (_backend, bridge) = make_bridge_with_permits(2);
+        let bridge = Arc::new(bridge);
+        let nested = tokio::spawn({
+            let bridge = Arc::clone(&bridge);
+            async move {
+                let _first = bridge.sweep_gate.enter().await;
+                let _second = bridge.sweep_gate.enter().await;
+            }
+        })
+        .await;
+        let err = nested.expect_err("a nested acquire is refused by the guard");
+        assert!(err.is_panic(), "{err:?}");
+        let msg = err
+            .into_panic()
+            .downcast::<String>()
+            .map(|s| *s)
+            .unwrap_or_default();
+        assert!(msg.contains("CIRISEdge#998"), "{msg}");
+        // Sequential use from one task stays legal.
+        tokio::spawn({
+            let bridge = Arc::clone(&bridge);
+            async move {
+                drop(bridge.sweep_gate.enter().await);
+                drop(bridge.sweep_gate.enter().await);
+            }
+        })
+        .await
+        .expect("take, release, take again is not re-entry");
     }
 
     /// The bound holds on the real bridge under real concurrency, not only on
