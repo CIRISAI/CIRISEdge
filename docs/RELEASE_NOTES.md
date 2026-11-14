@@ -1,5 +1,34 @@
 # CIRISEdge Release Notes
 
+# v45.1.0 — the long-term support line: two wheels that never hang, quorum rooms that widen in the mesh, the seat's counters
+
+**2026-11-13.** **MINOR. LTS** for a mesh of at most 100 nodes, until the persist v62 refactor;
+bug fixes only after this tag. Pins: persist v61.4.0 (exact, Python too:
+`ciris-persist==61.4.0`), CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. MSRV 1.92.
+
+**Consumer notes** (detail in CHANGELOG.md):
+- **The persist requirement is `ciris-persist==61.4.0`**; any other wheel is refused at
+  `init_edge_runtime` with `capsule_version_skew`. Migrations V214 and V215 (the cosign hold
+  tables) run at the first open.
+- **Two-wheel hosts no longer hang (CIRISEdge#988).** Every store view runs inside persist's
+  library through the ops proxy; edge never runs its own copy of persist's store code on the
+  wheel's backend. Init refuses a persist without the ops capsules. Before: v45.0.2 + persist
+  61.2.3 failed 12 of 12 witness runs and hung 9 of 320 reproduction runs. After: 80 of 80 and
+  0 of 320 on local builds, 20 of 20 and 0 of 80 with the persist 61.4.0 tag-CI wheel.
+- **Trust reads no longer fail open through the proxy (CIRISPersist#1268)**, and a read that
+  persist answered with its timeout fallback is never kept.
+- **Quorum rooms widen and remove inside the mesh (persist #1252).** Cosign rows are decision
+  rows; an act has one ref across versions; a `withdraws` that arrives first waits for its target.
+- **The responder's line reads `refused: N, duplicate: D, rejected: R`**; `refused` keeps its old
+  meaning for this release.
+- **Seat counters**: advertise rows by class and arm, round openers, replication rows and bytes per
+  plane, peer activity and link up/down by class, first sync, wire level, and persist reads by
+  caller (complete in a single binary only; across two wheels only edge's side of the capsule, until
+  CIRISPersist#1270). **No seat CPU saving is claimed**; the
+  counters are what this release buys for the seat, and measurement follows.
+- **Out, kept for after the refactor:** the held-inert store, the shared first-contact page, the
+  key-plane memo fix, the push filter (F3), the narrowed first-contact read.
+
 # v45.0.0 — video in room calls, the fewest store reads, a late joiner's history, exact pins
 
 **2026-11-10.** **MAJOR.** Pins: persist v61.2.2 (exact, Python too), CIRISVerify v22.2.0

@@ -82,7 +82,7 @@ real video + real blobs through real relays, in CI).
 
 ## Status
 
-**v45.0.2.** Pins `ciris-persist` v61.2.3 (exact, Python too), CIRISVerify v22.2.0 and
+**v45.1.0 (LTS).** Pins `ciris-persist` v61.4.0 (exact, Python too), CIRISVerify v22.2.0 and
 leviculum v0.34.0+ciris.3 (`Cargo.toml`); MSRV 1.92; CC 1.0-rc17;
 wire vocabulary v1.0.3 (since v44.1.2). Release notes: [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md);
 threat model and its stated residuals: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
