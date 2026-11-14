@@ -2806,6 +2806,9 @@ pub struct ReticulumTransport {
     test_refuse_dials: Arc<std::sync::atomic::AtomicBool>,
     /// Test seam — how many dials [`Self::test_refuse_dials`] refused.
     test_refused_dials: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#993 — destinations whose last pre-seal route fetch failed;
+    /// shared by every dial ([`crate::transport::route_fetch_backoff`]).
+    route_fetch_backoff: Arc<crate::transport::route_fetch_backoff::RouteFetchBackoff>,
     /// CIRISEdge#805 item 5 — the router of peer-opened A/V links to the
     /// live calls, once one exists. It owns the A/V arrivals; `None` inside
     /// means another consumer took them first.
@@ -3531,6 +3534,7 @@ impl ReticulumTransport {
             test_offer_forwarded: Arc::clone(&self.test_offer_forwarded),
             test_refuse_dials: Arc::clone(&self.test_refuse_dials),
             test_refused_dials: Arc::clone(&self.test_refused_dials),
+            route_fetch_backoff: Arc::clone(&self.route_fetch_backoff),
             row_homed_elsewhere: Arc::clone(&self.row_homed_elsewhere),
             homing_tx: self.homing_tx.downgrade(),
             homed: Arc::clone(&self.homed),
@@ -4303,6 +4307,7 @@ impl ReticulumTransport {
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             test_refuse_dials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             test_refused_dials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            route_fetch_backoff: Arc::default(),
             bulk_dial_failed: std::sync::Mutex::new(HashMap::new()),
             row_homed_elsewhere: Arc::new(std::sync::Mutex::new(HashMap::new())),
             homing_tx,
@@ -12973,6 +12978,8 @@ struct DialCtx {
     test_refuse_dials: Arc<std::sync::atomic::AtomicBool>,
     /// Test seam — how many dials [`Self::test_refuse_dials`] refused.
     test_refused_dials: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#993 — shared with the transport.
+    route_fetch_backoff: Arc<crate::transport::route_fetch_backoff::RouteFetchBackoff>,
     /// Shared with the transport: peers whose row link was refused at a bound
     /// ([`ReticulumTransport::row_homed_elsewhere`]).
     row_homed_elsewhere: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
@@ -13522,6 +13529,28 @@ impl DialCtx {
         let pair = self
             .dial_transit_pair(destination_key_id, peer, has_path)
             .await?;
+        // CIRISEdge#993 — no pair means a route fetch; if the last one toward
+        // this destination failed, refuse now, before a link opens.
+        if pair.is_none() {
+            if let Some(until) = self
+                .route_fetch_backoff
+                .blocked_until(destination_key_id, std::time::Instant::now())
+            {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.inc_link_seal(crate::observability::LINK_SEAL_ROUTE_FETCH_BACKED_OFF);
+                }
+                return Err(TransportError::LinkSealRefused {
+                    peer: destination_key_id.to_owned(),
+                    reason: crate::observability::LINK_SEAL_ROUTE_FETCH_BACKED_OFF,
+                    detail: format!(
+                        "the last route fetch toward this peer failed; no dial for {} ms more                          (CIRISEdge#993)",
+                        until
+                            .saturating_duration_since(std::time::Instant::now())
+                            .as_millis()
+                    ),
+                });
+            }
+        }
         let link_id = self
             .connect_and_key(
                 destination_key_id,
@@ -14396,6 +14425,7 @@ impl DialCtx {
         .await;
         match outcome {
             Ok(pair) => {
+                self.route_fetch_backoff.clear(peer);
                 if let Some(m) = self.metrics.as_ref() {
                     m.inc_link_seal(PairSource::RouteFetch.as_str());
                 }
@@ -14412,6 +14442,10 @@ impl DialCtx {
                 Ok(pair)
             }
             Err(e) => {
+                // CIRISEdge#993 — every dial to this destination that would
+                // fetch again waits out the backoff.
+                self.route_fetch_backoff
+                    .note_failure(peer, std::time::Instant::now());
                 let err = seal_refused(
                     self.metrics.as_ref(),
                     peer,

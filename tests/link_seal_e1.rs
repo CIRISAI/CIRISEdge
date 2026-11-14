@@ -1294,6 +1294,45 @@ async fn a_route_answer_that_is_not_an_answer_refuses_the_link_e1() {
     assert!(t.a.seen.lock().await.is_empty());
 }
 
+/// CIRISEdge#993 — consecutive failed route fetches back their DESTINATION
+/// off: after the free retry, the sends that follow inside the window are
+/// refused before any link opens, by name, instead of each dialling and
+/// fetching again (two idle nodes that could not seal churned ~1,700 links a
+/// minute each). Two route requests, not one per send. Red at v45.1.0: every
+/// send dialled and fetched (A refuses every request: cap 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_route_fetch_backs_its_destination_off_993() {
+    let t = trio("fetchbackoff", false, false, false).await;
+    t.a.transport.set_route_request_cap_for_test(0);
+    for what in ["first", "the free retry"] {
+        match t.b.transport.send(&t.a.key.key_id, b"refused").await {
+            Err(TransportError::LinkSealRefused { reason, .. }) => {
+                assert!(
+                    reason == "link_seal_refused_route_closed"
+                        || reason == "link_seal_refused_route_timeout",
+                    "{what}: a refused fetch, by name: {reason}"
+                );
+            }
+            other => panic!("{what}: the fetch is refused by name: {other:?}"),
+        }
+    }
+    for i in 0..4 {
+        match t.b.transport.send(&t.a.key.key_id, b"again").await {
+            Err(TransportError::LinkSealRefused { reason, .. }) => {
+                assert_eq!(reason, "link_seal_route_fetch_backed_off", "send {i}");
+            }
+            other => panic!("send {i} inside the backoff is refused before a dial: {other:?}"),
+        }
+    }
+    assert_eq!(
+        t.b.seal("link_seal_route_request_sent"),
+        2,
+        "two route requests, not one per send: {:?}",
+        t.b.metrics.link_seal()
+    );
+    assert_eq!(t.b.seal("link_seal_route_fetch_backed_off"), 4);
+}
+
 /// **Route fetch 3** — an answer whose row is signed by, and about, ANOTHER
 /// key (A answers with B's own row, which it holds) is refused by name and
 /// never stored: the dialler keys only on the dialled key's own row.

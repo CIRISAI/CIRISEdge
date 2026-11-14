@@ -1275,6 +1275,10 @@ pub const LINK_SEAL_REFUSED_ROUTE_TIMEOUT: &str = "link_seal_refused_route_timeo
 pub const LINK_SEAL_REFUSED_ROUTE_CLOSED: &str = "link_seal_refused_route_closed";
 /// Refused: a request or answer frame could not be sent.
 pub const LINK_SEAL_REFUSED_ROUTE_SEND: &str = "link_seal_refused_route_send";
+/// CIRISEdge#993 — refused at the dialler before any link opened: the last
+/// route fetch toward this destination failed and its backoff holds
+/// (`transport::route_fetch_backoff`).
+pub const LINK_SEAL_ROUTE_FETCH_BACKED_OFF: &str = "link_seal_route_fetch_backed_off";
 
 // ─── CIRISEdge#627/#879 — on-link announce (`CANN`) receipt ──────────────
 /// CIRISEdge#968 — `transport_inbound_drops` tag: a CRPL replication frame
@@ -2435,6 +2439,7 @@ pub const LINK_SEAL_LABELS: &[&str] = &[
     LINK_SEAL_REFUSED_ROUTE_TIMEOUT,
     LINK_SEAL_REFUSED_ROUTE_CLOSED,
     LINK_SEAL_REFUSED_ROUTE_SEND,
+    LINK_SEAL_ROUTE_FETCH_BACKED_OFF,
     LINK_SEAL_DROPPED_BEFORE_KEYS,
     LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE,
     LINK_SEAL_REFUSED_HANDSHAKE_NODE_RATE,
