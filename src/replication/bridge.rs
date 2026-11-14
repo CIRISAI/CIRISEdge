@@ -1479,8 +1479,8 @@ impl SweepGate {
                 held_at,
                 count,
                 site,
-                "CIRISEdge#998: a task holding a sweep permit asked for another; the gate is \
-                 not re-entrant (a deadlock when every permit is held this way)"
+                "a task holding a sweep permit asked for another; the gate is not re-entrant \
+                 (a deadlock when every permit is held this way; history: CIRISEdge#998)"
             );
         }
     }
