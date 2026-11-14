@@ -30423,6 +30423,108 @@ pub(crate) mod tests {
         );
     }
 
+    /// CIRISEdge#998 — the stranger's announced-testimony Pull (#907, arm 4)
+    /// holds a sweep-gate permit across `serve_fetch_gated`, which resolves
+    /// the send set and, on an empty or expired consent memo, ACQUIRES A
+    /// SECOND PERMIT. The gate is not re-entrant (`sweep_gate_is_not_re_entrant`):
+    /// with every permit held by a Pull waiting for another, the node's whole
+    /// sweep width is gone for good, and every reader that needs a permit, on
+    /// every plane, parks behind it (big_room e6b, Dave: every responder
+    /// stepping for 354 s). Two shapes, each bounded by a timeout:
+    /// - one permit, one stranger Pull: it waits on itself;
+    /// - two permits, two concurrent stranger Pulls on one bridge, and the
+    ///   subject's own Key-plane Pull behind them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn a_strangers_announced_testimony_pull_never_waits_on_a_second_permit_998() {
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
+        let (relay, peer, peer_owner, o, d) = (
+            "node-relay",
+            "node-peer",
+            "person-peer",
+            "person-o",
+            "node-d",
+        );
+        register_fixture_keys(
+            &backend,
+            &[
+                (relay, identity_type::NODE),
+                (peer, identity_type::NODE),
+                (peer_owner, identity_type::USER),
+                (o, identity_type::USER),
+                (d, identity_type::NODE),
+            ],
+        )
+        .await;
+        seed_owner_binding(&backend, peer_owner, peer).await;
+        seed_common_root(&backend, &[relay, peer_owner, peer, o]).await;
+        seed_owner_binding(&backend, o, d).await;
+        let dir: Arc<dyn FederationDirectory> = backend.clone();
+        let relay_bridge = |permits: usize| {
+            let publish = vec![relay.to_string()];
+            Arc::new(
+                FederationDirectoryReplicationBridge::with_config(
+                    Arc::clone(&dir),
+                    Arc::new(Vec::new),
+                    BridgeConfig {
+                        advertise_sweep_permits: permits,
+                        ..BridgeConfig::default()
+                    },
+                )
+                .with_local_key_id(Some(relay.to_string()))
+                .with_self_provider(Some(Arc::new(move || publish.clone())))
+                .with_kind_publish_selector(Some(KindPublishSelector::from_sets(HashMap::from([
+                    (
+                        EnvelopeKind::Key,
+                        vec![relay.to_string(), d.to_string(), o.to_string()],
+                    ),
+                    (
+                        EnvelopeKind::IdentityOccurrence,
+                        vec![relay.to_string(), d.to_string()],
+                    ),
+                ])))),
+            )
+        };
+        let bound = std::time::Duration::from_secs(5);
+
+        // One permit: the Pull holds it and asks for another.
+        let one = relay_bridge(1);
+        let alone = tokio::time::timeout(
+            bound,
+            one.subject_holdings(EnvelopeKind::Attestation, o, Some(peer)),
+        )
+        .await;
+        assert!(
+            alone.as_ref().is_ok_and(|refs| !refs.is_empty()),
+            "a stranger's Pull with one sweep permit answers (it held the permit and \
+             waited for a second: the gate is not re-entrant): {alone:?}"
+        );
+
+        // Two permits, two Pulls at once, and a third reader on another plane.
+        for attempt in 0..50 {
+            let bridge = relay_bridge(2);
+            let pull = |b: Arc<FederationDirectoryReplicationBridge>| async move {
+                b.subject_holdings(EnvelopeKind::Attestation, o, Some(peer))
+                    .await
+            };
+            let (a, b) = tokio::join!(
+                tokio::spawn(tokio::time::timeout(bound, pull(Arc::clone(&bridge)))),
+                tokio::spawn(tokio::time::timeout(bound, pull(Arc::clone(&bridge)))),
+            );
+            let third = tokio::time::timeout(
+                bound,
+                bridge.subject_holdings(EnvelopeKind::Key, o, Some(o)),
+            )
+            .await;
+            assert!(
+                a.expect("task").is_ok() && b.expect("task").is_ok() && third.is_ok(),
+                "attempt {attempt}: two concurrent stranger Pulls held both sweep permits \
+                 and each waited for a third; the subject's own Key-plane Pull parked \
+                 behind them (CIRISEdge#998)"
+            );
+        }
+    }
+
     /// CIRISPersist#897 / persist v47.0.0 — an `affiliations` row is served to
     /// the members of the affiliation the ROW names, exactly as a community
     /// row is, and to nobody else.
