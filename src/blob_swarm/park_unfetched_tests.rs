@@ -7,6 +7,7 @@
 //! and nothing tied the two together: the bounded retry ladder was the only
 //! way back, and once it was spent the body read `not_fetched` for good.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::key_wake::{Awaiting, KeyWaits};
@@ -55,7 +56,7 @@ fn a_pull_parked_on_its_rooms_install_is_woken_by_the_install_once() {
         0,
         "nothing installed yet: no wake"
     );
-    assert!(waits.take_woken(&Default::default()).is_empty());
+    assert!(waits.take_woken(&HashSet::default()).is_empty());
 
     // The scope lifecycle installs the room.
     table
@@ -73,7 +74,7 @@ fn a_pull_parked_on_its_rooms_install_is_woken_by_the_install_once() {
         1,
         "the install wakes the parked pull"
     );
-    let woken = waits.take_woken(&Default::default());
+    let woken = waits.take_woken(&HashSet::default());
     assert_eq!(woken.len(), 1, "woken once");
     assert_eq!(woken[0].0, sha);
 
@@ -93,7 +94,7 @@ fn a_pull_parked_on_its_rooms_install_is_woken_by_the_install_once() {
         waits.wake_installed(router.table_generation(), installed),
         0
     );
-    assert!(waits.take_woken(&Default::default()).is_empty());
+    assert!(waits.take_woken(&HashSet::default()).is_empty());
 }
 
 /// A holder-parked pull of room content is woken by the room's install too
@@ -138,7 +139,7 @@ fn a_holder_parked_room_pull_is_woken_by_the_install_and_a_groupless_one_is_not(
         1
     );
     let woken: Vec<[u8; 32]> = waits
-        .take_woken(&Default::default())
+        .take_woken(&HashSet::default())
         .into_iter()
         .map(|(sha, _)| sha)
         .collect();

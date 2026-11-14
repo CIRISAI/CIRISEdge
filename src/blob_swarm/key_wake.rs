@@ -287,8 +287,8 @@ impl KeyWaits {
                     scope,
                     group,
                     generation: seen,
-                } => ((&*scope, group.as_str()), seen),
-                Awaiting::Holder {
+                }
+                | Awaiting::Holder {
                     group: Some((scope, group)),
                     generation: seen,
                 } => ((&*scope, group.as_str()), seen),
