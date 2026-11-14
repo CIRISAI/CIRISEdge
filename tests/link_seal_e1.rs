@@ -1331,6 +1331,30 @@ async fn a_failed_route_fetch_backs_its_destination_off_993() {
         t.b.metrics.link_seal()
     );
     assert_eq!(t.b.seal("link_seal_route_fetch_backed_off"), 4);
+
+    // The peer becomes able to answer (its request cap reopens) and announces:
+    // the backoff ends on the announce, not when the window does. The window
+    // is pushed far past the 5 s announce interval first, so only the
+    // announce can end it inside the wait.
+    t.b.transport
+        .note_route_fetch_failures_for_test(&t.a.key.key_id, 4);
+    assert!(t
+        .b
+        .transport
+        .route_fetch_backed_off_for_test(&t.a.key.key_id));
+    t.a.transport.set_route_request_cap_for_test(32);
+    assert!(
+        wait_until(Duration::from_secs(15), || async {
+            !t.b.transport
+                .route_fetch_backed_off_for_test(&t.a.key.key_id)
+        })
+        .await,
+        "A's announce ends B's backoff toward it (the window alone runs ~80 s)"
+    );
+    t.b.transport
+        .send(&t.a.key.key_id, b"after-the-announce")
+        .await
+        .expect("B -> A fetches and seals once A has announced");
 }
 
 /// **Route fetch 3** — an answer whose row is signed by, and about, ANOTHER

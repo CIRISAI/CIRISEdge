@@ -6244,6 +6244,26 @@ impl ReticulumTransport {
         self.seals.tapped()
     }
 
+    /// CIRISEdge#993 test seam — whether a pairless dial to `destination`
+    /// is backed off now.
+    #[doc(hidden)]
+    pub fn route_fetch_backed_off_for_test(&self, destination: &str) -> bool {
+        self.route_fetch_backoff
+            .blocked_until(destination, std::time::Instant::now())
+            .is_some()
+    }
+
+    /// CIRISEdge#993 test seam — book `failures` more failed route fetches
+    /// toward `destination` now, so its window is long (the announce reset
+    /// witness needs one longer than the announce interval).
+    #[doc(hidden)]
+    pub fn note_route_fetch_failures_for_test(&self, destination: &str, failures: u32) {
+        for _ in 0..failures {
+            self.route_fetch_backoff
+                .note_failure(destination, std::time::Instant::now());
+        }
+    }
+
     /// CC 5.3.3.5 E1 test seam — run as an UNANNOUNCED node from now on (set
     /// it before `listen`): no RNS announce, and no on-link announce, bundle
     /// or owner binding on the links it dials. A peer then cannot attribute
@@ -11652,6 +11672,7 @@ impl ReticulumTransport {
             lxmf_serve: &self.lxmf_serve,
             congestion: &self.congestion,
             peer_reachable: &self.peer_reachable,
+            route_fetch_backoff: &self.route_fetch_backoff,
             link_direction: &self.link_direction,
             metrics_source: self.metrics_source,
             #[cfg(feature = "lxmf")]
@@ -14757,6 +14778,9 @@ struct EventCtx<'a> {
     congestion: &'a crate::transport::av_backpressure::CongestionRegistry,
     /// CIRISEdge#794 — see the field of the same name on [`ReticulumTransport`].
     peer_reachable: &'a tokio::sync::broadcast::Sender<PeerReachable>,
+    /// CIRISEdge#993 — a verified announce ends its sender's route-fetch
+    /// backoff: the peer is live and may now hold the row it lacked.
+    route_fetch_backoff: &'a crate::transport::route_fetch_backoff::RouteFetchBackoff,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     link_direction: &'a std::sync::Mutex<LinkDirections>,
     /// CIRISEdge#853 — the transport's metrics source id, for its gauges.
@@ -20775,6 +20799,10 @@ async fn receive_announce(ctx: &EventCtx<'_>, view: AnnounceView, link: Option<L
     if let (Stage1Outcome::InstalledNew | Stage1Outcome::Refreshed, Some(key_id)) =
         (outcome, key_id.as_deref())
     {
+        // CIRISEdge#993 — a peer that announces may have minted the route row
+        // its last fetch lacked (or reopened its request cap): its next dial
+        // fetches at once, not when the backoff window ends.
+        ctx.route_fetch_backoff.clear(key_id);
         let _ = ctx.peer_reachable.send(PeerReachable::new(
             key_id,
             ReachabilityEvidence::PathLearned,
