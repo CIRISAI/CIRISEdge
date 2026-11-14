@@ -1099,6 +1099,13 @@ impl DagByteFetch for SwarmFetch {
                     }
                     last = format!("{peer}: {e}");
                 }
+                // 45.1.1 — the wait was taken by another fetch of this chunk:
+                // not the holder's failure, so no strike. The loop's own
+                // bound (`max_attempts`) still ends a chunk taken every time.
+                Err(e) if e.is_superseded_chunk_wait() => {
+                    self.settle(&peer, |_| {});
+                    last = format!("{peer}: {e}");
+                }
                 Err(e) => {
                     self.settle(&peer, |s| {
                         s.record_rtt(timeout, alpha);

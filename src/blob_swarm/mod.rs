@@ -411,6 +411,8 @@ mod dag_gone_terminal_tests;
 pub mod durability;
 #[cfg(test)]
 mod durability_763_tests;
+#[cfg(test)]
+mod endgame_superseded_tests;
 pub use durability::{rarest_first, target_mode, DurabilitySweep, Repair};
 mod key_wake;
 pub mod pull;
@@ -808,6 +810,10 @@ enum FetchResultBody {
     /// CIRISEdge#887 — no answer within the per-request timeout: silence,
     /// not a refusal ([`PeerState::record_timeout`]).
     Timeout,
+    /// 45.1.1 — the wait was replaced by a later fetch of the same chunk
+    /// ([`crate::edge::CHUNK_WAIT_SUPERSEDED`]): the holder neither answered
+    /// nor failed, so it is not struck.
+    Superseded,
 }
 
 /// CIRISEdge#581 — one process-lifetime WARN when the store gate is not
@@ -1225,6 +1231,8 @@ impl SwarmScheduler {
         // bound would otherwise count against the peer.
         let mut dispatched: std::collections::HashSet<(String, [u8; 32])> =
             std::collections::HashSet::new();
+        // 45.1.1 — per chunk, how many of its waits another fetch took.
+        let mut superseded: HashMap<[u8; 32], u32> = HashMap::new();
 
         // Assembly buffer keyed by chunk-SHA. Filled as each fetch
         // completes; final assembly walks the manifest in order.
@@ -1407,6 +1415,24 @@ impl SwarmScheduler {
                         pending.push_back(outcome.chunk_sha);
                     }
                 }
+                FetchResultBody::Superseded => {
+                    // 45.1.1 — another fetch of this chunk took its wait. Not
+                    // an answer and not a strike; the chunk goes back for
+                    // another holder. Bounded per chunk: a wait taken again
+                    // and again (another fetcher of the same chunk) counts as
+                    // an error strike past `error_strike_limit`, so the loop
+                    // cannot spin.
+                    let taken = superseded.entry(outcome.chunk_sha).or_insert(0u32);
+                    *taken = taken.saturating_add(1);
+                    if *taken > self.config.error_strike_limit.max(1) {
+                        if let Some(state) = peers.get_mut(&outcome.peer_key_id) {
+                            state.record_error_strike(self.config.error_strike_limit);
+                        }
+                    }
+                    if !chunk_bytes.contains_key(&outcome.chunk_sha) {
+                        pending.push_back(outcome.chunk_sha);
+                    }
+                }
                 FetchResultBody::Error(reason) => {
                     // Transport error — penalize via a synthetic
                     // RTT sample of the configured per-request timeout
@@ -1513,6 +1539,7 @@ impl SwarmScheduler {
                 Err(crate::EdgeError::Transport(crate::TransportError::Timeout(_))) => {
                     FetchResultBody::Timeout
                 }
+                Err(e) if e.is_superseded_chunk_wait() => FetchResultBody::Superseded,
                 Err(e) => FetchResultBody::Error(e.to_string()),
             };
             let _ = tx
@@ -1554,17 +1581,21 @@ impl SwarmScheduler {
             if chunk_bytes.contains_key(chunk_sha) {
                 continue;
             }
-            // Pick any peer with capacity that does NOT already have this
-            // chunk in flight (CIRISEdge#616): endgame is a race between
-            // DIFFERENT peers for the same chunk; a duplicate to the same
-            // peer only clobbers the edge's pending oneshot for that key.
-            // (Could iterate by ewma_rtt for the fastest; endgame is a
-            // coverage primitive, not a latency primitive — any-capacity is
-            // fine.)
+            // 45.1.1 — a chunk already waiting under ANY holder is not
+            // duplicated. The edge holds ONE waiter per `(blob, chunk)`
+            // (`chunk_waits`), so a duplicate to a second holder replaced the
+            // first holder's wait: each saw "channel closed", was struck, and
+            // the re-dispatch closed the other's wait in turn, so both holders
+            // were struck out of the fetch within milliseconds (big_room,
+            // CIRISServer 0.5.247). CIRISEdge#616 guarded the same holder only.
+            // A race between holders needs a waiter per holder; until then a
+            // chunk is asked of one holder at a time.
+            if dispatched.iter().any(|(_, c)| c == chunk_sha) {
+                continue;
+            }
             let candidate = peers
                 .iter()
                 .filter(|(_, p)| p.can_accept(self.config.max_in_flight_per_peer))
-                .filter(|(k, _)| !dispatched.contains(&((*k).clone(), *chunk_sha)))
                 .map(|(k, _)| k.clone())
                 .next();
             if let Some(peer) = candidate {

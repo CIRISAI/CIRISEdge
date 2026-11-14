@@ -676,6 +676,15 @@ impl Default for EdgeConfig {
     }
 }
 
+/// The tail of the error a chunk fetch returns when its wait was REPLACED by a
+/// later fetch of the same `(blob, chunk)`: the pending map holds one waiter
+/// per key, so the earlier one sees its channel close. It says nothing about
+/// the holder (45.1.1: the swarm's endgame duplicated a chunk to a second
+/// holder, the two registrations closed each other's waits at CPU speed, and
+/// both holders were struck out of the fetch). One spelling, read by
+/// [`EdgeError::is_superseded_chunk_wait`].
+pub(crate) const CHUNK_WAIT_SUPERSEDED: &str = "channel closed before response";
+
 /// Top-level error type.
 #[derive(thiserror::Error, Debug)]
 pub enum EdgeError {
@@ -784,6 +793,15 @@ pub enum EdgeError {
         /// Operator-configured floor below which the dispatcher drops.
         threshold: f64,
     },
+}
+
+impl EdgeError {
+    /// Whether this is a chunk fetch whose wait a later fetch of the same
+    /// chunk replaced ([`CHUNK_WAIT_SUPERSEDED`]): neither an answer from the
+    /// holder nor a failure of it.
+    pub(crate) fn is_superseded_chunk_wait(&self) -> bool {
+        matches!(self, Self::Config(m) if m.ends_with(CHUNK_WAIT_SUPERSEDED))
+    }
 }
 
 // ─── Type-erased handler dispatch ───────────────────────────────────
@@ -4184,9 +4202,9 @@ impl Edge {
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err(EdgeError::Config(
-                "fetch_blob_chunk channel closed before response".into(),
-            )),
+            Ok(Err(_)) => Err(EdgeError::Config(format!(
+                "fetch_blob_chunk {CHUNK_WAIT_SUPERSEDED}"
+            ))),
             Err(_) => Err(self.chunk_wait_timed_out(key, timeout)),
         }
     }
@@ -4196,6 +4214,22 @@ impl Edge {
         self.blob_chunk_fetch_pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Test seam (45.1.1): how many chunk fetches registered a wait.
+    #[cfg(test)]
+    pub(crate) fn chunk_wait_registrations(&self) -> u64 {
+        self.chunk_waits().registrations
+    }
+
+    /// Test seam (45.1.1): register a wait as a competing fetch of the same
+    /// chunk would, replacing any wait already there.
+    #[cfg(test)]
+    pub(crate) fn register_chunk_wait_for_test(
+        &self,
+        key: ([u8; 32], [u8; 32]),
+    ) -> crate::blob_swarm::chunk_waits::Wait {
+        self.register_chunk_wait(key)
     }
 
     /// CIRISEdge#887 — register a chunk fetch; a late answer already kept for
@@ -4457,9 +4491,9 @@ impl Edge {
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err(EdgeError::Config(
-                "fetch_blob_chunk_scoped channel closed before response".into(),
-            )),
+            Ok(Err(_)) => Err(EdgeError::Config(format!(
+                "fetch_blob_chunk_scoped {CHUNK_WAIT_SUPERSEDED}"
+            ))),
             Err(_) => Err(self.chunk_wait_timed_out(key, timeout)),
         }
     }
