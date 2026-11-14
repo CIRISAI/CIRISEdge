@@ -132,7 +132,7 @@ classifiers = [
 # other version (61.2.3, 61.3.0 alike) is refused at init with
 # `capsule_version_skew`. A range here would only admit wheels that cannot load.
 dependencies = [
-    "ciris-persist==61.4.0",
+    "ciris-persist==61.4.1",
 ]
 dynamic = ["version"]
 
