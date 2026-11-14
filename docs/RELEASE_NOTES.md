@@ -1,5 +1,11 @@
 # CIRISEdge Release Notes
 
+# v45.1.1 — the persist pin by tag
+
+**2026-11-14.** **PATCH.** Persist is pinned by its tag `v61.4.0` instead of by rev `0568ebf3`.
+It is the same commit, so nothing a host runs changes. A consumer that pins persist by tag now
+resolves a single persist source. Everything in v45.1.0 below applies unchanged.
+
 # v45.1.0 — the long-term support line: two wheels that never hang, quorum rooms that widen in the mesh, the seat's counters
 
 **2026-11-13.** **MINOR. LTS** for a mesh of at most 100 nodes, until the persist v62 refactor;
