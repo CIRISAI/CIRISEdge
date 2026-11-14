@@ -1675,6 +1675,126 @@ pub const HOLDINGS_DUPLICATE_UNHELD: [&str; 2] = [
     "attestation.duplicate_unheld",
     "transport_destination.duplicate_unheld",
 ];
+/// Seat load 2026-11-13 (S0) — the advertise's rows as counters, by the
+/// peer's class (its send-set reach, or `commons` between two seats) and
+/// what became of each row: `advertise.rows.<class>.<outcome>`. Added once
+/// per round (`listed_*`, `not_advertisable`, `withheld`, `duplicate`,
+/// `awaits_request`, `offered`) and once per withheld row for the two arms
+/// that book `recipient_not_in_send_set` (`withheld_reach`: the send-set
+/// reach does not carry the row's scope; `withheld_first_contact`: a
+/// first-contact peer and a row that is none of the shapes that reach
+/// carries; `withheld_row`: persist's per-row audience resolver refused it).
+/// The
+/// throttled advertise log line carried these only as a sample.
+pub const ADVERTISE_ROW_CLASSES: [&str; 6] = [
+    "consent",
+    "self_collective",
+    "family",
+    "first_contact",
+    "commons",
+    "none",
+];
+/// The outcomes of [`ADVERTISE_ROW_LABELS`], in its column order.
+pub const ADVERTISE_ROW_OUTCOMES: [&str; 11] = [
+    "listed_required",
+    "listed_head",
+    "listed_history",
+    "not_advertisable",
+    "withheld",
+    "withheld_reach",
+    "withheld_first_contact",
+    "withheld_row",
+    "duplicate",
+    "awaits_request",
+    "offered",
+];
+/// `advertise.rows.<class>.<outcome>`, class-major ([`advertise_row_label`]).
+pub const ADVERTISE_ROW_LABELS: [&str; 66] = [
+    "rows.consent.listed_required",
+    "rows.consent.listed_head",
+    "rows.consent.listed_history",
+    "rows.consent.not_advertisable",
+    "rows.consent.withheld",
+    "rows.consent.withheld_reach",
+    "rows.consent.withheld_first_contact",
+    "rows.consent.withheld_row",
+    "rows.consent.duplicate",
+    "rows.consent.awaits_request",
+    "rows.consent.offered",
+    "rows.self_collective.listed_required",
+    "rows.self_collective.listed_head",
+    "rows.self_collective.listed_history",
+    "rows.self_collective.not_advertisable",
+    "rows.self_collective.withheld",
+    "rows.self_collective.withheld_reach",
+    "rows.self_collective.withheld_first_contact",
+    "rows.self_collective.withheld_row",
+    "rows.self_collective.duplicate",
+    "rows.self_collective.awaits_request",
+    "rows.self_collective.offered",
+    "rows.family.listed_required",
+    "rows.family.listed_head",
+    "rows.family.listed_history",
+    "rows.family.not_advertisable",
+    "rows.family.withheld",
+    "rows.family.withheld_reach",
+    "rows.family.withheld_first_contact",
+    "rows.family.withheld_row",
+    "rows.family.duplicate",
+    "rows.family.awaits_request",
+    "rows.family.offered",
+    "rows.first_contact.listed_required",
+    "rows.first_contact.listed_head",
+    "rows.first_contact.listed_history",
+    "rows.first_contact.not_advertisable",
+    "rows.first_contact.withheld",
+    "rows.first_contact.withheld_reach",
+    "rows.first_contact.withheld_first_contact",
+    "rows.first_contact.withheld_row",
+    "rows.first_contact.duplicate",
+    "rows.first_contact.awaits_request",
+    "rows.first_contact.offered",
+    "rows.commons.listed_required",
+    "rows.commons.listed_head",
+    "rows.commons.listed_history",
+    "rows.commons.not_advertisable",
+    "rows.commons.withheld",
+    "rows.commons.withheld_reach",
+    "rows.commons.withheld_first_contact",
+    "rows.commons.withheld_row",
+    "rows.commons.duplicate",
+    "rows.commons.awaits_request",
+    "rows.commons.offered",
+    "rows.none.listed_required",
+    "rows.none.listed_head",
+    "rows.none.listed_history",
+    "rows.none.not_advertisable",
+    "rows.none.withheld",
+    "rows.none.withheld_reach",
+    "rows.none.withheld_first_contact",
+    "rows.none.withheld_row",
+    "rows.none.duplicate",
+    "rows.none.awaits_request",
+    "rows.none.offered",
+];
+
+/// The `advertise.rows.<class>.<outcome>` label; `None` for a name outside
+/// [`ADVERTISE_ROW_CLASSES`] × [`ADVERTISE_ROW_OUTCOMES`].
+#[must_use]
+pub fn advertise_row_label(class: &str, outcome: &str) -> Option<&'static str> {
+    let c = ADVERTISE_ROW_CLASSES.iter().position(|x| *x == class)?;
+    let o = ADVERTISE_ROW_OUTCOMES.iter().position(|x| *x == outcome)?;
+    ADVERTISE_ROW_LABELS
+        .get(c * ADVERTISE_ROW_OUTCOMES.len() + o)
+        .copied()
+}
+
+/// Seat load 2026-11-13 (P3) — a delivered envelope whose exact bytes the
+/// Ready set holds, answered `Duplicate` without calling persist.
+pub const HOLDINGS_DUPLICATE_FROM_INDEX: [&str; 2] = [
+    "attestation.duplicate_from_index",
+    "transport_destination.duplicate_from_index",
+];
 /// Feed drains (one per serve-cursor catch-up that read the store).
 pub const HOLDINGS_FEED_PROBES: [&str; 2] = [
     "attestation.feed_probes",
@@ -1712,6 +1832,10 @@ pub const STALE_ROUTE_SUPPRESSED: &str = "stale_route.suppressed";
 pub const STALE_ROUTE_EVICTED: &str = "stale_route.evicted";
 /// Marks dropped because a route left the index (an audit's `extra`).
 pub const STALE_ROUTE_CLEARED: &str = "stale_route.cleared";
+/// Seat load 2026-11-13 (P2) — refs remembered as held (a `Duplicate` of a
+/// ref the holdings set lacked, or persist's `HeldEquivalent`) forgotten
+/// because an audit found a held hash gone from persist's index.
+pub const HELD_EQUIVALENT_FORGOTTEN: &str = "held_equivalent.forgotten";
 /// Gauge: stale-route marks held.
 pub const HOLDINGS_GAUGE_STALE_ROUTE_SIZE: &str = "stale_route.size";
 /// Gauge: answers held in each key-plane memo, by `KeyPlaneRead` slot (key
@@ -1871,8 +1995,249 @@ pub const RESPONDER_ROUND_REPLY_SHED: &str = "reply_shed";
 pub const RESPONDER_ROUND_REPLY_SHED_NODE: &str = "reply_shed_node";
 /// CIRISEdge#943 — a reply outlived its round in the lane and was not sent.
 pub const RESPONDER_ROUND_REPLY_EXPIRED: &str = "reply_expired";
+/// Seat load 2026-11-13 (S0) — `responder_rounds_total` outcome: a responder
+/// round was opened by this inbound message type. Counted on the first frame of
+/// a round (a new round id; for a legacy frame with no round id, a message that
+/// only opens a round). `summary` is a whole-plane anti-entropy round, `pull` a
+/// subject Pull, `cursor_pull` the accord cursor plane, `fetch` a by-hash ask,
+/// `deliver` a bare push with no Summary before it.
+pub const RESPONDER_ROUND_OPENED_SUMMARY: &str = "opened_summary";
+/// See [`RESPONDER_ROUND_OPENED_SUMMARY`].
+pub const RESPONDER_ROUND_OPENED_PULL: &str = "opened_pull";
+/// See [`RESPONDER_ROUND_OPENED_SUMMARY`].
+pub const RESPONDER_ROUND_OPENED_CURSOR_PULL: &str = "opened_cursor_pull";
+/// See [`RESPONDER_ROUND_OPENED_SUMMARY`].
+pub const RESPONDER_ROUND_OPENED_FETCH: &str = "opened_fetch";
+/// See [`RESPONDER_ROUND_OPENED_SUMMARY`].
+pub const RESPONDER_ROUND_OPENED_DELIVER: &str = "opened_deliver";
+/// See [`RESPONDER_ROUND_OPENED_SUMMARY`]: a round whose first frame was a
+/// Diff (its Summary was lost or overtaken).
+pub const RESPONDER_ROUND_OPENED_DIFF: &str = "opened_diff";
+/// Seat load 2026-11-13 (S0) — `replication_io` labels. `*_rows` are
+/// envelopes carried by a `Deliver` (`deliver`: answering a Diff or a Fetch;
+/// `push`: an initiator's proactive Deliver beside its Summary), `*_bytes`
+/// their envelope bytes (the JSON frame around them is not counted),
+/// `summary_refs` and `diff_want` the hashes a Summary lists and a Diff asks
+/// for. `_in` is what this node received, `_out` what it sent.
+pub const REPLICATION_IO_LABELS: [&str; 17] = [
+    "deliver_rows_out",
+    "deliver_bytes_out",
+    "deliver_rows_in",
+    "deliver_bytes_in",
+    "push_rows_out",
+    "push_bytes_out",
+    "summary_refs_out",
+    "summary_refs_in",
+    "diff_want_out",
+    "diff_want_in",
+    "pull_out",
+    "pull_in",
+    "first_sync_complete",
+    "first_sync_ms",
+    "first_sync_rounds",
+    "first_sync_rows",
+    "first_sync_bytes",
+];
+/// Seat load 2026-11-13 (S0) — the classes a peer is counted under in
+/// `peer_activity`: the axis of this node's attestation send set that last
+/// resolved it (`consent`, `owner_routed`, `self_collective`, `first_contact`,
+/// `none`), or `unknown` for a peer no advertise has resolved yet (one that
+/// never rounds with this node on the Attestation plane). Class only, never a
+/// key: the map from key to class lives in [`EdgeMetrics::set_peer_class`].
+pub const PEER_CLASSES: [&str; 6] = [
+    "consent",
+    "owner_routed",
+    "self_collective",
+    "first_contact",
+    "none",
+    "unknown",
+];
+/// Seat load 2026-11-13 (S0) — how an initiator round toward a peer ended:
+/// skipped by the no-route backoff, not started because the transport cannot
+/// carry it, completed with rows exchanged or with nothing exchanged, timed
+/// out, its send failed, or ended otherwise (an error or a refusal).
+pub const INITIATOR_OUTCOMES: [&str; 7] = [
+    "skipped_backoff",
+    "not_carriable",
+    "exchanged",
+    "nothing_exchanged",
+    "timed_out",
+    "send_failed",
+    "ended",
+];
+/// `peer_activity.initiator.<class>.<outcome>`, class-major.
+pub const PEER_ACTIVITY_INITIATOR: [&str; 42] = [
+    "initiator.consent.skipped_backoff",
+    "initiator.consent.not_carriable",
+    "initiator.consent.exchanged",
+    "initiator.consent.nothing_exchanged",
+    "initiator.consent.timed_out",
+    "initiator.consent.send_failed",
+    "initiator.consent.ended",
+    "initiator.owner_routed.skipped_backoff",
+    "initiator.owner_routed.not_carriable",
+    "initiator.owner_routed.exchanged",
+    "initiator.owner_routed.nothing_exchanged",
+    "initiator.owner_routed.timed_out",
+    "initiator.owner_routed.send_failed",
+    "initiator.owner_routed.ended",
+    "initiator.self_collective.skipped_backoff",
+    "initiator.self_collective.not_carriable",
+    "initiator.self_collective.exchanged",
+    "initiator.self_collective.nothing_exchanged",
+    "initiator.self_collective.timed_out",
+    "initiator.self_collective.send_failed",
+    "initiator.self_collective.ended",
+    "initiator.first_contact.skipped_backoff",
+    "initiator.first_contact.not_carriable",
+    "initiator.first_contact.exchanged",
+    "initiator.first_contact.nothing_exchanged",
+    "initiator.first_contact.timed_out",
+    "initiator.first_contact.send_failed",
+    "initiator.first_contact.ended",
+    "initiator.none.skipped_backoff",
+    "initiator.none.not_carriable",
+    "initiator.none.exchanged",
+    "initiator.none.nothing_exchanged",
+    "initiator.none.timed_out",
+    "initiator.none.send_failed",
+    "initiator.none.ended",
+    "initiator.unknown.skipped_backoff",
+    "initiator.unknown.not_carriable",
+    "initiator.unknown.exchanged",
+    "initiator.unknown.nothing_exchanged",
+    "initiator.unknown.timed_out",
+    "initiator.unknown.send_failed",
+    "initiator.unknown.ended",
+];
+/// `peer_activity.link_up.<class>`: a link identified to a peer of `class`.
+pub const PEER_ACTIVITY_LINK_UP: [&str; 6] = [
+    "link_up.consent",
+    "link_up.owner_routed",
+    "link_up.self_collective",
+    "link_up.first_contact",
+    "link_up.none",
+    "link_up.unknown",
+];
+/// `peer_activity.link_down.<class>.<cause>` (causes in [`LinkCloseCause::ALL`]
+/// order), class-major: a link that was identified, closed.
+pub const PEER_ACTIVITY_LINK_DOWN: [&str; 78] = [
+    "link_down.consent.idle_expired",
+    "link_down.consent.pool_idle_expired",
+    "link_down.consent.pool_full",
+    "link_down.consent.local_teardown",
+    "link_down.consent.normal",
+    "link_down.consent.peer_closed",
+    "link_down.consent.timeout",
+    "link_down.consent.stale",
+    "link_down.consent.invalid_proof",
+    "link_down.consent.channel_exhausted",
+    "link_down.consent.blackholed",
+    "link_down.consent.other",
+    "link_down.consent.vanished",
+    "link_down.owner_routed.idle_expired",
+    "link_down.owner_routed.pool_idle_expired",
+    "link_down.owner_routed.pool_full",
+    "link_down.owner_routed.local_teardown",
+    "link_down.owner_routed.normal",
+    "link_down.owner_routed.peer_closed",
+    "link_down.owner_routed.timeout",
+    "link_down.owner_routed.stale",
+    "link_down.owner_routed.invalid_proof",
+    "link_down.owner_routed.channel_exhausted",
+    "link_down.owner_routed.blackholed",
+    "link_down.owner_routed.other",
+    "link_down.owner_routed.vanished",
+    "link_down.self_collective.idle_expired",
+    "link_down.self_collective.pool_idle_expired",
+    "link_down.self_collective.pool_full",
+    "link_down.self_collective.local_teardown",
+    "link_down.self_collective.normal",
+    "link_down.self_collective.peer_closed",
+    "link_down.self_collective.timeout",
+    "link_down.self_collective.stale",
+    "link_down.self_collective.invalid_proof",
+    "link_down.self_collective.channel_exhausted",
+    "link_down.self_collective.blackholed",
+    "link_down.self_collective.other",
+    "link_down.self_collective.vanished",
+    "link_down.first_contact.idle_expired",
+    "link_down.first_contact.pool_idle_expired",
+    "link_down.first_contact.pool_full",
+    "link_down.first_contact.local_teardown",
+    "link_down.first_contact.normal",
+    "link_down.first_contact.peer_closed",
+    "link_down.first_contact.timeout",
+    "link_down.first_contact.stale",
+    "link_down.first_contact.invalid_proof",
+    "link_down.first_contact.channel_exhausted",
+    "link_down.first_contact.blackholed",
+    "link_down.first_contact.other",
+    "link_down.first_contact.vanished",
+    "link_down.none.idle_expired",
+    "link_down.none.pool_idle_expired",
+    "link_down.none.pool_full",
+    "link_down.none.local_teardown",
+    "link_down.none.normal",
+    "link_down.none.peer_closed",
+    "link_down.none.timeout",
+    "link_down.none.stale",
+    "link_down.none.invalid_proof",
+    "link_down.none.channel_exhausted",
+    "link_down.none.blackholed",
+    "link_down.none.other",
+    "link_down.none.vanished",
+    "link_down.unknown.idle_expired",
+    "link_down.unknown.pool_idle_expired",
+    "link_down.unknown.pool_full",
+    "link_down.unknown.local_teardown",
+    "link_down.unknown.normal",
+    "link_down.unknown.peer_closed",
+    "link_down.unknown.timeout",
+    "link_down.unknown.stale",
+    "link_down.unknown.invalid_proof",
+    "link_down.unknown.channel_exhausted",
+    "link_down.unknown.blackholed",
+    "link_down.unknown.other",
+    "link_down.unknown.vanished",
+];
+/// `peer_activity.wire.<level>`: a peer counted once per process at its first
+/// replication frame, by the frame level it speaks: `v3` carries round
+/// metadata (CIRISEdge#634, edge v26+), `legacy` does not (an older peer).
+/// No handshake field carries a peer's edge version; this is the coarsest
+/// version signal the wire has.
+pub const PEER_ACTIVITY_WIRE: [&str; 2] = ["wire.legacy", "wire.v3"];
+
+/// Seat load 2026-11-13 (S0) — persist's per-caller read counters, flattened
+/// `<door>:<caller>.<reads|rows|bytes>` (edge labels every read it makes,
+/// `crate::read_caller`; this is where they become readable).
+#[must_use]
+pub fn persist_reads_snapshot() -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    for c in ciris_persist::observe::snapshot().callers {
+        let key = format!("{}:{}", c.door, c.caller);
+        out.insert(format!("{key}.reads"), c.reads);
+        out.insert(format!("{key}.rows"), c.rows);
+        out.insert(format!("{key}.bytes"), c.bytes);
+    }
+    out
+}
+
+/// Index of `class` in [`PEER_CLASSES`]; `unknown` for anything else.
+fn peer_class_index(class: &str) -> usize {
+    PEER_CLASSES
+        .iter()
+        .position(|c| *c == class)
+        .unwrap_or(PEER_CLASSES.len() - 1)
+}
+
+/// Cap on the key → class and link → class maps behind `peer_activity`.
+/// Past it the map is cleared and refilled: a lost class reads `unknown`
+/// once, never a wrong class.
+pub const PEER_CLASS_MAP_CAP: usize = 8192;
+
 /// Every `responder_rounds_total` outcome token.
-pub const RESPONDER_ROUND_OUTCOMES: [&str; 8] = [
+pub const RESPONDER_ROUND_OUTCOMES: [&str; 14] = [
     RESPONDER_ROUND_STARTED,
     RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL,
     RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL,
@@ -1881,6 +2246,12 @@ pub const RESPONDER_ROUND_OUTCOMES: [&str; 8] = [
     RESPONDER_ROUND_REPLY_SHED,
     RESPONDER_ROUND_REPLY_SHED_NODE,
     RESPONDER_ROUND_REPLY_EXPIRED,
+    RESPONDER_ROUND_OPENED_SUMMARY,
+    RESPONDER_ROUND_OPENED_PULL,
+    RESPONDER_ROUND_OPENED_CURSOR_PULL,
+    RESPONDER_ROUND_OPENED_FETCH,
+    RESPONDER_ROUND_OPENED_DELIVER,
+    RESPONDER_ROUND_OPENED_DIFF,
 ];
 
 /// CIRISEdge#853 — `responder_link_up_seconds` stage: the dialer's link-borne
@@ -2347,6 +2718,72 @@ pub const ADVERTISE_LABELS: &[&str] = &[
     ADVERTISE_SEND_SET_INVALIDATED,
     ADVERTISE_SEND_SET_DROPPED_LIVE,
     ADVERTISE_SEND_SET_EXPIRED,
+    "rows.consent.listed_required",
+    "rows.consent.listed_head",
+    "rows.consent.listed_history",
+    "rows.consent.not_advertisable",
+    "rows.consent.withheld",
+    "rows.consent.withheld_reach",
+    "rows.consent.withheld_first_contact",
+    "rows.consent.withheld_row",
+    "rows.consent.duplicate",
+    "rows.consent.awaits_request",
+    "rows.consent.offered",
+    "rows.self_collective.listed_required",
+    "rows.self_collective.listed_head",
+    "rows.self_collective.listed_history",
+    "rows.self_collective.not_advertisable",
+    "rows.self_collective.withheld",
+    "rows.self_collective.withheld_reach",
+    "rows.self_collective.withheld_first_contact",
+    "rows.self_collective.withheld_row",
+    "rows.self_collective.duplicate",
+    "rows.self_collective.awaits_request",
+    "rows.self_collective.offered",
+    "rows.family.listed_required",
+    "rows.family.listed_head",
+    "rows.family.listed_history",
+    "rows.family.not_advertisable",
+    "rows.family.withheld",
+    "rows.family.withheld_reach",
+    "rows.family.withheld_first_contact",
+    "rows.family.withheld_row",
+    "rows.family.duplicate",
+    "rows.family.awaits_request",
+    "rows.family.offered",
+    "rows.first_contact.listed_required",
+    "rows.first_contact.listed_head",
+    "rows.first_contact.listed_history",
+    "rows.first_contact.not_advertisable",
+    "rows.first_contact.withheld",
+    "rows.first_contact.withheld_reach",
+    "rows.first_contact.withheld_first_contact",
+    "rows.first_contact.withheld_row",
+    "rows.first_contact.duplicate",
+    "rows.first_contact.awaits_request",
+    "rows.first_contact.offered",
+    "rows.commons.listed_required",
+    "rows.commons.listed_head",
+    "rows.commons.listed_history",
+    "rows.commons.not_advertisable",
+    "rows.commons.withheld",
+    "rows.commons.withheld_reach",
+    "rows.commons.withheld_first_contact",
+    "rows.commons.withheld_row",
+    "rows.commons.duplicate",
+    "rows.commons.awaits_request",
+    "rows.commons.offered",
+    "rows.none.listed_required",
+    "rows.none.listed_head",
+    "rows.none.listed_history",
+    "rows.none.not_advertisable",
+    "rows.none.withheld",
+    "rows.none.withheld_reach",
+    "rows.none.withheld_first_contact",
+    "rows.none.withheld_row",
+    "rows.none.duplicate",
+    "rows.none.awaits_request",
+    "rows.none.offered",
 ];
 /// Every `link_stall` key.
 pub const LINK_STALL_LABELS: &[&str] = &[
@@ -2991,6 +3428,24 @@ pub struct EdgeMetrics {
     /// the outcome one of [`RESPONDER_ROUND_OUTCOMES`]. Lets the canonical tell
     /// a link that served a round and closed from one opened and closed empty.
     pub responder_rounds_total: Arc<RwLock<HashMap<(EnvelopeKind, &'static str), u64>>>,
+    /// Seat load 2026-11-13 (S0) — replication rows and envelope bytes moved,
+    /// by `(kind, label)` with the label one of [`REPLICATION_IO_LABELS`]. The
+    /// transport byte counters exclude replication frames; this is what the
+    /// replication plane itself carried, per plane and direction.
+    pub replication_io: Arc<RwLock<HashMap<(EnvelopeKind, &'static str), u64>>>,
+    /// Seat load 2026-11-13 (S0) — per-peer-class activity counters
+    /// (`peer_activity.<label>`): initiator round outcomes, link up and down,
+    /// and the replication frame level each peer speaks.
+    pub peer_activity: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// Seat load 2026-11-13 (S0) — the class each peer key was last resolved
+    /// under (bounded; see [`PEER_CLASS_MAP_CAP`]). Never exported.
+    pub peer_classes: Arc<RwLock<HashMap<String, &'static str>>>,
+    /// Seat load 2026-11-13 (S0) — the class each identified link was booked
+    /// under, so its close counts under the same class. Never exported.
+    pub link_classes: Arc<RwLock<HashMap<[u8; 16], &'static str>>>,
+    /// Seat load 2026-11-13 (S0) — peers whose wire level has been counted
+    /// (once per process). Never exported.
+    pub wire_seen: Arc<RwLock<std::collections::HashSet<String>>>,
     /// CIRISEdge#853 — responder link-up latency by stage (one of the
     /// `LINK_UP_STAGE_*` tokens): from `LinkEstablished` on a link a peer
     /// dialled to the end of that stage's intake. Buckets:
@@ -3361,6 +3816,14 @@ impl EdgeMetrics {
     /// Count one advertise event by its `ADVERTISE_*` label.
     pub fn inc_advertise(&self, label: &'static str) {
         *self.advertise.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// Seat load 2026-11-13 (S0) — add `n` to one `advertise` label (a
+    /// round's row totals are booked once, not per row). Zero adds nothing.
+    pub fn add_advertise(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.advertise.write().entry(label).or_insert(0) += n;
+        }
     }
 
     /// CIRISEdge#971 — count one `replication_reach` event.
@@ -4075,6 +4538,110 @@ impl EdgeMetrics {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Seat load 2026-11-13 (S0) — record the class `peer` resolved under.
+    pub fn set_peer_class(&self, peer: &str, class: &'static str) {
+        let mut map = self.peer_classes.write();
+        if map.len() >= PEER_CLASS_MAP_CAP && !map.contains_key(peer) {
+            map.clear();
+        }
+        map.insert(peer.to_owned(), PEER_CLASSES[peer_class_index(class)]);
+    }
+
+    /// Seat load 2026-11-13 (S0) — the class `peer` was last resolved under,
+    /// `unknown` when none.
+    #[must_use]
+    pub fn peer_class(&self, peer: &str) -> &'static str {
+        self.peer_classes
+            .read()
+            .get(peer)
+            .copied()
+            .unwrap_or("unknown")
+    }
+
+    fn inc_peer_activity(&self, label: &'static str) {
+        *self.peer_activity.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// Seat load 2026-11-13 (S0) — count an initiator round toward `peer`
+    /// that ended in `outcome` (one of [`INITIATOR_OUTCOMES`]).
+    pub fn inc_initiator_round(&self, peer: &str, outcome: &str) {
+        let c = peer_class_index(self.peer_class(peer));
+        if let Some(o) = INITIATOR_OUTCOMES.iter().position(|x| *x == outcome) {
+            self.inc_peer_activity(PEER_ACTIVITY_INITIATOR[c * INITIATOR_OUTCOMES.len() + o]);
+        }
+    }
+
+    /// Seat load 2026-11-13 (S0) — a link identified to `peer`: count it up
+    /// under the peer's class and remember the class for its close.
+    pub fn note_link_identified(&self, link: [u8; 16], peer: &str) {
+        let class = self.peer_class(peer);
+        {
+            let mut map = self.link_classes.write();
+            if map.len() >= PEER_CLASS_MAP_CAP && !map.contains_key(&link) {
+                map.clear();
+            }
+            map.insert(link, class);
+        }
+        self.inc_peer_activity(PEER_ACTIVITY_LINK_UP[peer_class_index(class)]);
+    }
+
+    /// Seat load 2026-11-13 (S0) — an identified link closed under `cause`:
+    /// count it down under the class it came up under. A link never
+    /// identified counts nothing here (its close is still in the
+    /// direction counters).
+    pub fn note_link_closed_class(&self, link: [u8; 16], cause: LinkCloseCause) {
+        let Some(class) = self.link_classes.write().remove(&link) else {
+            return;
+        };
+        let c = peer_class_index(class);
+        self.inc_peer_activity(PEER_ACTIVITY_LINK_DOWN[c * LinkCloseCause::COUNT + cause.index()]);
+    }
+
+    /// Seat load 2026-11-13 (S0) — the first replication frame from `peer`
+    /// in this process: count its wire level once. Returns whether it was
+    /// the first (the caller logs it once).
+    pub fn note_peer_wire(&self, peer: &str, v3: bool) -> bool {
+        {
+            let mut seen = self.wire_seen.write();
+            if seen.contains(peer) {
+                return false;
+            }
+            if seen.len() >= PEER_CLASS_MAP_CAP {
+                seen.clear();
+            }
+            seen.insert(peer.to_owned());
+        }
+        self.inc_peer_activity(PEER_ACTIVITY_WIRE[usize::from(v3)]);
+        true
+    }
+
+    /// Seat load 2026-11-13 (S0) — `peer_activity` by label.
+    #[must_use]
+    pub fn peer_activity(&self) -> HashMap<String, u64> {
+        owned_keys(&self.peer_activity)
+    }
+
+    /// Seat load 2026-11-13 (S0) — add `n` to `replication_io` `(kind, label)`.
+    pub fn add_replication_io(&self, kind: EnvelopeKind, label: &'static str, n: u64) {
+        if n > 0 {
+            *self
+                .replication_io
+                .write()
+                .entry((kind, label))
+                .or_insert(0) += n;
+        }
+    }
+
+    /// Seat load 2026-11-13 (S0) — `replication_io`, keyed `<kind>:<label>`.
+    #[must_use]
+    pub fn replication_io(&self) -> HashMap<String, u64> {
+        self.replication_io
+            .read()
+            .iter()
+            .map(|((kind, label), n)| (format!("{}:{label}", kind.as_wire_str()), *n))
+            .collect()
+    }
+
     /// CIRISEdge#853 — count one responder round lifecycle `outcome` (one of
     /// [`RESPONDER_ROUND_OUTCOMES`]) for `kind`.
     pub fn inc_responder_round(&self, kind: EnvelopeKind, outcome: &'static str) {
@@ -4388,6 +4955,9 @@ impl EdgeMetrics {
                 .read()
                 .snapshot(SWEEP_PERMIT_WAIT_BUCKETS_SECONDS),
             responder_rounds_total: self.responder_rounds_total(),
+            replication_io: self.replication_io(),
+            peer_activity: self.peer_activity(),
+            persist_reads: persist_reads_snapshot(),
             responder_link_up_seconds: self.responder_link_up_seconds(),
             responder_link_up_total: self.responder_link_up_total(),
             recovered_links_total: self.recovered_links_total(),
@@ -4793,6 +5363,19 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#853 — responder round lifecycle, keyed `<kind>:<outcome>`
     /// (outcomes: [`RESPONDER_ROUND_OUTCOMES`]).
     pub responder_rounds_total: HashMap<String, u64>,
+    /// Seat load 2026-11-13 (S0) — replication rows and bytes moved, keyed
+    /// `<kind>:<label>` (labels: [`REPLICATION_IO_LABELS`]).
+    pub replication_io: HashMap<String, u64>,
+    /// Seat load 2026-11-13 (S0) — `peer_activity.<label>`: initiator round
+    /// outcomes and link up/down by peer class, and peers' wire levels.
+    pub peer_activity: HashMap<String, u64>,
+    /// Seat load 2026-11-13 (S0) — persist's read counters by caller, read
+    /// from `ciris_persist::observe::snapshot().callers` at snapshot time:
+    /// `<door>:<caller>.<reads|rows|bytes>`. Only the persist copy linked into
+    /// this binary is read: in a host where the store runs in another
+    /// binary's persist (the two-wheel Python case) it reads that copy's
+    /// counters, not the store's.
+    pub persist_reads: HashMap<String, u64>,
     /// CIRISEdge#853 — responder link-up latency by stage
     /// (`bundle_gate` / `announce_intake` / `owner_binding`).
     pub responder_link_up_seconds: HashMap<String, HistogramSnapshot>,
@@ -5255,6 +5838,9 @@ impl EdgeMetricsBundle {
         );
         // CIRISEdge#853 — the responder's round lifecycle and link-up.
         f.family("responder_rounds_total", &self.responder_rounds_total);
+        f.family("replication_io", &self.replication_io);
+        f.family("peer_activity", &self.peer_activity);
+        f.family("persist_reads", &self.persist_reads);
         let mut link_ups = 0u64;
         for (stage, h) in &self.responder_link_up_seconds {
             link_ups = link_ups.saturating_add(h.count);
@@ -5521,6 +6107,9 @@ edge_metrics_bundle_fields!(
     replication_round_duration_seconds,
     sweep_permit_wait_seconds,
     responder_rounds_total,
+    replication_io,
+    peer_activity,
+    persist_reads,
     responder_link_up_seconds,
     responder_link_up_total,
     recovered_links_total,
@@ -5624,6 +6213,37 @@ mod liveness_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Seat load 2026-11-13 (S0) — **peer activity is counted by class, never
+    /// by key.** A first-contact peer's initiator outcome, a link up and its
+    /// close, and the class map's default for a peer never resolved.
+    #[test]
+    fn peer_activity_is_counted_by_class_seat_load() {
+        let m = EdgeMetrics::new();
+        m.set_peer_class("node-fc", "first_contact");
+        m.inc_initiator_round("node-fc", "not_carriable");
+        m.inc_initiator_round("node-never", "timed_out");
+        m.note_link_identified([7; 16], "node-fc");
+        m.note_link_closed_class([7; 16], LinkCloseCause::Stale);
+        m.note_link_closed_class([8; 16], LinkCloseCause::Stale);
+        let a = m.peer_activity();
+        assert_eq!(a.get("initiator.first_contact.not_carriable"), Some(&1));
+        assert_eq!(a.get("initiator.unknown.timed_out"), Some(&1));
+        assert_eq!(a.get("link_up.first_contact"), Some(&1));
+        assert_eq!(a.get("link_down.first_contact.stale"), Some(&1));
+        assert_eq!(
+            a.values().sum::<u64>(),
+            4,
+            "an unidentified link counts nothing"
+        );
+        assert!(
+            a.keys().all(|k| !k.contains("node-")),
+            "class only, never a key"
+        );
+        let flat = m.snapshot().flatten();
+        assert!(flat.counters.contains_key("peer_activity"));
+        assert!(m.snapshot().persist_reads.values().all(|_| true));
+    }
     use super::*;
     use crate::messages::MessageType;
     use crate::transport::TransportId;

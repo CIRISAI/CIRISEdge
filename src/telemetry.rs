@@ -658,7 +658,7 @@ impl Default for EdgeTelemetry {
 
 /// The `kind` tokens of `ciris.edge.decision_row.unheard`, in
 /// [`DecisionRowKind`](crate::decision_rows::DecisionRowKind)'s order.
-pub const DECISION_ROW_KINDS: [&str; 7] = [
+pub const DECISION_ROW_KINDS: [&str; 9] = [
     "membership_proposal",
     "membership_reply",
     "objection",
@@ -666,6 +666,10 @@ pub const DECISION_ROW_KINDS: [&str; 7] = [
     "moderation_action",
     "accord_halt",
     "contact_request",
+    // persist 61.3.0 (CIRISPersist#1252): a held widening/removal and one
+    // member's cosignature on it.
+    "cosign_pending",
+    "cosign_signature",
 ];
 
 fn kind_slot(kind: EnvelopeKind) -> usize {
@@ -1402,7 +1406,10 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("removal_delivery", "ciris.edge.removal.delivery", Gauge, Count, Some(("state", LabelValues::Tokens)), "Tracked removals: offered, acked, unacked. Rows, not peers."),
     spec("replication_round_duration_seconds", "ciris.edge.round.duration", Histogram, Seconds, KINDS, "Anti-entropy round time, by kind."),
     spec("sweep_permit_wait_seconds", "ciris.edge.sweep.permit_wait", Histogram, Seconds, None, "Time an advertise sweep waited for its permit."),
-    spec("responder_rounds_total", "ciris.edge.responder.rounds", Counter, Count, Some(("outcome", LabelValues::Tokens)), "Responder rounds by `kind:outcome`, including `reply_shed`, `reply_shed_node` and `reply_expired`."),
+    spec("responder_rounds_total", "ciris.edge.responder.rounds", Counter, Count, Some(("outcome", LabelValues::Tokens)), "Responder rounds by `kind:outcome`, including `reply_shed`, `reply_shed_node` and `reply_expired`, and `opened_*` for the message that opened a round (summary, pull, cursor_pull, fetch, deliver, diff)."),
+    spec("peer_activity", "ciris.edge.peer.activity", Counter, Count, Some(("label", LabelValues::Tokens)), "Per peer class (the attestation send-set axis that last resolved the peer, or `unknown`): initiator round outcomes (`initiator.<class>.<outcome>`), links identified and closed (`link_up.<class>`, `link_down.<class>.<cause>`), and each peer's replication frame level once per process (`wire.v3` / `wire.legacy`)."),
+    spec("persist_reads", "ciris.edge.persist.reads", Counter, Count, Some(("label", LabelValues::Tokens)), "persist's read counters by door and caller label (`<door>:<caller>.<reads|rows|bytes>`), from persist's own snapshot: which edge site each store read was made for."),
+    spec("replication_io", "ciris.edge.replication.io", Counter, Count, Some(("label", LabelValues::Tokens)), "Replication rows and envelope bytes moved, by `kind:label`: Deliver rows and bytes in and out (an answer or a proactive push), Summary refs and Diff wants in and out, Pulls in and out."),
     spec("responder_link_up_seconds", "ciris.edge.responder.link_up", Histogram, Seconds, Some(("stage", LabelValues::Tokens)), "Responder link-up time, by stage."),
     spec("responder_link_up_total", "ciris.edge.responder.link_up.outcomes", Counter, Count, Some(("outcome", LabelValues::Closed(&obs::LINK_UP_OUTCOMES))), "Responder link-ups, by outcome."),
     spec("recovered_links_total", "ciris.edge.links.recovered", Counter, Count, None, "Links rebuilt after a lost `LinkEstablished`."),

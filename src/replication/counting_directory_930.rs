@@ -45,6 +45,10 @@ pub(crate) struct CountingDirectory {
     head_gate: Arc<tokio::sync::Semaphore>,
     head_gated: Arc<std::sync::atomic::AtomicBool>,
     head_waiting: Arc<tokio::sync::Notify>,
+    /// CIRISEdge#988 — while set, the next read of each blocking sync method
+    /// answers the ops proxy's fail-closed timeout fallback once (the
+    /// refuse-all policy, depth 0, the unavailable node-key sentinel).
+    sync_fallback_once: Arc<Mutex<std::collections::HashSet<&'static str>>>,
 }
 
 impl CountingDirectory {
@@ -58,6 +62,7 @@ impl CountingDirectory {
             head_gate: Arc::new(tokio::sync::Semaphore::new(0)),
             head_gated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             head_waiting: Arc::new(tokio::sync::Notify::new()),
+            sync_fallback_once: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -101,6 +106,26 @@ impl CountingDirectory {
     pub(crate) fn fail_cursor_reads(&self, fail: bool) {
         self.fail_cursor_reads
             .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// CIRISEdge#988 — the next read of each blocking sync method answers the
+    /// proxy's timeout fallback, once. Its one caller is the binding's
+    /// latch witness, so it exists only where the binding does.
+    #[cfg(feature = "pyo3")]
+    pub(crate) fn time_out_sync_reads_once(&self) {
+        let mut s = self.sync_fallback_once.lock().expect("fallback");
+        s.extend([
+            "node_key_id",
+            "hardware_attestation_policy",
+            "withdraws_delegation_depth",
+        ]);
+    }
+
+    fn sync_falls_back(&self, method: &'static str) -> bool {
+        self.sync_fallback_once
+            .lock()
+            .expect("fallback")
+            .remove(method)
     }
 
     fn cursor_reads_fail(&self) -> bool {
@@ -658,6 +683,831 @@ impl FederationDirectory for CountingDirectory {
     ) -> Result<accord_carriage::AccordEvidenceAdmission, Error> {
         self.hit("apply_replicated_accord_evidence");
         self.inner.apply_replicated_accord_evidence(evidence).await
+    }
+    fn node_key_id(&self) -> Option<String> {
+        self.hit("node_key_id");
+        if self.sync_falls_back("node_key_id") {
+            return Some(ciris_persist::ffi::directory_capsule::NODE_KEY_ID_UNAVAILABLE.to_owned());
+        }
+        self.inner.node_key_id()
+    }
+    fn hardware_attestation_policy(&self) -> Arc<HardwareAttestationPolicy> {
+        self.hit("hardware_attestation_policy");
+        if self.sync_falls_back("hardware_attestation_policy") {
+            return Arc::new(
+                ciris_persist::ffi::directory_capsule::refuse_all_hardware_attestation_policy(),
+            );
+        }
+        self.inner.hardware_attestation_policy()
+    }
+    fn withdraws_delegation_depth(&self) -> usize {
+        self.hit("withdraws_delegation_depth");
+        if self.sync_falls_back("withdraws_delegation_depth") {
+            return 0;
+        }
+        self.inner.withdraws_delegation_depth()
+    }
+    // CIRISEdge#988 / persist 61.3–61.4 — every trait method this double did
+    // not delegate, delegated (taken from the generated KeptDirectory): a
+    // method left to the trait default answers Unsupported here where the
+    // store answers, so a witness over this double tested the default body.
+    async fn add_community_member(
+        &self,
+        community_key_id: &str,
+        member: types::CommunityMember,
+        spec: &cohort::AdmitSpec,
+    ) -> Result<bool, Error> {
+        self.hit("add_community_member");
+        self.inner
+            .add_community_member(community_key_id, member, spec)
+            .await
+    }
+    async fn add_family_member(
+        &self,
+        family_key_id: &str,
+        member: types::FamilyMember,
+        spec: &cohort::AdmitSpec,
+    ) -> Result<bool, Error> {
+        self.hit("add_family_member");
+        self.inner
+            .add_family_member(family_key_id, member, spec)
+            .await
+    }
+    async fn add_member(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        member: cohort::RosterMember,
+        spec: &cohort::AdmitSpec,
+    ) -> Result<bool, Error> {
+        self.hit("add_member");
+        self.inner
+            .add_member(cohort, group_key_id, member, spec)
+            .await
+    }
+    async fn add_peer_record(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        identity_type: &str,
+        transport_identity: Option<String>,
+    ) -> Result<(), Error> {
+        self.hit("add_peer_record");
+        self.inner
+            .add_peer_record(
+                key_id,
+                pubkey_ed25519_base64,
+                identity_type,
+                transport_identity,
+            )
+            .await
+    }
+    async fn adopt_genesis_reanchor(
+        &self,
+        record: SignedKeyRecord,
+        bundle: &genesis::GenesisBundle,
+    ) -> Result<(), Error> {
+        self.hit("adopt_genesis_reanchor");
+        self.inner.adopt_genesis_reanchor(record, bundle).await
+    }
+    async fn adopt_scrub_upgrade(
+        &self,
+        _record: SignedKeyRecord,
+    ) -> Result<register::AdoptScrubOutcome, Error> {
+        self.hit("adopt_scrub_upgrade");
+        self.inner.adopt_scrub_upgrade(_record).await
+    }
+    async fn apply_replicated_attestation(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<attestation_apply::ReplicatedAttestationOutcome, Error> {
+        self.hit("apply_replicated_attestation");
+        self.inner.apply_replicated_attestation(attestation).await
+    }
+    async fn apply_replicated_community(
+        &self,
+        community: types::SignedCommunity,
+    ) -> Result<ReplicatedCommunityOutcome, Error> {
+        self.hit("apply_replicated_community");
+        self.inner.apply_replicated_community(community).await
+    }
+    async fn apply_replicated_key_record(
+        &self,
+        record: SignedKeyRecord,
+    ) -> Result<register::ReplicatedKeyOutcome, Error> {
+        self.hit("apply_replicated_key_record");
+        self.inner.apply_replicated_key_record(record).await
+    }
+    async fn attestation_insert_local_many(
+        &self,
+        inputs: Vec<ciris_persist::federation::types::LocalAttestationInput>,
+    ) -> Result<Vec<String>, Error> {
+        self.hit("attestation_insert_local_many");
+        self.inner.attestation_insert_local_many(inputs).await
+    }
+    async fn attestation_upsert_local_many(
+        &self,
+        inputs: Vec<ciris_persist::federation::types::LocalAttestationInput>,
+    ) -> Result<Vec<String>, Error> {
+        self.hit("attestation_upsert_local_many");
+        self.inner.attestation_upsert_local_many(inputs).await
+    }
+    async fn attestations_binding_content_with_placements(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("attestations_binding_content_with_placements");
+        self.inner
+            .attestations_binding_content_with_placements(content_sha256)
+            .await
+    }
+    fn blackhole_rules_surface(&self) -> Option<&dyn BlackholeRules> {
+        self.hit("blackhole_rules_surface");
+        self.inner.blackhole_rules_surface()
+    }
+    async fn build_membership_change_envelope(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        new_member_key_ids: &[String],
+        entrenched: bool,
+        consensus_protocol: Option<&str>,
+    ) -> Result<serde_json::Value, Error> {
+        self.hit("build_membership_change_envelope");
+        self.inner
+            .build_membership_change_envelope(
+                cohort,
+                group_key_id,
+                new_member_key_ids,
+                entrenched,
+                consensus_protocol,
+            )
+            .await
+    }
+    async fn check_write_cohort_scope_for(
+        &self,
+        writer_occurrence_key_id: &str,
+        write_path: &'static str,
+        claimed_cohort_scope: &str,
+        claimed_target_id: Option<&str>,
+    ) -> Result<(), Error> {
+        self.hit("check_write_cohort_scope_for");
+        self.inner
+            .check_write_cohort_scope_for(
+                writer_occurrence_key_id,
+                write_path,
+                claimed_cohort_scope,
+                claimed_target_id,
+            )
+            .await
+    }
+    async fn compare_stored_witnesses(
+        &self,
+        peer_ids: Option<&[String]>,
+    ) -> Result<ciris_persist::witness::WitnessReconcileAction, Error> {
+        self.hit("compare_stored_witnesses");
+        self.inner.compare_stored_witnesses(peer_ids).await
+    }
+    async fn cosign_alias(&self, attestation_id: &str) -> Result<Option<(String, String)>, Error> {
+        self.hit("cosign_alias");
+        self.inner.cosign_alias(attestation_id).await
+    }
+    async fn cosign_receipt(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Option<cosign::CosignReceipt>, Error> {
+        self.hit("cosign_receipt");
+        self.inner.cosign_receipt(quorum_key).await
+    }
+    async fn delete_legacy_goal(&self, goal_id: &str) -> Result<(), Error> {
+        self.hit("delete_legacy_goal");
+        self.inner.delete_legacy_goal(goal_id).await
+    }
+    async fn drop_cosign_rows(&self, quorum_key: &str) -> Result<u64, Error> {
+        self.hit("drop_cosign_rows");
+        self.inner.drop_cosign_rows(quorum_key).await
+    }
+    fn edge_detection_surface(&self) -> Option<&dyn ciris_persist::derived::EdgeDetectionSink> {
+        self.hit("edge_detection_surface");
+        self.inner.edge_detection_surface()
+    }
+    async fn grant_trust(&self, grant: SignedTrustGrant) -> Result<(), Error> {
+        self.hit("grant_trust");
+        self.inner.grant_trust(grant).await
+    }
+    async fn group_at(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        version: u32,
+    ) -> Result<Option<cohort::GroupVersion>, Error> {
+        self.hit("group_at");
+        self.inner.group_at(cohort, group_key_id, version).await
+    }
+    async fn group_history(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<cohort::GroupVersion>, Error> {
+        self.hit("group_history");
+        self.inner.group_history(cohort, group_key_id).await
+    }
+    async fn group_prior_envelope(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<serde_json::Value, Error> {
+        self.hit("group_prior_envelope");
+        self.inner.group_prior_envelope(cohort, group_key_id).await
+    }
+    async fn heartbeat_shared_instance(
+        &self,
+        lease: &shared_instance::SharedInstanceLease,
+    ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
+        self.hit("heartbeat_shared_instance");
+        self.inner.heartbeat_shared_instance(lease).await
+    }
+    async fn last_witness_epoch_for_peer(&self, peer_id: &str) -> Result<Option<u64>, Error> {
+        self.hit("last_witness_epoch_for_peer");
+        self.inner.last_witness_epoch_for_peer(peer_id).await
+    }
+    async fn legacy_goals(&self) -> Result<Vec<LegacyGoal>, Error> {
+        self.hit("legacy_goals");
+        self.inner.legacy_goals().await
+    }
+    async fn list_cosign_aliases(&self, quorum_key: &str) -> Result<Vec<(String, String)>, Error> {
+        self.hit("list_cosign_aliases");
+        self.inner.list_cosign_aliases(quorum_key).await
+    }
+    async fn list_cosign_signatures(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        self.hit("list_cosign_signatures");
+        self.inner.list_cosign_signatures(quorum_key).await
+    }
+    async fn list_open_cosign_receipts(&self) -> Result<Vec<cosign::CosignReceipt>, Error> {
+        self.hit("list_open_cosign_receipts");
+        self.inner.list_open_cosign_receipts().await
+    }
+    async fn list_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: ciris_persist::read::AttestationFilter,
+        cursor: Option<ciris_persist::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<ciris_persist::read::ScoresPage, Error> {
+        self.hit("list_scores");
+        self.inner
+            .list_scores(caller_occurrence_key_id, filter, cursor, limit)
+            .await
+    }
+    async fn note_cosign_alias(
+        &self,
+        alias_attestation_id: &str,
+        quorum_key: &str,
+        held_attestation_id: &str,
+    ) -> Result<(), Error> {
+        self.hit("note_cosign_alias");
+        self.inner
+            .note_cosign_alias(alias_attestation_id, quorum_key, held_attestation_id)
+            .await
+    }
+    async fn peer_metadata_for(&self, key_id: &str) -> Result<Option<PeerMetadataRow>, Error> {
+        self.hit("peer_metadata_for");
+        self.inner.peer_metadata_for(key_id).await
+    }
+    fn peer_quota_observation(&self) -> Option<replication::admission::PeerQuotaObservation> {
+        self.hit("peer_quota_observation");
+        self.inner.peer_quota_observation()
+    }
+    async fn purge_attestation_projections(&self, attestation_id: &str) -> Result<(), Error> {
+        self.hit("purge_attestation_projections");
+        self.inner
+            .purge_attestation_projections(attestation_id)
+            .await
+    }
+    async fn purge_attestation_v31(&self, attestation_id: &str) -> Result<bool, Error> {
+        self.hit("purge_attestation_v31");
+        self.inner.purge_attestation_v31(attestation_id).await
+    }
+    async fn purge_delete_tombstoned_attestation(
+        &self,
+        attestation_id: &str,
+    ) -> Result<bool, Error> {
+        self.hit("purge_delete_tombstoned_attestation");
+        self.inner
+            .purge_delete_tombstoned_attestation(attestation_id)
+            .await
+    }
+    async fn purge_delete_tombstoned_trace(&self, trace_id: &str) -> Result<(u64, u64), Error> {
+        self.hit("purge_delete_tombstoned_trace");
+        self.inner.purge_delete_tombstoned_trace(trace_id).await
+    }
+    async fn purge_execution(
+        &self,
+        notice_id: &str,
+    ) -> Result<Option<steward_purge::PurgeExecution>, Error> {
+        self.hit("purge_execution");
+        self.inner.purge_execution(notice_id).await
+    }
+    async fn purge_genesis_delegation_row_v31(
+        &self,
+        attestation_id: &str,
+        expected_persist_row_hash: &str,
+        authority: &genesis::bundle::GenesisPurgeAuthority<'_>,
+    ) -> Result<bool, Error> {
+        self.hit("purge_genesis_delegation_row_v31");
+        self.inner
+            .purge_genesis_delegation_row_v31(attestation_id, expected_persist_row_hash, authority)
+            .await
+    }
+    async fn purge_mark_finalized(
+        &self,
+        notice_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error> {
+        self.hit("purge_mark_finalized");
+        self.inner.purge_mark_finalized(notice_id, at).await
+    }
+    async fn purge_put_execution(
+        &self,
+        execution: &steward_purge::PurgeExecution,
+        tombstones: &[steward_purge::PurgeTombstone],
+    ) -> Result<steward_purge::PurgePutOutcome, Error> {
+        self.hit("purge_put_execution");
+        self.inner.purge_put_execution(execution, tombstones).await
+    }
+    async fn purge_scan_attestations(
+        &self,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.hit("purge_scan_attestations");
+        self.inner.purge_scan_attestations(after_id, limit).await
+    }
+    async fn purge_tombstone_notices(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Vec<String>, Error> {
+        self.hit("purge_tombstone_notices");
+        self.inner.purge_tombstone_notices(plane, record_ref).await
+    }
+    async fn purge_tombstoned(
+        &self,
+        plane: &str,
+        record_ref: &str,
+    ) -> Result<Option<String>, Error> {
+        self.hit("purge_tombstoned");
+        self.inner.purge_tombstoned(plane, record_ref).await
+    }
+    async fn purge_tombstones_of(
+        &self,
+        notice_id: &str,
+    ) -> Result<Vec<steward_purge::PurgeTombstone>, Error> {
+        self.hit("purge_tombstones_of");
+        self.inner.purge_tombstones_of(notice_id).await
+    }
+    async fn purge_trace_ids_for_llm_model(&self, model: &str) -> Result<Vec<String>, Error> {
+        self.hit("purge_trace_ids_for_llm_model");
+        self.inner.purge_trace_ids_for_llm_model(model).await
+    }
+    async fn purge_trace_ids_signed_by(&self, key_id: &str) -> Result<Vec<String>, Error> {
+        self.hit("purge_trace_ids_signed_by");
+        self.inner.purge_trace_ids_signed_by(key_id).await
+    }
+    async fn purge_trace_row_counts(&self, trace_ids: &[String]) -> Result<(u64, u64), Error> {
+        self.hit("purge_trace_row_counts");
+        self.inner.purge_trace_row_counts(trace_ids).await
+    }
+    async fn put_attestation(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<AttestationOutcome, Error> {
+        self.hit("put_attestation");
+        self.inner.put_attestation(attestation).await
+    }
+    async fn put_attestation_authored(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<AttestationOutcome, Error> {
+        self.hit("put_attestation_authored");
+        self.inner.put_attestation_authored(attestation).await
+    }
+    async fn put_attestation_synced(
+        &self,
+        attestation: SignedAttestation,
+        authenticated_peer_key_id: &str,
+    ) -> Result<attestation_apply::ReplicatedAttestationOutcome, Error> {
+        self.hit("put_attestation_synced");
+        self.inner
+            .put_attestation_synced(attestation, authenticated_peer_key_id)
+            .await
+    }
+    async fn put_family_local(&self, family: Family) -> Result<(), Error> {
+        self.hit("put_family_local");
+        self.inner.put_family_local(family).await
+    }
+    async fn put_identity_occurrence_local(
+        &self,
+        occurrence: types::IdentityOccurrence,
+    ) -> Result<(), Error> {
+        self.hit("put_identity_occurrence_local");
+        self.inner.put_identity_occurrence_local(occurrence).await
+    }
+    async fn put_identity_occurrence_revocation_local(
+        &self,
+        revocation: types::IdentityOccurrenceRevocation,
+    ) -> Result<(), Error> {
+        self.hit("put_identity_occurrence_revocation_local");
+        self.inner
+            .put_identity_occurrence_revocation_local(revocation)
+            .await
+    }
+    async fn put_lineage_head_cosign(
+        &self,
+        cosign: lineage_witness::LineageHeadCosign,
+    ) -> Result<lineage_witness::LineageCosignOutcome, Error> {
+        self.hit("put_lineage_head_cosign");
+        self.inner.put_lineage_head_cosign(cosign).await
+    }
+    async fn put_touch_claim(
+        &self,
+        claim: &types::SignedTouchClaim,
+    ) -> Result<freshness::TouchApplyOutcome, Error> {
+        self.hit("put_touch_claim");
+        self.inner.put_touch_claim(claim).await
+    }
+    async fn put_wholeness_witness(
+        &self,
+        witness: &ciris_verify_core::substrate::WholenessWitness,
+        sig_ed25519_b64: &str,
+        sig_ml_dsa_65_b64: Option<&str>,
+        pqc_key_id: &str,
+        ed25519_pubkey_b64: &str,
+        ml_dsa_65_pubkey_b64: Option<&str>,
+        disclosed_leaves: Option<&[Vec<u8>]>,
+    ) -> Result<(), Error> {
+        self.hit("put_wholeness_witness");
+        self.inner
+            .put_wholeness_witness(
+                witness,
+                sig_ed25519_b64,
+                sig_ml_dsa_65_b64,
+                pqc_key_id,
+                ed25519_pubkey_b64,
+                ml_dsa_65_pubkey_b64,
+                disclosed_leaves,
+            )
+            .await
+    }
+    async fn read_group_plane_object(
+        &self,
+        link: &group_plane::GroupRowLink,
+    ) -> Result<Option<(group_plane::GroupSigned, Option<String>)>, Error> {
+        self.hit("read_group_plane_object");
+        self.inner.read_group_plane_object(link).await
+    }
+    async fn reap_expired_attestations(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        max_rows: usize,
+    ) -> Result<(usize, usize), Error> {
+        self.hit("reap_expired_attestations");
+        self.inner.reap_expired_attestations(now, max_rows).await
+    }
+    async fn rebuild_signed_wire_index(&self) -> Result<u64, Error> {
+        self.hit("rebuild_signed_wire_index");
+        self.inner.rebuild_signed_wire_index().await
+    }
+    async fn reconcile_peer_witnesses(
+        &self,
+        peer_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ciris_persist::witness::WitnessReconcileAction, Error> {
+        self.hit("reconcile_peer_witnesses");
+        self.inner.reconcile_peer_witnesses(peer_id, now).await
+    }
+    async fn record_announced_peer(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        pubkey_ml_dsa_65_base64: Option<&str>,
+        claimed_identity_type: Option<&str>,
+        last_seen: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        self.hit("record_announced_peer");
+        self.inner
+            .record_announced_peer(
+                key_id,
+                pubkey_ed25519_base64,
+                pubkey_ml_dsa_65_base64,
+                claimed_identity_type,
+                last_seen,
+            )
+            .await
+    }
+    async fn record_canonical_withdrawal(
+        &self,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), Error> {
+        self.hit("record_canonical_withdrawal");
+        self.inner
+            .record_canonical_withdrawal(key_id, superseded_by, authority_decision_digest)
+            .await
+    }
+    async fn record_hard_case(&self, event: hard_case::HardCaseEvent) -> Result<(), Error> {
+        self.hit("record_hard_case");
+        self.inner.record_hard_case(event).await
+    }
+    async fn record_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), Error> {
+        self.hit("record_role_withdrawal");
+        self.inner
+            .record_role_withdrawal(role, key_id, superseded_by, authority_decision_digest)
+            .await
+    }
+    async fn release_shared_instance_lease(
+        &self,
+        lease: &shared_instance::SharedInstanceLease,
+    ) -> Result<(), Error> {
+        self.hit("release_shared_instance_lease");
+        self.inner.release_shared_instance_lease(lease).await
+    }
+    async fn remove_peer_record(
+        &self,
+        key_id: &str,
+        hard: bool,
+        reason: &str,
+        acting_under_delegation_id: Option<&str>,
+    ) -> Result<(), Error> {
+        self.hit("remove_peer_record");
+        self.inner
+            .remove_peer_record(key_id, hard, reason, acting_under_delegation_id)
+            .await
+    }
+    async fn reseal_attestation_v31(&self, resealed: &Attestation) -> Result<bool, Error> {
+        self.hit("reseal_attestation_v31");
+        self.inner.reseal_attestation_v31(resealed).await
+    }
+    async fn resolve_consent_state(
+        &self,
+        target_key_id: &str,
+        subject_key_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<hard_case::ConsentState, Error> {
+        self.hit("resolve_consent_state");
+        self.inner
+            .resolve_consent_state(target_key_id, subject_key_id, now)
+            .await
+    }
+    async fn resolve_content_class_flag(
+        &self,
+        subject_key_id: &str,
+        dimension: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<content_class::ContentClassFlag, Error> {
+        self.hit("resolve_content_class_flag");
+        self.inner
+            .resolve_content_class_flag(subject_key_id, dimension, now)
+            .await
+    }
+    async fn resolve_encryption_keys(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<EncryptionPubkeys>, Error> {
+        self.hit("resolve_encryption_keys");
+        self.inner.resolve_encryption_keys(occurrence_key_id).await
+    }
+    async fn resolve_scoped_consent(
+        &self,
+        target_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+        qualifier: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<hard_case::ConsentState, Error> {
+        self.hit("resolve_scoped_consent");
+        self.inner
+            .resolve_scoped_consent(target_key_id, subject_key_id, scope, qualifier, now)
+            .await
+    }
+    async fn resolve_scoped_stance(
+        &self,
+        target_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+        qualifier: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<consent::ScopedStance, Error> {
+        self.hit("resolve_scoped_stance");
+        self.inner
+            .resolve_scoped_stance(target_key_id, subject_key_id, scope, qualifier, now)
+            .await
+    }
+    async fn resolve_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: ciris_persist::read::AttestationFilter,
+        policy: String,
+        trace: bool,
+    ) -> Result<ciris_persist::read::ComposedVerdict, Error> {
+        self.hit("resolve_scores");
+        self.inner
+            .resolve_scores(caller_occurrence_key_id, filter, policy, trace)
+            .await
+    }
+    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error> {
+        self.hit("revocations_for");
+        self.inner.revocations_for(revoked_key_id).await
+    }
+    async fn revoke_member(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        removed_key_id: &str,
+        spec: cohort::RevokeSpec,
+    ) -> Result<(), Error> {
+        self.hit("revoke_member");
+        self.inner
+            .revoke_member(cohort, group_key_id, removed_key_id, spec)
+            .await
+    }
+    async fn revoke_trust(&self, revocation: SignedTrustRevocation) -> Result<(), Error> {
+        self.hit("revoke_trust");
+        self.inner.revoke_trust(revocation).await
+    }
+    async fn run_consent_sla_watch(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        promotion_window: std::time::Duration,
+    ) -> Result<hard_case::ConsentWatchReport, Error> {
+        self.hit("run_consent_sla_watch");
+        self.inner
+            .run_consent_sla_watch(now, promotion_window)
+            .await
+    }
+    async fn settle_cosign_receipt(
+        &self,
+        quorum_key: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        self.hit("settle_cosign_receipt");
+        self.inner
+            .settle_cosign_receipt(quorum_key, outcome, settled_at)
+            .await
+    }
+    async fn supersede_affiliations(
+        &self,
+        new: types::SignedCommunity,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, Error> {
+        self.hit("supersede_affiliations");
+        self.inner.supersede_affiliations(new, authorization).await
+    }
+    async fn supersede_affiliations_with_quorum(
+        &self,
+        new: types::SignedCommunity,
+        change_envelope: serde_json::Value,
+        signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+    ) -> Result<u32, Error> {
+        self.hit("supersede_affiliations_with_quorum");
+        self.inner
+            .supersede_affiliations_with_quorum(new, change_envelope, signatures)
+            .await
+    }
+    async fn supersede_community(
+        &self,
+        new: types::SignedCommunity,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, Error> {
+        self.hit("supersede_community");
+        self.inner.supersede_community(new, authorization).await
+    }
+    async fn supersede_community_with_quorum(
+        &self,
+        new: types::SignedCommunity,
+        change_envelope: serde_json::Value,
+        signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+    ) -> Result<u32, Error> {
+        self.hit("supersede_community_with_quorum");
+        self.inner
+            .supersede_community_with_quorum(new, change_envelope, signatures)
+            .await
+    }
+    async fn supersede_family(
+        &self,
+        new: types::SignedFamily,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, Error> {
+        self.hit("supersede_family");
+        self.inner.supersede_family(new, authorization).await
+    }
+    async fn supersede_family_with_quorum(
+        &self,
+        new: types::SignedFamily,
+        change_envelope: serde_json::Value,
+        signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+    ) -> Result<u32, Error> {
+        self.hit("supersede_family_with_quorum");
+        self.inner
+            .supersede_family_with_quorum(new, change_envelope, signatures)
+            .await
+    }
+    async fn swap_member(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        out_key_id: &str,
+        in_member: cohort::RosterMember,
+        revoke_spec: cohort::RevokeSpec,
+        admit_spec: &cohort::AdmitSpec,
+    ) -> Result<bool, Error> {
+        self.hit("swap_member");
+        self.inner
+            .swap_member(
+                cohort,
+                group_key_id,
+                out_key_id,
+                in_member,
+                revoke_spec,
+                admit_spec,
+            )
+            .await
+    }
+    async fn try_acquire_shared_instance(
+        &self,
+        instance_name: &str,
+        owner_pid: i32,
+        owner_hostname: &str,
+        stale_after: Option<std::time::Duration>,
+    ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
+        self.hit("try_acquire_shared_instance");
+        self.inner
+            .try_acquire_shared_instance(instance_name, owner_pid, owner_hostname, stale_after)
+            .await
+    }
+    async fn update_peer_alias(&self, key_id: &str, alias: Option<String>) -> Result<(), Error> {
+        self.hit("update_peer_alias");
+        self.inner.update_peer_alias(key_id, alias).await
+    }
+    async fn update_peer_notes(&self, key_id: &str, notes: Option<String>) -> Result<(), Error> {
+        self.hit("update_peer_notes");
+        self.inner.update_peer_notes(key_id, notes).await
+    }
+    async fn update_peer_policy(&self, key_id: &str, policy: PeerPolicyBlob) -> Result<(), Error> {
+        self.hit("update_peer_policy");
+        self.inner.update_peer_policy(key_id, policy).await
+    }
+    async fn update_peer_trust(&self, key_id: &str, trust: TrustClass) -> Result<(), Error> {
+        self.hit("update_peer_trust");
+        self.inner.update_peer_trust(key_id, trust).await
+    }
+    async fn verify_membership_quorum(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        change_envelope: &serde_json::Value,
+        signatures: &[ciris_verify_core::threshold::ThresholdSignature],
+    ) -> Result<(), Error> {
+        self.hit("verify_membership_quorum");
+        self.inner
+            .verify_membership_quorum(cohort, group_key_id, change_envelope, signatures)
+            .await
+    }
+    async fn vote_window_first_held(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error> {
+        self.hit("vote_window_first_held");
+        self.inner.vote_window_first_held(action_id).await
+    }
+    async fn widen_audience(
+        &self,
+        prior_attestation_id: &str,
+        ci: &crossing::ContextualIntegrity,
+        signed: SignedAttestation,
+    ) -> Result<crossing::MeshCrossingOutcome, Error> {
+        self.hit("widen_audience");
+        self.inner
+            .widen_audience(prior_attestation_id, ci, signed)
+            .await
+    }
+    async fn withdraws_admission_depth(
+        &self,
+        attestation_id: &str,
+    ) -> Result<Option<usize>, Error> {
+        self.hit("withdraws_admission_depth");
+        self.inner.withdraws_admission_depth(attestation_id).await
     }
     fn as_dyn_directory(&self) -> &dyn FederationDirectory {
         self

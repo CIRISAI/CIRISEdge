@@ -2,6 +2,160 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.0 — 2026-11-13
+
+**MINOR. The long-term support line** for a mesh of at most 100 nodes, until the persist v62
+refactor lands. Pins: persist **v61.4.0** (tag 0568ebf3, exact, Python too: `ciris-persist==61.4.0`),
+CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. After this tag the line takes bug fixes only.
+
+### Consumer notes
+
+- **The persist requirement is `ciris-persist==61.4.0`.** Capsules are named for the persist
+  build; a 61.2.x or 61.3.0 wheel is refused at `init_edge_runtime` with `capsule_version_skew`.
+  Persist 61.3.0 and 61.4.0 add migrations V214 (`federation_cosign_pending`,
+  `federation_cosign_signatures`, `federation_cosign_aliases`) and V215 (the alias table indexed
+  by the held row); they run at the first open.
+- **Init refuses a persist that lacks the ops capsules.** Every store view edge holds (verify,
+  rooting, blackhole, edge-detection, the outbound queue) is built from persist's
+  `directory_ops_capsule` / `outbound_queue_ops_capsule`; the raw `outbound_queue_capsule` is no
+  longer read and `runtime_handle_capsule` is checked for presence only, never unwrapped.
+- **The responder's completion line reads `refused: N, duplicate: D, rejected: R`.** `refused`
+  keeps its old meaning (refusals and duplicates) for this release, because hosts parse it;
+  `rejected` is the real refusals. `RoundReport` and the applied outcomes gain `duplicate`.
+- **New counters (seat load).** All in `metrics_snapshot()` and docs/TELEMETRY_CATALOGUE.md:
+  `advertise.rows.<class>.<outcome>`, `responder_rounds_total.<kind>:opened_<message>`,
+  `replication_io.<kind>:<label>` (rows and bytes per plane, in and out) with
+  `first_sync_complete`, `peer_activity.initiator.<class>.<outcome>`,
+  `peer_activity.link_up.<class>` / `link_down.<class>.<cause>`, `peer_activity.wire.{v3,legacy}`,
+  `persist_reads.<door>:<caller>.<reads|rows|bytes>`, `holdings_index.<plane>.duplicate_from_index`,
+  `holdings_index.held_equivalent.forgotten`, and `decision_row_unheard_total` gains
+  `cosign_pending` and `cosign_signature`.
+- **`persist_reads` is complete only in a single binary.** In a host that links edge and persist
+  into one binary (ciris-server) every store read is counted under edge's site label. Across two
+  Python wheels, edge's snapshot reads the counters of edge's own copy of persist: it shows only
+  the reads counted on edge's side of the capsule (the typed attestation query, under its label,
+  e.g. `attestation_query:edge.first_contact`); reads counted inside persist's wheel stay in the
+  wheel's counters, unlabelled, until CIRISPersist#1270.
+- **No seat CPU saving is claimed.** Production windows on 2026-11-13 could not separate any
+  planned fix's CPU effect from zero; seat CPU follows link count. This release ships the counters
+  that measure it; measurement follows.
+
+### Fixed
+
+- **Two-wheel hang (CIRISEdge#988).** With persist and edge installed as two Python wheels, each
+  `.so` links its own `parking_lot`, which keeps parked threads in a per-binary table. Edge ran its
+  own compiled copy of persist's store code on the wheel's backend (a concrete `SqliteBackend`
+  lifted from `outbound_queue_capsule`), so a waiter one binary parked on the SQLite writer was
+  never woken by the other's unlock: the first `dispatch_inbound_bytes` hung for good, in either
+  direction. Every store call now runs inside persist's library through the ops proxy
+  (CIRISPersist#1227, #1244). `tests/no_concrete_persist_in_binding.rs` holds the binding to zero
+  concrete persist references; tools/two_wheel_lock_witness.sh and
+  tools/scenarios/cohab_store_lock_contention.py drive the two wheels side by side.
+  Measured (store-lock witness; 8-wide reproduction):
+
+  | build | witness | reproduction |
+  |---|---|---|
+  | v45.0.2 + persist 61.2.3 (before) | 12 of 12 runs failed | 9 of 320 runs hung |
+  | this branch, local wheels (edge 1eaa021, persist 61.4.0 from 4ca2a28b) | 80 of 80 passed | 0 of 320 hung |
+  | edge bcfdaff + persist 61.4.0 tag-CI wheel (sha256 4e507375…5f9c) | 20 of 20 passed | 0 of 80 hung |
+
+  A two-node Reticulum scenario over the two wheels (tools/scenarios/cohab_reticulum_two_node.py)
+  passed 20 of 20, with the rooting writes and the blackhole read on send traced through the proxy.
+- **Persist trust reads no longer fail open through the proxy (CIRISPersist#1268).** At 61.4.0 the
+  halt, withdrawal, audience, hardware-policy, key-grant, purge, roster and cosign-alias reads are
+  ops; none answers a trait default through the capsule.
+- **A read persist answers with its timeout fallback is never kept.** `node_key_id`,
+  `hardware_attestation_policy` and `withdraws_delegation_depth` block one host round trip through
+  the proxy (30 s bound, fail-closed). Edge latches the first real answer and never latches the
+  fallback (`NODE_KEY_ID_UNAVAILABLE`, the refuse-all policy, depth 0); a node key registered after
+  init is read when it lands (CIRISPersist#1269 is the v62 fix on persist's side).
+- **An unheard `cosign_pending` decision row was counted as `membership_proposal`.** The kind list
+  now carries both cosign kinds; a test checks every kind lands in its own slot.
+
+### Changed: persist #1252 (quorum rooms widen and remove inside the mesh)
+
+- **Cosign rows are decision rows.** `cosign:pending:` and `cosign:signature:` reach the room's
+  members as `DecisionRowKind::CosignPending` / `CosignSignature`, scoped by the held row, keyed
+  by the quorum key.
+- **One act, one ref.** An attestation's content hash is persist's wire hash; holdings are written
+  under the act's ref and remembered under the plain ref too, so an act offered under another
+  ref (a 61.2 peer's old hash) is wanted once and then answered as held (`HeldEquivalent`).
+- **A `withdraws` that arrives before its target parks on the row** (`row:<attestation_id>`) and
+  is released when the target lands, by replication, as a duplicate, or by a local write.
+
+### Changed: replication on the seat
+
+- **A Duplicate of a ref the holdings set lacks is remembered as held** (Attestation plane), so it
+  is not wanted again every round; an audit that finds a held hash gone forgets the remembered refs.
+- **Bytes a Ready holdings index holds are a Duplicate without a persist call**: long-lived peers
+  that re-push rows the seat withholds from them cost a hash lookup.
+- **An initiator does not deliver twice in one round**: the Diff that rode beside our own push no
+  longer asks for what we pushed, so a fresh node's first round applies each row once.
+
+### Paths the two-wheel fix covers, and two it does not exercise at wheel level
+
+Every store view runs through the ops proxy. Two paths are routed but not driven by a wheel-level
+test: the edge-detection writer (`put_edge_detection_event`) is unreachable from the Python binding,
+because the probe observer is off with no switch there (the route stays for single-binary hosts,
+which can enable it); and the sealed link, so nothing past the handshake (frames, replication):
+two fresh loopback nodes hold no signed route row of their own with a transit pair, so every
+pre-seal route fetch is answered `route_unavailable` and no link seals. The 20 two-wheel Reticulum
+runs above gave both nodes one all-zero transport identity, so neither rooted the other; with a
+transport identity each (the mixed runs below), each node roots the other.
+
+### Mixed versions
+
+- **In the release suite** (lib tests, on the merged head), the named mixed-version leg ran 9
+  tests: `an_act_offered_under_another_ref_is_wanted_once_1252` (three idle diffs against a 61.2
+  peer's old refs read no store page), `cosign_rows_are_decision_rows_on_their_room_1252`,
+  `a_cosigned_row_is_held_under_its_act_ref_1252`,
+  `a_withdraws_waits_for_its_target_and_lands_after_it_1252`,
+  `a_stale_route_is_fetched_once_not_every_round_971`,
+  `a_route_leaving_the_index_ends_every_stale_mark_971`,
+  `the_mark_past_the_cap_evicts_the_oldest_once_971`,
+  `a_duplicate_of_an_unheld_ref_is_not_wanted_again_seat_load` and
+  `a_re_pushed_held_row_costs_no_persist_call_seat_load`. The transport tests that answer as an
+  old peer (`answer_off_like_an_old_peer_for_test`, `set_old_peer_for_test`) ran in the lib groups,
+  not in that leg.
+- **Against the released v45.0.2** (tools/scenarios/cohab_reticulum_two_node.py, two processes on
+  loopback, 5 runs): node A the v45.0.2 release wheel (sha256 cc1b9e89…61ef7, checked against the
+  release's SHA256SUMS) on persist 61.2.3, node B this release on the persist 61.4.0 tag-CI wheel;
+  the control ran both nodes on this release (5 runs). Both nodes started in every run. B rooted A
+  and opened outbound links in 5 of 5; A reported in 3 runs and rooted B and opened outbound links
+  in 2 of them (in the third it rooted nothing and opened no link). No link sealed in either set
+  (above), so no frame crossed and no replication round ran: the scenario cannot drive replication
+  between fresh nodes, and no rows were applied, duplicated or refused. The v45.0.2 node failed in
+  every mixed run: its persist reader stalled (exit 3) in 2, and in the other 3 its edge answered
+  nothing during the quiet minute while B's route requests to it timed out
+  (`link_seal_refused_route_timeout`, 6–8 in each of those 3 runs, the one refusal class B showed
+  that the control did not). With both nodes on v45.0.2 (5 runs) a node stalled or hung in 5 of 5.
+  No node of this release failed in any run. That is v45.0.2's own two-wheel hang (CIRISEdge#988),
+  not an interaction between the versions; single-binary hosts (ciris-server) are not exposed to
+  it.
+
+### Deliberately out (designs kept for after the v62 refactor)
+
+The held-inert store (rows refused for a missing key or binding), the shared first-contact history
+page, the key-plane memo rebuild fix, the push filter (F3), and the narrowed first-contact read
+(needs CIRISPersist#1270 `by_types`).
+
+### Not run locally
+
+- `libcrux_cross_version_822` (0 run, 4 ignored): a cross-build witness for CIRISEdge#822 whose
+  four stages need fixtures from a build against the OTHER lock. It runs only when the file is built
+  twice (pre-#822 lock and fork) and the stages run `--ignored` in order over one `CIRIS_822_DIR`.
+  Nothing here touches openmls or libcrux.
+- The Android PyO3 variant (needs CI's libpython stub link) and iOS (no Apple toolchain); CI
+  builds both at the tag.
+
+### Also
+
+- deny ignores three more hickory DNSSEC-validation advisories (RUSTSEC-2026-0530/0531/0532), on
+  the same grounds as v45.0.2's.
+- A guard (`tools/gen_kept_directory.py --check`, `--check-doubles`, run by
+  `tests/kept_directory_current.rs`) fails a persist bump that adds a trait method the kept
+  directory or a test double does not delegate.
+
 ## 45.0.2 — 2026-11-12
 
 **PATCH.** Pins: persist **v61.2.3** (9873c0f4), CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3.

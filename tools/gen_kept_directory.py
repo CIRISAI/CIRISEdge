@@ -40,6 +40,60 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "src" / "ffi" / "kept_directory.rs"
 
 
+# CIRISEdge#988 — the trait's BLOCKING sync methods. Through persist's ops
+# proxy each is a round trip on persist's runtime that blocks its caller (and
+# answers a fail-closed fallback after 30 s), and persist's code compiled into
+# edge calls them from async bodies, i.e. on runtime workers. Each is answered
+# by a latch: a value read through the proxy is kept for the process, EXCEPT
+# the proxy's fail-closed fallback (and, for the node key, None), which is
+# never kept: the next use reads again, failing closed meanwhile.
+#
+# (name, value type, latch type, `is_kept(&value)` expression, latch→value)
+#  - node_key_id: the value only moves None → Some(k), and k is the Engine's
+#    own signer-derived key on every route persist sets it by (registration,
+#    engine.rs:3221; the lazy fills :1458/:8351), so a kept Some never goes
+#    stale; None (a first-run node before registration, which persist reads
+#    as "no audience check", CIRISPersist#1269) and the timeout sentinel are
+#    never kept.
+#  - hardware_attestation_policy / withdraws_delegation_depth: set only on a
+#    concrete backend before the host builds its Engine (no Engine or Python
+#    setter), so stable for the process; the timeout fallbacks (the
+#    refuse-all policy, depth 0) are never kept.
+LATCHED_SYNC = [
+    (
+        "node_key_id",
+        "Option<String>",
+        "String",
+        "v.as_deref().filter(|k| *k != ciris_persist::ffi::directory_capsule::NODE_KEY_ID_UNAVAILABLE).map(str::to_owned)",
+        "Some(k.clone())",
+    ),
+    (
+        "hardware_attestation_policy",
+        "std::sync::Arc<HardwareAttestationPolicy>",
+        "std::sync::Arc<HardwareAttestationPolicy>",
+        "(*v != ciris_persist::ffi::directory_capsule::refuse_all_hardware_attestation_policy()).then(|| std::sync::Arc::clone(&v))",
+        "std::sync::Arc::clone(k)",
+    ),
+    (
+        "withdraws_delegation_depth",
+        "usize",
+        "usize",
+        "(v != 0).then_some(v)",
+        "*k",
+    ),
+]
+
+# Sync methods the ops proxy answers without crossing the capsule (it returns
+# itself, a reference, or the trait default): delegated live.
+PURE_SYNC = {
+    "as_dyn_directory",
+    "blackhole_rules_surface",
+    "edge_detection_surface",
+    "peer_quota_observation",
+    "trust_root_standing_cache",
+}
+
+
 def load_persist_generator(persist: Path):
     script = persist / "scripts" / "gen_directory_double.py"
     spec = importlib.util.spec_from_file_location("persist_gen", script)
@@ -120,8 +174,17 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
     A("/// `inner` (persist's directory-ops proxy) and the capsules its copies point")
     A("/// into. Dropping the last clone releases the capsules; nothing else holds")
     A("/// them on edge's behalf.")
+    A("///")
+    A("/// The trait's blocking SYNC reads are answered by latches (see the")
+    A("/// generator's `LATCHED_SYNC`): a value read through the proxy is kept for")
+    A("/// the process, except the proxy's fail-closed fallback (and an absent node")
+    A("/// key), which is never kept, so the next use reads again. Each latch is")
+    A("/// tried once in [`Self::new`] (init, the host's thread), so in the steady")
+    A("/// state no runtime worker blocks on a sync read.")
     A("pub(crate) struct KeptDirectory {")
     A("    inner: Arc<dyn FederationDirectory>,")
+    for name, _ty, latch, _k, _v in LATCHED_SYNC:
+        A(f"    {name}: std::sync::OnceLock<{latch}>,")
     A("    _executor: Arc<crate::ffi::pyo3::KeptExecutor>,")
     A("    _capsule: pyo3::Py<pyo3::PyAny>,")
     A("}")
@@ -132,7 +195,16 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
     A("        executor: Arc<crate::ffi::pyo3::KeptExecutor>,")
     A("        capsule: pyo3::Py<pyo3::PyAny>,")
     A("    ) -> Self {")
-    A("        Self { inner, _executor: executor, _capsule: capsule }")
+    A("        let kept = Self {")
+    A("            inner,")
+    for name, *_ in LATCHED_SYNC:
+        A(f"            {name}: std::sync::OnceLock::new(),")
+    A("            _executor: executor,")
+    A("            _capsule: capsule,")
+    A("        };")
+    for name, *_ in LATCHED_SYNC:
+        A(f"        let _ = FederationDirectory::{name}(&kept);")
+    A("        kept")
     A("    }")
     A("}")
     A("")
@@ -168,6 +240,26 @@ def render(gen, methods, sync: set[str], anchored: set[str] = frozenset()) -> st
         if name in anchored:
             A("    // persist compiles this method only under `test` or `test-anchor`.")
             A('    #[cfg(feature = "test-anchor")]')
+        latched = {l[0]: l for l in LATCHED_SYNC}
+        if name in latched:
+            _n, _ty, _latch, kept_expr, value_of = latched[name]
+            A(f"    fn {name}({arglist}) -> {ret} {{")
+            A("        // Kept once read; the proxy's fail-closed fallback is never kept, so")
+            A("        // a slow first round trip does not stick for the process.")
+            if name == "node_key_id":
+                A("        // The value only moves None -> Some(k), and k is the Engine's own")
+                A("        // signer-derived key on every route persist sets it by, so a kept")
+                A("        // Some never goes stale; None is never kept (CIRISPersist#1269).")
+            A(f"        if let Some(k) = self.{name}.get() {{")
+            A(f"            return {value_of};")
+            A("        }")
+            A(f"        let v = self.inner.{name}({call});")
+            A(f"        match {kept_expr} {{")
+            A(f"            Some(keep) => {{ let k = self.{name}.get_or_init(|| keep); {value_of} }}")
+            A("            None => v,")
+            A("        }")
+            A("    }")
+            continue
         if name in sync:
             A(f"    fn {name}({arglist}) -> {ret} {{")
             A(f"        self.inner.{name}({call})")
@@ -214,22 +306,91 @@ def pinned_persist_src() -> Path:
     return Path(pkgs[0]["manifest_path"]).parent
 
 
+def impl_blocks(trait: str):
+    """Every `impl ... <trait> for <Type>` block in src/ and tests/, as
+    (path, type, set of method names defined at the block's top level)."""
+    import re
+
+    out = []
+    for path in sorted(list((ROOT / "src").rglob("*.rs")) + list((ROOT / "tests").rglob("*.rs"))):
+        text = path.read_text()
+        for m in re.finditer(
+            r"impl(?:<[^>]*>)?\s+(?:[A-Za-z_:]+::)?" + trait + r"\s+for\s+([A-Za-z_0-9]+)\s*\{",
+            text,
+        ):
+            i, depth = m.end(), 1
+            body_start = i
+            while depth and i < len(text):
+                c = text[i]
+                depth += (c == "{") - (c == "}")
+                i += 1
+            body = text[body_start : i - 1]
+            # Methods at the block's own depth only.
+            d, names, j = 0, set(), 0
+            for fm in re.finditer(r"[{}]|\b(?:async\s+)?fn\s+([a-z0-9_]+)\s*[<(]", body):
+                tok = fm.group(0)
+                if tok == "{":
+                    d += 1
+                elif tok == "}":
+                    d -= 1
+                elif d == 0:
+                    names.add(fm.group(1))
+            out.append((path.relative_to(ROOT), m.group(1), names))
+    return out
+
+
+def check_doubles(methods) -> int:
+    """CIRISEdge#988 — every implementor of persist's `FederationDirectory` in
+    this tree defines EVERY trait method, so no caller can reach a trait
+    default body through it: a default answers `Unsupported` (or a
+    plausible empty) where the store would answer, and a witness over the
+    double then tests the default. Fails naming each double and the methods
+    it lacks."""
+    want = {name for name, _args, _ret in methods}
+    bad = 0
+    blocks = impl_blocks("FederationDirectory")
+    for path, ty, names in blocks:
+        missing = sorted(want - names)
+        extra = sorted(names - want)
+        if missing:
+            bad += 1
+            print(f"MISSING: {path} impl FederationDirectory for {ty} lacks {len(missing)}: {', '.join(missing)}")
+        if extra:
+            bad += 1
+            print(f"EXTRA: {path} impl FederationDirectory for {ty} defines non-trait methods: {', '.join(extra)}")
+        if not missing and not extra:
+            print(f"OK {path} {ty}: {len(names)}/{len(want)}")
+    if not blocks:
+        print("no FederationDirectory implementor found: the scan is broken")
+        return 1
+    return bad
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--persist-src", type=Path)
     src.add_argument("--from-cargo-metadata", action="store_true")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--check-doubles", action="store_true")
     a = ap.parse_args()
     if a.from_cargo_metadata:
         a.persist_src = pinned_persist_src()
     gen = load_persist_generator(a.persist_src)
     methods = methods_of(gen, a.persist_src)
+    if a.check_doubles:
+        sys.exit(1 if check_doubles(methods) else 0)
+    sync = sync_methods(gen, a.persist_src)
+    known = {l[0] for l in LATCHED_SYNC} | PURE_SYNC
+    if sync != known:
+        # A new sync method would be delegated live: a blocking round trip on
+        # whatever thread calls it. Decide how it is answered, then list it.
+        sys.exit(f"the trait's sync methods changed: {sorted(sync)} != LATCHED_SYNC + PURE_SYNC {sorted(known)}")
     text = rustfmt(
         render(
             gen,
             methods,
-            sync_methods(gen, a.persist_src),
+            sync,
             test_anchor_methods(a.persist_src),
         )
     )

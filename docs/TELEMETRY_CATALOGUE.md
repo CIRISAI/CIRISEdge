@@ -313,6 +313,9 @@ to it, and a 1 is not visible from anywhere else.
 | `replication_round_duration_seconds` | `ciris.edge.round.duration` | histogram | seconds | operator-only |
 | `sweep_permit_wait_seconds` | `ciris.edge.sweep.permit_wait` | histogram | seconds | operator-only |
 | `responder_rounds_total` | `ciris.edge.responder.rounds` | counter | count | operator-only |
+| `peer_activity` | `ciris.edge.peer.activity` | counter | count | operator-only |
+| `persist_reads` | `ciris.edge.persist.reads` | counter | count | operator-only |
+| `replication_io` | `ciris.edge.replication.io` | counter | count | operator-only |
 | `responder_link_up_seconds` | `ciris.edge.responder.link_up` | histogram | seconds | operator-only |
 | `responder_link_up_total` | `ciris.edge.responder.link_up.outcomes` | counter | count | operator-only |
 | `recovered_links_total` | `ciris.edge.links.recovered` | counter | count | operator-only |

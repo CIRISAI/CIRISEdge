@@ -722,7 +722,7 @@ pub(crate) fn is_not_in_audience_refusal(outcome: &ApplyOutcome) -> bool {
 }
 
 /// The park key of a group's audience.
-fn audience_group_key(group_key_id: &str) -> String {
+pub(super) fn audience_group_key(group_key_id: &str) -> String {
     format!("audience:group:{group_key_id}")
 }
 
@@ -746,6 +746,12 @@ fn group_of_row(row: &Attestation) -> Option<String> {
     if let Ok(Some(signed)) = ciris_persist::federation::group_plane::group_signed_of_row(row) {
         return Some(signed.group_key_id().to_owned());
     }
+    // persist 61.3.0 (CIRISPersist#1252) — a `cosign:*` row carries its event
+    // (and so its group) inside its own member: a row refused `not_in_audience`
+    // waits on that group, and the group's membership rows release it.
+    if let Ok(Some(read)) = ciris_persist::federation::cosign::read_row(row) {
+        return Some(read.event.group_key_id().to_owned());
+    }
     ["community_key_id", "family_key_id"].iter().find_map(|m| {
         row.attestation_envelope
             .get(*m)
@@ -757,7 +763,7 @@ fn group_of_row(row: &Attestation) -> Option<String> {
 /// persist v61 S2 (#1148) — what a row refused `not_in_audience` waits on, most
 /// specific first: the group it is placed at, then its attester's owner axis.
 /// The park takes the first.
-fn audience_gate_keys(bytes: &[u8]) -> Vec<String> {
+pub(super) fn audience_gate_keys(bytes: &[u8]) -> Vec<String> {
     let Some(row) = row_of_wire(bytes) else {
         return Vec::new();
     };
@@ -865,8 +871,16 @@ fn attestation_outcome_to_apply(
     };
     match outcome {
         O::Inserted => (ApplyOutcome::Admitted, None),
+        // persist 61.3.0 (#1252): `HeldEquivalent` is the same verdict as a
+        // re-offer, ON PURPOSE: this node holds the same ACT under another row
+        // (an assembled widening/removal with another sufficient subset of
+        // cosignatures, other randomised ML-DSA bytes, or the same signer's
+        // other `cosign:*` signature), nothing was written and no refusal is
+        // booked. The one thing that differs, remembering the offered ref as
+        // held, the caller does before mapping (`note_if_held_equivalent`).
         O::Unchanged
         | O::Deduplicated
+        | O::HeldEquivalent
         | O::Refused {
             reason: R::AlreadyPresentIdentical,
         } => (ApplyOutcome::Duplicate, None),
@@ -3024,6 +3038,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// same verdict once per peer and keep paying for it once per peer, which is
     /// the amplification the issue measured.
     refusal_backoff: RefusalBackoff,
+    /// persist 61.3.0 (CIRISPersist#1252) — refs a peer offered for content
+    /// this node holds under another ref (a 61.2 peer's old hash of an
+    /// assembled cosigned row, another subset's bytes, another ML-DSA draw of
+    /// a cosign signature row). Taken out of every receive diff.
+    held_equivalent: super::wire_ref::HeldEquivalentRefs,
     /// CIRISEdge#971 — the STALE-ROUTE marks: a replicated route older than the
     /// one this node holds for the same `(occurrence_key_id, transport_kind)`.
     /// Its own memory, apart from [`Self::refusal_backoff`], because the stale
@@ -3374,6 +3393,7 @@ impl FederationDirectoryReplicationBridge {
             // this node just refused, not a policy, so there is no configuration
             // in which asking flat-out is the right answer.
             refusal_backoff: RefusalBackoff::new(),
+            held_equivalent: super::wire_ref::HeldEquivalentRefs::default(),
             stale_routes: RefusalBackoff::with_capacities(STALE_ROUTE_MARKS, 1),
             #[cfg(test)]
             probes: TestProbes::default(),
@@ -4334,7 +4354,7 @@ impl FederationDirectoryReplicationBridge {
         content_of: C,
     ) -> Vec<EnvelopeRef>
     where
-        T: serde::Serialize,
+        T: serde::Serialize + 'static,
         Read: Fn(Option<ResumeCursor>, u32) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<S>, SweepReadError>>,
         RS: Fn(&S) -> ResumeCursor,
@@ -5052,22 +5072,31 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// Falls back to [`super::summary::diff_refs`] over the drain exactly where
     /// [`Self::list_holdings`] does.
     async fn holdings_want(&self, kind: EnvelopeKind, remote: &[EnvelopeRef]) -> Vec<[u8; 32]> {
-        self.refresh_serve_tier().await;
-        match self.holdings_from_index(kind).await {
-            HoldingsAnswer::Set(plane) => match self.holdings_index.want(plane, remote) {
-                Ok(want) => {
-                    self.note_holdings_answer(plane, true);
-                    return want;
+        let want = async {
+            self.refresh_serve_tier().await;
+            match self.holdings_from_index(kind).await {
+                HoldingsAnswer::Set(plane) => match self.holdings_index.want(plane, remote) {
+                    Ok(want) => {
+                        self.note_holdings_answer(plane, true);
+                        return want;
+                    }
+                    Err(not_ready) => self.note_holdings_fallback(plane, not_ready),
+                },
+                HoldingsAnswer::Drained(refs) => return super::summary::diff_refs(&refs, remote),
+                HoldingsAnswer::IndexUnreadable => {
+                    return super::summary::diff_refs(
+                        &self.list_holdings_from_rows(kind).await,
+                        remote,
+                    )
                 }
-                Err(not_ready) => self.note_holdings_fallback(plane, not_ready),
-            },
-            HoldingsAnswer::Drained(refs) => return super::summary::diff_refs(&refs, remote),
-            HoldingsAnswer::IndexUnreadable => {
-                return super::summary::diff_refs(&self.list_holdings_from_rows(kind).await, remote)
+                HoldingsAnswer::Uncovered => {}
             }
-            HoldingsAnswer::Uncovered => {}
+            super::summary::diff_refs(&self.list_holdings_drain(kind).await, remote)
         }
-        super::summary::diff_refs(&self.list_holdings_drain(kind).await, remote)
+        .await;
+        // persist 61.3.0 (CIRISPersist#1252) — a ref this node settled as held
+        // under another ref is not wanted again (lever on or off).
+        self.held_equivalent.filter_want(want)
     }
 
     /// CIRISEdge#474 — serve an accord-quorum-evidence cursor pull. The plane has
@@ -5441,11 +5470,22 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // `Refused` leaving this choke is counted per envelope kind (the #425
         // choke already logs it; now it is also a metrics-scrape fact). The
         // typed Key-plane token axis books inside `apply_key`.
-        let outcome = crate::read_caller::scoped(
-            crate::read_caller::Site::Apply,
-            self.dispatch_apply(kind, envelope_bytes, source_peer),
-        )
-        .await;
+        // Seat load 2026-11-13 (P3) — bytes this node holds EXACTLY are a
+        // `Duplicate` persist would answer after a parse, a row read and a
+        // plan; the Ready holdings index answers it from memory. Long-lived
+        // peers re-push every row the seat holds but does not offer them back
+        // (their push filter reads the seat's send-gated Summary), and they
+        // will not be upgraded on our schedule, so the seat answers here.
+        let outcome = match self.duplicate_from_index(kind, envelope_bytes) {
+            Some(held) => held,
+            None => {
+                crate::read_caller::scoped(
+                    crate::read_caller::Site::Apply,
+                    self.dispatch_apply(kind, envelope_bytes, source_peer),
+                )
+                .await
+            }
+        };
         // CIRISEdge#457 — the receive plane now books EVERY outcome at this
         // choke, not just refusals: an accepted apply (Admitted = new state)
         // and a duplicate (already held) are counted distinctly, so "applied
@@ -5492,6 +5532,16 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             self.mark_feed_dirty();
         }
         self.holdings_write_through(kind, envelope_bytes, &outcome);
+        // persist 61.3.0 (CIRISPersist#1252, its (b)) — an assembled cosigned
+        // row this node already holds, offered under the hash of its bytes (a
+        // 61.2 peer's ref, which this node's index never holds): remember the
+        // offered ref as held so it is not wanted again every round.
+        if matches!(outcome, ApplyOutcome::Duplicate)
+            && super::wire_ref::is_act_named(kind, envelope_bytes)
+        {
+            self.held_equivalent
+                .note(super::wire_ref::plain_ref(envelope_bytes));
+        }
         self.remember_outcome(kind, envelope_bytes, &outcome);
         self.park_or_release(kind, envelope_bytes, &outcome, source_peer)
             .await;
@@ -5908,6 +5958,13 @@ impl FederationDirectoryReplicationBridge {
                  registration or owner binding, and asked their peers again now \
                  (CIRISEdge#858)"
             ),
+            ReleaseCause::RowLanded => tracing::info!(
+                row = %signer,
+                released,
+                kicked,
+                "a row landed that parked withdraws name — released them and asked their \
+                 peers again now (CIRISPersist#1252)"
+            ),
         }
         released
     }
@@ -5952,6 +6009,11 @@ impl FederationDirectoryReplicationBridge {
         // locally written membership / owner-binding / consent row admits.
         for key in audience_release_keys(envelope_bytes) {
             released += self.release_and_kick(&key, ReleaseCause::AudienceChanged);
+        }
+        // persist 61.3.0 (CIRISPersist#1252) — a locally written row releases
+        // the `withdraws` parked on it.
+        if let Some(id) = attestation_id_of(kind, envelope_bytes) {
+            released += self.release_and_kick(&row_wait_key(&id), ReleaseCause::RowLanded);
         }
         released
     }
@@ -6117,7 +6179,6 @@ impl FederationDirectoryReplicationBridge {
         outcome: &ApplyOutcome,
         source_peer: Option<&str>,
     ) {
-        use sha2::{Digest as _, Sha256};
         match outcome.retry_disposition() {
             // persist v59.0.0 — a key's record and an occurrence arrive as
             // ROWS, on their own session plane or on the Attestation plane, so
@@ -6141,15 +6202,23 @@ impl FederationDirectoryReplicationBridge {
                 if let Some(key_id) = key_of_record_row(kind, envelope_bytes) {
                     self.release_and_kick(&key_id, ReleaseCause::KeyAdmitted);
                 }
+                // persist 61.3.0 (CIRISPersist#1252) — the admitted (or held,
+                // or held-equivalent: persist recorded its id as an alias of the
+                // act) row releases the `withdraws` parked on it.
+                if let Some(id) = attestation_id_of(kind, envelope_bytes) {
+                    self.release_and_kick(&row_wait_key(&id), ReleaseCause::RowLanded);
+                }
             }
             Some(RetryDisposition::Transient) => {
-                let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+                let hash = super::wire_ref::envelope_ref(kind, envelope_bytes);
                 // persist v54.1.0 (#1042 follow-up) — a HELD signer persist
                 // said does not act for the row's identity yet
                 // (`SignerDoesNotActFor`): the #776 index on that signer, on
                 // any door that asks acts-for (occurrence, its revocation,
                 // route, touch claim). No Key read: its signature verified.
-                if let Some(signer) = outcome.awaits_acts_for() {
+                if let Some(target) = outcome.awaits_row() {
+                    self.park_on_absent_row(kind, hash, target, source_peer);
+                } else if let Some(signer) = outcome.awaits_acts_for() {
                     self.park_on_held_signer(kind, hash, signer, source_peer)
                         .await;
                 } else if let Some(signer) =
@@ -6208,7 +6277,7 @@ impl FederationDirectoryReplicationBridge {
                 }
             }
             Some(RetryDisposition::Terminal) if is_not_in_audience_refusal(outcome) => {
-                let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+                let hash = super::wire_ref::envelope_ref(kind, envelope_bytes);
                 self.park_on_audience(kind, hash, envelope_bytes, source_peer)
                     .await;
             }
@@ -6274,6 +6343,38 @@ impl FederationDirectoryReplicationBridge {
             &audience_owner_key(group_or_key),
             ReleaseCause::AudienceChanged,
         )
+    }
+
+    /// persist 61.3.0 (CIRISPersist#1252) — park a `withdraws` refused
+    /// `withdraws_target_unheld` on the row it names: quiet on the terminal
+    /// schedule until that row (or an alias of it) lands through the choke or a
+    /// local write, which releases it and re-asks the peer that offered it.
+    fn park_on_absent_row(
+        &self,
+        kind: EnvelopeKind,
+        hash: [u8; 32],
+        target: &str,
+        source_peer: Option<&str>,
+    ) {
+        let evictions = self.refusal_backoff.park_evictions();
+        let window = self.refusal_backoff.park_booked_at(
+            kind,
+            hash,
+            &row_wait_key(target),
+            source_peer,
+            Instant::now(),
+        );
+        self.book_park(kind);
+        self.note_park_evictions(evictions);
+        tracing::debug!(
+            kind = ?kind,
+            envelope_hash = %hex::encode(&hash[..8]),
+            target = %target,
+            from = source_peer.unwrap_or("<unattributed>"),
+            backoff_secs = window.as_secs(),
+            "withdraws refused: its target is not held here yet — parked on the target; \
+             its arrival releases it and re-asks the peer at once (CIRISPersist#1252)"
+        );
     }
 
     /// CIRISEdge#679 — park a refused row on its signer's ABSENT `Key`, on the
@@ -7005,6 +7106,21 @@ impl FederationDirectoryReplicationBridge {
         content_hash: &str,
         err: &ciris_persist::federation::Error,
     ) -> ApplyOutcome {
+        // persist 61.3.0 (CIRISPersist#1252) — a `withdraws` whose target is
+        // not held yet: the #858 ordering gap, parked on the target row and
+        // released when it (or an alias of it) lands.
+        if let ciris_persist::federation::Error::WithdrawsTargetUnheld {
+            target_attestation_id,
+            ..
+        } = err
+        {
+            if !target_attestation_id.trim().is_empty() {
+                return ApplyOutcome::refused_awaiting_row(
+                    apply_refusal_reason(plane, content_hash, err),
+                    target_attestation_id.clone(),
+                );
+            }
+        }
         // CIRISEdge#858 fix 7 — the signature axis first: persist v54.1.0 types
         // an unknown signer (park) apart from a bad signature (terminal).
         if let Some(outcome) = signature_refusal(plane, content_hash, err) {
@@ -7078,8 +7194,18 @@ impl FederationDirectoryReplicationBridge {
     /// obsolete — leaving it would let a stale attempt count lengthen the
     /// backoff of an unrelated later refusal of the same record.
     fn remember_outcome(&self, kind: EnvelopeKind, envelope_bytes: &[u8], outcome: &ApplyOutcome) {
-        use sha2::{Digest as _, Sha256};
-        let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+        // persist 61.3.0 (CIRISPersist#1252) — the ref a peer wanted these
+        // bytes under: the act ref for a cosigned group row (a 61.3+ peer's),
+        // and its bytes' own hash too (a 61.2 peer's), each remembered.
+        let act = super::wire_ref::envelope_ref(kind, envelope_bytes);
+        let plain = super::wire_ref::plain_ref(envelope_bytes);
+        self.remember_outcome_under(kind, act, outcome);
+        if plain != act {
+            self.remember_outcome_under(kind, plain, outcome);
+        }
+    }
+
+    fn remember_outcome_under(&self, kind: EnvelopeKind, hash: [u8; 32], outcome: &ApplyOutcome) {
         match outcome.retry_disposition() {
             None => {
                 // CIRISEdge#971 — an ADMIT of bytes once marked stale ends the
@@ -7538,7 +7664,7 @@ impl FederationDirectoryReplicationBridge {
         refs: &mut Vec<EnvelopeRef>,
         seen: &mut HashSet<[u8; 32]>,
     ) where
-        T: serde::Serialize,
+        T: serde::Serialize + 'static,
         IN: Fn(&S) -> bool,
         TS: Fn(&S) -> u64,
         C: Fn(&S) -> &T,
@@ -8281,6 +8407,9 @@ impl FederationDirectoryReplicationBridge {
             if plane == super::holdings_index::IndexPlane::TransportDestination && drift.extra > 0 {
                 self.drop_stale_marks_on_route_removal();
             }
+            if drift.extra > 0 {
+                self.forget_held_equivalents();
+            }
             self.book_holdings(obs::HOLDINGS_AUDITS[slot], 1);
             self.book_holdings(
                 obs::HOLDINGS_DRIFT_MISSING[slot],
@@ -8770,6 +8899,63 @@ impl FederationDirectoryReplicationBridge {
     /// older one current again, and the older bytes are never fetched while
     /// marked (so their admit can never end the mark), so every mark goes.
     /// Rare and cheap: each dropped mark costs at most one re-fetch.
+    /// Seat load 2026-11-13 (P3) — `Some(Duplicate)` iff the holdings index
+    /// is Ready for `kind`'s plane and holds `sha256(envelope_bytes)` itself.
+    ///
+    /// Only the bytes' own hash counts. The index keys each held row on
+    /// persist's content hash of the bytes persist serves for it, so a match
+    /// means these are those bytes, and persist's apply of byte-identical bytes
+    /// is `Unchanged` / the stale-route arm: `Duplicate` on every plane the
+    /// index covers. An act ref (a cosigned row's) is NOT used: bytes that
+    /// carry the same act under another ref are persist's to settle
+    /// (`HeldEquivalent`). Unbooted, Suspect or disabled: `None`, persist
+    /// answers. The window this trusts is the index's own: a row purged since
+    /// the last audit is answered held for at most one audit period, and a
+    /// purged row with a tombstone would be refused by persist anyway.
+    fn duplicate_from_index(
+        &self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+    ) -> Option<ApplyOutcome> {
+        use super::holdings_index::IndexPlane;
+        if !self.holdings_index.enabled() {
+            return None;
+        }
+        let plane = IndexPlane::of_kind(kind)?;
+        let hash = super::wire_ref::plain_ref(envelope_bytes);
+        if self.holdings_index.holds(plane, &hash) != Some(true) {
+            return None;
+        }
+        self.book_holdings(
+            crate::observability::HOLDINGS_DUPLICATE_FROM_INDEX[plane.slot()],
+            1,
+        );
+        Some(ApplyOutcome::Duplicate)
+    }
+
+    /// Seat load 2026-11-13 (S0) — add `n` to `advertise.rows.<class>.<outcome>`.
+    fn book_advertise_row(&self, class: &str, outcome: &str, n: u64) {
+        if let (Some(m), Some(label)) = (
+            self.metrics.as_ref(),
+            crate::observability::advertise_row_label(class, outcome),
+        ) {
+            m.add_advertise(label, n);
+        }
+    }
+
+    fn forget_held_equivalents(&self) {
+        // Seat load 2026-11-13 (P2) — a held hash LEFT persist's index (a
+        // purge, an erasure, a superseding row removed). A ref remembered as
+        // held because persist answered `Duplicate` may stand for that row,
+        // and it could now be the one this node should hold again, so every
+        // remembered ref goes. Each costs at most one more fetch.
+        let dropped = self.held_equivalent.clear_all();
+        self.book_holdings(
+            crate::observability::HELD_EQUIVALENT_FORGOTTEN,
+            u64::try_from(dropped).unwrap_or(u64::MAX),
+        );
+    }
+
     fn drop_stale_marks_on_route_removal(&self) {
         let dropped = self.stale_routes.clear_all();
         self.book_holdings(
@@ -8785,6 +8971,27 @@ impl FederationDirectoryReplicationBridge {
     /// free "missing" signal. Refusals and duplicates insert nothing: a
     /// duplicate can be a stale version the index does not hold (a superseded
     /// route), and the set must not gain a hash the index lacks.
+    /// persist 61.3.0 (CIRISPersist#1252) — persist settled the offered row as
+    /// the SAME ACT held under another row (`HeldEquivalent`): remember the
+    /// offered bytes' ref as held, so the receive diff does not want it again.
+    fn note_if_held_equivalent(
+        &self,
+        outcome: ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome,
+        bytes: &[u8],
+    ) {
+        use ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome as O;
+        if matches!(outcome, O::HeldEquivalent) {
+            self.held_equivalent.note(super::wire_ref::plain_ref(bytes));
+        }
+    }
+
+    /// persist 61.3.0 (CIRISPersist#1252) — refs remembered as held under
+    /// another ref.
+    #[must_use]
+    pub fn held_equivalent_refs(&self) -> usize {
+        self.held_equivalent.len()
+    }
+
     fn holdings_write_through(
         &self,
         kind: EnvelopeKind,
@@ -8793,7 +9000,6 @@ impl FederationDirectoryReplicationBridge {
     ) {
         use super::holdings_index::{record_of_envelope, IndexPlane};
         use crate::observability as obs;
-        use sha2::{Digest as _, Sha256};
         if !self.holdings_index.enabled() {
             return;
         }
@@ -8802,17 +9008,41 @@ impl FederationDirectoryReplicationBridge {
         };
         let slot = plane.slot();
         match outcome {
+            // persist 61.3.0 (CIRISPersist#1252) — the row's ref is persist's
+            // (the act ref of a cosigned group row), the hash persist's index
+            // holds for it.
             ApplyOutcome::Admitted => {
-                let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+                let hash = super::wire_ref::envelope_ref(kind, envelope_bytes);
                 let record = record_of_envelope(plane, envelope_bytes);
                 if self.holdings_index.upsert(plane, record, hash) {
                     self.book_holdings(obs::HOLDINGS_WRITE_THROUGH[slot], 1);
                 }
             }
             ApplyOutcome::Duplicate => {
-                let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+                let hash = super::wire_ref::envelope_ref(kind, envelope_bytes);
                 if self.holdings_index.holds(plane, &hash) == Some(false) {
                     self.book_holdings(obs::HOLDINGS_DUPLICATE_UNHELD[slot], 1);
+                    // Seat load 2026-11-13 (P2) — persist said it holds what
+                    // these bytes carry, under a ref this set lacks (a
+                    // decoration variant, a superseded version, a rewritten
+                    // row the audit has not reached). Remember the offered
+                    // refs as held, as the HeldEquivalent piece does, or the
+                    // receive diff wants them again every round: a
+                    // `Duplicate` clears the refusal backoff, so nothing else
+                    // stops that ask. A superseding version is never a
+                    // Duplicate (it is admitted under its own hash), so this
+                    // hides nothing; an audit that finds the index LOST a
+                    // hash forgets them all (`forget_held_equivalents`).
+                    //
+                    // Not on the route plane: a route Duplicate the set lacks
+                    // is the stale arm, which keeps its own marks on the
+                    // terminal schedule (`stale_routes`), re-asked when its
+                    // window ends and cleared when the held route leaves.
+                    if plane == IndexPlane::Attestation {
+                        self.held_equivalent.note(hash);
+                        self.held_equivalent
+                            .note(super::wire_ref::plain_ref(envelope_bytes));
+                    }
                 }
             }
             ApplyOutcome::Refused { .. } | ApplyOutcome::Deserialize(_) => {}
@@ -10619,6 +10849,9 @@ impl FederationDirectoryReplicationBridge {
         // rows (own nodes) or `family` rows (family members' nodes) and for
         // nothing wider; the row half below still runs on what passes.
         if !reach.admits(audience) {
+            if site == "advertise" {
+                self.book_advertise_row(reach.tag(), "withheld_reach", 1);
+            }
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
@@ -10660,6 +10893,9 @@ impl FederationDirectoryReplicationBridge {
             && !self.attestation_is_relayed_announce(row, memo).await
             && !self.consent_grant_names(row, peer, memo).await
         {
+            if site == "advertise" {
+                self.book_advertise_row(reach.tag(), "withheld_first_contact", 1);
+            }
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
@@ -10827,6 +11063,9 @@ impl FederationDirectoryReplicationBridge {
         // through the same resolver, before either is a member.
         let served = self.may_receive_cached(att, peer, memo).await.allowed();
         if !served {
+            if site == "advertise" {
+                self.book_advertise_row(reach.tag(), "withheld_row", 1);
+            }
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
@@ -11144,6 +11383,11 @@ impl FederationDirectoryReplicationBridge {
         membership: &'static str,
         set: &ResolvedPeerSet,
     ) {
+        // Seat load 2026-11-13 (S0) — the class this peer's activity is
+        // counted under (`peer_activity`), every resolve.
+        if let Some(m) = &self.metrics {
+            m.set_peer_class(peer, membership);
+        }
         let previous = {
             let Ok(mut seen) = self.send_set_membership.lock() else {
                 return;
@@ -11844,6 +12088,15 @@ impl FederationDirectoryReplicationBridge {
                 .map(ResolvedRecipient::reach)
                 == Some(Reach::FirstContact)
                 && ctx.moves != UnaskedOffer::Commons;
+        // Seat load 2026-11-13 (S0) — the class the round's row counters are
+        // booked under: `commons` between two seats, else the peer's reach.
+        let class = if ctx.moves == UnaskedOffer::Commons {
+            "commons"
+        } else {
+            ctx.resolved_recipient
+                .as_ref()
+                .map_or("none", |r| r.reach().tag())
+        };
         let mut first_at_tip = false;
         if no_walk {
             let margin = chrono::Duration::from_std(self.config.tip_margin).unwrap_or_default();
@@ -11873,6 +12126,11 @@ impl FederationDirectoryReplicationBridge {
             .await
             {
                 listed = required.0;
+                self.book_advertise_row(
+                    class,
+                    "listed_required",
+                    u64::try_from(required.0).unwrap_or(u64::MAX),
+                );
                 counts = required.2;
             }
         }
@@ -11901,6 +12159,11 @@ impl FederationDirectoryReplicationBridge {
             }
         };
         listed += served;
+        self.book_advertise_row(
+            class,
+            "listed_head",
+            u64::try_from(served).unwrap_or(u64::MAX),
+        );
         counts.merge(head_counts);
         let mut resweep: Option<(Option<ResumeCursor>, usize, bool)> = None;
         let plan = self
@@ -11933,6 +12196,11 @@ impl FederationDirectoryReplicationBridge {
                     }
                     self.resweep_cycle_step(&key, wrapped);
                     listed += b_served;
+                    self.book_advertise_row(
+                        class,
+                        "listed_history",
+                        u64::try_from(b_served).unwrap_or(u64::MAX),
+                    );
                     counts.merge(b_counts);
                     resweep = Some((plan.since, b_served, wrapped));
                 }
@@ -11960,6 +12228,15 @@ impl FederationDirectoryReplicationBridge {
         let unbooked = (withheld as u64).saturating_sub(booked);
         if unbooked > 0 {
             withheld_by_reason.insert("unbooked", unbooked);
+        }
+        for (outcome, n) in [
+            ("not_advertisable", counts.not_advertisable),
+            ("withheld", withheld),
+            ("duplicate", counts.duplicate),
+            ("awaits_request", counts.awaits_request),
+            ("offered", counts.offered),
+        ] {
+            self.book_advertise_row(class, outcome, u64::try_from(n).unwrap_or(u64::MAX));
         }
         let summary = AdvertiseRoundSummary {
             peer: key.0.clone(),
@@ -14511,8 +14788,13 @@ impl FederationDirectoryReplicationBridge {
                     // projection is a union keyed by the row's identity, so a
                     // re-offer projects nothing new; for the sweep's
                     // accounting the row did not change.
+                    // persist 61.3.0 (#1252): `HeldEquivalent` (the same act held
+                    // under another row) is a re-offer here too, on purpose: a
+                    // key-grant row is not a cosignable group row, and persist
+                    // defines the outcome as held, nothing written.
                     ReplicatedAttestationOutcome::Unchanged
-                    | ReplicatedAttestationOutcome::Deduplicated => ApplyOutcome::Duplicate,
+                    | ReplicatedAttestationOutcome::Deduplicated
+                    | ReplicatedAttestationOutcome::HeldEquivalent => ApplyOutcome::Duplicate,
                     // The row was refused at the attestation plane. Say so with
                     // persist's reason.
                     // persist v61 — with persist's retry disposition, as the
@@ -14754,14 +15036,20 @@ impl FederationDirectoryReplicationBridge {
                 // on both. The pre-v50 `Err(Conflict)` special case is gone.
                 let (outcome, refusal_token) = match source_peer {
                     Some(peer) => match self.directory.put_attestation_synced(record, peer).await {
-                        Ok(o) => attestation_outcome_to_apply(o, &content_hash),
+                        Ok(o) => {
+                            self.note_if_held_equivalent(o, bytes);
+                            attestation_outcome_to_apply(o, &content_hash)
+                        }
                         // persist v38.2.0 (CIRISEdge#522) — the door classes (AV-45
                         // membership, AV-84 third-party rows) arrive as typed persist
                         // variants and `refuse` names + counts them.
                         Err(e) => (self.refuse("Attestation", &content_hash, &e), None),
                     },
                     None => match self.directory.apply_replicated_attestation(record).await {
-                        Ok(o) => attestation_outcome_to_apply(o, &content_hash),
+                        Ok(o) => {
+                            self.note_if_held_equivalent(o, bytes);
+                            attestation_outcome_to_apply(o, &content_hash)
+                        }
                         Err(e) => (self.refuse("Attestation", &content_hash, &e), None),
                     },
                 };
@@ -15103,10 +15391,22 @@ impl FederationDirectoryReplicationBridge {
 /// advertise-hash = served-bytes = the point-read's `content_hash`, so a Diff'd
 /// peer fetches byte-identical what was advertised
 /// ([`ciris_persist::federation::FederationDirectory::lookup_signed_record_by_content_hash`]).
-fn content_hash_of<T: serde::Serialize>(value: &T) -> Option<([u8; 32], Vec<u8>)> {
+///
+/// persist 61.3.0 (CIRISPersist#1252) — an attestation row's ref is persist's
+/// [`attestation_wire_hash`](ciris_persist::federation::wire_index::attestation_wire_hash),
+/// THE ref rule: a cosigned group row is named by its act (its hash with no
+/// cosignatures), every other row by `sha256(to_vec(row))` as before. The
+/// bytes served are the row's own, unchanged. Every advertise, holdings and
+/// feed site that names a row by its content goes through here, so they keep
+/// one derivation with persist's index.
+fn content_hash_of<T: serde::Serialize + 'static>(value: &T) -> Option<([u8; 32], Vec<u8>)> {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(value).ok()?;
-    let hash: [u8; 32] = Sha256::digest(&bytes).into();
+    let any: &dyn std::any::Any = value;
+    let hash: [u8; 32] = match any.downcast_ref::<ciris_persist::federation::Attestation>() {
+        Some(row) => ciris_persist::federation::wire_index::attestation_wire_hash(row),
+        None => Sha256::digest(&bytes).into(),
+    };
     Some((hash, bytes))
 }
 
@@ -16947,7 +17247,7 @@ pub(crate) mod tests {
             attestation_outcome_to_apply(O::Inserted, "h"),
             (ApplyOutcome::Admitted, None)
         );
-        for o in [O::Unchanged, O::Deduplicated] {
+        for o in [O::Unchanged, O::Deduplicated, O::HeldEquivalent] {
             assert_eq!(
                 attestation_outcome_to_apply(o, "h"),
                 (ApplyOutcome::Duplicate, None),
@@ -17181,6 +17481,8 @@ pub(crate) mod tests {
                 group_key_id: "room".to_owned(),
                 offered_authority_key_id: "mo".to_owned(),
                 rule: ciris_persist::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+                // persist 61.4.0 (#1250): the door's count; absent here.
+                shortfall: None,
             },
         )
         .expect("a typed refusal");
@@ -31397,6 +31699,10 @@ pub(crate) mod tests {
     // CIRISEdge#971 — what an idle bootstrap round costs the seat.
     mod idle_round_cost_971;
 
+    // Seat load 2026-11-13 (S0) — in one binary, each edge read is credited
+    // to its site's label in persist's per-caller counters.
+    mod caller_attribution_seat_load;
+
     // CIRISEdge#971 — the seat's Revocation listing walk per idle round.
     mod revocation_walk_971;
 
@@ -32011,6 +32317,31 @@ enum ReleaseCause {
     /// persist v61 S2 (#1148) — a row that changes this node's audience (a
     /// group's membership row, an owner binding, a replication consent).
     AudienceChanged,
+    /// persist 61.3.0 (CIRISPersist#1252) — the row a parked `withdraws`
+    /// names (or an alias of it) landed.
+    RowLanded,
+}
+
+/// persist 61.3.0 (CIRISPersist#1252) — the park key a `withdraws` waiting on
+/// row `attestation_id` is indexed under. Its own namespace, so it can never
+/// collide with a signer's key id or an audience gate.
+fn row_wait_key(attestation_id: &str) -> String {
+    format!("row:{attestation_id}")
+}
+
+/// The `attestation_id` of an Attestation-index row's wire bytes, if they are
+/// one.
+fn attestation_id_of(kind: EnvelopeKind, envelope_bytes: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Id {
+        attestation_id: String,
+    }
+    if kind.persist_index_kind() != Some("Attestation") {
+        return None;
+    }
+    serde_json::from_slice::<Id>(envelope_bytes)
+        .ok()
+        .map(|r| r.attestation_id)
 }
 
 /// CIRISEdge#858 — the window of the park log: one line per signer per

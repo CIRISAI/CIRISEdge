@@ -13,8 +13,18 @@ use ciris_persist::federation::*;
 /// `inner` (persist's directory-ops proxy) and the capsules its copies point
 /// into. Dropping the last clone releases the capsules; nothing else holds
 /// them on edge's behalf.
+///
+/// The trait's blocking SYNC reads are answered by latches (see the
+/// generator's `LATCHED_SYNC`): a value read through the proxy is kept for
+/// the process, except the proxy's fail-closed fallback (and an absent node
+/// key), which is never kept, so the next use reads again. Each latch is
+/// tried once in [`Self::new`] (init, the host's thread), so in the steady
+/// state no runtime worker blocks on a sync read.
 pub(crate) struct KeptDirectory {
     inner: Arc<dyn FederationDirectory>,
+    node_key_id: std::sync::OnceLock<String>,
+    hardware_attestation_policy: std::sync::OnceLock<std::sync::Arc<HardwareAttestationPolicy>>,
+    withdraws_delegation_depth: std::sync::OnceLock<usize>,
     _executor: Arc<crate::ffi::pyo3::KeptExecutor>,
     _capsule: pyo3::Py<pyo3::PyAny>,
 }
@@ -25,15 +35,22 @@ impl KeptDirectory {
         executor: Arc<crate::ffi::pyo3::KeptExecutor>,
         capsule: pyo3::Py<pyo3::PyAny>,
     ) -> Self {
-        Self {
+        let kept = Self {
             inner,
+            node_key_id: std::sync::OnceLock::new(),
+            hardware_attestation_policy: std::sync::OnceLock::new(),
+            withdraws_delegation_depth: std::sync::OnceLock::new(),
             _executor: executor,
             _capsule: capsule,
-        }
+        };
+        let _ = FederationDirectory::node_key_id(&kept);
+        let _ = FederationDirectory::hardware_attestation_policy(&kept);
+        let _ = FederationDirectory::withdraws_delegation_depth(&kept);
+        kept
     }
 }
 
-// 250 delegations, generated.
+// 262 delegations, generated.
 #[async_trait::async_trait]
 impl FederationDirectory for KeptDirectory {
     async fn active_community_key_ids_for(
@@ -235,6 +252,17 @@ impl FederationDirectory for KeptDirectory {
             .attestations_binding_content(content_sha256)
             .await
     }
+    async fn attestations_binding_content_with_placements(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        self.inner
+            .attestations_binding_content_with_placements(content_sha256)
+            .await
+    }
+    fn blackhole_rules_surface(&self) -> Option<&dyn BlackholeRules> {
+        self.inner.blackhole_rules_surface()
+    }
     async fn build_membership_change_envelope(
         &self,
         cohort: cohort::Cohort,
@@ -293,6 +321,15 @@ impl FederationDirectory for KeptDirectory {
     ) -> Result<ciris_persist::witness::WitnessReconcileAction, Error> {
         self.inner.compare_stored_witnesses(peer_ids).await
     }
+    async fn cosign_alias(&self, attestation_id: &str) -> Result<Option<(String, String)>, Error> {
+        self.inner.cosign_alias(attestation_id).await
+    }
+    async fn cosign_receipt(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Option<cosign::CosignReceipt>, Error> {
+        self.inner.cosign_receipt(quorum_key).await
+    }
     async fn dag_manifests_of_chunk(
         &self,
         chunk_sha256: &[u8; 32],
@@ -304,6 +341,12 @@ impl FederationDirectory for KeptDirectory {
     }
     async fn delete_legacy_goal(&self, goal_id: &str) -> Result<(), Error> {
         self.inner.delete_legacy_goal(goal_id).await
+    }
+    async fn drop_cosign_rows(&self, quorum_key: &str) -> Result<u64, Error> {
+        self.inner.drop_cosign_rows(quorum_key).await
+    }
+    fn edge_detection_surface(&self) -> Option<&dyn ciris_persist::derived::EdgeDetectionSink> {
+        self.inner.edge_detection_surface()
     }
     async fn enter_mesh(
         &self,
@@ -408,7 +451,22 @@ impl FederationDirectory for KeptDirectory {
         self.inner.groups_of(cohort, member_key_id).await
     }
     fn hardware_attestation_policy(&self) -> std::sync::Arc<HardwareAttestationPolicy> {
-        self.inner.hardware_attestation_policy()
+        // Kept once read; the proxy's fail-closed fallback is never kept, so
+        // a slow first round trip does not stick for the process.
+        if let Some(k) = self.hardware_attestation_policy.get() {
+            return std::sync::Arc::clone(k);
+        }
+        let v = self.inner.hardware_attestation_policy();
+        match (*v
+            != ciris_persist::ffi::directory_capsule::refuse_all_hardware_attestation_policy())
+        .then(|| std::sync::Arc::clone(&v))
+        {
+            Some(keep) => {
+                let k = self.hardware_attestation_policy.get_or_init(|| keep);
+                std::sync::Arc::clone(k)
+            }
+            None => v,
+        }
     }
     async fn heartbeat_shared_instance(
         &self,
@@ -658,6 +716,15 @@ impl FederationDirectory for KeptDirectory {
     ) -> Result<Vec<Attestation>, Error> {
         self.inner.list_consent_revocations(since).await
     }
+    async fn list_cosign_aliases(&self, quorum_key: &str) -> Result<Vec<(String, String)>, Error> {
+        self.inner.list_cosign_aliases(quorum_key).await
+    }
+    async fn list_cosign_signatures(
+        &self,
+        quorum_key: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        self.inner.list_cosign_signatures(quorum_key).await
+    }
     async fn list_derived_hex(
         &self,
         original_sha256_hex: &str,
@@ -851,6 +918,9 @@ impl FederationDirectory for KeptDirectory {
         subject_key_id: &str,
     ) -> Result<Vec<LocationProof>, Error> {
         self.inner.list_location_proofs_for(subject_key_id).await
+    }
+    async fn list_open_cosign_receipts(&self) -> Result<Vec<cosign::CosignReceipt>, Error> {
+        self.inner.list_open_cosign_receipts().await
     }
     async fn list_open_self_roster_proposals(
         &self,
@@ -1154,7 +1224,36 @@ impl FederationDirectory for KeptDirectory {
             .await
     }
     fn node_key_id(&self) -> Option<String> {
-        self.inner.node_key_id()
+        // Kept once read; the proxy's fail-closed fallback is never kept, so
+        // a slow first round trip does not stick for the process.
+        // The value only moves None -> Some(k), and k is the Engine's own
+        // signer-derived key on every route persist sets it by, so a kept
+        // Some never goes stale; None is never kept (CIRISPersist#1269).
+        if let Some(k) = self.node_key_id.get() {
+            return Some(k.clone());
+        }
+        let v = self.inner.node_key_id();
+        match v
+            .as_deref()
+            .filter(|k| *k != ciris_persist::ffi::directory_capsule::NODE_KEY_ID_UNAVAILABLE)
+            .map(str::to_owned)
+        {
+            Some(keep) => {
+                let k = self.node_key_id.get_or_init(|| keep);
+                Some(k.clone())
+            }
+            None => v,
+        }
+    }
+    async fn note_cosign_alias(
+        &self,
+        alias_attestation_id: &str,
+        quorum_key: &str,
+        held_attestation_id: &str,
+    ) -> Result<(), Error> {
+        self.inner
+            .note_cosign_alias(alias_attestation_id, quorum_key, held_attestation_id)
+            .await
     }
     async fn note_self_roster_proposal(
         &self,
@@ -1426,6 +1525,12 @@ impl FederationDirectory for KeptDirectory {
             )
             .await
     }
+    async fn read_group_plane_object(
+        &self,
+        link: &group_plane::GroupRowLink,
+    ) -> Result<Option<(group_plane::GroupSigned, Option<String>)>, Error> {
+        self.inner.read_group_plane_object(link).await
+    }
     async fn reap_expired_attestations(
         &self,
         now: chrono::DateTime<chrono::Utc>,
@@ -1629,6 +1734,16 @@ impl FederationDirectory for KeptDirectory {
     ) -> Result<(), Error> {
         self.inner.set_consent_role(key_id, consent_role).await
     }
+    async fn settle_cosign_receipt(
+        &self,
+        quorum_key: &str,
+        outcome: &str,
+        settled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        self.inner
+            .settle_cosign_receipt(quorum_key, outcome, settled_at)
+            .await
+    }
     async fn settle_self_roster_proposal(
         &self,
         proposal_id: &str,
@@ -1807,6 +1922,18 @@ impl FederationDirectory for KeptDirectory {
         self.inner.withdraws_admission_depth(attestation_id).await
     }
     fn withdraws_delegation_depth(&self) -> usize {
-        self.inner.withdraws_delegation_depth()
+        // Kept once read; the proxy's fail-closed fallback is never kept, so
+        // a slow first round trip does not stick for the process.
+        if let Some(k) = self.withdraws_delegation_depth.get() {
+            return *k;
+        }
+        let v = self.inner.withdraws_delegation_depth();
+        match (v != 0).then_some(v) {
+            Some(keep) => {
+                let k = self.withdraws_delegation_depth.get_or_init(|| keep);
+                *k
+            }
+            None => v,
+        }
     }
 }

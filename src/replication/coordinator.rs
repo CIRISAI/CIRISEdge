@@ -122,17 +122,55 @@ enum RoleInbox {
 
 /// What an anti-entropy round produced. Surfaced to the application's
 /// metrics + τ_partial signal pipelines.
+///
+/// `?report` is printed on the responder's completion line
+/// (`responder served an anti-entropy round to completion`), so the field
+/// ORDER is part of what a host's log scripts see: `admitted`, `refused`
+/// (legacy: refusals and duplicates), then `duplicate` and `rejected`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundReport {
     pub kind: EnvelopeKind,
     /// How many envelopes the [`StateApplier`] admitted (changed local
     /// state).
     pub admitted: usize,
-    /// How many envelopes were delivered but refused (duplicates,
-    /// signature-validation failures, anti-rollback collisions).
+    /// Every delivered envelope that was not admitted: refusals AND
+    /// duplicates. This is the meaning `refused: N` has had in the
+    /// responder's completion line since CIRISEdge#425, and hosts parse it;
+    /// it keeps that meaning for this release and becomes `rejected`'s in
+    /// the next. Read [`Self::rejected`] and [`Self::duplicate`] instead.
     pub refused: usize,
+    /// Envelopes this node already held (persist: `Unchanged`,
+    /// `Deduplicated`, `AlreadyPresentIdentical`). Routine non-progress, not
+    /// a refusal: on the production canonical they outnumbered refusals
+    /// about twenty to one, and counting them as refused hid that.
+    pub duplicate: usize,
+    /// Envelopes a gate refused, or that did not deserialize:
+    /// `refused - duplicate`.
+    pub rejected: usize,
     /// The bounded-staleness signal at round close.
     pub staleness: StalenessSignal,
+}
+
+impl RoundReport {
+    /// A report for applied envelopes: `refused` counts refusals and
+    /// duplicates together (its legacy meaning), `duplicate` the latter.
+    #[must_use]
+    pub fn applied(
+        kind: EnvelopeKind,
+        admitted: usize,
+        refused: usize,
+        duplicate: usize,
+        staleness: StalenessSignal,
+    ) -> Self {
+        RoundReport {
+            kind,
+            admitted,
+            refused,
+            duplicate,
+            rejected: refused.saturating_sub(duplicate),
+            staleness,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -200,6 +238,19 @@ struct PullExchange {
 /// `drive_round_step(None)` (initiator) again to start the next
 /// round, or `drive_round_step(Some(inbound))` (responder) on the
 /// next inbound Summary.
+/// Seat load 2026-11-13 (S0) — what a `(peer, kind)` moved before its first
+/// round that moved nothing either way.
+#[derive(Debug, Default)]
+struct FirstSync {
+    first_seen: Option<std::time::Instant>,
+    rounds: u64,
+    rows: u64,
+    bytes: u64,
+    /// Rows this side sent since the last completed round.
+    rows_out_round: u64,
+    done: bool,
+}
+
 pub struct ReplicationCoordinator {
     /// CIRISEdge#662 — what the DRIVER of this coordinator is doing right now
     /// (`DriverPhase` as `u8`), and since when (unix ms). A responder has ONE
@@ -213,6 +264,9 @@ pub struct ReplicationCoordinator {
     /// Summary on a removal-class kind folds into the removal-receipt
     /// ledger (the peer's Summary IS the protocol-native delivery ack).
     metrics: Option<crate::observability::EdgeMetrics>,
+    /// Seat load 2026-11-13 (S0) — this `(peer, kind)`'s progress toward its
+    /// first in-sync round ([`Self::note_round_complete`]).
+    first_sync: std::sync::Mutex<FirstSync>,
     /// CIRISEdge#853 — the transport link the responder's latest inbound frame
     /// arrived on (a Reticulum link id), for the round lifecycle log lines.
     /// Observability only: never consulted for routing.
@@ -351,6 +405,7 @@ impl ReplicationCoordinator {
         };
         Self {
             metrics: None,
+            first_sync: std::sync::Mutex::new(FirstSync::default()),
             last_inbound_link: std::sync::Mutex::new(None),
             transport,
             peer_key_id: peer_key_id.into(),
@@ -442,6 +497,8 @@ impl ReplicationCoordinator {
         msg: ReplicationMessage,
         meta: Option<RoundMeta>,
     ) -> Result<(), CoordinatorError> {
+        self.book_io(&msg, false);
+        self.note_wire(meta.is_some());
         match &self.inbox {
             RoleInbox::Responder { inbound_tx, .. } => inbound_tx
                 .try_send(Inbound {
@@ -502,6 +559,8 @@ impl ReplicationCoordinator {
     ///
     /// [`ReplyRefusal`] — see its variants.
     pub fn deliver_reply(&self, msg: ReplicationMessage, round: u64) -> Result<(), ReplyRefusal> {
+        self.book_io(&msg, false);
+        self.note_wire(round != 0);
         let RoleInbox::Initiator {
             current_round,
             round_tx,
@@ -969,6 +1028,8 @@ impl ReplicationCoordinator {
                     kind,
                     admitted: 0,
                     refused: 0,
+                    duplicate: 0,
+                    rejected: 0,
                     staleness: StalenessSignal::InSync,
                 },
             ),
@@ -976,13 +1037,11 @@ impl ReplicationCoordinator {
                 kind,
                 admitted,
                 refused,
+                duplicate,
                 staleness,
-            } => DriveStep::Complete(RoundReport {
-                kind,
-                admitted,
-                refused,
-                staleness,
-            }),
+            } => DriveStep::Complete(RoundReport::applied(
+                kind, admitted, refused, duplicate, staleness,
+            )),
             // (An unproduced `RoundComplete` variant used to be mapped here to a
             // Complete report with `staleness: Unknown` — dead code that would
             // have DISGUISED unknown staleness as a cleanly completed round had
@@ -993,15 +1052,11 @@ impl ReplicationCoordinator {
                 kind,
                 admitted,
                 refused,
+                duplicate,
                 staleness,
             } => DriveStep::SendThenComplete(
                 msgs,
-                RoundReport {
-                    kind,
-                    admitted,
-                    refused,
-                    staleness,
-                },
+                RoundReport::applied(kind, admitted, refused, duplicate, staleness),
             ),
             ReplicationOutcome::UnexpectedMessage => DriveStep::Refused,
         }
@@ -1044,6 +1099,144 @@ impl ReplicationCoordinator {
         if let (Some(metrics), ReplicationMessage::Deliver(deliver)) = (&self.metrics, msg) {
             for _ in &deliver.envelopes {
                 metrics.inc_replication_served(deliver.kind);
+            }
+        }
+        self.book_io(msg, true);
+    }
+
+    /// Seat load 2026-11-13 (S0) — the peer's replication frame level, counted
+    /// once per peer per process (`peer_activity.wire.{v3,legacy}`) and said
+    /// once. No handshake field carries a peer's edge version.
+    fn note_wire(&self, v3: bool) {
+        if let Some(m) = &self.metrics {
+            if m.note_peer_wire(&self.peer_key_id, v3) {
+                tracing::info!(
+                    peer = %self.peer_key_id,
+                    class = m.peer_class(&self.peer_key_id),
+                    wire = if v3 { "v3" } else { "legacy" },
+                    "peer's replication frame level (first frame this process; no handshake \
+                     field carries the peer's edge version)"
+                );
+            }
+        }
+    }
+
+    /// Seat load 2026-11-13 (S0) — **first sync complete**: the first round
+    /// of this `(peer, kind)` that moved nothing either way (nothing admitted,
+    /// refused or duplicated here, this side's want satisfied, nothing sent).
+    /// Booked once per process, in `replication_io` as
+    /// `<kind>:first_sync_complete` with the sums `first_sync_ms`,
+    /// `first_sync_rounds`, `first_sync_rows` and `first_sync_bytes` (since
+    /// the first frame either way), and one INFO line naming the peer.
+    pub fn note_round_complete(&self, report: &RoundReport) {
+        let mut fs = self
+            .first_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fs.rounds = fs.rounds.saturating_add(1);
+        let idle = report.admitted == 0
+            && report.refused == 0
+            && report.staleness == StalenessSignal::InSync
+            && fs.rows_out_round == 0;
+        fs.rows_out_round = 0;
+        if fs.done || !idle {
+            return;
+        }
+        fs.done = true;
+        let elapsed_ms = fs.first_seen.map_or(0, |t| {
+            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+        });
+        let (rounds, rows, bytes) = (fs.rounds, fs.rows, fs.bytes);
+        drop(fs);
+        if let Some(m) = &self.metrics {
+            let kind = self.kind();
+            m.add_replication_io(kind, "first_sync_complete", 1);
+            m.add_replication_io(kind, "first_sync_ms", elapsed_ms);
+            m.add_replication_io(kind, "first_sync_rounds", rounds);
+            m.add_replication_io(kind, "first_sync_rows", rows);
+            m.add_replication_io(kind, "first_sync_bytes", bytes);
+        }
+        tracing::info!(
+            peer = %self.peer_key_id,
+            kind = ?self.kind(),
+            elapsed_ms,
+            rounds,
+            rows,
+            bytes,
+            "first sync complete: the first round with this peer on this plane that \
+             moved nothing either way"
+        );
+    }
+
+    /// Seat load 2026-11-13 (S0) — `replication_io`: the rows and envelope
+    /// bytes a message carried, the hashes a Summary listed and a Diff asked
+    /// for, and Pulls. Sent messages are booked once their send returned;
+    /// received ones as they are handed to the round. An initiator's Deliver
+    /// is booked `push_*` (its proactive push and its answer to the
+    /// responder's Diff); a responder's is `deliver_*`.
+    fn book_io(&self, msg: &ReplicationMessage, out: bool) {
+        if let ReplicationMessage::Deliver(d) = msg {
+            let rows = u64::try_from(d.envelopes.len()).unwrap_or(u64::MAX);
+            let bytes =
+                u64::try_from(d.envelopes.iter().map(Vec::len).sum::<usize>()).unwrap_or(u64::MAX);
+            let mut fs = self
+                .first_sync
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            fs.first_seen.get_or_insert_with(std::time::Instant::now);
+            fs.rows = fs.rows.saturating_add(rows);
+            fs.bytes = fs.bytes.saturating_add(bytes);
+            if out {
+                fs.rows_out_round = fs.rows_out_round.saturating_add(rows);
+            }
+        } else {
+            self.first_sync
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .first_seen
+                .get_or_insert_with(std::time::Instant::now);
+        }
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let initiator = matches!(self.inbox, RoleInbox::Initiator { .. });
+        let count = |x: usize| u64::try_from(x).unwrap_or(u64::MAX);
+        match msg {
+            ReplicationMessage::Deliver(deliver) => {
+                let bytes = count(deliver.envelopes.iter().map(Vec::len).sum());
+                let rows = count(deliver.envelopes.len());
+                let (rows_label, bytes_label) = match (out, initiator) {
+                    (true, true) => ("push_rows_out", "push_bytes_out"),
+                    (true, false) => ("deliver_rows_out", "deliver_bytes_out"),
+                    (false, _) => ("deliver_rows_in", "deliver_bytes_in"),
+                };
+                metrics.add_replication_io(deliver.kind, rows_label, rows);
+                metrics.add_replication_io(deliver.kind, bytes_label, bytes);
+            }
+            ReplicationMessage::Summary(summary) => metrics.add_replication_io(
+                summary.kind,
+                if out {
+                    "summary_refs_out"
+                } else {
+                    "summary_refs_in"
+                },
+                count(summary.refs.len()),
+            ),
+            ReplicationMessage::Diff(diff) => metrics.add_replication_io(
+                diff.kind,
+                if out { "diff_want_out" } else { "diff_want_in" },
+                count(diff.want.len()),
+            ),
+            ReplicationMessage::Fetch(fetch) => metrics.add_replication_io(
+                fetch.kind,
+                if out { "diff_want_out" } else { "diff_want_in" },
+                count(fetch.want.len()),
+            ),
+            ReplicationMessage::Pull(pull) => {
+                metrics.add_replication_io(pull.kind, if out { "pull_out" } else { "pull_in" }, 1);
+            }
+            ReplicationMessage::CursorPull(pull) => {
+                metrics.add_replication_io(pull.kind, if out { "pull_out" } else { "pull_in" }, 1);
             }
         }
     }
@@ -1339,6 +1532,8 @@ impl ReplicationCoordinator {
             Ok(Some(report)) => tracing::info!(
                 admitted = report.admitted,
                 refused = report.refused,
+                duplicate = report.duplicate,
+                rejected = report.rejected,
                 "subject Pull answered and applied"
             ),
             Ok(None) => tracing::info!("subject Pull throttled by the peer"),
@@ -2490,6 +2685,8 @@ mod tests {
             kind: EnvelopeKind::Revocation,
             admitted: 5,
             refused: 1,
+            duplicate: 0,
+            rejected: 1,
             staleness: StalenessSignal::BoundedBy { missing: 2 },
         };
         assert_eq!(report.kind, EnvelopeKind::Revocation);
@@ -2569,6 +2766,145 @@ mod tests {
         assert_eq!(served(), 0, "the send failed: nothing was served");
         coord_to("bob").send_message(&deliver).await.expect("sent");
         assert_eq!(served(), 2, "one per envelope that left");
+    }
+
+    /// Seat load 2026-11-13 (S0) — **the first in-sync round is booked once,
+    /// and a peer's wire level is counted once.** A responder whose round
+    /// moved rows does not book; the first round that moved nothing either
+    /// way does, with its sums; a later idle round does not again. The first
+    /// frame from the peer counts its frame level (`legacy`: no round
+    /// metadata); the second does not.
+    ///
+    /// Mutation that turns it red: drop the `fs.done` check, or count the
+    /// wire level on every frame.
+    #[tokio::test]
+    async fn first_sync_and_wire_level_are_booked_once_seat_load() {
+        let metrics = crate::observability::EdgeMetrics::default();
+        let (alice_t, _bob_t) = alice_bob_transports();
+        let coord = ReplicationCoordinator::new(
+            Arc::new(alice_t) as Arc<dyn Transport>,
+            "bob",
+            EnvelopeKind::Key,
+            SessionRole::Responder,
+            Arc::new(StaticProvider {
+                state: LocalState::new(),
+                envelopes: HashMap::new(),
+            }),
+            RecordingApplier::with(HashMap::new(), std::collections::HashSet::new()),
+        )
+        .with_metrics(Some(metrics.clone()));
+        let summary = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
+            kind: EnvelopeKind::Key,
+            refs: vec![],
+        });
+        coord
+            .deliver_inbound_framed(summary.clone(), None)
+            .expect("queued");
+        coord.deliver_inbound_framed(summary, None).expect("queued");
+        assert_eq!(metrics.peer_activity().get("wire.legacy").copied(), Some(1));
+        let io = |label: &str| {
+            metrics
+                .replication_io()
+                .get(&format!("key:{label}"))
+                .copied()
+                .unwrap_or(0)
+        };
+        let busy = RoundReport::applied(EnvelopeKind::Key, 2, 0, 0, StalenessSignal::InSync);
+        coord.note_round_complete(&busy);
+        assert_eq!(
+            io("first_sync_complete"),
+            0,
+            "a round that moved rows is not in sync"
+        );
+        let idle = RoundReport::applied(EnvelopeKind::Key, 0, 0, 0, StalenessSignal::InSync);
+        coord.note_round_complete(&idle);
+        assert_eq!(io("first_sync_complete"), 1);
+        assert_eq!(io("first_sync_rounds"), 2, "both rounds counted up to it");
+        coord.note_round_complete(&idle);
+        assert_eq!(io("first_sync_complete"), 1, "once per process");
+    }
+
+    /// Seat load 2026-11-13 (S0) — **`replication_io` counts what a plane
+    /// carried, by direction.** An initiator's Deliver is a push out; a
+    /// responder's is a deliver out; a Deliver handed to a responder is a
+    /// deliver in; a Summary and a Diff count their hashes. A failed send
+    /// counts nothing.
+    ///
+    /// Mutation that turns it red: drop `book_io` from `book_served` or from
+    /// `deliver_inbound_framed`.
+    #[tokio::test]
+    async fn replication_io_counts_rows_bytes_and_hashes_by_direction_seat_load() {
+        let metrics = crate::observability::EdgeMetrics::default();
+        let (alice_t, _bob_t) = alice_bob_transports();
+        let alice_t = Arc::new(alice_t);
+        let coord = |peer: &str, role: SessionRole| {
+            ReplicationCoordinator::new(
+                Arc::clone(&alice_t) as Arc<dyn Transport>,
+                peer,
+                EnvelopeKind::Key,
+                role,
+                Arc::new(StaticProvider {
+                    state: LocalState::new(),
+                    envelopes: HashMap::new(),
+                }),
+                RecordingApplier::with(HashMap::new(), std::collections::HashSet::new()),
+            )
+            .with_metrics(Some(metrics.clone()))
+        };
+        let deliver = ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::Key,
+            envelopes: vec![b"one".to_vec(), b"three".to_vec()],
+        });
+        let io = |label: &str| {
+            metrics
+                .replication_io()
+                .get(&format!("key:{label}"))
+                .copied()
+                .unwrap_or(0)
+        };
+        assert!(coord("nobody_home", SessionRole::Initiator)
+            .send_message(&deliver)
+            .await
+            .is_err());
+        assert_eq!(io("push_rows_out"), 0, "a failed send carried nothing");
+        coord("bob", SessionRole::Initiator)
+            .send_message(&deliver)
+            .await
+            .expect("sent");
+        assert_eq!((io("push_rows_out"), io("push_bytes_out")), (2, 8));
+        let responder = coord("bob", SessionRole::Responder);
+        responder.send_message(&deliver).await.expect("sent");
+        assert_eq!((io("deliver_rows_out"), io("deliver_bytes_out")), (2, 8));
+        responder
+            .deliver_inbound_framed(deliver.clone(), None)
+            .expect("queued");
+        assert_eq!((io("deliver_rows_in"), io("deliver_bytes_in")), (2, 8));
+        responder
+            .deliver_inbound_framed(
+                ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
+                    kind: EnvelopeKind::Key,
+                    refs: vec![
+                        EnvelopeRef {
+                            envelope_hash: h(1),
+                            seq: 1,
+                        },
+                        EnvelopeRef {
+                            envelope_hash: h(2),
+                            seq: 2,
+                        },
+                    ],
+                }),
+                None,
+            )
+            .expect("queued");
+        assert_eq!(io("summary_refs_in"), 2);
+        assert!(metrics
+            .snapshot()
+            .flatten()
+            .counters
+            .contains_key("replication_io"));
     }
 
     /// `drive_round_step(None)` from an Initiator yields a Summary
