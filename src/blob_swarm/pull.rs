@@ -455,6 +455,10 @@ fn epoch_refusal(
     Some(PullOutcome::NoEpoch)
 }
 
+/// 45.1.1 — the `blob_pull_refusals` tag for a parked pull dropped because
+/// the park register (`retry_capacity` entries) was full: that pull is no
+/// longer woken by a grant, an install or a holder claim.
+pub const PULL_REFUSAL_PARK_REGISTER_FULL: &str = "park_register_full";
 /// The `blob_pull_refusals` tag for [`PullOutcome::SizeMismatch`].
 pub const PULL_REFUSAL_SIZE_MISMATCH: &str = "size_mismatch";
 /// The `blob_pull_refusals` tag for [`PullOutcome::NoEpoch`] (CIRISEdge#601 /
@@ -1868,7 +1872,17 @@ where
             },
             (_, group) => key_wake::Awaiting::Holder { group, generation },
         };
-        self.key_waits.park(sha, row, awaiting);
+        self.park_counted(sha, row, awaiting);
+    }
+
+    /// Park `sha` on `awaiting`, counting a pull the full register dropped
+    /// ([`PULL_REFUSAL_PARK_REGISTER_FULL`]) so a seat sees it.
+    fn park_counted(&self, sha: [u8; 32], row: &Attestation, awaiting: key_wake::Awaiting) {
+        if self.key_waits.park(sha, row, awaiting).is_some() {
+            self.edge
+                .metrics()
+                .inc_blob_pull_refusal(PULL_REFUSAL_PARK_REGISTER_FULL);
+        }
     }
 
     /// 45.1.1 — wake every parked pull whose group the scope address table
@@ -3328,7 +3342,7 @@ where
                 // CIRISEdge#779 — parked on the manifest's key: its wrap
                 // (self / family) or its epoch's grant (`community_dek`)
                 // wakes the pull, however long the ladder has given up.
-                self.key_waits.park(
+                self.park_counted(
                     sha,
                     row,
                     match pointer.tier {
@@ -3738,7 +3752,7 @@ where
                 // the ladder below is not giving up on the file.
                 let awaiting = awaiting_of(&readiness.missing);
                 let missing = readiness.missing.len() as u64;
-                self.key_waits.park(sha, row, awaiting);
+                self.park_counted(sha, row, awaiting);
                 // Progress restarts the ladder (and its backoff); bounded,
                 // since `missing` can only fall as many times as it has keys.
                 let attempts_spent = if self.chunk_keys_progressed(sha, missing) {
@@ -3885,7 +3899,7 @@ where
             // refusal and never `NotGranted`.
             Err(e) => match awaiting_key_of(&e) {
                 Some(awaiting) => {
-                    self.key_waits.park(sha, row, awaiting);
+                    self.park_counted(sha, row, awaiting);
                     let retrying = self.book_retry(row, sha, attempts);
                     PullOutcome::DagAwaitingKey { attempts, retrying }
                 }
@@ -5103,6 +5117,36 @@ mod holder_wake_45_1_1_tests {
         let woken = puller.woken_dags();
         assert_eq!(woken.len(), 1, "the claim for its blob wakes it");
         assert_eq!(woken[0].0, sha);
+    }
+
+    /// A full park register drops its oldest pull and COUNTS it, so a seat
+    /// sees pulls that will no longer be woken. Red with the count removed.
+    #[tokio::test]
+    async fn a_pull_dropped_from_a_full_park_register_is_counted() {
+        use crate::blob_swarm::chunk_grants_779_tests::{edge_of, puller_with, two_devices};
+        let (_alice, _node_a, node_b) = two_devices().await;
+        let edge = edge_of(&node_b);
+        let puller = puller_with(
+            &node_b,
+            &edge,
+            PullConfig {
+                retry_capacity: 1,
+                ..PullConfig::default()
+            },
+        );
+        let row = bare_row(ciris_persist::federation::types::cohort_scope::FEDERATION);
+        let full = || {
+            edge.metrics()
+                .blob_pull_refusals
+                .read()
+                .get(PULL_REFUSAL_PARK_REGISTER_FULL)
+                .copied()
+                .unwrap_or(0)
+        };
+        puller.park_unfetched([1; 32], &row, &commons(&[1; 32]), 0, false);
+        assert_eq!(full(), 0, "room for one");
+        puller.park_unfetched([2; 32], &row, &commons(&[2; 32]), 0, false);
+        assert_eq!(full(), 1, "the oldest was dropped, and counted");
     }
 
     /// The bridge reads a holder claim with persist's own parser: `here`

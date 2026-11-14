@@ -131,11 +131,18 @@ impl KeyWaits {
     /// Record that the DAG at `dag` (referenced by `row`) is parked on
     /// `awaiting`. Replaces what it waited on before and keeps a pending
     /// wake: a grant that landed while this attempt was running must still
-    /// re-pull it.
-    pub(crate) fn park(&self, dag: [u8; 32], row: &Attestation, awaiting: Awaiting) {
+    /// re-pull it. Returns the parked pull dropped to make room, if the
+    /// register was full (45.1.1: the caller counts it).
+    pub(crate) fn park(
+        &self,
+        dag: [u8; 32],
+        row: &Attestation,
+        awaiting: Awaiting,
+    ) -> Option<[u8; 32]> {
         let Ok(mut inner) = self.inner.lock() else {
-            return;
+            return None;
         };
+        let mut dropped = None;
         let woken = if let Some(old) = inner.parked.remove(&dag) {
             inner.unindex(dag, &old.awaiting);
             old.woken
@@ -155,6 +162,7 @@ impl KeyWaits {
                         "parked-DAG key register FULL — dropped the oldest; a grant for it \
                          no longer wakes its pull (history: CIRISEdge#779)"
                     );
+                    dropped = Some(oldest);
                 }
             }
             false
@@ -183,6 +191,7 @@ impl KeyWaits {
                 order,
             },
         );
+        dropped
     }
 
     /// The DAG is done waiting (stored, held, or refused for good).
