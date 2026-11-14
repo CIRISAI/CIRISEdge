@@ -413,6 +413,8 @@ pub mod durability;
 mod durability_763_tests;
 #[cfg(test)]
 mod endgame_superseded_tests;
+#[cfg(test)]
+mod park_unfetched_tests;
 pub use durability::{rarest_first, target_mode, DurabilitySweep, Repair};
 mod key_wake;
 pub mod pull;

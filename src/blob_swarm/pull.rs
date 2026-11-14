@@ -191,6 +191,13 @@ impl PullSink {
         }
     }
 
+    /// 45.1.1 — a holder claim (`custody:ack` `here`) for `sha` was admitted:
+    /// a pull parked for want of a holder is woken now. Called at the
+    /// bridge's admission choke, beside [`Self::key_grant_admitted`].
+    pub fn holder_claim_admitted(&self, sha: [u8; 32]) {
+        self.key_waits.wake_holder(sha);
+    }
+
     /// How many offers the full queue has dropped since start-up.
     #[must_use]
     pub fn dropped(&self) -> u64 {
@@ -1462,6 +1469,21 @@ impl BlobChunkVerifier for HashOnlyVerifier {
     }
 }
 
+/// 45.1.1 — whether a whole-blob fetch that failed with `e` parks, and on
+/// what: `Some(true)` on its group's install (`ScopeUnroutable`),
+/// `Some(false)` on a holder claim or its group's install (no holder to take
+/// the bytes from: `NoHolders`, `ChunkUnreachable`, or any failure once the
+/// ladder is spent), `None` while a retry is booked for a failure a holder
+/// claim cannot help.
+pub(crate) fn parks_after(e: &SwarmError, retrying: bool) -> Option<bool> {
+    match e {
+        SwarmError::ScopeUnroutable { .. } => Some(true),
+        SwarmError::ChunkUnreachable { .. } | SwarmError::NoHolders(_) => Some(false),
+        _ if !retrying => Some(false),
+        _ => None,
+    }
+}
+
 /// A pull that did not complete and may be tried again.
 #[derive(Debug, Clone)]
 struct Retry {
@@ -1688,6 +1710,8 @@ where
                     for r in self.due_retries() {
                         self.dispatch(&limiter, r.row, r.sha, r.attempts);
                     }
+                    // 45.1.1 — a group installed since a pull parked on it.
+                    self.wake_installed_scopes();
                     for (sha, row) in self.woken_dags() {
                         self.dispatch(&limiter, row, sha, 0);
                     }
@@ -1820,6 +1844,41 @@ where
         if let Ok(mut seen) = self.chunk_keys_missing.lock() {
             seen.remove(&sha);
         }
+    }
+
+    /// 45.1.1 — park a pull that had nobody to fetch from, so it is woken
+    /// rather than dropped when its ladder runs out (see
+    /// [`key_wake`](super::key_wake)): on its group's install when the group
+    /// was not installed (`scope_unroutable`), else on a holder claim for
+    /// `sha` or its group's install.
+    fn park_unfetched(
+        &self,
+        sha: [u8; 32],
+        row: &Attestation,
+        meaning: &BlobMeaning,
+        generation: u64,
+        scope_unroutable: bool,
+    ) {
+        let group = super::scope::table_key(&meaning.key_plane());
+        let awaiting = match (scope_unroutable, group) {
+            (true, Some((scope, group))) => key_wake::Awaiting::Scope {
+                scope,
+                group,
+                generation,
+            },
+            (_, group) => key_wake::Awaiting::Holder { group, generation },
+        };
+        self.key_waits.park(sha, row, awaiting);
+    }
+
+    /// 45.1.1 — wake every parked pull whose group the scope address table
+    /// has installed since the pull ran. Run on the puller's tick.
+    pub(crate) fn wake_installed_scopes(&self) -> usize {
+        let router = self.edge.blob_scope_router();
+        self.key_waits
+            .wake_installed(router.table_generation(), |scope, group| {
+                router.group_installed(scope, group)
+            })
     }
 
     /// Book a retry, bounded. Returns whether it was booked (false when the
@@ -2482,6 +2541,9 @@ where
                 .await;
         }
         let metrics = self.edge.metrics();
+        // 45.1.1 — the scope table's generation as this attempt begins: a
+        // parked pull wakes only when the table moves past it.
+        let generation = self.edge.blob_scope_router().table_generation();
 
         // Who has it — persist's holder plane, minus ourselves.
         let holders = match self
@@ -2493,6 +2555,7 @@ where
         };
         if holders.is_empty() {
             let retrying = self.book_retry(row, sha, attempts);
+            self.park_unfetched(sha, row, &meaning, generation, false);
             return PullOutcome::NoHolders { attempts, retrying };
         }
 
@@ -2521,6 +2584,11 @@ where
             }
             Err(e) => {
                 let retrying = self.book_retry(row, sha, attempts);
+                // 45.1.1 — nobody to fetch from right now: park, so the group's
+                // install or a new holder's claim wakes it after the ladder.
+                if let Some(scope_unroutable) = parks_after(&e, retrying) {
+                    self.park_unfetched(sha, row, &meaning, generation, scope_unroutable);
+                }
                 return PullOutcome::FetchFailed {
                     reason: e.to_string(),
                     retrying,
@@ -2789,12 +2857,15 @@ where
         meaning: &BlobMeaning,
         author: Option<&Result<crate::contact::Subject, crate::contact::LadderStall>>,
     ) -> PullOutcome {
+        // 45.1.1 — see the whole-blob path.
+        let generation = self.edge.blob_scope_router().table_generation();
         let holders = match self.holders_for(row, sha, attempts, meaning, author).await {
             Ok(h) => h,
             Err(outcome) => return outcome,
         };
         if holders.is_empty() {
             let retrying = self.book_retry(row, sha, attempts);
+            self.park_unfetched(sha, row, meaning, generation, false);
             return PullOutcome::NoHolders { attempts, retrying };
         }
         let fetch = SwarmFetch::new(
@@ -2805,8 +2876,21 @@ where
             self.config.dag_chunks_in_flight,
             sha,
         );
-        self.pull_dag_inner(row, sha, attempts, meaning, &fetch)
-            .await
+        let outcome = self
+            .pull_dag_inner(row, sha, attempts, meaning, &fetch)
+            .await;
+        // 45.1.1 — a DAG whose fetch failed past its ladder parks for a holder
+        // (or its group's install) rather than being dropped.
+        if matches!(
+            outcome,
+            PullOutcome::FetchFailed {
+                retrying: false,
+                ..
+            }
+        ) {
+            self.park_unfetched(sha, row, meaning, generation, false);
+        }
+        outcome
     }
 
     /// **The chunk-DAG pull with a caller's fetcher** (CIRISEdge#717,
@@ -4947,5 +5031,105 @@ mod tests {
         let sink = PullSink::disconnected();
         let row = content_row("community", "room", &SHA);
         assert_eq!(sink.offer(&row), PullOffer::Dropped);
+    }
+}
+
+/// 45.1.1 — a pull with nobody to fetch from parks, and a new holder's claim
+/// wakes it.
+#[cfg(test)]
+mod holder_wake_45_1_1_tests {
+    use super::super::meaning::fixture::{bare_row, commons};
+    use super::*;
+
+    /// Which failures park, and on what. Red at v45.1.0, where none parked.
+    #[test]
+    fn a_fetch_with_no_source_parks_and_a_retryable_one_waits_for_its_ladder() {
+        let unroutable = SwarmError::ScopeUnroutable {
+            blob_sha: "b".into(),
+            reason: "group NOT INSTALLED".into(),
+        };
+        let unreachable = SwarmError::ChunkUnreachable {
+            blob_sha: "b".into(),
+            chunk_sha: "c".into(),
+        };
+        let other = SwarmError::Substrate("disk".into());
+        assert_eq!(
+            parks_after(&unroutable, true),
+            Some(true),
+            "parks on the install"
+        );
+        assert_eq!(
+            parks_after(&unreachable, true),
+            Some(false),
+            "parks on a holder"
+        );
+        assert_eq!(
+            parks_after(&SwarmError::NoHolders("b".into()), true),
+            Some(false)
+        );
+        assert_eq!(parks_after(&other, true), None, "a retry is booked");
+        assert_eq!(
+            parks_after(&other, false),
+            Some(false),
+            "the ladder is spent"
+        );
+    }
+
+    /// A pull parked for want of a holder is woken by an admitted holder
+    /// claim for its blob, and only for its blob. Red with
+    /// `holder_claim_admitted` a no-op.
+    #[tokio::test]
+    async fn a_holder_claim_for_the_blob_wakes_the_pull_parked_on_it() {
+        use crate::blob_swarm::chunk_grants_779_tests::{edge_of, puller_of, two_devices};
+        let (_alice, _node_a, node_b) = two_devices().await;
+        let edge = edge_of(&node_b);
+        let puller = puller_of(&node_b, &edge);
+        let sha = [0x45; 32];
+        let row = bare_row(ciris_persist::federation::types::cohort_scope::FEDERATION);
+        puller.park_unfetched(sha, &row, &commons(&sha), 0, false);
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = PullSink {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            key_waits: Arc::clone(&puller.key_waits),
+            local_key_id: puller.local_key_id.clone(),
+        };
+        sink.holder_claim_admitted([0x99; 32]);
+        assert!(
+            puller.woken_dags().is_empty(),
+            "another blob's claim wakes nothing"
+        );
+        sink.holder_claim_admitted(sha);
+        let woken = puller.woken_dags();
+        assert_eq!(woken.len(), 1, "the claim for its blob wakes it");
+        assert_eq!(woken[0].0, sha);
+    }
+
+    /// The bridge reads a holder claim with persist's own parser: `here`
+    /// names the blob, `none` and any other row name nothing.
+    #[test]
+    fn a_here_custody_report_names_its_blob_and_nothing_else_does() {
+        use ciris_persist::federation::custody_ack::{custody_ack_envelope, CustodyState};
+        let sha = [0x5e; 32];
+        let mut here = bare_row(ciris_persist::federation::types::cohort_scope::COMMUNITY);
+        here.attestation_envelope = custody_ack_envelope(
+            &sha,
+            CustodyState::Here,
+            Some(54),
+            "community",
+            Some("room"),
+        )
+        .expect("envelope");
+        assert_eq!(
+            crate::replication::bridge::holder_claim_sha(&here),
+            Some(sha)
+        );
+        let mut none = here.clone();
+        none.attestation_envelope =
+            custody_ack_envelope(&sha, CustodyState::None, None, "community", Some("room"))
+                .expect("envelope");
+        assert_eq!(crate::replication::bridge::holder_claim_sha(&none), None);
+        let plain = bare_row(ciris_persist::federation::types::cohort_scope::COMMUNITY);
+        assert_eq!(crate::replication::bridge::holder_claim_sha(&plain), None);
     }
 }
