@@ -22,6 +22,19 @@
 //! dropped), one entry per key the DAG still waits on, and a wake is a flag,
 //! so a thousand chunk grants landing inside one tick coalesce into one
 //! re-pull of their DAG.
+//!
+//! **45.1.1 — a pull with nobody to fetch from parks here too.** A pull that
+//! ends `ScopeUnroutable` (its room's group not yet in the scope address
+//! table), `NoHolders`, or a failed fetch (`ChunkUnreachable`, a ladder
+//! spent) used to be dropped once its bounded retry ladder ran out, and
+//! nothing re-offered the row: the body read `not_fetched` for good
+//! (CIRISServer 0.5.247 `big_room`). It now parks on [`Awaiting::Scope`] or
+//! [`Awaiting::Holder`] and is woken by the scope address table installing
+//! its group (the writes the scope lifecycle's install / advance / refresh
+//! verbs make, read through the table's generation on the puller's tick) or
+//! by an admitted holder claim for its blob. The bound is the same register:
+//! at most `capacity` parked pulls of every kind together (the puller's
+//! `retry_capacity`, 256 by default), the oldest dropped with a WARN.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -40,6 +53,23 @@ pub(crate) enum Awaiting {
     /// An epoch-axis grant (`community_dek`): the manifest's sealed-under
     /// epoch, when the pointer names one.
     Epoch(Option<u64>),
+    /// 45.1.1 — the content's group was not installed in the scope address
+    /// table when the pull ran (`ScopeUnroutable`). Woken when the table's
+    /// generation moves past `generation` (the value read as the pull began)
+    /// and the group is installed.
+    Scope {
+        scope: crate::CohortScope,
+        group: String,
+        generation: u64,
+    },
+    /// 45.1.1 — the pull found no holder to take the bytes from (`NoHolders`,
+    /// `ChunkUnreachable`, or a ladder spent on a failed fetch). Woken by a
+    /// holder claim (`custody:ack` `here`) for this blob, and, when the
+    /// content has a group, as [`Self::Scope`] is.
+    Holder {
+        group: Option<(crate::CohortScope, String)>,
+        generation: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -78,7 +108,7 @@ impl Inner {
                     }
                 }
             }
-            Awaiting::Epoch(_) => {}
+            Awaiting::Epoch(_) | Awaiting::Scope { .. } | Awaiting::Holder { .. } => {}
         }
     }
 }
@@ -101,11 +131,18 @@ impl KeyWaits {
     /// Record that the DAG at `dag` (referenced by `row`) is parked on
     /// `awaiting`. Replaces what it waited on before and keeps a pending
     /// wake: a grant that landed while this attempt was running must still
-    /// re-pull it.
-    pub(crate) fn park(&self, dag: [u8; 32], row: &Attestation, awaiting: Awaiting) {
+    /// re-pull it. Returns the parked pull dropped to make room, if the
+    /// register was full (45.1.1: the caller counts it).
+    pub(crate) fn park(
+        &self,
+        dag: [u8; 32],
+        row: &Attestation,
+        awaiting: Awaiting,
+    ) -> Option<[u8; 32]> {
         let Ok(mut inner) = self.inner.lock() else {
-            return;
+            return None;
         };
+        let mut dropped = None;
         let woken = if let Some(old) = inner.parked.remove(&dag) {
             inner.unindex(dag, &old.awaiting);
             old.woken
@@ -125,6 +162,7 @@ impl KeyWaits {
                         "parked-DAG key register FULL — dropped the oldest; a grant for it \
                          no longer wakes its pull (history: CIRISEdge#779)"
                     );
+                    dropped = Some(oldest);
                 }
             }
             false
@@ -140,7 +178,7 @@ impl KeyWaits {
                     inner.by_stream.insert(k.clone(), dag);
                 }
             }
-            Awaiting::Epoch(_) => {}
+            Awaiting::Epoch(_) | Awaiting::Scope { .. } | Awaiting::Holder { .. } => {}
         }
         let order = inner.next_order;
         inner.next_order += 1;
@@ -153,6 +191,7 @@ impl KeyWaits {
                 order,
             },
         );
+        dropped
     }
 
     /// The DAG is done waiting (stored, held, or refused for good).
@@ -214,6 +253,60 @@ impl KeyWaits {
                     p.woken = true;
                     woke += 1;
                 }
+            }
+        }
+        woke
+    }
+
+    /// 45.1.1 — a holder claim (`custody:ack` `here`) for `sha` was admitted.
+    /// Wakes the pull parked on it for want of a holder; returns whether one
+    /// was.
+    pub(crate) fn wake_holder(&self, sha: [u8; 32]) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        match inner.parked.get_mut(&sha) {
+            Some(p) if matches!(p.awaiting, Awaiting::Holder { .. }) => {
+                p.woken = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 45.1.1 — the scope address table is at `generation`. Wakes every pull
+    /// parked on a group (`Scope`, or `Holder` with a group) whose recorded
+    /// generation is older AND whose group `installed` now answers for. A
+    /// parked pull whose group is still missing keeps its old generation and
+    /// is asked again on the next tick; one that was woken records
+    /// `generation`, so a pull that fails again against an unchanged table is
+    /// not woken again (no re-pull loop). Returns how many were woken.
+    pub(crate) fn wake_installed(
+        &self,
+        generation: u64,
+        installed: impl Fn(&crate::CohortScope, &str) -> bool,
+    ) -> usize {
+        let Ok(mut inner) = self.inner.lock() else {
+            return 0;
+        };
+        let mut woke = 0;
+        for p in inner.parked.values_mut() {
+            let (group, seen) = match &mut p.awaiting {
+                Awaiting::Scope {
+                    scope,
+                    group,
+                    generation: seen,
+                }
+                | Awaiting::Holder {
+                    group: Some((scope, group)),
+                    generation: seen,
+                } => ((&*scope, group.as_str()), seen),
+                _ => continue,
+            };
+            if *seen < generation && installed(group.0, group.1) {
+                *seen = generation;
+                p.woken = true;
+                woke += 1;
             }
         }
         woke

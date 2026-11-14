@@ -2,6 +2,87 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.2 — 2026-11-14
+
+**PATCH. Rooms of three or more read their history.** Pins: persist **v61.4.1** by tag (`tag =
+"v61.4.1"`, commit 32e19ede; Python too: `ciris-persist==61.4.1`), CIRISVerify v22.2.0, leviculum
+v0.34.0+ciris.3. Found by the server's `big_room` harness on 0.5.247: a newcomer in a three-person
+room read one history message `not_fetched` and another `seal_mismatch` until teardown, and a
+second run of identical code passed. Three causes, two in edge and one in persist; all three fixed.
+
+### Consumer notes
+
+- **The persist requirement is `ciris-persist==61.4.1`.** Capsules are named for the persist
+  build, so a 61.4.0 wheel is refused at `init_edge_runtime` with `capsule_version_skew`. No
+  migration and no call-shape change.
+- **New counters.** `blob_pull_refusals[park_register_full]` counts a parked pull dropped from the
+  full park register (it is then no longer woken); `link_seal[link_seal_route_fetch_backed_off]`
+  counts a dial refused inside a route-fetch backoff.
+
+### Fixed
+
+- **A body sealed before the newcomer held its author's key now opens (persist v61.4.1,
+  CIRISPersist#1271).** Edge adopts a pulled body with no named minter, and persist chose the
+  epoch's minter as the lone one granting this node, without asking whether it acts for the
+  body's author. On Carol's node Bob's epoch-0 grant arrived first, Alice's body was bound to Bob,
+  and the repair for stranded bindings never moved it (Bob holds a grant): every read was
+  `seal_mismatch`. 61.4.1 filters the lone candidate by acts-for-author, rebinds a stranded
+  binding only onto a minter that acts for the author, and heals a body that does not open on read.
+- **A one-chunk blob with two routable holders is no longer struck out by its own fetch.** The
+  edge holds one waiter per `(blob, chunk)`; the swarm's endgame (always on for a one-chunk blob)
+  sent a duplicate to the second holder, which replaced the first holder's wait, and each closed
+  wait ("channel closed before response") was an error strike. Both holders were retired within
+  milliseconds (20 dispatches in 45 ms on Carol). The endgame now skips a chunk already waiting
+  under any holder, and a replaced wait is neither an answer nor a strike (bounded: past
+  `error_strike_limit` supersessions of one chunk it is a strike again).
+- **A pull with nobody to fetch from parks instead of being dropped.** A pull that ended with its
+  room's group not yet installed in the scope address table, with no holder, with every holder
+  unreachable, or with its retry ladder spent (5 attempts, about 75 s) was dropped, and nothing
+  re-offered the row. It now parks and is woken by the scope address table installing its group,
+  or by an admitted holder claim (`custody:ack` `here`) for its blob.
+  - The scope wake reads a generation counter the table bumps on every write that can make an
+    address appear (install, refresh, install-next, activate-next), rather than hooking the scope
+    lifecycle's verbs: `ScopeLifecycle` is built by the host, so this needs no host change, and it
+    also covers hosts that drive the table directly. A woken pull records the generation, so one
+    that fails again against an unchanged table is not re-pulled every tick.
+  - The park register is shared with the key-wake parks: at most `retry_capacity` entries (256 by
+    default), the oldest dropped with a WARN and counted (`park_register_full`).
+- **Consecutive failed route fetches back their destination off (CIRISEdge#993).** A dial with no
+  transit pair fetches the peer's route row first; when that failed, every caller dialled again
+  on its own schedule, and the outbound drain retries each queued row separately, so N rows toward
+  such a peer were N redials (about 1,700 link up/down a minute per node in the loopback control
+  scenario; the behaviour predates v45.0.2). The first failure toward a destination is free: one
+  immediate retry is kept, the CC 5.3.3.5 E1 / CIRISEdge#964 contract that the dialler cannot see
+  a responder's request cap reopen or its own replaced PQC commitment. From the second
+  consecutive failure a pairless dial is refused before any link opens, for 5 s doubling to
+  5 min; bounded at 4096 destinations. A successful fetch clears it, a verified announce from the
+  peer clears it (the peer may have minted its row), and a dial that holds a pair (a replicated
+  route row) never consults it.
+
+### Tested
+
+- `a_newcomer_opens_a_body_whose_authors_grant_arrived_after_it_1271` (tests/blob_federation_e2e.rs):
+  three members; Bob's grant first; Alice's body through edge's own pull, offered by both holders;
+  Alice's grant after the body; the body opens. Red on v45.1.1 (Rust identical to v45.1.0) with
+  persist 61.4.0 (`SealMismatch`), green here. The two-holder fetch itself is witnessed at the swarm
+  (`a_chunk_with_two_holders_is_asked_once_and_lands`, red with the old endgame filter); the whole
+  path end to end is the server's `big_room`.
+- Every fix has a witness red under its own mutation: the superseded wait, the scope wake (no
+  generation bump), the holder wake, the drop counter, the backoff and its announce reset.
+
+### Known, not fixed in this line
+
+- **CIRISEdge#996:** `direct_links_805`'s relay-leg test loses A/V chunks under CPU contention
+  (5 in 10 interleaved runs, the same at v45.1.0 and here). A/V relay is off on the server for this
+  LTS.
+- **Owner keys reach a six-node room in about 600 s, against about 75 s for three:** the keys land
+  as a staircase whose span is exactly the key-plane memo's 10-minute revalidation on the seat.
+  The memo work waits for after the persist v62 refactor.
+- **CIRISEdge#998:** in six-node runs one node's replication responder can wedge for minutes,
+  every driver stuck in one step while its initiator keeps running (present at v45.1.0). Rows
+  toward that node, including owner bindings and invitations, do not cross until it clears. Under
+  investigation; it is the next fix on this line.
+
 ## 45.1.1 — 2026-11-14
 
 **PATCH. The pin form only.** Persist is pinned by its tag, `tag = "v61.4.0"`, instead of by

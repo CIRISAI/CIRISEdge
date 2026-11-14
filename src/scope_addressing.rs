@@ -584,6 +584,21 @@ fn retire_slot(
 pub struct ScopeAddressTable {
     deriver: Arc<dyn DestinationDeriver>,
     inner: RwLock<Inner>,
+    /// 45.1.1 — bumped by every write that can make an address appear
+    /// (install, refresh, install-next, activate-next), after the write
+    /// lock is released. The blob puller reads it to wake a pull parked on
+    /// a group that was not installed when it ran.
+    generation: std::sync::atomic::AtomicU64,
+}
+
+/// Bumps the table's generation when the writer that declared it returns,
+/// after its write guard (declared later, dropped earlier) is released.
+struct BumpOnDrop<'a>(&'a std::sync::atomic::AtomicU64);
+
+impl Drop for BumpOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl ScopeAddressTable {
@@ -598,7 +613,15 @@ impl ScopeAddressTable {
         Self {
             deriver,
             inner: RwLock::new(Inner::default()),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// 45.1.1 — how many writes that can make an address appear have
+    /// completed. Monotonic; read by the blob puller's scope wake.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
     // ── Cold path: install + rotate ──────────────────────────────────
@@ -616,6 +639,7 @@ impl ScopeAddressTable {
         exporter_secret: &[u8; 32],
         members: &[impl AsRef<str>],
     ) -> Result<usize, ScopeAddressError> {
+        let _bump = BumpOnDrop(&self.generation);
         let mut guard = self.inner.write();
         let inner = &mut *guard;
 
@@ -691,6 +715,7 @@ impl ScopeAddressTable {
         exporter_secret: &[u8; 32],
         members: &[impl AsRef<str>],
     ) -> Result<MembershipRefresh, ScopeAddressError> {
+        let _bump = BumpOnDrop(&self.generation);
         if members.is_empty() {
             return Err(ScopeAddressError::EmptyMembership { epoch });
         }
@@ -792,6 +817,7 @@ impl ScopeAddressTable {
         exporter_secret: &[u8; 32],
         members: &[impl AsRef<str>],
     ) -> Result<usize, ScopeAddressError> {
+        let _bump = BumpOnDrop(&self.generation);
         let mut guard = self.inner.write();
         // Disjoint field borrows: the group state is mutated while the
         // reverse index is read (validation) and then written (commit),
@@ -835,6 +861,7 @@ impl ScopeAddressTable {
         scope: &CohortScope,
         group_id: &str,
     ) -> Result<EpochTransition, ScopeAddressError> {
+        let _bump = BumpOnDrop(&self.generation);
         let mut guard = self.inner.write();
         let inner = &mut *guard;
         let reverse = &mut inner.reverse;

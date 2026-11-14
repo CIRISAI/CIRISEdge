@@ -3168,6 +3168,20 @@ pub type RevocationObserver = Arc<dyn Fn(&str) + Send + Sync>;
 /// default 30 s cadence, so the item-1 bound still re-resolves every round.
 const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(10);
 
+/// 45.1.1 — the blob a holder claim says this device holds: a well-formed
+/// `custody:ack:v1` row in state `here` (CC 3.1.3.3), read with persist's own
+/// parser. `None` for any other row, a `none` report, or a malformed one.
+pub(crate) fn holder_claim_sha(row: &ciris_persist::federation::Attestation) -> Option<[u8; 32]> {
+    use ciris_persist::federation::custody_ack::{parse_custody_ack, CustodyState};
+    let ack = parse_custody_ack(row).ok().flatten()?;
+    if ack.state != CustodyState::Here {
+        return None;
+    }
+    let mut sha = [0u8; 32];
+    hex::decode_to_slice(&ack.blob_sha256_hex, &mut sha).ok()?;
+    Some(sha)
+}
+
 /// Peers whose send-set membership is remembered for change logging.
 const SEND_SET_MEMBERSHIP_CAP: usize = 4096;
 
@@ -14976,6 +14990,12 @@ impl FederationDirectoryReplicationBridge {
                             .is_empty()
                     })
                     .map(|_| record.attestation.clone());
+                // 45.1.1 — a holder claim names a blob a parked pull may be
+                // waiting on a holder for; read before the row moves.
+                let holder_claim: Option<[u8; 32]> = self
+                    .pull_sink
+                    .as_ref()
+                    .and_then(|_| holder_claim_sha(&record.attestation));
                 // persist v38.5.0 (CIRISPersist#771) — the Attestation plane's
                 // typed outcome, the twin of the Key plane's #565
                 // `ReplicatedKeyOutcome` that `key_outcome_to_apply` above has
@@ -15084,6 +15104,10 @@ impl FederationDirectoryReplicationBridge {
                     // node's to pull if the gate agrees. Offered, never awaited.
                     if let (Some(sink), Some(row)) = (self.pull_sink.as_ref(), pull) {
                         let _ = sink.offer(&row);
+                    }
+                    // 45.1.1 — a new holder for a blob a pull parked on.
+                    if let (Some(sink), Some(sha)) = (self.pull_sink.as_ref(), holder_claim) {
+                        sink.holder_claim_admitted(sha);
                     }
                     if let (Some(row), Some(log)) = (
                         receipt_row,

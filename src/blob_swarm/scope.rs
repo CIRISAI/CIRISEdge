@@ -395,6 +395,23 @@ impl BlobScopeRouter {
         self.table.as_ref().map(|t| t.groups()).unwrap_or_default()
     }
 
+    /// 45.1.1 — the table's write generation ([`ScopeAddressTable::generation`]),
+    /// `0` with no table: a parked pull is woken when this moves past the
+    /// value it recorded and its group is installed.
+    #[must_use]
+    pub(crate) fn table_generation(&self) -> u64 {
+        self.table.as_ref().map_or(0, |t| t.generation())
+    }
+
+    /// 45.1.1 — whether the table holds `group` (a [`table_key`] id) at any
+    /// live epoch.
+    #[must_use]
+    pub(crate) fn group_installed(&self, scope: &CohortScope, group: &str) -> bool {
+        self.table
+            .as_ref()
+            .is_some_and(|t| t.live_epochs(scope, group).is_some())
+    }
+
     /// Resolve `peer_key_id` to the address this content's bytes must
     /// move over.
     ///
@@ -889,6 +906,19 @@ pub fn admit_blob_serve(
 /// community holder read as not-in-group on send and every community
 /// arrival as a group mismatch on serve, and both refusals were silent.
 /// Family groups are installed under the id the content names.
+/// 45.1.1 — the `(scope, table group id)` a pull of `content` is addressed
+/// under: the key [`BlobScopeRouter::route`] looks up and the scope lifecycle
+/// installs. `None` for federation content (no group, no install to wait for).
+#[must_use]
+pub(crate) fn table_key(content: &ContentScope) -> Option<(CohortScope, String)> {
+    match content {
+        ContentScope::Federation => None,
+        ContentScope::Group { scope, group_id } => {
+            Some((scope.clone(), table_group_id(scope, group_id)))
+        }
+    }
+}
+
 fn table_group_id(scope: &CohortScope, group_id: &str) -> String {
     crate::scope_room::ScopeRoom::from_content_scope(&ContentScope::Group {
         scope: scope.clone(),

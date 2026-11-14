@@ -74,6 +74,10 @@ pub(crate) struct ChunkWaits {
     /// `(requester key_id, chunk)` → when this node started answering it.
     serving: HashMap<(String, ChunkKey), Instant>,
     serve_permits: ServePermits,
+    /// Test seam: how many fetches registered a wait (CIRISEdge 45.1.1 —
+    /// the witness that one chunk is asked once, not once per holder).
+    #[cfg(test)]
+    pub(crate) registrations: u64,
 }
 
 /// The longest an answer is treated as in flight. The reply path's own
@@ -115,6 +119,10 @@ impl ChunkWaits {
             }
         }
         let (tx, rx) = oneshot::channel();
+        #[cfg(test)]
+        {
+            self.registrations += 1;
+        }
         self.slots.insert(key, Slot::Waiting(tx));
         Wait::Pending(rx)
     }

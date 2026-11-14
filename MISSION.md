@@ -8,10 +8,10 @@
 
 **Version**: 2.0
 **Status**: written at v1.0.0 (Agent 3.0 / CEWP GA, 2026-05-30); the
-shipped line is **v45.x** (v45.1.1 LTS: persist v61.4.0, CIRISVerify v22.2.0,
+shipped line is **v45.x** (v45.1.2 LTS: persist v61.4.1, CIRISVerify v22.2.0,
 leviculum v0.34.0+ciris.3, CC 1.0-rc17, wire vocabulary v1.0.3 since v44.1.2). §11 is the
 v1.0 record; the current threat surface is `docs/THREAT_MODEL.md`.
-**Date**: 2026-05-30 (status line 2026-11-13)
+**Date**: 2026-05-30 (status line 2026-11-14)
 
 This is the reverse-engineered MDD charter for CIRISEdge: it maps the
 four pillars — Mission (WHY) / Protocols (WHO) / Schemas (WHAT) / Logic

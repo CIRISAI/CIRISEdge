@@ -240,6 +240,9 @@ pub mod link_seal;
 /// (`CLM-pre-seal-route-fetch`).
 #[cfg(feature = "_reticulum-module")]
 pub mod route_fetch;
+/// CIRISEdge#993 — a failed route fetch backs its destination off.
+#[cfg(feature = "_reticulum-module")]
+pub(crate) mod route_fetch_backoff;
 #[cfg(feature = "_reticulum-module")]
 pub mod shaping_referral;
 
