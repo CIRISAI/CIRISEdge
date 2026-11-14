@@ -1,5 +1,28 @@
 # CIRISEdge Release Notes
 
+# v45.1.2 — rooms of three or more read their history
+
+**2026-11-14.** **PATCH.** Pins: persist v61.4.1 by tag (exact, Python too:
+`ciris-persist==61.4.1`), CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. Detail in CHANGELOG.md.
+
+- **Python hosts install `ciris-persist==61.4.1`**; a 61.4.0 wheel is refused at init.
+- **A body sealed before a newcomer held its author's key now opens** (persist 61.4.1,
+  CIRISPersist#1271: acts-for-author binding, heal on read, no migration).
+- **A one-chunk blob with two routable holders is fetched once**, instead of the endgame's
+  duplicate striking both holders out within milliseconds.
+- **A pull with nobody to fetch from parks** and is woken by its room's scope install (read
+  through the scope address table's generation, because the scope lifecycle is host-built) or by
+  a holder claim for its blob; the park register is bounded at 256 by default and counts drops
+  (`blob_pull_refusals[park_register_full]`).
+- **Consecutive failed route fetches back their destination off** (CIRISEdge#993): the first
+  failure is free (the E1 / #964 one-retry contract), then 5 s doubling to 5 min; cleared by a
+  successful fetch or a verified announce (`link_seal_route_fetch_backed_off`).
+- **Known:** CIRISEdge#996 (A/V relay-leg chunk loss under CPU contention, present at 45.1.0; relay
+  is off on the server), and owner keys reaching a six-node room in about 600 s (the key-plane
+  memo's revalidation; after the v62 refactor). And CIRISEdge#998: in six-node runs one node's
+  replication responder can wedge for minutes while its initiator keeps running (present at
+  45.1.0); the next fix on this line.
+
 # v45.1.1 — the persist pin by tag
 
 **2026-11-14.** **PATCH.** Persist is pinned by its tag `v61.4.0` instead of by rev `0568ebf3`.
