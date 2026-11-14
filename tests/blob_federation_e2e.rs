@@ -7723,3 +7723,178 @@ async fn an_audience_member_outside_the_live_group_opens_a_kept_streams_chunks_8
         "an unkept call leaves no key_grant row"
     );
 }
+
+/// **45.1.2 — the big_room symptom, whole: a three-person room where the
+/// newcomer holds another member's epoch-0 grant when the author's body
+/// arrives, and the author's own grant lands after the body. The body opens.**
+///
+/// Field (CIRISServer 0.5.247 `big_room`, nroom3b, Carol): Bob's epoch-0
+/// grant reached Carol at 03:39:56; Alice's body was stored at 03:40:06.170
+/// (fetched from two routable holders, Alice and Bob); Alice's own epoch-0
+/// grant landed at 03:40:20. Persist 61.4.0 bound the body to the lone minter
+/// granting Carol (Bob) without asking whether Bob acts for its author; the
+/// stranded repair did not move it (Bob holds a grant), so every read was
+/// `seal_mismatch` until teardown. Persist 61.4.1 (CIRISPersist#1271) filters
+/// the lone candidate by acts-for-author and heals a body that does not open
+/// onto the minter that does.
+///
+/// Driven through edge's own pull path (`pull_inline_with` → the store door,
+/// which adopts with NO named minter, as production does), with both members
+/// that hold the bytes offered as holders. Red on persist 61.4.0: the final
+/// open is `SealMismatch`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // the field's order, step by step, in one place on purpose
+async fn a_newcomer_opens_a_body_whose_authors_grant_arrived_after_it_1271() {
+    use ciris_edge::blob_swarm::{BlobPuller, PullConfig, PullOutcome};
+    use ciris_persist::federation::FederationDirectory;
+
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let carol = Ident::new("carol-fed", 0x33);
+    let all = [&alice, &bob, &carol];
+    let room = "room-big-1271";
+    let node_a = node(&all, &alice).await;
+    let node_b = node(&all, &bob).await;
+    let node_c = node(&all, &carol).await;
+    for n in [&node_a, &node_b, &node_c] {
+        seed_room(n, room, &all).await;
+    }
+    for (from, to) in [
+        (&node_a, &node_b),
+        (&node_a, &node_c),
+        (&node_b, &node_a),
+        (&node_b, &node_c),
+        (&node_c, &node_a),
+        (&node_c, &node_b),
+    ] {
+        federate(from, to).await;
+    }
+
+    // Bob writes first: his node mints ITS epoch 0 for the room and wraps it
+    // to Carol. Alice writes next, under her node's own epoch 0.
+    let _bobs = seal_1271(&node_b, room, &bob, b"bob says hello").await;
+    let body: &[u8] = b"alice wrote this before carol joined";
+    let alices = seal_1271(&node_a, room, &alice, body).await;
+    let sha: [u8; 32] = hex::decode(&alices.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    assert_eq!(
+        alices.epoch,
+        Some(0),
+        "precondition: Alice's body is epoch 0"
+    );
+
+    // 1. Bob's epoch-0 grant reaches Carol first (03:39:56).
+    admit_grants_1271(&node_b, &node_c).await;
+
+    // 2. Alice's body reaches Carol through edge's pull, offered by the two
+    //    members that hold it, Alice and Bob (03:40:06).
+    let edge_c = Arc::new(
+        ciris_edge::Edge::builder()
+            .directory(node_c.dir.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+            .federation_directory(node_c.dir.clone() as Arc<dyn FederationDirectory>)
+            .queue(node_c.dir.clone())
+            .signer(node_c.signer.clone())
+            .transport(Arc::new(ciris_edge::transport::NullTransport))
+            .config(ciris_edge::EdgeConfig::default())
+            .build()
+            .expect("Carol's edge"),
+    );
+    let puller = BlobPuller::new(
+        Arc::clone(&edge_c),
+        node_c.store.engine().clone(),
+        node_c.dir.clone(),
+        node_c.dir.clone() as Arc<dyn FederationDirectory>,
+        node_c.me.clone(),
+        PullConfig::default(),
+    );
+    let row = signed_content_row(&alice, room, &alices.pointer).await;
+    let fetch = StoreFetch {
+        engine: node_a.store.engine().clone(),
+        peer: node_c.me.clone(),
+        holders: vec![node_a.me.clone(), node_b.me.clone()],
+        tamper: None,
+    };
+    let stored = puller.pull_inline_with(&row, sha, &fetch).await;
+    assert!(
+        matches!(stored, PullOutcome::Stored { .. }),
+        "Carol stores Alice's body: {stored:?}"
+    );
+    let before = open_1271(&node_c, &alices.pointer, &alice).await;
+    assert!(
+        before.is_err(),
+        "precondition: Alice's grant has not landed, so the body cannot open yet: {before:?}"
+    );
+
+    // 3. Alice's own epoch-0 grant lands after the body (03:40:20).
+    admit_grants_1271(&node_a, &node_c).await;
+
+    // The body opens. On persist 61.4.0 this stayed `SealMismatch` for good:
+    // the body was bound to Bob's epoch 0 and never moved.
+    let got = open_1271(&node_c, &alices.pointer, &alice)
+        .await
+        .expect("Carol opens Alice's body once Alice's grant has landed (CIRISPersist#1271)");
+    assert_eq!(got, body);
+}
+
+async fn seal_1271(
+    n: &Node,
+    room: &str,
+    author: &Ident,
+    text: &[u8],
+) -> ciris_edge::group_content::SealedContent {
+    n.store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(room),
+            author_key_id: &author.key_id,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: text,
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
+        })
+        .await
+        .expect("seal at the community tier")
+}
+
+async fn open_1271(
+    viewer: &Node,
+    pointer: &BlobPointer,
+    author: &Ident,
+) -> Result<Vec<u8>, GroupContentError> {
+    viewer
+        .store
+        .open(OpenRequest {
+            pointer,
+            author_key_id: &author.key_id,
+            asserted_at: ts(),
+            viewer_key_id: &viewer.me,
+        })
+        .await
+}
+
+/// Every key-grant set `from` emitted, admitted on `to` through its door.
+async fn admit_grants_1271(from: &Node, to: &Node) {
+    use ciris_persist::federation::key_grant::{is_key_grant_row, SignedKeyGrantRow};
+    let rows = ciris_persist::federation::FederationDirectory::list_attestations_since(
+        &*from.dir, None, 400,
+    )
+    .await
+    .expect("list");
+    for row in rows {
+        if is_key_grant_row(&row.attestation) {
+            to.store
+                .engine()
+                .apply_replicated_key_grant(SignedKeyGrantRow {
+                    attestation: row.attestation,
+                })
+                .await
+                .expect("admit the set");
+        }
+    }
+}
