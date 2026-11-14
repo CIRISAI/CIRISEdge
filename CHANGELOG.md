@@ -2,6 +2,14 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.1 — 2026-11-14
+
+**PATCH. The pin form only.** Persist is pinned by its tag, `tag = "v61.4.0"`, instead of by
+`rev = "0568ebf3…"`. It is the same commit and the same tree, so nothing a host runs changes. A
+consumer that pins persist by tag beside edge now resolves one persist source, and a release gate
+that reads `?tag=` from `Cargo.lock` passes. Code, pins and behaviour are otherwise identical to
+45.1.0, and every 45.1.0 note applies.
+
 ## 45.1.0 — 2026-11-13
 
 **MINOR. The long-term support line** for a mesh of at most 100 nodes, until the persist v62
