@@ -4821,7 +4821,8 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // properties that were already here: the pending set is keyed by signer
         // NAME (a repeat note is idempotent), and `take_missing_signer_for`
         // removes on take. One name yields one Pull per peer, and that Pull
-        // REPLACES the tick's ordinary round rather than racing it.
+        // runs ahead of the tick's ordinary round rather than racing it
+        // (CIRISEdge#1005: it no longer replaces it).
         // Third-party signers ARE queueable again: a conferred server answers
         // an identifier Pull for any subject on a public plane (ROLE_MATRIX
         // axis 3), so a name this node cannot resolve locally is reachable by

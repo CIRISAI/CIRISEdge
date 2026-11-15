@@ -1794,12 +1794,23 @@ async fn round_and_report(
     seat: &mut RoundSeat<'_>,
     ended: &mut RoundEnded,
 ) -> RoundClass {
-    // FSD-SIGNER-RECOVERY D3 — a recovery round REPLACES this
-    // tick's ordinary round; the two never overlap. It costs one
-    // cadence tick per recovered key, and only on a tick where a
-    // name is actually queued. At most one name per peer can exist
-    // (D4), so recovery displaces at most one ordinary round per
-    // peer before it is done.
+    // FSD-SIGNER-RECOVERY D3 — a recovery round runs FIRST on a tick where a
+    // name is queued, and the two never overlap: the recovery round is closed
+    // (ended, or abandoned with its session reset) before the ordinary one
+    // opens a round of its own, so a late reply to the Pull names a round this
+    // node no longer drives and is dropped at the registry (CIRISEdge#634).
+    //
+    // CIRISEdge#1005 — the recovery round no longer REPLACES the ordinary
+    // round; the ordinary round follows it in the same tick. The old reading
+    // ("at most one name per peer, so recovery displaces at most one ordinary
+    // round") failed in the field: a host re-queues a contact's missing key
+    // every pass, the seat cannot answer it, and every tick became a recovery
+    // round, so the Summary that offers the node's OWN rows never went and the
+    // seat never met the node that could have unlocked the answer. A recovery
+    // round costs the tick at most one `round_timeout` more (10 s against the
+    // 30 s cadence; a tick that overruns is skipped, never bursted), which is
+    // cheaper than the alternative bound of one ordinary round every N ticks:
+    // that would still delay a fresh node's own Key by N cadences.
     let recovery = match run_one_recovery_round(coord, round_timeout, seat).await {
         Ok(step) => step,
         Err(e) => {
@@ -1845,14 +1856,13 @@ async fn round_and_report(
             DriveStep::Refused => RoundEvent::Refused,
             DriveStep::SendThenWait(_) => RoundEvent::TimedOut,
         };
-        *ended = RoundEnded::of(&event);
-        if let RoundEvent::Completed(report) = &event {
-            coord.note_round_complete(report);
-        }
+        // CIRISEdge#1005 — a recovery round is booked as one, never as the
+        // ordinary round's "first sync complete": it offers nothing of this
+        // node's, so it says nothing about whether the two sides are in sync.
+        coord.note_recovery_round(matches!(event, RoundEvent::Completed(_)));
         if let Some(sink) = event_sink {
             let _ = sink.send((peer_id.to_string(), event)).await;
         }
-        return RoundClass::Other;
     }
     let outcome = run_one_round(coord, round_timeout, seat).await;
     let class = match &outcome {
@@ -2088,7 +2098,8 @@ async fn run_one_round(
 ///
 /// Entering the same loop with `SendThenWait(∅)` sends nothing and waits, so the
 /// only reply it can consume is the Pull's. Combined with the per-peer scheduler
-/// task being sequential — a recovery round REPLACES the tick's ordinary round —
+/// task being sequential — a recovery round is closed before the tick's ordinary
+/// round opens its own (CIRISEdge#1005: it runs after, it no longer replaces it) —
 /// at most one exchange is ever outstanding on a coordinator. That is the
 /// correlation, achieved by construction rather than by a request id, and it
 /// needs no wire change.

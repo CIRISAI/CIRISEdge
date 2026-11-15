@@ -77,16 +77,23 @@ be the Pull's. No new wire verb, no request ID, no protocol version event.
 ### D2 — Correlation by construction: one exchange outstanding per coordinator
 
 Each `(peer, kind)` coordinator has one sequential scheduler task. A recovery
-round **replaces** the ordinary round on its tick, so at no point are two
-exchanges outstanding on one coordinator. This is what makes the absence of
+round runs **before** the ordinary round on its tick and is closed before the
+ordinary round opens its own, so at no point are two exchanges outstanding on one coordinator. This is what makes the absence of
 request IDs safe, and it is the same property the rest of the protocol already
 relies on — the session is a sequential per-peer state machine.
 
-### D3 — A recovery round replaces its tick
+### D3 — A recovery round runs ahead of its tick's ordinary round
 
-Cost: one cadence tick per recovered key, and only on a tick where a name is
-actually queued. Bounded by D4: at most one name per peer exists, so recovery
-can displace at most one ordinary round per peer before it is done.
+Cost: at most one `round_timeout` added to a tick where a name is actually
+queued. The ordinary round always follows in the same tick.
+
+Until v45.1.4 the recovery round *replaced* the tick, on the reading that D4
+bounds the queue to one name per peer, so recovery could displace at most one
+ordinary round. CIRISEdge#1005 measured the opposite: a host re-queues a
+contact's missing key every pass, toward a seat that cannot answer it, so every
+tick became a recovery round and the Summary that offers the node's own rows
+never went. A recovery round is booked apart (`recovery_rounds`), never as the
+ordinary round's `first_sync_complete`.
 
 ### D4 — Queue only what a Pull can satisfy: the delivering peer's own key
 
@@ -164,7 +171,7 @@ Every name states which of the two round types it belongs to.
    against is bounded by two properties that already existed: the pending set is
    keyed by signer name (repeat notes are idempotent) and
    `take_missing_signer_for` removes on take, so N refusals naming one key yield
-   one Pull — which *replaces* the tick's ordinary round rather than racing it.
+   one Pull — which runs ahead of the tick's ordinary round rather than racing it.
 
 ## 7. Out of scope
 
