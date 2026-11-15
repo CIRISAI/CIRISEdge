@@ -208,12 +208,19 @@ renewed in 30 s lapses to normal. The tier does not close forwarding.
 | `link_seal_refused_*` | the side that refused | that the sender knows |
 | `transport_signer_id_mismatch` | this node's own wiring | that peers can key to it |
 | `replication_reply_wait_seconds` | the responder | the reverse path's cause |
+| `replication_envelopes_served_total` | the sender | that the peer admitted the row |
 
 `transport_signer_id_mismatch` stays a gauge. It is set once at construction
 and read back on every refresh. A node at 1 logs one ERROR and carries on, and
 its peers see `link_seal_refused_no_pair`. The server needs a standing token for
 it on top of the field: a node's own 0 says nothing about peers failing to key
 to it, and a 1 is not visible from anywhere else.
+
+`replication_envelopes_served_total` counts the rows this node sent a peer on
+the replication plane, pushed or delivered, each row once, when the transport
+took the frame. Per-direction detail (push, deliver, summary, diff, pull) is in
+`replication_io`. Before 45.1.3 a peer added after start (every initiator on a
+server-composed node) counted into neither.
 
 ## Log events
 

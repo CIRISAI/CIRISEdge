@@ -2,6 +2,88 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.3 — 2026-11-14
+
+**PATCH. A node's replication responder no longer wedges (CIRISEdge#998).** Pins unchanged:
+persist **v61.4.1** by tag (`ciris-persist==61.4.1`), CIRISVerify v22.2.0, leviculum
+v0.34.0+ciris.3. No wire change, no call-shape change, no migration. Found in the server's
+six-person `big_room` runs: one node's responders all sat in one step for minutes (354 s on Dave
+at 45.1.2, 372 s and 483 s on 45.1.0's nroom6b and nroom6c) while its initiator kept running, so
+nothing toward that node crossed, including owner bindings and invitations.
+
+### Fixed
+
+- **A task holding a sweep permit no longer asks for a second one (CIRISEdge#998).** The node-wide
+  sweep gate (two permits by default) is not re-entrant. A stranger's announced-testimony Pull
+  (#907, `subject_pull_answer` arm 4) held its permit across the whole holdings walk, and each row
+  of that walk resolves its recipient through the consent memo, which takes a second permit when
+  the memo is empty or expired. Two concurrent stranger Pulls then held both permits and waited
+  for each other forever.
+  - **Why it froze every plane, not one.** Every other permit taker parked behind them. The store
+    feed's catch-up waits for a page permit while holding the node-wide feed mutex, and the
+    key-plane listing holds its memo lock across that catch-up, so every responder on every plane
+    ended up waiting. Responder steps have no deadline; initiators time out at 10 s, which is why
+    the node still looked alive from outside.
+  - **The fix.** The announced-testimony permit is now taken inside the holdings walk, around the
+    paged store read only, and released before the per-row recipient resolution.
+  - **The class, audited.** A call graph from every permit site in the bridge (all 19, plus the
+    paged-read closures and the offer path by hand) found this one holder able to reach another
+    acquire. No permit holder reaches the feed mutex or a memo lock, so no lock-then-permit order
+    can invert.
+- **A peer added after start counts into the host's metrics.** Every replication coordinator
+  built after `ReplicationRuntime::start` was built with no metrics bag. That covers peers added
+  by `set_peers` / `register_peer`, homed peers, the bundle seats' Pull and their revocation
+  rounds. Only `start`'s initial peers and the responder factory carried one. This predates 45.1.
+  A server-composed node starts with no peers, so before 45.1.3 every initiator on it was
+  unmetered. Its initiator-side counters read zero:
+  - `replication_envelopes_served_total` from pushes;
+  - `replication_io` push, summary, diff and pull rows;
+  - `first_sync_complete`;
+  - `peer_activity.wire`.
+
+  So 45.1.0's seat-load counters were partly dark on the seat. It showed most after 45.1's
+  seat-load changes moved a node's rows from its responders' answers (metered) onto its own push
+  (unmetered). `replication_envelopes_served_total` keeps its meaning: rows sent on the
+  replication plane, pushed or delivered, each row once, when the transport took the frame. It was
+  never meant to count the 45.0.x double delivery of a pushed row. `replication_io` remains the
+  per-direction detail.
+- **A debug guard against re-entry.** In debug builds the sweep gate records which task holds a
+  permit and where it was taken. A task that holds one and asks for another panics under test and
+  logs an error naming both sites in other debug builds. Release builds carry none of it.
+
+### Tested
+
+- `a_strangers_announced_testimony_pull_never_waits_on_a_second_permit_998`
+  (`replication::bridge`): two permits, two concurrent stranger Pulls and the subject's own
+  Key-plane Pull, with an expired consent memo. Red at 45.1.2 on the first of 50 attempts (one
+  permit and one Pull hangs outright); green here.
+- `a_task_holding_a_sweep_permit_cannot_ask_for_another_998` (`sweep_width_tests`): the guard
+  fires on a nested acquire. Both witnesses are red under their own mutation.
+- `a_peer_added_after_start_counts_into_the_hosts_bag` (`replication::runtime`): a runtime
+  started with no peers, a peer added by `set_peers`, its push and a later Deliver read through
+  the host's own `EdgeMetrics`: served = push rows = rows sent, each once. Red (0, 0) with the
+  bag dropped from `build_peer_coordinator`. `every_production_coordinator_is_built_with_metrics`
+  guards the class by source scan.
+- The full integration gate runs in debug, so the guard was live across all of it.
+- **Field confirmation:** with the gate off (`CIRIS_EDGE_ADVERTISE_SWEEP_PERMITS=0` on every
+  node), four six-person `big_room` runs on 45.1.2 + persist 61.4.1 passed 4 of 4 with no
+  `stepping` drops on any node, against 2 wedged runs of 3 at the default permits.
+- **Production:** the seat itself showed only stalls of up to 4.5 s (the Attestation plane, agent
+  CI peers, 2026-11-13); the minutes-long wedge was seen in the six-node harness.
+
+### Known, not fixed in this line
+
+- **CIRISEdge#1000:** a responder step still has no deadline of its own. With the deadlock gone
+  nothing known holds one for long, but a bound is filed for after this line.
+- **CIRISEdge#996:** `direct_links_805`'s relay-leg test loses A/V chunks under CPU contention
+  (present at v45.1.0). A/V relay is off on the server for this LTS.
+- **Owner keys reach a six-node room in about 600 s, against about 75 s for three:** a staircase
+  whose span is the key-plane memo's 10-minute revalidation on the seat; after the persist v62
+  refactor.
+- **CIRISEdge#1002:** an initiator round's opening step (building its Summary and push) runs
+  outside the round timeout, so a stuck opening step never ends its round. Filed for after this
+  line.
+
 ## 45.1.2 — 2026-11-14
 
 **PATCH. Rooms of three or more read their history.** Pins: persist **v61.4.1** by tag (`tag =

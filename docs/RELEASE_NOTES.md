@@ -1,5 +1,30 @@
 # CIRISEdge Release Notes
 
+# v45.1.3 — a node's responder no longer wedges
+
+**2026-11-14.** **PATCH.** Pins unchanged: persist v61.4.1 by tag (`ciris-persist==61.4.1`),
+CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. No wire change. Detail in CHANGELOG.md.
+
+- **A task holding a sweep permit no longer asks for another** (CIRISEdge#998). A stranger's
+  announced-testimony Pull held its permit across a walk that could take a second one; two such
+  Pulls held both permits and waited for each other. The store feed and the key-plane listing
+  park behind the gate while holding their locks, so every responder on every plane on that node
+  waited too. In six-node harness runs that lasted minutes; the production seat showed only
+  stalls up to 4.5 s. The permit is now taken around the paged store read only.
+- **A peer added after start counts into the host's metrics.** Before 45.1.3 every coordinator
+  added after the runtime started had no metrics bag, so on a server-composed node, which starts
+  with no peers, the initiator-side replication counters read zero. Those are served from
+  pushes, `replication_io`, first sync and the peer's wire level. This predates 45.1. Served
+  means rows sent, pushed or delivered, once each.
+- **Debug builds guard the class:** a nested permit acquire panics under test and logs an error
+  naming both sites otherwise.
+- **Witnessed:** a deadlock witness red at 45.1.2 (first of 50 attempts) and green here, and a
+  guard witness; the full integration gate ran in debug with the guard live.
+- **Known:** CIRISEdge#1000 (a responder step has no deadline of its own), CIRISEdge#996 (A/V
+  relay-leg loss under CPU contention; relay is off on the server), and owner keys reaching a
+  six-node room in about 600 s (the key-plane memo's revalidation; after the v62 refactor), and CIRISEdge#1002 (an initiator
+  round's opening step runs outside the round timeout).
+
 # v45.1.2 — rooms of three or more read their history
 
 **2026-11-14.** **PATCH.** Pins: persist v61.4.1 by tag (exact, Python too:

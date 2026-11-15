@@ -1252,6 +1252,7 @@ struct HomedPeers {
     applier: Arc<dyn StateApplier>,
     scheduler_handle: SchedulerHandle,
     current_initiators: Arc<Mutex<HashSet<(String, EnvelopeKind)>>>,
+    metrics: Option<crate::observability::EdgeMetrics>,
     proactive_publish: bool,
     /// Held across peer sets ([`ReplicationRuntime::set_peers`]).
     peers: Arc<Mutex<Vec<ReplicationPeer>>>,
@@ -1276,6 +1277,7 @@ impl HomedPeers {
                 &self.transport,
                 &self.bridge,
                 &self.applier,
+                self.metrics.as_ref(),
                 self.proactive_publish,
                 node,
                 kind,
@@ -1485,6 +1487,7 @@ impl BundlePull {
             &self.transport,
             &self.bridge,
             &self.applier,
+            self.metrics.as_ref(),
             self.proactive_publish,
             seat,
             kind,
@@ -1521,6 +1524,7 @@ impl BundlePull {
                 &self.transport,
                 &self.bridge,
                 &self.applier,
+                self.metrics.as_ref(),
                 self.proactive_publish,
                 &p.peer_key_id,
                 p.kind,
@@ -1793,10 +1797,12 @@ fn spawn_homed_forwarder(homed: HomedPeers, cancel_rx: &watch::Receiver<bool>) {
 }
 
 /// A coordinator in `role` over the runtime's shared parts.
+#[allow(clippy::too_many_arguments)] // the runtime's shared parts, one seam each; `metrics` is CIRISEdge#998's bag fix
 fn build_peer_coordinator(
     transport: &Arc<dyn Transport>,
     bridge: &Arc<FederationDirectoryReplicationBridge>,
     applier: &Arc<dyn StateApplier>,
+    metrics: Option<&crate::observability::EdgeMetrics>,
     proactive_publish: bool,
     peer_key_id: &str,
     kind: EnvelopeKind,
@@ -1819,6 +1825,12 @@ fn build_peer_coordinator(
             provider,
             applier,
         )
+        // The host's bag, as `start`'s initial initiators and the responder
+        // factory carry it: without it every counter the coordinator books
+        // (served, `replication_io`, first sync, the peer's wire level) is
+        // dark for each peer added after start, which on a server-composed
+        // node (started with no peers) is every initiator.
+        .with_metrics(metrics.cloned())
         .with_proactive_publish(proactive_publish),
     )
 }
@@ -2183,6 +2195,7 @@ impl ReplicationRuntime {
                 applier: Arc::clone(&shared_applier),
                 scheduler_handle: scheduler_handle.clone(),
                 current_initiators: Arc::clone(&current_initiators),
+                metrics: config.metrics.clone(),
                 proactive_publish,
                 peers: Arc::clone(&homed_peers),
             },
@@ -2715,6 +2728,7 @@ impl ReplicationRuntime {
             &self.transport,
             &self.bridge,
             &self.applier,
+            self.config.metrics.as_ref(),
             self.proactive_publish,
             peer_key_id,
             kind,
@@ -3677,6 +3691,126 @@ mod tests {
             .await
             .is_none());
         rt.shutdown().await;
+    }
+
+    /// **A peer added after start counts into the host's bag.** A
+    /// server-composed node starts with no peers and gets every initiator from
+    /// `set_peers` (or homing, or the bundle Pull), all built by
+    /// `build_peer_coordinator`, which carried no metrics: served, the
+    /// `replication_io` push/summary/diff/pull rows, first sync and the
+    /// peer's wire level read zero for every one of them. Here the runtime
+    /// starts with no peers, `set_peers` adds one, and its coordinator's sends
+    /// are read through the SAME `EdgeMetrics` the host passed in: a push
+    /// books served = rows pushed, a later Deliver for other rows books the
+    /// sum, and each row is counted once (served equals the push rows).
+    ///
+    /// Mutation that turns it red: drop `.with_metrics(..)` from
+    /// `build_peer_coordinator`.
+    #[tokio::test]
+    async fn a_peer_added_after_start_counts_into_the_hosts_bag() {
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
+        let directory: Arc<dyn FederationDirectory> = backend;
+        let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
+        let host_bag = crate::observability::EdgeMetrics::default();
+        let config = ReplicationRuntimeConfig {
+            metrics: Some(host_bag.clone()),
+            scheduler: SchedulerConfig {
+                cadence: std::time::Duration::from_hours(1),
+                ..SchedulerConfig::default()
+            },
+            ..unit_config()
+        };
+        let mut rt =
+            ReplicationRuntime::start(directory, transport, Vec::new(), config, None).await;
+        rt.set_peers(vec![ReplicationPeer {
+            peer_key_id: "seat-a".to_string(),
+            kind: EnvelopeKind::Key,
+        }])
+        .await
+        .expect("set_peers");
+        let coord = rt
+            .registry()
+            .get_initiator("seat-a", EnvelopeKind::Key)
+            .await
+            .expect("set_peers hot-added the initiator");
+        let served = || {
+            host_bag
+                .snapshot()
+                .replication_envelopes_served_total
+                .get(&EnvelopeKind::Key)
+                .copied()
+                .unwrap_or(0)
+        };
+        let pushed = || {
+            host_bag
+                .replication_io()
+                .get("key:push_rows_out")
+                .copied()
+                .unwrap_or(0)
+        };
+        // The start-up round may already have sent its Summary; only what
+        // these sends add is measured.
+        let (served0, pushed0) = (served(), pushed());
+        let deliver = |rows: &[&[u8]]| {
+            crate::replication::protocol::ReplicationMessage::Deliver(
+                crate::replication::protocol::DeliverMessage {
+                    kind: EnvelopeKind::Key,
+                    envelopes: rows.iter().map(|r| r.to_vec()).collect(),
+                },
+            )
+        };
+        coord
+            .send_message(&deliver(&[b"row-1", b"row-2"]))
+            .await
+            .expect("push sent");
+        assert_eq!(
+            (served() - served0, pushed() - pushed0),
+            (2, 2),
+            "a push from a peer added after start is served, in the host's bag"
+        );
+        coord
+            .send_message(&deliver(&[b"row-3"]))
+            .await
+            .expect("deliver sent");
+        assert_eq!(served() - served0, 3, "push plus a Deliver books the sum");
+        assert_eq!(
+            served() - served0,
+            pushed() - pushed0,
+            "each row sent is counted once"
+        );
+        rt.shutdown().await;
+    }
+
+    /// **Every production coordinator carries the host's bag.** A source scan
+    /// of this file's non-test half: each `ReplicationCoordinator::new(` is
+    /// followed by `.with_metrics(` before its builder chain ends. This file
+    /// is the only production builder of coordinators (the others are test
+    /// fixtures).
+    #[test]
+    fn every_production_coordinator_is_built_with_metrics() {
+        let src = include_str!("runtime.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the file has a non-test half");
+        let needle = concat!("ReplicationCoordinator", "::new(");
+        let mut sites = 0;
+        for (at, _) in prod.match_indices(needle) {
+            sites += 1;
+            let line = prod[..at].lines().count();
+            // The builder chain: the constructor's arguments and the
+            // `.with_*` calls that follow, well inside 16 lines.
+            let chain: String = prod[at..].lines().take(16).collect::<Vec<_>>().join("\n");
+            assert!(
+                chain.contains(".with_metrics("),
+                "runtime.rs:{line}: a production ReplicationCoordinator is built without \
+                 .with_metrics(..), so every counter it books is dark"
+            );
+        }
+        assert!(
+            sites >= 3,
+            "found only {sites} builder sites; the scan is stale"
+        );
     }
 
     /// `shutdown` is idempotent.
