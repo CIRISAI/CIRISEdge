@@ -3408,7 +3408,10 @@ pub struct EdgeMetrics {
     /// coordinator's Summary observer (protocol-native acks).
     pub removal_receipts: Arc<RwLock<RemovalReceiptLedger>>,
     /// CIRISEdge#433 — per-[`EnvelopeKind`] count of envelopes the REPLICATION
-    /// plane served to a peer. The mirror-image defect of the withhold blindness:
+    /// plane sent to a peer: pushed (an initiator's Deliver beside its
+    /// Summary) or delivered (an answer to a Diff or a Fetch), each row once,
+    /// when its send returned. `replication_io` holds the per-direction
+    /// detail. The mirror-image defect of the withhold blindness:
     /// [`Self::envelopes_sent_total`] is bumped only from `src/edge.rs`
     /// application/durable paths, so a node that moved 56 trace rows through
     /// anti-entropy rounds reported `envelopes_sent_total: 0` — reporting broken
@@ -4363,7 +4366,7 @@ impl EdgeMetrics {
     /// CIRISEdge#433 — increment the replication-plane served counter for `kind`.
     ///
     /// Called by the coordinator once per envelope of a `Deliver` whose send
-    /// returned: not at a fetch, because a proactive push fetches before
+    /// returned, pushed or delivered (each row is sent, and counted, once): not at a fetch, because a proactive push fetches before
     /// anything has left. It marks the transport taking the frame, not the
     /// peer acknowledging it.
     pub fn inc_replication_served(&self, kind: EnvelopeKind) {

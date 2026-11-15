@@ -1387,7 +1387,7 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("announce_to_binding_ms_last", "ciris.edge.announce.to_binding_last", Gauge, Milliseconds, None, "The latest first-seen bind's latency."),
     spec("withholds_by_reason", "ciris.edge.withholds", Counter, Count, REASON, "Rows withheld from a peer, by reason."),
     spec("recent_withholds", "ciris.edge.withholds.recent", Gauge, Count, Some(("peer", LabelValues::PeerKeyed)), "The latest withholds with their peer. Names peers: never public."),
-    spec("replication_envelopes_served_total", "ciris.edge.replication.envelopes_served", Counter, Count, KINDS, "Envelopes served, by kind."),
+    spec("replication_envelopes_served_total", "ciris.edge.replication.envelopes_served", Counter, Count, KINDS, "Envelopes sent on the replication plane, pushed or delivered, by kind."),
     spec("apply_refusals_by_kind", "ciris.edge.apply_refusals.by_kind", Counter, Count, KINDS, "Apply refusals, by kind."),
     spec("key_apply_refusals_by_reason", "ciris.edge.apply_refusals.key", Counter, Count, REASON, "Key-plane refusals, by persist token."),
     spec("attestation_apply_refusals_by_reason", "ciris.edge.apply_refusals.attestation", Counter, Count, REASON, "Attestation refusals, by persist token."),
