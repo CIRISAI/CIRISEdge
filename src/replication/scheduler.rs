@@ -3383,6 +3383,141 @@ mod tests {
         assert!(rx.try_recv().is_err(), "and nothing may be put on the wire");
     }
 
+    /// A node's own Key rows, plus a recovery name its host re-queues every
+    /// pass (a contact's key still missing: "KEY FETCH STALLED").
+    struct RequeueingProvider {
+        own: StaticProvider,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl StateProvider for RequeueingProvider {
+        async fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            self.own.local_refs(kind).await
+        }
+        async fn fetch_envelope(&self, kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
+            self.own.fetch_envelope(kind, h).await
+        }
+        fn take_missing_signer_for(&self, _peer_key_id: &str) -> Option<String> {
+            self.asked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some("stranger".to_string())
+        }
+    }
+
+    /// CIRISEdge#1005 — **a recovery round never costs a peer its ordinary
+    /// round.** The node's host re-queues a stranger's key every pass, toward
+    /// a seat that answers the Pull with an empty Summary (it does not hold
+    /// that key). Before the fix every tick was a recovery round, the ordinary
+    /// round's Summary never went, and the node's own Key rows never reached
+    /// the seat (field: 62 recovery rounds in 297 s, no ordinary Key round).
+    #[tokio::test]
+    async fn a_requeued_recovery_name_does_not_starve_the_own_key_round() {
+        let (alice_to_bob_tx, mut alice_to_bob_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (bob_to_alice_tx, mut bob_to_alice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let alice_transport = Arc::new(InMemTransport {
+            peer_inbox: HashMap::from([("bob".to_string(), alice_to_bob_tx)]),
+        });
+        let bob_transport = Arc::new(InMemTransport {
+            peer_inbox: HashMap::from([("alice".to_string(), bob_to_alice_tx)]),
+        });
+        let mut a_state = LocalState::new();
+        a_state.insert(EnvelopeKind::Key, h(1), 1);
+        a_state.insert(EnvelopeKind::Key, h(2), 2);
+        let alice_provider = Arc::new(RequeueingProvider {
+            own: StaticProvider {
+                state: a_state,
+                envelopes: HashMap::from([(h(1), b"env_1".to_vec()), (h(2), b"env_2".to_vec())]),
+            },
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let bob_provider = Arc::new(StaticProvider {
+            state: LocalState::new(),
+            envelopes: HashMap::new(),
+        });
+        let alice_applier =
+            RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
+        let bob_applier = Arc::new(RecordingApplier {
+            known: HashMap::from([(b"env_1".to_vec(), h(1)), (b"env_2".to_vec(), h(2))]),
+            local_hashes: std::sync::Mutex::new(std::collections::HashSet::new()),
+        });
+        let alice_coord = Arc::new(ReplicationCoordinator::new(
+            alice_transport,
+            "bob",
+            EnvelopeKind::Key,
+            SessionRole::Initiator,
+            alice_provider.clone(),
+            alice_applier,
+        ));
+        let bob_coord = Arc::new(ReplicationCoordinator::new(
+            bob_transport,
+            "alice",
+            EnvelopeKind::Key,
+            SessionRole::Responder,
+            bob_provider,
+            bob_applier.clone(),
+        ));
+        let bob_route = bob_coord.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = alice_to_bob_rx.recv().await {
+                let msg = ReplicationCoordinator::parse_inbound_bytes(&bytes).unwrap();
+                let _ = bob_route.deliver_inbound(msg);
+            }
+        });
+        let alice_route = alice_coord.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = bob_to_alice_rx.recv().await {
+                let msg = ReplicationCoordinator::parse_inbound_bytes(&bytes).unwrap();
+                let _ = alice_route.deliver_inbound(msg);
+            }
+        });
+        let bob_drive = bob_coord.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = bob_drive.recv_inbound().await {
+                let Ok(step) = bob_drive.drive_round_step(Some(msg)).await else {
+                    continue;
+                };
+                if let DriveStep::SendThenWait(msgs) = step {
+                    for m in &msgs {
+                        let _ = bob_drive.send_message(m).await;
+                    }
+                }
+            }
+        });
+
+        let mut sched = ReplicationScheduler::new(fast_config());
+        sched.add_initiator(alice_coord.clone());
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let sched_handle =
+            tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
+
+        let landed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if bob_applier.local_hashes.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let asked = alice_provider
+            .asked
+            .load(std::sync::atomic::Ordering::Relaxed);
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sched_handle)
+            .await
+            .expect("scheduler shutdown")
+            .expect("scheduler join");
+        assert!(asked > 0, "the recovery name was asked for");
+        assert!(
+            landed.is_ok(),
+            "the node's own Key rows must reach the seat while a recovery name is \
+             re-queued every pass ({asked} recovery asks, own rows never offered: \
+             CIRISEdge#1005)"
+        );
+    }
+
     /// FSD-SIGNER-RECOVERY invariant 3 — only the `Key` coordinator recovers.
     ///
     /// `start_pull` sends `PullMessage { kind: self.kind, .. }`, and the row
