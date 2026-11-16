@@ -626,13 +626,11 @@ async fn a_room_row_refused_not_in_audience_lands_right_after_the_room_record_11
     );
     let backoff = bridge_b.refusal_backoff_for_test();
     let gate = format!("audience:group:{ROOM}");
-    assert_eq!(backoff.parked_on(&gate), 1, "parked on the room");
+    assert_eq!(backoff.parked_on(&gate), 1, "indexed on the room");
+    // 45.1.5 — transient (persist's is_retryable), so quiet for its window
+    // only; the room's record releases it sooner.
     assert!(
-        backoff.suppressed_at(
-            EnvelopeKind::Attestation,
-            &hash,
-            Instant::now() + Duration::from_mins(1)
-        ),
+        backoff.suppressed_at(EnvelopeKind::Attestation, &hash, Instant::now()),
         "quiet while B is outside the room"
     );
 

@@ -878,13 +878,14 @@ fn audience_release_keys(bytes: &[u8]) -> Vec<String> {
 ///   did not apply; since v59.0.0 it no longer folds in the pending proposal,
 ///   which persist split out so this token can stop).
 ///
-/// persist v61 S2 (CIRISPersist#1148) — ONE override: `not_in_audience` (a
-/// replicated row this node is not in the audience for). persist marks it
-/// retryable (the roster may yet admit this node), but nothing about the
-/// offering peer's next round changes it, so edge books it TERMINAL: the
-/// per-(peer, row) refusal backoff then re-asks on its terminal schedule
-/// instead of every round, forever. Matched by persist's token, so the arm
-/// holds on a persist that does not name the variant yet.
+/// persist v61 S2 (CIRISPersist#1148) — `not_in_audience` (a replicated row
+/// this node is not in the audience for) is retryable by persist's own table
+/// ("the audience can widen, and a re-offer then lands"). Until 45.1.5 edge
+/// overrode it TERMINAL; it now follows persist like every other token. The
+/// choke indexes it on its audience gate as an ORDINARY row
+/// (`index_on_audience`): the gate's release forgets it at once, and the #858
+/// transient cap still falls it to the terminal schedule when nothing ever
+/// releases it, so it is never asked for every round forever.
 fn attestation_refusal_retry(
     reason: ciris_persist::federation::attestation_apply::AttestationRefusalReason,
 ) -> RetryDisposition {
@@ -894,8 +895,8 @@ fn attestation_refusal_retry(
 /// [`attestation_refusal_retry`] on persist's token and its own
 /// `is_retryable`, so the `not_in_audience` override is witnessed on a persist
 /// that does not name the variant yet.
-fn attestation_refusal_retry_of(token: &str, persist_retryable: bool) -> RetryDisposition {
-    if token == ATTESTATION_NOT_IN_AUDIENCE || !persist_retryable {
+fn attestation_refusal_retry_of(_token: &str, persist_retryable: bool) -> RetryDisposition {
+    if !persist_retryable {
         RetryDisposition::Terminal
     } else {
         RetryDisposition::Transient
@@ -6374,6 +6375,11 @@ impl FederationDirectoryReplicationBridge {
                 // really was removed still falls to the terminal schedule.
                 if outcome_awaits_roster(outcome) {
                     self.index_on_roster(kind, hash, envelope_bytes, source_peer);
+                } else if is_not_in_audience_refusal(outcome) {
+                    // 45.1.5 — the #1006 rule for `not_in_audience`: indexed
+                    // on what gates it (its group, else its attester's owner
+                    // axis), an ordinary transient row.
+                    self.index_on_audience(kind, hash, envelope_bytes, source_peer);
                 } else
                 // persist v54.1.0 (#1042 follow-up) — a HELD signer persist
                 // said does not act for the row's identity yet
@@ -6507,6 +6513,24 @@ impl FederationDirectoryReplicationBridge {
             &audience_owner_key(group_or_key),
             ReleaseCause::AudienceChanged,
         )
+    }
+
+    /// 45.1.5 — index a `not_in_audience` refusal on the first gate
+    /// [`audience_gate_keys`] names (its group, else its attester's owner
+    /// axis): the gate an admitted roster, membership row, owner binding or
+    /// replication consent releases (#1148). Its schedule is untouched.
+    fn index_on_audience(
+        &self,
+        kind: EnvelopeKind,
+        hash: [u8; 32],
+        envelope_bytes: &[u8],
+        source_peer: Option<&str>,
+    ) {
+        if let Some(gate) = audience_gate_keys(envelope_bytes).first() {
+            let _ = self
+                .refusal_backoff
+                .index_ordinary_on(kind, hash, gate, source_peer);
+        }
     }
 
     /// CIRISEdge#1006 — index a refusal its group's roster decides on that
@@ -15047,7 +15071,9 @@ impl FederationDirectoryReplicationBridge {
                 == ciris_persist::federation::key_grant::KeyGrantRefusalReason::RecipientNotInAudience
                     .as_str() =>
             {
-                ApplyOutcome::refused_terminal(format!(
+                // 45.1.5 — transient, as persist's table says; indexed on its
+                // audience gate by the choke like the general door's.
+                ApplyOutcome::refused(format!(
                     "key_grant: row refused at the attestation plane \
                      ({ATTESTATION_NOT_IN_AUDIENCE}) — {reason}: {detail} — \
                      attestation_id={attestation_id} type={attestation_type} sealer={minter}"
@@ -17492,10 +17518,12 @@ pub(crate) mod tests {
                         "{reason}: the message names the SAME branch the ledger books: {msg}"
                     );
                     // persist v59.0.0 — the split: a pending roster proposal is
-                    // retried, a refused key-plane row is not. persist v61 S2 —
-                    // `not_in_audience` is retryable by persist and TERMINAL here.
+                    // retried, a refused key-plane row is not. 45.1.5 —
+                    // `not_in_audience` follows persist: retryable.
                     let expected = match reason {
-                        R::StoreConflict | R::SelfRosterPending => RetryDisposition::Transient,
+                        R::StoreConflict | R::SelfRosterPending | R::NotInAudience => {
+                            RetryDisposition::Transient
+                        }
                         _ => RetryDisposition::Terminal,
                     };
                     assert_eq!(
@@ -17508,23 +17536,21 @@ pub(crate) mod tests {
     }
 
     /// persist v61 S2 (CIRISPersist#1148) — `not_in_audience` is retryable by
-    /// persist's predicate, and edge books it TERMINAL so the per-(peer, row)
-    /// refusal backoff re-asks on its terminal schedule, never every round.
-    /// Every other token keeps persist's disposition.
+    /// persist's predicate. Until 45.1.5 edge overrode it TERMINAL; every token
+    /// now keeps persist's disposition, and the choke's gate index (plus the
+    /// #858 cap) is what keeps a never-released one off the every-round loop.
     #[test]
-    fn not_in_audience_is_terminal_whatever_persist_says() {
+    fn not_in_audience_follows_persists_disposition() {
         use ciris_persist::federation::attestation_apply::AttestationRefusalReason as R;
-        // The token edge matches is persist's own, and persist calls it
-        // retryable — the override is what makes it terminal.
         assert_eq!(R::NotInAudience.as_str(), ATTESTATION_NOT_IN_AUDIENCE);
         assert!(R::NotInAudience.is_retryable());
         assert_eq!(
             attestation_refusal_retry(R::NotInAudience),
-            RetryDisposition::Terminal
+            RetryDisposition::Transient
         );
         assert_eq!(
             attestation_refusal_retry_of(ATTESTATION_NOT_IN_AUDIENCE, true),
-            RetryDisposition::Terminal
+            RetryDisposition::Transient
         );
         assert_eq!(
             attestation_refusal_retry_of(ATTESTATION_NOT_IN_AUDIENCE, false),
@@ -17609,8 +17635,9 @@ pub(crate) mod tests {
             1,
             "parked on its room"
         );
+        // 45.1.5 — transient now: quiet for its window, released sooner.
         assert!(
-            backoff.suppressed_at(kind, &hash, Instant::now() + Duration::from_mins(1)),
+            backoff.suppressed_at(kind, &hash, Instant::now()),
             "quiet while the room has not admitted this node"
         );
 
@@ -17876,14 +17903,15 @@ pub(crate) mod tests {
     /// ladder.
     #[tokio::test]
     async fn a_not_in_audience_row_nothing_releases_stays_on_the_terminal_floor_1148() {
-        use crate::replication::refusal_backoff::TERMINAL_BASE;
+        // 45.1.5 — the floor is reached through the #858 cap now, not a park:
+        // the row rides the transient ladder and falls to the terminal
+        // schedule, so a gate nothing releases never loops every round.
         use sha2::{Digest as _, Sha256};
         let (_backend, bridge) = make_bridge(&[]);
         let kind = EnvelopeKind::Attestation;
         let wire = audience_row_1148("grant-1148b", "person-owner", "chat:message:v1", "room-a");
         let hash: [u8; 32] = Sha256::digest(&wire).into();
         let refused = not_in_audience_outcome_1148();
-        let t0 = Instant::now();
         bridge.remember_outcome(kind, &wire, &refused);
         bridge
             .park_or_release(kind, &wire, &refused, Some("peer-p"))
@@ -17896,20 +17924,22 @@ pub(crate) mod tests {
         assert_eq!(
             backoff.parked_on("audience:group:room-a"),
             1,
-            "still parked"
+            "still indexed: another room's row releases nothing"
+        );
+        let t0 = Instant::now();
+        let mut moved = false;
+        for _ in 0..64 {
+            moved |= backoff
+                .record_tracked_at(kind, hash, RetryDisposition::Transient, None, t0)
+                .moved_to_terminal;
+        }
+        assert!(
+            moved,
+            "the #858 cap falls it to the terminal schedule — no loop"
         );
         assert!(
-            backoff.suppressed_at(
-                kind,
-                &hash,
-                t0 + TERMINAL_BASE.saturating_sub(Duration::from_secs(1))
-            ),
-            "quiet for the whole terminal window — no loop"
-        );
-        let second = backoff.record_at(kind, hash, RetryDisposition::Terminal, t0 + TERMINAL_BASE);
-        assert!(
-            second > TERMINAL_BASE,
-            "a repeat refusal backs off further: {second:?}"
+            backoff.suppressed_at(kind, &hash, t0 + Duration::from_mins(10)),
+            "quiet on the terminal schedule"
         );
     }
 
