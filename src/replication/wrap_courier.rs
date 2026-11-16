@@ -299,11 +299,11 @@ impl Courier {
                 self.book("wrap_courier_refused", carry.len());
                 self.retry_or_give_up(recipient, None);
             }
-            Err(e) => self.retry_or_give_up(recipient, Some(e)),
+            Err(e) => self.retry_or_give_up(recipient, Some(&e)),
         }
     }
 
-    fn retry_or_give_up(&mut self, recipient: &str, error: Option<String>) {
+    fn retry_or_give_up(&mut self, recipient: &str, error: Option<&str>) {
         let Some(p) = self.pending.get_mut(recipient) else {
             return;
         };
@@ -317,7 +317,7 @@ impl Courier {
             }
             tracing::info!(
                 attempts = MAX_ATTEMPTS,
-                error = error.as_deref().unwrap_or("refused"),
+                error = error.unwrap_or("refused"),
                 "wrap courier gave up on a member's wraps after its bound; a later \
                  round between the two (or a restart) carries them"
             );

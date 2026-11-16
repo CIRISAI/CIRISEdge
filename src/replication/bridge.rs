@@ -893,13 +893,13 @@ fn attestation_refusal_retry(
 }
 
 /// [`attestation_refusal_retry`] on persist's token and its own
-/// `is_retryable`, so the `not_in_audience` override is witnessed on a persist
-/// that does not name the variant yet.
+/// `is_retryable`: persist's disposition, for every token (45.1.5 retired the
+/// `not_in_audience` override).
 fn attestation_refusal_retry_of(_token: &str, persist_retryable: bool) -> RetryDisposition {
-    if !persist_retryable {
-        RetryDisposition::Terminal
-    } else {
+    if persist_retryable {
         RetryDisposition::Transient
+    } else {
+        RetryDisposition::Terminal
     }
 }
 
