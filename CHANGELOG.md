@@ -2,6 +2,102 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.4 — 2026-11-15
+
+**PATCH. A new node is no longer locked out of a seat, its own Key is no longer starved by
+recovery rounds, and a member's row that beats their acceptance lands (CIRISEdge#1004, #1005,
+#1006).** Pins unchanged: persist **v61.4.1** by tag (`ciris-persist==61.4.1`), CIRISVerify
+v22.2.0, leviculum v0.34.0+ciris.3. No wire change, no call-shape change, no migration. All three
+were found in the server's harness and QA runs against 45.1.3.
+
+### Fixed
+
+- **A new node that returns on a second transport identity is not locked out (CIRISEdge#1004,
+  seat side).** A brand-new node announced on transport identity A and was bound Advisory, with no
+  Key row at the seat yet. When the same key came back on identity B at the same epoch (a wiped
+  `data/edge`, or a stray process that shared the key), the seat read B as a stale re-announce:
+  at equal epoch only an owner may move a route, and with no Key row the seat's directory could
+  not confirm ownership. Every link from B missed attribution and was torn down inside the E1
+  hold before the #402 carve-out could land B's Key row, so the lockout never cleared.
+  - **The fix.** On `UnknownKeyId` the seat now accepts the announce's own ownership proof: the
+    key id's fingerprint is the claimed pubkey's and the attestation self-verifies under it. This
+    is the #636 proof Stage 1 already binds every first-seen peer on. B then reroutes as the owner
+    (the #336 owner reroute), its links are attributed, and its Key row lands.
+  - **Why this is the smallest change.** Supersession rules are unchanged. Only the input that was
+    missing on `UnknownKeyId` is supplied, and it is used only over a resident entry that is not
+    Rooted, so a Rooted route still moves only on the directory's verdict (CRITICAL-1, #337).
+  - **Spoofing.** The proof needs the federation private key. An attacker who knows only the key
+    id cannot produce it, so it cannot evict anything it could not evict before. It also loses the
+    lockout it had: a spoofer that announced first under a new node's key id is now superseded
+    by the real node.
+  - **A stale announce from another identity no longer keeps the resident alive.** The
+    IgnoreStale arm refreshed the resident's LRU stamp whatever identity announced. It now does so
+    only for the resident's own transport key (#530's liveness ordering is otherwise unchanged).
+- **A recovery round no longer costs a peer its ordinary round (CIRISEdge#1005, node side).** A
+  signer-recovery round replaced the tick's ordinary round, and only the ordinary round's Summary
+  offers the node's own rows. A host that re-queues a contact's missing key every pass, toward a
+  seat that cannot answer it yet, turned every tick into a recovery round. The node's own Key never
+  went, so the seat never met the node it would have needed to answer the Pull (62 recovery rounds
+  in 297 s, no ordinary Key round).
+  - **The fix.** The ordinary round now follows the recovery round in the same tick. The recovery
+    round is closed before the ordinary one opens its own round, so one exchange is still
+    outstanding at a time, and a late Pull reply is dropped at the registry (#634).
+  - **The cost.** At most one `round_timeout` (10 s) more on a tick where a name is queued,
+    against the 30 s cadence, and a tick that overruns is skipped, never bursted. The alternative,
+    a guaranteed ordinary round every N ticks, would still delay a fresh node's own Key by N
+    cadences.
+  - **Booked apart.** A recovery round no longer books `note_round_complete`, which logged "first
+    sync complete: moved nothing" for a node whose own rows had never been offered. It is counted
+    as `replication_io` `<kind>:recovery_rounds` / `recovery_rounds_completed`.
+    `FSD_SIGNER_RECOVERY` D2/D3 updated.
+- **A member's row that arrives before their membership lands once the membership does
+  (CIRISEdge#1006).** In a star room (members not all contacts of each other), a newcomer that
+  already held the roster received a member's chat row before that member's acceptance. persist
+  refused it `NoCommunityMembership`. Edge classified that TERMINAL (30 min doubling to 6 h), and
+  nothing cleared the refusal when the membership landed seconds later, so the row was never
+  asked for again and its body never fetched.
+  - **Transient again.** `not_a_community_member` and `not_a_family_member` are transient. Persist
+    cannot tell "removed" from "not caught up yet", and in a growing room it is the latter. Their
+    log line no longer says TERMINAL. A member who really was removed is still bounded: after
+    `TRANSIENT_CAP_HITS_BEFORE_TERMINAL` (3) windows at the cap the row falls to the terminal
+    schedule (#858, the #544 storm bound).
+  - **Released by the roster event.** These two classes and `retry_after_roster` are now indexed on
+    their group's audience gate (`audience:group:<group>`, from the row's signed cohort target). Any
+    event that lands the roster releases them at once and kicks the offering peer, reusing the
+    #1148 release paths:
+    - a first roster, a roster supersede or a widening admitted through the replication choke;
+    - the widener's local widening (`release_audience`);
+    - a `RosterLanded` row reported through `note_local_writes_since`.
+  - **Not parked.** They stay ordinary transient rows, so a roster that arrives by some other path
+    still converges on the transient window. They do not wait out a terminal park.
+  - Both community and family planes. No persist-facing contract changes.
+
+### Tested
+
+- `a_new_node_back_on_a_second_identity_reaches_the_seat_1004` (`canonical_nat_clients_971`,
+  real Reticulum on loopback): a seat with no Key row for the client; identity A is bound, then
+  suspended; identity B, same key and epoch, runs its bootstrap rounds. Red at 45.1.3: after
+  2 min the seat's route still named A, B had no attributed link and no Key row. Green here.
+- `a_requeued_recovery_name_does_not_starve_the_own_key_round` (`replication::scheduler`): a
+  recovery name re-queued every pass toward a seat that answers it empty. Red at 45.1.3 (499
+  recovery asks in 5 s, 0 of 2 own rows at the seat). Green here.
+- `a_members_row_ahead_of_their_acceptance_lands_once_it_does_1006` and
+  `a_locally_landed_roster_clears_a_members_refused_row_1006` (`replication::bridge`): a star
+  room of three, the member's row before the member's widening, through the choke and through
+  `note_local_writes_since`. Both red at 45.1.3 and green here. Unit witnesses cover the
+  widening, a roster supersede, the family plane, the first roster (`retry_after_roster`), and
+  that an indexed row still falls to the terminal schedule at the cap.
+
+### Known, not fixed in this line
+
+- **CIRISEdge#1000:** a responder step still has no deadline of its own.
+- **CIRISEdge#996:** `direct_links_805`'s relay-leg test loses A/V chunks under CPU contention.
+  A/V relay is off on the server for this LTS.
+- **CIRISEdge#1002:** an initiator round's opening step runs outside the round timeout.
+- **Owner keys reach a six-node room in about 600 s, against about 75 s for three.** #1005 may
+  have been its cause (a node's own Key starved by recovery rounds until its queue drained); to
+  be re-measured on 45.1.4 before it is attributed to the key-plane memo's revalidation.
+
 ## 45.1.3 — 2026-11-14
 
 **PATCH. A node's replication responder no longer wedges (CIRISEdge#998).** Pins unchanged:
