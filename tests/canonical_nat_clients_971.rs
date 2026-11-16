@@ -2214,3 +2214,135 @@ async fn the_seat_is_never_asked_about_a_member_971() {
         assert!(bridge.signer_queued(name), "{name} stays queued");
     }
 }
+
+/// **CIRISEdge#1004 — a new node that returns on a second transport identity
+/// before its Key row lands is not locked out of the seat.**
+///
+/// The field's shape: a brand-new node announces to a seat on transport
+/// identity A. The seat holds no Key row for the node's key, so it binds A at
+/// Stage 1 (Advisory). A's process goes away before any round of its lands.
+/// The same federation key then returns on transport identity B (a wiped
+/// `data/edge`, or the real node after a stray process that shared the key),
+/// at the same epoch. Before the fix the seat read B's announce as a stale
+/// re-announce (equal epoch, ownership not provable without a Key row),
+/// refreshed A's entry, and every link from B missed attribution and was torn
+/// down inside the E1 hold, so B's Key row never landed and the lockout never
+/// cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_node_back_on_a_second_identity_reaches_the_seat_1004() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let can_key = Ident::new("canonical-1004", 0x91).await;
+    let can_owner = Ident::new("steward-1004", 0x92).await;
+    let client_key = Ident::new("ciris-client-1004", 0x93).await;
+    let can_record = can_key.record("node").await;
+    // The seat has never met the client: no Key row for it.
+    let canonical = Node::new(can_key, can_owner, Vec::new()).await;
+    let client = Node::unclaimed(client_key, vec![can_record]).await;
+    let key = client.key.key_id.clone();
+    assert!(
+        canonical
+            .dir
+            .lookup_public_key(&key)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "precondition: the seat holds no Key row for the client"
+    );
+
+    let base = tmp.path().to_path_buf();
+    let (t_canonical, addr) = build_reticulum_with_retry(|| async {
+        let mut cfg = ReticulumTransportConfig::new(
+            base.join("canonical/transport.id"),
+            &canonical.key.key_id,
+        );
+        cfg.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        cfg.announce_interval = Duration::from_secs(5);
+        (cfg, canonical.auth())
+    })
+    .await;
+    t_canonical.refuse_outbound_dials_for_test(true);
+    let port = addr.port();
+    let _rt_canonical = start_runtime(
+        &canonical,
+        Arc::clone(&t_canonical),
+        Vec::new(),
+        Duration::from_hours(1),
+    )
+    .await;
+    wait_for_own_route(&canonical, Duration::from_secs(150)).await;
+    let client_ref = &client;
+    let client_cfg = |dir: &str| {
+        let path = base.join(dir).join("transport.id");
+        let key = key.clone();
+        move || {
+            let path = path.clone();
+            let key = key.clone();
+            let auth = client_ref.auth();
+            async move {
+                let mut cfg = ReticulumTransportConfig::new(path, &key);
+                cfg.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+                cfg.bootstrap_peers = vec![format!("127.0.0.1:{port}").parse().unwrap()];
+                cfg.announce_interval = Duration::from_secs(5);
+                (cfg, auth)
+            }
+        }
+    };
+
+    // Identity A: announces, is bound at the seat, and goes away before any
+    // round of its runs (no runtime: nothing of its lands).
+    let (t_a, _) = build_reticulum_with_retry(client_cfg("identity-a")).await;
+    // Its event loop runs (announces go out); nothing reads its frames.
+    let (a_tx, mut a_rx) = tokio::sync::mpsc::channel::<InboundFrame>(64);
+    let listen_a = Arc::clone(&t_a);
+    tokio::spawn(async move { listen_a.listen(a_tx).await });
+    tokio::spawn(async move { while a_rx.recv().await.is_some() {} });
+    let seat = Arc::clone(&t_canonical);
+    assert!(
+        wait_until(Duration::from_mins(2), || {
+            let (seat, key) = (Arc::clone(&seat), key.clone());
+            async move { seat.rooted_peers().await.contains(&key) }
+        })
+        .await,
+        "identity A's announce binds the client at the seat (Stage 1, Advisory)"
+    );
+    let dest_a = t_canonical.peer_dest_hash_for_test(&key).await;
+    let report = t_a.suspend(Duration::from_secs(10)).await;
+    assert!(report.quiescent, "identity A's process is gone: {report:?}");
+    drop(t_a);
+
+    // Identity B: the same federation key, a fresh transport identity, the
+    // same epoch, with the device's bootstrap rounds toward the seat.
+    let (t_b, _) = build_reticulum_with_retry(client_cfg("identity-b")).await;
+    seed_route(&canonical, &client).await;
+    let peers = ciris_edge::replication::runtime::BOOTSTRAP_ROUND_PLANES
+        .into_iter()
+        .map(|kind| ReplicationPeer {
+            peer_key_id: canonical.key.key_id.clone(),
+            kind,
+        })
+        .collect();
+    let _rt_b = start_runtime(&client, t_b, peers, Duration::from_secs(3)).await;
+
+    let landed = wait_until(Duration::from_mins(2), || {
+        let (dir, key) = (Arc::clone(&canonical.dir), key.clone());
+        async move { matches!(dir.lookup_public_key(&key).await, Ok(Some(_))) }
+    })
+    .await;
+    let dest_now = t_canonical.peer_dest_hash_for_test(&key).await;
+    let links = t_canonical.reverse_links_for_test(&key).await;
+    assert!(
+        landed,
+        "identity B's Key row must land at the seat (dest at A {dest_a:?}, now {dest_now:?}, \
+         attributed links {links:?}): first-come Advisory bind lockout, CIRISEdge#1004"
+    );
+    assert_ne!(dest_now, dest_a, "the seat's route follows identity B");
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            let (seat, key) = (Arc::clone(&seat), key.clone());
+            async move { !seat.reverse_links_for_test(&key).await.is_empty() }
+        })
+        .await,
+        "identity B's links are attributed at the seat"
+    );
+}
