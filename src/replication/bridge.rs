@@ -18957,6 +18957,199 @@ pub(crate) mod tests {
         }
     }
 
+    /// CIRISEdge#1006 — a star room of three whose members are not contacts:
+    /// the founder `s6-authority`, the newcomer `s6-newcomer` (this node) and
+    /// a member `s6-member` whose acceptance has not reached the newcomer yet.
+    /// Returns the newcomer's backend and bridge, holding the room's roster
+    /// (founder + newcomer), the member's widening as the founder signed it,
+    /// that widening's row as the founder serves it, and the member's chat row.
+    async fn star_room_newcomer_1006() -> (
+        Arc<SqliteBackend>,
+        FederationDirectoryReplicationBridge,
+        SignedCommunityMembershipWidening,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        use ciris_persist::federation::group_plane::GroupPlaneFamily;
+        let keys = [
+            ("s6-authority", identity_type::USER),
+            ("s6-community", identity_type::AGENT),
+            ("s6-member", identity_type::USER),
+            ("s6-newcomer", identity_type::USER),
+        ];
+        let room = sign_community_fixture("s6-authority", {
+            let mut c = fixture_community_founded("s6-community", "s6-authority", "s6-member");
+            c.members.retain(|m| m.key_id == "s6-authority");
+            c
+        });
+        // The founder widens alone while it holds the room's one seat; the
+        // second widening needs the newcomer's cosignature too (persist v61,
+        // #1123: two seats, `roster_consensus_insufficient` at one voice).
+        let widen = |member: &str| {
+            let mut w = sign_community_membership_widening_fixture(
+                "s6-authority",
+                ciris_persist::federation::CommunityMembershipWidening {
+                    community_key_id: "s6-community".to_string(),
+                    member_key_id: member.to_string(),
+                    joined_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                    effective_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                    role: None,
+                    persist_row_hash: String::new(),
+                },
+            );
+            if member == "s6-member" {
+                w.cosignatures = founding_cosignatures_fixture(
+                    "s6-authority",
+                    ["s6-newcomer"].into_iter(),
+                    &w.community_membership_widening.signing_envelope(),
+                );
+            }
+            w
+        };
+        let (backend_a, bridge_a) = make_bridge(&[]);
+        register_fixture_keys(&backend_a, &keys).await;
+        backend_a
+            .put_community(room)
+            .await
+            .expect("A founds the room");
+        let (backend_n, bridge_n) = make_bridge(&[]);
+        register_fixture_keys(&backend_n, &keys).await;
+        for member in ["s6-newcomer", "s6-member"] {
+            let w = widen(member);
+            let wire = serde_json::to_vec(&w).expect("wire");
+            for dir in [&*backend_a as &dyn FederationDirectory, &*backend_n] {
+                seed_consent_for_widening(dir, EnvelopeKind::CommunityMembershipWidening, &wire)
+                    .await;
+            }
+            backend_a
+                .put_community_membership_widening(w)
+                .await
+                .expect("A widens the member in");
+        }
+        let member_row = |bytes: &[u8], member: &str| {
+            serde_json::from_slice::<Attestation>(bytes)
+                .is_ok_and(|r| r.attestation_envelope.to_string().contains(member))
+        };
+        let roster = served_group_rows(&bridge_a, GroupPlaneFamily::Roster).await;
+        let widenings = served_group_rows(&bridge_a, GroupPlaneFamily::Widening).await;
+        let newcomer_widening = widenings
+            .iter()
+            .find(|(_, b)| member_row(b, "s6-newcomer"))
+            .expect("the newcomer's widening row");
+        let member_widening = widenings
+            .iter()
+            .find(|(_, b)| member_row(b, "s6-member"))
+            .expect("the member's widening row")
+            .1
+            .clone();
+        // The newcomer holds the room's roster, and it lists the newcomer but
+        // not yet the member.
+        for (_, bytes) in [&roster[0], newcomer_widening] {
+            let outcome = bridge_n
+                .apply_envelope_bytes(EnvelopeKind::Attestation, bytes, Some("s6-authority"))
+                .await;
+            assert!(outcome.is_admitted(), "{outcome:?}");
+        }
+        let chat = community_scoped_chat_row("s6-member", "s6-community");
+        (
+            backend_n,
+            bridge_n,
+            widen("s6-member"),
+            member_widening,
+            chat,
+        )
+    }
+
+    /// The member's chat row beats the member's acceptance to the newcomer.
+    /// Returns the row's wire ref.
+    async fn the_chat_row_arrives_first_1006(
+        bridge: &FederationDirectoryReplicationBridge,
+        chat: &[u8],
+    ) -> [u8; 32] {
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, chat, Some("s6-member-node"))
+            .await;
+        let ApplyOutcome::Refused { reason, .. } = &outcome else {
+            panic!("a row ahead of its writer's membership refuses, got {outcome:?}");
+        };
+        assert!(reason.contains("class=not_a_community_member"), "{reason}");
+        let hash = super::super::wire_ref::envelope_ref(EnvelopeKind::Attestation, chat);
+        assert!(
+            bridge
+                .refusal_backoff
+                .suppressed_at(EnvelopeKind::Attestation, &hash, Instant::now()),
+            "the refused row is out of the next round's want for its window"
+        );
+        hash
+    }
+
+    /// CIRISEdge#1006 — the member's acceptance lands at the newcomer as the
+    /// founder's widening row, through the replication choke: the refused chat
+    /// row is asked for again at once and admits. Before the fix the refusal
+    /// was TERMINAL and nothing cleared it, so the row stayed out of `want` for
+    /// 30 min doubling to 6 h, and the sender pushes it only once.
+    #[tokio::test]
+    async fn a_members_row_ahead_of_their_acceptance_lands_once_it_does_1006() {
+        let (_backend, bridge, _widening, widening_row, chat) = star_room_newcomer_1006().await;
+        let hash = the_chat_row_arrives_first_1006(&bridge, &chat).await;
+        let outcome = bridge
+            .apply_envelope_bytes(
+                EnvelopeKind::Attestation,
+                &widening_row,
+                Some("s6-authority"),
+            )
+            .await;
+        assert!(
+            outcome.is_admitted(),
+            "the member's widening admits: {outcome:?}"
+        );
+        assert!(
+            !bridge
+                .refusal_backoff
+                .suppressed_at(EnvelopeKind::Attestation, &hash, Instant::now()),
+            "the roster that seats the writer clears the refusal, so the kicked round asks \
+             for the row now (CIRISEdge#1006)"
+        );
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &chat, Some("s6-member-node"))
+            .await;
+        assert!(outcome.is_admitted(), "the row admits: {outcome:?}");
+    }
+
+    /// CIRISEdge#1006 — the same, with the widening written LOCALLY (the
+    /// bridge's widener on the acceptance, or the host) and reported through
+    /// `note_local_writes_since`: the RosterLanded row clears the refusal.
+    #[tokio::test]
+    async fn a_locally_landed_roster_clears_a_members_refused_row_1006() {
+        let (backend, bridge, widening, _row, chat) = star_room_newcomer_1006().await;
+        let hash = the_chat_row_arrives_first_1006(&bridge, &chat).await;
+        let before = Utc::now();
+        backend
+            .put_community_membership_widening(widening)
+            .await
+            .expect("the member's widening lands locally");
+        let landed = bridge
+            .note_local_writes_since(before, None)
+            .await
+            .expect("decision-row scan");
+        assert!(
+            landed
+                .iter()
+                .any(|r| r.kind == crate::decision_rows::DecisionRowKind::RosterLanded),
+            "the local widening is a RosterLanded row: {landed:?}"
+        );
+        assert!(
+            !bridge
+                .refusal_backoff
+                .suppressed_at(EnvelopeKind::Attestation, &hash, Instant::now()),
+            "RosterLanded clears the refusal of a row its member wrote (CIRISEdge#1006)"
+        );
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &chat, Some("s6-member-node"))
+            .await;
+        assert!(outcome.is_admitted(), "the row admits: {outcome:?}");
+    }
+
     #[tokio::test]
     async fn e4_family_forward_path_preserves_authority_signature() {
         let signed = sign_family_fixture("e4-authority", fixture_family("e4-family", "e4-member"));
