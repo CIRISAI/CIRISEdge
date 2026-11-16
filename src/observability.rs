@@ -2023,7 +2023,10 @@ pub const RESPONDER_ROUND_OPENED_DIFF: &str = "opened_diff";
 /// their envelope bytes (the JSON frame around them is not counted),
 /// `summary_refs` and `diff_want` the hashes a Summary lists and a Diff asks
 /// for. `_in` is what this node received, `_out` what it sent.
-pub const REPLICATION_IO_LABELS: [&str; 17] = [
+/// CIRISEdge#1005 — `recovery_rounds` / `recovery_rounds_completed` count the
+/// signer-recovery rounds (a Pull, no Summary), booked apart from the
+/// ordinary rounds `first_sync_*` describes.
+pub const REPLICATION_IO_LABELS: [&str; 19] = [
     "deliver_rows_out",
     "deliver_bytes_out",
     "deliver_rows_in",
@@ -2041,6 +2044,8 @@ pub const REPLICATION_IO_LABELS: [&str; 17] = [
     "first_sync_rounds",
     "first_sync_rows",
     "first_sync_bytes",
+    "recovery_rounds",
+    "recovery_rounds_completed",
 ];
 /// Seat load 2026-11-13 (S0) — the classes a peer is counted under in
 /// `peer_activity`: the axis of this node's attestation send set that last

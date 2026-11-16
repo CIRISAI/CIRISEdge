@@ -662,6 +662,36 @@ impl RefusalBackoff {
         true
     }
 
+    /// CIRISEdge#1006 — index an ALREADY-booked refusal on `gate` and leave it
+    /// an ORDINARY row: its window, its class and the #858 transient-cap fall
+    /// to the terminal schedule ([`TRANSIENT_CAP_HITS_BEFORE_TERMINAL`]) are
+    /// all unchanged, unlike [`Self::index_waiting_on`], which parks it. A
+    /// release of `gate` ([`Self::release_signer_rows`]) forgets it at once.
+    /// Returns `false` when no refusal is booked for the row.
+    ///
+    /// For a refusal decided by state still in motion that has no single row
+    /// to wait on: a member's row ahead of their membership, which the roster
+    /// that seats them releases, and which a member who was really removed
+    /// must still not re-ask more than the transient ladder allows.
+    pub fn index_ordinary_on(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: [u8; 32],
+        gate: &str,
+        from_peer: Option<&str>,
+    ) -> bool {
+        let key = (kind, envelope_hash);
+        let mut st = self.lock();
+        let Some(entry) = st.entries.get_mut(&key) else {
+            return false;
+        };
+        if from_peer.is_some() {
+            entry.waiting_from = from_peer.map(str::to_owned);
+        }
+        st.index_on(&key, gate);
+        true
+    }
+
     /// CIRISEdge#858 — index an already-booked refusal on a signer this node
     /// HOLDS but whose standing for the row's identity has not landed ("signer
     /// S is neither identity I nor an active occurrence of it, nor a node it
@@ -1136,6 +1166,45 @@ mod tests_679 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CIRISEdge#1006 — a refusal indexed with `index_ordinary_on` keeps the
+    /// #858 bound: the transient ladder, then the terminal schedule after
+    /// [`TRANSIENT_CAP_HITS_BEFORE_TERMINAL`] windows at the cap (a member
+    /// who really was removed is not re-asked every 5 min forever), and a
+    /// release of its gate forgets it.
+    #[test]
+    fn an_ordinary_indexed_row_still_falls_to_terminal_and_is_released_1006() {
+        let b = RefusalBackoff::new();
+        let k = EnvelopeKind::Attestation;
+        let h = [6u8; 32];
+        let t0 = Instant::now();
+        b.record_at(k, h, RetryDisposition::Transient, t0);
+        assert!(b.index_ordinary_on(k, h, "audience:group:g", Some("peer")));
+        assert_eq!(b.parked_on_signer_len(), 0, "not a park");
+        let mut moved = false;
+        for _ in 0..64 {
+            moved |= b
+                .record_tracked_at(k, h, RetryDisposition::Transient, None, t0)
+                .moved_to_terminal;
+        }
+        assert!(
+            moved,
+            "the transient cap still falls to the terminal schedule"
+        );
+        assert_eq!(b.parked_on("audience:group:g"), 1, "still indexed");
+        let (released, ask) = b.release_signer_from("audience:group:g");
+        assert_eq!(released, 1);
+        assert_eq!(
+            ask,
+            vec![(k, "peer".to_string())],
+            "the offering peer is asked again"
+        );
+        assert!(!b.suppressed_at(k, &h, t0), "forgotten");
+        assert!(
+            !b.index_ordinary_on(k, [7u8; 32], "g", None),
+            "nothing booked, nothing indexed"
+        );
+    }
 
     fn hash(seed: u8) -> [u8; 32] {
         let mut h = [0u8; 32];

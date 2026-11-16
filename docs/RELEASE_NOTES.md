@@ -1,5 +1,34 @@
 # CIRISEdge Release Notes
 
+# v45.1.4 — a new node reaches its seat, and a member's early row lands
+
+**2026-11-15.** **PATCH.** Pins unchanged: persist v61.4.1 by tag (`ciris-persist==61.4.1`),
+CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. No wire change. Detail in CHANGELOG.md.
+
+- **A new node back on a second transport identity is not locked out of a seat**
+  (CIRISEdge#1004, seat side). With no Key row for the node, the seat could not confirm that the
+  second identity owned the key, kept the first-come Advisory bind, and tore down every link
+  from the new identity before its Key row could land. On `UnknownKeyId` the seat now accepts the
+  announce's own fingerprint-and-signature ownership proof (Stage 1's #636 proof). It is used
+  only over a resident that is not Rooted, so Rooted routes keep the #337 protection unchanged. A
+  stale announce from another identity no longer refreshes the resident's LRU stamp.
+- **A recovery round no longer starves a node's own Key** (CIRISEdge#1005, node side). It
+  replaced the tick's ordinary round. A contact key re-queued every pass made every tick a
+  recovery round, so the node's own rows were never offered. The ordinary round now follows it in
+  the same tick, at most one round timeout more. Recovery rounds are booked apart
+  (`recovery_rounds`), never as "first sync complete".
+- **A member's row that beats their acceptance lands once it arrives** (CIRISEdge#1006).
+  `not_a_community_member` / `not_a_family_member` are transient again. With `retry_after_roster`
+  they are indexed on their group's audience gate, so the roster or widening that lands (through
+  the choke, the local widener or `RosterLanded`) re-asks the row at once. A writer who really
+  was removed still falls to the terminal schedule at the transient cap.
+- **Witnessed:** three witnesses, each red at 45.1.3 and green here: a loopback seat, a scheduler
+  round, and a three-person star room. There are unit witnesses for a roster supersede, the
+  family plane, the first roster and the cap bound.
+- **Known:** CIRISEdge#1000, CIRISEdge#996, CIRISEdge#1002, and owner keys reaching a six-node
+  room in about 600 s. #1005 may have been that staircase's cause; it is to be re-measured on
+  45.1.4.
+
 # v45.1.3 — a node's responder no longer wedges
 
 **2026-11-14.** **PATCH.** Pins unchanged: persist v61.4.1 by tag (`ciris-persist==61.4.1`),

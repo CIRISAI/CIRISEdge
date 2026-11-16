@@ -1168,6 +1168,21 @@ impl ReplicationCoordinator {
         );
     }
 
+    /// CIRISEdge#1005 — book a signer-recovery round (`completed` when its
+    /// Pull was answered) in `replication_io` as `<kind>:recovery_rounds` and
+    /// `<kind>:recovery_rounds_completed`. Never [`Self::note_round_complete`]:
+    /// a recovery round offers nothing of this node's, so it says nothing
+    /// about the two sides being in sync, and booking it there logged "first
+    /// sync complete" for a node whose own rows had never been offered.
+    pub(crate) fn note_recovery_round(&self, completed: bool) {
+        if let Some(m) = &self.metrics {
+            m.add_replication_io(self.kind, "recovery_rounds", 1);
+            if completed {
+                m.add_replication_io(self.kind, "recovery_rounds_completed", 1);
+            }
+        }
+    }
+
     /// Seat load 2026-11-13 (S0) — `replication_io`: the rows and envelope
     /// bytes a message carried, the hashes a Summary listed and a Diff asked
     /// for, and Pulls. Sent messages are booked once their send returned;
@@ -1352,8 +1367,8 @@ impl ReplicationCoordinator {
     ///   driving`);
     /// - and whatever the next round did read, it read as its OWN Summary.
     ///
-    /// A recovery round (FSD-SIGNER-RECOVERY) avoids that by replacing a tick,
-    /// which is right for background repair and wrong for an ask a person is
+    /// A recovery round (FSD-SIGNER-RECOVERY) avoids that by running ahead of
+    /// a tick's ordinary round, on a round of its own, which is right for background repair and wrong for an ask a person is
     /// waiting on: it would queue behind the round in flight and the round gate.
     /// Here each Pull's round id is the correlation, carried by the frames that
     /// already have one, so no wire change.

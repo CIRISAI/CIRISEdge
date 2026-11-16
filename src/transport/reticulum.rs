@@ -21333,7 +21333,9 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
     // gate, CC 6 N1); the manifest-validation-gated KEX (attest a trust-root-
     // blessed build before the record is durably saved) is the post-CIRISServer-
     // 0.6 follow-on tracked up the centipede.
-    let (chain_opt, provenance, owns_key) = match verdict {
+    // CIRISEdge#1004 — the fourth value: the announce proved ownership on its
+    // own (see the `UnknownKeyId` note in the Rejected arm).
+    let (chain_opt, provenance, owns_key, owns_by_fingerprint) = match verdict {
         RootingVerdict::Confirmed { chain } => {
             // ROOTED — verify the attestation against the directory-CONFIRMED
             // Ed25519 (never the wire claim), then apply the hybrid PQC policy.
@@ -21360,6 +21362,7 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                 // chain rooted at a pinned steward — the announcer provably owns
                 // the key bound to `key_id`.
                 true,
+                false,
             )
         }
         RootingVerdict::Rejected { rejection } => {
@@ -21390,6 +21393,22 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
             // rejections — a lookup `DirectoryError` (or any pre-match rejection)
             // does NOT prove the announcer owns the key, so it is fail-closed here.
             let owns_key = owns_key_from_rooting_rejection(&rejection);
+            // CIRISEdge#1004 — with NO directory row for the key
+            // (`UnknownKeyId`) the directory has nothing to compare, but the
+            // announce can still prove ownership on its own: the claimed key
+            // id's fingerprint is the claimed pubkey's, and the attestation
+            // self-verified under that pubkey (above). That is Stage 1's #636
+            // proof, which every first-seen bind already rests on. Without it a
+            // brand-new node that came back on a second transport identity
+            // before its Key row landed could not prove it owns the key, lost
+            // to its own first (Advisory) bind at equal epoch, and every link
+            // from the new identity was torn down before the #402 carve-out
+            // could land the Key row. It needs the federation PRIVATE key, so a
+            // spoofer who knows only the key id gains nothing; and it is
+            // applied only over an entry that is not Rooted (below), so
+            // CRITICAL-1 (#337) is unchanged.
+            let owns_by_fingerprint = matches!(rejection, RootingRejection::UnknownKeyId { .. })
+                && key_id_binds_pubkey(&key_id, &attestation.federation_pubkey_ed25519);
             // CIRISEdge#337 §4 — advisory admits are attacker-floodable (mint
             // unlimited self-signed keypairs). DEBUG, not INFO: the always-on
             // admit signal is the THROTTLED `peer_admitted_log` point-1 line
@@ -21426,6 +21445,7 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                 None,
                 ciris_persist::federation::self_at_login::BindingProvenance::Advisory,
                 owns_key,
+                owns_by_fingerprint,
             )
         }
     };
@@ -21483,6 +21503,15 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                 e.transport_pubkey64,
             )
         });
+        // CIRISEdge#1004 — the directory-free ownership proof counts unless
+        // the resident entry is ROOTED: a Rooted route moves only on the
+        // directory's own verdict, exactly as before (CRITICAL-1, #337). Over
+        // an Advisory entry (no better proven than this announce) it lets the
+        // owner's newer identity supersede at equal epoch (#336's owner
+        // reroute) instead of losing to first-come.
+        let resident_rooted =
+            existing_snapshot.is_some_and(|(p, _, _, _)| matches!(p, BindingProvenance::Rooted));
+        let owns_key = owns_key || (owns_by_fingerprint && !resident_rooted);
         // The heal this decision may make for a provably wrong stored key,
         // named in the log and counted below.
         let key_heal = existing_snapshot.is_some_and(|(_, _, d, k)| {
@@ -21533,8 +21562,16 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                 // peers nothing has heard from rather than peers whose route
                 // simply has not changed. This is victim ORDERING only — nothing
                 // here expires anything.
+                //
+                // CIRISEdge#1004 — but only for the RESIDENT's own announce
+                // (the same 64-byte transport key). A stale verdict on a
+                // DIFFERENT identity's announce is no evidence the resident is
+                // alive; refreshing its stamp there kept a dead first-come
+                // entry first in line forever.
                 if let Some(existing) = peers.get_mut(&key_id) {
-                    existing.last_seen = std::time::Instant::now();
+                    if existing.transport_pubkey64 == binding_pubkey64 {
+                        existing.last_seen = std::time::Instant::now();
+                    }
                 }
                 if owns_key {
                     if let Some(existing) = peers.get_mut(&key_id) {
