@@ -201,6 +201,7 @@ pub mod summary;
 mod typed_refusal_858_tests;
 pub mod wire_frame;
 pub mod wire_ref;
+pub(crate) mod wrap_courier;
 
 /// What [`InboundRouter::try_route`] did with a frame.
 ///

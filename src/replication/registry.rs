@@ -407,6 +407,39 @@ impl ReplicationRegistry {
         }
     }
 
+    /// 45.1.5 (the wrap courier) — register `coord` as the initiator for
+    /// `(peer, kind)` only while that slot is empty. `false` when an initiator
+    /// already holds it (the peer's own round carries what the courier would).
+    pub(crate) async fn register_initiator_if_absent(
+        &self,
+        peer_key_id: &str,
+        kind: EnvelopeKind,
+        coord: &Arc<ReplicationCoordinator>,
+    ) -> bool {
+        let mut initiators = self.initiators.write().await;
+        let key = (peer_key_id.to_owned(), kind);
+        if initiators.contains_key(&key) {
+            return false;
+        }
+        initiators.insert(key, Arc::clone(coord));
+        true
+    }
+
+    /// 45.1.5 — remove the `(peer, kind)` initiator only if it is still
+    /// `coord` (a peer added meanwhile keeps its own).
+    pub(crate) async fn deregister_initiator_if(
+        &self,
+        peer_key_id: &str,
+        kind: EnvelopeKind,
+        coord: &Arc<ReplicationCoordinator>,
+    ) {
+        let mut initiators = self.initiators.write().await;
+        let key = (peer_key_id.to_owned(), kind);
+        if initiators.get(&key).is_some_and(|c| Arc::ptr_eq(c, coord)) {
+            initiators.remove(&key);
+        }
+    }
+
     /// Remove BOTH roles' coordinators for `(peer, kind)`. Returns what was
     /// removed as `(initiator, responder)`.
     pub async fn deregister(

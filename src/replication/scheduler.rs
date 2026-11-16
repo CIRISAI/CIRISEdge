@@ -2068,6 +2068,24 @@ fn propagate_kick(
     }
 }
 
+/// 45.1.5 (the wrap courier) — one ordinary round on `coord`, outside the
+/// scheduler and its gate: the courier runs one at a time on its own task.
+/// The round's report, or why it did not complete.
+pub(crate) async fn run_courier_round(
+    coord: &ReplicationCoordinator,
+    round_timeout: Duration,
+) -> Result<RoundReport, String> {
+    let gate = RoundGate::new(1);
+    let peer = coord.peer_key_id().to_owned();
+    let mut seat = RoundSeat::take(&gate, &peer, "wrap_courier").await;
+    match run_one_round(coord, round_timeout, &mut seat).await {
+        Ok(DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report)) => Ok(report),
+        Ok(DriveStep::Refused) => Err("the round was refused".to_owned()),
+        Ok(DriveStep::SendThenWait(_)) => Err("the round returned mid-exchange".to_owned()),
+        Err(e) => Err(format!("{e:?}")),
+    }
+}
+
 async fn run_one_round(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,

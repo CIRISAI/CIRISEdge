@@ -1858,6 +1858,11 @@ pub struct ReplicationRuntime {
     /// CIRISEdge#768 — the pending-KeyGrant emitter
     /// ([`super::key_grant_emitter`]); `Some` iff `sealed_content` was set.
     key_grant_emitter: Option<JoinHandle<()>>,
+    /// 45.1.5 — the wrap courier (`super::wrap_courier`); `Some` iff this
+    /// node seals content and knows its own key.
+    wrap_courier: Option<JoinHandle<()>>,
+    /// Woken by the host's kicks.
+    wrap_courier_wake: Arc<tokio::sync::Notify>,
     config: ReplicationRuntimeConfig,
     /// Runtime control channel for the scheduler (CIRISEdge#173,
     /// v5.1.0). Used by [`Self::register_initiator_peer`] /
@@ -2184,6 +2189,28 @@ impl ReplicationRuntime {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let key_grant_emitter = spawn_key_grant_emitter_for(&config, key_grant_wake, &cancel_rx);
+        // 45.1.5 — the wrap courier: a sealing host's wraps to a room member
+        // that is not its peer (`super::wrap_courier`).
+        let wrap_courier_wake = Arc::new(tokio::sync::Notify::new());
+        let wrap_courier = config
+            .local_key_id
+            .clone()
+            .filter(|_| config.sealed_content.is_some())
+            .map(|local_key_id| {
+                super::wrap_courier::spawn_wrap_courier(
+                    super::wrap_courier::WrapCourierDeps {
+                        directory: Arc::clone(&directory),
+                        registry: Arc::clone(&registry),
+                        transport: Arc::clone(&transport),
+                        applier: Arc::clone(&shared_applier),
+                        local_key_id,
+                        metrics: config.metrics.clone(),
+                        round_timeout: config.scheduler.round_timeout,
+                    },
+                    Arc::clone(&wrap_courier_wake),
+                    cancel_rx.clone(),
+                )
+            });
         spawn_reachability_forwarder(&transport, &scheduler_handle, &cancel_rx);
         let current_initiators = Arc::new(Mutex::new(initial_initiator_set));
         let homed_peers = Arc::new(Mutex::new(Vec::new()));
@@ -2242,6 +2269,8 @@ impl ReplicationRuntime {
             cancel_tx,
             scheduler_task: Some(scheduler_task),
             key_grant_emitter,
+            wrap_courier,
+            wrap_courier_wake,
             config,
             scheduler_handle,
             current_initiators,
@@ -2456,6 +2485,7 @@ impl ReplicationRuntime {
     /// the round it fires reads the consent grant it was fired for.
     pub async fn round_now(&self, peer_key_id: &str) -> Result<(), ReplicationRuntimeError> {
         self.bridge.invalidate_send_set_memos("host_kick");
+        self.wrap_courier_wake.notify_one();
         self.bundle_pull.kick_host();
         self.scheduler_handle.round_now(Some(peer_key_id)).await?;
         Ok(())
@@ -2476,6 +2506,9 @@ impl ReplicationRuntime {
     pub async fn round_now_all(&self) -> Result<(), ReplicationRuntimeError> {
         // CIRISEdge#968 — see [`Self::round_now`].
         self.bridge.invalidate_send_set_memos("host_kick");
+        // 45.1.5 — a kick is how a room seat says it granted: the courier
+        // carries wraps to members that are not peers.
+        self.wrap_courier_wake.notify_one();
         self.bundle_pull.kick_host();
         self.scheduler_handle.round_now(None).await?;
         Ok(())
@@ -3000,6 +3033,9 @@ impl ReplicationRuntime {
             let _ = task.await;
         }
         if let Some(task) = self.key_grant_emitter.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.wrap_courier.take() {
             let _ = task.await;
         }
     }

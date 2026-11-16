@@ -790,7 +790,11 @@ impl Transport for PairTransport {
 }
 
 /// The node's runtime over `transport`, with no peers.
-async fn runtime_on(node: &Node, transport: Arc<dyn Transport>) -> ReplicationRuntime {
+async fn runtime_on(
+    node: &Node,
+    transport: Arc<dyn Transport>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+) -> ReplicationRuntime {
     ReplicationRuntime::start(
         Arc::clone(&node.dir) as Arc<dyn FederationDirectory>,
         transport,
@@ -807,6 +811,7 @@ async fn runtime_on(node: &Node, transport: Arc<dyn Transport>) -> ReplicationRu
                 pull_sink: None,
                 revocations: None,
             }),
+            metrics,
             ..ReplicationRuntimeConfig::default()
         },
         None,
@@ -847,8 +852,14 @@ async fn a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6() {
         other_registry: std::sync::OnceLock::new(),
         sent: std::sync::Mutex::new(Vec::new()),
     });
-    let mut rt_a = runtime_on(&a, Arc::clone(&t_a) as Arc<dyn Transport>).await;
-    let mut rt_b = runtime_on(&b, Arc::clone(&t_b) as Arc<dyn Transport>).await;
+    let metrics_b = crate::observability::EdgeMetrics::new();
+    let mut rt_a = runtime_on(&a, Arc::clone(&t_a) as Arc<dyn Transport>, None).await;
+    let mut rt_b = runtime_on(
+        &b,
+        Arc::clone(&t_b) as Arc<dyn Transport>,
+        Some(metrics_b.clone()),
+    )
+    .await;
 
     // Each knows the other's node (key, owner binding, occurrence): members
     // of one room, met through the room, never contacts.
@@ -943,4 +954,23 @@ async fn a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6() {
         }
     }
     assert!(delivered > 0, "the wrap crossed in a Deliver");
+    // Booked on the minter: sent and admitted, nothing refused or given up.
+    let io = metrics_b.replication_io();
+    let count = |label: &str| {
+        io.iter()
+            .filter(|(k, _)| k.ends_with(&format!(":{label}")))
+            .map(|(_, v)| *v)
+            .sum::<u64>()
+    };
+    assert!(count("wrap_courier_sent") > 0, "{io:?}");
+    assert_eq!(
+        count("wrap_courier_admitted"),
+        count("wrap_courier_sent"),
+        "{io:?}"
+    );
+    assert_eq!(
+        count("wrap_courier_refused") + count("wrap_courier_gave_up"),
+        0,
+        "{io:?}"
+    );
 }
