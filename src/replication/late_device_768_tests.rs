@@ -753,3 +753,196 @@ async fn measure_a_noop_emission_on_a_node_with_many_rooms_768() {
     let _ = engine.emit_pending_key_grants().await;
     time("pointer-recorded (post-#967 enumeration)").await;
 }
+
+/// 45.1.5 star rooms — a transport between exactly two runtimes: what one sends
+/// to the other's node key is routed into the other's registry, attributed to
+/// the sender, the way a link-attributed frame is. Every frame is tapped.
+struct PairTransport {
+    me: String,
+    other: String,
+    other_registry: std::sync::OnceLock<Arc<crate::replication::ReplicationRegistry>>,
+    sent: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+#[async_trait]
+impl Transport for PairTransport {
+    fn id(&self) -> TransportId {
+        TransportId::HTTP
+    }
+    async fn send(&self, to: &str, bytes: &[u8]) -> Result<TransportSendOutcome, TransportError> {
+        if to != self.other {
+            return Err(TransportError::Unreachable(to.to_owned()));
+        }
+        let Some(registry) = self.other_registry.get().cloned() else {
+            return Err(TransportError::Unreachable(to.to_owned()));
+        };
+        self.sent.lock().expect("tap").push(bytes.to_vec());
+        let (me, bytes) = (self.me.clone(), bytes.to_vec());
+        tokio::spawn(async move {
+            let _ = registry.route_inbound_bytes(&me, &bytes).await;
+        });
+        Ok(TransportSendOutcome::Delivered)
+    }
+    async fn listen(
+        &self,
+        _: tokio::sync::mpsc::Sender<InboundFrame>,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
+}
+
+/// The node's runtime over `transport`, with no peers.
+async fn runtime_on(node: &Node, transport: Arc<dyn Transport>) -> ReplicationRuntime {
+    ReplicationRuntime::start(
+        Arc::clone(&node.dir) as Arc<dyn FederationDirectory>,
+        transport,
+        Vec::new(),
+        ReplicationRuntimeConfig {
+            scheduler: SchedulerConfig {
+                cadence: Duration::from_hours(1),
+                round_timeout: Duration::from_secs(5),
+                ..SchedulerConfig::default()
+            },
+            local_key_id: Some(node.me.clone()),
+            sealed_content: Some(SealedContentWiring {
+                engine: BridgeEngine(node.store.engine().clone()),
+                pull_sink: None,
+                revocations: None,
+            }),
+            ..ReplicationRuntimeConfig::default()
+        },
+        None,
+    )
+    .await
+}
+
+/// 45.1.5 star rooms — **a minter's wrap reaches a room member that is not its
+/// replication peer.** The star room's shape: Q's node B wrote into the room
+/// and minted an epoch, wrapped to P's node A; A and B are members but not
+/// contacts, so neither runs a round toward the other, and persist serves a
+/// wrap to its recipient only (no member relays it). Before the fix the wrap
+/// never left B and A read B's messages `NotGranted` for good (star6: 0/3).
+///
+/// Asserted on what A ADMITS (`community_dek_minters_granting`), within a
+/// bound after B's host kicks a round. And the negative: every row B sent A
+/// is one of A's own wraps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6() {
+    let p = Ident::new("person-p-1009", 0x71);
+    let q = Ident::new("person-q-1009", 0x72);
+    let a_dev = Ident::new("node-a-1009", 0x81);
+    let b_dev = Ident::new("node-b-1009", 0x82);
+    let a = device(&[&p, &q], &p, &a_dev).await;
+    let b = device(&[&p, &q], &q, &b_dev).await;
+    seed_room(&a, &p, &[&p, &q]).await;
+    seed_room(&b, &p, &[&p, &q]).await;
+
+    let t_a = Arc::new(PairTransport {
+        me: a.me.clone(),
+        other: b.me.clone(),
+        other_registry: std::sync::OnceLock::new(),
+        sent: std::sync::Mutex::new(Vec::new()),
+    });
+    let t_b = Arc::new(PairTransport {
+        me: b.me.clone(),
+        other: a.me.clone(),
+        other_registry: std::sync::OnceLock::new(),
+        sent: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut rt_a = runtime_on(&a, Arc::clone(&t_a) as Arc<dyn Transport>).await;
+    let mut rt_b = runtime_on(&b, Arc::clone(&t_b) as Arc<dyn Transport>).await;
+
+    // Each knows the other's node (key, owner binding, occurrence): members
+    // of one room, met through the room, never contacts.
+    for (from, to, rt_to) in [(&a, &b, &rt_b), (&b, &a, &rt_a)] {
+        let (rec, binding, occ) = device_rows(from).await;
+        to.dir
+            .put_public_key(SignedKeyRecord { record: rec })
+            .await
+            .expect("the other node's key");
+        let _ = rt_to
+            .bridge()
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &binding, Some(&from.me))
+            .await;
+        let _ = rt_to
+            .bridge()
+            .apply_envelope_bytes(EnvelopeKind::IdentityOccurrence, &occ, None)
+            .await;
+    }
+
+    // B writes into the room: it mints an epoch wrapped to A's node too.
+    let sealed = b
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(ROOM),
+            author_key_id: &b.me,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: b"written by a member who is not your contact",
+            description: None,
+        })
+        .await
+        .expect("B seals at the community tier");
+    let epoch = sealed.epoch.expect("a community-DEK epoch");
+    assert!(
+        sealed.granted.iter().any(|g| g == &a.me),
+        "precondition: B's epoch is wrapped to A: {:?}",
+        sealed.granted
+    );
+
+    // Only now do the two transports connect, and B's host kicks, as the
+    // server's room seat does after granting ("room seat: key grants").
+    t_a.other_registry.set(rt_b.registry()).ok();
+    t_b.other_registry.set(rt_a.registry()).ok();
+    rt_b.round_now_all().await.expect("kick");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let granted = loop {
+        let granting = a
+            .dir
+            .community_dek_minters_granting(ROOM, epoch, &a.me)
+            .await
+            .expect("read A's grants");
+        if granting.iter().any(|m| m == &b.me) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let sent = t_b.sent.lock().expect("tap").clone();
+    rt_a.shutdown().await;
+    rt_b.shutdown().await;
+    assert!(
+        granted,
+        "B's wrap to A never crossed: A and B are not replication peers, a wrap is \
+         served to its recipient only, and nothing carried it ({} frames sent by B; \
+         45.1.5 star rooms)",
+        sent.len()
+    );
+
+    // Negative: every row B delivered to A is a key-grant row addressed to A.
+    let mut delivered = 0usize;
+    for frame in &sent {
+        let Ok(msg) = crate::replication::ReplicationCoordinator::parse_inbound_bytes(frame) else {
+            continue;
+        };
+        if let crate::replication::protocol::ReplicationMessage::Deliver(d) = msg {
+            for env in &d.envelopes {
+                let row: ciris_persist::federation::Attestation =
+                    serde_json::from_slice(env).expect("a delivered row");
+                assert!(
+                    ciris_persist::federation::key_grant::is_key_grant_row(&row)
+                        && row.attested_key_id == a.me,
+                    "B delivered A a row that is not A's own wrap: {} {}",
+                    row.attestation_type,
+                    row.attested_key_id
+                );
+                delivered += 1;
+            }
+        }
+    }
+    assert!(delivered > 0, "the wrap crossed in a Deliver");
+}

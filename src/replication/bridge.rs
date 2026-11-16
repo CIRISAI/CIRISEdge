@@ -17810,6 +17810,64 @@ pub(crate) mod tests {
         .await;
     }
 
+    /// 45.1.5 (hygiene, the #1006 rule) — **`not_in_audience` follows persist's
+    /// `is_retryable`: transient, indexed on its gate as an ORDINARY row.**
+    /// Persist marks it retryable ("the audience can widen, and a re-offer
+    /// then lands"). Edge booked it terminal and parked it; it now takes the
+    /// transient window, its gate's release still forgets it at once, and the
+    /// #858 cap still falls it to the terminal schedule when nothing ever
+    /// releases it. Both doors: the general one and the key-grant one.
+    #[tokio::test]
+    async fn a_not_in_audience_refusal_is_transient_and_indexed_on_its_gate_star6() {
+        use ciris_persist::federation::attestation_apply::AttestationRefusalReason as R;
+        assert!(R::NotInAudience.is_retryable(), "persist: retryable");
+        assert_eq!(
+            attestation_refusal_retry(R::NotInAudience),
+            RetryDisposition::Transient,
+            "edge follows persist's is_retryable"
+        );
+        let (_backend, bridge) = make_bridge(&[]);
+        let kind = EnvelopeKind::Attestation;
+        let wire = audience_row_1148("grant-1009", "person-owner", "chat:message:v1", "room-1009");
+        let hash = super::super::wire_ref::envelope_ref(kind, &wire);
+        let refused = not_in_audience_outcome_1148();
+        assert_eq!(
+            refused.retry_disposition(),
+            Some(RetryDisposition::Transient)
+        );
+        bridge.remember_outcome(kind, &wire, &refused);
+        bridge
+            .park_or_release(kind, &wire, &refused, Some("peer-p"))
+            .await;
+        let backoff = bridge.refusal_backoff_for_test();
+        assert_eq!(
+            backoff.parked_on("audience:group:room-1009"),
+            1,
+            "indexed on its room"
+        );
+        assert_eq!(
+            backoff.parked_on_signer_len(),
+            0,
+            "an ordinary row, not a park"
+        );
+        assert!(backoff.suppressed_at(kind, &hash, Instant::now()));
+        assert!(
+            !backoff.suppressed_at(kind, &hash, Instant::now() + Duration::from_mins(1)),
+            "the transient window, not the 30 min terminal one"
+        );
+        let widening = audience_row_1148(
+            "w-1009",
+            "person-founder",
+            "membership:widening:v1",
+            "room-1009",
+        );
+        bridge
+            .park_or_release(kind, &widening, &ApplyOutcome::Admitted, Some("peer-p"))
+            .await;
+        assert_eq!(backoff.parked_on("audience:group:room-1009"), 0, "released");
+        assert!(!backoff.suppressed_at(kind, &hash, Instant::now()));
+    }
+
     /// persist v61 S2 (#1148) — **with nothing to release it, a row refused
     /// `not_in_audience` stays parked on the terminal floor and is not asked
     /// for in a loop.** A membership row of ANOTHER room releases nothing; the
