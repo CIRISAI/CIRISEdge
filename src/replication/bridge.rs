@@ -245,9 +245,16 @@ pub enum ApplyRefusalClass {
     RetryAfterStanding,
     /// persist#757 (AV-45) — a `community`-scoped row whose writer is NOT in
     /// the roster this node holds. Until persist v47.0.0 this and "roster not
-    /// held yet" were one refusal, and edge called both transient; persist
-    /// now tells them apart, and this one is terminal — nothing about it
-    /// changes by waiting.
+    /// held yet" were one refusal, and edge called both transient. From v47
+    /// edge called this one terminal, which CIRISEdge#1006 found wrong: in a
+    /// growing room a member's row reaches a newcomer before that member's
+    /// acceptance does, and "the roster I hold does not list the writer" is
+    /// then an ordering artefact. Persist cannot tell "removed" from "not
+    /// caught up yet". Transient again: the roster that seats the writer
+    /// releases the row at once, and a writer who really was removed falls to
+    /// the terminal schedule after
+    /// [`TRANSIENT_CAP_HITS_BEFORE_TERMINAL`](super::refusal_backoff::TRANSIENT_CAP_HITS_BEFORE_TERMINAL)
+    /// windows at the cap (the #544 storm bound).
     NotACommunityMember,
     /// persist#757 (AV-45) — the family mirror of
     /// [`Self::NotACommunityMember`].
@@ -304,18 +311,35 @@ impl ApplyRefusalClass {
     /// Is this refusal expected to resolve itself once more state lands, with
     /// no operator action?
     ///
-    /// TRUE for the roster-ordering class and **only** that: a refused row is
-    /// not stored, so this node still lacks its hash and the next
-    /// Summary/Diff re-offers it — convergence is by construction, not by a
-    /// retry queue. FALSE for a fork, a third-party row, and a writer the
-    /// HELD roster excludes: none changes on its own, and each is a decision
-    /// someone has to see. (Before persist v47.0.0 the last was
-    /// indistinguishable from "roster not held yet" and rode as transient.)
+    /// TRUE for the ordering classes: a roster, a standing or a consent row
+    /// not held yet, and a writer the HELD roster does not list yet
+    /// (CIRISEdge#1006: in a growing room that is the member's acceptance
+    /// still on its way). A refused row is not stored, so this node still
+    /// lacks its hash and the next Summary/Diff re-offers it. FALSE for a
+    /// fork, a third-party row, a roster change without standing and a
+    /// refused consent: none changes on its own, and each is a decision
+    /// someone has to see.
     #[must_use]
     pub fn is_transient(self) -> bool {
         matches!(
             self,
-            Self::RetryAfterRoster | Self::RetryAfterStanding | Self::RetryAfterConsent
+            Self::RetryAfterRoster
+                | Self::RetryAfterStanding
+                | Self::RetryAfterConsent
+                | Self::NotACommunityMember
+                | Self::NotAFamilyMember
+        )
+    }
+
+    /// CIRISEdge#1006 — the classes a roster event of the row's group
+    /// decides: the roster not held yet, and a writer the held roster does
+    /// not list (yet). Indexed on the group's audience gate, so the roster or
+    /// membership row that lands releases them at once.
+    #[must_use]
+    pub fn awaits_roster(self) -> bool {
+        matches!(
+            self,
+            Self::RetryAfterRoster | Self::NotACommunityMember | Self::NotAFamilyMember
         )
     }
 
@@ -400,7 +424,8 @@ fn classified_refusal_reason(
          not stored, so the node still lacks it and the next round re-offers it. It \
          lands once the roster shows the writer as an ACTIVE member, and keeps \
          refusing while the roster shows the member removed — the same discipline \
-         covers both halves of the revocation pairing (CIRISEdge#522)"
+         covers both halves of the revocation pairing (history: CIRISEdge#522, \
+         history: CIRISEdge#1006)"
     } else {
         "TERMINAL — this does not resolve by retrying (CIRISEdge#522)"
     };
@@ -721,9 +746,39 @@ pub(crate) fn is_not_in_audience_refusal(outcome: &ApplyOutcome) -> bool {
     }
 }
 
+/// The prefix of [`audience_group_key`].
+const AUDIENCE_GROUP_PREFIX: &str = "audience:group:";
+
 /// The park key of a group's audience.
 pub(super) fn audience_group_key(group_key_id: &str) -> String {
-    format!("audience:group:{group_key_id}")
+    format!("{AUDIENCE_GROUP_PREFIX}{group_key_id}")
+}
+
+/// CIRISEdge#1006 — is `outcome` a refusal its group's roster decides: the
+/// roster not held yet, or a writer the held roster does not list (yet)?
+fn outcome_awaits_roster(outcome: &ApplyOutcome) -> bool {
+    let ApplyOutcome::Refused {
+        class: Some(class), ..
+    } = outcome
+    else {
+        return false;
+    };
+    ApplyRefusalClass::ALL
+        .iter()
+        .any(|c| c.awaits_roster() && c.as_str() == *class)
+}
+
+/// CIRISEdge#1006 — the group whose roster decides a row's membership
+/// refusal: the cohort its signed envelope names (persist's own reading,
+/// [`envelope_cohort_target`](ciris_persist::federation::admission::envelope_cohort_target)),
+/// else the group a group-plane row is placed at.
+fn roster_group_of(bytes: &[u8]) -> Option<String> {
+    let row = row_of_wire(bytes)?;
+    ciris_persist::federation::admission::envelope_cohort_target(&row.attestation_envelope)
+        .ok()
+        .flatten()
+        .map(str::to_owned)
+        .or_else(|| group_of_row(&row))
 }
 
 /// The park key of a key's owner axis (a `self` row's audience is its
@@ -3827,6 +3882,16 @@ impl FederationDirectoryReplicationBridge {
                 {
                     r.proposal_id = proposal_id.map(str::to_owned);
                 }
+                // CIRISEdge#1006 — a landed roster event releases the rows its
+                // members wrote before this node's roster listed them.
+                if r.kind == crate::decision_rows::DecisionRowKind::RosterLanded {
+                    if let Some(group) = r.scope_id.as_deref() {
+                        self.release_and_kick(
+                            &audience_group_key(group),
+                            ReleaseCause::AudienceChanged,
+                        );
+                    }
+                }
                 let _ = self.decision_rows.emit(r.clone());
                 out.push(r);
             }
@@ -6280,6 +6345,10 @@ impl FederationDirectoryReplicationBridge {
                     // THIS node's audience (a group's record or membership
                     // event, an owner binding, a replication consent) releases
                     // the rows parked `not_in_audience` on it.
+                    // CIRISEdge#1006 — the same gate releases the rows a
+                    // member wrote before this node's roster listed them
+                    // (`index_on_roster`): a first roster and a supersede or
+                    // widening of it alike.
                     for key in audience_release_keys(envelope_bytes) {
                         self.release_and_kick(&key, ReleaseCause::AudienceChanged);
                     }
@@ -6298,6 +6367,14 @@ impl FederationDirectoryReplicationBridge {
             }
             Some(RetryDisposition::Transient) => {
                 let hash = super::wire_ref::envelope_ref(kind, envelope_bytes);
+                // CIRISEdge#1006 — a row ahead of its group's roster, or of
+                // its writer's place in it, waits on the roster event that
+                // lands: indexed on the group's audience gate (#1148's release
+                // paths), kept an ordinary transient row so a writer who
+                // really was removed still falls to the terminal schedule.
+                if outcome_awaits_roster(outcome) {
+                    self.index_on_roster(kind, hash, envelope_bytes, source_peer);
+                } else
                 // persist v54.1.0 (#1042 follow-up) — a HELD signer persist
                 // said does not act for the row's identity yet
                 // (`SignerDoesNotActFor`): the #776 index on that signer, on
@@ -6430,6 +6507,36 @@ impl FederationDirectoryReplicationBridge {
             &audience_owner_key(group_or_key),
             ReleaseCause::AudienceChanged,
         )
+    }
+
+    /// CIRISEdge#1006 — index a refusal its group's roster decides on that
+    /// group's audience gate (`audience:group:<group>`), the gate a landed
+    /// roster or membership row releases (#1148). Its schedule is untouched:
+    /// the transient ladder, falling to the terminal schedule at the cap.
+    fn index_on_roster(
+        &self,
+        kind: EnvelopeKind,
+        hash: [u8; 32],
+        envelope_bytes: &[u8],
+        source_peer: Option<&str>,
+    ) {
+        let Some(group) = roster_group_of(envelope_bytes) else {
+            return;
+        };
+        if self.refusal_backoff.index_ordinary_on(
+            kind,
+            hash,
+            &audience_group_key(&group),
+            source_peer,
+        ) {
+            tracing::debug!(
+                kind = ?kind,
+                envelope_hash = %hex::encode(&hash[..8]),
+                group = %group,
+                "a row is ahead of its group's roster here — the roster event that lands \
+                 asks for it again at once (history: CIRISEdge#1006)"
+            );
+        }
     }
 
     /// persist 61.3.0 (CIRISPersist#1252) — park a `withdraws` refused
@@ -17526,6 +17633,183 @@ pub(crate) mod tests {
         );
     }
 
+    /// CIRISEdge#1006 — a row placed at `group` under `field`
+    /// (`community_key_id` / `family_key_id`), as wire bytes.
+    fn placed_row_1006(
+        id: &str,
+        attester: &str,
+        dimension: &str,
+        field: &str,
+        group: &str,
+    ) -> Vec<u8> {
+        let row = build_federation_attestation(
+            id,
+            attester,
+            attester,
+            "scores",
+            serde_json::json!({ "dimension": dimension, field: group }),
+        );
+        serde_json::to_vec(&row).expect("wire")
+    }
+
+    /// CIRISEdge#1006 — book `err` for `wire` as the door would, then assert
+    /// it is indexed on its group's audience gate and still TRANSIENT; land
+    /// `release` (an admitted roster or membership row) and assert the row is
+    /// released and asked for again at once.
+    async fn a_roster_refusal_is_released_by_1006(
+        err: ciris_persist::federation::Error,
+        class: ApplyRefusalClass,
+        wire: &[u8],
+        release: &[u8],
+        gate: &str,
+    ) {
+        let (_backend, bridge) = make_bridge(&[]);
+        let kind = EnvelopeKind::Attestation;
+        let hash = super::super::wire_ref::envelope_ref(kind, wire);
+        let refused = bridge.refuse_as("Attestation", "h", &err, class);
+        assert_eq!(
+            refused.retry_disposition(),
+            Some(RetryDisposition::Transient)
+        );
+        bridge.remember_outcome(kind, wire, &refused);
+        bridge
+            .park_or_release(kind, wire, &refused, Some("peer-p"))
+            .await;
+        let backoff = bridge.refusal_backoff_for_test();
+        assert_eq!(backoff.parked_on(gate), 1, "{class:?}: indexed on {gate}");
+        assert_eq!(
+            backoff.parked_on_signer_len(),
+            0,
+            "{class:?}: an ordinary row, not a park (the #858 cap still bounds it)"
+        );
+        assert!(backoff.suppressed_at(kind, &hash, Instant::now()));
+        let before = bridge.signer_releases();
+        bridge
+            .park_or_release(kind, release, &ApplyOutcome::Admitted, Some("peer-p"))
+            .await;
+        assert_eq!(backoff.parked_on(gate), 0, "{class:?}: released");
+        assert!(
+            bridge.signer_releases() > before,
+            "{class:?}: the release fired"
+        );
+        assert!(
+            !backoff.suppressed_at(kind, &hash, Instant::now()),
+            "{class:?}: asked for again at once"
+        );
+    }
+
+    /// CIRISEdge#1006 — a member's community row ahead of their membership is
+    /// released by the widening that seats them.
+    #[tokio::test]
+    async fn a_not_a_member_row_is_released_by_the_widening_that_seats_its_writer_1006() {
+        use ciris_persist::federation::Error as E;
+        use ciris_persist::scope::ScopeRefusalReason as R;
+        a_roster_refusal_is_released_by_1006(
+            E::WriteScopeRefused(R::NoCommunityMembership),
+            ApplyRefusalClass::NotACommunityMember,
+            &placed_row_1006(
+                "chat-1006",
+                "person-bob",
+                "chat:message:v1",
+                "community_key_id",
+                "room-1006",
+            ),
+            &placed_row_1006(
+                "w-1006",
+                "person-founder",
+                "membership:widening:v1",
+                "community_key_id",
+                "room-1006",
+            ),
+            "audience:group:room-1006",
+        )
+        .await;
+    }
+
+    /// CIRISEdge#1006 — the same row, released by a SUPERSEDING roster record
+    /// of the room (`group:roster:v1`), not a widening.
+    #[tokio::test]
+    async fn a_not_a_member_row_is_released_by_a_roster_supersede_1006() {
+        use ciris_persist::federation::Error as E;
+        use ciris_persist::scope::ScopeRefusalReason as R;
+        a_roster_refusal_is_released_by_1006(
+            E::WriteScopeRefused(R::NoCommunityMembership),
+            ApplyRefusalClass::NotACommunityMember,
+            &placed_row_1006(
+                "chat-1006s",
+                "person-bob",
+                "chat:message:v1",
+                "community_key_id",
+                "room-1006s",
+            ),
+            &placed_row_1006(
+                "r-1006s",
+                "person-founder",
+                "group:roster:v1",
+                "community_key_id",
+                "room-1006s",
+            ),
+            "audience:group:room-1006s",
+        )
+        .await;
+    }
+
+    /// CIRISEdge#1006 — the family plane: `NotAFamilyMember`, placed at its
+    /// family, released by the family's widening.
+    #[tokio::test]
+    async fn a_not_a_family_member_row_is_released_by_the_familys_widening_1006() {
+        use ciris_persist::federation::Error as E;
+        use ciris_persist::scope::ScopeRefusalReason as R;
+        a_roster_refusal_is_released_by_1006(
+            E::WriteScopeRefused(R::NoFamilyMembership),
+            ApplyRefusalClass::NotAFamilyMember,
+            &placed_row_1006(
+                "fam-1006",
+                "person-bob",
+                "chat:message:v1",
+                "family_key_id",
+                "household-1006",
+            ),
+            &placed_row_1006(
+                "fw-1006",
+                "person-founder",
+                "membership:widening:v1",
+                "family_key_id",
+                "household-1006",
+            ),
+            "audience:group:household-1006",
+        )
+        .await;
+    }
+
+    /// CIRISEdge#1006 — a row ahead of the FIRST roster this node holds
+    /// (`MembershipUnresolved`) is released by that roster record's landing.
+    #[tokio::test]
+    async fn a_row_ahead_of_its_first_roster_is_released_by_it_1006() {
+        use ciris_persist::federation::Error as E;
+        use ciris_persist::scope::ScopeRefusalReason as R;
+        a_roster_refusal_is_released_by_1006(
+            E::WriteScopeRefused(R::MembershipUnresolved),
+            ApplyRefusalClass::RetryAfterRoster,
+            &placed_row_1006(
+                "chat-1006f",
+                "person-bob",
+                "chat:message:v1",
+                "community_key_id",
+                "room-1006f",
+            ),
+            &placed_row_1006(
+                "r-1006f",
+                "person-founder",
+                "group:roster:v1",
+                "community_key_id",
+                "room-1006f",
+            ),
+            "audience:group:room-1006f",
+        )
+        .await;
+    }
+
     /// persist v61 S2 (#1148) — **with nothing to release it, a row refused
     /// `not_in_audience` stays parked on the terminal floor and is not asked
     /// for in a loop.** A membership row of ANOTHER room releases nothing; the
@@ -19236,11 +19520,11 @@ pub(crate) mod tests {
             Some(ApplyRefusalClass::RetryAfterRoster),
         );
         assert!(ApplyRefusalClass::RetryAfterRoster.is_transient());
-        // TERMINAL: the roster IS held and the writer is not in it. Before
-        // v47 persist could not tell these from the transient case, and
-        // edge rode both as "retry after the roster" — a permanent refusal
-        // wearing a transient label, in the direction this ledger exists to
-        // prevent.
+        // The roster IS held and the writer is not in it (yet). Persist
+        // v47 tells this from "roster not held"; it is still an ordering
+        // artefact while a room grows (CIRISEdge#1006: the member's
+        // acceptance is on its way), so TRANSIENT, with the #858 cap fall to
+        // the terminal schedule bounding a writer who really was removed.
         assert_eq!(
             ApplyRefusalClass::classify(&E::WriteScopeRefused(R::NoCommunityMembership)),
             Some(ApplyRefusalClass::NotACommunityMember),
@@ -19249,8 +19533,16 @@ pub(crate) mod tests {
             ApplyRefusalClass::classify(&E::WriteScopeRefused(R::NoFamilyMembership)),
             Some(ApplyRefusalClass::NotAFamilyMember),
         );
-        assert!(!ApplyRefusalClass::NotACommunityMember.is_transient());
-        assert!(!ApplyRefusalClass::NotAFamilyMember.is_transient());
+        assert!(ApplyRefusalClass::NotACommunityMember.is_transient());
+        assert!(ApplyRefusalClass::NotAFamilyMember.is_transient());
+        for class in [
+            ApplyRefusalClass::RetryAfterRoster,
+            ApplyRefusalClass::NotACommunityMember,
+            ApplyRefusalClass::NotAFamilyMember,
+        ] {
+            assert!(class.awaits_roster(), "{class:?}");
+        }
+        assert!(!ApplyRefusalClass::ThirdPartyRow.awaits_roster());
 
         // AV-84 (persist#757) — a policy verdict about the ROW's content, and
         // NOT a delivery problem. Terminal: nothing about it changes by
@@ -19347,7 +19639,8 @@ pub(crate) mod tests {
         assert!(msg.contains("class=retry_after_roster"), "{msg}");
         assert!(msg.contains("TRANSIENT"), "{msg}");
         // persist v47.0.0 (#797): a HELD roster that excludes the writer is
-        // the other answer, and it is terminal.
+        // the other answer. CIRISEdge#1006: transient too, and its line no
+        // longer says TERMINAL.
         let err = E::WriteScopeRefused(R::NoCommunityMembership);
         let msg = classified_refusal_reason(
             "Attestation",
@@ -19356,7 +19649,8 @@ pub(crate) mod tests {
             ApplyRefusalClass::NotACommunityMember,
         );
         assert!(msg.contains("class=not_a_community_member"), "{msg}");
-        assert!(msg.contains("TERMINAL"), "{msg}");
+        assert!(msg.contains("TRANSIENT"), "{msg}");
+        assert!(!msg.contains("TERMINAL"), "{msg}");
         let terminal = classified_refusal_reason(
             "Community",
             "deadbeef",
@@ -31193,7 +31487,7 @@ pub(crate) mod tests {
                 "an unbound node must not inherit anyone's membership — the principal \
                  fold widens to the single live owner and NEVER past it, and the door it \
                  refuses at is still the MEMBERSHIP door. The roster IS held here, so \
-                 persist v47.0.0 names it terminal, not 'roster not held yet': {reason}"
+                 persist v47.0.0 names it 'not a member', not 'roster not held yet': {reason}"
             ),
             other => panic!("an unbound node must not inherit anyone's membership; got {other:?}"),
         }
