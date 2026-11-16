@@ -2,6 +2,68 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.5 — 2026-11-16
+
+**PATCH. A member's messages in a star room open for everyone: a minter carries its key-grant
+wraps to members that are not its peers; and `not_in_audience` follows persist's retry rule.**
+Pins unchanged: persist **v61.4.1** by tag (`ciris-persist==61.4.1`), CIRISVerify v22.2.0,
+leviculum v0.34.0+ciris.3. No wire change, no call-shape change, no migration. Found in the
+server's star6 harness on 45.1.4 (0/3): a newcomer read the founder's messages but never a
+second writer's.
+
+### Fixed
+
+- **A minter carries its wraps to a room member that is not its peer.** A member who writes
+  mints its own epoch and wraps it to each member device. persist serves a wrap to its recipient
+  only, so no member can relay it, and a host's replication peers are its consent peers. In a star
+  room the members are contacts of the founder but not of each other. A non-founder's wraps
+  therefore never left its node, and the newcomer read its messages `not_granted` for good. This
+  was not the #1006 ordering class: the founder's wrap and person row were refused, released and
+  admitted within about 100 ms in every run.
+  - **The wrap courier** (`replication::wrap_courier`) runs one task per sealing runtime. It is
+    woken by the host's kicks (the room seat kicks after granting) and runs once at start. It
+    reads this node's own key-grant rows newest first until a page holds nothing new. Each wrap
+    whose recipient has no Attestation initiator here is carried in one ordinary
+    Summary/Diff/Deliver round on a coordinator of its own. That coordinator is registered only
+    while the recipient's initiator slot is empty, and the round goes over whatever route
+    reaches the recipient. No new wire message.
+  - **Scope.** Only rows this node signed, addressed to that recipient, each passing persist's
+    own `may_receive`. The round offers exactly those refs and wants nothing back. A recipient
+    that is, or becomes, a peer is left to its ordinary round.
+  - **Bounded.** One round per recipient at a time. Retries double from 10 s to 5 min, and the
+    courier gives up after 6 attempts. It holds at most 256 recipients and carries at most 64
+    rows per round. Nothing is read between wakes.
+  - **Booked** in `replication_io`: `attestation:wrap_courier_{sent,admitted,refused,gave_up}`,
+    counted in rows. `admitted` means the round ended in sync. Never addresses.
+- **`not_in_audience` follows persist's retry rule.** persist marks it retryable; edge overrode
+  it to terminal on both the general and the key-grant door. It is now transient and indexed on
+  its audience gate as an ordinary row, the #1006 shape. The #1148 releases still forget it at
+  once, and the #858 cap still moves a never-released one to the terminal schedule.
+
+### Tested
+
+- `a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6` (`late_device_768_tests`): two
+  real substrates and runtimes joined only by a pair transport. Node B mints an epoch wrapped
+  to member A, and the two are not peers. Red at 45.1.4: B sent no frames in 20 s. Green here:
+  - A admits B's wrap after B's host kicks;
+  - every row B delivered is one of A's own wraps;
+  - B books sent == admitted, with nothing refused or given up.
+- `a_not_in_audience_refusal_is_transient_and_indexed_on_its_gate_star6` (`replication::bridge`):
+  red at 45.1.4 (terminal), green here. The #1148 witnesses now assert the transient window and
+  the cap fall in place of the terminal park. Courier units cover the backoff bound and a round
+  that offers only what it carries.
+
+### Known, not fixed in this line
+
+- **CIRISEdge#1000:** a responder step still has no deadline of its own.
+- **CIRISEdge#996:** `direct_links_805`'s relay-leg test loses A/V chunks under CPU contention.
+- **CIRISEdge#1002:** an initiator round's opening step runs outside the round timeout.
+- **CIRISEdge#1009:** `av_call_nat_805`'s punched-interface room call failed once, with the link
+  seal held during keying.
+- **mesh6 `not_fetched`:** a message body's bytes not fetched in one six-person mesh run, a
+  different class from star6's (blob fetch). To be filed.
+- **Owner keys reach a six-node room in about 600 s:** to be re-measured after #1005.
+
 ## 45.1.4 — 2026-11-15
 
 **PATCH. A new node is no longer locked out of a seat, its own Key is no longer starved by
