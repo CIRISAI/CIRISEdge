@@ -19374,7 +19374,8 @@ pub(crate) mod tests {
     /// 30 min doubling to 6 h, and the sender pushes it only once.
     #[tokio::test]
     async fn a_members_row_ahead_of_their_acceptance_lands_once_it_does_1006() {
-        let (_backend, bridge, _widening, widening_row, chat) = star_room_newcomer_1006().await;
+        let (_backend, bridge, _widening, widening_row, chat) =
+            Box::pin(star_room_newcomer_1006()).await;
         let hash = the_chat_row_arrives_first_1006(&bridge, &chat).await;
         let outcome = bridge
             .apply_envelope_bytes(
@@ -19405,7 +19406,7 @@ pub(crate) mod tests {
     /// `note_local_writes_since`: the RosterLanded row clears the refusal.
     #[tokio::test]
     async fn a_locally_landed_roster_clears_a_members_refused_row_1006() {
-        let (backend, bridge, widening, _row, chat) = star_room_newcomer_1006().await;
+        let (backend, bridge, widening, _row, chat) = Box::pin(star_room_newcomer_1006()).await;
         let hash = the_chat_row_arrives_first_1006(&bridge, &chat).await;
         let before = Utc::now();
         backend

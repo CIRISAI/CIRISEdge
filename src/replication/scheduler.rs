@@ -3422,6 +3422,7 @@ mod tests {
     /// round's Summary never went, and the node's own Key rows never reached
     /// the seat (field: 62 recovery rounds in 297 s, no ordinary Key round).
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // the full node↔seat fixture beside its one assertion
     async fn a_requeued_recovery_name_does_not_starve_the_own_key_round() {
         let (alice_to_bob_tx, mut alice_to_bob_rx) = tokio::sync::mpsc::unbounded_channel();
         let (bob_to_alice_tx, mut bob_to_alice_rx) = tokio::sync::mpsc::unbounded_channel();

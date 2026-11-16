@@ -2229,6 +2229,7 @@ async fn the_seat_is_never_asked_about_a_member_971() {
 /// down inside the E1 hold, so B's Key row never landed and the lockout never
 /// cleared.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one seat, two identities of one node, and the story between them
 async fn a_new_node_back_on_a_second_identity_reaches_the_seat_1004() {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
