@@ -2026,7 +2026,10 @@ pub const RESPONDER_ROUND_OPENED_DIFF: &str = "opened_diff";
 /// CIRISEdge#1005 — `recovery_rounds` / `recovery_rounds_completed` count the
 /// signer-recovery rounds (a Pull, no Summary), booked apart from the
 /// ordinary rounds `first_sync_*` describes.
-pub const REPLICATION_IO_LABELS: [&str; 19] = [
+/// 45.1.5 — `wrap_courier_{sent,admitted,refused,gave_up}`: key-grant wraps
+/// this node carried to a room member that is not its replication peer (rows,
+/// on the Attestation plane).
+pub const REPLICATION_IO_LABELS: [&str; 23] = [
     "deliver_rows_out",
     "deliver_bytes_out",
     "deliver_rows_in",
@@ -2046,6 +2049,10 @@ pub const REPLICATION_IO_LABELS: [&str; 19] = [
     "first_sync_bytes",
     "recovery_rounds",
     "recovery_rounds_completed",
+    "wrap_courier_sent",
+    "wrap_courier_admitted",
+    "wrap_courier_refused",
+    "wrap_courier_gave_up",
 ];
 /// Seat load 2026-11-13 (S0) — the classes a peer is counted under in
 /// `peer_activity`: the axis of this node's attestation send set that last

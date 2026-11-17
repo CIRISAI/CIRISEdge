@@ -1,5 +1,23 @@
 # CIRISEdge Release Notes
 
+# v45.1.5 — a member's messages in a star room open for everyone
+
+**2026-11-16.** **PATCH.** Pins unchanged: persist v61.4.1 by tag (`ciris-persist==61.4.1`),
+CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. No wire change. Detail in CHANGELOG.md.
+
+- **A minter carries its key-grant wraps to a room member that is not its peer.** persist serves
+  a wrap to its recipient only, and in a star room members are not each other's peers, so a
+  non-founder's wraps never left its node and newcomers read its messages `not_granted`. The
+  wrap courier sends exactly those wraps, each passing persist's `may_receive`, in one ordinary
+  round to that member. It is woken by the host's kicks, bounded (6 attempts, backoff from 10 s
+  to 5 min) and booked as `wrap_courier_{sent,admitted,refused,gave_up}`.
+- **`not_in_audience` is transient, as persist says.** It is indexed on its audience gate and
+  released by the room's roster events. The #858 cap still bounds one that nothing releases.
+- **Witnessed:** a two-node, non-peer room, red at 45.1.4 and green here (the minter sends only
+  the recipient's wraps). The audience refusal witness is also red then green.
+- **Known:** CIRISEdge#1000, #996, #1002, #1009, a mesh6 blob-fetch miss (to be filed), and the
+  six-node owner-key staircase (to be re-measured).
+
 # v45.1.4 — a new node reaches its seat, and a member's early row lands
 
 **2026-11-15.** **PATCH.** Pins unchanged: persist v61.4.1 by tag (`ciris-persist==61.4.1`),
