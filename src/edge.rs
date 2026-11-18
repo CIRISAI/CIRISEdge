@@ -4815,9 +4815,45 @@ impl Edge {
     #[cfg(feature = "_reticulum-module")]
     pub fn set_node_signer(&self, signer: Arc<LocalSigner>) -> Result<(), EdgeError> {
         let signer = checked_node_signer(signer, self.reticulum_transport.as_deref())?;
-        self.node_signer.set(signer).map_err(|_| {
-            EdgeError::Config("set_node_signer: the node signer is already set".into())
+        // One node key per process: the same key again is a no-op (a host
+        // that sets it at compose and again on another path); a DIFFERENT
+        // key is refused loudly, never swapped under a running node.
+        if let Some(held) = self.node_signer.get() {
+            if held.key_id == signer.key_id {
+                return Ok(());
+            }
+            tracing::warn!(
+                held = %held.key_id,
+                offered = %signer.key_id,
+                "set_node_signer: a second, different node signer was offered and refused — \
+                 one node key per process"
+            );
+            return Err(EdgeError::Config(format!(
+                "set_node_signer: the node signer is already {} (offered {})",
+                held.key_id, signer.key_id
+            )));
+        }
+        let key_id = signer.key_id.clone();
+        self.node_signer.set(signer).or_else(|lost| {
+            // A concurrent set with the same key is the same no-op.
+            if self.node_signer.get().is_some_and(|held| held.key_id == lost.key_id) {
+                Ok(())
+            } else {
+                Err(EdgeError::Config(format!(
+                    "set_node_signer: a different node signer was set concurrently (offered {key_id})"
+                )))
+            }
         })
+    }
+
+    /// 45.1.6 — the key id this Edge signs AS THE NODE with: the one
+    /// [`Self::node_signer`] resolves to. On a split home it is the node's
+    /// key, not the actor's; on a single-key node the two are the same. A
+    /// host's split-home witness asserts it equals the transport's occurrence.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn node_signer_key_id(&self) -> String {
+        self.node_signer().key_id.clone()
     }
 
     /// 45.1.6 — **the signer of THIS NODE**: the one whose key is the
@@ -12373,10 +12409,11 @@ mod scope_native_install_tests {
         ))
     }
 
-    /// 45.1.6 — the node signer is set once, and an Edge with none set reads
-    /// its own signer as the node (a single-key node is unchanged).
+    /// 45.1.6 — one node key per process: setting the same node signer again
+    /// is a no-op, a DIFFERENT one is refused, and an Edge with none set
+    /// reads its own signer as the node (a single-key node is unchanged).
     #[tokio::test]
-    async fn the_node_signer_is_set_once_and_falls_back_to_the_signer() {
+    async fn the_node_signer_is_one_key_and_falls_back_to_the_signer() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let edge = builder(tmp.path(), "edge-ns")
             .await
@@ -12393,10 +12430,24 @@ mod scope_native_install_tests {
             .signer();
         edge.set_node_signer(Arc::clone(&other)).expect("first set");
         assert_eq!(edge.node_signer().key_id, other.key_id);
-        let Err(EdgeError::Config(msg)) = edge.set_node_signer(other) else {
-            panic!("a second set is refused");
+        assert_eq!(edge.node_signer_key_id(), other.key_id);
+        // The same key again (compose and another path both set it): a no-op.
+        edge.set_node_signer(Arc::clone(&other))
+            .expect("the same key again is a no-op");
+        assert_eq!(edge.node_signer_key_id(), other.key_id);
+        // A different key: refused, and the held one stays.
+        let tmp_third = tempfile::tempdir().expect("tempdir");
+        let third = builder(tmp_third.path(), "edge-ns-third")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .build()
+            .expect("build")
+            .signer();
+        let Err(EdgeError::Config(msg)) = edge.set_node_signer(third) else {
+            panic!("a second, different node signer is refused");
         };
-        assert!(msg.contains("already set"), "{msg}");
+        assert!(msg.contains("already"), "{msg}");
+        assert_eq!(edge.node_signer_key_id(), other.key_id);
     }
 
     /// 45.1.6 guard — **what `join_call_as` signs AS THE NODE takes the node
