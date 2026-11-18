@@ -1,5 +1,24 @@
 # CIRISEdge Release Notes
 
+# v45.1.6 — a call starts on every agent install, and a refused wrap is carried again
+
+**2026-11-18.** **PATCH.** Pins unchanged: persist v61.4.1 by tag (`ciris-persist==61.4.1`),
+CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. One additive wire member. Detail in CHANGELOG.md.
+
+- **A split home's call is signed by the node.** On every agent install (agent key ≠ node key)
+  `POST /v1/chat/<room>/call` returned 503 `call.plumbing`: the stream was bound by the agent, not
+  its publisher, the node. `Edge::node_signer()` is now the node's signer (the host's
+  `Edge::set_node_signer` / `EdgeBuilder::node_signer`, else the transport's own, else the Edge's),
+  and the call binds and co-scrubs with it. No host change is needed on an agent install.
+- **The wrap courier books what the recipient did (CIRISEdge#1014).** It booked a round's end as
+  `admitted` though the recipient had refused the wrap (its roster had not landed) and never
+  retried. A row is now settled by the recipient's next answer, and a refusal is retried on the
+  backoff. A Diff names the offered rows its sender refused and backs off from (`withheld`, only
+  for offers of at most 64 refs; a pre-45.1.6 peer ignores it).
+- **Witnessed:** a split-home call and a wrap refused before the roster lands, each red at 45.1.5
+  and green here.
+- **Known:** CIRISEdge#1000, #996, #1002, #1009, #1010, #1012, and the six-node owner-key staircase.
+
 # v45.1.5 — a member's messages in a star room open for everyone
 
 **2026-11-16.** **PATCH.** Pins unchanged: persist v61.4.1 by tag (`ciris-persist==61.4.1`),

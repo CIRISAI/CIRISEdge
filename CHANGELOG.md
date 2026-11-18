@@ -2,6 +2,95 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.6 — 2026-11-18
+
+**PATCH. A call starts on every agent install, and a wrap a member refused before their roster
+landed reaches them once it has.** Pins unchanged: persist **v61.4.1** by tag
+(`ciris-persist==61.4.1`), CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. No migration. One
+additive wire member (`Diff.withheld`, below); a peer before 45.1.6 ignores it.
+
+### Fixed
+
+- **A split home's call is signed by the node.** Field: ciris-agent 2.22.1 + server 0.5.249 (edge
+  45.1.4). `POST /v1/chat/<room>/call` returned 503 `call.plumbing`: "the signer that binds this
+  stream's chunk keys is ciris-agent-bootstrap-…, not the publisher ciris-node-bootstrap-…". Every
+  agent install is a split home: the Edge signs as the agent (the actor), while its transport, its
+  stream's publisher and its room leaf are the node. `join_call_as` handed the call the Edge's
+  engine signer as the stream's chunk-key binder and as the node's co-scrub on the call row, and
+  `Call::join` refused it. Standalone harness nodes have one key, so every witness passed.
+  - **`Edge::node_signer()`** is the signer of THIS NODE, the one whose key is the transport's
+    occurrence. It is the host's (`EdgeBuilder::node_signer`, `Edge::set_node_signer`; refused
+    when its key is not the occurrence, set once), else the transport's own signer when that is
+    the node (`ReticulumTransport::node_signer`), else the Edge's signer. A single-key node is
+    unchanged, and an agent install needs no host change: its transport already holds the node's
+    signer. The pyo3 init also hands the node identity it resolves under `use_node_identity` to
+    the builder.
+  - `join_call_as` binds the stream (and so its Ready/Caps, rebinds and leave) and co-scrubs the
+    call row with the node signer. The attendee, when the host names none, stays the Edge's
+    signer: the actor (#541).
+  - Same class: `send_mandatory`'s and the federation fan-out's self-loopback filters compared
+    peers with the actor only. A split home is also the node it advertises.
+- **The wrap courier books what the recipient did, and carries a refused wrap again
+  (CIRISEdge#1014).** Field (server harness, four-person star room, 45.1.5): dave never got bob's
+  key_grant, `not_granted: 1` for 6 min, while bob booked `wrap_courier_sent 2 / admitted 2`.
+  dave's responder recorded the round `admitted: 0, refused: 1` (persist: not yet an active member)
+  and dave's roster landed 1.7 s later. The courier read a round's end as admission (the report it
+  read was its own apply of dave's empty Deliver) and dropped dave. dave's #1148 release re-asks
+  only its own peers, which in a star room do not include the minter.
+  - A row is now settled by the recipient's next answer: asked for again, or named in its Diff's
+    new `withheld` (rows it refused and backs off from), the delivery was refused, and the row is
+    retried on the existing backoff (10 s doubling to 5 min, given up after 6). Neither asked for
+    nor withheld, the recipient holds it. A delivered row is confirmed by a round 2 s later.
+  - **`Diff.withheld`** is sent only for an offer of at most 64 refs, capped at 64 hashes, and
+    omitted when empty, so an ordinary round's Diff is byte-identical. A recipient before 45.1.6
+    names nothing withheld; a row it refused and still backs off from reads as held there.
+  - **Booked truthfully:** `wrap_courier_sent` counts rows the recipient asked for and was
+    delivered; each delivery is later booked once, `admitted` or `refused` (or `gave_up`).
+
+### Tested
+
+- `a_split_home_joins_its_rooms_call_as_the_node` (`scoped_body_identity_link_718`): A's Edge
+  signs as an agent while its transport is the node, as the pyo3 path and the server compose it.
+  Red at 45.1.5 with the field's error. Green here: A joins, and B accepts A's frames (under a
+  binding verified against A's node key), publisher A's node.
+- Guards (`edge`): a source scan holds that `join_call_as` binds and co-scrubs with the node
+  signer and uses the Edge's signer only as the attendee fallback; the node signer is set once
+  and falls back to the Edge's signer.
+- `a_wrap_refused_before_the_roster_lands_is_carried_again_1014` (`late_device_768_tests`): B's
+  wrap reaches A before A's roster, A refuses, the roster lands 1.7 s later. Red at 45.1.5 (sent 2
+  / admitted 2, never granted). Green here: A admits within 60 s, B books the refusal before the
+  admission, and sent == refused + admitted with nothing given up. Units: a row settled by the
+  answer, the round recording the answer, a responder naming what it withholds (and nothing for
+  a large offer).
+
+### Audit: what edge signs as "this node"
+
+| Site | Role | 45.1.6 |
+| --- | --- | --- |
+| `join_call_as` stream binder (`CallDeps::signer`: binding, Ready/Caps, rebind, leave, chunk seal) | node | node signer |
+| `join_call_as` call-row co-scrub (`PersistCallRecord::node`) | node | node signer |
+| `join_call_as` attendee fallback | actor (#541) | unchanged |
+| `send_mandatory` / federation self-loopback filters | node identity | actor or advertised id |
+| Envelope signing, enqueue sender, delivery and refusal attestations | actor (#541, v18.15) | unchanged |
+| Transport routes, announces, transit pair | node | already the transport's own signer |
+| Direct-link proposals | node | channel signals on the node's identity link; no edge signature |
+| File holds, custody claims and co-scrubs (`attestation_bind::Signers`) | node | host-supplied `Signers { node, actor }`, no edge-side default |
+| Key-grant emitter | minter | persist's engine signer |
+| Wrap courier | minter | carries rows, signs nothing; scans by the runtime's `local_key_id` |
+| Touch claims (pyo3 `produce_*_touch`) | attester's own | unchanged |
+
+### Known, not fixed in this line
+
+- **CIRISEdge#1000:** a responder step still has no deadline of its own.
+- **CIRISEdge#996:** `direct_links_805`'s relay-leg test loses A/V chunks under CPU contention.
+- **CIRISEdge#1002:** an initiator round's opening step runs outside the round timeout.
+- **CIRISEdge#1009:** `av_call_nat_805`'s punched-interface room call failed once, with the link
+  seal held during keying.
+- **CIRISEdge#1010:** a fresh A/V leg drops its first frames, and the rotation leg blames the
+  rotation for them.
+- **CIRISEdge#1012:** mesh6: a member's message body bytes are never fetched (`not_fetched`).
+- **Owner keys reach a six-node room in about 600 s:** to be re-measured.
+
 ## 45.1.5 — 2026-11-16
 
 **PATCH. A member's messages in a star room open for everyone: a minter carries its key-grant
