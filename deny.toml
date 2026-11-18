@@ -119,6 +119,19 @@ ignore = [
     "RUSTSEC-2026-0530",  # parent-side NSEC at a zone cut accepted as nonexistence proof
     "RUSTSEC-2026-0531",  # child-side NSEC/NSEC3 accepted as proof of no DS record
     "RUSTSEC-2026-0532",  # parent-side NSEC3 at a zone cut accepted as nonexistence proof
+    # 45.1.6 — three more of the same class (published 2026-11-17/18), same
+    # grounds re-checked at this tree (`cargo tree -i hickory-proto -e
+    # features`: __https, https-ring only; no dnssec-* feature), and nothing
+    # calls the resolver. Clears when verify >= 22.2.1 (hickory removed) is
+    # adopted with persist's re-pin in the refactor cut.
+    "RUSTSEC-2026-0549",  # NSEC3 NODATA at a zone apex accepted without a matching NSEC3
+    "RUSTSEC-2026-0550",  # unsigned NSEC/NSEC3 record used in a nonexistence proof
+    "RUSTSEC-2026-0551",  # records of another DNS class marked secure without validation
+    # 45.1.6 — chrono flagged unmaintained (an informational advisory, no
+    # vulnerability). chrono is used across edge, persist and verify for
+    # timestamps; replacing it is a cross-repo change for the refactor cut
+    # (persist v62's Clock seam), not an LTS patch.
+    "RUSTSEC-2026-0543",  # chrono unmaintained
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained
     "RUSTSEC-2026-0098",  # rustls-webpki URI-name constraint (no URI SAN validation here)
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard-DNS constraint (no name-constraint certs)
