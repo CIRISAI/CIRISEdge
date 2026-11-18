@@ -346,6 +346,10 @@ pub trait StateProvider: Send + Sync {
         false
     }
 
+    /// 45.1.6 (CIRISEdge#1014) — the peer's Diff named offered hashes it
+    /// lacks and withholds (it refused them). Only the wrap courier reads it.
+    fn note_peer_withheld(&self, _kind: EnvelopeKind, _withheld: &[[u8; 32]]) {}
+
     /// The round this provider's listing went into ended, `lost` when it did
     /// not complete: what was listed has not been delivered.
     fn round_ended(&self, _kind: EnvelopeKind, _lost: bool) {}

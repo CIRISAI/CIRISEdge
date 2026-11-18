@@ -86,7 +86,11 @@ fn arb_diff() -> impl Strategy<Value = DiffMessage> {
         arb_envelope_kind(),
         prop::collection::vec(any::<[u8; 32]>(), 0..32),
     )
-        .prop_map(|(kind, want)| DiffMessage { kind, want })
+        .prop_map(|(kind, want)| DiffMessage {
+            kind,
+            want,
+            withheld: Vec::new(),
+        })
 }
 
 fn arb_fetch() -> impl Strategy<Value = FetchMessage> {

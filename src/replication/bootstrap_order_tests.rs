@@ -145,7 +145,11 @@ impl Transport for NewContact {
                 self.reply(
                     kind,
                     round,
-                    ReplicationMessage::Diff(DiffMessage { kind, want }),
+                    ReplicationMessage::Diff(DiffMessage {
+                        kind,
+                        want,
+                        withheld: Vec::new(),
+                    }),
                 );
             }
             ReplicationMessage::Deliver(d) if !d.envelopes.is_empty() => self.take(d.kind),
@@ -348,7 +352,11 @@ impl Transport for WantsEverything {
                         kind,
                         refs: Vec::new(),
                     }),
-                    ReplicationMessage::Diff(DiffMessage { kind, want }),
+                    ReplicationMessage::Diff(DiffMessage {
+                        kind,
+                        want,
+                        withheld: Vec::new(),
+                    }),
                 ]
             }
             ReplicationMessage::Diff(d) => vec![ReplicationMessage::Deliver(DeliverMessage {

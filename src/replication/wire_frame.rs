@@ -536,6 +536,7 @@ mod tests {
             let msg = ReplicationMessage::Diff(DiffMessage {
                 kind: EnvelopeKind::Key,
                 want: vec![],
+                withheld: Vec::new(),
             });
             for v in [WIRE_PROTOCOL_VERSION, WIRE_PROTOCOL_VERSION_V2] {
                 let out = try_unwrap_framed(&wrap_at_version(&msg, v))
@@ -604,6 +605,7 @@ mod tests {
             ReplicationMessage::Diff(DiffMessage {
                 kind: EnvelopeKind::Attestation,
                 want: vec![h],
+                withheld: Vec::new(),
             }),
             ReplicationMessage::Fetch(FetchMessage {
                 kind: EnvelopeKind::Revocation,
@@ -655,6 +657,7 @@ mod tests {
             ReplicationMessage::Diff(DiffMessage {
                 kind: EnvelopeKind::OrgMembership,
                 want: vec![h],
+                withheld: Vec::new(),
             }),
             ReplicationMessage::Deliver(DeliverMessage {
                 kind: EnvelopeKind::PartnerRecord,
@@ -717,6 +720,7 @@ mod tests {
         let msg_v2 = ReplicationMessage::Diff(crate::replication::protocol::DiffMessage {
             kind: EnvelopeKind::OrgMembership,
             want: vec![],
+            withheld: Vec::new(),
         });
         let framed = wrap_for_kind(&msg_v2);
         assert_eq!(

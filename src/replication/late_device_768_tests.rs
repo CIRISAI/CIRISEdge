@@ -906,6 +906,19 @@ async fn a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6() {
     t_b.other_registry.set(rt_a.registry()).ok();
     rt_b.round_now_all().await.expect("kick");
 
+    // 45.1.6 (CIRISEdge#1014) — and B's courier books the admission, which
+    // it does on the round that reads A holding the wrap.
+    let booked = || {
+        let io = metrics_b.replication_io();
+        let count = |label: &str| {
+            io.iter()
+                .filter(|(k, _)| k.ends_with(&format!(":{label}")))
+                .map(|(_, v)| *v)
+                .sum::<u64>()
+        };
+        count("wrap_courier_sent") > 0
+            && count("wrap_courier_admitted") == count("wrap_courier_sent")
+    };
     let deadline = Instant::now() + Duration::from_secs(20);
     let granted = loop {
         let granting = a
@@ -913,7 +926,7 @@ async fn a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6() {
             .community_dek_minters_granting(ROOM, epoch, &a.me)
             .await
             .expect("read A's grants");
-        if granting.iter().any(|m| m == &b.me) {
+        if granting.iter().any(|m| m == &b.me) && booked() {
             break true;
         }
         if Instant::now() >= deadline {
@@ -927,9 +940,10 @@ async fn a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6() {
     assert!(
         granted,
         "B's wrap to A never crossed: A and B are not replication peers, a wrap is \
-         served to its recipient only, and nothing carried it ({} frames sent by B; \
-         45.1.5 star rooms)",
-        sent.len()
+         served to its recipient only, and nothing carried it; or B's courier never \
+         booked it admitted ({} frames sent by B; 45.1.5 star rooms, CIRISEdge#1014): {:?}",
+        sent.len(),
+        metrics_b.replication_io()
     );
 
     // Negative: every row B delivered to A is a key-grant row addressed to A.
@@ -1096,7 +1110,7 @@ async fn a_wrap_refused_before_the_roster_lands_is_carried_again_1014() {
     // A admits B's wrap within the bound, and B's courier books the refusal
     // before the admission.
     let mut refused_first = false;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let landed = loop {
         let count = io();
         if count("wrap_courier_refused") > 0 && count("wrap_courier_admitted") == 0 {
@@ -1120,8 +1134,7 @@ async fn a_wrap_refused_before_the_roster_lands_is_carried_again_1014() {
         a.dir
             .community_dek_minters_granting(ROOM, epoch, &a.me)
             .await
-            .map(|m| m.contains(&b.me))
-            .unwrap_or(false),
+            .is_ok_and(|m| m.contains(&b.me)),
         metrics_b.replication_io()
     );
     assert!(

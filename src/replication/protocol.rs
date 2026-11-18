@@ -690,7 +690,22 @@ pub enum SummaryStatus {
 pub struct DiffMessage {
     pub kind: EnvelopeKind,
     pub want: Vec<[u8; 32]>,
+    /// 45.1.6 (CIRISEdge#1014) — offered hashes this node LACKS and is not
+    /// asking for now: it refused them and holds the refusal's backoff
+    /// (CIRISEdge#544). Without it "not in `want`" reads the same for a row
+    /// held and a row refused, and the wrap courier booked a refusal as
+    /// admitted. Bounded by [`MAX_WITHHELD`] and sent only when the offer is
+    /// no larger, so an ordinary round's Diff stays byte-identical. Empty is
+    /// omitted on the wire (a pre-45.1.6 Diff), and a pre-45.1.6 peer
+    /// ignores the member (no `deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<[u8; 32]>,
 }
+
+/// 45.1.6 (CIRISEdge#1014) — the most hashes a [`DiffMessage`] withholds by
+/// name, and the largest offer it names them for: a courier round's
+/// (`wrap_courier`'s rows per recipient).
+pub const MAX_WITHHELD: usize = 64;
 
 /// "I want these envelopes by hash." Used for on-demand fetch (a
 /// consumer learns of a hash via a third channel and asks edge to
@@ -993,6 +1008,7 @@ mod tests {
         let m = ReplicationMessage::Diff(DiffMessage {
             kind: EnvelopeKind::Revocation,
             want: vec![fake_hash(3)],
+            withheld: Vec::new(),
         });
         let bytes = m.to_bytes();
         let parsed = ReplicationMessage::from_bytes(&bytes).expect("parse");

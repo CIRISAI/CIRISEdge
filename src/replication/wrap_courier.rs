@@ -31,8 +31,21 @@
 //!   reads nothing. Coalesced (one task, one round per recipient at a time),
 //!   retried with a doubling backoff, and given up after
 //!   [`MAX_ATTEMPTS`] with a counter.
+//! - **Done when the recipient holds it** (45.1.6, CIRISEdge#1014). A round
+//!   ending says nothing about the recipient's apply: its Deliver may be
+//!   refused (the field: dave's roster landed 1.7 s after bob's wrap, and
+//!   persist refused it "not an active member"). So a row is settled by the
+//!   recipient's NEXT answer, read off the round: asked for again, or named
+//!   `withheld` in its Diff (it refused the row and holds the backoff), the
+//!   delivery was refused and the row is retried on the backoff; neither
+//!   asked for nor withheld, it holds the row. A delivered row is confirmed
+//!   by a round [`CONFIRM_DELAY`] later. A pre-45.1.6 recipient names
+//!   nothing withheld: a row it refused and still backs off from reads as
+//!   held there.
 //! - **Booked.** `replication_io` `attestation:wrap_courier_{sent,admitted,
-//!   refused,gave_up}` (rows). Never addresses.
+//!   refused,gave_up}` (rows): `sent` is a row the recipient asked for and
+//!   was delivered, and each delivery is later booked once, `admitted` or
+//!   `refused` (or, unsettled at the bound, `gave_up`). Never addresses.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -48,7 +61,7 @@ use super::coordinator::ReplicationCoordinator;
 use super::protocol::{EnvelopeKind, EnvelopeRef};
 use super::registry::ReplicationRegistry;
 use super::session::SessionRole;
-use super::summary::{StalenessSignal, StateApplier, StateProvider};
+use super::summary::{StateApplier, StateProvider};
 use crate::transport::Transport;
 
 /// Rows read per page of this node's own wraps, newest first.
@@ -70,6 +83,9 @@ const RETRY_BASE: Duration = Duration::from_secs(10);
 const RETRY_CAP: Duration = Duration::from_mins(5);
 /// The coalescing window after a wake.
 const DEBOUNCE: Duration = Duration::from_millis(250);
+/// After a round that delivered rows, the wait before the round that reads
+/// whether the recipient holds them (CIRISEdge#1014).
+const CONFIRM_DELAY: Duration = Duration::from_secs(2);
 
 /// What the courier needs from the runtime.
 pub(crate) struct WrapCourierDeps {
@@ -84,9 +100,18 @@ pub(crate) struct WrapCourierDeps {
 
 /// A recipient's wraps waiting to cross.
 struct Pending {
-    rows: Vec<(Attestation, Vec<u8>, [u8; 32])>,
+    rows: Vec<Wrap>,
     attempts: u32,
     next_at: Instant,
+}
+
+/// One wrap waiting to cross.
+struct Wrap {
+    row: Attestation,
+    bytes: Vec<u8>,
+    hash: [u8; 32],
+    /// Delivered in a round, and not yet settled by the recipient's answer.
+    delivered: bool,
 }
 
 /// The courier's own memory: one task owns it, so nothing is shared.
@@ -209,11 +234,16 @@ impl Courier {
                     attempts: 0,
                     next_at: Instant::now(),
                 });
-                if entry.rows.iter().any(|(_, _, h)| *h == hash) {
+                if entry.rows.iter().any(|w| w.hash == hash) {
                     continue;
                 }
                 if entry.rows.len() < MAX_ROWS_PER_RECIPIENT {
-                    entry.rows.push((row, bytes, hash));
+                    entry.rows.push(Wrap {
+                        row,
+                        bytes,
+                        hash,
+                        delivered: false,
+                    });
                     // A new wrap is worth a prompt round.
                     entry.next_at = Instant::now();
                     fresh += 1;
@@ -256,50 +286,99 @@ impl Courier {
         };
         // persist's own gate: may this recipient receive this row here?
         let mut carry = Vec::new();
-        for (row, bytes, hash) in &pending.rows {
+        for w in &pending.rows {
             let allowed = ciris_persist::federation::replication_audience::may_receive(
                 &*self.deps.directory,
                 recipient,
-                row,
+                &w.row,
             )
             .await
             .is_ok_and(ciris_persist::federation::replication_audience::Verdict::allowed);
             if allowed {
-                carry.push((bytes.clone(), *hash));
+                carry.push((w.bytes.clone(), w.hash));
             }
         }
         let outcome = if carry.is_empty() {
             Err("no wrap is in the recipient's audience here yet".to_owned())
         } else {
-            self.book("wrap_courier_sent", carry.len());
             self.round(recipient, &carry).await
         };
         match outcome {
             Ok(Carried::BecamePeer) => {
                 self.pending.remove(recipient);
             }
-            Ok(Carried::Held) => {
-                self.book("wrap_courier_admitted", carry.len());
-                let carried: HashSet<[u8; 32]> = carry.iter().map(|(_, h)| *h).collect();
-                for h in &carried {
-                    self.remember(*h);
-                }
-                if let Some(p) = self.pending.get_mut(recipient) {
-                    p.rows.retain(|(_, _, h)| !carried.contains(h));
-                    if p.rows.is_empty() {
-                        self.pending.remove(recipient);
-                    }
-                }
-                tracing::debug!(
-                    rows = carried.len(),
-                    "wrap courier: a member that is not a peer holds this node's wraps"
-                );
-            }
-            Ok(Carried::NotHeld) => {
-                self.book("wrap_courier_refused", carry.len());
-                self.retry_or_give_up(recipient, None);
-            }
+            Ok(Carried::Answered(answer)) => self.settle(recipient, &carry, &answer),
             Err(e) => self.retry_or_give_up(recipient, Some(&e)),
+        }
+    }
+
+    /// CIRISEdge#1014 — settle each row this round offered by the
+    /// recipient's answer ([`settle_row`]), book it, and schedule the next
+    /// round: none when it holds every row, the backoff after a refusal, a
+    /// confirming round after a delivery.
+    fn settle(&mut self, recipient: &str, carry: &[(Vec<u8>, [u8; 32])], answer: &Answer) {
+        let offered: HashSet<[u8; 32]> = carry.iter().map(|(_, h)| *h).collect();
+        let Some(p) = self.pending.get_mut(recipient) else {
+            return;
+        };
+        let (mut sent, mut refused, mut admitted, mut withheld) = (0usize, 0usize, 0usize, 0usize);
+        let mut held = Vec::new();
+        for w in p.rows.iter_mut().filter(|w| offered.contains(&w.hash)) {
+            let outcome = settle_row(
+                w.delivered,
+                answer.asked.contains(&w.hash),
+                answer.withheld.contains(&w.hash),
+            );
+            match outcome {
+                RowOutcome::Delivered { refused_before } => {
+                    sent += 1;
+                    refused += usize::from(refused_before);
+                    w.delivered = true;
+                }
+                RowOutcome::Withheld { refused_before } => {
+                    withheld += 1;
+                    refused += usize::from(refused_before);
+                    w.delivered = false;
+                }
+                RowOutcome::Held { delivered_here } => {
+                    admitted += usize::from(delivered_here);
+                    held.push(w.hash);
+                }
+            }
+        }
+        p.rows.retain(|w| !held.contains(&w.hash));
+        let empty = p.rows.is_empty();
+        if sent > 0 {
+            self.book("wrap_courier_sent", sent);
+        }
+        if refused > 0 {
+            self.book("wrap_courier_refused", refused);
+        }
+        if admitted > 0 {
+            self.book("wrap_courier_admitted", admitted);
+        }
+        for h in &held {
+            self.remember(*h);
+        }
+        if !held.is_empty() {
+            tracing::debug!(
+                rows = held.len(),
+                "wrap courier: a member that is not a peer holds this node's wraps"
+            );
+        }
+        if empty {
+            self.pending.remove(recipient);
+        } else if refused > 0 || withheld > 0 {
+            tracing::debug!(
+                refused,
+                withheld,
+                "wrap courier: the member refused this node's wraps; carried again on the \
+                 backoff (history: CIRISEdge#1014)"
+            );
+            self.retry_or_give_up(recipient, None);
+        } else if let Some(p) = self.pending.get_mut(recipient) {
+            // Delivered: the next round reads whether the member holds them.
+            p.next_at = Instant::now() + CONFIRM_DELAY;
         }
     }
 
@@ -309,7 +388,7 @@ impl Courier {
         };
         p.attempts = p.attempts.saturating_add(1);
         if p.attempts >= MAX_ATTEMPTS {
-            let given: Vec<[u8; 32]> = p.rows.iter().map(|(_, _, h)| *h).collect();
+            let given: Vec<[u8; 32]> = p.rows.iter().map(|w| w.hash).collect();
             self.pending.remove(recipient);
             self.book("wrap_courier_gave_up", given.len());
             for h in given {
@@ -338,7 +417,7 @@ impl Courier {
             recipient.to_owned(),
             EnvelopeKind::Attestation,
             SessionRole::Initiator,
-            provider,
+            Arc::clone(&provider) as Arc<dyn StateProvider>,
             Arc::clone(&self.deps.applier),
         ));
         if !self
@@ -354,26 +433,61 @@ impl Courier {
             .registry
             .deregister_initiator_if(recipient, EnvelopeKind::Attestation, &coord)
             .await;
-        report.map(|r| {
-            if r.staleness == StalenessSignal::InSync {
-                Carried::Held
-            } else {
-                Carried::NotHeld
-            }
-        })
+        // CIRISEdge#1014 — the round's own report is THIS node's apply of
+        // the recipient's (empty) Deliver, never the recipient's apply of
+        // ours: what settles the rows is the recipient's answer.
+        report.map(|_| Carried::Answered(provider.answer()))
     }
 }
 
 /// How a courier round ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Carried {
-    /// The recipient holds every row offered.
-    Held,
-    /// The round completed and the recipient still lacks some: refused there.
-    NotHeld,
+    /// The round completed: what the recipient asked for and withheld.
+    Answered(Answer),
     /// The recipient became a peer before the round opened: its own round
     /// carries the wraps.
     BecamePeer,
+}
+
+/// The recipient's answer to one courier round (CIRISEdge#1014).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Answer {
+    /// Rows it asked for (its Diff's `want`), delivered this round.
+    asked: HashSet<[u8; 32]>,
+    /// Rows it lacks and named withheld: it refused them and backs off.
+    withheld: HashSet<[u8; 32]>,
+}
+
+/// What one offered row's answer means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowOutcome {
+    /// Asked for, and delivered now. `refused_before`: an earlier delivery
+    /// did not land there.
+    Delivered { refused_before: bool },
+    /// Lacked and withheld: refused. `refused_before`: the refusal of an
+    /// unsettled delivery, booked now.
+    Withheld { refused_before: bool },
+    /// Neither asked for nor withheld: the recipient holds it.
+    /// `delivered_here`: by this courier's delivery (booked admitted).
+    Held { delivered_here: bool },
+}
+
+/// CIRISEdge#1014 — one offered row, settled by the recipient's answer.
+fn settle_row(delivered: bool, asked: bool, withheld: bool) -> RowOutcome {
+    if asked {
+        RowOutcome::Delivered {
+            refused_before: delivered,
+        }
+    } else if withheld {
+        RowOutcome::Withheld {
+            refused_before: delivered,
+        }
+    } else {
+        RowOutcome::Held {
+            delivered_here: delivered,
+        }
+    }
 }
 
 /// The delay before attempt `attempts + 1`: [`RETRY_BASE`] doubling, capped
@@ -389,6 +503,9 @@ fn retry_delay(attempts: u32) -> Duration {
 struct WrapProvider {
     refs: Vec<EnvelopeRef>,
     bodies: HashMap<[u8; 32], Vec<u8>>,
+    /// What the recipient answered: the rows it fetched, the rows it
+    /// withheld (CIRISEdge#1014).
+    answer: std::sync::Mutex<Answer>,
 }
 
 impl WrapProvider {
@@ -402,7 +519,15 @@ impl WrapProvider {
             })
             .collect();
         let bodies = carry.iter().map(|(b, h)| (*h, b.clone())).collect();
-        Self { refs, bodies }
+        Self {
+            refs,
+            bodies,
+            answer: std::sync::Mutex::new(Answer::default()),
+        }
+    }
+
+    fn answer(&self) -> Answer {
+        self.answer.lock().map(|a| a.clone()).unwrap_or_default()
     }
 }
 
@@ -426,10 +551,28 @@ impl StateProvider for WrapProvider {
         kind: EnvelopeKind,
         envelope_hash: &[u8; 32],
     ) -> Option<Vec<u8>> {
-        if kind == EnvelopeKind::Attestation {
-            self.bodies.get(envelope_hash).cloned()
-        } else {
-            None
+        if kind != EnvelopeKind::Attestation {
+            return None;
+        }
+        let body = self.bodies.get(envelope_hash).cloned();
+        if body.is_some() {
+            if let Ok(mut a) = self.answer.lock() {
+                a.asked.insert(*envelope_hash);
+            }
+        }
+        body
+    }
+    fn note_peer_withheld(&self, kind: EnvelopeKind, withheld: &[[u8; 32]]) {
+        if kind != EnvelopeKind::Attestation {
+            return;
+        }
+        if let Ok(mut a) = self.answer.lock() {
+            a.withheld.extend(
+                withheld
+                    .iter()
+                    .filter(|h| self.bodies.contains_key(*h))
+                    .copied(),
+            );
         }
     }
 }
@@ -449,6 +592,76 @@ mod tests {
         assert_eq!(retry_delay(40), RETRY_CAP);
         let total: Duration = (1..MAX_ATTEMPTS).map(retry_delay).sum();
         assert!(total <= RETRY_CAP * MAX_ATTEMPTS, "{total:?}");
+    }
+
+    /// CIRISEdge#1014 — each offered row is settled by the recipient's answer
+    /// alone: asked again after a delivery is a refusal of that delivery,
+    /// withheld is a refusal, and only a row neither asked for nor withheld
+    /// is held — booked admitted when this courier delivered it.
+    #[test]
+    fn a_row_is_settled_by_the_recipients_answer() {
+        // First offer: asked, delivered, nothing to settle yet.
+        assert_eq!(
+            settle_row(false, true, false),
+            RowOutcome::Delivered {
+                refused_before: false
+            }
+        );
+        // The field: delivered, then withheld (refused, backing off).
+        assert_eq!(
+            settle_row(true, false, true),
+            RowOutcome::Withheld {
+                refused_before: true
+            }
+        );
+        // Delivered, then asked again: that delivery did not land.
+        assert_eq!(
+            settle_row(true, true, false),
+            RowOutcome::Delivered {
+                refused_before: true
+            }
+        );
+        // Delivered, then neither: held, booked admitted.
+        assert_eq!(
+            settle_row(true, false, false),
+            RowOutcome::Held {
+                delivered_here: true
+            }
+        );
+        // Never delivered by us and held: dropped, not booked.
+        assert_eq!(
+            settle_row(false, false, false),
+            RowOutcome::Held {
+                delivered_here: false
+            }
+        );
+        // Withheld before any delivery (a refusal another carrier earned):
+        // nothing of ours to book.
+        assert_eq!(
+            settle_row(false, false, true),
+            RowOutcome::Withheld {
+                refused_before: false
+            }
+        );
+    }
+
+    /// The courier round records the recipient's answer: what it fetched and
+    /// what it withheld, of the rows offered and no others.
+    #[tokio::test]
+    async fn the_courier_round_records_the_recipients_answer() {
+        let carry = vec![
+            (b"wrap-1".to_vec(), [1u8; 32]),
+            (b"wrap-2".to_vec(), [2u8; 32]),
+        ];
+        let p = WrapProvider::new(&carry);
+        assert!(p
+            .fetch_envelope(EnvelopeKind::Attestation, &[1u8; 32])
+            .await
+            .is_some());
+        p.note_peer_withheld(EnvelopeKind::Attestation, &[[2u8; 32], [9u8; 32]]);
+        let a = p.answer();
+        assert_eq!(a.asked, HashSet::from([[1u8; 32]]));
+        assert_eq!(a.withheld, HashSet::from([[2u8; 32]]));
     }
 
     /// The courier round offers exactly the wraps it carries, serves only

@@ -327,6 +327,15 @@ the CRPL wire-frame prefix (#72) plus the long-lived Session (#73)
 plus the scheduler (#75) constitute the v1 anti-entropy protocol.
 CEG defers to edge per #58.
 
+**`Diff.withheld` (45.1.6, CIRISEdge#1014).** A `Diff` may name, beside
+`want`, the offered hashes the asker LACKS and is deliberately not asking
+for: rows it refused and still backs off from (#544). Without it, absence
+from `want` reads the same for a row held and a row refused, and the wrap
+courier booked a recipient's refusal as admitted. Sent only for an offer of
+at most 64 refs and capped at 64 hashes, so an ordinary round's `Diff` is
+unchanged; empty is omitted (a pre-45.1.6 `Diff`), and a pre-45.1.6 peer
+ignores the member. Additive: no `WIRE_PROTOCOL_VERSION` change.
+
 #### 3.4.1 The RECEIVE axis — subject-scoped `Pull` (CIRISEdge#462)
 
 Anti-entropy converges what a peer **advertises**. It structurally

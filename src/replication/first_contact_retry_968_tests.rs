@@ -138,6 +138,7 @@ impl Transport for Canonical {
                     ReplicationMessage::Diff(DiffMessage {
                         kind,
                         want: Vec::new(),
+                        withheld: Vec::new(),
                     }),
                 );
             }
