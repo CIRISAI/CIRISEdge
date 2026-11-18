@@ -1522,6 +1522,12 @@ pub struct Edge {
     /// serve the next join.
     #[cfg(feature = "_reticulum-module")]
     room_groups: std::sync::OnceLock<Arc<crate::mls::CohortGroups>>,
+    /// 45.1.6 — the host-supplied signer of THIS NODE, for a split home
+    /// (the Edge's `signer` is the actor, the transport the node). Set once:
+    /// at build ([`EdgeBuilder::node_signer`]) or by [`Edge::set_node_signer`].
+    /// Read through [`Edge::node_signer`].
+    #[cfg(feature = "_reticulum-module")]
+    node_signer: std::sync::OnceLock<Arc<LocalSigner>>,
     /// CIRISEdge#805 item 5 — the keep door a call's stream registers through
     /// (never reached while kept streams wait on CIRISPersist#1067).
     #[cfg(feature = "_reticulum-module")]
@@ -1640,6 +1646,8 @@ pub struct EdgeBuilder {
     scope_lifecycle: Option<Arc<crate::scope_lifecycle::ScopeLifecycle>>,
     #[cfg(feature = "_reticulum-module")]
     room_groups: Option<Arc<crate::mls::CohortGroups>>,
+    #[cfg(feature = "_reticulum-module")]
+    node_signer: Option<Arc<LocalSigner>>,
     #[cfg(feature = "_reticulum-module")]
     stream_dek_registrar: Option<Arc<dyn crate::transport::av_keep::StreamDekRegistrar>>,
     /// CIRISEdge#34 (v0.14.0 wiring) — optionally pre-built
@@ -1929,6 +1937,23 @@ pub fn baked_canonical_ip_dials() -> Vec<(String, std::net::SocketAddr)> {
         .collect()
 }
 
+/// 45.1.6 — `signer` as this node's signer: refused when a Reticulum
+/// transport is wired and its occurrence is another key.
+#[cfg(feature = "_reticulum-module")]
+fn checked_node_signer(
+    signer: Arc<LocalSigner>,
+    transport: Option<&crate::transport::reticulum::ReticulumTransport>,
+) -> Result<Arc<LocalSigner>, EdgeError> {
+    match transport {
+        Some(t) if t.occurrence_key_id() != signer.key_id => Err(EdgeError::Config(format!(
+            "node signer {} is not this node: the transport's occurrence is {}",
+            signer.key_id,
+            t.occurrence_key_id()
+        ))),
+        _ => Ok(signer),
+    }
+}
+
 impl Edge {
     /// CIRISEdge#541 — the identity peers know this node as.
     ///
@@ -1978,6 +2003,8 @@ impl Edge {
             scope_lifecycle: None,
             #[cfg(feature = "_reticulum-module")]
             room_groups: None,
+            #[cfg(feature = "_reticulum-module")]
+            node_signer: None,
             #[cfg(feature = "_reticulum-module")]
             stream_dek_registrar: None,
             reachability: None,
@@ -3630,7 +3657,8 @@ impl Edge {
             // sender == receiver would loopback through edge's verify
             // (AV-8 self-destination is structurally a misroute) and
             // waste a queue row.
-            if peer == self.signer.key_id {
+            // 45.1.6 — a split home is ALSO the node it advertises.
+            if peer == self.signer.key_id || peer == self.advertised_key_id() {
                 continue;
             }
             // **Bypass-subscription invariant** — DO NOT consult
@@ -3838,7 +3866,8 @@ impl Edge {
             // Self-loopback filter — same invariant as `send_mandatory`
             // (sender == receiver loopbacks through edge's verify;
             // AV-8 structural misroute).
-            if steward.key_id == self.signer.key_id {
+            // 45.1.6 — a split home is ALSO the node it advertises.
+            if steward.key_id == self.signer.key_id || steward.key_id == self.advertised_key_id() {
                 continue;
             }
 
@@ -4766,6 +4795,50 @@ impl Edge {
         })
     }
 
+    /// 45.1.6 — **set the signer of THIS NODE on a running Edge**, for a
+    /// split home: an agent install, whose Edge signs as the agent (the
+    /// actor) while its Reticulum transport, its stream's publisher and its
+    /// room leaf are the node. Every signature edge makes AS the node (a
+    /// call's chunk-key binding, its Ready/Caps and leave, the node's
+    /// co-scrub on the call row) takes [`Self::node_signer`].
+    ///
+    /// Optional: when the transport's own signer is the node
+    /// ([`ReticulumTransport::node_signer`]), it is used without this.
+    /// Set once.
+    ///
+    /// # Errors
+    /// [`EdgeError::Config`] when a node signer is already set, or when
+    /// `signer`'s key is not the Reticulum transport's occurrence (it would
+    /// sign as a node peers do not know this one as).
+    ///
+    /// [`ReticulumTransport::node_signer`]: crate::transport::reticulum::ReticulumTransport::node_signer
+    #[cfg(feature = "_reticulum-module")]
+    pub fn set_node_signer(&self, signer: Arc<LocalSigner>) -> Result<(), EdgeError> {
+        let signer = checked_node_signer(signer, self.reticulum_transport.as_deref())?;
+        self.node_signer.set(signer).map_err(|_| {
+            EdgeError::Config("set_node_signer: the node signer is already set".into())
+        })
+    }
+
+    /// 45.1.6 — **the signer of THIS NODE**: the one whose key is the
+    /// transport's occurrence ([`ReticulumTransport::occurrence_key_id`]).
+    /// The host's ([`Self::set_node_signer`], [`EdgeBuilder::node_signer`]),
+    /// else the transport's own when it is the node, else the Edge's signer
+    /// (a single-key node: the node IS the signer).
+    ///
+    /// [`ReticulumTransport::occurrence_key_id`]: crate::transport::reticulum::ReticulumTransport::occurrence_key_id
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn node_signer(&self) -> Arc<LocalSigner> {
+        if let Some(node) = self.node_signer.get() {
+            return Arc::clone(node);
+        }
+        self.reticulum_transport
+            .as_ref()
+            .and_then(|t| t.node_signer())
+            .unwrap_or_else(|| Arc::clone(&self.signer))
+    }
+
     /// CIRISEdge#805 item 5 — **join `room`'s call** (`FSD/AV_CALL_API.md`
     /// §4): start this node's stream; an in-room call needs no ring (§7).
     /// Needs the Reticulum transport, the scope lifecycle, the room groups
@@ -4842,6 +4915,14 @@ impl Edge {
                 as Arc<dyn crate::transport::av_keep::StreamDekRegistrar>
         });
         let own = transport.occurrence_key_id().to_owned();
+        // 45.1.6 — the node signs as the node: on a split home the Edge's
+        // signer is the actor, and a stream bound by it was refused ("the
+        // signer that binds this stream's chunk keys is <agent>, not the
+        // publisher <node>").
+        let node = self.node_signer();
+        // The attendee, when the host names none, is the Edge's signer: the
+        // node itself on a single-key node, and on a split home the actor
+        // (#541: stored rows and authorship are the actor's).
         let actor = actor.unwrap_or_else(|| Arc::clone(&self.signer));
         // Item 6 — the row this join writes is the ACTOR's own (attester =
         // only subject): refused by name before the call starts.
@@ -4859,7 +4940,7 @@ impl Edge {
         let record = Arc::new(crate::transport::av_call::PersistCallRecord {
             directory: Arc::clone(&directory),
             actor,
-            node: Arc::clone(&self.signer),
+            node: Arc::clone(&node),
         }) as Arc<dyn crate::transport::av_call::CallRecord>;
         let verifier = Arc::new(crate::transport::av_chunk_auth::DirectoryKeys(Arc::clone(
             &directory,
@@ -4882,7 +4963,7 @@ impl Edge {
                 record: Some(record),
                 // The node signs its stream's chunk-key bindings: the stream's
                 // publisher is the node (`own`), whoever attends.
-                signer: Arc::clone(&self.signer),
+                signer: node,
                 verifier,
                 load: Some(Arc::clone(&self.load_ladder)),
             },
@@ -8899,6 +8980,17 @@ impl EdgeBuilder {
         self
     }
 
+    /// 45.1.6 — the signer of THIS NODE, when it is not [`Self::signer`]: a
+    /// split home, whose Edge signs as the actor while its transport is the
+    /// node. See [`Edge::set_node_signer`]; `build` refuses one whose key is
+    /// not the Reticulum transport's occurrence.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn node_signer(mut self, signer: Arc<LocalSigner>) -> Self {
+        self.node_signer = Some(signer);
+        self
+    }
+
     /// CIRISEdge#805 item 5 — the keep door a call's stream registers its
     /// epoch DEKs through when kept (persist's `Engine`). Unset, a kept
     /// stream is refused by name; an unkept one never touches it.
@@ -9097,6 +9189,15 @@ impl EdgeBuilder {
         // that would refuse every inbound envelope at verify time.
         crate::verify::require_strict_policy(self.config.hybrid_policy)
             .map_err(EdgeError::Config)?;
+        // 45.1.6 — a node signer that is not the node the transport is.
+        #[cfg(feature = "_reticulum-module")]
+        let node_signer = match self.node_signer {
+            Some(node) => Some(checked_node_signer(
+                node,
+                self.reticulum_transport.as_deref(),
+            )?),
+            None => None,
+        };
 
         // A split home is addressed at the node it advertises and signs as
         // the actor: both are this node (AV-8).
@@ -9354,6 +9455,11 @@ impl EdgeBuilder {
             #[cfg(feature = "_reticulum-module")]
             room_groups: match self.room_groups {
                 Some(groups) => std::sync::OnceLock::from(groups),
+                None => std::sync::OnceLock::new(),
+            },
+            #[cfg(feature = "_reticulum-module")]
+            node_signer: match node_signer {
+                Some(signer) => std::sync::OnceLock::from(signer),
                 None => std::sync::OnceLock::new(),
             },
             #[cfg(feature = "_reticulum-module")]
@@ -12265,6 +12371,68 @@ mod scope_native_install_tests {
             )),
             key_id,
         ))
+    }
+
+    /// 45.1.6 — the node signer is set once, and an Edge with none set reads
+    /// its own signer as the node (a single-key node is unchanged).
+    #[tokio::test]
+    async fn the_node_signer_is_set_once_and_falls_back_to_the_signer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let edge = builder(tmp.path(), "edge-ns")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .build()
+            .expect("build");
+        assert_eq!(edge.node_signer().key_id, edge.signer_key_id());
+        let tmp_node = tempfile::tempdir().expect("tempdir");
+        let other = builder(tmp_node.path(), "edge-ns-node")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .build()
+            .expect("build")
+            .signer();
+        edge.set_node_signer(Arc::clone(&other)).expect("first set");
+        assert_eq!(edge.node_signer().key_id, other.key_id);
+        let Err(EdgeError::Config(msg)) = edge.set_node_signer(other) else {
+            panic!("a second set is refused");
+        };
+        assert!(msg.contains("already set"), "{msg}");
+    }
+
+    /// 45.1.6 guard — **what `join_call_as` signs AS THE NODE takes the node
+    /// signer.** The stream's chunk-key binder (`CallDeps::signer`) and the
+    /// call row's co-scrub (`PersistCallRecord::node`) are the node; the
+    /// Edge's own signer is the actor on a split home, so the only place it
+    /// may appear in `join_call_as` is the attendee fallback.
+    #[test]
+    fn join_call_as_signs_as_the_node_with_the_node_signer() {
+        let src = include_str!("edge.rs");
+        let start = src
+            .find("pub async fn join_call_as(")
+            .expect("join_call_as");
+        let end = start
+            + src[start..]
+                .find("pub fn blob_scope_router(")
+                .expect("the fn after join_call_as");
+        let body = &src[start..end];
+        assert!(body.contains("let node = self.node_signer();"), "{body}");
+        assert!(
+            body.contains("node: Arc::clone(&node),"),
+            "co-scrub is the node"
+        );
+        assert!(
+            body.contains("signer: node,"),
+            "the stream binder is the node"
+        );
+        let uses: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains("self.signer") && !l.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(
+            uses,
+            ["        let actor = actor.unwrap_or_else(|| Arc::clone(&self.signer));"],
+            "the Edge's own signer is only the attendee fallback in join_call_as"
+        );
     }
 
     /// The room groups arm once on a running Edge built without them (the

@@ -9120,6 +9120,12 @@ pub fn init_edge_runtime(
     // routing to pick the right medium per envelope.
     if let Some(reticulum_t) = reticulum_transport {
         builder = builder.reticulum_transport(reticulum_t);
+        // 45.1.6 — a split home (`use_node_identity`): the Edge signs as the
+        // actor, and what it signs AS THE NODE (a call's stream binding, the
+        // node's co-scrub) takes the node's own signer.
+        if use_node_identity {
+            builder = builder.node_signer(Arc::clone(&reticulum_identity_signer));
+        }
     }
     #[cfg(feature = "transport-http")]
     if let Some(https_t) = https_transport {
