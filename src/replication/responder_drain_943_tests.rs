@@ -586,6 +586,7 @@ async fn the_node_is_bounded_in_reply_bytes_across_its_lanes() {
     let diff = ReplicationMessage::Diff(super::protocol::DiffMessage {
         kind: EnvelopeKind::Key,
         want: Vec::new(),
+        withheld: Vec::new(),
     });
     let summary = ReplicationMessage::Summary(super::protocol::SummaryMessage {
         status: None,

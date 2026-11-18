@@ -2028,7 +2028,10 @@ pub const RESPONDER_ROUND_OPENED_DIFF: &str = "opened_diff";
 /// ordinary rounds `first_sync_*` describes.
 /// 45.1.5 — `wrap_courier_{sent,admitted,refused,gave_up}`: key-grant wraps
 /// this node carried to a room member that is not its replication peer (rows,
-/// on the Attestation plane).
+/// on the Attestation plane). Since 45.1.6 (CIRISEdge#1014) `sent` is a row the
+/// member asked for and was delivered, and each delivery is booked once more
+/// by the member's next answer: `admitted` (it holds the row) or `refused`
+/// (asked again, or withheld); `gave_up` at the courier's bound.
 pub const REPLICATION_IO_LABELS: [&str; 23] = [
     "deliver_rows_out",
     "deliver_bytes_out",

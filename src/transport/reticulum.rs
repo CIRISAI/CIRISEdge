@@ -6009,6 +6009,17 @@ impl ReticulumTransport {
         self.local_signer.key_id != self.config.local_key_id
     }
 
+    /// 45.1.6 — **this node's own signer**: the federation `LocalSigner` the
+    /// transport holds, when it IS the identity the node advertises
+    /// ([`Self::occurrence_key_id`]); `None` when the two differ
+    /// ([`Self::signer_id_mismatch`]). On a split home (an agent install:
+    /// the Edge signs as the agent, the transport is the node) this is the
+    /// node's signer, the one a "this node" signature must use.
+    #[must_use]
+    pub fn node_signer(&self) -> Option<Arc<LocalSigner>> {
+        (!self.signer_id_mismatch()).then(|| Arc::clone(&self.local_signer))
+    }
+
     /// Mirror [`Self::signer_id_mismatch`] into the attached metrics bag.
     fn report_signer_id_mismatch(&self) {
         if let Some(m) = self.metrics.get() {

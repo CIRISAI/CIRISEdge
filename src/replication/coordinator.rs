@@ -3110,6 +3110,7 @@ mod tests {
         let bob_diff = ReplicationMessage::Diff(DiffMessage {
             kind: EnvelopeKind::Key,
             want: vec![h(1)],
+            withheld: Vec::new(),
         });
         let _ = coord.drive_round_step(Some(bob_diff)).await.unwrap();
 
@@ -3189,6 +3190,7 @@ mod tests {
         let wrong_kind = ReplicationMessage::Diff(DiffMessage {
             kind: EnvelopeKind::Revocation, // ← inbound for Revocation
             want: vec![],
+            withheld: Vec::new(),
         });
         let step = coord.drive_round_step(Some(wrong_kind)).await.unwrap();
         assert!(matches!(step, DriveStep::Refused));

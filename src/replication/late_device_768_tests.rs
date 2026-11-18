@@ -906,6 +906,19 @@ async fn a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6() {
     t_b.other_registry.set(rt_a.registry()).ok();
     rt_b.round_now_all().await.expect("kick");
 
+    // 45.1.6 (CIRISEdge#1014) — and B's courier books the admission, which
+    // it does on the round that reads A holding the wrap.
+    let booked = || {
+        let io = metrics_b.replication_io();
+        let count = |label: &str| {
+            io.iter()
+                .filter(|(k, _)| k.ends_with(&format!(":{label}")))
+                .map(|(_, v)| *v)
+                .sum::<u64>()
+        };
+        count("wrap_courier_sent") > 0
+            && count("wrap_courier_admitted") == count("wrap_courier_sent")
+    };
     let deadline = Instant::now() + Duration::from_secs(20);
     let granted = loop {
         let granting = a
@@ -913,7 +926,7 @@ async fn a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6() {
             .community_dek_minters_granting(ROOM, epoch, &a.me)
             .await
             .expect("read A's grants");
-        if granting.iter().any(|m| m == &b.me) {
+        if granting.iter().any(|m| m == &b.me) && booked() {
             break true;
         }
         if Instant::now() >= deadline {
@@ -927,9 +940,10 @@ async fn a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6() {
     assert!(
         granted,
         "B's wrap to A never crossed: A and B are not replication peers, a wrap is \
-         served to its recipient only, and nothing carried it ({} frames sent by B; \
-         45.1.5 star rooms)",
-        sent.len()
+         served to its recipient only, and nothing carried it; or B's courier never \
+         booked it admitted ({} frames sent by B; 45.1.5 star rooms, CIRISEdge#1014): {:?}",
+        sent.len(),
+        metrics_b.replication_io()
     );
 
     // Negative: every row B delivered to A is a key-grant row addressed to A.
@@ -973,4 +987,167 @@ async fn a_minters_wrap_reaches_a_member_that_is_not_its_peer_star6() {
         0,
         "{io:?}"
     );
+}
+
+/// 45.1.6 (CIRISEdge#1014) — **a wrap the recipient refused because its roster
+/// had not landed is carried again once it has.** The field: dave's responder
+/// refused bob's wrap (`admitted: 0, refused: 1`, dave not yet an active
+/// member) and dave's roster landed 1.7 s later; bob's courier had booked the
+/// round `admitted` and dropped dave, and dave's #1148 release re-asks only
+/// its own replication peers, which in a star room do not include the
+/// minter. dave read bob's messages `NotGranted` for good.
+///
+/// Here A has no room roster when B's courier first carries the wrap, so A
+/// refuses it; the roster then lands on A (a local write, released through
+/// the host's hook). A must admit B's wrap within the bound, and B's courier
+/// must book the refusal first and the admission after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrap_refused_before_the_roster_lands_is_carried_again_1014() {
+    let p = Ident::new("person-p-1014", 0x73);
+    let q = Ident::new("person-q-1014", 0x74);
+    let a_dev = Ident::new("node-a-1014", 0x83);
+    let b_dev = Ident::new("node-b-1014", 0x84);
+    let a = device(&[&p, &q], &p, &a_dev).await;
+    let b = device(&[&p, &q], &q, &b_dev).await;
+    // B holds the room; A's roster has not landed yet.
+    seed_room(&b, &p, &[&p, &q]).await;
+
+    let t_a = Arc::new(PairTransport {
+        me: a.me.clone(),
+        other: b.me.clone(),
+        other_registry: std::sync::OnceLock::new(),
+        sent: std::sync::Mutex::new(Vec::new()),
+    });
+    let t_b = Arc::new(PairTransport {
+        me: b.me.clone(),
+        other: a.me.clone(),
+        other_registry: std::sync::OnceLock::new(),
+        sent: std::sync::Mutex::new(Vec::new()),
+    });
+    let metrics_b = crate::observability::EdgeMetrics::new();
+    let mut rt_a = runtime_on(&a, Arc::clone(&t_a) as Arc<dyn Transport>, None).await;
+    let mut rt_b = runtime_on(
+        &b,
+        Arc::clone(&t_b) as Arc<dyn Transport>,
+        Some(metrics_b.clone()),
+    )
+    .await;
+    for (from, to, rt_to) in [(&a, &b, &rt_b), (&b, &a, &rt_a)] {
+        let (rec, binding, occ) = device_rows(from).await;
+        to.dir
+            .put_public_key(SignedKeyRecord { record: rec })
+            .await
+            .expect("the other node's key");
+        let _ = rt_to
+            .bridge()
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &binding, Some(&from.me))
+            .await;
+        let _ = rt_to
+            .bridge()
+            .apply_envelope_bytes(EnvelopeKind::IdentityOccurrence, &occ, None)
+            .await;
+    }
+    let sealed = b
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(ROOM),
+            author_key_id: &b.me,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: b"written before the reader's roster landed",
+            description: None,
+        })
+        .await
+        .expect("B seals at the community tier");
+    let epoch = sealed.epoch.expect("a community-DEK epoch");
+    assert!(
+        sealed.granted.iter().any(|g| g == &a.me),
+        "precondition: B's epoch is wrapped to A: {:?}",
+        sealed.granted
+    );
+
+    let io = || {
+        let io = metrics_b.replication_io();
+        move |label: &str| {
+            io.iter()
+                .filter(|(k, _)| k.ends_with(&format!(":{label}")))
+                .map(|(_, v)| *v)
+                .sum::<u64>()
+        }
+    };
+    let a_granted = || async {
+        a.dir
+            .community_dek_minters_granting(ROOM, epoch, &a.me)
+            .await
+            .expect("read A's grants")
+            .iter()
+            .any(|m| m == &b.me)
+    };
+
+    t_a.other_registry.set(rt_b.registry()).ok();
+    t_b.other_registry.set(rt_a.registry()).ok();
+    rt_b.round_now_all().await.expect("kick");
+
+    // The first carry reaches A before its roster: A refuses it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while io()("wrap_courier_sent") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "B's courier carried the wrap to A: {:?}",
+            metrics_b.replication_io()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!a_granted().await, "A refused the wrap: no roster yet");
+
+    // A's roster lands (the field: 1.7 s after the refusal), written locally
+    // and released through the host's hook, as a host does.
+    tokio::time::sleep(Duration::from_millis(1_700)).await;
+    seed_room(&a, &p, &[&p, &q]).await;
+    let _ = rt_a.bridge().release_audience(ROOM);
+
+    // A admits B's wrap within the bound, and B's courier books the refusal
+    // before the admission.
+    let mut refused_first = false;
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let landed = loop {
+        let count = io();
+        if count("wrap_courier_refused") > 0 && count("wrap_courier_admitted") == 0 {
+            refused_first = true;
+        }
+        if a_granted().await && count("wrap_courier_admitted") > 0 {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    rt_a.shutdown().await;
+    rt_b.shutdown().await;
+    let count = io();
+    assert!(
+        landed,
+        "A never admitted B's wrap after its roster landed, or B never booked it \
+         (granted: {}; CIRISEdge#1014): {:?}",
+        a.dir
+            .community_dek_minters_granting(ROOM, epoch, &a.me)
+            .await
+            .is_ok_and(|m| m.contains(&b.me)),
+        metrics_b.replication_io()
+    );
+    assert!(
+        refused_first,
+        "B's courier booked A's refusal before the admission: {:?}",
+        metrics_b.replication_io()
+    );
+    // Truthful counters: every delivery is booked once, refused or admitted.
+    assert_eq!(
+        count("wrap_courier_sent"),
+        count("wrap_courier_refused") + count("wrap_courier_admitted"),
+        "{:?}",
+        metrics_b.replication_io()
+    );
+    assert_eq!(count("wrap_courier_gave_up"), 0);
 }

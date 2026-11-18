@@ -1307,6 +1307,15 @@ impl PyEdge {
         self.inner.signer_key_id().to_string()
     }
 
+    /// 45.1.6 — the key id this Edge signs with AS THE NODE (a call's
+    /// stream binding, the node's co-scrub). On a split home
+    /// (`use_node_identity`) it is the node's key, not the actor's
+    /// [`Self::signer_key_id`]; on a single-key node the two are equal.
+    #[cfg(feature = "_reticulum-module")]
+    fn node_signer_key_id(&self) -> String {
+        self.inner.node_signer_key_id()
+    }
+
     /// CIRISEdge#208 — install a runtime override for the
     /// `dispatch_inbound` trust short-circuit threshold. Conformance
     /// harness contract: setting forces the short-circuit ON for the
@@ -9120,6 +9129,12 @@ pub fn init_edge_runtime(
     // routing to pick the right medium per envelope.
     if let Some(reticulum_t) = reticulum_transport {
         builder = builder.reticulum_transport(reticulum_t);
+        // 45.1.6 — a split home (`use_node_identity`): the Edge signs as the
+        // actor, and what it signs AS THE NODE (a call's stream binding, the
+        // node's co-scrub) takes the node's own signer.
+        if use_node_identity {
+            builder = builder.node_signer(Arc::clone(&reticulum_identity_signer));
+        }
     }
     #[cfg(feature = "transport-http")]
     if let Some(https_t) = https_transport {

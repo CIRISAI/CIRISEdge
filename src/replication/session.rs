@@ -829,7 +829,18 @@ impl Session {
         // for the window its disposition earned, is the whole fix; the sender
         // needs to be told nothing, because it was never the one choosing.
         let before = want.len();
-        want.retain(|h| !provider.retry_suppressed(self.kind, h));
+        // 45.1.6 (CIRISEdge#1014) — and names them, for an offer no larger
+        // than a courier round's: the offerer cannot tell a row this node
+        // refused from one it holds by its absence from `want`.
+        let name_withheld = remote.refs.len() <= super::protocol::MAX_WITHHELD;
+        let mut withheld: Vec<[u8; 32]> = Vec::new();
+        want.retain(|h| {
+            let suppressed = provider.retry_suppressed(self.kind, h);
+            if suppressed && name_withheld && withheld.len() < super::protocol::MAX_WITHHELD {
+                withheld.push(*h);
+            }
+            !suppressed
+        });
         let suppressed = before - want.len();
         if suppressed > 0 {
             // DEBUG, not WARN: the suppression is the CURE, and the refusal that
@@ -922,6 +933,7 @@ impl Session {
         outbound.push(ReplicationMessage::Diff(DiffMessage {
             kind: self.kind,
             want,
+            withheld,
         }));
         ReplicationOutcome::Send(outbound)
     }
@@ -993,6 +1005,9 @@ impl Session {
     ) -> ReplicationOutcome {
         if diff.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
+        }
+        if !diff.withheld.is_empty() {
+            provider.note_peer_withheld(self.kind, &diff.withheld);
         }
         // Seat load 2026-11-13 (P4) — the bytes pushed THIS round are already
         // on their way. The responder computed its Diff from its Summary,
@@ -1083,6 +1098,7 @@ impl Session {
             &DiffMessage {
                 kind: fetch.kind,
                 want: fetch.want.clone(),
+                withheld: Vec::new(),
             },
             provider,
             source_peer,
@@ -2137,6 +2153,7 @@ mod tests {
                 ReplicationMessage::Diff(DiffMessage {
                     kind: EnvelopeKind::Revocation, // ← wrong kind for this session
                     want: vec![],
+                    withheld: Vec::new(),
                 }),
                 &provider,
                 &applier,
@@ -2241,6 +2258,7 @@ mod tests {
         let diff = DiffMessage {
             kind: EnvelopeKind::Key,
             want: vec![h(1), h(2)],
+            withheld: Vec::new(),
         };
         match init.on_diff(&diff, &provider, Some("seat")).await {
             ReplicationOutcome::Send(out) => match &out[0] {
@@ -2596,6 +2614,7 @@ mod tests {
             ReplicationMessage::Diff(DiffMessage {
                 kind: EnvelopeKind::Key,
                 want: vec![h(9)],
+                withheld: Vec::new(),
             })
         };
         let bob_deliver = || {
@@ -2710,6 +2729,7 @@ mod tests {
         let bob_diff = ReplicationMessage::Diff(DiffMessage {
             kind: EnvelopeKind::Key,
             want: vec![],
+            withheld: Vec::new(),
         });
         let _ = alice
             .on_message(bob_diff, &a_provider, &a_applier, None)
@@ -3498,6 +3518,46 @@ mod tests {
             "staleness must be computed from what we ACTUALLY asked for, or a \
              suppressed row reads as permanently-missing progress"
         );
+        // 45.1.6 (CIRISEdge#1014) — and the offerer is told which it lacks
+        // and withholds, so a refusal does not read as held.
+        assert_eq!(diff.withheld, vec![h(1)]);
+
+        // An offer larger than a courier round's names nothing withheld: an
+        // ordinary round's Diff stays as it was.
+        let mut big = Session::new(SessionRole::Responder, EnvelopeKind::Key);
+        let refs = (0..=super::super::protocol::MAX_WITHHELD)
+            .map(|i| EnvelopeRef {
+                envelope_hash: if i == 0 {
+                    h(1)
+                } else {
+                    [u8::try_from(i + 100).unwrap_or(0); 32]
+                },
+                seq: u64::try_from(i).unwrap_or(0),
+            })
+            .collect();
+        let ReplicationOutcome::Send(msgs) = big
+            .on_message(
+                ReplicationMessage::Summary(SummaryMessage {
+                    status: None,
+                    kind: EnvelopeKind::Key,
+                    refs,
+                }),
+                &provider,
+                &NoApply,
+                None,
+            )
+            .await
+        else {
+            panic!("a Summary must produce Summary+Diff");
+        };
+        let diff = msgs
+            .iter()
+            .find_map(|m| match m {
+                ReplicationMessage::Diff(d) => Some(d),
+                _ => None,
+            })
+            .expect("a Diff");
+        assert!(diff.withheld.is_empty(), "{:?}", diff.withheld);
     }
 
     /// A provider with default retention (`Bodies`), for deliver-side tests
@@ -3652,6 +3712,7 @@ mod tests {
             let diff = DiffMessage {
                 kind: EnvelopeKind::Attestation,
                 want: want.clone(),
+                withheld: Vec::new(),
             };
             let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None).await
             else {
@@ -3696,6 +3757,7 @@ mod tests {
         let diff = DiffMessage {
             kind: EnvelopeKind::Attestation,
             want: wanted,
+            withheld: Vec::new(),
         };
         let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None).await else {
             panic!("on_diff must Send a Deliver");
@@ -3739,6 +3801,7 @@ mod tests {
         let diff = DiffMessage {
             kind: EnvelopeKind::Attestation,
             want: vec![hash],
+            withheld: Vec::new(),
         };
         let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None).await else {
             panic!("on_diff must Send a Deliver");
@@ -3786,6 +3849,7 @@ mod tests {
         let diff = DiffMessage {
             kind: EnvelopeKind::Attestation,
             want: vec![fetchable, unfetchable],
+            withheld: Vec::new(),
         };
         let ReplicationOutcome::Send(msgs) =
             responder.on_diff(&diff, &provider, Some("peer-x")).await
@@ -3906,6 +3970,7 @@ mod tests {
             ReplicationMessage::Diff(DiffMessage {
                 kind: EnvelopeKind::Key,
                 want: vec![h(9)],
+                withheld: Vec::new(),
             })
         };
         let empty = || {
@@ -4023,6 +4088,7 @@ mod tests {
                 ReplicationMessage::Diff(DiffMessage {
                     kind: EnvelopeKind::Key,
                     want: Vec::new(),
+                    withheld: Vec::new(),
                 }),
                 &provider,
                 &applier,

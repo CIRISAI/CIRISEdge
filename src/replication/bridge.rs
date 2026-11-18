@@ -30605,6 +30605,7 @@ pub(crate) mod tests {
         let diff = ReplicationMessage::Diff(DiffMessage {
             kind: EnvelopeKind::Attestation,
             want: listed.iter().copied().collect(),
+            withheld: Vec::new(),
         });
         let out = session
             .on_message(diff, &provider, &applier, Some(ALICE_NODE))
