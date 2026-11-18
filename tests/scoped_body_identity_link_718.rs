@@ -558,7 +558,12 @@ enum Arming {
     AfterRun,
 }
 
-async fn spawn_member(node: Node, rt: Arc<ReticulumTransport>, arming: Arming) -> Member {
+async fn spawn_member(
+    node: Node,
+    rt: Arc<ReticulumTransport>,
+    arming: Arming,
+    actor: Option<Arc<ciris_edge::identity::LocalSigner>>,
+) -> Member {
     let source = || {
         Arc::new(RoomScopedSource {
             inner: ciris_edge::blob_swarm::PersistBlobChunkSource::new(node.store.engine().clone()),
@@ -572,10 +577,14 @@ async fn spawn_member(node: Node, rt: Arc<ReticulumTransport>, arming: Arming) -
         .directory(node.dir.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
         .federation_directory(node.dir.clone() as Arc<dyn FederationDirectory>)
         .queue(node.dir.clone())
-        .signer(node.signer.clone())
+        // A split home (`actor`): the Edge signs as the actor while its
+        // transport, and every peer, knows the node — as the pyo3
+        // `use_node_identity` path and CIRISServer compose an agent install.
+        .signer(actor.clone().unwrap_or_else(|| node.signer.clone()))
         .reticulum_transport(Arc::clone(&rt))
         .config(EdgeConfig {
             hybrid_policy: HybridPolicy::Strict,
+            advertised_key_id: actor.as_ref().map(|_| node.me.clone()),
             ..EdgeConfig::default()
         });
     if arming == Arming::AtBuild {
@@ -616,8 +625,19 @@ async fn mesh(tag: &str, direct_ab: bool) -> Mesh {
     mesh_armed(tag, direct_ab, Arming::AtBuild).await
 }
 
-#[allow(clippy::too_many_lines)] // three transports, one room, one group: the topology in one place on purpose
 async fn mesh_armed(tag: &str, direct_ab: bool, arming: Arming) -> Mesh {
+    mesh_homed(tag, direct_ab, arming, None).await
+}
+
+/// [`mesh_armed`], with A a split home when `actor_a` is given: A's Edge
+/// signs as that actor, its transport and its room leaf are the node.
+#[allow(clippy::too_many_lines)] // three transports, one room, one group: the topology in one place on purpose
+async fn mesh_homed(
+    tag: &str,
+    direct_ab: bool,
+    arming: Arming,
+    actor_a: Option<Arc<ciris_edge::identity::LocalSigner>>,
+) -> Mesh {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().to_path_buf();
@@ -721,8 +741,8 @@ async fn mesh_armed(tag: &str, direct_ab: bool, arming: Arming) -> Mesh {
     .await
     .expect("B joins from the Welcome");
 
-    let a = spawn_member(node_a, rt_a, arming).await;
-    let b = spawn_member(node_b, rt_b, arming).await;
+    let a = spawn_member(node_a, rt_a, arming, actor_a).await;
+    let b = spawn_member(node_b, rt_b, arming, None).await;
     for (member, group) in [(&a, &group_a), (&b, &group_b)] {
         member
             .edge
@@ -1154,6 +1174,100 @@ async fn a_running_edge_armed_late_joins_its_rooms_call() {
         .expect("frames open");
     assert_eq!(f.bytes, body);
     assert_eq!(f.publisher, m.a.node.me);
+    ca.leave().await.expect("A leaves");
+    cb.leave().await.expect("B leaves");
+}
+
+/// 45.1.6 — **a split home joins its room's call, and its stream is bound by
+/// the node.** Every agent install is a split home: the Edge signs as the
+/// agent (the actor), while the transport, the stream's publisher and the room
+/// leaf are the node. At 45.1.5 `join_call_as` handed the call the Edge's
+/// engine signer as the stream's chunk-key binder, and `Call::join` refused
+/// it: "the signer that binds this stream's chunk keys is ciris-agent-…, not
+/// the publisher ciris-node-…" (the field 503 on `POST /v1/chat/<room>/call`).
+/// Here A is a split home; it joins, and B accepts A's frames, which it does
+/// only under a `StreamKeyBinding` that verifies against A's node key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_home_joins_its_rooms_call_as_the_node() {
+    use ciris_edge::mls::CohortGroups;
+    use ciris_edge::transport::av_call::{CallOptions, Frame};
+    let agent = Ident::new("agent-call-split", 0x44);
+    let actor = node(&[&agent], &agent).await;
+    let m = mesh_homed(
+        "callsplit",
+        true,
+        Arming::AfterRun,
+        Some(Arc::clone(&actor.signer)),
+    )
+    .await;
+    assert_ne!(
+        m.a.edge.signer_key_id(),
+        m.a.node.me,
+        "fixture: A's Edge signs as the actor, not the node"
+    );
+    assert_eq!(m.a.rt.occurrence_key_id(), m.a.node.me, "fixture");
+    wait_for_path(&m.b, &m.a, true, Duration::from_mins(1)).await;
+    wait_for_path(&m.a, &m.b, true, Duration::from_mins(1)).await;
+    for (member, store) in [(&m.a, &m.stores[0]), (&m.b, &m.stores[1])] {
+        member
+            .edge
+            .arm_room_groups(Arc::new(CohortGroups::new(
+                store.clone(),
+                member.node.me.clone(),
+            )))
+            .expect("arm the running Edge");
+    }
+    let mut ca =
+        m.a.edge
+            .join_call_as(
+                ROOM,
+                CallOptions::default(),
+                Some(owner_signer(&m.a.node, 0x11)),
+            )
+            .await
+            .expect("a split home joins its room's call (45.1.6)");
+    let mut cb =
+        m.b.edge
+            .join_call_as(
+                ROOM,
+                CallOptions::default(),
+                Some(owner_signer(&m.b.node, 0x22)),
+            )
+            .await
+            .expect("B joins");
+    let mut b_frames = cb.frames().expect("B's frames");
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
+    while ca.legs().is_empty() || cb.legs().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both legs come up: A {:?}, B {:?}",
+            ca.legs(),
+            cb.legs()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let body = b"a frame from a split home".to_vec();
+    let mut delivered = false;
+    for _ in 0..50 {
+        if ca
+            .publish(Frame::opaque(body.clone()))
+            .await
+            .expect("publish")
+            .delivered()
+            == 1
+        {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(delivered, "A's frame left on its leg");
+    let f = tokio::time::timeout(Duration::from_secs(20), b_frames.recv())
+        .await
+        .expect("A's frame reaches B in time: B verified A's binding by A's node key")
+        .expect("frames open");
+    assert_eq!(f.bytes, body);
+    assert_eq!(f.publisher, m.a.node.me, "the publisher is the node");
     ca.leave().await.expect("A leaves");
     cb.leave().await.expect("B leaves");
 }
