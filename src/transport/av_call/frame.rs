@@ -542,6 +542,9 @@ impl Reassemblers {
     /// dropped incomplete.
     pub fn forget(&mut self, stream: StreamId) -> Vec<FrameRefusal> {
         self.last_frame.retain(|(s, _, _), _| *s != stream);
+        // v45.1.7 — and its per-stream loss (Codex on #1016: a churned
+        // stream with a gap left its entry behind for the call's life).
+        self.lost_by_stream.retain(|(s, _), _| *s != stream);
         self.views.remove(&stream);
         let keys: Vec<(StreamId, ChunkLayer)> = self
             .slots

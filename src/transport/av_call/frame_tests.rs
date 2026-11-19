@@ -531,6 +531,36 @@ fn a_lost_video_frame_is_a_frame_seq_gap_and_audio_is_unaffected() {
     );
 }
 
+/// v45.1.7 — forgetting a stream drops its per-stream loss too (Codex on
+/// #1016: `lost_by_stream` kept a dead entry per churned stream), while the
+/// call-wide per-layer count stays.
+#[test]
+fn forgetting_a_stream_drops_its_per_stream_loss() {
+    let mut rs = Reassemblers::default();
+    let mut seq = 40;
+    for k in [0u32, 1, 3] {
+        for p in split(&frame_bytes(1_500, 3), 1_000, k).expect("fits") {
+            let _ = rs.push(
+                chunk(1, seq, CODEC_TEMPORAL_LAYERED, L0, p),
+                FRAMING_FRAGMENTS,
+            );
+            seq += 1;
+        }
+    }
+    assert_eq!(rs.lost_of(S, CODEC_TEMPORAL_LAYERED), 1, "one frame lost");
+    let _ = rs.forget(S);
+    assert_eq!(rs.lost_of(S, CODEC_TEMPORAL_LAYERED), 0);
+    assert!(
+        rs.lost_by_stream.keys().all(|(s, _)| *s != S),
+        "no entry left for the forgotten stream"
+    );
+    assert_eq!(
+        rs.lost_by_layer().values().sum::<u64>(),
+        1,
+        "the call-wide count is history, kept"
+    );
+}
+
 /// The frame's video at `layer` with its marker `frame_seq`.
 fn video_frame(seq: &mut u64, epoch: u64, layer: ChunkLayer, k: u32) -> Vec<ReceivedFrame> {
     let out: Vec<ReceivedFrame> = split(&frame_bytes(600, 4), 1_000, k)
