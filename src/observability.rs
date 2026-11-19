@@ -5035,6 +5035,8 @@ impl EdgeMetrics {
             apply_refusals: t.apply_refusals,
             loop_last_progress_age_seconds: t.loop_last_progress_age_seconds,
             node_alive: t.node_alive,
+            call_legs: t.call_legs,
+            call_legs_overflow: t.call_legs_overflow,
         }
     }
 }
@@ -5509,6 +5511,12 @@ pub struct EdgeMetricsBundle {
     pub loop_last_progress_age_seconds: HashMap<String, f64>,
     /// v44 — see [`crate::telemetry::TELEMETRY_CATALOGUE`].
     pub node_alive: u64,
+    /// v45.1.7 — every live call leg's series, at most
+    /// [`crate::telemetry::call_legs::CALL_LEG_ROWS_MAX`] rows; see
+    /// [`crate::telemetry::call_legs`].
+    pub call_legs: Vec<crate::telemetry::call_legs::CallLegSeries>,
+    /// v45.1.7 — leg rows left out of this reading past the cap.
+    pub call_legs_overflow: u64,
 }
 
 /// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
@@ -6018,6 +6026,15 @@ impl EdgeMetricsBundle {
             "loop_last_progress_age_seconds",
             &self.loop_last_progress_age_seconds,
         );
+        // v45.1.7 — the per-leg series are structured (they carry several
+        // attributes each); the flat form carries how many there are.
+        f.counters
+            .insert("call_legs".to_string(), self.call_legs.len() as u64);
+        #[allow(clippy::cast_precision_loss)]
+        f.gauges.insert(
+            "call_legs_overflow".to_string(),
+            self.call_legs_overflow as f64,
+        );
         f
     }
 }
@@ -6187,6 +6204,8 @@ edge_metrics_bundle_fields!(
     apply_refusals,
     loop_last_progress_age_seconds,
     node_alive,
+    call_legs,
+    call_legs_overflow,
 );
 
 #[cfg(test)]

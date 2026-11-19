@@ -3748,6 +3748,31 @@ fn telemetry_into_pydict(
         ages.set_item(name.as_str(), *age)?;
     }
     root.set_item("loop_last_progress_age_seconds", ages)?;
+    // v45.1.7 — per-leg call series: `[{"name", "kind", "unit",
+    // "attributes": {..}, "value"}]`, live legs only.
+    let legs = pyo3::types::PyList::empty(py);
+    for series in &b.call_legs {
+        let entry = pyo3::types::PyDict::new(py);
+        entry.set_item("name", series.name)?;
+        entry.set_item(
+            "kind",
+            match series.kind {
+                crate::telemetry::Kind::Counter => "counter",
+                crate::telemetry::Kind::Gauge => "gauge",
+                crate::telemetry::Kind::Histogram => "histogram",
+            },
+        )?;
+        entry.set_item("unit", series.unit)?;
+        let attributes = pyo3::types::PyDict::new(py);
+        for (k, v) in &series.attributes {
+            attributes.set_item(*k, v.as_str())?;
+        }
+        entry.set_item("attributes", attributes)?;
+        entry.set_item("value", series.value)?;
+        legs.append(entry)?;
+    }
+    root.set_item("call_legs", legs)?;
+    root.set_item("call_legs_overflow", b.call_legs_overflow)?;
     Ok(())
 }
 
@@ -8042,6 +8067,9 @@ pub fn init_edge_runtime(
     // translation (Roaming / Full / Gateway / AP) is deferred — see
     // `AgentMode` docblock.
     transport_config.listen_addr = listen_addr;
+    // v45.1.7 — the operator's own bootstrap peers, before any canonical is
+    // seeded below: the facilitator's last fallback.
+    let operator_bootstrap_peers = bootstrap_peers.clone();
     transport_config.bootstrap_peers = bootstrap_peers;
     // CIRISEdge#296 — auto-seed the canonical TCP dial from persist's baked
     // `canonical_bootstrap_hints()` so a DIRECT `init_edge_runtime` consumer
@@ -8210,11 +8238,16 @@ pub fn init_edge_runtime(
     }
     // v44 — proposing on by default: the bundle's canonical is the
     // facilitator when the host named none, under the #661 gate (a node under
-    // a test trust root never probes the production canonical).
-    .resolve_bundle_facilitator(crate::edge::baked_canonical_dials_allowed(
-        baked_canonical_dials,
-        crate::edge::test_trust_root_override_active(),
-    ));
+    // a test trust root never probes the production canonical). v45.1.7 —
+    // else the operator's first bootstrap peer, as the server's compose does:
+    // without one, members two hops apart through the seat never got a leg.
+    .resolve_facilitator(
+        crate::edge::baked_canonical_dials_allowed(
+            baked_canonical_dials,
+            crate::edge::test_trust_root_override_active(),
+        ),
+        &operator_bootstrap_peers,
+    );
     // CC 5.4.3 — link shaping policy.
     if let Some(class) = shaping_class.as_deref() {
         use crate::transport::link_shaping::BudgetClass;

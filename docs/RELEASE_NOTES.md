@@ -1,5 +1,36 @@
 # CIRISEdge Release Notes
 
+# v45.1.7 — call telemetry, chat reactions and threads
+
+**2026-11-19.** **PATCH.** Pins: persist v61.4.2 by tag (`ciris-persist==61.4.2`, `tag v61.4.2, commit 213a1c86`),
+CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. No migration. Detail in CHANGELOG.md.
+
+- **`call_legs`: what each live call leg is doing, for the call screen's "?" panel.** One row per
+  member, stream and media kind, as `ciris.edge.call.*` series, each its own catalogue row: path
+  (`direct` or `relayed`, the relay's key id, carrier, punched, NAT types `unknown` on 45.1.x),
+  rtt, bitrate send and receive, frames lost, chunks skipped, jitter, reorder depth and codec.
+  Read from `Edge::metrics().snapshot().call_legs`. Live legs only, at most 64 rows, owner-session
+  only by Eric's decision, no addresses; nothing new runs per chunk.
+- **Chat reactions and flat threads.** `chat_message_reply_in` names a thread's root
+  (`replies_to_attestation_id`) and refuses a thread in a thread; `chat_reaction_in` writes a
+  `chat:reaction:v1` with the emoji sealed, taken back by withdraw; `reactions_for` reads them,
+  earliest per (person, target, emoji). A reply carries a file as a message does. Features `chat:reactions` and `chat:threads`.
+- **An agent node proposes direct links through its first bootstrap peer** when no facilitator
+  is named and the bundle's is gated (test trust root): calls between members two hops apart
+  through the seat get legs.
+- **A call leg born on a punched interface reads punched** in `leg_info` and `call_legs`
+  (it read `Interface` before).
+- **Three `call_legs` corrections from review:** a link forwarded through a punched transport
+  peer reads `relayed`; a release or skip at a reorder deadline is published without waiting for
+  another packet; send and receive bitrate both count the chunk's plaintext payload.
+- **Five more from review:** a revised thread root keeps its replies in one thread; a reaction
+  counts only on a message of this room (on its current form); a member-chosen timestamp can no
+  longer overflow the jitter maths; a churned stream's loss count is freed; a share's rows name
+  its codec.
+- **persist v61.4.2:** the capsule proxy routes 34 directory methods it used to refuse, among them
+  `list_live_consent_grants_by`. Wire-compatible; ABI 13.
+- **Witnessed:** red with each fix undone, green here.
+
 # v45.1.6 — a call starts on every agent install, and a refused wrap is carried again
 
 **2026-11-18.** **PATCH.** Pins unchanged: persist v61.4.1 by tag (`ciris-persist==61.4.1`),

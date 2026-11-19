@@ -1634,6 +1634,12 @@ mod tests {
     fn a_share_is_its_own_admission_beside_the_camera() {
         let (cam, share) = (s(1), s(7));
         let mut a = AlmState::new("a", cam, &roster(), false, 1);
+        // A loaded box: the share's provisional stamps come some ms after
+        // the call's clock started. The window below must be passed from
+        // THEIR stamp, not from the clock's start (CIRISEdge 45.1.7: with
+        // the reset at exactly PROVISIONAL_MS + 1, any lag of 2 ms or more
+        // read C as still fresh).
+        std::thread::sleep(Duration::from_millis(5));
         a.on_caps("b", CAPS_THIS_BUILD);
         a.on_caps("c", CAPS_THIS_BUILD);
         a.add_own_stream(share);
@@ -1681,8 +1687,10 @@ mod tests {
             "the camera's children are its own"
         );
         // Past the window: C never chose either stream, B only the share.
+        // Every stamp so far is at or before `lag` on the call's clock.
+        let lag = a.now_ms();
         a.t0 = Instant::now()
-            .checked_sub(Duration::from_millis(PROVISIONAL_MS + 1))
+            .checked_sub(Duration::from_millis(PROVISIONAL_MS + lag + 1))
             .expect("the clock is past the window");
         assert_eq!(a.own_exclude_on(share, &legs, false), vec!["c".to_owned()]);
         assert_eq!(

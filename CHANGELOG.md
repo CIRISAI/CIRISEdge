@@ -2,6 +2,148 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.7 — 2026-11-19
+
+**PATCH. Per-leg call telemetry, chat reactions and flat threads, a facilitator for agent nodes,
+and persist v61.4.2.** Pins: persist **v61.4.2** by tag (`ciris-persist==61.4.2`; was v61.4.1),
+CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. No migration. Two new clear chat members and one
+new chat dimension (below); a peer before 45.1.7 stores and replicates them as ordinary `chat:`
+rows and shows a reply as a plain message.
+
+### Changed
+
+- **persist v61.4.2** (tag v61.4.2, commit 213a1c86): wire-compatible with 61.4.1,
+  `DIRECTORY_ABI_VERSION` stays 13. The capsule proxy now routes 34 `FederationDirectory` methods
+  that read `Unsupported` through it before, `list_live_consent_grants_by` among them, so an agent node's capability gate
+  no longer reads "no grants" through the capsule. `DirectoryOp` / `DirectoryOpResult` variants
+  are appended; edge matches neither exhaustively.
+
+### Added
+
+- **`call_legs`: one row per live call leg, as `ciris.edge.call.*` series**, for the call
+  screen's "?" panel. A row is a member, one stream and one media kind (`audio`, `video`,
+  `share`), sent (this node's own stream on its leg to the member) or received (the member's
+  stream as it reaches this node). Every series carries `ciris.room.id`, `ciris.call.id`,
+  `ciris.call.member`, `ciris.call.stream_id` and `ciris.media.kind`:
+  - `ciris.edge.call.path` (gauge, 1): `path` `direct` or `relayed`; `relay.key_id`, the member
+    relay that is the stream's ALM primary parent (empty when none; a transport forwarder is
+    `relayed` with an empty key); `transport`, the carrier (`datagram` or `channel`); `punched`;
+    `nat.local_type` and `nat.peer_type`, always `unknown` on 45.1.x (leviculum 0.34 has no NAT
+    classification); `direction`.
+  - `ciris.edge.call.rtt` (ms, the leg link's srtt) and `ciris.edge.call.bitrate` (bit/s,
+    `direction` send or recv, re-measured at most once a second).
+  - Receive rows only: `ciris.edge.call.frames_lost` (gaps in `frame_seq`),
+    `ciris.edge.call.frames_skipped` (chunks the reorder window gave up on),
+    `ciris.edge.call.jitter` (ms, RFC 3550 against the signed source timestamp) and
+    `ciris.edge.call.reorder_window` (the most chunks the window held in the last second).
+  - `ciris.edge.call.codec` (gauge, 1): `codec`, the binding's registered token for the class,
+    else the class's name; never a peer-chosen string.
+  - Each instrument is its own `TELEMETRY_CATALOGUE` row (field `call_legs`, label
+    `ciris.call.member` as `LabelValues::CallLeg`, operator-only; `Unit::BitsPerSecond` is new),
+    so a host renders OTLP from the catalogue. The host reads them from
+    `Edge::metrics().snapshot()`: `EdgeMetricsBundle::call_legs` (`Vec<CallLegSeries>`: name,
+    kind, UCUM unit, attributes, value) and `call_legs_overflow`. Python:
+    `metrics_snapshot()["call_legs"]`. The flat form (UniFFI) carries the series count.
+  - **Bounded:** rows are read from each live call's state when the bundle is read (a `Weak`
+    registry), so a leg's series are gone in the first snapshot after the leg or its call ends; at
+    most 64 rows (`CALL_LEG_ROWS_MAX`), `call_legs_overflow` counting the rest. No address, IP or
+    port is ever an attribute.
+  - **Off the hot path:** send bytes ride each leg's congestion entry under the lock
+    `note_leg_outcomes` already holds; the receive side lives in the reorder loop's own maps and
+    is published once a second (the loop wakes to publish).
+- **Flat reply threads** (`FSD/CHAT_REACTIONS_AND_THREADS.md` §2 in CIRISServer, settled by CC).
+  `chat::chat_message_reply_in` writes an ordinary `chat:message:v1` with one more clear member,
+  `replies_to_attestation_id`, the thread's ROOT; nothing is written to the root. It refuses
+  `chat.thread_in_thread` (naming the root as `root_attestation_id`) and
+  `chat.reply_target_not_in_room` as `ChatComposeError::Refused(ChatRefusal)`. A revision keeps
+  the root. `ChatMessage::replies_to` carries it, and `messages_in_room` files a stray nested
+  reply under its target's root: a reader never opens a thread in a thread. A reply carries a
+  file as a message does (`file: Option<&Attestation>`, refused `chat.file_not_in_room` when the
+  file is not in the room), and is revised, withdrawn, recanted and reported as a message.
+- **Emoji reactions.** `chat::chat_reaction_in` writes `chat:reaction:v1`: clear
+  `community_key_id` and `target_attestation_id`, the emoji sealed under the room's DEK exactly as
+  a body is. One emoji sequence of at most 32 bytes (`chat::is_one_emoji`, over the Unicode emoji
+  property tables: flags, keycaps, modifiers, tag runs, ZWJ sequences), else `chat.not_an_emoji`.
+  Taken back by the author's `chat_message_withdraw_in`, which now also takes the author's own
+  reaction (a reaction is never revised or recanted). `chat::reactions_for(room, targets)` reads
+  them opened, keeping the earliest per (person, target, emoji, byte for byte) and at most 20
+  emoji per person per target; `chat::open_reaction` opens one row. Reactions are not messages:
+  `messages_in_room` never returns one.
+- **Conformance features:** `chat::FEATURE_REACTIONS` (`chat:reactions`),
+  `chat::FEATURE_THREADS` (`chat:threads`) and `chat::CHAT_FEATURES` name them for the host's
+  features list; edge advertises none itself.
+
+### Fixed
+
+- **An agent node with no named facilitator proposes direct links through its first bootstrap
+  peer.** Field: the server's fold harness, where calls never formed legs on agent-style (PyO3)
+  nodes. The PyO3 init took the facilitator from the host or the genesis bundle only, and the
+  bundle's is gated off under a test trust root (#661), so nothing proposed and members two hops
+  apart through the seat never got a leg (a derived A/V address answers a one-hop neighbour only).
+  `DirectLinksConfig::resolve_facilitator`: the host-named one, else the bundle's where allowed,
+  else the operator's first bootstrap peer (taken before any canonical is seeded, so the #661 gate
+  holds), logged once at INFO with its source (`FacilitatorSource`). The server's compose already
+  defaulted to the first bootstrap peer. `edge_node` is unchanged.
+- **A call leg born on a punched interface reads punched.** `ReticulumTransport::av_link_path`
+  (behind `Call::leg_info` and the `call_legs` path series) asked leviculum's
+  `direct_link_interface`, which names only a link MOVED onto a punched interface. A call leg
+  dialled once the identity link moved is sent on the punched interface from its first packet
+  and was never moved, so E4's legs read `Interface` / `punched=false`. A link now reads
+  `DirectUdp` when it was moved onto a punched interface or its interface index is one a direct
+  path rides (`DirectPathTracker::punched_interfaces`); the link list is read only while a direct
+  path is up. Found by the E4 telemetry witness, red before the fix.
+- **A link forwarded through a punched peer reads relayed** (Codex on #1016). A punched interface
+  is one socket to one peer (leviculum `interfaces/direct_udp.rs`), but when that peer is a
+  transport node a link to a third destination through it leaves on the same interface; the
+  born-on check now also requires the link not be forwarded (`born_on_punched`).
+- **A release or skip at a reorder deadline is published** (Codex on #1016). Only arrivals marked
+  the receive side for its once-a-second publish, so a deadline's release or skip after the last
+  arrival left bitrate, skipped, depth and lost stale until the next packet. `RxPublish` marks a
+  publish on any release, skip or framing-gate move; an idle call publishes nothing.
+- **`ciris.edge.call.bitrate` counts one layer both ways** (Codex on #1016): each chunk's
+  plaintext payload. The send side counted the wire form (overhead and trailer included).
+- **A publisher's source stamp cannot overflow the jitter transit** (Codex on #1016). The
+  transit took `source_ts_ms as i64`, a member-chosen `u64`: at or above 2^63 the subtraction
+  overflowed (a panic that ended the reorder task under overflow checks). It is taken in `i128`,
+  and a step past 60 s re-anchors instead of counting as jitter.
+- **Forgetting a stream drops its per-stream loss** (Codex on #1016): `Reassemblers::forget`
+  left a churned stream's `lost_by_stream` entry for the call's life.
+- **A share's send rows name its registered codec** (Codex on #1016); they read the class token.
+- **A revised thread root keeps its thread** (Codex on #1016). The room fold reports what it
+  folded each id under, and `messages_in_room` files a reply naming any older form of its root
+  (before a revision, or its `self` row) under the root as it stands.
+- **A reaction counts only on a message of this room** (Codex on #1016). `reactions_for` with no
+  targets returned a signed reaction naming a foreign-room or unknown id; one on an older form
+  of a message now counts on, and reports, the message's head.
+
+### Privacy
+
+- `call_legs` is the third field that names peers (`ciris.call.member`, and `relay.key_id`),
+  after `peer_reachability_ratio` and `recent_withholds`: a named exception by Eric's decision
+  (2026-11-19), operator-only and served to the owner session only, live calls only, 64 rows at
+  most. The catalogue test pins `LabelValues::CallLeg` to the `call_legs` field alone;
+  `docs/TELEMETRY_CATALOGUE.md` says why.
+- A reaction's emoji is sealed: which emoji someone chose is as private as what they wrote.
+
+### Witnessed
+
+- The roster-relay call (`alm_mesh_stage2`): C's receive row for B's stream is `relayed` with A
+  as `relay.key_id`, every instrument present with the common attributes; A's row for B is
+  `direct`, unpunched; B's send row to A has a rate; every series is gone after the calls drop.
+  E4 (`av_call_nat_805`): A's send and receive rows to B read `direct`, `punched`, `datagram`;
+  both nodes' series are gone after leave. No attribute value of any witnessed series parses as an
+  IP or socket address. Unit: the 64-row cap and its overflow count, one catalogue row per
+  instrument.
+- Chat (`chat_message_federates`): a reply round trip; a reply carrying a file, whose edit keeps
+  its root and its file and whose recant leaves the root; a reply to a reply refused naming the root;
+  a stray nested reply filed under the root; a reaction opened, deduplicated to the earliest and
+  taken back by withdraw; text that is not one emoji refused; and a reaction made on bob's node
+  crossing to alice's, who opens the emoji (a non-member opens nothing). Unit: emoji sequence
+  shapes.
+- The facilitator: an unnamed facilitator under a test trust root resolves to the first bootstrap
+  peer without reading the bundle; host and bundle still come first; `off` resolves nothing.
+- Each witness was run red, with its fix undone, before green.
+
 ## 45.1.6 — 2026-11-18
 
 **PATCH. A call starts on every agent install, and a wrap a member refused before their roster

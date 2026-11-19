@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "45.1.6"
+version = "45.1.7"
 edition = "2021"
 rust-version = "1.92"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -469,7 +469,9 @@ publish = false
 # 45.1.1: the same persist commit (0568ebf3) pinned by its tag v61.4.0, so a consumer that pins persist by tag resolves one source.
 # 45.1.2: persist v61.4.1 (tag; commit 32e19ede, CIRISPersist#1271 only: a lone epoch-minter candidate must act for the body's
 # author, the stranded repair rebinds only onto one that does, and a body that does not open heals on read). No migration.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.4.1", version = "61", features = ["sqlite", "encrypted-kv"] }
+# 45.1.7: persist v61.4.2 (tag; commit 213a1c86): the capsule proxy routes 34 FederationDirectory methods it refused before
+# (list_live_consent_grants_by among them); wire-compatible, DIRECTORY_ABI_VERSION 13, DirectoryOp variants appended. No migration.
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.4.2", version = "61", features = ["sqlite", "encrypted-kv"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -562,6 +564,9 @@ hex         = "0.4"
 # name the field it reads. Already in the graph (serde_json/regex); pinned here
 # only to name it.
 memchr      = "2"
+# v45.1.7 — a chat reaction is one emoji: the Unicode emoji property tables.
+# Already in the graph (url → idna → stringprep); named here for `emoji`.
+unicode-properties = { version = "0.1.4", default-features = false, features = ["emoji"] }
 
 # Errors / logs
 thiserror   = "1"
@@ -1641,7 +1646,7 @@ async-trait        = "0.1"
 # two `ciris-verify-core` cdylibs — the empty-stdout SIGSEGV class).
 # v38.6.0 (CIRISPersist#774) — held in lockstep with the runtime pin above
 # through the RC-adopt and back onto `tag`. These two move together, always.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.4.1", version = "61", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv", "test-anchor"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v61.4.2", version = "61", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv", "test-anchor"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3

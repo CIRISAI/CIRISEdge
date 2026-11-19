@@ -53,7 +53,13 @@ impl<'m> Witness<'m> {
 
 #[test]
 fn every_bundle_field_has_exactly_one_row_and_every_row_a_field() {
-    let mut rows: Vec<&str> = TELEMETRY_CATALOGUE.iter().map(|s| s.field).collect();
+    // v45.1.7 — `call_legs` has one row per instrument, and only it may.
+    let mut rows: Vec<&str> = TELEMETRY_CATALOGUE
+        .iter()
+        .filter(|s| s.field != "call_legs")
+        .map(|s| s.field)
+        .collect();
+    rows.push("call_legs");
     rows.sort_unstable();
     let before = rows.len();
     rows.dedup();
@@ -82,9 +88,12 @@ fn every_name_is_a_unique_dotted_ciris_edge_name() {
 
 /// A peer in a label is a per-peer series, hashed or not. Two old fields are
 /// keyed by peer; nothing may join them, and neither may leave the operator.
+/// v45.1.7 decided one more, `call_legs` (live call legs only, capped): it
+/// is the only [`LabelValues::CallLeg`] field, and operator-only.
 #[test]
 fn no_label_names_a_peer_but_the_two_old_ones_and_they_stay_operator_only() {
     let mut peer_keyed = Vec::new();
+    let mut call_leg = Vec::new();
     for s in TELEMETRY_CATALOGUE {
         let Some((key, values)) = s.label else {
             continue;
@@ -94,11 +103,18 @@ fn no_label_names_a_peer_but_the_two_old_ones_and_they_stay_operator_only() {
             peer_keyed.push(s.field);
             continue;
         }
+        if values == LabelValues::CallLeg {
+            assert_eq!(s.exposure, Exposure::OperatorOnly, "{}", s.field);
+            call_leg.push(s.field);
+            continue;
+        }
         for forbidden in ["peer", "link", "room", "key_id", "address", "dest"] {
             assert!(!key.contains(forbidden), "{}: `{key}`", s.field);
         }
     }
     assert_eq!(peer_keyed, ["peer_reachability_ratio", "recent_withholds"]);
+    call_leg.dedup();
+    assert_eq!(call_leg, ["call_legs"]);
 }
 
 /// The one public field. A new one is a privacy decision, made here.

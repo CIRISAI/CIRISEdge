@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "45.1.6"
+version = "45.1.7"
 dependencies = [
  "async-trait",
  "axum",
@@ -1149,6 +1149,7 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
+ "unicode-properties",
  "uniffi",
  "uuid",
  "x509-parser",
@@ -1193,8 +1194,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "61.4.1"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v61.4.1#32e19ededa296694c131a9e6014fff7ab3dd96bd"
+version = "61.4.2"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v61.4.2#213a1c867c7dd329fe2631b56acb9bf08f6524e9"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
