@@ -1255,11 +1255,10 @@ pub async fn chat_message_reply_in(
     store: &dyn crate::group_content::GroupContentStore,
 ) -> Result<(Attestation, crate::group_content::SealedContent), ChatComposeError> {
     use crate::replication::attestation_bind::truncate_to_substrate_resolution;
-    let room = community_key_id;
     if dimension_of(root) != Some(CHAT_MESSAGE_DIMENSION) || is_retraction(root) {
         return Err(ChatComposeError::Refused(ChatRefusal::NotAMessage));
     }
-    if room_of(root).as_deref() != Some(room) {
+    if room_of(root).as_deref() != Some(community_key_id) {
         return Err(ChatComposeError::Refused(ChatRefusal::ReplyTargetNotInRoom));
     }
     if let Some(r) = replies_to_of(root) {
@@ -1268,12 +1267,12 @@ pub async fn chat_message_reply_in(
         }));
     }
     if let Some(f) = file {
-        if room_of(f).as_deref() != Some(room) {
+        if room_of(f).as_deref() != Some(community_key_id) {
             return Err(ChatComposeError::Refused(ChatRefusal::FileNotInRoom));
         }
     }
     let at = truncate_to_substrate_resolution(asserted_at);
-    let (mut members, sealed) = sealed_body_members(author, room, body, at, store)
+    let (mut members, sealed) = sealed_body_members(author, community_key_id, body, at, store)
         .await
         .map_err(ChatComposeError::Failed)?;
     members.insert(
@@ -1286,9 +1285,15 @@ pub async fn chat_message_reply_in(
             serde_json::json!(f.attestation_id),
         );
     }
-    let row = chat_row(author, room, CHAT_MESSAGE_DIMENSION, members, at)
-        .await
-        .map_err(ChatComposeError::Failed)?;
+    let row = chat_row(
+        author,
+        community_key_id,
+        CHAT_MESSAGE_DIMENSION,
+        members,
+        at,
+    )
+    .await
+    .map_err(ChatComposeError::Failed)?;
     Ok((row, sealed))
 }
 

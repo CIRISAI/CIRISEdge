@@ -4906,6 +4906,7 @@ fn framing_state_of(
     }
 }
 
+#[allow(clippy::too_many_lines)] // one select loop: window, framing gate, reassembly, counts, the leg publish
 async fn reorder_loop(
     shared: Arc<Shared>,
     mut heard: mpsc::Receiver<Heard>,

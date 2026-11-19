@@ -34,8 +34,11 @@ pub(super) struct LegCong {
     pub(super) congested: u32,
     pub(super) clean: u32,
     pub(super) shed: bool,
-    pub(super) tx: HashMap<(StreamId, u8), (u64, Instant, Instant)>,
+    pub(super) tx: HashMap<(StreamId, u8), TxBytes>,
 }
+
+/// One own (stream, class) on a leg: bytes sent, first and last send.
+pub(super) type TxBytes = (u64, Instant, Instant);
 
 /// What the reorder loop accumulates per heard (stream, codec class).
 #[derive(Debug)]
@@ -149,7 +152,7 @@ pub(super) fn publish_rx(
 /// The codec a row names: the binding's registered token for the class when
 /// it named one, else the class's own name. Never a peer-chosen string.
 pub(super) fn codec_token(
-    map: Option<crate::transport::av_chunk_auth::CodecMap>,
+    map: Option<&crate::transport::av_chunk_auth::CodecMap>,
     class: u8,
 ) -> &'static str {
     if let Some(known) = map.and_then(|m| {
@@ -195,29 +198,25 @@ fn rate(
         let secs = dt.as_secs_f64().max(0.001);
         (db as f64) * 8.0 / secs
     };
-    match memo.get_mut(&key) {
-        Some(m) => {
-            let dt = now.saturating_duration_since(m.at);
-            if dt >= RATE_MIN_SPAN {
-                m.bps = bps(bytes.saturating_sub(m.bytes), dt);
-                m.at = now;
-                m.bytes = bytes;
-            }
-            m.bps
+    if let Some(m) = memo.get_mut(&key) {
+        let dt = now.saturating_duration_since(m.at);
+        if dt >= RATE_MIN_SPAN {
+            m.bps = bps(bytes.saturating_sub(m.bytes), dt);
+            m.at = now;
+            m.bytes = bytes;
         }
-        None => {
-            let v = bps(bytes, now.saturating_duration_since(since));
-            memo.insert(
-                key,
-                RateMemo {
-                    at: now,
-                    bytes,
-                    bps: v,
-                },
-            );
-            v
-        }
+        return m.bps;
     }
+    let v = bps(bytes, now.saturating_duration_since(since));
+    memo.insert(
+        key,
+        RateMemo {
+            at: now,
+            bytes,
+            bps: v,
+        },
+    );
+    v
 }
 
 impl Shared {
@@ -281,7 +280,7 @@ impl CallLegSource for Shared {
             if path == LegPath::Gone {
                 continue;
             }
-            let tx: Vec<((StreamId, u8), (u64, Instant, Instant))> = {
+            let tx: Vec<((StreamId, u8), TxBytes)> = {
                 let mut cong = Shared::lock(&self.leg_cong);
                 let Some(c) = cong.get_mut(&member) else {
                     continue;
@@ -318,7 +317,7 @@ impl CallLegSource for Shared {
                     frames_skipped: None,
                     jitter_ms: None,
                     reorder_window: None,
-                    codec: codec_token(codec_map, class),
+                    codec: codec_token(codec_map.as_ref(), class),
                 });
             }
         }
@@ -377,7 +376,7 @@ impl CallLegSource for Shared {
                 frames_skipped: Some(leg.skipped),
                 jitter_ms: Some(leg.jitter_ms),
                 reorder_window: Some(leg.depth),
-                codec: codec_token(self.auth.codecs_of(stream), class),
+                codec: codec_token(self.auth.codecs_of(stream).as_ref(), class),
             });
         }
         memo.retain(|k, _| seen.contains(k));

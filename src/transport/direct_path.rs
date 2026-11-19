@@ -399,17 +399,18 @@ impl DirectLinksConfig {
     ) -> Self {
         let (out, source) =
             self.resolve_facilitator_from(baked_dials_allowed, Self::bundle_facilitator, bootstrap);
-        match &out.facilitator {
-            Some(f) => tracing::info!(
+        if let Some(f) = &out.facilitator {
+            tracing::info!(
                 facilitator = %f,
                 source = source.as_str(),
                 "direct links: facilitator resolved"
-            ),
-            None => tracing::info!(
+            );
+        } else {
+            tracing::info!(
                 source = source.as_str(),
                 proposing = ?out.proposing,
                 "direct links: no facilitator, so nothing proposes"
-            ),
+            );
         }
         out
     }
