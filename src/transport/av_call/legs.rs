@@ -520,10 +520,10 @@ mod tests {
         let frames = super::super::frame::Reassemblers::default();
         let mut acc = HashMap::new();
         let mut publish = RxPublish::new(t0);
-        let mut turn = |h: super::super::Heard,
-                        window: &mut super::super::ReorderWindow,
-                        acc: &mut HashMap<(StreamId, u8), RxAcc>,
-                        publish: &mut RxPublish| {
+        let turn = |h: super::super::Heard,
+                    window: &mut super::super::ReorderWindow,
+                    acc: &mut HashMap<(StreamId, u8), RxAcc>,
+                    publish: &mut RxPublish| {
             let before = window.counts();
             note_arrival(acc, &h);
             publish.heard();
