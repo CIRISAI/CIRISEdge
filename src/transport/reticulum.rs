@@ -568,6 +568,54 @@ fn link_is_forwarded(
             .is_some_and(|hops| hops > 1)
 }
 
+/// v45.1.7 — whether a link that was never MOVED onto a punched interface was
+/// born on one, to its peer: sent on a punched interface (`interface` is one
+/// of `punched`) and not forwarded. A punched interface is one socket to one
+/// peer (leviculum-std `interfaces/direct_udp.rs`), but when that peer is a
+/// transport node, a link to a THIRD destination whose next hop is the peer
+/// leaves on the same interface; it is forwarded (more than one hop), so it
+/// is relayed, not direct. `forwarded` is read only when the interface
+/// matches.
+fn born_on_punched(
+    interface: Option<usize>,
+    punched: &[usize],
+    forwarded: impl FnOnce() -> bool,
+) -> bool {
+    interface.is_some_and(|i| punched.contains(&i)) && !forwarded()
+}
+
+#[cfg(test)]
+mod born_on_punched_tests {
+    use super::born_on_punched;
+
+    /// A link on a punched interface is direct only when it goes to the
+    /// punched peer itself: a link to a third destination forwarded through
+    /// that peer (a transport node) leaves on the same interface and is
+    /// relayed (red at 13e8b60: read punched).
+    #[test]
+    fn a_forwarded_link_on_a_punched_interface_is_not_punched() {
+        assert!(
+            born_on_punched(Some(3), &[3], || false),
+            "to the peer: direct"
+        );
+        assert!(
+            !born_on_punched(Some(3), &[3], || true),
+            "through the peer to a third destination: relayed"
+        );
+        assert!(
+            !born_on_punched(Some(2), &[3], || false),
+            "another interface"
+        );
+        assert!(!born_on_punched(None, &[3], || false), "no interface");
+        let mut read = false;
+        assert!(!born_on_punched(Some(2), &[3], || {
+            read = true;
+            false
+        }));
+        assert!(!read, "the hop count is read only on a punched interface");
+    }
+}
+
 /// CC 5.4.3 — which links are offered shaping: the identity plane only. An
 /// A/V link is a burst a GPA can see regardless (CC 5.3.3.2) and would pay
 /// seconds of jitter for nothing; a scoped link is one hop of scoped content
@@ -7160,14 +7208,18 @@ impl ReticulumTransport {
             return true;
         }
         let punched = self.direct_paths.tracker().punched_interfaces();
-        !punched.is_empty()
-            && self
-                .node
-                .link_list()
-                .into_iter()
-                .find(|l| l.link_id == *id)
-                .and_then(|l| l.interface_index)
-                .is_some_and(|i| punched.contains(&i))
+        if punched.is_empty() {
+            return false;
+        }
+        let interface = self
+            .node
+            .link_list()
+            .into_iter()
+            .find(|l| l.link_id == *id)
+            .and_then(|l| l.interface_index);
+        born_on_punched(interface, &punched, || {
+            link_is_forwarded(&self.node, id, self.node.link_destination(id))
+        })
     }
 
     /// leviculum#102 / #104 — the most plaintext one message on `link` carries
