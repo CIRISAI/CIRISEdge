@@ -921,6 +921,22 @@ impl DirectPathTracker {
         })
     }
 
+    /// v45.1.7 — every punched interface a direct path rides now. A link
+    /// BORN on one (a call leg dialled after the identity link moved, its
+    /// path learned through the punched interface) was never moved onto it,
+    /// so leviculum's `direct_link_interface` does not name it; its
+    /// interface index is one of these.
+    #[must_use]
+    pub fn punched_interfaces(&self) -> Vec<usize> {
+        self.peers
+            .values()
+            .filter_map(|p| match p.entry {
+                Entry::Direct { interface, .. } => Some(interface),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Peers with a direct path now (the `direct_links_active` gauge).
     #[must_use]
     pub fn direct_count(&self) -> usize {

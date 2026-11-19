@@ -7139,7 +7139,7 @@ impl ReticulumTransport {
         use crate::transport::av_call::LegPath;
         let id = LinkId::new(*link);
         let mdu = self.node.link_mdu(&id)?;
-        let path = if self.node.direct_link_interface(&id).is_some() {
+        let path = if self.link_rides_punched_interface(&id) {
             LegPath::DirectUdp
         } else if link_is_forwarded(&self.node, &id, self.node.link_destination(&id)) {
             LegPath::Relayed
@@ -7147,6 +7147,27 @@ impl ReticulumTransport {
             LegPath::Interface
         };
         Some((path, mdu))
+    }
+
+    /// v45.1.7 — whether `id` runs over a punched interface: moved onto one
+    /// (leviculum's `direct_link_interface`), or BORN on one: a call leg
+    /// dialled once the identity link moved is sent on the punched
+    /// interface from its first packet and was never moved, so only its
+    /// interface index says so. Read (a link list) only while some direct
+    /// path is up.
+    fn link_rides_punched_interface(&self, id: &LinkId) -> bool {
+        if self.node.direct_link_interface(id).is_some() {
+            return true;
+        }
+        let punched = self.direct_paths.tracker().punched_interfaces();
+        !punched.is_empty()
+            && self
+                .node
+                .link_list()
+                .into_iter()
+                .find(|l| l.link_id == *id)
+                .and_then(|l| l.interface_index)
+                .is_some_and(|i| punched.contains(&i))
     }
 
     /// leviculum#102 / #104 — the most plaintext one message on `link` carries
