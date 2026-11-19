@@ -3492,9 +3492,9 @@ async fn a_reply_carries_a_file_and_a_revision_keeps_root_and_file() {
     let seen = room_messages(&w).await;
     assert_eq!(
         seen.iter()
-            .map(|m| m.attestation_id.clone())
+            .map(|m| m.attestation_id.as_str())
             .collect::<Vec<_>>(),
-        [root.attestation_id.clone()],
+        [root.attestation_id.as_str()],
         "the reply is recanted, the root stands"
     );
 
