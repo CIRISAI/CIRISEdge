@@ -403,7 +403,7 @@ impl CallLegSource for Shared {
                 let codec_map = if stream == own_primary {
                     self.opts.codecs
                 } else {
-                    None
+                    Shared::lock(&self.own_share_codecs).get(&stream).copied()
                 };
                 rows.push(CallLegRow {
                     room: self.room.clone(),

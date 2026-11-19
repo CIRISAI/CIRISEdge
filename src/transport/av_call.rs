@@ -1742,6 +1742,10 @@ struct Shared {
     rx_legs: StdMutex<HashMap<(StreamId, u8), legs::RxLeg>>,
     /// v45.1.7 — the other members' streams their bindings call shares.
     share_streams: StdMutex<std::collections::HashSet<StreamId>>,
+    /// v45.1.7 — this node's own shares' codec maps (`Call::add_stream`), for
+    /// their send rows' codec (Codex on #1016: a share's rows read the class
+    /// token). Its own lock: the leg rows are read without the async `shares`.
+    own_share_codecs: StdMutex<HashMap<StreamId, crate::transport::av_chunk_auth::CodecMap>>,
     /// v45.1.7 — each row's last rate measure.
     leg_rates: StdMutex<HashMap<legs::RateKey, legs::RateMemo>>,
     /// ALM C5 — the oldest frame age seen in the inbound queues this window
@@ -2201,6 +2205,7 @@ impl Call {
             leg_cong: StdMutex::new(HashMap::new()),
             rx_legs: StdMutex::new(HashMap::new()),
             share_streams: StdMutex::new(std::collections::HashSet::new()),
+            own_share_codecs: StdMutex::new(HashMap::new()),
             leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
             load,
@@ -2796,6 +2801,9 @@ impl Call {
         )
         .await?;
         send_bindings_on(shared, &mut publisher, &key.wire, key.wire_v2.as_ref()).await;
+        if let Some(map) = key.codecs {
+            Shared::lock(&shared.own_share_codecs).insert(stream, map);
+        }
         live_shares.insert(
             stream,
             ShareStream {
@@ -2944,6 +2952,7 @@ impl Call {
                 .unwrap_or(crate::transport::av_chunk_auth::FINAL_SEQ_NONE);
             let wire = sign_end_of(&self.shared, &share.key, final_seq, why).await?;
             shares.remove(&stream);
+            Shared::lock(&self.shared.own_share_codecs).remove(&stream);
             Shared::lock(&self.shared.alm).remove_own_stream(stream);
             wire
         };

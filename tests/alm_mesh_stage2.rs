@@ -1393,8 +1393,11 @@ fn drain_from(
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines)] // one story, told in order
 async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
+    use ciris_edge::telemetry::call_legs::CALL_CODEC;
     use ciris_edge::transport::av_call::LeaveCause;
-    use ciris_edge::transport::av_chunk_auth::{STREAM_KIND_MEDIA, STREAM_KIND_SHARE};
+    use ciris_edge::transport::av_chunk_auth::{
+        CodecMap, CodecToken, STREAM_KIND_MEDIA, STREAM_KIND_SHARE,
+    };
     let _call = one_call().await;
     let tag = "alm2-share";
     let (nodes, groups, _tmp) = topo(tag, 2, 2, &[(0, 1)], None).await;
@@ -1407,7 +1410,13 @@ async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
     let mut events = ca.events().expect("A's events");
     let mut frames = ca.frames().expect("A's frames");
     let cam = cb.stream();
-    let share = cb.add_stream(None).await.expect("B shares its screen");
+    // v45.1.7 — the share declares its codec (Codex on #1016: a share's send
+    // rows read the class token, not the share's registered codec).
+    let opus = CodecMap::new([CodecToken::Opus]).expect("map");
+    let share = cb
+        .add_stream(Some(opus))
+        .await
+        .expect("B shares its screen");
     assert_ne!(share, cam);
     assert_eq!(cb.streams().await, vec![cam, share]);
     wait_bound(&ca, 2).await;
@@ -1455,6 +1464,23 @@ async fn a_share_beside_the_camera_is_heard_and_ends_alone() {
         "A hears both streams: camera {}, share {}",
         heard.get(&cam).map_or(0, std::collections::BTreeSet::len),
         heard.get(&share).map_or(0, std::collections::BTreeSet::len)
+    );
+    // v45.1.7 — B's send row for the share names the share's codec.
+    let share_label = stream_label(share);
+    let snap = b.metrics.snapshot();
+    let share_codec: Vec<_> =
+        common::call_leg_series(&snap.call_legs, CALL_CODEC, &a.key.key_id, "send")
+            .into_iter()
+            .filter(|s| {
+                common::call_leg_attr(s, "ciris.call.stream_id") == Some(share_label.as_str())
+            })
+            .collect();
+    assert_eq!(share_codec.len(), 1, "{:?}", snap.call_legs);
+    assert_eq!(
+        common::call_leg_attr(share_codec[0], "codec"),
+        Some("opus"),
+        "the share's send row names its registered codec: {:?}",
+        share_codec[0]
     );
     cb.end_stream(share).await.expect("B stops sharing");
     assert_eq!(cb.streams().await, vec![cam], "the camera carries on");
