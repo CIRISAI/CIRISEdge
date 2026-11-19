@@ -56,9 +56,13 @@ one peer's series, so the window is dropped, not carried, and
 
 ## Per-leg call series (v45.1.7)
 
-`call_legs` is the one field that names rooms and members, by decision: the
-call screen's "?" panel needs to say which leg is slow and why. It is bounded
-three ways. It is operator-only. It is live only: rows are read from each live
+`call_legs` is the one field whose labels name rooms and members
+(`ciris.call.member` is a peer key): a named third exception to "no peer in a
+label", after `peer_reachability_ratio` and `recent_withholds`, by Eric's
+decision (2026-11-19), because the call screen's "?" panel needs to say which
+leg is slow and why. It has one catalogue row per instrument, all of field
+`call_legs`, and it is bounded three ways. It is operator-only, and the
+server serves it to the owner session only, never on a public surface. It is live only: rows are read from each live
 call's state when the bundle is read, so a leg's series are gone in the first
 snapshot after the leg or its call ends. It is capped at 64 rows (a member, a
 stream and a media kind each), with `call_legs_overflow` counting the rest.
@@ -404,6 +408,13 @@ server-composed node) counted into neither.
 | `group_backfill_completed_total` | `ciris.edge.group_backfill.completed` | counter | count | operator-only |
 | `apply_refusals` | `ciris.edge.apply_refusals` | counter | count | operator-only |
 | `loop_last_progress_age_seconds` | `ciris.edge.loop.last_progress_age` | gauge | seconds | operator-only |
-| `call_legs` | `ciris.edge.call.legs` | gauge | count | operator-only |
+| `call_legs` | `ciris.edge.call.path` | gauge | count | operator-only |
+| `call_legs` | `ciris.edge.call.rtt` | gauge | milliseconds | operator-only |
+| `call_legs` | `ciris.edge.call.bitrate` | gauge | bits/s | operator-only |
+| `call_legs` | `ciris.edge.call.frames_lost` | counter | count | operator-only |
+| `call_legs` | `ciris.edge.call.frames_skipped` | counter | count | operator-only |
+| `call_legs` | `ciris.edge.call.jitter` | gauge | milliseconds | operator-only |
+| `call_legs` | `ciris.edge.call.reorder_window` | gauge | count | operator-only |
+| `call_legs` | `ciris.edge.call.codec` | gauge | count | operator-only |
 | `call_legs_overflow` | `ciris.edge.call.legs_overflow` | gauge | count | operator-only |
 | `node_alive` | `ciris.edge.node.alive` | gauge | count | public-safe |

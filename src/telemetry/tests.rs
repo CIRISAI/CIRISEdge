@@ -53,7 +53,13 @@ impl<'m> Witness<'m> {
 
 #[test]
 fn every_bundle_field_has_exactly_one_row_and_every_row_a_field() {
-    let mut rows: Vec<&str> = TELEMETRY_CATALOGUE.iter().map(|s| s.field).collect();
+    // v45.1.7 — `call_legs` has one row per instrument, and only it may.
+    let mut rows: Vec<&str> = TELEMETRY_CATALOGUE
+        .iter()
+        .filter(|s| s.field != "call_legs")
+        .map(|s| s.field)
+        .collect();
+    rows.push("call_legs");
     rows.sort_unstable();
     let before = rows.len();
     rows.dedup();
@@ -107,6 +113,7 @@ fn no_label_names_a_peer_but_the_two_old_ones_and_they_stay_operator_only() {
         }
     }
     assert_eq!(peer_keyed, ["peer_reachability_ratio", "recent_withholds"]);
+    call_leg.dedup();
     assert_eq!(call_leg, ["call_legs"]);
 }
 

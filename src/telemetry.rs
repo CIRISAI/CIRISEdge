@@ -1255,6 +1255,8 @@ pub enum Unit {
     Bytes,
     /// A ratio in `[0, 1]`.
     Ratio,
+    /// v45.1.7 — bits per second.
+    BitsPerSecond,
 }
 
 /// Who may read a field. The server enforces this: `PublicSafe` may stay on
@@ -1282,8 +1284,11 @@ pub enum LabelValues {
     /// both operator-only, and neither may be joined by a new field.
     PeerKeyed,
     /// v45.1.7 — one live call leg's series ([`call_legs`]): a room, a call,
-    /// a member, a stream and a media kind, with each instrument's own
-    /// attributes. Only `call_legs`, operator-only, live legs only, at most
+    /// a member (`ciris.call.member`, a peer key: a named exception to "no
+    /// peer in a label", by Eric's decision), a stream and a media kind,
+    /// with each instrument's own attributes. Only the `call_legs` field's
+    /// rows (one per instrument), operator-only (the host serves them to the
+    /// owner session only), live legs only, at most
     /// [`call_legs::CALL_LEG_ROWS_MAX`] rows.
     CallLeg,
 }
@@ -1327,6 +1332,7 @@ const fn spec(
 }
 
 const REASON: Option<(&str, LabelValues)> = Some(("reason", LabelValues::Tokens));
+const CALL_LEG: Option<(&str, LabelValues)> = Some(("ciris.call.member", LabelValues::CallLeg));
 const LEVER_TOKENS: &[&str] = &["walk", "page", "bulk"];
 const FORWARD_REFUSAL_REASONS: &[&str] = &[obs::FORWARD_REFUSED_CAPACITY];
 const KINDS: Option<(&str, LabelValues)> = Some(("kind", LabelValues::EnvelopeKinds));
@@ -1341,7 +1347,7 @@ const fn closed(
 }
 
 use Kind::{Counter, Gauge, Histogram};
-use Unit::{Bytes, Count, Milliseconds, Nanoseconds, Ratio, Seconds};
+use Unit::{BitsPerSecond, Bytes, Count, Milliseconds, Nanoseconds, Ratio, Seconds};
 
 /// Every bundle field, one row each. See the module docs.
 pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
@@ -1484,7 +1490,17 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("group_backfill_completed_total", "ciris.edge.group_backfill.completed", Counter, Count, None, "Join backfills that read to the end of the history families."),
     spec("apply_refusals", "ciris.edge.apply_refusals", Counter, Count, Some(("state", LabelValues::Tokens)), "`moved_to_terminal` and `refused_then_admitted:<class>`: a refusal's life, not its reason. Every key present at zero."),
     spec("loop_last_progress_age_seconds", "ciris.edge.loop.last_progress_age", Gauge, Seconds, closed("loop", LoopName::TOKENS), "Whole seconds since each loop turned. -1: not running, a parked node included. Stamped on each loop's own cadence, not per event. Not public: a dispatcher busy with a batch turns late."),
-    spec("call_legs", "ciris.edge.call.legs", Gauge, Count, Some(("ciris.call.leg", LabelValues::CallLeg)), "Per-leg call series for live calls only (`ciris.edge.call.path`, `.rtt`, `.bitrate`, `.frames_lost`, `.frames_skipped`, `.jitter`, `.reorder_window`, `.codec`); a leg's series go when it or its call ends. Names rooms and members: never public. The flat count is the series carried."),
+    // v45.1.7 — the per-leg call instruments: one row each, every one the
+    // `call_legs` field (its series carry the instrument name), keyed by a
+    // live call leg by Eric's decision: owner-session only.
+    spec("call_legs", call_legs::CALL_PATH, Gauge, Count, CALL_LEG, "1 per live call leg; `path` direct or relayed, `relay.key_id` (empty unless a member relay carries it), `transport` (datagram or channel), `punched`, `nat.local_type` and `nat.peer_type` (`unknown` on 45.1.x), `direction`. Names rooms and members: owner-session only."),
+    spec("call_legs", call_legs::CALL_RTT, Gauge, Milliseconds, CALL_LEG, "The leg link's smoothed RTT, by `direction`."),
+    spec("call_legs", call_legs::CALL_BITRATE, Gauge, BitsPerSecond, CALL_LEG, "Media bits per second on the leg, `direction` send or recv, re-measured at most once a second."),
+    spec("call_legs", call_legs::CALL_FRAMES_LOST, Counter, Count, CALL_LEG, "Receive rows: frames of a framed stream never received (gaps in `frame_seq`)."),
+    spec("call_legs", call_legs::CALL_FRAMES_SKIPPED, Counter, Count, CALL_LEG, "Receive rows: chunks the reorder window gave up waiting for."),
+    spec("call_legs", call_legs::CALL_JITTER, Gauge, Milliseconds, CALL_LEG, "Receive rows: RFC 3550 interarrival jitter against the signed source timestamp."),
+    spec("call_legs", call_legs::CALL_REORDER_WINDOW, Gauge, Count, CALL_LEG, "Receive rows: the most chunks the reorder window held in the last second."),
+    spec("call_legs", call_legs::CALL_CODEC, Gauge, Count, CALL_LEG, "1, with `codec` the stream's registered codec for the media kind, or its class, and `direction`."),
     spec("call_legs_overflow", "ciris.edge.call.legs_overflow", Gauge, Count, None, "Leg rows left out of this reading past the cap of 64. Non-zero: the panel is missing legs."),
     TelemetrySpec { exposure: Exposure::PublicSafe, ..spec("node_alive", "ciris.edge.node.alive", Gauge, Count, None, "1 when the event loop and the ladder both turned within 60 s. A bound this coarse says the node runs and nothing of its traffic: the one field for an unauthenticated route.") },
 ];

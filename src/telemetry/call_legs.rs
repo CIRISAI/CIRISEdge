@@ -386,17 +386,31 @@ mod tests {
         assert_eq!(names, [CALL_PATH, CALL_RTT, CALL_BITRATE, CALL_CODEC]);
     }
 
-    /// Every instrument is a dotted `ciris.edge.call.*` name.
+    /// Every instrument is a dotted `ciris.edge.call.*` name with its own
+    /// catalogue row (field `call_legs`, label `CallLeg`, operator-only), of
+    /// the same kind; and every `call_legs` row is an instrument.
     #[test]
-    fn every_instrument_is_a_call_name() {
-        for (name, ..) in CALL_LEG_INSTRUMENTS {
+    fn every_instrument_is_a_catalogue_row_and_back() {
+        use super::super::{Exposure, LabelValues, TELEMETRY_CATALOGUE};
+        for (name, kind, ..) in CALL_LEG_INSTRUMENTS {
             assert!(name.starts_with("ciris.edge.call."), "{name}");
-            assert!(
-                super::super::TELEMETRY_CATALOGUE
-                    .iter()
-                    .all(|s| s.name != *name),
-                "{name} is a catalogue name too"
+            let row = TELEMETRY_CATALOGUE
+                .iter()
+                .find(|s| s.name == *name)
+                .unwrap_or_else(|| panic!("{name} has no catalogue row"));
+            assert_eq!(row.field, "call_legs", "{name}");
+            assert_eq!(row.kind, *kind, "{name}");
+            assert_eq!(row.exposure, Exposure::OperatorOnly, "{name}");
+            assert_eq!(
+                row.label,
+                Some(("ciris.call.member", LabelValues::CallLeg)),
+                "{name}"
             );
         }
+        let rows = TELEMETRY_CATALOGUE
+            .iter()
+            .filter(|s| s.field == "call_legs")
+            .count();
+        assert_eq!(rows, CALL_LEG_INSTRUMENTS.len());
     }
 }
