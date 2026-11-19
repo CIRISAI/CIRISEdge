@@ -1122,6 +1122,8 @@ pub enum ChatRefusal {
     ReactionTargetNotInRoom,
     /// `chat.not_a_message`: the target is not a chat message or reply.
     NotAMessage,
+    /// `chat.file_not_in_room`: the file a reply carries is not in the room.
+    FileNotInRoom,
     /// `chat.not_an_emoji`: not exactly one emoji of at most
     /// [`REACTION_MAX_BYTES`] bytes.
     NotAnEmoji,
@@ -1136,6 +1138,7 @@ impl ChatRefusal {
             Self::ReplyTargetNotInRoom => "chat.reply_target_not_in_room",
             Self::ReactionTargetNotInRoom => "chat.reaction_target_not_in_room",
             Self::NotAMessage => "chat.not_a_message",
+            Self::FileNotInRoom => "chat.file_not_in_room",
             Self::NotAnEmoji => "chat.not_an_emoji",
         }
     }
@@ -1231,17 +1234,23 @@ fn replies_to_of(a: &Attestation) -> Option<&str> {
 /// [`FIELD_REPLIES_TO`], in the clear. Nothing is written to the root.
 ///
 /// `root` is the message as the caller holds it (on a peer, its widening).
+/// `file`: a file the reply carries, as [`chat_message_attachment_in`]
+/// carries one (it must already be in `room`; `body` is then its caption).
+/// A reply is a message in every other way: revised, withdrawn, recanted,
+/// reacted to and reported as one.
 ///
 /// # Errors
 /// [`ChatRefusal::ThreadInThread`] when `root` is itself a reply (naming its
 /// root), [`ChatRefusal::NotAMessage`] when it is not a chat message,
-/// [`ChatRefusal::ReplyTargetNotInRoom`] when it is not in `room`; a seal,
+/// [`ChatRefusal::ReplyTargetNotInRoom`] when it is not in `room`,
+/// [`ChatRefusal::FileNotInRoom`] when `file` is not; a seal,
 /// canonicalization or signing failure as [`ChatComposeError::Failed`].
 pub async fn chat_message_reply_in(
     author: &crate::identity::LocalSigner,
     community_key_id: &str,
     root: &Attestation,
     body: &str,
+    file: Option<&Attestation>,
     asserted_at: chrono::DateTime<chrono::Utc>,
     store: &dyn crate::group_content::GroupContentStore,
 ) -> Result<(Attestation, crate::group_content::SealedContent), ChatComposeError> {
@@ -1258,6 +1267,11 @@ pub async fn chat_message_reply_in(
             root_attestation_id: r.to_owned(),
         }));
     }
+    if let Some(f) = file {
+        if room_of(f).as_deref() != Some(room) {
+            return Err(ChatComposeError::Refused(ChatRefusal::FileNotInRoom));
+        }
+    }
     let at = truncate_to_substrate_resolution(asserted_at);
     let (mut members, sealed) = sealed_body_members(author, room, body, at, store)
         .await
@@ -1266,6 +1280,12 @@ pub async fn chat_message_reply_in(
         FIELD_REPLIES_TO.to_owned(),
         serde_json::json!(root.attestation_id),
     );
+    if let Some(f) = file {
+        members.insert(
+            FIELD_ATTACHMENT.to_owned(),
+            serde_json::json!(f.attestation_id),
+        );
+    }
     let row = chat_row(author, room, CHAT_MESSAGE_DIMENSION, members, at)
         .await
         .map_err(ChatComposeError::Failed)?;

@@ -3060,7 +3060,7 @@ async fn a_reply_names_its_root_and_a_thread_in_a_thread_is_refused() {
     let root = placed(&w, "what time?").await;
 
     let (reply, _) =
-        chat::chat_message_reply_in(&w.alice, &w.room, &root, "seven", later(1), &store)
+        chat::chat_message_reply_in(&w.alice, &w.room, &root, "seven", None, later(1), &store)
             .await
             .expect("reply");
     assert_eq!(
@@ -3087,8 +3087,16 @@ async fn a_reply_names_its_root_and_a_thread_in_a_thread_is_refused() {
         .expect("the root");
     assert_eq!(top.replies_to, None, "nothing is written to the root");
 
-    let refused =
-        chat::chat_message_reply_in(&w.alice, &w.room, &reply_w, "nested", later(2), &store).await;
+    let refused = chat::chat_message_reply_in(
+        &w.alice,
+        &w.room,
+        &reply_w,
+        "nested",
+        None,
+        later(2),
+        &store,
+    )
+    .await;
     assert_eq!(
         refused.err(),
         Some(chat::ChatComposeError::Refused(
@@ -3102,6 +3110,7 @@ async fn a_reply_names_its_root_and_a_thread_in_a_thread_is_refused() {
         "chat:room:v1:elsewhere",
         &root,
         "x",
+        None,
         later(2),
         &store,
     )
@@ -3120,10 +3129,17 @@ async fn a_reply_names_its_root_and_a_thread_in_a_thread_is_refused() {
         .as_object_mut()
         .unwrap()
         .remove(chat::FIELD_REPLIES_TO);
-    let (stray, _) =
-        chat::chat_message_reply_in(&w.alice, &w.room, &disguised, "stray", later(3), &store)
-            .await
-            .expect("the check reads the row in hand");
+    let (stray, _) = chat::chat_message_reply_in(
+        &w.alice,
+        &w.room,
+        &disguised,
+        "stray",
+        None,
+        later(3),
+        &store,
+    )
+    .await
+    .expect("the check reads the row in hand");
     let stray_w = shared_in_room(&w, &stray).await;
     let seen = room_messages(&w).await;
     let s = seen
@@ -3400,5 +3416,104 @@ async fn a_reaction_crosses_to_the_other_member_who_opens_the_emoji() {
             Some(Body::Unopened { .. })
         ),
         "a non-member opens nothing"
+    );
+}
+
+/// **A reply carries a file as a message does, and a reply is a message in
+/// every other way:** the reader shows its root and its file; a revision keeps
+/// both; a recant removes it; a file from another room is refused.
+#[tokio::test]
+async fn a_reply_carries_a_file_and_a_revision_keeps_root_and_file() {
+    let w = world().await;
+    let store = content_store(&w).await;
+    let root = placed(&w, "photos from saturday?").await;
+    // A row already in the room stands in for the file row, as in the
+    // attachment witness.
+    let file = root.clone();
+
+    let (reply, _) = chat::chat_message_reply_in(
+        &w.alice,
+        &w.room,
+        &root,
+        "here",
+        Some(&file),
+        later(1),
+        &store,
+    )
+    .await
+    .expect("reply with a file");
+    assert_eq!(
+        reply.attestation_envelope[chat::FIELD_ATTACHMENT],
+        file.attestation_id.as_str()
+    );
+    let reply_w = shared_in_room(&w, &reply).await;
+    let seen = room_messages(&w).await;
+    let r = seen
+        .iter()
+        .find(|m| m.attestation_id == reply_w.attestation_id)
+        .expect("the reply");
+    assert_eq!(r.replies_to.as_deref(), Some(root.attestation_id.as_str()));
+    assert_eq!(r.attachment.as_deref(), Some(file.attestation_id.as_str()));
+    assert_eq!(r.body, Body::Text("here".to_owned()));
+
+    // An edit of the reply keeps its thread and its file.
+    let (edit, _) = chat::chat_message_supersede_in(
+        &w.alice,
+        &w.room,
+        &reply_w,
+        "here they are",
+        later(2),
+        &store,
+    )
+    .await
+    .expect("revise the reply");
+    put(&w, &edit).await;
+    let seen = room_messages(&w).await;
+    let e = seen
+        .iter()
+        .find(|m| m.attestation_id == edit.attestation_id)
+        .expect("the revision is the head");
+    assert_eq!(e.replies_to.as_deref(), Some(root.attestation_id.as_str()));
+    assert_eq!(e.attachment.as_deref(), Some(file.attestation_id.as_str()));
+    assert_eq!(e.body, Body::Text("here they are".to_owned()));
+    assert_eq!(e.edits.as_deref(), Some(reply_w.attestation_id.as_str()));
+
+    // A recant of the reply removes it; the root stands.
+    let recant = chat::chat_message_recant_in(
+        &w.alice,
+        &w.room,
+        &edit,
+        &chat::ComposerReason::Incorrect,
+        later(3),
+    )
+    .await
+    .expect("recant the reply");
+    put(&w, &recant).await;
+    let seen = room_messages(&w).await;
+    assert_eq!(
+        seen.iter()
+            .map(|m| m.attestation_id.clone())
+            .collect::<Vec<_>>(),
+        [root.attestation_id.clone()],
+        "the reply is recanted, the root stands"
+    );
+
+    let mut elsewhere = file.clone();
+    elsewhere.attestation_envelope[chat::FIELD_COMMUNITY_ID] = serde_json::json!("another-room");
+    assert_eq!(
+        chat::chat_message_reply_in(
+            &w.alice,
+            &w.room,
+            &root,
+            "x",
+            Some(&elsewhere),
+            later(4),
+            &store
+        )
+        .await
+        .err(),
+        Some(chat::ChatComposeError::Refused(
+            chat::ChatRefusal::FileNotInRoom
+        ))
     );
 }
