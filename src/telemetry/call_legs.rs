@@ -40,7 +40,7 @@ pub const CALL_LEG_ROWS_MAX: usize = 64;
 pub const CALL_LEG_INSTRUMENTS: &[(&str, Kind, &str, &str)] = &[
     (CALL_PATH, Kind::Gauge, "1", "1 per live leg; `path` direct or relayed, `relay.key_id` (empty unless a member relay carries it), `transport` (the carrier: datagram or channel), `punched`, `nat.local_type` and `nat.peer_type` (`unknown` on 45.1.x)."),
     (CALL_RTT, Kind::Gauge, "ms", "The leg link's smoothed RTT."),
-    (CALL_BITRATE, Kind::Gauge, "bit/s", "Media bits per second on the leg, `direction` send or recv, since the last reading at least a second ago."),
+    (CALL_BITRATE, Kind::Gauge, "bit/s", "Media bits per second on the leg, `direction` send or recv, counted at one layer both ways: each chunk's plaintext payload (never its wire form), since the last reading at least a second ago."),
     (CALL_FRAMES_LOST, Kind::Counter, "{frame}", "Frames of a framed stream never received (gaps in `frame_seq`)."),
     (CALL_FRAMES_SKIPPED, Kind::Counter, "{chunk}", "Chunks the reorder window gave up waiting for."),
     (CALL_JITTER, Kind::Gauge, "ms", "RFC 3550 interarrival jitter against the publisher's signed source timestamp."),

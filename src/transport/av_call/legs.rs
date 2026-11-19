@@ -37,8 +37,38 @@ pub(super) struct LegCong {
     pub(super) tx: HashMap<(StreamId, u8), TxBytes>,
 }
 
-/// One own (stream, class) on a leg: bytes sent, first and last send.
+impl LegCong {
+    /// One own chunk of `key` the leg took: its payload counts.
+    pub(super) fn note_own_sent(
+        &mut self,
+        key: (StreamId, u8),
+        payload: ChunkPayload,
+        now: Instant,
+    ) {
+        let tx = self.tx.entry(key).or_insert((0, now, now));
+        tx.0 = tx.0.saturating_add(payload.0);
+        tx.2 = now;
+    }
+}
+
+/// One own (stream, class) on a leg: payload bytes sent, first and last send.
 pub(super) type TxBytes = (u64, Instant, Instant);
+
+/// v45.1.7 — the layer both directions of `ciris.edge.call.bitrate` count:
+/// a chunk's PLAINTEXT payload (a framed stream's fragment with its marker,
+/// as sealed at send and as the reorder window releases it at receive),
+/// never its wire form. A type of its own, so the send site cannot pass the
+/// wire length (Codex on #1016: send counted wire bytes, receive counted
+/// plaintext, so the panel compared two layers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChunkPayload(u64);
+
+impl ChunkPayload {
+    /// The payload of a chunk whose plaintext is `len` bytes.
+    pub(super) fn of_len(len: usize) -> Self {
+        Self(u64::try_from(len).unwrap_or(u64::MAX))
+    }
+}
 
 /// What the reorder loop accumulates per heard (stream, codec class).
 #[derive(Debug)]
@@ -76,11 +106,9 @@ impl RxAcc {
         self.last_transit_ms = Some(transit);
     }
 
-    /// One chunk released in order (deduped): its bytes count.
-    pub(super) fn on_released(&mut self, len: usize) {
-        self.bytes = self
-            .bytes
-            .saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+    /// One chunk released in order (deduped): its payload counts.
+    pub(super) fn on_released(&mut self, payload: ChunkPayload) {
+        self.bytes = self.bytes.saturating_add(payload.0);
     }
 }
 
@@ -504,7 +532,7 @@ mod tests {
             publish.moved(out.len(), before, window.counts());
             for f in &out {
                 if let Some(a) = acc.get_mut(&(f.stream, f.codec_id)) {
-                    a.on_released(f.bytes.len());
+                    a.on_released(ChunkPayload::of_len(f.bytes.len()));
                 }
             }
         };
@@ -527,7 +555,7 @@ mod tests {
         for f in &out {
             acc.get_mut(&(f.stream, f.codec_id))
                 .unwrap()
-                .on_released(f.bytes.len());
+                .on_released(ChunkPayload::of_len(f.bytes.len()));
         }
         assert!(
             publish.deadline().is_some(),
@@ -548,6 +576,23 @@ mod tests {
         let out = window.tick(t3 + Duration::from_secs(5));
         publish.moved(out.len(), before, window.counts());
         assert_eq!(publish.deadline(), None, "an idle call publishes nothing");
+    }
+
+    /// Codex on #1016 — one chunk counts the same bytes sent as received:
+    /// its plaintext payload, both ways (the send side counted its wire
+    /// form before, overhead and trailer included).
+    #[test]
+    fn a_chunk_counts_its_payload_both_ways() {
+        let t = Instant::now();
+        let key = (StreamId([7; 32]), CODEC_OPAQUE);
+        let h = heard(0, t);
+        let payload = ChunkPayload::of_len(h.frame.bytes.len());
+        let mut leg = LegCong::default();
+        leg.note_own_sent(key, payload, t);
+        let mut rx = RxAcc::new("bob", t);
+        rx.on_released(ChunkPayload::of_len(h.frame.bytes.len()));
+        assert_eq!(leg.tx[&key].0, rx.bytes);
+        assert_eq!(rx.bytes, 100, "the plaintext, not the wire form");
     }
 
     /// A skip that releases nothing still marks the publish (the counts

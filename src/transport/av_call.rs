@@ -3547,7 +3547,7 @@ async fn send_own_chunk(
         publisher.dispatcher_mut(),
         &report,
         wire_len,
-        Some((stream, codec_id)),
+        Some((stream, codec_id, legs::ChunkPayload::of_len(plaintext_len))),
     );
     Shared::lock(&shared.alm).on_own_published_on(stream, wire_len, base_or_audio);
     shared.published.fetch_add(1, Ordering::Relaxed);
@@ -4111,7 +4111,7 @@ fn note_leg_outcomes(
     dispatcher: &mut crate::transport::realtime_av_dispatcher::AvDispatcher,
     report: &[(String, LegSend)],
     wire_len: u64,
-    own_sent: Option<(StreamId, u8)>,
+    own_sent: Option<(StreamId, u8, legs::ChunkPayload)>,
 ) {
     let now = Instant::now();
     // leviculum#102 — a datagram carries no delivery proof: what such a leg
@@ -4130,10 +4130,8 @@ fn note_leg_outcomes(
                     alm.on_delivered(wire_len);
                 }
                 // v45.1.7 — the leg's send bytes, per own (stream, class).
-                if let Some(key) = own_sent {
-                    let tx = e.tx.entry(key).or_insert((0, now, now));
-                    tx.0 = tx.0.saturating_add(wire_len);
-                    tx.2 = now;
+                if let Some((stream, class, payload)) = own_sent {
+                    e.note_own_sent((stream, class), payload, now);
                 }
                 e.congested = 0;
                 e.clean = e.clean.saturating_add(1);
@@ -4979,7 +4977,7 @@ async fn reorder_loop(
         rx_pub.moved(released.len(), counts_before, window.counts());
         for f in &released {
             if let Some(a) = rx.get_mut(&(f.stream, f.codec_id)) {
-                a.on_released(f.bytes.len());
+                a.on_released(legs::ChunkPayload::of_len(f.bytes.len()));
             }
         }
         let mut ready = Vec::new();

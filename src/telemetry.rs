@@ -1495,7 +1495,7 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     // live call leg by Eric's decision: owner-session only.
     spec("call_legs", call_legs::CALL_PATH, Gauge, Count, CALL_LEG, "1 per live call leg; `path` direct or relayed, `relay.key_id` (empty unless a member relay carries it), `transport` (datagram or channel), `punched`, `nat.local_type` and `nat.peer_type` (`unknown` on 45.1.x), `direction`. Names rooms and members: owner-session only."),
     spec("call_legs", call_legs::CALL_RTT, Gauge, Milliseconds, CALL_LEG, "The leg link's smoothed RTT, by `direction`."),
-    spec("call_legs", call_legs::CALL_BITRATE, Gauge, BitsPerSecond, CALL_LEG, "Media bits per second on the leg, `direction` send or recv, re-measured at most once a second."),
+    spec("call_legs", call_legs::CALL_BITRATE, Gauge, BitsPerSecond, CALL_LEG, "Media bits per second on the leg, `direction` send or recv: each chunk's plaintext payload both ways (never its wire form), re-measured at most once a second."),
     spec("call_legs", call_legs::CALL_FRAMES_LOST, Counter, Count, CALL_LEG, "Receive rows: frames of a framed stream never received (gaps in `frame_seq`)."),
     spec("call_legs", call_legs::CALL_FRAMES_SKIPPED, Counter, Count, CALL_LEG, "Receive rows: chunks the reorder window gave up waiting for."),
     spec("call_legs", call_legs::CALL_JITTER, Gauge, Milliseconds, CALL_LEG, "Receive rows: RFC 3550 interarrival jitter against the signed source timestamp."),

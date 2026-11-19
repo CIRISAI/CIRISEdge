@@ -74,7 +74,7 @@ and `ciris.media.kind` (`audio`, `video` or `share`):
 |---|---|---|---|
 | `ciris.edge.call.path` | gauge (1) | 1 | `path` (`direct`, `relayed`), `relay.key_id` (empty unless a member relay forwards it), `transport` (`datagram`, `channel`), `punched`, `nat.local_type`, `nat.peer_type` (`unknown` on 45.1.x), `direction` |
 | `ciris.edge.call.rtt` | gauge | ms | `direction` |
-| `ciris.edge.call.bitrate` | gauge | bit/s | `direction` (`send`, `recv`) |
+| `ciris.edge.call.bitrate` | gauge | bit/s | `direction` (`send`, `recv`); counts each chunk's plaintext payload both ways, never the wire form |
 | `ciris.edge.call.frames_lost` | counter | {frame} | receive rows only |
 | `ciris.edge.call.frames_skipped` | counter | {chunk} | receive rows only |
 | `ciris.edge.call.jitter` | gauge | ms | receive rows only |
