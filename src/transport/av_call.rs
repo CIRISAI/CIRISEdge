@@ -4927,12 +4927,12 @@ async fn reorder_loop(
     // v45.1.7 — the per-leg receive side, kept here (no lock per chunk) and
     // published once a second.
     let mut rx: HashMap<(StreamId, u8), legs::RxAcc> = HashMap::new();
-    let mut rx_published = Instant::now();
-    // Something heard since the last publish: the loop wakes to publish it
-    // even when nothing else arrives.
-    let mut rx_dirty = false;
+    // Something heard, released or skipped since the last publish: the loop
+    // wakes to publish it even when nothing else arrives.
+    let mut rx_pub = legs::RxPublish::new(Instant::now());
     loop {
-        let publish_at = rx_dirty.then(|| rx_published + legs::RX_PUBLISH_EVERY);
+        let publish_at = rx_pub.deadline();
+        let counts_before = window.counts();
         let next = [
             window.next_deadline(),
             gate.next_deadline(FRAMING_HOLD),
@@ -4947,7 +4947,7 @@ async fn reorder_loop(
                     h = heard.recv() => match h {
                         Some(h) => {
                             legs::note_arrival(&mut rx, &h);
-                            rx_dirty = true;
+                            rx_pub.heard();
                             window.push(h.frame, h.at)
                         }
                         None => return,
@@ -4960,7 +4960,7 @@ async fn reorder_loop(
             None => match heard.recv().await {
                 Some(h) => {
                     legs::note_arrival(&mut rx, &h);
-                    rx_dirty = true;
+                    rx_pub.heard();
                     window.push(h.frame, h.at)
                 }
                 None => return,
@@ -4976,6 +4976,7 @@ async fn reorder_loop(
             }
         }
         let now = Instant::now();
+        rx_pub.moved(released.len(), counts_before, window.counts());
         for f in &released {
             if let Some(a) = rx.get_mut(&(f.stream, f.codec_id)) {
                 a.on_released(f.bytes.len());
@@ -4987,6 +4988,11 @@ async fn reorder_loop(
             ready.extend(gate.admit(f, st, now));
         }
         let (late, unknown) = gate.tick(now, FRAMING_HOLD, framing_state);
+        rx_pub.moved(
+            late.len() + usize::try_from(unknown).unwrap_or(usize::MAX),
+            counts_before,
+            counts_before,
+        );
         ready.extend(late);
         for _ in 0..unknown {
             dropped += 1;
@@ -5012,9 +5018,7 @@ async fn reorder_loop(
             drop(c);
             *Shared::lock(&shared.frames_lost) = frames_of.lost_by_layer();
         }
-        if rx_dirty && now.saturating_duration_since(rx_published) >= legs::RX_PUBLISH_EVERY {
-            rx_published = now;
-            rx_dirty = false;
+        if rx_pub.take_due(now) {
             legs::publish_rx(&shared, &mut rx, &mut window, &frames_of, now);
         }
         for f in whole {

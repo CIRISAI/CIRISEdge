@@ -109,6 +109,62 @@ pub(super) struct RxLeg {
     depth: u64,
 }
 
+/// When the reorder loop publishes: at most once per [`RX_PUBLISH_EVERY`],
+/// and only when something moved since the last publish. Moved is a chunk
+/// heard, a chunk released (by an arrival or a deadline), a skip, a frame the
+/// framing gate let go or dropped. An idle call publishes nothing; a deadline
+/// that releases or skips buffered chunks after the last arrival still does
+/// (Codex on #1016: before, only arrivals counted, so a timeout's release or
+/// skip stayed unpublished until the next packet).
+#[derive(Debug)]
+pub(super) struct RxPublish {
+    dirty: bool,
+    at: Instant,
+}
+
+impl RxPublish {
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            dirty: false,
+            at: now,
+        }
+    }
+
+    /// When the loop must wake to publish, if anything waits.
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.dirty.then(|| self.at + RX_PUBLISH_EVERY)
+    }
+
+    /// A chunk arrived.
+    pub(super) fn heard(&mut self) {
+        self.dirty = true;
+    }
+
+    /// One turn released `released` chunks (or let go / dropped that many
+    /// frames at the framing gate) and moved the window's counts from
+    /// `before` to `after` (a skip may release nothing).
+    pub(super) fn moved(
+        &mut self,
+        released: usize,
+        before: super::ReorderCounts,
+        after: super::ReorderCounts,
+    ) {
+        if released > 0 || before != after {
+            self.dirty = true;
+        }
+    }
+
+    /// Whether to publish now; if so, the clock restarts.
+    pub(super) fn take_due(&mut self, now: Instant) -> bool {
+        if self.dirty && now.saturating_duration_since(self.at) >= RX_PUBLISH_EVERY {
+            self.dirty = false;
+            self.at = now;
+            return true;
+        }
+        false
+    }
+}
+
 /// The reorder loop's per-second publish: `acc` with the window's and the
 /// reassembly's per-stream counts. Streams unheard for [`LEG_STALE_AFTER`]
 /// are dropped from `acc` too.
@@ -119,14 +175,23 @@ pub(super) fn publish_rx(
     frames: &super::frame::Reassemblers,
     now: Instant,
 ) {
+    *Shared::lock(&shared.rx_legs) = rx_rows(acc, window, frames, now);
+}
+
+/// [`publish_rx`]'s rows.
+pub(super) fn rx_rows(
+    acc: &mut HashMap<(StreamId, u8), RxAcc>,
+    window: &mut super::ReorderWindow,
+    frames: &super::frame::Reassemblers,
+    now: Instant,
+) -> HashMap<(StreamId, u8), RxLeg> {
     acc.retain(|_, a| now.saturating_duration_since(a.last) < LEG_STALE_AFTER);
     let stats: HashMap<StreamId, (BTreeMap<u8, u64>, usize)> = window
         .take_stream_stats()
         .into_iter()
         .map(|(s, k, d)| (s, (k, d)))
         .collect();
-    let out: HashMap<(StreamId, u8), RxLeg> = acc
-        .iter()
+    acc.iter()
         .map(|(&(stream, class), a)| {
             let (skipped, depth) = stats
                 .get(&stream)
@@ -145,8 +210,7 @@ pub(super) fn publish_rx(
                 },
             )
         })
-        .collect();
-    *Shared::lock(&shared.rx_legs) = out;
+        .collect()
 }
 
 /// The codec a row names: the binding's registered token for the class when
@@ -391,5 +455,113 @@ impl CallLegSource for Shared {
             Shared::lock(&self.share_streams).retain(|s| !dead.contains(s));
         }
         rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::realtime_av::{ChunkLayer, ChunkSeq, Epoch};
+
+    fn heard(seq: u64, at: Instant) -> super::super::Heard {
+        super::super::Heard {
+            frame: super::super::ReceivedFrame {
+                publisher: "bob".to_owned(),
+                stream: StreamId([7; 32]),
+                epoch: Epoch(1),
+                chunk_seq: ChunkSeq(seq),
+                codec_id: CODEC_OPAQUE,
+                layer: ChunkLayer::BASE,
+                bytes: vec![0; 100],
+                frame_seq: None,
+                source_ts_ms: 1_000 + seq * 20,
+            },
+            at,
+        }
+    }
+
+    /// Codex on #1016 — a deadline that skips a missing chunk and releases
+    /// the one buffered behind it, after the last arrival was published,
+    /// publishes again: the row shows the skip and the released bytes. Red
+    /// before: only arrivals marked the receive side for a publish, so the
+    /// skip waited for a next packet that never came.
+    #[test]
+    fn a_skip_at_a_deadline_after_the_last_arrival_is_published() {
+        let t0 = Instant::now();
+        let mut window = super::super::ReorderWindow::new();
+        let frames = super::super::frame::Reassemblers::default();
+        let mut acc = HashMap::new();
+        let mut publish = RxPublish::new(t0);
+        let mut turn = |h: super::super::Heard,
+                        window: &mut super::super::ReorderWindow,
+                        acc: &mut HashMap<(StreamId, u8), RxAcc>,
+                        publish: &mut RxPublish| {
+            let before = window.counts();
+            note_arrival(acc, &h);
+            publish.heard();
+            let at = h.at;
+            let out = window.push(h.frame, at);
+            publish.moved(out.len(), before, window.counts());
+            for f in &out {
+                if let Some(a) = acc.get_mut(&(f.stream, f.codec_id)) {
+                    a.on_released(f.bytes.len());
+                }
+            }
+        };
+        // 0 is released; 2 waits for 1, which never comes.
+        turn(heard(0, t0), &mut window, &mut acc, &mut publish);
+        turn(heard(2, t0), &mut window, &mut acc, &mut publish);
+        let t1 = t0 + RX_PUBLISH_EVERY;
+        assert!(publish.take_due(t1), "the arrivals are published");
+        let rows = rx_rows(&mut acc, &mut window, &frames, t1);
+        let row = &rows[&(StreamId([7; 32]), CODEC_OPAQUE)];
+        assert_eq!((row.skipped, row.bytes), (0, 100), "2 still waits");
+        assert_eq!(publish.deadline(), None, "nothing waits to publish");
+
+        // No more arrivals. The deadline skips 1 and releases 2.
+        let t2 = t1 + super::super::REORDER_WINDOW_MAX;
+        let before = window.counts();
+        let out = window.tick(t2);
+        assert_eq!(out.len(), 1, "2 is released at its deadline");
+        publish.moved(out.len(), before, window.counts());
+        for f in &out {
+            acc.get_mut(&(f.stream, f.codec_id))
+                .unwrap()
+                .on_released(f.bytes.len());
+        }
+        assert!(
+            publish.deadline().is_some(),
+            "the release wakes the loop to publish it"
+        );
+        let t3 = t2 + RX_PUBLISH_EVERY;
+        assert!(publish.take_due(t3));
+        let rows = rx_rows(&mut acc, &mut window, &frames, t3);
+        let row = &rows[&(StreamId([7; 32]), CODEC_OPAQUE)];
+        assert_eq!(
+            (row.skipped, row.bytes),
+            (1, 200),
+            "the skip and the release"
+        );
+
+        // Idle: nothing moved, nothing to publish.
+        let before = window.counts();
+        let out = window.tick(t3 + Duration::from_secs(5));
+        publish.moved(out.len(), before, window.counts());
+        assert_eq!(publish.deadline(), None, "an idle call publishes nothing");
+    }
+
+    /// A skip that releases nothing still marks the publish (the counts
+    /// moved).
+    #[test]
+    fn a_skip_that_releases_nothing_still_counts_as_moved() {
+        let t = Instant::now();
+        let mut p = RxPublish::new(t);
+        let before = super::super::ReorderCounts::default();
+        let after = super::super::ReorderCounts {
+            skipped: 1,
+            ..before
+        };
+        p.moved(0, before, after);
+        assert!(p.deadline().is_some());
     }
 }
