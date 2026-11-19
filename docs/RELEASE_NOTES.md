@@ -23,6 +23,10 @@ CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. No migration. Detail in CHANGELO
 - **Three `call_legs` corrections from review:** a link forwarded through a punched transport
   peer reads `relayed`; a release or skip at a reorder deadline is published without waiting for
   another packet; send and receive bitrate both count the chunk's plaintext payload.
+- **Five more from review:** a revised thread root keeps its replies in one thread; a reaction
+  counts only on a message of this room (on its current form); a member-chosen timestamp can no
+  longer overflow the jitter maths; a churned stream's loss count is freed; a share's rows name
+  its codec.
 - **persist v61.4.2:** the capsule proxy routes 34 directory methods it used to refuse, among them
   `list_live_consent_grants_by`. Wire-compatible; ABI 13.
 - **Witnessed:** red with each fix undone, green here.

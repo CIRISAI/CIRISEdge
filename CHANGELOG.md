@@ -102,6 +102,19 @@ rows and shows a reply as a plain message.
   publish on any release, skip or framing-gate move; an idle call publishes nothing.
 - **`ciris.edge.call.bitrate` counts one layer both ways** (Codex on #1016): each chunk's
   plaintext payload. The send side counted the wire form (overhead and trailer included).
+- **A publisher's source stamp cannot overflow the jitter transit** (Codex on #1016). The
+  transit took `source_ts_ms as i64`, a member-chosen `u64`: at or above 2^63 the subtraction
+  overflowed (a panic that ended the reorder task under overflow checks). It is taken in `i128`,
+  and a step past 60 s re-anchors instead of counting as jitter.
+- **Forgetting a stream drops its per-stream loss** (Codex on #1016): `Reassemblers::forget`
+  left a churned stream's `lost_by_stream` entry for the call's life.
+- **A share's send rows name its registered codec** (Codex on #1016); they read the class token.
+- **A revised thread root keeps its thread** (Codex on #1016). The room fold reports what it
+  folded each id under, and `messages_in_room` files a reply naming any older form of its root
+  (before a revision, or its `self` row) under the root as it stands.
+- **A reaction counts only on a message of this room** (Codex on #1016). `reactions_for` with no
+  targets returned a signed reaction naming a foreign-room or unknown id; one on an older form
+  of a message now counts on, and reports, the message's head.
 
 ### Privacy
 
