@@ -407,3 +407,61 @@ pub async fn node_signed_occurrence(
         },
     }
 }
+
+/// v45.1.7 — the value of `key` on one per-leg call series.
+pub fn call_leg_attr<'a>(
+    s: &'a ciris_edge::telemetry::call_legs::CallLegSeries,
+    key: &str,
+) -> Option<&'a str> {
+    s.attributes
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// v45.1.7 — every series is a known instrument with the five common
+/// attributes, and no attribute value is an IP or a socket address.
+pub fn assert_call_legs_well_formed(series: &[ciris_edge::telemetry::call_legs::CallLegSeries]) {
+    use ciris_edge::telemetry::call_legs::{CALL_LEG_COMMON_ATTRIBUTES, CALL_LEG_INSTRUMENTS};
+    for s in series {
+        assert!(
+            CALL_LEG_INSTRUMENTS.iter().any(|(n, ..)| *n == s.name),
+            "{} is an instrument",
+            s.name
+        );
+        for key in CALL_LEG_COMMON_ATTRIBUTES {
+            let v = call_leg_attr(s, key).unwrap_or_else(|| panic!("{} lacks {key}", s.name));
+            assert!(!v.is_empty(), "{} has an empty {key}", s.name);
+        }
+        for (k, v) in &s.attributes {
+            assert!(
+                v.parse::<std::net::IpAddr>().is_err()
+                    && v.parse::<std::net::SocketAddr>().is_err(),
+                "{}: {k} = {v} is an address",
+                s.name
+            );
+            assert!(
+                !v.contains("127.0.0.1") && !v.contains("::1"),
+                "{}: {k} = {v} carries an address",
+                s.name
+            );
+        }
+    }
+}
+
+/// v45.1.7 — the series of `name` for `member`'s leg, one `direction`.
+pub fn call_leg_series<'a>(
+    series: &'a [ciris_edge::telemetry::call_legs::CallLegSeries],
+    name: &str,
+    member: &str,
+    direction: &str,
+) -> Vec<&'a ciris_edge::telemetry::call_legs::CallLegSeries> {
+    series
+        .iter()
+        .filter(|s| {
+            s.name == name
+                && call_leg_attr(s, "ciris.call.member") == Some(member)
+                && (call_leg_attr(s, "direction").is_none_or(|d| d == direction))
+        })
+        .collect()
+}

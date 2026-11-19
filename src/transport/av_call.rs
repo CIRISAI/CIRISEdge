@@ -124,6 +124,8 @@ use crate::transport::reticulum::ReticulumTransport;
 mod alm;
 #[path = "av_call/frame.rs"]
 pub mod frame;
+#[path = "av_call/legs.rs"]
+mod legs;
 pub use alm::{AlmCounts, AlmParents};
 
 /// ALM C5 — media older than this in the inbound queue is dropped by age
@@ -1250,6 +1252,11 @@ struct StreamWindow {
     /// When each recently released key was first seen (for the gap).
     released_at: VecDeque<((u64, u64), Instant)>,
     gap_ewma: Duration,
+    /// v45.1.7 — chunks skipped, by the codec class of the chunk released
+    /// after the gap (a missing chunk's own class is unknown).
+    skipped_by_class: BTreeMap<u8, u64>,
+    /// v45.1.7 — the most chunks held since the stats were last taken.
+    depth_max: usize,
 }
 
 impl StreamWindow {
@@ -1260,6 +1267,8 @@ impl StreamWindow {
             buf: BTreeMap::new(),
             released_at: VecDeque::new(),
             gap_ewma: REORDER_GAP_PRIOR,
+            skipped_by_class: BTreeMap::new(),
+            depth_max: 0,
         }
     }
 
@@ -1351,7 +1360,21 @@ impl ReorderWindow {
             return Vec::new();
         }
         w.buf.insert(key, (now, frame));
+        w.depth_max = w.depth_max.max(w.buf.len());
         self.drain(stream, now)
+    }
+
+    /// v45.1.7 — per stream: chunks skipped so far by codec class (see
+    /// [`StreamWindow`]), and the most chunks held since the last take (reset
+    /// to the depth now).
+    pub fn take_stream_stats(&mut self) -> Vec<(StreamId, BTreeMap<u8, u64>, usize)> {
+        self.streams
+            .iter_mut()
+            .map(|(s, w)| {
+                let depth = std::mem::replace(&mut w.depth_max, w.buf.len());
+                (*s, w.skipped_by_class.clone(), depth)
+            })
+            .collect()
     }
 
     /// Release what is in order for `stream`, and skip a missing chunk whose
@@ -1377,6 +1400,8 @@ impl ReorderWindow {
                 };
                 if w.started {
                     self.counts.skipped += skipped;
+                    let class = w.buf.get(&head).map_or(0, |(_, f)| f.codec_id);
+                    *w.skipped_by_class.entry(class).or_insert(0) += skipped;
                 }
                 w.next = Some(head);
                 continue;
@@ -1710,7 +1735,15 @@ struct Shared {
     leg_ttl: StdMutex<HashMap<String, Arc<crate::transport::realtime_av_runtime::MediaTtl>>>,
     /// ALM C5 — each out-leg's congestion streaks and whether it is shed to
     /// the base layer: `(congested, clean, shed)`.
-    leg_cong: StdMutex<HashMap<String, (u32, u32, bool)>>,
+    /// v45.1.7 — and what this node sent on it per own (stream, class).
+    leg_cong: StdMutex<HashMap<String, legs::LegCong>>,
+    /// v45.1.7 — the receive side per (stream, class), as the reorder loop
+    /// last published it.
+    rx_legs: StdMutex<HashMap<(StreamId, u8), legs::RxLeg>>,
+    /// v45.1.7 — the other members' streams their bindings call shares.
+    share_streams: StdMutex<std::collections::HashSet<StreamId>>,
+    /// v45.1.7 — each row's last rate measure.
+    leg_rates: StdMutex<HashMap<legs::RateKey, legs::RateMemo>>,
     /// ALM C5 — the oldest frame age seen in the inbound queues this window
     /// (ms), for the ladder's `edge:av_queue_age` signal.
     queue_age_ms: AtomicU64,
@@ -2166,6 +2199,9 @@ impl Call {
             in_senders: StdMutex::new(HashMap::new()),
             leg_ttl: StdMutex::new(HashMap::new()),
             leg_cong: StdMutex::new(HashMap::new()),
+            rx_legs: StdMutex::new(HashMap::new()),
+            share_streams: StdMutex::new(std::collections::HashSet::new()),
+            leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
             load,
             setup_began: std::time::Instant::now(),
@@ -2183,6 +2219,9 @@ impl Call {
         }
         if let Some(m) = &shared.metrics {
             m.telemetry.call_began();
+            // v45.1.7 — its legs report while it lives.
+            let source: Arc<dyn crate::telemetry::call_legs::CallLegSource> = shared.clone();
+            m.telemetry.call_legs.register(Arc::downgrade(&source));
         }
         tracing::info!(
             room = %room,
@@ -3503,7 +3542,13 @@ async fn send_own_chunk(
         .relay_inner_report(inner, &exclude)
         .await
         .map_err(|e| CallError::Plumbing(e.to_string()))?;
-    note_leg_outcomes(shared, publisher.dispatcher_mut(), &report, wire_len);
+    note_leg_outcomes(
+        shared,
+        publisher.dispatcher_mut(),
+        &report,
+        wire_len,
+        Some((stream, codec_id)),
+    );
     Shared::lock(&shared.alm).on_own_published_on(stream, wire_len, base_or_audio);
     shared.published.fetch_add(1, Ordering::Relaxed);
     Ok(report
@@ -4066,7 +4111,9 @@ fn note_leg_outcomes(
     dispatcher: &mut crate::transport::realtime_av_dispatcher::AvDispatcher,
     report: &[(String, LegSend)],
     wire_len: u64,
+    own_sent: Option<(StreamId, u8)>,
 ) {
+    let now = Instant::now();
     // leviculum#102 — a datagram carries no delivery proof: what such a leg
     // accepted is all the uplink meter can know it delivered.
     // Lock order: `leg_ttl`, then `alm`, then `leg_cong` (nothing takes
@@ -4075,17 +4122,23 @@ fn note_leg_outcomes(
     let mut alm = Shared::lock(&shared.alm);
     let mut cong = Shared::lock(&shared.leg_cong);
     for (peer, leg) in report {
-        let e = cong.entry(peer.clone()).or_insert((0, 0, false));
+        let e = cong.entry(peer.clone()).or_default();
         match leg {
             LegSend::Sent => {
                 alm.on_sent(peer, wire_len);
                 if ttl.get(peer).is_some_and(|t| t.uses_datagrams()) {
                     alm.on_delivered(wire_len);
                 }
-                e.0 = 0;
-                e.1 = e.1.saturating_add(1);
-                if e.2 && e.1 >= LEG_RESTORE_AFTER {
-                    e.2 = false;
+                // v45.1.7 — the leg's send bytes, per own (stream, class).
+                if let Some(key) = own_sent {
+                    let tx = e.tx.entry(key).or_insert((0, now, now));
+                    tx.0 = tx.0.saturating_add(wire_len);
+                    tx.2 = now;
+                }
+                e.congested = 0;
+                e.clean = e.clean.saturating_add(1);
+                if e.shed && e.clean >= LEG_RESTORE_AFTER {
+                    e.shed = false;
                     let host = Shared::lock(&shared.policies)
                         .get(peer)
                         .copied()
@@ -4097,10 +4150,10 @@ fn note_leg_outcomes(
             LegSend::Failed(AvDispatcherError::Congested) => {
                 shared.count(crate::observability::AV_CHUNK_DROPPED_CONGESTED);
                 alm.on_dropped(wire_len);
-                e.1 = 0;
-                e.0 = e.0.saturating_add(1);
-                if !e.2 && e.0 >= LEG_SHED_AFTER {
-                    e.2 = true;
+                e.clean = 0;
+                e.congested = e.congested.saturating_add(1);
+                if !e.shed && e.congested >= LEG_SHED_AFTER {
+                    e.shed = true;
                     dispatcher.set_layer_policy(peer, ReceiverLayerPolicy::BLINKING_DOT);
                     alm.counts.legs_shed_to_base += 1;
                     shared.count(crate::observability::AV_LEG_SHED_TO_BASE);
@@ -4797,7 +4850,7 @@ async fn forward(
         .relay_inner_report(inner, &exclude)
         .await
     {
-        note_leg_outcomes(shared, publisher.dispatcher_mut(), &report, wire_len);
+        note_leg_outcomes(shared, publisher.dispatcher_mut(), &report, wire_len, None);
         let sent = report
             .iter()
             .filter(|(_, leg)| matches!(leg, LegSend::Sent))
@@ -4870,16 +4923,32 @@ async fn reorder_loop(
     let mut gate = frame::FramingGate::default();
     let framing_state =
         |f: &ReceivedFrame| framing_state_of(&shared, f.stream, f.epoch, &f.publisher);
+    // v45.1.7 — the per-leg receive side, kept here (no lock per chunk) and
+    // published once a second.
+    let mut rx: HashMap<(StreamId, u8), legs::RxAcc> = HashMap::new();
+    let mut rx_published = Instant::now();
+    // Something heard since the last publish: the loop wakes to publish it
+    // even when nothing else arrives.
+    let mut rx_dirty = false;
     loop {
-        let next = match (window.next_deadline(), gate.next_deadline(FRAMING_HOLD)) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let publish_at = rx_dirty.then(|| rx_published + legs::RX_PUBLISH_EVERY);
+        let next = [
+            window.next_deadline(),
+            gate.next_deadline(FRAMING_HOLD),
+            publish_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let released = match next {
             Some(deadline) => {
                 tokio::select! {
                     h = heard.recv() => match h {
-                        Some(h) => window.push(h.frame, h.at),
+                        Some(h) => {
+                            legs::note_arrival(&mut rx, &h);
+                            rx_dirty = true;
+                            window.push(h.frame, h.at)
+                        }
                         None => return,
                     },
                     () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
@@ -4888,7 +4957,11 @@ async fn reorder_loop(
                 }
             }
             None => match heard.recv().await {
-                Some(h) => window.push(h.frame, h.at),
+                Some(h) => {
+                    legs::note_arrival(&mut rx, &h);
+                    rx_dirty = true;
+                    window.push(h.frame, h.at)
+                }
                 None => return,
             },
         };
@@ -4902,6 +4975,11 @@ async fn reorder_loop(
             }
         }
         let now = Instant::now();
+        for f in &released {
+            if let Some(a) = rx.get_mut(&(f.stream, f.codec_id)) {
+                a.on_released(f.bytes.len());
+            }
+        }
         let mut ready = Vec::new();
         for f in released {
             let st = framing_state(&f);
@@ -4932,6 +5010,11 @@ async fn reorder_loop(
             c.frames_open = u64::try_from(frames_of.open()).unwrap_or(u64::MAX);
             drop(c);
             *Shared::lock(&shared.frames_lost) = frames_of.lost_by_layer();
+        }
+        if rx_dirty && now.saturating_duration_since(rx_published) >= legs::RX_PUBLISH_EVERY {
+            rx_published = now;
+            rx_dirty = false;
+            legs::publish_rx(&shared, &mut rx, &mut window, &frames_of, now);
         }
         for f in whole {
             if frames.send(f).await.is_err() {
@@ -5074,6 +5157,9 @@ async fn apply_pending_replace(shared: &Arc<Shared>, force: bool) -> Result<(), 
 /// [`Attendance::on_bound`]), its events emitted. Another attendee's signed
 /// end waits for its verdict ([`settle_ends`]).
 fn on_bound(shared: &Arc<Shared>, b: &StreamKeyBinding) {
+    if b.kind == crate::transport::av_chunk_auth::STREAM_KIND_SHARE && b.publisher != shared.own {
+        Shared::lock(&shared.share_streams).insert(b.stream);
+    }
     if b.end.is_some() && b.publisher != shared.own {
         Shared::lock(&shared.attendance).defer_end(b, Instant::now());
         return;

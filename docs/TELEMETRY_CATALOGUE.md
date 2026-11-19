@@ -54,6 +54,34 @@ one peer's series, so the window is dropped, not carried, and
 - `ShapingStatus.links` and `.peers`, `load_ledger.transit[]`, the C7 tail and
   referral peers are not in the bundle. They name who talks to whom.
 
+## Per-leg call series (v45.1.7)
+
+`call_legs` is the one field that names rooms and members, by decision: the
+call screen's "?" panel needs to say which leg is slow and why. It is bounded
+three ways. It is operator-only. It is live only: rows are read from each live
+call's state when the bundle is read, so a leg's series are gone in the first
+snapshot after the leg or its call ends. It is capped at 64 rows (a member, a
+stream and a media kind each), with `call_legs_overflow` counting the rest.
+No address, IP or port is ever an attribute. Every series carries
+`ciris.room.id`, `ciris.call.id`, `ciris.call.member`, `ciris.call.stream_id`
+and `ciris.media.kind` (`audio`, `video` or `share`):
+
+| Instrument | Kind | Unit | Own attributes |
+|---|---|---|---|
+| `ciris.edge.call.path` | gauge (1) | 1 | `path` (`direct`, `relayed`), `relay.key_id` (empty unless a member relay forwards it), `transport` (`datagram`, `channel`), `punched`, `nat.local_type`, `nat.peer_type` (`unknown` on 45.1.x), `direction` |
+| `ciris.edge.call.rtt` | gauge | ms | `direction` |
+| `ciris.edge.call.bitrate` | gauge | bit/s | `direction` (`send`, `recv`) |
+| `ciris.edge.call.frames_lost` | counter | {frame} | receive rows only |
+| `ciris.edge.call.frames_skipped` | counter | {chunk} | receive rows only |
+| `ciris.edge.call.jitter` | gauge | ms | receive rows only |
+| `ciris.edge.call.reorder_window` | gauge | {chunk} | receive rows only |
+| `ciris.edge.call.codec` | gauge (1) | 1 | `codec`, `direction` |
+
+A send row is this node's own stream to one member's leg. A receive row is
+one member's stream as it reaches this node: `relayed` with `relay.key_id`
+when a member relay is its ALM primary parent, and `relayed` with an empty
+key when a transport forwarder carries the link.
+
 Log lines that name peers or rooms stay local: `edge.alm.decision` at DEBUG,
 referral lines, `direct link` lines, `room` in `CALL JOINED` and `CALL LEFT`. The
 `shaped frame sent` TRACE line must never be enabled in production.
@@ -376,4 +404,6 @@ server-composed node) counted into neither.
 | `group_backfill_completed_total` | `ciris.edge.group_backfill.completed` | counter | count | operator-only |
 | `apply_refusals` | `ciris.edge.apply_refusals` | counter | count | operator-only |
 | `loop_last_progress_age_seconds` | `ciris.edge.loop.last_progress_age` | gauge | seconds | operator-only |
+| `call_legs` | `ciris.edge.call.legs` | gauge | count | operator-only |
+| `call_legs_overflow` | `ciris.edge.call.legs_overflow` | gauge | count | operator-only |
 | `node_alive` | `ciris.edge.node.alive` | gauge | count | public-safe |

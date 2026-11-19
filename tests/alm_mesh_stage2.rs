@@ -49,12 +49,15 @@ use ciris_edge::mls::cohort_group::mint_cohort_key_material;
 use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
 use ciris_edge::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
+use ciris_edge::telemetry::call_legs::{CALL_BITRATE, CALL_LEG_INSTRUMENTS, CALL_PATH};
 use ciris_edge::transport::av_call::{
     Call, CallDeps, CallEvent, CallOptions, Frame, ReceivedFrame, RoomRoster, REANNOUNCE_PART_GAP,
 };
 use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{AvKeepTarget, StreamDekRegistrar};
-use ciris_edge::transport::realtime_av::{ChunkLayer, ReceiverLayerPolicy, CODEC_AV1_SVC};
+use ciris_edge::transport::realtime_av::{
+    stream_label, ChunkLayer, ReceiverLayerPolicy, CODEC_AV1_SVC,
+};
 use ciris_edge::transport::realtime_av_alm::controller::wire::encode;
 use ciris_edge::transport::realtime_av_alm::controller::{
     ControlMsg, DecisionKind, Offer, Role, SubscribeRequest,
@@ -721,6 +724,82 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
     assert_eq!(live.alm_active_calls, 1);
     assert!(live.alm_c3_peers >= 1, "C knows A speaks C3");
     assert_eq!(live.call_setup_duration_seconds["first_frame"].count, 1);
+    // v45.1.7 — the receive side is published once a second: wait for the
+    // rows B's stretch made, then read them.
+    let rated = |n: &Node, member: &str, direction: &str| {
+        common::call_leg_series(
+            &n.metrics.snapshot().call_legs,
+            CALL_BITRATE,
+            member,
+            direction,
+        )
+        .first()
+        .is_some_and(|s| s.value > 0.0)
+    };
+    // Media flows while the rows are read: a rate falls to 0 a second after
+    // its media stops, as it should.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let rows_came = loop {
+        let _ = cb.publish(Frame::opaque(body("b", seq))).await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if rated(c, &b.key.key_id, "recv")
+            && rated(a, &b.key.key_id, "recv")
+            && rated(b, &a.key.key_id, "send")
+        {
+            break true;
+        }
+        if tokio::time::Instant::now() > deadline {
+            break false;
+        }
+    };
+    assert!(
+        rows_came,
+        "the leg rows come: C {:?}\nA {:?}\nB {:?}",
+        c.metrics.snapshot().call_legs,
+        a.metrics.snapshot().call_legs,
+        b.metrics.snapshot().call_legs
+    );
+    call_legs_name_the_relay(&c.metrics.snapshot(), a, b, c, &cb);
+    let at_a = a.metrics.snapshot();
+    let at_b = b.metrics.snapshot();
+    for (snap, who) in [(&at_a, "A"), (&at_b, "B")] {
+        common::assert_call_legs_well_formed(&snap.call_legs);
+        assert_eq!(snap.call_legs_overflow, 0, "{who}");
+    }
+    // A hears B first-hand on B's own link: direct, one TCP hop, no punch.
+    for name in CALL_LEG_INSTRUMENTS.iter().map(|(n, ..)| *n) {
+        assert_eq!(
+            common::call_leg_series(&at_a.call_legs, name, &b.key.key_id, "recv").len(),
+            1,
+            "A's receive row for B carries {name}: {:?}",
+            at_a.call_legs
+        );
+    }
+    let path = common::call_leg_series(&at_a.call_legs, CALL_PATH, &b.key.key_id, "recv")[0];
+    assert_eq!(
+        common::call_leg_attr(path, "path"),
+        Some("direct"),
+        "{path:?}"
+    );
+    assert_eq!(
+        common::call_leg_attr(path, "relay.key_id"),
+        Some(""),
+        "{path:?}"
+    );
+    assert_eq!(
+        common::call_leg_attr(path, "punched"),
+        Some("false"),
+        "{path:?}"
+    );
+    // B's own stream on its one leg, to A: a send row with a rate.
+    let sent = common::call_leg_series(&at_b.call_legs, CALL_BITRATE, &a.key.key_id, "send");
+    assert_eq!(sent.len(), 1, "{:?}", at_b.call_legs);
+    assert!(sent[0].value > 0.0, "B sent media to A: {:?}", sent[0]);
+    assert_eq!(
+        common::call_leg_attr(sent[0], "ciris.call.stream_id"),
+        Some(stream_label(cb.stream()).as_str())
+    );
     drop(cc);
     let ended = c.metrics.snapshot();
     assert_eq!(ended.alm_active_calls, 0, "a dropped call ends too");
@@ -728,6 +807,70 @@ async fn a_member_unreachable_directly_is_heard_through_a_roster_relay() {
     assert_eq!(
         ended.call_setup_duration_seconds["ended"].count, 0,
         "its setup was already over"
+    );
+    assert!(
+        ended.call_legs.is_empty(),
+        "a call's leg series go with it: {:?}",
+        ended.call_legs
+    );
+    drop(cb);
+    drop(ca);
+    for n in [a, b] {
+        assert!(
+            n.metrics.snapshot().call_legs.is_empty(),
+            "no call, no legs"
+        );
+    }
+}
+
+/// v45.1.7 — C hears B only through A: every instrument on C's receive row
+/// for B's stream, `relayed`, naming A as the relay.
+fn call_legs_name_the_relay(
+    live: &ciris_edge::observability::EdgeMetricsBundle,
+    a: &Node,
+    b: &Node,
+    c: &Node,
+    cb: &Call,
+) {
+    common::assert_call_legs_well_formed(&live.call_legs);
+    assert_eq!(live.call_legs_overflow, 0);
+    for name in CALL_LEG_INSTRUMENTS.iter().map(|(n, ..)| *n) {
+        let rows = common::call_leg_series(&live.call_legs, name, &b.key.key_id, "recv");
+        assert_eq!(
+            rows.len(),
+            1,
+            "C's row for B carries {name}: {:?}",
+            live.call_legs
+        );
+        let s = rows[0];
+        assert_eq!(
+            common::call_leg_attr(s, "ciris.call.stream_id"),
+            Some(stream_label(cb.stream()).as_str())
+        );
+        assert_eq!(common::call_leg_attr(s, "ciris.media.kind"), Some("audio"));
+        assert_eq!(common::call_leg_attr(s, "ciris.room.id"), Some(cb.room()));
+    }
+    let path = common::call_leg_series(&live.call_legs, CALL_PATH, &b.key.key_id, "recv")[0];
+    assert_eq!(
+        common::call_leg_attr(path, "path"),
+        Some("relayed"),
+        "{path:?}"
+    );
+    assert_eq!(
+        common::call_leg_attr(path, "relay.key_id"),
+        Some(a.key.key_id.as_str()),
+        "the relay is A: {path:?}"
+    );
+    assert_eq!(common::call_leg_attr(path, "punched"), Some("false"));
+    assert_eq!(
+        common::call_leg_attr(path, "nat.local_type"),
+        Some("unknown")
+    );
+    let rate = common::call_leg_series(&live.call_legs, CALL_BITRATE, &b.key.key_id, "recv")[0];
+    assert!(rate.value > 0.0, "C heard B's media: {rate:?}");
+    assert!(
+        common::call_leg_series(&live.call_legs, CALL_PATH, &c.key.key_id, "recv").is_empty(),
+        "no row for C itself"
     );
 }
 

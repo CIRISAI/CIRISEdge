@@ -24,7 +24,8 @@
 //!   series, so the window is dropped and counted as withheld.
 //! - **No peer in a label.** No field names a peer, a link or a room, with the
 //!   two old exceptions the catalogue marks [`LabelValues::PeerKeyed`], and both
-//!   are operator-only.
+//!   are operator-only. v45.1.7 made one more, by decision: `call_legs`
+//!   ([`LabelValues::CallLeg`], [`call_legs`]), live calls only and capped.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -33,6 +34,9 @@ use std::time::{Duration, Instant};
 
 use crate::observability::{self as obs, HistogramSnapshot};
 use crate::replication::EnvelopeKind;
+
+#[path = "telemetry/call_legs.rs"]
+pub mod call_legs;
 
 /// A closed label set: an enum whose tokens are the only values a label takes.
 macro_rules! closed_set {
@@ -505,6 +509,8 @@ pub struct TelemetrySnapshot {
     pub apply_refusals: HashMap<String, u64>,
     pub loop_last_progress_age_seconds: HashMap<String, f64>,
     pub node_alive: u64,
+    pub call_legs: Vec<call_legs::CallLegSeries>,
+    pub call_legs_overflow: u64,
 }
 
 /// The token of `apply_refusals` for a row moved from the transient schedule
@@ -597,6 +603,8 @@ pub struct EdgeTelemetry {
     moved_to_terminal: AtomicU64,
     refused_then_admitted: Mutex<HashMap<&'static str, u64>>,
     loop_stamps: [AtomicU64; LoopName::COUNT],
+    /// v45.1.7 — the live calls whose legs `call_legs` reads.
+    pub call_legs: call_legs::CallLegRegistry,
 }
 
 impl Default for EdgeTelemetry {
@@ -652,6 +660,7 @@ impl Default for EdgeTelemetry {
             moved_to_terminal: AtomicU64::new(0),
             refused_then_admitted: Mutex::new(HashMap::new()),
             loop_stamps: arr(),
+            call_legs: call_legs::CallLegRegistry::default(),
         }
     }
 }
@@ -1058,6 +1067,7 @@ impl EdgeTelemetry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map_or(0, DecisionRowSender::receiver_count);
+        let (legs, legs_over) = self.call_legs.rows(call_legs::CALL_LEG_ROWS_MAX);
         TelemetrySnapshot {
             event_handler_duration_seconds: hist_family(
                 EventLabel::TOKENS,
@@ -1187,6 +1197,11 @@ impl EdgeTelemetry {
                     )
                 })
                 .collect(),
+            call_legs: legs
+                .iter()
+                .flat_map(call_legs::CallLegRow::series)
+                .collect(),
+            call_legs_overflow: legs_over,
         }
     }
 }
@@ -1266,6 +1281,11 @@ pub enum LabelValues {
     /// Keyed by a peer. Only `peer_reachability_ratio` and `recent_withholds`,
     /// both operator-only, and neither may be joined by a new field.
     PeerKeyed,
+    /// v45.1.7 — one live call leg's series ([`call_legs`]): a room, a call,
+    /// a member, a stream and a media kind, with each instrument's own
+    /// attributes. Only `call_legs`, operator-only, live legs only, at most
+    /// [`call_legs::CALL_LEG_ROWS_MAX`] rows.
+    CallLeg,
 }
 
 /// One bundle field.
@@ -1464,6 +1484,8 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("group_backfill_completed_total", "ciris.edge.group_backfill.completed", Counter, Count, None, "Join backfills that read to the end of the history families."),
     spec("apply_refusals", "ciris.edge.apply_refusals", Counter, Count, Some(("state", LabelValues::Tokens)), "`moved_to_terminal` and `refused_then_admitted:<class>`: a refusal's life, not its reason. Every key present at zero."),
     spec("loop_last_progress_age_seconds", "ciris.edge.loop.last_progress_age", Gauge, Seconds, closed("loop", LoopName::TOKENS), "Whole seconds since each loop turned. -1: not running, a parked node included. Stamped on each loop's own cadence, not per event. Not public: a dispatcher busy with a batch turns late."),
+    spec("call_legs", "ciris.edge.call.legs", Gauge, Count, Some(("ciris.call.leg", LabelValues::CallLeg)), "Per-leg call series for live calls only (`ciris.edge.call.path`, `.rtt`, `.bitrate`, `.frames_lost`, `.frames_skipped`, `.jitter`, `.reorder_window`, `.codec`); a leg's series go when it or its call ends. Names rooms and members: never public. The flat count is the series carried."),
+    spec("call_legs_overflow", "ciris.edge.call.legs_overflow", Gauge, Count, None, "Leg rows left out of this reading past the cap of 64. Non-zero: the panel is missing legs."),
     TelemetrySpec { exposure: Exposure::PublicSafe, ..spec("node_alive", "ciris.edge.node.alive", Gauge, Count, None, "1 when the event loop and the ladder both turned within 60 s. A bound this coarse says the node runs and nothing of its traffic: the one field for an unauthenticated route.") },
 ];
 

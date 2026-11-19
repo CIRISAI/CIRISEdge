@@ -3748,6 +3748,31 @@ fn telemetry_into_pydict(
         ages.set_item(name.as_str(), *age)?;
     }
     root.set_item("loop_last_progress_age_seconds", ages)?;
+    // v45.1.7 — per-leg call series: `[{"name", "kind", "unit",
+    // "attributes": {..}, "value"}]`, live legs only.
+    let legs = pyo3::types::PyList::empty(py);
+    for series in &b.call_legs {
+        let entry = pyo3::types::PyDict::new(py);
+        entry.set_item("name", series.name)?;
+        entry.set_item(
+            "kind",
+            match series.kind {
+                crate::telemetry::Kind::Counter => "counter",
+                crate::telemetry::Kind::Gauge => "gauge",
+                crate::telemetry::Kind::Histogram => "histogram",
+            },
+        )?;
+        entry.set_item("unit", series.unit)?;
+        let attributes = pyo3::types::PyDict::new(py);
+        for (k, v) in &series.attributes {
+            attributes.set_item(*k, v.as_str())?;
+        }
+        entry.set_item("attributes", attributes)?;
+        entry.set_item("value", series.value)?;
+        legs.append(entry)?;
+    }
+    root.set_item("call_legs", legs)?;
+    root.set_item("call_legs_overflow", b.call_legs_overflow)?;
     Ok(())
 }
 

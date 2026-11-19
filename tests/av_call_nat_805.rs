@@ -44,6 +44,7 @@ use ciris_edge::mls::cohort_group::mint_cohort_key_material;
 use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
 use ciris_edge::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
+use ciris_edge::telemetry::call_legs::{CALL_BITRATE, CALL_PATH};
 use ciris_edge::transport::av_call::{
     Call, CallDeps, CallError, CallOptions, Frame, ReceivedFrame, RoomRoster,
 };
@@ -732,8 +733,74 @@ async fn a_room_call_behind_t_runs_over_a_punched_interface() {
     );
     cross(&mut call_b, "B", &p.b.key.key_id, 10..15, &mut a_frames).await;
 
+    // v45.1.7 — the per-leg series say the leg is punched, both ways (the
+    // receive side is published once a second).
+    let rated = |direction: &str| {
+        common::call_leg_series(
+            &p.a.metrics.snapshot().call_legs,
+            CALL_BITRATE,
+            &p.b.key.key_id,
+            direction,
+        )
+        .first()
+        .is_some_and(|s| s.value > 0.0)
+    };
+    // Media flows while the rows are read: a rate falls to 0 a second after
+    // its media stops, as it should.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut k = 100;
+    let rows_came = loop {
+        for call in [&mut call_a, &mut call_b] {
+            let _ = call.publish(Frame::opaque(body("tele", k))).await;
+        }
+        k += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if rated("send") && rated("recv") {
+            break true;
+        }
+        if tokio::time::Instant::now() > deadline {
+            break false;
+        }
+    };
+    assert!(
+        rows_came,
+        "A's leg rows to B: {:?}",
+        p.a.metrics.snapshot().call_legs
+    );
+    let snap = p.a.metrics.snapshot();
+    common::assert_call_legs_well_formed(&snap.call_legs);
+    for direction in ["send", "recv"] {
+        let path = common::call_leg_series(&snap.call_legs, CALL_PATH, &p.b.key.key_id, direction);
+        assert_eq!(
+            path.len(),
+            1,
+            "A's {direction} row to B: {:?}",
+            snap.call_legs
+        );
+        for (k, v) in [
+            ("path", "direct"),
+            ("punched", "true"),
+            ("transport", "datagram"),
+            ("relay.key_id", ""),
+            ("ciris.media.kind", "audio"),
+        ] {
+            assert_eq!(
+                common::call_leg_attr(path[0], k),
+                Some(v),
+                "{direction}: {:?}",
+                path[0]
+            );
+        }
+        let rate =
+            common::call_leg_series(&snap.call_legs, CALL_BITRATE, &p.b.key.key_id, direction);
+        assert!(rate[0].value > 0.0, "{direction}: {:?}", rate[0]);
+    }
     call_a.leave().await.expect("A leaves");
     call_b.leave().await.expect("B leaves");
+    for side in [&p.a, &p.b] {
+        let legs = side.metrics.snapshot().call_legs;
+        assert!(legs.is_empty(), "the leg series go at leave: {legs:?}");
+    }
 }
 
 /// Both members' legs are up and keyed, and each has heard the other's
