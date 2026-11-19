@@ -119,6 +119,30 @@ use sha2::{Digest as _, Sha256};
 /// prefix is NOT reserved by `default_reserved_prefix_rules` — an ordinary
 /// `user` identity may emit it.
 pub const CHAT_MESSAGE_DIMENSION: &str = "chat:message:v1";
+/// v45.1.7 — an emoji reaction to a message or reply of a room
+/// (`FSD/CHAT_REACTIONS_AND_THREADS.md` §2): clear [`FIELD_COMMUNITY_ID`]
+/// and [`FIELD_REACTION_TARGET`], the emoji SEALED as a message body is.
+/// Under CC 3.1.9's open `chat:` family; taken back by the author's
+/// `withdraws` ([`chat_message_withdraw_in`]).
+pub const CHAT_REACTION_DIMENSION: &str = "chat:reaction:v1";
+/// v45.1.7 — on a reply ([`chat_message_reply_in`]): the thread ROOT's
+/// attestation id, in the clear (CC 3.3.11 `topical_relation:replies_to`
+/// carried on the message row, as [`FIELD_ATTACHMENT`] is).
+pub const FIELD_REPLIES_TO: &str = "replies_to_attestation_id";
+/// v45.1.7 — on a reaction: the message or reply it reacts to, in the clear.
+pub const FIELD_REACTION_TARGET: &str = "target_attestation_id";
+/// v45.1.7 — the conformance feature for reactions, for a host's features
+/// list (edge advertises none itself).
+pub const FEATURE_REACTIONS: &str = "chat:reactions";
+/// v45.1.7 — the conformance feature for flat threads.
+pub const FEATURE_THREADS: &str = "chat:threads";
+/// v45.1.7 — every chat feature this build's rows and readers carry.
+pub const CHAT_FEATURES: &[&str] = &[FEATURE_REACTIONS, FEATURE_THREADS];
+/// v45.1.7 — the most bytes one reaction's emoji takes (UTF-8).
+pub const REACTION_MAX_BYTES: usize = 32;
+/// v45.1.7 — the most distinct emoji a reader counts per person per target
+/// (the earliest); the host's `chat.reaction_limit`.
+pub const REACTIONS_PER_PERSON_MAX: usize = 20;
 /// The joiner's MLS KeyPackage for a room — step 1 of the handshake.
 pub const KEY_PACKAGE_DIMENSION: &str = "chat:key_package:v1";
 /// The creator's MLS Welcome for the joiner — step 2 of the handshake.
@@ -1083,6 +1107,324 @@ pub async fn chat_message_attachment_in(
     Ok((row, sealed))
 }
 
+/// v45.1.7 — why a reply or a reaction was refused before anything was
+/// written, by the code the host answers with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatRefusal {
+    /// `chat.thread_in_thread`: the named target is itself a reply; a reply
+    /// names the thread's root, `root_attestation_id`.
+    ThreadInThread { root_attestation_id: String },
+    /// `chat.reply_target_not_in_room`: the target is not a message of this
+    /// room.
+    ReplyTargetNotInRoom,
+    /// `chat.reaction_target_not_in_room`: the target is not a message of
+    /// this room.
+    ReactionTargetNotInRoom,
+    /// `chat.not_a_message`: the target is not a chat message or reply.
+    NotAMessage,
+    /// `chat.not_an_emoji`: not exactly one emoji of at most
+    /// [`REACTION_MAX_BYTES`] bytes.
+    NotAnEmoji,
+}
+
+impl ChatRefusal {
+    /// The code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::ThreadInThread { .. } => "chat.thread_in_thread",
+            Self::ReplyTargetNotInRoom => "chat.reply_target_not_in_room",
+            Self::ReactionTargetNotInRoom => "chat.reaction_target_not_in_room",
+            Self::NotAMessage => "chat.not_a_message",
+            Self::NotAnEmoji => "chat.not_an_emoji",
+        }
+    }
+}
+
+/// v45.1.7 — a reply or reaction composer's error: refused by rule, or a
+/// failure below it (seal, signing).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChatComposeError {
+    /// Refused before anything was sealed or written.
+    #[error("{}", .0.code())]
+    Refused(ChatRefusal),
+    /// The seal, canonicalization or signing failed.
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// v45.1.7 — whether `s` is exactly one emoji (one RGI-shaped emoji
+/// sequence, so one extended grapheme cluster) of at most
+/// [`REACTION_MAX_BYTES`] bytes: a flag (two regional indicators), a keycap
+/// (`[0-9#*]` FE0F? 20E3), or an emoji with an optional modifier or FE0F
+/// and an optional tag run, joined by ZWJ into one sequence. Plain text,
+/// digits alone, whitespace and two emoji side by side are not one.
+#[must_use]
+pub fn is_one_emoji(s: &str) -> bool {
+    use unicode_properties::UnicodeEmoji as _;
+    const ZWJ: char = '\u{200D}';
+    const VS16: char = '\u{FE0F}';
+    const KEYCAP: char = '\u{20E3}';
+    const CANCEL_TAG: char = '\u{E007F}';
+    let ri = |c: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+    let modifier = |c: char| ('\u{1F3FB}'..='\u{1F3FF}').contains(&c);
+    let tag = |c: char| ('\u{E0020}'..='\u{E007E}').contains(&c);
+    if s.is_empty() || s.len() > REACTION_MAX_BYTES {
+        return false;
+    }
+    let cs: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    loop {
+        let Some(&c) = cs.get(i) else {
+            return false;
+        };
+        if ri(c) {
+            if !cs.get(i + 1).is_some_and(|n| ri(*n)) {
+                return false;
+            }
+            i += 2;
+        } else if c.is_ascii_digit() || c == '#' || c == '*' {
+            i += 1;
+            if cs.get(i) == Some(&VS16) {
+                i += 1;
+            }
+            if cs.get(i) != Some(&KEYCAP) {
+                return false;
+            }
+            i += 1;
+        } else {
+            if !c.is_emoji_char() || c.is_emoji_component() {
+                return false;
+            }
+            i += 1;
+            if cs.get(i).is_some_and(|n| *n == VS16 || modifier(*n)) {
+                i += 1;
+            }
+            if cs.get(i).is_some_and(|n| tag(*n)) {
+                while cs.get(i).is_some_and(|n| tag(*n)) {
+                    i += 1;
+                }
+                if cs.get(i) != Some(&CANCEL_TAG) {
+                    return false;
+                }
+                i += 1;
+            }
+        }
+        match cs.get(i) {
+            None => return true,
+            Some(&ZWJ) => i += 1,
+            Some(_) => return false,
+        }
+    }
+}
+
+/// The thread root `target` names when it is itself a reply.
+fn replies_to_of(a: &Attestation) -> Option<&str> {
+    a.attestation_envelope
+        .get(FIELD_REPLIES_TO)
+        .and_then(serde_json::Value::as_str)
+}
+
+/// v45.1.7 — **a reply in a flat thread**: an ordinary `chat:message:v1`
+/// row, sealed and shared exactly as [`chat_message_attestation_in`] (born
+/// `self`, widened to the room by the share), naming the thread's `root` by
+/// [`FIELD_REPLIES_TO`], in the clear. Nothing is written to the root.
+///
+/// `root` is the message as the caller holds it (on a peer, its widening).
+///
+/// # Errors
+/// [`ChatRefusal::ThreadInThread`] when `root` is itself a reply (naming its
+/// root), [`ChatRefusal::NotAMessage`] when it is not a chat message,
+/// [`ChatRefusal::ReplyTargetNotInRoom`] when it is not in `room`; a seal,
+/// canonicalization or signing failure as [`ChatComposeError::Failed`].
+pub async fn chat_message_reply_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    root: &Attestation,
+    body: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    store: &dyn crate::group_content::GroupContentStore,
+) -> Result<(Attestation, crate::group_content::SealedContent), ChatComposeError> {
+    use crate::replication::attestation_bind::truncate_to_substrate_resolution;
+    let room = community_key_id;
+    if dimension_of(root) != Some(CHAT_MESSAGE_DIMENSION) || is_retraction(root) {
+        return Err(ChatComposeError::Refused(ChatRefusal::NotAMessage));
+    }
+    if room_of(root).as_deref() != Some(room) {
+        return Err(ChatComposeError::Refused(ChatRefusal::ReplyTargetNotInRoom));
+    }
+    if let Some(r) = replies_to_of(root) {
+        return Err(ChatComposeError::Refused(ChatRefusal::ThreadInThread {
+            root_attestation_id: r.to_owned(),
+        }));
+    }
+    let at = truncate_to_substrate_resolution(asserted_at);
+    let (mut members, sealed) = sealed_body_members(author, room, body, at, store)
+        .await
+        .map_err(ChatComposeError::Failed)?;
+    members.insert(
+        FIELD_REPLIES_TO.to_owned(),
+        serde_json::json!(root.attestation_id),
+    );
+    let row = chat_row(author, room, CHAT_MESSAGE_DIMENSION, members, at)
+        .await
+        .map_err(ChatComposeError::Failed)?;
+    Ok((row, sealed))
+}
+
+/// v45.1.7 — **an emoji reaction** to `target` (any message or reply of the
+/// room, by anyone): a `chat:reaction:v1` row naming the room and the target
+/// in the clear, with `emoji` sealed under the room's DEK exactly as a
+/// message body is, so which emoji someone chose is as private as what they
+/// wrote. Born `self` and shared to the room like a message. Taken back by
+/// the author's [`chat_message_withdraw_in`] naming the reaction.
+///
+/// One per (person, target, emoji) is a READER rule ([`reactions_for`]
+/// keeps the earliest); this composer reads nothing.
+///
+/// # Errors
+/// [`ChatRefusal::NotAnEmoji`] ([`is_one_emoji`]), [`ChatRefusal::NotAMessage`],
+/// [`ChatRefusal::ReactionTargetNotInRoom`]; a seal, canonicalization or
+/// signing failure as [`ChatComposeError::Failed`].
+pub async fn chat_reaction_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    target: &Attestation,
+    emoji: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    store: &dyn crate::group_content::GroupContentStore,
+) -> Result<(Attestation, crate::group_content::SealedContent), ChatComposeError> {
+    use crate::replication::attestation_bind::truncate_to_substrate_resolution;
+    let room = community_key_id;
+    if !is_one_emoji(emoji) {
+        return Err(ChatComposeError::Refused(ChatRefusal::NotAnEmoji));
+    }
+    if dimension_of(target) != Some(CHAT_MESSAGE_DIMENSION) || is_retraction(target) {
+        return Err(ChatComposeError::Refused(ChatRefusal::NotAMessage));
+    }
+    if room_of(target).as_deref() != Some(room) {
+        return Err(ChatComposeError::Refused(
+            ChatRefusal::ReactionTargetNotInRoom,
+        ));
+    }
+    let at = truncate_to_substrate_resolution(asserted_at);
+    let (mut members, sealed) = sealed_body_members(author, room, emoji, at, store)
+        .await
+        .map_err(ChatComposeError::Failed)?;
+    members.insert(
+        FIELD_REACTION_TARGET.to_owned(),
+        serde_json::json!(target.attestation_id),
+    );
+    let row = chat_row(author, room, CHAT_REACTION_DIMENSION, members, at)
+        .await
+        .map_err(ChatComposeError::Failed)?;
+    Ok((row, sealed))
+}
+
+/// v45.1.7 — one reaction as read back ([`reactions_for`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatReaction {
+    /// The reaction row's id (its widening's, on a peer): what a take-back
+    /// names.
+    pub attestation_id: String,
+    /// Who reacted: the attester, always.
+    pub author_key_id: String,
+    /// The message or reply it reacts to, as the reactor held it.
+    pub target_attestation_id: String,
+    /// The emoji, opened, or why it did not open.
+    pub emoji: Body,
+    pub asserted_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// v45.1.7 — **the live reactions in `room`**, oldest first, opened, folded
+/// by the reader rules: a withdrawn reaction is gone (the author's own
+/// `withdraws`); of two by one person on one target with one emoji (byte for
+/// byte) the EARLIEST stands; at most [`REACTIONS_PER_PERSON_MAX`] distinct
+/// emoji per person per target count (the earliest); a row whose emoji
+/// opens as anything but [`is_one_emoji`] is dropped. A reaction whose emoji
+/// does not open is kept, with its [`Body::Unopened`] reason, and is not
+/// deduplicated (its emoji is unknown).
+///
+/// `targets`: only reactions to these ids; empty: every reaction in the
+/// room. A host folding by lineage passes every id of a message's chain
+/// (its widening and its revisions).
+///
+/// # Errors
+/// A directory read failure.
+pub async fn reactions_for(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    participants: &[String],
+    room: &str,
+    targets: &[String],
+    store: &dyn crate::group_content::GroupContentStore,
+    viewer_key_id: &str,
+) -> Result<Vec<ChatReaction>, String> {
+    let rows = rows_in_room(directory, participants, room, CHAT_REACTION_DIMENSION).await?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::<(String, String, String)>::new();
+    let mut per_person = std::collections::BTreeMap::<(String, String), usize>::new();
+    for a in &rows {
+        let Some(target) = a
+            .attestation_envelope
+            .get(FIELD_REACTION_TARGET)
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !targets.is_empty() && !targets.iter().any(|t| t == target) {
+            continue;
+        }
+        let Some(r) = open_reaction(a, room, store, viewer_key_id).await else {
+            continue;
+        };
+        if let Body::Text(emoji) = &r.emoji {
+            if !is_one_emoji(emoji) {
+                tracing::debug!(
+                    reaction = %a.attestation_id,
+                    "a reaction that is not one emoji is dropped"
+                );
+                continue;
+            }
+            let who = (a.attesting_key_id.clone(), target.to_owned());
+            if !seen.insert((who.0.clone(), who.1.clone(), emoji.clone())) {
+                continue;
+            }
+            let n = per_person.entry(who).or_insert(0);
+            if *n >= REACTIONS_PER_PERSON_MAX {
+                continue;
+            }
+            *n += 1;
+        }
+        out.push(r);
+    }
+    Ok(out)
+}
+
+/// v45.1.7 — one reaction row of `room`, its emoji opened as `viewer_key_id`
+/// (a body's open: the binding inputs off THIS row). `None` when the row is
+/// not a reaction in `room` or names no target. No reader rule applies here;
+/// [`reactions_for`] applies them.
+pub async fn open_reaction(
+    a: &Attestation,
+    room: &str,
+    store: &dyn crate::group_content::GroupContentStore,
+    viewer_key_id: &str,
+) -> Option<ChatReaction> {
+    let target = a
+        .attestation_envelope
+        .get(FIELD_REACTION_TARGET)
+        .and_then(serde_json::Value::as_str)?;
+    let mut m = ChatMessage::from_row_in(a, room, CHAT_REACTION_DIMENSION)?;
+    m.resolve_content(store, viewer_key_id).await;
+    Some(ChatReaction {
+        attestation_id: a.attestation_id.clone(),
+        author_key_id: a.attesting_key_id.clone(),
+        target_attestation_id: target.to_owned(),
+        emoji: m.body,
+        asserted_at: a.asserted_at,
+    })
+}
+
 /// The member a chat `withdraws` / `recants` carries its reason code under.
 /// A composer sits at the room's scope, where its members are plaintext to
 /// every holder, so the reason is a code from [`ComposerReason`], never free
@@ -1166,13 +1508,19 @@ pub fn composer_is_authors(composer: &Attestation, target: &Attestation) -> bool
         ) == Some(target.attestation_id.as_str())
 }
 
-/// Refuse a composer `author` may not write over `target` in `room`.
+/// Refuse a composer `author` may not write over `target` in `room`. A
+/// reaction (v45.1.7) may be withdrawn (`reaction_ok`), never revised or
+/// recanted.
 fn check_composer_target(
     author: &crate::identity::LocalSigner,
     room: &str,
     target: &Attestation,
+    reaction_ok: bool,
 ) -> Result<(), String> {
-    if dimension_of(target) != Some(CHAT_MESSAGE_DIMENSION) {
+    let dimension = dimension_of(target);
+    if dimension != Some(CHAT_MESSAGE_DIMENSION)
+        && !(reaction_ok && dimension == Some(CHAT_REACTION_DIMENSION))
+    {
         return Err(format!(
             "row {} is not a chat message ({:?})",
             target.attestation_id,
@@ -1222,7 +1570,7 @@ pub async fn chat_message_supersede_in(
     use ciris_persist::federation::envelope::paths;
     use ciris_persist::federation::types::attestation_type as ty;
     let room = community_key_id;
-    check_composer_target(author, room, target)?;
+    check_composer_target(author, room, target, false)?;
     let at = truncate_to_substrate_resolution(asserted_at);
     let (mut members, sealed) = sealed_body_members(author, room, new_body, at, store).await?;
     members.insert(
@@ -1232,6 +1580,10 @@ pub async fn chat_message_supersede_in(
     // A revision changes the words, not what the message carries.
     if let Some(file) = target.attestation_envelope.get(FIELD_ATTACHMENT) {
         members.insert(FIELD_ATTACHMENT.to_owned(), file.clone());
+    }
+    // v45.1.7 — nor which thread it is in.
+    if let Some(root) = target.attestation_envelope.get(FIELD_REPLIES_TO) {
+        members.insert(FIELD_REPLIES_TO.to_owned(), root.clone());
     }
     let row = chat_row_shaped(
         author,
@@ -1248,6 +1600,9 @@ pub async fn chat_message_supersede_in(
 /// **The author withdraws a message**: a `withdraws` naming `target` (the
 /// current head, as for [`chat_message_supersede_in`]), retracting it
 /// without saying it was false. Born in the room at federation tier.
+///
+/// v45.1.7 — `target` may also be the author's own reaction
+/// ([`chat_reaction_in`]): the take-back.
 ///
 /// # Errors
 /// `target` is not `author`'s chat message in `room`; `reason` is not a
@@ -1302,7 +1657,12 @@ async fn retraction_in(
     asserted_at: chrono::DateTime<chrono::Utc>,
     attestation_type: &'static str,
 ) -> Result<Attestation, String> {
-    check_composer_target(author, room, target)?;
+    check_composer_target(
+        author,
+        room,
+        target,
+        attestation_type == ciris_persist::federation::types::attestation_type::WITHDRAWS,
+    )?;
     if !reason.allowed_on(attestation_type) {
         return Err(format!(
             "reason `{}` is not a `{attestation_type}` code",
@@ -1698,6 +2058,7 @@ pub async fn messages_in_room(
             .iter()
             .filter_map(|a| ChatMessage::from_row(a, room))
             .collect();
+    file_replies_under_roots(&mut out);
     // Corroborate the pre-v39 claims, one owner walk per distinct attester.
     let mut owner_of: std::collections::BTreeMap<String, Option<String>> =
         std::collections::BTreeMap::new();
@@ -1748,6 +2109,36 @@ pub async fn messages_in_room(
     }
 
     Ok(out)
+}
+
+/// v45.1.7 — no threads in threads, as a reader: a reply whose named target
+/// is itself a reply here (by its id or the self row it widens) is filed
+/// under that reply's root, followed to a root (bounded; a cycle stops).
+fn file_replies_under_roots(messages: &mut [ChatMessage]) {
+    let mut parent: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for m in messages.iter() {
+        if let Some(r) = &m.replies_to {
+            parent.insert(m.attestation_id.clone(), r.clone());
+            if let Some(w) = &m.widens {
+                parent.insert(w.clone(), r.clone());
+            }
+            if let Some(e) = &m.edits {
+                parent.insert(e.clone(), r.clone());
+            }
+        }
+    }
+    for m in messages.iter_mut() {
+        let Some(mut root) = m.replies_to.clone() else {
+            continue;
+        };
+        for _ in 0..8 {
+            match parent.get(&root) {
+                Some(up) if *up != root => root.clone_from(up),
+                _ => break,
+            }
+        }
+        m.replies_to = Some(root);
+    }
 }
 
 /// CIRISEdge#676 — when `from` LAST published a KeyPackage in `room`
@@ -2206,6 +2597,10 @@ pub struct ChatMessage {
     /// The file this message carries, by its attestation id
     /// ([`chat_message_attachment_in`]).
     pub attachment: Option<String>,
+    /// v45.1.7 — the thread root this reply is filed under
+    /// ([`chat_message_reply_in`]). [`messages_in_room`] files a stray nested
+    /// reply (its named target is itself a reply) under that target's root.
+    pub replies_to: Option<String>,
 }
 
 impl ChatMessage {
@@ -2223,7 +2618,13 @@ impl ChatMessage {
     /// from a room with no record anywhere of why.
     #[must_use]
     pub fn from_row(a: &Attestation, room: &str) -> Option<Self> {
-        if dimension_of(a) != Some(CHAT_MESSAGE_DIMENSION)
+        Self::from_row_in(a, room, CHAT_MESSAGE_DIMENSION)
+    }
+
+    /// [`Self::from_row`] for a row of `dimension` (a reaction's sealed
+    /// emoji opens as a body does).
+    fn from_row_in(a: &Attestation, room: &str, dimension: &str) -> Option<Self> {
+        if dimension_of(a) != Some(dimension)
             || room_of(a).as_deref() != Some(room)
             || is_retraction(a)
         {
@@ -2292,6 +2693,10 @@ impl ChatMessage {
                 .get(FIELD_ATTACHMENT)
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
+            replies_to: env
+                .get(FIELD_REPLIES_TO)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
         }
     }
 
@@ -2346,5 +2751,77 @@ impl ChatMessage {
                 reason: UnopenedReason::from_store_error(&e),
             },
         };
+    }
+}
+
+#[cfg(test)]
+mod reaction_tests {
+    use super::*;
+
+    /// v45.1.7 — one emoji passes, in its sequence shapes; text, two emoji,
+    /// a bare digit, whitespace and an oversize run do not.
+    #[test]
+    fn one_emoji_is_one_emoji_sequence_and_nothing_else() {
+        for ok in [
+            "👍",
+            "👍🏽",
+            "❤️",
+            "©",
+            "🇺🇸",
+            "1️⃣",
+            "#⃣",
+            "👨‍👩‍👧‍👦",
+            "🏳️‍🌈",
+            "🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
+        ] {
+            assert!(is_one_emoji(ok), "{ok:?} is one emoji");
+        }
+        for bad in [
+            "",
+            "a",
+            "ok",
+            "1",
+            "👍👍",
+            "👍 ",
+            " 👍",
+            "\u{200D}",
+            "🏽",
+            "🇺",
+            "👍\u{200D}",
+            "<script>",
+            "127.0.0.1",
+        ] {
+            assert!(!is_one_emoji(bad), "{bad:?} is not one emoji");
+        }
+        let long = "👨\u{200D}".repeat(8) + "👨";
+        assert!(long.len() > REACTION_MAX_BYTES);
+        assert!(!is_one_emoji(&long), "over {REACTION_MAX_BYTES} bytes");
+    }
+
+    /// v45.1.7 — a stray nested reply is filed under its target's root, by
+    /// the target's id or the self row it widens.
+    #[test]
+    fn a_nested_reply_is_filed_under_the_root() {
+        let m = |id: &str, widens: Option<&str>, to: Option<&str>| ChatMessage {
+            attestation_id: id.to_owned(),
+            author_key_id: "a".to_owned(),
+            attesting_key_id: "a".to_owned(),
+            on_behalf_of_claim: None,
+            body: Body::Text(String::new()),
+            asserted_at: chrono::Utc::now(),
+            widens: widens.map(str::to_owned),
+            edits: None,
+            attachment: None,
+            replies_to: to.map(str::to_owned),
+        };
+        let mut v = vec![
+            m("root", None, None),
+            m("reply-w", Some("reply-self"), Some("root")),
+            m("nested", None, Some("reply-self")),
+            m("nested2", None, Some("nested")),
+        ];
+        file_replies_under_roots(&mut v);
+        let to: Vec<Option<&str>> = v.iter().map(|m| m.replies_to.as_deref()).collect();
+        assert_eq!(to, [None, Some("root"), Some("root"), Some("root")]);
     }
 }

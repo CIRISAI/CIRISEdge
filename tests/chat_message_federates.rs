@@ -3022,3 +3022,383 @@ async fn a_message_carries_a_file_in_the_room_and_a_revision_keeps_it() {
         "a file from another room is refused"
     );
 }
+
+// ─── v45.1.7: flat threads and reactions ────────────────────────────
+
+/// Store `row` as alice's and share it into the room; the widening every
+/// reader holds.
+async fn shared_in_room(
+    w: &World,
+    row: &ciris_persist::federation::Attestation,
+) -> ciris_persist::federation::Attestation {
+    put(w, row).await;
+    let crossing = share_encrypted_privately(
+        &*w.dir,
+        row,
+        EncryptedCohort::Community {
+            community_key_id: w.room.clone(),
+        },
+        CrossingBasis::ProducerAuthority,
+        w.signers(),
+    )
+    .await
+    .expect("share into the room");
+    let Shared::Placed { attestation_id } = crossing.shared else {
+        panic!("placed: {:?}", crossing.shared);
+    };
+    w.stored(&alice_fed(), &attestation_id).await
+}
+
+/// **A reply names its thread's root in the clear, reads back filed under
+/// it, and a reply to a reply is refused naming the root.** A stray nested
+/// reply (an author that skipped the check) is filed under the root by the
+/// reader.
+#[tokio::test]
+async fn a_reply_names_its_root_and_a_thread_in_a_thread_is_refused() {
+    let w = world().await;
+    let store = content_store(&w).await;
+    let root = placed(&w, "what time?").await;
+
+    let (reply, _) =
+        chat::chat_message_reply_in(&w.alice, &w.room, &root, "seven", later(1), &store)
+            .await
+            .expect("reply");
+    assert_eq!(
+        reply.attestation_envelope[chat::FIELD_REPLIES_TO],
+        root.attestation_id.as_str(),
+        "the root, in the clear"
+    );
+    assert_eq!(
+        reply.attestation_envelope["dimension"],
+        chat::CHAT_MESSAGE_DIMENSION
+    );
+    let reply_w = shared_in_room(&w, &reply).await;
+    let seen = room_messages(&w).await;
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    let r = seen
+        .iter()
+        .find(|m| m.attestation_id == reply_w.attestation_id)
+        .expect("the reply is in the room");
+    assert_eq!(r.replies_to.as_deref(), Some(root.attestation_id.as_str()));
+    assert_eq!(r.body, Body::Text("seven".to_owned()));
+    let top = seen
+        .iter()
+        .find(|m| m.attestation_id == root.attestation_id)
+        .expect("the root");
+    assert_eq!(top.replies_to, None, "nothing is written to the root");
+
+    let refused =
+        chat::chat_message_reply_in(&w.alice, &w.room, &reply_w, "nested", later(2), &store).await;
+    assert_eq!(
+        refused.err(),
+        Some(chat::ChatComposeError::Refused(
+            chat::ChatRefusal::ThreadInThread {
+                root_attestation_id: root.attestation_id.clone()
+            }
+        )),
+    );
+    let elsewhere = chat::chat_message_reply_in(
+        &w.alice,
+        "chat:room:v1:elsewhere",
+        &root,
+        "x",
+        later(2),
+        &store,
+    )
+    .await;
+    assert_eq!(
+        elsewhere.err(),
+        Some(chat::ChatComposeError::Refused(
+            chat::ChatRefusal::ReplyTargetNotInRoom
+        ))
+    );
+
+    // A nested reply written anyway: the reply, disguised as a root.
+    let mut disguised = reply_w.clone();
+    disguised
+        .attestation_envelope
+        .as_object_mut()
+        .unwrap()
+        .remove(chat::FIELD_REPLIES_TO);
+    let (stray, _) =
+        chat::chat_message_reply_in(&w.alice, &w.room, &disguised, "stray", later(3), &store)
+            .await
+            .expect("the check reads the row in hand");
+    let stray_w = shared_in_room(&w, &stray).await;
+    let seen = room_messages(&w).await;
+    let s = seen
+        .iter()
+        .find(|m| m.attestation_id == stray_w.attestation_id)
+        .expect("the stray reply is read");
+    assert_eq!(
+        s.replies_to.as_deref(),
+        Some(root.attestation_id.as_str()),
+        "filed under the root, never a nested thread"
+    );
+}
+
+/// Alice reacts to `target` with `emoji` at `later(at)`; the shared row.
+async fn react(
+    w: &World,
+    store: &ciris_edge::group_content::PersistGroupContentStore,
+    target: &ciris_persist::federation::Attestation,
+    emoji: &str,
+    at: i64,
+) -> ciris_persist::federation::Attestation {
+    let (row, sealed) = chat::chat_reaction_in(&w.alice, &w.room, target, emoji, later(at), store)
+        .await
+        .expect("react");
+    assert!(sealed.fully_readable(), "{:?}", sealed.excluded);
+    assert_eq!(
+        row.attestation_envelope["dimension"],
+        chat::CHAT_REACTION_DIMENSION
+    );
+    assert_eq!(
+        row.attestation_envelope[chat::FIELD_REACTION_TARGET],
+        target.attestation_id.as_str()
+    );
+    assert!(
+        !row.attestation_envelope.to_string().contains(emoji),
+        "the emoji is sealed, never in the clear"
+    );
+    shared_in_room(w, &row).await
+}
+
+/// **A reaction seals its emoji, reads back opened, is kept once per
+/// (person, target, emoji) (the earliest), is taken back by the author's
+/// withdraw, and is never a message.** Text that is not one emoji is
+/// refused before anything is sealed.
+#[tokio::test]
+async fn a_reaction_opens_dedups_to_the_earliest_and_is_taken_back() {
+    let w = world().await;
+    let store = content_store(&w).await;
+    let me = me_of(&w).await;
+    let target = placed(&w, "we won").await;
+
+    for bad in ["ok", "👍👍", "1", "", "👍 ", "🏽"] {
+        assert_eq!(
+            chat::chat_reaction_in(&w.alice, &w.room, &target, bad, later(1), &store)
+                .await
+                .err(),
+            Some(chat::ChatComposeError::Refused(
+                chat::ChatRefusal::NotAnEmoji
+            )),
+            "{bad:?}"
+        );
+    }
+
+    let first = react(&w, &store, &target, "👍", 1).await;
+    let _second = react(&w, &store, &target, "👍", 2).await;
+    let party = react(&w, &store, &target, "🎉", 3).await;
+
+    let read = || async {
+        chat::reactions_for(&*w.dir, &[alice_fed()], &w.room, &[], &store, &me)
+            .await
+            .expect("read the reactions")
+    };
+    let got = read().await;
+    let emoji: Vec<(&str, Body)> = got
+        .iter()
+        .map(|r| (r.attestation_id.as_str(), r.emoji.clone()))
+        .collect();
+    assert_eq!(
+        emoji,
+        [
+            (first.attestation_id.as_str(), Body::Text("👍".to_owned())),
+            (party.attestation_id.as_str(), Body::Text("🎉".to_owned())),
+        ],
+        "one 👍, the earliest, and the 🎉"
+    );
+    assert!(got.iter().all(
+        |r| r.author_key_id == alice_fed() && r.target_attestation_id == target.attestation_id
+    ));
+    assert_eq!(
+        room_messages(&w).await.len(),
+        1,
+        "a reaction is not a message"
+    );
+    assert!(
+        chat::reactions_for(
+            &*w.dir,
+            &[alice_fed()],
+            &w.room,
+            &["someone-else".to_owned()],
+            &store,
+            &me
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "filtered by target"
+    );
+
+    // Take-back: the author withdraws the 🎉.
+    let back = chat::chat_message_withdraw_in(
+        &w.alice,
+        &w.room,
+        &party,
+        &chat::ComposerReason::Unspecified,
+        later(4),
+    )
+    .await
+    .expect("withdraw the reaction");
+    put(&w, &back).await;
+    let after: Vec<Body> = read().await.into_iter().map(|r| r.emoji).collect();
+    assert_eq!(after, [Body::Text("👍".to_owned())], "the 🎉 is taken back");
+    // A reaction is withdrawn, never revised or recanted.
+    assert!(
+        chat::chat_message_supersede_in(&w.alice, &w.room, &first, "👎", later(5), &store)
+            .await
+            .is_err()
+    );
+}
+
+/// **Bob reacts on his node to alice's message; alice's node opens the
+/// emoji.** The crossings are the planes' shapes carried by hand, as in the
+/// three-member witness: bob's key grants and sealed bytes reach alice's
+/// node, and alice opens the reaction row as a body is opened.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // two nodes, a room, a message, a reaction — in one place
+async fn a_reaction_crosses_to_the_other_member_who_opens_the_emoji() {
+    use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
+    use ciris_persist::federation::types::consensus_protocol;
+
+    let alice = signer("alice-fed", 1);
+    let bob = signer("bob-fed", 3);
+    let humans = [&alice, &bob];
+    let a = peer(&humans, ("alice-fed", 1)).await;
+    let b = peer(&humans, ("bob-fed", 3)).await;
+
+    let room = chat::new_room_community_key_id();
+    let roster = chat::community(
+        &room,
+        "the pair",
+        &[(alice_fed().as_str(), Some(MEMBER_ROLE_FOUNDER))],
+        consensus_protocol::MAJORITY,
+        ts(),
+    )
+    .expect("alice is the founder");
+    let signed_room = chat::signed_community(roster, &alice).await.expect("sign");
+    for p in [&a, &b] {
+        p.dir
+            .put_community(signed_room.clone())
+            .await
+            .expect("both nodes admit the room");
+        p.dir
+            .put_public_key(SignedKeyRecord {
+                record: record(
+                    &room,
+                    &room_signer(&room, 9),
+                    &room_signer(&room, 9),
+                    "user",
+                )
+                .await,
+            })
+            .await
+            .expect("register the room id as a key (persist fixture convention)");
+    }
+    let proposal = ciris_edge::membership::propose(
+        &*a.dir,
+        ciris_edge::membership::GroupScope::Community,
+        &room,
+        bob_fed().as_str(),
+        None,
+        chrono::Utc::now() + chrono::Duration::days(7),
+        &alice,
+    )
+    .await
+    .expect("alice proposes bob");
+    ciris_edge::membership::reply(&*a.dir, &proposal.attestation_id, true, &bob)
+        .await
+        .expect("bob accepts");
+    assert!(ciris_edge::membership::widen(
+        &*a.dir,
+        ciris_edge::membership::GroupScope::Community,
+        &room,
+        bob_fed().as_str(),
+        None,
+        ts(),
+        &alice,
+    )
+    .await
+    .expect("alice widens on the acceptance"));
+    let consent_rows: Vec<_> = a
+        .dir
+        .list_attestations_since(None, 1024)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.attestation)
+        .filter(ciris_edge::membership::is_membership_row)
+        .collect();
+    for row in &consent_rows {
+        b.dir
+            .put_attestation(ciris_persist::federation::SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .expect("bob's node admits the consent row");
+    }
+    for wd in a
+        .dir
+        .list_signed_community_membership_widenings_since(None, 64)
+        .await
+        .unwrap()
+    {
+        b.dir
+            .put_community_membership_widening(wd.widening)
+            .await
+            .expect("bob's node admits the widening");
+    }
+    for (from, to) in [(&a, &b), (&b, &a)] {
+        carry_identity(from, to).await;
+    }
+
+    // Alice's message reaches bob.
+    let t1 = ts();
+    let (row1, sealed1) = chat::chat_message_attestation_in(&alice, &room, "we won", t1, &a.store)
+        .await
+        .expect("alice sends");
+    carry_key_grants(&a, &b).await;
+    carry_bytes(&a, &b, &room, alice_fed().as_str(), &sealed1, t1)
+        .await
+        .expect("bob's node adopts the bytes");
+    assert_eq!(
+        read_as(&b, &row1, &room, &b.me).await,
+        Body::Text("we won".to_owned())
+    );
+
+    // Bob reacts on his node; it crosses back.
+    let t2 = ts() + chrono::Duration::seconds(1);
+    let (reaction, sealed) = chat::chat_reaction_in(&bob, &room, &row1, "🎉", t2, &b.store)
+        .await
+        .expect("bob reacts");
+    assert!(
+        sealed.granted.contains(&a.me),
+        "the emoji is wrapped to alice's engine: {:?}",
+        sealed.granted
+    );
+    carry_key_grants(&b, &a).await;
+    carry_bytes(&b, &a, &room, bob_fed().as_str(), &sealed, t2)
+        .await
+        .expect("alice's node adopts the bytes");
+    let opened = chat::open_reaction(&reaction, &room, &a.store, &a.me)
+        .await
+        .expect("a reaction row of this room");
+    assert_eq!(
+        opened.emoji,
+        Body::Text("🎉".to_owned()),
+        "alice opens bob's emoji"
+    );
+    assert_eq!(opened.author_key_id, bob_fed());
+    assert_eq!(opened.target_attestation_id, row1.attestation_id);
+    assert!(
+        matches!(
+            chat::open_reaction(&reaction, &room, &b.store, "dave-fed-occ")
+                .await
+                .map(|r| r.emoji),
+            Some(Body::Unopened { .. })
+        ),
+        "a non-member opens nothing"
+    );
+}

@@ -562,6 +562,9 @@ hex         = "0.4"
 # name the field it reads. Already in the graph (serde_json/regex); pinned here
 # only to name it.
 memchr      = "2"
+# v45.1.7 — a chat reaction is one emoji: the Unicode emoji property tables.
+# Already in the graph (url → idna → stringprep); named here for `emoji`.
+unicode-properties = { version = "0.1.4", default-features = false, features = ["emoji"] }
 
 # Errors / logs
 thiserror   = "1"
