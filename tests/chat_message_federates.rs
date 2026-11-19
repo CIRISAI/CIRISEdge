@@ -3517,3 +3517,117 @@ async fn a_reply_carries_a_file_and_a_revision_keeps_root_and_file() {
         ))
     );
 }
+
+/// **A revised root keeps its thread, and a reaction counts only on a
+/// message of this room** (Codex on #1016). Reply 1 names the root R; R is
+/// revised to R′; reply 2 is composed from R′ (what the room now lists). Both
+/// read back filed under R′, one thread. A reaction on R before its revision
+/// reads as a reaction on R′. A validly signed reaction naming an id that is
+/// no message of this room (the composer's check skipped) is not returned.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one story, told in order
+async fn a_revised_root_keeps_its_thread_and_a_reaction_needs_a_message_here() {
+    let w = world().await;
+    let store = content_store(&w).await;
+    let me = me_of(&w).await;
+    let root = placed(&w, "dinner at 7?").await;
+
+    let (reply1, _) =
+        chat::chat_message_reply_in(&w.alice, &w.room, &root, "yes", None, later(1), &store)
+            .await
+            .expect("reply 1");
+    let reply1 = shared_in_room(&w, &reply1).await;
+    let on_root = react(&w, &store, &root, "👍", 2).await;
+
+    let (revised, _) =
+        chat::chat_message_supersede_in(&w.alice, &w.room, &root, "dinner at 8?", later(3), &store)
+            .await
+            .expect("revise the root");
+    put(&w, &revised).await;
+    let seen = room_messages(&w).await;
+    let head = seen
+        .iter()
+        .find(|m| m.edits.as_deref() == Some(root.attestation_id.as_str()))
+        .expect("the revision is the root's head")
+        .attestation_id
+        .clone();
+    let head_row = w.stored(&alice_fed(), &head).await;
+
+    let (reply2, _) = chat::chat_message_reply_in(
+        &w.alice,
+        &w.room,
+        &head_row,
+        "8 works",
+        None,
+        later(4),
+        &store,
+    )
+    .await
+    .expect("reply 2, composed from the head");
+    let reply2 = shared_in_room(&w, &reply2).await;
+
+    let seen = room_messages(&w).await;
+    let thread: Vec<Option<&str>> = [&reply1, &reply2]
+        .iter()
+        .map(|r| {
+            seen.iter()
+                .find(|m| m.attestation_id == r.attestation_id)
+                .expect("each reply is read")
+                .replies_to
+                .as_deref()
+        })
+        .collect();
+    assert_eq!(
+        thread,
+        [Some(head.as_str()), Some(head.as_str())],
+        "one thread, under the root as it stands"
+    );
+
+    // A reaction on an id that is no message of this room, signed anyway.
+    let mut nowhere = root.clone();
+    nowhere.attestation_id = "not-a-message-of-this-room".to_owned();
+    let (forged, _) = chat::chat_reaction_in(&w.alice, &w.room, &nowhere, "🎉", later(5), &store)
+        .await
+        .expect("the composer reads the row in hand");
+    let forged = shared_in_room(&w, &forged).await;
+
+    let got = chat::reactions_for(&*w.dir, &[alice_fed()], &w.room, &[], &store, &me)
+        .await
+        .expect("read the reactions");
+    assert_eq!(
+        got.iter()
+            .map(|r| (r.attestation_id.as_str(), r.target_attestation_id.as_str()))
+            .collect::<Vec<_>>(),
+        [(on_root.attestation_id.as_str(), head.as_str())],
+        "the 👍 on R counts on R′; the forged 🎉 ({}) is not returned",
+        forged.attestation_id
+    );
+    for asked in [&root.attestation_id, &head] {
+        assert_eq!(
+            chat::reactions_for(
+                &*w.dir,
+                &[alice_fed()],
+                &w.room,
+                std::slice::from_ref(asked),
+                &store,
+                &me
+            )
+            .await
+            .unwrap()
+            .len(),
+            1,
+            "asked by {asked}: R and R′ are one message"
+        );
+    }
+    assert!(chat::reactions_for(
+        &*w.dir,
+        &[alice_fed()],
+        &w.room,
+        &[nowhere.attestation_id.clone()],
+        &store,
+        &me
+    )
+    .await
+    .unwrap()
+    .is_empty());
+}

@@ -1370,9 +1370,15 @@ pub struct ChatReaction {
 /// does not open is kept, with its [`Body::Unopened`] reason, and is not
 /// deduplicated (its emoji is unknown).
 ///
-/// `targets`: only reactions to these ids; empty: every reaction in the
-/// room. A host folding by lineage passes every id of a message's chain
-/// (its widening and its revisions).
+/// A reaction counts only on a message of `room` that `participants` wrote
+/// (a reply included), read as the message stands: one naming an older form
+/// of a message (its `self` row, a revised prior) counts on, and reports, the
+/// message's head; one naming no message here is dropped. So `participants`
+/// are the room's speakers, as for [`messages_in_room`], not only the
+/// reactors.
+///
+/// `targets`: only reactions to these ids (any form of a message's chain);
+/// empty: every reaction in the room.
 ///
 /// # Errors
 /// A directory read failure.
@@ -1385,6 +1391,15 @@ pub async fn reactions_for(
     viewer_key_id: &str,
 ) -> Result<Vec<ChatReaction>, String> {
     let rows = rows_in_room(directory, participants, room, CHAT_REACTION_DIMENSION).await?;
+    // v45.1.7 — a reaction counts only on a message of THIS room as it
+    // stands (Codex on #1016: a hand-built reaction naming a foreign-room or
+    // unknown id was returned room-wide). One naming an older form of a
+    // message counts on the message as revised.
+    let (messages, aliases) =
+        rows_in_room_folded(directory, participants, room, CHAT_MESSAGE_DIMENSION).await?;
+    let in_room: std::collections::BTreeSet<&str> =
+        messages.iter().map(|m| m.attestation_id.as_str()).collect();
+    let targets: Vec<&str> = targets.iter().map(|t| aliases.head(t)).collect();
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::<(String, String, String)>::new();
     let mut per_person = std::collections::BTreeMap::<(String, String), usize>::new();
@@ -1396,12 +1411,22 @@ pub async fn reactions_for(
         else {
             continue;
         };
-        if !targets.is_empty() && !targets.iter().any(|t| t == target) {
+        let target = aliases.head(target);
+        if !in_room.contains(target) {
+            tracing::debug!(
+                reaction = %a.attestation_id,
+                target,
+                "a reaction on no message of this room is dropped"
+            );
             continue;
         }
-        let Some(r) = open_reaction(a, room, store, viewer_key_id).await else {
+        if !targets.is_empty() && !targets.contains(&target) {
+            continue;
+        }
+        let Some(mut r) = open_reaction(a, room, store, viewer_key_id).await else {
             continue;
         };
+        target.clone_into(&mut r.target_attestation_id);
         if let Body::Text(emoji) = &r.emoji {
             if !is_one_emoji(emoji) {
                 tracing::debug!(
@@ -1959,6 +1984,43 @@ pub async fn rows_in_room(
     room: &str,
     dimension: &str,
 ) -> Result<Vec<Attestation>, String> {
+    Ok(
+        rows_in_room_folded(directory, participants, room, dimension)
+            .await?
+            .0,
+    )
+}
+
+/// v45.1.7 — every id a row was folded out under, to the row that now stands
+/// for it: a revision's or a widening's prior → the head (followed through a
+/// chain, bounded). A reply or reaction naming an older form of a message is
+/// read against the message as it stands (Codex on #1016: a revised root
+/// split its thread, its older replies naming the prior id).
+#[derive(Debug, Default)]
+pub(crate) struct Aliases(std::collections::BTreeMap<String, String>);
+
+impl Aliases {
+    /// `id` as the room holds it now: its head when it was revised or
+    /// widened, else itself.
+    pub(crate) fn head<'a>(&'a self, id: &'a str) -> &'a str {
+        let mut at = id;
+        for _ in 0..16 {
+            match self.0.get(at) {
+                Some(next) if next != at => at = next,
+                _ => break,
+            }
+        }
+        at
+    }
+}
+
+/// [`rows_in_room`], with the [`Aliases`] its fold made.
+pub(crate) async fn rows_in_room_folded(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    participants: &[String],
+    room: &str,
+    dimension: &str,
+) -> Result<(Vec<Attestation>, Aliases), String> {
     use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
     use ciris_persist::federation::types::attestation_type as ty;
     // persist v56 (#1001): each participant's rows of `dimension`, plus the
@@ -2006,6 +2068,7 @@ pub async fn rows_in_room(
         .collect();
     let mut folded = std::collections::BTreeSet::<String>::new();
     let mut foreign = std::collections::BTreeSet::<String>::new();
+    let mut aliases = std::collections::BTreeMap::<String, String>::new();
     for c in &rows {
         let Some(target) =
             ciris_persist::federation::precedence::references_attestation_id_from_envelope(
@@ -2019,6 +2082,9 @@ pub async fn rows_in_room(
         };
         if composer_is_authors(c, t) {
             folded.insert(target.to_owned());
+            if c.attestation_type == ty::SUPERSEDES {
+                aliases.insert(target.to_owned(), c.attestation_id.clone());
+            }
         } else {
             // Someone else's composer over this message is not a thing said
             // either: it is dropped, not shown as an empty message.
@@ -2045,7 +2111,7 @@ pub async fn rows_in_room(
             .then_with(|| a.attestation_id.cmp(&b.attestation_id))
     });
     out.dedup_by(|a, b| a.attestation_id == b.attestation_id);
-    Ok(out)
+    Ok((out, Aliases(aliases)))
 }
 
 /// Read a room's messages, oldest first, one per thing said, OPENED with the
@@ -2077,13 +2143,13 @@ pub async fn messages_in_room(
     store: &dyn crate::group_content::GroupContentStore,
     viewer_key_id: &str,
 ) -> Result<Vec<ChatMessage>, String> {
-    let mut out: Vec<ChatMessage> =
-        rows_in_room(directory, participants, room, CHAT_MESSAGE_DIMENSION)
-            .await?
-            .iter()
-            .filter_map(|a| ChatMessage::from_row(a, room))
-            .collect();
-    file_replies_under_roots(&mut out);
+    let (rows, aliases) =
+        rows_in_room_folded(directory, participants, room, CHAT_MESSAGE_DIMENSION).await?;
+    let mut out: Vec<ChatMessage> = rows
+        .iter()
+        .filter_map(|a| ChatMessage::from_row(a, room))
+        .collect();
+    file_replies_under_roots(&mut out, &aliases);
     // Corroborate the pre-v39 claims, one owner walk per distinct attester.
     let mut owner_of: std::collections::BTreeMap<String, Option<String>> =
         std::collections::BTreeMap::new();
@@ -2139,7 +2205,17 @@ pub async fn messages_in_room(
 /// v45.1.7 — no threads in threads, as a reader: a reply whose named target
 /// is itself a reply here (by its id or the self row it widens) is filed
 /// under that reply's root, followed to a root (bounded; a cycle stops).
-fn file_replies_under_roots(messages: &mut [ChatMessage]) {
+fn file_replies_under_roots(messages: &mut [ChatMessage], aliases: &Aliases) {
+    // A reply naming an older form of its root (the root revised since) is
+    // read against the root as it stands, so a thread stays one thread.
+    for m in messages.iter_mut() {
+        if let Some(r) = &m.replies_to {
+            let head = aliases.head(r);
+            if head != r {
+                m.replies_to = Some(head.to_owned());
+            }
+        }
+    }
     let mut parent: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for m in messages.iter() {
         if let Some(r) = &m.replies_to {
@@ -2162,7 +2238,7 @@ fn file_replies_under_roots(messages: &mut [ChatMessage]) {
                 _ => break,
             }
         }
-        m.replies_to = Some(root);
+        m.replies_to = Some(aliases.head(&root).to_owned());
     }
 }
 
@@ -2845,8 +2921,52 @@ mod reaction_tests {
             m("nested", None, Some("reply-self")),
             m("nested2", None, Some("nested")),
         ];
-        file_replies_under_roots(&mut v);
+        file_replies_under_roots(&mut v, &Aliases::default());
         let to: Vec<Option<&str>> = v.iter().map(|m| m.replies_to.as_deref()).collect();
         assert_eq!(to, [None, Some("root"), Some("root"), Some("root")]);
+    }
+
+    /// v45.1.7 (Codex on #1016) — a reply naming any older form of its root
+    /// (revised twice: R → R′ → R″) is filed under the root as it stands, and
+    /// a nested reply under such a reply too.
+    #[test]
+    fn a_reply_to_a_revised_root_is_filed_under_its_head() {
+        let m = |id: &str, to: Option<&str>| ChatMessage {
+            attestation_id: id.to_owned(),
+            author_key_id: "a".to_owned(),
+            attesting_key_id: "a".to_owned(),
+            on_behalf_of_claim: None,
+            body: Body::Text(String::new()),
+            asserted_at: chrono::Utc::now(),
+            widens: None,
+            edits: None,
+            attachment: None,
+            replies_to: to.map(str::to_owned),
+        };
+        let aliases = Aliases(
+            [("R", "R1"), ("R1", "R2")]
+                .into_iter()
+                .map(|(a, b)| (a.to_owned(), b.to_owned()))
+                .collect(),
+        );
+        let mut v = vec![
+            m("R2", None),
+            m("old", Some("R")),
+            m("mid", Some("R1")),
+            m("new", Some("R2")),
+            m("nested", Some("old")),
+        ];
+        file_replies_under_roots(&mut v, &aliases);
+        let to: Vec<Option<&str>> = v.iter().map(|m| m.replies_to.as_deref()).collect();
+        assert_eq!(to, [None, Some("R2"), Some("R2"), Some("R2"), Some("R2")]);
+        assert_eq!(aliases.head("R"), "R2");
+        assert_eq!(aliases.head("other"), "other");
+        let cycle = Aliases(
+            [("x", "y"), ("y", "x")]
+                .into_iter()
+                .map(|(a, b)| (a.to_owned(), b.to_owned()))
+                .collect(),
+        );
+        let _ = cycle.head("x"); // bounded: a cycle stops
     }
 }
