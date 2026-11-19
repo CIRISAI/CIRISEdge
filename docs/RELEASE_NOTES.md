@@ -20,6 +20,9 @@ CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. No migration. Detail in CHANGELO
   through the seat get legs.
 - **A call leg born on a punched interface reads punched** in `leg_info` and `call_legs`
   (it read `Interface` before).
+- **Three `call_legs` corrections from review:** a link forwarded through a punched transport
+  peer reads `relayed`; a release or skip at a reorder deadline is published without waiting for
+  another packet; send and receive bitrate both count the chunk's plaintext payload.
 - **persist v61.4.2:** the capsule proxy routes 34 directory methods it used to refuse, among them
   `list_live_consent_grants_by`. Wire-compatible; ABI 13.
 - **Witnessed:** red with each fix undone, green here.

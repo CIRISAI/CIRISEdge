@@ -92,6 +92,16 @@ rows and shows a reply as a plain message.
   `DirectUdp` when it was moved onto a punched interface or its interface index is one a direct
   path rides (`DirectPathTracker::punched_interfaces`); the link list is read only while a direct
   path is up. Found by the E4 telemetry witness, red before the fix.
+- **A link forwarded through a punched peer reads relayed** (Codex on #1016). A punched interface
+  is one socket to one peer (leviculum `interfaces/direct_udp.rs`), but when that peer is a
+  transport node a link to a third destination through it leaves on the same interface; the
+  born-on check now also requires the link not be forwarded (`born_on_punched`).
+- **A release or skip at a reorder deadline is published** (Codex on #1016). Only arrivals marked
+  the receive side for its once-a-second publish, so a deadline's release or skip after the last
+  arrival left bitrate, skipped, depth and lost stale until the next packet. `RxPublish` marks a
+  publish on any release, skip or framing-gate move; an idle call publishes nothing.
+- **`ciris.edge.call.bitrate` counts one layer both ways** (Codex on #1016): each chunk's
+  plaintext payload. The send side counted the wire form (overhead and trailer included).
 
 ### Privacy
 
