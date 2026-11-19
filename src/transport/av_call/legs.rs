@@ -18,6 +18,10 @@ use crate::transport::realtime_av::{
 
 use super::{call_id_hex, CallState, LegPath, Shared};
 
+/// The largest transit step one sample may add to the jitter estimate (ms):
+/// past it, a clock step or a forged source stamp, not jitter.
+const JITTER_STEP_MAX_MS: u128 = 60_000;
+
 /// How often the reorder loop publishes what it accumulated.
 pub(super) const RX_PUBLISH_EVERY: Duration = Duration::from_secs(1);
 /// A stream (or an own stream on a leg) unheard this long has no row: it
@@ -78,7 +82,7 @@ pub(super) struct RxAcc {
     since: Instant,
     last: Instant,
     jitter_ms: f64,
-    last_transit_ms: Option<i64>,
+    last_transit_ms: Option<i128>,
 }
 
 impl RxAcc {
@@ -95,13 +99,22 @@ impl RxAcc {
 
     /// One copy arrived at `arrival_ms` (UNIX ms), signed at `source_ms`: the
     /// RFC 3550 §6.4.1 estimator, `J += (|D| − J) / 16`.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
+    ///
+    /// `source_ms` is the publisher's, any `u64` (Codex on #1016: an `i64`
+    /// cast of a value past 2^63 overflowed the subtraction, a panic that
+    /// killed the reorder task under overflow checks). The transit is taken in
+    /// `i128`, which no two `u64`s overflow, and a step larger than
+    /// [`JITTER_STEP_MAX_MS`] is a clock step or a forged stamp, not jitter:
+    /// it re-anchors the transit and leaves the estimate as it was.
+    #[allow(clippy::cast_precision_loss)]
     pub(super) fn on_arrival(&mut self, at: Instant, arrival_ms: u64, source_ms: u64) {
         self.last = self.last.max(at);
-        let transit = arrival_ms as i64 - source_ms as i64;
+        let transit = i128::from(arrival_ms) - i128::from(source_ms);
         if let Some(prev) = self.last_transit_ms {
-            let d = (transit - prev).unsigned_abs() as f64;
-            self.jitter_ms += (d - self.jitter_ms) / 16.0;
+            let d = (transit - prev).unsigned_abs();
+            if d <= JITTER_STEP_MAX_MS {
+                self.jitter_ms += (d as f64 - self.jitter_ms) / 16.0;
+            }
         }
         self.last_transit_ms = Some(transit);
     }
@@ -593,6 +606,32 @@ mod tests {
         rx.on_released(ChunkPayload::of_len(h.frame.bytes.len()));
         assert_eq!(leg.tx[&key].0, rx.bytes);
         assert_eq!(rx.bytes, 100, "the plaintext, not the wire form");
+    }
+
+    /// Codex on #1016 — a publisher's source stamp is any `u64`: `u64::MAX`
+    /// must neither panic (the `i64` cast overflowed before) nor poison the
+    /// estimate, and ordinary samples around it still read as jitter.
+    #[test]
+    fn an_absurd_source_stamp_neither_panics_nor_poisons_jitter() {
+        let t = Instant::now();
+        let mut rx = RxAcc::new("bob", t);
+        rx.on_arrival(t, 1_000_000, 999_980);
+        rx.on_arrival(t, 1_000_020, u64::MAX);
+        rx.on_arrival(t, 1_000_030, 1 << 63);
+        rx.on_arrival(t, 1_000_040, 0);
+        assert!(rx.jitter_ms.is_finite());
+        assert!(
+            rx.jitter_ms.abs() < f64::EPSILON,
+            "absurd steps are skipped: {}",
+            rx.jitter_ms
+        );
+        rx.on_arrival(t, 1_000_060, 999_980);
+        rx.on_arrival(t, 1_000_090, 1_000_000);
+        assert!(
+            (rx.jitter_ms - 10.0 / 16.0).abs() < 1e-9,
+            "a 10 ms step after re-anchoring is jitter: {}",
+            rx.jitter_ms
+        );
     }
 
     /// A skip that releases nothing still marks the publish (the counts
