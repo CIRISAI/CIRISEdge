@@ -248,6 +248,36 @@ impl Proposing {
     }
 }
 
+/// v45.1.7 — where [`DirectLinksConfig::resolve_facilitator`] found the
+/// facilitator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FacilitatorSource {
+    /// Proposing is off: none.
+    ProposingOff,
+    /// The host named it.
+    Host,
+    /// The genesis bundle's first serve node.
+    Bundle,
+    /// The first bootstrap peer the operator named.
+    Bootstrap,
+    /// Nowhere: nothing proposes.
+    None,
+}
+
+impl FacilitatorSource {
+    /// The log token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProposingOff => "proposing_off",
+            Self::Host => "host",
+            Self::Bundle => "bundle",
+            Self::Bootstrap => "bootstrap",
+            Self::None => "none",
+        }
+    }
+}
+
 /// CIRISEdge#805 item 8 — direct links for this node. The default proposes
 /// ([`Proposing::On`]) with the facilitator the host's init resolves from
 /// the genesis bundle ([`Self::resolve_bundle_facilitator`]), serves no
@@ -351,6 +381,67 @@ impl DirectLinksConfig {
             }
         }
         self
+    }
+
+    /// v45.1.7 — fill an unnamed facilitator in the order a host that runs
+    /// no compose of its own needs: the host-named one, else the bundle's
+    /// (under the CIRISEdge#661 gate), else the FIRST of `bootstrap` (the
+    /// operator's own bootstrap peers, which serve a facilitator on UDP at
+    /// their TCP dial's port, as the server's compose assumes). An
+    /// operator-named peer is not the baked canonical, so the #661 gate still
+    /// holds under a test trust root. `Off` resolves nothing. Logged once, at
+    /// INFO, with the source.
+    #[must_use]
+    pub fn resolve_facilitator(
+        self,
+        baked_dials_allowed: bool,
+        bootstrap: &[std::net::SocketAddr],
+    ) -> Self {
+        let (out, source) =
+            self.resolve_facilitator_from(baked_dials_allowed, Self::bundle_facilitator, bootstrap);
+        match &out.facilitator {
+            Some(f) => tracing::info!(
+                facilitator = %f,
+                source = source.as_str(),
+                "direct links: facilitator resolved"
+            ),
+            None => tracing::info!(
+                source = source.as_str(),
+                proposing = ?out.proposing,
+                "direct links: no facilitator, so nothing proposes"
+            ),
+        }
+        out
+    }
+
+    /// [`Self::resolve_facilitator`] with the bundle's facilitator read
+    /// through `bundle` (only when the gate allows it), and its source
+    /// returned rather than logged.
+    #[must_use]
+    pub fn resolve_facilitator_from(
+        mut self,
+        baked_dials_allowed: bool,
+        bundle: impl FnOnce() -> Option<String>,
+        bootstrap: &[std::net::SocketAddr],
+    ) -> (Self, FacilitatorSource) {
+        if self.proposing == Proposing::Off {
+            self.facilitator = None;
+            return (self, FacilitatorSource::ProposingOff);
+        }
+        if self.facilitator.is_some() {
+            return (self, FacilitatorSource::Host);
+        }
+        if baked_dials_allowed {
+            if let Some(f) = bundle() {
+                self.facilitator = Some(f);
+                return (self, FacilitatorSource::Bundle);
+            }
+        }
+        if let Some(first) = bootstrap.first() {
+            self.facilitator = Some(first.to_string());
+            return (self, FacilitatorSource::Bootstrap);
+        }
+        (self, FacilitatorSource::None)
     }
 
     /// The settings handed to `ReticulumNodeBuilder::direct_link`, always,
@@ -1592,5 +1683,62 @@ mod tests {
             Duration::ZERO
         ));
         assert!(direct_leg_stalled(0, DIRECT_LEG_NO_PROGRESS));
+    }
+
+    /// v45.1.7 — an agent-style (PyO3) node under a test trust root, with
+    /// bootstrap peers and no facilitator named, proposes through its first
+    /// bootstrap peer (red at 45.1.6: it resolved none, and members two hops
+    /// apart through the seat never got a leg). The host's and the bundle's
+    /// still come first; `off` resolves nothing.
+    #[test]
+    fn an_unnamed_facilitator_falls_back_to_the_first_bootstrap_peer() {
+        let boot: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:4242".parse().unwrap(),
+            "10.0.0.9:4242".parse().unwrap(),
+        ];
+        let gated = crate::edge::baked_canonical_dials_allowed(None, true);
+        assert!(!gated, "a test trust root gates the baked canonical");
+        let bundle_read = std::cell::Cell::new(false);
+        let (d, src) = DirectLinksConfig::default().resolve_facilitator_from(
+            gated,
+            || {
+                bundle_read.set(true);
+                Some("108.61.242.236:4242".to_owned())
+            },
+            &boot,
+        );
+        assert!(!bundle_read.get(), "the gate never reads the bundle");
+        assert_eq!(src, FacilitatorSource::Bootstrap);
+        assert_eq!(d.facilitator.as_deref(), Some("127.0.0.1:4242"));
+        assert!(d.proposes());
+        let (d, src) = DirectLinksConfig::default().resolve_facilitator_from(
+            true,
+            || Some("108.61.242.236:4242".to_owned()),
+            &boot,
+        );
+        assert_eq!(
+            (src, d.facilitator.as_deref()),
+            (FacilitatorSource::Bundle, Some("108.61.242.236:4242"))
+        );
+        let (d, src) = DirectLinksConfig {
+            facilitator: Some("10.1.1.1:4242".to_owned()),
+            ..DirectLinksConfig::default()
+        }
+        .resolve_facilitator_from(true, || Some("x:1".to_owned()), &boot);
+        assert_eq!(
+            (src, d.facilitator.as_deref()),
+            (FacilitatorSource::Host, Some("10.1.1.1:4242"))
+        );
+        let (d, src) = DirectLinksConfig {
+            proposing: Proposing::Off,
+            ..DirectLinksConfig::default()
+        }
+        .resolve_facilitator_from(false, || None, &boot);
+        assert_eq!(
+            (src, d.facilitator),
+            (FacilitatorSource::ProposingOff, None)
+        );
+        let (d, src) = DirectLinksConfig::default().resolve_facilitator_from(false, || None, &[]);
+        assert_eq!((src, d.facilitator), (FacilitatorSource::None, None));
     }
 }
