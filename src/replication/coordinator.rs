@@ -50,8 +50,8 @@ use tracing::Instrument;
 use crate::transport::{Transport, TransportError};
 
 use super::protocol::{
-    EnvelopeKind, FetchMessage, ProtocolError, PullMessage, ReplicationMessage, SummaryMessage,
-    SummaryStatus,
+    EnvelopeKind, EnvelopeRef, FetchMessage, ProtocolError, PullMessage, ReplicationMessage,
+    SummaryMessage, SummaryStatus,
 };
 use super::session::{ReplicationOutcome, Session, SessionRole, MAX_DELIVER_ENVELOPE_BYTES};
 use super::summary::{StalenessSignal, StateApplier, StateProvider};
@@ -296,6 +296,21 @@ pub struct ReplicationCoordinator {
     /// How many empty `Diff`s the peer has sent: each is its word that it
     /// holds, or will not ask for, everything this node offered it.
     peer_lacks_nothing: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#1020 — the ids of this initiator's last few ended rounds, so
+    /// a reply that arrives after its round ended is known as OURS and late,
+    /// not a stranger's.
+    recent_rounds: std::sync::Mutex<std::collections::VecDeque<u64>>,
+    /// CIRISEdge#1020 — refs a late reply named: a responder `Summary`'s refs,
+    /// or the hashes of a `Deliver`'s bodies. Merged into the next driven
+    /// round's responder `Summary`, so its want asks for what it still lacks.
+    /// Only refs are kept, never bodies: the bytes still come through the
+    /// gated Fetch → Deliver and the apply door, as asked-for bodies (#552).
+    salvaged_refs: std::sync::Mutex<Vec<EnvelopeRef>>,
+    /// CIRISEdge#1020 — refs salvaged from late replies since construction.
+    late_refs_salvaged: AtomicU64,
+    /// CIRISEdge#1020 — hashes already salvaged once from an abandoned round
+    /// ([`Self::salvage_unanswered`]); cleared past [`Self::SALVAGE_CAP`].
+    salvaged_once: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
     /// Rings when an ordinary round ends: a held round asks again on this.
     round_finished: tokio::sync::Notify,
     last_round_lost: std::sync::atomic::AtomicBool,
@@ -415,6 +430,10 @@ impl ReplicationCoordinator {
             applier,
             session: Mutex::new(Session::new(role, kind)),
             peer_lacks_nothing: std::sync::atomic::AtomicU64::new(0),
+            recent_rounds: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            salvaged_refs: std::sync::Mutex::new(Vec::new()),
+            late_refs_salvaged: AtomicU64::new(0),
+            salvaged_once: std::sync::Mutex::new(std::collections::HashSet::new()),
             round_finished: tokio::sync::Notify::new(),
             last_round_lost: std::sync::atomic::AtomicBool::new(false),
             last_completed: std::sync::Mutex::new(None),
@@ -603,6 +622,9 @@ impl ReplicationCoordinator {
                 .try_send(msg)
                 .map_err(|_| ReplyRefusal::BackPressure);
         }
+        // CIRISEdge#1020 — whether a round is in flight or not, a reply to one
+        // of ours that already ended is late, and what it named is kept.
+        self.salvage_late_reply(&msg, round);
         if current == 0 && pull == 0 {
             return Err(ReplyRefusal::NoRoundInFlight);
         }
@@ -610,6 +632,156 @@ impl ReplicationCoordinator {
             expected: if current != 0 { current } else { pull },
             got: round,
         })
+    }
+
+    /// How many ended round ids [`Self::recent_rounds`] keeps.
+    const RECENT_ROUNDS: usize = 8;
+    /// The most refs [`Self::salvaged_refs`] holds; past it the oldest go.
+    /// Two head pages' worth: a late reply is one round's listing.
+    const SALVAGE_CAP: usize = 4096;
+
+    /// CIRISEdge#1020 — a reply to one of THIS initiator's recent rounds
+    /// arrived after that round ended (the responder answered slower than the
+    /// round's step timeout). Its frame is still dropped, visibly, because the
+    /// round id binds a reply to its session state. What it NAMED is kept: a
+    /// `Summary`'s refs, or a `Deliver`'s body hashes. The next round's want
+    /// then asks for whatever is still missing. Without this, the responder
+    /// has already moved its listing past those rows, so they wait for the
+    /// re-sweep: minutes for a first-contact peer, and a stalled contact.
+    ///
+    /// A reply naming a round this initiator never opened is a stranger's and
+    /// is ignored.
+    fn salvage_late_reply(&self, msg: &ReplicationMessage, round: u64) {
+        if round == 0 {
+            return;
+        }
+        let ours = self
+            .recent_rounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&round);
+        if !ours {
+            return;
+        }
+        // A late `Deliver` needs nothing here: the hashes it answers are still
+        // in the session's expectations (`pending_bodies`, which outlive a
+        // round reset), and [`Self::merge_salvaged`] asks for those again.
+        let named: Vec<EnvelopeRef> = match msg {
+            ReplicationMessage::Summary(sm) if sm.kind == self.kind => sm.refs.clone(),
+            _ => return,
+        };
+        if named.is_empty() {
+            return;
+        }
+        let mut kept = self
+            .salvaged_refs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut added = 0u64;
+        for r in named {
+            if !kept.iter().any(|k| k.envelope_hash == r.envelope_hash) {
+                kept.push(r);
+                added += 1;
+            }
+        }
+        if kept.len() > Self::SALVAGE_CAP {
+            let over = kept.len() - Self::SALVAGE_CAP;
+            kept.drain(..over);
+        }
+        drop(kept);
+        self.late_refs_salvaged.fetch_add(added, Ordering::Relaxed);
+        tracing::debug!(
+            peer = %self.peer_key_id,
+            kind = ?self.kind,
+            round,
+            refs = added,
+            "late reply to an ended round — its refs are kept for the next round's \
+             want (CIRISEdge#1020)"
+        );
+    }
+
+    /// CIRISEdge#1020 — the id of the driven round that ended last (0 = none
+    /// yet), for the round's log line.
+    #[must_use]
+    pub fn last_ended_round(&self) -> u64 {
+        self.recent_rounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .back()
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// CIRISEdge#1020 — refs salvaged from late replies since construction.
+    #[must_use]
+    pub fn late_refs_salvaged(&self) -> u64 {
+        self.late_refs_salvaged.load(Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#1020 — fold the salvaged refs into a responder `Summary` this
+    /// initiator is about to process in a driven round, once each.
+    fn merge_salvaged(&self, msg: &mut ReplicationMessage) {
+        let ReplicationMessage::Summary(sm) = msg else {
+            return;
+        };
+        if sm.kind != self.kind {
+            return;
+        }
+        let kept = std::mem::take(
+            &mut *self
+                .salvaged_refs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for r in kept {
+            if !sm.refs.iter().any(|k| k.envelope_hash == r.envelope_hash) {
+                sm.refs.push(r);
+            }
+        }
+    }
+
+    /// CIRISEdge#1020 — a driven round was abandoned with bodies still
+    /// expected: its `Deliver` was lost or will come late. The responder's
+    /// listing has moved past those rows, so keep their hashes for the next
+    /// round's want. Each hash is salvaged ONCE: a body the responder cannot
+    /// serve would otherwise hold every round open to its timeout (#876),
+    /// forever. After that it falls back to the re-sweep, as before.
+    fn salvage_unanswered(&self, expected: Vec<[u8; 32]>) {
+        if expected.is_empty() {
+            return;
+        }
+        let mut once = self
+            .salvaged_once
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if once.len() > Self::SALVAGE_CAP {
+            once.clear();
+        }
+        let fresh: Vec<[u8; 32]> = expected.into_iter().filter(|h| once.insert(*h)).collect();
+        drop(once);
+        if fresh.is_empty() {
+            return;
+        }
+        let mut kept = self
+            .salvaged_refs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut added = 0u64;
+        for h in fresh {
+            if !kept.iter().any(|k| k.envelope_hash == h) {
+                kept.push(EnvelopeRef {
+                    envelope_hash: h,
+                    seq: 0,
+                });
+                added += 1;
+            }
+        }
+        if kept.len() > Self::SALVAGE_CAP {
+            let over = kept.len() - Self::SALVAGE_CAP;
+            kept.drain(..over);
+        }
+        drop(kept);
+        self.late_refs_salvaged.fetch_add(added, Ordering::Relaxed);
     }
 
     /// Wait for the next inbound replication message.
@@ -751,7 +923,17 @@ impl ReplicationCoordinator {
         else {
             return;
         };
-        current_round.store(0, Ordering::Release);
+        let ended = current_round.swap(0, Ordering::AcqRel);
+        if ended != 0 {
+            let mut recent = self
+                .recent_rounds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if recent.len() >= Self::RECENT_ROUNDS {
+                recent.pop_front();
+            }
+            recent.push_back(ended);
+        }
         *round_tx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -764,7 +946,12 @@ impl ReplicationCoordinator {
     /// is inherited by the next one (CIRISEdge#634 §5.1).
     pub async fn abandon_round(&self) {
         self.end_round().await;
-        self.session.lock().await.reset();
+        let mut session = self.session.lock().await;
+        // CIRISEdge#1020 — what this round asked for and never got.
+        if self.role == SessionRole::Initiator {
+            self.salvage_unanswered(session.expected_body_hashes());
+        }
+        session.reset();
     }
 
     /// The pull round's id, minting one when none is live and no driven
@@ -870,6 +1057,10 @@ impl ReplicationCoordinator {
                         bound_round.store(incoming, Ordering::Release);
                     }
                 }
+                let mut m = m;
+                if self.role == SessionRole::Initiator {
+                    self.merge_salvaged(&mut m);
+                }
                 self.note_removal_ack(&m);
                 if matches!(&m, ReplicationMessage::Diff(d) if d.want.is_empty()) {
                     self.peer_lacks_nothing.fetch_add(1, Ordering::AcqRel);
@@ -949,6 +1140,22 @@ impl ReplicationCoordinator {
     /// when fanning round cadence across (peer × kind) pairs.
     pub fn kind(&self) -> EnvelopeKind {
         self.kind
+    }
+
+    /// CIRISEdge#1020 — a RESPONDER's reply did not leave (a send error or
+    /// timeout, expired in the lane, or shed at enqueue): the listing it
+    /// carried was not delivered, so put the listing's watermark back and the
+    /// next round lists those rows again. "Listing is not delivery" held on
+    /// the initiator side already ([`StateProvider::round_ended`]); a
+    /// responder's listing had no end, so a lost reply left its rows behind
+    /// the watermark until the re-sweep came round.
+    pub(crate) fn note_listing_lost(&self) {
+        self.provider.round_ended(self.kind, true);
+    }
+
+    /// CIRISEdge#1020 — a responder's reply left in full.
+    pub(crate) fn note_listing_delivered(&self) {
+        self.provider.listing_delivered(self.kind);
     }
 
     /// An ordinary round ended, `lost` when it did not complete
@@ -2237,6 +2444,140 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             refs,
         })
+    }
+
+    /// The `want` of the Diff a step sends, or `None` if it sends no Diff.
+    fn diff_want(step: &DriveStep) -> Option<Vec<[u8; 32]>> {
+        let msgs = match step {
+            DriveStep::SendThenWait(m) | DriveStep::SendThenComplete(m, _) => m,
+            _ => return None,
+        };
+        msgs.iter().find_map(|m| match m {
+            ReplicationMessage::Diff(d) => Some(d.want.clone()),
+            _ => None,
+        })
+    }
+
+    /// CIRISEdge#1020 — the agent-lane contact stall, 2026-11-20. The
+    /// responder answered node-a's round after that round had ended, and its
+    /// listing had already moved past the rows it named. The reply is still
+    /// DROPPED (the round id binds a reply to its session), but what it named
+    /// is not lost: the next round's want asks for it.
+    ///
+    /// Mutation that turns it red: drop the `salvage_late_reply` call in
+    /// `deliver_reply`.
+    #[tokio::test]
+    async fn a_late_summary_names_what_the_next_round_wants_1020() {
+        let (alice, _to_bob) = pull_rig(HashMap::new());
+        let _ = alice.drive_round_step(None).await.expect("opens R1");
+        let r1 = alice.current_round();
+        assert_ne!(r1, 0);
+        alice.abandon_round().await; // R1 timed out
+        let late = summary_of(
+            vec![EnvelopeRef {
+                envelope_hash: h(7),
+                seq: 1,
+            }],
+            None,
+        );
+        assert_eq!(
+            alice.deliver_reply(late, r1),
+            Err(ReplyRefusal::NoRoundInFlight),
+            "the late reply itself is still a visible drop"
+        );
+        assert_eq!(alice.late_refs_salvaged(), 1);
+        let _ = alice.drive_round_step(None).await.expect("opens R2");
+        let r2 = alice.current_round();
+        assert_ne!(r2, r1);
+        // R2's answer lists nothing: the responder's watermark is past h(7).
+        let step = alice
+            .drive_round_step(Some(summary_of(vec![], None)))
+            .await
+            .expect("step");
+        assert_eq!(
+            diff_want(&step),
+            Some(vec![h(7)]),
+            "R2 asks for what R1's late answer named"
+        );
+        // R2 is abandoned too, its body still expected: R3 asks once more
+        // (the abandoned-round salvage), and then never again (each hash once).
+        alice.abandon_round().await;
+        let _ = alice.drive_round_step(None).await.expect("opens R3");
+        let step = alice
+            .drive_round_step(Some(summary_of(vec![], None)))
+            .await
+            .expect("step");
+        assert_eq!(diff_want(&step), Some(vec![h(7)]), "R3: asked once more");
+        alice.abandon_round().await;
+        let _ = alice.drive_round_step(None).await.expect("opens R4");
+        let step = alice
+            .drive_round_step(Some(summary_of(vec![], None)))
+            .await
+            .expect("step");
+        assert_ne!(
+            diff_want(&step).unwrap_or_default(),
+            vec![h(7)],
+            "bounded: R4 does not ask again"
+        );
+    }
+
+    /// CIRISEdge#1020 — a reply naming a round this initiator never opened is
+    /// a stranger's: nothing is kept.
+    #[tokio::test]
+    async fn a_reply_to_a_round_never_opened_is_not_salvaged_1020() {
+        let (alice, _to_bob) = pull_rig(HashMap::new());
+        let late = summary_of(
+            vec![EnvelopeRef {
+                envelope_hash: h(9),
+                seq: 1,
+            }],
+            None,
+        );
+        let _ = alice.deliver_reply(late, 0x5eed);
+        assert_eq!(alice.late_refs_salvaged(), 0);
+    }
+
+    /// CIRISEdge#1020 — the round asked for a body and was abandoned before
+    /// the Deliver came (lost, or late). The responder's listing has moved
+    /// past the row, so the next round's want must name it again, ONCE: a body
+    /// the responder cannot serve would otherwise hold every round open to its
+    /// timeout (#876).
+    ///
+    /// Mutation that turns it red: drop the `salvage_unanswered` call in
+    /// `abandon_round`.
+    #[tokio::test]
+    async fn an_abandoned_round_asks_again_once_for_the_body_it_wanted_1020() {
+        let (alice, _to_bob) = pull_rig(HashMap::new());
+        let _ = alice.drive_round_step(None).await.expect("opens R1");
+        let step = alice
+            .drive_round_step(Some(summary_of(
+                vec![EnvelopeRef {
+                    envelope_hash: h(8),
+                    seq: 1,
+                }],
+                None,
+            )))
+            .await
+            .expect("step");
+        assert_eq!(diff_want(&step), Some(vec![h(8)]), "R1 wants h(8)");
+        alice.abandon_round().await; // the Deliver never came
+        let _ = alice.drive_round_step(None).await.expect("opens R2");
+        let step = alice
+            .drive_round_step(Some(summary_of(vec![], None)))
+            .await
+            .expect("step");
+        assert_eq!(diff_want(&step), Some(vec![h(8)]), "R2 asks again");
+        alice.abandon_round().await; // and again it never came
+        let _ = alice.drive_round_step(None).await.expect("opens R3");
+        let step = alice
+            .drive_round_step(Some(summary_of(vec![], None)))
+            .await
+            .expect("step");
+        assert_ne!(
+            diff_want(&step).unwrap_or_default(),
+            vec![h(8)],
+            "salvaged once; after that the re-sweep has it, as before"
+        );
     }
 
     /// The field's two losses, on one coordinator: a round is LIVE when the Pull

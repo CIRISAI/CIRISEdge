@@ -354,6 +354,12 @@ pub trait StateProvider: Send + Sync {
     /// not complete: what was listed has not been delivered.
     fn round_ended(&self, _kind: EnvelopeKind, _lost: bool) {}
 
+    /// CIRISEdge#1020 — a RESPONDER's reply carrying this provider's listing
+    /// left in full: the listing was delivered. Resets the in-a-row loss count
+    /// without taking the rollback (an initiator round on the same key may
+    /// still need it).
+    fn listing_delivered(&self, _kind: EnvelopeKind) {}
+
     /// Return the byte-exact signed envelope for the given content
     /// hash, or `None` if the envelope isn't in local state. Called
     /// during the Deliver-message construction step.

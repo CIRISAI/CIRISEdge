@@ -1519,6 +1519,7 @@ impl GatedRound<'_> {
             took_ms: started.elapsed().as_millis(),
             outcome: ended.outcome,
             error: ended.error,
+            round: self.coord.last_ended_round(),
         };
         (ran, line)
     }
@@ -1561,6 +1562,7 @@ impl GatedRound<'_> {
                 took_ms: 0,
                 outcome: crate::observability::RoundOutcome::NoRoute.as_str(),
                 error: Some(error),
+                round: 0,
             },
         )
     }
@@ -1574,12 +1576,16 @@ struct RoundLine {
     took_ms: u128,
     outcome: &'static str,
     error: Option<String>,
+    /// CIRISEdge#1020 — the round's id, the one a `round_mismatch` drop names,
+    /// so a late reply can be matched to the round it answered (0 = none ran).
+    round: u64,
 }
 
 impl RoundLine {
     fn log(&self, span: &tracing::Span, next_in: Duration, why: NextRound) {
         span.in_scope(|| {
             tracing::info!(
+                round = self.round,
                 took_ms = self.took_ms,
                 outcome = self.outcome,
                 error = self.error.as_deref().unwrap_or(""),

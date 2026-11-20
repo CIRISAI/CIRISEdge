@@ -156,6 +156,10 @@ struct ReplyJob {
     queued_at: Instant,
     bytes: usize,
     finishes: Option<Finish>,
+    /// CIRISEdge#1020 — the step that produced this reply took a HEAD LISTING
+    /// (it answered a round-opening `Summary`), so its leaving retires that
+    /// listing. A Pull's answer is a `Summary` too, but from the subject read.
+    listing: bool,
 }
 
 #[derive(Default)]
@@ -263,12 +267,26 @@ impl ReplyLane {
     /// [`Self::has_room`] before stepping a frame that wants an answer and is
     /// the only producer, so a job is refused here only when a `Deliver` was
     /// answered, which a responder does not do today.
+    #[cfg(test)]
     pub(super) fn enqueue(
         &self,
         coord: &ReplicationCoordinator,
         msgs: Vec<ReplicationMessage>,
         round: u64,
         finishes: Option<Finish>,
+    ) {
+        self.enqueue_with(coord, msgs, round, finishes, false);
+    }
+
+    /// [`Self::enqueue`], saying whether the step took a head listing
+    /// ([`ReplyJob::listing`]).
+    pub(super) fn enqueue_with(
+        &self,
+        coord: &ReplicationCoordinator,
+        msgs: Vec<ReplicationMessage>,
+        round: u64,
+        finishes: Option<Finish>,
+        listing: bool,
     ) {
         let bytes = deliver_bytes(&msgs);
         self.state.add(bytes);
@@ -278,12 +296,16 @@ impl ReplyLane {
             queued_at: Instant::now(),
             bytes,
             finishes,
+            listing,
         };
         self.state.jobs.fetch_add(1, Ordering::Relaxed);
         if self.tx.try_send(job).is_err() {
             self.state.jobs.fetch_sub(1, Ordering::Relaxed);
             self.state.give_back(bytes);
             self.shed(coord, "reply");
+            // CIRISEdge#1020 — this reply was stepped (its listing taken), then
+            // never queued: the listing was not delivered.
+            coord.note_listing_lost();
         }
     }
 }
@@ -300,6 +322,8 @@ async fn run(
         }
         if queued > max_queued(&coord) {
             count(&coord, obs::RESPONDER_ROUND_REPLY_EXPIRED);
+            // CIRISEdge#1020 — not sent: its listing was not delivered.
+            coord.note_listing_lost();
             if let ThrottleDecision::Emit { suppressed_prev } =
                 lane_log().check(coord.peer_key_id())
             {
@@ -349,7 +373,16 @@ async fn send(coord: &ReplicationCoordinator, state: &LaneState, job: &ReplyJob)
         }
         count(coord, failed);
         state.send_failed.store(true, Ordering::Release);
+        // CIRISEdge#1020 — the rest of the job is dropped with it: whatever it
+        // listed was not delivered.
+        coord.note_listing_lost();
         return;
+    }
+    // CIRISEdge#1020 — a reply that carried the step's head listing left: that
+    // listing reached the peer. A Deliver lost after it is the initiator's to
+    // ask for again (its expectations outlive the round).
+    if job.listing {
+        coord.note_listing_delivered();
     }
     if let Some(Finish { report, began }) = &job.finishes {
         count(coord, obs::RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL);
