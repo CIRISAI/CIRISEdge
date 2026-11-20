@@ -2448,9 +2448,8 @@ mod tests {
 
     /// The `want` of the Diff a step sends, or `None` if it sends no Diff.
     fn diff_want(step: &DriveStep) -> Option<Vec<[u8; 32]>> {
-        let msgs = match step {
-            DriveStep::SendThenWait(m) | DriveStep::SendThenComplete(m, _) => m,
-            _ => return None,
+        let (DriveStep::SendThenWait(msgs) | DriveStep::SendThenComplete(msgs, _)) = step else {
+            return None;
         };
         msgs.iter().find_map(|m| match m {
             ReplicationMessage::Diff(d) => Some(d.want.clone()),
