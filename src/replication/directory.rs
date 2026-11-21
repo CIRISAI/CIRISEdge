@@ -298,6 +298,28 @@ pub trait ReplicationDirectory: Send + Sync {
     /// when it did not complete.
     fn round_ended(&self, _peer_key_id: &str, _kind: EnvelopeKind, _lost: bool) {}
 
+    /// CIRISEdge#1020 — the responder's listing toward `peer_key_id` on `kind`
+    /// was delivered ([`super::summary::StateProvider::listing_delivered`]).
+    fn listing_delivered(&self, _peer_key_id: &str, _kind: EnvelopeKind) {}
+
+    /// CIRISEdge#1020 — [`super::summary::StateProvider::listing_mark`].
+    fn listing_mark(
+        &self,
+        _peer_key_id: &str,
+        _kind: EnvelopeKind,
+    ) -> Option<super::summary::ListingMark> {
+        None
+    }
+
+    /// CIRISEdge#1020 — [`super::summary::StateProvider::rewind_listing`].
+    fn rewind_listing(
+        &self,
+        _peer_key_id: &str,
+        _kind: EnvelopeKind,
+        _mark: &super::summary::ListingMark,
+    ) {
+    }
+
     /// Apply one envelope to local state. The implementation verifies the signed
     /// envelope's signature + canonical-bytes hash before admitting; the merge
     /// layer in persist is the canonical anti-rollback authority. Returns an
@@ -444,6 +466,22 @@ impl StateProvider for DirectoryStateAdapter {
     fn round_ended(&self, kind: EnvelopeKind, lost: bool) {
         if let Some(peer) = self.peer_key_id.as_deref() {
             self.inner.round_ended(peer, kind, lost);
+        }
+    }
+
+    fn listing_delivered(&self, kind: EnvelopeKind) {
+        if let Some(peer) = self.peer_key_id.as_deref() {
+            self.inner.listing_delivered(peer, kind);
+        }
+    }
+
+    fn listing_mark(&self, kind: EnvelopeKind) -> Option<super::summary::ListingMark> {
+        self.inner.listing_mark(self.peer_key_id.as_deref()?, kind)
+    }
+
+    fn rewind_listing(&self, kind: EnvelopeKind, mark: &super::summary::ListingMark) {
+        if let Some(peer) = self.peer_key_id.as_deref() {
+            self.inner.rewind_listing(peer, kind, mark);
         }
     }
 

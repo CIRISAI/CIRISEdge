@@ -4733,18 +4733,29 @@ impl EdgeMetrics {
 
     /// CIRISEdge#853 — end every link-up older than
     /// [`RESPONDER_LINK_UP_TIMEOUT`] as `timeout`. Run on the reaper's tick.
-    pub fn responder_link_up_expire(&self) {
+    ///
+    /// CIRISEdge#1019 — returns each expired link with its age, so the caller
+    /// can name it: the counter alone could not say WHICH dialers opened a link
+    /// and never sent on it.
+    pub fn responder_link_up_expire(&self) -> Vec<([u8; 16], std::time::Duration)> {
         let mut pending = self.responder_link_up_pending.write();
-        let before = pending.len();
-        pending.retain(|_, at| at.elapsed() < RESPONDER_LINK_UP_TIMEOUT);
-        let expired = (before - pending.len()) as u64;
-        if expired > 0 {
+        let mut gone = Vec::new();
+        pending.retain(|link, at| {
+            let age = at.elapsed();
+            let keep = age < RESPONDER_LINK_UP_TIMEOUT;
+            if !keep {
+                gone.push((*link, age));
+            }
+            keep
+        });
+        if !gone.is_empty() {
             *self
                 .responder_link_up_total
                 .write()
                 .entry(LINK_UP_TIMEOUT)
-                .or_insert(0) += expired;
+                .or_insert(0) += gone.len() as u64;
         }
+        gone
     }
 
     /// CIRISEdge P0 telemetry — record one anti-entropy round's wall time

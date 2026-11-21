@@ -2,6 +2,55 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.8 — 2026-11-21
+
+**PATCH. A late reply's rows are asked for again, a lost reply's listing is put back, and a link-up
+that times out is named.** Pins unchanged: persist **v61.4.2** by tag, CIRISVerify v22.2.0,
+leviculum v0.34.0+ciris.3. No migration, no wire change.
+
+### Fixed
+
+- **The agent-lane contact stall of 2026-11-20 (#1020).** A loaded canonical answered a peer's
+  anti-entropy rounds after those rounds had ended (a 10 s step), so the peer dropped each reply
+  as `round_mismatch`. Meanwhile the canonical had already moved its listing past the rows those
+  replies named, and they waited for the paced re-sweep. A first-contact peer's owner binding
+  missed the 180 s contact window.
+  - **Initiator:** a reply to one of the coordinator's last 8 ended rounds is still dropped
+    visibly, since the round id binds a reply to its session. But a late `Summary`'s refs are
+    kept and folded into the next round's want. A round abandoned with bodies still expected
+    asks for them again. Each hash is salvaged ONCE, so a body the responder cannot serve
+    costs at most one timed-out round (#876). Only refs are kept: bodies still come through the
+    gated Fetch → Deliver and the apply door (#552).
+  - **Responder: listing is not delivery, on this side too.** The responder marks where its
+    head listing starts before stepping a round-opening `Summary`, and the reply carries the
+    mark. If that reply fails to send, times out, expires in the lane or is shed after its
+    step, the watermark rewinds to at most that mark: only ever back, never to the beginning,
+    at most three in a row, and the run ends at a delivered listing. A non-listing reply's loss
+    rewinds nothing. The initiator's own restore now also only ever moves the watermark back,
+    so it can't undo a responder rewind on the shared `(peer, plane)` key.
+- **The `anti-entropy round ended` line names its `round`** (0 when none opened). A
+  `round_mismatch` drop names the same id, so a late reply can be matched to its round.
+
+### Added
+
+- **A link-up that times out is named (#1019).** Each #853 `responder_link_up` `timeout` is
+  logged at INFO with the link id, the peer it was attributed to (or `-`), the plane of ours it
+  reached, whether it is still up, and its age. Throttled to 20 a minute node-wide. Before, it
+  was only a counter.
+
+### Review
+
+An independent review of the first cut found two defects, both fixed before tag:
+- a lock-order inversion in the new link-up log that could deadlock the reaper against a send;
+- a shared rollback queue that could still skip rows. It was replaced by the per-reply marks
+  above.
+Witnesses (each red with its fix mutated out): `a_late_summary_names_what_the_next_round_wants_1020`,
+`a_reply_to_a_round_never_opened_is_not_salvaged_1020`,
+`an_abandoned_round_asks_again_once_for_the_body_it_wanted_1020`,
+`a_lost_reply_rewinds_to_its_own_listing_and_never_forward_1020`,
+`an_initiator_restore_never_moves_past_a_responder_rewind_1020`,
+`a_delivered_listing_ends_the_run_of_rewinds_1020`.
+
 ## 45.1.7 — 2026-11-19
 
 **PATCH. Per-leg call telemetry, chat reactions and flat threads, a facilitator for agent nodes,

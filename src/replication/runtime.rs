@@ -704,10 +704,19 @@ pub(crate) fn spawn_responder_drive(
                 std::time::Instant::now(),
             );
             coord.set_driver_phase(DriverPhase::Stepping);
+            // CIRISEdge#1020 — a round-opening Summary is answered with this
+            // node's head listing: mark where it starts, so the reply's loss
+            // rewinds to exactly that listing.
+            let listing = if matches!(inbound.msg, super::protocol::ReplicationMessage::Summary(_))
+            {
+                coord.listing_mark()
+            } else {
+                None
+            };
             match coord.drive_round_step_framed(Some(inbound)).await {
                 Ok(DriveStep::SendThenWait(msgs)) => {
                     if !msgs.is_empty() {
-                        lane.enqueue(&coord, msgs, coord.current_round(), None);
+                        lane.enqueue_with(&coord, msgs, coord.current_round(), None, listing);
                     }
                 }
                 // CIRISEdge#380 — defensive: `SendThenComplete` is initiator-only
@@ -716,7 +725,7 @@ pub(crate) fn spawn_responder_drive(
                 Ok(DriveStep::SendThenComplete(msgs, report)) => {
                     round_began = None;
                     let finish = Finish { report, began };
-                    lane.enqueue(&coord, msgs, coord.current_round(), Some(finish));
+                    lane.enqueue_with(&coord, msgs, coord.current_round(), Some(finish), listing);
                 }
                 Ok(DriveStep::Complete(report)) => {
                     round_began = None;

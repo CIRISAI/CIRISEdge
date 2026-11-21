@@ -715,6 +715,13 @@ impl Session {
         }
     }
 
+    /// CIRISEdge#1020 — every body this session still expects: asked for by a
+    /// Diff, Fetch or Pull and not yet received.
+    #[must_use]
+    pub fn expected_body_hashes(&self) -> Vec<[u8; 32]> {
+        self.pending_bodies.keys().copied().collect()
+    }
+
     /// Default lifetime of an expectation, in rounds.
     ///
     /// Long enough to survive the round that issued it plus a peer that answers

@@ -1480,6 +1480,8 @@ impl GatedRound<'_> {
         // permit to its outcome, whatever that outcome is: a round that
         // timed out after its full budget is exactly the one to see.
         let started = std::time::Instant::now();
+        // CIRISEdge#1020 — the round line names the round only if one opened.
+        let ended_before = self.coord.last_ended_round();
         // CC 5.4.3 — on a shaped link a wait is paced by the link's frame
         // gap: the per-wait timeout is at least the Poisson p99 of a reply's
         // frames ([`PACING_WAIT_GAPS`]), else every wait on a slow link times
@@ -1519,6 +1521,9 @@ impl GatedRound<'_> {
             took_ms: started.elapsed().as_millis(),
             outcome: ended.outcome,
             error: ended.error,
+            round: Some(self.coord.last_ended_round())
+                .filter(|r| *r != ended_before)
+                .unwrap_or(0),
         };
         (ran, line)
     }
@@ -1561,6 +1566,7 @@ impl GatedRound<'_> {
                 took_ms: 0,
                 outcome: crate::observability::RoundOutcome::NoRoute.as_str(),
                 error: Some(error),
+                round: 0,
             },
         )
     }
@@ -1574,12 +1580,16 @@ struct RoundLine {
     took_ms: u128,
     outcome: &'static str,
     error: Option<String>,
+    /// CIRISEdge#1020 — the round's id, the one a `round_mismatch` drop names,
+    /// so a late reply can be matched to the round it answered (0 = none ran).
+    round: u64,
 }
 
 impl RoundLine {
     fn log(&self, span: &tracing::Span, next_in: Duration, why: NextRound) {
         span.in_scope(|| {
             tracing::info!(
+                round = self.round,
                 took_ms = self.took_ms,
                 outcome = self.outcome,
                 error = self.error.as_deref().unwrap_or(""),
