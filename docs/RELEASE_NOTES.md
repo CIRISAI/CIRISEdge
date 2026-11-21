@@ -1,5 +1,21 @@
 # CIRISEdge Release Notes
 
+# v45.1.8 — a late reply is not lost, and a lost reply is listed again
+
+**2026-11-21.** **PATCH.** Pins unchanged: persist v61.4.2 by tag, CIRISVerify v22.2.0, leviculum
+v0.34.0+ciris.3. No migration, no wire change. Detail in CHANGELOG.md.
+
+- **The contact stall of 2026-11-20 (#1020).** A loaded canonical's replies to a peer's rounds came
+  after those rounds ended, were dropped as `round_mismatch`, and the canonical had already listed
+  past the rows they named. Now the peer keeps a late reply's refs and asks for them next round
+  (once per hash), and an abandoned round asks again, once, for what it never got. The canonical
+  rewinds its listing to where a lost reply's listing began: only back, never to the beginning.
+- **The round-ended line names its round id**, so a late reply can be matched to its round.
+- **A link-up that times out is named at INFO** (link, peer if attributed, plane, still up, age;
+  20 a minute node-wide), not only counted (#1019).
+- Reviewed before tag; the review's two findings (a lock-order inversion, a rollback queue that
+  could skip rows) are fixed. Each fix has a witness that fails with it removed.
+
 # v45.1.7 — call telemetry, chat reactions and threads
 
 **2026-11-19.** **PATCH.** Pins: persist v61.4.2 by tag (`ciris-persist==61.4.2`, `tag v61.4.2, commit 213a1c86`),
