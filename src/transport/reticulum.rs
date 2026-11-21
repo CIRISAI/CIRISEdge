@@ -1344,6 +1344,12 @@ static INBOUND_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 static NO_ROUTE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
 
+/// CIRISEdge#1019 — the link-up timeout line: up to 20 a minute node-wide.
+fn link_up_timeout_log() -> &'static crate::log_throttle::LogThrottle {
+    static T: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
+    T.get_or_init(|| crate::log_throttle::LogThrottle::new(20, Duration::from_mins(1), 4))
+}
+
 fn no_route_log() -> &'static crate::log_throttle::LogThrottle {
     NO_ROUTE_LOG
         .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_mins(10), 1024))
@@ -9896,6 +9902,36 @@ impl ReticulumTransport {
         }
     }
 
+    /// CIRISEdge#1019 — name each link a peer dialled that carried no
+    /// application frame within [`crate::observability::RESPONDER_LINK_UP_TIMEOUT`]
+    /// (the #853 `timeout` outcome, a counter until now). Says who it was if the
+    /// link was attributed, which plane of ours it reached, and whether it is
+    /// still up, so a read can tell a dialer that gave up from one that is
+    /// stuck. Node-wide throttle: a burst of abandoned dials is one line per
+    /// window plus a suppressed count, never a flood.
+    async fn log_link_up_timeouts(&self, expired: &[([u8; 16], std::time::Duration)]) {
+        use crate::log_throttle::ThrottleDecision;
+        let peers = self.link_to_peer_key_id.lock().await;
+        let planes = self.link_plane.lock().await;
+        for (link, age) in expired {
+            let id = LinkId::new(*link);
+            let ThrottleDecision::Emit { suppressed_prev } = link_up_timeout_log().check("node")
+            else {
+                continue;
+            };
+            tracing::info!(
+                link = %hex::encode(link),
+                peer = peers.get(&id).map_or("-", String::as_str),
+                plane = planes.get(&id).map_or("-", |p| p.as_str()),
+                still_up = self.node.link_is_established(&id),
+                age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                suppressed_prev,
+                "a link a peer dialled carried no application frame within the establish \
+                 window — counted responder_link_up timeout (CIRISEdge#853, #1019)"
+            );
+        }
+    }
+
     /// CIRISEdge#926 — the stall guard judged `link_id` dead. A link on a
     /// punched interface moves back onto its relayed path (leviculum#83
     /// `retire_direct_link`: the punched path is what stopped carrying the
@@ -11865,7 +11901,10 @@ impl ReticulumTransport {
                     // CIRISEdge#853 — link-ups that never reached an
                     // application frame within the establish window.
                     if let Some(m) = self.metrics.get() {
-                        m.responder_link_up_expire();
+                        let expired = m.responder_link_up_expire();
+                        if !expired.is_empty() {
+                            self.log_link_up_timeouts(&expired).await;
+                        }
                     }
                     let closed = self.reap_idle_inbound_links().await;
                     if closed > 0 {
