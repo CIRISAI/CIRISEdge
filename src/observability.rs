@@ -1411,8 +1411,11 @@ pub const ADVERTISE_SEND_SET_INVALIDATED: &str = "advertise_send_set_invalidated
 /// LIVE (inside its TTL): the next round's send set pays a read it would
 /// otherwise have answered from memory. The cause split of the #968 drops.
 pub const ADVERTISE_SEND_SET_DROPPED_LIVE: &str = "advertise_send_set_dropped_live";
-/// CIRISEdge#971 — a round found the consent memo present but past
-/// its TTL (the other cause of a send-set read).
+/// CIRISEdge#971 — a send-set read whose cause is the TTL: the memo was
+/// present but past its TTL, or (45.1.9, A5) a door dropped a memo that had
+/// already expired. The `ttl` reason of the send set's read causes, so
+/// `advertise_send_set_read_miss + advertise_send_set_expired +
+/// advertise_send_set_read_invalidated` equals the send set's store reads.
 pub const ADVERTISE_SEND_SET_EXPIRED: &str = "advertise_send_set_expired";
 /// 45.1.9 (attribution) — a send-set lookup answered from the consent memo,
 /// at whichever caller asked (a round's advertise, a fetch, a shed's

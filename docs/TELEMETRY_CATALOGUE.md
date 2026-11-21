@@ -90,7 +90,7 @@ Log lines that name peers or rooms stay local: `edge.alm.decision` at DEBUG,
 referral lines, `direct link` lines, `room` in `CALL JOINED` and `CALL LEFT`. The
 `shaped frame sent` TRACE line must never be enabled in production.
 
-## The six questions
+## The questions
 
 ### Why didn't this peer connect?
 
