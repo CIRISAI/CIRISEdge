@@ -522,6 +522,11 @@ struct VerdictCache {
     /// miss and commits only if it is unchanged — see [`Self::commit`].
     generation: u64,
     by_subject: HashMap<CacheKey, CachedVerdict>,
+    /// 45.1.9 (attribution) — pairs dropped since their last resolve, and
+    /// why. Telemetry only: [`Self::get_fresh`] never reads it, and it is
+    /// capped ([`crate::replication::memo_attribution::DROP_MARKS_CAP`]), as
+    /// both halves of the key are peer-supplied.
+    dropped: crate::replication::memo_attribution::DropMarks<CacheKey>,
 }
 
 impl VerdictCache {
@@ -561,10 +566,18 @@ impl VerdictCache {
         // (the row's signed mirror), so an unbounded map would be a cheap DoS —
         // and post-#731 the key is a PAIR, so the product of forged roots and
         // forged signers is what an attacker would try to inflate.
-        self.by_subject
-            .retain(|_, v| now.saturating_duration_since(v.fetched_at) < RELAY_VERDICT_TTL);
+        let dropped = &mut self.dropped;
+        self.by_subject.retain(|key, v| {
+            let keep = now.saturating_duration_since(v.fetched_at) < RELAY_VERDICT_TTL;
+            if !keep {
+                dropped.dropped(key.clone(), false);
+            }
+            keep
+        });
+        let key = cache_key(subject);
+        self.dropped.filled(&key);
         self.by_subject.insert(
-            cache_key(subject),
+            key,
             CachedVerdict {
                 verdict,
                 fetched_at: now,
@@ -588,15 +601,47 @@ impl VerdictCache {
     /// it.
     fn invalidate(&mut self, key_id: &str) {
         self.generation = self.generation.wrapping_add(1);
-        self.by_subject
-            .retain(|(root, signer), _| root != key_id && signer != key_id);
+        let now = Instant::now();
+        let dropped = &mut self.dropped;
+        self.by_subject.retain(|key, v| {
+            let keep = key.0 != key_id && key.1 != key_id;
+            if !keep {
+                dropped.dropped(key.clone(), Self::live(v, now));
+            }
+            keep
+        });
+    }
+
+    fn live(entry: &CachedVerdict, now: Instant) -> bool {
+        now.saturating_duration_since(entry.fetched_at) < RELAY_VERDICT_TTL
+    }
+
+    /// 45.1.9 (attribution) — why a resolve of `subject` that found no fresh
+    /// verdict is happening: a verdict past its TTL, else what dropped it.
+    fn cause(
+        &self,
+        subject: &AccordRelaySubject,
+        now: Instant,
+    ) -> crate::replication::memo_attribution::FallThrough {
+        let key = cache_key(subject);
+        match self.by_subject.get(&key) {
+            Some(v) if !Self::live(v, now) => {
+                crate::replication::memo_attribution::FallThrough::Ttl
+            }
+            _ => self.dropped.cause(&key),
+        }
     }
 
     /// Drop everything (a coarse "trust state moved and we cannot cheaply say
     /// whose" signal). Bumps the generation for the same reason.
     fn invalidate_all(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-        self.by_subject.clear();
+        let now = Instant::now();
+        let taken = std::mem::take(&mut self.by_subject);
+        self.dropped.dropped_all(taken.into_iter().map(|(key, v)| {
+            let live = Self::live(&v, now);
+            (key, live)
+        }));
     }
 }
 
@@ -621,6 +666,9 @@ pub struct AccordRelayGate {
     /// "I" cannot evaluate consent-scoped reach at all.
     self_key_id: Option<String>,
     cache: Mutex<VerdictCache>,
+    /// 45.1.9 (attribution) — where every resolve's cause and the cache's
+    /// size are counted. `None` counts nothing.
+    metrics: Option<crate::observability::EdgeMetrics>,
 }
 
 impl AccordRelayGate {
@@ -634,6 +682,43 @@ impl AccordRelayGate {
             directory,
             self_key_id,
             cache: Mutex::new(VerdictCache::default()),
+            metrics: None,
+        }
+    }
+
+    /// 45.1.9 (attribution) — count every lookup's cause and the cache's size
+    /// into `metrics` (builder).
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// 45.1.9 — book a lookup that found no fresh verdict, under its cause.
+    fn book_resolve(&self, cache: &VerdictCache, subject: &AccordRelaySubject, now: Instant) {
+        use crate::replication::memo_attribution::book_read;
+        book_read(
+            self.metrics.as_ref(),
+            &crate::observability::MEMO_READS_ACCORD_RELAY,
+            cache.cause(subject, now),
+        );
+    }
+
+    /// 45.1.9 — book a lookup answered from the cache.
+    fn book_hit(&self) {
+        crate::replication::memo_attribution::book_hit(
+            self.metrics.as_ref(),
+            &crate::observability::MEMO_READS_ACCORD_RELAY,
+        );
+    }
+
+    /// 45.1.9 — the cache's size gauge.
+    fn gauge_size(&self, cache: &VerdictCache) {
+        if let Some(m) = &self.metrics {
+            m.set_structure_size(
+                crate::observability::STRUCTURE_SIZE_ACCORD_RELAY_VERDICTS,
+                cache.by_subject.len(),
+            );
         }
     }
 
@@ -734,8 +819,10 @@ impl AccordRelayGate {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.get_fresh(&subject, now).is_some() {
+                self.book_hit();
                 return Ok(subject);
             }
+            self.book_resolve(&guard, &subject, now);
             // Snapshot the generation WITH the miss check, so an invalidation
             // during the `.await` below is detected at commit.
             guard.generation
@@ -754,10 +841,14 @@ impl AccordRelayGate {
                 return Ok(subject);
             }
         };
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .commit(&subject, verdict, gen_at_miss, now);
+        {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.commit(&subject, verdict, gen_at_miss, now);
+            self.gauge_size(&cache);
+        }
         Ok(subject)
     }
 
@@ -816,10 +907,12 @@ impl AccordRelayGate {
                 .cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match guard.get_fresh(&subject, now) {
-                Some(verdict) => return decision_of(verdict),
-                None => guard.generation,
+            if let Some(verdict) = guard.get_fresh(&subject, now) {
+                self.book_hit();
+                return decision_of(verdict);
             }
+            self.book_resolve(&guard, &subject, now);
+            guard.generation
         };
         let verdict =
             match may_relay_accord_participation(&*self.directory, us, participation).await {
@@ -835,10 +928,14 @@ impl AccordRelayGate {
                     return RelayDecision::Refused(RelayRefusal::Unresolved);
                 }
             };
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .commit(&subject, verdict, gen_at_miss, now);
+        {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.commit(&subject, verdict, gen_at_miss, now);
+            self.gauge_size(&cache);
+        }
         decision_of(verdict)
     }
 
@@ -854,19 +951,23 @@ impl AccordRelayGate {
     /// trust rule — being too eager only costs a re-resolve, while being too
     /// narrow caches a verdict past the event that falsified it.
     pub fn invalidate(&self, key_id: &str) {
-        self.cache
+        let mut cache = self
+            .cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .invalidate(key_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.invalidate(key_id);
+        self.gauge_size(&cache);
     }
 
     /// Drop every cached verdict — the coarse "trust state moved and we cannot
     /// cheaply say whose" signal.
     pub fn invalidate_all(&self) {
-        self.cache
+        let mut cache = self
+            .cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .invalidate_all();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.invalidate_all();
+        self.gauge_size(&cache);
     }
 
     /// Test/diagnostic: how many verdicts are currently cached (fresh or not).
@@ -1508,6 +1609,53 @@ mod tests {
     /// The decision then flips from `Unresolved` to `RosterUnresolvable` —
     /// proving the resolve actually ran, which a bare "still refused" could
     /// not.
+    /// 45.1.9 (attribution) — every prime is counted under why it resolved
+    /// or did not: `miss` (never cached), `hit`, `ttl` (the verdict expired),
+    /// `invalidated` (an event dropped it live, keyed or whole); the size
+    /// gauge follows the cache. The verdict's value is not under test.
+    #[tokio::test]
+    async fn every_prime_says_why_it_resolved_attribution_1019x() {
+        use crate::observability as obs;
+        let dir: Arc<dyn FederationDirectory> =
+            Arc::new(ciris_persist::store::test_backend::test_backend());
+        let m = obs::EdgeMetrics::new();
+        let gate = AccordRelayGate::new(dir, Some("us".into())).with_metrics(Some(m.clone()));
+        let reads = |label: &str| m.memo_reads().get(label).copied().unwrap_or(0);
+        let verdicts = || {
+            m.structure_sizes()
+                .get(obs::STRUCTURE_SIZE_ACCORD_RELAY_VERDICTS)
+                .copied()
+        };
+        let row = drill_row("holder-a", "accord-root");
+        let t0 = now();
+        gate.prime(&row, t0).await.expect("judgeable");
+        assert_eq!(reads(obs::MEMO_READ_ACCORD_RELAY_MISS), 1);
+        assert_eq!(verdicts(), Some(1));
+        gate.prime(&row, t0).await.expect("judgeable");
+        assert_eq!(reads(obs::MEMO_READ_ACCORD_RELAY_HIT), 1);
+        let t1 = t0 + RELAY_VERDICT_TTL;
+        gate.prime(&row, t1).await.expect("judgeable");
+        assert_eq!(reads(obs::MEMO_READ_ACCORD_RELAY_TTL), 1);
+        gate.invalidate("holder-a");
+        assert_eq!(verdicts(), Some(0));
+        gate.prime(&row, t1).await.expect("judgeable");
+        assert_eq!(reads(obs::MEMO_READ_ACCORD_RELAY_INVALIDATED), 1, "keyed");
+        gate.invalidate_all();
+        gate.prime(&row, t1).await.expect("judgeable");
+        assert_eq!(reads(obs::MEMO_READ_ACCORD_RELAY_INVALIDATED), 2, "whole");
+        // A pair evicted by a later commit's expiry sweep reads as its TTL.
+        let other = drill_row("holder-b", "accord-root");
+        gate.prime(&other, t1 + RELAY_VERDICT_TTL)
+            .await
+            .expect("judgeable");
+        assert_eq!(reads(obs::MEMO_READ_ACCORD_RELAY_MISS), 2, "never cached");
+        assert_eq!(verdicts(), Some(1), "the expired pair was swept");
+        gate.prime(&row, t1 + RELAY_VERDICT_TTL)
+            .await
+            .expect("judgeable");
+        assert_eq!(reads(obs::MEMO_READ_ACCORD_RELAY_TTL), 2, "swept expired");
+    }
+
     #[tokio::test]
     async fn priming_an_unheld_root_caches_a_cannot_judge_verdict() {
         let dir: Arc<dyn FederationDirectory> =

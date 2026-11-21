@@ -243,6 +243,11 @@ impl FeedState {
     pub(crate) fn take(&mut self, read: KeyPlaneRead) -> Pending {
         std::mem::take(&mut self.inboxes[read.index()])
     }
+
+    /// 45.1.9 (attribution) — rows waiting in `read`'s inbox.
+    pub(crate) fn inbox_len(&self, read: KeyPlaneRead) -> usize {
+        self.inboxes[read.index()].rows.len()
+    }
 }
 
 #[cfg(test)]

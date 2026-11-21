@@ -127,7 +127,7 @@ pub(crate) enum KeyPlaneRead {
 }
 
 impl KeyPlaneRead {
-    #[cfg(test)]
+    /// Every slot, in slot order.
     pub(crate) const ALL: [Self; 4] = [
         Self::KeyRecord,
         Self::OccurrenceBinding,
@@ -381,6 +381,11 @@ pub(crate) struct PlaneMemo {
     generation: u64,
     /// The listing cache, most recently used first.
     listings: Vec<CachedListing>,
+    /// 45.1.9 (attribution) — subjects dropped since their last read, and
+    /// why (a delta row, an overflow or a forget: `invalidated`; an answer
+    /// that aged out or whose revalidation failed: `ttl`). Telemetry only:
+    /// [`Self::lookup`] never reads it.
+    dropped: super::memo_attribution::DropMarks<String>,
     /// Test-only: how much older than `built_at` the memo reads ([`Self::age`]).
     #[cfg(test)]
     aged: Duration,
@@ -461,7 +466,14 @@ impl PlaneMemo {
     /// dirt BEFORE this runs.
     pub(crate) fn revalidate(&mut self, now: Instant) {
         let prior = self.epoch;
-        self.entries.retain(|_, a| a.epoch == prior);
+        let dropped = &mut self.dropped;
+        self.entries.retain(|subject, a| {
+            let keep = a.epoch == prior;
+            if !keep {
+                dropped.dropped(subject.clone(), false);
+            }
+            keep
+        });
         self.epoch = self.epoch.wrapping_add(1);
         self.built_at = Some(now);
         self.reset_age();
@@ -471,7 +483,9 @@ impl PlaneMemo {
     /// Forget everything, so the next listing rebuilds (a probe that could
     /// not read the store cannot vouch for any answer).
     pub(crate) fn forget(&mut self) {
-        self.entries.clear();
+        let taken = std::mem::take(&mut self.entries);
+        self.dropped
+            .dropped_all(taken.into_keys().map(|subject| (subject, true)));
         self.listings.clear();
         self.built_at = None;
         self.forgotten = true;
@@ -486,11 +500,19 @@ impl PlaneMemo {
             Dirt::Clean => 0,
             Dirt::Subjects(subjects) => subjects
                 .iter()
-                .filter(|s| self.entries.remove(s.as_str()).is_some())
+                .filter(|s| {
+                    let held = self.entries.remove(s.as_str()).is_some();
+                    if held {
+                        self.dropped.dropped((*s).clone(), true);
+                    }
+                    held
+                })
                 .count(),
             Dirt::Plane => {
-                let n = self.entries.len();
-                self.entries.clear();
+                let taken = std::mem::take(&mut self.entries);
+                let n = taken.len();
+                self.dropped
+                    .dropped_all(taken.into_keys().map(|subject| (subject, true)));
                 n
             }
         };
@@ -504,8 +526,16 @@ impl PlaneMemo {
     /// failed vouches for nothing, so it is not served stale either).
     pub(crate) fn remove(&mut self, subject: &str) {
         if self.entries.remove(subject).is_some() {
+            // Its revalidation read failed: the read it is owed is the TTL's.
+            self.dropped.dropped(subject.to_owned(), false);
             self.bump();
         }
+    }
+
+    /// 45.1.9 (attribution) — why a subject the memo holds no answer for
+    /// ([`Lookup::Missing`]) is being read: what dropped it, else `miss`.
+    pub(crate) fn missing_cause(&self, subject: &str) -> super::memo_attribution::FallThrough {
+        self.dropped.cause(subject)
     }
 
     /// What the memo holds for `subject`.
@@ -528,6 +558,7 @@ impl PlaneMemo {
 
     /// Memoize `subject`'s answer, read now (in the current epoch).
     pub(crate) fn insert(&mut self, subject: String, refs: Vec<EnvelopeRef>) {
+        self.dropped.filled(subject.as_str());
         let epoch = self.epoch;
         self.entries.insert(subject, Answer { refs, epoch });
         self.bump();
@@ -633,6 +664,47 @@ mod tests {
             .expect("after t0");
         assert!(!m.needs_rebuild(just_before));
         assert!(m.needs_rebuild(t0 + MEMO_TTL));
+    }
+
+    /// 45.1.9 (attribution) — a subject the memo holds no answer for reads
+    /// under what dropped it: never read (`miss`), a delta row, an overflow
+    /// or a forget (`invalidated`), an answer two epochs old or a failed
+    /// revalidation (`ttl`); an insert clears the mark.
+    #[test]
+    fn a_missing_subject_reads_under_what_dropped_it_attribution_1019x() {
+        use crate::replication::memo_attribution::FallThrough;
+        let t0 = Instant::now();
+        let mut m = PlaneMemo::default();
+        m.rebuild(t0);
+        assert_eq!(m.missing_cause("a"), FallThrough::Miss);
+        for s in ["a", "b", "c", "d"] {
+            m.insert(s.to_owned(), vec![r(1)]);
+        }
+        m.apply(&Dirt::Subjects(vec!["a".to_owned()]));
+        assert_eq!(
+            m.missing_cause("a"),
+            FallThrough::Invalidated,
+            "a delta row"
+        );
+        m.insert("a".to_owned(), vec![r(1)]);
+        assert_eq!(m.missing_cause("a"), FallThrough::Miss, "a fill clears it");
+        m.revalidate(t0 + MEMO_TTL);
+        m.insert("a".to_owned(), vec![r(1)]);
+        m.remove("b");
+        assert_eq!(
+            m.missing_cause("b"),
+            FallThrough::Ttl,
+            "a failed revalidation"
+        );
+        m.revalidate(t0 + MEMO_TTL + MEMO_TTL);
+        assert_eq!(m.missing_cause("c"), FallThrough::Ttl, "two epochs old");
+        assert!(matches!(m.lookup("a"), Lookup::Stale(_)));
+        m.apply(&Dirt::Plane);
+        assert_eq!(m.missing_cause("a"), FallThrough::Invalidated, "the plane");
+        m.insert("e".to_owned(), vec![r(1)]);
+        m.forget();
+        assert_eq!(m.missing_cause("e"), FallThrough::Invalidated, "a forget");
+        assert_eq!(m.missing_cause("c"), FallThrough::Ttl, "earlier marks kept");
     }
 
     #[test]

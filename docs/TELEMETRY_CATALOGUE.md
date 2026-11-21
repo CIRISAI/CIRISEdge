@@ -231,6 +231,24 @@ renewed in 30 s lapses to normal. The tier does not close forwarding.
 6. `wake_first_round_duration_seconds`: on a phone, the time from resume to the
    first completed round.
 
+### Which memo is reading the store, and why? (v45.1.9)
+
+1. `memo_reads{<memo>.<reason>}`: each lookup through the owner, announce,
+   own-set, key-plane and accord relay memos. `hit` answered from memory;
+   `miss`, `ttl` and `invalidated` are reads, by cause: never filled, expired,
+   or dropped by an event while live. A rising `invalidated` names the event
+   path (a host kick, an ownership or revocation row, a delta row on a key
+   plane); a rising `ttl` is the cadence; a rising `miss` is a working set
+   that grows or churns. `owner.joined` waited on another caller's read.
+2. The consent send set: `advertise_send_set_lookup_{hit,joined}`, then
+   `advertise_send_set_read_miss`, `advertise_send_set_expired` and
+   `advertise_send_set_read_invalidated`, which sum to the reads.
+3. `structure_sizes{<structure>}`: how big what those paths walk is. The last
+   send set's three widths, each memo's entries, `sweep_cursors.tracked`
+   against 8192, `refusal_memory.parked_signers`, and each key plane's
+   `store_feed.inbox.*` against 4096. Every gauge is set where the structure
+   changes, so a scrape reads the last change, never a recount.
+
 ## Which side of the wire
 
 | Series | Sits on | Cannot tell you |
@@ -311,6 +329,8 @@ server-composed node) counted into neither.
 | `replication_reach` | `ciris.edge.replication.reach` | counter | count | operator-only |
 | `bundle_pull` | `ciris.edge.replication.bundle_pull` | counter | count | operator-only |
 | `initiator_peers` | `ciris.edge.replication.initiator_peers` | gauge | count | operator-only |
+| `memo_reads` | `ciris.edge.memo.reads` | counter | count | operator-only |
+| `structure_sizes` | `ciris.edge.structure.sizes` | gauge | count | operator-only |
 | `direct_links_active` | `ciris.edge.direct_links.active` | gauge | count | operator-only |
 | `replication_routed_to_responder_total` | `ciris.edge.replication.routed.responder` | counter | count | operator-only |
 | `replication_routed_to_initiator_total` | `ciris.edge.replication.routed.initiator` | counter | count | operator-only |

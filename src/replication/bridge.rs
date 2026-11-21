@@ -1967,6 +1967,9 @@ struct SweepCursors {
     tick: u64,
     /// Evictions not yet counted ([`Self::take_evicted`]).
     evicted: u64,
+    /// 45.1.9 (attribution) — where the tracked-entry gauge is set, on every
+    /// insert (an eviction at the cap is paired with one). `None` in tests.
+    size_gauge: Option<crate::observability::EdgeMetrics>,
 }
 
 /// CIRISEdge#531 DEPTH — how many `(peer, plane)` watermarks are retained.
@@ -2294,10 +2297,16 @@ impl SweepCursors {
     fn touch(&mut self, key: &(String, EnvelopeKind)) -> &mut PlaneWatermark {
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
-        if !self.by_peer_plane.contains_key(key)
-            && self.by_peer_plane.len() >= MAX_TRACKED_SWEEP_CURSORS
-        {
-            self.evict_oldest();
+        if !self.by_peer_plane.contains_key(key) {
+            if self.by_peer_plane.len() >= MAX_TRACKED_SWEEP_CURSORS {
+                self.evict_oldest();
+            }
+            if let Some(m) = &self.size_gauge {
+                m.set_structure_size(
+                    crate::observability::STRUCTURE_SIZE_SWEEP_CURSORS,
+                    self.by_peer_plane.len() + 1,
+                );
+            }
         }
         let wm = self.by_peer_plane.entry(key.clone()).or_default();
         wm.touched = tick;
@@ -2904,6 +2913,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// read; the [`CONSENT_SEND_SET_MEMO_TTL`] window sits under the anti-entropy
     /// cadence so a between-round withdraw still takes effect next round.
     consent_memo: Mutex<Option<(ResolvedPeerSet, Instant)>>,
+    /// 45.1.9 (attribution) — what emptied [`Self::consent_memo`], and the
+    /// keys events dropped from the announce and own-set memos, so each next
+    /// read is counted under its cause. Telemetry only; never read for an
+    /// answer.
+    memo_marks: MemoMarks,
     /// CIRISEdge#817 — the consent memo's miss is SINGLE-FLIGHT: when it
     /// expires while N peer sweeps run, one of them re-reads the send-set and
     /// the rest await that read, instead of N full-history reads at once. The
@@ -3278,6 +3292,18 @@ pub struct FederationDirectoryReplicationBridge {
     park_log: crate::log_throttle::LogThrottle,
 }
 
+/// 45.1.9 (attribution) — the bridge's memo marks
+/// ([`super::memo_attribution`]).
+#[derive(Debug, Default)]
+struct MemoMarks {
+    /// What emptied the consent send-set memo.
+    consent: super::memo_attribution::SlotMark,
+    /// Subjects an event dropped from the announce memo.
+    announce: Mutex<super::memo_attribution::DropMarks<String>>,
+    /// Identities an event dropped from the own-set memo.
+    own_set: Mutex<super::memo_attribution::DropMarks<String>>,
+}
+
 /// CIRISEdge#523 — one memoized owner-binding resolution for one node.
 #[derive(Debug, Clone)]
 struct CachedOwner {
@@ -3297,6 +3323,9 @@ struct CachedOwner {
 #[derive(Debug, Default)]
 struct OwnerCache {
     by_node: HashMap<String, CachedOwner>,
+    /// 45.1.9 (attribution) — the nodes an event dropped, so the next
+    /// resolve is counted under its cause. Never read for an answer.
+    dropped: super::memo_attribution::DropMarks<String>,
 }
 
 impl OwnerCache {
@@ -3317,6 +3346,7 @@ impl OwnerCache {
     }
 
     fn put(&mut self, node: &str, owner: Option<String>, now: Instant) {
+        self.dropped.filled(node);
         self.by_node.insert(
             node.to_string(),
             CachedOwner {
@@ -3331,8 +3361,43 @@ impl OwnerCache {
     /// owner key stops conferring membership on the nodes it owns). Event-driven
     /// from the apply path; [`OWNER_BINDING_MEMO_TTL`] is the backstop.
     fn invalidate(&mut self, key_id: &str) {
-        self.by_node
-            .retain(|node, e| node != key_id && e.owner.as_deref() != Some(key_id));
+        let now = Instant::now();
+        let dropped = &mut self.dropped;
+        self.by_node.retain(|node, e| {
+            let keep = node != key_id && e.owner.as_deref() != Some(key_id);
+            if !keep {
+                dropped.dropped(node.clone(), Self::live(e, now));
+            }
+            keep
+        });
+    }
+
+    /// Drop every entry (a whole-memo event).
+    fn clear(&mut self) {
+        let now = Instant::now();
+        let taken = std::mem::take(&mut self.by_node);
+        self.dropped.dropped_all(taken.into_iter().map(|(node, e)| {
+            let live = Self::live(&e, now);
+            (node, live)
+        }));
+    }
+
+    fn live(entry: &CachedOwner, now: Instant) -> bool {
+        now.duration_since(entry.resolved_at) < OWNER_BINDING_MEMO_TTL
+    }
+
+    /// 45.1.9 (attribution) — why a resolve of `node` that missed the memo
+    /// is reading: an entry past its TTL, else what dropped it.
+    fn cause(&self, node: &str, now: Instant) -> super::memo_attribution::FallThrough {
+        match self.by_node.get(node) {
+            Some(e) if !Self::live(e, now) => super::memo_attribution::FallThrough::Ttl,
+            _ => self.dropped.cause(node),
+        }
+    }
+
+    /// Nodes held, fresh or not.
+    fn len(&self) -> usize {
+        self.by_node.len()
     }
 }
 
@@ -3523,6 +3588,7 @@ impl FederationDirectoryReplicationBridge {
             send_set_membership: std::sync::Mutex::new(HashMap::new()),
             config,
             consent_memo: Mutex::new(None),
+            memo_marks: MemoMarks::default(),
             consent_flight: SingleFlight::default(),
             consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
             send_set_invalidations: std::sync::atomic::AtomicUsize::new(0),
@@ -3842,6 +3908,9 @@ impl FederationDirectoryReplicationBridge {
         // CIRISEdge P0 telemetry — the sweep gate records its permit wait
         // into the same bag.
         self.sweep_gate.metrics.clone_from(&metrics);
+        if let Ok(c) = self.sweep_cursors.get_mut() {
+            c.size_gauge.clone_from(&metrics);
+        }
         if let Some(m) = &metrics {
             self.decision_rows.attach_telemetry(&m.telemetry);
             // CIRISEdge#971 — the lever's position is a gauge from the start,
@@ -6289,6 +6358,10 @@ impl FederationDirectoryReplicationBridge {
             parked_on_signer_len: as_u64(b.parked_on_signer_len()),
             parked_on_signer_capacity: as_u64(b.park_capacity()),
         });
+        m.set_structure_size(
+            crate::observability::STRUCTURE_SIZE_PARKED_SIGNERS,
+            b.parked_signers(),
+        );
     }
 
     /// CIRISEdge#858 — count one park, on the bridge and in the metrics bag.
@@ -8144,6 +8217,10 @@ impl FederationDirectoryReplicationBridge {
                         obs::KEY_PLANE_MEMO_HITS,
                         u64::try_from(subjects.len()).unwrap_or(u64::MAX),
                     );
+                    m.add_memo_reads(
+                        obs::MEMO_READ_KEY_PLANE_HIT[read.index()],
+                        u64::try_from(subjects.len()).unwrap_or(u64::MAX),
+                    );
                 }
                 return refs;
             }
@@ -8187,6 +8264,8 @@ impl FederationDirectoryReplicationBridge {
         };
         let (mut reads, mut failed, mut unread, mut stale_served, mut revalidated) =
             (0u64, 0u64, 0u64, 0u64, 0u64);
+        // 45.1.9 (attribution) — each read's cause: miss, ttl, invalidated.
+        let mut read_causes = [0u64; 3];
         for (subject, was_stale) in absent
             .into_iter()
             .map(|s| (s, false))
@@ -8220,6 +8299,15 @@ impl FederationDirectoryReplicationBridge {
                 continue;
             }
             reads += 1;
+            read_causes[if was_stale {
+                1
+            } else {
+                match memo.missing_cause(subject) {
+                    super::memo_attribution::FallThrough::Miss => 0,
+                    super::memo_attribution::FallThrough::Ttl => 1,
+                    super::memo_attribution::FallThrough::Invalidated => 2,
+                }
+            }] += 1;
             let found = {
                 // CIRISEdge#531 — the width permit, per member read.
                 let _permit = self
@@ -8275,6 +8363,11 @@ impl FederationDirectoryReplicationBridge {
             m.add_key_plane_sweep(obs::KEY_PLANE_BUDGET_DEFERRED, unread);
             m.add_key_plane_sweep(obs::KEY_PLANE_STALE_SERVED, stale_served);
             m.add_key_plane_sweep(obs::KEY_PLANE_REVALIDATED, revalidated);
+            let slot = read.index();
+            m.add_memo_reads(obs::MEMO_READ_KEY_PLANE_HIT[slot], hits);
+            m.add_memo_reads(obs::MEMO_READ_KEY_PLANE_MISS[slot], read_causes[0]);
+            m.add_memo_reads(obs::MEMO_READ_KEY_PLANE_TTL[slot], read_causes[1]);
+            m.add_memo_reads(obs::MEMO_READ_KEY_PLANE_INVALIDATED[slot], read_causes[2]);
             if reads > 0 {
                 m.add_key_plane_sweep(obs::KEY_PLANE_SWEEPS, 1);
                 m.add_key_plane_sweep(obs::KEY_PLANE_SUBJECT_READS, reads);
@@ -8770,6 +8863,30 @@ impl FederationDirectoryReplicationBridge {
         Some(refs)
     }
 
+    /// 45.1.9 (attribution) — take `take`'s key-plane inbox, and set every
+    /// inbox's size gauge (a drain filled them, a take empties one).
+    fn take_feed_inbox(
+        &self,
+        feed: &mut super::store_feed::FeedState,
+        take: Option<KeyPlaneRead>,
+    ) -> super::store_feed::Pending {
+        let pending = take.map(|r| feed.take(r)).unwrap_or_default();
+        self.gauge_feed_inboxes(feed);
+        pending
+    }
+
+    /// 45.1.9 (attribution) — the four store-feed inbox size gauges.
+    fn gauge_feed_inboxes(&self, feed: &super::store_feed::FeedState) {
+        if let Some(m) = &self.metrics {
+            for read in KeyPlaneRead::ALL {
+                m.set_structure_size(
+                    crate::observability::STRUCTURE_SIZE_FEED_INBOX[read.index()],
+                    feed.inbox_len(read),
+                );
+            }
+        }
+    }
+
     /// CIRISEdge#971 — bring the Attestation serve-cursor feed current, and
     /// take `take`'s key-plane inbox. Shared by the holdings index (every row's
     /// hash, inserted here) and the four CIRISEdge#930 memos (their rows,
@@ -8795,11 +8912,11 @@ impl FederationDirectoryReplicationBridge {
         ) {
             Some(Covered::Coalesced) => {
                 self.book_holdings(obs::HOLDINGS_FEED_COALESCED[slot], 1);
-                return Ok(take.map(|r| feed.take(r)).unwrap_or_default());
+                return Ok(self.take_feed_inbox(&mut feed, take));
             }
             Some(Covered::Spaced) => {
                 self.book_key_plane(obs::KEY_PLANE_PROBES_SPACED, 1);
-                return Ok(take.map(|r| feed.take(r)).unwrap_or_default());
+                return Ok(self.take_feed_inbox(&mut feed, take));
             }
             None => {}
         }
@@ -8833,6 +8950,7 @@ impl FederationDirectoryReplicationBridge {
                          is clean (tracked: CIRISEdge#930, tracked: CIRISEdge#971)"
                     );
                     feed.fail();
+                    self.gauge_feed_inboxes(&feed);
                     self.holdings_index.mark_suspect(IndexPlane::Attestation);
                     self.book_key_plane(obs::KEY_PLANE_PROBE_FAILURES, 1);
                     self.book_holdings(obs::HOLDINGS_FEED_FAILURES[slot], 1);
@@ -8873,7 +8991,7 @@ impl FederationDirectoryReplicationBridge {
         if indexing {
             self.gauge_holdings(IndexPlane::Attestation);
         }
-        Ok(take.map(|r| feed.take(r)).unwrap_or_default())
+        Ok(self.take_feed_inbox(&mut feed, take))
     }
 
     /// CIRISEdge#971 — bring the route serve-cursor feed current for the
@@ -11910,29 +12028,37 @@ impl FederationDirectoryReplicationBridge {
     /// none), so the acquire cannot re-enter the gate; the waiters hold no
     /// permit while they wait.
     async fn resolved_peer_set(&self, local: &str) -> Option<ResolvedPeerSet> {
+        use super::memo_attribution::{book_hit, book_joined, book_read};
+        const LABELS: crate::observability::MemoReadLabels =
+            crate::observability::MEMO_READS_SEND_SET;
         if let Some(hit) = self.fresh_consent_memo() {
+            book_hit(self.metrics.as_ref(), &LABELS);
             return Some(hit);
         }
+        // 45.1.9 — set by this caller's own read, so a caller that waited on
+        // another's is counted `joined`.
+        let led = std::sync::atomic::AtomicBool::new(false);
         let (set, _) = self
             .consent_flight
             .run(
                 &(),
                 || async {
+                    led.store(true, std::sync::atomic::Ordering::Relaxed);
                     // A flight that landed between our miss and our joining
                     // has filled the memo already.
                     if let Some(hit) = self.fresh_consent_memo() {
+                        book_hit(self.metrics.as_ref(), &LABELS);
                         return (Some(hit), None);
                     }
                     // CIRISEdge#971 — the cause split of a send-set read: a
-                    // memo that is present but past its TTL is counted here;
-                    // one a door dropped while live is counted where it was
-                    // dropped (`invalidate_send_set_memos`); an empty memo
-                    // with neither is a first read.
-                    if self.consent_memo_expired() {
-                        if let Some(m) = &self.metrics {
-                            m.inc_advertise(crate::observability::ADVERTISE_SEND_SET_EXPIRED);
-                        }
-                    }
+                    // memo that is present but past its TTL is counted
+                    // `advertise_send_set_expired`; one a door dropped while
+                    // live is counted where it was dropped
+                    // (`invalidate_send_set_memos`). 45.1.9 — and every read
+                    // is counted under exactly one cause here: expired (or
+                    // dropped already expired), dropped live, or first.
+                    let why = self.memo_marks.consent.cause(self.consent_memo_expired());
+                    book_read(self.metrics.as_ref(), &LABELS, why);
                     let _permit = self
                         .sweep_gate
                         .enter_at(crate::observability::SWEEP_PERMIT_SEND_SET)
@@ -11948,12 +12074,34 @@ impl FederationDirectoryReplicationBridge {
                     if let (Some(set), Some(at)) = (set, at) {
                         if let Ok(mut memo) = self.consent_memo.lock() {
                             *memo = Some((set.clone(), *at));
+                            self.memo_marks.consent.filled();
                         }
+                        self.gauge_send_set(set);
                     }
                 },
             )
             .await;
+        if !led.load(std::sync::atomic::Ordering::Relaxed) {
+            book_joined(self.metrics.as_ref(), &LABELS);
+        }
         set
+    }
+
+    /// 45.1.9 (attribution) — the size gauges of a send set just stored in
+    /// the consent memo.
+    fn gauge_send_set(&self, set: &ResolvedPeerSet) {
+        use crate::observability as obs;
+        if let Some(m) = &self.metrics {
+            m.set_structure_size(obs::STRUCTURE_SIZE_SEND_SET_NAMED, set.len());
+            m.set_structure_size(
+                obs::STRUCTURE_SIZE_SEND_SET_OWNER_ROUTED,
+                set.owner_routed_len(),
+            );
+            m.set_structure_size(
+                obs::STRUCTURE_SIZE_SEND_SET_COLLECTIVE_ROUTED,
+                set.collective_routed_len(),
+            );
+        }
     }
 
     /// Whether `node` is in this node's last resolved attestation send set
@@ -13951,16 +14099,29 @@ impl FederationDirectoryReplicationBridge {
     /// taken here: this runs inside permit-holding sections (the attestation
     /// page's audience gates), and the gate is not re-entrant.
     async fn owner_of_cached(&self, node_key_id: &str) -> OwnerLookup {
+        use super::memo_attribution::{book_hit, book_joined, book_read, FallThrough};
+        const LABELS: crate::observability::MemoReadLabels = crate::observability::MEMO_READS_OWNER;
         if let Some(hit) = self.fresh_owner(node_key_id) {
+            book_hit(self.metrics.as_ref(), &LABELS);
             return hit;
         }
-        self.owner_flight
+        // 45.1.9 — set by this caller's own read (see `resolved_peer_set`).
+        let led = std::sync::atomic::AtomicBool::new(false);
+        let answer = self
+            .owner_flight
             .run(
                 &node_key_id.to_owned(),
                 || async {
+                    led.store(true, std::sync::atomic::Ordering::Relaxed);
                     if let Some(hit) = self.fresh_owner(node_key_id) {
+                        book_hit(self.metrics.as_ref(), &LABELS);
                         return (hit, None);
                     }
+                    let why = self
+                        .owner_cache
+                        .lock()
+                        .map_or(FallThrough::Miss, |c| c.cause(node_key_id, Instant::now()));
+                    book_read(self.metrics.as_ref(), &LABELS, why);
                     crate::read_caller::scoped(
                         crate::read_caller::Site::OwnerBinding,
                         self.read_owner_of(node_key_id),
@@ -13976,11 +14137,72 @@ impl FederationDirectoryReplicationBridge {
                     };
                     if let Ok(mut cache) = self.owner_cache.lock() {
                         cache.put(node_key_id, owner, *at);
+                        self.gauge_owner_memo(cache.len());
                     }
                 },
             )
             .await
-            .0
+            .0;
+        if !led.load(std::sync::atomic::Ordering::Relaxed) {
+            book_joined(self.metrics.as_ref(), &LABELS);
+        }
+        answer
+    }
+
+    /// 45.1.9 (attribution) — the owner memo's size gauge.
+    fn gauge_owner_memo(&self, len: usize) {
+        if let Some(m) = &self.metrics {
+            m.set_structure_size(crate::observability::STRUCTURE_SIZE_OWNER_MEMO, len);
+        }
+    }
+
+    /// 45.1.9 (attribution) — drop every announce-memo entry, marking each.
+    fn clear_announce_memo(&self) {
+        let now = Instant::now();
+        let taken = self
+            .announce_cache
+            .lock()
+            .map(|mut memo| std::mem::take(&mut *memo))
+            .unwrap_or_default();
+        if let Ok(mut marks) = self.memo_marks.announce.lock() {
+            marks.dropped_all(taken.into_iter().map(|(subject, (at, _))| {
+                (subject, now.duration_since(at) < OWNER_BINDING_MEMO_TTL)
+            }));
+        }
+        self.gauge_memo_size(crate::observability::STRUCTURE_SIZE_ANNOUNCE_MEMO, 0);
+    }
+
+    /// 45.1.9 (attribution) — drop every own-set-memo entry, marking each.
+    fn clear_own_set_memo(&self) {
+        let now = Instant::now();
+        let taken = self
+            .own_set_cache
+            .lock()
+            .map(|mut memo| std::mem::take(&mut *memo))
+            .unwrap_or_default();
+        if let Ok(mut marks) = self.memo_marks.own_set.lock() {
+            marks.dropped_all(taken.into_iter().map(|(identity, (at, _))| {
+                (identity, now.duration_since(at) < OWNER_BINDING_MEMO_TTL)
+            }));
+        }
+        self.gauge_memo_size(crate::observability::STRUCTURE_SIZE_OWN_SET_MEMO, 0);
+    }
+
+    /// 45.1.9 (attribution) — set a memo size gauge.
+    fn gauge_memo_size(&self, label: &'static str, len: usize) {
+        if let Some(m) = &self.metrics {
+            m.set_structure_size(label, len);
+        }
+    }
+
+    /// 45.1.9 (attribution) — the consent memo was taken by a door: mark
+    /// what emptied it.
+    fn mark_consent_taken(&self, taken: Option<&(ResolvedPeerSet, Instant)>) {
+        if let Some((_, at)) = taken {
+            self.memo_marks
+                .consent
+                .dropped(at.elapsed() < CONSENT_SEND_SET_MEMO_TTL);
+        }
     }
 
     /// The owner memo's answer for `node_key_id` iff it is still fresh.
@@ -14058,20 +14280,17 @@ impl FederationDirectoryReplicationBridge {
         self.consent_flight.invalidate();
         if let Ok(mut cache) = self.owner_cache.lock() {
             cache.invalidate(key_id);
+            self.gauge_owner_memo(cache.len());
         }
         if let Ok(mut memo) = self.consent_memo.lock() {
-            *memo = None;
+            self.mark_consent_taken(memo.take().as_ref());
         }
         // CIRISEdge#682 — the announce memo is owner-derived on BOTH sides (the
         // node's own binding decides announced-ness; the owner's other bindings
         // decide who counts as "the owner's nodes"), so it has no single key to
         // evict. Whole drop, the #524 trade: ownership events are rare.
-        if let Ok(mut memo) = self.announce_cache.lock() {
-            memo.clear();
-        }
-        if let Ok(mut memo) = self.own_set_cache.lock() {
-            memo.clear();
-        }
+        self.clear_announce_memo();
+        self.clear_own_set_memo();
     }
 
     /// persist v61 (CIRISPersist#991) — the apply-side hook the framed Family
@@ -14187,17 +14406,14 @@ impl FederationDirectoryReplicationBridge {
         self.owner_flight.invalidate();
         self.consent_flight.invalidate();
         if let Ok(mut cache) = self.owner_cache.lock() {
-            cache.by_node.clear();
+            cache.clear();
+            self.gauge_owner_memo(0);
         }
         if let Ok(mut memo) = self.consent_memo.lock() {
-            *memo = None;
+            self.mark_consent_taken(memo.take().as_ref());
         }
-        if let Ok(mut memo) = self.announce_cache.lock() {
-            memo.clear();
-        }
-        if let Ok(mut memo) = self.own_set_cache.lock() {
-            memo.clear();
-        }
+        self.clear_announce_memo();
+        self.clear_own_set_memo();
     }
 
     /// **CIRISEdge#968 (wait B) — a LOCAL write may have changed what moves to
@@ -14228,11 +14444,11 @@ impl FederationDirectoryReplicationBridge {
     pub fn invalidate_send_set_memos(&self, reason: &'static str) {
         self.owner_flight.invalidate();
         self.consent_flight.invalidate();
-        let taken = self
-            .consent_memo
-            .lock()
-            .ok()
-            .and_then(|mut memo| memo.take());
+        let taken = self.consent_memo.lock().ok().and_then(|mut memo| {
+            let taken = memo.take();
+            self.mark_consent_taken(taken.as_ref());
+            taken
+        });
         let had_consent = taken.is_some();
         // CIRISEdge#971 — a LIVE memo dropped is a send-set read this door
         // caused (the cause split the seat's permit rate needs: kick vs TTL).
@@ -14240,14 +14456,11 @@ impl FederationDirectoryReplicationBridge {
             .as_ref()
             .is_some_and(|(_, at)| at.elapsed() < CONSENT_SEND_SET_MEMO_TTL);
         if let Ok(mut cache) = self.owner_cache.lock() {
-            cache.by_node.clear();
+            cache.clear();
+            self.gauge_owner_memo(0);
         }
-        if let Ok(mut memo) = self.announce_cache.lock() {
-            memo.clear();
-        }
-        if let Ok(mut memo) = self.own_set_cache.lock() {
-            memo.clear();
-        }
+        self.clear_announce_memo();
+        self.clear_own_set_memo();
         if let Some(gate) = self.accord_relay_gate.as_ref() {
             gate.invalidate_all();
         }
@@ -14590,13 +14803,28 @@ impl FederationDirectoryReplicationBridge {
     /// [`Self::invalidate_owner_memo`]). An unresolved answer is NOT cached,
     /// matching [`Self::owner_of_cached`].
     async fn identity_row_reach(&self, subject: &str) -> IdentityRowReach {
+        use super::memo_attribution::{book_hit, book_read, FallThrough};
+        const LABELS: crate::observability::MemoReadLabels =
+            crate::observability::MEMO_READS_ANNOUNCE;
+        let mut expired = false;
         if let Ok(memo) = self.announce_cache.lock() {
             if let Some((at, reach)) = memo.get(subject) {
                 if at.elapsed() < OWNER_BINDING_MEMO_TTL {
+                    book_hit(self.metrics.as_ref(), &LABELS);
                     return reach.clone();
                 }
+                expired = true;
             }
         }
+        let why = if expired {
+            FallThrough::Ttl
+        } else {
+            self.memo_marks
+                .announce
+                .lock()
+                .map_or(FallThrough::Miss, |marks| marks.cause(subject))
+        };
+        book_read(self.metrics.as_ref(), &LABELS, why);
         self.announce_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let reach = match self.owner_of_cached(subject).await {
@@ -14647,6 +14875,13 @@ impl FederationDirectoryReplicationBridge {
         if reach != IdentityRowReach::Unresolved {
             if let Ok(mut memo) = self.announce_cache.lock() {
                 memo.insert(subject.to_owned(), (Instant::now(), reach.clone()));
+                self.gauge_memo_size(
+                    crate::observability::STRUCTURE_SIZE_ANNOUNCE_MEMO,
+                    memo.len(),
+                );
+            }
+            if let Ok(mut marks) = self.memo_marks.announce.lock() {
+                marks.filled(subject);
             }
         }
         reach
@@ -14853,13 +15088,28 @@ impl FederationDirectoryReplicationBridge {
         &self,
         identity: &str,
     ) -> Result<Arc<HashSet<String>>, ciris_persist::federation::Error> {
+        use super::memo_attribution::{book_hit, book_read, FallThrough};
+        const LABELS: crate::observability::MemoReadLabels =
+            crate::observability::MEMO_READS_OWN_SET;
+        let mut expired = false;
         if let Ok(memo) = self.own_set_cache.lock() {
             if let Some((at, own)) = memo.get(identity) {
                 if at.elapsed() < OWNER_BINDING_MEMO_TTL {
+                    book_hit(self.metrics.as_ref(), &LABELS);
                     return Ok(Arc::clone(own));
                 }
+                expired = true;
             }
         }
+        let why = if expired {
+            FallThrough::Ttl
+        } else {
+            self.memo_marks
+                .own_set
+                .lock()
+                .map_or(FallThrough::Miss, |marks| marks.cause(identity))
+        };
+        book_read(self.metrics.as_ref(), &LABELS, why);
         let mut own: HashSet<String> = ciris_persist::federation::admission::nodes_owned_by(
             &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
             identity,
@@ -14877,6 +15127,13 @@ impl FederationDirectoryReplicationBridge {
         let own = Arc::new(own);
         if let Ok(mut memo) = self.own_set_cache.lock() {
             memo.insert(identity.to_owned(), (Instant::now(), Arc::clone(&own)));
+            self.gauge_memo_size(
+                crate::observability::STRUCTURE_SIZE_OWN_SET_MEMO,
+                memo.len(),
+            );
+        }
+        if let Ok(mut marks) = self.memo_marks.own_set.lock() {
+            marks.filled(identity);
         }
         Ok(own)
     }
@@ -14891,11 +15148,17 @@ impl FederationDirectoryReplicationBridge {
     /// longer, never served early.
     fn forget_reach(&self, key_id: &str) {
         if let Ok(mut memo) = self.announce_cache.lock() {
-            memo.remove(key_id);
+            if let Some((at, _)) = memo.remove(key_id) {
+                if let Ok(mut marks) = self.memo_marks.announce.lock() {
+                    marks.dropped(key_id.to_owned(), at.elapsed() < OWNER_BINDING_MEMO_TTL);
+                }
+            }
+            self.gauge_memo_size(
+                crate::observability::STRUCTURE_SIZE_ANNOUNCE_MEMO,
+                memo.len(),
+            );
         }
-        if let Ok(mut memo) = self.own_set_cache.lock() {
-            memo.clear();
-        }
+        self.clear_own_set_memo();
     }
 
     /// CIRISEdge#682 — the subject-Pull decision for one identity row about
@@ -32658,6 +32921,10 @@ pub(crate) mod tests {
 
     // CIRISEdge#968 — a local write reaches the next round's send set.
     mod contact_waits_968;
+
+    // 45.1.9 (attribution) — every memoised read says why it read, and the
+    // structure size gauges the same paths set.
+    mod memo_attribution_1019x;
 
     // CIRISEdge#971 — what an idle bootstrap round costs the seat.
     mod idle_round_cost_971;

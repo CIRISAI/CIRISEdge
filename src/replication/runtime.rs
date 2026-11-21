@@ -209,10 +209,13 @@ fn build_bridge(
         // the advertise sweep and its direct-fetch twin. CIRISPersist#731 — no
         // root is passed: each object names its own, in its signed bytes.
         .with_accord_relay_gate(config.accord_relay_enforced.then(|| {
-            Arc::new(crate::replication::accord_relay_gate::AccordRelayGate::new(
-                Arc::clone(directory),
-                config.local_key_id.clone(),
-            ))
+            Arc::new(
+                crate::replication::accord_relay_gate::AccordRelayGate::new(
+                    Arc::clone(directory),
+                    config.local_key_id.clone(),
+                )
+                .with_metrics(config.metrics.clone()),
+            )
         })),
     )
 }

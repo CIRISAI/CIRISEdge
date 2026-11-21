@@ -1414,6 +1414,21 @@ pub const ADVERTISE_SEND_SET_DROPPED_LIVE: &str = "advertise_send_set_dropped_li
 /// CIRISEdge#971 — a round found the consent memo present but past
 /// its TTL (the other cause of a send-set read).
 pub const ADVERTISE_SEND_SET_EXPIRED: &str = "advertise_send_set_expired";
+/// 45.1.9 (attribution) — a send-set lookup answered from the consent memo,
+/// at whichever caller asked (a round's advertise, a fetch, a shed's
+/// `send_set_reaches`). With the reads below, the memo's hit rate.
+pub const ADVERTISE_SEND_SET_LOOKUP_HIT: &str = "advertise_send_set_lookup_hit";
+/// 45.1.9 — a send-set lookup that missed the memo and waited on a read
+/// another caller had in flight (#817): no read of its own.
+pub const ADVERTISE_SEND_SET_LOOKUP_JOINED: &str = "advertise_send_set_lookup_joined";
+/// 45.1.9 — a send-set read because the memo was never filled. With
+/// `advertise_send_set_expired` (its TTL) and
+/// `advertise_send_set_read_invalidated` (a door dropped it), every read the
+/// store served the consent memo, each under one cause.
+pub const ADVERTISE_SEND_SET_READ_MISS: &str = "advertise_send_set_read_miss";
+/// 45.1.9 — a send-set read because a door (a local write, an ownership
+/// event, a revocation) dropped the memo while it was live.
+pub const ADVERTISE_SEND_SET_READ_INVALIDATED: &str = "advertise_send_set_read_invalidated";
 /// A request or response that completed on a link a peer dialled before the
 /// event loop had answered its handshake (the two ride different event planes,
 /// so a fast dialler's first frame can overtake its last handshake part), or a
@@ -1867,6 +1882,263 @@ pub const KEY_PLANE_GAUGE_STALE: [&str; 4] = [
     "key_plane.occurrence_binding.stale",
     "key_plane.revocation.stale",
     "key_plane.occurrence_withdrawal.stale",
+];
+
+// ─── 45.1.9 (attribution) — `EdgeMetrics::memo_reads` labels ─────────────
+//
+// Every lookup through a TTL memo on a hot path, by memo and by why it went
+// to the store: `hit` (answered from the memo), `miss` (never filled, or
+// evicted), `ttl` (the answer expired), `invalidated` (an event dropped it
+// while it was live), and for a single-flight memo `joined` (it waited on a
+// read another caller had in flight). A memo's reads are its `miss`, `ttl`
+// and `invalidated`; no memo here has a forced bypass. The consent send-set
+// memo is counted in `advertise` (`ADVERTISE_SEND_SET_LOOKUP_*`, `_READ_*`).
+// Labels are `<memo>.<reason>`; nothing names a peer or a key.
+
+/// The owner-binding memo (`owner_of`, CIRISEdge#523): answered from it.
+pub const MEMO_READ_OWNER_HIT: &str = "owner.hit";
+/// The owner memo: waited on another caller's read of the same node.
+pub const MEMO_READ_OWNER_JOINED: &str = "owner.joined";
+/// The owner memo: read, the node never memoized (or evicted).
+pub const MEMO_READ_OWNER_MISS: &str = "owner.miss";
+/// The owner memo: read, the node's answer past its 30 s TTL.
+pub const MEMO_READ_OWNER_TTL: &str = "owner.ttl";
+/// The owner memo: read, the node's answer dropped by an ownership,
+/// revocation or local-write event.
+pub const MEMO_READ_OWNER_INVALIDATED: &str = "owner.invalidated";
+/// The announce memo (identity-row reach, CIRISEdge#682): answered from it.
+pub const MEMO_READ_ANNOUNCE_HIT: &str = "announce.hit";
+/// The announce memo: walked, the subject never memoized.
+pub const MEMO_READ_ANNOUNCE_MISS: &str = "announce.miss";
+/// The announce memo: walked, the subject's reach past its TTL.
+pub const MEMO_READ_ANNOUNCE_TTL: &str = "announce.ttl";
+/// The announce memo: walked, the subject's reach dropped by an event.
+pub const MEMO_READ_ANNOUNCE_INVALIDATED: &str = "announce.invalidated";
+/// The own-set memo (an identity's nodes and occurrences, CIRISEdge#971):
+/// answered from it.
+pub const MEMO_READ_OWN_SET_HIT: &str = "own_set.hit";
+/// The own-set memo: read, the identity never memoized.
+pub const MEMO_READ_OWN_SET_MISS: &str = "own_set.miss";
+/// The own-set memo: read, the identity's set past its TTL.
+pub const MEMO_READ_OWN_SET_TTL: &str = "own_set.ttl";
+/// The own-set memo: read, the identity's set dropped by an event.
+pub const MEMO_READ_OWN_SET_INVALIDATED: &str = "own_set.invalidated";
+/// The `accord:*` relay verdict cache (workstream F): answered from it.
+pub const MEMO_READ_ACCORD_RELAY_HIT: &str = "accord_relay.hit";
+/// The accord relay cache: resolved, the `(root, signer)` pair never cached.
+pub const MEMO_READ_ACCORD_RELAY_MISS: &str = "accord_relay.miss";
+/// The accord relay cache: resolved, the pair's verdict past its 10 s TTL.
+pub const MEMO_READ_ACCORD_RELAY_TTL: &str = "accord_relay.ttl";
+/// The accord relay cache: resolved, the pair's verdict dropped by an event.
+pub const MEMO_READ_ACCORD_RELAY_INVALIDATED: &str = "accord_relay.invalidated";
+/// The key-plane memos (CIRISEdge#930), by `KeyPlaneRead` slot: a subject a
+/// listing answered fresh from the memo (or from its listing cache).
+pub const MEMO_READ_KEY_PLANE_HIT: [&str; 4] = [
+    "key_plane.key_record.hit",
+    "key_plane.occurrence_binding.hit",
+    "key_plane.revocation.hit",
+    "key_plane.occurrence_withdrawal.hit",
+];
+/// A key-plane subject read from the store, never memoized (or a first
+/// build). The three read labels of a plane sum to its subject reads.
+pub const MEMO_READ_KEY_PLANE_MISS: [&str; 4] = [
+    "key_plane.key_record.miss",
+    "key_plane.occurrence_binding.miss",
+    "key_plane.revocation.miss",
+    "key_plane.occurrence_withdrawal.miss",
+];
+/// A key-plane subject re-read because its answer aged out (the
+/// stale-while-revalidate read, or an answer two epochs old).
+pub const MEMO_READ_KEY_PLANE_TTL: [&str; 4] = [
+    "key_plane.key_record.ttl",
+    "key_plane.occurrence_binding.ttl",
+    "key_plane.revocation.ttl",
+    "key_plane.occurrence_withdrawal.ttl",
+];
+/// A key-plane subject re-read because a delta row dirtied it, the inbox
+/// overflowed, or a failed probe forgot the memo.
+pub const MEMO_READ_KEY_PLANE_INVALIDATED: [&str; 4] = [
+    "key_plane.key_record.invalidated",
+    "key_plane.occurrence_binding.invalidated",
+    "key_plane.revocation.invalidated",
+    "key_plane.occurrence_withdrawal.invalidated",
+];
+/// Every `memo_reads` key.
+pub const MEMO_READ_LABELS: &[&str] = &[
+    MEMO_READ_OWNER_HIT,
+    MEMO_READ_OWNER_JOINED,
+    MEMO_READ_OWNER_MISS,
+    MEMO_READ_OWNER_TTL,
+    MEMO_READ_OWNER_INVALIDATED,
+    MEMO_READ_ANNOUNCE_HIT,
+    MEMO_READ_ANNOUNCE_MISS,
+    MEMO_READ_ANNOUNCE_TTL,
+    MEMO_READ_ANNOUNCE_INVALIDATED,
+    MEMO_READ_OWN_SET_HIT,
+    MEMO_READ_OWN_SET_MISS,
+    MEMO_READ_OWN_SET_TTL,
+    MEMO_READ_OWN_SET_INVALIDATED,
+    MEMO_READ_ACCORD_RELAY_HIT,
+    MEMO_READ_ACCORD_RELAY_MISS,
+    MEMO_READ_ACCORD_RELAY_TTL,
+    MEMO_READ_ACCORD_RELAY_INVALIDATED,
+    MEMO_READ_KEY_PLANE_HIT[0],
+    MEMO_READ_KEY_PLANE_HIT[1],
+    MEMO_READ_KEY_PLANE_HIT[2],
+    MEMO_READ_KEY_PLANE_HIT[3],
+    MEMO_READ_KEY_PLANE_MISS[0],
+    MEMO_READ_KEY_PLANE_MISS[1],
+    MEMO_READ_KEY_PLANE_MISS[2],
+    MEMO_READ_KEY_PLANE_MISS[3],
+    MEMO_READ_KEY_PLANE_TTL[0],
+    MEMO_READ_KEY_PLANE_TTL[1],
+    MEMO_READ_KEY_PLANE_TTL[2],
+    MEMO_READ_KEY_PLANE_TTL[3],
+    MEMO_READ_KEY_PLANE_INVALIDATED[0],
+    MEMO_READ_KEY_PLANE_INVALIDATED[1],
+    MEMO_READ_KEY_PLANE_INVALIDATED[2],
+    MEMO_READ_KEY_PLANE_INVALIDATED[3],
+];
+
+/// 45.1.9 — the labels one memo's lookups are counted under.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoReadLabels {
+    /// Answered from the memo.
+    pub hit: &'static str,
+    /// Waited on another caller's read (single-flight memos only).
+    pub joined: Option<&'static str>,
+    /// Read: never filled, or evicted.
+    pub miss: &'static str,
+    /// Read: the answer expired.
+    pub ttl: &'static str,
+    /// Read: an event dropped the answer while it was live.
+    pub invalidated: &'static str,
+    /// `true`: the labels are `advertise` keys (the consent send set, whose
+    /// family predates `memo_reads`); `false`: `memo_reads` keys.
+    pub in_advertise: bool,
+}
+
+impl MemoReadLabels {
+    /// Count one lookup under `label`, in this memo's family.
+    pub fn inc(&self, metrics: &EdgeMetrics, label: &'static str) {
+        if self.in_advertise {
+            metrics.inc_advertise(label);
+        } else {
+            metrics.inc_memo_read(label);
+        }
+    }
+}
+
+/// The owner memo's labels.
+pub const MEMO_READS_OWNER: MemoReadLabels = MemoReadLabels {
+    hit: MEMO_READ_OWNER_HIT,
+    joined: Some(MEMO_READ_OWNER_JOINED),
+    miss: MEMO_READ_OWNER_MISS,
+    ttl: MEMO_READ_OWNER_TTL,
+    invalidated: MEMO_READ_OWNER_INVALIDATED,
+    in_advertise: false,
+};
+/// The announce memo's labels.
+pub const MEMO_READS_ANNOUNCE: MemoReadLabels = MemoReadLabels {
+    hit: MEMO_READ_ANNOUNCE_HIT,
+    joined: None,
+    miss: MEMO_READ_ANNOUNCE_MISS,
+    ttl: MEMO_READ_ANNOUNCE_TTL,
+    invalidated: MEMO_READ_ANNOUNCE_INVALIDATED,
+    in_advertise: false,
+};
+/// The own-set memo's labels.
+pub const MEMO_READS_OWN_SET: MemoReadLabels = MemoReadLabels {
+    hit: MEMO_READ_OWN_SET_HIT,
+    joined: None,
+    miss: MEMO_READ_OWN_SET_MISS,
+    ttl: MEMO_READ_OWN_SET_TTL,
+    invalidated: MEMO_READ_OWN_SET_INVALIDATED,
+    in_advertise: false,
+};
+/// The accord relay cache's labels.
+pub const MEMO_READS_ACCORD_RELAY: MemoReadLabels = MemoReadLabels {
+    hit: MEMO_READ_ACCORD_RELAY_HIT,
+    joined: None,
+    miss: MEMO_READ_ACCORD_RELAY_MISS,
+    ttl: MEMO_READ_ACCORD_RELAY_TTL,
+    invalidated: MEMO_READ_ACCORD_RELAY_INVALIDATED,
+    in_advertise: false,
+};
+/// The consent send-set memo's labels (in the `advertise` family).
+pub const MEMO_READS_SEND_SET: MemoReadLabels = MemoReadLabels {
+    hit: ADVERTISE_SEND_SET_LOOKUP_HIT,
+    joined: Some(ADVERTISE_SEND_SET_LOOKUP_JOINED),
+    miss: ADVERTISE_SEND_SET_READ_MISS,
+    ttl: ADVERTISE_SEND_SET_EXPIRED,
+    invalidated: ADVERTISE_SEND_SET_READ_INVALIDATED,
+    in_advertise: true,
+};
+
+/// The labels of key-plane slot `slot` (a `KeyPlaneRead` index).
+#[must_use]
+pub const fn memo_reads_key_plane(slot: usize) -> MemoReadLabels {
+    MemoReadLabels {
+        hit: MEMO_READ_KEY_PLANE_HIT[slot],
+        joined: None,
+        miss: MEMO_READ_KEY_PLANE_MISS[slot],
+        ttl: MEMO_READ_KEY_PLANE_TTL[slot],
+        invalidated: MEMO_READ_KEY_PLANE_INVALIDATED[slot],
+        in_advertise: false,
+    }
+}
+
+// ─── 45.1.9 (attribution) — `EdgeMetrics::structure_sizes` labels ────────
+//
+// Gauges: entries held by the sets and indexes hot paths walk, each SET where
+// the structure changes (never computed at scrape time). The holdings index
+// sizes (`holdings_index_gauge.<plane>.size`), the key-plane memos
+// (`holdings_index_gauge.key_plane.<plane>.memo_entries`) and the refusal
+// memory (`refusal_memory_len`, `parked_on_signer_len`) were gauged before
+// this and stay where they are.
+
+/// Peers the live consent grants name directly, in the last send set read.
+pub const STRUCTURE_SIZE_SEND_SET_NAMED: &str = "send_set.named";
+/// Nodes the last send set reaches through a grant subject's owner-binding.
+pub const STRUCTURE_SIZE_SEND_SET_OWNER_ROUTED: &str = "send_set.owner_routed";
+/// Nodes the last send set reaches through the self-collective and family
+/// widening.
+pub const STRUCTURE_SIZE_SEND_SET_COLLECTIVE_ROUTED: &str = "send_set.collective_routed";
+/// Nodes in the owner-binding memo, fresh or not.
+pub const STRUCTURE_SIZE_OWNER_MEMO: &str = "owner_memo.entries";
+/// Subjects in the announce memo, fresh or not.
+pub const STRUCTURE_SIZE_ANNOUNCE_MEMO: &str = "announce_memo.entries";
+/// Identities in the own-set memo, fresh or not.
+pub const STRUCTURE_SIZE_OWN_SET_MEMO: &str = "own_set_memo.entries";
+/// `(root, signer)` verdicts in the accord relay cache, fresh or not.
+pub const STRUCTURE_SIZE_ACCORD_RELAY_VERDICTS: &str = "accord_relay.verdicts";
+/// `(peer, plane)` advertise watermarks tracked, against 8192.
+pub const STRUCTURE_SIZE_SWEEP_CURSORS: &str = "sweep_cursors.tracked";
+/// Signers the refusal memory's park index holds rows under.
+pub const STRUCTURE_SIZE_PARKED_SIGNERS: &str = "refusal_memory.parked_signers";
+/// Rows waiting in each key-plane memo's store-feed inbox, by `KeyPlaneRead`
+/// slot, against 4096 (past it the inbox collapses to "the plane is dirty").
+pub const STRUCTURE_SIZE_FEED_INBOX: [&str; 4] = [
+    "store_feed.inbox.key_record",
+    "store_feed.inbox.occurrence_binding",
+    "store_feed.inbox.revocation",
+    "store_feed.inbox.occurrence_withdrawal",
+];
+/// Every `structure_sizes` key.
+pub const STRUCTURE_SIZE_LABELS: &[&str] = &[
+    STRUCTURE_SIZE_SEND_SET_NAMED,
+    STRUCTURE_SIZE_SEND_SET_OWNER_ROUTED,
+    STRUCTURE_SIZE_SEND_SET_COLLECTIVE_ROUTED,
+    STRUCTURE_SIZE_OWNER_MEMO,
+    STRUCTURE_SIZE_ANNOUNCE_MEMO,
+    STRUCTURE_SIZE_OWN_SET_MEMO,
+    STRUCTURE_SIZE_ACCORD_RELAY_VERDICTS,
+    STRUCTURE_SIZE_SWEEP_CURSORS,
+    STRUCTURE_SIZE_PARKED_SIGNERS,
+    STRUCTURE_SIZE_FEED_INBOX[0],
+    STRUCTURE_SIZE_FEED_INBOX[1],
+    STRUCTURE_SIZE_FEED_INBOX[2],
+    STRUCTURE_SIZE_FEED_INBOX[3],
 ];
 /// Gauge: milliseconds from the runtime's warm-up start to this plane's set
 /// being Ready (its walk from the head of the log plus its boot drain), set
@@ -2738,6 +3010,10 @@ pub const ADVERTISE_LABELS: &[&str] = &[
     ADVERTISE_SEND_SET_INVALIDATED,
     ADVERTISE_SEND_SET_DROPPED_LIVE,
     ADVERTISE_SEND_SET_EXPIRED,
+    ADVERTISE_SEND_SET_LOOKUP_HIT,
+    ADVERTISE_SEND_SET_LOOKUP_JOINED,
+    ADVERTISE_SEND_SET_READ_MISS,
+    ADVERTISE_SEND_SET_READ_INVALIDATED,
     "rows.consent.listed_required",
     "rows.consent.listed_head",
     "rows.consent.listed_history",
@@ -3077,6 +3353,12 @@ pub struct EdgeMetrics {
     /// toward, by where they came from (`INITIATOR_PEERS_*`). A gauge: set,
     /// not counted. All zero on a device with nobody to round with.
     pub initiator_peers: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// 45.1.9 (attribution) — every lookup through a hot-path memo, by
+    /// `<memo>.<reason>` (`MEMO_READ_*`).
+    pub memo_reads: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// 45.1.9 (attribution) — the sizes of the sets and indexes hot paths
+    /// walk (`STRUCTURE_SIZE_*`). A gauge, set where the structure changes.
+    pub structure_sizes: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — direct links (leviculum#70) by label
     /// (`DIRECT_LINK_*` constants in this module): proposals made, skipped
     /// and refused, and each outcome. Every `direct_link_failed_*` label is a
@@ -3874,6 +4156,37 @@ impl EdgeMetrics {
     /// CIRISEdge#971 — set the `initiator_peers` gauge for `source`.
     pub fn set_initiator_peers(&self, source: &'static str, peers: u64) {
         self.initiator_peers.write().insert(source, peers);
+    }
+
+    /// 45.1.9 — count one memo lookup under `label` (a `MEMO_READ_*`).
+    pub fn inc_memo_read(&self, label: &'static str) {
+        *self.memo_reads.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// 45.1.9 — add `n` memo lookups under `label`.
+    pub fn add_memo_reads(&self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.memo_reads.write().entry(label).or_insert(0) += n;
+        }
+    }
+
+    /// 45.1.9 — the memo lookups by label.
+    #[must_use]
+    pub fn memo_reads(&self) -> HashMap<String, u64> {
+        owned_keys(&self.memo_reads)
+    }
+
+    /// 45.1.9 — set the size gauge `label` (a `STRUCTURE_SIZE_*`).
+    pub fn set_structure_size(&self, label: &'static str, n: usize) {
+        self.structure_sizes
+            .write()
+            .insert(label, u64::try_from(n).unwrap_or(u64::MAX));
+    }
+
+    /// 45.1.9 — the size gauges by label.
+    #[must_use]
+    pub fn structure_sizes(&self) -> HashMap<String, u64> {
+        owned_keys(&self.structure_sizes)
     }
 
     /// CIRISEdge#971 — the `initiator_peers` gauge by source.
@@ -4836,6 +5149,12 @@ impl EdgeMetrics {
             .into_iter()
             .map(|(k, v)| (k, v as f64))
             .collect();
+        // Entry counts, far below 2^52.
+        #[allow(clippy::cast_precision_loss)]
+        let structure_sizes = registered(&self.structure_sizes, STRUCTURE_SIZE_LABELS)
+            .into_iter()
+            .map(|(k, v)| (k, v as f64))
+            .collect();
         EdgeMetricsBundle {
             envelopes_sent_total: self.envelopes_sent_total.read().clone(),
             envelopes_received_total: self.envelopes_received_total.read().clone(),
@@ -4925,6 +5244,8 @@ impl EdgeMetrics {
             replication_reach: registered(&self.replication_reach, REPLICATION_REACH_LABELS),
             bundle_pull: registered(&self.bundle_pull, BUNDLE_PULL_LABELS),
             initiator_peers: registered(&self.initiator_peers, INITIATOR_PEERS_LABELS),
+            memo_reads: registered(&self.memo_reads, MEMO_READ_LABELS),
+            structure_sizes,
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
@@ -5287,6 +5608,10 @@ pub struct EdgeMetricsBundle {
     pub bundle_pull: HashMap<String, u64>,
     /// CIRISEdge#971 — `initiator_peers.<source>`, a gauge.
     pub initiator_peers: HashMap<String, u64>,
+    /// 45.1.9 — `memo_reads.<memo>.<reason>`: every hot-path memo lookup.
+    pub memo_reads: HashMap<String, u64>,
+    /// 45.1.9 — `structure_sizes.<structure>`, gauges set where each changes.
+    pub structure_sizes: HashMap<String, f64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
     pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
@@ -5765,6 +6090,9 @@ impl EdgeMetricsBundle {
         f.family("replication_reach", &self.replication_reach);
         f.family("bundle_pull", &self.bundle_pull);
         f.family("initiator_peers", &self.initiator_peers);
+        // 45.1.9 — the memo lookups by reason, and the structure sizes.
+        f.family("memo_reads", &self.memo_reads);
+        f.gauge_family("structure_sizes", &self.structure_sizes);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
             "direct_links_active".to_string(),
@@ -6117,6 +6445,8 @@ edge_metrics_bundle_fields!(
     replication_reach,
     bundle_pull,
     initiator_peers,
+    memo_reads,
+    structure_sizes,
     direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,

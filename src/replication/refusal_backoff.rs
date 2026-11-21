@@ -798,6 +798,13 @@ impl RefusalBackoff {
         self.lock().parked
     }
 
+    /// 45.1.9 (attribution) — how many signers the park index holds rows
+    /// under (the `refusal_memory.parked_signers` gauge).
+    #[must_use]
+    pub fn parked_signers(&self) -> usize {
+        self.lock().by_signer.len()
+    }
+
     /// CIRISEdge#858 — how many rows are parked on `signer` right now (the
     /// `N` of the one-line-per-signer park log).
     #[must_use]

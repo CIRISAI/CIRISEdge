@@ -3238,6 +3238,12 @@ fn metrics_bundle_to_pydict<'py>(
         holdings_index_gauge.set_item(label.as_str(), *v)?;
     }
     root.set_item("holdings_index_gauge", holdings_index_gauge)?;
+    // 45.1.9 (attribution) — the structure size gauges.
+    let structure_sizes = pyo3::types::PyDict::new(py);
+    for (label, v) in &bundle.structure_sizes {
+        structure_sizes.set_item(label.as_str(), *v)?;
+    }
+    root.set_item("structure_sizes", structure_sizes)?;
     // v44 LTS — the persisted-standing refresh.
     let persisted_standing = pyo3::types::PyDict::new(py);
     for (label, n) in &bundle.persisted_standing {
@@ -3264,6 +3270,7 @@ fn metrics_bundle_to_pydict<'py>(
         ("replication_reach", &bundle.replication_reach),
         ("bundle_pull", &bundle.bundle_pull),
         ("initiator_peers", &bundle.initiator_peers),
+        ("memo_reads", &bundle.memo_reads),
     ] {
         let d = pyo3::types::PyDict::new(py);
         for (label, n) in family {

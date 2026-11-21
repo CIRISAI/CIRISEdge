@@ -228,6 +228,11 @@ fn every_label_constant_is_in_its_family_list() {
             crate::observability::INITIATOR_PEERS_LABELS,
         ),
         ("PEER_BINDING_", PEER_BINDING_LABELS),
+        ("MEMO_READ_", crate::observability::MEMO_READ_LABELS),
+        (
+            "STRUCTURE_SIZE_",
+            crate::observability::STRUCTURE_SIZE_LABELS,
+        ),
     ] {
         for value in constants(prefix) {
             assert!(
