@@ -144,6 +144,8 @@ mod holdings_index_971_tests;
 /// whole safety of the design.
 pub mod key_grant_emitter;
 #[cfg(test)]
+mod key_plane_attribution_1019x_tests;
+#[cfg(test)]
 mod key_plane_cache_971_tests;
 /// CIRISEdge#930 — the key-plane listings, memoized per subject on the
 /// store's admission cursor.
@@ -156,6 +158,8 @@ mod key_plane_v59_tests;
 pub mod known_hashes;
 #[cfg(test)]
 mod late_device_768_tests;
+/// 45.1.9 (attribution) — why a memo lookup went to the store.
+pub(crate) mod memo_attribution;
 pub mod mesh_config;
 /// CIRISEdge#552 — which Key an unverifiable signature was missing, so it can
 /// be pulled. `Key` is the root of every admission's dependency closure.

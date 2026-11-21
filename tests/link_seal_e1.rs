@@ -3071,14 +3071,14 @@ async fn restart_b(t: &Trio) -> (Arc<ReticulumTransport>, EdgeMetrics) {
 /// reconnects, which is why this needs a hop.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bound_peer_has_standing_from_its_first_handshake_after_a_restart() {
-    bound_peer_after_a_restart("restart", true).await;
+    Box::pin(bound_peer_after_a_restart("restart", true)).await;
 }
 
 /// **Witness (v44 LTS)** — the binding alone earns nothing: the same peer, off
 /// the active roster, is a stranger on the persisted arm too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bound_peer_off_the_roster_is_a_stranger_after_a_restart() {
-    bound_peer_after_a_restart("offroster", false).await;
+    Box::pin(bound_peer_after_a_restart("offroster", false)).await;
 }
 
 /// `C` sends `B` `frame` until a handshake has reached `B`, however it was

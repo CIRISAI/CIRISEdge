@@ -1,5 +1,19 @@
 # CIRISEdge Release Notes
 
+# v45.1.9 — attribution: why each memo read, and how big each walked set is
+
+**2026-11-21.** **PATCH.** Pins: persist v61.4.3 by tag (`ciris-persist==61.4.3`, commit 157ee52c),
+CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. No migration, no wire change. Detail in CHANGELOG.md.
+
+- **Every memoised read says why it read** (`memo_reads`: hit, joined, miss, ttl, invalidated)
+  across the owner, announce, own-set, key-plane and accord-relay memos; the send set extends
+  its `advertise` family. So a cost spike reads as "this memo, for this reason", not as "something
+  read the store".
+- **Gauges for the sets the hot paths walk** (`structure_sizes`): send-set parts, memo sizes, sweep
+  cursors, parked signers, store-feed inboxes.
+- **persist v61.4.3:** the caller-label cap is 128, so edge's and the server's labels both fit.
+- Telemetry only: no memo answers differently (independently reviewed).
+
 # v45.1.8 — a late reply is not lost, and a lost reply is listed again
 
 **2026-11-21.** **PATCH.** Pins unchanged: persist v61.4.2 by tag, CIRISVerify v22.2.0, leviculum
