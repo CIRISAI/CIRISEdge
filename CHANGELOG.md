@@ -2,6 +2,46 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.9 — 2026-11-21
+
+**PATCH. Attribution: every memoised read says why it read, the walked sets are gauged, and
+persist v61.4.3.** Pins: persist **v61.4.3** by tag (`ciris-persist==61.4.3`; was v61.4.2),
+CIRISVerify v22.2.0, leviculum v0.34.0+ciris.3. No migration, no wire change. Telemetry only:
+no memo answers differently.
+
+### Changed
+
+- **persist v61.4.3** (tag, commit 157ee52c): `MAX_CALLER_LABELS` 32 → 128, plus
+  `caller_label_refusals`; no API removed. Edge's 26 caller labels and the server's 27 fit
+  without overflowing into `other`.
+
+### Added
+
+- **`memo_reads`: why each memoised read fell through to the store** (Eric's attribution ask:
+  attribute, and shed, workload in an emergency). Per memo, `{hit, joined, miss, ttl, invalidated}`:
+  the owner memo (with its single-flight), the announce memo, the own-set memo, the key-plane
+  memos per plane, and the accord relay cache. The consent send set extends its `advertise`
+  family: `advertise_send_set_lookup_{hit,joined}` and `advertise_send_set_read_{miss,invalidated}`,
+  with `advertise_send_set_expired` as its `ttl`. A door that drops a memo marks the keys it
+  drops, so the next read counts `invalidated` rather than `miss`. For each memo, miss + ttl +
+  invalidated equals its store reads.
+- **`structure_sizes`: gauges for the sets a hot path walks**, set where each changes and never
+  at scrape:
+  - the send set (named, owner-routed, collective-routed);
+  - the owner, announce and own-set memo sizes;
+  - accord relay verdicts;
+  - sweep cursors tracked;
+  - parked signers;
+  - the store-feed inbox per key plane.
+- All labels come from closed lists, with no peer, key or address id. Every token has a
+  catalogue row and a docs row.
+
+### Known limits (telemetry accuracy only)
+
+Marks that reach the 16,384-per-memo cap can turn later `invalidated` reads into `miss`. A hit
+takes the metrics map's write lock, as edge's other counters do. A rare fill/mark race can count
+one `invalidated` read as `miss`.
+
 ## 45.1.8 — 2026-11-21
 
 **PATCH. A late reply's rows are asked for again, a lost reply's listing is put back, and a link-up
