@@ -204,6 +204,11 @@ impl SubjectPullAnswer {
     }
 }
 
+/// CIRISEdge#1020 — an opaque listing position ([`StateProvider::listing_mark`]):
+/// the watermark's `(visibility instant, attestation id)` before a listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingMark(pub(crate) (chrono::DateTime<chrono::Utc>, String));
+
 #[async_trait]
 pub trait StateProvider: Send + Sync {
     /// Snapshot the refs this node OFFERS to the round's peer for `kind` — the
@@ -354,10 +359,20 @@ pub trait StateProvider: Send + Sync {
     /// not complete: what was listed has not been delivered.
     fn round_ended(&self, _kind: EnvelopeKind, _lost: bool) {}
 
-    /// CIRISEdge#1020 — a RESPONDER's reply carrying this provider's listing
-    /// left in full: the listing was delivered. Resets the in-a-row loss count
-    /// without taking the rollback (an initiator round on the same key may
-    /// still need it).
+    /// CIRISEdge#1020 — where this provider's next head listing toward the
+    /// peer starts, taken by a RESPONDER before it steps a round-opening
+    /// `Summary`. `None`: no position is kept (a plane with no watermark, or a
+    /// peer not yet listed to).
+    fn listing_mark(&self, _kind: EnvelopeKind) -> Option<ListingMark> {
+        None
+    }
+
+    /// CIRISEdge#1020 — the reply that carried the listing taken at `mark` did
+    /// not leave: put the listing position back to at most `mark`.
+    fn rewind_listing(&self, _kind: EnvelopeKind, _mark: &ListingMark) {}
+
+    /// CIRISEdge#1020 — a responder's reply carrying a head listing left: the
+    /// lost listings are no longer in a row.
     fn listing_delivered(&self, _kind: EnvelopeKind) {}
 
     /// Return the byte-exact signed envelope for the given content

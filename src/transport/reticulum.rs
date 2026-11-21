@@ -9911,8 +9911,22 @@ impl ReticulumTransport {
     /// window plus a suppressed count, never a flood.
     async fn log_link_up_timeouts(&self, expired: &[([u8; 16], std::time::Duration)]) {
         use crate::log_throttle::ThrottleDecision;
-        let peers = self.link_to_peer_key_id.lock().await;
-        let planes = self.link_plane.lock().await;
+        // One map lock at a time, copied out: `live_link_to_where` takes
+        // `link_plane` then `link_to_peer_key_id`, so holding both here in the
+        // other order could deadlock the reaper against a send.
+        let ids: Vec<LinkId> = expired.iter().map(|(l, _)| LinkId::new(*l)).collect();
+        let planes: HashMap<LinkId, LinkPlane> = {
+            let held = self.link_plane.lock().await;
+            ids.iter()
+                .filter_map(|id| held.get(id).map(|p| (*id, *p)))
+                .collect()
+        };
+        let peers: HashMap<LinkId, String> = {
+            let held = self.link_to_peer_key_id.lock().await;
+            ids.iter()
+                .filter_map(|id| held.get(id).map(|p| (*id, p.clone())))
+                .collect()
+        };
         for (link, age) in expired {
             let id = LinkId::new(*link);
             let ThrottleDecision::Emit { suppressed_prev } = link_up_timeout_log().check("node")

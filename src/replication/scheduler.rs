@@ -1480,6 +1480,8 @@ impl GatedRound<'_> {
         // permit to its outcome, whatever that outcome is: a round that
         // timed out after its full budget is exactly the one to see.
         let started = std::time::Instant::now();
+        // CIRISEdge#1020 — the round line names the round only if one opened.
+        let ended_before = self.coord.last_ended_round();
         // CC 5.4.3 — on a shaped link a wait is paced by the link's frame
         // gap: the per-wait timeout is at least the Poisson p99 of a reply's
         // frames ([`PACING_WAIT_GAPS`]), else every wait on a slow link times
@@ -1519,7 +1521,9 @@ impl GatedRound<'_> {
             took_ms: started.elapsed().as_millis(),
             outcome: ended.outcome,
             error: ended.error,
-            round: self.coord.last_ended_round(),
+            round: Some(self.coord.last_ended_round())
+                .filter(|r| *r != ended_before)
+                .unwrap_or(0),
         };
         (ran, line)
     }

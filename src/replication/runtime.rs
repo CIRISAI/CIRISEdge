@@ -705,8 +705,14 @@ pub(crate) fn spawn_responder_drive(
             );
             coord.set_driver_phase(DriverPhase::Stepping);
             // CIRISEdge#1020 — a round-opening Summary is answered with this
-            // node's head listing; the lane retires it when the reply leaves.
-            let listing = matches!(inbound.msg, super::protocol::ReplicationMessage::Summary(_));
+            // node's head listing: mark where it starts, so the reply's loss
+            // rewinds to exactly that listing.
+            let listing = if matches!(inbound.msg, super::protocol::ReplicationMessage::Summary(_))
+            {
+                coord.listing_mark()
+            } else {
+                None
+            };
             match coord.drive_round_step_framed(Some(inbound)).await {
                 Ok(DriveStep::SendThenWait(msgs)) => {
                     if !msgs.is_empty() {

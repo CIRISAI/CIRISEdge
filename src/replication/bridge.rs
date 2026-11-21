@@ -1711,16 +1711,12 @@ struct PlaneWatermark {
     /// [`SweepCursors::rewind_skipped`] moves [`Self::high_water`] back here so
     /// the next round re-reads it instead of waiting out a re-sweep cycle.
     skip_mark: Option<SkipMark>,
-    /// Where [`Self::high_water`] stood before each head read not yet known
-    /// delivered, oldest first: a listing that was lost puts the watermark
-    /// back to the OLDEST of them ([`SweepCursors::round_ended`]).
-    ///
-    /// CIRISEdge#1020 — a queue, not one slot. A responder steps a frame (and
-    /// takes its listing) before the reply lane sends the previous reply, so
-    /// listing L2 can be taken before L1's send fails. One slot would hold L2's
-    /// start, and restoring it would skip L1's rows. Rewinding too far only
-    /// lists rows again; rewinding too little loses them until the re-sweep.
-    rollback: std::collections::VecDeque<ListedFrom>,
+    /// Where [`Self::high_water`] stood before the latest head read: a round
+    /// that listed and was lost puts it back ([`SweepCursors::round_ended`]).
+    rollback: Option<ListedFrom>,
+    /// CIRISEdge#1020 — a RESPONDER's lost listings put back in a row
+    /// ([`SweepCursors::rewind_to`]); a delivered listing ends the row.
+    responder_rewinds: u8,
     /// How many lost rounds in a row have been put back.
     lost_rounds: u8,
     /// The groups this peer was last read for ([`SweepCursors::groups_changed`]).
@@ -1783,10 +1779,15 @@ const GROUP_BACKFILL_PAGE: u32 = 256;
 /// so a peer that always fails does not pin a walk on one page.
 const MAX_ROUND_RESTORES: u8 = 3;
 
-/// CIRISEdge#1020 — how many listings per `(peer, plane)` may wait to be known
-/// delivered. A responder's reply lane holds at most `REPLY_QUEUE_JOBS` (8), so
-/// past this the oldest kept start still covers every later listing.
-const MAX_PENDING_LISTINGS: usize = 8;
+/// CIRISEdge#1020 — `a` is strictly before `b` on the watermark's order, where
+/// `None` is the beginning. A watermark at the beginning has nothing before it.
+fn is_earlier(a: Option<&ResumeCursor>, b: Option<&ResumeCursor>) -> bool {
+    match (a, b) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(a), Some(b)) => a < b,
+    }
+}
 
 /// What the advertise predicate reads besides the row: the self-publish set,
 /// the per-kind publish selector's answers, and the cohort. A change in any of
@@ -2019,9 +2020,7 @@ impl SweepCursors {
     ) -> Option<BackfillPage> {
         let wm = self.touch(key);
         let short = served < budget as usize;
-        if wm.rollback.len() < MAX_PENDING_LISTINGS {
-            wm.rollback.push_back(ListedFrom(wm.high_water.clone()));
-        }
+        wm.rollback = Some(ListedFrom(wm.high_water.clone()));
         if let Some(c) = last {
             wm.high_water = Some(c);
         }
@@ -2051,28 +2050,28 @@ impl SweepCursors {
     /// a round lost after it would leave its rows behind the watermark until
     /// the re-sweep came round, so a lost round puts the watermark back and the
     /// next round lists them again. At most [`MAX_ROUND_RESTORES`] in a row.
-    /// Returns whether it moved.
+    /// Returns whether it moved. A responder's listing has its own end
+    /// ([`Self::rewind_to`]); the rollback here is the latest listing's.
     ///
-    /// CIRISEdge#1020 — a responder's listing now has an end too: its reply
-    /// lane reports a reply that did not leave as `lost`
-    /// ([`super::coordinator::ReplicationCoordinator::note_listing_lost`]) and
-    /// one that left as delivered ([`Self::listing_delivered`]). A delivery
-    /// retires the oldest pending listing; a loss restores the oldest and
-    /// forgets the rest, since everything after it is re-listed from there.
+    /// CIRISEdge#1020 — the restore only ever moves the watermark BACK. The
+    /// key is shared with this node's responder toward the same peer, whose
+    /// lost listing may already have rewound it further: restoring the
+    /// initiator's later start over that would skip the responder's rows.
     fn round_ended(&mut self, key: &(String, EnvelopeKind), lost: bool) -> bool {
         let Some(wm) = self.by_peer_plane.get_mut(key) else {
             return false;
         };
+        let rollback = wm.rollback.take();
         if !lost {
-            wm.rollback.pop_front();
             wm.lost_rounds = 0;
             return false;
         }
-        let oldest = wm.rollback.pop_front();
-        wm.rollback.clear();
-        let Some(ListedFrom(position)) = oldest else {
+        let Some(ListedFrom(position)) = rollback else {
             return false;
         };
+        if !is_earlier(position.as_ref(), wm.high_water.as_ref()) {
+            return false;
+        }
         if wm.lost_rounds >= MAX_ROUND_RESTORES {
             return false;
         }
@@ -2081,14 +2080,51 @@ impl SweepCursors {
         true
     }
 
-    /// CIRISEdge#1020 — a responder's reply left in full: its listing, the
-    /// oldest pending one (the lane is FIFO), was delivered, and the losses
-    /// are no longer in a row.
+    /// CIRISEdge#1020 — a RESPONDER's reply carrying a head listing did not
+    /// leave (a send error or timeout, expired in the reply lane, or shed at
+    /// enqueue): put the watermark back to where THAT listing started, its
+    /// `mark` taken before the step. Listing is not delivery, on this side as
+    /// on the initiator's.
+    ///
+    /// Each lost reply carries its own mark, so nothing is shared between
+    /// replies or roles and nothing can be retired by the wrong one. It only
+    /// ever moves the watermark BACK: a mark at or past the current position
+    /// is a no-op, so a later reply's loss never undoes an earlier one's.
+    /// Never to "the beginning": a mark of `None` (a peer with no position
+    /// yet) leaves its rows to the re-sweep, as a first listing always did.
+    /// At most [`MAX_ROUND_RESTORES`] in a row; a delivered listing ends the
+    /// row ([`Self::listing_delivered`]). Returns whether it moved.
+    fn rewind_to(&mut self, key: &(String, EnvelopeKind), mark: Option<&ResumeCursor>) -> bool {
+        let Some(mark) = mark else {
+            return false;
+        };
+        let Some(wm) = self.by_peer_plane.get_mut(key) else {
+            return false;
+        };
+        if wm.responder_rewinds >= MAX_ROUND_RESTORES
+            || !is_earlier(Some(mark), wm.high_water.as_ref())
+        {
+            return false;
+        }
+        wm.responder_rewinds += 1;
+        wm.high_water = Some(mark.clone());
+        true
+    }
+
+    /// CIRISEdge#1020 — a responder's reply carrying a head listing left: the
+    /// lost listings are no longer in a row.
     fn listing_delivered(&mut self, key: &(String, EnvelopeKind)) {
         if let Some(wm) = self.by_peer_plane.get_mut(key) {
-            wm.rollback.pop_front();
-            wm.lost_rounds = 0;
+            wm.responder_rewinds = 0;
         }
+    }
+
+    /// CIRISEdge#1020 — where `key`'s next head listing starts, taken before a
+    /// responder steps a round-opening Summary ([`Self::rewind_to`]).
+    fn listing_mark(&self, key: &(String, EnvelopeKind)) -> Option<ResumeCursor> {
+        self.by_peer_plane
+            .get(key)
+            .and_then(|wm| wm.high_water.clone())
     }
 
     /// Record the backfill page: advance, or WRAP to the beginning when the
@@ -5739,6 +5775,35 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     fn listing_delivered(&self, peer_key_id: &str, kind: EnvelopeKind) {
         if let Ok(mut c) = self.sweep_cursors.lock() {
             c.listing_delivered(&(peer_key_id.to_owned(), kind));
+        }
+    }
+
+    fn listing_mark(
+        &self,
+        peer_key_id: &str,
+        kind: EnvelopeKind,
+    ) -> Option<super::summary::ListingMark> {
+        self.sweep_cursors
+            .lock()
+            .ok()?
+            .listing_mark(&(peer_key_id.to_owned(), kind))
+            .map(super::summary::ListingMark)
+    }
+
+    fn rewind_listing(
+        &self,
+        peer_key_id: &str,
+        kind: EnvelopeKind,
+        mark: &super::summary::ListingMark,
+    ) {
+        let moved = self
+            .sweep_cursors
+            .lock()
+            .is_ok_and(|mut c| c.rewind_to(&(peer_key_id.to_owned(), kind), Some(&mark.0)));
+        if moved {
+            if let Some(m) = &self.metrics {
+                m.inc_advertise(crate::observability::ADVERTISE_WATERMARK_REWOUND);
+            }
         }
     }
 
@@ -31750,73 +31815,77 @@ pub(crate) mod tests {
         }
 
         /// CIRISEdge#1020 — a responder steps the next frame (and takes its
-        /// listing) before the reply lane sends the previous reply. Listing L2
-        /// is taken, then L1's reply is lost: the watermark goes back to L1's
-        /// start, not L2's, or L1's rows wait for the re-sweep.
+        /// listing) before the reply lane sends the previous reply. L1 is
+        /// listed, then L2, then L1's reply is lost: the watermark goes back to
+        /// L1's own mark. A later loss with a later mark never undoes it.
         ///
-        /// Mutation that turns it red: keep one rollback slot (the latest
-        /// listing's), as before #1020.
+        /// Mutation that turns it red: drop the `is_earlier` guard in
+        /// `rewind_to` (L2's loss then moves the watermark forward past L1).
         #[test]
-        fn a_lost_listing_rewinds_to_the_oldest_listing_not_yet_delivered_1020() {
+        fn a_lost_reply_rewinds_to_its_own_listing_and_never_forward_1020() {
             let mut c = SweepCursors::default();
             let k = key();
-            // Caught up, so each listing is a head read past the tip.
             assert_eq!(c.after_head(&k, 1, 4, Some(cur(1))), None);
-            assert!(!c.round_ended(&k, false), "a completed round moves nothing");
-            let _ = c.after_head(&k, 1, 4, Some(cur(2))); // L1: from cur(1)
-            let _ = c.after_head(&k, 1, 4, Some(cur(3))); // L2: from cur(2)
-            assert_eq!(c.head(&k), Some(cur(3)));
+            let m1 = c.listing_mark(&k).expect("a position"); // L1 from cur(1)
+            let _ = c.after_head(&k, 1, 4, Some(cur(2)));
+            let m2 = c.listing_mark(&k).expect("a position"); // L2 from cur(2)
+            let _ = c.after_head(&k, 1, 4, Some(cur(3)));
+            assert!(c.rewind_to(&k, Some(&m1)), "L1 lost: back to its mark");
+            assert_eq!(c.head(&k), Some(cur(1)));
             assert!(
-                c.round_ended(&k, true),
-                "the lost listing moves the watermark"
+                !c.rewind_to(&k, Some(&m2)),
+                "L2 lost after it: its mark is later, so nothing moves"
             );
-            assert_eq!(
-                c.head(&k),
-                Some(cur(1)),
-                "back to where L1 started, so L1's rows and L2's are listed again"
-            );
+            assert_eq!(c.head(&k), Some(cur(1)), "L1's rows are not skipped");
+            assert!(!c.rewind_to(&k, None), "no mark: never to the beginning");
         }
 
-        /// CIRISEdge#1020 — the lane retires a delivered listing, so a later
-        /// loss rewinds only to what is still undelivered.
+        /// CIRISEdge#1020 — the key is shared by this node's initiator and its
+        /// responder toward one peer. A responder loss rewinds it; the
+        /// initiator's round then ends lost with a LATER rollback, and must not
+        /// carry the watermark forward over the responder's rows.
+        ///
+        /// Mutation that turns it red: drop the `is_earlier` guard in
+        /// `round_ended`.
         #[test]
-        fn a_delivered_listing_is_retired_before_a_later_loss_1020() {
+        fn an_initiator_restore_never_moves_past_a_responder_rewind_1020() {
             let mut c = SweepCursors::default();
             let k = key();
-            assert_eq!(c.after_head(&k, 1, 4, Some(cur(1))), None);
-            c.listing_delivered(&k);
-            let _ = c.after_head(&k, 1, 4, Some(cur(2))); // L1: from cur(1)
-            let _ = c.after_head(&k, 1, 4, Some(cur(3))); // L2: from cur(2)
-            c.listing_delivered(&k); // L1 left
-            assert!(c.round_ended(&k, true));
-            assert_eq!(c.head(&k), Some(cur(2)), "only L2 is listed again");
-        }
-
-        /// CIRISEdge#1020 — restores are bounded IN A ROW, and a delivered
-        /// listing ends the row. Before #1020 only an initiator's completed
-        /// round reset the count, so a responder-only key stopped restoring
-        /// for good after three losses over its whole life.
-        #[test]
-        fn a_delivery_ends_the_run_of_losses_so_restores_resume_1020() {
-            let mut c = SweepCursors::default();
-            let k = key();
-            assert_eq!(c.after_head(&k, 1, 4, Some(cur(1))), None);
-            c.listing_delivered(&k);
-            for n in 2..=4u8 {
-                let _ = c.after_head(&k, 1, 4, Some(cur(n)));
-                assert!(c.round_ended(&k, true), "loss {n} restores");
-            }
-            let _ = c.after_head(&k, 1, 4, Some(cur(5)));
+            assert_eq!(c.after_head(&k, 1, 4, Some(cur(2))), None);
+            assert!(!c.round_ended(&k, false));
+            let responder = c.listing_mark(&k).expect("a position"); // from cur(2)
+            let _ = c.after_head(&k, 1, 4, Some(cur(3))); // responder's listing
+            let _ = c.after_head(&k, 1, 4, Some(cur(4))); // initiator's, from cur(3)
+            assert!(c.rewind_to(&k, Some(&responder)));
+            assert_eq!(c.head(&k), Some(cur(2)));
             assert!(
                 !c.round_ended(&k, true),
-                "the fourth loss in a row does not"
+                "the initiator's rollback (cur 3) is later than the watermark"
             );
-            let _ = c.after_head(&k, 1, 4, Some(cur(6)));
+            assert_eq!(c.head(&k), Some(cur(2)), "the responder's rows stay listed");
+        }
+
+        /// CIRISEdge#1020 — a responder's rewinds are bounded IN A ROW, and a
+        /// delivered listing ends the row, so restores resume after one.
+        ///
+        /// Mutation that turns it red: drop the reset in `listing_delivered`.
+        #[test]
+        fn a_delivered_listing_ends_the_run_of_rewinds_1020() {
+            let mut c = SweepCursors::default();
+            let k = key();
+            assert_eq!(c.after_head(&k, 1, 4, Some(cur(1))), None);
+            for n in 2..=4u8 {
+                let m = c.listing_mark(&k).expect("a position");
+                let _ = c.after_head(&k, 1, 4, Some(cur(n * 10)));
+                assert!(c.rewind_to(&k, Some(&m)), "loss {n} rewinds");
+            }
+            let m = c.listing_mark(&k).expect("a position");
+            let _ = c.after_head(&k, 1, 4, Some(cur(90)));
+            assert!(!c.rewind_to(&k, Some(&m)), "the fourth in a row does not");
             c.listing_delivered(&k);
-            let _ = c.after_head(&k, 1, 4, Some(cur(7)));
             assert!(
-                c.round_ended(&k, true),
-                "after a delivery the next loss restores again"
+                c.rewind_to(&k, Some(&m)),
+                "after a delivery it rewinds again"
             );
         }
 

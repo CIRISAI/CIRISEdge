@@ -673,22 +673,20 @@ impl ReplicationCoordinator {
         if named.is_empty() {
             return;
         }
-        let mut kept = self
-            .salvaged_refs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut added = 0u64;
-        for r in named {
-            if !kept.iter().any(|k| k.envelope_hash == r.envelope_hash) {
-                kept.push(r);
-                added += 1;
+        // Counted toward the once-per-hash bound now: if the responder cannot
+        // serve a salvaged hash, the round that asks for it may time out
+        // (#876), and that round's abandon must not ask for it again.
+        {
+            let mut once = self
+                .salvaged_once
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if once.len() > Self::SALVAGE_CAP {
+                once.clear();
             }
+            once.extend(named.iter().map(|r| r.envelope_hash));
         }
-        if kept.len() > Self::SALVAGE_CAP {
-            let over = kept.len() - Self::SALVAGE_CAP;
-            kept.drain(..over);
-        }
-        drop(kept);
+        let added = Self::keep_salvaged(&self.salvaged_refs, named);
         self.late_refs_salvaged.fetch_add(added, Ordering::Relaxed);
         tracing::debug!(
             peer = %self.peer_key_id,
@@ -733,8 +731,10 @@ impl ReplicationCoordinator {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        let mut held: std::collections::HashSet<[u8; 32]> =
+            sm.refs.iter().map(|k| k.envelope_hash).collect();
         for r in kept {
-            if !sm.refs.iter().any(|k| k.envelope_hash == r.envelope_hash) {
+            if held.insert(r.envelope_hash) {
                 sm.refs.push(r);
             }
         }
@@ -757,22 +757,35 @@ impl ReplicationCoordinator {
         if once.len() > Self::SALVAGE_CAP {
             once.clear();
         }
-        let fresh: Vec<[u8; 32]> = expected.into_iter().filter(|h| once.insert(*h)).collect();
+        let fresh: Vec<EnvelopeRef> = expected
+            .into_iter()
+            .filter(|h| once.insert(*h))
+            .map(|envelope_hash| EnvelopeRef {
+                envelope_hash,
+                seq: 0,
+            })
+            .collect();
         drop(once);
         if fresh.is_empty() {
             return;
         }
-        let mut kept = self
-            .salvaged_refs
+        let added = Self::keep_salvaged(&self.salvaged_refs, fresh);
+        self.late_refs_salvaged.fetch_add(added, Ordering::Relaxed);
+    }
+
+    /// Append `refs` not already kept (a set, not a scan: a late reply can
+    /// name a page of refs against up to [`Self::SALVAGE_CAP`] kept), then
+    /// drop the oldest past the cap. Returns how many were added.
+    fn keep_salvaged(kept: &std::sync::Mutex<Vec<EnvelopeRef>>, refs: Vec<EnvelopeRef>) -> u64 {
+        let mut kept = kept
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held: std::collections::HashSet<[u8; 32]> =
+            kept.iter().map(|k| k.envelope_hash).collect();
         let mut added = 0u64;
-        for h in fresh {
-            if !kept.iter().any(|k| k.envelope_hash == h) {
-                kept.push(EnvelopeRef {
-                    envelope_hash: h,
-                    seq: 0,
-                });
+        for r in refs {
+            if held.insert(r.envelope_hash) {
+                kept.push(r);
                 added += 1;
             }
         }
@@ -780,8 +793,7 @@ impl ReplicationCoordinator {
             let over = kept.len() - Self::SALVAGE_CAP;
             kept.drain(..over);
         }
-        drop(kept);
-        self.late_refs_salvaged.fetch_add(added, Ordering::Relaxed);
+        added
     }
 
     /// Wait for the next inbound replication message.
@@ -1142,15 +1154,22 @@ impl ReplicationCoordinator {
         self.kind
     }
 
-    /// CIRISEdge#1020 — a RESPONDER's reply did not leave (a send error or
-    /// timeout, expired in the lane, or shed at enqueue): the listing it
-    /// carried was not delivered, so put the listing's watermark back and the
-    /// next round lists those rows again. "Listing is not delivery" held on
-    /// the initiator side already ([`StateProvider::round_ended`]); a
-    /// responder's listing had no end, so a lost reply left its rows behind
-    /// the watermark until the re-sweep came round.
-    pub(crate) fn note_listing_lost(&self) {
-        self.provider.round_ended(self.kind, true);
+    /// CIRISEdge#1020 — a RESPONDER's reply carrying a head listing did not
+    /// leave (a send error or timeout, expired in the lane, or shed at
+    /// enqueue): put the listing position back to at most `mark`, where that
+    /// listing started, and the next round lists those rows again. "Listing is
+    /// not delivery" held on the initiator side already
+    /// ([`StateProvider::round_ended`]); a responder's listing had no end, so
+    /// a lost reply left its rows behind the watermark until the re-sweep.
+    pub(crate) fn note_listing_lost(&self, mark: &super::summary::ListingMark) {
+        self.provider.rewind_listing(self.kind, mark);
+    }
+
+    /// CIRISEdge#1020 — where this responder's next head listing starts, taken
+    /// before it steps a round-opening `Summary`; the reply carries it so its
+    /// loss rewinds to exactly its own listing.
+    pub(crate) fn listing_mark(&self) -> Option<super::summary::ListingMark> {
+        self.provider.listing_mark(self.kind)
     }
 
     /// CIRISEdge#1020 — a responder's reply left in full.
@@ -2498,17 +2517,11 @@ mod tests {
             Some(vec![h(7)]),
             "R2 asks for what R1's late answer named"
         );
-        // R2 is abandoned too, its body still expected: R3 asks once more
-        // (the abandoned-round salvage), and then never again (each hash once).
+        // R2 is abandoned too (the responder could not serve it, say): R3 does
+        // NOT ask again. A salvaged hash counts toward the once-per-hash bound
+        // at salvage, so an unservable one costs one round, not two.
         alice.abandon_round().await;
         let _ = alice.drive_round_step(None).await.expect("opens R3");
-        let step = alice
-            .drive_round_step(Some(summary_of(vec![], None)))
-            .await
-            .expect("step");
-        assert_eq!(diff_want(&step), Some(vec![h(7)]), "R3: asked once more");
-        alice.abandon_round().await;
-        let _ = alice.drive_round_step(None).await.expect("opens R4");
         let step = alice
             .drive_round_step(Some(summary_of(vec![], None)))
             .await
@@ -2516,7 +2529,7 @@ mod tests {
         assert_ne!(
             diff_want(&step).unwrap_or_default(),
             vec![h(7)],
-            "bounded: R4 does not ask again"
+            "bounded: asked once"
         );
     }
 
