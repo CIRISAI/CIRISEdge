@@ -1451,9 +1451,9 @@ jobs:
   # the linux/darwin wheel hashes. Edge no longer ships wheels, so the
   # subjects are now the native binaries the Release DOES ship, one
   # manifest per target:
-  #   android-arm64-v8a   aarch64-linux-android     libciris_edge.so  (in android.tar.gz)
-  #   android-x86_64      x86_64-linux-android      libciris_edge.so  (in android.tar.gz)
-  #   android-armeabi-v7a armv7-linux-androideabi   libciris_edge.so  (in android.tar.gz)
+  #   android-arm64-v8a   android-arm64-v8a         libciris_edge.so  (in android.tar.gz)
+  #   android-x86_64      android-x86_64            libciris_edge.so  (in android.tar.gz)
+  #   android-armeabi-v7a android-armeabi-v7a       libciris_edge.so  (in android.tar.gz)
   #   ios-aarch64         aarch64-apple-ios         libciris_edge.dylib (in the xcframework)
   #   ios-aarch64-sim     aarch64-apple-ios-sim     libciris_edge.dylib (in the xcframework)
   # Each hash is of the exact per-target artifact the packaging jobs put in
@@ -1622,9 +1622,15 @@ jobs:
               --output "dist/manifests/ciris-edge-${VERSION}-${label}.manifest.json"
             echo "✓ signed ${label} (${target})"
           }
-          sign_platform android-arm64-v8a   aarch64-linux-android   dist/bin/ciris-edge-android-arm64-v8a/libciris_edge.so
-          sign_platform android-x86_64      x86_64-linux-android    dist/bin/ciris-edge-android-x86_64/libciris_edge.so
-          sign_platform android-armeabi-v7a armv7-linux-androideabi dist/bin/ciris-edge-android-armeabi-v7a/libciris_edge.so
+          # Android targets are ABI NAMES, not Rust triples, on purpose: they are
+          # what CIRISVerify's runtime detect_target() returns
+          # (CIRISVerify src/ciris-verify-ffi/src/constructor.rs:236-243) and
+          # what Verify registers its own mobile binaries under
+          # (CIRISVerify .github/workflows/release.yml:1198-1211). iOS uses the
+          # triples, as Verify does. Do not "fix" these back to triples.
+          sign_platform android-arm64-v8a   android-arm64-v8a       dist/bin/ciris-edge-android-arm64-v8a/libciris_edge.so
+          sign_platform android-x86_64      android-x86_64          dist/bin/ciris-edge-android-x86_64/libciris_edge.so
+          sign_platform android-armeabi-v7a android-armeabi-v7a     dist/bin/ciris-edge-android-armeabi-v7a/libciris_edge.so
           sign_platform ios-aarch64         aarch64-apple-ios       dist/bin/ciris-edge-ios-aarch64-apple-ios/libciris_edge.dylib
           sign_platform ios-aarch64-sim     aarch64-apple-ios-sim   dist/bin/ciris-edge-ios-aarch64-apple-ios-sim/libciris_edge.dylib
           shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
@@ -1786,10 +1792,17 @@ jobs:
           # an error, not a skip: signing step already refused it, and a
           # registry entry silently short a target is the failure this
           # round-trip exists to catch.
+          #
+          # Registry keys follow CIRISVerify's convention, one across the stack:
+          # Android = ABI names (what Verify's runtime detect_target() returns,
+          # CIRISVerify src/ciris-verify-ffi/src/constructor.rs:236-243, and what
+          # Verify registers under, CIRISVerify .github/workflows/release.yml:
+          # 1198-1211); iOS = Rust triples. Not Rust triples for Android: a
+          # lookup by detect_target() would miss them. Do not "fix" these back.
           declare -A TARGET_FOR=(
-            ["ciris-edge-android-arm64-v8a/libciris_edge.so"]="aarch64-linux-android"
-            ["ciris-edge-android-x86_64/libciris_edge.so"]="x86_64-linux-android"
-            ["ciris-edge-android-armeabi-v7a/libciris_edge.so"]="armv7-linux-androideabi"
+            ["ciris-edge-android-arm64-v8a/libciris_edge.so"]="android-arm64-v8a"
+            ["ciris-edge-android-x86_64/libciris_edge.so"]="android-x86_64"
+            ["ciris-edge-android-armeabi-v7a/libciris_edge.so"]="android-armeabi-v7a"
             ["ciris-edge-ios-aarch64-apple-ios/libciris_edge.dylib"]="aarch64-apple-ios"
             ["ciris-edge-ios-aarch64-apple-ios-sim/libciris_edge.dylib"]="aarch64-apple-ios-sim"
           )
