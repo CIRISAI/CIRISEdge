@@ -162,6 +162,7 @@ pub mod touch_claim;
 pub mod transport;
 pub mod verify;
 pub mod version;
+pub mod wire_bytes;
 
 /// CC 0.7 wire-vocabulary pin (CIRISEdge#241, v8.0.0). The SHA-256 of
 /// `WIRE_VOCABULARY.md` as ratified (v1.0.3, rc17 a08db38: the retired

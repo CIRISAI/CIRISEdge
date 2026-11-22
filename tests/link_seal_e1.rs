@@ -3365,3 +3365,203 @@ async fn measure_flood_cost_947() {
             .collect::<std::collections::BTreeMap<_, _>>()
     );
 }
+
+/// B's wire ledger, read after its transport folded the interface counters.
+fn wire_of(node: &Node) -> ciris_edge::wire_bytes::WireBytesSnapshot {
+    node.transport.refresh_metrics();
+    node.metrics.wire_bytes.snapshot()
+}
+
+/// **Witness (CIRISEdge#1025)** — every byte an interface carried lands in
+/// one `(transport, plane)` cell. B dials A over TCP and moves an envelope in
+/// Resources (a dialler ships envelopes that way), real replication rounds and
+/// the link's own KEX; A answers on the Channel. Then, on B:
+///
+/// - each plane those moved is non-zero: `resource` out, `application` in,
+///   `replication`, `link_control` (and `announce`, the on-link `CANN`);
+/// - what edge attributed is EXACTLY the bytes it handed leviculum (the seal's
+///   tap of every frame, sealed and unsealed, sums to the same figure);
+/// - the planes of `tcp` sum to exactly what B's TCP interface carried, in
+///   both directions, with `other` the residual and no overrun;
+/// - nothing is counted under any other transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one witness, read top to bottom
+async fn every_byte_an_interface_carried_lands_in_a_plane_1025() {
+    use ciris_edge::wire_bytes::{WireDir, WirePlane, WireTransport};
+    let t = trio("wire1025", true, false, false).await;
+    let attributed = |s: &ciris_edge::wire_bytes::WireBytesSnapshot, dir| -> u64 {
+        WirePlane::ALL
+            .iter()
+            .filter(|p| **p != WirePlane::Other)
+            .map(|p| s.get(dir, WireTransport::Tcp, *p))
+            .sum()
+    };
+    let before = wire_of(&t.b);
+    t.b.transport.set_link_wire_tap_for_test(true);
+
+    let marker = b"1025-WIRE-ROW-";
+    let tiny = marked(marker, 300);
+    let small = marked(marker, 3_000);
+    let big = marked(marker, 200_000);
+    for frame in [&tiny, &small, &big] {
+        t.b.transport
+            .send(&t.a.key.key_id, frame)
+            .await
+            .expect("B -> A");
+        assert!(
+            wait_until(Duration::from_secs(30), || async {
+                t.a.received(frame).await
+            })
+            .await,
+            "A delivered B's {}-byte frame",
+            frame.len()
+        );
+    }
+    let reply = marked(b"1025-WIRE-REPLY-", 5_000);
+    t.a.transport
+        .send(&t.b.key.key_id, &reply)
+        .await
+        .expect("A -> B");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.b.received(&reply).await
+        })
+        .await,
+        "B delivered A's reply"
+    );
+
+    // Real replication: B's runtime runs rounds against A on the same link.
+    let mut runtime = ReplicationRuntime::start(
+        Arc::clone(&t.b.dir) as Arc<dyn FederationDirectory>,
+        Arc::clone(&t.b.transport) as Arc<dyn Transport>,
+        vec![ReplicationPeer {
+            peer_key_id: t.a.key.key_id.clone(),
+            kind: EnvelopeKind::Key,
+        }],
+        ReplicationRuntimeConfig {
+            scheduler: SchedulerConfig {
+                cadence: Duration::from_millis(500),
+                round_timeout: Duration::from_secs(2),
+                ..SchedulerConfig::default()
+            },
+            local_key_id: Some(t.b.key.key_id.clone()),
+            metrics: Some(t.b.metrics.clone()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let replicated = wait_until(Duration::from_secs(30), || async {
+        wire_of(&t.b).get(WireDir::Out, WireTransport::Tcp, WirePlane::Replication) > 0
+    })
+    .await;
+    runtime.shutdown().await;
+    assert!(
+        replicated,
+        "B's replication rounds reached the wire: {:?}",
+        wire_of(&t.b).family(WireDir::Out)
+    );
+
+    // Quiesce: the interface totals and the attribution stop moving.
+    let mut last = wire_of(&t.b);
+    let mut settled = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = wire_of(&t.b);
+        if now == last {
+            settled = true;
+            break;
+        }
+        last = now;
+    }
+    assert!(settled, "B's wire went quiet");
+    let tapped_frames = t.b.transport.link_wire_tapped_for_test();
+    t.b.transport.set_link_wire_tap_for_test(false);
+    let s = last;
+
+    let out = |p| s.get(WireDir::Out, WireTransport::Tcp, p);
+    let inn = |p| s.get(WireDir::In, WireTransport::Tcp, p);
+    eprintln!(
+        "1025 wire witness, B tcp out: {:?}",
+        WirePlane::ALL
+            .iter()
+            .map(|p| (p.as_str(), out(*p)))
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "1025 wire witness, B tcp in: {:?}",
+        WirePlane::ALL
+            .iter()
+            .map(|p| (p.as_str(), inn(*p)))
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "1025 wire witness, B tcp interface: in {} out {}",
+        s.interface[WireDir::In as usize][WireTransport::Tcp as usize],
+        s.interface[WireDir::Out as usize][WireTransport::Tcp as usize],
+    );
+    // A dialler ships its envelopes as Resources: the three of them, sealed.
+    assert!(
+        out(WirePlane::Resource) >= 203_300,
+        "the Resources carried B's three envelopes: {}",
+        out(WirePlane::Resource)
+    );
+    assert!(out(WirePlane::Replication) > 0, "replication rounds");
+    assert!(out(WirePlane::LinkControl) > 0, "B's transit KEX");
+    assert!(out(WirePlane::Announce) > 0, "B's on-link announce");
+    assert!(
+        inn(WirePlane::Application) >= 5_000,
+        "A's reply, on the Channel"
+    );
+
+    // What edge attributed is exactly what it handed leviculum.
+    let tapped: u64 = tapped_frames.iter().map(|(_, f)| f.len() as u64).sum();
+    assert_eq!(
+        attributed(&s, WireDir::Out) - attributed(&before, WireDir::Out),
+        tapped,
+        "B's attributed bytes out are the frames it handed leviculum"
+    );
+
+    // Every byte the TCP interface carried is in exactly one plane.
+    for dir in [WireDir::In, WireDir::Out] {
+        let truth = s.interface[dir as usize][WireTransport::Tcp as usize];
+        let planes: u64 = WirePlane::ALL
+            .iter()
+            .map(|p| s.get(dir, WireTransport::Tcp, *p))
+            .sum();
+        assert!(truth > 0, "{dir:?}: the interface carried bytes");
+        assert_eq!(planes, truth, "{dir:?}: the planes sum to the interface");
+        assert_eq!(
+            s.overrun[dir as usize][WireTransport::Tcp as usize],
+            0,
+            "{dir:?}: nothing attributed past the interface"
+        );
+        assert!(
+            attributed(&s, dir) <= truth,
+            "{dir:?}: attribution within the interface"
+        );
+        for other in WireTransport::ALL {
+            if other == WireTransport::Tcp {
+                continue;
+            }
+            for p in WirePlane::ALL {
+                assert_eq!(s.get(dir, other, p), 0, "{dir:?} {other:?} {p:?}");
+            }
+        }
+    }
+    // The bundle carries both families under `transport:plane`.
+    let bundle = t.b.metrics.snapshot();
+    assert_eq!(
+        bundle.transport_wire_bytes_out_total["tcp:resource"],
+        out(WirePlane::Resource)
+    );
+    assert_eq!(
+        bundle.transport_wire_bytes_out_total.len(),
+        WirePlane::COUNT,
+        "one transport row: {:?}",
+        bundle
+            .transport_wire_bytes_out_total
+            .keys()
+            .collect::<Vec<_>>()
+    );
+}

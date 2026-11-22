@@ -2796,6 +2796,8 @@ impl PyEdge {
     ///   "durable_enqueued_total":   {"durable": 5, "mandatory": 0, ...},
     ///   "transport_bytes_in_total": {"reticulum-rs": 24576, ...},
     ///   "transport_bytes_out_total":{"http": 1024, ...},
+    ///   "transport_wire_bytes_in_total": {"tcp:replication": 9216, ...},
+    ///   "transport_wire_bytes_out_total":{"tcp:shaped": 40960, ...},
     ///   "peer_reachability_ratio":  {"peer-x:reticulum-rs": 0.75, ...},
     ///   # CIRISEdge#433 — the withhold ledger + the replication-plane
     ///   # served counter. Together they separate the three states a node
@@ -3111,6 +3113,24 @@ fn metrics_bundle_to_pydict<'py>(
         bytes_out.set_item(k.0, *v)?;
     }
     root.set_item("transport_bytes_out_total", bytes_out)?;
+
+    // CIRISEdge#1025 — the wire, keyed `transport:plane`.
+    for (name, family) in [
+        (
+            "transport_wire_bytes_in_total",
+            &bundle.transport_wire_bytes_in_total,
+        ),
+        (
+            "transport_wire_bytes_out_total",
+            &bundle.transport_wire_bytes_out_total,
+        ),
+    ] {
+        let d = pyo3::types::PyDict::new(py);
+        for (k, v) in family {
+            d.set_item(k.as_str(), *v)?;
+        }
+        root.set_item(name, d)?;
+    }
 
     // CIRISEdge#809 — the two leviculum pressure signals, as scalars.
     root.set_item(

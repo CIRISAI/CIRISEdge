@@ -514,6 +514,9 @@ async fn migrate_dialled_link_state(
     }
     let mut planes = link_plane.lock().await;
     if let Some(p) = planes.remove(&connect_id) {
+        if p == LinkPlane::Av {
+            seals.mark_av(wire_id.into_bytes());
+        }
         planes.insert(wire_id, p);
     }
 }
@@ -3214,6 +3217,9 @@ pub struct ReticulumTransport {
     /// leviculum#102 — what was last folded from leviculum's datagram
     /// counters into `av_plane` ([`fold_av_datagrams`]).
     av_datagram_fold: Arc<std::sync::Mutex<AvDatagramFold>>,
+    /// CIRISEdge#1025 — the interface byte totals last folded into the wire
+    /// ledger.
+    wire_fold: Arc<crate::wire_bytes::InterfaceFold>,
     /// Test seam — the C3 `CAPS` bits calls on this node leave out
     /// ([`Self::set_av_caps_withheld_for_test`]). 0 in production.
     av_caps_withheld: std::sync::atomic::AtomicU32,
@@ -4042,6 +4048,11 @@ impl ReticulumTransport {
                 });
             }
         }
+        // CIRISEdge#1025 — the medium a sealed frame on a non-direct link is
+        // counted under.
+        seals.set_base_transport(base_wire_transport(
+            interface_specs.iter().map(|i| i.kind.as_str()),
+        ));
         if let Some(name) = share_instance_local.clone() {
             builder = builder.share_instance(true).instance_name(name);
         }
@@ -4430,6 +4441,7 @@ impl ReticulumTransport {
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
             av_datagram_fold: Arc::default(),
+            wire_fold: Arc::default(),
             av_caps_withheld: std::sync::atomic::AtomicU32::new(0),
             av_datagrams_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             av_layer_requests: std::sync::atomic::AtomicBool::new(false),
@@ -5267,6 +5279,7 @@ impl ReticulumTransport {
     /// Hand the bag to everything that counts into it. Both doors come here,
     /// so a part cannot be left counting into nothing.
     fn adopt_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        self.seals.attach_wire(Arc::clone(&metrics.wire_bytes));
         self.keyer.attach_metrics(metrics.clone());
         self.shapers.attach_metrics(metrics.clone());
         let _ = self.metrics.set(metrics);
@@ -8940,10 +8953,17 @@ impl ReticulumTransport {
         // Timer-free).
         match response.await {
             Ok(info) => {
-                match self
-                    .seals
-                    .open(link_id.into_bytes(), Lane::Response, &info.response_data)
-                {
+                let opened =
+                    self.seals
+                        .open(link_id.into_bytes(), Lane::Response, &info.response_data);
+                // CIRISEdge#1025 — a response is a frame delivered on the link.
+                self.seals.count_inbound(
+                    link_id.into_bytes(),
+                    Lane::Response,
+                    &info.response_data,
+                    &opened,
+                );
+                match opened {
                     Inbound::Open(plain) => Ok(plain),
                     Inbound::Refuse(r) => {
                         let err =
@@ -11170,6 +11190,7 @@ impl Transport for ReticulumTransport {
         if let Some(m) = self.metrics.get() {
             mirror_planes(&self.node, m);
             fold_av_datagrams(&self.node, &self.av_sink, &self.av_datagram_fold, m);
+            fold_wire_bytes(&self.node, &self.wire_fold, m);
             m.telemetry
                 .set_av_datagrams_enabled(self.av_datagrams_enabled());
         }
@@ -11464,6 +11485,30 @@ fn fold_av_datagrams(
     }
 }
 
+/// CIRISEdge#1025 — fold leviculum's per-interface socket byte totals (HDLC
+/// framing and IFAC included) into the wire ledger's interface truth, by
+/// transport, as deltas. On the node tick and before a snapshot, never per
+/// packet. No interface name, address or id leaves this function: the name is
+/// read only for leviculum's `DirectPeer/` prefix.
+fn fold_wire_bytes(
+    node: &ReticulumNode,
+    fold: &crate::wire_bytes::InterfaceFold,
+    metrics: &crate::observability::EdgeMetrics,
+) {
+    let stats = node.interface_stats();
+    fold.fold(
+        &metrics.wire_bytes,
+        stats.iter().map(|i| {
+            (
+                i.interface_id.0,
+                crate::wire_bytes::WireTransport::of_interface(i.kind.as_str(), &i.name),
+                i.rx_bytes,
+                i.tx_bytes,
+            )
+        }),
+    );
+}
+
 /// `FSD/CIRIS_MESH.md` §7.7 — a forwarded link this node refused is a dial
 /// that failed somewhere else, so every move of the count is said, once, off
 /// the node lock. Returns the count it has told.
@@ -11498,6 +11543,9 @@ struct NodeTick {
     metrics: Option<crate::observability::EdgeMetrics>,
     av_sink: Arc<crate::transport::av_sink::AvSink>,
     av_datagram_fold: Arc<std::sync::Mutex<AvDatagramFold>>,
+    /// CIRISEdge#1025 — the interface byte totals last folded into the wire
+    /// ledger.
+    wire_fold: Arc<crate::wire_bytes::InterfaceFold>,
     av_datagrams_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -11530,6 +11578,7 @@ impl NodeTick {
         t.set_seal_held(held);
         mirror_planes(node, m);
         fold_av_datagrams(node, &self.av_sink, &self.av_datagram_fold, m);
+        fold_wire_bytes(node, &self.wire_fold, m);
         t.set_av_datagrams_enabled(
             self.av_datagrams_enabled
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -11599,6 +11648,7 @@ impl ReticulumTransport {
             metrics: self.metrics.get().cloned(),
             av_sink: Arc::clone(&self.av_sink),
             av_datagram_fold: Arc::clone(&self.av_datagram_fold),
+            wire_fold: Arc::clone(&self.wire_fold),
             av_datagrams_enabled: Arc::clone(&self.av_datagrams_enabled),
         }
     }
@@ -13294,6 +13344,9 @@ impl DialCtx {
         // identity-plane send on either side may ride it. Tagged here, before
         // establishment, so no selector can observe an untagged link.
         self.link_plane.lock().await.insert(link_id, plane);
+        if plane == LinkPlane::Av {
+            self.seals.mark_av(link_id.into_bytes());
+        }
         before_establish(link_id);
 
         // Explicit-hash destinations are never pathed (see the routability note
@@ -13477,7 +13530,10 @@ impl DialCtx {
             )
             .await;
             match sent {
-                Ok(Ok(())) => self.seals.tap_frame(link, frame),
+                Ok(Ok(())) => {
+                    self.seals.tap_frame(link, frame);
+                    self.seals.count_unsealed_out(link, frame);
+                }
                 Ok(Err(e)) => {
                     let err = refused(AvHandshakeError::Send(e.to_string()));
                     self.close_refused(link_id).await;
@@ -14571,6 +14627,7 @@ impl DialCtx {
             .map_err(|_| RouteFetchError::Send("request send timed out".to_owned()))?
             .map_err(|e| RouteFetchError::Send(e.to_string()))?;
             self.seals.tap_frame(link, &request);
+            self.seals.count_unsealed_out(link, &request);
             if let Some(m) = self.metrics.as_ref() {
                 m.inc_link_seal(crate::observability::LINK_SEAL_ROUTE_REQUEST_SENT);
             }
@@ -17034,6 +17091,7 @@ fn spawn_route_answer_send(
             let failure = match sent {
                 Ok(Ok(())) => {
                     seals.tap_frame(link, frame);
+                    seals.count_unsealed_out(link, frame);
                     continue;
                 }
                 Ok(Err(e)) => e.to_string(),
@@ -17415,6 +17473,9 @@ async fn seal_inbound(
     } else {
         ctx.seals.open(link, lane, data)
     };
+    // CIRISEdge#1025 — every frame leviculum delivered on a link, counted
+    // once, here, by what its seal made of it.
+    ctx.seals.count_inbound(link, lane, data, &outcome);
     close_evicted(ctx);
     match outcome {
         Inbound::Open(plain) => shaped_inbound(ctx, link_id, lane, plain).await,
@@ -18458,6 +18519,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 LinkPlane::Av => ResourceStrategy::AcceptNone,
                 LinkPlane::Identity | LinkPlane::Scoped => ResourceStrategy::AcceptAll,
             };
+            // CIRISEdge#1025 — an A/V link's frames are counted `av`.
+            if plane == LinkPlane::Av {
+                ctx.seals.mark_av(link_id.into_bytes());
+            }
             let _ = ctx.node.set_resource_strategy(&link_id, strategy);
             // CIRISEdge#32 (v0.14.0) — record establish time for the
             // Links FFI surface's `age_seconds` derivation.
@@ -19325,6 +19390,8 @@ async fn direct_link_established(
     interface: usize,
     proposed: bool,
 ) {
+    // CIRISEdge#1025 — its frames ride the punched interface from here.
+    ctx.seals.set_direct(link_id.into_bytes(), true);
     let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
     let after = link_channel_message_limit(ctx.node, &link_id);
     let (peer, before, active) = {
@@ -19524,6 +19591,8 @@ async fn direct_link_failed(
 /// CIRISEdge#805 item 8 — a punched interface went down; leviculum put its link
 /// back on the interface it left (or closed it, with none left).
 async fn direct_link_lost(ctx: &EventCtx<'_>, link_id: LinkId, interface: usize) {
+    // CIRISEdge#1025 — its frames are on the relayed path's medium again.
+    ctx.seals.set_direct(link_id.into_bytes(), false);
     let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
     let (peer, active) = {
         let mut tracker = ctx.direct_paths.tracker();
@@ -22800,6 +22869,31 @@ fn apply_tcp_client_transit(
         ),
         (None, false) => builder.add_tcp_client(addr),
     }
+}
+
+/// CIRISEdge#1025 — the one medium every configured interface shares (by its
+/// registered kind), or `other` when they differ. A link the seal sees is
+/// counted under it unless it rides a punched direct interface.
+fn base_wire_transport<'a>(
+    kinds: impl IntoIterator<Item = &'a str>,
+) -> crate::wire_bytes::WireTransport {
+    use crate::wire_bytes::WireTransport as T;
+    let mut base = None;
+    for kind in kinds {
+        let t = match kind {
+            "TCPServerInterface" | "TCPClientInterface" => T::Tcp,
+            "UDPInterface" => T::Udp,
+            "AutoInterface" => T::Auto,
+            "LocalInterface" => T::Local,
+            _ => T::Other,
+        };
+        match base {
+            None => base = Some(t),
+            Some(b) if b == t => {}
+            Some(_) => return T::Other,
+        }
+    }
+    base.unwrap_or(T::Tcp)
 }
 
 #[allow(unused_variables, unused_mut)]

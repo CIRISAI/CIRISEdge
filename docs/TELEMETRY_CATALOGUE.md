@@ -92,6 +92,77 @@ referral lines, `direct link` lines, `room` in `CALL JOINED` and `CALL LEFT`. Th
 
 ## The questions
 
+### Where do this node's bytes go?
+
+`transport_wire_bytes_in_total` and `transport_wire_bytes_out_total`
+(CIRISEdge#1025) say, for every byte an interface carried, which medium and
+which plane it was for. Keys are `transport:plane`, and both label sets are
+closed:
+
+- **transport** (11): `tcp`, `udp`, `udp-direct` (a punched direct link),
+  `i2p`, `lora`, `serial`, `ble`, `auto`, `local`, `http`, `other`.
+- **plane** (11): `application`, `replication`, `resource`, `av`, `announce`,
+  `path`, `link_control`, `relay`, `direct_link`, `shaped`, `other`.
+
+That is at most 121 keys per direction, plus each family's total. A transport
+that carried nothing is absent. A transport that carried anything lists all 11
+planes, so a 0 there is a plane that moved nothing. No address, port, link,
+interface name or peer is ever a key.
+
+How a key gets its bytes:
+
+- **Interface truth.** leviculum's I/O tasks count every byte read from or
+  written to a socket, HDLC framing and IFAC included. The node tick (1 s), and
+  every snapshot, folds those per-interface totals in by transport. Each
+  interface's last reading is kept, so a TCP client that disconnects keeps its
+  bytes up to the last fold. The bytes it moved after that fold and before it
+  went are lost, at most one second of one connection, until leviculum exposes
+  retired-interface totals (CIRISAI/leviculum#111).
+- **Edge's attribution.** Every frame edge seals or opens on a Reticulum link
+  (CC 5.3.3.5 E1) is counted once, at the seal, with one atomic add, by its
+  lane and its tag:
+
+| Plane | Rule |
+|---|---|
+| `application` | an envelope or any untagged Channel frame; link requests and responses |
+| `replication` | `CRPL`, the `CFRG` fragments of a `CRPL` frame, and a Resource carrying one |
+| `resource` | a Resource whose payload has no tag of its own (an envelope, a file) |
+| `av` | the datagram lane, any frame on an A/V link, and `CHLO` / `CSKB` / `CALM` |
+| `announce` | `CANN` and `CBND` link frames |
+| `link_control` | `CTKX` (transit KEX), `CTKR` / `CTKA` (pre-seal route fetch), `SHAP` / `SHRF` / `SHCP`, `CNAK` |
+| `relay` | `CONP` onion layers |
+| `shaped` | `SHPF`: every frame on a shaped link, real and cover alike |
+| `path`, `direct_link` | nothing yet: they wait for leviculum's per-packet hook (CIRISAI/leviculum#111) |
+| `other` | interface truth minus every plane above |
+
+  HTTP's `application` is the envelope bytes `Edge::send` and
+  `dispatch_inbound` count. A link on a punched interface is `udp-direct`. Any
+  other link is counted under the node's one configured interface kind, or
+  under `other` when the node has several kinds.
+
+**Reading `other`.** A transport's planes sum to what its interfaces carried, so
+`other` is everything leviculum moved that edge never handed it, and everything
+it wrapped around edge's frames: relayed packets, RNS announces and path
+requests, link requests, proofs and keepalives, Resource advertisements, parts
+and retransmits, packet headers, link tokens and HDLC framing. About a fifth of
+a small frame is that wrapping (CC 5.4.3 rc17 puts it at 107 B of header and
+token plus an 83 B proof per packet). An `other` far above that is the
+finding. Until leviculum exposes a per-packet hook (CIRISAI/leviculum#111),
+the planes it would split
+out (`path`, `link_control` beyond edge's own frames, `relay` beyond onion,
+`direct_link`) stay inside `other`.
+
+**`shaped` is not split on purpose.** Real frames against cover is the activity
+shaping hides (see [Shaping's numbers](#shapings-numbers)). A shaped link sends
+at its class rate whatever it carries: 33,000 B/s each way on a seat link,
+7,000 B/s at `server`, and about 1.15 times that on the wire. So `shaped` grows
+with the number of shaped links, not with load.
+
+`transport_bytes_in_total` and `transport_bytes_out_total` keep their old
+meaning: application envelope bytes by edge transport id (`http`,
+`reticulum-rs`). They were never the wire, so a seat whose wire is all
+replication and shaping can read `{}` there.
+
 ### Why didn't this peer connect?
 
 Read this on the node that was dialled, then on the dialler.
@@ -295,6 +366,8 @@ server-composed node) counted into neither.
 | `durable_enqueued_total` | `ciris.edge.durable.enqueued` | counter | count | operator-only |
 | `transport_bytes_in_total` | `ciris.edge.transport.bytes.in` | counter | bytes | operator-only |
 | `transport_bytes_out_total` | `ciris.edge.transport.bytes.out` | counter | bytes | operator-only |
+| `transport_wire_bytes_in_total` | `ciris.edge.transport.wire.bytes.in` | counter | bytes | operator-only |
+| `transport_wire_bytes_out_total` | `ciris.edge.transport.wire.bytes.out` | counter | bytes | operator-only |
 | `peer_reachability_ratio` | `ciris.edge.peer.reachability` | gauge | ratio | operator-only |
 | `inbound_dropped_low_trust` | `ciris.edge.inbound.dropped_low_trust` | counter | count | operator-only |
 | `replication_round_outcomes_total` | `ciris.edge.round.outcomes` | counter | count | operator-only |

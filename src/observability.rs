@@ -55,7 +55,10 @@
 //! - `transport_bytes_in_total[TransportId]` — bytes-counted by the
 //!   listener side
 //! - `transport_bytes_out_total[TransportId]` — bytes-counted by the
-//!   send side
+//!   send side (both: application envelopes only)
+//! - `transport_wire_bytes_{in,out}_total["transport:plane"]` — every byte
+//!   an interface carried, by closed transport and plane
+//!   ([`crate::wire_bytes`], CIRISEdge#1025)
 //!
 //! Gauges:
 //!
@@ -3240,11 +3243,20 @@ pub struct EdgeMetrics {
     pub durable_enqueued_total: Arc<RwLock<HashMap<DeliveryClass, u64>>>,
     /// Per-transport byte count for inbound frames. Incremented by
     /// the inbound listener side when it pushes an [`crate::transport::InboundFrame`].
+    /// Application envelopes only, once per envelope; the wire is
+    /// [`Self::wire_bytes`].
     pub transport_bytes_in_total: Arc<RwLock<HashMap<TransportId, u64>>>,
     /// Per-transport byte count for outbound envelopes. Incremented
     /// at the success exit of [`crate::transport::Transport::send`]
     /// invocations (`Edge::send` direct path, durable dispatcher loop).
+    /// Application envelopes only, once per envelope; the wire is
+    /// [`Self::wire_bytes`].
     pub transport_bytes_out_total: Arc<RwLock<HashMap<TransportId, u64>>>,
+    /// CIRISEdge#1025 — every byte that crossed an edge interface, by
+    /// `(transport, plane)`: interface truth folded from leviculum's I/O
+    /// counters, attributed at the E1 seal and the HTTP envelope sites
+    /// ([`crate::wire_bytes`]). `transport_wire_bytes_{in,out}_total`.
+    pub wire_bytes: Arc<crate::wire_bytes::WireBytes>,
     /// Gauge — per-(peer, medium) reachability ratio. Mirror of the
     /// reachability tracker; consumers can read the mirror without
     /// reaching across to [`crate::ReachabilityTracker`].
@@ -3849,14 +3861,37 @@ impl EdgeMetrics {
 
     /// Add `bytes` to the inbound byte counter for `transport`.
     pub fn add_bytes_in(&self, transport: TransportId, bytes: u64) {
-        let mut guard = self.transport_bytes_in_total.write();
-        *guard.entry(transport).or_insert(0) += bytes;
+        {
+            let mut guard = self.transport_bytes_in_total.write();
+            *guard.entry(transport).or_insert(0) += bytes;
+        }
+        // CIRISEdge#1025 — HTTP owns its wire: its envelope bytes are its
+        // application plane. A Reticulum envelope's bytes are counted at the
+        // seal, as the frames that carried it.
+        if transport == TransportId::HTTP {
+            self.wire_bytes.add(
+                crate::wire_bytes::WireDir::In,
+                crate::wire_bytes::WireTransport::Http,
+                crate::wire_bytes::WirePlane::Application,
+                bytes,
+            );
+        }
     }
 
     /// Add `bytes` to the outbound byte counter for `transport`.
     pub fn add_bytes_out(&self, transport: TransportId, bytes: u64) {
-        let mut guard = self.transport_bytes_out_total.write();
-        *guard.entry(transport).or_insert(0) += bytes;
+        {
+            let mut guard = self.transport_bytes_out_total.write();
+            *guard.entry(transport).or_insert(0) += bytes;
+        }
+        if transport == TransportId::HTTP {
+            self.wire_bytes.add(
+                crate::wire_bytes::WireDir::Out,
+                crate::wire_bytes::WireTransport::Http,
+                crate::wire_bytes::WirePlane::Application,
+                bytes,
+            );
+        }
     }
 
     /// Record an enqueue against the cumulative durable-enqueue counter.
@@ -5141,6 +5176,7 @@ impl EdgeMetrics {
     #[must_use]
     pub fn snapshot(&self) -> EdgeMetricsBundle {
         let t = self.telemetry.snapshot();
+        let wire = self.wire_bytes.snapshot();
         // The raw count of real frames is a clock of the node's real traffic;
         // it leaves only through `ShapingWindows`.
         let mut link_shaping = registered(&self.link_shaping, LINK_SHAPING_LABELS);
@@ -5166,6 +5202,8 @@ impl EdgeMetrics {
             durable_enqueued_total: self.durable_enqueued_total.read().clone(),
             transport_bytes_in_total: self.transport_bytes_in_total.read().clone(),
             transport_bytes_out_total: self.transport_bytes_out_total.read().clone(),
+            transport_wire_bytes_in_total: wire.family(crate::wire_bytes::WireDir::In),
+            transport_wire_bytes_out_total: wire.family(crate::wire_bytes::WireDir::Out),
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             blob_serve_legacy_dag_walks: self.blob_serve_legacy_dag_walks(),
@@ -5535,6 +5573,12 @@ pub struct EdgeMetricsBundle {
     pub durable_enqueued_total: HashMap<DeliveryClass, u64>,
     pub transport_bytes_in_total: HashMap<TransportId, u64>,
     pub transport_bytes_out_total: HashMap<TransportId, u64>,
+    /// CIRISEdge#1025 — bytes received on the wire, keyed `transport:plane`
+    /// ([`crate::wire_bytes`]). A transport's planes sum to what its
+    /// interfaces carried; `other` is the part edge did not attribute.
+    pub transport_wire_bytes_in_total: std::collections::BTreeMap<String, u64>,
+    /// CIRISEdge#1025 — bytes sent on the wire, keyed `transport:plane`.
+    pub transport_wire_bytes_out_total: std::collections::BTreeMap<String, u64>,
     pub peer_reachability_ratio: HashMap<(String, String), f64>,
     /// CIRISEdge#48-B (v0.19.6) — cumulative count of envelopes
     /// dropped at `dispatch_inbound` due to trust short-circuit.
@@ -5985,6 +6029,14 @@ impl EdgeMetricsBundle {
             "transport_bytes_out_total",
             self.transport_bytes_out_total.iter().map(|(k, v)| (k.0, v)),
         );
+        f.family(
+            "transport_wire_bytes_in_total",
+            self.transport_wire_bytes_in_total.iter(),
+        );
+        f.family(
+            "transport_wire_bytes_out_total",
+            self.transport_wire_bytes_out_total.iter(),
+        );
         for ((peer, medium), ratio) in &self.peer_reachability_ratio {
             f.gauges
                 .insert(format!("peer_reachability_ratio.{peer}:{medium}"), *ratio);
@@ -6414,6 +6466,8 @@ edge_metrics_bundle_fields!(
     durable_enqueued_total,
     transport_bytes_in_total,
     transport_bytes_out_total,
+    transport_wire_bytes_in_total,
+    transport_wire_bytes_out_total,
     peer_reachability_ratio,
     inbound_dropped_low_trust,
     replication_round_outcomes_total,

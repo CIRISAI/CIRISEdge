@@ -1358,6 +1358,8 @@ pub const TELEMETRY_CATALOGUE: &[TelemetrySpec] = &[
     spec("durable_enqueued_total", "ciris.edge.durable.enqueued", Counter, Count, Some(("class", LabelValues::Tokens)), "Durable sends enqueued, by delivery class."),
     spec("transport_bytes_in_total", "ciris.edge.transport.bytes.in", Counter, Bytes, Some(("transport", LabelValues::Tokens)), "Bytes received, by transport."),
     spec("transport_bytes_out_total", "ciris.edge.transport.bytes.out", Counter, Bytes, Some(("transport", LabelValues::Tokens)), "Bytes sent, by transport."),
+    spec("transport_wire_bytes_in_total", "ciris.edge.transport.wire.bytes.in", Counter, Bytes, Some(("transport:plane", LabelValues::Tokens)), "Bytes received on the wire, by closed transport and plane (11 x 11 at most); a transport's planes sum to what its interfaces carried, and `other` is what edge did not attribute."),
+    spec("transport_wire_bytes_out_total", "ciris.edge.transport.wire.bytes.out", Counter, Bytes, Some(("transport:plane", LabelValues::Tokens)), "Bytes sent on the wire, by closed transport and plane (11 x 11 at most); a transport's planes sum to what its interfaces carried, and `other` is what edge did not attribute."),
     spec("peer_reachability_ratio", "ciris.edge.peer.reachability", Gauge, Ratio, Some(("peer", LabelValues::PeerKeyed)), "Per-peer send success. Names peers: never public."),
     spec("inbound_dropped_low_trust", "ciris.edge.inbound.dropped_low_trust", Counter, Count, None, "Envelopes dropped by the trust short-circuit."),
     spec("replication_round_outcomes_total", "ciris.edge.round.outcomes", Counter, Count, closed("outcome", &["completed", "refused", "timed_out", "error", "no_route"]), "Anti-entropy rounds, by outcome."),
