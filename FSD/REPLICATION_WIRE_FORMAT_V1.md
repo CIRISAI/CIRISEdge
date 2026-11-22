@@ -415,18 +415,20 @@ The design and its rationale are in `docs/design/RANGE_FINGERPRINTS.md`. This
 section is normative for the bytes.
 
 **Inputs.**
-- `salt`: 32 bytes, drawn fresh from the OS CSPRNG by the sender for each peer
-  session: at process start, on the peer's reconnect, and at least hourly. It
-  is never derived from anything stable, and sent only where the transport is
-  confidential to that peer (design §6.4, R5-R6).
+- `salt`: 32 bytes, drawn from the OS CSPRNG by the sender separately **for
+  each peer and each direction**, at process start and at least hourly. It is
+  never one value shared across peers, never derived from anything stable, and
+  sent only where the transport is confidential to that peer (design §6.4,
+  R5-R6).
 - `plane`: the `EnvelopeKind` wire name (`"key"`, `"identity_occurrence"`, …),
   ASCII.
 - `prefix`: a lowercase hex string of 0-64 characters. The range is every
   32-byte envelope hash `x` whose lowercase hex starts with it.
-- `S`: on the sender, exactly the set of envelope hashes it would offer this
-  peer on this plane, after the audience filter, minus the ids this Summary
-  lists in `refs`. On the receiver, `settled ∩ mirror` minus the same listed
-  ids. Either way the filter is applied before the sum and the count (R1).
+- `S`: on the sender, the envelope hashes it offers this peer on this plane,
+  after the audience filter. On the receiver, `settled ∩ mirror`. On both
+  sides, two things are left out: the head rows this Summary carries in `refs`
+  (ranges named in `lc` are **not** left out), and every range named in `pk`.
+  Either way the filter is applied before the sum and the count (R1).
 
 **Construction (`"a":1`).**
 
@@ -465,6 +467,7 @@ V6 plane "key", prefix "",         S = {x0,x1,x2}       count 3  fp 5ab8ad56d241
 V7 plane "key", prefix "eb5",      S = {x0,x1,x2,x3}    count 1  fp 54b68f91e5e75e11a19a0b51808ea1c4
 V8 plane "key", prefix "0",        S = {x0,x1,x2,x3}    count 0  fp b54121e4e71812a2a2640c382ab3eddd
 V9 plane "key", prefix "eb508c89", S = {x0,x1,x2,x3}    count 1  fp e732ee33209b5da52ff7f3b57d5f1e5a
+T1 salt tag st for salt = 00 01 … 1f                    st 5b816966
 ```
 
 These vectors show:
@@ -475,7 +478,7 @@ These vectors show:
 - V7 and V9: prefixes of three and eight characters;
 - V8: a non-root range with count 0, which differs from V1's root.
 
-**Wire.** These are additive, flattened members, ignored by a pre-`rf` peer.
+**Wire.** These are additive members, nested under one `rf` member, and ignored by a pre-`rf` peer.
 No `WIRE_PROTOCOL_VERSION` change.
 
 `rf` is a **nested** optional member, omitted when absent and declared after
@@ -483,17 +486,21 @@ No `WIRE_PROTOCOL_VERSION` change.
 `rf`, never as a failed message.
 
 `Summary.rf`:
-- `{"v":1,"a":1,"salt":"<base64url, 32 bytes>","sid":u32,"n":[[prefix,count,fp_hex]…],"c":[[parent,[16 counts],fp_hex×16]…],"lc":[prefix…]}`;
+- `{"v":1,"a":1,"ep":"<base64url, 8 bytes>","salt":"<base64url, 32 bytes>","sid":u32,"n":[[prefix,count,fp_hex]…],"c":[[parent,[16 counts],fp_hex×16]…],"lc":[prefix…],"pk":[prefix…]}`;
+- `ep` is a random per-process epoch. `sid` starts at a random u32 per
+  process;
 - `n` always contains the root `""`;
 - `lc` names the ranges whose ids `refs` lists completely;
 - every fingerprint excludes the ids this Summary lists in `refs`;
 - the salt is repeated in every RF Summary of the peer session.
 
 `Diff.rf`:
-- `{"v":1,"sid":u32,"m":[…],"s":[…],"l":[…]}`: the match, split and list
-  prefixes, answering the Summary with that `sid`;
-- or `{"v":1,"sid":u32,"u":"unbooted"|"salt"|"cap"|"busy"}` when the receiver
-  is unable to answer.
+- `{"v":1,"sid":u32,"st":"<8 hex>","m":[…],"s":[…],"l":[…]}`: the match,
+  split and list prefixes, answering the Summary with that `sid` and salt tag;
+- `st` = `SHA-256("CIRIS-RF-v1/tag" || salt)[0..4]`, in hex;
+- or `{"v":1,"sid":u32,"st":"<8 hex>","u":"unbooted"|"salt"|"cap"|"busy"|"transport"}`
+  when the receiver is unable to answer. `u` makes the next round a head-only
+  legacy Summary, never a full listing.
 
 The marker:
 - `{"v":1}` means the node answers RF;

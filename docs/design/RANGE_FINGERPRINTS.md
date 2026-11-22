@@ -12,7 +12,7 @@ text, **[inf]** is inferred from numbers, **[new]** is proposed here.
   **salted** additive fingerprint over **hash-prefix ranges** of each plane,
   fan-out 16. The fingerprint is Σ SHA-256(tag‖salt‖id) mod 2^256, with the
   count, hashed and truncated to 16 bytes. The salt is 32 fresh random bytes
-  per peer session, sent only over a confidential transport (§6.4). The order
+  per peer and direction, sent only over a confidential transport (§6.4). The order
   is the envelope hash itself, not a cursor (§2.1).
 - **Who sends what.**
   - The **sender** sends fingerprints of the rows it would offer today, the
@@ -61,22 +61,28 @@ text, **[inf]** is inferred from numbers, **[new]** is proposed here.
   bootstrap planes is about 25-31 GB and Deliver bodies as JSON number arrays
   about 25-32 GB. The accounting does not close, which suggests some counted
   bytes never left (§1.4, §11.2). In sync, range fingerprints cut the first to about
-  95 MB (ceiling 0.75 GB). Compact bodies cut the second to about 12 GB toward
+  265 MB over all five bootstrap planes with their Diffs (ceiling 2.1 GB).
+  Compact bodies cut the second to about 12 GB toward
   capable peers (§10.2, §12).
 - **CC has ruled** (2026-11-22, §7): a fingerprint is a compressed ref list,
   not a holding claim; the Attestation plane is allowed, mixed-audience ranges
   included, so long as each fingerprint covers only rows that peer may
   receive. No CC text changes. The construction and its known-answer vectors
   are in `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2, which CC cites.
-- **Named requirements** R1-R16 (§13) carry CC's conditions, the hardening
+- **Named requirements** R1-R21 (§13) carry CC's conditions, the hardening
   and the independent review's fixes:
   - the audience filter goes before the sum and the count;
   - fingerprints are per peer, by type;
   - a match feed books what a match proves, on both sides;
-  - the salted sum, with a fresh 32-byte per-peer-session salt;
-  - answers bound to their Summary, and the root in every Summary;
-  - completion, staleness and pacing that read a two-way root match;
-  - salt-churn limits.
+  - the salted sum, with a 32-byte salt per peer and direction;
+  - answers bound to their Summary by `(sid, st)`, and the root in every
+    Summary;
+  - late `Summary_R` nodes answered under their old `sid`;
+  - completion, staleness and pacing that read a two-way root match and an
+    empty want;
+  - parking by name, never on removal planes;
+  - a mirror that holds only settled ids;
+  - salt-churn limits, where every `u` is a head-only round.
 - **Decisions** are recorded in §11.1. The open question for the
   implementation to measure is in §11.2.
 
@@ -240,7 +246,7 @@ prefix string.
 |---|---|---|
 | Union of disjoint sets | sum of their fingerprints | recompute |
 | Remove one row (withdrawal, per-peer exception) | subtract its hash | recompute the leaf and its path |
-| Per-peer projection = shared set ± a few rows | O(exceptions) over a shared membership index (the salted sums are per peer session, §3.4) | a per-peer tree, or per-peer leaf recomputation |
+| Per-peer projection = shared set ± a few rows | O(exceptions) over a shared membership index (the salted sums are per peer and direction, §3.4) | a per-peer tree, or per-peer leaf recomputation |
 | Cost in sync | one 16 B root | one root |
 | Cost with k sparse differences | O(k · depth · 16) node fingerprints + O(k · leaf) refs | the same |
 | Rounds | depth + 1 | depth + 1 |
@@ -281,12 +287,19 @@ offers its own Summary.
 - The **sender** A sends nodes `(prefix, count, fp)` over its set S_A(B)
   (§2.4). Every Summary includes the root (R11). A also sends ids (`refs`): the
   head rows (§5.1), and the ranges it lists completely, which it names in `lc`.
-- **Fingerprints exclude this Summary's own listed ids, on both sides.** Every
-  node's sum and count are computed over the set minus the ids this Summary
-  carries in `refs`. The sender subtracts them from S_A, and the receiver
-  subtracts them from T_B. Those ids are compared one by one through the Diff
-  instead. So a head row B lacks does not make the root differ, and a churning
-  plane still matches (review finding 11).
+- **Fingerprints exclude this Summary's head rows, and only those, on both
+  sides.** Write H for the head rows this Summary carries (§5.1). Every node's
+  sum and count are computed over the set minus H: the sender subtracts H from
+  S_A, and the receiver subtracts H from T_B. Head rows are compared one by one
+  through the Diff instead. A head row B lacks therefore does not make the root
+  differ, and a churning plane still matches (review finding 11).
+- **Ranges listed in this Summary (`lc`) are not subtracted** (re-review N3).
+  Subtracting them would make a listed range match in the very Summary that
+  lists it. Its remainders and lost Delivers would then need a fresh descent,
+  InSync and #380 would fire a round early, and `acked_by_match` could ack a
+  revocation just offered. A listed range stays on the frontier as a
+  fingerprint node. It leaves only when a **later** Summary that does not list
+  it gets `match`.
 - The **receiver** B computes `fp(T_B(A), prefix)` for each node and answers
   per node:
   - `match`: equal.
@@ -315,21 +328,24 @@ offers its own Summary.
     receipted-file gate, ignored under RF (§4.4.1 row 5): a superset made only
     of rows B holds changes no match and discloses nothing.
 - **T_B(A)**, the receiver's set, is `settled_B ∩ M_B(A)`:
-  - **`M_B(A)`, the listed mirror**, is the set of ids A has listed to B on that
-    plane, kept per `(peer, plane)` (§3.2). An id enters when A lists it, as a
-    head row or in any listed range. An id leaves when A lists a range
-    completely (`lc`) without it, which is A saying it no longer offers that id
-    to B;
+  - **`M_B(A)`, the listed mirror**, holds the ids A has listed to B on that
+    plane **that B holds or settles**, kept per `(peer, plane)` (§3.2). An id
+    A lists enters when it is already in `settled_B`, or later, when B admits
+    it from A's Deliver after wanting it (re-review N6). An id that is never
+    settled, such as a fake id a hostile peer lists, never takes space. An id
+    leaves when a newer complete listing (`lc`) of its range omits it. That is
+    A saying it no longer offers that id to B;
   - **`settled_B`** is what B would not want: its holdings, plus the #1252
     held-equivalent refs, plus refusals still in backoff (#544), plus the known
     hashes on a `HashFirst` plane (#552). On the removal planes (`Revocation`,
     `IdentityOccurrenceRevocation`) it is the holdings only (R13, finding 5).
 
-**Safety.** Write L for this Summary's listed ids. If
-`fp(S_A − L, p) = fp(T_B − L, p)` then, up to a collision,
-`(S_A − L) ∩ p = (T_B − L) ∩ p ⊆ settled_B`, and every id of L is compared by
+**Safety.** Write H for this Summary's head rows. If
+`fp(S_A − H, p) = fp(T_B − H, p)` then, up to a collision,
+`(S_A − H) ∩ p = (T_B − H) ∩ p ⊆ settled_B`, and every id of H is compared by
 the Diff. So a match never suppresses a row the sender currently offers. The
-proof needs only `T_B ⊆ settled_B`.
+proof needs only `T_B ⊆ settled_B`. Prefix collisions in the mirror cannot
+break it either: T_B is still a subset of settled, whatever M holds.
 
 **Convergence when B holds more than A offers (finding 1).** That is the
 normal case on the bootstrap planes: a phone offers a handful of rows and holds
@@ -376,22 +392,33 @@ like `withheld` (a plain `#[serde(default, skip_serializing_if =
 ```text
 Summary (RF sender, in sync):
 {"type":"summary","kind":"identity_occurrence","refs":[],
- "rf":{"v":1,"a":1,"salt":"<43 b64url>","sid":118,"n":[["",33012,"<32 hex>"]]}}   ~ 185 B
+ "rf":{"v":1,"a":1,"ep":"<11 b64url>","salt":"<43 b64url>","sid":2974410118,
+       "n":[["",33012,"<32 hex>"]]}}                                              ~ 210 B
 
 after a split of "3f": the root again, plus one packed record per split parent
  "rf":{…,"n":[["",33012,"…"]],"c":[["3f",[c0..c15],"<16 x 32 hex>"]]}           + ~610 B / split
 
 a complete listing of "3f2a": its ids in refs (or compact "rh", §12), named in lc
  "rf":{…,"lc":["3f2a"]}
+parked ranges, left out of every ancestor's sum on both sides (§2.6)
+ "rf":{…,"pk":["7c01"]}
 
 Diff (RF receiver):
 {"type":"diff","kind":"identity_occurrence","want":[],
- "rf":{"v":1,"sid":118,"m":[""],"s":[],"l":[]}}                                   ~ 85 B
-unable this round:  "rf":{"v":1,"sid":118,"u":"unbooted"|"salt"|"cap"|"busy"}
+ "rf":{"v":1,"sid":2974410118,"st":"<8 hex>","m":[""],"s":[],"l":[]}}            ~ 100 B
+unable this round:  "rf":{"v":1,"sid":…,"st":…,"u":"unbooted"|"salt"|"cap"|"busy"|"transport"}
 ```
 
 - `sid` numbers the sender's RF Summaries per `(peer, plane)`, across both
-  roles. Every answer echoes it (§2.6, finding 7).
+  roles, from a random u32 per process. Every answer echoes it with `st`, the
+  salt tag (§2.6, findings 7 and N9).
+- `ep` is a random 64-bit epoch drawn once per sender process. A receiver uses
+  it to tell a restarted sender from salt churn (§6.4, N4).
+- **`u` never means a full listing** (N4). The next round toward that peer is
+  a head-only Summary, the rows new since the head position, which is the
+  legacy head listing. The round after retries RF. Only `RF_U_LEGACY_AFTER` =
+  20 consecutive `u` answers mark the peer legacy, and a legacy pair is paced
+  by the quiet rule (§6.3).
 - A marker with no nodes (`"rf":{"v":1}`) on a legacy Summary or Diff says "I
   answer RF". `"e":1` in it says "I decode the compact encoding" (§12.3).
 
@@ -412,8 +439,15 @@ unable this round:  "rf":{"v":1,"sid":118,"u":"unbooted"|"salt"|"cap"|"busy"}
   `bridge.rs:2063-2124`) have nothing to undo on an RF plane.
 - **Answers are bound to their Summary** (R10, finding 7):
   - The sender keeps the last `RF_SNAPSHOTS` = 4 Summaries per `(peer, plane)`,
-    each recorded as `sid → {prefix → fp as sent}`.
-  - An answer whose `sid` is not among them is dropped
+    each recorded compactly as `(sid, salt tag) → {prefix → (count, fp)}`.
+    An in-sync snapshot is the root alone (about 30 B). The worst case, a
+    16-split Summary, is about 5 KB (§3.4).
+  - **`sid` starts at a random u32 per process** and counts up from there.
+    Every answer echoes `sid` and `st`, the Summary's salt tag: the first 4
+    bytes of `SHA-256("CIRIS-RF-v1/tag" ‖ salt)`. An answer applies only to
+    the snapshot with that `(sid, st)`. After a sender restart, an in-flight
+    answer can therefore never meet a new snapshot under an old salt
+    (re-review N9). An answer that matches no snapshot is dropped
     (`rf_answers_stale`).
   - A `match p` is applied only if the sender's current `fp(p)` still equals
     the fingerprint sent. Under the salt, equal fingerprints mean the same set,
@@ -426,13 +460,31 @@ unable this round:  "rf":{"v":1,"sid":118,"u":"unbooted"|"salt"|"cap"|"busy"}
 - **A listed range stays on the frontier** as a node until it answers `match`.
   That carries deferred Deliver remainders, transient refusals and lost frames
   (§1.3 items 1-3).
-- **A leaf that keeps failing is parked.** If a leaf has been listed
-  `RF_LEAF_RETRIES` = 4 times with the same wants and still does not match, it
-  is parked with exponential backoff (to 1 h). That covers an unfetchable
-  #429 row or a refusal loop. The root still covers it, and any change to it
-  un-parks it.
-- **Bounds.** At most `RF_MAX_SPLITS_PER_SUMMARY` = 16 packed splits (~10 KB)
-  and at most the effective page (`sweep_page_rows` under the host's page
+- **A leaf that keeps failing is parked, by name, and never on a removal
+  plane** (re-review N2).
+  - **When.** A leaf listed `RF_LEAF_RETRIES` = 4 times that still does not
+    match is parked, if every id it leaves unmatched is one of two kinds:
+    - one B named in the Diff's `withheld` (a refusal in backoff, #1014);
+    - one A could not serve (#429).
+    The backoff is exponential, to 1 h.
+  - **Named on the wire.** The Summary lists parked prefixes in `pk`. Both
+    sides leave a parked range out of every ancestor's sum and count, so the
+    rest of the plane can still match at the root. InSync and #380 then read
+    "matched except `pk`", and the staleness signal reports the parked rows as
+    `BoundedBy` (§5.11).
+  - **Un-parked** when:
+    - the backoff ends;
+    - A's set in the range changes;
+    - a later Diff no longer names those ids in `withheld`.
+  - **Never on `Revocation` or `IdentityOccurrenceRevocation`.** Their leaves
+    hold at most 16 rows, and a revocation B refuses must keep being offered
+    until B admits it. Such a leaf is simply re-listed each round. That costs
+    at most 16 refs a round, and that plane's root does not match until B
+    holds the row. That is true: B does not hold it.
+- **Bounds.** At most `RF_MAX_SPLITS_PER_SUMMARY` = 16 packed splits (~10 KB).
+  The 256 children inside those `c` records count only against this 16-record
+  cap, never against the receiver's node cap (§6.4, re-review N5). There are
+  also at most the effective page (`sweep_page_rows` under the host's page
   lever) of listed refs per Summary; the rest waits a round. Frontiers are
   LRU-capped like `MAX_TRACKED_SWEEP_CURSORS` (`bridge.rs:1986`). An evicted
   frontier restarts at the root, which costs one descent, never a row.
@@ -451,7 +503,7 @@ Split records are ~610 B; a listed ref is 154 B as JSON, ~45 B compact (§12).
 
 | k random differences | RF, whole descent, JSON refs | RF, compact refs | One legacy listing (JSON / compact) |
 |---|---|---|---|
-| in sync | ~185 B Summary + ~85 B Diff per round | same | 5.1 MB / 1.5 MB **every listing** |
+| in sync | ~210 B Summary + ~100 B Diff per round | same | 5.1 MB / 1.5 MB **every listing** |
 | 1 | 3.2 KB over 5 rounds | 2.4 KB | |
 | 10 | 24 KB | 15 KB | |
 | 100 | 184 KB | 97 KB | |
@@ -468,10 +520,18 @@ legacy listing.
 new pair, or a receiver after a restart, has an empty `M_B(A)`. Its root
 differs, the two top levels split (they are larger than a page), and A then
 lists the plane one page per round, once. That is the legacy first walk, and
-it is paid once per receiver restart, not once per listing. For a phone that
-restarts, the canonical lists its whole offer once: ≈ 140k refs, ≈ 6.3 MB
-compact. Persisting the mirror would remove that cost; it is left for after
-the LTS (§11.3).
+it is paid once per receiver restart, not once per listing.
+- **Throughput** is the Deliver budget per round, as in a legacy walk. A
+  listed range stays on the frontier (§2.3). If its Deliver did not carry
+  everything, or was lost, the next Summary's fingerprint of that range
+  differs. B answers `list` again, and the remainder is wanted and delivered.
+  A Deliver budget smaller than a page therefore slows the walk, but never
+  strands a row (re-review N3).
+- **A phone restart.** Without seeding, the canonical lists its whole offer
+  once: ≈ 140k refs, ≈ 6.3 MB compact. With §3.2's public-plane seed that
+  shrinks to the IdentityOccurrence, TransportDestination and Attestation
+  planes, plus the few differing public ranges. Persisting the mirror would
+  remove the rest; it is left for after the LTS (§11.3).
 
 ### 2.8 Lying peers and collisions
 
@@ -491,7 +551,7 @@ the LTS (§11.3).
   with the counts balanced, to a target (Wagner's generalized birthday is cheap
   in hash evaluations). That would make an A–B range match while B lacks a row.
 - **The salted sum closes it.** Each element is `e(x) = SHA-256(tag‖salt‖x)`.
-  The salt is 32 fresh random bytes per peer session, sent only inside a
+  The salt is 32 fresh random bytes per peer and direction, sent only over a
   confidential transport (§6.4, R5-R6).
   - A third party cannot compute any `e(x)` toward that peer, so it cannot
     prepare a set.
@@ -549,16 +609,35 @@ memory.
   `RangeIndex`. A truncated id that matches a settled id A never listed only
   enlarges T_B by an id B holds: that costs efficiency, never safety, and it
   happens with probability about n²/2^64.
-- **An id enters** when it is in any RF Summary's `refs` from A: a head row or
-  a listed range.
-- **A range is replaced** when A lists it completely and names it in `lc`:
-  the mirror's ids in that range become exactly the ids listed. Ids A has
-  stopped offering leave this way.
-- **Capped.** A hostile peer could list made-up ids to grow the mirror, so it
-  is capped per `(peer, plane)` at 262,144 ids (2 MiB) and node-wide at
-  32 MiB. A peer at the cap gets `"u":"cap"` on that plane, and the pair goes
-  legacy; this is counted in `rf_mirror_capped`. Nothing is evicted, so no
-  range re-opens because of an eviction.
+- **An id enters only if B settles it** (re-review N6):
+  - an id A lists (a head row, or in a listed range) that is already in
+    `settled_B` enters at once;
+  - one B wants enters when B admits it from A's Deliver. The session already
+    records what it asked for (`expect_bodies_for_rounds`, `session.rs:704`),
+    and that is the hook;
+  - an id that never settles, such as a fake id a hostile peer lists, never
+    takes space.
+
+  The mirror is therefore never larger than B's own settled set. A few hostile
+  peers cannot fill it and push honest pairs to legacy.
+- **A range is replaced** when A lists it completely (`lc`): the mirror's ids
+  in that range become exactly the listed ids that B settles. Ids A has
+  stopped offering leave this way. **An `lc` is applied only if its `sid` is
+  newer than the last `lc` applied to that range**, so a reordered, older
+  listing cannot undo a newer one. A small per-`(peer, plane)` map of
+  `prefix → sid` holds the recent ones (plausible item).
+- **Capped** as a backstop: 262,144 ids per `(peer, plane)` (2 MiB), and
+  32 MiB node-wide, shared fairly per peer. A peer at the cap gets
+  `"u":"cap"` on that plane, counted in `rf_mirror_capped`. Nothing is evicted,
+  so no range re-opens because of an eviction.
+- **Seeded after a restart on the public planes** (plausible item). On `Key`,
+  `Revocation` and `IdentityOccurrenceRevocation`, a receiver with an empty
+  mirror may seed `M_B(A)` from its own settled rows on that plane. It does so
+  when A's root count is at least half its settled count. Those rows are
+  public and served to every peer, so the seed discloses nothing. A seeded id
+  A does not offer makes a range differ until A's next `lc` of it prunes it.
+  This turns most of a phone's restart cost from a full listing into a
+  descent over the few ranges that differ.
 - **Sizes.** A phone's mirror of the canonical is the canonical's whole offer,
   ≈ 140k × 8 B ≈ 1.1 MiB. The canonical's mirror of a phone is the phone's
   handful of own rows. A seat's mirror of another seat is ≈ 1.1 MiB. Restart
@@ -614,12 +693,14 @@ peers, four of them seats with full mirrors, every cap reached.
 |---|---|---|
 | `RangeIndex`, all planes (membership + labels, §3.1, §4.4.2) | ≈ 7 MiB | ≈ 7 MiB |
 | `PeerSums` (256 × 40 B ≈ 10 KiB per `(peer, plane)`, §3.1) | ≈ 1 MiB | 135 × 6 × 10 KiB ≈ 8 MiB |
-| Frontiers + `RF_SNAPSHOTS` (≈ 2 KiB per `(peer, plane)` at the split cap) | < 0.5 MiB | ≈ 1.6 MiB |
+| Frontiers (≈ 2 KiB per `(peer, plane)` at the split cap) | < 0.5 MiB | ≈ 1.6 MiB |
+| `RF_SNAPSHOTS` = 4 per `(peer, plane)`, compact `prefix → (count, fp)`: ≈ 30 B in sync (root only), ≈ 5 KB for a 16-split Summary (re-review N8) | < 0.1 MiB | 135 × 6 × 4 × 5 KB ≈ 16 MiB |
+| A second `PeerSums` while a new salt builds in the background (§6.4) | < 0.1 MiB | ≈ 8 MiB |
 | Receiver mirrors `M_B(A)` (8 B an id) | ≈ 1 MiB | 4 seats × 6 planes × 33k × 8 B + 131 phones' own rows ≈ 7 MiB |
 | Receiver `PeerSums` over `settled ∩ M` | < 0.5 MiB | ≈ 8 MiB |
 | Attestation volatile bitsets (§4.4.4) | < 0.1 MiB | 135 × ~2.5 KiB ≈ 0.3 MiB |
 | Compact/receiver caches, misc | | ≈ 8 MiB |
-| **Total** | **≈ 10 MiB** | **≈ 40 MiB** |
+| **Total** | **≈ 10 MiB** | **≈ 65 MiB** |
 
 **CPU and store reads in sync.**
 - An in-sync round is one root compare per `(peer, plane)` per direction. Every
@@ -642,22 +723,26 @@ that peer listed to it.
 
 | Salt scope | When the full salted pass runs | Canonical cost |
 |---|---|---|
-| **per peer session (R5, recommended)** | sender: once per new salt per peer, i.e. at session start, on reconnect, and at least hourly, then O(delta) per memo generation. Receiver: once per salt it accepts (§6.4) | sender ≈ 70 ms per salt per peer, so at the hourly floor 135 peers × 70 ms / 3,600 s ≈ 0.3% of a core, plus reconnects. Receiver: tiny for phones (their own rows), ≈ 70 ms per seat peer per salt. Deltas: 10 new rows × 17 peers = 170 hashes ≈ 85 µs per generation |
+| **per peer and direction, at process start and hourly (R5)** | sender: once per new salt per peer, in the background (§6.4), then O(delta) per memo generation. Receiver: once per salt it accepts (§6.4) | sender ≈ 70 ms per salt per peer, so 135 peers × 70 ms / 3,600 s ≈ 0.3% of a core. Reconnects cost nothing (N4). Receiver: tiny for phones (their own rows), ≈ 70 ms per seat peer per salt. Deltas: 10 new rows × 17 peers = 170 hashes ≈ 85 µs per generation |
 | per round | every round, per peer, per role | 17 peers × 2 roles × 70 ms per 30 s ≈ 8% of a core for the sender alone, ≈ 16% with the receiver, and over 100% if all 135 peers were active |
 
 The per-session salt is cheaper by the number of rounds a session carries:
 twenty for a ten-minute session, 120 for the hourly floor. Counters
 `rf_peersums_built` and `rf_peersums_build_ms` (§8) measure the real rate. A
-round never waits for a build: until a peer's sums exist, that round sends a
-legacy Summary (R8).
+round never waits for a build. A rotation keeps the old salt until the new
+sums are ready. A peer's very first sums are the only case with none, and
+until they exist its rounds are head-only (R8).
 
 **Fail to the old behaviour, never to a wrong answer** (R8).
-- The receiver answers `"u"`, and the sender lists that peer the legacy way
-  next round, when the holdings index for the plane is not `Ready` (unbooted,
-  booting or suspect, `holdings_index.rs` "Failing to the old behaviour"), or
-  when a salt or cap rule refuses (§6.4).
-- The sender sends a legacy Summary when its listing failed or the peer's sums
-  are not yet built.
+- The receiver answers `"u"` when the holdings index for the plane is not
+  `Ready` (unbooted, booting or suspect, `holdings_index.rs` "Failing to the
+  old behaviour"), when a salt, cap, busy or transport rule refuses (§6.4), or
+  when its mirror is at the cap. Every `u` makes the sender's next round a
+  **head-only** legacy Summary, never a full listing (N4). The round after
+  retries RF. Twenty consecutive `u` mark the pair legacy, paced by §6.3's
+  quiet rule.
+- The sender sends a head-only Summary when its listing failed or the peer's
+  first sums are not yet built.
 
 ### 3.5 Why not a persist API
 
@@ -681,8 +766,10 @@ content exists" (`~/CIRISConstitution/constitution/part_5_transport_substrate.md
 Range fingerprints add no new disclosure if both sides fingerprint only inside
 the other's audience (§2.4). Per side:
 
-- the sender, its exact offer, so nothing beyond what it lists;
-- the receiver, its would-not-want set inside what it would serve the sender.
+- the sender: its offer, so nothing beyond what it lists;
+- the receiver: `settled_B ∩ M_B(A)`, the rows it holds or settles out of
+  those the sender itself listed (§2.4, §3.2). The sender holds every row it
+  lists, and so is in that row's audience (CC 5.2).
 
 ### 4.2 The bootstrap planes (45.1.x)
 
@@ -690,7 +777,7 @@ the other's audience (§2.4). Per side:
   over public rows (the `Key` plane is "a #402 bootstrap plane, served public",
   `bridge.rs:5230-5233`; the revocation planes enumerate `Projection::Global`).
   Membership is shared and has no per-peer exceptions; the salted sums are
-  still per peer session, so per peer (R2).
+  still per peer and direction (R2).
 - `IdentityOccurrence`, `TransportDestination`: shared membership minus the
   peer's #682 subjects, filtered before the per-peer salted sum (R1): "an unannounced node's occurrence and route go only to
   its owner's own nodes" (`bridge.rs:5282-5285`). The exception set is
@@ -991,10 +1078,20 @@ its own counter (§11, decision 7).
 - A late reply's refs are still salvaged (`salvage_late_reply`,
   `coordinator.rs:654`) and merged into the next responder Summary
   (`merge_salvaged`, `coordinator.rs:721`).
-- A late reply's `rf` answers are **not** dropped wholesale. They are applied
-  under §2.6's binding: by `sid`, and for a `match` only when the node's
-  fingerprint is unchanged. That is what keeps a NAT'd initiator's descent
-  moving when its replies arrive after the round ended (§5.6).
+- A late reply's `rf` **answers** (a late `Diff_R`) are not dropped wholesale.
+  They are applied under §2.6's binding: by `(sid, st)`, and for a `match` only
+  when the node's fingerprint is unchanged.
+- **A late `Summary_R`'s `rf` nodes are salvaged too, and answered** (re-review
+  N1). `salvage_late_reply` (`coordinator.rs:654-718`) keeps a late Summary's
+  refs. Under RF it also keeps the Summary's `rf` member: its `sid`, salt and
+  nodes. The initiator's next `Diff_I` answers those nodes under their **old**
+  `sid`, beside its answer to the current one. The responder's 4-snapshot
+  window (§2.6) still holds them.
+- Without this, a NAT'd phone whose canonical replies always arrive after its
+  round ended would never answer the canonical's offer, and the canonical's
+  descent toward the phone would stall. With it, that descent advances one
+  step per round, one round behind. Witness 23 checks that descent with every
+  `Summary_R` late.
 - The listing marks and rewinds (`listing_mark`, `coordinator.rs:1171`;
   `rewind_to`, `bridge.rs:2100`) remain for head listings and for legacy peers.
   RF state needs none (§2.6).
@@ -1016,7 +1113,7 @@ round, and the descent would stall.
 - `peer_holds_all` holds only if our last RF Summary's root was answered
   `match` at our **current** generation (§2.6 binding);
 - `want_nothing` holds only if we answered `match` on the peer's root at the
-  peer's latest `sid`.
+  peer's latest `sid`, **and** our Diff on that Summary wanted nothing (N3).
 
 Both directions must be root-matched. Otherwise the round waits for the reply
 as any round does. For a legacy peer the gate is unchanged. The proactive
@@ -1070,7 +1167,9 @@ RangeMatched { peer, plane, side: Sender | Receiver, sid, prefix,
   them as equivalents, or is refusing them for now.
 - **Receiver side.** B answers `match p`. Then A offers every id of T_B ∩ p,
   and A holds what it offers.
-- **Booked over the compared snapshot only.** The ids are those compared:
+- **Booked over the compared snapshot only, minus its head rows** (N3). The
+  ids are those compared, never a row the same Summary listed as a head row
+  and B may still lack:
   - on the sender, S_A ∩ p at the sent `sid`, which is the current set because
     the fingerprint is unchanged;
   - on the receiver, T_B ∩ p computed and booked in one step when it answers.
@@ -1134,10 +1233,14 @@ lists nothing, so it wants nothing.
 
 **[new]** For an RF peer:
 - `InSync` holds only when the root matched in **both** directions at current
-  generations (§5.6's test);
+  generations (§5.6's test), **and** the round's want was empty (re-review N3).
+  A head row this node still lacks is not "in sync" even under a matching
+  root. Parked ranges (`pk`, §2.6) are reported as `BoundedBy { missing:
+  parked rows }`, never as `InSync`;
 - a descending round reports `BoundedBy` with `missing` = the open frontier
   nodes' count difference, or `Unknown` when that is not known;
-- `first_sync` completes only at the first two-way root match.
+- `first_sync` completes only at the first two-way root match with an empty
+  want. The #380 completion (§5.6) uses the same test.
 
 The signal is then stronger than today's: a match proves the whole plane, not
 one page.
@@ -1208,55 +1311,103 @@ listings about 4×.
 The knob is local "less of its own optional work", which CC 4.2.1.4 lets a
 node do without any row. It is not a mesh-config key.
 
-### 6.4 The salt: per peer session, and its limits (findings 12, 13)
+### 6.4 The salt: per peer and direction, and its limits (findings 12, 13; re-review N4, N7, N9)
 
 **Why not per link session (finding 13).** `src/replication` has no link
 identity: the Session builds a message, and the transport picks the link
 afterwards, a pooled or reverse-path one. A per-link salt therefore cannot be
 written where `rf` is built, and R6 could not be enforced there.
 
-**[new] The salt is per peer session** (recommended; the team lead is
-confirming with CC):
-- It is drawn by the sender as 32 bytes from the OS CSPRNG. Each `(peer,
-  sending process)` holds one salt, drawn fresh:
-  - at process start;
-  - when the peer reconnects, meaning the transport reports a live link to the
-    peer after a period with none (the same evidence that clears the #794
-    no-route backoff, `scheduler.rs` module docs, "A peer with no route
-    backs off");
+**[new] The salt is per peer and per direction.** CC confirmed this meets its
+requirement, with two things stated outright (2026-11-22):
+- **Distinct for each peer and each direction.** A sender draws a separate
+  32-byte salt from the OS CSPRNG for each peer it sends RF to. It is never one
+  process-wide value reused across peers: otherwise C would learn the salt that
+  A uses toward B. B's salt toward A is B's own draw, so the two directions
+  never share one.
+- **When it is drawn.** Per peer, on each of:
+  - process start;
   - at least once an hour.
-- It is never derived from anything stable: no key, key id, link id, link
-  hash, round id, counter or clock.
-- It rides in every RF Summary of the session.
 
-**R6 is enforced where `rf` is built.** RF Summaries are built only for a peer
-the transport reports as confidential end to end, through a new
-`Transport::confidential_to(peer) -> bool`:
-- **Reticulum: always.** "There is never a plaintext edge frame in either
-  direction" (`src/transport/link_seal.rs` module docs, E1 enforced at once).
-  Every pooled or reverse-path link is sealed, so it does not matter which link
-  the transport picks.
-- **HTTP: only when the peer's target is `https`.** The HTTP transport allows
-  TLS-terminating front ends (`src/transport/http.rs:19-32`), so plain-HTTP
-  peers get legacy Summaries.
+  It is **not** redrawn on reconnect (N4). A redraw per reconnect cost a full
+  salted pass each time, with no sender-side limit, and starved churny phones.
+  The team lead is confirming the drop with CC. CC's stated reason for fresh
+  salts is "never derived from anything stable", which a random hourly draw
+  satisfies.
+- **Never derived** from a key, key id, link id, link hash, round id, counter
+  or clock.
+- **Built before it is used.** A new salt's `PeerSums` are built in the
+  background. The old salt stays in use until they are ready, so a rotation
+  never costs a round.
+- It rides in every RF Summary, with `ep`, a random 64-bit epoch drawn once
+  per sender process (§2.5).
+- **A peer session**, the unit capabilities are remembered for (§6.1, §12.3),
+  is one `ep` of that peer. The marker carries `ep` too
+  (`"rf":{"v":1,"ep":…,"e":1}`). A peer that restarts shows a new `ep`, and
+  everything learned under the old one (`rf` capability, `e`) is forgotten
+  until the peer says it again.
 
-**Limits a hostile peer cannot get past (finding 12):**
-- **The first salt wins.** A receiver accepts one salt per peer session. A new
-  salt is accepted only if `RF_SALT_MIN_AGE` = 10 min has passed since the last
-  one accepted, or the receiver itself saw the peer reconnect. Otherwise it
-  answers `"u":"salt"` and the round goes legacy.
-- **A rebuild token bucket**, per peer: 3 rebuilds, refilled at one per 20 min.
-  It is joined by a node-wide cap of 2 concurrent rebuilds; beyond either,
-  `"u":"busy"`.
-- **A node cap per Summary.** A receiver evaluates at most 64 nodes and 16
-  split records per Summary. Anything beyond is answered `"u":"cap"`. Honest
-  senders stay under it (§2.6).
+**R6 is enforced where `rf` is built, and checked where it arrives** (N7). A
+new `Transport::confidential_to(peer) -> bool` decides:
+- **The trait default is `false`.** A transport is confidential only if it says
+  so.
+- **Reticulum: `true`.** Every frame on every lane is E1-sealed: "There is
+  never a plaintext edge frame in either direction" (`src/transport/link_seal.rs`
+  module docs). Every pooled or reverse-path link is sealed, so it does not
+  matter which link the transport picks.
+- **HTTP:** `HttpsTransport` (`src/transport/http.rs:498`) is `true`;
+  `HttpTransport` (`http.rs:135`) is `false`.
+- **Packet radio: `false`** unless the frame rides the `federation_session`
+  seal. Its AEAD is "caller's choice" (`src/transport/packet_radio/mod.rs:37`),
+  and it is a broadcast medium.
+- **Inbound.** A salted RF Summary that arrived over a transport whose
+  `confidential_to(sender)` is false has already exposed its salt. The
+  receiver does not use it: it answers `"u":"transport"`, and the sender's
+  next Summary toward it carries no `rf`. `InboundFrame` carries the
+  `TransportId` (`src/transport/mod.rs:580`), so the check is local.
+- **Residual, stated.** An `https` target behind a third-party TLS-terminating
+  CDN or front end (`http.rs:19-32` allows one) sees the salt. That party can
+  then forge collisions only toward that one peer, and only for that hour's
+  salt. An operator who does not trust the front end should not front
+  replication with it.
+
+**Limits a hostile peer cannot get past (finding 12, N4):**
+- **Salt changes.** A receiver accepts a new salt from a peer in two cases:
+  - **a new `ep`.** The sender restarted, which is honest: accepted, subject to
+    the rebuild bucket;
+  - **the same `ep`**, if at least `RF_SALT_MIN_AGE` = 10 min has passed since
+    the last salt it accepted. The hourly rotation always qualifies.
+
+  Anything else is churn and is answered `"u":"salt"`.
+- **A refused change degrades to a listing, never a stall** (CC). `u` makes the
+  sender's next round toward that peer a head-only legacy Summary: the rows new
+  since the head position, i.e. the legacy head listing. It is never a full
+  re-listing (N4). The round after retries RF. Once the receiver accepts the
+  salt, the descent resumes where its frontier stood. The honest case is a
+  sender that restarted while the receiver missed it: with a new `ep` it is not
+  refused at all, and a refusal can come only from an exhausted bucket.
+- **A rebuild token bucket, per peer:** 3 rebuilds, refilled at one per 20 min.
+- **A node-wide cap of 2 concurrent rebuilds, fair per peer.** A peer may hold
+  at most one of the two slots. Waiting peers are served round-robin, so sybils
+  cannot hold both. Beyond these, `"u":"busy"`, which is again a head-only
+  round.
+- **A node cap per Summary.** A receiver evaluates at most 64 nodes in `n` and
+  16 split records in `c`. The 256 children inside the `c` records count only
+  against the 16-record cap (N5), so an honest 16-split Summary is never
+  refused. Anything beyond is answered `"u":"cap"`.
+- **Sender-side redraws** happen only at process start and on the hourly timer,
+  so no peer can make A redraw.
 - **Counted:** `rf_salt_changes_received`, `rf_rebuilds_refused`,
-  `rf_answers_cap`.
+  `rf_answers_cap`, `rf_transport_refused`.
+
+**A restart storm.** When the canonical restarts, every peer sees a new `ep`
+and rebuilds once, within its bucket. At most 2 rebuilds run at a time
+node-wide. Peers waiting for a slot get head-only rounds, not full listings, so
+a restart costs a few rounds of head rows, not ~20 rounds of full listings.
 
 The reply lane's byte budget (`reply_lane.rs`) does not need to change. The
-cost a peer can impose is now bounded by the token bucket, not by how many
-frames it sends.
+cost a peer can impose is bounded by the token bucket and the slot fairness,
+not by how many frames it sends.
 
 ## 7. What the Constitution says, and what to ask it
 
@@ -1303,17 +1454,26 @@ included), never derived from anything stable, 32 bytes, and carried only
 inside the sealed link. CC agreed to caching for the link's life.
 
 The independent review (finding 13) showed that a per-link salt cannot be
-written where `rf` is built: the replication layer has no link identity. This
-revision therefore makes the salt **per peer session** (§6.4) and keeps every
-other property:
-- 32 bytes from the OS CSPRNG;
-- fresh at process start, on the peer's reconnect, and at least hourly;
-- never derived from anything stable;
-- sent only where `Transport::confidential_to(peer)` holds: every Reticulum
-  frame is E1-sealed; on HTTP, only `https` targets.
+written where `rf` is built: the replication layer has no link identity. The
+salt is therefore **per peer and per direction** (§6.4). **CC confirmed** that
+this meets its requirement, stating two things outright, and both are in R5
+and R16:
+- the salt is distinct for each peer and each direction, never one value
+  reused across peers;
+- a receiver's refusal of an early salt change degrades the round to a
+  listing, never a stall. Under re-review N4 that is the head-only round.
 
-**The team lead is confirming this change with CC.** It is R4-R6, and it stays
-`"a":1`; ristretto255 remains `"a":2`.
+The other properties are kept:
+- 32 bytes from the OS CSPRNG;
+- never derived from anything stable;
+- sent only where `Transport::confidential_to(peer)` holds.
+
+After re-review N4 the salt is drawn at process start and at least hourly, no
+longer on reconnect. **The team lead is confirming that drop with CC.**
+
+CC also has no objection to the listed mirror, to deny-on-unread, or to
+match-not-holding on the removal planes. This is R4-R6, and it stays `"a":1`;
+ristretto255 remains `"a":2`.
 
 ## 8. Telemetry
 
@@ -1333,6 +1493,10 @@ All closed label sets; no peer id, key id or address is ever a label.
 | `rf_answers_stale` | counter | plane, reason = `sid_unknown` / `fp_changed` / `out_of_order` | answers dropped by §2.6's binding |
 | `rf_salt_changes_received`, `rf_rebuilds_refused`, `rf_answers_cap` | counter | plane | §6.4's limits |
 | `rf_parse_failed` | counter | message | `rf` members this build could not read (§2.5) |
+| `rf_transport_refused` | counter | transport | salted Summaries refused because they arrived over a non-confidential transport (§6.4, N7) |
+| `rf_head_only_rounds` | counter | plane, cause = `u_unbooted` / `u_salt` / `u_cap` / `u_busy` / `u_transport` / `no_sums` | rounds degraded to head-only (§6.4) |
+| `rf_late_summary_answered` | counter | plane | late `Summary_R` nodes answered under their old `sid` (§5.5, N1) |
+| `rf_parked_ranges` | gauge | plane | ranges named in `pk` across all peers (§2.6, N2) |
 | `rf_leaf_parked` | counter | plane | leaves parked after `RF_LEAF_RETRIES` (§2.6) |
 | `replication_io` `summary_refs_built`, `summary_bytes_built` | counter | plane | Summaries as built, booked before `transport.send` (§11.2, finding 15) |
 | `rf_tree_rebuilds`, `rf_tree_build_ms` | counter | plane | sender rebuilds and their cost |
@@ -1446,19 +1610,28 @@ transport, as `key_plane_v59_tests::NodeA`):
     carrying its peer, and the Summary builder refuses one for another peer.
     A unit test pins that refusal, and a compile-fail test pins that no
     accessor returns a bare sum.
-16. **Fresh salts (R5).**
-    - Two peer sessions of the same pair draw different salts: the peer
-      disconnects and reconnects, the hourly rotation fires, and the process
-      restarts. Two different peers never share a salt.
+16. **Fresh salts, per peer and direction (R5).**
+    - A's salts toward B and toward C differ. A's salt toward B differs from
+      B's toward A.
+    - A's salt toward B changes on the hourly rotation and on a restart of A,
+      and **not** on B's reconnect (N4). A sender's redraws are bounded by its
+      timer: a peer reconnecting every 2 minutes causes none.
     - The salt is 32 bytes.
     - It is not equal to any value derivable from the pair's keys, key ids,
       link id, link hash or round ids. The test computes the obvious
       derivations (hashes and HKDFs of each) and asserts none matches.
     - A source scan asserts the salt is produced only by a call to the OS
       CSPRNG.
-17. **Never outside a confidential transport (R6).** `confidential_to` is
-    true for every Reticulum peer and false for an `http://` peer. Toward an
-    `http://` peer no Summary carries `rf`. The Reticulum send path seals every
+17. **Never outside a confidential transport (R6, N7).** `confidential_to`
+    is:
+    - true for Reticulum and `HttpsTransport`;
+    - false for `HttpTransport`;
+    - false for packet radio without the `federation_session` seal;
+    - false for the trait default.
+
+    No Summary built for a false peer carries `rf`. A salted RF Summary that
+    arrives over a non-confidential transport is answered `"u":"transport"`,
+    and its salt is never used. The Reticulum send path seals every
     frame, which the E1 suite already witnesses. The salt appears in no log line, metric
     label, persisted row or FFI return (a source scan, as `log_citations`
     does).
@@ -1479,8 +1652,10 @@ broke, never identical sets on both sides):
     - The same on the Attestation plane, where B holds rows of groups A is not
       in. B's answers are unchanged by them: receiver-side R1 and R7.
 20. **Legacy fallbacks (R8).** `"u"` makes the next round toward that peer a
-    legacy Summary. No `PeerSums` yet (a fresh salt, a build pending) gives a
-    legacy Summary at once, without waiting. An unread volatile verdict leaves
+    head-only legacy Summary, never a full listing, and the round after
+    retries RF. Twenty in a row mark the pair legacy. No `PeerSums` yet (the
+    first build pending) gives a head-only Summary at once, without waiting. A
+    rotation keeps sending under the old salt until the new sums are ready. An unread volatile verdict leaves
     its row out of S_A(P), and the root is still sent.
 21. **Stale answers (finding 7).** Interleave initiator and responder Summaries.
     Deliver an old `match p` after a newer `split p`, and a `match` for a node
@@ -1490,9 +1665,13 @@ broke, never identical sets on both sides):
     in one leaf, then add a row elsewhere. The new row is listed and delivered
     within depth + 2 rounds. The stuck leaf parks after `RF_LEAF_RETRIES`.
 23. **The #380 gate (finding 2).** A proactive-publish initiator toward an RF
-    responder never returns `SendAndComplete` before a two-way root match. Its
-    descent completes even when every `Summary_R` arrives after the round
-    ended.
+    responder never returns `SendAndComplete` before a two-way root match with
+    an empty want. **Both** descents complete when every `Summary_R` arrives
+    after the round ended:
+    - the phone's offer toward the canonical, from the late `Diff_R`;
+    - the canonical's offer toward the phone, from the late `Summary_R`'s
+      salvaged nodes, answered in the next `Diff_I` under their old `sid`
+      (N1, R18).
 24. **Staleness and first sync (finding 9).** While descending, no round
     reports `InSync`, and `first_sync` is not done. Both turn at the first
     two-way root match.
@@ -1505,11 +1684,46 @@ broke, never identical sets on both sides):
     starts only after a quiet cycle.
 27. **Salt churn (finding 12).** A peer that sends a new salt in every Summary
     gets `"u":"salt"` after the first. It costs the receiver at most 3 rebuilds
-    plus one per 20 min, and never more than 2 at once node-wide. Summaries
-    over the node cap get `"u":"cap"`.
+    plus one per 20 min, and never more than 2 at once node-wide. With many
+    sybil peers, each holds at most one slot, and an honest peer still gets one
+    (round-robin). Summaries over the node cap get `"u":"cap"`. An honest
+    16-split Summary, 256 child fingerprints, is never `"u":"cap"` (N5).
 28. **The measurement (finding 15).** A Summary built and then refused by
     `transport.send` is booked in `summary_bytes_built` and not in
     `summary_bytes_out`.
+
+**From the re-review of ad71fc0:**
+
+29. **A refused revocation (N2).** A `key:revocation:v1` row that B refuses
+    transiently, then admits within what would have been the park window, is
+    admitted, and the Revocation root matches in the round after. A terminally
+    refused revocation keeps its leaf listed, at most 16 refs a round, and is
+    never parked. On a non-removal plane, a parked leaf named in `pk` lets the
+    root match, and InSync reports it as `BoundedBy`.
+30. **A missed sender restart (CC, R16).** The sender restarts, with a new salt
+    and a new `ep`, and the receiver misses the reconnect. The receiver accepts
+    the new `ep` within its bucket. With the bucket exhausted, the next round
+    is head-only, never a full listing, and later rounds resume RF. A phone
+    that reconnects every 2 minutes for an hour never receives a full listing
+    (N4).
+31. **`sid` across a restart (N9).** An answer for `sid` k under the old salt
+    arrives after the sender restarted and has a snapshot numbered k under the
+    new salt. The answer is dropped as stale, because its `st` differs, and
+    books nothing.
+32. **Listed ranges (N3).**
+    - A Deliver lost after an `lc` listing: the range does not match in that
+      Summary, and the next Summary re-lists the remainder.
+    - First contact with a Deliver budget below a page converges, at the
+      budget's rate.
+    - A revocation offered in a listed range is not `acked_by_match` until a
+      later Summary matches it.
+33. **Mirror flooding (N6).** A hostile peer listing 10^6 made-up ids grows
+    its mirror on the receiver by zero. The node-wide mirror cap stays
+    available to honest pairs.
+34. **Phone-restart seed (plausible).** A phone restarts holding the canonical's
+    whole Key plane. With the seed, the next sync of `Key`, `Revocation` and
+    `IdentityOccurrenceRevocation` costs a descent over the differing ranges,
+    not a full listing.
 
 **Gates** (per the repo's rules): run every integration suite the change can
 reach, the source-scan suites (`log_citations` and its siblings), the wide
@@ -1522,7 +1736,7 @@ only on this host.
 ### 10.1 The sequence
 
 Each step ships alone. A comes before B and C. D needs A's receiver plumbing
-and B's index, `PeerSums` and frontier. E needs D's canary. R1-R16 (§13) are in
+and B's index, `PeerSums` and frontier. E needs D's canary. R1-R21 (§13) are in
 force from the first step that sends or answers a fingerprint: A for answers,
 B for sends.
 
@@ -1544,10 +1758,10 @@ Against the 42 h of §1.4, with every peer on step A and the canonical on B:
 
 ```text
 Summary tx on the five bootstrap planes, today          ~ 25-31 GB (§1.4)
-RF in sync: per pair 3 planes x 2 roles x 120/h x 42 h  = 30,240 Summaries
-            x 185 B (salt and sid included)             ~ 5.6 MB per pair
-            x 17 concurrent links                       ~ 95 MB
-            ceiling: x 135 identities, always on        ~ 0.75 GB
+RF in sync: per pair 5 planes x 2 roles x 120/h x 42 h  = 50,400 rounds
+            x (210 B Summary + 100 B Diff)              ~ 15.6 MB per pair
+            x 17 concurrent links                       ~ 265 MB
+            ceiling: x 135 identities, always on        ~ 2.1 GB
 plus each difference once (§2.7: 2.4 KB compact for an isolated one),
 plus one paged listing per receiver restart (~6.3 MB per phone, §2.7)
 
@@ -1588,12 +1802,15 @@ tx after steps B and C, every peer capable              ~ 13-20 GB  (about -70% 
 | 3 | Unknown peers | Speculative RF: an unknown peer gets an RF Summary, and one that answers without `rf` is marked legacy at once (§6.1). This covers the `rf` nodes only, never the compact encoding (§12.3) | Eric |
 | 4 | `legacy_resweep_every` | 1 h default; `0` = unpaced (§6.3) | Eric |
 | 5 | Descent | One step per round; the #634 round shape is kept (§2.6) | team lead |
-| 6 | The receiver's set | Restricted to what it may serve the sender (§2.4, §3.2, §4.4.6) | team lead |
+| 6 | The receiver's set | `settled_B ∩ M_B(A)`, the listed mirror: only ids the sender listed, and only those the receiver settles (§2.4, §3.2, §4.4.6). This replaces the first draft's "what it may serve the sender" after review finding 1 | team lead, revised on review |
 | 7 | Want carry-over | Only on canary evidence that `diff_want_in` ≫ `deliver_rows_out` persists (§5.4, step C) | team lead |
 | 8 | The Attestation plane | On the LTS: built in step D, switched on in step E (§4.4, §10.1) | Eric |
 | 9 | CC questions 1-4 | Ruled 2026-11-22; no CC text change (§7) | CC |
 | 10 | Collision hardening | The salted sum Σ H(salt‖id), 32 random bytes, fresh, never derived. CC asked for it per link session; after review finding 13 it is per peer session, sent only over confidential transports, with `PeerSums` cached for the session (§6.4). Stays `"a":1` (§2.2, §2.8, R4-R6) | CC, taken by the team lead; the per-peer scope is being confirmed with CC |
 | 12 | Review of 6f49541 | All 15 confirmed findings fixed in this revision; each plausible item addressed in §11.3 | reviewer, team lead |
+| 13 | Salt scope (CC, 2026-11-22) | Per peer **and** per direction, never one value reused across peers; a refused early salt change degrades the round to a (head-only) listing, never a stall (§6.4, R5, R16) | CC |
+| 14 | Redraw on reconnect | Dropped: the salt is drawn at process start and at least hourly. Restarted senders are recognised by a random `ep` (§6.4, re-review N4) | team lead; being confirmed with CC |
+| 15 | Re-review of ad71fc0 | N1-N10 fixed, the two plausible items and the extras adopted (§11.3), and CC's two salt items folded in | reviewer, team lead |
 | 11 | Where the construction lives | `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2, with known-answer vectors; CC cites it (R9) | CC |
 
 ### 11.2 For the implementation to measure: does a full key listing ever arrive?
@@ -1637,8 +1854,17 @@ The answer goes into this section before B's canary, so the canary can tell
 | The "half" rule is a count oracle | **Stated:** one bit per range about T_B, which contains only ids A listed. Harmless now that finding 6 is fixed (§2.3) |
 | The TD publish-set bit goes stale | **Adopted:** only row-intrinsic bits are stored at feed time; publish-set membership is evaluated at each index rebuild (§3.1) |
 | The 1.3 GB residual is too small for framing | **Adopted:** §1.4 now gives ranges and names "counted but never sent" as an open explanation, for #1025 to settle |
-| Memory, typical and worst | **Stated:** ≈ 10 MiB typical, ≈ 40 MiB worst (§3.4) |
+| Memory, typical and worst | **Stated:** ≈ 10 MiB typical, ≈ 65 MiB worst, with snapshots counted (re-review N8, §3.4) |
 | More known-answer vectors | **Adopted:** V2 wraps mod 2^256; V7 and V9 use 3- and 8-character prefixes; V8 is a non-root range with count 0 (FSD §3.4.2) |
+
+**The re-review of ad71fc0: plausible items and extras.**
+
+| Item | Disposition |
+|---|---|
+| Phone restarts cost a full canonical listing | **Adopted:** public-plane seed of the mirror after a restart, when A's root count is at least half B's settled count (§3.2) |
+| `lc` reordering | **Adopted:** an `lc` applies only if its `sid` is newer than the last one applied to that range (§3.2) |
+| Sybils holding the 2 rebuild slots | **Adopted:** at most one slot per peer, round-robin (§6.4) |
+| In-sync bytes over 3 planes and Summaries only | **Fixed:** 5 planes and Diffs, ≈ 265 MB per 42 h at 17 links (§10.2) |
 
 **After the LTS.** Persisting the receiver's mirror `M_B(A)` would remove the
 one full listing a receiver restart costs (§2.7). It stays in memory for 45.1.x,
@@ -1774,20 +2000,26 @@ Each is a MUST. Each has a witness in §9.
   ‖ x)`, summed mod 2^256, with the count, closed by the node hash of
   `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2. An unsalted sum is never sent.
   Witness 18.
-- **R5. The salt is 32 bytes, random, fresh per peer session, never derived.**
-  - It is drawn from the OS CSPRNG at process start, on the peer's reconnect,
-    and at least hourly (§6.4).
+- **R5. The salt is 32 random bytes, distinct per peer and per direction,
+  never derived.**
+  - Each sender draws it from the OS CSPRNG separately for each peer, on each
+    of: process start, and at least hourly (§6.4).
+  - It is never one process-wide value reused across peers, so C cannot learn
+    A's salt toward B.
   - It is never derived from a key, key id, node id, link id, link hash, round
     id, counter or clock.
-  - It is never reused across peers: each peer gets its own draw.
-  - The team lead is confirming with CC that per peer session, rather than per
-    link session, meets CC's rule, since the replication layer has no link
-    identity (§6.4).
+  - It is built in the background before use.
+  - CC confirmed the per-peer scope. The drop of redraw-on-reconnect (N4) is
+    being confirmed.
   - Witness 16.
 - **R6. The salt is sent only where the transport is confidential.**
-  - An RF Summary is built only when `Transport::confidential_to(peer)` holds:
-    always on Reticulum, where every frame is E1-sealed, and only on `https`
-    targets over HTTP (§6.4).
+  - An RF Summary is built only when `Transport::confidential_to(peer)` holds.
+    The default is false. It is true on Reticulum, where every frame is
+    E1-sealed, and on `HttpsTransport`. It is false on `HttpTransport` and on
+    packet radio without the `federation_session` seal (§6.4).
+  - An inbound salted Summary over a non-confidential transport is answered
+    `"u":"transport"`, and its salt is never used.
+  - Residual: an `https` front end that terminates TLS sees the salt (§6.4).
   - The salt is never logged, put in a metric, persisted, or returned across
     the FFI.
   - Witness 17.
@@ -1820,4 +2052,20 @@ Each is a MUST. Each has a witness in §9.
 - **R14. Never list a range larger than a page; list unasked only at two rows
   or fewer** (§2.3). Witness 25.
 - **R15. Legacy pacing starts only once a pair is quiet** (§6.3). Witness 26.
-- **R16. The salt-change and rebuild limits of §6.4.** Witness 27.
+- **R16. The salt-change and rebuild limits of §6.4.**
+  - A new `ep` is accepted. On the same `ep`, a change is accepted only after
+    10 min.
+  - There is a per-peer bucket of 3 rebuilds plus 1 per 20 min, and 2
+    concurrent rebuilds node-wide, at most one per peer.
+  - Any `u` makes the next round a head-only legacy round, never a full listing
+    and never a stall. The round after retries RF.
+  - Witnesses 27 and 30.
+- **R17. Answers carry `(sid, st)`, and `sid` starts at a random u32 per
+  process** (N9). Witness 31.
+- **R18. A late `Summary_R` is answered under its old `sid`** (N1). Witness 23.
+- **R19. Parking is by name (`pk`) and never on a removal plane** (N2).
+  Witness 29.
+- **R20. Fingerprints exclude head rows only.** A listed range leaves the
+  frontier only on a later Summary's match. InSync and #380 also need an empty
+  want (N3). Witness 32.
+- **R21. The mirror holds only ids B settles** (N6). Witness 33.
