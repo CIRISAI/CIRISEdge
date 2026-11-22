@@ -69,7 +69,7 @@ text, **[inf]** is inferred from numbers, **[new]** is proposed here.
   included, so long as each fingerprint covers only rows that peer may
   receive. No CC text changes. The construction and its known-answer vectors
   are in `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2, which CC cites.
-- **Named requirements** R1-R21 (§13) carry CC's conditions, the hardening
+- **Named requirements** R1-R24 (§13) carry CC's conditions, the hardening
   and the independent review's fixes:
   - the audience filter goes before the sum and the count;
   - fingerprints are per peer, by type;
@@ -416,9 +416,24 @@ unable this round:  "rf":{"v":1,"sid":…,"st":…,"u":"unbooted"|"salt"|"cap"|"
   it to tell a restarted sender from salt churn (§6.4, N4).
 - **`u` never means a full listing** (N4). The next round toward that peer is
   a head-only Summary, the rows new since the head position, which is the
-  legacy head listing. The round after retries RF. Only `RF_U_LEGACY_AFTER` =
-  20 consecutive `u` answers mark the peer legacy, and a legacy pair is paced
-  by the quiet rule (§6.3).
+  legacy head listing. The round after retries RF, except as below.
+- **When `u` makes a pair legacy, and how it comes back** (final review B1):
+  - `u:"transport"` and `u:"cap"` mark the pair legacy **at once**. Both are
+    permanent conditions. A receiver behind a TLS front end that reaches the
+    node over plain HTTP (`http.rs:19-32`) sees an `HttpTransport` inbound id
+    on every frame.
+  - `u:"unbooted"`, `u:"busy"` and `u:"salt"` are transient. They mark the
+    pair legacy only after `RF_U_LEGACY_AFTER` = 20 in a row.
+  - A pair made legacy by `u` is ordinary legacy, with full re-listing paced
+    by §6.3's quiet rule. It **retries RF** on a new `ep` from the receiver, or
+    once `legacy_resweep_every` has passed since it was marked. A failed retry
+    re-marks it at once, so a broken pair costs one RF Summary per interval,
+    never a cycle of head-only rounds.
+  - **Operator flag `CIRIS_EDGE_HTTP_LISTENER_CONFIDENTIAL`** (a field on the
+    HTTP server config, default false) declares a plain listener confidential
+    because it sits behind a TLS front end the operator runs. With it set, the
+    inbound check (§6.4) accepts salted Summaries on that listener, under the
+    TLS front-end residual already stated there.
 - A marker with no nodes (`"rf":{"v":1}`) on a legacy Summary or Diff says "I
   answer RF". `"e":1` in it says "I decode the compact encoding" (§12.3).
 
@@ -463,19 +478,19 @@ unable this round:  "rf":{"v":1,"sid":…,"st":…,"u":"unbooted"|"salt"|"cap"|"
 - **A leaf that keeps failing is parked, by name, and never on a removal
   plane** (re-review N2).
   - **When.** A leaf listed `RF_LEAF_RETRIES` = 4 times that still does not
-    match is parked, if every id it leaves unmatched is one of two kinds:
-    - one B named in the Diff's `withheld` (a refusal in backoff, #1014);
-    - one A could not serve (#429).
-    The backoff is exponential, to 1 h.
+    match is parked, if every id it leaves unmatched is one A could not serve
+    (#429), or a want that A served and B never admitted. A refusal in backoff
+    cannot keep a leaf open: it is in `settled_B`, so it matches. The backoff
+    is exponential, to 1 h.
   - **Named on the wire.** The Summary lists parked prefixes in `pk`. Both
     sides leave a parked range out of every ancestor's sum and count, so the
     rest of the plane can still match at the root. InSync and #380 then read
     "matched except `pk`", and the staleness signal reports the parked rows as
     `BoundedBy` (§5.11).
-  - **Un-parked** when:
-    - the backoff ends;
-    - A's set in the range changes;
-    - a later Diff no longer names those ids in `withheld`.
+  - **Un-parked** when the backoff ends, or when A's set in the range changes.
+  - **Capped:** at most `RF_MAX_PARKED` = 64 prefixes in `pk` per Summary.
+    `pk` entries also count against the receiver's node cap (§6.4). A sender
+    past the cap lists the oldest parked ranges again instead of naming more.
   - **Never on `Revocation` or `IdentityOccurrenceRevocation`.** Their leaves
     hold at most 16 rows, and a revocation B refuses must keep being offered
     until B admits it. Such a leaf is simply re-listed each round. That costs
@@ -632,9 +647,12 @@ memory.
   so no range re-opens because of an eviction.
 - **Seeded after a restart on the public planes** (plausible item). On `Key`,
   `Revocation` and `IdentityOccurrenceRevocation`, a receiver with an empty
-  mirror may seed `M_B(A)` from its own settled rows on that plane. It does so
-  when A's root count is at least half its settled count. Those rows are
-  public and served to every peer, so the seed discloses nothing. A seeded id
+  mirror may seed `M_B(A)` from its own **holdings** on that plane. That is
+  never the wider settled set: known hashes on a `HashFirst` server would
+  reopen the oracle of finding 6. It does so when A's root count is at least
+  half B's holdings count. Those planes are listed with no per-peer filter
+  (`bridge.rs:5296`), so the rows are public, and holding them discloses
+  nothing. A seeded id
   A does not offer makes a range differ until A's next `lc` of it prunes it.
   This turns most of a phone's restart cost from a full listing into a
   descent over the few ranges that differ.
@@ -739,8 +757,9 @@ until they exist its rounds are head-only (R8).
   old behaviour"), when a salt, cap, busy or transport rule refuses (§6.4), or
   when its mirror is at the cap. Every `u` makes the sender's next round a
   **head-only** legacy Summary, never a full listing (N4). The round after
-  retries RF. Twenty consecutive `u` mark the pair legacy, paced by §6.3's
-  quiet rule.
+  retries RF. `u:"transport"` and `u:"cap"` mark the pair legacy at once. The
+  transient reasons do so after 20 in a row, and a legacy-by-`u` pair retries
+  RF on a new `ep` or after `legacy_resweep_every` (§2.5, B1).
 - The sender sends a head-only Summary when its listing failed or the peer's
   first sums are not yet built.
 
@@ -1342,13 +1361,25 @@ requirement, with two things stated outright (2026-11-22):
     attributed to a peer key before it reaches a coordinator.
   - **A link that authenticates as a different key is a different peer**, with
     its own salt.
-  - **A key rotation or revocation draws a NEW salt.** When the peer's key
-    record is rotated (a superseding `key:record:v1` for that key, seen on the
-    key-plane feed that already drops that subject's memo answers) or revoked
-    (the admitted-revocation observer, `RevocationObserver`,
-    `bridge.rs:3424`), the salt toward that peer is redrawn and the old one
-    discarded, with its `PeerSums`. The old key's holder can therefore never
-    learn the salt used toward the key's successor.
+  - **A key rotation or revocation draws a NEW salt** (final review B2).
+    - **Rotation** means a change of the peer's **key material**. The
+      `key:record:v1` row that supersedes the previous one carries a different
+      public key, seen on the key-plane feed that already drops that subject's
+      memo answers. A superseding row with the **same** key, as a PQC
+      completion or a re-seal produces, is not a rotation and must not redraw.
+    - **Revocation** is keyed on the revocation's **subject**,
+      `revoked_key_sha256_ed25519_raw`, resolved to a peer key. It is never
+      keyed on `revoked_key_id`, which persist lets a revoker withhold.
+      `on_revocation_admitted` calls today's observer only when
+      `revoked_key_id` is `Some` (`bridge.rs:7723-7726`).
+    - **Its own hook.** The RF redraw is a dedicated call inside
+      `on_revocation_admitted`, made for every admitted revocation, not a
+      second `RevocationObserver`. The observer is a single `Option` slot
+      (`bridge.rs:2967`, `bridge.rs:3945`), and `directory_cache.rs:196-205`
+      already holds it.
+    - **On redraw** the salt toward that peer is drawn again and the old one
+      is discarded, with its `PeerSums`. The old key's holder can therefore
+      never learn the salt used toward the key's successor.
 - **Never derived** from a key, key id, link id, link hash, round id, counter
   or clock.
 - **Built before it is used.** A new salt's `PeerSums` are built in the
@@ -1524,6 +1555,8 @@ All closed label sets; no peer id, key id or address is ever a label.
 | `rf_head_only_rounds` | counter | plane, cause = `u_unbooted` / `u_salt` / `u_cap` / `u_busy` / `u_transport` / `no_sums` | rounds degraded to head-only (§6.4) |
 | `rf_late_summary_answered` | counter | plane | late `Summary_R` nodes answered under their old `sid` (§5.5, N1) |
 | `rf_parked_ranges` | gauge | plane | ranges named in `pk` across all peers (§2.6, N2) |
+| `rf_ep_flaps` | counter | none | a peer key whose `ep` alternated between two values within an hour: two live processes under one key (§6.4) |
+| `rf_legacy_by_u` | counter | reason | pairs marked legacy by `u`, and their scheduled RF retries (§2.5, B1) |
 | `rf_leaf_parked` | counter | plane | leaves parked after `RF_LEAF_RETRIES` (§2.6) |
 | `replication_io` `summary_refs_built`, `summary_bytes_built` | counter | plane | Summaries as built, booked before `transport.send` (§11.2, finding 15) |
 | `rf_tree_rebuilds`, `rf_tree_build_ms` | counter | plane | sender rebuilds and their cost |
@@ -1640,6 +1673,10 @@ transport, as `key_plane_v59_tests::NodeA`):
 16. **Fresh salts, per peer and direction (R5).**
     - A's salts toward B and toward C differ. A's salt toward B differs from
       B's toward A.
+    - **B2.** A revocation whose `revoked_key_id` is withheld, carrying only
+      `revoked_key_sha256_ed25519_raw`, still redraws the salt toward that
+      peer. A re-seal or PQC completion of the peer's `key:record:v1` (same
+      key material) does **not** redraw. A rotation to new key material does.
     - **Authenticated binding (CC).** A reconnect from B that authenticates as
       B's key reuses the salt. A link that authenticates as a different key K
       is a different peer and gets its own salt, never B's. When B's key record
@@ -1688,7 +1725,10 @@ broke, never identical sets on both sides):
       in. B's answers are unchanged by them: receiver-side R1 and R7.
 20. **Legacy fallbacks (R8).** `"u"` makes the next round toward that peer a
     head-only legacy Summary, never a full listing, and the round after
-    retries RF. Twenty in a row mark the pair legacy. No `PeerSums` yet (the
+    retries RF. `u:"transport"` and `u:"cap"` mark the pair legacy at once.
+    Twenty transient `u` in a row do too. A legacy-by-`u` pair retries RF on a
+    new `ep` or after `legacy_resweep_every`, and the B1 witnesses below cover
+    it. No `PeerSums` yet (the
     first build pending) gives a head-only Summary at once, without waiting. A
     rotation keeps sending under the old salt until the new sums are ready. An unread volatile verdict leaves
     its row out of S_A(P), and the root is still sent.
@@ -1726,6 +1766,18 @@ broke, never identical sets on both sides):
 28. **The measurement (finding 15).** A Summary built and then refused by
     `transport.send` is booked in `summary_bytes_built` and not in
     `summary_bytes_out`.
+
+**From the final review of f2a5ead (B1):**
+
+35. **A receiver behind an HTTP front end.** A receiver whose node is reached
+    over plain HTTP behind a TLS front end answers `u:"transport"`. The pair
+    is legacy at once and converges by the paced legacy path with no
+    head-only phase. With `CIRIS_EDGE_HTTP_LISTENER_CONFIDENTIAL` set, the same
+    pair runs RF.
+36. **Retry on schedule.** A receiver `unbooted` for 25 rounds turns the pair
+    legacy at round 20. It is retried with RF once `legacy_resweep_every` has
+    passed, or at once when the receiver's `ep` changes, and converges by RF
+    when the receiver is ready.
 
 **From the re-review of ad71fc0:**
 
@@ -1771,7 +1823,7 @@ only on this host.
 ### 10.1 The sequence
 
 Each step ships alone. A comes before B and C. D needs A's receiver plumbing
-and B's index, `PeerSums` and frontier. E needs D's canary. R1-R21 (§13) are in
+and B's index, `PeerSums` and frontier. E needs D's canary. R1-R24 (§13) are in
 force from the first step that sends or answers a fingerprint: A for answers,
 B for sends.
 
@@ -2108,3 +2160,14 @@ Each is a MUST. Each has a witness in §9.
   frontier only on a later Summary's match. InSync and #380 also need an empty
   want (N3). Witness 32.
 - **R21. The mirror holds only ids B settles** (N6). Witness 33.
+- **R22. `u` and legacy** (B1). `u:"transport"` and `u:"cap"` make the pair
+  legacy at once; the transient reasons do so after 20 in a row. A
+  legacy-by-`u` pair retries RF on a new `ep` or after
+  `legacy_resweep_every`. An operator may declare a plain HTTP listener
+  confidential (`CIRIS_EDGE_HTTP_LISTENER_CONFIDENTIAL`). Witnesses 35 and 36.
+- **R23. Redraw triggers** (B2). A redraw is keyed on the revocation's
+  subject (`revoked_key_sha256_ed25519_raw`) through a dedicated hook in
+  `on_revocation_admitted`. Rotation means new key material only; a re-seal or
+  PQC completion does not redraw. Witness 16.
+- **R24. The restart seed uses holdings only, and `pk` is capped at 64**
+  (final-review nits). Witnesses 34 and 29.

@@ -444,7 +444,8 @@ fp       = SHA-256( "CIRIS-RF-v1/node" || u8(len plane) || plane
                     || LE256(sum) || u64_be(count) )[0..16]
 ```
 
-The two tags are exactly 16 ASCII bytes. `"a":2` is reserved for a
+The tags are ASCII, with no terminator: `"CIRIS-RF-v1/elem"` and
+`"CIRIS-RF-v1/node"` are 16 bytes each, and `"CIRIS-RF-v1/tag"` is 15 bytes. `"a":2` is reserved for a
 ristretto255 multiset hash and is not defined here.
 
 **Known-answer vectors.** With:
