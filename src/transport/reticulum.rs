@@ -3918,8 +3918,9 @@ impl ReticulumTransport {
         tracing::info!(
             proposes = config.direct_links.proposes(),
             proposing = ?config.direct_links.proposing,
-            facilitator = ?config.direct_links.facilitator,
-            serves_facilitator = ?config.direct_links.serve_facilitator,
+            // Whether, never where: no address in a log line.
+            facilitator_named = config.direct_links.facilitator.is_some(),
+            serves_facilitator = config.direct_links.serve_facilitator.is_some(),
             accept = ?config.direct_links.accept,
             "reticulum direct links (CIRISEdge#805 item 8, leviculum#70)"
         );
