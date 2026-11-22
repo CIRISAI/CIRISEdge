@@ -2928,6 +2928,39 @@ async fn a_panicking_keying_costs_one_link_and_no_worker_947() {
     );
 }
 
+/// **Witness (#947, v45.1)** — the window the once-seen
+/// `a_panicking_keying_costs_one_link_and_no_worker_947` failure fell in: the
+/// pool hands B's send a link whose close lands as the send starts (there, A
+/// had refused the link and its close was still on the way). The send finds
+/// the link gone, closes it, and ships once on a fresh link, and A delivers
+/// it. Before 45.1.10 the send failed on the spot, with nothing retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pooled_link_that_goes_under_a_send_is_reshipped_on_a_fresh_one_947() {
+    let t = trio("gonepool", true, false, false).await;
+    one_way(&t.b, &t.a, 0, b"947-POOL-WARMUP-")
+        .await
+        .expect("B's link is up and pooled");
+    let pooled = t.b.transport.pooled_link_ids_for_test().await;
+    assert_eq!(pooled.len(), 1, "B pooled its one link to A");
+    t.b.transport.close_next_shipped_links_for_test(1);
+    one_way(&t.b, &t.a, 1, b"947-POOL-GONE-")
+        .await
+        .expect("B's send on the link that went lands at A");
+    assert_eq!(
+        t.b.seal(ciris_edge::observability::LINK_SEAL_POOLED_LINK_GONE_RETRIED),
+        1,
+        "B reshipped once, on a fresh link: {:?}",
+        t.b.metrics.link_seal()
+    );
+    assert!(
+        !t.b.transport
+            .pooled_link_ids_for_test()
+            .await
+            .contains(&pooled[0]),
+        "the link that went left B's pool"
+    );
+}
+
 /// **Witness (#947, v44 LTS)** — a suspend that lands while a link is keying
 /// leaves nothing behind: the suspend gets to quiescent with the decapsulation
 /// still on the blocking pool, its outcome lands on no link, and after resume

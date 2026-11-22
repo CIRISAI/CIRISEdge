@@ -397,6 +397,10 @@ enum ShipError {
     Busy,
     /// Any other send failure — not retryable on the same link.
     Other(TransportError),
+    /// CIRISEdge#947 — the link went, or its peer refused the transfer, under
+    /// the send: nothing reached the peer on it, and nothing will. Not
+    /// retryable on this link; a fresh one may carry it.
+    Gone(TransportError),
 }
 
 impl ShipError {
@@ -408,7 +412,7 @@ impl ShipError {
             ShipError::Busy => {
                 TransportError::Io("reticulum send_resource: transfer in progress".to_string())
             }
-            ShipError::Other(e) => e,
+            ShipError::Other(e) | ShipError::Gone(e) => e,
         }
     }
 }
@@ -2918,6 +2922,10 @@ pub struct ReticulumTransport {
     /// drains too fast to collide). Zero in production: one relaxed atomic
     /// load per ship. Set via [`Self::force_next_sends_busy_for_test`].
     test_force_busy: Arc<std::sync::atomic::AtomicU32>,
+    /// CIRISEdge#947 test seam — see
+    /// [`Self::close_next_shipped_links_for_test`]. 0 in production: one
+    /// relaxed atomic load per ship.
+    test_close_before_ship: Arc<std::sync::atomic::AtomicU32>,
     /// CIRISEdge#853 test seam — see
     /// [`ReticulumTransport::delay_channel_sends_for_test`]. 0 in production.
     test_channel_delay_ms: std::sync::atomic::AtomicU64,
@@ -4389,6 +4397,7 @@ impl ReticulumTransport {
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
             test_force_busy: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            test_close_before_ship: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             test_channel_delay_ms: std::sync::atomic::AtomicU64::new(0),
             stall_guard: Arc::default(),
             test_unacked_links: std::sync::Mutex::new(HashMap::new()),
@@ -6194,6 +6203,16 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub fn set_first_words_delay_for_test(&self, delay: Duration) {
         self.seals.set_first_words_delay(delay);
+    }
+
+    /// CIRISEdge#947 test seam — the next `n` resource ships find their link
+    /// closed just as they start, as a pooled link does when the peer's close
+    /// lands between the pool handing it out and the send. Real close, real
+    /// send: the error the send meets is leviculum's own.
+    #[doc(hidden)]
+    pub fn close_next_shipped_links_for_test(&self, n: u32) {
+        self.test_close_before_ship
+            .store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// CIRISEdge#947 test seam — the node-wide rate of strangers' handshakes
@@ -10029,6 +10048,7 @@ impl ReticulumTransport {
             last_used: Arc::clone(&self.pool_last_used),
             link_id,
             armed: true,
+            reused: false,
         }
     }
 
@@ -10840,7 +10860,7 @@ impl ReticulumTransport {
                     }
                     tokio::time::sleep(REVERSE_PATH_BUSY_BACKOFF).await;
                 }
-                Err(ShipError::Other(e)) => {
+                Err(ShipError::Other(e) | ShipError::Gone(e)) => {
                     if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                         reverse_path_fallback_log().check(destination_key_id)
                     {
@@ -10895,6 +10915,18 @@ impl ReticulumTransport {
             .is_ok()
         {
             return Err(ShipError::Busy);
+        }
+        // CIRISEdge#947 test seam — the link closes under the send as it starts.
+        if self
+            .test_close_before_ship
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            let _ = self.node.close_link(link_id).await;
         }
         // CIRISEdge#926 test seam — a link whose peer stopped acknowledging
         // holds its one Resource slot with a transfer that never proves.
@@ -11023,6 +11055,11 @@ impl ReticulumTransport {
                 leviculum_std::error::Error::Resource(
                     leviculum_core::resource::ResourceError::TransferInProgress,
                 ) => ShipError::Busy,
+                // CIRISEdge#947 — the link is no longer leviculum's (a link it
+                // dropped reads `InvalidRequest` here): gone, not a bad send.
+                other if !self.node.link_is_established(link_id) => ShipError::Gone(
+                    TransportError::Io(format!("reticulum send_resource: {other}")),
+                ),
                 other => ShipError::Other(TransportError::Io(format!(
                     "reticulum send_resource: {other}"
                 ))),
@@ -11071,8 +11108,20 @@ impl ReticulumTransport {
                                  before the resource completed (CIRISEdge#353b caveat; burst-and-leave \
                                  is the separate initiator-push end-state)"
                             );
-                            Err(ShipError::Other(TransportError::Timeout(max_transfer)))
+                            Err(ShipError::Gone(TransportError::Timeout(max_transfer)))
                         }
+                        // CIRISEdge#947 — the peer cancelled it (a link it
+                        // refused takes no Resource), or the link left Active.
+                        Err(
+                            e @ CompletionError::Resource {
+                                error:
+                                    leviculum_core::resource::ResourceError::RejectedByRemote
+                                    | leviculum_core::resource::ResourceError::LinkNotActive
+                                    | leviculum_core::resource::ResourceError::LinkClosed,
+                            },
+                        ) => Err(ShipError::Gone(TransportError::Io(format!(
+                            "reticulum resource send: {e}"
+                        )))),
                         Err(e) => Err(ShipError::Other(TransportError::Io(format!(
                             "reticulum resource send: {e}"
                         )))),
@@ -12287,12 +12336,9 @@ impl ReticulumTransport {
         if replication {
             self.note_reach(crate::observability::REPLICATION_REACH_DIALLED);
         }
+        let mut lane_bulk = bulk && self.shapers.offers_to(Some(destination_key_id));
         let lane = self
-            .identity_lane(
-                destination_key_id,
-                &candidates,
-                bulk && self.shapers.offers_to(Some(destination_key_id)),
-            )
+            .identity_lane(destination_key_id, &candidates, lane_bulk)
             .await;
         let mut claim = match lane {
             Ok(c) => c,
@@ -12307,6 +12353,7 @@ impl ReticulumTransport {
             .needs_bulk_plane(claim.link_id().into_bytes(), envelope_bytes)
         {
             claim.release().await;
+            lane_bulk = true;
             claim = match self
                 .identity_lane(destination_key_id, &candidates, true)
                 .await
@@ -12347,6 +12394,7 @@ impl ReticulumTransport {
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
         // hard cap (v13.6.1 progress-aware wait).
+        let reused = claim.reused;
         let shipped = self
             .ship_resource_on_link(
                 &link_id,
@@ -12356,7 +12404,54 @@ impl ReticulumTransport {
             )
             .await;
         claim.release().await;
-        shipped.map_err(ShipError::into_transport)?;
+        let link_id = match shipped {
+            // CIRISEdge#947 — a pooled link the peer refused (or closed) under
+            // this send: its close had not reached this node when the pool
+            // handed it out. Nothing landed. Close it here, so no other send
+            // takes it, and ship once on a fresh lane. Only a pooled lane: a
+            // link this send dialled itself failing is the dial's answer.
+            Err(ShipError::Gone(e)) if reused => {
+                tracing::info!(
+                    key_id = %destination_key_id,
+                    link = %hex::encode(link_id.as_bytes()),
+                    error = %e,
+                    "a pooled link went under the send; closing it and shipping once on a \
+                     fresh lane (CIRISEdge#947)"
+                );
+                if let Some(m) = self.metrics.get() {
+                    m.inc_link_seal(crate::observability::LINK_SEAL_POOLED_LINK_GONE_RETRIED);
+                }
+                self.seals.refuse(link_id.into_bytes());
+                let _ = self.node.close_link(&link_id).await;
+                let fresh = match self
+                    .identity_lane(destination_key_id, &candidates, lane_bulk)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Err(self
+                            .bulk_dial_refused(destination_key_id, envelope_bytes, e)
+                            .await)
+                    }
+                };
+                let fresh_id = fresh.link_id();
+                let shipped = self
+                    .ship_resource_on_link(
+                        &fresh_id,
+                        envelope_bytes,
+                        DIAL_NO_PROGRESS_WINDOW,
+                        RESOURCE_TRANSFER_TIMEOUT,
+                    )
+                    .await;
+                fresh.release().await;
+                shipped.map_err(ShipError::into_transport)?;
+                fresh_id
+            }
+            other => {
+                other.map_err(ShipError::into_transport)?;
+                link_id
+            }
+        };
         // CIRISEdge#915 — a room peer reached through a transport node: try
         // to bring this link direct for the room's later traffic.
         self.propose_direct_to_room_peer(destination_key_id, link_id, &candidates)
@@ -12999,6 +13094,9 @@ struct LinkClaim {
     last_used: Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
     link_id: LinkId,
     armed: bool,
+    /// CIRISEdge#947 — the lane came out of the pool (an earlier send's
+    /// link), not from this send's own dial.
+    reused: bool,
 }
 
 impl LinkClaim {
@@ -13249,6 +13347,7 @@ impl DialCtx {
             last_used: Arc::clone(&self.pool_last_used),
             link_id,
             armed: true,
+            reused: false,
         }
     }
 
@@ -14769,7 +14868,11 @@ impl DialCtx {
             in_flight.insert(id);
             stamp_pool_use(&self.pool_last_used, id);
         }
-        picked.map(|id| self.link_claim(id))
+        picked.map(|id| {
+            let mut claim = self.link_claim(id);
+            claim.reused = true;
+            claim
+        })
     }
 }
 

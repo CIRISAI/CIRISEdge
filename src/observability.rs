@@ -1467,6 +1467,10 @@ pub const LINK_SEAL_DECAPSULATED: &str = "link_seal_decapsulated";
 /// had answered its handshake, HELD sealed and opened once the link is keyed
 /// (bounded; past the bound it is `link_seal_dropped_before_keys`).
 pub const LINK_SEAL_HELD_BEFORE_KEYS: &str = "link_seal_held_before_keys";
+/// CIRISEdge#947 — a send on a pooled link found it gone or refused under it
+/// (the peer's close had not landed yet); the link was closed here and the
+/// send shipped once on a fresh lane.
+pub const LINK_SEAL_POOLED_LINK_GONE_RETRIED: &str = "link_seal_pooled_link_gone_retried";
 
 // ─── CIRISEdge#805 item 8 — `EdgeMetrics::direct_link` labels ─────────
 
@@ -2743,6 +2747,7 @@ pub const LINK_SEAL_LABELS: &[&str] = &[
     LINK_SEAL_HELD_DURING_KEYING,
     LINK_SEAL_DECAPSULATED,
     LINK_SEAL_HELD_BEFORE_KEYS,
+    LINK_SEAL_POOLED_LINK_GONE_RETRIED,
     LINK_SEAL_KEYER_PANICKED,
     LINK_SEAL_KEYING_SKIPPED_STALE,
     LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STANDING,
