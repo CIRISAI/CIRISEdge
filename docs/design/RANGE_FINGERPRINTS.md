@@ -1331,9 +1331,24 @@ requirement, with two things stated outright (2026-11-22):
 
   It is **not** redrawn on reconnect (N4). A redraw per reconnect cost a full
   salted pass each time, with no sender-side limit, and starved churny phones.
-  The team lead is confirming the drop with CC. CC's stated reason for fresh
-  salts is "never derived from anything stable", which a random hourly draw
-  satisfies.
+  **CC approved the drop (2026-11-22)** on the condition below.
+- **Bound to the peer's authenticated identity** (CC's condition). The salt is
+  keyed by the peer key the transport authenticated, and by direction; it is
+  never keyed by a link, a route or an address:
+  - **A reconnect reuses the salt only for a link that authenticates as the
+    same peer key.** Every Reticulum link is keyed to the dialled node by the
+    E1 handshake (`src/transport/link_seal.rs` module docs: a pair
+    authenticated to that node), and every inbound replication frame is
+    attributed to a peer key before it reaches a coordinator.
+  - **A link that authenticates as a different key is a different peer**, with
+    its own salt.
+  - **A key rotation or revocation draws a NEW salt.** When the peer's key
+    record is rotated (a superseding `key:record:v1` for that key, seen on the
+    key-plane feed that already drops that subject's memo answers) or revoked
+    (the admitted-revocation observer, `RevocationObserver`,
+    `bridge.rs:3424`), the salt toward that peer is redrawn and the old one
+    discarded, with its `PeerSums`. The old key's holder can therefore never
+    learn the salt used toward the key's successor.
 - **Never derived** from a key, key id, link id, link hash, round id, counter
   or clock.
 - **Built before it is used.** A new salt's `PeerSums` are built in the
@@ -1365,6 +1380,11 @@ new `Transport::confidential_to(peer) -> bool` decides:
   receiver does not use it: it answers `"u":"transport"`, and the sender's
   next Summary toward it carries no `rf`. `InboundFrame` carries the
   `TransportId` (`src/transport/mod.rs:580`), so the check is local.
+  **Like every refusal, it fails to a plain listing, never a stall.** The
+  sender's next round is the head-only legacy round (as for every `u`, below).
+  The sender then keeps sending that peer head-only rounds on that transport,
+  as for a legacy peer, until a confidential transport reaches it. CC agreed to
+  the stricter default of `false`.
 - **Residual, stated.** An `https` target behind a third-party TLS-terminating
   CDN or front end (`http.rs:19-32` allows one) sees the salt. That party can
   then forge collisions only toward that one peer, and only for that hour's
@@ -1469,7 +1489,14 @@ The other properties are kept:
 - sent only where `Transport::confidential_to(peer)` holds.
 
 After re-review N4 the salt is drawn at process start and at least hourly, no
-longer on reconnect. **The team lead is confirming that drop with CC.**
+longer on reconnect. **CC approved that drop** on two conditions, both in R5
+and witness 16/17:
+- the salt is bound to the peer's authenticated key: reused across a reconnect
+  only for the same key, and redrawn on that key's rotation or revocation;
+- the inbound refusal of an unsealed salt fails to the head-only listing,
+  never a stall.
+
+CC also agreed to the stricter `confidential_to` default of false.
 
 CC also has no objection to the listed mirror, to deny-on-unread, or to
 match-not-holding on the removal planes. This is R4-R6, and it stays `"a":1`;
@@ -1613,6 +1640,12 @@ transport, as `key_plane_v59_tests::NodeA`):
 16. **Fresh salts, per peer and direction (R5).**
     - A's salts toward B and toward C differ. A's salt toward B differs from
       B's toward A.
+    - **Authenticated binding (CC).** A reconnect from B that authenticates as
+      B's key reuses the salt. A link that authenticates as a different key K
+      is a different peer and gets its own salt, never B's. When B's key record
+      is rotated (a superseding `key:record:v1`) or revoked (an admitted
+      `key:revocation:v1`), the salt toward B is redrawn at once, and the old
+      salt's `PeerSums` are dropped.
     - A's salt toward B changes on the hourly rotation and on a restart of A,
       and **not** on B's reconnect (N4). A sender's redraws are bounded by its
       timer: a peer reconnecting every 2 minutes causes none.
@@ -1631,7 +1664,9 @@ transport, as `key_plane_v59_tests::NodeA`):
 
     No Summary built for a false peer carries `rf`. A salted RF Summary that
     arrives over a non-confidential transport is answered `"u":"transport"`,
-    and its salt is never used. The Reticulum send path seals every
+    and its salt is never used. The next round toward that sender is a
+    head-only legacy round, and later rounds stay head-only on that
+    transport. They never stall. The Reticulum send path seals every
     frame, which the E1 suite already witnesses. The salt appears in no log line, metric
     label, persisted row or FFI return (a source scan, as `log_citations`
     does).
@@ -1806,10 +1841,10 @@ tx after steps B and C, every peer capable              ~ 13-20 GB  (about -70% 
 | 7 | Want carry-over | Only on canary evidence that `diff_want_in` ≫ `deliver_rows_out` persists (§5.4, step C) | team lead |
 | 8 | The Attestation plane | On the LTS: built in step D, switched on in step E (§4.4, §10.1) | Eric |
 | 9 | CC questions 1-4 | Ruled 2026-11-22; no CC text change (§7) | CC |
-| 10 | Collision hardening | The salted sum Σ H(salt‖id), 32 random bytes, fresh, never derived. CC asked for it per link session; after review finding 13 it is per peer session, sent only over confidential transports, with `PeerSums` cached for the session (§6.4). Stays `"a":1` (§2.2, §2.8, R4-R6) | CC, taken by the team lead; the per-peer scope is being confirmed with CC |
+| 10 | Collision hardening | The salted sum Σ H(salt‖id), 32 random bytes, fresh, never derived. CC asked for it per link session; after review finding 13 it is per peer session, sent only over confidential transports, with `PeerSums` cached for the session (§6.4). Stays `"a":1` (§2.2, §2.8, R4-R6) | CC, taken by the team lead; the per-peer-and-direction scope and its binding to the authenticated key were confirmed by CC (decisions 13, 14) |
 | 12 | Review of 6f49541 | All 15 confirmed findings fixed in this revision; each plausible item addressed in §11.3 | reviewer, team lead |
 | 13 | Salt scope (CC, 2026-11-22) | Per peer **and** per direction, never one value reused across peers; a refused early salt change degrades the round to a (head-only) listing, never a stall (§6.4, R5, R16) | CC |
-| 14 | Redraw on reconnect | Dropped: the salt is drawn at process start and at least hourly. Restarted senders are recognised by a random `ep` (§6.4, re-review N4) | team lead; being confirmed with CC |
+| 14 | Redraw on reconnect | Dropped: the salt is drawn at process start and at least hourly, per peer and direction, and bound to the peer's authenticated key. It is reused across a reconnect only for a link that authenticates as the same key, and redrawn on that key's rotation or revocation. Restarted senders are recognised by a random `ep` (§6.4, R5, re-review N4) | **CONFIRMED by CC**, 2026-11-22 |
 | 15 | Re-review of ad71fc0 | N1-N10 fixed, the two plausible items and the extras adopted (§11.3), and CC's two salt items folded in | reviewer, team lead |
 | 11 | Where the construction lives | `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2, with known-answer vectors; CC cites it (R9) | CC |
 
@@ -2009,8 +2044,12 @@ Each is a MUST. Each has a witness in §9.
   - It is never derived from a key, key id, node id, link id, link hash, round
     id, counter or clock.
   - It is built in the background before use.
-  - CC confirmed the per-peer scope. The drop of redraw-on-reconnect (N4) is
-    being confirmed.
+  - It is bound to the peer's **authenticated** key. It is reused across a
+    reconnect only for a link that authenticates as that same key. A link
+    authenticating as a different key is a different peer with its own salt.
+    A rotation or revocation of the peer's key record draws a new salt (§6.4).
+  - CC confirmed the per-peer scope, and the drop of redraw-on-reconnect on
+    this binding.
   - Witness 16.
 - **R6. The salt is sent only where the transport is confidential.**
   - An RF Summary is built only when `Transport::confidential_to(peer)` holds.

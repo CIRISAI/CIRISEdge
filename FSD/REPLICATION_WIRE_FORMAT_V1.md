@@ -417,8 +417,10 @@ section is normative for the bytes.
 **Inputs.**
 - `salt`: 32 bytes, drawn from the OS CSPRNG by the sender separately **for
   each peer and each direction**, at process start and at least hourly. It is
-  never one value shared across peers, never derived from anything stable, and
-  sent only where the transport is confidential to that peer (design §6.4,
+  bound to the peer's authenticated key: reused across a reconnect only for
+  the same key, and redrawn when that key's record is rotated or revoked. It
+  is never one value shared across peers, never derived from anything stable,
+  and sent only where the transport is confidential to that peer (design §6.4,
   R5-R6).
 - `plane`: the `EnvelopeKind` wire name (`"key"`, `"identity_occurrence"`, …),
   ASCII.
