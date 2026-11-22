@@ -404,6 +404,82 @@ fifth verb (a fifth `ReplicationMessage` variant) that closes this:
   column, manifest v2), which CIRISServer pins — so the cut is
   coordinated by construction.
 
+#### 3.4.2 Range fingerprints, `rf` v1 (specified for 45.1.10+, not yet implemented)
+
+The construction CC cites. It was ruled on 2026-11-22:
+- a fingerprint is a compressed ref list, not a holding claim;
+- CC 6.1.5 fixes what a round conveys, not its encoding;
+- a `list` answer is a step of the automatic diff, not a request.
+
+The design and its rationale are in `docs/design/RANGE_FINGERPRINTS.md`. This
+section is normative for the bytes.
+
+**Inputs.**
+- `salt`: 32 bytes, drawn fresh from the OS CSPRNG by the sender for each link
+  session. It is never derived from anything stable, and carried only inside
+  the sealed link (design §13, R5-R6).
+- `plane`: the `EnvelopeKind` wire name (`"key"`, `"identity_occurrence"`, …),
+  ASCII.
+- `prefix`: a lowercase hex string of 0-64 characters. The range is every
+  32-byte envelope hash `x` whose lowercase hex starts with it.
+- `S`: exactly the set of envelope hashes the sender would offer this peer on
+  this plane. The audience filter is applied before the sum and the count
+  (R1).
+
+**Construction (`"a":1`).**
+
+```text
+e(x)     = SHA-256( "CIRIS-RF-v1/elem" || salt || x )          16 + 32 + 32 bytes
+           read as an unsigned 256-bit little-endian integer
+sum      = Σ_{x ∈ S, x in prefix} e(x)  mod 2^256
+count    = |{x ∈ S : x in prefix}|
+fp       = SHA-256( "CIRIS-RF-v1/node" || u8(len plane) || plane
+                    || u8(len prefix) || prefix
+                    || LE256(sum) || u64_be(count) )[0..16]
+```
+
+The two tags are exactly 16 ASCII bytes. `"a":2` is reserved for a
+ristretto255 multiset hash and is not defined here.
+
+**Known-answer vectors.** With:
+- `salt = 00 01 02 … 1f`;
+- `x_i = SHA-256("ciris-rf-vector-" || decimal i)` for i = 0…3.
+
+```text
+x0 = eb508c89d15536335c7c2009f9166e6577f2f4155bdbe8bb6dad116ff3946d29
+x1 = c4d3d45d7a7f43e6fc35e22ce3991f6fa756ce394271a4ce54d5104236b6aaf0
+x2 = 5173398ec09eb3f5f83570ece6705a3554222fe8fb6279f0900b2cdfff87a2db
+x3 = d5d55d7ae7725dd2775b8c038b8697f4adc99bef7f1b060dc9d2a62ee59246ee
+e(x0) LE = 3ce04fd7d2d80d6f15a18e1345cc6688ab54f0ea3a201bca8c5d78673d0d4d51
+
+V1 plane "key", prefix "",  S = {}                count 0  fp 424536b38733e31120b522bb3d906fef
+V2 plane "key", prefix "",  S = {x0,x1,x2,x3}     count 4  fp 6b0ceedb4be4d229f583ab2129e78b17
+   sum LE = 126990de50d21e21f249526b14de9adfb5233783ad5a369ec08beb8cf1403e07
+V3 plane "key", prefix "e", S = {x0,x1,x2,x3}     count 1  fp f42b8c0a2585fe2c1abfe267731bb4e4
+V4 plane "identity_occurrence", prefix "", S = {x0..x3}  count 4  fp 4219528fc526b10ff80c4c3419bd9baf
+V5 as V2 with salt = 20 21 … 3f                   count 4  fp b4f22081a2fd177ea367cd2d1f43fec2
+V6 plane "key", prefix "",  S = {x0,x1,x2}        count 3  fp 5ab8ad56d241203063179fdf44176e59
+```
+
+V4 shows that the plane is bound into the fingerprint, V5 the salt, and V6 the
+count.
+
+**Wire.** These are additive, flattened members, ignored by a pre-`rf` peer.
+No `WIRE_PROTOCOL_VERSION` change.
+
+`Summary.rf`:
+- `{"v":1,"a":1,"salt":"<base64url, 32 bytes>","n":[[prefix,count,fp_hex]…],"c":[[parent,[16 counts],fp_hex×16]…]}`;
+- the salt is repeated in every RF Summary of the link session.
+
+`Diff.rf`:
+- `{"v":1,"m":[…],"s":[…],"l":[…]}`, the match, split and list prefixes;
+- or `{"v":1,"u":true}` when the receiver is unable to answer.
+
+The marker:
+- `{"v":1}` means the node answers RF;
+- `"e":1` in it means the node decodes the compact `rh` / `wh` / `xh` / `eb`
+  members (design §12).
+
 ### 3.5 WIRE_PROTOCOL_VERSION
 
 Replication protocol version is carried in the wire-frame:

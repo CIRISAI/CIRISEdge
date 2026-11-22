@@ -8,10 +8,11 @@ text, **[inf]** is inferred from numbers, **[new]** is proposed here.
 
 ## 0. The recommendation in one page
 
-- **Protocol.** Range-based set reconciliation in the Negentropy style: an
-  additive fingerprint (sum of the 32-byte envelope hashes mod 2^256, plus the
-  count, hashed and truncated to 16 bytes) over **hash-prefix ranges** of each
-  plane, fan-out 16. The order is the envelope hash itself, not a cursor
+- **Protocol.** Range-based set reconciliation in the Negentropy style: a
+  **salted** additive fingerprint over **hash-prefix ranges** of each plane,
+  fan-out 16. The fingerprint is Σ SHA-256(tag‖salt‖id) mod 2^256, with the
+  count, hashed and truncated to 16 bytes. The salt is 32 fresh random bytes
+  per link session, carried only inside the sealed link. The order is the envelope hash itself, not a cursor
   (§2.1). The **sender** sends fingerprints of exactly the rows it would offer
   today. The **receiver** answers each range `match`, `split` or `list`, and
   never sends a fingerprint, a count or an id of its own (§2.3). Ids are listed
@@ -36,8 +37,8 @@ text, **[inf]** is inferred from numbers, **[new]** is proposed here.
   `IdentityOccurrenceRevocation`. They carry 201.1M of the canonical's 201.7M
   listed refs in 42 h (§1.4). Then the `Attestation` plane, also on 45.1.x
   (Eric, 2026-11-22). Its audience classes and volatile buckets are designed in
-  full in §4.4. It ships behind its own switch and is turned on when CC rules on
-  question 1, the only CC question that blocks anything (§7).
+  full in §4.4. CC has ruled that it may go ahead (§7). It ships behind its own
+  switch in step D and is turned on in step E.
 - **Compatibility.** Capability is learned in band from the `rf` members. A
   peer that never answers one stays on the legacy listing, paced by
   **`BridgeConfig::legacy_resweep_every` (env `CIRIS_EDGE_LEGACY_RESWEEP_SECS`,
@@ -49,8 +50,18 @@ text, **[inf]** is inferred from numbers, **[new]** is proposed here.
 - **Effect on canonical-1.** Of the 42 h's 63.8 GB tx, about 30.7 GB is Summary
   JSON on the bootstrap planes and about 31.7 GB is Deliver bodies as JSON
   number arrays (§1.4). In sync, range fingerprints cut the first to about
-  62 MB (ceiling 0.5 GB). Compact bodies cut the second to about 12 GB toward
+  89 MB (ceiling 0.7 GB). Compact bodies cut the second to about 12 GB toward
   capable peers (§10.2, §12).
+- **CC has ruled** (2026-11-22, §7): a fingerprint is a compressed ref list,
+  not a holding claim; the Attestation plane is allowed, mixed-audience ranges
+  included, so long as each fingerprint covers only rows that peer may
+  receive. No CC text changes. The construction and its known-answer vectors
+  are in `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2, which CC cites.
+- **Named requirements** R1-R9 (§13) carry CC's conditions and the hardening:
+  - the audience filter goes before the sum and the count;
+  - fingerprints are per peer;
+  - a match feed keeps holder counts whole on both sides;
+  - the salted sum, with a fresh per-link-session salt of 32 bytes.
 - **Decisions** are recorded in §11.1. The open question for the
   implementation to measure is in §11.2.
 
@@ -192,29 +203,38 @@ prefix string.
 |---|---|---|
 | Union of disjoint sets | sum of their fingerprints | recompute |
 | Remove one row (withdrawal, per-peer exception) | subtract its hash | recompute the leaf and its path |
-| Per-peer projection = shared set ± a few rows | O(exceptions) from the shared tree | a per-peer tree, or per-peer leaf recomputation |
+| Per-peer projection = shared set ± a few rows | O(exceptions) over a shared membership index (the salted sums are per link session, §3.4) | a per-peer tree, or per-peer leaf recomputation |
 | Cost in sync | one 16 B root | one root |
 | Cost with k sparse differences | O(k · depth · 16) node fingerprints + O(k · leaf) refs | the same |
 | Rounds | depth + 1 | depth + 1 |
-| Collision resistance | generalized birthday (Wagner) is the known weakness of a plain sum; mitigated below | cryptographic |
+| Collision resistance | a plain sum falls to generalized birthday (Wagner); the salted sum below takes the elements out of any third party's reach | cryptographic |
 | Prior art | Negentropy, deployed in Nostr relays | many |
 
-**Pick the additive fingerprint.** The decisive row is the per-peer one:
+**Pick the additive fingerprint.** The decisive row is the per-peer one.
 `IdentityOccurrence` and `TransportDestination` are one shared set minus a
-peer's #682 withheld subjects (`bridge.rs:8507-8516`), and the
-Attestation projection is a union of audience classes (§4.4). Both are sums and
-differences of shared sums; with a Merkle tree each would be a per-peer tree.
+peer's #682 withheld subjects (`bridge.rs:8507-8516`), and the Attestation
+projection is a union of audience classes (§4.4). With a sum, each peer's set
+is assembled from shared membership with a few additions and subtractions;
+with a Merkle tree, each would be a per-peer tree. The sum is over **exactly
+that peer's set** before anything is hashed (R1, R2).
 
 ```text
-v(x)        = x read as a little-endian 256-bit integer     x = envelope hash
-fp(S, p)    = trunc16( SHA-256( "ciris-rf-v1" || plane || p ||
-                                LE256( sum v(x) mod 2^256 ) || u32be(|S|) ) )
+e(x)      = SHA-256( "CIRIS-RF-v1/elem" || salt || x )   as LE 256-bit     x = envelope hash
+sum       = Σ_{x ∈ S_A(P), x in p} e(x) mod 2^256
+count     = |{x ∈ S_A(P) : x in p}|
+fp(S, p)  = SHA-256( "CIRIS-RF-v1/node" || u8 len || plane || u8 len || p
+                     || LE256(sum) || u64_be(count) )[0..16]
 ```
 
-The outer hash binds the plane and the prefix, so a fingerprint of one range
-cannot stand for another. SHA-256 is the hash every envelope hash already is.
-The wire names the construction (`"a":1`), so a stronger one (§2.8) is a new
-value, not a new message.
+The normative bytes and six known-answer vectors are in
+`FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2 (R9).
+- The outer hash binds the plane and the prefix, so a fingerprint of one range
+  cannot stand for another.
+- The salt makes every element a value only the two ends of the link can
+  compute (§2.8).
+- SHA-256 is the hash every envelope hash already is.
+- The wire names the construction, `"a":1`, so a stronger one (`"a":2`,
+  ristretto255, reserved) is a new value, not a new message.
 
 ### 2.3 Who says what: the sender fingerprints, the receiver only answers
 
@@ -265,8 +285,10 @@ leans toward a smaller T_B, which costs a listing, not a row.
 answer depends on, B may serve A. A sender that crafts fingerprints to probe
 B learns, at most, whether B holds exactly some set of rows A is in the audience
 of. For the bootstrap planes those rows are federation-public (the holder
-directory of the Commons, CC 5.2's table) or rows B would serve A. §7 asks CC
-to confirm this reading before the Attestation plane (§4.4).
+directory of the Commons, CC 5.2's table) or rows B would serve A. CC
+confirmed the reading on 2026-11-22: a fingerprint is a compressed ref list,
+not a holding claim, provided it covers only rows the peer may receive (§7,
+R1).
 
 ### 2.5 Wire shape
 
@@ -279,7 +301,7 @@ pinned by `summary_status_is_flat_optional_and_tolerant_937`).
 ```text
 Summary (RF sender, in sync):
 {"type":"summary","kind":"identity_occurrence","refs":[],
- "rf":{"v":1,"a":1,"n":[["",33012,"<32 hex>"]]}}                        ~ 121 B
+ "rf":{"v":1,"a":1,"salt":"<43 b64url>","n":[["",33012,"<32 hex>"]]}}  ~ 173 B
 
 Summary (after a split of "3f"): one packed record per split parent
  "rf":{"v":1,"a":1,"c":[["3f",[c0..c15],"<16 x 32 hex>"]]}               ~ 700 B / split
@@ -318,6 +340,10 @@ Diff (RF receiver):
   extra node. The initiator's and the responder's answers fold into the same
   frontier, as the two roles share one `SweepCursors` key today
   (`bridge.rs:2059-2062`).
+- **The salt and the frontier are separate.** The receiver answers each
+  Summary with the salt that Summary carries (R6). The frontier is prefixes
+  only, so it does not depend on the salt. A round that rides another pooled
+  link, with that link session's own salt, continues the same descent.
 - A listed range stays on the frontier as a node until it answers `match`. That
   is what carries deferred Deliver remainders, transient refusals and lost
   frames (§1.3 items 1-3).
@@ -337,7 +363,7 @@ For a plane of n rows, fan-out 16, leaf threshold 16:
 
 | Case | Bytes per round per direction | Rounds | Store reads |
 |---|---|---|---|
-| In sync | ~121 B Summary + ~75 B Diff | 1 | 0 (§3.4) |
+| In sync | ~173 B Summary (the salt included) + ~75 B Diff | 1 | 0 (§3.4) |
 | One missing row, n = 33k | ~2.1 KB of splits over 3 levels + ~1.2 KB leaf listing ≈ 3.3 KB in all | 4 (root, 16, 256, leaf) | 0 |
 | k sparse missing rows | ≈ k × 3.3 KB less shared upper levels | 4 | 0 |
 | First contact or k ≥ n/2 | B answers `list` at the root: the plane is listed a page per round, **once** | n / page | as today |
@@ -356,34 +382,52 @@ twice the minimum there.
 - **A lies.** A can make B answer `split`, then must list to make progress, and
   every listed row is gated by the serve gate and every delivered row by
   admission. A cannot inject a row or learn anything §2.4 does not allow.
-- **A third party forges a collision.** A plain modular sum is open to
-  Wagner's generalized-birthday attack: with many chosen elements, a k-sum
-  equal to a target is cheap **in hash evaluations**. Here each element is the
-  hash of an admitted row whose bytes include its hybrid signatures (§1.1), so
-  each candidate costs an ML-DSA-65 signature, not a hash. A useful attack
-  needs on the order of 2^31 signed candidates and 2^16 admitted rows from
-  attacker keys, placed in one prefix range of A and kept off B (or the
-  reverse) against both sides' anti-entropy, past `PeerBurst` and admission,
-  with counts balanced. The prize is one delayed backstop for one row toward
-  one peer; the head listing, the kicks and every Pull still carry it.
-  **Recommendation: ship the sum (`"a":1`)** and keep `"a":2` reserved for an
-  elliptic-curve multiset hash over ristretto255 (collision resistance rests on
-  discrete log, still additive and incremental, at the cost of one hash-to-group
-  per row at insert; `curve25519-dalek` is already in the tree through
-  `ed25519-dalek`). Decision 1 in §11.
+- **A third party forges a collision.** CC flagged it, and it is real for an
+  unsalted sum. A peer connected to both A and B can mint rows whose hashes sum,
+  with the counts balanced, to a target (Wagner's generalized birthday is cheap
+  in hash evaluations), and so make the A–B range match while B lacks a row. The
+  hybrid signature inside each row's hash makes each candidate costly, but it
+  does not make the attack impossible.
+- **The salted sum closes it.** Each element is `e(x) = SHA-256(tag‖salt‖x)`.
+  The salt is drawn fresh by the sender for each link session, and it is known
+  only to the two ends of that sealed link (R5, R6).
+  - A third party cannot compute any `e(x)` on the A–B link, so it cannot
+    prepare a set in advance.
+  - A row it mints lands at a value it cannot predict.
+  - A random collision of the 128-bit truncation is 2^-128 per comparison.
+  - The only parties who know the salt are A and B. Either can already lie
+    (above) and hurt only itself.
+- **Why per link session and not per round.** A per-round salt would make the
+  sender re-hash its whole offer every round, and the receiver its whole set.
+  §3.4 has the arithmetic: per link session the same safety costs one hash pass
+  per link-up per plane, plus the delta per memo generation.
+- `"a":1` is this salted sum (decision 1, as hardened 2026-11-22). `"a":2`
+  stays reserved for a ristretto255 multiset hash.
 
 ## 3. Where fingerprints come from
 
 ### 3.1 The sender's trees
 
-**[new] `RangeTree`**, per session plane: 4,096 leaf buckets (three hex digits)
-each holding a 256-bit sum and a count, and the plane's hashes sorted for the
-listing of a range. A node at depth ≤ 3 sums buckets; a deeper node scans its
-bucket (about 8 rows at 33k).
+The sender keeps two kinds of structure.
+
+**[new] `RangeIndex`**, one per session plane, shared across peers. It is
+**membership only**: the plane's hashes sorted into 4,096 leaf buckets (three
+hex digits), each hash with the labels the per-peer filter reads (the subject
+on the identity planes, §4.4.2's labels on the Attestation plane). It holds no
+sum, no count and no fingerprint, so nothing salted or peer-specific is ever
+shared (R2).
+
+**[new] `LinkSums`**, one per `(link session, plane)`. A link session belongs
+to exactly one peer.
+- It holds 256 level-2 buckets of salted sum and count, over exactly that
+  peer's set: `RangeIndex` filtered by the peer's audience before summing (R1).
+- A node at depth ≤ 2 adds buckets.
+- A deeper node hashes the members of its level-2 bucket in that peer's set,
+  about 130 at 33k rows.
 
 | Plane | Built from | Rebuilt when |
 |---|---|---|
-| `Key`, `Revocation`, `IdentityOccurrenceRevocation` (peer-invariant) | the plane's complete listing from `key_plane_listing` (`bridge.rs:8193`): the listing cache when it hits (`bridge.rs:8204-8222`), else the listing just built | the memo's generation moves (`key_plane_memo.rs:575`); "generation moves on every change to what the memo would answer" (`key_plane_memo.rs:357-362`) |
+| `Key`, `Revocation`, `IdentityOccurrenceRevocation` (peer-invariant membership) | the plane's complete listing from `key_plane_listing` (`bridge.rs:8193`): the listing cache when it hits (`bridge.rs:8204-8222`), else the listing just built | the memo's generation moves (`key_plane_memo.rs:575`); "generation moves on every change to what the memo would answer" (`key_plane_memo.rs:357-362`) |
 | `IdentityOccurrence` | the shared listing over the publish set, minus, per peer, the refs of its #682 withheld subjects (memo lookups) | as above; the per-peer patch is cached against `(generation, withheld set)` |
 | `TransportDestination` | the holdings index's route records (`holdings_index.rs:325`, which already keep each route's subject "so the stranger view … can later filter by owner"), filtered by the listing's predicate: subject in the publish set, or `relayable_signed_route` (`bridge.rs:8572`), stored as one bit per record at feed time; minus the peer's #682 subjects | each route feed delta |
 
@@ -392,11 +436,12 @@ bucket (about 8 rows at 33k).
 budget left unread (`KEY_PLANE_READ_BUDGET` 256, `key_plane_memo.rs:296`) is
 absent from both. So S_A equals today's offer by construction.
 
-Rebuilding is one pass over the listing (33k additions, well under a
-millisecond) and happens at most once per memo generation, which moves at most
-once per feed probe (`FEED_PROBE_SPACING` 5 s, `store_feed.rs:86`) plus the
-TTL epoch (`MEMO_TTL` 10 min, `key_plane_memo.rs:97`). Incremental add and
-subtract is a later optimisation.
+The `RangeIndex` is rebuilt once per memo generation: one unsalted pass, at
+most once per feed probe (`FEED_PROBE_SPACING` 5 s, `store_feed.rs:86`) plus the
+TTL epoch (`MEMO_TTL` 10 min, `key_plane_memo.rs:97`). Each live `LinkSums` is
+then updated **incrementally** by the generation's delta: hash the rows added
+and removed with that link's salt, and add or subtract them. A full salted
+pass happens only when a link session starts (§3.4).
 
 ### 3.2 The receiver's settled sets
 
@@ -457,10 +502,33 @@ A row leaving a set is a subtraction: no tombstone of the tree's own.
 
 | | Memory | CPU in sync | Store reads in sync |
 |---|---|---|---|
-| Sender trees, 5 planes | 4,096 × 36 B buckets + n × 32 B sorted hashes per plane: about 4 MiB at canonical sizes | none: the root is cached per `(peer, plane, generation)` | none: the listing cache hits |
+| Sender `RangeIndex`, all planes | n × (32 B + labels) per plane: about 4 MiB at canonical sizes, plus §4.4.7 for Attestation | none | none: the listing cache hits |
+| Sender `LinkSums` | 256 × 40 B ≈ 10 KiB per `(link session, plane)`: 17 links × 6 planes ≈ 1 MiB; 135 peers × 2 pooled links × 6 ≈ 16 MiB worst | none: the root is cached per `(link session, plane, generation)` | none |
 | Sender per peer | a frontier (usually the root) and a head position: under 1 KiB per `(peer, plane)`, 2 KiB at the split cap | none | none |
-| Receiver | per plane 4,096 buckets + the sorted hashes: about 4 MiB beside the holdings index | one root sum plus the corrections in the root's range | none: the index answers; a clean feed is not probed within `FEED_PROBE_SPACING` |
+| Receiver | a `RangeIndex` over its settled set per plane (≈ 4 MiB), and `LinkSums` per `(peer's salt, plane)`, rebuilt when a new salt arrives | one root compare plus the corrections in the root's range, salted the same way | none: the index answers; a clean feed is not probed within `FEED_PROBE_SPACING` |
 | Exclusions | at most 65,536 × 32 B ≈ 2 MiB | | |
+
+**The CPU cost of the salt.** One element costs one SHA-256 over 80 bytes:
+two compressions, about 0.2 µs with SHA extensions and ≈ 0.5 µs without (the
+conservative figure used here). The canonical's offer, all six planes at
+today's sizes, is about 140k rows:
+- Key 33k;
+- IdentityOccurrence ≤ 33k;
+- TransportDestination ~18k;
+- Revocation and IdentityOccurrenceRevocation ≤ 7.2k each;
+- Attestation 42.5k.
+
+| Salt scope | When the full salted pass runs | Canonical cost |
+|---|---|---|
+| **per link session (R5)** | once per link-up per plane, on the link's first RF Summary; then O(delta) per memo generation | ≈ 70 ms per link-up as sender, ≈ 70 ms as receiver over its own holdings. At one link-up every 10 s: ≈ 1.4% of a core. At one a second (a churn storm): ≈ 14%. Deltas: 10 new rows × 17 links = 170 hashes ≈ 85 µs per generation |
+| per round | every round, per link, per role | 17 links × 2 roles × 70 ms per 30 s ≈ 8% of a core for the sender alone, ≈ 16% with the receiver, and ≈ 120% if all 135 peers were linked at once |
+
+The per-link salt is cheaper than the per-round one by the number of rounds a
+link carries: a link that lives ten minutes carries twenty. Link churn
+(CIRISEdge#532) is the variable that sets the real figure. Step A's telemetry
+counts link-up rebuilds and their milliseconds (`rf_linksums_built`, §8). A
+link-up does not wait for the pass: until a `LinkSums` exists, that link's
+round sends a legacy Summary (§3.4 fallback).
 
 **Fail to the old behaviour, never to a wrong answer.** If the receiver's plane
 is not `Ready` (holdings index unbooted, booting or suspect,
@@ -498,9 +566,10 @@ the other's audience (§2.4). Per side:
 - `Key`, `Revocation`, `IdentityOccurrenceRevocation`: peer-invariant listings
   over public rows (the `Key` plane is "a #402 bootstrap plane, served public",
   `bridge.rs:5230-5233`; the revocation planes enumerate `Projection::Global`).
-  One shared tree; no per-peer exceptions.
-- `IdentityOccurrence`, `TransportDestination`: one shared tree minus the
-  peer's #682 subjects: "an unannounced node's occurrence and route go only to
+  Membership is shared and has no per-peer exceptions; the salted sums are
+  still per link session, so per peer (R2).
+- `IdentityOccurrence`, `TransportDestination`: shared membership minus the
+  peer's #682 subjects, filtered before the per-link salted sum (R1): "an unannounced node's occurrence and route go only to
   its owner's own nodes" (`bridge.rs:5282-5285`). The exception set is
   `identity_rows_withheld_from` (`bridge.rs:15182`), the same function the
   listing applies, so the sender's fingerprint excludes exactly what its
@@ -516,11 +585,11 @@ listing. Under range fingerprints its answer is cached against
 `(peer, memo generation, owner-binding generation)`, so an idle round does not
 run it.
 
-### 4.4 The Attestation plane (on the LTS; on when CC rules on question 1)
+### 4.4 The Attestation plane (on the LTS; CC ruled 2026-11-22)
 
-Built in full on 45.1.x behind its own switch (§10.1, step D), and turned on
-the release after CC answers question 1 (§7). Nothing below waits on CC except
-the switch.
+Built in full on 45.1.x behind its own switch (§10.1, step D) and turned on in
+step E. CC's ruling on question 1 allows it on the condition R1 and R2 carry:
+each fingerprint covers only rows that peer may receive (§7, §4.4.8).
 
 The Attestation offer is per row and partly live. Recomputing it per peer per
 round would cost what the walk costs today. So the design splits every input
@@ -584,9 +653,9 @@ Attestation-index rows (`holdings_index.rs` module docs).
 #### 4.4.3 Classes, and each peer's offer as a sum of them
 
 A **class** is the set of non-volatile rows sharing `(place, proj, flags)`.
-Each class keeps its rows' hashes: a dense 4,096-bucket tree for the commons
-class, which is most of the plane, and a sparse sorted list for every other
-class.
+Each class is **membership**: its rows' hashes in the plane's `RangeIndex`
+buckets (§3.1). That is dense for the commons class, which is most of the
+plane, and sparse for every other class. A class holds no sum.
 
 **The audience of a placement** comes from persist's resolver,
 `audience_nodes(cohort_scope, target)` (persist v61.4.3 `replication_audience.rs:591`):
@@ -625,10 +694,17 @@ S_A(P) = Σ_{c ∈ C(P), bits pass} tree_c
        + volatile rows whose cached verdict for P is yes
 ```
 
-The commons class is shared by every peer and costs nothing per peer. Every
-other class is summed into a per-peer 256-bucket array (≈ 9 KiB a peer), and
-deeper nodes scan the class members in the bucket. A peer's array is rebuilt
-only when one of its inputs moves:
+A peer's `LinkSums` (§3.1) is the salted sum and count, bucket by bucket, of
+exactly S_A(P) as computed above, with that link's salt (R1, R2). Its 256
+buckets are about 10 KiB a link session, and deeper nodes hash the members of
+S_A(P) in the bucket. The subtractions in the formula act on membership, or on
+salted values under the same salt. Either way the `(sum, count)` that enter
+the outer hash are bit-identical to summing the filtered set, and witness 15
+checks every sent node against that filter-first reference.
+
+Membership is shared across peers; sums never are. A peer's `LinkSums` is
+recomputed (the members changed, re-hashed with the same salt) only when one
+of its inputs moves:
 - one of its classes;
 - a placement audience it is in or leaves;
 - its peer bits;
@@ -719,19 +795,23 @@ Two rules make it sound without B evaluating volatile gates for A:
 | | Memory | Idle round |
 |---|---|---|
 | Labels | ≈ 64 B a row: ≈ 2.7 MiB | none |
-| Class trees | commons dense (≈ 147 KiB); others sparse, 32 B a row | none |
+| Class membership | in the plane's `RangeIndex`: 32 B a row plus labels | none |
 | Placement audiences | one node set per placement | none: dirt-driven |
-| Per peer | 256-bucket array ≈ 9 KiB; volatile bitset `n_volatile` bits; inclusions and exclusions ≤ 1,024 each | root compare |
+| Per peer | `LinkSums` ≈ 10 KiB per link session; volatile bitset `n_volatile` bits; inclusions and exclusions ≤ 1,024 each | root compare |
 | Gate reads | ≤ `RF_GATE_BUDGET` per (peer, round), only on dirt or TTL | zero |
 
-#### 4.4.8 What CC question 1 decides
+#### 4.4.8 CC question 1, ruled
 
-Whether a fingerprint or a match answer over `community`, `affiliations`,
-`family` and `self` rows, made only to a node in each row's audience, is a
-holding claim under CC 5.2. If CC rules that it is one, and must not be made at
-`self` or `family` scope, then `self(owner)` and `family(f)` placements become
-volatile by rule: never fingerprinted, always listed through the gates. The
-rest of the design is unchanged; only the switch's default waits.
+CC ruled that a fingerprint is a compressed ref list, not a holding claim
+(§7). Mixed-audience ranges are allowed on one condition: each fingerprint
+covers only rows that peer may receive. This section's construction meets the
+condition in three ways:
+- S_A(P) is built from P's classes and P's own volatile verdicts only (R1);
+- the sum and count are over that set before hashing;
+- no fingerprint, sum or cache is shared with another peer (R2).
+
+The fallback this section used to describe, making `self` and `family`
+placements volatile by rule, is not needed. Step E needs no further ruling.
 
 ## 5. Interaction with what exists
 
@@ -799,21 +879,71 @@ The initiator's push skips refs the peer's last Summary showed it holds
 `match` means the peer holds everything we would push. `peer_lacks_nothing`
 (`coordinator.rs:298`) counts root matches as it counts empty Diffs.
 
-### 5.7 The removal receipt ledger (#441)
+### 5.7 The match feed: holders from matched ranges, on both sides (R3)
 
-An ack is booked today when a peer's Summary lists a removal row
-(`coordinator.rs:1110-1120`). Under RF a `match` over range p proves the peer
-holds every removal row of S_A in p, so the sender books those, once per
-`(peer, plane, generation)`. That is a stronger ack than a listing: a listing
-says the peer's offer contains the row; a match says the peer holds all of
-ours.
+CC's condition (c): any consumer that reads "peer P holds id x" from rounds must
+still count P as a holder of every id in a range that **matched**, on both
+sides. Otherwise rarity reads low for exactly the best-replicated rows, the
+ones that never get listed again.
+
+**Where holders are read from ref lists today [read]:**
+
+| Consumer | Reads | Site |
+|---|---|---|
+| the removal receipt ledger (#441) | every hash of a peer's Summary on a removal kind, as "the peer's own statement of holdings" | `coordinator.rs:1110-1120` → `observability.rs:4722` (`removal_ack_from_summary`) |
+| the known-hash holder map (#552) | the hashes a peer's Summary offered that this node lacks, with the peer as holder | `session.rs:903` → `bridge.rs:5168-5194` (`note_known_hashes`, `last_advertised_by`) |
+| the proactive push's delta basis | the peer's last Summary as what it holds | `session.rs:493`, `session.rs:554` |
+| `peer_lacks_nothing` | an empty Diff | `coordinator.rs:1077-1079` |
+
+The noise-floor and rarity machinery itself does **not** read replication
+refs today:
+- its holder counts come from signed `FountainHoldingClaim` envelopes
+  (`swarm/runtime.rs:467` `upsert`, `:503` `distinct_holders`, `:531`
+  `weighted_holder_equivalents`);
+- the read side is a tap on the same claim plane (`holonomic/converged_view.rs`
+  module docs);
+- the `AggregationMetaV1` producer (`holonomic/aggregation.rs`) is
+  verify-shaped and fed by them.
+
+So range fingerprints cannot lower today's rarity counts. The match feed below
+is what keeps that true for the four consumers above, and for any producer that
+later reads holders from rounds.
+
+**[new] The match feed.** One event, emitted by each side when a range
+matches:
+
+```text
+RangeMatched { peer, plane, role: Sender | Receiver, link_session, prefix,
+               ids: lazy iterator over this side's own set ∩ prefix }
+```
+
+- **Sender side.** A receives `match` for prefix p. Then B holds every id of
+  S_A(B) ∩ p, so each id is booked with B as a holder.
+- **Receiver side.** B answers `match` for prefix p. Then A offers, and so
+  holds, every id of T_B(A) ∩ p, so each id is booked with A as a holder.
+- **Once per change.** The feed fires for `(peer, plane, prefix)` only when the
+  matched set's generation differs from the last one it fired for. A root that
+  matches round after round costs nothing after the first match. The
+  iteration is O(|set ∩ p|) once per change.
+- **Consumers:**
+  - the removal ledger books acks from both roles: a match is a stronger ack
+    than a listing, because a listing says the peer offers the row and a match
+    says it holds all of ours;
+  - the holder map refreshes `last_advertised` for its known hashes in p, so
+    on a `HashFirst` plane the holder map stays as fresh as the matches, not
+    the eviction cutoff (§5.8);
+  - the proactive push reads "root matched" (§5.6);
+  - `peer_lacks_nothing` counts root matches;
+  - a future rounds-reading rarity producer subscribes to the same event.
+- **Witness 14** (§9) pins that, for the same pair and the same sets, every
+  consumer's count equals the count the legacy listing produces.
 
 ### 5.8 Known hashes on conferred servers (#552)
 
-As §3.2: in T_B on a `HashFirst` plane, refreshed by re-listing after their
-cutoff. The holder map's freshness becomes the eviction cutoff, not the
-re-sweep wrap; `known_hashes.rs` "Eviction" already takes the cutoff from the
-caller.
+In T_B on a `HashFirst` plane (§3.2). The match feed (§5.7) refreshes each
+known hash's holder on every new match of its range, so the holder map ages
+only when the peer's set changes. If a known hash does age out, it leaves T_B,
+its range differs, and the listing re-teaches it with its holder.
 
 ### 5.9 First contact
 
@@ -927,30 +1057,26 @@ node do without any row; it is not a mesh-config key.
 - CC 5.4.3 item 4: maintenance traffic is shaped
   (`part_5_transport_substrate.md:954`). §5.10.
 
-**Questions for CC:**
+**Questions put to CC, and its rulings (2026-11-22).** No CC text changes.
 
-1. **Is a range fingerprint, or a receiver's match answer, a holding claim
-   under CC 5.2?** This design treats it as a statement made only to a node in
-   the audience of every row it covers (§2.4). That is harmless for the
-   Commons-public bootstrap planes. It needs a ruling before the Attestation
-   plane (§4.4, built on the LTS behind its switch) puts `community`, `family`
-   and `self` rows under fingerprints, in particular for "nothing of the
-   content, of the roster or of who holds it". **This is the only question that
-   blocks anything, and it blocks only turning the Attestation switch on.**
-   §4.4.8 says what changes if CC rules that it is a holding claim.
-2. **CC 6.1.5, "carries what a node holds and lacks".** May a round carry it as
-   a fingerprint over ranges, with ids only where the ranges differ? Is there a
-   normative consumer that needs the per-row list each round? Edge's own
-   consumers (the holder map, the removal ledger, the proactive push) are
-   covered in §5.6-5.8. Suggested text: "carries, or proves by range
-   fingerprint, what a node holds and lacks".
-3. **CC 5.2, "an automatic diff is not a request".** Confirm that a receiver's
-   `list` answer for a range is not a request in this sense: it widens nothing,
-   because the sender still lists only what it would offer unasked.
-4. **The fingerprint construction as a pinned rule.** The replication wire is
-   edge's, so CC need not pin it. Say whether CC wants the `"a":1` sum
-   construction stated, or the `"a":2` collision-resistant one required, given
-   §2.8's cost analysis.
+| # | Question | Ruling | What it puts in this design |
+|---|---|---|---|
+| 1 | Is a range fingerprint, or a match answer, a holding claim under CC 5.2? | **No.** A fingerprint is a compressed ref list. The Attestation plane is allowed, mixed-audience ranges included, provided each fingerprint covers **only rows that peer may receive** | §4.4 is enabled on that condition, as R1 and R2 (§13). §4.4.8's fallback is not needed |
+| 2 | CC 6.1.5, "carries what a node holds and lacks": may it be a fingerprint? | **Yes.** CC 6.1.5 fixes what a round conveys, not its encoding. Any consumer that reads holders from rounds must still see every id of a matched range, on both sides | the match feed, R3 (§5.7) |
+| 3 | Is a `list` answer a request under "an automatic diff is not a request"? | **No.** It is a step of the automatic diff | none: the sender lists only its unasked offer (§2.4) |
+| 4 | Should CC pin the construction? | **It is edge's wire, not `WIRE_VOCABULARY`.** The construction and known-answer vectors go in `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4, which CC cites | §3.4.2 of the FSD, R9 |
+
+**Hardening CC asked for, and took.** The unsalted sum lets a peer connected to
+both A and B mint rows of equal sum and count and suppress a row on the A–B
+link. The fix is the salted sum Σ H(salt‖id), with the salt per link session:
+- drawn by the sender at link establishment;
+- fresh and random for every session, re-established ones included;
+- never derived from anything stable;
+- 32 bytes;
+- carried only inside the sealed link.
+
+A per-link-session `LinkSums` is cached for the link's life (CC agreed). This
+is R4-R6, and it stays `"a":1`; ristretto255 remains `"a":2`.
 
 ## 8. Telemetry
 
@@ -973,6 +1099,9 @@ All closed label sets; no peer id, key id or address is ever a label.
 | `rf_round_outcome_by_size` | counter | plane, role, outcome, size band | §11.2's measurement: does a large Summary's round complete |
 | `rf_attestation_pending_buckets` | gauge | walk class | §4.4.4's buckets waiting for verdicts, all peers |
 | `rf_attestation_gate_reads` | counter | cause = `absent` / `dirt` / `ttl` | volatile verdicts re-read, by why (the #1019x attribution shape) |
+| `rf_linksums_built`, `rf_linksums_build_ms` | counter | plane, role = `sender` / `receiver` | full salted passes at link-session start, and their cost (§3.4) |
+| `rf_linksums_delta_hashes` | counter | plane | salted hashes spent on memo-generation deltas |
+| `rf_match_feed_ids` | counter | plane, role, consumer | ids delivered to each match-feed consumer (§5.7) |
 | `rf_attestation_class_rebuilds` | counter | cause = `class` / `audience` / `peer_bits` / `quarantine` / `self_set` | per-peer array rebuilds (§4.4.3) |
 
 The byte truth comes from #1025's ledger, `(transport, plane)` cells with
@@ -1042,8 +1171,8 @@ transport, as `key_plane_v59_tests::NodeA`):
     the `withdraws` is fed. An expiring grant is out at its `expires_at`. A
     bucket with an unread verdict is never covered by a sent node.
     `RF_GATE_BUDGET` bounds gate reads per round. An idle round reads nothing.
-    With the §4.4.8 ruling applied, no `self` or `family` row is ever under a
-    fingerprint.
+    Every fingerprint over a mixed-audience range sums only rows the peer may
+    receive (R1).
 
 **The encoding** (§12):
 
@@ -1052,6 +1181,40 @@ transport, as `key_plane_v59_tests::NodeA`):
     has not advertised `"e":1`. A compact Deliver of consent grants is classed
     `contact` by the shaper and by #1025's frame classifier, as its JSON twin
     is.
+
+**The named requirements** (§13):
+
+14. **The match feed equals the listing (R3).** For the same pair and sets, run
+    once with the legacy listing and once with RF, and compare:
+    - the removal ledger's acks per peer;
+    - the holder map's entries and holders;
+    - the proactive push's skips;
+    - `peer_lacks_nothing`.
+
+    Each must equal the legacy run on both sides once the ranges match, and the
+    feed must fire once per change, not once per round.
+15. **Filter first (R1, R2).** For every node a sender emits, its `(sum,
+    count)` equals a reference computed by filtering the peer's set first and
+    salting second. Two peers with different audiences over the same plane and
+    the same salt get different fingerprints whenever their sets differ. No
+    `LinkSums` is ever read for a peer other than its own.
+16. **Fresh salts (R5).**
+    - Two link sessions of the same pair draw different salts. So does a link
+      torn down and re-established between the same two nodes, within one
+      process and across a restart.
+    - The salt is 32 bytes.
+    - It is not equal to any value derivable from the pair's keys, key ids,
+      link id, link hash or round ids. The test computes the obvious
+      derivations (hashes and HKDFs of each) and asserts none matches.
+    - A source scan asserts the salt is produced only by a call to the OS
+      CSPRNG.
+17. **Never outside the seal (R6).** A frame carrying `rf.salt` is never
+    written by an unsealed path. On a transport without confidentiality the
+    sender sends a legacy Summary. The salt appears in no log line, metric
+    label, persisted row or FFI return (a source scan, as `log_citations`
+    does).
+18. **Known answers (R9).** The implementation reproduces the six vectors of
+    `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2, byte for byte.
 
 **Gates** (per the repo's rules): run every integration suite the change can
 reach, the source-scan suites (`log_citations` and its siblings), the wide
@@ -1064,15 +1227,17 @@ only on this host.
 ### 10.1 The sequence
 
 Each step ships alone. A comes before B and C. D needs A's receiver plumbing
-and B's trees and frontier. E needs D and CC's answer to question 1.
+and B's index, `LinkSums` and frontier. E needs D's canary. R1-R9 (§13) are in
+force from the first step that sends or answers a fingerprint: A for answers,
+B for sends.
 
 | Step | Ships | Switch | Default |
 |---|---|---|---|
 | A (45.1.10) | the byte labels of §8 (`summary_bytes_*`, `diff_bytes_*`, `deliver_wire_bytes_*`); §11.2's measurement; the receiver half on the bootstrap planes: plane tags in the holdings index, `settled_B`, the `rf` answers, the marker; **decoding** of the compact encoding (§12), advertised as `"e":1` | `CIRIS_EDGE_RANGE_FINGERPRINTS_ANSWER` | **on**: it answers only when asked and costs only memory |
 | B (45.1.11) | the sender half on the five bootstrap planes: trees, frontier, head ring, capability, §5.6-5.8's adjustments, §6.3's pacing toward legacy peers; **encoding** of compact refs, wants and bodies toward peers that advertised `"e":1` | `CIRIS_EDGE_RANGE_FINGERPRINTS`; `CIRIS_EDGE_COMPACT_WIRE` for §12 | **off**; on for the canary on canonical-1 |
 | C (45.1.12) | the sender and encoding defaults flipped, on the canary's numbers; want carry-over only if the canary shows `diff_want_in` ≫ `deliver_rows_out` (decision 7) | as B | on |
-| D (45.1.13) | the Attestation plane, both halves (§4.4): row labels, class trees, placement audiences, volatile verdicts and pending buckets, the required-row memo, learned inclusions | `CIRIS_EDGE_RANGE_FINGERPRINTS_ATTESTATION` | **off** until CC rules on question 1 |
-| E (the first 45.1.x after the ruling) | D's switch on, with §4.4.8 applied if CC rules that a fingerprint over `self` or `family` rows is a holding claim | as D | on |
+| D (45.1.13) | the Attestation plane, both halves (§4.4): row labels, class membership, placement audiences, volatile verdicts and pending buckets, the required-row memo, learned inclusions | `CIRIS_EDGE_RANGE_FINGERPRINTS_ATTESTATION` | off; on for the canary |
+| E (45.1.14) | D's switch on. CC has ruled (§7), so no fallback applies | as D | on |
 
 The receiver half ships first because the canonical can only save bytes toward
 peers that answer, and phones update on the agent's release train. For the
@@ -1085,9 +1250,9 @@ Against the 42 h of §1.4, with every peer on step A and the canonical on B:
 ```text
 Summary tx on the five bootstrap planes, today          ~ 30.7 GB
 RF in sync: per pair 3 planes x 2 roles x 120/h x 42 h  = 30,240 Summaries
-            x 121 B                                     ~ 3.7 MB per pair
-            x 17 concurrent links                       ~ 62 MB
-            ceiling: x 135 identities, always on        ~ 0.5 GB
+            x 173 B (salt included)                     ~ 5.2 MB per pair
+            x 17 concurrent links                       ~ 89 MB
+            ceiling: x 135 identities, always on        ~ 0.7 GB
 plus genuine differences, ~3.3 KB each, and first contacts listed once
 
 Deliver bodies on the wire, today (9.05 GB raw x ~3.5)  ~ 31.7 GB
@@ -1127,7 +1292,10 @@ tx after steps B and C, every peer capable              ~ 13-14 GB  (about -79%)
 | 5 | Descent | One step per round; the #634 round shape is kept (§2.6) | team lead |
 | 6 | The receiver's set | Restricted to what it may serve the sender (§2.4, §3.2, §4.4.6) | team lead |
 | 7 | Want carry-over | Only on canary evidence that `diff_want_in` ≫ `deliver_rows_out` persists (§5.4, step C) | team lead |
-| 8 | The Attestation plane | On the LTS: built in step D, switched on in step E once CC rules on question 1 (§4.4, §10.1) | Eric |
+| 8 | The Attestation plane | On the LTS: built in step D, switched on in step E (§4.4, §10.1) | Eric |
+| 9 | CC questions 1-4 | Ruled 2026-11-22; no CC text change (§7) | CC |
+| 10 | Collision hardening | The salted sum Σ H(salt‖id), one salt per link session: 32 random bytes, fresh per session, never derived, carried only in the sealed link; `LinkSums` cached for the link's life. Stays `"a":1` (§2.2, §2.8, R4-R6) | CC, taken by the team lead |
+| 11 | Where the construction lives | `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2, with known-answer vectors; CC cites it (R9) | CC |
 
 ### 11.2 For the implementation to measure: does a full key listing ever arrive?
 
@@ -1241,3 +1409,68 @@ a first-contact Key listing, 33k refs: ~5.1 MB -> ~1.4 MB
 
 Base64 costs one pass over the bytes on each side, negligible beside the JSON
 number formatting it replaces.
+
+## 13. Named requirements
+
+Each is a MUST, and each has a witness in §9.
+
+- **R1. The audience filter comes before the sum and the count.** Every
+  fingerprint a node sends is computed over exactly the set of rows that peer
+  may receive on that plane in that range: S_A(P) for a sender, T_B(A) for a
+  receiver. The filter is applied before the sum and before the count, and the
+  count is in the preimage. A construction that subtracts exceptions from a
+  shared base is allowed only on two conditions: the exceptions are a subset of
+  the base, and they are salted with the same link salt. Then the `(sum,
+  count)` entering the outer hash are bit-identical to filtering first. Never
+  filter, truncate or correct after hashing. Witness 15.
+- **R2. Fingerprints are per peer.** No sum, count, fingerprint or cached root
+  is shared between peers or reused across peers whose audiences differ. What
+  may be shared is unsalted membership only (`RangeIndex`, class membership,
+  placement audiences, §3.1, §4.4.3), which is never sent. Every salted value
+  belongs to one link session, and a link session belongs to one peer.
+  Witness 15.
+- **R3. A match counts holders, on both sides.** When a range matches, the
+  sender counts the receiver as a holder of every id of its own set in the
+  range, and the receiver counts the sender as a holder of every id of its own
+  set in the range. Both are booked through the match feed (§5.7), to every
+  consumer that reads holders from rounds, once per change of the matched set.
+  Witness 14.
+- **R4. The salted sum.** `"a":1` is `e(x) = SHA-256("CIRIS-RF-v1/elem" ‖ salt
+  ‖ x)`, summed mod 2^256 with the count and closed by the node hash of
+  `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2. An unsalted sum is never sent.
+  Witness 18.
+- **R5. The salt is fresh, random, per link session, 32 bytes.**
+  - The sender draws the salt from the OS CSPRNG when a link session is
+    established: every new session, a re-established one included, and every
+    process start.
+  - It is never derived from anything stable: no key, key id, node id, link id,
+    link hash, round id, counter or clock.
+  - It is 32 bytes (CC's floor is 16).
+  - A link session's `LinkSums` may be cached for that session's life and are
+    discarded with it.
+  - On HTTPS, where there is no link, a session is the transport's connection
+    session with the peer, with a new salt on each new session and at least
+    hourly.
+
+  Witness 16.
+- **R6. The salt never leaves the sealed link.**
+  - It travels only in RF Summaries on that link: the first of the session and
+    every one after, so a lost first frame cannot strand the receiver.
+  - It travels only on a transport that is confidential end to end: the E1
+    per-link seal (`src/transport/link_seal.rs`, AES-256-GCM per direction) or
+    HTTPS.
+  - Where neither holds, the node sends no RF Summary.
+  - The salt is never logged, put in a metric, persisted, or returned across
+    the FFI.
+
+  Witness 17.
+- **R7. The receiver's set stays inside "would not want" and inside what it may
+  serve the sender** (§2.4, decision 6). Safety needs the first; no disclosure
+  needs the second. Witnesses 3 and 10.
+- **R8. Fail to the legacy listing, never to a wrong answer.** If an input is
+  not ready, the node sends or answers the legacy way and never fingerprints:
+  a holdings index not `Ready`, no `LinkSums` yet, or a volatile verdict
+  unread (§3.4, §4.4.4). Witnesses 2, 6 and 12.
+- **R9. The bytes are the FSD's.** The construction and its known-answer
+  vectors live in `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2. Any change is a
+  new `"a"` value, never an edit of `"a":1`. Witness 18.
