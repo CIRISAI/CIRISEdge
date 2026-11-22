@@ -42,9 +42,12 @@ env:
 
 jobs:
   # ─── linux-x86_64 — feature-combo gauntlet ──────────────────────────
-  # Mission alignment: the lens cutover (Phase 1) consumes edge from
-  # Python via the pyo3 feature; the `pyo3-full` matrix entry covers
-  # that path. The other entries are the lane-isolation gauntlet.
+  # 45.x LTS — edge no longer SHIPS Python (the last release with wheels
+  # was v45.1.9). The integration suite moved off the pyo3 feature onto the
+  # `full` entry; the pyo3 binding (still in-tree until the v62 line, and
+  # still compiled into CIRISServer's one wheel) keeps its own `pyo3-lib`
+  # entry so its unit tests keep running. The other entries are the
+  # lane-isolation gauntlet.
   #
   # ## Feature-combo matrix (per persist's `linux-x86_64-test`
   # substrate-matrix precedent — CIRISPersist v2.0.1)
@@ -67,9 +70,14 @@ jobs:
   #     battle-tested; first-class gauntlet entry.
   #   - all-transports: all three lanes together. Catches feature-
   #     interaction breakage.
-  #   - pyo3-full: the wheel-build canonical (transport-http +
-  #     transport-reticulum + pyo3). Runs `cargo test --all-targets`
-  #     so lib tests + integration tests + doctests all exercise.
+  #   - full: transport-http + transport-reticulum + lxmf + ffi-uniffi.
+  #     Runs `cargo test --tests` so lib tests + every integration
+  #     suite exercise. This is the set the old `pyo3-full` entry ran
+  #     (pyo3 implied transport-reticulum + ffi-uniffi; no integration
+  #     suite needs pyo3 itself), minus the binding.
+  #   - pyo3-lib: the binding's own unit tests (src/ffi/pyo3.rs and the
+  #     pyo3-gated Postgres backend arms) plus the #458 gate. `--lib`
+  #     only — the integration suites already ran on `full`.
   #
   # `fail-fast: false` so a regression in one entry doesn't mask
   # regressions in others. Wall-clock = slowest single entry (not
@@ -83,14 +91,14 @@ jobs:
     runs-on: ubuntu-latest
     # Test binaries link with line tables only, not full debuginfo. Each
     # integration-test binary links persist + verify; at full debuginfo
-    # pyo3-full's --tests set ran the runner out of disk mid-link
+    # the full --tests set ran the runner out of disk mid-link
     # (`ld … Bus error`, 13 MB free, PR #775) after free-disk-space.
     # Line tables keep file:line in panics and backtraces.
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     # v7.4.4 (CIRISEdge#238) — restore only; the canonical linux-x86_64
-    # save now lives on `pyo3-wheel linux-x86_64` (release profile).
+    # save lives on `desktop-release-build linux-x86_64` (release profile).
     # `packages: write` no longer needed here.
     strategy:
       fail-fast: false
@@ -100,10 +108,11 @@ jobs:
           - { name: reticulum,      features: "transport-reticulum" }
           - { name: packet-radio,   features: "transport-packet-radio" }
           - { name: all-transports, features: "transport-http transport-reticulum transport-packet-radio" }
-          - { name: pyo3-full,      features: "transport-http transport-reticulum pyo3 lxmf", all_targets: "true" }
+          - { name: full,           features: "transport-http transport-reticulum lxmf ffi-uniffi", all_targets: "true" }
+          - { name: pyo3-lib,       features: "transport-http transport-reticulum pyo3 lxmf" }
     steps:
       - uses: actions/checkout@v4
-      # pyo3-full builds the largest target set (--all-targets: lib +
+      # full builds the largest target set (--tests: lib +
       # integration tests + benches + doctests against persist + verify
       # + criterion). At persist v5.0.0 + verify v5.0.0 the cumulative
       # compile artifact set exceeds the default GitHub runner's 14GB
@@ -111,8 +120,8 @@ jobs:
       # preinstalled Android SDK / .NET / GHC / dotnet toolchains we
       # don't use — keeps the leaner --lib lanes (core / reticulum /
       # packet-radio / all-transports) from paying the ~60s setup cost.
-      - name: free disk space (pyo3-full only — large compile footprint)
-        if: matrix.combo.name == 'pyo3-full'
+      - name: free disk space (full + pyo3-lib — large compile footprint)
+        if: matrix.combo.name == 'full' || matrix.combo.name == 'pyo3-lib'
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
@@ -157,11 +166,12 @@ jobs:
           # cross-repo layer keyed on the substrate triple.
           key: ${{ matrix.combo.name }}
       - name: cargo test --features "${{ matrix.combo.features }}"
-        # pyo3-full runs --tests to exercise the integration test suite
+        # full runs --tests to exercise the integration test suite
         # (transport_http_hardening, reticulum_loopback,
-        # https_per_messagetype_roundtrip, etc.) plus all lib tests; the
-        # transport-lane entries run --lib only because the integration
-        # suites need the full pyo3 + http stack to link.
+        # https_per_messagetype_roundtrip, peer_mutation_ffi, etc.) plus
+        # all lib tests; the transport-lane entries (and pyo3-lib) run
+        # --lib only because the integration suites need the full http +
+        # reticulum + uniffi stack to link.
         #
         # `--tests` deliberately EXCLUDES benches (criterion's measurement
         # runs at N=2048 take 10+ minutes per Join/Leave point). Bench
@@ -176,9 +186,9 @@ jobs:
         # CDN edge condition. CARGO_NET_RETRY=10 covers in-process
         # retries; this catches sustained pockets where cargo's budget
         # exhausts. 3 attempts with 60s wait between is the same
-        # shape used on android-ndk + build-ios + ios-pyo3 + benches.
+        # shape used on android-ndk + build-ios + benches.
         #
-        # v45.0.0 — 75 minutes per attempt. On PR #980 a warm pyo3-full
+        # v45.0.0 — 75 minutes per attempt. On PR #980 a warm (then) pyo3-full
         # --tests run took 40 minutes and the cold first attempt was cut
         # off at 45 with no test failed, so the lane spent a whole
         # attempt on its own budget. This bounds the CI step, not any
@@ -203,14 +213,15 @@ jobs:
       # to construct its own pqc-less engine and reach the gate. Anti-rot: a gate
       # no lane runs rots silently (CIRISEdge#435).
       - name: "CIRISEdge#458 gate — pqc-less transport refused (own process)"
-        if: matrix.combo.name == 'pyo3-full'
+        if: matrix.combo.name == 'pyo3-lib'
         run: |
           cargo test --features "${{ matrix.combo.features }}" --lib \
             py_init_edge_runtime_refuses_pqc_less_reticulum_transport -- --ignored
       # CIRISEdge#229 — RESTORE only on this lane. The canonical
-      # linux-x86_64 save lives on the `pyo3-wheel` `linux-x86_64`
-      # matrix entry (release-profile `target/`, ~1 GB), matching every
-      # other PLAT in the matrix.
+      # linux-x86_64 save lives on the `desktop-release-build`
+      # `linux-x86_64` matrix entry (release-profile `target/`, ~1 GB),
+      # matching every other PLAT in the matrix (it was the `pyo3-wheel`
+      # entry until the 45.x line stopped building wheels after v45.1.9).
       #
       # v7.4.4 (CIRISEdge#238) — the prior canonical save site was THIS
       # lane (`linux-x86_64-test` / `pyo3-full`). That captured a debug
@@ -219,8 +230,8 @@ jobs:
       # consumers (CIRISServer wheels, conformance harness) needed
       # release artifacts; cargo refingerprinted on the wrong profile
       # and recompiled the substrate anyway → 7.5 GB downloaded for ~
-      # nothing. Move the save to `pyo3-wheel linux-x86_64` (release
-      # profile, ~1 GB) — same canonical key, useful blob.
+      # nothing. Move the save to a release-profile desktop build
+      # (~1 GB) — same canonical key, useful blob.
 
   # ─── network gauntlet — the adversarial-wire + on-wire suite ────────
   # CIRISEdge#932/#414/#426: the transport apply / attribution / fragment path
@@ -231,8 +242,8 @@ jobs:
   # convergence) was ungated. This job runs it on every push/PR, plus the on-wire
   # integration suite (fragmentation/reassembly, the wire proptest, reticulum
   # loopback + AV-42, multi-tier relay byte-identity, leviculum interface
-  # diversity, reachability, route table). Non-pyo3 (transport-reticulum) so it is
-  # a distinct, leaner lane from pyo3-full's `--tests`.
+  # diversity, reachability, route table). transport-reticulum only, so it is
+  # a distinct, leaner lane from `full`'s `--tests`.
   network-gauntlet:
     name: network gauntlet (DST fault-soak + on-wire)
     runs-on: ubuntu-latest
@@ -365,14 +376,15 @@ jobs:
         run: cargo test --lib --features test-anchor
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
-  # No pyo3 feature here per persist's matrix precedent — the abi3 wheel
-  # build for darwin runs via the pyo3-wheel matrix entry below.
+  # No pyo3 feature here per persist's matrix precedent — the darwin
+  # release build (pyo3 included, the shape CIRISServer's macOS wheel
+  # compiles) runs via the `desktop-release-build` matrix entry below.
   darwin-aarch64-test:
     name: darwin-aarch64 (no pyo3)
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: off PR (cut runners)
     runs-on: macos-15
     # CIRISEdge#229 — restore only; canonical macos-aarch64 save lives
-    # on `pyo3-wheel` `darwin-aarch64` (release-profile target/).
+    # on `desktop-release-build` `darwin-aarch64` (release-profile target/).
     # `packages: write` not needed here.
     steps:
       - uses: actions/checkout@v4
@@ -429,7 +441,7 @@ jobs:
           command: cargo test --no-run --features "transport-http transport-reticulum"
       - name: cargo test (transport-http + transport-reticulum)
         # transport-reticulum on darwin too — Leviculum's macOS path is
-        # load-bearing (edge ships darwin wheels; the teranos fork base
+        # load-bearing (CIRISServer ships darwin wheels with edge inside; the teranos fork base
         # exists for macOS compat). CIRISEdge#14.
         #
         # v7.4.2 — same retry wrapper as the linux-x86_64-test matrix
@@ -446,7 +458,7 @@ jobs:
           shell: bash
           command: cargo test --features "transport-http transport-reticulum"
       # CIRISEdge#229 — restore only on this lane. The canonical
-      # macos-aarch64 save site is the `pyo3-wheel` `darwin-aarch64`
+      # macos-aarch64 save site is the `desktop-release-build` `darwin-aarch64`
       # matrix entry (release-profile target/, matches what downstream
       # consumers build against). Saving here would write a debug-
       # profile target/ blob over it (same canonical key, second-
@@ -456,43 +468,26 @@ jobs:
 
   # ─── android-ndk: per-ABI mobile cross-compile (CIRISEdge#17) ───────
   #
-  # Pattern lifted verbatim from CIRISPersist v2.0.7+ `android-ndk`
-  # (CIRISPersist#96–99 closure). Each matrix entry builds BOTH:
+  # Pattern lifted from CIRISPersist v2.0.7+ `android-ndk`
+  # (CIRISPersist#96–99 closure). Each matrix entry builds
+  # `libciris_edge.so` (no PyO3) for native Android consumers (UniFFI /
+  # JNI; the Kotlin bindings ride `kotlin-bindings.tar.gz`). Built with
+  # `transport-reticulum` only — Reticulum is the canonical cohabitation
+  # wire per MISSION §1.4. NO `transport-http` on mobile — HTTP is the
+  # documented cloud fallback.
   #
-  #   1. `libciris_edge.so` (plain, no PyO3) — for native Android
-  #      consumers (e.g. Rust-only Android apps invoking edge via JNI
-  #      / UniFFI). Built with `transport-reticulum` only — Reticulum
-  #      is the canonical cohabitation wire per MISSION §1.4 and the
-  #      CIRISPersist#85 cohabitation EPIC. NO `transport-http` on
-  #      mobile — HTTP is the documented cloud fallback.
+  # 45.x LTS — the Chaquopy PyO3 variant (`libciris_edge_pyo3.so`, the
+  # libpython3.10 stub + DT_NEEDED dance, the `android-wheels.tar.gz`
+  # asset) is GONE: edge no longer ships Python, and the last release
+  # carrying Chaquopy wheels is v45.1.9. Python on Android rides
+  # CIRISServer's one wheel. The lessons that lane encoded live in git
+  # history (v45.1.9 ci.yml) and CIRISPersist#96–99 if it is ever needed.
   #
-  #   2. `libciris_edge_pyo3.so` (Chaquopy abi3) — for the Python
-  #      agent's cohabitation case: agent runs on Chaquopy and imports
-  #      `ciris_edge` from a Chaquopy wheel. Requires the libpython3.10
-  #      stub + DT_NEEDED dance per CIRISPersist#98 (without it,
-  #      Chaquopy's RTLD_LOCAL libpython load leaves the extension
-  #      symbols dangling at import time with `cannot locate symbol
-  #      _Py_IncRef`).
-  #
-  # Hard-won lessons (CIRISPersist#96–99 verbatim):
-  #
-  #   * `PYO3_CONFIG_FILE` (not `PYO3_CROSS=1`) — PyO3 probes the host
-  #     Python under PYO3_CROSS, which fails on Android targets.
-  #     CONFIG_FILE bypasses all host detection.
-  #   * `abi3=true` + wheel tag `cp310-abi3-android_24_{abi}` — NOT
-  #     `cp310-cp310`. Persist v2.0.5's cp310 wheels ref'd unstable
-  #     ABI symbols Chaquopy doesn't export (`_Py_IncRef` etc.).
-  #   * `suppress_build_script_link_lines=true` — belt-and-suspenders
-  #     to ensure PyO3's build script doesn't emit
-  #     `cargo:rustc-link-lib=python3.10` (which fails since the NDK
-  #     sysroot has no libpython).
-  #   * `pointer_width` = 32 for armeabi-v7a (ARM32), 64 for arm64-v8a
-  #     and x86_64.
-  #   * OpenSSL no-sm4 for x86_64-android — OpenSSL 3.6.x's
-  #     `sm4-x86_64.S` uses SM4-NI ISA that NDK r26b's clang
-  #     assembler doesn't grok. aarch64 + armeabi-v7a unaffected.
+  # `pointer_width` = 32 for armeabi-v7a (ARM32), 64 for arm64-v8a and
+  # x86_64 — it fed the PyO3 config and is kept in the matrix only as
+  # documentation of the ABI.
   android-ndk:
-    name: android ${{ matrix.abi }} (${{ matrix.variant }})
+    name: android ${{ matrix.abi }}
     runs-on: ubuntu-latest
     # CIRISEdge#229 — save edge-self-warm on main (no persist/verify
     # upstream for android-* PLATs; edge owns its own warm cycle).
@@ -501,18 +496,18 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
-      # CI-time split (v13.1.x): `variant` axis parallelizes the two
-      # sequential cargo-ndk builds (plain ~5.4m + PyO3 ~6.8m serial =
-      # 12m+ per ABI job). 3 jobs → 6, each doing ONE build; the ABI
-      # legs drop from ~14-16m to ~7-8m wall. The include entries match
-      # on `abi` and enrich every {abi, variant} combination.
-      # CIRISEdge (cut runners): PR + main build ONE pyo3 subset-canary (arm64-v8a
-      # pyo3 — the #618-class cfg-subset guard, the load-bearing mobile check); the
-      # full 3-ABI × {plain,pyo3} matrix builds only on tags where the android
-      # release wheels are cut (6 android jobs → 1 per PR/merge). Whole-`matrix:`
-      # fromJSON — the documented dynamic-matrix form (job-level `if:` can't see
-      # `matrix`, CIRISPersist#638).
-      matrix: ${{ fromJSON( startsWith(github.ref, 'refs/tags/v') && '{"include":[{"abi":"arm64-v8a","variant":"plain","target":"aarch64-linux-android","clang_prefix":"aarch64-linux-android24","pointer_width":64},{"abi":"arm64-v8a","variant":"pyo3","target":"aarch64-linux-android","clang_prefix":"aarch64-linux-android24","pointer_width":64},{"abi":"x86_64","variant":"plain","target":"x86_64-linux-android","clang_prefix":"x86_64-linux-android24","pointer_width":64},{"abi":"x86_64","variant":"pyo3","target":"x86_64-linux-android","clang_prefix":"x86_64-linux-android24","pointer_width":64},{"abi":"armeabi-v7a","variant":"plain","target":"armv7-linux-androideabi","clang_prefix":"armv7a-linux-androideabi24","pointer_width":32},{"abi":"armeabi-v7a","variant":"pyo3","target":"armv7-linux-androideabi","clang_prefix":"armv7a-linux-androideabi24","pointer_width":32}]}' || '{"include":[{"abi":"arm64-v8a","variant":"pyo3","target":"aarch64-linux-android","clang_prefix":"aarch64-linux-android24","pointer_width":64}]}' ) }}
+      # CIRISEdge (cut runners): PR + main build ONE arm64-v8a canary (the
+      # #618-class cfg-subset guard: `transport-reticulum` alone, cross-compiled
+      # for Android); the full 3-ABI matrix builds only on tags where the
+      # android release tarball is cut. Whole-`matrix:` fromJSON — the
+      # documented dynamic-matrix form (job-level `if:` can't see `matrix`,
+      # CIRISPersist#638).
+      #
+      # 45.x LTS — the `{plain,pyo3}` variant axis is gone with the Chaquopy
+      # wheels; the PR/main canary, which was the arm64 PYO3 cell, is now the
+      # arm64 plain cell (what ships). The pyo3-sqlite cfg subset that canary
+      # also guarded is kept compiling by the `lint` job's pyo3-sqlite check.
+      matrix: ${{ fromJSON( startsWith(github.ref, 'refs/tags/v') && '{"include":[{"abi":"arm64-v8a","target":"aarch64-linux-android","clang_prefix":"aarch64-linux-android24","pointer_width":64},{"abi":"x86_64","target":"x86_64-linux-android","clang_prefix":"x86_64-linux-android24","pointer_width":64},{"abi":"armeabi-v7a","target":"armv7-linux-androideabi","clang_prefix":"armv7a-linux-androideabi24","pointer_width":32}]}' || '{"include":[{"abi":"arm64-v8a","target":"aarch64-linux-android","clang_prefix":"aarch64-linux-android24","pointer_width":64}]}' ) }}
     env:
       # CIRISEdge#216 — sccache over the GHA cache backend (the
       # CIRISServer bench.yml pattern). Compilation-unit caching that
@@ -522,15 +517,8 @@ jobs:
       RUSTC_WRAPPER: sccache
       # Edge's mobile feature set. Reticulum is the canonical cohabitation
       # wire (MISSION §1.4); HTTP is the cloud fallback, intentionally NOT
-      # on mobile. The plain `.so` build (first cargo-ndk invocation below)
-      # uses only `transport-reticulum`; the PyO3 build (second invocation)
-      # adds `pyo3 extension-module` on top.
+      # on mobile.
       MOBILE_BASE_FEATURES: "transport-reticulum"
-      # v8.3.0 (CIRISEdge#246 / CIRISPersist#339, v11.9.1) — pyo3-sqlite drops
-      # the postgres→openssl chain AND (via #339's refinery hygiene) the
-      # sqlite→refinery→tokio-postgres→openssl transitive, so the Android
-      # vendored-OpenSSL build is gone. Mirrors the Windows cutover (#247).
-      MOBILE_PYO3_FEATURES: "transport-reticulum pyo3-sqlite extension-module"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -538,17 +526,17 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Set up sccache (compiler cache over GHA)
         uses: mozilla-actions/sccache-action@v0.0.9
-      # The pyo3 variant links against the libpython stub with different
-      # RUSTFLAGS, so its target dir is NOT interchangeable with plain's —
-      # each variant owns its cache key (plain keeps the pre-split key so
-      # existing warm layers still hit).
+      # The cache key is the pre-split plain key (`android-<abi>`), so the
+      # warm layers the plain cells saved on tags keep hitting. The
+      # `android-<abi>-pyo3` keys are no longer saved by anyone and are
+      # no longer restored.
       - uses: ./.github/actions/ciriscache
         id: cachekey
         with:
-          plat: android-${{ matrix.abi }}${{ matrix.variant == 'pyo3' && '-pyo3' || '' }}
+          plat: android-${{ matrix.abi }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: android-${{ matrix.abi }}-${{ matrix.variant }}
+          key: android-${{ matrix.abi }}-plain
         continue-on-error: true
       - name: setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -564,21 +552,8 @@ jobs:
           VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # x86_64 only: OpenSSL 3.6.x SM4-NI workaround. AV-NN: Chaquopy
-      # build path is one of the two cohabitation surfaces; an
-      # assembler failure here is a hard release-blocker.
-      # v8.3.0 (CIRISEdge#246 / CIRISPersist#339) — the x86_64-android
-      # pre-build-OpenSSL-from-source step + its env export are GONE. The
-      # PyO3 lane builds `pyo3-sqlite`, and persist v11.9.1 gated the
-      # sqlite→refinery→tokio-postgres→openssl transitive behind `postgres`,
-      # so there is no openssl-sys in the Android dep tree to satisfy. The
-      # SM4-NI workaround (Configure `no-sm4`) is moot with no openssl build.
-
-      # Plain .so (no PyO3) — the `plain` variant job. Native Android
-      # consumers (Rust-only, UniFFI/JNI) take this artifact; the
-      # Chaquopy variant job is for the Python-agent cohabitation case.
-      - name: cargo ndk build (${{ matrix.abi }} — plain, no PyO3)
-        if: matrix.variant == 'plain'
+      # Native Android consumers (UniFFI/JNI) take this artifact.
+      - name: cargo ndk build (${{ matrix.abi }} — no PyO3)
         # Cross-process retry via nick-fields/retry@v3 — catches
         # transient `index.crates.io` resolution flakes the in-process
         # CARGO_NET_RETRY=10 can't (e.g. when cargo gives up but a
@@ -600,88 +575,11 @@ jobs:
           command: >-
             cargo ndk -t ${{ matrix.abi }} --platform 24 build --release
             --features "$MOBILE_BASE_FEATURES"
-      - name: save plain .so
-        if: matrix.variant == 'plain'
+      - name: save .so
         run: |
           mkdir -p dist/${{ matrix.abi }}
           cp "target/${{ matrix.target }}/release/libciris_edge.so" \
              "dist/${{ matrix.abi }}/libciris_edge.so"
-
-      # PyO3 Chaquopy abi3 .so — with explicit libpython3.10 DT_NEEDED
-      # (CIRISPersist#98). Chaquopy loads libpython with RTLD_LOCAL so
-      # extensions must DT_NEED it explicitly. We build a stub
-      # libpython3.10.so for the linker to resolve against and add
-      # `-lpython3.10` via RUSTFLAGS. Chaquopy's real libpython
-      # provides the symbols at runtime.
-      - name: create PyO3 config + libpython stub
-        if: matrix.variant == 'pyo3'
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: |
-          CFG="${RUNNER_TEMP}/pyo3-android.config"
-          cat > "${CFG}" <<CFGEOF
-          implementation=CPython
-          version=3.10
-          shared=false
-          abi3=true
-          lib_name=python3.10
-          lib_dir=
-          executable=
-          pointer_width=${{ matrix.pointer_width }}
-          build_flags=
-          suppress_build_script_link_lines=true
-          CFGEOF
-          sed -i 's/^[[:space:]]*//' "${CFG}"
-          echo "PYO3_CONFIG_FILE=${CFG}" >> "$GITHUB_ENV"
-
-          STUB_DIR="${RUNNER_TEMP}/python-stub"
-          mkdir -p "${STUB_DIR}"
-          TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
-          echo 'void __pystub(void){}' | \
-            "${TOOLCHAIN}/bin/${{ matrix.clang_prefix }}-clang" \
-              -shared -nostdlib -Wl,-soname,libpython3.10.so \
-              -o "${STUB_DIR}/libpython3.10.so" -x c -
-          echo "✓ PyO3 config (pointer_width=${{ matrix.pointer_width }}):"
-          cat "${CFG}"
-          echo "✓ stub libpython3.10.so:"
-          file "${STUB_DIR}/libpython3.10.so"
-
-      - name: cargo ndk build (${{ matrix.abi }} — PyO3 Chaquopy abi3)
-        if: matrix.variant == 'pyo3'
-        # Cross-process retry — see plain-build step for rationale.
-        uses: nick-fields/retry@v3
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          RUSTFLAGS: "-L ${{ runner.temp }}/python-stub -C link-arg=-Wl,--no-as-needed -C link-arg=-lpython3.10"
-        with:
-          timeout_minutes: 20
-          max_attempts: 3
-        # --platform 24: same getifaddrs floor as the plain build above. The
-        # PyO3 cdylib's permissive stub-link flags could let the undefined
-        # symbol through to a RUNTIME dlopen failure on <24 devices — pin the
-        # platform so it's resolved at build time on both variants.
-          command: >-
-            cargo ndk -t ${{ matrix.abi }} --platform 24 build --release --lib
-            --features "$MOBILE_PYO3_FEATURES"
-
-      - name: verify DT_NEEDED includes libpython3.10.so
-        if: matrix.variant == 'pyo3'
-        # AV-NN: the whole point of the stub-link dance is the
-        # DT_NEEDED entry. If this assertion fails the wheel will
-        # silently dlopen on Chaquopy and crash on first import —
-        # catch at build time, not runtime.
-        run: |
-          readelf -d "target/${{ matrix.target }}/release/libciris_edge.so" \
-            | grep -q 'libpython3.10.so' \
-            && echo "✓ DT_NEEDED: libpython3.10.so present" \
-            || { echo "::error::libpython3.10.so missing from DT_NEEDED"; exit 1; }
-
-      - name: collect PyO3 .so (Chaquopy wheels)
-        if: matrix.variant == 'pyo3'
-        run: |
-          mkdir -p dist/${{ matrix.abi }}
-          cp "target/${{ matrix.target }}/release/libciris_edge.so" \
-             "dist/${{ matrix.abi }}/libciris_edge_pyo3.so"
 
       - name: sccache stats
         if: always()
@@ -695,12 +593,12 @@ jobs:
           if [ -x "$STRIP" ]; then
             for so in dist/${{ matrix.abi }}/*.so; do "$STRIP" "$so"; done
           fi
-          echo "=== ${{ matrix.abi }} (${{ matrix.variant }}) ==="
+          echo "=== ${{ matrix.abi }} ==="
           ls -la dist/${{ matrix.abi }}/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ciris-edge-android-${{ matrix.abi }}-${{ matrix.variant }}
+          name: ciris-edge-android-${{ matrix.abi }}
           path: dist/${{ matrix.abi }}/
       # CIRISEdge#229 — save edge-self-warm on main, per-ABI.
       - id: cache-save-android
@@ -724,13 +622,11 @@ jobs:
 
   # ─── android-package: collect per-ABI artifacts (CIRISEdge#17) ──────
   #
-  # Pattern lifted verbatim from CIRISPersist v2.0.7+ `android-package`.
-  # Two output tarballs:
-  #
-  #   1. `ciris-edge-v{VERSION}-android.tar.gz` — raw `.so` per ABI for
-  #      native Android consumers.
-  #   2. `ciris-edge-v{VERSION}-android-wheels.tar.gz` — three Chaquopy
-  #      abi3 wheels (one per ABI), tagged `cp310-abi3-android_24_{abi}`.
+  # Pattern lifted from CIRISPersist v2.0.7+ `android-package`. One output
+  # tarball: `ciris-edge-v{VERSION}-android.tar.gz` — raw `.so` per ABI for
+  # native Android consumers. (The second tarball,
+  # `ciris-edge-v{VERSION}-android-wheels.tar.gz` of Chaquopy abi3 wheels,
+  # was last published at v45.1.9.)
   android-package:
     name: package android artifacts
     if: startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: release-only, off PR+merge (cut runners)
@@ -749,105 +645,18 @@ jobs:
           pattern: ciris-edge-android-*
           path: artifacts/
       - name: package raw android .so tarball
-        # Split-matrix artifact names (plain/pyo3 variants build in
-        # parallel jobs): the raw .so tarball takes the `-plain` half.
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           mkdir -p dist/android/arm64-v8a dist/android/x86_64 dist/android/armeabi-v7a
-          cp artifacts/ciris-edge-android-arm64-v8a-plain/libciris_edge.so    dist/android/arm64-v8a/
-          cp artifacts/ciris-edge-android-x86_64-plain/libciris_edge.so       dist/android/x86_64/
-          cp artifacts/ciris-edge-android-armeabi-v7a-plain/libciris_edge.so  dist/android/armeabi-v7a/
+          cp artifacts/ciris-edge-android-arm64-v8a/libciris_edge.so    dist/android/arm64-v8a/
+          cp artifacts/ciris-edge-android-x86_64/libciris_edge.so       dist/android/x86_64/
+          cp artifacts/ciris-edge-android-armeabi-v7a/libciris_edge.so  dist/android/armeabi-v7a/
           tar -czf "dist/ciris-edge-v${VERSION}-android.tar.gz" -C dist android
           echo "✓ ciris-edge-v${VERSION}-android.tar.gz"
-      - name: package Chaquopy abi3 wheels
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-
-          build_wheel() {
-            local ABI="$1"         # e.g. arm64_v8a (underscore for wheel tag)
-            local ABI_DIR="$2"     # e.g. arm64-v8a (hyphen for artifact dir)
-
-            local WHEEL_TAG="cp310-abi3-android_24_${ABI}"
-            local WHEEL_NAME="ciris_edge-${VERSION}-${WHEEL_TAG}.whl"
-            local WORK="dist/wheel-work/${ABI}"
-
-            mkdir -p "${WORK}/ciris_edge" "${WORK}/ciris_edge-${VERSION}.dist-info"
-
-            cp "artifacts/ciris-edge-android-${ABI_DIR}-pyo3/libciris_edge_pyo3.so" \
-               "${WORK}/ciris_edge/ciris_edge.so"
-            # CIRISEdge#824 — the module must actually be IN the .so: a
-            # `pyo3-sqlite` build once compiled no binding code at all, and
-            # `import ciris_edge` failed on every Android device.
-            grep -a -q PyInit_ciris_edge "${WORK}/ciris_edge/ciris_edge.so" \
-              || { echo "::error::${ABI}: ciris_edge.so exports no PyInit_ciris_edge (#824)"; exit 1; }
-            cp python/ciris_edge/__init__.py "${WORK}/ciris_edge/"
-            # .pyi stubs are optional — copy only if present (edge has
-            # not shipped them yet; persist's wheel does). Resistant
-            # to future addition without a workflow tweak.
-            if [ -f python/ciris_edge/ciris_edge.pyi ]; then
-              cp python/ciris_edge/ciris_edge.pyi "${WORK}/ciris_edge/"
-            fi
-
-            cat > "${WORK}/ciris_edge-${VERSION}.dist-info/METADATA" <<METAEOF
-          Metadata-Version: 2.1
-          Name: ciris-edge
-          Version: ${VERSION}
-          Summary: Reticulum-native federation transport for the CIRIS stack
-          License: AGPL-3.0-or-later
-          Requires-Python: >=3.10
-          METAEOF
-
-            cat > "${WORK}/ciris_edge-${VERSION}.dist-info/WHEEL" <<WHEELEOF
-          Wheel-Version: 1.0
-          Generator: ciris-edge-ci
-          Root-Is-Purelib: false
-          Tag: ${WHEEL_TAG}
-          WHEELEOF
-
-            echo "ciris_edge" > "${WORK}/ciris_edge-${VERSION}.dist-info/top_level.txt"
-
-            cd "${WORK}"
-            local RECORD="ciris_edge-${VERSION}.dist-info/RECORD"
-            : > "${RECORD}"
-            find ciris_edge ciris_edge-${VERSION}.dist-info \
-              -type f ! -name RECORD | sort | while read -r f; do
-              local HASH
-              HASH=$(python3 -c "
-          import hashlib, base64
-          with open('${f}', 'rb') as fh:
-              d = hashlib.sha256(fh.read()).digest()
-          print('sha256=' + base64.urlsafe_b64encode(d).rstrip(b'=').decode())
-          ")
-              local SIZE
-              SIZE=$(stat -c%s "${f}")
-              echo "${f},${HASH},${SIZE}" >> "${RECORD}"
-            done
-            echo "${RECORD},," >> "${RECORD}"
-            cd - > /dev/null
-
-            (cd "${WORK}" && zip -r "../../${WHEEL_NAME}" ciris_edge ciris_edge-${VERSION}.dist-info)
-            echo "✓ ${WHEEL_NAME} ($(stat -c%s "dist/${WHEEL_NAME}") bytes)"
-          }
-
-          build_wheel arm64_v8a    arm64-v8a
-          build_wheel x86_64      x86_64
-          build_wheel armeabi_v7a armeabi-v7a
-
-          tar -czf "dist/ciris-edge-v${VERSION}-android-wheels.tar.gz" \
-            -C dist \
-            "ciris_edge-${VERSION}-cp310-abi3-android_24_arm64_v8a.whl" \
-            "ciris_edge-${VERSION}-cp310-abi3-android_24_x86_64.whl" \
-            "ciris_edge-${VERSION}-cp310-abi3-android_24_armeabi_v7a.whl"
-
-          echo "✓ ciris-edge-v${VERSION}-android-wheels.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: ciris-edge-android
           path: dist/ciris-edge-v*-android.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ciris-edge-android-wheels
-          path: dist/ciris-edge-v*-android-wheels.tar.gz
 
   # ─── build-ios: device + simulator (CIRISEdge#17) ───────────────────
   #
@@ -865,6 +674,11 @@ jobs:
   #   * If a Python-on-iOS consumer materializes, copy persist's
   #     `ios-build` job verbatim — that lane is documented + green.
   #     Until then, the simpler verify pattern is the right shape.
+  #     (Edge DID carry that lane as `ios-pyo3`, shipping
+  #     `ciris-edge-v{VERSION}-ios.tar.gz` of BeeWare `.abi3.so` files,
+  #     through v45.1.9. The 45.x LTS stops shipping Python and the lane
+  #     is gone; this job inherited its CIRISCache save and its PR/main
+  #     simulator canary.)
   #
   # Verify's RUSTFLAGS install_name bake — DO NOT replace with
   # `install_name_tool` post-link. install_name_tool rewrites the
@@ -874,17 +688,23 @@ jobs:
   # stable.
   build-ios:
     name: ios ${{ matrix.target }}
-    if: startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: release-only, off PR+merge (cut runners)
     runs-on: macos-latest
-    # CIRISEdge#229 — restore only; the canonical ios save happens on
-    # the ios-pyo3 lane (PyO3 + extension-module on top is the densest
-    # iOS build, subsumes this plain dylib lane's target/).
+    # CIRISEdge#229 — the canonical CIRISCache save for ios-aarch64 /
+    # ios-aarch64-sim (main + tags). It lived on the `ios-pyo3` lane until
+    # that lane was removed; without a save here the restore below would
+    # read a layer nobody writes.
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { target: aarch64-apple-ios,     sdk: iphoneos,         plat: ios-aarch64     }
-          - { target: aarch64-apple-ios-sim, sdk: iphonesimulator,  plat: ios-aarch64-sim }
+      # CIRISEdge (cut runners): PR + main build ONE simulator canary (the iOS
+      # cfg-subset check; it was the `ios-pyo3` sim cell before the 45.x LTS
+      # dropped Python); tags build device + simulator for the XCFramework.
+      # Whole-`matrix:` fromJSON — the documented dynamic-matrix form
+      # (job-level `if:` can't see `matrix`, CIRISPersist#638). `xcframework`
+      # stays tag-only, so PR/main never need the device slice.
+      matrix: ${{ fromJSON( startsWith(github.ref, 'refs/tags/v') && '{"include":[{"target":"aarch64-apple-ios","sdk":"iphoneos","plat":"ios-aarch64"},{"target":"aarch64-apple-ios-sim","sdk":"iphonesimulator","plat":"ios-aarch64-sim"}]}' || '{"include":[{"target":"aarch64-apple-ios-sim","sdk":"iphonesimulator","plat":"ios-aarch64-sim"}]}' ) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -959,6 +779,26 @@ jobs:
             target/${{ matrix.target }}/release/libciris_edge.dylib
             target/${{ matrix.target }}/release/libciris_edge.a
           if-no-files-found: error
+      # CIRISEdge#229 — save edge-self-warm per iOS PLAT on main + tags (moved
+      # here from the removed `ios-pyo3` lane).
+      - id: cache-save-ios
+        uses: CIRISAI/CIRISCache/save@v1.1
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        continue-on-error: true  # a cache SAVE must never fail a build or a release (v34.3.0: setup-oras HTTP 500 skipped the upload)
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # CIRISPersist#1022 — a tag run's blob is what downstream exact-pins
+          # restore, so a non-publish there is an ::error:: (still under the
+          # continue-on-error above: loud, never release-gating).
+          strict: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
+      - name: report unpublished cache save (main)
+        if: github.ref == 'refs/heads/main' && steps.cache-save-ios.outputs.published != 'true'
+        env:
+          REASON: ${{ steps.cache-save-ios.outputs.reason || 'save step did not reach the push (e.g. setup-oras failed)' }}
+        shell: bash
+        run: |
+          echo "::warning::CIRISCache save not published: ${REASON}"
 
   # ─── xcframework: CIRISEdge.xcframework (CIRISEdge#17) ──────────────
   #
@@ -1030,314 +870,6 @@ jobs:
           path: ciris-edge-v*-xcframework.tar.gz
           if-no-files-found: error
 
-  # ─── ios-pyo3: iOS Python-on-iOS cohabitation (CIRISEdge#17) ────────
-  #
-  # Pattern lifted verbatim from CIRISPersist v2.0.4+ `ios-build`
-  # (CIRISPersist .github/workflows/ci.yml job `ios-build`). This is
-  # the iOS parallel of `android-ndk`'s Chaquopy lane: cohabiting
-  # Python-on-iOS hosts (BeeWare Briefcase) need to `import ciris_edge`
-  # exactly the same way Chaquopy does on Android. Unblocks
-  # CIRISAgent v2.9.4 release.
-  #
-  # Coexists with `build-ios` + `xcframework` (those serve native
-  # Swift consumers via XCFramework). The two iOS lanes are
-  # orthogonal — one ships a Python extension `.abi3.so`, the other
-  # ships a Swift-importable framework.
-  #
-  # Hard-won lessons from persist's v2.0.4 closure (verbatim):
-  #
-  #   * `cargo build` directly, NOT `maturin build` — maturin 1.13's
-  #     platform check rejects darwin→iOS cross-compile.
-  #   * `PYO3_CROSS=1` + `PYO3_CROSS_LIB_DIR` pointing at a staged
-  #     dir containing both libpython3.10.dylib AND the matching
-  #     `_sysconfigdata__ios_*.py`. PyO3 PR #5605 requires libpython
-  #     linking on iOS (unlike Android where DT_NEEDED + stub does it).
-  #   * `Python-Apple-support` is BeeWare's prebuilt iOS Python.
-  #     Version pin: `3.10-b13` — matches persist's `PYTHON_IOS_VER`
-  #     `PYTHON_IOS_BUILD` exactly (CIRISPersist Cargo.toml's
-  #     [target.'cfg(target_os = "ios")'] table is built/tested
-  #     against this version, and edge's `pyo3` feature pulls
-  #     `ciris-persist/pyo3` which inherits persist's iOS dep table).
-  #     Cohabitation depends on substrate version-match.
-  #   * `install_name_tool -id @rpath/...` — cargo bakes the runner's
-  #     absolute path into the dylib's install name. Briefcase needs
-  #     an @rpath-relative name. Persist takes a binary-hash hit here
-  #     (the install_name_tool mutation shifts Mach-O headers), but
-  #     accepts it because Python wheel surfaces aren't subject to
-  #     the binary-hash-integrity invariant the way verify's native
-  #     framework is. Same trade-off applies to edge's iOS PyO3 path.
-  #     (Contrast: `build-ios` above bakes install_name at link-time
-  #     via RUSTFLAGS — that path IS hash-integrity-sensitive.)
-  #
-  # Features: full `pyo3 extension-module` set, like persist. Edge's
-  # `pyo3` feature already implies `transport-reticulum` (via the
-  # v0.5.1 lonely-pyo3 guard in Cargo.toml), so the Reticulum
-  # cohabitation wire is on. No `transport-http` (mobile = cloud
-  # fallback off, same as Android).
-  #
-  # Why matrix where persist uses sequential steps: edge's split
-  # mirrors the `android-ndk` → `android-package` pattern already in
-  # this file. Persist runs both targets in one job because its
-  # downstream `ios-build` is the terminal artifact-producer; edge
-  # splits build vs package so a future iOS-only refactor (e.g.
-  # adding iOS-sim-x86_64 for Intel Macs) drops in cleanly.
-  ios-pyo3:
-    name: ios PyO3 abi3 (${{ matrix.target }})
-    runs-on: macos-15
-    # CIRISEdge#229 — densest iOS canonical save (PyO3 +
-    # extension-module on top of build-ios's plain dylib). PLAT
-    # tokens `ios-aarch64` / `ios-aarch64-sim` match persist's
-    # ios-build save and the CIRISServer#99 canonical scheme.
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      # CIRISEdge (cut runners): PR + main build ONE pyo3-sim canary (the ios
-      # cfg-subset/cross-link guard); both targets build only on tags where the
-      # xcframework/wheels are cut. Whole-`matrix:` fromJSON — the documented
-      # dynamic-matrix form (job-level `if:` can't see `matrix`, CIRISPersist#638).
-      matrix: ${{ fromJSON( startsWith(github.ref, 'refs/tags/v') && '{"include":[{"target":"aarch64-apple-ios","dir":"ios-device","sysconfig":"_sysconfigdata__ios_arm64-iphoneos.py","xcfw_dir":"ios-arm64","plat":"ios-aarch64"},{"target":"aarch64-apple-ios-sim","dir":"ios-simulator","sysconfig":"_sysconfigdata__ios_arm64-iphonesimulator.py","xcfw_dir":"ios-arm64_x86_64-simulator","plat":"ios-aarch64-sim"}]}' || '{"include":[{"target":"aarch64-apple-ios-sim","dir":"ios-simulator","sysconfig":"_sysconfigdata__ios_arm64-iphonesimulator.py","xcfw_dir":"ios-arm64_x86_64-simulator","plat":"ios-aarch64-sim"}]}' ) }}
-    env:
-      # Persist's pin verbatim — see job docblock above for rationale.
-      PYTHON_IOS_VER: "3.10"
-      PYTHON_IOS_BUILD: "b13"
-      # Edge's mobile-PyO3 feature set. `pyo3` implies
-      # `transport-reticulum` (Cargo.toml v0.5.1 guard) so explicitly
-      # naming it would be redundant — but we name it anyway for the
-      # same self-documenting reason the wheel job does.
-      # v8.3.0 (CIRISEdge#246) — pyo3-sqlite drops openssl on iOS too (the
-      # target-table openssl is `optional` behind postgres as of persist
-      # v11.9.1 / #339); no vendored-openssl cross-compile on the iOS lane.
-      IOS_PYO3_FEATURES: "transport-reticulum pyo3-sqlite extension-module"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.0
-        with:
-          targets: ${{ matrix.target }}
-      - uses: ./.github/actions/ciriscache
-        id: cachekey
-        with:
-          plat: ${{ matrix.plat }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-          key: ios-pyo3-${{ matrix.target }}
-        continue-on-error: true
-      - name: Repair toolchain if rustup-init shadow (cache-poison heal)
-        # Same heal as `build-ios` + `darwin-aarch64-test`. macOS
-        # runners exhibit the rustup-init shim poison-restore under
-        # Swatinem/rust-cache; CIRISVerify v2.1.4+ active-heal pattern.
-        shell: bash
-        run: |
-          if cargo build --help 2>&1 | grep -q "rustup-init"; then
-            echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
-            rm -rf "$HOME/.cargo/bin"
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
-            export PATH="$HOME/.cargo/bin:$PATH"
-          fi
-          rustup default stable
-          cargo --version
-          cargo build --help >/dev/null
-      - uses: actions/setup-python@v5
-        with:
-          # Persist uses 3.13 here for the host runner Python (the
-          # target Python comes from Python-Apple-support); we match
-          # exactly to keep the cohabitation substrate aligned.
-          python-version: "3.13"
-      - name: extract version from Cargo.toml
-        id: version
-        run: |
-          VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - name: download Python-Apple-support (iOS)
-        id: python-ios
-        # Stage libpython + matching _sysconfigdata into one dir for
-        # PYO3_CROSS_LIB_DIR. Persist's exact recipe (CIRISPersist
-        # ci.yml lines 252-281), restricted to this matrix entry's
-        # target — the matrix split means each runner only stages
-        # ONE target's libpython, where persist's single-job version
-        # staged both. Halves the per-runner work + makes
-        # parallelism trivial.
-        run: |
-          SUPPORT_URL="https://github.com/beeware/Python-Apple-support/releases/download/${PYTHON_IOS_VER}-${PYTHON_IOS_BUILD}/Python-${PYTHON_IOS_VER}-iOS-support.${PYTHON_IOS_BUILD}.tar.gz"
-          mkdir -p "${RUNNER_TEMP}/python-ios"
-          curl -sL "${SUPPORT_URL}" -o "${RUNNER_TEMP}/python-ios-support.tar.gz"
-          tar xzf "${RUNNER_TEMP}/python-ios-support.tar.gz" -C "${RUNNER_TEMP}/python-ios"
-
-          XCFW="${RUNNER_TEMP}/python-ios/Python.xcframework"
-
-          # PyO3 cross-compilation needs libpython + _sysconfigdata
-          # in one directory. Stage them from the xcframework subdir
-          # matching this matrix entry's target.
-          STAGE_DIR="${RUNNER_TEMP}/pyo3-ios-stage"
-          mkdir -p "$STAGE_DIR"
-          cp "$XCFW/${{ matrix.xcfw_dir }}/Python.framework/Python" \
-             "$STAGE_DIR/libpython${PYTHON_IOS_VER}.dylib"
-          cp "$XCFW/${{ matrix.xcfw_dir }}/lib-arm64/python${PYTHON_IOS_VER}/${{ matrix.sysconfig }}" \
-             "$STAGE_DIR/"
-          echo "lib_dir=${STAGE_DIR}" >> "$GITHUB_OUTPUT"
-
-          echo "✓ Python-Apple-support ${PYTHON_IOS_VER}-${PYTHON_IOS_BUILD} staged for ${{ matrix.target }}"
-          ls -la "$STAGE_DIR/"
-      - name: cargo build (ios PyO3 — ${{ matrix.target }})
-        # Direct `cargo build` — NOT `maturin build`. Maturin 1.13's
-        # platform check rejects darwin→iOS cross-compile; persist
-        # documented this in v2.0.4 and the constraint persists.
-        #
-        # Cross-process retry via nick-fields/retry@v3 — this is the
-        # lane that observably flaked on PR #76 (`heck` not found in
-        # crates.io index on this specific runner; non-sim iOS PyO3
-        # pulled the same dep and succeeded). Per the env-block
-        # rationale: CARGO_NET_RETRY=10 covers in-process retries;
-        # this wrapper covers the case where cargo gives up but a
-        # fresh process succeeds.
-        uses: nick-fields/retry@v3
-        env:
-          PYO3_CROSS: "1"
-          PYO3_CROSS_PYTHON_VERSION: "3.10"
-          PYO3_CROSS_LIB_DIR: ${{ steps.python-ios.outputs.lib_dir }}
-        with:
-          timeout_minutes: 20
-          max_attempts: 3
-          command: >-
-            cargo build --release
-            --target ${{ matrix.target }}
-            --lib
-            --features "$IOS_PYO3_FEATURES"
-      - name: strip + rename + install_name fix
-        # Mach-O rename: libciris_edge.dylib → ciris_edge.abi3.so
-        # (Python extension naming convention). install_name_tool
-        # rewrites the embedded path from /Users/runner/work/... to
-        # @rpath-relative for Briefcase consumption. The hash-integrity
-        # hit is intentional and accepted (see job docblock).
-        run: |
-          mkdir -p "dist/${{ matrix.dir }}"
-          SRC="target/${{ matrix.target }}/release/libciris_edge.dylib"
-          DST="dist/${{ matrix.dir }}/ciris_edge.abi3.so"
-          if [ ! -f "$SRC" ]; then
-            echo "::error::$SRC not found"
-            ls -la "target/${{ matrix.target }}/release/" | grep ciris
-            exit 1
-          fi
-          strip -x "$SRC"
-          # @rpath name matches persist's pattern — Briefcase resolves
-          # @rpath at app-bundle load time via the embedded
-          # Python.framework search.
-          install_name_tool -id \
-            "@rpath/ciris_edge.ciris_edge.framework/ciris_edge.ciris_edge" \
-            "$SRC"
-          cp "$SRC" "$DST"
-          echo "✓ ${{ matrix.dir }}: $(stat -f%z "$DST" 2>/dev/null || stat -c%s "$DST") bytes"
-          # CIRISEdge#824 — the PyO3 module must be in the binary (see the
-          # Android wheel step).
-          grep -a -q PyInit_ciris_edge "$DST" \
-            || { echo "::error::${{ matrix.dir }}: no PyInit_ciris_edge in $DST (#824)"; exit 1; }
-          otool -D "$DST"
-          file "$DST"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ciris-edge-ios-pyo3-${{ matrix.dir }}
-          path: dist/${{ matrix.dir }}/ciris_edge.abi3.so
-          if-no-files-found: error
-      # CIRISEdge#229 — save edge-self-warm on main, per-target.
-      #
-      # RESTORE-ONLY on the macOS lanes (v18.4.1). The save step failed the
-      # v18.4.0 gate AFTER every substantive step passed — build, strip +
-      # install_name fix, and the artifact upload were all green; only this
-      # trailing bookkeeping step reddened the board, which meant a release
-      # gate hung on a cache write. CIRISPersist hit the identical failure on
-      # its `darwin-aarch64` lane 3/3 (v37.1.0, v38.0.0, e119eff) and closed
-      # it the same way in persist v38.2.0/#762: nothing that exists is lost,
-      # because the attempts had warmed nothing. `continue-on-error` rather
-      # than deletion so the lane still reports the write attempt without
-      # gating a release on it; re-enable when the save is resource-bounded.
-      - id: cache-save-ios
-        uses: CIRISAI/CIRISCache/save@v1.1
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-        continue-on-error: true
-        with:
-          key: ${{ steps.cachekey.outputs.key }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # CIRISPersist#1022 — a tag run's blob is what downstream exact-pins
-          # restore, so a non-publish there is an ::error:: (still under the
-          # continue-on-error above: loud, never release-gating).
-          strict: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
-      - name: report unpublished cache save (main)
-        if: github.ref == 'refs/heads/main' && steps.cache-save-ios.outputs.published != 'true'
-        env:
-          REASON: ${{ steps.cache-save-ios.outputs.reason || 'save step did not reach the push (e.g. setup-oras failed)' }}
-        shell: bash
-        run: |
-          echo "::warning::CIRISCache save not published: ${REASON}"
-
-  # ─── ios-pyo3-package: collect device + simulator (CIRISEdge#17) ────
-  #
-  # Persist runs the equivalent of this step inline at the end of its
-  # `ios-build` job (one runner builds both targets sequentially, then
-  # tarballs them). Edge splits into matrix + downstream-package to
-  # mirror the `android-ndk` → `android-package` pattern already in
-  # this file. Output shape matches persist exactly:
-  #
-  #     ciris-edge-v{VERSION}-ios.tar.gz
-  #       ├── ios-device/ciris_edge.abi3.so
-  #       └── ios-simulator/ciris_edge.abi3.so
-  #
-  # This is NOT a Python wheel. Persist deliberately ships the raw
-  # `.abi3.so` files in a tarball, NOT as `cp310-abi3-ios_*` wheels —
-  # because BeeWare Briefcase consumes them via its own `iOS.pth`
-  # mechanism, not via pip install. The user's spec called for a
-  # `cp310-abi3-ios_*` wheel-naming pattern; we deliberately do NOT
-  # invent one — the instruction was "mirror exactly what persist's
-  # lane produces — don't invent." Persist produces tarballs. If
-  # CIRISAgent v2.9.4's host actually wants pip-installable wheels
-  # later, that's a follow-up adapter step — but the cohabitation
-  # primitive (a built `ciris_edge.abi3.so` matching Python-Apple-
-  # support's libpython) is what `import ciris_edge` needs, and the
-  # tarball delivers exactly that.
-  ios-pyo3-package:
-    name: package ios PyO3 artifacts
-    if: startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: release-only, off PR+merge (cut runners)
-    runs-on: ubuntu-latest
-    needs: [ios-pyo3]
-    steps:
-      - uses: actions/checkout@v4
-      - name: extract version from Cargo.toml
-        id: version
-        run: |
-          VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - name: download iOS PyO3 artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ciris-edge-ios-pyo3-*
-          path: artifacts/
-      - name: package iOS PyO3 tarball
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p dist/ios-device dist/ios-simulator
-          cp artifacts/ciris-edge-ios-pyo3-ios-device/ciris_edge.abi3.so       dist/ios-device/
-          cp artifacts/ciris-edge-ios-pyo3-ios-simulator/ciris_edge.abi3.so    dist/ios-simulator/
-
-          echo "=== ios-device ==="
-          ls -la dist/ios-device/
-          file dist/ios-device/ciris_edge.abi3.so
-          echo "=== ios-simulator ==="
-          ls -la dist/ios-simulator/
-          file dist/ios-simulator/ciris_edge.abi3.so
-
-          tar -czf "dist/ciris-edge-v${VERSION}-ios.tar.gz" \
-            -C dist ios-device ios-simulator
-
-          echo "✓ packaged ciris-edge-v${VERSION}-ios.tar.gz"
-          ls -la "dist/ciris-edge-v${VERSION}-ios.tar.gz"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ciris-edge-ios-pyo3
-          path: dist/ciris-edge-v*-ios.tar.gz
-          if-no-files-found: error
-
   # ─── lint: clippy + fmt (mission rejection gate) ────────────────────
   lint:
     name: clippy + fmt
@@ -1361,7 +893,7 @@ jobs:
         with:
           components: clippy, rustfmt
       # CIRISEdge#229 — restore only; the canonical linux-x86_64 save
-      # happens on the linux-x86_64-test pyo3-full lane.
+      # happens on the `desktop-release-build` linux-x86_64 cell.
       - uses: ./.github/actions/ciriscache
         with:
           plat: linux-x86_64
@@ -1379,10 +911,11 @@ jobs:
           shell: bash
           command: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3 lxmf mesh-harness test-anchor" -- -D warnings
       - name: cargo clippy (uniffi feature on)
-        # v0.13.0 (CIRISEdge#36 GO) — uniffi gate. The wheel build
-        # default-enables `ffi-uniffi` via `pyo3` ⇒ `ffi-uniffi`, but
-        # we still keep the explicit check so a `pyo3`-less consumer
-        # (mobile-only build) catches drift.
+        # v0.13.0 (CIRISEdge#36 GO) — uniffi gate. `pyo3` ⇒ `ffi-uniffi`,
+        # but we still keep the explicit check so a `pyo3`-less consumer
+        # (mobile-only build) catches drift. The pyo3-less `ffi-uniffi`
+        # build itself compiles (under -D warnings) on the
+        # `linux-x86_64 (full)` test lane.
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 30
@@ -1390,14 +923,27 @@ jobs:
           retry_wait_seconds: 60
           shell: bash
           command: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3 ffi-uniffi" -- -D warnings
+      # 45.x LTS — the `pyo3-sqlite` cfg subset (persist's postgres-free
+      # PyEngine; no Postgres backend arms) is what CIRISServer's Windows and
+      # mobile wheels compile edge with. Its only PR-time compile was the
+      # Android PyO3 canary, removed when edge stopped shipping Python, so it
+      # is checked here, host-side, until the binding leaves the tree (v62).
+      - name: cargo check (pyo3-sqlite subset)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_wait_seconds: 60
+          shell: bash
+          command: cargo check --lib --features "transport-reticulum pyo3-sqlite"
       # CIRISEdge#345 (ask #3) — the test-anchor lane. The compile-fenced
       # `test-anchor` feature is what the mesh-repro harness (CIRISServer#258)
       # enables to boot an edge/agent node under CIRIS_TESTING_MODE. Clippy it
       # (so the harness build stays warning-clean) and run the edge-tier e2e
       # that proves a SW-test-root-scrubbed peer ROOTS through edge's
       # root_binding. This test is feature-gated, so it runs ONLY here — the
-      # default combos never compile it. NOT in any release lane: the wheel
-      # feature set omits `test-anchor`, so the relaxation is compiled out.
+      # default combos never compile it. NOT in any release lane: the release
+      # feature sets omit `test-anchor`, so the relaxation is compiled out.
       - name: cargo clippy (test-anchor on)
         uses: nick-fields/retry@v3
         with:
@@ -1516,10 +1062,10 @@ jobs:
   benches:
     name: cargo bench --no-run (all features)
     runs-on: ubuntu-latest
-    # CIRISEdge#216 — sccache (see pyo3-wheel). This job is the poster
-    # child: it deliberately never SAVES a CIRISCache layer (#238 moved
-    # its save to the pyo3-wheel linux job after the 7.5 GB blob
-    # incident), but the layer it RESTORES is the wheel's release-profile
+    # CIRISEdge#216 — sccache (see desktop-release-build). This job is the
+    # poster child: it deliberately never SAVES a CIRISCache layer (#238
+    # moved its save to the release-profile linux desktop job after the
+    # 7.5 GB blob incident), but the layer it RESTORES is that release-profile
     # target while this compiles the bench profile of the all-features
     # union — near-zero coverage, so it cold-built ~11 min on EVERY run.
     # sccache gives it a real cache without resurrecting the giant blob.
@@ -1569,13 +1115,27 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  # ─── pyo3-wheel: maturin abi3-py310 wheels ──────────────────────────
+  # ─── desktop-release-build: release-profile desktop compile + cache ──
   #
-  # Three wheels per release. Matrix mirrors CIRISPersist exactly
-  # (linux x86_64 + aarch64, darwin arm64). darwin-x86_64 omitted —
-  # GitHub Actions Intel macOS runners queue indefinitely due to
-  # capacity issues; persist's matrix dropped it for the same reason.
-  # Add back via manual upload if a real consumer materializes.
+  # 45.x LTS — this was `pyo3-wheel` (maturin abi3-py310 wheels for linux
+  # x86_64 + aarch64, darwin arm64, windows x64), the last of which shipped
+  # with v45.1.9. Edge no longer ships Python. What the job did BESIDES the
+  # wheels is still needed, so the job stays without maturin:
+  #
+  #   * it is the canonical CIRISCache save site for the four desktop PLATs
+  #     (linux-x86_64, linux-aarch64, macos-aarch64, windows-x64). Edge's own
+  #     lanes restore those layers, and so does CIRISServer's build-wheels /
+  #     bench, which compiles edge with `pyo3 extension-module` into its one
+  #     wheel. Same features, same release profile, same keys as before.
+  #   * it is the only place the pyo3 binding compiles on macOS and Windows,
+  #     the platforms CIRISServer ships it on.
+  #   * its linux-x86_64 cell builds the `emit_edge_extras` host CLI that
+  #     `build-manifest` runs.
+  #
+  # The edge crate is built as an rlib only (`cargo rustc --crate-type
+  # rlib`): that is how CIRISServer links it, and it needs no
+  # extension-module link arguments (an extension-module cdylib does not
+  # link on macOS without maturin's `-undefined dynamic_lookup`).
   #
   # Each matrix entry runs on a NATIVE runner for that target so we
   # avoid cross-compile drama (sysroot, linkers, vendored crypto
@@ -1586,7 +1146,10 @@ jobs:
   # linked persist v5.x; downstream `pip install` hit ResolutionImpossible.
   # This job parses both files and fails fast if the Cargo-pinned tag
   # does not satisfy the pyproject PEP 440 constraint, before any wheel
-  # is built. ~10s job; gates pyo3-wheel via `needs:`.
+  # is built. ~10s job. 45.x LTS: edge builds no wheel, but pyproject.toml
+  # stays (CIRISConformance's nightly matrix source-builds edge from its
+  # git pin through it), so the check stays too — standalone, gating
+  # nothing.
   cargo-pyproject-skew-check:
     name: cargo <-> pyproject pin-skew check
     runs-on: ubuntu-latest
@@ -1600,16 +1163,15 @@ jobs:
       - name: check skew
         run: python3 .github/scripts/check_cargo_pyproject_skew.py
 
-  pyo3-wheel:
-    name: maturin abi3-py310 wheel (${{ matrix.label }})
-    # CIRISEdge (cut runners): the desktop maturin wheels (linux-x86_64,
-    # linux-aarch64, macos-aarch64, windows-x64 — windows alone ~27m) are release
-    # artifacts + cross-repo cache warmers; nothing on a PR consumes them (the
-    # pyo3 compile is already covered by linux-x86_64 (pyo3-full) + the android/ios
-    # pyo3 canaries). Off PR; still on main (cache + wheel-break catch) and tags.
+  desktop-release-build:
+    name: desktop release build (${{ matrix.label }})
+    # CIRISEdge (cut runners): the desktop release builds (linux-x86_64,
+    # linux-aarch64, macos-aarch64, windows-x64 — windows alone ~27m) are
+    # cross-repo cache warmers; nothing on a PR consumes them (the pyo3
+    # compile is covered on PRs by `lint` + `linux-x86_64 (pyo3-lib)`). Off
+    # PR; still on main (cache + desktop-break catch) and tags.
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-    needs: [cargo-pyproject-skew-check]
-    # CIRISEdge#229 — save the cross-repo cache on main-branch wheel
+    # CIRISEdge#229 — save the cross-repo cache on main-branch + tag
     # builds (one per canonical PLAT: linux-x86_64, linux-aarch64,
     # macos-aarch64, windows-x64). PR runs read but don't write.
     permissions:
@@ -1779,61 +1341,21 @@ jobs:
           rustup default stable
           cargo --version
           cargo build --help >/dev/null
+      # pyo3's build script needs a host interpreter to resolve its config,
+      # even for an abi3 extension-module build that never links libpython.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: install maturin
-        run: pip install maturin
-      - name: maturin build
-        # v0.7.0 (CIRISEdge#17) — explicit `--features "pyo3 extension-module"`.
-        # `extension-module` is a separate Cargo feature now (persist
-        # v1.13.0 discipline) — folding it into `pyo3` broke
-        # `cargo test --features pyo3` because tests must link libpython
-        # but the wheel must NOT (host interpreter provides the symbols).
-        # pyproject.toml's [tool.maturin].features list also names both;
-        # we pass --features here too so the CI invocation is
-        # self-documenting and resistant to pyproject drift.
+      - name: cargo build --release (edge as an rlib, the binding on)
+        # The feature set CIRISServer compiles edge with (`pyo3
+        # extension-module transport-http`; `pyo3-sqlite` on Windows, per
+        # CIRISPersist#328), in the release profile, so the CIRISCache blob
+        # saved below is the one downstream release builds can reuse.
+        # `cargo rustc --crate-type rlib` builds the lib target as an rlib
+        # only (see the job header for why not the cdylib).
         #
-        # v1.0.1 (CIRISEdge#50 re-reopen) — on Linux, skip maturin's
-        # default auditwheel pass and run auditwheel manually below with
-        # `--exclude libsqlite3.so.0`. Without the exclude, auditwheel
-        # sidecars edge's libsqlite3 into `ciris_edge.libs/` with a
-        # mangled SONAME (`libsqlite3-eac351cf.so.0`), and the resulting
-        # PyPI wheel ends up with a SECOND libsqlite3 in the cohabitation
-        # process alongside persist's. The two are independent libsqlite3
-        # instances with their own `sqlite3GlobalConfig` static globals;
-        # edge's is never `sqlite3_initialize`d → null `xMalloc` →
-        # SIGSEGV on the durable-send SQL path. Same fix shape persist
-        # v3.6.3 used (CIRISPersist#136). System libsqlite3 stays a
-        # runtime dep (manylinux base image includes it).
-        # v1.1.4 (CIRISEdge#56) — added `transport-http` so the published
-        # wheel can exercise the v0.19.3 HTTPS init surface. The pyo3
-        # feature already pulls transport-reticulum; this adds the second
-        # transport. The CI invocation and pyproject's [tool.maturin]
-        # features list both name all three, redundantly, so a future
-        # drift between the two surfaces fails loudly instead of silently
-        # publishing a wheel missing a transport.
-        #
-        # v2.1.1 (CIRISEdge#87 / leviculum#10) — `shell: bash` forces Git
-        # Bash on windows-latest so the `if [ ... ]` shell test resolves
-        # (default Windows shell is pwsh; pwsh chokes on POSIX `[`).
-        #
-        # v7.4.3 (CIRISEdge#236) — Windows now uses stable rustc + the
-        # standard `x86_64-pc-windows-msvc` target. No -Zbuild-std,
-        # no LNK1181 workaround, no NIGHTLY_PIN. Win7 SP1 + Server
-        # 2008 R2 (EOL 2020) compat dropped; cross-repo CIRISCache hits
-        # restored on Windows. Maturin tags the resulting wheel
-        # `win_amd64` (pip platform-tag matches against x86_64 + windows
-        # only); the published wheel runs on Win10 / Win11 / Server
-        # 2016+.
-        #
-        # v7.4.2 — cross-process retry via nick-fields/retry@v3.
-        # `cargo metadata` at the start of maturin build flaked v7.0.13
-        # + v7.3.1 with `curl failed [16] HTTP2 framing layer` mid-
-        # download. CARGO_NET_RETRY=10 doesn't cover sustained
-        # crates.io CDN pockets. 30-min timeout matches the slowest
-        # Windows wheel (stable, no build-std); 3 attempts with 60s
-        # wait. Same shape as the test-lane wrappers.
+        # v7.4.2 — cross-process retry via nick-fields/retry@v3 for the
+        # crates.io CDN flake class.
         uses: nick-fields/retry@v3
         with:
           # v43.1.0 — persist v59's release build of ciris-persist alone runs past 30
@@ -1844,119 +1366,17 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 60
           shell: bash
-          command: |
-            set -euo pipefail
-            # v7.4.3 (CIRISEdge#236) — Windows now uses stable rustc +
-            # the standard `x86_64-pc-windows-msvc` target. No
-            # -Zbuild-std, no LNK1181 workaround, no NIGHTLY_PIN. The
-            # Linux branch keeps `--auditwheel=skip` so the manual
-            # `auditwheel repair --exclude libsqlite3.so.0` step below
-            # can sidecar-bundle libsqlite3 with the right SONAME
-            # (CIRISEdge#50). All other platforms use the default
-            # maturin auditwheel pass.
-            if [ "${{ runner.os }}" = "Linux" ]; then
-              maturin build --release --strip --features "${{ matrix.features }}" --auditwheel=skip
-            else
-              maturin build --release --strip --features "${{ matrix.features }}"
-            fi
+          command: cargo rustc --release --lib --crate-type rlib --features "${{ matrix.features }}"
       - name: sccache stats
         if: always()
         shell: bash
         run: sccache --show-stats
-      - name: auditwheel repair --exclude libsqlite3.so.0 (Linux only)
-        # v1.0.1 (CIRISEdge#50 re-reopen) — manual auditwheel with the
-        # libsqlite3 exclude. Mirrors CIRISPersist v3.6.3's CIRISPersist#136
-        # auditwheel exclude so edge.so and persist.so both NEEDED a
-        # plain `libsqlite3.so.0` that the dynamic loader unifies → ONE
-        # libsqlite3 instance shared across cdylibs.
-        if: runner.os == 'Linux'
-        run: |
-          pip install auditwheel
-          mkdir -p target/wheels/repaired
-          for whl in target/wheels/*linux*.whl; do
-            auditwheel repair --exclude libsqlite3.so.0 -w target/wheels/repaired/ "$whl"
-            rm "$whl"
-          done
-          mv target/wheels/repaired/*.whl target/wheels/
-          rmdir target/wheels/repaired
-      - name: verify libsqlite3 is plain NEEDED entry (Linux only)
-        # v1.0.1 (CIRISEdge#50 re-reopen) — post-build gate that fails
-        # the build if auditwheel re-introduced the mangled SONAME. The
-        # NEEDED entry MUST be plain `libsqlite3.so.0` (not
-        # `libsqlite3-<hash>.so.0`). Mirrors CIRISPersist v3.5.3's CI gate.
-        if: runner.os == 'Linux'
-        run: |
-          set -e
-          for whl in target/wheels/*linux*.whl; do
-            echo "::group::Verifying $whl"
-            tmp=$(mktemp -d)
-            unzip -q "$whl" -d "$tmp"
-            so=$(find "$tmp" -name "*.so" -path "*/ciris_edge/*" | head -1)
-            if [ -z "$so" ]; then
-              echo "::error::no ciris_edge .so found in $whl"; exit 1
-            fi
-            needed=$(readelf -d "$so" | grep -i sqlite3 || true)
-            echo "NEEDED libsqlite3 lines:"
-            echo "$needed"
-            if echo "$needed" | grep -q 'libsqlite3-[0-9a-f]\+\.so\.0'; then
-              echo "::error::$whl has a MANGLED libsqlite3 SONAME — auditwheel exclude failed"
-              exit 1
-            fi
-            if ! echo "$needed" | grep -q 'libsqlite3\.so\.0'; then
-              echo "::error::$whl has NO libsqlite3.so.0 NEEDED entry — verify auditwheel ran"
-              exit 1
-            fi
-            # Confirm no libsqlite3 sidecar
-            if ls "$tmp"/ciris_edge.libs/libsqlite3* 2>/dev/null; then
-              echo "::error::$whl has a libsqlite3 in .libs sidecar — auditwheel exclude failed"
-              exit 1
-            fi
-            rm -rf "$tmp"
-            echo "::endgroup::"
-          done
-      - name: confirm wheel shape
-        # v0.7.0 (CIRISEdge#17) — abi3-py310 not cp311-abi3. Chaquopy
-        # bundles Python 3.10; abi3 is forward-compatible so the py310
-        # wheel runs on 3.11 / 3.12 / 3.13 too. Bumping the floor down
-        # is an expansion of compatibility, not a regression. Mixed-mode
-        # maturin can still silently emit cp31N-cp31N wheels; catch at
-        # build time, before PyPI. Same v0.1.10-regression closure
-        # persist uses.
-        #
-        # v2.1.1 (CIRISEdge#87 / leviculum#10) — `shell: bash` to force
-        # Git Bash on windows-latest; pwsh can't parse `ls -la` + the
-        # `if ! ls ... >/dev/null` shell test.
-        shell: bash
-        run: |
-          ls -la target/wheels/
-          if ! ls target/wheels/*-cp310-abi3-*.whl >/dev/null 2>&1; then
-            echo "::error::Expected cp310-abi3 wheel for ${{ matrix.label }}; got:"
-            ls target/wheels/*.whl 2>/dev/null || echo "  (no wheels)"
-            exit 1
-          fi
-          # CIRISEdge#824 — every wheel's extension module must export
-          # PyInit_ciris_edge. The Windows `pyo3-sqlite` wheel shipped for
-          # many releases with none (no binding code compiled), so
-          # `import ciris_edge` failed there while this lane stayed green.
-          for whl in target/wheels/*-cp310-abi3-*.whl; do
-            python -c 'import sys, zipfile
-          z = zipfile.ZipFile(sys.argv[1])
-          mods = [n for n in z.namelist() if n.startswith("ciris_edge/ciris_edge") and n.endswith((".so", ".pyd"))]
-          ok = bool(mods) and all(b"PyInit_ciris_edge" in z.read(n) for n in mods)
-          print(sys.argv[1], mods, "PyInit_ciris_edge:", ok)
-          sys.exit(0 if ok else 1)' "$whl" \
-              || { echo "::error::$whl: extension module has no PyInit_ciris_edge (#824)"; exit 1; }
-          done
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ciris_edge-wheel-${{ matrix.label }}
-          path: target/wheels/*.whl
       # Build the host-side `emit_edge_extras` CLI binary on the
-      # linux-x86_64 wheel runner and hand it off to `build-manifest`
+      # linux-x86_64 runner and hand it off to `build-manifest`
       # as an artifact. Avoids `build-manifest` recompiling the full
       # `ciris-edge` release graph a second time just to run a tiny
       # JSON-emitter binary (CI wall-time optimisation; ~3min saved on
-      # tag runs). The feature set deliberately differs from the wheel
+      # tag runs). The feature set deliberately differs from the rlib
       # build above: this is a host CLI, NOT a Python extension, so
       # `pyo3` + `extension-module` must NOT be passed (those would
       # require libpython at link time and produce a non-executable
@@ -1974,7 +1394,7 @@ jobs:
           path: target/release/emit_edge_extras
           retention-days: 7
       # CIRISEdge#229 — save warm cache to GHCR on main only, one save
-      # per canonical PLAT. The wheel matrix is now the canonical save
+      # per canonical PLAT. This matrix is the canonical save
       # site for EVERY desktop PLAT — linux-x86_64, linux-aarch64,
       # macos-aarch64 (`darwin-aarch64` label), windows-x64
       # (`windows-x86_64` label). All four save a release-profile
@@ -1982,7 +1402,7 @@ jobs:
       # and what downstream release consumers can actually reuse.
       #
       # v7.4.4 (CIRISEdge#238) — linux-x86_64 was previously saved on
-      # the `linux-x86_64-test` `pyo3-full` lane (debug profile + all
+      # the `linux-x86_64-test` (then `pyo3-full`) lane (debug profile + all
       # feature combos + incremental → ~7.5 GB blob). Moved here so
       # consumers get a release blob like every other PLAT.
       - id: cache-save-wheel
@@ -2012,22 +1432,39 @@ jobs:
   # verified as part of the tag-gated release.
   #
   # Trust posture: this manifest is the cryptographic root of trust.
-  # PyPI is just a fast distribution channel — peers verifying
+  # The GitHub Release is just a distribution channel — peers verifying
   # authenticity check the registry-side hybrid signature here, not
-  # the PyPI artifact itself. PEP 740 attestations on the PyPI
-  # upload compound the two.
+  # the downloaded artifact itself.
+  #
+  # 45.x LTS — WHAT is signed changed. Through v45.1.9 the four
+  # manifests signed the four desktop abi3 wheels and the registry held
+  # the linux/darwin wheel hashes. Edge no longer ships wheels, so the
+  # subjects are now the native binaries the Release DOES ship, one
+  # manifest per target:
+  #   android-arm64-v8a   aarch64-linux-android     libciris_edge.so  (in android.tar.gz)
+  #   android-x86_64      x86_64-linux-android      libciris_edge.so  (in android.tar.gz)
+  #   android-armeabi-v7a armv7-linux-androideabi   libciris_edge.so  (in android.tar.gz)
+  #   ios-aarch64         aarch64-apple-ios         libciris_edge.dylib (in the xcframework)
+  #   ios-aarch64-sim     aarch64-apple-ios-sim     libciris_edge.dylib (in the xcframework)
+  # Each hash is of the exact per-target artifact the packaging jobs put in
+  # the tarballs (android-ndk strips before upload; build-ios bakes its
+  # install_name at link time precisely so the dylib hash survives into the
+  # xcframework). The android-arm64-v8a manifest is the canonical one: it
+  # carries EdgeExtras and is the copy kept as `ciris-edge-<ver>.manifest.json`.
   #
   # Tag-gated: registry registration is a release action. On a
   # branch push + tag push of the same commit, two CI runs would
   # otherwise both POST `version=X` to the registry — and because
-  # maturin wheels aren't byte-reproducible, the two runs register
+  # release builds aren't byte-reproducible, the two runs register
   # different hashes and the loser's round-trip GET fails on a hash
   # mismatch. The tag-gate keeps registration to the tag run only
   # (CIRISEdge#11; v0.2.3 main-run hit the race).
   build-manifest:
     name: Generate + sign build manifest (hybrid Ed25519 + ML-DSA-65)
     runs-on: ubuntu-latest
-    needs: pyo3-wheel
+    # desktop-release-build: the `emit-edge-extras-bin` host CLI.
+    # android-ndk + build-ios: the per-target binaries signed below.
+    needs: [desktop-release-build, android-ndk, build-ios]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
@@ -2080,7 +1517,7 @@ jobs:
           sudo install -m755 build-tool/ciris-build-verify /usr/local/bin/ciris-build-verify
           ciris-build-sign --version
       - name: download pre-built emit_edge_extras
-        # The `pyo3-wheel` linux-x86_64 cell builds this host CLI as a
+        # The `desktop-release-build` linux-x86_64 cell builds this host CLI as a
         # side-effect of its existing release compile and uploads it as
         # the `emit-edge-extras-bin` artifact. Reusing it here drops
         # ~3min of wall-time off the tag run that would otherwise be
@@ -2105,16 +1542,21 @@ jobs:
             > "dist/edge-extras-${{ steps.version.outputs.version }}.json"
           echo "EdgeExtras emitted:"
           cat "dist/edge-extras-${{ steps.version.outputs.version }}.json"
-      - name: download wheel for BuildManifest signing (linux x86_64)
+      - name: download the per-target Android .so artifacts
+        # `ciris-edge-android-<abi>` (one per ABI). The pattern needs the dash
+        # after `android`, so it never matches `android-package`'s tarball
+        # artifact `ciris-edge-android`.
         uses: actions/download-artifact@v4
         with:
-          name: ciris_edge-wheel-linux-x86_64
-          path: dist/wheel
-      - name: download all multi-arch wheels for binary-manifest aggregation
+          pattern: ciris-edge-android-*
+          path: dist/bin
+      - name: download the per-target iOS dylib artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: ciris_edge-wheel-*
-          path: dist/wheels
+          pattern: ciris-edge-ios-*
+          path: dist/bin
+      - name: list the binaries to sign
+        run: find dist/bin -type f -name 'libciris_edge.*' -exec ls -la {} \;
       - name: sign manifest with hybrid Ed25519 + ML-DSA-65
         # Two independent secrets per the bridge onboarding (CIRISEdge#1):
         # ciris-build-sign generate-keys produces TWO unrelated 32-byte
@@ -2137,34 +1579,31 @@ jobs:
           printf '%s' "${CIRIS_BUILD_MLDSA_SECRET}" | base64 -d > "$MLDSA_KEY_PATH"
           VERSION="${{ steps.version.outputs.version }}"
           mkdir -p dist/manifests
-          # CIRISEdge#471 — EVERY desktop platform gets its own hybrid-signed
-          # manifest, not just linux-x86_64. Each wheel sits under
-          # dist/wheels/ciris_edge-wheel-<label>/ (the multi-arch download above).
-          # `--target` is metadata and ciris-build-sign HASHES the wheel file (never
-          # runs it), so signing the windows/darwin/aarch64 wheels on this linux
-          # runner is correct.
+          # CIRISEdge#471 — EVERY shipped target gets its own hybrid-signed
+          # manifest. Each binary sits under dist/bin/<artifact>/ (the
+          # downloads above). `--target` is metadata and ciris-build-sign
+          # HASHES the file (never runs it), so signing android/iOS binaries on
+          # this linux runner is correct.
           sign_platform() {
-            local label="$1" target="$2" wheel
-            wheel="$(ls "dist/wheels/ciris_edge-wheel-${label}"/*.whl 2>/dev/null | head -1)"
-            if [ -z "$wheel" ]; then
-              echo "::error::no wheel found for ${label} (dist/wheels/ciris_edge-wheel-${label}/)"
+            local label="$1" target="$2" bin="$3"
+            if [ ! -f "$bin" ]; then
+              echo "::error::no binary for ${label} at ${bin}"
               exit 1
             fi
-            # EdgeExtras is a linux-x86_64 SOURCE/build-input snapshot — its dep-tree
-            # hash is `cargo tree --target x86_64-unknown-linux-gnu` and
-            # enabled_transports reflects the emit binary — so it is accurate ONLY for
-            # the canonical manifest. The other platforms sign binary hash + target +
-            # signature WITHOUT it, rather than stamp a linux source snapshot onto a
-            # non-linux wheel (Codex on #471). `--extras` is optional to ciris-build-sign.
+            # EdgeExtras is a SOURCE/build-input snapshot (its dep-tree hash is
+            # `cargo tree --target x86_64-unknown-linux-gnu`; enabled_transports
+            # reflects the emit binary), so only the canonical manifest carries
+            # it. The other targets sign binary hash + target + signature WITHOUT
+            # it (Codex on #471). `--extras` is optional to ciris-build-sign.
             local extras_args=()
-            if [ "$label" = "linux-x86_64" ]; then
+            if [ "$label" = "android-arm64-v8a" ]; then
               extras_args=(--extras "dist/edge-extras-${VERSION}.json")
             fi
             ciris-build-sign sign \
               --primitive edge \
               --build-id "$VERSION" \
               --target "$target" \
-              --binary "$wheel" \
+              --binary "$bin" \
               --binary-version "$VERSION" \
               "${extras_args[@]}" \
               --ed25519-seed "$ED_KEY_PATH" \
@@ -2173,21 +1612,22 @@ jobs:
               --output "dist/manifests/ciris-edge-${VERSION}-${label}.manifest.json"
             echo "✓ signed ${label} (${target})"
           }
-          sign_platform linux-x86_64   x86_64-unknown-linux-gnu
-          sign_platform linux-aarch64  aarch64-unknown-linux-gnu
-          sign_platform darwin-aarch64 aarch64-apple-darwin
-          sign_platform windows-x86_64 x86_64-pc-windows-msvc
+          sign_platform android-arm64-v8a   aarch64-linux-android   dist/bin/ciris-edge-android-arm64-v8a/libciris_edge.so
+          sign_platform android-x86_64      x86_64-linux-android    dist/bin/ciris-edge-android-x86_64/libciris_edge.so
+          sign_platform android-armeabi-v7a armv7-linux-androideabi dist/bin/ciris-edge-android-armeabi-v7a/libciris_edge.so
+          sign_platform ios-aarch64         aarch64-apple-ios       dist/bin/ciris-edge-ios-aarch64-apple-ios/libciris_edge.dylib
+          sign_platform ios-aarch64-sim     aarch64-apple-ios-sim   dist/bin/ciris-edge-ios-aarch64-apple-ios-sim/libciris_edge.dylib
           shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
-          # The linux-x86_64 manifest is the CANONICAL one registered with
-          # CIRISRegistry (its round-trip below); the other three ride the GitHub
-          # Release attached beside their wheels.
-          cp "dist/manifests/ciris-edge-${VERSION}-linux-x86_64.manifest.json" \
+          # The android-arm64-v8a manifest is the CANONICAL one (it carries
+          # EdgeExtras); every target's hash is registered with CIRISRegistry
+          # below, and all five manifests ride the GitHub Release.
+          cp "dist/manifests/ciris-edge-${VERSION}-android-arm64-v8a.manifest.json" \
              "dist/ciris-edge-${VERSION}.manifest.json"
-          echo "=== per-platform signed manifests ==="
+          echo "=== per-target signed manifests ==="
           ls -la dist/manifests/
-          echo "=== canonical (linux-x86_64) manifest ==="
+          echo "=== canonical (android-arm64-v8a) manifest ==="
           cat "dist/ciris-edge-${VERSION}.manifest.json"
-      - name: upload per-platform signed manifests
+      - name: upload per-target signed manifests
         uses: actions/upload-artifact@v4
         with:
           name: ciris-edge-manifests
@@ -2332,22 +1772,28 @@ jobs:
             exit 1
           fi
 
+          # The same five binaries the manifests above signed. A missing one is
+          # an error, not a skip: signing step already refused it, and a
+          # registry entry silently short a target is the failure this
+          # round-trip exists to catch.
           declare -A TARGET_FOR=(
-            ["ciris_edge-wheel-linux-x86_64"]="x86_64-unknown-linux-gnu"
-            ["ciris_edge-wheel-linux-aarch64"]="aarch64-unknown-linux-gnu"
-            ["ciris_edge-wheel-darwin-aarch64"]="aarch64-apple-darwin"
+            ["ciris-edge-android-arm64-v8a/libciris_edge.so"]="aarch64-linux-android"
+            ["ciris-edge-android-x86_64/libciris_edge.so"]="x86_64-linux-android"
+            ["ciris-edge-android-armeabi-v7a/libciris_edge.so"]="armv7-linux-androideabi"
+            ["ciris-edge-ios-aarch64-apple-ios/libciris_edge.dylib"]="aarch64-apple-ios"
+            ["ciris-edge-ios-aarch64-apple-ios-sim/libciris_edge.dylib"]="aarch64-apple-ios-sim"
           )
 
           BINARIES_JSON="{}"
-          for ARTDIR in "${!TARGET_FOR[@]}"; do
-            TARGET="${TARGET_FOR[$ARTDIR]}"
-            WHEEL="$(ls dist/wheels/${ARTDIR}/*.whl 2>/dev/null | head -1)"
-            if [ -z "${WHEEL}" ]; then
-              echo "::warning::No wheel found for ${TARGET} (artifact ${ARTDIR}); skipping"
-              continue
+          for REL in "${!TARGET_FOR[@]}"; do
+            TARGET="${TARGET_FOR[$REL]}"
+            BIN="dist/bin/${REL}"
+            if [ ! -f "${BIN}" ]; then
+              echo "::error::No binary for ${TARGET} at ${BIN}"
+              exit 1
             fi
-            SHA="sha256:$(sha256sum "${WHEEL}" | cut -d' ' -f1)"
-            echo "  ${TARGET}: ${SHA} ($(basename ${WHEEL}))"
+            SHA="sha256:$(sha256sum "${BIN}" | cut -d' ' -f1)"
+            echo "  ${TARGET}: ${SHA} (${REL})"
             BINARIES_JSON=$(python3 -c "
           import json, sys
           d = json.loads(sys.argv[1])
@@ -2368,7 +1814,7 @@ jobs:
               'version': '${{ steps.version.outputs.version }}',
               'binaries': binaries,
               'generated_at': '${GENERATED_AT}',
-              'notes': 'CIRIS federation transport substrate; manifest signed via ciris-build-sign --primitive edge (CIRISVerify v1.9.0). Per-platform hybrid-signed manifests for linux x86_64 + aarch64, darwin arm64, windows x64 (this registry holds the linux-x86_64 canonical; all four are attached to the GitHub Release beside their wheels). Git-tag-only; not published to PyPI.',
+              'notes': 'CIRIS federation transport substrate; manifest signed via ciris-build-sign --primitive edge (CIRISVerify v1.9.0). Per-target hybrid-signed manifests for the shipped native binaries: android arm64-v8a / x86_64 / armeabi-v7a libciris_edge.so and iOS device / simulator libciris_edge.dylib (all five attached to the GitHub Release). Git-tag-only; ships no Python since 45.x (last wheels: v45.1.9).',
           }))
           " "${BINARIES_JSON}")
           echo "POST ${REGISTRY_URL}/v1/verify/binary-manifest"
@@ -2465,154 +1911,18 @@ jobs:
             dist/round-trip.json
             dist/binaries-posted.json
 
-  # ─── cohabitation-conformance: cross-artifact contract gate ─────────
+  # ─── cohabitation-conformance: REMOVED (45.x LTS) ───────────────────
   #
-  # Verifies the just-built wheels coexist correctly with the rest of
-  # the pinned federation stack (ciris-persist + ciris-keyring +
-  # ciris-crypto) when loaded as separate `.so` files — the actual
-  # production cohabitation deployment, NOT the per-crate test binary.
-  #
-  # Why this exists: CIRISPersist#109 (PyO3 cross-crate PyClass identity
-  # failure) shipped because edge's `cargo test --features pyo3` links
-  # PyEngine + PyEdge into ONE test binary; the cross-module identity
-  # problem only surfaces when persist and edge are TWO wheels. This
-  # job loads exactly that deployment shape — pinned siblings from
-  # CIRISConformance's matrix + the just-built under-test wheel — and
-  # runs the conformance suite. Tag-only release-quality signal; it does not
-  # gate any publisher (edge is git-tag-only).
-  #
-  # Matrix: 3 platforms × 2 backends = 6 cells. Each platform exercises
-  # its own native wheel; each backend (sqlite, postgres) exercises
-  # persist's runtime backend dispatch under cohabitation. Catches the
-  # rare backend-specific cohabitation gotcha (e.g. concurrent-Engine
-  # construction against postgres pool vs sqlite WAL) that backend-
-  # agnostic conformance tests would miss.
-  #
-  # Implementation lives in `CIRISAI/CIRISConformance` as a reusable
-  # workflow — see that repo's README for adding new cases.
-  # ─── extract-substrate-pins: Cargo.toml → JSON pin-overrides ────────
-  #
-  # Reads edge's actual Cargo.toml pins for ciris-persist (Python wheel)
-  # and ciris-keyring (= ciris-verify Python wheel — both come from
-  # CIRISVerify at the same tag) and emits a JSON object that the
-  # cohabitation gate feeds into the harness's `pin-overrides` input.
-  #
-  # This eliminates the substrate-currency race: edge's own Cargo pin
-  # IS the cohabitation contract. The conformance matrix becomes
-  # documentation-of-record + nightly drift gate, but is no longer on
-  # the critical path of an edge release.
-  #
-  # ## History — why this job briefly stopped emitting ciris-verify
-  #
-  # During the v1.4.0/v1.4.1 cycle, persist v4.8.0's pyproject still
-  # pinned `ciris-verify<5,>=4.4.2` while edge's Cargo pin moved to
-  # ciris-keyring/crypto v5.0.0. Forcing the Python `ciris-verify==5.0.0`
-  # alongside persist 4.8.0 was unresolvable (the Python pin ceiling
-  # and the Cargo pin ceiling diverged). This job temporarily stopped
-  # emitting the ciris-verify override; the v1.4.1 release notes
-  # documented the workaround.
-  #
-  # **Persist v4.10.0 closes the divergence** — its pyproject bumps
-  # `ciris-verify` to `>=5.0.0,<6` (matching the Rust pin). The
-  # conformance matrix can now install `ciris-verify==5.0.0` alongside
-  # `ciris-persist==4.10.0` without conflict, so this job re-enables
-  # the ciris-verify pin-override extraction.
-  #
-  # Going forward, if persist's pyproject ciris-verify ceiling lags
-  # again, this job will need to either skip the ciris-verify override
-  # (the v1.4.0 workaround) or persist needs to coordinate the pyproject
-  # bump with its own Cargo bump.
-  extract-substrate-pins:
-    name: extract substrate pins from Cargo.toml
-    runs-on: ubuntu-latest
-    outputs:
-      pin-overrides: ${{ steps.extract.outputs.json }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: extract
-        run: |
-          python3 <<'PYEOF' >> "$GITHUB_OUTPUT"
-          import re, json
-          text = open('Cargo.toml').read()
-          lock = open('Cargo.lock').read()
-          def lock_version(crate):
-              m = re.search(rf'^name = "{re.escape(crate)}"\nversion = "([^"]+)"', lock, re.M)
-              if not m:
-                  raise SystemExit(f'no {crate} entry in Cargo.lock')
-              return m.group(1)
-          def find_pin(crate):
-              # A `tag = "vX.Y.Z"` pin names the version and the git ref at once.
-              # A prestage pins `rev = "<sha>"` (develop against the certified
-              # commit, flip to the tag once it derefs to that tree): the git ref
-              # is the sha and the version is Cargo.lock's resolved entry. Both
-              # shapes are pins; only the tag one was parsed before (CIRISEdge#733).
-              m = re.search(rf'^{re.escape(crate)}\s*=\s*\{{[^}}]*tag\s*=\s*"v(\d+\.\d+\.\d+)"', text, re.M)
-              if m:
-                  return m.group(1), f'v{m.group(1)}'
-              m = re.search(rf'^{re.escape(crate)}\s*=\s*\{{[^}}]*rev\s*=\s*"([0-9a-f]{{7,40}})"', text, re.M)
-              if m:
-                  return lock_version(crate), m.group(1)
-              raise SystemExit(f'no tag or rev pin found for {crate} in Cargo.toml')
-          persist, persist_ref = find_pin('ciris-persist')
-          verify_major = int(find_pin('ciris-keyring')[0].split('.')[0])
-          pins = {
-              # CIRISEdge is git-tag-only and persist stopped PyPI-publishing at
-              # v30.4.0, so build persist from the git tag edge pins in Cargo.toml.
-              #
-              # VERIFY IS PINNED HERE, as a RANGE, since v21.1.0 (CIRISEdge#579).
-              #
-              # It was deliberately omitted before, on reasoning that is true
-              # and was still wrong: edge consumes verify THROUGH persist, and
-              # persist's wheel Requires-Dist pins the matching `ciris-verify`
-              # transitively — so an override looked unnecessary. What that
-              # missed is that the conformance matrix carries its OWN explicit
-              # `ciris-verify==X.Y.Z` in `stack`, which this override never
-              # touched, and an explicit user pin beats a transitive range. The
-              # first time persist's firewall crossed a verify MAJOR (v42.0.0:
-              # `ciris-verify>=15,<16`) while the matrix still said 14.2.0, every
-              # cohab cell on the v21.0.0 tag died at pip-install with
-              # ResolutionImpossible — before a single test ran.
-              #
-              # The override is the MAJOR range derived from the ciris-keyring
-              # Cargo tag, not an exact version: it mirrors persist's own
-              # firewall shape, so a verify patch published ahead of edge's Cargo
-              # pin still resolves. It is a plain PyPI spec, not `git+…`, because
-              # the CIRISVerify Python project lives at `bindings/python`, not
-              # the repo root (the v16.0.1 lesson recorded here before). The
-              # Rust tag and the PyPI version now move together
-              # (`scripts/bump-version.sh` bumps the workspace and the Python
-              # package in one step), so the tag's major IS the wheel's major.
-              # ciris-server's wheel carries no `ciris-verify` dependency at all
-              # (only `ciris-client`), so this cannot create a third conflict.
-              'ciris-persist': f'git+https://github.com/CIRISAI/CIRISPersist.git@{persist_ref}',
-              'ciris-verify': f'ciris-verify>={verify_major},<{verify_major + 1}',
-          }
-          print(f'json={json.dumps(pins)}')
-          PYEOF
-          echo "extracted:"
-          grep '^json=' "$GITHUB_OUTPUT"
-
-  cohabitation-conformance:
-    name: cohabitation (${{ matrix.platform }} × ${{ matrix.backend }})
-    if: startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: release-only, off PR+merge (cut runners)
-    needs: [pyo3-wheel, extract-substrate-pins]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { platform: linux-x86_64,   runs-on: ubuntu-latest,    backend: sqlite   }
-          - { platform: linux-x86_64,   runs-on: ubuntu-latest,    backend: postgres }
-          - { platform: linux-aarch64,  runs-on: ubuntu-24.04-arm, backend: sqlite   }
-          - { platform: linux-aarch64,  runs-on: ubuntu-24.04-arm, backend: postgres }
-          - { platform: darwin-aarch64, runs-on: macos-15,         backend: sqlite   }
-          - { platform: darwin-aarch64, runs-on: macos-15,         backend: postgres }
-    uses: CIRISAI/CIRISConformance/.github/workflows/run-against-wheels.yml@main
-    with:
-      runs-on: ${{ matrix.runs-on }}
-      backend: ${{ matrix.backend }}
-      under-test-wheel-artifact: ciris_edge-wheel-${{ matrix.platform }}
-      under-test-package: ciris-edge
-      pin-overrides: ${{ needs.extract-substrate-pins.outputs.pin-overrides }}
+  # This tag-only job ran CIRISConformance's reusable
+  # `run-against-wheels.yml` (3 platforms × 2 backends) against the
+  # just-built `ciris_edge-wheel-<plat>` artifacts, with pin overrides from
+  # an `extract-substrate-pins` job. Edge no longer builds wheels (the last
+  # release with them is v45.1.9), so there is no under-test artifact to
+  # hand it, and both jobs are gone. The Python cohabitation surface is now
+  # CIRISServer's one wheel, which bundles edge; cohabitation conformance
+  # belongs on that wheel. CIRISConformance's own nightly matrix still
+  # source-builds edge from its git pin via pyproject.toml, which is why
+  # pyproject.toml and python/ stay in this repo until the v62 line.
 
   # ─── mobile-release: GitHub Release tarball publish (CIRISEdge#17) ──
   #
@@ -2621,23 +1931,22 @@ jobs:
   # Tag-gated GitHub Release artifact upload for ALL the mobile +
   # native-Swift lanes that DON'T go through PyPI:
   #
-  #   - `ciris-edge-v{VERSION}-ios.tar.gz`         — iOS PyO3 abi3.so
-  #     (BeeWare Briefcase consumes via iOS.pth)
   #   - `ciris-edge-v{VERSION}-android.tar.gz`     — raw per-ABI .so
   #     (native Android consumers, JNI/UniFFI)
-  #   - `ciris-edge-v{VERSION}-android-wheels.tar.gz`
-  #                                                — three Chaquopy
-  #     abi3 wheels (the Python-on-Android cohabitation surface)
   #   - `ciris-edge-v{VERSION}-xcframework.tar.gz` — CIRISEdge.xcframework
   #     (native Swift consumers)
+  #   - `ciris-edge-v{VERSION}-kotlin-bindings.tar.gz` /
+  #     `ciris-edge-v{VERSION}-swift-bindings.tar.gz` — UniFFI bindings
+  #   - the per-target hybrid-signed manifests from `build-manifest`
   #   - `SHA256SUMS`                                — release-attestable
   #     hashes over all of the above
   #
-  # v16.0.1 (CIRISEdge#471) — the GitHub Release is the SOLE desktop-wheel
-  # channel too: mobile-release attaches the four desktop wheels
-  # (linux-x86_64, linux-aarch64, darwin-aarch64, windows-x86_64) + their
-  # per-platform hybrid-signed manifests here. There is no PyPI publish; edge is
-  # git-tag-only.
+  # There is no PyPI publish; edge is git-tag-only (CIRISEdge#471).
+  #
+  # 45.x LTS — edge no longer ships Python. The last release carrying the
+  # Python assets is v45.1.9: the four desktop abi3 wheels, the
+  # `android-wheels.tar.gz` Chaquopy wheels, and `ios.tar.gz` (BeeWare
+  # PyO3 `.abi3.so`). Python consumers ride CIRISServer's one wheel.
   #
   # Persist's job: CIRISPersist ci.yml lines 1293-1426. Mirrored shape:
   #   - Tag-gate: `if: startsWith(github.ref, 'refs/tags/v')`
@@ -2654,17 +1963,16 @@ jobs:
     name: Upload mobile + native artifacts to GitHub Release (tag-gated)
     runs-on: ubuntu-latest
     needs:
-      - ios-pyo3-package
       - android-package
       - xcframework
       - lint
       - license-audit
-      # CIRISEdge#471 — mobile-release is now the SOLE publisher of the desktop
-      # wheels + their per-platform signed manifests, so it inherits publish-pypi's
-      # desktop quality gates: never ship a wheel whose platform tests failed, or
-      # before the full wheel matrix + signed manifests exist (no partial-download
-      # race). `pyo3-wheel` gates on ALL four desktop cells (incl. windows).
-      - pyo3-wheel
+      # Never publish a release whose platform tests failed, or before the
+      # signed manifests exist (no partial-download race). The desktop
+      # release builds stay a gate (they were, as `pyo3-wheel`): a release
+      # whose pyo3 binding no longer builds on one of CIRISServer's desktop
+      # platforms is a broken release for its one wheel.
+      - desktop-release-build
       - build-manifest
       - linux-x86_64-test
       - darwin-aarch64-test
@@ -2679,7 +1987,7 @@ jobs:
         run: |
           VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - name: download iOS PyO3 artifact (with retry)
+      - name: download Android raw .so artifact (with retry)
         env:
           GH_TOKEN: ${{ github.token }}
         # `gh run download` (NOT actions/download-artifact@v4) — persist's
@@ -2687,25 +1995,6 @@ jobs:
         # the v4 action surfaces directly. 5-attempt retry verbatim.
         run: |
           mkdir -p dist
-          for attempt in 1 2 3 4 5; do
-            if gh run download "$GITHUB_RUN_ID" \
-                --repo "$GITHUB_REPOSITORY" \
-                --name ciris-edge-ios-pyo3 \
-                --dir dist; then
-              echo "✓ iOS PyO3 artifact download succeeded on attempt $attempt"
-              break
-            fi
-            if [ "$attempt" = "5" ]; then
-              echo "::error::iOS PyO3 artifact download failed 5 times"
-              exit 1
-            fi
-            echo "::warning::iOS PyO3 download attempt $attempt failed; retrying in $((attempt * 10))s"
-            sleep $((attempt * 10))
-          done
-      - name: download Android raw .so artifact (with retry)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
           for attempt in 1 2 3 4 5; do
             if gh run download "$GITHUB_RUN_ID" \
                 --repo "$GITHUB_REPOSITORY" \
@@ -2719,25 +2008,6 @@ jobs:
               exit 1
             fi
             echo "::warning::Android download attempt $attempt failed; retrying in $((attempt * 10))s"
-            sleep $((attempt * 10))
-          done
-      - name: download Android Chaquopy wheels artifact (with retry)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if gh run download "$GITHUB_RUN_ID" \
-                --repo "$GITHUB_REPOSITORY" \
-                --name ciris-edge-android-wheels \
-                --dir dist; then
-              echo "✓ Android wheels download succeeded on attempt $attempt"
-              break
-            fi
-            if [ "$attempt" = "5" ]; then
-              echo "::error::Android wheels download failed 5 times"
-              exit 1
-            fi
-            echo "::warning::Android wheels download attempt $attempt failed; retrying in $((attempt * 10))s"
             sleep $((attempt * 10))
           done
       - name: download XCFramework tarball artifact (with retry)
@@ -2759,43 +2029,11 @@ jobs:
             echo "::warning::XCFramework download attempt $attempt failed; retrying in $((attempt * 10))s"
             sleep $((attempt * 10))
           done
-      - name: download desktop abi3 wheels for durable Release attach (with retry)
-        # CIRISEdge#471 — publish-pypi was the desktop wheels' ONLY durable home;
-        # with it removed, attach them to the GitHub Release so build-manifest's
-        # registered (hybrid-signed) hashes stay obtainable. NOT PyPI — no one
-        # consumes these off PyPI; the Release is the durable, hash-matching source.
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if gh run download "$GITHUB_RUN_ID" \
-                --repo "$GITHUB_REPOSITORY" \
-                --pattern 'ciris_edge-wheel-*' \
-                --dir dist/wheels; then
-              echo "✓ desktop wheels download succeeded on attempt $attempt"
-              break
-            fi
-            if [ "$attempt" = "5" ]; then
-              echo "::error::desktop wheels download failed 5 times"
-              exit 1
-            fi
-            echo "::warning::desktop wheels download attempt $attempt failed; retrying in $((attempt * 10))s"
-            sleep $((attempt * 10))
-          done
-          # gh run download nests each artifact in its own dir; flatten beside the
-          # tarballs so SHA256SUMS + the upload pick them up.
-          find dist/wheels -name '*.whl' -exec mv {} dist/ \;
-          echo "=== desktop wheels ==="
-          ls -la dist/*.whl
-          COUNT=$(ls dist/*.whl 2>/dev/null | wc -l)
-          if [ "$COUNT" -ne 4 ]; then
-            echo "::error::expected 4 desktop wheels (linux x86_64+aarch64, darwin arm64, windows x64), got $COUNT"
-            exit 1
-          fi
       - name: download per-platform signed manifests (with retry)
-        # CIRISEdge#471 — the hybrid-signed manifest for EACH desktop wheel
-        # (build-manifest signs all four). Attached to the Release beside its wheel
-        # so EVERY platform's binary is verifiable against a signed manifest.
+        # CIRISEdge#471 — the hybrid-signed manifest for EACH shipped native
+        # binary (build-manifest signs all five: android x3, iOS device + sim).
+        # Attached to the Release so EVERY target's binary is verifiable against
+        # a signed manifest.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -2814,14 +2052,14 @@ jobs:
             echo "::warning::signed manifests download attempt $attempt failed; retrying in $((attempt * 10))s"
             sleep $((attempt * 10))
           done
-          echo "=== per-platform signed manifests ==="
+          echo "=== per-target signed manifests ==="
           ls -la dist/manifests/*.manifest.json
           MCOUNT=$(ls dist/manifests/*.manifest.json 2>/dev/null | wc -l)
-          if [ "$MCOUNT" -ne 4 ]; then
-            echo "::error::expected 4 per-platform signed manifests, got $MCOUNT"
+          if [ "$MCOUNT" -ne 5 ]; then
+            echo "::error::expected 5 per-target signed manifests (android arm64-v8a/x86_64/armeabi-v7a, ios device/sim), got $MCOUNT"
             exit 1
           fi
-          # Flatten beside the wheels/tarballs — gh release upload/download use a
+          # Flatten beside the tarballs — gh release upload/download use a
           # FLAT asset namespace, so SHA256SUMS must reference basenames or
           # `sha256sum -c` fails for a consumer who downloads them side-by-side
           # (CIRISEdge#471, Codex).
@@ -2829,9 +2067,7 @@ jobs:
       # v0.13.0 (CIRISEdge#36 GO) — bundle the UniFFI-generated Kotlin
       # and Swift bindings as release tarballs. Mobile / native
       # consumers (CIRISAgent KMP UI, future iOS shell) consume them
-      # directly without running `uniffi-bindgen`. Python's wheel
-      # already ships its generated binding bundled via maturin; only
-      # the non-Python lanes need separate tarballs.
+      # directly without running `uniffi-bindgen`.
       - name: package Kotlin bindings tarball
         run: |
           VERSION="${{ steps.version.outputs.version }}"
@@ -2844,14 +2080,12 @@ jobs:
           tar -czf "dist/ciris-edge-v${VERSION}-swift-bindings.tar.gz" \
               -C bindings swift
           echo "✓ packaged Swift bindings ($(stat -c%s "dist/ciris-edge-v${VERSION}-swift-bindings.tar.gz") bytes)"
-      - name: verify all six assets present
+      - name: verify all four tarballs present
         run: |
           echo "=== dist/ ==="
           ls -la dist/
           VERSION="${{ steps.version.outputs.version }}"
-          for ASSET in "ciris-edge-v${VERSION}-ios.tar.gz" \
-                       "ciris-edge-v${VERSION}-android.tar.gz" \
-                       "ciris-edge-v${VERSION}-android-wheels.tar.gz" \
+          for ASSET in "ciris-edge-v${VERSION}-android.tar.gz" \
                        "ciris-edge-v${VERSION}-xcframework.tar.gz" \
                        "ciris-edge-v${VERSION}-kotlin-bindings.tar.gz" \
                        "ciris-edge-v${VERSION}-swift-bindings.tar.gz"; do
@@ -2864,11 +2098,11 @@ jobs:
       - name: generate SHA256SUMS
         run: |
           cd dist
-          # Include the desktop wheels + their per-platform signed manifests so all
-          # integrity metadata travels with the Release (CIRISEdge#471). All by
-          # BASENAME — release assets are a flat namespace, so `sha256sum -c` works
-          # when a consumer downloads them beside SHA256SUMS.
-          sha256sum ciris-edge-v*.tar.gz *.whl *.manifest.json > SHA256SUMS
+          # Include the per-target signed manifests so all integrity metadata
+          # travels with the Release (CIRISEdge#471). All by BASENAME — release
+          # assets are a flat namespace, so `sha256sum -c` works when a consumer
+          # downloads them beside SHA256SUMS.
+          sha256sum ciris-edge-v*.tar.gz *.manifest.json > SHA256SUMS
           cat SHA256SUMS
       - name: create GitHub Release + upload assets
         env:
@@ -2893,19 +2127,15 @@ jobs:
             echo "✓ release ${TAG} already exists — uploading assets"
           fi
 
-          # --clobber so tag re-runs are idempotent. PyPI is rejecting the
-          # re-upload separately via skip-existing; GH releases need
+          # --clobber so tag re-runs are idempotent; GH releases need
           # --clobber explicitly.
           gh release upload "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber \
-            "dist/ciris-edge-v${VERSION}-ios.tar.gz" \
             "dist/ciris-edge-v${VERSION}-android.tar.gz" \
-            "dist/ciris-edge-v${VERSION}-android-wheels.tar.gz" \
             "dist/ciris-edge-v${VERSION}-xcframework.tar.gz" \
             "dist/ciris-edge-v${VERSION}-kotlin-bindings.tar.gz" \
             "dist/ciris-edge-v${VERSION}-swift-bindings.tar.gz" \
-            dist/*.whl \
             dist/*.manifest.json \
             "dist/SHA256SUMS"
 
@@ -2915,7 +2145,7 @@ jobs:
           # follow-up successful run uploaded assets to the existing
           # release but never flipped it published, so consumers couldn't
           # see iOS / Android assets via the Release page even though
-          # PyPI was green. `gh release edit` is no-op on a non-draft
+          # the rest of the tag run was green. `gh release edit` is no-op on a non-draft
           # release, so unconditional invocation is the simplest fix.
           gh release edit "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
@@ -2926,12 +2156,13 @@ jobs:
           {
             echo "## Mobile + native release assets"
             echo ""
-            echo "- \`ciris-edge-v${VERSION}-ios.tar.gz\` (iOS PyO3: device + simulator .abi3.so)"
             echo "- \`ciris-edge-v${VERSION}-android.tar.gz\` (raw per-ABI .so)"
-            echo "- \`ciris-edge-v${VERSION}-android-wheels.tar.gz\` (Chaquopy abi3 wheels: arm64, x86_64, armeabi-v7a)"
             echo "- \`ciris-edge-v${VERSION}-xcframework.tar.gz\` (CIRISEdge.xcframework for native Swift consumers)"
             echo "- \`ciris-edge-v${VERSION}-kotlin-bindings.tar.gz\` (UniFFI-generated Kotlin Multiplatform bindings, v0.13.0)"
             echo "- \`ciris-edge-v${VERSION}-swift-bindings.tar.gz\` (UniFFI-generated Swift bindings, v0.13.0)"
+            echo "- per-target hybrid-signed \`*.manifest.json\`"
             echo "- \`SHA256SUMS\`"
+            echo ""
+            echo "No Python assets: the last release with wheels is v45.1.9."
           } >> "$GITHUB_STEP_SUMMARY"
 

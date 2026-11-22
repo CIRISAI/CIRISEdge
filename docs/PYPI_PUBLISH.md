@@ -5,6 +5,9 @@
 > `pip install ciris-edge` is **not** a supported path. This file used to be
 > the PyPI operator runbook; it now documents the actual distribution model so
 > anyone who lands here (e.g. from `docs/RELEASE_NOTES.md`) gets the truth.
+>
+> **45.x LTS: edge no longer ships Python at all.** It ships as a Rust crate
+> plus UniFFI bindings. v45.1.9 is the last release with Python wheels.
 
 ## Why no PyPI
 
@@ -18,45 +21,70 @@
 
 ## How CIRISEdge is actually consumed
 
+**Edge ships as a Rust crate plus UniFFI bindings. It no longer ships
+Python: v45.1.9 is the last release with Python assets.**
+
 | Consumer | Mechanism |
 |----------|-----------|
-| Rust crates (CIRISServer, …) | pin the **Cargo git tag**: `ciris-edge = { git = "…/CIRISEdge", tag = "v16.0.1" }` |
-| Python (CIRISAgent) | rides the **`ciris-server` one-wheel** (#896), which bundles edge + resolves ONE process-wide `ciris-persist` by construction |
-| Mobile / native | the **GitHub Release** tarballs (android, ios, xcframework, kotlin/swift bindings) |
-| Desktop Python wheels | the **GitHub Release** — the four abi3 wheels (linux x86_64 + aarch64, darwin arm64, windows x64), each beside its hybrid-signed manifest |
+| Rust crates (CIRISServer, …) | pin the **Cargo git tag**: `ciris-edge = { git = "…/CIRISEdge", tag = "v45.1.9" }` |
+| Python (CIRISAgent) | rides the **`ciris-server` one-wheel** (#896), which compiles edge's `pyo3` binding in and resolves ONE process-wide `ciris-persist` by construction |
+| Mobile / native | the **GitHub Release** assets: Android per-ABI `.so`, `CIRISEdge.xcframework`, UniFFI Kotlin + Swift bindings |
 
-`pyproject.toml`'s `ciris-persist>=31,<32` is a **source-build major-tracker +
-co-resident version-agreement declaration**, not an install-time index
-requirement — it is unresolvable from PyPI by design.
+The Python assets that v45.1.9 and earlier attached, and that later releases
+do not: the four desktop abi3 wheels (linux x86_64 + aarch64, darwin arm64,
+windows x64), `ciris-edge-v<ver>-android-wheels.tar.gz` (Chaquopy), and
+`ciris-edge-v<ver>-ios.tar.gz` (BeeWare PyO3 `.abi3.so`).
+
+The `pyo3` feature, `src/ffi/pyo3.rs`, `pyproject.toml` and `python/` stay in
+the tree until the v62 line. CIRISServer compiles the binding into its wheel,
+and CIRISConformance's nightly matrix source-builds edge from its git pin
+through `pyproject.toml`. CI keeps all of it alive: `linux-x86_64 (pyo3-lib)`
+runs the binding's unit tests, `lint` clippies it and checks the
+`pyo3-sqlite` subset, and `desktop-release-build` compiles it in release on
+all four desktop platforms. `pyproject.toml`'s `ciris-persist` range is a
+**source-build major-tracker + co-resident version-agreement declaration**,
+not an install-time index requirement; it cannot be resolved from PyPI by
+design.
 
 ## What ships on a release tag
 
-Pushing a `v*` tag runs `ci.yml`. On green edge-side, `mobile-release` creates
-the GitHub Release (it is the **sole** publisher) and attaches:
+Pushing a `v*` tag runs `ci.yml`. When the edge-side jobs are green,
+`mobile-release` creates the GitHub Release (it is the **only** publisher) and
+attaches **10 assets**:
 
-- the mobile/native tarballs + `SHA256SUMS`;
-- the **four desktop abi3 wheels**;
-- **one hybrid-signed manifest per desktop platform** (`ciris-edge-<version>-<label>.manifest.json`),
-  produced by `build-manifest` via `ciris-build-sign` (Ed25519 + ML-DSA-65). The
-  linux-x86_64 manifest is additionally registered with CIRISRegistry as the
-  canonical; all four ride the Release so **every platform's binary is verifiable
-  against a signed manifest**.
+- `ciris-edge-v<ver>-android.tar.gz`: `libciris_edge.so` for arm64-v8a, x86_64, armeabi-v7a;
+- `ciris-edge-v<ver>-xcframework.tar.gz`: `CIRISEdge.xcframework` (device + simulator);
+- `ciris-edge-v<ver>-kotlin-bindings.tar.gz` and `ciris-edge-v<ver>-swift-bindings.tar.gz`;
+- **one hybrid-signed manifest per shipped native binary**
+  (`ciris-edge-<ver>-<label>.manifest.json`, five of them: `android-arm64-v8a`,
+  `android-x86_64`, `android-armeabi-v7a`, `ios-aarch64`, `ios-aarch64-sim`).
+  `build-manifest` produces them with `ciris-build-sign` (Ed25519 + ML-DSA-65).
+  The android-arm64-v8a manifest is the canonical one and carries
+  `EdgeExtras`. All five target hashes are registered with CIRISRegistry and
+  round-trip verified;
+- `SHA256SUMS` over all of the above.
 
-`mobile-release` gates on the desktop quality jobs (`pyo3-wheel`,
-`build-manifest`, `linux-x86_64-test`, `darwin-aarch64-test`) so a wheel whose
-platform tests or manifest build failed is never distributed.
+Through v45.1.9 the four manifests signed the desktop wheels and the release
+had 15 assets.
 
-## Verifying a downloaded wheel
+`mobile-release` gates on `desktop-release-build`, `build-manifest`,
+`linux-x86_64-test`, `darwin-aarch64-test`, `lint` and `license-audit`. A
+release whose tests failed, whose manifests are missing, or whose pyo3 binding
+no longer builds on one of CIRISServer's desktop platforms is never published.
 
-1. Download the wheel + its `ciris-edge-<version>-<label>.manifest.json` from the
-   Release (or check its line in `SHA256SUMS`).
+## Verifying a downloaded binary
+
+1. Download the tarball and the `ciris-edge-<version>-<label>.manifest.json`
+   for the target from the Release (or check its line in `SHA256SUMS`).
 2. Verify the manifest signature with `ciris-build-verify` (from the CIRISVerify
    build-tool tarball) against the edge build steward key `ciris-edge-build-v1`.
-3. Confirm the manifest's `binary_hash` matches `sha256` of the wheel.
+3. Confirm the manifest's `binary_hash` matches the `sha256` of the target's
+   `libciris_edge.so` (in `android.tar.gz`) or `libciris_edge.dylib` (inside
+   the xcframework slice).
 
 ## Known-benign red on release tags
 
-Two tag-only jobs are expected to be red and do **not** gate the release:
-the historical PyPI publish (now removed) and — until every substrate sibling
-re-pins — cohabitation conformance. Verify a release by **edge-side jobs green +
-the GitHub Release artifacts**, not an all-green board.
+Both tag-only jobs that used to be expected red are gone: the PyPI publish
+(removed in v16.0.1) and cohabitation conformance (removed with the wheels in
+the 45.x LTS; that job belongs on CIRISServer's wheel now). Verify a release by
+**edge-side jobs green + the asset count (10)**, not an all-green board.

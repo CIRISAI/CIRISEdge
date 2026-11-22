@@ -2,7 +2,22 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
-## 45.1.9 — 2026-11-21
+## Unreleased (45.x LTS)
+
+### Removed
+
+- **Edge no longer ships Python.** The release stops building and attaching the
+  four desktop cp310-abi3 wheels, the Chaquopy `android-wheels.tar.gz`, and the
+  BeeWare `ios.tar.gz` (PyO3 `.abi3.so`). v45.1.9 is the last release with
+  them. Edge ships as a Rust crate (git tag) plus UniFFI bindings (Kotlin,
+  Swift, `CIRISEdge.xcframework`, Android `.so`). The agent gets edge through
+  CIRISServer's wheel. The `pyo3` feature and `src/ffi/pyo3.rs` stay until the
+  v62 line, and CI still compiles them on all four desktop platforms and runs
+  their unit tests. CI jobs removed: `ios-pyo3`, `ios-pyo3-package`, the
+  android `pyo3` variant cells, `cohabitation-conformance`,
+  `extract-substrate-pins`. `pyo3-wheel` became `desktop-release-build`, which
+  runs without maturin and keeps the CIRISCache save and `emit_edge_extras`.
+
 
 **PATCH. Attribution: every memoised read says why it read, the walked sets are gauged, and
 persist v61.4.3.** Pins: persist **v61.4.3** by tag (`ciris-persist==61.4.3`; was v61.4.2),
