@@ -261,8 +261,13 @@ jobs:
         # a silent hang into a failed step that reruns alone.
         timeout-minutes: 5
       - uses: dtolnay/rust-toolchain@1.97.0
+      # `plat` is required: without it the composite computed
+      # `ciris-substrate-v1--release-…`, a key nothing saves, so every
+      # restore missed. linux-x86_64 is this runner's canonical PLAT.
       - uses: ./.github/actions/ciriscache
         id: cachekey
+        with:
+          plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
         with:
           key: network-gauntlet
@@ -363,8 +368,13 @@ jobs:
         # a silent hang into a failed step that reruns alone.
         timeout-minutes: 5
       - uses: dtolnay/rust-toolchain@1.97.0
+      # `plat` is required: without it the composite computed
+      # `ciris-substrate-v1--release-…`, a key nothing saves, so every
+      # restore missed. linux-x86_64 is this runner's canonical PLAT.
       - uses: ./.github/actions/ciriscache
         id: cachekey
+        with:
+          plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-anchor-lane
