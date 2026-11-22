@@ -415,16 +415,18 @@ The design and its rationale are in `docs/design/RANGE_FINGERPRINTS.md`. This
 section is normative for the bytes.
 
 **Inputs.**
-- `salt`: 32 bytes, drawn fresh from the OS CSPRNG by the sender for each link
-  session. It is never derived from anything stable, and carried only inside
-  the sealed link (design §13, R5-R6).
+- `salt`: 32 bytes, drawn fresh from the OS CSPRNG by the sender for each peer
+  session: at process start, on the peer's reconnect, and at least hourly. It
+  is never derived from anything stable, and sent only where the transport is
+  confidential to that peer (design §6.4, R5-R6).
 - `plane`: the `EnvelopeKind` wire name (`"key"`, `"identity_occurrence"`, …),
   ASCII.
 - `prefix`: a lowercase hex string of 0-64 characters. The range is every
   32-byte envelope hash `x` whose lowercase hex starts with it.
-- `S`: exactly the set of envelope hashes the sender would offer this peer on
-  this plane. The audience filter is applied before the sum and the count
-  (R1).
+- `S`: on the sender, exactly the set of envelope hashes it would offer this
+  peer on this plane, after the audience filter, minus the ids this Summary
+  lists in `refs`. On the receiver, `settled ∩ mirror` minus the same listed
+  ids. Either way the filter is applied before the sum and the count (R1).
 
 **Construction (`"a":1`).**
 
@@ -452,28 +454,46 @@ x2 = 5173398ec09eb3f5f83570ece6705a3554222fe8fb6279f0900b2cdfff87a2db
 x3 = d5d55d7ae7725dd2775b8c038b8697f4adc99bef7f1b060dc9d2a62ee59246ee
 e(x0) LE = 3ce04fd7d2d80d6f15a18e1345cc6688ab54f0ea3a201bca8c5d78673d0d4d51
 
-V1 plane "key", prefix "",  S = {}                count 0  fp 424536b38733e31120b522bb3d906fef
-V2 plane "key", prefix "",  S = {x0,x1,x2,x3}     count 4  fp 6b0ceedb4be4d229f583ab2129e78b17
+V1 plane "key", prefix "",         S = {}               count 0  fp 424536b38733e31120b522bb3d906fef
+V2 plane "key", prefix "",         S = {x0,x1,x2,x3}    count 4  fp 6b0ceedb4be4d229f583ab2129e78b17
    sum LE = 126990de50d21e21f249526b14de9adfb5233783ad5a369ec08beb8cf1403e07
-V3 plane "key", prefix "e", S = {x0,x1,x2,x3}     count 1  fp f42b8c0a2585fe2c1abfe267731bb4e4
-V4 plane "identity_occurrence", prefix "", S = {x0..x3}  count 4  fp 4219528fc526b10ff80c4c3419bd9baf
-V5 as V2 with salt = 20 21 … 3f                   count 4  fp b4f22081a2fd177ea367cd2d1f43fec2
-V6 plane "key", prefix "",  S = {x0,x1,x2}        count 3  fp 5ab8ad56d241203063179fdf44176e59
+   (the raw sum is 2 x 2^256 + this: V2 wraps mod 2^256)
+V3 plane "key", prefix "e",        S = {x0,x1,x2,x3}    count 1  fp f42b8c0a2585fe2c1abfe267731bb4e4
+V4 plane "identity_occurrence", prefix "", S = {x0..x3} count 4  fp 4219528fc526b10ff80c4c3419bd9baf
+V5 as V2 with salt = 20 21 … 3f                         count 4  fp b4f22081a2fd177ea367cd2d1f43fec2
+V6 plane "key", prefix "",         S = {x0,x1,x2}       count 3  fp 5ab8ad56d241203063179fdf44176e59
+V7 plane "key", prefix "eb5",      S = {x0,x1,x2,x3}    count 1  fp 54b68f91e5e75e11a19a0b51808ea1c4
+V8 plane "key", prefix "0",        S = {x0,x1,x2,x3}    count 0  fp b54121e4e71812a2a2640c382ab3eddd
+V9 plane "key", prefix "eb508c89", S = {x0,x1,x2,x3}    count 1  fp e732ee33209b5da52ff7f3b57d5f1e5a
 ```
 
-V4 shows that the plane is bound into the fingerprint, V5 the salt, and V6 the
-count.
+These vectors show:
+- V2: the sum wraps mod 2^256;
+- V4: the plane is bound into the fingerprint;
+- V5: the salt is bound in;
+- V6: the count is bound in;
+- V7 and V9: prefixes of three and eight characters;
+- V8: a non-root range with count 0, which differs from V1's root.
 
 **Wire.** These are additive, flattened members, ignored by a pre-`rf` peer.
 No `WIRE_PROTOCOL_VERSION` change.
 
+`rf` is a **nested** optional member, omitted when absent and declared after
+`kind`. It is parsed leniently: a shape the reader cannot parse reads as no
+`rf`, never as a failed message.
+
 `Summary.rf`:
-- `{"v":1,"a":1,"salt":"<base64url, 32 bytes>","n":[[prefix,count,fp_hex]…],"c":[[parent,[16 counts],fp_hex×16]…]}`;
-- the salt is repeated in every RF Summary of the link session.
+- `{"v":1,"a":1,"salt":"<base64url, 32 bytes>","sid":u32,"n":[[prefix,count,fp_hex]…],"c":[[parent,[16 counts],fp_hex×16]…],"lc":[prefix…]}`;
+- `n` always contains the root `""`;
+- `lc` names the ranges whose ids `refs` lists completely;
+- every fingerprint excludes the ids this Summary lists in `refs`;
+- the salt is repeated in every RF Summary of the peer session.
 
 `Diff.rf`:
-- `{"v":1,"m":[…],"s":[…],"l":[…]}`, the match, split and list prefixes;
-- or `{"v":1,"u":true}` when the receiver is unable to answer.
+- `{"v":1,"sid":u32,"m":[…],"s":[…],"l":[…]}`: the match, split and list
+  prefixes, answering the Summary with that `sid`;
+- or `{"v":1,"sid":u32,"u":"unbooted"|"salt"|"cap"|"busy"}` when the receiver
+  is unable to answer.
 
 The marker:
 - `{"v":1}` means the node answers RF;
