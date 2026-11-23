@@ -2533,6 +2533,16 @@ impl Edge {
         Some(self.reticulum_transport.as_ref()?.shaping_status())
     }
 
+    /// v45.1 — this node's last NAT measurement: behaviours only, never an
+    /// address (`CallEvent::MediaPathFailed`'s `local_nat`). `None` with no
+    /// Reticulum transport, and on the leviculum v0.34.0+ciris.3 pin, which
+    /// measures nothing yet.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn local_nat_report(&self) -> Option<crate::transport::media_path::NatReport> {
+        self.reticulum_transport.as_ref()?.local_nat_report()
+    }
+
     /// E8 — what this node knows of `peer`'s shaping (§3.1): whether it
     /// shapes, as far as it has answered an offer here.
     #[cfg(feature = "_reticulum-module")]
@@ -4296,6 +4306,21 @@ impl Edge {
     ///                        link, the room discriminated INSIDE the link
     ///                        (`BlobChunkFetch::scope_discriminator`);
     ///   no path            ⇒ the derived address (never a forwarder on a guess).
+    /// Calls cut — how this node reaches blob holder `holder`, as a
+    /// [`crate::blob_swarm::PeerState::path_rank`]: one hop (the derived
+    /// address), then through another member (a roster relay the holder was
+    /// heard through), then anything else, and only through a serve seat (the
+    /// canonical) last. A node with no Reticulum transport ranks every holder
+    /// alike.
+    pub(crate) async fn holder_path_rank(&self, holder: &str) -> u8 {
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            return t.holder_path_rank(holder).await;
+        }
+        let _ = holder;
+        crate::blob_swarm::PATH_RANK_OTHER
+    }
+
     /// Counted (`blob_scoped_carriers`) and logged with the path shape.
     /// `None` when this node has no Reticulum transport (the caller refuses).
     #[cfg(feature = "_reticulum-module")]
@@ -4918,9 +4943,10 @@ impl Edge {
             .ok_or_else(|| missing("a Reticulum transport"))?;
         // CC 5.4.3 rc16 — a peer in anonymous mode (its Anonymous Tier
         // active) is confined to the row plane: no call, no stream.
-        if let Err(token) = transport.onion().media_allowed() {
-            transport.onion().count(token);
-            return Err(CallError::AnonymousMode);
+        match transport.media_refusal() {
+            Some(crate::onion::tokens::ANONYMOUS_NO_MEDIA) => return Err(CallError::AnonymousMode),
+            Some(_) => return Err(CallError::ShapedOnly),
+            None => {}
         }
         let lifecycle = self
             .scope_lifecycle
@@ -9370,6 +9396,12 @@ impl EdgeBuilder {
             canonical_id_set.extend(baked_canonical_genesis_ids());
         }
         let canonical_peers = Arc::new(std::sync::RwLock::new(canonical_id_set));
+        // Calls cut — a call on this node reads the live seat set: a serve seat
+        // never relays call media, and a seat's relay offers are dropped.
+        #[cfg(feature = "_reticulum-module")]
+        if let Some(t) = self.reticulum_transport.as_ref() {
+            t.set_serve_seats(Arc::clone(&canonical_peers));
+        }
         let introduction_bridge = Arc::new(ReinstallableCell::new("introduction_bridge"));
         // `FSD/PRIVACY_MODES.md` §6.12 — what a shed lever on a shaped slot
         // reads at decision time: the roster and the owner's devices from the

@@ -1085,12 +1085,27 @@ pub const ALM_OFFER_REFUSED_NOT_PUBLISHER: &str = "alm_offer_refused:not_publish
 /// the publisher's own first offers at a join: the next one, a second later,
 /// is checked again.
 pub const ALM_OFFER_REFUSED_UNBOUND: &str = "alm_offer_refused:unbound";
+/// [`ALM_OFFER_REFUSED`]: a serve seat offered a stream it does not publish
+/// (calls cut: a serve seat never relays call media, audio included).
+pub const ALM_OFFER_REFUSED_SERVE_SEAT: &str = "alm_offer_refused:serve_seat";
 /// ALM C2 — a subscribe admitted / refused at this node.
 pub const ALM_ADMIT: &str = "alm_admit";
 /// ALM C2 — a subscribe refused at this node (the token is counted too).
 pub const ALM_REFUSE: &str = "alm_refuse";
+/// ALM C2 — this serve seat refused a relay subscribe (calls cut: a serve
+/// seat never relays call media). The wire says `relay_class_refused`.
+pub const ALM_REFUSE_SERVE_SEAT: &str = "relay_serve_seat";
 /// ALM C2 — a subscriber shed by this node.
 pub const ALM_SHED: &str = "alm_shed";
+/// ALM C2 — a child shed because this node turned relaying off
+/// (`Call::set_relay(false)`). The wire says `relay_shed:upstream_lost`.
+pub const ALM_RELAY_OFF_SHED: &str = "relay_shed:relay_off";
+/// G8 — this node's uplink stalled: its legs' Channels held messages
+/// unproved past `UPLINK_STALL_MS` on two legs or more. Counted on the rise.
+pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
+/// 45.2.0 — a call or A/V link refused on a shaped-only node: live A/V rides
+/// unshaped links only (Eric 2026-11-06).
+pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
 /// ALM — a chunk this node forwarded as an admitted media parent.
 pub const ALM_FORWARDED: &str = "alm_forwarded";
 /// ALM C4 — this node's primary parent for a stream changed.
@@ -1521,6 +1536,9 @@ pub const DIRECT_LINK_FAILED_INTERFACE_LOST: &str = "direct_link_failed_interfac
 pub const DIRECT_LINK_FAILED_PEER_FELL_BACK: &str = "direct_link_failed_peer_fell_back";
 /// A punched interface went down; its link is back on its relayed path.
 pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
+/// G8 — a direct path forgotten because its LINK closed (the punched
+/// interface went with it): the next dial proposes at once.
+pub const DIRECT_LINK_RELEASED_LINK_CLOSED: &str = "direct_link_released_link_closed";
 /// A direct A/V leg's path was judged gone and the leg fell back
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
@@ -2876,6 +2894,7 @@ pub const DIRECT_LINK_LABELS: &[&str] = &[
     DIRECT_LINK_FAILED_INTERFACE_LOST,
     DIRECT_LINK_FAILED_PEER_FELL_BACK,
     DIRECT_LINK_LOST,
+    DIRECT_LINK_RELEASED_LINK_CLOSED,
     DIRECT_LINK_LEG_FELL_BACK,
     DIRECT_LINK_OFF_PROPOSING_OFF,
     DIRECT_LINK_OFF_NO_FACILITATOR,
@@ -2950,9 +2969,14 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_OFFER_REFUSED,
     ALM_OFFER_REFUSED_NOT_PUBLISHER,
     ALM_OFFER_REFUSED_UNBOUND,
+    ALM_OFFER_REFUSED_SERVE_SEAT,
     ALM_ADMIT,
     ALM_REFUSE,
+    ALM_REFUSE_SERVE_SEAT,
     ALM_SHED,
+    ALM_RELAY_OFF_SHED,
+    ALM_UPLINK_STALL,
+    SHAPED_ONLY_NO_MEDIA,
     ALM_FORWARDED,
     ALM_PARENT_CHANGE,
     ALM_RELAY_TIER_ROSTER,

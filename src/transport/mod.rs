@@ -121,6 +121,11 @@ pub mod av_spine;
 #[cfg(feature = "_reticulum-module")]
 pub mod direct_path;
 
+/// v45.1 — why a call's media path failed: the `MediaPathFailed` event's
+/// types, the NAT report, and the one place the cause is decided. Pure, so
+/// it builds without a transport (the UniFFI surface reads its types).
+pub mod media_path;
+
 /// Application-Layer Multicast (ALM) — mesh-tree video built on the
 /// per-peer [`realtime_av_relay::RelayNode`] primitive (CIRISEdge#131 +
 /// CIRISEdge#128 MDC). Pure-Rust, signed [`realtime_av_alm::RelayCapacity`]

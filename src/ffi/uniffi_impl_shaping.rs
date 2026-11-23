@@ -164,3 +164,59 @@ pub fn onion_status() -> Result<crate::EdgeOnionStatus, crate::EdgeBindingsError
         Err(crate::EdgeBindingsError::Unsupported)
     }
 }
+
+/// v45.1 — this node's last NAT measurement, as tokens: the `local_nat` of a
+/// call's `media_path_failed` event. `None` on the leviculum v0.34.0+ciris.3
+/// pin, which measures nothing yet.
+pub fn local_nat_report() -> Result<Option<crate::EdgeNatReport>, crate::EdgeBindingsError> {
+    #[cfg(feature = "_reticulum-module")]
+    {
+        Ok(transport()?
+            .local_nat_report()
+            .as_ref()
+            .map(crate::EdgeNatReport::from))
+    }
+    #[cfg(not(feature = "_reticulum-module"))]
+    {
+        Err(crate::EdgeBindingsError::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod nat_report_tests {
+    /// The UniFFI record carries every token of the report, unchanged.
+    #[test]
+    fn the_record_is_the_report_in_tokens() {
+        use crate::transport::media_path::{
+            AddressFamily, NatAllocation, NatEvidence, NatFiltering, NatMapping, NatReport,
+            RouterMapping,
+        };
+        let at = chrono::DateTime::from_timestamp_millis(1_790_000_000_123).expect("instant");
+        let r = NatReport::new(
+            NatMapping::EndpointIndependent,
+            NatAllocation::Preserving,
+            NatFiltering::AddressAndPortDependent,
+            Some(true),
+            RouterMapping::HeldPcp,
+            AddressFamily::V6,
+            NatEvidence::TwoObserver,
+            at,
+        );
+        let e = crate::EdgeNatReport::from(&r);
+        assert_eq!(
+            e,
+            crate::EdgeNatReport {
+                mapping: "endpoint_independent".to_owned(),
+                allocation: "preserving".to_owned(),
+                filtering: "address_and_port_dependent".to_owned(),
+                port_preserving: Some(true),
+                router_mapping: "held_pcp".to_owned(),
+                family: "v6".to_owned(),
+                evidence: "two_observer".to_owned(),
+                legacy_class: "port_restricted".to_owned(),
+                measured_at: 1_790_000_000_123,
+            }
+        );
+        assert_eq!(NatMapping::parse(&e.mapping), Some(r.mapping));
+    }
+}

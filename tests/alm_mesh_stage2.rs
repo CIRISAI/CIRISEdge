@@ -339,7 +339,116 @@ async fn topo(
     dials: &[(usize, usize)],
     canonical: Option<usize>,
 ) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
+    topo_capped(tag, n, members, dials, canonical, None).await
+}
+
+/// A node's UPLINK as a shared bottleneck: every byte the node sends back
+/// down a TCP link another node dialled to it waits its turn in ONE FIFO
+/// drained at `bytes_per_s` (0: unlimited), with no queue limit — a
+/// bufferbloated home or cellular uplink. What others send to the node
+/// passes at once. Turned on after setup.
+struct CappedUplink {
+    bytes_per_s: AtomicU64,
+    next_free: tokio::sync::Mutex<tokio::time::Instant>,
+}
+
+impl CappedUplink {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            bytes_per_s: AtomicU64::new(0),
+            next_free: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        })
+    }
+
+    fn cap_kbit(&self, kbit: u64) {
+        self.bytes_per_s.store(kbit * 1000 / 8, Ordering::SeqCst);
+    }
+
+    /// When `n` bytes handed over now leave the bottleneck.
+    async fn due(&self, n: usize) -> tokio::time::Instant {
+        let rate = self.bytes_per_s.load(Ordering::SeqCst);
+        let now = tokio::time::Instant::now();
+        if rate == 0 {
+            return now;
+        }
+        let mut next = self.next_free.lock().await;
+        let start = (*next).max(now);
+        let done = start + Duration::from_micros(n as u64 * 1_000_000 / rate);
+        *next = done;
+        done
+    }
+}
+
+/// A pipe in front of `port`'s listener whose return direction (the node's
+/// sends) rides `uplink`. Returns the port to dial instead.
+async fn capped_listener(port: u16, uplink: Arc<CappedUplink>) -> u16 {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the capped pipe");
+    let front = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(node) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
+                continue;
+            };
+            let _ = client.set_nodelay(true);
+            let _ = node.set_nodelay(true);
+            let (mut client_rx, mut client_tx) = client.into_split();
+            let (mut node_rx, mut node_tx) = node.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut client_rx, &mut node_tx).await;
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+            let up = Arc::clone(&uplink);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                while let Ok(n) = node_rx.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    let due = up.due(n).await;
+                    if tx.send((due, buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some((due, bytes)) = rx.recv().await {
+                    tokio::time::sleep_until(due).await;
+                    if client_tx.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    front
+}
+
+/// [`topo`], with node `capped.0`'s uplink a [`CappedUplink`]: every node that
+/// dials it reaches it through [`capped_listener`]. The capped node must dial
+/// nobody (its own outbound connections would bypass the cap).
+#[allow(clippy::too_many_lines)] // `topo`'s body plus the capped pipe
+async fn topo_capped(
+    tag: &str,
+    n: usize,
+    members: usize,
+    dials: &[(usize, usize)],
+    canonical: Option<usize>,
+    capped: Option<(usize, Arc<CappedUplink>)>,
+) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
     init_tracing();
+    if let Some((c, _)) = &capped {
+        assert!(
+            dials.iter().all(|(_, j)| j != c),
+            "the capped node dials nobody"
+        );
+    }
+    let mut capped_port: Option<u16> = None;
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut keys = Vec::new();
     for i in 0..n {
@@ -358,11 +467,19 @@ async fn topo(
     let mut nodes: Vec<Node> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
         let dir = directory_with(records.clone()).await;
-        let peers: Vec<u16> = dials
-            .iter()
-            .filter(|(_, j)| *j == i)
-            .map(|(a, _)| nodes[*a].port)
-            .collect();
+        let mut peers: Vec<u16> = Vec::new();
+        for (a, _) in dials.iter().filter(|(_, j)| *j == i) {
+            match &capped {
+                Some((c, uplink)) if c == a => {
+                    if capped_port.is_none() {
+                        capped_port =
+                            Some(capped_listener(nodes[*a].port, Arc::clone(uplink)).await);
+                    }
+                    peers.push(capped_port.expect("the capped pipe"));
+                }
+                _ => peers.push(nodes[*a].port),
+            }
+        }
         nodes.push(
             node(
                 key,
@@ -3080,4 +3197,570 @@ async fn a_member_claiming_depth_zero_is_not_the_publisher() {
         "{:?}",
         c.metrics.av_plane()
     );
+}
+
+/// **Calls cut — a relay turns off mid-call** (`Call::set_relay(false)`):
+/// members `A` and `E` both relay; `B` and `C` reach each other only through
+/// them (each a TCP client of A and E; `T` the canonical, no member). C hears
+/// B through one of them, X. X turns relaying off: it sheds C make-before-
+/// break, C re-parents to the other relay Y and keeps hearing B, the event
+/// at C names Y, and X reports `RelayStatus { relaying: false }` and, once
+/// its drain passes, forwards to nobody.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_relay_that_turns_off_hands_its_children_to_another_relay() {
+    let _call = one_call().await;
+    let tag = "alm2-setrelay";
+    // 0 = A, 1 = E (relays), 2 = B, 3 = C (the room's four); 4 = T.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+    )
+    .await;
+    let (a, e, b, c, t) = (&nodes[0], &nodes[1], &nodes[2], &nodes[3], &nodes[4]);
+    let ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let ce = join_loaded(e, &groups[1], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(b, &groups[2], tag, relay_opts(), None).await;
+    let mut cc = join_loaded(c, &groups[3], tag, relay_opts(), None).await;
+    let mut c_events = cc.events().expect("C's events");
+    wait_legs(&cb, 2).await;
+    wait_legs(&cc, 2).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!cc.legs().contains(&b.key.key_id), "C has no leg to B");
+
+    let relays = [a.key.key_id.clone(), e.key.key_id.clone()];
+    let on_a_relay =
+        || async { primary_for(&cc, cb.stream()).is_some_and(|p| relays.contains(&p)) };
+    assert!(
+        wait_until(Duration::from_secs(90), on_a_relay).await,
+        "C hears B through A or E: {:?}",
+        cc.alm_parents()
+    );
+    let x = primary_for(&cc, cb.stream()).expect("a parent");
+    let (cx, y) = if x == a.key.key_id {
+        (&ca, e.key.key_id.clone())
+    } else {
+        (&ce, a.key.key_id.clone())
+    };
+    assert_ne!(x, t.key.key_id);
+    let (relaying, kids) = cx.relay_status();
+    assert!(relaying && kids >= 1, "X relays: {:?}", cx.relay_status());
+
+    // X turns relaying off.
+    cx.set_relay(false).await;
+    assert!(!cx.relay_status().0);
+    let moved = wait_until(Duration::from_secs(30), || async {
+        primary_for(&cc, cb.stream()).as_deref() == Some(y.as_str())
+    })
+    .await;
+    assert!(
+        moved,
+        "C re-parents to the other relay: {:?}; X's log {:?}",
+        cc.alm_parents(),
+        cx.alm_log()
+    );
+    // C still hears B, now through Y.
+    let mut rx_c = cc.frames().expect("C's frames");
+    let mut heard = 0;
+    for seq in 0..40 {
+        cb.publish(Frame::opaque(body("b", seq)))
+            .await
+            .expect("B publishes");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(f)) = tokio::time::timeout_at(deadline, rx_c.recv()).await {
+        if f.publisher == b.key.key_id {
+            heard += 1;
+            if heard == 40 {
+                break;
+            }
+        }
+    }
+    assert!(heard >= 36, "C keeps hearing B through Y: {heard} of 40");
+    // X forwards to nobody once its drain passes, and said so.
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            cx.relay_status() == (false, 0)
+        })
+        .await,
+        "X's children are gone: {:?}",
+        cx.relay_status()
+    );
+    assert!(
+        av(
+            if x == a.key.key_id {
+                &a.metrics
+            } else {
+                &e.metrics
+            },
+            "relay_shed:relay_off"
+        ) >= 1
+    );
+    // C was told the path moved through Y.
+    let mut through = Vec::new();
+    while let Ok(ev) = c_events.try_recv() {
+        if let ciris_edge::transport::av_call::CallEvent::MediaPathRestored {
+            member,
+            via,
+            through: t,
+        } = ev
+        {
+            if member == b.key.key_id {
+                assert_eq!(via, ciris_edge::transport::media_path::PathKind::PeerRelay);
+                through.push(t);
+            }
+        }
+    }
+    assert_eq!(
+        through.last().cloned().flatten().as_deref(),
+        Some(y.as_str()),
+        "the last path event for B names Y: {through:?}"
+    );
+    drop(cc);
+    drop(cb);
+    drop(ce);
+    drop(ca);
+}
+
+/// **Calls cut — a serve seat that IS a room member never relays**, audio
+/// included, even joined with `relay: true`: members `A` (relays), `S` (a
+/// serve seat in every node's canonical set, its own included), `B` and `C`
+/// (each a TCP client of A and S only, so they reach each other only through
+/// one of them). B and C hear each other through A, never S; S reports
+/// `relaying: false` and forwards to nobody, and nobody takes it as a parent.
+// The seat set lives on the node's Edge (`_edge`).
+#[allow(
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::used_underscore_binding
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_serve_seat_in_the_room_never_relays() {
+    let _call = one_call().await;
+    let tag = "alm2-seat";
+    // 0 = A, 1 = S (the seat), 2 = B, 3 = C; 4 = T.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+    )
+    .await;
+    let (a, seat, b, c) = (&nodes[0], &nodes[1], &nodes[2], &nodes[3]);
+    for n in &nodes {
+        n._edge
+            .recognised_seats()
+            .write()
+            .expect("the seat set")
+            .insert(seat.key.key_id.clone());
+    }
+    let _ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let cs = join_loaded(seat, &groups[1], tag, relay_opts(), None).await;
+    let cb = join_loaded(b, &groups[2], tag, relay_opts(), None).await;
+    let cc = join_loaded(c, &groups[3], tag, relay_opts(), None).await;
+    wait_legs(&cb, 2).await;
+    wait_legs(&cc, 2).await;
+    assert_eq!(cs.relay_status(), (false, 0), "a seat never relays");
+    let through_a = wait_until(Duration::from_secs(90), || async {
+        primary_for(&cc, cb.stream()).as_deref() == Some(a.key.key_id.as_str())
+            && primary_for(&cb, cc.stream()).as_deref() == Some(a.key.key_id.as_str())
+    })
+    .await;
+    assert!(
+        through_a,
+        "B and C hear each other through A: C {:?} / B {:?}",
+        cc.alm_parents(),
+        cb.alm_parents()
+    );
+    // Long enough for several offer rounds: S is never a parent of anything
+    // it does not publish, and relays nothing.
+    for _ in 0..20 {
+        for call in [&cb, &cc] {
+            for p in call.alm_parents() {
+                if p.publisher.as_deref() == Some(seat.key.key_id.as_str()) {
+                    continue;
+                }
+                for parent in [p.primary.as_deref(), p.standby.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    assert_ne!(parent, seat.key.key_id, "the seat is a media parent: {p:?}");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(cs.relay_status(), (false, 0));
+    assert!(cs.relayed_to().is_empty(), "{:?}", cs.relayed_to());
+    assert_eq!(cs.alm_counts().forwarded, 0);
+}
+
+/// Publish 600 B frames at 30 Hz from `cp` for `secs`, from `seq0`.
+async fn publish_capped_for(cp: &mut Call, secs: u64, seq0: u64) -> u64 {
+    let size = cp.chunk_plaintext_budget().unwrap_or(240).min(600);
+    let mut seq = seq0;
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < end {
+        let mut b = body("p", seq);
+        b.resize(size, b'.');
+        let _ = cp.publish(Frame::opaque(b)).await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    seq
+}
+
+/// Every link `m` saw closed by Channel retry exhaustion, either side
+/// (A/V legs included: they are not identified, so `peer_activity` misses
+/// them).
+fn channel_exhausted(m: &EdgeMetrics) -> u64 {
+    closed_by(m, "channel_exhausted")
+}
+
+/// Every link `m` saw closed with `cause`, inbound and outbound.
+fn closed_by(m: &EdgeMetrics, cause: &str) -> u64 {
+    m.inbound_link_closed_by_reason()
+        .get(cause)
+        .copied()
+        .unwrap_or(0)
+        + m.outbound_link_closed_by_reason()
+            .get(cause)
+            .copied()
+            .unwrap_or(0)
+}
+
+/// Every link `m` saw torn down by something other than this node or its
+/// peer choosing to (a retry exhaustion, a timeout, staleness).
+fn torn_down(m: &EdgeMetrics) -> u64 {
+    ["channel_exhausted", "timeout", "stale"]
+        .iter()
+        .map(|c| closed_by(m, c))
+        .sum()
+}
+
+/// **G8 — a publisher whose uplink is capped below its fan-out** (the
+/// server's av_mesh cell, on loopback, with no tc): `P` publishes
+/// 600 B at 30 Hz to `A`, `B` and `C`, who reach each other directly, every
+/// member relaying (the host's member default). `P`'s uplink is then capped
+/// at 250 kbit/s with an unbounded queue: about one copy of its stream on
+/// the wire, a third of its fan-out.
+///
+/// What the design does (`docs/AV_ALM_DESIGN.md` §5.1, C2): `P` sheds to one
+/// child make-before-break, the other two take that child as their relay,
+/// and everyone keeps hearing `P` at about the one-copy rate. What must not
+/// happen (CIRISEdge 45.1.9 matrix, leviculum#113): every link of `P`
+/// torn down by Channel retry exhaustion within ~2 s of the cap.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
+    let _call = one_call().await;
+    let tag = "alm2-capped";
+    let uplink = CappedUplink::new();
+    // 0 = P (capped, dials nobody), 1..=3 = A, B, C (dial P and each other);
+    // 4 = T (the canonical shape, dials everyone but P).
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&uplink))),
+    )
+    .await;
+    let p = &nodes[0];
+    let mut cp = join_loaded(p, &groups[0], tag, relay_opts(), None).await;
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    wait_legs(&cp, 3).await;
+    for l in &listeners {
+        wait_legs(l, 3).await;
+    }
+    let mut rx: Vec<mpsc::Receiver<ReceivedFrame>> = listeners
+        .iter_mut()
+        .map(|l| l.frames().expect("frames"))
+        .collect();
+    let drain = |rx: &mut Vec<mpsc::Receiver<ReceivedFrame>>, from: &str| {
+        rx.iter_mut()
+            .map(|r| {
+                let mut n = 0u64;
+                while let Ok(f) = r.try_recv() {
+                    if f.publisher == from {
+                        n += 1;
+                    }
+                }
+                n
+            })
+            .collect::<Vec<u64>>()
+    };
+    // Baseline: the full mesh carries P.
+    let seq = publish_capped_for(&mut cp, 5, 0).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let base = drain(&mut rx, &p.key.key_id);
+    assert!(
+        base.iter().all(|n| *n * 10 >= seq * 9),
+        "baseline: {base:?} of {seq}"
+    );
+
+    // The cap: one copy of P's stream on the wire and a third to spare (the
+    // server's cell, 250 kbit/s against ~190 kbit/s a copy, scaled to this
+    // leg's frame: the frame plus ~170 B of chunk, signature, seal and link
+    // framing, 30 a second), so three copies are ~2.3x what it carries.
+    let frame = cp.chunk_plaintext_budget().unwrap_or(240).min(600) as u64;
+    let copy_kbit = (frame + 170) * 8 * 30 / 1000;
+    let exhausted_before: u64 = nodes.iter().map(|n| channel_exhausted(&n.metrics)).sum();
+    let torn_before: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum();
+    uplink.cap_kbit(copy_kbit * 13 / 10);
+    // When the first link is torn down after the cap, on P and on its peers
+    // (the matrix: every node, 1.6-2.2 s after cap_on).
+    let cap_on = tokio::time::Instant::now();
+    let first_torn: Arc<std::sync::Mutex<Vec<Option<Duration>>>> =
+        Arc::new(std::sync::Mutex::new(vec![None; nodes.len()]));
+    let sampler = {
+        let ms: Vec<EdgeMetrics> = nodes.iter().map(|n| n.metrics.clone()).collect();
+        let base: Vec<u64> = ms.iter().map(torn_down).collect();
+        let first = Arc::clone(&first_torn);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut f = first.lock().expect("first");
+                for (i, m) in ms.iter().enumerate() {
+                    if f[i].is_none() && torn_down(m) > base[i] {
+                        f[i] = Some(cap_on.elapsed());
+                    }
+                }
+            }
+        })
+    };
+    let capped_from = seq;
+    let seq = publish_capped_for(&mut cp, 30, seq).await;
+    sampler.abort();
+    let sent = seq - capped_from;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let heard = drain(&mut rx, &p.key.key_id);
+    let exhausted: u64 = nodes
+        .iter()
+        .map(|n| channel_exhausted(&n.metrics))
+        .sum::<u64>()
+        - exhausted_before;
+    let torn: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum::<u64>() - torn_before;
+    let parents: Vec<Option<String>> = listeners
+        .iter()
+        .map(|l| primary_for(l, cp.stream()))
+        .collect();
+    let direct = parents
+        .iter()
+        .filter(|x| x.as_deref() == Some(p.key.key_id.as_str()))
+        .count();
+    let context = format!(
+        "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
+         ChannelExhausted {exhausted}; torn {torn}; first teardown after the cap (P, A, B, C, T) {:?}; P legs {:?}",
+        cp.alm_own_children(),
+        cp.alm_counts(),
+        first_torn.lock().expect("first").clone(),
+        cp.legs()
+    );
+    // Every criterion is judged and every failure named, so a red run says
+    // what each fix buys (G8: A and C in edge, leviculum#113).
+    let mut failed: Vec<String> = Vec::new();
+    if exhausted != 0 {
+        failed.push(format!("links torn down by retry exhaustion: {exhausted}"));
+    }
+    if torn != 0 {
+        failed.push(format!("links torn down (exhausted/timeout/stale): {torn}"));
+    }
+    if direct != 1 {
+        failed.push(format!("P's direct children: {direct}, want 1"));
+    }
+    if parents.iter().any(Option::is_none) {
+        failed.push("a listener has no parent".to_owned());
+    }
+    for (i, n) in heard.iter().enumerate() {
+        // About the one-copy rate: the uplink carries one copy, so each
+        // listener hears most of what P published once it settled.
+        if *n * 10 < sent * 7 {
+            failed.push(format!("listener {i} heard {n} of {sent}"));
+        }
+    }
+    eprintln!("[G8] capped publisher: {context}; failed {failed:?}");
+    assert!(failed.is_empty(), "{failed:?}: {context}");
+    drop(listeners);
+    drop(cp);
+}
+
+/// **45.2.0 — no calls on a shaped-only node** (Eric 2026-11-06: live A/V
+/// rides unshaped links only). Node `S` sets `require_shaped_links`:
+/// - its call start and join are refused `ShapedOnly`
+///   (`shaped_only_no_media`), before anything starts;
+/// - an A/V link another member dials to it is refused on ITS side (the
+///   accepting door, not only the proposing one);
+/// - a call among the others is unaffected: A, B and C hear each other.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_shaped_only_node_neither_joins_nor_accepts_call_media() {
+    let _call = one_call().await;
+    let tag = "alm2-shaped";
+    // 0..=2 = A, B, C; 3 = S (shaped-only). Full mesh, no canonical.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        4,
+        4,
+        &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)],
+        None,
+    )
+    .await;
+    let (a, s) = (&nodes[0], &nodes[3]);
+    let mut policy = s.transport.shaping_policy();
+    policy.require_shaped_links = true;
+    let _ = s.transport.set_shaping_policy(policy).await;
+
+    // Start and join are refused by name.
+    let refused = Call::join(
+        &room_of(tag),
+        &s.key.key_id,
+        CallDeps {
+            room_group: groups[3].clone(),
+            roster: Arc::new(Roster(true)),
+            owners: Arc::clone(&s.dir) as Arc<dyn ciris_edge::transport::av_call::CallOwners>,
+            transport: Arc::clone(&s.transport),
+            lifecycle: Arc::clone(&s.lifecycle),
+            registrar: Arc::new(CountingRegistrar::default()),
+            events: None,
+            metrics: Some(s.metrics.clone()),
+            record: None,
+            signer: s.key.signer(),
+            verifier: Arc::clone(&s.dir) as Arc<dyn StreamKeyVerifier>,
+            load: None,
+        },
+        relay_opts(),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(ciris_edge::transport::av_call::CallError::ShapedOnly)
+        ),
+        "a shaped-only node's join is refused: {:?}",
+        refused.as_ref().err()
+    );
+    assert!(av(&s.metrics, "shaped_only_no_media") >= 1);
+
+    // The accepting door: S holds an A/V address (as a node that joined
+    // before turning shaped-only would), A dials it, S refuses the arrival.
+    let stream =
+        ciris_edge::transport::realtime_av::StreamId(sha2::Sha256::digest(b"g8-shaped").into());
+    let group = ciris_edge::av_addressing::stream_group_id(stream);
+    let scope = ciris_edge::cohort_scope::CohortScope::Cohort {
+        cohort_id: room_of(tag),
+    };
+    for n in [a, s] {
+        n.lifecycle
+            .joined(
+                &scope,
+                &group,
+                1,
+                &[0x5d; 32],
+                &[a.key.key_id.as_str(), s.key.key_id.as_str()],
+            )
+            .expect("install the stream's group");
+    }
+    let mut s_arrivals = s.transport.take_av_arrivals().expect("S's arrivals");
+    let address = a
+        .lifecycle
+        .table()
+        .send_address(&scope, &group, &s.key.key_id)
+        .expect("S's address");
+    let dialled = a.transport.open_av_link(&s.key.key_id, &address).await;
+    if dialled.is_ok() {
+        let arrival = tokio::time::timeout(Duration::from_secs(20), s_arrivals.recv())
+            .await
+            .expect("the arrival reaches S")
+            .expect("arrivals open");
+        let accepted = s.transport.accept_av_arrival(arrival).await;
+        assert!(
+            accepted
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("shaped_only_no_media")),
+            "S refuses the A/V arrival by name: {:?}",
+            accepted.as_ref().err()
+        );
+    }
+    let before = av(&s.metrics, "shaped_only_no_media");
+    assert!(before >= 2, "the accept door counted too: {before}");
+
+    // A call among the others is unaffected.
+    let mut ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(&nodes[1], &groups[1], tag, relay_opts(), None).await;
+    let cc = join_loaded(&nodes[2], &groups[2], tag, relay_opts(), None).await;
+    for call in [&ca, &cb, &cc] {
+        assert!(
+            wait_until(Duration::from_secs(30), || async {
+                call.legs().iter().filter(|m| **m != s.key.key_id).count() >= 2
+            })
+            .await,
+            "the others' legs come up: {:?}",
+            call.legs()
+        );
+        assert!(
+            !call.legs().contains(&s.key.key_id),
+            "no leg to the shaped-only node: {:?}",
+            call.legs()
+        );
+    }
+    let mut rx = ca.frames().expect("A's frames");
+    for seq in 0..20 {
+        cb.publish(Frame::opaque(body("b", seq)))
+            .await
+            .expect("B publishes");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let mut heard = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(f)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        if f.publisher == nodes[1].key.key_id {
+            heard += 1;
+            if heard == 20 {
+                break;
+            }
+        }
+    }
+    assert_eq!(heard, 20, "A hears B: the others' call runs");
 }

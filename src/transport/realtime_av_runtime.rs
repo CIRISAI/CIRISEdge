@@ -1660,7 +1660,7 @@ mod leviculum_link {
         }
 
         async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
-            self.send_with(bytes, None).await
+            self.send_with(bytes, None, false).await
         }
 
         /// leviculum#102 — a leg whose peer takes datagrams sends each media
@@ -1668,18 +1668,48 @@ mod leviculum_link {
         /// the Channel, timed when the peer takes timed frames, and counts
         /// the fallback.
         async fn send_media(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            self.media(bytes, false).await
+        }
+
+        /// Calls cut — a forwarded chunk: the same send, sealed into the wire
+        /// ledger's `relay` plane.
+        async fn send_media_relayed(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            self.media(bytes, true).await
+        }
+    }
+
+    impl LeviculumAvSender {
+        /// One media frame: a datagram on a datagram leg, else a (timed)
+        /// Channel message. `relayed`: forwarded for another member.
+        async fn media(&self, bytes: &[u8], relayed: bool) -> Result<(), AvDispatcherError> {
             if self.media_ttl.uses_datagrams() {
-                return self.send_datagram(bytes);
+                return self.send_datagram(bytes, relayed);
             }
-            let sent = self.send_with(bytes, self.media_ttl.for_chunk(bytes)).await;
+            let sent = self
+                .send_with(bytes, self.media_ttl.for_chunk(bytes), relayed)
+                .await;
             if sent.is_ok() {
                 self.count(crate::observability::AV_SENT_DATAGRAM_FALLBACK);
             }
             sent
         }
-    }
 
-    impl LeviculumAvSender {
+        /// Seal `bytes` on `lane` under the link's keys; a forwarded chunk is
+        /// counted in the `relay` plane.
+        fn seal_lane(
+            &self,
+            lane: crate::transport::link_seal::Lane,
+            bytes: &[u8],
+            relayed: bool,
+        ) -> Result<Vec<u8>, crate::transport::link_seal::SealRefusal> {
+            if relayed {
+                self.seals
+                    .seal_relayed(self.link_id.into_bytes(), lane, bytes)
+            } else {
+                self.seals.seal(self.link_id.into_bytes(), lane, bytes)
+            }
+        }
+
         /// leviculum#102 — one media frame as one unordered link datagram,
         /// sealed on the E1 datagram lane. Never waits: a full action queue
         /// (`Busy`) or interface (`PacingDelay`) refuses it before leviculum
@@ -1688,7 +1718,7 @@ mod leviculum_link {
         /// never retried: an interface with no room sheds it
         /// (`DropReason::DatagramShed`, `av_datagram_shed`) and the receiver
         /// sees the sequence gap.
-        fn send_datagram(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+        fn send_datagram(&self, bytes: &[u8], relayed: bool) -> Result<(), AvDispatcherError> {
             use leviculum_core::SendError;
             use leviculum_std::error::Error as LevError;
 
@@ -1707,11 +1737,9 @@ mod leviculum_link {
                 }));
             }
             // CC 5.3.3.5 E1 — sealed under the link's keys, or not sent.
-            let Ok(sealed) = self.seals.seal(
-                self.link_id.into_bytes(),
-                crate::transport::link_seal::Lane::Datagram,
-                bytes,
-            ) else {
+            let Ok(sealed) =
+                self.seal_lane(crate::transport::link_seal::Lane::Datagram, bytes, relayed)
+            else {
                 self.count(crate::observability::AV_SEND_FAILED);
                 if let Some(m) = self.metrics.as_ref() {
                     m.inc_link_seal(crate::observability::LINK_SEAL_REFUSED_UNSEALED_SEND);
@@ -1765,6 +1793,7 @@ mod leviculum_link {
             &self,
             bytes: &[u8],
             ttl: Option<std::time::Duration>,
+            relayed: bool,
         ) -> Result<(), AvDispatcherError> {
             use leviculum_core::SendError;
             use leviculum_std::error::Error as LevError;
@@ -1786,11 +1815,9 @@ mod leviculum_link {
                 }));
             }
             // CC 5.3.3.5 E1 — sealed under the link's keys, or not sent.
-            let Ok(sealed) = self.seals.seal(
-                self.link_id.into_bytes(),
-                crate::transport::link_seal::Lane::Channel,
-                bytes,
-            ) else {
+            let Ok(sealed) =
+                self.seal_lane(crate::transport::link_seal::Lane::Channel, bytes, relayed)
+            else {
                 self.count(crate::observability::AV_SEND_FAILED);
                 if let Some(m) = self.metrics.as_ref() {
                     m.inc_link_seal(crate::observability::LINK_SEAL_REFUSED_UNSEALED_SEND);
