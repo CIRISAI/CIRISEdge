@@ -668,3 +668,94 @@ async fn a_withdraws_waits_for_its_target_and_lands_after_it_1252() {
     );
     let _ = &r.dave;
 }
+
+/// CIRISEdge#1029 F7 — **a cosignature for a hold this node has settled is
+/// refused TERMINAL, and not asked for again.**
+///
+/// Field (12-person star, 45.1.9): the joiner admitted dave's widening
+/// assembled, so its hold settled `landed`; the founder then pushed the
+/// event's `cosign:signature:v1` rows every round and each was refused
+/// `cosign_pending_settled`, booked `retry="transient"` (~16 refusals per
+/// joiner). persist 61.4 raises the token as an untyped `InvalidArgument`, so
+/// edge's conservative default read it as moving state. A settled hold is not
+/// held again (CIRISPersist#1252): the same bytes can only be refused again.
+/// Here the joiner holds the pending row, its voices fill it, the event lands,
+/// and then a further member's voice arrives.
+/// Red before: `Some(Transient)`, and the hash not suppressed past the 20 s
+/// transient base.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cosignature_for_a_settled_hold_is_refused_terminal_1029() {
+    use crate::replication::refusal_backoff::{RetryDisposition, TRANSIENT_CAP};
+    use ciris_persist::federation::cosign as persist_cosign;
+    use ciris_persist::federation::group_plane::group_signed_of_row;
+    let people = parties();
+    let dirs = stores(&people, 2).await;
+    let (a, b) = (Arc::clone(&dirs[0]), Arc::clone(&dirs[1]));
+    let r = room_of_three(people, &[&b], &a).await;
+    let (row, bytes) = assembled(&a, &r).await;
+    let nb = bridge(&b, &r.bob);
+    let signed = group_signed_of_row(&row)
+        .expect("a group row")
+        .expect("decodes");
+    // The hold opens at the joiner (its pending row), its two voices fill it,
+    // and the assembled event lands: the hold settles `landed` there.
+    let pending = serde_json::to_vec(&persist_cosign::pending_row(&signed).expect("pending row"))
+        .expect("wire");
+    let held = nb
+        .apply_envelope_bytes(KIND, &pending, Some(&r.alice.node.key_id))
+        .await;
+    assert_eq!(held, ApplyOutcome::Admitted, "the hold opens: {held:?}");
+    for voice in signed.cosignatures() {
+        let wire = serde_json::to_vec(
+            &persist_cosign::signature_row(&signed, voice).expect("signature row"),
+        )
+        .expect("wire");
+        let filled = nb
+            .apply_envelope_bytes(KIND, &wire, Some(&r.alice.node.key_id))
+            .await;
+        assert_eq!(
+            filled,
+            ApplyOutcome::Admitted,
+            "a voice fills the hold: {filled:?}"
+        );
+    }
+    let landed = nb
+        .apply_envelope_bytes(KIND, &bytes, Some(&r.alice.node.key_id))
+        .await;
+    assert!(
+        matches!(landed, ApplyOutcome::Admitted | ApplyOutcome::Duplicate),
+        "the event lands: {landed:?}"
+    );
+    // Then alice's voice, which the event did not need, as the founder pushes
+    // every member's.
+    let voices = vec![cosign(&r.event, &r.alice.person)
+        .await
+        .expect("alice's voice")];
+    let backoff = nb.refusal_backoff_for_test();
+    for voice in &voices {
+        let wire = serde_json::to_vec(
+            &persist_cosign::signature_row(&signed, voice).expect("signature row"),
+        )
+        .expect("wire");
+        let hash = plain_ref(&wire);
+        let outcome = nb
+            .apply_envelope_bytes(KIND, &wire, Some(&r.alice.node.key_id))
+            .await;
+        let ApplyOutcome::Refused { reason, .. } = &outcome else {
+            panic!("a cosignature for a settled hold is refused, got {outcome:?}");
+        };
+        assert!(
+            reason.contains(persist_cosign::COSIGN_PENDING_SETTLED),
+            "precondition: the field's refusal, got {reason}"
+        );
+        assert_eq!(
+            outcome.retry_disposition(),
+            Some(RetryDisposition::Terminal),
+            "a settled hold is not held again: the same bytes can only be refused again"
+        );
+        assert!(
+            backoff.suppressed_at(KIND, &hash, std::time::Instant::now() + TRANSIENT_CAP),
+            "not asked for again inside the terminal window"
+        );
+    }
+}

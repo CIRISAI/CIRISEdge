@@ -570,6 +570,9 @@ fn signature_refusal(
 ///   object), an `InvalidArgument` led by `self_roster::ASSERTED_AT_STALE`,
 ///   and a `SelfRosterNotLanded` whose decision is not `pending`. Each arm
 ///   carries its reasoning.
+/// - CIRISEdge#1029 F7: an `InvalidArgument` led by persist's
+///   `cosign::COSIGN_PENDING_SETTLED` or `cosign::COSIGN_PENDING_TOO_OLD`
+///   ([`cosign_refusal_terminal`]).
 pub(crate) fn typed_terminal_verdict(
     err: &ciris_persist::federation::Error,
 ) -> Option<&'static str> {
@@ -659,8 +662,27 @@ pub(crate) fn typed_terminal_verdict(
         // `KeyPlaneRefused` (transient, `attestation_refusal_retry`); this arm
         // is for any door that returns it typed.
         E::SelfRosterNotLanded { decision, .. } if *decision != "pending" => Some(*decision),
+        // CIRISEdge#1029 F7 — persist 61.4 (CIRISPersist#1252) refuses a cosign
+        // row for a hold this node has already settled (`landed` or `expired`),
+        // and a pending row whose event was signed more than one hold window
+        // before this node's receipt, as an untyped `InvalidArgument` led by a
+        // stable `pub const` token. Neither can turn: a settled hold is not held
+        // again, and the event only ages. Read from persist's token, so the
+        // conservative transient default no longer re-asks the same bytes every
+        // round (~16 refusals per joiner in a 12-person room). persist types
+        // both on the next 61.4 cut; the class does not exist on v62.
+        E::InvalidArgument(message) => cosign_refusal_terminal(message),
         _ => None,
     }
+}
+
+/// CIRISEdge#1029 F7 — the persist cosign refusal token leading `message`,
+/// if it is one no re-offer can admit ([`typed_terminal_verdict`]).
+fn cosign_refusal_terminal(message: &str) -> Option<&'static str> {
+    use ciris_persist::federation::cosign::{COSIGN_PENDING_SETTLED, COSIGN_PENDING_TOO_OLD};
+    [COSIGN_PENDING_SETTLED, COSIGN_PENDING_TOO_OLD]
+        .into_iter()
+        .find(|token| message.starts_with(token))
 }
 
 /// persist v55.0.0 (#1055, #1007) — a `PurgeRefused` is terminal unless
