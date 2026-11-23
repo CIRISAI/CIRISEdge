@@ -19559,6 +19559,20 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             );
             ctx.link_book().forget(link_id, close_cause(reason)).await;
             ctx.alm_links.forget(&link_id.into_bytes());
+            // G8 — the punched interface goes with its link: forget the
+            // peer's direct path so its next dial proposes at once.
+            if let Some(peer) = ctx.direct_paths.tracker().link_closed(link_id) {
+                tracing::info!(
+                    peer = %peer,
+                    link = %hex::encode(link_id.as_bytes()),
+                    reason = ?reason,
+                    "direct path RELEASED: its link closed and its punched interface with it; \
+                     the next dial proposes at once (no backoff)"
+                );
+                if let Some(m) = ctx.metrics {
+                    m.inc_direct_link(crate::observability::DIRECT_LINK_RELEASED_LINK_CLOSED);
+                }
+            }
             if pooled {
                 note_starved_pool_close(reason, &link_id);
             }

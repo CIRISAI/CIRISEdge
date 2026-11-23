@@ -1100,6 +1100,9 @@ pub const ALM_SHED: &str = "alm_shed";
 /// ALM C2 — a child shed because this node turned relaying off
 /// (`Call::set_relay(false)`). The wire says `relay_shed:upstream_lost`.
 pub const ALM_RELAY_OFF_SHED: &str = "relay_shed:relay_off";
+/// G8 — this node's uplink stalled: its legs' Channels held messages
+/// unproved past `UPLINK_STALL_MS` on two legs or more. Counted on the rise.
+pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
 /// ALM — a chunk this node forwarded as an admitted media parent.
 pub const ALM_FORWARDED: &str = "alm_forwarded";
 /// ALM C4 — this node's primary parent for a stream changed.
@@ -1530,6 +1533,9 @@ pub const DIRECT_LINK_FAILED_INTERFACE_LOST: &str = "direct_link_failed_interfac
 pub const DIRECT_LINK_FAILED_PEER_FELL_BACK: &str = "direct_link_failed_peer_fell_back";
 /// A punched interface went down; its link is back on its relayed path.
 pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
+/// G8 — a direct path forgotten because its LINK closed (the punched
+/// interface went with it): the next dial proposes at once.
+pub const DIRECT_LINK_RELEASED_LINK_CLOSED: &str = "released_link_closed";
 /// A direct A/V leg's path was judged gone and the leg fell back
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
@@ -2885,6 +2891,7 @@ pub const DIRECT_LINK_LABELS: &[&str] = &[
     DIRECT_LINK_FAILED_INTERFACE_LOST,
     DIRECT_LINK_FAILED_PEER_FELL_BACK,
     DIRECT_LINK_LOST,
+    DIRECT_LINK_RELEASED_LINK_CLOSED,
     DIRECT_LINK_LEG_FELL_BACK,
     DIRECT_LINK_OFF_PROPOSING_OFF,
     DIRECT_LINK_OFF_NO_FACILITATOR,
@@ -2965,6 +2972,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_REFUSE_SERVE_SEAT,
     ALM_SHED,
     ALM_RELAY_OFF_SHED,
+    ALM_UPLINK_STALL,
     ALM_FORWARDED,
     ALM_PARENT_CHANGE,
     ALM_RELAY_TIER_ROSTER,

@@ -265,7 +265,21 @@ pub(super) struct AlmState {
     pub(super) parent_moves: Vec<(StreamId, Option<String>)>,
     /// Calls cut — per child node: bytes, chunks and streams forwarded.
     relayed: BTreeMap<String, (u64, u64, BTreeSet<StreamId>)>,
+    /// G8 — this node's uplink is stalled: its legs' Channels hold messages
+    /// unproved far past the RTT floor ([`UPLINK_STALL_MS`] on at least
+    /// [`UPLINK_STALL_LEGS`] legs). On a datagram uplink this is the only
+    /// sender-side sign of a bottleneck past the process (a router, a
+    /// bufferbloated cellular queue): the egress meter's refusals never
+    /// come (`path_meter` "Limit: datagram legs").
+    uplink_stall: bool,
 }
+
+/// G8 — a leg whose oldest unproved Channel message has waited this long is
+/// stalled: far above any propagation floor this mesh runs at, and under
+/// leviculum's ~1.3 s retry budget (leviculum#113).
+pub(super) const UPLINK_STALL_MS: u64 = 400;
+/// G8 — how many stalled legs make it the UPLINK (not one slow peer).
+pub(super) const UPLINK_STALL_LEGS: usize = 2;
 
 /// **The canonical audio fallback lever** (`FSD/CIRIS_MESH.md` §6.4; Eric
 /// 2026-11-21: no traffic on the canonical, audio included, while the mesh
@@ -345,7 +359,21 @@ impl AlmState {
             relay_status_pending: None,
             parent_moves: Vec::new(),
             relayed: BTreeMap::new(),
+            uplink_stall: false,
         }
+    }
+
+    /// G8 — whether this node's uplink is stalled now (the call reads its
+    /// legs' unproved Channel ages each watch tick). On the rise it is
+    /// counted; while it holds, the next egress window is read as congested
+    /// at one stream's room, so this node sheds to one child (LIFO) and its
+    /// relay work goes, and its periodic offers pause (they would only queue
+    /// behind the backlog and spend the Channel's retry budget).
+    pub(super) fn set_uplink_stall(&mut self, stalled: bool) {
+        if stalled && !self.uplink_stall {
+            self.label(crate::observability::ALM_UPLINK_STALL);
+        }
+        self.uplink_stall = stalled;
     }
 
     /// Calls cut — one chunk of `stream` forwarded to `child`.
@@ -1547,7 +1575,14 @@ impl AlmState {
         }
 
         // C2: one egress window feeds every admission on this uplink.
-        if let Some(w) = self.egress.roll(now) {
+        if let Some(mut w) = self.egress.roll(now) {
+            // G8 — a stalled datagram uplink is congested at one stream's room,
+            // whatever the (blind) meter read.
+            if self.uplink_stall {
+                let one = self.own_rate.costs().0 as f64;
+                w.congested = true;
+                w.capacity_bps = Some(w.capacity_bps.map_or(one, |c| c.min(one)));
+            }
             let streams: Vec<StreamId> = self.relays.keys().copied().collect();
             let mut shed: Vec<(StreamId, String)> = Vec::new();
             for s in streams {
@@ -1666,8 +1701,11 @@ impl AlmState {
             }
         }
 
-        // Offers (C3) to every C3 member this node can reach.
-        if now.saturating_sub(self.last_offer_ms) >= OFFER_EVERY_MS || self.last_offer_ms == 0 {
+        // Offers (C3) to every C3 member this node can reach; paused while the
+        // uplink is stalled (G8).
+        if !self.uplink_stall
+            && (now.saturating_sub(self.last_offer_ms) >= OFFER_EVERY_MS || self.last_offer_ms == 0)
+        {
             self.last_offer_ms = now.max(1);
             let mut own_offer = self.own.offer();
             own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);
@@ -2292,6 +2330,87 @@ mod tests {
             .sels
             .get(&s(1))
             .is_none_or(|sel| sel.candidates().iter().all(|(p, _, _)| p != "c")));
+    }
+
+    /// G8 — a stalled datagram uplink is congested at one stream's room: the
+    /// publisher keeps ONE child and sheds the rest (most recent first), its
+    /// offers pause, and the stall is counted once on the rise.
+    #[test]
+    fn a_stalled_uplink_sheds_the_publisher_to_one_child() {
+        let roster4: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let mut a = AlmState::new("a", s(1), &roster4, true, 1);
+        let mut rng = SplitMix64(5);
+        let mut log = DecisionLog::default();
+        for p in ["b", "c", "d"] {
+            let d = a.own.request(
+                0,
+                &SubscribeRequest {
+                    subscriber: p.into(),
+                    role: Role::Primary,
+                    forward_capable: true,
+                    layers: None,
+                },
+                &mut rng,
+                &mut log,
+            );
+            assert!(matches!(d, AdmitDecision::Admit { .. }), "{p}: {d:?}");
+        }
+        assert_eq!(a.own_children().len(), 3);
+        // Media flows a while, so the stream has a measured rate.
+        for _ in 0..6 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            a.t0 =
+                a.t0.checked_sub(Duration::from_millis(1_000))
+                    .expect("clock");
+            let _ = a.tick(&[]);
+        }
+        assert_eq!(
+            a.own_children().len(),
+            3,
+            "no shed while the uplink is clean"
+        );
+        a.set_uplink_stall(true);
+        a.set_uplink_stall(true);
+        assert_eq!(
+            a.labels
+                .iter()
+                .filter(|l| **l == crate::observability::ALM_UPLINK_STALL)
+                .count(),
+            1,
+            "counted once on the rise"
+        );
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            a.t0 =
+                a.t0.checked_sub(Duration::from_millis(1_000))
+                    .expect("clock");
+            out.extend(a.tick(&["b".into(), "c".into(), "d".into()]));
+        }
+        let kids = a.own_children();
+        assert_eq!(kids.len(), 1, "one child kept: {kids:?}");
+        assert_eq!(kids[0].0, "b", "the oldest commitment is kept (LIFO shed)");
+        let shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
+        assert!(
+            shed.contains(&"c".to_owned()) && shed.contains(&"d".to_owned()),
+            "{shed:?}"
+        );
+        assert!(
+            !out.iter().any(|o| matches!(
+                decode(&o.frame, "a"),
+                Ok(WireFrame::Control(ControlFrame {
+                    msg: ControlMsg::Offer(_),
+                    ..
+                }))
+            )),
+            "no offers while stalled"
+        );
     }
 
     // ── #945: three real controllers, C3 through the real encoder ────────

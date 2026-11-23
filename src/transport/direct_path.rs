@@ -890,6 +890,31 @@ impl DirectPathTracker {
         Some(peer)
     }
 
+    /// G8 — `link` itself closed (a Channel exhausted, a timeout, the peer's
+    /// close). leviculum retires the punched interface with it
+    /// (`direct_link_link_removed`), so a `Direct` or `Proposing` entry on it
+    /// names nothing. The peer is forgotten, with no backoff: a new identity
+    /// link carries no proposal cooldown (leviculum's is per link), so the
+    /// next dial to the peer proposes at once instead of waiting out
+    /// [`DIRECT_RETRY_BASE`] (the 60 s gaps of the 45.1.9 relay matrix).
+    /// Returns the peer, when the link was its entry's.
+    pub fn link_closed(&mut self, link: LinkId) -> Option<String> {
+        self.upgrades.remove(&link);
+        let peer = self.link_peer.remove(&link)?;
+        let held = self.peers.get(&peer).is_some_and(|p| {
+            matches!(
+                p.entry,
+                Entry::Direct { link: l, .. } | Entry::Proposing { link: l, .. } if l == link
+            )
+        });
+        if held {
+            self.peers.remove(&peer);
+            Some(peer)
+        } else {
+            None
+        }
+    }
+
     /// `link`'s punched interface went down; the link is back on its relayed
     /// path (or closed). The peer may be asked again after the base period.
     pub fn lost(&mut self, link: LinkId, now: Instant) -> Option<String> {
@@ -1380,6 +1405,45 @@ mod tests {
     }
 
     use super::*;
+
+    /// G8 — a direct path whose LINK closed is forgotten with no backoff (the
+    /// next dial proposes at once on a new link), unlike a punched interface
+    /// lost under a live link, which waits the base period.
+    #[test]
+    fn a_closed_link_releases_its_direct_path_without_backoff() {
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        t.peers.insert(
+            "b".into(),
+            PeerDirect {
+                entry: Entry::Direct {
+                    link: link(1),
+                    interface: 5,
+                },
+                attempts: 2,
+                last_failure: None,
+            },
+        );
+        t.link_peer.insert(link(1), "b".into());
+        assert_eq!(t.link_closed(link(1)).as_deref(), Some("b"));
+        assert_eq!(t.admit("b", link(2), now), Ok(()), "asked again at once");
+        assert_eq!(t.link_closed(link(1)), None, "already forgotten");
+        // A live link whose interface went down still backs off.
+        t.peers.insert(
+            "c".into(),
+            PeerDirect {
+                entry: Entry::Direct {
+                    link: link(3),
+                    interface: 6,
+                },
+                attempts: 0,
+                last_failure: None,
+            },
+        );
+        t.link_peer.insert(link(3), "c".into());
+        assert_eq!(t.lost(link(3), now).as_deref(), Some("c"));
+        assert!(t.admit("c", link(4), now).is_err());
+    }
 
     fn link(b: u8) -> LinkId {
         LinkId::new([b; 16])

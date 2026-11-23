@@ -5475,6 +5475,7 @@ async fn watch_loop(shared: Arc<Shared>) {
     let mut tick = tokio::time::interval(WATCH_TICK);
     let mut n: u64 = 0;
     let mut sent_expired: HashMap<[u8; 16], LegCounters> = HashMap::new();
+    let mut unproved: HashMap<[u8; 16], (u16, Instant)> = HashMap::new();
     loop {
         tick.tick().await;
         if shared.ended.load(Ordering::Relaxed) {
@@ -5493,7 +5494,7 @@ async fn watch_loop(shared: Arc<Shared>) {
         }
         reconcile_legs(&shared);
         let _ = apply_pending_replace(&shared, false).await;
-        alm_tick(&shared, &mut sent_expired).await;
+        alm_tick(&shared, &mut sent_expired, &mut unproved).await;
         settle_ends(&shared);
         check_lost(&shared);
     }
@@ -5670,11 +5671,43 @@ struct LegCounters {
     delivered: u64,
 }
 
-async fn alm_tick(shared: &Arc<Shared>, sent_expired: &mut HashMap<[u8; 16], LegCounters>) {
+async fn alm_tick(
+    shared: &Arc<Shared>,
+    sent_expired: &mut HashMap<[u8; 16], LegCounters>,
+    unproved: &mut HashMap<[u8; 16], (u16, Instant)>,
+) {
     let legs: Vec<(String, [u8; 16])> = Shared::lock(&shared.out_legs)
         .iter()
         .map(|(p, l)| (p.clone(), l.link_id))
         .collect();
+    // G8 — how long each leg's oldest unproved Channel message has waited.
+    let now = Instant::now();
+    let mut stalled_legs = 0usize;
+    for (_, link) in &legs {
+        let oldest = shared
+            .transport
+            .av_link_stats(link)
+            .and_then(|st| st.oldest_unacked_seq);
+        match oldest {
+            Some(seq) => {
+                let since = match unproved.get(link) {
+                    Some((s, t)) if *s == seq => *t,
+                    _ => {
+                        unproved.insert(*link, (seq, now));
+                        now
+                    }
+                };
+                if now.duration_since(since) >= Duration::from_millis(alm::UPLINK_STALL_MS) {
+                    stalled_legs += 1;
+                }
+            }
+            None => {
+                unproved.remove(link);
+            }
+        }
+    }
+    unproved.retain(|l, _| legs.iter().any(|(_, x)| x == l));
+    Shared::lock(&shared.alm).set_uplink_stall(stalled_legs >= alm::UPLINK_STALL_LEGS);
     for (peer, link) in &legs {
         let stats = shared.transport.av_link_stats(link);
         let expired = shared.transport.av_link_expired(link).sender;
