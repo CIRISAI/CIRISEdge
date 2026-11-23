@@ -27,7 +27,18 @@ Every token in this file is **frozen for 45.x**. Later releases only add tokens;
 
 Anonymous mode implies shaped-only. When both hold, the anonymous token is reported, so the client needs distinct copy for each. Both are refused before anything starts. A link another member dials to such a node is refused on that node's side too, counted on the A/V plane as `shaped_only_no_media`.
 
-The other members see such a node as simply not in the call. Today they still dial every room member, so dial attempts toward it go on, bounded by the leg backoff. If no direct path to it can be made, a `media_path_failed` can fire for it with the direct-path cause. That is a known 45.2.0 limit, not a new token; see the edge note on dialling attendees only.
+**Turning shaped-only or anonymous mid-call ends the call.** The state reads `Ended(MediaRefused { token })` (Python `state()` is `ended:<token>`). Every leg is torn down at once, and `av_call_ended_media_refused` counts it. Show it, with the same copy as the refusal.
+
+The other members see such a node as simply not in the call: no path event names it (see the attendee rule below). They still dial every room member, so attempts toward it continue, bounded by the leg backoff. Dialling attendees only is a later 45.2.0 change.
+
+## Call end (`CallState::Ended(EndCause)`, Python `state()`)
+
+| Value | Meaning | Show / Diag |
+|---|---|---|
+| `ended:hung_up` | This node left. | Show |
+| `ended:revoked` | This node is no longer a room member. | Show |
+| `ended:expired` | An ad-hoc call's community expired (not in this release). | Show |
+| `ended:shaped_only_no_media` / `ended:onion_anonymous_no_media` (`MediaRefused { token }`) | This node stopped carrying call media mid-call. | **Show** |
 
 ## Call events
 
@@ -36,6 +47,11 @@ The other members see such a node as simply not in the call. Today they still di
 | `relay_status` (`CallEvent::RelayStatus`) | `relaying: bool`, `relaying_for: u16` | **Show** ("relaying for N people") | On change, once a value has held one 250 ms tick, and at once on `set_relay`. `relaying_for` counts distinct child **nodes**; the host maps nodes to people. |
 | `media_path_restored` (`CallEvent::MediaPathRestored`) | `member`, `via: PathKind`, `through: Option<key id>` | **Show** (`via = peer_relay`: "through {person of `through`}"; any other `via`: "direct") | A direct leg came up after a `media_path_failed`. Or the member's primary stream is first heard through another member. Re-fired whenever `via` or `through` changes, a move back to the publisher included. |
 | `media_path_failed` (`CallEvent::MediaPathFailed`) | `member`, `cause`, `retryable`, `retry_after_s`, `detail`, `tried`, `local_nat`, `peer_nat`, `relay` | **Show** (`cause`; `relay` as a secondary line) | Only when there is neither a direct leg nor a member relay: at once in a two-person call, else after `RELAY_WAIT` with no member relaying. Once per cause. |
+
+**Path events concern attendees only.** `media_path_failed` and `media_path_restored` are never raised for a room member who is not in the call. An attendee is a member that this node has evidence of in the call:
+- its leg reached this node;
+- its stream or key binding reached this node, directly or through a relay;
+- a call row names its person, mapped to that person's nodes.
 
 `tried` is a list of `{kind: PathKind, outcome: PathOutcome, attempts, elapsed_ms, knocks_sent, sockets}`. `local_nat` and `peer_nat.report` are `NatReport` dicts: `mapping`, `allocation`, `filtering`, `port_preserving`, `router_mapping`, `family`, `evidence`, `legacy_class`, `measured_at` (ms). `peer_nat` also has `source`. All of these are Diag. `legacy_class` may appear in the "?" panel.
 
