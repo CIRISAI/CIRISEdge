@@ -1151,3 +1151,225 @@ async fn a_wrap_refused_before_the_roster_lands_is_carried_again_1014() {
     );
     assert_eq!(count("wrap_courier_gave_up"), 0);
 }
+
+/// CIRISEdge#1029 F2b — **one Deliver that seats the joiner also lands the
+/// rows its audience gates, against real stores.** The field (12-person
+/// star, the joiner): one Deliver from the founder carried the founder's
+/// epoch wrap for the joiner and room rows ahead of the rows that seat it;
+/// in wire order the wrap was refused `recipient_not_in_audience`, the room
+/// rows `not_in_audience`, and the wrap landed ~147 s later.
+///
+/// A is P's node, the room's founder and minter; Q is widened in on A (P's
+/// proposal, Q's acceptance, the widening), and A seals, so its epoch is
+/// wrapped to B, Q's node. B holds the room's record (P alone) and nothing
+/// of Q's seat. One Deliver to B carries, in the order the founder's required
+/// read lists them, the wrap to B and a room row of P's, then the proposal,
+/// the acceptance and the widening. Every row is admitted, and B holds A's grant.
+/// The room row stands for the field's cosign rows: both are refused by the
+/// same `not_in_audience` gate until B is seated, and a cosign hold needs a
+/// `majority` room of three this fixture does not have. Red before: the wrap
+/// and the room row refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_deliver_seats_the_joiner_before_its_wrap_and_room_rows_1029() {
+    use crate::replication::directory::{
+        DirectoryStateAdapter, MutableDirectoryStateAdapter, ReplicationDirectory,
+    };
+    use crate::replication::protocol::{DeliverMessage, ReplicationMessage};
+    use crate::replication::session::{ReplicationOutcome, Session, SessionRole};
+    use ciris_persist::federation::attestation_emit;
+    use ciris_persist::federation::group_plane::GroupPlaneFamily;
+    let p = Ident::new("person-p-1029", 0x91);
+    let q = Ident::new("person-q-1029", 0x92);
+    let a_dev = Ident::new("node-a-1029", 0xa1);
+    let b_dev = Ident::new("node-b-1029", 0xa2);
+    let a = device(&[&p, &q], &p, &a_dev).await;
+    let b = device(&[&p, &q], &q, &b_dev).await;
+    // The room on A: founded by P alone, then Q widened in by consent.
+    seed_room(&a, &p, &[&p]).await;
+    let proposal = crate::membership::propose(
+        &*a.dir,
+        crate::membership::GroupScope::Community,
+        ROOM,
+        &q.key_id,
+        None,
+        chrono::Utc::now() + chrono::Duration::days(7),
+        &p.signer(),
+    )
+    .await
+    .expect("P proposes Q");
+    crate::membership::reply(&*a.dir, &proposal.attestation_id, true, &q.signer())
+        .await
+        .expect("Q accepts");
+    assert!(
+        crate::community_roster::widen_community(
+            &*a.dir,
+            ROOM,
+            &q.key_id,
+            None,
+            chrono::Utc::now(),
+            &[&p.signer()],
+        )
+        .await
+        .expect("the widening"),
+        "Q was not a member before"
+    );
+    let mut rt_a = runtime(&a).await;
+    let mut rt_b = runtime(&b).await;
+    for (from, to, rt_to) in [(&a, &b, &rt_b), (&b, &a, &rt_a)] {
+        let (rec, binding, occ) = device_rows(from).await;
+        to.dir
+            .put_public_key(SignedKeyRecord { record: rec })
+            .await
+            .expect("the other node's key");
+        let _ = rt_to
+            .bridge()
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &binding, Some(&from.me))
+            .await;
+        let _ = rt_to
+            .bridge()
+            .apply_envelope_bytes(EnvelopeKind::IdentityOccurrence, &occ, None)
+            .await;
+    }
+    let sealed = a
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(ROOM),
+            author_key_id: &a.me,
+            asserted_at: chrono::Utc::now(),
+            field: ContentField::Body,
+            plaintext: b"said before the joiner was seated here",
+            description: None,
+        })
+        .await
+        .expect("A seals at the community tier");
+    let epoch = sealed.epoch.expect("a community-DEK epoch");
+    assert!(
+        sealed.granted.iter().any(|g| g == &b.me),
+        "precondition: A's epoch is wrapped to B: {:?}",
+        sealed.granted
+    );
+
+    let rows: Vec<_> = FederationDirectory::list_attestations_since(&*a.dir, None, 512)
+        .await
+        .expect("A's rows")
+        .into_iter()
+        .map(|r| r.attestation)
+        .collect();
+    let dimension = |r: &ciris_persist::federation::Attestation| {
+        crate::membership::dimension_of(r)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let wire = |r: &ciris_persist::federation::Attestation| serde_json::to_vec(r).expect("wire");
+    let grants: Vec<Vec<u8>> = rows
+        .iter()
+        .filter(|r| ciris_persist::federation::key_grant::is_key_grant_row(r))
+        .filter(|r| r.attested_key_id == b.me || r.subject_key_ids.contains(&b.me))
+        .map(wire)
+        .collect();
+    assert!(!grants.is_empty(), "A holds its wrap to B");
+    let one = |what: &str, pick: &dyn Fn(&ciris_persist::federation::Attestation) -> bool| {
+        wire(
+            rows.iter()
+                .find(|r| pick(r))
+                .unwrap_or_else(|| panic!("A holds {what}")),
+        )
+    };
+    let record = one("the room's record", &|r| {
+        GroupPlaneFamily::of_row(r) == Some(GroupPlaneFamily::Roster)
+    });
+    let proposed = one("the proposal", &|r| {
+        dimension(r).starts_with("membership:proposal:")
+    });
+    let accepted = one("the acceptance", &|r| {
+        dimension(r).starts_with("membership:acceptance:")
+    });
+    let widened = one("the widening", &|r| {
+        GroupPlaneFamily::of_row(r) == Some(GroupPlaneFamily::Widening)
+    });
+    // A room row of P's, as the founder relays it.
+    let mut extra = serde_json::Map::new();
+    extra.insert("community_key_id".into(), ROOM.into());
+    extra.insert("score".into(), 1.0.into());
+    let mut input = ciris_persist::federation::EmitAttestationInput::with_envelope(
+        "scores",
+        ciris_persist::federation::envelope::EnvelopeCore {
+            dimension: Some(crate::chat::CHAT_MESSAGE_DIMENSION.to_owned()),
+            extra,
+            ..Default::default()
+        },
+        "community",
+    );
+    let canonical =
+        attestation_emit::stamp_and_canonicalize(&mut input, &p.key_id, chrono::Utc::now())
+            .expect("stamp");
+    let sig = crate::identity::sign_hybrid_raw(&p.signer(), &canonical, "room row")
+        .await
+        .expect("sign");
+    let room_row = serde_json::to_vec(
+        &attestation_emit::assemble(p.key_id.clone(), &canonical, sig, input)
+            .expect("assemble")
+            .0,
+    )
+    .expect("wire");
+
+    // B knows the room (its record, P alone, written as a host writes it)
+    // but not that Q is in it, as the joiner did: the room is there, its own
+    // seat is not.
+    seed_room(&b, &p, &[&p]).await;
+    let _ = rt_b.bridge().release_audience(ROOM);
+    let _ = record;
+
+    // The field's refusal, shown once on its own: the wrap ahead of the seat.
+    let alone = rt_b
+        .bridge()
+        .apply_envelope_bytes(EnvelopeKind::Attestation, &grants[0], Some(&a.me))
+        .await;
+    assert!(
+        matches!(&alone, crate::replication::summary::ApplyOutcome::Refused { reason, .. }
+            if reason.contains("recipient_not_in_audience")),
+        "precondition: B outside the room refuses its wrap recipient_not_in_audience: {alone:?}"
+    );
+
+    let mut envelopes = grants.clone();
+    envelopes.push(room_row);
+    envelopes.extend([proposed, accepted, widened]);
+    let n = envelopes.len();
+    let bridge_b: Arc<dyn ReplicationDirectory> = rt_b.bridge();
+    let provider = DirectoryStateAdapter::new(Arc::clone(&bridge_b));
+    let applier = MutableDirectoryStateAdapter::new(bridge_b);
+    let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+    let outcome = session
+        .on_message(
+            ReplicationMessage::Deliver(DeliverMessage {
+                kind: EnvelopeKind::Attestation,
+                envelopes,
+            }),
+            &provider,
+            &applier,
+            Some(&a.me),
+        )
+        .await;
+    let granted = b
+        .dir
+        .community_dek_minters_granting(ROOM, epoch, &b.me)
+        .await
+        .expect("read B's grants");
+    rt_a.shutdown().await;
+    rt_b.shutdown().await;
+    match outcome {
+        ReplicationOutcome::Applied {
+            admitted, refused, ..
+        } => assert_eq!(
+            (admitted, refused),
+            (n, 0),
+            "the seat, then the wrap and the room row, all in one Deliver"
+        ),
+        o => panic!("expected Applied, got {o:?}"),
+    }
+    assert!(
+        granted.iter().any(|m| m == &a.me),
+        "B holds A's wrap for epoch {epoch}: {granted:?}"
+    );
+}
