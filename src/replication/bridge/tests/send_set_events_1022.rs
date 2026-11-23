@@ -5,6 +5,9 @@
 //! owner history every 10 s, with nothing changed (the canonical: ~19k rows a
 //! read, several reads a minute, zero invalidations). Its freshness is now the
 //! events; the TTL is a five-minute backstop for what only the clock changes.
+//! A replicated or feed-drained row drops a memo at once when it is at least
+//! [`CONSENT_SEND_SET_EVENT_FLOOR`] old, and marks a younger one dirty so it
+//! lapses at the floor: a busy seat never reads faster than the old TTL did.
 //! Each witness counts the reads the store served for the set
 //! (`consent_set_reads`) and the `advertise_send_set_*` causes.
 //!
@@ -40,6 +43,34 @@ fn age_memo(b: &FederationDirectoryReplicationBridge, by: StdDuration) {
 
 fn reads(b: &FederationDirectoryReplicationBridge) -> usize {
     b.consent_set_reads.load(Ordering::SeqCst)
+}
+
+fn advertise(m: &obs::EdgeMetrics, label: &str) -> u64 {
+    m.advertise().get(label).copied().unwrap_or(0)
+}
+
+/// Past the event floor: a row landing now drops the memo at once.
+fn past_floor() -> StdDuration {
+    CONSENT_SEND_SET_EVENT_FLOOR + StdDuration::from_secs(1)
+}
+
+/// A `consent:replication:v1` grant by `node-a` naming `peer`, as it arrives
+/// on the wire.
+fn wire_grant(peer: &str) -> Vec<u8> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let envelope = serde_json::json!({
+        "id": id,
+        "attesting_key_id": "node-a",
+        "attested_key_id": peer,
+        "attestation_type": "scores",
+        "dimension": "consent:replication:v1",
+        "payload": {
+            "grants": "transfer",
+            "attestation_prefixes": ["trace:"],
+        },
+    });
+    let row = build_federation_attestation(&id, "node-a", peer, "scores", envelope);
+    serde_json::to_vec(&row).expect("serialize grant")
 }
 
 async fn seeded() -> Arc<SqliteBackend> {
@@ -118,6 +149,7 @@ async fn a_door_less_host_write_drops_the_memo_at_the_next_feed_drain_1022() {
         .catch_up_attestation_feed(Instant::now(), None)
         .await
         .expect("feed drain");
+    age_memo(&bridge, past_floor());
     seed_consent_membership(&backend, "node-a", "node-new").await;
     bridge.mark_feed_dirty();
     bridge
@@ -175,8 +207,8 @@ async fn a_content_row_moves_no_send_set_1022() {
     assert_eq!(reads(&bridge), 1, "a chat row is content, not consent");
 }
 
-/// A consent grant that arrives ON THE WIRE and is admitted drops the memo
-/// on the apply choke, before any feed drain.
+/// A consent grant that arrives ON THE WIRE and is admitted drops a memo
+/// past the event floor on the apply choke, before any feed drain.
 #[tokio::test]
 async fn a_replicated_consent_grant_drops_the_memo_on_admission_1022() {
     let backend = seeded().await;
@@ -185,27 +217,72 @@ async fn a_replicated_consent_grant_drops_the_memo_on_admission_1022() {
     seed_common_root(&backend, &["node-a", "node-wire"]).await;
     let before = bridge.resolved_peer_set("node-a").await.expect("send set");
     assert!(before.recipient("node-wire").is_none());
-    let id = uuid::Uuid::new_v4().to_string();
-    let envelope = serde_json::json!({
-        "id": id,
-        "attesting_key_id": "node-a",
-        "attested_key_id": "node-wire",
-        "attestation_type": "scores",
-        "dimension": "consent:replication:v1",
-        "payload": {
-            "grants": "transfer",
-            "attestation_prefixes": ["trace:"],
-        },
-    });
-    let row = build_federation_attestation(&id, "node-a", "node-wire", "scores", envelope);
-    let wire = serde_json::to_vec(&row).expect("serialize grant");
+    age_memo(&bridge, past_floor());
     let outcome = bridge
-        .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-wire"))
+        .apply_envelope_bytes(
+            EnvelopeKind::Attestation,
+            &wire_grant("node-wire"),
+            Some("node-wire"),
+        )
         .await;
     assert!(outcome.is_admitted(), "the grant is admitted: {outcome:?}");
     let after = bridge.resolved_peer_set("node-a").await.expect("send set");
     assert_eq!(reads(&bridge), 2, "admission dropped the memo; one re-read");
     assert!(after.recipient("node-wire").is_some());
+    assert_eq!(advertise(&m, obs::ADVERTISE_SEND_SET_READ_INVALIDATED), 1);
+}
+
+/// A row that lands on a memo YOUNGER than the floor marks it dirty: the memo
+/// answers until it reaches the floor (as the old 10 s TTL did), then the next
+/// resolve reads once, counted `invalidated`, and the new peer is in the set.
+/// A burst of rows inside the window is one invalidation and one read.
+#[tokio::test]
+async fn rows_on_a_young_memo_cost_one_read_at_the_floor_1022() {
+    let backend = seeded().await;
+    let m = obs::EdgeMetrics::new();
+    let bridge = counted(&backend, &m);
+    seed_common_root(&backend, &["node-a", "node-wire", "node-new"]).await;
+    bridge.resolved_peer_set("node-a").await.expect("send set");
+    for peer in ["node-wire", "node-new"] {
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire_grant(peer), Some(peer))
+            .await;
+        assert!(outcome.is_admitted(), "the grant is admitted: {outcome:?}");
+    }
+    let held = bridge.resolved_peer_set("node-a").await.expect("send set");
+    assert_eq!(reads(&bridge), 1, "under the floor the memo still answers");
+    assert!(held.recipient("node-wire").is_none());
+    assert_eq!(
+        advertise(&m, obs::ADVERTISE_SEND_SET_INVALIDATED),
+        1,
+        "two rows on one memo are one invalidation"
+    );
+    age_memo(&bridge, CONSENT_SEND_SET_EVENT_FLOOR);
+    let after = bridge.resolved_peer_set("node-a").await.expect("send set");
+    assert_eq!(reads(&bridge), 2, "the dirty memo lapsed at the floor");
+    assert!(after.recipient("node-wire").is_some());
+    assert!(after.recipient("node-new").is_some());
+    assert_eq!(advertise(&m, obs::ADVERTISE_SEND_SET_READ_INVALIDATED), 1);
+    assert_eq!(advertise(&m, obs::ADVERTISE_SEND_SET_EXPIRED), 0);
+    // The re-read memo is clean: idle again, it holds to the backstop.
+    age_memo(&bridge, StdDuration::from_mins(2));
+    bridge.resolved_peer_set("node-a").await.expect("send set");
+    assert_eq!(reads(&bridge), 2, "the new memo is not dirty");
+}
+
+/// The host's own write is not floored: a kick drops a memo of any age at
+/// once (CIRISEdge#968, the first-contact lesson).
+#[tokio::test]
+async fn a_host_kick_drops_a_young_memo_at_once_1022() {
+    let backend = seeded().await;
+    let m = obs::EdgeMetrics::new();
+    let bridge = counted(&backend, &m);
+    bridge.resolved_peer_set("node-a").await.expect("send set");
+    seed_consent_membership(&backend, "node-a", "node-new").await;
+    bridge.invalidate_send_set_memos("host_kick");
+    let after = bridge.resolved_peer_set("node-a").await.expect("send set");
+    assert_eq!(reads(&bridge), 2);
+    assert!(after.recipient("node-new").is_some());
 }
 
 /// The classifier: content planes are skipped, the four structural types

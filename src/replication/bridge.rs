@@ -2914,12 +2914,19 @@ pub struct FederationDirectoryReplicationBridge {
     /// move the set drops the memo: [`Self::row_may_move_send_set`] on the
     /// apply choke and on the serve-cursor feed, which sees every door), and
     /// [`CONSENT_SEND_SET_MEMO_TTL`] is only the backstop for what no row
-    /// announces (a grant or binding lapsing on the clock).
+    /// announces (a grant or binding lapsing on the clock). A row on a memo
+    /// younger than [`CONSENT_SEND_SET_EVENT_FLOOR`] defers its drop to that
+    /// age ([`Self::consent_memo_dirty`]).
     consent_memo: Mutex<Option<(ResolvedPeerSet, Instant)>>,
     /// CIRISEdge#1022 — when the read that filled [`Self::consent_memo`]
     /// BEGAN, in unix ms: a row the feed drains that persist admitted before
     /// then is already in the memo, so it drops nothing. 0 before any read.
     consent_read_began_ms: std::sync::atomic::AtomicI64,
+    /// CIRISEdge#1022 — a row that can move the set landed on the memo while
+    /// it was younger than [`CONSENT_SEND_SET_EVENT_FLOOR`]: it lapses at that
+    /// age instead of the backstop. Written only under [`Self::consent_memo`]'s
+    /// lock; cleared when a read stores a new memo.
+    consent_memo_dirty: std::sync::atomic::AtomicBool,
     /// 45.1.9 (attribution) — what emptied [`Self::consent_memo`], and the
     /// keys events dropped from the announce and own-set memos, so each next
     /// read is counted under its cause. Telemetry only; never read for an
@@ -3453,7 +3460,21 @@ pub type RevocationObserver = Arc<dyn Fn(&str) + Send + Sync>;
 /// `valid_until` passing. That, and a row a content plane carries that the
 /// classifier skips, are bounded by this backstop. Five minutes: an idle seat
 /// pays one send-set read per five minutes instead of six a minute.
-const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(300);
+const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_mins(5);
+
+/// CIRISEdge#1022 — the youngest a memo a REPLICATED or feed-drained row
+/// drops at once. A row that can move the set and lands on a younger memo
+/// marks it dirty instead, and the dirty memo lapses when it reaches this age.
+///
+/// A seat admits rows from every peer all day, and the classifier counts any
+/// row outside the content planes. Dropping on each would trade the old
+/// TTL's six reads a minute for one read per admitted row; the floor caps a
+/// busy seat at the pre-#1022 rate (10 s, the old TTL, so no such row waits
+/// longer than it did) while an idle one still pays nothing. The host's own
+/// writes are not floored:
+/// [`FederationDirectoryReplicationBridge::invalidate_send_set_memos`] drops
+/// at once, the #968 first-contact lesson.
+const CONSENT_SEND_SET_EVENT_FLOOR: Duration = Duration::from_secs(10);
 
 /// CIRISEdge#1022 — a send set memoized NARROWER than the truth (an owner or
 /// self-collective walk errored, [`ResolvedPeerSet::owner_walk_complete`])
@@ -3461,9 +3482,13 @@ const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(300);
 /// answers again, and a narrowed set withholds until it does.
 const CONSENT_SEND_SET_PARTIAL_TTL: Duration = Duration::from_secs(10);
 
-/// The TTL a memoized `set` is held to.
-fn consent_memo_ttl(set: &ResolvedPeerSet) -> Duration {
-    if set.owner_walk_complete() {
+/// The TTL a memoized `set` is held to: the backstop, unless the set is
+/// narrower than the truth or a row that can move it has landed since
+/// (`dirty`, [`CONSENT_SEND_SET_EVENT_FLOOR`]).
+fn consent_memo_ttl(set: &ResolvedPeerSet, dirty: bool) -> Duration {
+    if dirty {
+        CONSENT_SEND_SET_EVENT_FLOOR
+    } else if set.owner_walk_complete() {
         CONSENT_SEND_SET_MEMO_TTL
     } else {
         CONSENT_SEND_SET_PARTIAL_TTL
@@ -3611,6 +3636,7 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// Construct with explicit configuration, **v1-only**.
+    #[allow(clippy::too_many_lines)] // one initialiser per field of the bridge
     pub fn with_config(
         directory: Arc<dyn FederationDirectory>,
         cohort: CohortProvider,
@@ -3630,6 +3656,7 @@ impl FederationDirectoryReplicationBridge {
             config,
             consent_memo: Mutex::new(None),
             consent_read_began_ms: std::sync::atomic::AtomicI64::new(0),
+            consent_memo_dirty: std::sync::atomic::AtomicBool::new(false),
             memo_marks: MemoMarks::default(),
             consent_flight: SingleFlight::default(),
             consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -12129,6 +12156,8 @@ impl FederationDirectoryReplicationBridge {
                     if let (Some(set), Some(at)) = (set, at) {
                         if let Ok(mut memo) = self.consent_memo.lock() {
                             *memo = Some((set.clone(), *at));
+                            self.consent_memo_dirty
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             self.memo_marks.consent.filled();
                         }
                         self.gauge_send_set(set);
@@ -12184,17 +12213,39 @@ impl FederationDirectoryReplicationBridge {
 
     /// The consent memo's value iff it is younger than
     /// [`CONSENT_SEND_SET_MEMO_TTL`].
+    ///
+    /// CIRISEdge#1022 — a DIRTY memo past [`CONSENT_SEND_SET_EVENT_FLOOR`] is
+    /// taken here, as the invalidation it was deferred from: the read that
+    /// follows is counted `invalidated`, not `expired`.
     fn fresh_consent_memo(&self) -> Option<ResolvedPeerSet> {
-        let memo = self.consent_memo.lock().ok()?;
+        let mut memo = self.consent_memo.lock().ok()?;
+        let dirty = self.consent_memo_dirty_now();
         let (set, resolved_at) = memo.as_ref()?;
-        (resolved_at.elapsed() < consent_memo_ttl(set)).then(|| set.clone())
+        if resolved_at.elapsed() < consent_memo_ttl(set, dirty) {
+            return Some(set.clone());
+        }
+        if dirty {
+            self.mark_consent_taken(memo.take().as_ref());
+        }
+        None
+    }
+
+    /// Whether the memo `set`, resolved at `at`, is still within its TTL.
+    fn consent_memo_live(&self, set: &ResolvedPeerSet, at: Instant) -> bool {
+        at.elapsed() < consent_memo_ttl(set, self.consent_memo_dirty_now())
+    }
+
+    /// CIRISEdge#1022 — the dirty mark (read under the memo's lock).
+    fn consent_memo_dirty_now(&self) -> bool {
+        self.consent_memo_dirty
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// CIRISEdge#971 — is the consent memo present but past its TTL?
     fn consent_memo_expired(&self) -> bool {
         self.consent_memo.lock().is_ok_and(|memo| {
             memo.as_ref()
-                .is_some_and(|(set, at)| at.elapsed() >= consent_memo_ttl(set))
+                .is_some_and(|(set, at)| !self.consent_memo_live(set, *at))
         })
     }
 
@@ -14253,10 +14304,12 @@ impl FederationDirectoryReplicationBridge {
     /// 45.1.9 (attribution) — the consent memo was taken by a door: mark
     /// what emptied it.
     fn mark_consent_taken(&self, taken: Option<&(ResolvedPeerSet, Instant)>) {
-        if let Some((_, at)) = taken {
-            self.memo_marks
-                .consent
-                .dropped(at.elapsed() < CONSENT_SEND_SET_MEMO_TTL);
+        if let Some((set, at)) = taken {
+            // CIRISEdge#1022 — a dirty memo lapsing at the floor is the
+            // deferred invalidation, so it reads as `invalidated`.
+            self.memo_marks.consent.dropped(
+                self.consent_memo_dirty_now() || at.elapsed() < consent_memo_ttl(set, false),
+            );
         }
     }
 
@@ -14455,24 +14508,34 @@ impl FederationDirectoryReplicationBridge {
 
     /// CIRISEdge#1022 — can admitting `row` move this node's send set? `true`
     /// for every row but the content planes persist's send set never reads:
-    /// traces and their summaries, chat, delivery receipts, key grants,
-    /// custody acks (blob holder claims), sessions, ledgers and settlements.
-    /// A `withdraws` / `recants` / `supersedes` / `delegates_to` is always
-    /// `true`, whatever it names. Unknown dimensions are `true`: the cost of a
-    /// wrong `true` is one read, of a wrong `false` a set stale for up to
-    /// [`CONSENT_SEND_SET_MEMO_TTL`].
+    /// traces and their summaries, chat, delivery receipts, file descriptors,
+    /// key grants, custody acks (blob holder claims), sessions, ledgers and
+    /// settlements. persist's send set reads consent grants, steward and
+    /// self-roster rows, key records, occurrences, age bands, allow lists,
+    /// family rosters and memberships and owner bindings
+    /// (`consent_peers_by_principals`, `nodes_owned_by`, `send_set_for`); none
+    /// of those is a content plane. A `withdraws` / `recants` / `supersedes` /
+    /// `delegates_to` is always `true`, whatever it names. Unknown dimensions
+    /// are `true`: the cost of a wrong `true` is one read (and at most one per
+    /// [`CONSENT_SEND_SET_EVENT_FLOOR`]), of a wrong `false` a set stale for up
+    /// to [`CONSENT_SEND_SET_MEMO_TTL`].
     pub(crate) fn row_may_move_send_set(row: &Attestation) -> bool {
-        use ciris_persist::federation::types::attestation_type;
-        const CONTENT_PLANES: [&str; 9] = [
-            "trace:",
-            "trace_summary:",
-            "chat:",
+        use ciris_persist::federation::{
+            admission, content_class::dimension_of, custody_ack, key_grant, session_claim,
+            types::attestation_type,
+        };
+        // Each stem is spelled by the crate that owns the plane, never here.
+        const CONTENT_PLANES: [&str; 10] = [
+            admission::TRACE_DIMENSION_PREFIX,
+            admission::TRACE_SUMMARY_DIMENSION_PREFIX,
+            crate::chat::CHAT_ATTESTATION_PREFIX,
             crate::receipts::RECEIPT_DIMENSION_PREFIX,
-            "key_grant:",
-            "custody:ack:",
-            "session:",
-            "ledger:",
-            "settlement:",
+            crate::files::FILE_DIMENSION,
+            key_grant::KEY_GRANT_DIMENSION_PREFIX,
+            custody_ack::CUSTODY_ACK_DIMENSION,
+            session_claim::SESSION_DIMENSION_PREFIX,
+            admission::LEDGER_DIMENSION_PREFIX,
+            admission::SETTLEMENT_DIMENSION_PREFIX,
         ];
         if matches!(
             row.attestation_type.as_str(),
@@ -14483,11 +14546,7 @@ impl FederationDirectoryReplicationBridge {
         ) {
             return true;
         }
-        let dimension = row
-            .attestation_envelope
-            .get("dimension")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+        let dimension = dimension_of(row).unwrap_or("");
         !CONTENT_PLANES.iter().any(|p| dimension.starts_with(p))
     }
 
@@ -14512,26 +14571,46 @@ impl FederationDirectoryReplicationBridge {
     /// CIRISEdge#1022 — drop the consent send-set memo alone, because a row
     /// that can move it arrived (`reason`: `replicated_row`, `feed_row`).
     /// Counted with the other send-set invalidations; reads nothing.
+    ///
+    /// A memo younger than [`CONSENT_SEND_SET_EVENT_FLOOR`] is marked dirty
+    /// rather than dropped, and lapses at the floor: a burst of rows costs a
+    /// busy seat at most one read per floor. Each memo is counted once,
+    /// whether dropped now or marked (a dirty memo is not counted again).
     fn invalidate_consent_memo(&self, reason: &'static str) {
+        // A read in flight began before this row: it must not store.
         self.consent_flight.invalidate();
-        let taken = self.consent_memo.lock().ok().and_then(|mut memo| {
-            let taken = memo.take();
-            self.mark_consent_taken(taken.as_ref());
-            taken
-        });
-        let Some((_, at)) = taken else {
+        let Ok(mut memo) = self.consent_memo.lock() else {
             return;
         };
+        let Some((set, at)) = memo.as_ref() else {
+            return;
+        };
+        let live = self.consent_memo_live(set, *at);
+        let deferred = at.elapsed() < CONSENT_SEND_SET_EVENT_FLOOR;
+        let was_dirty = if deferred {
+            self.consent_memo_dirty
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        } else {
+            let was_dirty = self.consent_memo_dirty_now();
+            self.mark_consent_taken(memo.take().as_ref());
+            was_dirty
+        };
+        drop(memo);
+        if was_dirty {
+            // Counted when it was marked.
+            return;
+        }
         self.send_set_invalidations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(m) = &self.metrics {
             m.inc_advertise(crate::observability::ADVERTISE_SEND_SET_INVALIDATED);
-            if at.elapsed() < CONSENT_SEND_SET_MEMO_TTL {
+            if live {
                 m.inc_advertise(crate::observability::ADVERTISE_SEND_SET_DROPPED_LIVE);
             }
         }
         tracing::debug!(
             reason,
+            deferred,
             "send-set memo dropped by a row that can move it (CIRISEdge#1022)"
         );
     }
@@ -14592,7 +14671,7 @@ impl FederationDirectoryReplicationBridge {
         // caused (the cause split the seat's permit rate needs: kick vs TTL).
         let dropped_live = taken
             .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() < CONSENT_SEND_SET_MEMO_TTL);
+            .is_some_and(|(set, at)| self.consent_memo_live(set, *at));
         if let Ok(mut cache) = self.owner_cache.lock() {
             cache.clear();
             self.gauge_owner_memo(0);
@@ -14896,9 +14975,9 @@ impl FederationDirectoryReplicationBridge {
     /// CIRISEdge#968 — the consent memo's age, `None` when empty or stale.
     fn consent_memo_age(&self) -> Option<Duration> {
         let memo = self.consent_memo.lock().ok()?;
-        let (_, resolved_at) = memo.as_ref()?;
+        let (set, resolved_at) = memo.as_ref()?;
         let age = resolved_at.elapsed();
-        (age < CONSENT_SEND_SET_MEMO_TTL).then_some(age)
+        self.consent_memo_live(set, *resolved_at).then_some(age)
     }
 
     /// CIRISEdge#682 — how many times the announce walk actually ran (the memo
