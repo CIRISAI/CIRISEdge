@@ -749,6 +749,11 @@ pub struct DirectPathTracker {
     /// neither replace its `Direct` or `Proposing` on another nor back it off
     /// when it fails.
     upgrades: HashMap<LinkId, Upgrade>,
+    /// G8 — when each peer's direct path was last released for free by its
+    /// link closing ([`Self::link_closed`]): one free re-punch per
+    /// [`DIRECT_RETRY_BASE`], so a peer whose links keep dying (or that is
+    /// gone) is asked at the ordinary pace, never in a storm.
+    released: HashMap<String, Instant>,
 }
 
 impl DirectPathTracker {
@@ -897,8 +902,15 @@ impl DirectPathTracker {
     /// link carries no proposal cooldown (leviculum's is per link), so the
     /// next dial to the peer proposes at once instead of waiting out
     /// [`DIRECT_RETRY_BASE`] (the 60 s gaps of the 45.1.9 relay matrix).
-    /// Returns the peer, when the link was its entry's.
-    pub fn link_closed(&mut self, link: LinkId) -> Option<String> {
+    ///
+    /// Bounded: the free release happens once per peer per
+    /// [`DIRECT_RETRY_BASE`]; a second link close inside it backs the peer
+    /// off by that base, as a lost path does. Releasing proposes nothing by
+    /// itself: a proposal is only ever made by a dial (an A/V leg, or a send
+    /// to a room peer, #915), and only over a NEW identity link, which a gone
+    /// peer never completes (the dial ends `no_link`). Returns the peer, when
+    /// the link was its entry's.
+    pub fn link_closed(&mut self, link: LinkId, now: Instant) -> Option<String> {
         self.upgrades.remove(&link);
         let peer = self.link_peer.remove(&link)?;
         let held = self.peers.get(&peer).is_some_and(|p| {
@@ -907,12 +919,27 @@ impl DirectPathTracker {
                 Entry::Direct { link: l, .. } | Entry::Proposing { link: l, .. } if l == link
             )
         });
-        if held {
-            self.peers.remove(&peer);
-            Some(peer)
-        } else {
-            None
+        if !held {
+            return None;
         }
+        self.released
+            .retain(|_, t| now.saturating_duration_since(*t) < DIRECT_RETRY_BASE);
+        if self.released.contains_key(&peer) {
+            self.peers.insert(
+                peer.clone(),
+                PeerDirect {
+                    entry: Entry::BackingOff {
+                        until: now + DIRECT_RETRY_BASE,
+                    },
+                    attempts: 0,
+                    last_failure: None,
+                },
+            );
+        } else {
+            self.peers.remove(&peer);
+            self.released.insert(peer.clone(), now);
+        }
+        Some(peer)
     }
 
     /// `link`'s punched interface went down; the link is back on its relayed
@@ -1425,9 +1452,30 @@ mod tests {
             },
         );
         t.link_peer.insert(link(1), "b".into());
-        assert_eq!(t.link_closed(link(1)).as_deref(), Some("b"));
+        assert_eq!(t.link_closed(link(1), now).as_deref(), Some("b"));
         assert_eq!(t.admit("b", link(2), now), Ok(()), "asked again at once");
-        assert_eq!(t.link_closed(link(1)), None, "already forgotten");
+        assert_eq!(t.link_closed(link(1), now), None, "already forgotten");
+        // A second close inside the base period is NOT free: no storm.
+        t.peers.insert(
+            "b".into(),
+            PeerDirect {
+                entry: Entry::Direct {
+                    link: link(7),
+                    interface: 5,
+                },
+                attempts: 0,
+                last_failure: None,
+            },
+        );
+        t.link_peer.insert(link(7), "b".into());
+        let soon = now + Duration::from_secs(10);
+        assert_eq!(t.link_closed(link(7), soon).as_deref(), Some("b"));
+        assert!(t.admit("b", link(8), soon).is_err(), "backs off");
+        assert_eq!(
+            t.admit("b", link(8), soon + DIRECT_RETRY_BASE),
+            Ok(()),
+            "at the ordinary pace"
+        );
         // A live link whose interface went down still backs off.
         t.peers.insert(
             "c".into(),

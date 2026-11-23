@@ -19561,7 +19561,11 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             ctx.alm_links.forget(&link_id.into_bytes());
             // G8 — the punched interface goes with its link: forget the
             // peer's direct path so its next dial proposes at once.
-            if let Some(peer) = ctx.direct_paths.tracker().link_closed(link_id) {
+            if let Some(peer) = ctx
+                .direct_paths
+                .tracker()
+                .link_closed(link_id, std::time::Instant::now())
+            {
                 tracing::info!(
                     peer = %peer,
                     link = %hex::encode(link_id.as_bytes()),
