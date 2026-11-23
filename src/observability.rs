@@ -55,7 +55,10 @@
 //! - `transport_bytes_in_total[TransportId]` — bytes-counted by the
 //!   listener side
 //! - `transport_bytes_out_total[TransportId]` — bytes-counted by the
-//!   send side
+//!   send side (both: application envelopes only)
+//! - `transport_wire_bytes_{in,out}_total["transport:plane"]` — every byte
+//!   an interface carried, by closed transport and plane
+//!   ([`crate::wire_bytes`], CIRISEdge#1025)
 //!
 //! Gauges:
 //!
@@ -1464,6 +1467,10 @@ pub const LINK_SEAL_DECAPSULATED: &str = "link_seal_decapsulated";
 /// had answered its handshake, HELD sealed and opened once the link is keyed
 /// (bounded; past the bound it is `link_seal_dropped_before_keys`).
 pub const LINK_SEAL_HELD_BEFORE_KEYS: &str = "link_seal_held_before_keys";
+/// CIRISEdge#947 — a send on a pooled link found it gone or refused under it
+/// (the peer's close had not landed yet); the link was closed here and the
+/// send shipped once on a fresh lane.
+pub const LINK_SEAL_POOLED_LINK_GONE_RETRIED: &str = "link_seal_pooled_link_gone_retried";
 
 // ─── CIRISEdge#805 item 8 — `EdgeMetrics::direct_link` labels ─────────
 
@@ -2307,7 +2314,20 @@ pub const RESPONDER_ROUND_OPENED_DIFF: &str = "opened_diff";
 /// member asked for and was delivered, and each delivery is booked once more
 /// by the member's next answer: `admitted` (it holds the row) or `refused`
 /// (asked again, or withheld); `gave_up` at the courier's bound.
-pub const REPLICATION_IO_LABELS: [&str; 23] = [
+/// Range fingerprints, step A (`docs/design/RANGE_FINGERPRINTS.md` §8):
+/// `summary_bytes_*`, `diff_bytes_*` and `deliver_wire_bytes_*` are the
+/// FRAMES as they crossed the transport (the CRPL preamble and the JSON
+/// included, unlike `deliver_bytes_*`). `summary_refs_built` /
+/// `summary_bytes_built` book a Summary when it is BUILT, before
+/// `transport.send`, so a listing built and never sent is visible (§11.2).
+/// The `rf_*` labels count the receiver half: fingerprint nodes received,
+/// answers given (`match`, `split`, `list`), `rf` members it could not read,
+/// every `u` answer (`rf_unable`) and why (`receiver_unbooted`,
+/// `salt_refused`, `answers_cap`, `mirror_capped`, `rebuilds_refused`,
+/// `transport_refused`), salt changes accepted, bucket rebuilds run, ids the
+/// restart seed added, ids the match feed handed a consumer, and pending ids
+/// settled from that peer.
+pub const REPLICATION_IO_LABELS: [&str; 48] = [
     "deliver_rows_out",
     "deliver_bytes_out",
     "deliver_rows_in",
@@ -2331,7 +2351,43 @@ pub const REPLICATION_IO_LABELS: [&str; 23] = [
     "wrap_courier_admitted",
     "wrap_courier_refused",
     "wrap_courier_gave_up",
+    "summary_bytes_out",
+    "summary_bytes_in",
+    "diff_bytes_out",
+    "diff_bytes_in",
+    "deliver_wire_bytes_out",
+    "deliver_wire_bytes_in",
+    "summary_refs_built",
+    "summary_bytes_built",
+    "rf_nodes_in",
+    "rf_match",
+    "rf_split",
+    "rf_list",
+    "rf_not_understood",
+    "rf_unable",
+    "rf_receiver_unbooted",
+    "rf_salt_refused",
+    "rf_answers_cap",
+    "rf_mirror_capped",
+    "rf_rebuilds_refused",
+    "rf_transport_refused",
+    "rf_salt_changes_received",
+    "rf_peersums_built",
+    "rf_seeded",
+    "rf_match_feed_ids",
+    "rf_settled_from_peer",
 ];
+
+/// Range fingerprints, step A — the `holdings_index_gauge` label of the ids
+/// held in every receiver mirror together (`rf_mirror_ids`, design §8).
+pub const RF_MIRROR_IDS_GAUGE: &str = "rf_mirror_ids";
+/// Range fingerprints, step A — the `holdings_index_gauge` label of the ids a
+/// receiver has asked for and not yet seen admitted (`rf_pending_ids`).
+pub const RF_PENDING_IDS_GAUGE: &str = "rf_pending_ids";
+/// Range fingerprints, step A — the `holdings_index_gauge` label of the `rf`
+/// members this process could not read since it started (`rf_parse_failed`,
+/// design §2.5): a process-wide count, so a gauge.
+pub const RF_PARSE_FAILED_GAUGE: &str = "rf_parse_failed";
 /// Seat load 2026-11-13 (S0) — the classes a peer is counted under in
 /// `peer_activity`: the axis of this node's attestation send set that last
 /// resolved it (`consent`, `owner_routed`, `self_collective`, `first_contact`,
@@ -2740,6 +2796,7 @@ pub const LINK_SEAL_LABELS: &[&str] = &[
     LINK_SEAL_HELD_DURING_KEYING,
     LINK_SEAL_DECAPSULATED,
     LINK_SEAL_HELD_BEFORE_KEYS,
+    LINK_SEAL_POOLED_LINK_GONE_RETRIED,
     LINK_SEAL_KEYER_PANICKED,
     LINK_SEAL_KEYING_SKIPPED_STALE,
     LINK_SEAL_REFUSED_HANDSHAKE_SENDER_RATE_STANDING,
@@ -3240,11 +3297,24 @@ pub struct EdgeMetrics {
     pub durable_enqueued_total: Arc<RwLock<HashMap<DeliveryClass, u64>>>,
     /// Per-transport byte count for inbound frames. Incremented by
     /// the inbound listener side when it pushes an [`crate::transport::InboundFrame`].
+    /// Application envelopes only, once per envelope; the wire is
+    /// [`Self::wire_bytes`].
     pub transport_bytes_in_total: Arc<RwLock<HashMap<TransportId, u64>>>,
     /// Per-transport byte count for outbound envelopes. Incremented
     /// at the success exit of [`crate::transport::Transport::send`]
     /// invocations (`Edge::send` direct path, durable dispatcher loop).
+    /// Application envelopes only, once per envelope; the wire is
+    /// [`Self::wire_bytes`].
     pub transport_bytes_out_total: Arc<RwLock<HashMap<TransportId, u64>>>,
+    /// CIRISEdge#1025 — every byte that crossed an edge interface, by
+    /// `(transport, plane)`: interface truth folded from leviculum's I/O
+    /// counters, attributed at the E1 seal and the HTTP envelope sites
+    /// ([`crate::wire_bytes`]). `transport_wire_bytes_{in,out}_total`.
+    pub wire_bytes: Arc<crate::wire_bytes::WireBytes>,
+    /// CIRISEdge#1025 — links by transport and direction, distinct peers per
+    /// hour and day, the top peers by wire bytes, and link lifetimes
+    /// ([`crate::link_census`]).
+    pub link_census: Arc<crate::link_census::LinkCensus>,
     /// Gauge — per-(peer, medium) reachability ratio. Mirror of the
     /// reachability tracker; consumers can read the mirror without
     /// reaching across to [`crate::ReachabilityTracker`].
@@ -3849,14 +3919,37 @@ impl EdgeMetrics {
 
     /// Add `bytes` to the inbound byte counter for `transport`.
     pub fn add_bytes_in(&self, transport: TransportId, bytes: u64) {
-        let mut guard = self.transport_bytes_in_total.write();
-        *guard.entry(transport).or_insert(0) += bytes;
+        {
+            let mut guard = self.transport_bytes_in_total.write();
+            *guard.entry(transport).or_insert(0) += bytes;
+        }
+        // CIRISEdge#1025 — HTTP owns its wire: its envelope bytes are its
+        // application plane. A Reticulum envelope's bytes are counted at the
+        // seal, as the frames that carried it.
+        if transport == TransportId::HTTP {
+            self.wire_bytes.add(
+                crate::wire_bytes::WireDir::In,
+                crate::wire_bytes::WireTransport::Http,
+                crate::wire_bytes::WirePlane::Application,
+                bytes,
+            );
+        }
     }
 
     /// Add `bytes` to the outbound byte counter for `transport`.
     pub fn add_bytes_out(&self, transport: TransportId, bytes: u64) {
-        let mut guard = self.transport_bytes_out_total.write();
-        *guard.entry(transport).or_insert(0) += bytes;
+        {
+            let mut guard = self.transport_bytes_out_total.write();
+            *guard.entry(transport).or_insert(0) += bytes;
+        }
+        if transport == TransportId::HTTP {
+            self.wire_bytes.add(
+                crate::wire_bytes::WireDir::Out,
+                crate::wire_bytes::WireTransport::Http,
+                crate::wire_bytes::WirePlane::Application,
+                bytes,
+            );
+        }
     }
 
     /// Record an enqueue against the cumulative durable-enqueue counter.
@@ -4924,6 +5017,32 @@ impl EdgeMetrics {
         self.inc_peer_activity(PEER_ACTIVITY_LINK_UP[peer_class_index(class)]);
     }
 
+    /// CIRISEdge#1025 — an established link closed under `cause` after
+    /// `lifetime`: one `link_duration_seconds` observation, under the
+    /// `peer_activity` class it came up under, else `dialled` (this node
+    /// opened it, `inbound` false) or `unidentified`. Call before
+    /// [`Self::note_link_closed_class`], which forgets the class.
+    pub fn note_link_lifetime(
+        &self,
+        link: [u8; 16],
+        inbound: bool,
+        cause: LinkCloseCause,
+        lifetime: std::time::Duration,
+    ) {
+        let unclassed = if inbound {
+            crate::link_census::LINK_CLASS_UNIDENTIFIED
+        } else {
+            crate::link_census::LINK_CLASS_DIALLED
+        };
+        let class = self
+            .link_classes
+            .read()
+            .get(&link)
+            .map_or(unclassed, |c| peer_class_index(c));
+        self.link_census
+            .observe_link_lifetime(class, cause, lifetime);
+    }
+
     /// Seat load 2026-11-13 (S0) — an identified link closed under `cause`:
     /// count it down under the class it came up under. A link never
     /// identified counts nothing here (its close is still in the
@@ -5141,6 +5260,7 @@ impl EdgeMetrics {
     #[must_use]
     pub fn snapshot(&self) -> EdgeMetricsBundle {
         let t = self.telemetry.snapshot();
+        let wire = self.wire_bytes.snapshot();
         // The raw count of real frames is a clock of the node's real traffic;
         // it leaves only through `ShapingWindows`.
         let mut link_shaping = registered(&self.link_shaping, LINK_SHAPING_LABELS);
@@ -5166,6 +5286,13 @@ impl EdgeMetrics {
             durable_enqueued_total: self.durable_enqueued_total.read().clone(),
             transport_bytes_in_total: self.transport_bytes_in_total.read().clone(),
             transport_bytes_out_total: self.transport_bytes_out_total.read().clone(),
+            transport_wire_bytes_in_total: wire.family(crate::wire_bytes::WireDir::In),
+            transport_wire_bytes_out_total: wire.family(crate::wire_bytes::WireDir::Out),
+            links_active: self.link_census.links_active(),
+            distinct_peers_1h: self.link_census.distinct_peers_1h(),
+            distinct_peers_24h: self.link_census.distinct_peers_24h(),
+            top_peers_by_bytes: self.link_census.top_peers_by_bytes(),
+            link_duration_seconds: self.link_census.link_duration_seconds(),
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             blob_serve_legacy_dag_walks: self.blob_serve_legacy_dag_walks(),
@@ -5535,6 +5662,28 @@ pub struct EdgeMetricsBundle {
     pub durable_enqueued_total: HashMap<DeliveryClass, u64>,
     pub transport_bytes_in_total: HashMap<TransportId, u64>,
     pub transport_bytes_out_total: HashMap<TransportId, u64>,
+    /// CIRISEdge#1025 — bytes received on the wire, keyed `transport:plane`
+    /// ([`crate::wire_bytes`]). A transport's planes sum to what its
+    /// interfaces carried; `other` is the part edge did not attribute.
+    pub transport_wire_bytes_in_total: std::collections::BTreeMap<String, u64>,
+    /// CIRISEdge#1025 — bytes sent on the wire, keyed `transport:plane`.
+    pub transport_wire_bytes_out_total: std::collections::BTreeMap<String, u64>,
+    /// CIRISEdge#1025 — established Reticulum links now, keyed
+    /// `transport:direction` (every [`crate::link_census::LINKS_ACTIVE_KEYS`]
+    /// key present). A link on a punched interface is `udp-direct`.
+    pub links_active: std::collections::BTreeMap<String, u64>,
+    /// CIRISEdge#1025 — distinct authenticated peers with a link to this node
+    /// in the last hour (HyperLogLog, ±1.6 % standard error).
+    pub distinct_peers_1h: u64,
+    /// CIRISEdge#1025 — the same over the last 24 hours.
+    pub distinct_peers_24h: u64,
+    /// CIRISEdge#1025 — the heaviest peers by wire bytes since start, at most
+    /// [`crate::link_census::TOP_PEERS_EXPORTED`], heaviest first, each keyed
+    /// by a per-process salted hash (never a metric label).
+    pub top_peers_by_bytes: Vec<crate::link_census::TopPeerBytes>,
+    /// CIRISEdge#1025 — established → closed, keyed `class:cause`; a label
+    /// set nothing closed under is absent.
+    pub link_duration_seconds: HashMap<String, HistogramSnapshot>,
     pub peer_reachability_ratio: HashMap<(String, String), f64>,
     /// CIRISEdge#48-B (v0.19.6) — cumulative count of envelopes
     /// dropped at `dispatch_inbound` due to trust short-circuit.
@@ -5985,6 +6134,38 @@ impl EdgeMetricsBundle {
             "transport_bytes_out_total",
             self.transport_bytes_out_total.iter().map(|(k, v)| (k.0, v)),
         );
+        f.family(
+            "transport_wire_bytes_in_total",
+            self.transport_wire_bytes_in_total.iter(),
+        );
+        f.family(
+            "transport_wire_bytes_out_total",
+            self.transport_wire_bytes_out_total.iter(),
+        );
+        // CIRISEdge#1025 — links, peers and link lifetimes.
+        f.family("links_active", self.links_active.iter());
+        f.counters
+            .insert("distinct_peers_1h".to_string(), self.distinct_peers_1h);
+        f.counters
+            .insert("distinct_peers_24h".to_string(), self.distinct_peers_24h);
+        // The top-N list is keyed by a salted peer hash, which no flat series
+        // may carry (WORKLOAD_ATTRIBUTION A8): the flat form is the entry
+        // count and each RANK's bytes.
+        f.counters.insert(
+            "top_peers_by_bytes".to_string(),
+            self.top_peers_by_bytes.len() as u64,
+        );
+        for (rank, e) in self.top_peers_by_bytes.iter().enumerate() {
+            f.counters
+                .insert(format!("top_peers_by_bytes.{rank}.bytes_in"), e.bytes_in);
+            f.counters
+                .insert(format!("top_peers_by_bytes.{rank}.bytes_out"), e.bytes_out);
+            f.counters.insert(
+                format!("top_peers_by_bytes.{rank}.error_bytes"),
+                e.error_bytes,
+            );
+        }
+        f.histogram_family("link_duration_seconds", &self.link_duration_seconds);
         for ((peer, medium), ratio) in &self.peer_reachability_ratio {
             f.gauges
                 .insert(format!("peer_reachability_ratio.{peer}:{medium}"), *ratio);
@@ -6414,6 +6595,13 @@ edge_metrics_bundle_fields!(
     durable_enqueued_total,
     transport_bytes_in_total,
     transport_bytes_out_total,
+    transport_wire_bytes_in_total,
+    transport_wire_bytes_out_total,
+    links_active,
+    distinct_peers_1h,
+    distinct_peers_24h,
+    top_peers_by_bytes,
+    link_duration_seconds,
     peer_reachability_ratio,
     inbound_dropped_low_trust,
     replication_round_outcomes_total,

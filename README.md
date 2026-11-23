@@ -82,7 +82,7 @@ real video + real blobs through real relays, in CI).
 
 ## Status
 
-**v45.1.9 (LTS).** Pins `ciris-persist` v61.4.3 (exact, by tag, Python too), CIRISVerify v22.2.0 and
+**v45.1.10 (LTS).** Pins `ciris-persist` v61.4.4 (exact, by tag), CIRISVerify v22.2.4 and
 leviculum v0.34.0+ciris.3 (`Cargo.toml`); MSRV 1.92; CC 1.0-rc17;
 wire vocabulary v1.0.3 (since v44.1.2). Release notes: [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md);
 threat model and its stated residuals: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
@@ -106,9 +106,25 @@ to a peer; scope-native addressing end to end (`#499`); the A/V mesh spine;
 Reticulum + HTTPS + packet-radio transports; the anti-entropy replication
 engine; the `#393` two-item attribution gate; MLS cohorts (TreeKEM, X-Wing)
 with scope-derived addressing and seal/retirement; mandatory hybrid Ed25519 +
-ML-DSA-65 on every producer; PyO3 + UniFFI mobile surfaces (Android floor:
+ML-DSA-65 on every producer; UniFFI Kotlin + Swift surfaces (Android floor:
 API 24). The Anonymous Tier is wired and dormant. Pinned in lockstep to
 `ciris-persist` via drift-witnessed policy hashes.
+
+## Distribution
+
+Edge ships as a **Rust crate** and as **UniFFI bindings**; it no longer ships
+Python. Rust consumers pin the git tag
+(`ciris-edge = { git = "https://github.com/CIRISAI/CIRISEdge", tag = "v…" }`).
+Native and mobile consumers take the GitHub Release assets: the Android
+per-ABI `.so` tarball, `CIRISEdge.xcframework`, and the generated Kotlin and
+Swift bindings, beside their signed manifests and `SHA256SUMS`. Python
+consumers (the agent) get edge inside CIRISServer's wheel, which compiles
+edge's `pyo3` binding in. Nothing is published to PyPI, and `pip install
+ciris-edge` is not a supported path. **v45.1.9 is the last release with Python
+assets** (desktop abi3 wheels, Chaquopy `android-wheels.tar.gz`, BeeWare
+`ios.tar.gz`). The `pyo3` feature, `src/ffi/pyo3.rs`, `pyproject.toml` and
+`python/` stay in the tree, compiled and tested in CI, until the v62 line
+removes them. See [`docs/PYPI_PUBLISH.md`](docs/PYPI_PUBLISH.md).
 
 ## Sister repos
 

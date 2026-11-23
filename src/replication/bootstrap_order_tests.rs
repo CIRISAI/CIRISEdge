@@ -135,6 +135,7 @@ impl Transport for NewContact {
                         status: None,
                         kind,
                         refs: Vec::new(),
+                        rf: None,
                     }),
                 );
                 let want = if self.holds(kind) {
@@ -149,6 +150,7 @@ impl Transport for NewContact {
                         kind,
                         want,
                         withheld: Vec::new(),
+                        rf: None,
                     }),
                 );
             }
@@ -351,11 +353,13 @@ impl Transport for WantsEverything {
                         status: None,
                         kind,
                         refs: Vec::new(),
+                        rf: None,
                     }),
                     ReplicationMessage::Diff(DiffMessage {
                         kind,
                         want,
                         withheld: Vec::new(),
+                        rf: None,
                     }),
                 ]
             }

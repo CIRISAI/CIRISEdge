@@ -130,6 +130,7 @@ impl Transport for Canonical {
                         status: None,
                         kind,
                         refs: Vec::new(),
+                        rf: None,
                     }),
                 );
                 self.reply(
@@ -139,6 +140,7 @@ impl Transport for Canonical {
                         kind,
                         want: Vec::new(),
                         withheld: Vec::new(),
+                        rf: None,
                     }),
                 );
             }

@@ -2796,6 +2796,13 @@ impl PyEdge {
     ///   "durable_enqueued_total":   {"durable": 5, "mandatory": 0, ...},
     ///   "transport_bytes_in_total": {"reticulum-rs": 24576, ...},
     ///   "transport_bytes_out_total":{"http": 1024, ...},
+    ///   "transport_wire_bytes_in_total": {"tcp:replication": 9216, ...},
+    ///   "transport_wire_bytes_out_total":{"tcp:shaped": 40960, ...},
+    ///   "links_active":             {"tcp:inbound": 17, "udp-direct:outbound": 1, ...},
+    ///   "distinct_peers_1h": 12, "distinct_peers_24h": 70,
+    ///   "top_peers_by_bytes": [{"peer": "9f2c…", "bytes_in": 1, "bytes_out": 2,
+    ///                           "error_bytes": 0}, ...],
+    ///   "link_duration_seconds":    {"first_contact:peer_closed": {"buckets": ...}},
     ///   "peer_reachability_ratio":  {"peer-x:reticulum-rs": 0.75, ...},
     ///   # CIRISEdge#433 — the withhold ledger + the replication-plane
     ///   # served counter. Together they separate the three states a node
@@ -3111,6 +3118,51 @@ fn metrics_bundle_to_pydict<'py>(
         bytes_out.set_item(k.0, *v)?;
     }
     root.set_item("transport_bytes_out_total", bytes_out)?;
+
+    // CIRISEdge#1025 — the wire, keyed `transport:plane`.
+    for (name, family) in [
+        (
+            "transport_wire_bytes_in_total",
+            &bundle.transport_wire_bytes_in_total,
+        ),
+        (
+            "transport_wire_bytes_out_total",
+            &bundle.transport_wire_bytes_out_total,
+        ),
+    ] {
+        let d = pyo3::types::PyDict::new(py);
+        for (k, v) in family {
+            d.set_item(k.as_str(), *v)?;
+        }
+        root.set_item(name, d)?;
+    }
+
+    // CIRISEdge#1025 — links by `transport:direction`, distinct peers, the
+    // top peers by wire bytes (`[{"peer", "bytes_in", "bytes_out",
+    // "error_bytes"}]`, `peer` a per-process salted hash) and link lifetimes
+    // by `class:cause`.
+    let links = pyo3::types::PyDict::new(py);
+    for (k, v) in &bundle.links_active {
+        links.set_item(k.as_str(), *v)?;
+    }
+    root.set_item("links_active", links)?;
+    root.set_item("distinct_peers_1h", bundle.distinct_peers_1h)?;
+    root.set_item("distinct_peers_24h", bundle.distinct_peers_24h)?;
+    let top = pyo3::types::PyList::empty(py);
+    for e in &bundle.top_peers_by_bytes {
+        let entry = pyo3::types::PyDict::new(py);
+        entry.set_item("peer", e.peer.as_str())?;
+        entry.set_item("bytes_in", e.bytes_in)?;
+        entry.set_item("bytes_out", e.bytes_out)?;
+        entry.set_item("error_bytes", e.error_bytes)?;
+        top.append(entry)?;
+    }
+    root.set_item("top_peers_by_bytes", top)?;
+    let lifetimes = pyo3::types::PyDict::new(py);
+    for (label, h) in &bundle.link_duration_seconds {
+        lifetimes.set_item(label.as_str(), histogram_to_pydict(py, h)?)?;
+    }
+    root.set_item("link_duration_seconds", lifetimes)?;
 
     // CIRISEdge#809 — the two leviculum pressure signals, as scalars.
     root.set_item(
@@ -11725,6 +11777,41 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pymodule]
 fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register(m)
+}
+
+/// CIRISServer's wheel gate requires the `PyInit_ciris_edge` symbol.
+///
+/// Edge stopped building its own wheels in the 45.x LTS, but CIRISServer still
+/// compiles this crate's `pyo3` feature into its one wheel. Its build-wheels
+/// gate refuses any wheel whose `_native` library lacks `PyInit_ciris_edge`
+/// (its `NEED_PYINIT` list), on every target. That symbol is the entry point the
+/// `#[pymodule] fn ciris_edge` above generates. Edge no longer links a cdylib in
+/// its own CI, so no CI job inspects a shared object for it. This test links
+/// against the symbol by its exported NAME, so renaming or removing the
+/// pymodule breaks the `pyo3-lib` lane here instead of the server's release.
+#[cfg(test)]
+mod server_wheel_gate_pyinit {
+    extern "C" {
+        // Never called: calling it needs a live interpreter. Linking to it by
+        // name is the whole check.
+        fn PyInit_ciris_edge() -> *mut pyo3::ffi::PyObject;
+    }
+
+    #[test]
+    fn server_wheel_gate_requires_the_pyinit_ciris_edge_symbol() {
+        // Taking the address forces the linker to resolve the exported name;
+        // if no item exports `PyInit_ciris_edge`, this test binary fails to link.
+        let entry: unsafe extern "C" fn() -> *mut pyo3::ffi::PyObject = PyInit_ciris_edge;
+        std::hint::black_box(entry);
+        // The module name the entry point registers is the one the server's
+        // agent imports (`ciris_edge`).
+        assert_eq!(
+            super::ciris_edge::__PYO3_NAME
+                .to_str()
+                .expect("utf-8 module name"),
+            "ciris_edge"
+        );
+    }
 }
 
 /// CIRISEdge#573 — the signer `build_signed_inbound_envelope` signs with.

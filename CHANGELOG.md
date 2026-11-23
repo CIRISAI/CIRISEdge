@@ -2,6 +2,77 @@
 
 Full notes for every release are in [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md).
 
+## 45.1.10 — 2026-11-22
+
+**PATCH. Where the bytes go, who the links are, and Python leaves the release.** Pins: persist
+**v61.4.4** by tag (`ciris-persist==61.4.4`; was v61.4.3), CIRISVerify **v22.2.4** (was v22.2.0),
+leviculum v0.34.0+ciris.3, `url` 2.5.9. No migration. No wire change for any node on the mesh
+today: the new replication members are read and never sent.
+
+### Added
+
+- **Bytes on the wire, by transport and plane** (CIRISEdge#1025):
+  `transport_wire_bytes_in_total` / `transport_wire_bytes_out_total`, keyed `transport:plane`.
+  Each transport's planes sum to what its interfaces carried; `other` is what leviculum moved
+  that edge did not attribute (announces and path traffic, until leviculum#111). The old
+  `transport_bytes_in_total` / `transport_bytes_out_total` keep their type and meaning
+  (application envelopes).
+- **Links and peers** (CIRISEdge#1025): `links_active` by transport and direction;
+  `distinct_peers_1h` / `distinct_peers_24h` from a bounded estimator; `top_peers_by_bytes`, a
+  bounded list keyed by a hash salted per process, never a metric label;
+  `link_duration_seconds`, a histogram by close cause. No address or peer identifier is
+  exported.
+- **Replication frame bytes**: Summary, Diff and Deliver frame bytes in both directions, and
+  `summary_refs_built` / `summary_bytes_built`, counted when a Summary is built and not only
+  when it is sent.
+- **Range fingerprints, step A** (`docs/design/RANGE_FINGERPRINTS.md`,
+  `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.4.2): the `rf` members and the compact ref and body
+  members are decoded; `Transport::confidential_to` (false unless a transport says so); the
+  passive receiver, **off by default** (`CIRIS_EDGE_RANGE_FINGERPRINTS_ANSWER=1` turns it on).
+  Nothing sends a fingerprint in this release. With the lever off a node sends and answers as
+  45.1.9 did.
+
+### Changed
+
+- **persist v61.4.4** (tag, commit 5ef264f3) and **CIRISVerify v22.2.4** (b5404bb3), moved
+  together so the tree holds one Verify. Verify since 22.2.0: `hickory-resolver` dropped (it is
+  gone from edge's graph too), the `rustix` and `quinn-udp` advisories cleared, `valid_until`
+  signed as `.sssZ`, self-verification finds its module by address, `url` 2.5.9
+  (RUSTSEC-2026-0592). No API change.
+
+### Fixed
+
+- **A pooled link that closes under a send** (CIRISEdge#947): the pool could hand out a link
+  the peer had just refused, and the send failed with no retry. A Resource send on a reused
+  link that turns out to be gone now closes that link and ships once on a fresh one
+  (`link_seal_pooled_link_gone_retried`). Channel-lane sends are CIRISEdge#1026.
+- **The facilitator is logged by its source, never its address** (host, bundle or bootstrap).
+
+### Removed
+
+- **Edge no longer ships Python.** The release stops building and attaching the
+  four desktop cp310-abi3 wheels, the Chaquopy `android-wheels.tar.gz`, and the
+  BeeWare `ios.tar.gz` (PyO3 `.abi3.so`). v45.1.9 is the last release with
+  them. Edge ships as a Rust crate (git tag) plus UniFFI bindings (Kotlin,
+  Swift, `CIRISEdge.xcframework`, Android `.so`). The agent gets edge through
+  CIRISServer's wheel. The `pyo3` feature and `src/ffi/pyo3.rs` stay until the
+  v62 line, and CI still compiles them on all four desktop platforms and runs
+  their unit tests. CI jobs removed: `ios-pyo3`, `ios-pyo3-package`, the
+  android `pyo3` variant cells, `cohabitation-conformance`,
+  `extract-substrate-pins`. `pyo3-wheel` became `desktop-release-build`, which
+  runs without maturin and keeps the CIRISCache save and `emit_edge_extras`.
+  The release has **10 assets** (was 15): `android.tar.gz`, `xcframework.tar.gz`,
+  `kotlin-bindings.tar.gz`, `swift-bindings.tar.gz`, five signed manifests, one per shipped
+  binary (`android-arm64-v8a`, `android-x86_64`, `android-armeabi-v7a`, `ios-aarch64`,
+  `ios-aarch64-sim`), and `SHA256SUMS`.
+
+### Not in this release
+
+- CIRISEdge#1022 (the send set re-read on its TTL): the event-driven memo is held back after
+  review, because an admitted row could discard the read in flight.
+- The NAT punch for two NAT'd peers and the call's media-path event: the next cut, on a new
+  leviculum tag.
+
 ## 45.1.9 — 2026-11-21
 
 **PATCH. Attribution: every memoised read says why it read, the walked sets are gauged, and

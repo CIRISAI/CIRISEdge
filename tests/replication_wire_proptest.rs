@@ -78,6 +78,7 @@ fn arb_summary() -> impl Strategy<Value = SummaryMessage> {
             status: None,
             kind,
             refs,
+            rf: None,
         })
 }
 
@@ -90,6 +91,7 @@ fn arb_diff() -> impl Strategy<Value = DiffMessage> {
             kind,
             want,
             withheld: Vec::new(),
+            rf: None,
         })
 }
 

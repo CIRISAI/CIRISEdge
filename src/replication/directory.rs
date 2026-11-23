@@ -320,6 +320,32 @@ pub trait ReplicationDirectory: Send + Sync {
     ) {
     }
 
+    /// Range fingerprints, step A — [`super::summary::StateProvider::rf_marker`].
+    fn rf_marker(&self, _kind: EnvelopeKind) -> Option<super::range_fp::RfSummary> {
+        None
+    }
+
+    /// Range fingerprints, step A — [`super::summary::StateProvider::rf_marker_diff`].
+    fn rf_marker_diff(&self, _kind: EnvelopeKind) -> Option<super::range_fp::RfDiff> {
+        None
+    }
+
+    /// Range fingerprints, step A — [`super::summary::StateProvider::rf_answer`],
+    /// for the Summary `peer_key_id` sent.
+    async fn rf_answer(
+        &self,
+        _peer_key_id: &str,
+        _kind: EnvelopeKind,
+        _remote: &super::protocol::SummaryMessage,
+        _raw_want: &[[u8; 32]],
+        _final_want: &[[u8; 32]],
+    ) -> Option<super::range_fp::RfDiff> {
+        None
+    }
+
+    /// Range fingerprints, step A — [`super::summary::StateProvider::rf_note_settled`].
+    fn rf_note_settled(&self, _peer_key_id: &str, _kind: EnvelopeKind, _envelope_bytes: &[u8]) {}
+
     /// Apply one envelope to local state. The implementation verifies the signed
     /// envelope's signature + canonical-bytes hash before admitting; the merge
     /// layer in persist is the canonical anti-rollback authority. Returns an
@@ -482,6 +508,38 @@ impl StateProvider for DirectoryStateAdapter {
     fn rewind_listing(&self, kind: EnvelopeKind, mark: &super::summary::ListingMark) {
         if let Some(peer) = self.peer_key_id.as_deref() {
             self.inner.rewind_listing(peer, kind, mark);
+        }
+    }
+
+    fn rf_marker(&self, kind: EnvelopeKind) -> Option<super::range_fp::RfSummary> {
+        self.inner.rf_marker(kind)
+    }
+
+    fn rf_marker_diff(&self, kind: EnvelopeKind) -> Option<super::range_fp::RfDiff> {
+        self.inner.rf_marker_diff(kind)
+    }
+
+    async fn rf_answer(
+        &self,
+        kind: EnvelopeKind,
+        remote: &super::protocol::SummaryMessage,
+        raw_want: &[[u8; 32]],
+        final_want: &[[u8; 32]],
+    ) -> Option<super::range_fp::RfDiff> {
+        self.inner
+            .rf_answer(
+                self.peer_key_id.as_deref()?,
+                kind,
+                remote,
+                raw_want,
+                final_want,
+            )
+            .await
+    }
+
+    fn rf_note_settled(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) {
+        if let Some(peer) = self.peer_key_id.as_deref() {
+            self.inner.rf_note_settled(peer, kind, envelope_bytes);
         }
     }
 

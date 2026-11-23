@@ -594,7 +594,7 @@ mod through_the_serve_paths {
     /// on neither, and each path books one refusal.
     #[tokio::test]
     async fn the_share_peer_gets_the_row_and_the_announce_peer_does_not() {
-        let w = World::boot(&["peer-a", "peer-b"]).await;
+        let w = Box::pin(World::boot(&["peer-a", "peer-b"])).await;
         w.bless("peer-a").await;
         w.bless("peer-b").await;
         seed_grant(&w.backend, LOCAL, "peer-a", &SHARE, no_extra()).await;
@@ -621,7 +621,7 @@ mod through_the_serve_paths {
     /// names the agent, and the peers differ only in what that grant covers.
     #[tokio::test]
     async fn the_steward_grant_serves_on_the_real_paths() {
-        let w = World::boot(&["peer-a", "peer-b"]).await;
+        let w = Box::pin(World::boot(&["peer-a", "peer-b"])).await;
         let bridge = w.bridge;
         let w = World {
             bridge: bridge.with_consent_subjects(vec!["agent-x".to_string()]),
@@ -643,7 +643,7 @@ mod through_the_serve_paths {
     /// serve-capable still takes a third party's trace from this node.
     #[tokio::test]
     async fn a_relayed_trace_still_reaches_an_announce_only_peer() {
-        let w = World::boot(&["lens-b"]).await;
+        let w = Box::pin(World::boot(&["lens-b"])).await;
         w.bless("lens-b").await;
         seed_grant(&w.backend, LOCAL, "lens-b", &ANNOUNCE, no_extra()).await;
         seed_trace_attestation(&w.backend, "agent-elsewhere").await;
@@ -658,7 +658,7 @@ mod through_the_serve_paths {
     /// its grant still live. Each answer is the next round's.
     #[tokio::test]
     async fn a_canonical_joining_or_leaving_the_roster_needs_no_restart() {
-        let w = World::boot(&["canonical-early"]).await;
+        let w = Box::pin(World::boot(&["canonical-early"])).await;
         let baked = crate::edge::baked_canonical_genesis_ids();
         for peer in ["canonical-early", "canonical-late"] {
             assert!(
@@ -716,7 +716,7 @@ mod through_the_serve_paths {
     /// grant of it. The accord's blessing is untouched; the walk reads no seat.
     #[tokio::test]
     async fn a_withdrawn_conferral_takes_effect_at_the_next_round() {
-        let w = World::boot(&["canonical-early"]).await;
+        let w = Box::pin(World::boot(&["canonical-early"])).await;
         let conferral = w.bless("canonical-early").await;
         seed_grant(&w.backend, LOCAL, "canonical-early", &SHARE, no_extra()).await;
         seed_trace_attestation(&w.backend, LOCAL).await;

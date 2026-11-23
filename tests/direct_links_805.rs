@@ -3169,3 +3169,171 @@ async fn a_wedged_punched_link_with_no_call_is_still_reaped() {
     .await;
     assert!(reaped, "the wedge ends: no call holds this link");
 }
+
+/// A side's census, read after its transport drained its link tallies.
+fn census(side: &Side) -> ciris_edge::observability::EdgeMetricsBundle {
+    side.transport.refresh_metrics();
+    side.metrics.snapshot()
+}
+
+/// **Witness (CIRISEdge#1025 items 1, 2, 4 and the top-N)** — A dials B
+/// through `T` over TCP (no room yet, so nothing proposes): the link counts
+/// `tcp:outbound` on A and `tcp:inbound` on B, each side has seen exactly one
+/// distinct peer, and A's top-N holds one entry, under a hash that is not B's
+/// key id. A and B then share a room and A sends again: the same link comes up
+/// direct and moves to `udp-direct` on both ends. A tears it down: it leaves
+/// `udp-direct` (not `tcp`), A's `link_duration_seconds` has one
+/// `dialled:local_teardown` life and B's exactly one (its cause is CIRISEdge#1030), and the
+/// distinct-peer gauges still read 1 (the window outlives the link).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one witness, read top to bottom
+async fn links_peers_and_lifetimes_are_counted_by_medium_and_cause_1025() {
+    let mut p = trio("c1025", proposer(), DirectLinksConfig::default()).await;
+    let a0 = census(&p.a);
+    assert_eq!(a0.links_active.len(), 20, "every key present");
+    assert_eq!(a0.distinct_peers_1h, 0);
+
+    p.a.transport
+        .send(&p.b.key.key_id, b"census-1025-1")
+        .await
+        .expect("A's send to B ships through T");
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            let a = census(&p.a);
+            let b = census(&p.b);
+            a.links_active["tcp:outbound"] >= 1
+                && b.links_active["tcp:inbound"] >= 1
+                && a.distinct_peers_1h == 1
+                && b.distinct_peers_1h == 1
+        })
+        .await,
+        "the relayed link counts tcp on both ends and each saw one peer: A {:?} B {:?}",
+        census(&p.a).links_active,
+        census(&p.b).links_active
+    );
+    let a1 = census(&p.a);
+    let b1 = census(&p.b);
+    assert_eq!(a1.links_active["udp-direct:outbound"], 0);
+    assert_eq!(a1.links_active["udp-direct:inbound"], 0);
+    assert_eq!(a1.distinct_peers_24h, 1);
+    assert_eq!(b1.distinct_peers_24h, 1);
+    let tcp_out = a1.links_active["tcp:outbound"];
+    let tcp_in_b = b1.links_active["tcp:inbound"];
+    // The sum is the direction record's.
+    assert_eq!(
+        a1.links_active.values().sum::<u64>(),
+        p.a.metrics.inbound_links() + p.a.metrics.outbound_links()
+    );
+    // The top-N on each end: one peer, by salted hash; A sent on the link and
+    // B received it. The two ends' salts differ, so their hashes do too.
+    assert_eq!(
+        a1.top_peers_by_bytes.len(),
+        1,
+        "{:?}",
+        a1.top_peers_by_bytes
+    );
+    assert_eq!(
+        b1.top_peers_by_bytes.len(),
+        1,
+        "{:?}",
+        b1.top_peers_by_bytes
+    );
+    let top = &a1.top_peers_by_bytes[0];
+    assert!(top.bytes_out > 0, "{top:?}");
+    assert!(
+        b1.top_peers_by_bytes[0].bytes_in > 0,
+        "{:?}",
+        b1.top_peers_by_bytes
+    );
+    assert_ne!(top.peer, b1.top_peers_by_bytes[0].peer);
+    assert_eq!(top.peer.len(), 16);
+    assert!(!p.b.key.key_id.contains(&top.peer) && !top.peer.contains(&p.b.key.key_id));
+    // Neither the hash nor the key id is a flat series.
+    let flat = a1.flatten();
+    assert_eq!(flat.counters["top_peers_by_bytes"], 1);
+    assert!(flat.counters["top_peers_by_bytes.0.bytes_out"] > 0);
+    for key in flat.counters.keys().chain(flat.gauges.keys()) {
+        assert!(!key.contains(&top.peer), "{key}");
+        assert!(!key.contains(&p.b.key.key_id), "{key}");
+    }
+    assert!(a1.link_duration_seconds.is_empty(), "nothing closed yet");
+
+    // Share the room; A's next send brings the link direct.
+    let (_spine, _b_addr) = open_call(&p).await;
+    p.a.transport
+        .send(&p.b.key.key_id, b"census-1025-2")
+        .await
+        .expect("A's room send");
+    let up = next_event(&mut p.a.events, Duration::from_secs(30), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the link comes up direct");
+    let DirectPathEvent::Established { link_id, .. } = up else {
+        unreachable!()
+    };
+    assert!(
+        wait_until(Duration::from_secs(15), || async {
+            census(&p.a).links_active["udp-direct:outbound"] == 1
+                && census(&p.b).links_active["udp-direct:inbound"] == 1
+        })
+        .await,
+        "the link moved to udp-direct on both ends: A {:?} B {:?}",
+        census(&p.a).links_active,
+        census(&p.b).links_active
+    );
+    let a2 = census(&p.a);
+    assert_eq!(a2.links_active["tcp:outbound"], tcp_out - 1, "it left tcp");
+    assert_eq!(census(&p.b).links_active["tcp:inbound"], tcp_in_b - 1);
+
+    // A tears it down.
+    p.a.transport
+        .link_teardown(&link_id)
+        .await
+        .expect("teardown");
+    let a3 = census(&p.a);
+    assert_eq!(a3.links_active["udp-direct:outbound"], 0, "left udp-direct");
+    assert_eq!(a3.links_active["tcp:outbound"], tcp_out - 1, "not tcp");
+    let life = &a3.link_duration_seconds["dialled:local_teardown"];
+    assert_eq!(life.count, 1, "{:?}", a3.link_duration_seconds.keys());
+    assert!(life.sum_seconds > 0.0);
+    assert_eq!(
+        a3.link_duration_seconds
+            .values()
+            .map(|h| h.count)
+            .sum::<u64>(),
+        1,
+        "one life ended on A: {:?}",
+        a3.link_duration_seconds.keys()
+    );
+    // B records the link's end exactly once. On a direct link B does not learn
+    // of A's teardown as a close: it finds out when its own Channel runs out
+    // (measured: about 31 s, cause `channel_exhausted`), which is CIRISEdge#1030.
+    // So this asserts the count and leaves the cause to that issue; when a
+    // direct link's close reaches the peer, tighten it to `peer_closed`.
+    assert!(
+        wait_until(Duration::from_secs(90), || async {
+            p.b.transport.reap_idle_inbound_links().await;
+            census(&p.b)
+                .link_duration_seconds
+                .values()
+                .map(|h| h.count)
+                .sum::<u64>()
+                == 1
+        })
+        .await,
+        "B records the link's end once: {:?}",
+        census(&p.b).link_duration_seconds.keys()
+    );
+    assert_eq!(census(&p.b).links_active["udp-direct:inbound"], 0);
+    // The windows outlive the link.
+    assert_eq!(census(&p.a).distinct_peers_1h, 1);
+    assert_eq!(census(&p.b).distinct_peers_24h, 1);
+    // The flat form carries the histogram by `class:cause`.
+    let flat = census(&p.a).flatten();
+    assert_eq!(
+        flat.counters["link_duration_seconds.dialled:local_teardown.count"],
+        1
+    );
+    assert_eq!(flat.counters["links_active.udp-direct:outbound"], 0);
+}

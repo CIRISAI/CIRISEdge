@@ -741,6 +741,27 @@ struct LinkTable {
     ledger: AwaitingLedger,
     /// Links the cap refused; the caller closes them ([`LinkSeals::take_evicted`]).
     evicted: Vec<[u8; 16]>,
+    /// CIRISEdge#1025 — what the wire ledger needs to know of a link, read
+    /// under the lock every seal and open already takes: whether it is an
+    /// A/V link, and whether it rides a punched direct interface now.
+    wire: HashMap<[u8; 16], LinkWire>,
+}
+
+/// CIRISEdge#1025 — a link's wire facts ([`LinkTable::wire`]).
+#[derive(Debug, Clone, Default)]
+struct LinkWire {
+    facts: WireFacts,
+    /// The link's byte tally toward its authenticated peer, once one is
+    /// attributed ([`LinkSeals::bind_peer`]): the census's only view of the
+    /// peer is its salted hash.
+    peer: Option<Arc<crate::link_census::PeerTally>>,
+}
+
+/// CIRISEdge#1025 — what the wire ledger needs of a link.
+#[derive(Debug, Clone, Copy, Default)]
+struct WireFacts {
+    av: bool,
+    direct: bool,
 }
 
 impl LinkTable {
@@ -754,9 +775,10 @@ impl LinkTable {
         }
     }
 
-    fn remove(&mut self, link: &[u8; 16]) {
+    fn remove(&mut self, link: &[u8; 16]) -> Option<LinkWire> {
         self.map.remove(link);
         self.ledger.remove(link);
+        self.wire.remove(link)
     }
 
     /// Refuse the oldest `Awaiting` links, never `keep`, until the ledger is
@@ -837,6 +859,18 @@ pub struct LinkSeals {
     decaps: AtomicU64,
     /// Test seam: how long a responder's first words wait, in milliseconds.
     first_words_delay_ms: AtomicU64,
+    /// CIRISEdge#1025 — the wire ledger every frame through here is counted
+    /// in, once the transport adopts its metrics.
+    wire: std::sync::OnceLock<Arc<crate::wire_bytes::WireBytes>>,
+    /// CIRISEdge#1025 — the plane of each in-flight `CFRG` frame.
+    fragment_planes: crate::wire_bytes::FragmentPlanes,
+    /// CIRISEdge#1025 — the medium a link that is not on a direct interface
+    /// rides ([`Self::set_base_transport`]), as a [`WireTransport`] index.
+    ///
+    /// [`WireTransport`]: crate::wire_bytes::WireTransport
+    base_transport: std::sync::atomic::AtomicU8,
+    /// CIRISEdge#1025 — the census each link's peer tally drains into.
+    census: std::sync::OnceLock<Arc<crate::link_census::LinkCensus>>,
 }
 
 impl std::fmt::Debug for LinkSeals {
@@ -876,7 +910,212 @@ impl LinkSeals {
             decap_panics: std::sync::atomic::AtomicBool::new(false),
             decaps: AtomicU64::new(0),
             first_words_delay_ms: AtomicU64::new(0),
+            wire: std::sync::OnceLock::new(),
+            fragment_planes: crate::wire_bytes::FragmentPlanes::default(),
+            base_transport: std::sync::atomic::AtomicU8::new(
+                crate::wire_bytes::WireTransport::Tcp as u8,
+            ),
+            census: std::sync::OnceLock::new(),
         }
+    }
+
+    /// CIRISEdge#1025 — count every frame through this table in `wire` from
+    /// now on. The first ledger attached wins; a second is ignored.
+    pub fn attach_wire(&self, wire: Arc<crate::wire_bytes::WireBytes>) {
+        let _ = self.wire.set(wire);
+    }
+
+    /// CIRISEdge#1025 — the medium of a link not on a direct interface: the
+    /// node's one configured kind of interface, or `other` when it has
+    /// several (the seal cannot ask leviculum per frame which one a link is
+    /// on without the node lock).
+    pub fn set_base_transport(&self, transport: crate::wire_bytes::WireTransport) {
+        self.base_transport
+            .store(transport as u8, Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#1025 — `link` is an A/V link: its frames are `av`.
+    pub fn mark_av(&self, link: [u8; 16]) {
+        self.links().wire.entry(link).or_default().facts.av = true;
+    }
+
+    /// CIRISEdge#1025 — tally every peer's bytes into `census` from now on.
+    /// The first census attached wins; a second is ignored.
+    pub fn attach_census(&self, census: Arc<crate::link_census::LinkCensus>) {
+        let _ = self.census.set(census);
+    }
+
+    /// The medium a link not on a direct interface is counted under.
+    #[must_use]
+    pub fn base_transport(&self) -> crate::wire_bytes::WireTransport {
+        let i = usize::from(self.base_transport.load(Ordering::Relaxed));
+        crate::wire_bytes::WireTransport::ALL
+            .get(i)
+            .copied()
+            .unwrap_or(crate::wire_bytes::WireTransport::Other)
+    }
+
+    /// CIRISEdge#1025 — `link` is attributed to the authenticated peer
+    /// `key_id`: its frames are tallied toward that peer from here, and the
+    /// peer is seen. Only the key id's salted hash is kept. A link this table
+    /// does not hold (already forgotten) is left alone, so a late attribution
+    /// cannot leave an entry behind. A re-attribution to another peer drains
+    /// the old tally first.
+    pub fn bind_peer(&self, link: [u8; 16], key_id: &str) {
+        let Some(census) = self.census.get() else {
+            return;
+        };
+        let hash = census.peer_hash(key_id);
+        let (fresh, old) = {
+            let mut links = self.links();
+            if !links.map.contains_key(&link) {
+                return;
+            }
+            let entry = links.wire.entry(link).or_default();
+            if entry.peer.as_ref().is_some_and(|p| p.hash() == hash) {
+                return;
+            }
+            let fresh = Arc::new(crate::link_census::PeerTally::new(hash));
+            let old = entry.peer.replace(Arc::clone(&fresh));
+            (fresh, old)
+        };
+        if let Some(old) = old {
+            census.drain_tally(&old);
+        }
+        census.note_tally_seen(&fresh);
+    }
+
+    /// CIRISEdge#1025 — drain every live link's peer tally into the census
+    /// (the top-N sketch) and mark its peer seen in the current bucket. On the
+    /// node tick and before a snapshot, never per packet.
+    pub fn flush_peer_tallies(&self) {
+        let Some(census) = self.census.get() else {
+            return;
+        };
+        let tallies: Vec<Arc<crate::link_census::PeerTally>> = self
+            .links()
+            .wire
+            .values()
+            .filter_map(|w| w.peer.clone())
+            .collect();
+        for t in &tallies {
+            census.drain_tally(t);
+        }
+    }
+
+    /// CIRISEdge#1025 — `link` moved onto (`true`) or off (`false`) a punched
+    /// direct interface.
+    pub fn set_direct(&self, link: [u8; 16], direct: bool) {
+        let mut links = self.links();
+        if direct || links.wire.contains_key(&link) {
+            links.wire.entry(link).or_default().facts.direct = direct;
+        }
+    }
+
+    fn wire_of(&self, facts: Option<WireFacts>) -> (crate::wire_bytes::WireTransport, bool) {
+        let facts = facts.unwrap_or_default();
+        let transport = if facts.direct {
+            crate::wire_bytes::WireTransport::UdpDirect
+        } else {
+            self.base_transport()
+        };
+        (transport, facts.av)
+    }
+
+    /// A link's wire facts, and its peer tally credited `bytes` in the
+    /// direction given, under the one lock the caller would take anyway.
+    fn facts_tallied(&self, link: &[u8; 16], inbound: bool, bytes: usize) -> Option<WireFacts> {
+        let links = self.links();
+        let w = links.wire.get(link)?;
+        if let Some(p) = &w.peer {
+            if inbound {
+                p.add_in(bytes as u64);
+            } else {
+                p.add_out(bytes as u64);
+            }
+        }
+        Some(w.facts)
+    }
+
+    fn count(
+        &self,
+        dir: crate::wire_bytes::WireDir,
+        transport: crate::wire_bytes::WireTransport,
+        plane: crate::wire_bytes::WirePlane,
+        bytes: usize,
+    ) {
+        if let Some(w) = self.wire.get() {
+            w.add(dir, transport, plane, bytes as u64);
+        }
+    }
+
+    /// The plane of an edge frame's plaintext on `lane` (CIRISEdge#1025).
+    fn plane_of(&self, lane: Lane, av: bool, plain: &[u8]) -> crate::wire_bytes::WirePlane {
+        use crate::wire_bytes::WirePlane;
+        match lane {
+            Lane::Datagram => WirePlane::Av,
+            _ if av => WirePlane::Av,
+            // A Resource is named by what it carries when that has a tag of
+            // its own (a replication Deliver rides one), else `resource`.
+            Lane::Resource => {
+                match crate::wire_bytes::classify_link_frame(plain, &self.fragment_planes) {
+                    WirePlane::Application => WirePlane::Resource,
+                    p => p,
+                }
+            }
+            Lane::Request | Lane::Response => WirePlane::Application,
+            Lane::Channel => crate::wire_bytes::classify_link_frame(plain, &self.fragment_planes),
+        }
+    }
+
+    /// CIRISEdge#1025 — count an UNSEALED frame this node handed leviculum on
+    /// `link` (a transit-KEX part, a route request or answer), once its send
+    /// returned.
+    pub fn count_unsealed_out(&self, link: [u8; 16], frame: &[u8]) {
+        let facts = self.facts_tallied(&link, false, frame.len());
+        let (transport, _) = self.wire_of(facts);
+        let plane = crate::wire_bytes::unsealed_control(frame)
+            .unwrap_or(crate::wire_bytes::WirePlane::Other);
+        self.count(
+            crate::wire_bytes::WireDir::Out,
+            transport,
+            plane,
+            frame.len(),
+        );
+    }
+
+    /// CIRISEdge#1025 — count one frame leviculum delivered on `link`'s
+    /// `lane`, as it arrived (`frame`), once its seal outcome is known: an
+    /// opened frame by its plaintext, a handshake or route frame as link
+    /// control, a Resource held before keys as a Resource, and anything
+    /// refused or dropped by its lane (`other` on the Channel, which a frame
+    /// that never opened cannot name). Called once per delivered frame, at
+    /// the transport's seal choke point, never on a replay.
+    pub fn count_inbound(&self, link: [u8; 16], lane: Lane, frame: &[u8], outcome: &Inbound) {
+        use crate::wire_bytes::WirePlane;
+        let facts = self.facts_tallied(&link, true, frame.len());
+        let (transport, av) = self.wire_of(facts);
+        let plane = match outcome {
+            Inbound::Open(plain) => self.plane_of(lane, av, plain),
+            Inbound::Pending
+            | Inbound::Handshake(_)
+            | Inbound::Keyed { .. }
+            | Inbound::RouteRequested { .. }
+            | Inbound::RouteAnswered => WirePlane::LinkControl,
+            Inbound::HeldBeforeKeys => WirePlane::Resource,
+            Inbound::Drop(_) | Inbound::Refuse(_) | Inbound::Closed => match lane {
+                Lane::Resource => WirePlane::Resource,
+                Lane::Datagram => WirePlane::Av,
+                _ if av => WirePlane::Av,
+                _ => crate::wire_bytes::unsealed_control(frame).unwrap_or(WirePlane::Other),
+            },
+        };
+        self.count(
+            crate::wire_bytes::WireDir::In,
+            transport,
+            plane,
+            frame.len(),
+        );
     }
 
     fn route_answers(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], RouteAnswerTx>> {
@@ -1571,16 +1810,19 @@ impl LinkSeals {
         lane: Lane,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, SealRefusal> {
-        let sealed = match self.links().map.get(&link) {
-            Some(State::Sealed(s)) => Arc::clone(s),
-            _ => return Err(SealRefusal::Unsealed),
+        let (sealed, facts) = {
+            let links = self.links();
+            match links.map.get(&link) {
+                Some(State::Sealed(s)) => (Arc::clone(s), links.wire.get(&link).cloned()),
+                _ => return Err(SealRefusal::Unsealed),
+            }
         };
         // CC 3.2 (f) — a pairing-pinned link carries first contact only, and
         // only through `seal_first_contact`: no other send path can use it.
         if sealed.pinned.load(Ordering::Relaxed) {
             return Err(SealRefusal::FirstContactOnly);
         }
-        Ok(self.seal_with(link, &sealed, lane, plaintext))
+        Ok(self.seal_with(link, &sealed, facts, lane, plaintext))
     }
 
     /// CC 3.2 (f) — seal one first-contact frame on a pairing-pinned link.
@@ -1595,17 +1837,23 @@ impl LinkSeals {
         lane: Lane,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, SealRefusal> {
-        let sealed = match self.links().map.get(&link) {
-            Some(State::Sealed(s)) if s.pinned.load(Ordering::Relaxed) => Arc::clone(s),
-            _ => return Err(SealRefusal::Unsealed),
+        let (sealed, facts) = {
+            let links = self.links();
+            match links.map.get(&link) {
+                Some(State::Sealed(s)) if s.pinned.load(Ordering::Relaxed) => {
+                    (Arc::clone(s), links.wire.get(&link).cloned())
+                }
+                _ => return Err(SealRefusal::Unsealed),
+            }
         };
-        Ok(self.seal_with(link, &sealed, lane, plaintext))
+        Ok(self.seal_with(link, &sealed, facts, lane, plaintext))
     }
 
     fn seal_with(
         &self,
         link: [u8; 16],
         sealed: &SealedLink,
+        facts: Option<LinkWire>,
         lane: Lane,
         plaintext: &[u8],
     ) -> Vec<u8> {
@@ -1614,6 +1862,23 @@ impl LinkSeals {
             frame = msgpack_bin(&frame);
         }
         self.tap_frame(link, &frame);
+        // CIRISEdge#1025 — counted as sealed: every sealed send path hands
+        // this frame to leviculum next, and one whose send then fails is a
+        // dead link's last frame. The link's facts came with its keys, under
+        // the one lock the seal takes.
+        if let Some(p) = facts.as_ref().and_then(|f| f.peer.as_deref()) {
+            p.add_out(frame.len() as u64);
+        }
+        if self.wire.get().is_some() {
+            let (transport, av) = self.wire_of(facts.map(|f| f.facts));
+            let plane = self.plane_of(lane, av, plaintext);
+            self.count(
+                crate::wire_bytes::WireDir::Out,
+                transport,
+                plane,
+                frame.len(),
+            );
+        }
         frame
     }
 
@@ -1734,7 +1999,12 @@ impl LinkSeals {
 
     /// Forget a closed link (its keys and anything held for it).
     pub fn forget(&self, link: &[u8; 16]) {
-        self.links().remove(link);
+        // CIRISEdge#1025 — what the link carried since the last tick still
+        // counts toward its peer.
+        let gone = self.links().remove(link);
+        if let (Some(t), Some(census)) = (gone.and_then(|w| w.peer), self.census.get()) {
+            census.drain_tally(&t);
+        }
         self.route_answers().remove(link);
         self.held
             .lock()

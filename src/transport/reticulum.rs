@@ -397,6 +397,10 @@ enum ShipError {
     Busy,
     /// Any other send failure — not retryable on the same link.
     Other(TransportError),
+    /// CIRISEdge#947 — the link went, or its peer refused the transfer, under
+    /// the send: nothing reached the peer on it, and nothing will. Not
+    /// retryable on this link; a fresh one may carry it.
+    Gone(TransportError),
 }
 
 impl ShipError {
@@ -408,7 +412,7 @@ impl ShipError {
             ShipError::Busy => {
                 TransportError::Io("reticulum send_resource: transfer in progress".to_string())
             }
-            ShipError::Other(e) => e,
+            ShipError::Other(e) | ShipError::Gone(e) => e,
         }
     }
 }
@@ -514,6 +518,9 @@ async fn migrate_dialled_link_state(
     }
     let mut planes = link_plane.lock().await;
     if let Some(p) = planes.remove(&connect_id) {
+        if p == LinkPlane::Av {
+            seals.mark_av(wire_id.into_bytes());
+        }
         planes.insert(wire_id, p);
     }
 }
@@ -2915,6 +2922,10 @@ pub struct ReticulumTransport {
     /// drains too fast to collide). Zero in production: one relaxed atomic
     /// load per ship. Set via [`Self::force_next_sends_busy_for_test`].
     test_force_busy: Arc<std::sync::atomic::AtomicU32>,
+    /// CIRISEdge#947 test seam — see
+    /// [`Self::close_next_shipped_links_for_test`]. 0 in production: one
+    /// relaxed atomic load per ship.
+    test_close_before_ship: Arc<std::sync::atomic::AtomicU32>,
     /// CIRISEdge#853 test seam — see
     /// [`ReticulumTransport::delay_channel_sends_for_test`]. 0 in production.
     test_channel_delay_ms: std::sync::atomic::AtomicU64,
@@ -3214,6 +3225,9 @@ pub struct ReticulumTransport {
     /// leviculum#102 — what was last folded from leviculum's datagram
     /// counters into `av_plane` ([`fold_av_datagrams`]).
     av_datagram_fold: Arc<std::sync::Mutex<AvDatagramFold>>,
+    /// CIRISEdge#1025 — the interface byte totals last folded into the wire
+    /// ledger.
+    wire_fold: Arc<crate::wire_bytes::InterfaceFold>,
     /// Test seam — the C3 `CAPS` bits calls on this node leave out
     /// ([`Self::set_av_caps_withheld_for_test`]). 0 in production.
     av_caps_withheld: std::sync::atomic::AtomicU32,
@@ -3904,8 +3918,9 @@ impl ReticulumTransport {
         tracing::info!(
             proposes = config.direct_links.proposes(),
             proposing = ?config.direct_links.proposing,
-            facilitator = ?config.direct_links.facilitator,
-            serves_facilitator = ?config.direct_links.serve_facilitator,
+            // Whether, never where: no address in a log line.
+            facilitator_named = config.direct_links.facilitator.is_some(),
+            serves_facilitator = config.direct_links.serve_facilitator.is_some(),
             accept = ?config.direct_links.accept,
             "reticulum direct links (CIRISEdge#805 item 8, leviculum#70)"
         );
@@ -4042,6 +4057,10 @@ impl ReticulumTransport {
                 });
             }
         }
+        // CIRISEdge#1025 — the medium a sealed frame on a non-direct link is
+        // counted under.
+        let wire_base = base_wire_transport(interface_specs.iter().map(|i| i.kind.as_str()));
+        seals.set_base_transport(wire_base);
         if let Some(name) = share_instance_local.clone() {
             builder = builder.share_instance(true).instance_name(name);
         }
@@ -4378,6 +4397,7 @@ impl ReticulumTransport {
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
             test_force_busy: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            test_close_before_ship: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             test_channel_delay_ms: std::sync::atomic::AtomicU64::new(0),
             stall_guard: Arc::default(),
             test_unacked_links: std::sync::Mutex::new(HashMap::new()),
@@ -4412,7 +4432,7 @@ impl ReticulumTransport {
             pool_idle_cap: std::sync::atomic::AtomicUsize::new(DEFAULT_LINK_POOL_IDLE_CAP),
             pool_links_closed: std::sync::atomic::AtomicU64::new(0),
             link_in_flight: Arc::new(Mutex::new(HashSet::new())),
-            link_direction: Arc::new(std::sync::Mutex::new(LinkDirections::default())),
+            link_direction: Arc::new(std::sync::Mutex::new(LinkDirections::with_base(wire_base))),
             inbound_idle_bound_ms: std::sync::atomic::AtomicU64::new(
                 u64::try_from(DEFAULT_INBOUND_LINK_IDLE_BOUND.as_millis()).unwrap_or(u64::MAX),
             ),
@@ -4430,6 +4450,7 @@ impl ReticulumTransport {
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
             av_datagram_fold: Arc::default(),
+            wire_fold: Arc::default(),
             av_caps_withheld: std::sync::atomic::AtomicU32::new(0),
             av_datagrams_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             av_layer_requests: std::sync::atomic::AtomicBool::new(false),
@@ -5267,6 +5288,8 @@ impl ReticulumTransport {
     /// Hand the bag to everything that counts into it. Both doors come here,
     /// so a part cannot be left counting into nothing.
     fn adopt_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        self.seals.attach_wire(Arc::clone(&metrics.wire_bytes));
+        self.seals.attach_census(Arc::clone(&metrics.link_census));
         self.keyer.attach_metrics(metrics.clone());
         self.shapers.attach_metrics(metrics.clone());
         let _ = self.metrics.set(metrics);
@@ -6181,6 +6204,16 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub fn set_first_words_delay_for_test(&self, delay: Duration) {
         self.seals.set_first_words_delay(delay);
+    }
+
+    /// CIRISEdge#947 test seam — the next `n` resource ships find their link
+    /// closed just as they start, as a pooled link does when the peer's close
+    /// lands between the pool handing it out and the send. Real close, real
+    /// send: the error the send meets is leviculum's own.
+    #[doc(hidden)]
+    pub fn close_next_shipped_links_for_test(&self, n: u32) {
+        self.test_close_before_ship
+            .store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// CIRISEdge#947 test seam — the node-wide rate of strangers' handshakes
@@ -8940,10 +8973,17 @@ impl ReticulumTransport {
         // Timer-free).
         match response.await {
             Ok(info) => {
-                match self
-                    .seals
-                    .open(link_id.into_bytes(), Lane::Response, &info.response_data)
-                {
+                let opened =
+                    self.seals
+                        .open(link_id.into_bytes(), Lane::Response, &info.response_data);
+                // CIRISEdge#1025 — a response is a frame delivered on the link.
+                self.seals.count_inbound(
+                    link_id.into_bytes(),
+                    Lane::Response,
+                    &info.response_data,
+                    &opened,
+                );
+                match opened {
                     Inbound::Open(plain) => Ok(plain),
                     Inbound::Refuse(r) => {
                         let err =
@@ -10009,6 +10049,7 @@ impl ReticulumTransport {
             last_used: Arc::clone(&self.pool_last_used),
             link_id,
             armed: true,
+            reused: false,
         }
     }
 
@@ -10820,7 +10861,7 @@ impl ReticulumTransport {
                     }
                     tokio::time::sleep(REVERSE_PATH_BUSY_BACKOFF).await;
                 }
-                Err(ShipError::Other(e)) => {
+                Err(ShipError::Other(e) | ShipError::Gone(e)) => {
                     if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                         reverse_path_fallback_log().check(destination_key_id)
                     {
@@ -10875,6 +10916,18 @@ impl ReticulumTransport {
             .is_ok()
         {
             return Err(ShipError::Busy);
+        }
+        // CIRISEdge#947 test seam — the link closes under the send as it starts.
+        if self
+            .test_close_before_ship
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            let _ = self.node.close_link(link_id).await;
         }
         // CIRISEdge#926 test seam — a link whose peer stopped acknowledging
         // holds its one Resource slot with a transfer that never proves.
@@ -11003,6 +11056,11 @@ impl ReticulumTransport {
                 leviculum_std::error::Error::Resource(
                     leviculum_core::resource::ResourceError::TransferInProgress,
                 ) => ShipError::Busy,
+                // CIRISEdge#947 — the link is no longer leviculum's (a link it
+                // dropped reads `InvalidRequest` here): gone, not a bad send.
+                other if !self.node.link_is_established(link_id) => ShipError::Gone(
+                    TransportError::Io(format!("reticulum send_resource: {other}")),
+                ),
                 other => ShipError::Other(TransportError::Io(format!(
                     "reticulum send_resource: {other}"
                 ))),
@@ -11051,8 +11109,20 @@ impl ReticulumTransport {
                                  before the resource completed (CIRISEdge#353b caveat; burst-and-leave \
                                  is the separate initiator-push end-state)"
                             );
-                            Err(ShipError::Other(TransportError::Timeout(max_transfer)))
+                            Err(ShipError::Gone(TransportError::Timeout(max_transfer)))
                         }
+                        // CIRISEdge#947 — the peer cancelled it (a link it
+                        // refused takes no Resource), or the link left Active.
+                        Err(
+                            e @ CompletionError::Resource {
+                                error:
+                                    leviculum_core::resource::ResourceError::RejectedByRemote
+                                    | leviculum_core::resource::ResourceError::LinkNotActive
+                                    | leviculum_core::resource::ResourceError::LinkClosed,
+                            },
+                        ) => Err(ShipError::Gone(TransportError::Io(format!(
+                            "reticulum resource send: {e}"
+                        )))),
                         Err(e) => Err(ShipError::Other(TransportError::Io(format!(
                             "reticulum resource send: {e}"
                         )))),
@@ -11143,6 +11213,13 @@ impl Transport for ReticulumTransport {
         TransportId::RETICULUM_RS
     }
 
+    /// Range fingerprints (R6): every frame on every lane of every link is
+    /// E1-sealed (`link_seal` module docs: "There is never a plaintext edge
+    /// frame in either direction"), whichever pooled link carries it.
+    fn confidential_to(&self, _peer: &str) -> bool {
+        true
+    }
+
     /// CIRISEdge#809 — the Edge's bag becomes this transport's; first
     /// handle wins, so a bag a test attached through `with_metrics` is
     /// kept and production (which never calls `with_metrics`) gets the
@@ -11170,6 +11247,8 @@ impl Transport for ReticulumTransport {
         if let Some(m) = self.metrics.get() {
             mirror_planes(&self.node, m);
             fold_av_datagrams(&self.node, &self.av_sink, &self.av_datagram_fold, m);
+            fold_wire_bytes(&self.node, &self.wire_fold, m);
+            self.seals.flush_peer_tallies();
             m.telemetry
                 .set_av_datagrams_enabled(self.av_datagrams_enabled());
         }
@@ -11464,6 +11543,30 @@ fn fold_av_datagrams(
     }
 }
 
+/// CIRISEdge#1025 — fold leviculum's per-interface socket byte totals (HDLC
+/// framing and IFAC included) into the wire ledger's interface truth, by
+/// transport, as deltas. On the node tick and before a snapshot, never per
+/// packet. No interface name, address or id leaves this function: the name is
+/// read only for leviculum's `DirectPeer/` prefix.
+fn fold_wire_bytes(
+    node: &ReticulumNode,
+    fold: &crate::wire_bytes::InterfaceFold,
+    metrics: &crate::observability::EdgeMetrics,
+) {
+    let stats = node.interface_stats();
+    fold.fold(
+        &metrics.wire_bytes,
+        stats.iter().map(|i| {
+            (
+                i.interface_id.0,
+                crate::wire_bytes::WireTransport::of_interface(i.kind.as_str(), &i.name),
+                i.rx_bytes,
+                i.tx_bytes,
+            )
+        }),
+    );
+}
+
 /// `FSD/CIRIS_MESH.md` §7.7 — a forwarded link this node refused is a dial
 /// that failed somewhere else, so every move of the count is said, once, off
 /// the node lock. Returns the count it has told.
@@ -11498,6 +11601,9 @@ struct NodeTick {
     metrics: Option<crate::observability::EdgeMetrics>,
     av_sink: Arc<crate::transport::av_sink::AvSink>,
     av_datagram_fold: Arc<std::sync::Mutex<AvDatagramFold>>,
+    /// CIRISEdge#1025 — the interface byte totals last folded into the wire
+    /// ledger.
+    wire_fold: Arc<crate::wire_bytes::InterfaceFold>,
     av_datagrams_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -11530,6 +11636,9 @@ impl NodeTick {
         t.set_seal_held(held);
         mirror_planes(node, m);
         fold_av_datagrams(node, &self.av_sink, &self.av_datagram_fold, m);
+        fold_wire_bytes(node, &self.wire_fold, m);
+        // CIRISEdge#1025 — each link's peer bytes into the top-N sketch.
+        self.seals.flush_peer_tallies();
         t.set_av_datagrams_enabled(
             self.av_datagrams_enabled
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -11599,6 +11708,7 @@ impl ReticulumTransport {
             metrics: self.metrics.get().cloned(),
             av_sink: Arc::clone(&self.av_sink),
             av_datagram_fold: Arc::clone(&self.av_datagram_fold),
+            wire_fold: Arc::clone(&self.wire_fold),
             av_datagrams_enabled: Arc::clone(&self.av_datagrams_enabled),
         }
     }
@@ -12237,12 +12347,9 @@ impl ReticulumTransport {
         if replication {
             self.note_reach(crate::observability::REPLICATION_REACH_DIALLED);
         }
+        let mut lane_bulk = bulk && self.shapers.offers_to(Some(destination_key_id));
         let lane = self
-            .identity_lane(
-                destination_key_id,
-                &candidates,
-                bulk && self.shapers.offers_to(Some(destination_key_id)),
-            )
+            .identity_lane(destination_key_id, &candidates, lane_bulk)
             .await;
         let mut claim = match lane {
             Ok(c) => c,
@@ -12257,6 +12364,7 @@ impl ReticulumTransport {
             .needs_bulk_plane(claim.link_id().into_bytes(), envelope_bytes)
         {
             claim.release().await;
+            lane_bulk = true;
             claim = match self
                 .identity_lane(destination_key_id, &candidates, true)
                 .await
@@ -12297,6 +12405,7 @@ impl ReticulumTransport {
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
         // hard cap (v13.6.1 progress-aware wait).
+        let reused = claim.reused;
         let shipped = self
             .ship_resource_on_link(
                 &link_id,
@@ -12306,7 +12415,54 @@ impl ReticulumTransport {
             )
             .await;
         claim.release().await;
-        shipped.map_err(ShipError::into_transport)?;
+        let link_id = match shipped {
+            // CIRISEdge#947 — a pooled link the peer refused (or closed) under
+            // this send: its close had not reached this node when the pool
+            // handed it out. Nothing landed. Close it here, so no other send
+            // takes it, and ship once on a fresh lane. Only a pooled lane: a
+            // link this send dialled itself failing is the dial's answer.
+            Err(ShipError::Gone(e)) if reused => {
+                tracing::info!(
+                    key_id = %destination_key_id,
+                    link = %hex::encode(link_id.as_bytes()),
+                    error = %e,
+                    "a pooled link went under the send; closing it and shipping once on a \
+                     fresh lane (CIRISEdge#947)"
+                );
+                if let Some(m) = self.metrics.get() {
+                    m.inc_link_seal(crate::observability::LINK_SEAL_POOLED_LINK_GONE_RETRIED);
+                }
+                self.seals.refuse(link_id.into_bytes());
+                let _ = self.node.close_link(&link_id).await;
+                let fresh = match self
+                    .identity_lane(destination_key_id, &candidates, lane_bulk)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Err(self
+                            .bulk_dial_refused(destination_key_id, envelope_bytes, e)
+                            .await)
+                    }
+                };
+                let fresh_id = fresh.link_id();
+                let shipped = self
+                    .ship_resource_on_link(
+                        &fresh_id,
+                        envelope_bytes,
+                        DIAL_NO_PROGRESS_WINDOW,
+                        RESOURCE_TRANSFER_TIMEOUT,
+                    )
+                    .await;
+                fresh.release().await;
+                shipped.map_err(ShipError::into_transport)?;
+                fresh_id
+            }
+            other => {
+                other.map_err(ShipError::into_transport)?;
+                link_id
+            }
+        };
         // CIRISEdge#915 — a room peer reached through a transport node: try
         // to bring this link direct for the room's later traffic.
         self.propose_direct_to_room_peer(destination_key_id, link_id, &candidates)
@@ -12595,14 +12751,75 @@ impl LinkDirection {
 
 /// CIRISEdge#853 — the direction of every established link, with running
 /// counts so the gauges are O(1) to publish on every establish and close.
-#[derive(Debug, Default)]
+/// CIRISEdge#1025 — and each link's medium (its base, or `udp-direct` while it
+/// rides a punched interface) and establishment time, for `links_active` and
+/// `link_duration_seconds`.
+#[derive(Debug)]
 struct LinkDirections {
     by_link: HashMap<LinkId, LinkDirection>,
     inbound: u64,
     outbound: u64,
+    /// CIRISEdge#1025 — per established link: when it came up, and whether
+    /// it is on a punched interface now.
+    since: HashMap<LinkId, (std::time::Instant, bool)>,
+    /// CIRISEdge#1025 — the medium a link not on a direct interface rides.
+    base: crate::wire_bytes::WireTransport,
+    /// CIRISEdge#1025 — established links by `[transport][direction]`.
+    active: crate::link_census::LinksActive,
+}
+
+impl Default for LinkDirections {
+    fn default() -> Self {
+        Self::with_base(crate::wire_bytes::WireTransport::Tcp)
+    }
 }
 
 impl LinkDirections {
+    fn with_base(base: crate::wire_bytes::WireTransport) -> Self {
+        Self {
+            by_link: HashMap::new(),
+            inbound: 0,
+            outbound: 0,
+            since: HashMap::new(),
+            base,
+            active: [[0; 2]; crate::wire_bytes::WireTransport::COUNT],
+        }
+    }
+
+    /// The `links_active` cell of a link going `dir` that is (or is not) on
+    /// a punched interface.
+    fn cell(&mut self, dir: LinkDirection, direct: bool) -> &mut u64 {
+        let t = if direct {
+            crate::wire_bytes::WireTransport::UdpDirect
+        } else {
+            self.base
+        };
+        let d = usize::from(dir == LinkDirection::Outbound);
+        &mut self.active[t as usize][d]
+    }
+
+    /// CIRISEdge#1025 — `link_id` moved onto (`true`) or off a punched
+    /// interface: it moves between its base medium and `udp-direct`. A link
+    /// with no direction record is not counted, so nothing moves.
+    fn set_direct(&mut self, link_id: &LinkId, direct: bool) {
+        let Some(dir) = self.by_link.get(link_id).copied() else {
+            return;
+        };
+        let Some((_, was)) = self.since.get(link_id).copied() else {
+            return;
+        };
+        if was == direct {
+            return;
+        }
+        let from = self.cell(dir, was);
+        *from = from.saturating_sub(1);
+        let to = self.cell(dir, direct);
+        *to = to.saturating_add(1);
+        if let Some(e) = self.since.get_mut(link_id) {
+            e.1 = direct;
+        }
+    }
+
     fn count(&mut self, dir: LinkDirection, up: bool) {
         let n = match dir {
             LinkDirection::Inbound => &mut self.inbound,
@@ -12616,16 +12833,38 @@ impl LinkDirections {
     }
 
     fn insert(&mut self, link_id: LinkId, dir: LinkDirection) {
+        let (at, direct) = self
+            .since
+            .get(&link_id)
+            .copied()
+            .unwrap_or((std::time::Instant::now(), false));
         if let Some(prev) = self.by_link.insert(link_id, dir) {
             self.count(prev, false);
+            let c = self.cell(prev, direct);
+            *c = c.saturating_sub(1);
         }
         self.count(dir, true);
+        let c = self.cell(dir, direct);
+        *c = c.saturating_add(1);
+        self.since.insert(link_id, (at, direct));
     }
 
+    #[cfg(test)]
     fn remove(&mut self, link_id: &LinkId) -> Option<LinkDirection> {
+        self.remove_timed(link_id).map(|(dir, _)| dir)
+    }
+
+    /// Remove `link_id`'s record: its direction and how long it was up.
+    fn remove_timed(&mut self, link_id: &LinkId) -> Option<(LinkDirection, std::time::Duration)> {
         let dir = self.by_link.remove(link_id)?;
         self.count(dir, false);
-        Some(dir)
+        let (at, direct) = self
+            .since
+            .remove(link_id)
+            .unwrap_or((std::time::Instant::now(), false));
+        let c = self.cell(dir, direct);
+        *c = c.saturating_sub(1);
+        Some((dir, at.elapsed()))
     }
 
     fn inbound_ids(&self) -> Vec<LinkId> {
@@ -12763,6 +13002,8 @@ fn publish_link_directions(
 ) {
     if let Some(m) = metrics {
         m.set_link_directions(source, dirs.inbound, dirs.outbound);
+        // CIRISEdge#1025 — the same links, by medium.
+        m.link_census.set_links_active(source, dirs.active);
     }
 }
 
@@ -12779,9 +13020,18 @@ fn forget_link_direction(
     let mut dirs = dirs
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = dirs.remove(link_id);
-    if let (Some(d), Some(m)) = (dir, metrics) {
+    let removed = dirs.remove_timed(link_id);
+    let dir = removed.map(|(d, _)| d);
+    if let (Some((d, lifetime)), Some(m)) = (removed, metrics) {
         m.add_link_closed(d == LinkDirection::Inbound, cause, 1);
+        // CIRISEdge#1025 — its lifetime, under the class it came up under
+        // (read before the class is forgotten below).
+        m.note_link_lifetime(
+            link_id.into_bytes(),
+            d == LinkDirection::Inbound,
+            cause,
+            lifetime,
+        );
     }
     // Seat load 2026-11-13 (S0) — link down, by the class it came up under.
     if let Some(m) = metrics {
@@ -12949,6 +13199,9 @@ struct LinkClaim {
     last_used: Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
     link_id: LinkId,
     armed: bool,
+    /// CIRISEdge#947 — the lane came out of the pool (an earlier send's
+    /// link), not from this send's own dial.
+    reused: bool,
 }
 
 impl LinkClaim {
@@ -13199,6 +13452,7 @@ impl DialCtx {
             last_used: Arc::clone(&self.pool_last_used),
             link_id,
             armed: true,
+            reused: false,
         }
     }
 
@@ -13294,6 +13548,9 @@ impl DialCtx {
         // identity-plane send on either side may ride it. Tagged here, before
         // establishment, so no selector can observe an untagged link.
         self.link_plane.lock().await.insert(link_id, plane);
+        if plane == LinkPlane::Av {
+            self.seals.mark_av(link_id.into_bytes());
+        }
         before_establish(link_id);
 
         // Explicit-hash destinations are never pathed (see the routability note
@@ -13468,6 +13725,9 @@ impl DialCtx {
         // is not published to any pool or selector until this dial returns —
         // so no sealed frame can precede the handshake.
         self.seals.install_initiator(link, transit);
+        // CIRISEdge#1025 — keyed to `peer`'s published transit pair: the
+        // link's bytes are tallied toward it.
+        self.seals.bind_peer(link, peer);
         let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
         for frame in &frames {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -13477,7 +13737,10 @@ impl DialCtx {
             )
             .await;
             match sent {
-                Ok(Ok(())) => self.seals.tap_frame(link, frame),
+                Ok(Ok(())) => {
+                    self.seals.tap_frame(link, frame);
+                    self.seals.count_unsealed_out(link, frame);
+                }
                 Ok(Err(e)) => {
                     let err = refused(AvHandshakeError::Send(e.to_string()));
                     self.close_refused(link_id).await;
@@ -14571,6 +14834,7 @@ impl DialCtx {
             .map_err(|_| RouteFetchError::Send("request send timed out".to_owned()))?
             .map_err(|e| RouteFetchError::Send(e.to_string()))?;
             self.seals.tap_frame(link, &request);
+            self.seals.count_unsealed_out(link, &request);
             if let Some(m) = self.metrics.as_ref() {
                 m.inc_link_seal(crate::observability::LINK_SEAL_ROUTE_REQUEST_SENT);
             }
@@ -14712,7 +14976,11 @@ impl DialCtx {
             in_flight.insert(id);
             stamp_pool_use(&self.pool_last_used, id);
         }
-        picked.map(|id| self.link_claim(id))
+        picked.map(|id| {
+            let mut claim = self.link_claim(id);
+            claim.reused = true;
+            claim
+        })
     }
 }
 
@@ -15822,6 +16090,7 @@ async fn attribute_and_deliver(
                     .lock()
                     .await
                     .insert(link_id, key_id.clone());
+                ctx.seals.bind_peer(link_id.into_bytes(), &key_id);
                 tracing::info!(
                     link = ?link_id,
                     peer = %key_id,
@@ -16506,6 +16775,7 @@ async fn link_attribution_now(ctx: &EventCtx<'_>, link_id: LinkId) -> Option<Str
         .lock()
         .await
         .insert(link_id, key_id.clone());
+    ctx.seals.bind_peer(link_id.into_bytes(), &key_id);
     Some(key_id)
 }
 
@@ -16671,6 +16941,7 @@ async fn reattribute_to_corroborated_claim(
     if key_id != claimed {
         return false;
     }
+    ctx.seals.bind_peer(link_id.into_bytes(), &key_id);
     ctx.link_to_peer_key_id.lock().await.insert(link_id, key_id);
     true
 }
@@ -17034,6 +17305,7 @@ fn spawn_route_answer_send(
             let failure = match sent {
                 Ok(Ok(())) => {
                     seals.tap_frame(link, frame);
+                    seals.count_unsealed_out(link, frame);
                     continue;
                 }
                 Ok(Err(e)) => e.to_string(),
@@ -17415,6 +17687,9 @@ async fn seal_inbound(
     } else {
         ctx.seals.open(link, lane, data)
     };
+    // CIRISEdge#1025 — every frame leviculum delivered on a link, counted
+    // once, here, by what its seal made of it.
+    ctx.seals.count_inbound(link, lane, data, &outcome);
     close_evicted(ctx);
     match outcome {
         Inbound::Open(plain) => shaped_inbound(ctx, link_id, lane, plain).await,
@@ -18458,6 +18733,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 LinkPlane::Av => ResourceStrategy::AcceptNone,
                 LinkPlane::Identity | LinkPlane::Scoped => ResourceStrategy::AcceptAll,
             };
+            // CIRISEdge#1025 — an A/V link's frames are counted `av`.
+            if plane == LinkPlane::Av {
+                ctx.seals.mark_av(link_id.into_bytes());
+            }
             let _ = ctx.node.set_resource_strategy(&link_id, strategy);
             // CIRISEdge#32 (v0.14.0) — record establish time for the
             // Links FFI surface's `age_seconds` derivation.
@@ -18624,6 +18903,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     .lock()
                     .await
                     .insert(link_id, key_id.clone());
+                ctx.seals.bind_peer(link_id.into_bytes(), &key_id);
                 // CC 5.3.3.5 E1 — the link's attribution landed after its
                 // handshake did (the identify rides the control plane, the
                 // handshake the data plane): hold the claim to it now, and
@@ -19325,6 +19605,16 @@ async fn direct_link_established(
     interface: usize,
     proposed: bool,
 ) {
+    // CIRISEdge#1025 — its frames ride the punched interface from here.
+    ctx.seals.set_direct(link_id.into_bytes(), true);
+    {
+        let mut dirs = ctx
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dirs.set_direct(&link_id, true);
+        publish_link_directions(ctx.metrics, ctx.metrics_source, &dirs);
+    }
     let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
     let after = link_channel_message_limit(ctx.node, &link_id);
     let (peer, before, active) = {
@@ -19524,6 +19814,16 @@ async fn direct_link_failed(
 /// CIRISEdge#805 item 8 — a punched interface went down; leviculum put its link
 /// back on the interface it left (or closed it, with none left).
 async fn direct_link_lost(ctx: &EventCtx<'_>, link_id: LinkId, interface: usize) {
+    // CIRISEdge#1025 — its frames are on the relayed path's medium again.
+    ctx.seals.set_direct(link_id.into_bytes(), false);
+    {
+        let mut dirs = ctx
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dirs.set_direct(&link_id, false);
+        publish_link_directions(ctx.metrics, ctx.metrics_source, &dirs);
+    }
     let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
     let (peer, active) = {
         let mut tracker = ctx.direct_paths.tracker();
@@ -20948,6 +21248,7 @@ async fn receive_announce(ctx: &EventCtx<'_>, view: AnnounceView, link: Option<L
     if let (Stage1Outcome::InstalledNew, Some(key_id)) = (outcome, key_id.as_deref()) {
         let bound = bind_identified_links_to(
             ctx.node,
+            ctx.seals,
             ctx.established_links,
             ctx.link_to_peer_key_id,
             view.transport_identity_hash(),
@@ -21230,6 +21531,7 @@ async fn stage1_bind_announce(
 /// "links beat the announce" ordering this issue exists to make harmless.
 async fn bind_identified_links_to(
     node: &ReticulumNode,
+    seals: &crate::transport::link_seal::LinkSeals,
     established: &Mutex<HashSet<LinkId>>,
     link_to_peer_key_id: &Mutex<HashMap<LinkId, String>>,
     transport_identity_hash: [u8; 16],
@@ -21246,6 +21548,7 @@ async fn bind_identified_links_to(
                 .lock()
                 .await
                 .insert(link_id, key_id.to_owned());
+            seals.bind_peer(link_id.into_bytes(), key_id);
             bound += 1;
         }
     }
@@ -22802,6 +23105,31 @@ fn apply_tcp_client_transit(
     }
 }
 
+/// CIRISEdge#1025 — the one medium every configured interface shares (by its
+/// registered kind), or `other` when they differ. A link the seal sees is
+/// counted under it unless it rides a punched direct interface.
+fn base_wire_transport<'a>(
+    kinds: impl IntoIterator<Item = &'a str>,
+) -> crate::wire_bytes::WireTransport {
+    use crate::wire_bytes::WireTransport as T;
+    let mut base = None;
+    for kind in kinds {
+        let t = match kind {
+            "TCPServerInterface" | "TCPClientInterface" => T::Tcp,
+            "UDPInterface" => T::Udp,
+            "AutoInterface" => T::Auto,
+            "LocalInterface" => T::Local,
+            _ => T::Other,
+        };
+        match base {
+            None => base = Some(t),
+            Some(b) if b == t => {}
+            Some(_) => return T::Other,
+        }
+    }
+    base.unwrap_or(T::Tcp)
+}
+
 #[allow(unused_variables, unused_mut)]
 // every variant arm is feature-gated
 // v0.12.0 (CIRISEdge#24) — the match arms cover seven feature-gated
@@ -24118,6 +24446,7 @@ mod tests {
                     status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![],
+                    rf: None,
                 },
             ));
             assert_eq!(bootstrap_key_ids_named(&summary), None);
@@ -27030,6 +27359,7 @@ mod scope_native_addressing_tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: Vec::new(),
+                rf: None,
             }));
         let sent = Transport::send(&transport, "nobody", &frame).await;
         assert!(

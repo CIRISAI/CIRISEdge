@@ -1312,11 +1312,46 @@ impl ReplicationCoordinator {
                 Self::reply_frame(msg, bound_round.load(Ordering::Acquire))
             }
         };
+        self.book_wire_built(msg, bytes.len());
         self.transport
             .send(&self.peer_key_id, &bytes)
             .await
-            .map(|_| self.book_served(msg))
+            .map(|_| {
+                self.book_served(msg);
+                self.book_wire(msg, bytes.len(), true);
+            })
             .map_err(CoordinatorError::from)
+    }
+
+    /// Range fingerprints, step A (design §8, §11.2) — a Summary as BUILT,
+    /// before `transport.send`: `summary_refs_built` / `summary_bytes_built`.
+    /// The sent twins are booked only on a send that returned, so the two
+    /// differ exactly by what was built and never handed down.
+    fn book_wire_built(&self, msg: &ReplicationMessage, len: usize) {
+        let (Some(metrics), ReplicationMessage::Summary(summary)) = (&self.metrics, msg) else {
+            return;
+        };
+        let n = |x: usize| u64::try_from(x).unwrap_or(u64::MAX);
+        metrics.add_replication_io(summary.kind, "summary_refs_built", n(summary.refs.len()));
+        metrics.add_replication_io(summary.kind, "summary_bytes_built", n(len));
+    }
+
+    /// Range fingerprints, step A (design §8) — the frame bytes of a Summary,
+    /// a Diff or a Deliver, as they crossed (`out`) or arrived.
+    pub(crate) fn book_wire(&self, msg: &ReplicationMessage, len: usize, out: bool) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let label = match (msg, out) {
+            (ReplicationMessage::Summary(_), true) => "summary_bytes_out",
+            (ReplicationMessage::Summary(_), false) => "summary_bytes_in",
+            (ReplicationMessage::Diff(_), true) => "diff_bytes_out",
+            (ReplicationMessage::Diff(_), false) => "diff_bytes_in",
+            (ReplicationMessage::Deliver(_), true) => "deliver_wire_bytes_out",
+            (ReplicationMessage::Deliver(_), false) => "deliver_wire_bytes_in",
+            _ => return,
+        };
+        metrics.add_replication_io(msg.kind(), label, u64::try_from(len).unwrap_or(u64::MAX));
     }
 
     /// CIRISEdge#433 — `replication_envelopes_served_total`, at the one moment
@@ -1500,10 +1535,15 @@ impl ReplicationCoordinator {
         msg: &ReplicationMessage,
         round: u64,
     ) -> Result<(), CoordinatorError> {
+        let bytes = Self::reply_frame(msg, round);
+        self.book_wire_built(msg, bytes.len());
         self.transport
-            .send(&self.peer_key_id, &Self::reply_frame(msg, round))
+            .send(&self.peer_key_id, &bytes)
             .await
-            .map(|_| self.book_served(msg))
+            .map(|_| {
+                self.book_served(msg);
+                self.book_wire(msg, bytes.len(), true);
+            })
             .map_err(CoordinatorError::from)
     }
 
@@ -1750,10 +1790,14 @@ impl ReplicationCoordinator {
         round: u64,
     ) -> Result<(), CoordinatorError> {
         let bytes = super::wire_frame::wrap_v3(msg, RoundSide::Initiator, round);
+        self.book_wire_built(msg, bytes.len());
         self.transport
             .send(&self.peer_key_id, &bytes)
             .await
-            .map(|_| self.book_served(msg))
+            .map(|_| {
+                self.book_served(msg);
+                self.book_wire(msg, bytes.len(), true);
+            })
             .map_err(CoordinatorError::from)
     }
 
@@ -2462,6 +2506,7 @@ mod tests {
             status,
             kind: EnvelopeKind::Attestation,
             refs,
+            rf: None,
         })
     }
 
@@ -2996,6 +3041,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         let framed = super::super::wire_frame::wrap(&msg);
         let parsed = ReplicationCoordinator::try_parse_inbound_bytes(&framed)
@@ -3023,6 +3069,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         // Bare form — refused.
         let bare = msg.to_bytes();
@@ -3086,6 +3133,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         let r = coord.send_message(&m).await;
         assert!(matches!(
@@ -3165,6 +3213,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         coord
             .deliver_inbound_framed(summary.clone(), None)
@@ -3191,6 +3240,82 @@ mod tests {
         assert_eq!(io("first_sync_rounds"), 2, "both rounds counted up to it");
         coord.note_round_complete(&idle);
         assert_eq!(io("first_sync_complete"), 1, "once per process");
+    }
+
+    /// Range fingerprints, step A (design §8, §11.2, witness 28) — **a
+    /// Summary is booked when BUILT, and its frame bytes only when SENT.** A
+    /// failed send books `summary_refs_built` / `summary_bytes_built` and no
+    /// `summary_bytes_out`; a sent one books both, with the frame's length;
+    /// a Diff and a Deliver book their frame bytes too.
+    ///
+    /// Mutation that turns it red: book the built pair after the send, or
+    /// drop `book_wire` from the send's `Ok` arm.
+    #[tokio::test]
+    async fn summaries_are_booked_when_built_and_frames_when_sent_rf_28() {
+        let metrics = crate::observability::EdgeMetrics::default();
+        let (alice_t, _bob_t) = alice_bob_transports();
+        let alice_t = Arc::new(alice_t);
+        let coord = |peer: &str| {
+            ReplicationCoordinator::new(
+                Arc::clone(&alice_t) as Arc<dyn Transport>,
+                peer,
+                EnvelopeKind::Key,
+                SessionRole::Initiator,
+                Arc::new(StaticProvider {
+                    state: LocalState::new(),
+                    envelopes: HashMap::new(),
+                }),
+                RecordingApplier::with(HashMap::new(), std::collections::HashSet::new()),
+            )
+            .with_metrics(Some(metrics.clone()))
+        };
+        let io = |label: &str| {
+            metrics
+                .replication_io()
+                .get(&format!("key:{label}"))
+                .copied()
+                .unwrap_or(0)
+        };
+        let summary = ReplicationMessage::Summary(SummaryMessage {
+            status: None,
+            kind: EnvelopeKind::Key,
+            refs: vec![EnvelopeRef {
+                envelope_hash: h(1),
+                seq: 1,
+            }],
+            rf: None,
+        });
+        assert!(coord("nobody_home").send_message(&summary).await.is_err());
+        assert_eq!(io("summary_refs_built"), 1, "built, though never sent");
+        assert!(io("summary_bytes_built") > 0);
+        assert_eq!(io("summary_bytes_out"), 0, "a failed send crossed nothing");
+        let c = coord("bob");
+        c.send_message(&summary).await.expect("sent");
+        assert_eq!(io("summary_refs_built"), 2);
+        assert_eq!(
+            io("summary_bytes_out"),
+            io("summary_bytes_built") / 2,
+            "the sent frame is the built frame"
+        );
+        let diff = ReplicationMessage::Diff(DiffMessage {
+            kind: EnvelopeKind::Key,
+            want: vec![h(2)],
+            withheld: Vec::new(),
+            rf: None,
+        });
+        c.send_message(&diff).await.expect("sent");
+        assert!(io("diff_bytes_out") > 0);
+        let deliver = ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::Key,
+            envelopes: vec![b"one".to_vec()],
+        });
+        c.send_message(&deliver).await.expect("sent");
+        assert!(
+            io("deliver_wire_bytes_out") > io("push_bytes_out"),
+            "the frame is larger than its raw body"
+        );
+        c.book_wire(&deliver, 99, false);
+        assert_eq!(io("deliver_wire_bytes_in"), 99);
     }
 
     /// Seat load 2026-11-13 (S0) — **`replication_io` counts what a plane
@@ -3263,6 +3388,7 @@ mod tests {
                             seq: 2,
                         },
                     ],
+                    rf: None,
                 }),
                 None,
             )
@@ -3336,6 +3462,7 @@ mod tests {
                 envelope_hash: h(99),
                 seq: 1,
             }],
+            rf: None,
         });
         let step = coord.drive_round_step(Some(remote_summary)).await.unwrap();
         match step {
@@ -3446,6 +3573,7 @@ mod tests {
                     seq: 4,
                 },
             ],
+            rf: None,
         });
         let step2 = coord.drive_round_step(Some(bob_summary)).await.unwrap();
         match step2 {
@@ -3464,6 +3592,7 @@ mod tests {
             kind: EnvelopeKind::Key,
             want: vec![h(1)],
             withheld: Vec::new(),
+            rf: None,
         });
         let _ = coord.drive_round_step(Some(bob_diff)).await.unwrap();
 
@@ -3544,6 +3673,7 @@ mod tests {
             kind: EnvelopeKind::Revocation, // ← inbound for Revocation
             want: vec![],
             withheld: Vec::new(),
+            rf: None,
         });
         let step = coord.drive_round_step(Some(wrong_kind)).await.unwrap();
         assert!(matches!(step, DriveStep::Refused));
@@ -3757,6 +3887,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             });
             assert_eq!(bob.last_inbound_link_hex(), "-");
             bob.deliver_inbound_framed_on(open.clone(), None, Some([0xab; 16]))
@@ -3787,6 +3918,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             });
 
             // v3 round-open → v3 replies echoing the round.
@@ -3866,6 +3998,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             });
             // Round 1 opens, bob replies; the initiator then dies (no Diff, no Deliver).
             bob.deliver_inbound_framed(summary.clone(), open(1))
@@ -3915,6 +4048,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             });
             alice.deliver_reply(msg.clone(), round).unwrap();
             assert_eq!(alice.inbound_depth(), 1);
@@ -3955,6 +4089,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             });
             assert!(matches!(
                 alice.deliver_reply(msg, first),

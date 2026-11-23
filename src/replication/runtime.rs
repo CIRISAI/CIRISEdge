@@ -268,6 +268,7 @@ fn resolve_sweep_permits(mut config: BridgeConfig) -> BridgeConfig {
     config = resolve_sweep_page_rows(config);
     config = resolve_holdings_index(config);
     config = resolve_key_plane_levers(config);
+    config = resolve_range_fingerprints(config);
     let Ok(raw) = std::env::var(BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV) else {
         return config;
     };
@@ -426,6 +427,36 @@ fn resolve_key_plane_levers(mut config: BridgeConfig) -> BridgeConfig {
                 "key-plane read budget is not a positive whole number: IGNORED, \
                  keeping the configured value (tracked: CIRISEdge#971)"
             ),
+        }
+    }
+    config
+}
+
+/// Range fingerprints, step A — the receiver half's lever
+/// ([`BridgeConfig::RANGE_FINGERPRINTS_ANSWER_ENV`]): off by default, the
+/// environment turns it on or off. Same contract as
+/// [`resolve_holdings_index`].
+fn resolve_range_fingerprints(mut config: BridgeConfig) -> BridgeConfig {
+    if let Ok(raw) = std::env::var(BridgeConfig::RANGE_FINGERPRINTS_ANSWER_ENV) {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "on" | "true" => {
+                tracing::info!(
+                    env = BridgeConfig::RANGE_FINGERPRINTS_ANSWER_ENV,
+                    "range-fingerprint answers turned ON from the environment: this node \
+                     answers a peer's fingerprinted Summary and says so in its marker"
+                );
+                config.range_fingerprints_answer = true;
+            }
+            "0" | "off" | "false" => {
+                config.range_fingerprints_answer = false;
+            }
+            other => {
+                tracing::warn!(
+                    env = BridgeConfig::RANGE_FINGERPRINTS_ANSWER_ENV,
+                    value = other,
+                    "unrecognised value ignored: range-fingerprint answers stay as configured"
+                );
+            }
         }
     }
     config
@@ -3547,6 +3578,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             }));
         let outcome = rt
             .registry()

@@ -366,9 +366,10 @@ impl DirectLinksConfig {
             }
             Proposing::On => {
                 self.facilitator = Self::bundle_facilitator();
-                if let Some(f) = &self.facilitator {
+                // No address in a log line: the source is the whole story.
+                if self.facilitator.is_some() {
                     tracing::info!(
-                        facilitator = %f,
+                        source = FacilitatorSource::Bundle.as_str(),
                         "direct links: facilitator resolved from the genesis bundle's first \
                          serve node (v44: proposing on by default)"
                     );
@@ -399,9 +400,10 @@ impl DirectLinksConfig {
     ) -> Self {
         let (out, source) =
             self.resolve_facilitator_from(baked_dials_allowed, Self::bundle_facilitator, bootstrap);
-        if let Some(f) = &out.facilitator {
+        // No address in a log line: the source class is what an operator acts
+        // on, and the address itself is the host's own config.
+        if out.facilitator.is_some() {
             tracing::info!(
-                facilitator = %f,
                 source = source.as_str(),
                 "direct links: facilitator resolved"
             );
@@ -1224,6 +1226,32 @@ impl DirectPaths {
 
 #[cfg(test)]
 mod tests {
+    /// No log line in this module carries an address: the facilitator is
+    /// logged by its source class, never by the `host:port` it resolves to.
+    /// A source scan over the module's own tracing calls (the field forms a
+    /// formatted address would take).
+    #[test]
+    fn no_log_line_here_carries_an_address() {
+        let src = include_str!("direct_path.rs");
+        let forbidden = [
+            concat!("facilitator", " = %"),
+            concat!("facilitator", " = ?"),
+            concat!("addr", " = %"),
+            concat!("addr", " = ?"),
+            concat!("bootstrap", " = ?"),
+        ];
+        for (i, line) in src.lines().enumerate() {
+            for f in forbidden {
+                assert!(
+                    !line.contains(f),
+                    "direct_path.rs:{}: `{}`",
+                    i + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+
     use super::*;
 
     fn link(b: u8) -> LinkId {

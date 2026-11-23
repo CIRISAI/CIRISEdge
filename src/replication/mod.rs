@@ -174,6 +174,7 @@ mod park_fresh_858_tests;
 #[cfg(all(test, feature = "_reticulum-module"))]
 mod persisted_standing_timing_tests;
 pub mod protocol;
+pub mod range_fp;
 pub mod refusal_backoff;
 pub mod registry;
 mod reply_lane;
@@ -183,6 +184,8 @@ mod responder_drain_943_tests;
 /// CIRISEdge#552/#553 — how much of a plane this node keeps, and the
 /// revocation carve-out a configured retention cannot reach.
 pub mod retention;
+#[cfg(test)]
+mod rf_step_a_tests;
 pub mod runtime;
 pub mod scheduler;
 pub mod serve_policy;
@@ -338,13 +341,14 @@ impl InboundRouter {
         };
         match self
             .registry
-            .route_inbound_bytes_on(
+            .route_inbound_bytes_confidential(
                 &peer,
                 &frame.envelope_bytes,
                 frame
                     .reply_path
                     .filter(|p| p.transport() == crate::transport::TransportId::RETICULUM_RS)
                     .map(|p| p.token()),
+                range_fp::inbound_is_confidential(frame.transport),
             )
             .await
         {

@@ -234,6 +234,7 @@ async fn idle_rounds_at(n: usize) -> Vec<(EnvelopeKind, usize, u64, Duration)> {
                 status: None,
                 kind,
                 refs: Vec::new(),
+                rf: None,
             });
             let bytes = wire_frame::wrap_v3(&summary, RoundSide::Initiator, round_id);
             let t0 = std::time::Instant::now();
@@ -351,6 +352,7 @@ async fn key_summary_at(n: usize) -> (usize, usize, usize, usize) {
             status: None,
             kind: EnvelopeKind::Key,
             refs: refs.clone(),
+            rf: None,
         }),
         RoundSide::Responder,
         1,

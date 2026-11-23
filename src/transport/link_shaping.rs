@@ -4940,6 +4940,66 @@ mod tests {
         )
     }
 
+    /// Range fingerprints, step A (design §12.3, witness 13): a Deliver whose
+    /// bodies ride the compact `eb` member is classed by those bodies, as its
+    /// JSON twin is. The classifier decodes through
+    /// `ReplicationMessage::from_bytes`, which folds `eb` into `envelopes`.
+    #[test]
+    fn a_compact_deliver_is_classed_by_its_bodies_as_its_json_twin_13() {
+        use crate::replication::protocol::EnvelopeKind as K;
+        use crate::replication::range_fp::encode_compact_body;
+        use crate::replication::wire_frame::{wrap_v3, RoundSide, PREAMBLE_LEN_V3};
+        let consent = attestation_row(
+            "scores",
+            &serde_json::json!({
+                "dimension": ciris_persist::federation::consent_peer_set::DIMENSION,
+            }),
+        );
+        let chat = attestation_row(
+            "scores",
+            &serde_json::json!({"dimension": "chat:message:v1"}),
+        );
+        let compact = |rows: &[Vec<u8>]| {
+            let mut frame = wrap_v3(
+                &deliver(K::Attestation, Vec::new()),
+                RoundSide::Responder,
+                9,
+            );
+            let body = String::from_utf8(frame.split_off(PREAMBLE_LEN_V3)).expect("json");
+            let eb: Vec<String> = rows.iter().map(|r| encode_compact_body(r)).collect();
+            let body = body.replacen(
+                "\"envelopes\":[]",
+                &format!(
+                    "\"envelopes\":[],\"eb\":{}",
+                    serde_json::to_string(&eb).expect("eb")
+                ),
+                1,
+            );
+            assert!(body.contains("\"eb\":"), "the splice landed: {body}");
+            frame.extend_from_slice(body.as_bytes());
+            frame
+        };
+        assert_eq!(
+            Lane::of(&compact(std::slice::from_ref(&consent))),
+            Lane::Contact
+        );
+        assert_eq!(
+            Lane::of(&wrap_v3(
+                &deliver(K::Attestation, vec![consent.clone()]),
+                RoundSide::Responder,
+                9
+            )),
+            Lane::Contact,
+            "the JSON twin"
+        );
+        assert_eq!(Lane::of(&compact(std::slice::from_ref(&chat))), Lane::Sync);
+        assert_eq!(
+            Lane::of(&compact(&[consent, chat])),
+            Lane::Sync,
+            "a mixed page"
+        );
+    }
+
     /// CIRISEdge#962 — the lane is read from the frame the field produces:
     /// the real `wire_frame` wrappers (v1 and the v3 round frame) and the
     /// edge's envelope order. Bootstrap planes in any verb, a Deliver of
@@ -5062,6 +5122,7 @@ mod tests {
                     kind: K::Attestation,
                     refs: Vec::new(),
                     status: None,
+                    rf: None,
                 }),
             ),
         ] {

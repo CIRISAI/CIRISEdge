@@ -92,6 +92,140 @@ referral lines, `direct link` lines, `room` in `CALL JOINED` and `CALL LEFT`. Th
 
 ## The questions
 
+### Where do this node's bytes go?
+
+`transport_wire_bytes_in_total` and `transport_wire_bytes_out_total`
+(CIRISEdge#1025) say, for every byte an interface carried, which medium and
+which plane it was for. Keys are `transport:plane`, and both label sets are
+closed:
+
+- **transport** (11): `tcp`, `udp`, `udp-direct` (a punched direct link),
+  `i2p`, `lora`, `serial`, `ble`, `auto`, `local`, `http`, `other`.
+- **plane** (11): `application`, `replication`, `resource`, `av`, `announce`,
+  `path`, `link_control`, `relay`, `direct_link`, `shaped`, `other`.
+
+That is at most 121 keys per direction, plus each family's total. A transport
+that carried nothing is absent. A transport that carried anything lists all 11
+planes, so a 0 there is a plane that moved nothing. No address, port, link,
+interface name or peer is ever a key.
+
+How a key gets its bytes:
+
+- **Interface truth.** leviculum's I/O tasks count every byte read from or
+  written to a socket, HDLC framing and IFAC included. The node tick (1 s), and
+  every snapshot, folds those per-interface totals in by transport. Each
+  interface's last reading is kept, so a TCP client that disconnects keeps its
+  bytes up to the last fold. The bytes it moved after that fold and before it
+  went are lost, at most one second of one connection, until leviculum exposes
+  retired-interface totals (CIRISAI/leviculum#111).
+- **Edge's attribution.** Every frame edge seals or opens on a Reticulum link
+  (CC 5.3.3.5 E1) is counted once, at the seal, with one atomic add, by its
+  lane and its tag:
+
+| Plane | Rule |
+|---|---|
+| `application` | an envelope or any untagged Channel frame; link requests and responses |
+| `replication` | `CRPL`, the `CFRG` fragments of a `CRPL` frame, and a Resource carrying one |
+| `resource` | a Resource whose payload has no tag of its own (an envelope, a file) |
+| `av` | the datagram lane, any frame on an A/V link, and `CHLO` / `CSKB` / `CALM` |
+| `announce` | `CANN` and `CBND` link frames |
+| `link_control` | `CTKX` (transit KEX), `CTKR` / `CTKA` (pre-seal route fetch), `SHAP` / `SHRF` / `SHCP`, `CNAK` |
+| `relay` | `CONP` onion layers |
+| `shaped` | `SHPF`: every frame on a shaped link, real and cover alike |
+| `path`, `direct_link` | nothing yet: they wait for leviculum's per-packet hook (CIRISAI/leviculum#111) |
+| `other` | interface truth minus every plane above |
+
+  HTTP's `application` is the envelope bytes `Edge::send` and
+  `dispatch_inbound` count. A link on a punched interface is `udp-direct`. Any
+  other link is counted under the node's one configured interface kind, or
+  under `other` when the node has several kinds.
+
+**Reading `other`.** A transport's planes sum to what its interfaces carried, so
+`other` is everything leviculum moved that edge never handed it, and everything
+it wrapped around edge's frames: relayed packets, RNS announces and path
+requests, link requests, proofs and keepalives, Resource advertisements, parts
+and retransmits, packet headers, link tokens and HDLC framing. About a fifth of
+a small frame is that wrapping (CC 5.4.3 rc17 puts it at 107 B of header and
+token plus an 83 B proof per packet). An `other` far above that is the
+finding. Until leviculum exposes a per-packet hook (CIRISAI/leviculum#111),
+the planes it would split
+out (`path`, `link_control` beyond edge's own frames, `relay` beyond onion,
+`direct_link`) stay inside `other`.
+
+**`shaped` is not split on purpose.** Real frames against cover is the activity
+shaping hides (see [Shaping's numbers](#shapings-numbers)). A shaped link sends
+at its class rate whatever it carries: 33,000 B/s each way on a seat link,
+7,000 B/s at `server`, and about 1.15 times that on the wire. So `shaped` grows
+with the number of shaped links, not with load.
+
+`transport_bytes_in_total` and `transport_bytes_out_total` keep their old
+meaning: application envelope bytes by edge transport id (`http`,
+`reticulum-rs`). They were never the wire, so a seat whose wire is all
+replication and shaping can read `{}` there.
+
+### How many links and peers does this node carry? (CIRISEdge#1025)
+
+Four families size a seat. None names a peer, link, address or port, and every
+one is bounded.
+
+- **`links_active`**: the established Reticulum links now, keyed
+  `transport:direction`. The transport tokens are the wire-bytes ones, less
+  `http` (10), and the direction is `inbound` (a peer opened it) or `outbound`
+  (this node dialled it), so 20 keys, every one present from the first
+  snapshot. A link counts under the node's one configured interface kind (or
+  `other` when it has several) until it moves onto a punched interface, then
+  under `udp-direct`, and back if it falls back. The same record backs
+  `inbound_links` / `outbound_links`, so the 20 keys sum to them. Memory: 20
+  integers per transport instance.
+- **`distinct_peers_1h`** and **`distinct_peers_24h`**: how many distinct
+  peers had an authenticated link to this node in the last hour and the last
+  day. A peer counts once however many links it holds, and it is counted again
+  in each five-minute bucket its link stays up. The estimator is a HyperLogLog
+  of 2^12 registers per bucket: 12 five-minute buckets for the hour (so the
+  window is the last 55 to 60 minutes) and 24 hourly buckets for the day,
+  merged by register max on read. Standard error is 1.04/sqrt(4096), about
+  1.6 % (±4.9 % at 3σ); below about 10,000 peers the linear-counting branch is
+  within a peer or two of exact. The input is SHA-256 of a 32-byte salt drawn
+  from the OS at start and the peer's key id; the key id is never kept, and
+  neither the salt nor any register is exported. Memory: 36 × 4 KiB = 144 KiB.
+  A peer is authenticated when edge attributes the link: the dialled node, by
+  the transit pair the link was keyed to, or the identified dialler, by its
+  proven Reticulum identity and binding.
+- **`top_peers_by_bytes`**: the 10 peers that moved the most wire bytes with
+  this node since it started, heaviest first, each as `peer` (16 hex digits of
+  the same salted hash), `bytes_in`, `bytes_out` and `error_bytes`. A
+  Space-Saving sketch of 64 counters (about 2 KiB) feeds it from the E1 seal's
+  attribution: every frame sealed or opened on an attributed link adds to that
+  link's tally (one atomic add), and the node tick drains the tallies into the
+  sketch. Any peer above 1/64 of all peer-attributed bytes is in the sketch,
+  and an entry is over-ranked by at most its `error_bytes`; `bytes_in` and
+  `bytes_out` are lower bounds. The hash means nothing outside this process:
+  a restart draws a new salt and two nodes never share one, so an entry can be
+  followed between scrapes of one process and nowhere else. This is the
+  per-peer sketch WORKLOAD_ATTRIBUTION A8 asks for, so it is not a label: the
+  bundle (and the PyO3 dict) carry the list, and the flat (UniFFI / OTLP) form
+  carries only the entry count and `top_peers_by_bytes.<rank>.bytes_in` /
+  `.bytes_out` / `.error_bytes` for ranks 0 to 9, without the hash. Bytes
+  leviculum moved that edge never handed it (`other` in the wire family) are
+  not in it.
+- **`link_duration_seconds`**: each established link's life, from its
+  `LinkEstablished` to its close, keyed `class:cause`. `cause` is the close
+  cause the direction counters use (`idle_expired`, `pool_idle_expired`,
+  `pool_full`, `local_teardown`, `normal`, `peer_closed`, `timeout`, `stale`,
+  `invalid_proof`, `channel_exhausted`, `blackholed`, `other`, `vanished`);
+  `class` is the `peer_activity` class an inbound link came up under (a peer
+  identified to this node), `dialled` for a link this node opened
+  (`peer_activity` classes only identified inbound links), or `unidentified`
+  for an inbound link no peer identified on. Buckets are 1 s, 5 s, 30 s,
+  2 min, 10 min, 1 h, 6 h and `+Inf`. A label set nothing closed under is
+  absent, so at most 8 × 13 = 104 label sets (about 8 KiB). A link
+  recovered after a lost `LinkEstablished` (`recovered_links_total`) is timed
+  from its recovery.
+
+`first_contact:peer_closed` filling the 1 s and 5 s buckets while
+`distinct_peers_24h` stays small is the churn #1025 found: few identities,
+many short links.
+
 ### Why didn't this peer connect?
 
 Read this on the node that was dialled, then on the dialler.
@@ -272,6 +406,34 @@ took the frame. Per-direction detail (push, deliver, summary, diff, pull) is in
 `replication_io`. Before 45.1.3 a peer added after start (every initiator on a
 server-composed node) counted into neither.
 
+Range fingerprints, step A (`docs/design/RANGE_FINGERPRINTS.md` §8) adds to
+`replication_io`:
+
+- the frame bytes of what crossed, preamble and JSON included:
+  `summary_bytes_{out,in}`, `diff_bytes_{out,in}` and
+  `deliver_wire_bytes_{out,in}`. These sit beside `deliver_bytes_*`, which
+  stay the raw envelope bytes;
+- `summary_refs_built` and `summary_bytes_built`, booked when a Summary is
+  built, before the send. With the sent twins, these show a listing that was
+  built but never handed down (§11.2);
+- the receiver half's counters: `rf_nodes_in` (fingerprint nodes received,
+  split children included), the answers `rf_match`, `rf_split` and `rf_list`,
+  `rf_not_understood` (an `rf` member this build could not read, answered
+  with the plain marker), and `rf_unable` for every `u` answer, with its
+  reason in one of `rf_receiver_unbooted`, `rf_salt_refused`,
+  `rf_answers_cap`, `rf_mirror_capped`, `rf_rebuilds_refused` (`busy`) and
+  `rf_transport_refused`. `rf_salt_changes_received` counts salts accepted,
+  `rf_peersums_built` the full salted passes over a mirror, `rf_seeded` the
+  ids the restart seed added, `rf_match_feed_ids` the known hashes a matched
+  range re-heard from their holder, and `rf_settled_from_peer` the wanted
+  ids that entered a mirror on admission.
+
+`holdings_index_gauge` gains `rf_mirror_ids` (the ids held in every
+receiver mirror together), `rf_pending_ids` (the ids asked for and not yet
+seen admitted) and `rf_parse_failed` (the `rf` members this process could not
+parse or read since it started). No label carries a peer, a salt or an
+address.
+
 ## Log events
 
 | Target | Level | Carries |
@@ -295,6 +457,13 @@ server-composed node) counted into neither.
 | `durable_enqueued_total` | `ciris.edge.durable.enqueued` | counter | count | operator-only |
 | `transport_bytes_in_total` | `ciris.edge.transport.bytes.in` | counter | bytes | operator-only |
 | `transport_bytes_out_total` | `ciris.edge.transport.bytes.out` | counter | bytes | operator-only |
+| `transport_wire_bytes_in_total` | `ciris.edge.transport.wire.bytes.in` | counter | bytes | operator-only |
+| `transport_wire_bytes_out_total` | `ciris.edge.transport.wire.bytes.out` | counter | bytes | operator-only |
+| `links_active` | `ciris.edge.links.active` | gauge | count | operator-only |
+| `distinct_peers_1h` | `ciris.edge.peers.distinct.1h` | gauge | count | operator-only |
+| `distinct_peers_24h` | `ciris.edge.peers.distinct.24h` | gauge | count | operator-only |
+| `top_peers_by_bytes` | `ciris.edge.peers.top_by_bytes` | gauge | bytes | operator-only |
+| `link_duration_seconds` | `ciris.edge.link.duration` | histogram | seconds | operator-only |
 | `peer_reachability_ratio` | `ciris.edge.peer.reachability` | gauge | ratio | operator-only |
 | `inbound_dropped_low_trust` | `ciris.edge.inbound.dropped_low_trust` | counter | count | operator-only |
 | `replication_round_outcomes_total` | `ciris.edge.round.outcomes` | counter | count | operator-only |
