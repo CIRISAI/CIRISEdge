@@ -278,7 +278,15 @@ pub(super) struct AlmState {
 /// stalled: far above any propagation floor this mesh runs at, and under
 /// leviculum's ~1.3 s retry budget (leviculum#113).
 pub(super) const UPLINK_STALL_MS: u64 = 400;
-/// G8 — how many stalled legs make it the UPLINK (not one slow peer).
+/// G8 — while this node's uplink is stalled its offers go out this rarely
+/// instead of every [`OFFER_EVERY_MS`]: a bounded hold. An offer is a hint
+/// that only queues behind the backlog; the relays' offers (their uplinks are
+/// not stalled) carry the re-parenting, and a stalled node still offers
+/// every few seconds so nobody forgets it.
+pub(super) const STALL_OFFER_EVERY_MS: u64 = 5_000;
+/// G8 — how many stalled legs make it the UPLINK (not one slow peer). With
+/// one leg (a two-person call) there is no verdict, and none is needed: a
+/// publisher with one child has nothing to shed.
 pub(super) const UPLINK_STALL_LEGS: usize = 2;
 
 /// **The canonical audio fallback lever** (`FSD/CIRIS_MESH.md` §6.4; Eric
@@ -367,8 +375,9 @@ impl AlmState {
     /// legs' unproved Channel ages each watch tick). On the rise it is
     /// counted; while it holds, the next egress window is read as congested
     /// at one stream's room, so this node sheds to one child (LIFO) and its
-    /// relay work goes, and its periodic offers pause (they would only queue
-    /// behind the backlog and spend the Channel's retry budget).
+    /// relay work goes, and its periodic offers are held to one every
+    /// [`STALL_OFFER_EVERY_MS`] (they would only queue behind the backlog and
+    /// spend the Channel's retry budget).
     pub(super) fn set_uplink_stall(&mut self, stalled: bool) {
         if stalled && !self.uplink_stall {
             self.label(crate::observability::ALM_UPLINK_STALL);
@@ -1701,11 +1710,14 @@ impl AlmState {
             }
         }
 
-        // Offers (C3) to every C3 member this node can reach; paused while the
-        // uplink is stalled (G8).
-        if !self.uplink_stall
-            && (now.saturating_sub(self.last_offer_ms) >= OFFER_EVERY_MS || self.last_offer_ms == 0)
-        {
+        // Offers (C3) to every C3 member this node can reach; held to one every
+        // STALL_OFFER_EVERY_MS while the uplink is stalled (G8).
+        let offer_every = if self.uplink_stall {
+            STALL_OFFER_EVERY_MS
+        } else {
+            OFFER_EVERY_MS
+        };
+        if now.saturating_sub(self.last_offer_ms) >= offer_every || self.last_offer_ms == 0 {
             self.last_offer_ms = now.max(1);
             let mut own_offer = self.own.offer();
             own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);

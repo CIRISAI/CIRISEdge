@@ -1535,7 +1535,7 @@ pub const DIRECT_LINK_FAILED_PEER_FELL_BACK: &str = "direct_link_failed_peer_fel
 pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
 /// G8 — a direct path forgotten because its LINK closed (the punched
 /// interface went with it): the next dial proposes at once.
-pub const DIRECT_LINK_RELEASED_LINK_CLOSED: &str = "released_link_closed";
+pub const DIRECT_LINK_RELEASED_LINK_CLOSED: &str = "direct_link_released_link_closed";
 /// A direct A/V leg's path was judged gone and the leg fell back
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
