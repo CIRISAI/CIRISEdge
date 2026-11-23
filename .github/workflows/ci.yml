@@ -1180,7 +1180,11 @@ jobs:
     # cross-repo cache warmers; nothing on a PR consumes them (the pyo3
     # compile is covered on PRs by `lint` + `linux-x86_64 (pyo3-lib)`). Off
     # PR; still on main (cache + desktop-break catch) and tags.
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    # Off ordinary PRs (cut runners). A PR from a `ci-release/*` branch runs
+    # it, so a change to this job is proven before a tag depends on it: the
+    # v45.1.10 tag was this job's first run after maturin left, and its
+    # darwin leg did not link.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.head_ref, 'ci-release/')
     # CIRISEdge#229 — save the cross-repo cache on main-branch + tag
     # builds (one per canonical PLAT: linux-x86_64, linux-aarch64,
     # macos-aarch64, windows-x64). PR runs read but don't write.
@@ -1376,7 +1380,18 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 60
           shell: bash
-          command: cargo rustc --release --lib --crate-type rlib --features "${{ matrix.features }}"
+          # macOS: edge is built as an rlib, but cargo still links its
+          # dependency ciris-persist as the cdylib that crate declares, and
+          # with `extension-module` that library leaves the Python symbols
+          # for the interpreter to supply. Linux and Windows link it as it
+          # stands; Apple's linker refuses undefined symbols unless told to
+          # look them up at load time. maturin passed these two arguments
+          # for us until 45.1.10 dropped it.
+          command: |
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-undefined -C link-arg=dynamic_lookup"
+            fi
+            cargo rustc --release --lib --crate-type rlib --features "${{ matrix.features }}"
       - name: sccache stats
         if: always()
         shell: bash
