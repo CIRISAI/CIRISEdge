@@ -18,6 +18,17 @@ Every token in this file is **frozen for 45.x**. Later releases only add tokens;
 | `Call::relayed_to() -> Vec<RelayedTo>` | What this node forwarded, per child node: `child`, `bytes`, `chunks`, `streams`. Diag. |
 | `RELAY_WAIT` (6 s) | How long a member with no direct path waits for a member relay before `MediaPathFailed` fires. |
 
+## Call refusals (`CallError`, Python `ValueError` whose message starts with the token), Show
+
+| Token | Variant | Meaning | retryable |
+|---|---|---|---|
+| `onion_anonymous_no_media` | `AnonymousMode` | This device is in anonymous mode: it starts and joins no call and accepts no call link. | no (while anonymous) |
+| `shaped_only_no_media` | `ShapedOnly` | This device is set to shaped links only, and calls ride unshaped links: it starts and joins no call and accepts no call link. Direct links stay allowed. | no (while the setting is on) |
+
+Anonymous mode implies shaped-only. When both hold, the anonymous token is reported, so the client needs distinct copy for each. Both are refused before anything starts. A link another member dials to such a node is refused on that node's side too, counted on the A/V plane as `shaped_only_no_media`.
+
+The other members see such a node as simply not in the call. Today they still dial every room member, so dial attempts toward it go on, bounded by the leg backoff. If no direct path to it can be made, a `media_path_failed` can fire for it with the direct-path cause. That is a known 45.2.0 limit, not a new token; see the edge note on dialling attendees only.
+
 ## Call events
 
 | Event (`kind` on the Python dict) | Fields | Show / Diag | When |
