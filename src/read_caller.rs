@@ -32,6 +32,10 @@ pub(crate) enum Site {
     AdvertiseRequired,
     /// The required read's group rows (`required_group_rows`).
     AdvertiseGroups,
+    /// CIRISEdge#1029 — a watched join's read of its group's Welcomes
+    /// (`joiners_welcomes`), apart from the group rows so a hub's join cost
+    /// is its own line.
+    AdvertiseWelcomes,
     /// An advertise page of the serve cursor (`attestation_page`).
     AdvertiseHistory,
     /// The CC 5.2 unasked-offer check (`moves_unasked`).
@@ -87,9 +91,10 @@ pub(crate) enum Site {
 
 impl Site {
     /// Every site, in label order (the slot table's order).
-    pub(crate) const ALL: [Self; 26] = [
+    pub(crate) const ALL: [Self; 27] = [
         Self::AdvertiseRequired,
         Self::AdvertiseGroups,
+        Self::AdvertiseWelcomes,
         Self::AdvertiseHistory,
         Self::AdvertiseUnasked,
         Self::AdvertiseGate,
@@ -122,6 +127,7 @@ impl Site {
         match self {
             Self::AdvertiseRequired => "edge.advertise.required",
             Self::AdvertiseGroups => "edge.advertise.groups",
+            Self::AdvertiseWelcomes => "edge.advertise.welcomes",
             Self::AdvertiseHistory => "edge.advertise.history",
             Self::AdvertiseUnasked => "edge.advertise.unasked",
             Self::AdvertiseGate => "edge.advertise.gate",

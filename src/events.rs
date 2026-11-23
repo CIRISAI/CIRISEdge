@@ -94,6 +94,77 @@ pub enum EventKind {
     /// Slow-consumer marker — the receiver lagged by N events. Emitted
     /// by the subscription-side adapter, not by the substrate.
     Lagged,
+    /// CIRISEdge#1029 — a row a room's membership or keying turns on was
+    /// admitted from a peer, through the replication apply choke. On the
+    /// union channel only ([`EventBus::subscribe_all`]); coalescing is
+    /// allowed, and on a `Lagged` gap the host's own sweep is the fallback.
+    /// Built by [`NetworkEvent::row_admitted`].
+    RowAdmitted {
+        /// What kind of row it is.
+        dimension: AdmittedRow,
+        /// The community or room id the row is placed in, when it names one.
+        group_id: Option<String>,
+        /// The key the row is about: its attested key, or for a Welcome the
+        /// joiner it is for.
+        subject: String,
+        /// The row's author (its attesting key).
+        author: String,
+        /// The row's `attestation_id`.
+        row_id: String,
+    },
+}
+
+/// CIRISEdge#1029 — the closed set of rows [`EventKind::RowAdmitted`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmittedRow {
+    /// A joiner's MLS KeyPackage (`chat:key_package:v1`): the adder may add.
+    KeyPackage,
+    /// An MLS Welcome (`chat:welcome:v1`): the joiner may key.
+    Welcome,
+    /// An MLS Commit (`chat:commit:v1`).
+    Commit,
+    /// An invitee's answer (`membership:acceptance:v1`,
+    /// `membership:decline:v1`): the host may seat.
+    MembershipDecision,
+    /// A roster widening (`membership:widening:v1`): a member is seated.
+    MembershipWiden,
+    /// A key grant (`key_grant:*`).
+    KeyGrant,
+}
+
+impl AdmittedRow {
+    /// The kind of row `dimension` is, if it is one the event names.
+    #[must_use]
+    pub fn of_dimension(dimension: &str) -> Option<Self> {
+        use ciris_persist::federation::group_plane::MEMBERSHIP_WIDENING_DIMENSION;
+        use ciris_persist::federation::key_grant::KEY_GRANT_DIMENSION_PREFIX;
+        use ciris_persist::federation::membership_acceptance::{
+            ACCEPTANCE_DIMENSION, DECLINE_DIMENSION,
+        };
+        Some(match dimension {
+            crate::chat::KEY_PACKAGE_DIMENSION => Self::KeyPackage,
+            crate::chat::WELCOME_DIMENSION => Self::Welcome,
+            crate::chat::COMMIT_DIMENSION => Self::Commit,
+            ACCEPTANCE_DIMENSION | DECLINE_DIMENSION => Self::MembershipDecision,
+            MEMBERSHIP_WIDENING_DIMENSION => Self::MembershipWiden,
+            d if d.starts_with(KEY_GRANT_DIMENSION_PREFIX) => Self::KeyGrant,
+            _ => return None,
+        })
+    }
+
+    /// The stable token, as serialized.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KeyPackage => "key_package",
+            Self::Welcome => "welcome",
+            Self::Commit => "commit",
+            Self::MembershipDecision => "membership_decision",
+            Self::MembershipWiden => "membership_widen",
+            Self::KeyGrant => "key_grant",
+        }
+    }
 }
 
 /// Per-category broadcast payload. The category-specific fields
@@ -245,6 +316,45 @@ impl NetworkEvent {
             lagged_count: None,
             destination_hash: Some(destination_hash),
             hops: Some(hops),
+            resource_kind: None,
+            measurement: None,
+            unit: None,
+        }
+    }
+
+    /// CIRISEdge#1029 — construct a [`EventKind::RowAdmitted`] event. The
+    /// identifiers ride the kind; `peer_key_id` is left empty (the row's
+    /// carrier is not what the host acts on).
+    #[must_use]
+    pub fn row_admitted(
+        dimension: AdmittedRow,
+        group_id: Option<String>,
+        subject: impl Into<String>,
+        author: impl Into<String>,
+        row_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            at: Utc::now(),
+            kind: EventKind::RowAdmitted {
+                dimension,
+                group_id,
+                subject: subject.into(),
+                author: author.into(),
+                row_id: row_id.into(),
+            },
+            message: format!("row admitted: {}", dimension.as_str()),
+            peer_key_id: None,
+            transport_id: None,
+            severity: EventSeverity::Info,
+            aspect: None,
+            identity_hash: None,
+            app_data: None,
+            rssi_dbm: None,
+            snr_db: None,
+            link_id: None,
+            lagged_count: None,
+            destination_hash: None,
+            hops: None,
             resource_kind: None,
             measurement: None,
             unit: None,
@@ -518,6 +628,13 @@ impl EventBus {
     /// `subscribe_resources` channel and project through [`ResourceEvent`].
     pub fn emit_resource(&self, event: NetworkEvent) {
         let _ = self.resources.send(event.clone());
+        let _ = self.all.send(event);
+    }
+
+    /// CIRISEdge#1029 — emit a [`EventKind::RowAdmitted`] event, on the
+    /// union channel only (the agreed subscription is
+    /// [`Self::subscribe_all`]; no per-category channel carries it).
+    pub fn emit_row_admitted(&self, event: NetworkEvent) {
         let _ = self.all.send(event);
     }
 

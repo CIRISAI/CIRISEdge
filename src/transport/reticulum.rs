@@ -7100,6 +7100,7 @@ impl ReticulumTransport {
             Ok(()) => dispatch_proposal(
                 &self.node,
                 &self.direct_paths,
+                &self.onion,
                 self.metrics.get(),
                 destination_key_id,
                 link,
@@ -7126,6 +7127,7 @@ impl ReticulumTransport {
         let table = self.scope_addresses.get().cloned();
         let metrics = self.metrics.get().cloned();
         let lifecycle = Arc::clone(&self.lifecycle);
+        let onion = Arc::clone(&self.onion);
         let wait = GLARE_WAIT.mul_f64(1.0 + jitter_draw());
         tokio::spawn(async move {
             tokio::time::sleep(wait).await;
@@ -7144,8 +7146,16 @@ impl ReticulumTransport {
             {
                 return;
             }
-            let _ =
-                dispatch_proposal(&node, &direct_paths, metrics.as_ref(), &peer, link, now).await;
+            let _ = dispatch_proposal(
+                &node,
+                &direct_paths,
+                &onion,
+                metrics.as_ref(),
+                &peer,
+                link,
+                now,
+            )
+            .await;
         });
     }
 
@@ -7160,10 +7170,12 @@ impl ReticulumTransport {
     /// rule ([`crate::transport::direct_path::accepts_direct`]).
     #[must_use]
     pub fn should_accept_direct(&self, peer_key_id: &str) -> bool {
-        crate::transport::direct_path::accepts_direct(
-            self.direct_paths.config.accept,
-            self.direct_standing(peer_key_id),
-        )
+        // CIRISEdge#1028 — an anonymous node accepts no upgrade.
+        self.onion.may_reveal_address().is_ok()
+            && crate::transport::direct_path::accepts_direct(
+                self.direct_paths.config.accept,
+                self.direct_standing(peer_key_id),
+            )
     }
 
     /// Whether `peer_key_id` may share a direct path with this node: it
@@ -15018,9 +15030,15 @@ struct AnnounceCtx {
 /// consented contact. Shared by the accept decision and the proposal hook.
 /// Start a proposal to `peer` on `link`: the tracker's record, the waiter for
 /// its outcome, and leviculum's dispatch. The caller has admitted it.
+///
+/// CIRISEdge#1028 — the one door every proposal goes through, so the one
+/// place an anonymous node ([`crate::onion::runtime::OnionRuntime::may_reveal_address`])
+/// is stopped: nothing is sent, so leviculum opens no session and probes no
+/// facilitator, and the peer is backed off as for a refused proposal.
 async fn dispatch_proposal(
     node: &ReticulumNode,
     direct_paths: &crate::transport::direct_path::DirectPaths,
+    onion: &crate::onion::runtime::OnionRuntime,
     metrics: Option<&crate::observability::EdgeMetrics>,
     peer: &str,
     link: LinkId,
@@ -15034,6 +15052,17 @@ async fn dispatch_proposal(
             m.inc_direct_link(label);
         }
     };
+    if let Err(token) = onion.may_reveal_address() {
+        onion.count(token);
+        direct_paths.tracker().propose_refused(peer, link, now);
+        tracing::debug!(
+            link = %hex::encode(link.as_bytes()),
+            "direct path: not proposing — this node's Anonymous Tier is active (CC 5.4.6)"
+        );
+        return Err(crate::transport::direct_path::DirectPath::Unavailable {
+            reason: "propose_refused",
+        });
+    }
     // Registered BEFORE the dispatch, so the outcome cannot precede the
     // registration.
     let rx = direct_paths.wait_for(link);
@@ -19697,6 +19726,7 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
     let direct_paths = Arc::clone(ctx.direct_paths);
     let metrics = ctx.metrics.cloned();
     let node = Arc::clone(ctx.av_node);
+    let onion = Arc::clone(ctx.onion);
     tokio::spawn(async move {
         let accept = direct_paths.config.accept;
         let standing = |p: &str| direct_standing(table.as_deref(), &direct_paths, p);
@@ -19714,7 +19744,14 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
             shares_room = peer.as_deref().is_some_and(standing);
         }
         let held_ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let accepted = peer.is_some() && accepts_direct(accept, shares_room);
+        // CIRISEdge#1028 — an anonymous node answers no upgrade: accepting
+        // hands the proposer and the facilitator its reflexive address. Read
+        // at the answer, after any standing wait.
+        let anonymous = onion.may_reveal_address().err();
+        if let Some(token) = anonymous {
+            onion.count(token);
+        }
+        let accepted = anonymous.is_none() && peer.is_some() && accepts_direct(accept, shares_room);
         // v44 — before the answer goes, so the outcome cannot precede the
         // record: from here this link may move under a Resource
         // (`direct_path` docs).

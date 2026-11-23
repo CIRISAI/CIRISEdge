@@ -206,6 +206,19 @@ impl OnionRuntime {
         Ok(())
     }
 
+    /// CIRISEdge#1028 — **an anonymous identity never upgrades**: may this
+    /// node reveal its address to a peer (a direct-link proposal, or an answer
+    /// accepting one)? `Err` while the tier is active, for every peer.
+    ///
+    /// # Errors
+    /// [`tokens::ANONYMOUS_NO_DIRECT`].
+    pub fn may_reveal_address(&self) -> Result<(), &'static str> {
+        if self.tier().is_ok() {
+            return Err(tokens::ANONYMOUS_NO_DIRECT);
+        }
+        Ok(())
+    }
+
     /// The peers whose links this node shapes for the tier: as a relay, the
     /// members of the layers next to its own; as a publisher only, layer 1
     /// (its first hops). Empty while the tier is not active.

@@ -264,6 +264,26 @@ fn room_member_for(room: &crate::scope_room::ScopeRoom) -> &'static str {
 /// able to tell which one is theirs. Crate-private, like its siblings.
 const FIELD_MLS_FOR: &str = "mls_for_key_id";
 
+/// CIRISEdge#1029 F1 — whom a room's Welcome row is for: its
+/// [`FIELD_MLS_FOR`] member. `None` for any other row, and for a pair-era
+/// Welcome that names nobody (its room was the address).
+pub(crate) fn welcome_recipient(a: &Attestation) -> Option<&str> {
+    if crate::membership::dimension_of(a) != Some(WELCOME_DIMENSION) {
+        return None;
+    }
+    a.attestation_envelope
+        .get(FIELD_MLS_FOR)
+        .and_then(serde_json::Value::as_str)
+}
+
+/// CIRISEdge#1029 F1 — a handshake row's [`FIELD_MLS_EPOCH`]: the epoch a
+/// Welcome joins its recipient into, or the epoch a Commit advanced to.
+pub(crate) fn mls_epoch(a: &Attestation) -> Option<u64> {
+    a.attestation_envelope
+        .get(FIELD_MLS_EPOCH)
+        .and_then(serde_json::Value::as_u64)
+}
+
 /// **The room two people share, derived from their fed-IDs alone.**
 ///
 /// Order-free by construction: the pair is sorted before hashing, so Alice and

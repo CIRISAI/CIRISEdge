@@ -404,7 +404,7 @@ pub use emission::{
     MAX_PAYLOAD_BYTES,
 };
 pub use events::{
-    EventBus, EventKind, EventSeverity, NetworkEvent, PathEvent, ResourceEvent,
+    AdmittedRow, EventBus, EventKind, EventSeverity, NetworkEvent, PathEvent, ResourceEvent,
     DEFAULT_EVENT_CHANNEL_CAPACITY,
 };
 pub use handler::{
