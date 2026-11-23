@@ -5079,7 +5079,18 @@ mod tests {
     /// wake it. Red before: still parked when the deadline passes.
     #[cfg(feature = "_reticulum-module")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)] // the scope-native edge fixture beside its one assertion
     async fn the_loop_wakes_a_scope_parked_pull_on_the_install_1029() {
+        async fn gone(waits: &KeyWaits, sha: [u8; 32]) -> bool {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while waits.is_parked(sha) {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            true
+        }
         use crate::blob_swarm::chunk_grants_779_tests::{puller_with, two_devices, NoWire};
         use crate::blob_swarm::scope::table_key;
         use crate::scope_addressing::{MemberAddress, ScopeAddressTable, StubDeriver};
@@ -5176,16 +5187,6 @@ mod tests {
                 },
             );
         };
-        async fn gone(waits: &KeyWaits, sha: [u8; 32]) -> bool {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while waits.is_parked(sha) {
-                if std::time::Instant::now() >= deadline {
-                    return false;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            true
-        }
         let waits = Arc::clone(&puller.key_waits);
         // A sentinel the loop's first tick wakes (its room is installed past
         // the generation it parked at): once it is gone, the loop is on its

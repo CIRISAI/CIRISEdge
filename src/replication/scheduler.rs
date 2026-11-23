@@ -3631,6 +3631,7 @@ mod tests {
     /// runs in the same kicked tick, after the ordinary one. Red before: the
     /// first frame the seat saw after the kick was the `Fetch`.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // the full node↔seat fixture beside its one assertion
     async fn a_kicked_round_sends_its_summary_before_a_queued_recovery_ask_1029() {
         let (alice_to_bob_tx, mut alice_to_bob_rx) = tokio::sync::mpsc::unbounded_channel();
         let (bob_to_alice_tx, mut bob_to_alice_rx) = tokio::sync::mpsc::unbounded_channel();
