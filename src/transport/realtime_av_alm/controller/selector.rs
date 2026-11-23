@@ -280,6 +280,13 @@ impl<P: PeerRef> ParentSelector<P> {
         self.forward_capable
     }
 
+    /// Calls cut — this node started or stopped offering relay mid-call
+    /// (`Call::set_relay`): told with every later subscribe, and no longer
+    /// read as a forwarder that must not move deeper.
+    pub fn set_forward_capable(&mut self, on: bool) {
+        self.forward_capable = on;
+    }
+
     /// Tell the selector whether this node has admitted children.
     pub fn set_has_children(&mut self, has: bool) {
         self.has_children = has;

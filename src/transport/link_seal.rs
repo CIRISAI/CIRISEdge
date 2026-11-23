@@ -1822,7 +1822,39 @@ impl LinkSeals {
         if sealed.pinned.load(Ordering::Relaxed) {
             return Err(SealRefusal::FirstContactOnly);
         }
-        Ok(self.seal_with(link, &sealed, facts, lane, plaintext))
+        Ok(self.seal_with(link, &sealed, facts, lane, plaintext, None))
+    }
+
+    /// Calls cut — [`Self::seal`] for a media frame this node FORWARDS for
+    /// another member (an ALM relay hop): counted in the `relay` plane of the
+    /// wire ledger instead of `av`, so "bytes relayed for others" is one cell.
+    ///
+    /// # Errors
+    /// As [`Self::seal`].
+    pub fn seal_relayed(
+        &self,
+        link: [u8; 16],
+        lane: Lane,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, SealRefusal> {
+        let (sealed, facts) = {
+            let links = self.links();
+            match links.map.get(&link) {
+                Some(State::Sealed(s)) => (Arc::clone(s), links.wire.get(&link).cloned()),
+                _ => return Err(SealRefusal::Unsealed),
+            }
+        };
+        if sealed.pinned.load(Ordering::Relaxed) {
+            return Err(SealRefusal::FirstContactOnly);
+        }
+        Ok(self.seal_with(
+            link,
+            &sealed,
+            facts,
+            lane,
+            plaintext,
+            Some(crate::wire_bytes::WirePlane::Relay),
+        ))
     }
 
     /// CC 3.2 (f) — seal one first-contact frame on a pairing-pinned link.
@@ -1846,7 +1878,7 @@ impl LinkSeals {
                 _ => return Err(SealRefusal::Unsealed),
             }
         };
-        Ok(self.seal_with(link, &sealed, facts, lane, plaintext))
+        Ok(self.seal_with(link, &sealed, facts, lane, plaintext, None))
     }
 
     fn seal_with(
@@ -1856,6 +1888,7 @@ impl LinkSeals {
         facts: Option<LinkWire>,
         lane: Lane,
         plaintext: &[u8],
+        plane: Option<crate::wire_bytes::WirePlane>,
     ) -> Vec<u8> {
         let mut frame = sealed.seal(lane, plaintext);
         if lane.is_msgpack() {
@@ -1871,7 +1904,7 @@ impl LinkSeals {
         }
         if self.wire.get().is_some() {
             let (transport, av) = self.wire_of(facts.map(|f| f.facts));
-            let plane = self.plane_of(lane, av, plaintext);
+            let plane = plane.unwrap_or_else(|| self.plane_of(lane, av, plaintext));
             self.count(
                 crate::wire_bytes::WireDir::Out,
                 transport,

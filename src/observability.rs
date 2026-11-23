@@ -1085,12 +1085,21 @@ pub const ALM_OFFER_REFUSED_NOT_PUBLISHER: &str = "alm_offer_refused:not_publish
 /// the publisher's own first offers at a join: the next one, a second later,
 /// is checked again.
 pub const ALM_OFFER_REFUSED_UNBOUND: &str = "alm_offer_refused:unbound";
+/// [`ALM_OFFER_REFUSED`]: a serve seat offered a stream it does not publish
+/// (calls cut: a serve seat never relays call media, audio included).
+pub const ALM_OFFER_REFUSED_SERVE_SEAT: &str = "alm_offer_refused:serve_seat";
 /// ALM C2 — a subscribe admitted / refused at this node.
 pub const ALM_ADMIT: &str = "alm_admit";
 /// ALM C2 — a subscribe refused at this node (the token is counted too).
 pub const ALM_REFUSE: &str = "alm_refuse";
+/// ALM C2 — this serve seat refused a relay subscribe (calls cut: a serve
+/// seat never relays call media). The wire says `relay_class_refused`.
+pub const ALM_REFUSE_SERVE_SEAT: &str = "relay_serve_seat";
 /// ALM C2 — a subscriber shed by this node.
 pub const ALM_SHED: &str = "alm_shed";
+/// ALM C2 — a child shed because this node turned relaying off
+/// (`Call::set_relay(false)`). The wire says `relay_shed:upstream_lost`.
+pub const ALM_RELAY_OFF_SHED: &str = "relay_shed:relay_off";
 /// ALM — a chunk this node forwarded as an admitted media parent.
 pub const ALM_FORWARDED: &str = "alm_forwarded";
 /// ALM C4 — this node's primary parent for a stream changed.
@@ -2950,9 +2959,12 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_OFFER_REFUSED,
     ALM_OFFER_REFUSED_NOT_PUBLISHER,
     ALM_OFFER_REFUSED_UNBOUND,
+    ALM_OFFER_REFUSED_SERVE_SEAT,
     ALM_ADMIT,
     ALM_REFUSE,
+    ALM_REFUSE_SERVE_SEAT,
     ALM_SHED,
+    ALM_RELAY_OFF_SHED,
     ALM_FORWARDED,
     ALM_PARENT_CHANGE,
     ALM_RELAY_TIER_ROSTER,

@@ -3234,6 +3234,10 @@ pub struct ReticulumTransport {
     /// leviculum#102 — the host's A/V datagram lever
     /// ([`Self::set_av_datagrams_enabled`]). Default on.
     av_datagrams_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Calls cut — the serve seats (the canonical set) this node knows of,
+    /// shared with the Edge: a call reads it so a seat never relays call media
+    /// and a seat's relay offers are dropped (`av_call::alm`).
+    serve_seats: std::sync::OnceLock<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
     /// v45 — the host's lever for SUBSCRIBE layer caps
     /// ([`Self::set_av_layer_requests_enabled`]). Default OFF until CC rules.
     av_layer_requests: std::sync::atomic::AtomicBool,
@@ -4453,6 +4457,7 @@ impl ReticulumTransport {
             wire_fold: Arc::default(),
             av_caps_withheld: std::sync::atomic::AtomicU32::new(0),
             av_datagrams_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            serve_seats: std::sync::OnceLock::new(),
             av_layer_requests: std::sync::atomic::AtomicBool::new(false),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_paths,
@@ -6238,6 +6243,25 @@ impl ReticulumTransport {
         }
     }
 
+    /// Calls cut — share the Edge's live serve-seat (canonical) set with this
+    /// transport's calls. Set once; a later call is ignored.
+    pub fn set_serve_seats(
+        &self,
+        seats: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    ) {
+        let _ = self.serve_seats.set(seats);
+    }
+
+    /// Calls cut — the serve seats this node knows of now (empty when no
+    /// Edge shared its set).
+    #[must_use]
+    pub fn serve_seats(&self) -> Vec<String> {
+        self.serve_seats
+            .get()
+            .and_then(|s| s.read().ok().map(|set| set.iter().cloned().collect()))
+            .unwrap_or_default()
+    }
+
     /// leviculum#102 — the A/V datagram lever's position
     /// ([`Self::set_av_datagrams_enabled`]).
     #[must_use]
@@ -7289,7 +7313,9 @@ impl ReticulumTransport {
     /// rule ([`crate::transport::direct_path::accepts_direct`]).
     #[must_use]
     pub fn should_accept_direct(&self, peer_key_id: &str) -> bool {
-        if self.direct_paths.refuses_for_test() {
+        if self.direct_paths.refuses_for_test()
+            || self.direct_paths.refuses_peer_for_test(peer_key_id)
+        {
             return false;
         }
         crate::transport::direct_path::accepts_direct(
@@ -7324,6 +7350,14 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub fn set_refuse_direct_for_test(&self, refuse: bool) {
         self.direct_paths.set_refuse_for_test(refuse);
+    }
+
+    /// Test seam: refuse `peer`'s direct-link requests (REJECT `POLICY`) from
+    /// now on, whatever the accept rule says: a pair whose punch cannot
+    /// succeed (set on both ends).
+    #[doc(hidden)]
+    pub fn refuse_direct_from_for_test(&self, peer: &str) {
+        self.direct_paths.refuse_peer_for_test(peer);
     }
 
     /// Test seam: forget `peer`'s direct-path backoff, so the next dial to it
@@ -7937,6 +7971,59 @@ impl ReticulumTransport {
             .map(|p| (p.hops, p.next_hop))
             .collect();
         scoped_path_shape_from_paths(&paths)
+    }
+
+    /// Calls cut — how this node reaches `destination_key_id` for a blob
+    /// fetch (`blob_swarm::PATH_RANK_*`): a one-hop path is direct; a path, or
+    /// a relay the destination was heard through (leviculum#91), via a roster
+    /// member (a room peer or consented contact) is a peer relay; a path
+    /// whose only forwarders are serve seats is seat-only; anything else
+    /// (no path, an unknown forwarder) is other.
+    pub async fn holder_path_rank(&self, destination_key_id: &str) -> u8 {
+        use crate::blob_swarm::{
+            PATH_RANK_DIRECT, PATH_RANK_OTHER, PATH_RANK_PEER_RELAY, PATH_RANK_SEAT_ONLY,
+        };
+        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let mut forwarders: Vec<[u8; 16]> = Vec::new();
+        for c in &candidates {
+            if let Some(p) = self.node.get_path_clone(&c.dest_hash) {
+                if p.hops <= 1 && p.next_hop.is_none() {
+                    return PATH_RANK_DIRECT;
+                }
+                forwarders.extend(p.next_hop);
+            }
+            forwarders.extend(self.node.relay_routes(&c.dest_hash).iter().map(|r| r.relay));
+        }
+        if forwarders.is_empty() {
+            return PATH_RANK_OTHER;
+        }
+        let mut via_seat = false;
+        for f in &forwarders {
+            if let Some(k) = self.roster_relay_key(f).await {
+                if k != destination_key_id {
+                    return PATH_RANK_PEER_RELAY;
+                }
+            }
+            via_seat |= self.forwarder_is_serve_seat(f).await;
+        }
+        if via_seat {
+            PATH_RANK_SEAT_ONLY
+        } else {
+            PATH_RANK_OTHER
+        }
+    }
+
+    /// Calls cut — whether transport id `relay` is a known serve seat's.
+    async fn forwarder_is_serve_seat(&self, relay: &[u8; 16]) -> bool {
+        let seats = self.serve_seats();
+        if seats.is_empty() {
+            return false;
+        }
+        let peers = self.peers.lock().await;
+        peers.iter().any(|(key_id, rp)| {
+            seats.iter().any(|s| s == key_id)
+                && TransportIdentityPub::from_pub64(&rp.transport_pubkey64).hash()[..] == relay[..]
+        })
     }
 
     /// CIRISEdge#718 test seam — what a TRANSPORT NODE can say about the
@@ -19883,7 +19970,10 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
         let held_ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
         let accepted = peer.is_some()
             && accepts_direct(accept, shares_room)
-            && !direct_paths.refuses_for_test();
+            && !direct_paths.refuses_for_test()
+            && !peer
+                .as_deref()
+                .is_some_and(|p| direct_paths.refuses_peer_for_test(p));
         // v44 — before the answer goes, so the outcome cannot precede the
         // record: from here this link may move under a Resource
         // (`direct_path` docs).

@@ -4697,10 +4697,23 @@ fn call_event_to_pydict<'py>(
             }
             d.set_item("relay", relay.token())?;
         }
-        V::MediaPathRestored { member, via } => {
+        V::MediaPathRestored {
+            member,
+            via,
+            through,
+        } => {
             d.set_item("kind", "media_path_restored")?;
             d.set_item("member", member)?;
             d.set_item("via", via.token())?;
+            d.set_item("through", through.as_deref())?;
+        }
+        V::RelayStatus {
+            relaying,
+            relaying_for,
+        } => {
+            d.set_item("kind", "relay_status")?;
+            d.set_item("relaying", *relaying)?;
+            d.set_item("relaying_for", *relaying_for)?;
         }
     }
     Ok(d)
@@ -4821,6 +4834,8 @@ pub const PY_CALL_VERBS: &[&str] = &[
     "end_stream",
     "streams",
     "frames_lost_by_layer",
+    "set_relay",
+    "relay_status",
 ];
 
 #[cfg(feature = "_reticulum-module")]
@@ -4869,6 +4884,25 @@ impl PyCall {
     /// The room.
     fn room(&self) -> String {
         self.room.clone()
+    }
+
+    /// Calls cut — start or stop relaying others' streams, live
+    /// (`Call::set_relay`): off sheds every child make-before-break. A serve
+    /// seat stays off. Fires a `relay_status` event.
+    fn set_relay(&self, py: Python<'_>, on: bool) -> PyResult<()> {
+        self.with_call(py, move |c| {
+            Box::pin(async move {
+                c.set_relay(on).await;
+                Ok(())
+            })
+        })
+    }
+
+    /// Calls cut — `(relaying, relaying_for)`: whether this node offers
+    /// relay, and how many distinct child NODES it forwards others' streams
+    /// to now.
+    fn relay_status(&self, py: Python<'_>) -> PyResult<(bool, u16)> {
+        self.with_call(py, |c| Box::pin(async move { Ok(c.relay_status()) }))
     }
 
     /// This node's stream id (32 bytes): the one it joined with, or the
@@ -15113,12 +15147,36 @@ mod pyo3_tier2_tests {
                     &CallEvent::MediaPathRestored {
                         member: "b".to_owned(),
                         via: PathKind::DirectReflexive,
+                        through: None,
                     },
                 )
                 .expect("project");
                 assert_eq!(text(&r, "kind"), "media_path_restored");
                 assert_eq!(text(&r, "member"), "b");
                 assert_eq!(text(&r, "via"), "direct_reflexive");
+                assert!(item(&r, "through").is_none());
+                let relayed = call_event_to_pydict(
+                    py,
+                    &CallEvent::MediaPathRestored {
+                        member: "b".to_owned(),
+                        via: PathKind::PeerRelay,
+                        through: Some("c".to_owned()),
+                    },
+                )
+                .expect("project");
+                assert_eq!(text(&relayed, "via"), "peer_relay");
+                assert_eq!(text(&relayed, "through"), "c");
+                let status = call_event_to_pydict(
+                    py,
+                    &CallEvent::RelayStatus {
+                        relaying: true,
+                        relaying_for: 2,
+                    },
+                )
+                .expect("project");
+                assert_eq!(text(&status, "kind"), "relay_status");
+                let n: u16 = item(&status, "relaying_for").extract().expect("u16");
+                assert_eq!(n, 2);
                 let none = call_event_to_pydict(
                     py,
                     &CallEvent::MediaPathFailed {

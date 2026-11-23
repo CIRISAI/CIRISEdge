@@ -1145,6 +1145,9 @@ pub(crate) struct DirectPaths {
     /// Test seam: refuse every peer's direct-link request (REJECT `POLICY`),
     /// whatever the accept rule says.
     refuse_for_test: std::sync::atomic::AtomicBool,
+    /// Test seam: refuse these peers' direct-link requests (REJECT `POLICY`),
+    /// whatever the accept rule says: a pair whose punch cannot succeed.
+    refuse_peers_for_test: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Most consented contacts remembered for direct links.
@@ -1162,6 +1165,7 @@ impl DirectPaths {
             yielding: std::sync::Mutex::new(HashMap::new()),
             local_nat: std::sync::Mutex::new(None),
             refuse_for_test: std::sync::atomic::AtomicBool::new(false),
+            refuse_peers_for_test: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1187,6 +1191,22 @@ impl DirectPaths {
     pub(crate) fn set_refuse_for_test(&self, refuse: bool) {
         self.refuse_for_test
             .store(refuse, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test seam: refuse `peer`'s direct-link requests from now on.
+    pub(crate) fn refuse_peer_for_test(&self, peer: &str) {
+        self.refuse_peers_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(peer.to_owned());
+    }
+
+    /// Whether the test seam refuses `peer`'s direct-link requests.
+    pub(crate) fn refuses_peer_for_test(&self, peer: &str) -> bool {
+        self.refuse_peers_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(peer)
     }
 
     /// Whether the test seam refuses every direct-link request.

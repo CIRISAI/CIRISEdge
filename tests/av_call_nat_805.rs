@@ -1617,3 +1617,345 @@ async fn fresh_interface_burst_measure() {
         t.transport_stats()
     );
 }
+
+// ─── calls cut: a member that cannot punch is heard through another member ──
+
+struct Trio {
+    t: ReticulumNode,
+    sides: Vec<Side>,
+    room: String,
+    groups: Vec<CohortGroup>,
+    _tmp: tempfile::TempDir,
+}
+
+/// `T` (the canonical's role: transport on, a facilitator), then `A`, `B`
+/// and `C`, each a TCP client of `T` and of nothing else, each proposing
+/// direct links through `T`'s facilitator as a server-composed node does; a
+/// room over all three. `A` and `B` refuse each other's direct-link request
+/// (REJECT `POLICY`), so their punch never succeeds: the pair a random
+/// symmetric NAT and a strict one make. `C` punches to both.
+async fn trio(tag: &str) -> Trio {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (t, t_port, f_port) = transport_node().await;
+    let direct = || DirectLinksConfig {
+        facilitator: Some(format!("127.0.0.1:{f_port}")),
+        ..DirectLinksConfig::default()
+    };
+    let mut keys = Vec::new();
+    for (i, name) in ["a", "b", "c"].iter().enumerate() {
+        keys.push(
+            Ident::new(
+                &format!("node-{name}-trio-{tag}"),
+                0x60 + u8::try_from(i).unwrap(),
+            )
+            .await,
+        );
+    }
+    let mut records = Vec::new();
+    for k in &keys {
+        records.push(k.record().await);
+    }
+    let mut sides = Vec::new();
+    for (i, key) in keys.into_iter().enumerate() {
+        let dir = directory_with(records.clone()).await;
+        sides.push(
+            side(
+                key,
+                &dir,
+                &tmp.path().join(format!("n{i}")),
+                t_port,
+                direct(),
+            )
+            .await,
+        );
+    }
+    for from in &sides {
+        let routes = from
+            .dir
+            .list_signed_transport_destinations_for(&from.key.key_id)
+            .await
+            .expect("list routes");
+        for to in &sides {
+            if to.key.key_id != from.key.key_id {
+                for r in &routes {
+                    FederationDirectory::put_signed_transport_destination(&*to.dir, r)
+                        .await
+                        .expect("seed the route");
+                }
+            }
+        }
+    }
+    let known = wait_until(Duration::from_mins(1), || async {
+        for a in &sides {
+            for b in &sides {
+                if a.key.key_id != b.key.key_id && !a.transport.seek_peer(&b.key.key_id).await {
+                    return false;
+                }
+            }
+        }
+        true
+    })
+    .await;
+    assert!(known, "every member reaches every other through T");
+    // The pair that cannot punch.
+    sides[0]
+        .transport
+        .refuse_direct_from_for_test(&sides[1].key.key_id);
+    sides[1]
+        .transport
+        .refuse_direct_from_for_test(&sides[0].key.key_id);
+
+    let room = format!("room-call-trio-{tag}");
+    let first = CohortGroup::create(store(&format!("{tag}-0")), &room, &sides[0].key.key_id, 16)
+        .await
+        .expect("A founds the room");
+    let mut groups = vec![first];
+    for (i, sd) in sides.iter().enumerate().skip(1) {
+        let (material, kp) = mint_cohort_key_material(&sd.key.key_id).expect("key material");
+        let add = groups[0]
+            .add_member(&sd.key.key_id, kp)
+            .await
+            .expect("add the member");
+        for g in groups.iter().skip(1) {
+            let _ = g
+                .apply_remote_commit(add.commit())
+                .await
+                .expect("apply the Add");
+        }
+        groups.push(
+            CohortGroup::join(
+                store(&format!("{tag}-{i}")),
+                &room,
+                material,
+                add.welcome().expect("a Welcome"),
+                16,
+            )
+            .await
+            .expect("join from the Welcome"),
+        );
+    }
+    Trio {
+        t,
+        sides,
+        room,
+        groups,
+        _tmp: tmp,
+    }
+}
+
+/// The host's defaults for a member node (CIRISServer: relay on for members,
+/// off for canonicals).
+fn member_opts() -> CallOptions {
+    CallOptions {
+        relay: true,
+        ..CallOptions::default()
+    }
+}
+
+async fn join_as(side: &Side, group: &CohortGroup, room: &str, opts: CallOptions) -> Call {
+    Call::join(
+        room,
+        &side.key.key_id,
+        CallDeps {
+            room_group: group.clone(),
+            roster: Arc::new(Roster),
+            owners: Arc::clone(&side.dir) as Arc<dyn ciris_edge::transport::av_call::CallOwners>,
+            transport: Arc::clone(&side.transport),
+            lifecycle: Arc::clone(&side.lifecycle),
+            registrar: Arc::new(UnwiredRegistrar) as Arc<dyn StreamDekRegistrar>,
+            events: None,
+            metrics: Some(side.metrics.clone()),
+            record: None,
+            signer: side.key.signer(),
+            verifier: Arc::clone(&side.dir) as Arc<dyn StreamKeyVerifier>,
+            load: None,
+        },
+        opts,
+    )
+    .await
+    .expect("join")
+}
+
+fn primary_for(
+    call: &Call,
+    stream: ciris_edge::transport::realtime_av::StreamId,
+) -> Option<String> {
+    call.alm_parents()
+        .into_iter()
+        .find(|p| p.stream == stream)
+        .and_then(|p| p.primary)
+}
+
+/// Bytes `T`'s interfaces carried, both ways: everything that crossed it.
+fn t_bytes(t: &ReticulumNode) -> u64 {
+    t.interface_stats()
+        .iter()
+        .map(|i| i.rx_bytes + i.tx_bytes)
+        .sum()
+}
+
+/// **The calls-cut acceptance witness** (Eric 2026-11-21: "if anyone in that
+/// room had a hard NAT, they should use the other peers as relays"). A and B
+/// cannot punch to each other; C punches to both. Every member is on the
+/// host's member default (relay on). A hears B's media, and B hears A's,
+/// THROUGH C: each chooses C as the parent of the other's stream, says so on
+/// `MediaPathRestored { via: peer_relay, through: C }` with no standing
+/// `MediaPathFailed`, and C counts what it forwarded. No call leg crosses T,
+/// and T carries signalling only: what crossed it during the media is a small
+/// fraction of what the media moved.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_that_cannot_punch_is_heard_through_another_member() {
+    let p = Box::pin(trio("relay")).await;
+    let (a, b, c) = (&p.sides[0], &p.sides[1], &p.sides[2]);
+    let mut ca = join_as(a, &p.groups[0], &p.room, member_opts()).await;
+    let mut cb = join_as(b, &p.groups[1], &p.room, member_opts()).await;
+    let cc = join_as(c, &p.groups[2], &p.room, member_opts()).await;
+    let mut a_frames = ca.frames().expect("A's frames");
+    let mut b_frames = cb.frames().expect("B's frames");
+    let mut a_events = ca.events().expect("A's events");
+
+    // C's legs come up over punched interfaces; A and B never reach each other.
+    let legs_up = wait_until(Duration::from_mins(2), || async {
+        ca.legs().contains(&c.key.key_id)
+            && cb.legs().contains(&c.key.key_id)
+            && cc.legs().len() >= 2
+    })
+    .await;
+    assert!(
+        legs_up,
+        "C's legs: A {:?}, B {:?}, C {:?}",
+        ca.legs(),
+        cb.legs(),
+        cc.legs()
+    );
+    assert!(!ca.legs().contains(&b.key.key_id), "A has no leg to B");
+    assert!(!cb.legs().contains(&a.key.key_id), "B has no leg to A");
+
+    // The mesh carries them: each takes C as the other's parent.
+    let relayed = wait_until(Duration::from_mins(1), || async {
+        primary_for(&ca, cb.stream()).as_deref() == Some(c.key.key_id.as_str())
+            && primary_for(&cb, ca.stream()).as_deref() == Some(c.key.key_id.as_str())
+    })
+    .await;
+    assert!(
+        relayed,
+        "A's parents {:?}; B's parents {:?}; C's log {:?}",
+        ca.alm_parents(),
+        cb.alm_parents(),
+        cc.alm_log()
+    );
+
+    // Media both ways, through C, while T is watched.
+    let t_before = t_bytes(&p.t);
+    let n = 60u64;
+    let mut sent_bytes = 0u64;
+    for seq in 0..n {
+        for (call, who) in [(&mut ca, "a"), (&mut cb, "b")] {
+            let mut frame = body(who, seq);
+            frame.resize(600, b'.');
+            sent_bytes += frame.len() as u64;
+            let _ = call.publish(Frame::opaque(frame)).await.expect("publish");
+        }
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let heard = |rx: &mut mpsc::Receiver<ReceivedFrame>, from: String| {
+        let rx = rx;
+        async move {
+            let mut got = std::collections::BTreeSet::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while got.len() < usize::try_from(n).unwrap() {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(f)) if f.publisher == from => {
+                        got.insert(f.bytes);
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+            got.len()
+        }
+    };
+    let at_a = heard(&mut a_frames, b.key.key_id.clone()).await;
+    let at_b = heard(&mut b_frames, a.key.key_id.clone()).await;
+    let t_after = t_bytes(&p.t);
+    assert_eq!(
+        (at_a, at_b),
+        (usize::try_from(n).unwrap(), usize::try_from(n).unwrap()),
+        "A hears all of B through C, and B all of A; C forwarded {:?}",
+        cc.relayed_to()
+    );
+
+    // C did the relaying, and says so.
+    let relayed_to = cc.relayed_to();
+    for x in [a, b] {
+        let r = relayed_to
+            .iter()
+            .find(|r| r.child == x.key.key_id)
+            .unwrap_or_else(|| panic!("C forwarded to {}: {relayed_to:?}", x.key.key_id));
+        assert!(r.chunks >= n && r.bytes > 0, "{r:?}");
+    }
+    let (relaying, relaying_for) = cc.relay_status();
+    assert!(relaying);
+    assert_eq!(relaying_for, 2, "C relays for two nodes");
+    let relay_out = c
+        .metrics
+        .wire_bytes
+        .snapshot()
+        .family(ciris_edge::wire_bytes::WireDir::Out);
+    let relay_plane: u64 = relay_out
+        .iter()
+        .filter(|(k, _)| k.ends_with(":relay"))
+        .map(|(_, v)| *v)
+        .sum();
+    assert!(
+        relay_plane > 0,
+        "C's forwarded media is in the relay plane: {relay_out:?}"
+    );
+
+    // No call leg crosses T, and T carried signalling only.
+    for call in [&ca, &cb, &cc] {
+        for leg in call.leg_info() {
+            assert_ne!(
+                leg.path,
+                ciris_edge::transport::av_call::LegPath::Relayed,
+                "a call leg rides a forwarder: {leg:?}"
+            );
+        }
+    }
+    let t_moved = t_after.saturating_sub(t_before);
+    assert!(
+        t_moved * 10 < sent_bytes,
+        "T carried {t_moved} B while the media moved {sent_bytes} B: media crossed T"
+    );
+
+    // The event says through whom; no failure stands for B.
+    let mut restored = None;
+    let mut failed = None;
+    while let Ok(e) = a_events.try_recv() {
+        match e {
+            CallEvent::MediaPathRestored {
+                member,
+                via,
+                through,
+            } if member == b.key.key_id => restored = Some((via, through)),
+            CallEvent::MediaPathFailed { member, .. } if member == b.key.key_id => {
+                failed = Some(member);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        restored,
+        Some((
+            ciris_edge::transport::media_path::PathKind::PeerRelay,
+            Some(c.key.key_id.clone())
+        )),
+        "A is told B is heard through C"
+    );
+    assert_eq!(
+        failed, None,
+        "no MediaPathFailed for a member a relay carries"
+    );
+}

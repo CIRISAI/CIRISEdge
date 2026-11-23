@@ -139,6 +139,20 @@ pub struct AlmParents {
     pub parent_changes: u64,
 }
 
+/// Calls cut — what a relay forwarded to one child node
+/// ([`super::Call::relayed_to`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelayedTo {
+    /// The child node.
+    pub child: String,
+    /// Bytes forwarded to it (each chunk's sealed size on the wire).
+    pub bytes: u64,
+    /// Chunks forwarded to it.
+    pub chunks: u64,
+    /// The streams forwarded to it.
+    pub streams: Vec<StreamId>,
+}
+
 /// What the ALM counted on a call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AlmCounts {
@@ -161,8 +175,12 @@ pub struct AlmCounts {
     /// Legs shed to the base layer under congestion (C5).
     pub legs_shed_to_base: u64,
     /// `OFFER`s claiming depth 0 from anyone but the stream's publisher, or
-    /// before its binding arrived, dropped.
+    /// before its binding arrived, or a serve seat's for a stream it does not
+    /// publish, dropped.
     pub offers_refused: u64,
+    /// Calls cut — bytes this node forwarded as a media parent (each chunk's
+    /// sealed size), to every child.
+    pub relayed_bytes: u64,
 }
 
 /// The call's ALM controller state (see the module docs).
@@ -227,7 +245,42 @@ pub(super) struct AlmState {
     /// every SUBSCRIBE it sends a parent that takes one.
     wanted_layers: BTreeMap<StreamId, crate::transport::realtime_av::ReceiverLayerPolicy>,
     pub(super) events: Vec<super::CallEvent>,
+    /// Calls cut — this node is a serve seat (a canonical): it never relays
+    /// call media, audio included, whatever the host asked
+    /// ([`CANONICAL_AV_FALLBACK`] off).
+    serve_seat: bool,
+    /// Calls cut — the serve seats this node knows of: their OFFERs for a
+    /// stream they do not publish are dropped (or, with the lever on, put on
+    /// the canonical tier).
+    seats: BTreeSet<String>,
+    /// Calls cut — streams a serve seat offered and this node refused: the
+    /// media-path event's `refused_by_policy` when no member offered.
+    seat_offered: BTreeSet<StreamId>,
+    /// Calls cut — the last `RelayStatus` emitted, and the one seen last tick
+    /// (a value is emitted only after it holds for one tick).
+    relay_status: Option<(bool, u16)>,
+    relay_status_pending: Option<(bool, u16)>,
+    /// Calls cut — primary-parent changes since the call last read them:
+    /// `(stream, new primary)`, for the media-path event.
+    pub(super) parent_moves: Vec<(StreamId, Option<String>)>,
+    /// Calls cut — per child node: bytes, chunks and streams forwarded.
+    relayed: BTreeMap<String, (u64, u64, BTreeSet<StreamId>)>,
 }
+
+/// **The canonical audio fallback lever** (`FSD/CIRIS_MESH.md` §6.4; Eric
+/// 2026-11-21: no traffic on the canonical, audio included, while the mesh
+/// scales). Off: a serve seat never relays call media, and a receiver drops a
+/// serve seat's `OFFER` for a stream the seat does not publish. On: the seat
+/// may relay and receivers place it on the canonical tier (never video, an
+/// audio standby only, [`ParentSelector::set_tier`]). Off for 45.x.
+pub const CANONICAL_AV_FALLBACK: bool = false;
+
+/// The `ShedReason` a relay that turned off sends its children. An older
+/// peer refuses an unknown shed code as malformed and would then wait out
+/// the silence, so the wire carries `UpstreamLost` (the child fails over at
+/// once) and the precise reason is the local label
+/// [`crate::observability::ALM_RELAY_OFF_SHED`].
+const RELAY_OFF_WIRE_REASON: ShedReason = ShedReason::UpstreamLost;
 
 impl AlmState {
     /// A fresh state for `me` publishing `own_stream` in a room of `members`.
@@ -285,7 +338,188 @@ impl AlmState {
             layer_caps: BTreeMap::new(),
             wanted_layers: BTreeMap::new(),
             events: Vec::new(),
+            serve_seat: false,
+            seats: BTreeSet::new(),
+            seat_offered: BTreeSet::new(),
+            relay_status: None,
+            relay_status_pending: None,
+            parent_moves: Vec::new(),
+            relayed: BTreeMap::new(),
         }
+    }
+
+    /// Calls cut — one chunk of `stream` forwarded to `child`.
+    pub(super) fn note_relayed(&mut self, child: &str, stream: StreamId, wire_bytes: u64) {
+        self.counts.relayed_bytes = self.counts.relayed_bytes.saturating_add(wire_bytes);
+        let e = self.relayed.entry(child.to_owned()).or_default();
+        e.0 = e.0.saturating_add(wire_bytes);
+        e.1 = e.1.saturating_add(1);
+        e.2.insert(stream);
+    }
+
+    /// Calls cut — what this node forwarded, per child node.
+    pub(super) fn relayed_to(&self) -> Vec<RelayedTo> {
+        self.relayed
+            .iter()
+            .map(|(child, (bytes, chunks, streams))| RelayedTo {
+                child: child.clone(),
+                bytes: *bytes,
+                chunks: *chunks,
+                streams: streams.iter().copied().collect(),
+            })
+            .collect()
+    }
+
+    /// Calls cut — this node is a serve seat: with [`CANONICAL_AV_FALLBACK`]
+    /// off it never relays, so relaying turns off at once (its children
+    /// fail over make-before-break) and stays off.
+    pub(super) fn set_serve_seat(&mut self, seat: bool) -> Vec<Outgoing> {
+        self.serve_seat = seat && !CANONICAL_AV_FALLBACK;
+        if self.serve_seat {
+            self.set_relay(false)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Calls cut — the serve seats this node knows of (the canonical set).
+    pub(super) fn set_seats(&mut self, seats: impl IntoIterator<Item = String>) {
+        self.seats = seats.into_iter().collect();
+        if CANONICAL_AV_FALLBACK {
+            let seats: Vec<String> = self.seats.iter().cloned().collect();
+            for sel in self.sels.values_mut() {
+                for p in &seats {
+                    sel.set_tier(
+                        p,
+                        crate::transport::realtime_av_alm::controller::Tier::Canonical,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether this node offers relay now.
+    pub(super) fn relay_capable(&self) -> bool {
+        self.relay_capable
+    }
+
+    /// Calls cut — `Call::set_relay`: start or stop relaying, live.
+    ///
+    /// Off: every relay admission closes (its offer reads no room), every
+    /// child is shed make-before-break (the commitment leaves the ledger now,
+    /// but this node keeps forwarding to it until it unsubscribes or the
+    /// drain passes, so its standby or another relay takes over first), each
+    /// is told with a SHED ([`RELAY_OFF_WIRE_REASON`] on the wire, booked
+    /// `relay_shed:relay_off`), offers stop, and an emptied relay is dropped
+    /// on a later tick. On: admission reopens at the service tier and every
+    /// received stream gets a relay admission on the next tick. A serve seat
+    /// stays off. Returns the SHED frames to send.
+    pub(super) fn set_relay(&mut self, on: bool) -> Vec<Outgoing> {
+        let on = on && !self.serve_seat;
+        if on == self.relay_capable {
+            return Vec::new();
+        }
+        self.relay_capable = on;
+        for sel in self.sels.values_mut() {
+            sel.set_forward_capable(on);
+        }
+        let mut out = Vec::new();
+        if on {
+            let closed = !self.tier.admits_new_relay_work();
+            for a in self.relays.values_mut() {
+                a.set_admit_closed(closed);
+            }
+        } else {
+            let now = self.now_ms();
+            let mut shed = Vec::new();
+            for (stream, a) in &mut self.relays {
+                a.set_admit_closed(true);
+                for p in a.shed_all_draining(now, RELAY_OFF_WIRE_REASON, &mut self.log) {
+                    shed.push((*stream, p));
+                }
+            }
+            for (stream, p) in shed {
+                self.counts.shed += 1;
+                self.label(crate::observability::ALM_SHED);
+                self.label(crate::observability::ALM_RELAY_OFF_SHED);
+                out.push(Outgoing {
+                    to: p,
+                    frame: encode(
+                        stream,
+                        &ControlMsg::Shed {
+                            reason: RELAY_OFF_WIRE_REASON,
+                        },
+                    ),
+                });
+            }
+        }
+        let status = (self.relay_capable, self.relaying_for());
+        self.relay_status = Some(status);
+        self.relay_status_pending = None;
+        self.events.push(super::CallEvent::RelayStatus {
+            relaying: status.0,
+            relaying_for: status.1,
+        });
+        out
+    }
+
+    /// Calls cut — how many distinct child NODES this node forwards others'
+    /// streams to now (admitted, or draining after a make-before-break shed).
+    /// Its own stream's children are not counted: that is publishing, not
+    /// relaying. Nodes, not people: the host maps a node to its owner.
+    pub(super) fn relaying_for(&self) -> u16 {
+        let kids: BTreeSet<String> = self
+            .relays
+            .values()
+            .flat_map(|a| a.forwarding_to().into_iter().map(|(p, _)| p))
+            .collect();
+        u16::try_from(kids.len()).unwrap_or(u16::MAX)
+    }
+
+    /// Calls cut — streams a serve seat offered here and was refused, and no
+    /// member offered (the media-path event's `refused_by_policy`).
+    pub(super) fn only_a_seat_offered(&self, stream: StreamId) -> bool {
+        self.seat_offered.contains(&stream)
+            && self.sels.get(&stream).is_none_or(|s| {
+                s.candidates()
+                    .iter()
+                    .all(|(p, _, _)| self.seats.contains(p))
+            })
+    }
+
+    /// Calls cut — whether any member other than the publisher offers
+    /// `stream` here now (a relay could carry it).
+    pub(super) fn member_offers(&self, stream: StreamId) -> bool {
+        let publisher = self.publisher_of.get(&stream);
+        self.sels.get(&stream).is_some_and(|s| {
+            s.candidates().iter().any(|(p, st, _)| {
+                Some(p) != publisher
+                    && !self.seats.contains(p)
+                    && !matches!(
+                        st,
+                        crate::transport::realtime_av_alm::controller::PeerState::Down
+                    )
+            })
+        })
+    }
+
+    /// The streams this node receives, with the publisher each names.
+    pub(super) fn streams_of(&self, publisher: &str) -> Vec<StreamId> {
+        self.publisher_of
+            .iter()
+            .filter(|(_, p)| p.as_str() == publisher)
+            .map(|(s, _)| *s)
+            .collect()
+    }
+
+    /// The primary parent this node chose for `stream`, if any.
+    pub(super) fn primary_of(&self, stream: StreamId) -> Option<String> {
+        self.sels.get(&stream).and_then(|s| s.primary().cloned())
+    }
+
+    /// The publisher `stream` names.
+    pub(super) fn publisher_of(&self, stream: StreamId) -> Option<&str> {
+        self.publisher_of.get(&stream).map(String::as_str)
     }
 
     /// The call's monotonic clock (ms).
@@ -429,6 +663,7 @@ impl AlmState {
         }
         self.caps.retain(|p, _| members.contains(p));
         self.provisional.retain(|(_, p), _| members.contains(p));
+        self.relayed.retain(|p, _| members.contains(p));
     }
 
     /// The service tier (§7.2): Admit-close on relays at ≥ 1, A-shed (LIFO,
@@ -567,9 +802,20 @@ impl AlmState {
             self.relay_capable,
             self.members.clone(),
         );
+        let seats: Vec<String> = if CANONICAL_AV_FALLBACK {
+            self.seats.iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
         self.sels.entry(stream).or_insert_with(|| {
             let mut s = ParentSelector::new(me, cfg, fc);
             s.set_members(members);
+            for p in &seats {
+                s.set_tier(
+                    p,
+                    crate::transport::realtime_av_alm::controller::Tier::Canonical,
+                );
+            }
             s
         })
     }
@@ -969,7 +1215,19 @@ impl AlmState {
                 if !self.is_own(stream) {
                     self.ensure_relay(stream);
                 }
-                let (decision, preempted) = if self.is_own(stream) {
+                let (decision, preempted) = if self.serve_seat && !self.is_own(stream) {
+                    // Calls cut — a serve seat never relays call media. The
+                    // wire carries `ClassRefused` (a code every C3 peer
+                    // reads); the local token names the rule.
+                    self.label(crate::observability::ALM_REFUSE_SERVE_SEAT);
+                    (
+                        AdmitDecision::Refuse {
+                            reason: RefuseReason::ClassRefused,
+                            retry_after_ms: self.cfg.backoff_base_ms * 4,
+                        },
+                        Vec::new(),
+                    )
+                } else if self.is_own(stream) {
                     self.provisional.remove(&(stream, peer.to_owned()));
                     let ext = self.external_except(stream);
                     let (mut rng, mut log) = (self.rng.clone(), std::mem::take(&mut self.log));
@@ -1074,6 +1332,18 @@ impl AlmState {
             }
             ControlMsg::Offer(o) => {
                 if self.is_own(stream) || !self.members.iter().any(|m| m == peer) {
+                    return out;
+                }
+                // Calls cut — a serve seat's OFFER for a stream it does not
+                // publish: dropped while the canonical fallback is off.
+                if !CANONICAL_AV_FALLBACK
+                    && self.seats.contains(peer)
+                    && self.bound_publisher.get(&stream).is_none_or(|p| p != peer)
+                {
+                    self.counts.offers_refused += 1;
+                    self.seat_offered.insert(stream);
+                    self.label(crate::observability::ALM_OFFER_REFUSED);
+                    self.label(crate::observability::ALM_OFFER_REFUSED_SERVE_SEAT);
                     return out;
                 }
                 if o.depth == 0 {
@@ -1346,6 +1616,7 @@ impl AlmState {
                     self.label(crate::observability::ALM_PARENT_CHANGE);
                 }
                 self.last_primary.insert(s, primary.clone());
+                self.parent_moves.push((s, primary.clone()));
             }
             // The publisher keeps sending a C3 member that has not chosen
             // (the join gap): tell it once this node chose another parent.
@@ -1416,7 +1687,7 @@ impl AlmState {
             let relay_offers: Vec<(StreamId, Vec<String>, Vec<u8>)> = self
                 .relays
                 .iter()
-                .filter(|(_, a)| a.forwarding())
+                .filter(|(_, a)| self.relay_capable && a.forwarding())
                 .map(|(s, a)| {
                     let mut o = a.offer();
                     let rate = self.rates.get(s).cloned().unwrap_or_default();
@@ -1452,6 +1723,32 @@ impl AlmState {
                     }
                 }
             }
+        }
+
+        // Calls cut — a relay turned off keeps forwarding to its draining
+        // children until each unsubscribes or its drain passes; then the
+        // emptied admission goes.
+        if !self.relay_capable {
+            for a in self.relays.values_mut() {
+                a.expire_drains(now);
+            }
+            self.relays.retain(|_, a| !a.forwarding_to().is_empty());
+        }
+
+        // Calls cut — `RelayStatus`, on change, once a value has held for a
+        // tick (a make-before-break hand-off does not fire twice).
+        let status = (self.relay_capable, self.relaying_for());
+        if self.relay_status == Some(status) {
+            self.relay_status_pending = None;
+        } else if self.relay_status_pending == Some(status) {
+            self.relay_status = Some(status);
+            self.relay_status_pending = None;
+            self.events.push(super::CallEvent::RelayStatus {
+                relaying: status.0,
+                relaying_for: status.1,
+            });
+        } else {
+            self.relay_status_pending = Some(status);
         }
         out
     }
@@ -1778,6 +2075,223 @@ mod tests {
             }))
         )));
         assert!(a.relays[&s(7)].admit_closed());
+    }
+
+    /// A relay with two children (B primary, C standby) on stream 7.
+    fn relaying_a() -> AlmState {
+        let mut a = AlmState::new("a", s(1), &roster(), true, 1);
+        let mut adm = Admission::relay("a".to_owned(), ControllerConfig::interactive(), None);
+        adm.set_members(roster());
+        adm.set_upstream(Some(1), vec!["x".into()], true, 10);
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        for (p, role) in [("b", Role::Primary), ("c", Role::Standby)] {
+            let _ = adm.request(
+                0,
+                &SubscribeRequest {
+                    subscriber: p.into(),
+                    role,
+                    forward_capable: false,
+                    layers: None,
+                },
+                &mut rng,
+                &mut log,
+            );
+        }
+        a.relays.insert(s(7), adm);
+        a
+    }
+
+    fn sheds(out: &[Outgoing]) -> Vec<(String, ShedReason)> {
+        out.iter()
+            .filter_map(|o| match decode(&o.frame, "a") {
+                Ok(WireFrame::Control(ControlFrame {
+                    msg: ControlMsg::Shed { reason },
+                    ..
+                })) => Some((o.to.clone(), reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Calls cut — `set_relay(false)` mid-call: every child is shed
+    /// make-before-break (told with a code every C3 peer decodes, booked
+    /// `relay_shed:relay_off`), forwarding continues to the draining children,
+    /// offers stop, `RelayStatus` fires at once, and the emptied relay goes
+    /// once the drains pass. `set_relay(true)` reopens.
+    #[test]
+    fn a_relay_turned_off_hands_its_children_off_and_stops_offering() {
+        let mut a = relaying_a();
+        assert_eq!(a.relaying_for(), 2);
+        let out = a.set_relay(false);
+        let mut shed = sheds(&out);
+        shed.sort();
+        assert_eq!(
+            shed,
+            vec![
+                ("b".to_owned(), ShedReason::UpstreamLost),
+                ("c".to_owned(), ShedReason::UpstreamLost)
+            ],
+            "every child told, on a code an older peer decodes"
+        );
+        assert!(a.labels.contains(&crate::observability::ALM_RELAY_OFF_SHED));
+        assert_eq!(a.caps_bits() & CAP_RELAY, 0, "CAPS no longer names relay");
+        assert!(matches!(
+            a.events.last(),
+            Some(super::super::CallEvent::RelayStatus {
+                relaying: false,
+                relaying_for: 2
+            })
+        ));
+        // Make-before-break: still forwarding to both while they drain.
+        let mut kids = a.relay_children(s(7));
+        kids.sort();
+        assert_eq!(kids.len(), 2, "{kids:?}");
+        // No relay offer goes out while off.
+        let out = a.tick(&["b".to_owned(), "c".to_owned()]);
+        assert!(
+            !out.iter().any(|o| matches!(
+                decode(&o.frame, "a"),
+                Ok(WireFrame::Control(ControlFrame { stream, msg: ControlMsg::Offer(_) })) if stream == s(7)
+            )),
+            "no offer of the relayed stream"
+        );
+        // The drains pass: the relay goes, and the status settles to 0.
+        a.t0 = Instant::now()
+            .checked_sub(Duration::from_millis(a.cfg.down_silence_ms + 1_000))
+            .expect("past the drain");
+        let _ = a.tick(&[]);
+        let _ = a.tick(&[]);
+        assert!(a.relays.is_empty(), "the emptied relay is dropped");
+        assert_eq!(a.relaying_for(), 0);
+        assert!(a.events.iter().any(|e| matches!(
+            e,
+            super::super::CallEvent::RelayStatus {
+                relaying: false,
+                relaying_for: 0
+            }
+        )));
+        // On again: CAPS says so and RelayStatus fires.
+        let out = a.set_relay(true);
+        assert!(out.is_empty());
+        assert_ne!(a.caps_bits() & CAP_RELAY, 0);
+        assert!(matches!(
+            a.events.last(),
+            Some(super::super::CallEvent::RelayStatus {
+                relaying: true,
+                relaying_for: 0
+            })
+        ));
+    }
+
+    /// Calls cut — `RelayStatus` fires on change, only after a value held
+    /// one tick, and never on a repeat.
+    #[test]
+    fn relay_status_fires_on_change_after_holding_a_tick() {
+        let mut a = relaying_a();
+        let count = |a: &AlmState| {
+            a.events
+                .iter()
+                .filter(|e| matches!(e, super::super::CallEvent::RelayStatus { .. }))
+                .count()
+        };
+        let _ = a.tick(&[]);
+        assert_eq!(count(&a), 0, "a first value waits a tick");
+        let _ = a.tick(&[]);
+        assert_eq!(count(&a), 1);
+        assert!(matches!(
+            a.events.last(),
+            Some(super::super::CallEvent::RelayStatus {
+                relaying: true,
+                relaying_for: 2
+            })
+        ));
+        let _ = a.tick(&[]);
+        let _ = a.tick(&[]);
+        assert_eq!(count(&a), 1, "no repeat");
+    }
+
+    /// Calls cut — a serve seat never relays call media, audio included:
+    /// turning seat on sheds what it relayed, it never offers relay again,
+    /// `set_relay(true)` cannot reopen it, and a relay SUBSCRIBE is refused
+    /// (`relay_class_refused` on the wire, `relay_serve_seat` here). Its own
+    /// stream is still served.
+    #[test]
+    fn a_serve_seat_never_relays() {
+        let mut a = relaying_a();
+        let out = a.set_serve_seat(true);
+        assert_eq!(sheds(&out).len(), 2, "what it relayed is handed off");
+        assert!(!a.relay_capable());
+        assert!(a.set_relay(true).is_empty());
+        assert!(!a.relay_capable(), "a seat stays off");
+        let sub = |stream| ControlFrame {
+            stream,
+            msg: ControlMsg::Subscribe(SubscribeRequest {
+                subscriber: "b".into(),
+                role: Role::Standby,
+                forward_capable: false,
+                layers: None,
+            }),
+        };
+        let out = a.on_control("b", sub(s(9)), 10.0);
+        assert!(matches!(
+            decode(&out[0].frame, "a"),
+            Ok(WireFrame::Control(ControlFrame {
+                msg: ControlMsg::Decision(AdmitDecision::Refuse {
+                    reason: RefuseReason::ClassRefused,
+                    ..
+                }),
+                ..
+            }))
+        ));
+        assert!(a
+            .labels
+            .contains(&crate::observability::ALM_REFUSE_SERVE_SEAT));
+        assert!(a.relays.get(&s(9)).is_none(), "no relay admission is made");
+        // Its own stream is publishing, not relaying.
+        a.on_caps("b", CAPS_THIS_BUILD);
+        let out = a.on_control("b", sub(s(1)), 10.0);
+        assert!(matches!(
+            decode(&out[0].frame, "a"),
+            Ok(WireFrame::Control(ControlFrame {
+                msg: ControlMsg::Decision(AdmitDecision::Admit { .. }),
+                ..
+            }))
+        ));
+    }
+
+    /// Calls cut — a receiver drops a serve seat's OFFER for a stream the seat
+    /// does not publish: it is never a candidate, and the stream reads
+    /// `only_a_seat_offered` (the media-path event's `refused_by_policy`).
+    #[test]
+    fn a_serve_seats_offer_is_dropped_by_its_receiver() {
+        let mut b = AlmState::new("b", s(2), &roster(), true, 2);
+        b.set_seats(["c".to_owned()]);
+        b.note_publisher(s(1), "a");
+        b.note_bound_publisher(s(1), "a");
+        let offer = ControlFrame {
+            stream: s(1),
+            msg: ControlMsg::Offer(crate::transport::realtime_av_alm::controller::Offer {
+                from: "c".to_owned(),
+                depth: 1,
+                ancestry: vec!["a".to_owned()],
+                headroom_bps: 1_000_000,
+                forwarder_headroom_bps: 1_000_000,
+                upstream_latency_ms: 10,
+                forwarding: true,
+            }),
+        };
+        let _ = b.on_control("c", offer, 10.0);
+        assert_eq!(b.counts.offers_refused, 1);
+        assert!(b
+            .labels
+            .contains(&crate::observability::ALM_OFFER_REFUSED_SERVE_SEAT));
+        assert!(!b.member_offers(s(1)));
+        assert!(b.only_a_seat_offered(s(1)));
+        assert!(b
+            .sels
+            .get(&s(1))
+            .is_none_or(|sel| sel.candidates().iter().all(|(p, _, _)| p != "c")));
     }
 
     // ── #945: three real controllers, C3 through the real encoder ────────

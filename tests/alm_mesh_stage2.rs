@@ -3081,3 +3081,140 @@ async fn a_member_claiming_depth_zero_is_not_the_publisher() {
         c.metrics.av_plane()
     );
 }
+
+/// **Calls cut — a relay turns off mid-call** (`Call::set_relay(false)`):
+/// members `A` and `E` both relay; `B` and `C` reach each other only through
+/// them (each a TCP client of A and E; `T` the canonical, no member). C hears
+/// B through one of them, X. X turns relaying off: it sheds C make-before-
+/// break, C re-parents to the other relay Y and keeps hearing B, the event
+/// at C names Y, and X reports `RelayStatus { relaying: false }` and, once
+/// its drain passes, forwards to nobody.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_relay_that_turns_off_hands_its_children_to_another_relay() {
+    let _call = one_call().await;
+    let tag = "alm2-setrelay";
+    // 0 = A, 1 = E (relays), 2 = B, 3 = C (the room's four); 4 = T.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+    )
+    .await;
+    let (a, e, b, c, t) = (&nodes[0], &nodes[1], &nodes[2], &nodes[3], &nodes[4]);
+    let ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let ce = join_loaded(e, &groups[1], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(b, &groups[2], tag, relay_opts(), None).await;
+    let mut cc = join_loaded(c, &groups[3], tag, relay_opts(), None).await;
+    let mut c_events = cc.events().expect("C's events");
+    wait_legs(&cb, 2).await;
+    wait_legs(&cc, 2).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!cc.legs().contains(&b.key.key_id), "C has no leg to B");
+
+    let relays = [a.key.key_id.clone(), e.key.key_id.clone()];
+    let on_a_relay =
+        || async { primary_for(&cc, cb.stream()).is_some_and(|p| relays.contains(&p)) };
+    assert!(
+        wait_until(Duration::from_secs(90), on_a_relay).await,
+        "C hears B through A or E: {:?}",
+        cc.alm_parents()
+    );
+    let x = primary_for(&cc, cb.stream()).expect("a parent");
+    let (cx, y) = if x == a.key.key_id {
+        (&ca, e.key.key_id.clone())
+    } else {
+        (&ce, a.key.key_id.clone())
+    };
+    assert_ne!(x, t.key.key_id);
+    let (relaying, kids) = cx.relay_status();
+    assert!(relaying && kids >= 1, "X relays: {:?}", cx.relay_status());
+
+    // X turns relaying off.
+    cx.set_relay(false).await;
+    assert!(!cx.relay_status().0);
+    let moved = wait_until(Duration::from_secs(30), || async {
+        primary_for(&cc, cb.stream()).as_deref() == Some(y.as_str())
+    })
+    .await;
+    assert!(
+        moved,
+        "C re-parents to the other relay: {:?}; X's log {:?}",
+        cc.alm_parents(),
+        cx.alm_log()
+    );
+    // C still hears B, now through Y.
+    let mut rx_c = cc.frames().expect("C's frames");
+    let mut heard = 0;
+    for seq in 0..40 {
+        cb.publish(Frame::opaque(body("b", seq)))
+            .await
+            .expect("B publishes");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(f)) = tokio::time::timeout_at(deadline, rx_c.recv()).await {
+        if f.publisher == b.key.key_id {
+            heard += 1;
+            if heard == 40 {
+                break;
+            }
+        }
+    }
+    assert!(heard >= 36, "C keeps hearing B through Y: {heard} of 40");
+    // X forwards to nobody once its drain passes, and said so.
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            cx.relay_status() == (false, 0)
+        })
+        .await,
+        "X's children are gone: {:?}",
+        cx.relay_status()
+    );
+    assert!(
+        av(
+            if x == a.key.key_id {
+                &a.metrics
+            } else {
+                &e.metrics
+            },
+            "relay_shed:relay_off"
+        ) >= 1
+    );
+    // C was told the path moved through Y.
+    let mut through = Vec::new();
+    while let Ok(ev) = c_events.try_recv() {
+        if let ciris_edge::transport::av_call::CallEvent::MediaPathRestored {
+            member,
+            via,
+            through: t,
+        } = ev
+        {
+            if member == b.key.key_id {
+                assert_eq!(via, ciris_edge::transport::media_path::PathKind::PeerRelay);
+                through.push(t);
+            }
+        }
+    }
+    assert_eq!(
+        through.last().cloned().flatten().as_deref(),
+        Some(y.as_str()),
+        "the last path event for B names Y: {through:?}"
+    );
+    drop(cc);
+    drop(cb);
+    drop(ce);
+    drop(ca);
+}

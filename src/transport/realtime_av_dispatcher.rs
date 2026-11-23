@@ -300,6 +300,14 @@ pub trait AvLinkSender: Send + Sync + 'static {
         self.send(bytes).await
     }
 
+    /// Calls cut — [`Self::send_media`] for a chunk this node forwards for
+    /// another member (an ALM relay hop): the same send, counted as relayed
+    /// where the sender keeps a wire ledger. The default is
+    /// [`Self::send_media`].
+    async fn send_media_relayed(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+        self.send_media(bytes).await
+    }
+
     /// The most one message on this link carries, when the transport knows
     /// it. Control frames that span several messages (a call's stream key
     /// binding) are sized to it. `None` by default.
@@ -755,7 +763,7 @@ impl AvDispatcher {
     /// per-link state, advances its `link_seq`, and sends.
     async fn fan_out(&mut self, inner: &InnerSealed) -> Result<(), AvDispatcherError> {
         let mut first_err: Option<AvDispatcherError> = None;
-        for (_, leg) in self.fan_out_report(inner, &[]).await? {
+        for (_, leg) in self.fan_out_report(inner, &[], false).await? {
             if let LegSend::Failed(e) = leg {
                 first_err.get_or_insert(e);
             }
@@ -772,7 +780,7 @@ impl AvDispatcher {
         &mut self,
         inner: &InnerSealed,
     ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
-        self.fan_out_report(inner, &[]).await
+        self.fan_out_report(inner, &[], false).await
     }
 
     /// CIRISEdge#805 item 5 — fan a chunk this node RELAYS out to every
@@ -786,7 +794,22 @@ impl AvDispatcher {
         inner: &InnerSealed,
         except: &[PeerKeyId],
     ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
-        self.fan_out_report(inner, except).await
+        self.fan_out_report(inner, except, false).await
+    }
+
+    /// Calls cut — [`Self::relay_inner_report`] for a chunk this node
+    /// FORWARDS for another member (its publisher is not this node): each
+    /// leg's send is [`AvLinkSender::send_media_relayed`], so the wire ledger
+    /// counts it in the `relay` plane.
+    ///
+    /// # Errors
+    /// As [`Self::publish_inner_report`].
+    pub async fn forward_inner_report(
+        &mut self,
+        inner: &InnerSealed,
+        except: &[PeerKeyId],
+    ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
+        self.fan_out_report(inner, except, true).await
     }
 
     /// CIRISEdge#805 — send control frames (not chunks) to every downstream
@@ -921,6 +944,7 @@ impl AvDispatcher {
         &mut self,
         inner: &InnerSealed,
         except: &[PeerKeyId],
+        forwarded: bool,
     ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
         // CIRISEdge#805 item 8 — EVERY subscriber is attempted. This
         // loop used to return on the first refusal, so one congested or closed
@@ -959,14 +983,21 @@ impl AvDispatcher {
                 state.settle_until = Some(state.settle_until.map_or(until, |u| u.max(until)));
             }
             state.last_media = Some(now);
-            let mut sent = state.sender.send_media(&wire).await;
+            let send = |sender: &dyn AvLinkSender, wire: &[u8]| {
+                if forwarded {
+                    sender.send_media_relayed(wire)
+                } else {
+                    sender.send_media(wire)
+                }
+            };
+            let mut sent = send(state.sender.as_ref(), &wire).await;
             while matches!(sent, Err(AvDispatcherError::Congested))
                 && state
                     .settle_until
                     .is_some_and(|until| std::time::Instant::now() < until)
             {
                 tokio::time::sleep(SETTLE_RETRY).await;
-                sent = state.sender.send_media(&wire).await;
+                sent = send(state.sender.as_ref(), &wire).await;
             }
             if state
                 .settle_until

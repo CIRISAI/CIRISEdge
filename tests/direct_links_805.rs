@@ -1573,8 +1573,12 @@ async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
             delivered.lock().unwrap().contains(&(seq - 1))
         })
         .await,
-        "B hears A over R: {:?}",
-        delivered.lock().unwrap()
+        "B hears A over R: {:?}; R booked congested {:?}; A {:?}; R {:?}; B {:?}",
+        delivered.lock().unwrap(),
+        admissions.congested_drops(),
+        q.a.metrics.av_plane(),
+        q.r.metrics.av_plane(),
+        q.b.metrics.av_plane()
     );
 
     // The direct leg: A's dial punches through R and reaches B directly.

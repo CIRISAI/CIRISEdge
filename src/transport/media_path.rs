@@ -6,8 +6,13 @@
 //!
 //! When a call cannot connect to a member, the person sees the real reason:
 //! this node's NAT, the peer's NAT (as the peer claims it), and what was tried.
-//! The canonical never relays call media, so there is no fallback, and the
-//! event says so ([`RelayStanding::RefusedByPolicy`], always, on the LTS).
+//! A member this node cannot reach directly is still heard when another
+//! member relays its stream (the ALM mesh: direct, then a member relay); the
+//! canonical never relays call media (Eric 2026-11-21, audio included). So
+//! `MediaPathFailed` fires only when there is neither a direct leg nor a
+//! member relay, and its [`RelayStanding`] says which of the two relay facts
+//! held; a member heard through a relay reads
+//! `MediaPathRestored { via: peer_relay, through }`.
 //!
 //! # Edge decides the cause once
 //!
@@ -106,6 +111,11 @@ token_enum! {
         /// This node does not trust the peer enough to reveal its public
         /// address or escalate toward it.
         NotTrusted => "not_trusted",
+        /// No direct path, and no other member of the call offered to relay
+        /// the member's stream (none relays, none reaches it, or only a serve
+        /// seat offered, which never relays). The detail still names why the
+        /// direct path failed.
+        NoMemberCouldRelay => "no_member_could_relay",
         /// None of the above (a transient refusal, a path lost on the way, the
         /// operator's switch).
         Other => "other",
@@ -188,6 +198,9 @@ token_enum! {
         Birthday => "birthday",
         /// A mapping the router holds on request (PCP, NAT-PMP, UPnP).
         MappedPort => "mapped_port",
+        /// Another member of the call relays the member's stream to this
+        /// node (the ALM mesh); `through` names it.
+        PeerRelay => "peer_relay",
     }
 }
 
@@ -326,11 +339,13 @@ token_enum! {
 token_enum! {
     /// Whether a relay could carry the call's media instead.
     pub enum RelayStanding {
-        /// The canonical never relays call media: refused by policy. Always
-        /// this on the LTS.
-        RefusedByPolicy => "refused_by_policy",
-        /// Relaying is allowed, and no relay was available.
+        /// Another member relays the member's stream here.
+        PeerRelayInUse => "peer_relay_in_use",
+        /// No member offered to relay it.
         NoneAvailable => "none_available",
+        /// Only a serve seat offered, and a serve seat never relays call
+        /// media (audio included): refused by policy.
+        RefusedByPolicy => "refused_by_policy",
     }
 }
 
@@ -988,20 +1003,64 @@ pub fn path_attempts(facts: &DirectPathFacts) -> Vec<PathAttempt> {
     out
 }
 
-/// The relay standing on the LTS: the canonical never relays call media.
-pub const LTS_RELAY_STANDING: RelayStanding = RelayStanding::RefusedByPolicy;
+/// What the call's ALM mesh says about relaying a member's stream to this
+/// node, when its direct path failed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelayFacts {
+    /// The call has a member besides this node and the member: someone who
+    /// could relay.
+    pub others_in_call: bool,
+    /// A member other than the publisher relays its stream here now (this
+    /// node's primary parent for it is that member).
+    pub member_relay: bool,
+    /// A serve seat offered the stream and was refused, and no member did.
+    pub seat_only: bool,
+}
+
+/// **THE relay standing**, from `relay`. Pure.
+#[must_use]
+pub const fn relay_standing(relay: &RelayFacts) -> RelayStanding {
+    if relay.member_relay {
+        RelayStanding::PeerRelayInUse
+    } else if relay.seat_only {
+        RelayStanding::RefusedByPolicy
+    } else {
+        RelayStanding::NoneAvailable
+    }
+}
+
+/// **THE verdict on a call's media path** to a member: the direct path's
+/// verdict ([`media_path_verdict`]) when nobody else is in the call to relay,
+/// else `no_member_could_relay` (retryable: a member that starts relaying, or
+/// joins, carries it; `retry_after_s` the direct path's backoff), keeping the
+/// direct path's detail so the branch that failed is still named. Pure.
+/// Callers ask only when there is no direct leg and the standing is not
+/// [`RelayStanding::PeerRelayInUse`].
+#[must_use]
+pub fn call_path_verdict(facts: &DirectPathFacts, relay: &RelayFacts) -> MediaPathVerdict {
+    let direct = media_path_verdict(facts);
+    if !relay.others_in_call || relay.member_relay {
+        return direct;
+    }
+    MediaPathVerdict {
+        cause: MediaPathCause::NoMemberCouldRelay,
+        retryable: true,
+        retry_after_s: facts.backoff_remaining.map(whole_secs),
+        detail: direct.detail,
+    }
+}
 
 /// Everything a `MediaPathFailed` carries but its member, from `facts`, as of
 /// `now` (the instant an unmeasured local report reads).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaPathFailure {
-    /// [`media_path_verdict`]'s cause.
+    /// [`call_path_verdict`]'s cause.
     pub cause: MediaPathCause,
-    /// [`media_path_verdict`]'s.
+    /// [`call_path_verdict`]'s.
     pub retryable: bool,
-    /// [`media_path_verdict`]'s.
+    /// [`call_path_verdict`]'s.
     pub retry_after_s: Option<u32>,
-    /// [`media_path_verdict`]'s.
+    /// [`call_path_verdict`]'s.
     pub detail: Option<PathDetail>,
     /// [`path_attempts`].
     pub tried: Vec<PathAttempt>,
@@ -1009,15 +1068,15 @@ pub struct MediaPathFailure {
     pub local_nat: NatReport,
     /// The peer's claim, if it made one.
     pub peer_nat: Option<PeerNatReport>,
-    /// [`LTS_RELAY_STANDING`].
+    /// [`relay_standing`].
     pub relay: RelayStanding,
 }
 
 impl MediaPathFailure {
     /// Derive it.
     #[must_use]
-    pub fn from_facts(facts: &DirectPathFacts, now: DateTime<Utc>) -> Self {
-        let v = media_path_verdict(facts);
+    pub fn from_facts(facts: &DirectPathFacts, relay: &RelayFacts, now: DateTime<Utc>) -> Self {
+        let v = call_path_verdict(facts, relay);
         Self {
             cause: v.cause,
             retryable: v.retryable,
@@ -1029,7 +1088,7 @@ impl MediaPathFailure {
                 .clone()
                 .unwrap_or_else(|| NatReport::unknown(now)),
             peer_nat: facts.peer_nat.clone(),
-            relay: LTS_RELAY_STANDING,
+            relay: relay_standing(relay),
         }
     }
 }
@@ -1647,8 +1706,9 @@ mod tests {
             RelayStanding::token,
             RelayStanding::parse,
         );
-        assert_eq!(MediaPathCause::ALL.len(), 10);
-        assert_eq!(PathKind::ALL.len(), 6);
+        assert_eq!(MediaPathCause::ALL.len(), 11);
+        assert_eq!(PathKind::ALL.len(), 7);
+        assert_eq!(RelayStanding::ALL.len(), 3);
         assert_eq!(PathOutcome::ALL.len(), 8);
     }
 
@@ -1677,17 +1737,127 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_from_unmeasured_facts_is_unknown_and_refused_by_policy() {
+    fn a_two_person_failure_from_unmeasured_facts_is_unknown_with_no_relay() {
         let f = MediaPathFailure::from_facts(
             &DirectPathFacts::bare(DirectAttempt::Failed(AttemptFailure::PunchFailed)),
+            &RelayFacts::default(),
             at(),
         );
         assert_eq!(f.cause, MediaPathCause::PunchNoAnswer);
         assert!(f.retryable);
         assert_eq!(f.retry_after_s, None);
         assert_eq!(f.detail, Some(PathDetail::PunchSilent));
-        assert_eq!(f.relay, RelayStanding::RefusedByPolicy);
+        assert_eq!(f.relay, RelayStanding::NoneAvailable);
         assert_eq!(f.local_nat, NatReport::unknown(at()));
         assert_eq!(f.peer_nat, None);
+    }
+
+    /// The relay half of the verdict, row by row: who else is in the call,
+    /// whether a member relays, whether only a serve seat offered.
+    #[test]
+    fn the_relay_verdict_table() {
+        let punch = DirectPathFacts {
+            backoff_remaining: Some(Duration::from_millis(2_500)),
+            ..DirectPathFacts::bare(DirectAttempt::Failed(AttemptFailure::PunchFailed))
+        };
+        let refused = DirectPathFacts::bare(DirectAttempt::Failed(AttemptFailure::Rejected(
+            reject::POLICY,
+        )));
+        let f = |others, member_relay, seat_only| RelayFacts {
+            others_in_call: others,
+            member_relay,
+            seat_only,
+        };
+        // (facts, relay) -> (cause, retryable, retry_after_s, detail, standing)
+        let rows: [(
+            &DirectPathFacts,
+            RelayFacts,
+            MediaPathCause,
+            bool,
+            Option<u32>,
+            PathDetail,
+            RelayStanding,
+        ); 7] = [
+            // Two people: the direct verdict stands; nobody could relay.
+            (
+                &punch,
+                f(false, false, false),
+                MediaPathCause::PunchNoAnswer,
+                true,
+                Some(3),
+                PathDetail::PunchSilent,
+                RelayStanding::NoneAvailable,
+            ),
+            (
+                &refused,
+                f(false, false, false),
+                MediaPathCause::RefusedByPeerPolicy,
+                false,
+                None,
+                PathDetail::PeerRejectPolicy,
+                RelayStanding::NoneAvailable,
+            ),
+            // Others in the call, none relays: no member could relay; the
+            // direct branch is still named, and a retry can help.
+            (
+                &punch,
+                f(true, false, false),
+                MediaPathCause::NoMemberCouldRelay,
+                true,
+                Some(3),
+                PathDetail::PunchSilent,
+                RelayStanding::NoneAvailable,
+            ),
+            (
+                &refused,
+                f(true, false, false),
+                MediaPathCause::NoMemberCouldRelay,
+                true,
+                None,
+                PathDetail::PeerRejectPolicy,
+                RelayStanding::NoneAvailable,
+            ),
+            // Only a serve seat offered: refused by policy.
+            (
+                &punch,
+                f(true, false, true),
+                MediaPathCause::NoMemberCouldRelay,
+                true,
+                Some(3),
+                PathDetail::PunchSilent,
+                RelayStanding::RefusedByPolicy,
+            ),
+            // A member relays: no failure is raised (the caller never asks),
+            // and if it did the direct verdict and `peer_relay_in_use` read.
+            (
+                &punch,
+                f(true, true, false),
+                MediaPathCause::PunchNoAnswer,
+                true,
+                Some(3),
+                PathDetail::PunchSilent,
+                RelayStanding::PeerRelayInUse,
+            ),
+            (
+                &punch,
+                f(true, true, true),
+                MediaPathCause::PunchNoAnswer,
+                true,
+                Some(3),
+                PathDetail::PunchSilent,
+                RelayStanding::PeerRelayInUse,
+            ),
+        ];
+        for (facts, relay, cause, retryable, after, detail, standing) in rows {
+            let v = call_path_verdict(facts, &relay);
+            assert_eq!(v.cause, cause, "{relay:?}");
+            assert_eq!(v.retryable, retryable, "{relay:?}");
+            assert_eq!(v.retry_after_s, after, "{relay:?}");
+            assert_eq!(v.detail, Some(detail), "{relay:?}");
+            assert_eq!(relay_standing(&relay), standing, "{relay:?}");
+            let failure = MediaPathFailure::from_facts(facts, &relay, at());
+            assert_eq!(failure.cause, cause);
+            assert_eq!(failure.relay, standing);
+        }
     }
 }
