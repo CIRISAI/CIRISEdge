@@ -46,7 +46,7 @@ use ciris_edge::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
 use ciris_edge::telemetry::call_legs::{CALL_BITRATE, CALL_PATH};
 use ciris_edge::transport::av_call::{
-    Call, CallDeps, CallError, CallOptions, Frame, ReceivedFrame, RoomRoster,
+    Call, CallDeps, CallError, CallEvent, CallOptions, Frame, ReceivedFrame, RoomRoster,
 };
 use ciris_edge::transport::av_chunk_auth::StreamKeyVerifier;
 use ciris_edge::transport::av_keep::{StreamDekRegistrar, UnwiredRegistrar};
@@ -1045,6 +1045,199 @@ async fn a_room_call_behind_t_without_a_facilitator_has_no_leg() {
         call_a.publish(Frame::opaque(body("A", 0))).await,
         Err(CallError::NoBudget)
     ));
+}
+
+/// Every call event `call` fires, collected as they come (the events channel
+/// is bounded, so it is drained from the start).
+fn collect_events(call: &mut Call) -> Arc<std::sync::Mutex<Vec<CallEvent>>> {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut rx = call.events().expect("the call's events");
+    let into = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Some(e) = rx.recv().await {
+            into.lock().expect("events").push(e);
+        }
+    });
+    seen
+}
+
+fn path_events(seen: &std::sync::Mutex<Vec<CallEvent>>) -> Vec<CallEvent> {
+    seen.lock()
+        .expect("events")
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                CallEvent::MediaPathFailed { .. } | CallEvent::MediaPathRestored { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// **v45.1 — a failed media path says why, once, and is answered when the
+/// path comes up.** `A` has `T`'s facilitator; `B` has none, and refuses
+/// every direct-link request (the test seam: REJECT `POLICY`). So:
+///
+/// - `A`'s leg to `B` proposes, `B` refuses, the dial across `T` cannot
+///   stand: `A` fires exactly one `MediaPathFailed { member: B, cause:
+///   refused_by_peer_policy, retryable: false, detail: peer_reject_policy,
+///   relay: refused_by_policy }`, its `tried` the reflexive
+///   punch refused, its NAT `unknown` (this leviculum pin measures nothing)
+///   and no peer report (no carrier on this pin).
+/// - `B`'s leg to `A` cannot propose at all: one `MediaPathFailed { member:
+///   A, cause: no_facilitator }`.
+/// - `A` dials `B` again through its backoff, and fires nothing more.
+/// - `B` then allows the path: `A`'s next proposal (on a fresh identity link,
+///   past leviculum's per-link cooldown) brings it direct, the legs come up,
+///   and each side fires one `MediaPathRestored` over `direct_reflexive`.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_failed_media_path_says_why_once_and_is_restored() {
+    use ciris_edge::transport::media_path::{
+        MediaPathCause, NatEvidence, NatMapping, PathDetail, PathKind, PathOutcome, RelayStanding,
+    };
+    let mut p = pair("mpf", true).await;
+    let (a_id, b_id) = (p.a.key.key_id.clone(), p.b.key.key_id.clone());
+    p.b.transport.set_refuse_direct_for_test(true);
+    let mut call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A joins");
+    let mut call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B joins");
+    let seen_a = collect_events(&mut call_a);
+    let seen_b = collect_events(&mut call_b);
+
+    // A's proposal is refused, on the identity link it rode.
+    let refused_link = loop {
+        let e = tokio::time::timeout(Duration::from_secs(60), p.a.events.recv())
+            .await
+            .expect("A's proposal ends")
+            .expect("direct-path events");
+        if let DirectPathEvent::Failed {
+            link_id,
+            reason,
+            proposed: true,
+            ..
+        } = e
+        {
+            assert_eq!(reason, "direct_link_failed_rejected");
+            break link_id;
+        }
+    };
+    let failed = |seen: &std::sync::Mutex<Vec<CallEvent>>| {
+        path_events(seen)
+            .into_iter()
+            .filter(|e| matches!(e, CallEvent::MediaPathFailed { .. }))
+            .count()
+    };
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            failed(&seen_a) >= 1 && failed(&seen_b) >= 1
+        })
+        .await,
+        "each side says why: A {:?}, B {:?}",
+        path_events(&seen_a),
+        path_events(&seen_b)
+    );
+    match &path_events(&seen_a)[..] {
+        [CallEvent::MediaPathFailed {
+            member,
+            cause,
+            retryable,
+            retry_after_s,
+            detail,
+            tried,
+            local_nat,
+            peer_nat,
+            relay,
+        }] => {
+            assert_eq!(member, &b_id);
+            assert_eq!(*cause, MediaPathCause::RefusedByPeerPolicy);
+            assert!(!retryable);
+            assert_eq!(*retry_after_s, None);
+            assert_eq!(*detail, Some(PathDetail::PeerRejectPolicy));
+            assert_eq!(*relay, RelayStanding::RefusedByPolicy);
+            assert_eq!(tried.len(), 1, "{tried:?}");
+            assert_eq!(tried[0].kind, PathKind::DirectReflexive);
+            assert_eq!(tried[0].outcome, PathOutcome::RefusedByPeer);
+            assert!(tried[0].attempts >= 1);
+            assert_eq!(local_nat.mapping, NatMapping::Unknown);
+            assert_eq!(local_nat.evidence, NatEvidence::None);
+            assert_eq!(peer_nat, &None);
+        }
+        other => panic!("A: one MediaPathFailed for B: {other:?}"),
+    }
+    match &path_events(&seen_b)[..] {
+        [CallEvent::MediaPathFailed {
+            member,
+            cause,
+            retryable,
+            detail,
+            tried,
+            relay,
+            ..
+        }] => {
+            assert_eq!(member, &a_id);
+            assert_eq!(*cause, MediaPathCause::NoFacilitator);
+            assert!(retryable);
+            assert_eq!(*detail, Some(PathDetail::FacilitatorUnresolved));
+            assert_eq!(*relay, RelayStanding::RefusedByPolicy);
+            assert_eq!(
+                tried
+                    .iter()
+                    .map(|t| (t.kind, t.outcome))
+                    .collect::<Vec<_>>(),
+                [(PathKind::DirectReflexive, PathOutcome::NoFacilitator)]
+            );
+        }
+        other => panic!("B: one MediaPathFailed for A: {other:?}"),
+    }
+    assert!(
+        p.a.transport.local_nat_report().is_none(),
+        "nothing measured on this pin"
+    );
+
+    // Retries through the backoff fire nothing more.
+    let skipped = dl(&p.a.metrics, "direct_link_skipped_backoff");
+    assert!(
+        wait_until(Duration::from_mins(1), || async {
+            dl(&p.a.metrics, "direct_link_skipped_backoff") >= skipped + 2
+        })
+        .await,
+        "A dials B again through its backoff"
+    );
+    assert_eq!(failed(&seen_a), 1, "{:?}", path_events(&seen_a));
+    assert_eq!(failed(&seen_b), 1, "{:?}", path_events(&seen_b));
+
+    // B allows the path; A's next dial proposes on a fresh identity link.
+    p.b.transport.set_refuse_direct_for_test(false);
+    let _ = p.a.transport.link_teardown(&refused_link).await;
+    p.a.transport.clear_direct_backoff_for_test(&b_id);
+    let restored = |seen: &std::sync::Mutex<Vec<CallEvent>>| {
+        path_events(seen)
+            .into_iter()
+            .filter(|e| matches!(e, CallEvent::MediaPathRestored { .. }))
+            .count()
+    };
+    assert!(
+        wait_until(Duration::from_mins(2), || async {
+            restored(&seen_a) >= 1 && restored(&seen_b) >= 1
+        })
+        .await,
+        "the path comes up and each side says so: A {:?}, B {:?}, A's legs {:?}",
+        path_events(&seen_a),
+        path_events(&seen_b),
+        call_a.legs()
+    );
+    assert!(!call_a.legs().is_empty() && !call_b.legs().is_empty());
+    for (seen, peer) in [(&seen_a, &b_id), (&seen_b, &a_id)] {
+        match &path_events(seen)[..] {
+            [CallEvent::MediaPathFailed { member: f, .. }, CallEvent::MediaPathRestored { member, via }] =>
+            {
+                assert_eq!((f, member), (peer, peer));
+                assert_eq!(*via, PathKind::DirectReflexive);
+            }
+            other => panic!("one failure, then one restore: {other:?}"),
+        }
+    }
 }
 
 /// **E4, the other order** — A's dial proposes to B before B's call is

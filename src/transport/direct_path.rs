@@ -609,6 +609,22 @@ pub const fn failure_label(failure: Failure) -> &'static str {
     }
 }
 
+/// v45.1 — what a [`DirectPath::Unavailable`] reason that is not a
+/// proposal's outcome says about the attempt
+/// ([`crate::transport::media_path::DirectAttempt`]).
+#[must_use]
+pub fn attempt_of_skip(reason: &str) -> crate::transport::media_path::DirectAttempt {
+    use crate::transport::media_path::{DirectAttempt, NotProposed};
+    match reason {
+        "backing_off" => DirectAttempt::NotProposed(NotProposed::BackingOff),
+        "yield_to_initiator" => DirectAttempt::NotProposed(NotProposed::Yielded),
+        "propose_refused" => DirectAttempt::NotProposed(NotProposed::ProposeRefused),
+        "no_link" => DirectAttempt::NotProposed(NotProposed::NoLink),
+        // `pending`: a proposal runs with no outcome yet.
+        _ => DirectAttempt::NoOutcome,
+    }
+}
+
 /// Whether `failure`, on an upgrade that started `age` ago, is leviculum giving
 /// up a HOLD rather than a session. A link whose punch landed waits on the
 /// relay for a transfer to finish, with no deadline; the session ended when it
@@ -713,6 +729,11 @@ struct PeerDirect {
     entry: Entry,
     /// Retryable failures in a row; reset by a direct path.
     attempts: u32,
+    /// v45.1 — the failure of the last proposal that ended without a path,
+    /// kept across the backoff it set so a dial that cannot propose still
+    /// knows why ([`crate::transport::media_path::DirectPathFacts`]); cleared
+    /// by a direct path or its loss.
+    last_failure: Option<Failure>,
 }
 
 /// CIRISEdge#805 item 8 — the per-peer direct-path state machine and its retry
@@ -768,7 +789,10 @@ impl DirectPathTracker {
         channel_limit_before: Option<usize>,
         now: Instant,
     ) {
-        let attempts = self.peers.get(peer).map_or(0, |p| p.attempts);
+        let (attempts, last_failure) = self
+            .peers
+            .get(peer)
+            .map_or((0, None), |p| (p.attempts, p.last_failure));
         self.note_upgrade(link, UpgradeSide::Proposer, now);
         self.link_peer.insert(link, peer.to_owned());
         self.peers.insert(
@@ -780,6 +804,7 @@ impl DirectPathTracker {
                     since: now,
                 },
                 attempts,
+                last_failure,
             },
         );
     }
@@ -789,7 +814,10 @@ impl DirectPathTracker {
     pub fn propose_refused(&mut self, peer: &str, link: LinkId, now: Instant) {
         self.upgrades.remove(&link);
         self.link_peer.remove(&link);
-        let attempts = self.peers.get(peer).map_or(0, |p| p.attempts);
+        let (attempts, last_failure) = self
+            .peers
+            .get(peer)
+            .map_or((0, None), |p| (p.attempts, p.last_failure));
         self.peers.insert(
             peer.to_owned(),
             PeerDirect {
@@ -797,6 +825,7 @@ impl DirectPathTracker {
                     until: now + DIRECT_RETRY_BASE,
                 },
                 attempts,
+                last_failure,
             },
         );
     }
@@ -830,6 +859,7 @@ impl DirectPathTracker {
             PeerDirect {
                 entry: Entry::Direct { link, interface },
                 attempts: 0,
+                last_failure: None,
             },
         );
         Some((peer, before))
@@ -854,6 +884,7 @@ impl DirectPathTracker {
             PeerDirect {
                 entry,
                 attempts: attempts.saturating_add(1),
+                last_failure: Some(failure),
             },
         );
         Some(peer)
@@ -871,6 +902,7 @@ impl DirectPathTracker {
                     until: now + DIRECT_RETRY_BASE,
                 },
                 attempts: 0,
+                last_failure: None,
             },
         );
         Some(peer)
@@ -938,6 +970,41 @@ impl DirectPathTracker {
                 _ => None,
             })
             .collect()
+    }
+
+    /// v45.1 — the failure of `peer`'s last proposal that ended without a
+    /// path, while no path has come since.
+    #[must_use]
+    pub fn last_failure(&self, peer: &str) -> Option<Failure> {
+        self.peers.get(peer).and_then(|p| p.last_failure)
+    }
+
+    /// v45.1 — how long until `peer` may be proposed to again, while a
+    /// backoff runs.
+    #[must_use]
+    pub fn backoff_remaining(&self, peer: &str, now: Instant) -> Option<Duration> {
+        match self.peers.get(peer)?.entry {
+            Entry::BackingOff { until } if until > now => Some(until - now),
+            _ => None,
+        }
+    }
+
+    /// v45.1 — `peer`'s failed proposals in a row.
+    #[must_use]
+    pub fn attempts(&self, peer: &str) -> u32 {
+        self.peers.get(peer).map_or(0, |p| p.attempts)
+    }
+
+    /// Test seam: forget `peer`'s backoff, so the next dial proposes. The
+    /// failure on record stays.
+    pub fn clear_backoff_for_test(&mut self, peer: &str) {
+        if let Some(p) = self.peers.get_mut(peer) {
+            if matches!(p.entry, Entry::BackingOff { .. }) {
+                p.entry = Entry::BackingOff {
+                    until: Instant::now(),
+                };
+            }
+        }
     }
 
     /// Peers with a direct path now (the `direct_links_active` gauge).
@@ -1033,7 +1100,7 @@ impl Drop for DirectPathGuard {
     }
 }
 
-/// What [`crate::transport::reticulum::ReticulumTransport::ensure_direct_path`]
+/// What [`crate::transport::reticulum::ReticulumTransport::ensure_direct_path_facts`]
 /// came to.
 #[derive(Debug)]
 pub enum DirectPath {
@@ -1070,6 +1137,14 @@ pub(crate) struct DirectPaths {
     /// v44 — peers this node is yielding to on a link it did not initiate,
     /// since when ([`glare_verdict`]).
     yielding: std::sync::Mutex<HashMap<String, Instant>>,
+    /// v45.1 — this node's last NAT measurement
+    /// ([`crate::transport::media_path::NatReport`]). Never written on the
+    /// v0.34.0+ciris.3 pin: leviculum measures nothing yet. Its probe
+    /// summary (`direct_link_diag` `event = "probe"`) will fill it.
+    local_nat: std::sync::Mutex<Option<crate::transport::media_path::NatReport>>,
+    /// Test seam: refuse every peer's direct-link request (REJECT `POLICY`),
+    /// whatever the accept rule says.
+    refuse_for_test: std::sync::atomic::AtomicBool,
 }
 
 /// Most consented contacts remembered for direct links.
@@ -1085,7 +1160,39 @@ impl DirectPaths {
             anchors: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             contacts: std::sync::Mutex::new(std::collections::HashSet::new()),
             yielding: std::sync::Mutex::new(HashMap::new()),
+            local_nat: std::sync::Mutex::new(None),
+            refuse_for_test: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// v45.1 — this node's last NAT measurement, if any.
+    pub(crate) fn local_nat(&self) -> Option<crate::transport::media_path::NatReport> {
+        self.local_nat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// v45.1 — record this node's NAT measurement. The leviculum probe
+    /// summary's consumer calls it; nothing does on this pin.
+    #[allow(dead_code)] // the leviculum diagnostic that feeds it is not on the pin
+    pub(crate) fn note_local_nat(&self, report: crate::transport::media_path::NatReport) {
+        *self
+            .local_nat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+    }
+
+    /// Test seam: refuse every direct-link request while set.
+    pub(crate) fn set_refuse_for_test(&self, refuse: bool) {
+        self.refuse_for_test
+            .store(refuse, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the test seam refuses every direct-link request.
+    pub(crate) fn refuses_for_test(&self) -> bool {
+        self.refuse_for_test
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// v44 — since when this node has been yielding to `peer`'s proposal.

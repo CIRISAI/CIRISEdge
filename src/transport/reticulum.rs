@@ -6555,12 +6555,46 @@ impl ReticulumTransport {
         self.seals.is_sealed(link)
     }
 
-    #[allow(clippy::too_many_lines)] // one dial: target, direct path, per-key attempts, cleanup
+    /// v45.1 — [`Self::open_av_link`], with the facts of its direct-path
+    /// step (`None` when the dial ended before it): a call reads them when
+    /// the leg does not come up, to say why (`CallEvent::MediaPathFailed`).
+    pub(crate) async fn open_av_link_with_path(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+    ) -> (
+        Result<crate::transport::av_sink::AvLink, TransportError>,
+        Option<crate::transport::media_path::DirectPathFacts>,
+    ) {
+        let mut facts = None;
+        let link = self
+            .open_av_link_into(
+                destination_key_id,
+                address,
+                self.occurrence_key_id(),
+                &mut facts,
+            )
+            .await;
+        (link, facts)
+    }
+
     async fn open_av_link_claiming(
         &self,
         destination_key_id: &str,
         address: &MemberAddress,
         initiator_key_id: &str,
+    ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
+        self.open_av_link_into(destination_key_id, address, initiator_key_id, &mut None)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)] // one dial: target, direct path, per-key attempts, cleanup
+    async fn open_av_link_into(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+        initiator_key_id: &str,
+        path_facts: &mut Option<crate::transport::media_path::DirectPathFacts>,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
         // CC 5.4.3 rc16 — a node in anonymous mode is confined to the row
         // plane: it opens no A/V leg (no call, no stream).
@@ -6578,7 +6612,9 @@ impl ReticulumTransport {
         // nodes share a punched interface: bring the path direct first, when
         // this node can (CC 5.4.6). Whatever the outcome, the dial below is the
         // same; the guard keeps the punched interface for this leg's life.
-        let direct_path = match self.ensure_direct_path(destination_key_id).await {
+        let (direct_path, facts) = self.ensure_direct_path_facts(destination_key_id).await;
+        *path_facts = Some(facts);
+        let direct_path = match direct_path {
             crate::transport::direct_path::DirectPath::Direct { interface, guard } => {
                 tracing::debug!(
                     key_id = %destination_key_id,
@@ -6870,18 +6906,77 @@ impl ReticulumTransport {
     /// Called only by [`Self::open_av_link`], for a member of the call's group:
     /// a proposal reveals this node's public address to the peer, so nothing
     /// else proposes (`direct_path` module docs).
-    pub(crate) async fn ensure_direct_path(
+    ///
+    /// v45.1 — with the [`crate::transport::media_path::DirectPathFacts`] of
+    /// the attempt: what a call reads when the leg it dialled does not come
+    /// up, to say why (`CallEvent::MediaPathFailed`). Every fact that waits on
+    /// leviculum's punch diagnostics is `None` on this pin.
+    pub(crate) async fn ensure_direct_path_facts(
         &self,
         destination_key_id: &str,
-    ) -> crate::transport::direct_path::DirectPath {
+    ) -> (
+        crate::transport::direct_path::DirectPath,
+        crate::transport::media_path::DirectPathFacts,
+    ) {
+        use crate::transport::media_path::{DirectAttempt, DirectPathFacts, NotProposed};
+        let began = std::time::Instant::now();
+        let (path, mut attempt) = self.ensure_direct_path_traced(destination_key_id).await;
+        let (attempts, last_failure, backoff_remaining) = {
+            let t = self.direct_paths.tracker();
+            (
+                t.attempts(destination_key_id),
+                t.last_failure(destination_key_id),
+                t.backoff_remaining(destination_key_id, std::time::Instant::now()),
+            )
+        };
+        // A pass that proposed nothing new (a backoff, leviculum's cooldown, a
+        // yield) carries the failure on record: that is still why there is no
+        // path. No link, or a proposal still running, is its own answer.
+        if let (
+            DirectAttempt::NotProposed(
+                NotProposed::BackingOff | NotProposed::ProposeRefused | NotProposed::Yielded,
+            ),
+            Some(f),
+        ) = (attempt, last_failure)
+        {
+            attempt = DirectAttempt::Failed(f.into());
+        }
+        let config = &self.direct_paths.config;
+        let facts = DirectPathFacts {
+            proposing: config.proposing == crate::transport::direct_path::Proposing::On,
+            facilitator_resolved: config.facilitator.is_some(),
+            // A call dial proposes to every member of the call's group: this
+            // node trusts it with its address (`direct_path` module docs).
+            peer_trusted: true,
+            attempt,
+            attempts,
+            elapsed: began.elapsed(),
+            local_nat: self.direct_paths.local_nat(),
+            backoff_remaining,
+            ..DirectPathFacts::bare(attempt)
+        };
+        (path, facts)
+    }
+
+    async fn ensure_direct_path_traced(
+        &self,
+        destination_key_id: &str,
+    ) -> (
+        crate::transport::direct_path::DirectPath,
+        crate::transport::media_path::DirectAttempt,
+    ) {
         use crate::transport::direct_path::{
             DirectOutcome, DirectPath, DirectPathState, DIRECT_PATH_BUDGET,
         };
+        use crate::transport::media_path::{DirectAttempt, NotProposed};
         if !self.direct_paths.config.proposes() {
             if let Some(m) = self.metrics.get() {
                 m.inc_direct_link(self.direct_paths.config.off_label());
             }
-            return DirectPath::NotConfigured;
+            return (
+                DirectPath::NotConfigured,
+                DirectAttempt::NotProposed(NotProposed::NoLink),
+            );
         }
         // ONE deadline over the identity-link dial, the proposal and its
         // outcome: the A/V dial never waits on a direct path past the budget,
@@ -6897,10 +6992,13 @@ impl ReticulumTransport {
         let known = self.direct_paths.tracker().state(destination_key_id);
         if let Some(DirectPathState::Direct { link, interface }) = known {
             if self.node.direct_link_interface(&link) == Some(interface) {
-                return DirectPath::Direct {
-                    interface,
-                    guard: self.direct_paths.anchor(link),
-                };
+                return (
+                    DirectPath::Direct {
+                        interface,
+                        guard: self.direct_paths.anchor(link),
+                    },
+                    DirectAttempt::Established,
+                );
             }
         }
         let mut candidates = self.resolve_dial_candidates(destination_key_id).await;
@@ -6909,7 +7007,10 @@ impl ReticulumTransport {
         }
         if candidates.is_empty() {
             count(crate::observability::DIRECT_LINK_SKIPPED_NO_LINK);
-            return DirectPath::Unavailable { reason: "no_link" };
+            return (
+                DirectPath::Unavailable { reason: "no_link" },
+                DirectAttempt::NotProposed(NotProposed::NoLink),
+            );
         }
         // A one-hop neighbour (a shared interface) is already direct.
         if candidates
@@ -6917,7 +7018,10 @@ impl ReticulumTransport {
             .any(|c| self.node.hops_to(&c.dest_hash) == Some(1))
         {
             count(crate::observability::DIRECT_LINK_SKIPPED_NEIGHBOUR);
-            return DirectPath::AlreadyNeighbour;
+            return (
+                DirectPath::AlreadyNeighbour,
+                DirectAttempt::AlreadyNeighbour,
+            );
         }
         // The dial behind `identity_lane` is a detached task: a timeout here
         // abandons the wait, not the link.
@@ -6927,7 +7031,12 @@ impl ReticulumTransport {
         )
         .await;
         let link = match lane {
-            None => return DirectPath::Unavailable { reason: "pending" },
+            None => {
+                return (
+                    DirectPath::Unavailable { reason: "pending" },
+                    DirectAttempt::NoOutcome,
+                )
+            }
             Some(Ok(claim)) => {
                 let link = claim.link_id();
                 // Proposing sends two channel signals, not a resource: the lane
@@ -6942,26 +7051,46 @@ impl ReticulumTransport {
                     error = %e,
                     "direct path: no identity link to the member (CIRISEdge#805 item 8)"
                 );
-                return DirectPath::Unavailable { reason: "no_link" };
+                return (
+                    DirectPath::Unavailable { reason: "no_link" },
+                    DirectAttempt::NotProposed(NotProposed::NoLink),
+                );
             }
         };
         let (link, rx) = match self.start_or_join_proposal(destination_key_id, link).await {
             Ok(waiting) => waiting,
-            Err(done) => return done,
+            Err(done) => {
+                let attempt = match &done {
+                    DirectPath::Unavailable { reason } => {
+                        crate::transport::direct_path::attempt_of_skip(reason)
+                    }
+                    DirectPath::Direct { .. } => DirectAttempt::Established,
+                    DirectPath::AlreadyNeighbour => DirectAttempt::AlreadyNeighbour,
+                    DirectPath::NotConfigured => DirectAttempt::NotProposed(NotProposed::NoLink),
+                };
+                return (done, attempt);
+            }
         };
         match with_timeout(remaining(), rx).await {
-            Some(Ok(DirectOutcome::Established { interface })) => DirectPath::Direct {
-                interface,
-                guard: self.direct_paths.anchor(link),
-            },
-            Some(Ok(DirectOutcome::Failed(failure))) => DirectPath::Unavailable {
-                reason: crate::transport::direct_path::failure_label(failure),
-            },
+            Some(Ok(DirectOutcome::Established { interface })) => (
+                DirectPath::Direct {
+                    interface,
+                    guard: self.direct_paths.anchor(link),
+                },
+                DirectAttempt::Established,
+            ),
+            Some(Ok(DirectOutcome::Failed(failure))) => (
+                DirectPath::Unavailable {
+                    reason: crate::transport::direct_path::failure_label(failure),
+                },
+                DirectAttempt::Failed(failure.into()),
+            ),
             // Lost before the dial got to use it, the waiter dropped, or still
             // running past the budget (its outcome still reaches the tracker).
-            Some(Ok(DirectOutcome::Lost) | Err(_)) | None => {
-                DirectPath::Unavailable { reason: "pending" }
-            }
+            Some(Ok(DirectOutcome::Lost) | Err(_)) | None => (
+                DirectPath::Unavailable { reason: "pending" },
+                DirectAttempt::NoOutcome,
+            ),
         }
     }
 
@@ -7005,7 +7134,7 @@ impl ReticulumTransport {
         let _ = self.start_or_join_proposal(destination_key_id, link).await;
     }
 
-    /// CIRISEdge#805 item 8 — the proposal half of [`Self::ensure_direct_path`]:
+    /// CIRISEdge#805 item 8 — the proposal half of [`Self::ensure_direct_path_facts`]:
     /// start a proposal to `destination_key_id` on its identity `link`, or join
     /// the one already running. `Ok` is the link whose outcome to await and the
     /// registration to await it on; `Err` is the answer when there is nothing
@@ -7160,10 +7289,48 @@ impl ReticulumTransport {
     /// rule ([`crate::transport::direct_path::accepts_direct`]).
     #[must_use]
     pub fn should_accept_direct(&self, peer_key_id: &str) -> bool {
+        if self.direct_paths.refuses_for_test() {
+            return false;
+        }
         crate::transport::direct_path::accepts_direct(
             self.direct_paths.config.accept,
             self.direct_standing(peer_key_id),
         )
+    }
+
+    /// v45.1 — this node's last NAT measurement
+    /// ([`crate::transport::media_path::NatReport`]): `None` on the
+    /// v0.34.0+ciris.3 pin, which measures nothing (leviculum's probe
+    /// diagnostics will fill it).
+    #[must_use]
+    pub fn local_nat_report(&self) -> Option<crate::transport::media_path::NatReport> {
+        self.direct_paths.local_nat()
+    }
+
+    /// v45.1 — the technique a standing direct path to `peer` rides, if
+    /// one stands: a punched interface is `direct_reflexive` (leviculum does
+    /// not say which candidate won on this pin), else `None`.
+    #[must_use]
+    pub fn direct_path_kind(&self, peer: &str) -> Option<crate::transport::media_path::PathKind> {
+        matches!(
+            self.direct_paths.tracker().state(peer),
+            Some(crate::transport::direct_path::DirectPathState::Direct { .. })
+        )
+        .then_some(crate::transport::media_path::PathKind::DirectReflexive)
+    }
+
+    /// Test seam: refuse every peer's direct-link request (REJECT `POLICY`)
+    /// while `refuse` holds, whatever the accept rule says.
+    #[doc(hidden)]
+    pub fn set_refuse_direct_for_test(&self, refuse: bool) {
+        self.direct_paths.set_refuse_for_test(refuse);
+    }
+
+    /// Test seam: forget `peer`'s direct-path backoff, so the next dial to it
+    /// proposes at once.
+    #[doc(hidden)]
+    pub fn clear_direct_backoff_for_test(&self, peer: &str) {
+        self.direct_paths.tracker().clear_backoff_for_test(peer);
     }
 
     /// Whether `peer_key_id` may share a direct path with this node: it
@@ -19595,7 +19762,9 @@ async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
             shares_room = peer.as_deref().is_some_and(standing);
         }
         let held_ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let accepted = peer.is_some() && accepts_direct(accept, shares_room);
+        let accepted = peer.is_some()
+            && accepts_direct(accept, shares_room)
+            && !direct_paths.refuses_for_test();
         // v44 — before the answer goes, so the outcome cannot precede the
         // record: from here this link may move under a Resource
         // (`direct_path` docs).

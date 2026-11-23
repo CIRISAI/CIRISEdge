@@ -2533,6 +2533,16 @@ impl Edge {
         Some(self.reticulum_transport.as_ref()?.shaping_status())
     }
 
+    /// v45.1 — this node's last NAT measurement: behaviours only, never an
+    /// address (`CallEvent::MediaPathFailed`'s `local_nat`). `None` with no
+    /// Reticulum transport, and on the leviculum v0.34.0+ciris.3 pin, which
+    /// measures nothing yet.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn local_nat_report(&self) -> Option<crate::transport::media_path::NatReport> {
+        self.reticulum_transport.as_ref()?.local_nat_report()
+    }
+
     /// E8 — what this node knows of `peer`'s shaping (§3.1): whether it
     /// shapes, as far as it has answered an offer here.
     #[cfg(feature = "_reticulum-module")]

@@ -455,6 +455,46 @@ pub enum CallEvent {
         /// The stream in its place.
         new: StreamId,
     },
+    /// v45.1 — the media path to `member` failed, and why (Eric's ruling: the
+    /// person sees the real reason). Fired once per (call, member) when its
+    /// path attempt concludes with no media leg; a later failed retry fires
+    /// again only when its cause changed. Every field but `member` is
+    /// behaviours, counts and tokens, never an address
+    /// ([`crate::transport::media_path`]); the cause is edge's, decided once
+    /// by [`crate::transport::media_path::media_path_cause`].
+    MediaPathFailed {
+        /// The member this node has no media leg to.
+        member: String,
+        /// Why.
+        cause: crate::transport::media_path::MediaPathCause,
+        /// Whether a retry can help (decided with the cause:
+        /// [`crate::transport::media_path::media_path_verdict`]).
+        retryable: bool,
+        /// When to retry, in seconds, if known (`None` when not retryable).
+        retry_after_s: Option<u32>,
+        /// The internal branch that decided the cause, a closed token list
+        /// ([`crate::transport::media_path::PathDetail`], rendered as its
+        /// snake_case token on every FFI). Always `Some` when `cause` is
+        /// `other`; never free text.
+        detail: Option<crate::transport::media_path::PathDetail>,
+        /// What was tried toward it.
+        tried: Vec<crate::transport::media_path::PathAttempt>,
+        /// This node's NAT (all `unknown` until leviculum measures it).
+        local_nat: crate::transport::media_path::NatReport,
+        /// The member's NAT, as it claims it, if it said.
+        peer_nat: Option<crate::transport::media_path::PeerNatReport>,
+        /// Whether a relay could carry it instead: `refused_by_policy` on the
+        /// LTS (the canonical never relays call media).
+        relay: crate::transport::media_path::RelayStanding,
+    },
+    /// v45.1 — a media leg to `member` came up after a
+    /// [`CallEvent::MediaPathFailed`] for it.
+    MediaPathRestored {
+        /// The member.
+        member: String,
+        /// The technique the leg rides.
+        via: crate::transport::media_path::PathKind,
+    },
 }
 
 /// Why an attendee left ([`CallEvent::AttendeeLeft`]).
@@ -1681,6 +1721,10 @@ struct Shared {
     attendee: String,
     /// Attendees already announced on `events()`.
     attendees_known: StdMutex<std::collections::BTreeSet<String>>,
+    /// v45.1 — the members a `MediaPathFailed` stands for, with the cause it
+    /// named: once per (call, member) until a leg comes up
+    /// ([`Shared::path_failed`], [`Shared::path_up`]).
+    path_failed: StdMutex<HashMap<String, crate::transport::media_path::MediaPathCause>>,
     /// The one `RecordRefused` has fired.
     record_refused: AtomicBool,
     id: CallId,
@@ -1973,6 +2017,78 @@ impl Shared {
         }
     }
 
+    /// v45.1 — a dial to `member` ended with no leg, its direct-path step
+    /// having come to `facts`. Fires `MediaPathFailed` the first time, and
+    /// again only when the cause changed on a pass that concluded something
+    /// new; a pass that only met the backoff (or a running proposal) never
+    /// re-fires. Nothing fires when a path stands (the dial failed for
+    /// another reason, and retries) or a link from the member carries media
+    /// here already.
+    fn path_failed(&self, member: &str, facts: &crate::transport::media_path::DirectPathFacts) {
+        use crate::transport::media_path::MediaPathFailure;
+        if facts.path_stands() || self.ended.load(Ordering::Relaxed) {
+            return;
+        }
+        if Self::lock(&self.in_links).values().any(|p| p == member) {
+            return;
+        }
+        let failure = MediaPathFailure::from_facts(facts, chrono::Utc::now());
+        {
+            let mut standing = Self::lock(&self.path_failed);
+            match standing.get(member) {
+                Some(c) if *c == failure.cause => return,
+                Some(_) if !facts.attempt.conclusive() => return,
+                _ => {}
+            }
+            standing.insert(member.to_owned(), failure.cause);
+        }
+        tracing::info!(
+            peer = %member,
+            cause = failure.cause.token(),
+            detail = failure.detail.map_or("none", |d| d.token()),
+            retryable = failure.retryable,
+            relay = failure.relay.token(),
+            local_mapping = failure.local_nat.mapping.token(),
+            "call: no media path to the member (CallEvent::MediaPathFailed)"
+        );
+        self.emit(CallEvent::MediaPathFailed {
+            member: member.to_owned(),
+            cause: failure.cause,
+            retryable: failure.retryable,
+            retry_after_s: failure.retry_after_s,
+            detail: failure.detail,
+            tried: failure.tried,
+            local_nat: failure.local_nat,
+            peer_nat: failure.peer_nat,
+            relay: failure.relay,
+        });
+    }
+
+    /// v45.1 — a media leg to or from `member` came up over `via`: a
+    /// standing `MediaPathFailed` for it is answered by `MediaPathRestored`.
+    fn path_up(&self, member: &str, via: crate::transport::media_path::PathKind) {
+        if Self::lock(&self.path_failed).remove(member).is_none() {
+            return;
+        }
+        tracing::info!(
+            peer = %member,
+            via = via.token(),
+            "call: the media path to the member came up (CallEvent::MediaPathRestored)"
+        );
+        self.emit(CallEvent::MediaPathRestored {
+            member: member.to_owned(),
+            via,
+        });
+    }
+
+    /// The technique a leg to `member` rides when the dial did not say: a
+    /// standing punched path, else a one-hop neighbour.
+    fn path_kind_of(&self, member: &str) -> crate::transport::media_path::PathKind {
+        self.transport
+            .direct_path_kind(member)
+            .unwrap_or(crate::transport::media_path::PathKind::DirectLan)
+    }
+
     /// The first frame heard ends this call's setup.
     fn note_first_frame(&self) {
         use crate::telemetry::CallSetupOutcome;
@@ -2178,6 +2294,7 @@ impl Call {
             record,
             attendee,
             attendees_known: StdMutex::new(std::collections::BTreeSet::new()),
+            path_failed: StdMutex::new(HashMap::new()),
             record_refused: AtomicBool::new(false),
             id,
             signer,
@@ -3802,6 +3919,7 @@ async fn close_departed(shared: &Arc<Shared>, left: &[String]) {
     });
     Shared::lock(&shared.in_senders).retain(|peer, _| !left.contains(peer));
     Shared::lock(&shared.leg_ttl).retain(|peer, _| !left.contains(peer));
+    Shared::lock(&shared.path_failed).retain(|peer, _| !left.contains(peer));
     for l in closing {
         let _ = shared.transport.link_teardown(&l).await;
     }
@@ -3880,13 +3998,30 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     else {
         return false;
     };
-    let link = match shared.transport.open_av_link(member, &address).await {
+    let (dialled, path) = shared
+        .transport
+        .open_av_link_with_path(member, &address)
+        .await;
+    let link = match dialled {
         Ok(l) => l,
         Err(e) => {
             tracing::debug!(peer = %member, error = %e, "call leg: dial failed (will retry)");
+            if let Some(facts) = &path {
+                shared.path_failed(member, facts);
+            }
             return false;
         }
     };
+    // A punched path the tracker holds names the technique, also for a leg
+    // born on it (which the dial sees as a one-hop neighbour).
+    let via = shared
+        .transport
+        .direct_path_kind(member)
+        .or_else(|| {
+            path.as_ref()
+                .and_then(crate::transport::media_path::DirectPathFacts::via)
+        })
+        .unwrap_or(crate::transport::media_path::PathKind::DirectLan);
     if shared.ended.load(Ordering::Relaxed) {
         let _ = shared.transport.link_teardown(&link.link_id).await;
         return false;
@@ -4008,6 +4143,7 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     }
     Shared::lock(&shared.leg_ttl).insert(member.to_owned(), media_ttl);
     Shared::lock(&shared.leg_cong).remove(member);
+    shared.path_up(member, via);
     // ALM C3 — the responder's frames ride this leg's reverse direction.
     tokio::spawn(out_leg_reader(
         Arc::clone(shared),
@@ -4080,6 +4216,7 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
         return;
     };
     Shared::lock(&shared.in_links).insert(link_id, peer.clone());
+    shared.path_up(&peer, shared.path_kind_of(&peer));
     // ALM C3 — the responder speaks first, on the reverse direction of the
     // link it accepted: a pre-C3 dialler never reads that direction, so the
     // CAPS frame is harmless there, and a C3 dialler answers with its own.

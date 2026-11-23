@@ -443,6 +443,38 @@ pub struct EdgeShapingStatus {
     pub layer_reserve_links: u32,
 }
 
+/// v45.1 — this node's NAT, as tokens (`local_nat_report`); the UniFFI
+/// twin of [`crate::transport::media_path::NatReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeNatReport {
+    pub mapping: String,
+    pub allocation: String,
+    pub filtering: String,
+    pub port_preserving: Option<bool>,
+    pub router_mapping: String,
+    pub family: String,
+    pub evidence: String,
+    pub legacy_class: String,
+    /// Milliseconds since the Unix epoch.
+    pub measured_at: i64,
+}
+
+impl From<&crate::transport::media_path::NatReport> for EdgeNatReport {
+    fn from(r: &crate::transport::media_path::NatReport) -> Self {
+        Self {
+            mapping: r.mapping.token().to_owned(),
+            allocation: r.allocation.token().to_owned(),
+            filtering: r.filtering.token().to_owned(),
+            port_preserving: r.port_preserving,
+            router_mapping: r.router_mapping.token().to_owned(),
+            family: r.family.token().to_owned(),
+            evidence: r.evidence.token().to_owned(),
+            legacy_class: r.legacy_class.token().to_owned(),
+            measured_at: r.measured_at.timestamp_millis(),
+        }
+    }
+}
+
 /// One row of the fleet-default table (`shaping_class_table`).
 #[derive(Debug, Clone)]
 pub struct EdgeShapingClassInfo {
