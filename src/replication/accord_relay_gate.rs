@@ -154,8 +154,8 @@ use ciris_verify_core::accord_live_quorum::AccordParticipation;
 /// How long one resolved [`RelayVerdict`] stays usable before the gate
 /// re-resolves it.
 ///
-/// Sized off the reasoning the consent send-set memo's TTL had before
-/// CIRISEdge#1022 made that memo event-driven (10 s): long
+/// Sized off the same reasoning as
+/// [`CONSENT_SEND_SET_MEMO_TTL`](crate::replication::bridge) (10 s): long
 /// enough that a round's advertise sweep plus its N per-envelope serve gates
 /// share ONE resolution, short enough to sit well under the 30 s anti-entropy
 /// cadence, so a change nobody sent us an invalidation event for still takes

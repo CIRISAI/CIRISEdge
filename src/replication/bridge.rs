@@ -2928,16 +2928,9 @@ pub struct FederationDirectoryReplicationBridge {
     /// so an N-envelope Deliver did N consent-set reads inside the
     /// unbounded reply assembly and blew the 10 s round budget (100% round
     /// timeouts). This memo collapses a round's advertise + N fetches to ONE
-    /// read. Since CIRISEdge#1022 freshness is the EVENTS (every row that can
-    /// move the set drops the memo: [`Self::row_may_move_send_set`] on the
-    /// apply choke and on the serve-cursor feed, which sees every door), and
-    /// [`CONSENT_SEND_SET_MEMO_TTL`] is only the backstop for what no row
-    /// announces (a grant or binding lapsing on the clock).
+    /// read; the [`CONSENT_SEND_SET_MEMO_TTL`] window sits under the anti-entropy
+    /// cadence so a between-round withdraw still takes effect next round.
     consent_memo: Mutex<Option<(ResolvedPeerSet, Instant)>>,
-    /// CIRISEdge#1022 — when the read that filled [`Self::consent_memo`]
-    /// BEGAN, in unix ms: a row the feed drains that persist admitted before
-    /// then is already in the memo, so it drops nothing. 0 before any read.
-    consent_read_began_ms: std::sync::atomic::AtomicI64,
     /// 45.1.9 (attribution) — what emptied [`Self::consent_memo`], and the
     /// keys events dropped from the announce and own-set memos, so each next
     /// read is counted under its cause. Telemetry only; never read for an
@@ -3452,45 +3445,11 @@ enum OwnerLookup {
 /// with the revoked `key_id` after each ADMITTED Revocation apply.
 pub type RevocationObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// CIRISEdge#400 / #1022 — the BACKSTOP on a memoized consent send-set.
-///
-/// Until 45.1.10 this was 10 s and it was the freshness: a seat re-derived an
-/// unchanged set from ~19k rows several times a minute with zero
-/// invalidations (CIRISEdge#1022). Freshness is now the events. Every input
-/// persist's send set reads is an attestation row (consent grants
-/// `consent:replication:v1`, owner bindings, steward and self-roster rows,
-/// family rosters and memberships, occurrences, key records, and the
-/// `withdraws` / `recants` / `supersedes` / `delegates_to` that move them),
-/// and each reaches the memo by one of:
-///
-/// - the host's local-write doors (`invalidate_send_set_memos`: a kick,
-///   `note_local_write(s)`, a released signer);
-/// - the replicated apply choke, on an admitted row that may move the set
-///   ([`FederationDirectoryReplicationBridge::row_may_move_send_set`]);
-/// - the serve-cursor feed ([`super::store_feed`]), which drains every row
-///   persist admits whatever door wrote it, so a host write no door reports
-///   drops the memo at the next feed drain (each round's holdings ask).
-///
-/// What no row announces is the clock: a grant's `expires_at` or a CC 3.4.12
-/// `valid_until` passing. That, and a row a content plane carries that the
-/// classifier skips, are bounded by this backstop. Five minutes: an idle seat
-/// pays one send-set read per five minutes instead of six a minute.
-const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(300);
-
-/// CIRISEdge#1022 — a send set memoized NARROWER than the truth (an owner or
-/// self-collective walk errored, [`ResolvedPeerSet::owner_walk_complete`])
-/// is retried on the pre-#1022 cadence: no event announces that the store
-/// answers again, and a narrowed set withholds until it does.
-const CONSENT_SEND_SET_PARTIAL_TTL: Duration = Duration::from_secs(10);
-
-/// The TTL a memoized `set` is held to.
-fn consent_memo_ttl(set: &ResolvedPeerSet) -> Duration {
-    if set.owner_walk_complete() {
-        CONSENT_SEND_SET_MEMO_TTL
-    } else {
-        CONSENT_SEND_SET_PARTIAL_TTL
-    }
-}
+/// CIRISEdge#400 — how long a memoized consent send-set stays fresh. Chosen to
+/// span one anti-entropy round's assembly steps (advertise → Diff → Deliver,
+/// bounded by the scheduler's 10 s round budget) while staying well under the
+/// default 30 s cadence, so the item-1 bound still re-resolves every round.
+const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(10);
 
 /// 45.1.1 — the blob a holder claim says this device holds: a well-formed
 /// `custody:ack:v1` row in state `here` (CC 3.1.3.3), read with persist's own
@@ -3652,7 +3611,6 @@ impl FederationDirectoryReplicationBridge {
             send_set_membership: std::sync::Mutex::new(HashMap::new()),
             config,
             consent_memo: Mutex::new(None),
-            consent_read_began_ms: std::sync::atomic::AtomicI64::new(0),
             memo_marks: MemoMarks::default(),
             consent_flight: SingleFlight::default(),
             consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -9237,7 +9195,6 @@ impl FederationDirectoryReplicationBridge {
         let started = Instant::now();
         let indexing = self.holdings_index.enabled();
         let (mut rows_seen, mut inserted) = (0u64, 0u64);
-        let mut send_set_moved = false;
         loop {
             self.book_key_plane(obs::KEY_PLANE_PROBE_READS, 1);
             self.book_holdings(obs::HOLDINGS_FEED_PROBES[slot], 1);
@@ -9276,7 +9233,6 @@ impl FederationDirectoryReplicationBridge {
             let served = page.len();
             for served_row in &page {
                 rows_seen += 1;
-                send_set_moved |= self.feed_row_moves_send_set(served_row);
                 feed.distribute(&served_row.attestation);
                 if indexing {
                     // The hash persist's index holds for this row: the same
@@ -9303,9 +9259,6 @@ impl FederationDirectoryReplicationBridge {
             }
         }
         feed.attestations.completed(started, generation);
-        if send_set_moved {
-            self.invalidate_consent_memo("feed_row");
-        }
         self.book_key_plane(obs::KEY_PLANE_PROBE_ROWS, rows_seen);
         self.book_holdings(obs::HOLDINGS_FEED_INSERTS[slot], inserted);
         if indexing {
@@ -12326,9 +12279,7 @@ impl FederationDirectoryReplicationBridge {
     ///   apply event announces: a binding whose `expires_at` passes, a CC
     ///   3.4.12 `valid_until` that lapses, and a binding admitted by some path
     ///   that does not run through the bridge's apply loop. Bounded by
-    ///   [`CONSENT_SEND_SET_MEMO_TTL`] (a five-minute backstop since
-    ///   CIRISEdge#1022; a binding admitted by any door reaches the memo
-    ///   through the serve-cursor feed first).
+    ///   [`CONSENT_SEND_SET_MEMO_TTL`], i.e. under one round.
     /// - **A PARTIAL walk is memoized.** If a subject's walk errors, the
     ///   narrower set is still stored (with `owner_walk_complete = false`)
     ///   rather than re-read per envelope. Not caching it would re-create
@@ -12386,12 +12337,6 @@ impl FederationDirectoryReplicationBridge {
                         .sweep_gate
                         .enter_at(crate::observability::SWEEP_PERMIT_SEND_SET)
                         .await;
-                    // CIRISEdge#1022 — a row persist admitted from here on may
-                    // be missing from this read; one admitted before is in it.
-                    self.consent_read_began_ms.store(
-                        chrono::Utc::now().timestamp_millis(),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
                     let set = crate::read_caller::scoped(
                         crate::read_caller::Site::SendSet,
                         self.read_peer_set(local),
@@ -12461,14 +12406,14 @@ impl FederationDirectoryReplicationBridge {
     fn fresh_consent_memo(&self) -> Option<ResolvedPeerSet> {
         let memo = self.consent_memo.lock().ok()?;
         let (set, resolved_at) = memo.as_ref()?;
-        (resolved_at.elapsed() < consent_memo_ttl(set)).then(|| set.clone())
+        (resolved_at.elapsed() < CONSENT_SEND_SET_MEMO_TTL).then(|| set.clone())
     }
 
     /// CIRISEdge#971 — is the consent memo present but past its TTL?
     fn consent_memo_expired(&self) -> bool {
         self.consent_memo.lock().is_ok_and(|memo| {
             memo.as_ref()
-                .is_some_and(|(set, at)| at.elapsed() >= consent_memo_ttl(set))
+                .is_some_and(|(_, at)| at.elapsed() >= CONSENT_SEND_SET_MEMO_TTL)
         })
     }
 
@@ -14727,89 +14672,6 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// CIRISEdge#1022 — can admitting `row` move this node's send set? `true`
-    /// for every row but the content planes persist's send set never reads:
-    /// traces and their summaries, chat, delivery receipts, key grants,
-    /// custody acks (blob holder claims), sessions, ledgers and settlements.
-    /// A `withdraws` / `recants` / `supersedes` / `delegates_to` is always
-    /// `true`, whatever it names. Unknown dimensions are `true`: the cost of a
-    /// wrong `true` is one read, of a wrong `false` a set stale for up to
-    /// [`CONSENT_SEND_SET_MEMO_TTL`].
-    pub(crate) fn row_may_move_send_set(row: &Attestation) -> bool {
-        use ciris_persist::federation::types::attestation_type;
-        const CONTENT_PLANES: [&str; 9] = [
-            "trace:",
-            "trace_summary:",
-            "chat:",
-            crate::receipts::RECEIPT_DIMENSION_PREFIX,
-            "key_grant:",
-            "custody:ack:",
-            "session:",
-            "ledger:",
-            "settlement:",
-        ];
-        if matches!(
-            row.attestation_type.as_str(),
-            attestation_type::WITHDRAWS
-                | attestation_type::RECANTS
-                | attestation_type::SUPERSEDES
-                | attestation_type::DELEGATES_TO
-        ) {
-            return true;
-        }
-        let dimension = row
-            .attestation_envelope
-            .get("dimension")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        !CONTENT_PLANES.iter().any(|p| dimension.starts_with(p))
-    }
-
-    /// CIRISEdge#1022 — does a row the serve-cursor feed drained move the
-    /// send set the consent memo holds? Only a row that may move it
-    /// ([`Self::row_may_move_send_set`]) AND that persist admitted at or after
-    /// the memo's read began (with a second's margin for an admission
-    /// committing just after its stamp): one admitted earlier is in the memo.
-    fn feed_row_moves_send_set(
-        &self,
-        served: &ciris_persist::federation::ServedAttestation,
-    ) -> bool {
-        if !Self::row_may_move_send_set(&served.attestation) {
-            return false;
-        }
-        let began = self
-            .consent_read_began_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
-        served.admitted_at.timestamp_millis() >= began.saturating_sub(1_000)
-    }
-
-    /// CIRISEdge#1022 — drop the consent send-set memo alone, because a row
-    /// that can move it arrived (`reason`: `replicated_row`, `feed_row`).
-    /// Counted with the other send-set invalidations; reads nothing.
-    fn invalidate_consent_memo(&self, reason: &'static str) {
-        self.consent_flight.invalidate();
-        let taken = self.consent_memo.lock().ok().and_then(|mut memo| {
-            let taken = memo.take();
-            self.mark_consent_taken(taken.as_ref());
-            taken
-        });
-        let Some((_, at)) = taken else {
-            return;
-        };
-        self.send_set_invalidations
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(m) = &self.metrics {
-            m.inc_advertise(crate::observability::ADVERTISE_SEND_SET_INVALIDATED);
-            if at.elapsed() < CONSENT_SEND_SET_MEMO_TTL {
-                m.inc_advertise(crate::observability::ADVERTISE_SEND_SET_DROPPED_LIVE);
-            }
-        }
-        tracing::debug!(
-            reason,
-            "send-set memo dropped by a row that can move it (CIRISEdge#1022)"
-        );
-    }
-
     /// persist v52.0.0 (CIRISPersist#784) — the whole-drop sibling of
     /// [`Self::invalidate_owner_memo`], for a digest-only revocation that names
     /// no key_id to evict by. Revocations are rare; the memos refill on the
@@ -15950,9 +15812,6 @@ impl FederationDirectoryReplicationBridge {
                 // so the high-volume `scores` plane pays one string compare.
                 let owner_invalidation: Option<String> =
                     Self::owner_binding_touched(&record.attestation).map(ToOwned::to_owned);
-                // CIRISEdge#1022 — a row that can move the send set drops the
-                // consent memo when it is admitted (decided before the move).
-                let moves_send_set = Self::row_may_move_send_set(&record.attestation);
                 // CIRISEdge#968 — the two arrivals a first contact waits on,
                 // named when they land (they were visible only through the
                 // host's poller and the generic propagation kick).
@@ -16082,8 +15941,6 @@ impl FederationDirectoryReplicationBridge {
                     }
                     if let Some(node) = owner_invalidation {
                         self.invalidate_owner_memo(&node);
-                    } else if moves_send_set {
-                        self.invalidate_consent_memo("replicated_row");
                     }
                     if let Some((what, author, subject, id)) = arrival {
                         tracing::info!(
@@ -33343,10 +33200,6 @@ pub(crate) mod tests {
     // 45.1.9 (attribution) — every memoised read says why it read, and the
     // structure size gauges the same paths set.
     mod memo_attribution_1019x;
-
-    // CIRISEdge#1022 — an idle send-set memo reads nothing; every door that
-    // can change the set drops it.
-    mod send_set_events_1022;
 
     // CIRISEdge#971 — what an idle bootstrap round costs the seat.
     mod idle_round_cost_971;
