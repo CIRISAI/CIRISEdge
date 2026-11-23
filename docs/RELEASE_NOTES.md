@@ -1,5 +1,29 @@
 # CIRISEdge Release Notes
 
+# v45.1.10 — where the bytes go, who the links are, and Python leaves the release
+
+**2026-11-22.** **PATCH.** Pins: persist v61.4.4 by tag (`ciris-persist==61.4.4`, commit 5ef264f3),
+CIRISVerify v22.2.4 (was v22.2.0), leviculum v0.34.0+ciris.3. No migration, and no wire change for
+any node on the mesh today. Detail in CHANGELOG.md.
+
+- **Every byte on the wire has a transport and a plane** (`transport_wire_bytes_{in,out}_total`),
+  so a seat's egress can be read as replication, resources, shaping, A/V, link control or the
+  remainder. The application-envelope counters keep their meaning.
+- **Links and peers, for sizing a seat:** `links_active` by transport, distinct identified peers
+  over 1 h and 24 h, the top peers by bytes as a bounded salted list, and how long links live by
+  why they closed. No address or peer identifier leaves the node.
+- **Range fingerprints, step A:** the wire members are read, replication frames are counted by
+  kind, and the passive receiver ships **off** (`CIRIS_EDGE_RANGE_FINGERPRINTS_ANSWER=1`).
+  Nothing sends a fingerprint yet. The sender, which is what cuts a seat's listing traffic,
+  is the next step.
+- **A send no longer dies on a pooled link the peer just closed** (#947): it reships once on a
+  fresh link.
+- **Edge stops shipping Python.** The release is a Rust crate by tag plus UniFFI bindings, 10
+  assets where there were 15: no wheels, no `android-wheels.tar.gz`, no `ios.tar.gz` (that one
+  was the BeeWare PyO3 build; the native iOS output is the xcframework). The `pyo3` feature
+  stays in the crate, tested, because CIRISServer builds it into its own wheel.
+- **Verify v22.2.4 and persist v61.4.4**, moved together; `url` 2.5.9 (RUSTSEC-2026-0592).
+
 # v45.1.9 — attribution: why each memo read, and how big each walked set is
 
 **2026-11-21.** **PATCH.** Pins: persist v61.4.3 by tag (`ciris-persist==61.4.3`, commit 157ee52c),
