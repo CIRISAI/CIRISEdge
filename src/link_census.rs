@@ -821,7 +821,8 @@ mod tests {
         assert_eq!(fc.count, 2);
         let st = &d["unidentified:stale"];
         assert_eq!(st.buckets()[4].1, 0, "not within 10 min");
-        assert_eq!(st.buckets()[5].1, 1, "within 6 h");
+        assert_eq!(st.buckets()[5].1, 0, "not within 1 h");
+        assert_eq!(st.buckets()[6].1, 1, "within 6 h");
         let lt = &d["unknown:local_teardown"];
         assert_eq!(lt.buckets()[6].1, 0, "past 6 h");
         assert_eq!(lt.buckets()[7], ("+Inf".to_string(), 1));
