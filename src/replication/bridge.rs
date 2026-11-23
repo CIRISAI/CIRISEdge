@@ -1767,6 +1767,10 @@ struct PlaneWatermark {
     /// CIRISEdge#968 — the history of the groups this peer joined since it
     /// was first seen, not yet offered ([`SweepCursors::groups_changed`]).
     join_backfill: Option<JoinBackfill>,
+    /// CIRISEdge#1029 F1 — the groups this peer joined whose Welcome for it is
+    /// still looked for, each with the listings it is looked for in
+    /// ([`SweepCursors::welcome_watch`]).
+    welcome_watch: BTreeMap<String, u32>,
     /// When a peer that gets no walk may read its next page of history
     /// ([`SweepCursors::history_due`]).
     history_at: Option<Instant>,
@@ -1802,6 +1806,13 @@ struct JoinBackfill {
     generation: u64,
 }
 
+/// CIRISEdge#1029 F1 — what [`FederationDirectoryReplicationBridge::required_group_rows`]
+/// read: the peer's own Welcomes, which lead the required rows, and the rest.
+struct GroupRows {
+    welcomes: Vec<Attestation>,
+    rows: Vec<Attestation>,
+}
+
 /// CIRISEdge#968 — the families a group's history is placed under: a thing
 /// said in a room is shared to it by a widening (`supersedes`), a composer
 /// over it is born at the room (`withdraws`, `recants`, `supersedes`), and
@@ -1813,6 +1824,19 @@ const GROUP_HISTORY_FAMILIES: [&str; 5] = ["chat:", "file:", "recants", "superse
 /// CIRISEdge#968 — the rows of the history families one peer's join backfill
 /// reads a round, before the `page` lever halves it.
 const GROUP_BACKFILL_PAGE: u32 = 256;
+
+/// CIRISEdge#1029 F1 — how many of a peer's listings look for its Welcome in
+/// a group it joined. The Welcome is placed only after the joiner's
+/// KeyPackage reaches its adder (two hub hops after the seat: ~140 s in the
+/// 12-person field run, a few listings), and every listing pays one read of
+/// the room's Welcomes, so the watch is bounded: past it the Welcome moves
+/// as any row does.
+const WELCOME_WATCH_LISTINGS: u32 = 60;
+
+/// CIRISEdge#1029 F1 — how many more listings carry a peer's Welcome as
+/// required once one is found, so a lost round does not put it back behind
+/// the history (the field's rounds to the joiner were timing out).
+const WELCOME_FOUND_LISTINGS: u32 = 3;
 
 /// How many lost rounds in a row get their rows listed again. Past it the
 /// watermark moves as it would have and the re-sweep carries what was passed,
@@ -2261,7 +2285,12 @@ impl SweepCursors {
             .map(|b| (b.groups, b.since, b.generation))
             .unwrap_or_default();
         pending.0.retain(|g| groups.contains(g));
+        wm.welcome_watch.retain(|g, _| groups.contains(g));
         if !first && !joined.is_empty() {
+            for group in joined.iter().take(REQUIRED_GROUPS) {
+                wm.welcome_watch
+                    .insert(group.clone(), WELCOME_WATCH_LISTINGS);
+            }
             pending.0.extend(joined);
             pending.1 = None;
             pending.2 = pending.2.wrapping_add(1);
@@ -2274,6 +2303,33 @@ impl SweepCursors {
             });
         }
         true
+    }
+
+    /// CIRISEdge#1029 F1 — the groups whose Welcome for `key`'s peer this
+    /// listing looks for. Each costs one listing of its watch; a group whose
+    /// watch is spent leaves it.
+    fn welcome_watch(&mut self, key: &(String, EnvelopeKind)) -> Vec<String> {
+        let Some(wm) = self.by_peer_plane.get_mut(key) else {
+            return Vec::new();
+        };
+        let groups: Vec<String> = wm.welcome_watch.keys().cloned().collect();
+        wm.welcome_watch.retain(|_, left| {
+            *left = left.saturating_sub(1);
+            *left > 0
+        });
+        groups
+    }
+
+    /// CIRISEdge#1029 F1 — `group`'s Welcome for `key`'s peer was found: it
+    /// stays required for [`WELCOME_FOUND_LISTINGS`] more listings at most.
+    fn welcome_found(&mut self, key: &(String, EnvelopeKind), group: &str) {
+        if let Some(left) = self
+            .by_peer_plane
+            .get_mut(key)
+            .and_then(|wm| wm.welcome_watch.get_mut(group))
+        {
+            *left = (*left).min(WELCOME_FOUND_LISTINGS);
+        }
     }
 
     /// CIRISEdge#968 — the join backfill in progress for `key`, if any.
@@ -13734,13 +13790,15 @@ impl FederationDirectoryReplicationBridge {
         rows.extend(self.invitations_naming(peer, peer_principals).await);
         let withdrawals = self.grant_withdrawals(peer, &rows).await;
         rows.extend(withdrawals);
-        rows.extend(
-            crate::read_caller::scoped(
-                crate::read_caller::Site::AdvertiseGroups,
-                self.required_group_rows(key, peer_principals),
-            )
-            .await,
-        );
+        let groups = crate::read_caller::scoped(
+            crate::read_caller::Site::AdvertiseGroups,
+            self.required_group_rows(key, peer_principals),
+        )
+        .await;
+        // CIRISEdge#1029 F1 — the peer's own Welcome leads the push: every
+        // required row has one `seq`, and the push keeps their order.
+        rows.splice(0..0, groups.welcomes);
+        rows.extend(groups.rows);
         self.record_page(rows.len());
         let mut seen = HashSet::new();
         rows.retain(|r| seen.insert(r.attestation_id.clone()));
@@ -13875,11 +13933,14 @@ impl FederationDirectoryReplicationBridge {
     /// changes and not every round: a new member's record and roster events,
     /// by each group's own index. Without them it sits in an empty room. A group
     /// past [`REQUIRED_GROUPS`] is history's.
+    ///
+    /// CIRISEdge#1029 F1 — and, for a group the peer joined, the Welcome
+    /// naming it ([`Self::joiners_welcomes`]), returned apart so it leads.
     async fn required_group_rows(
         &self,
         key: &(String, EnvelopeKind),
         peer_principals: &HashSet<String>,
-    ) -> Vec<Attestation> {
+    ) -> GroupRows {
         use ciris_persist::federation::attestation_query::AttestationQuery;
         use ciris_persist::federation::group_plane as gp;
         use ciris_persist::federation::types::cohort_scope;
@@ -13896,9 +13957,12 @@ impl FederationDirectoryReplicationBridge {
             .sweep_cursors
             .lock()
             .is_ok_and(|mut c| c.groups_changed(key, &groups));
-        let mut rows = self.group_history_backfill(key).await;
+        let (welcomes, joined_at) = self.joiners_welcomes(key, peer_principals).await;
+        let mut rows = self
+            .group_history_backfill(key, peer_principals, &joined_at)
+            .await;
         if !changed {
-            return rows;
+            return GroupRows { welcomes, rows };
         }
         for group in groups.iter().take(REQUIRED_GROUPS) {
             if let Ok(Some(page)) = AttestationQuery::to(group, REQUIRED_READ_PAGE)
@@ -13925,15 +13989,87 @@ impl FederationDirectoryReplicationBridge {
                 rows.extend(page.into_iter().take(REQUIRED_READ_PAGE.get() as usize));
             }
         }
-        rows
+        GroupRows { welcomes, rows }
     }
 
+    /// CIRISEdge#1029 F1 — **the Welcome naming the peer, in each group it
+    /// joined and is still watched for** ([`SweepCursors::welcome_watch`]),
+    /// with the epoch it joins the peer at, by group.
+    ///
+    /// A Welcome is attested to its author and names its joiner only in the
+    /// body (`chat.rs`, AV-84 producer-only), so no required query reads it
+    /// by the joiner: it moved as the newest room row, behind the joiner's
+    /// whole backfill, and reached the joiner four rounds (160 s) after it
+    /// was placed. One read of the group's Welcomes per watched group per
+    /// listing, until it is found and has been offered a few times.
+    async fn joiners_welcomes(
+        &self,
+        key: &(String, EnvelopeKind),
+        peer_principals: &HashSet<String>,
+    ) -> (Vec<Attestation>, BTreeMap<String, u64>) {
+        use ciris_persist::federation::types::cohort_scope;
+        let watched = self
+            .sweep_cursors
+            .lock()
+            .map(|mut c| c.welcome_watch(key))
+            .unwrap_or_default();
+        let mut welcomes = Vec::new();
+        let mut joined_at = BTreeMap::new();
+        for group in watched {
+            let read = self
+                .directory
+                .list_targeted_by_dimension_prefix(
+                    &[
+                        cohort_scope::FAMILY,
+                        cohort_scope::COMMUNITY,
+                        cohort_scope::AFFILIATIONS,
+                    ],
+                    &group,
+                    crate::chat::WELCOME_DIMENSION,
+                )
+                .await;
+            let Ok(rows) = read else {
+                tracing::debug!(peer = %key.0, "required read: a joined group's Welcomes not served");
+                continue;
+            };
+            let mine: Vec<Attestation> = rows
+                .into_iter()
+                .filter(|a| {
+                    crate::chat::welcome_recipient(a).is_some_and(|r| peer_principals.contains(r))
+                })
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            if let Some(epoch) = mine.iter().filter_map(crate::chat::mls_epoch).max() {
+                joined_at.insert(group.clone(), epoch);
+            }
+            if let Ok(mut c) = self.sweep_cursors.lock() {
+                c.welcome_found(key, &group);
+            }
+            welcomes.extend(mine);
+        }
+        (welcomes, joined_at)
+    }
     /// CIRISEdge#968 — **one page of a late joiner's group history**
     /// ([`JoinBackfill`]): the next [`GROUP_BACKFILL_PAGE`] rows (under the
     /// host's `page` lever) of the history families, kept where placed in a
     /// group the peer joined. A read that fails is read again next round from
     /// where it stood.
-    async fn group_history_backfill(&self, key: &(String, EnvelopeKind)) -> Vec<Attestation> {
+    ///
+    /// CIRISEdge#1029 F1 — of the room's MLS handshake the joiner can use only
+    /// its own Welcome and the Commits past it, so the page drops
+    /// ([`Self::joiner_can_use`]) every KeyPackage, every Welcome for someone
+    /// else, and every Commit at or below the epoch of the joiner's Welcome in
+    /// `joined_at`. At N = 12 those were ~0.5–1 MB of PQC-sized rows ahead of
+    /// the history. A dropped row is only not backfilled: it moves as any
+    /// row does.
+    async fn group_history_backfill(
+        &self,
+        key: &(String, EnvelopeKind),
+        peer_principals: &HashSet<String>,
+        joined_at: &BTreeMap<String, u64>,
+    ) -> Vec<Attestation> {
         let Some(backfill) = self
             .sweep_cursors
             .lock()
@@ -13971,7 +14107,10 @@ impl FederationDirectoryReplicationBridge {
             .map(|s| s.attestation)
             .filter(|a| {
                 ciris_persist::federation::cohort_target_of_envelope(&a.attestation_envelope)
-                    .is_some_and(|g| backfill.groups.contains(g))
+                    .is_some_and(|g| {
+                        backfill.groups.contains(g)
+                            && Self::joiner_can_use(a, peer_principals, joined_at.get(g).copied())
+                    })
             })
             .collect();
         let finished = self
@@ -13991,6 +14130,30 @@ impl FederationDirectoryReplicationBridge {
             );
         }
         rows
+    }
+
+    /// CIRISEdge#1029 F1 — may a room row be part of a joiner's backfill? Not
+    /// a KeyPackage (the joiner adds no one by its backfill, and holds its
+    /// own), not a Welcome for anyone else (sealed to its recipient), and not
+    /// a Commit at or below `welcome_epoch`, the epoch the joiner's Welcome
+    /// joins it at. A Commit is kept while that epoch is unknown.
+    fn joiner_can_use(
+        a: &Attestation,
+        peer_principals: &HashSet<String>,
+        welcome_epoch: Option<u64>,
+    ) -> bool {
+        match crate::membership::dimension_of(a) {
+            Some(crate::chat::KEY_PACKAGE_DIMENSION) => false,
+            Some(crate::chat::WELCOME_DIMENSION) => {
+                crate::chat::welcome_recipient(a).is_some_and(|r| peer_principals.contains(r))
+            }
+            Some(crate::chat::COMMIT_DIMENSION) => match (welcome_epoch, crate::chat::mls_epoch(a))
+            {
+                (Some(joined), Some(epoch)) => epoch > joined,
+                _ => true,
+            },
+            _ => true,
+        }
     }
 
     /// **CC 5.2 — does this row move to `peer` without being asked?** It has
