@@ -861,6 +861,13 @@ pub enum CallError {
     /// starts and joins no call and no stream. Refused before anything starts.
     #[error("this node is in anonymous mode: no call and no stream (onion_anonymous_no_media)")]
     AnonymousMode,
+    /// 45.2.0 — this node is shaped-only by its own setting
+    /// (`ShapingPolicy::require_shaped_links`): live A/V rides unshaped links
+    /// only (Eric 2026-11-06), so it starts and joins no call and accepts no
+    /// A/V link. Refused before anything starts. Anonymous mode, which
+    /// implies shaped-only, is reported as [`Self::AnonymousMode`].
+    #[error("this node is shaped-only: no call and no stream (shaped_only_no_media)")]
+    ShapedOnly,
     /// v45 — the stream named is not one this node publishes in the call
     /// (never added, or already ended).
     #[error("stream {0} is not one this node publishes in the call")]
@@ -2361,6 +2368,13 @@ impl Call {
             verifier,
             load,
         } = deps;
+        // CC 5.4.3 / 45.2.0 — no call on a node that carries no call media,
+        // before anything starts (no address installed, no leg dialled).
+        match transport.media_refusal() {
+            Some(crate::onion::tokens::ANONYMOUS_NO_MEDIA) => return Err(CallError::AnonymousMode),
+            Some(_) => return Err(CallError::ShapedOnly),
+            None => {}
+        }
         if signer.key_id != own_key_id {
             return Err(CallError::Plumbing(format!(
                 "the signer that binds this stream's chunk keys is {}, not the publisher {own_key_id}",

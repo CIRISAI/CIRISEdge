@@ -3624,3 +3624,143 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     drop(listeners);
     drop(cp);
 }
+
+/// **45.2.0 — no calls on a shaped-only node** (Eric 2026-11-06: live A/V
+/// rides unshaped links only). Node `S` sets `require_shaped_links`:
+/// - its call start and join are refused `ShapedOnly`
+///   (`shaped_only_no_media`), before anything starts;
+/// - an A/V link another member dials to it is refused on ITS side (the
+///   accepting door, not only the proposing one);
+/// - a call among the others is unaffected: A, B and C hear each other.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_shaped_only_node_neither_joins_nor_accepts_call_media() {
+    let _call = one_call().await;
+    let tag = "alm2-shaped";
+    // 0..=2 = A, B, C; 3 = S (shaped-only). Full mesh, no canonical.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        4,
+        4,
+        &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)],
+        None,
+    )
+    .await;
+    let (a, s) = (&nodes[0], &nodes[3]);
+    let mut policy = s.transport.shaping_policy();
+    policy.require_shaped_links = true;
+    let _ = s.transport.set_shaping_policy(policy).await;
+
+    // Start and join are refused by name.
+    let refused = Call::join(
+        &room_of(tag),
+        &s.key.key_id,
+        CallDeps {
+            room_group: groups[3].clone(),
+            roster: Arc::new(Roster(true)),
+            owners: Arc::clone(&s.dir) as Arc<dyn ciris_edge::transport::av_call::CallOwners>,
+            transport: Arc::clone(&s.transport),
+            lifecycle: Arc::clone(&s.lifecycle),
+            registrar: Arc::new(CountingRegistrar::default()),
+            events: None,
+            metrics: Some(s.metrics.clone()),
+            record: None,
+            signer: s.key.signer(),
+            verifier: Arc::clone(&s.dir) as Arc<dyn StreamKeyVerifier>,
+            load: None,
+        },
+        relay_opts(),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(ciris_edge::transport::av_call::CallError::ShapedOnly)
+        ),
+        "a shaped-only node's join is refused: {:?}",
+        refused.as_ref().err()
+    );
+    assert!(av(&s.metrics, "shaped_only_no_media") >= 1);
+
+    // The accepting door: S holds an A/V address (as a node that joined
+    // before turning shaped-only would), A dials it, S refuses the arrival.
+    let stream =
+        ciris_edge::transport::realtime_av::StreamId(sha2::Sha256::digest(b"g8-shaped").into());
+    let group = ciris_edge::av_addressing::stream_group_id(stream);
+    let scope = ciris_edge::cohort_scope::CohortScope::Cohort {
+        cohort_id: room_of(tag),
+    };
+    for n in [a, s] {
+        n.lifecycle
+            .joined(
+                &scope,
+                &group,
+                1,
+                &[0x5d; 32],
+                &[a.key.key_id.as_str(), s.key.key_id.as_str()],
+            )
+            .expect("install the stream's group");
+    }
+    let mut s_arrivals = s.transport.take_av_arrivals().expect("S's arrivals");
+    let address = a
+        .lifecycle
+        .table()
+        .send_address(&scope, &group, &s.key.key_id)
+        .expect("S's address");
+    let dialled = a.transport.open_av_link(&s.key.key_id, &address).await;
+    if dialled.is_ok() {
+        let arrival = tokio::time::timeout(Duration::from_secs(20), s_arrivals.recv())
+            .await
+            .expect("the arrival reaches S")
+            .expect("arrivals open");
+        let accepted = s.transport.accept_av_arrival(arrival).await;
+        assert!(
+            accepted
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("shaped_only_no_media")),
+            "S refuses the A/V arrival by name: {:?}",
+            accepted.as_ref().err()
+        );
+    }
+    let before = av(&s.metrics, "shaped_only_no_media");
+    assert!(before >= 2, "the accept door counted too: {before}");
+
+    // A call among the others is unaffected.
+    let mut ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(&nodes[1], &groups[1], tag, relay_opts(), None).await;
+    let cc = join_loaded(&nodes[2], &groups[2], tag, relay_opts(), None).await;
+    for call in [&ca, &cb, &cc] {
+        assert!(
+            wait_until(Duration::from_secs(30), || async {
+                call.legs().iter().filter(|m| **m != s.key.key_id).count() >= 2
+            })
+            .await,
+            "the others' legs come up: {:?}",
+            call.legs()
+        );
+        assert!(
+            !call.legs().contains(&s.key.key_id),
+            "no leg to the shaped-only node: {:?}",
+            call.legs()
+        );
+    }
+    let mut rx = ca.frames().expect("A's frames");
+    for seq in 0..20 {
+        cb.publish(Frame::opaque(body("b", seq)))
+            .await
+            .expect("B publishes");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let mut heard = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(f)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        if f.publisher == nodes[1].key.key_id {
+            heard += 1;
+            if heard == 20 {
+                break;
+            }
+        }
+    }
+    assert_eq!(heard, 20, "A hears B: the others' call runs");
+}

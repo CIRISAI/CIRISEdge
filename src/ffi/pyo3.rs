@@ -4516,6 +4516,7 @@ fn call_err_token(e: &crate::transport::av_call::CallError) -> &'static str {
         E::ActorIsNotTheSubject { .. } => "actor_is_not_the_subject",
         E::Plumbing(_) => "plumbing",
         E::AnonymousMode => crate::onion::tokens::ANONYMOUS_NO_MEDIA,
+        E::ShapedOnly => crate::transport::link_shaping::SHAPED_ONLY_NO_MEDIA,
         E::UnknownStream(_) => "unknown_stream",
         E::TooManyStreams(_) => "too_many_streams",
         E::ChunkSeqExhausted { .. } => "chunk_seq_exhausted",
@@ -4534,6 +4535,7 @@ fn call_err_to_py(e: &crate::transport::av_call::CallError) -> PyErr {
         | E::FrameTooLarge { .. }
         | E::ActorIsNotTheSubject { .. }
         | E::AnonymousMode
+        | E::ShapedOnly
         | E::UnknownStream(_)
         | E::TooManyStreams(_) => PyValueError::new_err(msg),
         _ => PyRuntimeError::new_err(msg),

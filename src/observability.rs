@@ -1103,6 +1103,9 @@ pub const ALM_RELAY_OFF_SHED: &str = "relay_shed:relay_off";
 /// G8 — this node's uplink stalled: its legs' Channels held messages
 /// unproved past `UPLINK_STALL_MS` on two legs or more. Counted on the rise.
 pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
+/// 45.2.0 — a call or A/V link refused on a shaped-only node: live A/V rides
+/// unshaped links only (Eric 2026-11-06).
+pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
 /// ALM — a chunk this node forwarded as an admitted media parent.
 pub const ALM_FORWARDED: &str = "alm_forwarded";
 /// ALM C4 — this node's primary parent for a stream changed.
@@ -2973,6 +2976,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_SHED,
     ALM_RELAY_OFF_SHED,
     ALM_UPLINK_STALL,
+    SHAPED_ONLY_NO_MEDIA,
     ALM_FORWARDED,
     ALM_PARENT_CHANGE,
     ALM_RELAY_TIER_ROSTER,

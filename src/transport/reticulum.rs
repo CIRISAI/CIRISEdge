@@ -6621,12 +6621,12 @@ impl ReticulumTransport {
         path_facts: &mut Option<crate::transport::media_path::DirectPathFacts>,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
         // CC 5.4.3 rc16 — a node in anonymous mode is confined to the row
-        // plane: it opens no A/V leg (no call, no stream).
-        if let Err(token) = self.onion.media_allowed() {
-            self.onion.count(token);
+        // plane, and a shaped-only node (45.2.0) carries no live A/V: it
+        // opens no A/V leg (no call, no stream).
+        if let Some(token) = self.media_refusal() {
             return Err(TransportError::Config(format!(
-                "{token}: this node is in anonymous mode (its Anonymous Tier is active); \
-                 no call and no stream ride its links (CC 5.4.3)"
+                "{token}: this node carries no call media (anonymous mode or shaped-only, \
+                 CC 5.4.3); no call and no stream ride its links"
             )));
         }
         let (dest_hash, transport_keys, pair) =
@@ -6804,6 +6804,19 @@ impl ReticulumTransport {
         use crate::transport::av_transit_handshake::check_claim;
         use crate::transport::link_seal::SealRefusal;
         let link_id = LinkId::new(arrival.link_id);
+        // 45.2.0 — the accepting side too (#1028's lesson): a node that
+        // carries no call media answers no A/V link, whoever dialled it.
+        if let Some(token) = self.media_refusal() {
+            tracing::info!(
+                peer = %arrival.peer.as_str(),
+                token,
+                "A/V arrival REFUSED: this node carries no call media (anonymous or shaped-only)"
+            );
+            let _ = self.node.close_link(&link_id).await;
+            return Err(TransportError::Config(format!(
+                "{token}: this node carries no call media"
+            )));
+        }
         let checked = match self.seals.transit(arrival.link_id) {
             Some((transit, Some(claimed))) => check_claim(&claimed, arrival.peer.as_str())
                 .map(|()| transit)
@@ -8568,6 +8581,27 @@ impl ReticulumTransport {
     /// CC 5.4.6 — this node's Anonymous Tier (dormant in v44 unless opted in
     /// and available).
     #[must_use]
+    /// 45.2.0 — why this node carries no call media, if it does not: the
+    /// anonymous tier first (`onion_anonymous_no_media`; anonymous implies
+    /// shaped-only), else its own shaped-only setting
+    /// ([`crate::transport::link_shaping::SHAPED_ONLY_NO_MEDIA`], counted on
+    /// the A/V plane). Counted each time it refuses. `None`: media is
+    /// allowed.
+    pub fn media_refusal(&self) -> Option<&'static str> {
+        if let Err(token) = self.onion.media_allowed() {
+            self.onion.count(token);
+            return Some(token);
+        }
+        if self.shapers.shaped_only() {
+            let token = crate::transport::link_shaping::SHAPED_ONLY_NO_MEDIA;
+            if let Some(m) = self.metrics.get() {
+                m.inc_av_plane(token);
+            }
+            return Some(token);
+        }
+        None
+    }
+
     pub fn onion(&self) -> &Arc<crate::onion::runtime::OnionRuntime> {
         &self.onion
     }
