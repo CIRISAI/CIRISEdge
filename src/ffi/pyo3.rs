@@ -14993,6 +14993,7 @@ mod pyo3_tier2_tests {
     /// token, and a refusal is a `ValueError` or `RuntimeError` that starts
     /// with its token.
     #[test]
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)] // one projection per event kind
     fn call_events_and_refusals_project_by_token() {
         use crate::transport::av_call::{CallError, CallEvent, EndCause};
         init_python();

@@ -1250,7 +1250,7 @@ mod tests {
         rows.push((
             "peer unsupported, backoff ignored",
             DirectPathFacts {
-                backoff_remaining: Some(Duration::from_secs(60)),
+                backoff_remaining: Some(Duration::from_mins(1)),
                 ..failed(F::Rejected(reject::UNSUPPORTED))
             },
             C::PeerUnsupported,
@@ -1261,7 +1261,7 @@ mod tests {
             "peer not trusted",
             DirectPathFacts {
                 peer_trusted: false,
-                backoff_remaining: Some(Duration::from_secs(60)),
+                backoff_remaining: Some(Duration::from_mins(1)),
                 ..failed(F::PunchFailed)
             },
             C::NotTrusted,
@@ -1281,7 +1281,7 @@ mod tests {
         rows.push((
             "peer policy",
             DirectPathFacts {
-                backoff_remaining: Some(Duration::from_secs(120)),
+                backoff_remaining: Some(Duration::from_mins(2)),
                 ..failed(F::Rejected(reject::POLICY))
             },
             C::RefusedByPeerPolicy,
@@ -1296,7 +1296,7 @@ mod tests {
                     peer_nat: Some(peer(NatAllocation::Random)),
                     escalation_granted: Some(false),
                     heard_not_acked: Some(true),
-                    backoff_remaining: Some(Duration::from_secs(3_600)),
+                    backoff_remaining: Some(Duration::from_hours(1)),
                     ..failed(f)
                 },
                 C::BothNatsRandom,
@@ -1311,7 +1311,7 @@ mod tests {
                 peer_nat: Some(peer(NatAllocation::Sequential)),
                 escalation_granted: Some(false),
                 escalation_refill: Some(Duration::from_secs(90)),
-                backoff_remaining: Some(Duration::from_secs(3_600)),
+                backoff_remaining: Some(Duration::from_hours(1)),
                 ..failed(F::PunchFailed)
             },
             C::BudgetRefused,
@@ -1322,7 +1322,7 @@ mod tests {
             "budget refused, refill unknown: the backoff",
             DirectPathFacts {
                 escalation_granted: Some(false),
-                backoff_remaining: Some(Duration::from_secs(3_600)),
+                backoff_remaining: Some(Duration::from_hours(1)),
                 ..failed(F::PunchFailed)
             },
             C::BudgetRefused,
@@ -1350,7 +1350,7 @@ mod tests {
             "heard, never acked",
             DirectPathFacts {
                 heard_not_acked: Some(true),
-                backoff_remaining: Some(Duration::from_secs(3_600)),
+                backoff_remaining: Some(Duration::from_hours(1)),
                 ..failed(F::PunchFailed)
             },
             C::PunchOneWay,
@@ -1360,7 +1360,7 @@ mod tests {
         rows.push((
             "punch failed",
             DirectPathFacts {
-                backoff_remaining: Some(Duration::from_secs(3_600)),
+                backoff_remaining: Some(Duration::from_hours(1)),
                 ..failed(F::PunchFailed)
             },
             C::PunchNoAnswer,
@@ -1390,7 +1390,7 @@ mod tests {
             "timeout, unmeasured report",
             DirectPathFacts {
                 local_nat: Some(NatReport::unknown(at())),
-                backoff_remaining: Some(Duration::from_secs(120)),
+                backoff_remaining: Some(Duration::from_mins(2)),
                 ..failed(F::Timeout)
             },
             C::NatUndetermined,
@@ -1517,6 +1517,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one row per technique and outcome
     fn the_tried_list_names_what_ran() {
         use AttemptFailure as F;
         let t = |f: DirectPathFacts| -> Vec<(PathKind, PathOutcome)> {
@@ -1758,6 +1759,7 @@ mod tests {
     /// The relay half of the verdict, row by row: who else is in the call,
     /// whether a member relays, whether only a serve seat offered.
     #[test]
+    #[allow(clippy::type_complexity)] // a row is the table's whole contract
     fn the_relay_verdict_table() {
         let punch = DirectPathFacts {
             backoff_remaining: Some(Duration::from_millis(2_500)),

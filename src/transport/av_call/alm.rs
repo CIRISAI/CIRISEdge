@@ -2300,7 +2300,7 @@ mod tests {
         assert!(a
             .labels
             .contains(&crate::observability::ALM_REFUSE_SERVE_SEAT));
-        assert!(a.relays.get(&s(9)).is_none(), "no relay admission is made");
+        assert!(!a.relays.contains_key(&s(9)), "no relay admission is made");
         // Its own stream is publishing, not relaying.
         a.on_caps("b", CAPS_THIS_BUILD);
         let out = a.on_control("b", sub(s(1)), 10.0);
@@ -2377,9 +2377,7 @@ mod tests {
                 a.on_own_published(600, true);
                 a.on_sent("b", 700);
             }
-            a.t0 =
-                a.t0.checked_sub(Duration::from_millis(1_000))
-                    .expect("clock");
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
             let _ = a.tick(&[]);
         }
         assert_eq!(
@@ -2403,9 +2401,7 @@ mod tests {
                 a.on_own_published(600, true);
                 a.on_sent("b", 700);
             }
-            a.t0 =
-                a.t0.checked_sub(Duration::from_millis(1_000))
-                    .expect("clock");
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
             out.extend(a.tick(&["b".into(), "c".into(), "d".into()]));
         }
         let kids = a.own_children();
