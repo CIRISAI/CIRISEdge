@@ -116,6 +116,10 @@ token_enum! {
         /// seat offered, which never relays). The detail still names why the
         /// direct path failed.
         NoMemberCouldRelay => "no_member_could_relay",
+        /// This node is on the anonymous tier (CC 5.4.3): it neither
+        /// proposes nor accepts a direct link, because a punch reveals its
+        /// address. Not retryable while the tier is on.
+        AnonymousNoDirect => "anonymous_no_direct",
         /// None of the above (a transient refusal, a path lost on the way, the
         /// operator's switch).
         Other => "other",
@@ -747,7 +751,7 @@ pub struct MediaPathVerdict {
 impl MediaPathCause {
     /// Whether a retry can help. `false` for a fact a retry does not change:
     /// both NATs random, the peer untrusted, the peer's policy, the peer
-    /// unable to take part. `true` for the rest.
+    /// unable to take part, the anonymous tier. `true` for the rest.
     #[must_use]
     pub const fn retryable(self) -> bool {
         !matches!(
@@ -756,6 +760,7 @@ impl MediaPathCause {
                 | Self::NotTrusted
                 | Self::RefusedByPeerPolicy
                 | Self::PeerUnsupported
+                | Self::AnonymousNoDirect
         )
     }
 }
@@ -1479,7 +1484,12 @@ mod tests {
         }
         // `no_member_could_relay` is the relay half's (`the_relay_verdict_table`):
         // the direct verdict never names it.
-        for c in C::ALL.iter().filter(|c| **c != C::NoMemberCouldRelay) {
+        // `anonymous_no_direct` is decided before any attempt, by the
+        // anonymous tier (its emission lands with the room-join merge).
+        for c in C::ALL
+            .iter()
+            .filter(|c| !matches!(**c, C::NoMemberCouldRelay | C::AnonymousNoDirect))
+        {
             assert!(
                 rows.iter().any(|r| r.2 == *c),
                 "{c:?} has no row that maps to it"
@@ -1508,6 +1518,7 @@ mod tests {
             (C::BudgetRefused, true),
             (C::NotTrusted, false),
             (C::NoMemberCouldRelay, true),
+            (C::AnonymousNoDirect, false),
             (C::Other, true),
         ];
         assert_eq!(table.len(), C::ALL.len());
@@ -1710,7 +1721,7 @@ mod tests {
             RelayStanding::token,
             RelayStanding::parse,
         );
-        assert_eq!(MediaPathCause::ALL.len(), 11);
+        assert_eq!(MediaPathCause::ALL.len(), 12);
         assert_eq!(PathKind::ALL.len(), 7);
         assert_eq!(RelayStanding::ALL.len(), 3);
         assert_eq!(PathOutcome::ALL.len(), 8);

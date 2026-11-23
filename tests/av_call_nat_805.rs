@@ -1107,7 +1107,7 @@ async fn a_failed_media_path_says_why_once_and_is_restored() {
 
     // A's proposal is refused, on the identity link it rode.
     let refused_link = loop {
-        let e = tokio::time::timeout(Duration::from_secs(60), p.a.events.recv())
+        let e = tokio::time::timeout(Duration::from_mins(1), p.a.events.recv())
             .await
             .expect("A's proposal ends")
             .expect("direct-path events");
@@ -1129,7 +1129,7 @@ async fn a_failed_media_path_says_why_once_and_is_restored() {
             .count()
     };
     assert!(
-        wait_until(Duration::from_secs(60), || async {
+        wait_until(Duration::from_mins(1), || async {
             failed(&seen_a) >= 1 && failed(&seen_b) >= 1
         })
         .await,
@@ -1634,6 +1634,7 @@ struct Trio {
 /// room over all three. `A` and `B` refuse each other's direct-link request
 /// (REJECT `POLICY`), so their punch never succeeds: the pair a random
 /// symmetric NAT and a strict one make. `C` punches to both.
+#[allow(clippy::too_many_lines)] // three sides, their routes and the room
 async fn trio(tag: &str) -> Trio {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1753,6 +1754,8 @@ fn member_opts() -> CallOptions {
     }
 }
 
+// The options are moved into the call.
+#[allow(clippy::large_types_passed_by_value)]
 async fn join_as(side: &Side, group: &CohortGroup, room: &str, opts: CallOptions) -> Call {
     Call::join(
         room,
@@ -1820,7 +1823,8 @@ fn t_bytes(t: &ReticulumNode) -> u64 {
 /// `MediaPathFailed`, and C counts what it forwarded. No call leg crosses T,
 /// and T carries signalling only: what crossed it during the media is a small
 /// fraction of what the media moved.
-#[allow(clippy::too_many_lines)]
+// a, b, c, p: the members and the fixture, as the docs name them.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_member_that_cannot_punch_is_heard_through_another_member() {
     let p = Box::pin(trio("relay")).await;
