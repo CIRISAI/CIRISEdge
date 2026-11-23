@@ -523,6 +523,20 @@ struct OutboundState {
     last_media: Option<std::time::Instant>,
 }
 
+/// One media send: forwarded for another member ([`AvLinkSender::send_media_relayed`])
+/// or this node's own ([`AvLinkSender::send_media`]).
+async fn send_media_as(
+    sender: &dyn AvLinkSender,
+    wire: &[u8],
+    forwarded: bool,
+) -> Result<(), AvDispatcherError> {
+    if forwarded {
+        sender.send_media_relayed(wire).await
+    } else {
+        sender.send_media(wire).await
+    }
+}
+
 /// ALM C5 — a leg with no media for this long counts as idle.
 pub const MEDIA_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 /// ALM C5 — how long a leg resuming from idle settles. The Channel opens at a
@@ -983,21 +997,14 @@ impl AvDispatcher {
                 state.settle_until = Some(state.settle_until.map_or(until, |u| u.max(until)));
             }
             state.last_media = Some(now);
-            let send = |sender: &dyn AvLinkSender, wire: &[u8]| {
-                if forwarded {
-                    sender.send_media_relayed(wire)
-                } else {
-                    sender.send_media(wire)
-                }
-            };
-            let mut sent = send(state.sender.as_ref(), &wire).await;
+            let mut sent = send_media_as(state.sender.as_ref(), &wire, forwarded).await;
             while matches!(sent, Err(AvDispatcherError::Congested))
                 && state
                     .settle_until
                     .is_some_and(|until| std::time::Instant::now() < until)
             {
                 tokio::time::sleep(SETTLE_RETRY).await;
-                sent = send(state.sender.as_ref(), &wire).await;
+                sent = send_media_as(state.sender.as_ref(), &wire, forwarded).await;
             }
             if state
                 .settle_until

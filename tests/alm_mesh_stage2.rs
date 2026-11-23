@@ -3218,3 +3218,82 @@ async fn a_relay_that_turns_off_hands_its_children_to_another_relay() {
     drop(ce);
     drop(ca);
 }
+
+/// **Calls cut — a serve seat that IS a room member never relays**, audio
+/// included, even joined with `relay: true`: members `A` (relays), `S` (a
+/// serve seat in every node's canonical set, its own included), `B` and `C`
+/// (each a TCP client of A and S only, so they reach each other only through
+/// one of them). B and C hear each other through A, never S; S reports
+/// `relaying: false` and forwards to nobody, and nobody takes it as a parent.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_serve_seat_in_the_room_never_relays() {
+    let _call = one_call().await;
+    let tag = "alm2-seat";
+    // 0 = A, 1 = S (the seat), 2 = B, 3 = C; 4 = T.
+    let (nodes, groups, _tmp) = topo(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+    )
+    .await;
+    let (a, seat, b, c) = (&nodes[0], &nodes[1], &nodes[2], &nodes[3]);
+    for n in &nodes {
+        n._edge
+            .recognised_seats()
+            .write()
+            .expect("the seat set")
+            .insert(seat.key.key_id.clone());
+    }
+    let _ca = join_loaded(a, &groups[0], tag, relay_opts(), None).await;
+    let cs = join_loaded(seat, &groups[1], tag, relay_opts(), None).await;
+    let cb = join_loaded(b, &groups[2], tag, relay_opts(), None).await;
+    let cc = join_loaded(c, &groups[3], tag, relay_opts(), None).await;
+    wait_legs(&cb, 2).await;
+    wait_legs(&cc, 2).await;
+    assert_eq!(cs.relay_status(), (false, 0), "a seat never relays");
+    let through_a = wait_until(Duration::from_secs(90), || async {
+        primary_for(&cc, cb.stream()).as_deref() == Some(a.key.key_id.as_str())
+            && primary_for(&cb, cc.stream()).as_deref() == Some(a.key.key_id.as_str())
+    })
+    .await;
+    assert!(
+        through_a,
+        "B and C hear each other through A: C {:?} / B {:?}",
+        cc.alm_parents(),
+        cb.alm_parents()
+    );
+    // Long enough for several offer rounds: S is never a parent of anything
+    // it does not publish, and relays nothing.
+    for _ in 0..20 {
+        for call in [&cb, &cc] {
+            for p in call.alm_parents() {
+                if p.publisher.as_deref() == Some(seat.key.key_id.as_str()) {
+                    continue;
+                }
+                for parent in [p.primary.as_deref(), p.standby.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    assert_ne!(parent, seat.key.key_id, "the seat is a media parent: {p:?}");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(cs.relay_status(), (false, 0));
+    assert!(cs.relayed_to().is_empty(), "{:?}", cs.relayed_to());
+    assert_eq!(cs.alm_counts().forwarded, 0);
+}
