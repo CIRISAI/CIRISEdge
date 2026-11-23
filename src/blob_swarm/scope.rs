@@ -403,6 +403,13 @@ impl BlobScopeRouter {
         self.table.as_ref().map_or(0, |t| t.generation())
     }
 
+    /// CIRISEdge#1029 F5 — a receiver that wakes when the table's
+    /// generation moves; `None` with no table.
+    #[must_use]
+    pub(crate) fn table_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.table.as_ref().map(|t| t.changes())
+    }
+
     /// 45.1.1 — whether the table holds `group` (a [`table_key`] id) at any
     /// live epoch.
     #[must_use]

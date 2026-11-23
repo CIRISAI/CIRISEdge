@@ -1669,8 +1669,29 @@ where
         let mut held_back: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
         let mut durability_ticks: u64 = 0;
         let max = self.config.max_in_flight.max(1);
+        // CIRISEdge#1029 F5 — the scope table's installs, so a pull parked on
+        // its group re-runs as the group is installed (the field's ~4 s wait
+        // for the next tick). Taken again on a tick while the table is not
+        // armed yet; the tick stays the backstop.
+        let mut installs = self.edge.blob_scope_router().table_changes();
         loop {
             tokio::select! {
+                changed = async {
+                    match installs.as_mut() {
+                        Some(rx) => rx.changed().await.is_ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if !changed {
+                        installs = None;
+                        continue;
+                    }
+                    if self.wake_installed_scopes() > 0 {
+                        for (sha, row) in self.woken_dags() {
+                            self.dispatch(&limiter, row, sha, 0);
+                        }
+                    }
+                }
                 () = async {
                     match durability.as_mut() {
                         Some(t) => { t.tick().await; }
@@ -1715,6 +1736,9 @@ where
                         self.dispatch(&limiter, r.row, r.sha, r.attempts);
                     }
                     // 45.1.1 — a group installed since a pull parked on it.
+                    if installs.is_none() {
+                        installs = self.edge.blob_scope_router().table_changes();
+                    }
                     self.wake_installed_scopes();
                     for (sha, row) in self.woken_dags() {
                         self.dispatch(&limiter, row, sha, 0);
@@ -5045,6 +5069,147 @@ mod tests {
         let sink = PullSink::disconnected();
         let row = content_row("community", "room", &SHA);
         assert_eq!(sink.offer(&row), PullOffer::Dropped);
+    }
+    /// CIRISEdge#1029 F5 — **the run loop wakes a pull parked on its room's
+    /// scope install when the install lands, not on its next tick.** Field
+    /// (12-person star, the joiner): the room keyed, the scope address was
+    /// installed, and the parked pulls waited for the loop's 5 s tick
+    /// (`retry_backoff`) before re-running: ~4 s on the critical path to the
+    /// first read. Here the tick is a minute away, so only the install can
+    /// wake it. Red before: still parked when the deadline passes.
+    #[cfg(feature = "_reticulum-module")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_loop_wakes_a_scope_parked_pull_on_the_install_1029() {
+        use crate::blob_swarm::chunk_grants_779_tests::{puller_with, two_devices, NoWire};
+        use crate::blob_swarm::scope::table_key;
+        use crate::scope_addressing::{MemberAddress, ScopeAddressTable, StubDeriver};
+        use crate::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
+        use ciris_persist::federation::FederationDirectory;
+        struct Quiet;
+        impl ScopedDestinationSink for Quiet {
+            fn register(&self, _: &MemberAddress, _: &crate::CohortScope) -> Result<(), String> {
+                Ok(())
+            }
+            fn retire(&self, _: &MemberAddress, _: &crate::CohortScope) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        /// A scope-native node must answer chunk fetches by scope (#640).
+        struct Sighted;
+        #[async_trait::async_trait]
+        impl crate::blob_swarm::BlobChunkSource for Sighted {
+            async fn read_chunk(
+                &self,
+                _b: [u8; 32],
+                _c: [u8; 32],
+                _p: &str,
+            ) -> Result<Option<Vec<u8>>, crate::blob_swarm::ChunkSourceRefusal> {
+                Ok(None)
+            }
+            async fn chunk_scope(&self, _b: [u8; 32]) -> Option<crate::blob_swarm::ContentScope> {
+                None
+            }
+            fn answers_scope(&self) -> bool {
+                true
+            }
+        }
+        fn room(id: &str) -> crate::blob_swarm::ContentScope {
+            crate::blob_swarm::ContentScope::Group {
+                scope: crate::CohortScope::Cohort {
+                    cohort_id: id.to_owned(),
+                },
+                group_id: id.to_owned(),
+            }
+        }
+        let (_alice, _node_a, node) = two_devices().await;
+        let table = Arc::new(ScopeAddressTable::new(Arc::new(StubDeriver)));
+        let lifecycle = Arc::new(ScopeLifecycle::new(
+            Arc::clone(&table),
+            Arc::new(Quiet),
+            node.me.clone(),
+            Duration::from_mins(5),
+        ));
+        let edge = Arc::new(
+            crate::Edge::builder()
+                .directory(node.dir.clone() as Arc<dyn crate::verify::VerifyDirectory>)
+                .federation_directory(node.dir.clone() as Arc<dyn FederationDirectory>)
+                .queue(node.dir.clone())
+                .signer(node.signer.clone())
+                .transport(Arc::new(NoWire) as Arc<dyn crate::transport::Transport>)
+                .config(crate::EdgeConfig::default())
+                .scope_lifecycle(lifecycle)
+                .blob_chunk_source(Arc::new(Sighted))
+                .build()
+                .expect("build edge"),
+        );
+        let puller = puller_with(
+            &node,
+            &edge,
+            PullConfig {
+                retry_backoff: Duration::from_mins(1),
+                ..PullConfig::default()
+            },
+        );
+        let router = edge.blob_scope_router();
+        let row = bare_row(ciris_persist::federation::types::cohort_scope::COMMUNITY);
+        let install = |id: &str, seed: u8| {
+            let (scope, group) = table_key(&room(id)).expect("a room has a table key");
+            table
+                .install_group(
+                    &scope,
+                    &group,
+                    1,
+                    &[seed; 32],
+                    &[node.me.as_str(), "native-alice"],
+                )
+                .expect("install");
+        };
+        let park = |sha: [u8; 32], id: &str, generation: u64| {
+            let (scope, group) = table_key(&room(id)).expect("a room has a table key");
+            puller.key_waits.park(
+                sha,
+                &row,
+                key_wake::Awaiting::Scope {
+                    scope,
+                    group,
+                    generation,
+                },
+            );
+        };
+        async fn gone(waits: &KeyWaits, sha: [u8; 32]) -> bool {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while waits.is_parked(sha) {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            true
+        }
+        let waits = Arc::clone(&puller.key_waits);
+        // A sentinel the loop's first tick wakes (its room is installed past
+        // the generation it parked at): once it is gone, the loop is on its
+        // minute-long wait.
+        let first = "chat:room:v1:00000000000000000000000000001029";
+        let generation = router.table_generation();
+        park([0x01; 32], first, generation);
+        install(first, 1);
+        let (_sink, run) = Arc::clone(&puller).start();
+        assert!(
+            gone(&waits, [0x01; 32]).await,
+            "the first tick re-runs the sentinel"
+        );
+
+        // The joiner's pull parks on its room, and then the room keys.
+        let joined = "chat:room:v1:f28dba543b2f4186ab20eed2a2748afa";
+        park([0x02; 32], joined, router.table_generation());
+        install(joined, 2);
+        let woken = gone(&waits, [0x02; 32]).await;
+        run.abort();
+        assert!(
+            woken,
+            "the install wakes the parked pull at once, not at the loop's next tick"
+        );
     }
 }
 

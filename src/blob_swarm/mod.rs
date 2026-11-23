@@ -1669,14 +1669,29 @@ fn resolve_holder_routes(
                         .collect(),
                     _ => Vec::new(),
                 };
-                tracing::warn!(
-                    blob_sha = %blob_hex,
-                    holder = %holder,
-                    reason = refusal.reason_tag(),
-                    installed_groups = ?installed,
-                    "blob holder DROPPED from the swarm candidate set — no address for \
-                     this content's scope. NOT retried at the federation address: {refusal}",
-                );
+                // CIRISEdge#1029 F5 — a group not installed YET is the room
+                // still keying: the pull parks on the install and the install
+                // wakes it, so it is not a fault, and at WARN it repeated per
+                // holder per retry on every joiner. Other refusals stay WARN.
+                if matches!(refusal, ScopeRouteRefusal::GroupNotInstalled { .. }) {
+                    tracing::info!(
+                        blob_sha = %blob_hex,
+                        holder = %holder,
+                        reason = refusal.reason_tag(),
+                        installed_groups = ?installed,
+                        "blob holder dropped from the swarm candidate set until its group is \
+                         installed here; the pull waits for the install: {refusal}",
+                    );
+                } else {
+                    tracing::warn!(
+                        blob_sha = %blob_hex,
+                        holder = %holder,
+                        reason = refusal.reason_tag(),
+                        installed_groups = ?installed,
+                        "blob holder DROPPED from the swarm candidate set — no address for \
+                         this content's scope. NOT retried at the federation address: {refusal}",
+                    );
+                }
                 if first_refusal.is_none() {
                     first_refusal = Some(refusal.to_string());
                 }
