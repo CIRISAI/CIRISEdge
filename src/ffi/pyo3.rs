@@ -4796,6 +4796,7 @@ fn call_state_token(s: &crate::transport::av_call::CallState) -> String {
         CallState::Ended(EndCause::HungUp) => "ended:hung_up".to_owned(),
         CallState::Ended(EndCause::Revoked) => "ended:revoked".to_owned(),
         CallState::Ended(EndCause::Expired) => "ended:expired".to_owned(),
+        CallState::Ended(EndCause::MediaRefused { token }) => format!("ended:{token}"),
     }
 }
 

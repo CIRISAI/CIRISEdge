@@ -3764,3 +3764,87 @@ async fn a_shaped_only_node_neither_joins_nor_accepts_call_media() {
     }
     assert_eq!(heard, 20, "A hears B: the others' call runs");
 }
+
+/// **45.2.0 — a member that turns shaped-only MID-call ends its call**
+/// (`EndCause::MediaRefused`, `shaped_only_no_media`): its legs are torn
+/// down at once, so it sends no more unshaped media, and the others carry on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_turning_shaped_only_mid_call_ends_its_call() {
+    let _call = one_call().await;
+    let tag = "alm2-midshaped";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let ca = join_loaded(&nodes[0], &groups[0], tag, relay_opts(), None).await;
+    let cb = join_loaded(&nodes[1], &groups[1], tag, relay_opts(), None).await;
+    let cc = join_loaded(&nodes[2], &groups[2], tag, relay_opts(), None).await;
+    for call in [&ca, &cb, &cc] {
+        wait_legs(call, 2).await;
+    }
+    let c = &nodes[2];
+    let mut policy = c.transport.shaping_policy();
+    policy.require_shaped_links = true;
+    let _ = c.transport.set_shaping_policy(policy).await;
+    let ended = wait_until(Duration::from_secs(5), || async {
+        matches!(
+            cc.state(),
+            ciris_edge::transport::av_call::CallState::Ended(
+                ciris_edge::transport::av_call::EndCause::MediaRefused {
+                    token: "shaped_only_no_media"
+                }
+            )
+        )
+    })
+    .await;
+    assert!(ended, "C's call ends by name: {:?}", cc.state());
+    assert!(
+        cc.legs().is_empty(),
+        "C's legs are torn down: {:?}",
+        cc.legs()
+    );
+    assert_eq!(av(&c.metrics, "av_call_ended_media_refused"), 1);
+    // The others lose their legs to C and keep their own.
+    for call in [&ca, &cb] {
+        assert!(
+            wait_until(Duration::from_secs(20), || async {
+                !call.legs().contains(&c.key.key_id) && call.legs().len() == 1
+            })
+            .await,
+            "the others carry on without C: {:?}",
+            call.legs()
+        );
+    }
+}
+
+/// **45.2.0 — path events concern attendees only**: a room member who never
+/// joins the call produces no `media_path_failed` or `media_path_restored` on
+/// anyone, past the relay wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_who_never_joins_produces_no_path_event() {
+    let _call = one_call().await;
+    let tag = "alm2-absent";
+    let (nodes, groups, _tmp) = topo(tag, 3, 3, &[(0, 1), (0, 2), (1, 2)], None).await;
+    let mut ca = join_loaded(&nodes[0], &groups[0], tag, relay_opts(), None).await;
+    let mut cb = join_loaded(&nodes[1], &groups[1], tag, relay_opts(), None).await;
+    let mut events = [
+        ca.events().expect("A's events"),
+        cb.events().expect("B's events"),
+    ];
+    wait_legs(&ca, 1).await;
+    wait_legs(&cb, 1).await;
+    tokio::time::sleep(ciris_edge::transport::av_call::RELAY_WAIT * 2).await;
+    let absent = &nodes[2].key.key_id;
+    for (who, rx) in ["A", "B"].iter().zip(events.iter_mut()) {
+        while let Ok(e) = rx.try_recv() {
+            let about = match &e {
+                CallEvent::MediaPathFailed { member, .. }
+                | CallEvent::MediaPathRestored { member, .. } => Some(member),
+                _ => None,
+            };
+            assert_ne!(
+                about,
+                Some(absent),
+                "{who} raised a path event for a non-attendee: {e:?}"
+            );
+        }
+    }
+    drop((ca, cb));
+}

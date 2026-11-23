@@ -8588,16 +8588,26 @@ impl ReticulumTransport {
     /// the A/V plane). Counted each time it refuses. `None`: media is
     /// allowed.
     pub fn media_refusal(&self) -> Option<&'static str> {
-        if let Err(token) = self.onion.media_allowed() {
-            self.onion.count(token);
-            return Some(token);
-        }
-        if self.shapers.shaped_only() {
-            let token = crate::transport::link_shaping::SHAPED_ONLY_NO_MEDIA;
+        let token = self.media_refused_now()?;
+        if token == crate::transport::link_shaping::SHAPED_ONLY_NO_MEDIA {
             if let Some(m) = self.metrics.get() {
                 m.inc_av_plane(token);
             }
+        } else {
+            self.onion.count(token);
+        }
+        Some(token)
+    }
+
+    /// 45.2.0 — [`Self::media_refusal`] without counting: a live call reads
+    /// it every watch tick to end itself on a mid-call switch.
+    #[must_use]
+    pub fn media_refused_now(&self) -> Option<&'static str> {
+        if let Err(token) = self.onion.media_allowed() {
             return Some(token);
+        }
+        if self.shapers.shaped_only() {
+            return Some(crate::transport::link_shaping::SHAPED_ONLY_NO_MEDIA);
         }
         None
     }

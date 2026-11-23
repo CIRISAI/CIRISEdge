@@ -1106,6 +1106,9 @@ pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
 /// 45.2.0 — a call or A/V link refused on a shaped-only node: live A/V rides
 /// unshaped links only (Eric 2026-11-06).
 pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
+/// 45.2.0 — a live call ended because this node stopped carrying call media
+/// (it turned shaped-only or anonymous), `EndCause::MediaRefused`.
+pub const AV_CALL_ENDED_MEDIA_REFUSED: &str = "av_call_ended_media_refused";
 /// ALM — a chunk this node forwarded as an admitted media parent.
 pub const ALM_FORWARDED: &str = "alm_forwarded";
 /// ALM C4 — this node's primary parent for a stream changed.
@@ -2977,6 +2980,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_RELAY_OFF_SHED,
     ALM_UPLINK_STALL,
     SHAPED_ONLY_NO_MEDIA,
+    AV_CALL_ENDED_MEDIA_REFUSED,
     ALM_FORWARDED,
     ALM_PARENT_CHANGE,
     ALM_RELAY_TIER_ROSTER,
