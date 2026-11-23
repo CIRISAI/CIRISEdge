@@ -2089,7 +2089,7 @@ impl Shared {
                 return;
             }
         }
-        self.raise_path_failed(member, facts, &relay);
+        self.raise_path_failed(member, facts, relay);
     }
 
     /// Calls cut — what the ALM mesh says about relaying `member` here.
@@ -2123,10 +2123,10 @@ impl Shared {
         &self,
         member: &str,
         facts: &crate::transport::media_path::DirectPathFacts,
-        relay: &crate::transport::media_path::RelayFacts,
+        relay: crate::transport::media_path::RelayFacts,
     ) {
         use crate::transport::media_path::MediaPathFailure;
-        let failure = MediaPathFailure::from_facts(facts, relay, chrono::Utc::now());
+        let failure = MediaPathFailure::from_facts(facts, &relay, chrono::Utc::now());
         {
             let mut standing = Self::lock(&self.path_failed);
             match standing.get(member) {
@@ -2242,7 +2242,7 @@ impl Shared {
             if relay.member_relay || Self::lock(&self.in_links).values().any(|p| *p == member) {
                 continue;
             }
-            self.raise_path_failed(&member, &facts, &relay);
+            self.raise_path_failed(&member, &facts, relay);
         }
     }
 
@@ -5671,6 +5671,7 @@ struct LegCounters {
     delivered: u64,
 }
 
+#[allow(clippy::too_many_lines)] // the watch tick's ALM pass, in order
 async fn alm_tick(
     shared: &Arc<Shared>,
     sent_expired: &mut HashMap<[u8; 16], LegCounters>,

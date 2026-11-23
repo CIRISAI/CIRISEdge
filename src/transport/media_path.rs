@@ -1477,7 +1477,9 @@ mod tests {
             );
             assert_eq!(media_path_cause(facts), *cause);
         }
-        for c in C::ALL {
+        // `no_member_could_relay` is the relay half's (`the_relay_verdict_table`):
+        // the direct verdict never names it.
+        for c in C::ALL.iter().filter(|c| **c != C::NoMemberCouldRelay) {
             assert!(
                 rows.iter().any(|r| r.2 == *c),
                 "{c:?} has no row that maps to it"
@@ -1505,6 +1507,7 @@ mod tests {
             (C::PeerUnsupported, false),
             (C::BudgetRefused, true),
             (C::NotTrusted, false),
+            (C::NoMemberCouldRelay, true),
             (C::Other, true),
         ];
         assert_eq!(table.len(), C::ALL.len());

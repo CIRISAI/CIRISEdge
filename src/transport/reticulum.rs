@@ -6982,6 +6982,7 @@ impl ReticulumTransport {
         (path, facts)
     }
 
+    #[allow(clippy::too_many_lines)] // one deadline over every step, in order
     async fn ensure_direct_path_traced(
         &self,
         destination_key_id: &str,

@@ -4564,6 +4564,7 @@ fn call_codecs_arg(tokens: &[String]) -> PyResult<crate::transport::av_chunk_aut
 /// A [`CallEvent`](crate::transport::av_call::CallEvent) as a Python dict:
 /// `{"kind": <token>, ...the variant's fields}`.
 #[cfg(feature = "_reticulum-module")]
+#[allow(clippy::too_many_lines)] // one arm per event kind
 fn call_event_to_pydict<'py>(
     py: Python<'py>,
     ev: &crate::transport::av_call::CallEvent,
@@ -4679,7 +4680,10 @@ fn call_event_to_pydict<'py>(
             d.set_item("cause", cause.token())?;
             d.set_item("retryable", *retryable)?;
             d.set_item("retry_after_s", *retry_after_s)?;
-            d.set_item("detail", detail.map(|t| t.token()))?;
+            d.set_item(
+                "detail",
+                detail.map(crate::transport::media_path::PathDetail::token),
+            )?;
             let list = pyo3::types::PyList::empty(py);
             for a in tried {
                 list.append(path_attempt_to_pydict(py, a)?)?;
@@ -15086,9 +15090,12 @@ mod pyo3_tier2_tests {
                     relay: RelayStanding::RefusedByPolicy,
                 };
                 let d = call_event_to_pydict(py, &ev).expect("project");
-                let item = |d: &Bound<'_, pyo3::types::PyDict>, k: &str| {
+                fn item<'py>(
+                    d: &Bound<'py, pyo3::types::PyDict>,
+                    k: &str,
+                ) -> Bound<'py, pyo3::PyAny> {
                     d.get_item(k).expect("get").unwrap_or_else(|| panic!("{k}"))
-                };
+                }
                 let text = |d: &Bound<'_, pyo3::types::PyDict>, k: &str| -> String {
                     item(d, k).extract().expect("str")
                 };

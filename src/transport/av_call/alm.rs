@@ -184,6 +184,7 @@ pub struct AlmCounts {
 }
 
 /// The call's ALM controller state (see the module docs).
+#[allow(clippy::struct_excessive_bools)] // independent switches, each its own lever
 pub(super) struct AlmState {
     me: String,
     cfg: ControllerConfig,
@@ -1588,6 +1589,7 @@ impl AlmState {
             // G8 — a stalled datagram uplink is congested at one stream's room,
             // whatever the (blind) meter read.
             if self.uplink_stall {
+                #[allow(clippy::cast_precision_loss)] // bits/s, far below 2^52
                 let one = self.own_rate.costs().0 as f64;
                 w.congested = true;
                 w.capacity_bps = Some(w.capacity_bps.map_or(one, |c| c.min(one)));
@@ -2135,7 +2137,8 @@ mod tests {
         adm.set_upstream(Some(1), vec!["x".into()], true, 10);
         let mut rng = SplitMix64(3);
         let mut log = DecisionLog::default();
-        for (p, role) in [("b", Role::Primary), ("c", Role::Standby)] {
+        // Standbys: a cold relay's one trial slot holds one primary.
+        for (p, role) in [("b", Role::Standby), ("c", Role::Standby)] {
             let _ = adm.request(
                 0,
                 &SubscribeRequest {

@@ -1630,7 +1630,7 @@ impl SwarmScheduler {
             if dispatched.iter().any(|(_, c)| c == chunk_sha) {
                 continue;
             }
-            let best = best_rank(&peers);
+            let best = best_rank(peers);
             let candidate = peers
                 .iter()
                 .filter(|(_, p)| {
