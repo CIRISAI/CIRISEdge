@@ -809,13 +809,9 @@ mod tests {
         c.observe_link_lifetime(
             LINK_CLASS_UNIDENTIFIED,
             LinkCloseCause::Stale,
-            Duration::from_secs(7_200),
+            Duration::from_hours(2),
         );
-        c.observe_link_lifetime(
-            5,
-            LinkCloseCause::LocalTeardown,
-            Duration::from_secs(86_400),
-        );
+        c.observe_link_lifetime(5, LinkCloseCause::LocalTeardown, Duration::from_hours(24));
         let d = c.link_duration_seconds();
         assert_eq!(d.len(), 3, "{:?}", d.keys());
         let fc = &d["first_contact:peer_closed"];
