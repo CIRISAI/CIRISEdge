@@ -2037,6 +2037,10 @@ async fn a_punched_link_closed_under_a_call_comes_back_within_seconds() {
         "A's leg to B is back on a punched interface: {:?}",
         call_a.leg_info()
     );
+    eprintln!(
+        "[G8C] link close -> new punched identity link {took:?}; -> call leg punched again {:?}",
+        closed_at.elapsed()
+    );
     assert!(
         dl(&p.a.metrics, "direct_link_released_link_closed") >= 1,
         "{:?}",
