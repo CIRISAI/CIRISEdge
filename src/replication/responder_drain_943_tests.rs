@@ -587,11 +587,13 @@ async fn the_node_is_bounded_in_reply_bytes_across_its_lanes() {
         kind: EnvelopeKind::Key,
         want: Vec::new(),
         withheld: Vec::new(),
+        rf: None,
     });
     let summary = ReplicationMessage::Summary(super::protocol::SummaryMessage {
         status: None,
         kind: EnvelopeKind::Key,
         refs: Vec::new(),
+        rf: None,
     });
     let mut held = Vec::new();
     for n in 0..lanes {

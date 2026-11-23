@@ -1078,6 +1078,12 @@ pub struct BridgeConfig {
     /// every subject a listing lacks, the pre-v45 behaviour. Env
     /// [`Self::KEY_PLANE_READ_BUDGET_ENV`].
     pub key_plane_read_budget: usize,
+    /// Range fingerprints, step A (`docs/design/RANGE_FINGERPRINTS.md`): the
+    /// passive receiver half. `true` (the default) answers a peer's
+    /// fingerprinted Summary on the bootstrap planes and says so in a marker;
+    /// it sends no fingerprint of its own. `false` sends and answers exactly
+    /// as 45.1.9 did. Env [`Self::RANGE_FINGERPRINTS_ANSWER_ENV`].
+    pub range_fingerprints_answer: bool,
 }
 
 impl BridgeConfig {
@@ -1238,6 +1244,11 @@ impl BridgeConfig {
     /// [`Self::key_plane_read_budget`], a positive whole number, read once at
     /// runtime assembly. Zero or unparseable is ignored with a WARN.
     pub const KEY_PLANE_READ_BUDGET_ENV: &'static str = "CIRIS_EDGE_KEY_PLANE_READ_BUDGET";
+
+    /// Range fingerprints, step A — `0`, `off` or `false` turns the passive
+    /// receiver half OFF ([`Self::range_fingerprints_answer`]). Read once at
+    /// runtime assembly.
+    pub const RANGE_FINGERPRINTS_ANSWER_ENV: &'static str = "CIRIS_EDGE_RANGE_FINGERPRINTS_ANSWER";
 }
 
 impl BridgeConfig {
@@ -1289,6 +1300,7 @@ impl Default for BridgeConfig {
             feed_probe_spacing: super::store_feed::FEED_PROBE_SPACING,
             key_plane_listing_cache: Self::default_key_plane_listing_cache(),
             key_plane_read_budget: super::key_plane_memo::KEY_PLANE_READ_BUDGET,
+            range_fingerprints_answer: true,
         }
     }
 }
@@ -3098,6 +3110,10 @@ pub struct FederationDirectoryReplicationBridge {
     /// subject and invalidated by the store's admission cursor (see
     /// [`super::key_plane_memo`]).
     key_plane_memos: super::key_plane_memo::KeyPlaneMemos,
+    /// Range fingerprints, step A — the passive receiver half
+    /// ([`super::range_fp::RfReceiver`]), `None` when the lever is off. Held
+    /// only for synchronous work, never across an await.
+    rf_receiver: Option<Mutex<super::range_fp::RfReceiver>>,
     /// CIRISEdge#971 — the receive diff's holdings as a set
     /// ([`super::holdings_index`]), fed by [`Self::store_feed`], the
     /// write-through in [`Self::apply_envelope_bytes`], and the audit.
@@ -3636,7 +3652,7 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// Construct with explicit configuration, **v1-only**.
-    #[allow(clippy::too_many_lines)] // one initialiser per field of the bridge
+    #[allow(clippy::too_many_lines)] // one struct literal: every field's first state
     pub fn with_config(
         directory: Arc<dyn FederationDirectory>,
         cohort: CohortProvider,
@@ -3687,6 +3703,7 @@ impl FederationDirectoryReplicationBridge {
             first_contact_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             key_plane_memos: super::key_plane_memo::KeyPlaneMemos::default(),
+            rf_receiver: config.range_fingerprints_answer.then(Mutex::default),
             holdings_index: super::holdings_index::HoldingsIndex::new(
                 config.holdings_index,
                 config.holdings_audit_every,
@@ -5003,6 +5020,212 @@ impl FederationDirectoryReplicationBridge {
     }
 }
 
+// ─── Range fingerprints, step A: the receiver half ──────────────────
+
+impl FederationDirectoryReplicationBridge {
+    /// Range fingerprints, step A — the planes this node answers range
+    /// fingerprints on: the five bootstrap planes
+    /// ([`super::runtime::BOOTSTRAP_ROUND_PLANES`]). The Attestation plane is
+    /// step D (`docs/design/RANGE_FINGERPRINTS.md` §10.1).
+    #[must_use]
+    pub(crate) fn rf_answers_on(kind: EnvelopeKind) -> bool {
+        super::runtime::BOOTSTRAP_ROUND_PLANES.contains(&kind)
+    }
+
+    fn add_rf_io(&self, kind: EnvelopeKind, label: &'static str, n: u64) {
+        if let Some(m) = &self.metrics {
+            m.add_replication_io(kind, label, n);
+        }
+    }
+
+    /// Range fingerprints, step A — this node's HOLDINGS on a public plane,
+    /// for the receiver's restart seed (design §3.2, R24): the holdings
+    /// index's rows of that plane's family, never the wider settled set.
+    /// `IdentityOccurrenceRevocation` has none: its rows are `withdraws`,
+    /// whose type alone cannot tell an occurrence's withdrawal from a consent
+    /// grant's, so seeding it from a family would put non-public rows into a
+    /// mirror. It is listed once instead.
+    fn rf_seed_holdings(&self, kind: EnvelopeKind) -> Option<Vec<[u8; 32]>> {
+        super::holdings_index::SeedFamily::of_kind(kind)
+            .and_then(|f| self.holdings_index.hashes_of_family(f))
+    }
+
+    /// Range fingerprints, step A — is the plane's holdings index `Ready`, so
+    /// the receiver may answer (R8)? Otherwise `u:"unbooted"`.
+    fn rf_holdings_ready(&self, kind: EnvelopeKind) -> bool {
+        self.holdings_index.enabled()
+            && super::holdings_index::IndexPlane::of_kind(kind).is_some_and(|p| {
+                self.holdings_index.status(p) == super::holdings_index::Status::Ready
+            })
+    }
+
+    /// Range fingerprints, step A — answer one fingerprinted Summary from
+    /// `peer_key_id` (design §2.3-§2.6, §3.2, §6.4). Memory only: the mirror,
+    /// the holdings index, the refusal backoff, the known-hash and
+    /// held-equivalent maps. No store read.
+    async fn rf_answer_summary(
+        &self,
+        peer_key_id: &str,
+        kind: EnvelopeKind,
+        remote: &super::protocol::SummaryMessage,
+        raw_want: &[[u8; 32]],
+        final_want: &[[u8; 32]],
+    ) -> Option<super::range_fp::RfDiff> {
+        use super::range_fp::RxInput;
+        let rx = self.rf_receiver.as_ref()?;
+        if !Self::rf_answers_on(kind) {
+            return None;
+        }
+        let rf = remote.rf.as_ref()?;
+        let page = u64::from(self.sweep_page_budget().await);
+        let ready = self.rf_holdings_ready(kind);
+        let seed = if ready
+            && !rf.transport_refused
+            && rx.lock().is_ok_and(|g| g.wants_seed(peer_key_id, kind))
+        {
+            self.rf_seed_holdings(kind)
+        } else {
+            None
+        };
+        let raw: HashSet<[u8; 32]> = raw_want.iter().copied().collect();
+        let fin: HashSet<[u8; 32]> = final_want.iter().copied().collect();
+        let (ans, mirror_ids, pending_ids) = {
+            let mut g = rx.lock().ok()?;
+            let known = self.known_hashes.lock().ok()?;
+            let held_equivalent = |h: &[u8; 32]| self.held_equivalent.contains(h);
+            // A provisional member stays only while it is still not wanted.
+            // Probed without `retry_suppressed`'s side effects: that books a
+            // suppressed WANT, and this is no want.
+            let now = Instant::now();
+            let still_settled = |h: &[u8; 32]| {
+                self.refusal_backoff.suppressed_at(kind, h, now)
+                    || (kind == EnvelopeKind::TransportDestination
+                        && self.stale_routes.suppressed_at(kind, h, now))
+                    || known.contains(kind, h)
+                    || self.held_equivalent.contains(h)
+            };
+            let ans = g.answer(&RxInput {
+                peer: peer_key_id,
+                kind,
+                rf,
+                refs: &remote.refs,
+                raw_want: &raw,
+                final_want: &fin,
+                held_equivalent: &held_equivalent,
+                still_settled: &still_settled,
+                ready,
+                seed: seed.as_deref(),
+                feed: !known.is_empty(),
+                page,
+                now,
+            });
+            (ans, g.mirror_total(), g.pending_total())
+        };
+        self.rf_book_answer(kind, rf, &ans, mirror_ids, pending_ids);
+        if ans.flags.not_understood {
+            return self.rf_marker_diff_inner(kind);
+        }
+        if ans.flags.unable.is_none() {
+            self.rf_match_feed(peer_key_id, kind, &ans.matched);
+        }
+        Some(ans.diff)
+    }
+
+    /// Range fingerprints, step A — the receiver's counters and gauges for
+    /// one answer (design §8). Closed labels only; no peer, salt or address.
+    fn rf_book_answer(
+        &self,
+        kind: EnvelopeKind,
+        rf: &super::range_fp::RfSummary,
+        ans: &super::range_fp::RxAnswer,
+        mirror_ids: usize,
+        pending_ids: usize,
+    ) {
+        use super::range_fp::Unable;
+        let Some(m) = &self.metrics else {
+            return;
+        };
+        let n = |x: usize| u64::try_from(x).unwrap_or(u64::MAX);
+        m.set_holdings_index_gauge(crate::observability::RF_MIRROR_IDS_GAUGE, n(mirror_ids));
+        m.set_holdings_index_gauge(crate::observability::RF_PENDING_IDS_GAUGE, n(pending_ids));
+        m.set_holdings_index_gauge(
+            crate::observability::RF_PARSE_FAILED_GAUGE,
+            super::range_fp::RF_PARSE_FAILED.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if ans.flags.not_understood {
+            m.add_replication_io(kind, "rf_not_understood", 1);
+            return;
+        }
+        m.add_replication_io(kind, "rf_nodes_in", n(rf.n.len() + 16 * rf.c.len()));
+        m.add_replication_io(kind, "rf_match", n(ans.diff.m.len()));
+        m.add_replication_io(kind, "rf_split", n(ans.diff.s.len()));
+        m.add_replication_io(kind, "rf_list", n(ans.diff.l.len()));
+        m.add_replication_io(kind, "rf_seeded", n(ans.flags.seeded));
+        if ans.flags.salt_changed {
+            m.add_replication_io(kind, "rf_salt_changes_received", 1);
+        }
+        if ans.flags.rebuilt {
+            m.add_replication_io(kind, "rf_peersums_built", 1);
+        }
+        if let Some(why) = ans.flags.unable {
+            m.add_replication_io(kind, "rf_unable", 1);
+            let label = match why {
+                Unable::Unbooted => "rf_receiver_unbooted",
+                Unable::Salt => "rf_salt_refused",
+                Unable::Cap if ans.flags.mirror_capped => "rf_mirror_capped",
+                Unable::Cap => "rf_answers_cap",
+                Unable::Busy => "rf_rebuilds_refused",
+                Unable::Transport => "rf_transport_refused",
+            };
+            m.add_replication_io(kind, label, 1);
+        }
+    }
+
+    /// The refusal memory, for witnesses that seed a refusal the way the
+    /// apply choke records one.
+    #[cfg(test)]
+    pub(crate) fn refusal_backoff_for_tests(&self) -> &RefusalBackoff {
+        &self.refusal_backoff
+    }
+
+    fn rf_marker_diff_inner(&self, kind: EnvelopeKind) -> Option<super::range_fp::RfDiff> {
+        (self.rf_receiver.is_some() && Self::rf_answers_on(kind))
+            .then(|| super::range_fp::RfDiff::marker(super::range_fp::process_epoch(), true))
+    }
+
+    /// Range fingerprints, step A — the match feed's RECEIVER side (design
+    /// §5.7, R3). This node answered `match` on ranges of `peer`'s offer, so
+    /// `peer` offers, and holds, every id compared there. The consumer that
+    /// reads holders from rounds on this side is the known-hash holder map
+    /// (#552): each known hash in a matched range whose holder is `peer` is
+    /// re-heard from it, so it ages only when `peer`'s set changes. Booked as
+    /// a match, never as a Summary listing: nothing is ADDED to the known set
+    /// and no holder is changed here. The receiver fires once per change of
+    /// the matched set ([`super::range_fp::RxAnswer::matched`]). The other
+    /// three consumers (the removal ledger, the proactive push, "peer lacks
+    /// nothing") read the SENDER side, which arrives with step B.
+    fn rf_match_feed(&self, peer: &str, kind: EnvelopeKind, matched: &[(String, Vec<[u8; 32]>)]) {
+        if matched.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut refreshed = 0u64;
+        if let Ok(mut known) = self.known_hashes.lock() {
+            for (_, ids) in matched {
+                for h in ids {
+                    if known.holder(kind, h) == Some(peer) {
+                        known.note(kind, *h, peer, now);
+                        refreshed += 1;
+                    }
+                }
+            }
+        }
+        self.add_rf_io(kind, "rf_match_feed_ids", refreshed);
+    }
+}
+
 // ─── ReplicationDirectory impl ──────────────────────────────────────
 
 #[async_trait]
@@ -5913,6 +6136,48 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     fn listing_delivered(&self, peer_key_id: &str, kind: EnvelopeKind) {
         if let Ok(mut c) = self.sweep_cursors.lock() {
             c.listing_delivered(&(peer_key_id.to_owned(), kind));
+        }
+    }
+
+    fn rf_marker(&self, kind: EnvelopeKind) -> Option<super::range_fp::RfSummary> {
+        (self.rf_receiver.is_some() && Self::rf_answers_on(kind))
+            .then(|| super::range_fp::RfSummary::marker(super::range_fp::process_epoch(), true))
+    }
+
+    fn rf_marker_diff(&self, kind: EnvelopeKind) -> Option<super::range_fp::RfDiff> {
+        self.rf_marker_diff_inner(kind)
+    }
+
+    async fn rf_answer(
+        &self,
+        peer_key_id: &str,
+        kind: EnvelopeKind,
+        remote: &super::protocol::SummaryMessage,
+        raw_want: &[[u8; 32]],
+        final_want: &[[u8; 32]],
+    ) -> Option<super::range_fp::RfDiff> {
+        self.rf_answer_summary(peer_key_id, kind, remote, raw_want, final_want)
+            .await
+    }
+
+    fn rf_note_settled(&self, peer_key_id: &str, kind: EnvelopeKind, envelope_bytes: &[u8]) {
+        let Some(rx) = self.rf_receiver.as_ref() else {
+            return;
+        };
+        if !Self::rf_answers_on(kind) {
+            return;
+        }
+        // The body may have been listed under its act ref or its plain ref
+        // (persist #1252): a pending id under either enters.
+        let refs = [
+            super::wire_ref::envelope_ref(kind, envelope_bytes),
+            super::wire_ref::plain_ref(envelope_bytes),
+        ];
+        if rx
+            .lock()
+            .is_ok_and(|mut g| g.note_settled(peer_key_id, kind, &refs))
+        {
+            self.add_rf_io(kind, "rf_settled_from_peer", 1);
         }
     }
 
@@ -9039,7 +9304,8 @@ impl FederationDirectoryReplicationBridge {
                     // hashes. An unserializable row is skipped (the set lacks
                     // it: the safe direction).
                     if let Some((hash, _)) = content_hash_of(&served_row.attestation) {
-                        let record = Record::attestation(&served_row.attestation.attestation_id);
+                        let record = Record::attestation(&served_row.attestation.attestation_id)
+                            .with_family(&served_row.attestation.attestation_type);
                         if self
                             .holdings_index
                             .upsert(IndexPlane::Attestation, Some(record), hash)
@@ -9287,7 +9553,8 @@ impl FederationDirectoryReplicationBridge {
             );
             for row in &page {
                 if let Some((hash, _)) = content_hash_of(&row.attestation) {
-                    let record = Record::attestation(&row.attestation.attestation_id);
+                    let record = Record::attestation(&row.attestation.attestation_id)
+                        .with_family(&row.attestation.attestation_type);
                     self.holdings_index
                         .upsert(IndexPlane::Attestation, Some(record), hash);
                 }
@@ -31194,6 +31461,7 @@ pub(crate) mod tests {
             kind: EnvelopeKind::Attestation,
             want: listed.iter().copied().collect(),
             withheld: Vec::new(),
+            rf: None,
         });
         let out = session
             .on_message(diff, &provider, &applier, Some(ALICE_NODE))

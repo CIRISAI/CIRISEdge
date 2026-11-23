@@ -11213,6 +11213,13 @@ impl Transport for ReticulumTransport {
         TransportId::RETICULUM_RS
     }
 
+    /// Range fingerprints (R6): every frame on every lane of every link is
+    /// E1-sealed (`link_seal` module docs: "There is never a plaintext edge
+    /// frame in either direction"), whichever pooled link carries it.
+    fn confidential_to(&self, _peer: &str) -> bool {
+        true
+    }
+
     /// CIRISEdge#809 — the Edge's bag becomes this transport's; first
     /// handle wins, so a bag a test attached through `with_metrics` is
     /// kept and production (which never calls `with_metrics`) gets the
@@ -24438,6 +24445,7 @@ mod tests {
                     status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![],
+                    rf: None,
                 },
             ));
             assert_eq!(bootstrap_key_ids_named(&summary), None);
@@ -27350,6 +27358,7 @@ mod scope_native_addressing_tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: Vec::new(),
+                rf: None,
             }));
         let sent = Transport::send(&transport, "nobody", &frame).await;
         assert!(

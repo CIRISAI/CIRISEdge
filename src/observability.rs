@@ -2314,7 +2314,20 @@ pub const RESPONDER_ROUND_OPENED_DIFF: &str = "opened_diff";
 /// member asked for and was delivered, and each delivery is booked once more
 /// by the member's next answer: `admitted` (it holds the row) or `refused`
 /// (asked again, or withheld); `gave_up` at the courier's bound.
-pub const REPLICATION_IO_LABELS: [&str; 23] = [
+/// Range fingerprints, step A (`docs/design/RANGE_FINGERPRINTS.md` §8):
+/// `summary_bytes_*`, `diff_bytes_*` and `deliver_wire_bytes_*` are the
+/// FRAMES as they crossed the transport (the CRPL preamble and the JSON
+/// included, unlike `deliver_bytes_*`). `summary_refs_built` /
+/// `summary_bytes_built` book a Summary when it is BUILT, before
+/// `transport.send`, so a listing built and never sent is visible (§11.2).
+/// The `rf_*` labels count the receiver half: fingerprint nodes received,
+/// answers given (`match`, `split`, `list`), `rf` members it could not read,
+/// every `u` answer (`rf_unable`) and why (`receiver_unbooted`,
+/// `salt_refused`, `answers_cap`, `mirror_capped`, `rebuilds_refused`,
+/// `transport_refused`), salt changes accepted, bucket rebuilds run, ids the
+/// restart seed added, ids the match feed handed a consumer, and pending ids
+/// settled from that peer.
+pub const REPLICATION_IO_LABELS: [&str; 48] = [
     "deliver_rows_out",
     "deliver_bytes_out",
     "deliver_rows_in",
@@ -2338,7 +2351,43 @@ pub const REPLICATION_IO_LABELS: [&str; 23] = [
     "wrap_courier_admitted",
     "wrap_courier_refused",
     "wrap_courier_gave_up",
+    "summary_bytes_out",
+    "summary_bytes_in",
+    "diff_bytes_out",
+    "diff_bytes_in",
+    "deliver_wire_bytes_out",
+    "deliver_wire_bytes_in",
+    "summary_refs_built",
+    "summary_bytes_built",
+    "rf_nodes_in",
+    "rf_match",
+    "rf_split",
+    "rf_list",
+    "rf_not_understood",
+    "rf_unable",
+    "rf_receiver_unbooted",
+    "rf_salt_refused",
+    "rf_answers_cap",
+    "rf_mirror_capped",
+    "rf_rebuilds_refused",
+    "rf_transport_refused",
+    "rf_salt_changes_received",
+    "rf_peersums_built",
+    "rf_seeded",
+    "rf_match_feed_ids",
+    "rf_settled_from_peer",
 ];
+
+/// Range fingerprints, step A — the `holdings_index_gauge` label of the ids
+/// held in every receiver mirror together (`rf_mirror_ids`, design §8).
+pub const RF_MIRROR_IDS_GAUGE: &str = "rf_mirror_ids";
+/// Range fingerprints, step A — the `holdings_index_gauge` label of the ids a
+/// receiver has asked for and not yet seen admitted (`rf_pending_ids`).
+pub const RF_PENDING_IDS_GAUGE: &str = "rf_pending_ids";
+/// Range fingerprints, step A — the `holdings_index_gauge` label of the `rf`
+/// members this process could not read since it started (`rf_parse_failed`,
+/// design §2.5): a process-wide count, so a gauge.
+pub const RF_PARSE_FAILED_GAUGE: &str = "rf_parse_failed";
 /// Seat load 2026-11-13 (S0) — the classes a peer is counted under in
 /// `peer_activity`: the axis of this node's attestation send set that last
 /// resolved it (`consent`, `owner_routed`, `self_collective`, `first_contact`,

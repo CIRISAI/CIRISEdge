@@ -651,6 +651,17 @@ pub struct EnvelopeRef {
 pub struct SummaryMessage {
     pub kind: EnvelopeKind,
     pub refs: Vec<EnvelopeRef>,
+    /// Range fingerprints (`docs/design/RANGE_FINGERPRINTS.md`, FSD §3.4.2):
+    /// a NESTED optional member, declared after `kind` so the lane classifier
+    /// still finds `kind` in the frame's head, and parsed leniently: a shape
+    /// this build cannot read is no `rf`, never a failed Summary. `None` is
+    /// byte-identical to a pre-RF Summary.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::range_fp::lenient"
+    )]
+    pub rf: Option<super::range_fp::RfSummary>,
     /// CIRISEdge#937 — why `refs` is what it is, when it is not simply the
     /// responder's holdings. `None` (the overwhelmingly common case, and the
     /// only value a pre-v44 peer ever sends) means "these are my refs". A
@@ -700,6 +711,15 @@ pub struct DiffMessage {
     /// ignores the member (no `deny_unknown_fields`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub withheld: Vec<[u8; 32]>,
+    /// Range fingerprints: the receiver's answers to the Summary it answers,
+    /// or a marker (FSD §3.4.2). Nested, optional, leniently parsed, as
+    /// [`SummaryMessage::rf`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::range_fp::lenient"
+    )]
+    pub rf: Option<super::range_fp::RfDiff>,
 }
 
 /// 45.1.6 (CIRISEdge#1014) — the most hashes a [`DiffMessage`] withholds by
@@ -881,7 +901,83 @@ impl ReplicationMessage {
     /// Parse from on-wire JSON bytes. Returns `Err` on JSON parse
     /// failure or unknown tag.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        serde_json::from_slice(bytes).map_err(|e| ProtocolError::Decode(e.to_string()))
+        let mut msg: Self =
+            serde_json::from_slice(bytes).map_err(|e| ProtocolError::Decode(e.to_string()))?;
+        msg.decode_compact(bytes);
+        Ok(msg)
+    }
+
+    /// Range fingerprints, step A (design §12.3): fold the compact members
+    /// `rh` (Summary refs), `wh` / `xh` (Diff want / withheld) and `eb`
+    /// (Deliver bodies) into the fields every consumer already reads, so
+    /// nothing downstream knows the encoding existed. Decode only: this build
+    /// never sends them. A frame without any of the four keys pays one byte
+    /// scan.
+    fn decode_compact(&mut self, bytes: &[u8]) {
+        use super::range_fp::{decode_compact_body, decode_compact_hashes};
+        #[derive(serde::Deserialize)]
+        struct Compact {
+            #[serde(default)]
+            rh: Option<String>,
+            #[serde(default)]
+            wh: Option<String>,
+            #[serde(default)]
+            xh: Option<String>,
+            #[serde(default)]
+            eb: Option<Vec<String>>,
+        }
+        /// `extra`'s hashes appended to `into`, each once.
+        fn merge(into: &mut Vec<[u8; 32]>, extra: Option<&String>) {
+            if let Some(s) = extra {
+                let have: std::collections::HashSet<[u8; 32]> = into.iter().copied().collect();
+                into.extend(
+                    decode_compact_hashes(s)
+                        .into_iter()
+                        .filter(|h| !have.contains(h)),
+                );
+            }
+        }
+        // One pass over the frame for `"rh":`, `"wh":`, `"xh":` or `"eb":`.
+        let present = bytes.windows(5).any(|w| {
+            w[0] == b'"'
+                && matches!(&w[1..3], b"rh" | b"wh" | b"xh" | b"eb")
+                && w[3] == b'"'
+                && w[4] == b':'
+        });
+        if !present {
+            return;
+        }
+        let Ok(c) = serde_json::from_slice::<Compact>(bytes) else {
+            return;
+        };
+        match self {
+            Self::Summary(m) => {
+                if let Some(s) = c.rh.as_ref() {
+                    let have: std::collections::HashSet<[u8; 32]> =
+                        m.refs.iter().map(|r| r.envelope_hash).collect();
+                    m.refs.extend(
+                        decode_compact_hashes(s)
+                            .into_iter()
+                            .filter(|h| !have.contains(h))
+                            .map(|envelope_hash| EnvelopeRef {
+                                envelope_hash,
+                                seq: 0,
+                            }),
+                    );
+                }
+            }
+            Self::Diff(d) => {
+                merge(&mut d.want, c.wh.as_ref());
+                merge(&mut d.withheld, c.xh.as_ref());
+            }
+            Self::Deliver(d) => {
+                if let Some(bodies) = c.eb {
+                    d.envelopes
+                        .extend(bodies.iter().filter_map(|b| decode_compact_body(b)));
+                }
+            }
+            Self::Fetch(_) | Self::Pull(_) | Self::CursorPull(_) => {}
+        }
     }
 }
 
@@ -949,6 +1045,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Attestation,
             refs: vec![],
+            rf: None,
         });
         assert_eq!(
             std::str::from_utf8(&plain.to_bytes()).unwrap(),
@@ -961,6 +1058,7 @@ mod tests {
             }),
             kind: EnvelopeKind::Attestation,
             refs: vec![],
+            rf: None,
         });
         let bytes = throttled.to_bytes();
         let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -997,6 +1095,7 @@ mod tests {
                     seq: 101,
                 },
             ],
+            rf: None,
         });
         let bytes = m.to_bytes();
         let parsed = ReplicationMessage::from_bytes(&bytes).expect("parse");
@@ -1009,6 +1108,7 @@ mod tests {
             kind: EnvelopeKind::Revocation,
             want: vec![fake_hash(3)],
             withheld: Vec::new(),
+            rf: None,
         });
         let bytes = m.to_bytes();
         let parsed = ReplicationMessage::from_bytes(&bytes).expect("parse");
@@ -1343,6 +1443,7 @@ mod tests {
                 status: None,
                 kind,
                 refs: vec![],
+                rf: None,
             });
             let bytes = m.to_bytes();
             let s = std::str::from_utf8(&bytes).unwrap();

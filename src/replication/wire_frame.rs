@@ -378,6 +378,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Attestation,
             refs: vec![],
+            rf: None,
         });
         let framed = wrap(&msg);
         // First 4 bytes are the magic.
@@ -479,6 +480,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         // v1 — round-trips (v1 trust kind on v1 framing).
         let v1 = wrap_at_version(&msg, WIRE_PROTOCOL_VERSION);
@@ -506,6 +508,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Community,
                 refs: vec![],
+                rf: None,
             })
         }
 
@@ -537,6 +540,7 @@ mod tests {
                 kind: EnvelopeKind::Key,
                 want: vec![],
                 withheld: Vec::new(),
+                rf: None,
             });
             for v in [WIRE_PROTOCOL_VERSION, WIRE_PROTOCOL_VERSION_V2] {
                 let out = try_unwrap_framed(&wrap_at_version(&msg, v))
@@ -601,11 +605,13 @@ mod tests {
                     envelope_hash: h,
                     seq: 1,
                 }],
+                rf: None,
             }),
             ReplicationMessage::Diff(DiffMessage {
                 kind: EnvelopeKind::Attestation,
                 want: vec![h],
                 withheld: Vec::new(),
+                rf: None,
             }),
             ReplicationMessage::Fetch(FetchMessage {
                 kind: EnvelopeKind::Revocation,
@@ -619,31 +625,37 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Family,
                 refs: vec![],
+                rf: None,
             }),
             ReplicationMessage::Summary(SummaryMessage {
                 status: None,
                 kind: EnvelopeKind::Community,
                 refs: vec![],
+                rf: None,
             }),
             ReplicationMessage::Summary(SummaryMessage {
                 status: None,
                 kind: EnvelopeKind::IdentityOccurrenceRevocation,
                 refs: vec![],
+                rf: None,
             }),
             ReplicationMessage::Summary(SummaryMessage {
                 status: None,
                 kind: EnvelopeKind::FamilyMembershipRevocation,
                 refs: vec![],
+                rf: None,
             }),
             ReplicationMessage::Summary(SummaryMessage {
                 status: None,
                 kind: EnvelopeKind::CommunityMembershipRevocation,
                 refs: vec![],
+                rf: None,
             }),
             ReplicationMessage::Summary(SummaryMessage {
                 status: None,
                 kind: EnvelopeKind::LocationProof,
                 refs: vec![],
+                rf: None,
             }),
             // v2 kinds — round-trip via wrap_for_kind (selects 0x02).
             ReplicationMessage::Summary(SummaryMessage {
@@ -653,11 +665,13 @@ mod tests {
                     envelope_hash: h,
                     seq: 1,
                 }],
+                rf: None,
             }),
             ReplicationMessage::Diff(DiffMessage {
                 kind: EnvelopeKind::OrgMembership,
                 want: vec![h],
                 withheld: Vec::new(),
+                rf: None,
             }),
             ReplicationMessage::Deliver(DeliverMessage {
                 kind: EnvelopeKind::PartnerRecord,
@@ -700,6 +714,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         let framed = wrap_for_kind(&msg_v1);
         assert_eq!(framed[REPLICATION_FRAME_MAGIC.len()], WIRE_PROTOCOL_VERSION);
@@ -709,6 +724,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Organization,
             refs: vec![],
+            rf: None,
         });
         let framed = wrap_for_kind(&msg_v2);
         assert_eq!(
@@ -721,6 +737,7 @@ mod tests {
             kind: EnvelopeKind::OrgMembership,
             want: vec![],
             withheld: Vec::new(),
+            rf: None,
         });
         let framed = wrap_for_kind(&msg_v2);
         assert_eq!(
@@ -733,6 +750,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::PartnerRecord,
             refs: vec![],
+            rf: None,
         });
         let framed = wrap_for_kind(&msg_v2);
         assert_eq!(
@@ -752,6 +770,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         let v2 = wrap_at_version(&msg, WIRE_PROTOCOL_VERSION_V2);
         let unwrapped = try_unwrap(&v2).expect("decode").expect("magic");

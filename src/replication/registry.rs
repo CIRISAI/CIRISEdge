@@ -573,11 +573,32 @@ impl ReplicationRegistry {
         bytes: &[u8],
         link: Option<[u8; 16]>,
     ) -> Result<RouteOutcome, RegistryError> {
-        let framed = match wire_frame::try_unwrap_framed(bytes) {
+        self.route_inbound_bytes_confidential(peer_key_id, bytes, link, false)
+            .await
+    }
+
+    /// [`Self::route_inbound_bytes_on`], saying whether the transport the frame
+    /// arrived on is confidential end to end (range fingerprints, design
+    /// §6.4, R6). A salted RF Summary that arrived over a transport that is
+    /// NOT is marked so its salt is never used: the receiver answers
+    /// `u:"transport"`. Every other caller passes `false`, the safe default.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::route_inbound_bytes`].
+    pub async fn route_inbound_bytes_confidential(
+        &self,
+        peer_key_id: &str,
+        bytes: &[u8],
+        link: Option<[u8; 16]>,
+        confidential: bool,
+    ) -> Result<RouteOutcome, RegistryError> {
+        let mut framed = match wire_frame::try_unwrap_framed(bytes) {
             Ok(Some(f)) => f,
             Ok(None) => return Ok(RouteOutcome::NotAReplicationFrame),
             Err(e) => return Err(RegistryError::Protocol(e.into())),
         };
+        super::range_fp::mark_inbound_transport(&mut framed.msg, confidential);
         if self.local_key_id() == Some(peer_key_id) {
             tracing::warn!(
                 peer = %peer_key_id,
@@ -606,6 +627,7 @@ impl ReplicationRegistry {
                         reason: ReplyDropReason::NoInitiator,
                     });
                 };
+                initiator.book_wire(&framed.msg, bytes.len(), false);
                 match initiator.deliver_reply(framed.msg, round) {
                     Ok(()) => Ok(RouteOutcome::RoutedToInitiator { kind, round }),
                     Err(ReplyRefusal::BackPressure) => Err(RegistryError::BackPressure {
@@ -637,6 +659,7 @@ impl ReplicationRegistry {
                 else {
                     return Ok(RouteOutcome::NoCoordinatorRegistered { kind });
                 };
+                responder.book_wire(&framed.msg, bytes.len(), false);
                 responder
                     .deliver_inbound_framed_on(framed.msg, meta, link)
                     .map_err(|_| RegistryError::BackPressure {
@@ -800,6 +823,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         let framed = wrap(&msg);
 
@@ -822,6 +846,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Attestation,
             refs: vec![],
+            rf: None,
         });
         let framed = wrap(&msg);
         let r = registry
@@ -855,6 +880,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::IdentityOccurrence,
             refs: vec![],
+            rf: None,
         });
         let framed = wrap(&msg);
         let r = registry
@@ -875,6 +901,79 @@ mod tests {
         );
     }
 
+    /// Range fingerprints, step A (R6, N7, witness 17's inbound half) — **a
+    /// salted Summary that arrived over a non-confidential transport reaches
+    /// the session marked, so its salt is never used.** The default route
+    /// (every caller that does not say otherwise) is non-confidential; only a
+    /// caller that names its transport confidential lets the salt through;
+    /// a marker with no salt is never marked.
+    ///
+    /// Mutation that turns it red: drop the `mark_inbound_transport` call, or
+    /// default `route_inbound_bytes_on` to confidential.
+    #[tokio::test]
+    async fn an_unsealed_inbound_salt_is_marked_before_the_session_sees_it_rf_17() {
+        use crate::replication::range_fp::{encode_salt, inbound_is_confidential, RfSummary};
+        let registry = ReplicationRegistry::new();
+        let responder = make_responder("agent", EnvelopeKind::Key);
+        registry
+            .register("agent", EnvelopeKind::Key, Arc::clone(&responder))
+            .await;
+        let salted = |salt: bool| {
+            wrap(&ReplicationMessage::Summary(SummaryMessage {
+                status: None,
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+                rf: Some(RfSummary {
+                    v: 1,
+                    a: Some(1),
+                    salt: salt.then(|| encode_salt(&[7; 32])),
+                    sid: Some(1),
+                    ..RfSummary::default()
+                }),
+            }))
+        };
+        let refused = |m: Option<ReplicationMessage>| match m {
+            Some(ReplicationMessage::Summary(s)) => s.rf.expect("rf").transport_refused,
+            other => panic!("a Summary: {other:?}"),
+        };
+        registry
+            .route_inbound_bytes("agent", &salted(true))
+            .await
+            .expect("routed");
+        assert!(
+            refused(responder.recv_inbound().await),
+            "the default is refusal"
+        );
+        registry
+            .route_inbound_bytes_confidential("agent", &salted(true), None, false)
+            .await
+            .expect("routed");
+        assert!(refused(responder.recv_inbound().await));
+        registry
+            .route_inbound_bytes_confidential("agent", &salted(true), None, true)
+            .await
+            .expect("routed");
+        assert!(!refused(responder.recv_inbound().await), "sealed: usable");
+        registry
+            .route_inbound_bytes("agent", &salted(false))
+            .await
+            .expect("routed");
+        assert!(
+            !refused(responder.recv_inbound().await),
+            "a marker exposes nothing"
+        );
+        // The inbound predicate: Reticulum yes; plain HTTP (undeclared) and
+        // the rest no.
+        assert!(inbound_is_confidential(TransportId::RETICULUM_RS));
+        assert!(inbound_is_confidential(TransportId::LEVICULUM));
+        for t in [TransportId::LORA, TransportId::SERIAL, TransportId::I2P] {
+            assert!(!inbound_is_confidential(t), "{t:?}");
+        }
+        if std::env::var(crate::replication::range_fp::HTTP_LISTENER_CONFIDENTIAL_ENV).is_err() {
+            assert!(!inbound_is_confidential(TransportId::HTTP));
+        }
+    }
+
     #[tokio::test]
     async fn route_with_correct_peer_wrong_kind_returns_no_coordinator() {
         let registry = ReplicationRegistry::new();
@@ -885,6 +984,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Revocation,
             refs: vec![],
+            rf: None,
         });
         let framed = wrap(&msg);
         let r = registry
@@ -919,6 +1019,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         let v3 = wire_frame::wrap_at_version(&msg, 0x03);
         let r = registry.route_inbound_bytes("anyone", &v3).await;
@@ -939,6 +1040,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         let framed = wrap(&msg);
         // Fill the capacity-8 channel.
@@ -1072,6 +1174,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Community,
                 refs: vec![],
+                rf: None,
             })
         }
 
@@ -1391,6 +1494,7 @@ mod tests {
                     status: None,
                     kind,
                     refs: vec![],
+                    rf: None,
                 },
             )),
             transport: TransportId::RETICULUM_RS,
