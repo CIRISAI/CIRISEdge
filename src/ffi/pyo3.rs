@@ -2798,6 +2798,11 @@ impl PyEdge {
     ///   "transport_bytes_out_total":{"http": 1024, ...},
     ///   "transport_wire_bytes_in_total": {"tcp:replication": 9216, ...},
     ///   "transport_wire_bytes_out_total":{"tcp:shaped": 40960, ...},
+    ///   "links_active":             {"tcp:inbound": 17, "udp-direct:outbound": 1, ...},
+    ///   "distinct_peers_1h": 12, "distinct_peers_24h": 70,
+    ///   "top_peers_by_bytes": [{"peer": "9f2c…", "bytes_in": 1, "bytes_out": 2,
+    ///                           "error_bytes": 0}, ...],
+    ///   "link_duration_seconds":    {"first_contact:peer_closed": {"buckets": ...}},
     ///   "peer_reachability_ratio":  {"peer-x:reticulum-rs": 0.75, ...},
     ///   # CIRISEdge#433 — the withhold ledger + the replication-plane
     ///   # served counter. Together they separate the three states a node
@@ -3131,6 +3136,33 @@ fn metrics_bundle_to_pydict<'py>(
         }
         root.set_item(name, d)?;
     }
+
+    // CIRISEdge#1025 — links by `transport:direction`, distinct peers, the
+    // top peers by wire bytes (`[{"peer", "bytes_in", "bytes_out",
+    // "error_bytes"}]`, `peer` a per-process salted hash) and link lifetimes
+    // by `class:cause`.
+    let links = pyo3::types::PyDict::new(py);
+    for (k, v) in &bundle.links_active {
+        links.set_item(k.as_str(), *v)?;
+    }
+    root.set_item("links_active", links)?;
+    root.set_item("distinct_peers_1h", bundle.distinct_peers_1h)?;
+    root.set_item("distinct_peers_24h", bundle.distinct_peers_24h)?;
+    let top = pyo3::types::PyList::empty(py);
+    for e in &bundle.top_peers_by_bytes {
+        let entry = pyo3::types::PyDict::new(py);
+        entry.set_item("peer", e.peer.as_str())?;
+        entry.set_item("bytes_in", e.bytes_in)?;
+        entry.set_item("bytes_out", e.bytes_out)?;
+        entry.set_item("error_bytes", e.error_bytes)?;
+        top.append(entry)?;
+    }
+    root.set_item("top_peers_by_bytes", top)?;
+    let lifetimes = pyo3::types::PyDict::new(py);
+    for (label, h) in &bundle.link_duration_seconds {
+        lifetimes.set_item(label.as_str(), histogram_to_pydict(py, h)?)?;
+    }
+    root.set_item("link_duration_seconds", lifetimes)?;
 
     // CIRISEdge#809 — the two leviculum pressure signals, as scalars.
     root.set_item(

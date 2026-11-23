@@ -114,6 +114,7 @@ pub mod handler;
 pub mod holonomic;
 pub mod identity;
 pub mod key_boundary;
+pub mod link_census;
 pub mod load_ladder;
 pub mod load_levers;
 pub mod log_throttle;

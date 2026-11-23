@@ -4059,9 +4059,8 @@ impl ReticulumTransport {
         }
         // CIRISEdge#1025 — the medium a sealed frame on a non-direct link is
         // counted under.
-        seals.set_base_transport(base_wire_transport(
-            interface_specs.iter().map(|i| i.kind.as_str()),
-        ));
+        let wire_base = base_wire_transport(interface_specs.iter().map(|i| i.kind.as_str()));
+        seals.set_base_transport(wire_base);
         if let Some(name) = share_instance_local.clone() {
             builder = builder.share_instance(true).instance_name(name);
         }
@@ -4433,7 +4432,7 @@ impl ReticulumTransport {
             pool_idle_cap: std::sync::atomic::AtomicUsize::new(DEFAULT_LINK_POOL_IDLE_CAP),
             pool_links_closed: std::sync::atomic::AtomicU64::new(0),
             link_in_flight: Arc::new(Mutex::new(HashSet::new())),
-            link_direction: Arc::new(std::sync::Mutex::new(LinkDirections::default())),
+            link_direction: Arc::new(std::sync::Mutex::new(LinkDirections::with_base(wire_base))),
             inbound_idle_bound_ms: std::sync::atomic::AtomicU64::new(
                 u64::try_from(DEFAULT_INBOUND_LINK_IDLE_BOUND.as_millis()).unwrap_or(u64::MAX),
             ),
@@ -5290,6 +5289,7 @@ impl ReticulumTransport {
     /// so a part cannot be left counting into nothing.
     fn adopt_metrics(&self, metrics: crate::observability::EdgeMetrics) {
         self.seals.attach_wire(Arc::clone(&metrics.wire_bytes));
+        self.seals.attach_census(Arc::clone(&metrics.link_census));
         self.keyer.attach_metrics(metrics.clone());
         self.shapers.attach_metrics(metrics.clone());
         let _ = self.metrics.set(metrics);
@@ -11241,6 +11241,7 @@ impl Transport for ReticulumTransport {
             mirror_planes(&self.node, m);
             fold_av_datagrams(&self.node, &self.av_sink, &self.av_datagram_fold, m);
             fold_wire_bytes(&self.node, &self.wire_fold, m);
+            self.seals.flush_peer_tallies();
             m.telemetry
                 .set_av_datagrams_enabled(self.av_datagrams_enabled());
         }
@@ -11629,6 +11630,8 @@ impl NodeTick {
         mirror_planes(node, m);
         fold_av_datagrams(node, &self.av_sink, &self.av_datagram_fold, m);
         fold_wire_bytes(node, &self.wire_fold, m);
+        // CIRISEdge#1025 — each link's peer bytes into the top-N sketch.
+        self.seals.flush_peer_tallies();
         t.set_av_datagrams_enabled(
             self.av_datagrams_enabled
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -12741,14 +12744,75 @@ impl LinkDirection {
 
 /// CIRISEdge#853 — the direction of every established link, with running
 /// counts so the gauges are O(1) to publish on every establish and close.
-#[derive(Debug, Default)]
+/// CIRISEdge#1025 — and each link's medium (its base, or `udp-direct` while it
+/// rides a punched interface) and establishment time, for `links_active` and
+/// `link_duration_seconds`.
+#[derive(Debug)]
 struct LinkDirections {
     by_link: HashMap<LinkId, LinkDirection>,
     inbound: u64,
     outbound: u64,
+    /// CIRISEdge#1025 — per established link: when it came up, and whether
+    /// it is on a punched interface now.
+    since: HashMap<LinkId, (std::time::Instant, bool)>,
+    /// CIRISEdge#1025 — the medium a link not on a direct interface rides.
+    base: crate::wire_bytes::WireTransport,
+    /// CIRISEdge#1025 — established links by `[transport][direction]`.
+    active: crate::link_census::LinksActive,
+}
+
+impl Default for LinkDirections {
+    fn default() -> Self {
+        Self::with_base(crate::wire_bytes::WireTransport::Tcp)
+    }
 }
 
 impl LinkDirections {
+    fn with_base(base: crate::wire_bytes::WireTransport) -> Self {
+        Self {
+            by_link: HashMap::new(),
+            inbound: 0,
+            outbound: 0,
+            since: HashMap::new(),
+            base,
+            active: [[0; 2]; crate::wire_bytes::WireTransport::COUNT],
+        }
+    }
+
+    /// The `links_active` cell of a link going `dir` that is (or is not) on
+    /// a punched interface.
+    fn cell(&mut self, dir: LinkDirection, direct: bool) -> &mut u64 {
+        let t = if direct {
+            crate::wire_bytes::WireTransport::UdpDirect
+        } else {
+            self.base
+        };
+        let d = usize::from(dir == LinkDirection::Outbound);
+        &mut self.active[t as usize][d]
+    }
+
+    /// CIRISEdge#1025 — `link_id` moved onto (`true`) or off a punched
+    /// interface: it moves between its base medium and `udp-direct`. A link
+    /// with no direction record is not counted, so nothing moves.
+    fn set_direct(&mut self, link_id: &LinkId, direct: bool) {
+        let Some(dir) = self.by_link.get(link_id).copied() else {
+            return;
+        };
+        let Some((_, was)) = self.since.get(link_id).copied() else {
+            return;
+        };
+        if was == direct {
+            return;
+        }
+        let from = self.cell(dir, was);
+        *from = from.saturating_sub(1);
+        let to = self.cell(dir, direct);
+        *to = to.saturating_add(1);
+        if let Some(e) = self.since.get_mut(link_id) {
+            e.1 = direct;
+        }
+    }
+
     fn count(&mut self, dir: LinkDirection, up: bool) {
         let n = match dir {
             LinkDirection::Inbound => &mut self.inbound,
@@ -12762,16 +12826,37 @@ impl LinkDirections {
     }
 
     fn insert(&mut self, link_id: LinkId, dir: LinkDirection) {
+        let (at, direct) = self
+            .since
+            .get(&link_id)
+            .copied()
+            .unwrap_or((std::time::Instant::now(), false));
         if let Some(prev) = self.by_link.insert(link_id, dir) {
             self.count(prev, false);
+            let c = self.cell(prev, direct);
+            *c = c.saturating_sub(1);
         }
         self.count(dir, true);
+        let c = self.cell(dir, direct);
+        *c = c.saturating_add(1);
+        self.since.insert(link_id, (at, direct));
     }
 
     fn remove(&mut self, link_id: &LinkId) -> Option<LinkDirection> {
+        self.remove_timed(link_id).map(|(dir, _)| dir)
+    }
+
+    /// Remove `link_id`'s record: its direction and how long it was up.
+    fn remove_timed(&mut self, link_id: &LinkId) -> Option<(LinkDirection, std::time::Duration)> {
         let dir = self.by_link.remove(link_id)?;
         self.count(dir, false);
-        Some(dir)
+        let (at, direct) = self
+            .since
+            .remove(link_id)
+            .unwrap_or((std::time::Instant::now(), false));
+        let c = self.cell(dir, direct);
+        *c = c.saturating_sub(1);
+        Some((dir, at.elapsed()))
     }
 
     fn inbound_ids(&self) -> Vec<LinkId> {
@@ -12909,6 +12994,8 @@ fn publish_link_directions(
 ) {
     if let Some(m) = metrics {
         m.set_link_directions(source, dirs.inbound, dirs.outbound);
+        // CIRISEdge#1025 — the same links, by medium.
+        m.link_census.set_links_active(source, dirs.active);
     }
 }
 
@@ -12925,9 +13012,18 @@ fn forget_link_direction(
     let mut dirs = dirs
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = dirs.remove(link_id);
-    if let (Some(d), Some(m)) = (dir, metrics) {
+    let removed = dirs.remove_timed(link_id);
+    let dir = removed.map(|(d, _)| d);
+    if let (Some((d, lifetime)), Some(m)) = (removed, metrics) {
         m.add_link_closed(d == LinkDirection::Inbound, cause, 1);
+        // CIRISEdge#1025 — its lifetime, under the class it came up under
+        // (read before the class is forgotten below).
+        m.note_link_lifetime(
+            link_id.into_bytes(),
+            d == LinkDirection::Inbound,
+            cause,
+            lifetime,
+        );
     }
     // Seat load 2026-11-13 (S0) — link down, by the class it came up under.
     if let Some(m) = metrics {
@@ -13621,6 +13717,9 @@ impl DialCtx {
         // is not published to any pool or selector until this dial returns —
         // so no sealed frame can precede the handshake.
         self.seals.install_initiator(link, transit);
+        // CIRISEdge#1025 — keyed to `peer`'s published transit pair: the
+        // link's bytes are tallied toward it.
+        self.seals.bind_peer(link, peer);
         let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
         for frame in &frames {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -15983,6 +16082,7 @@ async fn attribute_and_deliver(
                     .lock()
                     .await
                     .insert(link_id, key_id.clone());
+                ctx.seals.bind_peer(link_id.into_bytes(), &key_id);
                 tracing::info!(
                     link = ?link_id,
                     peer = %key_id,
@@ -16667,6 +16767,7 @@ async fn link_attribution_now(ctx: &EventCtx<'_>, link_id: LinkId) -> Option<Str
         .lock()
         .await
         .insert(link_id, key_id.clone());
+    ctx.seals.bind_peer(link_id.into_bytes(), &key_id);
     Some(key_id)
 }
 
@@ -16832,6 +16933,7 @@ async fn reattribute_to_corroborated_claim(
     if key_id != claimed {
         return false;
     }
+    ctx.seals.bind_peer(link_id.into_bytes(), &key_id);
     ctx.link_to_peer_key_id.lock().await.insert(link_id, key_id);
     true
 }
@@ -18793,6 +18895,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     .lock()
                     .await
                     .insert(link_id, key_id.clone());
+                ctx.seals.bind_peer(link_id.into_bytes(), &key_id);
                 // CC 5.3.3.5 E1 — the link's attribution landed after its
                 // handshake did (the identify rides the control plane, the
                 // handshake the data plane): hold the claim to it now, and
@@ -19496,6 +19599,14 @@ async fn direct_link_established(
 ) {
     // CIRISEdge#1025 — its frames ride the punched interface from here.
     ctx.seals.set_direct(link_id.into_bytes(), true);
+    {
+        let mut dirs = ctx
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dirs.set_direct(&link_id, true);
+        publish_link_directions(ctx.metrics, ctx.metrics_source, &dirs);
+    }
     let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
     let after = link_channel_message_limit(ctx.node, &link_id);
     let (peer, before, active) = {
@@ -19697,6 +19808,14 @@ async fn direct_link_failed(
 async fn direct_link_lost(ctx: &EventCtx<'_>, link_id: LinkId, interface: usize) {
     // CIRISEdge#1025 — its frames are on the relayed path's medium again.
     ctx.seals.set_direct(link_id.into_bytes(), false);
+    {
+        let mut dirs = ctx
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dirs.set_direct(&link_id, false);
+        publish_link_directions(ctx.metrics, ctx.metrics_source, &dirs);
+    }
     let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
     let (peer, active) = {
         let mut tracker = ctx.direct_paths.tracker();
@@ -21121,6 +21240,7 @@ async fn receive_announce(ctx: &EventCtx<'_>, view: AnnounceView, link: Option<L
     if let (Stage1Outcome::InstalledNew, Some(key_id)) = (outcome, key_id.as_deref()) {
         let bound = bind_identified_links_to(
             ctx.node,
+            ctx.seals,
             ctx.established_links,
             ctx.link_to_peer_key_id,
             view.transport_identity_hash(),
@@ -21403,6 +21523,7 @@ async fn stage1_bind_announce(
 /// "links beat the announce" ordering this issue exists to make harmless.
 async fn bind_identified_links_to(
     node: &ReticulumNode,
+    seals: &crate::transport::link_seal::LinkSeals,
     established: &Mutex<HashSet<LinkId>>,
     link_to_peer_key_id: &Mutex<HashMap<LinkId, String>>,
     transport_identity_hash: [u8; 16],
@@ -21419,6 +21540,7 @@ async fn bind_identified_links_to(
                 .lock()
                 .await
                 .insert(link_id, key_id.to_owned());
+            seals.bind_peer(link_id.into_bytes(), key_id);
             bound += 1;
         }
     }
