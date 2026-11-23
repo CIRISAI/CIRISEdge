@@ -590,3 +590,105 @@ async fn a_welcome_placed_after_the_backfill_is_required_for_its_joiner_1029() {
         "the joiner's Welcome is a required row, ahead of every walked row"
     );
 }
+
+/// The joiner's listing, `n` times, for the read counts below.
+async fn listings(bridge: &FederationDirectoryReplicationBridge, n: usize) {
+    for _ in 0..n {
+        let _ = bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(JOINER))
+            .await;
+    }
+}
+
+/// CIRISEdge#1029 F1 — **the Welcome read is bounded and costs a group
+/// nobody is joining nothing.** Each listing of a watched join reads the
+/// room's Welcomes once; once the joiner's is found it is read in
+/// `1 + WELCOME_FOUND_LISTINGS` listings and never again, a watch that never
+/// finds one ends after `WELCOME_WATCH_LISTINGS`, and a member that joined
+/// nothing (the baseline) is never read for. Counted on the targeted door
+/// alone after the join round (whose roster read uses the same door).
+#[tokio::test]
+async fn the_welcome_read_stops_once_found_or_spent_and_costs_a_settled_member_nothing_1029() {
+    const DOOR: &str = "list_targeted_by_dimension_prefix";
+    // A member since the baseline: no join, no read.
+    let backend = audience_backend().await;
+    room(&backend).await;
+    carol_joins(&backend).await;
+    let counting = CountingDirectory::new(Arc::clone(&backend) as Arc<dyn FederationDirectory>);
+    let settled = bridge(Arc::new(counting.clone()));
+    listings(&settled, 1).await;
+    counting.reset();
+    listings(&settled, 10).await;
+    assert_eq!(
+        counting.count(DOOR),
+        0,
+        "a member that joined nothing is read for nothing"
+    );
+
+    // A join whose Welcome is placed after the join round.
+    let backend = audience_backend().await;
+    room(&backend).await;
+    let counting = CountingDirectory::new(Arc::clone(&backend) as Arc<dyn FederationDirectory>);
+    let found = bridge(Arc::new(counting.clone()));
+    listings(&found, 1).await;
+    carol_joins(&backend).await;
+    listings(&found, 1).await;
+    handshake_row(
+        &backend,
+        "person-alice",
+        crate::chat::WELCOME_DIMENSION,
+        Some(("person-carol", 4)),
+        512,
+    )
+    .await;
+    counting.reset();
+    listings(&found, 10).await;
+    assert_eq!(
+        counting.count(DOOR),
+        1 + WELCOME_FOUND_LISTINGS as usize,
+        "found, then offered a bounded number of listings more, then never read again"
+    );
+
+    // A join whose Welcome never comes.
+    let backend = audience_backend().await;
+    room(&backend).await;
+    let counting = CountingDirectory::new(Arc::clone(&backend) as Arc<dyn FederationDirectory>);
+    let spent = bridge(Arc::new(counting.clone()));
+    listings(&spent, 1).await;
+    carol_joins(&backend).await;
+    listings(&spent, 1).await;
+    counting.reset();
+    listings(&spent, WELCOME_WATCH_LISTINGS as usize + 10).await;
+    assert_eq!(
+        counting.count(DOOR),
+        WELCOME_WATCH_LISTINGS as usize - 1,
+        "the watch's own listings and no more (the join round spent one)"
+    );
+}
+
+/// CIRISEdge#1029 F1 — **the Welcome read is credited to its own site** in
+/// persist's per-caller read counters (`crate::read_caller`), so a hub's join
+/// cost is visible apart from the group rows' and the history's. Real
+/// `SqliteBackend`; persist's counters are process-wide, so a delta. Red
+/// before: credited `edge.advertise.groups`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_welcome_read_is_credited_to_its_own_read_site_1029() {
+    let key = "list_targeted_by_dimension_prefix:edge.advertise.welcomes.reads";
+    let reads = || {
+        crate::observability::persist_reads_snapshot()
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    };
+    let backend = audience_backend().await;
+    room(&backend).await;
+    let bridge = bridge(backend.clone());
+    listings(&bridge, 1).await;
+    carol_joins(&backend).await;
+    let before = reads();
+    listings(&bridge, 2).await;
+    assert!(
+        reads() > before,
+        "the watched join's Welcome read is credited {key}"
+    );
+}

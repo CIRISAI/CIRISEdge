@@ -14030,9 +14030,9 @@ impl FederationDirectoryReplicationBridge {
         let mut welcomes = Vec::new();
         let mut joined_at = BTreeMap::new();
         for group in watched {
-            let read = self
-                .directory
-                .list_targeted_by_dimension_prefix(
+            let read = crate::read_caller::scoped(
+                crate::read_caller::Site::AdvertiseWelcomes,
+                self.directory.list_targeted_by_dimension_prefix(
                     &[
                         cohort_scope::FAMILY,
                         cohort_scope::COMMUNITY,
@@ -14040,8 +14040,9 @@ impl FederationDirectoryReplicationBridge {
                     ],
                     &group,
                     crate::chat::WELCOME_DIMENSION,
-                )
-                .await;
+                ),
+            )
+            .await;
             let Ok(rows) = read else {
                 tracing::debug!(peer = %key.0, "required read: a joined group's Welcomes not served");
                 continue;
