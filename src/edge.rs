@@ -6518,7 +6518,12 @@ async fn route_attributed_frame(
     use crate::log_throttle::ThrottleDecision;
     use crate::replication::registry::{RegistryError, RouteOutcome};
     match registry
-        .route_inbound_bytes(source, &frame.envelope_bytes)
+        .route_inbound_bytes_confidential(
+            source,
+            &frame.envelope_bytes,
+            None,
+            crate::replication::range_fp::inbound_is_confidential(frame.transport),
+        )
         .await
     {
         Ok(RouteOutcome::RoutedToResponder { kind, built }) => {
@@ -11340,6 +11345,7 @@ mod inbound_ingest_tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             }));
         assert!(
             route_replication_frame(Some(&registry), &frame(crpl, Some("agent-peer")), None).await,
@@ -11374,6 +11380,7 @@ mod inbound_ingest_tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             }));
         assert!(!route_replication_frame(None, &frame(crpl, Some("agent-peer")), None).await);
     }
@@ -11398,6 +11405,7 @@ mod inbound_ingest_tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             }));
         let mut f = frame(crpl.clone(), None);
         f.link_key_id = Some("self-node".into());
@@ -11511,6 +11519,7 @@ mod inbound_ingest_tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             }));
         // The id the transport's equality path derives for a fresh peer: the
         // delivered record's own federation key id — never anything link-shaped.
@@ -11549,6 +11558,7 @@ mod inbound_ingest_tests {
                 status: None,
                 kind: EnvelopeKind::Attestation,
                 refs: vec![],
+                rf: None,
             }));
         let mut h = frame(att, None);
         h.link_key_id = Some(transport_id.clone());
@@ -11672,6 +11682,7 @@ mod inbound_ingest_tests {
                     status: None,
                     kind: EnvelopeKind::Attestation,
                     refs: vec![],
+                    rf: None,
                 },
             )),
             transport: TransportId::HTTP,
@@ -11754,6 +11765,7 @@ mod inbound_ingest_tests {
                     status: None,
                     kind,
                     refs: vec![],
+                    rf: None,
                 },
             )),
             transport: TransportId::RETICULUM_RS,
@@ -11837,7 +11849,7 @@ mod inbound_ingest_tests {
             let kind = EnvelopeKind::ALL[kind_idx];
             let frame = InboundFrame {
                 envelope_bytes: crate::replication::wire_frame::wrap(
-                    &ReplicationMessage::Summary(SummaryMessage { status: None, kind, refs: vec![] }),
+                    &ReplicationMessage::Summary(SummaryMessage { status: None, kind, refs: vec![], rf: None, }),
                 ),
                 transport: TransportId::RETICULUM_RS,
                 received_at: chrono::Utc::now(),
@@ -11928,6 +11940,7 @@ mod inbound_ingest_tests {
                     status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![],
+                    rf: None,
                 }))
                 .expect("channel not yet full");
         }
@@ -11942,6 +11955,7 @@ mod inbound_ingest_tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             }));
         // This frame can't fit → BackPressure. Pre-#373: a silent WARN, lost.
         let consumed =

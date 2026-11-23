@@ -456,6 +456,7 @@ async fn inbound_frame_resets_and_the_release_kick_is_not_swallowed_794() {
         status: None,
         kind: EnvelopeKind::IdentityOccurrence,
         refs: vec![],
+        rf: None,
     }));
     let _ = registry.route_inbound_bytes("gone", &frame).await;
     assert!(

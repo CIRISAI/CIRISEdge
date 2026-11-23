@@ -2506,6 +2506,7 @@ mod tests {
             status,
             kind: EnvelopeKind::Attestation,
             refs,
+            rf: None,
         })
     }
 
@@ -3040,6 +3041,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         let framed = super::super::wire_frame::wrap(&msg);
         let parsed = ReplicationCoordinator::try_parse_inbound_bytes(&framed)
@@ -3067,6 +3069,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         // Bare form — refused.
         let bare = msg.to_bytes();
@@ -3130,6 +3133,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         let r = coord.send_message(&m).await;
         assert!(matches!(
@@ -3209,6 +3213,7 @@ mod tests {
             status: None,
             kind: EnvelopeKind::Key,
             refs: vec![],
+            rf: None,
         });
         coord
             .deliver_inbound_framed(summary.clone(), None)
@@ -3278,6 +3283,7 @@ mod tests {
                 envelope_hash: h(1),
                 seq: 1,
             }],
+            rf: None,
         });
         assert!(coord("nobody_home").send_message(&summary).await.is_err());
         assert_eq!(io("summary_refs_built"), 1, "built, though never sent");
@@ -3295,6 +3301,7 @@ mod tests {
             kind: EnvelopeKind::Key,
             want: vec![h(2)],
             withheld: Vec::new(),
+            rf: None,
         });
         c.send_message(&diff).await.expect("sent");
         assert!(io("diff_bytes_out") > 0);
@@ -3381,6 +3388,7 @@ mod tests {
                             seq: 2,
                         },
                     ],
+                    rf: None,
                 }),
                 None,
             )
@@ -3454,6 +3462,7 @@ mod tests {
                 envelope_hash: h(99),
                 seq: 1,
             }],
+            rf: None,
         });
         let step = coord.drive_round_step(Some(remote_summary)).await.unwrap();
         match step {
@@ -3564,6 +3573,7 @@ mod tests {
                     seq: 4,
                 },
             ],
+            rf: None,
         });
         let step2 = coord.drive_round_step(Some(bob_summary)).await.unwrap();
         match step2 {
@@ -3582,6 +3592,7 @@ mod tests {
             kind: EnvelopeKind::Key,
             want: vec![h(1)],
             withheld: Vec::new(),
+            rf: None,
         });
         let _ = coord.drive_round_step(Some(bob_diff)).await.unwrap();
 
@@ -3662,6 +3673,7 @@ mod tests {
             kind: EnvelopeKind::Revocation, // ← inbound for Revocation
             want: vec![],
             withheld: Vec::new(),
+            rf: None,
         });
         let step = coord.drive_round_step(Some(wrong_kind)).await.unwrap();
         assert!(matches!(step, DriveStep::Refused));
@@ -3875,6 +3887,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             });
             assert_eq!(bob.last_inbound_link_hex(), "-");
             bob.deliver_inbound_framed_on(open.clone(), None, Some([0xab; 16]))
@@ -3905,6 +3918,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             });
 
             // v3 round-open → v3 replies echoing the round.
@@ -3984,6 +3998,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             });
             // Round 1 opens, bob replies; the initiator then dies (no Diff, no Deliver).
             bob.deliver_inbound_framed(summary.clone(), open(1))
@@ -4033,6 +4048,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             });
             alice.deliver_reply(msg.clone(), round).unwrap();
             assert_eq!(alice.inbound_depth(), 1);
@@ -4073,6 +4089,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             });
             assert!(matches!(
                 alice.deliver_reply(msg, first),

@@ -329,6 +329,43 @@ pub(crate) struct Record {
     /// The route's subject (its `occurrence_key_id`); `None` on the
     /// Attestation plane. Kept so the stranger view can filter by owner later.
     pub(crate) subject: Option<String>,
+    /// Range fingerprints, step A: the key-plane family of an Attestation-index
+    /// row, read from its `attestation_type` when the feed names it, so the
+    /// receiver's restart seed can take one plane's HOLDINGS without a store
+    /// read (design §3.2, R24). `None` for every other row.
+    pub(crate) family: Option<SeedFamily>,
+}
+
+/// Range fingerprints, step A — the public key-plane families a receiver's
+/// mirror may be seeded from after a restart (design §3.2, R24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SeedFamily {
+    /// `key:record:v1`, the `Key` plane.
+    KeyRecord,
+    /// `key:revocation:v1`, the `Revocation` plane.
+    KeyRevocation,
+}
+
+impl SeedFamily {
+    /// The family of a row by its `attestation_type`.
+    #[must_use]
+    pub(crate) fn of_attestation_type(attestation_type: &str) -> Option<Self> {
+        match attestation_type {
+            "key:record:v1" => Some(Self::KeyRecord),
+            "key:revocation:v1" => Some(Self::KeyRevocation),
+            _ => None,
+        }
+    }
+
+    /// The family a session plane is seeded from.
+    #[must_use]
+    pub(crate) fn of_kind(kind: EnvelopeKind) -> Option<Self> {
+        match kind {
+            EnvelopeKind::Key => Some(Self::KeyRecord),
+            EnvelopeKind::Revocation => Some(Self::KeyRevocation),
+            _ => None,
+        }
+    }
 }
 
 impl Record {
@@ -338,7 +375,15 @@ impl Record {
         Self {
             key: attestation_id.to_owned(),
             subject: None,
+            family: None,
         }
+    }
+
+    /// The record with its seed family read from `attestation_type`.
+    #[must_use]
+    pub(crate) fn with_family(mut self, attestation_type: &str) -> Self {
+        self.family = SeedFamily::of_attestation_type(attestation_type);
+        self
     }
 
     /// A route-index record.
@@ -347,6 +392,7 @@ impl Record {
         Self {
             key: format!("{occurrence_key_id}\u{1f}{transport_kind}"),
             subject: Some(occurrence_key_id.to_owned()),
+            family: None,
         }
     }
 }
@@ -381,6 +427,8 @@ struct PlaneSet {
     hashes: HashSet<[u8; 32]>,
     /// Record key → (current hash, subject), for records a feed named.
     records: HashMap<String, ([u8; 32], Option<String>)>,
+    /// Range fingerprints, step A — the seed family of each recorded hash.
+    families: HashMap<[u8; 32], SeedFamily>,
     journal: Option<Journal>,
     last_reconcile: Option<Instant>,
 }
@@ -391,6 +439,7 @@ impl Default for PlaneSet {
             status: Status::Unbooted,
             hashes: HashSet::new(),
             records: HashMap::new(),
+            families: HashMap::new(),
             journal: None,
             last_reconcile: None,
         }
@@ -403,15 +452,24 @@ impl PlaneSet {
     /// completes is journalled so the reconcile keeps it.
     fn upsert(&mut self, record: Option<Record>, hash: [u8; 32]) -> bool {
         let mut replaced = None;
-        if let Some(Record { key, subject }) = record {
+        if let Some(Record {
+            key,
+            subject,
+            family,
+        }) = record
+        {
             if let Some((old, _)) = self.records.insert(key, (hash, subject)) {
                 if old != hash {
                     replaced = Some(old);
                 }
             }
+            if let Some(f) = family {
+                self.families.insert(hash, f);
+            }
         }
         if let Some(old) = replaced {
             self.hashes.remove(&old);
+            self.families.remove(&old);
         }
         let inserted = self.hashes.insert(hash);
         if let Some(j) = self.journal.as_mut() {
@@ -442,6 +500,7 @@ impl PlaneSet {
         self.hashes = expected;
         let hashes = &self.hashes;
         self.records.retain(|_, (h, _)| hashes.contains(h));
+        self.families.retain(|h, _| hashes.contains(h));
         drift
     }
 }
@@ -669,6 +728,24 @@ impl HoldingsIndex {
         }
     }
 
+    /// Range fingerprints, step A — every held hash of one seed family, when
+    /// the set may answer (design §3.2, R24: the receiver's restart seed is
+    /// HOLDINGS only). `None` when the plane is not `Ready`.
+    #[must_use]
+    pub(crate) fn hashes_of_family(&self, family: SeedFamily) -> Option<Vec<[u8; 32]>> {
+        if !self.enabled {
+            return None;
+        }
+        let s = self.plane(IndexPlane::Attestation).read().ok()?;
+        (s.status == Status::Ready).then(|| {
+            s.families
+                .iter()
+                .filter(|(h, f)| **f == family && s.hashes.contains(*h))
+                .map(|(h, _)| *h)
+                .collect()
+        })
+    }
+
     /// The route subjects the set holds a current hash for (the future
     /// stranger view's input; see the module docs).
     #[cfg(test)]
@@ -689,10 +766,14 @@ pub(crate) fn record_of_envelope(plane: IndexPlane, envelope_bytes: &[u8]) -> Op
     match plane {
         IndexPlane::Attestation => {
             let inner = value.get("attestation").unwrap_or(&value);
+            let family = inner
+                .get("attestation_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             inner
                 .get("attestation_id")
                 .and_then(serde_json::Value::as_str)
-                .map(Record::attestation)
+                .map(|id| Record::attestation(id).with_family(family))
         }
         IndexPlane::TransportDestination => {
             let td = value.get("transport_destination")?;

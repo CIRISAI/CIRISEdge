@@ -24125,6 +24125,7 @@ mod tests {
                     status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![],
+                    rf: None,
                 },
             ));
             assert_eq!(bootstrap_key_ids_named(&summary), None);
@@ -27037,6 +27038,7 @@ mod scope_native_addressing_tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: Vec::new(),
+                rf: None,
             }));
         let sent = Transport::send(&transport, "nobody", &frame).await;
         assert!(

@@ -268,6 +268,7 @@ fn resolve_sweep_permits(mut config: BridgeConfig) -> BridgeConfig {
     config = resolve_sweep_page_rows(config);
     config = resolve_holdings_index(config);
     config = resolve_key_plane_levers(config);
+    config = resolve_range_fingerprints(config);
     let Ok(raw) = std::env::var(BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV) else {
         return config;
     };
@@ -426,6 +427,26 @@ fn resolve_key_plane_levers(mut config: BridgeConfig) -> BridgeConfig {
                 "key-plane read budget is not a positive whole number: IGNORED, \
                  keeping the configured value (tracked: CIRISEdge#971)"
             ),
+        }
+    }
+    config
+}
+
+/// Range fingerprints, step A — the receiver half's lever
+/// ([`BridgeConfig::RANGE_FINGERPRINTS_ANSWER_ENV`], only turns OFF). Same
+/// contract as [`resolve_holdings_index`].
+fn resolve_range_fingerprints(mut config: BridgeConfig) -> BridgeConfig {
+    if let Ok(raw) = std::env::var(BridgeConfig::RANGE_FINGERPRINTS_ANSWER_ENV) {
+        if matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        ) {
+            tracing::info!(
+                env = BridgeConfig::RANGE_FINGERPRINTS_ANSWER_ENV,
+                "range-fingerprint answers turned OFF from the environment: this node \
+                 neither answers nor advertises them, the 45.1.9 behaviour"
+            );
+            config.range_fingerprints_answer = false;
         }
     }
     config
@@ -3547,6 +3568,7 @@ mod tests {
                 status: None,
                 kind: EnvelopeKind::Key,
                 refs: vec![],
+                rf: None,
             }));
         let outcome = rt
             .registry()

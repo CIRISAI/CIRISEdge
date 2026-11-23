@@ -375,6 +375,7 @@ async fn round(
                 seq,
             })
             .collect(),
+        rf: None,
     };
     let ReplicationOutcome::Send(msgs) = sess
         .on_message(

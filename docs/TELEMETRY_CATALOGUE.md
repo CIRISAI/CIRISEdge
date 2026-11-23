@@ -281,7 +281,24 @@ Range fingerprints, step A (`docs/design/RANGE_FINGERPRINTS.md` §8) adds to
   stay the raw envelope bytes;
 - `summary_refs_built` and `summary_bytes_built`, booked when a Summary is
   built, before the send. With the sent twins, these show a listing that was
-  built but never handed down (§11.2).
+  built but never handed down (§11.2);
+- the receiver half's counters: `rf_nodes_in` (fingerprint nodes received,
+  split children included), the answers `rf_match`, `rf_split` and `rf_list`,
+  `rf_not_understood` (an `rf` member this build could not read, answered
+  with the plain marker), and `rf_unable` for every `u` answer, with its
+  reason in one of `rf_receiver_unbooted`, `rf_salt_refused`,
+  `rf_answers_cap`, `rf_mirror_capped`, `rf_rebuilds_refused` (`busy`) and
+  `rf_transport_refused`. `rf_salt_changes_received` counts salts accepted,
+  `rf_peersums_built` the full salted passes over a mirror, `rf_seeded` the
+  ids the restart seed added, `rf_match_feed_ids` the known hashes a matched
+  range re-heard from their holder, and `rf_settled_from_peer` the wanted
+  ids that entered a mirror on admission.
+
+`holdings_index_gauge` gains `rf_mirror_ids` (the ids held in every
+receiver mirror together), `rf_pending_ids` (the ids asked for and not yet
+seen admitted) and `rf_parse_failed` (the `rf` members this process could not
+parse or read since it started). No label carries a peer, a salt or an
+address.
 
 ## Log events
 

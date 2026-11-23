@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
-use super::protocol::{EnvelopeKind, EnvelopeRef};
+use super::protocol::{EnvelopeKind, EnvelopeRef, SummaryMessage};
 use super::refusal_backoff::RetryDisposition;
 
 /// Snapshot of the envelopes a peer holds locally per
@@ -374,6 +374,38 @@ pub trait StateProvider: Send + Sync {
     /// CIRISEdge#1020 — a responder's reply carrying a head listing left: the
     /// lost listings are no longer in a row.
     fn listing_delivered(&self, _kind: EnvelopeKind) {}
+
+    /// Range fingerprints, step A (`docs/design/RANGE_FINGERPRINTS.md` §6.1):
+    /// the marker this node puts on its Summaries on `kind`, saying it answers
+    /// RF and decodes the compact encoding. `None` (the default) sends a
+    /// pre-RF Summary, byte for byte.
+    fn rf_marker(&self, _kind: EnvelopeKind) -> Option<super::range_fp::RfSummary> {
+        None
+    }
+
+    /// Range fingerprints, step A: the marker on a Diff that answers a Summary
+    /// carrying no fingerprints.
+    fn rf_marker_diff(&self, _kind: EnvelopeKind) -> Option<super::range_fp::RfDiff> {
+        None
+    }
+
+    /// Range fingerprints, step A (design §2.3-§2.6): answer a fingerprinted
+    /// Summary. `raw_want` is the receive diff before refusal suppression and
+    /// hash-first learning, `final_want` the want this node sends. In memory
+    /// only (the receiver half reads no store).
+    async fn rf_answer(
+        &self,
+        _kind: EnvelopeKind,
+        _remote: &SummaryMessage,
+        _raw_want: &[[u8; 32]],
+        _final_want: &[[u8; 32]],
+    ) -> Option<super::range_fp::RfDiff> {
+        None
+    }
+
+    /// Range fingerprints, step A (R21): a body the round's peer delivered was
+    /// admitted or found held, so a pending id may enter that peer's mirror.
+    fn rf_note_settled(&self, _kind: EnvelopeKind, _envelope_bytes: &[u8]) {}
 
     /// Return the byte-exact signed envelope for the given content
     /// hash, or `None` if the envelope isn't in local state. Called

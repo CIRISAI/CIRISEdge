@@ -182,6 +182,7 @@ async fn round(s: &Seat, round_id: u64) -> Cost {
         status: None,
         kind,
         refs: Vec::new(),
+        rf: None,
     });
     s.rt.registry()
         .route_inbound_bytes(

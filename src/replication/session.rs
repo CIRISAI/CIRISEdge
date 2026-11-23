@@ -460,6 +460,7 @@ impl Session {
             status: None,
             kind: self.kind,
             refs: refs.clone(),
+            rf: provider.rf_marker(self.kind),
         };
         self.last_summary_sent = Some(summary.clone());
         // A Summary-opened round is answered with Summary_R + Diff_R; the
@@ -782,6 +783,7 @@ impl Session {
             status,
             kind: self.kind,
             refs: answer.refs,
+            rf: None,
         };
         // Record what we offered so a subsequent Diff for these refs is served
         // (the responder path reads `last_summary_sent` conceptually via
@@ -826,6 +828,15 @@ impl Session {
         // CIRISEdge#971 — asked as the diff, not as the holdings: a provider
         // that keeps its holdings as a set answers without materialising them.
         let mut want = provider.local_want(self.kind, &remote.refs).await;
+        // Range fingerprints, step A: the receive diff before suppression and
+        // hash-first learning, which the receiver's mirror reads to tell a
+        // held id from a refused or known one (design §3.2). Kept only when
+        // the Summary carries fingerprints.
+        let rf_raw_want: Option<Vec<[u8; 32]>> = remote
+            .rf
+            .as_ref()
+            .filter(|rf| rf.is_fingerprinted() || rf.transport_refused)
+            .map(|_| want.clone());
         // CIRISEdge#544 — the re-offer loop is RECEIVER-PULLED, and this is where
         // the pull is decided. `want` is memoryless: a refused row is never
         // stored, so it is absent from `local_holdings`, so it comes straight
@@ -914,6 +925,12 @@ impl Session {
             }
         }
 
+        // Range fingerprints, step A: answer the Summary's fingerprints, or
+        // say this node answers them (design §2.3, §6.1).
+        let rf = match rf_raw_want.as_deref() {
+            Some(raw) => provider.rf_answer(self.kind, remote, raw, &want).await,
+            None => provider.rf_marker_diff(self.kind),
+        };
         let mut outbound = Vec::new();
         // Responder ALSO needs to send its Summary so the
         // initiator's side of the round can progress. We include it
@@ -926,6 +943,7 @@ impl Session {
                 status: None,
                 kind: self.kind,
                 refs: my_refs,
+                rf: provider.rf_marker(self.kind),
             };
             self.last_summary_sent = Some(my_summary.clone());
             outbound.push(ReplicationMessage::Summary(my_summary));
@@ -941,6 +959,7 @@ impl Session {
             kind: self.kind,
             want,
             withheld,
+            rf,
         }));
         ReplicationOutcome::Send(outbound)
     }
@@ -1106,6 +1125,7 @@ impl Session {
                 kind: fetch.kind,
                 want: fetch.want.clone(),
                 withheld: Vec::new(),
+                rf: None,
             },
             provider,
             source_peer,
@@ -1289,10 +1309,16 @@ impl Session {
                 .apply_envelope(self.kind, env_bytes, source_peer)
                 .await
             {
-                ApplyOutcome::Admitted => admitted += 1,
+                ApplyOutcome::Admitted => {
+                    admitted += 1;
+                    // Range fingerprints, step A (R21): a pending id this
+                    // peer listed enters its mirror once it is held.
+                    provider.rf_note_settled(self.kind, env_bytes);
+                }
                 // Routine non-progress (a re-delivered held row) — quiet by design;
                 // WARN-ing every duplicate would drown the genuine refusals.
                 ApplyOutcome::Duplicate => {
+                    provider.rf_note_settled(self.kind, env_bytes);
                     refused += 1;
                     duplicate += 1;
                     tracing::debug!(
@@ -2043,6 +2069,7 @@ mod tests {
                     seq: 2,
                 },
             ],
+            rf: None,
         });
         let out = match responder
             .on_message(remote_summary, &provider, &applier, None)
@@ -2161,6 +2188,7 @@ mod tests {
                     kind: EnvelopeKind::Revocation, // ← wrong kind for this session
                     want: vec![],
                     withheld: Vec::new(),
+                    rf: None,
                 }),
                 &provider,
                 &applier,
@@ -2266,6 +2294,7 @@ mod tests {
             kind: EnvelopeKind::Key,
             want: vec![h(1), h(2)],
             withheld: Vec::new(),
+            rf: None,
         };
         match init.on_diff(&diff, &provider, Some("seat")).await {
             ReplicationOutcome::Send(out) => match &out[0] {
@@ -2315,6 +2344,7 @@ mod tests {
                         envelope_hash: h(1),
                         seq: 1,
                     }],
+                    rf: None,
                 }),
                 &provider,
                 &applier,
@@ -2498,6 +2528,7 @@ mod tests {
                         envelope_hash: h(1),
                         seq: 1,
                     }],
+                    rf: None,
                 }),
                 &provider,
                 &applier,
@@ -2547,6 +2578,7 @@ mod tests {
                             seq: 9,
                         },
                     ],
+                    rf: None,
                 }),
                 &provider,
                 &applier,
@@ -2615,6 +2647,7 @@ mod tests {
                     envelope_hash: h(1),
                     seq: 1,
                 }],
+                rf: None,
             })
         };
         let bob_diff = || {
@@ -2622,6 +2655,7 @@ mod tests {
                 kind: EnvelopeKind::Key,
                 want: vec![h(9)],
                 withheld: Vec::new(),
+                rf: None,
             })
         };
         let bob_deliver = || {
@@ -2726,6 +2760,7 @@ mod tests {
                     seq: 3,
                 },
             ],
+            rf: None,
         });
         alice.start_round(&a_provider).await;
         let _ = alice
@@ -2737,6 +2772,7 @@ mod tests {
             kind: EnvelopeKind::Key,
             want: vec![],
             withheld: Vec::new(),
+            rf: None,
         });
         let _ = alice
             .on_message(bob_diff, &a_provider, &a_applier, None)
@@ -3133,6 +3169,7 @@ mod tests {
                     seq: 2,
                 },
             ],
+            rf: None,
         };
         let ReplicationOutcome::Send(msgs) = session
             .on_message(
@@ -3206,6 +3243,7 @@ mod tests {
                         envelope_hash: h(1),
                         seq: 1,
                     }],
+                    rf: None,
                 }),
                 &HashFirstEverywhere,
                 &NoApply,
@@ -3269,6 +3307,7 @@ mod tests {
                 envelope_hash: h(1),
                 seq: 1,
             }],
+            rf: None,
         };
         let ReplicationOutcome::Send(msgs) = session
             .on_message(
@@ -3331,6 +3370,7 @@ mod tests {
                 envelope_hash: h(n),
                 seq: 1,
             }],
+            rf: None,
         };
 
         // Within the round the exemption stands — a racing Summary must not be
@@ -3429,6 +3469,7 @@ mod tests {
                 envelope_hash: h(1),
                 seq: 1,
             }],
+            rf: None,
         };
         let ReplicationOutcome::Send(msgs) = session
             .on_message(
@@ -3494,6 +3535,7 @@ mod tests {
                     seq: 2,
                 },
             ],
+            rf: None,
         };
         let ReplicationOutcome::Send(msgs) = session
             .on_message(
@@ -3548,6 +3590,7 @@ mod tests {
                     status: None,
                     kind: EnvelopeKind::Key,
                     refs,
+                    rf: None,
                 }),
                 &provider,
                 &NoApply,
@@ -3720,6 +3763,7 @@ mod tests {
                 kind: EnvelopeKind::Attestation,
                 want: want.clone(),
                 withheld: Vec::new(),
+                rf: None,
             };
             let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None).await
             else {
@@ -3765,6 +3809,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             want: wanted,
             withheld: Vec::new(),
+            rf: None,
         };
         let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None).await else {
             panic!("on_diff must Send a Deliver");
@@ -3809,6 +3854,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             want: vec![hash],
             withheld: Vec::new(),
+            rf: None,
         };
         let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None).await else {
             panic!("on_diff must Send a Deliver");
@@ -3857,6 +3903,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             want: vec![fetchable, unfetchable],
             withheld: Vec::new(),
+            rf: None,
         };
         let ReplicationOutcome::Send(msgs) =
             responder.on_diff(&diff, &provider, Some("peer-x")).await
@@ -3913,6 +3960,7 @@ mod tests {
                     status: None,
                     kind: EnvelopeKind::Key,
                     refs: vec![],
+                    rf: None,
                 }),
                 &provider,
                 &applier,
@@ -3971,6 +4019,7 @@ mod tests {
                     envelope_hash: h(1),
                     seq: 1,
                 }],
+                rf: None,
             })
         };
         let diff_r = || {
@@ -3978,6 +4027,7 @@ mod tests {
                 kind: EnvelopeKind::Key,
                 want: vec![h(9)],
                 withheld: Vec::new(),
+                rf: None,
             })
         };
         let empty = || {
@@ -4084,6 +4134,7 @@ mod tests {
                         envelope_hash: h(9),
                         seq: 9,
                     }],
+                    rf: None,
                 }),
                 &provider,
                 &applier,
@@ -4096,6 +4147,7 @@ mod tests {
                     kind: EnvelopeKind::Key,
                     want: Vec::new(),
                     withheld: Vec::new(),
+                    rf: None,
                 }),
                 &provider,
                 &applier,
