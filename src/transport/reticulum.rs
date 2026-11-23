@@ -12849,6 +12849,11 @@ impl LinkDirections {
         self.since.insert(link_id, (at, direct));
     }
 
+    #[cfg(test)]
+    fn remove(&mut self, link_id: &LinkId) -> Option<LinkDirection> {
+        self.remove_timed(link_id).map(|(dir, _)| dir)
+    }
+
     /// Remove `link_id`'s record: its direction and how long it was up.
     fn remove_timed(&mut self, link_id: &LinkId) -> Option<(LinkDirection, std::time::Duration)> {
         let dir = self.by_link.remove(link_id)?;
