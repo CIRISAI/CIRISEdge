@@ -74,6 +74,10 @@ pub(super) const COVERED: [EnvelopeKind; 6] = [
 pub(super) fn index_on() -> BridgeConfig {
     BridgeConfig {
         holdings_index: true,
+        // No timed audit inside a test: the default (60 s) is wall clock, and
+        // a long loaded run crossed it ("no audit ran" left=2). A witness that
+        // wants an audit says so (`Duration::ZERO`).
+        holdings_audit_every: NO_TEST_OUTLIVES,
         ..BridgeConfig::default()
     }
 }
