@@ -432,6 +432,7 @@ async fn capped_listener(port: u16, uplink: Arc<CappedUplink>) -> u16 {
 /// [`topo`], with node `capped.0`'s uplink a [`CappedUplink`]: every node that
 /// dials it reaches it through [`capped_listener`]. The capped node must dial
 /// nobody (its own outbound connections would bypass the cap).
+#[allow(clippy::too_many_lines)] // `topo`'s body plus the capped pipe
 async fn topo_capped(
     tag: &str,
     n: usize,
@@ -3341,7 +3342,12 @@ async fn a_relay_that_turns_off_hands_its_children_to_another_relay() {
 /// (each a TCP client of A and S only, so they reach each other only through
 /// one of them). B and C hear each other through A, never S; S reports
 /// `relaying: false` and forwards to nobody, and nobody takes it as a parent.
-#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+// The seat set lives on the node's Edge (`_edge`).
+#[allow(
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::used_underscore_binding
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_serve_seat_in_the_room_never_relays() {
     let _call = one_call().await;
