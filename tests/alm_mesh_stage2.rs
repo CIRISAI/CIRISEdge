@@ -3542,8 +3542,30 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     let exhausted_before: u64 = nodes.iter().map(|n| channel_exhausted(&n.metrics)).sum();
     let torn_before: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum();
     uplink.cap_kbit(copy_kbit * 13 / 10);
+    // When the first link is torn down after the cap, on P and on its peers
+    // (the matrix: every node, 1.6-2.2 s after cap_on).
+    let cap_on = tokio::time::Instant::now();
+    let first_torn: Arc<std::sync::Mutex<Vec<Option<Duration>>>> =
+        Arc::new(std::sync::Mutex::new(vec![None; nodes.len()]));
+    let sampler = {
+        let ms: Vec<EdgeMetrics> = nodes.iter().map(|n| n.metrics.clone()).collect();
+        let base: Vec<u64> = ms.iter().map(torn_down).collect();
+        let first = Arc::clone(&first_torn);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut f = first.lock().expect("first");
+                for (i, m) in ms.iter().enumerate() {
+                    if f[i].is_none() && torn_down(m) > base[i] {
+                        f[i] = Some(cap_on.elapsed());
+                    }
+                }
+            }
+        })
+    };
     let capped_from = seq;
     let seq = publish_capped_for(&mut cp, 30, seq).await;
+    sampler.abort();
     let sent = seq - capped_from;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let heard = drain(&mut rx, &p.key.key_id);
@@ -3563,9 +3585,10 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
         .count();
     let context = format!(
         "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
-         ChannelExhausted {exhausted}; torn {torn}; P legs {:?}",
+         ChannelExhausted {exhausted}; torn {torn}; first teardown after the cap (P, A, B, C, T) {:?}; P legs {:?}",
         cp.alm_own_children(),
         cp.alm_counts(),
+        first_torn.lock().expect("first").clone(),
         cp.legs()
     );
     // Every criterion is judged and every failure named, so a red run says
