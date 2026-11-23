@@ -500,6 +500,17 @@ impl Transport for HttpsTransport {
         TransportId::HTTP
     }
 
+    /// Range fingerprints (R6): only a peer whose configured target is an
+    /// `https` URL. A plain `http` target configured on this transport is not
+    /// confidential, whatever the transport's name.
+    fn confidential_to(&self, peer: &str) -> bool {
+        self.peer_urls.get(peer).is_some_and(|url| {
+            url.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("https://")
+        })
+    }
+
     async fn send(
         &self,
         destination_key_id: &str,
@@ -1506,5 +1517,42 @@ mod v0_19_3_init_tests {
         let p2 = std::fs::read(&cert2).unwrap();
         assert!(!p1.is_empty());
         assert!(!p2.is_empty());
+    }
+}
+
+/// Range fingerprints (design §6.4, R6, witness 17) — `confidential_to`.
+#[cfg(test)]
+mod confidential_to_rf_tests {
+    use super::*;
+
+    /// **The HTTPS transport is confidential only toward an `https` target**;
+    /// a plain `http` target on it, an unknown peer and the plain HTTP
+    /// transport are not, and neither is the trait default.
+    ///
+    /// Mutation that turns it red: answer `true` for every peer of the HTTPS
+    /// transport, or drop the plain transport back to a `true` override.
+    #[test]
+    fn confidential_only_toward_https_targets_rf_17() {
+        let urls = HashMap::from([
+            (
+                "a".to_owned(),
+                "https://seat.invalid/edge/inbound".to_owned(),
+            ),
+            (
+                "b".to_owned(),
+                "http://seat.invalid/edge/inbound".to_owned(),
+            ),
+            (
+                "c".to_owned(),
+                "  HTTPS://seat.invalid/edge/inbound".to_owned(),
+            ),
+        ]);
+        let https = HttpsTransport::new(None, HttpClientConfig::default(), urls).expect("a client");
+        assert!(https.confidential_to("a"));
+        assert!(!https.confidential_to("b"), "a plain target");
+        assert!(https.confidential_to("c"), "scheme case and space");
+        assert!(!https.confidential_to("nobody"));
+        let plain = HttpTransport::new(HttpTransportConfig::default()).expect("plain");
+        assert!(!plain.confidential_to("a"));
     }
 }

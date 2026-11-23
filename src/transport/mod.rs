@@ -760,6 +760,15 @@ pub trait Transport: Send + Sync + 'static {
     /// Stable identifier for metrics + logs.
     fn id(&self) -> TransportId;
 
+    /// Range fingerprints (`docs/design/RANGE_FINGERPRINTS.md` §6.4, R6):
+    /// is every byte this transport carries to `peer` confidential end to
+    /// end? A salted RF Summary is built only for a peer this answers `true`
+    /// for. **The default is `false`**: a transport is confidential only if
+    /// it says so.
+    fn confidential_to(&self, _peer: &str) -> bool {
+        false
+    }
+
     /// Send the byte-exact signed envelope to the peer addressed by
     /// `destination_key_id`. The transport resolves the address from
     /// the key (Reticulum: `dest = sha256(pubkey)[..16]`; HTTP:
