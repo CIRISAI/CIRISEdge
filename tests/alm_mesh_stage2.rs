@@ -339,7 +339,115 @@ async fn topo(
     dials: &[(usize, usize)],
     canonical: Option<usize>,
 ) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
+    topo_capped(tag, n, members, dials, canonical, None).await
+}
+
+/// A node's UPLINK as a shared bottleneck: every byte the node sends back
+/// down a TCP link another node dialled to it waits its turn in ONE FIFO
+/// drained at `bytes_per_s` (0: unlimited), with no queue limit — a
+/// bufferbloated home or cellular uplink. What others send to the node
+/// passes at once. Turned on after setup.
+struct CappedUplink {
+    bytes_per_s: AtomicU64,
+    next_free: tokio::sync::Mutex<tokio::time::Instant>,
+}
+
+impl CappedUplink {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            bytes_per_s: AtomicU64::new(0),
+            next_free: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        })
+    }
+
+    fn cap_kbit(&self, kbit: u64) {
+        self.bytes_per_s.store(kbit * 1000 / 8, Ordering::SeqCst);
+    }
+
+    /// When `n` bytes handed over now leave the bottleneck.
+    async fn due(&self, n: usize) -> tokio::time::Instant {
+        let rate = self.bytes_per_s.load(Ordering::SeqCst);
+        let now = tokio::time::Instant::now();
+        if rate == 0 {
+            return now;
+        }
+        let mut next = self.next_free.lock().await;
+        let start = (*next).max(now);
+        let done = start + Duration::from_micros(n as u64 * 1_000_000 / rate);
+        *next = done;
+        done
+    }
+}
+
+/// A pipe in front of `port`'s listener whose return direction (the node's
+/// sends) rides `uplink`. Returns the port to dial instead.
+async fn capped_listener(port: u16, uplink: Arc<CappedUplink>) -> u16 {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the capped pipe");
+    let front = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(node) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
+                continue;
+            };
+            let _ = client.set_nodelay(true);
+            let _ = node.set_nodelay(true);
+            let (mut client_rx, mut client_tx) = client.into_split();
+            let (mut node_rx, mut node_tx) = node.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut client_rx, &mut node_tx).await;
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+            let up = Arc::clone(&uplink);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                while let Ok(n) = node_rx.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    let due = up.due(n).await;
+                    if tx.send((due, buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some((due, bytes)) = rx.recv().await {
+                    tokio::time::sleep_until(due).await;
+                    if client_tx.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    front
+}
+
+/// [`topo`], with node `capped.0`'s uplink a [`CappedUplink`]: every node that
+/// dials it reaches it through [`capped_listener`]. The capped node must dial
+/// nobody (its own outbound connections would bypass the cap).
+async fn topo_capped(
+    tag: &str,
+    n: usize,
+    members: usize,
+    dials: &[(usize, usize)],
+    canonical: Option<usize>,
+    capped: Option<(usize, Arc<CappedUplink>)>,
+) -> (Vec<Node>, Vec<CohortGroup>, tempfile::TempDir) {
     init_tracing();
+    if let Some((c, _)) = &capped {
+        assert!(
+            dials.iter().all(|(_, j)| j != c),
+            "the capped node dials nobody"
+        );
+    }
+    let mut capped_port: Option<u16> = None;
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut keys = Vec::new();
     for i in 0..n {
@@ -358,11 +466,19 @@ async fn topo(
     let mut nodes: Vec<Node> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
         let dir = directory_with(records.clone()).await;
-        let peers: Vec<u16> = dials
-            .iter()
-            .filter(|(_, j)| *j == i)
-            .map(|(a, _)| nodes[*a].port)
-            .collect();
+        let mut peers: Vec<u16> = Vec::new();
+        for (a, _) in dials.iter().filter(|(_, j)| *j == i) {
+            match &capped {
+                Some((c, uplink)) if c == a => {
+                    if capped_port.is_none() {
+                        capped_port =
+                            Some(capped_listener(nodes[*a].port, Arc::clone(uplink)).await);
+                    }
+                    peers.push(capped_port.expect("the capped pipe"));
+                }
+                _ => peers.push(nodes[*a].port),
+            }
+        }
         nodes.push(
             node(
                 key,
@@ -3296,4 +3412,152 @@ async fn a_serve_seat_in_the_room_never_relays() {
     assert_eq!(cs.relay_status(), (false, 0));
     assert!(cs.relayed_to().is_empty(), "{:?}", cs.relayed_to());
     assert_eq!(cs.alm_counts().forwarded, 0);
+}
+
+/// Publish 600 B frames at 30 Hz from `cp` for `secs`, from `seq0`.
+async fn publish_capped_for(cp: &mut Call, secs: u64, seq0: u64) -> u64 {
+    let size = cp.chunk_plaintext_budget().unwrap_or(240).min(600);
+    let mut seq = seq0;
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < end {
+        let mut b = body("p", seq);
+        b.resize(size, b'.');
+        let _ = cp.publish(Frame::opaque(b)).await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    seq
+}
+
+/// Every identified link `m` saw closed by Channel retry exhaustion.
+fn channel_exhausted(m: &EdgeMetrics) -> u64 {
+    m.peer_activity()
+        .iter()
+        .filter(|(k, _)| k.ends_with(".channel_exhausted"))
+        .map(|(_, v)| *v)
+        .sum()
+}
+
+/// **G8 — a publisher whose uplink is capped below its fan-out** (the
+/// server's av_mesh cell, on loopback, with no tc): `P` publishes
+/// 600 B at 30 Hz to `A`, `B` and `C`, who reach each other directly, every
+/// member relaying (the host's member default). `P`'s uplink is then capped
+/// at 250 kbit/s with an unbounded queue: about one copy of its stream on
+/// the wire, a third of its fan-out.
+///
+/// What the design does (`docs/AV_ALM_DESIGN.md` §5.1, C2): `P` sheds to one
+/// child make-before-break, the other two take that child as their relay,
+/// and everyone keeps hearing `P` at about the one-copy rate. What must not
+/// happen (CIRISEdge 45.1.9 matrix, leviculum#113): every link of `P`
+/// torn down by Channel retry exhaustion within ~2 s of the cap.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
+    let _call = one_call().await;
+    let tag = "alm2-capped";
+    let uplink = CappedUplink::new();
+    // 0 = P (capped, dials nobody), 1..=3 = A, B, C (dial P and each other);
+    // 4 = T (the canonical shape, dials everyone but P).
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&uplink))),
+    )
+    .await;
+    let p = &nodes[0];
+    let mut cp = join_loaded(p, &groups[0], tag, relay_opts(), None).await;
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    wait_legs(&cp, 3).await;
+    for l in &listeners {
+        wait_legs(l, 3).await;
+    }
+    let mut rx: Vec<mpsc::Receiver<ReceivedFrame>> = listeners
+        .iter_mut()
+        .map(|l| l.frames().expect("frames"))
+        .collect();
+    let drain = |rx: &mut Vec<mpsc::Receiver<ReceivedFrame>>, from: &str| {
+        rx.iter_mut()
+            .map(|r| {
+                let mut n = 0u64;
+                while let Ok(f) = r.try_recv() {
+                    if f.publisher == from {
+                        n += 1;
+                    }
+                }
+                n
+            })
+            .collect::<Vec<u64>>()
+    };
+    // Baseline: the full mesh carries P.
+    let seq = publish_capped_for(&mut cp, 5, 0).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let base = drain(&mut rx, &p.key.key_id);
+    assert!(
+        base.iter().all(|n| *n * 10 >= seq * 9),
+        "baseline: {base:?} of {seq}"
+    );
+
+    // The cap: one copy of P's stream on the wire and a third to spare (the
+    // server's cell, 250 kbit/s against ~190 kbit/s a copy, scaled to this
+    // leg's frame: the frame plus ~170 B of chunk, signature, seal and link
+    // framing, 30 a second), so three copies are ~2.3x what it carries.
+    let frame = cp.chunk_plaintext_budget().unwrap_or(240).min(600) as u64;
+    let copy_kbit = (frame + 170) * 8 * 30 / 1000;
+    let exhausted_before: u64 = nodes.iter().map(|n| channel_exhausted(&n.metrics)).sum();
+    uplink.cap_kbit(copy_kbit * 13 / 10);
+    let capped_from = seq;
+    let seq = publish_capped_for(&mut cp, 30, seq).await;
+    let sent = seq - capped_from;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let heard = drain(&mut rx, &p.key.key_id);
+    let exhausted: u64 = nodes
+        .iter()
+        .map(|n| channel_exhausted(&n.metrics))
+        .sum::<u64>()
+        - exhausted_before;
+    let parents: Vec<Option<String>> = listeners
+        .iter()
+        .map(|l| primary_for(l, cp.stream()))
+        .collect();
+    let direct = parents
+        .iter()
+        .filter(|x| x.as_deref() == Some(p.key.key_id.as_str()))
+        .count();
+    let context = format!(
+        "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
+         ChannelExhausted {exhausted}; P legs {:?}",
+        cp.alm_own_children(),
+        cp.alm_counts(),
+        cp.legs()
+    );
+    assert_eq!(
+        exhausted, 0,
+        "no link torn down by retry exhaustion: {context}"
+    );
+    assert_eq!(direct, 1, "P keeps ONE direct child: {context}");
+    for (x, n) in parents.iter().zip(&heard) {
+        assert!(x.is_some(), "every listener has a parent: {context}");
+        // About the one-copy rate: the uplink carries one copy, so each
+        // listener hears most of what P published once it settled.
+        assert!(*n * 10 >= sent * 7, "{n} of {sent} heard: {context}");
+    }
+    drop(listeners);
+    drop(cp);
 }

@@ -1230,7 +1230,7 @@ async fn a_failed_media_path_says_why_once_and_is_restored() {
     assert!(!call_a.legs().is_empty() && !call_b.legs().is_empty());
     for (seen, peer) in [(&seen_a, &b_id), (&seen_b, &a_id)] {
         match &path_events(seen)[..] {
-            [CallEvent::MediaPathFailed { member: f, .. }, CallEvent::MediaPathRestored { member, via }] =>
+            [CallEvent::MediaPathFailed { member: f, .. }, CallEvent::MediaPathRestored { member, via, .. }] =>
             {
                 assert_eq!((f, member), (peer, peer));
                 assert_eq!(*via, PathKind::DirectReflexive);
@@ -1787,6 +1787,22 @@ fn primary_for(
         .and_then(|p| p.primary)
 }
 
+/// How many distinct frames of `from` arrive at `rx`, up to `n`, within 20 s.
+async fn heard_from(rx: &mut mpsc::Receiver<ReceivedFrame>, from: &str, n: u64) -> usize {
+    let mut got = std::collections::BTreeSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while got.len() < usize::try_from(n).unwrap() {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(f)) if f.publisher == from => {
+                got.insert(f.bytes);
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    got.len()
+}
+
 /// Bytes `T`'s interfaces carried, both ways: everything that crossed it.
 fn t_bytes(t: &ReticulumNode) -> u64 {
     t.interface_stats()
@@ -1860,25 +1876,8 @@ async fn a_member_that_cannot_punch_is_heard_through_another_member() {
         }
         tokio::time::sleep(Duration::from_millis(33)).await;
     }
-    let heard = |rx: &mut mpsc::Receiver<ReceivedFrame>, from: String| {
-        let rx = rx;
-        async move {
-            let mut got = std::collections::BTreeSet::new();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-            while got.len() < usize::try_from(n).unwrap() {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Some(f)) if f.publisher == from => {
-                        got.insert(f.bytes);
-                    }
-                    Ok(Some(_)) => {}
-                    _ => break,
-                }
-            }
-            got.len()
-        }
-    };
-    let at_a = heard(&mut a_frames, b.key.key_id.clone()).await;
-    let at_b = heard(&mut b_frames, a.key.key_id.clone()).await;
+    let at_a = heard_from(&mut a_frames, &b.key.key_id, n).await;
+    let at_b = heard_from(&mut b_frames, &a.key.key_id, n).await;
     let t_after = t_bytes(&p.t);
     assert_eq!(
         (at_a, at_b),
