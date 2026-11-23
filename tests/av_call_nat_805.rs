@@ -1958,3 +1958,144 @@ async fn a_member_that_cannot_punch_is_heard_through_another_member() {
         "no MediaPathFailed for a member a relay carries"
     );
 }
+
+/// The next `Established` on `side`'s direct-path events within `within`, as
+/// `(link_id, at)`.
+async fn next_established(
+    side: &mut Side,
+    within: Duration,
+) -> Option<([u8; 16], tokio::time::Instant)> {
+    tokio::time::timeout(within, async {
+        loop {
+            match side.events.recv().await {
+                Ok(DirectPathEvent::Established { link_id, .. }) => {
+                    return (link_id, tokio::time::Instant::now());
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => panic!("events closed"),
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+/// Whether `call`'s leg to `to` rides a punched interface now.
+fn leg_is_punched(call: &Call, to: &Side) -> bool {
+    call.leg_info().iter().any(|l| {
+        l.member == to.key.key_id && l.path == ciris_edge::transport::av_call::LegPath::DirectUdp
+    })
+}
+
+/// **G8 C, end to end** — a punched path whose LINK closes under a live call
+/// leg comes back within seconds, not after the 60 s backoff that mirrored
+/// leviculum's per-link proposal cooldown (the 45.1.9 relay matrix's 60–75 s
+/// gaps). leviculum retires the punched interface with its link, so the leg
+/// over it goes too; the released direct path lets the leg's redial propose
+/// at once on a new identity link. Then the bounds: a second close inside
+/// the 60 s window backs the peer off (no punch storm), and a hang-up
+/// proposes nothing.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_punched_link_closed_under_a_call_comes_back_within_seconds() {
+    let mut p = Box::pin(pair("g8c", true)).await;
+    let call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A joins");
+    let call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B joins");
+    let (first, _) = next_established(&mut p.a, Duration::from_mins(1))
+        .await
+        .expect("A's identity link moves onto a punched interface");
+    assert!(
+        wait_until(Duration::from_mins(1), || async {
+            leg_is_punched(&call_a, &p.b)
+        })
+        .await,
+        "A's leg to B rides the punched interface: {:?}",
+        call_a.leg_info()
+    );
+
+    // The link closes from under the live leg (here A's own teardown; in
+    // the field a Channel exhausted, leviculum#113).
+    let closed_at = tokio::time::Instant::now();
+    p.a.transport
+        .link_teardown(&first)
+        .await
+        .expect("tear the punched link down");
+    let (second, up_at) = next_established(&mut p.a, Duration::from_secs(45))
+        .await
+        .expect("a new identity link is punched again");
+    assert_ne!(second, first, "a new link");
+    let took = up_at - closed_at;
+    assert!(
+        took < Duration::from_secs(30),
+        "back on a direct path in {took:?}, not after the 60 s backoff"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            leg_is_punched(&call_a, &p.b)
+        })
+        .await,
+        "A's leg to B is back on a punched interface: {:?}",
+        call_a.leg_info()
+    );
+    assert!(
+        dl(&p.a.metrics, "direct_link_released_link_closed") >= 1,
+        "{:?}",
+        p.a.metrics.direct_link()
+    );
+
+    // A hang-up proposes nothing: the legs go, the identity link and its
+    // direct path stay, and no release or proposal follows.
+    let proposed = dl(&p.a.metrics, "direct_link_proposed");
+    let released = dl(&p.a.metrics, "direct_link_released_link_closed");
+    let _ = call_a.leave().await;
+    let _ = call_b.leave().await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        (
+            dl(&p.a.metrics, "direct_link_proposed"),
+            dl(&p.a.metrics, "direct_link_released_link_closed")
+        ),
+        (proposed, released),
+        "a hang-up re-punched nothing: {:?}",
+        p.a.metrics.direct_link()
+    );
+
+    // A second close inside the 60 s window is not free: the peer backs
+    // off, so a peer whose links keep dying is never punched in a storm.
+    let call_a = join(&p.a, &p.groups[0], &p.room).await.expect("A rejoins");
+    let _call_b = join(&p.b, &p.groups[1], &p.room).await.expect("B rejoins");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            leg_is_punched(&call_a, &p.b)
+        })
+        .await,
+        "the rejoined leg rides the standing punched path: {:?}",
+        call_a.leg_info()
+    );
+    assert!(
+        closed_at.elapsed() < Duration::from_secs(55),
+        "still inside the window"
+    );
+    let proposed = dl(&p.a.metrics, "direct_link_proposed");
+    p.a.transport
+        .link_teardown(&second)
+        .await
+        .expect("tear the second punched link down");
+    assert!(
+        next_established(&mut p.a, Duration::from_secs(20))
+            .await
+            .is_none(),
+        "no re-punch inside the window"
+    );
+    assert_eq!(
+        dl(&p.a.metrics, "direct_link_proposed"),
+        proposed,
+        "nothing proposed while backing off: {:?}",
+        p.a.metrics.direct_link()
+    );
+    assert!(
+        dl(&p.a.metrics, "direct_link_skipped_backoff") >= 1,
+        "the leg's redials met the backoff: {:?}",
+        p.a.metrics.direct_link()
+    );
+}
