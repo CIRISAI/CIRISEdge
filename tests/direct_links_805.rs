@@ -3337,3 +3337,109 @@ async fn links_peers_and_lifetimes_are_counted_by_medium_and_cause_1025() {
     );
     assert_eq!(flat.counters["links_active.udp-direct:outbound"], 0);
 }
+
+// ─── CIRISEdge#1028: an anonymous identity never upgrades ───────────────
+
+/// Turn `side`'s Anonymous Tier on: opted in, with a dealt period whose every
+/// layer answers (CC 5.4.6). `tier()` is then `Ok`.
+fn anonymous(side: &Side) {
+    use ciris_edge::onion::policy::OnionPolicy;
+    use ciris_edge::transport::onion_layers::{deal_layers, RelayCandidate};
+    use ciris_edge::transport::onion_liveness::LivenessEvidence;
+    let onion = side.transport.onion();
+    onion.set_policy(OnionPolicy {
+        enabled: true,
+        ..OnionPolicy::default()
+    });
+    let mut ids: Vec<String> = (0..8).map(|i| format!("relay-1028-{i}")).collect();
+    ids.push(side.key.key_id.clone());
+    let candidates: Vec<RelayCandidate> = ids
+        .iter()
+        .map(|k| RelayCandidate {
+            key_id: k.clone(),
+            is_seat: true,
+            relay_standing: false,
+            row_live: true,
+            announced: true,
+            hop_key_valid: true,
+            opted_out: false,
+            owner_bound_under_bundle_root: true,
+        })
+        .collect();
+    let deal = deal_layers(&candidates, 5, 2);
+    assert!(deal.available, "the deal meets every layer's floor");
+    for k in deal.layers.iter().flatten() {
+        onion.observe(k, LivenessEvidence::ShapedLinkUp);
+    }
+    onion.install_deal(deal);
+    assert_eq!(onion.tier(), Ok(()), "the tier is active");
+}
+
+/// **#1028** — a node whose Anonymous Tier is active ANSWERS a direct-link
+/// request with a refusal: accepting would hand the proposer (and the
+/// facilitator) this node's reflexive address, and an anonymous identity holds
+/// only layer and rendezvous links (CC 5.4.6). A shares a room with B and
+/// proposes on its send, as #915 does; B refuses, nothing goes direct. Red
+/// before: B accepted (the room was all it asked).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_anonymous_node_refuses_a_direct_link_request_1028() {
+    let mut p = trio("a1028", proposer(), DirectLinksConfig::default()).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    anonymous(&p.b);
+    p.a.transport
+        .send(&p.b.key.key_id, b"room-1028")
+        .await
+        .expect("A's send to B ships through T");
+    let asked = next_event(&mut p.b.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Requested { .. })
+    })
+    .await
+    .expect("B's host was asked");
+    assert!(
+        matches!(
+            &asked,
+            DirectPathEvent::Requested {
+                accepted: false,
+                ..
+            }
+        ),
+        "an anonymous node refuses: {asked:?}"
+    );
+    let failed = next_event(&mut p.a.events, Duration::from_secs(10), |e| {
+        matches!(
+            e,
+            DirectPathEvent::Failed { .. } | DirectPathEvent::Established { .. }
+        )
+    })
+    .await
+    .expect("A's outcome");
+    assert!(
+        matches!(&failed, DirectPathEvent::Failed { .. }),
+        "nothing goes direct: {failed:?}"
+    );
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_refused"), 1);
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_accepted"), 0);
+    assert_eq!(p.b.metrics.direct_links_active(), 0);
+}
+
+/// **#1028** — a node whose Anonymous Tier is active PROPOSES nothing: a
+/// proposal reveals its address to the peer and makes it probe the
+/// facilitator. Its send to a room peer (#915's proposal hook) ships and
+/// proposes nothing; the peer is never asked. Red before: A proposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_anonymous_node_proposes_no_direct_link_1028() {
+    let mut p = trio("p1028", proposer(), DirectLinksConfig::default()).await;
+    let (_spine, _b_addr) = open_call(&p).await;
+    anonymous(&p.a);
+    p.a.transport
+        .send(&p.b.key.key_id, b"room-1028")
+        .await
+        .expect("A's send to B ships through T");
+    let asked = next_event(&mut p.b.events, Duration::from_secs(10), |e| {
+        matches!(e, DirectPathEvent::Requested { .. })
+    })
+    .await;
+    assert!(asked.is_none(), "B is never asked: {asked:?}");
+    assert_eq!(dl(&p.a.metrics, "direct_link_proposed"), 0);
+    assert_eq!(p.a.metrics.direct_links_active(), 0);
+}
