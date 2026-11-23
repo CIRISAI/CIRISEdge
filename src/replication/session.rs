@@ -289,6 +289,70 @@ struct HeldReport {
     staleness: StalenessSignal,
 }
 
+/// CIRISEdge#1029 F2b — **the order one Deliver's rows are applied in**: on
+/// the Attestation plane, the rows that open a group's audience
+/// ([`opens_audience`]) first, then the rest, each part in wire order.
+///
+/// A push carries what the sender lists, not what the receiver can admit in
+/// order: the founder's required read lists the wraps to a joiner before the
+/// widening that seats it, so the joiner refused its own epoch wrap
+/// `recipient_not_in_audience` (and the room's cosign rows `not_in_audience`)
+/// half a second before the widening in the same Deliver opened the audience,
+/// and the wrap landed ~147 s later on rounds that timed out. Wire order is
+/// kept within each part, so a sender's dependency order (a proposal before
+/// its acceptance before the widening) still holds.
+fn apply_order(kind: EnvelopeKind, envelopes: &[Vec<u8>]) -> Vec<&Vec<u8>> {
+    let mut order: Vec<&Vec<u8>> = envelopes.iter().collect();
+    if kind == EnvelopeKind::Attestation && order.len() > 1 {
+        // Stable: openers (`false`) first, wire order kept within each part.
+        order.sort_by_key(|bytes| !opens_audience(bytes));
+    }
+    order
+}
+
+/// CIRISEdge#1029 F2b — the group-plane rows a member's audience is read
+/// from: a group's record (`group:roster:`), a widening, and the consent it
+/// rests on (`membership:proposal:`, `membership:acceptance:`). A removal or
+/// resignation narrows an audience and keeps its wire place. Read from the
+/// dimension alone, bare row or its `{"attestation": …}` wrap; bytes that do
+/// not parse keep their place.
+fn opens_audience(bytes: &[u8]) -> bool {
+    use ciris_persist::federation::group_plane::{
+        GROUP_ROSTER_DIMENSION, MEMBERSHIP_WIDENING_DIMENSION,
+    };
+    use ciris_persist::federation::membership_acceptance::{
+        ACCEPTANCE_DIMENSION, PROPOSAL_DIMENSION,
+    };
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        dimension: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Row {
+        #[serde(default)]
+        attestation_envelope: Option<Envelope>,
+        #[serde(default)]
+        attestation: Option<Box<Row>>,
+    }
+    let Ok(row) = serde_json::from_slice::<Row>(bytes) else {
+        return false;
+    };
+    let envelope = match row.attestation {
+        Some(inner) => inner.attestation_envelope,
+        None => row.attestation_envelope,
+    };
+    envelope.and_then(|e| e.dimension).is_some_and(|d| {
+        [
+            GROUP_ROSTER_DIMENSION,
+            MEMBERSHIP_WIDENING_DIMENSION,
+            PROPOSAL_DIMENSION,
+            ACCEPTANCE_DIMENSION,
+        ]
+        .contains(&d.as_str())
+    })
+}
+
 /// The identity of a refused wire row, for the log line naming it. Read
 /// best-effort from the bytes: an Attestation-plane row is the bare
 /// `Attestation` or its `{"attestation": …}` wrap; another plane's row has
@@ -1268,7 +1332,9 @@ impl Session {
         // cannot — it must produce a reason this loop surfaces. A refusal that
         // withholds carriage can therefore never again read as absence of work; the
         // `refused` count in the `RoundReport` always has a matching WARN saying WHY.
-        for env_bytes in &deliver.envelopes {
+        //
+        // CIRISEdge#1029 F2b — in audience order ([`apply_order`]).
+        for env_bytes in apply_order(self.kind, &deliver.envelopes) {
             // CIRISEdge#552 — PER ENVELOPE, not per message. A responder can
             // append bodies to a Fetch reply, and appending does not make them
             // requested. Gating the whole message on "any envelope matched"
@@ -2837,6 +2903,91 @@ mod tests {
             } => {
                 assert_eq!(admitted, 0, "nothing admitted");
                 assert_eq!(refused, 3, "every refused envelope is counted, not dropped");
+            }
+            o => panic!("expected Applied, got {o:?}"),
+        }
+    }
+
+    /// CIRISEdge#1029 F2b — **within one Deliver, the rows that open an
+    /// audience apply before the rows it gates.** Field (12-person star, the
+    /// joiner): one Deliver from the founder carried the founder's epoch wrap
+    /// for the joiner, then the room's cosign rows, then the widening that
+    /// seats the joiner. Applied in wire order, the wrap was refused
+    /// `recipient_not_in_audience` and the cosign rows `not_in_audience`; the
+    /// widening landed 0.5 s later and opened the audience, and the wrap was
+    /// re-asked on rounds that timed out, landing ~147 s later. The applier
+    /// here is persist's audience rule reduced to its order dependence; the
+    /// rows are the field's shapes. Red before: the wrap and the cosign row
+    /// refused.
+    #[tokio::test]
+    async fn a_deliver_applies_the_widening_before_the_rows_its_audience_gates_1029() {
+        use ciris_persist::federation::group_plane::MEMBERSHIP_WIDENING_DIMENSION;
+        use ciris_persist::federation::key_grant::KEY_GRANT_EPOCH_DIMENSION;
+        const ROOM: &str = "chat:room:v1:f28dba543b2f4186ab20eed2a2748afa";
+        fn row(id: &str, dimension: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "attestation_id": id,
+                "attestation_type": "scores",
+                "cohort_scope": "community",
+                "attestation_envelope": {"dimension": dimension, "community_key_id": ROOM},
+            }))
+            .expect("row")
+        }
+        fn dimension_of(bytes: &[u8]) -> String {
+            let v: serde_json::Value = serde_json::from_slice(bytes).expect("json");
+            v["attestation_envelope"]["dimension"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        }
+        /// The joiner's node: outside the room's audience until the widening
+        /// naming it lands.
+        #[derive(Default)]
+        struct Joiner {
+            seated: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl StateApplier for Joiner {
+            async fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                b: &[u8],
+                _source_peer: Option<&str>,
+            ) -> ApplyOutcome {
+                let dimension = dimension_of(b);
+                if dimension.starts_with("membership:") {
+                    self.seated.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return ApplyOutcome::Admitted;
+                }
+                if self.seated.load(std::sync::atomic::Ordering::SeqCst) {
+                    ApplyOutcome::Admitted
+                } else {
+                    ApplyOutcome::refused("not_in_audience")
+                }
+            }
+        }
+        let joiner = Joiner::default();
+        let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let deliver = DeliverMessage {
+            kind: EnvelopeKind::Attestation,
+            envelopes: vec![
+                row("wrap", KEY_GRANT_EPOCH_DIMENSION),
+                row("voice", "cosign:signature:v1"),
+                row("seat", MEMBERSHIP_WIDENING_DIMENSION),
+            ],
+        };
+        match session
+            .on_deliver(&deliver, &BodiesProvider, &joiner, Some("founder"))
+            .await
+        {
+            ReplicationOutcome::Applied {
+                admitted, refused, ..
+            } => {
+                assert_eq!(
+                    (admitted, refused),
+                    (3, 0),
+                    "the widening opens the audience before the wrap and the cosign row apply"
+                );
             }
             o => panic!("expected Applied, got {o:?}"),
         }
