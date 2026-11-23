@@ -3065,6 +3065,9 @@ pub struct FederationDirectoryReplicationBridge {
     /// a proposal this node's identities issued. `None`: acceptances are
     /// stored and nothing is widened here.
     membership_widener: Option<crate::membership::MembershipWidener>,
+    /// CIRISEdge#1029 — the node's event bus, for
+    /// [`crate::events::EventKind::RowAdmitted`]. `None`: no event.
+    events: Option<Arc<crate::events::EventBus>>,
     /// CIRISEdge#768 — the runtime's pending-`KeyGrant` emitter's wake. An
     /// admitted row that can make persist re-wrap an epoch (the #916 doors —
     /// [`crate::replication::key_grant_emitter::wakes_key_grant_emitter`])
@@ -3701,6 +3704,7 @@ impl FederationDirectoryReplicationBridge {
             convergence: None,
             revocation_observer: None,
             membership_widener: None,
+            events: None,
             key_grant_wake: None,
             release_kick: std::sync::OnceLock::new(),
             decision_rows: crate::decision_rows::DecisionRowSignal::new(),
@@ -4180,6 +4184,15 @@ impl FederationDirectoryReplicationBridge {
         widener: Option<crate::membership::MembershipWidener>,
     ) -> Self {
         self.membership_widener = widener;
+        self
+    }
+
+    /// CIRISEdge#1029 — the event bus a row a room's membership or keying
+    /// turns on is announced on when it is admitted from a peer
+    /// ([`crate::events::EventKind::RowAdmitted`]).
+    #[must_use]
+    pub fn with_events(mut self, events: Option<Arc<crate::events::EventBus>>) -> Self {
+        self.events = events;
         self
     }
 
@@ -8265,6 +8278,7 @@ impl FederationDirectoryReplicationBridge {
                     // v44 — a decision-relevant row landed through the choke.
                     if let Some(row) = attestation_of_bytes(envelope_bytes) {
                         let _ = self.decision_rows.observe(&row, before, None);
+                        self.emit_row_admitted(&row);
                     }
                     self.widen_on_admitted_acceptance(envelope_bytes).await;
                     // persist v61 (CIRISPersist#991) — a group's record and its
@@ -15676,6 +15690,35 @@ impl FederationDirectoryReplicationBridge {
                 "bridge: an admitted withdraws revoked blob bytes on this node (CIRISEdge#606)"
             );
         }
+    }
+
+    /// CIRISEdge#1029 — announce an admitted row the host's room passes act
+    /// on (a KeyPackage, a Welcome, a Commit, an invitee's answer, a widening,
+    /// a key grant) on the event bus, if one is installed. Pure over the row:
+    /// a dimension compare for every other row.
+    fn emit_row_admitted(&self, row: &Attestation) {
+        let Some(events) = self.events.as_ref() else {
+            return;
+        };
+        let Some(dimension) =
+            crate::membership::dimension_of(row).and_then(crate::events::AdmittedRow::of_dimension)
+        else {
+            return;
+        };
+        let subject = match dimension {
+            crate::events::AdmittedRow::Welcome => {
+                crate::chat::welcome_recipient(row).unwrap_or(&row.attested_key_id)
+            }
+            _ => &row.attested_key_id,
+        };
+        events.emit_row_admitted(crate::events::NetworkEvent::row_admitted(
+            dimension,
+            ciris_persist::federation::cohort_target_of_envelope(&row.attestation_envelope)
+                .map(str::to_owned),
+            subject,
+            row.attesting_key_id.clone(),
+            row.attestation_id.clone(),
+        ));
     }
 
     /// CIRISEdge#968 — `(what, author, subject, id)` for a row a first

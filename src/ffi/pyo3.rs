@@ -2995,6 +2995,8 @@ impl PyEdge {
         // round-outcome counter surfaced by `metrics_snapshot`. Cheap clone;
         // the counters are `Arc`-backed and shared with `self.inner`.
         config.metrics = Some(self.inner.metrics());
+        // CIRISEdge#1029 — the admitted-row events ride the Edge's bus.
+        config.events = Some(self.inner.events());
 
         // CIRISEdge#311 — the #257 Key-plane set + #305 occurrence-plane set
         // collapse into ONE `SelfOwn` provider; the unified engine advertises

@@ -759,3 +759,76 @@ async fn a_cosignature_for_a_settled_hold_is_refused_terminal_1029() {
         );
     }
 }
+
+/// CIRISEdge#1029 — **an admitted widening and the seated member's
+/// KeyPackage are announced on the event bus**, as `RowAdmitted` on the union
+/// channel. The host seats on the decision and adds on the KeyPackage
+/// (~19 s and ~20 s of the 12-person join waited for its next sweep), and
+/// until now the KeyPackage's admission was a log line only. Real rows
+/// through the replicated door: dave's assembled widening, then his
+/// KeyPackage in the room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admitted_widening_and_keypackage_are_announced_1029() {
+    use crate::events::{AdmittedRow, EventBus, EventKind};
+    let people = parties();
+    let dirs = stores(&people, 2).await;
+    let (a, b) = (Arc::clone(&dirs[0]), Arc::clone(&dirs[1]));
+    let r = room_of_three(people, &[&b], &a).await;
+    let (row, bytes) = assembled(&a, &r).await;
+    let bus = Arc::new(EventBus::default());
+    let mut all = bus.subscribe_all();
+    let publish = vec![r.bob.node.key_id.clone(), r.bob.person.key_id.clone()];
+    let nb = FederationDirectoryReplicationBridge::with_config(
+        Arc::clone(&b) as Arc<dyn FederationDirectory>,
+        Arc::new({
+            let publish = publish.clone();
+            move || publish.clone()
+        }),
+        index_on(),
+    )
+    .with_local_key_id(Some(r.bob.node.key_id.clone()))
+    .with_self_provider(Some(Arc::new(move || publish.clone())))
+    .with_events(Some(Arc::clone(&bus)));
+
+    assert_eq!(
+        nb.apply_envelope_bytes(KIND, &bytes, Some(&r.alice.node.key_id))
+            .await,
+        ApplyOutcome::Admitted
+    );
+    let seated = all.try_recv().expect("the widening is announced");
+    assert_eq!(
+        seated.kind,
+        EventKind::RowAdmitted {
+            dimension: AdmittedRow::MembershipWiden,
+            group_id: Some(r.id.clone()),
+            subject: row.attested_key_id.clone(),
+            author: row.attesting_key_id.clone(),
+            row_id: row.attestation_id.clone(),
+        }
+    );
+
+    let kp = crate::chat::key_package_attestation_in(
+        &r.dave.person,
+        &crate::scope_room::ScopeRoom::community(r.id.clone()),
+        b"dave's key package",
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("dave's KeyPackage");
+    let wire = serde_json::to_vec(&kp).expect("wire");
+    let added = nb
+        .apply_envelope_bytes(KIND, &wire, Some(&r.alice.node.key_id))
+        .await;
+    assert_eq!(added, ApplyOutcome::Admitted, "dave is seated: {added:?}");
+    assert_eq!(
+        all.try_recv().expect("the KeyPackage is announced").kind,
+        EventKind::RowAdmitted {
+            dimension: AdmittedRow::KeyPackage,
+            group_id: Some(r.id.clone()),
+            subject: r.dave.person.key_id.clone(),
+            author: r.dave.person.key_id.clone(),
+            row_id: kp.attestation_id.clone(),
+        }
+    );
+    assert!(all.try_recv().is_err(), "one event per admitted row");
+}
