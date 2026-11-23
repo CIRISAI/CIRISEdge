@@ -317,6 +317,14 @@ pub enum EndCause {
     Revoked,
     /// An ad-hoc call's community expired (not in this release).
     Expired,
+    /// 45.2.0 — this node stopped carrying call media mid-call: it turned
+    /// shaped-only (`shaped_only_no_media`) or anonymous
+    /// (`onion_anonymous_no_media`). Every leg is torn down at once, so a
+    /// node that changed its setting sends no more unshaped media.
+    MediaRefused {
+        /// The refusal token.
+        token: &'static str,
+    },
 }
 
 /// Where a call stands.
@@ -1753,6 +1761,10 @@ struct Shared {
     attendee: String,
     /// Attendees already announced on `events()`.
     attendees_known: StdMutex<std::collections::BTreeSet<String>>,
+    /// 45.2.0 — the NODES of the attendees the call rows name (a row is the
+    /// person's; a node acts for it by persist's owner binding): who a path
+    /// event may concern ([`Shared::is_attendee`]).
+    attendee_nodes: StdMutex<std::collections::BTreeSet<String>>,
     /// v45.1 — the members a `MediaPathFailed` stands for, with the cause it
     /// named: once per (call, member) until a leg comes up
     /// ([`Shared::path_failed`], [`Shared::path_up`]).
@@ -2078,6 +2090,11 @@ impl Shared {
         if facts.path_stands() || self.ended.load(Ordering::Relaxed) {
             return;
         }
+        // 45.2.0 — path events concern attendees only: a room member who is
+        // not in the call has no media path to fail.
+        if !self.is_attendee(member) {
+            return;
+        }
         if Self::lock(&self.in_links).values().any(|p| p == member) {
             return;
         }
@@ -2097,6 +2114,19 @@ impl Shared {
             }
         }
         self.raise_path_failed(member, facts, relay);
+    }
+
+    /// 45.2.0 — whether `member` attends this call, as far as this node can
+    /// tell: its leg reached us, its stream or its key binding reached us
+    /// (directly or through a relay), or a call row names its key. A call row
+    /// is written by the PERSON's key and legs are the NODE's, so on a split
+    /// home the row alone may not name the member; the other three do.
+    fn is_attendee(&self, member: &str) -> bool {
+        Self::lock(&self.in_links).values().any(|p| p == member)
+            || !Self::lock(&self.alm).streams_of(member).is_empty()
+            || self.auth.publishers().iter().any(|p| p == member)
+            || Self::lock(&self.attendees_known).contains(member)
+            || Self::lock(&self.attendee_nodes).contains(member)
     }
 
     /// Calls cut — what the ALM mesh says about relaying `member` here.
@@ -2246,7 +2276,10 @@ impl Shared {
         for (member, facts) in due {
             let relay = self.relay_facts(&member);
             Self::lock(&self.path_pending).remove(&member);
-            if relay.member_relay || Self::lock(&self.in_links).values().any(|p| *p == member) {
+            if relay.member_relay
+                || Self::lock(&self.in_links).values().any(|p| *p == member)
+                || !self.is_attendee(&member)
+            {
                 continue;
             }
             self.raise_path_failed(&member, &facts, relay);
@@ -2477,6 +2510,7 @@ impl Call {
             record,
             attendee,
             attendees_known: StdMutex::new(std::collections::BTreeSet::new()),
+            attendee_nodes: StdMutex::new(std::collections::BTreeSet::new()),
             path_failed: StdMutex::new(HashMap::new()),
             path_pending: StdMutex::new(HashMap::new()),
             path_via: StdMutex::new(HashMap::new()),
@@ -5480,6 +5514,14 @@ async fn announce_attendees(shared: &Arc<Shared>) {
             .collect()
     };
     for key_id in fresh {
+        // 45.2.0 — the person's nodes attend with it (a path event names the
+        // node). A failed read leaves the row's own key, as `call_members`.
+        let nodes = shared
+            .owners
+            .nodes_owned_by(&key_id)
+            .await
+            .unwrap_or_default();
+        Shared::lock(&shared.attendee_nodes).extend(nodes);
         shared.emit(CallEvent::AttendeeJoined { key_id });
     }
 }
@@ -5493,6 +5535,11 @@ async fn watch_loop(shared: Arc<Shared>) {
     loop {
         tick.tick().await;
         if shared.ended.load(Ordering::Relaxed) {
+            return;
+        }
+        // 45.2.0 — a node that stops carrying call media mid-call ends it.
+        if let Some(token) = shared.transport.media_refused_now() {
+            end_media_refused(&shared, token).await;
             return;
         }
         n = n.wrapping_add(1);
@@ -5512,6 +5559,33 @@ async fn watch_loop(shared: Arc<Shared>) {
         settle_ends(&shared);
         check_lost(&shared);
     }
+}
+
+/// 45.2.0 — end the call because this node no longer carries call media
+/// (`token`): the state reads `Ended(MediaRefused)`, the end is booked once,
+/// every leg and inbound link is torn down and the call's addresses are left.
+async fn end_media_refused(shared: &Arc<Shared>, token: &'static str) {
+    *Shared::lock(&shared.state) = CallState::Ended(EndCause::MediaRefused { token });
+    shared.ended.store(true, Ordering::Relaxed);
+    shared.book_end("media_refused");
+    shared.count(crate::observability::AV_CALL_ENDED_MEDIA_REFUSED);
+    tracing::info!(
+        room = %shared.room,
+        token,
+        "CALL ENDED: this node no longer carries call media (shaped-only or anonymous)"
+    );
+    let legs: Vec<[u8; 16]> = Shared::lock(&shared.out_legs)
+        .drain()
+        .map(|(_, l)| l.link_id)
+        .collect();
+    let ins: Vec<[u8; 16]> = Shared::lock(&shared.in_links)
+        .drain()
+        .map(|(l, _)| l)
+        .collect();
+    for l in legs.iter().chain(ins.iter()) {
+        let _ = shared.transport.link_teardown(l).await;
+    }
+    let _ = shared.lifecycle.leave(&shared.scope, &shared.group_id);
 }
 
 /// A fresh join nonce and the stream id it derives, drawn again on the
