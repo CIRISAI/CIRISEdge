@@ -613,6 +613,22 @@ impl PyEdge {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    /// v45.1 — this node's last NAT measurement as a dict (`mapping`,
+    /// `allocation`, `filtering`, `port_preserving`, `router_mapping`,
+    /// `family`, `evidence`, `legacy_class`, `measured_at` in ms), the shape
+    /// of a `media_path_failed` event's `local_nat`. `None` with no Reticulum
+    /// transport, and on this leviculum pin, which measures nothing yet.
+    #[cfg(feature = "_reticulum-module")]
+    fn local_nat_report<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        self.inner
+            .local_nat_report()
+            .map(|r| nat_report_to_pydict(py, &r))
+            .transpose()
+    }
+
     /// E8 — what this node knows of `peer`'s shaping, as JSON: `peer`,
     /// `shapes` (null until it has answered an offer here), `shaped_now`,
     /// `gap_s`. `None` with no Reticulum transport.
@@ -4647,7 +4663,84 @@ fn call_event_to_pydict<'py>(
             d.set_item("old_stream_id", pyo3::types::PyBytes::new(py, &old.0))?;
             d.set_item("new_stream_id", pyo3::types::PyBytes::new(py, &new.0))?;
         }
+        V::MediaPathFailed {
+            member,
+            cause,
+            retryable,
+            retry_after_s,
+            detail,
+            tried,
+            local_nat,
+            peer_nat,
+            relay,
+        } => {
+            d.set_item("kind", "media_path_failed")?;
+            d.set_item("member", member)?;
+            d.set_item("cause", cause.token())?;
+            d.set_item("retryable", *retryable)?;
+            d.set_item("retry_after_s", *retry_after_s)?;
+            d.set_item("detail", detail.map(|t| t.token()))?;
+            let list = pyo3::types::PyList::empty(py);
+            for a in tried {
+                list.append(path_attempt_to_pydict(py, a)?)?;
+            }
+            d.set_item("tried", list)?;
+            d.set_item("local_nat", nat_report_to_pydict(py, local_nat)?)?;
+            match peer_nat {
+                Some(p) => {
+                    let pd = pyo3::types::PyDict::new(py);
+                    pd.set_item("report", nat_report_to_pydict(py, &p.report)?)?;
+                    pd.set_item("source", p.source.token())?;
+                    d.set_item("peer_nat", pd)?;
+                }
+                None => d.set_item("peer_nat", py.None())?,
+            }
+            d.set_item("relay", relay.token())?;
+        }
+        V::MediaPathRestored { member, via } => {
+            d.set_item("kind", "media_path_restored")?;
+            d.set_item("member", member)?;
+            d.set_item("via", via.token())?;
+        }
     }
+    Ok(d)
+}
+
+/// v45.1 — a [`NatReport`](crate::transport::media_path::NatReport) as a
+/// Python dict: its tokens, `port_preserving` (`None` unmeasured) and
+/// `measured_at` in milliseconds since the Unix epoch.
+#[cfg(feature = "_reticulum-module")]
+fn nat_report_to_pydict<'py>(
+    py: Python<'py>,
+    r: &crate::transport::media_path::NatReport,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("mapping", r.mapping.token())?;
+    d.set_item("allocation", r.allocation.token())?;
+    d.set_item("filtering", r.filtering.token())?;
+    d.set_item("port_preserving", r.port_preserving)?;
+    d.set_item("router_mapping", r.router_mapping.token())?;
+    d.set_item("family", r.family.token())?;
+    d.set_item("evidence", r.evidence.token())?;
+    d.set_item("legacy_class", r.legacy_class.token())?;
+    d.set_item("measured_at", r.measured_at.timestamp_millis())?;
+    Ok(d)
+}
+
+/// v45.1 — a [`PathAttempt`](crate::transport::media_path::PathAttempt) as a
+/// Python dict.
+#[cfg(feature = "_reticulum-module")]
+fn path_attempt_to_pydict<'py>(
+    py: Python<'py>,
+    a: &crate::transport::media_path::PathAttempt,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("kind", a.kind.token())?;
+    d.set_item("outcome", a.outcome.token())?;
+    d.set_item("attempts", a.attempts)?;
+    d.set_item("elapsed_ms", a.elapsed_ms)?;
+    d.set_item("knocks_sent", a.knocks_sent)?;
+    d.set_item("sockets", a.sockets)?;
     Ok(d)
 }
 
@@ -14916,6 +15009,135 @@ mod pyo3_tier2_tests {
                     .extract()
                     .expect("str");
                 assert_eq!(&got, kind);
+            }
+            // v45.1 — MediaPathFailed / MediaPathRestored round-trip: every
+            // token back out of the dict as the event holds it.
+            {
+                use crate::transport::media_path::{
+                    AddressFamily, MediaPathCause, NatAllocation, NatEvidence, NatFiltering,
+                    NatMapping, NatReport, NatReportSource, PathAttempt, PathKind, PathOutcome,
+                    PeerNatReport, RelayStanding, RouterMapping,
+                };
+                let at =
+                    chrono::DateTime::from_timestamp_millis(1_790_000_000_123).expect("instant");
+                let peer = NatReport::new(
+                    NatMapping::AddressAndPortDependent,
+                    NatAllocation::Random,
+                    NatFiltering::AddressAndPortDependent,
+                    Some(false),
+                    RouterMapping::None,
+                    AddressFamily::V4,
+                    NatEvidence::TwoObserver,
+                    at,
+                );
+                let ev = CallEvent::MediaPathFailed {
+                    member: "b".to_owned(),
+                    cause: MediaPathCause::PunchNoAnswer,
+                    retryable: true,
+                    retry_after_s: Some(3_600),
+                    detail: Some(crate::transport::media_path::PathDetail::PunchSilent),
+                    tried: vec![PathAttempt {
+                        kind: PathKind::DirectReflexive,
+                        outcome: PathOutcome::NoAnswer,
+                        attempts: 2,
+                        elapsed_ms: 4_321,
+                        knocks_sent: 7,
+                        sockets: 1,
+                    }],
+                    local_nat: NatReport::unknown(at),
+                    peer_nat: Some(PeerNatReport {
+                        report: peer,
+                        source: NatReportSource::SelfReported,
+                    }),
+                    relay: RelayStanding::RefusedByPolicy,
+                };
+                let d = call_event_to_pydict(py, &ev).expect("project");
+                let item = |d: &Bound<'_, pyo3::types::PyDict>, k: &str| {
+                    d.get_item(k).expect("get").unwrap_or_else(|| panic!("{k}"))
+                };
+                let text = |d: &Bound<'_, pyo3::types::PyDict>, k: &str| -> String {
+                    item(d, k).extract().expect("str")
+                };
+                assert_eq!(text(&d, "kind"), "media_path_failed");
+                assert_eq!(text(&d, "member"), "b");
+                assert_eq!(text(&d, "cause"), "punch_no_answer");
+                assert_eq!(text(&d, "relay"), "refused_by_policy");
+                assert_eq!(text(&d, "detail"), "punch_silent");
+                let retryable: bool = item(&d, "retryable").extract().expect("bool");
+                assert!(retryable);
+                let after: Option<u32> = item(&d, "retry_after_s").extract().expect("int");
+                assert_eq!(after, Some(3_600));
+                let tried = item(&d, "tried");
+                let tried = tried.cast::<pyo3::types::PyList>().expect("list");
+                assert_eq!(tried.len(), 1);
+                let a = tried.get_item(0).expect("first");
+                let a = a.cast::<pyo3::types::PyDict>().expect("dict");
+                assert_eq!(text(a, "kind"), "direct_reflexive");
+                assert_eq!(text(a, "outcome"), "no_answer");
+                let n = |k: &str| -> u64 { item(a, k).extract().expect("int") };
+                assert_eq!(
+                    (
+                        n("attempts"),
+                        n("elapsed_ms"),
+                        n("knocks_sent"),
+                        n("sockets")
+                    ),
+                    (2, 4_321, 7, 1)
+                );
+                let local = item(&d, "local_nat");
+                let local = local.cast::<pyo3::types::PyDict>().expect("dict");
+                assert_eq!(text(local, "mapping"), "unknown");
+                assert_eq!(text(local, "evidence"), "none");
+                assert_eq!(text(local, "legacy_class"), "unknown");
+                assert!(item(local, "port_preserving").is_none());
+                let ms: i64 = item(local, "measured_at").extract().expect("ms");
+                assert_eq!(ms, 1_790_000_000_123);
+                let peer_d = item(&d, "peer_nat");
+                let peer_d = peer_d.cast::<pyo3::types::PyDict>().expect("dict");
+                assert_eq!(text(peer_d, "source"), "self_reported");
+                let rep = item(peer_d, "report");
+                let rep = rep.cast::<pyo3::types::PyDict>().expect("dict");
+                assert_eq!(text(rep, "allocation"), "random");
+                assert_eq!(text(rep, "legacy_class"), "symmetric");
+                assert_eq!(text(rep, "router_mapping"), "none");
+                let pp: Option<bool> = item(rep, "port_preserving").extract().expect("bool");
+                assert_eq!(pp, Some(false));
+                let back = |t: &str| MediaPathCause::parse(t);
+                assert_eq!(
+                    back(&text(&d, "cause")),
+                    Some(MediaPathCause::PunchNoAnswer)
+                );
+
+                let r = call_event_to_pydict(
+                    py,
+                    &CallEvent::MediaPathRestored {
+                        member: "b".to_owned(),
+                        via: PathKind::DirectReflexive,
+                    },
+                )
+                .expect("project");
+                assert_eq!(text(&r, "kind"), "media_path_restored");
+                assert_eq!(text(&r, "member"), "b");
+                assert_eq!(text(&r, "via"), "direct_reflexive");
+                let none = call_event_to_pydict(
+                    py,
+                    &CallEvent::MediaPathFailed {
+                        member: "c".to_owned(),
+                        cause: MediaPathCause::PeerUnsupported,
+                        retryable: false,
+                        retry_after_s: None,
+                        detail: None,
+                        tried: Vec::new(),
+                        local_nat: NatReport::unknown(at),
+                        peer_nat: None,
+                        relay: RelayStanding::RefusedByPolicy,
+                    },
+                )
+                .expect("project");
+                assert!(item(&none, "peer_nat").is_none());
+                assert!(item(&none, "detail").is_none());
+                assert!(item(&none, "retry_after_s").is_none());
+                assert_eq!(text(&none, "cause"), "peer_unsupported");
             }
             let value = [
                 CallError::NotARoomMember {

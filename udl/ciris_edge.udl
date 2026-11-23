@@ -269,6 +269,12 @@ namespace ciris_edge {
     // media as unordered link datagrams. Default on; edge never moves it.
     [Throws=EdgeBindingsError]
     void av_datagrams_set_enabled(boolean enabled);
+
+    // v45.1 — this node's last NAT measurement (behaviours only, never an
+    // address): the `local_nat` of a call's `media_path_failed` event. Null
+    // on this leviculum pin, which measures nothing yet.
+    [Throws=EdgeBindingsError]
+    EdgeNatReport? local_nat_report();
 };
 
 // ─── Error type ─────────────────────────────────────────────────────
@@ -572,6 +578,21 @@ dictionary EdgeShapingClassInfo {
     u32 bytes_per_s;
     double gb_month_per_link_each_way;
     double gb_month_at_cap_each_way;
+};
+
+// v45.1 — RFC 4787 NAT behaviours as snake_case tokens (closed sets; see
+// `transport::media_path`). `legacy_class` is the RFC 3489 display word,
+// derived from mapping + filtering by edge. `measured_at` is ms since epoch.
+dictionary EdgeNatReport {
+    string mapping;
+    string allocation;
+    string filtering;
+    boolean? port_preserving;
+    string router_mapping;
+    string family;
+    string evidence;
+    string legacy_class;
+    i64 measured_at;
 };
 
 dictionary EdgeOnionStatus {
