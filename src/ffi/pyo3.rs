@@ -11779,6 +11779,41 @@ fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register(m)
 }
 
+/// CIRISServer's wheel gate requires the `PyInit_ciris_edge` symbol.
+///
+/// Edge stopped building its own wheels in the 45.x LTS, but CIRISServer still
+/// compiles this crate's `pyo3` feature into its one wheel. Its build-wheels
+/// gate refuses any wheel whose `_native` library lacks `PyInit_ciris_edge`
+/// (its `NEED_PYINIT` list), on every target. That symbol is the entry point the
+/// `#[pymodule] fn ciris_edge` above generates. Edge no longer links a cdylib in
+/// its own CI, so no CI job inspects a shared object for it. This test links
+/// against the symbol by its exported NAME, so renaming or removing the
+/// pymodule breaks the `pyo3-lib` lane here instead of the server's release.
+#[cfg(test)]
+mod server_wheel_gate_pyinit {
+    extern "C" {
+        // Never called: calling it needs a live interpreter. Linking to it by
+        // name is the whole check.
+        fn PyInit_ciris_edge() -> *mut pyo3::ffi::PyObject;
+    }
+
+    #[test]
+    fn server_wheel_gate_requires_the_pyinit_ciris_edge_symbol() {
+        // Taking the address forces the linker to resolve the exported name;
+        // if no item exports `PyInit_ciris_edge`, this test binary fails to link.
+        let entry: unsafe extern "C" fn() -> *mut pyo3::ffi::PyObject = PyInit_ciris_edge;
+        std::hint::black_box(entry);
+        // The module name the entry point registers is the one the server's
+        // agent imports (`ciris_edge`).
+        assert_eq!(
+            super::ciris_edge::__PYO3_NAME
+                .to_str()
+                .expect("utf-8 module name"),
+            "ciris_edge"
+        );
+    }
+}
+
 /// CIRISEdge#573 — the signer `build_signed_inbound_envelope` signs with.
 ///
 /// Extracted from the pyo3 method so a Rust test can drive the SAME
