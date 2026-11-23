@@ -3429,12 +3429,31 @@ async fn publish_capped_for(cp: &mut Call, secs: u64, seq0: u64) -> u64 {
     seq
 }
 
-/// Every identified link `m` saw closed by Channel retry exhaustion.
+/// Every link `m` saw closed by Channel retry exhaustion, either side
+/// (A/V legs included: they are not identified, so `peer_activity` misses
+/// them).
 fn channel_exhausted(m: &EdgeMetrics) -> u64 {
-    m.peer_activity()
+    closed_by(m, "channel_exhausted")
+}
+
+/// Every link `m` saw closed with `cause`, inbound and outbound.
+fn closed_by(m: &EdgeMetrics, cause: &str) -> u64 {
+    m.inbound_link_closed_by_reason()
+        .get(cause)
+        .copied()
+        .unwrap_or(0)
+        + m.outbound_link_closed_by_reason()
+            .get(cause)
+            .copied()
+            .unwrap_or(0)
+}
+
+/// Every link `m` saw torn down by something other than this node or its
+/// peer choosing to (a retry exhaustion, a timeout, staleness).
+fn torn_down(m: &EdgeMetrics) -> u64 {
+    ["channel_exhausted", "timeout", "stale"]
         .iter()
-        .filter(|(k, _)| k.ends_with(".channel_exhausted"))
-        .map(|(_, v)| *v)
+        .map(|c| closed_by(m, c))
         .sum()
 }
 
@@ -3521,6 +3540,7 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     let frame = cp.chunk_plaintext_budget().unwrap_or(240).min(600) as u64;
     let copy_kbit = (frame + 170) * 8 * 30 / 1000;
     let exhausted_before: u64 = nodes.iter().map(|n| channel_exhausted(&n.metrics)).sum();
+    let torn_before: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum();
     uplink.cap_kbit(copy_kbit * 13 / 10);
     let capped_from = seq;
     let seq = publish_capped_for(&mut cp, 30, seq).await;
@@ -3532,6 +3552,7 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
         .map(|n| channel_exhausted(&n.metrics))
         .sum::<u64>()
         - exhausted_before;
+    let torn: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum::<u64>() - torn_before;
     let parents: Vec<Option<String>> = listeners
         .iter()
         .map(|l| primary_for(l, cp.stream()))
@@ -3542,22 +3563,35 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
         .count();
     let context = format!(
         "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
-         ChannelExhausted {exhausted}; P legs {:?}",
+         ChannelExhausted {exhausted}; torn {torn}; P legs {:?}",
         cp.alm_own_children(),
         cp.alm_counts(),
         cp.legs()
     );
-    assert_eq!(
-        exhausted, 0,
-        "no link torn down by retry exhaustion: {context}"
-    );
-    assert_eq!(direct, 1, "P keeps ONE direct child: {context}");
-    for (x, n) in parents.iter().zip(&heard) {
-        assert!(x.is_some(), "every listener has a parent: {context}");
+    // Every criterion is judged and every failure named, so a red run says
+    // what each fix buys (G8: A and C in edge, leviculum#113).
+    let mut failed: Vec<String> = Vec::new();
+    if exhausted != 0 {
+        failed.push(format!("links torn down by retry exhaustion: {exhausted}"));
+    }
+    if torn != 0 {
+        failed.push(format!("links torn down (exhausted/timeout/stale): {torn}"));
+    }
+    if direct != 1 {
+        failed.push(format!("P's direct children: {direct}, want 1"));
+    }
+    if parents.iter().any(Option::is_none) {
+        failed.push("a listener has no parent".to_owned());
+    }
+    for (i, n) in heard.iter().enumerate() {
         // About the one-copy rate: the uplink carries one copy, so each
         // listener hears most of what P published once it settled.
-        assert!(*n * 10 >= sent * 7, "{n} of {sent} heard: {context}");
+        if *n * 10 < sent * 7 {
+            failed.push(format!("listener {i} heard {n} of {sent}"));
+        }
     }
+    eprintln!("[G8] capped publisher: {context}; failed {failed:?}");
+    assert!(failed.is_empty(), "{failed:?}: {context}");
     drop(listeners);
     drop(cp);
 }
