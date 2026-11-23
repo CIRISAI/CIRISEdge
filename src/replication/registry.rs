@@ -606,6 +606,7 @@ impl ReplicationRegistry {
                         reason: ReplyDropReason::NoInitiator,
                     });
                 };
+                initiator.book_wire(&framed.msg, bytes.len(), false);
                 match initiator.deliver_reply(framed.msg, round) {
                     Ok(()) => Ok(RouteOutcome::RoutedToInitiator { kind, round }),
                     Err(ReplyRefusal::BackPressure) => Err(RegistryError::BackPressure {
@@ -637,6 +638,7 @@ impl ReplicationRegistry {
                 else {
                     return Ok(RouteOutcome::NoCoordinatorRegistered { kind });
                 };
+                responder.book_wire(&framed.msg, bytes.len(), false);
                 responder
                     .deliver_inbound_framed_on(framed.msg, meta, link)
                     .map_err(|_| RegistryError::BackPressure {

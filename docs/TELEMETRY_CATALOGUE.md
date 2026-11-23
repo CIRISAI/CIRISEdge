@@ -272,6 +272,17 @@ took the frame. Per-direction detail (push, deliver, summary, diff, pull) is in
 `replication_io`. Before 45.1.3 a peer added after start (every initiator on a
 server-composed node) counted into neither.
 
+Range fingerprints, step A (`docs/design/RANGE_FINGERPRINTS.md` §8) adds to
+`replication_io`:
+
+- the frame bytes of what crossed, preamble and JSON included:
+  `summary_bytes_{out,in}`, `diff_bytes_{out,in}` and
+  `deliver_wire_bytes_{out,in}`. These sit beside `deliver_bytes_*`, which
+  stay the raw envelope bytes;
+- `summary_refs_built` and `summary_bytes_built`, booked when a Summary is
+  built, before the send. With the sent twins, these show a listing that was
+  built but never handed down (§11.2).
+
 ## Log events
 
 | Target | Level | Carries |

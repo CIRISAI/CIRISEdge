@@ -2307,7 +2307,13 @@ pub const RESPONDER_ROUND_OPENED_DIFF: &str = "opened_diff";
 /// member asked for and was delivered, and each delivery is booked once more
 /// by the member's next answer: `admitted` (it holds the row) or `refused`
 /// (asked again, or withheld); `gave_up` at the courier's bound.
-pub const REPLICATION_IO_LABELS: [&str; 23] = [
+/// Range fingerprints, step A (`docs/design/RANGE_FINGERPRINTS.md` §8):
+/// `summary_bytes_*`, `diff_bytes_*` and `deliver_wire_bytes_*` are the
+/// FRAMES as they crossed the transport (the CRPL preamble and the JSON
+/// included, unlike `deliver_bytes_*`). `summary_refs_built` /
+/// `summary_bytes_built` book a Summary when it is BUILT, before
+/// `transport.send`, so a listing built and never sent is visible (§11.2).
+pub const REPLICATION_IO_LABELS: [&str; 31] = [
     "deliver_rows_out",
     "deliver_bytes_out",
     "deliver_rows_in",
@@ -2331,6 +2337,14 @@ pub const REPLICATION_IO_LABELS: [&str; 23] = [
     "wrap_courier_admitted",
     "wrap_courier_refused",
     "wrap_courier_gave_up",
+    "summary_bytes_out",
+    "summary_bytes_in",
+    "diff_bytes_out",
+    "diff_bytes_in",
+    "deliver_wire_bytes_out",
+    "deliver_wire_bytes_in",
+    "summary_refs_built",
+    "summary_bytes_built",
 ];
 /// Seat load 2026-11-13 (S0) — the classes a peer is counted under in
 /// `peer_activity`: the axis of this node's attestation send set that last
