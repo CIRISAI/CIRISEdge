@@ -3262,6 +3262,10 @@ pub struct EdgeMetrics {
     /// counters, attributed at the E1 seal and the HTTP envelope sites
     /// ([`crate::wire_bytes`]). `transport_wire_bytes_{in,out}_total`.
     pub wire_bytes: Arc<crate::wire_bytes::WireBytes>,
+    /// CIRISEdge#1025 — links by transport and direction, distinct peers per
+    /// hour and day, the top peers by wire bytes, and link lifetimes
+    /// ([`crate::link_census`]).
+    pub link_census: Arc<crate::link_census::LinkCensus>,
     /// Gauge — per-(peer, medium) reachability ratio. Mirror of the
     /// reachability tracker; consumers can read the mirror without
     /// reaching across to [`crate::ReachabilityTracker`].
@@ -4964,6 +4968,32 @@ impl EdgeMetrics {
         self.inc_peer_activity(PEER_ACTIVITY_LINK_UP[peer_class_index(class)]);
     }
 
+    /// CIRISEdge#1025 — an established link closed under `cause` after
+    /// `lifetime`: one `link_duration_seconds` observation, under the
+    /// `peer_activity` class it came up under, else `dialled` (this node
+    /// opened it, `inbound` false) or `unidentified`. Call before
+    /// [`Self::note_link_closed_class`], which forgets the class.
+    pub fn note_link_lifetime(
+        &self,
+        link: [u8; 16],
+        inbound: bool,
+        cause: LinkCloseCause,
+        lifetime: std::time::Duration,
+    ) {
+        let unclassed = if inbound {
+            crate::link_census::LINK_CLASS_UNIDENTIFIED
+        } else {
+            crate::link_census::LINK_CLASS_DIALLED
+        };
+        let class = self
+            .link_classes
+            .read()
+            .get(&link)
+            .map_or(unclassed, |c| peer_class_index(c));
+        self.link_census
+            .observe_link_lifetime(class, cause, lifetime);
+    }
+
     /// Seat load 2026-11-13 (S0) — an identified link closed under `cause`:
     /// count it down under the class it came up under. A link never
     /// identified counts nothing here (its close is still in the
@@ -5209,6 +5239,11 @@ impl EdgeMetrics {
             transport_bytes_out_total: self.transport_bytes_out_total.read().clone(),
             transport_wire_bytes_in_total: wire.family(crate::wire_bytes::WireDir::In),
             transport_wire_bytes_out_total: wire.family(crate::wire_bytes::WireDir::Out),
+            links_active: self.link_census.links_active(),
+            distinct_peers_1h: self.link_census.distinct_peers_1h(),
+            distinct_peers_24h: self.link_census.distinct_peers_24h(),
+            top_peers_by_bytes: self.link_census.top_peers_by_bytes(),
+            link_duration_seconds: self.link_census.link_duration_seconds(),
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             blob_serve_legacy_dag_walks: self.blob_serve_legacy_dag_walks(),
@@ -5584,6 +5619,22 @@ pub struct EdgeMetricsBundle {
     pub transport_wire_bytes_in_total: std::collections::BTreeMap<String, u64>,
     /// CIRISEdge#1025 — bytes sent on the wire, keyed `transport:plane`.
     pub transport_wire_bytes_out_total: std::collections::BTreeMap<String, u64>,
+    /// CIRISEdge#1025 — established Reticulum links now, keyed
+    /// `transport:direction` (every [`crate::link_census::LINKS_ACTIVE_KEYS`]
+    /// key present). A link on a punched interface is `udp-direct`.
+    pub links_active: std::collections::BTreeMap<String, u64>,
+    /// CIRISEdge#1025 — distinct authenticated peers with a link to this node
+    /// in the last hour (HyperLogLog, ±1.6 % standard error).
+    pub distinct_peers_1h: u64,
+    /// CIRISEdge#1025 — the same over the last 24 hours.
+    pub distinct_peers_24h: u64,
+    /// CIRISEdge#1025 — the heaviest peers by wire bytes since start, at most
+    /// [`crate::link_census::TOP_PEERS_EXPORTED`], heaviest first, each keyed
+    /// by a per-process salted hash (never a metric label).
+    pub top_peers_by_bytes: Vec<crate::link_census::TopPeerBytes>,
+    /// CIRISEdge#1025 — established → closed, keyed `class:cause`; a label
+    /// set nothing closed under is absent.
+    pub link_duration_seconds: HashMap<String, HistogramSnapshot>,
     pub peer_reachability_ratio: HashMap<(String, String), f64>,
     /// CIRISEdge#48-B (v0.19.6) — cumulative count of envelopes
     /// dropped at `dispatch_inbound` due to trust short-circuit.
@@ -6042,6 +6093,30 @@ impl EdgeMetricsBundle {
             "transport_wire_bytes_out_total",
             self.transport_wire_bytes_out_total.iter(),
         );
+        // CIRISEdge#1025 — links, peers and link lifetimes.
+        f.family("links_active", self.links_active.iter());
+        f.counters
+            .insert("distinct_peers_1h".to_string(), self.distinct_peers_1h);
+        f.counters
+            .insert("distinct_peers_24h".to_string(), self.distinct_peers_24h);
+        // The top-N list is keyed by a salted peer hash, which no flat series
+        // may carry (WORKLOAD_ATTRIBUTION A8): the flat form is the entry
+        // count and each RANK's bytes.
+        f.counters.insert(
+            "top_peers_by_bytes".to_string(),
+            self.top_peers_by_bytes.len() as u64,
+        );
+        for (rank, e) in self.top_peers_by_bytes.iter().enumerate() {
+            f.counters
+                .insert(format!("top_peers_by_bytes.{rank}.bytes_in"), e.bytes_in);
+            f.counters
+                .insert(format!("top_peers_by_bytes.{rank}.bytes_out"), e.bytes_out);
+            f.counters.insert(
+                format!("top_peers_by_bytes.{rank}.error_bytes"),
+                e.error_bytes,
+            );
+        }
+        f.histogram_family("link_duration_seconds", &self.link_duration_seconds);
         for ((peer, medium), ratio) in &self.peer_reachability_ratio {
             f.gauges
                 .insert(format!("peer_reachability_ratio.{peer}:{medium}"), *ratio);
@@ -6473,6 +6548,11 @@ edge_metrics_bundle_fields!(
     transport_bytes_out_total,
     transport_wire_bytes_in_total,
     transport_wire_bytes_out_total,
+    links_active,
+    distinct_peers_1h,
+    distinct_peers_24h,
+    top_peers_by_bytes,
+    link_duration_seconds,
     peer_reachability_ratio,
     inbound_dropped_low_trust,
     replication_round_outcomes_total,

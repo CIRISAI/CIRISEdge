@@ -163,6 +163,69 @@ meaning: application envelope bytes by edge transport id (`http`,
 `reticulum-rs`). They were never the wire, so a seat whose wire is all
 replication and shaping can read `{}` there.
 
+### How many links and peers does this node carry? (CIRISEdge#1025)
+
+Four families size a seat. None names a peer, link, address or port, and every
+one is bounded.
+
+- **`links_active`**: the established Reticulum links now, keyed
+  `transport:direction`. The transport tokens are the wire-bytes ones, less
+  `http` (10), and the direction is `inbound` (a peer opened it) or `outbound`
+  (this node dialled it), so 20 keys, every one present from the first
+  snapshot. A link counts under the node's one configured interface kind (or
+  `other` when it has several) until it moves onto a punched interface, then
+  under `udp-direct`, and back if it falls back. The same record backs
+  `inbound_links` / `outbound_links`, so the 20 keys sum to them. Memory: 20
+  integers per transport instance.
+- **`distinct_peers_1h`** and **`distinct_peers_24h`**: how many distinct
+  peers had an authenticated link to this node in the last hour and the last
+  day. A peer counts once however many links it holds, and it is counted again
+  in each five-minute bucket its link stays up. The estimator is a HyperLogLog
+  of 2^12 registers per bucket: 12 five-minute buckets for the hour (so the
+  window is the last 55 to 60 minutes) and 24 hourly buckets for the day,
+  merged by register max on read. Standard error is 1.04/sqrt(4096), about
+  1.6 % (±4.9 % at 3σ); below about 10,000 peers the linear-counting branch is
+  within a peer or two of exact. The input is SHA-256 of a 32-byte salt drawn
+  from the OS at start and the peer's key id; the key id is never kept, and
+  neither the salt nor any register is exported. Memory: 36 × 4 KiB = 144 KiB.
+  A peer is authenticated when edge attributes the link: the dialled node, by
+  the transit pair the link was keyed to, or the identified dialler, by its
+  proven Reticulum identity and binding.
+- **`top_peers_by_bytes`**: the 10 peers that moved the most wire bytes with
+  this node since it started, heaviest first, each as `peer` (16 hex digits of
+  the same salted hash), `bytes_in`, `bytes_out` and `error_bytes`. A
+  Space-Saving sketch of 64 counters (about 2 KiB) feeds it from the E1 seal's
+  attribution: every frame sealed or opened on an attributed link adds to that
+  link's tally (one atomic add), and the node tick drains the tallies into the
+  sketch. Any peer above 1/64 of all peer-attributed bytes is in the sketch,
+  and an entry is over-ranked by at most its `error_bytes`; `bytes_in` and
+  `bytes_out` are lower bounds. The hash means nothing outside this process:
+  a restart draws a new salt and two nodes never share one, so an entry can be
+  followed between scrapes of one process and nowhere else. This is the
+  per-peer sketch WORKLOAD_ATTRIBUTION A8 asks for, so it is not a label: the
+  bundle (and the PyO3 dict) carry the list, and the flat (UniFFI / OTLP) form
+  carries only the entry count and `top_peers_by_bytes.<rank>.bytes_in` /
+  `.bytes_out` / `.error_bytes` for ranks 0 to 9, without the hash. Bytes
+  leviculum moved that edge never handed it (`other` in the wire family) are
+  not in it.
+- **`link_duration_seconds`**: each established link's life, from its
+  `LinkEstablished` to its close, keyed `class:cause`. `cause` is the close
+  cause the direction counters use (`idle_expired`, `pool_idle_expired`,
+  `pool_full`, `local_teardown`, `normal`, `peer_closed`, `timeout`, `stale`,
+  `invalid_proof`, `channel_exhausted`, `blackholed`, `other`, `vanished`);
+  `class` is the `peer_activity` class an inbound link came up under (a peer
+  identified to this node), `dialled` for a link this node opened
+  (`peer_activity` classes only identified inbound links), or `unidentified`
+  for an inbound link no peer identified on. Buckets are 1 s, 5 s, 30 s,
+  2 min, 10 min, 1 h, 6 h and `+Inf`. A label set nothing closed under is
+  absent, so at most 8 × 13 = 104 label sets (about 8 KiB). A link
+  recovered after a lost `LinkEstablished` (`recovered_links_total`) is timed
+  from its recovery.
+
+`first_contact:peer_closed` filling the 1 s and 5 s buckets while
+`distinct_peers_24h` stays small is the churn #1025 found: few identities,
+many short links.
+
 ### Why didn't this peer connect?
 
 Read this on the node that was dialled, then on the dialler.
@@ -368,6 +431,11 @@ server-composed node) counted into neither.
 | `transport_bytes_out_total` | `ciris.edge.transport.bytes.out` | counter | bytes | operator-only |
 | `transport_wire_bytes_in_total` | `ciris.edge.transport.wire.bytes.in` | counter | bytes | operator-only |
 | `transport_wire_bytes_out_total` | `ciris.edge.transport.wire.bytes.out` | counter | bytes | operator-only |
+| `links_active` | `ciris.edge.links.active` | gauge | count | operator-only |
+| `distinct_peers_1h` | `ciris.edge.peers.distinct.1h` | gauge | count | operator-only |
+| `distinct_peers_24h` | `ciris.edge.peers.distinct.24h` | gauge | count | operator-only |
+| `top_peers_by_bytes` | `ciris.edge.peers.top_by_bytes` | gauge | bytes | operator-only |
+| `link_duration_seconds` | `ciris.edge.link.duration` | histogram | seconds | operator-only |
 | `peer_reachability_ratio` | `ciris.edge.peer.reachability` | gauge | ratio | operator-only |
 | `inbound_dropped_low_trust` | `ciris.edge.inbound.dropped_low_trust` | counter | count | operator-only |
 | `replication_round_outcomes_total` | `ciris.edge.round.outcomes` | counter | count | operator-only |
