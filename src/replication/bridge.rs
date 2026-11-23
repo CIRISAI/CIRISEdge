@@ -1079,10 +1079,15 @@ pub struct BridgeConfig {
     /// [`Self::KEY_PLANE_READ_BUDGET_ENV`].
     pub key_plane_read_budget: usize,
     /// Range fingerprints, step A (`docs/design/RANGE_FINGERPRINTS.md`): the
-    /// passive receiver half. `true` (the default) answers a peer's
-    /// fingerprinted Summary on the bootstrap planes and says so in a marker;
-    /// it sends no fingerprint of its own. `false` sends and answers exactly
-    /// as 45.1.9 did. Env [`Self::RANGE_FINGERPRINTS_ANSWER_ENV`].
+    /// passive receiver half. `true` answers a peer's fingerprinted Summary
+    /// on the bootstrap planes and says so in a marker; it sends no
+    /// fingerprint of its own. `false` (the default in 45.1.10) sends and
+    /// answers exactly as 45.1.9 did. It ships off: no node sends a
+    /// fingerprint yet, and the review of the receiver found two ways a peer
+    /// that does could spend this node's CPU past the design's bound
+    /// (duplicate prefixes and `pk` outside the node cap; an `ep` change that
+    /// costs no rebuild token). The default turns on with the sender, once
+    /// both are closed. Env [`Self::RANGE_FINGERPRINTS_ANSWER_ENV`].
     pub range_fingerprints_answer: bool,
 }
 
@@ -1245,8 +1250,9 @@ impl BridgeConfig {
     /// runtime assembly. Zero or unparseable is ignored with a WARN.
     pub const KEY_PLANE_READ_BUDGET_ENV: &'static str = "CIRIS_EDGE_KEY_PLANE_READ_BUDGET";
 
-    /// Range fingerprints, step A — `0`, `off` or `false` turns the passive
-    /// receiver half OFF ([`Self::range_fingerprints_answer`]). Read once at
+    /// Range fingerprints, step A — `1`, `on` or `true` turns the passive
+    /// receiver half ON, `0`, `off` or `false` turns it off
+    /// ([`Self::range_fingerprints_answer`], off by default). Read once at
     /// runtime assembly.
     pub const RANGE_FINGERPRINTS_ANSWER_ENV: &'static str = "CIRIS_EDGE_RANGE_FINGERPRINTS_ANSWER";
 }
@@ -1300,7 +1306,7 @@ impl Default for BridgeConfig {
             feed_probe_spacing: super::store_feed::FEED_PROBE_SPACING,
             key_plane_listing_cache: Self::default_key_plane_listing_cache(),
             key_plane_read_budget: super::key_plane_memo::KEY_PLANE_READ_BUDGET,
-            range_fingerprints_answer: true,
+            range_fingerprints_answer: false,
         }
     }
 }
