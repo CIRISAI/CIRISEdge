@@ -1231,7 +1231,7 @@ async fn run_one_coordinator_forever(
                     continue;
                 }
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str, kicked = true);
-                let (ran, line) = round.run().instrument(span.clone()).await;
+                let (ran, line) = round.run(true).instrument(span.clone()).await;
                 // CIRISEdge#968 — the wait to the next round, for the line.
                 let (next_in, why) = match ran {
                     RoundRan::Skipped => continue,
@@ -1268,7 +1268,7 @@ async fn run_one_coordinator_forever(
                 // fan-out too.
                 // CIRISEdge#790 — instrumented, never entered (see the kick arm).
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
-                let (ran, line) = round.run().instrument(span.clone()).await;
+                let (ran, line) = round.run(false).instrument(span.clone()).await;
                 // CIRISEdge#968 — the tick that follows, with `Skip`: the next
                 // multiple of the cadence past now.
                 let now = tokio::time::Instant::now();
@@ -1451,8 +1451,9 @@ struct GatedRound<'a> {
 
 impl GatedRound<'_> {
     /// Run the round unless the peer is backed off. The caller logs the
-    /// returned line once it knows when the next round is due.
-    async fn run(&self) -> (RoundRan, RoundLine) {
+    /// returned line once it knows when the next round is due. `kicked`: a
+    /// caller asked for this round now ([`round_and_report`]).
+    async fn run(&self, kicked: bool) -> (RoundRan, RoundLine) {
         // Decided BEFORE the gate: a backed-off coordinator never holds or
         // queues for a permit.
         let Admission::Run(ticket) = self.backoff.admit(self.peer_id, self.coord.kind()) else {
@@ -1495,6 +1496,7 @@ impl GatedRound<'_> {
             self.peer_id,
             &mut seat,
             &mut ended,
+            kicked,
         )
         .await;
         if let Some(m) = self.metrics {
@@ -1792,9 +1794,17 @@ fn log_round_error(peer: &str, kind: EnvelopeKind, what: &'static str, error: &s
 }
 
 /// One anti-entropy round toward this coordinator's peer — the signer-recovery
-/// attempt first, then the ordinary round — and its [`RoundEvent`] to the sink.
+/// attempt and the ordinary round — and its [`RoundEvent`]s to the sink.
 /// Shared by the cadence tick and the [`SchedulerCommand::RoundNow`] kick.
 /// Returns how the round ended, for the no-route backoff (CIRISEdge#794).
+///
+/// CIRISEdge#1029 F4 — on a tick the recovery round goes first; on a KICK it
+/// goes after. A kick exists because a caller cannot wait for the cadence
+/// (a joiner's KeyPackage, a member's grant), and a recovery ask the peer does
+/// not answer cost the kicked Summary one `round_timeout`: 8 s on every kicked
+/// hop of the 12-person room's join. The recovery round still runs in the
+/// kicked tick, once the ordinary one is closed, so the two never overlap and
+/// a kick that comes every few seconds does not starve it.
 #[allow(clippy::too_many_lines)] // the round's one exit table: every arm is a log and an event
 async fn round_and_report(
     coord: &Arc<ReplicationCoordinator>,
@@ -1803,75 +1813,13 @@ async fn round_and_report(
     peer_id: &str,
     seat: &mut RoundSeat<'_>,
     ended: &mut RoundEnded,
+    kicked: bool,
 ) -> RoundClass {
-    // FSD-SIGNER-RECOVERY D3 — a recovery round runs FIRST on a tick where a
-    // name is queued, and the two never overlap: the recovery round is closed
-    // (ended, or abandoned with its session reset) before the ordinary one
-    // opens a round of its own, so a late reply to the Pull names a round this
-    // node no longer drives and is dropped at the registry (CIRISEdge#634).
-    //
-    // CIRISEdge#1005 — the recovery round no longer REPLACES the ordinary
-    // round; the ordinary round follows it in the same tick. The old reading
-    // ("at most one name per peer, so recovery displaces at most one ordinary
-    // round") failed in the field: a host re-queues a contact's missing key
-    // every pass, the seat cannot answer it, and every tick became a recovery
-    // round, so the Summary that offers the node's OWN rows never went and the
-    // seat never met the node that could have unlocked the answer. A recovery
-    // round costs the tick at most one `round_timeout` more (10 s against the
-    // 30 s cadence; a tick that overruns is skipped, never bursted), which is
-    // cheaper than the alternative bound of one ordinary round every N ticks:
-    // that would still delay a fresh node's own Key by N cadences.
-    let recovery = match run_one_recovery_round(coord, round_timeout, seat).await {
-        Ok(step) => step,
-        Err(e) => {
-            // Lifecycle — the transport is suspended: skip quietly. The
-            // ordinary round would be refused the same way; nothing is
-            // reported and no backoff moves.
-            if matches!(round_class_of(&e), RoundClass::Suspended) {
-                tracing::debug!("signer-recovery round skipped: transport suspended");
-                return RoundClass::Suspended;
-            }
-            // CIRISEdge#794 — no route: the ordinary round would fail the
-            // same way, so it does not run; the backoff takes over.
-            if let RoundClass::NoRoute(error) = round_class_of(&e) {
-                log_round_error(
-                    peer_id,
-                    coord.kind(),
-                    "signer-recovery round: no route to peer (CIRISEdge#794)",
-                    &error,
-                );
-                let event = RoundEvent::NoRoute(format!("transport: {error}"));
-                *ended = RoundEnded::of(&event);
-                if let Some(sink) = event_sink {
-                    let _ = sink.send((peer_id.to_string(), event)).await;
-                }
-                return RoundClass::NoRoute(error);
-            }
-            // A failed recovery must not also cost this peer its
-            // ordinary round. The row stays transient-refused and
-            // re-notes its signer on the next offer (D6).
-            tracing::warn!(
-                error = ?e,
-                "signer-recovery round failed; running ordinary \
-                 anti-entropy this tick instead (FSD-SIGNER-RECOVERY D6)"
-            );
-            None
-        }
-    };
-    if let Some(step) = recovery {
-        let event = match step {
-            DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report) => {
-                RoundEvent::Completed(report)
-            }
-            DriveStep::Refused => RoundEvent::Refused,
-            DriveStep::SendThenWait(_) => RoundEvent::TimedOut,
-        };
-        // CIRISEdge#1005 — a recovery round is booked as one, never as the
-        // ordinary round's "first sync complete": it offers nothing of this
-        // node's, so it says nothing about whether the two sides are in sync.
-        coord.note_recovery_round(matches!(event, RoundEvent::Completed(_)));
-        if let Some(sink) = event_sink {
-            let _ = sink.send((peer_id.to_string(), event)).await;
+    if !kicked {
+        if let Err(class) =
+            recovery_and_report(coord, round_timeout, event_sink, peer_id, seat, ended).await
+        {
+            return class;
         }
     }
     let outcome = run_one_round(coord, round_timeout, seat).await;
@@ -1955,7 +1903,99 @@ async fn round_and_report(
     // expires. Relief can only LENGTHEN the cadence
     // (relieve-never-expand, enforced in persist's fold), so this
     // can never speed rounds up past what the operator configured.
+    //
+    // CIRISEdge#1029 F4 — a kicked round's recovery follows it. Its own ending
+    // is its event's; the ordinary round's stands for the backoff.
+    if kicked && matches!(class, RoundClass::Other) {
+        let mut after = RoundEnded::default();
+        let _ =
+            recovery_and_report(coord, round_timeout, event_sink, peer_id, seat, &mut after).await;
+    }
     class
+}
+
+/// The signer-recovery round of [`round_and_report`], and its event to the
+/// sink. `Err` carries the class the ordinary round would end with anyway
+/// (the transport is suspended, or there is no route), so it does not run.
+async fn recovery_and_report(
+    coord: &Arc<ReplicationCoordinator>,
+    round_timeout: Duration,
+    event_sink: Option<&tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
+    peer_id: &str,
+    seat: &mut RoundSeat<'_>,
+    ended: &mut RoundEnded,
+) -> Result<(), RoundClass> {
+    // FSD-SIGNER-RECOVERY D3 — a recovery round runs FIRST on a tick where a
+    // name is queued, and the two never overlap: the recovery round is closed
+    // (ended, or abandoned with its session reset) before the ordinary one
+    // opens a round of its own, so a late reply to the Pull names a round this
+    // node no longer drives and is dropped at the registry (CIRISEdge#634).
+    //
+    // CIRISEdge#1005 — the recovery round no longer REPLACES the ordinary
+    // round; the ordinary round follows it in the same tick. The old reading
+    // ("at most one name per peer, so recovery displaces at most one ordinary
+    // round") failed in the field: a host re-queues a contact's missing key
+    // every pass, the seat cannot answer it, and every tick became a recovery
+    // round, so the Summary that offers the node's OWN rows never went and the
+    // seat never met the node that could have unlocked the answer. A recovery
+    // round costs the tick at most one `round_timeout` more (10 s against the
+    // 30 s cadence; a tick that overruns is skipped, never bursted), which is
+    // cheaper than the alternative bound of one ordinary round every N ticks:
+    // that would still delay a fresh node's own Key by N cadences.
+    let recovery = match run_one_recovery_round(coord, round_timeout, seat).await {
+        Ok(step) => step,
+        Err(e) => {
+            // Lifecycle — the transport is suspended: skip quietly. The
+            // ordinary round would be refused the same way; nothing is
+            // reported and no backoff moves.
+            if matches!(round_class_of(&e), RoundClass::Suspended) {
+                tracing::debug!("signer-recovery round skipped: transport suspended");
+                return Err(RoundClass::Suspended);
+            }
+            // CIRISEdge#794 — no route: the ordinary round would fail the
+            // same way, so it does not run; the backoff takes over.
+            if let RoundClass::NoRoute(error) = round_class_of(&e) {
+                log_round_error(
+                    peer_id,
+                    coord.kind(),
+                    "signer-recovery round: no route to peer (CIRISEdge#794)",
+                    &error,
+                );
+                let event = RoundEvent::NoRoute(format!("transport: {error}"));
+                *ended = RoundEnded::of(&event);
+                if let Some(sink) = event_sink {
+                    let _ = sink.send((peer_id.to_string(), event)).await;
+                }
+                return Err(RoundClass::NoRoute(error));
+            }
+            // A failed recovery must not also cost this peer its
+            // ordinary round. The row stays transient-refused and
+            // re-notes its signer on the next offer (D6).
+            tracing::warn!(
+                error = ?e,
+                "signer-recovery round failed; running ordinary \
+                 anti-entropy this tick instead (FSD-SIGNER-RECOVERY D6)"
+            );
+            None
+        }
+    };
+    if let Some(step) = recovery {
+        let event = match step {
+            DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report) => {
+                RoundEvent::Completed(report)
+            }
+            DriveStep::Refused => RoundEvent::Refused,
+            DriveStep::SendThenWait(_) => RoundEvent::TimedOut,
+        };
+        // CIRISEdge#1005 — a recovery round is booked as one, never as the
+        // ordinary round's "first sync complete": it offers nothing of this
+        // node's, so it says nothing about whether the two sides are in sync.
+        coord.note_recovery_round(matches!(event, RoundEvent::Completed(_)));
+        if let Some(sink) = event_sink {
+            let _ = sink.send((peer_id.to_string(), event)).await;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3555,6 +3595,169 @@ mod tests {
             "the node's own Key rows must reach the seat while a recovery name is \
              re-queued every pass ({asked} recovery asks, own rows never offered: \
              CIRISEdge#1005)"
+        );
+    }
+
+    /// Rows released from a park, handed to the next recovery round once
+    /// [`Self::armed`] is set: what a kicked Attestation round found queued in
+    /// the field.
+    struct ReleasingProvider {
+        own: StaticProvider,
+        armed: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl StateProvider for ReleasingProvider {
+        async fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            self.own.local_refs(kind).await
+        }
+        async fn fetch_envelope(&self, kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
+            self.own.fetch_envelope(kind, h).await
+        }
+        fn take_released_rows_for(&self, _peer_key_id: &str, _kind: EnvelopeKind) -> Vec<[u8; 32]> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                vec![h(9)]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// CIRISEdge#1029 F4 — **a kicked round sends its Summary first; the
+    /// recovery ask waits behind it.** Field (12-person star): the joiner's
+    /// kick toward the founder, right after it published its KeyPackage, ran a
+    /// recovery `Fetch` first; the founder never answered it inside the round
+    /// timeout, so the KeyPackage's Summary left 8 s late, on every kicked hop.
+    /// A kick exists because a caller cannot wait. The recovery round still
+    /// runs in the same kicked tick, after the ordinary one. Red before: the
+    /// first frame the seat saw after the kick was the `Fetch`.
+    #[tokio::test]
+    async fn a_kicked_round_sends_its_summary_before_a_queued_recovery_ask_1029() {
+        let (alice_to_bob_tx, mut alice_to_bob_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (bob_to_alice_tx, mut bob_to_alice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let alice_transport = Arc::new(InMemTransport {
+            peer_inbox: HashMap::from([("bob".to_string(), alice_to_bob_tx)]),
+        });
+        let bob_transport = Arc::new(InMemTransport {
+            peer_inbox: HashMap::from([("alice".to_string(), bob_to_alice_tx)]),
+        });
+        let mut a_state = LocalState::new();
+        a_state.insert(EnvelopeKind::Attestation, h(1), 1);
+        let alice_provider = Arc::new(ReleasingProvider {
+            own: StaticProvider {
+                state: a_state,
+                envelopes: HashMap::from([(h(1), b"env_1".to_vec())]),
+            },
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let alice_coord = Arc::new(ReplicationCoordinator::new(
+            alice_transport,
+            "bob",
+            EnvelopeKind::Attestation,
+            SessionRole::Initiator,
+            alice_provider.clone(),
+            RecordingApplier::with(HashMap::new(), std::collections::HashSet::new()),
+        ));
+        let bob_coord = Arc::new(ReplicationCoordinator::new(
+            bob_transport,
+            "alice",
+            EnvelopeKind::Attestation,
+            SessionRole::Responder,
+            Arc::new(StaticProvider {
+                state: LocalState::new(),
+                envelopes: HashMap::new(),
+            }),
+            Arc::new(RecordingApplier {
+                known: HashMap::from([(b"env_1".to_vec(), h(1))]),
+                local_hashes: std::sync::Mutex::new(std::collections::HashSet::new()),
+            }),
+        ));
+        // What the seat receives, in order. It never answers a Fetch: the
+        // founder's reply did not come back inside the round in the field.
+        let seen: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
+        let bob_route = bob_coord.clone();
+        let record = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Some(bytes) = alice_to_bob_rx.recv().await {
+                let msg = ReplicationCoordinator::parse_inbound_bytes(&bytes).unwrap();
+                let what = match &msg {
+                    crate::replication::protocol::ReplicationMessage::Summary(_) => "summary",
+                    crate::replication::protocol::ReplicationMessage::Fetch(_) => "fetch",
+                    crate::replication::protocol::ReplicationMessage::Pull(_) => "pull",
+                    _ => "other",
+                };
+                record.lock().unwrap().push(what);
+                if what != "fetch" {
+                    let _ = bob_route.deliver_inbound(msg);
+                }
+            }
+        });
+        let alice_route = alice_coord.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = bob_to_alice_rx.recv().await {
+                let msg = ReplicationCoordinator::parse_inbound_bytes(&bytes).unwrap();
+                let _ = alice_route.deliver_inbound(msg);
+            }
+        });
+        let bob_drive = bob_coord.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = bob_drive.recv_inbound().await {
+                let Ok(step) = bob_drive.drive_round_step(Some(msg)).await else {
+                    continue;
+                };
+                if let DriveStep::SendThenWait(msgs) = step {
+                    for m in &msgs {
+                        let _ = bob_drive.send_message(m).await;
+                    }
+                }
+            }
+        });
+
+        let mut sched = ReplicationScheduler::new(SchedulerConfig {
+            cadence: Duration::from_hours(1),
+            round_timeout: Duration::from_millis(500),
+            ..SchedulerConfig::default()
+        });
+        let control = sched.install_control_channel();
+        sched.add_initiator(alice_coord.clone());
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let sched_handle =
+            tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
+        // The start-up tick, with nothing queued.
+        tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
+            .await
+            .expect("the start-up round")
+            .expect("open");
+        seen.lock().unwrap().clear();
+
+        // A row is released for this peer, then a caller kicks the plane.
+        alice_provider
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        control.round_now(Some("bob")).await.expect("kick");
+        let fetched = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if seen.lock().unwrap().contains(&"fetch") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let order = seen.lock().unwrap().clone();
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sched_handle)
+            .await
+            .expect("scheduler shutdown")
+            .expect("scheduler join");
+        assert!(
+            fetched.is_ok(),
+            "the queued recovery ask still goes in the kicked tick: {order:?}"
+        );
+        assert_eq!(
+            order.first(),
+            Some(&"summary"),
+            "a kicked round's Summary is the first frame, ahead of the recovery ask: {order:?}"
         );
     }
 
