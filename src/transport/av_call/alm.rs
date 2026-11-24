@@ -36,6 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use super::rxmove::LatencyFloor;
 use crate::load_ladder::ServiceTier;
 use crate::transport::realtime_av::StreamId;
 use crate::transport::realtime_av_alm::controller::wire::{
@@ -238,7 +239,8 @@ pub(super) struct AlmState {
     own_rate: Rate,
     rates: BTreeMap<StreamId, Rate>,
     forwarded_seen: BTreeMap<StreamId, SeenRing>,
-    min_offset: BTreeMap<StreamId, (i64, u64)>,
+    /// RM1 — each received stream's latency floor ([`LatencyFloor`]).
+    min_offset: BTreeMap<StreamId, LatencyFloor>,
     last_offer_ms: u64,
     pub(super) counts: AlmCounts,
     pub(super) labels: Vec<&'static str>,
@@ -1180,13 +1182,13 @@ impl AlmState {
         }
         let wall = crate::transport::av_chunk_auth::unix_ms_now();
         let offset = wall as i64 - source_ms as i64;
-        let entry = self.min_offset.entry(stream).or_insert((offset, now));
-        // The floor decays: a better floor wins at once, a stale one is
-        // replaced after 30 s.
-        if offset < entry.0 || now.saturating_sub(entry.1) > 30_000 {
-            *entry = (offset, now);
-        }
-        let latency = (offset - entry.0).max(0) as f64;
+        // RM1: a better floor wins at once; only an on-time sample
+        // re-anchors an old one (drift), never a queued one.
+        let latency = self
+            .min_offset
+            .entry(stream)
+            .or_insert_with(|| LatencyFloor::new(offset, now))
+            .sample(offset, now) as f64;
         let Some(sel) = self.sels.get_mut(&stream) else {
             return;
         };
@@ -2674,6 +2676,51 @@ mod tests {
         }
         assert!(sheds(&out).is_empty(), "{:?}", sheds(&out));
         assert_eq!(a.own_children().len(), 1);
+    }
+
+    // ── ReceiverMoves (docs/design/call_congestion, rows RM1–RM6, N4) ────
+
+    /// A chunk of `stream` from `from`, sent `delay_ms` ago by its signed
+    /// clock.
+    fn late_chunk(n: &mut AlmState, stream: StreamId, from: &str, seq: u64, delay_ms: u64) {
+        let src = crate::transport::av_chunk_auth::unix_ms_now() - delay_ms;
+        n.on_chunk(stream, from, 1, seq, 300, src, true, 0);
+    }
+
+    /// The receiver's floor for `stream` (its minimum clock offset).
+    fn floor_of(n: &AlmState, stream: StreamId) -> i64 {
+        n.min_offset[&stream].floor()
+    }
+
+    /// RM1 — observable: a chunk's signed `source_ts_ms` against the wall
+    /// clock; state: the stream queued 500 ms behind its floor for 40 s;
+    /// action: the floor stays; must never: re-anchor while the stream is
+    /// late. Mutation (45.2.0 before RM1): the floor was replaced once 30 s
+    /// old, so after 30 s of queueing the latency read 0 and the late signal
+    /// was gone.
+    #[test]
+    fn a_stream_late_for_forty_seconds_still_reads_late() {
+        let mut b = AlmState::new("b", s(2), &roster(), true, 2);
+        b.on_caps("a", CAPS_THIS_BUILD);
+        b.note_publisher(s(1), "a");
+        b.note_bound_publisher(s(1), "a");
+        let mut seq = 0;
+        for _ in 0..100 {
+            late_chunk(&mut b, s(1), "a", seq, 0);
+            seq += 1;
+            b.t0 = b.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+        }
+        let on_time = floor_of(&b, s(1));
+        for _ in 0..2_000 {
+            late_chunk(&mut b, s(1), "a", seq, 500);
+            seq += 1;
+            b.t0 = b.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+        }
+        assert!(
+            floor_of(&b, s(1)) - on_time < 50,
+            "the floor moved {} ms during 40 s of queueing",
+            floor_of(&b, s(1)) - on_time
+        );
     }
 
     // ── #945: three real controllers, C3 through the real encoder ────────
