@@ -4423,6 +4423,14 @@ fn reconcile_legs(shared: &Arc<Shared>) {
                         now + Duration::from_millis(alm::STALL_PROBE_HOLD_MS),
                     );
                     shared.count(crate::observability::AV_LEG_REDIAL_DEFERRED);
+                    tracing::debug!(
+                        target: "ciris_edge::c3_fail",
+                        node = %shared.own,
+                        peer = %m,
+                        stalled,
+                        publishing,
+                        "leg redial deferred (heard through a relay)"
+                    );
                     continue;
                 }
             }
@@ -4886,20 +4894,37 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
             .dispatcher_mut()
             .send_control_to(&o.to, &o.frame)
             .await;
-        let ok = if let Some(LegSend::Sent) = sent {
-            true
+        let (ok, why) = if let Some(LegSend::Sent) = sent {
+            (true, String::new())
         } else {
+            let out_leg = match &sent {
+                None => "no out leg".to_owned(),
+                Some(l) => format!("out leg {l:?}"),
+            };
             let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
             match sender {
-                Some(s) => crate::transport::realtime_av_dispatcher::AvLinkSender::send(
+                Some(s) => match crate::transport::realtime_av_dispatcher::AvLinkSender::send(
                     s.as_ref(),
                     &o.frame,
                 )
                 .await
-                .is_ok(),
-                None => false,
+                {
+                    Ok(()) => (true, String::new()),
+                    Err(e) => (false, format!("{out_leg}; in link {e:?}")),
+                },
+                None => (false, format!("{out_leg}; no in link")),
             }
         };
+        if !ok {
+            tracing::debug!(
+                target: "ciris_edge::c3_fail",
+                node = %shared.own,
+                peer = %o.to,
+                kind = crate::transport::realtime_av_runtime::send_diag::kind_of(&o.frame),
+                why = %why,
+                "C3 send failed"
+            );
+        }
         if ok {
             Shared::lock(&shared.alm).counts.c3_sent += 1;
             shared.count(crate::observability::ALM_C3_SENT);
@@ -4948,6 +4973,14 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
             return;
         }
     }
+    tracing::debug!(
+        target: "ciris_edge::c3_fail",
+        node = %shared.own,
+        peer = %o.to,
+        kind = crate::transport::realtime_av_runtime::send_diag::kind_of(&o.frame),
+        why = "resend budget spent",
+        "C3 send failed"
+    );
     shared.count(crate::observability::ALM_C3_SEND_FAILED);
 }
 
