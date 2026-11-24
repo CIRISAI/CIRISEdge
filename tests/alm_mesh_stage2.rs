@@ -3568,6 +3568,18 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     let exhausted_before: u64 = nodes.iter().map(|n| channel_exhausted(&n.metrics)).sum();
     let torn_before: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum();
     uplink.cap_kbit(copy_kbit * 13 / 10);
+    // Each link's close is logged on target `ciris_edge::link_close` (debug)
+    // with its node, direction, plane, peer and reason; this line is the
+    // origin its times are read from, and the names map key ids to roles.
+    tracing::info!(
+        target: "ciris_edge::link_close",
+        names = ?nodes
+            .iter()
+            .zip(["P", "A", "B", "C", "T"])
+            .map(|(n, r)| (r, n.key.key_id.clone()))
+            .collect::<Vec<_>>(),
+        "G8 cap on"
+    );
     // When the first link is torn down after the cap, on P and on its peers
     // (the matrix: every node, 1.6-2.2 s after cap_on).
     let cap_on = tokio::time::Instant::now();

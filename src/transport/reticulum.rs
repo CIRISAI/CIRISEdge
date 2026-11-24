@@ -19614,6 +19614,49 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 &*ctx.reusable_scoped_link.lock().await,
                 link_id,
             );
+            // G8 — which link went, on which node, which way and on which
+            // plane: read before the book forgets it (target
+            // `ciris_edge::link_close`, debug; the capped-uplink witness
+            // times each one from the cap).
+            if tracing::enabled!(target: "ciris_edge::link_close", tracing::Level::DEBUG) {
+                let direction = ctx
+                    .link_direction
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .by_link
+                    .get(&link_id)
+                    .copied();
+                let av_peer = ctx
+                    .av_dialed_peer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&link_id)
+                    .cloned();
+                let plane = if av_peer.is_some() || ctx.av_sink.link_ids().contains(&link_id) {
+                    "av"
+                } else {
+                    match ctx.link_plane.lock().await.get(&link_id) {
+                        Some(LinkPlane::Identity) => "identity",
+                        Some(LinkPlane::Scoped) => "scoped",
+                        Some(LinkPlane::Av) => "av",
+                        None => "unknown",
+                    }
+                };
+                let peer = match av_peer {
+                    Some(p) => Some(p),
+                    None => ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned(),
+                };
+                tracing::debug!(
+                    target: "ciris_edge::link_close",
+                    node = %ctx.local_key_id,
+                    link = %hex::encode(link_id.as_bytes()),
+                    direction = ?direction,
+                    plane,
+                    peer = ?peer,
+                    reason = ?reason,
+                    "link closed"
+                );
+            }
             ctx.link_book().forget(link_id, close_cause(reason)).await;
             ctx.alm_links.forget(&link_id.into_bytes());
             // G8 — the punched interface goes with its link: forget the
