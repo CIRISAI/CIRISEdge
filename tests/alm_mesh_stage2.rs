@@ -4439,6 +4439,23 @@ async fn a_capped_publishers_children_move_themselves_and_come_back() {
             .collect::<Vec<_>>(),
     );
     eprintln!("[RM] capped then lifted: {context}; failed {failed:?}");
+    if !failed.is_empty() {
+        // What each node decided, and the looks around the first failure.
+        let around = first_none.unwrap_or(lift);
+        let near: Vec<_> = capped
+            .iter()
+            .chain(&lifted)
+            .filter(|l| {
+                l.at + Duration::from_secs(6) >= around && l.at <= around + Duration::from_secs(2)
+            })
+            .map(|l| (l.at.as_millis(), l.queue_ms, l.own, l.parents.clone()))
+            .collect();
+        eprintln!("[RM] looks around {around:?}: {near:?}");
+        eprintln!("[RM] P log:\n{}", cp.alm_log().2);
+        for (i, l) in listeners.iter().enumerate() {
+            eprintln!("[RM] listener {i} log:\n{}", l.alm_log().2);
+        }
+    }
     assert!(failed.is_empty(), "{failed:?}: {context}");
     drop(listeners);
     drop(cp);
