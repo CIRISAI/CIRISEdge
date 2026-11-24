@@ -4982,6 +4982,8 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
         "C3 send failed"
     );
     shared.count(crate::observability::ALM_C3_SEND_FAILED);
+    // An ADMIT nobody heard holds a slot for nothing: release it.
+    Shared::lock(&shared.alm).on_admit_undelivered(&o.to, &o.frame);
 }
 
 /// One C3 frame from `peer`. A dialler hearing the responder's CAPS on its

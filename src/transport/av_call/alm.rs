@@ -888,6 +888,29 @@ impl AlmState {
         self.ensure_own_primaries();
     }
 
+    /// An ADMIT this node made could not be delivered (its resend budget
+    /// spent): the commitment it named is released, so no slot is held for
+    /// a child that never heard it was admitted (it asks again). Row E2 then
+    /// applies as for any other loss.
+    pub(super) fn on_admit_undelivered(&mut self, peer: &str, frame: &[u8]) {
+        let Ok(crate::transport::realtime_av_alm::controller::wire::WireFrame::Control(
+            ControlFrame {
+                stream,
+                msg: ControlMsg::Decision(AdmitDecision::Admit { .. }),
+            },
+        )) = crate::transport::realtime_av_alm::controller::wire::decode(frame, &self.me)
+        else {
+            return;
+        };
+        let p = peer.to_owned();
+        if let Some(a) = self.own_admission_mut(stream) {
+            a.release(&p);
+        } else if let Some(a) = self.relays.get_mut(&stream) {
+            a.release(&p);
+        }
+        self.ensure_own_primaries();
+    }
+
     /// Row E2 — every own stream with any subscriber keeps a PRIMARY: when
     /// its last primary is lost by any cause (a link close, an unsubscribe, a
     /// shed), the oldest standby is promoted at once and told with an ADMIT
@@ -2985,6 +3008,29 @@ mod tests {
             })
             .map(|o| o.to.clone())
             .collect()
+    }
+
+    /// An ADMIT that could not be delivered leaves no commitment behind.
+    #[test]
+    fn an_undelivered_admit_releases_its_commitment() {
+        let mut a = publisher_with(&["b", "c"]);
+        let admit = encode(
+            s(1),
+            &ControlMsg::Decision(AdmitDecision::Admit {
+                role: Role::Primary,
+            }),
+        );
+        a.on_admit_undelivered("c", &admit);
+        assert_eq!(a.own_children(), vec![("b".to_owned(), Role::Primary)]);
+        // Anything that is not an ADMIT changes nothing.
+        let offer_like = encode(
+            s(1),
+            &ControlMsg::Shed {
+                reason: ShedReason::OverCommitted,
+            },
+        );
+        a.on_admit_undelivered("b", &offer_like);
+        assert_eq!(a.own_children(), vec![("b".to_owned(), Role::Primary)]);
     }
 
     /// Row E2, cause: a link close — the publisher's last primary's leg goes
