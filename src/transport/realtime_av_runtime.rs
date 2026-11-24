@@ -1324,6 +1324,75 @@ pub use leviculum_link::{
 };
 
 #[cfg(feature = "_reticulum-module")]
+/// G8 diagnostic — edge-sealed A/V bytes per link and frame kind, as each
+/// send returned (`sent` when leviculum took it, `refused` when it refused
+/// a sealed frame). Off unless a test turns it on; then one map update per
+/// send.
+#[doc(hidden)]
+pub mod send_diag {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    type Map = HashMap<([u8; 16], &'static str), (u64, u64)>;
+    static MAP: OnceLock<Mutex<Map>> = OnceLock::new();
+
+    /// Start counting.
+    pub fn enable() {
+        ON.store(true, Ordering::Relaxed);
+    }
+
+    /// Record one send.
+    pub fn note(link: [u8; 16], kind: &'static str, bytes: usize, ok: bool) {
+        if !ON.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut m = MAP
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let e = m.entry((link, kind)).or_insert((0, 0));
+        if ok {
+            e.0 += bytes as u64;
+        } else {
+            e.1 += bytes as u64;
+        }
+    }
+
+    /// `(link, kind, bytes sent, bytes refused)` so far.
+    #[must_use]
+    pub fn snapshot() -> Vec<([u8; 16], &'static str, u64, u64)> {
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|((l, k), (s, r))| (*l, *k, *s, *r))
+            .collect()
+    }
+
+    /// The kind of an edge control frame on an A/V link's Channel.
+    #[must_use]
+    pub fn kind_of(bytes: &[u8]) -> &'static str {
+        if bytes.starts_with(&crate::transport::av_chunk_auth::BINDING_PART_MAGIC) {
+            return "binding_part";
+        }
+        if crate::transport::realtime_av_alm::controller::wire::is_control_frame(bytes) {
+            return match bytes.get(5) {
+                Some(0x01) => "caps",
+                Some(0x02) => "subscribe",
+                Some(0x03) => "unsubscribe",
+                Some(0x04) => "admit",
+                Some(0x05) => "refuse",
+                Some(0x06) => "shed",
+                Some(0x07) => "offer",
+                _ => "c3_other",
+            };
+        }
+        "other_ctl"
+    }
+}
+
 mod leviculum_link {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1660,7 +1729,7 @@ mod leviculum_link {
         }
 
         async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
-            self.send_with(bytes, None, false).await
+            self.send_with(bytes, None, false, false).await
         }
 
         /// leviculum#102 — a leg whose peer takes datagrams sends each media
@@ -1686,7 +1755,7 @@ mod leviculum_link {
                 return self.send_datagram(bytes, relayed);
             }
             let sent = self
-                .send_with(bytes, self.media_ttl.for_chunk(bytes), relayed)
+                .send_with(bytes, self.media_ttl.for_chunk(bytes), relayed, true)
                 .await;
             if sent.is_ok() {
                 self.count(crate::observability::AV_SENT_DATAGRAM_FALLBACK);
@@ -1756,6 +1825,12 @@ mod leviculum_link {
                 .try_send_unordered(&sealed)
             {
                 Ok(_sequence) => {
+                    crate::transport::realtime_av_runtime::send_diag::note(
+                        self.link_id.into_bytes(),
+                        "media_datagram",
+                        sealed.len(),
+                        true,
+                    );
                     self.count(crate::observability::AV_SENT);
                     self.count(crate::observability::AV_SENT_DATAGRAM);
                     if let Some(stamps) = self.outbound_liveness.as_deref() {
@@ -1794,7 +1869,9 @@ mod leviculum_link {
             bytes: &[u8],
             ttl: Option<std::time::Duration>,
             relayed: bool,
+            media: bool,
         ) -> Result<(), AvDispatcherError> {
+            use crate::transport::realtime_av_runtime::send_diag;
             use leviculum_core::SendError;
             use leviculum_std::error::Error as LevError;
             /// leviculum#94's timed wrapper: msgtype u16 ‖ sent_ms u32 ‖ ttl_ms u32.
@@ -1843,6 +1920,16 @@ mod leviculum_link {
                 Some(ttl) => handle.try_send_timed(&sealed, ttl).await,
                 None => handle.try_send(&sealed).await,
             };
+            crate::transport::realtime_av_runtime::send_diag::note(
+                self.link_id.into_bytes(),
+                if media {
+                    "media_channel"
+                } else {
+                    send_diag::kind_of(bytes)
+                },
+                sealed.len(),
+                sent.is_ok(),
+            );
             match sent {
                 Ok(()) => {
                     self.count(crate::observability::AV_SENT);
