@@ -48,9 +48,22 @@ CONSTANTS
     RedialOnPathUp,     \* a dead leg redials when its path is back, not on backoff
     ShedDrains,         \* a shed child keeps media until it moved (make-before-break)
     PeerLiveness,       \* the hold counts authenticated inbound from the PEER on any leg
+                        \* (leviculum's PeerEvidenceHold)
+    ProbeBackoff,       \* any widening waits 2 windows x 2^fails (fails <= 2)
+    HashRank,           \* P keeps, and receivers spare, the lowest-ranked child by a
+                        \* rank every member computes (RankSeq), not admission order
+    RankSeq,            \* that rank (the order of hash(stream, child key))
+    StaggeredSetup,     \* P's legs are set up one per StaggerTicks, not all at once
+    StaggerTicks,
+    SetupUnits,         \* queue units P's side of one leg's setup costs (0: free)
+    SerialRedial,       \* while P's verdict holds: one leg setup at a time; a
+                        \* listener heard through a relay defers its legs' redial
+    ProbeTwoLegs,       \* P sends a small control frame each ProbeEvery on <= 2 idle legs
+    ProbeEvery,
     ReceiverMoves,      \* a non-first child that sees P's media late moves itself
     RxDelayTicks,       \* ... at this media delay (ticks)
     QTarget,            \* the queue delay the steady state must get under (ticks)
+    GapBound,           \* a stall-shed child has a parent again within this (ticks)
     CloseLost,          \* environment: a LINKCLOSE never reaches the peer (#1030)
     \* --- the uplink --------------------------------------------------------
     M,                  \* media units one child's copy costs per tick
@@ -105,7 +118,11 @@ Max(a, b) == IF a > b THEN a ELSE b
 
 Capped(t) == CapAt <= t /\ t < CapUntil
 Rate(t) == IF Capped(t) THEN RCap ELSE RFree
-InWin(t) == CapAt <= t /\ t <= Horizon - TailTicks
+\* Heard is judged on what P published WHILE CAPPED (up to TailTicks before the
+\* horizon, so it can still arrive); with no cap, on the whole run.
+InWin(t) == IF CapAt >= Horizon THEN t <= Horizon - TailTicks
+            ELSE CapAt <= t /\ t < CapUntil /\ t <= Horizon - TailTicks
+QDelayS(S) == IF S.backlog = 0 THEN 0 ELSE (S.backlog - 1) \div Rate(S.now)
 
 \* 8 x 1.5^(k-1), rounded down: 8, 12, 18, 27, 40, 60, 91, 136, ...
 OrdNum(k) == (8 * 3^(k - 1)) \div (2^(k - 1))
@@ -141,12 +158,16 @@ VARIABLES
     shedBy, offerAt, offerFwd, offerRoom, rxDelay, lateMove,
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual, maxQd,
+    firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
+    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
 
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
-          rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd, dialAt, dialBo, pathAt, children, order,
+          rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd,
+          firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
+          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -154,7 +175,7 @@ vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           hist, bad, choice>>
 
 ASSUME /\ NL >= 2 /\ RCap >= 1 /\ RFree >= RCap /\ MaxTries >= 1
-       /\ CapAt >= 0 /\ Horizon > CapAt /\ Stale > 0 /\ WatchEvery >= 1
+       /\ CapAt >= 0 /\ Stale > 0 /\ WatchEvery >= 1
 
 -----------------------------------------------------------------------------
 (* The state as one record, so a tick can be written as a pipeline of     *)
@@ -167,7 +188,11 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         pathAt |-> pathAt, children |-> children, order |-> order,
         drainTo |-> drainTo, shedPend |-> shedPend, room |-> room,
         demand |-> demand, lastCong |-> lastCong, lastWiden |-> lastWiden, probeFails |-> probeFails, lateMove |-> lateMove,
-        maxQd |-> maxQd, stall |-> stall,
+        maxQd |-> maxQd, firstVerdictAt |-> firstVerdictAt, firstShedAt |-> firstShedAt,
+        firstShedQ |-> firstShedQ, fullAt |-> fullAt, lastSetupAt |-> lastSetupAt,
+        shedAtL |-> shedAtL, maxParentGap |-> maxParentGap, lastNewAt |-> lastNewAt,
+        maxMediaGap |-> maxMediaGap, idleCand |-> idleCand,
+        stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
         winPhase |-> winPhase, relayKids |-> relayKids, parent |-> parent,
@@ -234,15 +259,19 @@ TearDown(S, l, why, ch) ==
 \* (c) The shed: keep the `keep` OLDEST children (LIFO shed), notify the rest.
 ShedTo(S, keep) ==
     LET kids == S.children
-        ordered == SelectSeq(S.order, LAMBDA x : x \in kids)
+        ordered == IF HashRank THEN SelectSeq(RankSeq, LAMBDA x : x \in kids)
+                   ELSE SelectSeq(S.order, LAMBDA x : x \in kids)
         kept == {ordered[i] : i \in 1..Min(keep, Len(ordered))}
         victims == kids \ kept
         S1 == [S EXCEPT !.children = kept, !.room = 1,
+                        !.firstShedAt = IF @ < 0 /\ victims /= {} THEN S.now ELSE @,
+                        !.firstShedQ = IF @ < 0 /\ victims /= {} THEN QDelayS(S) ELSE @,
                         !.zeroShed = @ \/ (kept = {} /\ kids /= {}),
                         !.sheds = @ + Cardinality(victims),
                         !.drainTo = [v \in L |-> IF v \in victims /\ ShedDrains
                                                  THEN S.now + DrainTicks ELSE @[v]],
-                        !.shedPend = [v \in L |-> IF v \in victims THEN TRUE ELSE @[v]]]
+                        !.shedPend = [v \in L |-> IF v \in victims THEN TRUE ELSE @[v]],
+                        !.shedAtL = [v \in L |-> IF v \in victims THEN S.now ELSE @[v]]]
     IN SendEach(S1, victims, Pay("shed"))
 
 KeepOf(ch) == IF RoomKeepsOne THEN 1 ELSE ch.keep
@@ -256,7 +285,7 @@ Media1(S, s, c, t) ==
     ELSE LET S0 == [S EXCEPT !.peerAuth[c][s] = S.now,
                              !.rxDelay[c] = IF s = "P" THEN S.now - t ELSE @]
              S1 == IF t > S0.lastHeard[c]
-                   THEN [S0 EXCEPT !.lastHeard[c] = t,
+                   THEN [S0 EXCEPT !.lastHeard[c] = t, !.lastNewAt[c] = S.now,
                                    !.heard[c] = IF InWin(t) THEN @ + 1 ELSE @]
                    ELSE S0
              kids == {k \in S1.relayKids[c] : S1.up[<<c, k>>]}
@@ -293,6 +322,8 @@ OnAdmit(S, l, x) ==
     ELSE LET old == S.parent[l]
              S1 == [S EXCEPT !.parent[l] = x, !.pendSub[l] = None,
                              !.reparents[l] = @ + 1, !.lastSwitch[l] = S.now,
+                             !.maxParentGap = IF S.shedAtL[l] >= 0 THEN Max(@, S.now - S.shedAtL[l]) ELSE @,
+                             !.shedAtL[l] = -1,
                              !.shedBy[l] = None, !.lateMove[l] = FALSE]
              \* a move made because P's media came late says so: P reads it
              \* as congestion (ReceiverMoves)
@@ -326,7 +357,7 @@ Handle(S, pay, s, r) ==
             LET kids == S.children \ {s}
             IN [S EXCEPT !.children = kids, !.drainTo[s] = -1, !.shedPend[s] = FALSE,
                          !.room = Max(1, Cardinality(kids)), !.lastCong = S.now,
-                         !.probeFails = Min(@ + 1, 2)]
+                         !.probeFails = IF ProbeBackoff THEN Min(@ + 1, 2) ELSE @]
       [] pay.p = "unsub" ->
             IF r = "P"
             THEN [S EXCEPT !.children = @ \ {s}, !.drainTo[s] = -1, !.shedPend[s] = FALSE]
@@ -365,7 +396,7 @@ RecvProof(S, it) ==
 
 RecvClose(S, it) ==
     LET l == it.leg
-    IN IF Alive(S, l[2]) /\ S.peerUp[l] /\ it.gen = S.gen[l]
+    IN IF l \in Legs /\ Alive(S, l[2]) /\ S.peerUp[l] /\ it.gen = S.gen[l]
        THEN [S EXCEPT !.peerUp[l] = FALSE,
                       !.torn = @ \cup {[leg |-> l, why |-> "peer_closed", at |-> S.now,
                                         peerAlive |-> Alive(S, l[1])]}]
@@ -433,15 +464,32 @@ StaleLegs(S) ==
 \* (e) Redial (reconcile_legs / dial_leg; DirectPathTracker::link_closed).
 DialDue(S, l) == IF RedialOnPathUp THEN S.now >= S.dialAt[l] \/ S.now = S.pathAt[l]
                  ELSE S.now >= S.dialAt[l]
+InvolvesP(l) == l[1] = "P" \/ l[2] = "P"
+\* SerialRedial: while P's verdict holds, one P leg's setup at a time (one per
+\* SetupGap), and a listener that hears P through a relay defers its legs
+\* with P (it retries on its backoff).
+SetupGap == Max(1, SetupUnits \div RCap)
+SerialOK(S, l) ==
+    ~SerialRedial \/ ~InvolvesP(l) \/ ~S.stall
+    \/ (S.now - S.lastSetupAt >= SetupGap
+        /\ ~(l[1] \in L /\ S.parent[l[1]] \notin {None, "P"})
+        /\ ~(l[2] \in L /\ S.parent[l[2]] \notin {None, "P"}))
+\* P's side of a leg's setup (link handshake, PQC transit KEX, hello,
+\* bindings) queues on P's uplink.
+SetupCost(S, l) ==
+    IF SetupUnits > 0 /\ InvolvesP(l)
+    THEN Emit([S EXCEPT !.lastSetupAt = S.now], "P",
+              Item("close", <<"none", "none">>, -1, 0, 0, NoPay, "P", {}, S.now), SetupUnits)
+    ELSE S
 RECURSIVE RedialOver(_, _)
 RedialOver(S, ls) ==
     IF ls = {} THEN S
     ELSE LET l == CHOOSE l \in ls : TRUE
              S1 == IF ~S.up[l] /\ Alive(S, l[1]) /\ DialDue(S, l)
-                   THEN IF S.now >= S.pathAt[l] /\ Alive(S, l[2])
-                        THEN [S EXCEPT !.up[l] = TRUE, !.peerUp[l] = TRUE, !.gen[l] = @ + 1,
+                   THEN IF S.now >= S.pathAt[l] /\ Alive(S, l[2]) /\ SerialOK(S, l)
+                        THEN SetupCost([S EXCEPT !.up[l] = TRUE, !.peerUp[l] = TRUE, !.gen[l] = @ + 1,
                                        !.chan[l] = <<>>, !.srtt8[l] = 0, !.lastAuth[l] = -1,
-                                       !.rxNext[l] = S.nextSeq[l], !.dialBo[l] = DialMin]
+                                       !.rxNext[l] = S.nextSeq[l], !.dialBo[l] = DialMin], l)
                         ELSE LET b == Min(2 * S.dialBo[l], DialMax)
                              IN [S EXCEPT !.dialBo[l] = b, !.dialAt[l] = S.now + b]
                    ELSE S
@@ -463,7 +511,8 @@ PWatch(S, ch) ==
              seen == IF det THEN S.now ELSE S.stallSeen
              st == IF ShedOnVerdict THEN seen >= 0 /\ S.now - seen < Latch ELSE det
              S1 == [S EXCEPT !.obs = newObs, !.stallSeen = seen, !.stall = st,
-                             !.verdicts = IF st /\ ~S.stall THEN @ + 1 ELSE @]
+                             !.verdicts = IF st /\ ~S.stall THEN @ + 1 ELSE @,
+                             !.firstVerdictAt = IF @ < 0 /\ st THEN S.now ELSE @]
          IN IF ShedOnVerdict /\ st /\ ~S.stall /\ Cardinality(S1.children) > KeepOf(ch)
             THEN ShedTo(S1, KeepOf(ch)) ELSE S1
 
@@ -491,8 +540,12 @@ LWatch1(S, l, k) ==
                                    !.pendSub[l] = None]
                    ELSE S1
              c == Cands(S2, l)
-             first == LET o == SelectSeq(S2.order, LAMBDA x : x \in S2.children)
-                      IN IF o = <<>> THEN None ELSE o[1]
+             \* HashRank: the lowest-ranked MEMBER never moves on late media
+             \* (computable by everyone); else P's oldest child (the rank rides
+             \* the Admit, a wire addition)
+             first == IF HashRank THEN RankSeq[1]
+                      ELSE LET o == SelectSeq(S2.order, LAMBDA x : x \in S2.children)
+                           IN IF o = <<>> THEN None ELSE o[1]
              relays == SelectSeq(c, LAMBDA x : x /= "P")
          IN IF S2.pendSub[l] = None /\ S2.parent[l] = None /\ c /= <<>>
             THEN Subscribe(S2, l, Pick(c, k))
@@ -527,11 +580,13 @@ Window(S, ch) ==
     ELSE LET \* any widening waits out the probe backoff: 2 windows x 2^fails
              \* since the last congestion (a late move is one, ReceiverMoves)
              calm == S.now - Max(S.lastCong, S.lastWiden) >= 2 * WindowTicks * 2^S.probeFails
-             r1 == IF S.demand /\ S.room < NL /\ (calm \/ ~ReceiverMoves) THEN S.room + 1 ELSE S.room
+             r1 == IF S.demand /\ S.room < NL /\ (calm \/ ~ProbeBackoff) THEN S.room + 1 ELSE S.room
              \* SlowStart: two clean windows since the last congestion and the
              \* last widening prove the room it has; widen by one stream (the
              \* probe is the widening; a stall takes it back).
-             probe == SlowStart /\ r1 = S.room /\ r1 < NL /\ calm   \* one stream a window
+             probe == SlowStart /\ r1 = S.room /\ r1 < NL   \* one stream a window
+                      /\ (IF ProbeBackoff THEN calm
+                          ELSE S.now - Max(S.lastCong, S.lastWiden) >= 2 * WindowTicks)
              r2 == IF probe THEN r1 + 1 ELSE r1
              r3 == IF ~SlowStart /\ S.lastCong >= 0 /\ S.now - S.lastCong >= CeilingStale
                    THEN NL ELSE r2
@@ -585,6 +640,18 @@ Drain(S) ==
 \* Bookkeeping: how long a listener has been in two ledgers at once.
 InLedger(S, x, l) == IF x = "P" THEN l \in S.children \/ S.drainTo[l] >= S.now
                      ELSE l \in S.relayKids[x]
+Max0(X) == IF X = {} THEN 0 ELSE CHOOSE x \in X : \A y \in X : x >= y
+\* The stall shed's gap: the longest stretch a live listener goes without a
+\* new tick of P's media inside the capped window, and how long a listener
+\* sits with no parent, nothing pending, and a viable member offering.
+Gaps(S) ==
+    [S EXCEPT !.maxMediaGap = IF InWin(S.now) /\ S.now > CapAt
+                              THEN Max(@, Max0({S.now - S.lastNewAt[c] : c \in {x \in L : Alive(S, x)}}))
+                              ELSE @,
+              !.idleCand = [c \in L |->
+                  IF Alive(S, c) /\ S.parent[c] = None /\ S.pendSub[c] = None
+                     /\ Cands(S, c) /= <<>> THEN @[c] + 1 ELSE 0]]
+
 Dual(S) == [S EXCEPT !.dual = [l \in L |->
                 IF Cardinality({x \in Nodes \ {l} : InLedger(S, x, l)}) > 1
                 THEN @[l] + 1 ELSE 0]]
@@ -595,7 +662,6 @@ Dual(S) == [S EXCEPT !.dual = [l \in L |->
 (* `bad` (the properties a behaviour has violated so far) and read it at  *)
 (* the terminal states without TLC stopping at the first violation.      *)
 -----------------------------------------------------------------------------
-QDelayS(S) == IF S.backlog = 0 THEN 0 ELSE (S.backlog - 1) \div Rate(S.now)
 AliveLS(S) == {c \in L : Alive(S, c)}
 DirectS(S) == {c \in AliveLS(S) : S.parent[c] = "P"}
 OverS(S) == S.now = Horizon
@@ -612,6 +678,13 @@ KeepsOneChildS(S) == ~S.zeroShed
 NeverTwoParentsS(S) == \A c \in L : S.dual[c] <= 2 + S.maxQd
 \* Make-before-break: a child P shed keeps P's media until it has moved.
 MakeBeforeBreakS(S) == \A c \in AliveLS(S) : S.shedPend[c] /\ S.up[<<"P", c>>] => S.drainTo[c] >= S.now
+\* The stall shed (a split of make-before-break, see the .md): never left
+\* without a parent while a viable member offers (beyond one watch tick).
+NoIdleWithOfferS(S) == \A c \in L : S.idleCand[c] <= 2 * WatchEvery   \* a refused subscribe costs one watch tick
+\* Every child a stall shed removed has a parent again within GapBound of the
+\* shed (it learns of the shed only when the notice leaves P's queue).
+StallShedGapS(S) == /\ S.maxParentGap <= GapBound
+                    /\ \A c \in AliveLS(S) : S.shedAtL[c] >= 0 => S.now - S.shedAtL[c] <= GapBound
 \* Every Channel message is proved or its link torn within the held bound.
 NothingWaitsForeverS(S) ==
     \A l \in {x \in Legs : Alive(S, x[1])} : \A i \in 1..Len(S.chan[l]) :
@@ -644,7 +717,8 @@ DeadDetectedS(S) ==
 Bad(S) ==
     {n \in {"NoSpuriousTeardown", "KeepsOneChild", "NeverTwoParents", "MakeBeforeBreak",
             "NothingWaitsForever", "ReparentBound", "EndParented", "EndHeard",
-            "EndFullFanOut", "DeadDetected", "EndQueueDrained"} :
+            "EndFullFanOut", "DeadDetected", "EndQueueDrained",
+            "NoIdleWithOffer", "StallShedGap"} :
         CASE n = "NoSpuriousTeardown" -> ~NoSpuriousTeardownS(S)
           [] n = "KeepsOneChild" -> ~KeepsOneChildS(S)
           [] n = "NeverTwoParents" -> ~NeverTwoParentsS(S)
@@ -655,7 +729,9 @@ Bad(S) ==
           [] n = "EndHeard" -> ~EndHeardS(S)
           [] n = "EndFullFanOut" -> ~EndFullFanOutS(S)
           [] n = "DeadDetected" -> ~DeadDetectedS(S)
-          [] n = "EndQueueDrained" -> ~EndQueueDrainedS(S)}
+          [] n = "EndQueueDrained" -> ~EndQueueDrainedS(S)
+          [] n = "NoIdleWithOffer" -> ~NoIdleWithOfferS(S)
+          [] n = "StallShedGap" -> ~StallShedGapS(S)}
 
 -----------------------------------------------------------------------------
 LegName(l) == l[1] \o ">" \o l[2]
@@ -670,8 +746,30 @@ Snap(S, T0) ==
      heard |-> S.heard, published |-> S.published,
      torn_now |-> {<<LegName(r.leg), r.why>> : r \in S.torn \ T0}]
 
+\* The call's own legs set up at the start (P's side queues): all at tick 0,
+\* or one P leg per StaggerTicks (StaggeredSetup). Order: P's legs, then the
+\* listeners' legs toward P.
+StartLegs == [i \in 1..(2 * NL) |-> IF i <= NL THEN <<"P", LSeq[i]>> ELSE <<LSeq[i - NL], "P">>]
+RECURSIVE SetupAll(_, _)
+SetupAll(S, i) == IF i > 2 * NL THEN S ELSE SetupAll(SetupCost(S, StartLegs[i]), i + 1)
+StartSetup(S) ==
+    IF SetupUnits = 0 THEN S
+    ELSE IF ~StaggeredSetup THEN (IF S.now = 0 THEN SetupAll(S, 1) ELSE S)
+    ELSE IF S.now % StaggerTicks = 0 /\ S.now \div StaggerTicks < 2 * NL
+         THEN SetupCost(S, StartLegs[S.now \div StaggerTicks + 1]) ELSE S
+
+\* ProbeTwoLegs: a small control frame every ProbeEvery on at most two of P's
+\* live legs with nothing unproved, so the verdict never waits for an offer.
+ProbeLegs(S) ==
+    LET idle == SelectSeq([i \in 1..NL |-> <<"P", LSeq[i]>>],
+                          LAMBDA l : S.up[l] /\ S.chan[l] = <<>>)
+        n == Min(2, Len(idle))
+        RECURSIVE Go(_, _)
+        Go(T, i) == IF i > n THEN T ELSE Go(SendCtrl(T, idle[i], Pay("probe")), i + 1)
+    IN IF ProbeTwoLegs /\ Alive(S, "P") /\ S.now % ProbeEvery = 0 THEN Go(S, 1) ELSE S
+
 Step(S, ch) ==
-    LET S1 == Timers(S, ch)
+    LET S1 == Timers(Flush(ProbeLegs(StartSetup(S))), ch)
         S2 == Flush(StaleLegs(S1))
         S3 == Redial(S2)
         S4 == Watch(S3, ch)
@@ -679,9 +777,10 @@ Step(S, ch) ==
         S6 == Offers(S5)
         S7 == Flush(Publish(S6))
         S8 == Drain(S7)
-        S9 == Dual(S8)
+        S9 == Gaps(Dual(S8))
         S10 == IF TraceOn THEN [S9 EXCEPT !.hist = Append(@, Snap(S9, S.torn))] ELSE S9
-        S11 == [S10 EXCEPT !.now = @ + 1, !.maxQd = Max(@, QDelayS(S10))]
+        S11 == [S10 EXCEPT !.now = @ + 1, !.maxQd = Max(@, QDelayS(S10)),
+                           !.fullAt = IF @ < 0 /\ \A c \in L : S10.parent[c] = "P" THEN S10.now ELSE @]
     IN [S11 EXCEPT !.bad = @ \cup Bad(S11)]
 
 \* The environment's and the code's free choices, ONE per behaviour (fixed
@@ -706,7 +805,10 @@ Init ==
     /\ lastAuth = [l \in Legs |-> -1]
     /\ peerAuth = [x \in Nodes |-> [y \in Nodes |-> -1]]
     /\ rxDelay = [c \in L |-> 0] /\ probeFails = 0 /\ lateMove = [c \in L |-> FALSE]
-    /\ maxQd = 0
+    /\ maxQd = 0 /\ firstVerdictAt = -1 /\ firstShedAt = -1 /\ firstShedQ = -1
+    /\ fullAt = -1 /\ lastSetupAt = -100
+    /\ shedAtL = [c \in L |-> -1] /\ maxParentGap = 0 /\ lastNewAt = [c \in L |-> 0]
+    /\ maxMediaGap = 0 /\ idleCand = [c \in L |-> 0]
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
     /\ children = {} /\ order = <<>> /\ drainTo = [c \in L |-> -1]
@@ -739,7 +841,11 @@ Assign(S) ==
     /\ chan' = S.chan /\ nextSeq' = S.nextSeq /\ rxNext' = S.rxNext
     /\ srtt8' = S.srtt8 /\ lastAuth' = S.lastAuth /\ peerAuth' = S.peerAuth
     /\ rxDelay' = S.rxDelay /\ probeFails' = S.probeFails /\ lateMove' = S.lateMove
-    /\ maxQd' = S.maxQd /\ dialAt' = S.dialAt
+    /\ maxQd' = S.maxQd /\ firstVerdictAt' = S.firstVerdictAt
+    /\ firstShedAt' = S.firstShedAt /\ firstShedQ' = S.firstShedQ
+    /\ fullAt' = S.fullAt /\ lastSetupAt' = S.lastSetupAt
+    /\ shedAtL' = S.shedAtL /\ maxParentGap' = S.maxParentGap /\ lastNewAt' = S.lastNewAt
+    /\ maxMediaGap' = S.maxMediaGap /\ idleCand' = S.idleCand /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden
@@ -812,7 +918,9 @@ Observed ==
      exhausted |-> Cardinality({r \in torn : r.why = "exhausted"}),
      direct |-> Cardinality(Direct),
      relayed |-> Cardinality({c \in AliveL : parent[c] \notin {None, "P"}}),
-     sheds |-> sheds, verdicts |-> verdicts, qdelay |-> QueueDelay,
+     sheds |-> sheds, verdicts |-> verdicts, qdelay |-> QueueDelay, max_qdelay |-> maxQd,
+     first_verdict |-> firstVerdictAt, first_shed |-> firstShedAt, q_at_shed |-> firstShedQ,
+     full_at |-> fullAt, parent_gap |-> maxParentGap, media_gap |-> maxMediaGap,
      heard_pct |-> [c \in L |-> IF published = 0 THEN 100 ELSE (100 * heard[c]) \div published]]
 \* One line per terminal state: the outcome, the violated set, what is observed.
 RecordOutcome == Over => PrintT(<<"OUTCOME", Outcome, bad, Observed>>)
@@ -830,4 +938,8 @@ T_EndHeard == EndHeard \/ Dump
 T_EndFullFanOut == EndFullFanOut \/ Dump
 T_DeadDetected == DeadDetected \/ Dump
 T_EndQueueDrained == EndQueueDrained \/ Dump
+NoIdleWithOffer == NoIdleWithOfferS(Rec)
+StallShedGap == StallShedGapS(Rec)
+T_NoIdleWithOffer == NoIdleWithOffer \/ Dump
+T_StallShedGap == StallShedGap \/ Dump
 =============================================================================

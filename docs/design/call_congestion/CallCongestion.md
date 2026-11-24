@@ -40,6 +40,9 @@ At the scale the cfgs use, **1 tick = 100 ms**. The values below are those of `r
 | `OfferEvery`, `StallOfferEvery` | 10, 50 | 1 s, 5 s | |
 | `RelaySlots` | 1 | a relay's cold-start trial slot (one stream) | it doubles after 2 clean windows in code; held at 1 here |
 | `DrainTicks` | 50 | `down_silence_ms` = 5 s | |
+| `RxDelayTicks` | 3 | - (proposed: 300 ms of media delay seen by a child) | ReceiverMoves |
+| `QTarget` | 5 | - (500 ms) | EndQueueDrained; RFC 8298's target is 50–100 ms, this bound is looser on purpose |
+| `Horizon` | 230 (200 for the conformance runs) | - | the cap holds 10..49 unless stated |
 | `Dwell` (s) | 20 | `min_dwell_ms` = 10 s | hides: a voluntary move back to P is 5× sooner than in code |
 | `CeilingStale` (s) | 20 | `CEILING_STALE_MS` = 60 s | hides: full fan-out returns 30× sooner than in code |
 | `DialMin`/`DialMax` | 10/80 | 1 s / 8 s | |
@@ -87,9 +90,11 @@ All switches are FALSE in the baseline, which is the code before any of today's 
 | `Hold113` | At the 5th timeout the leg is held while an authenticated packet arrived after the message's first send, up to `Stale` from that first send. | leviculum 206734977: `poll_with_inbound` channel/mod.rs:1034-1036 |
 | `ShedOnVerdict` | Shed at once on the verdict's rise, with the verdict latched `Latch` past its last detection. Off: the verdict only sets a flag, and the next egress window sheds. | calls2 WIP `alm.rs` `set_uplink_stall` / `fold_egress_window`; today `alm.rs:382` (flag) + `alm.rs:1588-1596` (window) |
 | `RoomKeepsOne` | A shed keeps exactly one direct child. Off: 0 or 1 (abstraction 7). | calls2 WIP: own room = one + reserve + external; today `alm.rs:1591-1611` + `admission.rs:456` |
-| `SlowStart` | P's first room is `InitFanout` (1). It grows by one stream per clean window with demand. Off: the room is the whole room (`PUBLISHER_INITIAL_FANOUT` = 8). | missing; today `alm.rs:322-323` |
+| `SlowStart` | P's first room is `InitFanout` (1). After two clean windows since the last congestion and the last widening, it widens by one stream (the probe is the widening; a stall or a late move takes it back). One stream a window at most. Off: the room is the whole room (`PUBLISHER_INITIAL_FANOUT` = 8), and it grows only on demand or when the ceiling goes stale. | missing; today `alm.rs:322-323` |
 | `RedialOnPathUp` | A torn leg redials the tick its path is back. Off: on the 1→8 s doubling backoff. | missing on the leg; today `av_call.rs:4276-4283`; the path release is `direct_path.rs:913` |
 | `ShedDrains` | A shed child is fed for `DrainTicks` or until it unsubscribes (make-before-break). Off: the stall shed removes it from the ledger and P stops at once. | missing for the stall shed: `admission.rs:905-914` removes without a drain; `shed_all_draining` `admission.rs:396` is the drained form (relay-off, tier 2) |
+| `PeerLiveness` | The hold (C3) counts an authenticated packet from the same peer on any leg: the peer's own leg's frames and datagrams, which decrypt under that leg's key, as well as this leg's proofs. | missing in leviculum (#113 option (a)); today the per-link `last_authenticated_inbound_ms` (channel/mod.rs:1034) |
+| `ReceiverMoves` | A child of P that is not P's first child, and that sees P's media arrive `RxDelayTicks` (300 ms) or more after it was sent, moves itself to a relay, keeping P until the relay admits. Its unsubscribe says "late" (`unsub_late`). P reads that as congestion: room = its current children, `lastCong` = now, and the probe backoff steps up. Any widening (P6's demand step, or the SlowStart probe) waits 2 windows × 2^fails, fails ≤ 2, stepping down after each widening that held. | missing in edge. The delay is readable: `on_chunk` carries `source_ms` (alm.rs). The rank of P's first child is a wire addition to the Admit. |
 | `CloseLost` (environment) | A LINKCLOSE never reaches the peer, which learns only by the stale bound. | CIRISEdge#1030 |
 
 ## Properties
@@ -103,10 +108,11 @@ The safety properties are checked at every state. The model folds them into `bad
 | `NeverTwoParents` | A listener sits in two forwarders' ledgers for at most 2 ticks plus P's queue delay. The parent variable is single-valued by construction. This is the ledger form. |
 | `MakeBeforeBreak` | A child P shed, while its leg is up, is still fed by P until it has moved. |
 | `NothingWaitsForever` | Every Channel message is proved, or its leg torn, within `Stale + HeldCap + Wait(5, cap)`. |
-| `ReparentBound` | At most `MaxReparents` (3) re-parentings per listener. The join counts as one. |
+| `ReparentBound` | At most `MaxReparents` re-parentings per listener: the join, the move to a relay, the move back after a lift, and two per probe. With the probe backoff at most ⌊log₂(H/2W)⌋+1 probes fit in a horizon H, so the bound is 3 + 2·(⌊log₂(H/20)⌋+1) (11 at H = 230). A bound logarithmic in the call's length is what "no oscillation" means here. |
 | `EndParented` | At the horizon every live listener has a parent. |
 | `EndHeard` | At the horizon every live listener heard at least 70 % of what P published in the window. |
-| `EndFullFanOut` | `RecoverBy` (45 ticks) after the cap lifts, every live listener's parent is P. |
+| `EndFullFanOut` | `RecoverBy` ticks after the cap lifts, every live listener's parent is P. `RecoverBy` is stated per configuration: the latch (20) + a window (10) + the dwell (20) + a window (10) + the widenings. With SlowStart and the backoff, the widenings are 2W·4 + 2W·2 = 120; without SlowStart, the ceiling staleness (20). That gives 180 or 80 ticks at N=4. In code scale: about 2 + 1 + 10 + 1 + 8 + 4 ≈ 26 s with SlowStart, and about 60 + 10 + 4 ≈ 74 s without (the real dwell and staleness). |
+| `EndQueueDrained` | At the end, P's queue delay is at most `QTarget` (500 ms), unless a widening is less than `Dwell` + 4 windows old (a probe still playing out). |
 | `DeadDetected` | `DeadBound` after a node dies, every leg toward it is down at the live dialer, and every leg from it at the live receiver. `DeadBound` = an offer period + twice the retry span at the learned cap + the stale bound: the bound the code has today, so the fixes must not stretch it (#1030). |
 
 Terminal outcomes (the `Outcome` probe):
@@ -193,6 +199,16 @@ The status column says one of three things:
 | L2 | a redial is due | the path is not back yet | the dial fails; the backoff doubles 1→8 s | `RedialOver` failure branch | edge av_call.rs:4253-4285 | implemented (F6: 15.5 s to recover) |
 | L3 | the path is back (re-punched) | the leg is down | **dial now** | `DialDue` with `RedialOnPathUp` | none | **missing** |
 | L4 | a new leg is up | - | a fresh Channel (SRTT unknown) | `RedialOver` success | lev link establish | implemented. **Model note:** the learned delay is lost with the old link: the new leg starts at the 100 ms floor, into a queue that may still be long. |
+
+### Rows the model added (missing in code)
+
+| # | Input | State | Action | Model | Code | Status |
+|---|---|---|---|---|---|---|
+| N1 | the timer fires at try ≥ 5 | an authenticated packet from the same PEER on any leg arrived after the first send | hold, as C3 | `Held` with `PeerLiveness` (`peerAuth`) | lev: extend `poll_with_inbound`'s `authenticated_inbound_ms` to the peer's newest authenticated time across its links (link_management.rs:4692-4715 passes per-link today) | **missing** |
+| N2 | a chunk of P's stream arrives directly from P, `now − source_ms ≥ 300 ms` | this node is P's child and not P's first child; a relay offers room | subscribe to the relay; keep P until it admits; then unsubscribe P with reason "late" | `LWatch1` ReceiverMoves branch, `OnAdmit` (`unsub_late`) | edge alm.rs `on_chunk` (has `source_ms`) → selector; a `late` unsubscribe code in C3 (wire.rs) | **missing** |
+| N3 | a "late" unsubscribe | - | drop the child; room = current children; congested now; probe backoff + 1 (max 2) | `Handle` "unsub_late" | admission.rs (a new input beside `on_egress_window`) | **missing** |
+| N4 | the egress window closes, no stall | the room may widen (demand, or the SlowStart probe) | widen by at most one stream, and only after 2 windows × 2^fails since the last congestion or widening; a widening after one that held steps fails down | `Window` (`calm`, `probeFails`) | admission.rs:854-875 (demand additive increase has no backoff today) | **missing** |
+| N5 | P's first child | - | P tells each child its admission rank (or "first") in the Admit, so only the others move on N2 | `first` read from P's order | wire.rs Admit; selector | **missing** (wire addition) |
 
 ### Not in the model, but on this path
 

@@ -11,9 +11,19 @@ CONSTANTS
     RedialOnPathUp = @RPU@
     ShedDrains = @DRAIN@
     PeerLiveness = @PEER@
+    ProbeBackoff = @PBO@
+    HashRank = @HASH@
+    RankSeq <- @RANK@
+    StaggeredSetup = @STAG@
+    StaggerTicks = 3
+    SetupUnits = @SETUP@
+    SerialRedial = @SERIAL@
+    ProbeTwoLegs = @PROBE2@
+    ProbeEvery = 2
     ReceiverMoves = @RXMOVE@
     RxDelayTicks = 3
     QTarget = 5
+    GapBound = @GAP@
     CloseLost = @CLOSELOST@
     M = 3
     RCap = @RCAP@
@@ -34,12 +44,12 @@ CONSTANTS
     WindowTicks = 10
     OfferEvery = 10
     StallOfferEvery = 50
-    InitFanout = 1
+    InitFanout = @INIT@
     RelaySlots = @SLOTS@
     MaxDepth = 3
     DrainTicks = 50
-    Dwell = 20
-    CeilingStale = 20
+    Dwell = @DWELL@
+    CeilingStale = @CSTALE@
     DownSilence = 50
     SubTimeout = 20
     Backoff = 5

@@ -1,0 +1,1131 @@
+{
+ "smoke-baseline": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 462,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 1,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 1
+  },
+  "errors": [],
+  "params": {
+   "PPH": "{3}",
+   "LPH": "{0}",
+   "WPH": "{0}",
+   "NPICK": "1",
+   "PUNCH": "{10}"
+  }
+ },
+ "baseline": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 48,
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 56,
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 24,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 64,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 72,
+   "Collapsed [NoSpuriousTeardown]": 56
+  },
+  "errors": [],
+  "params": {}
+ },
+ "only-ReceiptsPerAttempt": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 32,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 48,
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 52,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 76,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 80,
+   "Collapsed [NoSpuriousTeardown]": 32
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE"
+  }
+ },
+ "only-RtoLearnsDelay": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 56,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 48,
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 24,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 64,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 72,
+   "Collapsed [NoSpuriousTeardown]": 56
+  },
+  "errors": [],
+  "params": {
+   "RTO": "TRUE"
+  }
+ },
+ "only-Hold113": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 56,
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 24,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 48,
+   "Collapsed [NoSpuriousTeardown]": 56,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 72,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 64
+  },
+  "errors": [],
+  "params": {
+   "HOLD": "TRUE"
+  }
+ },
+ "only-ShedOnVerdict": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 40,
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 80,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 120,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 80
+  },
+  "errors": [],
+  "params": {
+   "SOV": "TRUE"
+  }
+ },
+ "only-RoomKeepsOne": {
+  "violated": [
+   "EndHeard",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 56,
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 12,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 64,
+   "Collapsed [NoSpuriousTeardown]": 28
+  },
+  "errors": [],
+  "params": {
+   "RKO": "TRUE"
+  }
+ },
+ "only-SlowStart": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NeverTwoParents",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 26,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 32,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 54,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 60,
+   "Collapsed [NoSpuriousTeardown]": 32,
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 24,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NeverTwoParents,NoSpuriousTeardown]": 8,
+   "Collapsed [EndHeard,NeverTwoParents,NoSpuriousTeardown]": 8,
+   "Collapsed [NeverTwoParents,NoSpuriousTeardown]": 8,
+   "Collapsed [EndHeard,MakeBeforeBreak,NeverTwoParents,NoSpuriousTeardown]": 28,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NeverTwoParents,NoSpuriousTeardown]": 28,
+   "Collapsed [MakeBeforeBreak,NeverTwoParents,NoSpuriousTeardown]": 12
+  },
+  "errors": [],
+  "params": {
+   "SS": "TRUE"
+  }
+ },
+ "only-RedialOnPathUp": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 24,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 48,
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 56,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 72,
+   "Collapsed [NoSpuriousTeardown]": 56,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 64
+  },
+  "errors": [],
+  "params": {
+   "RPU": "TRUE"
+  }
+ },
+ "only-ShedDrains": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 64,
+   "Collapsed [EndHeard,KeepsOneChild,NoSpuriousTeardown]": 36,
+   "Collapsed [KeepsOneChild,NoSpuriousTeardown]": 84,
+   "Collapsed [NoSpuriousTeardown]": 136
+  },
+  "errors": [],
+  "params": {
+   "DRAIN": "TRUE"
+  }
+ },
+ "only-PeerLiveness": {
+  "violated": [
+   "KeepsOneChild",
+   "MakeBeforeBreak"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 50716,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut [MakeBeforeBreak]": 96,
+   "FullFanOut [KeepsOneChild,MakeBeforeBreak]": 88
+  },
+  "errors": [],
+  "params": {
+   "PEER": "TRUE"
+  }
+ },
+ "only-ReceiverMoves": {
+  "violated": [
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [NoSpuriousTeardown]": 199,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 120,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 1
+  },
+  "errors": [],
+  "params": {
+   "RXMOVE": "TRUE"
+  }
+ },
+ "pin-c8699c3d6": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 24,
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 56,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 48,
+   "Collapsed [NoSpuriousTeardown]": 56,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 72,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 64
+  },
+  "errors": [],
+  "params": {
+   "HOLD": "TRUE"
+  }
+ },
+ "pin-c75fdeb01": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 52,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 44,
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 32,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 84,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 76,
+   "Collapsed [NoSpuriousTeardown]": 32
+  },
+  "errors": [],
+  "params": {
+   "HOLD": "TRUE",
+   "RPA": "TRUE"
+  }
+ },
+ "pin-c75fdeb01+edge-wip": {
+  "violated": [
+   "EndHeard",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 35808,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 40,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 112
+  },
+  "errors": [],
+  "params": {
+   "HOLD": "TRUE",
+   "RPA": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE"
+  }
+ },
+ "six-on": {
+  "violated": [
+   "EndHeard",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 31744,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut [MakeBeforeBreak]": 112,
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 2,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 14
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE"
+  }
+ },
+ "eight-on": {
+  "violated": [
+   "EndHeard",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 29824,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 2,
+   "FullFanOut": 104,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 6,
+   "Collapsed [NoSpuriousTeardown]": 4
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE"
+  }
+ },
+ "all-on": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE"
+  }
+ },
+ "all-but-ReceiptsPerAttempt": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36448,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 156
+  },
+  "errors": [],
+  "params": {
+   "RPA": "FALSE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE"
+  }
+ },
+ "all-but-RtoLearnsDelay": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 35352,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 148
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "FALSE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE"
+  }
+ },
+ "all-but-ShedOnVerdict": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "FALSE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE"
+  }
+ },
+ "all-but-RoomKeepsOne": {
+  "violated": [
+   "KeepsOneChild"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 256,
+   "FullFanOut [KeepsOneChild]": 64
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "FALSE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE"
+  }
+ },
+ "all-but-SlowStart": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 32760,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 136
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "FALSE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE"
+  }
+ },
+ "all-but-RedialOnPathUp": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "FALSE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE"
+  }
+ },
+ "all-but-Hold113": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "FALSE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE"
+  }
+ },
+ "all-but-ShedDrains": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "FALSE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE"
+  }
+ },
+ "all-but-PeerLiveness": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "FALSE",
+   "RXMOVE": "TRUE"
+  }
+ },
+ "all-but-ReceiverMoves": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 29136,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 112
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "FALSE"
+  }
+ },
+ "start-capped-baseline": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 16,
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 32,
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 16,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 104,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 88,
+   "Collapsed [NoSpuriousTeardown]": 64
+  },
+  "errors": [],
+  "params": {
+   "CAPAT": "0"
+  }
+ },
+ "start-capped-six-on": {
+  "violated": [
+   "MakeBeforeBreak"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 34944,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut [MakeBeforeBreak]": 148
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "CAPAT": "0"
+  }
+ },
+ "start-capped-all-on": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "CAPAT": "0"
+  }
+ },
+ "start-capped-all-but-SlowStart": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 30112,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 120
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "FALSE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "CAPAT": "0"
+  }
+ },
+ "cap-stays-eight-on": {
+  "violated": [
+   "EndHeard",
+   "EndParented",
+   "EndQueueDrained",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 2,
+   "Collapsed [EndHeard,EndQueueDrained,NoSpuriousTeardown]": 1,
+   "Relayed(direct=1) [EndQueueDrained]": 80,
+   "Relayed(direct=1)": 32,
+   "FullFanOut": 20,
+   "Collapsed [EndQueueDrained,NoSpuriousTeardown]": 4,
+   "Collapsed [EndQueueDrained,MakeBeforeBreak,NoSpuriousTeardown]": 6,
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 3,
+   "Relayed(direct=1) [EndQueueDrained,MakeBeforeBreak]": 6,
+   "Stranded [EndParented]": 4,
+   "Starved [EndHeard,EndQueueDrained,MakeBeforeBreak]": 2
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "CAPUNTIL": "1000"
+  }
+ },
+ "cap-stays-all-on": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "Relayed(direct=1)": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "CAPUNTIL": "1000"
+  }
+ },
+ "rcap3-all-on": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 35680,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 152
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "RCAP": "3"
+  }
+ },
+ "rcap5-all-on": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "RCAP": "5"
+  }
+ },
+ "n3-baseline": {
+  "violated": [
+   "EndHeard",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 73920,
+  "depth": 231,
+  "outcomes": {
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 44,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 12,
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 40,
+   "Collapsed [NoSpuriousTeardown]": 40,
+   "Collapsed [MakeBeforeBreak,NoSpuriousTeardown]": 76,
+   "Collapsed [KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 108
+  },
+  "errors": [],
+  "params": {
+   "LSEQ": "Listeners2"
+  }
+ },
+ "n3-all-on": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "LSEQ": "Listeners2"
+  }
+ },
+ "dead-B-baseline": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": null,
+  "depth": null,
+  "outcomes": {},
+  "errors": [
+   "Error: Assumption line 156, col 8 to line 157, col 71 of module CallCongestion is false."
+  ],
+  "params": {
+   "DEAD": "\"B\"",
+   "DEADAT": "30",
+   "STALE": "40",
+   "SRTTCAP": "6",
+   "CAPAT": "1000",
+   "CAPUNTIL": "1000"
+  }
+ },
+ "dead-B-all-on": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": null,
+  "depth": null,
+  "outcomes": {},
+  "errors": [
+   "Error: Assumption line 156, col 8 to line 157, col 71 of module CallCongestion is false."
+  ],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "DEAD": "\"B\"",
+   "DEADAT": "30",
+   "STALE": "40",
+   "SRTTCAP": "6",
+   "CAPAT": "1000",
+   "CAPUNTIL": "1000"
+  }
+ },
+ "dead-B-all-on-close-lost": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": null,
+  "depth": null,
+  "outcomes": {},
+  "errors": [
+   "Error: Assumption line 156, col 8 to line 157, col 71 of module CallCongestion is false."
+  ],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "CLOSELOST": "TRUE",
+   "DEAD": "\"B\"",
+   "DEADAT": "30",
+   "STALE": "40",
+   "SRTTCAP": "6",
+   "CAPAT": "1000",
+   "CAPUNTIL": "1000"
+  }
+ },
+ "dead-B-capped-all-on": {
+  "violated": [
+   "NeverTwoParents"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut [NeverTwoParents]": 44,
+   "Relayed(direct=1) [NeverTwoParents]": 112,
+   "Relayed(direct=1)": 4
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "DEAD": "\"B\"",
+   "DEADAT": "30",
+   "STALE": "40",
+   "SRTTCAP": "6",
+   "CAPAT": "10",
+   "CAPUNTIL": "1000"
+  }
+ },
+ "close-lost-all-on": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "CLOSELOST": "TRUE"
+  }
+ },
+ "watch3-all-on": {
+  "violated": [],
+  "temporal": [],
+  "finished": true,
+  "distinct": 36960,
+  "depth": 231,
+  "outcomes": {
+   "FullFanOut": 160
+  },
+  "errors": [],
+  "params": {
+   "RPA": "TRUE",
+   "RTO": "TRUE",
+   "SOV": "TRUE",
+   "RKO": "TRUE",
+   "SS": "TRUE",
+   "RPU": "TRUE",
+   "HOLD": "TRUE",
+   "DRAIN": "TRUE",
+   "PEER": "TRUE",
+   "RXMOVE": "TRUE",
+   "WATCH": "3"
+  }
+ },
+ "conf-run1": {
+  "violated": [
+   "EndHeard",
+   "EndParented",
+   "EndQueueDrained",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NeverTwoParents",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 64320,
+  "depth": 201,
+  "outcomes": {
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 125,
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 32,
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 124,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NeverTwoParents,NoSpuriousTeardown]": 1,
+   "Collapsed [EndHeard,EndParented,MakeBeforeBreak,NoSpuriousTeardown]": 15,
+   "Collapsed [EndHeard,EndQueueDrained,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 8,
+   "Collapsed [EndHeard,EndQueueDrained,MakeBeforeBreak,NoSpuriousTeardown]": 5,
+   "Collapsed [EndHeard,EndParented,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 10
+  },
+  "errors": [],
+  "params": {
+   "HOLD": "TRUE",
+   "CAPUNTIL": "1000",
+   "HORIZON": "200"
+  }
+ },
+ "conf-run2": {
+  "violated": [
+   "EndHeard",
+   "EndParented",
+   "EndQueueDrained",
+   "KeepsOneChild",
+   "MakeBeforeBreak",
+   "NeverTwoParents",
+   "NoSpuriousTeardown"
+  ],
+  "temporal": [],
+  "finished": true,
+  "distinct": 64320,
+  "depth": 201,
+  "outcomes": {
+   "Collapsed [EndHeard,MakeBeforeBreak,NoSpuriousTeardown]": 106,
+   "Collapsed [EndHeard,NoSpuriousTeardown]": 48,
+   "Collapsed [EndHeard,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 122,
+   "Collapsed [EndHeard,EndQueueDrained,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 12,
+   "Collapsed [EndHeard,EndQueueDrained,MakeBeforeBreak,NoSpuriousTeardown]": 20,
+   "Collapsed [EndHeard,EndParented,MakeBeforeBreak,NoSpuriousTeardown]": 4,
+   "Collapsed [EndHeard,EndParented,KeepsOneChild,MakeBeforeBreak,NoSpuriousTeardown]": 2,
+   "Collapsed [EndHeard,MakeBeforeBreak,NeverTwoParents,NoSpuriousTeardown]": 6
+  },
+  "errors": [],
+  "params": {
+   "HOLD": "TRUE",
+   "RPA": "TRUE",
+   "CAPUNTIL": "1000",
+   "HORIZON": "200"
+  }
+ }
+}

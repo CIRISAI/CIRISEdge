@@ -31,16 +31,19 @@ GUARD = os.path.expanduser("~/CIRISGrace/bin/cargo_guard.sh")
 CAP_SECS = 5400
 
 ALL_OFF = dict(RPA="FALSE", RTO="FALSE", HOLD="FALSE", SOV="FALSE", RKO="FALSE",
-               SS="FALSE", RPU="FALSE", DRAIN="FALSE", PEER="FALSE", RXMOVE="FALSE")
+               SS="FALSE", RPU="FALSE", DRAIN="FALSE", PEER="FALSE", RXMOVE="FALSE",
+               PBO="FALSE", HASH="FALSE", STAG="FALSE", SERIAL="FALSE", PROBE2="FALSE")
 SWITCH = dict(RPA="ReceiptsPerAttempt", RTO="RtoLearnsDelay", HOLD="Hold113",
               SOV="ShedOnVerdict", RKO="RoomKeepsOne", SS="SlowStart",
               RPU="RedialOnPathUp", DRAIN="ShedDrains", PEER="PeerLiveness",
-              RXMOVE="ReceiverMoves")
+              RXMOVE="ReceiverMoves", PBO="ProbeBackoff", HASH="HashRank",
+              STAG="StaggeredSetup", SERIAL="SerialRedial", PROBE2="ProbeTwoLegs")
 INVS = "TypeOK RecordOutcome"   # the properties fold into `bad`, read per terminal state
-BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RCAP="4", CAPAT="10",
+BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4", CAPAT="10",
             CAPUNTIL="50", HORIZON="230", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
-            LPH="{0, 5}", WPH="{0, 5}", NPICK="2", MAXREP="3", DEAD='"none"',
+            LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
+            DWELL="20", CSTALE="20", GAP="15",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -51,78 +54,94 @@ def on(*keys):
 # Today's code at each pin, as switches (CallCongestion.md, "The switches").
 TODAY_LEV_C86 = on("HOLD")                    # leviculum c8699c3d6 (#113 hold only)
 TODAY_LEV_C75 = on("HOLD", "RPA")             # leviculum c75fdeb01 (+ per-attempt receipts)
-EDGE_WIP = on("SOV", "RKO")                   # calls2's uncommitted alm.rs (shed on rise, latch, room)
+EDGE_WIP = on("SOV", "RKO")                   # calls2's alm.rs (shed on rise, latch, room)
 SIX = on("RPA", "RTO", "SOV", "RKO", "SS", "RPU")       # the brief's six
 EIGHT = dict(SIX, **on("HOLD", "DRAIN"))                # + the #113 hold, make-before-break
-ALL = dict(EIGHT, **on("PEER", "RXMOVE"))               # + the two the model found missing
+ALL = dict(EIGHT, **on("PEER", "RXMOVE", "PBO"))        # + what the model found missing
+# The lead's proposed minimum for 45.2.0's safety properties.
+MIN = on("PEER", "SOV", "RKO", "PBO", "SERIAL")
+SETUP = dict(SETUP="40")                      # ~1 s of P's queue per leg set up (F11)
 
 
 def scenarios():
     yield "smoke-baseline", dict(PPH="{3}", LPH="{0}", WPH="{0}", NPICK="1", PUNCH="{10}")
     yield "baseline", {}
-    # One switch at a time on the baseline: which failure each removes alone.
     for k in SWITCH:
         yield f"only-{SWITCH[k]}", on(k)
-    # The pins measured today.
     yield "pin-c8699c3d6", TODAY_LEV_C86
     yield "pin-c75fdeb01", TODAY_LEV_C75
     yield "pin-c75fdeb01+edge-wip", dict(TODAY_LEV_C75, **EDGE_WIP)
-    # Cumulative: the brief's six, + hold and drain, + the two new ones.
     yield "six-on", SIX
     yield "eight-on", EIGHT
     yield "all-on", ALL
-    # Leave one out of all-on: what each switch is still needed for.
     for k in ALL:
         yield f"all-but-{SWITCH[k]}", dict(ALL, **{k: "FALSE"})
-    # The cap from the first tick (slow start's case) and a cap that stays.
-    yield "start-capped-baseline", dict(CAPAT="0")
-    yield "start-capped-six-on", dict(SIX, CAPAT="0")
-    yield "start-capped-all-on", dict(ALL, CAPAT="0")
-    yield "start-capped-all-but-SlowStart", dict(ALL, SS="FALSE", CAPAT="0")
-    yield "cap-stays-eight-on", dict(EIGHT, CAPUNTIL="1000")
+    # ReceiverMoves without the wire addition: a rank every member computes.
+    yield "all-on-hashrank", dict(ALL, HASH="TRUE")
+    yield "cap-stays-all-on-hashrank", dict(ALL, HASH="TRUE", CAPUNTIL="1000")
+    # The minimum safety set, and its leave-one-outs (with and without setup cost).
+    for tag, extra in [("", {}), ("-setup", SETUP)]:
+        yield f"min{tag}", dict(MIN, **extra)
+        for k in MIN:
+            yield f"min{tag}-but-{SWITCH[k]}", dict(MIN, **{k: "FALSE"}, **extra)
+        yield f"cap-stays-min{tag}", dict(MIN, CAPUNTIL="1000", **extra)
+    yield "peer-only-setup", dict(on("PEER"), **SETUP)
+    # Setup cost (F11) and the redial storm.
+    yield "baseline-setup", SETUP
+    yield "all-on-setup", dict(ALL, **SETUP)
+    yield "all-on-setup-serial", dict(ALL, SERIAL="TRUE", **SETUP)
+    # A call that STARTS on a weak uplink (its own legs' setup in the queue).
+    for stag in ["FALSE", "TRUE"]:
+        t = "stag" if stag == "TRUE" else "burst"
+        yield f"start-weak-{t}-min", dict(MIN, CAPAT="0", STAG=stag, **SETUP)
+        yield f"start-weak-{t}-all-on", dict(ALL, CAPAT="0", STAG=stag, **SETUP)
+    # The first room (probe) at 1, 2, N: time on a relay at the start vs peak queue.
+    for n in ["1", "2", "3"]:
+        yield f"probe{n}-uncapped", dict(ALL, INIT=n, CAPAT="1000", CAPUNTIL="1000")
+        yield f"probe{n}-start-capped", dict(ALL, INIT=n, CAPAT="0")
+    # The shed alone (SOV + RKO, receipts in, no peer hold): queue depth at the
+    # shed and its peak, by overload (RCap 3 = 3.0x, 4 = 2.25x, 5 = 1.8x, 6 = 1.5x)
+    # and by verdict latency (the offer phases); and with ProbeTwoLegs.
+    for r in ["3", "4", "5", "6"]:
+        yield f"shed-alone-rcap{r}", dict(on("RPA", "SOV", "RKO"), RCAP=r)
+        yield f"shed-probe2-rcap{r}", dict(on("RPA", "SOV", "RKO", "PROBE2"), RCAP=r)
     yield "cap-stays-all-on", dict(ALL, CAPUNTIL="1000")
-    # Uplink sizes: one copy exactly, and 1.67 copies.
-    yield "rcap3-all-on", dict(ALL, RCAP="3")
-    yield "rcap5-all-on", dict(ALL, RCAP="5")
-    # Three people.
-    yield "n3-baseline", dict(LSEQ="Listeners2")
-    yield "n3-all-on", dict(ALL, LSEQ="Listeners2")
-    # A dead peer (#1030): the fixes must not hide it. No cap, so a teardown
-    # is only the dead peer's; the stale bound and the SRTT cap scaled
-    # together (the ASSUME of ChannelHold.tla).
+    yield "start-capped-all-on", dict(ALL, CAPAT="0")
+    yield "n3-baseline", dict(LSEQ="Listeners2", RANK="Rank2")
+    yield "n3-all-on", dict(ALL, LSEQ="Listeners2", RANK="Rank2")
+    # A dead peer (#1030): the fixes must not hide it (evidence stops => the
+    # hold stops). No cap; the stale bound and the SRTT cap scaled together.
     dead = dict(DEAD='"B"', DEADAT="30", STALE="40", SRTTCAP="6", CAPAT="1000", CAPUNTIL="1000")
     yield "dead-B-baseline", dead
+    yield "dead-B-peer-only", dict(on("PEER"), **dead)
     yield "dead-B-all-on", dict(ALL, **dead)
     yield "dead-B-all-on-close-lost", dict(ALL, CLOSELOST="TRUE", **dead)
     yield "dead-B-capped-all-on", dict(ALL, **dict(dead, CAPAT="10"))
-    # A close that never arrives (#1030) with everyone alive.
     yield "close-lost-all-on", dict(ALL, CLOSELOST="TRUE")
-    # The watch tick at 300 ms instead of 200 ms (it is 250 ms in code).
     yield "watch3-all-on", dict(ALL, WATCH="3")
-    # Conformance: the recorded runs' shape (the cap stays on to the end).
+    # The dwell and the ceiling staleness at the code's values (10 s, 60 s).
+    yield "unscaled-all-on", dict(ALL, DWELL="100", CSTALE="600", HORIZON="330")
+    yield "unscaled-min", dict(MIN, DWELL="100", CSTALE="600", HORIZON="330")
     yield "conf-run1", dict(TODAY_LEV_C86, CAPUNTIL="1000", HORIZON="200")
     yield "conf-run2", dict(TODAY_LEV_C75, CAPUNTIL="1000", HORIZON="200")
-    # Wide: every listener its own offer phase and tie-break (chunked by P's
-    # phase), for the configurations the report leans on.
-    for n, p in [("baseline", {}), ("pin-c75fdeb01", TODAY_LEV_C75), ("all-on", ALL)]:
+    for n, p in [("baseline", {}), ("pin-c75fdeb01", TODAY_LEV_C75), ("all-on", ALL), ("min", MIN)]:
         yield f"wide-{n}", dict(p, WIDE="TRUE")
 
 
 def recover_by(p):
-    """EndFullFanOut's bound (ticks after the cap lifts): two windows for the
-    verdict to clear, the dwell, and the widenings. With SlowStart each added
-    stream waits out the probe backoff (2 windows x 2^fails, fails <= 2,
-    stepping down after each probe that held); without it, the ceiling's
-    staleness."""
+    """EndFullFanOut's bound (ticks after the cap lifts): the verdict's latch
+    (20) and the window it closes in (10), the dwell and a window for the
+    move, and the widenings: with SlowStart one stream per two clean windows,
+    each waiting out the probe backoff (2W x 2^fails, fails <= 2, stepping
+    down after each probe that held); without it, the ceiling's staleness."""
     n = 2 if p["LSEQ"] == "Listeners2" else 3
+    w = 10
     if p["SS"] == "TRUE":
-        fmax = 2 if p["RXMOVE"] == "TRUE" else 0
-        grow = sum(2 * 10 * 2 ** max(0, fmax - i) for i in range(n - 1))
+        fmax = 2 if p["PBO"] == "TRUE" else 0
+        grow = sum(2 * w * 2 ** max(0, fmax - i) for i in range(max(0, n - int(p["INIT"]))))
     else:
-        grow = 20
-    # the verdict's latch (20) and the window it closes in (10), then the
-    # dwell (20) and a window for the move, plus the widenings
-    return str(20 + 10 + 20 + 10 + grow)
+        grow = int(p["CSTALE"])
+    return str(20 + w + int(p["DWELL"]) + w + grow)
 
 
 def max_reparents(p):
@@ -355,7 +374,41 @@ def trace(outdir, name, prop):
     print(out if out else text[-1500:])
 
 
+PROPS_ORDER = ["NoSpuriousTeardown", "KeepsOneChild", "NeverTwoParents", "MakeBeforeBreak",
+               "StallShedGap", "NoIdleWithOffer",
+               "NothingWaitsForever", "ReparentBound", "EndParented", "EndHeard",
+               "EndFullFanOut", "EndQueueDrained", "DeadDetected"]
+SHORT = dict(StallShedGap="Gap", NoIdleWithOffer="Idle", NoSpuriousTeardown="NoTear", KeepsOneChild="One", NeverTwoParents="Two",
+             MakeBeforeBreak="MBB", NothingWaitsForever="Wait", ReparentBound="Rep",
+             EndParented="Par", EndHeard="Heard", EndFullFanOut="Full",
+             EndQueueDrained="Queue", DeadDetected="Dead")
+
+
+def grid(results):
+    """Scenario x property: ok, or the share of terminal states that broke it."""
+    head = "| scenario | " + " | ".join(SHORT[p] for p in PROPS_ORDER) + " | outcomes | states |"
+    out = [head, "|---" * (len(PROPS_ORDER) + 3) + "|"]
+    for name, r in results.items():
+        total = sum(r["outcomes"].values()) or 1
+        cells = []
+        for prop in PROPS_ORDER:
+            bad = sum(v for k, v in r["outcomes"].items() if "[" in k and prop in k.split("[")[1])
+            cells.append("ok" if bad == 0 else f"**{bad}/{total}**")
+        oc = {}
+        for k, v in r["outcomes"].items():
+            kk = k.split(" [")[0]
+            oc[kk] = oc.get(kk, 0) + v
+        ocs = ", ".join(f"{k} {v}" for k, v in sorted(oc.items()))
+        run = f"{r['distinct']}" + ("" if r["finished"] else " PARTIAL") + (" ERR" if r.get("errors") else "")
+        out.append(f"| {name} | " + " | ".join(cells) + f" | {ocs} | {run} |")
+    return "\n".join(out) + "\n"
+
+
 def table(results):
+    return grid(results) + "\n" + table_detail(results)
+
+
+def table_detail(results):
     out = ["| scenario | switches on | violated | outcomes (terminal states) | states / depth |",
            "|---|---|---|---|---|"]
     for name, r in results.items():
