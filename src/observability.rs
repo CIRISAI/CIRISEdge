@@ -1103,6 +1103,10 @@ pub const ALM_RELAY_OFF_SHED: &str = "relay_shed:relay_off";
 /// G8 — this node's uplink stalled: its legs' Channels held messages
 /// unproved past `UPLINK_STALL_MS` on two legs or more. Counted on the rise.
 pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
+/// G8 — a periodic offer not sent on a leg whose oldest unproved Channel
+/// message has waited past its floor by `UPLINK_BACKLOG_MS`: it would only
+/// queue behind the backlog and spend that link's retry budget.
+pub const ALM_OFFER_HELD_BACKLOG: &str = "alm_offer_held:backlog";
 /// 45.2.0 — a call or A/V link refused on a shaped-only node: live A/V rides
 /// unshaped links only (Eric 2026-11-06).
 pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
@@ -2979,6 +2983,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_SHED,
     ALM_RELAY_OFF_SHED,
     ALM_UPLINK_STALL,
+    ALM_OFFER_HELD_BACKLOG,
     SHAPED_ONLY_NO_MEDIA,
     AV_CALL_ENDED_MEDIA_REFUSED,
     ALM_FORWARDED,

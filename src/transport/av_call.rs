@@ -1857,6 +1857,10 @@ struct Shared {
     /// ALM C5 — the oldest frame age seen in the inbound queues this window
     /// (ms), for the ladder's `edge:av_queue_age` signal.
     queue_age_ms: AtomicU64,
+    /// G8 — the legs (by peer) whose oldest unproved Channel message is
+    /// backlogged ([`alm::UPLINK_BACKLOG_MS`]): their periodic offers are
+    /// held until it is proved.
+    backlogged_legs: StdMutex<std::collections::HashSet<String>>,
     /// The node's service ladder, if any.
     load: Option<Arc<crate::load_ladder::SharedLadder>>,
     /// Test seam: every pump holds its next frame until this instant (a
@@ -2563,6 +2567,7 @@ impl Call {
             own_share_codecs: StdMutex::new(HashMap::new()),
             leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
+            backlogged_legs: StdMutex::new(std::collections::HashSet::new()),
             load,
             setup_began: std::time::Instant::now(),
             setup_done: AtomicBool::new(false),
@@ -4616,6 +4621,12 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
         if !Shared::lock(&shared.alm).speaks_c3(&o.to) {
             continue;
         }
+        // G8 — a periodic offer to a backlogged leg would only queue behind
+        // it and spend its Channel's retry budget; the next one replaces it.
+        if is_periodic(&o.frame) && Shared::lock(&shared.backlogged_legs).contains(&o.to) {
+            shared.count(crate::observability::ALM_OFFER_HELD_BACKLOG);
+            continue;
+        }
         let refused_by_seam = !is_periodic(&o.frame)
             && shared
                 .test_fail_c3
@@ -5788,22 +5799,29 @@ async fn alm_tick(
     // G8 — how long each leg's oldest unproved Channel message has waited.
     let now = Instant::now();
     let mut stalled_legs = 0usize;
-    for (_, link) in &legs {
-        let oldest = shared
-            .transport
-            .av_link_stats(link)
-            .and_then(|st| st.oldest_unacked_seq);
-        match oldest {
+    let mut measurable = 0usize;
+    let mut backlogged: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut worst_ms = 0u64;
+    for (peer, link) in &legs {
+        let st = shared.transport.av_link_stats(link);
+        match st.and_then(|st| st.oldest_unacked_seq) {
             Some(seq) => {
-                let since = match unproved.get(link) {
-                    Some((s, t)) if *s == seq => *t,
+                measurable += 1;
+                let (since, carried) = match unproved.get(link) {
+                    Some((s, t)) if *s == seq => (*t, true),
                     _ => {
                         unproved.insert(*link, (seq, now));
-                        now
+                        (now, false)
                     }
                 };
-                if now.duration_since(since) >= Duration::from_millis(alm::UPLINK_STALL_MS) {
+                let age = u64::try_from(now.duration_since(since).as_millis()).unwrap_or(u64::MAX);
+                worst_ms = worst_ms.max(age);
+                if age >= alm::UPLINK_STALL_MS {
                     stalled_legs += 1;
+                }
+                let floor = st.and_then(|st| st.min_rtt_ms).unwrap_or(0);
+                if carried && age.saturating_sub(floor) >= alm::UPLINK_BACKLOG_MS {
+                    backlogged.insert(peer.clone());
                 }
             }
             None => {
@@ -5812,7 +5830,26 @@ async fn alm_tick(
         }
     }
     unproved.retain(|l, _| legs.iter().any(|(_, x)| x == l));
-    Shared::lock(&shared.alm).set_uplink_stall(stalled_legs >= alm::UPLINK_STALL_LEGS);
+    let early = backlogged.len() >= alm::UPLINK_STALL_LEGS && backlogged.len() == measurable;
+    let detected = early || stalled_legs >= alm::UPLINK_STALL_LEGS;
+    let rose = {
+        let mut a = Shared::lock(&shared.alm);
+        let was = a.uplink_stalled();
+        a.set_uplink_stall(detected);
+        !was && a.uplink_stalled()
+    };
+    if rose {
+        tracing::info!(
+            node = %shared.own,
+            legs = legs.len(),
+            measurable,
+            backlogged = backlogged.len(),
+            stalled_legs,
+            oldest_unproved_ms = worst_ms,
+            "A/V uplink stall: shedding to one direct child now (G8)"
+        );
+    }
+    *Shared::lock(&shared.backlogged_legs) = backlogged;
     for (peer, link) in &legs {
         let stats = shared.transport.av_link_stats(link);
         let expired = shared.transport.av_link_expired(link).sender;

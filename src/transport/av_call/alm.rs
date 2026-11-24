@@ -41,8 +41,8 @@ use crate::transport::realtime_av_alm::controller::wire::{
 };
 use crate::transport::realtime_av_alm::controller::{
     Admission, AdmitDecision, ChunkPos, ControlFrame, ControlMsg, ControllerConfig, DecisionKind,
-    DecisionLog, EgressMeter, ParentSelector, PathChunk, RefuseReason, Role, SelectorAction,
-    ShedReason, SplitMix64, SubscribeRequest,
+    DecisionLog, EgressMeter, EgressWindow, ParentSelector, PathChunk, RefuseReason, Role,
+    SelectorAction, ShedReason, SplitMix64, SubscribeRequest,
 };
 
 /// How often a forwarder offers each stream it can serve.
@@ -273,6 +273,13 @@ pub(super) struct AlmState {
     /// bufferbloated cellular queue): the egress meter's refusals never
     /// come (`path_meter` "Limit: datagram legs").
     uplink_stall: bool,
+    /// G8 — when the stall was last detected: the verdict holds
+    /// [`UPLINK_STALL_LATCH_MS`] past it (the stalled legs' links can die,
+    /// and their detection with them, before the queue has drained).
+    uplink_stall_seen_ms: Option<u64>,
+    /// G8 — frames made between ticks (the shed on a stall's rise), sent
+    /// with the next tick's.
+    pending_out: Vec<Outgoing>,
 }
 
 /// G8 — a leg whose oldest unproved Channel message has waited this long is
@@ -289,6 +296,17 @@ pub(super) const STALL_OFFER_EVERY_MS: u64 = 5_000;
 /// one leg (a two-person call) there is no verdict, and none is needed: a
 /// publisher with one child has nothing to shed.
 pub(super) const UPLINK_STALL_LEGS: usize = 2;
+/// G8 — the earlier verdict: a leg's oldest unproved Channel message is
+/// BACKLOGGED when it was already unproved at the previous watch tick (its
+/// age is rising) and has waited this long past the leg's own RTT floor
+/// (`min_rtt`, so a long but uncongested path is not a queue). The uplink is
+/// stalled when EVERY leg with something unproved is backlogged and there
+/// are at least [`UPLINK_STALL_LEGS`] of them: one slow peer is one leg, and
+/// a leg that proves its messages in time vetoes the verdict.
+pub(super) const UPLINK_BACKLOG_MS: u64 = 200;
+/// G8 — how long a stall verdict holds after its last detection: about the
+/// time a shed publisher's queue takes to drain the backlog its legs saw.
+pub(super) const UPLINK_STALL_LATCH_MS: u64 = 2_000;
 
 /// **The canonical audio fallback lever** (`FSD/CIRIS_MESH.md` §6.4; Eric
 /// 2026-11-21: no traffic on the canonical, audio included, while the mesh
@@ -369,21 +387,51 @@ impl AlmState {
             parent_moves: Vec::new(),
             relayed: BTreeMap::new(),
             uplink_stall: false,
+            uplink_stall_seen_ms: None,
+            pending_out: Vec::new(),
         }
     }
 
-    /// G8 — whether this node's uplink is stalled now (the call reads its
-    /// legs' unproved Channel ages each watch tick). On the rise it is
-    /// counted; while it holds, the next egress window is read as congested
-    /// at one stream's room, so this node sheds to one child (LIFO) and its
-    /// relay work goes, and its periodic offers are held to one every
-    /// [`STALL_OFFER_EVERY_MS`] (they would only queue behind the backlog and
-    /// spend the Channel's retry budget).
-    pub(super) fn set_uplink_stall(&mut self, stalled: bool) {
-        if stalled && !self.uplink_stall {
-            self.label(crate::observability::ALM_UPLINK_STALL);
+    /// G8 — whether the stall verdict holds now (detected, or latched).
+    pub(super) fn uplink_stalled(&self) -> bool {
+        self.uplink_stall
+    }
+
+    /// G8 — whether this watch tick DETECTED this node's uplink stalled (the
+    /// call reads its legs' unproved Channel ages). The verdict holds
+    /// [`UPLINK_STALL_LATCH_MS`] past the last detection. On its rise it is
+    /// counted and this node sheds AT ONCE, not at the next egress window:
+    /// at 2-3x overload the stalled legs' links die (Channel retry
+    /// exhaustion, ~1.3 s) before a window closes, and their detection with
+    /// them (CIRISEdge 45.2.0, the capped witness: verdict 1, shed 0). The
+    /// shed keeps ONE direct child (LIFO) and lets the relay work go. While
+    /// the verdict holds, every egress window reads congested at that room
+    /// and periodic offers are held to one every [`STALL_OFFER_EVERY_MS`]
+    /// (they would only queue behind the backlog and spend the Channel's
+    /// retry budget).
+    pub(super) fn set_uplink_stall(&mut self, detected: bool) {
+        let now = self.now_ms();
+        if detected {
+            self.uplink_stall_seen_ms = Some(now);
         }
+        let stalled = self
+            .uplink_stall_seen_ms
+            .is_some_and(|t| now.saturating_sub(t) < UPLINK_STALL_LATCH_MS);
+        let rose = stalled && !self.uplink_stall;
         self.uplink_stall = stalled;
+        if rose {
+            self.label(crate::observability::ALM_UPLINK_STALL);
+            let w = EgressWindow {
+                sent_bps: 0.0,
+                delivered_bps: 0.0,
+                dropped_bytes: 0,
+                max_queue_ms: 0.0,
+                congested: true,
+                capacity_bps: None,
+            };
+            let out = self.fold_egress_window(now, w);
+            self.pending_out.extend(out);
+        }
     }
 
     /// Calls cut — one chunk of `stream` forwarded to `child`.
@@ -1552,6 +1600,65 @@ impl AlmState {
         (bps as f64 * scale).min(u64::MAX as f64 / 2.0).round() as u64
     }
 
+    /// C2 — fold one egress window into every admission on this uplink and
+    /// return the sheds it made. While the uplink is stalled (G8) the window
+    /// reads congested whatever the (blind) meter said: every relayed stream
+    /// and share at one stream's room (that work goes), and this node's own
+    /// stream at one stream ABOVE the reserve and whatever the node still
+    /// holds elsewhere, so exactly one direct child is kept, never zero.
+    #[allow(clippy::cast_precision_loss)] // bits/s, far below 2^52
+    fn fold_egress_window(&mut self, now: u64, mut w: EgressWindow) -> Vec<Outgoing> {
+        let mut out = Vec::new();
+        let one = self.own_rate.costs().0 as f64;
+        if self.uplink_stall {
+            w.congested = true;
+            w.capacity_bps = Some(w.capacity_bps.map_or(one, |c| c.min(one)));
+        }
+        let streams: Vec<StreamId> = self.relays.keys().copied().collect();
+        let mut shed: Vec<(StreamId, String)> = Vec::new();
+        for s in streams {
+            let ext = self.external_except(s);
+            let a = self.relays.get_mut(&s).expect("present");
+            a.set_external_committed(ext);
+            for p in a.on_egress_window(now, &w, &mut self.log) {
+                shed.push((s, p));
+            }
+        }
+        let ext = self.external_except(self.own_stream);
+        self.own.set_external_committed(ext);
+        let mut own_w = w;
+        if self.uplink_stall {
+            own_w.capacity_bps = Some(one + self.cfg.reserve_bps as f64 + ext as f64);
+        }
+        for p in self.own.on_egress_window(now, &own_w, &mut self.log) {
+            shed.push((self.own_stream, p));
+        }
+        // v45 — each share sheds by its own commitments.
+        let shares: Vec<StreamId> = self.shares.keys().copied().collect();
+        for s in shares {
+            let ext = self.external_except(s);
+            let (a, _) = self.shares.get_mut(&s).expect("present");
+            a.set_external_committed(ext);
+            for p in a.on_egress_window(now, &w, &mut self.log) {
+                shed.push((s, p));
+            }
+        }
+        for (s, p) in shed {
+            self.counts.shed += 1;
+            self.label(crate::observability::ALM_SHED);
+            out.push(Outgoing {
+                to: p,
+                frame: encode(
+                    s,
+                    &ControlMsg::Shed {
+                        reason: ShedReason::OverCommitted,
+                    },
+                ),
+            });
+        }
+        out
+    }
+
     /// One watch tick: egress windows (C2 measurement and over-commit
     /// shedding), selector ticks (C4/C6) with the upstream refresh after
     /// each decision, relay admissions for newly forwarded streams, offers to
@@ -1560,7 +1667,7 @@ impl AlmState {
     #[allow(clippy::too_many_lines)]
     pub(super) fn tick(&mut self, c3_legs: &[String]) -> Vec<Outgoing> {
         let now = self.now_ms();
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.pending_out);
 
         // Measured rates price commitments (production streams are the
         // host's bitrate, not a nominal one).
@@ -1585,53 +1692,9 @@ impl AlmState {
         }
 
         // C2: one egress window feeds every admission on this uplink.
-        if let Some(mut w) = self.egress.roll(now) {
-            // G8 — a stalled datagram uplink is congested at one stream's room,
-            // whatever the (blind) meter read.
-            if self.uplink_stall {
-                #[allow(clippy::cast_precision_loss)] // bits/s, far below 2^52
-                let one = self.own_rate.costs().0 as f64;
-                w.congested = true;
-                w.capacity_bps = Some(w.capacity_bps.map_or(one, |c| c.min(one)));
-            }
-            let streams: Vec<StreamId> = self.relays.keys().copied().collect();
-            let mut shed: Vec<(StreamId, String)> = Vec::new();
-            for s in streams {
-                let ext = self.external_except(s);
-                let a = self.relays.get_mut(&s).expect("present");
-                a.set_external_committed(ext);
-                for p in a.on_egress_window(now, &w, &mut self.log) {
-                    shed.push((s, p));
-                }
-            }
-            let ext = self.external_except(self.own_stream);
-            self.own.set_external_committed(ext);
-            for p in self.own.on_egress_window(now, &w, &mut self.log) {
-                shed.push((self.own_stream, p));
-            }
-            // v45 — each share sheds by its own commitments.
-            let shares: Vec<StreamId> = self.shares.keys().copied().collect();
-            for s in shares {
-                let ext = self.external_except(s);
-                let (a, _) = self.shares.get_mut(&s).expect("present");
-                a.set_external_committed(ext);
-                for p in a.on_egress_window(now, &w, &mut self.log) {
-                    shed.push((s, p));
-                }
-            }
-            for (s, p) in shed {
-                self.counts.shed += 1;
-                self.label(crate::observability::ALM_SHED);
-                out.push(Outgoing {
-                    to: p,
-                    frame: encode(
-                        s,
-                        &ControlMsg::Shed {
-                            reason: ShedReason::OverCommitted,
-                        },
-                    ),
-                });
-            }
+        if let Some(w) = self.egress.roll(now) {
+            let shed = self.fold_egress_window(now, w);
+            out.extend(shed);
         }
 
         // C4/C6 per stream; the relay's upstream view is refreshed after
@@ -2422,6 +2485,105 @@ mod tests {
             )),
             "no offers while stalled"
         );
+    }
+
+    /// G8 — publisher `a` of a four-person room with `kids` children admitted
+    /// in order and six seconds of media behind it (its stream has a
+    /// measured rate, the last egress window just closed).
+    fn publisher_with(kids: &[&str]) -> AlmState {
+        let roster4: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let mut a = AlmState::new("a", s(1), &roster4, true, 1);
+        let mut rng = SplitMix64(5);
+        let mut log = DecisionLog::default();
+        for p in kids {
+            let d = a.own.request(
+                0,
+                &SubscribeRequest {
+                    subscriber: (*p).into(),
+                    role: Role::Primary,
+                    forward_capable: true,
+                    layers: None,
+                },
+                &mut rng,
+                &mut log,
+            );
+            assert!(matches!(d, AdmitDecision::Admit { .. }), "{p}: {d:?}");
+        }
+        for _ in 0..6 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            let _ = a.tick(&[]);
+        }
+        assert_eq!(a.own_children().len(), kids.len(), "clean uplink: no shed");
+        a
+    }
+
+    /// G8 — the race the capped matrix lost (CIRISEdge 45.1.9, the loopback
+    /// witness on leviculum c75fdeb0): the stall verdict rises between two
+    /// egress windows, the stalled legs' links die before the next window
+    /// closes, and their detection with them. The shed must go out on the
+    /// RISE (one child kept, the newest shed first), and the verdict must
+    /// hold for [`UPLINK_STALL_LATCH_MS`] after its last detection, so the
+    /// window that closes next still reads the uplink as congested.
+    #[test]
+    fn a_stall_whose_links_die_before_the_window_closes_still_sheds() {
+        let mut a = publisher_with(&["b", "c", "d"]);
+        let legs: Vec<String> = vec!["b".into(), "c".into(), "d".into()];
+        a.set_uplink_stall(true);
+        // The same watch tick: no egress window has closed yet.
+        let mut out = a.tick(&legs);
+        assert_eq!(
+            a.own_children(),
+            vec![("b".to_owned(), Role::Primary)],
+            "shed at the rise, to the oldest child"
+        );
+        // The stalled legs are gone a tick later: nothing is detected.
+        a.t0 = a.t0.checked_sub(Duration::from_millis(250)).expect("clock");
+        a.set_uplink_stall(false);
+        assert!(a.uplink_stalled(), "latched past the last detection");
+        a.t0 = a.t0.checked_sub(Duration::from_millis(800)).expect("clock");
+        a.set_uplink_stall(false);
+        for _ in 0..30 {
+            a.on_own_published(600, true);
+            a.on_sent("b", 700);
+        }
+        out.extend(a.tick(&legs));
+        let shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            shed,
+            vec!["d".to_owned(), "c".to_owned()],
+            "LIFO, once each"
+        );
+        assert_eq!(a.own_children().len(), 1, "the window keeps one child");
+        // The latch ends UPLINK_STALL_LATCH_MS after the last detection.
+        a.t0 =
+            a.t0.checked_sub(Duration::from_millis(1_000))
+                .expect("clock");
+        a.set_uplink_stall(false);
+        assert!(!a.uplink_stalled(), "released after the latch");
+    }
+
+    /// G8 — a stalled uplink with ONE child has nothing to shed: the verdict
+    /// keeps the last direct path whatever the reserve or the relay work.
+    #[test]
+    fn a_stall_never_sheds_the_last_child() {
+        let mut a = publisher_with(&["b"]);
+        a.set_uplink_stall(true);
+        let mut out = a.tick(&["b".into()]);
+        for _ in 0..3 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            a.set_uplink_stall(true);
+            out.extend(a.tick(&["b".into()]));
+        }
+        assert!(sheds(&out).is_empty(), "{:?}", sheds(&out));
+        assert_eq!(a.own_children().len(), 1);
     }
 
     // ── #945: three real controllers, C3 through the real encoder ────────
