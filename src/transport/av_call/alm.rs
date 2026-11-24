@@ -2231,15 +2231,18 @@ impl AlmState {
             return Vec::new();
         }
         let directs = sel.direct_children_by_offer(now, &publisher);
-        if rxmove::spared(s, &self.me, &directs) {
-            if self.late_noted.insert(s) {
-                self.label(crate::observability::ALM_LATE_SPARED);
-            }
-            return Vec::new();
-        }
+        // RM6 before RM4: both mean "no move", but the own-downlink verdict
+        // does not depend on this node's rank, so it is read (and counted)
+        // first, whichever child the publisher keeps.
         if self.own_downlink_slow(s, &publisher, now) {
             if self.late_noted.insert(s) {
                 self.label(crate::observability::ALM_LATE_OWN_DOWNLINK);
+            }
+            return Vec::new();
+        }
+        if rxmove::spared(s, &self.me, &directs) {
+            if self.late_noted.insert(s) {
+                self.label(crate::observability::ALM_LATE_SPARED);
             }
             return Vec::new();
         }
