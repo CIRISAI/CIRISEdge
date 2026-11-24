@@ -134,19 +134,19 @@ VARIABLES
     \* (e) redial
     dialAt, dialBo, pathAt,
     \* (c) the publisher
-    children, order, drainTo, shedPend, room, demand, lastCong, lastWiden,
+    children, order, drainTo, shedPend, room, demand, lastCong, lastWiden, probeFails,
     stall, stallSeen, obs, verdicts, sheds, zeroShed, lastOffer, winPhase,
     \* (d) listeners
     relayKids, parent, pendSub, pendAt, boUntil, reparents, lastSwitch,
-    shedBy, offerAt, offerFwd, offerRoom, rxDelay,
+    shedBy, offerAt, offerFwd, offerRoom, rxDelay, lateMove,
     \* bookkeeping the properties read
-    heard, lastHeard, lastFwd, published, torn, dual,
+    heard, lastHeard, lastFwd, published, torn, dual, maxQd,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
 
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
-          rxNext, srtt8, lastAuth, peerAuth, rxDelay, dialAt, dialBo, pathAt, children, order,
+          rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -166,7 +166,8 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         lastAuth |-> lastAuth, peerAuth |-> peerAuth, rxDelay |-> rxDelay, dialAt |-> dialAt, dialBo |-> dialBo,
         pathAt |-> pathAt, children |-> children, order |-> order,
         drainTo |-> drainTo, shedPend |-> shedPend, room |-> room,
-        demand |-> demand, lastCong |-> lastCong, lastWiden |-> lastWiden, stall |-> stall,
+        demand |-> demand, lastCong |-> lastCong, lastWiden |-> lastWiden, probeFails |-> probeFails, lateMove |-> lateMove,
+        maxQd |-> maxQd, stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
         winPhase |-> winPhase, relayKids |-> relayKids, parent |-> parent,
@@ -292,8 +293,11 @@ OnAdmit(S, l, x) ==
     ELSE LET old == S.parent[l]
              S1 == [S EXCEPT !.parent[l] = x, !.pendSub[l] = None,
                              !.reparents[l] = @ + 1, !.lastSwitch[l] = S.now,
-                             !.shedBy[l] = None]
-             S2 == IF old \notin {None, x} THEN SendCtrl(S1, <<l, old>>, Pay("unsub")) ELSE S1
+                             !.shedBy[l] = None, !.lateMove[l] = FALSE]
+             \* a move made because P's media came late says so: P reads it
+             \* as congestion (ReceiverMoves)
+             why == IF S.lateMove[l] /\ old = "P" THEN "unsub_late" ELSE "unsub"
+             S2 == IF old \notin {None, x} THEN SendCtrl(S1, <<l, old>>, Pay(why)) ELSE S1
              \* a publisher that shed this node make-before-break is told once
              \* the replacement is up (alm.rs draining_parent)
              S3 == IF S.shedBy[l] = "P" /\ x /= "P" /\ old /= "P"
@@ -318,6 +322,11 @@ Handle(S, pay, s, r) ==
             THEN [S EXCEPT !.pendSub[r] = None, !.boUntil[r][s] = S.now + Backoff]
             ELSE S
       [] pay.p = "shed" -> OnShed(S, r, s)
+      [] pay.p = "unsub_late" ->
+            LET kids == S.children \ {s}
+            IN [S EXCEPT !.children = kids, !.drainTo[s] = -1, !.shedPend[s] = FALSE,
+                         !.room = Max(1, Cardinality(kids)), !.lastCong = S.now,
+                         !.probeFails = Min(@ + 1, 2)]
       [] pay.p = "unsub" ->
             IF r = "P"
             THEN [S EXCEPT !.children = @ \ {s}, !.drainTo[s] = -1, !.shedPend[s] = FALSE]
@@ -492,7 +501,7 @@ LWatch1(S, l, k) ==
             \* move to a relay, keeping P until the relay admits.
             ELSE IF /\ ReceiverMoves /\ S2.pendSub[l] = None /\ S2.parent[l] = "P"
                     /\ S2.rxDelay[l] >= RxDelayTicks /\ first /= l /\ relays /= <<>>
-            THEN Subscribe(S2, l, relays[Min(k, Len(relays))])
+            THEN Subscribe([S2 EXCEPT !.lateMove[l] = TRUE], l, relays[Min(k, Len(relays))])
             ELSE IF /\ S2.pendSub[l] = None /\ S2.parent[l] \notin {None, "P"}
                     /\ Viable(S2, l, "P") /\ S2.now - S2.lastSwitch[l] >= Dwell
             THEN Subscribe(S2, l, "P")
@@ -515,17 +524,23 @@ Window(S, ch) ==
     ELSE IF S.stall
     THEN LET S1 == [S EXCEPT !.lastCong = S.now, !.room = Min(@, 1)]
          IN IF Cardinality(S1.children) > KeepOf(ch) THEN ShedTo(S1, KeepOf(ch)) ELSE S1
-    ELSE LET r1 == IF S.demand /\ S.room < NL THEN S.room + 1 ELSE S.room
+    ELSE LET \* any widening waits out the probe backoff: 2 windows x 2^fails
+             \* since the last congestion (a late move is one, ReceiverMoves)
+             calm == S.now - Max(S.lastCong, S.lastWiden) >= 2 * WindowTicks * 2^S.probeFails
+             r1 == IF S.demand /\ S.room < NL /\ (calm \/ ~ReceiverMoves) THEN S.room + 1 ELSE S.room
              \* SlowStart: two clean windows since the last congestion and the
              \* last widening prove the room it has; widen by one stream (the
              \* probe is the widening; a stall takes it back).
-             probe == SlowStart /\ r1 < NL
-                      /\ S.now - Max(S.lastCong, S.lastWiden) >= 2 * WindowTicks
+             probe == SlowStart /\ r1 = S.room /\ r1 < NL /\ calm   \* one stream a window
              r2 == IF probe THEN r1 + 1 ELSE r1
              r3 == IF ~SlowStart /\ S.lastCong >= 0 /\ S.now - S.lastCong >= CeilingStale
                    THEN NL ELSE r2
+             \* a widening after one that held (no congestion since) steps the
+             \* backoff down: the probe that worked is the measurement
+             held == S.lastWiden > S.lastCong
          IN [S EXCEPT !.room = r3, !.demand = IF r1 /= S.room THEN FALSE ELSE @,
-                      !.lastWiden = IF r3 /= S.room THEN S.now ELSE @]
+                      !.lastWiden = IF r3 /= S.room THEN S.now ELSE @,
+                      !.probeFails = IF r3 /= S.room /\ held THEN Max(0, @ - 1) ELSE @]
 
 \* Offers: every node, on every live out-leg, each OfferEvery (P: each
 \* StallOfferEvery while stalled).
@@ -592,9 +607,9 @@ NoSpuriousTeardownS(S) == \A t \in S.torn : t.why \in {"exhausted", "stale"} => 
 \* A publisher with a subscriber keeps a direct child: no shed leaves zero.
 KeepsOneChildS(S) == ~S.zeroShed
 \* Never two parents: a listener is in two forwarders' ledgers only while a
-\* move is in flight (two ticks on uncapped paths, plus the queue delay when
-\* the old parent is P and the unsubscribe or the shed rides its queue).
-NeverTwoParentsS(S) == \A c \in L : S.dual[c] <= 2 + QDelayS(S)
+\* move is in flight (two ticks on uncapped paths, plus P's queue delay when
+\* P's admit or shed rides its queue: bounded by the largest delay so far).
+NeverTwoParentsS(S) == \A c \in L : S.dual[c] <= 2 + S.maxQd
 \* Make-before-break: a child P shed keeps P's media until it has moved.
 MakeBeforeBreakS(S) == \A c \in AliveLS(S) : S.shedPend[c] /\ S.up[<<"P", c>>] => S.drainTo[c] >= S.now
 \* Every Channel message is proved or its link torn within the held bound.
@@ -602,8 +617,10 @@ NothingWaitsForeverS(S) ==
     \A l \in {x \in Legs : Alive(S, x[1])} : \A i \in 1..Len(S.chan[l]) :
         S.now - S.chan[l][i].first <= Stale + HeldCap + Wait(MaxTries, Base(SrttCap8))
 \* The queue a congested publisher holds gets back under QTarget by the end
-\* (a capped uplink must not carry a multi-second backlog for good).
-EndQueueDrainedS(S) == OverS(S) => QDelayS(S) <= QTarget
+\* (a capped uplink must not carry a multi-second backlog for good), unless a
+\* widening (a probe) is still playing out: the dwell before a listener takes
+\* the new room, and up to four windows for the verdict, the shed and the drain.
+EndQueueDrainedS(S) == (OverS(S) /\ S.now - S.lastWiden >= Dwell + 4 * WindowTicks) => QDelayS(S) <= QTarget
 \* No oscillation: re-parentings per listener are bounded (the join counts).
 ReparentBoundS(S) == \A c \in L : S.reparents[c] <= MaxReparents
 
@@ -664,7 +681,7 @@ Step(S, ch) ==
         S8 == Drain(S7)
         S9 == Dual(S8)
         S10 == IF TraceOn THEN [S9 EXCEPT !.hist = Append(@, Snap(S9, S.torn))] ELSE S9
-        S11 == [S10 EXCEPT !.now = @ + 1]
+        S11 == [S10 EXCEPT !.now = @ + 1, !.maxQd = Max(@, QDelayS(S10))]
     IN [S11 EXCEPT !.bad = @ \cup Bad(S11)]
 
 \* The environment's and the code's free choices, ONE per behaviour (fixed
@@ -688,7 +705,8 @@ Init ==
     /\ rxNext = [l \in Legs |-> 0] /\ srtt8 = [l \in Legs |-> 0]
     /\ lastAuth = [l \in Legs |-> -1]
     /\ peerAuth = [x \in Nodes |-> [y \in Nodes |-> -1]]
-    /\ rxDelay = [c \in L |-> 0]
+    /\ rxDelay = [c \in L |-> 0] /\ probeFails = 0 /\ lateMove = [c \in L |-> FALSE]
+    /\ maxQd = 0
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
     /\ children = {} /\ order = <<>> /\ drainTo = [c \in L |-> -1]
@@ -720,7 +738,8 @@ Assign(S) ==
     /\ up' = S.up /\ peerUp' = S.peerUp /\ gen' = S.gen /\ downAt' = S.downAt
     /\ chan' = S.chan /\ nextSeq' = S.nextSeq /\ rxNext' = S.rxNext
     /\ srtt8' = S.srtt8 /\ lastAuth' = S.lastAuth /\ peerAuth' = S.peerAuth
-    /\ rxDelay' = S.rxDelay /\ dialAt' = S.dialAt
+    /\ rxDelay' = S.rxDelay /\ probeFails' = S.probeFails /\ lateMove' = S.lateMove
+    /\ maxQd' = S.maxQd /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden

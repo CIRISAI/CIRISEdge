@@ -38,7 +38,7 @@ SWITCH = dict(RPA="ReceiptsPerAttempt", RTO="RtoLearnsDelay", HOLD="Hold113",
               RXMOVE="ReceiverMoves")
 INVS = "TypeOK RecordOutcome"   # the properties fold into `bad`, read per terminal state
 BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RCAP="4", CAPAT="10",
-            CAPUNTIL="50", HORIZON="140", STALE="100", SRTTCAP="17", WATCH="2",
+            CAPUNTIL="50", HORIZON="230", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", MAXREP="3", DEAD='"none"',
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
@@ -100,8 +100,8 @@ def scenarios():
     # The watch tick at 300 ms instead of 200 ms (it is 250 ms in code).
     yield "watch3-all-on", dict(ALL, WATCH="3")
     # Conformance: the recorded runs' shape (the cap stays on to the end).
-    yield "conf-run1", dict(TODAY_LEV_C86, CAPUNTIL="1000", HORIZON="160")
-    yield "conf-run2", dict(TODAY_LEV_C75, CAPUNTIL="1000", HORIZON="160")
+    yield "conf-run1", dict(TODAY_LEV_C86, CAPUNTIL="1000", HORIZON="200")
+    yield "conf-run2", dict(TODAY_LEV_C75, CAPUNTIL="1000", HORIZON="200")
     # Wide: every listener its own offer phase and tie-break (chunked by P's
     # phase), for the configurations the report leans on.
     for n, p in [("baseline", {}), ("pin-c75fdeb01", TODAY_LEV_C75), ("all-on", ALL)]:
@@ -110,16 +110,35 @@ def scenarios():
 
 def recover_by(p):
     """EndFullFanOut's bound (ticks after the cap lifts): two windows for the
-    verdict to clear, the dwell, and either one stream per two clean windows
-    (SlowStart) or the ceiling's staleness."""
+    verdict to clear, the dwell, and the widenings. With SlowStart each added
+    stream waits out the probe backoff (2 windows x 2^fails, fails <= 2,
+    stepping down after each probe that held); without it, the ceiling's
+    staleness."""
     n = 2 if p["LSEQ"] == "Listeners2" else 3
-    grow = (n - 1) * 2 * 10 if p["SS"] == "TRUE" else 20
-    return str(2 * 10 + 20 + grow)
+    if p["SS"] == "TRUE":
+        fmax = 2 if p["RXMOVE"] == "TRUE" else 0
+        grow = sum(2 * 10 * 2 ** max(0, fmax - i) for i in range(n - 1))
+    else:
+        grow = 20
+    # the verdict's latch (20) and the window it closes in (10), then the
+    # dwell (20) and a window for the move, plus the widenings
+    return str(20 + 10 + 20 + 10 + grow)
+
+
+def max_reparents(p):
+    """ReparentBound: the join, the move to a relay at the first congestion,
+    the move back after a lift, and two per probe; with the probe backoff
+    (2 windows x 2^fails) at most floor(log2(H / 2W)) + 1 probes fit."""
+    import math
+    h = int(p["HORIZON"])
+    return str(3 + 2 * (int(math.log2(max(1, h // 20))) + 1))
 
 
 def cfg_text(params):
     p = dict(BASE, **params)
     p.setdefault("RECOVER", recover_by(p))
+    if "MAXREP" not in params:
+        p["MAXREP"] = max_reparents(p)
     text = open(os.path.join(HERE, "base.cfg.tmpl")).read()
     for k, v in p.items():
         text = text.replace(f"@{k}@", v)
