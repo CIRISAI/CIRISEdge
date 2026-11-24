@@ -9398,9 +9398,11 @@ impl EdgeBuilder {
         let canonical_peers = Arc::new(std::sync::RwLock::new(canonical_id_set));
         // Calls cut — a call on this node reads the live seat set: a serve seat
         // never relays call media, and a seat's relay offers are dropped.
-        #[cfg(feature = "_reticulum-module")]
-        if let Some(t) = self.reticulum_transport.as_ref() {
-            t.set_serve_seats(Arc::clone(&canonical_peers));
+        // On every registered transport, whichever builder method registered
+        // it (a typed or a generic registration), so the rule never depends
+        // on the path.
+        for transport in &self.transports {
+            transport.attach_serve_seats(Arc::clone(&canonical_peers));
         }
         let introduction_bridge = Arc::new(ReinstallableCell::new("introduction_bridge"));
         // `FSD/PRIVACY_MODES.md` §6.12 — what a shed lever on a shaped slot

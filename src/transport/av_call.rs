@@ -2122,7 +2122,15 @@ impl Shared {
     /// is written by the PERSON's key and legs are the NODE's, so on a split
     /// home the row alone may not name the member; the other three do.
     fn is_attendee(&self, member: &str) -> bool {
-        Self::lock(&self.in_links).values().any(|p| p == member)
+        // In a two-person room the other member IS the party the call is
+        // with: the direct path is the only way the call can work, so its
+        // path events concern it before it has shown any sign of joining.
+        let two_person = {
+            let m = Self::lock(&self.members);
+            m.len() <= 2 && m.iter().any(|x| x == member)
+        };
+        two_person
+            || Self::lock(&self.in_links).values().any(|p| p == member)
             || !Self::lock(&self.alm).streams_of(member).is_empty()
             || self.auth.publishers().iter().any(|p| p == member)
             || Self::lock(&self.attendees_known).contains(member)
@@ -2462,6 +2470,14 @@ impl Call {
         let members_for_alm = members.clone();
         // Calls cut — a serve seat never relays call media, audio included
         // (`alm::CANONICAL_AV_FALLBACK` off), whatever the host asked.
+        if !transport.serve_seats_attached() {
+            tracing::error!(
+                room = %room,
+                "call: this transport was given no serve-seat set (built outside \
+                 EdgeBuilder::build?) — the rule that a serve seat never relays cannot be \
+                 applied here"
+            );
+        }
         let seats = transport.serve_seats();
         let own_is_seat = !alm::CANONICAL_AV_FALLBACK && seats.iter().any(|s| s == own_key_id);
         let alm_seed = {

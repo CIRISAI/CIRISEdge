@@ -6252,6 +6252,14 @@ impl ReticulumTransport {
         let _ = self.serve_seats.set(seats);
     }
 
+    /// 45.2.0 — whether an Edge shared its seat set with this transport. A
+    /// call on a transport without one cannot apply the seat rule: it says so
+    /// at ERROR, never silently.
+    #[must_use]
+    pub fn serve_seats_attached(&self) -> bool {
+        self.serve_seats.get().is_some()
+    }
+
     /// Calls cut — the serve seats this node knows of now (empty when no
     /// Edge shared its set).
     #[must_use]
@@ -11531,6 +11539,10 @@ impl Transport for ReticulumTransport {
 
     fn attach_load_ladder(&self, ladder: Arc<crate::load_ladder::SharedLadder>) {
         let _ = self.load_ladder.set(ladder);
+    }
+
+    fn attach_serve_seats(&self, seats: Arc<std::sync::RwLock<std::collections::HashSet<String>>>) {
+        self.set_serve_seats(seats);
     }
 
     fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {

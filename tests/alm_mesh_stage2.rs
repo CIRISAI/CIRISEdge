@@ -3416,6 +3416,26 @@ async fn a_serve_seat_in_the_room_never_relays() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     assert_eq!(cs.relay_status(), (false, 0));
+    // Asked outright, the seat refuses: B sends it a relay SUBSCRIBE for C's
+    // stream (as a stale or misbehaving member would).
+    let sub = encode(
+        cc.stream(),
+        &ControlMsg::Subscribe(SubscribeRequest {
+            subscriber: b.key.key_id.clone(),
+            role: Role::Primary,
+            forward_capable: false,
+            layers: None,
+        }),
+    );
+    cb.send_c3_for_test(&seat.key.key_id, sub).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            av(&seat.metrics, "relay_serve_seat") >= 1
+        })
+        .await,
+        "the seat refuses a relay SUBSCRIBE by name: {:?}",
+        seat.metrics.av_plane()
+    );
     assert!(cs.relayed_to().is_empty(), "{:?}", cs.relayed_to());
     assert_eq!(cs.alm_counts().forwarded, 0);
 }
