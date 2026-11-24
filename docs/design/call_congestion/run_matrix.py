@@ -49,7 +49,7 @@ BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4
             CAPUNTIL="50", HORIZON="260", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE",
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE", SILENT="FALSE", KEEPFRESH="FALSE", REPAIR="FALSE", CLEANUP="FALSE", CTRLBG="0", NCEVERY="10", KILLAT="0", UPSHED="FALSE",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -169,6 +169,28 @@ def scenarios():
     yield "f14-test-silent-keepfresh-cleanup", dict(f14t, KEEPFRESH="TRUE", CLEANUP="TRUE")
     yield "f14-test-silent-keepfresh-repair-cleanup", dict(f14t, KEEPFRESH="TRUE", REPAIR="TRUE",
                                                           CLEANUP="TRUE")
+    # The last queue term: P's other control (load only), against the 0.33-copy
+    # leftover (4 units at RCap 16, copy 12): (a) re-announce paced 1 part/s/leg
+    # and suspended while latched, (b) offers to non-children every 2 s.
+    f15 = dict(SHIP, M="12", RCAP="16", CAPUNTIL="1000", FEED='"fix2"', SILENT="TRUE",
+               KEEPFRESH="TRUE", CLEANUP="TRUE", BINDEVERY="100", BINDPACE="10", BINDEXP="TRUE",
+               BINDSKIP="TRUE", BINDSKIPMAX="100")
+    for bg in ["0", "1", "2", "3", "4"]:
+        yield f"ctrl-bg{bg}", dict(f15, CTRLBG=bg)
+        yield f"ctrl-bg{bg}-nc2s", dict(f15, CTRLBG=bg, NCEVERY="20")
+    yield "ctrl-nc2s-dead-C", dict(f15, NCEVERY="20", DEAD='"C"', DEADAT="30")
+    yield "ctrl-nc1s-dead-C", dict(f15, DEAD='"C"', DEADAT="30")
+    # The kill witness: P's leg to its first direct child torn mid-cap (t = 12 s).
+    kill = dict(f15, KILLAT="120", HORIZON="260")
+    yield "kill", kill
+    yield "kill-upstream-shed", dict(kill, UPSHED="TRUE")
+    yield "kill-test-config", dict(MIN, **on("SS"), INIT="2", HOLDT="100", M="12", RCAP="16",
+                                   CAPUNTIL="1000", FEED='"fix2"', SILENT="TRUE", KEEPFRESH="TRUE",
+                                   KILLAT="120")
+    yield "kill-test-config-upstream-shed", dict(MIN, **on("SS"), INIT="2", HOLDT="100", M="12",
+                                                 RCAP="16", CAPUNTIL="1000", FEED='"fix2"',
+                                                 SILENT="TRUE", KEEPFRESH="TRUE", KILLAT="120",
+                                                 UPSHED="TRUE")
     # The shipping set.
     for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
         fine = dict(SHIP, M="12", RCAP=r)

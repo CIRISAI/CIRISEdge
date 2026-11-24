@@ -77,6 +77,10 @@ CONSTANTS
                         \* leg to every node it receives from
     TreeRepair,         \* F14b: no new media on any path for RepairTicks -> re-subscribe
     AdmitCleanup,       \* an Admit nobody is waiting for is answered by an Unsubscribe
+    CtrlBg,             \* P's other A/V control, units per tick (load only)
+    NonChildEvery,      \* P offers to members that are not its children this often
+    KillAt,             \* P's leg to its first direct child is torn at this tick (0: never)
+    UpstreamShed,       \* a relay that loses its parent sheds its children (they fail over)
     RepairTicks,
     BindEvery,          \* F13: P re-announces its stream binding every BindEvery (0: off)
     BindParts,          \* ... as this many Channel messages per leg
@@ -203,7 +207,7 @@ VARIABLES
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual, maxQd,
     firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips,
+    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
@@ -211,7 +215,7 @@ VARIABLES
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd,
           firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, dialAt, dialBo, pathAt, children, order,
+          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, lastOfferNC, allOkAt, lostAt, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -239,7 +243,8 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         drainClear |-> drainClear, capEndQ |-> capEndQ, slowMoved |-> slowMoved,
         offerDirect |-> offerDirect, zeroRun |-> zeroRun, maxZeroRun |-> maxZeroRun,
         standbys |-> standbys, maxStallCopies |-> maxStallCopies, primaryGapRun |-> primaryGapRun,
-        maxPrimaryGap |-> maxPrimaryGap, bindSkips |-> bindSkips,
+        maxPrimaryGap |-> maxPrimaryGap, bindSkips |-> bindSkips, lastOfferNC |-> lastOfferNC,
+        allOkAt |-> allOkAt, lostAt |-> lostAt,
         stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
@@ -613,10 +618,21 @@ Subscribe(S, l, x) ==
 
 LWatch1(S, l, k) ==
     IF ~Alive(S, l) THEN S
-    ELSE LET S1 == IF S.parent[l] /= None /\ (~S.peerUp[<<S.parent[l], l>>] \/ ~S.up[<<l, S.parent[l]>>])
+    ELSE LET lost == S.parent[l] /= None /\ (~S.peerUp[<<S.parent[l], l>>] \/ ~S.up[<<l, S.parent[l]>>])
+             S0 == IF lost
                    THEN [S EXCEPT !.boUntil[l][S.parent[l]] = S.now + Backoff,
                                   !.parent[l] = None]
                    ELSE S
+             \* UpstreamShed: a relay that lost its parent sheds its children
+             \* (Shed{UpstreamLost}), so they fail over on the S1 path
+             kids == S0.relayKids[l]
+             RECURSIVE ShedKids(_, _)
+             ShedKids(T, ks) == IF ks = {} THEN T
+                                ELSE LET kd == CHOOSE kx \in ks : TRUE
+                                     IN ShedKids(SendCtrl(T, <<l, kd>>, Pay("shed")), ks \ {kd})
+             S1 == IF UpstreamShed /\ lost /\ kids /= {}
+                   THEN ShedKids([S0 EXCEPT !.relayKids[l] = {}], kids)
+                   ELSE S0
              S2 == IF S1.pendSub[l] /= None /\ S1.now - S1.pendAt[l] >= SubTimeout
                    THEN [S1 EXCEPT !.boUntil[l][S1.pendSub[l]] = S1.now + Backoff,
                                    !.pendSub[l] = None]
@@ -753,8 +769,11 @@ OffersOver(S, ns) ==
              \* a silent listener offers only to the other listeners (relay
              \* candidacy), nothing to P, unless KeepFresh (it receives from P)
              to == IF n /= "P" /\ SilentListener /\ ~KeepFresh THEN Nodes \ {n, "P"} ELSE Nodes \ {n}
+             ncDue == S.now - S.lastOfferNC >= NonChildEvery
+             to2 == IF n = "P" /\ ~ncDue THEN {m \in to : m \in S.children} ELSE to
              S1 == IF Alive(S, n) /\ S.now - S.lastOffer[n] >= every
-                   THEN OfferLegs([S EXCEPT !.lastOffer[n] = S.now], n, to)
+                   THEN OfferLegs([S EXCEPT !.lastOffer[n] = S.now,
+                                            !.lastOfferNC = IF n = "P" /\ ncDue THEN S.now ELSE @], n, to2)
                    ELSE S
          IN OffersOver(S1, ns \ {n})
 Offers(S) == Flush(Reannounce(OffersOver(S, Nodes)))
@@ -767,8 +786,11 @@ Publish(S) ==
              S1 == [S EXCEPT !.published = IF InWin(S.now) THEN @ + 1 ELSE @,
                              !.maxStallCopies = IF S.stall THEN Max(@, Cardinality(to)) ELSE @]
              per == IF StallDrain /\ S.stall THEN Max(1, (M * DrainPct) \div 100) ELSE M
-         IN IF to = {} THEN S1
-            ELSE Emit(S1, "P", Item("media", <<"P", "P">>, 0, 0, 0, NoPay, "P", to, S.now),
+             S1b == IF CtrlBg > 0
+                    THEN Emit(S1, "P", Item("close", <<"none", "none">>, -1, 0, 0, NoPay, "P", {}, S.now), CtrlBg)
+                    ELSE S1
+         IN IF to = {} THEN S1b
+            ELSE Emit(S1b, "P", Item("media", <<"P", "P">>, 0, 0, 0, NoPay, "P", to, S.now),
                       per * Cardinality(to))
 
 \* (a) The uplink drains Rate units at the end of the tick; what left it is
@@ -853,7 +875,9 @@ EndQueueDrainedS(S) == (OverS(S) /\ S.now - S.lastWiden >= Dwell + 4 * WindowTic
 ReparentBoundS(S) == \A c \in L : S.reparents[c] <= MaxReparents
 
 \* --- At the horizon (the terminal states) ---------------------------------
-EndParentedS(S) == OverS(S) => \A c \in AliveLS(S) : S.parent[c] /= None
+\* (a move begun within GapBound of the end is in flight, not a strand)
+EndParentedS(S) == OverS(S) => \A c \in AliveLS(S) :
+                       S.parent[c] /= None \/ (S.lostAt[c] >= 0 /\ S.now - S.lostAt[c] <= GapBound)
 EndHeardS(S) == OverS(S) => \A c \in AliveLS(S) : 10 * S.heard[c] >= 7 * S.published
 \* RecoverBy is stated per configuration (run_matrix.py): with SlowStart one
 \* stream per two clean windows plus the dwell; without, the ceiling's
@@ -868,7 +892,7 @@ DeadBound == OfferEvery + 2 * Wait(MaxTries, Base(SrttCap8)) + 13 * Base(SrttCap
 \* With ConditionalRto the dialer side is the cold ladder: one offer period
 \* for a message to be outstanding, its 5 cold waits (13 ticks), a watch tick.
 ColdSpan == Ordinary(1, 1) + Ordinary(2, 1) + Ordinary(3, 1) + Ordinary(4, 1) + Ordinary(5, 1)
-DialerDeadBound == IF ConditionalRto THEN OfferEvery + ColdSpan + 2
+DialerDeadBound == IF ConditionalRto THEN Max(OfferEvery, NonChildEvery) + ColdSpan + 2
                    ELSE OfferEvery + 2 * Wait(MaxTries, Base(SrttCap8)) + 13 * Base(SrttCap8) + 2
 DeadDetectedS(S) ==
     /\ (DeadNode /= None /\ S.now >= DeadAt + DialerDeadBound) =>
@@ -967,6 +991,11 @@ CloseIn(S, ls) ==
                                             !.peerUp[l] = FALSE, !.dialAt[l] = S.now + 100000], l[1], l[2])
                    ELSE S
          IN CloseIn(S1, ls \ {l})
+Kill(S, ch) ==
+    IF KillAt = 0 \/ S.now /= KillAt \/ S.children = {} THEN S
+    ELSE LET o == SelectSeq(S.order, LAMBDA x : x \in S.children)
+             c == IF o = <<>> THEN CHOOSE x \in S.children : TRUE ELSE o[1]
+         IN Flush(TearDown(S, <<"P", c>>, "killed", ch))
 Hangup(S) == IF Graceful /\ DeadNode \in L /\ S.now = DeadAt - 1
              THEN LET S1 == IF S.parent[DeadNode] /= None
                             THEN SendCtrl(S, <<DeadNode, S.parent[DeadNode]>>, Pay("unsub")) ELSE S
@@ -977,7 +1006,7 @@ Replays(S) == IF ReplayAttack /\ DeadNode /= None /\ S.now > DeadAt
               THEN Flush(ReplayTo(S, Nodes \ {DeadNode})) ELSE S
 
 Step(S, ch) ==
-    LET S1 == Timers(Flush(ProbeLegs(StartSetup(Replays(Hangup(S))))), ch)
+    LET S1 == Timers(Flush(ProbeLegs(StartSetup(Replays(Hangup(Kill(S, ch)))))), ch)
         S2 == Flush(StaleLegs(S1))
         S3 == Redial(S2)
         S4 == Watch(S3, ch)
@@ -993,6 +1022,13 @@ Step(S, ch) ==
                                           THEN S10.now ELSE @,
                            !.fullAt = IF @ < 0 /\ \A c \in {x \in L : Alive(S10, x)} : S10.parent[c] = "P" THEN S10.now ELSE @,
 
+                           !.lostAt = [c \in L |-> IF S10.parent[c] = None
+                                                    THEN (IF S.parent[c] /= None \/ @[c] < 0 THEN S10.now ELSE @[c])
+                                                    ELSE -1],
+                           !.allOkAt = IF @ < 0 /\ KillAt > 0 /\ S10.now > KillAt
+                                          /\ S10.children /= {}
+                                          /\ \A c \in {x \in L : Alive(S10, x)} : S10.parent[c] /= None
+                                       THEN S10.now ELSE @,
                            !.primaryGapRun = IF S10.children = {} /\ S10.standbys /= {} /\ Alive(S10, "P")
                                              THEN @ + 1 ELSE 0,
                            !.maxPrimaryGap = Max(@, IF S10.children = {} /\ S10.standbys /= {} /\ Alive(S10, "P")
@@ -1032,7 +1068,7 @@ Init ==
     /\ lastFromParent = [c \in L |-> 0] /\ drainClear = -1 /\ capEndQ = -1 /\ slowMoved = FALSE
     /\ offerDirect = [c \in L |-> [n \in Nodes |-> FALSE]] /\ zeroRun = 0 /\ maxZeroRun = 0
     /\ standbys = {} /\ maxStallCopies = 0 /\ primaryGapRun = 0 /\ maxPrimaryGap = 0
-    /\ bindSkips = [l \in Legs |-> 0]
+    /\ bindSkips = [l \in Legs |-> 0] /\ lastOfferNC = -100 /\ allOkAt = -1 /\ lostAt = [c \in L |-> -1]
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
     /\ children = {} /\ order = <<>> /\ drainTo = [c \in L |-> -1]
@@ -1073,7 +1109,8 @@ Assign(S) ==
     /\ lastFromParent' = S.lastFromParent /\ drainClear' = S.drainClear /\ capEndQ' = S.capEndQ /\ slowMoved' = S.slowMoved
     /\ offerDirect' = S.offerDirect /\ zeroRun' = S.zeroRun /\ maxZeroRun' = S.maxZeroRun
     /\ standbys' = S.standbys /\ maxStallCopies' = S.maxStallCopies
-    /\ primaryGapRun' = S.primaryGapRun /\ maxPrimaryGap' = S.maxPrimaryGap /\ bindSkips' = S.bindSkips /\ dialAt' = S.dialAt
+    /\ primaryGapRun' = S.primaryGapRun /\ maxPrimaryGap' = S.maxPrimaryGap /\ bindSkips' = S.bindSkips
+    /\ lastOfferNC' = S.lastOfferNC /\ allOkAt' = S.allOkAt /\ lostAt' = S.lostAt /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden
@@ -1127,7 +1164,8 @@ EventuallyNothingOutstanding == \A l \in Legs : <>(chan[l] = <<>> \/ ~up[l] \/ O
 Outcome ==
     LET k == {t \in torn : t.why = "exhausted" /\ t.peerAlive}
     IN IF k /= {} THEN "Collapsed"
-       ELSE IF \E c \in AliveL : parent[c] = None THEN "Stranded"
+       ELSE IF \E c \in AliveL : parent[c] = None /\ ~(lostAt[c] >= 0 /\ now - lostAt[c] <= GapBound)
+            THEN "Stranded"
        ELSE IF \E c \in AliveL : 10 * heard[c] < 7 * published THEN "Starved"
        ELSE IF Direct = AliveL THEN "FullFanOut"
        ELSE "Relayed(direct=" \o ToString(Cardinality(Direct)) \o ")"
@@ -1150,7 +1188,7 @@ Observed ==
      first_verdict |-> firstVerdictAt, first_shed |-> firstShedAt, q_at_shed |-> firstShedQ,
      full_at |-> fullAt, parent_gap |-> maxParentGap, media_gap |-> maxMediaGap,
      drain_clear |-> drainClear, cap_end_q |-> capEndQ, zero_direct |-> maxZeroRun,
-     stall_copies |-> maxStallCopies, primary_gap |-> maxPrimaryGap, verdict_rises |-> verdicts,
+     all_ok_after_kill |-> IF allOkAt >= 0 THEN allOkAt - KillAt ELSE IF KillAt > 0 THEN 9999 ELSE -1, stall_copies |-> maxStallCopies, primary_gap |-> maxPrimaryGap, verdict_rises |-> verdicts,
      heard_pct |-> [c \in L |-> IF published = 0 THEN 100 ELSE (100 * heard[c]) \div published]]
 \* One line per terminal state: the outcome, the violated set, what is observed.
 RecordOutcome == Over => PrintT(<<"OUTCOME", Outcome, bad, Observed>>)
