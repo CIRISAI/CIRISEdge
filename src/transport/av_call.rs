@@ -1860,6 +1860,9 @@ struct Shared {
     /// G8 — rung when a fan-out parks a chunk: the flusher retries it with
     /// the publisher lock taken briefly, never inside `publish`.
     parked_wake: tokio::sync::Notify,
+    /// G8 C — members whose direct path came up while a leg dial to them was
+    /// in flight: if that dial fails, it is retried at once.
+    path_up_mid_dial: StdMutex<std::collections::HashSet<String>>,
     /// G8 — the legs (by peer) whose oldest unproved Channel message is
     /// backlogged ([`alm::UPLINK_BACKLOG_MS`]): their periodic offers are
     /// held until it is proved.
@@ -2571,6 +2574,7 @@ impl Call {
             leg_rates: StdMutex::new(HashMap::new()),
             queue_age_ms: AtomicU64::new(0),
             parked_wake: tokio::sync::Notify::new(),
+            path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
             backlogged_legs: StdMutex::new(std::collections::HashSet::new()),
             load,
             setup_began: std::time::Instant::now(),
@@ -4292,11 +4296,15 @@ async fn redial_on_direct_path(shared: Arc<Shared>) {
             let mut dialling = Shared::lock(&shared.dialling);
             // A dial in flight holds its entry an hour ahead; a backoff at
             // most DIAL_BACKOFF_MAX.
-            let backing_off = dialling
-                .get(&peer)
-                .is_some_and(|until| *until > now && *until <= now + DIAL_BACKOFF_MAX);
+            let until = dialling.get(&peer).copied();
+            let backing_off = until.is_some_and(|u| u > now && u <= now + DIAL_BACKOFF_MAX);
             if backing_off {
                 dialling.remove(&peer);
+            } else if until.is_some_and(|u| u > now + DIAL_BACKOFF_MAX) {
+                // In flight: it may have started before the path stood and
+                // fail on that ("no route"); if it does, it redials at once
+                // instead of backing off (reconcile_legs).
+                Shared::lock(&shared.path_up_mid_dial).insert(peer.clone());
             }
             backing_off
         };
@@ -4338,6 +4346,16 @@ fn reconcile_legs(shared: &Arc<Shared>) {
             if ok {
                 dialling.remove(&m);
                 Shared::lock(&s.backoff).remove(&m);
+                Shared::lock(&s.path_up_mid_dial).remove(&m);
+            } else if Shared::lock(&s.path_up_mid_dial).remove(&m) {
+                // G8 C — the member's direct path came up while this dial was
+                // in flight (it started with no path and failed on that):
+                // dial again now, not after the backoff (measured 12.6 s
+                // with the path already up). Once per path-up.
+                dialling.remove(&m);
+                drop(dialling);
+                s.count(crate::observability::AV_LEG_REDIAL_ON_DIRECT_PATH);
+                reconcile_legs(&s);
             } else {
                 let mut backoff = Shared::lock(&s.backoff);
                 let b = backoff
@@ -4735,9 +4753,10 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
         if !Shared::lock(&shared.alm).speaks_c3(&o.to) {
             continue;
         }
-        // G8 — a periodic offer to a backlogged leg would only queue behind
-        // it and spend its Channel's retry budget; the next one replaces it.
-        if is_periodic(&o.frame) && Shared::lock(&shared.backlogged_legs).contains(&o.to) {
+        // G8 / row D1 — a periodic offer to a backlogged leg would only queue
+        // behind it and spend its Channel's retry budget; the next one
+        // replaces it. Any other leg keeps the normal cadence.
+        if offer_held(&o.frame, &o.to, &Shared::lock(&shared.backlogged_legs)) {
             shared.count(crate::observability::ALM_OFFER_HELD_BACKLOG);
             continue;
         }
@@ -4785,6 +4804,14 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
             tokio::spawn(async move { resend_c3(&s, o).await });
         }
     }
+}
+
+/// G8 / row D1 — whether a C3 frame to `to` is held: a periodic OFFER to a
+/// leg whose oldest unproved Channel message is backlogged. Nothing else,
+/// and never a leg with nothing outstanding (the verdict being latched does
+/// not matter here).
+fn offer_held(frame: &[u8], to: &str, backlogged: &std::collections::HashSet<String>) -> bool {
+    is_periodic(frame) && backlogged.contains(to)
 }
 
 /// Retry a C3 frame a congested link refused, until [`C3_RESEND_BUDGET`]

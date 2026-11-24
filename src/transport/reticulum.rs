@@ -13219,6 +13219,35 @@ fn resource_concluded(
         .is_some_and(|at| at.elapsed() < INBOUND_TRANSFER_STALL)
 }
 
+/// G8 C — whether a link attached to `attached` rode the punched interface
+/// `released`: only a link known to be on exactly it. A link whose interface
+/// leviculum no longer names is left to its own retries rather than risk a
+/// healthy path.
+const fn on_released_interface(attached: Option<usize>, released: usize) -> bool {
+    matches!(attached, Some(i) if i == released)
+}
+
+#[cfg(test)]
+mod released_interface_tests {
+    use super::on_released_interface;
+
+    /// G8 C — a release closes only the A/V links attached to the released
+    /// punched interface: a link on another interface (a LAN path to the
+    /// same peer) or of unknown attachment is left up.
+    #[test]
+    fn only_a_link_on_the_released_interface_is_closed() {
+        assert!(on_released_interface(Some(3), 3));
+        assert!(
+            !on_released_interface(Some(1), 3),
+            "another interface stays up"
+        );
+        assert!(
+            !on_released_interface(None, 3),
+            "unknown attachment stays up"
+        );
+    }
+}
+
 /// CIRISEdge#853 (Codex round two on #854) — is `link_id` a pooled lane, in
 /// either pool family (identity `reusable_dialed_link` or scoped
 /// `reusable_scoped_link`)? A linear scan over the pools' lanes: both are small
@@ -19663,10 +19692,11 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // peer's direct path so its next dial proposes at once.
             // Bound first: the tracker's std guard must not live across the
             // path request's await below.
-            let released = ctx
-                .direct_paths
-                .tracker()
-                .link_closed(link_id, std::time::Instant::now());
+            let (released, released_iface) = {
+                let mut t = ctx.direct_paths.tracker();
+                let iface = t.interface_of_link(link_id);
+                (t.link_closed(link_id, std::time::Instant::now()), iface)
+            };
             if let Some(peer) = released {
                 tracing::info!(
                     peer = %peer,
@@ -19693,14 +19723,15 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                         );
                     }
                 }
-                // G8 C — the A/V links this node dialled to the peer rode the
-                // punched interface (a call's scope-derived address answers
-                // only a direct neighbour): they are dead with it, but an
-                // idle one waits out its Channel's retries before anyone
-                // knows (2-10 s measured). Close them now, so the call's leg
-                // redials at once (its redial proposes the new punch); the
-                // peer's own release closes the ones it dialled here.
-                let av_links: Vec<LinkId> = ctx
+                // G8 C — released punched interface ∧ an A/V link this node
+                // dialled to the peer is attached to THAT interface → close
+                // it now; never a link on any other interface (a LAN path to
+                // the same peer stays up). Such a link is dead with the
+                // interface, but an idle one waits out its Channel's retries
+                // before anyone knows (2-10 s measured); closed, the call's
+                // leg redials at once (its redial proposes the new punch).
+                // The peer's own release closes the ones it dialled here.
+                let dialled: Vec<LinkId> = ctx
                     .av_dialed_peer
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -19708,6 +19739,23 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     .filter(|(_, p)| **p == peer)
                     .map(|(l, _)| *l)
                     .collect();
+                let av_links: Vec<LinkId> = match released_iface {
+                    Some(iface) if !dialled.is_empty() => {
+                        let attached: HashMap<LinkId, Option<usize>> = ctx
+                            .node
+                            .link_list()
+                            .into_iter()
+                            .map(|l| (l.link_id, l.interface_index))
+                            .collect();
+                        dialled
+                            .into_iter()
+                            .filter(|l| {
+                                on_released_interface(attached.get(l).copied().flatten(), iface)
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
                 for l in av_links {
                     let closed = ctx.node.close_link(&l).await;
                     tracing::info!(

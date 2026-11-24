@@ -998,6 +998,17 @@ impl DirectPathTracker {
             .is_some_and(|u| held_failure(failure, now.saturating_duration_since(u.since)))
     }
 
+    /// G8 C — the punched interface `link` (a peer's identity link) rides,
+    /// while its peer's direct path is `Direct` on that link.
+    #[must_use]
+    pub fn interface_of_link(&self, link: LinkId) -> Option<usize> {
+        let peer = self.link_peer.get(&link)?;
+        match self.peers.get(peer)?.entry {
+            Entry::Direct { link: l, interface } if l == link => Some(interface),
+            _ => None,
+        }
+    }
+
     /// Where `peer`'s direct path stands, if it was ever proposed to.
     #[must_use]
     pub fn state(&self, peer: &str) -> Option<DirectPathState> {

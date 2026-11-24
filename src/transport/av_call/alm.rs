@@ -299,12 +299,6 @@ pub(super) struct AlmState {
 /// stalled: far above any propagation floor this mesh runs at, and under
 /// leviculum's ~1.3 s retry budget (leviculum#113).
 pub(super) const UPLINK_STALL_MS: u64 = 400;
-/// G8 — while this node's uplink is stalled its offers go out this rarely
-/// instead of every [`OFFER_EVERY_MS`]: a bounded hold. An offer is a hint
-/// that only queues behind the backlog; the relays' offers (their uplinks are
-/// not stalled) carry the re-parenting, and a stalled node still offers
-/// every few seconds so nobody forgets it.
-pub(super) const STALL_OFFER_EVERY_MS: u64 = 5_000;
 /// G8 — how many stalled legs make it the UPLINK (not one slow peer). With
 /// one leg (a two-person call) there is no verdict, and none is needed: a
 /// publisher with one child has nothing to shed.
@@ -418,10 +412,9 @@ impl AlmState {
     /// exhaustion, ~1.3 s) before a window closes, and their detection with
     /// them (CIRISEdge 45.2.0, the capped witness: verdict 1, shed 0). The
     /// shed keeps ONE direct child (LIFO) and lets the relay work go. While
-    /// the verdict holds, every egress window reads congested at that room
-    /// and periodic offers are held to one every [`STALL_OFFER_EVERY_MS`]
-    /// (they would only queue behind the backlog and spend the Channel's
-    /// retry budget).
+    /// the verdict holds, every egress window reads congested at that room.
+    /// Offers keep their cadence (row D1): only a BACKLOGGED leg's offer is
+    /// held, at the send (`alm_offer_held:backlog`).
     pub(super) fn set_uplink_stall(&mut self, detected: bool) {
         let now = self.now_ms();
         if detected {
@@ -1826,14 +1819,14 @@ impl AlmState {
             }
         }
 
-        // Offers (C3) to every C3 member this node can reach; held to one every
-        // STALL_OFFER_EVERY_MS while the uplink is stalled (G8).
-        let offer_every = if self.uplink_stall {
-            STALL_OFFER_EVERY_MS
-        } else {
-            OFFER_EVERY_MS
-        };
-        if now.saturating_sub(self.last_offer_ms) >= offer_every || self.last_offer_ms == 0 {
+        // Offers (C3) to every C3 member this node can reach, every
+        // OFFER_EVERY_MS, stalled or not. Row D1: latched verdict ∧ a leg
+        // with nothing unproved → that leg keeps the normal cadence (its
+        // Channel traffic is what a dead peer is noticed by: the gap between
+        // messages plus the retry ladder); latched ∧ backlogged leg → its
+        // offer is held at the send (av_call `send_alm`). Never a blanket
+        // hold-back: 5 s on every leg made a dead listener noticed ~4 s late.
+        if now.saturating_sub(self.last_offer_ms) >= OFFER_EVERY_MS || self.last_offer_ms == 0 {
             self.last_offer_ms = now.max(1);
             let mut own_offer = self.own.offer();
             own_offer.headroom_bps = self.nominal(own_offer.headroom_bps, &self.own_rate);
@@ -2494,16 +2487,22 @@ mod tests {
             shed.contains(&"c".to_owned()) && shed.contains(&"d".to_owned()),
             "{shed:?}"
         );
-        assert!(
-            !out.iter().any(|o| matches!(
-                decode(&o.frame, "a"),
-                Ok(WireFrame::Control(ControlFrame {
-                    msg: ControlMsg::Offer(_),
-                    ..
-                }))
-            )),
-            "no offers while stalled"
-        );
+        // Row D1: the verdict holds back no offers here (a backlogged leg's
+        // is held at the send); a leg with nothing outstanding keeps its
+        // normal cadence, so a dead peer on it is still noticed in time.
+        let offers = out
+            .iter()
+            .filter(|o| {
+                matches!(
+                    decode(&o.frame, "a"),
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Offer(_),
+                        ..
+                    }))
+                )
+            })
+            .count();
+        assert!(offers >= 2, "an offer each window while stalled: {offers}");
     }
 
     /// G8 — publisher `a` of a four-person room with `kids` children admitted

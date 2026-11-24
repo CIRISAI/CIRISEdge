@@ -982,3 +982,25 @@ fn a_replacement_is_not_a_leave() {
     assert_eq!(ev, added("carol", 7));
     assert!(!a.ended.contains(&("carol".to_owned(), StreamId([5; 32]))));
 }
+
+/// G8 / row D1 — under a latched stall verdict only a BACKLOGGED leg's
+/// periodic offer is held; a leg with nothing outstanding keeps its cadence,
+/// and nothing but an offer is ever held.
+#[test]
+fn only_a_backlogged_leg_holds_its_offer() {
+    let mut offer = vec![0u8; 16];
+    offer[5] = 0x07; // KIND_OFFER
+    assert!(is_periodic(&offer), "the fixture is an offer");
+    let mut not_offer = offer.clone();
+    not_offer[5] = 0x01;
+    let backlogged: std::collections::HashSet<String> = ["b".to_owned()].into_iter().collect();
+    assert!(offer_held(&offer, "b", &backlogged));
+    assert!(
+        !offer_held(&offer, "c", &backlogged),
+        "a clear leg keeps its cadence"
+    );
+    assert!(
+        !offer_held(&not_offer, "b", &backlogged),
+        "only offers are held"
+    );
+}

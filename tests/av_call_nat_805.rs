@@ -1082,7 +1082,7 @@ fn path_events(seen: &std::sync::Mutex<Vec<CallEvent>>) -> Vec<CallEvent> {
 /// - `A`'s leg to `B` proposes, `B` refuses, the dial across `T` cannot
 ///   stand: `A` fires exactly one `MediaPathFailed { member: B, cause:
 ///   refused_by_peer_policy, retryable: false, detail: peer_reject_policy,
-///   relay: refused_by_policy }`, its `tried` the reflexive
+///   relay: none_available }` (`T` is not in the call), its `tried` the reflexive
 ///   punch refused, its NAT `unknown` (this leviculum pin measures nothing)
 ///   and no peer report (no carrier on this pin).
 /// - `B`'s leg to `A` cannot propose at all: one `MediaPathFailed { member:
@@ -1154,7 +1154,12 @@ async fn a_failed_media_path_says_why_once_and_is_restored() {
             assert!(!retryable);
             assert_eq!(*retry_after_s, None);
             assert_eq!(*detail, Some(PathDetail::PeerRejectPolicy));
-            assert_eq!(*relay, RelayStanding::RefusedByPolicy);
+            // `T` is a transport and the facilitator, not in the room or the
+            // call: nobody could relay, so `none_available` (the frozen doc).
+            // `refused_by_policy` is only for a serve seat IN the call whose
+            // offer was dropped (an older seat that still offers; since
+            // 45.2.0 a seat never offers): the alm unit tests feed one.
+            assert_eq!(*relay, RelayStanding::NoneAvailable);
             assert_eq!(tried.len(), 1, "{tried:?}");
             assert_eq!(tried[0].kind, PathKind::DirectReflexive);
             assert_eq!(tried[0].outcome, PathOutcome::RefusedByPeer);
@@ -1179,7 +1184,7 @@ async fn a_failed_media_path_says_why_once_and_is_restored() {
             assert_eq!(*cause, MediaPathCause::NoFacilitator);
             assert!(retryable);
             assert_eq!(*detail, Some(PathDetail::FacilitatorUnresolved));
-            assert_eq!(*relay, RelayStanding::RefusedByPolicy);
+            assert_eq!(*relay, RelayStanding::NoneAvailable);
             assert_eq!(
                 tried
                     .iter()
@@ -1227,7 +1232,26 @@ async fn a_failed_media_path_says_why_once_and_is_restored() {
         path_events(&seen_b),
         call_a.legs()
     );
-    assert!(!call_a.legs().is_empty() && !call_b.legs().is_empty());
+    // Each side's restore fires when the FIRST leg between them is up (B's
+    // on A's leg arriving); B's own leg follows: its dial in flight started
+    // with no path and fails "no route" (~4 s), then redials at once because
+    // the path came up meanwhile (G8 C), so one failed dial plus one dial.
+    // Before, it waited out a full backoff with the path up (12.6 s).
+    let legs_from = tokio::time::Instant::now();
+    let both = wait_until(Duration::from_secs(8), || async {
+        !call_a.legs().is_empty() && !call_b.legs().is_empty()
+    })
+    .await;
+    eprintln!(
+        "[MPF] both legs up after the restore: {both} in {:?}",
+        legs_from.elapsed()
+    );
+    assert!(
+        both,
+        "both legs up: A {:?}, B {:?}",
+        call_a.legs(),
+        call_b.legs()
+    );
     for (seen, peer) in [(&seen_a, &b_id), (&seen_b, &a_id)] {
         match &path_events(seen)[..] {
             [CallEvent::MediaPathFailed { member: f, .. }, CallEvent::MediaPathRestored { member, via, .. }] =>
