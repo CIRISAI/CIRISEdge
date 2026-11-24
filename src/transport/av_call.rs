@@ -1848,6 +1848,11 @@ struct Shared {
     /// this node has no leg of its own to that member).
     in_senders:
         StdMutex<HashMap<String, Arc<crate::transport::realtime_av_runtime::LeviculumAvSender>>>,
+    /// The sender of each live in-link by link id: when the in-link whose
+    /// sender `in_senders` holds closes while another from the same member
+    /// stands (two dials raced, or a redial), that one's takes its place.
+    in_link_senders:
+        StdMutex<HashMap<[u8; 16], Arc<crate::transport::realtime_av_runtime::LeviculumAvSender>>>,
     /// ALM C5 — each out-leg's media TTLs (set once its peer takes timed frames).
     leg_ttl: StdMutex<HashMap<String, Arc<crate::transport::realtime_av_runtime::MediaTtl>>>,
     /// ALM C5 — each out-leg's congestion streaks and whether it is shed to
@@ -1874,6 +1879,10 @@ struct Shared {
     /// G8 C — members whose direct path came up while a leg dial to them was
     /// in flight: if that dial fails, it is retried at once.
     path_up_mid_dial: StdMutex<std::collections::HashSet<String>>,
+    /// Members a second leg dial races an in-flight one to: the member
+    /// dialled this node meanwhile, so its call address stands, and the first
+    /// dial may be waiting out a no-path establish timeout from before it did.
+    racing_dial: StdMutex<std::collections::HashSet<String>>,
     /// G8 serial redial — members whose leg this node had and lost, not yet
     /// redialled (a redial may be deferred once; a first dial never is).
     lost_legs: StdMutex<std::collections::HashSet<String>>,
@@ -2584,6 +2593,7 @@ impl Call {
                 a
             }),
             in_senders: StdMutex::new(HashMap::new()),
+            in_link_senders: StdMutex::new(HashMap::new()),
             leg_ttl: StdMutex::new(HashMap::new()),
             leg_cong: StdMutex::new(HashMap::new()),
             rx_legs: StdMutex::new(HashMap::new()),
@@ -2593,6 +2603,7 @@ impl Call {
             queue_age_ms: AtomicU64::new(0),
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
+            racing_dial: StdMutex::new(std::collections::HashSet::new()),
             lost_legs: StdMutex::new(std::collections::HashSet::new()),
             reannounce_skipped: StdMutex::new(HashMap::new()),
             reannounce_running: AtomicBool::new(false),
@@ -2931,6 +2942,22 @@ impl Call {
         Shared::lock(&self.shared.out_legs)
             .get(member)
             .map(|l| l.link_id)
+    }
+
+    /// Test seam — the members the publisher's dispatcher holds a leg to
+    /// (what a send can reach), beside [`Self::legs`] (what the call
+    /// believes it has); the two must agree.
+    #[doc(hidden)]
+    pub async fn dispatcher_legs_for_test(&self) -> Vec<String> {
+        let mut v = self
+            .shared
+            .publisher
+            .lock()
+            .await
+            .dispatcher_mut()
+            .subscriber_ids();
+        v.sort();
+        v
     }
 
     /// The members this node has a leg to.
@@ -4019,8 +4046,7 @@ async fn send_own_chunk(
         .map(|(peer, leg)| {
             let outcome = leg_outcome(leg);
             if outcome == LegOutcome::Gone {
-                Shared::lock(&shared.out_legs).remove(&peer);
-                Shared::lock(&shared.alm).on_child_link_down(&peer);
+                out_leg_gone(shared, &peer);
             }
             (peer, outcome)
         })
@@ -4308,10 +4334,28 @@ async fn redial_on_direct_path(shared: Arc<Shared>) {
         if shared.ended.load(Ordering::Relaxed) {
             return;
         }
+        dial_now_if_backing_off(&shared, &peer, "a direct path came up");
+    }
+}
+
+/// `peer` is reachable now (a direct path came up, or it just dialled this
+/// node): if this node has no leg to it and is only waiting out a failed
+/// dial's backoff, dial now; a dial in flight that fails redials at once.
+/// At setup a member dialled before its call address stood fails ("derived
+/// destination did not establish") and backed off to the next tick or
+/// longer, while the member's own leg here was already up (rxmove's
+/// come-back trace: P had no leg to any member for ~5 s, and its ADMITs rode
+/// the members' paced in-links).
+/// [`dial_now_if_backing_off`]'s reason when the member dialled this node.
+const RACE_ON_INBOUND: &str = "the member dialled this node";
+
+fn dial_now_if_backing_off(shared: &Arc<Shared>, peer: &str, why: &'static str) {
+    {
+        let peer = peer.to_owned();
         if !Shared::lock(&shared.members).contains(&peer)
             || Shared::lock(&shared.out_legs).contains_key(&peer)
         {
-            continue;
+            return;
         }
         let now = Instant::now();
         let waiting_backoff = {
@@ -4327,6 +4371,24 @@ async fn redial_on_direct_path(shared: Arc<Shared>) {
                 // fail on that ("no route"); if it does, it redials at once
                 // instead of backing off (reconcile_legs).
                 Shared::lock(&shared.path_up_mid_dial).insert(peer.clone());
+                // The member dialled this node: its address stands NOW, and
+                // the dial in flight may sit out the whole no-path establish
+                // timeout from before it did (5 s at every early joiner's
+                // setup). A second dial races it; the loser closes its link.
+                if why == RACE_ON_INBOUND && Shared::lock(&shared.racing_dial).insert(peer.clone())
+                {
+                    let s = Arc::clone(shared);
+                    let m = peer.clone();
+                    tokio::spawn(async move {
+                        let ok = dial_leg(&s, &m).await;
+                        Shared::lock(&s.racing_dial).remove(&m);
+                        if ok {
+                            Shared::lock(&s.backoff).remove(&m);
+                            Shared::lock(&s.lost_legs).remove(&m);
+                        }
+                    });
+                    shared.count(crate::observability::AV_LEG_REDIAL_ON_DIRECT_PATH);
+                }
             }
             backing_off
         };
@@ -4334,10 +4396,11 @@ async fn redial_on_direct_path(shared: Arc<Shared>) {
             Shared::lock(&shared.backoff).remove(&peer);
             tracing::debug!(
                 peer = %peer,
-                "call leg: a direct path came up while the leg waited out a dial backoff; dialling now (G8 C)"
+                why,
+                "call leg: the member is reachable while the leg waited out a dial backoff; dialling now (G8 C)"
             );
             shared.count(crate::observability::AV_LEG_REDIAL_ON_DIRECT_PATH);
-            reconcile_legs(&shared);
+            reconcile_legs(shared);
         }
     }
 }
@@ -4501,10 +4564,12 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
     else {
         return false;
     };
+    let started = tokio::time::Instant::now();
     let (dialled, path) = shared
         .transport
         .open_av_link_with_path(member, &address)
         .await;
+    let opened_ms = started.elapsed().as_millis();
     let link = match dialled {
         Ok(l) => l,
         Err(e) => {
@@ -4529,13 +4594,21 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         let _ = shared.transport.link_teardown(&link.link_id).await;
         return false;
     }
+    // A racing dial (`racing_dial`) already stood the leg up: this link is
+    // not needed.
+    if Shared::lock(&shared.out_legs).contains_key(member) {
+        let _ = shared.transport.link_teardown(&link.link_id).await;
+        return true;
+    }
     let Some(channel_limit) = link.sender.channel_limit() else {
         return false;
     };
     // The stream hello: the link's first message after the transit KEX.
     let hello = encode_hello(shared.stream());
     let deadline = tokio::time::Instant::now() + HELLO_BUDGET;
-    if let Err(e) = send_patiently(&link.sender, &hello, deadline).await {
+    let hello_sent = send_patiently(&link.sender, &hello, deadline).await;
+    let hello_ms = started.elapsed().as_millis();
+    if let Err(e) = hello_sent {
         tracing::debug!(peer = %member, error = %e, "call leg: hello not sent");
         let _ = shared.transport.link_teardown(&link.link_id).await;
         return false;
@@ -4588,6 +4661,13 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         {
             return false;
         }
+        // Two dials to one member can race (`racing_dial`): the one that
+        // finds a leg already standing closes its own link.
+        if Shared::lock(&shared.out_legs).contains_key(member) {
+            drop(publisher);
+            let _ = shared.transport.link_teardown(&link_id).await;
+            return true;
+        }
         if let Err(e) = publisher.add_subscriber(AvSubscriberLink {
             subscriber: member.to_owned(),
             transit_key: seal_key,
@@ -4603,15 +4683,16 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         // The binding parts just filled the link's Channel window: the leg
         // settles, so the first chunks retry rather than drop.
         publisher.dispatcher_mut().settle(&member.to_owned());
+        // Under the publisher lock, so a racing dial's check above sees it.
+        Shared::lock(&shared.out_legs).insert(
+            member.to_owned(),
+            OutLeg {
+                link_id,
+                channel_limit,
+                media: Arc::clone(&media_ttl),
+            },
+        );
     }
-    Shared::lock(&shared.out_legs).insert(
-        member.to_owned(),
-        OutLeg {
-            link_id,
-            channel_limit,
-            media: Arc::clone(&media_ttl),
-        },
-    );
     // ALM C5 — media to a peer that takes timed frames rides them; one that
     // takes datagrams (leviculum#102) gets them instead.
     {
@@ -4638,6 +4719,9 @@ async fn dial_leg(shared: &Arc<Shared>, member: &str) -> bool {
         peer = %member,
         link = %hex::encode(link_id),
         channel_limit,
+        opened_ms,
+        hello_ms,
+        up_ms = started.elapsed().as_millis(),
         "call leg UP: this node's stream rides a keyed link to the member (CIRISEdge#805)"
     );
     true
@@ -4721,11 +4805,17 @@ async fn send_patiently(
     bytes: &[u8],
     deadline: tokio::time::Instant,
 ) -> Result<(), AvDispatcherError> {
+    // From 1 ms, doubling to 25: a refusal is the Channel window (free again
+    // one proof later, a round trip) or its pacing gate (free at rtt/window);
+    // a fixed 25 ms poll made a new leg's bindings (dozens of parts at the
+    // initial window of 2) take ~1 s on loopback, the whole setup's tail.
+    let mut pause = Duration::from_millis(1);
     loop {
         match sender.send(bytes).await {
             Ok(()) => return Ok(()),
             Err(AvDispatcherError::Congested) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_millis(25));
             }
             Err(e) => return Err(e),
         }
@@ -4781,6 +4871,10 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
         alm.caps_frame(shared.transport.av_datagrams_enabled())
     };
     Shared::lock(&shared.in_senders).insert(peer.clone(), Arc::clone(&sender));
+    Shared::lock(&shared.in_link_senders).insert(link_id, Arc::clone(&sender));
+    // The member reached this node: its call address stands, so a leg back
+    // to it that failed for want of one is dialled now.
+    dial_now_if_backing_off(&shared, &peer, RACE_ON_INBOUND);
     let deadline = tokio::time::Instant::now() + HELLO_BUDGET;
     if send_patiently(&sender, &caps, deadline).await.is_ok() {
         shared.count(crate::observability::ALM_C3_SENT);
@@ -4791,9 +4885,24 @@ async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
     if !Shared::lock(&shared.in_links).values().any(|p| *p == peer) {
         Shared::lock(&shared.alm).on_parent_link_down(&peer);
     }
+    Shared::lock(&shared.in_link_senders).remove(&link_id);
+    let other = {
+        let ins = Shared::lock(&shared.in_links);
+        let by_link = Shared::lock(&shared.in_link_senders);
+        ins.iter()
+            .filter(|(_, p)| **p == peer)
+            .find_map(|(l, _)| by_link.get(l).cloned())
+    };
     let mut senders = Shared::lock(&shared.in_senders);
     if senders.get(&peer).is_some_and(|s| Arc::ptr_eq(s, &sender)) {
-        senders.remove(&peer);
+        match other {
+            Some(o) => {
+                senders.insert(peer, o);
+            }
+            None => {
+                senders.remove(&peer);
+            }
+        }
     }
 }
 
@@ -4917,6 +5026,11 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
             .dispatcher_mut()
             .send_control_to(&o.to, &o.frame)
             .await;
+        // Gone, or a leg the dispatcher no longer holds (dial_leg adds it
+        // there before `out_legs`, so this is a real mismatch).
+        if matches!(sent, Some(LegSend::Gone) | None) {
+            out_leg_gone(shared, &o.to);
+        }
         let (ok, why) = if let Some(LegSend::Sent) = sent {
             (true, String::new())
         } else {
@@ -4987,6 +5101,11 @@ async fn resend_c3(shared: &Arc<Shared>, o: alm::Outgoing) {
             .dispatcher_mut()
             .send_control_to(&o.to, &o.frame)
             .await;
+        // Gone, or a leg the dispatcher no longer holds (dial_leg adds it
+        // there before `out_legs`, so this is a real mismatch).
+        if matches!(sent, Some(LegSend::Gone) | None) {
+            out_leg_gone(shared, &o.to);
+        }
         let mut ok = matches!(sent, Some(LegSend::Sent));
         if !ok {
             let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
@@ -5034,6 +5153,11 @@ async fn retry_offer_once(shared: &Arc<Shared>, o: alm::Outgoing) {
         .dispatcher_mut()
         .send_control_to(&o.to, &o.frame)
         .await;
+    // Gone, or a leg the dispatcher no longer holds (dial_leg adds it
+    // there before `out_legs`, so this is a real mismatch).
+    if matches!(sent, Some(LegSend::Gone) | None) {
+        out_leg_gone(shared, &o.to);
+    }
     let mut ok = matches!(sent, Some(LegSend::Sent));
     if !ok {
         let sender = Shared::lock(&shared.in_senders).get(&o.to).cloned();
@@ -5160,23 +5284,50 @@ async fn out_leg_reader(
             handle_c3(&shared, &peer, &f.bytes, true).await;
         }
     }
-    // The leg's link closed: unless a fresh leg replaced it, the member holds
-    // no commitment here any more.
-    let replaced = Shared::lock(&shared.out_legs)
+    // The leg's link closed: unless a fresh leg replaced it (or a send
+    // already found it gone), the member holds no commitment here any more.
+    let mine = Shared::lock(&shared.out_legs)
         .get(&peer)
-        .is_some_and(|l| l.link_id != link_id);
-    if !replaced {
-        Shared::lock(&shared.out_legs).remove(&peer);
-        Shared::lock(&shared.lost_legs).insert(peer.clone());
-        let mut a = Shared::lock(&shared.alm);
-        a.on_child_link_down(&peer);
-        // Row T1 — this node's OWN leg toward a member it receives a stream
-        // from is torn → that parent is lost: fail over now, as when its
-        // media leg closes (the two die together on a congested uplink, but
-        // which close lands first is not ours to pick; waiting for the
-        // other one left a listener on a parent that heard nothing).
-        a.on_parent_link_down(&peer);
+        .is_some_and(|l| l.link_id == link_id);
+    if mine {
+        leg_lost(&shared, &peer);
     }
+}
+
+/// A send found this node's own leg to `peer` gone (the dispatcher dropped
+/// it: the link is no longer held). The call's legs must say so too: the
+/// dispatcher had forgotten the leg while `out_legs` still listed it, so
+/// [`reconcile_legs`] never redialled and every later answer to `peer` read
+/// "no out leg" and fell to its (congested) in-link — rxmove's come-back
+/// trace, P's ADMITs refused for good.
+fn out_leg_gone(shared: &Arc<Shared>, peer: &str) {
+    if !Shared::lock(&shared.out_legs).contains_key(peer) {
+        return;
+    }
+    shared.count(crate::observability::AV_LEG_GONE_ON_SEND);
+    tracing::debug!(
+        target: "ciris_edge::c3_fail",
+        node = %shared.own,
+        peer = %peer,
+        "own leg gone on send: dropped, to be redialled"
+    );
+    leg_lost(shared, peer);
+}
+
+/// This node's own leg to `peer` is lost: off the call's legs (so it is
+/// redialled), its children's slots released, and — row T1 — a parent
+/// reached on it is lost.
+fn leg_lost(shared: &Arc<Shared>, peer: &str) {
+    Shared::lock(&shared.out_legs).remove(peer);
+    Shared::lock(&shared.lost_legs).insert(peer.to_owned());
+    let mut a = Shared::lock(&shared.alm);
+    a.on_child_link_down(peer);
+    // Row T1 — this node's OWN leg toward a member it receives a stream
+    // from is torn → that parent is lost: fail over now, as when its
+    // media leg closes (the two die together on a congested uplink, but
+    // which close lands first is not ours to pick; waiting for the
+    // other one left a listener on a parent that heard nothing).
+    a.on_parent_link_down(peer);
 }
 
 #[allow(clippy::too_many_lines)] // one linear per-frame sequence: part, open, source check, relay, deliver
@@ -6073,8 +6224,7 @@ async fn flush_parked_loop(shared: Arc<Shared>) {
                 if matches!(leg, LegSend::Sent) {
                     shared.count(crate::observability::AV_CHUNK_PARKED_SENT);
                 } else if matches!(leg, LegSend::Gone) {
-                    Shared::lock(&shared.out_legs).remove(peer);
-                    Shared::lock(&shared.alm).on_child_link_down(peer);
+                    out_leg_gone(&shared, peer);
                 }
             }
             for _ in 0..replaced {

@@ -3569,6 +3569,110 @@ fn torn_down(m: &EdgeMetrics) -> u64 {
         .sum()
 }
 
+/// **Every pair has both legs within the setup bound, and keeps them,
+/// uncapped** (rxmove's come-back trace): in the room of
+/// [`a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`] with
+/// no cap, every member holds its own leg to every other member within
+/// `SETUP_BOUND` of the last join, and the call's legs agree with what its
+/// publisher can send on, for the whole stretch. Without the fix the early
+/// joiners (P first) had no leg to the later ones for ~6 s: each dial began
+/// before that member's address stood and sat out the 5 s no-path establish
+/// timeout and a backoff, while P's ADMITs rode the members' paced in-links.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn every_pair_keeps_both_legs_uncapped() {
+    /// One dial (its link, the responder's KEX, then the hello and bindings
+    /// paced at that link's establishment RTT over the initial window: up to
+    /// 0.82 s measured on a debug build, 0.1 s typical) plus one dial
+    /// backoff floor (`DIAL_BACKOFF_MIN`, 1 s) and change: well short of the
+    /// 5 s no-path establish timeout a dial begun before the member's
+    /// address stood sat out (6.4 s without the fix).
+    const SETUP_BOUND: Duration = Duration::from_secs(2);
+    let _call = one_call().await;
+    let tag = "alm2-legs";
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        None,
+    )
+    .await;
+    let mut cp = join_loaded(&nodes[0], &groups[0], tag, relay_opts(), None).await;
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    let ids: Vec<String> = nodes[..4].iter().map(|n| n.key.key_id.clone()).collect();
+    // Setup: from the last join until every node holds a leg to every other
+    // member, in the call and in its dispatcher alike.
+    let joined = tokio::time::Instant::now();
+    let mut setup = None;
+    let mut timeline: Vec<(u128, Vec<(usize, usize)>)> = Vec::new();
+    while joined.elapsed() < Duration::from_secs(30) {
+        let calls: Vec<&Call> = std::iter::once(&cp).chain(listeners.iter()).collect();
+        let mut row = Vec::new();
+        for c in &calls {
+            row.push((c.legs().len(), c.dispatcher_legs_for_test().await.len()));
+        }
+        if timeline.last().is_none_or(|l| l.1 != row) {
+            timeline.push((joined.elapsed().as_millis(), row.clone()));
+        }
+        if row.iter().all(|r| *r == (3, 3)) {
+            setup = Some(joined.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    eprintln!("[LEGS] setup {setup:?}; timeline {timeline:?}");
+    // The bound from mechanism: once the last member has joined, every
+    // member it reaches dials back at once, with no wait on a no-path
+    // establish timeout begun before that member's address stood.
+    assert!(
+        setup.is_some_and(|d| d <= SETUP_BOUND),
+        "every pair has both legs within {SETUP_BOUND:?} of the last join: {setup:?}; timeline {timeline:?}"
+    );
+    let mut failed: Vec<String> = Vec::new();
+    let mut seq = 0;
+    for second in 0..20u64 {
+        seq = publish_timed_for(&mut cp, 1, seq).await.0;
+        let calls: Vec<&Call> = std::iter::once(&cp).chain(listeners.iter()).collect();
+        for (i, c) in calls.iter().enumerate() {
+            let mut want: Vec<String> = ids.iter().filter(|m| **m != ids[i]).cloned().collect();
+            want.sort();
+            let (legs, held) = (c.legs(), c.dispatcher_legs_for_test().await);
+            if legs != want || held != want {
+                failed.push(format!(
+                    "t+{second}s node {i}: legs {} of 3, dispatcher {} of 3 (agree: {})",
+                    legs.len(),
+                    held.len(),
+                    legs == held
+                ));
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "every pair keeps both legs: {failed:?}; legs gone on send {:?}",
+        nodes
+            .iter()
+            .map(|n| av(&n.metrics, "av_leg_gone_on_send"))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// **G8 — a publisher whose uplink is capped below its fan-out** (the
 /// server's av_mesh cell, on loopback, with no tc): `P` publishes
 /// 600 B at 30 Hz to `A`, `B` and `C`, who reach each other directly, every

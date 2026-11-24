@@ -1120,6 +1120,9 @@ pub const AV_BINDING_REANNOUNCE_HELD: &str = "av_binding_reannounce_held";
 /// G8 serial redial — a leg redial deferred: this node's uplink stall
 /// verdict holds and the member is heard through a relay.
 pub const AV_LEG_REDIAL_DEFERRED: &str = "av_leg_redial_deferred";
+/// 45.2.0 — a send found this node's own leg to a member gone (the link no
+/// longer held): the leg is dropped from the call's legs so it is redialled.
+pub const AV_LEG_GONE_ON_SEND: &str = "av_leg_gone_on_send";
 /// 45.2.0 — a call or A/V link refused on a shaped-only node: live A/V rides
 /// unshaped links only (Eric 2026-11-06).
 pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
@@ -3006,6 +3009,7 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     AV_LEG_REDIAL_ON_DIRECT_PATH,
     AV_BINDING_REANNOUNCE_HELD,
     AV_LEG_REDIAL_DEFERRED,
+    AV_LEG_GONE_ON_SEND,
     SHAPED_ONLY_NO_MEDIA,
     AV_CALL_ENDED_MEDIA_REFUSED,
     ALM_FORWARDED,
