@@ -218,6 +218,11 @@ pub struct Admission<P: PeerRef> {
     admit_closed: bool,
     external_committed: u64,
     draining: BTreeMap<P, Drain>,
+    /// G8 — no upward probe (no demand step, no doubling, no stale reset)
+    /// before this instant: set by an uplink-stall verdict.
+    probe_hold_until_ms: u64,
+    /// G8 slow start ([`Self::set_slow_start`]).
+    slow_start: bool,
 }
 
 impl<P: PeerRef> Admission<P> {
@@ -277,6 +282,8 @@ impl<P: PeerRef> Admission<P> {
             admit_closed: false,
             external_committed: 0,
             draining: BTreeMap::new(),
+            probe_hold_until_ms: 0,
+            slow_start: false,
         }
     }
 
@@ -358,6 +365,33 @@ impl<P: PeerRef> Admission<P> {
                 .probe_bps
                 .max((streams.min(MAX_PROBE_STREAMS) * self.cfg.stream_bps) as f64);
         }
+    }
+
+    /// G8 slow start, for a publisher: while its uplink is unmeasured the
+    /// probe allowance binds forwarders too (off: a forward-capable
+    /// subscriber that fits the hard limit is admitted past the probe, and an
+    /// unmeasured publisher's hard limit is unbounded, so every relaying
+    /// member is a direct child at once). Off by default; the live call's
+    /// publisher turns it on. The stage-1 sim's large worlds are tuned on the
+    /// unbounded start (t2/t3/l3 fail with it on).
+    pub fn set_slow_start(&mut self, on: bool) {
+        self.slow_start = on && self.is_root;
+    }
+
+    /// G8 — an uplink-stall verdict: the probe restarts at one stream and
+    /// nothing widens the room (no demand step, no doubling, no stale
+    /// ceiling reset) until `until_ms`. The verdict IS the measurement; an
+    /// upward probe straight after it re-overloads the queue it just left.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn hold_probe(&mut self, until_ms: u64) {
+        self.probe_hold_until_ms = self.probe_hold_until_ms.max(until_ms);
+        self.probe_bps = self.probe_bps.min(self.cfg.stream_bps as f64);
+    }
+
+    /// Whether an upward probe is held now ([`Self::hold_probe`]).
+    #[must_use]
+    pub fn probe_held(&self, now_ms: u64) -> bool {
+        now_ms < self.probe_hold_until_ms
     }
 
     /// Everyone this forwarder sends to: the ledger, plus subscribers shed
@@ -702,6 +736,21 @@ impl<P: PeerRef> Admission<P> {
         if depth.saturating_add(1) > self.cfg.max_depth {
             return self.refuse(now_ms, req, RefuseReason::DepthLimit, rng, log);
         }
+        // Row S3 (the plain no-parent path): a publisher with NO primary
+        // child admits a primary whatever its probe, ceiling or last offer
+        // said. Its uplink is the one path nothing replaces, and the root's
+        // floor is one stream; refusing it here left a capped publisher with
+        // no children for the rest of a cap (the kept child's link had died).
+        // Only for a publisher whose uplink carries nothing else of its own
+        // (no share or relay commitments): those keep their room.
+        if self.is_root
+            && req.role == Role::Primary
+            && self.external_committed == 0
+            && !self.ledger.values().any(|c| c.role == Role::Primary)
+        {
+            self.commit(now_ms, req, log);
+            return AdmitDecision::Admit { role: req.role };
+        }
         let existing = self.ledger.get(&req.subscriber).map_or(0, |c| c.bps);
         let need = self.cfg.role_bps(req.role);
         if need <= existing {
@@ -737,7 +786,14 @@ impl<P: PeerRef> Admission<P> {
         // Blocked only by the probe gate (it fits the hard limit): a
         // forwarder is admitted, and that admission IS the next probe step.
         // Nobody is displaced to satisfy a growth gate.
-        if forwarder && (committed + need) as f64 <= hard + 1.0 {
+        //
+        // Not at a slow-starting publisher (G8): its uplink is the one path
+        // nothing replaces, and while it is unmeasured every member that
+        // relays would be admitted at once, the full fan-out the probe
+        // exists to avoid. A refused forwarder hears the stream through a
+        // child (that child relays) and its refusal is the demand that
+        // widens the probe.
+        if forwarder && !self.slow_start && (committed + need) as f64 <= hard + 1.0 {
             self.probe_bps = self
                 .probe_bps
                 .max((committed + need) as f64 - self.floor_bps);
@@ -794,6 +850,27 @@ impl<P: PeerRef> Admission<P> {
         std::mem::take(&mut self.preempted)
     }
 
+    /// Row E2 — a publisher left with no PRIMARY but holding a standby:
+    /// promote the oldest standby to primary (priced as one) and return it;
+    /// the caller tells it with an ADMIT as primary. `None` when a primary
+    /// stands, there is no standby, or this is not a publisher.
+    pub fn promote_standby_if_no_primary(&mut self) -> Option<P> {
+        if !self.is_root || self.ledger.values().any(|c| c.role == Role::Primary) {
+            return None;
+        }
+        let p = self
+            .ledger
+            .iter()
+            .filter(|(_, c)| c.role == Role::Standby)
+            .min_by_key(|(_, c)| c.order)
+            .map(|(p, _)| p.clone())?;
+        let bps = self.cfg.role_bps(Role::Primary);
+        let c = self.ledger.get_mut(&p).expect("present");
+        c.role = Role::Primary;
+        c.bps = bps;
+        Some(p)
+    }
+
     /// A subscriber left (or its link is gone).
     pub fn release(&mut self, sub: &P) -> bool {
         let drained = self.draining.remove(sub).is_some();
@@ -842,6 +919,7 @@ impl<P: PeerRef> Admission<P> {
             }
         } else {
             self.clean_streak += 1;
+            let held = self.probe_held(now_ms);
             if let Some(c) = self.ceiling_bps {
                 // A clean window that carried more than the ceiling shows the
                 // uplink carries at least that: committable at the meter's
@@ -858,7 +936,7 @@ impl<P: PeerRef> Admission<P> {
                 // if the uplink really is full, takes it back. Without it a
                 // shed member waited out the staleness (60-120 s) with the
                 // uplink clean the whole time (avmesh4, after the cap lifted).
-                if self.demand && !self.over_claim_flagged {
+                if self.demand && !self.over_claim_flagged && !held {
                     self.demand = false;
                     // From what the hard limit reads now (a publisher's
                     // one-stream floor included), so a step is one stream.
@@ -877,6 +955,7 @@ impl<P: PeerRef> Admission<P> {
                 // Not for a forwarder caught over-claiming: that measurement
                 // is what disproved its word, and it stays disproved.
                 if !self.over_claim_flagged
+                    && !held
                     && now_ms.saturating_sub(self.last_congested_ms) >= self.ceiling_stale_ms
                 {
                     self.ceiling_bps = None;
@@ -889,7 +968,10 @@ impl<P: PeerRef> Admission<P> {
                 // last growth): the probe is the measurement, so it must be
                 // spent when someone is waiting for it.
                 let used = self.committed_bps() as f64 >= 0.8 * (self.floor_bps + self.probe_bps);
-                if (used || self.demand) && self.clean_streak >= self.cfg.probe_clean_windows {
+                if (used || self.demand)
+                    && !held
+                    && self.clean_streak >= self.cfg.probe_clean_windows
+                {
                     self.demand = false;
                     self.clean_streak = 0;
                     self.probe_bps = (self.probe_bps * 2.0)
@@ -903,12 +985,30 @@ impl<P: PeerRef> Admission<P> {
         let mut shed = Vec::new();
         let limit = self.hard_limit_bps();
         while self.committed_bps() as f64 > limit + 1.0 {
-            let Some(victim) = self
+            // Stall row S3: standbys go first (most recent first); a
+            // publisher never sheds its LAST primary (it is the one path
+            // nothing replaces), so it is never left with only standbys.
+            let primaries = self
+                .ledger
+                .values()
+                .filter(|c| c.role == Role::Primary)
+                .count();
+            let standby = self
                 .ledger
                 .iter()
+                .filter(|(_, c)| c.role == Role::Standby)
                 .max_by_key(|(_, c)| c.order)
-                .map(|(p, _)| p.clone())
-            else {
+                .map(|(p, _)| p.clone());
+            let victim = standby.or_else(|| {
+                if self.is_root && primaries <= 1 {
+                    return None;
+                }
+                self.ledger
+                    .iter()
+                    .max_by_key(|(_, c)| c.order)
+                    .map(|(p, _)| p.clone())
+            });
+            let Some(victim) = victim else {
                 break;
             };
             self.ledger.remove(&victim);
@@ -961,6 +1061,51 @@ mod tests {
                 reason: RefuseReason::Capacity,
                 ..
             }
+        ));
+    }
+
+    /// G8 slow start — an unmeasured publisher's probe binds forwarders too:
+    /// three relay-capable members asking at once get ONE direct slot, and
+    /// the refusals are the demand that widens it.
+    #[test]
+    fn an_unmeasured_publisher_admits_one_forwarder_first() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::publisher(0u32, cfg, None);
+        a.set_slow_start(true);
+        roster(&mut a);
+        let mut rng = SplitMix64(1);
+        let mut log = DecisionLog::default();
+        let mut admitted = 0;
+        for s in 1..=3u32 {
+            let mut r = req(s, Role::Primary);
+            r.forward_capable = true;
+            if matches!(
+                a.request(0, &r, &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 1, "one direct child into an unmeasured uplink");
+    }
+
+    /// Row S3 — a publisher with no primary child admits one whatever its
+    /// room reads (here it advertises half a stream), so a capped call never
+    /// sits with no direct child; a second primary still meets the limit.
+    #[test]
+    fn a_publisher_with_no_primary_admits_one() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::publisher(0u32, cfg.clone(), Some(cfg.stream_bps / 2));
+        roster(&mut a);
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        assert!(matches!(
+            a.request(0, &req(1, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+        assert!(!matches!(
+            a.request(0, &req(2, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
         ));
     }
 

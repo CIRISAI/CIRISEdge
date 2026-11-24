@@ -197,6 +197,10 @@ pub struct AvSink {
     /// arriving datagram: a receiver whose event loop is loaded (another
     /// build on the box, a slow phone). 0 in production.
     datagram_handling_delay_us: std::sync::atomic::AtomicU64,
+    /// Test seam — `(every, hold, next)`: the event loop holds one event for
+    /// `hold` every `every` (a starved host). `None` in production.
+    loop_hold:
+        std::sync::Mutex<Option<(std::time::Duration, std::time::Duration, std::time::Instant)>>,
     arrivals_tx: mpsc::Sender<AvArrival>,
     arrivals_rx: Mutex<Option<mpsc::Receiver<AvArrival>>>,
 }
@@ -266,6 +270,7 @@ impl AvSink {
             links: Mutex::new(SinkLinks::default()),
             lose_datagrams: std::sync::atomic::AtomicU64::new(0),
             datagram_handling_delay_us: std::sync::atomic::AtomicU64::new(0),
+            loop_hold: std::sync::Mutex::new(None),
             arrivals_tx,
             arrivals_rx: Mutex::new(Some(arrivals_rx)),
         }
@@ -390,6 +395,31 @@ impl AvSink {
             u64::try_from(delay.as_micros()).unwrap_or(u64::MAX),
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// Test seam — hold the event loop for `hold` every `every`
+    /// (`every` zero ends it).
+    pub(crate) fn set_loop_hold(&self, every: std::time::Duration, hold: std::time::Duration) {
+        *self
+            .loop_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (!every.is_zero()).then(|| (every, hold, std::time::Instant::now() + every));
+    }
+
+    /// Test seam — the hold due now, if any ([`Self::set_loop_hold`]).
+    pub(crate) fn take_loop_hold(&self) -> Option<std::time::Duration> {
+        let mut h = self
+            .loop_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (every, hold, next) = (*h)?;
+        let now = std::time::Instant::now();
+        if now < next {
+            return None;
+        }
+        *h = Some((every, hold, now + every));
+        Some(hold)
     }
 
     /// Test seam — the delay [`Self::set_datagram_handling_delay`] set, if any.

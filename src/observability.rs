@@ -1103,6 +1103,26 @@ pub const ALM_RELAY_OFF_SHED: &str = "relay_shed:relay_off";
 /// G8 — this node's uplink stalled: its legs' Channels held messages
 /// unproved past `UPLINK_STALL_MS` on two legs or more. Counted on the rise.
 pub const ALM_UPLINK_STALL: &str = "alm_uplink_stall";
+/// G8 — a periodic offer not sent on a leg whose oldest unproved Channel
+/// message has waited past its floor by `UPLINK_BACKLOG_MS`: it would only
+/// queue behind the backlog and spend that link's retry budget.
+pub const ALM_OFFER_HELD_BACKLOG: &str = "alm_offer_held:backlog";
+/// G8 — a chunk a settling leg had parked went out on the flusher's retry.
+pub const AV_CHUNK_PARKED_SENT: &str = "av_chunk_parked_sent";
+/// G8 — a parked chunk replaced by a newer one (it never left the process).
+pub const AV_CHUNK_PARKED_REPLACED: &str = "av_chunk_parked_replaced";
+/// G8 C — a call leg waiting out a failed dial's backoff dialled at once
+/// because the member's direct path came up.
+pub const AV_LEG_REDIAL_ON_DIRECT_PATH: &str = "av_leg_redial_on_direct_path";
+/// G8 — a periodic stream-key binding re-announce skipped on one leg: the
+/// uplink stall verdict held or the leg was backlogged.
+pub const AV_BINDING_REANNOUNCE_HELD: &str = "av_binding_reannounce_held";
+/// G8 serial redial — a leg redial deferred: this node's uplink stall
+/// verdict holds and the member is heard through a relay.
+pub const AV_LEG_REDIAL_DEFERRED: &str = "av_leg_redial_deferred";
+/// 45.2.0 — a send found this node's own leg to a member gone (the link no
+/// longer held): the leg is dropped from the call's legs so it is redialled.
+pub const AV_LEG_GONE_ON_SEND: &str = "av_leg_gone_on_send";
 /// 45.2.0 — a call or A/V link refused on a shaped-only node: live A/V rides
 /// unshaped links only (Eric 2026-11-06).
 pub const SHAPED_ONLY_NO_MEDIA: &str = "shaped_only_no_media";
@@ -1542,6 +1562,9 @@ pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
 /// G8 — a direct path forgotten because its LINK closed (the punched
 /// interface went with it): the next dial proposes at once.
 pub const DIRECT_LINK_RELEASED_LINK_CLOSED: &str = "direct_link_released_link_closed";
+/// G8 C — at a direct path's release, a path request for the peer's
+/// announced destination went out (its route rode the punched interface).
+pub const DIRECT_LINK_RELEASED_PATH_REQUESTED: &str = "direct_link_released_path_requested";
 /// A direct A/V leg's path was judged gone and the leg fell back
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
@@ -2898,6 +2921,7 @@ pub const DIRECT_LINK_LABELS: &[&str] = &[
     DIRECT_LINK_FAILED_PEER_FELL_BACK,
     DIRECT_LINK_LOST,
     DIRECT_LINK_RELEASED_LINK_CLOSED,
+    DIRECT_LINK_RELEASED_PATH_REQUESTED,
     DIRECT_LINK_LEG_FELL_BACK,
     DIRECT_LINK_OFF_PROPOSING_OFF,
     DIRECT_LINK_OFF_NO_FACILITATOR,
@@ -2979,6 +3003,13 @@ pub const AV_PLANE_LABELS: &[&str] = &[
     ALM_SHED,
     ALM_RELAY_OFF_SHED,
     ALM_UPLINK_STALL,
+    ALM_OFFER_HELD_BACKLOG,
+    AV_CHUNK_PARKED_SENT,
+    AV_CHUNK_PARKED_REPLACED,
+    AV_LEG_REDIAL_ON_DIRECT_PATH,
+    AV_BINDING_REANNOUNCE_HELD,
+    AV_LEG_REDIAL_DEFERRED,
+    AV_LEG_GONE_ON_SEND,
     SHAPED_ONLY_NO_MEDIA,
     AV_CALL_ENDED_MEDIA_REFUSED,
     ALM_FORWARDED,

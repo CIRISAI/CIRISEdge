@@ -224,7 +224,11 @@ pub struct ControllerConfig {
     /// Clean time a recovering peer needs to be available again.
     pub recover_clean_ms: u64,
     /// How long a Down/Suspected peer stays so before an offer (liveness,
-    /// not delivery) may start its recovery.
+    /// not delivery) may start its recovery. One exception: row S3's ask of
+    /// the publisher after losing it as primary (`ParentSelector`'s
+    /// `publisher_fallback`) ignores the hold, since the publisher may be the
+    /// only route back; its ADMIT then clears the Down
+    /// (`docs/AV_ALM_DESIGN.md` §4).
     pub down_hold_ms: u64,
     /// Smoothed loss at or above which a path is degraded.
     pub degraded_loss: f64,

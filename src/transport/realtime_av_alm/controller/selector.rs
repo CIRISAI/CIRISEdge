@@ -121,6 +121,10 @@ struct Cand<P> {
     eligible: bool,
     tier: Tier,
     offer_at_ms: u64,
+    /// When this node last gave up waiting on a request to this candidate
+    /// (the request timed out and the selector told the forwarder its
+    /// current wish: an UNSUBSCRIBE, or the standby restated).
+    abandoned_at_ms: Option<u64>,
 }
 
 /// One chunk as a path delivered it.
@@ -146,6 +150,19 @@ pub struct PathChunk {
 
 /// How long an unanswered subscribe waits before it counts as refused.
 pub const REQUEST_TIMEOUT_MS: u64 = 3_000;
+/// How long after this node abandoned a request an answer to it can still
+/// arrive: the forwarder retries an answer its link refuses for up to 30 s
+/// (edge's `C3_RESEND_BUDGET`).
+pub const LATE_ANSWER_MS: u64 = 30_000;
+/// Row S3 — a parentless node asks the publisher itself at most this often
+/// (about a stall verdict's latch: a refusal under it is not a reason to
+/// wait longer).
+pub const PUBLISHER_ASK_EVERY_MS: u64 = 2_000;
+/// Row S3 — how many times a node that lost the publisher as its primary
+/// asks it directly before leaving it to the ordinary failover: a bounded
+/// ask (a publisher with primaries refuses; asking forever crowded a
+/// capacity-tight room, the stage-1 sim's t2).
+pub const PUBLISHER_ASKS: u32 = 3;
 
 /// Consecutive offers without room to take over before a standby is replaced.
 pub const STANDBY_NO_ROOM_OFFERS: u32 = 5;
@@ -196,6 +213,12 @@ pub struct ParentSelector<P: PeerRef> {
     parent_changes: u64,
     tiers: BTreeMap<P, Tier>,
     next_r3_probe_ms: u64,
+    /// Row S3 — when the publisher may next be asked by
+    /// [`Self::publisher_fallback`].
+    next_publisher_ask_ms: u64,
+    /// Row S3 — publisher asks left for this loss ([`PUBLISHER_ASKS`]); a
+    /// primary resets it.
+    publisher_asks_left: u32,
     /// Since when this node has had no primary (member-tier R3).
     parentless_since_ms: Option<u64>,
     last_activity_ms: Option<u64>,
@@ -230,6 +253,8 @@ impl<P: PeerRef> ParentSelector<P> {
             parent_changes: 0,
             tiers: BTreeMap::new(),
             next_r3_probe_ms: 0,
+            next_publisher_ask_ms: 0,
+            publisher_asks_left: PUBLISHER_ASKS,
             parentless_since_ms: None,
             last_activity_ms: None,
             activity_since_ms: 0,
@@ -398,6 +423,7 @@ impl<P: PeerRef> ParentSelector<P> {
             eligible: true,
             tier,
             offer_at_ms: now_ms,
+            abandoned_at_ms: None,
         })
     }
 
@@ -579,13 +605,99 @@ impl<P: PeerRef> ParentSelector<P> {
     ) -> Vec<SelectorAction<P>> {
         let me = self.me.clone();
         let mut out = Vec::new();
-        let Some(link) = self.cands.get(from).map(|c| c.link) else {
+        let Some((link, abandoned_at)) = self.cands.get(from).map(|c| (c.link, c.abandoned_at_ms))
+        else {
             return out;
         };
+        // An ADMIT names the role it answers (admission echoes the request's
+        // role). One for another role than the request now out answers an
+        // older request: the answer to the current one is still to come (or
+        // the timeout cleans up), so it is not applied.
+        if let (Link::Requested { role: asked, .. }, AdmitDecision::Admit { role: got }) =
+            (link, decision)
+        {
+            if asked != *got {
+                log.record(
+                    now_ms,
+                    &me,
+                    DecisionKind::Unsubscribe,
+                    Some(from),
+                    0,
+                    "late answer to another request: not applied",
+                );
+                return out;
+            }
+        }
         let Link::Requested {
             role, was_standby, ..
         } = link
         else {
+            // A late answer to a request this node abandoned: it has told the
+            // forwarder its current wish since (an UNSUBSCRIBE, or the standby
+            // restated), which the forwarder reads after this answer, so the
+            // answer is not applied.
+            let late = abandoned_at.is_some_and(|t| now_ms.saturating_sub(t) <= LATE_ANSWER_MS);
+            if late && link.subscribed() && matches!(decision, AdmitDecision::Admit { .. }) {
+                log.record(
+                    now_ms,
+                    &me,
+                    DecisionKind::Unsubscribe,
+                    Some(from),
+                    0,
+                    "late answer to an abandoned request: not applied",
+                );
+                return out;
+            }
+            // Row E2, the child's side: the publisher promoted this node's
+            // STANDBY subscription to primary (its last primary was lost).
+            // With no primary of its own, take it as the primary now.
+            if matches!(
+                decision,
+                AdmitDecision::Admit {
+                    role: Role::Primary
+                }
+            ) && link == Link::Standby
+                && self.primary.is_none()
+            {
+                if self.standby.as_ref() == Some(from) {
+                    self.standby = None;
+                }
+                let c = self.cands.get_mut(from).expect("present");
+                c.link = Link::Primary;
+                c.failures = 0;
+                c.meter.restart();
+                self.set_primary(now_ms, from.clone(), log, "promoted by parent");
+                return out;
+            }
+            // A primary this node did not ask for, from its standby parent,
+            // while it has a primary elsewhere: the forwarder would hold a
+            // primary slot (and feed the full stream) for a node that counts
+            // it a standby. Release it: an UNSUBSCRIBE frees the slot, and
+            // the next tick takes a standby again.
+            if matches!(
+                decision,
+                AdmitDecision::Admit {
+                    role: Role::Primary
+                }
+            ) && link == Link::Standby
+            {
+                if self.standby.as_ref() == Some(from) {
+                    self.standby = None;
+                }
+                self.cands.get_mut(from).expect("present").link = Link::None;
+                log.record(
+                    now_ms,
+                    &me,
+                    DecisionKind::Unsubscribe,
+                    Some(from),
+                    0,
+                    "unasked primary while holding one",
+                );
+                out.push(SelectorAction::Unsubscribe {
+                    parent: from.clone(),
+                });
+                return out;
+            }
             // Stale answer for something we no longer want.
             if matches!(decision, AdmitDecision::Admit { .. }) && !link.subscribed() {
                 out.push(SelectorAction::Unsubscribe {
@@ -610,69 +722,87 @@ impl<P: PeerRef> ParentSelector<P> {
                     self.standby = None;
                 }
             }
-            AdmitDecision::Admit { .. } => match role {
-                Role::Standby => {
-                    // A new standby replaces the old one: release it, or its
-                    // reservation would be held for nothing.
-                    if let Some(old) = self.standby.clone().filter(|o| o != from) {
-                        if self
-                            .cands
-                            .get(&old)
-                            .is_some_and(|c| c.link == Link::Standby)
-                        {
-                            self.cands.get_mut(&old).expect("present").link = Link::None;
+            AdmitDecision::Admit { .. } => {
+                // The forwarder just committed to this node: fresh evidence it
+                // is alive, so a Down left by an old link-down (the row S3 ask
+                // bypasses health) is not held against the new subscription.
+                // It was: the asked publisher's ADMIT was failed over one tick
+                // later, at every ask (the kill witness, kill 2).
+                let c = self.cands.get_mut(from).expect("present");
+                if let Some((_, to)) = c.health.on_admitted(now_ms) {
+                    log.record(
+                        now_ms,
+                        &me,
+                        DecisionKind::PeerState,
+                        Some(from),
+                        to as i64,
+                        "admitted",
+                    );
+                }
+                match role {
+                    Role::Standby => {
+                        // A new standby replaces the old one: release it, or its
+                        // reservation would be held for nothing.
+                        if let Some(old) = self.standby.clone().filter(|o| o != from) {
+                            if self
+                                .cands
+                                .get(&old)
+                                .is_some_and(|c| c.link == Link::Standby)
+                            {
+                                self.cands.get_mut(&old).expect("present").link = Link::None;
+                                log.record(
+                                    now_ms,
+                                    &me,
+                                    DecisionKind::Unsubscribe,
+                                    Some(&old),
+                                    0,
+                                    "standby replaced",
+                                );
+                                out.push(SelectorAction::Unsubscribe { parent: old });
+                            }
+                        }
+                        let c = self.cands.get_mut(from).expect("present");
+                        c.link = Link::Standby;
+                        c.failures = 0;
+                        c.subscribed_at = now_ms;
+                        c.meter.restart();
+                        self.standby = Some(from.clone());
+                    }
+                    Role::Primary => {
+                        // The path was unmetered while the ask was out, and a
+                        // standby's sequence skipped layers: the first full
+                        // chunk continues from nothing.
+                        self.cands.get_mut(from).expect("present").meter.restart();
+                        if self.primary.is_some() {
+                            let c = self.cands.get_mut(from).expect("present");
+                            c.link = Link::Promoting {
+                                since_ms: now_ms,
+                                first_full_ms: None,
+                                full_chunks: 0,
+                            };
                             log.record(
                                 now_ms,
                                 &me,
-                                DecisionKind::Unsubscribe,
-                                Some(&old),
+                                DecisionKind::PromoteStart,
+                                Some(from),
                                 0,
-                                "standby replaced",
+                                "mbb",
                             );
-                            out.push(SelectorAction::Unsubscribe { parent: old });
+                        } else {
+                            if was_standby {
+                                self.standby = None;
+                            }
+                            let c = self.cands.get_mut(from).expect("present");
+                            c.link = Link::Primary;
+                            c.failures = 0;
+                            if !was_standby {
+                                c.subscribed_at = now_ms;
+                            }
+                            self.set_primary(now_ms, from.clone(), log, "admitted");
                         }
                     }
-                    let c = self.cands.get_mut(from).expect("present");
-                    c.link = Link::Standby;
-                    c.failures = 0;
-                    c.subscribed_at = now_ms;
-                    c.meter.restart();
-                    self.standby = Some(from.clone());
                 }
-                Role::Primary => {
-                    // The path was unmetered while the ask was out, and a
-                    // standby's sequence skipped layers: the first full
-                    // chunk continues from nothing.
-                    self.cands.get_mut(from).expect("present").meter.restart();
-                    if self.primary.is_some() {
-                        let c = self.cands.get_mut(from).expect("present");
-                        c.link = Link::Promoting {
-                            since_ms: now_ms,
-                            first_full_ms: None,
-                            full_chunks: 0,
-                        };
-                        log.record(
-                            now_ms,
-                            &me,
-                            DecisionKind::PromoteStart,
-                            Some(from),
-                            0,
-                            "mbb",
-                        );
-                    } else {
-                        if was_standby {
-                            self.standby = None;
-                        }
-                        let c = self.cands.get_mut(from).expect("present");
-                        c.link = Link::Primary;
-                        c.failures = 0;
-                        if !was_standby {
-                            c.subscribed_at = now_ms;
-                        }
-                        self.set_primary(now_ms, from.clone(), log, "admitted");
-                    }
-                }
-            },
+            }
         }
         out
     }
@@ -684,6 +814,7 @@ impl<P: PeerRef> ParentSelector<P> {
         log.record(now_ms, &self.me, DecisionKind::Subscribe, Some(&p), 1, why);
         self.last_primary = Some(p.clone());
         self.primary = Some(p);
+        self.publisher_asks_left = PUBLISHER_ASKS;
         self.last_switch_ms = now_ms;
     }
 
@@ -869,6 +1000,49 @@ impl<P: PeerRef> ParentSelector<P> {
     /// R3's probe target: the best-scoring member-tier candidate that is
     /// viable in every way but advertised room.
     /// `direct_only`: the stream's publisher alone (a depth-0 offer).
+    /// Row S3, the child's side — the stream's publisher, known from any
+    /// depth-0 offer it ever made, as a primary candidate whatever its health
+    /// (a link down left it Down), its offer's age or a backoff (a refusal
+    /// under a stall verdict is retried after the verdict's latch, not a
+    /// doubling backoff): at most one ask per [`PUBLISHER_ASK_EVERY_MS`].
+    fn publisher_fallback(&self, now_ms: u64) -> Option<P> {
+        // Only for a node whose LOST primary was the publisher itself: at
+        // join the ordinary pick and the publisher's offers do the work, and
+        // a node that lost a relay re-parents in the relays' tree (asking the
+        // publisher for everyone herds onto it).
+        // And only once the ordinary failover has had a request's time
+        // ([`REQUEST_TIMEOUT_MS`]) to find a parent.
+        let parentless_long = self
+            .parentless_since_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) >= REQUEST_TIMEOUT_MS);
+        // Live calls only (`direct_first`, like R1): the stage-1 sim's
+        // capacity-tight worlds (t2) are tuned without it.
+        if !self.cfg.direct_first
+            || now_ms < self.next_publisher_ask_ms
+            || self.last_primary.is_none()
+            || !parentless_long
+            || self.publisher_asks_left == 0
+        {
+            return None;
+        }
+        // The publisher this node was taking the stream from directly (it
+        // lost that link): a node on a relay asks its relays' tree first.
+        let lost = self.last_primary.as_ref()?;
+        self.cands
+            .iter()
+            .find(|(p, c)| {
+                *p == lost
+                    && c.tier == Tier::Member
+                    && c.link == Link::None
+                    && c.eligible
+                    && self.members.contains(p)
+                    && c.offer
+                        .as_ref()
+                        .is_some_and(|o| o.depth == 0 && o.ancestry.is_empty())
+            })
+            .map(|(p, _)| p.clone())
+    }
+
     fn best_member_ignoring_room(&self, now_ms: u64, direct_only: bool) -> Option<P> {
         self.cands
             .iter()
@@ -915,6 +1089,9 @@ impl<P: PeerRef> ParentSelector<P> {
         log: &mut DecisionLog,
     ) -> SelectorAction<P> {
         let c = self.cands.get_mut(p).expect("candidate");
+        // A new request: the answer to it is the one now awaited, so the
+        // late-answer window of an earlier, abandoned one ends here.
+        c.abandoned_at_ms = None;
         c.link = Link::Requested {
             role,
             at_ms: now_ms,
@@ -986,6 +1163,7 @@ impl<P: PeerRef> ParentSelector<P> {
             self.last_activity_ms,
             self.activity_since_ms,
         );
+        let down_silence_ms = self.cfg.down_silence_ms;
         for (p, c) in &mut self.cands {
             let rolled = c.meter.roll(now_ms);
             if rolled && standby.as_ref() == Some(p) {
@@ -1010,7 +1188,25 @@ impl<P: PeerRef> ParentSelector<P> {
                 } else {
                     last
                 };
-                now_ms.saturating_sub(last) * 2 / (2 + depth)
+                // Before a new subscription's first chunk, the parent's
+                // advertised upstream latency (a publisher's uplink queue
+                // included) is owed too: the stream it admits into is that
+                // late at its own end. A publisher with a 2.2 s queue,
+                // admitted, went Suspected at 1.5 s and was dropped before
+                // its first chunk could arrive (the kill witness, kill 2).
+                let first_owed = c
+                    .meter
+                    .last_arrival_ms()
+                    .is_none_or(|a| a < c.subscribed_at);
+                let grace = if first_owed {
+                    c.offer
+                        .as_ref()
+                        .map_or(0, |o| u64::from(o.upstream_latency_ms))
+                        .min(down_silence_ms)
+                } else {
+                    0
+                };
+                now_ms.saturating_sub(last).saturating_sub(grace) * 2 / (2 + depth)
             });
             let snap = c.meter.snapshot();
             // Degraded = loss over the threshold OR end-to-end latency over
@@ -1053,6 +1249,7 @@ impl<P: PeerRef> ParentSelector<P> {
                         SelectorAction::Unsubscribe { parent: p.clone() }
                     });
                     c.failures += 1;
+                    c.abandoned_at_ms = Some(now_ms);
                     c.backoff_until = now_ms
                         + self
                             .cfg
@@ -1187,6 +1384,10 @@ impl<P: PeerRef> ParentSelector<P> {
                     && self.members.contains(s)
                     && now_ms >= c.backoff_until
                     && c.offer.as_ref().is_some_and(|o| o.forwarding)
+                    // Never a parent from inside this node's own subtree: a
+                    // standby taken before the tree moved can be a
+                    // descendant now (its offer's ancestry names this node).
+                    && !c.offer.as_ref().is_some_and(|o| o.ancestry.contains(&self.me))
                     && matches!(
                         c.health.state(),
                         PeerState::Available | PeerState::Degraded | PeerState::Recovering
@@ -1205,6 +1406,14 @@ impl<P: PeerRef> ParentSelector<P> {
                 out.push(self.request(now_ms, &s, Role::Primary, "promote standby", log));
             } else if let Some(p) = self.pick(Role::Primary, now_ms, false, rng) {
                 out.push(self.request(now_ms, &p, Role::Primary, "join", log));
+            } else if let Some(p) = self.publisher_fallback(now_ms) {
+                // Row S3, the child's side: no primary and no viable
+                // candidate → ask the publisher itself, without waiting for
+                // its next offer or for its candidate to revive (it holds the
+                // stream; its admission takes a primary when it has none).
+                self.next_publisher_ask_ms = now_ms + PUBLISHER_ASK_EVERY_MS;
+                self.publisher_asks_left = self.publisher_asks_left.saturating_sub(1);
+                out.push(self.request(now_ms, &p, Role::Primary, "ask publisher", log));
             } else if self.video_unavailable() && now_ms >= self.next_r3_probe_ms {
                 // R3: on the canonical tier, keep ASKING the member tier on a
                 // jittered backoff, even when no member advertises room: a
@@ -1258,6 +1467,11 @@ impl<P: PeerRef> ParentSelector<P> {
             let pc = &self.cands[&p];
             let sc = &self.cands[&s];
             let calm = self.promoting().is_none() && !pending_primary && sc.link == Link::Standby;
+            // Never promote a standby that is now this node's descendant.
+            let looped = sc
+                .offer
+                .as_ref()
+                .is_some_and(|o| o.ancestry.contains(&self.me));
             let depth_ok = !self.has_children
                 || match (pc.offer.as_ref(), sc.offer.as_ref()) {
                     (Some(po), Some(so)) => so.depth <= po.depth,
@@ -1291,6 +1505,7 @@ impl<P: PeerRef> ParentSelector<P> {
                     && self.cands[&p].health.state() == PeerState::Available,
             );
             if calm
+                && !looped
                 && depth_ok
                 && (held || to_direct)
                 && !off_direct
@@ -1766,12 +1981,191 @@ mod tests {
         assert!(!s.video_unavailable());
     }
 
+    /// Row S3 and the loop guard — a node that lost its primary never takes
+    /// a standby or candidate from its own subtree (an offer whose ancestry
+    /// names it), and asks the publisher at once though its candidate is Down.
+    #[test]
+    fn a_parentless_node_never_takes_its_own_descendant_and_asks_the_publisher() {
+        let mut cfg = ControllerConfig::interactive();
+        cfg.direct_first = true;
+        let mut s = ParentSelector::new(1u32, cfg.clone(), true);
+        s.set_members([1u32, 2, 3]);
+        // 2 publishes; 3 relays it (depth 1 under 2).
+        let relay = |anc: Vec<u32>| Offer {
+            from: 3,
+            depth: u8::try_from(anc.len()).unwrap_or(1),
+            ancestry: anc,
+            headroom_bps: 4 * cfg.stream_bps,
+            forwarder_headroom_bps: 4 * cfg.stream_bps,
+            upstream_latency_ms: 0,
+            forwarding: true,
+        };
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        let _ = drive(&mut s, &cfg, 0, 10_000, &[(2, 4, 20.0)]);
+        s.on_offer(10_000, relay(vec![2]), 20.0, &mut log);
+        let _ = drive(&mut s, &cfg, 10_000, 20_000, &[(2, 4, 20.0)]);
+        assert_eq!(s.primary(), Some(&2));
+        // The tree moved: 3 is now UNDER this node (its ancestry names 1).
+        s.on_offer(20_000, relay(vec![2, 1]), 20.0, &mut log);
+        s.on_link_down(20_100, &2, &mut log);
+        let mut asked: Vec<(u32, Role)> = Vec::new();
+        for k in 0..24u64 {
+            let t = 20_250 + k * 250;
+            for a in s.tick(t, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    asked.push((parent, role));
+                }
+            }
+        }
+        assert!(
+            !asked.iter().any(|(p, r)| *p == 3 && *r == Role::Primary),
+            "never a primary from its own subtree: {asked:?}"
+        );
+        assert!(
+            asked.iter().any(|(p, r)| *p == 2 && *r == Role::Primary),
+            "the publisher is asked at once, Down or not: {asked:?}"
+        );
+    }
+
     /// A member with no parent and no candidate advertising room still asks
     /// (R3 on the member tier), on its jittered backoff. avmesh4 (C): shed by
     /// m0 under a cap, m1 and m3 never asked m0 again in the 60 s after the
     /// cap lifted (m0 refused nothing on its own stream), because m0's offer
     /// showed no room. Mutation (v44.1.1): a member-only world waits for
     /// room in silence, and no subscribe to the publisher is ever sent.
+    /// A late ADMIT (the forwarder retries a refused answer for up to 30 s)
+    /// is applied only when it answers the request now out: one for another
+    /// role, or for a request this node abandoned, changes nothing; an
+    /// unasked primary while this node holds one is released with an
+    /// UNSUBSCRIBE. Mutation: each installed a parent or kept the slot.
+    #[test]
+    fn a_late_admit_is_applied_only_to_the_request_now_out() {
+        let cfg = ControllerConfig::interactive();
+        let mut rng = SplitMix64(5);
+        let mut log = DecisionLog::default();
+        let admit = |role| AdmitDecision::Admit { role };
+        // (a) Another role than the request now out: not applied.
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2, 3]);
+        let _ = drive(&mut s, &cfg, 0, 10_000, &[(2, 4, 20.0), (3, 4, 30.0)]);
+        let primary = *s.primary().expect("a primary");
+        let other = if primary == 2 { 3 } else { 2 };
+        let standby = s.standby.clone();
+        if standby == Some(other) {
+            s.cands.get_mut(&other).expect("cand").link = Link::None;
+            s.standby = None;
+        }
+        s.cands.get_mut(&other).expect("cand").link = Link::Requested {
+            role: Role::Standby,
+            at_ms: 10_000,
+            was_standby: false,
+        };
+        let out = s.on_decision(10_100, &other, &admit(Role::Primary), &mut rng, &mut log);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(s.primary(), Some(&primary));
+        assert!(matches!(s.cands[&other].link, Link::Requested { .. }));
+        // (b) An unasked primary from the standby parent while holding one.
+        s.cands.get_mut(&other).expect("cand").link = Link::Standby;
+        s.standby = Some(other);
+        let out = s.on_decision(10_200, &other, &admit(Role::Primary), &mut rng, &mut log);
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, SelectorAction::Unsubscribe { parent } if *parent == other)),
+            "the slot is released: {out:?}"
+        );
+        assert_eq!(s.primary(), Some(&primary));
+        assert_eq!(s.cands[&other].link, Link::None);
+        // (c) A late answer to an abandoned request: not applied, even when
+        // the node is parentless (its later message to the forwarder wins).
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2]);
+        s.on_offer(0, offer(2, 4, &cfg), 20.0, &mut log);
+        {
+            let c = s.cands.get_mut(&2).expect("cand");
+            c.link = Link::Standby;
+            c.abandoned_at_ms = Some(5_000);
+        }
+        s.standby = Some(2);
+        let out = s.on_decision(20_000, &2, &admit(Role::Primary), &mut rng, &mut log);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(s.primary(), None, "no parent installed by a late answer");
+        // Past LATE_ANSWER_MS it is the forwarder's own promotion (row E2).
+        let _ = s.on_decision(40_000, &2, &admit(Role::Primary), &mut rng, &mut log);
+        assert_eq!(s.primary(), Some(&2));
+        // (d) Abandoned, then asked again within the window: the new
+        // request's answer is applied.
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2]);
+        s.on_offer(0, offer(2, 4, &cfg), 20.0, &mut log);
+        s.cands.get_mut(&2).expect("cand").abandoned_at_ms = Some(5_000);
+        let _ = s.request(6_000, &2, Role::Primary, "again", &mut log);
+        let _ = s.on_decision(6_100, &2, &admit(Role::Primary), &mut rng, &mut log);
+        assert_eq!(
+            s.primary(),
+            Some(&2),
+            "the current request's answer is applied"
+        );
+        assert_eq!(s.cands[&2].abandoned_at_ms, None);
+    }
+
+    /// Row S3 held — the asked publisher's ADMIT keeps: the Down its old
+    /// link-down left is cleared by the ADMIT, and before the first chunk
+    /// the publisher's advertised upstream latency (its uplink queue) is
+    /// owed as well as the silence threshold. Mutation (kill 2): failed over
+    /// one tick after every ADMIT, and the whole tree ended parentless.
+    #[test]
+    fn an_asked_publishers_admit_keeps_through_its_queue() {
+        let mut cfg = ControllerConfig::interactive();
+        cfg.direct_first = true;
+        let mut s = ParentSelector::new(1u32, cfg.clone(), false);
+        s.set_members([1u32, 2]);
+        let mut rng = SplitMix64(9);
+        let mut log = DecisionLog::default();
+        let _ = drive(&mut s, &cfg, 0, 10_000, &[(2, 4, 20.0)]);
+        assert_eq!(s.primary(), Some(&2));
+        s.on_link_down(10_100, &2, &mut log);
+        let queued = |t| {
+            let mut o = offer(2, 4, &cfg);
+            o.upstream_latency_ms = 2_200;
+            let _ = t;
+            o
+        };
+        let mut admitted_at = None;
+        let mut t = 10_250;
+        while t < 30_000 {
+            if t % 1_000 == 0 {
+                s.on_offer(t, queued(t), 20.0, &mut log);
+            }
+            for a in s.tick(t, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent: 2, role } = a {
+                    let d = AdmitDecision::Admit { role };
+                    let _ = s.on_decision(t, &2, &d, &mut rng, &mut log);
+                    if role == Role::Primary && admitted_at.is_none() {
+                        admitted_at = Some(t);
+                    }
+                }
+            }
+            if let Some(at) = admitted_at {
+                // No chunk yet: the queue is 2.2 s deep.
+                if t < at + 2_000 {
+                    assert_eq!(
+                        s.primary(),
+                        Some(&2),
+                        "kept through its queue at t={t} (admitted {at})"
+                    );
+                } else {
+                    break;
+                }
+            }
+            t += 250;
+        }
+        assert!(
+            admitted_at.is_some(),
+            "the publisher was asked and admitted"
+        );
+    }
+
     #[test]
     fn a_member_with_no_parent_asks_the_publisher_without_room() {
         let cfg = ControllerConfig::interactive();
