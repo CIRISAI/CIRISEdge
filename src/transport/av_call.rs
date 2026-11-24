@@ -1865,6 +1865,8 @@ struct Shared {
     path_up_mid_dial: StdMutex<std::collections::HashSet<String>>,
     /// G8 — re-announce rounds skipped in a row, per leg.
     reannounce_skipped: StdMutex<HashMap<String, u32>>,
+    /// G8 pacing — a re-announce is in flight.
+    reannounce_running: AtomicBool,
     /// G8 — the legs (by peer) whose oldest unproved Channel message is
     /// backlogged ([`alm::UPLINK_BACKLOG_MS`]): their periodic offers are
     /// held until it is proved.
@@ -2578,6 +2580,7 @@ impl Call {
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
             reannounce_skipped: StdMutex::new(HashMap::new()),
+            reannounce_running: AtomicBool::new(false),
             backlogged_legs: StdMutex::new(std::collections::HashSet::new()),
             load,
             setup_began: std::time::Instant::now(),
@@ -3971,6 +3974,7 @@ async fn send_own_chunk(
     let wire_len = u64::try_from(plaintext_len + AV_CHUNK_WIRE_OVERHEAD + CHUNK_TRAILER_LEN)
         .unwrap_or(u64::MAX);
     let legs_now = publisher.dispatcher_mut().subscriber_ids();
+    exclude.extend(stalled_channel_legs(shared, &legs_now));
     {
         let alm = Shared::lock(&shared.alm);
         if alm.tier().own_call_audio_only() && !base_or_audio {
@@ -4768,6 +4772,22 @@ fn is_base_or_audio(codec_id: u8, layer: ChunkLayer) -> bool {
     codec_id == crate::transport::realtime_av::CODEC_OPAQUE || layer == ChunkLayer::BASE
 }
 
+/// Row E3 — latched stall verdict ∧ a leg whose media rides the reliable
+/// Channel (no datagram capability yet, e.g. a fresh leg before the peer's
+/// CAPS) → that leg gets no media until it has datagrams: a Channel media
+/// frame on a queued uplink is retransmitted into the same queue. Never on
+/// an unstalled uplink (the Channel fallback serves a pre-datagram peer).
+fn stalled_channel_legs(shared: &Arc<Shared>, legs: &[String]) -> Vec<String> {
+    if !Shared::lock(&shared.alm).uplink_stalled() {
+        return Vec::new();
+    }
+    let ttl = Shared::lock(&shared.leg_ttl);
+    legs.iter()
+        .filter(|l| !ttl.get(*l).is_some_and(|t| t.uses_datagrams()))
+        .cloned()
+        .collect()
+}
+
 /// C1 and C5 on one fan-out's report: every leg's outcome feeds the egress
 /// meter, and a leg that stays congested is shed to the base layer until it
 /// runs clean (the host's own policy is the cap it is restored to).
@@ -4839,13 +4859,16 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
         if !Shared::lock(&shared.alm).speaks_c3(&o.to) {
             continue;
         }
-        // G8 / row D1 — a periodic offer to a backlogged leg would only queue
-        // behind it and spend its Channel's retry budget; the next one
-        // replaces it. Any other leg keeps the normal cadence.
-        if offer_held(&o.frame, &o.to, &Shared::lock(&shared.backlogged_legs)) {
-            shared.count(crate::observability::ALM_OFFER_HELD_BACKLOG);
-            continue;
-        }
+        // F14a — no offer is held on any leg, backlogged or not: the ~1 s
+        // offer is each leg's fresh Channel message, and leviculum's learned
+        // retry ladder applies only to a message with fresh evidence since
+        // its first send. A held leg went quiet, so the next message on it (a
+        // shed, an admit) ran the cold ladder behind the queue and the link
+        // died (P's kept child, a silent listener, on 9035988aa). Both sides
+        // keep it: P offers its stream on its leg to each member, and every
+        // member offers its own on its leg toward each node, the one it
+        // receives from included. The bulky repeat (the binding re-announce)
+        // is the one held (reannounce_held_legs).
         let refused_by_seam = !is_periodic(&o.frame)
             && shared
                 .test_fail_c3
@@ -4890,14 +4913,6 @@ async fn send_alm(shared: &Arc<Shared>, out: Vec<alm::Outgoing>) {
             tokio::spawn(async move { resend_c3(&s, o).await });
         }
     }
-}
-
-/// G8 / row D1 — whether a C3 frame to `to` is held: a periodic OFFER to a
-/// leg whose oldest unproved Channel message is backlogged. Nothing else,
-/// and never a leg with nothing outstanding (the verdict being latched does
-/// not matter here).
-fn offer_held(frame: &[u8], to: &str, backlogged: &std::collections::HashSet<String>) -> bool {
-    is_periodic(frame) && backlogged.contains(to)
 }
 
 /// Retry a C3 frame a congested link refused, until [`C3_RESEND_BUDGET`]
@@ -5051,7 +5066,14 @@ async fn out_leg_reader(
         .is_some_and(|l| l.link_id != link_id);
     if !replaced {
         Shared::lock(&shared.out_legs).remove(&peer);
-        Shared::lock(&shared.alm).on_child_link_down(&peer);
+        let mut a = Shared::lock(&shared.alm);
+        a.on_child_link_down(&peer);
+        // Row T1 — this node's OWN leg toward a member it receives a stream
+        // from is torn → that parent is lost: fail over now, as when its
+        // media leg closes (the two die together on a congested uplink, but
+        // which close lands first is not ours to pick; waiting for the
+        // other one left a listener on a parent that heard nothing).
+        a.on_parent_link_down(&peer);
     }
 }
 
@@ -5301,7 +5323,12 @@ async fn take_binding(shared: &Arc<Shared>, peer: &str, wire: &[u8]) {
 /// value reads as queue delay for seconds. The egress meter takes that for
 /// the uplink, on a schedule, so a measured ceiling never goes stale. A
 /// binding nobody lost can arrive half a second later.
-pub const REANNOUNCE_PART_GAP: Duration = Duration::from_millis(50);
+///
+/// G8 pacing: one part per leg per second, so a re-announce trickles
+/// across its period instead of landing as one burst in front of media,
+/// proofs and offers (~10 parts × 2 bindings per leg at the base MTU were
+/// ~3 s of queue on a capped uplink when sent within 0.5 s).
+pub const REANNOUNCE_PART_GAP: Duration = Duration::from_secs(1);
 
 /// Send a binding's parts on every leg but `except`, ONE PART PER HOLD of the
 /// publisher lock. A binding is about ten Channel messages on a base-MTU link;
@@ -5359,6 +5386,19 @@ async fn send_binding_paced(
 /// Re-send this stream's current binding on every leg (a receiver whose
 /// inbound queue dropped a part gets it again).
 async fn reannounce(shared: &Arc<Shared>) {
+    // G8 pacing — never more than one re-announce in flight: a paced one
+    // can outlast BINDING_REANNOUNCE, and the next round then waits.
+    if shared.reannounce_running.swap(true, Ordering::AcqRel) {
+        shared.count(crate::observability::AV_BINDING_REANNOUNCE_HELD);
+        return;
+    }
+    struct Running<'a>(&'a AtomicBool);
+    impl Drop for Running<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _running = Running(&shared.reannounce_running);
     let (wire, wire_v2) = {
         let k = Shared::lock(&shared.own_key);
         (Arc::clone(&k.wire), k.wire_v2.clone())
@@ -5607,7 +5647,12 @@ async fn forward(
     if targets.is_empty() {
         return;
     }
-    let exclude: Vec<String> = legs.into_iter().filter(|l| !targets.contains(l)).collect();
+    let mut exclude: Vec<String> = legs
+        .iter()
+        .filter(|l| !targets.contains(*l))
+        .cloned()
+        .collect();
+    exclude.extend(stalled_channel_legs(shared, &legs));
     let wire_len =
         u64::try_from(inner.inner_ciphertext().len() + AV_CHUNK_WIRE_OVERHEAD).unwrap_or(u64::MAX);
     if let Ok(report) = publisher

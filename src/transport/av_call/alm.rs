@@ -2764,6 +2764,36 @@ mod tests {
         );
     }
 
+    /// F14a — a SILENT listener (it publishes nothing) still sends one fresh
+    /// Channel message a second on its own leg toward the node it receives a
+    /// stream from, stalled or not: its own stream's OFFER, to every C3 leg,
+    /// the publisher included. That keeps evidence flowing on both of the
+    /// publisher's links to it (leviculum's same-key form).
+    #[test]
+    fn a_silent_listener_offers_on_its_leg_to_its_parent_each_second() {
+        let roster: Vec<String> = vec!["a".into(), "b".into()];
+        let mut b = AlmState::new("b", s(2), &roster, true, 1);
+        b.uplink_stall = true;
+        let mut offers = 0;
+        for _ in 0..3 {
+            b.t0 = b.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            for o in b.tick(&["a".into()]) {
+                if o.to == "a"
+                    && matches!(
+                        decode(&o.frame, "b"),
+                        Ok(WireFrame::Control(ControlFrame {
+                            msg: ControlMsg::Offer(_),
+                            ..
+                        }))
+                    )
+                {
+                    offers += 1;
+                }
+            }
+        }
+        assert!(offers >= 3, "one a second toward the parent: {offers}");
+    }
+
     /// G8 — a stalled uplink with ONE child has nothing to shed: the verdict
     /// keeps the last direct path whatever the reserve or the relay work.
     #[test]

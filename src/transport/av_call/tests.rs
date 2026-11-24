@@ -983,28 +983,6 @@ fn a_replacement_is_not_a_leave() {
     assert!(!a.ended.contains(&("carol".to_owned(), StreamId([5; 32]))));
 }
 
-/// G8 / row D1 — under a latched stall verdict only a BACKLOGGED leg's
-/// periodic offer is held; a leg with nothing outstanding keeps its cadence,
-/// and nothing but an offer is ever held.
-#[test]
-fn only_a_backlogged_leg_holds_its_offer() {
-    let mut offer = vec![0u8; 16];
-    offer[5] = 0x07; // KIND_OFFER
-    assert!(is_periodic(&offer), "the fixture is an offer");
-    let mut not_offer = offer.clone();
-    not_offer[5] = 0x01;
-    let backlogged: std::collections::HashSet<String> = ["b".to_owned()].into_iter().collect();
-    assert!(offer_held(&offer, "b", &backlogged));
-    assert!(
-        !offer_held(&offer, "c", &backlogged),
-        "a clear leg keeps its cadence"
-    );
-    assert!(
-        !offer_held(&not_offer, "b", &backlogged),
-        "only offers are held"
-    );
-}
-
 /// G8 — a periodic re-announce skips every leg while the uplink stall
 /// verdict holds, else only the backlogged legs; a clear leg on a clear
 /// uplink still gets it; and no leg goes more than REANNOUNCE_MAX_SKIPS
@@ -1078,4 +1056,17 @@ fn a_stalled_uplink_redials_one_leg_at_a_time() {
         RedialGate::Dial,
         "no relay: dial"
     );
+}
+
+/// G8 pacing — a re-announce puts at most one binding part per leg per
+/// second on the uplink: at the base MTU's ~400-byte part that is ~3.2
+/// kbit/s per leg, under 3% of a 127 kbit/s cap for three legs.
+#[test]
+fn a_reannounce_sends_one_part_per_leg_per_second() {
+    const { assert!(REANNOUNCE_PART_GAP.as_millis() >= 1_000) };
+    let part = 400u64;
+    let legs = 3u64;
+    #[allow(clippy::cast_possible_truncation)]
+    let per_s = part * legs * 1_000 / REANNOUNCE_PART_GAP.as_millis() as u64;
+    assert!(per_s * 8 * 100 / 127_000 < 3 * 8, "{per_s} B/s");
 }

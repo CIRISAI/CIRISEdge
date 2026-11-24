@@ -736,6 +736,21 @@ impl<P: PeerRef> Admission<P> {
         if depth.saturating_add(1) > self.cfg.max_depth {
             return self.refuse(now_ms, req, RefuseReason::DepthLimit, rng, log);
         }
+        // Row S3 (the plain no-parent path): a publisher with NO primary
+        // child admits a primary whatever its probe, ceiling or last offer
+        // said. Its uplink is the one path nothing replaces, and the root's
+        // floor is one stream; refusing it here left a capped publisher with
+        // no children for the rest of a cap (the kept child's link had died).
+        // Only for a publisher whose uplink carries nothing else of its own
+        // (no share or relay commitments): those keep their room.
+        if self.is_root
+            && req.role == Role::Primary
+            && self.external_committed == 0
+            && !self.ledger.values().any(|c| c.role == Role::Primary)
+        {
+            self.commit(now_ms, req, log);
+            return AdmitDecision::Admit { role: req.role };
+        }
         let existing = self.ledger.get(&req.subscriber).map_or(0, |c| c.bps);
         let need = self.cfg.role_bps(req.role);
         if need <= existing {
@@ -1051,6 +1066,26 @@ mod tests {
             }
         }
         assert_eq!(admitted, 1, "one direct child into an unmeasured uplink");
+    }
+
+    /// Row S3 — a publisher with no primary child admits one whatever its
+    /// room reads (here it advertises half a stream), so a capped call never
+    /// sits with no direct child; a second primary still meets the limit.
+    #[test]
+    fn a_publisher_with_no_primary_admits_one() {
+        let cfg = ControllerConfig::interactive();
+        let mut a = Admission::publisher(0u32, cfg.clone(), Some(cfg.stream_bps / 2));
+        roster(&mut a);
+        let mut rng = SplitMix64(3);
+        let mut log = DecisionLog::default();
+        assert!(matches!(
+            a.request(0, &req(1, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
+        assert!(!matches!(
+            a.request(0, &req(2, Role::Primary), &mut rng, &mut log),
+            AdmitDecision::Admit { .. }
+        ));
     }
 
     #[test]
