@@ -352,6 +352,9 @@ struct CappedUplink {
     next_free: tokio::sync::Mutex<tokio::time::Instant>,
     /// The longest any byte has waited to leave (µs): the peak queue delay.
     peak_us: AtomicU64,
+    /// ReceiverMoves (RM6) — a fixed delay (ms) on what OTHERS send this
+    /// node: a slow downlink. 0: none.
+    down_delay_ms: AtomicU64,
 }
 
 impl CappedUplink {
@@ -360,7 +363,26 @@ impl CappedUplink {
             bytes_per_s: AtomicU64::new(0),
             next_free: tokio::sync::Mutex::new(tokio::time::Instant::now()),
             peak_us: AtomicU64::new(0),
+            down_delay_ms: AtomicU64::new(0),
         })
+    }
+
+    /// Delay everything others send this node by `ms` (its downlink).
+    fn delay_down_ms(&self, ms: u64) {
+        self.down_delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// How long a byte handed over now waits to leave (ms), when the queue
+    /// is not being written this instant.
+    fn queue_ms(&self) -> Option<u64> {
+        let next = self.next_free.try_lock().ok()?;
+        Some(
+            u64::try_from(
+                next.saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+        )
     }
 
     /// The peak queue delay so far, and reset it.
@@ -409,8 +431,29 @@ async fn capped_listener(port: u16, uplink: Arc<CappedUplink>) -> u16 {
             let _ = node.set_nodelay(true);
             let (mut client_rx, mut client_tx) = client.into_split();
             let (mut node_rx, mut node_tx) = node.into_split();
+            // The node's downlink: passes at once, or after the set delay.
+            let (dtx, mut drx) = mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+            let down = Arc::clone(&uplink);
             tokio::spawn(async move {
-                let _ = tokio::io::copy(&mut client_rx, &mut node_tx).await;
+                let mut buf = vec![0u8; 16 * 1024];
+                while let Ok(n) = client_rx.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    let d = down.down_delay_ms.load(Ordering::SeqCst);
+                    let due = tokio::time::Instant::now() + Duration::from_millis(d);
+                    if dtx.send((due, buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some((due, bytes)) = drx.recv().await {
+                    tokio::time::sleep_until(due).await;
+                    if node_tx.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
             });
             let (tx, mut rx) = mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
             let up = Arc::clone(&uplink);
@@ -420,9 +463,14 @@ async fn capped_listener(port: u16, uplink: Arc<CappedUplink>) -> u16 {
                     if n == 0 {
                         return;
                     }
-                    let due = up.due(n).await;
-                    if tx.send((due, buf[..n].to_vec())).is_err() {
-                        return;
+                    // Paced in small pieces, as a link drains: one read of
+                    // a deep queue is many frames, and one due time for all
+                    // of them would deliver them as one burst.
+                    for piece in buf[..n].chunks(512) {
+                        let due = up.due(piece.len()).await;
+                        if tx.send((due, piece.to_vec())).is_err() {
+                            return;
+                        }
                     }
                 }
             });
@@ -4080,4 +4128,393 @@ async fn a_member_who_never_joins_produces_no_path_event() {
         }
     }
     drop((ca, cb));
+}
+
+// ── ReceiverMoves (docs/design/call_congestion, rows RM2–RM7) ─────────────
+
+/// RM4 — `member`'s rank on `stream`, as edge computes it.
+fn rank_of(stream: ciris_edge::transport::realtime_av::StreamId, member: &str) -> (u64, String) {
+    (
+        ciris_edge::transport::realtime_av_alm::controller::hash_rank(
+            &stream.0,
+            &member.to_owned(),
+        ),
+        member.to_owned(),
+    )
+}
+
+/// One look at the room while `P` publishes: when (since the cap), `P`'s
+/// uplink queue (ms), and each listener's primary for `P`'s stream.
+#[derive(Debug, Clone)]
+struct Look {
+    at: Duration,
+    queue_ms: Option<u64>,
+    parents: Vec<Option<String>>,
+}
+
+/// Publish `P`'s 30 Hz stream for `secs` and look at the room every third
+/// frame (~100 ms). Returns the next seq.
+async fn publish_looking(
+    cp: &mut Call,
+    listeners: &[Call],
+    uplink: &CappedUplink,
+    origin: tokio::time::Instant,
+    secs: u64,
+    seq0: u64,
+    looks: &mut Vec<Look>,
+) -> u64 {
+    let size = cp.chunk_plaintext_budget().unwrap_or(240).min(600);
+    let stream = cp.stream();
+    let mut seq = seq0;
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < end {
+        let mut b = body("p", seq);
+        b.resize(size, b'.');
+        let _ = cp.publish(Frame::opaque(b)).await;
+        if seq.is_multiple_of(3) {
+            looks.push(Look {
+                at: origin.elapsed(),
+                queue_ms: uplink.queue_ms(),
+                parents: listeners.iter().map(|l| primary_for(l, stream)).collect(),
+            });
+        }
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    seq
+}
+
+/// **ReceiverMoves — a capped publisher's children move themselves, and come
+/// back once the cap lifts.** The room and cap of
+/// [`a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`] (one
+/// copy of `P`'s stream and a third to spare, three children), held 20 s and
+/// lifted. Judged on what each listener chose, looked at every ~100 ms:
+/// 1. RM2/RM3: every child but the lowest-ranked (RM4) is on a member relay
+///    within 1 s of its media turning late (`P`'s queue past 300 ms, plus the
+///    300 ms that media takes to arrive), and stays there while the cap holds;
+/// 2. exactly one direct child (the lowest-ranked) for the rest of the cap;
+/// 3. no listener is ever without a parent (make-before-break);
+/// 4. RM7: after the lift every child is direct again within the stated
+///    bound, with at most two primary changes each (out and back): no
+///    oscillation.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_capped_publishers_children_move_themselves_and_come_back() {
+    /// RM7's bound after the lift: the ceiling's staleness (60 s) + the
+    /// dwell (10 s) + a window and the probe backoff.
+    const RETURN_BOUND: Duration = Duration::from_secs(85);
+    let _call = one_call().await;
+    let tag = "alm2-rxmove";
+    let uplink = CappedUplink::new();
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&uplink))),
+    )
+    .await;
+    let p = &nodes[0];
+    let pid = p.key.key_id.clone();
+    let mut cp = join_loaded(p, &groups[0], tag, relay_opts(), None).await;
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    wait_legs(&cp, 3).await;
+    for l in &listeners {
+        wait_legs(l, 3).await;
+    }
+    let stream = cp.stream();
+    let names: Vec<String> = nodes[1..4].iter().map(|n| n.key.key_id.clone()).collect();
+    let kept = (0..3)
+        .min_by_key(|i| rank_of(stream, &names[*i]))
+        .expect("three");
+    // Baseline: the probe widens to the full mesh.
+    let origin = tokio::time::Instant::now();
+    let mut looks = Vec::new();
+    let all_direct = |l: &Look| l.parents.iter().all(|x| x.as_deref() == Some(pid.as_str()));
+    let mut seq = 0;
+    // Slow start: the third child is relayed first and moves to P once the
+    // probe has room and its dwell has passed.
+    for _ in 0..20 {
+        seq = publish_looking(&mut cp, &listeners, &uplink, origin, 2, seq, &mut looks).await;
+        if looks.last().is_some_and(all_direct) {
+            break;
+        }
+    }
+    // Settled a little longer: offers and the standbys catch up.
+    seq = publish_looking(&mut cp, &listeners, &uplink, origin, 3, seq, &mut looks).await;
+    assert!(
+        looks.last().is_some_and(all_direct),
+        "baseline: the full mesh carries P: {:?}; looks {:?}; P children {:?}; logs: P {}\n A {}\n B {}\n C {}",
+        looks.last(),
+        looks
+            .iter()
+            .step_by(10)
+            .map(|l| (l.at.as_millis(), l.parents.clone()))
+            .collect::<Vec<_>>(),
+        cp.alm_own_children(),
+        cp.alm_log().2,
+        listeners[0].alm_log().2,
+        listeners[1].alm_log().2,
+        listeners[2].alm_log().2,
+    );
+    let frame = cp.chunk_plaintext_budget().unwrap_or(240).min(600) as u64;
+    let copy_kbit = (frame + 170) * 8 * 30 / 1000;
+    let torn_before: Vec<u64> = nodes.iter().map(|n| torn_down(&n.metrics)).collect();
+    uplink.cap_kbit(copy_kbit * 13 / 10);
+    let cap_on = tokio::time::Instant::now();
+    let mut capped = Vec::new();
+    seq = publish_looking(&mut cp, &listeners, &uplink, cap_on, 20, seq, &mut capped).await;
+    uplink.cap_kbit(0);
+    let lift = cap_on.elapsed();
+    let mut lifted = Vec::new();
+    let _ = publish_looking(
+        &mut cp,
+        &listeners,
+        &uplink,
+        cap_on,
+        RETURN_BOUND.as_secs() + 10,
+        seq,
+        &mut lifted,
+    )
+    .await;
+
+    let mut failed: Vec<String> = Vec::new();
+    let late_at = capped
+        .iter()
+        .find(|l| l.queue_ms.is_some_and(|q| q >= 300))
+        .map(|l| l.at);
+    let Some(late_at) = late_at else {
+        panic!("the cap never queued P's uplink 300 ms: {capped:?}");
+    };
+    // Media queued 300 ms reaches the listeners 300 ms later.
+    let deadline = late_at + Duration::from_millis(300) + Duration::from_secs(1);
+    let relayed = |x: &Option<String>| x.as_deref().is_some_and(|x| x != pid.as_str());
+    for i in (0..3).filter(|i| *i != kept) {
+        let moved = capped.iter().find(|l| relayed(&l.parents[i])).map(|l| l.at);
+        match moved {
+            Some(at) if at <= deadline => {}
+            other => failed.push(format!(
+                "listener {i} on a relay at {other:?}, deadline {deadline:?} (late at {late_at:?})"
+            )),
+        }
+    }
+    let settled: Vec<&Look> = capped.iter().filter(|l| l.at > deadline).collect();
+    for l in &settled {
+        let direct: Vec<usize> = (0..3)
+            .filter(|i| l.parents[*i].as_deref() == Some(pid.as_str()))
+            .collect();
+        if direct != vec![kept] {
+            failed.push(format!(
+                "at {:?} P's direct children {direct:?}, want only the lowest-ranked {kept}",
+                l.at
+            ));
+            break;
+        }
+    }
+    for l in capped.iter().chain(&lifted) {
+        if l.parents.iter().any(Option::is_none) {
+            failed.push(format!(
+                "a listener without a parent at {:?}: {:?}",
+                l.at, l.parents
+            ));
+            break;
+        }
+    }
+    let back = lifted.iter().find(|l| all_direct(l)).map(|l| l.at - lift);
+    match back {
+        Some(b) if b <= RETURN_BOUND => {}
+        other => failed.push(format!(
+            "all direct again {other:?} after the lift (bound {RETURN_BOUND:?})"
+        )),
+    }
+    if let Some(l) = lifted.last() {
+        if !all_direct(l) {
+            failed.push(format!("not all direct at the end: {:?}", l.parents));
+        }
+    }
+    for i in 0..3 {
+        let changes = capped
+            .iter()
+            .chain(&lifted)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|w| w[0].parents[i] != w[1].parents[i])
+            .count();
+        let most = if i == kept { 0 } else { 2 };
+        if changes > most {
+            failed.push(format!(
+                "listener {i}: {changes} primary changes (at most {most})"
+            ));
+        }
+    }
+    let torn: Vec<u64> = nodes
+        .iter()
+        .zip(&torn_before)
+        .map(|(n, b)| torn_down(&n.metrics) - b)
+        .collect();
+    let first_none = capped
+        .iter()
+        .chain(&lifted)
+        .find(|l| l.parents.iter().any(Option::is_none))
+        .map(|l| l.at);
+    let context = format!(
+        "links torn per node (P, A, B, C, T) {torn:?}; first parentless look {first_none:?}; \
+         offers held for backlog per node {:?}; \
+         kept {kept}; late at {late_at:?}; lift at {lift:?}; back after {back:?}; P children {:?}; \
+         P counts {:?}; P labels: stall {} departure {}; listeners' late moves {:?}; capped looks {:?}",
+        nodes
+            .iter()
+            .map(|n| {
+                (
+                    av(&n.metrics, "alm_offer_held:backlog"),
+                    av(&n.metrics, "alm_c3_send_failed"),
+                    av(&n.metrics, "alm_c3_sent"),
+                    av(&n.metrics, "alm_c3_received"),
+                )
+            })
+            .collect::<Vec<_>>(),
+        cp.alm_own_children(),
+        cp.alm_counts(),
+        av(&p.metrics, "alm_uplink_stall"),
+        av(&p.metrics, "alm_departure_congestion"),
+        nodes[1..4]
+            .iter()
+            .map(|n| (av(&n.metrics, "alm_late_move"), av(&n.metrics, "alm_late_spared")))
+            .collect::<Vec<_>>(),
+        capped
+            .iter()
+            .step_by(5)
+            .take(30)
+            .map(|l| (l.at.as_millis(), l.queue_ms, l.parents.iter().map(|x| x.as_deref() == Some(pid.as_str())).collect::<Vec<_>>()))
+            .collect::<Vec<_>>(),
+    );
+    eprintln!("[RM] capped then lifted: {context}; failed {failed:?}");
+    assert!(failed.is_empty(), "{failed:?}: {context}");
+    drop(listeners);
+    drop(cp);
+}
+
+/// Calls 1, 2 and 3 each publish 30 Hz for `secs`.
+async fn publish_three(calls: &mut [Call], secs: u64, seq0: u64) -> u64 {
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let mut seq = seq0;
+    while tokio::time::Instant::now() < end {
+        for who in 1..=3usize {
+            let size = calls[who].chunk_plaintext_budget().unwrap_or(240).min(600);
+            let mut b = body(["r", "p", "q", "s"][who], seq);
+            b.resize(size, b'.');
+            let _ = calls[who].publish(Frame::opaque(b)).await;
+        }
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    seq
+}
+
+/// **RM6 — a receiver whose own downlink is slow does not move.** Three
+/// members publish (`P` and two others); `R`'s downlink then delays everything sent
+/// to it by 400 ms. `P`'s stream reads late at `R`, and so do the others': the
+/// lateness is `R`'s own, a relay would not help, and `R` stays a direct
+/// child of `P` (the own-downlink guard is counted). `P` is chosen so that
+/// `R` is not the lowest-ranked of its direct children (it would merely be
+/// spared).
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_receiver_whose_own_downlink_is_slow_does_not_move() {
+    let _call = one_call().await;
+    let tag = "alm2-rxslow";
+    let downlink = CappedUplink::new();
+    // 0 = R (slow downlink, dials nobody), 1..=3 members, 4 = T.
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&downlink))),
+    )
+    .await;
+    let r = &nodes[0];
+    let mut calls = Vec::new();
+    for (i, g) in groups.iter().enumerate() {
+        calls.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    for c in &calls {
+        wait_legs(c, 3).await;
+    }
+    // Every member but R publishes. P: one whose direct children include R
+    // and another child ranked below R (so R is not merely spared).
+    let mut seq = 0;
+    let mut chosen = None;
+    for _ in 0..15 {
+        seq = publish_three(&mut calls, 3, seq).await;
+        chosen = (1..=3usize).find(|&p| {
+            let st = calls[p].stream();
+            let pid = nodes[p].key.key_id.as_str();
+            let direct: Vec<usize> = (0..=3usize)
+                .filter(|i| *i != p && primary_for(&calls[*i], st).as_deref() == Some(pid))
+                .collect();
+            direct.contains(&0)
+                && direct
+                    .iter()
+                    .any(|i| rank_of(st, &nodes[*i].key.key_id) < rank_of(st, &r.key.key_id))
+        });
+        if chosen.is_some() {
+            break;
+        }
+    }
+    let p = chosen.expect("a publisher with R and a lower-ranked member as direct children");
+    let pid = nodes[p].key.key_id.clone();
+    let pstream = calls[p].stream();
+    let guarded_before = av(&r.metrics, "alm_late_guarded:own_downlink");
+    downlink.delay_down_ms(400);
+    let mut left = None;
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        seq = publish_three(&mut calls, 1, seq).await;
+        let now = primary_for(&calls[0], pstream);
+        if now.as_deref() != Some(pid.as_str()) {
+            left = Some((start.elapsed(), now));
+            break;
+        }
+    }
+    let guarded = av(&r.metrics, "alm_late_guarded:own_downlink") - guarded_before;
+    let context = format!(
+        "P = node {p}: R left P {left:?}; guarded {guarded}; R moves {} spared {}",
+        av(&r.metrics, "alm_late_move"),
+        av(&r.metrics, "alm_late_spared"),
+    );
+    eprintln!("[RM6] slow downlink: {context}");
+    assert!(left.is_none(), "R moved off P: {context}");
+    assert!(
+        guarded >= 1,
+        "the guard never ran (R was not late?): {context}"
+    );
+    drop(calls);
 }
