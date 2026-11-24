@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use super::rxmove::LatencyFloor;
+use super::rxmove::{self, LatencyFloor, Reading};
 use crate::load_ladder::ServiceTier;
 use crate::transport::realtime_av::StreamId;
 use crate::transport::realtime_av_alm::controller::wire::{
@@ -298,6 +298,14 @@ pub(super) struct AlmState {
     /// RM5 — when this node last published each of its own streams (call
     /// ms): a stream published within [`STREAM_LIVE_MS`] is live.
     own_published_ms: BTreeMap<StreamId, u64>,
+    /// RM2 — each (stream, delivering peer)'s latency readings.
+    readings: BTreeMap<(StreamId, String), Reading>,
+    /// RM2 — streams in a late episode this node already moved in (one move
+    /// an episode); the episode ends when the primary reads on time.
+    late_moved: BTreeSet<StreamId>,
+    /// RM4/RM6 — streams whose current late episode was already counted as
+    /// spared or guarded (one label an episode, not one a tick).
+    late_noted: BTreeSet<StreamId>,
 }
 
 /// RM5 — an own stream published this recently is live: a direct child's
@@ -414,6 +422,9 @@ impl AlmState {
             uplink_stall_seen_ms: None,
             pending_out: Vec::new(),
             own_published_ms: BTreeMap::new(),
+            readings: BTreeMap::new(),
+            late_moved: BTreeSet::new(),
+            late_noted: BTreeSet::new(),
         }
     }
 
@@ -1205,6 +1216,11 @@ impl AlmState {
             .entry(stream)
             .or_insert_with(|| LatencyFloor::new(offset, now))
             .sample(offset, now) as f64;
+        // RM2: per path, so the publisher's own delivery is read alone.
+        self.readings
+            .entry((stream, from.to_owned()))
+            .or_default()
+            .push(now, latency);
         let Some(sel) = self.sels.get_mut(&stream) else {
             return;
         };
@@ -1488,12 +1504,19 @@ impl AlmState {
                 }
             }
             ControlMsg::Decision(d) => {
-                let acts = match self.sels.get_mut(&stream) {
-                    Some(s) => {
-                        s.on_decision(now, &peer.to_owned(), &d, &mut self.rng, &mut self.log)
-                    }
-                    None => Vec::new(),
+                let (acts, late) = match self.sels.get_mut(&stream) {
+                    Some(s) => (
+                        s.on_decision(now, &peer.to_owned(), &d, &mut self.rng, &mut self.log),
+                        s.take_late_moved(),
+                    ),
+                    None => (Vec::new(), false),
                 };
+                if late {
+                    // RM3: switched on the relay's admit; the publisher is
+                    // left in `acts`. One move this late episode.
+                    self.late_moved.insert(stream);
+                    self.label(crate::observability::ALM_LATE_MOVE);
+                }
                 out.extend(self.action_frames(stream, acts));
                 self.sync_upstream(stream);
             }
@@ -1627,6 +1650,9 @@ impl AlmState {
         self.rates.remove(&old);
         self.forwarded_seen.remove(&old);
         self.min_offset.remove(&old);
+        self.readings.retain(|(s, _), _| *s != old);
+        self.late_moved.remove(&old);
+        self.late_noted.remove(&old);
         self.last_primary.remove(&old);
         self.told_publisher.remove(&old);
         self.draining_parent.remove(&old);
@@ -1805,6 +1831,8 @@ impl AlmState {
             }
             self.log = log;
             out.extend(self.action_frames(s, acts));
+            let moved = self.receiver_move(s, now);
+            out.extend(moved);
             self.sync_upstream(s);
 
             let sel = &self.sels[&s];
@@ -1957,6 +1985,76 @@ impl AlmState {
             self.relay_status_pending = Some(status);
         }
         out
+    }
+
+    /// RM2 — ReceiverMoves, once a watch tick for each received stream: a
+    /// direct child of the publisher whose media from it reads late moves
+    /// itself to a member relay, make-before-break (the relay's admit
+    /// switches and leaves the publisher, RM3, in [`Self::on_control`]).
+    ///
+    /// Transition: observable, the publisher's own delivery of `stream`
+    /// (its signed `source_ts_ms` over the RM1 floor) reads late, ≥
+    /// [`rxmove::LATE_MS`] on two readings not falling; state, the primary is
+    /// the publisher, nothing is pending, this late episode moved nothing
+    /// yet, this node is not the lowest-ranked of the publisher's direct
+    /// children (RM4, from the offers); action, ask the best member relay
+    /// with room, not this node's descendant and offering within 5 s, that
+    /// is not a direct child which may itself move (only the spared one, or
+    /// a member deeper in the tree); must never, move when spared, move to a
+    /// stale offer or one without room, move twice in one episode, or leave
+    /// the publisher before the admit.
+    fn receiver_move(&mut self, s: StreamId, now: u64) -> Vec<Outgoing> {
+        let Some(publisher) = self.bound_publisher.get(&s).cloned() else {
+            return Vec::new();
+        };
+        let Some(sel) = self.sels.get(&s) else {
+            return Vec::new();
+        };
+        let primary = sel.primary().cloned();
+        // The episode ends when the primary (wherever it is) reads on time.
+        if let Some(p) = &primary {
+            let on_time = self
+                .readings
+                .get(&(s, p.clone()))
+                .and_then(|r| r.current(now))
+                .is_some_and(|l| l < rxmove::LATE_MS);
+            if on_time {
+                self.late_moved.remove(&s);
+                self.late_noted.remove(&s);
+            }
+        }
+        if primary.as_ref() != Some(&publisher)
+            || sel.primary_pending()
+            || self.late_moved.contains(&s)
+        {
+            return Vec::new();
+        }
+        let late = self
+            .readings
+            .get(&(s, publisher.clone()))
+            .is_some_and(|r| r.sustained_late(now, rxmove::LATE_MS));
+        if !late {
+            return Vec::new();
+        }
+        let directs = sel.direct_children_by_offer(now, &publisher);
+        if rxmove::spared(s, &self.me, &directs) {
+            if self.late_noted.insert(s) {
+                self.label(crate::observability::ALM_LATE_SPARED);
+            }
+            return Vec::new();
+        }
+        // A direct child that is not the spared one may move itself: never
+        // a target (two movers onto each other would loop).
+        let keep = rxmove::lowest(s, &directs).cloned();
+        let allowed = |c: &String| !directs.contains(c) || Some(c) == keep.as_ref();
+        let mut log = std::mem::take(&mut self.log);
+        let act = self
+            .sels
+            .get_mut(&s)
+            .and_then(|sel| sel.late_move(now, &publisher, &allowed, &mut log));
+        self.log = log;
+        act.map(|a| self.action_frames(s, vec![a]))
+            .unwrap_or_default()
     }
 
     /// Every stream this node receives, with its chosen parents.
@@ -2942,6 +3040,214 @@ mod tests {
                 spec_rank(s(7), m)
             );
         }
+    }
+
+    /// A receiver `me` of `a`'s stream s(1) in a room of a, b, c, d: joined
+    /// to `a` directly, with each of `relays` offering it as a direct child
+    /// of `a` (depth 1) with room, every subscribe answered Admit, two
+    /// seconds of on-time media. Returns the receiver and the frames it sent.
+    fn joined_receiver(me: &str, relays: &[&str]) -> (AlmState, Vec<Outgoing>) {
+        let roster4: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+        let mut n = AlmState::new(me, s(9), &roster4, true, 3);
+        for p in ["a", "b", "c", "d"].into_iter().filter(|p| *p != me) {
+            n.on_caps(p, CAPS_THIS_BUILD | CAP_RELAY);
+        }
+        n.note_publisher(s(1), "a");
+        n.note_bound_publisher(s(1), "a");
+        let mut sent = Vec::new();
+        let mut seq = 0;
+        for step in 0..200u64 {
+            n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+            late_chunk(&mut n, s(1), "a", seq, 0);
+            if let Some(sb) = n.sels.get(&s(1)).and_then(|x| x.standby().cloned()) {
+                late_chunk(&mut n, s(1), &sb, seq, 0);
+            }
+            seq += 1;
+            if step % 50 == 0 {
+                offers_to(&mut n, relays);
+            }
+            if step % 12 == 0 {
+                let out = n.tick(&[]);
+                sent.extend(answer_admits(&mut n, &out));
+                sent.extend(out);
+            }
+        }
+        (n, sent)
+    }
+
+    /// `a`'s offer (depth 0) and each relay's (depth 1 under `a`, room) to `n`.
+    fn offers_to(n: &mut AlmState, relays: &[&str]) {
+        let me = n.me.clone();
+        let a = Outgoing {
+            to: me.clone(),
+            frame: offer_frame(s(1), "a"),
+        };
+        let _ = deliver(n, "a", &[a]);
+        for r in relays {
+            let f = Outgoing {
+                to: me.clone(),
+                frame: wire::encode(
+                    s(1),
+                    &ControlMsg::Offer(crate::transport::realtime_av_alm::controller::Offer {
+                        from: (*r).to_owned(),
+                        depth: 1,
+                        ancestry: vec!["a".to_owned()],
+                        headroom_bps: 100_000_000,
+                        forwarder_headroom_bps: 100_000_000,
+                        upstream_latency_ms: 0,
+                        forwarding: true,
+                    }),
+                ),
+            };
+            let _ = deliver(n, r, &[f]);
+        }
+    }
+
+    /// Answer every SUBSCRIBE in `out` with an Admit from its parent, except
+    /// to `hold` (whose answer the test gives itself).
+    fn answer_admits_but(n: &mut AlmState, out: &[Outgoing], hold: Option<&str>) -> Vec<Outgoing> {
+        let mut more = Vec::new();
+        for o in out {
+            if let Ok(WireFrame::Control(ControlFrame {
+                stream,
+                msg: ControlMsg::Subscribe(req),
+            })) = decode(&o.frame, &n.me)
+            {
+                if Some(o.to.as_str()) == hold {
+                    continue;
+                }
+                let admit = Outgoing {
+                    to: n.me.clone(),
+                    frame: encode(
+                        stream,
+                        &ControlMsg::Decision(AdmitDecision::Admit { role: req.role }),
+                    ),
+                };
+                more.extend(deliver(n, &o.to, &[admit]));
+            }
+        }
+        more
+    }
+
+    fn answer_admits(n: &mut AlmState, out: &[Outgoing]) -> Vec<Outgoing> {
+        answer_admits_but(n, out, None)
+    }
+
+    /// Whether `out` holds a `kind` frame (subscribe / unsubscribe) to `to`.
+    fn sends(out: &[Outgoing], to: &str, subscribe: bool) -> bool {
+        out.iter().filter(|o| o.to == to).any(|o| {
+            matches!(
+                (decode(&o.frame, "x"), subscribe),
+                (
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Subscribe(_),
+                        ..
+                    })),
+                    true
+                ) | (
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Unsubscribe { .. },
+                        ..
+                    })),
+                    false
+                )
+            )
+        })
+    }
+
+    /// RM2 + RM3 — observable: the median latency of `a`'s stream as `a`
+    /// itself delivers it, ≥ 300 ms over the last 250 ms of chunks and not
+    /// falling; state: this node's primary is `a`, nothing pending, it is not
+    /// the lowest-ranked of `a`'s direct children (RM4, from the offers), a
+    /// member that is not its descendant offers the stream with room;
+    /// action: subscribe to that member, keep `a` until it admits (RM3), then
+    /// switch and unsubscribe `a`; must never: unsubscribe `a` before the
+    /// admit, move when spared, move to a direct child that may itself move.
+    /// Mutation (45.2.0 before RM2): nothing moves; the child waits for a
+    /// shed notice queued behind the very backlog that made it late.
+    #[test]
+    fn a_late_direct_child_moves_to_the_kept_child_make_before_break() {
+        let mut kids = vec!["b", "c", "d"];
+        kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
+        let (kept, mover) = (kids[0], kids[2]);
+        let others: Vec<&str> = kids.iter().copied().filter(|k| *k != mover).collect();
+        let (mut n, _) = joined_receiver(mover, &others);
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"), "the premise");
+        // a's queue: its chunks now arrive 400 ms late.
+        let mut asked_at = None;
+        let mut sent = Vec::new();
+        for step in 0..60u64 {
+            n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+            late_chunk(&mut n, s(1), "a", 10_000 + step, 400);
+            if step % 50 == 0 {
+                offers_to(&mut n, &others);
+            }
+            if step % 12 == 11 {
+                let out = n.tick(&[]);
+                sent.extend(answer_admits_but(&mut n, &out, Some(kept)));
+                if asked_at.is_none() && sends(&out, kept, true) {
+                    asked_at = Some(step * 20);
+                }
+                sent.extend(out);
+                if asked_at.is_some() {
+                    break;
+                }
+            }
+        }
+        let at = asked_at.expect("the late child asks the kept child");
+        assert!(at <= 1_000, "asked {at} ms after its media turned late");
+        assert!(
+            !sends(&sent, others[1], true),
+            "never onto a child that may move"
+        );
+        assert!(
+            !sends(&sent, "a", false),
+            "a is kept until the relay admits"
+        );
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"));
+        // The admit: switch, then leave a.
+        let admit = Outgoing {
+            to: mover.to_owned(),
+            frame: encode(
+                s(1),
+                &ControlMsg::Decision(AdmitDecision::Admit {
+                    role: Role::Primary,
+                }),
+            ),
+        };
+        let out = deliver(&mut n, kept, &[admit]);
+        assert_eq!(
+            n.primary_of(s(1)).as_deref(),
+            Some(kept),
+            "switched on the admit"
+        );
+        assert!(sends(&out, "a", false), "and only then left a: {out:?}");
+    }
+
+    /// RM4 — the lowest-ranked of `a`'s direct children never moves on late
+    /// media: it is the child `a`'s shed keeps.
+    #[test]
+    fn the_lowest_ranked_direct_child_is_spared() {
+        let mut kids = vec!["b", "c", "d"];
+        kids.sort_by_key(|k| (spec_rank(s(1), k), (*k).to_owned()));
+        let me = kids[0];
+        let (mut n, _) = joined_receiver(me, &kids[1..]);
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"), "the premise");
+        let mut sent = Vec::new();
+        for step in 0..150u64 {
+            n.t0 = n.t0.checked_sub(Duration::from_millis(20)).expect("clock");
+            late_chunk(&mut n, s(1), "a", 10_000 + step, 400);
+            if step % 50 == 0 {
+                offers_to(&mut n, &kids[1..]);
+            }
+            if step % 12 == 11 {
+                let out = n.tick(&[]);
+                sent.extend(answer_admits(&mut n, &out));
+                sent.extend(out);
+            }
+        }
+        assert_eq!(n.primary_of(s(1)).as_deref(), Some("a"), "spared: {sent:?}");
+        assert!(!sends(&sent, "a", false));
     }
 
     // ── #945: three real controllers, C3 through the real encoder ────────

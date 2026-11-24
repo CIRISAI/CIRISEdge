@@ -6,6 +6,9 @@
 //! call's [`super::alm::AlmState`] owns one of each per stream (or per
 //! stream and path) and asks them on every chunk and every watch tick.
 
+use crate::transport::realtime_av::StreamId;
+use crate::transport::realtime_av_alm::controller::hash_rank;
+
 /// RM1 — the floor is re-anchored upward at most this often (the hosts'
 /// clocks drift; a floor that never rises would read drift as queueing).
 pub(super) const FLOOR_REANCHOR_MS: u64 = 30_000;
@@ -57,6 +60,103 @@ impl LatencyFloor {
     }
 }
 
+/// RM2 — the latency at or above which a publisher's own delivery is late.
+pub(super) const LATE_MS: f64 = 300.0;
+/// RM2 — the span a reading takes the median over (about one watch tick of
+/// chunks: one late chunk is not a late stream).
+pub(super) const READING_MS: u64 = 250;
+/// RM2 — the fewest chunks a reading is made of.
+pub(super) const READING_MIN_SAMPLES: usize = 3;
+
+/// RM2 — one path's latency readings for one stream: the chunks of the last
+/// two [`READING_MS`] spans, `(call ms, latency ms)`.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Reading {
+    samples: std::collections::VecDeque<(u64, f64)>,
+}
+
+impl Reading {
+    /// One chunk's latency at `now_ms`.
+    pub(super) fn push(&mut self, now_ms: u64, latency_ms: f64) {
+        self.samples.push_back((now_ms, latency_ms));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(t, _)| t + 2 * READING_MS < now_ms)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The median of the chunks that arrived in `(now − to, now − from]`,
+    /// when there are at least [`READING_MIN_SAMPLES`] of them.
+    fn median(&self, now_ms: u64, from_ago: u64, to_ago: u64) -> Option<f64> {
+        let mut v: Vec<f64> = self
+            .samples
+            .iter()
+            .filter(|(t, _)| {
+                now_ms.saturating_sub(*t) >= from_ago && now_ms.saturating_sub(*t) < to_ago
+            })
+            .map(|(_, l)| *l)
+            .collect();
+        if v.len() < READING_MIN_SAMPLES {
+            return None;
+        }
+        v.sort_by(f64::total_cmp);
+        Some(v[v.len() / 2])
+    }
+
+    /// The reading now: the median over the last [`READING_MS`].
+    pub(super) fn current(&self, now_ms: u64) -> Option<f64> {
+        self.median(now_ms, 0, READING_MS)
+    }
+
+    /// The reading before it: the median over the span before.
+    fn previous(&self, now_ms: u64) -> Option<f64> {
+        self.median(now_ms, READING_MS, 2 * READING_MS)
+    }
+
+    /// RM2 — whether the path reads late on a SUSTAINED, non-falling
+    /// reading: two consecutive readings at or above `bar`, the newer not
+    /// below the older. One late sample is not enough: in the model it made
+    /// two children leave at 1.5x where one would do (CallCongestion R13),
+    /// and a falling reading is a queue already draining.
+    pub(super) fn sustained_late(&self, now_ms: u64, bar: f64) -> bool {
+        match (self.current(now_ms), self.previous(now_ms)) {
+            (Some(cur), Some(prev)) => cur >= bar && prev >= bar && cur >= prev,
+            _ => false,
+        }
+    }
+}
+
+/// RM4 — `member`'s rank on `stream` ([`hash_rank`]), with the key as the
+/// tie-break: the order a publisher's shed and every receiver share.
+pub(super) fn rank(stream: StreamId, member: &str) -> (u64, String) {
+    (hash_rank(&stream.0, &member.to_owned()), member.to_owned())
+}
+
+/// RM4 — the lowest-ranked of `members` on `stream`.
+pub(super) fn lowest<'a>(
+    stream: StreamId,
+    members: impl IntoIterator<Item = &'a String>,
+) -> Option<&'a String> {
+    members.into_iter().min_by_key(|m| rank(stream, m))
+}
+
+/// RM4 — whether `me` is spared on `stream`: it is the lowest-ranked of the
+/// publisher's direct children it knows of, itself and `directs` (from the
+/// members' fresh offers). Transition: observable, the offers' depth and
+/// ancestry; state, this node is a direct child; action, a spared node never
+/// moves on late media (the publisher's shed keeps exactly it); must never,
+/// spare on a stale offer (the caller passes only fresh ones).
+pub(super) fn spared(stream: StreamId, me: &str, directs: &[String]) -> bool {
+    let mine = rank(stream, me);
+    directs
+        .iter()
+        .filter(|d| d.as_str() != me)
+        .all(|d| rank(stream, d) > mine)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +185,46 @@ mod tests {
         // Not again before the next re-anchor age.
         assert_eq!(f.sample(60, 130_000), 30);
         assert_eq!(f.floor(), 30);
+    }
+
+    /// RM2 — one late chunk, or one late reading, is not a late stream; two
+    /// late readings, not falling, are; a falling one is not.
+    #[test]
+    fn a_reading_is_late_only_when_sustained_and_not_falling() {
+        let mut r = Reading::default();
+        for t in (0..1_000).step_by(20) {
+            r.push(t, 10.0);
+        }
+        r.push(1_000, 900.0);
+        assert!(!r.sustained_late(1_000, LATE_MS), "one sample");
+        let mut t = 1_000;
+        while t < 1_250 {
+            t += 20;
+            r.push(t, 400.0);
+        }
+        assert!(!r.sustained_late(t, LATE_MS), "one late reading");
+        while t < 1_520 {
+            t += 20;
+            r.push(t, 400.0);
+        }
+        assert!(r.sustained_late(t, LATE_MS), "two, level");
+        while t < 1_780 {
+            t += 20;
+            r.push(t, 350.0);
+        }
+        assert!(!r.sustained_late(t, LATE_MS), "falling: a queue draining");
+        assert!(!r.sustained_late(t + 600, LATE_MS), "no chunks, no reading");
+    }
+
+    /// RM4 — exactly one of a set of direct children is spared, and it is
+    /// the lowest-ranked.
+    #[test]
+    fn exactly_the_lowest_ranked_child_is_spared() {
+        let s = StreamId([3; 32]);
+        let kids: Vec<String> = ["k1", "k2", "k3", "k4"].map(String::from).to_vec();
+        let spared_ones: Vec<&String> = kids.iter().filter(|k| spared(s, k, &kids)).collect();
+        assert_eq!(spared_ones, vec![lowest(s, &kids).expect("four")]);
+        // Alone (no offer seen), a direct child is spared: it may be the one.
+        assert!(spared(s, "k2", &[]));
     }
 }
