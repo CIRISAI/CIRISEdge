@@ -214,7 +214,10 @@ def recover_by(p):
     w = 10
     if p["SS"] == "TRUE":
         fmax = 2 if p["PBO"] == "TRUE" else 0
-        steps = [2 * w * 2 ** max(0, fmax - i) for i in range(max(0, n - int(p["INIT"])))]
+        # a stall or a late departure restarts the room from one stream, so
+        # the climb back is n - 1 widenings whatever the first room was
+        climb = n - 1 if p["HOLDT"] != "0" or p["RXMOVE"] == "TRUE" else n - int(p["INIT"])
+        steps = [2 * w * 2 ** max(0, fmax - i) for i in range(max(0, climb))]
         if steps:
             steps[0] = max(steps[0], int(p["HOLDT"]))
         grow = sum(steps)

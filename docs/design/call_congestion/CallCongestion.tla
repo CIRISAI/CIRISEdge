@@ -591,7 +591,8 @@ LWatch1(S, l, k) ==
                     \* RM6: what another source shows (every other stream this node
                     \* hears carries its own downlink's delay too)
                     /\ ~(OwnDownlinkGuard /\ l = SlowNode /\ 2 * SlowTicks >= RxDelayTicks)
-            THEN Subscribe([S2 EXCEPT !.lateMove[l] = TRUE], l, relays[Min(k, Len(relays))])
+            THEN Subscribe([S2 EXCEPT !.lateMove[l] = TRUE,
+                                      !.slowMoved = @ \/ l = SlowNode], l, relays[Min(k, Len(relays))])
             \* SilenceFailover: the primary delivered nothing for SilentTicks
             \* and another member that hears the stream offers: move to it,
             \* keeping the old parent until the new one admits.
@@ -700,7 +701,7 @@ Gaps(S) ==
                      /\ Cands(S, c) /= <<>> THEN @[c] + 1 ELSE 0]]
 
 Dual(S) == [S EXCEPT !.dual = [l \in L |->
-                IF Cardinality({x \in Nodes \ {l} : InLedger(S, x, l)}) > 1
+                IF Cardinality({x \in Nodes \ {l} : Alive(S, x) /\ InLedger(S, x, l)}) > 1
                 THEN @[l] + 1 ELSE 0]]
 
 -----------------------------------------------------------------------------
@@ -842,8 +843,31 @@ ReplayTo(S, ms) ==
              S2 == IF x \in L THEN Recv(S1, Item("media", <<DeadNode, DeadNode>>, 0, 0, 0, NoPay,
                                                   DeadNode, {x}, 0)) ELSE S1
          IN ReplayTo(S2, ms \ {x})
-Hangup(S) == IF Graceful /\ DeadNode \in L /\ S.now = DeadAt - 1 /\ S.parent[DeadNode] /= None
-             THEN Flush(SendCtrl(S, <<DeadNode, S.parent[DeadNode]>>, Pay("unsub")))
+RECURSIVE CloseOut(_, _)
+CloseOut(S, ls) ==   \* the leaver's own legs: closed at its side, LINKCLOSE sent
+    IF ls = {} THEN S
+    ELSE LET l == CHOOSE l \in ls : TRUE
+             S1 == IF S.up[l]
+                   THEN Emit([S EXCEPT !.up[l] = FALSE, !.chan[l] = <<>>, !.downAt[l] = S.now], l[1],
+                             Item("close", l, S.gen[l], 0, 0, NoPay, l[1], {}, S.now), CtrlSize)
+                   ELSE S
+         IN CloseOut(S1, ls \ {l})
+\* the legs toward the leaver: their dialers see the close of the leaver's
+\* session (the links are torn at both ends when a call is left)
+RECURSIVE CloseIn(_, _)
+CloseIn(S, ls) ==
+    IF ls = {} THEN S
+    ELSE LET l == CHOOSE l \in ls : TRUE
+             S1 == IF S.up[l]
+                   THEN ChildDown([S EXCEPT !.up[l] = FALSE, !.chan[l] = <<>>, !.downAt[l] = S.now,
+                                            !.peerUp[l] = FALSE, !.dialAt[l] = S.now + 100000], l[1], l[2])
+                   ELSE S
+         IN CloseIn(S1, ls \ {l})
+Hangup(S) == IF Graceful /\ DeadNode \in L /\ S.now = DeadAt - 1
+             THEN LET S1 == IF S.parent[DeadNode] /= None
+                            THEN SendCtrl(S, <<DeadNode, S.parent[DeadNode]>>, Pay("unsub")) ELSE S
+                  IN Flush(CloseIn(Flush(CloseOut(Flush(S1), {l \in Legs : l[1] = DeadNode})),
+                                   {l \in Legs : l[2] = DeadNode}))
              ELSE S
 Replays(S) == IF ReplayAttack /\ DeadNode /= None /\ S.now > DeadAt
               THEN Flush(ReplayTo(S, Nodes \ {DeadNode})) ELSE S
@@ -864,7 +888,7 @@ Step(S, ch) ==
                            !.drainClear = IF @ < 0 /\ S10.firstShedAt >= 0 /\ QDelayS(S10) <= QTarget
                                           THEN S10.now ELSE @,
                            !.fullAt = IF @ < 0 /\ \A c \in {x \in L : Alive(S10, x)} : S10.parent[c] = "P" THEN S10.now ELSE @,
-                           !.slowMoved = @ \/ (SlowNode \in L /\ S10.lateMove[SlowNode]),
+
                            !.zeroRun = IF S10.firstShedAt >= 0 /\ Alive(S10, "P") /\ S10.children = {}
                                        THEN @ + 1 ELSE 0,
                            !.maxZeroRun = Max(@, IF S10.firstShedAt >= 0 /\ Alive(S10, "P") /\ S10.children = {}
