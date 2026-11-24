@@ -306,6 +306,8 @@ pub(super) struct AlmState {
     /// RM4/RM6 — streams whose current late episode was already counted as
     /// spared or guarded (one label an episode, not one a tick).
     late_noted: BTreeSet<StreamId>,
+    /// RM4 — offer periods so far (rotates the order offers go out in).
+    offer_round: u64,
 }
 
 /// RM5 — an own stream published this recently is live: a direct child's
@@ -425,6 +427,7 @@ impl AlmState {
             readings: BTreeMap::new(),
             late_moved: BTreeSet::new(),
             late_noted: BTreeSet::new(),
+            offer_round: 0,
         }
     }
 
@@ -1934,27 +1937,34 @@ impl AlmState {
                     (*s, skip, encode(*s, &ControlMsg::Offer(o)))
                 })
                 .collect();
+            // RM4 — the receivers spare by the relays' offers, so no offer
+            // may be the one always sent last: a leg that refuses the tail
+            // of a burst (a busy Channel; the periodic offer is not retried)
+            // would starve that stream's relay offers for good. The order
+            // rotates each offer period.
+            self.offer_round = self.offer_round.wrapping_add(1);
             for peer in c3_legs {
                 if !self.members.iter().any(|m| m == peer) {
                     continue;
                 }
-                out.push(Outgoing {
-                    to: peer.clone(),
-                    frame: own_frame.clone(),
-                });
-                for f in &share_frames {
+                let mut frames: Vec<&Vec<u8>> = std::iter::once(&own_frame)
+                    .chain(share_frames.iter())
+                    .chain(
+                        relay_offers
+                            .iter()
+                            .filter(|(_, skip, _)| !skip.contains(peer))
+                            .map(|(_, _, f)| f),
+                    )
+                    .collect();
+                if !frames.is_empty() {
+                    let k = usize::try_from(self.offer_round).unwrap_or(0) % frames.len();
+                    frames.rotate_left(k);
+                }
+                for f in frames {
                     out.push(Outgoing {
                         to: peer.clone(),
                         frame: f.clone(),
                     });
-                }
-                for (_, skip, f) in &relay_offers {
-                    if !skip.contains(peer) {
-                        out.push(Outgoing {
-                            to: peer.clone(),
-                            frame: f.clone(),
-                        });
-                    }
                 }
             }
         }
@@ -2059,6 +2069,33 @@ impl AlmState {
             .get_mut(&s)
             .and_then(|sel| sel.late_move(now, &publisher, &allowed, &mut log));
         self.log = log;
+        if let Some(SelectorAction::Subscribe { parent, .. }) = &act {
+            tracing::debug!(
+                target: "ciris_edge::rxmove",
+                me = %self.me,
+                stream = %crate::transport::realtime_av::stream_label(s),
+                to = %parent,
+                readings = ?self
+                    .readings
+                    .iter()
+                    .map(|((st, from), r)| {
+                        (crate::transport::realtime_av::stream_label(*st), from.clone(), r.current(now))
+                    })
+                    .collect::<Vec<_>>(),
+                "late from its publisher: asking a member relay"
+            );
+        }
+        if act.is_none() && self.late_noted.insert(s) {
+            // Late, not spared, not guarded, and no member relay to move to.
+            tracing::debug!(
+                target: "ciris_edge::rxmove",
+                me = %self.me,
+                stream = %crate::transport::realtime_av::stream_label(s),
+                directs = ?directs,
+                candidates = ?self.sels.get(&s).map(ParentSelector::candidates),
+                "late from its publisher, no member relay to move to"
+            );
+        }
         act.map(|a| self.action_frames(s, vec![a]))
             .unwrap_or_default()
     }

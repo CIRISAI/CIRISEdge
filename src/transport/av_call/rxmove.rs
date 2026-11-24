@@ -68,8 +68,12 @@ pub(super) const OTHER_LATE_MS: f64 = 150.0;
 /// RM2 — the span a reading takes the median over (about one watch tick of
 /// chunks: one late chunk is not a late stream).
 pub(super) const READING_MS: u64 = 250;
-/// RM2 — the fewest chunks a reading is made of.
-pub(super) const READING_MIN_SAMPLES: usize = 3;
+/// RM2 — the fewest chunks a reading is made of. Under the queue a child
+/// receives only its share of the uplink: three copies into a 1.3-copy cap
+/// is about 13 chunks a second each, three or four a span.
+pub(super) const READING_MIN_SAMPLES: usize = 2;
+/// RM2 — the least time a sustained reading's chunks arrive over.
+pub(super) const READING_SPAN_MS: u64 = 200;
 
 /// RM2 — one path's latency readings for one stream: the chunks of the last
 /// two [`READING_MS`] spans, `(call ms, latency ms)`.
@@ -91,44 +95,51 @@ impl Reading {
         }
     }
 
-    /// The median of the chunks that arrived in `(now − to, now − from]`,
+    /// The median of `v` (non-empty).
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    }
+
+    /// The reading now: the median of the chunks of the last [`READING_MS`],
     /// when there are at least [`READING_MIN_SAMPLES`] of them.
-    fn median(&self, now_ms: u64, from_ago: u64, to_ago: u64) -> Option<f64> {
-        let mut v: Vec<f64> = self
+    pub(super) fn current(&self, now_ms: u64) -> Option<f64> {
+        let v: Vec<f64> = self
             .samples
             .iter()
-            .filter(|(t, _)| {
-                now_ms.saturating_sub(*t) >= from_ago && now_ms.saturating_sub(*t) < to_ago
-            })
+            .filter(|(t, _)| now_ms.saturating_sub(*t) < READING_MS)
             .map(|(_, l)| *l)
             .collect();
-        if v.len() < READING_MIN_SAMPLES {
-            return None;
-        }
-        v.sort_by(f64::total_cmp);
-        Some(v[v.len() / 2])
-    }
-
-    /// The reading now: the median over the last [`READING_MS`].
-    pub(super) fn current(&self, now_ms: u64) -> Option<f64> {
-        self.median(now_ms, 0, READING_MS)
-    }
-
-    /// The reading before it: the median over the span before.
-    fn previous(&self, now_ms: u64) -> Option<f64> {
-        self.median(now_ms, READING_MS, 2 * READING_MS)
+        (v.len() >= READING_MIN_SAMPLES).then(|| Self::median(v))
     }
 
     /// RM2 — whether the path reads late on a SUSTAINED, non-falling
-    /// reading: two consecutive readings at or above `bar`, the newer not
-    /// below the older. One late sample is not enough: in the model it made
-    /// two children leave at 1.5x where one would do (CallCongestion R13),
-    /// and a falling reading is a queue already draining.
+    /// reading: the chunks of the last two [`READING_MS`] spans, at least
+    /// [`READING_MIN_SAMPLES`] in each half and arriving over at least
+    /// [`READING_SPAN_MS`], split by arrival into an older and a newer half: both halves'
+    /// medians at or above `bar`, the newer not below the older. One late
+    /// sample is not enough: in the model it made two children leave at
+    /// 1.5x where one would do (CallCongestion R13), and a falling reading is
+    /// a queue already draining. Split by count, not by clock: a queue
+    /// delivers in bursts, and a burst must not read as no reading.
     pub(super) fn sustained_late(&self, now_ms: u64, bar: f64) -> bool {
-        match (self.current(now_ms), self.previous(now_ms)) {
-            (Some(cur), Some(prev)) => cur >= bar && prev >= bar && cur >= prev,
-            _ => false,
+        let recent: Vec<(u64, f64)> = self
+            .samples
+            .iter()
+            .filter(|(t, _)| now_ms.saturating_sub(*t) < 2 * READING_MS)
+            .copied()
+            .collect();
+        if recent.len() < 2 * READING_MIN_SAMPLES {
+            return false;
         }
+        let span = recent.last().map_or(0, |l| l.0) - recent.first().map_or(0, |f| f.0);
+        if span < READING_SPAN_MS {
+            return false;
+        }
+        let (old, new) = recent.split_at(recent.len() / 2);
+        let older = Self::median(old.iter().map(|(_, l)| *l).collect());
+        let newer = Self::median(new.iter().map(|(_, l)| *l).collect());
+        older >= bar && newer >= bar && newer >= older
     }
 }
 
