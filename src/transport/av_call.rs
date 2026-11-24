@@ -1863,6 +1863,8 @@ struct Shared {
     /// G8 C — members whose direct path came up while a leg dial to them was
     /// in flight: if that dial fails, it is retried at once.
     path_up_mid_dial: StdMutex<std::collections::HashSet<String>>,
+    /// G8 — re-announce rounds skipped in a row, per leg.
+    reannounce_skipped: StdMutex<HashMap<String, u32>>,
     /// G8 — the legs (by peer) whose oldest unproved Channel message is
     /// backlogged ([`alm::UPLINK_BACKLOG_MS`]): their periodic offers are
     /// held until it is proved.
@@ -2575,6 +2577,7 @@ impl Call {
             queue_age_ms: AtomicU64::new(0),
             parked_wake: tokio::sync::Notify::new(),
             path_up_mid_dial: StdMutex::new(std::collections::HashSet::new()),
+            reannounce_skipped: StdMutex::new(HashMap::new()),
             backlogged_legs: StdMutex::new(std::collections::HashSet::new()),
             load,
             setup_began: std::time::Instant::now(),
@@ -5299,10 +5302,8 @@ async fn reannounce(shared: &Arc<Shared>) {
     // a new leg's bindings (dial_leg), an epoch roll's (send_bindings_on), a
     // v2 upgrade's (send_v2_bindings_to).
     let held = reannounce_held_legs(shared).await;
-    if !held.is_empty() {
-        for _ in &held {
-            shared.count(crate::observability::AV_BINDING_REANNOUNCE_HELD);
-        }
+    for _ in &held {
+        shared.count(crate::observability::AV_BINDING_REANNOUNCE_HELD);
     }
     // v2 first (CC rc18), then v1.
     if !v2.is_empty() {
@@ -5317,8 +5318,16 @@ async fn reannounce(shared: &Arc<Shared>) {
     }
 }
 
+/// G8 — at most this many re-announce rounds in a row are skipped on one
+/// leg (6 × [`BINDING_REANNOUNCE`] = 60 s): the re-announce repairs a binding
+/// part a receiver's full inbound queue dropped (a new leg gets its bindings
+/// at setup, a roll sends its own, a relay forwards what it verifies), so a
+/// repair may wait out a congested minute, not forever.
+const REANNOUNCE_MAX_SKIPS: u32 = 6;
+
 /// G8 — the legs a periodic re-announce skips now: every leg while this
-/// node's uplink stall verdict holds, else the backlogged ones.
+/// node's uplink stall verdict holds, else the backlogged ones; never a leg
+/// already skipped [`REANNOUNCE_MAX_SKIPS`] rounds in a row.
 async fn reannounce_held_legs(shared: &Arc<Shared>) -> Vec<String> {
     let stalled = Shared::lock(&shared.alm).uplink_stalled();
     let legs = shared
@@ -5328,17 +5337,26 @@ async fn reannounce_held_legs(shared: &Arc<Shared>) -> Vec<String> {
         .dispatcher_mut()
         .subscriber_ids();
     let backlogged = Shared::lock(&shared.backlogged_legs).clone();
-    reannounce_skips(&legs, stalled, &backlogged)
+    let mut skipped = Shared::lock(&shared.reannounce_skipped);
+    skipped.retain(|l, _| legs.contains(l));
+    reannounce_skips(&legs, stalled, &backlogged, &mut skipped)
 }
 
-/// G8 — the pure rule [`reannounce_held_legs`] applies.
+/// G8 — the pure rule [`reannounce_held_legs`] applies, keeping each leg's
+/// count of rounds skipped in a row.
 fn reannounce_skips(
     legs: &[String],
     stalled: bool,
     backlogged: &std::collections::HashSet<String>,
+    skipped: &mut HashMap<String, u32>,
 ) -> Vec<String> {
     legs.iter()
-        .filter(|l| stalled || backlogged.contains(*l))
+        .filter(|l| {
+            let n = skipped.entry((*l).clone()).or_insert(0);
+            let skip = (stalled || backlogged.contains(*l)) && *n < REANNOUNCE_MAX_SKIPS;
+            *n = if skip { *n + 1 } else { 0 };
+            skip
+        })
         .cloned()
         .collect()
 }

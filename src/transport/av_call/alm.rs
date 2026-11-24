@@ -1004,7 +1004,9 @@ impl AlmState {
                 };
                 match adm.role_of(p) {
                     Some(Role::Primary) => false,
-                    Some(Role::Standby) => !base_or_audio,
+                    // Stall row S1: latched verdict → a standby gets nothing
+                    // (an opaque/audio standby is a full second copy).
+                    Some(Role::Standby) => self.uplink_stall || !base_or_audio,
                     None => {
                         let fresh = self
                             .provisional
@@ -1117,7 +1119,9 @@ impl AlmState {
             .forwarding_to()
             .into_iter()
             .filter(|(p, role)| {
-                p != from && p != publisher && (*role == Role::Primary || base_or_audio)
+                p != from
+                    && p != publisher
+                    && (*role == Role::Primary || (base_or_audio && !self.uplink_stall))
             })
             .map(|(p, _)| p)
             .collect();
@@ -1330,6 +1334,23 @@ impl AlmState {
                         AdmitDecision::Refuse {
                             reason: RefuseReason::ClassRefused,
                             retry_after_ms: self.cfg.backoff_base_ms * 4,
+                        },
+                        Vec::new(),
+                    )
+                } else if self.is_own(stream)
+                    && self.uplink_stall
+                    && req.role == Role::Standby
+                    && self
+                        .own_admission(stream)
+                        .is_some_and(|a| a.role_of(&req.subscriber).is_none())
+                {
+                    // Stall row S2: a latched verdict admits no new standby
+                    // (a shed child is never left as one).
+                    self.provisional.remove(&(stream, peer.to_owned()));
+                    (
+                        AdmitDecision::Refuse {
+                            reason: RefuseReason::Capacity,
+                            retry_after_ms: UPLINK_STALL_LATCH_MS,
                         },
                         Vec::new(),
                     )
@@ -2653,6 +2674,88 @@ mod tests {
         }
         assert!(admitted, "one step once the hold has passed");
         assert_eq!(a.own_children().len(), 2);
+    }
+
+    /// Admit `p` on `a`'s own stream in `role`, forward-capable.
+    fn admit_as(a: &mut AlmState, p: &str, role: Role) {
+        let mut rng = SplitMix64(7);
+        let mut log = DecisionLog::default();
+        let now = a.now_ms();
+        let d = a.own.request(
+            now,
+            &SubscribeRequest {
+                subscriber: p.into(),
+                role,
+                forward_capable: true,
+                layers: None,
+            },
+            &mut rng,
+            &mut log,
+        );
+        assert!(matches!(d, AdmitDecision::Admit { .. }), "{p}: {d:?}");
+    }
+
+    /// Stall row S1 / E1 — under a latched stall verdict P sends ONE copy of
+    /// its stream: a standby child (for an opaque / audio stream a full second
+    /// copy) gets nothing until the verdict clears.
+    #[test]
+    fn a_latched_stall_sends_one_copy_per_stream() {
+        let mut a = publisher_with(&["b"]);
+        admit_as(&mut a, "c", Role::Standby);
+        // Both speak C3 (a pre-C3 peer is served the full mesh as before).
+        a.on_caps("b", CAP_C3_V1);
+        a.on_caps("c", CAP_C3_V1);
+        let legs: Vec<String> = vec!["b".into(), "c".into()];
+        a.uplink_stall = true;
+        let excluded = a.own_exclude(&legs, true);
+        let copies = legs.iter().filter(|l| !excluded.contains(l)).count();
+        assert_eq!(copies, 1, "excluded {excluded:?}");
+        a.uplink_stall = false;
+        assert!(
+            a.own_exclude(&legs, true).is_empty(),
+            "fed again once it clears"
+        );
+    }
+
+    /// Stall rows S2, S3 / E2 — a stall shed takes standbys first and never
+    /// the last primary (here the standby is the OLDER commitment, so LIFO
+    /// alone would shed the primary), and a shed child asking back as a
+    /// standby while the verdict holds is refused.
+    #[test]
+    fn a_stall_shed_keeps_a_primary_and_admits_no_standby() {
+        let roster4: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let mut a = AlmState::new("a", s(1), &roster4, true, 1);
+        admit_as(&mut a, "c", Role::Standby);
+        admit_as(&mut a, "b", Role::Primary);
+        for _ in 0..6 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            let _ = a.tick(&[]);
+        }
+        a.set_uplink_stall(true);
+        let _ = a.tick(&["b".into(), "c".into()]);
+        assert_eq!(a.own_children(), vec![("b".to_owned(), Role::Primary)]);
+        let _ = a.on_control(
+            "c",
+            ControlFrame {
+                stream: s(1),
+                msg: ControlMsg::Subscribe(SubscribeRequest {
+                    subscriber: "c".into(),
+                    role: Role::Standby,
+                    forward_capable: true,
+                    layers: None,
+                }),
+            },
+            10.0,
+        );
+        assert_eq!(
+            a.own_children(),
+            vec![("b".to_owned(), Role::Primary)],
+            "no standby re-admitted under the verdict"
+        );
     }
 
     /// G8 — a stalled uplink with ONE child has nothing to shed: the verdict

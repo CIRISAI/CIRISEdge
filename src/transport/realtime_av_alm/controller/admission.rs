@@ -949,12 +949,30 @@ impl<P: PeerRef> Admission<P> {
         let mut shed = Vec::new();
         let limit = self.hard_limit_bps();
         while self.committed_bps() as f64 > limit + 1.0 {
-            let Some(victim) = self
+            // Stall row S3: standbys go first (most recent first); a
+            // publisher never sheds its LAST primary (it is the one path
+            // nothing replaces), so it is never left with only standbys.
+            let primaries = self
+                .ledger
+                .values()
+                .filter(|c| c.role == Role::Primary)
+                .count();
+            let standby = self
                 .ledger
                 .iter()
+                .filter(|(_, c)| c.role == Role::Standby)
                 .max_by_key(|(_, c)| c.order)
-                .map(|(p, _)| p.clone())
-            else {
+                .map(|(p, _)| p.clone());
+            let victim = standby.or_else(|| {
+                if self.is_root && primaries <= 1 {
+                    return None;
+                }
+                self.ledger
+                    .iter()
+                    .max_by_key(|(_, c)| c.order)
+                    .map(|(p, _)| p.clone())
+            });
+            let Some(victim) = victim else {
                 break;
             };
             self.ledger.remove(&victim);

@@ -3720,6 +3720,18 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
     if direct != 1 {
         failed.push(format!("P's direct children: {direct}, want 1"));
     }
+    // E2: a publisher with any subscriber keeps at least one PRIMARY (never
+    // only standbys).
+    if !cp
+        .alm_own_children()
+        .iter()
+        .any(|(_, r)| *r == ciris_edge::transport::realtime_av_alm::controller::Role::Primary)
+    {
+        failed.push(format!(
+            "P has no primary child: {:?}",
+            cp.alm_own_children()
+        ));
+    }
     if parents.iter().any(Option::is_none) {
         failed.push("a listener has no parent".to_owned());
     }

@@ -1007,19 +1007,32 @@ fn only_a_backlogged_leg_holds_its_offer() {
 
 /// G8 — a periodic re-announce skips every leg while the uplink stall
 /// verdict holds, else only the backlogged legs; a clear leg on a clear
-/// uplink still gets it.
+/// uplink still gets it; and no leg goes more than REANNOUNCE_MAX_SKIPS
+/// rounds in a row without one.
 #[test]
 fn a_reannounce_skips_backlogged_legs_and_a_stalled_uplink() {
     let legs: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
     let backlogged: std::collections::HashSet<String> = ["b".to_owned()].into_iter().collect();
+    let mut n = HashMap::new();
     assert_eq!(
-        reannounce_skips(&legs, false, &backlogged),
+        reannounce_skips(&legs, false, &backlogged, &mut n),
         vec!["b".to_owned()]
     );
     assert_eq!(
-        reannounce_skips(&legs, true, &backlogged),
+        reannounce_skips(&legs, true, &backlogged, &mut n),
         legs,
         "stalled: none"
     );
-    assert!(reannounce_skips(&legs, false, &std::collections::HashSet::new()).is_empty());
+    assert!(reannounce_skips(&legs, false, &std::collections::HashSet::new(), &mut n).is_empty());
+    let mut n = HashMap::new();
+    let mut sent_b = 0;
+    for _ in 0..(REANNOUNCE_MAX_SKIPS + 1) {
+        if !reannounce_skips(&legs, true, &backlogged, &mut n).contains(&"b".to_owned()) {
+            sent_b += 1;
+        }
+    }
+    assert_eq!(
+        sent_b, 1,
+        "bounded: a stalled leg still gets one every max rounds"
+    );
 }
