@@ -295,7 +295,14 @@ pub(super) struct AlmState {
     /// G8 — frames made between ticks (the shed on a stall's rise), sent
     /// with the next tick's.
     pending_out: Vec<Outgoing>,
+    /// RM5 — when this node last published each of its own streams (call
+    /// ms): a stream published within [`STREAM_LIVE_MS`] is live.
+    own_published_ms: BTreeMap<StreamId, u64>,
 }
+
+/// RM5 — an own stream published this recently is live: a direct child's
+/// departure from it is read as congestion.
+pub(super) const STREAM_LIVE_MS: u64 = 2_000;
 
 /// G8 — a leg whose oldest unproved Channel message has waited this long is
 /// stalled: far above any propagation floor this mesh runs at, and under
@@ -354,6 +361,7 @@ impl AlmState {
         own.set_members(members.iter().cloned());
         own.set_slow_start(true);
         own.set_probe_backoff(true);
+        own.set_shed_rank(Some(own_stream.0));
         own.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         Self {
             me: me.to_owned(),
@@ -405,6 +413,7 @@ impl AlmState {
             uplink_stall: false,
             uplink_stall_seen_ms: None,
             pending_out: Vec::new(),
+            own_published_ms: BTreeMap::new(),
         }
     }
 
@@ -966,6 +975,8 @@ impl AlmState {
     /// This node published `bytes` of its own (primary) stream.
     #[cfg(test)]
     pub(super) fn on_own_published(&mut self, bytes: u64, base_or_audio: bool) {
+        let now = self.now_ms();
+        self.own_published_ms.insert(self.own_stream, now);
         self.own_rate.add(bytes, base_or_audio);
     }
 
@@ -977,6 +988,8 @@ impl AlmState {
         bytes: u64,
         base_or_audio: bool,
     ) {
+        let now = self.now_ms();
+        self.own_published_ms.insert(stream, now);
         if stream == self.own_stream {
             self.own_rate.add(bytes, base_or_audio);
         } else if let Some((_, r)) = self.shares.get_mut(&stream) {
@@ -1071,6 +1084,7 @@ impl AlmState {
         a.set_members(self.members.iter().cloned());
         a.set_slow_start(true);
         a.set_probe_backoff(true);
+        a.set_shed_rank(Some(stream.0));
         a.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         self.shares.insert(stream, (a, Rate::default()));
         let now = self.now_ms();
@@ -1446,8 +1460,28 @@ impl AlmState {
                 let p = peer.to_owned();
                 if self.is_own(stream) {
                     self.provisional.remove(&(stream, p.clone()));
+                    let live = self
+                        .own_published_ms
+                        .get(&stream)
+                        .is_some_and(|t| now.saturating_sub(*t) <= STREAM_LIVE_MS);
+                    let ext = self.external_except(stream);
+                    let mut log = std::mem::take(&mut self.log);
+                    let mut departed = false;
                     if let Some(a) = self.own_admission_mut(stream) {
+                        // RM5: a direct child (a primary in the ledger, not
+                        // one being shed: that one counts once, at its shed)
+                        // leaving a live stream is congestion.
+                        let direct = a.role_of(&p) == Some(Role::Primary) && !a.is_draining(&p);
                         a.release(&p);
+                        if direct && live {
+                            a.set_external_committed(ext);
+                            a.on_departure(now, &mut log);
+                            departed = true;
+                        }
+                    }
+                    self.log = log;
+                    if departed {
+                        self.label(crate::observability::ALM_DEPARTURE_CONGESTION);
                     }
                 } else if let Some(a) = self.relays.get_mut(&stream) {
                     a.release(&p);
@@ -1558,6 +1592,8 @@ impl AlmState {
     /// selector learns the new stream id and asks.
     pub(super) fn replace_own_stream(&mut self, stream: StreamId) {
         self.own_stream = stream;
+        // RM4: the receivers rank by the new stream id.
+        self.own.set_shed_rank(Some(stream.0));
         let now = self.now_ms();
         let c3: Vec<String> = self
             .caps
@@ -2492,10 +2528,17 @@ mod tests {
         }
         let kids = a.own_children();
         assert_eq!(kids.len(), 1, "one child kept: {kids:?}");
-        assert_eq!(kids[0].0, "b", "the oldest commitment is kept (LIFO shed)");
+        let lowest = ["b", "c", "d"]
+            .into_iter()
+            .min_by_key(|k| spec_rank(s(1), k))
+            .expect("three");
+        assert_eq!(kids[0].0, lowest, "the lowest-ranked child is kept (RM4)");
         let shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
         assert!(
-            shed.contains(&"c".to_owned()) && shed.contains(&"d".to_owned()),
+            ["b", "c", "d"]
+                .iter()
+                .filter(|k| **k != lowest)
+                .all(|k| shed.contains(&(*k).to_owned())),
             "{shed:?}"
         );
         assert!(
@@ -2574,10 +2617,13 @@ mod tests {
         a.set_uplink_stall(true);
         // The same watch tick: no egress window has closed yet.
         let mut out = a.tick(&legs);
+        // RM4: the kept child is the lowest-ranked; the rest go highest first.
+        let mut by_rank = vec!["b", "c", "d"];
+        by_rank.sort_by_key(|k| spec_rank(s(1), k));
         assert_eq!(
             a.own_children(),
-            vec![("b".to_owned(), Role::Primary)],
-            "shed at the rise, to the oldest child"
+            vec![(by_rank[0].to_owned(), Role::Primary)],
+            "shed at the rise, to the lowest-ranked child"
         );
         // The stalled legs are gone a tick later: nothing is detected.
         a.t0 = a.t0.checked_sub(Duration::from_millis(250)).expect("clock");
@@ -2593,8 +2639,8 @@ mod tests {
         let shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
         assert_eq!(
             shed,
-            vec!["d".to_owned(), "c".to_owned()],
-            "LIFO, once each"
+            vec![by_rank[2].to_owned(), by_rank[1].to_owned()],
+            "highest rank first, once each"
         );
         assert_eq!(a.own_children().len(), 1, "the window keeps one child");
         // The latch ends UPLINK_STALL_LATCH_MS after the last detection.
@@ -2681,6 +2727,23 @@ mod tests {
     }
 
     // ── ReceiverMoves (docs/design/call_congestion, rows RM1–RM6, N4) ────
+
+    /// The rank every member computes for `member` on `stream` (RM4):
+    /// sha256(stream id ‖ the member's canonical encoding), the first eight
+    /// bytes big-endian. Spelled out here so the test is the specification.
+    fn spec_rank(stream: StreamId, member: &str) -> u64 {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(stream.0);
+        let mut enc = Vec::new();
+        crate::transport::realtime_av_alm::controller::PeerRef::encode(
+            &member.to_owned(),
+            &mut enc,
+        );
+        h.update(&enc);
+        let d = h.finalize();
+        u64::from_be_bytes(d[..8].try_into().expect("eight bytes"))
+    }
 
     /// A chunk of `stream` from `from`, sent `delay_ms` ago by its signed
     /// clock.
@@ -2788,6 +2851,97 @@ mod tests {
             gaps.iter().skip(2).all(|g| *g >= 8),
             "the wait reaches 8 windows and stays: {gaps:?}"
         );
+    }
+
+    /// RM4 — observable: an uplink-stall verdict; state: three direct
+    /// children; action: the stall shed keeps the LOWEST-RANKED child by
+    /// hash(stream id ‖ member key), the same order every receiver computes;
+    /// must never: keep a different child than the receivers spare, keep
+    /// zero, or keep two. The lowest-ranked child is admitted last here, so
+    /// the mutation (45.2.0 before RM4: LIFO by admission) sheds it.
+    #[test]
+    fn a_stall_shed_keeps_the_lowest_ranked_child() {
+        let mut kids = vec!["b", "c", "d"];
+        kids.sort_by_key(|k| std::cmp::Reverse(spec_rank(s(1), k)));
+        let lowest = *kids.last().expect("three");
+        let mut a = publisher_with(&kids);
+        a.set_uplink_stall(true);
+        let out = a.tick(&["b".into(), "c".into(), "d".into()]);
+        assert_eq!(
+            a.own_children(),
+            vec![(lowest.to_owned(), Role::Primary)],
+            "the lowest-ranked child is kept"
+        );
+        let mut shed: Vec<String> = sheds(&out).into_iter().map(|(p, _)| p).collect();
+        shed.sort();
+        let mut want: Vec<String> = kids
+            .iter()
+            .filter(|k| **k != lowest)
+            .map(|k| (*k).to_owned())
+            .collect();
+        want.sort();
+        assert_eq!(shed, want, "every other child is shed, once");
+    }
+
+    /// RM5 — observable: a direct child's UNSUBSCRIBE while this node's
+    /// stream is live; state: two direct children on an unmeasured probe;
+    /// action: room = the children left, no widening for 2 windows × 2^fails
+    /// (fails = 1 now); must never: widen sooner. Mutation (45.2.0 before
+    /// RM5): the slot the leaver freed was offered at once, so the next
+    /// member landed straight back on the congested uplink.
+    #[test]
+    fn a_direct_childs_departure_is_read_as_congestion() {
+        let mut a = publisher_with(&["b", "c"]);
+        let leave = Outgoing {
+            to: "a".to_owned(),
+            frame: encode(
+                s(1),
+                &ControlMsg::Unsubscribe {
+                    subscriber: "b".to_owned(),
+                },
+            ),
+        };
+        let _ = deliver(&mut a, "b", &[leave]);
+        assert_eq!(a.own_children().len(), 1, "the premise: b left");
+        assert_eq!(a.own.offer().headroom_bps, 0, "room = the children left");
+        let mut rng = SplitMix64(13);
+        let mut log = DecisionLog::default();
+        let d = SubscribeRequest {
+            subscriber: "d".to_owned(),
+            role: Role::Primary,
+            forward_capable: true,
+            layers: None,
+        };
+        let mut admitted_after = None;
+        for w in 1..=8u64 {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("c", 700);
+            }
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            let _ = a.tick(&[]);
+            let now = a.now_ms();
+            if matches!(
+                a.own.request(now, &d, &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ) {
+                admitted_after = Some(w);
+                break;
+            }
+        }
+        let w = admitted_after.expect("the room widens again after the backoff");
+        assert!(w >= 4, "widened {w} windows after a departure (backoff 4)");
+    }
+
+    /// RM4 — the rank the shed uses is the rank spelled out above.
+    #[test]
+    fn the_shed_rank_is_the_specified_hash() {
+        for m in ["a", "b", "some-longer-member-key"] {
+            assert_eq!(
+                crate::transport::realtime_av_alm::controller::hash_rank(&s(7).0, &m.to_owned()),
+                spec_rank(s(7), m)
+            );
+        }
     }
 
     // ── #945: three real controllers, C3 through the real encoder ────────

@@ -81,7 +81,7 @@ pub mod peer_state;
 pub mod selector;
 pub mod wire;
 
-pub use admission::{Admission, ClassPolicy, Commitment, ForwarderKind};
+pub use admission::{hash_rank, Admission, ClassPolicy, Commitment, ForwarderKind};
 pub use decision_log::{DecisionKind, DecisionLog};
 pub use path_meter::{ChunkPos, EgressMeter, EgressWindow, PathMeter, PathSnapshot};
 pub use peer_state::{PeerHealth, PeerState};
