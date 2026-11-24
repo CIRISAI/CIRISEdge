@@ -4677,7 +4677,32 @@ async fn a_receiver_whose_own_downlink_is_slow_does_not_move() {
             break;
         }
     }
-    let p = chosen.expect("a publisher with R and a lower-ranked member as direct children");
+    let Some(p) = chosen else {
+        // Who each publisher feeds directly, with each child's rank (and
+        // R's), so a miss says whether the tree or the ranks were wrong.
+        let seen: Vec<String> = (1..=3usize)
+            .map(|p| {
+                let st = calls[p].stream();
+                let pid = nodes[p].key.key_id.as_str();
+                let kids: Vec<String> = (0..=3usize)
+                    .filter(|i| *i != p)
+                    .map(|i| {
+                        format!(
+                            "{i}:{}@{}",
+                            primary_for(&calls[i], st).map_or("none".to_owned(), |x| if x == pid {
+                                "direct".to_owned()
+                            } else {
+                                x[..6].to_owned()
+                            }),
+                            rank_of(st, &nodes[i].key.key_id).0
+                        )
+                    })
+                    .collect();
+                format!("P{p}: {kids:?}")
+            })
+            .collect();
+        panic!("a publisher with R and a lower-ranked member as direct children: {seen:?}");
+    };
     let pid = nodes[p].key.key_id.clone();
     let pstream = calls[p].stream();
     let guarded_before = av(&r.metrics, "alm_late_guarded:own_downlink");
