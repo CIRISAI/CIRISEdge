@@ -133,6 +133,20 @@ Adaptation is **asymmetric**: react fast to degradation, promote slowly (GCC
 the current parent first (cheap); only escalate to a parent switch if the *base*
 layer is threatened or degradation persists past dwell.
 
+**The down hold, and its one exception.** A parent whose link closed (or that
+looped, or shed this node) is held Down for `down_hold_ms` (15 s): an offer
+proves the forwarder is alive, not that it delivers, so liveness alone cannot
+clear a verdict that delivery earned. The one exception is row S3 on the
+child's side: a node whose lost primary was the stream's **publisher**, parentless
+for a request's time with no viable candidate, asks the publisher directly
+whatever its health, at most three times per loss, one per 2 s. The publisher
+is the one node that always holds the stream, and when every relay hangs
+under the lost link it is the only route back: waiting out the hold collapsed
+the whole tree (45.2.0 kill witness). The publisher's ADMIT answering that ask
+clears the Down (a fresh commitment, not an offer), and its offer's
+`upstream_latency_ms` (its own uplink queue) is owed before the first chunk,
+so delivery still has to follow or silence takes the parent down again.
+
 ---
 
 ## 5. The dynamic capacity attestation
