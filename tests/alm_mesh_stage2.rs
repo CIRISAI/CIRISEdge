@@ -4150,6 +4150,8 @@ struct Look {
     at: Duration,
     queue_ms: Option<u64>,
     parents: Vec<Option<String>>,
+    /// `P`'s own-stream children: (primaries, every child it feeds).
+    own: (usize, usize),
 }
 
 /// Publish `P`'s 30 Hz stream for `secs` and look at the room every third
@@ -4176,6 +4178,17 @@ async fn publish_looking(
                 at: origin.elapsed(),
                 queue_ms: uplink.queue_ms(),
                 parents: listeners.iter().map(|l| primary_for(l, stream)).collect(),
+                own: {
+                    let kids = cp.alm_own_children();
+                    (
+                        kids.iter()
+                            .filter(|(_, r)| {
+                                *r == ciris_edge::transport::realtime_av_alm::controller::Role::Primary
+                            })
+                            .count(),
+                        kids.len(),
+                    )
+                },
             });
         }
         seq += 1;
@@ -4194,7 +4207,10 @@ async fn publish_looking(
 ///    300 ms that media takes to arrive), and stays there while the cap holds;
 /// 2. exactly one direct child (the lowest-ranked) for the rest of the cap;
 /// 3. no listener is ever without a parent (make-before-break);
-/// 4. RM7: after the lift every child is direct again within the stated
+/// 4. E1: once the children have moved, `P` feeds one child of its stream
+///    while the cap holds (no fed standby); E2: `P` keeps a primary while
+///    anyone subscribes;
+/// 5. RM7: after the lift every child is direct again within the stated
 ///    bound, with at most two primary changes each (out and back): no
 ///    oscillation.
 #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
@@ -4325,6 +4341,25 @@ async fn a_capped_publishers_children_move_themselves_and_come_back() {
             ));
             break;
         }
+    }
+    // E1 (RM3): once the children have moved, P feeds one copy of its
+    // stream while the cap holds: no child kept as a (fed) standby.
+    if let Some(l) = settled.iter().find(|l| l.own.1 > 1) {
+        failed.push(format!(
+            "E1: at {:?} P feeds {} children of its stream ({} primary)",
+            l.at, l.own.1, l.own.0
+        ));
+    }
+    // E2: P keeps a primary while anyone subscribes.
+    if let Some(l) = capped
+        .iter()
+        .chain(&lifted)
+        .find(|l| l.own.1 > 0 && l.own.0 == 0)
+    {
+        failed.push(format!(
+            "E2: at {:?} P has {} subscribers and no primary",
+            l.at, l.own.1
+        ));
     }
     for l in capped.iter().chain(&lifted) {
         if l.parents.iter().any(Option::is_none) {

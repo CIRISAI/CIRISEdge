@@ -2013,6 +2013,11 @@ impl AlmState {
     /// a member deeper in the tree); must never, move when spared, move to a
     /// stale offer or one without room, move twice in one episode, or leave
     /// the publisher before the admit.
+    ///
+    /// Must never (RM2, the loop rule): ask a direct child of the publisher
+    /// that may itself move (any but the lowest-ranked). Two late movers
+    /// asking each other would both be admitted, each the other's parent: a
+    /// loop with the publisher's stream reaching neither.
     fn receiver_move(&mut self, s: StreamId, now: u64) -> Vec<Outgoing> {
         let Some(publisher) = self.bound_publisher.get(&s).cloned() else {
             return Vec::new();
