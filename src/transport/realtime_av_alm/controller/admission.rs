@@ -223,7 +223,18 @@ pub struct Admission<P: PeerRef> {
     probe_hold_until_ms: u64,
     /// G8 slow start ([`Self::set_slow_start`]).
     slow_start: bool,
+    /// N4 — the probe backoff ([`Self::set_probe_backoff`]).
+    probe_backoff: bool,
+    /// N4 — failed probes, at most [`PROBE_FAILS_MAX`]: each doubles the wait
+    /// before the next widening.
+    probe_fails: u32,
+    /// N4 — the last congestion or widening, and whether it was a widening.
+    probe_event: Option<(u64, bool)>,
 }
+
+/// N4 — the most failed probes the backoff counts (the wait tops out at
+/// 2 windows × 2^2).
+pub const PROBE_FAILS_MAX: u32 = 2;
 
 impl<P: PeerRef> Admission<P> {
     /// The room roster (membership gate). Fail-closed: until set, and for
@@ -284,6 +295,9 @@ impl<P: PeerRef> Admission<P> {
             draining: BTreeMap::new(),
             probe_hold_until_ms: 0,
             slow_start: false,
+            probe_backoff: false,
+            probe_fails: 0,
+            probe_event: None,
         }
     }
 
@@ -386,6 +400,55 @@ impl<P: PeerRef> Admission<P> {
     pub fn hold_probe(&mut self, until_ms: u64) {
         self.probe_hold_until_ms = self.probe_hold_until_ms.max(until_ms);
         self.probe_bps = self.probe_bps.min(self.cfg.stream_bps as f64);
+    }
+
+    /// N4 — the probe backoff (`docs/design/call_congestion`, rows N4 and
+    /// ProbeBackoff). Off by default (the stage-1 sim's worlds are tuned
+    /// without it); the live call's publisher turns it on.
+    ///
+    /// Transition: observable, an egress window closing clean; state, a
+    /// widening is due (the demand step, or the slow-start probe doubling);
+    /// action, widen only once 2 windows × 2^fails have passed since the last
+    /// congestion or widening, fails ≤ [`PROBE_FAILS_MAX`]: a congestion that
+    /// follows a widening before the next one (the probe failed) and a direct
+    /// child's departure ([`Self::on_departure`]) step fails up, a widening
+    /// that comes after one that held steps it down; must never, widen sooner.
+    /// Without it a publisher under a permanent cap re-parents its children
+    /// for ever (probe, late, leave, repeat).
+    pub fn set_probe_backoff(&mut self, on: bool) {
+        self.probe_backoff = on;
+    }
+
+    /// N4 — failed probes counted now.
+    #[must_use]
+    pub fn probe_fails(&self) -> u32 {
+        self.probe_fails
+    }
+
+    /// N4 — whether the backoff lets the room widen at `now_ms`.
+    fn widen_allowed(&self, now_ms: u64) -> bool {
+        !self.probe_backoff
+            || self.probe_event.is_none_or(|(t, _)| {
+                now_ms >= t + (2 * self.cfg.meter_window_ms << self.probe_fails)
+            })
+    }
+
+    /// N4 — the room widened at `now_ms`.
+    fn note_widen(&mut self, now_ms: u64) {
+        if self.probe_event.is_some_and(|(_, widen)| widen) {
+            // The previous widening held: nothing congested since.
+            self.probe_fails = self.probe_fails.saturating_sub(1);
+        }
+        self.probe_event = Some((now_ms, true));
+    }
+
+    /// N4 — congestion at `now_ms`; `failed`: count it as a failed probe
+    /// whatever came before (a departure, RM5).
+    fn note_congestion(&mut self, now_ms: u64, failed: bool) {
+        if failed || self.probe_event.is_some_and(|(_, widen)| widen) {
+            self.probe_fails = (self.probe_fails + 1).min(PROBE_FAILS_MAX);
+        }
+        self.probe_event = Some((now_ms, false));
     }
 
     /// Whether an upward probe is held now ([`Self::hold_probe`]).
@@ -859,6 +922,7 @@ impl<P: PeerRef> Admission<P> {
         if let Some(c) = w.capacity_bps.filter(|_| w.congested) {
             self.clean_streak = 0;
             self.last_congested_ms = now_ms;
+            self.note_congestion(now_ms, false);
             self.ceiling_bps = Some(c);
             log.record(
                 now_ms,
@@ -884,6 +948,9 @@ impl<P: PeerRef> Admission<P> {
         } else {
             self.clean_streak += 1;
             let held = self.probe_held(now_ms);
+            // N4: a widening (the demand step, the probe doubling) also waits
+            // out the probe backoff; a ceiling going stale is not one.
+            let backoff = !self.widen_allowed(now_ms);
             if let Some(c) = self.ceiling_bps {
                 // A clean window that carried more than the ceiling shows the
                 // uplink carries at least that: committable at the meter's
@@ -900,8 +967,9 @@ impl<P: PeerRef> Admission<P> {
                 // if the uplink really is full, takes it back. Without it a
                 // shed member waited out the staleness (60-120 s) with the
                 // uplink clean the whole time (avmesh4, after the cap lifted).
-                if self.demand && !self.over_claim_flagged && !held {
+                if self.demand && !self.over_claim_flagged && !held && !backoff {
                     self.demand = false;
+                    self.note_widen(now_ms);
                     // From what the hard limit reads now (a publisher's
                     // one-stream floor included), so a step is one stream.
                     let per = self.class.fraction.unwrap_or(1.0);
@@ -934,10 +1002,12 @@ impl<P: PeerRef> Admission<P> {
                 let used = self.committed_bps() as f64 >= 0.8 * (self.floor_bps + self.probe_bps);
                 if (used || self.demand)
                     && !held
+                    && !backoff
                     && self.clean_streak >= self.cfg.probe_clean_windows
                 {
                     self.demand = false;
                     self.clean_streak = 0;
+                    self.note_widen(now_ms);
                     self.probe_bps = (self.probe_bps * 2.0)
                         .min((MAX_PROBE_STREAMS * self.cfg.stream_bps) as f64);
                 }

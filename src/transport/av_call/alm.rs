@@ -353,6 +353,7 @@ impl AlmState {
         let mut own = Admission::publisher(me.to_owned(), cfg.clone(), None);
         own.set_members(members.iter().cloned());
         own.set_slow_start(true);
+        own.set_probe_backoff(true);
         own.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         Self {
             me: me.to_owned(),
@@ -1069,6 +1070,7 @@ impl AlmState {
         let mut a = Admission::publisher(self.me.clone(), self.cfg.clone(), None);
         a.set_members(self.members.iter().cloned());
         a.set_slow_start(true);
+        a.set_probe_backoff(true);
         a.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         self.shares.insert(stream, (a, Rate::default()));
         let now = self.now_ms();
@@ -2720,6 +2722,71 @@ mod tests {
             floor_of(&b, s(1)) - on_time < 50,
             "the floor moved {} ms during 40 s of queueing",
             floor_of(&b, s(1)) - on_time
+        );
+    }
+
+    /// N4 — observable: the egress window; state: a permanent cap of one
+    /// stream, a member waiting (demand), each widening read congested at
+    /// once (the probe failed); action: every widening waits 2 windows ×
+    /// 2^fails after the last congestion or widening, fails ≤ 2; must never:
+    /// widen sooner. Mutation (45.2.0 before N4): the demand step widened
+    /// every clean window, so a capped publisher probed, overloaded and shed
+    /// every other second (probe, late, leave, repeat).
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_capped_publishers_probe_backs_off_instead_of_oscillating() {
+        let mut a = publisher_with(&["b"]);
+        let one = a.own_rate.costs().0 as f64;
+        let mut rng = SplitMix64(11);
+        let mut log = DecisionLog::default();
+        let win = |congested: bool, sent: f64| EgressWindow {
+            sent_bps: sent,
+            delivered_bps: sent,
+            dropped_bytes: u64::from(congested) * 1_000,
+            max_queue_ms: if congested { 500.0 } else { 0.0 },
+            congested,
+            capacity_bps: congested.then_some(one),
+        };
+        // The cap is measured: one stream.
+        a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+        let now = a.now_ms();
+        let _ = a.own.on_egress_window(now, &win(true, one), &mut log);
+        let mut widenings = Vec::new();
+        for w in 0..60u64 {
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            let now = a.now_ms();
+            let mut admitted = false;
+            for p in ["b", "c"] {
+                if a.own.role_of(&p.to_owned()).is_none() {
+                    let r = SubscribeRequest {
+                        subscriber: p.to_owned(),
+                        role: Role::Primary,
+                        forward_capable: true,
+                        layers: None,
+                    };
+                    admitted |= matches!(
+                        a.own.request(now, &r, &mut rng, &mut log),
+                        AdmitDecision::Admit { .. }
+                    );
+                }
+            }
+            if admitted {
+                widenings.push(w);
+            }
+            // Two copies into a one-copy cap read congested; one is clean.
+            let two = a.own.ledger().len() > 1;
+            let _ = a.own.on_egress_window(now, &win(two, one), &mut log);
+            assert!(!a.own.ledger().is_empty(), "never zero direct children");
+        }
+        assert!(
+            widenings.len() <= 9,
+            "{} widenings in 60 windows under a permanent cap: {widenings:?}",
+            widenings.len()
+        );
+        let gaps: Vec<u64> = widenings.windows(2).map(|p| p[1] - p[0]).collect();
+        assert!(
+            gaps.iter().skip(2).all(|g| *g >= 8),
+            "the wait reaches 8 windows and stays: {gaps:?}"
         );
     }
 
