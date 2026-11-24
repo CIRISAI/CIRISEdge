@@ -1321,7 +1321,11 @@ impl<P: PeerRef> ParentSelector<P> {
                     && c.eligible
                     && self.members.contains(s)
                     && now_ms >= c.backoff_until
-                    && c.offer.as_ref().is_some_and(|o| o.forwarding)
+                    // The loop guard: never a standby that now hears the
+                    // stream through this node.
+                    && c.offer
+                        .as_ref()
+                        .is_some_and(|o| o.forwarding && !o.ancestry.contains(&me))
                     && matches!(
                         c.health.state(),
                         PeerState::Available | PeerState::Degraded | PeerState::Recovering
@@ -1392,7 +1396,10 @@ impl<P: PeerRef> ParentSelector<P> {
         if let (Some(p), Some(s)) = (self.primary.clone(), self.standby.clone()) {
             let pc = &self.cands[&p];
             let sc = &self.cands[&s];
-            let calm = self.promoting().is_none() && !pending_primary && sc.link == Link::Standby;
+            let calm = self.promoting().is_none()
+                && !pending_primary
+                && sc.link == Link::Standby
+                && sc.offer.as_ref().is_some_and(|o| !o.ancestry.contains(&me));
             let depth_ok = !self.has_children
                 || match (pc.offer.as_ref(), sc.offer.as_ref()) {
                     (Some(po), Some(so)) => so.depth <= po.depth,
@@ -1444,9 +1451,13 @@ impl<P: PeerRef> ParentSelector<P> {
             let c = &self.cands[&s];
             let calm = c.link == Link::Standby && self.promoting().is_none();
             let canonical = c.tier == Tier::Canonical;
+            // A standby under this node (its offer's ancestry holds it)
+            // could never take over: drop it like a down one.
+            let looped = c.offer.as_ref().is_some_and(|o| o.ancestry.contains(&me));
             if c.health.state() == PeerState::Down
                 || (!canonical && !self.members.contains(&s))
                 || !c.eligible
+                || looped
             {
                 self.standby = None;
                 out.push(self.drop_parent(now_ms, &s, rng, log, "standby down or ineligible"));
@@ -1726,6 +1737,65 @@ mod tests {
                     role: Role::Standby
                 },
                 "the publisher is not taken back as a fed standby"
+            );
+        }
+    }
+
+    /// The loop guard on a standby: a standby whose latest offer shows this
+    /// node in its ancestry (it now hears the stream THROUGH this node) is
+    /// never promoted, neither as a failover nor as a voluntary switch.
+    /// Mutation (45.2.0 before): the promotion checked only the standby's
+    /// health and forwarding, so a node with no primary asked its own
+    /// descendant (the kill witness, 734a272).
+    #[test]
+    fn a_standby_that_became_a_descendant_is_never_promoted() {
+        let mut cfg = ControllerConfig::interactive();
+        cfg.direct_first = true;
+        cfg.jitter = false;
+        let mut s = ParentSelector::new(1u32, cfg.clone(), true);
+        s.set_members([1u32, 2, 3]);
+        let (mut rng, mut log) = (SplitMix64(5), DecisionLog::default());
+        let offers = [(2, 4, 20.0)];
+        let _ = drive(&mut s, &cfg, 0, 4_000, &offers);
+        assert_eq!(s.primary(), Some(&2), "the premise: on the publisher");
+        // 3 offers as a relay under 2 and becomes this node's standby.
+        let mut t = 4_000;
+        let mut standby = false;
+        while t < 12_000 && !standby {
+            s.on_offer(t, offer(2, 4, &cfg), 20.0, &mut log);
+            s.on_offer(t, relay_offer(3, &cfg), 5.0, &mut log);
+            for a in s.tick(t, &mut rng, &mut log) {
+                if let SelectorAction::Subscribe { parent, role } = a {
+                    let _ = s.on_decision(
+                        t,
+                        &parent,
+                        &AdmitDecision::Admit { role },
+                        &mut rng,
+                        &mut log,
+                    );
+                }
+            }
+            standby = s.standby() == Some(&3);
+            t += 250;
+        }
+        assert!(standby, "the premise: 3 is the standby");
+        // 3 now hears the stream through this node, and the publisher's link
+        // is gone.
+        let looped = Offer {
+            depth: 2,
+            ancestry: vec![2, 1],
+            ..offer(3, 4, &cfg)
+        };
+        s.on_offer(t, looped, 5.0, &mut log);
+        s.on_link_down(t, &2, &mut log);
+        for k in 0..8u64 {
+            let acts = s.tick(t + k * 250, &mut rng, &mut log);
+            assert!(
+                !acts.contains(&SelectorAction::Subscribe {
+                    parent: 3,
+                    role: Role::Primary
+                }),
+                "promoted its own descendant: {acts:?}"
             );
         }
     }
