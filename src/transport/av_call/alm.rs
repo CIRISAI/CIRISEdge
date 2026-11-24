@@ -59,6 +59,9 @@ pub(super) const PUBLISHER_INITIAL_PROBE: u64 = 2;
 /// G8 — after an uplink-stall verdict, how long nothing widens this node's
 /// rooms (`Admission::hold_probe`).
 pub(super) const STALL_PROBE_HOLD_MS: u64 = 10_000;
+/// Row B1b — under a latched stall verdict, how often a member that holds no
+/// commitment here is sent this node's offers (the leg's liveness minimum).
+pub(super) const STALL_NONCHILD_OFFER_MS: u64 = 2_000;
 /// G8 slow start — how long a member refused for room still gets the
 /// publisher's chunks: two offer periods, so a child's OFFER has reached it
 /// and it has moved before the bridge ends.
@@ -293,6 +296,8 @@ pub(super) struct AlmState {
     /// G8 — frames made between ticks (the shed on a stall's rise), sent
     /// with the next tick's.
     pending_out: Vec<Outgoing>,
+    /// Row B1b — when each peer was last sent this node's offers.
+    offered_at: BTreeMap<String, u64>,
 }
 
 /// G8 — a leg whose oldest unproved Channel message has waited this long is
@@ -396,6 +401,7 @@ impl AlmState {
             uplink_stall: false,
             uplink_stall_seen_ms: None,
             pending_out: Vec::new(),
+            offered_at: BTreeMap::new(),
         }
     }
 
@@ -1886,10 +1892,43 @@ impl AlmState {
                     (*s, skip, encode(*s, &ControlMsg::Offer(o)))
                 })
                 .collect();
+            // Row B1b: latched verdict ∧ the peer is neither a child here nor
+            // a parent this node receives from → its offers go at
+            // the liveness minimum, one per STALL_NONCHILD_OFFER_MS; a child
+            // keeps the 1 s cadence. Answers are never delayed (they are not
+            // offers). Dead detection on such a leg is then ~2 s + the cold
+            // retry ladder.
+            let children: BTreeSet<String> = if self.uplink_stall {
+                self.own_admissions()
+                    .flat_map(|(_, a)| a.forwarding_to().into_iter().map(|(p, _)| p))
+                    .chain(
+                        self.relays
+                            .values()
+                            .flat_map(|a| a.forwarding_to().into_iter().map(|(p, _)| p)),
+                    )
+                    // F14a: and every node this one receives a stream from
+                    // keeps the 1 s cadence too (its leg's evidence).
+                    .chain(self.sels.values().flat_map(|sel| {
+                        sel.primary()
+                            .cloned()
+                            .into_iter()
+                            .chain(sel.standby().cloned())
+                    }))
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
             for peer in c3_legs {
                 if !self.members.iter().any(|m| m == peer) {
                     continue;
                 }
+                if self.uplink_stall && !children.contains(peer) {
+                    let last = self.offered_at.get(peer).copied().unwrap_or(0);
+                    if last != 0 && now.saturating_sub(last) < STALL_NONCHILD_OFFER_MS {
+                        continue;
+                    }
+                }
+                self.offered_at.insert(peer.clone(), now.max(1));
                 out.push(Outgoing {
                     to: peer.clone(),
                     frame: own_frame.clone(),
@@ -2766,14 +2805,15 @@ mod tests {
 
     /// F14a — a SILENT listener (it publishes nothing) still sends one fresh
     /// Channel message a second on its own leg toward the node it receives a
-    /// stream from, stalled or not: its own stream's OFFER, to every C3 leg,
+    /// stream from: its own stream's OFFER, to every C3 leg,
     /// the publisher included. That keeps evidence flowing on both of the
     /// publisher's links to it (leviculum's same-key form).
     #[test]
     fn a_silent_listener_offers_on_its_leg_to_its_parent_each_second() {
         let roster: Vec<String> = vec!["a".into(), "b".into()];
+        // Its own uplink is clear (a listener's is not the bottleneck); were
+        // it stalled, row B1b keeps a parent at 1 s too.
         let mut b = AlmState::new("b", s(2), &roster, true, 1);
-        b.uplink_stall = true;
         let mut offers = 0;
         for _ in 0..3 {
             b.t0 = b.t0.checked_sub(Duration::from_secs(1)).expect("clock");
@@ -2792,6 +2832,36 @@ mod tests {
             }
         }
         assert!(offers >= 3, "one a second toward the parent: {offers}");
+    }
+
+    /// Row B1b — under a latched verdict a member that is not a child gets
+    /// this node's offers once per STALL_NONCHILD_OFFER_MS; a child keeps the
+    /// 1 s cadence.
+    #[test]
+    fn a_latched_stall_offers_non_children_every_two_seconds() {
+        let mut a = publisher_with(&["b"]);
+        let (mut to_b, mut to_c) = (0, 0);
+        for _ in 0..4 {
+            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+            a.uplink_stall = true;
+            for o in a.tick(&["b".into(), "c".into()]) {
+                if matches!(
+                    decode(&o.frame, "a"),
+                    Ok(WireFrame::Control(ControlFrame {
+                        msg: ControlMsg::Offer(_),
+                        ..
+                    }))
+                ) {
+                    if o.to == "b" {
+                        to_b += 1;
+                    } else if o.to == "c" {
+                        to_c += 1;
+                    }
+                }
+            }
+        }
+        assert!(to_b >= 4, "the child keeps 1 s: {to_b}");
+        assert!(to_c <= 2, "a non-child at 2 s: {to_c}");
     }
 
     /// G8 — a stalled uplink with ONE child has nothing to shed: the verdict

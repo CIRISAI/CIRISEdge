@@ -1005,14 +1005,22 @@ fn a_reannounce_skips_backlogged_legs_and_a_stalled_uplink() {
     let mut n = HashMap::new();
     let mut sent_b = 0;
     for _ in 0..(REANNOUNCE_MAX_SKIPS + 1) {
-        if !reannounce_skips(&legs, true, &backlogged, &mut n).contains(&"b".to_owned()) {
+        if !reannounce_skips(&legs, false, &backlogged, &mut n).contains(&"b".to_owned()) {
             sent_b += 1;
         }
     }
     assert_eq!(
         sent_b, 1,
-        "bounded: a stalled leg still gets one every max rounds"
+        "bounded: a backlogged leg still gets one every max rounds"
     );
+    let mut n = HashMap::new();
+    for _ in 0..(REANNOUNCE_MAX_SKIPS + 2) {
+        assert_eq!(
+            reannounce_skips(&legs, true, &backlogged, &mut n),
+            legs,
+            "B1a: suspended outright while latched"
+        );
+    }
 }
 
 /// G8 serial redial — under a latched stall verdict at most one leg setup is

@@ -5513,7 +5513,14 @@ fn reannounce_skips(
     legs.iter()
         .filter(|l| {
             let n = skipped.entry((*l).clone()).or_insert(0);
-            let skip = (stalled || backlogged.contains(*l)) && *n < REANNOUNCE_MAX_SKIPS;
+            // Row B1a: latched verdict → the periodic re-announce is
+            // suspended outright (it is loss repair only; a part lost under
+            // the cap is repaired after it clears). The bound applies to a
+            // backlogged leg on an unstalled uplink.
+            if stalled {
+                return true;
+            }
+            let skip = backlogged.contains(*l) && *n < REANNOUNCE_MAX_SKIPS;
             *n = if skip { *n + 1 } else { 0 };
             skip
         })
