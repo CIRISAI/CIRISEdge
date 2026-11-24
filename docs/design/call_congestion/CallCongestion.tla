@@ -71,6 +71,16 @@ CONSTANTS
                         \* member), "child" (the lowest-ranked of P's direct children,
                         \* exactly), "offer" (the same, as the members' offers show it)
     StallHold,          \* no widening for this long after the last congestion (ticks)
+    BindEvery,          \* F13: P re-announces its stream binding every BindEvery (0: off)
+    BindParts,          \* ... as this many Channel messages per leg
+    BindSize,           \* ... each this many units (a hybrid-signed part)
+    RetxReenter,        \* a retransmit is a new packet: it re-enters the queue
+    BindSkip,           \* skip the re-announce on a leg while the verdict holds or the
+                        \* leg is backlogged (av_binding_reannounce_held) ...
+    BindSkipMax,        \* ... at most this many rounds in a row (the bound)
+    BindPace,           \* send one part per leg every BindPace ticks (1: all at once)
+    BindExpire,         \* a re-announce part is never retransmitted: at its first
+                        \* timeout it expires (it repeats what the peer has)
     StandbyFeed,        \* what a STANDBY child of P gets (an opaque or audio stream):
                         \* "none": no standbys (the model before F12);
                         \* "full": today's contract (alm.rs:31-32): every chunk, a full
@@ -186,7 +196,7 @@ VARIABLES
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual, maxQd,
     firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap,
+    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
@@ -194,7 +204,7 @@ VARIABLES
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd,
           firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, dialAt, dialBo, pathAt, children, order,
+          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, bindSkips, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -222,7 +232,7 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         drainClear |-> drainClear, capEndQ |-> capEndQ, slowMoved |-> slowMoved,
         offerDirect |-> offerDirect, zeroRun |-> zeroRun, maxZeroRun |-> maxZeroRun,
         standbys |-> standbys, maxStallCopies |-> maxStallCopies, primaryGapRun |-> primaryGapRun,
-        maxPrimaryGap |-> maxPrimaryGap,
+        maxPrimaryGap |-> maxPrimaryGap, bindSkips |-> bindSkips,
         stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
@@ -245,13 +255,14 @@ Emit(S, n, it, size) ==
     ELSE [S EXCEPT !.net = Append(@, it)]
 
 \* (b) A new Channel message on leg l (Channel::send -> ReceiptTracker::register).
+SizeOf(pay) == IF pay.p = "bind" THEN BindSize ELSE CtrlSize
 SendCtrl(S, l, pay) ==
     IF ~S.up[l] \/ ~Alive(S, l[1]) THEN S
     ELSE LET q == S.nextSeq[l]
              S1 == [S EXCEPT !.chan[l] = Append(@, [seq |-> q, first |-> S.now,
                                                    atts |-> <<S.now>>, pay |-> pay]),
                              !.nextSeq[l] = q + 1]
-         IN Emit(S1, l[1], Item("ctrl", l, S.gen[l], q, 1, pay, l[1], {}, S.now), CtrlSize)
+         IN Emit(S1, l[1], Item("ctrl", l, S.gen[l], q, 1, pay, l[1], {}, S.now), SizeOf(pay))
 
 RECURSIVE SendEach(_, _, _)
 SendEach(S, set, pay) ==   \* P sends pay to each listener in set
@@ -497,10 +508,13 @@ TimerMsgs(S, l, i, ch) ==
              learned == ~ConditionalRto \/ AuthSince(S, l) > m.first
              due == m.atts[k] + Wait(k, Base(IF learned THEN S.srtt8[l] ELSE 0))
          IN IF S.now < due THEN TimerMsgs(S, l, i + 1, ch)
+            ELSE IF BindExpire /\ m.pay.p = "bind"
+            THEN TimerMsgs([S EXCEPT !.chan[l] = RemoveAt(@, i)], l, i, ch)
             ELSE IF k >= MaxTries /\ ~Held(S, l, m) THEN TearDown(S, l, "exhausted", ch)
             ELSE LET S1 == [S EXCEPT !.chan[l][i].atts = Append(@, S.now)]
                      S2 == Emit(S1, l[1], Item("ctrl", l, S.gen[l], m.seq, k + 1, m.pay,
-                                               l[1], {}, S.now), CtrlSize)
+                                               l[1], {}, S.now),
+                                IF RetxReenter THEN SizeOf(m.pay) ELSE 0)
                  IN TimerMsgs(S2, l, i + 1, ch)
 
 RECURSIVE TimersOver(_, _, _)
@@ -677,6 +691,36 @@ Window(S, ch) ==
                       !.lastWiden = IF r3 /= S.room THEN S.now ELSE @,
                       !.probeFails = IF r3 /= S.room /\ held THEN Max(0, @ - 1) ELSE @]
 
+\* F13: P's binding re-announce, every BindEvery on every live leg: BindParts
+\* Channel messages of BindSize. BindSkip: a leg is skipped while the verdict
+\* holds or its oldest unproved message is older than StallTicks, at most
+\* BindSkipMax rounds in a row.
+Backlogged(S, l) == Len(S.chan[l]) > 0 /\ S.now - S.chan[l][1].first >= StallTicks
+RECURSIVE BindParts1(_, _, _)
+BindParts1(S, l, n) == IF n = 0 THEN S ELSE BindParts1(SendCtrl(S, l, Pay("bind")), l, n - 1)
+RECURSIVE BindLegs(_, _)
+BindLegs(S, ls) ==
+    IF ls = {} THEN S
+    ELSE LET l == CHOOSE l \in ls : TRUE
+             skip == BindSkip /\ (S.stall \/ Backlogged(S, l)) /\ S.bindSkips[l] < BindSkipMax
+             S1 == IF ~S.up[l] THEN S
+                   ELSE IF skip THEN [S EXCEPT !.bindSkips[l] = @ + 1]
+                   ELSE BindParts1([S EXCEPT !.bindSkips[l] = 0], l, BindParts)
+         IN BindLegs(S1, ls \ {l})
+\* With BindPace > 1 the round's parts go one per leg every BindPace ticks.
+RECURSIVE BindOne(_, _)
+BindOne(S, ls) ==
+    IF ls = {} THEN S
+    ELSE LET l == CHOOSE l \in ls : TRUE
+             skip == BindSkip /\ (S.stall \/ Backlogged(S, l)) /\ S.bindSkips[l] < BindSkipMax
+         IN BindOne(IF ~S.up[l] THEN S ELSE IF skip THEN S ELSE SendCtrl(S, l, Pay("bind")), ls \ {l})
+Phase(S) == S.now % BindEvery
+Reannounce(S) ==
+    IF BindEvery = 0 \/ ~Alive(S, "P") \/ S.now = 0 THEN S
+    ELSE IF BindPace <= 1 THEN (IF Phase(S) = 0 THEN BindLegs(S, PLegs) ELSE S)
+    ELSE IF Phase(S) % BindPace = 0 /\ Phase(S) \div BindPace < BindParts THEN BindOne(S, PLegs)
+    ELSE S
+
 \* Offers: every node, on every live out-leg, each OfferEvery (P: each
 \* StallOfferEvery while stalled).
 OfferPay(S, n) ==
@@ -696,7 +740,7 @@ OffersOver(S, ns) ==
                    THEN OfferLegs([S EXCEPT !.lastOffer[n] = S.now], n, Nodes \ {n})
                    ELSE S
          IN OffersOver(S1, ns \ {n})
-Offers(S) == Flush(OffersOver(S, Nodes))
+Offers(S) == Flush(Reannounce(OffersOver(S, Nodes)))
 
 \* P publishes one tick of media to its children and the drained.
 Publish(S) ==
@@ -971,6 +1015,7 @@ Init ==
     /\ lastFromParent = [c \in L |-> 0] /\ drainClear = -1 /\ capEndQ = -1 /\ slowMoved = FALSE
     /\ offerDirect = [c \in L |-> [n \in Nodes |-> FALSE]] /\ zeroRun = 0 /\ maxZeroRun = 0
     /\ standbys = {} /\ maxStallCopies = 0 /\ primaryGapRun = 0 /\ maxPrimaryGap = 0
+    /\ bindSkips = [l \in Legs |-> 0]
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
     /\ children = {} /\ order = <<>> /\ drainTo = [c \in L |-> -1]
@@ -1011,7 +1056,7 @@ Assign(S) ==
     /\ lastFromParent' = S.lastFromParent /\ drainClear' = S.drainClear /\ capEndQ' = S.capEndQ /\ slowMoved' = S.slowMoved
     /\ offerDirect' = S.offerDirect /\ zeroRun' = S.zeroRun /\ maxZeroRun' = S.maxZeroRun
     /\ standbys' = S.standbys /\ maxStallCopies' = S.maxStallCopies
-    /\ primaryGapRun' = S.primaryGapRun /\ maxPrimaryGap' = S.maxPrimaryGap /\ dialAt' = S.dialAt
+    /\ primaryGapRun' = S.primaryGapRun /\ maxPrimaryGap' = S.maxPrimaryGap /\ bindSkips' = S.bindSkips /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden

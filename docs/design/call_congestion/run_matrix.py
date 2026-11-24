@@ -49,7 +49,7 @@ BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4
             CAPUNTIL="50", HORIZON="260", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"',
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"', BINDEVERY="0", BINDPARTS="10", BINDSIZE="17", RETX="TRUE", BINDSKIP="FALSE", BINDSKIPMAX="3", BINDPACE="1", BINDEXP="FALSE",
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -126,6 +126,21 @@ def scenarios():
     # The kept child dies mid-stall: what the fix costs its relayed listeners.
     for feed in ["full", "fix", "fix2"]:
         yield f"kept-dies-feed-{feed}", dict(test, FEED=f'"{feed}"', DEAD='"A"', DEADAT="30")
+    # F13: the 10 s binding re-announce (10 parts of ~3.5 KB per leg; copy =
+    # 12 units ~ 2.4 KB a tick, so a part ~ 17 units), at 2.25x, cap held.
+    f13 = dict(SHIP, M="12", RCAP="16", CAPUNTIL="1000", FEED='"fix2"', BINDEVERY="100")
+    yield "f13-ship-reannounce", f13
+    yield "f13-ship-reannounce-no-retx", dict(f13, RETX="FALSE")
+    for mx in ["1", "3", "100"]:
+        yield f"f13-ship-reannounce-skip{mx}", dict(f13, BINDSKIP="TRUE", BINDSKIPMAX=mx)
+    yield "f13-ship-no-reannounce", dict(f13, BINDEVERY="0")
+    # Remedies: parts expire instead of retrying; parts paced across the period.
+    yield "f13-ship-expire", dict(f13, BINDEXP="TRUE")
+    yield "f13-ship-expire-skip3", dict(f13, BINDEXP="TRUE", BINDSKIP="TRUE")
+    yield "f13-ship-pace5", dict(f13, BINDPACE="5")
+    yield "f13-ship-pace5-expire", dict(f13, BINDPACE="5", BINDEXP="TRUE")
+    yield "f13-ship-pace5-expire-skip3", dict(f13, BINDPACE="5", BINDEXP="TRUE", BINDSKIP="TRUE")
+    yield "f13-ship-pace9-expire-skip3", dict(f13, BINDPACE="9", BINDEXP="TRUE", BINDSKIP="TRUE")
     # The shipping set.
     for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
         fine = dict(SHIP, M="12", RCAP=r)
