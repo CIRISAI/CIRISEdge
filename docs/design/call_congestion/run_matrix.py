@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Run TLC on CallCongestion.tla for each scenario and tabulate what holds.
+
+    python3 docs/design/call_congestion/run_matrix.py OUTDIR [--only REGEX]
+    python3 docs/design/call_congestion/run_matrix.py OUTDIR --trace NAME PROPERTY
+    python3 docs/design/call_congestion/run_matrix.py OUTDIR --reparse
+
+check mode: for each scenario this writes OUTDIR/<name>.cfg and runs TLC on
+MCCallCongestion.tla with -continue, so every violated invariant is listed,
+not just the first; the outcome probe (RecordOutcome) prints the outcome of
+every terminal state. The summary goes to OUTDIR/matrix.json and matrix.md.
+
+trace mode: one scenario, TraceOn = TRUE, the traced variant T_<PROPERTY>
+only; the first violation prints the compact per-tick history, rendered to
+OUTDIR/<name>.<PROPERTY>.trace.txt. (This TLC build prints no error trace
+for this spec past ~23 states, so the history is the trace.)
+
+TLC goes through the host's scheduler (one run at a time, honest memory
+figure): GRACE_SCHED_* + cargo_guard.sh, nice 19, ionice idle.
+Same conventions as leviculum docs/direct_link/run_matrix.py.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+JAR = os.path.expanduser("~/.cache/ciris-kernel/tla2tools-1.7.4.jar")
+GUARD = os.path.expanduser("~/CIRISGrace/bin/cargo_guard.sh")
+CAP_SECS = 5400
+
+ALL_OFF = dict(RPA="FALSE", RTO="FALSE", HOLD="FALSE", SOV="FALSE", RKO="FALSE",
+               SS="FALSE", RPU="FALSE", DRAIN="FALSE")
+SWITCH = dict(RPA="ReceiptsPerAttempt", RTO="RtoLearnsDelay", HOLD="Hold113",
+              SOV="ShedOnVerdict", RKO="RoomKeepsOne", SS="SlowStart",
+              RPU="RedialOnPathUp", DRAIN="ShedDrains")
+INVS = ("TypeOK NoSpuriousTeardown KeepsOneChild NeverTwoParents MakeBeforeBreak "
+        "NothingWaitsForever ReparentBound EndParented EndHeard EndFullFanOut "
+        "DeadDetected RecordOutcome")
+BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RCAP="4", CAPAT="10",
+            CAPUNTIL="50", HORIZON="100", STALE="100", SRTTCAP="17", WATCH="2",
+            SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
+            LPH="{0, 5}", WPH="{0, 5}", NPICK="2", MAXREP="3", DEAD='"none"',
+            DEADAT="0", TRACE="FALSE", INVS=INVS, PROPS="")
+
+
+def on(*keys):
+    return {k: "TRUE" for k in keys}
+
+
+# Today's code at each pin, as switches (CallCongestion.md, "Where the code is").
+TODAY_LEV_C86 = on("HOLD")                    # leviculum c8699c3d6 (#113 hold only)
+TODAY_LEV_C75 = on("HOLD", "RPA")             # leviculum c75fdeb01 (+ per-attempt receipts)
+EDGE_WIP = on("SOV", "RKO")                   # calls2's uncommitted alm.rs (shed on rise, latch, room)
+ALL6 = on("RPA", "RTO", "SOV", "RKO", "SS", "RPU")
+ALL = dict(ALL6, **on("HOLD", "DRAIN"))
+
+
+def scenarios():
+    yield "baseline", {}
+    yield "smoke-baseline", dict(PPH="{3}", LPH="{0}", WPH="{0}", NPICK="1", PUNCH="{10}")
+    # One switch at a time on the baseline: which failure each removes alone.
+    for k in SWITCH:
+        yield f"only-{SWITCH[k]}", on(k)
+    # The pins measured today.
+    yield "pin-c8699c3d6", TODAY_LEV_C86
+    yield "pin-c75fdeb01", TODAY_LEV_C75
+    yield "pin-c75fdeb01+edge-wip", dict(TODAY_LEV_C75, **EDGE_WIP)
+    # The six switches of the brief, and all eight.
+    yield "six-on", ALL6
+    yield "all-on", ALL
+    # Leave one out of all-on: what each switch is still needed for.
+    for k in ALL:
+        yield f"all-but-{SWITCH[k]}", dict(ALL, **{k: "FALSE"})
+    # The cap from the first tick (slow start's case) and a cap that stays.
+    yield "start-capped-baseline", dict(CAPAT="0")
+    yield "start-capped-all-on", dict(ALL, CAPAT="0")
+    yield "start-capped-all-but-SlowStart", dict(ALL, SS="FALSE", CAPAT="0")
+    yield "cap-stays-all-on", dict(ALL, CAPUNTIL="1000")
+    # Uplink sizes: one copy exactly, and 1.67 copies.
+    yield "rcap3-all-on", dict(ALL, RCAP="3")
+    yield "rcap5-all-on", dict(ALL, RCAP="5")
+    # Three people.
+    yield "n3-baseline", dict(LSEQ="Listeners2")
+    yield "n3-all-on", dict(ALL, LSEQ="Listeners2")
+    # A dead peer (#1030): the fixes must not hide it. Stale bound and the
+    # SRTT cap scaled together (the ASSUME of ChannelHold.tla).
+    dead = dict(DEAD='"B"', DEADAT="30", STALE="40", SRTTCAP="6", CAPUNTIL="1000")
+    yield "dead-B-baseline", dead
+    yield "dead-B-all-on", dict(ALL, **dead)
+    yield "dead-B-all-on-close-lost", dict(ALL, CLOSELOST="TRUE", **dead)
+    # A close that never arrives (#1030) with everyone alive.
+    yield "close-lost-all-on", dict(ALL, CLOSELOST="TRUE")
+    # The watch tick at 300 ms instead of 200 ms (it is 250 ms in code).
+    yield "watch3-all-on", dict(ALL, WATCH="3")
+
+
+def cfg_text(params):
+    p = dict(BASE, **params)
+    text = open(os.path.join(HERE, "base.cfg.tmpl")).read()
+    for k, v in p.items():
+        text = text.replace(f"@{k}@", v)
+    assert "@" not in text, text
+    return text
+
+
+def tlc(outdir, name, cfgtext, extra=()):
+    cfg = os.path.join(outdir, name + ".cfg")
+    open(cfg, "w").write(cfgtext)
+    env = dict(os.environ, GRACE_SCHED_OWNER="edge",
+               GRACE_SCHED_KIND="edge: tlc call model", GRACE_SCHED_PEAK_GB="4")
+    cmd = ["timeout", str(CAP_SECS), "nice", "-n", "19", "ionice", "-c3", GUARD,
+           "java", "-Xmx3g", "-XX:+UseParallelGC", "-cp", JAR, "tlc2.TLC",
+           "-workers", "2", *extra, "-config", cfg,
+           "-metadir", os.path.join(outdir, name + ".states"),
+           os.path.join(outdir, "MCCallCongestion.tla")]
+    log = os.path.join(outdir, name + ".log")
+    counts = {}
+    with open(log, "w") as fh:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                cwd=outdir, text=True, env=env)
+        for line in proc.stdout:
+            m = re.search(r'<<"OUTCOME", "([^"]+)">>', line)
+            if m:
+                counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+            else:
+                fh.write(line)
+        proc.wait()
+        fh.write("OUTCOME_COUNTS " + json.dumps(counts) + "\n")
+    subprocess.run(["rm", "-rf", os.path.join(outdir, name + ".states")])
+    return log
+
+
+def parse_log(log, params):
+    t = open(log).read()
+    violated = sorted(set(re.findall(r"Invariant (\w+) is violated", t)))
+    temporal = sorted(set(re.findall(r"Temporal propert(?:y|ies) (\w+)? ?(?:is|were) violated", t)))
+    if "Temporal properties were violated" in t:
+        temporal = temporal or ["(temporal)"]
+    distinct = re.findall(r"([\d,]+) distinct states found", t)
+    depth = re.findall(r"depth of the complete state graph search is (\d+)", t)
+    outcomes = {}
+    for m in re.findall(r"OUTCOME_COUNTS (\{.*\})", t):
+        for k, v in json.loads(m).items():
+            outcomes[k] = outcomes.get(k, 0) + v
+    errors = [l for l in t.splitlines() if l.startswith("Error:") and "is violated" not in l
+              and "behavior up to" not in l]
+    return dict(violated=violated, temporal=temporal, finished="Finished in" in t,
+                distinct=int(distinct[-1].replace(",", "")) if distinct else None,
+                depth=int(depth[-1]) if depth else None, outcomes=outcomes,
+                errors=errors[:3], params=params)
+
+
+# --- a small reader for TLA+ values as TLC prints them -----------------------
+TOK = re.compile(r'\s*(<<|>>|\|->|:>|@@|\\in|"(?:[^"\\]|\\.)*"|-?\d+|[A-Za-z_][A-Za-z_0-9]*|[\[\]{}(),])')
+
+
+def tokens(s):
+    pos, out = 0, []
+    while pos < len(s):
+        m = TOK.match(s, pos)
+        if not m:
+            if s[pos:].strip() == "":
+                break
+            raise ValueError(s[pos:pos + 40])
+        out.append(m.group(1))
+        pos = m.end()
+    return out
+
+
+def value(ts, i=0):
+    t = ts[i]
+    if t == "<<":
+        items, i = [], i + 1
+        while ts[i] != ">>":
+            v, i = value(ts, i)
+            items.append(v)
+            if ts[i] == ",":
+                i += 1
+        return tuple(items), i + 1
+    if t == "{":
+        items, i = [], i + 1
+        while ts[i] != "}":
+            v, i = value(ts, i)
+            items.append(v)
+            if ts[i] == ",":
+                i += 1
+        return ("set", tuple(items)), i + 1
+    if t == "[":
+        rec, i = {}, i + 1
+        while ts[i] != "]":
+            k = ts[i]
+            assert ts[i + 1] == "|->", ts[i:i + 3]
+            v, i = value(ts, i + 2)
+            rec[k] = v
+            if ts[i] == ",":
+                i += 1
+        return rec, i + 1
+    if t == "(":
+        fn, i = {}, i + 1
+        while ts[i] != ")":
+            k, i = value(ts, i)
+            assert ts[i] == ":>"
+            v, i = value(ts, i + 1)
+            fn[k] = v
+            if ts[i] == "@@":
+                i += 1
+        return ("fn", fn), i + 1
+    if t.startswith('"'):
+        return t[1:-1], i + 1
+    if t in ("TRUE", "FALSE"):
+        return t == "TRUE", i + 1
+    if re.fullmatch(r"-?\d+", t):
+        return int(t), i + 1
+    return t, i + 1
+
+
+def show(v):
+    if isinstance(v, tuple) and len(v) == 2 and v[0] == "set":
+        return "{" + ", ".join(sorted(show(x) for x in v[1])) + "}"
+    if isinstance(v, tuple) and len(v) == 2 and v[0] == "fn":
+        return "(" + ", ".join(f"{show(k)}:{show(x)}" for k, x in v[1].items()) + ")"
+    if isinstance(v, tuple):
+        return "<" + ",".join(show(x) for x in v) + ">"
+    if isinstance(v, dict):
+        return "[" + " ".join(f"{k}={show(x)}" for k, x in v.items()) + "]"
+    if isinstance(v, bool):
+        return "T" if v else "F"
+    return str(v)
+
+
+def render_trace(text):
+    """The compact history printed by Dump, one line per tick that changed."""
+    line = next((l for l in text.splitlines() if l.startswith('<<"TRACE", ')), None)
+    if line is None:
+        return None
+    hist, _ = value(tokens(line[len('<<"TRACE", '):-2]))
+    lines, prev = [], {}
+    for snap in hist:
+        cur = {k: show(v) for k, v in snap.items()}
+        changed = {k: v for k, v in cur.items() if prev.get(k) != v and k != "t"}
+        prev = cur
+        if changed:
+            lines.append(f"t={cur['t']:>3}  " + "  ".join(f"{k}={v}" for k, v in changed.items()))
+    return "\n".join(lines) + "\n"
+
+
+def prepare(outdir):
+    os.makedirs(outdir, exist_ok=True)
+    for f in ["CallCongestion.tla", "MCCallCongestion.tla"]:
+        subprocess.run(["cp", os.path.join(HERE, f), outdir], check=True)
+
+
+def trace(outdir, name, prop):
+    prepare(outdir)
+    params = dict(scenarios())[name]
+    p = dict(params, TRACE="TRUE", INVS=f"T_{prop}")
+    log = tlc(outdir, f"{name}.{prop}", cfg_text(p))
+    text = open(log).read()
+    out = render_trace(text)
+    path = os.path.join(outdir, f"{name}.{prop}.trace.txt")
+    open(path, "w").write(out or "no violation (or no trace printed)\n" + text[-2000:])
+    print(path)
+    print(out if out else text[-1500:])
+
+
+def table(results):
+    out = ["| scenario | switches on | violated | outcomes (terminal states) | states / depth |",
+           "|---|---|---|---|---|"]
+    for name, r in results.items():
+        p = r["params"]
+        sw = ", ".join(SWITCH[k] for k in SWITCH if p.get(k) == "TRUE") or "none"
+        oc = ", ".join(f"{k} x{v}" for k, v in sorted(r["outcomes"].items())) or "-"
+        bad = ", ".join(r["violated"] + r["temporal"]) or "none"
+        run = f"{r['distinct']} / {r['depth']}" + ("" if r["finished"] else " PARTIAL")
+        if r.get("errors"):
+            run += " ERR " + "; ".join(r["errors"])
+        out.append(f"| {name} | {sw} | {bad} | {oc} | {run} |")
+    return "\n".join(out) + "\n"
+
+
+def main():
+    outdir = sys.argv[1]
+    if len(sys.argv) > 2 and sys.argv[2] == "--trace":
+        return trace(outdir, sys.argv[3], sys.argv[4])
+    resfile = os.path.join(outdir, "matrix.json")
+    if len(sys.argv) > 2 and sys.argv[2] == "--reparse":
+        res = {n: parse_log(os.path.join(outdir, n + ".log"), p) for n, p in scenarios()
+               if os.path.exists(os.path.join(outdir, n + ".log"))}
+        json.dump(res, open(resfile, "w"), indent=1)
+        open(os.path.join(outdir, "matrix.md"), "w").write(table(res))
+        return
+    only = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == "--only" else None
+    prepare(outdir)
+    results = json.load(open(resfile)) if os.path.exists(resfile) else {}
+    for name, params in scenarios():
+        if only and not re.fullmatch(only, name):
+            continue
+        if name in results and not only:
+            continue
+        log = tlc(outdir, name, cfg_text(params), extra=["-continue"])
+        results[name] = parse_log(log, params)
+        json.dump(results, open(resfile, "w"), indent=1)
+        r = results[name]
+        print(name, r["distinct"], r["depth"], r["outcomes"], r["violated"], r["temporal"],
+              r["errors"], flush=True)
+    open(os.path.join(outdir, "matrix.md"), "w").write(table(results))
+
+
+if __name__ == "__main__":
+    main()
