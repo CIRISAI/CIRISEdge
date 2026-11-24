@@ -33,13 +33,15 @@ CAP_SECS = 5400
 ALL_OFF = dict(RPA="FALSE", RTO="FALSE", HOLD="FALSE", SOV="FALSE", RKO="FALSE",
                SS="FALSE", RPU="FALSE", DRAIN="FALSE", PEER="FALSE", RXMOVE="FALSE",
                PBO="FALSE", HASH="FALSE", STAG="FALSE", SERIAL="FALSE", PROBE2="FALSE",
-               SILENCE="FALSE", SDRAIN="FALSE")
+               SILENCE="FALSE", SDRAIN="FALSE", FRESH="FALSE", CRTO="FALSE",
+               REPLAY="FALSE", DELAYP="FALSE")
 SWITCH = dict(RPA="ReceiptsPerAttempt", RTO="RtoLearnsDelay", HOLD="Hold113",
               SOV="ShedOnVerdict", RKO="RoomKeepsOne", SS="SlowStart",
               RPU="RedialOnPathUp", DRAIN="ShedDrains", PEER="PeerLiveness",
               RXMOVE="ReceiverMoves", PBO="ProbeBackoff", HASH="HashRank",
               STAG="StaggeredSetup", SERIAL="SerialRedial", PROBE2="ProbeTwoLegs",
-              SILENCE="SilenceFailover", SDRAIN="StallDrain")
+              SILENCE="SilenceFailover", SDRAIN="StallDrain", FRESH="FreshEvidence",
+              CRTO="ConditionalRto", REPLAY="ReplayAttack", DELAYP="DelayProofs")
 INVS = "TypeOK RecordOutcome"   # the properties fold into `bad`, read per terminal state
 BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4", CAPAT="10",
             CAPUNTIL="50", HORIZON="230", STALE="100", SRTTCAP="17", WATCH="2",
@@ -59,9 +61,9 @@ TODAY_LEV_C75 = on("HOLD", "RPA")             # leviculum c75fdeb01 (+ per-attem
 EDGE_WIP = on("SOV", "RKO")                   # calls2's alm.rs (shed on rise, latch, room)
 SIX = on("RPA", "RTO", "SOV", "RKO", "SS", "RPU")       # the brief's six
 EIGHT = dict(SIX, **on("HOLD", "DRAIN"))                # + the #113 hold, make-before-break
-ALL = dict(EIGHT, **on("PEER", "RXMOVE", "PBO"))        # + what the model found missing
+ALL = dict(EIGHT, **on("PEER", "RXMOVE", "PBO", "FRESH", "CRTO"))        # + what the model found missing
 # The lead's proposed minimum for 45.2.0's safety properties.
-MIN = on("PEER", "SOV", "RKO", "PBO", "SERIAL")
+MIN = on("PEER", "SOV", "RKO", "PBO", "SERIAL", "FRESH", "CRTO")
 SETUP = dict(SETUP="40")                      # ~1 s of P's queue per leg set up (F11)
 
 
@@ -69,7 +71,8 @@ def scenarios():
     yield "smoke-baseline", dict(PPH="{3}", LPH="{0}", WPH="{0}", NPICK="1", PUNCH="{10}")
     yield "baseline", {}
     for k in SWITCH:
-        yield f"only-{SWITCH[k]}", on(k)
+        if k not in ("REPLAY", "DELAYP"):
+            yield f"only-{SWITCH[k]}", on(k)
     yield "pin-c8699c3d6", TODAY_LEV_C86
     yield "pin-c75fdeb01", TODAY_LEV_C75
     yield "pin-c75fdeb01+edge-wip", dict(TODAY_LEV_C75, **EDGE_WIP)
@@ -92,7 +95,7 @@ def scenarios():
     # the minimum set plus SilenceFailover (300 / 500 ms), StallDrain (25 /
     # 50 / 75 % of a copy), both, and ProbeTwoLegs, at 2.25x, 1.8x, 1.5x.
     for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
-        fine = dict(MIN, M="12", RCAP=r)
+        fine = dict(MIN, M="12", RCAP=r, CAPUNTIL="1000")
         yield f"cmp-{tag}-min", fine
         yield f"cmp-{tag}-silence3", dict(fine, SILENCE="TRUE", SILENTT="3")
         yield f"cmp-{tag}-silence5", dict(fine, SILENCE="TRUE", SILENTT="5")
@@ -102,6 +105,19 @@ def scenarios():
         yield f"cmp-{tag}-probe2", dict(fine, PROBE2="TRUE")
         yield f"cmp-{tag}-probe2-drain50", dict(fine, PROBE2="TRUE", SDRAIN="TRUE", DRAINPCT="50")
         yield f"cmp-{tag}-rxmove-hash", dict(fine, RXMOVE="TRUE", HASH="TRUE")
+    # The review (leviculum): fresh evidence, the conditional RTO, adversaries.
+    dq = dict(DEAD='"B"', DEADAT="52")           # B dies just after the cap lifts (SRTT at its cap)
+    yield "dead-after-queue-min", dict(MIN, **dq)
+    yield "dead-after-queue-min-learned-rto", dict(MIN, RTO="TRUE", **dq)
+    yield "dead-after-queue-min-learned-rto-unconditional", dict(MIN, RTO="TRUE", CRTO="FALSE", **dq)
+    yield "dead-after-queue-all-on", dict(ALL, **dq)
+    rp = dict(DEAD='"B"', DEADAT="30", STALE="40", SRTTCAP="6", CAPAT="1000", CAPUNTIL="1000",
+              REPLAY="TRUE")
+    yield "replay-dead-B-min", dict(MIN, **rp)
+    yield "replay-dead-B-min-stale-evidence", dict(MIN, FRESH="FALSE", **rp)
+    yield "delay-proofs-A-min", dict(MIN, DELAYP="TRUE")
+    yield "delay-proofs-A-no-peer", dict(MIN, PEER="FALSE", DELAYP="TRUE")
+    yield "delay-proofs-A-uncapped-min", dict(MIN, DELAYP="TRUE", CAPAT="1000", CAPUNTIL="1000")
     # What closes the stall-shed gap on the minimum set.
     yield "min+probe2", dict(MIN, PROBE2="TRUE")
     yield "min+rxmove-hash", dict(MIN, RXMOVE="TRUE", HASH="TRUE")

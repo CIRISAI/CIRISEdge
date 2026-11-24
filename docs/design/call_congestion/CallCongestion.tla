@@ -59,6 +59,13 @@ CONSTANTS
     SerialRedial,       \* while P's verdict holds: one leg setup at a time; a
                         \* listener heard through a relay defers its legs' redial
     ProbeTwoLegs,       \* P sends a small control frame each ProbeEvery on <= 2 idle legs
+    FreshEvidence,      \* evidence = packets that ADVANCE state only (a new Channel
+                        \* sequence, a proof for an outstanding receipt, a new chunk)
+    ConditionalRto,     \* the learned RTO applies only while there is fresh evidence
+                        \* since the message's first send; else the cold ladder
+    ReplayAttack,       \* an on-path party replays old frames of DeadNode's after it dies
+    DelayProofs,        \* an on-path party withholds the proofs DelayVictim emits
+    DelayVictim, AdvFrom, AdvTo,
     SilenceFailover,    \* a child whose primary delivered nothing for SilentTicks moves
     SilentTicks,
     StallDrain,         \* while the verdict holds, P's copies are DrainPct of a copy
@@ -287,7 +294,7 @@ KeepOf(ch) == IF RoomKeepsOne THEN 1 ELSE ch.keep
 \* Media of P's tick t from s at c (dedup by t; a relay forwards new t).
 Media1(S, s, c, t) ==
     IF ~Alive(S, c) \/ ~S.peerUp[<<s, c>>] THEN S
-    ELSE LET S0 == [S EXCEPT !.peerAuth[c][s] = S.now,
+    ELSE LET S0 == [S EXCEPT !.peerAuth[c][s] = IF ~FreshEvidence \/ t > S.lastHeard[c] THEN S.now ELSE @,
                              !.lastFromParent[c] = IF S.parent[c] = s THEN S.now ELSE @,
                              !.rxDelay[c] = IF s = "P" THEN S.now - t ELSE @]
              S1 == IF t > S0.lastHeard[c]
@@ -373,8 +380,11 @@ Handle(S, pay, s, r) ==
 RecvCtrl(S, it) ==
     LET l == it.leg  r == l[2]
     IN IF ~Alive(S, r) \/ ~S.peerUp[l] THEN S
-       ELSE LET S1 == Emit([S EXCEPT !.peerAuth[r][l[1]] = S.now], r,
-                           Item("proof", l, it.gen, it.seq, it.att, NoPay, r, {}, S.now), 0)
+       ELSE LET fresh == ~FreshEvidence \/ it.seq >= S.rxNext[l]
+                withheld == DelayProofs /\ r = DelayVictim /\ AdvFrom <= S.now /\ S.now < AdvTo
+                S0 == [S EXCEPT !.peerAuth[r][l[1]] = IF fresh THEN S.now ELSE @]
+                S1 == IF withheld THEN S0
+                      ELSE Emit(S0, r, Item("proof", l, it.gen, it.seq, it.att, NoPay, r, {}, S.now), 0)
             IN IF it.seq >= S1.rxNext[l]
                THEN Handle([S1 EXCEPT !.rxNext[l] = it.seq + 1], it.pay, l[1], r)
                ELSE S1   \* AlreadyDelivered: proved again, handled once
@@ -441,7 +451,8 @@ TimerMsgs(S, l, i, ch) ==
     IF ~S.up[l] \/ i > Len(S.chan[l]) THEN S
     ELSE LET m == S.chan[l][i]
              k == Len(m.atts)
-             due == m.atts[k] + Wait(k, Base(S.srtt8[l]))
+             learned == ~ConditionalRto \/ AuthSince(S, l) > m.first
+             due == m.atts[k] + Wait(k, Base(IF learned THEN S.srtt8[l] ELSE 0))
          IN IF S.now < due THEN TimerMsgs(S, l, i + 1, ch)
             ELSE IF k >= MaxTries /\ ~Held(S, l, m) THEN TearDown(S, l, "exhausted", ch)
             ELSE LET S1 == [S EXCEPT !.chan[l][i].atts = Append(@, S.now)]
@@ -725,9 +736,16 @@ EndFullFanOutS(S) == (OverS(S) /\ CapUntil + RecoverBy <= Horizon) =>
 \* the code already has (an offer period + the retry span at the learned
 \* cap, twice; the stale bound for the receiver side).
 DeadBound == OfferEvery + 2 * Wait(MaxTries, Base(SrttCap8)) + 13 * Base(SrttCap8) + Stale
+\* With ConditionalRto the dialer side is the cold ladder: one offer period
+\* for a message to be outstanding, its 5 cold waits (13 ticks), a watch tick.
+ColdSpan == Ordinary(1, 1) + Ordinary(2, 1) + Ordinary(3, 1) + Ordinary(4, 1) + Ordinary(5, 1)
+DialerDeadBound == IF ConditionalRto THEN OfferEvery + ColdSpan + 2
+                   ELSE OfferEvery + 2 * Wait(MaxTries, Base(SrttCap8)) + 13 * Base(SrttCap8) + 2
 DeadDetectedS(S) ==
-    (DeadNode /= None /\ S.now >= DeadAt + DeadBound) =>
-        \A l \in Legs : (l[2] = DeadNode => ~S.up[l]) /\ (l[1] = DeadNode => ~S.peerUp[l])
+    /\ (DeadNode /= None /\ S.now >= DeadAt + DialerDeadBound) =>
+          \A l \in Legs : l[2] = DeadNode /\ Alive(S, l[1]) => ~S.up[l]
+    /\ (DeadNode /= None /\ S.now >= DeadAt + Stale + 2) =>
+          \A l \in Legs : l[1] = DeadNode => ~S.peerUp[l]
 
 Bad(S) ==
     {n \in {"NoSpuriousTeardown", "KeepsOneChild", "NeverTwoParents", "MakeBeforeBreak",
@@ -783,8 +801,24 @@ ProbeLegs(S) ==
         Go(T, i) == IF i > n THEN T ELSE Go(SendCtrl(T, idle[i], Pay("probe")), i + 1)
     IN IF ProbeTwoLegs /\ Alive(S, "P") /\ S.now % ProbeEvery = 0 THEN Go(S, 1) ELSE S
 
+\* ReplayAttack: after DeadNode dies, an on-path party replays a frame it
+\* recorded: its first Channel message (seq 0) and its first media tick, on
+\* every leg from it. They decrypt (no replay protection on the link), so
+\* only FreshEvidence keeps them from counting as the peer being alive.
+RECURSIVE ReplayTo(_, _)
+ReplayTo(S, ms) ==
+    IF ms = {} THEN S
+    ELSE LET x == CHOOSE x \in ms : TRUE
+             l == <<DeadNode, x>>
+             S1 == Recv(S, Item("ctrl", l, S.gen[l], 0, 1, Offer(TRUE, TRUE), DeadNode, {}, 0))
+             S2 == IF x \in L THEN Recv(S1, Item("media", <<DeadNode, DeadNode>>, 0, 0, 0, NoPay,
+                                                  DeadNode, {x}, 0)) ELSE S1
+         IN ReplayTo(S2, ms \ {x})
+Replays(S) == IF ReplayAttack /\ DeadNode /= None /\ S.now > DeadAt
+              THEN Flush(ReplayTo(S, Nodes \ {DeadNode})) ELSE S
+
 Step(S, ch) ==
-    LET S1 == Timers(Flush(ProbeLegs(StartSetup(S))), ch)
+    LET S1 == Timers(Flush(ProbeLegs(StartSetup(Replays(S)))), ch)
         S2 == Flush(StaleLegs(S1))
         S3 == Redial(S2)
         S4 == Watch(S3, ch)
