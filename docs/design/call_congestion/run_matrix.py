@@ -49,7 +49,7 @@ BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4
             CAPUNTIL="50", HORIZON="260", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
-            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0",
+            DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0", FEED='"none"',
             DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
@@ -115,6 +115,17 @@ def scenarios():
         yield f"cmp-{tag}-probe2", dict(fine, PROBE2="TRUE")
         yield f"cmp-{tag}-probe2-drain50", dict(fine, PROBE2="TRUE", SDRAIN="TRUE", DRAINPCT="50")
         yield f"cmp-{tag}-rxmove-hash", dict(fine, RXMOVE="TRUE", HASH="TRUE")
+    # F12: what P sends a standby after a stall shed (copy = 12 units, 2.25x,
+    # cap held). The edge test's configuration (receipts + fast shed + slow
+    # start, no ReceiverMoves yet) and the shipping set, each with the
+    # standby fed a full copy (today's contract) and with the fix.
+    test = dict(MIN, **on("SS"), INIT="2", HOLDT="100", M="12", RCAP="16", CAPUNTIL="1000")
+    for feed in ["none", "full", "fix", "fix2"]:
+        yield f"f12-test-feed-{feed}", dict(test, FEED=f'"{feed}"')
+        yield f"f12-ship-feed-{feed}", dict(SHIP, M="12", RCAP="16", CAPUNTIL="1000", FEED=f'"{feed}"')
+    # The kept child dies mid-stall: what the fix costs its relayed listeners.
+    for feed in ["full", "fix", "fix2"]:
+        yield f"kept-dies-feed-{feed}", dict(test, FEED=f'"{feed}"', DEAD='"A"', DEADAT="30")
     # The shipping set.
     for r, tag in [("16", "x225"), ("20", "x18"), ("24", "x15")]:
         fine = dict(SHIP, M="12", RCAP=r)

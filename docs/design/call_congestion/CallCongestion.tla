@@ -71,6 +71,13 @@ CONSTANTS
                         \* member), "child" (the lowest-ranked of P's direct children,
                         \* exactly), "offer" (the same, as the members' offers show it)
     StallHold,          \* no widening for this long after the last congestion (ticks)
+    StandbyFeed,        \* what a STANDBY child of P gets (an opaque or audio stream):
+                        \* "none": no standbys (the model before F12);
+                        \* "full": today's contract (alm.rs:31-32): every chunk, a full
+                        \*   copy; a stall-shed child stays P's standby; the standby's
+                        \*   commitment counts in the one-stream room;
+                        \* "fix": nothing to a standby under a latched verdict, a stall
+                        \*   shed leaves no standby, a shed never takes the last primary
     SlowNode, SlowTicks,\* a listener whose own downlink adds SlowTicks to everything
     DepartureHolds,     \* RM5: P reads ANY direct child's departure as a late one
     Graceful,           \* DeadNode hangs up (unsubscribes its parent) instead of dying
@@ -179,7 +186,7 @@ VARIABLES
     \* bookkeeping the properties read
     heard, lastHeard, lastFwd, published, torn, dual, maxQd,
     firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun,
+    shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap,
     hist,               \* the compact history (empty unless TraceOn)
     choice,             \* this behaviour's choices, fixed at Init (see Choices)
     bad                 \* the properties this behaviour has violated so far
@@ -187,7 +194,7 @@ VARIABLES
 vars == <<now, fifo, backlog, net, up, peerUp, gen, downAt, chan, nextSeq,
           rxNext, srtt8, lastAuth, peerAuth, rxDelay, probeFails, lateMove, maxQd,
           firstVerdictAt, firstShedAt, firstShedQ, fullAt, lastSetupAt,
-          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, dialAt, dialBo, pathAt, children, order,
+          shedAtL, maxParentGap, lastNewAt, maxMediaGap, idleCand, lastFromParent, drainClear, capEndQ, slowMoved, offerDirect, zeroRun, maxZeroRun, standbys, maxStallCopies, primaryGapRun, maxPrimaryGap, dialAt, dialBo, pathAt, children, order,
           drainTo, shedPend, room, demand, lastCong, lastWiden, stall, stallSeen, obs,
           verdicts, sheds, zeroShed, lastOffer, winPhase, relayKids, parent,
           pendSub, pendAt, boUntil, reparents, lastSwitch, shedBy, offerAt,
@@ -214,6 +221,8 @@ Rec == [now |-> now, fifo |-> fifo, backlog |-> backlog, net |-> net, up |-> up,
         maxMediaGap |-> maxMediaGap, idleCand |-> idleCand, lastFromParent |-> lastFromParent,
         drainClear |-> drainClear, capEndQ |-> capEndQ, slowMoved |-> slowMoved,
         offerDirect |-> offerDirect, zeroRun |-> zeroRun, maxZeroRun |-> maxZeroRun,
+        standbys |-> standbys, maxStallCopies |-> maxStallCopies, primaryGapRun |-> primaryGapRun,
+        maxPrimaryGap |-> maxPrimaryGap,
         stall |-> stall,
         stallSeen |-> stallSeen, obs |-> obs, verdicts |-> verdicts,
         sheds |-> sheds, zeroShed |-> zeroShed, lastOffer |-> lastOffer,
@@ -264,7 +273,8 @@ Depth(S, x) == IF x = "P" THEN 0 ELSE Cardinality(Chain(S, x))
 \* (c) The leg to child y went down at its dialer x (on_child_link_down).
 ChildDown(S, x, y) ==
     IF x = "P"
-    THEN [S EXCEPT !.children = @ \ {y}, !.drainTo[y] = -1, !.shedPend[y] = FALSE]
+    THEN [S EXCEPT !.children = @ \ {y}, !.drainTo[y] = -1, !.shedPend[y] = FALSE,
+                   !.standbys = @ \ {y}]
     ELSE [S EXCEPT !.relayKids[x] = @ \ {y}]
 
 \* (e) Leg l torn down at its dialer (check_channel_timeouts TearDownLink).
@@ -283,9 +293,14 @@ ShedTo(S, keep) ==
     LET kids == S.children
         ordered == IF HashRank THEN SelectSeq(RankSeq, LAMBDA x : x \in kids)
                    ELSE SelectSeq(S.order, LAMBDA x : x \in kids)
-        kept == {ordered[i] : i \in 1..Min(keep, Len(ordered))}
+        \* "full": each standby's (full-copy) commitment counts against the
+        \* one-stream room first, so the primaries keep what is left
+        room1 == IF StandbyFeed = "full" THEN Max(0, keep - Cardinality(S.standbys)) ELSE keep
+        kept == {ordered[i] : i \in 1..Min(room1, Len(ordered))}
         victims == kids \ kept
         S1 == [S EXCEPT !.children = kept, !.room = 1,
+                        !.standbys = IF StandbyFeed = "full" THEN (@ \cup victims) \ kept
+                                     ELSE IF StandbyFeed \in {"fix", "fix2"} THEN {} ELSE @,
                         !.firstShedAt = IF @ < 0 /\ victims /= {} THEN S.now ELSE @,
                         !.firstShedQ = IF @ < 0 /\ victims /= {} THEN QDelayS(S) ELSE @,
                         !.zeroShed = @ \/ (kept = {} /\ kids /= {}),
@@ -326,7 +341,7 @@ MediaTo(S, s, set, t) ==
 PAdmit(S, l) ==
     IF l \in S.children THEN SendCtrl(S, <<"P", l>>, Pay("admit"))
     ELSE IF Cardinality(S.children) < S.room
-    THEN SendCtrl([S EXCEPT !.children = @ \cup {l},
+    THEN SendCtrl([S EXCEPT !.children = @ \cup {l}, !.standbys = @ \ {l},
                             !.order = Append(SelectSeq(@, LAMBDA x : x /= l), l),
                             !.drainTo[l] = -1, !.shedPend[l] = FALSE],
                   <<"P", l>>, Pay("admit"))
@@ -351,10 +366,18 @@ OnAdmit(S, l, x) ==
              \* a move made because P's media came late says so: P reads it
              \* as congestion (ReceiverMoves)
              why == IF S.lateMove[l] /\ old = "P" THEN "unsub_late" ELSE "unsub"
-             S2 == IF old \notin {None, x} THEN SendCtrl(S1, <<l, old>>, Pay(why)) ELSE S1
+             \* the selector demotes the old primary to a warm standby after a
+             \* make-before-break switch (selector.rs module docs): with
+             \* standbys modelled, a late mover keeps P as its standby (P hears
+             \* the late departure through the role change: "standby_late")
+             \* "fix2": a LATE move never keeps P as a standby (it unsubscribes)
+             keepsP == StandbyFeed /= "none" /\ old = "P" /\ x /= "P"
+                       /\ ~(StandbyFeed = "fix2" /\ S.lateMove[l])
+             S2 == IF keepsP THEN SendCtrl(S1, <<l, old>>, Pay(IF S.lateMove[l] THEN "standby_late" ELSE "standby"))
+                   ELSE IF old \notin {None, x} THEN SendCtrl(S1, <<l, old>>, Pay(why)) ELSE S1
              \* a publisher that shed this node make-before-break is told once
              \* the replacement is up (alm.rs draining_parent)
-             S3 == IF S.shedBy[l] = "P" /\ x /= "P" /\ old /= "P"
+             S3 == IF S.shedBy[l] = "P" /\ x /= "P" /\ old /= "P" /\ StandbyFeed /= "full"
                    THEN SendCtrl(S2, <<l, "P">>, Pay("unsub")) ELSE S2
          IN S3
 
@@ -379,11 +402,21 @@ Handle(S, pay, s, r) ==
       [] pay.p = "unsub_late" \/ (pay.p = "unsub" /\ DepartureHolds /\ r = "P" /\ s \in S.children) ->
             LET kids == S.children \ {s}
             IN [S EXCEPT !.children = kids, !.drainTo[s] = -1, !.shedPend[s] = FALSE,
+                         !.standbys = @ \ {s},
                          !.room = Max(1, Cardinality(kids)), !.lastCong = S.now,
                          !.probeFails = IF ProbeBackoff THEN Min(@ + 1, 2) ELSE @]
+      [] pay.p \in {"standby", "standby_late"} /\ r = "P" ->
+            LET kids == S.children \ {s}
+                late == pay.p = "standby_late" \/ (DepartureHolds /\ s \in S.children)
+            IN [S EXCEPT !.children = kids, !.standbys = @ \cup {s}, !.drainTo[s] = -1,
+                         !.shedPend[s] = FALSE,
+                         !.room = IF late THEN Max(1, Cardinality(kids)) ELSE @,
+                         !.lastCong = IF late THEN S.now ELSE @,
+                         !.probeFails = IF late /\ ProbeBackoff THEN Min(@ + 1, 2) ELSE @]
       [] pay.p = "unsub" ->
             IF r = "P"
-            THEN [S EXCEPT !.children = @ \ {s}, !.drainTo[s] = -1, !.shedPend[s] = FALSE]
+            THEN [S EXCEPT !.children = @ \ {s}, !.drainTo[s] = -1, !.shedPend[s] = FALSE,
+                           !.standbys = @ \ {s}]
             ELSE [S EXCEPT !.relayKids[r] = @ \ {s}]
       [] OTHER -> S
 
@@ -558,7 +591,7 @@ Subscribe(S, l, x) ==
 
 LWatch1(S, l, k) ==
     IF ~Alive(S, l) THEN S
-    ELSE LET S1 == IF S.parent[l] /= None /\ ~S.peerUp[<<S.parent[l], l>>]
+    ELSE LET S1 == IF S.parent[l] /= None /\ (~S.peerUp[<<S.parent[l], l>>] \/ ~S.up[<<l, S.parent[l]>>])
                    THEN [S EXCEPT !.boUntil[l][S.parent[l]] = S.now + Backoff,
                                   !.parent[l] = None]
                    ELSE S
@@ -668,8 +701,10 @@ Offers(S) == Flush(OffersOver(S, Nodes))
 \* P publishes one tick of media to its children and the drained.
 Publish(S) ==
     IF ~Alive(S, "P") THEN S
-    ELSE LET to == {c \in L : (c \in S.children \/ S.drainTo[c] >= S.now) /\ S.up[<<"P", c>>]}
-             S1 == [S EXCEPT !.published = IF InWin(S.now) THEN @ + 1 ELSE @]
+    ELSE LET sb == IF StandbyFeed = "full" \/ (StandbyFeed \in {"fix", "fix2"} /\ ~S.stall) THEN S.standbys ELSE {}
+             to == {c \in L : (c \in S.children \/ S.drainTo[c] >= S.now \/ c \in sb) /\ S.up[<<"P", c>>]}
+             S1 == [S EXCEPT !.published = IF InWin(S.now) THEN @ + 1 ELSE @,
+                             !.maxStallCopies = IF S.stall THEN Max(@, Cardinality(to)) ELSE @]
              per == IF StallDrain /\ S.stall THEN Max(1, (M * DrainPct) \div 100) ELSE M
          IN IF to = {} THEN S1
             ELSE Emit(S1, "P", Item("media", <<"P", "P">>, 0, 0, 0, NoPay, "P", to, S.now),
@@ -738,6 +773,12 @@ OwnSlowStaysS(S) == ~S.slowMoved
 \* RM4: after a shed P is never left with no direct child (beyond two watch
 \* ticks: a move in flight).
 NeverDrainedS(S) == S.maxZeroRun <= 2 * WatchEvery
+\* F12: under a latched stall verdict, P's media egress for its stream is at
+\* most one copy.
+EgressOneCopyS(S) == S.maxStallCopies <= 1
+\* F12: while P has any subscriber (a standby counts), it has a primary
+\* (beyond two watch ticks).
+OnePrimaryS(S) == S.maxPrimaryGap <= 2 * WatchEvery
 \* Every Channel message is proved or its link torn within the held bound.
 NothingWaitsForeverS(S) ==
     \A l \in {x \in Legs : Alive(S, x[1])} : \A i \in 1..Len(S.chan[l]) :
@@ -778,7 +819,7 @@ Bad(S) ==
     {n \in {"NoSpuriousTeardown", "KeepsOneChild", "NeverTwoParents", "MakeBeforeBreak",
             "NothingWaitsForever", "ReparentBound", "EndParented", "EndHeard",
             "EndFullFanOut", "DeadDetected", "EndQueueDrained",
-            "NoIdleWithOffer", "StallShedGap", "OwnSlowStays", "NeverDrained"} :
+            "NoIdleWithOffer", "StallShedGap", "OwnSlowStays", "NeverDrained", "EgressOneCopy", "OnePrimary"} :
         CASE n = "NoSpuriousTeardown" -> ~NoSpuriousTeardownS(S)
           [] n = "KeepsOneChild" -> ~KeepsOneChildS(S)
           [] n = "NeverTwoParents" -> ~NeverTwoParentsS(S)
@@ -793,7 +834,9 @@ Bad(S) ==
           [] n = "NoIdleWithOffer" -> ~NoIdleWithOfferS(S)
           [] n = "StallShedGap" -> ~StallShedGapS(S)
           [] n = "OwnSlowStays" -> ~OwnSlowStaysS(S)
-          [] n = "NeverDrained" -> ~NeverDrainedS(S)}
+          [] n = "NeverDrained" -> ~NeverDrainedS(S)
+          [] n = "EgressOneCopy" -> ~EgressOneCopyS(S)
+          [] n = "OnePrimary" -> ~OnePrimaryS(S)}
 
 -----------------------------------------------------------------------------
 LegName(l) == l[1] \o ">" \o l[2]
@@ -889,6 +932,10 @@ Step(S, ch) ==
                                           THEN S10.now ELSE @,
                            !.fullAt = IF @ < 0 /\ \A c \in {x \in L : Alive(S10, x)} : S10.parent[c] = "P" THEN S10.now ELSE @,
 
+                           !.primaryGapRun = IF S10.children = {} /\ S10.standbys /= {} /\ Alive(S10, "P")
+                                             THEN @ + 1 ELSE 0,
+                           !.maxPrimaryGap = Max(@, IF S10.children = {} /\ S10.standbys /= {} /\ Alive(S10, "P")
+                                                    THEN S10.primaryGapRun + 1 ELSE 0),
                            !.zeroRun = IF S10.firstShedAt >= 0 /\ Alive(S10, "P") /\ S10.children = {}
                                        THEN @ + 1 ELSE 0,
                            !.maxZeroRun = Max(@, IF S10.firstShedAt >= 0 /\ Alive(S10, "P") /\ S10.children = {}
@@ -923,6 +970,7 @@ Init ==
     /\ maxMediaGap = 0 /\ idleCand = [c \in L |-> 0]
     /\ lastFromParent = [c \in L |-> 0] /\ drainClear = -1 /\ capEndQ = -1 /\ slowMoved = FALSE
     /\ offerDirect = [c \in L |-> [n \in Nodes |-> FALSE]] /\ zeroRun = 0 /\ maxZeroRun = 0
+    /\ standbys = {} /\ maxStallCopies = 0 /\ primaryGapRun = 0 /\ maxPrimaryGap = 0
     /\ dialAt = [l \in Legs |-> 0] /\ dialBo = [l \in Legs |-> DialMin]
     /\ pathAt = [l \in Legs |-> 0]
     /\ children = {} /\ order = <<>> /\ drainTo = [c \in L |-> -1]
@@ -961,7 +1009,9 @@ Assign(S) ==
     /\ shedAtL' = S.shedAtL /\ maxParentGap' = S.maxParentGap /\ lastNewAt' = S.lastNewAt
     /\ maxMediaGap' = S.maxMediaGap /\ idleCand' = S.idleCand
     /\ lastFromParent' = S.lastFromParent /\ drainClear' = S.drainClear /\ capEndQ' = S.capEndQ /\ slowMoved' = S.slowMoved
-    /\ offerDirect' = S.offerDirect /\ zeroRun' = S.zeroRun /\ maxZeroRun' = S.maxZeroRun /\ dialAt' = S.dialAt
+    /\ offerDirect' = S.offerDirect /\ zeroRun' = S.zeroRun /\ maxZeroRun' = S.maxZeroRun
+    /\ standbys' = S.standbys /\ maxStallCopies' = S.maxStallCopies
+    /\ primaryGapRun' = S.primaryGapRun /\ maxPrimaryGap' = S.maxPrimaryGap /\ dialAt' = S.dialAt
     /\ dialBo' = S.dialBo /\ pathAt' = S.pathAt /\ children' = S.children
     /\ order' = S.order /\ drainTo' = S.drainTo /\ shedPend' = S.shedPend
     /\ room' = S.room /\ demand' = S.demand /\ lastCong' = S.lastCong /\ lastWiden' = S.lastWiden
@@ -1038,6 +1088,7 @@ Observed ==
      first_verdict |-> firstVerdictAt, first_shed |-> firstShedAt, q_at_shed |-> firstShedQ,
      full_at |-> fullAt, parent_gap |-> maxParentGap, media_gap |-> maxMediaGap,
      drain_clear |-> drainClear, cap_end_q |-> capEndQ, zero_direct |-> maxZeroRun,
+     stall_copies |-> maxStallCopies, primary_gap |-> maxPrimaryGap, verdict_rises |-> verdicts,
      heard_pct |-> [c \in L |-> IF published = 0 THEN 100 ELSE (100 * heard[c]) \div published]]
 \* One line per terminal state: the outcome, the violated set, what is observed.
 RecordOutcome == Over => PrintT(<<"OUTCOME", Outcome, bad, Observed>>)
@@ -1059,4 +1110,8 @@ NoIdleWithOffer == NoIdleWithOfferS(Rec)
 StallShedGap == StallShedGapS(Rec)
 T_NoIdleWithOffer == NoIdleWithOffer \/ Dump
 T_StallShedGap == StallShedGap \/ Dump
+EgressOneCopy == EgressOneCopyS(Rec)
+OnePrimary == OnePrimaryS(Rec)
+T_EgressOneCopy == EgressOneCopy \/ Dump
+T_OnePrimary == OnePrimary \/ Dump
 =============================================================================
