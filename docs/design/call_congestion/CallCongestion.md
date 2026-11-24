@@ -148,7 +148,43 @@ There is no TLC deadlock: `Tick` is enabled until the horizon. A halting state i
 
 ## Results
 
-(filled from run_matrix.py output below)
+The final run is in `results/` (`matrix.json`, `matrix.md`, `quality.md`). The tables below are generated from those files: `run_matrix.py OUTDIR --reparse` and `summarise.py OUTDIR`.
+
+- **Reachability, not likelihood.** Every figure is over all reachable behaviours of the scenario: every offer phase of P (10), the listeners' phase, the window phase, the room a shed leaves, the tie-break and the re-punch time.
+- **Tick and run length.** A tick is 100 ms. The cap holds 1–5 s (ticks 10–49) unless a row says "cap held"; the horizon is 26 s.
+
+### The findings, in the order they were found
+
+- **R1 — the baseline reproduces F1 and F2 (and F9).** The cap lands at t=10. P's offer of t=13 is retried at 14, 16, 18 and 21. Without per-attempt receipts every proof answers a replaced receipt and is dropped. P's three legs are torn `exhausted` at t=26, 1.6 s after the cap, with P alive. The listeners' legs toward P die at 2.3 s: their proofs leave through P's queue (F9).
+  - Over all phases (summarise): the verdict at 0.6 / 1.0 / 1.6 s; the window shed at 1.0 / 1.5 / 2.0 s, with 1.5 / 2.1 / 2.9 s of queue at the shed (F10's 0.9–2.2 s).
+  - With setup cost (`baseline-setup`), teardowns add redials whose setups refill the queue (F11): peak queue up to 8.2 s against 3.3 s without. The reachable cycle is teardown → redial → deeper queue → more teardowns.
+- **R2 — a late shed cannot save the links by itself.** After a shed to one child, a 1.33-copy uplink drains at only cap − one copy (− control). A backlog past ~1.2 s therefore outlives the retry ladder for seconds.
+- **R3 — the #113 hold rarely fires on call legs.** Legs are one-way. The only authenticated inbound on P>A is proofs. At ~1 Hz control, the proof of the previous message has come back before the stuck one is sent, unless the queue is already longer than the offer interval.
+- **R4 — the six switches of the brief are not enough** (six-on: Collapsed or Starved). The proofs that RTO learning and the hold need ride the queue they should measure. When the cap lands just after P's offer timer, no sample arrives before the 1.3 s ladder runs out, and the shed notice and the drain ride the same queue.
+- **R5 — what the model found missing:**
+  1. **PeerLiveness** (leviculum PeerEvidenceHold): evidence from the same peer on any leg.
+  2. **ReceiverMoves**: a late child moves itself; its unsubscribe beats P's queue.
+  3. **The late departure as a congestion signal.**
+  4. **ProbeBackoff**: without it the model oscillates (probe → return → late → leave).
+  - With these, every property holds (`all-on`, `cap-stays-all-on`).
+- **R6 — SlowStart helps only a call that starts capped.** It costs recovery time after a lift (bounded by the backoff, stated in EndFullFanOut).
+- **R7 — the minimum safety set.** PeerLiveness + ShedOnVerdict + RoomKeepsOne + ProbeBackoff + SerialRedial, plus FreshEvidence + ConditionalRto and the receipts and hold already in leviculum, has no spurious teardown and never loses its last child. Its leave-one-outs show which switch carries each property.
+  - It misses the stall-shed gap and the quality bound: the shed notice rides P's queue, and after the shed one copy plus control and held retransmits nearly fill the cap.
+- **R8 — the stall-shed gap tracks the queue at the shed.** Gap ≈ q_at_shed + the kept child's next offer + a subscribe round trip. On the minimum set that is 1.2 / 2.1 / 3.2 s at 2.25×.
+  - SilenceFailover gives nothing. In a FIFO the media queued for a victim before the shed is ahead of its notice, so silence starts when the notice comes out.
+  - StallDrain clears the queue faster but does not shorten the gap.
+  - ProbeTwoLegs bounds the verdict (0.6 s) and meets the bound at 1.8×, but not at 2.25×.
+  - Only ReceiverMoves on the hash rank meets gap < 1.5 s and heard > 70 % at 2.25×, 1.8× and 1.5×.
+- **R9 — FreshEvidence requires per-attempt receipts.** Without them, a shed child's leg toward P has no fresh evidence (P sends it no media, P's offers are held to 5 s, retransmits don't count), and the collapse is back (`min-without-receipts`, `cap-stays-min-without-receipts`).
+- **R10 — dead-peer detection = the longest gap between this node's Channel messages on the leg + the cold ladder.** With the stall hold-back on P's offers that gap is 5 s, so P's legs to a peer that died during a latched verdict are detected later than the tight bound (`dead-after-queue-min`). The shipping set mostly never latches the verdict and holds the bound.
+  - Replay cannot hold a link under FreshEvidence (`replay-dead-B-min`); it can without (`replay-dead-B-min-stale-evidence`).
+  - Withholding proofs cannot tear down a link whose peer is visibly alive under PeerLiveness (`delay-proofs-A-ship`); it can without (`delay-proofs-A-no-peer`).
+- **R11 — the shipping set** is the minimum set + ReceiverMoves on the hash rank (scope from offers) + DepartureHolds + OwnDownlinkGuard + SlowStart (probe 2, 10 s hold).
+  - Heard ≥ 99 % with the cap held at 2.25×, 1.8× and 1.5×; peak queue ≤ 0.6 s; no teardown; no oscillation.
+  - Full fan-out after a lift within the stated bound: un-scaled, latch 2 s + window 1 s + the climb from one stream (max(10 s hold, 8 s backoff) + 4 s) + dwell 10 s + window 1 s ≈ 28 s.
+- **R12 — RM4 scopes.** Neither variant ever drained P to zero at N=4. Sparing the lowest-ranked MEMBER is safe here only by timing: the first mover's unsubscribe shrinks P's queue before the next one judges. Sparing the lowest-ranked of P's direct children as the members' offers show them (`offer`) is safe by construction, and needs no wire change.
+- **R13 — an overshoot at 1.5×.** With one sample per watch tick, a second child still reads late 200 ms after the first one left, before the queue has drained. So two leave where one would do, and the climb back costs one more widening. The rule should judge on a sustained, non-falling reading (decision row RM2).
+
 
 ## Decision table
 
@@ -285,6 +321,15 @@ A recorded run conforms when the model, configured with that run's pins, can rea
 
 - `run1_c8699c3d6.json`: from the leviculum#113 comment of 2026-11-24 01:23Z. Per node, the first teardowns were P 1.82 s, A 2.13 s, B 2.13 s, C 1.72 s. 6 exhausted, P had 0 direct children, all 3 listeners were on relays, shed 0, alm_uplink_stall 1, heard ~21 %.
 - `run2_c75fdeb01.json`: only the brief's ranges were available. First teardown at 2.17–2.73 s, the listeners' legs toward P first, P sheds to one child. No per-node file was available to this model (asked calls2; see the report).
+
+**Results of the check** (scenarios `pin-c8699c3d6`, `pin-c75fdeb01`, and `conf-run1` / `conf-run2` with the cap held to the end):
+
+- **Run 2 conforms.** A reachable observation has every listener's first teardown inside 2.17–2.73 s and the listeners' legs toward P torn first (`conf-run2`).
+- **Run 1 does not conform.** C's first teardown at 1.72 s is earlier than any listener teardown the model reaches (≥ 2.3 s): a listener's message needs more than the 1.3 s ladder of queue delay, and the queue grows 1.25 s per second. Two candidates:
+  - P's uplink carried more than three copies plus control in that run (bindings, attendance re-announces);
+  - C's teardown was on a link the model lacks (its identity link through T).
+  - Run 1 predates per-link logging, so the lead classed it as under-instrumented rather than a model gap. It stays open until an instrumented run shows the same early teardown.
+- **The per-link logs** of the later runs were requested from the calls agent and had not arrived when this was written. `trace_check.py --log` reads them directly once they do.
 
 ## References
 

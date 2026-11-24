@@ -51,6 +51,7 @@ def main():
         if not os.path.exists(path):
             continue
         cap = int(dict(BASE, **params)["CAPAT"])
+        dead = dict(BASE, **params)["DEAD"].strip('"')   # a departed node's heard is not judged
         obs = []
         for line in open(path):
             line = line.strip()
@@ -66,7 +67,7 @@ def main():
             stats([o["q_at_shed"] / 10 if o["q_at_shed"] >= 0 else None for o in obs]),
             stats([o["max_qdelay"] / 10 for o in obs]),
             stats([o["qdelay"] / 10 for o in obs]),
-            stats([min(fn(o["heard_pct"]).values()) for o in obs]),
+            stats([min(v for k, v in fn(o["heard_pct"]).items() if k != dead) for o in obs]),
             stats([o["full_at"] / 10 if o["full_at"] >= 0 else None for o in obs]),
             stats([o["parent_gap"] / 10 for o in obs]),
             stats([o["media_gap"] / 10 for o in obs]),

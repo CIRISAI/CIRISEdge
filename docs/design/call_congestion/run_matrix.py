@@ -46,7 +46,7 @@ SWITCH = dict(RPA="ReceiptsPerAttempt", RTO="RtoLearnsDelay", HOLD="Hold113",
               OWNGUARD="OwnDownlinkGuard", DEPHOLD="DepartureHolds", GRACEFUL="Graceful")
 INVS = "TypeOK RecordOutcome"   # the properties fold into `bad`, read per terminal state
 BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RANK="Rank3", RCAP="4", CAPAT="10",
-            CAPUNTIL="50", HORIZON="230", STALE="100", SRTTCAP="17", WATCH="2",
+            CAPUNTIL="50", HORIZON="260", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", DEAD='"none"', INIT="1", SETUP="0",
             DWELL="20", CSTALE="20", GAP="15", M="3", SILENTT="3", DRAINPCT="50", SLOWNODE='"none"', SLOWTICKS="0", SCOPE='"member"', HOLDT="0",
@@ -128,7 +128,7 @@ def scenarios():
                                                      CAPUNTIL="1000")
     yield "cap-stays-ship", dict(SHIP, CAPUNTIL="1000")
     yield "ship-setup", dict(SHIP, **SETUP)
-    yield "ship-unscaled", dict(SHIP, DWELL="100", CSTALE="600", HORIZON="320")
+    yield "ship-unscaled", dict(SHIP, DWELL="100", CSTALE="600", HORIZON="400")
     # (i) a receiver whose own downlink is slow (no cap: P is fine).
     slow = dict(SLOWNODE='"B"', SLOWTICKS="3", CAPAT="1000", CAPUNTIL="1000")
     yield "ship-slow-B", dict(SHIP, **slow)
