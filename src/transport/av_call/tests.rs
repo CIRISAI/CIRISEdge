@@ -1036,3 +1036,46 @@ fn a_reannounce_skips_backlogged_legs_and_a_stalled_uplink() {
         "bounded: a stalled leg still gets one every max rounds"
     );
 }
+
+/// G8 serial redial — under a latched stall verdict at most one leg setup is
+/// in flight; a member heard through a relay is deferred when this node is
+/// stalled or publishes nothing; an unstalled publishing node dials everyone
+/// at once as before.
+#[test]
+fn a_stalled_uplink_redials_one_leg_at_a_time() {
+    assert_eq!(
+        redial_gate(false, true, 3, false),
+        RedialGate::Dial,
+        "unstalled: as before"
+    );
+    assert_eq!(
+        redial_gate(false, true, 3, true),
+        RedialGate::Dial,
+        "publishing, unstalled"
+    );
+    assert_eq!(
+        redial_gate(true, true, 0, false),
+        RedialGate::Dial,
+        "the first setup"
+    );
+    assert_eq!(
+        redial_gate(true, true, 1, false),
+        RedialGate::Wait,
+        "one in flight"
+    );
+    assert_eq!(
+        redial_gate(true, true, 0, true),
+        RedialGate::Defer,
+        "stalled, heard via a relay"
+    );
+    assert_eq!(
+        redial_gate(false, false, 0, true),
+        RedialGate::Defer,
+        "a silent listener"
+    );
+    assert_eq!(
+        redial_gate(false, false, 0, false),
+        RedialGate::Dial,
+        "no relay: dial"
+    );
+}

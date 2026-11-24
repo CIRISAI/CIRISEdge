@@ -4323,14 +4323,82 @@ async fn redial_on_direct_path(shared: Arc<Shared>) {
     }
 }
 
+/// G8 serial redial — what [`reconcile_legs`] does with one member that has
+/// no leg and no dial pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedialGate {
+    /// Dial now.
+    Dial,
+    /// Not this tick: the one setup a stalled uplink allows is in flight.
+    Wait,
+    /// Hold the dial for the probe hold.
+    Defer,
+}
+
+/// G8 serial redial, the transitions. Each leg setup pushes the link, the
+/// PQC transit KEX, a hello and ~10 binding parts through this node's uplink
+/// (~1 s of queue at a capped uplink); after a teardown every leg used to
+/// redial at once (the 18.95 s peak).
+/// - verdict latched ∧ legs down → at most ONE setup in flight (the kept
+///   child first: [`reconcile_legs`] orders it first);
+/// - the member is heard through a relay (every stream it publishes has a
+///   primary other than it) ∧ (verdict latched ∨ this node publishes
+///   nothing, so the leg would carry no media of its own) → redial deferred
+///   by [`alm::STALL_PROBE_HOLD_MS`]: a listener that lost its leg to a
+///   shed publisher pushes no setup through that publisher's queue;
+/// - otherwise dial (an unstalled uplink dials all at once, as before).
+fn redial_gate(
+    stalled: bool,
+    publishing: bool,
+    in_flight: usize,
+    heard_through_relay: bool,
+) -> RedialGate {
+    if heard_through_relay && (stalled || !publishing) {
+        RedialGate::Defer
+    } else if !stalled {
+        RedialGate::Dial
+    } else if in_flight >= 1 {
+        RedialGate::Wait
+    } else {
+        RedialGate::Dial
+    }
+}
+
 /// Dial every member this node has no leg to (and is not already dialling,
 /// and has not just failed to reach).
 fn reconcile_legs(shared: &Arc<Shared>) {
     if shared.ended.load(Ordering::Relaxed) {
         return;
     }
-    let members: Vec<String> = Shared::lock(&shared.members).clone();
+    let mut members: Vec<String> = Shared::lock(&shared.members).clone();
     let now = Instant::now();
+    // G8 serial redial: what the ALM says about this node's uplink and the
+    // members it can already hear through a relay.
+    let (stalled, publishing, kept, relayed): (bool, bool, Vec<String>, Vec<String>) = {
+        let a = Shared::lock(&shared.alm);
+        let kept = a.own_children().into_iter().map(|(p, _)| p).collect();
+        let relayed = members
+            .iter()
+            .filter(|m| {
+                let streams = a.streams_of(m);
+                !streams.is_empty()
+                    && streams
+                        .iter()
+                        .all(|s| a.primary_of(*s).is_some_and(|p| p != **m))
+            })
+            .cloned()
+            .collect();
+        (a.uplink_stalled(), a.publishing(), kept, relayed)
+    };
+    // The kept child first.
+    members.sort_by_key(|m| !kept.contains(m));
+    let mut in_flight = {
+        let dialling = Shared::lock(&shared.dialling);
+        dialling
+            .values()
+            .filter(|u| **u > now + DIAL_BACKOFF_MAX)
+            .count()
+    };
     for m in members {
         if m == shared.own || Shared::lock(&shared.out_legs).contains_key(&m) {
             continue;
@@ -4340,7 +4408,22 @@ fn reconcile_legs(shared: &Arc<Shared>) {
             if dialling.get(&m).is_some_and(|until| *until > now) {
                 continue;
             }
+            match redial_gate(stalled, publishing, in_flight, relayed.contains(&m)) {
+                RedialGate::Dial => {}
+                RedialGate::Wait => continue,
+                RedialGate::Defer => {
+                    // Heard through a relay: no reason to push a setup
+                    // through this uplink now; try again after the hold.
+                    dialling.insert(
+                        m.clone(),
+                        now + Duration::from_millis(alm::STALL_PROBE_HOLD_MS),
+                    );
+                    shared.count(crate::observability::AV_LEG_REDIAL_DEFERRED);
+                    continue;
+                }
+            }
             dialling.insert(m.clone(), now + Duration::from_hours(1));
+            in_flight += 1;
         }
         let s = Arc::clone(shared);
         tokio::spawn(async move {

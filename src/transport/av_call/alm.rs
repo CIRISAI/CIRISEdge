@@ -399,6 +399,12 @@ impl AlmState {
         }
     }
 
+    /// G8 serial redial — whether this node's own stream carried media in
+    /// its last measured window (a silent listener's legs carry no media).
+    pub(super) fn publishing(&self) -> bool {
+        self.own_rate.full_bps > 0.0 || self.own_rate.win_full > 0
+    }
+
     /// G8 — whether the stall verdict holds now (detected, or latched).
     pub(super) fn uplink_stalled(&self) -> bool {
         self.uplink_stall
