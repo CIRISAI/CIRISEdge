@@ -350,6 +350,8 @@ async fn topo(
 struct CappedUplink {
     bytes_per_s: AtomicU64,
     next_free: tokio::sync::Mutex<tokio::time::Instant>,
+    /// The longest any byte has waited to leave (µs): the peak queue delay.
+    peak_us: AtomicU64,
 }
 
 impl CappedUplink {
@@ -357,7 +359,13 @@ impl CappedUplink {
         Arc::new(Self {
             bytes_per_s: AtomicU64::new(0),
             next_free: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            peak_us: AtomicU64::new(0),
         })
+    }
+
+    /// The peak queue delay so far, and reset it.
+    fn take_peak(&self) -> Duration {
+        Duration::from_micros(self.peak_us.swap(0, Ordering::SeqCst))
     }
 
     fn cap_kbit(&self, kbit: u64) {
@@ -375,6 +383,8 @@ impl CappedUplink {
         let start = (*next).max(now);
         let done = start + Duration::from_micros(n as u64 * 1_000_000 / rate);
         *next = done;
+        let waited = u64::try_from(done.duration_since(now).as_micros()).unwrap_or(u64::MAX);
+        self.peak_us.fetch_max(waited, Ordering::SeqCst);
         done
     }
 }
@@ -3442,17 +3452,45 @@ async fn a_serve_seat_in_the_room_never_relays() {
 
 /// Publish 600 B frames at 30 Hz from `cp` for `secs`, from `seq0`.
 async fn publish_capped_for(cp: &mut Call, secs: u64, seq0: u64) -> u64 {
+    publish_timed_for(cp, secs, seq0).await.0
+}
+
+/// How long each `publish()` call took: `(max, p95, p50)`.
+#[derive(Debug, Clone, Copy)]
+struct PublishLatency {
+    max: Duration,
+    p95: Duration,
+    p50: Duration,
+}
+
+/// [`publish_capped_for`], timing every `publish()` call (the host's capture
+/// loop waits on it).
+async fn publish_timed_for(cp: &mut Call, secs: u64, seq0: u64) -> (u64, PublishLatency) {
     let size = cp.chunk_plaintext_budget().unwrap_or(240).min(600);
     let mut seq = seq0;
+    let mut took: Vec<Duration> = Vec::new();
     let end = tokio::time::Instant::now() + Duration::from_secs(secs);
     while tokio::time::Instant::now() < end {
         let mut b = body("p", seq);
         b.resize(size, b'.');
+        let t = tokio::time::Instant::now();
         let _ = cp.publish(Frame::opaque(b)).await;
+        took.push(t.elapsed());
         seq += 1;
         tokio::time::sleep(Duration::from_millis(33)).await;
     }
-    seq
+    took.sort();
+    let at = |q: usize| {
+        took.get((took.len() * q / 100).min(took.len().saturating_sub(1)))
+            .copied()
+    };
+    let lat = PublishLatency {
+        max: took.last().copied().unwrap_or_default(),
+        p95: at(95).unwrap_or_default(),
+        p50: at(50).unwrap_or_default(),
+    };
+    eprintln!("[G8] publish latency over {} calls: {lat:?}", took.len());
+    (seq, lat)
 }
 
 /// Every link `m` saw closed by Channel retry exhaustion, either side
@@ -3602,8 +3640,10 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
         })
     };
     let capped_from = seq;
+    let _ = uplink.take_peak();
     let seq = publish_capped_for(&mut cp, 30, seq).await;
     sampler.abort();
+    let peak = uplink.take_peak();
     let sent = seq - capped_from;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let heard = drain(&mut rx, &p.key.key_id);
@@ -3622,7 +3662,7 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
         .filter(|x| x.as_deref() == Some(p.key.key_id.as_str()))
         .count();
     let context = format!(
-        "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
+        "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; peak queue {peak:?}; parents {parents:?}; P children {:?}; P counts {:?}; \
          ChannelExhausted {exhausted}; torn {torn}; first teardown after the cap (P, A, B, C, T) {:?}; P legs {:?}",
         cp.alm_own_children(),
         cp.alm_counts(),
@@ -3652,6 +3692,129 @@ async fn a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed() {
         }
     }
     eprintln!("[G8] capped publisher: {context}; failed {failed:?}");
+    assert!(failed.is_empty(), "{failed:?}: {context}");
+    drop(listeners);
+    drop(cp);
+}
+
+/// **G8 slow start — a call that STARTS on a capped uplink.** The same
+/// room and cap as [`a_capped_publisher_sheds_to_one_child_and_the_rest_are_relayed`]
+/// (one copy of `P`'s stream and a third to spare), but capped before the
+/// call's first chunk: `P` starts at one direct child into its unmeasured
+/// uplink, the others hear it through that child, and a step up that the
+/// uplink cannot carry is taken back by the stall verdict before any link's
+/// retry budget is spent. No link dies; every listener has a parent and
+/// hears most of what `P` published.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_call_that_starts_on_a_capped_uplink_keeps_every_link() {
+    let _call = one_call().await;
+    let tag = "alm2-capstart";
+    let uplink = CappedUplink::new();
+    let (nodes, groups, _tmp) = topo_capped(
+        tag,
+        5,
+        4,
+        &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ],
+        Some(4),
+        Some((0, Arc::clone(&uplink))),
+    )
+    .await;
+    let p = &nodes[0];
+    let mut cp = join_loaded(p, &groups[0], tag, relay_opts(), None).await;
+    // Capped before any leg is up or any chunk flows (the same scale as the
+    // capped witness: a 600 B frame's copy plus ~170 B of framing, 30/s).
+    let frame = cp.chunk_plaintext_budget().unwrap_or(240).min(600) as u64;
+    let copy_kbit = (frame + 170) * 8 * 30 / 1000;
+    uplink.cap_kbit(copy_kbit * 13 / 10);
+    let exhausted_before: u64 = nodes.iter().map(|n| channel_exhausted(&n.metrics)).sum();
+    let torn_before: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum();
+    tracing::info!(
+        target: "ciris_edge::link_close",
+        names = ?nodes
+            .iter()
+            .zip(["P", "A", "B", "C", "T"])
+            .map(|(n, r)| (r, n.key.key_id.clone()))
+            .collect::<Vec<_>>(),
+        "G8 cap on"
+    );
+    let mut listeners = Vec::new();
+    for (i, g) in groups.iter().enumerate().skip(1) {
+        listeners.push(join_loaded(&nodes[i], g, tag, relay_opts(), None).await);
+    }
+    wait_legs(&cp, 3).await;
+    for l in &listeners {
+        wait_legs(l, 3).await;
+    }
+    let mut rx: Vec<mpsc::Receiver<ReceivedFrame>> = listeners
+        .iter_mut()
+        .map(|l| l.frames().expect("frames"))
+        .collect();
+    let _ = uplink.take_peak();
+    let sent = publish_capped_for(&mut cp, 20, 0).await;
+    let peak = uplink.take_peak();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let heard: Vec<u64> = rx
+        .iter_mut()
+        .map(|r| {
+            let mut n = 0u64;
+            while let Ok(f) = r.try_recv() {
+                if f.publisher == p.key.key_id {
+                    n += 1;
+                }
+            }
+            n
+        })
+        .collect();
+    let exhausted: u64 = nodes
+        .iter()
+        .map(|n| channel_exhausted(&n.metrics))
+        .sum::<u64>()
+        - exhausted_before;
+    let torn: u64 = nodes.iter().map(|n| torn_down(&n.metrics)).sum::<u64>() - torn_before;
+    let parents: Vec<Option<String>> = listeners
+        .iter()
+        .map(|l| primary_for(l, cp.stream()))
+        .collect();
+    let direct = parents
+        .iter()
+        .filter(|x| x.as_deref() == Some(p.key.key_id.as_str()))
+        .count();
+    let context = format!(
+        "copy {copy_kbit} kbit/s; sent {sent}; heard {heard:?}; peak queue {peak:?}; parents {parents:?}; \
+         P children {:?}; P counts {:?}; ChannelExhausted {exhausted}; torn {torn}",
+        cp.alm_own_children(),
+        (cp.alm_counts(), av(&p.metrics, "alm_uplink_stall")),
+    );
+    let mut failed: Vec<String> = Vec::new();
+    if torn != 0 || exhausted != 0 {
+        failed.push(format!(
+            "links torn down: {torn} ({exhausted} by retry exhaustion)"
+        ));
+    }
+    if direct != 1 {
+        failed.push(format!("P's direct children: {direct}, want 1"));
+    }
+    if parents.iter().any(Option::is_none) {
+        failed.push("a listener has no parent".to_owned());
+    }
+    for (i, n) in heard.iter().enumerate() {
+        if *n * 10 < sent * 7 {
+            failed.push(format!("listener {i} heard {n} of {sent}"));
+        }
+    }
+    eprintln!("[G8] capped from the start: {context}; failed {failed:?}");
     assert!(failed.is_empty(), "{failed:?}: {context}");
     drop(listeners);
     drop(cp);

@@ -6,6 +6,7 @@ Every token in this file is **frozen for 45.x**. Later releases only add tokens;
 
 ## Host defaults (the host decides, edge does not)
 
+- A publisher starts with TWO direct children and widens as its uplink shows room (slow start). The cost: in a room of four or more, members beyond the second hear the publisher through a member relay first, and move to it directly only once it has room (a voluntary switch, seconds later). After an uplink stall it widens nothing for 10 s.
 - `CallOptions::relay: bool` is unchanged. The server passes `true` for member nodes and `false` for canonicals and for a client on a metered or mobile network.
 - Edge adds one rule of its own: **a serve seat never relays call media, audio included**, whatever `relay` says. The rule is applied on every transport the Edge was built with, whichever builder method registered it. A call on a transport that was given no seat set logs an ERROR. The lever is `av_call::CANONICAL_AV_FALLBACK = false` on 45.x.
 
@@ -124,6 +125,7 @@ On leviculum v0.34.0+ciris.3 every NAT field reads `unknown` / `none`, because n
 | `relay_serve_seat` | This serve seat refused a relay SUBSCRIBE. The wire says `relay_class_refused`. |
 | `alm_offer_refused:serve_seat` | A serve seat's OFFER for a stream it does not publish, dropped. |
 | `alm_uplink_stall` | This node's uplink stalled: two or more legs held a control message unproved past 400 ms. It sheds to one child. |
+| `alm_offer_held:backlog` | A periodic offer not sent on a leg whose oldest control message waited 200 ms past that leg's own round trip. 45.2.0 also raises `alm_uplink_stall` when every leg with something unproved (two or more) is backlogged like this, and the shed happens at once. |
 | `direct_link_released_link_closed` | A direct path forgotten because its link closed; the next dial re-punches at once, once per peer per 60 s. |
 | `holder_rank:direct` / `:peer_relay` / `:other` / `:seat_only` | How the best holder of a blob fetch was reached. A fetch asks only the best-ranked holders. |
 

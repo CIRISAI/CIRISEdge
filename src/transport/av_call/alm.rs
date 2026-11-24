@@ -9,10 +9,13 @@
 //! What it runs:
 //!
 //! - **This node's stream, as parent 0**: an [`Admission`] (C2) answering the
-//!   other members' C3 `SUBSCRIBE`s. A small room starts as the full mesh it
-//!   always was (the publisher's probe allowance is the room, up to
-//!   [`PUBLISHER_INITIAL_FANOUT`]); measured congestion then sheds the most
-//!   recent subscribers to member relays (T7).
+//!   other members' C3 `SUBSCRIBE`s. A publisher starts at
+//!   [`PUBLISHER_INITIAL_PROBE`] direct children into an unmeasured uplink
+//!   and widens one step a clean window while members wait (G8 slow
+//!   start: the rest hear it through the first child meanwhile); measured
+//!   congestion, or an uplink-stall verdict, sheds the most recent
+//!   subscribers to member relays (T7) and holds the probe
+//!   [`STALL_PROBE_HOLD_MS`].
 //! - **Every other member's stream, as subscriber**: a [`ParentSelector`]
 //!   (C4/C6) choosing among the publisher itself and the members that
 //!   forward it, from their C3 `OFFER`s. Room membership gates candidacy
@@ -47,9 +50,19 @@ use crate::transport::realtime_av_alm::controller::{
 
 /// How often a forwarder offers each stream it can serve.
 pub(super) const OFFER_EVERY_MS: u64 = 1_000;
-/// The publisher's starting probe allowance, in streams: a small room is
-/// served as the full mesh it was; measurement then rules.
-pub(super) const PUBLISHER_INITIAL_FANOUT: u64 = 8;
+/// The publisher's starting probe allowance, in streams (G8 slow start): an
+/// unmeasured uplink takes two copies first (a three-person room is the full
+/// mesh it was), and the probe widens while members wait for it. Full fan-out from the first
+/// chunk overloaded a capped uplink at once (the 45.1.9 matrix: 250 kbit
+/// against three copies of ~190).
+pub(super) const PUBLISHER_INITIAL_PROBE: u64 = 2;
+/// G8 — after an uplink-stall verdict, how long nothing widens this node's
+/// rooms (`Admission::hold_probe`).
+pub(super) const STALL_PROBE_HOLD_MS: u64 = 10_000;
+/// G8 slow start — how long a member refused for room still gets the
+/// publisher's chunks: two offer periods, so a child's OFFER has reached it
+/// and it has moved before the bridge ends.
+pub(super) const SLOW_START_BRIDGE_MS: u64 = 2 * OFFER_EVERY_MS;
 /// How long a C3 peer that has not yet chosen a parent for this node's
 /// stream keeps receiving it (the join gap: join jitter + one offer + one
 /// round trip). Past it, a peer that chose nothing gets nothing.
@@ -337,8 +350,8 @@ impl AlmState {
         cfg.direct_first = true;
         let mut own = Admission::publisher(me.to_owned(), cfg.clone(), None);
         own.set_members(members.iter().cloned());
-        let fanout = (members.len().saturating_sub(1) as u64).clamp(1, PUBLISHER_INITIAL_FANOUT);
-        own.set_probe_streams(fanout);
+        own.set_slow_start(true);
+        own.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         Self {
             me: me.to_owned(),
             egress: EgressMeter::new(cfg.meter_window_ms, cfg.congestion_queue_ms),
@@ -419,8 +432,23 @@ impl AlmState {
             .is_some_and(|t| now.saturating_sub(t) < UPLINK_STALL_LATCH_MS);
         let rose = stalled && !self.uplink_stall;
         self.uplink_stall = stalled;
+        if detected {
+            // No upward re-probe until a hold past the last detection.
+            let until = now.saturating_add(STALL_PROBE_HOLD_MS);
+            self.own.hold_probe(until);
+            for (a, _) in self.shares.values_mut() {
+                a.hold_probe(until);
+            }
+            for a in self.relays.values_mut() {
+                a.hold_probe(until);
+            }
+        }
         if rose {
             self.label(crate::observability::ALM_UPLINK_STALL);
+            // Nobody unsubscribed keeps this node's own chunks on a stalled
+            // uplink (the provisional join window, the slow-start bridge).
+            let own: Vec<StreamId> = self.own_admissions().map(|(s, _)| s).collect();
+            self.provisional.retain(|(s, _), _| !own.contains(s));
             let w = EgressWindow {
                 sent_bps: 0.0,
                 delivered_bps: 0.0,
@@ -1038,9 +1066,8 @@ impl AlmState {
         }
         let mut a = Admission::publisher(self.me.clone(), self.cfg.clone(), None);
         a.set_members(self.members.iter().cloned());
-        let fanout =
-            (self.members.len().saturating_sub(1) as u64).clamp(1, PUBLISHER_INITIAL_FANOUT);
-        a.set_probe_streams(fanout);
+        a.set_slow_start(true);
+        a.set_probe_streams(PUBLISHER_INITIAL_PROBE);
         self.shares.insert(stream, (a, Rate::default()));
         let now = self.now_ms();
         let c3: Vec<String> = self
@@ -1321,8 +1348,32 @@ impl AlmState {
                     a.set_external_committed(ext);
                     let d = a.request(now, &req, &mut rng, &mut log);
                     let pre = a.take_preempted();
+                    let unmeasured = a.ceiling_bps().is_none();
                     self.rng = rng;
                     self.log = log;
+                    // G8 slow start — a member the probe has no room for yet
+                    // keeps this node's chunks for SLOW_START_BRIDGE_MS, while
+                    // the first children start offering the stream, so the
+                    // move to a relay costs it nothing. Only while the uplink
+                    // is unmeasured, and not when it is stalled: there the
+                    // bridge is the overload.
+                    if unmeasured
+                        && !self.uplink_stall
+                        && matches!(
+                            d,
+                            AdmitDecision::Refuse {
+                                reason: RefuseReason::Capacity,
+                                ..
+                            }
+                        )
+                    {
+                        let since = now.saturating_sub(PROVISIONAL_MS - SLOW_START_BRIDGE_MS);
+                        let e = self
+                            .provisional
+                            .entry((stream, peer.to_owned()))
+                            .or_insert(since);
+                        *e = (*e).max(since);
+                    }
                     (d, pre)
                 } else if self.relays.contains_key(&stream) {
                     let ext = self.external_except(stream);
@@ -2415,39 +2466,7 @@ mod tests {
     /// offers pause, and the stall is counted once on the rise.
     #[test]
     fn a_stalled_uplink_sheds_the_publisher_to_one_child() {
-        let roster4: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
-        let mut a = AlmState::new("a", s(1), &roster4, true, 1);
-        let mut rng = SplitMix64(5);
-        let mut log = DecisionLog::default();
-        for p in ["b", "c", "d"] {
-            let d = a.own.request(
-                0,
-                &SubscribeRequest {
-                    subscriber: p.into(),
-                    role: Role::Primary,
-                    forward_capable: true,
-                    layers: None,
-                },
-                &mut rng,
-                &mut log,
-            );
-            assert!(matches!(d, AdmitDecision::Admit { .. }), "{p}: {d:?}");
-        }
-        assert_eq!(a.own_children().len(), 3);
-        // Media flows a while, so the stream has a measured rate.
-        for _ in 0..6 {
-            for _ in 0..30 {
-                a.on_own_published(600, true);
-                a.on_sent("b", 700);
-            }
-            a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
-            let _ = a.tick(&[]);
-        }
-        assert_eq!(
-            a.own_children().len(),
-            3,
-            "no shed while the uplink is clean"
-        );
+        let mut a = publisher_with(&["b", "c", "d"]);
         a.set_uplink_stall(true);
         a.set_uplink_stall(true);
         assert_eq!(
@@ -2495,19 +2514,35 @@ mod tests {
         let mut a = AlmState::new("a", s(1), &roster4, true, 1);
         let mut rng = SplitMix64(5);
         let mut log = DecisionLog::default();
+        // Slow start: each child after the probe's two is admitted once a
+        // clean window has shown the uplink carrying the ones before it.
         for p in kids {
-            let d = a.own.request(
-                0,
-                &SubscribeRequest {
-                    subscriber: (*p).into(),
-                    role: Role::Primary,
-                    forward_capable: true,
-                    layers: None,
-                },
-                &mut rng,
-                &mut log,
-            );
-            assert!(matches!(d, AdmitDecision::Admit { .. }), "{p}: {d:?}");
+            let mut d = None;
+            for _ in 0..4 {
+                let now = a.now_ms();
+                let r = a.own.request(
+                    now,
+                    &SubscribeRequest {
+                        subscriber: (*p).into(),
+                        role: Role::Primary,
+                        forward_capable: true,
+                        layers: None,
+                    },
+                    &mut rng,
+                    &mut log,
+                );
+                if matches!(r, AdmitDecision::Admit { .. }) {
+                    d = Some(r);
+                    break;
+                }
+                for _ in 0..30 {
+                    a.on_own_published(600, true);
+                    a.on_sent("b", 700);
+                }
+                a.t0 = a.t0.checked_sub(Duration::from_secs(1)).expect("clock");
+                let _ = a.tick(&[]);
+            }
+            assert!(d.is_some(), "{p} admitted within four clean windows");
         }
         for _ in 0..6 {
             for _ in 0..30 {
@@ -2564,6 +2599,61 @@ mod tests {
                 .expect("clock");
         a.set_uplink_stall(false);
         assert!(!a.uplink_stalled(), "released after the latch");
+    }
+
+    /// G8 — after a stall verdict nothing widens the publisher's room for
+    /// [`STALL_PROBE_HOLD_MS`]: a member refused meanwhile (the demand that
+    /// would step the ceiling up a clean window) waits the hold out, then one
+    /// step admits it.
+    #[test]
+    fn no_upward_probe_for_a_hold_after_a_stall() {
+        let mut a = publisher_with(&["b"]);
+        let mut rng = SplitMix64(9);
+        let mut log = DecisionLog::default();
+        let c = SubscribeRequest {
+            subscriber: "c".to_owned(),
+            role: Role::Primary,
+            forward_capable: true,
+            layers: None,
+        };
+        let media = |a: &mut AlmState, ms: u64| {
+            for _ in 0..30 {
+                a.on_own_published(600, true);
+                a.on_sent("b", 700);
+            }
+            a.t0 = a.t0.checked_sub(Duration::from_millis(ms)).expect("clock");
+        };
+        a.set_uplink_stall(true);
+        let _ = a.tick(&[]);
+        let mut waited = 0u64;
+        while waited + 1_000 < STALL_PROBE_HOLD_MS {
+            media(&mut a, 1_000);
+            waited += 1_000;
+            a.set_uplink_stall(false);
+            let _ = a.tick(&[]);
+            let now = a.now_ms();
+            let d = a.own.request(now, &c, &mut rng, &mut log);
+            assert!(
+                !matches!(d, AdmitDecision::Admit { .. }),
+                "admitted {waited} ms after the stall"
+            );
+        }
+        let mut admitted = false;
+        for _ in 0..4 {
+            media(&mut a, 1_000);
+            a.set_uplink_stall(false);
+            let _ = a.tick(&[]);
+            let now = a.now_ms();
+            if matches!(
+                a.own.request(now, &c, &mut rng, &mut log),
+                AdmitDecision::Admit { .. }
+            ) {
+                admitted = true;
+                break;
+            }
+        }
+        assert!(admitted, "one step once the hold has passed");
+        assert_eq!(a.own_children().len(), 2);
     }
 
     /// G8 — a stalled uplink with ONE child has nothing to shed: the verdict
