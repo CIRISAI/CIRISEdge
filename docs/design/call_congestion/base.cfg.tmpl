@@ -10,6 +10,10 @@ CONSTANTS
     SlowStart = @SS@
     RedialOnPathUp = @RPU@
     ShedDrains = @DRAIN@
+    PeerLiveness = @PEER@
+    ReceiverMoves = @RXMOVE@
+    RxDelayTicks = 3
+    QTarget = 5
     CloseLost = @CLOSELOST@
     M = 3
     RCap = @RCAP@
@@ -47,10 +51,11 @@ CONSTANTS
     WPhases = @WPH@
     NPick = @NPICK@
     MaxReparents = @MAXREP@
-    RecoverBy = 45
+    RecoverBy = @RECOVER@
     DeadNode = @DEAD@
     DeadAt = @DEADAT@
     TraceOn = @TRACE@
+    Wide = @WIDE@
 SPECIFICATION Spec
 INVARIANTS @INVS@
 @PROPS@

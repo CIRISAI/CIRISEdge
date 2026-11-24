@@ -31,33 +31,35 @@ GUARD = os.path.expanduser("~/CIRISGrace/bin/cargo_guard.sh")
 CAP_SECS = 5400
 
 ALL_OFF = dict(RPA="FALSE", RTO="FALSE", HOLD="FALSE", SOV="FALSE", RKO="FALSE",
-               SS="FALSE", RPU="FALSE", DRAIN="FALSE")
+               SS="FALSE", RPU="FALSE", DRAIN="FALSE", PEER="FALSE", RXMOVE="FALSE")
 SWITCH = dict(RPA="ReceiptsPerAttempt", RTO="RtoLearnsDelay", HOLD="Hold113",
               SOV="ShedOnVerdict", RKO="RoomKeepsOne", SS="SlowStart",
-              RPU="RedialOnPathUp", DRAIN="ShedDrains")
+              RPU="RedialOnPathUp", DRAIN="ShedDrains", PEER="PeerLiveness",
+              RXMOVE="ReceiverMoves")
 INVS = "TypeOK RecordOutcome"   # the properties fold into `bad`, read per terminal state
 BASE = dict(ALL_OFF, CLOSELOST="FALSE", LSEQ="Listeners3", RCAP="4", CAPAT="10",
-            CAPUNTIL="50", HORIZON="100", STALE="100", SRTTCAP="17", WATCH="2",
+            CAPUNTIL="50", HORIZON="140", STALE="100", SRTTCAP="17", WATCH="2",
             SLOTS="1", PUNCH="{10, 30}", PPH="{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}",
             LPH="{0, 5}", WPH="{0, 5}", NPICK="2", MAXREP="3", DEAD='"none"',
-            DEADAT="0", TRACE="FALSE", INVS=INVS, PROPS="")
+            DEADAT="0", TRACE="FALSE", WIDE="FALSE", INVS=INVS, PROPS="")
 
 
 def on(*keys):
     return {k: "TRUE" for k in keys}
 
 
-# Today's code at each pin, as switches (CallCongestion.md, "Where the code is").
+# Today's code at each pin, as switches (CallCongestion.md, "The switches").
 TODAY_LEV_C86 = on("HOLD")                    # leviculum c8699c3d6 (#113 hold only)
 TODAY_LEV_C75 = on("HOLD", "RPA")             # leviculum c75fdeb01 (+ per-attempt receipts)
 EDGE_WIP = on("SOV", "RKO")                   # calls2's uncommitted alm.rs (shed on rise, latch, room)
-ALL6 = on("RPA", "RTO", "SOV", "RKO", "SS", "RPU")
-ALL = dict(ALL6, **on("HOLD", "DRAIN"))
+SIX = on("RPA", "RTO", "SOV", "RKO", "SS", "RPU")       # the brief's six
+EIGHT = dict(SIX, **on("HOLD", "DRAIN"))                # + the #113 hold, make-before-break
+ALL = dict(EIGHT, **on("PEER", "RXMOVE"))               # + the two the model found missing
 
 
 def scenarios():
-    yield "baseline", {}
     yield "smoke-baseline", dict(PPH="{3}", LPH="{0}", WPH="{0}", NPICK="1", PUNCH="{10}")
+    yield "baseline", {}
     # One switch at a time on the baseline: which failure each removes alone.
     for k in SWITCH:
         yield f"only-{SWITCH[k]}", on(k)
@@ -65,16 +67,19 @@ def scenarios():
     yield "pin-c8699c3d6", TODAY_LEV_C86
     yield "pin-c75fdeb01", TODAY_LEV_C75
     yield "pin-c75fdeb01+edge-wip", dict(TODAY_LEV_C75, **EDGE_WIP)
-    # The six switches of the brief, and all eight.
-    yield "six-on", ALL6
+    # Cumulative: the brief's six, + hold and drain, + the two new ones.
+    yield "six-on", SIX
+    yield "eight-on", EIGHT
     yield "all-on", ALL
     # Leave one out of all-on: what each switch is still needed for.
     for k in ALL:
         yield f"all-but-{SWITCH[k]}", dict(ALL, **{k: "FALSE"})
     # The cap from the first tick (slow start's case) and a cap that stays.
     yield "start-capped-baseline", dict(CAPAT="0")
+    yield "start-capped-six-on", dict(SIX, CAPAT="0")
     yield "start-capped-all-on", dict(ALL, CAPAT="0")
     yield "start-capped-all-but-SlowStart", dict(ALL, SS="FALSE", CAPAT="0")
+    yield "cap-stays-eight-on", dict(EIGHT, CAPUNTIL="1000")
     yield "cap-stays-all-on", dict(ALL, CAPUNTIL="1000")
     # Uplink sizes: one copy exactly, and 1.67 copies.
     yield "rcap3-all-on", dict(ALL, RCAP="3")
@@ -82,20 +87,39 @@ def scenarios():
     # Three people.
     yield "n3-baseline", dict(LSEQ="Listeners2")
     yield "n3-all-on", dict(ALL, LSEQ="Listeners2")
-    # A dead peer (#1030): the fixes must not hide it. Stale bound and the
-    # SRTT cap scaled together (the ASSUME of ChannelHold.tla).
-    dead = dict(DEAD='"B"', DEADAT="30", STALE="40", SRTTCAP="6", CAPUNTIL="1000")
+    # A dead peer (#1030): the fixes must not hide it. No cap, so a teardown
+    # is only the dead peer's; the stale bound and the SRTT cap scaled
+    # together (the ASSUME of ChannelHold.tla).
+    dead = dict(DEAD='"B"', DEADAT="30", STALE="40", SRTTCAP="6", CAPAT="1000", CAPUNTIL="1000")
     yield "dead-B-baseline", dead
     yield "dead-B-all-on", dict(ALL, **dead)
     yield "dead-B-all-on-close-lost", dict(ALL, CLOSELOST="TRUE", **dead)
+    yield "dead-B-capped-all-on", dict(ALL, **dict(dead, CAPAT="10"))
     # A close that never arrives (#1030) with everyone alive.
     yield "close-lost-all-on", dict(ALL, CLOSELOST="TRUE")
     # The watch tick at 300 ms instead of 200 ms (it is 250 ms in code).
     yield "watch3-all-on", dict(ALL, WATCH="3")
+    # Conformance: the recorded runs' shape (the cap stays on to the end).
+    yield "conf-run1", dict(TODAY_LEV_C86, CAPUNTIL="1000", HORIZON="160")
+    yield "conf-run2", dict(TODAY_LEV_C75, CAPUNTIL="1000", HORIZON="160")
+    # Wide: every listener its own offer phase and tie-break (chunked by P's
+    # phase), for the configurations the report leans on.
+    for n, p in [("baseline", {}), ("pin-c75fdeb01", TODAY_LEV_C75), ("all-on", ALL)]:
+        yield f"wide-{n}", dict(p, WIDE="TRUE")
+
+
+def recover_by(p):
+    """EndFullFanOut's bound (ticks after the cap lifts): two windows for the
+    verdict to clear, the dwell, and either one stream per two clean windows
+    (SlowStart) or the ceiling's staleness."""
+    n = 2 if p["LSEQ"] == "Listeners2" else 3
+    grow = (n - 1) * 2 * 10 if p["SS"] == "TRUE" else 20
+    return str(2 * 10 + 20 + grow)
 
 
 def cfg_text(params):
     p = dict(BASE, **params)
+    p.setdefault("RECOVER", recover_by(p))
     text = open(os.path.join(HERE, "base.cfg.tmpl")).read()
     for k, v in p.items():
         text = text.replace(f"@{k}@", v)
@@ -107,9 +131,9 @@ def tlc(outdir, name, cfgtext, extra=()):
     cfg = os.path.join(outdir, name + ".cfg")
     open(cfg, "w").write(cfgtext)
     env = dict(os.environ, GRACE_SCHED_OWNER="edge",
-               GRACE_SCHED_KIND="edge: tlc call model", GRACE_SCHED_PEAK_GB="4")
+               GRACE_SCHED_KIND="edge: tlc call model", GRACE_SCHED_PEAK_GB="2")
     cmd = ["timeout", str(CAP_SECS), "nice", "-n", "19", "ionice", "-c3", GUARD,
-           "java", "-Xmx3g", "-XX:+UseParallelGC", "-cp", JAR, "tlc2.TLC",
+           "java", "-Xmx2g", "-Xss64m", "-XX:+UseParallelGC", "-cp", JAR, "tlc2.TLC",
            "-workers", "2", *extra, "-config", cfg,
            "-metadir", os.path.join(outdir, name + ".states"),
            os.path.join(outdir, "MCCallCongestion.tla")]
@@ -261,6 +285,38 @@ def render_trace(text):
     return "\n".join(lines) + "\n"
 
 
+def run_chunked(outdir, name, params):
+    """One TLC run per P offer phase, merged: the behaviours are independent
+    (every choice is fixed at Init), and a 5,120-wide BFS frontier of these
+    states does not fit a 3 GB heap. Same coverage as one run."""
+    p = dict(BASE, **params)
+    phases = [x.strip() for x in p["PPH"].strip("{}").split(",")]
+    merged = None
+    obs = set()
+    for ph in phases:
+        part = f"{name}@{ph}"
+        log = tlc(outdir, part, cfg_text(dict(params, PPH="{" + ph + "}")), extra=[])
+        r = parse_log(log, params)
+        o = os.path.join(outdir, part + ".observed.txt")
+        obs |= {l for l in open(o).read().splitlines() if l}
+        os.remove(o)
+        if merged is None:
+            merged = r
+            merged["chunks"] = 1
+            continue
+        merged["violated"] = sorted(set(merged["violated"]) | set(r["violated"]))
+        merged["temporal"] = sorted(set(merged["temporal"]) | set(r["temporal"]))
+        merged["finished"] = merged["finished"] and r["finished"]
+        merged["distinct"] = (merged["distinct"] or 0) + (r["distinct"] or 0)
+        merged["depth"] = max(merged["depth"] or 0, r["depth"] or 0)
+        for k, v in r["outcomes"].items():
+            merged["outcomes"][k] = merged["outcomes"].get(k, 0) + v
+        merged["errors"] = (merged["errors"] + r["errors"])[:3]
+        merged["chunks"] += 1
+    open(os.path.join(outdir, name + ".observed.txt"), "w").write("\n".join(sorted(obs)) + "\n")
+    return merged
+
+
 def prepare(outdir):
     os.makedirs(outdir, exist_ok=True)
     for f in ["CallCongestion.tla", "MCCallCongestion.tla"]:
@@ -314,8 +370,11 @@ def main():
             continue
         if name in results and not only:
             continue
-        log = tlc(outdir, name, cfg_text(params), extra=[])
-        results[name] = parse_log(log, params)
+        if params.get("WIDE") == "TRUE":
+            results[name] = run_chunked(outdir, name, params)
+        else:
+            log = tlc(outdir, name, cfg_text(params), extra=[])
+            results[name] = parse_log(log, params)
         json.dump(results, open(resfile, "w"), indent=1)
         r = results[name]
         print(name, r["distinct"], r["depth"], r["outcomes"], r["violated"], r["temporal"],

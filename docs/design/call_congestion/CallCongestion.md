@@ -203,7 +203,33 @@ The status column says one of three things:
 
 ## Trace conformance
 
-(below)
+A recorded run conforms when the model, configured with that run's pins, can reach a terminal state that makes the same observations.
+
+**What a run records.** These are the observables edge already prints:
+
+- the `ciris_edge::link_close` lines, each with its node, direction, plane, peer and reason, timed from the `G8 cap on` line;
+- the witness's context line `[G8] capped publisher: …`: first teardown per node, parents, P's children, the ALM counters `shed` and `alm_uplink_stall`, and frames heard.
+
+**What the model prints.** Every terminal state prints `Observed` beside its outcome. `run_matrix.py` writes each distinct observation to `OUTDIR/<scenario>.observed.txt`. The fields:
+
+| Field | What it holds | Edge counterpart |
+|---|---|---|
+| `first_torn[n]` | the first tick a leg was torn down at node n (exhausted as dialer, stale as receiver) | the witness's `torn_down` (channel_exhausted, timeout, stale) |
+| `exhausted` | legs torn by retry exhaustion | `channel_exhausted` |
+| `direct`, `relayed` | P's direct children and the listeners on a relay, at the end | — |
+| `sheds`, `verdicts` | sheds made and verdict rises | `shed`, `alm_uplink_stall` |
+| `heard_pct` | per listener, heard as a percent of what P published | — |
+
+**The check.** `trace_check.py OBSERVED RUN.json` reports CONFORMS with a witness observation, or the nearest observation and the fields that differ. Times match within ±3 ticks, which covers the witness's 100 ms sampler and the model's rounding. `--log EDGE.log` reads `first_torn` and `exhausted` straight from the test's stderr: the link_close lines, minus the cap line's time.
+
+- **A run that does not conform is a finding.** Either the code does something the model does not have, or the run was not the configuration it claims.
+- **Why this check and not a TLA+ trace spec.** A full trace spec (each logged event as an action constraint) would need every Channel event to be logged. Edge logs only closes and counters, so the projection check above is the strongest one the logs support.
+- **What would make it stronger.** Log leviculum's `channel: max retries exceeded` with seq and tries, plus each leg's last authenticated inbound before its teardown (the instrumentation asked for in leviculum#113). Then per-leg traces could be checked event by event.
+
+**The first two traces** are in `recorded_runs/`; results are in [Results](#results).
+
+- `run1_c8699c3d6.json`: from the leviculum#113 comment of 2026-11-24 01:23Z. Per node, the first teardowns were P 1.82 s, A 2.13 s, B 2.13 s, C 1.72 s. 6 exhausted, P had 0 direct children, all 3 listeners were on relays, shed 0, alm_uplink_stall 1, heard ~21 %.
+- `run2_c75fdeb01.json`: only the brief's ranges were available. First teardown at 2.17–2.73 s, the listeners' legs toward P first, P sheds to one child. No per-node file was available to this model (asked calls2; see the report).
 
 ## References
 
