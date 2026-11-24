@@ -208,6 +208,17 @@ def scenarios():
     # The dwell and the ceiling staleness at the code's values (10 s, 60 s).
     yield "unscaled-all-on", dict(ALL, DWELL="100", CSTALE="600", HORIZON="330")
     yield "unscaled-min", dict(MIN, DWELL="100", CSTALE="600", HORIZON="330")
+    # Conformance with calls2's per-link witness logs (cap held 30 s, as the
+    # test does; the pins of each log as switches; recorded_runs/README).
+    c30 = dict(CAPUNTIL="1000", HORIZON="330")
+    shed = on("SOV", "RKO")
+    yield "conf-t1", dict(TODAY_LEV_C75, **c30)                                  # receipts, edge 5be3874
+    yield "conf-t2", dict(shed, **c30)                                           # pre-receipts, edge 6ffc24b
+    yield "conf-t3", dict(shed, **on("SS"), INIT="2", HOLDT="100", **c30)        # + slow start
+    yield "conf-t4", dict(TODAY_LEV_C75, **shed, **on("SS"), INIT="2", HOLDT="100", **c30)
+    yield "conf-t5", dict(shed, **on("SS"), INIT="2", HOLDT="100", **c30)        # + publish fix
+    yield "conf-t4lev2", dict(TODAY_LEV_C75, **shed, **on("SS"), INIT="2", HOLDT="100",
+                              FEED='"full"', **c30)                              # F12
     yield "conf-run1", dict(TODAY_LEV_C86, CAPUNTIL="1000", HORIZON="200")
     yield "conf-run2", dict(TODAY_LEV_C75, CAPUNTIL="1000", HORIZON="200")
     for n, p in [("baseline", {}), ("pin-c75fdeb01", TODAY_LEV_C75), ("all-on", ALL), ("min", MIN)]:

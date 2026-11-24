@@ -123,21 +123,67 @@ def from_log(path):
     return {"first_torn": first, "exhausted": exhausted, "cap_at_ticks": 10}
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def from_witness(path):
+    """One run per "[G8] capped publisher:" context line of the edge capped
+    witness: first teardown per node (P, A, B, C, T), ChannelExhausted, heard
+    of sent per listener, the listeners' parents, P's shed count."""
+    runs, names = [], {}
+    for raw in open(path, errors="replace"):
+        line = ANSI.sub("", raw)
+        if "G8 cap on" in line:
+            names = {key: role for role, key in re.findall(r'\("(\w)", "([^"]+)"\)', line)}
+        if "[G8] capped publisher:" not in line:
+            continue
+        first = re.search(r"first teardown after the cap \(P, A, B, C, T\) \[([^\]]*)\]", line)
+        ft = {}
+        if first:
+            for role, v in zip("PABCT", [x.strip() for x in first.group(1).split(",")]):
+                m = re.match(r"Some\(([\d.]+)s\)", v)
+                if role != "T":
+                    ft[role] = float(m.group(1)) if m else None
+        sent = int(re.search(r"sent (\d+)", line).group(1))
+        heard = [int(x) for x in re.search(r"heard \[([^\]]*)\]", line).group(1).split(",")]
+        parents = re.findall(r'Some\("([^"]+)"\)|None', re.search(r"parents \[([^\]]*)\]", line).group(1))
+        roles = [names.get(x, x) if x else None for x in parents]
+        exhausted = int(re.search(r"ChannelExhausted (\d+)", line).group(1))
+        shed = int(re.search(r"shed: (\d+)", line).group(1))
+        tol = lambda pct: [max(0, pct - 10), min(100, pct + 10)]
+        runs.append({"first_torn": ft, "exhausted": exhausted,
+                     "direct": sum(1 for r in roles if r == "P"),
+                     "relayed": sum(1 for r in roles if r not in (None, "P")),
+                     "heard_pct": {c: tol(100 * h // max(1, sent)) for c, h in zip("ABC", heard)},
+                     "sheds": [max(0, shed - 1), shed + 1], "cap_at_ticks": 10,
+                     "name": f"{os.path.basename(path)} witness {len(runs) + 1}"})
+    return runs
+
+
 def main():
     observed = load_observed(sys.argv[1])
+    if sys.argv[2] == "--witness":
+        rc = 0
+        for run in from_witness(sys.argv[3]):
+            rc |= check(observed, run)
+        return rc
     run = from_log(sys.argv[3]) if sys.argv[2] == "--log" else json.load(open(sys.argv[2]))
+    return check(observed, run)
+
+
+def check(observed, run):
     run.setdefault("cap_at_ticks", 10)
     best = None
     for obs in observed:
         bad = mismatches(obs, run)
         if not bad:
-            print(f"CONFORMS: {run.get('name', sys.argv[2])} is reachable "
+            print(f"CONFORMS: {run.get('name')} is reachable "
                   f"({len(observed)} terminal observations)")
             print("  witness:", obs)
             return 0
         if best is None or len(bad) < len(best[1]):
             best = (obs, bad)
-    print(f"DOES NOT CONFORM: {run.get('name', sys.argv[2])}; nearest observation differs in:")
+    print(f"DOES NOT CONFORM: {run.get('name')}; nearest observation differs in:")
     for b in best[1]:
         print("  -", b)
     print("  nearest:", best[0])
